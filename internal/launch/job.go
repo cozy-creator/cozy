@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
@@ -76,11 +77,7 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}
 	cache := filepath.Join(f.Install.Dir, "artifact-cache")
-	overlays, err := filepath.Glob(filepath.Join(f.Install.Dir, "environment", "contents", "*", "site-packages"))
-	if err != nil || len(overlays) != 1 {
-		return orchestrator.WorkerLaunchSpec{}, nil, exit.Named(exit.Structural,
-			"package_overlay_missing", "installed package has no unique Python overlay")
-	}
+	environmentPython := home.VenvPython(filepath.Join(f.Install.Dir, "venv"))
 	placement.Jobs = []*orchestrator.JobPlan{{
 		Function:        facts.Name,
 		DescriptorID:    facts.DescriptorID,
@@ -93,8 +90,8 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 			"build_id":                    PackageRevisionDigest(f.Install),
 			"application":                 f.PackageDescriptor.Application,
 			"package_descriptor":          DescriptorPath(f.Install.Dir),
-			"overlay":                     overlays[0],
-			"overlay_content_digest":      placement.EnvironmentDigest,
+			"python":                      environmentPython,
+			"environment_content_digest":  PackageRevisionDigest(f.Install),
 			"job":                         facts.Name,
 			"gpu_count":                   facts.GPUCount,
 			"publishes":                   facts.Publishes,
@@ -108,15 +105,15 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	spec := orchestrator.WorkerLaunchSpec{
 		Placement: placement,
 		// The same entry the serving lane uses: the runtime's own public verb (spec.go).
-		Python:          runtimeBin,
-		Args:            []string{"serve"},
-		Dir:             f.Source,
-		Devices:         devices,
-		GraceSec:        3,
-		ArtifactCache:   cache,
-		EnvironmentRoot: filepath.Join(f.Install.Dir, "environment"),
-		ArtifactStore:   filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
-		BaseManifest:    filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "local-base.json"),
+		Python:            runtimeBin,
+		Args:              []string{"serve"},
+		Dir:               f.Source,
+		Devices:           devices,
+		GraceSec:          3,
+		ArtifactCache:     cache,
+		EnvironmentPython: environmentPython,
+		ArtifactStore:     filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
+		BaseManifest:      filepath.Join(f.Install.Dir, "base-manifest.json"),
 	}
 	return spec, facts, nil
 }

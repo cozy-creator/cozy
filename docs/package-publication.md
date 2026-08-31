@@ -35,9 +35,17 @@ requirements are refused. Development dependency groups are ignored.
 Source custody is limited to 20,000 files and 512 MiB total; each source file is limited to 64 MiB
 and `uv.lock` to 16 MiB. The three required files must be non-empty.
 
-Creator prunes the closed platform-owned roots shared by the CPU and CUDA base images, rather than
-uploading Torch, Runtime, TensorFS, or their baked closure. Runtime still compares every requirement
-against the actual selected base and refuses an incompatible or shadowing overlay.
+Creator omits only the remote platform families that a rental may not replace: Python, Torch,
+Runtime, TensorFS, and their platform closure. Ordinary libraries remain package-owned. Runtime
+compares those platform requirements with the base Tensorhub selected before installing the package
+environment.
+
+For local installation, Creator creates a normal uv venv using the release's Python requirement.
+It exports the already-committed `uv.lock` with `--frozen` because author-local source paths no
+longer exist on the consumer; those distributions come from their exact published wheels. Registry
+rows install with their lock hashes, then the project/custom wheels install without builds, and
+`uv pip check` joins the complete environment back to the wheel requirements. Publication itself
+already ran `uv export --locked`, so a mismatched project and lock never became a release.
 Cozy refuses `.env*`, credentials, keys, bytecode, and model-weight files instead of silently
 omitting them. It skips VCS directories, virtual environments, caches, editor state, and build
 output. Modified and ordinary untracked files are published normally.

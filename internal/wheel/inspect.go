@@ -1,7 +1,7 @@
 package wheel
 
 // Publication needs only a wheel's bounded name and version. Tensorhub owns
-// project-wheel and overlay policy after the uploaded bytes cross its trust boundary.
+// project-wheel and package-environment policy after the uploaded bytes cross its trust boundary.
 
 import (
 	"archive/zip"

@@ -48,6 +48,14 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	pyproject, problem := exactPackageInstallDocument("pyproject.toml", plan.Pyproject)
+	if problem != nil {
+		return problem
+	}
+	uvLock, problem := exactPackageInstallDocument("uv.lock", plan.UVLock)
+	if problem != nil {
+		return problem
+	}
 	release = plan.Release
 	if _, err := canonical.Raw(plan.ReleaseDigest); err != nil {
 		return exit.Internalf("Tensorhub returned an invalid release digest")
@@ -57,23 +65,20 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	runtimeBin, problem := launch.RefreshLocalBase(existingLayout.Root, existingLayout.LocalBase,
-		ctx.Cfg.Tool())
-	if problem != nil {
-		existing.Close()
-		return problem
-	}
 	_, generation, problem := existing.ActivePackage(ref.String())
 	if problem != nil {
 		existing.Close()
 		return problem
 	}
-	if generation != nil && generation.SourceDigest == releaseDigest &&
-		launch.PreparedOnLocalBase(*generation, existingLayout.LocalBase) {
+	if generation != nil && generation.SourceDigest == releaseDigest {
 		defer existing.Close()
 		return emitInstallResult(ctx, existingLayout, existing, &install.Result{Gen: *generation, Idempotent: true})
 	}
 	existing.Close()
+	runtimeBin, problem := launch.HostRuntime()
+	if problem != nil {
+		return problem
+	}
 	layout, problem := home.Open(ctx.Cfg.Home)
 	if problem != nil {
 		return problem
@@ -87,7 +92,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	}
 	defer os.RemoveAll(scratch)
 	published, problem := downloadPackageInstallPlan(hctx, ctx, scratch, ref, release, releaseDigest,
-		plan, packageConfig, packageDescriptor)
+		plan, packageConfig, packageDescriptor, pyproject, uvLock)
 	if problem != nil {
 		return problem
 	}
@@ -106,7 +111,6 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		var installProblem *exit.Error
 		result, installProblem = install.Run(layout, st, install.Request{
 			Ref: install.Ref{Package: ref.String()}, Force: true, Published: published,
-			Runtime: runtimeBin,
 		})
 		return installProblem
 	})
@@ -132,7 +136,7 @@ func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
 
 func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch string, ref hub.Ref,
 	release, releaseDigest string, plan hub.PackageDownloadPlan, packageConfig,
-	packageDescriptor install.ExactDocument,
+	packageDescriptor, pyproject, uvLock install.ExactDocument,
 ) (*install.PublishedSource, *exit.Error) {
 	if len(plan.Downloads) == 0 || len(plan.Downloads) > hub.MaxPackageInstallDownloads {
 		return nil, exit.Internalf("Tensorhub returned an invalid package install plan")
@@ -140,6 +144,8 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 	published := &install.PublishedSource{
 		Package: ref.String(), Release: release, SourceDigest: releaseDigest,
 		PackageConfig: packageConfig,
+		Pyproject:     pyproject,
+		UVLock:        uvLock,
 		Selection:     install.Selection{PackageDescriptor: packageDescriptor},
 	}
 	seen := map[string]bool{}

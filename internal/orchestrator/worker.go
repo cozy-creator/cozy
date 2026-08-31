@@ -219,17 +219,18 @@ type RemoteTarget struct {
 // placement. The caller (cl-010's `start`, or cl-001's live driver) resolves it from the
 // install; the orchestrator itself resolves nothing about Python.
 type WorkerLaunchSpec struct {
-	Python          string       `json:"python"` // the interpreter inside the package's own venv
-	Args            []string     `json:"args"`
-	Dir             string       `json:"dir"`
-	Imposed         []string     `json:"imposed"` // exact env values the launcher imposes, never inherited
-	Devices         []string     `json:"devices"` // the device envelope this process may SEE
-	GraceSec        float64      `json:"grace_sec"`
-	Warmup          WarmupPolicy `json:"warmup,omitempty"`
-	ArtifactCache   string       `json:"artifact_cache,omitempty"`
-	EnvironmentRoot string       `json:"environment_root,omitempty"`
-	ArtifactStore   string       `json:"artifact_store,omitempty"`
-	BaseManifest    string       `json:"base_manifest,omitempty"`
+	Python            string       `json:"python"` // package-independent control Runtime
+	Args              []string     `json:"args"`
+	Dir               string       `json:"dir"`
+	Imposed           []string     `json:"imposed"` // exact env values the launcher imposes, never inherited
+	Devices           []string     `json:"devices"` // the device envelope this process may SEE
+	GraceSec          float64      `json:"grace_sec"`
+	Warmup            WarmupPolicy `json:"warmup,omitempty"`
+	ArtifactCache     string       `json:"artifact_cache,omitempty"`
+	EnvironmentRoot   string       `json:"environment_root,omitempty"`
+	EnvironmentPython string       `json:"environment_python,omitempty"` // preinstalled package venv
+	ArtifactStore     string       `json:"artifact_store,omitempty"`
+	BaseManifest      string       `json:"base_manifest,omitempty"`
 	// Placement is what this worker is launched to host. LAUNCH CLAMPS THE SET TO ONE
 	// (worker-protocol header): a longer set is a typed refusal at the worker, so this
 	// side names one placement rather than pretending to a generality it cannot deliver.
@@ -976,6 +977,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	for _, option := range []struct{ flag, value string }{
 		{"--artifact-cache", spec.ArtifactCache},
 		{"--environment-root", spec.EnvironmentRoot},
+		{"--environment-python", spec.EnvironmentPython},
 		{"--artifact-store", spec.ArtifactStore},
 		{"--base-manifest", spec.BaseManifest},
 	} {

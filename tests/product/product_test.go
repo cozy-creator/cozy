@@ -436,7 +436,7 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 	b := filepath.Join(projects, "local-b")
 	c := filepath.Join(projects, "local-c")
 	writePublishProject(t, a, "local-a", "1.0.0",
-		[]string{"local-b>=2,<3", "local-b[images]>=2,<3", "cozy-runtime>=0.0.3", "msgspec>=0.19"},
+		[]string{"local-b>=2,<3", "local-b[images]>=2,<3", "cozy-runtime>=0.0.3", "typing-extensions>=4"},
 		"local-b = { path = \"../local-b\" }\n", true)
 	writePublishProject(t, b, "local-b", "2.1.0", nil,
 		"local-c = { path = \"../local-c\", editable = true }\nabsent-local = { path = \"../absent-local\" }\n", false)
@@ -455,10 +455,10 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		fatal(t, problem)
 		wheels[identity.Distribution] = identity.Version
 	}
-	if len(pack.DependencyWheels) != 2 || wheels["local-b"] != "2.1.0" ||
-		wheels["local-c"] != "3.0.0" || wheels["cozy-runtime"] != "" || //cozy:allow distribution assertion, not executable access
-		wheels["msgspec"] != "" { //cozy:allow distribution assertion, not executable access
-		t.Fatalf("local dependency closure did not include only the requested local wheels: %+v", pack.DependencyWheels)
+	if len(pack.DependencyWheels) != 4 || wheels["local-b"] != "2.1.0" ||
+		wheels["local-c"] != "3.0.0" || wheels["cozy-runtime"] != "0.0.11" || //cozy:allow distribution assertion, not executable access
+		wheels["typing-extensions"] == "" { //cozy:allow distribution assertion, not executable access
+		t.Fatalf("package dependency closure omitted an ordinary library: %+v", pack.DependencyWheels)
 	}
 	for _, dependency := range pack.DependencyWheels {
 		if !strings.HasSuffix(dependency.Filename, ".whl") {
@@ -467,12 +467,6 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		if info, err := os.Stat(dependency.Path); err != nil || !info.Mode().IsRegular() {
 			t.Fatalf("dependency wheel is not a staged regular file: %+v err=%v", dependency, err)
 		}
-	}
-
-	// The closed shared-base contract omits the local source candidate. Runtime
-	// validates the requirement against the actual base before installation.
-	if wheels["cozy-runtime"] != "" { //cozy:allow distribution assertion, not executable access
-		t.Fatalf("platform-owned Runtime candidate entered the overlay: %+v", pack.DependencyWheels)
 	}
 
 	writePublishProject(t, a, "local-a", "1.0.0", []string{"local-b>=3"},
@@ -567,11 +561,18 @@ func TestPackagePublishDownloadsLockedRegistryDependency(t *testing.T) {
 		t.Fatalf("%s: %s", problem.Message, problem.Remedy)
 	}
 	defer pack.Close()
-	if len(pack.DependencyWheels) != 1 {
-		t.Fatalf("registry dependency wheel count = %d, want 1", len(pack.DependencyWheels))
+	if len(pack.DependencyWheels) != 2 {
+		t.Fatalf("registry dependency wheel count = %d, want runtime plus humanize", len(pack.DependencyWheels))
 	}
-	dependency, problem := wheel.InspectIdentity(pack.DependencyWheels[0].Path)
-	fatal(t, problem)
+	var dependency wheel.Identity
+	var dependencyPath string
+	for _, candidate := range pack.DependencyWheels {
+		identity, inspectProblem := wheel.InspectIdentity(candidate.Path)
+		fatal(t, inspectProblem)
+		if identity.Distribution == "humanize" {
+			dependency, dependencyPath = identity, candidate.Path
+		}
+	}
 	if dependency.Distribution != "humanize" || dependency.Version != "4.13.0" ||
 		!strings.HasSuffix(dependency.Filename, "-py3-none-any.whl") {
 		t.Fatalf("registry dependency identity = %+v", dependency)
@@ -586,7 +587,7 @@ func TestPackagePublishDownloadsLockedRegistryDependency(t *testing.T) {
 	}
 	venvPython := filepath.Join(venv, "bin", "python")
 	command = exec.Command("uv", "pip", "install", "--python", venvPython, "--offline", "--no-index",
-		"--no-deps", pack.Wheel, pack.DependencyWheels[0].Path)
+		"--no-deps", pack.Wheel, dependencyPath)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("offline exact-wheel install: %v\n%s", err, output)
 	}

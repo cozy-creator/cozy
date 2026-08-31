@@ -21,38 +21,17 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// This is the complete current CPU base inventory; CUDA is a superset. Pruning
-// a base-owned distribution lets uv omit its locked transitive closure when
-// nothing else needs it. Runtime still compares requirements with the actual
-// base, so this small closed contract is not a profile or compatibility API.
-var platformOwnedRoots = map[string]bool{
-	"av":                true,
-	"cffi":              true,
-	"click":             true,
-	"cozy-runtime":      true, //cozy:allow base distribution identity, not executable access
-	"cryptography":      true,
-	"filelock":          true,
-	"fsspec":            true,
-	"grpcio":            true,
-	"jinja2":            true,
-	"markupsafe":        true,
-	"mpmath":            true,
-	"msgspec":           true,
-	"networkx":          true,
-	"numpy":             true,
-	"packaging":         true,
-	"pillow":            true,
-	"pip":               true,
-	"protobuf":          true,
-	"pycparser":         true,
-	"setuptools":        true,
-	"sympy":             true,
-	"tensorfs":          true,
-	"torch":             true,
-	"torchaudio":        true,
-	"torchvision":       true,
-	"typing-extensions": true,
-	"uv":                true,
+// A rental cannot replace these image-owned platform families. Ordinary libraries are
+// package-owned even when one image happens to carry a copy; Runtime compares this small
+// declared family against the actual selected base before any remote installation.
+var remoteBaseRoots = map[string]bool{
+	"cozy-runtime": true, //cozy:allow base distribution identity, not executable access
+	"msgspec":      true,
+	"tensorfs":     true,
+	"torch":        true,
+	"torchaudio":   true,
+	"torchvision":  true,
+	"triton":       true,
 }
 
 type registryLock struct {
@@ -83,8 +62,8 @@ func collectRegistryDependencies(ctx context.Context, project, stage string, exi
 	lockPath := filepath.Join(stage, "pylock.registry.toml")
 	args := []string{"export", "--locked", "--no-dev", "--no-emit-project", "--no-emit-local",
 		"--format", "pylock.toml", "--output-file", lockPath, "--no-progress", "--directory", project}
-	roots := make([]string, 0, len(platformOwnedRoots))
-	for name := range platformOwnedRoots {
+	roots := make([]string, 0, len(remoteBaseRoots))
+	for name := range remoteBaseRoots {
 		roots = append(roots, name)
 	}
 	sort.Strings(roots)
@@ -142,7 +121,7 @@ func registryDependenciesFromLock(ctx context.Context, raw []byte, stage string,
 			return nil, exit.Named(exit.Validation, "registry_dependency_lock_invalid",
 				"pylock.toml contains a package without an exact name and version")
 		}
-		if platformOwnedRoots[name] {
+		if remoteBaseRoots[name] {
 			return nil, exit.Named(exit.Validation, "registry_dependency_platform_root_present",
 				"uv export retained platform-owned root %s", name)
 		}

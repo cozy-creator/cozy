@@ -173,8 +173,12 @@ TFS_FIELD = re.compile(r"\.Tfs\b")
 # of verbs they may name. Publication and install derive the package descriptor once; launch
 # may ask for host facts and fit verdicts. Nothing executes a model
 # through these doors — that is what the orchestrator and worker protocol are for.
-RUNTIME_SITES = {"internal/install/install.go", "internal/launch/artifacts.go",
-                 "internal/packagepublish/package.go"}
+RUNTIME_SITES = {
+    "internal/install/install.go",
+    "internal/install/published.go",
+    "internal/launch/artifacts.go",
+    "internal/packagepublish/package.go",
+}
 RUNTIME_BIN = re.compile(r'"cozy-runtime"')
 # (cl-028) The INDIRECTIONS to the same binary, which the literal above cannot see:
 # `launch.Binary()` resolves the generation venv's cozy-runtime and `launch.RuntimeCLI{}`
@@ -814,7 +818,7 @@ def check_typed_resources():
 
 
 def check_python_seat():
-    """Published local execution delegates one exact CPython 3.12 base to Runtime."""
+    """Published local execution uses the release's own uv-selected Python environment."""
     path = pathlib.Path("internal/install/published.go")
     text = path.read_text()
     bad = []
@@ -824,13 +828,18 @@ def check_python_seat():
             bad.append(
                 f"internal/packagepublish/package.go: [python] publication injects {forbidden[:-1]}"
             )
-    for required in ('"prepare-package"', '"--base-manifest"', 'Python: "CPython 3.12"'):
+    for required in (
+        '"prepare-package"',
+        '"--base-manifest"',
+        '"--environment-python"',
+        "MaterializePublishedEnvironment",
+    ):
         if required not in text:
-            bad.append(f"{path}: [python] missing exact CPython 3.12 seat {required!r}")
+            bad.append(f"{path}: [python] missing full uv environment handoff {required!r}")
     install = pathlib.Path("internal/install/install.go").read_text()
-    for deleted in ("MaterializePublishedEnvironment", "pythonForABI", "cp314", "3.14"):
+    for deleted in ('"--environment-root"', 'Python: "CPython 3.12"', "LinkMode", "pythonForABI"):
         if deleted in text + install:
-            bad.append(f"internal/install: [python] deleted published environment path remains: {deleted}")
+            bad.append(f"internal/install: [python] retired shared-base install path remains: {deleted}")
 
     fixtures = (
         pathlib.Path("tests/product/testdata/build-weightless.py"),
@@ -885,5 +894,5 @@ print(
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) "
     f"web(stub+bounded-upload+no-log) retired-planes(absent) "
-    f"resources(typed package/model, no aliases) python(cp312 only) test(tests/product only)"
+    f"resources(typed package/model, no aliases) python(independent uv venvs) test(tests/product only)"
 )

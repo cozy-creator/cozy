@@ -34,7 +34,6 @@ type Request struct {
 	Force     bool
 	Local     *LocalSource
 	Published *PublishedSource
-	Runtime   string // already-refreshed trusted host Runtime for a published local install
 }
 
 // LocalSource is one author-controlled directory after Creator's bounded source
@@ -54,9 +53,11 @@ type PublishedSource struct {
 	Files         int
 	Package       string
 	PackageConfig ExactDocument
+	Pyproject     ExactDocument
 	ProjectWheel  PublishedWheel
 	Release       string
 	SourceDigest  string
+	UVLock        ExactDocument
 	Wheels        []PublishedWheel
 	Models        []PublishedModel
 	Selection     Selection
@@ -113,6 +114,18 @@ func validatePublished(gen records.PackageInstall, published *PublishedSource) *
 		!bytes.Equal(canonical.Digest(config.Bytes), configDigest) {
 		return exit.Named(exit.Conflict, "package_config_identity_mismatch",
 			"published package.toml bytes do not match their digest and length")
+	}
+	for _, item := range []struct {
+		name     string
+		document ExactDocument
+	}{{"pyproject.toml", published.Pyproject}, {"uv.lock", published.UVLock}} {
+		name, document := item.name, item.document
+		digest, err := canonical.Raw(document.Digest)
+		if err != nil || document.Length <= 0 || document.Length != int64(len(document.Bytes)) ||
+			!bytes.Equal(canonical.Digest(document.Bytes), digest) {
+			return exit.Named(exit.Conflict, "package_environment_document_identity_mismatch",
+				"published %s bytes do not match their digest and length", name)
+		}
 	}
 	return nil
 }
@@ -171,7 +184,8 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			return fail(exit.Internalf("cannot create package generation: %s", err))
 		}
 		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "tensorhub", req.Published.Package+"@"+req.Published.Release, req.Published.SourceDigest
-		gen.Package, gen.Version, gen.ProjectDir = req.Published.Package, req.Published.Release, genDir
+		gen.Package, gen.Version, gen.ProjectDir = req.Published.Package, req.Published.Release,
+			filepath.Join(genDir, "source")
 		if e := validatePublished(gen, req.Published); e != nil {
 			return fail(e)
 		}
@@ -243,8 +257,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	var placement ExactDocument
 	var err *exit.Error
 	if req.Published != nil {
-		descriptor, placement, gen.Runtime, env, err = preparePublished(
-			l, genDir, req.Runtime, req.Published)
+		descriptor, placement, gen.Runtime, env, err = preparePublished(l, genDir, req.Published)
 	} else {
 		env, err = MaterializeEnvironment(sourceDir, venvDir)
 	}
@@ -252,7 +265,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		return guard(err)
 	}
 	gen.Python, gen.UV, gen.LockDigest = env.Python, env.UV, env.LockDigest
-	gen.Platform, gen.Extra, gen.LinkMode = env.Platform, env.Extra, env.LinkMode
+	gen.Platform, gen.Extra = env.Platform, env.Extra
 	gen.Packages, gen.Closure = env.Packages, env.Closure
 	res.Warnings = append(res.Warnings, env.Warnings...)
 	mark("environment")

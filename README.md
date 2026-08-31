@@ -94,10 +94,10 @@ wheels in the same publication, including local dependencies activated through r
 It first asks Tensorhub whether the release is already committed, so a replay skips all wheel
 builds and uploads. Builds and uploads stop when they repeatedly make no byte progress; uploads run
 at no more than 16 files concurrently.
-Creator uses the common base inventory only to prune platform-owned roots from its locked export.
-It uploads exact pure-Python registry and local dependency wheels; the actual worker rejects base
-shadowing or an unsatisfied requirement before importing the package. Development dependency
-groups are not published. The package name and
+Creator omits only Python/Torch/Runtime/TensorFS platform families from its registry-wheel export;
+it has no worker-image inventory. It uploads exact pure-Python registry and local dependency wheels,
+and the actual worker compares platform requirements with its selected base before importing the
+package. Development dependency groups are not published. The package name and
 release come from `[project]`; `[tool.cozy]` supplies the Tensorhub organization:
 
 ```toml

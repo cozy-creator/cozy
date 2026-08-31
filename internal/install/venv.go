@@ -29,7 +29,6 @@ type EnvironmentReceipt struct {
 	LockDigest string
 	Platform   string
 	Extra      string
-	LinkMode   string
 	Packages   int
 	Closure    string
 	Warnings   []string
@@ -62,7 +61,6 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 		UV:         toolVersion("uv", "--version"),
 	}
 	env.Extra = pickCUDAExtra(sourceDir, &env.Warnings)
-	env.LinkMode = pickLinkMode(venvDir, &env.Warnings)
 
 	args := []string{"sync", "--locked", "--no-progress"}
 	if env.Extra != "" {
@@ -71,8 +69,7 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 	cmd := exec.Command("uv", args...)
 	cmd.Dir = sourceDir
 	cmd.Env = config.Frozen().Tool(
-		"UV_PROJECT_ENVIRONMENT="+venvDir,
-		"UV_LINK_MODE="+env.LinkMode,
+		"UV_PROJECT_ENVIRONMENT=" + venvDir,
 	)
 	var out strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &out
@@ -87,6 +84,89 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 	env.Python = pythonVersion(venvDir)
 	env.Packages, env.Closure = closure(venvDir)
 	return env, nil
+}
+
+// MaterializePublishedEnvironment recreates the frozen local environment from the exact
+// published project metadata, then installs the exact project and custom wheels. Registry
+// dependencies come from uv.lock; wheel paths replace only distributions whose published
+// bytes are authoritative. Nothing is inherited from Creator's own Python environment.
+func MaterializePublishedEnvironment(sourceDir, venvDir string, project PublishedWheel,
+	dependencies []PublishedWheel,
+) (*EnvironmentReceipt, *exit.Error) {
+	lock := filepath.Join(sourceDir, "uv.lock")
+	lockDigest, err := fileDigest(lock)
+	if err != nil {
+		return nil, exit.Named(exit.Structural, "lock_missing",
+			"the published release carries no uv.lock").
+			WithRemedy("publish the exact uv.lock that freezes the package environment")
+	}
+	env := &EnvironmentReceipt{
+		LockDigest: "sha256:" + lockDigest,
+		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
+		UV:         toolVersion("uv", "--version"),
+	}
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "package_python_incompatible",
+		"the package Python requirement cannot select an interpreter",
+		"venv", "--no-progress", venvDir); problem != nil {
+		return nil, problem
+	}
+	requirements := filepath.Join(filepath.Dir(venvDir), "locked-requirements.txt")
+	// Published local/workspace sources are represented by their exact wheels, not by the
+	// author's paths. Export the committed lock without reopening those unavailable paths;
+	// the final pip check joins the wheel requirements back to this frozen registry closure.
+	args := []string{"export", "--frozen", "--no-dev", "--no-emit-project",
+		"--format", "requirements.txt", "--output-file", requirements, "--no-progress"}
+	seen := map[string]bool{}
+	for _, wheel := range dependencies {
+		name := strings.TrimSpace(wheel.Distribution)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		args = append(args, "--no-emit-package", name)
+	}
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "locked_environment_refused",
+		"the published lock cannot export its exact registry closure", args...); problem != nil {
+		return nil, problem
+	}
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "locked_environment_refused",
+		"the exact registry closure is incompatible with the selected Python environment",
+		"pip", "install", "--no-deps", "--require-hashes", "--python",
+		home.VenvPython(venvDir), "--requirements", requirements); problem != nil {
+		return nil, problem
+	}
+	wheels := append([]PublishedWheel{project}, dependencies...)
+	args = []string{"pip", "install", "--offline", "--no-index", "--no-deps", "--no-build",
+		"--python", home.VenvPython(venvDir)}
+	for _, wheel := range wheels {
+		args = append(args, wheel.Path)
+	}
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "package_wheel_incompatible",
+		"an exact published wheel is incompatible with the selected Python environment", args...); problem != nil {
+		return nil, problem
+	}
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "package_requirement_incompatible",
+		"the installed package requirements are not satisfied", "pip", "check", "--python",
+		home.VenvPython(venvDir)); problem != nil {
+		return nil, problem
+	}
+	env.Python = pythonVersion(venvDir)
+	env.Packages, env.Closure = closure(venvDir)
+	return env, nil
+}
+
+func runUV(dir string, env []string, code, message string, args ...string) *exit.Error {
+	cmd := exec.Command("uv", args...)
+	cmd.Dir = dir
+	cmd.Env = env
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Run(); err != nil {
+		return exit.Named(exit.Validation, code, "%s: %s", message, condense(out.String())).
+			WithRemedy("fix the named requirement or wheel and publish a new locked release").
+			WithNext("cozy help package install")
+	}
+	return nil
 }
 
 // Disk measures one generation exactly once, at install: bytes only this generation
@@ -202,39 +282,6 @@ func hostCUDA() int {
 	major, _ := strconv.Atoi(string(m[1]))
 	minor, _ := strconv.Atoi(string(m[2]))
 	return major*10 + minor
-}
-
-// pickLinkMode keeps hardlink dedup across venvs when uv's cache and the generation
-// share a filesystem, and degrades to copies with a loud warning when they do not.
-func pickLinkMode(venvDir string, warn *[]string) string {
-	cache := strings.TrimSpace(runOut("uv", "cache", "dir"))
-	if cache == "" {
-		return "copy"
-	}
-	a, aok := deviceOf(cache)
-	b, bok := deviceOf(firstExistingParent(venvDir))
-	if !aok || !bok {
-		return "copy"
-	}
-	if a != b {
-		*warn = append(*warn, fmt.Sprintf(
-			"hardlink dedup degraded to copies: uv's cache (%s) and this install are on different mounts — every venv pays full bytes", cache))
-		return "copy"
-	}
-	return "hardlink"
-}
-
-func firstExistingParent(p string) string {
-	for {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-		parent := filepath.Dir(p)
-		if parent == p {
-			return p
-		}
-		p = parent
-	}
 }
 
 func pythonVersion(venvDir string) string {

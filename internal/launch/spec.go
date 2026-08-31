@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -28,16 +29,6 @@ func Read(gen records.PackageInstall, cozyHome string, env []string) (*Facts, *e
 	}
 	runtimeBin, descriptor := Binary(gen), ""
 	if gen.SourceKind == "tensorhub" {
-		localBase := filepath.Join(cozyHome, "local-base.json")
-		runtimeBin, e = RefreshLocalBase(cozyHome, localBase, env)
-		if e != nil {
-			return nil, e
-		}
-		if !PreparedOnLocalBase(gen, localBase) {
-			return nil, exit.Named(exit.Conflict, "local_base_changed",
-				"%s was prepared against an older local Runtime base", gen.Package).
-				WithRemedy("run `cozy package install %s` to rebuild its small overlay", gen.Package)
-		}
 		descriptor = DescriptorPath(gen.Dir)
 	}
 	return &Facts{
@@ -95,8 +86,8 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 }
 
 // Spec adds this host's target-environment materialization to a placement. The trusted
-// host Runtime owns worker control; the generation venv is only the selected executor
-// overlay. A connected worker never calls this method.
+// host Runtime owns worker control; the generation venv supplies the selected executor.
+// A connected worker never calls this method.
 func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	placement, e := f.Placement()
 	if e != nil {
@@ -122,12 +113,12 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 	return orchestrator.WorkerLaunchSpec{
 		Placement: placement,
 		Python:    runtimeBin, Args: []string{"serve"},
-		Dir:             f.Source,
-		Devices:         devices,
-		GraceSec:        3,
-		ArtifactCache:   cache,
-		EnvironmentRoot: filepath.Join(f.Install.Dir, "environment"),
-		ArtifactStore:   filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
-		BaseManifest:    filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "local-base.json"),
+		Dir:               f.Source,
+		Devices:           devices,
+		GraceSec:          3,
+		ArtifactCache:     cache,
+		EnvironmentPython: home.VenvPython(filepath.Join(f.Install.Dir, "venv")),
+		ArtifactStore:     filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
+		BaseManifest:      filepath.Join(f.Install.Dir, "base-manifest.json"),
 	}, nil
 }

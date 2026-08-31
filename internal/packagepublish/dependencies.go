@@ -111,9 +111,6 @@ func (c *dependencyCollector) collectProject(root string, document projectMetada
 				"project dependency %q uses a direct URL", raw).
 				WithRemedy("publish the distribution to an index or use a local path/workspace source")
 		}
-		if platformOwnedRoots[req.name] {
-			continue
-		}
 		source, exists := sources[req.name]
 		if !exists {
 			c.registry = true
@@ -193,6 +190,9 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 			return duplicateDependency(name, prior, canonical, version)
 		}
 		newExtras := c.activateExtras(canonical, req.extras)
+		if remoteBaseRoots[name] {
+			return nil
+		}
 		if len(newExtras) == 0 {
 			return nil
 		}
@@ -207,11 +207,13 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 	c.count++
 	c.byName[name] = dependencyRecord{source: canonical, version: version}
 	newExtras := c.activateExtras(canonical, req.extras)
-	c.stack[canonical] = true
-	if problem := c.collectProject(canonical, document, newExtras, true); problem != nil {
-		return problem
+	if !remoteBaseRoots[name] {
+		c.stack[canonical] = true
+		if problem := c.collectProject(canonical, document, newExtras, true); problem != nil {
+			return problem
+		}
+		delete(c.stack, canonical)
 	}
-	delete(c.stack, canonical)
 
 	out := filepath.Join(c.stage, "dependencies", fmt.Sprintf("%02d-%s", len(c.wheels)+1, name))
 	built, problem := wheel.Build(wheel.Request{Context: c.ctx, Tree: canonical, OutDir: out})
