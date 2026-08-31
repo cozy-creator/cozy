@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -216,9 +217,15 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.admission = pb.AdmissionState_ADMISSION_STATE_OPEN
 			}
 		} else {
-			for _, p := range r.Placements {
-				if p.PlacementId == w.placementID {
-					status = p
+			if w.spec.Connection != nil && w.spec.Placement.PlacementSetDigest == "" &&
+				len(r.Placements) == 1 {
+				status = r.Placements[0]
+				w.placementID = status.PlacementId
+			} else {
+				for _, p := range r.Placements {
+					if p.PlacementId == w.placementID {
+						status = p
+					}
 				}
 			}
 			if status != nil {
@@ -232,6 +239,15 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				}
 				for _, digest := range status.MaterializableBindingDigests {
 					materializable[spellOf(digest)] = true
+				}
+				if w.spec.Connection != nil && w.spec.Placement.PlacementSetDigest == "" {
+					w.planIDs = keysOf(dispatchable)
+					for planID := range materializable {
+						if !dispatchable[planID] {
+							w.planIDs = append(w.planIDs, planID)
+						}
+					}
+					sort.Strings(w.planIDs)
 				}
 				for _, f := range status.Faults {
 					w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))

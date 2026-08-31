@@ -673,6 +673,15 @@ func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *e
 	if target == nil || target.Connection == nil {
 		return "", "", ChangeNone, exit.Internalf("rental %s resolved no connected worker", id)
 	}
+	instance := rentalInstanceID(id)
+	c.mu.Lock()
+	live := c.workers[instance]
+	already := live != nil && !live.exited && !live.stopping && live.spec.Connection != nil &&
+		live.spec.Connection.RentalID == id
+	c.mu.Unlock()
+	if already {
+		return instance, "", ChangeNone, c.ensureWorkerClaimed(instance)
+	}
 	spec := WorkerLaunchSpec{Connection: target.Connection}
 	instance, change, problem := c.EnsureWorker(spec)
 	if problem == nil {
@@ -709,6 +718,65 @@ func (c *Orchestrator) ensureWorkerClaimed(instanceID string) *exit.Error {
 		case quiet > silent:
 			return exit.Named(exit.Failed, "worker_silent",
 				"the rented worker did not accept this Creator claim across %d report periods", SilentReports)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
+	logical LogicalPackage) (WorkerLaunchSpec, string, *exit.Error) {
+	silent := SilentReports * ReportCadence
+	for {
+		c.mu.Lock()
+		w := c.workers[instanceID]
+		gone := w == nil || w.exited
+		quiet := time.Duration(0)
+		var refused, desiredRefusal *exit.Error
+		if w != nil {
+			refused, desiredRefusal = w.refusal, w.desiredRefusal
+			if !w.lastReport.IsZero() {
+				quiet = time.Since(w.lastReport)
+			} else if !w.spawned.IsZero() {
+				quiet = time.Since(w.spawned)
+			}
+			if len(w.dispatchable) == 1 && w.placementID != "" &&
+				w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
+				w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision {
+				planID := keysOf(w.dispatchable)[0]
+				w.spec.Placement = DesiredPlacement{
+					Package: pinnedPackage(logical.Package, rentalID), Release: logical.Release,
+					PackageRevisionDigest: logical.ReleaseDigest, InstallID: logical.InstallID,
+					PlacementIDValue: w.placementID,
+					Entrypoints: []Entrypoint{{Name: logical.Function, Digest: planID,
+						Outputs: append([]string(nil), logical.Outputs...)}},
+				}
+				w.planIDs = []string{planID}
+				spec := w.spec
+				c.mu.Unlock()
+				return spec, planID, nil
+			}
+			if w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision &&
+				len(w.dispatchable) > 1 {
+				plans := strings.Join(keysOf(w.dispatchable), ", ")
+				c.mu.Unlock()
+				return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict,
+					"rental.binding_ambiguous",
+					"package %s exposed multiple dispatchable bindings [%s]", logical.Package, plans).
+					WithRemedy("publish one weightless entrypoint for this initial package_set lane")
+			}
+		}
+		c.mu.Unlock()
+		switch {
+		case refused != nil:
+			return WorkerLaunchSpec{}, "", refused
+		case desiredRefusal != nil:
+			return WorkerLaunchSpec{}, "", desiredRefusal
+		case gone:
+			return WorkerLaunchSpec{}, "", exit.New(exit.Failed,
+				"the rented worker exited before making package %s ready", logical.Package)
+		case quiet > silent:
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Failed, "worker_silent",
+				"the rented worker stopped reporting while preparing package %s", logical.Package)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

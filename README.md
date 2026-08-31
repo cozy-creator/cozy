@@ -196,9 +196,11 @@ reads RunPod SKU names or provider prices.
 Rental creation sends only the SKU and introduction credential material—never a package, model,
 request, profile, image, or placement. Tensorhub readiness means the worker location and TLS identity
 are attachable. Creator then claims that worker directly and sends a signed empty `package_set`; no
-WorkerControl frame is relayed through Tensorhub. Non-empty package/model state currently refuses
-until the signed `package_set` delegation protocol is installed; Creator does not reconstruct a
-remote CUDA/qualification closure from a local install as a fallback.
+WorkerControl frame is relayed through Tensorhub. A pinned weightless package release is queued as
+the logical `{package,release}` ref, signed, and sent in `package_set`; Creator learns the derived
+placement/binding from the worker's existing observed-state stream before dispatch. The local
+descriptor validates request/result shape only—it never supplies a remote profile, CUDA choice,
+qualification, wheel closure, or PlacementSet. Model-bound packages remain deferred.
 
 Each rental has one local Ed25519 Creator key and one separate media bearer. Both credentials are
 removed when the rental ends, and a lost Creator key requires a new rental.

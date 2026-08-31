@@ -98,6 +98,7 @@ type Resolver interface {
 	RefreshEditable(pkg string) (installID string, editable, changed bool, problem *exit.Error)
 	ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error)
 	ResolveInstall(installID string) (orchestrator.WorkerLaunchSpec, *exit.Error)
+	ResolveLogicalInstall(installID, function string) (orchestrator.LogicalPackage, *exit.Error)
 	Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error)
 	// Jobs names the `@job` functions one installed package registers, with the
 	// descriptor id each resolves to. The job submit route resolves a function to its

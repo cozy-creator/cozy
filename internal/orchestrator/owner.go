@@ -586,7 +586,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 			c.logf("rental %s has no package_set signer", w.spec.Connection.RentalID)
 			return true
 		}
-		delegation, signature, problem := c.opt.RentalPackageSet(w.spec.Connection)
+		delegation, signature, problem := c.opt.RentalPackageSet(w.spec.Connection, nil, nil)
 		if problem != nil {
 			c.refuseClaim(w, problem)
 			return true

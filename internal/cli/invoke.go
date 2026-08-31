@@ -923,11 +923,20 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 				WithRemedy("`cozy rental` lists this host's rented machines").
 				WithNext("cozy rental")
 		}
-		return Target{}, nil, exit.Named(exit.Unavailable,
-			"rental.download_delegation_unavailable",
-			"machine %s is attachable, but direct package/model download delegation is not installed",
-			row.MachineName).
-			WithRemedy("keep the rental; proto-013 must land before non-empty desired state can run")
+		target.MachineID = row.ID
+	}
+	if target.MachineID != "" {
+		install, problem := installedPackage(ctx, target.Package)
+		if problem != nil {
+			return Target{}, nil, problem.WithRemedy(
+				"install the exact release metadata locally until Tensorhub release detail supplies the descriptor")
+		}
+		descriptor, problem := launch.ReadDescriptor(launch.DescriptorPath(install.Dir), install.PackageDescriptor)
+		if problem != nil {
+			return Target{}, nil, problem
+		}
+		target.InstallID = install.ID
+		return target, descriptor, nil
 	}
 	facts, problem := generationFacts(ctx, target.Package)
 	if problem != nil && problem.Code == exit.NotFound {
@@ -987,6 +996,14 @@ func autoInstallPackage(ctx *Context, pkg string) *exit.Error {
 
 // generationFacts resolves the package's one active install.
 func generationFacts(ctx *Context, pkg string) (*launch.Facts, *exit.Error) {
+	install, e := installedPackage(ctx, pkg)
+	if e != nil {
+		return nil, e
+	}
+	return launch.Read(*install, ctx.Cfg.Home, ctx.Cfg.Tool())
+}
+
+func installedPackage(ctx *Context, pkg string) (*records.PackageInstall, *exit.Error) {
 	l, e := home.Open(ctx.Cfg.Home)
 	if e != nil {
 		return nil, e
@@ -1018,7 +1035,7 @@ func generationFacts(ctx *Context, pkg string) (*launch.Facts, *exit.Error) {
 	if install == nil {
 		return nil, exit.Internalf("%s is pinned to install %s and that row is gone", pkg, chosen.InstallID)
 	}
-	return launch.Read(*install, ctx.Cfg.Home, ctx.Cfg.Tool())
+	return install, nil
 }
 
 // eventText reads one string field out of an event's payload. It is how a pre-attempt

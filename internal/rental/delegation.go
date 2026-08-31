@@ -90,8 +90,9 @@ func SignDownloadDelegation(l home.Layout, connection *orchestrator.WorkerConnec
 	return document, identity.Sign(document), nil
 }
 
-func EmptyPackageSet(l home.Layout) orchestrator.RentalPackageSetSource {
-	return func(connection *orchestrator.WorkerConnection) ([]byte, []byte, *exit.Error) {
-		return SignDownloadDelegation(l, connection, nil, nil, time.Now().Add(30*time.Minute))
+func PackageSetSigner(l home.Layout) orchestrator.RentalPackageSetSource {
+	return func(connection *orchestrator.WorkerConnection, packages []*pb.DownloadPackageRef,
+		models []*pb.DownloadModelRef) ([]byte, []byte, *exit.Error) {
+		return SignDownloadDelegation(l, connection, packages, models, time.Now().Add(30*time.Minute))
 	}
 }

@@ -606,6 +606,34 @@ func (s *Store) RequestRow(id string) (*Request, *exit.Error) {
 	return &r, nil
 }
 
+// BindRequestPlan records the one binding digest learned from the worker after
+// logical package_set resolution. The client never supplies this value.
+func (s *Store) BindRequestPlan(id, planID string) *exit.Error {
+	if id == "" || planID == "" {
+		return exit.Internalf("cannot bind an empty request or plan identity")
+	}
+	result, err := s.db.Exec(`UPDATE requests SET plan_id=? WHERE id=? AND plan_id=''`, planID, id)
+	if err != nil {
+		return exit.Internalf("cannot bind request %s plan: %s", id, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return exit.Internalf("cannot read request %s plan binding result: %s", id, err)
+	}
+	if changed == 1 {
+		return nil
+	}
+	var held string
+	if err := s.db.QueryRow(`SELECT plan_id FROM requests WHERE id=?`, id).Scan(&held); err != nil {
+		return exit.Internalf("cannot read request %s plan binding: %s", id, err)
+	}
+	if held != planID {
+		return exit.Named(exit.Conflict, "request_plan_changed",
+			"request %s already binds plan %s, not %s", id, held, planID)
+	}
+	return nil
+}
+
 // RequestByIdempotencyKey resolves the durable identity before a retry touches any
 // caller-owned resources. In particular, a settled request's original and staged asset
 // files may both be gone; its recorded semantic body is still the answer for that key.

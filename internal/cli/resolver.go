@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -211,16 +212,47 @@ func (r *Resolver) ResolveInstall(installID string) (orchestrator.WorkerLaunchSp
 	return facts.Spec(r.Devices)
 }
 
+func (r *Resolver) ResolveLogicalInstall(installID, function string) (orchestrator.LogicalPackage, *exit.Error) {
+	install, descriptor, e := r.installDescriptor(installID)
+	if e != nil {
+		return orchestrator.LogicalPackage{}, e
+	}
+	entrypoint, e := descriptor.Function(function)
+	if e != nil {
+		return orchestrator.LogicalPackage{}, e
+	}
+	if len(descriptor.Entrypoints) != 1 || len(entrypoint.Models) != 0 {
+		return orchestrator.LogicalPackage{}, exit.Named(exit.Unavailable,
+			"rental.logical_package_unsupported",
+			"private package_set currently admits one weightless entrypoint and no model slots")
+	}
+	if install.SourceKind != "tensorhub" || !install.Verified {
+		return orchestrator.LogicalPackage{}, exit.Named(exit.Unavailable,
+			"rental.package_release_unpublished",
+			"private package_set requires an immutable Tensorhub package release")
+	}
+	if _, err := canonical.Raw(install.SourceDigest); err != nil {
+		return orchestrator.LogicalPackage{}, exit.Named(exit.Structural,
+			"rental.package_release_digest_invalid",
+			"installed package %s has no valid immutable release digest", install.Package)
+	}
+	return orchestrator.LogicalPackage{
+		Package: install.Package, Release: install.Version, ReleaseDigest: install.SourceDigest,
+		InstallID: install.ID, Function: function,
+		Outputs: launch.AssetPaths(entrypoint.Result),
+	}, nil
+}
+
 // Entrypoint returns one exact install's verified request/result schema.
 func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error) {
-	facts, e := r.installFacts(installID)
+	_, descriptor, e := r.installDescriptor(installID)
 	if e != nil {
 		return nil, e
 	}
-	return facts.PackageDescriptor.Function(name)
+	return descriptor.Function(name)
 }
 
-func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
+func (r *Resolver) installRecord(installID string) (*records.PackageInstall, *exit.Error) {
 	install, e := r.store.Install(strings.TrimSpace(installID))
 	if e != nil {
 		return nil, e
@@ -229,6 +261,27 @@ func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
 		return nil, exit.New(exit.NotFound,
 			"request install %s is no longer present", installID).
 			WithRemedy("the durable request retains its immutable install until terminal")
+	}
+	return install, nil
+}
+
+func (r *Resolver) installDescriptor(installID string) (*records.PackageInstall,
+	*launch.PackageDescriptor, *exit.Error) {
+	install, e := r.installRecord(installID)
+	if e != nil {
+		return nil, nil, e
+	}
+	descriptor, e := launch.ReadDescriptor(launch.DescriptorPath(install.Dir), install.PackageDescriptor)
+	if e != nil {
+		return nil, nil, e
+	}
+	return install, descriptor, nil
+}
+
+func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
+	install, e := r.installRecord(installID)
+	if e != nil {
+		return nil, e
 	}
 	return launch.Read(*install, r.cfg.Home, r.cfg.Tool())
 }
