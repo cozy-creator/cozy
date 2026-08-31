@@ -184,7 +184,7 @@ func TestLocalAPIDoor(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "records.db"))
 	fatal(t, problem)
 	fatal(t, store.RecordRental(records.Rental{
-		ID: "rental-down-arm", PackageRef: "cozy/fake/v1/run",
+		ID:               "rental-down-arm",
 		AcceleratorModel: "CPU", State: "ready", Hub: "https://hub.invalid",
 	}))
 	blocked := svc.call(t, "POST", "/v1/local/daemon/down", map[string]bool{"all": false})

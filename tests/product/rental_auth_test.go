@@ -75,13 +75,14 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 		t.Fatalf("ClaimProof differs from worker-protocol vector:\n got %s\nwant %s", fixedClaim, wantClaim)
 	}
 
-	request, problem := hub.RentalRequestBytes("cozy/marco-polo/v1/marco", nil, "cpu",
-		strings.Repeat("1", 64), identity.PublicKey())
+	request, problem := hub.RentalRequestBytes("cpu", strings.Repeat("1", 64),
+		identity.PublicKey(), 0, 0)
 	fatal(t, problem)
 	var body map[string]any
 	must(t, json.Unmarshal(request, &body))
 	if body["creator_public_key"] != identity.PublicKey() ||
-		body["media_token_sha256"] != strings.Repeat("1", 64) || body["renter_token_sha256"] != nil {
+		body["media_token_sha256"] != strings.Repeat("1", 64) || body["package_ref"] != nil ||
+		body["model_selections"] != nil || body["renter_token_sha256"] != nil {
 		t.Fatalf("rental create authority is not the hardcut shape: %s", request)
 	}
 }

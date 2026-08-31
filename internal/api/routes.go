@@ -70,8 +70,8 @@ var Routes = []Route{
 
 	// ---- the LOCAL extension module ----
 	{"POST", "/v1/local/rentals/{rental_id}/claim", Local, true, true, false, "",
-		"attach the daemon to one already-provisioned private worker",
-		"`cozy rental new` convergence"},
+		"attach the daemon directly to one generic empty private worker",
+		"`cozy rental new` attachment"},
 	{"DELETE", "/v1/local/rentals/{rental_id}/claim", Local, true, true, false, "",
 		"detach one rented worker and wait for its control loop to stop",
 		"`cozy rental end` credential cleanup"},

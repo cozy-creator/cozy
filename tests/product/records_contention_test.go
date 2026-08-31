@@ -33,8 +33,7 @@ func TestRentalRecordWaitsForAnotherProcessWriter(t *testing.T) {
 	go func() {
 		if problem := store.RecordRental(records.Rental{
 			ID: "pr-lock-proof", MachineName: "lock-proof", SKU: "cpu-test",
-			PackageRef: "paul/marco-polo-package/v1/marco", State: "booting",
-			Hub: "https://tensorhub.com",
+			State: "booting", Hub: "https://tensorhub.com",
 		}); problem != nil {
 			done <- problem
 			return

@@ -57,9 +57,6 @@ type Options struct {
 	// not hardware evidence: a rented worker is not dispatchable until this callback has
 	// durably joined its actual accelerator and worker identity to the rental.
 	ObserveRental func(RentalObservation) *exit.Error
-	// RecordRentalRefusal persists this owner's non-transient verdict on a private worker
-	// before the control stream closes. Without it a rejected ClaimAck exists only in RAM.
-	RecordRentalRefusal func(rentalID string, problem *exit.Error) *exit.Error
 	// RentalClaimProof signs the exact worker/boot/TLS leaf Creator is about to claim.
 	RentalClaimProof RentalClaimProofSource
 	// ConfigDigest is the local evaluated-config identity. Environment identity

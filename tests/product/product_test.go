@@ -255,16 +255,14 @@ func TestRentalCommandsSeparateInventoryFromCatalog(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "records.db"))
 	fatal(t, problem)
 	problem = store.RecordRental(records.Rental{
-		ID: "rnt-proof", MachineName: "studio", SKU: "h200", PackageRef: "proof/example/v1/generate",
+		ID: "rnt-proof", MachineName: "studio", SKU: "h200",
 		AcceleratorModel: "NVIDIA H200 SXM", State: "ready", Hub: "https://tensorhub.test",
-		SelectionProfile: "torch2.13.0-cu130-cp314-linux-x86", ObservedDriverVersion: "580.126.20",
 	})
 	fatal(t, problem)
 	store.Close()
 
 	if code, out := runCozy(t, root, "rental"); code != 0 ||
-		!strings.Contains(out, "studio") || !strings.Contains(out, "h200") ||
-		!strings.Contains(out, "torch 2.13.0") || !strings.Contains(out, "CUDA 13.0") {
+		!strings.Contains(out, "studio") || !strings.Contains(out, "h200") {
 		t.Fatalf("bare rental did not show current machines [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "rental", "list"); code != 2 ||
@@ -288,7 +286,7 @@ func TestRentalCommandsSeparateInventoryFromCatalog(t *testing.T) {
 	}
 	if code, out := runCozyDir(t, root, ".", []string{"TENSORHUB_URL=" + server.URL},
 		"rental", "new", "--name", "studio"); code != 2 ||
-		!strings.Contains(out, "options require a GPU SKU and package") {
+		!strings.Contains(out, "options require a GPU SKU") {
 		t.Fatalf("catalog view silently accepted rental options [exit %d]\n%s", code, out)
 	}
 }
@@ -725,8 +723,8 @@ func TestRentalGPUCatalog(t *testing.T) {
 		document.GPUs[1]["price"] != "$1.25/hr" {
 		t.Fatalf("rental catalog values drifted: %#v", document.GPUs)
 	}
-	if result := runCozyEnv(env, "rental", "new", "h200"); result.code != 2 || !strings.Contains(result.output, "org/package/vN/function") {
-		t.Fatalf("selected GPU without package did not explain the remaining argument [exit %d]\n%s", result.code, result.output)
+	if result := runCozyEnv(env, "rental", "new", "h200", "extra"); result.code != 2 || !strings.Contains(result.output, "unexpected argument") {
+		t.Fatalf("generic rental accepted a second positional argument [exit %d]\n%s", result.code, result.output)
 	}
 }
 

@@ -115,8 +115,8 @@ type Options struct {
 	Log          io.Writer
 	Web          http.Handler
 	Packages     Resolver
-	// Rentals resolves an attached worker's exact non-secret placement; nil means this
-	// host attaches no remote workers.
+	// Rentals validates one attached generic worker id; desired package/model state is
+	// sent separately over WorkerControl.
 	Rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 	// Shutdown is the cooperative-down hook the shutdown route calls (#449).
 	Shutdown func()

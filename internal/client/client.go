@@ -233,8 +233,7 @@ type StartResult struct {
 	Note       string `json:"note"`
 }
 
-// EnsureRental claims one attached rented worker without invoking a model. Its
-// ClaimAck actual-hardware readback becomes durable before this returns ready.
+// EnsureRental directly claims one attached empty worker and waits for ClaimAck.
 func (c *Client) EnsureRental(rentalID string) (StartResult, *exit.Error) {
 	var res StartResult
 	e := c.call("POST", "/v1/local/rentals/"+url.PathEscape(rentalID)+"/claim", map[string]any{}, &res)

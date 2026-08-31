@@ -178,12 +178,11 @@ reuse; job workers are reclaimed at terminal.
 
 ## Private rentals
 
-With Tensorhub configured, rent a private worker for an exact package:
+With Tensorhub configured, rent generic private capacity:
 
 ```sh
 cozy rental new                    # Cozy GPUs, VRAM, and retail hourly prices
-cozy rental new h200 org/package/v1/generate \
-	--name studio \
+cozy rental new h200 --name studio \
   --idempotency-key <unique-key>
 
 cozy rental                        # current rented machines
@@ -194,11 +193,15 @@ cozy rental end studio
 GPU names and prices come from Tensorhub's Cozy-owned rental catalog. Creator never exposes or
 reads RunPod SKU names or provider prices.
 
-Each rental has one local Ed25519 Creator key and one separate media bearer. Creator signs the
-exact worker/boot/TLS identity it claims and sends only signed package/model intent over
-WorkerControl. The worker resolves and downloads those artifacts directly from Tensorhub; Creator
-never requests or relays package/model download URLs. Both credentials are removed when the rental
-ends, and a lost Creator key requires a new rental.
+Rental creation sends only the SKU and introduction credential material—never a package, model,
+request, profile, image, or placement. Tensorhub readiness means the worker location and TLS identity
+are attachable. Creator then claims that worker directly and sends an empty desired state; no
+WorkerControl frame is relayed through Tensorhub. Non-empty package/model state currently refuses
+until the signed `package_set` delegation protocol is installed; Creator does not reconstruct a
+remote CUDA/qualification closure from a local install as a fallback.
+
+Each rental has one local Ed25519 Creator key and one separate media bearer. Both credentials are
+removed when the rental ends, and a lost Creator key requires a new rental.
 
 Rentals can continue billing until Tensorhub confirms their termination. `rental end` and
 `down --all` keep the Cozy daemon alive when remote absence cannot be confirmed.

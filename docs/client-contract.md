@@ -61,9 +61,10 @@ Any non-empty value refuses as `501 override_unresolved`; it is never silently i
 `worker` is a **LOCAL ADDITION**: it pins the request to an attached rental by id. An id
 this Cozy daemon does not hold is `404` before a request row exists. The pin is not in
 the idempotency digest because it selects where the same work runs, not what the work is.
-A new rental cannot be pinned until its exact desired placement has been accepted,
-converged, and reported dispatchable; otherwise submission refuses as
-`rental.convergence_pending`.
+A new rental is generic empty capacity and becomes attachable when Tensorhub publishes its
+pinned worker location. Non-empty remote work currently refuses as
+`rental.download_delegation_unavailable` until the signed `package_set` protocol is installed;
+Creator never substitutes a locally reconstructed platform qualification.
 
 `local_assets` is the CLI-only local extension for `--asset
 <field-path>=<file>`. Each row names the exact request-schema field path plus a source
@@ -240,7 +241,7 @@ URLs but remain local-scope rows in the same guarded route table.
 
 | route | scope | auth | notes |
 |---|---|---|---|
-| `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the daemon to one already-provisioned private worker |
+| `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the daemon to one generic empty private worker and directly claim WorkerControl |
 | `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | detach that worker and wait for its control loop before rental credentials are removed |
 | `POST /v1/local/daemon/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
 | `POST /v1/local/daemon/down` | local | yes | safe down fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |

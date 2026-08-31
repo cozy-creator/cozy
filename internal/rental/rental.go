@@ -292,13 +292,6 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 	}
 }
 
-// RecordControlRefusal makes a private-worker Claim or owner-side identity refusal durable.
-func RecordControlRefusal(st *records.Store) func(string, *exit.Error) *exit.Error {
-	return func(rentalID string, problem *exit.Error) *exit.Error {
-		return st.RecordRentalControlRefusal(rentalID, problem)
-	}
-}
-
 // ObserveWorker turns a remote ClaimAck into the rental's durable actual-hardware
 // readback. It is wired into the orchestrator so no remote session can become
 // dispatchable without crossing this records boundary.

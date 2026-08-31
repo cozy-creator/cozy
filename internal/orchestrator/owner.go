@@ -499,12 +499,6 @@ func (c *Orchestrator) refuseClaim(w *worker, e *exit.Error) {
 	w.refusal = e
 	c.mu.Unlock()
 	c.logf("REFUSING the claimed worker %s (%s): %s", w.instanceID, e.ErrName(), e.Message)
-	if w.spec.Connection != nil && c.opt.RecordRentalRefusal != nil {
-		if problem := c.opt.RecordRentalRefusal(w.spec.Connection.RentalID, e); problem != nil {
-			c.logf("rental %s claim refusal was not persisted: %s",
-				w.spec.Connection.RentalID, problem.Message)
-		}
-	}
 }
 
 // onSnapshot is THE ONE DIGEST-ACKED BARRIER (§5). The three-message
