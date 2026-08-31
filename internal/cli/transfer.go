@@ -107,16 +107,18 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		}
 		manifestID = row.ManifestDigest
 		evidenceRef = hub.Ref{Org: "local", Name: name}
-	} else if strings.ContainsRune(subject, os.PathSeparator) || strings.HasPrefix(subject, ".") {
-		// A path is an INGEST subject, not a publish subject (decisions #58's two-step
-		// model): the border runs where the bytes are, and only a canonical manifest
-		// is publishable. Refusing by name beats growing a second border here.
-		return exit.Usagef("%q is a path, and a path is not publishable", subject).
-			WithRemedy("ingest it first and publish the manifest id TensorFS prints").
-			WithNext("cozy help model publish")
 	} else {
 		manifestID, e = tfs.ManifestID(subject)
 		if e != nil {
+			cwd, err := os.Getwd()
+			if err != nil {
+				return exit.Internalf("cannot resolve the current directory: %s", err)
+			}
+			if source, sourceProblem := modelsource.Parse(subject, cwd); sourceProblem == nil {
+				return exit.Named(exit.Structural, "model_source_planner_unavailable",
+					"%s is a valid model source, but this TensorFS build cannot derive its closed ingest plan", source.Canonical).
+					WithRemedy("the byte plane must supply reviewed component, encoding, and construction-order facts; Creator will not infer them from filenames")
+			}
 			return e
 		}
 	}

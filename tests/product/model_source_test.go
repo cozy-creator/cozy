@@ -94,3 +94,14 @@ func TestTensorhubDestinationCannotUseLocalNamespace(t *testing.T) {
 		t.Fatalf("local Tensorhub destination = exit %d\n%s", result.code, result.output)
 	}
 }
+
+func TestRecognizedForeignSourceRefusesBeforeTensorFSOrNetwork(t *testing.T) {
+	root := t.TempDir()
+	result := runCozyEnv([]string{"COZY_HOME=" + root, "PATH=/usr/local/bin:/usr/bin:/bin"},
+		"model", "publish", "acme/model", "hf://org/model@"+strings.Repeat("a", 40),
+		"--release", "1.0.0", "--lane", "bf16")
+	if result.code != 1 || !strings.Contains(result.output, "closed ingest plan") ||
+		!strings.Contains(result.output, "Creator will not infer") {
+		t.Fatalf("recognized foreign source = exit %d\n%s", result.code, result.output)
+	}
+}
