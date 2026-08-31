@@ -2100,12 +2100,13 @@ func (x *ModelSourceProfile) GetProfile() string {
 }
 
 type PreparedModelSource struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Slot          string                 `protobuf:"bytes,1,opt,name=slot,proto3" json:"slot,omitempty"`
-	Profile       string                 `protobuf:"bytes,2,opt,name=profile,proto3" json:"profile,omitempty"`
-	Manifest      *Ref                   `protobuf:"bytes,3,opt,name=manifest,proto3" json:"manifest,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                         protoimpl.MessageState `protogen:"open.v1"`
+	Slot                          string                 `protobuf:"bytes,1,opt,name=slot,proto3" json:"slot,omitempty"`
+	Profile                       string                 `protobuf:"bytes,2,opt,name=profile,proto3" json:"profile,omitempty"`
+	Manifest                      *Ref                   `protobuf:"bytes,3,opt,name=manifest,proto3" json:"manifest,omitempty"`
+	ReleaseEvidenceCanonicalBytes []byte                 `protobuf:"bytes,4,opt,name=release_evidence_canonical_bytes,json=releaseEvidenceCanonicalBytes,proto3" json:"release_evidence_canonical_bytes,omitempty"` // exact TensorFS ReleaseEvidence/1 bytes;
+	unknownFields                 protoimpl.UnknownFields
+	sizeCache                     protoimpl.SizeCache
 }
 
 func (x *PreparedModelSource) Reset() {
@@ -2155,6 +2156,13 @@ func (x *PreparedModelSource) GetProfile() string {
 func (x *PreparedModelSource) GetManifest() *Ref {
 	if x != nil {
 		return x.Manifest
+	}
+	return nil
+}
+
+func (x *PreparedModelSource) GetReleaseEvidenceCanonicalBytes() []byte {
+	if x != nil {
+		return x.ReleaseEvidenceCanonicalBytes
 	}
 	return nil
 }
@@ -6574,6 +6582,7 @@ type ArtifactReceipt struct {
 	ArtifactTransactionId         string                 `protobuf:"bytes,5,opt,name=artifact_transaction_id,json=artifactTransactionId,proto3" json:"artifact_transaction_id,omitempty"`
 	TensorfsReceiptDigest         string                 `protobuf:"bytes,6,opt,name=tensorfs_receipt_digest,json=tensorfsReceiptDigest,proto3" json:"tensorfs_receipt_digest,omitempty"`
 	TensorfsReceiptCanonicalBytes []byte                 `protobuf:"bytes,7,opt,name=tensorfs_receipt_canonical_bytes,json=tensorfsReceiptCanonicalBytes,proto3" json:"tensorfs_receipt_canonical_bytes,omitempty"`
+	ReleaseEvidenceCanonicalBytes []byte                 `protobuf:"bytes,8,opt,name=release_evidence_canonical_bytes,json=releaseEvidenceCanonicalBytes,proto3" json:"release_evidence_canonical_bytes,omitempty"` // exact TensorFS ReleaseEvidence/1 bytes;
 	unknownFields                 protoimpl.UnknownFields
 	sizeCache                     protoimpl.SizeCache
 }
@@ -6653,6 +6662,13 @@ func (x *ArtifactReceipt) GetTensorfsReceiptDigest() string {
 func (x *ArtifactReceipt) GetTensorfsReceiptCanonicalBytes() []byte {
 	if x != nil {
 		return x.TensorfsReceiptCanonicalBytes
+	}
+	return nil
+}
+
+func (x *ArtifactReceipt) GetReleaseEvidenceCanonicalBytes() []byte {
+	if x != nil {
+		return x.ReleaseEvidenceCanonicalBytes
 	}
 	return nil
 }
@@ -11313,11 +11329,12 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x04path\x18\x04 \x01(\tR\x04path\"B\n" +
 	"\x12ModelSourceProfile\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\tR\x04slot\x12\x18\n" +
-	"\aprofile\x18\x02 \x01(\tR\aprofile\"t\n" +
+	"\aprofile\x18\x02 \x01(\tR\aprofile\"\xbd\x01\n" +
 	"\x13PreparedModelSource\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\tR\x04slot\x12\x18\n" +
 	"\aprofile\x18\x02 \x01(\tR\aprofile\x12/\n" +
-	"\bmanifest\x18\x03 \x01(\v2\x13.cozy.worker.v1.RefR\bmanifest\"\xbc\x02\n" +
+	"\bmanifest\x18\x03 \x01(\v2\x13.cozy.worker.v1.RefR\bmanifest\x12G\n" +
+	" release_evidence_canonical_bytes\x18\x04 \x01(\fR\x1dreleaseEvidenceCanonicalBytes\"\xbc\x02\n" +
 	"\x19PrepareModelSourceRequest\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\tR\voperationId\x126\n" +
 	"\x17source_selection_digest\x18\x02 \x01(\fR\x15sourceSelectionDigest\x12>\n" +
@@ -11698,7 +11715,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x11artifact_receipts\x18\f \x03(\v2\".cozy.worker.v1.ArtifactReceiptRefR\x10artifactReceipts\"\x95\x01\n" +
 	"\x12ArtifactReceiptRef\x126\n" +
 	"\x17artifact_receipt_digest\x18\x01 \x01(\fR\x15artifactReceiptDigest\x12G\n" +
-	" artifact_receipt_canonical_bytes\x18\x02 \x01(\fR\x1dartifactReceiptCanonicalBytes\"\xf4\x02\n" +
+	" artifact_receipt_canonical_bytes\x18\x02 \x01(\fR\x1dartifactReceiptCanonicalBytes\"\xbd\x03\n" +
 	"\x0fArtifactReceipt\x122\n" +
 	"\x15owner_authority_scope\x18\x01 \x01(\tR\x13ownerAuthorityScope\x12\x1d\n" +
 	"\n" +
@@ -11708,7 +11725,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"outputSlot\x126\n" +
 	"\x17artifact_transaction_id\x18\x05 \x01(\tR\x15artifactTransactionId\x126\n" +
 	"\x17tensorfs_receipt_digest\x18\x06 \x01(\tR\x15tensorfsReceiptDigest\x12G\n" +
-	" tensorfs_receipt_canonical_bytes\x18\a \x01(\fR\x1dtensorfsReceiptCanonicalBytes\"j\n" +
+	" tensorfs_receipt_canonical_bytes\x18\a \x01(\fR\x1dtensorfsReceiptCanonicalBytes\x12G\n" +
+	" release_evidence_canonical_bytes\x18\b \x01(\fR\x1dreleaseEvidenceCanonicalBytes\"j\n" +
 	"\x14ArtifactObjectSource\x12\x1b\n" +
 	"\tobject_id\x18\x01 \x01(\tR\bobjectId\x12\x16\n" +
 	"\x06length\x18\x02 \x01(\x04R\x06length\x12\x1d\n" +
