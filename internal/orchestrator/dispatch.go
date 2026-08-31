@@ -889,7 +889,11 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 		}
 		return req.PackageRevisionDigest, req.EnvironmentDigest, req.ConfigDigest, nil
 	}
-	return packageRevision, environment, c.opt.ConfigDigest, nil
+	if !validDigest(w.configDigest) {
+		return "", "", "", exit.Named(exit.Structural, "placement_identity_missing",
+			"worker %s carries no installed package config digest", w.instanceID)
+	}
+	return packageRevision, environment, w.configDigest, nil
 }
 
 func spellOf(raw []byte) string {

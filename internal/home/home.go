@@ -57,6 +57,9 @@ type Layout struct {
 	// address, pod id, state — are rows in the one records authority; only what must not
 	// be readable by another user on this host lives out here as files.
 	Rentals string
+	// LocalBase is the one Runtime-authored observation of the trusted local
+	// CPython environment. Package rows do not duplicate or select it.
+	LocalBase string
 }
 
 func Open(root string) (Layout, *exit.Error) {
@@ -89,6 +92,7 @@ func Open(root string) (Layout, *exit.Error) {
 	}
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
+	l.LocalBase = filepath.Join(root, "local-base.json")
 	for _, dir := range []string{l.Generations, l.Workers, l.Outputs, l.Triage, l.Publications} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)

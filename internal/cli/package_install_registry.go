@@ -12,6 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
@@ -40,12 +41,19 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	runtimeBin, problem := launch.RefreshLocalBase(existingLayout.Root, existingLayout.LocalBase,
+		ctx.Cfg.Tool())
+	if problem != nil {
+		existing.Close()
+		return problem
+	}
 	_, generation, problem := existing.ActivePackage(ref.String())
 	if problem != nil {
 		existing.Close()
 		return problem
 	}
-	if generation != nil && generation.SourceDigest == releaseDigest {
+	if generation != nil && generation.SourceDigest == releaseDigest &&
+		launch.PreparedOnLocalBase(*generation, existingLayout.LocalBase) {
 		defer existing.Close()
 		return emitInstallResult(ctx, existingLayout, existing, &install.Result{Gen: *generation, Idempotent: true})
 	}
@@ -78,6 +86,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		var installProblem *exit.Error
 		result, installProblem = install.Run(layout, st, install.Request{
 			Ref: install.Ref{Package: ref.String()}, Force: true, Published: published,
+			Runtime: runtimeBin,
 		})
 		return installProblem
 	})

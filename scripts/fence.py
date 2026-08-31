@@ -814,16 +814,17 @@ def check_typed_resources():
 
 
 def check_python_seat():
-    """Published environments have one hard CPython seat, never a parsed alias."""
-    path = pathlib.Path("internal/install/venv.go")
+    """Published local execution delegates one exact CPython 3.12 base to Runtime."""
+    path = pathlib.Path("internal/install/published.go")
     text = path.read_text()
     bad = []
-    for required in ('if abi != "cp312"', 'return "3.12", nil'):
+    for required in ('"prepare-package"', '"--base-manifest"', 'Python: "CPython 3.12"'):
         if required not in text:
             bad.append(f"{path}: [python] missing exact CPython 3.12 seat {required!r}")
-    for deleted in ("cp314", "3.14"):
-        if deleted in text:
-            bad.append(f"{path}: [python] deleted Python seat remains: {deleted}")
+    install = pathlib.Path("internal/install/install.go").read_text()
+    for deleted in ("MaterializePublishedEnvironment", "pythonForABI", "cp314", "3.14"):
+        if deleted in text + install:
+            bad.append(f"internal/install: [python] deleted published environment path remains: {deleted}")
 
     fixtures = (
         pathlib.Path("tests/product/testdata/build-weightless.py"),
@@ -839,12 +840,9 @@ def check_python_seat():
                 bad.append(f"{fixture}: [python] deleted Python seat remains: {deleted}")
 
     profiles = pathlib.Path("tests/product/package_release_client_test.go").read_text()
-    for expected in (
-        "torch2.13.0-cpu-cp312-linux-x86",
-        "torch2.13.0-cu130-cp312-linux-x86",
-    ):
-        if expected not in profiles:
-            bad.append(f"tests/product/package_release_client_test.go: [python] missing {expected}")
+    for deleted in ("torch2.13.0-cpu-cp312-linux-x86", "torch2.13.0-cu130-cp312-linux-x86"):
+        if deleted in profiles:
+            bad.append(f"tests/product/package_release_client_test.go: [python] retired profile remains: {deleted}")
     launcher = pathlib.Path("internal/orchestrator/worker.go").read_text()
     if "--instance-id" in launcher:
         bad.append("internal/orchestrator/worker.go: [python] Creator still passes Runtime's deleted --instance-id")

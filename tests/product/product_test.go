@@ -840,6 +840,22 @@ esac
 	}
 }
 
+func TestUpDoesNotRequireLocalRuntime(t *testing.T) {
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "up-without-local-runtime")
+	must(t, os.RemoveAll(root))
+	env := childEnv(t, root, "PATH="+t.TempDir())
+	t.Cleanup(func() { _ = runCozyEnv(env, "down", "--all") })
+
+	result := runCozyEnv(env, "up", "--json", "--full")
+	if result.code != 0 {
+		t.Fatalf("remote-capable daemon required a local Runtime [exit %d]\n%s",
+			result.code, result.output)
+	}
+	if _, err := os.Stat(filepath.Join(root, "local-base.json")); !os.IsNotExist(err) {
+		t.Fatalf("up created local package state without a local install: %v", err)
+	}
+}
+
 func TestRentalGPUCatalog(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v1/rental-skus" {
