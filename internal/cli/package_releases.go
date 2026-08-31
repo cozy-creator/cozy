@@ -35,6 +35,26 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()
 	defer cancel()
+	detail, lookupProblem := c.PackageRelease(hctx, ref, release)
+	if lookupProblem == nil {
+		if detail.Release.Release != release {
+			return exit.Internalf("package lookup returned release %q, want %q",
+				detail.Release.Release, release)
+		}
+		if _, err := canonical.Raw(detail.Release.ReleaseDigest); err != nil {
+			return exit.Internalf("published package has no exact release digest")
+		}
+		packagePublishStatus(ctx, "Release already published; no build or upload needed.")
+		return emit(ctx, compactRecord([]output.Field{
+			{K: "package", V: ref.String()}, {K: "release", V: release},
+			{K: "status", V: "already published"}, {K: "changed", V: false},
+			{K: "release_digest", V: detail.Release.ReleaseDigest},
+			{K: "uploaded", V: output.Bytes(0)}, {K: "hub", V: c.Base()},
+		}, "package", "release", "status"))
+	}
+	if lookupProblem.Code != exit.NotFound {
+		return lookupProblem
+	}
 	if problem := packagePublishStage(ctx, "Building package wheel and local dependencies", func() *exit.Error {
 		return pack.Build(hctx)
 	}); problem != nil {

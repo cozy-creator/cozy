@@ -42,6 +42,7 @@ func TestPackageReleaseClientContract(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "uploads": []map[string]any{
 				{"kind": "project_wheel", "path": "project.whl", "url": "https://storage.invalid/project", "required_headers": map[string]string{}, "already_uploaded": false},
+				{"kind": "descriptor", "path": "descriptor.json", "url": "https://storage.invalid/descriptor", "required_headers": map[string]string{}, "already_uploaded": false},
 				{"kind": "source", "path": "package.toml", "url": "https://storage.invalid/source", "required_headers": map[string]string{}, "already_uploaded": false},
 				{"kind": "dependency_wheel", "path": "proof_dependency-1.0.0-py3-none-any.whl", "url": "https://storage.invalid/dependency", "required_headers": map[string]string{}, "already_uploaded": false},
 			}})
@@ -49,7 +50,7 @@ func TestPackageReleaseClientContract(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == publishPath+"/finalize":
 			assertEmptyObject(t, r.Body)
 			_ = json.NewEncoder(w).Encode(map[string]any{"state": "committed",
-				"qualification_state": "qualified", "release_digest": "sha256:" + strings.Repeat("a", 64)})
+				"release_digest": "sha256:" + strings.Repeat("a", 64)})
 			return
 		default:
 			http.NotFound(w, r)
@@ -61,8 +62,9 @@ func TestPackageReleaseClientContract(t *testing.T) {
 
 	draft, problem := client.DeclarePackageRelease(context.Background(), ref, "1.0.0",
 		[]string{"package.toml"}, []string{"proof_dependency-1.0.0-py3-none-any.whl"}, "proof publish")
-	if problem != nil || draft.State != "pending" || len(draft.Uploads) != 3 ||
-		draft.Uploads[0].Kind != "project_wheel" || draft.Uploads[2].Kind != "dependency_wheel" {
+	if problem != nil || draft.State != "pending" || len(draft.Uploads) != 4 ||
+		draft.Uploads[0].Kind != "project_wheel" || draft.Uploads[1].Kind != "descriptor" ||
+		draft.Uploads[3].Kind != "dependency_wheel" {
 		t.Fatalf("declaration response changed: %+v problem=%v", draft, problem)
 	}
 	committed, problem := client.CommitPackageRelease(context.Background(), ref, "1.0.0", "proof publish")
@@ -178,6 +180,7 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 	project := t.TempDir()
 	writePublishProject(t, project, "wire-package", "1.0.0", nil, "", true)
+	lockPublishProject(t, project)
 	for i := range 48 {
 		name := filepath.Join(project, "wire_package", fmt.Sprintf("source_%02d.py", i))
 		must(t, os.WriteFile(name, []byte("VALUE = 1\n"), 0o644))
@@ -214,6 +217,10 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 				"already_uploaded": false, "kind": "project_wheel",
 				"path":             "project.whl",
 				"required_headers": map[string]string{}, "url": server.URL + "/storage/project",
+			}, {
+				"already_uploaded": false, "kind": "descriptor",
+				"path":             "descriptor.json",
+				"required_headers": map[string]string{}, "url": server.URL + "/storage/descriptor",
 			}}
 			for i, path := range body.Paths {
 				uploads = append(uploads, map[string]any{
@@ -226,7 +233,7 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == publishPath+"/finalize":
 			finalized.Add(1)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"state": "committed", "qualification_state": "qualified",
+				"state":          "committed",
 				"release_digest": "sha256:" + strings.Repeat("4", 64),
 			})
 		default:
@@ -241,8 +248,8 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 		strings.Contains(out, "package_release_digest:") || strings.Contains(out, "qualification:") ||
 		!strings.Contains(out, "Building package wheel and local dependencies...") ||
 		!strings.Contains(out, "Declaring 52 source files and 0 dependency wheels...") ||
-		!strings.Contains(out, "Uploading files: 0/53") ||
-		!strings.Contains(out, "Uploading files: 53/53") ||
+		!strings.Contains(out, "Uploading files: 0/54") ||
+		!strings.Contains(out, "Uploading files: 54/54") ||
 		!strings.Contains(out, "Committing exact package release...") {
 		t.Fatalf("pending package wire flow failed [exit %d]\n%s", code, out)
 	}

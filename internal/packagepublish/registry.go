@@ -28,6 +28,7 @@ import (
 var platformOwnedRoots = map[string]bool{
 	"av":                true,
 	"cffi":              true,
+	"click":             true,
 	"cozy-runtime":      true, //cozy:allow base distribution identity, not executable access
 	"cryptography":      true,
 	"filelock":          true,

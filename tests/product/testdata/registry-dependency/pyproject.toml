@@ -6,10 +6,13 @@ build-backend = "uv_build"
 name = "registry-dependency-proof"
 version = "1.0.0"
 requires-python = ">=3.12"
-dependencies = ["humanize==4.13.0"]
+dependencies = ["cozy-runtime==0.0.11", "humanize==4.13.0"]
 
 [tool.uv.build-backend]
 module-root = ""
 
 [tool.cozy]
 organization = "proof"
+
+[tool.uv.sources]
+cozy-runtime = { path = "__COZY_RUNTIME_FIXTURE__", editable = true }

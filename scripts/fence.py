@@ -818,6 +818,12 @@ def check_python_seat():
     path = pathlib.Path("internal/install/venv.go")
     text = path.read_text()
     bad = []
+    publication = pathlib.Path("internal/packagepublish/package.go").read_text()
+    for forbidden in ("PYTHONPATH=", "PYTHONHOME="):
+        if forbidden in publication:
+            bad.append(
+                f"internal/packagepublish/package.go: [python] publication injects {forbidden[:-1]}"
+            )
     for required in ('if abi != "cp312"', 'return "3.12", nil'):
         if required not in text:
             bad.append(f"{path}: [python] missing exact CPython 3.12 seat {required!r}")
@@ -838,13 +844,10 @@ def check_python_seat():
             if deleted in body:
                 bad.append(f"{fixture}: [python] deleted Python seat remains: {deleted}")
 
-    profiles = pathlib.Path("tests/product/package_release_client_test.go").read_text()
-    for expected in (
-        "torch2.13.0-cpu-cp312-linux-x86",
-        "torch2.13.0-cu130-cp312-linux-x86",
-    ):
-        if expected not in profiles:
-            bad.append(f"tests/product/package_release_client_test.go: [python] missing {expected}")
+    package_client = pathlib.Path("internal/hub/package_releases.go").read_text()
+    for retired in ("PackageInstallTarget", "qualification_state", 'json:"profile"'):
+        if retired in package_client:
+            bad.append(f"internal/hub/package_releases.go: [python] retired profile selection remains: {retired}")
     launcher = pathlib.Path("internal/orchestrator/worker.go").read_text()
     if "--instance-id" in launcher:
         bad.append("internal/orchestrator/worker.go: [python] Creator still passes Runtime's deleted --instance-id")

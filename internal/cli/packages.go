@@ -142,7 +142,7 @@ func handleLs(ctx *Context) *exit.Error {
 	l := output.List{
 		Name:      "packages",
 		Fields:    []string{"package", "version", "disk"},
-		AllFields: []string{"package", "major", "version", "disk", "profile", "placement_set", "generation", "source", "verified", "installed", "exclusive", "shared"},
+		AllFields: []string{"package", "major", "version", "disk", "placement_set", "generation", "source", "verified", "installed", "exclusive", "shared"},
 	}
 	for _, g := range rows {
 		l.Rows = append(l.Rows, map[string]string{
