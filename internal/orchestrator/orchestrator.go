@@ -181,6 +181,10 @@ type Orchestrator struct {
 	// frames is the LOSSY live lane's fanout (stream.go). The durable lane is rows in
 	// the records authority; these two are the whole event surface cl-006 serves.
 	frames *fanout
+	// productionWake is a lossy in-process nudge over the durable model-production rows.
+	// Source/artifact statuses are committed before signaling; restart/reconnect rereads rows.
+	productionWake    map[string]chan struct{}
+	productionRunning map[string]bool
 }
 
 type wait struct {
@@ -202,16 +206,18 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		opt.Yield = "smart"
 	}
 	c := &Orchestrator{
-		opt:           opt,
-		done:          make(chan struct{}),
-		sessions:      map[string]*session{},
-		workers:       map[string]*worker{},
-		waits:         map[string]*wait{},
-		offers:        map[string]*dispatchReservation{},
-		mediaCleaning: map[string]bool{},
-		starting:      map[string]bool{},
-		ensuring:      map[string]chan struct{}{},
-		frames:        newFanout(),
+		opt:               opt,
+		done:              make(chan struct{}),
+		sessions:          map[string]*session{},
+		workers:           map[string]*worker{},
+		waits:             map[string]*wait{},
+		offers:            map[string]*dispatchReservation{},
+		mediaCleaning:     map[string]bool{},
+		starting:          map[string]bool{},
+		ensuring:          map[string]chan struct{}{},
+		frames:            newFanout(),
+		productionWake:    make(map[string]chan struct{}),
+		productionRunning: make(map[string]bool),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a
 	// SAMPLING resolution, never a verdict: every verdict it acts on is the worker's own

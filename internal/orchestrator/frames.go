@@ -31,6 +31,7 @@ func (c *Orchestrator) dropSession(s *session) {
 	c.mu.Unlock()
 	// The out channel is closed by `converse`'s own defer — one owner, one close.
 	c.logf("control stream for boot %s closed", s.bootID)
+	c.signalAllProductions()
 }
 
 // jobMode answers whether the worker behind this session was launched in job mode.

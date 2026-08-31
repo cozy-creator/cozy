@@ -11,9 +11,9 @@ import (
 // ModelProductionSourceFile is the credential-free source transfer journal. Provider URLs
 // never enter this row; capability_revision only fences refreshed memory-only access.
 type ModelProductionSourceFile struct {
-	OperationID, Member, ObjectID, State, SafeCode, SafeDetail string
-	Length, TransferredBytes                                   int64
-	CapabilityRevision                                         uint64
+	OperationID, SelectionDigest, Member, ObjectID, State, SafeCode, SafeDetail string
+	Length, TransferredBytes                                                    int64
+	CapabilityRevision                                                          uint64
 }
 
 type PreparedModelSource struct {
@@ -49,20 +49,20 @@ func (s *Store) RecordModelProductionSourceFiles(operationID string,
 	}
 	defer tx.Rollback()
 	for _, file := range files {
-		var objectID string
+		var selection, objectID string
 		var length int64
-		err := tx.QueryRow(`SELECT object_id,length FROM model_production_source_files
-			WHERE operation_id=? AND member=?`, operationID, file.Member).Scan(&objectID, &length)
+		err := tx.QueryRow(`SELECT selection_digest,object_id,length FROM model_production_source_files
+			WHERE operation_id=? AND member=?`, operationID, file.Member).Scan(&selection, &objectID, &length)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			if _, err := tx.Exec(`INSERT INTO model_production_source_files
-				(operation_id,member,object_id,length) VALUES(?,?,?,?)`,
-				operationID, file.Member, file.ObjectID, file.Length); err != nil {
+				(operation_id,selection_digest,member,object_id,length) VALUES(?,?,?,?,?)`,
+				operationID, file.SelectionDigest, file.Member, file.ObjectID, file.Length); err != nil {
 				return exit.Internalf("cannot journal model source %s: %s", file.Member, err)
 			}
 		case err != nil:
 			return exit.Internalf("cannot read model source %s: %s", file.Member, err)
-		case objectID != file.ObjectID || length != file.Length:
+		case selection != file.SelectionDigest || objectID != file.ObjectID || length != file.Length:
 			return exit.Named(exit.Conflict, "model_production.source_file_conflict",
 				"model source member %s already binds another ObjectRef", file.Member)
 		}
@@ -91,7 +91,7 @@ func (s *Store) RecordModelProductionSourceStatus(file ModelProductionSourceFile
 }
 
 func (s *Store) ModelProductionSourceFiles(operationID string) ([]ModelProductionSourceFile, *exit.Error) {
-	rows, err := s.db.Query(`SELECT operation_id,member,object_id,length,capability_revision,
+	rows, err := s.db.Query(`SELECT operation_id,selection_digest,member,object_id,length,capability_revision,
 		state,transferred_bytes,safe_code,safe_detail FROM model_production_source_files
 		WHERE operation_id=? ORDER BY member`, operationID)
 	if err != nil {
@@ -101,7 +101,7 @@ func (s *Store) ModelProductionSourceFiles(operationID string) ([]ModelProductio
 	var out []ModelProductionSourceFile
 	for rows.Next() {
 		var row ModelProductionSourceFile
-		if err := rows.Scan(&row.OperationID, &row.Member, &row.ObjectID, &row.Length,
+		if err := rows.Scan(&row.OperationID, &row.SelectionDigest, &row.Member, &row.ObjectID, &row.Length,
 			&row.CapabilityRevision, &row.State, &row.TransferredBytes, &row.SafeCode,
 			&row.SafeDetail); err != nil {
 			return nil, exit.Internalf("cannot scan model source file: %s", err)
@@ -109,6 +109,34 @@ func (s *Store) ModelProductionSourceFiles(operationID string) ([]ModelProductio
 		out = append(out, row)
 	}
 	return out, nil
+}
+
+func (s *Store) RecordModelProductionProfiles(operationID string,
+	profiles []PreparedModelSource,
+) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin model source profile journal: %s", err)
+	}
+	defer tx.Rollback()
+	for _, profile := range profiles {
+		if _, err := tx.Exec(`INSERT INTO model_production_sources(operation_id,slot,profile)
+			VALUES(?,?,?) ON CONFLICT(operation_id,slot) DO NOTHING`, operationID,
+			profile.Slot, profile.Profile); err != nil {
+			return exit.Internalf("cannot journal model source profile %s: %s", profile.Slot, err)
+		}
+		var held string
+		if err := tx.QueryRow(`SELECT profile FROM model_production_sources
+			WHERE operation_id=? AND slot=?`, operationID, profile.Slot).Scan(&held); err != nil ||
+			held != profile.Profile {
+			return exit.Named(exit.Conflict, "model_production.source_profile_conflict",
+				"model source slot %s already binds another profile", profile.Slot)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit model source profiles: %s", err)
+	}
+	return nil
 }
 
 func (s *Store) RecordPreparedModelSources(operationID string,
@@ -136,7 +164,17 @@ func (s *Store) RecordPreparedModelSources(operationID string,
 			}
 		case err != nil:
 			return exit.Internalf("cannot read prepared model source %s: %s", source.Slot, err)
-		case profile != source.Profile || manifest != source.ManifestID || length != source.ManifestLength ||
+		case profile != source.Profile:
+			return exit.Named(exit.Conflict, "model_production.prepared_source_conflict",
+				"prepared model source %s changed its requested profile", source.Slot)
+		case manifest == "":
+			if _, err := tx.Exec(`UPDATE model_production_sources SET manifest_id=?,
+				manifest_length=?,release_evidence=? WHERE operation_id=? AND slot=? AND manifest_id=''`,
+				source.ManifestID, source.ManifestLength, source.ReleaseEvidence, operationID,
+				source.Slot); err != nil {
+				return exit.Internalf("cannot complete prepared model source %s: %s", source.Slot, err)
+			}
+		case manifest != source.ManifestID || length != source.ManifestLength ||
 			!bytes.Equal(evidence, source.ReleaseEvidence):
 			return exit.Named(exit.Conflict, "model_production.prepared_source_conflict",
 				"prepared model source %s replay changed its profile, Manifest, or evidence", source.Slot)
