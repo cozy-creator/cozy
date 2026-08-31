@@ -1,8 +1,12 @@
 package launch
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -66,6 +70,33 @@ func HostRuntime() (string, *exit.Error) {
 			WithRemedy("install the Cozy Runtime tool that ships with this Cozy release")
 	}
 	return path, nil
+}
+
+// RefreshLocalBase asks the trusted Runtime to observe its own CPython environment.
+// Creator stores the one returned file but never authors or interprets its inventory.
+func RefreshLocalBase(cozyHome, path string, env []string) (string, *exit.Error) {
+	bin, problem := HostRuntime()
+	if problem != nil {
+		return "", problem
+	}
+	runtime := RuntimeCLI{Bin: bin, Dir: cozyHome, Home: cozyHome, Env: env}
+	if problem := runtime.call(nil, "local-base", "--out", path); problem != nil {
+		return "", problem
+	}
+	return bin, nil
+}
+
+// PreparedOnLocalBase verifies only byte identity: Runtime owns the manifest
+// schema and staged its exact bytes into the generation cache during preparation.
+func PreparedOnLocalBase(generation records.PackageInstall, current string) bool {
+	raw, err := os.ReadFile(current)
+	if err != nil {
+		return false
+	}
+	digest := sha256.Sum256(raw)
+	staged, err := os.ReadFile(filepath.Join(generation.Dir, "artifact-cache",
+		hex.EncodeToString(digest[:])))
+	return err == nil && bytes.Equal(raw, staged)
 }
 
 // json runs one verb and decodes its `--json` document.
@@ -151,7 +182,7 @@ func runtimeRefusal(code int, verb, stdout, stderr string) *exit.Error {
 		} `json:"error"`
 	}
 	name, remedy := "runtime_refused", ""
-	if json.Unmarshal([]byte(stdout), &doc) == nil && doc.Error.Message != "" {
+	if json.Unmarshal([]byte(stderr), &doc) == nil && doc.Error.Message != "" {
 		said, remedy = doc.Error.Message, doc.Error.Remedy
 		if doc.Error.Name != "" {
 			name = doc.Error.Name

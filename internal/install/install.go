@@ -34,6 +34,7 @@ type Request struct {
 	Force     bool
 	Local     *LocalSource
 	Published *PublishedSource
+	Runtime   string // already-refreshed trusted host Runtime for a published local install
 }
 
 // LocalSource is one author-controlled directory after Creator's bounded source
@@ -71,9 +72,9 @@ type PublishedWheel struct {
 }
 
 type ExactDocument struct {
-	Bytes  []byte
-	Digest string
-	Length int64
+	Bytes  []byte `json:"canonical_bytes_base64"`
+	Digest string `json:"digest"`
+	Length int64  `json:"length"`
 }
 
 type Selection struct {
@@ -216,16 +217,15 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		return guard(e)
 	}
 
-	// ---- venv: the first code-executing step, on verified source only ----
+	// ---- environment: the first code-executing step, on verified source only ----
 	venvDir := filepath.Join(genDir, "venv")
 	var env *EnvironmentReceipt
+	var descriptor *launch.PackageDescriptor
+	var placement ExactDocument
 	var err *exit.Error
 	if req.Published != nil {
-		wheels := []string{req.Published.ProjectWheel.Path}
-		for _, wheel := range req.Published.Wheels {
-			wheels = append(wheels, wheel.Path)
-		}
-		env, err = MaterializePublishedEnvironment("cp312", venvDir, wheels)
+		descriptor, placement, gen.Runtime, env, err = preparePublished(
+			l, genDir, req.Runtime, req.Published)
 	} else {
 		env, err = MaterializeEnvironment(sourceDir, venvDir)
 	}
@@ -236,21 +236,16 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	gen.Platform, gen.Extra, gen.LinkMode = env.Platform, env.Extra, env.LinkMode
 	gen.Packages, gen.Closure = env.Packages, env.Closure
 	res.Warnings = append(res.Warnings, env.Warnings...)
-	mark("venv")
+	mark("environment")
 
-	// ---- descriptor: published installs retain the exact publication descriptor;
-	// the rented worker performs the actual install/import check. Editable installs
-	// ask their own Runtime for a local-only DevelopmentPackage placement.
-	var descriptor *launch.PackageDescriptor
-	var developmentSet ExactDocument
-	if req.Published != nil {
-		descriptor, e = launch.DecodeDescriptor(req.Published.Selection.PackageDescriptor.Bytes)
-	} else {
-		descriptor, developmentSet, e = deriveDevelopmentPlacement(
+	// ---- descriptor: Runtime authored both the imported published surface and its
+	// resident placement. Editable source retains its existing development path.
+	if req.Local != nil {
+		descriptor, placement, e = deriveDevelopmentPlacement(
 			venvDir, sourceDir, l.CAS, *req.Local)
-	}
-	if e != nil {
-		return guard(e)
+		if e != nil {
+			return guard(e)
+		}
 	}
 	descriptorPath := launch.DescriptorPath(genDir)
 	if err := os.MkdirAll(filepath.Dir(descriptorPath), 0o700); err != nil {
@@ -260,22 +255,17 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		return guard(exit.Internalf("cannot store private descriptor: %s", err))
 	}
 	gen.PackageDescriptor = descriptor.Digest
-	if req.Published != nil && descriptor.Digest != req.Published.Selection.PackageDescriptor.Digest {
-		return guard(exit.Named(exit.Conflict, "descriptor_identity_mismatch",
-			"the installed package derived descriptor %s, selected release requires %s",
-			descriptor.Digest, req.Published.Selection.PackageDescriptor.Digest))
-	}
 	if req.Local != nil {
 		cache := filepath.Join(genDir, "artifact-cache")
 		if err := os.MkdirAll(cache, 0o700); err != nil {
 			return guard(exit.Internalf("cannot create editable placement cache: %s", err))
 		}
 		if err := os.WriteFile(filepath.Join(cache,
-			strings.TrimPrefix(developmentSet.Digest, "sha256:")), developmentSet.Bytes, 0o600); err != nil {
+			strings.TrimPrefix(placement.Digest, "sha256:")), placement.Bytes, 0o600); err != nil {
 			return guard(exit.Internalf("cannot store editable PlacementSet: %s", err))
 		}
-		gen.PlacementSetDigest = developmentSet.Digest
 	}
+	gen.PlacementSetDigest = placement.Digest
 	mark("package_descriptor")
 	if req.Local != nil {
 		current, problem := packagepublish.PrepareFrom(sourceDir)

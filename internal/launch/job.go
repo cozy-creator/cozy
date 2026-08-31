@@ -78,7 +78,7 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}
 	cache := filepath.Join(f.Install.Dir, "artifact-cache")
-	overlays, err := filepath.Glob(filepath.Join(f.Install.Dir, "venv", "lib", "python*", "site-packages"))
+	overlays, err := filepath.Glob(filepath.Join(f.Install.Dir, "environment", "contents", "*", "site-packages"))
 	if err != nil || len(overlays) != 1 {
 		return orchestrator.WorkerLaunchSpec{}, nil, exit.Named(exit.Structural,
 			"package_overlay_missing", "installed package has no unique Python overlay")
@@ -116,8 +116,9 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 		Devices:         devices,
 		GraceSec:        3,
 		ArtifactCache:   cache,
-		EnvironmentRoot: filepath.Join(f.Install.Dir, "venv"),
+		EnvironmentRoot: filepath.Join(f.Install.Dir, "environment"),
 		ArtifactStore:   filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
+		BaseManifest:    filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "local-base.json"),
 	}
 	return spec, facts, nil
 }
