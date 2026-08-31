@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
@@ -62,7 +63,7 @@ func RunDaemon(stdout, stderr io.Writer) int {
 	ctx := &Context{
 		Inv: &Invocation{Bools: map[string]bool{}, Values: values(
 			"--port", intText(cfg.Port), "--yield", cfg.Yield), Mode: output.Mode{}},
-		Out: stdout, Err: stderr, Cfg: cfg,
+		Out: stdout, Err: stderr, Cfg: cfg, AccountAuth: accountauth.New(cfg),
 	}
 	if problem := serveDaemon(ctx); problem != nil {
 		fmt.Fprintln(stderr, problem.Error())

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/modelproduction"
@@ -20,18 +21,19 @@ type modelProductionManager struct {
 	cfg   config.Config
 	store *records.Store
 	log   io.Writer
+	auth  *accountauth.Manager
 
 	mu      sync.Mutex
 	running map[string]context.CancelFunc
 }
 
 func newModelProductionManager(cfg config.Config, store *records.Store,
-	log io.Writer,
+	log io.Writer, auth *accountauth.Manager,
 ) *modelProductionManager {
 	if log == nil {
 		log = io.Discard
 	}
-	return &modelProductionManager{cfg: cfg, store: store, log: log,
+	return &modelProductionManager{cfg: cfg, store: store, log: log, auth: auth,
 		running: map[string]context.CancelFunc{}}
 }
 
@@ -176,7 +178,7 @@ func (m *modelProductionManager) advance(runCtx context.Context,
 		return
 	}
 	resolveCtx := &Context{Inv: productionInvocation(plan.Instruction), Out: io.Discard,
-		Err: m.log, Cfg: m.cfg}
+		Err: m.log, Cfg: m.cfg, AccountAuth: m.auth}
 	var source publishSource
 	if operation.State != "outputs_preparing" && operation.State != "release_cut" &&
 		operation.State != "cleanup_pending" {
@@ -215,7 +217,7 @@ func (m *modelProductionManager) resolve(instruction modelproduction.Instruction
 	modelproduction.Plan, publishSource, *exit.Error,
 ) {
 	ctx := &Context{Inv: productionInvocation(instruction), Out: io.Discard,
-		Err: m.log, Cfg: m.cfg}
+		Err: m.log, Cfg: m.cfg, AccountAuth: m.auth}
 	source, problem := resolvePublishSource(ctx, instruction.Source)
 	if problem != nil {
 		return modelproduction.Plan{}, publishSource{}, problem
