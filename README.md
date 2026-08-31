@@ -142,12 +142,12 @@ cozy model list
 cozy model remove org/model
 ```
 
-Publish an existing canonical TensorFS manifest as one immutable release lane. `--lane` asserts
-the lane Tensorhub must independently derive from the manifest; it is not sent as a recipe field.
-The remote model name is created automatically when absent:
+Publish an existing canonical TensorFS manifest as one immutable release lane. `--lane` supplies
+its portable name; Tensorhub still independently derives and records the manifest contract. The
+remote model name is created automatically when absent:
 
 ```sh
-cozy model publish org/model sha256:<manifest> --release 1.0.0 --lane <derived-lane>
+cozy model publish org/model sha256:<manifest> --release 1.0.0 --lane bf16
 ```
 
 Download and publication are resumable and verify content identities before making a local or

@@ -53,14 +53,14 @@ type OpenPublicationResponse struct {
 	Created     bool    `json:"created"`
 }
 
-func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID, release string,
+func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID, release, laneKey string,
 	objects []Object, reason string,
 ) (OpenPublicationResponse, *exit.Error) {
 	var out OpenPublicationResponse
 	e := c.do(ctx, call{
 		method: http.MethodPut,
 		path:   publications(ref) + "/" + url.PathEscape(operationID), auth: true, reason: reason,
-		body:    map[string]any{"release": release, "objects": objects},
+		body:    map[string]any{"release": release, "lane_key": laneKey, "objects": objects},
 		byBytes: true, patient: true, strict: true,
 	}, &out)
 	return out, e
