@@ -248,7 +248,9 @@ func replayJobSubmission(sub JobSubmission,
 		InstallID: recorded.InstallID, Release: recorded.Release,
 		ReleaseDigest:        recorded.PackageRevisionDigest,
 		PrivatePackageDigest: recorded.PrivatePackageDigest,
-		PlanID:               recorded.PlanID, Outputs: outputs, ArtifactOutputs: artifactOutputs,
+		AcceptableWheelhouseManifestDigests: append([]string(nil),
+			recorded.AcceptableWheelhouseManifestDigests...),
+		PlanID: recorded.PlanID, Outputs: outputs, ArtifactOutputs: artifactOutputs,
 		JobGPUCount: recorded.JobGPUCount, Trees: trees, Worker: recorded.Worker,
 		Rental: sub.Rental, Models: models}, nil
 }
@@ -303,6 +305,8 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.PlanID, out.Outputs = logical.DescriptorID, logical.Outputs
 		out.ArtifactOutputs, out.JobGPUCount = logical.ArtifactOutputs, logical.GPUCount
 		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
+		out.AcceptableWheelhouseManifestDigests = append([]string(nil),
+			logical.AcceptableWheelhouseManifestDigests...)
 		return out, nil
 	}
 	refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
@@ -391,13 +395,18 @@ func (s *Server) resolvePrivateJob(ctx context.Context, sub JobSubmission,
 		return out, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", sub.Package, sub.Function)
 	}
-	revision, problem := s.packages.PreparePrivate(ctx, installID)
+	requiredRuntime := ""
+	if len(out.Models) > 0 {
+		requiredRuntime = "0.0.20"
+	}
+	revision, compatibleBases, problem := s.packages.PreparePrivate(ctx, installID, requiredRuntime)
 	if problem != nil {
 		return out, problem
 	}
 	out.InstallID = installID
 	out.Release, out.ReleaseDigest = revision.Release, revision.SourceDigest
 	out.PrivatePackageDigest = revision.Digest
+	out.AcceptableWheelhouseManifestDigests = compatibleBases
 	return out, nil
 }
 

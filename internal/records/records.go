@@ -68,7 +68,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // schema is the only records shape this pre-launch build accepts.
 var schema = append([]string{`
@@ -147,6 +147,15 @@ func Open(path string) (*Store, *exit.Error) {
 			db.Close()
 			return nil, e
 		}
+		if e := migrateRentalBaseSelection(db, path); e != nil {
+			db.Close()
+			return nil, e
+		}
+	} else if version == 2 {
+		if e := migrateRentalBaseSelection(db, path); e != nil {
+			db.Close()
+			return nil, e
+		}
 	} else if version != schemaVersion {
 		db.Close()
 		return nil, schemaReset(path,
@@ -201,7 +210,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=2`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=3`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -251,6 +260,72 @@ func migrateOutputExports(db *sql.DB, path string) *exit.Error {
 		return exit.Internalf("cannot commit records migration in %s: %s", path, err)
 	}
 	return nil
+}
+
+// migrateRentalBaseSelection adds the two exact pre-spend/frozen-family facts while retaining
+// accepted requests and paid rentals. The transaction is compared to the complete current schema
+// before commit, so any foreign version-2 mutation rolls back and refuses reset-required.
+func migrateRentalBaseSelection(db *sql.DB, path string) *exit.Error {
+	tx, err := db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin rental base-selection migration in %s: %s", path, err)
+	}
+	defer tx.Rollback()
+	version, err := databaseVersion(tx)
+	if err != nil {
+		return exit.Internalf("cannot re-read records version in %s: %s", path, err)
+	}
+	if version == schemaVersion {
+		return nil
+	}
+	if version != 2 {
+		return schemaReset(path, "records database changed to user_version %d while migrating rental bases", version)
+	}
+	requestColumn, err := schemaColumnExists(tx, "requests", "acceptable_base_manifests")
+	if err != nil {
+		return exit.Internalf("cannot inspect request base-selection column: %s", err)
+	}
+	rentalColumn, err := schemaColumnExists(tx, "rentals", "wheelhouse_manifest_digest")
+	if err != nil {
+		return exit.Internalf("cannot inspect rental base-selection column: %s", err)
+	}
+	if requestColumn != rentalColumn {
+		return schemaReset(path, "records database has a partial rental base-selection migration")
+	}
+	if !requestColumn {
+		for _, statement := range []string{
+			`ALTER TABLE requests ADD COLUMN acceptable_base_manifests TEXT NOT NULL DEFAULT '[]'`,
+			`ALTER TABLE rentals ADD COLUMN wheelhouse_manifest_digest TEXT NOT NULL DEFAULT ''`,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				return schemaReset(path, "records database cannot add exact rental base-selection facts: %s", err)
+			}
+		}
+	}
+	if _, err := tx.Exec(`PRAGMA user_version=3`); err != nil {
+		return exit.Internalf("cannot stamp rental base-selection migration in %s: %s", path, err)
+	}
+	want, err := currentSchema()
+	if err != nil {
+		return exit.Internalf("cannot derive current records schema: %s", err)
+	}
+	got, err := schemaSnapshot(tx)
+	if err != nil {
+		return exit.Internalf("cannot inspect migrated records schema in %s: %s", path, err)
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		return schemaReset(path, "records database did not reach the exact version 3 shape")
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit rental base-selection migration in %s: %s", path, err)
+	}
+	return nil
+}
+
+func schemaColumnExists(tx *sql.Tx, table, column string) (bool, error) {
+	var count int
+	err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name=?`, table, column).Scan(&count)
+	return count == 1, err
 }
 
 func schemaWithoutOutputExports() ([]string, error) {

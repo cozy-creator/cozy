@@ -26,7 +26,7 @@ import (
 
 const weightlessRef = "cozy/cozy-weightless-package"
 const localWeightlessRef = "local/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "73568e70866e77165521ca4e452c61784bc8e60e"
+const editableRuntimeFixtureSHA = "ebdcb4a319dd1d6d2afa352d9dfe824c2bca2b57"
 const editableTensorFSFixtureSHA = "0f49a4bf3fbe6fc8d41713b7ce9041c80161b7e6"
 
 func TestHumanQueuePositionLabelKeepsMachineKey(t *testing.T) {

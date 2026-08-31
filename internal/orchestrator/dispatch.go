@@ -33,7 +33,10 @@ type Submission struct {
 	// PrivatePackageDigest is the exact staged wheel-set identity for one editable rental.
 	// ReleaseDigest remains Runtime's source identity; this names the carriers.
 	PrivatePackageDigest string
-	Models               []ModelRef
+	// AcceptableWheelhouseManifestDigests is Runtime's sorted admission result over the
+	// exact current Hub active manifests. Tensorhub selects one family from this set.
+	AcceptableWheelhouseManifestDigests []string
+	Models                              []ModelRef
 
 	// Payload is the request body, verbatim. It rides the DeliveryGrant as the input
 	// `payload` — a grant input, never a wire field, so refreshing the grant can never
@@ -212,8 +215,10 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Package: s.Package, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
 		Release: s.Release, PackageRevisionDigest: s.ReleaseDigest,
 		PrivatePackageDigest: s.PrivatePackageDigest,
-		Outputs:              strings.Join(s.Outputs, ","),
-		Assets:               s.Assets, ArtifactOutputs: string(artifactBytes),
+		AcceptableWheelhouseManifestDigests: append([]string(nil),
+			s.AcceptableWheelhouseManifestDigests...),
+		Outputs: strings.Join(s.Outputs, ","),
+		Assets:  s.Assets, ArtifactOutputs: string(artifactBytes),
 		Kind: s.Kind, JobGPUCount: s.JobGPUCount, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental, Models: s.Models,
 		OutputExport: s.OutputExport,

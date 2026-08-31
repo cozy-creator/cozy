@@ -19,6 +19,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -132,7 +133,7 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 	}
 
 	request, problem := hub.RentalRequestBytes("cpu", strings.Repeat("1", 64),
-		identity.PublicKey())
+		identity.PublicKey(), []string{"sha256:" + strings.Repeat("2", 64)})
 	fatal(t, problem)
 	var body map[string]any
 	must(t, json.Unmarshal(request, &body))
@@ -140,6 +141,19 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 		body["media_token_sha256"] != strings.Repeat("1", 64) || body["package_ref"] != nil ||
 		body["model_selections"] != nil || body["renter_token_sha256"] != nil {
 		t.Fatalf("rental create authority is not the hardcut shape: %s", request)
+	}
+}
+
+func TestPrivateModeControlRuntimeFloor(t *testing.T) {
+	manifest := func(version string) []byte {
+		return []byte(`{"base_distributions":[{"distribution":"cozy-runtime","version":"` + //cozy:allow base distribution capability fact, not executable access
+			version + `"}]}`)
+	}
+	if launch.BaseRuntimeAtLeast(manifest("0.0.19"), "0.0.20") ||
+		!launch.BaseRuntimeAtLeast(manifest("0.0.20"), "0.0.20") ||
+		!launch.BaseRuntimeAtLeast(manifest("0.1.0"), "0.0.20") ||
+		launch.BaseRuntimeAtLeast(manifest("0.0.20-rc1"), "0.0.20") {
+		t.Fatal("private modeled Runtime capability floor admitted/refused the wrong active base")
 	}
 }
 

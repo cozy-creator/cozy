@@ -114,25 +114,27 @@ type Launcher interface {
 }
 
 type LogicalPackage struct {
-	Package       string
-	Release       string
-	ReleaseDigest string
-	Function      string
-	Outputs       []string
-	PlanID        string
-	Models        []ModelRef
+	Package                             string
+	Release                             string
+	ReleaseDigest                       string
+	Function                            string
+	Outputs                             []string
+	PlanID                              string
+	Models                              []ModelRef
+	AcceptableWheelhouseManifestDigests []string
 }
 
 type LogicalJob struct {
-	Package         string
-	Release         string
-	ReleaseDigest   string
-	Function        string
-	DescriptorID    string
-	Outputs         []string
-	ArtifactOutputs []ArtifactOutput
-	GPUCount        int64
-	Models          []ModelRef
+	Package                             string
+	Release                             string
+	ReleaseDigest                       string
+	Function                            string
+	DescriptorID                        string
+	Outputs                             []string
+	ArtifactOutputs                     []ArtifactOutput
+	GPUCount                            int64
+	Models                              []ModelRef
+	AcceptableWheelhouseManifestDigests []string
 }
 
 type ModelRef = records.ModelRef

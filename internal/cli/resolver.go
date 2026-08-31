@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -18,6 +21,99 @@ import (
 	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
+
+func (r *Resolver) preflightPublished(ref hub.Ref, release, releaseDigest string,
+	detail hub.PackageReleaseDetail,
+) ([]string, *exit.Error) {
+	layout, problem := home.Open(r.cfg.Home)
+	if problem != nil {
+		return nil, problem
+	}
+	ctx, cancel := hub.LongContext()
+	defer cancel()
+	active, problem := r.catalog.ActiveBaseManifests(ctx)
+	if problem != nil {
+		return nil, problem
+	}
+	digests := make([]string, len(active))
+	bases := make([]privatepackage.BaseManifest, len(active))
+	for index, base := range active {
+		digests[index] = base.WheelhouseManifestDigest
+		bases[index] = privatepackage.BaseManifest{Digest: base.WheelhouseManifestDigest,
+			Bytes: append([]byte(nil), base.WheelhouseManifest...)}
+	}
+	sort.Strings(digests)
+	cacheKey := releaseDigest + "\x00" + strings.Join(digests, "\x00")
+	r.mu.Lock()
+	if cached, ok := r.compatibility[cacheKey]; ok {
+		r.mu.Unlock()
+		return append([]string(nil), cached...), nil
+	}
+	r.mu.Unlock()
+	plan, problem := r.catalog.PackageDownloads(ctx, ref, release)
+	if problem != nil {
+		return nil, problem
+	}
+	packageConfig, problem := exactPackageInstallDocument("package config", plan.PackageConfig)
+	if problem != nil {
+		return nil, problem
+	}
+	packageDescriptor, problem := exactPackageInstallDocument(
+		"package descriptor", plan.PackageDescriptor)
+	if problem != nil {
+		return nil, problem
+	}
+	if plan.Release != release || plan.ReleaseDigest != releaseDigest ||
+		packageDescriptor.Digest != detail.Release.PackageDescriptorDigest ||
+		!bytes.Equal(packageDescriptor.Bytes, detail.PackageDescriptor) {
+		return nil, exit.Named(exit.Conflict, "package_preflight_release_changed",
+			"Tensorhub package download plan changed the exact release or descriptor")
+	}
+	if err := os.MkdirAll(layout.Transfer, 0o700); err != nil {
+		return nil, exit.Internalf("cannot create published preflight transfer root: %s", err)
+	}
+	scratch, err := os.MkdirTemp(layout.Transfer, ".published-preflight-")
+	if err != nil {
+		return nil, exit.Internalf("cannot create published preflight transfer: %s", err)
+	}
+	defer os.RemoveAll(scratch)
+	quiet := &Context{Cfg: r.cfg, Out: io.Discard, Err: io.Discard}
+	published, problem := downloadPackageInstallPlan(ctx, quiet, scratch, ref, release,
+		releaseDigest, plan, packageConfig, packageDescriptor)
+	if problem != nil {
+		return nil, problem
+	}
+	wheels := []privatepackage.PublishedWheel{{Digest: published.ProjectWheel.Digest,
+		Filename: published.ProjectWheel.Filename, Length: published.ProjectWheel.Length,
+		Path: published.ProjectWheel.Path, Kind: "project"}}
+	for _, wheel := range published.Wheels {
+		wheels = append(wheels, privatepackage.PublishedWheel{Digest: wheel.Digest,
+			Filename: wheel.Filename, Length: wheel.Length, Path: wheel.Path, Kind: "dependency"})
+	}
+	revision, stagedLayout, cleanup, problem := privatepackage.StagePublishedPreflight(layout,
+		ref.String(), release, releaseDigest, detail.PackageDescriptor, wheels)
+	if problem != nil {
+		return nil, problem
+	}
+	defer cleanup()
+	runtimeBin, problem := launch.HostRuntime()
+	if problem != nil {
+		return nil, problem
+	}
+	install := records.PackageInstall{Runtime: runtimeBin, SourceKind: "local", SourceRef: scratch}
+	compatible, problem := launch.PreflightPrivate(ctx, install, revision, bases,
+		stagedLayout, r.cfg.Tool())
+	if problem != nil {
+		return nil, problem
+	}
+	r.mu.Lock()
+	if r.compatibility[cacheKey] == nil {
+		r.compatibility[cacheKey] = append([]string(nil), compatible...)
+	}
+	cached := append([]string(nil), r.compatibility[cacheKey]...)
+	r.mu.Unlock()
+	return cached, nil
+}
 
 // The LOCAL module's package resolver: `org/name` -> the spec that makes its worker
 // resident. ONE source, and it is the only one a user's machine will ever use — the
@@ -40,7 +136,8 @@ type Resolver struct {
 	// cache holds the specs already derived this launch. Deriving one reads a descriptor
 	// and asks the runtime for its artifact index; a generation is IMMUTABLE, so doing it
 	// twice would answer the same thing twice.
-	cache map[string]orchestrator.WorkerLaunchSpec
+	cache         map[string]orchestrator.WorkerLaunchSpec
+	compatibility map[string][]string
 	// placements contain only control-plane facts. Keeping this cache distinct is the
 	// seam cl-020's verified control manifest will populate without a local venv.
 	placements map[string]orchestrator.DesiredPlacement
@@ -50,38 +147,60 @@ type Resolver struct {
 }
 
 // PreparePrivate freezes one editable install into exact wheels before any rental spend.
-func (r *Resolver) PreparePrivate(ctx context.Context, installID string) (privatepackage.Revision, *exit.Error) {
+func (r *Resolver) PreparePrivate(ctx context.Context, installID, requiredRuntime string) (
+	privatepackage.Revision, []string, *exit.Error,
+) {
 	install, problem := r.store.Install(installID)
 	if problem != nil {
-		return privatepackage.Revision{}, problem
+		return privatepackage.Revision{}, nil, problem
 	}
 	if install == nil {
-		return privatepackage.Revision{}, exit.New(exit.NotFound, "install %s does not exist", installID)
+		return privatepackage.Revision{}, nil, exit.New(exit.NotFound, "install %s does not exist", installID)
 	}
 	layout, problem := home.Open(r.cfg.Home)
 	if problem != nil {
-		return privatepackage.Revision{}, problem
+		return privatepackage.Revision{}, nil, problem
 	}
 	if problem := privatepackage.Sweep(layout, r.store); problem != nil {
-		return privatepackage.Revision{}, problem
+		return privatepackage.Revision{}, nil, problem
 	}
 	revision, problem := privatepackage.Stage(ctx, layout, *install)
 	if problem != nil {
-		return privatepackage.Revision{}, problem
+		return privatepackage.Revision{}, nil, problem
 	}
 	active, problem := r.catalog.ActiveBaseManifests(ctx)
 	if problem != nil {
-		return privatepackage.Revision{}, problem
+		return privatepackage.Revision{}, nil, problem
 	}
 	bases := make([]privatepackage.BaseManifest, len(active))
 	for index, base := range active {
 		bases[index] = privatepackage.BaseManifest{Digest: base.WheelhouseManifestDigest,
 			Bytes: append([]byte(nil), base.WheelhouseManifest...)}
 	}
-	if problem := launch.PreflightPrivate(ctx, *install, revision, bases, r.cfg.Home, r.cfg.Tool()); problem != nil {
-		return privatepackage.Revision{}, problem
+	compatible, problem := launch.PreflightPrivate(ctx, *install, revision, bases,
+		layout, r.cfg.Tool())
+	if problem != nil {
+		return privatepackage.Revision{}, nil, problem
 	}
-	return revision, nil
+	if requiredRuntime != "" {
+		byDigest := make(map[string][]byte, len(bases))
+		for _, base := range bases {
+			byDigest[base.Digest] = base.Bytes
+		}
+		filtered := compatible[:0]
+		for _, digest := range compatible {
+			if launch.BaseRuntimeAtLeast(byDigest[digest], requiredRuntime) {
+				filtered = append(filtered, digest)
+			}
+		}
+		compatible = filtered
+		if len(compatible) == 0 {
+			return privatepackage.Revision{}, nil, exit.Named(exit.Conflict,
+				"private_preflight_control_runtime_incompatible",
+				"modeled private execution requires active cozy-runtime >=%s", requiredRuntime)
+		}
+	}
+	return revision, compatible, nil
 }
 
 // PrivateRevision reopens the exact staged wheel set a durable request already names.
@@ -196,10 +315,11 @@ func short12(value string) string {
 func NewResolver(store *records.Store, cfg config.Config) *Resolver {
 	return &Resolver{
 		store: store, cfg: cfg,
-		cache:      map[string]orchestrator.WorkerLaunchSpec{},
-		placements: map[string]orchestrator.DesiredPlacement{},
-		catalog:    hub.New(cfg, "cozy-daemon"),
-		Devices:    []string{"0"},
+		cache:         map[string]orchestrator.WorkerLaunchSpec{},
+		compatibility: map[string][]string{},
+		placements:    map[string]orchestrator.DesiredPlacement{},
+		catalog:       hub.New(cfg, "cozy-daemon"),
+		Devices:       []string{"0"},
 	}
 }
 
@@ -358,10 +478,14 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function st
 			return empty, nil, exit.Internalf("cannot spell remote binding identity: %s", err)
 		}
 	}
+	compatibleBases, problem := r.preflightPublished(ref, release, releaseDigest, detail)
+	if problem != nil {
+		return empty, nil, problem
+	}
 	return orchestrator.LogicalPackage{
 		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
 		Function: function, Outputs: launch.AssetPaths(entrypoint.Result), PlanID: planID,
-		Models: models,
+		Models: models, AcceptableWheelhouseManifestDigests: compatibleBases,
 	}, entrypoint, nil
 }
 
@@ -444,10 +568,15 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 		})
 		outputs = append(outputs, output.OutputID)
 	}
+	compatibleBases, problem := r.preflightPublished(ref, release, releaseDigest, detail)
+	if problem != nil {
+		return empty, problem
+	}
 	return orchestrator.LogicalJob{
 		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
 		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
 		ArtifactOutputs: artifacts, GPUCount: job.Resources.GPUCount, Models: models,
+		AcceptableWheelhouseManifestDigests: compatibleBases,
 	}, nil
 }
 

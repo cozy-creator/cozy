@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +19,70 @@ import (
 	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
+
+// BaseRuntimeAtLeast reads only the control-plane capability version from exact Hub-held
+// WheelhouseManifest bytes. Runtime still owns every overlay compatibility decision.
+func BaseRuntimeAtLeast(raw []byte, floor string) bool {
+	var manifest struct {
+		BaseDistributions []struct {
+			Distribution string `json:"distribution"`
+			Version      string `json:"version"`
+		} `json:"base_distributions"`
+	}
+	if json.Unmarshal(raw, &manifest) != nil {
+		return false
+	}
+	held := ""
+	for _, distribution := range manifest.BaseDistributions {
+		if distribution.Distribution != "cozy-runtime" {
+			continue
+		}
+		if held != "" {
+			return false
+		}
+		held = distribution.Version
+	}
+	parse := func(value string) ([3]int, bool) {
+		var version [3]int
+		parts := strings.Split(value, ".")
+		if len(parts) != len(version) {
+			return version, false
+		}
+		for index, part := range parts {
+			parsed, err := strconv.Atoi(part)
+			if err != nil || parsed < 0 || strconv.Itoa(parsed) != part {
+				return version, false
+			}
+			version[index] = parsed
+		}
+		return version, true
+	}
+	current, currentOK := parse(held)
+	required, requiredOK := parse(floor)
+	if !currentOK || !requiredOK {
+		return false
+	}
+	for index := range current {
+		if current[index] != required[index] {
+			return current[index] > required[index]
+		}
+	}
+	return true
+}
+
+// GenerationToolEnv makes one installed generation's exact Runtime discoverable through the
+// already-frozen child environment without reading ambient process state.
+func GenerationToolEnv(generation records.PackageInstall, env []string) []string {
+	out := append([]string(nil), env...)
+	prefix := filepath.Dir(Binary(generation))
+	for index, value := range out {
+		if strings.HasPrefix(value, "PATH=") {
+			out[index] = "PATH=" + prefix + string(os.PathListSeparator) + strings.TrimPrefix(value, "PATH=")
+			return out
+		}
+	}
+	return append(out, "PATH="+prefix)
+}
 
 // DefaultRuntimeQueryTimeout bounds metadata-only runtime questions used while selecting
 // or starting a worker. These verbs read declarations; they do not construct an package,
@@ -69,29 +135,40 @@ func (r RuntimeCLI) privatePreflight(ctx context.Context, requestPath string,
 // staging and the one generation Runtime process that judges them.
 func PreflightPrivate(ctx context.Context, install records.PackageInstall,
 	revision privatepackage.Revision, bases []privatepackage.BaseManifest,
-	cozyHome string, env []string,
-) *exit.Error {
-	layout, problem := home.Open(cozyHome)
-	if problem != nil {
-		return problem
-	}
+	layout home.Layout, env []string,
+) ([]string, *exit.Error) {
 	requestPath, cleanup, problem := privatepackage.StagePreflight(layout, revision, bases)
 	if problem != nil {
-		return problem
+		return nil, problem
 	}
 	defer cleanup()
 	bounded, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	var result PrivatePreflightResult
-	runtime := RuntimeCLI{Bin: Binary(install), Dir: SourceDir(install), Home: cozyHome, Env: env}
+	runtime := RuntimeCLI{Bin: Binary(install), Dir: SourceDir(install), Home: layout.Root, Env: env}
 	if problem := runtime.privatePreflight(bounded, requestPath, &result); problem != nil {
-		return problem
+		return nil, problem
 	}
 	if result.PrivateRevisionDigest != revision.Digest || len(result.Compatible) == 0 {
-		return exit.Named(exit.Conflict, "private_preflight_identity_mismatch",
+		return nil, exit.Named(exit.Conflict, "private_preflight_identity_mismatch",
 			"Runtime preflight did not admit exact private revision %s", revision.Digest)
 	}
-	return nil
+	provided := make(map[string]bool, len(bases))
+	for _, base := range bases {
+		provided[base.Digest] = true
+	}
+	compatible := make([]string, 0, len(result.Compatible))
+	seen := map[string]bool{}
+	for _, row := range result.Compatible {
+		if !provided[row.Base] || seen[row.Base] {
+			return nil, exit.Named(exit.Conflict, "private_preflight_base_set_mismatch",
+				"Runtime preflight returned an unknown or duplicate active base %s", row.Base)
+		}
+		seen[row.Base] = true
+		compatible = append(compatible, row.Base)
+	}
+	sort.Strings(compatible)
+	return compatible, nil
 }
 
 // Binary is the runtime a generation carries. An install already refused a generation

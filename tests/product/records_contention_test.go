@@ -10,7 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRecordsSchemaIsExactV2AndStable(t *testing.T) {
+func TestRecordsSchemaIsExactV3AndStable(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -21,11 +21,12 @@ func TestRecordsSchemaIsExactV2AndStable(t *testing.T) {
 	var version, before int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
-	if version != 2 {
-		t.Fatalf("fresh records version = %d, want exact v2", version)
+	if version != 3 {
+		t.Fatalf("fresh records version = %d, want exact v3", version)
 	}
 	for _, column := range []string{
 		"rental", "package_revision_digest", "environment_digest", "config_digest",
+		"acceptable_base_manifests",
 	} {
 		var count int
 		must(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name=?`,
@@ -50,7 +51,7 @@ func TestRecordsSchemaIsExactV2AndStable(t *testing.T) {
 	var after int
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
 	if after != before {
-		t.Fatalf("exact v2 reopen performed DDL: schema_version %d -> %d", before, after)
+		t.Fatalf("exact v3 reopen performed DDL: schema_version %d -> %d", before, after)
 	}
 }
 
@@ -76,8 +77,45 @@ func TestRecordsMigratesExactV1OutputExportAddition(t *testing.T) {
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
 		WHERE type='table' AND name='request_output_exports'`).Scan(&exports))
-	if version != 2 || exports != 1 {
+	if version != 3 || exports != 1 {
 		t.Fatalf("v1 output export migration = version %d, tables %d", version, exports)
+	}
+}
+
+func TestRecordsMigratesExactV2RentalBaseSelectionAndRetainsRows(t *testing.T) {
+	path := t.TempDir() + "/records.db"
+	store, problem := records.Open(path)
+	fatal(t, problem)
+	request, fresh, problem := store.Submit(records.Request{ID: "req-v2-retained",
+		IdemKey: "v2-retained", BodyDigest: "sha256:" + strings.Repeat("1", 64),
+		Package: "proof/package", Entrypoint: "run", Payload: []byte("{}")})
+	fatal(t, problem)
+	if !fresh || request.ID != "req-v2-retained" {
+		t.Fatalf("v2 request setup = %+v fresh=%v", request, fresh)
+	}
+	fatal(t, store.RecordRental(records.Rental{ID: "pr-v2-retained", MachineName: "v2-retained",
+		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 70_000,
+		State: "ready", Hub: "https://hub.example"}))
+	store.Close()
+
+	db, err := sql.Open("sqlite", path)
+	must(t, err)
+	_, err = db.Exec(`ALTER TABLE requests DROP COLUMN acceptable_base_manifests;
+        ALTER TABLE rentals DROP COLUMN wheelhouse_manifest_digest;
+        PRAGMA user_version=2`)
+	must(t, err)
+	must(t, db.Close())
+
+	store, problem = records.Open(path)
+	fatal(t, problem)
+	defer store.Close()
+	heldRequest, problem := store.RequestRow("req-v2-retained")
+	fatal(t, problem)
+	heldRental, problem := store.RentalRow("pr-v2-retained")
+	fatal(t, problem)
+	if heldRequest == nil || len(heldRequest.AcceptableWheelhouseManifestDigests) != 0 ||
+		heldRental == nil || heldRental.WheelhouseManifestDigest != "" {
+		t.Fatalf("v2 retained rows changed: request=%+v rental=%+v", heldRequest, heldRental)
 	}
 }
 

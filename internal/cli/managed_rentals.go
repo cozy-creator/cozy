@@ -85,6 +85,10 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		if row.State != hub.RentalReady && row.State != "attached" {
 			continue
 		}
+		if !containsString(req.AcceptableWheelhouseManifestDigests,
+			row.WheelhouseManifestDigest) {
+			continue
+		}
 		queued, running, countsProblem := m.store.RentalRunCounts(row.ID)
 		if countsProblem != nil {
 			return "", "", countsProblem
@@ -139,7 +143,8 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s\n", sku.Name, usdPerHour(sku.PriceUSDMicrosPerHour))
 	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name, "",
 		"managed-rental-"+req.ID, "",
-		sku.PriceUSDMicrosPerHour, m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID)
+		sku.PriceUSDMicrosPerHour, m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID,
+		req.AcceptableWheelhouseManifestDigests)
 	if problem != nil {
 		return "", "", problem
 	}
@@ -157,6 +162,11 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 	}
 	line, problem := m.lineLocked()
 	return row.ID, line, problem
+}
+
+func containsString(values []string, wanted string) bool {
+	index := sort.SearchStrings(values, wanted)
+	return wanted != "" && index < len(values) && values[index] == wanted
 }
 
 func (m *managedRentals) catalogLocked() ([]hub.RentalSKU, *exit.Error) {
