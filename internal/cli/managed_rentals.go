@@ -24,7 +24,6 @@ type managedRentals struct {
 	layout       home.Layout
 	store        *records.Store
 	owner        *orchestrator.Orchestrator
-	idleGrace    time.Duration
 	idleSequence uint64
 	idleTimers   map[string]idleRelease
 	closed       bool
@@ -267,7 +266,7 @@ func (m *managedRentals) releaseWhenIdleLocked(id string) (string, *exit.Error) 
 		return "", problem
 	}
 	if found && last.Kind != "job" && !last.ClosedAt.IsZero() {
-		deadline := last.ClosedAt.Add(m.grace())
+		deadline := last.ClosedAt.Add(managedRentalIdleGrace)
 		if time.Now().Before(deadline) {
 			m.scheduleIdleReleaseLocked(id, deadline)
 			return m.lineLocked()
@@ -275,14 +274,6 @@ func (m *managedRentals) releaseWhenIdleLocked(id string) (string, *exit.Error) 
 	}
 	return m.releaseLocked(id)
 }
-
-func (m *managedRentals) grace() time.Duration {
-	if m.idleGrace > 0 {
-		return m.idleGrace
-	}
-	return managedRentalIdleGrace
-}
-
 func (m *managedRentals) scheduleIdleReleaseLocked(id string, deadline time.Time) {
 	if m.closed {
 		return
