@@ -75,18 +75,35 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 	}
 }
 
-func TestModelManifestGrammar(t *testing.T) {
+func TestModelProductionGrammar(t *testing.T) {
 	root := t.TempDir()
 	code, help := runCozy(t, root, "model", "publish", "--help")
-	if code != 0 || !strings.Contains(help, "<manifest>") ||
-		!strings.Contains(help, "--release") || !strings.Contains(help, "--lane") ||
-		strings.Contains(strings.ToLower(help), "snapshot") {
-		t.Fatalf("model publish did not expose only manifest/release/lane [exit %d]\n%s", code, help)
+	if code != 0 || !strings.Contains(help, "<source>") ||
+		!strings.Contains(help, "--release") || !strings.Contains(help, "--producer") ||
+		!strings.Contains(help, "--lane") || !strings.Contains(help, "--rental") ||
+		!strings.Contains(help, "--dry-run") || !strings.Contains(help, "--detach") ||
+		strings.Contains(help, "<manifest>") || strings.Contains(help, "--token-stdin") ||
+		strings.Contains(help, "--cloud") || strings.Contains(help, "--remote") ||
+		strings.Contains(help, "--machine") || strings.Contains(help, "--max-cost") {
+		t.Fatalf("model publish grammar drifted [exit %d]\n%s", code, help)
 	}
 	code, out := runCozy(t, root, "model", "publish", "acme/model",
-		"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	if code != 2 || !strings.Contains(out, "--release") || !strings.Contains(out, "--lane") {
-		t.Fatalf("model publish accepted missing release/lane [exit %d]\n%s", code, out)
+		"hf://acme/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	if code != 2 || !strings.Contains(out, "--release") {
+		t.Fatalf("model publish accepted missing release [exit %d]\n%s", code, out)
+	}
+	local := filepath.Join(root, "source.safetensors")
+	must(t, os.WriteFile(local, []byte("header-only-grammar-fixture"), 0o600))
+	code, out = runCozy(t, root, "--json", "model", "publish", "acme/model", local,
+		"--release", "1.2.3", "--dry-run")
+	if code != 0 || !strings.Contains(out, `"kind":"model-publication"`) ||
+		!strings.Contains(out, `"status":"planned"`) || !strings.Contains(out, `"id":"modelpub-`) {
+		t.Fatalf("source-driven dry-run failed [exit %d]\n%s", code, out)
+	}
+	code, out = runCozy(t, root, "model", "publish", "acme/model", local,
+		"--release", "1.2.3", "--dry-run", "--detach")
+	if code != 2 || !strings.Contains(out, "conflict") {
+		t.Fatalf("dry-run plus detach was accepted [exit %d]\n%s", code, out)
 	}
 	code, help = runCozy(t, root, "model", "download", "--help")
 	if code != 0 || strings.Contains(strings.ToLower(help), "snapshot") {
