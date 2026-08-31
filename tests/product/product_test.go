@@ -887,15 +887,12 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 		t.Fatalf("version-in-path remedy was not useful [exit %d]\n%s", code, out)
 	}
 
-	if code, out := runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--local", "--rental"); code != 2 ||
-		!strings.Contains(out, "mutually exclusive") {
-		t.Fatalf("local plus rental did not refuse [exit %d]\n%s", code, out)
-	}
-	if code, out := runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--machine", "local"); code != 2 ||
-		!strings.Contains(out, "unknown flag") {
-		t.Fatalf("deleted --machine did not refuse [exit %d]\n%s", code, out)
+	for _, deleted := range []string{"--local", "--cloud", "--machine"} {
+		if code, out := runCozy(t, root, "run", weightlessRef+"/tile",
+			"size=32", "seed=7", deleted); code != 2 ||
+			!strings.Contains(out, "unknown flag") {
+			t.Fatalf("deleted %s did not refuse [exit %d]\n%s", deleted, code, out)
+		}
 	}
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
 		"size=32", "seed=7", "--idempotency-key", "placement-proof", "--json")
