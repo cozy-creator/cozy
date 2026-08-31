@@ -65,23 +65,21 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	runtimeBin, problem := launch.RefreshLocalBase(existingLayout.Root, existingLayout.LocalBase,
-		ctx.Cfg.Tool())
-	if problem != nil {
-		existing.Close()
-		return problem
-	}
 	_, generation, problem := existing.ActivePackage(ref.String())
 	if problem != nil {
 		existing.Close()
 		return problem
 	}
-	if generation != nil && generation.SourceDigest == releaseDigest &&
-		launch.PreparedOnLocalBase(*generation, existingLayout.LocalBase) {
+	if generation != nil && generation.SourceDigest == releaseDigest {
 		defer existing.Close()
 		return emitInstallResult(ctx, existingLayout, existing, &install.Result{Gen: *generation, Idempotent: true})
 	}
 	existing.Close()
+	runtimeBin, problem := launch.RefreshLocalBase(existingLayout.Root, existingLayout.LocalBase,
+		ctx.Cfg.Tool())
+	if problem != nil {
+		return problem
+	}
 	layout, problem := home.Open(ctx.Cfg.Home)
 	if problem != nil {
 		return problem

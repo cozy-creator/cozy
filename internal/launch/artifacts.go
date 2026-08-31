@@ -1,10 +1,7 @@
 package launch
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -109,19 +106,6 @@ func RefreshGenerationBase(generation records.PackageInstall, cozyHome, path str
 ) *exit.Error {
 	runtime := RuntimeCLI{Bin: Binary(generation), Dir: SourceDir(generation), Home: cozyHome, Env: env}
 	return runtime.call(nil, "local-base", "--out", path)
-}
-
-// PreparedOnLocalBase verifies only byte identity: Runtime owns the manifest
-// schema and staged its exact bytes into the generation cache during preparation.
-func PreparedOnLocalBase(generation records.PackageInstall, current string) bool {
-	raw, err := os.ReadFile(current)
-	if err != nil {
-		return false
-	}
-	digest := sha256.Sum256(raw)
-	staged, err := os.ReadFile(filepath.Join(generation.Dir, "artifact-cache",
-		hex.EncodeToString(digest[:])))
-	return err == nil && bytes.Equal(raw, staged)
 }
 
 // json runs one verb and decodes its `--json` document.

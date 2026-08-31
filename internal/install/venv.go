@@ -86,6 +86,72 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 	return env, nil
 }
 
+// MaterializePublishedEnvironment recreates the frozen local environment from the exact
+// published project metadata, then installs the exact project and custom wheels. Registry
+// dependencies come from uv.lock; wheel paths replace only distributions whose published
+// bytes are authoritative. Nothing is inherited from Creator's own Python environment.
+func MaterializePublishedEnvironment(sourceDir, venvDir string, project PublishedWheel,
+	dependencies []PublishedWheel,
+) (*EnvironmentReceipt, *exit.Error) {
+	lock := filepath.Join(sourceDir, "uv.lock")
+	lockDigest, err := fileDigest(lock)
+	if err != nil {
+		return nil, exit.Named(exit.Structural, "lock_missing",
+			"the published release carries no uv.lock").
+			WithRemedy("publish the exact uv.lock that freezes the package environment")
+	}
+	env := &EnvironmentReceipt{
+		LockDigest: "sha256:" + lockDigest,
+		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
+		UV:         toolVersion("uv", "--version"),
+	}
+	args := []string{"sync", "--locked", "--no-progress", "--no-install-project"}
+	seen := map[string]bool{}
+	for _, wheel := range dependencies {
+		name := strings.TrimSpace(wheel.Distribution)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		args = append(args, "--no-install-package", name)
+	}
+	if problem := runUV(sourceDir, append(config.Frozen().Tool(),
+		"UV_PROJECT_ENVIRONMENT="+venvDir), args...); problem != nil {
+		return nil, problem
+	}
+	wheels := append([]PublishedWheel{project}, dependencies...)
+	args = []string{"pip", "install", "--offline", "--no-index", "--no-deps", "--no-build",
+		"--python", home.VenvPython(venvDir)}
+	for _, wheel := range wheels {
+		args = append(args, wheel.Path)
+	}
+	if problem := runUV(sourceDir, config.Frozen().Tool(), args...); problem != nil {
+		return nil, problem
+	}
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "pip", "check", "--python",
+		home.VenvPython(venvDir)); problem != nil {
+		return nil, problem
+	}
+	env.Python = pythonVersion(venvDir)
+	env.Packages, env.Closure = closure(venvDir)
+	return env, nil
+}
+
+func runUV(dir string, env []string, args ...string) *exit.Error {
+	cmd := exec.Command("uv", args...)
+	cmd.Dir = dir
+	cmd.Env = env
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Run(); err != nil {
+		return exit.Named(exit.Structural, "package_environment_refused",
+			"`uv %s` refused the package environment", strings.Join(args, " ")).
+			WithRemedy("uv said: %s", condense(out.String())).
+			WithNext("cozy help package install")
+	}
+	return nil
+}
+
 // Disk measures one generation exactly once, at install: bytes only this generation
 // holds, and bytes it shares with another venv through a hardlink. `cozy package list` reads
 // these numbers back out of the record — it never walks 122k files.

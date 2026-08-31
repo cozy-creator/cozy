@@ -28,16 +28,6 @@ func Read(gen records.PackageInstall, cozyHome string, env []string) (*Facts, *e
 	}
 	runtimeBin, descriptor := Binary(gen), ""
 	if gen.SourceKind == "tensorhub" {
-		localBase := filepath.Join(cozyHome, "local-base.json")
-		runtimeBin, e = RefreshLocalBase(cozyHome, localBase, env)
-		if e != nil {
-			return nil, e
-		}
-		if !PreparedOnLocalBase(gen, localBase) {
-			return nil, exit.Named(exit.Conflict, "local_base_changed",
-				"%s was prepared against an older local Runtime base", gen.Package).
-				WithRemedy("run `cozy package install %s` to rebuild its small overlay", gen.Package)
-		}
 		descriptor = DescriptorPath(gen.Dir)
 	}
 	return &Facts{
@@ -115,13 +105,9 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 			ArtifactStore: filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
 		}, nil
 	}
-	runtimeBin, e := HostRuntime()
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, e
-	}
 	return orchestrator.WorkerLaunchSpec{
 		Placement: placement,
-		Python:    runtimeBin, Args: []string{"serve"},
+		Python:    Binary(f.Install), Args: []string{"serve"},
 		Dir:             f.Source,
 		Devices:         devices,
 		GraceSec:        3,

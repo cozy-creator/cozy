@@ -184,7 +184,8 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			return fail(exit.Internalf("cannot create package generation: %s", err))
 		}
 		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "tensorhub", req.Published.Package+"@"+req.Published.Release, req.Published.SourceDigest
-		gen.Package, gen.Version, gen.ProjectDir = req.Published.Package, req.Published.Release, genDir
+		gen.Package, gen.Version, gen.ProjectDir = req.Published.Package, req.Published.Release,
+			filepath.Join(genDir, "source")
 		if e := validatePublished(gen, req.Published); e != nil {
 			return fail(e)
 		}

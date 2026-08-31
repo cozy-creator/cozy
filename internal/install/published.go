@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -19,9 +18,9 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// preparePublished asks the one trusted Runtime to install/import the exact small
-// wheel overlay and author its resident routing facts. Creator only stages bytes and
-// compares Runtime's descriptor with the committed publication descriptor.
+// preparePublished materializes the release's complete frozen uv environment, then asks
+// that environment's Runtime to author its resident routing facts. Creator compares the
+// derived descriptor with the committed publication descriptor.
 func preparePublished(l home.Layout, genDir, runtimeBin string, published *PublishedSource) (
 	*launch.PackageDescriptor, ExactDocument, string, *EnvironmentReceipt, *exit.Error,
 ) {
@@ -33,9 +32,14 @@ func preparePublished(l home.Layout, genDir, runtimeBin string, published *Publi
 	if err := os.MkdirAll(sourceDir, 0o700); err != nil {
 		return nil, empty, "", nil, exit.Internalf("cannot create package metadata directory: %s", err)
 	}
-	if err := os.WriteFile(filepath.Join(sourceDir, "package.toml"),
-		published.PackageConfig.Bytes, 0o400); err != nil {
-		return nil, empty, "", nil, exit.Internalf("cannot retain exact package.toml: %s", err)
+	for name, document := range map[string]ExactDocument{
+		"package.toml":   published.PackageConfig,
+		"pyproject.toml": published.Pyproject,
+		"uv.lock":        published.UVLock,
+	} {
+		if err := os.WriteFile(filepath.Join(sourceDir, name), document.Bytes, 0o400); err != nil {
+			return nil, empty, "", nil, exit.Internalf("cannot retain exact %s: %s", name, err)
+		}
 	}
 	cache := filepath.Join(genDir, "artifact-cache")
 	setDir := filepath.Join(cache, "sets", "package")
@@ -49,6 +53,18 @@ func preparePublished(l home.Layout, genDir, runtimeBin string, published *Publi
 		if problem := stagePublishedWheel(cache, setDir, &published.Wheels[index]); problem != nil {
 			return nil, empty, "", nil, problem
 		}
+	}
+	venvDir := filepath.Join(genDir, "venv")
+	environment, problem := MaterializePublishedEnvironment(sourceDir, venvDir,
+		published.ProjectWheel, published.Wheels)
+	if problem != nil {
+		return nil, empty, "", nil, problem
+	}
+	runtimeBin = home.VenvTool(venvDir, "cozy-runtime")
+	if info, err := os.Stat(runtimeBin); err != nil || !info.Mode().IsRegular() {
+		return nil, empty, "", nil, exit.Named(exit.Structural, "runtime_missing",
+			"the published package environment provides no cozy-runtime").
+			WithRemedy("declare cozy-runtime in pyproject.toml and refresh uv.lock")
 	}
 
 	args := []string{"--json", "prepare-package",
@@ -126,12 +142,9 @@ func preparePublished(l home.Layout, genDir, runtimeBin string, published *Publi
 	if err := os.WriteFile(placementPath, answer.PlacementSet.Bytes, 0o600); err != nil {
 		return nil, empty, "", nil, exit.Internalf("cannot store prepared package placement: %s", err)
 	}
-	closure := []string{fact.Sub("project_wheel").Str("distribution") + "==" +
-		fact.Sub("project_wheel").Str("version")}
 	selectedDependencies := map[string]bool{}
 	for _, wheel := range prepared.Sub("environment").List("wheels") {
 		selectedDependencies[wheel.Sub("ref").Str("digest")] = true
-		closure = append(closure, wheel.Str("distribution")+"=="+wheel.Str("version"))
 	}
 	if err := os.Remove(published.ProjectWheel.Path); err != nil {
 		return nil, empty, "", nil, exit.Internalf("cannot remove prepared project-wheel view: %s", err)
@@ -154,11 +167,8 @@ func preparePublished(l home.Layout, genDir, runtimeBin string, published *Publi
 			}
 		}
 	}
-	sort.Strings(closure)
-	environment := &EnvironmentReceipt{
-		Python: "CPython 3.12", Platform: "linux/amd64",
-		Packages: len(closure), Closure: strings.Join(closure, "\n"),
-	}
+	// The placement records the exact wheel subset used by a rental base. The local
+	// environment receipt above records the complete frozen closure this machine runs.
 	return descriptor, answer.PlacementSet, runtimeBin, environment, nil
 }
 

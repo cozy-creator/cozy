@@ -455,10 +455,10 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		fatal(t, problem)
 		wheels[identity.Distribution] = identity.Version
 	}
-	if len(pack.DependencyWheels) != 2 || wheels["local-b"] != "2.1.0" ||
+	if len(pack.DependencyWheels) != 3 || wheels["local-b"] != "2.1.0" ||
 		wheels["local-c"] != "3.0.0" || wheels["cozy-runtime"] != "" || //cozy:allow distribution assertion, not executable access
-		wheels["msgspec"] != "" { //cozy:allow distribution assertion, not executable access
-		t.Fatalf("local dependency closure did not include only the requested local wheels: %+v", pack.DependencyWheels)
+		wheels["msgspec"] == "" { //cozy:allow distribution assertion, not executable access
+		t.Fatalf("package dependency closure omitted an ordinary library: %+v", pack.DependencyWheels)
 	}
 	for _, dependency := range pack.DependencyWheels {
 		if !strings.HasSuffix(dependency.Filename, ".whl") {
@@ -472,7 +472,7 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 	// The closed shared-base contract omits the local source candidate. Runtime
 	// validates the requirement against the actual base before installation.
 	if wheels["cozy-runtime"] != "" { //cozy:allow distribution assertion, not executable access
-		t.Fatalf("platform-owned Runtime candidate entered the overlay: %+v", pack.DependencyWheels)
+		t.Fatalf("rental-base Runtime candidate entered the package wheels: %+v", pack.DependencyWheels)
 	}
 
 	writePublishProject(t, a, "local-a", "1.0.0", []string{"local-b>=3"},
