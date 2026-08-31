@@ -44,7 +44,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	_, existing, _, problem := open(ctx.Cfg, false)
+	existingLayout, existing, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return problem
 	}
@@ -56,7 +56,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if generation != nil && generation.SourceDigest == releaseDigest &&
 		generation.PlacementSetDigest == plan.PlacementSet.Digest {
 		defer existing.Close()
-		return emitInstallResult(ctx, existing, &install.Result{Gen: *generation, Idempotent: true})
+		return emitInstallResult(ctx, existingLayout, existing, &install.Result{Gen: *generation, Idempotent: true})
 	}
 	existing.Close()
 	layout, problem := home.Open(ctx.Cfg.Home)
@@ -93,7 +93,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	return emitInstallResult(ctx, st, result)
+	return emitInstallResult(ctx, layout, st, result)
 }
 
 func localPackageInstallTarget(ctx *Context) (hub.PackageInstallTarget, *exit.Error) {

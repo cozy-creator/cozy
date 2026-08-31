@@ -45,3 +45,12 @@ func deviceOf(p string) (uint64, bool) {
 	}
 	return uint64(serial), true
 }
+
+// Windows requires the writable bit for a read-only file to be removed. Directories
+// also need traversal permission while the retired tree is walked.
+func removalMode(info fs.FileInfo) fs.FileMode {
+	if info.IsDir() {
+		return info.Mode().Perm() | 0o700
+	}
+	return info.Mode().Perm() | 0o200
+}
