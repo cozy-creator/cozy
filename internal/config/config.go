@@ -53,6 +53,9 @@ type Config struct {
 
 	Tfs       string
 	TfsSource string
+	// TensorFSRegistry is an operator/test-only override. Ordinary imports use
+	// the reviewed registry embedded by the installed TensorFS binary.
+	TensorFSRegistry string
 
 	LocalRateMicroUSDPerHour       int64
 	LocalRateSource                string
@@ -74,6 +77,7 @@ type values struct {
 	HuggingFaceToken         string `name:"huggingface_token"`
 	CivitaiToken             string `name:"civitai_token"`
 	Tfs                      string `name:"tfs" default:"tfs"`
+	TensorFSRegistry         string `name:"tensorfs_registry"`
 	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
 	RentalsMaxHourlySpendUSD string `name:"rentals_max_hourly_spend_usd" default:"0"`
 	Port                     int    `name:"port" default:"8818"`
@@ -122,6 +126,7 @@ var environmentNames = map[string]string{
 	"huggingface_token": "HF_TOKEN",
 	"civitai_token":     "CIVITAI_TOKEN",
 	"tfs":               "COZY_TFS",
+	"tensorfs_registry": "COZY_TFS_REGISTRY",
 	"bootstrap":         "COZY_BOOTSTRAP_CREDENTIAL",
 }
 
@@ -180,6 +185,7 @@ func load() (Config, *exit.Error) {
 		CivitaiTokenSource:             sourceOf("civitai_token", file, environment, "unset"),
 		Tfs:                            strings.TrimSpace(input.Tfs),
 		TfsSource:                      sourceOf("tfs", file, environment, "default"),
+		TensorFSRegistry:               strings.TrimSpace(input.TensorFSRegistry),
 		LocalRateMicroUSDPerHour:       input.LocalRateMicroUSDPerHour,
 		LocalRateSource:                sourceOf("local_rate_micro_usd_per_hour", file, environment, "unset"),
 		RentalsMaxHourlySpendUSDMicros: rentalCap,
