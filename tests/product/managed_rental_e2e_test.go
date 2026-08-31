@@ -28,6 +28,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	var descriptorDigest string
 	var rentalRequest map[string]any
 	var createReason, deleteReason string
+	activeRentalID := "pr-managed-e2e"
 	posts, deletes := 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -72,20 +73,20 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			}
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"rental_id": "pr-managed-e2e", "state": "pending_acquisition",
+				"rental_id": activeRentalID, "state": "pending_acquisition",
 				"requested_accelerator_model": "GPU C", "hourly_rate_usd_micros": 300_000,
 			})
-		case r.Method == http.MethodDelete && r.URL.Path == "/v1/rentals/pr-managed-e2e":
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/rentals/"+activeRentalID:
 			deletes++
 			deleteReason = r.Header.Get("X-Tensorhub-Reason")
 			w.WriteHeader(http.StatusNoContent)
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/pr-managed-e2e":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/"+activeRentalID:
 			state := "ready"
 			if deletes > 0 {
 				state = "released"
 			}
 			answer := map[string]any{
-				"rental_id": "pr-managed-e2e", "state": state,
+				"rental_id": activeRentalID, "state": state,
 				"requested_accelerator_model": "GPU C", "hourly_rate_usd_micros": 300_000,
 			}
 			if state == "ready" {
@@ -121,6 +122,11 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	for _, entrypoint := range entrypoints {
 		row := entrypoint.(map[string]any)
 		if row["name"] == "tile" {
+			encoded, _ := json.Marshal(row)
+			var job map[string]any
+			must(t, json.Unmarshal(encoded, &job))
+			job["name"], job["publishes"] = "tile_job", false
+			descriptorDocument["jobs"] = []any{job}
 			row["models"] = []any{map[string]any{
 				"class": "TinyModel", "path": "tile.models.model",
 				"stamps": map[string]any{}, "component_use": map[string]any{"core": []any{"tile"}},
@@ -131,6 +137,10 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	descriptor, _ = json.Marshal(descriptorDocument)
 	decoded, problem := launch.DecodeDescriptor(descriptor)
 	fatal(t, problem)
+	jobDescriptorID := decoded.Jobs[0].DescriptorID
+	if jobDescriptorID == "" {
+		t.Fatal("remote job descriptor id was not derived")
+	}
 	descriptorDigest = decoded.Digest
 	store, problem := records.Open(filepath.Join(root, "records.db"))
 	fatal(t, problem)
@@ -229,5 +239,56 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	mu.Unlock()
 	if code != 0 || !strings.Contains(out, `"changed":false`) || gotPosts != 1 {
 		t.Fatalf("exact replay purchased again [exit %d posts=%d]\n%s", code, gotPosts, out)
+	}
+
+	mu.Lock()
+	posts, deletes, rentalRequest, createReason, deleteReason = 0, 0, nil, "", ""
+	activeRentalID = "pr-managed-job"
+	mu.Unlock()
+	code, out = runCozy(t, root, "run", weightlessRef+"/tile_job", "size=32", "seed=7",
+		"--rental", "--detach", "--idempotency-key", "managed-job", "--json")
+	if code != 0 || !strings.Contains(out, `"changed":true`) {
+		t.Fatalf("remote job submission [exit %d]\n%s\ndaemon:\n%s", code, out, daemonOutput.String())
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	request = nil
+	for time.Now().Before(deadline) {
+		store, problem = records.Open(filepath.Join(root, "records.db"))
+		fatal(t, problem)
+		rows, rowsProblem := store.RequestsOfKind("job", "", 20)
+		fatal(t, rowsProblem)
+		for i := range rows {
+			if rows[i].IdemKey == "managed-job" {
+				row := rows[i]
+				request = &row
+			}
+		}
+		rentalRow, _ := store.RentalRow("pr-managed-job")
+		store.Close()
+		mu.Lock()
+		done := posts == 1 && deletes == 1 && rentalRow == nil && request != nil && request.State == "failed"
+		mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	mu.Lock()
+	gotPosts, gotDeletes, body = posts, deletes, rentalRequest
+	mu.Unlock()
+	if request == nil || request.Worker != "pr-managed-job" || request.PlanID != jobDescriptorID || request.Kind != "job" ||
+		request.Release != "1.0.0" || request.PackageRevisionDigest != releaseDigest ||
+		request.JobGPUCount != 0 || len(request.Models) != 0 || gotPosts != 1 || gotDeletes != 1 ||
+		strings.Contains(fmt.Sprint(body), weightlessRef) || strings.Contains(fmt.Sprint(body), "tile_job") {
+		t.Fatalf("remote job lifecycle request=%+v posts=%d deletes=%d body=%v",
+			request, gotPosts, gotDeletes, body)
+	}
+	code, out = runCozy(t, root, "run", weightlessRef+"/tile_job", "size=32", "seed=7",
+		"--rental", "--detach", "--idempotency-key", "managed-job", "--json")
+	mu.Lock()
+	gotPosts = posts
+	mu.Unlock()
+	if code != 0 || !strings.Contains(out, `"changed":false`) || gotPosts != 1 {
+		t.Fatalf("remote job replay purchased again [exit %d posts=%d]\n%s", code, gotPosts, out)
 	}
 }

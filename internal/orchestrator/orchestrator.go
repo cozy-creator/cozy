@@ -121,6 +121,17 @@ type LogicalPackage struct {
 	Models        []ModelRef
 }
 
+type LogicalJob struct {
+	Package         string
+	Release         string
+	ReleaseDigest   string
+	Function        string
+	DescriptorID    string
+	Outputs         []string
+	ArtifactOutputs []ArtifactOutput
+	GPUCount        int64
+}
+
 type ModelRef = records.ModelRef
 
 // Orchestrator is the Cozy daemon's scheduling role.

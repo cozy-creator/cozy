@@ -30,10 +30,13 @@ import (
 
 // JobSubmission is the job submit body.
 type JobSubmission struct {
-	Package   string          `json:"package"`
-	Function  string          `json:"function"`
-	Input     json.RawMessage `json:"input"`
-	InstallID string          `json:"install_id,omitempty"`
+	Package       string          `json:"package"`
+	Function      string          `json:"function"`
+	Input         json.RawMessage `json:"input"`
+	InstallID     string          `json:"install_id,omitempty"`
+	Release       string          `json:"release,omitempty"`
+	ReleaseDigest string          `json:"release_digest,omitempty"`
+	Rental        bool            `json:"rental,omitempty"`
 	// Org is the publishing org whose SCRATCH repo this job lands in
 	// (`<org>/_job-<request-id>`). It defaults to `local` — a local host has no identity
 	// plane yet (decisions #229) and inventing one would be a fake account.
@@ -153,6 +156,7 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 	out := orchestrator.Submission{
 		Kind: "job", Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org),
+		Release: sub.Release, ReleaseDigest: sub.ReleaseDigest, Rental: sub.Rental,
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
@@ -165,6 +169,20 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 	}
 	if s.packages == nil {
 		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
+	}
+	if out.Rental {
+		if sub.InstallID != "" || sub.Release == "" || sub.ReleaseDigest == "" || len(sub.Trees) > 0 {
+			return out, exit.Named(exit.Validation, "rental.job_release_incomplete",
+				"remote jobs require one exact published release and no local input trees")
+		}
+		logical, problem := s.packages.ResolveRemoteJob(
+			sub.Package, sub.Release, sub.ReleaseDigest, sub.Function)
+		if problem != nil {
+			return out, problem
+		}
+		out.PlanID, out.Outputs = logical.DescriptorID, logical.Outputs
+		out.ArtifactOutputs, out.JobGPUCount = logical.ArtifactOutputs, logical.GPUCount
+		return out, nil
 	}
 	refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
 	if refreshProblem != nil {
@@ -201,6 +219,7 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 		out.PlanID = job.DescriptorID
 		out.Outputs = job.Outputs
 		out.ArtifactOutputs = job.ArtifactOutputs
+		out.JobGPUCount = job.GPUCount
 	}
 	if out.PlanID == "" {
 		return out, exit.Named(exit.NotFound, "unknown_job",
@@ -260,6 +279,12 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"outputs":          strings.Join(spec.Outputs, ","),
 		"artifact_outputs": artifactOutputs,
 		"trees":            strings.Join(spec.Trees, ","),
+		"job_gpu_count":    spec.JobGPUCount,
+	}
+	if spec.Rental {
+		doc["rental"] = true
+		doc["release"] = spec.Release
+		doc["release_digest"] = spec.ReleaseDigest
 	}
 	data, err := canonical.Write(doc)
 	if err != nil {

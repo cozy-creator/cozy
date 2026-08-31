@@ -22,6 +22,7 @@ package launch
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -55,12 +56,13 @@ type PackageDescriptor struct {
 // Entrypoint is one callable surface: its request schema, its declared model slots, and
 // its result shape.
 type Entrypoint struct {
-	Name      string `json:"name"`
-	Kind      string `json:"-"`
-	Models    []Slot `json:"models"`
-	Request   Struct `json:"request"`
-	Result    Struct `json:"result"`
-	Publishes bool   `json:"publishes"`
+	Name         string `json:"name"`
+	Kind         string `json:"-"`
+	DescriptorID string `json:"-"`
+	Models       []Slot `json:"models"`
+	Request      Struct `json:"request"`
+	Result       Struct `json:"result"`
+	Publishes    bool   `json:"publishes"`
 	// ArtifactOutputs is the job's explicit ArtifactSink slot set. It is separate from
 	// result asset fields because worker-protocol rev5 OutputBinding has no kind.
 	ArtifactOutputs []ArtifactOutput `json:"artifact_outputs"`
@@ -455,6 +457,12 @@ func DecodeDescriptor(data []byte) (*PackageDescriptor, *exit.Error) {
 	if d.Format != descriptorFormat || d.Application == "" {
 		return nil, exit.New(exit.Validation, "%s format/application is invalid", DescriptorFile)
 	}
+	var raw struct {
+		Jobs []json.RawMessage `json:"jobs"`
+	}
+	if err := json.Unmarshal(normalized, &raw); err != nil || len(raw.Jobs) != len(d.Jobs) {
+		return nil, exit.New(exit.Validation, "%s carries invalid job rows", DescriptorFile)
+	}
 	for i := range d.Entrypoints {
 		d.Entrypoints[i].Kind = "entrypoint"
 		if problem := validateEntrypoint(&d.Entrypoints[i]); problem != nil {
@@ -463,6 +471,11 @@ func DecodeDescriptor(data []byte) (*PackageDescriptor, *exit.Error) {
 	}
 	for i := range d.Jobs {
 		d.Jobs[i].Kind = "job"
+		digest := sha256.Sum256(append([]byte("cozy.runtime.job-descriptor\x00"), raw.Jobs[i]...))
+		d.Jobs[i].DescriptorID, err = canonical.Spell(digest[:])
+		if err != nil {
+			return nil, exit.Internalf("cannot spell job descriptor id: %s", err)
+		}
 		if problem := validateEntrypoint(&d.Jobs[i]); problem != nil {
 			return nil, problem
 		}

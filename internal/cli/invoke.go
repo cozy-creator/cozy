@@ -77,10 +77,21 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		}
 		return handleRun(ctx, target, callable)
 	}
-	if ctx.Inv.Bool("--stream") || ctx.Inv.Bool("--rental") || len(ctx.Inv.Values["--asset"]) > 0 ||
+	if ctx.Inv.Bool("--stream") || len(ctx.Inv.Values["--asset"]) > 0 ||
 		ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
-			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --detach, and local execution")
+			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --detach, and --rental")
+	}
+	if ctx.Inv.Bool("--rental") && len(callable.Models) > 0 {
+		return exit.Named(exit.Unavailable, "rental.modeled_job_unsupported",
+			"remote jobs with model slots are not supported yet")
+	}
+	if len(ctx.Inv.Values["--model"]) > 0 {
+		return exit.Usagef("--model applies to serving callables; remote modeled jobs are not supported yet")
+	}
+	if ctx.Inv.Bool("--rental") && len(ctx.Inv.Values["--input"]) > 0 {
+		return exit.Named(exit.Unavailable, "rental.job_input_tree_unsupported",
+			"remote jobs cannot grant a local input-tree directory")
 	}
 	if !ctx.Inv.Bool("--detach") {
 		ctx.Inv.Bools["--follow"] = true

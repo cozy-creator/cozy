@@ -312,6 +312,61 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function st
 	}, entrypoint, nil
 }
 
+func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string) (
+	orchestrator.LogicalJob, *exit.Error,
+) {
+	var empty orchestrator.LogicalJob
+	if _, err := canonical.Raw(releaseDigest); err != nil || release == "" {
+		return empty, exit.Named(exit.Structural, "rental.package_release_digest_invalid",
+			"remote package release identity is incomplete")
+	}
+	ref, problem := hub.ParseRef(pkg)
+	if problem != nil {
+		return empty, problem
+	}
+	ctx, cancel := hub.Context()
+	defer cancel()
+	detail, problem := r.catalog.PackageRelease(ctx, ref, release)
+	if problem != nil {
+		return empty, problem
+	}
+	if detail.Release.Release != release || detail.Release.ReleaseDigest != releaseDigest ||
+		detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
+		return empty, exit.Named(exit.Conflict, "rental.package_release_changed",
+			"Tensorhub release %s@%s does not match the queued immutable release", pkg, release)
+	}
+	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
+	if problem != nil || descriptor.Digest != detail.Release.PackageDescriptorDigest {
+		return empty, exit.Named(exit.Conflict, "rental.package_descriptor_digest_mismatch",
+			"Tensorhub descriptor bytes do not match their release fact")
+	}
+	job, problem := descriptor.Function(function)
+	if problem != nil {
+		return empty, problem
+	}
+	if job.Kind != "job" || job.DescriptorID == "" {
+		return empty, exit.Named(exit.Validation, "rental.job_descriptor_invalid",
+			"%s is not a published job callable", function)
+	}
+	if len(job.Models) > 0 {
+		return empty, exit.Named(exit.Unavailable, "rental.modeled_job_unsupported",
+			"remote job %s declares model slots", function)
+	}
+	artifacts := make([]orchestrator.ArtifactOutput, 0, len(job.ArtifactOutputs))
+	outputs := launch.AssetPaths(job.Result)
+	for _, output := range job.ArtifactOutputs {
+		artifacts = append(artifacts, orchestrator.ArtifactOutput{
+			OutputID: output.OutputID, MimeType: output.MimeType, MaxBytes: output.MaxBytes,
+		})
+		outputs = append(outputs, output.OutputID)
+	}
+	return orchestrator.LogicalJob{
+		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
+		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
+		ArtifactOutputs: artifacts, GPUCount: job.Resources.GPUCount,
+	}, nil
+}
+
 func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error) {
 	_, descriptor, problem := r.installDescriptor(installID)
 	if problem != nil {
