@@ -305,8 +305,12 @@ func (m *managedRentals) lineLocked() (string, *exit.Error) {
 	if problem != nil {
 		return "", problem
 	}
-	return fmt.Sprintf("rentals: %d remote machines running · %s of %s",
-		count, usdPerHour(burn), usdPerHour(m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros)), nil
+	machine := "machine"
+	if count != 1 {
+		machine = "machines"
+	}
+	return fmt.Sprintf("rentals: %d remote %s running · %s of %s",
+		count, machine, usdPerHour(burn), usdPerHour(m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros)), nil
 }
 
 func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
@@ -326,10 +330,10 @@ func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
 
 func usdPerHour(micros int64) string {
 	whole, fraction := micros/1_000_000, micros%1_000_000
-	if fraction == 0 {
-		return fmt.Sprintf("$%d/hour", whole)
+	decimal := fmt.Sprintf("%06d", fraction)
+	for len(decimal) > 2 && decimal[len(decimal)-1] == '0' {
+		decimal = decimal[:len(decimal)-1]
 	}
-	decimal := strings.TrimRight(fmt.Sprintf("%06d", fraction), "0")
 	return fmt.Sprintf("$%d.%s/hour", whole, decimal)
 }
 

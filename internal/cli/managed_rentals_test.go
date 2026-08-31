@@ -45,7 +45,7 @@ func TestRentalFleetUsesLockedRatesAndReusesCheapestIdleMachine(t *testing.T) {
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	if line != "rentals: 2 remote machines running · $1.15/hour of $2/hour" {
+	if line != "rentals: 2 remote machines running · $1.15/hour of $2.00/hour" {
 		t.Fatalf("fleet line = %q", line)
 	}
 	id, after, problem := fleet.acquire(request)
@@ -148,7 +148,7 @@ func TestManagedRentalAcquiresCheapestSKUAndLocksReturnedRate(t *testing.T) {
 		t.Fatal(problem)
 	}
 	if posts != 1 || request["sku"] != "cheap" || id != "pr-managed-proof" ||
-		line != "rentals: 1 remote machines running · $0.3/hour of $1/hour" {
+		line != "rentals: 1 remote machine running · $0.30/hour of $1.00/hour" {
 		t.Fatalf("acquisition posts=%d request=%v id=%q line=%q", posts, request, id, line)
 	}
 	row, problem := store.RentalRow(id)
@@ -172,7 +172,7 @@ func TestManualRentalIsNeverAutoReleased(t *testing.T) {
 		Home: layout.Root, HubURL: "http://127.0.0.1:1", RentalsMaxHourlySpendUSDMicros: 1_000_000,
 	}}
 	line, problem := (&managedRentals{ctx: ctx, layout: layout, store: store}).release(row.ID)
-	if problem != nil || !strings.Contains(line, "1 remote machines") {
+	if problem != nil || !strings.Contains(line, "1 remote machine") {
 		t.Fatalf("manual release decision = %q, %v", line, problem)
 	}
 	if kept, problem := store.RentalRow(row.ID); problem != nil || kept == nil {
@@ -211,7 +211,7 @@ func TestManagedRentalReleasesOnlyAfterItsAssignedQueueDrains(t *testing.T) {
 		RentalsMaxHourlySpendUSDMicros: 1_000_000,
 	}}
 	line, problem := (&managedRentals{ctx: ctx, layout: layout, store: store}).release(row.ID)
-	if problem != nil || deletes != 1 || line != "rentals: 0 remote machines running · $0/hour of $1/hour" {
+	if problem != nil || deletes != 1 || line != "rentals: 0 remote machines running · $0.00/hour of $1.00/hour" {
 		t.Fatalf("managed release deletes=%d line=%q problem=%v", deletes, line, problem)
 	}
 	if kept, problem := store.RentalRow(row.ID); problem != nil || kept != nil {
