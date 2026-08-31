@@ -7,15 +7,64 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tensorfs_core::canon::Value;
+use tensorfs_core::compat::{Accepts, CodeTopology, Requirement};
 use tensorfs_core::corpus;
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::header::{Closure as CoreClosure, Header};
-use tensorfs_core::ids::{self, Doc};
+use tensorfs_core::ids::{self, Doc, Plain};
 use tensorfs_core::manifest::Manifest;
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 
 use crate::errors::IntoPy;
+
+type CodeTensorRow = (String, String, String, Vec<u64>, Option<Vec<String>>);
+
+/// Author one canonical CodeTopology from already-projected MCC logical tensors.
+/// TensorFS receives exact component/key fields; it never parses MCC or guesses prefixes.
+#[pyfunction(name = "_code_topology")]
+pub fn code_topology<'p>(
+    py: Python<'p>,
+    contract_digest: &str,
+    tensors: Vec<CodeTensorRow>,
+) -> PyResult<Bound<'p, PyBytes>> {
+    if tensors.is_empty() {
+        return tensorfs_core::err::refuse(
+            tensorfs_core::err::Code::EMPTY_COMPONENTS,
+            "CodeTopology requires at least one tensor",
+        )
+        .or_refuse(py);
+    }
+    let mut components: Vec<(String, Vec<(String, Requirement)>)> = Vec::new();
+    let mut prior: Option<(String, String)> = None;
+    for (component, key, dtype, shape, accepts) in tensors {
+        let identity = (component.clone(), key.clone());
+        if prior.as_ref().is_some_and(|held| held >= &identity) {
+            return tensorfs_core::err::refuse(
+                tensorfs_core::err::Code::SORT_ORDER,
+                "CodeTensor rows must be sorted and unique by (component,key)",
+            )
+            .or_refuse(py);
+        }
+        prior = Some(identity);
+        let requirement = Requirement {
+            dtype: Dtype::parse(&dtype).or_refuse(py)?,
+            shape,
+            accepts: accepts.map(Accepts::OneOf).unwrap_or(Accepts::Any),
+        };
+        match components.last_mut() {
+            Some((held, keys)) if held == &component => keys.push((key, requirement)),
+            _ => components.push((component, vec![(key, requirement)])),
+        }
+    }
+    let topology = CodeTopology {
+        contract: contract_digest.to_string(),
+        components,
+    };
+    let raw = topology.canonical_bytes();
+    CodeTopology::parse(&raw).or_refuse(py)?;
+    Ok(PyBytes::new(py, &raw))
+}
 
 /// Canonical `Value` -> plain Python data. The document's shape survives; its Rust types do
 /// not cross, so no Python-side schema knowledge is needed or possible.

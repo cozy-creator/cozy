@@ -20,7 +20,7 @@ use crate::ids::{ascii_name, hex64, Doc, ObjectRef, Plain};
 use crate::limits;
 use crate::manifest::Manifest;
 use crate::repository::{
-    IngestProvenance, Mutation, ReleaseEvidence, RepositoryName, VerificationEvidence,
+    CheckpointEvidence, IngestProvenance, Mutation, RepositoryName, VerificationEvidence,
 };
 use crate::spec::EncodingSpec;
 use crate::store::{Store, Verdict};
@@ -321,11 +321,13 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
         length: snap.canonical_bytes().len() as u64,
     };
     let classification_digest = header.topology_digest();
-    let evidence = ReleaseEvidence {
+    let evidence = CheckpointEvidence {
         classification_digest: classification_digest.clone(),
         ingest: Some(ingest),
         verification: Some(verification),
     };
+    let checkpoint_manifest = manifest.clone();
+    let checkpoint_evidence = evidence.clone();
     let mutation = if repo.org == "local" {
         if lane != "local" {
             return refuse(Code::KEY_GRAMMAR, "local ingest requires lane local");
@@ -344,7 +346,6 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
             manifest,
             metadata: None,
             version: version.to_string(),
-            evidence: Some(Box::new(evidence)),
         }
     };
     let path = store.repository_path(&repo);
@@ -369,7 +370,7 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
             (digest, Some(bytes)) => {
                 let expected = crate::ids::prefixed("observed repository", digest)?;
                 let repository = crate::repository::Repository::parse(bytes)?;
-                repository.local_release()?;
+                repository.local_checkpoint()?;
                 let actual = format!("sha256:{}", repository.document_sha256());
                 if actual != expected {
                     return refuse(
@@ -386,7 +387,26 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
             }
         }
     }
-    store.apply_repository(current.as_deref(), &mutation, &Default::default())?;
+    if repo.org == "local" {
+        store.apply_repository(current.as_deref(), &mutation, &Default::default())?;
+    } else {
+        let checkpointed = store
+            .apply_repository(
+                current.as_deref(),
+                &Mutation::PutCheckpoint {
+                    repo: repo.clone(),
+                    manifest: checkpoint_manifest,
+                    evidence: Some(Box::new(checkpoint_evidence)),
+                },
+                &Default::default(),
+            )?
+            .expect("put_checkpoint retains the repository");
+        store.apply_repository(
+            Some(&checkpointed.canonical_bytes()),
+            &mutation,
+            &Default::default(),
+        )?;
+    }
     crate::catalog::Catalog::open(store.root())?.complete_operation(session)?;
     let _ = fs::remove_dir_all(candidate_dir(store.root(), session));
     Ok(id)

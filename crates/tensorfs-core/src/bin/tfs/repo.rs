@@ -10,7 +10,9 @@ use tensorfs_core::header::{Body, Header};
 use tensorfs_core::ids::{hex64, prefixed, Doc, ObjectRef};
 use tensorfs_core::manifest::{Entry, Manifest};
 use tensorfs_core::repository::{self, Mutation, Repository};
-use tensorfs_core::storage::{self, Census, InventoryEntry};
+use tensorfs_core::storage::{
+    self, Census, CheckpointFacts as CensusCheckpointFacts, InventoryEntry,
+};
 use tensorfs_core::store::{Fault, Store};
 
 use crate::{bail, flag, Flags};
@@ -128,6 +130,22 @@ fn repo_rows(repository: &Repository, bytes: &[u8]) -> Vec<Vec<u8>> {
         ("name", Value::str(repository.repo.name.clone())),
         ("org", Value::str(repository.repo.org.clone())),
     ]))];
+    for checkpoint in &repository.checkpoints {
+        let mut fields = vec![
+            ("kind", Value::str("checkpoint")),
+            ("manifest_length", Value::uint(checkpoint.manifest.length)),
+            (
+                "manifest_sha256",
+                Value::str(checkpoint.manifest.sha256.clone()),
+            ),
+            ("name", Value::str(repository.repo.name.clone())),
+            ("org", Value::str(repository.repo.org.clone())),
+        ];
+        if let Some(evidence) = &checkpoint.evidence {
+            fields.push(("evidence", evidence.to_value()));
+        }
+        rows.push(tensorfs_core::canon::write(&Value::obj(fields)));
+    }
     for release in &repository.releases {
         let mut fields = vec![
             ("kind", Value::str("release")),
@@ -141,13 +159,67 @@ fn repo_rows(repository: &Repository, bytes: &[u8]) -> Vec<Vec<u8>> {
             ("org", Value::str(repository.repo.org.clone())),
             ("version", Value::str(release.version.clone())),
         ];
-        if let Some(evidence) = &release.evidence {
-            fields.push(("evidence", evidence.to_value()));
-        }
         if let Some(metadata) = &release.metadata {
             fields.push(("metadata", metadata.to_value()));
         }
         rows.push(tensorfs_core::canon::write(&Value::obj(fields)));
+    }
+    rows
+}
+
+fn checkpoint_fact_rows(
+    repository: &Repository,
+    manifest: &ObjectRef,
+    facts: &CensusCheckpointFacts,
+) -> Vec<Vec<u8>> {
+    let mut fields = vec![
+        ("kind", Value::str("checkpoint_facts")),
+        ("manifest_length", Value::uint(manifest.length)),
+        ("manifest_sha256", Value::str(manifest.sha256.clone())),
+        ("name", Value::str(repository.repo.name.clone())),
+        ("object_bytes", Value::uint(facts.object_bytes)),
+        ("object_count", Value::uint(facts.object_count)),
+        ("org", Value::str(repository.repo.org.clone())),
+    ];
+    if let (Some(header), Some(topology)) = (&facts.header, &facts.topology_digest) {
+        fields.push(("header_length", Value::uint(header.length)));
+        fields.push(("header_sha256", Value::str(header.sha256.clone())));
+        fields.push(("topology_digest", Value::str(topology.clone())));
+    }
+    let mut rows = vec![tensorfs_core::canon::write(&Value::obj(fields))];
+    for (encoding_id, alias) in &facts.encodings {
+        let mut fields = vec![
+            ("encoding_id", Value::str(encoding_id.clone())),
+            ("kind", Value::str("checkpoint_encoding")),
+            ("manifest_sha256", Value::str(manifest.sha256.clone())),
+            ("name", Value::str(repository.repo.name.clone())),
+            ("org", Value::str(repository.repo.org.clone())),
+        ];
+        if let Some(alias) = alias {
+            fields.push(("alias", Value::str(alias.clone())));
+        }
+        rows.push(tensorfs_core::canon::write(&Value::obj(fields)));
+    }
+    for component in &facts.components {
+        rows.push(tensorfs_core::canon::write(&Value::obj(vec![
+            ("component", Value::str(component.clone())),
+            ("kind", Value::str("checkpoint_component")),
+            ("manifest_sha256", Value::str(manifest.sha256.clone())),
+            ("name", Value::str(repository.repo.name.clone())),
+            ("org", Value::str(repository.repo.org.clone())),
+        ])));
+    }
+    for (config, sha256, length, media_type) in &facts.configs {
+        rows.push(tensorfs_core::canon::write(&Value::obj(vec![
+            ("config", Value::str(config.clone())),
+            ("kind", Value::str("checkpoint_config")),
+            ("length", Value::uint(*length)),
+            ("manifest_sha256", Value::str(manifest.sha256.clone())),
+            ("media_type", Value::str(media_type.clone())),
+            ("name", Value::str(repository.repo.name.clone())),
+            ("org", Value::str(repository.repo.org.clone())),
+            ("sha256", Value::str(sha256.clone())),
+        ])));
     }
     rows
 }
@@ -237,7 +309,7 @@ pub fn cmd_repo_get(root: &Path, org: &str, name: &str, flags: &Flags) -> ExitCo
 }
 
 fn local_row(repository: &Repository) -> Result<Value, Refusal> {
-    let release = repository.local_release()?;
+    let release = repository.local_checkpoint()?;
     let row = Value::obj(vec![
         ("manifest_digest", Value::str(release.manifest.id())),
         ("manifest_length", Value::uint(release.manifest.length)),
@@ -248,7 +320,13 @@ fn local_row(repository: &Repository) -> Result<Value, Refusal> {
         ),
         (
             "source_selection",
-            Value::str(format!("sha256:{}", release.version)),
+            Value::str(format!(
+                "sha256:{}",
+                release
+                    .source_selection
+                    .as_ref()
+                    .expect("validated local checkpoint")
+            )),
         ),
     ]);
     Ok(row)
@@ -345,7 +423,7 @@ pub fn cmd_local_replace(
         }
     };
     let evidence = match read(Path::new(evidence_path))
-        .and_then(|bytes| tensorfs_core::repository::ReleaseEvidence::parse(&bytes))
+        .and_then(|bytes| tensorfs_core::repository::CheckpointEvidence::parse(&bytes))
     {
         Ok(evidence) => evidence,
         Err(error) => return bail(error),
@@ -436,11 +514,13 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
     };
 
     let inputs = match &mutation {
-        Mutation::PutRelease { manifest, .. } | Mutation::ReplaceLocal { manifest, .. } => {
+        Mutation::PutCheckpoint { manifest, .. }
+        | Mutation::PutRelease { manifest, .. }
+        | Mutation::ReplaceLocal { manifest, .. } => {
             let (Some(manifest_path), Some(inventory_path)) =
                 (flag(flags, "manifest"), flag(flags, "inventory"))
             else {
-                eprintln!("put_release requires --manifest <json> --inventory <jsonl>");
+                eprintln!("manifest mutation requires --manifest <json> --inventory <jsonl>");
                 return ExitCode::from(2);
             };
             let manifest_bytes = match read(Path::new(manifest_path)) {
@@ -493,7 +573,9 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
             };
             Some((manifest_bytes, header_bytes, inventory, classification))
         }
-        Mutation::RemoveRelease { .. } | Mutation::DeleteRepository { .. } => None,
+        Mutation::RemoveCheckpoint { .. }
+        | Mutation::RemoveRelease { .. }
+        | Mutation::DeleteRepository { .. } => None,
     };
 
     let classification = inputs.as_ref().and_then(|inputs| inputs.3.as_deref());
@@ -505,6 +587,23 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
         Some(repository) => {
             let bytes = repository.canonical_bytes();
             let lines = match (&mutation, inputs) {
+                (
+                    Mutation::PutCheckpoint { manifest, .. },
+                    Some((manifest_bytes, header, inventory, _)),
+                ) => {
+                    let facts = match Census::validate_checkpoint_inputs(
+                        manifest,
+                        &manifest_bytes,
+                        header.as_deref(),
+                        &inventory,
+                    ) {
+                        Ok(facts) => facts,
+                        Err(error) => return bail(error),
+                    };
+                    let mut rows = repo_rows(&repository, &bytes);
+                    rows.extend(checkpoint_fact_rows(&repository, manifest, &facts));
+                    rows
+                }
                 (
                     Mutation::PutRelease { lane, version, .. },
                     Some((manifest, header, inventory, _)),
@@ -527,26 +626,23 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                     }
                 }
                 (
-                    Mutation::ReplaceLocal { version, .. },
-                    Some((manifest, header, inventory, _)),
+                    Mutation::ReplaceLocal { manifest, .. },
+                    Some((manifest_bytes, header, inventory, _)),
                 ) => {
-                    let release = repository
-                        .releases
-                        .iter()
-                        .find(|release| release.lane == "local" && &release.version == version)
-                        .expect("replaced local release is present");
-                    match Census::project_release_inputs(
-                        &repository,
-                        &bytes,
-                        release,
-                        &manifest,
+                    let facts = match Census::validate_checkpoint_inputs(
+                        manifest,
+                        &manifest_bytes,
                         header.as_deref(),
-                        inventory,
+                        &inventory,
                     ) {
-                        Ok(projection) => projection.json_lines(),
+                        Ok(facts) => facts,
                         Err(error) => return bail(error),
-                    }
+                    };
+                    let mut rows = repo_rows(&repository, &bytes);
+                    rows.extend(checkpoint_fact_rows(&repository, manifest, &facts));
+                    rows
                 }
+                (Mutation::RemoveCheckpoint { .. }, None) => repo_rows(&repository, &bytes),
                 (Mutation::RemoveRelease { .. }, None) => repo_rows(&repository, &bytes),
                 _ => unreachable!("mutation inputs match their action"),
             };

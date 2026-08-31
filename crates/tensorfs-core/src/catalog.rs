@@ -37,7 +37,7 @@ const SCHEMA: &[(&str, &[&str])] = &[
             "profile",
             "manifest_sha256",
             "manifest_length",
-            "release_evidence",
+            "checkpoint_evidence",
         ],
     ),
     (
@@ -122,7 +122,7 @@ pub struct SourcePreparationResult {
     pub profile: String,
     pub manifest_sha256: String,
     pub manifest_length: u64,
-    pub release_evidence: Vec<u8>,
+    pub checkpoint_evidence: Vec<u8>,
 }
 
 pub enum SourcePreparation {
@@ -256,7 +256,7 @@ impl Catalog {
                    profile TEXT NOT NULL,
                    manifest_sha256 TEXT NOT NULL,
                    manifest_length INTEGER NOT NULL,
-                   release_evidence BLOB NOT NULL,
+                   checkpoint_evidence BLOB NOT NULL,
                    PRIMARY KEY (operation_id,slot)
                  ) STRICT;
                  CREATE TABLE tensorfs_verified_blobs (
@@ -460,7 +460,7 @@ impl Catalog {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT slot,profile,manifest_sha256,manifest_length,release_evidence
+                "SELECT slot,profile,manifest_sha256,manifest_length,checkpoint_evidence
                  FROM tensorfs_source_results WHERE operation_id=?1 ORDER BY slot",
             )
             .map_err(|error| sql("prepare source results", error))?;
@@ -471,7 +471,7 @@ impl Catalog {
                     profile: row.get(1)?,
                     manifest_sha256: row.get(2)?,
                     manifest_length: row.get(3)?,
-                    release_evidence: row.get(4)?,
+                    checkpoint_evidence: row.get(4)?,
                 })
             })
             .map_err(|error| sql("read source results", error))?
@@ -518,7 +518,7 @@ impl Catalog {
                     "source preparation Manifest has zero length",
                 );
             }
-            crate::repository::ReleaseEvidence::parse(&result.release_evidence)?;
+            crate::repository::CheckpointEvidence::parse(&result.checkpoint_evidence)?;
         }
         let request_digest = crate::ids::prefixed("source preparation request", request_digest)?;
         let mut connection = self.connection()?;
@@ -542,7 +542,7 @@ impl Catalog {
             transaction
                 .execute(
                     "INSERT INTO tensorfs_source_results
-                     (operation_id,slot,profile,manifest_sha256,manifest_length,release_evidence)
+                     (operation_id,slot,profile,manifest_sha256,manifest_length,checkpoint_evidence)
                      VALUES (?1,?2,?3,?4,?5,?6)",
                     params![
                         operation,
@@ -550,7 +550,7 @@ impl Catalog {
                         result.profile,
                         result.manifest_sha256,
                         result.manifest_length,
-                        result.release_evidence,
+                        result.checkpoint_evidence,
                     ],
                 )
                 .map_err(|error| sql("insert source result", error))?;

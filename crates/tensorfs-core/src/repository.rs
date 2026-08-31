@@ -9,6 +9,7 @@ use crate::err::{refuse, Code, Result};
 use crate::ids::{ascii_name, hex64, prefixed, Doc, ObjectRef};
 
 pub const MAX_REPOSITORY_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_CHECKPOINTS: usize = 4096;
 pub const MAX_RELEASES: usize = 4096;
 pub const MAX_EVIDENCE_BYTES: usize = 64 * 1024;
 
@@ -98,17 +99,17 @@ pub enum VerificationEvidence {
     },
 }
 
-/// Rust always derives classification from the exact header and closure. When a release
+/// Rust always derives classification from the exact header and closure. When a checkpoint
 /// came through the ingest border, its bounded provenance and one receipt verdict ride here
 /// instead of becoming separately stored documents.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReleaseEvidence {
+pub struct CheckpointEvidence {
     pub classification_digest: String,
     pub ingest: Option<IngestProvenance>,
     pub verification: Option<VerificationEvidence>,
 }
 
-impl ReleaseEvidence {
+impl CheckpointEvidence {
     pub fn required_files(&self) -> Result<Vec<(&'static str, ObjectRef)>> {
         let Some(ingest) = &self.ingest else {
             return Ok(Vec::new());
@@ -339,10 +340,74 @@ impl ReleaseEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkpoint {
+    /// The checkpoint identity is exactly this Manifest digest. The Repository entry adds
+    /// retention and evidence, never a second checkpoint id or document.
+    pub manifest: ObjectRef,
+    pub evidence: Option<CheckpointEvidence>,
+    pub source_selection: Option<String>,
+}
+
+impl Checkpoint {
+    fn key(&self) -> &str {
+        &self.manifest.sha256
+    }
+
+    fn validate(&self) -> Result<()> {
+        hex64("Checkpoint.manifest", &self.manifest.sha256)?;
+        if self.manifest.length == 0 {
+            return refuse(Code::LENGTH_MISMATCH, "checkpoint manifest has zero length");
+        }
+        if let Some(evidence) = &self.evidence {
+            CheckpointEvidence::from_value(&evidence.to_value())?;
+        }
+        if let Some(source_selection) = &self.source_selection {
+            hex64("Checkpoint.source_selection", source_selection)?;
+        }
+        Ok(())
+    }
+
+    fn from_value(v: &Value) -> Result<Self> {
+        let mut fields = Fields::new("Repository.checkpoint", v)?;
+        let evidence = fields
+            .opt("evidence")
+            .map(CheckpointEvidence::from_value)
+            .transpose()?;
+        let manifest =
+            ObjectRef::from_value("Repository.checkpoint.manifest", fields.req("manifest")?)?;
+        let source_selection = fields
+            .opt("source_selection")
+            .map(|value| {
+                hex64(
+                    "Repository.checkpoint.source_selection",
+                    as_str("Repository.checkpoint", "source_selection", value)?,
+                )
+            })
+            .transpose()?;
+        fields.done()?;
+        let checkpoint = Self {
+            manifest,
+            evidence,
+            source_selection,
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    fn to_value(&self) -> Value {
+        let mut fields = vec![("manifest", self.manifest.to_value())];
+        if let Some(evidence) = &self.evidence {
+            fields.push(("evidence", evidence.to_value()));
+        }
+        if let Some(source_selection) = &self.source_selection {
+            fields.push(("source_selection", Value::str(source_selection.clone())));
+        }
+        Value::obj(fields)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
-    /// Present only for a CozyTensors model release. Ordinary package, dataset, and user-file
-    /// repositories need no fabricated model-classification payload.
-    pub evidence: Option<ReleaseEvidence>,
     pub lane: String,
     pub manifest: ObjectRef,
     /// Optional domain metadata stored as an ordinary blob (for example PackageRelease).
@@ -368,20 +433,11 @@ impl Release {
                 return refuse(Code::LENGTH_MISMATCH, "release metadata has zero length");
             }
         }
-        if let Some(evidence) = &self.evidence {
-            // Round through the strict evidence reader so programmatic construction has the
-            // same caps as stored bytes.
-            ReleaseEvidence::from_value(&evidence.to_value())?;
-        }
         Ok(())
     }
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut fields = Fields::new("Repository.release", v)?;
-        let evidence = fields
-            .opt("evidence")
-            .map(ReleaseEvidence::from_value)
-            .transpose()?;
         let lane = fields.req_str("lane")?.to_string();
         let manifest =
             ObjectRef::from_value("Repository.release.manifest", fields.req("manifest")?)?;
@@ -392,7 +448,6 @@ impl Release {
         let version = fields.req_str("version")?.to_string();
         fields.done()?;
         let release = Self {
-            evidence,
             lane,
             manifest,
             metadata,
@@ -408,9 +463,6 @@ impl Release {
             ("manifest", self.manifest.to_value()),
             ("version", Value::str(self.version.clone())),
         ];
-        if let Some(evidence) = &self.evidence {
-            fields.push(("evidence", evidence.to_value()));
-        }
         if let Some(metadata) = &self.metadata {
             fields.push(("metadata", metadata.to_value()));
         }
@@ -420,6 +472,9 @@ impl Release {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {
+    /// Repository-retained manifests. A checkpoint has no identity beyond this exact
+    /// manifest ObjectRef; releases only assign release-local lane names to these roots.
+    pub checkpoints: Vec<Checkpoint>,
     pub releases: Vec<Release>,
     pub repo: RepositoryName,
 }
@@ -427,6 +482,7 @@ pub struct Repository {
 impl Repository {
     pub fn empty(repo: RepositoryName) -> Self {
         Self {
+            checkpoints: Vec::new(),
             releases: Vec::new(),
             repo,
         }
@@ -434,12 +490,47 @@ impl Repository {
 
     fn validate(&self) -> Result<()> {
         self.repo.validate()?;
+        if self.checkpoints.len() > MAX_CHECKPOINTS {
+            return refuse(
+                Code::REPOSITORY_FULL,
+                "repository exceeds 4,096 checkpoints",
+            );
+        }
+        let mut previous_checkpoint = None;
+        for checkpoint in &self.checkpoints {
+            checkpoint.validate()?;
+            if previous_checkpoint.is_some_and(|digest: &str| digest >= checkpoint.key()) {
+                return refuse(
+                    Code::SORT_ORDER,
+                    "repository checkpoints must be sorted and unique by manifest digest",
+                );
+            }
+            previous_checkpoint = Some(checkpoint.key());
+        }
         if self.releases.len() > MAX_RELEASES {
             return refuse(Code::REPOSITORY_FULL, "repository exceeds 4,096 releases");
         }
         let mut previous: Option<(&str, &str)> = None;
         for release in &self.releases {
             release.validate()?;
+            if self
+                .checkpoints
+                .binary_search_by(|checkpoint| checkpoint.key().cmp(&release.manifest.sha256))
+                .ok()
+                .and_then(|index| self.checkpoints.get(index))
+                .map(|checkpoint| &checkpoint.manifest)
+                != Some(&release.manifest)
+            {
+                return refuse(
+                    Code::CHECKPOINT_ABSENT,
+                    format!(
+                        "release ({},{}) references unretained checkpoint {}",
+                        release.version,
+                        release.lane,
+                        release.manifest.id()
+                    ),
+                );
+            }
             if previous.is_some_and(|key| key >= release.key()) {
                 return refuse(
                     Code::SORT_ORDER,
@@ -452,6 +543,54 @@ impl Repository {
             return refuse(Code::REPOSITORY_FULL, "repository exceeds 8 MiB");
         }
         Ok(())
+    }
+
+    pub fn put_checkpoint(&self, checkpoint: Checkpoint) -> Result<Self> {
+        checkpoint.validate()?;
+        let mut next = self.clone();
+        match next
+            .checkpoints
+            .binary_search_by(|candidate| candidate.key().cmp(checkpoint.key()))
+        {
+            Ok(index) if next.checkpoints[index] == checkpoint => return Ok(next),
+            Ok(_) => {
+                return refuse(
+                    Code::CHECKPOINT_CONFLICT,
+                    format!(
+                        "checkpoint {} already exists with other immutable facts",
+                        checkpoint.manifest.id()
+                    ),
+                )
+            }
+            Err(index) => next.checkpoints.insert(index, checkpoint),
+        }
+        next.validate()?;
+        Ok(next)
+    }
+
+    pub fn remove_checkpoint(&self, manifest_sha256: &str) -> Result<Self> {
+        hex64("Checkpoint.manifest", manifest_sha256)?;
+        if self
+            .releases
+            .iter()
+            .any(|release| release.manifest.sha256 == manifest_sha256)
+        {
+            return refuse(
+                Code::CHECKPOINT_REFERENCED,
+                format!("checkpoint sha256:{manifest_sha256} is referenced by a release lane"),
+            );
+        }
+        let mut next = self.clone();
+        let index = next
+            .checkpoints
+            .binary_search_by(|candidate| candidate.key().cmp(manifest_sha256))
+            .map_err(|_| crate::err::Refusal {
+                code: Code::CHECKPOINT_ABSENT,
+                detail: format!("checkpoint sha256:{manifest_sha256} does not exist"),
+            })?;
+        next.checkpoints.remove(index);
+        next.validate()?;
+        Ok(next)
     }
 
     pub fn put_release(&self, release: Release) -> Result<Self> {
@@ -496,24 +635,22 @@ impl Repository {
         crate::sha256::hex_digest(&self.canonical_bytes())
     }
 
-    /// Creator's local alias is an ordinary Repository at a reserved location with one
-    /// hidden release. Keep this invariant in the canonical reader, not in every client.
-    pub fn local_release(&self) -> Result<&Release> {
-        if self.repo.org != "local" || self.releases.len() != 1 {
+    /// Creator's local alias is one retained checkpoint under the reserved organization.
+    pub fn local_checkpoint(&self) -> Result<&Checkpoint> {
+        if self.repo.org != "local" || !self.releases.is_empty() || self.checkpoints.len() != 1 {
             return refuse(
                 Code::ATTACHMENT_CARDINALITY,
-                "a local alias must be org local with exactly one release",
+                "a local alias must be org local with exactly one checkpoint and no release",
             );
         }
-        let release = &self.releases[0];
-        if release.lane != "local" {
+        let checkpoint = &self.checkpoints[0];
+        if checkpoint.source_selection.is_none() {
             return refuse(
-                Code::KEY_GRAMMAR,
-                "a local alias release must use lane local",
+                Code::MISSING_FIELD,
+                "a local alias needs one source selection",
             );
         }
-        hex64("local source selection", &release.version)?;
-        Ok(release)
+        Ok(checkpoint)
     }
 }
 
@@ -524,6 +661,17 @@ impl Doc for Repository {
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut fields = Fields::new("Repository", v)?;
+        let raw_checkpoints = as_arr("Repository", "checkpoints", fields.req("checkpoints")?)?;
+        if raw_checkpoints.len() > MAX_CHECKPOINTS {
+            return refuse(
+                Code::REPOSITORY_FULL,
+                "repository exceeds 4,096 checkpoints",
+            );
+        }
+        let mut checkpoints = Vec::with_capacity(raw_checkpoints.len());
+        for value in raw_checkpoints {
+            checkpoints.push(Checkpoint::from_value(value)?);
+        }
         let raw = as_arr("Repository", "releases", fields.req("releases")?)?;
         if raw.len() > MAX_RELEASES {
             return refuse(Code::REPOSITORY_FULL, "repository exceeds 4,096 releases");
@@ -534,13 +682,21 @@ impl Doc for Repository {
         }
         let repo = RepositoryName::from_value(fields.req("repo")?)?;
         fields.done()?;
-        let repository = Self { releases, repo };
+        let repository = Self {
+            checkpoints,
+            releases,
+            repo,
+        };
         repository.validate()?;
         Ok(repository)
     }
 
     fn to_value(&self) -> Value {
         Value::obj(vec![
+            (
+                "checkpoints",
+                Value::arr(self.checkpoints.iter().map(Checkpoint::to_value).collect()),
+            ),
             (
                 "releases",
                 Value::arr(self.releases.iter().map(Release::to_value).collect()),
@@ -552,26 +708,34 @@ impl Doc for Repository {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mutation {
+    PutCheckpoint {
+        repo: RepositoryName,
+        manifest: ObjectRef,
+        evidence: Option<Box<CheckpointEvidence>>,
+    },
+    RemoveCheckpoint {
+        repo: RepositoryName,
+        manifest_sha256: String,
+    },
     PutRelease {
         repo: RepositoryName,
         lane: String,
         manifest: ObjectRef,
         metadata: Option<ObjectRef>,
         version: String,
-        evidence: Option<Box<ReleaseEvidence>>,
     },
     RemoveRelease {
         repo: RepositoryName,
         version: String,
         lane: String,
     },
-    /// Device-local mutable alias. The Repository still contains an ordinary immutable
-    /// release row, but replacement atomically swaps the complete one-row document.
+    /// Device-local mutable alias. Replacement atomically swaps the Repository's one
+    /// retained checkpoint; local aliases contain no release rows.
     ReplaceLocal {
         repo: RepositoryName,
         manifest: ObjectRef,
         version: String,
-        evidence: Box<ReleaseEvidence>,
+        evidence: Box<CheckpointEvidence>,
     },
     DeleteRepository {
         repo: RepositoryName,
@@ -584,17 +748,31 @@ impl Mutation {
         let mut fields = Fields::new("RepositoryMutation", &value)?;
         let action = fields.req_str("action")?.to_string();
         let result = match action.as_str() {
-            "put_release" => {
-                let evidence = fields
+            "put_checkpoint" => Mutation::PutCheckpoint {
+                evidence: fields
                     .opt("evidence_base64")
                     .map(|value| {
                         let encoded =
                             crate::canon::as_str("RepositoryMutation", "evidence_base64", value)?;
-                        Ok(Box::new(ReleaseEvidence::parse(&crate::b64::decode(
+                        Ok(Box::new(CheckpointEvidence::parse(&crate::b64::decode(
                             encoded,
                         )?)?))
                     })
-                    .transpose()?;
+                    .transpose()?,
+                manifest: ObjectRef::from_value(
+                    "RepositoryMutation.manifest",
+                    fields.req("manifest")?,
+                )?,
+                repo: RepositoryName::from_value(fields.req("repo")?)?,
+            },
+            "remove_checkpoint" => Mutation::RemoveCheckpoint {
+                manifest_sha256: hex64(
+                    "RepositoryMutation.checkpoint",
+                    fields.req_str("checkpoint")?,
+                )?,
+                repo: RepositoryName::from_value(fields.req("repo")?)?,
+            },
+            "put_release" => {
                 let lane = fields.req_str("lane")?.to_string();
                 let manifest =
                     ObjectRef::from_value("RepositoryMutation.manifest", fields.req("manifest")?)?;
@@ -610,7 +788,6 @@ impl Mutation {
                     manifest,
                     metadata,
                     version,
-                    evidence,
                 }
             }
             "remove_release" => Mutation::RemoveRelease {
@@ -625,7 +802,7 @@ impl Mutation {
                     fields.req("evidence_base64")?,
                 )?;
                 Mutation::ReplaceLocal {
-                    evidence: Box::new(ReleaseEvidence::parse(&crate::b64::decode(encoded)?)?),
+                    evidence: Box::new(CheckpointEvidence::parse(&crate::b64::decode(encoded)?)?),
                     manifest: ObjectRef::from_value(
                         "RepositoryMutation.manifest",
                         fields.req("manifest")?,
@@ -650,33 +827,12 @@ impl Mutation {
 
     pub fn repo(&self) -> &RepositoryName {
         match self {
-            Mutation::PutRelease { repo, .. }
+            Mutation::PutCheckpoint { repo, .. }
+            | Mutation::RemoveCheckpoint { repo, .. }
+            | Mutation::PutRelease { repo, .. }
             | Mutation::RemoveRelease { repo, .. }
             | Mutation::ReplaceLocal { repo, .. }
             | Mutation::DeleteRepository { repo } => repo,
-        }
-    }
-
-    pub fn put_ingested(
-        repo: RepositoryName,
-        lane: impl Into<String>,
-        manifest: ObjectRef,
-        version: impl Into<String>,
-        classification_digest: impl Into<String>,
-        ingest: IngestProvenance,
-        verification: VerificationEvidence,
-    ) -> Self {
-        Self::PutRelease {
-            repo,
-            lane: lane.into(),
-            manifest,
-            metadata: None,
-            version: version.into(),
-            evidence: Some(Box::new(ReleaseEvidence {
-                classification_digest: classification_digest.into(),
-                ingest: Some(ingest),
-                verification: Some(verification),
-            })),
         }
     }
 }
@@ -700,18 +856,15 @@ pub fn apply(
         );
     }
     match mutation {
-        Mutation::PutRelease {
+        Mutation::PutCheckpoint {
             repo,
-            lane,
             manifest,
-            metadata,
-            version,
             evidence,
         } => {
             if repo.org == "local" {
                 return refuse(
                     Code::KEY_GRAMMAR,
-                    "local repositories require replace_local and exactly one reserved lane",
+                    "local repositories require replace_local",
                 );
             }
             match (evidence.as_deref(), classification_digest) {
@@ -721,7 +874,7 @@ pub fn apply(
                         return refuse(
                             Code::TOPOLOGY_MISMATCH,
                             format!(
-                                "release evidence classification {} differs from derived {derived}",
+                                "checkpoint evidence classification {} differs from derived {derived}",
                                 evidence.classification_digest
                             ),
                         );
@@ -737,15 +890,53 @@ pub fn apply(
                 (None, Some(_)) => {
                     return refuse(
                         Code::MISSING_FIELD,
-                        "a CozyTensors release requires model evidence",
+                        "a CozyTensors checkpoint requires model evidence",
                     )
                 }
             }
             Ok(Some(
                 existing
                     .unwrap_or_else(|| Repository::empty(repo.clone()))
-                    .put_release(Release {
+                    .put_checkpoint(Checkpoint {
+                        manifest: manifest.clone(),
                         evidence: evidence.as_deref().cloned(),
+                        source_selection: None,
+                    })?,
+            ))
+        }
+        Mutation::RemoveCheckpoint {
+            repo,
+            manifest_sha256,
+        } => {
+            if repo.org == "local" {
+                return refuse(
+                    Code::KEY_GRAMMAR,
+                    "local aliases are removed as a complete repository",
+                );
+            }
+            let repository = existing.ok_or_else(|| crate::err::Refusal {
+                code: Code::REPOSITORY_ABSENT,
+                detail: "cannot remove a checkpoint from an absent repository".into(),
+            })?;
+            Ok(Some(repository.remove_checkpoint(manifest_sha256)?))
+        }
+        Mutation::PutRelease {
+            repo,
+            lane,
+            manifest,
+            metadata,
+            version,
+        } => {
+            if repo.org == "local" {
+                return refuse(
+                    Code::KEY_GRAMMAR,
+                    "local repositories require replace_local and exactly one reserved lane",
+                );
+            }
+            Ok(Some(
+                existing
+                    .unwrap_or_else(|| Repository::empty(repo.clone()))
+                    .put_release(Release {
                         lane: lane.clone(),
                         manifest: manifest.clone(),
                         metadata: metadata.clone(),
@@ -797,13 +988,12 @@ pub fn apply(
                 );
             }
             let repository = Repository {
-                releases: vec![Release {
-                    evidence: Some((**evidence).clone()),
-                    lane: "local".into(),
+                checkpoints: vec![Checkpoint {
                     manifest: manifest.clone(),
-                    metadata: None,
-                    version: version.clone(),
+                    evidence: Some((**evidence).clone()),
+                    source_selection: Some(version.clone()),
                 }],
+                releases: vec![],
                 repo: repo.clone(),
             };
             repository.validate()?;
@@ -826,8 +1016,8 @@ pub fn compare_release_key(left: &Release, right: &Release) -> Ordering {
 mod tests {
     use super::*;
 
-    fn evidence(seed: u8) -> ReleaseEvidence {
-        ReleaseEvidence {
+    fn evidence(seed: u8) -> CheckpointEvidence {
+        CheckpointEvidence {
             classification_digest: format!("sha256:{}", format!("{seed:02x}").repeat(32)),
             ingest: None,
             verification: None,
@@ -836,7 +1026,6 @@ mod tests {
 
     fn release(version: &str, lane: &str, seed: u8) -> Release {
         Release {
-            evidence: Some(evidence(seed)),
             lane: lane.into(),
             manifest: ObjectRef {
                 sha256: format!("{:02x}", seed + 1).repeat(32),
@@ -847,21 +1036,98 @@ mod tests {
         }
     }
 
+    fn checkpoints(releases: &[Release]) -> Vec<Checkpoint> {
+        let mut checkpoints: Vec<Checkpoint> = releases
+            .iter()
+            .map(|release| Checkpoint {
+                manifest: release.manifest.clone(),
+                evidence: Some(evidence(
+                    u8::from_str_radix(&release.manifest.sha256[..2], 16).unwrap() - 1,
+                )),
+                source_selection: None,
+            })
+            .collect();
+        checkpoints.sort_by(|left, right| left.key().cmp(right.key()));
+        checkpoints.dedup();
+        checkpoints
+    }
+
+    fn repository_with_release(repo: RepositoryName, release: Release) -> Repository {
+        Repository::empty(repo)
+            .put_checkpoint(Checkpoint {
+                evidence: Some(evidence(
+                    u8::from_str_radix(&release.manifest.sha256[..2], 16).unwrap() - 1,
+                )),
+                manifest: release.manifest.clone(),
+                source_selection: None,
+            })
+            .unwrap()
+            .put_release(release)
+            .unwrap()
+    }
+
     #[test]
     fn location_typed_repository_is_canonical_and_idempotent() {
         let name = RepositoryName::new("org", "model").unwrap();
-        let one = Repository::empty(name.clone())
-            .put_release(release("1.0.0", "X", 1))
-            .unwrap();
+        let one = repository_with_release(name.clone(), release("1.0.0", "X", 1));
         assert!(!String::from_utf8(one.canonical_bytes())
             .unwrap()
             .contains("format"));
         assert_eq!(Repository::parse(&one.canonical_bytes()).unwrap(), one);
         assert_eq!(one.put_release(release("1.0.0", "X", 1)).unwrap(), one);
+        let conflicting = release("1.0.0", "X", 2);
         assert_eq!(
-            one.put_release(release("1.0.0", "X", 2)).unwrap_err().code,
+            one.put_checkpoint(Checkpoint {
+                evidence: Some(evidence(2)),
+                manifest: conflicting.manifest.clone(),
+                source_selection: None,
+            })
+            .unwrap()
+            .put_release(conflicting)
+            .unwrap_err()
+            .code,
             Code::RELEASE_CONFLICT
         );
+    }
+
+    #[test]
+    fn retained_checkpoint_can_be_reused_and_delete_refuses_live_release_references() {
+        let name = RepositoryName::new("org", "model").unwrap();
+        let first = release("v0.1", "fp8", 1);
+        let second = Release {
+            version: "v0.2".into(),
+            lane: "mxfp8".into(),
+            ..first.clone()
+        };
+        let repository = Repository::empty(name)
+            .put_checkpoint(Checkpoint {
+                evidence: Some(evidence(1)),
+                manifest: first.manifest.clone(),
+                source_selection: None,
+            })
+            .unwrap()
+            .put_release(first.clone())
+            .unwrap()
+            .put_release(second.clone())
+            .unwrap();
+        assert_eq!(repository.checkpoints.len(), 1);
+        assert_eq!(repository.releases.len(), 2);
+        assert_eq!(
+            repository
+                .remove_checkpoint(&first.manifest.sha256)
+                .unwrap_err()
+                .code,
+            Code::CHECKPOINT_REFERENCED
+        );
+        let unreferenced = repository
+            .remove_release(&first.version, &first.lane)
+            .unwrap()
+            .remove_release(&second.version, &second.lane)
+            .unwrap()
+            .remove_checkpoint(&first.manifest.sha256)
+            .unwrap();
+        assert!(unreferenced.checkpoints.is_empty());
+        assert!(unreferenced.releases.is_empty());
     }
 
     #[test]
@@ -870,10 +1136,11 @@ mod tests {
             RepositoryName::new(".", "model").unwrap_err().code,
             Code::KEY_GRAMMAR
         );
-        let good = Repository::empty(RepositoryName::new("org", "model").unwrap())
-            .put_release(release("1.0.0", "X", 1))
-            .unwrap()
-            .canonical_bytes();
+        let good = repository_with_release(
+            RepositoryName::new("org", "model").unwrap(),
+            release("1.0.0", "X", 1),
+        )
+        .canonical_bytes();
         let bad = String::from_utf8(good)
             .unwrap()
             .replace("sha256:0101", "0101010101");
@@ -890,6 +1157,7 @@ mod tests {
             .map(|index| release(&format!("{index:04}"), "X", (index % 200) as u8))
             .collect();
         Repository {
+            checkpoints: checkpoints(&releases),
             releases: releases.clone(),
             repo: repo.clone(),
         }
@@ -899,6 +1167,7 @@ mod tests {
         too_many.push(release("zzzz", "X", 201));
         assert_eq!(
             Repository {
+                checkpoints: checkpoints(&too_many),
                 releases: too_many,
                 repo: repo.clone(),
             }
@@ -910,8 +1179,8 @@ mod tests {
 
         assert!(evidence(1).to_value().kind() == "object");
         assert!(
-            Repository {
-                releases: (0..MAX_RELEASES)
+            {
+                let releases: Vec<Release> = (0..MAX_RELEASES)
                     .map(|index| {
                         let mut value = release(
                             &format!("{index:04}{}", "v".repeat(124)),
@@ -921,8 +1190,12 @@ mod tests {
                         value.version.truncate(128);
                         value
                     })
-                    .collect(),
-                repo,
+                    .collect();
+                Repository {
+                    checkpoints: checkpoints(&releases),
+                    releases,
+                    repo,
+                }
             }
             .canonical_bytes()
             .len()
@@ -937,7 +1210,7 @@ mod tests {
             length: 12,
         };
         let source_uri = format!("hf://org/model@{}", "88".repeat(20));
-        let evidence = ReleaseEvidence {
+        let evidence = CheckpointEvidence {
             classification_digest: format!("sha256:{}", "55".repeat(32)),
             ingest: Some(IngestProvenance {
                 source_dialect: "safetensors.diffusers".into(),
@@ -953,14 +1226,14 @@ mod tests {
             }),
         };
         assert_eq!(
-            ReleaseEvidence::parse(&evidence.canonical_bytes()).unwrap(),
+            CheckpointEvidence::parse(&evidence.canonical_bytes()).unwrap(),
             evidence
         );
         let with_query = String::from_utf8(evidence.canonical_bytes())
             .unwrap()
             .replace(&source_uri, &format!("{source_uri}?token=secret"));
         assert_eq!(
-            ReleaseEvidence::parse(with_query.as_bytes())
+            CheckpointEvidence::parse(with_query.as_bytes())
                 .unwrap_err()
                 .code,
             Code::KEY_GRAMMAR

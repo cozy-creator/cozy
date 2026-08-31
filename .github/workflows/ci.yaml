@@ -41,7 +41,7 @@ jobs:
       - run: >-
           uvx --python 3.12 --from 'mypy==1.*' mypy --strict
           python/tensorfs scripts/version_contract.py
-          scripts/facade-conform.py scripts/facade-runs.py
+          scripts/facade-conform.py scripts/facade-runs.py scripts/code-topology-runs.py
 
   # The wheel matrix exists so it cannot rot: every platform we publish for is BUILT here,
   # and the native one is installed and made to read a real named tensor out of the

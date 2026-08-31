@@ -46,6 +46,7 @@ rm -rf "$work/venv"
 "$work/venv/bin/pip" install --quiet "$wheel"
 echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/version_contract.py installed "$wheel"
+"$work/venv/bin/python" scripts/code-topology-runs.py
 
 "$work/venv/bin/python" - "$fixture" "$SNAP" <<'PY'
 import hashlib, json, pathlib, sys, tempfile

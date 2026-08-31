@@ -8,7 +8,7 @@ use tensorfs_core::dtype::Dtype;
 use tensorfs_core::header::{Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::{Draft, Entry, Manifest};
-use tensorfs_core::repository::{Mutation, ReleaseEvidence, Repository};
+use tensorfs_core::repository::{CheckpointEvidence, Mutation, Repository};
 use tensorfs_core::store::{Fault, Store, Verdict};
 
 fn temporary(name: &str) -> PathBuf {
@@ -50,12 +50,12 @@ fn one_tmp_tree_is_recreatable_and_corruption_is_not_retained() {
     let _ = fs::remove_dir_all(root);
 }
 
-fn fixture(root: &Path) -> (ObjectRef, ReleaseEvidence) {
+fn fixture(root: &Path) -> (ObjectRef, CheckpointEvidence) {
     let store = Store::init(root).unwrap();
     model_fixture(&store, [0, 0, 0, 0])
 }
 
-fn model_fixture(store: &Store, value: [u8; 4]) -> (ObjectRef, ReleaseEvidence) {
+fn model_fixture(store: &Store, value: [u8; 4]) -> (ObjectRef, CheckpointEvidence) {
     let spec = tensorfs_core::registry::seeds()
         .into_iter()
         .find(|seed| seed.alias == "plain/1")
@@ -79,7 +79,7 @@ fn model_fixture(store: &Store, value: [u8; 4]) -> (ObjectRef, ReleaseEvidence) 
         )],
     };
     header.validate(&Closure::default()).unwrap();
-    let evidence = ReleaseEvidence {
+    let evidence = CheckpointEvidence {
         classification_digest: header.topology_digest(),
         ingest: None,
         verification: None,
@@ -106,8 +106,46 @@ fn model_fixture(store: &Store, value: [u8; 4]) -> (ObjectRef, ReleaseEvidence) 
     (manifest, evidence)
 }
 
+fn apply_release(
+    store: &Store,
+    observed: Option<&[u8]>,
+    release: &Mutation,
+) -> tensorfs_core::err::Result<Option<Repository>> {
+    let Mutation::PutRelease { repo, manifest, .. } = release else {
+        panic!("apply_release requires PutRelease")
+    };
+    let checkpointed = store
+        .apply_repository(
+            observed,
+            &Mutation::PutCheckpoint {
+                repo: repo.clone(),
+                manifest: manifest.clone(),
+                evidence: store
+                    .read_manifest(manifest)?
+                    .header()
+                    .map(|header| {
+                        tensorfs_core::checkpoint::load_header(store, header).map(|header| {
+                            Box::new(CheckpointEvidence {
+                                classification_digest: header.topology_digest(),
+                                ingest: None,
+                                verification: None,
+                            })
+                        })
+                    })
+                    .transpose()?,
+            },
+            &Fault::default(),
+        )?
+        .expect("put_checkpoint retains the repository");
+    store.apply_repository(
+        Some(&checkpointed.canonical_bytes()),
+        release,
+        &Fault::default(),
+    )
+}
+
 #[test]
-fn local_alias_is_one_atomic_replaceable_release() {
+fn local_alias_is_one_atomic_replaceable_checkpoint() {
     let root = temporary("local-alias");
     let store = Store::init(&root).unwrap();
     let repo = tensorfs_core::repository::RepositoryName::new("local", "h3-dev").unwrap();
@@ -125,9 +163,9 @@ fn local_alias_is_one_atomic_replaceable_release() {
         .unwrap()
         .unwrap();
     let bytes_a = alias_a.canonical_bytes();
-    assert_eq!(alias_a.releases.len(), 1);
-    assert_eq!(alias_a.releases[0].lane, "local");
-    assert_eq!(alias_a.releases[0].manifest, manifest_a);
+    assert!(alias_a.releases.is_empty());
+    assert_eq!(alias_a.checkpoints.len(), 1);
+    assert_eq!(alias_a.checkpoints[0].manifest, manifest_a);
 
     let mutation_b = Mutation::ReplaceLocal {
         repo: repo.clone(),
@@ -139,9 +177,13 @@ fn local_alias_is_one_atomic_replaceable_release() {
         .apply_repository(Some(&bytes_a), &mutation_b, &Fault::default())
         .unwrap()
         .unwrap();
-    assert_eq!(alias_b.releases.len(), 1);
-    assert_eq!(alias_b.releases[0].version, "22".repeat(32));
-    assert_eq!(alias_b.releases[0].manifest, manifest_b);
+    assert!(alias_b.releases.is_empty());
+    assert_eq!(alias_b.checkpoints.len(), 1);
+    assert_eq!(
+        alias_b.checkpoints[0].source_selection,
+        Some("22".repeat(32))
+    );
+    assert_eq!(alias_b.checkpoints[0].manifest, manifest_b);
     assert_eq!(
         store
             .apply_repository(Some(&bytes_a), &mutation_a, &Fault::default())
@@ -159,7 +201,6 @@ fn local_alias_is_one_atomic_replaceable_release() {
                     manifest: manifest_b.clone(),
                     metadata: None,
                     version: "1.0.0".into(),
-                    evidence: None,
                 },
                 &Fault::default(),
             )
@@ -222,7 +263,7 @@ fn local_alias_is_one_atomic_replaceable_release() {
     let _ = fs::remove_dir_all(root);
 }
 
-fn mutation(manifest: &ObjectRef, evidence: &ReleaseEvidence) -> Vec<u8> {
+fn mutation(manifest: &ObjectRef, evidence: &CheckpointEvidence) -> Vec<u8> {
     mutation_from_evidence(
         manifest,
         &evidence.canonical_bytes(),
@@ -233,9 +274,46 @@ fn mutation(manifest: &ObjectRef, evidence: &ReleaseEvidence) -> Vec<u8> {
     )
 }
 
+fn checkpoint_mutation(
+    manifest: &ObjectRef,
+    org: &str,
+    name: &str,
+    evidence: Option<&CheckpointEvidence>,
+) -> Vec<u8> {
+    checkpoint_mutation_from_evidence(
+        manifest,
+        org,
+        name,
+        evidence.map(CheckpointEvidence::canonical_bytes).as_deref(),
+    )
+}
+
+fn checkpoint_mutation_from_evidence(
+    manifest: &ObjectRef,
+    org: &str,
+    name: &str,
+    evidence: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut fields = vec![
+        ("action", Value::str("put_checkpoint")),
+        ("manifest", manifest.to_value()),
+        (
+            "repo",
+            Value::obj(vec![("name", Value::str(name)), ("org", Value::str(org))]),
+        ),
+    ];
+    if let Some(evidence) = evidence {
+        fields.push((
+            "evidence_base64",
+            Value::str(tensorfs_core::b64::encode(evidence)),
+        ));
+    }
+    tensorfs_core::canon::write(&Value::obj(fields))
+}
+
 fn mutation_from_evidence(
     manifest: &ObjectRef,
-    evidence: &[u8],
+    _evidence: &[u8],
     version: &str,
     lane: &str,
     org: &str,
@@ -243,10 +321,6 @@ fn mutation_from_evidence(
 ) -> Vec<u8> {
     tensorfs_core::canon::write(&Value::obj(vec![
         ("action", Value::str("put_release")),
-        (
-            "evidence_base64",
-            Value::str(tensorfs_core::b64::encode(evidence)),
-        ),
         ("lane", Value::str(lane)),
         ("manifest", manifest.to_value()),
         (
@@ -393,20 +467,18 @@ fn four_domain_ordinary_repositories_rebuild_after_projection_tables_are_emptied
             None
         };
         let repo = tensorfs_core::repository::RepositoryName::new("recovery", domain).unwrap();
-        store
-            .apply_repository(
-                None,
-                &Mutation::PutRelease {
-                    repo: repo.clone(),
-                    lane: "main".into(),
-                    manifest: manifest_ref,
-                    metadata: metadata.clone(),
-                    version: "1.0.0".into(),
-                    evidence: None,
-                },
-                &Fault::default(),
-            )
-            .unwrap();
+        apply_release(
+            &store,
+            None,
+            &Mutation::PutRelease {
+                repo: repo.clone(),
+                lane: "main".into(),
+                manifest: manifest_ref,
+                metadata: metadata.clone(),
+                version: "1.0.0".into(),
+            },
+        )
+        .unwrap();
         let repository_bytes = fs::read(store.repository_path(&repo)).unwrap();
         assert!(
             !String::from_utf8_lossy(&repository_bytes).contains("evidence"),
@@ -488,6 +560,36 @@ fn ordinary_repo_apply_needs_no_model_header_or_evidence() {
             .collect::<Vec<_>>(),
     )
     .unwrap();
+    let checkpoint_mutation_path = root.join("checkpoint-mutation.json");
+    fs::write(
+        &checkpoint_mutation_path,
+        checkpoint_mutation(&manifest_ref, "cozy", "marco-polo", None),
+    )
+    .unwrap();
+    let checkpointed = root.join("checkpointed.json");
+    let checkpoint_rows = root.join("checkpoint-rows.jsonl");
+    let checkpoint_result = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args([
+            "repo",
+            "apply",
+            "-",
+            checkpoint_mutation_path.to_str().unwrap(),
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--inventory",
+            inventory.to_str().unwrap(),
+            "--out",
+            checkpointed.to_str().unwrap(),
+            "--rows",
+            checkpoint_rows.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        checkpoint_result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checkpoint_result.stderr)
+    );
     let mutation = root.join("mutation.json");
     fs::write(
         &mutation,
@@ -513,7 +615,7 @@ fn ordinary_repo_apply_needs_no_model_header_or_evidence() {
         .args([
             "repo",
             "apply",
-            "-",
+            checkpointed.to_str().unwrap(),
             mutation.to_str().unwrap(),
             "--manifest",
             manifest_path.to_str().unwrap(),
@@ -533,7 +635,7 @@ fn ordinary_repo_apply_needs_no_model_header_or_evidence() {
     );
     let repository = Repository::parse(&fs::read(replacement).unwrap()).unwrap();
     assert_eq!(repository.releases.len(), 1);
-    assert!(repository.releases[0].evidence.is_none());
+    assert!(repository.checkpoints[0].evidence.is_none());
     assert_eq!(repository.releases[0].metadata.as_ref(), Some(&metadata));
     let rows = fs::read_to_string(rows).unwrap();
     assert!(rows.contains("\"object_kind\":\"file\""));
@@ -547,6 +649,22 @@ fn ordinary_repo_apply_needs_no_model_header_or_evidence() {
 fn crash_after_repo_replace_rebuilds_sql_from_files() {
     let root = temporary("crash-rebuild");
     let (manifest, evidence) = fixture(&root);
+    let store = Store::open(&root).unwrap();
+    let repo = tensorfs_core::repository::RepositoryName::new("org", "model").unwrap();
+    let checkpointed = store
+        .apply_repository(
+            None,
+            &Mutation::PutCheckpoint {
+                repo,
+                manifest: manifest.clone(),
+                evidence: Some(Box::new(evidence.clone())),
+            },
+            &Fault::default(),
+        )
+        .unwrap()
+        .unwrap();
+    let checkpointed_path = root.join("checkpointed.json");
+    fs::write(&checkpointed_path, checkpointed.canonical_bytes()).unwrap();
     let mutation_path = root.join("mutation.json");
     fs::write(&mutation_path, mutation(&manifest, &evidence)).unwrap();
     let ready = root.join("ready");
@@ -555,7 +673,7 @@ fn crash_after_repo_replace_rebuilds_sql_from_files() {
             "repo",
             "commit",
             root.to_str().unwrap(),
-            "-",
+            checkpointed_path.to_str().unwrap(),
             mutation_path.to_str().unwrap(),
             "--fault",
             "repo-after-replace",
@@ -636,14 +754,61 @@ fn committed_repo_apply_fixture_is_the_cross_process_projection_seam() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/repo_apply");
     let root = temporary("repo-apply-fixture");
     fs::create_dir_all(&root).unwrap();
+    let manifest_bytes = fs::read(fixture.join("manifest.json")).unwrap();
+    let manifest = ObjectRef::of(&manifest_bytes);
+    let checkpoint_evidence = CheckpointEvidence {
+        classification_digest:
+            "sha256:070967dd3fa6e33a6993da22055d1216e6592903ac8d7b40f0299997b2518914".into(),
+        ingest: None,
+        verification: None,
+    };
+    let checkpoint_mutation_path = root.join("checkpoint-mutation.json");
+    fs::write(
+        &checkpoint_mutation_path,
+        checkpoint_mutation(
+            &manifest,
+            "tensorhub",
+            "marco-polo",
+            Some(&checkpoint_evidence),
+        ),
+    )
+    .unwrap();
+    let checkpointed = root.join("checkpointed.json");
+    let checkpoint_rows = root.join("checkpoint-rows.jsonl");
+    let checkpoint_status = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args([
+            "repo",
+            "apply",
+            "-",
+            checkpoint_mutation_path.to_str().unwrap(),
+            "--manifest",
+            fixture.join("manifest.json").to_str().unwrap(),
+            "--header",
+            fixture.join("header.cbor").to_str().unwrap(),
+            "--inventory",
+            fixture.join("blobs.jsonl").to_str().unwrap(),
+            "--out",
+            checkpointed.to_str().unwrap(),
+            "--rows",
+            checkpoint_rows.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(checkpoint_status.success());
+    let release_mutation = root.join("release-mutation.json");
+    let mut release_mutation_bytes = fs::read(fixture.join("mutation.json")).unwrap();
+    if release_mutation_bytes.last() == Some(&b'\n') {
+        release_mutation_bytes.pop();
+    }
+    fs::write(&release_mutation, release_mutation_bytes).unwrap();
     let repository = root.join("repository.json");
     let rows = root.join("rows.jsonl");
     let status = Command::new(env!("CARGO_BIN_EXE_tfs"))
         .args([
             "repo",
             "apply",
-            "-",
-            fixture.join("mutation.json").to_str().unwrap(),
+            checkpointed.to_str().unwrap(),
+            release_mutation.to_str().unwrap(),
             "--manifest",
             fixture.join("manifest.json").to_str().unwrap(),
             "--header",
@@ -658,10 +823,11 @@ fn committed_repo_apply_fixture_is_the_cross_process_projection_seam() {
         .status()
         .unwrap();
     assert!(status.success());
-    assert_eq!(
-        fs::read(repository).unwrap(),
-        fs::read(fixture.join("expected_repository.json")).unwrap()
-    );
+    let mut expected_repository = fs::read(fixture.join("expected_repository.json")).unwrap();
+    if expected_repository.last() == Some(&b'\n') {
+        expected_repository.pop();
+    }
+    assert_eq!(fs::read(repository).unwrap(), expected_repository);
     assert_eq!(
         fs::read(rows).unwrap(),
         fs::read(fixture.join("expected_rows.jsonl")).unwrap()
@@ -674,7 +840,7 @@ fn committed_repo_apply_fixture_is_the_cross_process_projection_seam() {
             "repo",
             "apply",
             "-",
-            fixture.join("mutation.json").to_str().unwrap(),
+            checkpoint_mutation_path.to_str().unwrap(),
             "--manifest",
             fixture.join("manifest.json").to_str().unwrap(),
             "--header",
@@ -709,11 +875,12 @@ fn repo_list_evidence_round_trips_as_an_opaque_raw_message() {
     let manifest_bytes = fs::read(fixture.join("manifest.json")).unwrap();
     let manifest = Manifest::parse(&manifest_bytes).unwrap();
     let manifest_ref = store.put_manifest(&manifest).unwrap().obj;
-    let first_mutation =
-        Mutation::parse(&fs::read(fixture.join("mutation.json")).unwrap()).unwrap();
-    store
-        .apply_repository(None, &first_mutation, &Fault::default())
-        .unwrap();
+    let mut first_mutation_bytes = fs::read(fixture.join("mutation.json")).unwrap();
+    if first_mutation_bytes.last() == Some(&b'\n') {
+        first_mutation_bytes.pop();
+    }
+    let first_mutation = Mutation::parse(&first_mutation_bytes).unwrap();
+    apply_release(&store, None, &first_mutation).unwrap();
 
     let rows = root.join("list.jsonl");
     assert!(Command::new(env!("CARGO_BIN_EXE_tfs"))
@@ -783,12 +950,15 @@ fn repo_list_evidence_round_trips_as_an_opaque_raw_message() {
     let repository_bytes = fs::read(store.repository_path(first_mutation.repo())).unwrap();
     let repository = Repository::parse(&repository_bytes).unwrap();
     assert_eq!(repository.releases.len(), 2);
-    assert!(repository.releases.iter().all(|release| release
-        .evidence
-        .as_ref()
-        .unwrap()
-        .canonical_bytes()
-        == raw_message));
+    assert_eq!(repository.checkpoints.len(), 1);
+    assert!(
+        repository.checkpoints[0]
+            .evidence
+            .as_ref()
+            .unwrap()
+            .canonical_bytes()
+            == raw_message
+    );
 
     let before_red = repository_bytes;
     let current_red = root.join("current-red.json");
@@ -798,13 +968,11 @@ fn repo_list_evidence_round_trips_as_an_opaque_raw_message() {
     let red_mutation = root.join("red.json");
     fs::write(
         &red_mutation,
-        mutation_from_evidence(
+        checkpoint_mutation_from_evidence(
             &manifest_ref,
-            &noncanonical,
-            "3.0.0",
-            "cpu",
             "tensorhub",
             "marco-polo",
+            Some(&noncanonical),
         ),
     )
     .unwrap();

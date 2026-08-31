@@ -16,7 +16,7 @@ use crate::header::{topology_digest_of, topology_value};
 use crate::ids::{ascii_name, object_id, prefixed, ConfigRef, ObjectRef};
 use crate::manifest::{Draft, Entry};
 use crate::registry;
-use crate::repository::{IngestProvenance, ReleaseEvidence, VerificationEvidence};
+use crate::repository::{CheckpointEvidence, IngestProvenance, VerificationEvidence};
 use crate::spec::EncodingSpec;
 use crate::store::Store;
 
@@ -743,7 +743,7 @@ fn execute_prepared(
         .collect();
     sources.sort();
     sources.dedup();
-    let evidence = ReleaseEvidence {
+    let evidence = CheckpointEvidence {
         classification_digest: outcome.header.topology_digest(),
         ingest: Some(IngestProvenance {
             source_dialect: prepared.conv.dialect.to_string(),
@@ -759,7 +759,7 @@ fn execute_prepared(
         }),
     };
     let evidence_bytes = evidence.canonical_bytes();
-    ReleaseEvidence::parse(&evidence_bytes)?;
+    CheckpointEvidence::parse(&evidence_bytes)?;
     Ok((manifest, evidence_bytes))
 }
 
@@ -793,7 +793,7 @@ pub struct PreparedModelSource {
     pub profile: String,
     pub manifest_digest: String,
     pub manifest_length: u64,
-    pub release_evidence_canonical_bytes: Vec<u8>,
+    pub checkpoint_evidence_canonical_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1011,7 +1011,7 @@ fn validate_prepared_result(store: &Store, source: &PreparedModelSource) -> Resu
         length: source.manifest_length,
     };
     let manifest = store.read_manifest(&manifest_ref)?;
-    let evidence = ReleaseEvidence::parse(&source.release_evidence_canonical_bytes)?;
+    let evidence = CheckpointEvidence::parse(&source.checkpoint_evidence_canonical_bytes)?;
     let header_ref = manifest.header().ok_or_else(|| Refusal {
         code: Code::MISSING_FIELD,
         detail: "prepared model Manifest has no CozyTensors header".into(),
@@ -1020,7 +1020,7 @@ fn validate_prepared_result(store: &Store, source: &PreparedModelSource) -> Resu
     if evidence.classification_digest != header.topology_digest() {
         return refuse(
             Code::TOPOLOGY_MISMATCH,
-            "prepared ReleaseEvidence classification differs from its header",
+            "prepared CheckpointEvidence classification differs from its header",
         );
     }
     for (path, required) in evidence.required_files()? {
@@ -1031,7 +1031,7 @@ fn validate_prepared_result(store: &Store, source: &PreparedModelSource) -> Resu
         {
             return refuse(
                 Code::NOT_CONTAINED,
-                format!("prepared ReleaseEvidence file {path:?} is outside its Manifest"),
+                format!("prepared CheckpointEvidence file {path:?} is outside its Manifest"),
             );
         }
         let metadata =
@@ -1091,7 +1091,7 @@ fn prepare_model_source_with_registry(
                         profile: row.profile,
                         manifest_digest: format!("sha256:{}", row.manifest_sha256),
                         manifest_length: row.manifest_length,
-                        release_evidence_canonical_bytes: row.release_evidence,
+                        checkpoint_evidence_canonical_bytes: row.checkpoint_evidence,
                     })
                     .collect(),
             };
@@ -1132,7 +1132,7 @@ fn prepare_model_source_with_registry(
                 }
             }
         }
-        let (manifest, release_evidence_canonical_bytes) = execute_prepared(
+        let (manifest, checkpoint_evidence_canonical_bytes) = execute_prepared(
             store,
             &request.operation_id,
             &prepared,
@@ -1144,7 +1144,7 @@ fn prepare_model_source_with_registry(
             profile: requested.profile.clone(),
             manifest_digest: manifest.id(),
             manifest_length: manifest.length,
-            release_evidence_canonical_bytes,
+            checkpoint_evidence_canonical_bytes,
         });
         validate_prepared_result(store, sources.last().expect("just pushed source result"))?;
         catalog.progress(
@@ -1167,7 +1167,7 @@ fn prepare_model_source_with_registry(
                 .trim_start_matches("sha256:")
                 .to_string(),
             manifest_length: source.manifest_length,
-            release_evidence: source.release_evidence_canonical_bytes.clone(),
+            checkpoint_evidence: source.checkpoint_evidence_canonical_bytes.clone(),
         })
         .collect();
     catalog.commit_source_preparation(&request.operation_id, &digest, &rows)?;
@@ -1347,7 +1347,7 @@ mod tests {
             };
             store.read_manifest(&reference).unwrap();
             let evidence =
-                ReleaseEvidence::parse(&source.release_evidence_canonical_bytes).unwrap();
+                CheckpointEvidence::parse(&source.checkpoint_evidence_canonical_bytes).unwrap();
             let ingest = evidence.ingest.as_ref().unwrap();
             assert_eq!(
                 ingest.source_uri.as_deref(),

@@ -329,12 +329,12 @@ def main() -> None:
     if observation["reads"] != 0 or observation["hashes"] != 0:
         raise RuntimeError(f"inherited payload bytes moved: {observation}")
     target = store.manifest(f"sha256:{receipt['manifest']['sha256']}")
-    evidence = json.loads(receipt["release_evidence_canonical_bytes"])
+    evidence = json.loads(receipt["checkpoint_evidence_canonical_bytes"])
     if evidence != {
         "classification_digest": tensorfs.topology_digest(target["header"])
     }:
         raise RuntimeError(
-            "derived ReleaseEvidence is not the exact minimal final-topology fact"
+            "derived CheckpointEvidence is not the exact minimal final-topology fact"
         )
     target_header: dict[str, Any] = tensorfs.parse_header(target["header"])
     target_components: dict[str, dict[str, Any]] = target_header["components"]
@@ -363,7 +363,7 @@ def main() -> None:
         f"consumed_source_bytes={len(consumed) + len(inline)} "
         "source_reader=segmented+inline "
         "inherited_reads=0 inherited_hashes=0 immutable_receipt=1 "
-        "release_evidence=minimal"
+        "checkpoint_evidence=minimal"
     )
 
 

@@ -1,6 +1,6 @@
 # TensorFS
 
-The current release is `0.0.5`.
+The current release is `0.0.6`.
 
 TensorFS stores every domain repository as the same graph:
 
@@ -13,7 +13,7 @@ checkouts/<manifest-sha256>/...    # optional disposable local view
 tmp/                               # all transient local state; delete when stopped
 ```
 
-Repository files are authoritative mutable release indexes. Manifests are immutable virtual file
+Repository files are authoritative mutable checkpoint roots plus immutable release indexes. Manifests are immutable virtual file
 trees. Blobs are immutable content bytes. The same engine is used independently for model,
 package-source, dataset, and user-file stores; the physical domain/bucket supplies access and
 erasure isolation, not a different catalog format. SQLite locally and PostgreSQL in Tensorhub are
@@ -40,6 +40,11 @@ rows—not additional stored document formats.
 The Python package supports normal GIL-enabled CPython 3.12 only. Its native wheel is
 `cp312-abi3`; other Python implementations and CPython lines are refused at the tooling and import
 boundaries.
+
+`tensorfs.CodeTensor(component, key, dtype, shape, accepts)` and
+`tensorfs.code_topology(contract_digest, tensors)` are the one Python author seam for canonical
+CodeTopology bytes. Callers project exact component/key fields from their own code contract;
+TensorFS validates and writes them but never parses the foreign contract or guesses key prefixes.
 
 ```bash
 export PYO3_PYTHON="$(uv python find 3.12)"
@@ -106,9 +111,13 @@ are `{blob:{length,sha256},path}`; it validates the common Manifest grammar, wri
 bytes, and prints their ObjectRef. Local and cloud callers use this seam instead of defining a
 second source-tree codec.
 
-Publication order is blobs, manifest, repository compare-and-swap, then released-manifest index. A crash
-before repository replacement leaves harmless unreachable content. A crash afterward leaves
-storage ahead of SQL; `store rebuild` catches SQL up. The database never leads the repository file.
+Publication order is blobs, manifest, checkpoint-root compare-and-swap, then an optional release
+compare-and-swap and released-manifest index. `put_checkpoint` retains one exact Manifest ObjectRef;
+`remove_checkpoint` refuses while any release lane references it. `put_release` only maps a bounded
+`(version,lane)` to an already retained checkpoint, so one checkpoint can be reused by many lanes or
+releases. A crash before checkpoint replacement leaves harmless unreachable content. A crash
+afterward leaves a durable unreleased checkpoint; `store rebuild` catches SQL projections up. The
+database never leads the repository file.
 
 Each model row emitted by `repo list` carries the repository's exact canonical `evidence` object.
 Clients may preserve those bytes opaquely and base64-wrap them for a later `put_release`; TensorFS
@@ -183,7 +192,7 @@ prepared = store.prepare_model_source(
     declared_license,
 )
 # prepared = {replayed, sources:[{slot, profile, manifest_digest, manifest_length,
-#                                 release_evidence_canonical_bytes}]}
+#                                 checkpoint_evidence_canonical_bytes}]}
 store.release_model_source(operation_id)
 ```
 
@@ -192,7 +201,7 @@ ObjectRefs into operation identity and re-fences each regular non-symlink path b
 length, and change token before and after conversion. It deliberately does not perform a second
 whole-file SHA pass: the existing streaming ingest pass hashes every admitted tensor byte into the
 CAS. All profiles prepare under one operation; only a complete sorted result set becomes replayable.
-Each row carries the existing canonical `ReleaseEvidence/1` bytes bound to its header topology,
+Each row carries the canonical `CheckpointEvidence/1` bytes bound to its header topology,
 converter recipe, credential-free source URI/license, and approved producer. Exact replay returns
 the same Manifest and evidence bytes; changed profile/file/provenance facts conflict, and explicit
 release removes only operation holds. Access URLs, credentials, repository names, and catalog

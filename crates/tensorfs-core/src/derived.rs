@@ -889,7 +889,7 @@ pub(crate) struct TransactionRow {
     pub(crate) inherited_payload_bytes: u64,
     pub(crate) header: Option<ObjectRef>,
     pub(crate) manifest: Option<ObjectRef>,
-    pub(crate) release_evidence: Option<Vec<u8>>,
+    pub(crate) checkpoint_evidence: Option<Vec<u8>>,
 }
 
 fn part_value(part: &Part) -> Value {
@@ -1035,17 +1035,17 @@ impl TransactionRow {
             .opt("manifest")
             .map(|v| ObjectRef::from_value("DerivedTransaction.manifest", v))
             .transpose()?;
-        let release_evidence = f
-            .opt("release_evidence")
+        let checkpoint_evidence = f
+            .opt("checkpoint_evidence")
             .map(|value| {
-                let bytes = as_str("DerivedTransaction", "release_evidence", value)?
+                let bytes = as_str("DerivedTransaction", "checkpoint_evidence", value)?
                     .as_bytes()
                     .to_vec();
-                let evidence = crate::repository::ReleaseEvidence::parse(&bytes)?;
+                let evidence = crate::repository::CheckpointEvidence::parse(&bytes)?;
                 if evidence.ingest.is_some() || evidence.verification.is_some() {
                     return refuse(
                         Code::UNKNOWN_FIELD,
-                        "derived ReleaseEvidence cannot claim foreign ingest or verification",
+                        "derived CheckpointEvidence cannot claim foreign ingest or verification",
                     );
                 }
                 Ok(bytes)
@@ -1140,7 +1140,7 @@ impl TransactionRow {
             inherited_payload_bytes,
             header,
             manifest,
-            release_evidence,
+            checkpoint_evidence,
         };
         let before_parts = row.added_parts.clone();
         let before_configs = row.added_configs.clone();
@@ -1166,7 +1166,7 @@ impl TransactionRow {
                 if row.declaration.is_none()
                     || row.header.is_some()
                     || row.manifest.is_some()
-                    || row.release_evidence.is_some()
+                    || row.checkpoint_evidence.is_some()
                     || row.inherited_payload_objects != 0
                     || row.inherited_payload_bytes != 0
                 {
@@ -1181,7 +1181,7 @@ impl TransactionRow {
                     || row.current_session.is_some()
                     || row.header.is_none()
                     || row.manifest.is_none()
-                    || row.release_evidence.is_none()
+                    || row.checkpoint_evidence.is_none()
                     || row.inherited_payload_objects > limits::MAX_TOTAL_REFS as u64
                     || row.inherited_payload_bytes > limits::MAX_TOTAL_BYTES
                 {
@@ -1195,7 +1195,7 @@ impl TransactionRow {
                 if row.current_session.is_some()
                     || row.header.is_some()
                     || row.manifest.is_some()
-                    || row.release_evidence.is_some()
+                    || row.checkpoint_evidence.is_some()
                     || !row.added_parts.is_empty()
                     || !row.added_configs.is_empty()
                     || row.inherited_payload_objects != 0
@@ -1303,12 +1303,12 @@ impl TransactionRow {
         if let Some(manifest) = &self.manifest {
             fields.push(("manifest".to_string(), manifest.to_value()));
         }
-        if let Some(evidence) = &self.release_evidence {
+        if let Some(evidence) = &self.checkpoint_evidence {
             fields.push((
-                "release_evidence".to_string(),
+                "checkpoint_evidence".to_string(),
                 Value::str(
                     String::from_utf8(evidence.clone())
-                        .expect("canonical ReleaseEvidence is UTF-8"),
+                        .expect("canonical CheckpointEvidence is UTF-8"),
                 ),
             ));
         }
@@ -2096,7 +2096,7 @@ pub fn begin(
                 inherited_payload_bytes: 0,
                 header: None,
                 manifest: None,
-                release_evidence: None,
+                checkpoint_evidence: None,
             });
             Ok(())
         }
@@ -2373,7 +2373,7 @@ pub struct ReceiptFacts {
     pub added_objects: Vec<ObjectRef>,
     pub inherited_payload_objects: u64,
     pub inherited_payload_bytes: u64,
-    pub release_evidence_canonical_bytes: Vec<u8>,
+    pub checkpoint_evidence_canonical_bytes: Vec<u8>,
 }
 
 impl ReceiptFacts {
@@ -2396,10 +2396,10 @@ impl ReceiptFacts {
             ),
             ("manifest", self.manifest.to_value()),
             (
-                "release_evidence_canonical_bytes",
+                "checkpoint_evidence_canonical_bytes",
                 Value::str(
-                    String::from_utf8(self.release_evidence_canonical_bytes.clone())
-                        .expect("canonical ReleaseEvidence is UTF-8"),
+                    String::from_utf8(self.checkpoint_evidence_canonical_bytes.clone())
+                        .expect("canonical CheckpointEvidence is UTF-8"),
                 ),
             ),
             (
@@ -2482,22 +2482,24 @@ fn receipt_from(store: &Store, row: &TransactionRow) -> Result<ReceiptFacts> {
         code: Code::ARTIFACT_INCOMPLETE,
         detail: format!("committed transaction {} has no manifest", row.id),
     })?;
-    let release_evidence_canonical_bytes = row.release_evidence.clone().ok_or_else(|| Refusal {
-        code: Code::ARTIFACT_INCOMPLETE,
-        detail: format!("committed transaction {} has no ReleaseEvidence", row.id),
-    })?;
-    let evidence = crate::repository::ReleaseEvidence::parse(&release_evidence_canonical_bytes)?;
+    let checkpoint_evidence_canonical_bytes =
+        row.checkpoint_evidence.clone().ok_or_else(|| Refusal {
+            code: Code::ARTIFACT_INCOMPLETE,
+            detail: format!("committed transaction {} has no CheckpointEvidence", row.id),
+        })?;
+    let evidence =
+        crate::repository::CheckpointEvidence::parse(&checkpoint_evidence_canonical_bytes)?;
     if evidence.ingest.is_some() || evidence.verification.is_some() {
         return refuse(
             Code::UNKNOWN_FIELD,
-            "derived ReleaseEvidence cannot claim foreign ingest or verification",
+            "derived CheckpointEvidence cannot claim foreign ingest or verification",
         );
     }
     let header_bytes = checkpoint::load_header(store, &header)?;
     if evidence.classification_digest != header_bytes.topology_digest() {
         return refuse(
             Code::TOPOLOGY_MISMATCH,
-            "derived ReleaseEvidence classification differs from its final header",
+            "derived CheckpointEvidence classification differs from its final header",
         );
     }
     Ok(ReceiptFacts {
@@ -2509,7 +2511,7 @@ fn receipt_from(store: &Store, row: &TransactionRow) -> Result<ReceiptFacts> {
         added_objects: added_objects(row),
         inherited_payload_objects: row.inherited_payload_objects,
         inherited_payload_bytes: row.inherited_payload_bytes,
-        release_evidence_canonical_bytes,
+        checkpoint_evidence_canonical_bytes,
     })
 }
 
@@ -2551,20 +2553,20 @@ pub fn commit(
             "the addition set changed while commit constructed the target; retry commit",
         );
     }
-    let release_evidence = crate::repository::ReleaseEvidence {
+    let checkpoint_evidence = crate::repository::CheckpointEvidence {
         classification_digest: header.topology_digest(),
         ingest: None,
         verification: None,
     }
     .canonical_bytes();
-    crate::repository::ReleaseEvidence::parse(&release_evidence)?;
+    crate::repository::CheckpointEvidence::parse(&checkpoint_evidence)?;
     row.state = TransactionState::Committed(Disposition::Pending);
     row.current_session = None;
     row.header = Some(header_ref);
     row.manifest = Some(manifest_ref);
     row.inherited_payload_objects = inherited_payload_objects as u64;
     row.inherited_payload_bytes = inherited_payload_bytes;
-    row.release_evidence = Some(release_evidence);
+    row.checkpoint_evidence = Some(checkpoint_evidence);
     let committed = row.clone();
     txn.commit()?;
     receipt_from(store, &committed)
@@ -2634,7 +2636,7 @@ pub fn abandon(store: &Store, meta: &Meta, transaction: &str) -> Result<Option<R
                 inherited_payload_bytes: 0,
                 header: None,
                 manifest: None,
-                release_evidence: None,
+                checkpoint_evidence: None,
             });
             None
         }
