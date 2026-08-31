@@ -584,6 +584,12 @@ func (p *runProgress) on(e localapi.Event) bool {
 	if p.ctx.Mode().JSON {
 		return true // one JSON document on stdout: the run's own, at the end
 	}
+	// A redirected human command has no status line to rewrite. Its final result is the
+	// useful record; spraying every lossy tick into logs is neither progress nor a stable
+	// interface. --full deliberately restores the diagnostic stream.
+	if !p.ctx.Mode().Color && !p.ctx.Mode().Full {
+		return true
+	}
 	line := progressLine(e, p.ctx.Mode().Full)
 	if line == "" || line == p.last {
 		return true
@@ -591,33 +597,118 @@ func (p *runProgress) on(e localapi.Event) bool {
 	p.last, p.dirty = line, true
 	// stderr, deliberately: stdout carries the RESULT, so a piped `cozy run` is not
 	// polluted by the progress of producing it.
-	fmt.Fprintf(p.ctx.Err, "\r\033[K%s", line)
+	if p.ctx.Mode().Color {
+		fmt.Fprintf(p.ctx.Err, "\r\033[K%s", line)
+	} else {
+		fmt.Fprintln(p.ctx.Err, line)
+	}
 	return true
 }
 
 func (p *runProgress) done() {
-	if p.dirty {
+	if p.dirty && p.ctx.Mode().Color {
 		fmt.Fprintln(p.ctx.Err)
 	}
 }
 
-// progressLine renders one event. The runtime's own frame vocabulary is carried through
-// (`progress`, `stage`, `metric`) rather than translated into a second one.
+// progressLine is the human projection of one event. Runtime's exact typed envelope stays
+// available through --stream and --full; the ordinary status line shows only a named stage
+// or completion percentage. Timing samples and metrics are diagnostics, not user progress.
 func progressLine(e localapi.Event, full bool) string {
+	if full {
+		return diagnosticProgressLine(e)
+	}
 	kind := strings.TrimPrefix(e.Type, "request.")
 	switch kind {
 	case "progress":
+		return humanProgress(e.Payload["value"])
+	case "stage":
+		return humanStage(e.Payload["value"])
+	case "metric":
+		return ""
+	case "queued":
+		return "  preparing a local worker"
+	case "rentals":
+		if line, ok := e.Payload["line"].(string); ok {
+			return line
+		}
+	case "submitted":
+		return ""
+	case "dispatched":
+		return "  worker selected"
+	case "accepted":
+		return "  running"
+	case "requeued":
+		return "  retrying"
+	case "attempt_failed":
+		return "  attempt failed; retrying"
+	default:
+		return ""
+	}
+	return ""
+}
+
+func humanProgress(value any) string {
+	name := "running"
+	fraction, ok := number(value)
+	if fields, isMap := value.(map[string]any); isMap {
+		if named, exists := fields["name"].(string); exists && strings.TrimSpace(named) != "" {
+			name = strings.TrimSpace(named)
+		} else if named, exists := fields["stage"].(string); exists && strings.TrimSpace(named) != "" {
+			name = strings.TrimSpace(named)
+		}
+		for _, key := range []string{"fraction", "value"} {
+			if fraction, ok = number(fields[key]); ok {
+				break
+			}
+		}
+	}
+	if !ok || fraction < 0 || fraction > 1 {
+		return ""
+	}
+	return fmt.Sprintf("  %s — %.0f%%", name, fraction*100)
+}
+
+func humanStage(value any) string {
+	if name, ok := value.(string); ok && strings.TrimSpace(name) != "" {
+		return "  " + strings.TrimSpace(name)
+	}
+	if fields, ok := value.(map[string]any); ok {
+		if name, ok := fields["name"].(string); ok && strings.TrimSpace(name) != "" {
+			return "  " + strings.TrimSpace(name)
+		}
+	}
+	return ""
+}
+
+func number(value any) (float64, bool) {
+	switch value := value.(type) {
+	case float64:
+		return value, true
+	case float32:
+		return float64(value), true
+	case int:
+		return float64(value), true
+	case int64:
+		return float64(value), true
+	case json.Number:
+		parsed, err := value.Float64()
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+// diagnosticProgressLine preserves the old lossless human spelling for --full. The
+// machine surface remains --stream, which emits the complete JSON envelope unchanged.
+func diagnosticProgressLine(e localapi.Event) string {
+	kind := strings.TrimPrefix(e.Type, "request.")
+	switch kind {
+	case "progress", "stage", "metric":
 		if v, ok := e.Payload["value"].(map[string]any); ok {
 			return "  " + strings.TrimSpace(fmt.Sprintf("%s %s", kind, compactValue(v)))
 		}
-	case "stage", "metric":
-		if v, ok := e.Payload["value"].(map[string]any); ok {
-			return "  " + kind + " " + compactValue(v)
-		}
 	case "queued":
-		if !full {
-			return "  preparing a local worker"
-		}
 		if reason, ok := e.Payload["reason"].(string); ok {
 			return "  queued — " + reason
 		}
@@ -625,26 +716,6 @@ func progressLine(e localapi.Event, full bool) string {
 	case "rentals":
 		if line, ok := e.Payload["line"].(string); ok {
 			return line
-		}
-	case "submitted":
-		if !full {
-			return ""
-		}
-	case "dispatched":
-		if !full {
-			return "  worker selected"
-		}
-	case "accepted":
-		if !full {
-			return "  running"
-		}
-	case "requeued":
-		if !full {
-			return "  retrying"
-		}
-	case "attempt_failed":
-		if !full {
-			return "  attempt failed; retrying"
 		}
 	default:
 		return ""
@@ -950,6 +1021,9 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	}
 	defaults = append(defaults, "elapsed")
 	rec := compactRecord(fields, defaults...)
+	if ctx.Mode().Human && !ctx.Mode().Full && len(saved) > 0 {
+		rec.Fields = expandSavedResult(rec.Fields)
+	}
 	rec.Notes = notes
 	code := exit.JobTerminal(mapTerminal(status))
 	if code == exit.OK {
@@ -973,6 +1047,54 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 			WithNext("cozy run list --full")
 	}
 	return e
+}
+
+// expandSavedResult avoids printing an asset handle twice: once as an internal JSON
+// object and again as the useful saved path. Scalar result facts remain first-class human
+// fields; --json and --full retain the exact result envelope.
+func expandSavedResult(fields []output.Field) []output.Field {
+	result := make([]output.Field, 0, len(fields)+4)
+	reserved := make(map[string]bool, len(fields))
+	for _, field := range fields {
+		if field.K != "result" {
+			reserved[field.K] = true
+		}
+	}
+	for _, field := range fields {
+		if field.K != "result" {
+			result = append(result, field)
+			continue
+		}
+		values, ok := field.V.(map[string]any)
+		if !ok {
+			result = append(result, field)
+			continue
+		}
+		keys := make([]string, 0, len(values))
+		for key, value := range values {
+			lower := strings.ToLower(key)
+			if reserved[key] || strings.Contains(lower, "digest") || strings.HasSuffix(lower, "_ref") ||
+				strings.HasSuffix(lower, "_id") || !resultScalar(value) {
+				continue
+			}
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			result = append(result, output.Field{K: key, V: values[key]})
+		}
+	}
+	return result
+}
+
+func resultScalar(value any) bool {
+	switch value.(type) {
+	case string, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32,
+		uint64, float32, float64, json.Number:
+		return true
+	default:
+		return false
+	}
 }
 
 func mapTerminal(status string) string {

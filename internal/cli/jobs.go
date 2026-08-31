@@ -325,17 +325,24 @@ func newJobProgress(ctx *Context) *jobProgress {
 }
 
 func (p *jobProgress) on(e localapi.Event) bool {
+	if p.ctx.Mode().JSON || (!p.ctx.Mode().Color && !p.ctx.Mode().Full) {
+		return true
+	}
 	line := progressLine(e, p.ctx.Mode().Full)
 	if line == "" || line == p.last {
 		return true
 	}
 	p.last, p.dirty = line, true
-	fmt.Fprintf(p.ctx.Err, "\r\033[K%s", line)
+	if p.ctx.Mode().Color {
+		fmt.Fprintf(p.ctx.Err, "\r\033[K%s", line)
+	} else {
+		fmt.Fprintln(p.ctx.Err, line)
+	}
 	return true
 }
 
 func (p *jobProgress) done() {
-	if p.dirty {
+	if p.dirty && p.ctx.Mode().Color {
 		fmt.Fprintln(p.ctx.Err)
 	}
 }
