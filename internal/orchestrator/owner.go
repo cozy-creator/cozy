@@ -410,6 +410,7 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 	}
 	// The ClaimAck is the first thing this worker said; the silence clock runs from here.
 	w.lastReport = time.Now()
+	w.snapshotAcknowledged = false
 	if w.bootID != "" && w.bootID != ack.WorkerBootId {
 		delete(c.sessions, w.bootID)
 	}
@@ -568,7 +569,12 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	ackMsg := &pb.SnapshotAck{SnapshotId: snap.SnapshotId, SnapshotDigest: snap.SnapshotDigest}
 	ackMsg.RecordOwnerEpoch, ackMsg.ControlStreamGeneration, ackMsg.WorkerBootId =
 		recordOwnerEpoch, s.generation, s.bootID
-	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_SnapshotAck{SnapshotAck: ackMsg}})
+	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_SnapshotAck{SnapshotAck: ackMsg}}) {
+		return false
+	}
+	c.mu.Lock()
+	w.snapshotAcknowledged = true
+	c.mu.Unlock()
 	for _, continuation := range continuations {
 		c.afterAck(continuation.request, continuation.attempt, w)
 	}
@@ -586,6 +592,9 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		packages := clonePackageRefs(w.desiredPackages)
 		models := cloneModelRefs(w.desiredModels)
 		c.mu.Unlock()
+		if len(packages) == 0 && len(models) == 0 {
+			return true // generic capacity stays empty until Creator actually selects work
+		}
 		if e := c.issuePackageSet(s, w, packages, models); e != nil {
 			c.logf("rental %s package_set could not be issued: %s",
 				w.spec.Connection.RentalID, e.Message)

@@ -422,6 +422,7 @@ type worker struct {
 	acceptedRevision      uint64
 	convergedRevision     uint64
 	acceptedSetDigest     []byte
+	snapshotAcknowledged  bool
 	packageRevisionDigest string
 	environmentDigest     string
 	configDigest          string
@@ -705,7 +706,8 @@ func (c *Orchestrator) ensureWorkerClaimed(instanceID string) *exit.Error {
 	for {
 		c.mu.Lock()
 		w := c.workers[instanceID]
-		claimed := w != nil && !w.exited && w.bootID != "" && !w.lastReport.IsZero() && w.revision > 0
+		claimed := w != nil && !w.exited && w.bootID != "" && !w.lastReport.IsZero() &&
+			w.snapshotAcknowledged
 		gone := w == nil || w.exited
 		quiet := time.Duration(0)
 		var refused *exit.Error
