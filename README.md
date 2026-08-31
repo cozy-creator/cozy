@@ -174,16 +174,22 @@ to determine the callable lifecycle:
 ```sh
 cozy run org/package/generate \
   prompt="a watercolor lighthouse at dusk" \
-  --out ./outputs
+  --out ./outputs \
+  --await
 
-cozy run org/package/train epochs=3 --detach
+cozy run org/package/train epochs=3
 cozy run list
 cozy run cancel <run-id>
 ```
 
-An attached run follows progress and returns its terminal result. If its local package is missing,
-Cozy installs the newest compatible release from Tensorhub before starting; the download is visible
-progress, not an interactive prompt. `--detach` returns after durable acceptance. Reusing an explicit
+Every run is durable. Cozy observes its first three seconds so a warm, weightless function can still
+return its result directly; otherwise it prints the run id, live status, and authoritative queue
+position, then returns while the daemon continues. `--await` stays attached through the terminal and
+shows named pipeline stages, measured step speed, elapsed time, and an estimate while step telemetry
+is available. `--stream` is the corresponding typed event stream and requires `--await`.
+
+If the package is missing, Cozy installs the newest compatible release from Tensorhub before
+starting; the download is visible progress, not an interactive prompt. Reusing an explicit
 `--idempotency-key` safely returns the same recorded work. Before submission, Cozy materializes an
 omitted integer `seed` and hashes the finalized input payload. Files saved under `--out` use that full
 lowercase hash as their filename, so unseeded runs can share one directory without replacing one

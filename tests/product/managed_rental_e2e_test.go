@@ -168,7 +168,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 
 	code, out := runCozy(t, root, "run", weightlessRef+"/tile", "size=32", "seed=7",
 		"--model", "model=cozy/tiny@1.0.0#"+modelManifest,
-		"--rental", "--detach", "--idempotency-key", "managed-e2e", "--json")
+		"--rental", "--idempotency-key", "managed-e2e", "--json")
 	if code != 0 || !strings.Contains(out, `"changed":true`) {
 		t.Fatalf("rental submission [exit %d]\n%s\ndaemon:\n%s", code, out, daemonOutput.String())
 	}
@@ -233,7 +233,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	}
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile", "size=32", "seed=7",
 		"--model", "model=cozy/tiny@1.0.0#"+modelManifest,
-		"--rental", "--detach", "--idempotency-key", "managed-e2e", "--json")
+		"--rental", "--idempotency-key", "managed-e2e", "--json")
 	mu.Lock()
 	gotPosts = posts
 	mu.Unlock()
@@ -246,7 +246,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	activeRentalID = "pr-managed-job"
 	mu.Unlock()
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile_job", "size=32", "seed=7",
-		"--rental", "--detach", "--idempotency-key", "managed-job", "--json")
+		"--rental", "--idempotency-key", "managed-job", "--json")
 	if code != 0 || !strings.Contains(out, `"changed":true`) {
 		t.Fatalf("remote job submission [exit %d]\n%s\ndaemon:\n%s", code, out, daemonOutput.String())
 	}
@@ -284,7 +284,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			request, gotPosts, gotDeletes, body)
 	}
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile_job", "size=32", "seed=7",
-		"--rental", "--detach", "--idempotency-key", "managed-job", "--json")
+		"--rental", "--idempotency-key", "managed-job", "--json")
 	mu.Lock()
 	gotPosts = posts
 	mu.Unlock()

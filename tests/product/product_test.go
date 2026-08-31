@@ -130,8 +130,17 @@ func TestPackagePublishMetadataGrammar(t *testing.T) {
 	root := t.TempDir()
 	if code, help := runCozy(t, root, "run", "cozy/example/function", "--help"); code != 0 ||
 		strings.Contains(help, "--version") || strings.Contains(help, "vN/function") ||
-		!strings.Contains(help, "org/package[/function]") {
+		!strings.Contains(help, "org/package[/function]") || !strings.Contains(help, "--await") ||
+		strings.Contains(help, "--detach") || strings.Contains(help, "--wait") {
 		t.Fatalf("run retained versioned target grammar [exit %d]\n%s", code, help)
+	}
+	if code, out := runCozy(t, root, "run", "cozy/example/function", "--stream"); code != 2 ||
+		!strings.Contains(out, "--stream requires --await") {
+		t.Fatalf("run stream did not require an explicit await [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "run", "cozy/example/function", "--timeout", "1s"); code != 2 ||
+		!strings.Contains(out, "--timeout requires --await") {
+		t.Fatalf("run timeout did not require an explicit await [exit %d]\n%s", code, out)
 	}
 	if code, help := runCozy(t, root, "package", "publish", "--help"); code != 0 ||
 		strings.Contains(help, "--release") || strings.Contains(help, "--dir") ||
@@ -1109,7 +1118,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 
 	outputDir := filepath.Join(root, "human-run-output")
 	code, stdout, stderr := runCozyStreams(t, root, "run", weightlessRef+"/tile",
-		"size=32", "--out", outputDir)
+		"size=32", "--out", outputDir, "--await")
 	if code != 0 {
 		t.Fatalf("human invocation failed [exit %d]\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
@@ -1166,7 +1175,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	}
 
 	code, _, stderr = runCozyStreams(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--full")
+		"size=32", "seed=7", "--full", "--await")
 	if code != 0 || !strings.Contains(stderr, "progress value=") ||
 		!strings.Contains(stderr, "metric value=") {
 		t.Fatalf("--full did not retain Runtime diagnostics [exit %d]\n%s", code, stderr)
@@ -1180,7 +1189,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 		}
 	}
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--idempotency-key", "placement-proof", "--json")
+		"size=32", "seed=7", "--idempotency-key", "placement-proof", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"revision":"first"`) ||
 		!strings.Contains(out, `"digest":`) || !strings.Contains(out, `"result":`) {
 		t.Fatalf("first editable invocation did not run source [exit %d]\n%s\n%s",
@@ -1202,7 +1211,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	body = []byte(strings.Replace(string(body), `REVISION = "first"`, `REVISION = "second"`, 1))
 	must(t, os.WriteFile(source, body, 0o644))
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--json")
+		"size=32", "seed=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"revision":"second"`) {
 		t.Fatalf("edited body was not live on the next invocation [exit %d]\n%s", code, out)
 	}
@@ -1220,7 +1229,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	must(t, err)
 	must(t, os.WriteFile(lock, append(lockBytes, []byte("\n# editable lock refresh\n")...), 0o644))
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--json")
+		"size=32", "seed=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"revision":"second"`) {
 		t.Fatalf("metadata/lock refresh did not remain runnable [exit %d]\n%s", code, out)
 	}
@@ -1233,7 +1242,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	must(t, err)
 	must(t, os.WriteFile(pyproject, []byte("[project\n"), 0o644))
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--json")
+		"size=32", "seed=7", "--json", "--await")
 	if code != 1 || !strings.Contains(out, `"code":"editable_refresh_failed"`) {
 		t.Fatalf("failed edit did not return the typed refresh refusal [exit %d]\n%s", code, out)
 	}
@@ -1243,7 +1252,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	}
 	must(t, os.WriteFile(pyproject, goodMetadata, 0o644))
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--json")
+		"size=32", "seed=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"revision":"second"`) {
 		t.Fatalf("restored source did not reuse the last good generation [exit %d]\n%s", code, out)
 	}
@@ -1280,7 +1289,7 @@ func TestModeledDevelopmentInstallRefreshesAndKeepsLastGoodSelection(t *testing.
 		t.Fatalf("modeled editable install failed [exit %d]\n%s", code, out)
 	}
 	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
-		"value=7", "--json")
+		"value=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"value":7`) {
 		t.Fatalf("modeled editable invocation failed [exit %d]\n%s\n%s",
 			code, out, productWorkerLogs(root))
@@ -1294,7 +1303,7 @@ func TestModeledDevelopmentInstallRefreshesAndKeepsLastGoodSelection(t *testing.
 		"return Result(payload.value + 1)", 1))
 	must(t, os.WriteFile(source, body, 0o644))
 	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
-		"value=7", "--json")
+		"value=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"value":8`) {
 		t.Fatalf("modeled source edit was not live on the next invocation [exit %d]\n%s\n%s",
 			code, out, productWorkerLogs(root))
@@ -1311,7 +1320,7 @@ func TestModeledDevelopmentInstallRefreshesAndKeepsLastGoodSelection(t *testing.
 		`release = "9.9.9"`, 1)
 	must(t, os.WriteFile(binding, []byte(brokenBinding), 0o644))
 	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
-		"value=7", "--json")
+		"value=7", "--json", "--await")
 	if code != 1 || !strings.Contains(out, `"code":"editable_refresh_failed"`) {
 		t.Fatalf("absent modeled release did not return typed last-good refusal [exit %d]\n%s",
 			code, out)
@@ -1322,7 +1331,7 @@ func TestModeledDevelopmentInstallRefreshesAndKeepsLastGoodSelection(t *testing.
 	}
 	must(t, os.WriteFile(binding, goodBinding, 0o644))
 	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
-		"value=7", "--json")
+		"value=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"value":8`) {
 		t.Fatalf("restored modeled selection did not reuse last good generation [exit %d]\n%s",
 			code, out)
