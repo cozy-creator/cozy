@@ -538,6 +538,7 @@ func (c *Orchestrator) issuePrivatePackageSet(s *session, w *worker,
 	c.mu.Lock()
 	w.revision, w.desiredRefusal = revision, nil
 	w.desiredPrivate = clonePrivatePackageSet(selected)
+	w.desiredPrivatePlacement = nil
 	w.desiredPackages, w.desiredModels = nil, nil
 	c.mu.Unlock()
 	desired := &pb.DesiredWorkerState{RecordOwnerEpoch: recordOwnerEpoch,
@@ -549,6 +550,71 @@ func (c *Orchestrator) issuePrivatePackageSet(s *session, w *worker,
 	}
 	c.logf("DesiredWorkerState revision=%d private_package_set operation=%s files=%d -> %s",
 		revision, selected.OperationId, len(selected.Files), s.bootID)
+	return nil
+}
+
+// ConvergePrivatePlacement binds exact downloaded models to code already admitted under one
+// private revision. Creator signs logical refs only; Runtime authors the joined PlacementSet.
+func (c *Orchestrator) ConvergePrivatePlacement(instanceID, operationID,
+	privateRevisionDigest string, models []*pb.DownloadModelRef,
+) *exit.Error {
+	if operationID == "" || !validDigest(privateRevisionDigest) || len(models) == 0 {
+		return exit.Named(exit.Validation, "private_placement_incomplete",
+			"private modeled placement requires operation, exact revision, and models")
+	}
+	if c.opt.RentalPackageSet == nil {
+		return exit.Named(exit.Unavailable, "rental.package_set_signer_missing",
+			"this Cozy daemon has no package_set signer")
+	}
+	c.mu.Lock()
+	w := c.workers[instanceID]
+	var s *session
+	if w != nil {
+		s = c.sessions[w.bootID]
+	}
+	c.mu.Unlock()
+	if w == nil || w.spec.Connection == nil {
+		return exit.New(exit.NotFound, "no attached rental worker %s on this host", instanceID)
+	}
+	if s == nil {
+		return exit.Unavailablef("worker %s holds no claimed control stream", instanceID)
+	}
+	delegation, signature, problem := c.opt.RentalPackageSet(w.spec.Connection, nil, models)
+	if problem != nil {
+		return problem
+	}
+	revision, err := canonical.Raw(privateRevisionDigest)
+	if err != nil || len(delegation) == 0 || len(signature) != 64 {
+		return exit.Named(exit.Validation, "private_placement_delegation_incomplete",
+			"private modeled placement delegation is incomplete")
+	}
+	selected := &pb.DesiredPrivatePlacementSet{OperationId: operationID,
+		PrivateRevisionDigest: revision, DownloadDelegation: delegation,
+		DownloadDelegationSignature: signature}
+	return c.issuePrivatePlacementSet(s, w, selected)
+}
+
+func (c *Orchestrator) issuePrivatePlacementSet(s *session, w *worker,
+	selected *pb.DesiredPrivatePlacementSet,
+) *exit.Error {
+	if selected == nil {
+		return exit.Internalf("cannot issue an empty private placement set")
+	}
+	revision := c.nextRevision()
+	c.mu.Lock()
+	w.revision, w.desiredRefusal = revision, nil
+	w.desiredPrivate, w.desiredPackages, w.desiredModels = nil, nil, nil
+	w.desiredPrivatePlacement = clonePrivatePlacementSet(selected)
+	c.mu.Unlock()
+	desired := &pb.DesiredWorkerState{RecordOwnerEpoch: recordOwnerEpoch,
+		ControlStreamGeneration: s.generation, WorkerBootId: s.bootID, Revision: revision,
+		Posture: pb.Posture_POSTURE_ACCEPTING, WireMinor: pb.WireMinor,
+		Mode: &pb.DesiredWorkerState_PrivatePlacementSet{PrivatePlacementSet: selected}}
+	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: desired}}) {
+		return exit.Unavailablef("worker %s control stream closed before private placement send", w.instanceID)
+	}
+	c.logf("DesiredWorkerState revision=%d private_placement_set operation=%s -> %s",
+		revision, selected.OperationId, s.bootID)
 	return nil
 }
 
@@ -569,4 +635,14 @@ func clonePrivatePackageSet(in *pb.DesiredPrivatePackageSet) *pb.DesiredPrivateP
 		}
 	}
 	return out
+}
+
+func clonePrivatePlacementSet(in *pb.DesiredPrivatePlacementSet) *pb.DesiredPrivatePlacementSet {
+	if in == nil {
+		return nil
+	}
+	return &pb.DesiredPrivatePlacementSet{OperationId: in.OperationId,
+		PrivateRevisionDigest:       append([]byte(nil), in.PrivateRevisionDigest...),
+		DownloadDelegation:          append([]byte(nil), in.DownloadDelegation...),
+		DownloadDelegationSignature: append([]byte(nil), in.DownloadDelegationSignature...)}
 }

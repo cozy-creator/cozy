@@ -680,6 +680,19 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 			req.PrivatePackageUploadedBootID); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
+		logical.ReleaseDigest = req.PrivatePackageDigest
+		if !req.IsJob() && len(logical.Models) > 0 {
+			models := downloadModelRefs(logical.Models)
+			if len(models) != len(logical.Models) {
+				return WorkerLaunchSpec{}, "", exit.Named(exit.Validation,
+					"private_placement_model_unpublished",
+					"private serving requires exact published model releases")
+			}
+			if e := c.ConvergePrivatePlacement(instance, req.ID,
+				req.PrivatePackageDigest, models); e != nil {
+				return WorkerLaunchSpec{}, "", e
+			}
+		}
 	} else {
 		if c.opt.RentalPackageSet == nil || req.PrivatePackageDigest != "" {
 			return WorkerLaunchSpec{}, "", exit.Unavailablef(
@@ -701,7 +714,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		}
 		spec := WorkerLaunchSpec{Connection: remote.Connection, Placement: DesiredPlacement{
 			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
-			PackageRevisionDigest: req.PackageRevisionDigest,
+			PackageRevisionDigest: logical.ReleaseDigest,
 			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,
 				Outputs:         strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
 				ArtifactOutputs: artifacts, RSSCap: DefaultJobRSSCap, GPUCount: req.JobGPUCount}},
@@ -715,10 +728,18 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
-	if e := c.opt.Store.BindRemoteInvocation(req.ID, planID,
-		spec.Placement.PackageRevisionDigest, spec.Placement.EnvironmentDigest,
-		spec.Placement.ConfigDigest); e != nil {
-		return WorkerLaunchSpec{}, "", e
+	var bind *exit.Error
+	if req.PrivatePackageDigest != "" {
+		bind = c.opt.Store.BindPrivateRemoteInvocation(req.ID, planID,
+			spec.Placement.PackageRevisionDigest, spec.Placement.EnvironmentDigest,
+			spec.Placement.ConfigDigest)
+	} else {
+		bind = c.opt.Store.BindRemoteInvocation(req.ID, planID,
+			spec.Placement.PackageRevisionDigest, spec.Placement.EnvironmentDigest,
+			spec.Placement.ConfigDigest)
+	}
+	if bind != nil {
+		return WorkerLaunchSpec{}, "", bind
 	}
 	return spec, planID, nil
 }
@@ -970,7 +991,11 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 	req records.Request) (packageRevision, environment, config string, e *exit.Error) {
 	packageRevision = w.spec.Placement.PackageRevisionDigest
 	if req.IsJob() && w.spec.Connection != nil {
-		if req.PackageRevisionDigest == "" || req.PackageRevisionDigest != packageRevision {
+		expected := req.PackageRevisionDigest
+		if req.PrivatePackageDigest != "" {
+			expected = req.PrivatePackageDigest
+		}
+		if expected == "" || expected != packageRevision {
 			return "", "", "", exit.Named(exit.Conflict,
 				"request_invocation_identity_changed",
 				"worker %s no longer matches the job release pinned to request %s", w.instanceID, req.ID)
@@ -986,15 +1011,19 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 			"worker %s carries no selected environment digest", w.instanceID)
 	}
 	if w.spec.Connection != nil {
-		if req.PackageRevisionDigest == "" || req.EnvironmentDigest == "" || req.ConfigDigest == "" ||
-			req.PackageRevisionDigest != packageRevision || req.EnvironmentDigest != environment ||
+		expected := req.PackageRevisionDigest
+		if req.PrivatePackageDigest != "" {
+			expected = req.PrivatePackageDigest
+		}
+		if expected == "" || req.EnvironmentDigest == "" || req.ConfigDigest == "" ||
+			expected != packageRevision || req.EnvironmentDigest != environment ||
 			req.ConfigDigest != w.spec.Placement.ConfigDigest {
 			return "", "", "", exit.Named(exit.Conflict,
 				"request_invocation_identity_changed",
 				"worker %s no longer matches the invocation identity pinned to request %s",
 				w.instanceID, req.ID)
 		}
-		return req.PackageRevisionDigest, req.EnvironmentDigest, req.ConfigDigest, nil
+		return packageRevision, req.EnvironmentDigest, req.ConfigDigest, nil
 	}
 	if !validDigest(w.configDigest) {
 		return "", "", "", exit.Named(exit.Structural, "placement_identity_missing",

@@ -354,6 +354,9 @@ type worker struct {
 	// desiredPrivate is the exact command-scoped private wheel inventory. It survives
 	// control reconnect so a prepared pod can replay its ledgered PlacementSet directly.
 	desiredPrivate *pb.DesiredPrivatePackageSet
+	// desiredPrivatePlacement is the signed model-only join for the already-prepared private
+	// revision. It survives a control reconnect so pod-supervisor can replay its exact journal.
+	desiredPrivatePlacement *pb.DesiredPrivatePlacementSet
 
 	// what the worker itself reported; the orchestrator echoes, never invents
 	exited bool

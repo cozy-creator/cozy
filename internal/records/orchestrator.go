@@ -570,6 +570,39 @@ func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, c
 	return nil
 }
 
+// BindPrivateRemoteInvocation records worker-derived serving identity while retaining the
+// checkout source digest separately in package_revision_digest. private_package_digest is the
+// exact execution identity and must already equal the Runtime-reported revision.
+func (s *Store) BindPrivateRemoteInvocation(id, planID, privateRevision,
+	environment, config string,
+) *exit.Error {
+	if id == "" || planID == "" || privateRevision == "" || environment == "" || config == "" {
+		return exit.Internalf("cannot bind an incomplete private remote invocation identity")
+	}
+	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,environment_digest=?,config_digest=?
+    WHERE id=? AND private_package_digest=? AND (plan_id='' OR plan_id=?) AND
+    environment_digest='' AND config_digest=''`, planID, environment, config, id,
+		privateRevision, planID)
+	if err != nil {
+		return exit.Internalf("cannot bind request %s private invocation: %s", id, err)
+	}
+	if changed, err := result.RowsAffected(); err == nil && changed == 1 {
+		return nil
+	}
+	var heldPlan, heldPrivate, heldEnvironment, heldConfig string
+	if err := s.db.QueryRow(`SELECT plan_id,private_package_digest,environment_digest,config_digest
+    FROM requests WHERE id=?`, id).Scan(&heldPlan, &heldPrivate, &heldEnvironment,
+		&heldConfig); err != nil {
+		return exit.Internalf("cannot read request %s private invocation binding: %s", id, err)
+	}
+	if heldPlan != planID || heldPrivate != privateRevision || heldEnvironment != environment ||
+		heldConfig != config {
+		return exit.Named(exit.Conflict, "request_invocation_identity_changed",
+			"request %s already binds a different private invocation identity", id)
+	}
+	return nil
+}
+
 // MarkPrivatePackageUploaded crosses the durable boundary between verified carrier
 // acknowledgements and DesiredPrivatePackageSet. The caller proves every acknowledgement belongs
 // to this exact boot/session before moving the marker; a replacement boot therefore overwrites an

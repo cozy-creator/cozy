@@ -638,12 +638,20 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		c.replayPrivateAborts(s, w.spec.Connection.RentalID)
 		c.mu.Lock()
 		private := clonePrivatePackageSet(w.desiredPrivate)
+		privatePlacement := clonePrivatePlacementSet(w.desiredPrivatePlacement)
 		packages := clonePackageRefs(w.desiredPackages)
 		models := cloneModelRefs(w.desiredModels)
 		c.mu.Unlock()
 		if private != nil {
 			if e := c.issuePrivatePackageSet(s, w, private); e != nil {
 				c.logf("rental %s private_package_set could not be issued: %s",
+					w.spec.Connection.RentalID, e.Message)
+			}
+			return true
+		}
+		if privatePlacement != nil {
+			if e := c.issuePrivatePlacementSet(s, w, privatePlacement); e != nil {
+				c.logf("rental %s private_placement_set could not be issued: %s",
 					w.spec.Connection.RentalID, e.Message)
 			}
 			return true

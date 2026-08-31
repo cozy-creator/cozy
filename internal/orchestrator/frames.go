@@ -117,6 +117,7 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 	w.desiredPackages = clonePackageRefs(packages)
 	w.desiredModels = cloneModelRefs(models)
 	w.desiredPrivate = nil
+	w.desiredPrivatePlacement = nil
 	c.mu.Unlock()
 	d := &pb.DesiredWorkerState{
 		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamGeneration: s.generation,

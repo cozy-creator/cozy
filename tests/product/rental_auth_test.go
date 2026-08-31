@@ -106,12 +106,29 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 		wrongPackage, expires); problem == nil {
 		t.Fatal("delegation admitted a model for an undelegated package")
 	}
-	empty, emptySignature, problem := rental.SignDownloadDelegation(layout, connection,
-		nil, nil, time.Now().Add(30*time.Minute))
+	privateModels := []*pb.DownloadModelRef{{Package: "local/marco-polo",
+		Slot: "marco.models.model", Model: "cozy/tiny", Release: "1.0.0",
+		Manifest: models[0].Manifest}}
+	privateDelegation, privateSignature, problem := rental.SignDownloadDelegation(
+		layout, connection, nil, privateModels, expires)
 	fatal(t, problem)
-	if !bytes.Contains(empty, []byte(`"models":[]`)) || !bytes.Contains(empty, []byte(`"packages":[]`)) ||
-		!ed25519.Verify(public, empty, emptySignature) {
-		t.Fatalf("empty package_set authority is not explicit and signed: %s", empty)
+	privateDoc, err := canonical.Read(privateDelegation, &pb.DownloadDelegation{})
+	must(t, err)
+	if len(privateDoc.List("packages")) != 0 || len(privateDoc.List("models")) != 1 ||
+		!ed25519.Verify(public, privateDelegation, privateSignature) {
+		t.Fatalf("model-only private delegation is not exact and signed: %s", privateDelegation)
+	}
+	mixedPrivateModels := append([]*pb.DownloadModelRef{}, privateModels...)
+	mixedPrivateModels = append(mixedPrivateModels, &pb.DownloadModelRef{Package: "local/other",
+		Slot: "other.models.model", Model: "cozy/tiny", Release: "1.0.0",
+		Manifest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"})
+	if _, _, problem := rental.SignDownloadDelegation(layout, connection, nil,
+		mixedPrivateModels, expires); problem == nil {
+		t.Fatal("model-only delegation admitted two private package identities")
+	}
+	if _, _, problem := rental.SignDownloadDelegation(layout, connection,
+		nil, nil, time.Now().Add(30*time.Minute)); problem == nil {
+		t.Fatal("empty package/model delegation was admitted")
 	}
 
 	request, problem := hub.RentalRequestBytes("cpu", strings.Repeat("1", 64),
