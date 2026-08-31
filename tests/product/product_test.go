@@ -853,11 +853,33 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 		t.Fatalf("version-in-path remedy was not useful [exit %d]\n%s", code, out)
 	}
 
+	if code, out := runCozy(t, root, "run", weightlessRef+"/tile",
+		"size=32", "seed=7", "--max-cost", "1.0000001"); code != 2 ||
+		!strings.Contains(out, "at most six places") {
+		t.Fatalf("over-precise max cost did not refuse [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "run", weightlessRef+"/tile",
+		"size=32", "seed=7", "--max-cost", "2.00", "--machine", "local"); code != 2 ||
+		!strings.Contains(out, "mutually exclusive") {
+		t.Fatalf("max cost plus explicit machine did not refuse [exit %d]\n%s", code, out)
+	}
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--json")
+		"size=32", "seed=7", "--max-cost", "2.00", "--idempotency-key", "budget-proof", "--json")
 	if code != 0 || !strings.Contains(out, `"revision":"first"`) {
 		t.Fatalf("first editable invocation did not run source [exit %d]\n%s\n%s",
 			code, out, productWorkerLogs(root))
+	}
+	store, problem := records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	requests, problem := store.RequestsOfKind("serving", "", 10)
+	fatal(t, problem)
+	store.Close()
+	if len(requests) == 0 || requests[0].MaxCostUSDMicros != 2_000_000 || requests[0].Worker != "" {
+		t.Fatalf("local-first rental budget was not retained exactly: %+v", requests)
+	}
+	if code, out := runCozy(t, root, "run", weightlessRef+"/tile",
+		"size=32", "seed=7", "--max-cost", "1.00", "--idempotency-key", "budget-proof"); code != 1 || !strings.Contains(out, "different body") {
+		t.Fatalf("changed budget reused one request identity [exit %d]\n%s", code, out)
 	}
 	first := activePackageInstall(t, root)
 

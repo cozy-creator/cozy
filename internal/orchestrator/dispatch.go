@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"math"
 	"os"
@@ -68,6 +69,8 @@ type Submission struct {
 	// InstallID pins a durable request to one immutable local install resolution.
 	// Remote requests leave it empty.
 	InstallID string
+	// MaxCostUSDMicros authorizes automatic rental spend for this request. Zero forbids it.
+	MaxCostUSDMicros int64
 }
 
 const ArtifactSnapshotMime = "application/vnd.cozy.tensorfs.snapshot"
@@ -147,7 +150,18 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	s.ArtifactOutputs = artifactOutputs
 	bodyDigest := s.BodyDigest
 	if bodyDigest == "" {
-		spelled, err := canonical.Spell(canonical.Digest(s.Payload))
+		identity := s.Payload
+		if s.MaxCostUSDMicros > 0 {
+			encoded, err := canonical.Write(map[string]canonical.Value{
+				"payload":             base64.StdEncoding.EncodeToString(s.Payload),
+				"max_cost_usd_micros": s.MaxCostUSDMicros,
+			})
+			if err != nil {
+				return records.Request{}, nil, exit.Internalf("cannot encode request budget identity: %s", err)
+			}
+			identity = encoded
+		}
+		spelled, err := canonical.Spell(canonical.Digest(identity))
 		if err != nil {
 			return records.Request{}, nil, exit.Internalf("cannot digest the request body: %s", err)
 		}
@@ -163,12 +177,15 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Outputs: strings.Join(s.Outputs, ","),
 		Assets:  s.Assets, ArtifactOutputs: string(artifactBytes),
 		Kind: s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
-		Worker: s.Worker, InstallID: s.InstallID,
+		Worker: s.Worker, InstallID: s.InstallID, MaxCostUSDMicros: s.MaxCostUSDMicros,
 	}
 	event := map[string]any{
 		"package": s.Package, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
 		"artifact_outputs": artifactOutputs,
+	}
+	if s.MaxCostUSDMicros > 0 {
+		event["max_cost_usd_micros"] = s.MaxCostUSDMicros
 	}
 	return req, event, nil
 }
@@ -442,13 +459,13 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		spec, e := c.resolveFor(req)
 		if e != nil {
 			done()
-			c.failQueued(req.ID, e)
+			c.failQueued(req.ID, autoRentalGate(req, e))
 			return
 		}
 		instance, change, e := c.EnsureWorker(spec)
 		if e != nil {
 			done()
-			c.failQueued(req.ID, e)
+			c.failQueued(req.ID, autoRentalGate(req, e))
 			return
 		}
 		c.logf("%s: %s is %s for the queued request", req.Package, instance, change)
@@ -468,7 +485,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			}
 			c.ShutdownWorker(instance, StopGrace)
 			done()
-			c.failQueued(req.ID, e)
+			c.failQueued(req.ID, autoRentalGate(req, e))
 			return
 		}
 		c.drain()
@@ -478,6 +495,18 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		// for a plan the head does not need.
 		c.reviveQueue()
 	}()
+}
+
+func autoRentalGate(req records.Request, cause *exit.Error) *exit.Error {
+	if req.MaxCostUSDMicros <= 0 ||
+		(cause.Code != exit.Capacity && cause.Code != exit.Unavailable) {
+		return cause
+	}
+	return exit.Named(exit.Unavailable, "rental.package_preparation_unavailable",
+		"automatic rental is authorized up to %d USD micros, but this build cannot prepare "+
+			"the signed package/model set on a generic worker; no rental was purchased",
+		req.MaxCostUSDMicros).
+		WithRemedy("keep the request budget; package preparation must land before paid fallback is enabled")
 }
 
 // staged answers whether this worker was launched with the given plan id staged for it.

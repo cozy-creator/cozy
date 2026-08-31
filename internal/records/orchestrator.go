@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS requests (
   org          TEXT    NOT NULL DEFAULT '',
   trees        TEXT    NOT NULL DEFAULT '',
   worker       TEXT    NOT NULL DEFAULT '',
+  max_cost_usd_micros INTEGER NOT NULL DEFAULT 0,
   install_id   TEXT    REFERENCES install_generations(id),
   assets       TEXT    NOT NULL DEFAULT '[]',
   artifact_outputs TEXT NOT NULL DEFAULT '[]'
@@ -541,6 +542,8 @@ type Request struct {
 	// It lives on the request because a requeue must re-derive the same placement
 	// without a client saying so again. Empty = any local worker.
 	Worker string
+	// MaxCostUSDMicros is the exact automatic-rental authorization. Zero forbids spend.
+	MaxCostUSDMicros int64
 	// InstallID pins a durable local request to the exact immutable generation
 	// resolved before submission. Remote requests leave it empty.
 	InstallID string
@@ -570,14 +573,16 @@ type AssetBinding struct {
 }
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,payload,outputs,
-	state,ordinal,requeues,created_at,kind,org,trees,worker,COALESCE(install_id,''),assets,artifact_outputs`
+	state,ordinal,requeues,created_at,kind,org,trees,worker,max_cost_usd_micros,
+	COALESCE(install_id,''),assets,artifact_outputs`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
 	var assets string
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
 		&r.Payload, &r.Outputs, &r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
-		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.InstallID, &assets, &r.ArtifactOutputs)
+		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.MaxCostUSDMicros,
+		&r.InstallID, &assets, &r.ArtifactOutputs)
 	if err == nil && assets != "" {
 		err = json.Unmarshal([]byte(assets), &r.Assets)
 	}
@@ -851,11 +856,11 @@ func submitRequestTx(tx *sql.Tx, r Request, assets string) (Request, bool, *exit
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
-		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,install_id,assets,
+		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,max_cost_usd_micros,install_id,assets,
 		artifact_outputs)
-		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID, r.Payload,
-		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, nullable(r.InstallID),
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.MaxCostUSDMicros, nullable(r.InstallID),
 		assets, r.ArtifactOutputs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}

@@ -11,7 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRecordsV1MigrationIsAtomicAndMinimal(t *testing.T) {
+func TestRecordsV2MigrationIsAtomicAndMinimal(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -73,7 +73,7 @@ func TestRecordsV1MigrationIsAtomicAndMinimal(t *testing.T) {
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&schemaVersion))
 	must(t, db.QueryRow(`PRAGMA quick_check`).Scan(&quick))
-	if version != 1 || quick != "ok" {
+	if version != 2 || quick != "ok" {
 		t.Fatalf("migrated version/quick_check = %d/%q", version, quick)
 	}
 	retained := map[string]bool{
@@ -127,7 +127,47 @@ func TestRecordsV1MigrationIsAtomicAndMinimal(t *testing.T) {
 	var reopenedSchemaVersion int
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&reopenedSchemaVersion))
 	if reopenedSchemaVersion != schemaVersion {
-		t.Fatalf("v1 open performed DDL: schema_version %d -> %d", schemaVersion, reopenedSchemaVersion)
+		t.Fatalf("v2 open performed DDL: schema_version %d -> %d", schemaVersion, reopenedSchemaVersion)
+	}
+}
+
+func TestRecordsV1AddsDurableRequestBudget(t *testing.T) {
+	path := t.TempDir() + "/records.db"
+	store, problem := records.Open(path)
+	fatal(t, problem)
+	recorded, fresh, problem := store.Submit(records.Request{
+		ID: "req-v1-budget", IdemKey: "v1-budget", BodyDigest: "sha256:v1-budget",
+		Package: "proof/package", Entrypoint: "marco", PlanID: "sha256:plan", Payload: []byte("{}"),
+	})
+	fatal(t, problem)
+	if !fresh || recorded.ID != "req-v1-budget" {
+		t.Fatalf("v1 fixture request = %+v fresh=%v", recorded, fresh)
+	}
+	store.Close()
+
+	db, err := sql.Open("sqlite", path)
+	must(t, err)
+	_, err = db.Exec(`ALTER TABLE requests DROP COLUMN max_cost_usd_micros`)
+	must(t, err)
+	_, err = db.Exec(`PRAGMA user_version=1`)
+	must(t, err)
+	must(t, db.Close())
+
+	store, problem = records.Open(path)
+	fatal(t, problem)
+	defer store.Close()
+	row, problem := store.RequestRow("req-v1-budget")
+	fatal(t, problem)
+	if row == nil || row.BodyDigest != "sha256:v1-budget" || row.MaxCostUSDMicros != 0 {
+		t.Fatalf("v1 request migration = %+v", row)
+	}
+	db, err = sql.Open("sqlite", path)
+	must(t, err)
+	defer db.Close()
+	var version int
+	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
+	if version != 2 || !tableColumnNames(t, db, "requests")["max_cost_usd_micros"] {
+		t.Fatalf("v1->v2 migration = version %d", version)
 	}
 }
 
@@ -135,7 +175,7 @@ func TestRecordsRefusesFutureSchemaWithoutMutation(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
-	_, err = db.Exec(`CREATE TABLE future_owner(value TEXT); PRAGMA user_version=2`)
+	_, err = db.Exec(`CREATE TABLE future_owner(value TEXT); PRAGMA user_version=3`)
 	must(t, err)
 	var before int
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
@@ -156,7 +196,7 @@ func TestRecordsRefusesFutureSchemaWithoutMutation(t *testing.T) {
 	var version, after int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
-	if version != 2 || after != before {
+	if version != 3 || after != before {
 		t.Fatalf("future schema mutated: version=%d schema_version=%d->%d", version, before, after)
 	}
 	var names string

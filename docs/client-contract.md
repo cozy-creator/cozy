@@ -66,6 +66,13 @@ pinned worker location. Non-empty remote work currently refuses as
 `rental.download_delegation_unavailable` until the signed `package_set` protocol is installed;
 Creator never substitutes a locally reconstructed platform qualification.
 
+`max_cost_usd_micros` is the exact non-negative automatic-rental authorization behind CLI
+`--max-cost <decimal USD>`. Zero or absence forbids paid acquisition. It is mutually exclusive
+with `worker`, persists with the request, and enters idempotency identity only when nonzero. Cozy
+still tries local capacity first. Until non-empty signed package/model preparation is installed,
+a local capacity miss stops at `rental.package_preparation_unavailable` before any paid rental
+request; the stored budget is not treated as permission to buy unusable empty capacity.
+
 `local_assets` is the CLI-only local extension for `--asset
 <field-path>=<file>`. Each row names the exact request-schema field path plus a source
 path, digest, length, and detected media type. The daemon verifies those claims and

@@ -68,7 +68,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 // schema is applied only by the unversioned -> v1 migration.
 var schema = append([]string{`
@@ -155,14 +155,14 @@ func Open(path string) (*Store, *exit.Error) {
 			"records database %s has schema %d; this build supports %d", path, version, schemaVersion).
 			WithRemedy("use the Cozy version that wrote this database")
 	}
-	if version == 0 {
+	if version < schemaVersion {
 		// WAL is persistent database state, so enable it only after a future version has
 		// been refused without mutation and before the migration takes its writer lock.
 		if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
 			db.Close()
 			return nil, exit.Internalf("cannot enable WAL for %s: %s", path, err)
 		}
-		if e := migrateV1(db, path); e != nil {
+		if e := migrate(db, path); e != nil {
 			db.Close()
 			return nil, e
 		}
@@ -176,7 +176,7 @@ func databaseVersion(db interface{ QueryRow(string, ...any) *sql.Row }) (int, er
 	return version, err
 }
 
-func migrateV1(db *sql.DB, path string) *exit.Error {
+func migrate(db *sql.DB, path string) *exit.Error {
 	// _txlock=immediate makes database/sql's Begin the required BEGIN IMMEDIATE.
 	tx, err := db.Begin()
 	if err != nil {
@@ -193,67 +193,78 @@ func migrateV1(db *sql.DB, path string) *exit.Error {
 		}
 		return nil
 	}
-	if version != 0 {
+	if version < 0 || version > schemaVersion {
 		return exit.Named(exit.Conflict, "records.schema_newer",
 			"records database %s changed to schema %d while opening", path, version)
 	}
-	for _, stmt := range schema {
-		if _, err := tx.Exec(stmt); err != nil {
-			return exit.Internalf("cannot apply the records schema to %s: %s", path, err)
-		}
-	}
-	if e := migrateColumnRenames(tx, path); e != nil {
-		return e
-	}
-	if e := migrateRentalSchema(tx, path); e != nil {
-		return e
-	}
-	widened := map[string]map[string]bool{}
-	for _, column := range widen {
-		columns := widened[column.table]
-		if columns == nil {
-			columns, err = tableColumns(tx, column.table)
-			if err != nil {
-				return exit.Internalf("cannot inspect %s in %s: %s", column.table, path, err)
-			}
-			widened[column.table] = columns
-		}
-		if columns[column.column] {
-			continue
-		}
-		if _, err := tx.Exec(`ALTER TABLE ` + column.table + ` ADD COLUMN ` +
-			column.column + ` ` + column.ddl); err != nil {
-			return exit.Internalf("cannot add %s.%s in %s: %s",
-				column.table, column.column, path, err)
-		}
-		columns[column.column] = true
-	}
-	for _, stmt := range normalize {
-		if _, err := tx.Exec(stmt); err != nil {
-			return exit.Internalf("cannot normalize lifecycle state in %s: %s", path, err)
-		}
-	}
-	for _, r := range rebuild {
-		var ddl string
-		err := tx.QueryRow(`SELECT COALESCE(sql,'') FROM sqlite_master
-			WHERE type='table' AND name=?`, r.table).Scan(&ddl)
-		if err != nil || !strings.Contains(ddl, r.stale) {
-			continue
-		}
-		for _, stmt := range r.steps {
+	if version == 0 {
+		for _, stmt := range schema {
 			if _, err := tx.Exec(stmt); err != nil {
-				return exit.Internalf("cannot rebuild %s in %s: %s", r.table, path, err)
+				return exit.Internalf("cannot apply the records schema to %s: %s", path, err)
 			}
 		}
+		if e := migrateColumnRenames(tx, path); e != nil {
+			return e
+		}
+		if e := migrateRentalSchema(tx, path); e != nil {
+			return e
+		}
+		widened := map[string]map[string]bool{}
+		for _, column := range widen {
+			columns := widened[column.table]
+			if columns == nil {
+				columns, err = tableColumns(tx, column.table)
+				if err != nil {
+					return exit.Internalf("cannot inspect %s in %s: %s", column.table, path, err)
+				}
+				widened[column.table] = columns
+			}
+			if columns[column.column] {
+				continue
+			}
+			if _, err := tx.Exec(`ALTER TABLE ` + column.table + ` ADD COLUMN ` +
+				column.column + ` ` + column.ddl); err != nil {
+				return exit.Internalf("cannot add %s.%s in %s: %s",
+					column.table, column.column, path, err)
+			}
+			columns[column.column] = true
+		}
+		for _, stmt := range normalize {
+			if _, err := tx.Exec(stmt); err != nil {
+				return exit.Internalf("cannot normalize lifecycle state in %s: %s", path, err)
+			}
+		}
+		for _, r := range rebuild {
+			var ddl string
+			err := tx.QueryRow(`SELECT COALESCE(sql,'') FROM sqlite_master
+			WHERE type='table' AND name=?`, r.table).Scan(&ddl)
+			if err != nil || !strings.Contains(ddl, r.stale) {
+				continue
+			}
+			for _, stmt := range r.steps {
+				if _, err := tx.Exec(stmt); err != nil {
+					return exit.Internalf("cannot rebuild %s in %s: %s", r.table, path, err)
+				}
+			}
+		}
+		if e := dropDeadSchema(tx, path); e != nil {
+			return e
+		}
 	}
-	if e := dropDeadSchema(tx, path); e != nil {
-		return e
+	requestColumns, err := tableColumns(tx, "requests")
+	if err != nil {
+		return exit.Internalf("cannot inspect requests in %s: %s", path, err)
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=1`); err != nil {
-		return exit.Internalf("cannot stamp records schema 1 in %s: %s", path, err)
+	if !requestColumns["max_cost_usd_micros"] {
+		if _, err := tx.Exec(`ALTER TABLE requests ADD COLUMN max_cost_usd_micros INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return exit.Internalf("cannot add requests.max_cost_usd_micros in %s: %s", path, err)
+		}
+	}
+	if _, err := tx.Exec(`PRAGMA user_version=2`); err != nil {
+		return exit.Internalf("cannot stamp records schema 2 in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit records schema 1 in %s: %s", path, err)
+		return exit.Internalf("cannot commit records schema 2 in %s: %s", path, err)
 	}
 	return nil
 }
