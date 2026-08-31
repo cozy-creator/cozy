@@ -288,6 +288,75 @@ fn source_plan_selects_a_unique_reviewed_subset_from_provider_candidates() {
 }
 
 #[test]
+fn reviewed_production_selects_one_named_profile_from_a_shared_source() {
+    let root = temporary("named-profile");
+    fs::create_dir_all(&root).unwrap();
+    let first = root.join("first.bin");
+    let second = root.join("second.bin");
+    let registry = root.join("registry.json");
+    let first_order = root.join("first-order.json");
+    let second_order = root.join("second-order.json");
+    carrier(&first, &["first"]);
+    carrier(&second, &["second"]);
+    order(&first_order, &[("first", "first")]);
+    order(&second_order, &[("second", "second")]);
+    bank(
+        &registry,
+        "profile-a",
+        "diffusers.identity/1",
+        "safetensors.diffusers",
+        &[("first", &first)],
+        &[("first", "provider/first")],
+        &first_order,
+    );
+    bank(
+        &registry,
+        "profile-b",
+        "diffusers.identity/1",
+        "safetensors.diffusers",
+        &[("second", &second)],
+        &[("second", "provider/second")],
+        &second_order,
+    );
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tfs"));
+    let selected = command
+        .args(["ingest", "source-plan", "--registry"])
+        .arg(&registry)
+        .args(["--source-profile", "profile-b"])
+        .args(["--carrier", &format!("provider/first={}", first.display())])
+        .args([
+            "--carrier",
+            &format!("provider/second={}", second.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let text = String::from_utf8(selected.stdout).unwrap();
+    assert!(text.contains(r#""profile":"profile-b""#));
+    assert!(text.contains(second.to_str().unwrap()));
+    assert!(!text.contains(r#""component":"first""#));
+
+    let absent = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["ingest", "source-plan", "--registry"])
+        .arg(&registry)
+        .args(["--source-profile", "profile-c"])
+        .args([
+            "--carrier",
+            &format!("provider/second={}", second.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(!absent.status.success());
+    assert!(String::from_utf8_lossy(&absent.stderr).contains("reviewed source profile"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn source_plan_uses_the_compiled_product_registry_by_default() {
     let root = temporary("compiled-registry");
     fs::create_dir_all(&root).unwrap();
