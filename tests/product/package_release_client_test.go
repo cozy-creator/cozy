@@ -156,7 +156,7 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 0 {
 				t.Errorf("package download body is not empty: %+v err=%v", body, err)
 			}
-			_, _ = io.WriteString(w, `{"release":"1.2.3","release_digest":"sha256:`+strings.Repeat("2", 64)+`","package_config":{"canonical_bytes":"W2JpbmRpbmdzXQo=","digest":"sha256:`+strings.Repeat("3", 64)+`","length":11},"package_descriptor":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("4", 64)+`","length":2},"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","distribution":"package","import_roots":["package"],"kind":"project_wheel","length":4,"path":"package-1.2.3-py3-none-any.whl","tags":["py3-none-any"],"url":"https://storage.invalid/proof.whl","version":"1.2.3"}]}`)
+			_, _ = io.WriteString(w, `{"release":"1.2.3","release_digest":"sha256:`+strings.Repeat("2", 64)+`","package_config":{"canonical_bytes":"W2JpbmRpbmdzXQo=","digest":"sha256:`+strings.Repeat("3", 64)+`","length":11},"package_descriptor":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("4", 64)+`","length":2},"pyproject":{"canonical_bytes":"W3Byb2plY3RdCg==","digest":"sha256:`+strings.Repeat("5", 64)+`","length":10},"uv_lock":{"canonical_bytes":"dmVyc2lvbiA9IDEK","digest":"sha256:`+strings.Repeat("6", 64)+`","length":12},"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","distribution":"package","import_roots":["package"],"kind":"project_wheel","length":4,"path":"package-1.2.3-py3-none-any.whl","tags":["py3-none-any"],"url":"https://storage.invalid/proof.whl","version":"1.2.3"}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -175,6 +175,11 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 	}
 	if string(plan.PackageConfig.CanonicalBytes) != "[bindings]\n" || plan.PackageConfig.Length != 11 {
 		t.Fatalf("package config was not decoded exactly: %+v", plan.PackageConfig)
+	}
+	if string(plan.Pyproject.CanonicalBytes) != "[project]\n" || plan.Pyproject.Length != 10 ||
+		string(plan.UVLock.CanonicalBytes) != "version = 1\n" || plan.UVLock.Length != 12 {
+		t.Fatalf("package environment documents were not decoded exactly: pyproject=%+v lock=%+v",
+			plan.Pyproject, plan.UVLock)
 	}
 	if latest, problem := client.PackageDownloads(context.Background(), ref, ""); problem != nil || latest.Release != "1.2.3" {
 		t.Fatalf("latest package download = %+v, %v", latest, problem)

@@ -156,7 +156,7 @@ func preparePublished(l home.Layout, genDir, runtimeBin string, published *Publi
 	}
 	sort.Strings(closure)
 	environment := &EnvironmentReceipt{
-		Python: "CPython 3.12", Platform: "linux/amd64", LinkMode: "overlay",
+		Python: "CPython 3.12", Platform: "linux/amd64",
 		Packages: len(closure), Closure: strings.Join(closure, "\n"),
 	}
 	return descriptor, answer.PlacementSet, runtimeBin, environment, nil

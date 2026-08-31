@@ -71,8 +71,10 @@ type PackageDownloadPlan struct {
 	Downloads         []PackageInstallDownload `json:"downloads"`
 	PackageConfig     ExactDocument            `json:"package_config"`
 	PackageDescriptor ExactDocument            `json:"package_descriptor"`
+	Pyproject         ExactDocument            `json:"pyproject"`
 	Release           string                   `json:"release"`
 	ReleaseDigest     string                   `json:"release_digest"`
+	UVLock            ExactDocument            `json:"uv_lock"`
 }
 
 func packageReleasePath(ref Ref, release string) string {

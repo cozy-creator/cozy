@@ -1,14 +1,12 @@
 //go:build linux || darwin
 
-// The three filesystem facts the install pipeline needs that Go's portable API does not
-// expose: free space under a directory, whether a file is one of several links to the
-// same inode, and which device a path lives on. Each is one syscall here and one Windows
-// API call in the sibling file; nothing above this line knows which.
+// The filesystem facts the install pipeline needs that Go's portable API does not
+// expose: free space under a directory and whether a file is one of several links to
+// the same inode. Each is one syscall here and one Windows API call in the sibling file.
 package install
 
 import (
 	"io/fs"
-	"os"
 	"syscall"
 )
 
@@ -25,18 +23,6 @@ func freeBytes(dir string) (int64, bool) {
 func hardlinked(info fs.FileInfo) bool {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	return ok && st.Nlink > 1
-}
-
-func deviceOf(p string) (uint64, bool) {
-	info, err := os.Stat(p)
-	if err != nil {
-		return 0, false
-	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0, false
-	}
-	return uint64(st.Dev), true
 }
 
 // Unix unlinks files through their parent directory. Leave read-only regular files

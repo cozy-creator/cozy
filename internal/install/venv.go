@@ -29,7 +29,6 @@ type EnvironmentReceipt struct {
 	LockDigest string
 	Platform   string
 	Extra      string
-	LinkMode   string
 	Packages   int
 	Closure    string
 	Warnings   []string
@@ -62,7 +61,6 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 		UV:         toolVersion("uv", "--version"),
 	}
 	env.Extra = pickCUDAExtra(sourceDir, &env.Warnings)
-	env.LinkMode = pickLinkMode(venvDir, &env.Warnings)
 
 	args := []string{"sync", "--locked", "--no-progress"}
 	if env.Extra != "" {
@@ -71,8 +69,7 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 	cmd := exec.Command("uv", args...)
 	cmd.Dir = sourceDir
 	cmd.Env = config.Frozen().Tool(
-		"UV_PROJECT_ENVIRONMENT="+venvDir,
-		"UV_LINK_MODE="+env.LinkMode,
+		"UV_PROJECT_ENVIRONMENT=" + venvDir,
 	)
 	var out strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &out
@@ -202,39 +199,6 @@ func hostCUDA() int {
 	major, _ := strconv.Atoi(string(m[1]))
 	minor, _ := strconv.Atoi(string(m[2]))
 	return major*10 + minor
-}
-
-// pickLinkMode keeps hardlink dedup across venvs when uv's cache and the generation
-// share a filesystem, and degrades to copies with a loud warning when they do not.
-func pickLinkMode(venvDir string, warn *[]string) string {
-	cache := strings.TrimSpace(runOut("uv", "cache", "dir"))
-	if cache == "" {
-		return "copy"
-	}
-	a, aok := deviceOf(cache)
-	b, bok := deviceOf(firstExistingParent(venvDir))
-	if !aok || !bok {
-		return "copy"
-	}
-	if a != b {
-		*warn = append(*warn, fmt.Sprintf(
-			"hardlink dedup degraded to copies: uv's cache (%s) and this install are on different mounts — every venv pays full bytes", cache))
-		return "copy"
-	}
-	return "hardlink"
-}
-
-func firstExistingParent(p string) string {
-	for {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-		parent := filepath.Dir(p)
-		if parent == p {
-			return p
-		}
-		p = parent
-	}
 }
 
 func pythonVersion(venvDir string) string {

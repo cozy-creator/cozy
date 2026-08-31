@@ -47,7 +47,6 @@ type PackageInstall struct {
 	LockDigest         string
 	Platform           string
 	Extra              string // the CUDA-extra pick ("" = none declared or no accelerator)
-	LinkMode           string // "hardlink" | "copy" (cross-mount degradation)
 	Packages           int
 	Closure            string // one "name==version" per line
 	PackageDescriptor  string // exact digest of the generation-private Runtime-derived descriptor
@@ -89,7 +88,6 @@ CREATE TABLE IF NOT EXISTS install_generations (
   lock_digest   TEXT    NOT NULL,
   platform      TEXT    NOT NULL,
   extra         TEXT    NOT NULL,
-  link_mode     TEXT    NOT NULL,
   packages      INTEGER NOT NULL,
   closure       TEXT    NOT NULL,
   package_descriptor TEXT    NOT NULL,
@@ -276,7 +274,7 @@ func (s *Store) Close() { _ = s.db.Close() }
 
 var genFields = []string{
 	"id", "package", "major", "version", "source_kind", "source_ref", "source_digest",
-	"verified", "dir", "python", "runtime", "project_dir", "uv", "lock_digest", "platform", "extra", "link_mode",
+	"verified", "dir", "python", "runtime", "project_dir", "uv", "lock_digest", "platform", "extra",
 	"packages", "closure", "package_descriptor", "placement_set_digest", "bytes_excl", "bytes_shared", "created_at",
 }
 
@@ -298,7 +296,7 @@ func scanGen(rows interface{ Scan(...any) error }) (PackageInstall, error) {
 	var verified int
 	err := rows.Scan(&g.ID, &g.Package, &g.Major, &g.Version, &g.SourceKind, &g.SourceRef,
 		&g.SourceDigest, &verified, &g.Dir, &g.Python, &g.Runtime, &g.ProjectDir, &g.UV, &g.LockDigest, &g.Platform,
-		&g.Extra, &g.LinkMode, &g.Packages, &g.Closure, &g.PackageDescriptor, &g.PlacementSetDigest,
+		&g.Extra, &g.Packages, &g.Closure, &g.PackageDescriptor, &g.PlacementSetDigest,
 		&g.BytesExcl, &g.BytesShared, &g.CreatedAt)
 	g.Verified = verified == 1
 	return g, err
@@ -329,7 +327,7 @@ func (s *Store) Activate(g PackageInstall) (superseded string, e *exit.Error) {
 	if _, err := tx.Exec(`INSERT INTO install_generations(`+genCols("")+`)
 		VALUES(`+placeholders()+`)`,
 		g.ID, g.Package, g.Major, g.Version, g.SourceKind, g.SourceRef, g.SourceDigest,
-		verified, g.Dir, g.Python, g.Runtime, g.ProjectDir, g.UV, g.LockDigest, g.Platform, g.Extra, g.LinkMode,
+		verified, g.Dir, g.Python, g.Runtime, g.ProjectDir, g.UV, g.LockDigest, g.Platform, g.Extra,
 		g.Packages, g.Closure, g.PackageDescriptor, g.PlacementSetDigest,
 		g.BytesExcl, g.BytesShared, g.CreatedAt); err != nil {
 		return "", exit.Internalf("cannot insert generation %s: %s", g.ID, err)
