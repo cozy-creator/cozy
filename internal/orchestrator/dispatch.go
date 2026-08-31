@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"math"
 	"os"
@@ -149,7 +150,18 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	s.ArtifactOutputs = artifactOutputs
 	bodyDigest := s.BodyDigest
 	if bodyDigest == "" {
-		spelled, err := canonical.Spell(canonical.Digest(s.Payload))
+		identity := s.Payload
+		if s.MaxCostUSDMicros > 0 {
+			encoded, err := canonical.Write(map[string]canonical.Value{
+				"payload":             base64.StdEncoding.EncodeToString(s.Payload),
+				"max_cost_usd_micros": s.MaxCostUSDMicros,
+			})
+			if err != nil {
+				return records.Request{}, nil, exit.Internalf("cannot encode request budget identity: %s", err)
+			}
+			identity = encoded
+		}
+		spelled, err := canonical.Spell(canonical.Digest(identity))
 		if err != nil {
 			return records.Request{}, nil, exit.Internalf("cannot digest the request body: %s", err)
 		}

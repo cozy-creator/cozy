@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,12 @@ func TestBudgetedRequestStopsBeforePaidRentalWithoutPackagePreparation(t *testin
 	fatal(t, problem)
 	if !eventHasError(events, "rental.package_preparation_unavailable") {
 		t.Fatalf("budgeted request did not stop at the pre-purchase gate: %+v", events)
+	}
+	changedBudget := budgeted
+	changedBudget.MaxCostUSDMicros = 1_000_000
+	if _, _, problem := owner.c.Submit(changedBudget); problem == nil ||
+		!strings.Contains(problem.Message, "different body") {
+		t.Fatalf("changed budget reused one orchestrator identity: %v", problem)
 	}
 
 	zero := submission("sha256:plan", "proof/package", "zero-budget-gate", map[string]any{})
