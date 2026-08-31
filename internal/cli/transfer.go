@@ -1,8 +1,6 @@
 package cli
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
@@ -123,10 +121,9 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		}
 	}
 	reason := "cozy model publish " + ref.String() + " " + manifestID + " --release " + release + " --lane " + lane
-	// The operation id binds the complete destination tuple without exposing an
-	// independently caller-authored replay key.
-	sum := sha256.Sum256([]byte(ref.String() + "\x00" + release + "\x00" + lane + "\x00" + manifestID))
-	session := "manifest-" + hex.EncodeToString(sum[:])
+	// The versioned operation binds the complete named-lane intent without
+	// colliding with publications opened under earlier request semantics.
+	session := transfer.PublicationOperationID(ref, release, lane, manifestID)
 	tool, c, layout, e := tooling(ctx)
 	if e != nil {
 		return e

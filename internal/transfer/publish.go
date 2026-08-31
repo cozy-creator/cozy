@@ -16,6 +16,8 @@ package transfer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -31,6 +33,16 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
+
+const modelPublicationOperationVersion = "model-publication-named-lane/1\x00"
+
+// PublicationOperationID binds one named-lane publication intent. The version
+// keeps operations opened under older request semantics out of this replay key.
+func PublicationOperationID(ref hub.Ref, release, lane, manifestID string) string {
+	subject := modelPublicationOperationVersion + ref.String() + "\x00" + release + "\x00" + lane + "\x00" + manifestID
+	sum := sha256.Sum256([]byte(subject))
+	return "manifest-" + hex.EncodeToString(sum[:])
+}
 
 // One object write or read at the storage edge is bounded by BYTES MOVING, not by a
 // clock — see `mover`. The 30-minute constant that used to live here said in its own
@@ -138,14 +150,14 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	// 2. Open under the caller-stable operation id. Reopening returns the same durable
 	//    publication, including a prepared or committed one whose results can replay.
 	t0 = time.Now()
-	opened, e := p.Hub.OpenPublication(ctx, p.Ref, p.Session, p.Release, declared, p.Reason)
+	opened, e := p.Hub.OpenPublication(ctx, p.Ref, p.Session, p.Release, p.Lane, declared, p.Reason)
 	if e != nil {
 		return res, e
 	}
 	ms["open"] = since(t0)
 	publication := opened.Publication
 	if publication.Operation != p.Session || publication.Release != p.Release ||
-		publication.LaneKey != "" || publication.RequiredContract != "" ||
+		publication.LaneKey != p.Lane || publication.RequiredContract != "" ||
 		publication.State == "open" && publication.Lane != "" {
 		return res, exit.Internalf("publication reopened under different release coordinates")
 	}
