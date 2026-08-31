@@ -18,8 +18,12 @@ import (
 
 func client(ctx *Context) *hub.Client {
 	rev, _ := buildStamp()
+	auth := ctx.AccountAuth
+	if auth == nil {
+		auth = accountauth.New(ctx.Cfg)
+	}
 	return hub.New(ctx.Cfg, "cozy/"+tag+"+"+rev).
-		WithTokenSource(accountauth.New(ctx.Cfg))
+		WithTokenSource(auth)
 }
 
 // stamp trims a hub timestamp to whole seconds — the catalog's own RFC3339 with

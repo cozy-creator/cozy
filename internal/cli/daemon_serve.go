@@ -142,7 +142,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// route is the ask a platform with no process signal still has (#449), and it takes
 	// exactly the path a SIGTERM takes.
 	stop := make(chan os.Signal, 1)
-	productions := newModelProductionManager(ctx.Cfg, st, ctx.Out)
+	productions := newModelProductionManager(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
 	server := api.New(api.Options{
 		Orchestrator: c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,

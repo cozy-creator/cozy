@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/alecthomas/kong"
+	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -42,11 +43,12 @@ func (i *Invocation) Value(name string) string {
 // Context is the retained mechanism boundary. Handlers receive typed values and
 // frozen configuration; they never parse argv or read ambient configuration.
 type Context struct {
-	Inv    *Invocation
-	Out    io.Writer
-	Err    io.Writer
-	Cfg    config.Config
-	Daemon daemon.State
+	Inv         *Invocation
+	Out         io.Writer
+	Err         io.Writer
+	Cfg         config.Config
+	Daemon      daemon.State
+	AccountAuth *accountauth.Manager
 }
 
 func (c *Context) Mode() output.Mode { return c.Inv.Mode }
@@ -69,7 +71,7 @@ func (r *Runtime) call(h handler, args []string, flags map[string]bool,
 			Args: append([]string(nil), args...), Bools: flags,
 			Values: values, Mode: r.Mode,
 		},
-		Out: r.Out, Err: r.Err, Cfg: r.Cfg,
+		Out: r.Out, Err: r.Err, Cfg: r.Cfg, AccountAuth: accountauth.New(r.Cfg),
 	}
 	if daemon {
 		state, _, problem := ensureDaemon(ctx)
