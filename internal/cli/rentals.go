@@ -286,7 +286,6 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		ID: remote.ID, MachineName: machineName, SKU: skuName,
 		AcceleratorModel: remote.AcceleratorModel, HourlyRateUSDMicros: remote.HourlyRateUSDMicros,
 		ManagedRequestID: managedRequestID, State: remote.State, Hub: c.Base(),
-		WheelhouseManifestDigest: remote.WheelhouseManifestDigest,
 	}
 	stored, problem := st.RentalRow(remote.ID)
 	if problem != nil {
@@ -319,11 +318,6 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 				"rental %s changed its Cozy retail hourly rate from %d to %d USD micros",
 				seen.ID, row.HourlyRateUSDMicros, seen.HourlyRateUSDMicros)
 		}
-		if seen.WheelhouseManifestDigest != row.WheelhouseManifestDigest {
-			return exit.Named(exit.Conflict, "rental.wheelhouse_manifest_changed",
-				"rental %s changed selected WheelhouseManifest from %s to %s", seen.ID,
-				row.WheelhouseManifestDigest, seen.WheelhouseManifestDigest)
-		}
 		row.Address, row.State = seen.Address, seen.State
 		row.MediaAddress = seen.MediaAddress
 		row.ExpectedWorkerID, row.ExpectedWorkerBootID = seen.WorkerID, seen.WorkerBootID
@@ -340,7 +334,6 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	row.Address, row.State = attachable.Address, attachable.State
 	row.MediaAddress = attachable.MediaAddress
 	row.ExpectedWorkerID, row.ExpectedWorkerBootID = attachable.WorkerID, attachable.WorkerBootID
-	row.WheelhouseManifestDigest = attachable.WheelhouseManifestDigest
 	if !attachable.HoldsMediaHash(secret.HashHex(token)) {
 		return records.Rental{}, hub.Rental{}, false, exit.New(exit.Failed,
 			"rental %s is attachable and its live credential set does not carry the token this host minted", attachable.ID).

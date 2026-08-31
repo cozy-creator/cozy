@@ -71,14 +71,14 @@ until `cozy rental end`; Creator-managed rentals are released after all assigned
 are terminal, their output bytes are mirrored, and their outcome acknowledgements are sent.
 
 A generic rental becomes attachable when Tensorhub publishes its pinned worker location.
-Before acquisition, Creator asks Runtime to intersect each exact package wheel set with
-Tensorhub's active WheelhouseManifests; modeled private packages also require base Runtime
-0.0.20 or newer. The paid request contains that sorted intersection. Creator retains
-Tensorhub's selected manifest readback and reuses an idle rental only for a request that
-accepts the same manifest. Creator then sends the exact published release as a signed logical
+The paid request contains only the SKU, media-token hash, and Creator public key; package and
+model choices remain local until Creator attaches. Creator reuses an idle rental whose observed
+hardware fits the request, then sends the exact published release as a signed logical
 `package_set`, or an exact private revision as `private_package_set`; the worker's observed-state
 stream supplies the derived placement, dispatchable binding, and exact release/environment/config
-identities. Tensorhub's immutable release detail supplies the verified request/result descriptor.
+identities. Runtime observes the actual worker environment and refuses protected platform-package
+conflicts before offline installation. Tensorhub's immutable release detail supplies the verified
+request/result descriptor.
 
 `local_assets` is the CLI-only local extension for `--asset
 <field-path>=<file>`. Each row names the exact request-schema field path plus a source

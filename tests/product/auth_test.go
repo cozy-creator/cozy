@@ -110,8 +110,7 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 			}
 			writeAuthJSON(t, w, http.StatusAccepted, map[string]any{
 				"rental_id": "rental-auth-proof", "state": "pending_acquisition",
-				"hourly_rate_usd_micros":     int64(100_000),
-				"wheelhouse_manifest_digest": "sha256:" + strings.Repeat("2", 64),
+				"hourly_rate_usd_micros": int64(100_000),
 			})
 		default:
 			t.Errorf("unexpected auth route %s", r.URL.Path)
