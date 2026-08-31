@@ -156,7 +156,7 @@ pub fn acquire(
     objects: Vec<ObjectRef>,
 ) -> Result<(ReadLease, Receipts)> {
     // The hold FIRST: registered before the first fetch (tensorfs.md §2, pin root class 2).
-    let hold = meta.acquire_hold("read", manifest, Vec::new())?;
+    let hold = meta.acquire_hold("read")?;
     // Admission proves RLIMIT_NOFILE headroom for the COMPLETE descriptor set (H3 serves
     // 3,627 distinct objects — never an assumable count) or refuses typed.
     let distinct: HashSet<&str> = objects.iter().map(|o| o.sha256.as_str()).collect();

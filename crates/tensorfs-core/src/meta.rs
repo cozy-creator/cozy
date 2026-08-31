@@ -1,7 +1,7 @@
 //! Transient local coordination in SQLite.
 //!
-//! Repository files are the only durable catalog authority. Read leases and derived writes
-//! coordinate local processes; none of these rows makes content durable or adds a stored format.
+//! Repository files are the only durable catalog authority. Advisory marker locks protect local
+//! readers; SQLite retains only released-manifest lookup and resumable derived writes.
 
 use std::fs::{self, File};
 use std::path::PathBuf;
@@ -50,6 +50,7 @@ pub fn now_nanos_unique() -> u128 {
 pub struct Meta {
     db: PathBuf,
     lease_dir: PathBuf,
+    recovery_lock: PathBuf,
 }
 
 impl Meta {
@@ -57,9 +58,12 @@ impl Meta {
         crate::catalog::Catalog::open(store.root())?;
         let lease_dir = store.root().join("tmp/leases");
         fs::create_dir_all(&lease_dir).map_err(|error| io("mkdir lease markers", error))?;
+        let writer_dir = store.root().join("tmp/writers");
+        fs::create_dir_all(&writer_dir).map_err(|error| io("mkdir writer markers", error))?;
         Ok(Self {
             db: crate::catalog::Catalog::path(store.root()),
             lease_dir,
+            recovery_lock: writer_dir.join("recovery.lock"),
         })
     }
 
@@ -83,7 +87,7 @@ impl Meta {
         let count: u64 = self
             .connection()?
             .query_row(
-                "SELECT count(*) FROM tensorfs_releases WHERE manifest_sha256=?1",
+                "SELECT count(*) FROM tensorfs_released_manifests WHERE manifest_sha256=?1",
                 [digest],
                 |row| row.get(0),
             )
@@ -104,21 +108,8 @@ impl Meta {
         read_derived(&self.connection()?)
     }
 
-    pub fn acquire_hold(&self, kind: &str, manifest: &str, objects: Vec<String>) -> Result<Hold> {
+    pub fn acquire_hold(&self, kind: &str) -> Result<Hold> {
         ascii_name("lease kind", kind, limits::MAX_NAME_BYTES)?;
-        if !manifest.is_empty() {
-            hex64("lease manifest", manifest)?;
-        }
-        if objects.len() > limits::MAX_ENTRIES {
-            return refuse(Code::COUNT_CAP, "read lease object count exceeds cap");
-        }
-        let mut objects = objects;
-        for digest in &objects {
-            hex64("lease object", digest)?;
-        }
-        objects.sort();
-        objects.dedup();
-
         let id = format!("{kind}-{}-{}", std::process::id(), now_nanos_unique());
         let path = self.lease_path(&id);
         let file = File::options()
@@ -129,64 +120,46 @@ impl Meta {
             .map_err(|error| io("create lease marker", error))?;
         file.try_lock_exclusive()
             .map_err(|error| io("lock lease marker", error))?;
+        let recovery = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&self.recovery_lock)
+            .map_err(|error| io("open recovery lock", error))?;
+        FileExt::lock_shared(&recovery).map_err(|error| io("share recovery lock", error))?;
 
-        let mut connection = self.connection()?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| sql("begin read lease", error))?;
-        transaction
-            .execute(
-                "INSERT INTO tensorfs_read_leases(id,manifest_sha256,kind,owner_marker)
-                 VALUES (?1,?2,?3,?4)",
-                params![id, manifest, kind, path.to_string_lossy()],
-            )
-            .map_err(|error| sql("insert read lease", error))?;
-        for digest in &objects {
-            transaction
-                .execute(
-                    "INSERT INTO tensorfs_read_lease_objects(lease_id,sha256) VALUES (?1,?2)",
-                    params![id, digest],
-                )
-                .map_err(|error| sql("insert read lease object", error))?;
-        }
-        transaction
-            .commit()
-            .map_err(|error| sql("commit read lease", error))?;
         Ok(Hold {
             id,
             kind: kind.to_string(),
             file: Some(file),
+            _recovery: recovery,
             path,
             released: false,
         })
     }
 
     pub fn reap_holds(&self) -> Result<Vec<String>> {
-        let connection = self.connection()?;
-        let mut statement = connection
-            .prepare("SELECT id,owner_marker FROM tensorfs_read_leases ORDER BY id")
-            .map_err(|error| sql("prepare lease census", error))?;
-        let candidates = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|error| sql("read lease census", error))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| sql("collect lease census", error))?;
-        drop(statement);
-
         let mut reaped = Vec::new();
-        for (id, marker) in candidates {
-            let path = PathBuf::from(marker);
+        for entry in
+            fs::read_dir(&self.lease_dir).map_err(|error| io("read lease markers", error))?
+        {
+            let path = entry
+                .map_err(|error| io("read lease marker", error))?
+                .path();
+            let Some(id) = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
             let dead = match File::options().read(true).write(true).open(&path) {
                 Ok(file) => file.try_lock_exclusive().is_ok(),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                 Err(error) => return Err(io("open lease marker", error)),
             };
             if dead {
-                connection
-                    .execute("DELETE FROM tensorfs_read_leases WHERE id=?1", [&id])
-                    .map_err(|error| sql("reap read lease", error))?;
                 let _ = fs::remove_file(path);
                 reaped.push(id);
             }
@@ -253,6 +226,7 @@ pub struct Hold {
     id: String,
     kind: String,
     file: Option<File>,
+    _recovery: File,
     path: PathBuf,
     released: bool,
 }
@@ -263,32 +237,25 @@ impl Hold {
     }
 
     pub fn release(mut self, meta: &Meta) -> Result<()> {
-        let changed = meta
-            .connection()?
-            .execute("DELETE FROM tensorfs_read_leases WHERE id=?1", [&self.id])
-            .map_err(|error| sql("release read lease", error))?;
-        if changed != 1 {
-            return refuse(
-                Code::LEASE_REVOKED,
-                format!("lease {:?} is absent", self.id),
-            );
-        }
+        let _ = meta;
+        fs::remove_file(&self.path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Refusal {
+                    code: Code::LEASE_REVOKED,
+                    detail: format!("lease {:?} is absent", self.id),
+                }
+            } else {
+                io("remove lease marker", error)
+            }
+        })?;
         self.file = None;
-        let _ = fs::remove_file(&self.path);
         self.released = true;
         Ok(())
     }
 
     pub fn still_registered(&self, meta: &Meta) -> Result<()> {
-        let count: u64 = meta
-            .connection()?
-            .query_row(
-                "SELECT count(*) FROM tensorfs_read_leases WHERE id=?1",
-                [&self.id],
-                |row| row.get(0),
-            )
-            .map_err(|error| sql("check read lease", error))?;
-        if count == 1 {
+        let _ = meta;
+        if self.file.is_some() && self.path.is_file() {
             Ok(())
         } else {
             refuse(

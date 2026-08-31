@@ -6,7 +6,7 @@ TensorFS stores every domain repository as the same graph:
 repos/<org>/<name>.json
 manifests/<aa>/<bb>/<sha256>.json
 blobs/<aa>/<bb>/<sha256>
-tensorfs.sqlite                    # local rebuildable projection
+tensorfs.sqlite                    # five small local index/coordination/cache tables
 checkouts/<manifest-sha256>/...    # optional disposable local view
 tmp/                               # all transient local state; delete when stopped
 ```
@@ -15,8 +15,9 @@ Repository files are authoritative mutable release indexes. Manifests are immuta
 trees. Blobs are immutable content bytes. The same engine is used independently for model,
 package-source, dataset, and user-file stores; the physical domain/bucket supplies access and
 erasure isolation, not a different catalog format. SQLite locally and PostgreSQL in Tensorhub are
-query and coordination projections that rebuild from repository files; SQL never decides GC
-liveness.
+local indexes and coordination. Repository files rebuild released-manifest lookup; open operation
+holds protect in-flight writes from GC; derived transactions are resumable local work; verified
+blob rows avoid rehashing unchanged files. SQL never makes repository content durable.
 
 TensorFS has exactly three stored schemas:
 
@@ -94,7 +95,7 @@ are `{blob:{length,sha256},path}`; it validates the common Manifest grammar, wri
 bytes, and prints their ObjectRef. Local and cloud callers use this seam instead of defining a
 second source-tree codec.
 
-Publication order is blobs, manifest, repository compare-and-swap, then SQL projection. A crash
+Publication order is blobs, manifest, repository compare-and-swap, then released-manifest index. A crash
 before repository replacement leaves harmless unreachable content. A crash afterward leaves
 storage ahead of SQL; `store rebuild` catches SQL up. The database never leads the repository file.
 
@@ -106,11 +107,12 @@ Evidence is present only for a Manifest containing one typed CozyTensors header.
 do not fabricate model classification. A release may carry one optional `metadata` blob ref;
 package repositories use it for their exact PackageRelease while datasets and user files may omit
 it. Rebuild always recovers the repository, metadata, Manifest, and complete reached blob set;
-model headers additionally recover topology, component, encoding, and config projections.
+model headers additionally recover the diagnostic projection emitted by `store rebuild --rows`.
 
-`repo apply` derives full release projection rows from the exact manifest, header, and complete
-blob inventory before the caller may perform its repository CAS. Missing or length-mismatched bytes
-refuse publication.
+`repo apply` validates the exact manifest, header, and complete blob inventory before the caller may
+perform its repository CAS, then records only `(org,name,manifest_sha256)` in SQLite. Missing or
+length-mismatched bytes refuse publication. Full repo/release/object rows remain diagnostic rebuild
+output, not duplicated database tables.
 
 ## Read views
 

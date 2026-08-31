@@ -230,22 +230,17 @@ fn manifest_build_is_the_single_ordinary_file_producer() {
 
 fn projection_snapshot(root: &Path) -> Vec<String> {
     let db = rusqlite::Connection::open(root.join("tensorfs.sqlite")).unwrap();
-    let mut out = Vec::new();
-    for sql in [
-        "SELECT org||'|'||name||'|'||document_sha256 FROM tensorfs_repos ORDER BY 1",
-        "SELECT org||'|'||name||'|'||version||'|'||lane||'|'||manifest_sha256||'|'||manifest_length||'|'||hex(evidence_json)||'|'||header_sha256||'|'||header_length||'|'||topology_digest||'|'||object_count||'|'||object_bytes FROM tensorfs_releases ORDER BY 1",
-        "SELECT org||'|'||name||'|'||version||'|'||lane||'|'||sha256||'|'||length||'|'||object_kind FROM tensorfs_release_objects ORDER BY 1",
-    ] {
-        let mut statement = db.prepare(sql).unwrap();
-        out.extend(
-            statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-        );
-    }
-    out
+    let mut statement = db
+        .prepare(
+            "SELECT org||'|'||name||'|'||manifest_sha256
+             FROM tensorfs_released_manifests ORDER BY 1",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
 }
 
 #[test]
@@ -303,12 +298,13 @@ fn four_domain_ordinary_repositories_rebuild_after_projection_tables_are_emptied
         let before = projection_snapshot(&store_root);
         assert_eq!(
             before.len(),
-            if metadata.is_some() { 4 } else { 3 },
-            "one repo, release, and every reached blob"
+            1,
+            "only released manifest lookup is projected"
         );
 
         let db = rusqlite::Connection::open(store_root.join("tensorfs.sqlite")).unwrap();
-        db.execute("DELETE FROM tensorfs_repos", []).unwrap();
+        db.execute("DELETE FROM tensorfs_released_manifests", [])
+            .unwrap();
         drop(db);
         assert!(projection_snapshot(&store_root).is_empty());
 
@@ -482,9 +478,11 @@ fn crash_after_repo_replace_rebuilds_sql_from_files() {
     assert!(root.join("repos/org/model.json").is_file());
     let db = rusqlite::Connection::open(root.join("tensorfs.sqlite")).unwrap();
     let before: u64 = db
-        .query_row("SELECT count(*) FROM tensorfs_releases", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT count(*) FROM tensorfs_released_manifests",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(before, 0, "crash must not let SQL lead or half-commit");
     drop(db);
@@ -505,9 +503,11 @@ fn crash_after_repo_replace_rebuilds_sql_from_files() {
     assert!(status.success());
     let db = rusqlite::Connection::open(root.join("tensorfs.sqlite")).unwrap();
     let after: u64 = db
-        .query_row("SELECT count(*) FROM tensorfs_releases", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT count(*) FROM tensorfs_released_manifests",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(after, 1);
     assert!(fs::read_to_string(rows).unwrap().contains("release_object"));

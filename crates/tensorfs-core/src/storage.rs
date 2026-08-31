@@ -1215,9 +1215,11 @@ mod tests {
         );
         let connection = rusqlite::Connection::open(root.join("tensorfs.sqlite")).unwrap();
         let releases: u64 = connection
-            .query_row("SELECT count(*) FROM tensorfs_releases", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT count(*) FROM tensorfs_released_manifests",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(releases, 1);
 

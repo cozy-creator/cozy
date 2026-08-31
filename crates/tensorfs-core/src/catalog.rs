@@ -12,6 +12,7 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::storage::Projection;
 
 const ABANDON_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
+const SCHEMA_VERSION: u64 = 2;
 
 fn sql(what: impl AsRef<str>, error: rusqlite::Error) -> Refusal {
     Refusal {
@@ -61,10 +62,10 @@ impl Catalog {
         let version: u64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|error| sql("read catalog version", error))?;
-        if version != 1 {
+        if version != SCHEMA_VERSION {
             return refuse(
                 Code::UNKNOWN_FORMAT,
-                format!("tensorfs.sqlite user_version {version} != 1"),
+                format!("tensorfs.sqlite user_version {version} != {SCHEMA_VERSION}"),
             );
         }
         Ok(catalog)
@@ -84,123 +85,102 @@ impl Catalog {
 
     fn migrate(&self) -> Result<()> {
         let connection = self.connection()?;
-        connection
-            .execute_batch(
+        let version: u64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|error| sql("read catalog version", error))?;
+        match version {
+            0 => connection
+                .execute_batch(
                 "BEGIN IMMEDIATE;
-                 CREATE TABLE IF NOT EXISTS tensorfs_repos (
+                 CREATE TABLE tensorfs_released_manifests (
                    org TEXT NOT NULL,
                    name TEXT NOT NULL,
-                   document_sha256 TEXT NOT NULL,
-                   PRIMARY KEY (org,name)
-                 );
-                 CREATE TABLE IF NOT EXISTS tensorfs_releases (
-                   org TEXT NOT NULL,
-                   name TEXT NOT NULL,
-                   version TEXT NOT NULL,
-                   lane TEXT NOT NULL,
                    manifest_sha256 TEXT NOT NULL,
-                   manifest_length INTEGER NOT NULL,
-                   evidence_json BLOB NOT NULL,
-                   header_sha256 TEXT NOT NULL,
-                   header_length INTEGER NOT NULL,
-                   topology_digest TEXT NOT NULL,
-                   object_count INTEGER NOT NULL,
-                   object_bytes INTEGER NOT NULL,
-                   PRIMARY KEY (org,name,version,lane),
-                   FOREIGN KEY (org,name) REFERENCES tensorfs_repos(org,name) ON DELETE CASCADE
-                 );
-                 CREATE TABLE IF NOT EXISTS tensorfs_release_objects (
-                   org TEXT NOT NULL,
-                   name TEXT NOT NULL,
-                   version TEXT NOT NULL,
-                   lane TEXT NOT NULL,
-                   sha256 TEXT NOT NULL,
-                   length INTEGER NOT NULL,
-                   object_kind TEXT NOT NULL,
-                   PRIMARY KEY (org,name,version,lane,sha256),
-                   FOREIGN KEY (org,name,version,lane)
-                     REFERENCES tensorfs_releases(org,name,version,lane) ON DELETE CASCADE
-                 );
-                 CREATE TABLE IF NOT EXISTS tensorfs_release_encodings (
-                   org TEXT NOT NULL,
-                   name TEXT NOT NULL,
-                   version TEXT NOT NULL,
-                   lane TEXT NOT NULL,
-                   encoding_id TEXT NOT NULL,
-                   alias TEXT NOT NULL,
-                   PRIMARY KEY (org,name,version,lane,encoding_id,alias),
-                   FOREIGN KEY (org,name,version,lane)
-                     REFERENCES tensorfs_releases(org,name,version,lane) ON DELETE CASCADE
-                 );
-                 CREATE TABLE IF NOT EXISTS tensorfs_release_components (
-                   org TEXT NOT NULL,
-                   name TEXT NOT NULL,
-                   version TEXT NOT NULL,
-                   lane TEXT NOT NULL,
-                   component TEXT NOT NULL,
-                   PRIMARY KEY (org,name,version,lane,component),
-                   FOREIGN KEY (org,name,version,lane)
-                     REFERENCES tensorfs_releases(org,name,version,lane) ON DELETE CASCADE
-                 );
-                 CREATE TABLE IF NOT EXISTS tensorfs_release_configs (
-                   org TEXT NOT NULL,
-                   name TEXT NOT NULL,
-                   version TEXT NOT NULL,
-                   lane TEXT NOT NULL,
-                   config TEXT NOT NULL,
-                   sha256 TEXT NOT NULL,
-                   length INTEGER NOT NULL,
-                   media_type TEXT NOT NULL,
-                   PRIMARY KEY (org,name,version,lane,config),
-                   FOREIGN KEY (org,name,version,lane)
-                     REFERENCES tensorfs_releases(org,name,version,lane) ON DELETE CASCADE
-                 );
-                 CREATE TABLE IF NOT EXISTS tensorfs_operations (
+                   PRIMARY KEY (org,name,manifest_sha256)
+                 ) STRICT;
+                 CREATE TABLE tensorfs_operations (
                    id TEXT PRIMARY KEY,
                    org TEXT NOT NULL,
                    name TEXT NOT NULL,
-                   state TEXT NOT NULL CHECK (state IN ('open','abandoned','committed')),
                    writer_marker TEXT NOT NULL,
-                   last_progress_at INTEGER NOT NULL,
-                   accepted_objects INTEGER NOT NULL,
-                   accepted_bytes INTEGER NOT NULL
-                 );
+                   last_progress_at INTEGER NOT NULL
+                 ) STRICT;
                  CREATE TABLE IF NOT EXISTS tensorfs_holds (
                    operation_id TEXT NOT NULL,
                    key TEXT NOT NULL,
                    length INTEGER NOT NULL,
                    PRIMARY KEY (operation_id,key),
                    FOREIGN KEY (operation_id) REFERENCES tensorfs_operations(id) ON DELETE CASCADE
-                 );
-                 CREATE TABLE IF NOT EXISTS tensorfs_read_leases (
-                   id TEXT PRIMARY KEY,
-                   manifest_sha256 TEXT NOT NULL,
-                   kind TEXT NOT NULL,
-                   owner_marker TEXT NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS tensorfs_read_lease_objects (
-                   lease_id TEXT NOT NULL,
-                   sha256 TEXT NOT NULL,
-                   PRIMARY KEY (lease_id,sha256),
-                   FOREIGN KEY (lease_id) REFERENCES tensorfs_read_leases(id) ON DELETE CASCADE
-                 );
-                 CREATE TABLE IF NOT EXISTS tensorfs_derived_transactions (
+                 ) STRICT;
+                 CREATE TABLE tensorfs_derived_transactions (
                    id TEXT PRIMARY KEY,
                    bytes BLOB NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS tensorfs_verified_blobs (
+                 ) STRICT;
+                 CREATE TABLE tensorfs_verified_blobs (
                    sha256 TEXT PRIMARY KEY,
                    length INTEGER NOT NULL,
                    dev TEXT NOT NULL,
                    ino TEXT NOT NULL,
                    mtime_s INTEGER NOT NULL,
                    mtime_ns INTEGER NOT NULL
-                 );
-                 PRAGMA user_version=1;
+                 ) STRICT;
+                 PRAGMA user_version=2;
                  COMMIT;",
             )
-            .map_err(|error| sql("migrate catalog", error))?;
-        Ok(())
+            .map_err(|error| sql("create catalog", error)),
+            1 => connection
+                .execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE tensorfs_released_manifests (
+                   org TEXT NOT NULL,
+                   name TEXT NOT NULL,
+                   manifest_sha256 TEXT NOT NULL,
+                   PRIMARY KEY (org,name,manifest_sha256)
+                 ) STRICT;
+                 INSERT INTO tensorfs_released_manifests(org,name,manifest_sha256)
+                   SELECT DISTINCT org,name,manifest_sha256 FROM tensorfs_releases;
+                 CREATE TABLE tensorfs_operations_v2 (
+                   id TEXT PRIMARY KEY,
+                   org TEXT NOT NULL,
+                   name TEXT NOT NULL,
+                   writer_marker TEXT NOT NULL,
+                   last_progress_at INTEGER NOT NULL
+                 ) STRICT;
+                 INSERT INTO tensorfs_operations_v2(id,org,name,writer_marker,last_progress_at)
+                   SELECT id,org,name,writer_marker,last_progress_at
+                   FROM tensorfs_operations WHERE state='open';
+                 CREATE TABLE tensorfs_holds_v2 (
+                   operation_id TEXT NOT NULL,
+                   key TEXT NOT NULL,
+                   length INTEGER NOT NULL,
+                   PRIMARY KEY (operation_id,key),
+                   FOREIGN KEY (operation_id) REFERENCES tensorfs_operations_v2(id) ON DELETE CASCADE
+                 ) STRICT;
+                 INSERT INTO tensorfs_holds_v2(operation_id,key,length)
+                   SELECT h.operation_id,h.key,h.length FROM tensorfs_holds h
+                   JOIN tensorfs_operations o ON o.id=h.operation_id WHERE o.state='open';
+                 DROP TABLE tensorfs_read_lease_objects;
+                 DROP TABLE tensorfs_read_leases;
+                 DROP TABLE tensorfs_release_encodings;
+                 DROP TABLE tensorfs_release_components;
+                 DROP TABLE tensorfs_release_configs;
+                 DROP TABLE tensorfs_release_objects;
+                 DROP TABLE tensorfs_releases;
+                 DROP TABLE tensorfs_repos;
+                 DROP TABLE tensorfs_holds;
+                 DROP TABLE tensorfs_operations;
+                 ALTER TABLE tensorfs_operations_v2 RENAME TO tensorfs_operations;
+                 ALTER TABLE tensorfs_holds_v2 RENAME TO tensorfs_holds;
+                 PRAGMA user_version=2;
+                 COMMIT;",
+            )
+            .map_err(|error| sql("migrate catalog v1 to v2", error)),
+            SCHEMA_VERSION => Ok(()),
+            _ => refuse(
+                Code::UNKNOWN_FORMAT,
+                format!("tensorfs.sqlite user_version {version} is newer than {SCHEMA_VERSION}"),
+            ),
+        }
     }
 
     pub fn replace_all(&self, projection: &Projection) -> Result<()> {
@@ -209,14 +189,7 @@ impl Catalog {
             .transaction()
             .map_err(|error| sql("begin projection rebuild", error))?;
         transaction
-            .execute_batch(
-                "DELETE FROM tensorfs_release_encodings;
-                 DELETE FROM tensorfs_release_components;
-                 DELETE FROM tensorfs_release_configs;
-                 DELETE FROM tensorfs_release_objects;
-                 DELETE FROM tensorfs_releases;
-                 DELETE FROM tensorfs_repos;",
-            )
+            .execute_batch("DELETE FROM tensorfs_released_manifests;")
             .map_err(|error| sql("clear projection", error))?;
         insert_projection(&transaction, projection)?;
         transaction
@@ -231,7 +204,7 @@ impl Catalog {
             .map_err(|error| sql("begin repository projection", error))?;
         transaction
             .execute(
-                "DELETE FROM tensorfs_repos WHERE org=?1 AND name=?2",
+                "DELETE FROM tensorfs_released_manifests WHERE org=?1 AND name=?2",
                 params![org, name],
             )
             .map_err(|error| sql("delete old repository projection", error))?;
@@ -256,8 +229,7 @@ impl Catalog {
         self.connection()?
             .execute(
                 "INSERT INTO tensorfs_operations
-                 (id,org,name,state,writer_marker,last_progress_at,accepted_objects,accepted_bytes)
-                 VALUES (?1,?2,?3,'open',?4,?5,0,0)",
+                 (id,org,name,writer_marker,last_progress_at) VALUES (?1,?2,?3,?4,?5)",
                 params![id, org, name, guard.path.to_string_lossy(), now],
             )
             .map_err(|error| sql("begin operation", error))?;
@@ -285,11 +257,11 @@ impl Catalog {
         let transaction = connection
             .transaction()
             .map_err(|error| sql("begin operation resume", error))?;
-        let existing: Option<(String, String, String, String)> = transaction
+        let existing: Option<(String, String, String)> = transaction
             .query_row(
-                "SELECT state,writer_marker,org,name FROM tensorfs_operations WHERE id=?1",
+                "SELECT writer_marker,org,name FROM tensorfs_operations WHERE id=?1",
                 [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|error| sql("read operation resume", error))?;
@@ -298,13 +270,12 @@ impl Catalog {
                 transaction
                     .execute(
                         "INSERT INTO tensorfs_operations
-                         (id,org,name,state,writer_marker,last_progress_at,accepted_objects,accepted_bytes)
-                         VALUES (?1,?2,?3,'open',?4,?5,0,0)",
+                         (id,org,name,writer_marker,last_progress_at) VALUES (?1,?2,?3,?4,?5)",
                         params![id, org, name, guard.path.to_string_lossy(), now],
                     )
                     .map_err(|error| sql("recreate operation after rebuild", error))?;
             }
-            Some((state, marker, existing_org, existing_name)) if state == "open" => {
+            Some((marker, existing_org, existing_name)) => {
                 if existing_org != org || existing_name != name {
                     return refuse(
                         Code::TRANSACTION_CONFLICT,
@@ -322,16 +293,10 @@ impl Catalog {
                     .execute(
                         "UPDATE tensorfs_operations
                          SET writer_marker=?2,last_progress_at=?3
-                         WHERE id=?1 AND state='open'",
+                         WHERE id=?1",
                         params![id, guard.path.to_string_lossy(), now],
                     )
                     .map_err(|error| sql("claim resumed operation", error))?;
-            }
-            Some((state, _, _, _)) => {
-                return refuse(
-                    Code::TRANSACTION_CLOSED,
-                    format!("operation is already {state}"),
-                )
             }
         }
         transaction
@@ -355,7 +320,7 @@ impl Catalog {
             let projection = write()?;
             connection
                 .execute(
-                    "DELETE FROM tensorfs_repos WHERE org=?1 AND name=?2",
+                    "DELETE FROM tensorfs_released_manifests WHERE org=?1 AND name=?2",
                     params![org, name],
                 )
                 .map_err(|error| sql("delete old repository projection", error))?;
@@ -419,7 +384,7 @@ impl Catalog {
             .prepare(
                 "SELECT h.key,h.length FROM tensorfs_holds h
                  JOIN tensorfs_operations o ON o.id=h.operation_id
-                 WHERE o.state='open' ORDER BY h.key",
+                 ORDER BY h.key",
             )
             .map_err(|error| sql("prepare hold census", error))?;
         let rows = statement
@@ -460,11 +425,8 @@ impl Catalog {
         let changed = self
             .connection()?
             .execute(
-                "UPDATE tensorfs_operations SET
-                   last_progress_at=?2,
-                   accepted_objects=accepted_objects+?3,
-                   accepted_bytes=accepted_bytes+?4
-                 WHERE id=?1 AND state='open' AND (?3>0 OR ?4>0)",
+                "UPDATE tensorfs_operations SET last_progress_at=?2
+                 WHERE id=?1 AND (?3>0 OR ?4>0)",
                 params![operation, now, objects, bytes],
             )
             .map_err(|error| sql("record operation progress", error))?;
@@ -487,19 +449,13 @@ impl Catalog {
         let transaction = connection
             .transaction()
             .map_err(|error| sql("begin abandon", error))?;
-        let (state, writer_marker, last_progress): (String, String, u64) = transaction
+        let (writer_marker, last_progress): (String, u64) = transaction
             .query_row(
-                "SELECT state,writer_marker,last_progress_at FROM tensorfs_operations WHERE id=?1",
+                "SELECT writer_marker,last_progress_at FROM tensorfs_operations WHERE id=?1",
                 [operation],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|error| sql("read abandon candidate", error))?;
-        if state != "open" {
-            return refuse(
-                Code::TRANSACTION_CLOSED,
-                "only an open operation may be abandoned",
-            );
-        }
         if now.saturating_sub(last_progress) < ABANDON_AFTER_SECS {
             return refuse(
                 Code::ROOT_EXPIRED,
@@ -510,17 +466,8 @@ impl Catalog {
             return refuse(Code::STORE_BUSY, "operation writer is still live");
         }
         transaction
-            .execute(
-                "DELETE FROM tensorfs_holds WHERE operation_id=?1",
-                [operation],
-            )
-            .map_err(|error| sql("release abandoned holds", error))?;
-        transaction
-            .execute(
-                "UPDATE tensorfs_operations SET state='abandoned' WHERE id=?1",
-                [operation],
-            )
-            .map_err(|error| sql("record abandonment", error))?;
+            .execute("DELETE FROM tensorfs_operations WHERE id=?1", [operation])
+            .map_err(|error| sql("delete abandoned operation and holds", error))?;
         transaction
             .commit()
             .map_err(|error| sql("commit abandonment", error))
@@ -532,20 +479,11 @@ impl Catalog {
             .transaction()
             .map_err(|error| sql("begin operation completion", error))?;
         let changed = transaction
-            .execute(
-                "UPDATE tensorfs_operations SET state='committed' WHERE id=?1 AND state='open'",
-                [operation],
-            )
-            .map_err(|error| sql("complete operation", error))?;
+            .execute("DELETE FROM tensorfs_operations WHERE id=?1", [operation])
+            .map_err(|error| sql("delete completed operation and holds", error))?;
         if changed != 1 {
             return refuse(Code::TRANSACTION_CLOSED, "operation is not open");
         }
-        transaction
-            .execute(
-                "DELETE FROM tensorfs_holds WHERE operation_id=?1",
-                [operation],
-            )
-            .map_err(|error| sql("release committed holds", error))?;
         transaction
             .commit()
             .map_err(|error| sql("commit operation completion", error))
@@ -623,99 +561,14 @@ impl Catalog {
 }
 
 fn insert_projection(transaction: &Connection, projection: &Projection) -> Result<()> {
-    for row in &projection.repos {
-        transaction
-            .execute(
-                "INSERT INTO tensorfs_repos(org,name,document_sha256) VALUES (?1,?2,?3)",
-                params![row.org, row.name, row.document_sha256],
-            )
-            .map_err(|error| sql("insert repository row", error))?;
-    }
     for row in &projection.releases {
         transaction
             .execute(
-                "INSERT INTO tensorfs_releases
-                 (org,name,version,lane,manifest_sha256,manifest_length,evidence_json,
-                  header_sha256,header_length,topology_digest,object_count,object_bytes)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                params![
-                    row.org,
-                    row.name,
-                    row.version,
-                    row.lane,
-                    row.manifest_sha256,
-                    row.manifest_length,
-                    row.evidence_json.as_deref().unwrap_or(&[]),
-                    row.header_sha256.as_deref().unwrap_or(""),
-                    row.header_length.unwrap_or(0),
-                    row.topology_digest.as_deref().unwrap_or(""),
-                    row.object_count,
-                    row.object_bytes,
-                ],
+                "INSERT INTO tensorfs_released_manifests(org,name,manifest_sha256)
+                 VALUES (?1,?2,?3) ON CONFLICT DO NOTHING",
+                params![row.org, row.name, row.manifest_sha256],
             )
-            .map_err(|error| sql("insert release row", error))?;
-    }
-    for row in &projection.objects {
-        transaction
-            .execute(
-                "INSERT INTO tensorfs_release_objects
-                 (org,name,version,lane,sha256,length,object_kind)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    row.org,
-                    row.name,
-                    row.version,
-                    row.lane,
-                    row.sha256,
-                    row.length,
-                    row.object_kind,
-                ],
-            )
-            .map_err(|error| sql("insert release object row", error))?;
-    }
-    for row in &projection.encodings {
-        transaction
-            .execute(
-                "INSERT INTO tensorfs_release_encodings
-                 (org,name,version,lane,encoding_id,alias) VALUES (?1,?2,?3,?4,?5,?6)",
-                params![
-                    row.org,
-                    row.name,
-                    row.version,
-                    row.lane,
-                    row.encoding_id,
-                    row.alias.as_deref().unwrap_or(""),
-                ],
-            )
-            .map_err(|error| sql("insert release encoding row", error))?;
-    }
-    for row in &projection.components {
-        transaction
-            .execute(
-                "INSERT INTO tensorfs_release_components
-                 (org,name,version,lane,component) VALUES (?1,?2,?3,?4,?5)",
-                params![row.org, row.name, row.version, row.lane, row.component],
-            )
-            .map_err(|error| sql("insert release component row", error))?;
-    }
-    for row in &projection.configs {
-        transaction
-            .execute(
-                "INSERT INTO tensorfs_release_configs
-                 (org,name,version,lane,config,sha256,length,media_type)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    row.org,
-                    row.name,
-                    row.version,
-                    row.lane,
-                    row.config,
-                    row.sha256,
-                    row.length,
-                    row.media_type,
-                ],
-            )
-            .map_err(|error| sql("insert release config row", error))?;
+            .map_err(|error| sql("insert released manifest", error))?;
     }
     Ok(())
 }
@@ -735,12 +588,21 @@ fn marker_is_live(path: &Path) -> Result<bool> {
 pub struct WriterGuard {
     path: PathBuf,
     _file: File,
+    _recovery: File,
 }
 
 impl WriterGuard {
     pub fn acquire(root: &Path) -> Result<Self> {
         let directory = root.join("tmp/writers");
         fs::create_dir_all(&directory).map_err(|error| io("mkdir writer markers", error))?;
+        let recovery = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(directory.join("recovery.lock"))
+            .map_err(|error| io("open recovery lock", error))?;
+        FileExt::lock_shared(&recovery).map_err(|error| io("share recovery lock", error))?;
         let path = directory.join(format!(
             "{}-{}.writer",
             std::process::id(),
@@ -754,18 +616,34 @@ impl WriterGuard {
             .map_err(|error| io("create writer marker", error))?;
         file.try_lock_exclusive()
             .map_err(|error| io("lock writer marker", error))?;
-        Ok(Self { path, _file: file })
+        Ok(Self {
+            path,
+            _file: file,
+            _recovery: recovery,
+        })
     }
 
-    pub fn refuse_rebuild_if_live(root: &Path) -> Result<()> {
+    pub fn lock_rebuild(root: &Path) -> Result<RebuildGuard> {
         let directory = root.join("tmp/writers");
-        if !directory.is_dir() {
-            return Ok(());
-        }
+        fs::create_dir_all(&directory).map_err(|error| io("mkdir writer markers", error))?;
+        let recovery = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(directory.join("recovery.lock"))
+            .map_err(|error| io("open recovery lock", error))?;
+        recovery.try_lock_exclusive().map_err(|_| Refusal {
+            code: Code::STORE_BUSY,
+            detail: "a live writer blocks rebuild".into(),
+        })?;
         for entry in fs::read_dir(&directory).map_err(|error| io("read writer markers", error))? {
             let path = entry
                 .map_err(|error| io("read writer marker", error))?
                 .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("writer") {
+                continue;
+            }
             let marker = File::options()
                 .read(true)
                 .write(true)
@@ -776,8 +654,14 @@ impl WriterGuard {
             }
             fs::remove_file(path).map_err(|error| io("reap dead writer marker", error))?;
         }
-        Ok(())
+        Ok(RebuildGuard { _file: recovery })
     }
+}
+
+/// Exclusive against every writer from census through catalog replacement.
+#[derive(Debug)]
+pub struct RebuildGuard {
+    _file: File,
 }
 
 impl Drop for WriterGuard {
@@ -799,20 +683,166 @@ mod tests {
     }
 
     #[test]
+    fn catalog_has_five_tables_and_refuses_future_versions_without_mutation() {
+        let root = temporary("schema");
+        fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::initialize(&root).unwrap();
+        let connection = catalog.connection().unwrap();
+        let tables: Vec<String> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            tables,
+            vec![
+                "tensorfs_derived_transactions",
+                "tensorfs_holds",
+                "tensorfs_operations",
+                "tensorfs_released_manifests",
+                "tensorfs_verified_blobs",
+            ]
+        );
+        connection.execute_batch("PRAGMA user_version=3").unwrap();
+        drop(connection);
+        assert_eq!(
+            Catalog::initialize(&root).unwrap_err().code,
+            Code::UNKNOWN_FORMAT
+        );
+        let connection = rusqlite::Connection::open(Catalog::path(&root)).unwrap();
+        let version: u64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn version_one_migrates_only_live_coordination_and_released_manifests() {
+        let root = temporary("v1-migration");
+        fs::create_dir_all(&root).unwrap();
+        let connection = rusqlite::Connection::open(Catalog::path(&root)).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 CREATE TABLE tensorfs_repos(org TEXT,name TEXT,document_sha256 TEXT);
+                 CREATE TABLE tensorfs_releases(org TEXT,name TEXT,manifest_sha256 TEXT);
+                 CREATE TABLE tensorfs_release_objects(value TEXT);
+                 CREATE TABLE tensorfs_release_encodings(value TEXT);
+                 CREATE TABLE tensorfs_release_components(value TEXT);
+                 CREATE TABLE tensorfs_release_configs(value TEXT);
+                 CREATE TABLE tensorfs_operations(
+                   id TEXT PRIMARY KEY,org TEXT,name TEXT,state TEXT,writer_marker TEXT,
+                   last_progress_at INTEGER,accepted_objects INTEGER,accepted_bytes INTEGER);
+                 CREATE TABLE tensorfs_holds(operation_id TEXT,key TEXT,length INTEGER);
+                 CREATE TABLE tensorfs_read_leases(id TEXT);
+                 CREATE TABLE tensorfs_read_lease_objects(lease_id TEXT);
+                 CREATE TABLE tensorfs_derived_transactions(id TEXT PRIMARY KEY,bytes BLOB);
+                 CREATE TABLE tensorfs_verified_blobs(
+                   sha256 TEXT PRIMARY KEY,length INTEGER,dev TEXT,ino TEXT,
+                   mtime_s INTEGER,mtime_ns INTEGER);
+                 INSERT INTO tensorfs_releases VALUES ('org','repo','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+                 INSERT INTO tensorfs_operations VALUES ('open','org','repo','open','dead',7,1,9);
+                 INSERT INTO tensorfs_operations VALUES ('closed','org','repo','committed','dead',8,2,10);
+                 INSERT INTO tensorfs_holds VALUES ('open','blobs/aa',9);
+                 INSERT INTO tensorfs_holds VALUES ('closed','blobs/bb',10);
+                 INSERT INTO tensorfs_derived_transactions VALUES ('derived',x'7b7d');
+                 INSERT INTO tensorfs_verified_blobs VALUES ('bb',1,'1','2',3,4);
+                 PRAGMA user_version=1;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let catalog = Catalog::initialize(&root).unwrap();
+        let connection = catalog.connection().unwrap();
+        let released: u64 = connection
+            .query_row(
+                "SELECT count(*) FROM tensorfs_released_manifests",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let operations: Vec<String> = connection
+            .prepare("SELECT id FROM tensorfs_operations ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let holds: u64 = connection
+            .query_row("SELECT count(*) FROM tensorfs_holds", [], |row| row.get(0))
+            .unwrap();
+        let derived: u64 = connection
+            .query_row(
+                "SELECT count(*) FROM tensorfs_derived_transactions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let verified: u64 = connection
+            .query_row("SELECT count(*) FROM tensorfs_verified_blobs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(released, 1);
+        assert_eq!(operations, vec!["open"]);
+        assert_eq!(holds, 1);
+        assert_eq!(derived, 1);
+        assert_eq!(verified, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rebuild_refuses_live_writer_and_reaps_dead_marker() {
         let root = temporary("writer");
         fs::create_dir_all(&root).unwrap();
         let guard = WriterGuard::acquire(&root).unwrap();
         assert_eq!(
-            WriterGuard::refuse_rebuild_if_live(&root).unwrap_err().code,
+            WriterGuard::lock_rebuild(&root).unwrap_err().code,
             Code::STORE_BUSY
         );
         drop(guard);
         let directory = root.join("tmp/writers");
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("dead.writer"), b"").unwrap();
-        WriterGuard::refuse_rebuild_if_live(&root).unwrap();
-        assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
+        let rebuild = WriterGuard::lock_rebuild(&root).unwrap();
+        assert_eq!(
+            fs::read_dir(directory)
+                .unwrap()
+                .filter(|entry| entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    == Some("writer"))
+                .count(),
+            0
+        );
+        drop(rebuild);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gc_recovery_lock_refuses_live_read_or_derived_hold() {
+        let root = temporary("hold-fence");
+        let store = crate::store::Store::init(&root).unwrap();
+        let meta = crate::meta::Meta::open(&store).unwrap();
+        let hold = meta.acquire_hold("derived-writer").unwrap();
+        assert_eq!(
+            WriterGuard::lock_rebuild(&root).unwrap_err().code,
+            Code::STORE_BUSY
+        );
+        hold.release(&meta).unwrap();
+        WriterGuard::lock_rebuild(&root).unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -860,6 +890,15 @@ mod tests {
             .query_row("SELECT count(*) FROM tensorfs_holds", [], |row| row.get(0))
             .unwrap();
         assert_eq!(holds, 0);
+        let operations: u64 = connection
+            .query_row("SELECT count(*) FROM tensorfs_operations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            operations, 0,
+            "closed operations are not retained as tombstones"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
