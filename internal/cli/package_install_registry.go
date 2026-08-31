@@ -75,8 +75,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		return emitInstallResult(ctx, existingLayout, existing, &install.Result{Gen: *generation, Idempotent: true})
 	}
 	existing.Close()
-	runtimeBin, problem := launch.RefreshLocalBase(existingLayout.Root, existingLayout.LocalBase,
-		ctx.Cfg.Tool())
+	runtimeBin, problem := launch.HostRuntime()
 	if problem != nil {
 		return problem
 	}
@@ -112,7 +111,6 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		var installProblem *exit.Error
 		result, installProblem = install.Run(layout, st, install.Request{
 			Ref: install.Ref{Package: ref.String()}, Force: true, Published: published,
-			Runtime: runtimeBin,
 		})
 		return installProblem
 	})

@@ -31,8 +31,8 @@ func TestReclaimRemovesOnlyRetiredReadOnlyGeneration(t *testing.T) {
 		t.Fatalf("replacement = %q, %v", superseded, activateProblem)
 	}
 
-	retiredPackage := filepath.Join(retired.Dir, "venv", "contents", "overlay", "site-packages", "hidiffusion")
-	activePackage := filepath.Join(active.Dir, "venv", "contents", "overlay", "site-packages", "hidiffusion")
+	retiredPackage := filepath.Join(retired.Dir, "venv", "lib", "python3.12", "site-packages", "hidiffusion")
+	activePackage := filepath.Join(active.Dir, "venv", "lib", "python3.12", "site-packages", "hidiffusion")
 	writeReadOnlyPackage(t, retiredPackage)
 	writeReadOnlyPackage(t, activePackage)
 	t.Cleanup(func() { restoreDirectoryWrites(activePackage) })
@@ -60,7 +60,7 @@ func TestReclaimRemovesOnlyRetiredReadOnlyGeneration(t *testing.T) {
 		t.Fatalf("out-of-tree symlink target changed: %q, %v", got, err)
 	}
 	if mode, err := packageMode(activePackage); err != nil || mode != 0o555 {
-		t.Fatalf("active published overlay mode = %o, %v", mode, err)
+		t.Fatalf("active package environment mode = %o, %v", mode, err)
 	}
 	if generation, readProblem := store.Install(retired.ID); readProblem != nil || generation != nil {
 		t.Fatalf("retired record = %+v, %v", generation, readProblem)

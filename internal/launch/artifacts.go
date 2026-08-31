@@ -52,7 +52,7 @@ const DefaultRuntimeQueryTimeout = 5 * time.Second
 // Every question this host asks the runtime goes through here, so there is one place
 // that knows how to invoke it and one place that renders its refusals.
 type RuntimeCLI struct {
-	Bin          string        // host Runtime for published overlays; generation Runtime for source installs
+	Bin          string        // package Runtime for metadata; the control Runtime is selected separately
 	Dir          string        // the package project root
 	Descriptor   string        // exact published descriptor; empty for editable/source installs
 	Home         string        // COZY_HOME the runtime reads its artifact index out of
@@ -70,9 +70,8 @@ func Binary(generation records.PackageInstall) string {
 	return home.VenvTool(filepath.Join(generation.Dir, "venv"), "cozy-runtime")
 }
 
-// HostRuntime is the trusted local worker implementation. Published package venvs are
-// executor overlays and deliberately omit base-owned cozy-runtime; selecting a package
-// must never select the control process that supervises it.
+// HostRuntime is the package-independent local worker control process. Package code runs
+// through the separately selected venv interpreter.
 func HostRuntime() (string, *exit.Error) {
 	path, err := exec.LookPath("cozy-runtime")
 	if err != nil {

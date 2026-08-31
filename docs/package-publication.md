@@ -35,9 +35,10 @@ requirements are refused. Development dependency groups are ignored.
 Source custody is limited to 20,000 files and 512 MiB total; each source file is limited to 64 MiB
 and `uv.lock` to 16 MiB. The three required files must be non-empty.
 
-Creator prunes the closed platform-owned roots shared by the CPU and CUDA base images, rather than
-uploading Torch, Runtime, TensorFS, or their baked closure. Runtime still compares every requirement
-against the actual selected base and refuses an incompatible or shadowing overlay.
+Creator omits only the remote platform families that a rental may not replace: Python, Torch,
+Runtime, TensorFS, and their platform closure. Ordinary libraries remain package-owned. Runtime
+compares those platform requirements with the base Tensorhub selected before installing the package
+environment.
 Cozy refuses `.env*`, credentials, keys, bytecode, and model-weight files instead of silently
 omitting them. It skips VCS directories, virtual environments, caches, editor state, and build
 output. Modified and ordinary untracked files are published normally.

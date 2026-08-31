@@ -34,7 +34,6 @@ type Request struct {
 	Force     bool
 	Local     *LocalSource
 	Published *PublishedSource
-	Runtime   string // already-refreshed trusted host Runtime for a published local install
 }
 
 // LocalSource is one author-controlled directory after Creator's bounded source
@@ -116,10 +115,11 @@ func validatePublished(gen records.PackageInstall, published *PublishedSource) *
 		return exit.Named(exit.Conflict, "package_config_identity_mismatch",
 			"published package.toml bytes do not match their digest and length")
 	}
-	for name, document := range map[string]ExactDocument{
-		"pyproject.toml": published.Pyproject,
-		"uv.lock":        published.UVLock,
-	} {
+	for _, item := range []struct {
+		name     string
+		document ExactDocument
+	}{{"pyproject.toml", published.Pyproject}, {"uv.lock", published.UVLock}} {
+		name, document := item.name, item.document
 		digest, err := canonical.Raw(document.Digest)
 		if err != nil || document.Length <= 0 || document.Length != int64(len(document.Bytes)) ||
 			!bytes.Equal(canonical.Digest(document.Bytes), digest) {
@@ -257,8 +257,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	var placement ExactDocument
 	var err *exit.Error
 	if req.Published != nil {
-		descriptor, placement, gen.Runtime, env, err = preparePublished(
-			l, genDir, req.Runtime, req.Published)
+		descriptor, placement, gen.Runtime, env, err = preparePublished(l, genDir, req.Published)
 	} else {
 		env, err = MaterializeEnvironment(sourceDir, venvDir)
 	}

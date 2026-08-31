@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -85,8 +86,8 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 }
 
 // Spec adds this host's target-environment materialization to a placement. The trusted
-// host Runtime owns worker control; the generation venv is only the selected executor
-// overlay. A connected worker never calls this method.
+// host Runtime owns worker control; the generation venv supplies the selected executor.
+// A connected worker never calls this method.
 func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	placement, e := f.Placement()
 	if e != nil {
@@ -105,15 +106,19 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 			ArtifactStore: filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
 		}, nil
 	}
+	runtimeBin, e := HostRuntime()
+	if e != nil {
+		return orchestrator.WorkerLaunchSpec{}, e
+	}
 	return orchestrator.WorkerLaunchSpec{
 		Placement: placement,
-		Python:    Binary(f.Install), Args: []string{"serve"},
-		Dir:             f.Source,
-		Devices:         devices,
-		GraceSec:        3,
-		ArtifactCache:   cache,
-		EnvironmentRoot: filepath.Join(f.Install.Dir, "environment"),
-		ArtifactStore:   filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
-		BaseManifest:    filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "local-base.json"),
+		Python:    runtimeBin, Args: []string{"serve"},
+		Dir:               f.Source,
+		Devices:           devices,
+		GraceSec:          3,
+		ArtifactCache:     cache,
+		EnvironmentPython: home.VenvPython(filepath.Join(f.Install.Dir, "venv")),
+		ArtifactStore:     filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
+		BaseManifest:      filepath.Join(f.Install.Dir, "base-manifest.json"),
 	}, nil
 }

@@ -436,7 +436,7 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 	b := filepath.Join(projects, "local-b")
 	c := filepath.Join(projects, "local-c")
 	writePublishProject(t, a, "local-a", "1.0.0",
-		[]string{"local-b>=2,<3", "local-b[images]>=2,<3", "cozy-runtime>=0.0.3", "msgspec>=0.19"},
+		[]string{"local-b>=2,<3", "local-b[images]>=2,<3", "cozy-runtime>=0.0.3", "typing-extensions>=4"},
 		"local-b = { path = \"../local-b\" }\n", true)
 	writePublishProject(t, b, "local-b", "2.1.0", nil,
 		"local-c = { path = \"../local-c\", editable = true }\nabsent-local = { path = \"../absent-local\" }\n", false)
@@ -457,7 +457,7 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 	}
 	if len(pack.DependencyWheels) != 3 || wheels["local-b"] != "2.1.0" ||
 		wheels["local-c"] != "3.0.0" || wheels["cozy-runtime"] != "" || //cozy:allow distribution assertion, not executable access
-		wheels["msgspec"] == "" { //cozy:allow distribution assertion, not executable access
+		wheels["typing-extensions"] == "" { //cozy:allow distribution assertion, not executable access
 		t.Fatalf("package dependency closure omitted an ordinary library: %+v", pack.DependencyWheels)
 	}
 	for _, dependency := range pack.DependencyWheels {

@@ -21,22 +21,20 @@ import (
 // preparePublished materializes the release's complete frozen uv environment, then asks
 // that environment's Runtime to author its resident routing facts. Creator compares the
 // derived descriptor with the committed publication descriptor.
-func preparePublished(l home.Layout, genDir, runtimeBin string, published *PublishedSource) (
+func preparePublished(l home.Layout, genDir string, published *PublishedSource) (
 	*launch.PackageDescriptor, ExactDocument, string, *EnvironmentReceipt, *exit.Error,
 ) {
 	var empty ExactDocument
-	if runtimeBin == "" {
-		return nil, empty, "", nil, exit.Internalf("published install has no trusted host Runtime")
-	}
 	sourceDir := filepath.Join(genDir, "source")
 	if err := os.MkdirAll(sourceDir, 0o700); err != nil {
 		return nil, empty, "", nil, exit.Internalf("cannot create package metadata directory: %s", err)
 	}
-	for name, document := range map[string]ExactDocument{
-		"package.toml":   published.PackageConfig,
-		"pyproject.toml": published.Pyproject,
-		"uv.lock":        published.UVLock,
-	} {
+	for _, item := range []struct {
+		name     string
+		document ExactDocument
+	}{{"package.toml", published.PackageConfig}, {"pyproject.toml", published.Pyproject},
+		{"uv.lock", published.UVLock}} {
+		name, document := item.name, item.document
 		if err := os.WriteFile(filepath.Join(sourceDir, name), document.Bytes, 0o400); err != nil {
 			return nil, empty, "", nil, exit.Internalf("cannot retain exact %s: %s", name, err)
 		}
@@ -60,11 +58,24 @@ func preparePublished(l home.Layout, genDir, runtimeBin string, published *Publi
 	if problem != nil {
 		return nil, empty, "", nil, problem
 	}
-	runtimeBin = home.VenvTool(venvDir, "cozy-runtime")
+	runtimeBin := home.VenvTool(venvDir, "cozy-runtime")
 	if info, err := os.Stat(runtimeBin); err != nil || !info.Mode().IsRegular() {
 		return nil, empty, "", nil, exit.Named(exit.Structural, "runtime_missing",
 			"the published package environment provides no cozy-runtime").
 			WithRemedy("declare cozy-runtime in pyproject.toml and refresh uv.lock")
+	}
+	baseManifest := filepath.Join(genDir, "base-manifest.json")
+	baseCommand := exec.Command(runtimeBin, "--json", "--dir", sourceDir,
+		"local-base", "--out", baseManifest)
+	baseCommand.Env = config.Frozen().Tool("COZY_HOME=" + l.Root)
+	var baseOutput strings.Builder
+	baseCommand.Stdout, baseCommand.Stderr = &baseOutput, &baseOutput
+	baseErr := baseCommand.Run()
+	if baseCommand.ProcessState == nil {
+		return nil, empty, "", nil, exit.Internalf("cannot run %s: %s", runtimeBin, baseErr)
+	}
+	if code := baseCommand.ProcessState.ExitCode(); code != 0 {
+		return nil, empty, "", nil, metadataRefusal(code, "local-base", baseOutput.String())
 	}
 
 	args := []string{"--json", "prepare-package",
@@ -74,8 +85,8 @@ func preparePublished(l home.Layout, genDir, runtimeBin string, published *Publi
 		"--release-digest", published.SourceDigest,
 		"--project-wheel", published.ProjectWheel.Path,
 		"--artifact-cache", cache,
-		"--environment-root", filepath.Join(genDir, "environment"),
-		"--base-manifest", l.LocalBase,
+		"--environment-python", home.VenvPython(venvDir),
+		"--base-manifest", baseManifest,
 	}
 	for _, wheel := range published.Wheels {
 		args = append(args, "--dependency-wheel", wheel.Path)
