@@ -234,8 +234,8 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	activeRentalID = "pr-private-job-replay"
 	mu.Unlock()
 	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job", "size=32", "seed=7",
-		"--rental", "--detach", "--idempotency-key", "private-job-replay", "--json")
-	if code != 0 || !strings.Contains(out, `"changed":true`) {
+		"--rental", "--idempotency-key", "private-job-replay", "--json")
+	if code != 1 || !strings.Contains(out, `pinned media certificate`) {
 		t.Fatalf("private job submission [exit %d]\n%s\ndaemon:\n%s", code, out, daemonOutput.String())
 	}
 	deadline = time.Now().Add(10 * time.Second)
@@ -266,16 +266,25 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	}
 	must(t, os.RemoveAll(project))
 	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job", "size=32", "seed=7",
-		"--rental", "--detach", "--idempotency-key", "private-job-replay", "--json")
+		"--rental", "--idempotency-key", "private-job-replay", "--json")
 	mu.Lock()
 	gotPosts = posts
 	mu.Unlock()
-	if code != 0 || !strings.Contains(out, `"changed":false`) || gotPosts != 1 {
+	if code != 1 || !strings.Contains(out, `pinned media certificate`) || gotPosts != 1 {
 		t.Fatalf("private job replay reread source or rented again [exit %d posts=%d]\n%s",
 			code, gotPosts, out)
 	}
+	store, problem = records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	replayedRequest, problem := store.RequestByIdempotencyKey("private-job-replay")
+	store.Close()
+	fatal(t, problem)
+	if replayedRequest == nil || replayedRequest.ID != request.ID ||
+		replayedRequest.PrivatePackageDigest != request.PrivatePackageDigest {
+		t.Fatalf("private job replay changed durable identity: %+v -> %+v", request, replayedRequest)
+	}
 	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job", "size=64", "seed=7",
-		"--rental", "--detach", "--idempotency-key", "private-job-replay", "--json")
+		"--rental", "--idempotency-key", "private-job-replay", "--json")
 	mu.Lock()
 	gotPosts = posts
 	mu.Unlock()
