@@ -184,7 +184,11 @@ cozy run cancel <run-id>
 An attached run follows progress and returns its terminal result. If its local package is missing,
 Cozy installs the newest compatible release from Tensorhub before starting; the download is visible
 progress, not an interactive prompt. `--detach` returns after durable acceptance. Reusing an explicit
-`--idempotency-key` safely returns the same recorded work.
+`--idempotency-key` safely returns the same recorded work. Before submission, Cozy materializes an
+omitted integer `seed` and hashes the finalized input payload. Files saved under `--out` use that full
+lowercase hash as their filename, so unseeded runs can share one directory without replacing one
+another. The same explicit payload intentionally resolves to the same filename; multi-output results
+append each output field name.
 
 Local Runtime workers start on demand. Successful serving workers may remain resident for warm
 reuse; job workers are reclaimed at terminal.

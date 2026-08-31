@@ -75,7 +75,7 @@ if [ -n "$PACKAGE_ARCHIVE" ] && [ -f "$PACKAGE_ARCHIVE" ]; then
   check "package install verifies the release" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'cozy/weightless' && echo 1 || echo 0)" "$OUT"
 
   run run cozy/weightless/tile size=32 seed=7 --out "$COZY_HOME/out"
-  check "one real package invocation completes" "$([ "$CODE" = 0 ] && [ -s "$COZY_HOME/out/image.png" ] && echo 1 || echo 0)" "$OUT"
+  check "one real package invocation completes" "$([ "$CODE" = 0 ] && find "$COZY_HOME/out" -maxdepth 1 -type f -name '*.png' -size +0c | grep -q . && echo 1 || echo 0)" "$OUT"
 fi
 
 run down

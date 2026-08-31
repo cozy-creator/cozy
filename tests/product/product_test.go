@@ -44,6 +44,21 @@ func TestLiteralPayloadUsesOrdinaryScalarSyntax(t *testing.T) {
 	}
 }
 
+func TestResultAssetSpecCarriesExactOutputMediaType(t *testing.T) {
+	entrypoint := &launch.Entrypoint{Result: launch.Struct{Fields: []launch.Field{{
+		Name: "image", Type: json.RawMessage(`{"asset":"image"}`),
+		AssetBound: struct {
+			MaxBytes   int64    `json:"max_bytes"`
+			MediaTypes []string `json:"media_types"`
+		}{MaxBytes: 64 << 20, MediaTypes: []string{"image/webp"}},
+	}}}}
+	spec, ok := launch.ResultAssetSpec(entrypoint, "image")
+	if !ok || spec.Kind != "image" || spec.MaxBytes != 64<<20 ||
+		len(spec.MediaTypes) != 1 || spec.MediaTypes[0] != "image/webp" {
+		t.Fatalf("result asset spec lost the exact output contract: %#v, %v", spec, ok)
+	}
+}
+
 func TestPackageHasOneActiveVersion(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
 	fatal(t, problem)
@@ -1094,7 +1109,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 
 	outputDir := filepath.Join(root, "human-run-output")
 	code, stdout, stderr := runCozyStreams(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--out", outputDir)
+		"size=32", "--out", outputDir)
 	if code != 0 {
 		t.Fatalf("human invocation failed [exit %d]\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
@@ -1112,6 +1127,42 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 		if strings.Contains(stderr, raw) {
 			t.Errorf("redirected default progress exposed %q\n%s", raw, stderr)
 		}
+	}
+	files, err := os.ReadDir(outputDir)
+	must(t, err)
+	if len(files) != 1 || !requestOutputName(files[0].Name(), ".png") {
+		t.Fatalf("first invocation did not use one request-hash filename: %v", files)
+	}
+	if !strings.Contains(stderr, filepath.Join(outputDir, strings.TrimSuffix(files[0].Name(), ".png")+"*")) {
+		t.Fatalf("invocation did not announce its output hash before execution\n%s", stderr)
+	}
+	firstOutput := files[0].Name()
+	code, _, stderr = runCozyStreams(t, root, "run", weightlessRef+"/tile",
+		"size=32", "--out", outputDir)
+	if code != 0 {
+		t.Fatalf("second human invocation failed [exit %d]\n%s", code, stderr)
+	}
+	files, err = os.ReadDir(outputDir)
+	must(t, err)
+	if len(files) != 2 || files[0].Name() == files[1].Name() ||
+		!requestOutputName(files[0].Name(), ".png") || !requestOutputName(files[1].Name(), ".png") {
+		t.Fatalf("independent invocations did not retain two request-hash outputs: %v", files)
+	}
+	if files[0].Name() != firstOutput && files[1].Name() != firstOutput {
+		t.Fatalf("second invocation replaced the first output %q: %v", firstOutput, files)
+	}
+	fixedDir := filepath.Join(root, "fixed-seed-output")
+	for attempt := 0; attempt < 2; attempt++ {
+		code, _, stderr = runCozyStreams(t, root, "run", weightlessRef+"/tile",
+			"size=32", "seed=7", "--out", fixedDir)
+		if code != 0 {
+			t.Fatalf("fixed-seed invocation %d failed [exit %d]\n%s", attempt+1, code, stderr)
+		}
+	}
+	fixed, err := os.ReadDir(fixedDir)
+	must(t, err)
+	if len(fixed) != 1 || !requestOutputName(fixed[0].Name(), ".png") {
+		t.Fatalf("the same explicit payload did not resolve to one stable filename: %v", fixed)
 	}
 
 	code, _, stderr = runCozyStreams(t, root, "run", weightlessRef+"/tile",
@@ -1196,6 +1247,22 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	if code != 0 || !strings.Contains(out, `"revision":"second"`) {
 		t.Fatalf("restored source did not reuse the last good generation [exit %d]\n%s", code, out)
 	}
+}
+
+func requestOutputName(name, extension string) bool {
+	if !strings.HasSuffix(name, extension) {
+		return false
+	}
+	digest := strings.TrimSuffix(name, extension)
+	if len(digest) != 64 {
+		return false
+	}
+	for _, char := range digest {
+		if !strings.ContainsRune("0123456789abcdef", char) {
+			return false
+		}
+	}
+	return true
 }
 
 func TestModeledDevelopmentInstallRefreshesAndKeepsLastGoodSelection(t *testing.T) {
