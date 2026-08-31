@@ -349,11 +349,15 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 		if s.packages == nil {
 			return out, exit.Unavailablef("this Cozy daemon resolves no packages")
 		}
-		refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
-		if refreshProblem != nil {
-			return out, refreshProblem
-		}
-		if editable {
+		if strings.HasPrefix(sub.Package, "local/") {
+			refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
+			if refreshProblem != nil {
+				return out, refreshProblem
+			}
+			if !editable {
+				return out, exit.Named(exit.Conflict, "private_package_install_invalid",
+					"%s is not one editable local package", sub.Package)
+			}
 			return s.resolvePrivateServing(ctx, sub, out, refreshed)
 		}
 		if sub.InstallID != "" || sub.Release == "" || sub.ReleaseDigest == "" {

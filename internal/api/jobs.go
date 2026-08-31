@@ -280,11 +280,15 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			"a pinned remote worker requires rental authorization")
 	}
 	if out.Rental {
-		refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
-		if refreshProblem != nil {
-			return out, refreshProblem
-		}
-		if editable {
+		if strings.HasPrefix(sub.Package, "local/") {
+			refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
+			if refreshProblem != nil {
+				return out, refreshProblem
+			}
+			if !editable {
+				return out, exit.Named(exit.Conflict, "private_package_install_invalid",
+					"%s is not one editable local package", sub.Package)
+			}
 			return s.resolvePrivateJob(ctx, sub, out, refreshed)
 		}
 		if sub.InstallID != "" || sub.Release == "" || sub.ReleaseDigest == "" || len(sub.Trees) > 0 {
