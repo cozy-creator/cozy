@@ -30,7 +30,13 @@ type Submission struct {
 	PlanID        string // the entrypoint_binding_plan_id this attempt binds
 	Release       string // immutable remote package release; empty for local execution
 	ReleaseDigest string // exact remote release.json identity
-	Models        []ModelRef
+	// PrivatePackageDigest is the exact staged wheel-set identity for one editable rental.
+	// ReleaseDigest remains Runtime's source identity; this names the carriers.
+	PrivatePackageDigest string
+	// AcceptableWheelhouseManifestDigests is Runtime's sorted admission result over the
+	// exact current Hub active manifests. Tensorhub selects one family from this set.
+	AcceptableWheelhouseManifestDigests []string
+	Models                              []ModelRef
 
 	// Payload is the request body, verbatim. It rides the DeliveryGrant as the input
 	// `payload` — a grant input, never a wire field, so refreshing the grant can never
@@ -180,6 +186,26 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		}
 		bodyDigest = spelled
 	}
+	if s.PrivatePackageDigest != "" {
+		if !s.Rental || s.InstallID == "" || !validDigest(s.PrivatePackageDigest) {
+			return records.Request{}, nil, exit.Named(exit.Structural,
+				"private_package_request_invalid",
+				"a private package revision requires one editable rental install")
+		}
+		identity, err := canonical.Write(map[string]canonical.Value{
+			"body_digest":            bodyDigest,
+			"private_package_digest": s.PrivatePackageDigest,
+		})
+		if err != nil {
+			return records.Request{}, nil, exit.Internalf(
+				"cannot encode the private package request identity: %s", err)
+		}
+		bodyDigest, err = canonical.Spell(canonical.Digest(identity))
+		if err != nil {
+			return records.Request{}, nil, exit.Internalf(
+				"cannot digest the private package request identity: %s", err)
+		}
+	}
 	id := records.NewID("req")
 	if s.Kind == "job" {
 		id = records.NewID("job")
@@ -188,6 +214,9 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
 		Package: s.Package, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
 		Release: s.Release, PackageRevisionDigest: s.ReleaseDigest,
+		PrivatePackageDigest: s.PrivatePackageDigest,
+		AcceptableWheelhouseManifestDigests: append([]string(nil),
+			s.AcceptableWheelhouseManifestDigests...),
 		Outputs: strings.Join(s.Outputs, ","),
 		Assets:  s.Assets, ArtifactOutputs: string(artifactBytes),
 		Kind: s.Kind, JobGPUCount: s.JobGPUCount, Org: s.Org, Trees: strings.Join(s.Trees, ","),
@@ -203,6 +232,9 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		event["rental"] = true
 		event["release"] = s.Release
 		event["release_digest"] = s.ReleaseDigest
+		if s.PrivatePackageDigest != "" {
+			event["private_package_digest"] = s.PrivatePackageDigest
+		}
 	}
 	return req, event, nil
 }
@@ -620,10 +652,10 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		return WorkerLaunchSpec{}, "", exit.Named(exit.Internal, "rental.target_incomplete",
 			"rental %s resolved without a complete remote target", req.Worker)
 	}
-	if c.opt.RentalPackageSet == nil || req.Release == "" ||
-		!validDigest(req.PackageRevisionDigest) || (len(req.Models) == 0 && !validDigest(req.PlanID)) {
+	if req.Release == "" || !validDigest(req.PackageRevisionDigest) ||
+		(len(req.Models) == 0 && !validDigest(req.PlanID)) {
 		return WorkerLaunchSpec{}, "", exit.Unavailablef(
-			"remote package preparation requires an exact release and package_set signer")
+			"remote package preparation requires one exact package revision")
 	}
 	logical := LogicalPackage{Package: req.Package, Release: req.Release,
 		ReleaseDigest: req.PackageRevisionDigest, Function: req.Entrypoint,
@@ -633,10 +665,49 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
-	if e := c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
-		Package: logical.Package, Release: logical.Release, ReleaseDigest: logical.ReleaseDigest,
-	}}, downloadModelRefs(logical.Models)); e != nil {
-		return WorkerLaunchSpec{}, "", e
+	if req.InstallID != "" {
+		if c.opt.Packages == nil || !validDigest(req.PrivatePackageDigest) {
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
+				"private_package_request_incomplete",
+				"editable rental request %s names no sealed private package revision", req.ID)
+		}
+		revision, problem := c.opt.Packages.PrivateRevision(req.InstallID, req.PrivatePackageDigest)
+		if problem != nil {
+			return WorkerLaunchSpec{}, "", problem
+		}
+		if revision.Package != req.Package || revision.Release != req.Release ||
+			revision.SourceDigest != req.PackageRevisionDigest || revision.Digest != req.PrivatePackageDigest {
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict,
+				"private_package_revision_changed",
+				"request %s no longer matches its sealed private package revision", req.ID)
+		}
+		if e := c.ConvergePrivatePackage(instance, req.ID, revision,
+			req.PrivatePackageUploadedBootID); e != nil {
+			return WorkerLaunchSpec{}, "", e
+		}
+		logical.ReleaseDigest = req.PrivatePackageDigest
+		if !req.IsJob() && len(logical.Models) > 0 {
+			models := downloadModelRefs(logical.Models)
+			if len(models) != len(logical.Models) {
+				return WorkerLaunchSpec{}, "", exit.Named(exit.Validation,
+					"private_placement_model_unpublished",
+					"private serving requires exact published model releases")
+			}
+			if e := c.ConvergePrivatePlacement(instance, req.ID,
+				req.PrivatePackageDigest, models); e != nil {
+				return WorkerLaunchSpec{}, "", e
+			}
+		}
+	} else {
+		if c.opt.RentalPackageSet == nil || req.PrivatePackageDigest != "" {
+			return WorkerLaunchSpec{}, "", exit.Unavailablef(
+				"published remote package preparation requires a package_set signer")
+		}
+		if e := c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
+			Package: logical.Package, Release: logical.Release, ReleaseDigest: logical.ReleaseDigest,
+		}}, downloadModelRefs(logical.Models)); e != nil {
+			return WorkerLaunchSpec{}, "", e
+		}
 	}
 	if req.IsJob() {
 		if e := c.waitPackageStaged(instance); e != nil {
@@ -648,7 +719,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		}
 		spec := WorkerLaunchSpec{Connection: remote.Connection, Placement: DesiredPlacement{
 			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
-			PackageRevisionDigest: req.PackageRevisionDigest,
+			PackageRevisionDigest: logical.ReleaseDigest,
 			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,
 				Outputs:         strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
 				ArtifactOutputs: artifacts, RSSCap: DefaultJobRSSCap, GPUCount: req.JobGPUCount}},
@@ -662,10 +733,18 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
-	if e := c.opt.Store.BindRemoteInvocation(req.ID, planID,
-		spec.Placement.PackageRevisionDigest, spec.Placement.EnvironmentDigest,
-		spec.Placement.ConfigDigest); e != nil {
-		return WorkerLaunchSpec{}, "", e
+	var bind *exit.Error
+	if req.PrivatePackageDigest != "" {
+		bind = c.opt.Store.BindPrivateRemoteInvocation(req.ID, planID,
+			spec.Placement.PackageRevisionDigest, spec.Placement.EnvironmentDigest,
+			spec.Placement.ConfigDigest)
+	} else {
+		bind = c.opt.Store.BindRemoteInvocation(req.ID, planID,
+			spec.Placement.PackageRevisionDigest, spec.Placement.EnvironmentDigest,
+			spec.Placement.ConfigDigest)
+	}
+	if bind != nil {
+		return WorkerLaunchSpec{}, "", bind
 	}
 	return spec, planID, nil
 }
@@ -714,16 +793,25 @@ func (c *Orchestrator) releaseManaged(req records.Request) {
 		return
 	}
 	go func() {
-		line, problem := c.opt.ReleaseManagedRental(req.Worker)
-		if problem != nil {
+		if problem := c.releaseManagedNow(req); problem != nil {
 			c.logf("managed rental %s release deferred: %s", req.Worker, problem.Message)
-			return
-		}
-		if line != "" {
-			c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
-			c.logf("%s", line)
 		}
 	}()
+}
+
+func (c *Orchestrator) releaseManagedNow(req records.Request) *exit.Error {
+	if !req.Rental || req.Worker == "" || c.opt.ReleaseManagedRental == nil {
+		return nil
+	}
+	line, problem := c.opt.ReleaseManagedRental(req.Worker)
+	if problem != nil {
+		return problem
+	}
+	if line != "" {
+		c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
+		c.logf("%s", line)
+	}
+	return nil
 }
 
 func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
@@ -908,7 +996,11 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 	req records.Request) (packageRevision, environment, config string, e *exit.Error) {
 	packageRevision = w.spec.Placement.PackageRevisionDigest
 	if req.IsJob() && w.spec.Connection != nil {
-		if req.PackageRevisionDigest == "" || req.PackageRevisionDigest != packageRevision {
+		expected := req.PackageRevisionDigest
+		if req.PrivatePackageDigest != "" {
+			expected = req.PrivatePackageDigest
+		}
+		if expected == "" || expected != packageRevision {
 			return "", "", "", exit.Named(exit.Conflict,
 				"request_invocation_identity_changed",
 				"worker %s no longer matches the job release pinned to request %s", w.instanceID, req.ID)
@@ -924,15 +1016,19 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 			"worker %s carries no selected environment digest", w.instanceID)
 	}
 	if w.spec.Connection != nil {
-		if req.PackageRevisionDigest == "" || req.EnvironmentDigest == "" || req.ConfigDigest == "" ||
-			req.PackageRevisionDigest != packageRevision || req.EnvironmentDigest != environment ||
+		expected := req.PackageRevisionDigest
+		if req.PrivatePackageDigest != "" {
+			expected = req.PrivatePackageDigest
+		}
+		if expected == "" || req.EnvironmentDigest == "" || req.ConfigDigest == "" ||
+			expected != packageRevision || req.EnvironmentDigest != environment ||
 			req.ConfigDigest != w.spec.Placement.ConfigDigest {
 			return "", "", "", exit.Named(exit.Conflict,
 				"request_invocation_identity_changed",
 				"worker %s no longer matches the invocation identity pinned to request %s",
 				w.instanceID, req.ID)
 		}
-		return req.PackageRevisionDigest, req.EnvironmentDigest, req.ConfigDigest, nil
+		return packageRevision, req.EnvironmentDigest, req.ConfigDigest, nil
 	}
 	if !validDigest(w.configDigest) {
 		return "", "", "", exit.Named(exit.Structural, "placement_identity_missing",

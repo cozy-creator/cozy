@@ -42,6 +42,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -55,6 +56,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -98,6 +100,8 @@ type Server struct {
 // start may require the target environment through Resolve.
 type Resolver interface {
 	RefreshEditable(pkg string) (installID string, editable, changed bool, problem *exit.Error)
+	PreparePrivate(context.Context, string, string) (privatepackage.Revision, []string, *exit.Error)
+	PrivateRevision(string, string) (privatepackage.Revision, *exit.Error)
 	ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error)
 	ResolveInstall(installID string) (orchestrator.WorkerLaunchSpec, *exit.Error)
 	ResolveRemoteRelease(pkg, release, digest, function string, models []orchestrator.ModelRef) (

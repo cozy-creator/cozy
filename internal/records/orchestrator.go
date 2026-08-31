@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,23 +28,7 @@ import (
 //      single INSERT...SELECT...WHERE NOT EXISTS statement — atomic by construction,
 //      so two concurrent starts cannot both win.
 
-var orchestratorSchema = []string{`
-CREATE TABLE IF NOT EXISTS worker_processes (
-  instance_id     TEXT PRIMARY KEY,
-  package        TEXT    NOT NULL,
-  generation      TEXT    REFERENCES install_generations(id),
-  package_revision_digest      TEXT    NOT NULL,
-  worker_id       TEXT    NOT NULL,
-  devices         TEXT    NOT NULL,
-	pid             INTEGER NOT NULL,
-	birth           TEXT    NOT NULL,
-	session_id      TEXT,
-	state           TEXT    NOT NULL,
-  opened_at       TEXT    NOT NULL,
-  closed_at       TEXT    NOT NULL DEFAULT ''
-)`, `
-CREATE UNIQUE INDEX IF NOT EXISTS worker_session ON worker_processes(session_id)
-  WHERE session_id IS NOT NULL`, `
+const requestsDDL = `
 CREATE TABLE IF NOT EXISTS requests (
   id           TEXT PRIMARY KEY,
   idem_key     TEXT    NOT NULL UNIQUE,
@@ -53,6 +38,8 @@ CREATE TABLE IF NOT EXISTS requests (
   plan_id      TEXT    NOT NULL,
   package_release TEXT NOT NULL DEFAULT '',
   package_revision_digest TEXT NOT NULL DEFAULT '',
+  private_package_digest TEXT NOT NULL DEFAULT '',
+  private_package_uploaded_boot_id TEXT NOT NULL DEFAULT '',
   environment_digest TEXT NOT NULL DEFAULT '',
   config_digest TEXT NOT NULL DEFAULT '',
   payload      BLOB    NOT NULL,
@@ -71,7 +58,57 @@ CREATE TABLE IF NOT EXISTS requests (
   assets       TEXT    NOT NULL DEFAULT '[]',
   models       TEXT    NOT NULL DEFAULT '[]',
   artifact_outputs TEXT NOT NULL DEFAULT '[]'
+, acceptable_base_manifests TEXT NOT NULL DEFAULT '[]')`
+
+const requestsV2DDL = `
+CREATE TABLE IF NOT EXISTS requests (
+  id           TEXT PRIMARY KEY,
+  idem_key     TEXT    NOT NULL UNIQUE,
+  body_digest  TEXT    NOT NULL,
+  package     TEXT    NOT NULL,
+  entrypoint   TEXT    NOT NULL,
+  plan_id      TEXT    NOT NULL,
+  package_release TEXT NOT NULL DEFAULT '',
+  package_revision_digest TEXT NOT NULL DEFAULT '',
+  private_package_digest TEXT NOT NULL DEFAULT '',
+  private_package_uploaded_boot_id TEXT NOT NULL DEFAULT '',
+  environment_digest TEXT NOT NULL DEFAULT '',
+  config_digest TEXT NOT NULL DEFAULT '',
+  payload      BLOB    NOT NULL,
+  outputs      TEXT    NOT NULL DEFAULT '',
+  state        TEXT    NOT NULL,
+  ordinal      INTEGER NOT NULL DEFAULT 0,
+  requeues     INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT    NOT NULL,
+  kind         TEXT    NOT NULL DEFAULT 'serving',
+  job_gpu_count INTEGER NOT NULL DEFAULT 0,
+  org          TEXT    NOT NULL DEFAULT '',
+  trees        TEXT    NOT NULL DEFAULT '',
+  worker       TEXT    NOT NULL DEFAULT '',
+  rental       INTEGER NOT NULL DEFAULT 0,
+  install_id   TEXT    REFERENCES install_generations(id),
+  assets       TEXT    NOT NULL DEFAULT '[]',
+  models       TEXT    NOT NULL DEFAULT '[]',
+  artifact_outputs TEXT NOT NULL DEFAULT '[]'
+)`
+
+var orchestratorSchema = []string{`
+CREATE TABLE IF NOT EXISTS worker_processes (
+  instance_id     TEXT PRIMARY KEY,
+  package        TEXT    NOT NULL,
+  generation      TEXT    REFERENCES install_generations(id),
+  package_revision_digest      TEXT    NOT NULL,
+  worker_id       TEXT    NOT NULL,
+  devices         TEXT    NOT NULL,
+	pid             INTEGER NOT NULL,
+	birth           TEXT    NOT NULL,
+	session_id      TEXT,
+	state           TEXT    NOT NULL,
+  opened_at       TEXT    NOT NULL,
+  closed_at       TEXT    NOT NULL DEFAULT ''
 )`, `
+CREATE UNIQUE INDEX IF NOT EXISTS worker_session ON worker_processes(session_id)
+  WHERE session_id IS NOT NULL`, requestsDDL, `
 -- The PUBLICATION (cl-004). One row per job request, written INSIDE the terminal
 -- transaction: a publication that a terminal did not commit does not exist, which is
 -- what "killing before commit exposes no partial bundle" means as a schema property
@@ -411,9 +448,14 @@ type Request struct {
 	// Placement. They are CAS-bound with PlanID before the first offer so a retry or
 	// reconnect cannot silently change the execution named by this request.
 	PackageRevisionDigest string
-	EnvironmentDigest     string
-	ConfigDigest          string
-	Payload               []byte
+	// PrivatePackageDigest names Creator's sealed carrier set. UploadedBootID binds the
+	// completed transfer to the exact pod generation that acknowledged every file.
+	PrivatePackageDigest                string
+	PrivatePackageUploadedBootID        string
+	AcceptableWheelhouseManifestDigests []string
+	EnvironmentDigest                   string
+	ConfigDigest                        string
+	Payload                             []byte
 	// Outputs names one destination per RESULT FIELD PATH. It lives on the request
 	// because a REQUEUE re-derives the same grant shape without a client saying so again.
 	Outputs   string
@@ -489,15 +531,18 @@ type ModelRef struct {
 }
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
-	package_revision_digest,environment_digest,config_digest,payload,outputs,
+	package_revision_digest,private_package_digest,private_package_uploaded_boot_id,
+	acceptable_base_manifests,
+	environment_digest,config_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,
 	COALESCE(install_id,''),assets,models,artifact_outputs`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
-	var assets, models string
+	var assets, models, acceptableBases string
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
-		&r.Release, &r.PackageRevisionDigest, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
+		&r.Release, &r.PackageRevisionDigest, &r.PrivatePackageDigest,
+		&r.PrivatePackageUploadedBootID, &acceptableBases, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.JobGPUCount, &r.Org, &r.Trees, &r.Worker, &r.Rental,
 		&r.InstallID, &assets, &models, &r.ArtifactOutputs)
@@ -506,6 +551,9 @@ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	}
 	if err == nil && models != "" {
 		err = json.Unmarshal([]byte(models), &r.Models)
+	}
+	if err == nil && acceptableBases != "" {
+		err = json.Unmarshal([]byte(acceptableBases), &r.AcceptableWheelhouseManifestDigests)
 	}
 	return r, err
 }
@@ -560,6 +608,72 @@ func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, c
 			"request %s already binds a different worker-derived invocation identity", id)
 	}
 	return nil
+}
+
+// BindPrivateRemoteInvocation records worker-derived serving identity while retaining the
+// checkout source digest separately in package_revision_digest. private_package_digest is the
+// exact execution identity and must already equal the Runtime-reported revision.
+func (s *Store) BindPrivateRemoteInvocation(id, planID, privateRevision,
+	environment, config string,
+) *exit.Error {
+	if id == "" || planID == "" || privateRevision == "" || environment == "" || config == "" {
+		return exit.Internalf("cannot bind an incomplete private remote invocation identity")
+	}
+	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,environment_digest=?,config_digest=?
+    WHERE id=? AND private_package_digest=? AND (plan_id='' OR plan_id=?) AND
+    environment_digest='' AND config_digest=''`, planID, environment, config, id,
+		privateRevision, planID)
+	if err != nil {
+		return exit.Internalf("cannot bind request %s private invocation: %s", id, err)
+	}
+	if changed, err := result.RowsAffected(); err == nil && changed == 1 {
+		return nil
+	}
+	var heldPlan, heldPrivate, heldEnvironment, heldConfig string
+	if err := s.db.QueryRow(`SELECT plan_id,private_package_digest,environment_digest,config_digest
+    FROM requests WHERE id=?`, id).Scan(&heldPlan, &heldPrivate, &heldEnvironment,
+		&heldConfig); err != nil {
+		return exit.Internalf("cannot read request %s private invocation binding: %s", id, err)
+	}
+	if heldPlan != planID || heldPrivate != privateRevision || heldEnvironment != environment ||
+		heldConfig != config {
+		return exit.Named(exit.Conflict, "request_invocation_identity_changed",
+			"request %s already binds a different private invocation identity", id)
+	}
+	return nil
+}
+
+// MarkPrivatePackageUploaded crosses the durable boundary between verified carrier
+// acknowledgements and DesiredPrivatePackageSet. The caller proves every acknowledgement belongs
+// to this exact boot/session before moving the marker; a replacement boot therefore overwrites an
+// old marker only after it has independently re-received and verified the whole revision.
+func (s *Store) MarkPrivatePackageUploaded(id, digest, bootID string) *exit.Error {
+	if id == "" || digest == "" || bootID == "" {
+		return exit.Internalf("cannot record an incomplete private package upload")
+	}
+	result, err := s.db.Exec(`UPDATE requests SET private_package_uploaded_boot_id=?
+		WHERE id=? AND private_package_digest=?`, bootID, id, digest)
+	if err != nil {
+		return exit.Internalf("cannot record request %s private package upload: %s", id, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return exit.Internalf("cannot read request %s private package upload result: %s", id, err)
+	}
+	if changed == 1 {
+		return nil
+	}
+	var heldDigest string
+	if err := s.db.QueryRow(`SELECT private_package_digest FROM requests WHERE id=?`, id).
+		Scan(&heldDigest); err != nil {
+		return exit.Internalf("cannot read request %s private package upload: %s", id, err)
+	}
+	if heldDigest != digest {
+		return exit.Named(exit.Conflict, "private_package_revision_changed",
+			"request %s already names another private package revision", id)
+	}
+	return exit.Named(exit.Conflict, "private_package_request_changed",
+		"request %s cannot record its verified private package boot", id)
 }
 
 // AssignManagedRental pins one still-queued --rental request to the exact pod
@@ -749,6 +863,55 @@ func (s *Store) AssetInUse(digest string) (bool, *exit.Error) {
 	return false, nil
 }
 
+// PrivatePackageInUse keeps one exact wheel revision while executable work or the current
+// editable declaration can still select it. Terminal request rows retain audit identity but no
+// bytes; an edited pin stops retaining the superseded source revision.
+func (s *Store) PrivatePackageInUse(digest, packageName, release,
+	sourceDigest string,
+) (bool, *exit.Error) {
+	var used int
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests
+		WHERE private_package_digest=?
+		  AND state IN ('submitted','queued','dispatching','requeue_pending'))`, digest).
+		Scan(&used); err != nil {
+		return false, exit.Internalf("cannot read live private package ownership: %s", err)
+	}
+	if used != 0 {
+		return true, nil
+	}
+	if err := s.db.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM pins p JOIN install_generations g ON g.id=p.generation
+		WHERE g.package=? AND g.version=? AND g.source_kind='local' AND g.source_digest=?)`,
+		packageName, release, sourceDigest).Scan(&used); err != nil {
+		return false, exit.Internalf("cannot read current editable private package ownership: %s", err)
+	}
+	return used != 0, nil
+}
+
+// CanceledPrivatePackages are durable transfer tombstones owed to one attached worker. Replaying
+// them on every claimed session is idempotent and finishes cleanup after a daemon/stream crash.
+func (s *Store) CanceledPrivatePackages(workerID string) ([]Request, *exit.Error) {
+	rows, err := s.db.Query(`SELECT `+requestCols+` FROM requests
+		WHERE state='canceled' AND worker=? AND private_package_digest<>''
+		ORDER BY created_at,id`, workerID)
+	if err != nil {
+		return nil, exit.Internalf("cannot read canceled private package transfers: %s", err)
+	}
+	defer rows.Close()
+	var out []Request
+	for rows.Next() {
+		row, err := scanRequest(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot scan canceled private package transfer: %s", err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot finish canceled private package transfers: %s", err)
+	}
+	return out, nil
+}
+
 // SettleRequest records the request's final state. Only a terminal the orchestrator
 // ACCEPTED can settle one.
 func (s *Store) SettleRequest(id, state string) *exit.Error {
@@ -792,7 +955,7 @@ func (s *Store) BeginRequeue(id string, max int64) (count int64, started, cancel
 // same body digest answers the SAME request; the same key with a different body is a
 // conflict, never a second execution wearing one name.
 func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
-	r, assets, models, exportOutputs, problem := prepareRequest(r)
+	r, assets, models, acceptableBases, exportOutputs, problem := prepareRequest(r)
 	if problem != nil {
 		return Request{}, false, problem
 	}
@@ -801,7 +964,7 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 		return Request{}, false, exit.Internalf("cannot begin request submission: %s", err)
 	}
 	defer tx.Rollback()
-	recorded, fresh, problem := submitRequestTx(tx, r, assets, models, exportOutputs)
+	recorded, fresh, problem := submitRequestTx(tx, r, assets, models, acceptableBases, exportOutputs)
 	if problem != nil {
 		return Request{}, false, problem
 	}
@@ -811,7 +974,7 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 	return recorded, fresh, nil
 }
 
-func prepareRequest(r Request) (Request, string, string, string, *exit.Error) {
+func prepareRequest(r Request) (Request, string, string, string, string, *exit.Error) {
 	r.CreatedAt = now()
 	r.State = "submitted"
 	if r.Kind == "" {
@@ -822,7 +985,7 @@ func prepareRequest(r Request) (Request, string, string, string, *exit.Error) {
 		var err error
 		assets, err = json.Marshal(r.Assets)
 		if err != nil {
-			return Request{}, "", "", "", exit.Internalf("cannot record request %s assets: %s", r.ID, err)
+			return Request{}, "", "", "", "", exit.Internalf("cannot record request %s assets: %s", r.ID, err)
 		}
 	}
 	models := []byte("[]")
@@ -830,17 +993,51 @@ func prepareRequest(r Request) (Request, string, string, string, *exit.Error) {
 		var err error
 		models, err = json.Marshal(r.Models)
 		if err != nil {
-			return Request{}, "", "", "", exit.Internalf("cannot record request %s models: %s", r.ID, err)
+			return Request{}, "", "", "", "", exit.Internalf("cannot record request %s models: %s", r.ID, err)
+		}
+	}
+	acceptableBases := []byte("[]")
+	if len(r.AcceptableWheelhouseManifestDigests) > 0 {
+		if len(r.AcceptableWheelhouseManifestDigests) > 32 ||
+			!sort.StringsAreSorted(r.AcceptableWheelhouseManifestDigests) {
+			return Request{}, "", "", "", "", exit.Named(exit.Validation,
+				"rental.acceptable_base_manifests_invalid",
+				"acceptable base manifests must be 1..32 sorted exact digests")
+		}
+		prior := ""
+		for _, digest := range r.AcceptableWheelhouseManifestDigests {
+			if digest == prior || !validRequestDigest(digest) {
+				return Request{}, "", "", "", "", exit.Named(exit.Validation,
+					"rental.acceptable_base_manifests_invalid",
+					"acceptable base manifests must be unique exact digests")
+			}
+			prior = digest
+		}
+		var err error
+		acceptableBases, err = json.Marshal(r.AcceptableWheelhouseManifestDigests)
+		if err != nil {
+			return Request{}, "", "", "", "", exit.Internalf(
+				"cannot record request %s acceptable bases: %s", r.ID, err)
 		}
 	}
 	exportOutputs, problem := prepareOutputExport(r.OutputExport)
 	if problem != nil {
-		return Request{}, "", "", "", problem
+		return Request{}, "", "", "", "", problem
 	}
-	return r, string(assets), string(models), exportOutputs, nil
+	return r, string(assets), string(models), string(acceptableBases), exportOutputs, nil
 }
 
-func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string) (Request, bool, *exit.Error) {
+func validRequestDigest(value string) bool {
+	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value[7:])
+	return err == nil
+}
+
+func submitRequestTx(tx *sql.Tx, r Request, assets, models, acceptableBases,
+	exportOutputs string,
+) (Request, bool, *exit.Error) {
 	existing, err := scanRequest(tx.QueryRow(
 		`SELECT `+requestCols+` FROM requests WHERE idem_key=?`, r.IdemKey))
 	if err == nil {
@@ -856,12 +1053,14 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
-		plan_id,package_release,package_revision_digest,environment_digest,config_digest,
+		plan_id,package_release,package_revision_digest,private_package_digest,
+		private_package_uploaded_boot_id,acceptable_base_manifests,environment_digest,config_digest,
 		payload,outputs,state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,install_id,assets,models,
 		artifact_outputs)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
-		r.Release, r.PackageRevisionDigest, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
+		r.Release, r.PackageRevisionDigest, r.PrivatePackageDigest,
+		r.PrivatePackageUploadedBootID, acceptableBases, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.JobGPUCount, r.Org, r.Trees, r.Worker, r.Rental,
 		nullable(r.InstallID),
 		assets, models, r.ArtifactOutputs); err != nil {

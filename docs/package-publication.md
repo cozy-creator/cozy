@@ -69,8 +69,11 @@ from the current tree. Changing the tree during a partial publication does not r
 bytes; publish a new project version when the intended release contents changed.
 
 Finalize commits valid package custody even when no base image is active. Publication neither
-selects a base nor runs package code. The actual worker verifies requirements against its pinned
-base, installs the immutable wheels offline, imports the package, and derives callable/model bindings.
+selects a base nor runs package code. Before a later rented execution spends money, Creator downloads
+the exact immutable wheel set into disposable scratch and asks the installed Runtime to classify it
+against Tensorhub's active WheelhouseManifests. The paid request carries only the sorted compatible
+manifest digests. The selected worker still verifies the same wheels against its pinned base, installs
+them offline, imports the package, and derives callable/model bindings.
 
 Cozy also supplies Tensorhub's internal audit text from the command and exact
 package release. Publishers do not write an audit reason or release message.

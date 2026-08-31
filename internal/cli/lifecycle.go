@@ -227,6 +227,7 @@ func resolveRentalOperation(ctx *Context, key string) (string, *exit.Error) {
 		ID: seen.ID, SKU: request.SKU, AcceleratorModel: seen.AcceleratorModel,
 		HourlyRateUSDMicros: seen.HourlyRateUSDMicros, ManagedRequestID: operation.ManagedRequestID,
 		State: seen.State, Hub: operation.Hub,
+		WheelhouseManifestDigest: seen.WheelhouseManifestDigest,
 	}); problem != nil {
 		return "", problem
 	}

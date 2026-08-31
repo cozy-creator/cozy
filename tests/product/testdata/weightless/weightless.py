@@ -57,6 +57,12 @@ class TileOutput(msgspec.Struct):
     revision: str
 
 
+class TileJobOutput(msgspec.Struct):
+    size: int
+    seed: int
+    revision: str
+
+
 class RefuseInput(msgspec.Struct, forbid_unknown_fields=True):
     why: str = "cl-013 asked for it"
 
@@ -115,6 +121,12 @@ def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> Tile
         warm=ctx.boot_warmup,
         revision=REVISION,
     )
+
+
+@app.job
+def tile_job(payload: TileInput) -> TileJobOutput:
+    """Weightless remote-job fixture; its value proves frozen private revision replay."""
+    return TileJobOutput(size=payload.size, seed=payload.seed, revision=REVISION)
 
 
 @app.entrypoint

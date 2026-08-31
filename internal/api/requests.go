@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -132,7 +134,11 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		// staging object is opened merely to answer an already-recorded request.
 		spec = replaySubmission(sub, *existing)
 	} else {
-		spec, e = s.resolvePlan(sub)
+		if sub.Rental {
+			unlock := privatepackage.Guard()
+			defer unlock()
+		}
+		spec, e = s.resolvePlan(r.Context(), sub)
 		if e != nil {
 			s.refuseTyped(w, r, e)
 			return
@@ -211,8 +217,10 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Package: sub.Package, Entrypoint: sub.Function, Payload: payload,
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
 		InstallID: sub.InstallID, Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
-		Rental: sub.Rental, Models: models,
-		OutputExport: outputExportInput(sub),
+		PrivatePackageDigest: recorded.PrivatePackageDigest,
+		AcceptableWheelhouseManifestDigests: append([]string(nil),
+			recorded.AcceptableWheelhouseManifestDigests...),
+		Rental: sub.Rental, Models: models, OutputExport: outputExportInput(sub),
 	}
 }
 
@@ -326,7 +334,7 @@ func contractStatus(state string) string {
 // The plan id is resolved through the LOCAL resolver — the same object `start` uses — so
 // a client never names a plan digest and a submission can never bind a binding this host
 // did not install.
-func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Error) {
+func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.Submission, *exit.Error) {
 	out := orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
@@ -340,7 +348,21 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 	// A --rental request validates only immutable package metadata here. The
 	// scheduler chooses and records its worker after admission.
 	if out.Rental {
-		if s.packages == nil || sub.InstallID != "" || sub.Release == "" || sub.ReleaseDigest == "" {
+		if s.packages == nil {
+			return out, exit.Unavailablef("this Cozy daemon resolves no packages")
+		}
+		if strings.HasPrefix(sub.Package, "local/") {
+			refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
+			if refreshProblem != nil {
+				return out, refreshProblem
+			}
+			if !editable {
+				return out, exit.Named(exit.Conflict, "private_package_install_invalid",
+					"%s is not one editable local package", sub.Package)
+			}
+			return s.resolvePrivateServing(ctx, sub, out, refreshed)
+		}
+		if sub.InstallID != "" || sub.Release == "" || sub.ReleaseDigest == "" {
 			return out, exit.Unavailablef("remote execution requires one exact Tensorhub package release")
 		}
 		logical, entrypoint, e := s.packages.ResolveRemoteRelease(
@@ -355,6 +377,8 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 		}
 		out.PlanID = logical.PlanID
 		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
+		out.AcceptableWheelhouseManifestDigests = append([]string(nil),
+			logical.AcceptableWheelhouseManifestDigests...)
 		if len(out.Outputs) == 0 {
 			out.Outputs = logical.Outputs
 		}
@@ -468,6 +492,47 @@ func deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestrator.Submiss
 		})
 	}
 	return nil
+}
+
+func (s *Server) resolvePrivateServing(ctx context.Context, sub Submission,
+	out orchestrator.Submission, installID string,
+) (orchestrator.Submission, *exit.Error) {
+	spec, problem := s.packages.ResolveInstall(installID)
+	if problem != nil {
+		return out, problem
+	}
+	placement := spec.Placement
+	if placement.Package != sub.Package {
+		return out, exit.Named(exit.Conflict, "install_package_mismatch",
+			"install %s serves %s, not %s", installID, placement.Package, sub.Package)
+	}
+	planID, outputs, problem := placementPlan(placement, sub.Function)
+	if problem != nil {
+		return out, problem
+	}
+	entrypoint, problem := s.packages.Entrypoint(installID, sub.Function)
+	if problem != nil {
+		return out, problem
+	}
+	if problem := validateInputs(entrypoint, &out); problem != nil {
+		return out, problem
+	}
+	requiredRuntime := ""
+	if len(out.Models) > 0 {
+		requiredRuntime = launch.PrivateModeledRuntimeFloor
+	}
+	revision, compatibleBases, problem := s.packages.PreparePrivate(ctx, installID, requiredRuntime)
+	if problem != nil {
+		return out, problem
+	}
+	out.InstallID, out.PlanID = installID, planID
+	out.Release, out.ReleaseDigest = revision.Release, revision.SourceDigest
+	out.PrivatePackageDigest = revision.Digest
+	out.AcceptableWheelhouseManifestDigests = compatibleBases
+	if len(out.Outputs) == 0 {
+		out.Outputs = outputs
+	}
+	return out, nil
 }
 
 // validateInputs checks the payload and every local asset against the entrypoint that

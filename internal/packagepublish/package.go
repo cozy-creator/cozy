@@ -67,6 +67,16 @@ func Prepare() (*Package, *exit.Error) {
 // PrepareFrom exists so the product suite can drive publication staging from
 // an isolated project directory without changing the process working directory.
 func PrepareFrom(projectDir string) (*Package, *exit.Error) {
+	return prepareFrom(projectDir, true)
+}
+
+// PrepareLocalFrom applies the same bounded source rules without requiring a publishable
+// organization. Local installs live under Creator's reserved local/ namespace.
+func PrepareLocalFrom(projectDir string) (*Package, *exit.Error) {
+	return prepareFrom(projectDir, false)
+}
+
+func prepareFrom(projectDir string, publication bool) (*Package, *exit.Error) {
 	tree, files, problem := sourceTree(projectDir)
 	if problem != nil {
 		return nil, problem
@@ -75,9 +85,17 @@ func PrepareFrom(projectDir string) (*Package, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
-	metadata, problem := document.publicationMetadata()
+	metadata, problem := document.projectIdentity()
 	if problem != nil {
 		return nil, problem
+	}
+	if publication {
+		metadata, problem = document.publicationMetadata()
+		if problem != nil {
+			return nil, problem
+		}
+	} else {
+		metadata.Organization = "local"
 	}
 	return &Package{
 		Files: files, Tree: tree, Organization: metadata.Organization,
@@ -246,21 +264,31 @@ func readProjectDocument(path string) (projectMetadata, *exit.Error) {
 func (document projectMetadata) publicationMetadata() (struct {
 	Name, Version, Organization string
 }, *exit.Error) {
+	out, problem := document.projectIdentity()
+	if problem != nil {
+		return out, problem
+	}
+	out.Organization = strings.TrimSpace(document.Tool.Cozy.Organization)
+	if out.Organization == "" || out.Organization != document.Tool.Cozy.Organization {
+		return out, exit.Named(exit.Validation, "project_organization_missing",
+			"pyproject.toml must declare [tool.cozy] organization").
+			WithRemedy("add `[tool.cozy]` and `organization = \"your-org\"`")
+	}
+	return out, nil
+}
+
+func (document projectMetadata) projectIdentity() (struct {
+	Name, Version, Organization string
+}, *exit.Error) {
 	var out struct {
 		Name, Version, Organization string
 	}
 	out.Name = strings.TrimSpace(document.Project.Name)
 	out.Version = strings.TrimSpace(document.Project.Version)
-	out.Organization = strings.TrimSpace(document.Tool.Cozy.Organization)
 	if out.Name == "" || out.Name != document.Project.Name || out.Version == "" ||
 		out.Version != document.Project.Version {
 		return out, exit.Named(exit.Validation, "project_identity_missing",
 			"pyproject.toml [project] must declare one untrimmed name and version")
-	}
-	if out.Organization == "" || out.Organization != document.Tool.Cozy.Organization {
-		return out, exit.Named(exit.Validation, "project_organization_missing",
-			"pyproject.toml must declare [tool.cozy] organization").
-			WithRemedy("add `[tool.cozy]` and `organization = \"your-org\"`")
 	}
 	return out, nil
 }

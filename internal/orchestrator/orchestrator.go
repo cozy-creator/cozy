@@ -31,6 +31,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -109,28 +110,31 @@ type Launcher interface {
 	// the choice into the orchestrator, which resolves nothing.
 	ResolveJob(pkg, function string) (WorkerLaunchSpec, *exit.Error)
 	ResolveJobInstall(installID, function string) (WorkerLaunchSpec, *exit.Error)
+	PrivateRevision(installID, digest string) (privatepackage.Revision, *exit.Error)
 }
 
 type LogicalPackage struct {
-	Package       string
-	Release       string
-	ReleaseDigest string
-	Function      string
-	Outputs       []string
-	PlanID        string
-	Models        []ModelRef
+	Package                             string
+	Release                             string
+	ReleaseDigest                       string
+	Function                            string
+	Outputs                             []string
+	PlanID                              string
+	Models                              []ModelRef
+	AcceptableWheelhouseManifestDigests []string
 }
 
 type LogicalJob struct {
-	Package         string
-	Release         string
-	ReleaseDigest   string
-	Function        string
-	DescriptorID    string
-	Outputs         []string
-	ArtifactOutputs []ArtifactOutput
-	GPUCount        int64
-	Models          []ModelRef
+	Package                             string
+	Release                             string
+	ReleaseDigest                       string
+	Function                            string
+	DescriptorID                        string
+	Outputs                             []string
+	ArtifactOutputs                     []ArtifactOutput
+	GPUCount                            int64
+	Models                              []ModelRef
+	AcceptableWheelhouseManifestDigests []string
 }
 
 type ModelRef = records.ModelRef
@@ -188,6 +192,9 @@ type Orchestrator struct {
 	// Source/artifact statuses are committed before signaling; restart/reconnect rereads rows.
 	productionWake    map[string]chan struct{}
 	productionRunning map[string]bool
+	// privateTransfers is command-scoped, lossy progress over Creator's durable request
+	// row and sealed revision. A restart simply replays exact chunks from those authorities.
+	privateTransfers map[string]*privateTransfer
 }
 
 type wait struct {
@@ -222,6 +229,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		frames:            newFanout(),
 		productionWake:    make(map[string]chan struct{}),
 		productionRunning: make(map[string]bool),
+		privateTransfers:  make(map[string]*privateTransfer),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a
 	// SAMPLING resolution, never a verdict: every verdict it acts on is the worker's own
@@ -772,15 +780,27 @@ func (c *Orchestrator) CancelQueued(requestID string) *exit.Error {
 	if !applied {
 		return nil
 	}
+	row, problem := c.opt.Store.RequestRow(requestID)
+	if problem != nil || row == nil {
+		if problem != nil {
+			return problem
+		}
+		return exit.Internalf("canceled request %s cannot be read back", requestID)
+	}
+	abortProblem := c.cancelPrivateTransfer(requestID)
 	c.forget(requestID)
 	c.frames.forget(requestID)
 	c.logf("%s left the dispatch queue: canceled before any attempt", requestID)
 	c.signalClosed(requestWaitKey(requestID),
 		exit.New(exit.Canceled, "%s was canceled before any attempt was dispatched", requestID))
+	c.cleanupRequestAssets(*row)
 	// If this was the FIFO head, the next request inherits the scheduling question now;
 	// it must not wait for an unrelated worker report merely because the old head left.
 	c.reviveQueue()
-	return nil
+	if problem := c.releaseManagedNow(*row); problem != nil {
+		return problem
+	}
+	return abortProblem
 }
 
 func (c *Orchestrator) forget(requestID string) {

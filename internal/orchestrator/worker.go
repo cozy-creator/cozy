@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/media"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/processtree"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
@@ -350,6 +351,12 @@ type worker struct {
 	// locally reconstructed placement.
 	desiredPackages []*pb.DownloadPackageRef
 	desiredModels   []*pb.DownloadModelRef
+	// desiredPrivate is the exact command-scoped private wheel inventory. It survives
+	// control reconnect so a prepared pod can replay its ledgered PlacementSet directly.
+	desiredPrivate *pb.DesiredPrivatePackageSet
+	// desiredPrivatePlacement is the signed model-only join for the already-prepared private
+	// revision. It survives a control reconnect so pod-supervisor can replay its exact journal.
+	desiredPrivatePlacement *pb.DesiredPrivatePlacementSet
 
 	// what the worker itself reported; the orchestrator echoes, never invents
 	exited bool
@@ -1732,6 +1739,12 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	unlock := inputasset.Guard()
 	e = inputasset.Sweep(c.opt.Layout, c.opt.Store)
 	unlock()
+	if e != nil {
+		return 0, 0, e
+	}
+	unlockPrivate := privatepackage.Guard()
+	e = privatepackage.Sweep(c.opt.Layout, c.opt.Store)
+	unlockPrivate()
 	if e != nil {
 		return 0, 0, e
 	}

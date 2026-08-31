@@ -1,12 +1,15 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -26,7 +29,8 @@ import (
 //
 //	GET    /v1/rental-skus           -> [{name, accelerator_model, compute_capability,
 //	                                 vram_gb, price_usd_micros_per_hour}]
-//	POST   /v1/rentals               {sku, media_token_sha256:<64 hex>, creator_public_key}
+//	POST   /v1/rentals               {sku, media_token_sha256:<64 hex>, creator_public_key,
+//	                                     acceptable_wheelhouse_manifest_digests:[...]}
 //	                                 -> 202 {rental_id, state, ...}
 //	GET    /v1/rentals/{id}          -> {state, worker_address, cert_pem, media_address,
 //	                                     detail, worker_id, worker_boot_id,
@@ -69,8 +73,9 @@ type Rental struct {
 	// MediaTokenSHA256 is the pod media plane's LIVE credential set, as hashes. It is here so this host can
 	// see that the hash of the token it minted is one the pod was provisioned with —
 	// a comparison neither end can make by saying the token.
-	MediaTokenSHA256    []string
-	HourlyRateUSDMicros int64
+	MediaTokenSHA256         []string
+	HourlyRateUSDMicros      int64
+	WheelhouseManifestDigest string
 }
 
 // ExactDocument is the package descriptor returned with exact wheel downloads.
@@ -105,21 +110,23 @@ func (r Rental) HoldsMediaHash(hash string) bool {
 
 // wireRental is the answer's own shape.
 type wireRental struct {
-	ID                  string   `json:"rental_id"`
-	State               string   `json:"state"`
-	AcceleratorModel    string   `json:"requested_accelerator_model"`
-	WorkerAddress       string   `json:"worker_address"`
-	CertPEM             string   `json:"cert_pem"`
-	Detail              string   `json:"detail"`
-	MediaAddress        string   `json:"media_address"`
-	WorkerID            string   `json:"worker_id"`
-	WorkerBootID        string   `json:"worker_boot_id"`
-	CreatorPublicKey    string   `json:"creator_public_key"`
-	MediaTokenSHA256    []string `json:"media_token_sha256"`
-	HourlyRateUSDMicros int64    `json:"hourly_rate_usd_micros"`
+	ID                       string   `json:"rental_id"`
+	State                    string   `json:"state"`
+	AcceleratorModel         string   `json:"requested_accelerator_model"`
+	WorkerAddress            string   `json:"worker_address"`
+	CertPEM                  string   `json:"cert_pem"`
+	Detail                   string   `json:"detail"`
+	MediaAddress             string   `json:"media_address"`
+	WorkerID                 string   `json:"worker_id"`
+	WorkerBootID             string   `json:"worker_boot_id"`
+	CreatorPublicKey         string   `json:"creator_public_key"`
+	MediaTokenSHA256         []string `json:"media_token_sha256"`
+	HourlyRateUSDMicros      int64    `json:"hourly_rate_usd_micros"`
+	WheelhouseManifestDigest string   `json:"wheelhouse_manifest_digest"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var sha256IDPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 var computeCapabilityPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+$`)
 
 const maxRentalResponseBytes = 1 << 20
@@ -140,9 +147,10 @@ func (w wireRental) rental() Rental {
 		Address:          w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, MediaAddress: w.MediaAddress,
 		WorkerID: w.WorkerID, WorkerBootID: w.WorkerBootID,
-		CreatorPublicKey:    w.CreatorPublicKey,
-		MediaTokenSHA256:    w.MediaTokenSHA256,
-		HourlyRateUSDMicros: w.HourlyRateUSDMicros,
+		CreatorPublicKey:         w.CreatorPublicKey,
+		MediaTokenSHA256:         w.MediaTokenSHA256,
+		HourlyRateUSDMicros:      w.HourlyRateUSDMicros,
+		WheelhouseManifestDigest: w.WheelhouseManifestDigest,
 	}
 }
 
@@ -150,31 +158,71 @@ func (w wireRental) rental() Rental {
 // datacenter, offer, image, cache volume, disk, and ports do not have fields
 // here: Tensorhub resolves and selects them.
 type RentalRequest struct {
-	SKU              string `json:"sku"`
-	MediaTokenSHA256 string `json:"media_token_sha256"`
-	CreatorPublicKey string `json:"creator_public_key"`
+	AcceptableWheelhouseManifestDigests []string `json:"acceptable_wheelhouse_manifest_digests"`
+	MediaTokenSHA256                    string   `json:"media_token_sha256"`
+	CreatorPublicKey                    string   `json:"creator_public_key"`
+	SKU                                 string   `json:"sku"`
 }
 
 // RentalRequestBytes authors the exact bytes persisted before POST and replayed
 // unchanged after response loss. There is one encoder, not a digest struct plus
 // a separately marshaled transport map that can drift.
-func RentalRequestBytes(sku, mediaTokenSHA256, creatorPublicKey string) ([]byte, *exit.Error) {
+func RentalRequestBytes(sku, mediaTokenSHA256, creatorPublicKey string,
+	acceptableWheelhouseManifestDigests []string,
+) ([]byte, *exit.Error) {
 	req := RentalRequest{
+		AcceptableWheelhouseManifestDigests: append([]string(nil),
+			acceptableWheelhouseManifestDigests...),
 		SKU:              strings.TrimSpace(sku),
 		MediaTokenSHA256: strings.TrimPrefix(strings.TrimSpace(mediaTokenSHA256), "sha256:"),
 		CreatorPublicKey: strings.TrimSpace(creatorPublicKey),
 	}
 	public, publicErr := base64.RawURLEncoding.DecodeString(req.CreatorPublicKey)
-	if req.SKU == "" ||
+	if req.SKU == "" || len(req.AcceptableWheelhouseManifestDigests) == 0 ||
+		len(req.AcceptableWheelhouseManifestDigests) > 32 ||
+		!sort.StringsAreSorted(req.AcceptableWheelhouseManifestDigests) ||
 		!bareSHA256Pattern.MatchString(req.MediaTokenSHA256) || publicErr != nil || len(public) != 32 {
 		return nil, exit.Named(exit.Validation, "rental.intent_incomplete",
-			"sku, media token hash, and one Ed25519 Creator public key are required")
+			"sku, compatible base set, media token hash, and one Ed25519 Creator public key are required")
+	}
+	prior := ""
+	for _, digest := range req.AcceptableWheelhouseManifestDigests {
+		if digest == prior || !sha256IDPattern.MatchString(digest) {
+			return nil, exit.Named(exit.Validation, "rental.acceptable_base_manifests_invalid",
+				"acceptable base manifests must be sorted unique exact digests")
+		}
+		prior = digest
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {
 		return nil, exit.Internalf("cannot encode the closed rental request: %s", err)
 	}
 	return raw, nil
+}
+
+// ParseRentalRequestBytes reopens the exact persisted paid intent. Acquisition replay
+// derives compatibility only from these bytes; mutable caller arguments never replace
+// the package-set decision that was durably recorded before the POST.
+func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
+	var req RentalRequest
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
+			"persisted rental intent is not the closed request document")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
+			"persisted rental intent has trailing data")
+	}
+	canonical, problem := RentalRequestBytes(req.SKU, req.MediaTokenSHA256,
+		req.CreatorPublicKey, req.AcceptableWheelhouseManifestDigests)
+	if problem != nil || !bytes.Equal(canonical, raw) {
+		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
+			"persisted rental intent is not its exact canonical request")
+	}
+	return req, nil
 }
 
 // RentalSKU is one Cozy-priced product choice. Provider offer names and prices
@@ -248,6 +296,10 @@ func (w wireRental) named(what string) *exit.Error {
 		return exit.Named(exit.Conflict, "hub.rental_hourly_rate_missing",
 			"the hub %s without a positive locked Cozy retail hourly rate", what).
 			WithRemedy("upgrade Tensorhub before accepting a rental")
+	}
+	if !sha256IDPattern.MatchString(w.WheelhouseManifestDigest) {
+		return exit.Named(exit.Conflict, "hub.rental_wheelhouse_manifest_missing",
+			"the hub %s without one exact selected WheelhouseManifest digest", what)
 	}
 	return validateRentalID(w.ID)
 }

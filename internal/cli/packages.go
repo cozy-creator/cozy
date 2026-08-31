@@ -11,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -39,7 +40,13 @@ func open(cfg config.Config, write bool) (home.Layout, *records.Store, *install.
 
 func handleInstall(ctx *Context) *exit.Error {
 	if explicitPackageDirectory(ctx.Inv.Args[0]) {
+		if !ctx.Inv.Bool("--editable") {
+			return exit.Usagef("an explicit package directory requires --editable")
+		}
 		return handleDirectoryInstall(ctx)
+	}
+	if ctx.Inv.Bool("--editable") {
+		return exit.Usagef("--editable requires an explicit package directory")
 	}
 	return handleRegistryInstall(ctx)
 }
@@ -57,7 +64,7 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 		return exit.Usagef("an explicit package directory does not take registry or legacy source options").
 			WithRemedy("use `cozy package install %s` by itself", path)
 	}
-	pack, problem := packagepublish.PrepareFrom(path)
+	pack, problem := packagepublish.PrepareLocalFrom(path)
 	if problem != nil {
 		return problem
 	}
@@ -66,7 +73,7 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	ref, problem := install.ParseRef(pack.Organization + "/" + pack.Name)
+	ref, problem := install.ParseRef("local/" + pack.Name)
 	if problem != nil {
 		return problem
 	}
@@ -247,6 +254,12 @@ func handleRm(ctx *Context) *exit.Error {
 			return problem
 		}
 		freed += n
+	}
+	unlockPrivate := privatepackage.Guard()
+	privateProblem := privatepackage.Sweep(l, st)
+	unlockPrivate()
+	if privateProblem != nil {
+		return privateProblem
 	}
 	if len(removed.Rows) == 0 {
 		removed.Aggregates = []output.Field{{K: "changed", V: false}}

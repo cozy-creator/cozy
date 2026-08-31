@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -120,7 +121,7 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 
 	row, attachable, replay, e := acquireRental(ctx, l, st, skuName, requestedMachineName,
-		operationKey, reason, hourlyRate, ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "")
+		operationKey, reason, hourlyRate, ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "", nil)
 	if e != nil {
 		return e
 	}
@@ -171,15 +172,17 @@ func handleRent(ctx *Context) *exit.Error {
 // worker's authenticated attach projection are durable locally.
 func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName, requestedMachineName,
 	operationKey, reason string, hourlyRateUSDMicros, fleetCapUSDMicros int64,
-	deadline time.Time, managedRequestID string,
+	deadline time.Time, managedRequestID string, acceptableWheelhouseManifestDigests []string,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
 	return acquireRentalContext(context.Background(), ctx, l, st, skuName, requestedMachineName,
-		operationKey, reason, hourlyRateUSDMicros, fleetCapUSDMicros, deadline, managedRequestID)
+		operationKey, reason, hourlyRateUSDMicros, fleetCapUSDMicros, deadline, managedRequestID,
+		acceptableWheelhouseManifestDigests)
 }
 
 func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout,
 	st *records.Store, skuName, requestedMachineName, operationKey, reason string,
 	hourlyRateUSDMicros, fleetCapUSDMicros int64, deadline time.Time, managedRequestID string,
+	acceptableWheelhouseManifestDigests []string,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
 	c := client(ctx)
 	existing, e := st.RentalOperation(operationKey)
@@ -213,9 +216,33 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
-	requestBody, e := hub.RentalRequestBytes(skuName, secret.HashHex(token), creator.PublicKey())
-	if e != nil {
-		return records.Rental{}, hub.Rental{}, false, e
+	var requestBody []byte
+	if existing != nil {
+		requestBody = append([]byte(nil), existing.RequestBody...)
+	} else {
+		if len(acceptableWheelhouseManifestDigests) == 0 {
+			if managedRequestID != "" {
+				return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict,
+					"rental.acceptable_base_manifests_missing",
+					"managed request %s has no pre-spend compatible base set", managedRequestID)
+			}
+			hctx, cancel := hub.Context()
+			active, problem := c.ActiveBaseManifests(hctx)
+			cancel()
+			if problem != nil {
+				return records.Rental{}, hub.Rental{}, false, problem
+			}
+			for _, base := range active {
+				acceptableWheelhouseManifestDigests = append(
+					acceptableWheelhouseManifestDigests, base.WheelhouseManifestDigest)
+			}
+			sort.Strings(acceptableWheelhouseManifestDigests)
+		}
+		requestBody, e = hub.RentalRequestBytes(skuName, secret.HashHex(token),
+			creator.PublicKey(), acceptableWheelhouseManifestDigests)
+		if e != nil {
+			return records.Rental{}, hub.Rental{}, false, e
+		}
 	}
 	digest := rentalRequestDigest(c.Base(), requestBody)
 	op, replay, e := st.BeginRentalOperation(records.RentalOperation{
@@ -232,6 +259,10 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.idempotency_conflict",
 			"rental operation %s already names a different hub or request body", operationKey).
 			WithRemedy("reuse a key only for the exact same hub, GPU SKU, media token, and Creator key")
+	}
+	intent, e := hub.ParseRentalRequestBytes(op.RequestBody)
+	if e != nil {
+		return records.Rental{}, hub.Rental{}, false, e
 	}
 	if !replay {
 		fmt.Fprintf(ctx.Err, "  rental operation %s persisted; reuse this key to resume\n", operationKey)
@@ -269,6 +300,18 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 			remote.ID, remote.HourlyRateUSDMicros, hourlyRateUSDMicros).
 			WithRemedy("Creator requested immediate release and retained the operation until Tensorhub proves absence")
 	}
+	if !containsString(intent.AcceptableWheelhouseManifestDigests,
+		remote.WheelhouseManifestDigest) {
+		_ = st.AdvanceRentalOperation(operationKey, remote.ID, hub.RentalReleaseRequested)
+		hctx, cancel := hub.Context()
+		_ = c.Release(hctx, remote.ID, "selected WheelhouseManifest was not accepted")
+		cancel()
+		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict,
+			"rental.wheelhouse_manifest_unacceptable",
+			"rental %s selected WheelhouseManifest %s outside the persisted compatible set",
+			remote.ID, remote.WheelhouseManifestDigest).
+			WithRemedy("Creator requested immediate release and retained the operation until Tensorhub proves absence")
+	}
 	machineName := requestedMachineName
 	if machineName == "" {
 		machineName = rentalid.MachineName(remote.ID)
@@ -277,6 +320,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		ID: remote.ID, MachineName: machineName, SKU: skuName,
 		AcceleratorModel: remote.AcceleratorModel, HourlyRateUSDMicros: remote.HourlyRateUSDMicros,
 		ManagedRequestID: managedRequestID, State: remote.State, Hub: c.Base(),
+		WheelhouseManifestDigest: remote.WheelhouseManifestDigest,
 	}
 	stored, problem := st.RentalRow(remote.ID)
 	if problem != nil {
@@ -309,6 +353,11 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 				"rental %s changed its Cozy retail hourly rate from %d to %d USD micros",
 				seen.ID, row.HourlyRateUSDMicros, seen.HourlyRateUSDMicros)
 		}
+		if seen.WheelhouseManifestDigest != row.WheelhouseManifestDigest {
+			return exit.Named(exit.Conflict, "rental.wheelhouse_manifest_changed",
+				"rental %s changed selected WheelhouseManifest from %s to %s", seen.ID,
+				row.WheelhouseManifestDigest, seen.WheelhouseManifestDigest)
+		}
 		row.Address, row.State = seen.Address, seen.State
 		row.MediaAddress = seen.MediaAddress
 		row.ExpectedWorkerID, row.ExpectedWorkerBootID = seen.WorkerID, seen.WorkerBootID
@@ -325,6 +374,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	row.Address, row.State = attachable.Address, attachable.State
 	row.MediaAddress = attachable.MediaAddress
 	row.ExpectedWorkerID, row.ExpectedWorkerBootID = attachable.WorkerID, attachable.WorkerBootID
+	row.WheelhouseManifestDigest = attachable.WheelhouseManifestDigest
 	if !attachable.HoldsMediaHash(secret.HashHex(token)) {
 		return records.Rental{}, hub.Rental{}, false, exit.New(exit.Failed,
 			"rental %s is attachable and its live credential set does not carry the token this host minted", attachable.ID).

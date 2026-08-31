@@ -19,6 +19,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -106,16 +107,33 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 		wrongPackage, expires); problem == nil {
 		t.Fatal("delegation admitted a model for an undelegated package")
 	}
-	empty, emptySignature, problem := rental.SignDownloadDelegation(layout, connection,
-		nil, nil, time.Now().Add(30*time.Minute))
+	privateModels := []*pb.DownloadModelRef{{Package: "local/marco-polo",
+		Slot: "marco.models.model", Model: "cozy/tiny", Release: "1.0.0",
+		Manifest: models[0].Manifest}}
+	privateDelegation, privateSignature, problem := rental.SignDownloadDelegation(
+		layout, connection, nil, privateModels, expires)
 	fatal(t, problem)
-	if !bytes.Contains(empty, []byte(`"models":[]`)) || !bytes.Contains(empty, []byte(`"packages":[]`)) ||
-		!ed25519.Verify(public, empty, emptySignature) {
-		t.Fatalf("empty package_set authority is not explicit and signed: %s", empty)
+	privateDoc, err := canonical.Read(privateDelegation, &pb.DownloadDelegation{})
+	must(t, err)
+	if len(privateDoc.List("packages")) != 0 || len(privateDoc.List("models")) != 1 ||
+		!ed25519.Verify(public, privateDelegation, privateSignature) {
+		t.Fatalf("model-only private delegation is not exact and signed: %s", privateDelegation)
+	}
+	mixedPrivateModels := append([]*pb.DownloadModelRef{}, privateModels...)
+	mixedPrivateModels = append(mixedPrivateModels, &pb.DownloadModelRef{Package: "local/other",
+		Slot: "other.models.model", Model: "cozy/tiny", Release: "1.0.0",
+		Manifest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"})
+	if _, _, problem := rental.SignDownloadDelegation(layout, connection, nil,
+		mixedPrivateModels, expires); problem == nil {
+		t.Fatal("model-only delegation admitted two private package identities")
+	}
+	if _, _, problem := rental.SignDownloadDelegation(layout, connection,
+		nil, nil, time.Now().Add(30*time.Minute)); problem == nil {
+		t.Fatal("empty package/model delegation was admitted")
 	}
 
 	request, problem := hub.RentalRequestBytes("cpu", strings.Repeat("1", 64),
-		identity.PublicKey())
+		identity.PublicKey(), []string{"sha256:" + strings.Repeat("2", 64)})
 	fatal(t, problem)
 	var body map[string]any
 	must(t, json.Unmarshal(request, &body))
@@ -123,6 +141,30 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 		body["media_token_sha256"] != strings.Repeat("1", 64) || body["package_ref"] != nil ||
 		body["model_selections"] != nil || body["renter_token_sha256"] != nil {
 		t.Fatalf("rental create authority is not the hardcut shape: %s", request)
+	}
+	parsed, problem := hub.ParseRentalRequestBytes(request)
+	fatal(t, problem)
+	if parsed.SKU != "cpu" || len(parsed.AcceptableWheelhouseManifestDigests) != 1 ||
+		parsed.AcceptableWheelhouseManifestDigests[0] != "sha256:"+strings.Repeat("2", 64) {
+		t.Fatalf("persisted rental intent did not reopen exactly: %+v", parsed)
+	}
+	if _, problem := hub.ParseRentalRequestBytes(append(request, '\n')); problem == nil ||
+		problem.ErrName() != "rental.intent_invalid" {
+		t.Fatalf("noncanonical persisted rental intent reopened: %v", problem)
+	}
+}
+
+func TestPrivateModeControlRuntimeFloor(t *testing.T) {
+	manifest := func(version string) []byte {
+		return []byte(`{"base_distributions":[{"distribution":"cozy-runtime","version":"` + //cozy:allow base distribution capability fact, not executable access
+			version + `"}]}`)
+	}
+	if launch.PrivateModeledRuntimeFloor != "0.0.20" ||
+		launch.BaseRuntimeAtLeast(manifest("0.0.19"), launch.PrivateModeledRuntimeFloor) ||
+		!launch.BaseRuntimeAtLeast(manifest("0.0.20"), launch.PrivateModeledRuntimeFloor) ||
+		!launch.BaseRuntimeAtLeast(manifest("0.1.0"), launch.PrivateModeledRuntimeFloor) ||
+		launch.BaseRuntimeAtLeast(manifest("0.0.20-rc1"), launch.PrivateModeledRuntimeFloor) {
+		t.Fatal("private modeled Runtime capability floor admitted/refused the wrong active base")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -29,7 +30,7 @@ func SignDownloadDelegation(l home.Layout, connection *orchestrator.WorkerConnec
 		return nil, nil, exit.Named(exit.Validation, "rental.delegation_expiry_invalid",
 			"download delegation expiry must be in the next hour")
 	}
-	if len(packages) > 32 || len(models) > 32 {
+	if len(packages) > 32 || len(models) > 32 || len(packages)+len(models) == 0 {
 		return nil, nil, exit.Named(exit.Validation, "rental.delegation_too_large",
 			"download delegation admits at most 32 packages and 32 models")
 	}
@@ -59,12 +60,22 @@ func SignDownloadDelegation(l home.Layout, connection *orchestrator.WorkerConnec
 		prior = key
 	}
 	prior = ""
+	modelOnlyPackage := ""
 	for _, row := range models {
 		key := modelKey(row)
 		_, digestErr := canonical.Raw(row.GetManifest())
+		packageSelected := delegatedPackages[row.GetPackage()]
+		if len(packages) == 0 && row != nil {
+			if _, problem := hub.ParseRef(row.Package); problem == nil {
+				if modelOnlyPackage == "" {
+					modelOnlyPackage = row.Package
+				}
+				packageSelected = row.Package == modelOnlyPackage
+			}
+		}
 		if row == nil || strings.TrimSpace(row.Model) != row.Model || row.Model == "" ||
 			strings.TrimSpace(row.Release) != row.Release || row.Release == "" ||
-			strings.TrimSpace(row.Package) != row.Package || !delegatedPackages[row.Package] ||
+			strings.TrimSpace(row.Package) != row.Package || !packageSelected ||
 			strings.TrimSpace(row.Slot) != row.Slot || row.Slot == "" ||
 			digestErr != nil || key <= prior {
 			return nil, nil, exit.Named(exit.Validation, "rental.delegation_model_invalid",

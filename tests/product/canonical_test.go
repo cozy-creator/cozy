@@ -33,6 +33,7 @@ func TestCanonicalFormatsAreVersionOne(t *testing.T) {
 		&pb.ClaimProof{},
 		&pb.DownloadDelegation{},
 		&pb.PlacementSet{},
+		&pb.PrivatePackageRevision{},
 		&pb.WorkerSnapshotBody{},
 	} {
 		name := string(msg.ProtoReflect().Descriptor().FullName())
@@ -154,6 +155,8 @@ func messageFor(name string) proto.Message {
 		return &pb.DownloadDelegation{}
 	case "cozy.worker.v1.PlacementSet":
 		return &pb.PlacementSet{}
+	case "cozy.worker.v1.PrivatePackageRevision":
+		return &pb.PrivatePackageRevision{}
 	case "cozy.worker.v1.WorkerSnapshotBody":
 		return &pb.WorkerSnapshotBody{}
 	}

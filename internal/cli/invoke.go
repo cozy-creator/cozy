@@ -1263,6 +1263,16 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 	if problem != nil {
 		return Target{}, nil, problem
 	}
+	if ctx.Inv.Bool("--rental") && strings.HasPrefix(target.Package, "local/") {
+		facts, problem := generationFacts(ctx, target.Package)
+		if problem != nil {
+			return Target{}, nil, problem
+		}
+		target.InstallID = facts.Install.ID
+		target.Release = facts.Install.Version
+		target.ReleaseDigest = facts.Install.SourceDigest
+		return target, facts.PackageDescriptor, nil
+	}
 	if ctx.Inv.Bool("--rental") {
 		ref, problem := hub.ParseRef(target.Package)
 		if problem != nil {

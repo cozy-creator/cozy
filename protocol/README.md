@@ -2,7 +2,7 @@
 
 This directory contains the Go files Cozy needs from
 `cozy-creator/worker-protocol-v2` commit
-`e7fabb8240654faadb56f3876f7e2618fd825b70`.
+`cf377265f984eebd55345aa22085db8e849e2521`.
 
 The four files under `cozy/worker/v1/` are byte-identical to that commit's
 `gen/go/cozy/worker/v1/` output. They were generated with official protoc 35.1,

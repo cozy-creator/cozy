@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -31,6 +32,9 @@ func (l fixedLauncher) Resolve(string) (orchestrator.WorkerLaunchSpec, *exit.Err
 }
 func (l fixedLauncher) ResolveInstall(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	return l.spec, nil
+}
+func (l fixedLauncher) PrivateRevision(string, string) (privatepackage.Revision, *exit.Error) {
+	return privatepackage.Revision{}, exit.Unavailablef("fixed local launcher has no private package")
 }
 func (l fixedLauncher) ResolveLogicalInstall(string, string) (orchestrator.LogicalPackage, *exit.Error) {
 	return orchestrator.LogicalPackage{}, exit.Unavailablef("fixed local launcher has no remote package")
@@ -59,6 +63,9 @@ func (l packageLauncher) Resolve(pkg string) (orchestrator.WorkerLaunchSpec, *ex
 }
 func (l packageLauncher) ResolveInstall(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	return orchestrator.WorkerLaunchSpec{}, exit.New(exit.NotFound, "no fake install")
+}
+func (l packageLauncher) PrivateRevision(string, string) (privatepackage.Revision, *exit.Error) {
+	return privatepackage.Revision{}, exit.New(exit.NotFound, "no fake private package")
 }
 func (l packageLauncher) ResolveLogicalInstall(string, string) (orchestrator.LogicalPackage, *exit.Error) {
 	return orchestrator.LogicalPackage{}, exit.New(exit.NotFound, "no fake logical install")

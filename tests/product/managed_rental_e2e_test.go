@@ -2,6 +2,9 @@ package producttest
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,7 +20,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
 func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) {
@@ -26,10 +31,16 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	var mu sync.Mutex
 	var descriptor []byte
 	var descriptorDigest string
+	var activeManifestDigest string
+	var packageConfig, publishedWheel []byte
+	var publishedWheelFact wheel.Identity
+	var publishedWheelDigest string
+	var origin string
 	var rentalRequest map[string]any
 	var createReason, deleteReason string
 	activeRentalID := "pr-managed-e2e"
-	posts, deletes := 0, 0
+	posts, deletes, packageDownloads := 0, 0, 0
+	root := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -57,15 +68,50 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 					"created_at": "2026-08-30T00:00:00Z"},
 				"releases": []map[string]any{{"release": "1.0.0", "cut_at": "2026-08-30T00:00:00Z"}},
 			})
-		case strings.HasSuffix(r.URL.Path, "/download"):
-			t.Error("remote metadata resolution called the package download route")
-			http.Error(w, "download route must be worker-only in this flow", http.StatusInternalServerError)
+		case r.Method == http.MethodPost && r.URL.Path ==
+			"/v1/packages/cozy/cozy-weightless-package/download":
+			packageDownloads++
+			configSum := sha256.Sum256(packageConfig)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"downloads": []map[string]any{{
+					"digest": publishedWheelDigest, "distribution": publishedWheelFact.Distribution,
+					"import_roots": []string{"weightless"}, "kind": "project_wheel",
+					"length": publishedWheelFact.Length, "path": publishedWheelFact.Filename,
+					"tags": []string{"py3-none-any"}, "url": origin + "/files/published-wheel",
+					"version": publishedWheelFact.Version,
+				}},
+				"package_config": map[string]any{"canonical_bytes": packageConfig,
+					"digest": "sha256:" + hex.EncodeToString(configSum[:]), "length": len(packageConfig)},
+				"package_descriptor": map[string]any{"canonical_bytes": descriptor,
+					"digest": descriptorDigest, "length": len(descriptor)},
+				"release": "1.0.0", "release_digest": releaseDigest,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/files/published-wheel":
+			_, _ = w.Write(publishedWheel)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rental-skus":
 			_ = json.NewEncoder(w).Encode([]map[string]any{
 				{"name": "cpu", "accelerator_model": "CPU", "price_usd_micros_per_hour": 70_000},
 				{"name": "h200", "accelerator_model": "H200", "compute_capability": "9.0", "vram_gb": 141, "minimum_ram_per_gpu_gb": 128, "price_usd_micros_per_hour": 6_000_000},
 				{"name": "cheap", "accelerator_model": "GPU C", "compute_capability": "8.9", "vram_gb": 24, "minimum_ram_per_gpu_gb": 32, "price_usd_micros_per_hour": 300_000},
 			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/base-worker-manifests":
+			raw, err := os.ReadFile(filepath.Join(root, "active-base.json"))
+			if err != nil {
+				t.Error(err)
+				http.Error(w, "local base absent", http.StatusInternalServerError)
+				return
+			}
+			sum := sha256.Sum256(raw)
+			digest := "sha256:" + hex.EncodeToString(sum[:])
+			activeManifestDigest = digest
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"wheelhouse_manifest_digest": digest,
+				"wheelhouse_manifest":        json.RawMessage(raw),
+				"base_worker_image_digest":   digest,
+				"compatibility_profile":      map[string]any{},
+				"platform_target":            map[string]any{},
+				"activated_at":               "2026-08-31T00:00:00Z",
+			}})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/rentals":
 			posts++
 			createReason = r.Header.Get("X-Tensorhub-Reason")
@@ -80,6 +126,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"rental_id": activeRentalID, "state": "pending_acquisition",
 				"requested_accelerator_model": accelerator, "hourly_rate_usd_micros": rate,
+				"wheelhouse_manifest_digest": activeManifestDigest,
 			})
 		case r.Method == http.MethodDelete && r.URL.Path == "/v1/rentals/"+activeRentalID:
 			deletes++
@@ -89,6 +136,13 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"rental_id": "pr-idle-h200", "state": "ready",
 				"requested_accelerator_model": "H200", "hourly_rate_usd_micros": 6_000_000,
+				"wheelhouse_manifest_digest": activeManifestDigest,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/pr-idle-cpu-old":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"rental_id": "pr-idle-cpu-old", "state": "ready",
+				"requested_accelerator_model": "CPU", "hourly_rate_usd_micros": 70_000,
+				"wheelhouse_manifest_digest": "sha256:" + strings.Repeat("f", 64),
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/"+activeRentalID:
 			state := "ready"
@@ -102,6 +156,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			answer := map[string]any{
 				"rental_id": activeRentalID, "state": state,
 				"requested_accelerator_model": accelerator, "hourly_rate_usd_micros": rate,
+				"wheelhouse_manifest_digest": activeManifestDigest,
 			}
 			if state == "ready" {
 				answer["worker_address"] = "127.0.0.1:9443"
@@ -118,51 +173,44 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 		}
 	}))
 	defer server.Close()
+	origin = server.URL
 
-	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
 		"tensorhub_url: "+server.URL+"\ntensorhub_token: test-token\nport: 0\n"+
 			"rentals:\n  max_hourly_spend_usd: 7.00\n"), 0o600))
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 	project := weightlessProject(t)
-	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
+	pack, problem := packagepublish.PrepareLocalFrom(project)
+	fatal(t, problem)
+	fatal(t, pack.Build(context.Background()))
+	publishedWheel, _ = os.ReadFile(pack.Wheel)
+	publishedWheelSum := sha256.Sum256(publishedWheel)
+	publishedWheelDigest = "sha256:" + hex.EncodeToString(publishedWheelSum[:])
+	publishedWheelFact, problem = wheel.InspectIdentity(pack.Wheel)
+	fatal(t, problem)
+	packageConfig, _ = os.ReadFile(filepath.Join(project, "package.toml"))
+	pack.Close()
+	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
 		t.Fatalf("fixture install [exit %d]\n%s", code, out)
 	}
 	local := activePackageInstall(t, root)
+	fatal(t, launch.RefreshGenerationBase(local, root,
+		filepath.Join(root, "active-base.json"), childEnv(t, root)))
 	descriptor, _ = os.ReadFile(launch.DescriptorPath(local.Dir))
-	var descriptorDocument map[string]any
-	must(t, json.Unmarshal(descriptor, &descriptorDocument))
-	entrypoints := descriptorDocument["entrypoints"].([]any)
-	for _, entrypoint := range entrypoints {
-		row := entrypoint.(map[string]any)
-		if row["name"] == "tile" {
-			encoded, _ := json.Marshal(row)
-			var job map[string]any
-			must(t, json.Unmarshal(encoded, &job))
-			job["name"], job["publishes"] = "tile_job", false
-			descriptorDocument["jobs"] = []any{job}
-			row["models"] = []any{map[string]any{
-				"class": "TinyModel", "path": "tile.models.model",
-				"stamps": map[string]any{}, "component_use": map[string]any{"core": []any{"tile"}},
-			}}
-			descriptorDocument["entrypoints"] = []any{row}
-		}
-	}
-	descriptor, _ = json.Marshal(descriptorDocument)
 	decoded, problem := launch.DecodeDescriptor(descriptor)
 	fatal(t, problem)
-	jobDescriptorID := decoded.Jobs[0].DescriptorID
-	if jobDescriptorID == "" {
-		t.Fatal("remote job descriptor id was not derived")
-	}
 	descriptorDigest = decoded.Digest
 	store, problem := records.Open(filepath.Join(root, "records.db"))
 	fatal(t, problem)
+	fatal(t, store.RecordRental(records.Rental{ID: "pr-idle-cpu-old",
+		MachineName: "idle-cpu-old", SKU: "cpu", AcceleratorModel: "CPU",
+		HourlyRateUSDMicros: 70_000, State: "ready", Hub: server.URL,
+		WheelhouseManifestDigest: "sha256:" + strings.Repeat("f", 64)}))
 	store.Close()
 	daemonPath := filepath.Join(root, "cozy-daemon")
 	must(t, os.Symlink(cozyBin, daemonPath))
 	daemonCommand := exec.Command(daemonPath)
-	daemonCommand.Env = childEnv(t, root)
+	daemonCommand.Env = launch.GenerationToolEnv(local, childEnv(t, root))
 	var daemonOutput bytes.Buffer
 	daemonCommand.Stdout, daemonCommand.Stderr = &daemonOutput, &daemonOutput
 	must(t, daemonCommand.Start())
@@ -180,8 +228,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 		t.Fatalf("foreground daemon did not start:\n%s", daemonOutput.String())
 	}
 
-	code, out := runCozy(t, root, "run", weightlessRef+"/tile", "size=32", "seed=7",
-		"--model", "model=cozy/tiny@1.0.0#"+modelManifest,
+	code, out := runCozy(t, root, "run", localWeightlessRef+"/tile", "size=32", "seed=7",
 		"--rental", "--idempotency-key", "managed-e2e", "--json")
 	if code != 1 || !strings.Contains(out, `pinned media certificate`) {
 		t.Fatalf("three-second observation missed the fast rental failure [exit %d]\n%s\ndaemon:\n%s",
@@ -216,23 +263,25 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	gotPosts, gotDeletes, body := posts, deletes, rentalRequest
 	gotCreateReason, gotDeleteReason := createReason, deleteReason
 	mu.Unlock()
-	if request == nil || request.Worker != "pr-managed-e2e" || request.InstallID != "" ||
-		request.Release != "1.0.0" || request.PackageRevisionDigest != releaseDigest ||
-		len(request.Models) != 1 || request.Models[0].Package != weightlessRef ||
-		request.Models[0].Slot != "tile.models.model" || request.Models[0].Model != "cozy/tiny" ||
-		request.Models[0].Release != "1.0.0" || request.Models[0].Manifest != modelManifest ||
+	if request == nil || request.Worker != "pr-managed-e2e" || request.InstallID != local.ID ||
+		request.Release != "1.0.0" || request.PackageRevisionDigest != local.SourceDigest ||
+		request.PrivatePackageDigest == "" || len(request.Models) != 0 ||
+		len(request.AcceptableWheelhouseManifestDigests) != 1 ||
+		request.AcceptableWheelhouseManifestDigests[0] != activeManifestDigest ||
 		gotPosts != 1 || gotDeletes != 1 ||
-		body["sku"] != "cheap" || body["max_cost_usd_micros"] != nil || body["max_duration_seconds"] != nil {
+		body["sku"] != "cpu" || fmt.Sprint(body["acceptable_wheelhouse_manifest_digests"]) !=
+		"["+activeManifestDigest+"]" ||
+		body["max_cost_usd_micros"] != nil || body["max_duration_seconds"] != nil {
 		t.Fatalf("managed lifecycle request=%+v posts=%d deletes=%d body=%v", request, gotPosts, gotDeletes, body)
 	}
 	if gotCreateReason != "" || gotDeleteReason != "" ||
-		strings.Contains(fmt.Sprint(body), weightlessRef) || strings.Contains(fmt.Sprint(body), "cozy/tiny") {
+		strings.Contains(fmt.Sprint(body), localWeightlessRef) || strings.Contains(fmt.Sprint(body), "cozy/tiny") {
 		t.Fatalf("managed rental leaked work identity in reason/body: create=%q delete=%q body=%v",
 			gotCreateReason, gotDeleteReason, body)
 	}
 	wantLines := map[string]bool{
-		"rentals: 0 remote machines running · $0.00/hour of $7.00/hour": false,
-		"rentals: 1 remote machine running · $0.30/hour of $7.00/hour":  false,
+		"rentals: 1 remote machine running · $0.07/hour of $7.00/hour":  false,
+		"rentals: 2 remote machines running · $0.14/hour of $7.00/hour": false,
 	}
 	for _, event := range events {
 		if line, ok := event.Payload["line"].(string); ok {
@@ -246,8 +295,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			t.Fatalf("managed lifecycle omitted %q: %+v", line, events)
 		}
 	}
-	code, out = runCozy(t, root, "run", weightlessRef+"/tile", "size=32", "seed=7",
-		"--model", "model=cozy/tiny@1.0.0#"+modelManifest,
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile", "size=32", "seed=7",
 		"--rental", "--idempotency-key", "managed-e2e", "--json")
 	mu.Lock()
 	gotPosts = posts
@@ -258,6 +306,99 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 
 	mu.Lock()
 	posts, deletes, rentalRequest, createReason, deleteReason = 0, 0, nil, "", ""
+	activeRentalID = "pr-private-job-replay"
+	mu.Unlock()
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job", "size=32", "seed=7",
+		"--rental", "--idempotency-key", "private-job-replay", "--json")
+	if code != 1 || !strings.Contains(out, `pinned media certificate`) {
+		t.Fatalf("private job submission [exit %d]\n%s\ndaemon:\n%s", code, out, daemonOutput.String())
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	request = nil
+	for time.Now().Before(deadline) {
+		store, problem = records.Open(filepath.Join(root, "records.db"))
+		fatal(t, problem)
+		rows, rowsProblem := store.RequestsOfKind("job", "", 20)
+		fatal(t, rowsProblem)
+		for i := range rows {
+			if rows[i].IdemKey == "private-job-replay" {
+				row := rows[i]
+				request = &row
+			}
+		}
+		rentalRow, _ := store.RentalRow("pr-private-job-replay")
+		store.Close()
+		mu.Lock()
+		done := posts == 1 && deletes == 1 && rentalRow == nil && request != nil && request.State == "failed"
+		mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if request == nil || request.PrivatePackageDigest == "" || request.InstallID == "" {
+		t.Fatalf("private job did not freeze its exact install/revision: %+v", request)
+	}
+	must(t, os.RemoveAll(project))
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job", "size=32", "seed=7",
+		"--rental", "--idempotency-key", "private-job-replay", "--json")
+	mu.Lock()
+	gotPosts = posts
+	mu.Unlock()
+	if code != 1 || !strings.Contains(out, `pinned media certificate`) || gotPosts != 1 {
+		t.Fatalf("private job replay reread source or rented again [exit %d posts=%d]\n%s",
+			code, gotPosts, out)
+	}
+	store, problem = records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	replayedRequest, problem := store.RequestByIdempotencyKey("private-job-replay")
+	store.Close()
+	fatal(t, problem)
+	if replayedRequest == nil || replayedRequest.ID != request.ID ||
+		replayedRequest.PrivatePackageDigest != request.PrivatePackageDigest {
+		t.Fatalf("private job replay changed durable identity: %+v -> %+v", request, replayedRequest)
+	}
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job", "size=64", "seed=7",
+		"--rental", "--idempotency-key", "private-job-replay", "--json")
+	mu.Lock()
+	gotPosts = posts
+	mu.Unlock()
+	if code == 0 || !strings.Contains(out, "different body") || gotPosts != 1 {
+		t.Fatalf("changed private job payload reused the key [exit %d posts=%d]\n%s",
+			code, gotPosts, out)
+	}
+
+	// Preserve the published remote-job acquisition/release/replay acceptance beside the
+	// new private-serving case; a new transport must not erase an existing product arm.
+	var descriptorDocument map[string]any
+	must(t, json.Unmarshal(descriptor, &descriptorDocument))
+	entrypoints := descriptorDocument["entrypoints"].([]any)
+	for _, entrypoint := range entrypoints {
+		row := entrypoint.(map[string]any)
+		if row["name"] == "tile" {
+			encoded, _ := json.Marshal(row)
+			var job map[string]any
+			must(t, json.Unmarshal(encoded, &job))
+			job["name"], job["publishes"] = "tile_job", false
+			descriptorDocument["jobs"] = []any{job}
+			row["models"] = []any{map[string]any{
+				"class": "TinyModel", "path": "tile.models.model",
+				"stamps": map[string]any{}, "component_use": map[string]any{"core": []any{"tile"}},
+			}}
+			descriptorDocument["entrypoints"] = []any{row}
+		}
+	}
+	publishedDescriptor, _ := json.Marshal(descriptorDocument)
+	publishedDecoded, problem := launch.DecodeDescriptor(publishedDescriptor)
+	fatal(t, problem)
+	jobDescriptorID := publishedDecoded.Jobs[0].DescriptorID
+	if jobDescriptorID == "" {
+		t.Fatal("remote job descriptor id was not derived")
+	}
+	mu.Lock()
+	descriptor = publishedDescriptor
+	descriptorDigest = publishedDecoded.Digest
+	posts, deletes, rentalRequest, createReason, deleteReason = 0, 0, nil, "", ""
 	activeRentalID = "pr-managed-job"
 	mu.Unlock()
 	store, problem = records.Open(filepath.Join(root, "records.db"))
@@ -265,6 +406,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	fatal(t, store.RecordRental(records.Rental{
 		ID: "pr-idle-h200", MachineName: "idle-h200", SKU: "h200", AcceleratorModel: "H200",
 		HourlyRateUSDMicros: 6_000_000, State: "ready", Hub: server.URL,
+		WheelhouseManifestDigest: activeManifestDigest,
 	}))
 	store.Close()
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile_job", "size=32", "seed=7",
@@ -301,7 +443,10 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	mu.Unlock()
 	if request == nil || request.Worker != "pr-managed-job" || request.PlanID != jobDescriptorID || request.Kind != "job" ||
 		request.Release != "1.0.0" || request.PackageRevisionDigest != releaseDigest ||
-		request.JobGPUCount != 0 || len(request.Models) != 0 || gotPosts != 1 || gotDeletes != 1 ||
+		request.JobGPUCount != 0 || len(request.Models) != 0 ||
+		len(request.AcceptableWheelhouseManifestDigests) != 1 ||
+		request.AcceptableWheelhouseManifestDigests[0] != activeManifestDigest ||
+		gotPosts != 1 || gotDeletes != 1 ||
 		body["sku"] != "cpu" ||
 		strings.Contains(fmt.Sprint(body), weightlessRef) || strings.Contains(fmt.Sprint(body), "tile_job") {
 		t.Fatalf("remote job lifecycle request=%+v posts=%d deletes=%d body=%v",
@@ -314,6 +459,9 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	mu.Unlock()
 	if code != 1 || !strings.Contains(out, `pinned media certificate`) || gotPosts != 1 {
 		t.Fatalf("remote job replay purchased again [exit %d posts=%d]\n%s", code, gotPosts, out)
+	}
+	if packageDownloads != 1 {
+		t.Fatalf("published package preflight downloads=%d, want one exact resolution", packageDownloads)
 	}
 	store, problem = records.Open(filepath.Join(root, "records.db"))
 	fatal(t, problem)
