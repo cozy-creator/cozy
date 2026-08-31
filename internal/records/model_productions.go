@@ -321,6 +321,34 @@ func (s *Store) ActiveModelProductions() ([]ModelProductionOperation, *exit.Erro
 	return out, nil
 }
 
+func (s *Store) ModelProductions(state string, limit int) ([]ModelProductionOperation, *exit.Error) {
+	if limit < 1 || limit > 500 {
+		return nil, exit.New(exit.Validation, "model production list limit is outside 1..500")
+	}
+	query := `SELECT ` + modelProductionCols + ` FROM model_productions`
+	args := []any{}
+	if state != "" && state != "any" {
+		query += ` WHERE state=?`
+		args = append(args, state)
+	}
+	query += ` ORDER BY created_at DESC,id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, exit.Internalf("cannot list model productions: %s", err)
+	}
+	defer rows.Close()
+	var out []ModelProductionOperation
+	for rows.Next() {
+		row, err := scanModelProduction(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot scan model production: %s", err)
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
 func (s *Store) SelectModelProductionSKU(id, sku string) *exit.Error {
 	result, err := s.db.Exec(`UPDATE model_productions SET selected_sku=?,updated_at=?
 		WHERE id=? AND (selected_sku='' OR selected_sku=?)`, sku, now(), id, sku)

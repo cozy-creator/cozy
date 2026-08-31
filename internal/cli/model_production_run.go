@@ -6,11 +6,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
@@ -32,7 +30,7 @@ type productionManifest struct {
 	Length       int64
 }
 
-func runRentedModelProduction(ctx *Context, plan modelproduction.Plan,
+func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelproduction.Plan,
 	source publishSource,
 ) *exit.Error {
 	if plan.Production == nil || len(plan.Jobs) == 0 || len(source.Access) == 0 {
@@ -99,11 +97,14 @@ func runRentedModelProduction(ctx *Context, plan modelproduction.Plan,
 	if problem != nil {
 		return problem
 	}
-	runCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	rentalID, problem := ensureProductionRental(ctx, layout, store, plan, operation, progress)
+	if problem = productionCancellation(runCtx, store, operation.ID); problem != nil {
+		return failProduction(store, operation.ID, problem)
+	}
+	rentalID, problem := ensureProductionRental(runCtx, ctx, layout, store, plan, operation, progress)
 	if problem != nil {
+		if rentalID != "" {
+			return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
+		}
 		return failProduction(store, operation.ID, problem)
 	}
 	releaseOwed := true
@@ -281,17 +282,26 @@ func resumeProductionCleanup(ctx *Context, store *records.Store, plan modelprodu
 	return emitCompletedProduction(ctx, plan, completed, replay)
 }
 
-func ensureProductionRental(ctx *Context, layout home.Layout, store *records.Store,
+func ensureProductionRental(runCtx context.Context, ctx *Context, layout home.Layout, store *records.Store,
 	plan modelproduction.Plan, operation records.ModelProductionOperation,
 	progress *productionProgress,
 ) (string, *exit.Error) {
+	if problem := productionCancellation(runCtx, store, operation.ID); problem != nil {
+		return "", problem
+	}
 	if operation.RentalID != "" {
 		return operation.RentalID, nil
 	}
-	hctx, cancel := hub.Context()
+	hctx, cancel := productionHubContext(runCtx)
 	skus, problem := client(ctx).RentalSKUs(hctx)
 	cancel()
 	if problem != nil {
+		if cancelProblem := productionCancellation(runCtx, store, operation.ID); cancelProblem != nil {
+			return "", cancelProblem
+		}
+		return "", problem
+	}
+	if problem := productionCancellation(runCtx, store, operation.ID); problem != nil {
 		return "", problem
 	}
 	eligible := make([]hub.RentalSKU, 0, len(skus))
@@ -349,11 +359,21 @@ func ensureProductionRental(ctx *Context, layout home.Layout, store *records.Sto
 		return "", problem
 	}
 	progress.RentalSelecting(sku.Name)
-	row, _, _, problem := acquireRental(ctx, layout, store, sku.Name, "",
+	row, _, _, problem := acquireRentalContext(runCtx, ctx, layout, store, sku.Name, "",
 		operationKey, "cozy model publish "+plan.Destination,
 		rate, ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, "")
 	if problem != nil {
+		operation, readProblem := store.RentalOperation(operationKey)
+		if readProblem == nil && operation != nil {
+			return operation.RentalID, problem
+		}
+		if readProblem != nil {
+			return "", readProblem
+		}
 		return "", problem
+	}
+	if problem := productionCancellation(runCtx, store, operation.ID); problem != nil {
+		return row.ID, problem
 	}
 	progress.RentalReady(row.ID, row.State, sku.Name)
 	if problem = store.AdvanceModelProduction(operation.ID, "accepted", "source_preparing", 0,
@@ -438,6 +458,10 @@ func prepareProductionSource(runCtx context.Context, local *localclient.Client, 
 			result, problem = observed.result, observed.problem
 			goto prepared
 		case <-ticker.C:
+			if cancelProblem := productionCancellation(runCtx, store, plan.ID()); cancelProblem != nil {
+				cancelAction()
+				return cancelProblem
+			}
 			rows, readProblem := store.ModelProductionSourceFiles(plan.ID())
 			if readProblem != nil {
 				return readProblem
@@ -620,6 +644,9 @@ func waitNodeArtifacts(runCtx context.Context, store *records.Store, operationID
 		want[outputSlot] = true
 	}
 	for {
+		if cancelProblem := productionCancellation(runCtx, store, operationID); cancelProblem != nil {
+			return nil, cancelProblem
+		}
 		rows, problem := store.ModelProductionArtifacts(operationID)
 		if problem != nil {
 			return nil, problem
@@ -894,6 +921,10 @@ func cutProductionRelease(runCtx context.Context, ctx *Context, store *records.S
 		"cozy model publish "+plan.Destination+"@"+plan.Release)
 	cancel()
 	if problem != nil {
+		if problem.Code == exit.Unavailable || problem.Code == exit.Deadline {
+			return exit.Named(problem.Code, "model_production.cut_verdict_unknown",
+				"release cut verdict is unknown; replaying the same operation: %s", problem.Message)
+		}
 		return problem
 	}
 	if cut.Release != plan.Release || len(cut.Lanes) != len(plan.Production.Outputs) {
@@ -903,6 +934,13 @@ func cutProductionRelease(runCtx context.Context, ctx *Context, store *records.S
 	if problem = store.AdvanceModelProduction(plan.ID(), "outputs_preparing", "release_cut",
 		current.NodeIndex, current.RentalID); problem != nil {
 		return problem
+	}
+	// Cancellation racing the unary cut is observed only after its exact response is
+	// journaled. A committed cut wins and cleanup continues; it is never rewritten
+	// as a failed or invisible publication.
+	if cancelProblem := productionCancellation(runCtx, store, plan.ID()); cancelProblem != nil &&
+		cancelProblem.Code != exit.Canceled {
+		return cancelProblem
 	}
 	progress.ReleaseCut(plan.Release, len(lanes))
 	return nil
