@@ -42,6 +42,7 @@ func TestPackageReleaseClientContract(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "uploads": []map[string]any{
 				{"kind": "project_wheel", "path": "project.whl", "url": "https://storage.invalid/project", "required_headers": map[string]string{}, "already_uploaded": false},
+				{"kind": "descriptor", "path": "descriptor.json", "url": "https://storage.invalid/descriptor", "required_headers": map[string]string{}, "already_uploaded": false},
 				{"kind": "source", "path": "package.toml", "url": "https://storage.invalid/source", "required_headers": map[string]string{}, "already_uploaded": false},
 				{"kind": "dependency_wheel", "path": "proof_dependency-1.0.0-py3-none-any.whl", "url": "https://storage.invalid/dependency", "required_headers": map[string]string{}, "already_uploaded": false},
 			}})
@@ -49,7 +50,7 @@ func TestPackageReleaseClientContract(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == publishPath+"/finalize":
 			assertEmptyObject(t, r.Body)
 			_ = json.NewEncoder(w).Encode(map[string]any{"state": "committed",
-				"qualification_state": "qualified", "release_digest": "sha256:" + strings.Repeat("a", 64)})
+				"release_digest": "sha256:" + strings.Repeat("a", 64)})
 			return
 		default:
 			http.NotFound(w, r)
@@ -61,8 +62,9 @@ func TestPackageReleaseClientContract(t *testing.T) {
 
 	draft, problem := client.DeclarePackageRelease(context.Background(), ref, "1.0.0",
 		[]string{"package.toml"}, []string{"proof_dependency-1.0.0-py3-none-any.whl"}, "proof publish")
-	if problem != nil || draft.State != "pending" || len(draft.Uploads) != 3 ||
-		draft.Uploads[0].Kind != "project_wheel" || draft.Uploads[2].Kind != "dependency_wheel" {
+	if problem != nil || draft.State != "pending" || len(draft.Uploads) != 4 ||
+		draft.Uploads[0].Kind != "project_wheel" || draft.Uploads[1].Kind != "descriptor" ||
+		draft.Uploads[3].Kind != "dependency_wheel" {
 		t.Fatalf("declaration response changed: %+v problem=%v", draft, problem)
 	}
 	committed, problem := client.CommitPackageRelease(context.Background(), ref, "1.0.0", "proof publish")
@@ -149,31 +151,11 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 			if release := r.URL.Query().Get("release"); release != "" && release != "1.2.3" {
 				t.Errorf("package download release = %q", release)
 			}
-			var body struct {
-				Capability      hub.PackageInstallTarget `json:"capability"`
-				ModelSelections []hub.ModelSelection     `json:"model_selections"`
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 0 {
+				t.Errorf("package download body is not empty: %+v err=%v", body, err)
 			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ModelSelections == nil ||
-				len(body.ModelSelections) != 0 {
-				t.Errorf("package selection body changed: %+v err=%v", body, err)
-			}
-			profile := "torch2.13.0-cpu-cp312-linux-x86"
-			switch body.Capability.Accelerator {
-			case "cpu":
-				if body.Capability.OS != "linux" || body.Capability.Arch != "x86" ||
-					body.Capability.DriverCUDA != "" || body.Capability.ComputeCapability != "" {
-					t.Errorf("CPU package install target changed: %+v", body.Capability)
-				}
-			case "nvidia":
-				profile = "torch2.13.0-cu130-cp312-linux-x86"
-				if body.Capability.OS != "linux" || body.Capability.Arch != "x86" ||
-					body.Capability.DriverCUDA != "13.2" || body.Capability.ComputeCapability != "8.9" {
-					t.Errorf("NVIDIA package install target changed: %+v", body.Capability)
-				}
-			default:
-				t.Errorf("package install target omitted accelerator: %+v", body.Capability)
-			}
-			_, _ = io.WriteString(w, `{"release":"1.2.3","profile":"`+profile+`","placement_set":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("2", 64)+`","length":2},"package_descriptor":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("4", 64)+`","length":2},"qualification":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("5", 64)+`","length":2},"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","kind":"project_wheel","length":4,"path":"proof.whl","url":"https://storage.invalid/proof.whl"}]}`)
+			_, _ = io.WriteString(w, `{"release":"1.2.3","release_digest":"sha256:`+strings.Repeat("2", 64)+`","package_descriptor":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("4", 64)+`","length":2},"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","distribution":"package","import_roots":["package"],"kind":"project_wheel","length":4,"path":"package-1.2.3-py3-none-any.whl","tags":["py3-none-any"],"url":"https://storage.invalid/proof.whl","version":"1.2.3"}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -185,30 +167,20 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 	if problem != nil || len(card.Releases) != 1 || card.Releases[0].Release != "1.2.3" {
 		t.Fatalf("package card changed: %+v problem=%v", card, problem)
 	}
-	plan, problem := client.PackageDownloads(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
-		Accelerator: "cpu", OS: "linux", Arch: "x86",
-	})
-	if problem != nil || plan.Release != "1.2.3" || plan.Profile != "torch2.13.0-cpu-cp312-linux-x86" ||
-		len(plan.Downloads) != 1 || plan.Downloads[0].Path != "proof.whl" {
+	plan, problem := client.PackageDownloads(context.Background(), ref, "1.2.3")
+	if problem != nil || plan.Release != "1.2.3" ||
+		len(plan.Downloads) != 1 || plan.Downloads[0].Distribution != "package" {
 		t.Fatalf("package install plan changed: %+v problem=%v", plan, problem)
 	}
-	nvidia, problem := client.PackageDownloads(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
-		Accelerator: "nvidia", OS: "linux", Arch: "x86",
-		DriverCUDA: "13.2", ComputeCapability: "8.9",
-	})
-	if problem != nil || nvidia.Profile != "torch2.13.0-cu130-cp312-linux-x86" {
-		t.Fatalf("NVIDIA package install target was refused or selected another profile: %+v, %v", nvidia, problem)
-	}
-	if latest, problem := client.PackageDownloads(context.Background(), ref, "", hub.PackageInstallTarget{
-		Accelerator: "cpu", OS: "linux", Arch: "x86",
-	}); problem != nil || latest.Release != "1.2.3" {
-		t.Fatalf("latest compatible package download = %+v, %v", latest, problem)
+	if latest, problem := client.PackageDownloads(context.Background(), ref, ""); problem != nil || latest.Release != "1.2.3" {
+		t.Fatalf("latest package download = %+v, %v", latest, problem)
 	}
 }
 
 func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 	project := t.TempDir()
 	writePublishProject(t, project, "wire-package", "1.0.0", nil, "", true)
+	lockPublishProject(t, project)
 	for i := range 48 {
 		name := filepath.Join(project, "wire_package", fmt.Sprintf("source_%02d.py", i))
 		must(t, os.WriteFile(name, []byte("VALUE = 1\n"), 0o644))
@@ -245,6 +217,10 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 				"already_uploaded": false, "kind": "project_wheel",
 				"path":             "project.whl",
 				"required_headers": map[string]string{}, "url": server.URL + "/storage/project",
+			}, {
+				"already_uploaded": false, "kind": "descriptor",
+				"path":             "descriptor.json",
+				"required_headers": map[string]string{}, "url": server.URL + "/storage/descriptor",
 			}}
 			for i, path := range body.Paths {
 				uploads = append(uploads, map[string]any{
@@ -257,7 +233,7 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == publishPath+"/finalize":
 			finalized.Add(1)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"state": "committed", "qualification_state": "qualified",
+				"state":          "committed",
 				"release_digest": "sha256:" + strings.Repeat("4", 64),
 			})
 		default:
@@ -272,8 +248,8 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 		strings.Contains(out, "package_release_digest:") || strings.Contains(out, "qualification:") ||
 		!strings.Contains(out, "Building package wheel and local dependencies...") ||
 		!strings.Contains(out, "Declaring 52 source files and 0 dependency wheels...") ||
-		!strings.Contains(out, "Uploading files: 0/53") ||
-		!strings.Contains(out, "Uploading files: 53/53") ||
+		!strings.Contains(out, "Uploading files: 0/54") ||
+		!strings.Contains(out, "Uploading files: 54/54") ||
 		!strings.Contains(out, "Committing exact package release...") {
 		t.Fatalf("pending package wire flow failed [exit %d]\n%s", code, out)
 	}

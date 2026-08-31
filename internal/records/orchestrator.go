@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS requests (
   package     TEXT    NOT NULL,
   entrypoint   TEXT    NOT NULL,
   plan_id      TEXT    NOT NULL,
+  package_release TEXT NOT NULL DEFAULT '',
   package_revision_digest TEXT NOT NULL DEFAULT '',
   environment_digest TEXT NOT NULL DEFAULT '',
   config_digest TEXT NOT NULL DEFAULT '',
@@ -61,12 +62,14 @@ CREATE TABLE IF NOT EXISTS requests (
   requeues     INTEGER NOT NULL DEFAULT 0,
   created_at   TEXT    NOT NULL,
   kind         TEXT    NOT NULL DEFAULT 'serving',
+  job_gpu_count INTEGER NOT NULL DEFAULT 0,
   org          TEXT    NOT NULL DEFAULT '',
   trees        TEXT    NOT NULL DEFAULT '',
   worker       TEXT    NOT NULL DEFAULT '',
   rental       INTEGER NOT NULL DEFAULT 0,
   install_id   TEXT    REFERENCES install_generations(id),
   assets       TEXT    NOT NULL DEFAULT '[]',
+  models       TEXT    NOT NULL DEFAULT '[]',
   artifact_outputs TEXT NOT NULL DEFAULT '[]'
 )`, `
 -- The PUBLICATION (cl-004). One row per job request, written INSIDE the terminal
@@ -403,6 +406,7 @@ type Request struct {
 	Package    string
 	Entrypoint string
 	PlanID     string
+	Release    string
 	// A remote worker derives these invocation identities from its exact accepted
 	// Placement. They are CAS-bound with PlanID before the first offer so a retry or
 	// reconnect cannot silently change the execution named by this request.
@@ -421,7 +425,8 @@ type Request struct {
 	// whole job branch hangs off, and it lives on the request because a requeue must
 	// re-derive the same class without a client saying so again (cr-009: a job is an
 	// attempt class on the one machinery, not a second runtime).
-	Kind string
+	Kind        string
+	JobGPUCount int64
 	// Org is the publishing org a job's scratch repo is named under. Empty for serving.
 	Org string
 	// Trees are the job's typed input TREES, `ref=dir` joined by commas. Each becomes
@@ -441,6 +446,9 @@ type Request struct {
 	// authority-owned immutable input store, not at the caller's original file: a requeue
 	// after a client exit or daemon restart therefore grants the same verified bytes.
 	Assets []AssetBinding
+	// Models are exact package-slot-to-model bindings resolved before rental creation.
+	// They are local request state and are disclosed only after worker attachment.
+	Models []ModelRef
 	// ArtifactOutputs is the immutable ArtifactSink output subset projected beside the
 	// InvocationSpec. Rev5 OutputBinding has no kind, so this may never be inferred from
 	// ordinary asset outputs or from whichever receipts happen to arrive.
@@ -462,21 +470,35 @@ type AssetBinding struct {
 	MaxBytes  int64  `json:"max_bytes,omitempty"`
 }
 
-const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,
+// ModelRef is one exact user-selected model binding. Creator resolves the human
+// spelling before it rents anything, records this row with the request, and sends it
+// only to the attached worker in a signed download delegation.
+type ModelRef struct {
+	Package  string `json:"package"`
+	Slot     string `json:"slot"`
+	Model    string `json:"model"`
+	Release  string `json:"release"`
+	Manifest string `json:"manifest"`
+}
+
+const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
 	package_revision_digest,environment_digest,config_digest,payload,outputs,
-	state,ordinal,requeues,created_at,kind,org,trees,worker,rental,
-	COALESCE(install_id,''),assets,artifact_outputs`
+	state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,
+	COALESCE(install_id,''),assets,models,artifact_outputs`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
-	var assets string
+	var assets, models string
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
-		&r.PackageRevisionDigest, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
+		&r.Release, &r.PackageRevisionDigest, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
-		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.Rental,
-		&r.InstallID, &assets, &r.ArtifactOutputs)
+		&r.Kind, &r.JobGPUCount, &r.Org, &r.Trees, &r.Worker, &r.Rental,
+		&r.InstallID, &assets, &models, &r.ArtifactOutputs)
 	if err == nil && assets != "" {
 		err = json.Unmarshal([]byte(assets), &r.Assets)
+	}
+	if err == nil && models != "" {
+		err = json.Unmarshal([]byte(models), &r.Models)
 	}
 	return r, err
 }
@@ -505,9 +527,10 @@ func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, c
 		return exit.Internalf("cannot bind an incomplete remote invocation identity")
 	}
 	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,package_revision_digest=?,
-		environment_digest=?,config_digest=? WHERE id=? AND plan_id='' AND
-		package_revision_digest='' AND environment_digest='' AND config_digest=''`,
-		planID, packageRevision, environment, config, id)
+		environment_digest=?,config_digest=? WHERE id=? AND (plan_id='' OR plan_id=?) AND
+		(package_revision_digest='' OR package_revision_digest=?) AND
+		environment_digest='' AND config_digest=''`,
+		planID, packageRevision, environment, config, id, planID, packageRevision)
 	if err != nil {
 		return exit.Internalf("cannot bind request %s remote invocation: %s", id, err)
 	}
@@ -762,7 +785,7 @@ func (s *Store) BeginRequeue(id string, max int64) (count int64, started, cancel
 // same body digest answers the SAME request; the same key with a different body is a
 // conflict, never a second execution wearing one name.
 func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
-	r, assets, problem := prepareRequest(r)
+	r, assets, models, problem := prepareRequest(r)
 	if problem != nil {
 		return Request{}, false, problem
 	}
@@ -771,7 +794,7 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 		return Request{}, false, exit.Internalf("cannot begin request submission: %s", err)
 	}
 	defer tx.Rollback()
-	recorded, fresh, problem := submitRequestTx(tx, r, assets)
+	recorded, fresh, problem := submitRequestTx(tx, r, assets, models)
 	if problem != nil {
 		return Request{}, false, problem
 	}
@@ -781,7 +804,7 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 	return recorded, fresh, nil
 }
 
-func prepareRequest(r Request) (Request, string, *exit.Error) {
+func prepareRequest(r Request) (Request, string, string, *exit.Error) {
 	r.CreatedAt = now()
 	r.State = "submitted"
 	if r.Kind == "" {
@@ -792,13 +815,21 @@ func prepareRequest(r Request) (Request, string, *exit.Error) {
 		var err error
 		assets, err = json.Marshal(r.Assets)
 		if err != nil {
-			return Request{}, "", exit.Internalf("cannot record request %s assets: %s", r.ID, err)
+			return Request{}, "", "", exit.Internalf("cannot record request %s assets: %s", r.ID, err)
 		}
 	}
-	return r, string(assets), nil
+	models := []byte("[]")
+	if len(r.Models) > 0 {
+		var err error
+		models, err = json.Marshal(r.Models)
+		if err != nil {
+			return Request{}, "", "", exit.Internalf("cannot record request %s models: %s", r.ID, err)
+		}
+	}
+	return r, string(assets), string(models), nil
 }
 
-func submitRequestTx(tx *sql.Tx, r Request, assets string) (Request, bool, *exit.Error) {
+func submitRequestTx(tx *sql.Tx, r Request, assets, models string) (Request, bool, *exit.Error) {
 	existing, err := scanRequest(tx.QueryRow(
 		`SELECT `+requestCols+` FROM requests WHERE idem_key=?`, r.IdemKey))
 	if err == nil {
@@ -814,15 +845,15 @@ func submitRequestTx(tx *sql.Tx, r Request, assets string) (Request, bool, *exit
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
-		plan_id,package_revision_digest,environment_digest,config_digest,
-		payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,rental,install_id,assets,
+		plan_id,package_release,package_revision_digest,environment_digest,config_digest,
+		payload,outputs,state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,install_id,assets,models,
 		artifact_outputs)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
-		r.PackageRevisionDigest, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
-		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.Rental,
+		r.Release, r.PackageRevisionDigest, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.JobGPUCount, r.Org, r.Trees, r.Worker, r.Rental,
 		nullable(r.InstallID),
-		assets, r.ArtifactOutputs); err != nil {
+		assets, models, r.ArtifactOutputs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	return r, true, nil

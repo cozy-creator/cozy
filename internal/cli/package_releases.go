@@ -35,6 +35,26 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()
 	defer cancel()
+	detail, lookupProblem := c.PackageRelease(hctx, ref, release)
+	if lookupProblem == nil {
+		if detail.Release.Release != release {
+			return exit.Internalf("package lookup returned release %q, want %q",
+				detail.Release.Release, release)
+		}
+		if _, err := canonical.Raw(detail.Release.ReleaseDigest); err != nil {
+			return exit.Internalf("published package has no exact release digest")
+		}
+		packagePublishStatus(ctx, "Release already published; no build or upload needed.")
+		return emit(ctx, compactRecord([]output.Field{
+			{K: "package", V: ref.String()}, {K: "release", V: release},
+			{K: "status", V: "already published"}, {K: "changed", V: false},
+			{K: "release_digest", V: detail.Release.ReleaseDigest},
+			{K: "uploaded", V: output.Bytes(0)}, {K: "hub", V: c.Base()},
+		}, "package", "release", "status"))
+	}
+	if lookupProblem.Code != exit.NotFound {
+		return lookupProblem
+	}
 	if problem := packagePublishStage(ctx, "Building package wheel and local dependencies", func() *exit.Error {
 		return pack.Build(hctx)
 	}); problem != nil {
@@ -84,20 +104,10 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	fields := []output.Field{
 		{K: "package", V: ref.String()}, {K: "release", V: release},
 		{K: "status", V: status}, {K: "changed", V: !replay},
-		{K: "qualification", V: done.QualificationState},
-		{K: "qualification_error", V: done.QualificationError},
 		{K: "release_digest", V: done.ReleaseDigest},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}
-	defaults := []string{"package", "release", "status"}
-	if done.QualificationState != "qualified" {
-		defaults = append(defaults, "qualification")
-	}
-	record := compactRecord(fields, defaults...)
-	if done.QualificationError != "" {
-		record.Notes = append(record.Notes, done.QualificationError)
-	}
-	return emit(ctx, record)
+	return emit(ctx, compactRecord(fields, "package", "release", "status"))
 }
 
 func handlePackageYank(ctx *Context) *exit.Error {
@@ -160,6 +170,7 @@ func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package,
 		wantDependencies[dependency.Filename] = dependency.Path
 	}
 	wantProject := true
+	wantDescriptor := true
 	for _, upload := range uploads {
 		var local string
 		var ok bool
@@ -170,6 +181,12 @@ func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package,
 			}
 			local, ok = pack.Wheel, true
 			wantProject = false
+		case "descriptor":
+			if !wantDescriptor || upload.Path != "descriptor.json" || pack.Descriptor == "" {
+				return 0, exit.Internalf("package uploads returned unknown descriptor %q", upload.Path)
+			}
+			local, ok = pack.Descriptor, true
+			wantDescriptor = false
 		case "source":
 			local, ok = wantSources[upload.Path]
 			delete(wantSources, upload.Path)
@@ -184,7 +201,7 @@ func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package,
 		}
 		files = append(files, packageFile{subject: upload.Path, path: local, upload: upload})
 	}
-	if wantProject || len(wantSources) != 0 || len(wantDependencies) != 0 {
+	if wantProject || wantDescriptor || len(wantSources) != 0 || len(wantDependencies) != 0 {
 		return 0, exit.Internalf("package uploads omitted %d source files and %d dependency wheels",
 			len(wantSources), len(wantDependencies))
 	}

@@ -24,7 +24,7 @@ import (
 
 const weightlessRef = "cozy/cozy-weightless-package"
 const editableRuntimeFixtureSHA = "9e8409c0c68c6cae75209817ad47818770cde8db"
-const editableTensorFSFixtureSHA = "6b7ee6e5cfec5f34cdee0da9398ff8a91ce451b3"
+const editableTensorFSFixtureSHA = "0f49a4bf3fbe6fc8d41713b7ce9041c80161b7e6"
 
 func TestLiteralPayloadUsesOrdinaryScalarSyntax(t *testing.T) {
 	entrypoint := &launch.Entrypoint{
@@ -58,7 +58,6 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 	}
 	first := install("a", "1.0.0", 1)
 	second := install("b", "2.0.0", 2)
-	second.SelectionProfile = "torch2.13.0-cpu-cp312-linux-x86"
 	second.PlacementSetDigest = "sha256:" + strings.Repeat("b", 64)
 	if _, problem = store.Activate(first); problem != nil {
 		t.Fatal(problem)
@@ -71,8 +70,7 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 		t.Fatalf("active pins = %+v, %v", pins, problem)
 	}
 	_, active, problem := store.ActivePackage("cozy/example")
-	if problem != nil || active == nil || active.SelectionProfile != second.SelectionProfile ||
-		active.PlacementSetDigest != second.PlacementSetDigest {
+	if problem != nil || active == nil || active.PlacementSetDigest != second.PlacementSetDigest {
 		t.Fatalf("active selection = %+v, %v", active, problem)
 	}
 }
@@ -215,7 +213,7 @@ func TestRunAutoInstallsAMissingLocalPackage(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
-		_, _ = io.WriteString(w, `{"error":{"code":"package_download.no_compatible_release","message":"no non-yanked package release has a compatible active qualification","remedy":"publish a compatible release"}}`)
+		_, _ = io.WriteString(w, `{"error":{"code":"package_download.release_absent","message":"package has no non-yanked release","remedy":"publish a package release first"}}`)
 	}))
 	defer server.Close()
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
@@ -223,7 +221,7 @@ func TestRunAutoInstallsAMissingLocalPackage(t *testing.T) {
 	code, out := runCozyDir(t, root, ".", []string{"TENSORHUB_URL=" + server.URL},
 		"run", "proof/missing/generate")
 	if code != 1 || !strings.Contains(out, "is not installed; installing it from Tensorhub") ||
-		!strings.Contains(out, "no non-yanked package release") || strings.Contains(out, "is not installed on this host") {
+		!strings.Contains(out, "package has no non-yanked release") || strings.Contains(out, "is not installed on this host") {
 		t.Fatalf("missing package did not enter automatic registry installation [exit %d]\n%s", code, out)
 	}
 }
@@ -347,10 +345,8 @@ func TestPackagePublishCommittedReplayStaysCompact(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/finalize"):
-			_, _ = io.WriteString(w, `{"state":"committed","qualification_state":"qualified","release_digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"}`)
-		case r.Method == http.MethodPost:
-			_, _ = io.WriteString(w, `{"state":"committed","uploads":[]}`)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/releases/1.0.0"):
+			_, _ = io.WriteString(w, `{"release":{"release":"1.0.0","release_digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","package_descriptor_digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","package_descriptor_length":2,"created_at":"2026-08-31T00:00:00Z"},"document":{},"package_descriptor":{}}`)
 		default:
 			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
 		}
@@ -360,8 +356,9 @@ func TestPackagePublishCommittedReplayStaysCompact(t *testing.T) {
 		[]string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}, "package", "publish")
 	if code != 0 || !strings.Contains(out, "status:  already published") ||
 		!strings.Contains(out, "Checking proof/replay-package@1.0.0...") ||
-		!strings.Contains(out, "Release already published; refreshing status...") ||
-		!strings.Contains(out, "Committing exact package release...") ||
+		!strings.Contains(out, "Release already published; no build or upload needed.") ||
+		strings.Contains(out, "Building package wheel") ||
+		strings.Contains(out, "Committing exact package release") ||
 		strings.Contains(out, "qualification:") || strings.Contains(out, "changed:") {
 		t.Fatalf("committed replay emitted verbose state [exit %d]\n%s", code, out)
 	}
@@ -371,24 +368,23 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 	workspace := t.TempDir()
 	projects := filepath.Join(workspace, "projects")
 	must(t, os.MkdirAll(projects, 0o755))
-	must(t, os.WriteFile(filepath.Join(workspace, "pyproject.toml"), []byte(
-		"[tool.uv.workspace]\nmembers = [\"projects/*\"]\n"), 0o644))
 
 	a := filepath.Join(projects, "local-a")
 	b := filepath.Join(projects, "local-b")
 	c := filepath.Join(projects, "local-c")
-	platformCandidate := filepath.Join(projects, "platform-candidate")
 	writePublishProject(t, a, "local-a", "1.0.0",
-		[]string{"local-b>=2,<3", "local-b[images]>=2,<3", "cozy-runtime>=0.0.3"},
-		"local-b = [{ workspace = true, marker = \"sys_platform == 'linux'\" }, { index = \"pypi\", marker = \"sys_platform != 'linux'\" }]\ncozy-runtime = { workspace = true, editable = true }\n", true)
+		[]string{"local-b>=2,<3", "local-b[images]>=2,<3", "cozy-runtime>=0.0.3", "msgspec>=0.19"},
+		"local-b = { path = \"../local-b\" }\n", true)
 	writePublishProject(t, b, "local-b", "2.1.0", nil,
 		"local-c = { path = \"../local-c\", editable = true }\nabsent-local = { path = \"../absent-local\" }\n", false)
 	appendProjectTOML(t, b, "\n[project.optional-dependencies]\nimages = [\"local-c==3.0.0\"]\nunused = [\"absent-local==1\"]\n")
 	writePublishProject(t, c, "local-c", "3.0.0", nil, "", false)
-	writePublishProject(t, platformCandidate, "cozy-runtime", "0.0.3", nil, "", false) //cozy:allow distribution fixture, not executable access
+	lockPublishProject(t, a)
 
 	pack, problem := preparePublishPackage(a)
-	fatal(t, problem)
+	if problem != nil {
+		t.Fatalf("%s: %s", problem.Message, problem.Remedy)
+	}
 	defer pack.Close()
 	wheels := map[string]string{}
 	for _, dependency := range pack.DependencyWheels {
@@ -396,9 +392,10 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		fatal(t, problem)
 		wheels[identity.Distribution] = identity.Version
 	}
-	if len(pack.DependencyWheels) != 3 || wheels["local-b"] != "2.1.0" ||
-		wheels["local-c"] != "3.0.0" || wheels["cozy-runtime"] != "0.0.3" { //cozy:allow distribution assertion, not executable access
-		t.Fatalf("local dependency closure did not include the requested extra and base-name candidate: %+v", pack.DependencyWheels)
+	if len(pack.DependencyWheels) != 2 || wheels["local-b"] != "2.1.0" ||
+		wheels["local-c"] != "3.0.0" || wheels["cozy-runtime"] != "" || //cozy:allow distribution assertion, not executable access
+		wheels["msgspec"] != "" { //cozy:allow distribution assertion, not executable access
+		t.Fatalf("local dependency closure did not include only the requested local wheels: %+v", pack.DependencyWheels)
 	}
 	for _, dependency := range pack.DependencyWheels {
 		if !strings.HasSuffix(dependency.Filename, ".whl") {
@@ -409,15 +406,14 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		}
 	}
 
-	// Creator does not guess base ownership. It uploads Runtime as candidate
-	// custody; Tensorhub's exact profile inventory must select the base copy and
-	// omit this wheel from the eventual overlay.
-	if wheels["cozy-runtime"] != "0.0.3" { //cozy:allow distribution assertion, not executable access
-		t.Fatalf("local Runtime candidate was silently discarded: %+v", pack.DependencyWheels)
+	// The closed shared-base contract omits the local source candidate. Runtime
+	// validates the requirement against the actual base before installation.
+	if wheels["cozy-runtime"] != "" { //cozy:allow distribution assertion, not executable access
+		t.Fatalf("platform-owned Runtime candidate entered the overlay: %+v", pack.DependencyWheels)
 	}
 
 	writePublishProject(t, a, "local-a", "1.0.0", []string{"local-b>=3"},
-		"local-b = { workspace = true }\n", true)
+		"local-b = { path = \"../local-b\" }\n", true)
 	if incompatible, problem := preparePublishPackage(a); problem == nil || problem.Name != "local_dependency_version_incompatible" {
 		if incompatible != nil {
 			incompatible.Close()
@@ -427,7 +423,7 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 
 	writePublishProject(t, a, "local-a", "1.0.0",
 		[]string{"local-b[images]>=2,<3"},
-		"local-b = { workspace = true }\n", true)
+		"local-b = { path = \"../local-b\" }\n", true)
 	writePublishProject(t, c, "local-c", "3.0.0", []string{"local-a==1.0.0"},
 		"local-a = { path = \"../local-a\" }\n", false)
 	if cycle, problem := preparePublishPackage(a); problem == nil || problem.Name != "local_dependency_cycle" {
@@ -501,6 +497,128 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 	}
 }
 
+func TestPackagePublishDownloadsLockedRegistryDependency(t *testing.T) {
+	project := copyRegistryDependencyFixture(t)
+	pack, problem := preparePublishPackage(project)
+	if problem != nil {
+		t.Fatalf("%s: %s", problem.Message, problem.Remedy)
+	}
+	defer pack.Close()
+	if len(pack.DependencyWheels) != 1 {
+		t.Fatalf("registry dependency wheel count = %d, want 1", len(pack.DependencyWheels))
+	}
+	dependency, problem := wheel.InspectIdentity(pack.DependencyWheels[0].Path)
+	fatal(t, problem)
+	if dependency.Distribution != "humanize" || dependency.Version != "4.13.0" ||
+		!strings.HasSuffix(dependency.Filename, "-py3-none-any.whl") {
+		t.Fatalf("registry dependency identity = %+v", dependency)
+	}
+
+	venv := filepath.Join(t.TempDir(), "venv")
+	python, err := exec.LookPath("python3")
+	must(t, err)
+	command := exec.Command("uv", "venv", "--no-project", "--python", python, venv)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create offline-install proof venv: %v\n%s", err, output)
+	}
+	venvPython := filepath.Join(venv, "bin", "python")
+	command = exec.Command("uv", "pip", "install", "--python", venvPython, "--offline", "--no-index",
+		"--no-deps", pack.Wheel, pack.DependencyWheels[0].Path)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("offline exact-wheel install: %v\n%s", err, output)
+	}
+	command = exec.Command(venvPython, "-I", "-c",
+		"from registry_dependency_proof import marco; assert marco('marco') == 'polo'")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("offline-installed package callable: %v\n%s", err, output)
+	}
+}
+
+func TestPackagePublishRefusesUnsupportedRegistryDependencyLocks(t *testing.T) {
+	cases := []struct {
+		name, old, replacement, code string
+	}{
+		{
+			name:        "changed hash",
+			old:         "b810820b31891813b1673e8fec7f1ed3312061eab2f26e3fa192c393d11ed25f",
+			replacement: "a810820b31891813b1673e8fec7f1ed3312061eab2f26e3fa192c393d11ed25f",
+			code:        "registry_dependency_identity_mismatch",
+		},
+		{
+			name:        "foreign origin",
+			old:         "https://files.pythonhosted.org/packages/1e/c7/316e7ca04d26695ef0635dc81683d628350810eb8e9b2299fc08ba49f366/",
+			replacement: "https://packages.example.invalid/",
+			code:        "registry_dependency_origin_refused",
+		},
+		{
+			name: "alternate index", old: `registry = "https://pypi.org/simple"`,
+			replacement: `registry = "https://packages.example.invalid/simple"`,
+			code:        "registry_dependency_index_refused",
+		},
+		{
+			name: "native only", old: "humanize-4.13.0-py3-none-any.whl",
+			replacement: "humanize-4.13.0-cp312-cp312-manylinux_2_28_x86_64.whl",
+			code:        "registry_dependency_native_only",
+		},
+		{
+			name:        "source only",
+			old:         "wheels = [\n    { url = \"https://files.pythonhosted.org/packages/1e/c7/316e7ca04d26695ef0635dc81683d628350810eb8e9b2299fc08ba49f366/humanize-4.13.0-py3-none-any.whl\", hash = \"sha256:b810820b31891813b1673e8fec7f1ed3312061eab2f26e3fa192c393d11ed25f\", size = 128869, upload-time = \"2025-08-25T09:39:18.54Z\" },\n]\n",
+			replacement: "", code: "registry_dependency_source_only",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			project := copyRegistryDependencyFixture(t)
+			mutateFixtureFile(t, filepath.Join(project, "uv.lock"), tc.old, tc.replacement)
+			pack, problem := preparePublishPackage(project)
+			if pack != nil {
+				pack.Close()
+			}
+			if problem == nil || problem.Name != tc.code {
+				t.Fatalf("registry dependency refusal = %v, want %s", problem, tc.code)
+			}
+		})
+	}
+
+	t.Run("lock drift", func(t *testing.T) {
+		project := copyRegistryDependencyFixture(t)
+		mutateFixtureFile(t, filepath.Join(project, "pyproject.toml"),
+			"humanize==4.13.0", "humanize==4.12.0")
+		pack, problem := preparePublishPackage(project)
+		if pack != nil {
+			pack.Close()
+		}
+		if problem == nil || problem.Name != "registry_dependency_lock_drift" {
+			t.Fatalf("lock drift refusal = %v", problem)
+		}
+	})
+}
+
+func copyRegistryDependencyFixture(t *testing.T) string {
+	t.Helper()
+	target := t.TempDir()
+	must(t, os.CopyFS(target, os.DirFS(filepath.Join("testdata", "registry-dependency"))))
+	runtimeFixture := target + "-cozy-runtime"
+	writeRuntimeFixture(t, runtimeFixture)
+	project := filepath.Join(target, "pyproject.toml")
+	raw, err := os.ReadFile(project)
+	must(t, err)
+	raw = []byte(strings.ReplaceAll(string(raw), "__COZY_RUNTIME_FIXTURE__", runtimeFixture))
+	must(t, os.WriteFile(project, raw, 0o644))
+	lockPublishProject(t, target)
+	return target
+}
+
+func mutateFixtureFile(t *testing.T, path, old, replacement string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	must(t, err)
+	if strings.Count(string(raw), old) != 1 {
+		t.Fatalf("fixture mutation target occurs %d times in %s", strings.Count(string(raw), old), path)
+	}
+	must(t, os.WriteFile(path, []byte(strings.Replace(string(raw), old, replacement, 1)), 0o644))
+}
+
 func preparePublishPackage(root string) (*packagepublish.Package, *exit.Error) {
 	pack, problem := packagepublish.PrepareFrom(root)
 	if problem != nil {
@@ -513,14 +631,42 @@ func preparePublishPackage(root string) (*packagepublish.Package, *exit.Error) {
 	return pack, nil
 }
 
+func lockPublishProject(t *testing.T, root string) {
+	t.Helper()
+	_ = os.Remove(filepath.Join(root, "uv.lock"))
+	command := exec.Command("uv", "lock", "--directory", root)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("lock publish fixture: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(filepath.Join(root, "uv.lock")); err == nil {
+		return
+	}
+	t.Fatal("uv lock produced no fixture-local lock file")
+}
+
 func writePublishProject(t *testing.T, root, name, version string, dependencies []string, sources string, publishable bool) {
 	t.Helper()
 	if dependencies == nil {
 		dependencies = []string{}
 	}
+	if publishable {
+		hasRuntime := false
+		for _, dependency := range dependencies {
+			hasRuntime = hasRuntime || strings.HasPrefix(dependency, "cozy-runtime") //cozy:allow distribution fixture, not executable access
+		}
+		if !hasRuntime {
+			dependencies = append(dependencies, "cozy-runtime==0.0.11")
+		}
+		if !strings.Contains(sources, "cozy-runtime =") {
+			runtimeFixture := root + "-cozy-runtime"
+			writeRuntimeFixture(t, runtimeFixture)
+			sources += fmt.Sprintf("cozy-runtime = { path = %q, editable = true }\n", runtimeFixture)
+		}
+	}
 	must(t, os.MkdirAll(filepath.Join(root, strings.ReplaceAll(name, "-", "_")), 0o755))
-	must(t, os.WriteFile(filepath.Join(root, strings.ReplaceAll(name, "-", "_"), "__init__.py"),
-		[]byte("VALUE = 1\n"), 0o644))
+	module := strings.ReplaceAll(name, "-", "_")
+	body := "VALUE = 1\n"
+	must(t, os.WriteFile(filepath.Join(root, module, "__init__.py"), []byte(body), 0o644))
 	dependencyJSON, err := json.Marshal(dependencies)
 	must(t, err)
 	document := fmt.Sprintf(`[build-system]
@@ -541,10 +687,35 @@ module-root = ""
 	if publishable {
 		document += "\n[tool.cozy]\norganization = \"proof\"\n"
 		must(t, os.WriteFile(filepath.Join(root, "package.toml"), []byte(
-			"[application]\nobject = \""+strings.ReplaceAll(name, "-", "_")+":app\"\n"), 0o644))
+			"[application]\nobject = \""+module+":app\"\n"), 0o644))
 		must(t, os.WriteFile(filepath.Join(root, "uv.lock"), []byte("version = 1\n"), 0o644))
 	}
 	must(t, os.WriteFile(filepath.Join(root, "pyproject.toml"), []byte(document), 0o644))
+}
+
+func writeRuntimeFixture(t *testing.T, root string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(root, "pyproject.toml")); err == nil {
+		return
+	}
+	must(t, os.MkdirAll(filepath.Join(root, "cozy_runtime"), 0o755))
+	must(t, os.WriteFile(filepath.Join(root, "pyproject.toml"), []byte(`[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
+[project]
+name = "cozy-runtime" # //cozy:allow distribution fixture, not executable access
+version = "0.0.11"
+[project.scripts]
+cozy-runtime = "cozy_runtime:main" # //cozy:allow isolated fake console script
+[tool.uv.build-backend]
+module-root = ""
+`), 0o644))
+	must(t, os.WriteFile(filepath.Join(root, "cozy_runtime", "__init__.py"), []byte(`import json, pathlib, sys, tomllib
+def main():
+    root = pathlib.Path(sys.argv[sys.argv.index("--dir") + 1])
+    application = tomllib.loads((root / "package.toml").read_text())["application"]["object"]
+    print(json.dumps({"application": application, "entrypoints": [{"name": "proof", "request": {"fields": []}, "result": {"fields": []}}], "format": "cozy.package.descriptor/1", "jobs": [], "model_productions": []}, separators=(",", ":"), sort_keys=True))
+`), 0o644))
 }
 
 func appendProjectTOML(t *testing.T, root, document string) {
@@ -727,6 +898,22 @@ esac
 		if !strings.Contains(document.GPUs[0], want) {
 			t.Fatalf("up GPU summary omitted %q: %s", want, document.GPUs[0])
 		}
+	}
+}
+
+func TestUpDoesNotRequireLocalRuntime(t *testing.T) {
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "up-without-local-runtime")
+	must(t, os.RemoveAll(root))
+	env := childEnv(t, root, "PATH="+t.TempDir())
+	t.Cleanup(func() { _ = runCozyEnv(env, "down", "--all") })
+
+	result := runCozyEnv(env, "up", "--json", "--full")
+	if result.code != 0 {
+		t.Fatalf("remote-capable daemon required a local Runtime [exit %d]\n%s",
+			result.code, result.output)
+	}
+	if _, err := os.Stat(filepath.Join(root, "local-base.json")); !os.IsNotExist(err) {
+		t.Fatalf("up created local package state without a local install: %v", err)
 	}
 }
 

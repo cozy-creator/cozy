@@ -98,9 +98,10 @@ type Resolver interface {
 	RefreshEditable(pkg string) (installID string, editable, changed bool, problem *exit.Error)
 	ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error)
 	ResolveInstall(installID string) (orchestrator.WorkerLaunchSpec, *exit.Error)
-	ResolveLogicalInstall(installID, function string) (orchestrator.LogicalPackage, *exit.Error)
+	ResolveRemoteRelease(pkg, release, digest, function string, models []orchestrator.ModelRef) (
+		orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error)
+	ResolveRemoteJob(pkg, release, digest, function string) (orchestrator.LogicalJob, *exit.Error)
 	Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error)
-	RemoteEntrypoint(installID, name string) (*launch.Entrypoint, *exit.Error)
 	// Jobs names the `@job` functions one installed package registers, with the
 	// descriptor id each resolves to. The job submit route resolves a function to its
 	// digest through this and never lets a client name one (cl-004).

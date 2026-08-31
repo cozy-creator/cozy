@@ -43,7 +43,6 @@ type Resolver struct {
 	// seam cl-020's verified control manifest will populate without a local venv.
 	placements map[string]orchestrator.DesiredPlacement
 	catalog    *hub.Client
-	published  map[string]*launch.PackageDescriptor
 	// Devices is the device envelope a worker this host launches may SEE.
 	Devices []string
 }
@@ -147,7 +146,6 @@ func NewResolver(store *records.Store, cfg config.Config) *Resolver {
 		cache:      map[string]orchestrator.WorkerLaunchSpec{},
 		placements: map[string]orchestrator.DesiredPlacement{},
 		catalog:    hub.New(cfg, "cozy-daemon"),
-		published:  map[string]*launch.PackageDescriptor{},
 		Devices:    []string{"0"},
 	}
 }
@@ -217,48 +215,162 @@ func (r *Resolver) ResolveInstall(installID string) (orchestrator.WorkerLaunchSp
 	return facts.Spec(r.Devices)
 }
 
-func (r *Resolver) ResolveLogicalInstall(installID, function string) (orchestrator.LogicalPackage, *exit.Error) {
-	install, e := r.installRecord(installID)
-	if e != nil {
-		return orchestrator.LogicalPackage{}, e
+func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function string,
+	models []orchestrator.ModelRef,
+) (
+	orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error,
+) {
+	var empty orchestrator.LogicalPackage
+	if _, err := canonical.Raw(releaseDigest); err != nil || release == "" {
+		return empty, nil, exit.Named(exit.Structural, "rental.package_release_digest_invalid",
+			"remote package release identity is incomplete")
 	}
-	descriptor, e := r.publishedDescriptor(install)
-	if e != nil {
-		return orchestrator.LogicalPackage{}, e
+	ref, problem := hub.ParseRef(pkg)
+	if problem != nil {
+		return empty, nil, problem
 	}
-	entrypoint, e := descriptor.Function(function)
-	if e != nil {
-		return orchestrator.LogicalPackage{}, e
+	ctx, cancel := hub.Context()
+	defer cancel()
+	detail, problem := r.catalog.PackageRelease(ctx, ref, release)
+	if problem != nil {
+		return empty, nil, problem
 	}
-	if len(descriptor.Entrypoints) != 1 || len(entrypoint.Models) != 0 {
-		return orchestrator.LogicalPackage{}, exit.Named(exit.Unavailable,
-			"rental.logical_package_unsupported",
-			"private package_set currently admits one weightless entrypoint and no model slots")
+	if detail.Release.Release != release || detail.Release.ReleaseDigest != releaseDigest ||
+		detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
+		return empty, nil, exit.Named(exit.Conflict, "rental.package_release_changed",
+			"Tensorhub release %s@%s does not match the queued immutable release", pkg, release)
+	}
+	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
+	if problem != nil {
+		return empty, nil, problem
+	}
+	if descriptor.Digest != detail.Release.PackageDescriptorDigest {
+		return empty, nil, exit.Named(exit.Conflict, "rental.package_descriptor_digest_mismatch",
+			"Tensorhub descriptor bytes do not match their release fact")
+	}
+	entrypoint, problem := descriptor.Function(function)
+	if problem != nil {
+		return empty, nil, problem
+	}
+	if len(entrypoint.Models) > 0 && len(descriptor.Entrypoints) != 1 {
+		return empty, nil, exit.Named(exit.Unavailable, "rental.modeled_package_surface_unsupported",
+			"the first modeled rental lane requires one serving entrypoint so its worker-derived binding is unambiguous")
+	}
+	models = append([]orchestrator.ModelRef(nil), models...)
+	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
+	if len(models) != len(entrypoint.Models) {
+		return empty, nil, exit.Named(exit.Validation, "rental.model_selection_incomplete",
+			"%s requires exactly one model for each of its %d slots", function, len(entrypoint.Models))
+	}
+	bySlot := make(map[string]orchestrator.ModelRef, len(models))
+	for _, model := range models {
+		if _, exists := bySlot[model.Slot]; exists {
+			return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
+				"model slot %s was selected more than once", model.Slot)
+		}
+		bySlot[model.Slot] = model
+	}
+	for _, slot := range entrypoint.Models {
+		model, selected := bySlot[slot.Path]
+		if model.Package != pkg || model.Slot != slot.Path || model.Release == "" {
+			return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
+				"model selection does not bind exact slot %s", slot.Path)
+		}
+		if !selected {
+			return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
+				"model selection does not bind exact slot %s", slot.Path)
+		}
+		if len(slot.Stamps) != 0 {
+			return empty, nil, exit.Named(exit.Unavailable, "rental.model_stamps_unsupported",
+				"model slot %s uses unsupported stamps", slot.Path)
+		}
+		if _, problem := hub.ParseRef(model.Model); problem != nil {
+			return empty, nil, problem
+		}
+		if _, err := canonical.Raw(model.Manifest); err != nil {
+			return empty, nil, exit.Named(exit.Validation, "rental.model_manifest_invalid",
+				"model selection for %s has no exact manifest", slot.Path)
+		}
+	}
+	planID := ""
+	if len(models) == 0 {
+		body, err := canonical.Write(map[string]canonical.Value{
+			"name": function, "slots": []canonical.Value{},
+		})
+		if err != nil {
+			return empty, nil, exit.Internalf("cannot derive remote binding identity: %s", err)
+		}
+		planID, err = canonical.Spell(canonical.Digest(body))
+		if err != nil {
+			return empty, nil, exit.Internalf("cannot spell remote binding identity: %s", err)
+		}
 	}
 	return orchestrator.LogicalPackage{
-		Package: install.Package, Release: install.Version, ReleaseDigest: install.SourceDigest,
-		InstallID: install.ID, Function: function,
-		Outputs: launch.AssetPaths(entrypoint.Result),
+		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
+		Function: function, Outputs: launch.AssetPaths(entrypoint.Result), PlanID: planID,
+		Models: models,
+	}, entrypoint, nil
+}
+
+func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string) (
+	orchestrator.LogicalJob, *exit.Error,
+) {
+	var empty orchestrator.LogicalJob
+	if _, err := canonical.Raw(releaseDigest); err != nil || release == "" {
+		return empty, exit.Named(exit.Structural, "rental.package_release_digest_invalid",
+			"remote package release identity is incomplete")
+	}
+	ref, problem := hub.ParseRef(pkg)
+	if problem != nil {
+		return empty, problem
+	}
+	ctx, cancel := hub.Context()
+	defer cancel()
+	detail, problem := r.catalog.PackageRelease(ctx, ref, release)
+	if problem != nil {
+		return empty, problem
+	}
+	if detail.Release.Release != release || detail.Release.ReleaseDigest != releaseDigest ||
+		detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
+		return empty, exit.Named(exit.Conflict, "rental.package_release_changed",
+			"Tensorhub release %s@%s does not match the queued immutable release", pkg, release)
+	}
+	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
+	if problem != nil || descriptor.Digest != detail.Release.PackageDescriptorDigest {
+		return empty, exit.Named(exit.Conflict, "rental.package_descriptor_digest_mismatch",
+			"Tensorhub descriptor bytes do not match their release fact")
+	}
+	job, problem := descriptor.Function(function)
+	if problem != nil {
+		return empty, problem
+	}
+	if job.Kind != "job" || job.DescriptorID == "" {
+		return empty, exit.Named(exit.Validation, "rental.job_descriptor_invalid",
+			"%s is not a published job callable", function)
+	}
+	if len(job.Models) > 0 {
+		return empty, exit.Named(exit.Unavailable, "rental.modeled_job_unsupported",
+			"remote job %s declares model slots", function)
+	}
+	artifacts := make([]orchestrator.ArtifactOutput, 0, len(job.ArtifactOutputs))
+	outputs := launch.AssetPaths(job.Result)
+	for _, output := range job.ArtifactOutputs {
+		artifacts = append(artifacts, orchestrator.ArtifactOutput{
+			OutputID: output.OutputID, MimeType: output.MimeType, MaxBytes: output.MaxBytes,
+		})
+		outputs = append(outputs, output.OutputID)
+	}
+	return orchestrator.LogicalJob{
+		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
+		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
+		ArtifactOutputs: artifacts, GPUCount: job.Resources.GPUCount,
 	}, nil
 }
 
-// Entrypoint returns one exact install's verified request/result schema.
 func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error) {
-	_, descriptor, e := r.installDescriptor(installID)
-	if e != nil {
-		return nil, e
-	}
-	return descriptor.Function(name)
-}
-
-func (r *Resolver) RemoteEntrypoint(installID, name string) (*launch.Entrypoint, *exit.Error) {
-	install, e := r.installRecord(installID)
-	if e != nil {
-		return nil, e
-	}
-	descriptor, e := r.publishedDescriptor(install)
-	if e != nil {
-		return nil, e
+	_, descriptor, problem := r.installDescriptor(installID)
+	if problem != nil {
+		return nil, problem
 	}
 	return descriptor.Function(name)
 }
@@ -287,64 +399,6 @@ func (r *Resolver) installDescriptor(installID string) (*records.PackageInstall,
 		return nil, nil, e
 	}
 	return install, descriptor, nil
-}
-
-func (r *Resolver) publishedDescriptor(install *records.PackageInstall) (*launch.PackageDescriptor,
-	*exit.Error) {
-	r.mu.Lock()
-	descriptor := r.published[install.SourceDigest]
-	r.mu.Unlock()
-	if descriptor != nil {
-		return descriptor, nil
-	}
-	descriptor, problem := publishedPackageDescriptor(r.catalog, install)
-	if problem != nil {
-		return nil, problem
-	}
-	r.mu.Lock()
-	r.published[install.SourceDigest] = descriptor
-	r.mu.Unlock()
-	return descriptor, nil
-}
-
-func publishedPackageDescriptor(c *hub.Client,
-	install *records.PackageInstall) (*launch.PackageDescriptor, *exit.Error) {
-	if install.SourceKind != "tensorhub" || !install.Verified {
-		return nil, exit.Named(exit.Unavailable, "rental.package_release_unpublished",
-			"private package_set requires an immutable Tensorhub package release")
-	}
-	if _, err := canonical.Raw(install.SourceDigest); err != nil {
-		return nil, exit.Named(exit.Structural, "rental.package_release_digest_invalid",
-			"installed package %s has no valid immutable release digest", install.Package)
-	}
-	ref, problem := hub.ParseRef(install.Package)
-	if problem != nil {
-		return nil, problem
-	}
-	ctx, cancel := hub.Context()
-	defer cancel()
-	detail, problem := c.PackageRelease(ctx, ref, install.Version)
-	if problem != nil {
-		return nil, problem
-	}
-	if detail.Release.Release != install.Version || detail.Release.ReleaseDigest != install.SourceDigest {
-		return nil, exit.Named(exit.Conflict, "rental.package_release_changed",
-			"Tensorhub release %s@%s does not match the installed immutable release pin",
-			install.Package, install.Version)
-	}
-	if detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
-		return nil, exit.Named(exit.Conflict, "rental.package_descriptor_length_mismatch",
-			"Tensorhub descriptor length does not match its release fact")
-	}
-	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
-	if problem != nil {
-		return nil, problem
-	}
-	if descriptor.Digest != detail.Release.PackageDescriptorDigest {
-		return nil, exit.Named(exit.Conflict, "rental.package_descriptor_digest_mismatch",
-			"Tensorhub descriptor bytes do not match their release fact")
-	}
-	return descriptor, nil
 }
 
 func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {

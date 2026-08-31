@@ -1,6 +1,6 @@
 package hub
 
-// Typed package release/profile routes.
+// Typed package publication and download routes.
 
 import (
 	"context"
@@ -25,10 +25,8 @@ type PackageReleaseDraft struct {
 }
 
 type PackageReleaseCommit struct {
-	State              string `json:"state"`
-	ReleaseDigest      string `json:"release_digest"`
-	QualificationState string `json:"qualification_state"`
-	QualificationError string `json:"qualification_error,omitempty"`
+	State         string `json:"state"`
+	ReleaseDigest string `json:"release_digest"`
 }
 
 type PackageReleaseYank struct {
@@ -54,32 +52,22 @@ type PackageReleaseDetail struct {
 }
 
 type PackageInstallDownload struct {
-	Digest string `json:"digest"`
-	Kind   string `json:"kind"`
-	Length int64  `json:"length"`
-	Path   string `json:"path"`
-	URL    string `json:"url"`
+	Digest       string   `json:"digest"`
+	Distribution string   `json:"distribution"`
+	ImportRoots  []string `json:"import_roots"`
+	Kind         string   `json:"kind"`
+	Length       int64    `json:"length"`
+	Path         string   `json:"path"`
+	Tags         []string `json:"tags"`
+	URL          string   `json:"url"`
+	Version      string   `json:"version"`
 }
 
 type PackageDownloadPlan struct {
-	Release            string                   `json:"release"`
-	Profile            string                   `json:"profile"`
-	PlacementSet       ExactDocument            `json:"placement_set"`
-	PackageDescriptor  ExactDocument            `json:"package_descriptor"`
-	Qualification      ExactDocument            `json:"qualification"`
-	EnvironmentReceipt ExactDocument            `json:"environment_receipt"`
-	WheelhouseManifest ExactDocument            `json:"wheelhouse_manifest"`
-	Downloads          []PackageInstallDownload `json:"downloads"`
-}
-
-// PackageInstallTarget carries only measured local compatibility facts. Tensorhub
-// remains the authority that ranks qualified profiles and returns one exact selection.
-type PackageInstallTarget struct {
-	Accelerator       string `json:"accelerator"`
-	OS                string `json:"os"`
-	Arch              string `json:"arch"`
-	DriverCUDA        string `json:"driver_cuda"`
-	ComputeCapability string `json:"compute_capability"`
+	Downloads         []PackageInstallDownload `json:"downloads"`
+	PackageDescriptor ExactDocument            `json:"package_descriptor"`
+	Release           string                   `json:"release"`
+	ReleaseDigest     string                   `json:"release_digest"`
 }
 
 func packageReleasePath(ref Ref, release string) string {
@@ -123,20 +111,8 @@ func (c *Client) PackageRelease(ctx context.Context, ref Ref,
 	return out, e
 }
 
-func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string,
-	target PackageInstallTarget,
-) (PackageDownloadPlan, *exit.Error) {
+func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string) (PackageDownloadPlan, *exit.Error) {
 	var out PackageDownloadPlan
-	if target.OS == "" || target.Arch == "" ||
-		(target.Accelerator != "cpu" && target.Accelerator != "nvidia") ||
-		target.Accelerator == "cpu" && (target.DriverCUDA != "" || target.ComputeCapability != "") ||
-		target.Accelerator == "nvidia" && (target.DriverCUDA == "" || target.ComputeCapability == "") {
-		return out, exit.Internalf("package install target is incomplete or contradictory")
-	}
-	body := struct {
-		Capability      PackageInstallTarget `json:"capability"`
-		ModelSelections []ModelSelection     `json:"model_selections"`
-	}{Capability: target, ModelSelections: []ModelSelection{}}
 	query := url.Values{}
 	if release != "" {
 		query.Set("release", release)
@@ -146,7 +122,7 @@ func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string,
 		path += "?" + query.Encode()
 	}
 	e := c.do(ctx, call{method: http.MethodPost,
-		path: path, body: body, strict: true,
+		path: path, body: struct{}{}, strict: true,
 		responseBytes: 16 << 20}, &out)
 	return out, e
 }

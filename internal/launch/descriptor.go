@@ -22,6 +22,7 @@ package launch
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,23 +44,25 @@ const descriptorFormat = "cozy.package.descriptor/1"
 // PackageDescriptor is the closed PackageDescriptor/1 this host reads. Unknown fields refuse;
 // Raw is normalized canonical JSON for control-plane transport and semantic identity.
 type PackageDescriptor struct {
-	Format      string          `json:"format"`
-	Application string          `json:"application"`
-	Entrypoints []Entrypoint    `json:"entrypoints"`
-	Jobs        []Entrypoint    `json:"jobs"`
-	Digest      string          `json:"-"`
-	Raw         json.RawMessage `json:"-"`
+	Format           string            `json:"format"`
+	Application      string            `json:"application"`
+	Entrypoints      []Entrypoint      `json:"entrypoints"`
+	Jobs             []Entrypoint      `json:"jobs"`
+	ModelProductions []json.RawMessage `json:"model_productions"`
+	Digest           string            `json:"-"`
+	Raw              json.RawMessage   `json:"-"`
 }
 
 // Entrypoint is one callable surface: its request schema, its declared model slots, and
 // its result shape.
 type Entrypoint struct {
-	Name      string `json:"name"`
-	Kind      string `json:"-"`
-	Models    []Slot `json:"models"`
-	Request   Struct `json:"request"`
-	Result    Struct `json:"result"`
-	Publishes bool   `json:"publishes"`
+	Name         string `json:"name"`
+	Kind         string `json:"-"`
+	DescriptorID string `json:"-"`
+	Models       []Slot `json:"models"`
+	Request      Struct `json:"request"`
+	Result       Struct `json:"result"`
+	Publishes    bool   `json:"publishes"`
 	// ArtifactOutputs is the job's explicit ArtifactSink slot set. It is separate from
 	// result asset fields because worker-protocol rev5 OutputBinding has no kind.
 	ArtifactOutputs []ArtifactOutput `json:"artifact_outputs"`
@@ -174,9 +177,17 @@ func exactKeys(raw json.RawMessage, required, optional []string) (map[string]jso
 }
 
 func validateClosedDescriptor(data []byte) error {
-	root, err := exactKeys(data, []string{"application", "entrypoints", "format", "jobs"}, nil)
+	root, err := exactKeys(data,
+		[]string{"application", "entrypoints", "format", "jobs", "model_productions"}, nil)
 	if err != nil {
 		return err
+	}
+	var productions []json.RawMessage
+	if err := json.Unmarshal(root["model_productions"], &productions); err != nil {
+		return fmt.Errorf("model_productions must be an array")
+	}
+	if len(productions) != 0 {
+		return fmt.Errorf("model_productions must remain empty until Creator implements its production contract")
 	}
 	for collection, kind := range map[string]string{"entrypoints": "entrypoint", "jobs": "job"} {
 		var rows []json.RawMessage
@@ -446,6 +457,12 @@ func DecodeDescriptor(data []byte) (*PackageDescriptor, *exit.Error) {
 	if d.Format != descriptorFormat || d.Application == "" {
 		return nil, exit.New(exit.Validation, "%s format/application is invalid", DescriptorFile)
 	}
+	var raw struct {
+		Jobs []json.RawMessage `json:"jobs"`
+	}
+	if err := json.Unmarshal(normalized, &raw); err != nil || len(raw.Jobs) != len(d.Jobs) {
+		return nil, exit.New(exit.Validation, "%s carries invalid job rows", DescriptorFile)
+	}
 	for i := range d.Entrypoints {
 		d.Entrypoints[i].Kind = "entrypoint"
 		if problem := validateEntrypoint(&d.Entrypoints[i]); problem != nil {
@@ -454,6 +471,11 @@ func DecodeDescriptor(data []byte) (*PackageDescriptor, *exit.Error) {
 	}
 	for i := range d.Jobs {
 		d.Jobs[i].Kind = "job"
+		digest := sha256.Sum256(append([]byte("cozy.runtime.job-descriptor\x00"), raw.Jobs[i]...))
+		d.Jobs[i].DescriptorID, err = canonical.Spell(digest[:])
+		if err != nil {
+			return nil, exit.Internalf("cannot spell job descriptor id: %s", err)
+		}
 		if problem := validateEntrypoint(&d.Jobs[i]); problem != nil {
 			return nil, problem
 		}

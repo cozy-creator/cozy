@@ -124,7 +124,9 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	f.snapshotSent.Store(true)
 	f.say("WorkerSnapshot %s sent (%d B); admission is CLOSED until the ack", snapshotID, len(bodyBytes))
 
-	observed := func(revision uint64, placementID string, setDigest []byte, planIDs []string) {
+	observed := func(revision uint64, placementID string, setDigest []byte, planIDs []string,
+		packageRevision, environmentDigest, configDigest string,
+	) {
 		r := &pb.ObservedWorkerState{
 			AcceptedDesiredStateRevision: revision, ConvergedRevision: revision,
 			AcceptedPlacementSetDigest: setDigest,
@@ -146,7 +148,10 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				Materialization:    pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
 				Serving:            pb.ServingState_SERVING_STATE_DISPATCHABLE,
 				ExecutorGeneration: 1, DispatchableBindingDigests: bindingDigests,
-				PlacementSetDigest: setDigest,
+				PlacementSetDigest:    setDigest,
+				PackageRevisionDigest: packageRevision,
+				EnvironmentDigest:     environmentDigest,
+				ConfigDigest:          configDigest,
 			}}
 		}
 		env(func(e, g uint64, b string) {
@@ -187,6 +192,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 		case *pb.RecordOwnerFrame_DesiredState:
 			d := m.DesiredState
 			placementID, planIDs, setDigest := "", []string(nil), []byte(nil)
+			packageRevision, environmentDigest, configDigest := "", "", ""
 			if ds := d.GetPlacementSet(); ds != nil {
 				// THE BYTES ARE THE SET. Recompute BEFORE parsing a single field — a
 				// mismatch is a typed refusal with the desired state UNAPPLIED.
@@ -203,6 +209,10 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				}
 				for _, p := range doc.List("placements") {
 					placementID = p.Str("placement_id")
+					packageRevision = p.Sub("package").Str("release_digest")
+					environmentDigest = p.Str("environment_digest")
+					emptyConfig, _ := canonical.Write(map[string]canonical.Value{})
+					configDigest, _ = canonical.Spell(canonical.Digest(emptyConfig))
 					for _, entrypoint := range p.List("entrypoints") {
 						planIDs = append(planIDs, entrypoint.Str("entrypoint_binding_digest"))
 					}
@@ -210,7 +220,8 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			}
 			f.say("DesiredWorkerState revision=%d placement=%s plans=%d", d.Revision,
 				placementID, len(planIDs))
-			observed(d.Revision, placementID, setDigest, planIDs)
+			observed(d.Revision, placementID, setDigest, planIDs,
+				packageRevision, environmentDigest, configDigest)
 		case *pb.RecordOwnerFrame_AttemptOffer:
 			offer := m.AttemptOffer
 			f.say("AttemptOffer %s#%d placement=%s admission=%d", offer.RequestId,

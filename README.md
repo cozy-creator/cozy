@@ -72,8 +72,7 @@ local-only editable install after a bounded source scan. Every invocation checks
 a change atomically prepares a new generation and restarts stale execution state. A failed refresh
 keeps the last good generation pinned and refuses the invocation. Editable installs are neither
 published releases nor rentable deployments. Model bindings resolve the exact release and lane
-declared in `package.toml` from the local TensorFS store; they never synthesize Hub qualification
-or release records.
+declared in `package.toml` from the local TensorFS store; they never synthesize Hub release records.
 
 Remove local package generations with:
 
@@ -95,9 +94,9 @@ wheels in the same publication, including local dependencies activated through r
 It first asks Tensorhub whether the release is already committed, so a replay skips all wheel
 builds and uploads. Builds and uploads stop when they repeatedly make no byte progress; uploads run
 at no more than 16 files concurrently.
-Creator does not guess which names a base worker image owns: it uploads local candidates, and
-Tensorhub's exact per-profile inventory chooses a compatible base distribution instead of overlaying
-it. Tensorhub resolves indexed requirements and freezes their exact wheels. Development dependency
+Creator uses the common base inventory only to prune platform-owned roots from its locked export.
+It uploads exact pure-Python registry and local dependency wheels; the actual worker rejects base
+shadowing or an unsatisfied requirement before importing the package. Development dependency
 groups are not published. The package name and
 release come from `[project]`; `[tool.cozy]` supplies the Tensorhub organization:
 
@@ -200,13 +199,11 @@ rentals stop only through `cozy rental end`.
 
 Rental creation sends only the SKU and introduction credential material—never a package, model,
 request, profile, image, or placement. Tensorhub readiness means the worker location and TLS identity
-are attachable. Creator then claims that worker directly and sends a signed empty `package_set`; no
-WorkerControl frame is relayed through Tensorhub. A pinned weightless package release is queued as
-the logical `{package,release,release_digest}` ref, signed, and sent in `package_set`; Creator learns
-the derived placement/binding and exact invocation identities from the worker's existing
+are attachable. Creator then claims that worker directly and sends signed exact package and model
+release refs; no WorkerControl frame is relayed through Tensorhub. Creator learns the derived
+placement/binding and exact invocation identities from the worker's existing
 observed-state stream before dispatch. Tensorhub's exact release descriptor validates request/result
-shape; Creator never supplies a remote profile, CUDA choice, qualification, wheel closure, or
-PlacementSet. Model-bound packages remain deferred.
+shape; Creator never supplies a remote profile, CUDA choice, or precomputed PlacementSet.
 
 Each rental has one local Ed25519 Creator key and one separate media bearer. Both credentials are
 removed when the rental ends, and a lost Creator key requires a new rental.

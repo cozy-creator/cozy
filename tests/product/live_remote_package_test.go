@@ -97,27 +97,20 @@ func TestLiveRemoteMarcoPolo(t *testing.T) {
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	defer store.Close()
-	_, problem = store.Activate(records.PackageInstall{
-		ID: "live-marco", Package: live.Package, Major: 1, Version: detail.Release.Release,
-		SourceKind: "tensorhub", SourceRef: live.Package + "@" + detail.Release.Release,
-		SourceDigest: detail.Release.ReleaseDigest, Verified: true,
-		Dir: filepath.Join(root, "release-metadata"), LinkMode: "none",
-		PackageDescriptor: detail.Release.PackageDescriptorDigest,
-	})
-	fatal(t, problem)
 	connection := &orchestrator.WorkerConnection{
 		RentalID: live.RentalID, Addr: live.WorkerAddr, CACert: layout.RentalCert(live.RentalID),
 		WorkerID: live.WorkerID, WorkerBootID: live.WorkerBootID,
 		Media: &media.Spec{Addr: live.MediaAddr, Token: secret.New(live.MediaToken),
 			CACert: resolve(live.MediaCertPEM)},
 	}
-	launcher := livePackageLauncher{logical: orchestrator.LogicalPackage{
-		Package: live.Package, Release: detail.Release.Release,
-		ReleaseDigest: detail.Release.ReleaseDigest, InstallID: "live-marco",
-		Function: "marco", Outputs: launch.AssetPaths(entrypoint.Result),
-	}}
+	bindingBytes, err := canonical.Write(map[string]canonical.Value{
+		"name": "marco", "slots": []canonical.Value{},
+	})
+	must(t, err)
+	planID, err := canonical.Spell(canonical.Digest(bindingBytes))
+	must(t, err)
 	owner, problem := orchestrator.Open(orchestrator.Options{
-		Cfg: config.Config{Home: root}, Layout: layout, Store: store, Packages: launcher, Log: os.Stderr,
+		Cfg: config.Config{Home: root}, Layout: layout, Store: store, Log: os.Stderr,
 		Rentals: func(id string) (*orchestrator.RemoteTarget, *exit.Error) {
 			if id != live.RentalID {
 				return nil, exit.New(exit.NotFound, "unknown live rental %s", id)
@@ -141,8 +134,9 @@ func TestLiveRemoteMarcoPolo(t *testing.T) {
 
 	requestID, _, problem := owner.Submit(orchestrator.Submission{
 		IdemKey: "live-marco-polo", Package: live.Package, Entrypoint: "marco",
-		Payload: []byte(`{"message":"marco"}`), Worker: live.RentalID, InstallID: "live-marco",
-		Outputs: launch.AssetPaths(entrypoint.Result),
+		Payload: []byte(`{"message":"marco"}`), Worker: live.RentalID,
+		Release: detail.Release.Release, ReleaseDigest: detail.Release.ReleaseDigest,
+		PlanID: planID, Outputs: launch.AssetPaths(entrypoint.Result),
 	})
 	fatal(t, problem)
 	result, problem := owner.AwaitSettled(requestID, 3*time.Minute)
@@ -171,31 +165,6 @@ func TestLiveRemoteMarcoPolo(t *testing.T) {
 		row.EnvironmentDigest == "" || row.ConfigDigest == "" {
 		t.Fatalf("live request did not pin worker-resolved invocation identity: %+v", row)
 	}
-}
-
-type livePackageLauncher struct{ logical orchestrator.LogicalPackage }
-
-func (l livePackageLauncher) ResolveLogicalInstall(installID, function string) (orchestrator.LogicalPackage, *exit.Error) {
-	if installID != l.logical.InstallID || function != l.logical.Function {
-		return orchestrator.LogicalPackage{}, exit.New(exit.NotFound, "unknown live package selection")
-	}
-	return l.logical, nil
-}
-
-func (livePackageLauncher) ResolvePlacement(string) (orchestrator.DesiredPlacement, *exit.Error) {
-	return orchestrator.DesiredPlacement{}, exit.Unavailablef("live proof resolves no local placement")
-}
-func (livePackageLauncher) Resolve(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
-	return orchestrator.WorkerLaunchSpec{}, exit.Unavailablef("live proof launches no local worker")
-}
-func (livePackageLauncher) ResolveInstall(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
-	return orchestrator.WorkerLaunchSpec{}, exit.Unavailablef("live proof launches no local install")
-}
-func (livePackageLauncher) ResolveJob(string, string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
-	return orchestrator.WorkerLaunchSpec{}, exit.Unavailablef("live proof runs no jobs")
-}
-func (livePackageLauncher) ResolveJobInstall(string, string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
-	return orchestrator.WorkerLaunchSpec{}, exit.Unavailablef("live proof runs no jobs")
 }
 
 func copyFile(t *testing.T, source, destination string, mode os.FileMode) {

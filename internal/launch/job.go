@@ -8,8 +8,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
-const gib = 1 << 30
-
 // THE JOB HALF of an installed generation (cl-004). A job is an attempt class on the one
 // machinery (cr-009), so this file mints exactly what the serving half mints — a local
 // plan record and the digest that names it — over the descriptor's `jobs` list instead of
@@ -25,7 +23,7 @@ const gib = 1 << 30
 // CPU-class here: the census-shaped work this host runs reads canonical headers and
 // derives projections, and a job that needs a card declares `gpu_count` on its own
 // surface, which the record below carries as a FLOOR.
-const jobRSSBudget = int64(8) * gib
+const jobRSSBudget = orchestrator.DefaultJobRSSCap
 
 // JobFacts is one resolved `@job` on an installed generation.
 type JobFacts struct {
@@ -78,7 +76,7 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}
 	cache := filepath.Join(f.Install.Dir, "artifact-cache")
-	overlays, err := filepath.Glob(filepath.Join(f.Install.Dir, "venv", "lib", "python*", "site-packages"))
+	overlays, err := filepath.Glob(filepath.Join(f.Install.Dir, "environment", "contents", "*", "site-packages"))
 	if err != nil || len(overlays) != 1 {
 		return orchestrator.WorkerLaunchSpec{}, nil, exit.Named(exit.Structural,
 			"package_overlay_missing", "installed package has no unique Python overlay")
@@ -105,7 +103,7 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 			"cap_micro_usd":               int64(0),
 			"reclaim_on_terminal":         true,
 		},
-		RSSCap: jobRSSBudget,
+		RSSCap: jobRSSBudget, GPUCount: facts.GPUCount,
 	}}
 	spec := orchestrator.WorkerLaunchSpec{
 		Placement: placement,
@@ -116,10 +114,9 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 		Devices:         devices,
 		GraceSec:        3,
 		ArtifactCache:   cache,
-		EnvironmentRoot: filepath.Join(f.Install.Dir, "venv"),
+		EnvironmentRoot: filepath.Join(f.Install.Dir, "environment"),
 		ArtifactStore:   filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
-		BaseManifest: filepath.Join(cache,
-			strings.TrimPrefix(placement.WheelhouseManifestDigest, "sha256:")),
+		BaseManifest:    filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "local-base.json"),
 	}
 	return spec, facts, nil
 }

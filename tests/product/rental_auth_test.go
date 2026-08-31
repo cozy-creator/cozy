@@ -77,9 +77,12 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 	}
 	packages := []*pb.DownloadPackageRef{{Package: "cozy/marco-polo", Release: "1.0.0",
 		ReleaseDigest: "sha256:bc346950b7223be1aa3ec66c239c25538d374906df532c27a039e149bb2e632a"}}
+	models := []*pb.DownloadModelRef{{Package: "cozy/marco-polo", Slot: "marco.models.model",
+		Model: "cozy/tiny", Release: "1.0.0",
+		Manifest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
 	expires := time.Now().Add(30 * time.Minute)
 	delegation, signature, problem := rental.SignDownloadDelegation(layout, connection, packages,
-		nil, expires)
+		models, expires)
 	fatal(t, problem)
 	if len(signature) != ed25519.SignatureSize || !ed25519.Verify(public, delegation, signature) {
 		t.Fatal("download delegation was not signed by the rental Creator key")
@@ -88,14 +91,20 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 	must(t, err)
 	if doc.Str("rental_id") != connection.RentalID || doc.Str("worker_id") != connection.WorkerID ||
 		doc.Str("worker_boot_id") != connection.WorkerBootID || len(doc.List("packages")) != 1 ||
-		len(doc.List("models")) != 0 {
+		len(doc.List("models")) != 1 {
 		t.Fatalf("download delegation lost logical or worker identity: %s", delegation)
 	}
 	replayed, replaySignature, problem := rental.SignDownloadDelegation(layout, connection,
-		packages, nil, expires)
+		packages, models, expires)
 	fatal(t, problem)
 	if !bytes.Equal(replayed, delegation) || !bytes.Equal(replaySignature, signature) {
 		t.Fatal("exact logical package-set replay changed delegation bytes or signature")
+	}
+	wrongPackage := []*pb.DownloadModelRef{{Package: "other/package", Slot: "marco.models.model",
+		Model: "cozy/tiny", Release: "1.0.0", Manifest: models[0].Manifest}}
+	if _, _, problem := rental.SignDownloadDelegation(layout, connection, packages,
+		wrongPackage, expires); problem == nil {
+		t.Fatal("delegation admitted a model for an undelegated package")
 	}
 	empty, emptySignature, problem := rental.SignDownloadDelegation(layout, connection,
 		nil, nil, time.Now().Add(30*time.Minute))

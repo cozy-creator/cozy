@@ -48,9 +48,12 @@ type JobPlan struct {
 	ArtifactOutputs []ArtifactOutput
 	// Record is the closed key set `plan.py::JobBinding.read` accepts. An unknown key is
 	// a refusal at the worker, which is what makes "closed at both ends" a fact.
-	Record map[string]any
-	RSSCap int64
+	Record   map[string]any
+	RSSCap   int64
+	GPUCount int64
 }
+
+const DefaultJobRSSCap int64 = 8 << 30
 
 // stageJobPlans writes one job plan record per declared job into the worker's own home.
 // The file name is the descriptor id's hex, which is how the supervisor finds it.
@@ -78,7 +81,7 @@ func stageJobPlans(workerHome string, plans []*JobPlan) *exit.Error {
 // inferred from which field happens to be populated (cr-009's `fabd6fc` lesson). Job mode
 // hosts no PLACEMENT at all: there is no set, no serving axis, and no placement_id on its
 // attempts.
-func (c *Orchestrator) sendJobDirective(s *session, w *worker) {
+func (c *Orchestrator) sendJobDirective(s *session, w *worker) *exit.Error {
 	plan := w.spec.Placement.Jobs[0]
 	rev := c.nextRevision()
 	c.mu.Lock()
@@ -109,12 +112,38 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker) {
 		}},
 	}
 	d.RecordOwnerEpoch, d.ControlStreamGeneration, d.WorkerBootId = recordOwnerEpoch, s.generation, s.bootID
-	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}})
+	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}}) {
+		return exit.Unavailablef("worker %s control stream closed before job directive send", w.instanceID)
+	}
 	c.logf("DesiredWorkerState revision=%d posture=accepting JOB %s (%s) -> %s",
 		rev, plan.Function, shortDigest(plan.DescriptorID), s.bootID)
+	return nil
+}
+
+func (c *Orchestrator) ConvergeRemoteJob(instanceID string, spec WorkerLaunchSpec) *exit.Error {
+	if spec.Connection == nil || !spec.IsJob() || len(spec.Placement.Jobs) != 1 {
+		return exit.Internalf("remote job convergence requires one attached job spec")
+	}
+	c.mu.Lock()
+	w := c.workers[instanceID]
+	var s *session
+	if w != nil {
+		s = c.sessions[w.bootID]
+		w.spec = spec
+		w.planIDs = []string{spec.Placement.Jobs[0].DescriptorID}
+		w.desiredRefusal = nil
+	}
+	c.mu.Unlock()
+	if w == nil || s == nil {
+		return exit.Unavailablef("worker %s holds no claimed control stream", instanceID)
+	}
+	return c.sendJobDirective(s, w)
 }
 
 func gpuCountOf(p *JobPlan) int64 {
+	if p.GPUCount > 0 {
+		return p.GPUCount
+	}
 	if n, ok := p.Record["gpu_count"].(int64); ok {
 		return n
 	}

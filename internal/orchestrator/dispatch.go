@@ -24,10 +24,13 @@ import (
 // Submission is one local request. The orchestrator owns everything in it that decides
 // WHAT runs; the runtime owns everything about HOW.
 type Submission struct {
-	IdemKey    string // the caller's idempotency key
-	Package    string // org/name
-	Entrypoint string // the function
-	PlanID     string // the entrypoint_binding_plan_id this attempt binds
+	IdemKey       string // the caller's idempotency key
+	Package       string // org/name
+	Entrypoint    string // the function
+	PlanID        string // the entrypoint_binding_plan_id this attempt binds
+	Release       string // immutable remote package release; empty for local execution
+	ReleaseDigest string // exact remote release.json identity
+	Models        []ModelRef
 
 	// Payload is the request body, verbatim. It rides the DeliveryGrant as the input
 	// `payload` — a grant input, never a wire field, so refreshing the grant can never
@@ -61,14 +64,14 @@ type Submission struct {
 	// Org is the publishing org whose scratch repo this job publishes into.
 	Org string
 	// Trees are the job's typed input TREES as `ref=dir`, one grant input each.
-	Trees []string
+	Trees       []string
+	JobGPUCount int64
 
 	// Worker pins this request to an ATTACHED remote worker (a rental id resolved
 	// through Options.Rentals). Empty = any local worker.
 	Worker string
 	// InstallID pins a durable request to one immutable local install resolution.
-	// In the initial weightless remote lane it supplies only the exact logical release
-	// and request/result descriptor; no local platform facts cross the control stream.
+	// Remote requests instead carry Release and ReleaseDigest.
 	InstallID string
 	// Rental authorizes placement on Creator-managed rented capacity.
 	Rental bool
@@ -175,10 +178,11 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	req := records.Request{
 		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
 		Package: s.Package, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
+		Release: s.Release, PackageRevisionDigest: s.ReleaseDigest,
 		Outputs: strings.Join(s.Outputs, ","),
 		Assets:  s.Assets, ArtifactOutputs: string(artifactBytes),
-		Kind: s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
-		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
+		Kind: s.Kind, JobGPUCount: s.JobGPUCount, Org: s.Org, Trees: strings.Join(s.Trees, ","),
+		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental, Models: s.Models,
 	}
 	event := map[string]any{
 		"package": s.Package, "function": s.Entrypoint,
@@ -187,6 +191,8 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	}
 	if s.Rental {
 		event["rental"] = true
+		event["release"] = s.Release
+		event["release_digest"] = s.ReleaseDigest
 	}
 	return req, event, nil
 }
@@ -583,11 +589,6 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		}
 		return spec, req.PlanID, e
 	}
-	if req.IsJob() {
-		return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "remote_job_control_unavailable",
-			"a remote job cannot be resolved from a local installation").
-			WithRemedy("publish and rent an exact job control snapshot before enabling remote jobs")
-	}
 	if c.opt.Rentals == nil {
 		return WorkerLaunchSpec{}, "", exit.Unavailablef("this Cozy daemon attaches no remote workers")
 	}
@@ -599,22 +600,52 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		return WorkerLaunchSpec{}, "", exit.Named(exit.Internal, "rental.target_incomplete",
 			"rental %s resolved without a complete remote target", req.Worker)
 	}
-	if c.opt.Packages == nil || c.opt.RentalPackageSet == nil || req.InstallID == "" {
+	if c.opt.RentalPackageSet == nil || req.Release == "" ||
+		!validDigest(req.PackageRevisionDigest) || (len(req.Models) == 0 && !validDigest(req.PlanID)) {
 		return WorkerLaunchSpec{}, "", exit.Unavailablef(
 			"remote package preparation requires an exact release and package_set signer")
 	}
-	logical, e := c.opt.Packages.ResolveLogicalInstall(req.InstallID, req.Entrypoint)
-	if e != nil {
-		return WorkerLaunchSpec{}, "", e
-	}
+	logical := LogicalPackage{Package: req.Package, Release: req.Release,
+		ReleaseDigest: req.PackageRevisionDigest, Function: req.Entrypoint,
+		Outputs: strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
+		PlanID:  req.PlanID, Models: append([]ModelRef(nil), req.Models...)}
 	instance, _, _, e := c.EnsureRental(req.Worker)
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
+	models := make([]*pb.DownloadModelRef, 0, len(logical.Models))
+	for _, model := range logical.Models {
+		models = append(models, &pb.DownloadModelRef{Package: model.Package, Slot: model.Slot,
+			Model: model.Model, Release: model.Release, Manifest: model.Manifest})
+	}
 	if e := c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
 		Package: logical.Package, Release: logical.Release, ReleaseDigest: logical.ReleaseDigest,
-	}}, nil); e != nil {
+	}}, models); e != nil {
 		return WorkerLaunchSpec{}, "", e
+	}
+	if req.IsJob() {
+		if len(req.Models) != 0 {
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Unavailable,
+				"rental.modeled_job_unsupported", "remote jobs with model slots are not supported yet")
+		}
+		if e := c.waitPackageStaged(instance); e != nil {
+			return WorkerLaunchSpec{}, "", e
+		}
+		artifacts, e := decodeArtifactOutputs(req.ArtifactOutputs)
+		if e != nil {
+			return WorkerLaunchSpec{}, "", e
+		}
+		spec := WorkerLaunchSpec{Connection: remote.Connection, Placement: DesiredPlacement{
+			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
+			PackageRevisionDigest: req.PackageRevisionDigest,
+			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,
+				Outputs:         strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
+				ArtifactOutputs: artifacts, RSSCap: DefaultJobRSSCap, GPUCount: req.JobGPUCount}},
+		}}
+		if e := c.ConvergeRemoteJob(instance, spec); e != nil {
+			return WorkerLaunchSpec{}, "", e
+		}
+		return spec, req.PlanID, nil
 	}
 	spec, planID, e := c.ensureLogicalPackageReady(instance, req.Worker, logical)
 	if e != nil {
@@ -865,6 +896,14 @@ func (c *Orchestrator) maxOutputBytes() uint64 {
 func (c *Orchestrator) invocationIdentity(w *worker,
 	req records.Request) (packageRevision, environment, config string, e *exit.Error) {
 	packageRevision = w.spec.Placement.PackageRevisionDigest
+	if req.IsJob() && w.spec.Connection != nil {
+		if req.PackageRevisionDigest == "" || req.PackageRevisionDigest != packageRevision {
+			return "", "", "", exit.Named(exit.Conflict,
+				"request_invocation_identity_changed",
+				"worker %s no longer matches the job release pinned to request %s", w.instanceID, req.ID)
+		}
+		return packageRevision, "", "", nil
+	}
 	environment = w.spec.Placement.EnvironmentDigest
 	if environment == "" {
 		if w.spec.Connection == nil && w.spec.Placement.SourceDigest != "" {
@@ -884,7 +923,11 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 		}
 		return req.PackageRevisionDigest, req.EnvironmentDigest, req.ConfigDigest, nil
 	}
-	return packageRevision, environment, c.opt.ConfigDigest, nil
+	if !validDigest(w.configDigest) {
+		return "", "", "", exit.Named(exit.Structural, "placement_identity_missing",
+			"worker %s carries no installed package config digest", w.instanceID)
+	}
+	return packageRevision, environment, w.configDigest, nil
 }
 
 func spellOf(raw []byte) string {
@@ -1087,7 +1130,7 @@ func (c *Orchestrator) grantFor(req records.Request, attempt uint64, w *worker) 
 			return nil, e
 		}
 	}
-	if req.IsJob() {
+	if req.IsJob() && w.media == nil {
 		g, _, e := c.jobGrant(req, attempt)
 		return g, e
 	}
