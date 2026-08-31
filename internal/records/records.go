@@ -292,6 +292,8 @@ func dropDeadSchema(tx *sql.Tx, path string) *exit.Error {
 		"video_compositions",
 		"placement_acquisition_observations",
 		"artifact_receipts",
+		"rental_relay_refusals",
+		"rental_control_refusals",
 	} {
 		if _, err := tx.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
 			return exit.Internalf("cannot drop retired table %s from %s: %s", table, path, err)

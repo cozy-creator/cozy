@@ -80,7 +80,7 @@ func TestRecordsV1MigrationIsAtomicAndMinimal(t *testing.T) {
 		"install_generations": true, "pins": true, "worker_processes": true,
 		"requests": true, "attempts": true, "outputs": true, "request_events": true,
 		"publications": true, "job_checkpoints": true, "artifact_finalizations": true,
-		"rental_operations": true, "rentals": true, "rental_relay_refusals": true,
+		"rental_operations": true, "rentals": true,
 	}
 	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
 	must(t, err)
@@ -99,6 +99,7 @@ func TestRecordsV1MigrationIsAtomicAndMinimal(t *testing.T) {
 	for _, table := range []string{
 		"managed_profile_installs", "workflow_executions", "workflow_steps",
 		"video_compositions", "placement_acquisition_observations", "artifact_receipts",
+		"rental_relay_refusals", "rental_control_refusals",
 	} {
 		var count int
 		must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count))
