@@ -14,6 +14,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -57,12 +58,40 @@ type PrivatePreflightResult struct {
 	} `json:"compatible"`
 }
 
-// PrivatePreflight delegates rented-base wheel/tag/native/collision policy to the exact Runtime
-// that built this private revision. Creator supplies only Hub-authoritative active manifest bytes.
-func (r RuntimeCLI) PrivatePreflight(ctx context.Context, requestPath string,
+func (r RuntimeCLI) privatePreflight(ctx context.Context, requestPath string,
 	out *PrivatePreflightResult,
 ) *exit.Error {
 	return r.callContext(ctx, out, "private-preflight", requestPath)
+}
+
+// PreflightPrivate is Creator's one execution door for rented-base wheel/tag/native/collision
+// policy. The resolver supplies exact already-held facts; launch owns both disposable request
+// staging and the one generation Runtime process that judges them.
+func PreflightPrivate(ctx context.Context, install records.PackageInstall,
+	revision privatepackage.Revision, bases []privatepackage.BaseManifest,
+	cozyHome string, env []string,
+) *exit.Error {
+	layout, problem := home.Open(cozyHome)
+	if problem != nil {
+		return problem
+	}
+	requestPath, cleanup, problem := privatepackage.StagePreflight(layout, revision, bases)
+	if problem != nil {
+		return problem
+	}
+	defer cleanup()
+	bounded, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	var result PrivatePreflightResult
+	runtime := RuntimeCLI{Bin: Binary(install), Dir: SourceDir(install), Home: cozyHome, Env: env}
+	if problem := runtime.privatePreflight(bounded, requestPath, &result); problem != nil {
+		return problem
+	}
+	if result.PrivateRevisionDigest != revision.Digest || len(result.Compatible) == 0 {
+		return exit.Named(exit.Conflict, "private_preflight_identity_mismatch",
+			"Runtime preflight did not admit exact private revision %s", revision.Digest)
+	}
+	return nil
 }
 
 // Binary is the runtime a generation carries. An install already refused a generation

@@ -5,7 +5,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
@@ -79,21 +78,8 @@ func (r *Resolver) PreparePrivate(ctx context.Context, installID string) (privat
 		bases[index] = privatepackage.BaseManifest{Digest: base.WheelhouseManifestDigest,
 			Bytes: append([]byte(nil), base.WheelhouseManifest...)}
 	}
-	request, cleanup, problem := privatepackage.StagePreflight(layout, revision, bases)
-	if problem != nil {
+	if problem := launch.PreflightPrivate(ctx, *install, revision, bases, r.cfg.Home, r.cfg.Tool()); problem != nil {
 		return privatepackage.Revision{}, problem
-	}
-	defer cleanup()
-	var result launch.PrivatePreflightResult
-	runtime := launch.RuntimeCLI{Bin: launch.Binary(*install), Dir: install.SourceRef,
-		Home: r.cfg.Home, Env: r.cfg.Tool(), QueryTimeout: 5 * time.Minute}
-	if problem := runtime.PrivatePreflight(ctx, request, &result); problem != nil {
-		return privatepackage.Revision{}, problem
-	}
-	if result.PrivateRevisionDigest != revision.Digest || len(result.Compatible) == 0 {
-		return privatepackage.Revision{}, exit.Named(exit.Conflict,
-			"private_preflight_identity_mismatch",
-			"Runtime preflight did not admit exact private revision %s", revision.Digest)
 	}
 	return revision, nil
 }
