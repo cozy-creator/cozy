@@ -108,8 +108,9 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	ms := map[string]int64{}
 	res.MS = ms
 
-	// 1. Prepare the exact documents and known ObjectRefs. Finalize carries the
-	//    original bytes; the transfer claim carries only sorted digest/length facts.
+	// 1. Prepare the exact evidence and known ObjectRefs. The Manifest is one of
+	//    the transferred objects; finalize names its accepted digest/length and
+	//    Tensorhub reads those custody bytes itself.
 	t0 := time.Now()
 	if err := os.MkdirAll(p.Scratch, 0o700); err != nil {
 		return res, exit.Internalf("cannot create the transfer scratch at %s: %s", p.Scratch, err)
