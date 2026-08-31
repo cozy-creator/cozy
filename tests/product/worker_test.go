@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
+	localclient "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -141,6 +145,88 @@ func TestPackageScopedUnloadPreservesUnrelatedWarmWorker(t *testing.T) {
 	}
 	if worker := o.c.Worker(currentID); worker == nil || worker.Package != "fake/editable-left" {
 		t.Fatalf("scoped unload evicted the current editable generation: %#v", worker)
+	}
+}
+
+func TestUnloadClientReturnsAfterSuccessfulReclamation(t *testing.T) {
+	spec := fakeSpec("unload-client-return", "0")
+	acquisitionStarted := make(chan struct{}, 2)
+	releaseAcquisition := make(chan struct{})
+	o := hostOwnerConfigured(t, "unload-client-return", fixedLauncher{spec},
+		func(options *orchestrator.Options) {
+			options.RentalFleet = func() (string, *exit.Error) { return "test fleet", nil }
+			options.AcquireManagedRental = func(records.Request) (string, string, *exit.Error) {
+				acquisitionStarted <- struct{}{}
+				<-releaseAcquisition
+				return "", "", exit.Unavailablef("test rental acquisition released")
+			}
+		})
+	instance, _, problem := o.c.EnsureWorker(spec)
+	fatal(t, problem)
+	fatal(t, o.c.EnsurePlacementReady(instance, planIDOf(t, spec)))
+	rental := submission(planIDOf(t, spec), "fake/queued-rental",
+		"unload-client-queued-rental", map[string]any{"n": 1})
+	rental.Rental = true
+	submitDone := make(chan *exit.Error, 1)
+	go func() {
+		_, _, problem := o.c.Submit(rental)
+		submitDone <- problem
+	}()
+	select {
+	case <-acquisitionStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the queued rental did not enter its deliberately blocked acquisition")
+	}
+
+	creds, problem := api.Mint(o.l)
+	fatal(t, problem)
+	server := httptest.NewUnstartedServer(nil)
+	localAPI := api.New(api.Options{
+		Orchestrator: o.c, Cfg: o.cfg, Creds: creds,
+		Addr: server.Listener.Addr().String(),
+	})
+	handler, problem := localAPI.Handler()
+	fatal(t, problem)
+	server.Config.Handler = handler
+	server.Start()
+	t.Cleanup(func() {
+		close(releaseAcquisition)
+		select {
+		case <-submitDone:
+		case <-time.After(5 * time.Second):
+			t.Error("the test rental submission did not finish after its acquisition was released")
+		}
+		server.Close()
+	})
+
+	client, problem := localclient.Open(o.cfg, daemon.State{
+		Up: true, Addr: server.Listener.Addr().String(),
+	})
+	fatal(t, problem)
+	type answer struct {
+		result  api.UnloadResult
+		problem *exit.Error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		result, problem := client.Unload()
+		done <- answer{result: result, problem: problem}
+	}()
+
+	select {
+	case got := <-done:
+		fatal(t, got.problem)
+		if got.result.Count != 1 || len(got.result.Stopped) != 1 ||
+			got.result.Stopped[0].InstanceID != instance || o.c.Worker(instance) != nil {
+			t.Fatalf("unload did not return the reclaimed worker: %#v", got.result)
+		}
+		select {
+		case <-acquisitionStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("unload returned without reviving the queue after capacity changed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("unload reclaimed its worker but synchronously joined unrelated rental acquisition")
 	}
 }
 

@@ -100,6 +100,12 @@ func hostOwner(t *testing.T, name string) *owner {
 }
 
 func hostOwnerWithLauncher(t *testing.T, name string, launcher orchestrator.Launcher) *owner {
+	return hostOwnerConfigured(t, name, launcher, nil)
+}
+
+func hostOwnerConfigured(t *testing.T, name string, launcher orchestrator.Launcher,
+	configure func(*orchestrator.Options),
+) *owner {
 	t.Helper()
 	root := filepath.Join(os.TempDir(), "cozy-product-test", name)
 	must(t, os.RemoveAll(root))
@@ -115,10 +121,14 @@ func hostOwnerWithLauncher(t *testing.T, name string, launcher orchestrator.Laun
 	fatal(t, e)
 	log, err := os.Create(filepath.Join(root, "orchestrator.log"))
 	must(t, err)
-	c, e := orchestrator.Open(orchestrator.Options{
+	options := orchestrator.Options{
 		Cfg: cfg, Layout: l, Store: st, Yield: "smart", Log: log,
 		Packages: launcher, ConfigDigest: "sha256:" + strings.Repeat("22", 32), MaxOutputMiB: 8,
-	})
+	}
+	if configure != nil {
+		configure(&options)
+	}
+	c, e := orchestrator.Open(options)
 	fatal(t, e)
 	go func() { _ = c.Serve() }()
 	o := &owner{root: root, cfg: cfg, l: l, store: st, c: c}

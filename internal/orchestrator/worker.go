@@ -1679,7 +1679,11 @@ func (c *Orchestrator) unloadIdleLocalWorkers(pkg, keepInstallID string) ([]Work
 		}
 	}
 	if len(stopped) > 0 {
-		c.reviveQueue()
+		// Capacity changed, so the queue must be re-asked — but that wake is not part
+		// of reclamation. Its head may synchronously acquire a managed rental. Joining
+		// that unrelated network operation here kept `cozy unload` waiting after every
+		// selected process was reaped and its device grant was already released.
+		go c.reviveQueue()
 	}
 	return stopped, nil
 }
