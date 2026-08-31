@@ -84,6 +84,10 @@ type owner struct {
 }
 
 func hostOwner(t *testing.T, name string) *owner {
+	return hostOwnerWithLauncher(t, name, nil)
+}
+
+func hostOwnerWithLauncher(t *testing.T, name string, launcher orchestrator.Launcher) *owner {
 	t.Helper()
 	root := filepath.Join(os.TempDir(), "cozy-product-test", name)
 	must(t, os.RemoveAll(root))
@@ -101,7 +105,7 @@ func hostOwner(t *testing.T, name string) *owner {
 	must(t, err)
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: cfg, Layout: l, Store: st, Yield: "smart", Log: log,
-		ConfigDigest: "sha256:" + strings.Repeat("22", 32), MaxOutputMiB: 8,
+		Packages: launcher, ConfigDigest: "sha256:" + strings.Repeat("22", 32), MaxOutputMiB: 8,
 	})
 	fatal(t, e)
 	go func() { _ = c.Serve() }()

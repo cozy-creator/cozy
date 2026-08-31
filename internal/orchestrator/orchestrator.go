@@ -13,19 +13,21 @@
 // directory — there is no token field set anywhere in this package, which is what makes
 // "no fake cloud tokens" a fact a reader can check rather than a promise.
 //
-// The one law this package is written around (worker-protocol/02 §6.2): the
-// `recovered_attempts` a new session reports on Register are OPEN OBLIGATIONS, and no
-// next ordinal for those request ids may be minted until each is closed by its own
-// journaled terminal. A new session_id never manufactures absence.
+// The one law this package is written around: an accepted attempt is an OPEN OBLIGATION,
+// and no next ordinal may be minted until it has a terminal. Remote supervisors replay
+// their worker-local ledger; for a dead local Runtime child, this records authority writes
+// ABANDONED itself. Runtime is never asked to remember what died with it.
 package orchestrator
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sort"
 	"sync"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -148,7 +150,7 @@ type Orchestrator struct {
 	// launch per package: three cold requests for one package must not spawn three
 	// workers and three device grants for a card that serves one attempt at a time.
 	starting map[string]bool
-	// ensuring is the per-instance creation fence beneath every caller, including journal
+	// ensuring is the per-instance creation fence beneath every caller, including child
 	// recovery. `starting` serializes queue policy; this prevents two callers that already
 	// chose the same deterministic slot from spawning two processes into it.
 	ensuring         map[string]chan struct{}
@@ -425,20 +427,11 @@ func (c *Orchestrator) reviveQueue() {
 	c.selectOrStart(*req)
 }
 
-// recoverWorker is what happens when a worker's PROCESS dies. Two different things are
-// owed, and only one of them is the queue's:
-//
-//   - the attempts that worker was RUNNING owe a terminal, and the only thing that can
-//     produce one is the supervisor's own journal replayed by a worker in the SAME SLOT
-//     (worker-protocol/02 §6.2). So the slot is started again — its root, and therefore
-//     its journal, is deliberately reused — and the recovered attempt arrives on Register
-//     as an open obligation exactly as the law says.
-//   - anything merely WAITING needs capacity asked for, which is `reviveQueue`.
-//
-// Without the first half a `kill -9` of a job worker left its in-flight attempt with no
-// terminal forever: the request was not queued (it had an ordinal), so nothing looked at
-// it again. Found live by cl-004's kill arm, which only converged when a LATER submission
-// happened to restart the same slot.
+// recoverWorker settles the local process death from Creator's existing records
+// authority. Runtime is a disposable execution child: it owns neither a journal nor a
+// recovery decision. An unoffered assignment returns to the queue; an offer that may have
+// crossed the process boundary closes as ABANDONED and earns a fresh ordinal. The old
+// ordinal is never executed again.
 func (c *Orchestrator) recoverWorker(spec WorkerLaunchSpec) {
 	c.mu.Lock()
 	closing := c.closing
@@ -454,15 +447,81 @@ func (c *Orchestrator) recoverWorker(spec WorkerLaunchSpec) {
 		c.reviveQueue()
 		return
 	}
-	c.logf("worker %s died owing %d terminal(s); restarting the slot so its journal replays",
+	c.logf("worker %s died owing %d attempt(s); Creator is settling its local authority",
 		spec.InstanceID(), len(open))
+	for _, attempt := range open {
+		c.settleLocalProcessDeath(attempt)
+	}
+	// Restore the same slot only after every old ordinal is durably closed or aborted.
+	// The fresh Runtime child receives only new work; it reconstructs nothing.
 	if _, _, e := c.EnsureWorker(spec); e != nil {
-		// The slot cannot come back. The attempts it holds are unsettleable, and saying so
-		// beats leaving a client on a stream that will never close.
-		c.logf("the slot %s could not be restarted (%s); its %d open attempt(s) cannot settle",
-			spec.InstanceID(), e.Message, len(open))
+		c.logf("the local slot %s could not be restarted after death settlement: %s",
+			spec.InstanceID(), e.Message)
 	}
 	c.reviveQueue()
+}
+
+func (c *Orchestrator) settleLocalProcessDeath(attempt records.Attempt) {
+	if attempt.State == "preparing" {
+		c.settleDispatch(attempt.RequestID, uint64(attempt.Attempt), false)
+		if e := c.opt.Store.AbortDispatch(attempt.RequestID, attempt.Attempt,
+			attempt.SessionID, "local Runtime exited before the offer boundary"); e != nil {
+			c.logf("local Runtime death could not abort %s#%d: %s",
+				attempt.RequestID, attempt.Attempt, e.Message)
+			return
+		}
+		c.enqueue(attempt.RequestID)
+		return
+	}
+	if attempt.State == "terminal" {
+		if e := c.opt.Store.Closed(attempt.RequestID, attempt.Attempt); e != nil {
+			c.logf("local Runtime death could not close %s#%d: %s",
+				attempt.RequestID, attempt.Attempt, e.Message)
+			return
+		}
+		req, e := c.opt.Store.RequestRow(attempt.RequestID)
+		if e == nil && req != nil {
+			c.afterAck(*req, attempt, nil)
+		}
+		return
+	}
+	if attempt.State != "offered" && attempt.State != "accepted" &&
+		attempt.State != "recovered_open" {
+		c.logf("local Runtime death left %s#%d in unexpected state %s",
+			attempt.RequestID, attempt.Attempt, attempt.State)
+		return
+	}
+	specDigest, err := canonical.Raw(attempt.InvocationDigest)
+	if err != nil {
+		c.logf("local Runtime death cannot settle %s#%d: malformed invocation digest",
+			attempt.RequestID, attempt.Attempt)
+		return
+	}
+	message := "local Runtime exited; its execution context is gone and this ordinal will not run again"
+	body, digest, err := canonical.Identity(&pb.AttemptOutcomeBody{
+		RequestId: attempt.RequestID, AttemptOrdinal: uint64(attempt.Attempt),
+		InvocationSpecDigest: attempt.InvocationDigest,
+		Status:               pb.OutcomeStatus_OUTCOME_STATUS_ABANDONED,
+		SafeMessage:          message,
+		Cause: &pb.OutcomeCause{Code: pb.CauseCode_CAUSE_CODE_EXECUTOR_INVALIDATED,
+			Origin: pb.CauseOrigin_CAUSE_ORIGIN_RECORD_OWNER, Detail: message},
+		ExecutionStarted: attempt.State != "offered",
+	})
+	if err != nil {
+		c.logf("local Runtime death cannot author %s#%d outcome: %s",
+			attempt.RequestID, attempt.Attempt, err)
+		return
+	}
+	// onOutcome remains the one terminal validator/transaction. The synthetic local
+	// session has one buffered slot solely so its now-meaningless worker ACK can cross the
+	// existing closure boundary without another execution-specific store path.
+	s := &session{ctx: context.Background(), bootID: attempt.SessionID,
+		instanceID: attempt.InstanceID, out: make(chan *pb.RecordOwnerFrame, 1)}
+	c.onOutcome(s, &pb.AttemptOutcome{
+		RequestId: attempt.RequestID, AttemptOrdinal: uint64(attempt.Attempt),
+		InvocationSpecDigest: specDigest,
+		OutcomeId:            records.NewID("out"), OutcomeDigest: digest, OutcomeCanonicalBytes: body,
+	})
 }
 
 // NoProgressReports is how many SUCCESSIVE worker reports must both declare a wedge and

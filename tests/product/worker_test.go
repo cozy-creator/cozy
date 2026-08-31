@@ -12,8 +12,30 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
+
+type fixedLauncher struct{ spec orchestrator.WorkerLaunchSpec }
+
+func (l fixedLauncher) ResolvePlacement(string) (orchestrator.DesiredPlacement, *exit.Error) {
+	return l.spec.Placement, nil
+}
+func (l fixedLauncher) Resolve(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	return l.spec, nil
+}
+func (l fixedLauncher) ResolveInstall(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	return l.spec, nil
+}
+func (l fixedLauncher) ResolveLogicalInstall(string, string) (orchestrator.LogicalPackage, *exit.Error) {
+	return orchestrator.LogicalPackage{}, exit.Unavailablef("fixed local launcher has no remote package")
+}
+func (l fixedLauncher) ResolveJob(string, string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	return l.spec, nil
+}
+func (l fixedLauncher) ResolveJobInstall(string, string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	return l.spec, nil
+}
 
 func TestProgressWatchOpensAfterSnapshotBarrier(t *testing.T) {
 	o := hostOwner(t, "snapshot-watch-order")
@@ -282,6 +304,50 @@ func TestDroppedOutcomeAck(t *testing.T) {
 	if row.State != "closed" || row.TerminalStatus != "SUCCEEDED" {
 		t.Errorf("the attempt row is %s/%s", row.TerminalStatus, row.State)
 	}
+}
+
+func TestLocalRuntimeDeathSettlesFromCreatorRecords(t *testing.T) {
+	spec := fakeSpec("stateless-runtime-death", "2", "--arm", "idle")
+	o := hostOwnerWithLauncher(t, "stateless-runtime-death", fixedLauncher{spec})
+	instance, _, problem := o.c.EnsureWorker(spec)
+	fatal(t, problem)
+	planID := planIDOf(t, spec)
+	fatal(t, o.c.EnsurePlacementReady(instance, planID))
+	requestID, ordinal, problem := o.c.Submit(submission(planID,
+		"fake/stateless-runtime-death", "stateless-runtime-death-1",
+		map[string]any{"message": "marco"}))
+	fatal(t, problem)
+	fatal(t, o.c.AwaitAccepted(requestID, ordinal, 15*time.Second))
+
+	worker := o.c.Worker(instance)
+	if worker == nil || worker.PID <= 0 {
+		t.Fatalf("local worker has no process identity: %#v", worker)
+	}
+	process, err := os.FindProcess(worker.PID)
+	must(t, err)
+	must(t, process.Kill())
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		attempts, readProblem := o.store.Attempts(requestID)
+		fatal(t, readProblem)
+		request, readProblem := o.store.RequestRow(requestID)
+		fatal(t, readProblem)
+		if len(attempts) >= 2 && attempts[0].State == "closed" &&
+			attempts[0].TerminalStatus == "ABANDONED" &&
+			attempts[0].TerminalCause == "EXECUTOR_INVALIDATED" &&
+			request != nil && request.Requeues == 1 && request.Ordinal >= 2 {
+			if attempts[0].TerminalBody == nil {
+				t.Fatal("Creator persisted no canonical ABANDONED body")
+			}
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	attempts, _ := o.store.Attempts(requestID)
+	request, _ := o.store.RequestRow(requestID)
+	t.Fatalf("Creator did not settle and requeue after Runtime death: attempts=%#v request=%#v",
+		attempts, request)
 }
 
 // TestLocalSucceededRequiresEveryGrantedOutput is the local half of the output-set fence.
