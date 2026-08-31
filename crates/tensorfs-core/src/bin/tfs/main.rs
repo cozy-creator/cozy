@@ -57,6 +57,7 @@
 //!                                            verified refs -> canonical header + manifest
 //!   tfs checkpoint caps                      whole-document total caps, armed live
 //!   tfs checkpoint size [n]                  uniform-form header cost at H3 cardinality
+//!   tfs ingest source-plan --carrier <path>... --registry <registry.json>
 //!
 //! Reads and projection (tfs-005). Flags: --workers <n> --window <b> --ring <b>
 //! --hold-secs <s> --drop-unreleased --no-symlink
@@ -188,6 +189,7 @@ fn main() -> ExitCode {
         ["ingest", "converters"] => ingest::cmd_converters(),
         ["ingest", "golden"] => ingest::cmd_golden(),
         ["ingest", "bank", dia, fam, var, conv] => ingest::cmd_bank(dia, fam, var, conv, &flags),
+        ["ingest", "source-plan"] => ingest::cmd_source_plan(&flags),
         ["ingest", "plan", t] => ingest::cmd_plan(t, &flags),
         ["ingest", "run", r, t] => ingest::cmd_run(Path::new(r), t, &flags),
         ["ingest-worker", r, t] => ingest::cmd_worker(Path::new(r), t, &flags),

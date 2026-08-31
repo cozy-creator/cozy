@@ -30,7 +30,9 @@ use tensorfs_core::header::{topology_digest_of, topology_value};
 use tensorfs_core::ids::{ConfigRef, ObjectRef, Plain};
 use tensorfs_core::ingest::carrier::{self, SourceHeader};
 use tensorfs_core::ingest::convert::{self, Class, Converter, Effect, Plan, Rekey, Source, Target};
-use tensorfs_core::ingest::fingerprint::{self, Banked, Fingerprint, FingerprintRegistry};
+use tensorfs_core::ingest::fingerprint::{
+    self, Banked, Fingerprint, FingerprintRegistry, SourceProfile, SourceProfileComponent,
+};
 use tensorfs_core::ingest::stamp::{self, Stamp};
 use tensorfs_core::ingest::transaction::{self as tx, SourceFile};
 use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerificationReceipt};
@@ -74,6 +76,29 @@ fn sources(f: &Flags) -> Result<Vec<(String, PathBuf)>, ExitCode> {
         return Err(ExitCode::FAILURE);
     }
     out.sort();
+    Ok(out)
+}
+
+/// Unlabelled physical carriers for source-plan. Paths are locations only; no
+/// filename or directory segment participates in classification.
+fn carriers(f: &Flags) -> Result<Vec<PathBuf>, ExitCode> {
+    let mut out = Vec::new();
+    for (key, value) in f {
+        if key == "carrier" {
+            out.push(PathBuf::from(value));
+        }
+    }
+    if out.is_empty() {
+        eprintln!("REFUSED MISSING_FIELD: no --carrier <path> given");
+        return Err(ExitCode::FAILURE);
+    }
+    let mut unique = out.clone();
+    unique.sort();
+    unique.dedup();
+    if unique.len() != out.len() {
+        eprintln!("REFUSED DUPLICATE_KEY: one carrier path was supplied twice");
+        return Err(ExitCode::FAILURE);
+    }
     Ok(out)
 }
 
@@ -447,6 +472,7 @@ pub fn cmd_bank(
         Ok(b) => ok!(FingerprintRegistry::parse(&b)),
         Err(_) => FingerprintRegistry::default(),
     };
+    let mut reviewed = Vec::new();
     for (component, path) in &srcs {
         let (full, raw) = ok!(read_carrier(path));
         let h = if conv.name == "single_file.identity/1" {
@@ -483,6 +509,99 @@ pub fn cmd_bank(
             "banked {component}  {}  {}",
             fp.keyset_digest, fp.topology_digest
         );
+        reviewed.push((component.clone(), fp.keyset_digest));
+    }
+    if let Some(name) = flag(f, "source-profile") {
+        let order = match construction_order(f) {
+            Ok(order) => order,
+            Err(code) => return code,
+        };
+        let mut targets = Vec::new();
+        for (key, value) in f {
+            if key != "target" {
+                continue;
+            }
+            match value.split_once('=') {
+                Some((component, encoding)) if !component.is_empty() && !encoding.is_empty() => {
+                    targets.push((component.to_string(), encoding.to_string()));
+                }
+                _ => {
+                    eprintln!(
+                        "REFUSED MISSING_FIELD: --target wants component=encoding, got {value:?}"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        let mut component_names = Vec::new();
+        for (component, _) in &order {
+            if !component_names.contains(component) {
+                component_names.push(component.clone());
+            }
+        }
+        let mut components = Vec::new();
+        for component in &component_names {
+            let Some((_, keyset_digest)) = reviewed.iter().find(|(name, _)| name == component)
+            else {
+                eprintln!(
+                    "REFUSED CONSTRUCTION_ORDER_REQUIRED: order names unbanked component {component:?}"
+                );
+                return ExitCode::FAILURE;
+            };
+            let hits: Vec<&str> = targets
+                .iter()
+                .filter(|(name, _)| name == component)
+                .map(|(_, encoding)| encoding.as_str())
+                .collect();
+            if hits.len() != 1 {
+                eprintln!(
+                    "REFUSED MISSING_FIELD: source profile component {component:?} needs exactly one --target component=encoding"
+                );
+                return ExitCode::FAILURE;
+            }
+            components.push(SourceProfileComponent {
+                component: component.clone(),
+                keyset_digest: keyset_digest.clone(),
+                target_encoding: hits[0].to_string(),
+                construction_order: order
+                    .iter()
+                    .filter(|(name, _)| name == component)
+                    .map(|(_, key)| key.clone())
+                    .collect(),
+            });
+        }
+        if components.len() != reviewed.len() || targets.len() != reviewed.len() {
+            eprintln!(
+                "REFUSED MISSING_FIELD: source profile order, targets, and banked components must name the same exact set"
+            );
+            return ExitCode::FAILURE;
+        }
+        let profile = SourceProfile {
+            name: name.to_string(),
+            components,
+        };
+        let target = profile
+            .components
+            .iter()
+            .map(|component| format!("{}={}", component.component, component.target_encoding))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut prepared = match prepare_with_registry(f, &target, &srcs, &reg) {
+            Ok(prepared) => prepared,
+            Err(code) => return code,
+        };
+        if let Err(error) = prepared.plan.apply_order(&order) {
+            return bail(error);
+        }
+        reg.merge_source_profile(profile);
+    } else if f
+        .iter()
+        .any(|(key, _)| matches!(key.as_str(), "target" | "order"))
+    {
+        eprintln!(
+            "REFUSED MISSING_FIELD: --target/--order on ingest bank require --source-profile"
+        );
+        return ExitCode::FAILURE;
     }
     if let Some(dir) = p.parent() {
         let _ = fs::create_dir_all(dir);
@@ -497,6 +616,252 @@ pub fn cmd_bank(
         return ExitCode::FAILURE;
     }
     println!("{} entries -> {}", reg.entries.len(), p.display());
+    ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------------------ closed source plan
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CarrierUse {
+    Unused,
+    Whole,
+    Projected,
+}
+
+#[derive(Clone)]
+struct SourceAssignment {
+    component: String,
+    carrier: usize,
+    projected: bool,
+}
+
+fn enumerate_assignments(
+    index: usize,
+    candidates: &[Vec<(usize, bool)>],
+    uses: &mut [CarrierUse],
+    current: &mut Vec<SourceAssignment>,
+    components: &[SourceProfileComponent],
+    solutions: &mut Vec<Vec<SourceAssignment>>,
+) {
+    if solutions.len() >= 2 {
+        return;
+    }
+    if index == candidates.len() {
+        if uses.iter().all(|used| *used != CarrierUse::Unused) {
+            solutions.push(current.clone());
+        }
+        return;
+    }
+    for (carrier, projected) in &candidates[index] {
+        let prior = uses[*carrier];
+        let allowed = if *projected {
+            matches!(prior, CarrierUse::Unused | CarrierUse::Projected)
+        } else {
+            prior == CarrierUse::Unused
+        };
+        if !allowed {
+            continue;
+        }
+        uses[*carrier] = if *projected {
+            CarrierUse::Projected
+        } else {
+            CarrierUse::Whole
+        };
+        current.push(SourceAssignment {
+            component: components[index].component.clone(),
+            carrier: *carrier,
+            projected: *projected,
+        });
+        enumerate_assignments(index + 1, candidates, uses, current, components, solutions);
+        current.pop();
+        uses[*carrier] = prior;
+    }
+}
+
+fn profile_assignments(
+    profile: &SourceProfile,
+    registry: &FingerprintRegistry,
+    headers: &[SourceHeader],
+) -> Vec<Vec<SourceAssignment>> {
+    let mut candidates = Vec::new();
+    for component in &profile.components {
+        let Some(entry) = registry.entries.iter().find(|entry| {
+            entry.component == component.component && entry.keyset_digest == component.keyset_digest
+        }) else {
+            return Vec::new();
+        };
+        let projected = entry.converter == "single_file.identity/1";
+        let mut hits = Vec::new();
+        for (index, header) in headers.iter().enumerate() {
+            let view = if projected {
+                match convert::single_file_component(&component.component, header) {
+                    Ok(view) => view,
+                    Err(_) => continue,
+                }
+            } else {
+                header.clone()
+            };
+            let fingerprint = match fingerprint::fingerprint(&component.component, &view) {
+                Ok(fingerprint) => fingerprint,
+                Err(_) => continue,
+            };
+            if fingerprint.keyset_digest == component.keyset_digest
+                && fingerprint.topology_digest == entry.topology_digest
+                && fingerprint.logical_keys as u64 == entry.logical_keys
+            {
+                hits.push((index, projected));
+            }
+        }
+        if hits.is_empty() {
+            return Vec::new();
+        }
+        candidates.push(hits);
+    }
+    let mut solutions = Vec::new();
+    enumerate_assignments(
+        0,
+        &candidates,
+        &mut vec![CarrierUse::Unused; headers.len()],
+        &mut Vec::new(),
+        &profile.components,
+        &mut solutions,
+    );
+    solutions
+}
+
+/// Classify unlabelled exact carriers against whole-source review facts and emit the
+/// sole machine input for the existing prepare/run path. A physical path is never a
+/// classification fact. If two assignments survive, no tie-break exists here.
+pub fn cmd_source_plan(f: &Flags) -> ExitCode {
+    let paths = match carriers(f) {
+        Ok(paths) => paths,
+        Err(code) => return code,
+    };
+    let registry = match load_registry(f) {
+        Ok(registry) => registry,
+        Err(code) => return code,
+    };
+    if registry.source_profiles.is_empty() {
+        eprintln!("REFUSED UNREGISTERED_FINGERPRINT: the reviewed registry has no source profiles");
+        return ExitCode::FAILURE;
+    }
+    let mut headers = Vec::new();
+    for path in &paths {
+        match read_carrier(path) {
+            Ok((header, _)) => headers.push(header),
+            Err(error) => return bail(error),
+        }
+    }
+
+    let mut matches = Vec::new();
+    for profile in &registry.source_profiles {
+        for assignments in profile_assignments(profile, &registry, &headers) {
+            matches.push((profile, assignments));
+            if matches.len() >= 2 {
+                break;
+            }
+        }
+        if matches.len() >= 2 {
+            break;
+        }
+    }
+    if matches.is_empty() {
+        eprintln!(
+            "REFUSED UNREGISTERED_FINGERPRINT: carrier set matches no reviewed source profile"
+        );
+        return ExitCode::FAILURE;
+    }
+    if matches.len() != 1 {
+        let profiles: Vec<&str> = matches
+            .iter()
+            .map(|(profile, _)| profile.name.as_str())
+            .collect();
+        eprintln!(
+            "REFUSED AMBIGUOUS_CLASSIFICATION: carrier headers admit multiple component assignments in profiles {profiles:?}; exact provider member/slot review is required"
+        );
+        return ExitCode::FAILURE;
+    }
+    let (profile, assignments) = matches.remove(0);
+    let sources: Vec<(String, PathBuf)> = assignments
+        .iter()
+        .map(|assignment| {
+            (
+                assignment.component.clone(),
+                paths[assignment.carrier].clone(),
+            )
+        })
+        .collect();
+    let target = profile
+        .components
+        .iter()
+        .map(|component| format!("{}={}", component.component, component.target_encoding))
+        .collect::<Vec<_>>()
+        .join(",");
+    let order: Vec<(String, String)> = profile
+        .components
+        .iter()
+        .flat_map(|component| {
+            component
+                .construction_order
+                .iter()
+                .map(|key| (component.component.clone(), key.clone()))
+        })
+        .collect();
+    let mut flags = f.clone();
+    flags.retain(|(key, _)| key != "carrier" && key != "session");
+    for (component, path) in &sources {
+        flags.push((
+            "source".to_string(),
+            format!("{component}={}", path.to_string_lossy()),
+        ));
+    }
+    let mut prepared = match prepare_with_registry(&flags, &target, &sources, &registry) {
+        Ok(prepared) => prepared,
+        Err(code) => return code,
+    };
+    if let Err(error) = prepared.plan.apply_order(&order) {
+        return bail(error);
+    }
+    if let Err(error) = prepared.plan.check_converts_something() {
+        return bail(error);
+    }
+    let session = session_of(&flags, &prepared);
+    let source_values = assignments
+        .iter()
+        .map(|assignment| {
+            Value::obj(vec![
+                ("component", Value::str(assignment.component.clone())),
+                (
+                    "path",
+                    Value::str(paths[assignment.carrier].to_string_lossy().to_string()),
+                ),
+                ("projected", Value::Bool(assignment.projected)),
+            ])
+        })
+        .collect();
+    let order_values = prepared
+        .plan
+        .ops
+        .iter()
+        .map(|operation| {
+            Value::arr(vec![
+                Value::str(operation.component.clone()),
+                Value::str(operation.out_key.clone()),
+            ])
+        })
+        .collect();
+    let output = Value::obj(vec![
+        ("construction_order", Value::arr(order_values)),
+        ("converter", Value::str(prepared.plan.converter.clone())),
+        ("profile", Value::str(profile.name.clone())),
+        ("session", Value::str(session)),
+        ("sources", Value::arr(source_values)),
+        ("target", Value::str(target)),
+    ]);
+    println!(
+        "{}",
+        String::from_utf8(tensorfs_core::canon::write(&output)).unwrap()
+    );
     ExitCode::SUCCESS
 }
 
@@ -571,6 +936,15 @@ pub(crate) fn construction_order(f: &Flags) -> Result<Vec<(String, String)>, Exi
 fn prepare(f: &Flags, target: &str) -> Result<Prepared, ExitCode> {
     let srcs = sources(f)?;
     let reg = load_registry(f)?;
+    prepare_with_registry(f, target, &srcs, &reg)
+}
+
+fn prepare_with_registry(
+    f: &Flags,
+    target: &str,
+    srcs: &[(String, PathBuf)],
+    reg: &FingerprintRegistry,
+) -> Result<Prepared, ExitCode> {
     let target = match Target::parse(target) {
         Ok(t) => t,
         Err(e) => return Err(bail(e)),
@@ -580,7 +954,7 @@ fn prepare(f: &Flags, target: &str) -> Result<Prepared, ExitCode> {
 
     let (mut files, mut raws, mut verdicts, mut fps) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for (component, path) in &srcs {
+    for (component, path) in srcs {
         let (full, raw) = match read_carrier(path) {
             Ok(v) => v,
             Err(e) => return Err(bail(e)),

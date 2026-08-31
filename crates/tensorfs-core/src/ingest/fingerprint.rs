@@ -19,7 +19,7 @@ use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Result};
 use crate::header::{topology_digest_of, topology_value};
-use crate::ids::{ascii_name, hex64, object_id};
+use crate::ids::{ascii_name, hex64, object_id, prefixed};
 use crate::limits;
 use crate::structure::{Provenance, REAL, SYNTHETIC};
 
@@ -178,6 +178,24 @@ pub struct Banked {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FingerprintRegistry {
     pub entries: Vec<Banked>,
+    /// Reviewed whole-source recipes. Fingerprints authorize individual component
+    /// views; a source profile is the additional review fact that says which exact
+    /// components form one artifact, their target encoding, and construction order.
+    pub source_profiles: Vec<SourceProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceProfile {
+    pub name: String,
+    pub components: Vec<SourceProfileComponent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceProfileComponent {
+    pub component: String,
+    pub keyset_digest: String,
+    pub target_encoding: String,
+    pub construction_order: Vec<String>,
 }
 
 /// What the border concluded. There is no fifth state and no default.
@@ -292,6 +310,18 @@ impl FingerprintRegistry {
             (&a.keyset_digest, &a.component).cmp(&(&b.keyset_digest, &b.component))
         });
     }
+
+    pub fn merge_source_profile(&mut self, profile: SourceProfile) {
+        match self
+            .source_profiles
+            .iter_mut()
+            .find(|existing| existing.name == profile.name)
+        {
+            Some(slot) => *slot = profile,
+            None => self.source_profiles.push(profile),
+        }
+        self.source_profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    }
 }
 
 fn provenance_value(p: &Provenance) -> Value {
@@ -376,6 +406,10 @@ impl FingerprintRegistry {
                 provenance,
             });
         }
+        let source_profiles = match f.opt("source_profiles") {
+            None => Vec::new(),
+            Some(value) => parse_source_profiles(value)?,
+        };
         f.done()?;
         let mut seen: Vec<(&str, &str)> = entries
             .iter()
@@ -396,11 +430,30 @@ impl FingerprintRegistry {
                 "two entries bank the same (keyset_digest, component)",
             );
         }
-        Ok(FingerprintRegistry { entries })
+        for profile in &source_profiles {
+            for component in &profile.components {
+                if !entries.iter().any(|entry| {
+                    entry.component == component.component
+                        && entry.keyset_digest == component.keyset_digest
+                }) {
+                    return refuse(
+                        Code::UNREGISTERED_FINGERPRINT,
+                        format!(
+                            "source profile {:?} cites unbanked component {:?} / {}",
+                            profile.name, component.component, component.keyset_digest
+                        ),
+                    );
+                }
+            }
+        }
+        Ok(FingerprintRegistry {
+            entries,
+            source_profiles,
+        })
     }
 
     fn to_value(&self) -> Value {
-        Value::obj(vec![(
+        let mut fields = vec![(
             "entries",
             Value::arr(
                 self.entries
@@ -423,8 +476,157 @@ impl FingerprintRegistry {
                     })
                     .collect(),
             ),
-        )])
+        )];
+        if !self.source_profiles.is_empty() {
+            fields.push((
+                "source_profiles",
+                Value::arr(
+                    self.source_profiles
+                        .iter()
+                        .map(|profile| {
+                            Value::obj(vec![
+                                (
+                                    "components",
+                                    Value::arr(
+                                        profile
+                                            .components
+                                            .iter()
+                                            .map(|component| {
+                                                Value::obj(vec![
+                                                    (
+                                                        "component",
+                                                        Value::str(component.component.clone()),
+                                                    ),
+                                                    (
+                                                        "construction_order",
+                                                        Value::arr(
+                                                            component
+                                                                .construction_order
+                                                                .iter()
+                                                                .map(|key| Value::str(key.clone()))
+                                                                .collect(),
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "keyset_digest",
+                                                        Value::str(component.keyset_digest.clone()),
+                                                    ),
+                                                    (
+                                                        "target_encoding",
+                                                        Value::str(
+                                                            component.target_encoding.clone(),
+                                                        ),
+                                                    ),
+                                                ])
+                                            })
+                                            .collect(),
+                                    ),
+                                ),
+                                ("name", Value::str(profile.name.clone())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ));
+        }
+        Value::obj(fields)
     }
+}
+
+fn parse_source_profiles(value: &Value) -> Result<Vec<SourceProfile>> {
+    let mut profiles = Vec::new();
+    for value in as_arr("FingerprintRegistry", "source_profiles", value)? {
+        let mut fields = Fields::new("SourceProfile", value)?;
+        let name = fields.req_str("name")?.to_string();
+        ascii_name("source profile", &name, limits::MAX_NAME_BYTES)?;
+        let mut components = Vec::new();
+        for value in as_arr("SourceProfile", "components", fields.req("components")?)? {
+            let mut component_fields = Fields::new("SourceProfileComponent", value)?;
+            let component = component_fields.req_str("component")?.to_string();
+            ascii_name(
+                "source profile component",
+                &component,
+                limits::MAX_NAME_BYTES,
+            )?;
+            let keyset_digest = prefixed(
+                "source profile keyset_digest",
+                component_fields.req_str("keyset_digest")?,
+            )?;
+            let target_encoding = component_fields.req_str("target_encoding")?.to_string();
+            ascii_name(
+                "source profile target_encoding",
+                &target_encoding,
+                limits::MAX_NAME_BYTES,
+            )?;
+            let construction_order = as_arr(
+                "SourceProfileComponent",
+                "construction_order",
+                component_fields.req("construction_order")?,
+            )?
+            .iter()
+            .map(|value| {
+                as_str("SourceProfileComponent", "construction_order", value)
+                    .map(ToString::to_string)
+            })
+            .collect::<Result<Vec<_>>>()?;
+            component_fields.done()?;
+            if construction_order.is_empty() {
+                return refuse(
+                    Code::CONSTRUCTION_ORDER_REQUIRED,
+                    format!("source profile {name:?} component {component:?} has no order"),
+                );
+            }
+            let mut unique = construction_order.clone();
+            unique.sort();
+            unique.dedup();
+            if unique.len() != construction_order.len() {
+                return refuse(
+                    Code::DUPLICATE_KEY,
+                    format!("source profile {name:?} component {component:?} repeats a key"),
+                );
+            }
+            components.push(SourceProfileComponent {
+                component,
+                keyset_digest,
+                target_encoding,
+                construction_order,
+            });
+        }
+        fields.done()?;
+        if components.is_empty() {
+            return refuse(
+                Code::MISSING_FIELD,
+                format!("source profile {name:?} has no components"),
+            );
+        }
+        let mut component_names: Vec<&str> = components
+            .iter()
+            .map(|component| component.component.as_str())
+            .collect();
+        component_names.sort();
+        component_names.dedup();
+        if component_names.len() != components.len() {
+            return refuse(
+                Code::DUPLICATE_KEY,
+                format!("source profile {name:?} repeats a component"),
+            );
+        }
+        profiles.push(SourceProfile { name, components });
+    }
+    let mut names: Vec<&str> = profiles
+        .iter()
+        .map(|profile| profile.name.as_str())
+        .collect();
+    let given = names.clone();
+    names.sort();
+    if names != given {
+        return refuse(Code::SORT_ORDER, "source profiles must be sorted by name");
+    }
+    names.dedup();
+    if names.len() != profiles.len() {
+        return refuse(Code::DUPLICATE_KEY, "source profile names must be unique");
+    }
+    Ok(profiles)
 }
 
 /// Decoded `__metadata__` facts the border is willing to carry as EVIDENCE STAMPS. Foreign
@@ -543,6 +745,7 @@ mod tests {
                     note: "plain reviewed data".into(),
                 },
             }],
+            source_profiles: Vec::new(),
         }
     }
 
