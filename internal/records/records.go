@@ -67,7 +67,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 6
+const schemaVersion = 7
 
 // schema is the only records shape this pre-launch build accepts.
 var schema = append([]string{`
@@ -194,7 +194,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=6`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=7`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -123,6 +124,53 @@ func TestRentalRequestRequiresTheExplicitAcquisitionSeam(t *testing.T) {
 	}
 }
 
+func TestRentalPermissionPrefersLocalAndForceRentalSkipsIt(t *testing.T) {
+	name := "force-rental-local"
+	root := filepath.Join(os.TempDir(), "cozy-product-test", name)
+	spec := fakeSpec(name, "0", "--arm", "output", "--cozy-home", root)
+	var acquisitions atomic.Int64
+	owner := hostOwnerConfigured(t, name, fixedLauncher{spec},
+		func(options *orchestrator.Options) {
+			options.RentalFleet = func() (string, *exit.Error) { return "rentals: proof", nil }
+			options.AcquireManagedRental = func(records.Request) (string, string, *exit.Error) {
+				acquisitions.Add(1)
+				return "", "", exit.Named(exit.Unavailable, "force_rental_proof",
+					"the proof rental seam was called")
+			}
+		})
+	instance, _, problem := owner.c.EnsureWorker(spec)
+	fatal(t, problem)
+	fatal(t, owner.c.EnsurePlacementReady(instance, planIDOf(t, spec)))
+
+	permitted := submission(planIDOf(t, spec), spec.Placement.Package,
+		"rental-permitted-local", map[string]any{"message": "marco"})
+	permitted.Rental = true
+	localID, attempt, problem := owner.c.Submit(permitted)
+	fatal(t, problem)
+	if attempt != 1 {
+		t.Fatalf("rental-permitted request did not use ready local capacity: attempt=%d", attempt)
+	}
+	if result, problem := owner.c.AwaitSettled(localID, 5*time.Second); problem != nil || result.Status != "SUCCEEDED" {
+		t.Fatalf("rental-permitted local result=%+v problem=%v", result, problem)
+	}
+	if acquisitions.Load() != 0 {
+		t.Fatalf("rental permission called the paid seam despite ready local capacity")
+	}
+
+	required := submission(planIDOf(t, spec), spec.Placement.Package,
+		"rental-required-remote", map[string]any{"message": "marco"})
+	required.Rental, required.RentalRequired = true, true
+	remoteID, attempt, problem := owner.c.Submit(required)
+	fatal(t, problem)
+	if attempt != 0 || acquisitions.Load() != 1 {
+		t.Fatalf("forced rental attempt=%d acquisitions=%d", attempt, acquisitions.Load())
+	}
+	row := waitRequestState(t, owner, remoteID, "failed")
+	if !row.Rental || !row.RentalRequired || row.Worker != "" || row.Ordinal != 0 {
+		t.Fatalf("forced rental crossed into local dispatch: %+v", row)
+	}
+}
+
 func TestReadyManagedRentalDispatchesAgainAfterOutcomeAck(t *testing.T) {
 	name := "managed-rental-warm-wake"
 	root := filepath.Join(os.TempDir(), "cozy-product-test", name)
@@ -149,6 +197,7 @@ func TestReadyManagedRentalDispatchesAgainAfterOutcomeAck(t *testing.T) {
 		request := submission(planIDOf(t, spec), "fake/warm",
 			fmt.Sprintf("warm-rental-reuse-%d", run), map[string]any{"message": "marco"})
 		request.Rental = true
+		request.RentalRequired = true
 		id, attempt, problem := owner.c.Submit(request)
 		fatal(t, problem)
 		if attempt != 0 {
@@ -160,7 +209,7 @@ func TestReadyManagedRentalDispatchesAgainAfterOutcomeAck(t *testing.T) {
 				run, result, problem)
 		}
 		row, problem := owner.store.RequestRow(id)
-		if problem != nil || row == nil || row.Worker != "pr-warm" {
+		if problem != nil || row == nil || row.Worker != "pr-warm" || !row.RentalRequired {
 			t.Fatalf("run %d: warm rental assignment = %+v problem=%v", run, row, problem)
 		}
 	}

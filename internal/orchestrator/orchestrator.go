@@ -395,6 +395,10 @@ func (c *Orchestrator) drain() {
 			c.forget(id)
 			continue
 		}
+		if req.RentalRequired && req.Worker == "" {
+			c.selectOrStart(*req)
+			continue
+		}
 		attempt, e := c.dispatch(*req)
 		if e != nil {
 			// NO CAPACITY and AN ORDINAL THE LAW WILL NOT MINT YET are both "wait"; every

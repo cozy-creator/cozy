@@ -33,13 +33,14 @@ import (
 
 // JobSubmission is the job submit body.
 type JobSubmission struct {
-	Package       string          `json:"package"`
-	Function      string          `json:"function"`
-	Input         json.RawMessage `json:"input"`
-	InstallID     string          `json:"install_id,omitempty"`
-	Release       string          `json:"release,omitempty"`
-	ReleaseDigest string          `json:"release_digest,omitempty"`
-	Rental        bool            `json:"rental,omitempty"`
+	Package        string          `json:"package"`
+	Function       string          `json:"function"`
+	Input          json.RawMessage `json:"input"`
+	InstallID      string          `json:"install_id,omitempty"`
+	Release        string          `json:"release,omitempty"`
+	ReleaseDigest  string          `json:"release_digest,omitempty"`
+	Rental         bool            `json:"rental,omitempty"`
+	RentalRequired bool            `json:"rental_required,omitempty"`
 	// Worker pins an internal production step to the already-attached rental that
 	// prepared its source Manifests. It is admitted only with the CLI credential.
 	Worker string `json:"worker,omitempty"`
@@ -135,7 +136,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	if existing != nil {
 		spec, e = replayJobSubmission(sub, *existing)
 	} else {
-		if sub.Rental {
+		if sub.Rental || sub.RentalRequired {
 			unlock := privatepackage.Guard()
 			defer unlock()
 		}
@@ -250,7 +251,8 @@ func replayJobSubmission(sub JobSubmission,
 		PrivatePackageDigest: recorded.PrivatePackageDigest,
 		PlanID:               recorded.PlanID, Outputs: outputs, ArtifactOutputs: artifactOutputs,
 		JobGPUCount: recorded.JobGPUCount, Trees: trees, Worker: recorded.Worker,
-		Rental: sub.Rental, Models: models}, nil
+		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
+		Models: models}, nil
 }
 
 // resolveJob turns package+function into the orchestrator's Submission. The
@@ -260,7 +262,8 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 	out := orchestrator.Submission{
 		Kind: "job", Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org),
-		Release: sub.Release, ReleaseDigest: sub.ReleaseDigest, Rental: sub.Rental,
+		Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
+		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
 		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
 	}
 	if len(out.Payload) == 0 {
@@ -275,7 +278,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 	if s.packages == nil {
 		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
 	}
-	if sub.Worker != "" && !sub.Rental {
+	if sub.Worker != "" && !sub.Rental && !sub.RentalRequired {
 		return out, exit.Named(exit.Validation, "rental.job_worker_without_rental",
 			"a pinned remote worker requires rental authorization")
 	}
@@ -457,6 +460,9 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		doc["rental"] = true
 		doc["release"] = spec.Release
 		doc["release_digest"] = spec.ReleaseDigest
+	}
+	if spec.RentalRequired {
+		doc["rental_required"] = true
 	}
 	data, err := canonical.Write(doc)
 	if err != nil {

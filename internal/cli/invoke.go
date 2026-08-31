@@ -91,14 +91,14 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
 			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --await, and --rental")
 	}
-	if ctx.Inv.Bool("--rental") && len(callable.Models) > 0 {
+	if rentalRequested(ctx) && len(callable.Models) > 0 {
 		return exit.Named(exit.Unavailable, "rental.modeled_job_unsupported",
 			"remote jobs with model slots are not supported yet")
 	}
 	if len(ctx.Inv.Values["--model"]) > 0 {
 		return exit.Usagef("--model applies to serving callables; remote modeled jobs are not supported yet")
 	}
-	if ctx.Inv.Bool("--rental") && len(ctx.Inv.Values["--input"]) > 0 {
+	if rentalRequested(ctx) && len(ctx.Inv.Values["--input"]) > 0 {
 		return exit.Named(exit.Unavailable, "rental.job_input_tree_unsupported",
 			"remote jobs cannot grant a local input-tree directory")
 	}
@@ -109,13 +109,17 @@ func handleRunExecute(ctx *Context) *exit.Error {
 }
 
 func validateRunPlacement(ctx *Context) *exit.Error {
-	managedRental := ctx.Inv.Bool("--rental")
+	managedRental := rentalRequested(ctx)
 	if managedRental && ctx.Cfg.RentalsMaxHourlySpendUSDMicros <= 0 {
 		return exit.Named(exit.Usage, "rental.spend_cap_required",
 			"--rental requires a positive rentals.max_hourly_spend_usd in %s", filepath.Join(ctx.Cfg.Home, "config.yaml")).
 			WithRemedy("set the fleet-wide hourly ceiling before authorizing rental spend")
 	}
 	return nil
+}
+
+func rentalRequested(ctx *Context) bool {
+	return ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--force-rental")
 }
 
 func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
@@ -131,7 +135,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA — the surface the release's own
 	// runtime vouched for at install — so a typo costs a millisecond instead of a model
 	// load, and `steps=2` is an int because the schema says int.
-	managedRental := ctx.Inv.Bool("--rental")
+	managedRental := rentalRequested(ctx)
 	if legacy := launch.LegacyFileTerm(ctx.Inv.Args[1:]); managedRental && legacy != "" {
 		return exit.Named(exit.Usage, "remote_file_input_ambiguous",
 			"%s embeds file bytes into a JSON string and cannot name a remote input grant", legacy).
@@ -178,6 +182,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Package: target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
 		Release: target.Release, ReleaseDigest: target.ReleaseDigest, Rental: managedRental,
+		RentalRequired:  ctx.Inv.Bool("--force-rental"),
 		Models:          models,
 		OutputDirectory: outputDirectory, OutputPayloadHash: outputIntentHash,
 	}, key)
@@ -1263,7 +1268,7 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	if ctx.Inv.Bool("--rental") && strings.HasPrefix(target.Package, "local/") {
+	if rentalRequested(ctx) && strings.HasPrefix(target.Package, "local/") {
 		facts, problem := generationFacts(ctx, target.Package)
 		if problem != nil {
 			return Target{}, nil, problem
@@ -1273,7 +1278,7 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 		target.ReleaseDigest = facts.Install.SourceDigest
 		return target, facts.PackageDescriptor, nil
 	}
-	if ctx.Inv.Bool("--rental") {
+	if rentalRequested(ctx) {
 		ref, problem := hub.ParseRef(target.Package)
 		if problem != nil {
 			return Target{}, nil, problem
