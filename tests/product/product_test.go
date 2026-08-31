@@ -979,14 +979,14 @@ func TestUpDoesNotRequireLocalRuntime(t *testing.T) {
 	}
 }
 
-func TestRentalGPUCatalog(t *testing.T) {
+func TestRentalCatalog(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v1/rental-skus" {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[{"name":"h200","accelerator_model":"NVIDIA H200","compute_capability":"9.0","vram_gb":141,"minimum_ram_per_gpu_gb":64,"price_usd_micros_per_hour":6000000},{"name":"rtx-4090","accelerator_model":"NVIDIA GeForce RTX 4090","compute_capability":"8.9","vram_gb":24,"minimum_ram_per_gpu_gb":32,"price_usd_micros_per_hour":1250000}]`)
+		_, _ = io.WriteString(w, `[{"name":"h200","accelerator_model":"NVIDIA H200","compute_capability":"9.0","vram_gb":141,"minimum_ram_per_gpu_gb":64,"price_usd_micros_per_hour":6000000},{"name":"rtx-4090","accelerator_model":"NVIDIA GeForce RTX 4090","compute_capability":"8.9","vram_gb":24,"minimum_ram_per_gpu_gb":32,"price_usd_micros_per_hour":1250000},{"name":"cpu","accelerator_model":"CPU","compute_capability":"","vram_gb":0,"minimum_ram_per_gpu_gb":0,"price_usd_micros_per_hour":70000}]`)
 	}))
 	defer server.Close()
 	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-gpu-catalog")
@@ -1000,12 +1000,13 @@ func TestRentalGPUCatalog(t *testing.T) {
 	var document struct {
 		GPUs []map[string]string `json:"gpus"`
 	}
-	if err := json.Unmarshal([]byte(result.output), &document); err != nil || len(document.GPUs) != 2 {
-		t.Fatalf("rental catalog was not a two-row GPU list: %v\n%s", err, result.output)
+	if err := json.Unmarshal([]byte(result.output), &document); err != nil || len(document.GPUs) != 3 {
+		t.Fatalf("rental catalog was not a three-row machine list: %v\n%s", err, result.output)
 	}
 	if document.GPUs[0]["name"] != "h200" || document.GPUs[0]["model"] != "NVIDIA H200" ||
 		document.GPUs[0]["compute"] != "sm_90" || document.GPUs[0]["vram"] != "141 GB" || document.GPUs[0]["price"] != "$6/hr" ||
-		document.GPUs[1]["price"] != "$1.25/hr" {
+		document.GPUs[1]["price"] != "$1.25/hr" || document.GPUs[2]["name"] != "cpu" ||
+		document.GPUs[2]["model"] != "CPU" || document.GPUs[2]["price"] != "$0.07/hr" {
 		t.Fatalf("rental catalog values drifted: %#v", document.GPUs)
 	}
 	if result := runCozyEnv(env, "rental", "new", "h200", "extra"); result.code != 2 || !strings.Contains(result.output, "unexpected argument") {

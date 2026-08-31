@@ -67,6 +67,7 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 	if problem := m.reconcileLocked(); problem != nil {
 		return "", "", problem
 	}
+	needsCPU := len(req.Models) == 0 && req.JobGPUCount == 0
 	rows, problem := m.store.Rentals()
 	if problem != nil {
 		return "", "", problem
@@ -78,6 +79,9 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		return rows[i].ID < rows[j].ID
 	})
 	for _, row := range rows {
+		if (row.AcceleratorModel == "CPU") != needsCPU {
+			continue
+		}
 		if row.State != hub.RentalReady && row.State != "attached" {
 			continue
 		}
@@ -104,9 +108,16 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 	if problem != nil {
 		return "", "", problem
 	}
+	compatible := skus[:0]
+	for _, sku := range skus {
+		if (sku.AcceleratorModel == "CPU") == needsCPU {
+			compatible = append(compatible, sku)
+		}
+	}
+	skus = compatible
 	if len(skus) == 0 {
 		return "", "", exit.Named(exit.Capacity, "rental.no_skus",
-			"Tensorhub currently offers no rental SKU")
+			"Tensorhub currently offers no compatible rental SKU")
 	}
 	sort.Slice(skus, func(i, j int) bool {
 		if skus[i].PriceUSDMicrosPerHour != skus[j].PriceUSDMicrosPerHour {
