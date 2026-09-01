@@ -3,9 +3,8 @@
 # venv, and READ A REAL NAMED TENSOR out of a fresh current-layout store — a lease,
 # a plan in the caller's traversal order, a slot ring, and the digest the Rust path banks.
 #
-# An import smoke proves the wheel loads. This proves the wheel WORKS, which is the only
-# thing that stops a matrix entry from rotting quietly. A live run, not a test — see
-# tracker README #160.
+# An import smoke proves the wheel loads. This proves the wheel WORKS. It is the repo's
+# end-to-end test and CI runs it on every push.
 #
 #   scripts/wheel-smoke.sh [workdir] [python] [--skip-build] [--wheels <dir>]
 set -euo pipefail
@@ -47,6 +46,9 @@ rm -rf "$work/venv"
 echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/version_contract.py installed "$wheel"
 "$work/venv/bin/python" scripts/code-topology-runs.py
+# The frozen corpus, through the FACADE. `tfs vectors verify` runs the same 90 vectors
+# through Rust; this proves the marshal boundary agrees — same ids, same typed refusals.
+"$work/venv/bin/python" scripts/facade-conform.py
 
 "$work/venv/bin/python" - "$fixture" "$SNAP" <<'PY'
 import hashlib, json, pathlib, sys, tempfile
