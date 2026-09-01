@@ -295,53 +295,6 @@ func TestModelUploadSettlesPartialWhenIndependentBranchSucceeds(t *testing.T) {
 	}
 }
 
-func TestForeignModelProductionRefusesBeforeWriteOrSpend(t *testing.T) {
-	var mu sync.Mutex
-	accountReads, unexpected := 0, 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		if r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current" {
-			accountReads++
-			_ = json.NewEncoder(w).Encode(map[string]string{"name": "acme"})
-			return
-		}
-		unexpected++
-		http.Error(w, "unexpected provider/publication call", http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	root := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
-		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\n"), 0o600))
-	daemon := startDaemonProcess(t, root)
-	instruction := modelproduction.Instruction{
-		Destination: "foreign/output",
-		Source:      "hf://source/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		Producer:    "proof/tools@v1/build", Rental: true,
-	}
-	reply := daemon.call(t, http.MethodPost, "/v1/local/model-productions",
-		map[string]any{"instruction": instruction})
-	if reply.Status != http.StatusBadRequest || reply.code() != "usage" ||
-		!strings.Contains(string(reply.Body), "logged in as Tensorhub account acme") {
-		t.Fatalf("foreign production acceptance = %s", reply.brief())
-	}
-	layout, problem := home.Open(root)
-	fatal(t, problem)
-	store, problem := records.Open(layout.DB)
-	fatal(t, problem)
-	rows, problem := store.ModelProductions("any", 50)
-	store.Close()
-	fatal(t, problem)
-	mu.Lock()
-	reads, other := accountReads, unexpected
-	mu.Unlock()
-	if len(rows) != 0 || reads != 1 || other != 0 {
-		t.Fatalf("foreign production crossed boundary: rows=%d account_reads=%d other_calls=%d",
-			len(rows), reads, other)
-	}
-}
-
 func TestModelProductionSourceRequestHonorsCancellationContext(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -491,8 +444,7 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 		got != "GET /v1/models/resolve\nGET /v1/packages/proof/remote-producer\n"+
 			"GET /v1/packages/proof/remote-producer/releases/2.0.0\n"+
 			"GET /v1/packages/proof/remote-job\n"+
-			"GET /v1/packages/proof/remote-job/releases/3.0.0\n"+
-			"GET /v1/accounts/current" {
+			"GET /v1/packages/proof/remote-job/releases/3.0.0" {
 		t.Fatalf("remote production metadata routes =\n%s", got)
 	}
 	if producerCardReads != 1 {

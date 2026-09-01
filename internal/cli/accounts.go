@@ -15,6 +15,12 @@ func publicationAccount(ctx *Context) (*hub.Client, hub.Account, *exit.Error) {
 }
 
 func ownedPublication(ctx *Context, ref hub.Ref) (*hub.Client, *exit.Error) {
+	// An explicitly configured token may be an operator or automation credential
+	// with authority over more than one account. Tensorhub is the authority for
+	// that scope; an end-user account lookup would incorrectly narrow it here.
+	if ctx.Cfg.HubToken.Present() {
+		return client(ctx), nil
+	}
 	c, account, problem := publicationAccount(ctx)
 	if problem != nil {
 		return nil, problem

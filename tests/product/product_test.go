@@ -115,14 +115,10 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 
 func TestModelProductionGrammar(t *testing.T) {
 	root := t.TempDir()
+	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/v1/accounts/current" ||
-			r.Header.Get("Authorization") != "Bearer proof-token" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"name":"acme"}`)
+		requests++
+		http.Error(w, "dry-run unexpectedly contacted Tensorhub", http.StatusInternalServerError)
 	}))
 	defer server.Close()
 	accountEnv := []string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}
@@ -150,9 +146,9 @@ func TestModelProductionGrammar(t *testing.T) {
 	}
 	code, out = runCozyDir(t, root, ".", accountEnv, "model", "upload", "other/model", local,
 		"--dry-run")
-	if code != 2 || !strings.Contains(out, "logged in as Tensorhub account acme") ||
-		!strings.Contains(out, "publish as acme/model") {
-		t.Fatalf("cross-account model upload was not refused [exit %d]\n%s", code, out)
+	if code != 0 || !strings.Contains(out, "status:  planned") || requests != 0 {
+		t.Fatalf("configured publication token was narrowed client-side [exit %d requests %d]\n%s",
+			code, requests, out)
 	}
 	code, out = runCozy(t, root, "model", "upload", "acme/model", local,
 		"--dry-run", "--detach")
@@ -193,19 +189,15 @@ func TestModelReleaseUpdateAndYankCLIContracts(t *testing.T) {
 		requests = append(requests, r.Method+" "+r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		switch len(requests) {
-		case 1, 4:
-			if r.Method != http.MethodGet || r.URL.Path != "/v1/accounts/current" {
-				t.Fatalf("account request = %s %s", r.Method, r.URL.Path)
-			}
-			_, _ = io.WriteString(w, `{"name":"acme"}`)
-		case 2:
+		case 1:
 			if r.Method != http.MethodGet || r.URL.Path != "/v1/models/acme/model" {
 				t.Fatalf("release read = %s %s", r.Method, r.URL.Path)
 			}
 			_, _ = io.WriteString(w, `{"model":{"org":"acme","name":"model","created_at":"2026-09-01T00:00:00Z"},"releases":[{"release":"stable","revision":4,"cut_at":"2026-09-01T00:00:00Z","lanes":[{"lane":"broken","manifest_id":"`+checkpoint+`"}]}]}`)
-		case 3:
+		case 2:
 			if r.Method != http.MethodPost || r.URL.Path != "/v1/models/acme/model/releases/stable" ||
-				r.Header.Get("X-Tensorhub-Reason") != "cozy model publish acme/model@stable" {
+				r.Header.Get("X-Tensorhub-Reason") != "cozy model publish acme/model@stable" ||
+				r.Header.Get("Authorization") != "Bearer proof-token" {
 				t.Fatalf("release update = %s %s %#v", r.Method, r.URL.Path, r.Header)
 			}
 			var body struct {
@@ -218,9 +210,10 @@ func TestModelReleaseUpdateAndYankCLIContracts(t *testing.T) {
 				t.Fatalf("release update body = %#v, %v", body, err)
 			}
 			_, _ = io.WriteString(w, `{"release":"stable","revision":5,"yanked":false,"lanes":[{"lane":"fp8","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["fp8"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("d", 64)+`","changed":true}`)
-		case 5:
+		case 3:
 			if r.Method != http.MethodDelete || r.URL.Path != "/v1/models/acme/model/releases/stable" ||
-				r.Header.Get("X-Tensorhub-Reason") != "cozy model yank acme/model@stable" {
+				r.Header.Get("X-Tensorhub-Reason") != "cozy model yank acme/model@stable" ||
+				r.Header.Get("Authorization") != "Bearer proof-token" {
 				t.Fatalf("release yank = %s %s %#v", r.Method, r.URL.Path, r.Header)
 			}
 			_, _ = io.WriteString(w, `{"release":"stable","revision":6,"yanked":true,"lanes":[{"lane":"fp8","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["fp8"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("e", 64)+`","changed":true}`)
@@ -243,14 +236,48 @@ func TestModelReleaseUpdateAndYankCLIContracts(t *testing.T) {
 	}
 }
 
+func TestConfiguredTokenLeavesPublicationScopeToTensorhub(t *testing.T) {
+	checkpoint := "sha256:" + strings.Repeat("a", 64)
+	accountReads, mutations := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/accounts/current":
+			accountReads++
+			http.Error(w, "unexpected account lookup", http.StatusInternalServerError)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/foreign/model":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":{"code":"model.not_found","message":"model is absent"}}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/models/foreign/model/releases/stable":
+			mutations++
+			if r.Header.Get("Authorization") != "Bearer proof-token" {
+				t.Fatalf("publication carried authorization %q", r.Header.Get("Authorization"))
+			}
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":{"code":"publication.forbidden","message":"token cannot publish foreign/model","remedy":"use an authorized token"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	code, out := runCozyDir(t, t.TempDir(), ".", []string{
+		"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token",
+	}, "model", "publish", "foreign/model", "--release", "stable",
+		"--lane", "fp8="+checkpoint)
+	if code == 0 || accountReads != 0 || mutations != 1 ||
+		!strings.Contains(out, "token cannot publish foreign/model") ||
+		!strings.Contains(out, "use an authorized token") {
+		t.Fatalf("Hub publication refusal [exit %d accounts %d mutations %d]\n%s",
+			code, accountReads, mutations, out)
+	}
+}
+
 func TestModelPublishRefusesFinalLaneRemovalBeforeMutation(t *testing.T) {
 	checkpoint := "sha256:" + strings.Repeat("a", 64)
 	mutations := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current":
-			_, _ = io.WriteString(w, `{"name":"acme"}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/acme/model":
 			_, _ = io.WriteString(w, `{"model":{"org":"acme","name":"model","created_at":"2026-09-01T00:00:00Z"},"releases":[{"release":"stable","revision":4,"cut_at":"2026-09-01T00:00:00Z","lanes":[{"lane":"bf16","manifest_id":"`+checkpoint+`"}]}]}`)
 		default:
@@ -276,13 +303,11 @@ func TestModelPublishExactReplayUsesCurrentRevision(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch requests {
 		case 1:
-			_, _ = io.WriteString(w, `{"name":"acme"}`)
-		case 2:
 			if r.Method != http.MethodGet || r.URL.Path != "/v1/models/acme/model" {
 				t.Fatalf("release card = %s %s", r.Method, r.URL.Path)
 			}
 			_, _ = io.WriteString(w, `{"model":{"org":"acme","name":"model","created_at":"2026-09-01T00:00:00Z"},"releases":[{"release":"stable","revision":5,"cut_at":"2026-09-01T00:00:00Z","lanes":[{"lane":"fp8","manifest_id":"`+checkpoint+`"}]}]}`)
-		case 3:
+		case 2:
 			var body struct {
 				ExpectedRevision int64 `json:"expected_revision"`
 			}
@@ -300,7 +325,7 @@ func TestModelPublishExactReplayUsesCurrentRevision(t *testing.T) {
 		"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token",
 	}, "--json", "model", "publish", "acme/model", "--release", "stable",
 		"--lane", "fp8="+checkpoint)
-	if code != 0 || requests != 3 || !strings.Contains(out, `"revision":5`) ||
+	if code != 0 || requests != 2 || !strings.Contains(out, `"revision":5`) ||
 		!strings.Contains(out, `"changed":false`) {
 		t.Fatalf("exact release replay [exit %d requests %d]\n%s", code, requests, out)
 	}
