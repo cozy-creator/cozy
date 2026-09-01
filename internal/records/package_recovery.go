@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -15,11 +16,12 @@ import (
 
 const maxRecoveredPackageGenerations = 4096
 
-// RecoverPackageInventory copies only package generations and their active pins from
-// one explicit read-only Creator database into an empty current inventory. It never
-// discovers backups, guesses by mtime, traverses generation trees, or changes model
-// roots. Every database row is joined to exact bounded files before one transaction
-// makes any row visible.
+// RecoverPackageInventory merges verified package generations and their active pins
+// from one explicit read-only Creator database. It never discovers backups, guesses by
+// mtime, traverses generation trees, changes model roots, or replaces a current row.
+// Every source row is joined to exact bounded files before one transaction makes any
+// noncolliding row visible. An identical row is an idempotent no-op; any other generation
+// id or package-pin collision refuses the whole merge.
 func (s *Store) RecoverPackageInventory(sourcePath, generationsRoot string) (int, *exit.Error) {
 	absolute, err := filepath.Abs(sourcePath)
 	if err != nil || absolute == "" {
@@ -122,20 +124,39 @@ func (s *Store) RecoverPackageInventory(sourcePath, generationsRoot string) (int
 		return 0, exit.Internalf("cannot begin package inventory recovery: %s", err)
 	}
 	defer tx.Rollback()
-	var currentGenerations, currentPins int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM install_generations`).Scan(&currentGenerations); err != nil {
-		return 0, exit.Internalf("cannot inspect current package inventory: %s", err)
-	}
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM pins`).Scan(&currentPins); err != nil {
-		return 0, exit.Internalf("cannot inspect current package pins: %s", err)
-	}
-	if currentGenerations != 0 || currentPins != 0 {
-		return 0, exit.Named(exit.Conflict, "package_inventory_not_empty",
-			"current package inventory contains %d generations and %d pins",
-			currentGenerations, currentPins).
-			WithRemedy("recovery never merges or guesses; use an empty current inventory or keep the current rows")
-	}
+	missingGenerations := make([]PackageInstall, 0, len(generations))
 	for _, generation := range generations {
+		current, scanErr := scanGen(tx.QueryRow(
+			`SELECT `+genCols("")+` FROM install_generations WHERE id=?`, generation.ID))
+		switch {
+		case errors.Is(scanErr, sql.ErrNoRows):
+			missingGenerations = append(missingGenerations, generation)
+		case scanErr != nil:
+			return 0, exit.Internalf("cannot inspect current package generation %s: %s",
+				generation.ID, scanErr)
+		case current != generation:
+			return 0, exit.Named(exit.Conflict, "package_generation_recovery_collision",
+				"current package generation %s differs from the verified backup row", generation.ID).
+				WithRemedy("keep the current generation or recover a backup whose immutable row is identical")
+		}
+	}
+	missingPins := make([]Pin, 0, len(pins))
+	for _, pin := range pins {
+		var current Pin
+		scanErr := tx.QueryRow(`SELECT package,major,generation,activated_at FROM pins WHERE package=?`,
+			pin.Package).Scan(&current.Package, &current.Major, &current.InstallID, &current.ActivatedAt)
+		switch {
+		case errors.Is(scanErr, sql.ErrNoRows):
+			missingPins = append(missingPins, pin)
+		case scanErr != nil:
+			return 0, exit.Internalf("cannot inspect current package pin %s: %s", pin.Package, scanErr)
+		case current != pin:
+			return 0, exit.Named(exit.Conflict, "package_pin_recovery_collision",
+				"current package pin %s differs from the verified backup row", pin.Package).
+				WithRemedy("keep the current pin or recover a backup whose active pin is identical")
+		}
+	}
+	for _, generation := range missingGenerations {
 		verified := 0
 		if generation.Verified {
 			verified = 1
@@ -151,7 +172,7 @@ func (s *Store) RecoverPackageInventory(sourcePath, generationsRoot string) (int
 			return 0, exit.Internalf("cannot recover package generation %s: %s", generation.ID, err)
 		}
 	}
-	for _, pin := range pins {
+	for _, pin := range missingPins {
 		if _, err := tx.Exec(`INSERT INTO pins(package,major,generation,activated_at) VALUES(?,?,?,?)`,
 			pin.Package, pin.Major, pin.InstallID, pin.ActivatedAt); err != nil {
 			return 0, exit.Internalf("cannot recover package pin %s: %s", pin.Package, err)
@@ -160,7 +181,7 @@ func (s *Store) RecoverPackageInventory(sourcePath, generationsRoot string) (int
 	if err := tx.Commit(); err != nil {
 		return 0, exit.New(exit.Conflict, "package inventory recovery did not commit: %s", err)
 	}
-	return len(generations), nil
+	return len(missingGenerations), nil
 }
 
 func verifyRecoverableGeneration(generation PackageInstall, generationsRoot string) *exit.Error {
@@ -169,6 +190,11 @@ func verifyRecoverableGeneration(generation PackageInstall, generationsRoot stri
 		generation.SourceKind != "tensorhub" && generation.SourceKind != "local" {
 		return exit.Named(exit.Validation, "package_generation_recovery_invalid",
 			"backup generation %q has incomplete immutable identity", generation.ID)
+	}
+	if !generation.Verified {
+		return exit.Named(exit.Validation, "package_generation_recovery_unverified",
+			"backup generation %s is a local or otherwise unverified install", generation.ID).
+			WithRemedy("reinstall that local package from its source; recovery imports only verified custody")
 	}
 	wantDir := filepath.Join(filepath.Clean(generationsRoot), generation.ID)
 	if !filepath.IsAbs(generation.Dir) || filepath.Clean(generation.Dir) != wantDir {
