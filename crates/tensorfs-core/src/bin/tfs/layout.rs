@@ -112,7 +112,7 @@ pub fn project(h: &Header, contract_name: &str) -> CodeTopology {
 ///
 /// The rows carry component, key, logical dtype/shape and the measured role geometry, and
 /// nothing else — no format marks, no canonical bytes. That split is deliberate: the
-/// transcriber that reads a pinned foreign header (`scripts/h3-pairs.py`) must never become
+/// transcriber that reads a pinned foreign header must never become
 /// a second canonical writer, and the one-codec fence would catch it if it tried.
 ///
 /// **The logical facts are REAL and the part object ids are PLACEHOLDERS.** Keys, dtypes,
