@@ -38,6 +38,7 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	accountRegistrations := 0
 	accountName := ""
 	foreignModelRequests := 0
+	logoutAttempts := 0
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -115,6 +116,16 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 		case "/v1/auth/device-keys/" + authTestDeviceID:
 			if r.Method != http.MethodDelete || r.Header.Get("Authorization") != "Bearer second-access-token" {
 				t.Errorf("logout = %s auth %q", r.Method, r.Header.Get("Authorization"))
+				return
+			}
+			mu.Lock()
+			logoutAttempts++
+			attempt := logoutAttempts
+			mu.Unlock()
+			if attempt == 1 {
+				writeAuthJSON(t, w, http.StatusServiceUnavailable, map[string]any{"error": map[string]string{
+					"code": "auth.revoke_unavailable", "message": "machine revocation is temporarily unavailable",
+				}})
 				return
 			}
 			writeAuthJSON(t, w, http.StatusOK, map[string]bool{"ok": true})
@@ -266,6 +277,14 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 		t.Fatalf("revoke other machines [exit %d]\nstdout: %s\nstderr: %s",
 			revoked.code, revoked.stdout, revoked.stderr)
 	}
+	failedLogout := runAuthCozy(t, root, server.URL, "", "auth", "logout", "--json")
+	if failedLogout.code == 0 || !strings.Contains(failedLogout.stdout, `"code":"auth.revoke_unavailable"`) {
+		t.Fatalf("failed logout [exit %d]\nstdout: %s\nstderr: %s",
+			failedLogout.code, failedLogout.stdout, failedLogout.stderr)
+	}
+	if _, err := os.Stat(files[0]); err != nil {
+		t.Fatalf("failed server revocation erased the local key: %v", err)
+	}
 	loggedOut := runAuthCozy(t, root, server.URL, "", "auth", "logout", "--json")
 	if loggedOut.code != 0 || !strings.Contains(loggedOut.stdout, `"status":"logged out"`) || loggedOut.stderr != "" {
 		t.Fatalf("logout [exit %d]\nstdout: %s\nstderr: %s", loggedOut.code, loggedOut.stdout, loggedOut.stderr)
@@ -277,8 +296,8 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if enrollBegins != 2 || loginBegins != 8 {
-		t.Fatalf("auth begin calls = enroll %d login %d, want 2/8", enrollBegins, loginBegins)
+	if enrollBegins != 2 || loginBegins != 9 {
+		t.Fatalf("auth begin calls = enroll %d login %d, want 2/9", enrollBegins, loginBegins)
 	}
 	if foreignModelRequests != 0 {
 		t.Fatalf("foreign model requests = %d, want 0", foreignModelRequests)
