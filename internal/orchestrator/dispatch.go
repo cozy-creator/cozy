@@ -402,7 +402,11 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 			c.emit(requestID, "request.failed", 0, payload)
 		}
 		c.RetryOutputExport(requestID)
-		c.frames.forget(requestID)
+		if row != nil && row.ModelTransfer != nil {
+			c.forgetTransferProgress(requestID)
+		} else {
+			c.frames.forget(requestID)
+		}
 		c.signalClosed(requestWaitKey(requestID), e)
 		if row, read := c.opt.Store.RequestRow(requestID); read == nil && row != nil {
 			go c.cleanupRequestAssets(*row)
@@ -411,7 +415,12 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 	}
 	if canceled {
 		c.forget(requestID)
-		c.frames.forget(requestID)
+		if row, read := c.opt.Store.RequestRow(requestID); read == nil && row != nil &&
+			row.ModelTransfer != nil {
+			c.forgetTransferProgress(requestID)
+		} else {
+			c.frames.forget(requestID)
+		}
 		c.signalClosed(requestWaitKey(requestID),
 			exit.New(exit.Canceled, "%s was canceled before its requeue", requestID))
 		if row, read := c.opt.Store.RequestRow(requestID); read == nil && row != nil {
