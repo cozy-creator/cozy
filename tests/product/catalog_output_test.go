@@ -24,10 +24,23 @@ func TestModelSearchShowsAuthoritativeAvailableReleaseLanes(t *testing.T) {
 			if r.Method != http.MethodGet || r.URL.Query().Get("q") != "" {
 				t.Fatalf("model search = %s %s", r.Method, r.URL.String())
 			}
-			_, _ = io.WriteString(w, `{"models":[{"org":"acme","name":"alpha","created_at":"2026-09-01T00:00:00Z"},{"org":"acme","name":"beta","created_at":"2026-09-02T00:00:00Z"}],"search":{"total":2,"limit":1000,"capped":false,"q":""}}`)
+			if r.URL.Query().Get("family") == "sdxl" {
+				_, _ = io.WriteString(w, `{"models":[{"org":"acme","name":"alpha","family":"sdxl","created_at":"2026-09-01T00:00:00Z"}],"search":{"total":1,"limit":1000,"capped":false,"q":""}}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"models":[{"org":"acme","name":"alpha","family":"sdxl","created_at":"2026-09-01T00:00:00Z"},{"org":"acme","name":"beta","created_at":"2026-09-02T00:00:00Z"}],"search":{"total":2,"limit":1000,"capped":false,"q":""}}`)
 		case "/v1/models/acme/alpha":
 			alphaCards++
-			_, _ = io.WriteString(w, `{"model":{"org":"acme","name":"alpha","created_at":"2026-09-01T00:00:00Z"},"releases":[{"release":"2.0.0","lanes":[{"lane":"fp8","manifest_id":"`+manifest+`"},{"lane":"bf16","manifest_id":"`+manifest+`"},{"lane":"bf16","manifest_id":"`+manifest+`"}]},{"release":"1.0.0","lanes":[{"lane":"bf16","manifest_id":"`+manifest+`"}]},{"release":"broken","yanked":true,"lanes":[{"lane":"q4","manifest_id":"`+manifest+`"}]}]}`)
+			if r.Method == http.MethodPatch {
+				if r.Header.Get("Authorization") != "Bearer test-token" {
+					t.Fatalf("model family authorization = %q", r.Header.Get("Authorization"))
+				}
+				var body map[string]string
+				must(t, json.NewDecoder(r.Body).Decode(&body))
+				_, _ = io.WriteString(w, `{"model":{"org":"acme","name":"alpha","family":"`+body["family"]+`","created_at":"2026-09-01T00:00:00Z"}}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"model":{"org":"acme","name":"alpha","family":"sdxl","created_at":"2026-09-01T00:00:00Z"},"releases":[{"release":"2.0.0","lanes":[{"lane":"fp8","manifest_id":"`+manifest+`"},{"lane":"bf16","manifest_id":"`+manifest+`"},{"lane":"bf16","manifest_id":"`+manifest+`"}]},{"release":"1.0.0","lanes":[{"lane":"bf16","manifest_id":"`+manifest+`"}]},{"release":"broken","yanked":true,"lanes":[{"lane":"q4","manifest_id":"`+manifest+`"}]}]}`)
 		case "/v1/models/acme/beta":
 			betaCards++
 			_, _ = io.WriteString(w, `{"model":{"org":"acme","name":"beta","created_at":"2026-09-02T00:00:00Z"},"releases":[{"release":"stable","lanes":[{"lane":"int8","manifest_id":"`+manifest+`"}]}]}`)
@@ -42,12 +55,13 @@ func TestModelSearchShowsAuthoritativeAvailableReleaseLanes(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	env := []string{"TENSORHUB_URL=" + server.URL}
+	env := []string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=test-token"}
 
 	code, out := runCozyDir(t, t.TempDir(), ".", env, "model", "search")
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if code != 0 || len(lines) != 3 || !reflect.DeepEqual(strings.Fields(lines[0]), []string{"MODEL", "LANES"}) ||
+	if code != 0 || len(lines) != 3 || !reflect.DeepEqual(strings.Fields(lines[0]), []string{"MODEL", "FAMILY", "LANES"}) ||
 		!strings.Contains(lines[1], "acme/alpha") || !strings.Contains(lines[1], "1.0.0/bf16, 2.0.0/bf16, 2.0.0/fp8") ||
+		!strings.Contains(lines[1], "sdxl") ||
 		!strings.Contains(lines[2], "acme/beta") || !strings.Contains(lines[2], "stable/int8") ||
 		strings.Contains(out, "q4") || strings.Contains(out, manifest) {
 		t.Fatalf("model search output [exit %d]\n%s", code, out)
@@ -59,9 +73,19 @@ func TestModelSearchShowsAuthoritativeAvailableReleaseLanes(t *testing.T) {
 	}
 	if code != 0 || json.Unmarshal([]byte(out), &document) != nil || len(document.Models) != 1 ||
 		document.Models[0]["model"] != "acme/alpha" ||
+		document.Models[0]["family"] != "sdxl" ||
 		document.Models[0]["lanes"] != "1.0.0/bf16, 2.0.0/bf16, 2.0.0/fp8" ||
 		strings.Contains(out, manifest) {
 		t.Fatalf("exact model search output [exit %d]\n%s", code, out)
+	}
+
+	code, out = runCozyDir(t, t.TempDir(), ".", env, "model", "search", "--family", "sdxl")
+	if code != 0 || !strings.Contains(out, "acme/alpha") || strings.Contains(out, "acme/beta") {
+		t.Fatalf("family-filtered model search [exit %d]\n%s", code, out)
+	}
+	code, out = runCozyDir(t, t.TempDir(), ".", env, "model", "family", "acme/alpha", "illustrious")
+	if code != 0 || !strings.Contains(out, "family: illustrious") || !strings.Contains(out, "status: updated") {
+		t.Fatalf("model family update [exit %d]\n%s", code, out)
 	}
 
 	code, out = runCozyDir(t, t.TempDir(), ".", env, "package", "search")
@@ -73,7 +97,7 @@ func TestModelSearchShowsAuthoritativeAvailableReleaseLanes(t *testing.T) {
 		!strings.Contains(out, "created: 2026-09-03T00:00:00Z") {
 		t.Fatalf("exact package search output changed [exit %d]\n%s", code, out)
 	}
-	if searches != 1 || alphaCards != 2 || betaCards != 1 || packageSearches != 1 || packageCards != 1 {
+	if searches != 2 || alphaCards != 4 || betaCards != 1 || packageSearches != 1 || packageCards != 1 {
 		t.Fatalf("catalog requests = searches %d alpha %d beta %d package searches %d cards %d",
 			searches, alphaCards, betaCards, packageSearches, packageCards)
 	}

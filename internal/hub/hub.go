@@ -161,6 +161,7 @@ func (c *Client) Base() string { return c.base }
 type Resource struct {
 	Org       string `json:"org"`
 	Name      string `json:"name"`
+	Family    string `json:"family,omitempty"`
 	CreatedAt string `json:"created_at"`
 }
 
@@ -261,15 +262,34 @@ func (c *Client) Packages(ctx context.Context, query string) ([]Resource, Resour
 }
 
 // Models searches model resources server-side. Public.
-func (c *Client) Models(ctx context.Context, query string) ([]Resource, ResourceSearch, *exit.Error) {
+func (c *Client) Models(ctx context.Context, query, family string) ([]Resource, ResourceSearch, *exit.Error) {
 	var out struct {
 		Models []Resource     `json:"models"`
 		Search ResourceSearch `json:"search"`
 	}
-	if e := c.do(ctx, call{method: http.MethodGet, path: resourceSearchPath("models", query)}, &out); e != nil {
+	path := resourceSearchPath("models", query)
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	if family != "" {
+		path += separator + url.Values{"family": []string{family}}.Encode()
+	}
+	if e := c.do(ctx, call{method: http.MethodGet, path: path}, &out); e != nil {
 		return nil, ResourceSearch{}, e
 	}
 	return out.Models, out.Search, nil
+}
+
+func (c *Client) SetModelFamily(ctx context.Context, ref Ref, family string) (Resource, *exit.Error) {
+	var out struct {
+		Model Resource `json:"model"`
+	}
+	e := c.do(ctx, call{
+		method: http.MethodPatch, path: resourcePath("models", ref), auth: true,
+		reason: "update model discovery family", body: map[string]string{"family": family}, strict: true,
+	}, &out)
+	return out.Model, e
 }
 
 func resourceSearchPath(collection, query string) string {
