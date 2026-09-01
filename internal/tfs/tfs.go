@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -362,6 +363,36 @@ type SourcePlan struct {
 		Projected    bool   `json:"projected"`
 	} `json:"sources"`
 	Target string `json:"target"`
+}
+
+// SourceProfileMembers asks TensorFS which exact provider carriers a set of
+// reviewed profiles names. It is a registry-only query: no model body or
+// tensor header is opened.
+func (t *Tool) SourceProfileMembers(registry string, profiles []string) ([]string, *exit.Error) {
+	profiles = append([]string(nil), profiles...)
+	sort.Strings(profiles)
+	args := append([]string{"ingest", "source-members"}, profiles...)
+	if registry != "" {
+		args = append(args, "--registry", registry)
+	}
+	out, problem := t.run(args...)
+	if problem != nil {
+		return nil, problem
+	}
+	out = strings.TrimSuffix(out, "\n")
+	if out == "" || strings.Contains(out, "\r") {
+		return nil, exit.Internalf("tfs returned an invalid source-member selection")
+	}
+	members := strings.Split(out, "\n")
+	if len(members) > 4096 {
+		return nil, exit.Internalf("tfs returned too many source members")
+	}
+	for index, member := range members {
+		if member == "" || index > 0 && members[index-1] >= member {
+			return nil, exit.Internalf("tfs returned unsorted or duplicate source members")
+		}
+	}
+	return members, nil
 }
 
 // SameSelection ignores transient paths and sessions while binding the exact

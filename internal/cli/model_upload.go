@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -49,6 +51,15 @@ type producerPlan struct {
 	SourceProfiles   map[string]string
 	Outputs          []modeltransfer.OutputPin
 	NeedsAccelerator bool
+}
+
+func sourceProfileNames(profiles map[string]string) []string {
+	names := make([]string, 0, len(profiles))
+	for _, name := range profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return slices.Compact(names)
 }
 
 func handleModelUpload(ctx *Context) *exit.Error {
@@ -133,7 +144,15 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 		ctx.Inv.Bools["--rental"] = false
 		ctx.Inv.Bools["--rental-only"] = false
 	}
-	source, problem := resolvePublishSource(ctx, sourceArg)
+	producer, problem := resolveProducerPlan(ctx, producerName)
+	if problem != nil {
+		return problem
+	}
+	var sourceProfiles []string
+	if producer != nil {
+		sourceProfiles = sourceProfileNames(producer.SourceProfiles)
+	}
+	source, problem := resolvePublishSource(ctx, sourceArg, sourceProfiles)
 	if problem != nil {
 		return problem
 	}
@@ -141,10 +160,6 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 		return exit.Named(exit.Unavailable, "model_transfer.rented_catalog_source_unavailable",
 			"rented model transfer cannot yet bind a Tensorhub checkpoint through worker download delegation").
 			WithRemedy("run locally or use the original pinned provider source until the tracked catalog binding lands")
-	}
-	producer, problem := resolveProducerPlan(ctx, producerName)
-	if problem != nil {
-		return problem
 	}
 	plan := modeltransfer.Plan{
 		Instruction: instruction,
@@ -310,7 +325,7 @@ func canonicalProductionSource(ctx *Context, raw string) (string, *exit.Error) {
 	return ref.String() + "@" + strings.TrimSpace(release), nil
 }
 
-func resolvePublishSource(ctx *Context, raw string) (publishSource, *exit.Error) {
+func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (publishSource, *exit.Error) {
 	raw = strings.TrimSpace(raw)
 	lane := strings.TrimSpace(ctx.Inv.Value("--lane"))
 	if strings.HasPrefix(raw, "local/") {
@@ -378,6 +393,23 @@ func resolvePublishSource(ctx *Context, raw string) (publishSource, *exit.Error)
 		resolved, problem := resolver.Resolve(hctx, parsed)
 		if problem != nil {
 			return publishSource{}, problem
+		}
+		// A single carrier is already exact (for example Civitai's primary
+		// checkpoint). Multi-carrier provider repositories must be narrowed by
+		// TensorFS's reviewed profiles before any body is persisted or granted.
+		if len(resolved.Files) > 1 && len(sourceProfiles) > 0 {
+			tool, _, problem := localTensorFS(ctx)
+			if problem != nil {
+				return publishSource{}, problem
+			}
+			members, problem := tool.SourceProfileMembers(ctx.Cfg.TensorFSRegistry, sourceProfiles)
+			if problem != nil {
+				return publishSource{}, problem
+			}
+			resolved, problem = resolved.Select(members)
+			if problem != nil {
+				return publishSource{}, problem
+			}
 		}
 		exact := make([]modeltransfer.SourceFile, 0, len(resolved.Files))
 		access := make([]sourceCapability, 0, len(resolved.Files))
