@@ -37,6 +37,7 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	accountAttempts := 0
 	accountRegistrations := 0
 	accountName := ""
+	foreignModelRequests := 0
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -153,6 +154,11 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 				"rental_id": "rental-auth-proof", "state": "pending_acquisition",
 				"hourly_rate_usd_micros": int64(100_000),
 			})
+		case "/v1/models/foreign/model", "/v1/models/foreign/model/releases/stable":
+			mu.Lock()
+			foreignModelRequests++
+			mu.Unlock()
+			http.Error(w, "foreign model request crossed the account fence", http.StatusInternalServerError)
 		default:
 			t.Errorf("unexpected auth route %s", r.URL.Path)
 			http.NotFound(w, r)
@@ -220,6 +226,13 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 		!strings.Contains(status.stdout, `"account":"paul"`) || status.stderr != "" {
 		t.Fatalf("status after login [exit %d]\nstdout: %s\nstderr: %s", status.code, status.stdout, status.stderr)
 	}
+	foreign := runAuthCozy(t, root, server.URL, "", "model", "publish", "foreign/model",
+		"--release", "stable", "--lane", "bf16=sha256:"+strings.Repeat("a", 64))
+	if foreign.code != 2 || !strings.Contains(foreign.stdout, "logged in as Tensorhub account paul") ||
+		!strings.Contains(foreign.stdout, "publish as paul/model") {
+		t.Fatalf("machine account accepted foreign publication [exit %d]\nstdout: %s\nstderr: %s",
+			foreign.code, foreign.stdout, foreign.stderr)
+	}
 	manager := accountauth.New(config.Config{Home: root, HubURL: server.URL})
 	hubClient := hub.New(config.Config{HubURL: server.URL}, "cozy-product-auth-test").WithTokenSource(manager)
 	requestBody, problem := hub.RentalRequestBytes("cpu", strings.Repeat("1", 64),
@@ -232,8 +245,11 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if enrollBegins != 1 || loginBegins != 5 {
-		t.Fatalf("auth begin calls = enroll %d login %d, want 1/5", enrollBegins, loginBegins)
+	if enrollBegins != 1 || loginBegins != 6 {
+		t.Fatalf("auth begin calls = enroll %d login %d, want 1/6", enrollBegins, loginBegins)
+	}
+	if foreignModelRequests != 0 {
+		t.Fatalf("foreign model requests = %d, want 0", foreignModelRequests)
 	}
 	if accountAttempts != 2 || accountRegistrations != 1 || accountName != "paul" {
 		t.Fatalf("account registration = attempts %d successes %d name %q",
