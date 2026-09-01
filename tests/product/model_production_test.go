@@ -772,6 +772,8 @@ func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.
 	cutBodies := []string{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current":
+			_ = json.NewEncoder(w).Encode(map[string]string{"name": "acme"})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/models/acme/output/releases/ambiguous":
 			body, _ := io.ReadAll(r.Body)
 			mu.Lock()
