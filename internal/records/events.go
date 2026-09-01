@@ -207,6 +207,23 @@ func (s *Store) EventsAfter(requestID string, cursor int64, limit int) ([]Event,
 	return out, nil
 }
 
+// TerminalEventAt is the request's durable settlement clock. Pre-attempt failures and
+// cancellations have no attempt close timestamp, but their terminal event is committed in
+// the same transaction as the settled request state.
+func (s *Store) TerminalEventAt(requestID string) (string, *exit.Error) {
+	var at string
+	err := s.db.QueryRow(`SELECT at FROM request_events
+		WHERE request_id=? AND type IN ('request.completed','request.failed','request.canceled')
+		ORDER BY seq DESC LIMIT 1`, requestID).Scan(&at)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", exit.Internalf("cannot read terminal event time for %s: %s", requestID, err)
+	}
+	return at, nil
+}
+
 // LastEventSeq is the current head of the stream. A client that wants only what happens
 // NEXT opens at the head instead of replaying history.
 func (s *Store) LastEventSeq() (int64, *exit.Error) {

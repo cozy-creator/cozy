@@ -163,6 +163,25 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("human run list columns/order are not useful [exit %d]\n%s", code, out)
 	}
 
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job",
+		"size=8", "seed=11", "--await", "--json")
+	if code != 1 || !strings.Contains(out, "editable_jobs_unsupported") {
+		t.Fatalf("editable job red arm changed [exit %d]\n%s", code, out)
+	}
+	runs = listRuns()
+	if len(runs) == 0 {
+		t.Fatal("failed job is absent from run list")
+	}
+	jobElapsed, err := strconv.ParseFloat(strings.TrimSuffix(runs[0].Elapsed, "s"), 64)
+	if runs[0].Kind != "job" || runs[0].Status != "failed" ||
+		err != nil || jobElapsed < 0 || jobElapsed > 10 {
+		t.Fatalf("pre-attempt job row lost its kind or terminal elapsed clock: %+v (%v)", runs, err)
+	}
+	if code, out := runCozy(t, root, "run", "watch", runs[0].Number, "--json"); code == 0 ||
+		!strings.Contains(out, "editable_jobs_unsupported") {
+		t.Fatalf("numeric failed-job watch did not resolve the job [exit %d]\n%s", code, out)
+	}
+
 	detachedDir := filepath.Join(root, "detached-output")
 	code, stdout, stderr = runCozyStreams(t, root, "--json", "run", localWeightlessRef+"/tile",
 		"size=32", "seed=9", "delay_ms=4500", "--out", detachedDir)

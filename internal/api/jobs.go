@@ -769,7 +769,8 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	}
 	// THE ELAPSED CLOCK is the authority's own timestamps, and the LIVE progress is the
 	// lossy lane's latest tick — replayed on connect, never durable, never load-bearing.
-	state.ElapsedMS = elapsedMS(row, attempts)
+	terminalAt, _ := s.store.TerminalEventAt(row.ID)
+	state.ElapsedMS = elapsedMS(row, attempts, terminalAt)
 	if frame, ok := s.orchestrator.LatestFrame(row.ID); ok {
 		if value, ok := frame.Value.(map[string]any); ok {
 			state.Progress = value
@@ -835,7 +836,7 @@ func parseStamp(s string) time.Time {
 	return t
 }
 
-func elapsedMS(row records.Request, attempts []records.Attempt) int64 {
+func elapsedMS(row records.Request, attempts []records.Attempt, terminalAt string) int64 {
 	began := parseStamp(row.CreatedAt)
 	if began.IsZero() {
 		return 0
@@ -850,7 +851,21 @@ func elapsedMS(row records.Request, attempts []records.Attempt) int64 {
 			}
 		}
 	}
+	if settledRequestState(row.State) {
+		if terminal := parseStamp(terminalAt); !terminal.IsZero() && terminal.Before(end) {
+			end = terminal
+		}
+	}
 	return end.Sub(began).Milliseconds()
+}
+
+func settledRequestState(state string) bool {
+	switch state {
+	case "succeeded", "failed", "canceled", "refused", "abandoned":
+		return true
+	default:
+		return false
+	}
 }
 
 // ------------------------------------------------------------------------- cancel
