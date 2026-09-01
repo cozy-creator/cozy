@@ -385,9 +385,16 @@ func runCozyDir(t *testing.T, root, dir string, imposed []string, args ...string
 }
 
 func runCozyStreams(t *testing.T, root string, args ...string) (int, string, string) {
+	return runCozyDirStreams(t, root, "", nil, args...)
+}
+
+func runCozyDirStreams(t *testing.T, root, dir string, imposed []string,
+	args ...string,
+) (int, string, string) {
 	t.Helper()
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
-	cmd.Env = childEnv(t, root)
+	cmd.Env = childEnv(t, root, imposed...)
+	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	_ = cmd.Run()

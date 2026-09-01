@@ -4,12 +4,14 @@ import (
 	"context"
 	"io"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/modelproduction"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -44,6 +46,29 @@ func (m *modelProductionManager) SubmitModelProduction(_ context.Context,
 		instruction.Producer == "" || !instruction.Rental {
 		return records.ModelProductionOperation{}, false, exit.New(exit.Validation,
 			"durable model production requires destination, release, pinned source, producer, and rental approval")
+	}
+	if _, problem := hub.ParseRef(instruction.Destination); problem != nil {
+		return records.ModelProductionOperation{}, false, problem
+	}
+	if !modelReleasePattern.MatchString(instruction.Release) {
+		return records.ModelProductionOperation{}, false, exit.Usagef(
+			"model production release %q is not an immutable N.M.P semantic version",
+			instruction.Release)
+	}
+	if _, problem := canonicalProductionSource(&Context{Inv: productionInvocation(instruction)},
+		instruction.Source); problem != nil {
+		return records.ModelProductionOperation{}, false, problem
+	}
+	if _, problem := parseProductionCallable(instruction.Producer); problem != nil {
+		return records.ModelProductionOperation{}, false, problem
+	}
+	if strings.HasPrefix(instruction.Source, "local/") {
+		return records.ModelProductionOperation{}, false, exit.Usagef(
+			"a %s alias cannot be read by a rented worker", instruction.Source).
+			WithRemedy("use its addressable Tensorhub release or original pinned foreign source")
+	}
+	if problem := m.owns(instruction.Destination); problem != nil {
+		return records.ModelProductionOperation{}, false, problem
 	}
 	instructionBytes, err := instruction.Bytes()
 	if err != nil {
@@ -134,10 +159,7 @@ func (m *modelProductionManager) Start() {
 						"model_production.instruction_invalid", err.Error())
 					continue
 				}
-				accepted, _, submitProblem := m.SubmitModelProduction(context.Background(), instruction)
-				if submitProblem == nil {
-					m.kick(accepted)
-				}
+				_, _, _ = m.SubmitModelProduction(context.Background(), instruction)
 				continue
 			}
 			m.kick(operation)
@@ -166,6 +188,17 @@ func (m *modelProductionManager) kick(operation records.ModelProductionOperation
 		}()
 		m.advance(runCtx, operation)
 	}()
+}
+
+func (m *modelProductionManager) owns(destination string) *exit.Error {
+	ref, problem := hub.ParseRef(destination)
+	if problem != nil {
+		return problem
+	}
+	ctx := &Context{Inv: &Invocation{}, Out: io.Discard, Err: m.log,
+		Cfg: m.cfg, AccountAuth: m.auth}
+	_, problem = ownedPublication(ctx, ref)
+	return problem
 }
 
 func (m *modelProductionManager) advance(runCtx context.Context,

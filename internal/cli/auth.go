@@ -14,11 +14,12 @@ import (
 
 func handleAuthLogin(ctx *Context) *exit.Error {
 	manager := accountauth.New(ctx.Cfg)
+	input := bufio.NewReader(os.Stdin) //cozy:stdin-value login owns the two interactive values
 	hctx, cancel := hub.Context()
 	session, problem := manager.Authenticate(hctx)
 	cancel()
 	if problem == nil {
-		return emitAuthSession(ctx, session, "authenticated")
+		return emitAuthSession(ctx, session, "authenticated", input)
 	}
 	if !canEnroll(problem) {
 		return problem
@@ -32,7 +33,7 @@ func handleAuthLogin(ctx *Context) *exit.Error {
 	}
 	fmt.Fprintf(ctx.Err, "A verification code was sent to %s (expires %s).\nCode: ",
 		strings.TrimSpace(ctx.Inv.Args[0]), expires.Local().Format("15:04:05 MST"))
-	code, err := bufio.NewReader(os.Stdin).ReadString('\n') //cozy:stdin-value the email code is read interactively, never from argv
+	code, err := input.ReadString('\n') //cozy:stdin-value the email code is read interactively, never from argv
 	if err != nil && strings.TrimSpace(code) == "" {
 		return exit.Named(exit.Credential, "auth.code_unreadable",
 			"the email verification code could not be read: %s", err)
@@ -43,7 +44,7 @@ func handleAuthLogin(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	return emitAuthSession(ctx, session, "registered")
+	return emitAuthSession(ctx, session, "registered", input)
 }
 
 func handleAuthStatus(ctx *Context) *exit.Error {
@@ -62,7 +63,7 @@ func handleAuthStatus(ctx *Context) *exit.Error {
 		}
 		return problem
 	}
-	return emitAuthSession(ctx, session, "logged in", "cozy auth login <email>")
+	return emitAuthSession(ctx, session, "logged in", nil, "cozy auth login <email>")
 }
 
 func canEnroll(problem *exit.Error) bool {
@@ -77,20 +78,43 @@ func canEnroll(problem *exit.Error) bool {
 	return false
 }
 
-func emitAuthSession(ctx *Context, session accountauth.Session, status string, next ...string) *exit.Error {
+func emitAuthSession(ctx *Context, session accountauth.Session, status string,
+	input *bufio.Reader, next ...string,
+) *exit.Error {
 	hctx, cancel := hub.Context()
-	_, problem := client(ctx).WithToken(session.AccessToken, "machine login").CurrentUser(hctx)
+	c := client(ctx).WithToken(session.AccessToken, "machine login")
+	account, problem := c.CurrentAccount(hctx)
 	cancel()
+	if problem != nil && problem.ErrName() == "account.name_required" && input != nil {
+		fmt.Fprint(ctx.Err, "Tensorhub account name: ")
+		name, err := input.ReadString('\n') //cozy:stdin-value the account name is an interactive value, never argv
+		name = strings.TrimSpace(name)
+		if err != nil && name == "" {
+			return exit.Named(exit.Credential, "account.name_unreadable",
+				"the Tensorhub account name could not be read: %s", err)
+		}
+		if name == "" {
+			return exit.Usagef("Tensorhub account name is required")
+		}
+		hctx, cancel = hub.Context()
+		account, problem = c.RegisterAccount(hctx, name)
+		cancel()
+	}
+	if problem != nil && problem.ErrName() == "account.name_required" && input == nil {
+		account.Name = "not registered"
+		problem = nil
+	}
 	if problem != nil {
 		return problem
 	}
 	record := compactRecord([]output.Field{
 		{K: "status", V: status},
 		{K: "email", V: session.Email},
+		{K: "account", V: account.Name},
 		{K: "machine", V: session.DeviceKeyID},
 		{K: "hub", V: ctx.Cfg.HubURL},
 		{K: "access_expires", V: session.ExpiresAt},
-	}, "status", "email")
+	}, "status", "email", "account")
 	record.Next = next
 	return emit(ctx, record)
 }

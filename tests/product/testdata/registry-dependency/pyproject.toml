@@ -17,8 +17,5 @@ dependencies = [
 [tool.uv.build-backend]
 module-root = ""
 
-[tool.cozy]
-organization = "proof"
-
 [tool.uv.sources]
 cozy-runtime = { path = "__COZY_RUNTIME_FIXTURE__", editable = true }

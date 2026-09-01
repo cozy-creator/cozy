@@ -53,7 +53,7 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	}
 	if destination.Org == "local" {
 		return exit.Usagef("local/ is reserved for private aliases and cannot be a Tensorhub destination").
-			WithRemedy("publish under your Tensorhub organization, for example alice/%s", destination.Name)
+			WithRemedy("publish under your Tensorhub account, for example alice/%s", destination.Name)
 	}
 	release := strings.TrimSpace(ctx.Inv.Value("--release"))
 	if !modelReleasePattern.MatchString(release) {
@@ -68,6 +68,11 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		}
 	}
 	producerName := strings.TrimSpace(ctx.Inv.Value("--producer"))
+	if producerName != "" {
+		if _, problem := parseProductionCallable(producerName); problem != nil {
+			return problem
+		}
+	}
 	if producerName == "" && !ctx.Inv.Bool("--rental") {
 		_, manifestProblem := tfs.ManifestID(ctx.Inv.Args[1])
 		if strings.HasPrefix(ctx.Inv.Args[1], "local/") || manifestProblem == nil {
@@ -128,6 +133,9 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	}
 	id := plan.ID()
 	if ctx.Inv.Bool("--dry-run") {
+		if _, problem := ownedPublication(ctx, destination); problem != nil {
+			return problem
+		}
 		fields := []output.Field{
 			{K: "id", V: id}, {K: "kind", V: "model-publication"},
 			{K: "model", V: destination.String()}, {K: "release", V: release},

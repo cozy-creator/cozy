@@ -24,15 +24,18 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		return problem
 	}
 	defer pack.Close()
-	ref, problem := hub.ParseRef(pack.Organization + "/" + pack.Name)
+	c, account, problem := publicationAccount(ctx)
 	if problem != nil {
-		return problem.WithRemedy("fix [tool.cozy] organization or [project] name in pyproject.toml")
+		return problem
+	}
+	ref, problem := hub.ParseRef(account.Name + "/" + pack.Name)
+	if problem != nil {
+		return problem.WithRemedy("fix [project] name in pyproject.toml")
 	}
 	release := pack.Release
 	reason := "cozy package publish " + ref.String() + "@" + release
 	packagePublishStatus(ctx, "Checking %s@%s...", ref.String(), release)
 
-	c := client(ctx)
 	hctx, cancel := hub.LongContext()
 	defer cancel()
 	detail, lookupProblem := c.PackageRelease(hctx, ref, release)

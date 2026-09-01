@@ -1,6 +1,8 @@
 package producttest
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -95,12 +97,46 @@ func TestTensorhubDestinationCannotUseLocalNamespace(t *testing.T) {
 	}
 }
 
-func TestForeignSourceLaneRefusesBeforeNetwork(t *testing.T) {
+func TestForeignSourceLaneRefusesBeforeProviderNetwork(t *testing.T) {
 	root := t.TempDir()
-	result := runCozyEnv([]string{"COZY_HOME=" + root, "PATH=/usr/local/bin:/usr/bin:/bin"},
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/accounts/current" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"name":"acme"}`))
+	}))
+	defer server.Close()
+	result := runCozyEnv([]string{"COZY_HOME=" + root, "PATH=/usr/local/bin:/usr/bin:/bin",
+		"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"},
 		"model", "publish", "acme/model", "hf://org/model@"+strings.Repeat("a", 40),
 		"--release", "1.0.0", "--lane", "bf16")
 	if result.code != 2 || !strings.Contains(result.output, "--lane selects only") {
 		t.Fatalf("recognized foreign source = exit %d\n%s", result.code, result.output)
+	}
+}
+
+func TestMissingLocalPublishAliasRefusesBeforeAccountLookup(t *testing.T) {
+	accountReads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/accounts/current" {
+			accountReads++
+		}
+		http.Error(w, "unexpected account lookup", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	tfs := filepath.Join(root, "tfs-missing-alias")
+	must(t, os.WriteFile(tfs, []byte("#!/bin/sh\n"+
+		"[ \"$1 $2\" = \"store init\" ] && exit 0\n"+
+		"echo 'REFUSED NOT_FOUND: local alias missing' >&2\nexit 1\n"), 0o700))
+	result := runCozyEnv([]string{"COZY_HOME=" + root, "PATH=/usr/local/bin:/usr/bin:/bin",
+		"COZY_TFS=" + tfs, "TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"},
+		"model", "publish", "acme/model", "local/missing",
+		"--release", "1.0.0", "--lane", "bf16")
+	if result.code == 0 || accountReads != 0 || !strings.Contains(result.output, "missing") {
+		t.Fatalf("missing local alias = exit %d account reads %d\n%s",
+			result.code, accountReads, result.output)
 	}
 }

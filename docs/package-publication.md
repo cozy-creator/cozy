@@ -13,15 +13,12 @@ cozy package publish
 [project]
 name = "marco-polo-package"
 version = "1.0.0"
-
-[tool.cozy]
-organization = "paul"
 ```
 
-The example publishes as `paul/marco-polo-package@1.0.0`. Cozy does not add a `v` prefix or accept
-a second name/version on the command line. The configured `tensorhub_url` is the destination;
-an enrolled machine authenticates automatically. An explicit operator credential may still come
-from Cozy configuration or `TENSORHUB_TOKEN`; credentials never enter project metadata.
+If the authenticated Tensorhub account is `paul`, the example publishes as
+`paul/marco-polo-package@1.0.0`. Cozy does not add a `v` prefix or accept a second owner,
+name, or version on the command line. The configured `tensorhub_url` is the destination;
+an enrolled machine authenticates automatically. Credentials never enter project metadata.
 
 The project also supplies `uv.lock` and `package.toml`. Standard wheel `Requires-Dist` metadata is
 the dependency authority, and the lock selects exact ordinary registry wheels.

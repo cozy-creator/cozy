@@ -123,8 +123,17 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 	root := t.TempDir()
 	source := filepath.Join(root, "source.safetensors")
 	must(t, os.WriteFile(source, []byte("model-production-json-proof"), 0o600))
-	code, stdout, jsonStderr := runCozyStreams(t, root, "--json", "model", "publish",
-		"acme/proof", source, "--release", "1.0.0", "--dry-run")
+	accountServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/accounts/current" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"name": "acme"})
+	}))
+	defer accountServer.Close()
+	code, stdout, jsonStderr := runCozyDirStreams(t, root, ".",
+		[]string{"TENSORHUB_URL=" + accountServer.URL, "TENSORHUB_TOKEN=proof-token"},
+		"--json", "model", "publish", "acme/proof", source, "--release", "1.0.0", "--dry-run")
 	var document map[string]any
 	if code != 0 || json.Unmarshal([]byte(stdout), &document) != nil || document["status"] != "planned" ||
 		strings.TrimSpace(jsonStderr) != "" {
@@ -149,6 +158,53 @@ func TestModelProductionCancellationReportsCleanupTruth(t *testing.T) {
 	if got := pending.String(); !strings.Contains(got, "release is not yet confirmed") ||
 		strings.Contains(got, "provider absence confirmed") {
 		t.Fatalf("unconfirmed cancellation cleanup overstated reality:\n%s", got)
+	}
+}
+
+func TestForeignModelProductionRefusesBeforeWriteOrSpend(t *testing.T) {
+	var mu sync.Mutex
+	accountReads, unexpected := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current" {
+			accountReads++
+			_ = json.NewEncoder(w).Encode(map[string]string{"name": "acme"})
+			return
+		}
+		unexpected++
+		http.Error(w, "unexpected provider/publication call", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
+		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\n"), 0o600))
+	daemon := startDaemonProcess(t, root)
+	instruction := modelproduction.Instruction{
+		Destination: "foreign/output", Release: "1.0.0",
+		Source:   "hf://source/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Producer: "proof/tools@v1/build", Rental: true,
+	}
+	reply := daemon.call(t, http.MethodPost, "/v1/local/model-productions",
+		map[string]any{"instruction": instruction})
+	if reply.Status != http.StatusBadRequest || reply.code() != "usage" ||
+		!strings.Contains(string(reply.Body), "logged in as Tensorhub account acme") {
+		t.Fatalf("foreign production acceptance = %s", reply.brief())
+	}
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	rows, problem := store.ModelProductions("any", 50)
+	store.Close()
+	fatal(t, problem)
+	mu.Lock()
+	reads, other := accountReads, unexpected
+	mu.Unlock()
+	if len(rows) != 0 || reads != 1 || other != 0 {
+		t.Fatalf("foreign production crossed boundary: rows=%d account_reads=%d other_calls=%d",
+			len(rows), reads, other)
 	}
 }
 
@@ -244,6 +300,8 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 		requests = append(requests, r.Method+" "+r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current":
+			_ = json.NewEncoder(w).Encode(map[string]string{"name": "acme"})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/resolve":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"model": "acme/input", "release": "1.0.0", "lane": "bf16",
@@ -286,7 +344,7 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
-		"tensorhub_url: "+server.URL+"\nrentals:\n  max_hourly_spend_usd: 10\n"), 0o600))
+		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\nrentals:\n  max_hourly_spend_usd: 10\n"), 0o600))
 	code, out := runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
 		"--json", "--full", "model", "publish", "acme/output", "acme/input@1.0.0",
 		"--release", "1.0.0", "--producer", "proof/remote-producer@v2/build",
@@ -299,7 +357,8 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 		got != "GET /v1/models/resolve\nGET /v1/packages/proof/remote-producer\n"+
 			"GET /v1/packages/proof/remote-producer/releases/2.0.0\n"+
 			"GET /v1/packages/proof/remote-job\n"+
-			"GET /v1/packages/proof/remote-job/releases/3.0.0" {
+			"GET /v1/packages/proof/remote-job/releases/3.0.0\n"+
+			"GET /v1/accounts/current" {
 		t.Fatalf("remote production metadata routes =\n%s", got)
 	}
 	if producerCardReads != 1 {
@@ -357,6 +416,8 @@ func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *test
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current":
+			_ = json.NewEncoder(w).Encode(map[string]string{"name": "acme"})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/resolve":
 			mu.Lock()
 			sourceReads++
@@ -406,7 +467,7 @@ func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *test
 
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
-		"tensorhub_url: "+server.URL+"\nrentals:\n  max_hourly_spend_usd: 10\n"), 0o600))
+		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\nrentals:\n  max_hourly_spend_usd: 10\n"), 0o600))
 	args := []string{"--json", "--full", "model", "publish", "acme/output", "acme/input@1.0.0",
 		"--release", "1.0.0", "--producer", "proof/remote-producer/build", "--rental", "--detach"}
 	code, out := runCozy(t, root, args...)

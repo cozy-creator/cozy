@@ -98,16 +98,13 @@ Creator omits only Python/Torch/Runtime/TensorFS platform families and their sma
 closure from its registry-wheel export; it has no worker-image inventory. It uploads exact
 pure-Python registry and local dependency wheels, and the actual worker compares platform
 requirements with its selected base before importing the package. Development dependency groups
-are not published. The package name and
-release come from `[project]`; `[tool.cozy]` supplies the Tensorhub organization:
+are not published. The package name and release come from `[project]`; the owner is the
+authenticated user's Tensorhub account:
 
 ```toml
 [project]
 name = "marco-polo-package"
 version = "1.0.0"
-
-[tool.cozy]
-organization = "paul"
 ```
 
 From that project directory, publishing is simply:
@@ -116,9 +113,9 @@ From that project directory, publishing is simply:
 cozy package publish
 ```
 
-This publishes `paul/marco-polo-package@1.0.0`; Cozy never invents a `v` prefix. The destination
-comes from `tensorhub_url`. An enrolled machine authenticates automatically; an operator may still
-configure `tensorhub_token` or `TENSORHUB_TOKEN` explicitly.
+If the logged-in account is `paul`, this publishes `paul/marco-polo-package@1.0.0`; Cozy never
+invents a `v` prefix. The destination comes from `tensorhub_url`, and an enrolled machine
+authenticates automatically.
 
 Publication succeeds even when no base worker image is active. The package appears in the catalog
 immediately. On invocation, the selected worker verifies the immutable wheels against its actual
@@ -145,7 +142,7 @@ cozy model remove org/model
 Publish a pinned source directly, or execute one package-reviewed production whose fixed outputs
 become the release's lanes. `--lane` selects only an existing input release; it never names an
 output lane. An existing canonical TensorFS manifest can still be published directly as one
-immutable release lane:
+immutable release lane. The destination owner must match the account shown by `cozy auth`:
 
 ```sh
 cozy model publish org/model sha256:<manifest> --release 1.0.0 --lane <derived-lane>
@@ -304,10 +301,11 @@ cozy auth
 
 Tensorhub emails a one-time code. After it is entered, Cozy stores only this installation's
 Ed25519 machine key under its mode-0700 home and mode-0600 credential file. Short AuthKit access
-tokens stay in memory. Later authenticated commands sign a one-time challenge automatically; there
-is no refresh token or repeated login command. `cozy auth` verifies the stored key, shows the
-account email and available auth commands, or reports `not logged in` when this installation has
-no usable key.
+tokens stay in memory. A new user also chooses one immutable Tensorhub account name during this
+login; existing accounts skip that prompt. Later authenticated commands sign a one-time challenge
+automatically; there is no refresh token or repeated login command. `cozy auth` verifies the stored
+key, shows the email and Tensorhub account name, or reports `not logged in` when this installation
+has no usable key.
 
 ## Output and automation
 

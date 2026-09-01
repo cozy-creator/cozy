@@ -114,6 +114,17 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 
 func TestModelProductionGrammar(t *testing.T) {
 	root := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/accounts/current" ||
+			r.Header.Get("Authorization") != "Bearer proof-token" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"name":"acme"}`)
+	}))
+	defer server.Close()
+	accountEnv := []string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}
 	code, help := runCozy(t, root, "model", "publish", "--help")
 	if code != 0 || !strings.Contains(help, "<source>") ||
 		!strings.Contains(help, "--release") || !strings.Contains(help, "--producer") ||
@@ -131,11 +142,17 @@ func TestModelProductionGrammar(t *testing.T) {
 	}
 	local := filepath.Join(root, "source.safetensors")
 	must(t, os.WriteFile(local, []byte("header-only-grammar-fixture"), 0o600))
-	code, out = runCozy(t, root, "--json", "model", "publish", "acme/model", local,
+	code, out = runCozyDir(t, root, ".", accountEnv, "--json", "model", "publish", "acme/model", local,
 		"--release", "1.2.3", "--dry-run")
 	if code != 0 || !strings.Contains(out, `"kind":"model-publication"`) ||
 		!strings.Contains(out, `"status":"planned"`) || !strings.Contains(out, `"id":"modelpub-`) {
 		t.Fatalf("source-driven dry-run failed [exit %d]\n%s", code, out)
+	}
+	code, out = runCozyDir(t, root, ".", accountEnv, "model", "publish", "other/model", local,
+		"--release", "1.2.3", "--dry-run")
+	if code != 2 || !strings.Contains(out, "logged in as Tensorhub account acme") ||
+		!strings.Contains(out, "publish as acme/model") {
+		t.Fatalf("cross-account model publication was not refused [exit %d]\n%s", code, out)
 	}
 	code, out = runCozy(t, root, "model", "publish", "acme/model", local,
 		"--release", "1.2.3", "--dry-run", "--detach")
@@ -209,11 +226,11 @@ version = "1.0.0"
 	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte(
 		"[application]\nobject = \"proof_package:app\"\n"), 0o644))
 	must(t, os.WriteFile(filepath.Join(project, "uv.lock"), []byte("version = 1\n"), 0o644))
-	code, out := runCozyDir(t, root, project, []string{"TENSORHUB_TOKEN=proof-token"},
-		"package", "publish")
-	if code != 1 || !strings.Contains(out, "must declare [tool.cozy] organization") {
-		t.Fatalf("missing [tool.cozy] organization was not refused before build [exit %d]\n%s", code, out)
+	pack, problem := packagepublish.PrepareFrom(project)
+	if problem != nil || pack.Name != "proof-package" || pack.Release != "1.0.0" {
+		t.Fatalf("project identity without publisher metadata = %+v, %v", pack, problem)
 	}
+	pack.Close()
 }
 
 func TestPackageYankUsesPermanentReleaseEndpoint(t *testing.T) {
@@ -422,6 +439,8 @@ func TestPackagePublishCommittedReplayStaysCompact(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current":
+			_, _ = io.WriteString(w, `{"name":"proof"}`)
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/releases/1.0.0"):
 			_, _ = io.WriteString(w, `{"release":{"release":"1.0.0","release_digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","package_descriptor_digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","package_descriptor_length":2,"created_at":"2026-08-31T00:00:00Z"},"document":{},"package_descriptor":{}}`)
 		default:
@@ -793,7 +812,6 @@ module-root = ""
 		document += "\n[tool.uv.sources]\n" + sources
 	}
 	if publishable {
-		document += "\n[tool.cozy]\norganization = \"proof\"\n"
 		must(t, os.WriteFile(filepath.Join(root, "package.toml"), []byte(
 			"[application]\nobject = \""+module+":app\"\n"), 0o644))
 		must(t, os.WriteFile(filepath.Join(root, "uv.lock"), []byte("version = 1\n"), 0o644))

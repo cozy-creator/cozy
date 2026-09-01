@@ -32,12 +32,19 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	expires := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
 	var mu sync.Mutex
 	var public ed25519.PublicKey
+	enrollBegins := 0
 	loginBegins := 0
+	accountAttempts := 0
+	accountRegistrations := 0
+	accountName := ""
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1/auth/device-keys/enroll/begin":
+			mu.Lock()
+			enrollBegins++
+			mu.Unlock()
 			var body struct {
 				Email     string `json:"email"`
 				PublicKey string `json:"public_key"`
@@ -93,16 +100,50 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 				return
 			}
 			writeAuthToken(t, w, "second-access-token", expires)
-		case "/v1/auth/me":
+		case "/v1/accounts/current":
 			if authorization := r.Header.Get("Authorization"); authorization != "Bearer first-access-token" && authorization != "Bearer second-access-token" {
-				t.Errorf("current-user read carried %q", authorization)
+				t.Errorf("current-account read carried %q", authorization)
 				return
 			}
-			writeAuthJSON(t, w, http.StatusOK, map[string]any{
-				"id": "140e338a-ebd5-48c5-a124-703f2457195a", "email": "person@example.com",
-				"email_verified": true, "entitlements": []string{},
-				"availability": []map[string]any{{"action": "update_username", "allowed": true}},
-			})
+			mu.Lock()
+			name := accountName
+			mu.Unlock()
+			if name == "" {
+				writeAuthJSON(t, w, http.StatusConflict, map[string]any{"error": map[string]string{
+					"code": "account.name_required", "message": "choose an account name",
+					"remedy": "finish Tensorhub registration",
+				}})
+				return
+			}
+			writeAuthJSON(t, w, http.StatusOK, map[string]string{"name": name})
+		case "/v1/accounts/local":
+			if r.Method != http.MethodPut || r.Header.Get("Authorization") != "Bearer first-access-token" {
+				t.Errorf("reserved account registration = %s auth %q", r.Method, r.Header.Get("Authorization"))
+				return
+			}
+			mu.Lock()
+			accountAttempts++
+			mu.Unlock()
+			writeAuthJSON(t, w, http.StatusUnprocessableEntity, map[string]any{"error": map[string]string{
+				"code": "account.name_invalid", "message": "choose a valid, non-reserved account name",
+				"remedy": "choose another account name",
+			}})
+		case "/v1/accounts/paul":
+			if r.Method != http.MethodPut || r.Header.Get("Authorization") != "Bearer second-access-token" {
+				t.Errorf("account registration = %s auth %q", r.Method, r.Header.Get("Authorization"))
+				return
+			}
+			var body map[string]any
+			if !decodeAuthBody(t, r, &body) || len(body) != 0 {
+				t.Errorf("account registration body = %+v", body)
+				return
+			}
+			mu.Lock()
+			accountName = "paul"
+			accountAttempts++
+			accountRegistrations++
+			mu.Unlock()
+			writeAuthJSON(t, w, http.StatusOK, map[string]string{"name": "paul"})
 		case "/v1/rentals":
 			if r.Header.Get("Authorization") != "Bearer second-access-token" {
 				t.Errorf("protected hub request carried %q", r.Header.Get("Authorization"))
@@ -124,11 +165,11 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	if before.code != 0 || !strings.Contains(before.stdout, `"status":"not logged in"`) || before.stderr != "" {
 		t.Fatalf("status before login [exit %d]\nstdout: %s\nstderr: %s", before.code, before.stdout, before.stderr)
 	}
-	first := runAuthCozy(t, root, server.URL, "123456\n", "auth", "login", "person@example.com", "--json")
-	if first.code != 0 || !strings.Contains(first.stdout, `"status":"registered"`) ||
-		strings.Contains(first.stdout, "personal_org") ||
-		!strings.Contains(first.stderr, "A verification code was sent") {
-		t.Fatalf("first login [exit %d]\nstdout: %s\nstderr: %s", first.code, first.stdout, first.stderr)
+	first := runAuthCozy(t, root, server.URL, "123456\nlocal\n", "auth", "login", "person@example.com", "--json")
+	if first.code == 0 || !strings.Contains(first.stdout, `"code":"account.name_invalid"`) ||
+		!strings.Contains(first.stderr, "A verification code was sent") ||
+		!strings.Contains(first.stderr, "Tensorhub account name:") {
+		t.Fatalf("reserved account registration [exit %d]\nstdout: %s\nstderr: %s", first.code, first.stdout, first.stderr)
 	}
 
 	files, err := filepath.Glob(filepath.Join(root, "auth", "*.json"))
@@ -150,13 +191,33 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 		t.Fatal("short access token was persisted")
 	}
 
+	incomplete := runAuthCozy(t, root, server.URL, "", "auth", "--json")
+	if incomplete.code != 0 || !strings.Contains(incomplete.stdout, `"status":"logged in"`) ||
+		!strings.Contains(incomplete.stdout, `"email":"person@example.com"`) ||
+		!strings.Contains(incomplete.stdout, `"account":"not registered"`) ||
+		!strings.Contains(incomplete.stdout, `"cozy auth login <email>"`) || incomplete.stderr != "" {
+		t.Fatalf("incomplete account status [exit %d]\nstdout: %s\nstderr: %s",
+			incomplete.code, incomplete.stdout, incomplete.stderr)
+	}
+
+	retried := runAuthCozy(t, root, server.URL, "paul\n", "auth", "login", "person@example.com", "--json")
+	if retried.code != 0 || !strings.Contains(retried.stdout, `"status":"authenticated"`) ||
+		!strings.Contains(retried.stdout, `"account":"paul"`) ||
+		!strings.Contains(retried.stderr, "Tensorhub account name:") ||
+		strings.Contains(retried.stderr, "verification code") {
+		t.Fatalf("account registration retry [exit %d]\nstdout: %s\nstderr: %s",
+			retried.code, retried.stdout, retried.stderr)
+	}
+
 	second := runAuthCozy(t, root, server.URL, "", "auth", "login", "person@example.com", "--json")
-	if second.code != 0 || !strings.Contains(second.stdout, `"status":"authenticated"`) || second.stderr != "" {
+	if second.code != 0 || !strings.Contains(second.stdout, `"status":"authenticated"`) ||
+		!strings.Contains(second.stdout, `"account":"paul"`) || second.stderr != "" {
 		t.Fatalf("automatic login [exit %d]\nstdout: %s\nstderr: %s", second.code, second.stdout, second.stderr)
 	}
 	status := runAuthCozy(t, root, server.URL, "", "auth", "--json")
 	if status.code != 0 || !strings.Contains(status.stdout, `"status":"logged in"`) ||
-		!strings.Contains(status.stdout, `"email":"person@example.com"`) || status.stderr != "" {
+		!strings.Contains(status.stdout, `"email":"person@example.com"`) ||
+		!strings.Contains(status.stdout, `"account":"paul"`) || status.stderr != "" {
 		t.Fatalf("status after login [exit %d]\nstdout: %s\nstderr: %s", status.code, status.stdout, status.stderr)
 	}
 	manager := accountauth.New(config.Config{Home: root, HubURL: server.URL})
@@ -171,8 +232,12 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if loginBegins != 3 {
-		t.Fatalf("login begin calls = %d, want 3", loginBegins)
+	if enrollBegins != 1 || loginBegins != 5 {
+		t.Fatalf("auth begin calls = enroll %d login %d, want 1/5", enrollBegins, loginBegins)
+	}
+	if accountAttempts != 2 || accountRegistrations != 1 || accountName != "paul" {
+		t.Fatalf("account registration = attempts %d successes %d name %q",
+			accountAttempts, accountRegistrations, accountName)
 	}
 }
 
