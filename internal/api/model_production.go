@@ -162,11 +162,16 @@ func (s *Server) modelProductionState(operation records.ModelProductionOperation
 		Error: operation.SafeDetail, CreatedAt: operation.CreatedAt, UpdatedAt: operation.UpdatedAt,
 		Changed: changed}
 	var plan *modelproduction.Plan
-	if operation.State == "resolving" {
-		instruction, err := modelproduction.ParseInstruction(operation.Plan)
-		if err != nil {
+	var instruction *modelproduction.Instruction
+	if operation.State == "resolving" || operation.State == "canceled" {
+		parsed, err := modelproduction.ParseInstruction(operation.Plan)
+		if err == nil {
+			instruction = &parsed
+		} else if operation.State == "resolving" {
 			return state, exit.Internalf("cannot read model production %s instruction: %s", operation.ID, err)
 		}
+	}
+	if instruction != nil {
 		state.Model, state.Source = instruction.Destination, instruction.Source
 		state.Producer = instruction.Producer
 	} else {

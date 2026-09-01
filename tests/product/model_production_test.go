@@ -749,6 +749,35 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 	}
 }
 
+func TestCanceledResolvingModelProductionRendersAfterDaemonRestart(t *testing.T) {
+	root := t.TempDir()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	instruction := modelproduction.Instruction{
+		Destination: "acme/output", Source: "acme/missing@1.0.0",
+		Producer: "acme/tools/build", Rental: true,
+	}
+	bytes, err := instruction.Bytes()
+	must(t, err)
+	digest, err := instruction.Digest()
+	must(t, err)
+	operation, _, problem := store.BeginModelProductionInstruction(instruction.ID(), digest, bytes)
+	fatal(t, problem)
+	fatal(t, store.CancelModelProduction(operation.ID, "resolving", "canceled before plan acceptance"))
+	store.Close()
+
+	daemon := startDaemonProcess(t, root)
+	reply := daemon.call(t, http.MethodGet, "/v1/local/model-productions/"+operation.ID, nil)
+	var state api.ModelProductionState
+	if reply.Status != http.StatusOK || json.Unmarshal(reply.Body, &state) != nil ||
+		state.Status != "canceled" || state.Model != instruction.Destination ||
+		state.Source != instruction.Source || state.Producer != instruction.Producer {
+		t.Fatalf("canceled resolving production did not render: %s", reply.brief())
+	}
+}
+
 func TestModelProductionCancelCheckpointOrderingAndUnattachedProviderAbsence(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
 	fatal(t, problem)
