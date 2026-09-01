@@ -462,9 +462,12 @@ func validateHub(raw string) *exit.Error {
 func authRefusal(status int, data []byte) *exit.Error {
 	var answer struct {
 		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-			Remedy  string `json:"remedy"`
+			Code     string `json:"code"`
+			Message  string `json:"message"`
+			Remedy   string `json:"remedy"`
+			Metadata struct {
+				RetryAfterSeconds int `json:"retry_after_seconds"`
+			} `json:"metadata"`
 		} `json:"error"`
 	}
 	if json.Unmarshal(data, &answer) != nil || answer.Error.Code == "" {
@@ -479,7 +482,9 @@ func authRefusal(status int, data []byte) *exit.Error {
 		code = exit.Unavailable
 	}
 	problem := exit.Named(code, answer.Error.Code, "%s", answer.Error.Message)
-	if answer.Error.Remedy != "" {
+	if answer.Error.Metadata.RetryAfterSeconds > 0 {
+		problem.WithRemedy("retry after %d seconds", answer.Error.Metadata.RetryAfterSeconds)
+	} else if answer.Error.Remedy != "" {
 		problem.WithRemedy("%s", answer.Error.Remedy)
 	}
 	if code == exit.Credential {
