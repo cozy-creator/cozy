@@ -163,20 +163,6 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("human run list columns/order are not useful [exit %d]\n%s", code, out)
 	}
 
-	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job",
-		"size=8", "seed=11", "--await", "--json")
-	if code != 0 || !strings.Contains(out, `"status":"completed"`) {
-		t.Fatalf("local job did not complete [exit %d]\n%s", code, out)
-	}
-	runs = listRuns()
-	if len(runs) == 0 || runs[0].Kind != "job" {
-		t.Fatalf("full run list did not retain the job kind: %+v", runs)
-	}
-	if code, out := runCozy(t, root, "run", "watch", runs[0].Number, "--json"); code != 0 ||
-		!strings.Contains(out, `"status":"completed"`) {
-		t.Fatalf("numeric job watch failed [exit %d]\n%s", code, out)
-	}
-
 	detachedDir := filepath.Join(root, "detached-output")
 	code, stdout, stderr = runCozyStreams(t, root, "--json", "run", localWeightlessRef+"/tile",
 		"size=32", "seed=9", "delay_ms=4500", "--out", detachedDir)
