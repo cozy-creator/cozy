@@ -541,7 +541,7 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 	return orchestrator.LogicalJob{
 		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
 		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
-		ArtifactOutputs: artifacts, GPUCount: job.Resources.GPUCount,
+		ArtifactOutputs: artifacts, GPUCount: job.RequiredGPUCount(),
 		Requires: job.Resources.Requires, Models: models,
 		SourceProfiles: profiles,
 	}, job, nil

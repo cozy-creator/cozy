@@ -177,7 +177,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	facts := &JobFacts{
 		Name: function, Request: declared.Request, DescriptorID: said.DescriptorID, Outputs: outputs,
 		ArtifactOutputs: artifactOutputs,
-		Publishes:       declared.Publishes, GPUCount: declared.Resources.GPUCount,
+		Publishes:       declared.Publishes, GPUCount: declared.RequiredGPUCount(),
 		Requires: declared.Resources.Requires,
 	}
 	if len(declared.Models) > 0 {

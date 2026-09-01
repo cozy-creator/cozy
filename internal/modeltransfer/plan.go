@@ -120,12 +120,17 @@ var cudaResourcePattern = regexp.MustCompile(`^cuda[1-9][0-9]*\.[0-9]+\+$`)
 // selected by the base worker image and therefore contributes no sizing field here.
 func ParseResourceNeeds(gpuCount int64, requires string) (ResourceNeeds, error) {
 	needs := ResourceNeeds{GPUCount: gpuCount}
+	if gpuCount != 0 && gpuCount != 1 {
+		return needs, fmt.Errorf("GPU producer count must be zero or one, not %d", gpuCount)
+	}
+	declaredGPURequirement := false
 	for _, raw := range strings.Split(requires, ",") {
 		value := strings.ToLower(strings.TrimSpace(raw))
 		if value == "" {
 			continue
 		}
 		if cudaResourcePattern.MatchString(value) {
+			declaredGPURequirement = true
 			continue
 		}
 		match := resourcePattern.FindStringSubmatch(value)
@@ -137,6 +142,7 @@ func ParseResourceNeeds(gpuCount int64, requires string) (ResourceNeeds, error) 
 		if err != nil {
 			return needs, fmt.Errorf("resource requirement %q is outside the supported range", raw)
 		}
+		declaredGPURequirement = true
 		switch match[1] {
 		case "sm":
 			needs.MinSM = max(needs.MinSM, amount)
@@ -146,13 +152,39 @@ func ParseResourceNeeds(gpuCount int64, requires string) (ResourceNeeds, error) 
 			needs.RAMGB = max(needs.RAMGB, amount)
 		}
 	}
-	if needs.GPUCount == 0 && needs.MinSM == 0 && needs.VRAMGB == 0 {
-		return needs, nil
-	}
-	if needs.GPUCount != 1 || needs.MinSM == 0 || needs.VRAMGB == 0 || needs.RAMGB == 0 {
-		return needs, fmt.Errorf("GPU producer requires exactly one GPU plus explicit smN+, vramNg, and ramNg floors")
+	if gpuCount == 0 && declaredGPURequirement {
+		return needs, fmt.Errorf("CPU producer cannot declare GPU resource requirements")
 	}
 	return needs, nil
+}
+
+// AcceptsGPU checks only hard floors the package actually declared. The caller already
+// selected a GPU-class SKU from the catalog; an omitted floor is deliberately no filter.
+func (n ResourceNeeds) AcceptsGPU(computeCapability string, vramGB, ramGB int64) bool {
+	if n.GPUCount != 1 {
+		return false
+	}
+	if n.MinSM > 0 {
+		sm, err := computeSM(computeCapability)
+		if err != nil || sm < n.MinSM {
+			return false
+		}
+	}
+	return (n.VRAMGB == 0 || vramGB >= n.VRAMGB) &&
+		(n.RAMGB == 0 || ramGB >= n.RAMGB)
+}
+
+func computeSM(capability string) (int64, error) {
+	parts := strings.Split(capability, ".")
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("invalid compute capability")
+	}
+	major, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	minor, err := strconv.ParseInt(parts[1], 10, 64)
+	return major*10 + minor, err
 }
 
 // Bytes is the restart record. It contains only immutable identities and

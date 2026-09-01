@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -185,22 +185,12 @@ func transferSKUCompatible(transfer *records.ModelTransfer, sku hub.RentalSKU) b
 	if transfer == nil || transfer.GPUCount == 0 {
 		return true
 	}
-	sm, err := rentalComputeSM(sku.ComputeCapability)
-	return err == nil && sm >= transfer.MinSM && sku.VRAMGB >= transfer.VRAMGB &&
-		sku.MinimumRAMPerGPUGB >= transfer.RAMGB
-}
-
-func rentalComputeSM(capability string) (int64, error) {
-	parts := strings.Split(capability, ".")
-	if len(parts) != 2 {
-		return 0, fmt.Errorf("invalid compute capability")
-	}
-	major, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	minor, err := strconv.ParseInt(parts[1], 10, 64)
-	return major*10 + minor, err
+	return (modeltransfer.ResourceNeeds{
+		GPUCount: transfer.GPUCount,
+		MinSM:    transfer.MinSM,
+		VRAMGB:   transfer.VRAMGB,
+		RAMGB:    transfer.RAMGB,
+	}).AcceptsGPU(sku.ComputeCapability, sku.VRAMGB, sku.MinimumRAMPerGPUGB)
 }
 
 func (m *managedRentals) catalogLocked() ([]hub.RentalSKU, *exit.Error) {

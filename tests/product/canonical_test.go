@@ -19,6 +19,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -350,6 +351,58 @@ func TestPackageDescriptor(t *testing.T) {
 	} {
 		if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {
 			t.Errorf("%s was accepted at the descriptor boundary", name)
+		}
+	}
+
+	// gpu_count chooses the machine class. Size and architecture tokens are optional hard
+	// floors, not a mandatory four-field profile: an H3-like GPU producer with no floors
+	// still selects a GPU, while each declared floor independently narrows the candidates.
+	gpuRaw := []byte(`{"application":"h3:tools","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"H3Dits","component_use":{},"path":"four_lane.models.dits","source_profile":"hf/minimax-h3/native-dual-bf16/1","stamps":{}}],"name":"four_lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+	gpuDescriptor, problem := launch.DecodeDescriptor(gpuRaw)
+	fatal(t, problem)
+	job, problem := gpuDescriptor.Function("four_lane")
+	fatal(t, problem)
+	genericGPU, err := modeltransfer.ParseResourceNeeds(
+		job.RequiredGPUCount(), job.Resources.Requires)
+	if err != nil || genericGPU.GPUCount != 1 ||
+		!genericGPU.AcceptsGPU("", 1, 1) {
+		t.Fatalf("H3-like generic GPU resources = %+v, %v", genericGPU, err)
+	}
+	cpu, err := modeltransfer.ParseResourceNeeds(0, "")
+	if err != nil || cpu.GPUCount != 0 || cpu.AcceptsGPU("9.0", 80, 64) {
+		t.Fatalf("CPU resources selected GPU capacity: %+v, %v", cpu, err)
+	}
+	for name, test := range map[string]struct {
+		requires string
+		accepts  bool
+	}{
+		"sm admitted":   {"sm90+", true},
+		"sm refused":    {"sm91+", false},
+		"vram admitted": {"vram80g", true},
+		"vram refused":  {"vram81g", false},
+		"ram admitted":  {"ram64g", true},
+		"ram refused":   {"ram65g", false},
+	} {
+		needs, err := modeltransfer.ParseResourceNeeds(1, test.requires)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if got := needs.AcceptsGPU("9.0", 80, 64); got != test.accepts {
+			t.Errorf("%s: candidate acceptance = %v", name, got)
+		}
+	}
+	for _, invalid := range []struct {
+		gpu      int64
+		requires string
+	}{
+		{-1, ""}, {2, ""}, {0, "sm90+"}, {0, "cuda13.0+"},
+		{1, "sm0+"}, {1, "vram0g"}, {1, "cuda0.0+"}, {1, "cudaevil+"},
+		{1, "sm999999999999999999999999999+"}, {1, "unknown"},
+	} {
+		if _, err := modeltransfer.ParseResourceNeeds(invalid.gpu, invalid.requires); err == nil {
+			t.Errorf("invalid resource declaration gpu=%d requires=%q was accepted",
+				invalid.gpu, invalid.requires)
 		}
 	}
 }
