@@ -9,7 +9,7 @@
 //!                        plan structurally cannot read them, and evidence is their home.
 //!   `run`                spawns an ISOLATED child. The parent never parses the carrier.
 //!   `ingest-worker`      the hermetic child: it parses, converts, writes candidates under
-//!                        an expiring temporary candidate, and emits a receipt. It cannot
+//!                        a temporary session, and emits a receipt. It cannot
 //!                        install a manifest and it has no network stack linked into it.
 //!   `install`            the COORDINATOR's act. It consumes the receipt, verifies the
 //!                        binding, walks the tree, and alone promotes one root.
@@ -1121,7 +1121,6 @@ pub fn cmd_run(root: &Path, target: &str, f: &Flags) -> ExitCode {
                 | "spec-variant"
                 | "order"
                 | "tenant"
-                | "ttl"
                 | "isolation-tier"
         ) {
             argv.push(format!("--{k}"));
@@ -1172,11 +1171,10 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     }
     let session = session_of(f, &p);
     let tenant = flag(f, "tenant").unwrap_or("dev").to_string();
-    let ttl: u64 = flag_num(f, "ttl", 0);
     let store = ok!(Store::init(root));
 
     // The root goes down FIRST. From this line on the session is reapable whatever happens.
-    let (mut ingest_root, _operation_writer) = ok!(tx::open_root(&store, &session, &tenant, ttl));
+    let (mut ingest_root, _operation_writer) = ok!(tx::open_root(&store, &session, &tenant));
 
     // Configs are sidecar bytes the header commits BY REFERENCE.
     let mut configs: Vec<(String, ConfigRef)> = Vec::new();
@@ -1388,21 +1386,6 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
         stamp_ref.clone(),
         receipt_ref.clone(),
     ];
-    let accepted_bytes = ingest_root
-        .candidates
-        .iter()
-        .map(|candidate| candidate.length)
-        .sum();
-    ok!(
-        tensorfs_core::catalog::Catalog::open(store.root()).and_then(|catalog| {
-            catalog.progress(
-                &session,
-                tx::now_secs(),
-                ingest_root.candidates.len() as u64,
-                accepted_bytes,
-            )
-        })
-    );
     ok!(tx::write_session(store.root(), &ingest_root));
     let dir = tx::candidate_dir(store.root(), &session);
     for (name, bytes) in [
@@ -1427,17 +1410,10 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     println!("  candidates {}", stamped.stamp.candidate_set);
     println!("  golden     {}", stamped.stamp.golden);
     println!("receipt      {}", receipt_ref.id());
-    if ingest_root.expires_at == 0 {
-        println!(
-            "candidate    {} is resumable until explicit reap — NOT a checkpoint until `tfs ingest install`",
-            session
-        );
-    } else {
-        println!(
-            "candidate    {} expires at caller-selected {} — NOT a checkpoint until `tfs ingest install`",
-            session, ingest_root.expires_at
-        );
-    }
+    println!(
+        "candidate    {} is resumable until explicit reap — NOT a checkpoint until `tfs ingest install`",
+        session
+    );
     ExitCode::SUCCESS
 }
 
@@ -1519,12 +1495,7 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
 
     let session = flag(f, "session").unwrap_or("reingest").to_string();
     let tenant = flag(f, "tenant").unwrap_or("dev").to_string();
-    let (mut ingest_root, _operation_writer) = ok!(tx::open_root(
-        &store,
-        &session,
-        &tenant,
-        flag_num(f, "ttl", 0)
-    ));
+    let (mut ingest_root, _operation_writer) = ok!(tx::open_root(&store, &session, &tenant));
     let out = ok!(tx::execute(
         &store,
         &plan,
@@ -1632,15 +1603,9 @@ pub fn cmd_install(
     ExitCode::SUCCESS
 }
 
-pub fn cmd_reap(root: &Path, f: &Flags) -> ExitCode {
+pub fn cmd_reap(root: &Path, _f: &Flags) -> ExitCode {
     let store = ok!(Store::open(root));
-    // `--now` is the operator's explicit abandonment act; elapsed time grants no authority.
-    let now = if flag_on(f, "now") {
-        u64::MAX
-    } else {
-        tx::now_secs()
-    };
-    let (gone, kept) = ok!(tx::reap(&store, now));
+    let (gone, kept) = ok!(tx::reap(&store));
     for g in &gone {
         println!("reaped       {g}");
     }
@@ -1659,7 +1624,7 @@ pub fn cmd_sessions(root: &Path) -> ExitCode {
     for i in &installed {
         println!("manifest     sha256:{i}");
     }
-    let (_, live) = ok!(tx::reap(&store, 0));
+    let live = tx::sessions(&store);
     for s in &live {
         println!("candidate    {s} (temporary — not a release)");
     }

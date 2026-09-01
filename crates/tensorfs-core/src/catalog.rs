@@ -18,7 +18,7 @@ const SCHEMA: &[(&str, &[&str])] = &[
     ("tensorfs_holds", &["operation_id", "key", "length"]),
     (
         "tensorfs_operations",
-        &["id", "org", "name", "writer_marker", "last_progress_at"],
+        &["id", "org", "name", "writer_marker"],
     ),
     (
         "tensorfs_released_manifests",
@@ -230,8 +230,7 @@ impl Catalog {
                    id TEXT PRIMARY KEY,
                    org TEXT NOT NULL,
                    name TEXT NOT NULL,
-                   writer_marker TEXT NOT NULL,
-                   last_progress_at INTEGER NOT NULL
+                   writer_marker TEXT NOT NULL
                  ) STRICT;
                  CREATE TABLE tensorfs_holds (
                    operation_id TEXT NOT NULL,
@@ -309,13 +308,7 @@ impl Catalog {
             .map_err(|error| sql("commit repository projection", error))
     }
 
-    pub fn begin_operation(
-        &self,
-        id: &str,
-        org: &str,
-        name: &str,
-        now: u64,
-    ) -> Result<WriterGuard> {
+    pub fn begin_operation(&self, id: &str, org: &str, name: &str) -> Result<WriterGuard> {
         let root = self.path.parent().ok_or_else(|| Refusal {
             code: Code::IO_FAILED,
             detail: "catalog has no store parent".into(),
@@ -324,8 +317,8 @@ impl Catalog {
         self.connection()?
             .execute(
                 "INSERT INTO tensorfs_operations
-                 (id,org,name,writer_marker,last_progress_at) VALUES (?1,?2,?3,?4,?5)",
-                params![id, org, name, guard.path.to_string_lossy(), now],
+                 (id,org,name,writer_marker) VALUES (?1,?2,?3,?4)",
+                params![id, org, name, guard.path.to_string_lossy()],
             )
             .map_err(|error| sql("begin operation", error))?;
         Ok(guard)
@@ -334,13 +327,7 @@ impl Catalog {
     /// Claim an existing open operation for this process, or recreate its coordination row
     /// after an explicit catalog rebuild. The returned advisory-lock guard must live for the
     /// whole resumed writer/install process.
-    pub fn resume_operation(
-        &self,
-        id: &str,
-        org: &str,
-        name: &str,
-        now: u64,
-    ) -> Result<WriterGuard> {
+    pub fn resume_operation(&self, id: &str, org: &str, name: &str) -> Result<WriterGuard> {
         use rusqlite::OptionalExtension;
 
         let root = self.path.parent().ok_or_else(|| Refusal {
@@ -365,8 +352,8 @@ impl Catalog {
                 transaction
                     .execute(
                         "INSERT INTO tensorfs_operations
-                         (id,org,name,writer_marker,last_progress_at) VALUES (?1,?2,?3,?4,?5)",
-                        params![id, org, name, guard.path.to_string_lossy(), now],
+                         (id,org,name,writer_marker) VALUES (?1,?2,?3,?4)",
+                        params![id, org, name, guard.path.to_string_lossy()],
                     )
                     .map_err(|error| sql("recreate operation after rebuild", error))?;
             }
@@ -387,9 +374,9 @@ impl Catalog {
                 transaction
                     .execute(
                         "UPDATE tensorfs_operations
-                         SET writer_marker=?2,last_progress_at=?3
+                         SET writer_marker=?2
                          WHERE id=?1",
-                        params![id, guard.path.to_string_lossy(), now],
+                        params![id, guard.path.to_string_lossy()],
                     )
                     .map_err(|error| sql("claim resumed operation", error))?;
             }
@@ -407,7 +394,6 @@ impl Catalog {
         &self,
         operation: &str,
         request_digest: &str,
-        now: u64,
     ) -> Result<SourcePreparation> {
         crate::ids::ascii_name(
             "source preparation operation",
@@ -415,8 +401,7 @@ impl Catalog {
             crate::limits::MAX_NAME_BYTES,
         )?;
         let request_digest = crate::ids::prefixed("source preparation request", request_digest)?;
-        let guard =
-            self.resume_operation(operation, "_tensorfs", "model-source-preparation", now)?;
+        let guard = self.resume_operation(operation, "_tensorfs", "model-source-preparation")?;
         let connection = self.connection()?;
         let existing = connection.query_row(
             "SELECT request_digest,state FROM tensorfs_source_preparations WHERE operation_id=?1",
@@ -567,7 +552,7 @@ impl Catalog {
 
     /// Explicit lifecycle release. Acquiring the operation writer lock first prevents a
     /// caller from dropping holds under an in-flight preparation.
-    pub fn release_source_preparation(&self, operation: &str, now: u64) -> Result<()> {
+    pub fn release_source_preparation(&self, operation: &str) -> Result<()> {
         let count: u64 = self
             .connection()?
             .query_row(
@@ -579,8 +564,7 @@ impl Catalog {
         if count != 1 {
             return refuse(Code::ROOT_ABSENT, "model-source preparation is absent");
         }
-        let _guard =
-            self.resume_operation(operation, "_tensorfs", "model-source-preparation", now)?;
+        let _guard = self.resume_operation(operation, "_tensorfs", "model-source-preparation")?;
         self.complete_operation(operation)
     }
 
@@ -700,28 +684,10 @@ impl Catalog {
         Ok(result)
     }
 
-    pub fn progress(&self, operation: &str, now: u64, objects: u64, bytes: u64) -> Result<()> {
-        let changed = self
-            .connection()?
-            .execute(
-                "UPDATE tensorfs_operations SET last_progress_at=?2
-                 WHERE id=?1 AND (?3>0 OR ?4>0)",
-                params![operation, now, objects, bytes],
-            )
-            .map_err(|error| sql("record operation progress", error))?;
-        if changed != 1 {
-            return refuse(
-                Code::TRANSACTION_CONFLICT,
-                "progress requires an open operation and positive accepted progress",
-            );
-        }
-        Ok(())
-    }
-
     /// Explicit abandonment after every writer grant is revoked and the writer is gone.
     pub fn abandon(&self, operation: &str, grants_revoked: bool) -> Result<()> {
         if !grants_revoked {
-            return refuse(Code::STORE_BUSY, "abandon requires revoked/expired grants");
+            return refuse(Code::STORE_BUSY, "abandon requires revoked grants");
         }
         let mut connection = self.connection()?;
         let transaction = connection
@@ -1090,11 +1056,11 @@ mod tests {
     }
 
     #[test]
-    fn exact_holds_progress_and_explicit_abandonment_are_closed() {
+    fn exact_holds_and_explicit_abandonment_are_closed() {
         let root = temporary("operation");
         fs::create_dir_all(&root).unwrap();
         let catalog = Catalog::initialize(&root).unwrap();
-        let guard = catalog.begin_operation("op", "org", "repo", 10).unwrap();
+        let guard = catalog.begin_operation("op", "org", "repo").unwrap();
         let digest = "11".repeat(32);
         catalog
             .hold("op", &crate::storage::blob_key(&digest).unwrap(), 7)
@@ -1109,7 +1075,6 @@ mod tests {
                 .code,
             Code::KEY_GRAMMAR
         );
-        catalog.progress("op", 20, 1, 7).unwrap();
         assert_eq!(
             catalog.abandon("op", true).unwrap_err().code,
             Code::STORE_BUSY
@@ -1138,10 +1103,10 @@ mod tests {
         let root = temporary("operation-resume");
         fs::create_dir_all(&root).unwrap();
         let catalog = Catalog::initialize(&root).unwrap();
-        let first = catalog.begin_operation("op", "org", "repo", 10).unwrap();
+        let first = catalog.begin_operation("op", "org", "repo").unwrap();
         assert_eq!(
             catalog
-                .resume_operation("op", "org", "repo", 11)
+                .resume_operation("op", "org", "repo")
                 .unwrap_err()
                 .code,
             Code::STORE_BUSY
@@ -1149,15 +1114,15 @@ mod tests {
         drop(first);
         assert_eq!(
             catalog
-                .resume_operation("op", "org", "different", 12)
+                .resume_operation("op", "org", "different")
                 .unwrap_err()
                 .code,
             Code::TRANSACTION_CONFLICT
         );
-        let resumed = catalog.resume_operation("op", "org", "repo", 12).unwrap();
+        let resumed = catalog.resume_operation("op", "org", "repo").unwrap();
         assert_eq!(
             catalog
-                .resume_operation("op", "org", "repo", 13)
+                .resume_operation("op", "org", "repo")
                 .unwrap_err()
                 .code,
             Code::STORE_BUSY
@@ -1166,7 +1131,7 @@ mod tests {
 
         fs::remove_file(Catalog::path(&root)).unwrap();
         let rebuilt = Catalog::initialize(&root).unwrap();
-        let recovered = rebuilt.resume_operation("op", "org", "repo", 14).unwrap();
+        let recovered = rebuilt.resume_operation("op", "org", "repo").unwrap();
         rebuilt
             .hold(
                 "op",

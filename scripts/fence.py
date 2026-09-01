@@ -347,7 +347,7 @@ SERVE_PATH = ["crates/tensorfs-core/src/read.rs", "crates/tensorfs-core/src/fill
 BORDER_VOCAB = ["ingest::carrier", "ingest::convert", "ingest::fingerprint", "carrier::",
                 "fingerprint::", "convert::", "SourceHeader", "IngestProfile", "Converter",
                 "classify", "topology_fingerprint"]
-# `ingest::transaction` is deliberately NOT on that list. GC must mark the border's expiring
+# `ingest::transaction` is deliberately NOT on that list. GC must mark the border's temporary
 # candidate roots — they are pin root class 4 (tensorfs.md §2) — so the ROOT plane is a real
 # seam between the two. What stays banned is the DECIDING half: carrier decode, conversion
 # planning and classification. A fence that cannot tell a root from a parser would force the
