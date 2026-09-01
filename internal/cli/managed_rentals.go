@@ -77,6 +77,14 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 	if problem != nil {
 		return "", "", problem
 	}
+	skus, problem := m.catalogLocked()
+	if problem != nil {
+		return "", "", problem
+	}
+	byName := make(map[string]hub.RentalSKU, len(skus))
+	for _, sku := range skus {
+		byName[sku.Name] = sku
+	}
 	rows, problem := m.store.Rentals()
 	if problem != nil {
 		return "", "", problem
@@ -89,7 +97,10 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 	})
 	for _, row := range rows {
 		if transfer != nil && transfer.GPUCount > 0 {
-			continue // an old rental row does not retain the exact SKU resource envelope
+			sku, current := byName[row.SKU]
+			if !current || !transferSKUCompatible(transfer, sku) {
+				continue
+			}
 		}
 		if (row.AcceleratorModel == "CPU") != needsCPU {
 			continue
@@ -116,10 +127,6 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		return row.ID, line, lineProblem
 	}
 
-	skus, problem := m.catalogLocked()
-	if problem != nil {
-		return "", "", problem
-	}
 	compatible := skus[:0]
 	for _, sku := range skus {
 		if (sku.AcceleratorModel == "CPU") == needsCPU && transferSKUCompatible(transfer, sku) {
