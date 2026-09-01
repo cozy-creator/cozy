@@ -92,7 +92,8 @@ func (o *modelTransferOwner) RefreshRemoteSource(parent context.Context,
 	intent records.ModelTransferIntent,
 ) ([]orchestrator.ModelSourceCapability, *exit.Error) {
 	ctx := o.cliContext(intent, true)
-	resolved, problem := resolvePublishSource(ctx, intent.Source)
+	resolved, problem := resolvePublishSource(ctx, intent.Source,
+		sourceProfileNames(intent.SourceProfiles))
 	if problem != nil {
 		return nil, problem
 	}
