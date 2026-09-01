@@ -115,11 +115,6 @@ func (c *Orchestrator) attach(w *worker) {
 			}
 		}
 		c.mu.Lock()
-		if w.spawned.IsZero() && w.lastReport.IsZero() {
-			// An attached worker whose dial FAILED before any claim: that failure is
-			// measured non-progress, and the silence budget counts from its first one.
-			w.spawned = time.Now()
-		}
 		gone := w.exited || w.stopping || c.closing
 		c.mu.Unlock()
 		if gone {
@@ -225,11 +220,6 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
-	if w.spawned.IsZero() && w.lastReport.IsZero() {
-		w.spawned = time.Now() // the claim is out; silence from here is the pod's
-	}
-	c.mu.Unlock()
 	s := &session{ctx: ctx, instanceID: w.instanceID, out: make(chan *pb.RecordOwnerFrame, 32)}
 	go func() {
 		for m := range s.out {
@@ -477,7 +467,7 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 	if w.spec.Connection != nil {
 		w.remoteWorkerID = ack.WorkerId
 	}
-	// The ClaimAck is the first thing this worker said; the silence clock runs from here.
+	// The ClaimAck is the first observed worker identity on this stream.
 	w.lastReport = time.Now()
 	w.snapshotAcknowledged = false
 	if w.bootID != "" && w.bootID != ack.WorkerBootId {

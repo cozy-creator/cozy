@@ -342,20 +342,6 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
 			}
 		}
-		// THE NO-PROGRESS GROUND'S BOOKKEEPING (cl-025). Movement is a changed signature
-		// between two of the worker's own reports; the wedge verdict is the worker's own
-		// liveness monitor speaking on the activity lane. The orchestrator only counts.
-		sig := progressSignature(r, status)
-		moved := sig != w.progressSig
-		w.progressSig = sig
-		w.wedgedSubjects = wedgeDeclared(r)
-		w.wedged = len(w.wedgedSubjects) > 0
-		switch {
-		case moved, !w.wedged:
-			w.noProgress = 0
-		default:
-			w.noProgress++
-		}
 	}
 	phase := trimEnum(pb.WorkerPhase_name[int32(r.WorkerPhase)], "WORKER_PHASE_")
 	c.mu.Unlock()
@@ -437,98 +423,6 @@ func placementAcquisitionOf(status *pb.PlacementStatus) PlacementAcquisitionFact
 	facts.Package = leg(status.Acquisition.Package)
 	facts.Model = leg(status.Acquisition.Model)
 	return facts
-}
-
-// progressSignature renders every axis one ObservedWorkerState reports into one
-// comparable string, so "no axis moved since the last report" is a comparison of two
-// worker reports and nothing else (cl-025). The activity lane's high-water sequence is
-// the important member: the worker's liveness notes, boot steps and admission changes all
-// bump it, so a worker doing anything at all shows movement here even while its placement
-// axes hold still.
-func progressSignature(r *pb.ObservedWorkerState, status *pb.PlacementStatus) string {
-	maxSeq := uint64(0)
-	for _, a := range r.Activity {
-		if a.Seq > maxSeq {
-			maxSeq = a.Seq
-		}
-	}
-	sig := fmt.Sprintf("phase=%d adm=%d/%d slots=%d acc=%d conv=%d held=%d faults=%d seq=%d",
-		r.WorkerPhase, r.AdmissionState, r.AdmissionGeneration, r.AvailableAttemptSlots,
-		r.AcceptedDesiredStateRevision, r.ConvergedRevision, len(r.HeldAttempts),
-		len(r.Faults), maxSeq)
-	if jc := r.GetJobCapacity(); jc != nil {
-		sig += fmt.Sprintf(" jobs=%d/%d", jc.GetJobsAvailable(), jc.GetJobsInFlight())
-	}
-	if status != nil {
-		sig += fmt.Sprintf(" mat=%d srv=%d gen=%d disp=%s matz=%s set=%x",
-			status.Materialization, status.Serving, status.ExecutorGeneration,
-			strings.Join(spellDigests(status.DispatchableBindingDigests), ","),
-			strings.Join(spellDigests(status.MaterializableBindingDigests), ","), status.PlacementSetDigest)
-		if acquisition := status.GetAcquisition(); acquisition != nil {
-			for _, observed := range []struct {
-				name string
-				leg  *pb.AcquisitionLegObservation
-			}{{"package", acquisition.Package}, {"model", acquisition.Model}} {
-				name, leg := observed.name, observed.leg
-				if leg != nil {
-					sig += fmt.Sprintf(" %s=%d/%d/%d/%d", name, leg.StartedMonotonicNs,
-						leg.EndedMonotonicNs, leg.DownloadedBytes, leg.ReusedBytes)
-				}
-			}
-		}
-	}
-	return sig
-}
-
-func spellDigests(digests [][]byte) []string {
-	out := make([]string, 0, len(digests))
-	for _, digest := range digests {
-		out = append(out, spellOf(digest))
-	}
-	return out
-}
-
-// wedgeDeclared reads the worker's OWN no-progress verdict off the activity lane: its
-// liveness monitor emits a `liveness` note naming the WEDGED subject when consecutive
-// observations find a monotone position unmoved (a count of observations, clock-free on
-// the worker too). The orchestrator never diagnoses a wedge itself — it acts on this
-// report, which is the whole of decisions #613's rule.
-func wedgeDeclared(r *pb.ObservedWorkerState) map[string]bool {
-	type verdict struct {
-		seq    uint64
-		wedged bool
-	}
-	latest := map[string]verdict{}
-	for _, activity := range r.Activity {
-		if activity.Kind != "liveness" {
-			continue
-		}
-		subject, wedged, ok := livenessVerdict(activity.Step)
-		if !ok || latest[subject].seq > activity.Seq {
-			continue
-		}
-		latest[subject] = verdict{seq: activity.Seq, wedged: wedged}
-	}
-	out := map[string]bool{}
-	for subject, current := range latest {
-		if current.wedged {
-			out[subject] = true
-		}
-	}
-	return out
-}
-
-// livenessVerdict reads only the two exact Runtime spellings. In particular, the
-// recovery note contains the historical word WEDGED while explicitly retracting it;
-// substring matching turned that retraction into a fresh wedge.
-func livenessVerdict(step string) (subject string, wedged bool, ok bool) {
-	if subject, _, ok = strings.Cut(step, " is WEDGED by silence"); ok && subject != "" {
-		return subject, true, true
-	}
-	if subject, _, ok = strings.Cut(step, " resumed ("); ok && subject != "" {
-		return subject, false, true
-	}
-	return "", false, false
 }
 
 // faulted reads only the protocol's terminal axes. Fault rows are explanations and may
