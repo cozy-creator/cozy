@@ -623,36 +623,3 @@ pub fn cmd_mine(rows: &std::path::Path, name: &str, f: &Flags) -> ExitCode {
     }
     ExitCode::SUCCESS
 }
-
-pub fn cmd_capability(encoding: &str, device: &str, f: &Flags) -> ExitCode {
-    let recs = registry::capability_records();
-    println!(
-        "capability records: {} ({} qualified pairs)",
-        recs.records.len(),
-        recs.records.len()
-    );
-    let enc = match flag(f, "alias") {
-        Some(a) => match registry::seeds().iter().find(|s| s.alias == a) {
-            Some(s) => s.spec.object_id(),
-            None => {
-                eprintln!("no seed aliased {a:?}");
-                return ExitCode::from(2);
-            }
-        },
-        // A spec id is prefixed BY DEFINITION, and the CLI hands every digest argument over
-        // bare (`accept_printed_ids`), so put the one spelling back.
-        None if tensorfs_core::ids::hex64("encoding", encoding).is_ok() => {
-            format!("sha256:{encoding}")
-        }
-        None => encoding.to_string(),
-    };
-    match recs.admit(&enc, device) {
-        Ok(r) => {
-            println!("ADMITTED ({enc}, {device})");
-            println!("  implementation {}", r.implementation);
-            println!("  qualified against vectors {}", r.vectors.id());
-            ExitCode::SUCCESS
-        }
-        Err(e) => bail(e),
-    }
-}

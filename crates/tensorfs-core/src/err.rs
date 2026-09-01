@@ -79,7 +79,6 @@ codes![
     WHOLE_DIGEST_MISMATCH,
     NOT_CONTAINED,
     // registry / qualification
-    CAPABILITY_UNQUALIFIED,
     VECTOR_MISMATCH,
     // object store
     STORE_ERA,

@@ -145,7 +145,6 @@ fn main() -> ExitCode {
         ["checkpoint", "admit", r, h] => ckpt::cmd_admit(Path::new(r), h, &flags),
         ["conform"] => conform::cmd_conform(None, &flags),
         ["conform", w] => conform::cmd_conform(Some(w), &flags),
-        ["capability", e, d] => conform::cmd_capability(e, d, &flags),
         ["vectors", "mine", rows, name] => conform::cmd_mine(Path::new(rows), name, &flags),
         ["structure", "bank", rows, fam, var] => {
             fixtures::cmd_bank_rows(Path::new(rows), fam, var, &flags)
@@ -1421,7 +1420,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "no components",
     ));
 
-    // ---- tfs-015: hostile native bytes, keys, totals, capability ----
+    // ---- tfs-015: hostile native bytes, keys, totals ----
     cases.push(red_case(
         g,
         "digest-31-bytes",
