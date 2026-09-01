@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -351,6 +352,12 @@ type worker struct {
 	// locally reconstructed placement.
 	desiredPackages []*pb.DownloadPackageRef
 	desiredModels   []*pb.DownloadModelRef
+	desiredMu       sync.Mutex
+	// A rental is one machine and may host several package environments. Keep the
+	// worker-reported placement for every binding instead of overwriting package A when
+	// package B joins the same desired set.
+	remotePlacements map[string]DesiredPlacement
+	observedRemote   map[string]remotePlacementObservation
 	// desiredPrivate is the exact command-scoped private wheel inventory. It survives
 	// control reconnect so a prepared pod can replay its ledgered PlacementSet directly.
 	desiredPrivate *pb.DesiredPrivatePackageSet
@@ -451,12 +458,25 @@ type worker struct {
 	lastUseRevision  uint64
 }
 
+type remotePlacementObservation struct {
+	placementID           string
+	packageRevision       string
+	environmentDigest     string
+	configDigest          string
+	serving               pb.ServingState
+	dispatchablePlanIDs   map[string]bool
+}
+
 // dispatchableFor is the ROUTING GATE, and it is two questions with two owners (#482).
 // DISPATCHABILITY is a PLACEMENT property: the serving axis says DISPATCHABLE and the
 // placement advertises this plan. ADMISSION is a WORKER property: the fence is OPEN and a
 // seat is free. A placement that is STAGED but OFFLINE is not capacity, however much of it
 // is on disk.
 func (w *worker) dispatchableFor(planID string) bool {
+	if w.spec.Connection != nil && !w.spec.IsJob() {
+		placement, known := w.remotePlacements[planID]
+		return known && placement.PlacementIDValue != "" && w.dispatchable[planID]
+	}
 	return w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE && w.dispatchable[planID]
 }
 
@@ -712,9 +732,10 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 		var refused, desiredRefusal *exit.Error
 		if w != nil {
 			refused, desiredRefusal = w.refusal, w.desiredRefusal
+			observed := w.observedRemote[logical.ReleaseDigest]
 			planID := logical.PlanID
 			if planID == "" && len(logical.Models) > 0 {
-				for candidate, dispatchable := range w.dispatchable {
+				for candidate, dispatchable := range observed.dispatchablePlanIDs {
 					if dispatchable {
 						if planID != "" {
 							planID = ""
@@ -724,34 +745,36 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 					}
 				}
 			}
-			ready := planID != "" && w.dispatchable[planID] && w.placementID != "" &&
-				w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
+			ready := planID != "" && observed.dispatchablePlanIDs[planID] &&
+				observed.placementID != "" &&
+				observed.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
 				w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision
-			if ready && (!validDigest(w.packageRevisionDigest) || !validDigest(w.environmentDigest) ||
-				!validDigest(w.configDigest)) {
+			if ready && (!validDigest(observed.packageRevision) ||
+				!validDigest(observed.environmentDigest) || !validDigest(observed.configDigest)) {
 				c.mu.Unlock()
 				return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
 					"rental.invocation_identity_invalid",
 					"worker resolved package %s without complete invocation identity", logical.Package)
 			}
 			if ready {
-				if w.packageRevisionDigest != logical.ReleaseDigest {
+				if observed.packageRevision != logical.ReleaseDigest {
 					c.mu.Unlock()
 					return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict,
 						"rental.package_release_changed",
 						"worker resolved package release %s, not delegated %s",
-						w.packageRevisionDigest, logical.ReleaseDigest)
+						observed.packageRevision, logical.ReleaseDigest)
 				}
-				w.spec.Placement = DesiredPlacement{
+				placement := DesiredPlacement{
 					Package: pinnedPackage(logical.Package, rentalID), Release: logical.Release,
-					PackageRevisionDigest: w.packageRevisionDigest,
-					EnvironmentDigest:     w.environmentDigest, ConfigDigest: w.configDigest,
-					PlacementIDValue: w.placementID,
+					PackageRevisionDigest: observed.packageRevision,
+					EnvironmentDigest:     observed.environmentDigest, ConfigDigest: observed.configDigest,
+					PlacementIDValue: observed.placementID,
 					Entrypoints: []Entrypoint{{Name: logical.Function, Digest: planID,
 						Outputs: append([]string(nil), logical.Outputs...)}},
 				}
-				w.planIDs = []string{planID}
+				w.remotePlacements[planID] = placement
 				spec := w.spec
+				spec.Placement = placement
 				c.mu.Unlock()
 				return spec, planID, nil
 			}
@@ -837,6 +860,14 @@ func hostsPlans(w *worker, p DesiredPlacement) bool {
 	}
 	for _, j := range p.Jobs {
 		want[j.DescriptorID] = true
+	}
+	if w.spec.Connection != nil && !w.spec.IsJob() {
+		for id := range want {
+			if _, ok := w.remotePlacements[id]; !ok {
+				return false
+			}
+		}
+		return len(want) > 0
 	}
 	if len(want) != len(w.planIDs) {
 		return false
@@ -1078,13 +1109,15 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 // off a separate "have we heard from it" flag that could disagree with them.
 func newWorker(instanceID string, spec WorkerLaunchSpec) *worker {
 	w := &worker{
-		instanceID:     instanceID,
-		spec:           spec,
-		placementID:    spec.Placement.PlacementID(),
-		dispatchable:   map[string]bool{},
-		materializable: map[string]bool{},
-		stopped:        make(chan struct{}),
-		attachDone:     make(chan struct{}),
+		instanceID:       instanceID,
+		spec:             spec,
+		placementID:      spec.Placement.PlacementID(),
+		dispatchable:     map[string]bool{},
+		materializable:   map[string]bool{},
+		remotePlacements: map[string]DesiredPlacement{},
+		observedRemote:   map[string]remotePlacementObservation{},
+		stopped:          make(chan struct{}),
+		attachDone:       make(chan struct{}),
 	}
 	return w
 }

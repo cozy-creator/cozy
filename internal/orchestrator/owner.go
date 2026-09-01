@@ -649,6 +649,8 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		if len(packages) == 0 && len(models) == 0 {
 			return true // generic capacity stays empty until Creator actually selects work
 		}
+		w.desiredMu.Lock()
+		defer w.desiredMu.Unlock()
 		if e := c.issuePackageSet(s, w, packages, models); e != nil {
 			c.logf("rental %s package_set could not be issued: %s",
 				w.spec.Connection.RentalID, e.Message)
