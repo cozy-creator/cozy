@@ -158,6 +158,64 @@ func TestModelProductionCancellationReportsCleanupTruth(t *testing.T) {
 	}
 }
 
+func TestFailedModelUploadKeepsCompletedCheckpointVisible(t *testing.T) {
+	root := t.TempDir()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	instruction := modelproduction.Instruction{Destination: "acme/model",
+		Source:   "hf://acme/source@" + strings.Repeat("a", 40),
+		Producer: "acme/tools/build", Rental: true}
+	production := &launch.ModelProduction{Name: "build",
+		Outputs: []launch.ModelProductionOutput{
+			{Name: "finished", Source: "build.finished"},
+			{Name: "failed", Source: "build.failed"},
+		}}
+	plan := modelproduction.Plan{Instruction: instruction, Destination: instruction.Destination,
+		Source: instruction.Source, Producer: instruction.Producer, Production: production,
+		Jobs: []modelproduction.JobPin{{Step: "build", Callable: "acme/tools@v1/build"}}}
+	instructionBytes, err := instruction.Bytes()
+	must(t, err)
+	instructionDigest, err := instruction.Digest()
+	must(t, err)
+	_, _, problem = store.BeginModelProductionInstruction(instruction.ID(), instructionDigest,
+		instructionBytes)
+	fatal(t, problem)
+	planBytes, err := plan.Bytes()
+	must(t, err)
+	planDigest, err := plan.Digest()
+	must(t, err)
+	_, _, problem = store.AttachModelProductionPlan(instruction.ID(), instructionDigest,
+		instructionBytes, planBytes, planDigest)
+	fatal(t, problem)
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "accepted", "source_preparing", 0, "rental-proof"))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_preparing", "source_prepared", 0, "rental-proof"))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_prepared", "step_running", 0, "rental-proof"))
+	checkpoint := "sha256:" + strings.Repeat("d", 64)
+	fatal(t, store.RecordModelProductionArtifact(records.ModelProductionArtifact{
+		OperationID: instruction.ID(), StepName: "build", OutputSlot: "finished",
+		RequestID: "job-proof", Attempt: 1, InvocationDigest: "sha256:" + strings.Repeat("b", 64),
+		TransactionID: "transaction-proof", WriterGeneration: 1,
+		ReceiptDigest: "sha256:" + strings.Repeat("c", 64), Receipt: []byte(`{"format":"proof/1"}`),
+		ManifestID: checkpoint, ManifestLength: 128,
+		CheckpointEvidence: []byte(`{"format":"evidence/1"}`),
+	}, nil))
+	fatal(t, store.MarkModelProductionArtifactPublished(instruction.ID(), "build", "finished", "upload-proof"))
+	fatal(t, store.FailModelProduction(instruction.ID(), "step_running", "second_output_failed",
+		"the independent second output failed"))
+	store.Close()
+
+	daemon := startDaemonProcess(t, root)
+	reply := daemon.call(t, http.MethodGet, "/v1/local/model-productions/"+instruction.ID(), nil)
+	var state api.ModelProductionState
+	if reply.Status != http.StatusOK || json.Unmarshal(reply.Body, &state) != nil ||
+		state.Status != "failed" || state.Checkpoints["finished"] != checkpoint ||
+		state.Checkpoints["failed"] != "" {
+		t.Fatalf("failed upload lost its completed checkpoint: %s", reply.brief())
+	}
+}
+
 func TestForeignModelProductionRefusesBeforeWriteOrSpend(t *testing.T) {
 	var mu sync.Mutex
 	accountReads, unexpected := 0, 0
