@@ -430,8 +430,6 @@ impl Checkpoint {
 pub struct ReleaseLane {
     pub lane: String,
     pub manifest: ObjectRef,
-    /// Optional domain metadata stored as an ordinary blob.
-    pub metadata: Option<ObjectRef>,
 }
 
 impl ReleaseLane {
@@ -445,12 +443,6 @@ impl ReleaseLane {
         if self.manifest.length == 0 {
             return refuse(Code::LENGTH_MISMATCH, "release manifest has zero length");
         }
-        if let Some(metadata) = &self.metadata {
-            hex64("Release.metadata", &metadata.sha256)?;
-            if metadata.length == 0 {
-                return refuse(Code::LENGTH_MISMATCH, "release metadata has zero length");
-            }
-        }
         Ok(())
     }
 
@@ -459,29 +451,17 @@ impl ReleaseLane {
         let lane = fields.req_str("lane")?.to_string();
         let manifest =
             ObjectRef::from_value("Repository.release.lane.manifest", fields.req("manifest")?)?;
-        let metadata = fields
-            .opt("metadata")
-            .map(|value| ObjectRef::from_value("Repository.release.lane.metadata", value))
-            .transpose()?;
         fields.done()?;
-        let lane = Self {
-            lane,
-            manifest,
-            metadata,
-        };
+        let lane = Self { lane, manifest };
         lane.validate()?;
         Ok(lane)
     }
 
     fn to_value(&self) -> Value {
-        let mut fields = vec![
+        Value::obj(vec![
             ("lane", Value::str(self.lane.clone())),
             ("manifest", self.manifest.to_value()),
-        ];
-        if let Some(metadata) = &self.metadata {
-            fields.push(("metadata", metadata.to_value()));
-        }
-        Value::obj(fields)
+        ])
     }
 }
 
@@ -806,6 +786,12 @@ impl Repository {
         next.releases[release_index]
             .lanes
             .retain(|lane| remove.binary_search(&lane.lane).is_err());
+        if next.releases[release_index].lanes.is_empty() {
+            return refuse(
+                Code::RELEASE_CONFLICT,
+                "a release must retain one lane; yank the release to hide it",
+            );
+        }
         if next.releases[release_index].lanes == before {
             if expected_revision == 0 {
                 next.releases.remove(release_index);
@@ -1277,7 +1263,6 @@ mod tests {
                 sha256: format!("{:02x}", seed + 1).repeat(32),
                 length: 12,
             },
-            metadata: None,
         }
     }
 
@@ -1374,9 +1359,9 @@ mod tests {
             Code::CHECKPOINT_REFERENCED
         );
         let moved = repository
-            .update_release("v0.1", 1, Vec::new(), vec!["fp8".into(), "mxfp8".into()])
+            .update_release("v0.1", 1, Vec::new(), vec!["fp8".into()])
             .unwrap();
-        assert!(moved.releases[0].lanes.is_empty());
+        assert_eq!(moved.releases[0].lanes.len(), 1);
         assert!(moved.checkpoints[0].published);
         assert_eq!(
             moved
@@ -1397,7 +1382,6 @@ mod tests {
         let replacement = ReleaseLane {
             lane: "bf16".into(),
             manifest: peer.manifest.clone(),
-            metadata: None,
         };
         let repository = Repository::empty(RepositoryName::new("org", "model").unwrap())
             .put_checkpoint(Checkpoint {

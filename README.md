@@ -124,8 +124,8 @@ Clients may preserve those bytes opaquely and base64-wrap them for a later `put_
 remains the only parser and canonical writer. Ordinary release rows omit evidence.
 
 Evidence is present only for a Manifest containing one typed CozyTensors header. Ordinary files do
-not fabricate model classification. A lane may carry one optional domain metadata blob ref. Rebuild
-always recovers the repository, metadata, Manifest, and complete reached blob set;
+not fabricate model classification. Rebuild always recovers the repository, Manifest, and complete
+reached blob set;
 model headers additionally recover the diagnostic projection emitted by `store rebuild --rows`.
 
 ## Reviewed source planning and ingest

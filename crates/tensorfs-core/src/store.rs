@@ -443,15 +443,6 @@ impl Store {
                             );
                         }
                     }
-                    if let Some(metadata) = &lane.metadata {
-                        let file = self.open_verified(&metadata.sha256)?;
-                        if file.len() != metadata.length {
-                            return refuse(
-                                Code::LENGTH_MISMATCH,
-                                format!("{} length differs from release metadata", metadata.id()),
-                            );
-                        }
-                    }
                     if let Some(header_ref) = parsed.header() {
                         crate::checkpoint::load_header(self, header_ref)?;
                         crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;

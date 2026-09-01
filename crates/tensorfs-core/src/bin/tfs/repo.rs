@@ -149,7 +149,7 @@ fn repo_rows(repository: &Repository, bytes: &[u8]) -> Vec<Vec<u8>> {
     }
     for release in &repository.releases {
         for lane in &release.lanes {
-            let mut fields = vec![
+            let fields = vec![
                 ("kind", Value::str("release")),
                 ("lane", Value::str(lane.lane.clone())),
                 ("manifest_length", Value::uint(lane.manifest.length)),
@@ -160,9 +160,6 @@ fn repo_rows(repository: &Repository, bytes: &[u8]) -> Vec<Vec<u8>> {
                 ("release_yanked", Value::Bool(release.yanked)),
                 ("version", Value::str(release.version.clone())),
             ];
-            if let Some(metadata) = &lane.metadata {
-                fields.push(("metadata", metadata.to_value()));
-            }
             rows.push(tensorfs_core::canon::write(&Value::obj(fields)));
         }
     }
@@ -189,6 +186,17 @@ fn checkpoint_fact_rows(
         fields.push(("topology_digest", Value::str(topology.clone())));
     }
     let mut rows = vec![tensorfs_core::canon::write(&Value::obj(fields))];
+    for (object_kind, object) in &facts.objects {
+        rows.push(tensorfs_core::canon::write(&Value::obj(vec![
+            ("kind", Value::str("checkpoint_object")),
+            ("length", Value::uint(object.length)),
+            ("manifest_sha256", Value::str(manifest.sha256.clone())),
+            ("name", Value::str(repository.repo.name.clone())),
+            ("object_kind", Value::str(object_kind.clone())),
+            ("org", Value::str(repository.repo.org.clone())),
+            ("sha256", Value::str(object.sha256.clone())),
+        ])));
+    }
     for (encoding_id, alias) in &facts.encodings {
         let mut fields = vec![
             ("encoding_id", Value::str(encoding_id.clone())),
@@ -996,7 +1004,7 @@ pub fn cmd_rebuild(census: &Path, flags: &Flags) -> ExitCode {
         }
     }
     println!(
-        "rebuilt {} repos, {} releases, {} release objects",
+        "rebuilt {} repos, {} releases, {} checkpoint objects",
         projection.repos.len(),
         projection.releases.len(),
         projection.objects.len()

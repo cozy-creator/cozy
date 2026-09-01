@@ -417,7 +417,6 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
             set: vec![ReleaseLane {
                 lane: lane.to_string(),
                 manifest,
-                metadata: None,
             }],
             version: version.to_string(),
         };

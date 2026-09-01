@@ -738,7 +738,6 @@ impl PyStore {
                 Ok(ReleaseLane {
                     lane,
                     manifest: obj_ref(py, &digest, length)?,
-                    metadata: None,
                 })
             })
             .collect::<PyResult<Vec<_>>>()?;
@@ -1309,7 +1308,6 @@ impl PyOperation {
                     set: vec![ReleaseLane {
                         lane: lane.to_string(),
                         manifest,
-                        metadata: None,
                     }],
                     version: version.to_string(),
                 };

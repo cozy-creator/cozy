@@ -13,7 +13,7 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Body, Header};
 use crate::ids::{hex64, Doc, ObjectRef};
 use crate::manifest::{Entry, Manifest};
-use crate::repository::{Release, ReleaseLane, Repository, RepositoryName};
+use crate::repository::{Checkpoint, Release, ReleaseLane, Repository, RepositoryName};
 
 fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
     Refusal {
@@ -160,73 +160,77 @@ pub struct CheckpointRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseRow {
-    pub evidence_json: Option<Vec<u8>>,
+    pub lane: String,
+    pub manifest_length: u64,
+    pub manifest_sha256: String,
+    pub name: String,
+    pub org: String,
+    pub release_revision: u64,
+    pub release_yanked: bool,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointFactsRow {
     pub header_length: Option<u64>,
     pub header_sha256: Option<String>,
-    pub lane: String,
     pub manifest_length: u64,
     pub manifest_sha256: String,
     pub name: String,
     pub object_bytes: u64,
     pub object_count: u64,
     pub org: String,
-    pub release_revision: u64,
-    pub release_yanked: bool,
     pub topology_digest: Option<String>,
-    pub version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReleaseObjectRow {
-    pub lane: String,
+pub struct CheckpointObjectRow {
     pub length: u64,
+    pub manifest_sha256: String,
     pub name: String,
     pub object_kind: String,
     pub org: String,
     pub sha256: String,
-    pub version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReleaseEncodingRow {
+pub struct CheckpointEncodingRow {
     pub alias: Option<String>,
     pub encoding_id: String,
-    pub lane: String,
+    pub manifest_sha256: String,
     pub name: String,
     pub org: String,
-    pub version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReleaseComponentRow {
+pub struct CheckpointComponentRow {
     pub component: String,
-    pub lane: String,
+    pub manifest_sha256: String,
     pub name: String,
     pub org: String,
-    pub version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReleaseConfigRow {
+pub struct CheckpointConfigRow {
     pub config: String,
-    pub lane: String,
     pub length: u64,
+    pub manifest_sha256: String,
     pub media_type: String,
     pub name: String,
     pub org: String,
     pub sha256: String,
-    pub version: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Projection {
     pub checkpoints: Vec<CheckpointRow>,
-    pub components: Vec<ReleaseComponentRow>,
-    pub configs: Vec<ReleaseConfigRow>,
-    pub encodings: Vec<ReleaseEncodingRow>,
+    pub checkpoint_facts: Vec<CheckpointFactsRow>,
+    pub components: Vec<CheckpointComponentRow>,
+    pub configs: Vec<CheckpointConfigRow>,
+    pub encodings: Vec<CheckpointEncodingRow>,
     pub repos: Vec<RepoRow>,
     pub releases: Vec<ReleaseRow>,
-    pub objects: Vec<ReleaseObjectRow>,
+    pub objects: Vec<CheckpointObjectRow>,
 }
 
 impl Projection {
@@ -259,26 +263,29 @@ impl Projection {
             lines.push(crate::canon::write(&Value::obj(fields)));
         }
         for row in &self.releases {
-            let mut fields = vec![
+            let fields = vec![
                 ("kind", Value::str("release")),
                 ("lane", Value::str(row.lane.clone())),
+                ("manifest_length", Value::uint(row.manifest_length)),
+                ("manifest_sha256", Value::str(row.manifest_sha256.clone())),
+                ("name", Value::str(row.name.clone())),
+                ("org", Value::str(row.org.clone())),
+                ("release_revision", Value::uint(row.release_revision)),
+                ("release_yanked", Value::Bool(row.release_yanked)),
+                ("version", Value::str(row.version.clone())),
+            ];
+            lines.push(crate::canon::write(&Value::obj(fields)));
+        }
+        for row in &self.checkpoint_facts {
+            let mut fields = vec![
+                ("kind", Value::str("checkpoint_facts")),
                 ("manifest_length", Value::uint(row.manifest_length)),
                 ("manifest_sha256", Value::str(row.manifest_sha256.clone())),
                 ("name", Value::str(row.name.clone())),
                 ("object_bytes", Value::uint(row.object_bytes)),
                 ("object_count", Value::uint(row.object_count)),
                 ("org", Value::str(row.org.clone())),
-                ("release_revision", Value::uint(row.release_revision)),
-                ("release_yanked", Value::Bool(row.release_yanked)),
-                ("version", Value::str(row.version.clone())),
             ];
-            if let Some(evidence) = &row.evidence_json {
-                fields.push((
-                    "evidence",
-                    crate::canon::parse_canonical(evidence, crate::repository::MAX_EVIDENCE_BYTES)
-                        .expect("validated evidence bytes"),
-                ));
-            }
             if let (Some(sha256), Some(length), Some(topology)) =
                 (&row.header_sha256, row.header_length, &row.topology_digest)
             {
@@ -290,24 +297,22 @@ impl Projection {
         }
         for row in &self.objects {
             lines.push(crate::canon::write(&Value::obj(vec![
-                ("kind", Value::str("release_object")),
-                ("lane", Value::str(row.lane.clone())),
+                ("kind", Value::str("checkpoint_object")),
                 ("length", Value::uint(row.length)),
+                ("manifest_sha256", Value::str(row.manifest_sha256.clone())),
                 ("name", Value::str(row.name.clone())),
                 ("object_kind", Value::str(row.object_kind.clone())),
                 ("org", Value::str(row.org.clone())),
                 ("sha256", Value::str(row.sha256.clone())),
-                ("version", Value::str(row.version.clone())),
             ])));
         }
         for row in &self.encodings {
             let mut fields = vec![
                 ("encoding_id", Value::str(row.encoding_id.clone())),
-                ("kind", Value::str("release_encoding")),
-                ("lane", Value::str(row.lane.clone())),
+                ("kind", Value::str("checkpoint_encoding")),
+                ("manifest_sha256", Value::str(row.manifest_sha256.clone())),
                 ("name", Value::str(row.name.clone())),
                 ("org", Value::str(row.org.clone())),
-                ("version", Value::str(row.version.clone())),
             ];
             if let Some(alias) = &row.alias {
                 fields.push(("alias", Value::str(alias.clone())));
@@ -317,24 +322,22 @@ impl Projection {
         for row in &self.components {
             lines.push(crate::canon::write(&Value::obj(vec![
                 ("component", Value::str(row.component.clone())),
-                ("kind", Value::str("release_component")),
-                ("lane", Value::str(row.lane.clone())),
+                ("kind", Value::str("checkpoint_component")),
+                ("manifest_sha256", Value::str(row.manifest_sha256.clone())),
                 ("name", Value::str(row.name.clone())),
                 ("org", Value::str(row.org.clone())),
-                ("version", Value::str(row.version.clone())),
             ])));
         }
         for row in &self.configs {
             lines.push(crate::canon::write(&Value::obj(vec![
                 ("config", Value::str(row.config.clone())),
-                ("kind", Value::str("release_config")),
-                ("lane", Value::str(row.lane.clone())),
+                ("kind", Value::str("checkpoint_config")),
                 ("length", Value::uint(row.length)),
+                ("manifest_sha256", Value::str(row.manifest_sha256.clone())),
                 ("media_type", Value::str(row.media_type.clone())),
                 ("name", Value::str(row.name.clone())),
                 ("org", Value::str(row.org.clone())),
                 ("sha256", Value::str(row.sha256.clone())),
-                ("version", Value::str(row.version.clone())),
             ])));
         }
         lines
@@ -343,6 +346,7 @@ impl Projection {
 
 #[derive(Debug, Clone)]
 pub struct Census {
+    complete_inventory: bool,
     root: PathBuf,
     repositories: Vec<(Repository, Vec<u8>)>,
     manifests: BTreeMap<String, (Manifest, Vec<u8>)>,
@@ -355,6 +359,7 @@ pub struct CheckpointFacts {
     pub topology_digest: Option<String>,
     pub object_count: u64,
     pub object_bytes: u64,
+    pub objects: Vec<(String, ObjectRef)>,
     pub encodings: Vec<(String, Option<String>)>,
     pub components: Vec<String>,
     pub configs: Vec<(String, String, u64, String)>,
@@ -463,6 +468,10 @@ impl Census {
             topology_digest: header.as_ref().map(Header::topology_digest),
             object_count: objects.len() as u64,
             object_bytes,
+            objects: objects
+                .into_values()
+                .map(|(kind, object)| (kind.to_string(), object))
+                .collect(),
             encodings: Vec::new(),
             components: Vec::new(),
             configs: Vec::new(),
@@ -527,49 +536,12 @@ impl Census {
                 "projected release is not present in replacement repository",
             );
         }
-        if ObjectRef::of(manifest_bytes) != lane.manifest {
-            return refuse(
-                Code::OBJECT_ID_MISMATCH,
-                "staged manifest bytes disagree with the release reference",
-            );
-        }
-        let manifest = Manifest::parse(manifest_bytes)?;
-        match (manifest.header(), header_bytes) {
-            (Some(header_ref), Some(bytes)) => {
-                if ObjectRef::of(bytes) != *header_ref {
-                    return refuse(
-                        Code::OBJECT_ID_MISMATCH,
-                        "staged header bytes disagree with the manifest reference",
-                    );
-                }
-                Header::parse(bytes)?;
-            }
-            (None, None) => {}
-            (Some(_), None) => {
-                return refuse(
-                    Code::MISSING_FIELD,
-                    "model release requires staged header bytes",
-                )
-            }
-            (None, Some(_)) => {
-                return refuse(
-                    Code::ATTACHMENT_CARDINALITY,
-                    "ordinary release cannot supply CozyTensors header bytes",
-                )
-            }
-        }
-
-        let mut manifests = BTreeMap::new();
-        manifests.insert(
-            lane.manifest.sha256.clone(),
-            (manifest, manifest_bytes.to_vec()),
-        );
-        let census = Self {
-            root: PathBuf::new(),
-            repositories: Vec::new(),
-            manifests,
-            inventory,
-        };
+        let facts = Self::validate_checkpoint_inputs(
+            &lane.manifest,
+            manifest_bytes,
+            header_bytes,
+            &inventory,
+        )?;
         let mut projection = Projection::default();
         projection.repos.push(RepoRow {
             document_sha256: crate::sha256::hex_digest(repository_bytes),
@@ -591,14 +563,136 @@ impl Census {
                     published: checkpoint.published,
                 }
             }));
-        census.project_release_lane_with_header(
-            repository,
-            release,
-            lane,
-            &mut projection,
-            header_bytes,
-        )?;
+        let checkpoint = repository
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.manifest == lane.manifest)
+            .expect("validated release checkpoint");
+        let manifest = Manifest::parse(manifest_bytes)?;
+        Self::require_checkpoint_evidence(&manifest, checkpoint, &facts)?;
+        Self::append_checkpoint_facts(repository, checkpoint, facts, &mut projection);
+        projection.releases.push(ReleaseRow {
+            lane: lane.lane.clone(),
+            manifest_length: lane.manifest.length,
+            manifest_sha256: lane.manifest.sha256.clone(),
+            name: repository.repo.name.clone(),
+            org: repository.repo.org.clone(),
+            release_revision: release.revision,
+            release_yanked: release.yanked,
+            version: release.version.clone(),
+        });
         Ok(projection)
+    }
+
+    fn append_checkpoint_facts(
+        repository: &Repository,
+        checkpoint: &Checkpoint,
+        facts: CheckpointFacts,
+        projection: &mut Projection,
+    ) {
+        projection.checkpoint_facts.push(CheckpointFactsRow {
+            header_length: facts.header.as_ref().map(|header| header.length),
+            header_sha256: facts.header.as_ref().map(|header| header.sha256.clone()),
+            manifest_length: checkpoint.manifest.length,
+            manifest_sha256: checkpoint.manifest.sha256.clone(),
+            name: repository.repo.name.clone(),
+            object_bytes: facts.object_bytes,
+            object_count: facts.object_count,
+            org: repository.repo.org.clone(),
+            topology_digest: facts.topology_digest,
+        });
+        projection
+            .objects
+            .extend(
+                facts
+                    .objects
+                    .into_iter()
+                    .map(|(kind, object)| CheckpointObjectRow {
+                        length: object.length,
+                        manifest_sha256: checkpoint.manifest.sha256.clone(),
+                        name: repository.repo.name.clone(),
+                        object_kind: kind,
+                        org: repository.repo.org.clone(),
+                        sha256: object.sha256,
+                    }),
+            );
+        projection
+            .encodings
+            .extend(facts.encodings.into_iter().map(|(encoding_id, alias)| {
+                CheckpointEncodingRow {
+                    alias,
+                    encoding_id,
+                    manifest_sha256: checkpoint.manifest.sha256.clone(),
+                    name: repository.repo.name.clone(),
+                    org: repository.repo.org.clone(),
+                }
+            }));
+        projection
+            .components
+            .extend(
+                facts
+                    .components
+                    .into_iter()
+                    .map(|component| CheckpointComponentRow {
+                        component,
+                        manifest_sha256: checkpoint.manifest.sha256.clone(),
+                        name: repository.repo.name.clone(),
+                        org: repository.repo.org.clone(),
+                    }),
+            );
+        projection.configs.extend(facts.configs.into_iter().map(
+            |(config, sha256, length, media_type)| CheckpointConfigRow {
+                config,
+                length,
+                manifest_sha256: checkpoint.manifest.sha256.clone(),
+                media_type,
+                name: repository.repo.name.clone(),
+                org: repository.repo.org.clone(),
+                sha256,
+            },
+        ));
+    }
+
+    fn require_checkpoint_evidence(
+        manifest: &Manifest,
+        checkpoint: &Checkpoint,
+        facts: &CheckpointFacts,
+    ) -> Result<()> {
+        match (&facts.topology_digest, &checkpoint.evidence) {
+            (Some(topology), Some(evidence)) if topology == &evidence.classification_digest => {
+                for (path, required) in evidence.required_files()? {
+                    match manifest.entries().iter().find(|(candidate, _)| candidate == path) {
+                        Some((_, Entry::File(actual))) if actual == &required => {}
+                        _ => {
+                            return refuse(
+                                Code::NOT_CONTAINED,
+                                format!(
+                                    "checkpoint evidence {} must be the ordinary manifest file {path:?}",
+                                    required.id()
+                                ),
+                            )
+                        }
+                    }
+                }
+                Ok(())
+            }
+            (Some(topology), Some(evidence)) => refuse(
+                Code::TOPOLOGY_MISMATCH,
+                format!(
+                    "checkpoint classification {} differs from header topology {topology}",
+                    evidence.classification_digest
+                ),
+            ),
+            (Some(_), None) => refuse(
+                Code::MISSING_FIELD,
+                "a CozyTensors checkpoint requires model evidence",
+            ),
+            (None, Some(_)) => refuse(
+                Code::ATTACHMENT_CARDINALITY,
+                "model evidence requires one CozyTensors manifest entry",
+            ),
+            (None, None) => Ok(()),
+        }
     }
 
     pub fn open(root: &Path) -> Result<Self> {
@@ -610,6 +704,7 @@ impl Census {
             inventory_from_tree(root)?
         };
         Ok(Self {
+            complete_inventory: true,
             root: root.to_path_buf(),
             repositories,
             manifests,
@@ -619,6 +714,7 @@ impl Census {
 
     pub fn open_metadata(root: &Path) -> Result<Self> {
         Ok(Self {
+            complete_inventory: false,
             root: root.to_path_buf(),
             repositories: read_repositories(root)?,
             manifests: read_manifests(root)?,
@@ -671,6 +767,11 @@ impl Census {
                         published: checkpoint.published,
                     }
                 }));
+            if self.complete_inventory {
+                for checkpoint in &repository.checkpoints {
+                    self.project_checkpoint(repository, checkpoint, &mut projection)?;
+                }
+            }
             for release in &repository.releases {
                 self.project_release(repository, release, &mut projection)?;
             }
@@ -707,6 +808,11 @@ impl Census {
                     published: checkpoint.published,
                 }
             }));
+        if self.complete_inventory {
+            for checkpoint in &repository.checkpoints {
+                self.project_checkpoint(repository, checkpoint, &mut projection)?;
+            }
+        }
         for release in &repository.releases {
             self.project_release(repository, release, &mut projection)?;
         }
@@ -838,6 +944,31 @@ impl Census {
         Header::parse(&bytes)
     }
 
+    fn project_checkpoint(
+        &self,
+        repository: &Repository,
+        checkpoint: &Checkpoint,
+        projection: &mut Projection,
+    ) -> Result<()> {
+        let (manifest, manifest_bytes) = self.manifest(&checkpoint.manifest)?;
+        let header_bytes = manifest
+            .header()
+            .map(|reference| {
+                let path = self.root.join(blob_key(&reference.sha256)?);
+                fs::read(&path).map_err(|error| io(format!("read {}", path.display()), error))
+            })
+            .transpose()?;
+        let facts = Self::validate_checkpoint_inputs(
+            &checkpoint.manifest,
+            manifest_bytes,
+            header_bytes.as_deref(),
+            &self.inventory,
+        )?;
+        Self::require_checkpoint_evidence(manifest, checkpoint, &facts)?;
+        Self::append_checkpoint_facts(repository, checkpoint, facts, projection);
+        Ok(())
+    }
+
     fn project_release(
         &self,
         repository: &Repository,
@@ -845,247 +976,19 @@ impl Census {
         projection: &mut Projection,
     ) -> Result<()> {
         for lane in &release.lanes {
-            self.project_release_lane_with_header(repository, release, lane, projection, None)?;
-        }
-        Ok(())
-    }
-
-    fn project_release_lane_with_header(
-        &self,
-        repository: &Repository,
-        release: &Release,
-        lane: &ReleaseLane,
-        projection: &mut Projection,
-        header_bytes: Option<&[u8]>,
-    ) -> Result<()> {
-        let (manifest, _) = self.manifest(&lane.manifest)?;
-        let checkpoint = repository
-            .checkpoints
-            .iter()
-            .find(|checkpoint| checkpoint.manifest == lane.manifest)
-            .ok_or_else(|| Refusal {
-                code: Code::CHECKPOINT_ABSENT,
-                detail: "release checkpoint is absent from repository roots".into(),
-            })?;
-        let model = match (manifest.header(), checkpoint.evidence.as_ref()) {
-            (Some(header_ref), Some(evidence)) => {
-                let header = match header_bytes {
-                    Some(bytes) => {
-                        if ObjectRef::of(bytes) != *header_ref {
-                            return refuse(
-                                Code::OBJECT_ID_MISMATCH,
-                                "staged header bytes disagree with manifest",
-                            );
-                        }
-                        Header::parse(bytes)?
-                    }
-                    None => self.header(header_ref)?,
-                };
-                let topology_digest = header.topology_digest();
-                if evidence.classification_digest != topology_digest {
-                    return refuse(
-                        Code::TOPOLOGY_MISMATCH,
-                        format!(
-                            "release classification {} differs from header topology {topology_digest}",
-                            evidence.classification_digest
-                        ),
-                    );
-                }
-                for (path, required) in evidence.required_files()? {
-                    let found = manifest
-                        .entries()
-                        .iter()
-                        .find(|(candidate, _)| candidate == path);
-                    match found {
-                        Some((_, Entry::File(actual))) if actual == &required => {}
-                        _ => {
-                            return refuse(
-                                Code::NOT_CONTAINED,
-                                format!(
-                                "release evidence {} must be the ordinary manifest file {path:?}",
-                                required.id()
-                            ),
-                            )
-                        }
-                    }
-                }
-                Some((header_ref, header, topology_digest))
-            }
-            (None, None) if header_bytes.is_none() => None,
-            (Some(_), None) => {
-                return refuse(
-                    Code::MISSING_FIELD,
-                    "a CozyTensors release requires model evidence",
-                )
-            }
-            (None, Some(_)) => {
-                return refuse(
-                    Code::ATTACHMENT_CARDINALITY,
-                    "model evidence requires one CozyTensors manifest entry",
-                )
-            }
-            (None, None) => {
-                return refuse(
-                    Code::ATTACHMENT_CARDINALITY,
-                    "ordinary release cannot supply CozyTensors header bytes",
-                )
-            }
-        };
-        let mut objects: BTreeMap<String, (&'static str, ObjectRef)> = BTreeMap::new();
-        for (_, entry) in manifest.entries() {
-            insert_ref(
-                &mut objects,
-                if matches!(entry, Entry::CozyTensors(_)) {
-                    "header"
-                } else {
-                    "file"
-                },
-                entry.blob(),
-            )?;
-        }
-        if let Some(metadata) = &lane.metadata {
-            insert_ref(&mut objects, "metadata", metadata)?;
-        }
-        if let Some((_, header, _)) = &model {
-            for (_, config) in &header.configs {
-                insert_ref(
-                    &mut objects,
-                    "config",
-                    &ObjectRef {
-                        sha256: config.sha256.clone(),
-                        length: config.length,
-                    },
-                )?;
-            }
-            for (_, asset) in &header.assets {
-                for object in &asset.segments {
-                    insert_ref(&mut objects, "model_asset", object)?;
-                }
-            }
-            for (_, _, tensor) in header.tensors() {
-                for (_, part) in &tensor.parts {
-                    if let Body::Segments(segments) = &part.body {
-                        for object in segments {
-                            insert_ref(&mut objects, "part", object)?;
-                        }
-                    }
-                }
-            }
-        }
-        let mut object_bytes = 0u64;
-        for (kind, object) in objects.values() {
-            let observed_length = match self.inventory.get(&object.sha256) {
-                Some(inventory) => Some(inventory.length),
-                None if self.inventory.is_empty() => {
-                    fs::metadata(self.root.join(blob_key(&object.sha256)?))
-                        .ok()
-                        .map(|metadata| metadata.len())
-                }
-                None => None,
-            };
-            if observed_length != Some(object.length) {
-                return refuse(
-                    Code::OBJECT_ABSENT,
-                    format!(
-                        "{} {} is absent or length-mismatched in the blob inventory",
-                        kind,
-                        object.id()
-                    ),
-                );
-            }
-            object_bytes = object_bytes
-                .checked_add(object.length)
-                .ok_or_else(|| Refusal {
-                    code: Code::ARITH_OVERFLOW,
-                    detail: "release object bytes overflow".into(),
-                })?;
-            projection.objects.push(ReleaseObjectRow {
+            projection.releases.push(ReleaseRow {
                 lane: lane.lane.clone(),
-                length: object.length,
-                name: repository.repo.name.clone(),
-                object_kind: (*kind).to_string(),
-                org: repository.repo.org.clone(),
-                sha256: object.sha256.clone(),
-                version: release.version.clone(),
-            });
-        }
-        projection.releases.push(ReleaseRow {
-            evidence_json: checkpoint
-                .evidence
-                .as_ref()
-                .map(|evidence| crate::canon::write(&evidence.to_value())),
-            header_length: model.as_ref().map(|(reference, _, _)| reference.length),
-            header_sha256: model
-                .as_ref()
-                .map(|(reference, _, _)| reference.sha256.clone()),
-            lane: lane.lane.clone(),
-            manifest_length: lane.manifest.length,
-            manifest_sha256: lane.manifest.sha256.clone(),
-            name: repository.repo.name.clone(),
-            object_bytes,
-            object_count: objects.len() as u64,
-            org: repository.repo.org.clone(),
-            release_revision: release.revision,
-            release_yanked: release.yanked,
-            topology_digest: model.as_ref().map(|(_, _, digest)| digest.clone()),
-            version: release.version.clone(),
-        });
-        let Some((_, header, _)) = model else {
-            return Ok(());
-        };
-        for spec in &header.encodings {
-            let encoding_id = spec.object_id();
-            let aliases: Vec<String> = crate::registry::seeds()
-                .into_iter()
-                .filter(|seed| seed.spec.object_id() == encoding_id)
-                .map(|seed| seed.alias.to_string())
-                .collect();
-            if aliases.is_empty() {
-                projection.encodings.push(ReleaseEncodingRow {
-                    alias: None,
-                    encoding_id,
-                    lane: lane.lane.clone(),
-                    name: repository.repo.name.clone(),
-                    org: repository.repo.org.clone(),
-                    version: release.version.clone(),
-                });
-            } else {
-                for alias in aliases {
-                    projection.encodings.push(ReleaseEncodingRow {
-                        alias: Some(alias),
-                        encoding_id: encoding_id.clone(),
-                        lane: lane.lane.clone(),
-                        name: repository.repo.name.clone(),
-                        org: repository.repo.org.clone(),
-                        version: release.version.clone(),
-                    });
-                }
-            }
-        }
-        for (component, _) in &header.components {
-            projection.components.push(ReleaseComponentRow {
-                component: component.clone(),
-                lane: lane.lane.clone(),
+                manifest_length: lane.manifest.length,
+                manifest_sha256: lane.manifest.sha256.clone(),
                 name: repository.repo.name.clone(),
                 org: repository.repo.org.clone(),
-                version: release.version.clone(),
-            });
-        }
-        for (config, reference) in &header.configs {
-            projection.configs.push(ReleaseConfigRow {
-                config: config.clone(),
-                lane: lane.lane.clone(),
-                length: reference.length,
-                media_type: reference.media_type.clone(),
-                name: repository.repo.name.clone(),
-                org: repository.repo.org.clone(),
-                sha256: reference.sha256.clone(),
+                release_revision: release.revision,
+                release_yanked: release.yanked,
                 version: release.version.clone(),
             });
         }
         Ok(())
     }
-
     fn manifest_blob_refs(
         &self,
         manifest: &Manifest,
@@ -1369,9 +1272,6 @@ pub fn repository_release_lines(root: &Path) -> Result<Vec<Vec<u8>>> {
                 if let Some(evidence) = &checkpoint.evidence {
                     fields.push(("evidence", evidence.to_value()));
                 }
-                if let Some(metadata) = &lane.metadata {
-                    fields.push(("metadata", metadata.to_value()));
-                }
                 lines.push(crate::canon::write(&Value::obj(fields)));
             }
         }
@@ -1492,7 +1392,6 @@ mod tests {
             set: vec![ReleaseLane {
                 lane: lane.into(),
                 manifest: manifest.clone(),
-                metadata: None,
             }],
             version: version.into(),
         }
@@ -1601,7 +1500,6 @@ mod tests {
         let lane = ReleaseLane {
             lane: "cpu".into(),
             manifest: manifest_ref.clone(),
-            metadata: None,
         };
         let release = Release {
             lanes: vec![lane.clone()],

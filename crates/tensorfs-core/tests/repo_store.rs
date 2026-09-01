@@ -203,7 +203,6 @@ fn local_alias_is_one_atomic_replaceable_checkpoint() {
                     set: vec![ReleaseLane {
                         lane: "other".into(),
                         manifest: manifest_b.clone(),
-                        metadata: None,
                     }],
                     version: "1.0.0".into(),
                 },
@@ -447,9 +446,9 @@ fn projection_snapshot(root: &Path) -> Vec<String> {
 }
 
 #[test]
-fn four_domain_ordinary_repositories_rebuild_after_projection_tables_are_emptied() {
-    let root = temporary("four-domain-rebuild");
-    for domain in ["repo_cas", "package_source", "dataset_cas", "user_media"] {
+fn both_cas_domains_rebuild_after_projection_tables_are_emptied() {
+    let root = temporary("cas-domain-rebuild");
+    for domain in ["repo_cas", "dataset_cas"] {
         let store_root = root.join(domain);
         let store = Store::init(&store_root).unwrap();
         let payload = format!("{domain} durable bytes\n").into_bytes();
@@ -463,21 +462,6 @@ fn four_domain_ordinary_repositories_rebuild_after_projection_tables_are_emptied
             .obj;
         let manifest = Manifest::from_files(vec![("content.bin".into(), blob)]).unwrap();
         let manifest_ref = store.put_manifest(&manifest).unwrap().obj;
-        let metadata = if domain == "package_source" {
-            let bytes = b"{\"format\":\"cozy.package.release/1\"}";
-            Some(
-                store
-                    .put_stream(
-                        &mut bytes.as_slice(),
-                        Some(&ObjectRef::of(bytes)),
-                        &Fault::default(),
-                    )
-                    .unwrap()
-                    .obj,
-            )
-        } else {
-            None
-        };
         let repo = tensorfs_core::repository::RepositoryName::new("recovery", domain).unwrap();
         apply_release(
             &store,
@@ -489,7 +473,6 @@ fn four_domain_ordinary_repositories_rebuild_after_projection_tables_are_emptied
                 set: vec![ReleaseLane {
                     lane: "main".into(),
                     manifest: manifest_ref,
-                    metadata: metadata.clone(),
                 }],
                 version: "1.0.0".into(),
             },
@@ -535,24 +518,23 @@ fn four_domain_ordinary_repositories_rebuild_after_projection_tables_are_emptied
         let rows = fs::read_to_string(rows).unwrap();
         assert!(rows.contains("\"kind\":\"repo\""));
         assert!(rows.contains("\"kind\":\"release\""));
-        assert!(rows.contains("\"kind\":\"release_object\""));
+        assert!(rows.contains("\"kind\":\"checkpoint_object\""));
     }
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
-fn ordinary_repo_apply_needs_no_model_header_or_evidence() {
+fn ordinary_dataset_repo_apply_needs_no_model_header_or_evidence() {
     let root = temporary("ordinary-repo-apply");
     fs::create_dir_all(&root).unwrap();
-    let content = ObjectRef::of(b"package source");
-    let metadata = ObjectRef::of(b"package release");
+    let content = ObjectRef::of(b"dataset source");
     let manifest = Manifest::from_files(vec![("src/package.py".into(), content.clone())]).unwrap();
     let manifest_bytes = manifest.canonical_bytes();
     let manifest_ref = ObjectRef::of(&manifest_bytes);
     let manifest_path = root.join("manifest.json");
     fs::write(&manifest_path, &manifest_bytes).unwrap();
     let inventory = root.join("blobs.jsonl");
-    let mut inventory_rows = [content.clone(), metadata.clone()]
+    let mut inventory_rows = [content.clone()]
         .into_iter()
         .map(|object| {
             tensorfs_core::canon::write(&Value::obj(vec![
@@ -625,7 +607,6 @@ fn ordinary_repo_apply_needs_no_model_header_or_evidence() {
                 Value::arr(vec![Value::obj(vec![
                     ("lane", Value::str("source")),
                     ("manifest", manifest_ref.to_value()),
-                    ("metadata", metadata.to_value()),
                 ])]),
             ),
             ("version", Value::str("1.0.0")),
@@ -659,12 +640,7 @@ fn ordinary_repo_apply_needs_no_model_header_or_evidence() {
     let repository = Repository::parse(&fs::read(replacement).unwrap()).unwrap();
     assert_eq!(repository.releases.len(), 1);
     assert!(repository.checkpoints[0].evidence.is_none());
-    assert_eq!(
-        repository.releases[0].lanes[0].metadata.as_ref(),
-        Some(&metadata)
-    );
     let rows = fs::read_to_string(rows).unwrap();
-    assert!(rows.contains("\"metadata\":"));
     assert!(rows.contains("\"release_revision\":1"));
     assert!(!rows.contains("header_sha256"));
     assert!(!rows.contains("topology_digest"));
@@ -771,7 +747,9 @@ fn crash_after_repo_replace_rebuilds_sql_from_files() {
         )
         .unwrap();
     assert_eq!(after, 1);
-    assert!(fs::read_to_string(rows).unwrap().contains("release_object"));
+    assert!(fs::read_to_string(rows)
+        .unwrap()
+        .contains("checkpoint_object"));
     let _ = fs::remove_dir_all(root);
 }
 
