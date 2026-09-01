@@ -26,8 +26,9 @@ import (
 //
 // The contract is the hub's and is consumed verbatim, exactly as the catalog's is:
 //
-//	GET    /v1/rental-skus           -> [{name, accelerator_model, compute_capability,
-//	                                 vram_gb, price_usd_micros_per_hour}]
+//	GET    /v1/rental-skus           -> [{name, accelerator_model, base_worker_profile,
+//	                                 compute_capability, vram_gb,
+//	                                 price_usd_micros_per_hour}]
 //	POST   /v1/rentals               {name, sku, media_token_sha256:<64 hex>, creator_public_key}
 //	                                 -> 202 {rental_id, name, state, ...}
 //	GET    /v1/rentals/{id}          -> {state, worker_address, cert_pem, media_address,
@@ -210,8 +211,14 @@ func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
 // RentalSKU is one Cozy-priced product choice. Provider offer names and prices
 // are deliberately absent: the caller rents from Tensorhub, not its adapter.
 type RentalSKU struct {
-	Name                  string `json:"name"`
-	AcceleratorModel      string `json:"accelerator_model"`
+	Name             string `json:"name"`
+	AcceleratorModel string `json:"accelerator_model"`
+	// BaseWorkerProfile is the hub's own label for the base image this product boots,
+	// e.g. `torch2.13.0-cu130-cp312-linux-x86`. It is read so a published release whose
+	// requirements the label already contradicts is refused before the paid ask. It is
+	// deliberately NOT validated: a spelling this client cannot read means one fewer
+	// pre-spend check, never an unrentable catalog.
+	BaseWorkerProfile     string `json:"base_worker_profile"`
 	ComputeCapability     string `json:"compute_capability"`
 	VRAMGB                int64  `json:"vram_gb"`
 	MinimumRAMPerGPUGB    int64  `json:"minimum_ram_per_gpu_gb"`

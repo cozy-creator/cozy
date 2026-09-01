@@ -64,37 +64,47 @@ type PackageReleaseDetail struct {
 // CPU or accelerator product; it does not reinterpret the package descriptor's
 // model inputs as hardware requirements.
 func (d PackageReleaseDetail) Requirements() ([]string, *exit.Error) {
+	requirements, _, problem := d.Constraints()
+	return requirements, problem
+}
+
+// Constraints returns the release's execution dependencies AND its interpreter floor from
+// the same exact bytes. RequiresPython is the second half of what the SKU's base profile
+// can be checked against before renting; both are Tensorhub's own derivation from the
+// installed project wheel, so neither is re-derived here.
+func (d PackageReleaseDetail) Constraints() ([]string, string, *exit.Error) {
 	// Document is embedded inside another JSON response. The outer encoder may spell
 	// `<`, `>` and `&` as Unicode escapes, so RawMessage preserves transport tokens,
 	// not necessarily the stored PackageRelease bytes. Normalize the parsed content
 	// before checking its stored-byte identity; a semantic change still moves the hash.
 	canonicalDocument, err := canonical.NormalizeJCS(d.Document)
 	if err != nil {
-		return nil, exit.Named(exit.Structural, "hub.package_release_invalid",
+		return nil, "", exit.Named(exit.Structural, "hub.package_release_invalid",
 			"Tensorhub returned an invalid PackageRelease/1 document")
 	}
 	sum := sha256.Sum256(canonicalDocument)
 	want := "sha256:" + hex.EncodeToString(sum[:])
 	if d.Release.ReleaseDigest != want {
-		return nil, exit.Named(exit.Conflict, "hub.package_release_digest_mismatch",
+		return nil, "", exit.Named(exit.Conflict, "hub.package_release_digest_mismatch",
 			"Tensorhub package release bytes do not match release digest %s", d.Release.ReleaseDigest)
 	}
 	var document struct {
-		Format       string   `json:"format"`
-		Requirements []string `json:"requirements"`
+		Format         string   `json:"format"`
+		Requirements   []string `json:"requirements"`
+		RequiresPython string   `json:"requires_python"`
 	}
 	if err := json.Unmarshal(canonicalDocument, &document); err != nil ||
 		document.Format != "cozy.package.release/1" || document.Requirements == nil {
-		return nil, exit.Named(exit.Structural, "hub.package_release_invalid",
+		return nil, "", exit.Named(exit.Structural, "hub.package_release_invalid",
 			"Tensorhub returned an invalid PackageRelease/1 document")
 	}
 	for i, requirement := range document.Requirements {
 		if requirement == "" || i > 0 && requirement <= document.Requirements[i-1] {
-			return nil, exit.Named(exit.Structural, "hub.package_release_invalid",
+			return nil, "", exit.Named(exit.Structural, "hub.package_release_invalid",
 				"Tensorhub returned unsorted or empty package requirements")
 		}
 	}
-	return append([]string(nil), document.Requirements...), nil
+	return append([]string(nil), document.Requirements...), document.RequiresPython, nil
 }
 
 type PackageInstallDownload struct {

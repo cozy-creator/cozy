@@ -112,7 +112,15 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		return row.ID, line, lineProblem
 	}
 
-	sku, found := rental.CheapestCompatibleSKU(skus, req.NeedsAccelerator)
+	sku, mismatch, found := rental.CheapestCompatibleSKU(skus, req.NeedsAccelerator,
+		releaseConstraints(m.ctx, req))
+	if !found && mismatch != "" {
+		// Refused BEFORE the paid ask, in the pod's own vocabulary. Publication stays
+		// base-independent: the release is published and simply unqualified here.
+		return "", "", exit.Named(exit.Unavailable, "rental.package_base_incompatible",
+			"no rentable machine can run %s@%s — %s", req.Package, req.Release, mismatch).
+			WithRemedy("publish a release whose requirements one of Tensorhub's offered base images satisfies")
+	}
 	if !found {
 		return "", "", exit.Named(exit.Capacity, "rental.no_skus",
 			"Tensorhub currently offers no compatible rental SKU")
@@ -460,4 +468,29 @@ func settledRequest(state string) bool {
 		return true
 	}
 	return false
+}
+
+// releaseConstraints reads the release's own immutable requirements so the SKU choice
+// above can decline a base that already contradicts them. It is ADVISORY: a package this
+// host cannot name, or a hub that will not answer, yields no constraints and therefore no
+// refusal — the pod remains the authority on whether the package runs (th-075).
+func releaseConstraints(ctx *Context, req records.Request) rental.Constraints {
+	if req.Package == "" || req.Release == "" {
+		return rental.Constraints{}
+	}
+	ref, problem := hub.ParseRef(req.Package)
+	if problem != nil {
+		return rental.Constraints{}
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	detail, problem := client(ctx).PackageRelease(hctx, ref, req.Release)
+	if problem != nil {
+		return rental.Constraints{}
+	}
+	requirements, requiresPython, problem := detail.Constraints()
+	if problem != nil {
+		return rental.Constraints{}
+	}
+	return rental.Constraints{Requirements: requirements, RequiresPython: requiresPython}
 }
