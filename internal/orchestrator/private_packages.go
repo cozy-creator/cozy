@@ -2,7 +2,7 @@ package orchestrator
 
 import (
 	"bytes"
-	"io"
+	"context"
 	"os"
 	"time"
 
@@ -35,6 +35,27 @@ type privateTransferFile struct {
 	kind           pb.LocalDownloadKind
 	length         uint64
 }
+
+// PrivateWheel is one wheel of an unpublished revision as this daemon holds it on disk.
+type PrivateWheel struct {
+	Digest, Filename, Kind, Path string
+	Length                       int64
+}
+
+// PrivateWheelGrantSource is th-094's replacement for the byte relay. It PUTs every wheel the
+// store does not already hold and answers with one short-lived read capability per wheel, in
+// the order asked. It is a callback for the same reason RentalPackageSet is: the orchestrator
+// holds no Tensorhub client, and the account, the token, and the byte plane belong to the
+// entrypoint. Calling it again after a stall re-mints the capabilities without re-uploading.
+type PrivateWheelGrantSource func(context.Context, []PrivateWheel) ([]string, *exit.Error)
+
+// Object bounds, not control-stream bounds. They are what one revision may cost the store and
+// the pod's disk, and they match the pod ledger's own quota. Nothing on the wire carries them:
+// the frame that names these wheels carries 33 URLs at most.
+const (
+	maxPrivateWheelBytes    = int64(512 << 20)
+	maxPrivateWheelSetBytes = int64(1 << 30)
+)
 
 type privateTransferStatus struct {
 	state      pb.PrivatePackageFileState
@@ -127,9 +148,9 @@ func privateSelection(operationID string, revision privatepackage.Revision) (
 			return nil, nil, exit.Named(exit.Structural, "private_package_file_kind_invalid",
 				"private package file %s has kind %q", file.Filename, file.Kind)
 		}
-		if err != nil || file.Length <= 0 || file.Length > pb.MaxPrivatePackageFileBytes ||
+		if err != nil || file.Length <= 0 || file.Length > maxPrivateWheelBytes ||
 			(prior != nil && bytes.Compare(prior, digest) >= 0) ||
-			uint64(file.Length) > pb.MaxPrivatePackageAggregateBytes-total {
+			file.Length > maxPrivateWheelSetBytes-int64(total) {
 			return nil, nil, exit.Named(exit.Structural, "private_package_file_invalid",
 				"private package file %s has invalid identity or bounds", file.Filename)
 		}
@@ -148,35 +169,165 @@ func privateSelection(operationID string, revision privatepackage.Revision) (
 	return selected, transfer, nil
 }
 
+// transferPrivatePackage is th-094's whole owner half. It no longer sends a byte: the wheels go
+// to the store under capabilities scoped to their own digests, and the pod is handed one read
+// capability per wheel to spend against its own download edge.
+//
+// The loop exists because a capability is short-lived by design. A stall -- the pod saying it
+// has a partial prefix and needs a fresh URL -- is answered by minting new grants over the same
+// objects, which costs one HTTP round and re-uploads nothing, and the pod resumes from the
+// prefix it already holds.
 func (c *Orchestrator) transferPrivatePackage(instanceID, operationID string,
 	transfer *privateTransfer,
 ) *exit.Error {
-	_, selectedSession, problem := c.privateControl(instanceID)
-	if problem != nil {
-		return problem
+	if c.opt.PrivateWheels == nil {
+		return exit.Named(exit.Structural, "private_package_grants_unwired",
+			"this daemon cannot upload a private package revision")
 	}
-	transfer, problem = c.bindPrivateTransfer(instanceID, operationID, transfer, selectedSession)
-	if problem != nil {
-		return problem
-	}
-	for _, selected := range transferFilesInOrder(transfer) {
-		file, err := os.Open(selected.path)
-		if err != nil {
-			return exit.Named(exit.Structural, "private_package_wheel_unreadable", "%s", err)
-		}
-		info, statErr := file.Stat()
-		if statErr != nil || !info.Mode().IsRegular() || info.Size() != int64(selected.length) {
-			file.Close()
-			return exit.Named(exit.Structural, "private_package_wheel_changed",
-				"private package wheel %s changed before transfer", selected.filename)
-		}
-		problem := c.transferPrivateFile(instanceID, operationID, transfer, selected, file)
-		file.Close()
+	stale := 0
+	for {
+		_, selectedSession, problem := c.privateControl(instanceID)
 		if problem != nil {
 			return problem
 		}
+		held, problem := c.bindPrivateTransfer(instanceID, operationID, transfer, selectedSession)
+		if problem != nil {
+			return problem
+		}
+		ordered := transferFilesInOrder(held)
+		if problem := c.provePrivateWheelsUnchanged(ordered); problem != nil {
+			return problem
+		}
+		granted, problem := c.grantPrivateWheels(selectedSession, ordered)
+		if problem != nil {
+			return problem
+		}
+		// Clear the previous attempt's unverified statuses. A stall left behind by the round
+		// these grants were minted to answer would be read as this round's stall, and the loop
+		// would re-grant forever without ever waiting for an answer.
+		before := c.clearPrivateStalls(operationID)
+		frame := &pb.PrivatePackageFetchRequest{RecordOwnerEpoch: recordOwnerEpoch,
+			ControlStreamGeneration: selectedSession.generation,
+			WorkerBootId:            selectedSession.bootID, OperationId: operationID,
+			SourceDigest: held.source, Files: granted}
+		if !selectedSession.send(&pb.RecordOwnerFrame{
+			Msg: &pb.RecordOwnerFrame_PrivatePackageFetchRequest{
+				PrivatePackageFetchRequest: frame}}) {
+			continue
+		}
+		done, problem := c.awaitPrivateTransfer(instanceID, operationID, ordered, selectedSession)
+		if problem != nil {
+			return problem
+		}
+		if done {
+			return nil
+		}
+		// A stall is only worth answering while it is buying ground. A pod that keeps landing
+		// bytes gets as many capabilities as it needs; one that lands none twice running is not
+		// stalling, it is failing, and saying so beats an unbounded loop.
+		if after := c.privateProgress(operationID); after > before {
+			stale = 0
+		} else if stale++; stale > maxPrivateStalls {
+			return exit.Named(exit.Failed, "private_package_transfer_stuck",
+				"the worker landed no private package bytes across %d re-granted attempts",
+				stale)
+		}
+	}
+}
+
+// maxPrivateStalls is how many consecutive no-progress rounds a transfer may spend. Each one
+// costs a grant round trip and nothing else, so the bound is about ending, not about cost.
+const maxPrivateStalls = 3
+
+// clearPrivateStalls drops every unverified status and reports the durable byte total the pod
+// has acknowledged. A verified file is never cleared: it is settled.
+func (c *Orchestrator) clearPrivateStalls(operationID string) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	transfer := c.privateTransfers[operationID]
+	if transfer == nil {
+		return 0
+	}
+	var total uint64
+	for digest, status := range transfer.status {
+		if status.state == pb.PrivatePackageFileState_PRIVATE_PACKAGE_FILE_STATE_VERIFIED {
+			total += status.received
+			continue
+		}
+		total += status.received
+		delete(transfer.status, digest)
+	}
+	return total
+}
+
+func (c *Orchestrator) privateProgress(operationID string) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	transfer := c.privateTransfers[operationID]
+	if transfer == nil {
+		return 0
+	}
+	var total uint64
+	for _, status := range transfer.status {
+		total += status.received
+	}
+	return total
+}
+
+// provePrivateWheelsUnchanged reads the local files the revision named. The digest is the
+// revision's identity, so a wheel edited between staging and transfer is a different revision
+// wearing this one's name, and the store would refuse it anyway under the signed checksum.
+func (c *Orchestrator) provePrivateWheelsUnchanged(ordered []privateTransferFile) *exit.Error {
+	for _, selected := range ordered {
+		info, err := os.Stat(selected.path)
+		if err != nil {
+			return exit.Named(exit.Structural, "private_package_wheel_unreadable", "%s", err)
+		}
+		if !info.Mode().IsRegular() || info.Size() != int64(selected.length) {
+			return exit.Named(exit.Structural, "private_package_wheel_changed",
+				"private package wheel %s changed before transfer", selected.filename)
+		}
 	}
 	return nil
+}
+
+// grantPrivateWheels turns one ordered wheel set into the frame's grants. The URLs are
+// memory-only: they are never journaled, never logged, and never survive this frame.
+func (c *Orchestrator) grantPrivateWheels(current *session, ordered []privateTransferFile) (
+	[]*pb.PrivatePackageFileGrant, *exit.Error,
+) {
+	wheels := make([]PrivateWheel, 0, len(ordered))
+	for _, selected := range ordered {
+		spelled, err := canonical.Spell(selected.digest)
+		if err != nil {
+			return nil, exit.Internalf("cannot spell a private package wheel digest: %s", err)
+		}
+		kind := "dependency_wheel"
+		if selected.kind == pb.LocalDownloadKind_LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL {
+			kind = "project_wheel"
+		}
+		wheels = append(wheels, PrivateWheel{Digest: spelled, Filename: selected.filename,
+			Kind: kind, Path: selected.path, Length: int64(selected.length)})
+	}
+	urls, problem := c.opt.PrivateWheels(current.ctx, wheels)
+	if problem != nil {
+		return nil, problem
+	}
+	if len(urls) != len(ordered) {
+		return nil, exit.Internalf("private package grants answered for %d of %d wheels",
+			len(urls), len(ordered))
+	}
+	grants := make([]*pb.PrivatePackageFileGrant, 0, len(ordered))
+	for i, selected := range ordered {
+		if urls[i] == "" || len(urls[i]) > pb.MaxPrivatePackageGrantURLBytes {
+			return nil, exit.Named(exit.Internal, "private_package_grant_url_invalid",
+				"the read capability for %s is empty or over its bound", selected.filename)
+		}
+		grants = append(grants, &pb.PrivatePackageFileGrant{Digest: selected.digest,
+			Filename: selected.filename, Kind: selected.kind, Length: selected.length,
+			Url: urls[i]})
+	}
+	return grants, nil
 }
 
 func (c *Orchestrator) bindPrivateTransfer(instanceID, operationID string,
@@ -285,63 +436,6 @@ func transferFilesInOrder(transfer *privateTransfer) []privateTransferFile {
 	return rows
 }
 
-func (c *Orchestrator) transferPrivateFile(instanceID, operationID string,
-	transfer *privateTransfer, selected privateTransferFile, file *os.File,
-) *exit.Error {
-	spelled, _ := canonical.Spell(selected.digest)
-	for {
-		_, selectedSession, problem := c.privateControl(instanceID)
-		if problem != nil {
-			return problem
-		}
-		transfer, problem = c.bindPrivateTransfer(instanceID, operationID, transfer,
-			selectedSession)
-		if problem != nil {
-			return problem
-		}
-		status := c.privateStatus(operationID, spelled)
-		switch status.state {
-		case pb.PrivatePackageFileState_PRIVATE_PACKAGE_FILE_STATE_VERIFIED:
-			if status.received != selected.length {
-				return exit.Named(exit.Structural, "private_package_status_invalid",
-					"worker verified %s at %d of %d bytes", selected.filename,
-					status.received, selected.length)
-			}
-			return nil
-		case pb.PrivatePackageFileState_PRIVATE_PACKAGE_FILE_STATE_REFUSED:
-			return exit.Named(exit.Failed, status.safeCode,
-				"worker refused private package file %s: %s", selected.filename, status.safeDetail)
-		}
-		if status.received > selected.length {
-			return exit.Named(exit.Structural, "private_package_status_invalid",
-				"worker reported %d of %d private package bytes", status.received, selected.length)
-		}
-		remaining := selected.length - status.received
-		chunkLength := uint64(pb.MaxPrivatePackageChunkBytes)
-		if remaining < chunkLength {
-			chunkLength = remaining
-		}
-		data := make([]byte, int(chunkLength))
-		if _, err := file.ReadAt(data, int64(status.received)); err != nil && err != io.EOF {
-			return exit.Named(exit.Structural, "private_package_wheel_changed",
-				"cannot read private package wheel %s: %s", selected.filename, err)
-		}
-		frame := &pb.PrivatePackageFileChunk{RecordOwnerEpoch: recordOwnerEpoch,
-			ControlStreamGeneration: selectedSession.generation, WorkerBootId: selectedSession.bootID,
-			OperationId: operationID, SourceDigest: transfer.source, Digest: selected.digest,
-			Filename: selected.filename, Kind: selected.kind, Length: selected.length,
-			Offset: status.received, Data: data}
-		if !selectedSession.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_PrivatePackageFileChunk{
-			PrivatePackageFileChunk: frame}}) {
-			continue
-		}
-		if problem := c.awaitPrivateProgress(instanceID, operationID, spelled,
-			status.received, selectedSession); problem != nil {
-			return problem
-		}
-	}
-}
-
 func (c *Orchestrator) privateControl(instanceID string) (*worker, *session, *exit.Error) {
 	for {
 		c.mu.Lock()
@@ -373,15 +467,45 @@ func (c *Orchestrator) privateControl(instanceID string) (*worker, *session, *ex
 	}
 }
 
-func (c *Orchestrator) awaitPrivateProgress(instanceID, operationID, digest string,
-	before uint64, sent *session,
-) *exit.Error {
+// awaitPrivateTransfer resolves ONE fetch request. It answers true when every wheel the pod
+// reported is verified, false when the set stalled and the caller should re-grant, and a
+// problem when the pod refused a wheel outright -- which the schema reserves for bytes that are
+// not the named object, and which a fresh URL would never fix.
+func (c *Orchestrator) awaitPrivateTransfer(instanceID, operationID string,
+	ordered []privateTransferFile, sent *session,
+) (bool, *exit.Error) {
 	for {
-		status := c.privateStatus(operationID, digest)
-		if status.received > before ||
-			status.state == pb.PrivatePackageFileState_PRIVATE_PACKAGE_FILE_STATE_VERIFIED ||
-			status.state == pb.PrivatePackageFileState_PRIVATE_PACKAGE_FILE_STATE_REFUSED {
-			return nil
+		verified, stalled := 0, false
+		for _, selected := range ordered {
+			spelled, err := canonical.Spell(selected.digest)
+			if err != nil {
+				return false, exit.Internalf("cannot spell a private package wheel digest: %s", err)
+			}
+			status := c.privateStatus(operationID, spelled)
+			switch status.state {
+			case pb.PrivatePackageFileState_PRIVATE_PACKAGE_FILE_STATE_VERIFIED:
+				if status.received != selected.length {
+					return false, exit.Named(exit.Structural, "private_package_status_invalid",
+						"worker verified %s at %d of %d bytes", selected.filename,
+						status.received, selected.length)
+				}
+				verified++
+			case pb.PrivatePackageFileState_PRIVATE_PACKAGE_FILE_STATE_REFUSED:
+				return false, exit.Named(exit.Failed, status.safeCode,
+					"worker refused private package file %s: %s",
+					selected.filename, status.safeDetail)
+			case pb.PrivatePackageFileState_PRIVATE_PACKAGE_FILE_STATE_RECEIVING:
+				// A RECEIVING status carrying a safe code is the schema's resumable stall.
+				if status.safeCode != "" {
+					stalled = true
+				}
+			}
+		}
+		if verified == len(ordered) {
+			return true, nil
+		}
+		if stalled {
+			return false, nil
 		}
 		c.mu.Lock()
 		w := c.workers[instanceID]
@@ -394,16 +518,16 @@ func (c *Orchestrator) awaitPrivateProgress(instanceID, operationID, digest stri
 		c.mu.Unlock()
 		switch {
 		case !current:
-			return nil // the caller resends from the last acknowledged offset
+			return false, nil // the caller re-grants against the replacement session
 		case refused != nil:
-			return refused
+			return false, refused
 		case gone:
-			return exit.New(exit.Failed,
+			return false, exit.New(exit.Failed,
 				"the rented worker exited during private package transfer")
 		}
 		select {
 		case <-c.done:
-			return exit.Unavailablef("the daemon stopped during private package transfer")
+			return false, exit.Unavailablef("the daemon stopped during private package transfer")
 		case <-time.After(20 * time.Millisecond):
 		}
 	}

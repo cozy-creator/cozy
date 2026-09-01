@@ -71,6 +71,10 @@ type Options struct {
 	AcquireManagedRental func(records.Request) (string, string, *exit.Error)
 	ReleaseManagedRental func(string) (string, *exit.Error)
 	ModelTransfers       ModelTransferOwner
+	// PrivateWheels puts an unpublished revision's wheels in the object store and answers
+	// with one read capability per wheel (th-094). Without it this daemon cannot transfer a
+	// private package: the control stream carries control, not content.
+	PrivateWheels PrivateWheelGrantSource
 	// ConfigDigest is the local evaluated-config identity. Environment identity
 	// comes only from the exact selected PlacementSet.
 	ConfigDigest string

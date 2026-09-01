@@ -35,13 +35,14 @@
 // `MaxInlineControlBytes` (4 MiB) PER TRANSFER -- not per chunk. The distinction is the whole
 // rule: a 4 MiB frame is fine, and a 4 MiB frame sent 2,048 times to move 8 GiB is the defect,
 // because the total it moves is bounded by nothing. Anything larger than the ceiling travels
-// as a presigned URL to the process that holds the bytes, which is what `WeightsUploadGrant`
-// and `DeliveryGrant.outputs` already do. `MaxWeightsReadBytes` is a bounded RANGE of an
-// object an owner explicitly asked for, not a quantum of an unbounded whole.
+// as a presigned URL to the process that holds the bytes, which is what `WeightsUploadGrant`,
+// `PrivatePackageFileGrant` and `DeliveryGrant.outputs` already do. `MaxWeightsReadBytes` is a
+// bounded RANGE of an object an owner explicitly asked for, not a quantum of an unbounded whole.
 //
-// Private package upload does not obey this yet (`MaxPrivatePackageFileBytes` 512 MiB,
-// `MaxPrivatePackageAggregateBytes` 1 GiB, moved in 1 MiB chunks). It is tracked as th-094 and
-// the mechanical fence lands with it, because a rule with a carve-out is worse than no rule.
+// The rule has NO carve-out and is mechanically enforced on the BOUND: tensorhub's
+// `scripts/fence.py` convicts any content-bearing `Max*Bytes` constant above the ceiling,
+// whatever the field carrying it is called. th-094 retired the last exemption, private package
+// upload, which moved 1 GiB in 1 MiB frames.
 //
 // DOCUMENT VERSIONS. Every current pre-release document is `/1`. A digest-fenced document is NOT
 // additively versioned: an unknown key REFUSES, and shape changes hardcut the `/1` definition
