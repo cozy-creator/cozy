@@ -2,4 +2,5 @@ doc: header
 expect: ok
 id: sha256:797bfee78612aec9312a352e8cf16c938a92927254a6f51baf13d64b690f3fdd
 topology: sha256:392389bcf0afa2c5d7086d70be65a7a105b80a0ef9493d0983d0230dfa6c7b22
+shape: sha256:4ea9143718a01b3de027a7d73a1af9d27e09d8345fd8e4fd6c1c7f4c379f844f
 note: nvfp4 W4A4 base variant, rank-0 scalar role

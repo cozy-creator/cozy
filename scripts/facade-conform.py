@@ -74,6 +74,8 @@ def main() -> int:
                     bad.append(f"id {ok['id']} != frozen {v.get('id')!r}")
                 if "topology" in v and ok["topology"] != v["topology"]:
                     bad.append(f"topology {ok['topology']!r} != frozen {v['topology']}")
+                if "shape" in v and ok["shape"] != v["shape"]:
+                    bad.append(f"shape {ok['shape']!r} != frozen {v['shape']}")
                 if "manifest" in v and ok["manifest"] != v["manifest"]:
                     bad.append(f"manifest {ok['manifest']!r} != frozen {v['manifest']}")
                 if "grade" in v and ok["grade"] != v["grade"]:
@@ -115,6 +117,9 @@ def main() -> int:
     def topof(n: str) -> str:
         return str(outcomes.get(n, {}).get("topology") or "")
 
+    def shapeof(n: str) -> str:
+        return str(outcomes.get(n, {}).get("shape") or "")
+
     def manifest_of(n: str) -> str:
         return str(outcomes.get(n, {}).get("manifest") or "")
 
@@ -149,6 +154,23 @@ def main() -> int:
             and topof("header/plain-fp8")
             == topof("header/plain-fp8-reordered"),
             topof("header/plain-fp8-reordered"),
+        )
+    )
+    cross.append(
+        (
+            "a dtype-only recast flips topology_digest, not the shape digest",
+            topof("layout/code-topology") != topof("layout/code-topology-recast")
+            and shapeof("layout/code-topology") == shapeof("layout/code-topology-recast")
+            and bool(shapeof("layout/code-topology")),
+            shapeof("layout/code-topology-recast"),
+        )
+    )
+    cross.append(
+        (
+            "the shape projection is not the exact one",
+            topof("layout/code-topology") != shapeof("layout/code-topology")
+            and bool(shapeof("layout/code-topology")),
+            shapeof("layout/code-topology")[:19],
         )
     )
     cross.append(

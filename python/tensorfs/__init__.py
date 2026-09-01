@@ -63,6 +63,7 @@ from ._ext import (
     run_doc,
     seed_digests,
     topology_digest,
+    topology_shape_digest,
     transfer_object,
     transfer_manifest,
 )
@@ -127,6 +128,7 @@ __all__ = [
     "run_doc",
     "seed_digests",
     "topology_digest",
+    "topology_shape_digest",
     "transfer_object",
     "transfer_manifest",
 ]

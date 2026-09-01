@@ -27,6 +27,13 @@
 //!   [+parts, objects, configs]
 //! Parts and objects are the header's fill and transfer layers, BELOW the topology and
 //! invisible to matching. `topology_digest` is the fast-path index, never the decision.
+//!
+//! It ships with a SECOND index (tfs-038): the same projection with the dtype elided. The
+//! exact digest finds the pairs that already agree; the shape digest finds the pairs that
+//! differ only by dtype or encoding — the CONVERTIBLE and PRODUCIBLE half a catalog search
+//! is actually looking for, which exact equality is structurally blind to. Both ride on
+//! every report, so a search is three cheap steps: exact hit, shape hit worth grading, and
+//! everything else refused without grading at all. Both are indexes. Neither is a decision.
 
 use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
 use crate::dtype::Dtype;
@@ -128,11 +135,24 @@ impl CodeTopology {
     /// The SAME projection function a header computes, so the fast-path index is comparable
     /// on both sides. A digest hit means the logical {dtype, shape} sets agree — it never
     /// means the encodings do, which is why it can only ever be an index.
-    pub fn topology_digest(&self) -> String {
-        crate::header::topology_digest_of(&crate::header::topology_value(
+    pub fn projected(&self, projection: crate::header::Projection) -> crate::canon::Value {
+        crate::header::topology_projection(
+            projection,
             self.tensors()
                 .map(|(c, k, r)| (c, k, r.dtype, r.shape.as_slice())),
-        ))
+        )
+    }
+
+    pub fn topology_digest(&self) -> String {
+        crate::header::topology_digest_of(&self.projected(crate::header::Projection::Identity))
+    }
+
+    /// The shape-only bucket key, by the same code path with the dtype leaf elided. An
+    /// exact-digest miss with a shape-digest HIT is precisely the interesting half of a
+    /// catalog: the pairs that differ only by dtype or encoding, which are the CONVERTIBLE
+    /// and PRODUCIBLE candidates. Still an index; still never the decision.
+    pub fn topology_shape_digest(&self) -> String {
+        crate::header::topology_digest_of(&self.projected(crate::header::Projection::ShapeOnly))
     }
 }
 
@@ -901,6 +921,11 @@ pub struct CompatibilityReport {
     pub header: String,
     pub topology_required: String,
     pub topology_present: String,
+    /// The shape-only projections of the same two sides. Equal here with the exact digests
+    /// unequal is the search signal: the pair differs only by dtype or encoding, so it is
+    /// worth grading rather than skipping.
+    pub topology_shape_required: String,
+    pub topology_shape_present: String,
     pub lane: Lane,
     pub depth: Depth,
     pub mismatches: Vec<Details>,
@@ -920,6 +945,8 @@ impl CompatibilityReport {
             header: header.object_id()?,
             topology_required: code.topology_digest(),
             topology_present: header.topology_digest(),
+            topology_shape_required: code.topology_shape_digest(),
+            topology_shape_present: header.topology_shape_digest(),
             lane,
             depth: o.depth,
             mismatches: o.mismatches.clone(),
@@ -1121,6 +1148,14 @@ impl Plain for CompatibilityReport {
         let topology_present = prefixed("report.topology_present", f.req_str("topology_present")?)?;
         let topology_required =
             prefixed("report.topology_required", f.req_str("topology_required")?)?;
+        let topology_shape_present = prefixed(
+            "report.topology_shape_present",
+            f.req_str("topology_shape_present")?,
+        )?;
+        let topology_shape_required = prefixed(
+            "report.topology_shape_required",
+            f.req_str("topology_shape_required")?,
+        )?;
         let mut unconsumed = Vec::new();
         for u in as_arr("CompatibilityReport", "unconsumed", f.req("unconsumed")?)? {
             unconsumed.push(as_str("unconsumed", "key", u)?.to_string());
@@ -1145,6 +1180,8 @@ impl Plain for CompatibilityReport {
             header,
             topology_required,
             topology_present,
+            topology_shape_required,
+            topology_shape_present,
             lane,
             depth,
             mismatches,
@@ -1260,6 +1297,14 @@ impl Plain for CompatibilityReport {
             (
                 "topology_required",
                 Value::str(self.topology_required.clone()),
+            ),
+            (
+                "topology_shape_present",
+                Value::str(self.topology_shape_present.clone()),
+            ),
+            (
+                "topology_shape_required",
+                Value::str(self.topology_shape_required.clone()),
             ),
             (
                 "unconsumed",

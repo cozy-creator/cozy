@@ -507,6 +507,10 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
                 ])
             })
             .collect();
+        // The two index keys, both sides, so a catalog search can bucket off ONE call:
+        // exact digests equal -> the pair is already an exact-index hit; only the shape
+        // digests equal -> it differs by dtype or encoding alone and is worth grading;
+        // neither -> a different model, refused without grading at all.
         let doc = tensorfs_core::canon::Value::obj(vec![
             (
                 "satisfied",
@@ -517,6 +521,22 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
             (
                 "report",
                 tensorfs_core::canon::Value::str(report.object_id()),
+            ),
+            (
+                "topology_required",
+                tensorfs_core::canon::Value::str(report.topology_required.clone()),
+            ),
+            (
+                "topology_present",
+                tensorfs_core::canon::Value::str(report.topology_present.clone()),
+            ),
+            (
+                "topology_shape_required",
+                tensorfs_core::canon::Value::str(report.topology_shape_required.clone()),
+            ),
+            (
+                "topology_shape_present",
+                tensorfs_core::canon::Value::str(report.topology_shape_present.clone()),
             ),
         ]);
         println!(
@@ -535,6 +555,16 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
             "the fast-path index HITS (an index, never the decision)"
         } else {
             "index miss; the decision is the document comparison below"
+        }
+    );
+    println!(
+        "shape        required {} / present {} — {}",
+        &report.topology_shape_required[7..19],
+        &report.topology_shape_present[7..19],
+        if report.topology_shape_required == report.topology_shape_present {
+            "same shapes, so any difference is dtype or encoding alone (a search bucket)"
+        } else {
+            "different shapes: a different model, not a different packaging"
         }
     );
     if out.mismatches.is_empty() {
