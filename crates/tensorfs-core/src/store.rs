@@ -21,6 +21,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt;
+
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::ids::{hex64, prefixed, Doc, ObjectRef};
 use crate::sha256::{self, Sha256};
@@ -214,9 +216,30 @@ impl Fault {
 
 // ---------------------------------------------------------------- the store
 
-#[derive(Debug, Clone)]
+/// Where a store reports the bytes it moves. Every chunk hashed on the way IN
+/// (`put_stream_held`), every chunk rehashed for a verification (`verify`), and every byte
+/// a layer above carries into a candidate on the store's behalf (an inline part, a
+/// verified inherit) is announced as it happens, and every object that wins admission is
+/// counted — so a supervisor holding the other end can tell "still working" from
+/// "stopped" without a clock of its own.
+pub trait Progress: Send + Sync {
+    fn moved(&self, bytes: u64);
+    fn admitted(&self);
+}
+
+#[derive(Clone)]
 pub struct Store {
     root: PathBuf,
+    progress: Option<std::sync::Arc<dyn Progress>>,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("root", &self.root)
+            .field("observed", &self.progress.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,7 +333,25 @@ impl Store {
         crate::catalog::Catalog::initialize(root)?;
         Ok(Store {
             root: root.to_path_buf(),
+            progress: None,
         })
+    }
+
+    /// The same store, announcing every byte it moves to `sink`.
+    pub fn observed(self, sink: std::sync::Arc<dyn Progress>) -> Store {
+        Store {
+            root: self.root,
+            progress: Some(sink),
+        }
+    }
+
+    /// Announce `bytes` of progress. The store calls this for every chunk it streams or
+    /// rehashes; a layer that admits bytes without streaming them through the store (an
+    /// inline part, an inherit proven by record) calls it for the bytes it carried.
+    pub fn moved(&self, bytes: u64) {
+        if let Some(sink) = &self.progress {
+            sink.moved(bytes);
+        }
     }
 
     /// The three authoritative namespaces identify a TensorFS store. Old mixed-object and
@@ -331,6 +372,7 @@ impl Store {
         fs::create_dir_all(root.join("tmp")).map_err(|error| io("mkdir tmp", error))?;
         Ok(Store {
             root: root.to_path_buf(),
+            progress: None,
         })
     }
 
@@ -658,17 +700,32 @@ impl Store {
     ) -> Result<Put> {
         let catalog = crate::catalog::Catalog::open(&self.root)?;
         let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
-        let tmp = self.root.join("tmp").join(format!(
-            "put-{}-{}",
-            std::process::id(),
-            now_nanos_unique()
-        ));
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(|e| io(format!("create temp {}", tmp.display()), e))?;
+        // The temp is LOCKED for as long as this process needs it — through the write,
+        // the fsync and the link. `reap` takes the same lock to decide: a temp whose lock
+        // the kernel still holds has a live writer behind it, whatever its mtime says, and
+        // a temp whose lock it hands out is an orphan. The descriptor stays open until the
+        // link has landed; a writer that dies at any stage releases the lock with it.
+        let (tmp, mut f) = loop {
+            let tmp = self.root.join("tmp").join(format!(
+                "put-{}-{}",
+                std::process::id(),
+                now_nanos_unique()
+            ));
+            let f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|e| io(format!("create temp {}", tmp.display()), e))?;
+            match f.try_lock_exclusive() {
+                Ok(()) => break (tmp, f),
+                // Only a reaper can hold the lock on a name this process just minted: it
+                // saw the temp before the lock landed, and it unlinks what it locks. Mint
+                // another.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return cleanup(&tmp, io("lock temp", e)),
+            }
+        };
         fault.hit("open");
 
         let mut h = Sha256::new();
@@ -686,6 +743,7 @@ impl Store {
                 return cleanup(&tmp, io("write temp", e));
             }
             len += n as u64;
+            self.moved(n as u64);
             if first {
                 first = false;
                 fault.hit("partial");
@@ -695,7 +753,6 @@ impl Store {
         if let Err(e) = f.sync_all() {
             return cleanup(&tmp, io("fsync temp", e));
         }
-        drop(f);
         fault.hit("fsync");
 
         let hex = sha256::hex(&h.finish());
@@ -744,12 +801,16 @@ impl Store {
             fsync_dir(&dir)?;
         }
         let _ = fs::remove_file(&tmp);
+        drop(f);
 
         // A record is written only for bytes THIS process hashed. Losing the race means we
         // never saw the installed file's bytes, so we make no claim about them.
         if admitted {
             let md = stat(&dst)?;
             self.write_record(&VRecord::of(&hex, &md))?;
+            if let Some(sink) = &self.progress {
+                sink.admitted();
+            }
         }
         fault.hit("record");
         Ok(Put {
@@ -1019,7 +1080,7 @@ impl Store {
         if disagreement.is_none() && !force {
             return Ok((Verdict::Verified { rehashed: false }, Some(f)));
         }
-        let got = hash_fd(&mut f)?;
+        let got = self.hash_fd(&mut f)?;
         if got != hex {
             let why = disagreement.unwrap_or_else(|| "scrub rehash".to_string());
             // Remove the NAME: whatever is at the path now must stop satisfying reads. The
@@ -1044,7 +1105,7 @@ impl Store {
     }
 
     pub fn hash_object(&self, hex: &str) -> Result<String> {
-        hash_fd(&mut self.open_nofollow(hex)?)
+        self.hash_fd(&mut self.open_nofollow(hex)?)
     }
 
     /// Remove the corrupt authoritative name. A concurrent remover that got there first has
@@ -1134,25 +1195,35 @@ impl Store {
         Ok(s)
     }
 
-    /// Age-bounded reap of abandoned admission temps. A temp is scratch by construction:
-    /// nothing references it, so removing an old one can never lose an object.
-    pub fn reap(&self, max_age_secs: u64) -> Result<(usize, usize)> {
+    /// Reap the admission temps whose writer is GONE. A temp is scratch by construction:
+    /// nothing references it, so removing an orphan can never lose an object — and a temp
+    /// with a writer still behind it is one `link()` from being an object, so removing it
+    /// would fail that writer at the last step. Liveness is the lock `put_stream_held`
+    /// holds on the temp for its whole life: the kernel releases it only when the
+    /// descriptor closes, which a dead process does and a slow one does not. Age plays no
+    /// part — a writer streaming a large object is older than any clock a reaper could
+    /// pick. Only the store's own `put-` temps are considered; anything else under `tmp/`
+    /// belongs to whoever put it there.
+    pub fn reap(&self) -> Result<(usize, usize)> {
         let (mut gone, mut kept) = (0, 0);
         for p in read_dir(&self.root.join("tmp"))? {
-            let metadata = match fs::metadata(&p) {
-                Ok(metadata) if metadata.is_file() => metadata,
-                _ => continue,
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with("put-") || !fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
+                continue;
+            }
+            let f = match File::options().read(true).open(&p) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io(format!("open temp {}", p.display()), e)),
             };
-            let age = metadata
-                .modified()
-                .ok()
-                .and_then(|t| SystemTime::now().duration_since(t).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            if age >= max_age_secs && fs::remove_file(&p).is_ok() {
-                gone += 1;
-            } else {
+            if f.try_lock_exclusive().is_err() {
                 kept += 1;
+                continue;
+            }
+            match fs::remove_file(&p) {
+                Ok(()) => gone += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io(format!("reap temp {}", p.display()), e)),
             }
         }
         Ok((gone, kept))
@@ -1167,18 +1238,22 @@ fn cleanup<T>(tmp: &Path, e: Refusal) -> Result<T> {
     Err(e)
 }
 
-/// Hash an OPEN object from the top. Takes the descriptor, never the name — the caller has
-/// already resolved the path and everything after it is about this inode.
-fn hash_fd(f: &mut File) -> Result<String> {
-    f.seek(SeekFrom::Start(0)).map_err(|e| io("rewind", e))?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; BUF];
-    loop {
-        let n = f.read(&mut buf).map_err(|e| io("read object", e))?;
-        if n == 0 {
-            return Ok(sha256::hex(&h.finish()));
+impl Store {
+    /// Hash an OPEN object from the top. Takes the descriptor, never the name — the caller
+    /// has already resolved the path and everything after it is about this inode. A
+    /// rehash is bytes moved like any other, and is announced as such.
+    fn hash_fd(&self, f: &mut File) -> Result<String> {
+        f.seek(SeekFrom::Start(0)).map_err(|e| io("rewind", e))?;
+        let mut h = Sha256::new();
+        let mut buf = vec![0u8; BUF];
+        loop {
+            let n = f.read(&mut buf).map_err(|e| io("read object", e))?;
+            if n == 0 {
+                return Ok(sha256::hex(&h.finish()));
+            }
+            h.update(&buf[..n]);
+            self.moved(n as u64);
         }
-        h.update(&buf[..n]);
     }
 }
 

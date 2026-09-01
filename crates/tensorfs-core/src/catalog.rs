@@ -11,6 +11,11 @@ use rusqlite::{params, Connection};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::storage::Projection;
 
+/// The longest one catalog call may SLEEP on another writer's lock before it refuses. It is
+/// the only wait a store operation can legitimately spend blocked and idle, so it is also
+/// the floor under any patience a supervisor grants a worker that has gone quiet.
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 const SCHEMA_VERSION: u64 = 1;
 
 const SCHEMA: &[(&str, &[&str])] = &[
@@ -172,7 +177,7 @@ impl Catalog {
         let connection =
             Connection::open(&self.path).map_err(|error| sql("open catalog", error))?;
         connection
-            .busy_timeout(Duration::from_secs(5))
+            .busy_timeout(BUSY_TIMEOUT)
             .map_err(|error| sql("set catalog busy timeout", error))?;
         connection
             .execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")

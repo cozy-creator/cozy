@@ -20,7 +20,9 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use tensorfs_core::canon::{self, as_arr, as_str, Fields, Value};
@@ -41,9 +43,10 @@ use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerifi
 use tensorfs_core::limits;
 use tensorfs_core::manifest::{Draft, Entry};
 use tensorfs_core::registry;
-use tensorfs_core::store::Store;
+use tensorfs_core::store::{Progress, Store};
 use tensorfs_core::structure::{Provenance, REAL};
 
+use crate::watch::{self, Verdict, PROGRESS_PREFIX};
 use crate::{bail, flag, flag_num, flag_on, rss_kb, Flags};
 
 macro_rules! ok {
@@ -1057,6 +1060,11 @@ pub fn cmd_plan(target: &str, f: &Flags) -> ExitCode {
 
 /// What isolation this host could actually give the worker. Recorded in the receipt as an
 /// integer, because claiming a tier you did not get is worse than getting a lower one.
+///
+/// The rlimits are RESOURCE fences — address space and file size bound a runaway, not
+/// progress. There is deliberately no CPU-time limit: `ulimit -t` ended legitimate work at
+/// a fixed number of CPU-seconds whatever the input (xs-007 row 4). Whether the worker is
+/// still working is observed instead, by `watch::supervise`.
 fn isolation(argv: &[String], f: &Flags) -> (Command, i64, String) {
     let me = std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -1066,10 +1074,9 @@ fn isolation(argv: &[String], f: &Flags) -> (Command, i64, String) {
         .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
         .collect();
     let as_kb: u64 = flag_num(f, "rlimit-as-mb", 2048) * 1024;
-    let cpu_s: u64 = flag_num(f, "rlimit-cpu-s", 3600);
     let fsz_kb: u64 = flag_num(f, "rlimit-fsize-mb", 65536) * 1024;
     let inner = format!(
-        "ulimit -v {as_kb}; ulimit -t {cpu_s}; ulimit -f {fsz_kb}; ulimit -c 0; exec '{me}' {}",
+        "ulimit -v {as_kb}; ulimit -f {fsz_kb}; ulimit -c 0; exec '{me}' {}",
         quoted.join(" ")
     );
 
@@ -1088,7 +1095,7 @@ fn isolation(argv: &[String], f: &Flags) -> (Command, i64, String) {
         (
             c,
             2,
-            format!("netns + rlimits (as {as_kb} KiB, cpu {cpu_s} s)"),
+            format!("netns + rlimits (as {as_kb} KiB, fsize {fsz_kb} KiB)"),
         )
     } else {
         let mut c = Command::new("/bin/sh");
@@ -1097,7 +1104,7 @@ fn isolation(argv: &[String], f: &Flags) -> (Command, i64, String) {
             c,
             1,
             format!(
-                "separate process + rlimits (as {as_kb} KiB, cpu {cpu_s} s); no netns on this host"
+                "separate process + rlimits (as {as_kb} KiB, fsize {fsz_kb} KiB); no netns on this host"
             ),
         )
     }
@@ -1152,30 +1159,118 @@ pub fn cmd_run(root: &Path, target: &str, f: &Flags) -> ExitCode {
             argv.push(v.clone());
         }
     }
+    argv.push("--progress".into());
     let (mut cmd, tier, how) = isolation(&argv, f);
     println!("isolation    tier {tier} — {how}");
     println!("session      {session}");
-    let t0 = Instant::now();
-    match cmd.status() {
-        Ok(s) if s.success() => {
-            println!("worker exited 0 in {:.1}s", t0.elapsed().as_secs_f64());
+    // The worker's stdout is the observation channel: every line it prints is relayed
+    // here, and its progress records are consumed. Its stderr stays its own.
+    cmd.stdout(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("REFUSED IO_FAILED: spawn worker: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // `sh` and `unshare` both exec in place, so this pid IS the worker's.
+    println!("worker       pid {}", child.id());
+    let stdout = child.stdout.take().expect("piped stdout");
+    let declared = p.plan.declared_bytes().unwrap_or(0);
+    let report = watch::supervise(&mut child, stdout, declared);
+    let secs = report.elapsed.as_secs_f64();
+    println!(
+        "progress     moved {} B in {secs:.1} s ({:.1} MB/s), {} admitted; worst silence \
+         {:.3} s, patience {:.1} s",
+        report.moved,
+        report.moved as f64 / secs.max(1e-9) / 1e6,
+        report.admitted,
+        report.worst_gap.as_secs_f64(),
+        report.patience.as_secs_f64()
+    );
+    match report.verdict {
+        Verdict::Exited(s) if s.success() => {
+            println!("worker exited 0 in {secs:.1}s");
             ExitCode::SUCCESS
         }
-        Ok(s) => {
+        Verdict::Exited(s) => {
             eprintln!(
                 "worker exited {:?} — the candidate stays reapable and nothing installed",
                 s.code()
             );
             ExitCode::FAILURE
         }
-        Err(e) => {
-            eprintln!("REFUSED IO_FAILED: spawn worker: {e}");
+        Verdict::Stalled { silent, patience } => {
+            eprintln!(
+                "worker stalled: no byte moved, no CPU consumed and never seen running for \
+                 {:.1} s (patience {:.1} s); killed — the candidate stays reapable and \
+                 nothing installed",
+                silent.as_secs_f64(),
+                patience.as_secs_f64()
+            );
+            ExitCode::FAILURE
+        }
+        Verdict::Runaway { silent, allowed } => {
+            eprintln!(
+                "worker runaway: burning CPU with no byte moved for {:.1} s, past the \
+                 {:.1} s its own rate says the whole input costs; killed — the candidate \
+                 stays reapable and nothing installed",
+                silent.as_secs_f64(),
+                allowed.as_secs_f64()
+            );
+            ExitCode::FAILURE
+        }
+        Verdict::Lost(e) => {
+            eprintln!("REFUSED IO_FAILED: wait for worker: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
 // ------------------------------------------------------------------ the hermetic worker
+
+/// The worker's side of the observation channel: one record on stdout per chunk the store
+/// moves and per object it admits, cumulative, so the parent reads totals and never has to
+/// trust an interval. Under `--progress` only — a worker run by hand prints nothing extra.
+#[derive(Default)]
+struct Reporter {
+    moved: AtomicU64,
+    admitted: AtomicU64,
+}
+
+impl Reporter {
+    fn announce(&self) {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let written = writeln!(
+            out,
+            "{PROGRESS_PREFIX}{}\t{}",
+            self.moved.load(Ordering::Relaxed),
+            self.admitted.load(Ordering::Relaxed)
+        )
+        .and_then(|()| out.flush());
+        if written.is_err() {
+            // The channel's other end is closed: the run that asked for these records is
+            // gone. A worker nobody supervises does not go on burning CPU into a candidate
+            // nobody will install; the session stays resumable for the next run.
+            eprintln!(
+                "worker: the supervising run is gone; stopping — the candidate stays resumable"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+impl Progress for Reporter {
+    fn moved(&self, bytes: u64) {
+        self.moved.fetch_add(bytes, Ordering::Relaxed);
+        self.announce();
+    }
+    fn admitted(&self) {
+        self.admitted.fetch_add(1, Ordering::Relaxed);
+        self.announce();
+    }
+}
 
 pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     let t0 = Instant::now();
@@ -1196,7 +1291,10 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     }
     let session = session_of(f, &p);
     let tenant = flag(f, "tenant").unwrap_or("dev").to_string();
-    let store = ok!(Store::init(root));
+    let mut store = ok!(Store::init(root));
+    if flag_on(f, "progress") {
+        store = store.observed(Arc::new(Reporter::default()));
+    }
 
     // The root goes down FIRST. From this line on the session is reapable whatever happens.
     let (mut ingest_root, _operation_writer) = ok!(tx::open_root(&store, &session, &tenant));

@@ -104,7 +104,9 @@ tfs reap <root>
 Blob admission hashes while streaming, installs with no-clobber semantics, and records its
 rebuildable verification observation in SQLite. Manifests use the same digest/length identity but
 live under their typed namespace. A blob or Manifest that fails an exact rehash is removed from its
-authoritative path immediately; TensorFS retains no forensic copy.
+authoritative path immediately; TensorFS retains no forensic copy. A writer holds an advisory lock
+on its admission temp for the temp's whole life; `tfs reap` removes only the temps whose lock the
+kernel hands out, never by age, so a slow live writer is never reaped from under.
 
 ## Repository publication
 
@@ -211,6 +213,14 @@ The CLI and Python facade call the same `tensorfs-core::ingest::source` planner/
 trust or reinterpret asserted fields: the core re-reads carrier headers and the exact registry,
 reproduces the unique source plan byte-for-byte, then executes its sources, target, order, and
 session through the ordinary streaming ingest/CAS pass.
+
+`tfs ingest run` spawns the conversion as an isolated worker under address-space and file-size
+rlimits and no CPU-time limit: a CPU clock ends legitimate work at a fixed input size. The worker
+announces every byte it moves on its stdout, and the run ends it only on observation — no byte
+moved, no CPU tick, never seen running or in I/O across a window derived from the run's own
+worst silence (floored at the catalog's declared lock wait), or CPU burning with no byte moved
+past what the run's own rate says the whole input costs. Nothing about the run's duration is
+consulted.
 Editing a plan, changing carrier bytes or registry bytes, omitting an input, or supplying an
 unreviewed member refuses. Unique keysets need no member. Equal headers with no reviewed member
 admit multiple assignments and refuse; a provider adapter may supply a member only when its own
