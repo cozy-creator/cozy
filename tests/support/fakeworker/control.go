@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -15,42 +14,23 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/home"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 type fakeControl struct {
 	pb.UnimplementedWorkerControlServer
-	say                 func(string, ...any)
-	arm                 string
-	bootID              string
-	instance            string
-	releaseID           string
-	root                string // this worker's OWN filesystem root
-	verify              func(string) bool
-	dynamicPlan         string
-	dynamicPackage      string
-	dynamicRelease      string
-	dynamicEnvironment  string
-	dynamicConfig       string
-	dynamicPackageB     string
-	dynamicPlanB        string
-	dynamicReleaseB     string
-	dynamicEnvironmentB string
-	dynamicConfigB      string
+	say       func(string, ...any)
+	arm       string
+	bootID    string
+	instance  string
+	releaseID string
+	root      string // this worker's OWN filesystem root
+	verify    func(string) bool
 
 	generation   uint64
 	snapshotSent atomic.Bool
 }
 
 func (f *fakeControl) WatchProgress(_ *pb.ProgressOpen, stream pb.WorkerControl_WatchProgressServer) error {
-	if f.arm == "snapshotbarrier" {
-		if f.snapshotSent.Load() {
-			f.say("ARM: WatchProgress opened after WorkerSnapshot")
-		} else {
-			f.say("ARM: WatchProgress opened before WorkerSnapshot")
-		}
-	}
 	<-stream.Context().Done()
 	return nil
 }
@@ -105,10 +85,6 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: ack}})
 	f.say("ClaimAck sent: boot=%s instance=%s release=%s minor=%d",
 		f.bootID, f.instance, f.releaseID, pb.WireMinor)
-	if f.arm == "snapshotbarrier" {
-		time.Sleep(250 * time.Millisecond)
-	}
-
 	// ONE BOUNDED, DIGEST-ACKED SNAPSHOT (§5). The body is a real canonical document and
 	// the digest is over exactly its bytes, so a truncated snapshot cannot match one.
 	// Admission stays CLOSED until the ack: that barrier is stated on the wire.
@@ -137,14 +113,8 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	f.snapshotSent.Store(true)
 	f.say("WorkerSnapshot %s sent (%d B); admission is CLOSED until the ack", snapshotID, len(bodyBytes))
 
-	dynamicSlots := uint32(1)
 	observedMany := func(revision uint64, setDigest []byte, placements []*pb.PlacementStatus) {
 		availableSlots := uint32(2)
-		if f.arm == "delayed-output" {
-			availableSlots = 1
-		} else if f.arm == "dynamic-output" {
-			availableSlots = dynamicSlots
-		}
 		r := &pb.ObservedWorkerState{
 			AcceptedDesiredStateRevision: revision, ConvergedRevision: revision,
 			AcceptedPlacementSetDigest: setDigest,
@@ -152,18 +122,6 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			AppliedWireMinor:           pb.WireMinor,
 			AdmissionState:             pb.AdmissionState_ADMISSION_STATE_OPEN,
 			AdmissionGeneration:        admissionGeneration, AvailableAttemptSlots: availableSlots,
-		}
-		if f.arm == "placement-failed" {
-			for _, placement := range placements {
-				placement.Materialization = pb.MaterializationState_MATERIALIZATION_STATE_FAILED
-				placement.Serving = pb.ServingState_SERVING_STATE_OFFLINE
-				placement.DispatchableBindingDigests = nil
-				placement.Faults = []*pb.Fault{{
-					Kind: pb.FaultKind_FAULT_KIND_CONFIG_REFUSED, Subject: placement.PlacementId,
-					Reason: "package_descriptor_invalid",
-					Detail: "the installed Runtime cannot read this package descriptor",
-				}}
-			}
 		}
 		r.Placements = placements
 		env(func(e, g uint64, b string) {
@@ -197,9 +155,6 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	}
 
 	var dropAck *pb.AttemptOutcome
-	var currentRevision uint64
-	var currentSetDigest []byte
-	var currentPlacements []*pb.PlacementStatus
 	for {
 		frame, err := stream.Recv()
 		if err != nil {
@@ -224,36 +179,9 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			}
 		case *pb.RecordOwnerFrame_DesiredState:
 			d := m.DesiredState
-			if f.arm == "precondition" {
-				f.say("ARM: refusing desired revision %d with FailedPrecondition", d.Revision)
-				return status.Error(codes.FailedPrecondition,
-					"Runtime package preparation failed: proof package is incompatible")
-			}
 			setDigest := []byte(nil)
 			placements := []*pb.PlacementStatus(nil)
-			if f.arm == "dynamic-output" && d.GetPackageSet() != nil {
-				delegation := d.GetPackageSet().DownloadDelegation
-				doc, err := canonical.Read(delegation, &pb.DownloadDelegation{})
-				if err != nil {
-					f.say("ARM: dynamic package delegation is inadmissible: %v", err)
-					continue
-				}
-				setDigest = canonical.Digest(delegation)
-				for index, selected := range doc.List("packages") {
-					packageName := selected.Str("package")
-					planID, release, environment, config := f.dynamicPlan, f.dynamicRelease, f.dynamicEnvironment, f.dynamicConfig
-					if packageName == f.dynamicPackageB {
-						planID, release = f.dynamicPlanB, f.dynamicReleaseB
-						environment, config = f.dynamicEnvironmentB, f.dynamicConfigB
-					} else if f.dynamicPackage != "" && packageName != f.dynamicPackage {
-						f.say("ARM: no dynamic fixture for package %s", packageName)
-						continue
-					}
-					placements = append(placements, placementStatus(
-						fmt.Sprintf("plc-dynamic-package-%d", index+1), setDigest, []string{planID},
-						release, environment, config))
-				}
-			} else if ds := d.GetPlacementSet(); ds != nil {
+			if ds := d.GetPlacementSet(); ds != nil {
 				// THE BYTES ARE THE SET. Recompute BEFORE parsing a single field — a
 				// mismatch is a typed refusal with the desired state UNAPPLIED.
 				if !bytes.Equal(canonical.Digest(ds.PlacementSetCanonicalBytes), ds.PlacementSetDigest) {
@@ -285,9 +213,6 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			}
 			f.say("DesiredWorkerState revision=%d placements=%d plans=%d", d.Revision,
 				len(placements), plans)
-			currentRevision = d.Revision
-			currentSetDigest = append(currentSetDigest[:0], setDigest...)
-			currentPlacements = append(currentPlacements[:0], placements...)
 			observedMany(d.Revision, setDigest, placements)
 		case *pb.RecordOwnerFrame_AttemptOffer:
 			offer := m.AttemptOffer
@@ -318,29 +243,16 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				accepted.RecordOwnerEpoch, accepted.ControlStreamGeneration, accepted.WorkerBootId = e, g, b
 			})
 			send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptAccepted{AttemptAccepted: accepted}})
-			if f.arm == "dynamic-output" {
-				dynamicSlots = 0
-			}
 			switch f.arm {
 			case "badterminal":
 				f.badOutcomes(outcome, offer)
 			case "dropack":
 				dropAck = f.outcomeWithOutput(outcome, offer)
-			case "output":
-				f.outcomeWithOutput(outcome, offer)
-			case "delayed-output":
-				time.Sleep(500 * time.Millisecond)
-				f.outcomeWithOutput(outcome, offer)
 			case "missing-output":
 				t, _ := authorOutcome(offer.RequestId, offer.AttemptOrdinal,
 					offer.InvocationSpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED,
 					"success that omits its granted output")
 				f.say("ARM: SUCCEEDED outcome omits the granted output")
-				outcome(t)
-			case "dynamic-output":
-				t, _ := authorOutcome(offer.RequestId, offer.AttemptOrdinal,
-					offer.InvocationSpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED,
-					"dynamic package result")
 				outcome(t)
 			}
 		case *pb.RecordOwnerFrame_OutcomeAck:
@@ -358,13 +270,6 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				outcome(dropAck)
 				dropAck = nil
 				go func() { time.Sleep(3 * time.Second); os.Exit(0) }()
-			}
-			if f.arm == "delayed-output" {
-				observedMany(currentRevision, currentSetDigest, currentPlacements)
-			}
-			if f.arm == "dynamic-output" {
-				dynamicSlots = 1
-				observedMany(currentRevision, currentSetDigest, currentPlacements)
 			}
 		case *pb.RecordOwnerFrame_CancelAttempt:
 			f.say("CancelAttempt %s#%d", m.CancelAttempt.RequestId, m.CancelAttempt.AttemptOrdinal)
