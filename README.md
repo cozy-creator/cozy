@@ -25,15 +25,28 @@ A writable local TensorFS root has exactly one host owner. SQLite/advisory locks
 processes on that host; they are not a cross-host lock service and must not sit on NFS as shared
 mutation authority. Multi-host publication and GC use Tensorhub's R2/PostgreSQL control plane.
 
-TensorFS has exactly three stored schemas:
+Three schemas are STORED — written to a path, digested, and identified by their exact bytes:
 
 1. Repository JSON, typed by `repos/`.
 2. Manifest JSON, typed by `manifests/`.
-3. `cozytensors/1`, the portable CBOR tensor header stored as a blob.
+3. `cozytensors/1`, the portable CBOR tensor header, stored as a blob.
 
-Encoding definitions are nested CBOR values inside the CozyTensors header. Qualification vectors,
-operation requests, receipts, verification observations, and provider grants are fixtures or SQL
-rows—not additional stored document formats.
+Those three are the durable format contract. They are not the whole document inventory, and
+this file used to claim they were. Nine further canonical grammars cross a process boundary
+without being stored under their own path — `corpus.rs` `DOC_KINDS` enumerates them and the
+frozen corpus verifies every one:
+
+| grammar | where it lives |
+| --- | --- |
+| `EncodingSpec` | nested CBOR inside the CozyTensors header |
+| `EncodingVectors` | compiled-in registry fixture |
+| `IngestProfile`, `IngestSubject`, `IngestSession` | the ingest border's own documents |
+| `IngestVerificationReceipt`, `Stamp` | ingest evidence, digested but not path-typed |
+| `CodeTopology`, `CompatibilityReport` | the layout plane's inputs and output |
+
+Plus one bounded operational DTO, `source-plan.json`, specified below. Naming these does not
+make them stored formats; refusing to name them only made the count look smaller than the
+system.
 
 ## Build and test
 
@@ -45,17 +58,23 @@ the same wheel.
 CodeTopology bytes. Callers project exact component/key fields from their own code contract;
 TensorFS validates and writes them but never parses the foreign contract or guesses key prefixes.
 
+Everything below is what CI runs, in the same order.
+
 ```bash
 export PYO3_PYTHON="$(uv python find 3.12)"
-cargo test --workspace --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+python3 scripts/fence.py
+python3 scripts/version_contract.py source
 
 cargo build --release --bin tfs
+./target/release/tfs vectors verify
 uv run --python 3.12 --project conformance/cbor/python \
   python scripts/cbor-conformance.py --tfs target/release/tfs conform
-uv run --no-project --python 3.12 python scripts/fence.py
-uv run --no-project --python 3.12 python scripts/version_contract.py source
+
+# the end-to-end test: wheel -> fresh venv -> real store -> lease/plan/ring/CAS
+bash scripts/wheel-smoke.sh
 ```
 
 The CBOR gate runs the production Rust codec and an independent Python codec over the same
