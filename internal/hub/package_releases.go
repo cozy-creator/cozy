@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
@@ -63,7 +64,16 @@ type PackageReleaseDetail struct {
 // CPU or accelerator product; it does not reinterpret the package descriptor's
 // model inputs as hardware requirements.
 func (d PackageReleaseDetail) Requirements() ([]string, *exit.Error) {
-	sum := sha256.Sum256(d.Document)
+	// Document is embedded inside another JSON response. The outer encoder may spell
+	// `<`, `>` and `&` as Unicode escapes, so RawMessage preserves transport tokens,
+	// not necessarily the stored PackageRelease bytes. Normalize the parsed content
+	// before checking its stored-byte identity; a semantic change still moves the hash.
+	canonicalDocument, err := canonical.NormalizeJCS(d.Document)
+	if err != nil {
+		return nil, exit.Named(exit.Structural, "hub.package_release_invalid",
+			"Tensorhub returned an invalid PackageRelease/1 document")
+	}
+	sum := sha256.Sum256(canonicalDocument)
 	want := "sha256:" + hex.EncodeToString(sum[:])
 	if d.Release.ReleaseDigest != want {
 		return nil, exit.Named(exit.Conflict, "hub.package_release_digest_mismatch",
@@ -73,7 +83,7 @@ func (d PackageReleaseDetail) Requirements() ([]string, *exit.Error) {
 		Format       string   `json:"format"`
 		Requirements []string `json:"requirements"`
 	}
-	if err := json.Unmarshal(d.Document, &document); err != nil ||
+	if err := json.Unmarshal(canonicalDocument, &document); err != nil ||
 		document.Format != "cozy.package.release/1" || document.Requirements == nil {
 		return nil, exit.Named(exit.Structural, "hub.package_release_invalid",
 			"Tensorhub returned an invalid PackageRelease/1 document")
