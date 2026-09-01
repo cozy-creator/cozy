@@ -33,6 +33,8 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	var mu sync.Mutex
 	var public ed25519.PublicKey
 	loginBegins := 0
+	accountRegistrations := 0
+	accountName := ""
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -103,6 +105,37 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 				"email_verified": true, "entitlements": []string{},
 				"availability": []map[string]any{{"action": "update_username", "allowed": true}},
 			})
+		case "/v1/accounts/current":
+			if authorization := r.Header.Get("Authorization"); authorization != "Bearer first-access-token" && authorization != "Bearer second-access-token" {
+				t.Errorf("current-account read carried %q", authorization)
+				return
+			}
+			mu.Lock()
+			name := accountName
+			mu.Unlock()
+			if name == "" {
+				writeAuthJSON(t, w, http.StatusConflict, map[string]any{"error": map[string]string{
+					"code": "account.name_required", "message": "choose an account name",
+					"remedy": "finish Tensorhub registration",
+				}})
+				return
+			}
+			writeAuthJSON(t, w, http.StatusOK, map[string]string{"name": name})
+		case "/v1/accounts/paul":
+			if r.Method != http.MethodPut || r.Header.Get("Authorization") != "Bearer first-access-token" {
+				t.Errorf("account registration = %s auth %q", r.Method, r.Header.Get("Authorization"))
+				return
+			}
+			var body map[string]any
+			if !decodeAuthBody(t, r, &body) || len(body) != 0 {
+				t.Errorf("account registration body = %+v", body)
+				return
+			}
+			mu.Lock()
+			accountName = "paul"
+			accountRegistrations++
+			mu.Unlock()
+			writeAuthJSON(t, w, http.StatusOK, map[string]string{"name": "paul"})
 		case "/v1/rentals":
 			if r.Header.Get("Authorization") != "Bearer second-access-token" {
 				t.Errorf("protected hub request carried %q", r.Header.Get("Authorization"))
@@ -124,10 +157,11 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	if before.code != 0 || !strings.Contains(before.stdout, `"status":"not logged in"`) || before.stderr != "" {
 		t.Fatalf("status before login [exit %d]\nstdout: %s\nstderr: %s", before.code, before.stdout, before.stderr)
 	}
-	first := runAuthCozy(t, root, server.URL, "123456\n", "auth", "login", "person@example.com", "--json")
+	first := runAuthCozy(t, root, server.URL, "123456\npaul\n", "auth", "login", "person@example.com", "--json")
 	if first.code != 0 || !strings.Contains(first.stdout, `"status":"registered"`) ||
-		strings.Contains(first.stdout, "personal_org") ||
-		!strings.Contains(first.stderr, "A verification code was sent") {
+		!strings.Contains(first.stdout, `"account":"paul"`) ||
+		!strings.Contains(first.stderr, "A verification code was sent") ||
+		!strings.Contains(first.stderr, "Tensorhub account name:") {
 		t.Fatalf("first login [exit %d]\nstdout: %s\nstderr: %s", first.code, first.stdout, first.stderr)
 	}
 
@@ -151,12 +185,14 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	}
 
 	second := runAuthCozy(t, root, server.URL, "", "auth", "login", "person@example.com", "--json")
-	if second.code != 0 || !strings.Contains(second.stdout, `"status":"authenticated"`) || second.stderr != "" {
+	if second.code != 0 || !strings.Contains(second.stdout, `"status":"authenticated"`) ||
+		!strings.Contains(second.stdout, `"account":"paul"`) || second.stderr != "" {
 		t.Fatalf("automatic login [exit %d]\nstdout: %s\nstderr: %s", second.code, second.stdout, second.stderr)
 	}
 	status := runAuthCozy(t, root, server.URL, "", "auth", "--json")
 	if status.code != 0 || !strings.Contains(status.stdout, `"status":"logged in"`) ||
-		!strings.Contains(status.stdout, `"email":"person@example.com"`) || status.stderr != "" {
+		!strings.Contains(status.stdout, `"email":"person@example.com"`) ||
+		!strings.Contains(status.stdout, `"account":"paul"`) || status.stderr != "" {
 		t.Fatalf("status after login [exit %d]\nstdout: %s\nstderr: %s", status.code, status.stdout, status.stderr)
 	}
 	manager := accountauth.New(config.Config{Home: root, HubURL: server.URL})
@@ -173,6 +209,9 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	defer mu.Unlock()
 	if loginBegins != 3 {
 		t.Fatalf("login begin calls = %d, want 3", loginBegins)
+	}
+	if accountRegistrations != 1 || accountName != "paul" {
+		t.Fatalf("account registration = %d, name %q", accountRegistrations, accountName)
 	}
 }
 
