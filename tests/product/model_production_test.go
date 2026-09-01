@@ -601,8 +601,7 @@ func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *test
 	if readsAfterReplay != initialPackageReads {
 		t.Fatalf("exact replay re-resolved package latest: reads %d -> %d", initialPackageReads, readsAfterReplay)
 	}
-	followArgs := append([]string(nil), args[:len(args)-1]...)
-	follow := exec.Command(cozyBin, followArgs...)
+	follow := exec.Command(cozyBin, "--json", "run", "watch", accepted.ID)
 	follow.Env = childEnv(t, root)
 	var followStdout, followStderr bytes.Buffer
 	follow.Stdout, follow.Stderr = &followStdout, &followStderr

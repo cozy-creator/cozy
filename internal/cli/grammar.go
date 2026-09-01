@@ -207,6 +207,7 @@ type RunCmd struct {
 	Execute RunExecuteCmd `cmd:"" default:"withargs" hidden:""`
 	Cancel  RunCancelCmd  `cmd:"" help:"Cancel a queued or running run."`
 	List    RunListCmd    `cmd:"" help:"List current and past runs."`
+	Watch   RunWatchCmd   `cmd:"" help:"Watch one recorded run until it settles."`
 }
 
 type RunExecuteCmd struct {
@@ -219,7 +220,7 @@ type RunExecuteCmd struct {
 	Assets         []string `name:"asset" help:"Bind a local asset as field-path=file."`
 	Models         []string `name:"model" help:"Bind a model: --model org/model@release for one slot; --model slot=org/model@release for named slots."`
 	Rental         bool     `help:"Run on a Creator-managed rental."`
-	ForceRental    bool     `help:"Development/testing: require a remote rental even when local capacity is ready." hidden:""`
+	RentalOnly     bool     `help:"Require a remote rental even when local capacity is ready."`
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`
 	Trees          []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
 	Org            string   `help:"Job publication organization (defaults to local)."`
@@ -230,7 +231,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 	args := append([]string{c.Target}, c.Input...)
 	return r.call(handleRunExecute, args, bools(
 		"--stream", c.Stream, "--await", c.Await, "--rental", c.Rental,
-		"--force-rental", c.ForceRental), values(
+		"--rental-only", c.RentalOnly), values(
 		"--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets,
 		"--model", c.Models,
@@ -254,6 +255,14 @@ type RunListCmd struct {
 func (c *RunListCmd) Run(r *Runtime) error {
 	return r.call(handleRunList, nil, nil, values(
 		"--state", c.State, "--package", c.Package, "--limit", intText(c.Limit)), true)
+}
+
+type RunWatchCmd struct {
+	ID string `arg:"" name:"run" help:"Run id."`
+}
+
+func (c *RunWatchCmd) Run(r *Runtime) error {
+	return r.call(handleRunWatch, []string{c.ID}, nil, nil, true)
 }
 
 type RentalCmd struct {

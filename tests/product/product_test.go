@@ -340,12 +340,19 @@ func TestPackagePublishMetadataGrammar(t *testing.T) {
 		!strings.Contains(help, "--model slot=org/model@release") ||
 		!strings.Contains(help, "JSON file") || !strings.Contains(help, "--in request.json") ||
 		strings.Contains(help, "--detach") || strings.Contains(help, "--wait") ||
-		strings.Contains(help, "--force-rental") {
+		!strings.Contains(help, "--rental-only") || strings.Contains(help, "--force-rental") {
 		t.Fatalf("run retained versioned target grammar [exit %d]\n%s", code, help)
 	}
-	if code, out := runCozy(t, root, "run", "cozy/example/function", "--force-rental"); code != 2 || !strings.Contains(out, "rentals.max_hourly_spend_usd") ||
+	if code, out := runCozy(t, root, "run", "cozy/example/function", "--rental-only"); code != 2 || !strings.Contains(out, "rentals.max_hourly_spend_usd") ||
 		strings.Contains(out, "unknown flag") {
-		t.Fatalf("hidden force-rental flag did not enter the ordinary rental budget gate [exit %d]\n%s", code, out)
+		t.Fatalf("rental-only did not enter the ordinary rental budget gate [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "run", "cozy/example/function", "--rental", "--rental-only"); code != 2 || !strings.Contains(out, "mutually exclusive") {
+		t.Fatalf("run accepted both rental placement flags [exit %d]\n%s", code, out)
+	}
+	if code, help := runCozy(t, root, "run", "watch", "--help"); code != 0 ||
+		!strings.Contains(help, "<run>") {
+		t.Fatalf("run watch grammar drifted [exit %d]\n%s", code, help)
 	}
 	if code, out := runCozy(t, root, "run", "cozy/example/function", "--stream"); code != 2 ||
 		!strings.Contains(out, "--stream requires --await") {

@@ -190,6 +190,7 @@ cozy run org/package/generate \
 
 cozy run org/package/train epochs=3
 cozy run list
+cozy run watch <run-id>
 cozy run cancel <run-id>
 ```
 
@@ -198,6 +199,8 @@ return its result directly; otherwise it prints the run id, live status, and aut
 position, then returns while the daemon continues. `--await` stays attached through the terminal and
 shows named pipeline stages, measured step speed, elapsed time, and an estimate while step telemetry
 is available. `--stream` is the corresponding typed event stream and requires `--await`.
+`cozy run watch <run-id>` attaches to that same progress stream later; interrupting a watcher
+detaches without canceling the durable run.
 
 If the package is missing, Cozy installs the newest compatible release from Tensorhub before
 starting; the download is visible progress, not an interactive prompt. Reusing an explicit
@@ -227,8 +230,9 @@ cozy rental end studio
 
 GPU names and prices come from Tensorhub's Cozy-owned rental catalog. Creator never exposes or
 reads RunPod SKU names or provider prices. `cozy run` is local-only by default, while
-`--rental` lets Creator reuse idle manual/managed capacity or
-acquire the cheapest offered SKU that fits the configured fleet ceiling. Callers never name
+`--rental` permits Creator to reuse or acquire remote capacity only when ready local capacity cannot
+run the request. `--rental-only` deliberately bypasses local capacity and requires an external
+rental. Both modes remain under the configured fleet ceiling. Callers never name
 a worker. Creator-managed rentals stop after their assigned queue is fully mirrored; manual
 rentals stop only through `cozy rental end`.
 
