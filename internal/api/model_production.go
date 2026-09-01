@@ -181,7 +181,7 @@ func (s *Server) modelProductionState(operation records.ModelProductionOperation
 	switch {
 	case operation.State == "cleanup_pending":
 		state.Cleanup = "pending"
-	case operation.State == "completed" && operation.RentalID != "":
+	case (operation.State == "completed" || operation.State == "partial") && operation.RentalID != "":
 		state.Cleanup = "provider_absent"
 	case operation.State == "failed" || operation.State == "canceled":
 		state.Cleanup = "settled"

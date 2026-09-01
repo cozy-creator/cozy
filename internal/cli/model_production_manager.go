@@ -130,7 +130,7 @@ func (m *modelProductionManager) CancelModelProduction(id string) *exit.Error {
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
-	} else if operation.State != "completed" && operation.State != "failed" &&
+	} else if operation.State != "completed" && operation.State != "partial" && operation.State != "failed" &&
 		operation.State != "canceled" {
 		m.kick(*operation)
 	}
@@ -162,7 +162,7 @@ func (m *modelProductionManager) Start() {
 }
 
 func (m *modelProductionManager) kick(operation records.ModelProductionOperation) {
-	if operation.State == "resolving" || operation.State == "completed" ||
+	if operation.State == "resolving" || operation.State == "completed" || operation.State == "partial" ||
 		operation.State == "failed" || operation.State == "canceled" {
 		return
 	}

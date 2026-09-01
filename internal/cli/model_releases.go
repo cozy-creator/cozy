@@ -1,9 +1,9 @@
 package cli
 
 import (
+	"regexp"
 	"sort"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -11,15 +11,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
+var modelReleaseLabelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+!-]{0,63}$`)
+
 func modelLabel(flag, value string) (string, *exit.Error) {
-	if value == "" || value != strings.TrimSpace(value) || len(value) > 128 ||
-		!utf8.ValidString(value) || strings.ContainsRune(value, '/') {
-		return "", exit.Usagef("%s must be one non-empty path-safe label of at most 128 bytes", flag)
-	}
-	for _, r := range value {
-		if r < 0x20 || r == 0x7f {
-			return "", exit.Usagef("%s contains a control character", flag)
-		}
+	if !modelReleaseLabelPattern.MatchString(value) {
+		return "", exit.Usagef("%s must start alphanumeric and use at most 64 bytes of letters, digits, ., _, +, !, or -", flag)
 	}
 	return value, nil
 }

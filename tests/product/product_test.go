@@ -171,6 +171,11 @@ func TestModelProductionGrammar(t *testing.T) {
 	if code != 2 || !strings.Contains(out, "requires --lane") {
 		t.Fatalf("model publish accepted no lane changes [exit %d]\n%s", code, out)
 	}
+	code, out = runCozy(t, root, "model", "publish", "acme/model", "--release", "bad label",
+		"--lane", "bf16=sha256:"+strings.Repeat("a", 64))
+	if code != 2 || !strings.Contains(out, "must start alphanumeric") {
+		t.Fatalf("model publish accepted an unsafe release label [exit %d]\n%s", code, out)
+	}
 	code, help = runCozy(t, root, "model", "yank", "--help")
 	if code != 0 || !strings.Contains(help, "--release") {
 		t.Fatalf("model yank grammar drifted [exit %d]\n%s", code, help)

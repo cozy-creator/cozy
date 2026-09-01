@@ -156,7 +156,8 @@ cozy model upload tensorhub/minimax-h3 \
 `--dry-run` resolves the immutable source, producer, job releases, resource floors, and named outputs
 without moving model bodies or authorizing rental spend. Upload follows by default and a repeat of the
 same command resumes the durable operation. Successful checkpoints stay retained even when a later
-output fails; upload never makes them public.
+output fails; only that output's transitive dependants are skipped, independent branches continue,
+and surviving outputs return with `status: partial`. Upload never makes them public.
 
 Publish, repoint, add, or remove release lanes separately. Omitted lanes stay unchanged:
 

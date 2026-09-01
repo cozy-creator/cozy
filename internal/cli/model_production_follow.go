@@ -48,7 +48,7 @@ func followModelProduction(ctx *Context, client *localclient.Client,
 			}
 		}
 	}
-	if state.Status == "completed" {
+	if state.Status == "completed" || state.Status == "partial" {
 		return emitModelProductionState(ctx, state, state.Changed)
 	}
 	if state.Status == "canceled" {
@@ -105,7 +105,7 @@ func handleModelProductionCancel(ctx *Context) *exit.Error {
 
 func modelProductionSettled(state string) bool {
 	switch state {
-	case "completed", "failed", "canceled":
+	case "completed", "partial", "failed", "canceled":
 		return true
 	}
 	return false

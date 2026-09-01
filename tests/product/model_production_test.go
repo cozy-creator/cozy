@@ -216,6 +216,85 @@ func TestFailedModelUploadKeepsCompletedCheckpointVisible(t *testing.T) {
 	}
 }
 
+func TestModelUploadSettlesPartialWhenIndependentBranchSucceeds(t *testing.T) {
+	root := t.TempDir()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	instruction := modelproduction.Instruction{Destination: "acme/model",
+		Source:   "hf://acme/source@" + strings.Repeat("a", 40),
+		Producer: "acme/tools/build", Rental: true}
+	production := &launch.ModelProduction{Name: "branches", Sources: map[string]string{"source": "proof/source/1"},
+		Steps: []launch.ModelProductionStep{
+			{Name: "fails", Callable: "acme/tools@v1/fails",
+				Models: map[string]string{"source": "source"}, Outputs: []string{"model"}},
+			{Name: "succeeds", Callable: "acme/tools@v1/succeeds",
+				Models: map[string]string{"source": "source"}, Outputs: []string{"model"}},
+		}, Outputs: []launch.ModelProductionOutput{
+			{Name: "failed-branch", Source: "fails.model"},
+			{Name: "successful-branch", Source: "succeeds.model"},
+		}}
+	plan := modelproduction.Plan{Instruction: instruction, Destination: instruction.Destination,
+		Source: instruction.Source, Producer: instruction.Producer, Production: production,
+		Jobs: []modelproduction.JobPin{
+			{Step: "fails", Callable: "acme/tools@v1/fails"},
+			{Step: "succeeds", Callable: "acme/tools@v1/succeeds"},
+		}}
+	instructionBytes, err := instruction.Bytes()
+	must(t, err)
+	instructionDigest, err := instruction.Digest()
+	must(t, err)
+	_, _, problem = store.BeginModelProductionInstruction(instruction.ID(), instructionDigest,
+		instructionBytes)
+	fatal(t, problem)
+	planBytes, err := plan.Bytes()
+	must(t, err)
+	planDigest, err := plan.Digest()
+	must(t, err)
+	_, _, problem = store.AttachModelProductionPlan(instruction.ID(), instructionDigest,
+		instructionBytes, planBytes, planDigest)
+	fatal(t, problem)
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "accepted", "source_preparing", 0, ""))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_preparing", "source_prepared", 0, ""))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_prepared", "step_running", 0, ""))
+	_, problem = store.BeginModelProductionStep(records.ModelProductionStep{OperationID: instruction.ID(),
+		StepIndex: 0, StepName: "fails", RequestID: "job-fails", State: "failed"})
+	fatal(t, problem)
+	_, problem = store.BeginModelProductionStep(records.ModelProductionStep{OperationID: instruction.ID(),
+		StepIndex: 1, StepName: "succeeds", RequestID: "job-succeeds", State: "completed"})
+	fatal(t, problem)
+	checkpoint := "sha256:" + strings.Repeat("d", 64)
+	fatal(t, store.RecordModelProductionArtifact(records.ModelProductionArtifact{
+		OperationID: instruction.ID(), StepName: "succeeds", OutputSlot: "model",
+		RequestID: "job-succeeds", Attempt: 1,
+		InvocationDigest: "sha256:" + strings.Repeat("b", 64), TransactionID: "transaction-proof",
+		WriterGeneration: 1, ReceiptDigest: "sha256:" + strings.Repeat("c", 64),
+		Receipt: []byte(`{"format":"proof/1"}`), ManifestID: checkpoint, ManifestLength: 128,
+		CheckpointEvidence: []byte(`{"format":"evidence/1"}`),
+	}, nil))
+	fatal(t, store.MarkModelProductionArtifactPublished(instruction.ID(), "succeeds", "model", "upload-proof"))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "step_running", "outputs_preparing", 2, ""))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "outputs_preparing", "cleanup_pending", 2, ""))
+	store.Close()
+
+	daemon := startDaemonProcess(t, root)
+	deadline := time.Now().Add(5 * time.Second)
+	var state api.ModelProductionState
+	for time.Now().Before(deadline) {
+		reply := daemon.call(t, http.MethodGet, "/v1/local/model-productions/"+instruction.ID(), nil)
+		if reply.Status == http.StatusOK && json.Unmarshal(reply.Body, &state) == nil &&
+			state.Status == "partial" {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if state.Status != "partial" || state.Checkpoints["successful-branch"] != checkpoint ||
+		state.Checkpoints["failed-branch"] != "" {
+		t.Fatalf("branch-local model upload result = %+v", state)
+	}
+}
+
 func TestForeignModelProductionRefusesBeforeWriteOrSpend(t *testing.T) {
 	var mu sync.Mutex
 	accountReads, unexpected := 0, 0

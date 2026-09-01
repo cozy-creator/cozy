@@ -143,6 +143,14 @@ func (p *productionProgress) StepCompleted(index int, name, callable string) {
 	p.line("Step %d/%d: completed %s (%s).", index+1, p.totalSteps, name, callable)
 }
 
+func (p *productionProgress) StepFailed(index int, name string) {
+	p.line("Step %d/%d: %s failed; independent branches continue.", index+1, p.totalSteps, name)
+}
+
+func (p *productionProgress) StepSkipped(index int, name string) {
+	p.line("Step %d/%d: skipped %s because a dependency failed.", index+1, p.totalSteps, name)
+}
+
 func (p *productionProgress) OutputsRetained(outputs int) {
 	p.line("Upload: retained %d owner-only checkpoints.", outputs)
 }
