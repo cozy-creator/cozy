@@ -562,6 +562,12 @@ func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *test
 		!strings.HasPrefix(accepted.ID, "modelupload-") || accepted.Kind != "model-upload" {
 		t.Fatalf("detached acceptance [exit %d, parse %v]\n%s", code, err, out)
 	}
+	code, out = runCozy(t, root, args...)
+	var firstReplay api.ModelProductionState
+	if err := json.Unmarshal([]byte(out), &firstReplay); code != 0 || err != nil ||
+		firstReplay.ID != accepted.ID || firstReplay.Changed {
+		t.Fatalf("detached replay [exit %d, parse %v]\n%s", code, err, out)
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
@@ -591,9 +597,9 @@ func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *test
 	initialPackageReads := packageReads
 	producerRelease = "4.0.0"
 	mu.Unlock()
-	code, replayed := runCozy(t, root, args...)
-	if code != 0 || !strings.Contains(replayed, `"id":"`+accepted.ID+`"`) {
-		t.Fatalf("exact detached replay [exit %d]\n%s", code, replayed)
+	code, replayedOutput := runCozy(t, root, args...)
+	if code != 0 || !strings.Contains(replayedOutput, `"id":"`+accepted.ID+`"`) {
+		t.Fatalf("exact detached replay [exit %d]\n%s", code, replayedOutput)
 	}
 	mu.Lock()
 	readsAfterReplay := packageReads
