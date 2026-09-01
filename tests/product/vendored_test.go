@@ -16,6 +16,7 @@ package producttest
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"os"
 	"os/exec"
@@ -28,7 +29,8 @@ import (
 )
 
 // Point this at a local worker-protocol clone to compare real bytes. CI passes the
-// checkout it provisioned, exactly as it does for -worker-protocol-fixtures.
+// checkout it provisioned. The vendored trees below need no such checkout to be
+// checked; this only adds upstream provenance on top of them.
 var workerProtocolRepo = flag.String("worker-protocol-repo", "",
 	"a worker-protocol checkout; the vendored bytes are compared against it")
 
@@ -44,8 +46,17 @@ const (
 	peerDir        = "gen/go/cozy/worker/v1"
 	wantRepository = "https://github.com/cozy-creator/worker-protocol-v2"
 	sourceManifest = vendorDir + "/SOURCE"
+	// worker-protocol's frozen canonical corpus, vendored so the cross-language
+	// identity fence needs no token. `positive/` is deliberately not vendored:
+	// nothing here reads it, and an unread file is a digest nobody benefits from.
+	corpusDir = "testdata/worker-protocol"
+	// Where that corpus lives inside a worker-protocol checkout.
+	peerCorpusDir  = "fixtures"
+	corpusManifest = corpusDir + "/SOURCE"
 	digestValuePfx = "sha256:"
 	reVendorRemedy = "re-vendor: copy " + peerDir + "/*.go into protocol/cozy/worker/v1/ and rewrite SOURCE"
+	reCorpusRemedy = "re-vendor: copy the canonical/ and red/ documents and MANIFEST.json from " +
+		peerCorpusDir + "/ into " + corpusDir + "/ and rewrite its SOURCE"
 )
 
 // vendorManifest is SOURCE parsed into its `key=value` lines.
@@ -56,11 +67,25 @@ type vendorManifest struct {
 	digests    map[string]string // file name -> lowercase hex sha256
 }
 
-func readVendorManifest(t *testing.T) vendorManifest {
+// isVendoredFileKey keeps the parser strict: a manifest key is either one of the
+// three header fields or a relative path to a file this repo vendors. Anything
+// else is a typo, and a typo that parses is a digest nobody checks.
+func isVendoredFileKey(key string) bool {
+	if key == "" || strings.HasPrefix(key, "/") || strings.Contains(key, "..") {
+		return false
+	}
+	switch filepath.Ext(key) {
+	case ".go", ".json", ".bin":
+		return true
+	}
+	return false
+}
+
+func readVendorManifest(t *testing.T, manifestPath string) vendorManifest {
 	t.Helper()
-	raw, err := os.ReadFile(sourceManifest)
+	raw, err := os.ReadFile(manifestPath)
 	if err != nil {
-		t.Fatalf("vendored worker protocol has no SOURCE manifest: %v", err)
+		t.Fatalf("%s is missing: %v", manifestPath, err)
 	}
 	m := vendorManifest{digests: map[string]string{}}
 	for i, line := range strings.Split(string(raw), "\n") {
@@ -70,7 +95,7 @@ func readVendorManifest(t *testing.T) vendorManifest {
 		}
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
-			t.Fatalf("%s:%d: not a key=value line: %q", sourceManifest, i+1, line)
+			t.Fatalf("%s:%d: not a key=value line: %q", manifestPath, i+1, line)
 		}
 		switch {
 		case key == "repository":
@@ -80,17 +105,17 @@ func readVendorManifest(t *testing.T) vendorManifest {
 		case key == "wire_minor":
 			n, err := strconv.ParseUint(value, 10, 32)
 			if err != nil {
-				t.Fatalf("%s:%d: wire_minor %q is not a number", sourceManifest, i+1, value)
+				t.Fatalf("%s:%d: wire_minor %q is not a number", manifestPath, i+1, value)
 			}
 			m.wireMinor = uint32(n)
-		case strings.HasSuffix(key, ".go"):
+		case isVendoredFileKey(key):
 			digest, ok := strings.CutPrefix(value, digestValuePfx)
 			if !ok || len(digest) != 64 {
-				t.Fatalf("%s:%d: %s digest is not a sha256: %q", sourceManifest, i+1, key, value)
+				t.Fatalf("%s:%d: %s digest is not a sha256: %q", manifestPath, i+1, key, value)
 			}
 			m.digests[key] = strings.ToLower(digest)
 		default:
-			t.Fatalf("%s:%d: unknown manifest key %q", sourceManifest, i+1, key)
+			t.Fatalf("%s:%d: unknown manifest key %q", manifestPath, i+1, key)
 		}
 	}
 	return m
@@ -108,7 +133,7 @@ func sha256File(t *testing.T, path string) string {
 
 // TestVendorManifestIsExact checks the manifest itself before anything trusts it.
 func TestVendorManifestIsExact(t *testing.T) {
-	m := readVendorManifest(t)
+	m := readVendorManifest(t, sourceManifest)
 	if m.repository != wantRepository {
 		t.Errorf("SOURCE repository = %q, want %q", m.repository, wantRepository)
 	}
@@ -123,43 +148,107 @@ func TestVendorManifestIsExact(t *testing.T) {
 	}
 }
 
-// TestVendoredBytesMatchManifest is the always-armed half: the bytes on disk are
-// exactly what SOURCE says they are, and SOURCE names exactly the files present.
-// This catches a hand-edit of generated code and a half-landed re-vendor that
-// adds, drops, or rewrites a file without rewriting the manifest — including a
-// retired file left beside its replacement.
-func TestVendoredBytesMatchManifest(t *testing.T) {
-	m := readVendorManifest(t)
+// checkTreeMatchesManifest is the always-armed comparison, shared by both vendored
+// trees: the bytes on disk are exactly what the manifest says they are, and the
+// manifest names exactly the files present. This catches a hand-edit, and a
+// half-landed re-vendor that adds, drops, or rewrites a file without rewriting the
+// manifest — including a retired file left beside its replacement.
+func checkTreeMatchesManifest(t *testing.T, root string, m vendorManifest, remedy string) {
+	t.Helper()
 	if len(m.digests) == 0 {
-		t.Fatal("SOURCE lists no generated files; the manifest is not guarding anything")
+		t.Fatalf("%s/SOURCE lists no files; the manifest is not guarding anything", root)
 	}
 
-	entries, err := os.ReadDir(vendorDir)
-	if err != nil {
-		t.Fatalf("read %s: %v", vendorDir, err)
-	}
 	onDisk := map[string]bool{}
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".go") {
-			onDisk[entry.Name()] = true
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return relErr
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == "SOURCE" {
+			return nil
+		}
+		onDisk[rel] = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
 	}
 
 	for name, want := range m.digests {
 		if !onDisk[name] {
-			t.Errorf("SOURCE lists %s but it is not vendored; %s", name, reVendorRemedy)
+			t.Errorf("%s/SOURCE lists %s but it is not vendored; %s", root, name, remedy)
 			continue
 		}
-		if got := sha256File(t, filepath.Join(vendorDir, name)); got != want {
-			t.Errorf("%s digest mismatch:\n  on disk %s\n  SOURCE  %s\nthe vendored bytes were "+
-				"edited without rewriting SOURCE; %s", name, got, want, reVendorRemedy)
+		if got := sha256File(t, filepath.Join(root, filepath.FromSlash(name))); got != want {
+			t.Errorf("%s/%s digest mismatch:\n  on disk %s\n  SOURCE  %s\nthe vendored bytes "+
+				"were changed without rewriting SOURCE; %s", root, name, got, want, remedy)
 		}
 	}
 	for name := range onDisk {
 		if _, listed := m.digests[name]; !listed {
-			t.Errorf("%s is vendored but absent from SOURCE; an unlisted generated file is "+
-				"unguarded — %s", name, reVendorRemedy)
+			t.Errorf("%s/%s is vendored but absent from SOURCE; an unlisted file is "+
+				"unguarded — %s", root, name, remedy)
 		}
+	}
+}
+
+// TestVendoredBytesMatchManifest guards the generated bindings.
+func TestVendoredBytesMatchManifest(t *testing.T) {
+	checkTreeMatchesManifest(t, vendorDir, readVendorManifest(t, sourceManifest), reVendorRemedy)
+}
+
+// TestVendoredCorpusMatchesManifest guards the frozen canonical corpus.
+//
+// The corpus is vendored so TestCanonicalDocuments runs in every `go test ./...`
+// with no token and no sibling checkout — the cross-language identity check is
+// the one whose failure is least visible any other way, and it spent weeks
+// skipping on every CI run instead. The obvious objection to vendoring it is that
+// it changes on nearly every schema commit and vendored-diff.sh does not look at
+// fixtures, so it would become a NEW silent-drift surface. This is the answer:
+// the corpus carries its own SOURCE in the same key=value shape as the bindings',
+// naming the worker-protocol commit it was taken from and a sha256 per file, and
+// a stale or hand-touched corpus is a loud failure here rather than a quiet pass.
+func TestVendoredCorpusMatchesManifest(t *testing.T) {
+	checkTreeMatchesManifest(t, corpusDir, readVendorManifest(t, corpusManifest), reCorpusRemedy)
+}
+
+// TestCorpusAgreesWithBindings closes the triangle. The compiled binding, the
+// binding manifest, and the corpus all name a wire minor, and a re-vendor that
+// moves one without the others is exactly the half-landed bump this file exists
+// to catch. The corpus's own MANIFEST.json is the third witness: it is written by
+// worker-protocol, not by us, so it cannot be edited into agreement here.
+func TestCorpusAgreesWithBindings(t *testing.T) {
+	bindings := readVendorManifest(t, sourceManifest)
+	corpus := readVendorManifest(t, corpusManifest)
+	if bindings.commit != corpus.commit {
+		t.Errorf("the bindings are vendored from %s but the corpus from %s; re-vendor both "+
+			"from one worker-protocol commit", bindings.commit, corpus.commit)
+	}
+	if corpus.wireMinor != pb.WireMinor {
+		t.Errorf("%s records wire_minor = %d but the compiled binding speaks %d",
+			corpusManifest, corpus.wireMinor, pb.WireMinor)
+	}
+	var frozen struct {
+		WireMinor uint32 `json:"wire_minor"`
+	}
+	raw, err := os.ReadFile(filepath.Join(corpusDir, "MANIFEST.json"))
+	if err != nil {
+		t.Fatalf("read the frozen MANIFEST.json: %v", err)
+	}
+	if err := json.Unmarshal(raw, &frozen); err != nil {
+		t.Fatalf("parse the frozen MANIFEST.json: %v", err)
+	}
+	if frozen.WireMinor != pb.WireMinor {
+		t.Errorf("the frozen corpus was written at wire minor %d but the compiled binding "+
+			"speaks %d; %s", frozen.WireMinor, pb.WireMinor, reCorpusRemedy)
 	}
 }
 
@@ -167,7 +256,7 @@ func TestVendoredBytesMatchManifest(t *testing.T) {
 // exists for: a re-vendor that half-lands, leaving the compiled-in wire minor and
 // the recorded one disagreeing.
 func TestWireMinorMatchesManifest(t *testing.T) {
-	m := readVendorManifest(t)
+	m := readVendorManifest(t, sourceManifest)
 	if pb.WireMinor != m.wireMinor {
 		t.Errorf("compiled WireMinor = %d but SOURCE records wire_minor = %d.\n"+
 			"The vendored code and its manifest disagree about the wire level this build "+
@@ -193,7 +282,7 @@ func peerGit(t *testing.T, repo string, args ...string) (string, error) {
 // It is opt-in. It is never silently skipped: if the comparison is asked for and
 // cannot run, the test fails.
 func TestVendoredMatchesUpstream(t *testing.T) {
-	m := readVendorManifest(t)
+	m := readVendorManifest(t, sourceManifest)
 	repo := *workerProtocolRepo
 
 	if repo == "" {
@@ -282,4 +371,78 @@ func TestVendoredMatchesUpstream(t *testing.T) {
 		"%s",
 		m.commit[:12], pb.WireMinor, head[:12], upstreamMinor,
 		strings.Join(drifted, ", "), reVendorRemedy)
+}
+
+// TestVendoredCorpusMatchesUpstream is the corpus's peer half, and the reason
+// vendoring it does not create a silent-drift surface. The digest half above
+// proves the corpus has not been touched since it was copied; this proves it is
+// the copy of the commit its SOURCE names, and reports when upstream has frozen a
+// newer one. Opt-in through the same flag, and never skipped.
+func TestVendoredCorpusMatchesUpstream(t *testing.T) {
+	m := readVendorManifest(t, corpusManifest)
+	repo := *workerProtocolRepo
+
+	if repo == "" {
+		if *requireWorkerProtocolPeer {
+			t.Fatal("-require-worker-protocol-peer is set but -worker-protocol-repo is empty: " +
+				"the corpus comparison was asked for and cannot run.")
+		}
+		t.Log("upstream corpus comparison not wired (-worker-protocol-repo unset): the digest " +
+			"and wire-minor checks above still ran, and TestCanonicalDocuments ran against " +
+			"the vendored corpus.")
+		return
+	}
+	if _, err := peerGit(t, repo, "rev-parse", "--git-dir"); err != nil {
+		t.Fatalf("-worker-protocol-repo=%q is not a git checkout: %v", repo, err)
+	}
+
+	pinnedMissing := false
+	for name, want := range m.digests {
+		blob, err := peerGit(t, repo, "show", m.commit+":"+peerCorpusDir+"/"+name)
+		if err != nil {
+			t.Errorf("cannot read %s at pinned commit %s: %v (fetch the checkout?)",
+				name, m.commit[:12], err)
+			pinnedMissing = true
+			continue
+		}
+		sum := sha256.Sum256([]byte(blob))
+		if got := hex.EncodeToString(sum[:]); got != want {
+			t.Errorf("corpus %s does not match upstream at the pinned commit %s:\n"+
+				"  vendored %s\n  upstream %s", name, m.commit[:12], want, got)
+		}
+	}
+	if pinnedMissing {
+		return
+	}
+
+	head, err := peerGit(t, repo, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("cannot resolve the checkout's HEAD: %v", err)
+	}
+	head = strings.TrimSpace(head)
+	if head == m.commit {
+		t.Logf("vendored corpus is current with %s at %s", wantRepository, head[:12])
+		return
+	}
+
+	var drifted []string
+	for name, want := range m.digests {
+		blob, err := peerGit(t, repo, "show", head+":"+peerCorpusDir+"/"+name)
+		if err != nil {
+			drifted = append(drifted, name+" (gone upstream)")
+			continue
+		}
+		sum := sha256.Sum256([]byte(blob))
+		if hex.EncodeToString(sum[:]) != want {
+			drifted = append(drifted, name)
+		}
+	}
+	if len(drifted) == 0 {
+		t.Logf("checkout is at %s, the corpus SOURCE pins %s, but the frozen bytes are identical",
+			head[:12], m.commit[:12])
+		return
+	}
+	t.Errorf("VENDORED CANONICAL CORPUS IS STALE.\n"+
+		"  vendored: %s\n  upstream: %s\n  drifted:  %s\n%s",
+		m.commit[:12], head[:12], strings.Join(drifted, ", "), reCorpusRemedy)
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"flag"
 	"math"
 	"os"
 	"path/filepath"
@@ -23,52 +22,19 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// worker-protocol's frozen corpus. CI provisions it and points
-// WORKER_PROTOCOL_FIXTURES at it; a checkout beside this repo is the local fallback.
-const localFixtureDir = "/home/fidika/cozy_v2/worker-protocol/fixtures"
-
-var workerProtocolFixtures = flag.String("worker-protocol-fixtures", "",
-	"worker-protocol's frozen fixtures/ directory; CI passes the checkout it provisioned")
-var requireWorkerProtocolFixtures = flag.Bool("require-worker-protocol-fixtures", false,
-	"a frozen corpus that is absent is a failure rather than a skip")
-
-// resolveFixtureDir returns the corpus path, or "" when there is genuinely no corpus on
-// this disk. A corpus that was PROMISED and is not there is a hard failure, never a skip:
-// this is the workspace's only automated cross-language canonical-identity check, and a
-// silent skip is indistinguishable from a pass. CI passes
-// -require-worker-protocol-fixtures once it has arranged for the corpus to exist.
-func resolveFixtureDir(t *testing.T) string {
-	t.Helper()
-	dir, required := *workerProtocolFixtures, *requireWorkerProtocolFixtures
-	if dir == "" {
-		if required {
-			t.Fatal("-require-worker-protocol-fixtures is set but -worker-protocol-fixtures " +
-				"is empty: the frozen corpus was not provisioned")
-		}
-		dir = localFixtureDir
-	} else {
-		required = true
-	}
-	if _, err := os.Stat(filepath.Join(dir, "MANIFEST.json")); err != nil {
-		if required {
-			t.Fatalf("the frozen corpus was promised at %s and is not readable: %v", dir, err)
-		}
-		return ""
-	}
-	return dir
-}
-
 // TestCanonicalDocuments is the identity fence. Every document that crosses a repo or
 // process boundary is named by the sha256 of its canonical bytes, so two independent
 // writers in two languages must produce byte-identical documents or nothing downstream —
 // digests, plan ids, terminal admission — agrees at all. It is the cheapest test here and
 // the one whose failure is least visible any other way.
+//
+// It runs ALWAYS. The corpus is vendored at testdata/worker-protocol, digest-fenced
+// by vendored_test.go, so this needs no token, no sibling checkout and no flag. It
+// used to resolve a corpus off the local disk and t.Skipf when it was absent, which
+// is how it sat green and inert on every CI run while a whole wire minor of skew
+// went unnoticed. A skip is indistinguishable from a pass.
 func TestCanonicalDocuments(t *testing.T) {
-	fixtureDir := resolveFixtureDir(t)
-	if fixtureDir == "" {
-		t.Skipf("worker-protocol's frozen corpus is not on this disk: %s "+
-			"(pass -worker-protocol-fixtures=<checkout>/fixtures to run it)", localFixtureDir)
-	}
+	fixtureDir := corpusDir
 	var manifest struct {
 		Canonical map[string]struct{ ID, Type, Document string } `json:"canonical"`
 		WireMinor uint32                                         `json:"wire_minor"`
