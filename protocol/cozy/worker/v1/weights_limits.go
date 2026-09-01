@@ -10,8 +10,9 @@ const MaxWeightsObjects = 65536
 const MaxWeightsReadBytes = 4 << 20
 const MaxWeightsGrantURLBytes = 16 << 10
 
-// MaxInlineControlBytes is the ceiling every content-bearing bound above must respect: the
-// control stream carries control, not content. See the schema header; th-094 lands the fence.
+// MaxInlineControlBytes is the ceiling every content-bearing bound here must respect: the
+// control stream carries control, not content. It has no carve-out: the tensorhub fence in
+// scripts/fence.py convicts any content-bearing bound declared above it.
 const MaxInlineControlBytes = 4 << 20
 const MaxModelSourceFiles = 4096
 const MaxModelSourceProfiles = 16
@@ -22,7 +23,5 @@ const MaxModelSourceLicenseBytes = 4096
 const MaxModelSourceURLBytes = 16 << 10
 const MaxCheckpointEvidenceBytes = 64 << 10
 const MaxPrivatePackageFiles = 33
-const MaxPrivatePackageChunkBytes = 1 << 20
 const MaxPrivatePackageFilenameBytes = 255
-const MaxPrivatePackageFileBytes = 512 << 20
-const MaxPrivatePackageAggregateBytes = 1 << 30
+const MaxPrivatePackageGrantURLBytes = 16 << 10

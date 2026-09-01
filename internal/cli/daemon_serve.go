@@ -109,6 +109,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	configDigest := localConfigDigest(ctx.Cfg)
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	transfers := newModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
+	privateWheels := newPrivateWheelOwner(ctx.Cfg, ctx.Out, ctx.AccountAuth)
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
@@ -116,6 +117,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		RentalFleet: fleet.status, AcquireManagedRental: fleet.acquire,
 		ReleaseManagedRental: fleet.release,
 		ModelTransfers:       transfers,
+		PrivateWheels:        privateWheels.grants,
 		ConfigDigest:         configDigest,
 	})
 	if e != nil {
