@@ -31,12 +31,13 @@ type DependencyWheel struct {
 }
 
 type requirement struct {
-	raw       string
-	name      string
-	extras    []string
-	specifier pep440.Specifiers
-	hasSpec   bool
-	direct    bool
+	raw        string
+	name       string
+	extras     []string
+	specifier  pep440.Specifiers
+	constraint string
+	hasSpec    bool
+	direct     bool
 }
 
 type localSource struct {
@@ -229,7 +230,7 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 			"local project declares %s==%s but its wheel declares %s==%s",
 			name, version, identity.Distribution, identity.Version)
 	}
-	return c.add(identity, built.Path)
+	return c.add(identity, built.Path, req.exactPin(version))
 }
 
 func (c *dependencyCollector) collectWheel(req requirement, source string) *exit.Error {
@@ -260,15 +261,16 @@ func (c *dependencyCollector) collectWheel(req requirement, source string) *exit
 	}
 	c.count++
 	c.byName[identity.Distribution] = dependencyRecord{source: canonical, version: identity.Version}
-	return c.add(identity, canonical)
+	return c.add(identity, canonical, req.exactPin(identity.Version))
 }
 
-func (c *dependencyCollector) add(identity wheel.Identity, path string) *exit.Error {
-	// Runtime is carried so Creator can build its independent local venv, then omitted
-	// when Runtime authors the rental placement. Every other remote base root must stay
-	// out of DependencyWheels entirely; TensorFS local custody is the exact source member
-	// referenced by uv.lock, returned separately by Tensorhub's local install plan.
-	if remoteBaseRoots[identity.Distribution] && identity.Distribution != "cozy-runtime" { //cozy:allow base distribution identity, not executable access
+func (c *dependencyCollector) add(identity wheel.Identity, path string, exactPin bool) *exit.Error {
+	// Base-owned ranges remain requirements checked against the selected base inventory;
+	// turning a compatible Runtime floor into an overlay would create patch collisions.
+	// An exact Runtime pin is retained only for the older independent-local-venv contract,
+	// where exact equality is intentional rather than a floating platform requirement.
+	if remoteBaseRoots[identity.Distribution] &&
+		!(identity.Distribution == "cozy-runtime" && exactPin) { //cozy:allow base distribution identity, not executable access
 		return nil
 	}
 	if len(c.wheels) >= MaxDependencyWheels {
@@ -371,7 +373,13 @@ func parseRequirement(raw string) (requirement, *exit.Error) {
 		return requirement{}, invalidRequirement(raw)
 	}
 	req.specifier, req.hasSpec = specifier, true
+	req.constraint = strings.TrimSpace(rest)
 	return req, nil
+}
+
+func (r requirement) exactPin(version string) bool {
+	return r.name == "cozy-runtime" && //cozy:allow base distribution identity, not executable access
+		strings.TrimSpace(r.constraint) == "=="+version
 }
 
 func invalidRequirement(raw string) *exit.Error {
