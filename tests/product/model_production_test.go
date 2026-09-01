@@ -27,6 +27,27 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
+func beginAcceptedModelProduction(t *testing.T, store *records.Store,
+	plan modelproduction.Plan,
+) records.ModelProductionOperation {
+	t.Helper()
+	instructionBytes, err := plan.Instruction.Bytes()
+	must(t, err)
+	instructionDigest, err := plan.Instruction.Digest()
+	must(t, err)
+	_, _, problem := store.BeginModelProductionInstruction(plan.ID(), instructionDigest,
+		instructionBytes)
+	fatal(t, problem)
+	planBytes, err := plan.Bytes()
+	must(t, err)
+	planDigest, err := plan.Digest()
+	must(t, err)
+	operation, _, problem := store.AttachModelProductionPlan(plan.ID(), instructionDigest,
+		instructionBytes, planBytes, planDigest)
+	fatal(t, problem)
+	return operation
+}
+
 func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.T) {
 	var stderr bytes.Buffer
 	progress := cli.NewModelProductionProgress(&stderr, true, 10)
@@ -135,6 +156,31 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 	if code != 0 || json.Unmarshal([]byte(stdout), &document) != nil || document["status"] != "planned" ||
 		strings.TrimSpace(jsonStderr) != "" {
 		t.Fatalf("JSON model production output [exit %d]\nstdout: %s\nstderr: %s", code, stdout, jsonStderr)
+	}
+}
+
+func TestUnsupportedModelProductionModesRefuseBeforeResolution(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Error(w, "model production must not resolve this mode", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
+		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\nrentals:\n  max_hourly_spend_usd: 10\n"), 0o600))
+	for _, args := range [][]string{
+		{"model", "upload", "acme/output", "acme/input@1.0.0"},
+		{"model", "upload", "acme/output", "acme/input@1.0.0", "--rental"},
+		{"model", "upload", "acme/output", "acme/input@1.0.0", "--producer", "proof/tools/build"},
+	} {
+		code, out := runCozy(t, root, args...)
+		if code == 0 || !strings.Contains(out, "requires both --rental and --producer") {
+			t.Fatalf("unsupported model production mode %#v [exit %d]\n%s", args, code, out)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("unsupported model production modes made %d resolution requests", requests)
 	}
 }
 
@@ -963,17 +1009,13 @@ func TestModelProductionJoinsStepArtifactAndTransferBeforeReplay(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
 	fatal(t, problem)
 	defer store.Close()
-	plan := modelproduction.Plan{Destination: "acme/model",
+	instruction := modelproduction.Instruction{Destination: "acme/model",
+		Source:   "hf://acme/model@" + strings.Repeat("a", 40),
+		Producer: "acme/tools/build", Rental: true}
+	plan := modelproduction.Plan{Instruction: instruction, Destination: instruction.Destination,
 		Source:          "hf://acme/model@" + strings.Repeat("a", 40),
 		SourceSelection: "sha256:" + strings.Repeat("b", 64)}
-	data, err := plan.Bytes()
-	must(t, err)
-	digest, err := plan.Digest()
-	must(t, err)
-	_, _, problem = store.BeginModelProduction(records.ModelProductionOperation{
-		ID: plan.ID(), PlanDigest: digest, Plan: data,
-	})
-	fatal(t, problem)
+	beginAcceptedModelProduction(t, store, plan)
 	_, problem = store.BeginModelProductionStep(records.ModelProductionStep{
 		OperationID: plan.ID(), StepIndex: 0, StepName: "derive", State: "pending",
 	})

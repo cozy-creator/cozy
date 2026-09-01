@@ -30,20 +30,12 @@ type productionManifest struct {
 	Length       int64
 }
 
-func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelproduction.Plan,
-	source publishSource,
+func runRentedModelProduction(ctx *Context, runCtx context.Context,
+	operation records.ModelProductionOperation, plan modelproduction.Plan, source publishSource,
 ) *exit.Error {
 	if plan.Production == nil || len(plan.Jobs) == 0 {
 		return exit.Named(exit.Structural, "model_production.plan_incomplete",
 			"rented model production requires a reviewed graph and exact jobs")
-	}
-	planBytes, err := plan.Bytes()
-	if err != nil {
-		return exit.Internalf("cannot encode the model production restart plan: %s", err)
-	}
-	planDigest, err := plan.Digest()
-	if err != nil {
-		return exit.Internalf("cannot digest the model production restart plan: %s", err)
 	}
 	ordered, problem := plan.Production.OrderedSteps()
 	if problem != nil {
@@ -55,30 +47,20 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 		return problem
 	}
 	defer store.Close()
-	operation, replay, problem := store.BeginModelProduction(records.ModelProductionOperation{
-		ID: plan.ID(), PlanDigest: planDigest, Plan: planBytes,
-	})
-	if problem != nil {
-		return problem
-	}
 	existingArtifacts, problem := productionArtifactSnapshot(store, operation.ID)
 	if problem != nil {
 		return problem
 	}
-	if replay {
-		files, readProblem := store.ModelProductionSourceFiles(operation.ID)
-		if readProblem != nil {
-			return readProblem
-		}
-		transferred, total := productionSourceProgress(files)
-		progress.SeedSourceProgress(transferred, total)
-		progress.Resume(operation.ID, productionResumeStage(operation, ordered, transferred, total,
-			len(plan.Production.Outputs)))
-	} else {
-		progress.Accepted(operation.ID, len(plan.Production.Outputs))
+	files, problem := store.ModelProductionSourceFiles(operation.ID)
+	if problem != nil {
+		return problem
 	}
+	transferred, total := productionSourceProgress(files)
+	progress.SeedSourceProgress(transferred, total)
+	progress.Resume(operation.ID, productionResumeStage(operation, ordered, transferred, total,
+		len(plan.Production.Outputs)))
 	if operation.State == "completed" || operation.State == "partial" {
-		return emitCompletedProduction(ctx, store, plan, &operation, true)
+		return emitCompletedProduction(ctx, store, plan, &operation)
 	}
 	if operation.State == "failed" || operation.State == "canceled" {
 		return exit.Named(exit.Conflict, "model_production.settled",
@@ -86,7 +68,7 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 			operation.SafeDetail)
 	}
 	if operation.State == "cleanup_pending" {
-		return resumeProductionCleanup(ctx, store, plan, operation, replay, progress)
+		return resumeProductionCleanup(ctx, store, plan, operation, progress)
 	}
 	if operation.State == "outputs_preparing" {
 		if problem := finishProductionOutputs(runCtx, store, plan, progress); problem != nil {
@@ -96,7 +78,7 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 		if problem != nil || current == nil {
 			return problem
 		}
-		return resumeProductionCleanup(ctx, store, plan, *current, replay, progress)
+		return resumeProductionCleanup(ctx, store, plan, *current, progress)
 	}
 	state, _, problem := ensureDaemon(ctx)
 	if problem != nil {
@@ -134,7 +116,7 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 	}
 	progress.WorkerReady(rentalID)
 
-	announceSource := !replay || operation.State != "source_preparing"
+	announceSource := operation.State != "source_preparing"
 	if problem = prepareProductionSource(runCtx, local, store, plan, source, rentalID,
 		progress, announceSource); problem != nil {
 		return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
@@ -294,11 +276,11 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 	if problem != nil {
 		return problem
 	}
-	return emitCompletedProduction(ctx, store, plan, current, replay)
+	return emitCompletedProduction(ctx, store, plan, current)
 }
 
 func resumeProductionCleanup(ctx *Context, store *records.Store, plan modelproduction.Plan,
-	operation records.ModelProductionOperation, replay bool, progress *productionProgress,
+	operation records.ModelProductionOperation, progress *productionProgress,
 ) *exit.Error {
 	if operation.RentalID != "" {
 		progress.RentalReleaseStarting(operation.RentalID)
@@ -313,7 +295,7 @@ func resumeProductionCleanup(ctx *Context, store *records.Store, plan modelprodu
 	if problem != nil {
 		return problem
 	}
-	return emitCompletedProduction(ctx, store, plan, settled, replay)
+	return emitCompletedProduction(ctx, store, plan, settled)
 }
 
 func ensureProductionRental(runCtx context.Context, ctx *Context, layout home.Layout, store *records.Store,
@@ -992,7 +974,7 @@ func failProduction(store *records.Store, operationID string, cause *exit.Error)
 }
 
 func emitCompletedProduction(ctx *Context, store *records.Store, plan modelproduction.Plan,
-	operation *records.ModelProductionOperation, replay bool,
+	operation *records.ModelProductionOperation,
 ) *exit.Error {
 	rentalID := ""
 	if operation != nil {
@@ -1006,7 +988,7 @@ func emitCompletedProduction(ctx *Context, store *records.Store, plan modelprodu
 		{K: "id", V: plan.ID()}, {K: "kind", V: "model-upload"},
 		{K: "model", V: plan.Destination}, {K: "checkpoints", V: checkpoints},
 		{K: "rental", V: rentalID},
-		{K: "status", V: operation.State}, {K: "changed", V: !replay},
+		{K: "status", V: operation.State}, {K: "changed", V: false},
 	}, "model", "checkpoints", "status", "changed"))
 }
 

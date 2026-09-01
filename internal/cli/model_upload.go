@@ -53,27 +53,36 @@ func handleModelUpload(ctx *Context) *exit.Error {
 		return exit.Usagef("local/ is reserved for private aliases and cannot be a Tensorhub destination").
 			WithRemedy("publish under your Tensorhub account, for example alice/%s", destination.Name)
 	}
-	if ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--detach") {
+	dryRun := ctx.Inv.Bool("--dry-run")
+	rental := ctx.Inv.Bool("--rental")
+	detach := ctx.Inv.Bool("--detach")
+	producerName := strings.TrimSpace(ctx.Inv.Value("--producer"))
+	_, manifestProblem := tfs.ManifestID(ctx.Inv.Args[1])
+	direct := producerName == "" && !rental &&
+		(strings.HasPrefix(ctx.Inv.Args[1], "local/") || manifestProblem == nil)
+
+	if dryRun && detach {
 		return exit.Usagef("--dry-run and --detach conflict: a dry-run creates no durable operation")
 	}
-	if ctx.Inv.Bool("--rental") {
+	if !dryRun && !direct && (!rental || producerName == "") {
+		return exit.Named(exit.Unavailable, "model_upload_execution_unavailable",
+			"model production execution requires both --rental and --producer").
+			WithRemedy("use --dry-run to inspect another source or producer mode")
+	}
+	if direct {
+		if detach {
+			return exit.Usagef("--detach requires a durable model production")
+		}
+		return handleDirectModelUpload(ctx)
+	}
+	if rental {
 		if problem := validateRunPlacement(ctx); problem != nil {
 			return problem
 		}
 	}
-	producerName := strings.TrimSpace(ctx.Inv.Value("--producer"))
 	if producerName != "" {
 		if _, problem := parseProductionCallable(producerName); problem != nil {
 			return problem
-		}
-	}
-	if producerName == "" && !ctx.Inv.Bool("--rental") {
-		_, manifestProblem := tfs.ManifestID(ctx.Inv.Args[1])
-		if strings.HasPrefix(ctx.Inv.Args[1], "local/") || manifestProblem == nil {
-			if ctx.Inv.Bool("--detach") {
-				return exit.Usagef("--detach requires a durable model production")
-			}
-			return handleDirectModelUpload(ctx)
 		}
 	}
 	instructionSource, problem := canonicalProductionSource(ctx, ctx.Inv.Args[1])
@@ -82,8 +91,8 @@ func handleModelUpload(ctx *Context) *exit.Error {
 	}
 	instruction := modelproduction.Instruction{Destination: destination.String(),
 		Source: instructionSource, InputLane: strings.TrimSpace(ctx.Inv.Value("--lane")),
-		Producer: producerName, Rental: ctx.Inv.Bool("--rental")}
-	if !ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--rental") && producerName != "" {
+		Producer: producerName, Rental: rental}
+	if !dryRun {
 		daemonState, _, problem := ensureDaemon(ctx)
 		if problem != nil {
 			return problem
@@ -97,7 +106,7 @@ func handleModelUpload(ctx *Context) *exit.Error {
 		if problem != nil {
 			return problem
 		}
-		if ctx.Inv.Bool("--detach") {
+		if detach {
 			return emitModelProductionState(ctx, productionState, productionState.Changed)
 		}
 		return followModelProduction(ctx, local, productionState)
@@ -125,38 +134,33 @@ func handleModelUpload(ctx *Context) *exit.Error {
 		plan.Production, plan.Jobs = producer.Production, producer.Jobs
 		plan.Resources = producer.Needs
 	}
-	id := plan.ID()
-	if ctx.Inv.Bool("--dry-run") {
-		if _, problem := ownedPublication(ctx, destination); problem != nil {
-			return problem
-		}
-		fields := []output.Field{
-			{K: "id", V: id}, {K: "kind", V: "model-upload"},
-			{K: "model", V: destination.String()},
-			{K: "source", V: source.Canonical}, {K: "source_selection", V: source.Selection},
-			{K: "source_files", V: source.Files}, {K: "source_bytes", V: output.Bytes(source.Bytes)},
-			{K: "status", V: "planned"}, {K: "changed", V: false},
-		}
-		if producer != nil {
-			fields = append(fields,
-				output.Field{K: "producer", V: producer.Name + "@" + producer.Release},
-				output.Field{K: "production", V: producer.Production.Name},
-				output.Field{K: "source_profiles", V: plan.SourceProfiles()},
-				output.Field{K: "steps", V: len(producer.Jobs)},
-				output.Field{K: "outputs", V: plan.OutputNames()},
-				output.Field{K: "gpu_count", V: producer.GPUCount},
-				output.Field{K: "requires", V: producer.Requires},
-			)
-		}
-		defaults := []string{"id", "kind", "model", "source"}
-		if producer != nil {
-			defaults = append(defaults, "producer", "production", "outputs")
-		}
-		defaults = append(defaults, "status", "changed")
-		return emit(ctx, compactRecord(fields, defaults...))
+	if _, problem := ownedPublication(ctx, destination); problem != nil {
+		return problem
 	}
-	return exit.Named(exit.Unavailable, "model_upload_execution_unavailable",
-		"model upload %s is planned, but this build cannot yet submit its durable source upload", id)
+	fields := []output.Field{
+		{K: "id", V: plan.ID()}, {K: "kind", V: "model-upload"},
+		{K: "model", V: destination.String()},
+		{K: "source", V: source.Canonical}, {K: "source_selection", V: source.Selection},
+		{K: "source_files", V: source.Files}, {K: "source_bytes", V: output.Bytes(source.Bytes)},
+		{K: "status", V: "planned"}, {K: "changed", V: false},
+	}
+	if producer != nil {
+		fields = append(fields,
+			output.Field{K: "producer", V: producer.Name + "@" + producer.Release},
+			output.Field{K: "production", V: producer.Production.Name},
+			output.Field{K: "source_profiles", V: plan.SourceProfiles()},
+			output.Field{K: "steps", V: len(producer.Jobs)},
+			output.Field{K: "outputs", V: plan.OutputNames()},
+			output.Field{K: "gpu_count", V: producer.GPUCount},
+			output.Field{K: "requires", V: producer.Requires},
+		)
+	}
+	defaults := []string{"id", "kind", "model", "source"}
+	if producer != nil {
+		defaults = append(defaults, "producer", "production", "outputs")
+	}
+	defaults = append(defaults, "status", "changed")
+	return emit(ctx, compactRecord(fields, defaults...))
 }
 
 func canonicalProductionSource(ctx *Context, raw string) (string, *exit.Error) {

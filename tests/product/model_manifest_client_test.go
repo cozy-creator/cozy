@@ -269,7 +269,7 @@ func TestPublicationFinalizesCheckpointThenUpdatesLaneMap(t *testing.T) {
 			if r.Method != http.MethodPost || r.URL.Path != "/v1/models/acme/model/publications/manifest-proof/grants" {
 				t.Fatalf("grant request = %s %s", r.Method, r.URL.Path)
 			}
-			_, _ = io.WriteString(w, `{"grants":[],"held":[{"transfer_id":"transfer-proof","object_id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","length":7,"state":"accepted","received_bytes":7,"verified_bytes":7,"last_progress_at":"2026-08-31T00:00:00Z","accepted_at":"2026-08-31T00:00:00Z"}]}`)
+			_, _ = io.WriteString(w, `{"grants":[],"held":[{"transfer_id":"transfer-proof","object_id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","length":7,"state":"accepted"}]}`)
 		case 3:
 			if r.Method != http.MethodPost || r.URL.Path != "/v1/models/acme/model/publications/manifest-proof/finalize" {
 				t.Fatalf("finalize request = %s %s", r.Method, r.URL.Path)
@@ -312,7 +312,9 @@ func TestPublicationFinalizesCheckpointThenUpdatesLaneMap(t *testing.T) {
 	}
 	granted, problem := client.GrantKnownTransfers(context.Background(), ref, "manifest-proof",
 		[]string{"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, "proof")
-	if problem != nil || len(granted.Grants) != 0 || len(granted.Held) != 1 || granted.Held[0].VerifiedBytes != 7 {
+	if problem != nil || len(granted.Grants) != 0 || len(granted.Held) != 1 ||
+		granted.Held[0].TransferID != "transfer-proof" || granted.Held[0].State != "accepted" ||
+		granted.Held[0].Length != 7 {
 		t.Fatalf("GrantKnownTransfers = %#v, %v", granted, problem)
 	}
 	checkpoint, problem := client.FinalizePublication(context.Background(), ref, "manifest-proof",

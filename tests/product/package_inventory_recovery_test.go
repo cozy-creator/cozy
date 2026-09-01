@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/modelproduction"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -30,11 +31,13 @@ func TestRecordsSchemasSixThroughEightMigrateWithoutDroppingDurableRows(t *testi
 				MediaAddress: "127.0.0.1:9444", ExpectedWorkerID: "worker-proof",
 				ExpectedWorkerBootID: "boot-proof"}
 			fatal(t, store.RecordRental(rental))
-			_, _, problem = store.BeginModelProduction(records.ModelProductionOperation{
-				ID: "modelupload-pre-account", PlanDigest: "sha256:" + strings.Repeat("c", 64),
-				Plan: []byte(`{}`),
+			instruction := modelproduction.Instruction{Destination: "proof/migrate",
+				Source:   "hf://proof/source@" + strings.Repeat("c", 40),
+				Producer: "proof/tools/build", Rental: true}
+			beginAcceptedModelProduction(t, store, modelproduction.Plan{
+				Instruction: instruction, Destination: instruction.Destination,
+				Source: instruction.Source,
 			})
-			fatal(t, problem)
 			store.Close()
 			db, err := sql.Open("sqlite", database)
 			must(t, err)
