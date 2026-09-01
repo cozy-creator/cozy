@@ -181,9 +181,6 @@ def red_vectors() -> dict[str, tuple[bytes, str]]:
         value[2].sort(key=lambda row: row[0])
         return value
 
-    asset_case_collision = copy.deepcopy(asset_source)
-    asset_case_collision[2][0][0] = "A/x"
-    asset_case_collision[2][1][0] = "a/x"
     return {
         "old-json": (
             (GREEN / "minimal-inline.json").read_bytes(),
@@ -317,14 +314,6 @@ def red_vectors() -> dict[str, tuple[bytes, str]]:
         "asset-reserved-character": (
             cbor2.dumps(bad_asset("a\\b"), canonical=True),
             "asset names exclude reserved characters",
-        ),
-        "asset-windows-reserved": (
-            cbor2.dumps(bad_asset("NUL.txt"), canonical=True),
-            "asset names exclude Windows-reserved stems",
-        ),
-        "asset-case-collision": (
-            cbor2.dumps(asset_case_collision, canonical=True),
-            "asset names are unique under ASCII case-folding",
         ),
         "truncated": (minimal[:-1], "truncated input is forbidden"),
     }

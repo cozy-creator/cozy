@@ -42,15 +42,6 @@ MAX_TOTAL_REFS = 65_536
 MAX_TOTAL_BYTES = 1 << 50
 INLINE_MAX = 256
 U64_MAX = (1 << 64) - 1
-RESERVED_STEMS = {
-    "con",
-    "prn",
-    "aux",
-    "nul",
-    *(f"com{i}" for i in range(1, 10)),
-    *(f"lpt{i}" for i in range(1, 10)),
-}
-
 
 class Refusal(ValueError):
     def __init__(self, code: str, detail: str) -> None:
@@ -101,8 +92,6 @@ def asset_name(value: Any, where: str) -> str:
             refuse("TEXT_GRAMMAR", f"{where} has a reserved edge")
         if any(c in '\\:*?"<>|' for c in component):
             refuse("TEXT_GRAMMAR", f"{where} has a reserved character")
-        if component.split(".", 1)[0].lower() in RESERVED_STEMS:
-            refuse("TEXT_GRAMMAR", f"{where} has a Windows-reserved stem")
     return value
 
 
@@ -395,9 +384,6 @@ def normalize_header(document: Any, *, diagnostic: bool = False) -> list[Any]:
             ]
         )
     sorted_unique(assets, 0, "assets")
-    folded_assets = [asset[0].lower() for asset in assets]
-    if len(folded_assets) != len(set(folded_assets)):
-        refuse("DUPLICATE_KEY", "asset names collide under ASCII case-folding")
 
     encodings = [
         encoding_spec(v, f"encodings[{i}]", diagnostic=diagnostic)

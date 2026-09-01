@@ -1,4 +1,0 @@
-doc: manifest
-expect: refuse
-code: PATH_CASE_COLLISION
-note: portable paths cannot collide under ASCII case folding

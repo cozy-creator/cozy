@@ -1674,34 +1674,6 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     ));
     let mut draft = Draft::of(&snap);
     draft.entries.push((
-        "TOKENIZER.MODEL".to_string(),
-        Entry::File(ObjectRef::of(b"case")),
-    ));
-    draft.entries.sort_by(|left, right| left.0.cmp(&right.0));
-    cases.push(red_case(
-        "manifest-red",
-        "case-collision",
-        "manifest",
-        draft.canonical_bytes(),
-        "PATH_CASE_COLLISION",
-        "portable paths cannot collide under ASCII case folding",
-    ));
-    let mut draft = Draft::of(&snap);
-    draft.entries.push((
-        "CON.txt".to_string(),
-        Entry::File(ObjectRef::of(b"reserved")),
-    ));
-    draft.entries.sort_by(|left, right| left.0.cmp(&right.0));
-    cases.push(red_case(
-        "manifest-red",
-        "windows-reserved",
-        "manifest",
-        draft.canonical_bytes(),
-        "PATH_RESERVED",
-        "portable paths reject Windows reserved stems",
-    ));
-    let mut draft = Draft::of(&snap);
-    draft.entries.push((
         "model2.cozytensors".to_string(),
         Entry::CozyTensors(ha.object_ref()?),
     ));

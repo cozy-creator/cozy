@@ -49,12 +49,55 @@ fn relative(from_dir: &Path, to: &Path) -> PathBuf {
 /// are relative symlinks where possible; `force_copy` writes small read-only copies.
 /// Tensor payload segments are transitive CAS objects, not manifest entries, and never
 /// appear in this disposable view.
+/// Windows device stems. A manifest may legitimately name `aux.json` or `nul.safetensors`
+/// — real HuggingFace trees do — and a virtual tree is not entitled to a filesystem's
+/// opinions. A CHECKOUT is, because it writes real files, so the law lives here.
+const RESERVED: [&str; 22] = [
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// The two rules a real filesystem imposes that a manifest key does not: portable paths
+/// cannot use a Windows device stem, and two entries cannot case-fold onto one file. Both
+/// are checked before a single byte is written, so a refused checkout leaves nothing.
+fn portable_on_disk(manifest: &Manifest) -> Result<()> {
+    let mut folded: Vec<String> = Vec::with_capacity(manifest.entries().len());
+    for (path, _) in manifest.entries() {
+        for component in path.split('/') {
+            let stem = component
+                .split('.')
+                .next()
+                .unwrap_or(component)
+                .to_ascii_lowercase();
+            if RESERVED.contains(&stem.as_str()) {
+                return refuse(
+                    Code::PATH_RESERVED,
+                    format!("{path:?}: Windows reserved stem {stem:?} cannot be checked out"),
+                );
+            }
+        }
+        folded.push(path.to_ascii_lowercase());
+    }
+    folded.sort();
+    if let Some(pair) = folded.windows(2).find(|pair| pair[0] == pair[1]) {
+        return refuse(
+            Code::PATH_CASE_COLLISION,
+            format!(
+                "two entries case-fold onto {:?}; one checkout directory cannot hold both",
+                pair[0]
+            ),
+        );
+    }
+    Ok(())
+}
+
 pub fn checkout(
     store: &Store,
     manifest: &Manifest,
     destination: &Path,
     force_copy: bool,
 ) -> Result<Checkout> {
+    portable_on_disk(manifest)?;
     fs::create_dir_all(destination).map_err(|error| io("mkdir checkout", error))?;
     let destination = destination
         .canonicalize()
@@ -342,6 +385,38 @@ mod tests {
         }
         assert_eq!(fs::read_dir(&destination).unwrap().count(), 2);
         fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    /// The manifest itself admits both — a virtual tree has no device files and no case
+    /// folding — and the checkout is where a real filesystem gets its say.
+    #[test]
+    fn manifest_admits_windows_hostile_paths_that_checkout_refuses() {
+        let root = temporary("windows-hostile");
+        let store = Store::init(&root).unwrap();
+        let blob = put(&store, b"payload");
+        for (entries, code) in [
+            (
+                vec![
+                    ("aux.json".to_string(), Entry::File(blob.clone())),
+                    ("nul.safetensors".to_string(), Entry::File(blob.clone())),
+                ],
+                Code::PATH_RESERVED,
+            ),
+            (
+                vec![
+                    ("Config.json".to_string(), Entry::File(blob.clone())),
+                    ("config.json".to_string(), Entry::File(blob.clone())),
+                ],
+                Code::PATH_CASE_COLLISION,
+            ),
+        ] {
+            let manifest = Draft { entries }.seal().unwrap();
+            let destination = root.join(format!("checkout-{}", code.as_str()));
+            let error = checkout(&store, &manifest, &destination, false).unwrap_err();
+            assert_eq!(error.code, code);
+            assert!(!destination.exists(), "a refused checkout wrote nothing");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
