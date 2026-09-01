@@ -249,7 +249,7 @@ func handleModelList(ctx *Context) *exit.Error {
 		return problem
 	}
 	list := output.List{
-		Name: "models", Fields: []string{"model", "release", "lane", "manifest_id"},
+		Name: "models", Fields: []string{"model", "release", "lane"},
 		AllFields: []string{"model", "kind", "release", "lane", "manifest_id"},
 	}
 	for _, release := range releases {

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/accountauth"
@@ -42,8 +43,11 @@ func handleModelSearch(ctx *Context) *exit.Error   { return handleResourceSearch
 
 func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	if len(ctx.Inv.Args) == 1 {
-		if _, problem := hub.ParseRef(ctx.Inv.Args[0]); problem == nil {
-			return handleResourceShow(ctx, kind)
+		if ref, problem := hub.ParseRef(ctx.Inv.Args[0]); problem == nil {
+			if kind == "model" {
+				return handleModelShow(ctx, ref)
+			}
+			return handlePackageShow(ctx, ref)
 		}
 	}
 	query := strings.ToLower(strings.TrimSpace(strings.Join(ctx.Inv.Args, " ")))
@@ -73,16 +77,24 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 		resources = resources[:limit]
 	}
 
-	l := output.List{
-		Name:      kind + "s",
-		Fields:    []string{"ref"},
-		AllFields: []string{"ref", "created", "org", "name"},
-		Total:     search.Total,
+	l := output.List{Name: kind + "s", Fields: []string{"ref"},
+		AllFields: []string{"ref", "created", "org", "name"}, Total: search.Total}
+	if kind == "model" {
+		l.Fields = []string{"model", "lanes"}
+		l.AllFields = []string{"model", "lanes", "created", "org", "name"}
 	}
 	for _, r := range resources {
-		l.Rows = append(l.Rows, map[string]string{
+		row := map[string]string{
 			"ref": r.Ref(), "created": stamp(r.CreatedAt), "org": r.Org, "name": r.Name,
-		})
+		}
+		if kind == "model" {
+			card, problem := c.ModelCard(hctx, hub.Ref{Org: r.Org, Name: r.Name})
+			if problem != nil {
+				return problem
+			}
+			row = modelSearchRow(card)
+		}
+		l.Rows = append(l.Rows, row)
 	}
 
 	// The public listing is a whole-catalog read filtered here. That is honest at a
@@ -101,31 +113,60 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	return emit(ctx, l)
 }
 
-func handleResourceShow(ctx *Context, kind string) *exit.Error {
-	ref, e := hub.ParseRef(ctx.Inv.Args[0])
-	if e != nil {
-		return e
-	}
+func handleModelShow(ctx *Context, ref hub.Ref) *exit.Error {
 	c := client(ctx)
 	hctx, cancel := hub.Context()
 	defer cancel()
-	var r hub.Resource
-	if kind == "package" {
-		r, e = c.Package(hctx, ref)
-	} else {
-		r, e = c.Model(hctx, ref)
+	card, problem := c.ModelCard(hctx, ref)
+	if problem != nil {
+		return problem
 	}
+	return emit(ctx, output.List{
+		Name: "models", Fields: []string{"model", "lanes"},
+		AllFields: []string{"model", "lanes", "created", "org", "name"},
+		Rows:      []map[string]string{modelSearchRow(card)}, Total: 1,
+	})
+}
+
+func modelSearchRow(card hub.ModelCard) map[string]string {
+	seen := map[string]bool{}
+	for _, release := range card.Releases {
+		if release.Yanked {
+			continue
+		}
+		releaseName := strings.TrimSpace(release.Release)
+		if releaseName == "" {
+			continue
+		}
+		for _, lane := range release.Lanes {
+			if name := strings.TrimSpace(lane.Lane); name != "" {
+				seen[releaseName+"/"+name] = true
+			}
+		}
+	}
+	coordinates := make([]string, 0, len(seen))
+	for coordinate := range seen {
+		coordinates = append(coordinates, coordinate)
+	}
+	sort.Strings(coordinates)
+	return map[string]string{
+		"model": card.Model.Ref(), "lanes": strings.Join(coordinates, ", "),
+		"created": stamp(card.Model.CreatedAt), "org": card.Model.Org, "name": card.Model.Name,
+	}
+}
+
+func handlePackageShow(ctx *Context, ref hub.Ref) *exit.Error {
+	c := client(ctx)
+	hctx, cancel := hub.Context()
+	defer cancel()
+	r, e := c.Package(hctx, ref)
 	if e != nil {
 		return e
 	}
-	rec := output.Record{
+	return emit(ctx, output.Record{
 		Fields: []output.Field{
 			{K: "ref", V: r.Ref()},
 			{K: "created", V: stamp(r.CreatedAt)},
 		},
-	}
-	if kind == "model" {
-		rec.Next = []string{"cozy model download " + r.Ref()}
-	}
-	return emit(ctx, rec)
+	})
 }
