@@ -193,7 +193,7 @@ type RunExecuteCmd struct {
 	Out            string   `help:"Output directory." type:"path"`
 	Timeout        string   `help:"Request deadline."`
 	Stream         bool     `help:"Emit typed progress deltas."`
-	PayloadFile    string   `name:"in" help:"Read the whole payload from JSON." type:"path"`
+	PayloadFile    string   `name:"in" help:"Read the whole payload from a JSON file, e.g. --in request.json." type:"path"`
 	Assets         []string `name:"asset" help:"Bind a local asset as field-path=file."`
 	Models         []string `name:"model" help:"Bind a model: --model org/model@release for one slot; --model slot=org/model@release for named slots."`
 	Rental         bool     `help:"Run on a Creator-managed rental."`

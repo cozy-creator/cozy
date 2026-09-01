@@ -82,6 +82,24 @@ func TestPublishedPackageEnvironmentsKeepPythonAndTorchIndependent(t *testing.T)
 	}
 }
 
+func TestModelPrefetchStatusMakesLocalReuseClearWithoutIdentityNoise(t *testing.T) {
+	cases := []struct {
+		models []install.PublishedModel
+		want   string
+	}{
+		{want: "none"},
+		{models: []install.PublishedModel{{}}, want: "downloaded"},
+		{models: []install.PublishedModel{{Reused: true}}, want: "reused locally"},
+		{models: []install.PublishedModel{{Reused: true}, {}}, want: "downloaded + local reuse"},
+	}
+	for _, tc := range cases {
+		got := install.ModelPrefetchStatus(tc.models)
+		if got != tc.want || strings.Contains(got, "sha256") {
+			t.Fatalf("prefetch status = %q, want %q without digest noise", got, tc.want)
+		}
+	}
+}
+
 func quote(value string) string {
 	return `"` + strings.ReplaceAll(value, `"`, `\"`) + `"`
 }

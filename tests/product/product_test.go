@@ -155,6 +155,7 @@ func TestPackagePublishMetadataGrammar(t *testing.T) {
 		!strings.Contains(help, "org/package[/function]") || !strings.Contains(help, "--await") ||
 		!strings.Contains(help, "--model org/model@release") ||
 		!strings.Contains(help, "--model slot=org/model@release") ||
+		!strings.Contains(help, "JSON file") || !strings.Contains(help, "--in request.json") ||
 		strings.Contains(help, "--detach") || strings.Contains(help, "--wait") ||
 		strings.Contains(help, "--force-rental") {
 		t.Fatalf("run retained versioned target grammar [exit %d]\n%s", code, help)

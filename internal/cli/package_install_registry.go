@@ -156,11 +156,7 @@ func bestEffortDefaultModels(hctx context.Context, ctx *Context, root, runtimeBi
 			"package code is installed; default model prefetch failed: "+problem.Message)
 		return
 	}
-	if len(published.Models) == 0 {
-		result.ModelStatus = "none"
-		return
-	}
-	result.ModelStatus = "ready"
+	result.ModelStatus = install.ModelPrefetchStatus(published.Models)
 }
 
 func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
@@ -314,7 +310,7 @@ func downloadPublishedPackageModels(ctx context.Context, cli *Context, root, run
 	}
 	hubClient := client(cli)
 	for index, binding := range bindings {
-		packagePublishStatus(cli, "Downloading model %s...", binding.Ref)
+		packagePublishStatus(cli, "Resolving model %s...", binding.Ref)
 		selected, problem := acquirePublishedModel(ctx, cli, tool, hubClient,
 			binding.Ref, binding.Lane, published.Package, binding.ModelBindingPath,
 			filepath.Join(root, "models", fmt.Sprintf("%03d", index)))
@@ -338,7 +334,7 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 	} else if ok {
 		return install.PublishedModel{Package: packageName, Slot: slot, Model: local.Model,
 			Release: local.Release, Lane: local.Lane, Manifest: local.Manifest,
-			ManifestLength: local.ManifestLength}, nil
+			ManifestLength: local.ManifestLength, Reused: true}, nil
 	}
 	fetch := &transfer.Fetch{Tool: tool, Hub: hubClient, Spec: spec, Lane: lane,
 		Progress: progress(cli), Scratch: work}
@@ -360,7 +356,7 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 	}
 	return install.PublishedModel{Package: packageName, Slot: slot, Model: fetch.Ref.String(),
 		Release: fetched.Release, Lane: fetched.Lane, Manifest: fetched.ManifestID,
-		ManifestLength: fetched.ManifestLength}, nil
+		ManifestLength: fetched.ManifestLength, Reused: fetched.Moved == 0}, nil
 }
 
 type localModelSelection struct {

@@ -71,6 +71,29 @@ type PublishedModel struct {
 	Package        string `json:"package"`
 	Release        string `json:"release"`
 	Slot           string `json:"slot"`
+	Reused         bool   `json:"-"`
+}
+
+// ModelPrefetchStatus is the concise user-facing result of optional post-install
+// acquisition. Exact identities remain in the package/Manifest authorities, not output.
+func ModelPrefetchStatus(models []PublishedModel) string {
+	if len(models) == 0 {
+		return "none"
+	}
+	reused := 0
+	for _, model := range models {
+		if model.Reused {
+			reused++
+		}
+	}
+	switch reused {
+	case 0:
+		return "downloaded"
+	case len(models):
+		return "reused locally"
+	default:
+		return "downloaded + local reuse"
+	}
 }
 
 type PublishedWheel struct {
