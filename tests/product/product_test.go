@@ -587,6 +587,38 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 	}
 }
 
+func TestPackagePublishPrunesRuntimeOwnedTensorFS(t *testing.T) {
+	parent := t.TempDir()
+	project := filepath.Join(parent, "modeled")
+	runtimeFixture := filepath.Join(parent, "runtime-fixture")
+	tensorFSFixture := filepath.Join(parent, "tensorfs")
+	writeRuntimeFixture(t, runtimeFixture)
+	writePublishProject(t, tensorFSFixture, "tensorfs", "0.0.6", nil, "", false)
+	appendProjectTOML(t, runtimeFixture,
+		"\n[project.optional-dependencies]\nmodel-execution = [\"tensorfs==0.0.6\"]\n")
+	writePublishProject(t, project, "modeled", "1.0.0",
+		[]string{"cozy-runtime[model-execution]==0.0.11"},
+		fmt.Sprintf("cozy-runtime = { path = %q, editable = true }\n"+
+			"tensorfs = { path = %q, editable = true }\n", runtimeFixture, tensorFSFixture), true)
+	appendProjectTOML(t, project,
+		"\n[dependency-groups]\ndev = [\"tensorfs==0.0.6\"]\n")
+	lockPublishProject(t, project)
+
+	pack, problem := preparePublishPackage(project)
+	if problem != nil {
+		t.Fatalf("%s: %s", problem.Message, problem.Remedy)
+	}
+	defer pack.Close()
+	if len(pack.DependencyWheels) != 1 {
+		t.Fatalf("modeled package emitted %d dependency wheels, want only Runtime", len(pack.DependencyWheels))
+	}
+	identity, problem := wheel.InspectIdentity(pack.DependencyWheels[0].Path)
+	fatal(t, problem)
+	if identity.Distribution != "cozy-runtime" { //cozy:allow distribution assertion, not executable access
+		t.Fatalf("production overlay retained base-owned TensorFS: %+v", identity)
+	}
+}
+
 func TestPackagePublishDownloadsLockedRegistryDependency(t *testing.T) {
 	project := copyRegistryDependencyFixture(t)
 	pack, problem := preparePublishPackage(project)
