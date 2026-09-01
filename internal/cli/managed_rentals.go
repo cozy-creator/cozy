@@ -401,15 +401,10 @@ func (m *managedRentals) reconcileLocked() *exit.Error {
 		remote, observed := client(m.ctx).Rental(hctx, row.ID)
 		cancel()
 		if observed != nil {
-			if observed.Code == exit.NotFound {
-				m.cancelIdleReleaseLocked(row.ID)
-				if m.owner != nil {
-					m.owner.DetachRental(row.ID)
-				}
-				if _, problem := rental.Forget(m.layout, m.store, row.ID); problem != nil {
-					return problem
-				}
-				continue
+			if observed.ErrName() == "rental.not_found" {
+				return exit.Named(exit.Conflict, "rental.hub_record_missing",
+					"Tensorhub no longer has rental %s, but this host still has its non-released record", row.ID).
+					WithRemedy("reconcile Tensorhub with its provider before retrying; do not forget this rental or rent replacement capacity until its provider resource is confirmed released")
 			}
 			return observed
 		}
