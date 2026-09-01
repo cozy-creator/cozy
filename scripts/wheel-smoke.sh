@@ -109,6 +109,10 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
+    expected = {
+        "expected_topology": tensorfs.topology_digest(info["header"]),
+        "expected_encodings": sorted(row["id"] for row in header["encodings"]),
+    }
     repo_bytes = operation.commit_release(
         None, "1.0.0", "cpu", snap, len(info["manifest"]), evidence
     )
@@ -124,7 +128,7 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
     }
     local_a = destination.replace_local(
         None, "dev-model", "sha256:" + "11" * 32,
-        snap, len(info["manifest"]), evidence,
+        snap, len(info["manifest"]), evidence, **expected,
     )
     assert destination.resolve_local("dev-model") == {
         "name": "dev-model",
@@ -134,18 +138,31 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
     }
     local_b = destination.replace_local(
         local_a, "dev-model", "sha256:" + "22" * 32,
-        snap, len(info["manifest"]), evidence,
+        snap, len(info["manifest"]), evidence, **expected,
     )
     assert destination.repo_get("local", "dev-model") == local_b
     assert destination.resolve_local("dev-model")["source_selection"] == "sha256:" + "22" * 32
     try:
         destination.replace_local(
             local_a, "dev-model", "sha256:" + "33" * 32,
-            snap, len(info["manifest"]), evidence,
+            snap, len(info["manifest"]), evidence, **expected,
         )
         raise AssertionError("stale local alias replacement succeeded")
     except tensorfs.errors.RepositoryConflict:
         pass
+    for bad, error in [
+        ({**expected, "expected_topology": "sha256:" + "aa" * 32}, tensorfs.errors.TopologyMismatch),
+        ({**expected, "expected_encodings": ["sha256:" + "bb" * 32]}, tensorfs.errors.EncodingMismatch),
+        ({**expected, "expected_encodings": ["plain/1"]}, tensorfs.errors.MalformedDigest),
+    ]:
+        try:
+            destination.replace_local(
+                local_b, "dev-model", "sha256:" + "44" * 32,
+                snap, len(info["manifest"]), evidence, **bad,
+            )
+            raise AssertionError("wrong local output contract replaced the alias")
+        except error:
+            assert destination.repo_get("local", "dev-model") == local_b
     destination.remove_local(local_b, "dev-model")
     try:
         destination.resolve_local("dev-model")

@@ -9,7 +9,7 @@ use tensorfs_core::header::{Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::{Draft, Entry, Manifest};
 use tensorfs_core::repository::{CheckpointEvidence, Mutation, ReleaseLane, Repository};
-use tensorfs_core::store::{Fault, Store, Verdict};
+use tensorfs_core::store::{ExpectedCheckpointContract, Fault, Store, Verdict};
 
 fn temporary(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -215,6 +215,13 @@ fn local_alias_is_one_atomic_replaceable_checkpoint() {
 
     let evidence_path = root.join("evidence.json");
     fs::write(&evidence_path, evidence_b.canonical_bytes()).unwrap();
+    let header = tensorfs_core::checkpoint::load_header(
+        &store,
+        store.read_manifest(&manifest_b).unwrap().header().unwrap(),
+    )
+    .unwrap();
+    let topology = header.topology_digest();
+    let encoding = header.encodings[0].object_id();
     let replace = Command::new(env!("CARGO_BIN_EXE_tfs"))
         .args([
             "local",
@@ -228,6 +235,10 @@ fn local_alias_is_one_atomic_replaceable_checkpoint() {
             &format!("sha256:{}", alias_b.document_sha256()),
             "--evidence",
             evidence_path.to_str().unwrap(),
+            "--expected-topology",
+            &topology,
+            "--expected-encoding",
+            &encoding,
         ])
         .output()
         .unwrap();
@@ -263,6 +274,142 @@ fn local_alias_is_one_atomic_replaceable_checkpoint() {
         remove.status.success(),
         "{}",
         String::from_utf8_lossy(&remove.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn expected_local_contract_gates_positive_mismatch_replay_and_cas() {
+    let root = temporary("local-contract");
+    let store = Store::init(&root).unwrap();
+    let repo = tensorfs_core::repository::RepositoryName::new("local", "contract").unwrap();
+    let (manifest_a, evidence_a) = model_fixture(&store, [0, 0, 0, 0]);
+    let (manifest_b, evidence_b) = model_fixture(&store, [0, 0, 128, 63]);
+    let topology = evidence_b.classification_digest.clone();
+    let encoding = tensorfs_core::registry::seeds()
+        .into_iter()
+        .find(|seed| seed.alias == "plain/1")
+        .unwrap()
+        .spec
+        .object_id();
+    let expected =
+        ExpectedCheckpointContract::optional(Some(&topology), Some(vec![encoding.clone()]))
+            .unwrap()
+            .unwrap();
+    let mutation_a = Mutation::ReplaceLocal {
+        repo: repo.clone(),
+        manifest: manifest_a,
+        version: "11".repeat(32),
+        evidence: Box::new(evidence_a),
+    };
+    let alias_a = store
+        .apply_repository(None, &mutation_a, &Fault::default())
+        .unwrap()
+        .unwrap()
+        .canonical_bytes();
+
+    let mutation_b = Mutation::ReplaceLocal {
+        repo: repo.clone(),
+        manifest: manifest_b.clone(),
+        version: "22".repeat(32),
+        evidence: Box::new(evidence_b),
+    };
+    let alias_b = store
+        .apply_repository_with_expected_local(
+            Some(&alias_a),
+            &mutation_b,
+            Some(&expected),
+            &Fault::default(),
+        )
+        .unwrap()
+        .unwrap()
+        .canonical_bytes();
+    let alias_path = store.repository_path(&repo);
+    assert_eq!(fs::read(&alias_path).unwrap(), alias_b);
+
+    // Exact replay is the same Repository bytes and does not invent a generation.
+    let replay = store
+        .apply_repository_with_expected_local(
+            Some(&alias_b),
+            &mutation_b,
+            Some(&expected),
+            &Fault::default(),
+        )
+        .unwrap()
+        .unwrap()
+        .canonical_bytes();
+    assert_eq!(replay, alias_b);
+
+    let rejects =
+        |observed: &[u8], contract: &ExpectedCheckpointContract, code: tensorfs_core::err::Code| {
+            assert_eq!(
+                store
+                    .apply_repository_with_expected_local(
+                        Some(observed),
+                        &mutation_b,
+                        Some(contract),
+                        &Fault::default(),
+                    )
+                    .unwrap_err()
+                    .code,
+                code
+            );
+            assert_eq!(fs::read(&alias_path).unwrap(), alias_b);
+        };
+
+    let wrong_topology = ExpectedCheckpointContract::optional(
+        Some(&format!("sha256:{}", "aa".repeat(32))),
+        Some(vec![encoding]),
+    )
+    .unwrap()
+    .unwrap();
+    rejects(
+        &alias_b,
+        &wrong_topology,
+        tensorfs_core::err::Code::TOPOLOGY_MISMATCH,
+    );
+
+    let wrong_encoding = ExpectedCheckpointContract::optional(
+        Some(&topology),
+        Some(vec![format!("sha256:{}", "bb".repeat(32))]),
+    )
+    .unwrap()
+    .unwrap();
+    rejects(
+        &alias_b,
+        &wrong_encoding,
+        tensorfs_core::err::Code::ENCODING_MISMATCH,
+    );
+
+    assert_eq!(
+        ExpectedCheckpointContract::optional(Some(&topology), Some(vec!["plain/1".into()]),)
+            .unwrap_err()
+            .code,
+        tensorfs_core::err::Code::MALFORMED_DIGEST
+    );
+    for encoding_ids in [
+        vec![
+            format!("sha256:{}", "bb".repeat(32)),
+            format!("sha256:{}", "aa".repeat(32)),
+        ],
+        vec![
+            format!("sha256:{}", "aa".repeat(32)),
+            format!("sha256:{}", "aa".repeat(32)),
+        ],
+    ] {
+        assert_eq!(
+            ExpectedCheckpointContract::optional(Some(&topology), Some(encoding_ids))
+                .unwrap_err()
+                .code,
+            tensorfs_core::err::Code::SORT_ORDER
+        );
+    }
+
+    // A correct artifact contract never weakens the caller's observed-bytes CAS.
+    rejects(
+        &alias_a,
+        &expected,
+        tensorfs_core::err::Code::REPOSITORY_CONFLICT,
     );
     let _ = fs::remove_dir_all(root);
 }

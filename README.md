@@ -1,6 +1,6 @@
 # TensorFS
 
-The current release is `0.0.7`.
+The current release is `0.0.8`.
 
 TensorFS stores every domain repository as the same graph:
 
@@ -98,7 +98,8 @@ tfs repo commit <store> <current.json|-> <mutation.json>
 
 tfs local resolve <store> <name>
 tfs local replace <store> <name> <source-sha256> <manifest> <length> \
-  --observed <repository-sha256|absent> --evidence <evidence.json>
+  --observed <repository-sha256|absent> --evidence <evidence.json> \
+  [--expected-topology <sha256> --expected-encoding <sha256> ...]
 tfs local remove <store> <name> --observed <repository-sha256>
 
 tfs key blob <sha256>
@@ -118,6 +119,12 @@ increments one release revision. First publication permanently marks the checkpo
 `remove_checkpoint` therefore accepts only never-public, unreferenced checkpoints. A crash
 afterward leaves a durable unreleased checkpoint; `store rebuild` catches SQL projections up. The
 database never leads the repository file.
+
+`local replace` may require an exact producer output contract. The topology and one or more
+repeated EncodingSpec digests are supplied together; encoding digests must already be sorted and
+unique. TensorFS derives both sides from the resident Manifest, `cozytensors/1` header, and model
+evidence before the Repository CAS. It accepts no encoding alias and leaves the prior alias intact
+on any mismatch.
 
 Each model row emitted by `repo list` carries the repository's exact canonical `evidence` object.
 Clients may preserve those bytes opaquely and base64-wrap them for a later `put_checkpoint`; TensorFS

@@ -33,7 +33,7 @@ use tensorfs_core::read::{self, ObjectRange, ReadLease as CoreLease, Source as R
 use tensorfs_core::receipt::Receipts;
 use tensorfs_core::repository::{Mutation, ReleaseLane, Repository, RepositoryName};
 use tensorfs_core::storage;
-use tensorfs_core::store::{Fault, Store as CoreStore, Verdict};
+use tensorfs_core::store::{ExpectedCheckpointContract, Fault, Store as CoreStore, Verdict};
 
 use crate::docs::marshal;
 use crate::errors::{to_py, IntoPy};
@@ -587,8 +587,18 @@ impl PyStore {
     }
 
     /// Atomically replace the complete local alias after its exact Manifest is resident and
-    /// verified. `current` is the exact observed Repository bytes or None for creation.
-    #[pyo3(signature = (current, name, source_selection, manifest_id, manifest_length, evidence))]
+    /// verified. `current` is the exact observed Repository bytes or None for creation. The
+    /// optional contract is all-or-none and is checked from resident TensorFS documents.
+    #[pyo3(signature = (
+        current,
+        name,
+        source_selection,
+        manifest_id,
+        manifest_length,
+        evidence,
+        expected_topology=None,
+        expected_encodings=None,
+    ))]
     #[allow(clippy::too_many_arguments)]
     fn replace_local<'p>(
         &self,
@@ -599,7 +609,11 @@ impl PyStore {
         manifest_id: &str,
         manifest_length: u64,
         evidence: &[u8],
+        expected_topology: Option<&str>,
+        expected_encodings: Option<Vec<String>>,
     ) -> PyResult<Bound<'p, PyBytes>> {
+        let expected = ExpectedCheckpointContract::optional(expected_topology, expected_encodings)
+            .or_refuse(py)?;
         let selection = prefixed("local source selection", source_selection).or_refuse(py)?;
         let mutation = Mutation::ReplaceLocal {
             repo: RepositoryName::new("local", name).or_refuse(py)?,
@@ -611,8 +625,12 @@ impl PyStore {
         };
         let repository = py
             .detach(|| {
-                self.store
-                    .apply_repository(current, &mutation, &Fault::default())
+                self.store.apply_repository_with_expected_local(
+                    current,
+                    &mutation,
+                    expected.as_ref(),
+                    &Fault::default(),
+                )
             })
             .or_refuse(py)?
             .expect("replace_local retains the repository");
