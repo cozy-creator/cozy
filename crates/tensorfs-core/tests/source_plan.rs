@@ -114,6 +114,41 @@ fn string_field(path: &Path, field: &str) -> String {
 }
 
 #[test]
+fn h3_profiles_expose_only_the_five_reviewed_carriers() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args([
+            "ingest",
+            "source-members",
+            "hf/minimax-h3/native-dual-bf16/1",
+            "hf/minimax-h3/shared-bf16/1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "source-members failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let members: Vec<&str> = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .collect();
+    assert_eq!(
+        members,
+        vec![
+            "FL2VA/transformer/model.safetensors.index.json",
+            "Ref2VA/transformer/model.safetensors.index.json",
+            "audio_vae/diffusion_pytorch_model.safetensors",
+            "text_encoder/model.safetensors.index.json",
+            "vae/diffusion_pytorch_model.safetensors.index.json",
+        ]
+    );
+    assert!(!members.iter().any(|member| {
+        member.starts_with("transformer/") || member.starts_with("transformer_ref/")
+    }));
+}
+
+#[test]
 fn source_plan_maps_reviewed_single_file_components_without_its_filename() {
     let root = temporary("single");
     fs::create_dir_all(&root).unwrap();
