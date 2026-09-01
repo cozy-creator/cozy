@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"testing"
@@ -50,14 +51,18 @@ func TestPublishedJobRentalClass(t *testing.T) {
 func TestPackageReleaseRequirementsBindExactBytes(t *testing.T) {
 	raw := []byte(`{"format":"cozy.package.release/1","requirements":["cozy-runtime<1.0.0,>=0.0.34","torch<3,>=2.13"]}`)
 	sum := sha256.Sum256(raw)
-	detail := hub.PackageReleaseDetail{Document: raw}
+	// Go's outer JSON response encoder HTML-escapes `<` even though the stored
+	// PackageRelease writer does not. RawMessage therefore sees a different token
+	// spelling for the same document content.
+	transported := bytes.ReplaceAll(raw, []byte("<"), []byte(`\u003c`))
+	detail := hub.PackageReleaseDetail{Document: transported}
 	detail.Release.ReleaseDigest = "sha256:" + hex.EncodeToString(sum[:])
 	requirements, problem := detail.Requirements()
 	if problem != nil || len(requirements) != 2 || requirements[1] != "torch<3,>=2.13" {
 		t.Fatalf("exact release requirements were refused: requirements=%v problem=%v", requirements, problem)
 	}
 
-	detail.Document = append(append([]byte(nil), raw...), ' ')
+	detail.Document = bytes.Replace(raw, []byte("torch<3"), []byte("torch<4"), 1)
 	if _, problem := detail.Requirements(); problem == nil || problem.ErrName() != "hub.package_release_digest_mismatch" {
 		t.Fatalf("changed release bytes were admitted: %v", problem)
 	}
