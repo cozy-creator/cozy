@@ -1,14 +1,14 @@
 package workerprotov1
 
-// Artifact, model-source, and private-package host-exchange bounds are generated beside the schema.
-const MaxArtifactReceipts = 16
-const MaxArtifactReceiptBytes = 1 << 20
-const MaxArtifactReceiptAggregateBytes = 4 << 20
-const MaxArtifactDeclarationBytes = 1 << 20
-const MaxArtifactInventoryBytes = 4 << 20
-const MaxArtifactObjects = 65536
-const MaxArtifactReadBytes = 4 << 20
-const MaxArtifactGrantURLBytes = 16 << 10
+// Weights, model-source, and private-package host-exchange bounds are generated beside the schema.
+const MaxWeightsReceipts = 16
+const MaxWeightsReceiptBytes = 1 << 20
+const MaxWeightsReceiptAggregateBytes = 4 << 20
+const MaxWeightsDeclarationBytes = 1 << 20
+const MaxWeightsInventoryBytes = 4 << 20
+const MaxWeightsObjects = 65536
+const MaxWeightsReadBytes = 4 << 20
+const MaxWeightsGrantURLBytes = 16 << 10
 const MaxModelSourceFiles = 4096
 const MaxModelSourceProfiles = 16
 const MaxModelSourceMemberBytes = 1024

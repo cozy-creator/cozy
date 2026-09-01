@@ -178,7 +178,7 @@ Tensorhub releases; their exact release and descriptor identities are pinned in 
 They do not need to be installable in the laptop's local Python environment. Local production still
 uses the ordinary installed package generation. `--rental-only` skips local capacity and requires an
 external attempt. Downloads that could rent currently refuse until Creator wires the negotiated
-artifact-read return plane; local-only sources under `--rental` remain local.
+weights-read return plane; local-only sources under `--rental` remain local.
 
 ## Run packages and jobs
 

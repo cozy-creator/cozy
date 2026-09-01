@@ -186,8 +186,8 @@ func messageFor(name string) proto.Message {
 		return &pb.InvocationSpec{}
 	case "cozy.worker.v1.AttemptOutcomeBody":
 		return &pb.AttemptOutcomeBody{}
-	case "cozy.worker.v1.ArtifactReceipt":
-		return &pb.ArtifactReceipt{}
+	case "cozy.worker.v1.WeightsReceipt":
+		return &pb.WeightsReceipt{}
 	case "cozy.worker.v1.ClaimProof":
 		return &pb.ClaimProof{}
 	case "cozy.worker.v1.DownloadDelegation":

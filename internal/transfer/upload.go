@@ -57,7 +57,7 @@ type Upload struct {
 	// Empty uses Ref. A local/name alias can therefore publish to an unrelated
 	// remote org/name without pretending the destination already owns its bytes.
 	EvidenceRef hub.Ref
-	// CheckpointEvidence is the exact ArtifactSink evidence for an unretained local
+	// CheckpointEvidence is the exact WeightsSink evidence for an unretained local
 	// output. When present, it avoids inventing a temporary repository merely so
 	// the privileged transfer finalizer can read bytes it already owns.
 	CheckpointEvidence []byte

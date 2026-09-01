@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS requests (
   install_id   TEXT    REFERENCES install_generations(id),
   assets       TEXT    NOT NULL DEFAULT '[]',
   models       TEXT    NOT NULL DEFAULT '[]',
-  artifact_outputs TEXT NOT NULL DEFAULT '[]'
+  weights_outputs TEXT NOT NULL DEFAULT '[]'
 )`
 
 var orchestratorSchema = []string{`
@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   session_id       TEXT    NOT NULL,
   invocation_digest TEXT    NOT NULL,
   invocation        BLOB    NOT NULL,
-  artifact_outputs  TEXT    NOT NULL DEFAULT '[]',
+  weights_outputs  TEXT    NOT NULL DEFAULT '[]',
   state            TEXT    NOT NULL,
   plan_digest      TEXT    NOT NULL DEFAULT '',
   construction     TEXT    NOT NULL DEFAULT '',
@@ -159,8 +159,8 @@ CREATE TABLE IF NOT EXISTS outputs (
   PRIMARY KEY (request_id, attempt, output_id),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`, outputExportSchema, `
--- Cozy's first-wins typed artifact disposition and Runtime completion.
-CREATE TABLE IF NOT EXISTS artifact_finalizations (
+-- Cozy's first-wins typed weights disposition and Runtime completion.
+CREATE TABLE IF NOT EXISTS weights_finalizations (
   request_id         TEXT    NOT NULL,
   attempt            INTEGER NOT NULL,
   instance_id        TEXT    NOT NULL,
@@ -465,10 +465,10 @@ type Request struct {
 	// Models are exact package-slot-to-model bindings resolved before rental creation.
 	// They are local request state and are disclosed only after worker attachment.
 	Models []ModelRef
-	// ArtifactOutputs is the immutable ArtifactSink output subset projected beside the
+	// WeightsOutputs is the immutable WeightsSink output subset projected beside the
 	// InvocationSpec. Rev5 OutputBinding has no kind, so this may never be inferred from
 	// ordinary asset outputs or from whichever receipts happen to arrive.
-	ArtifactOutputs string
+	WeightsOutputs string
 	// OutputExport is a CLI-authenticated, descriptor-derived local publication intent.
 	// It is recorded in its own durable row in the same transaction as this request.
 	OutputExport *OutputExportIntent
@@ -512,7 +512,7 @@ const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_
 	package_revision_digest,private_package_digest,private_package_uploaded_boot_id,
 	environment_digest,config_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,rental_required,
-	COALESCE(install_id,''),assets,models,artifact_outputs`
+	COALESCE(install_id,''),assets,models,weights_outputs`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
@@ -520,7 +520,7 @@ func requestScanTargets(r *Request, assets, models *string) []any {
 		&r.PrivatePackageUploadedBootID, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.JobGPUCount, &r.Org, &r.Trees, &r.Worker, &r.Rental, &r.RentalRequired,
-		&r.InstallID, assets, models, &r.ArtifactOutputs}
+		&r.InstallID, assets, models, &r.WeightsOutputs}
 }
 
 func finishRequestScan(r Request, assets, models string, err error) (Request, error) {
@@ -1081,7 +1081,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		plan_id,package_release,package_revision_digest,private_package_digest,
 		private_package_uploaded_boot_id,environment_digest,config_digest,
 		payload,outputs,state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,rental_required,install_id,assets,models,
-		artifact_outputs)
+		weights_outputs)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.PackageRevisionDigest, r.PrivatePackageDigest,
@@ -1089,7 +1089,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.JobGPUCount, r.Org, r.Trees, r.Worker, r.Rental,
 		r.RentalRequired,
 		nullable(r.InstallID),
-		assets, models, r.ArtifactOutputs); err != nil {
+		assets, models, r.WeightsOutputs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	if problem := recordOutputExportTx(tx, r.ID, r.OutputExport, exportOutputs); problem != nil {
@@ -1124,7 +1124,7 @@ type Attempt struct {
 	SessionID           string
 	InvocationDigest    string
 	InvocationCanonical []byte
-	ArtifactOutputs     string
+	WeightsOutputs      string
 	State               string // preparing | offered | dispatch_aborted | accepted | recovered_open | terminal | closed
 	PlanDigest          string
 	Construction        string
@@ -1225,10 +1225,10 @@ func (s *Store) Dispatch(a Attempt) (int64, *exit.Error) {
 	}
 	a.Attempt = ordinal
 	if _, err := tx.Exec(`INSERT INTO attempts(request_id,attempt,attempt_key,instance_id,
-		session_id,invocation_digest,invocation,artifact_outputs,state,dispatched_at)
+		session_id,invocation_digest,invocation,weights_outputs,state,dispatched_at)
 		VALUES(?,?,?,?,?,?,?,?,'preparing',?)`,
 		a.RequestID, a.Attempt, a.AttemptKey, a.InstanceID, a.SessionID,
-		a.InvocationDigest, a.InvocationCanonical, a.ArtifactOutputs, a.DispatchedAt); err != nil {
+		a.InvocationDigest, a.InvocationCanonical, a.WeightsOutputs, a.DispatchedAt); err != nil {
 		return 0, exit.New(exit.Conflict, "cannot journal attempt %s#%d: %s", a.RequestID, a.Attempt, err).
 			WithRemedy("an attempt ordinal is written once")
 	}
@@ -1360,16 +1360,16 @@ type Output struct {
 	MimeType string
 }
 
-// ArtifactReceipt is the validated Runtime-authored ArtifactReceipt/1 carried by an outcome.
-type ArtifactReceipt struct {
+// WeightsReceipt is the validated Runtime-authored WeightsReceipt/1 carried by an outcome.
+type WeightsReceipt struct {
 	RequestID, OwnerScope, InvocationDigest, OutputSlot string
 	Attempt                                             int64
 	ReceiptDigest                                       string
 	ReceiptBytes                                        []byte
 }
 
-// ArtifactFinalization is Cozy's durable typed first-wins disposition and Runtime completion.
-type ArtifactFinalization struct {
+// WeightsFinalization is Cozy's durable typed first-wins disposition and Runtime completion.
+type WeightsFinalization struct {
 	RequestID, InstanceID, OwnerScope, InvocationDigest, OutputSlot string
 	Attempt                                                         int64
 	Disposition, ReceiptDigest, ScratchRootID                       string
@@ -1396,12 +1396,12 @@ type Terminal struct {
 	// terminal's own TriageBundleRef before this transaction runs. A one-shot run
 	// deletes its worker root (cr-011 §8), so a bundle worth keeping is the client's
 	// to keep — and "the client" is this orchestrator.
-	TriageDigest          string
-	TriageLength          int64
-	TriagePath            string
-	Body                  []byte
-	Outputs               []Output
-	ArtifactFinalizations []ArtifactFinalization
+	TriageDigest         string
+	TriageLength         int64
+	TriagePath           string
+	Body                 []byte
+	Outputs              []Output
+	WeightsFinalizations []WeightsFinalization
 	// Event is the attempt-end lifecycle event, appended INSIDE this transaction so the
 	// stream cannot disagree with the authority about whether the request ended.
 	EventType    string
@@ -1501,10 +1501,10 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 		}
 	}
 	visible := now()
-	for _, finalization := range t.ArtifactFinalizations {
-		var held ArtifactFinalization
+	for _, finalization := range t.WeightsFinalizations {
+		var held WeightsFinalization
 		err := tx.QueryRow(`SELECT attempt,instance_id,owner_scope,disposition,
-			receipt_digest,scratch_root_id FROM artifact_finalizations
+			receipt_digest,scratch_root_id FROM weights_finalizations
 			WHERE request_id=? AND invocation_digest=? AND output_slot=?`, finalization.RequestID,
 			finalization.InvocationDigest, finalization.OutputSlot).Scan(&held.Attempt,
 			&held.InstanceID, &held.OwnerScope, &held.Disposition, &held.ReceiptDigest,
@@ -1516,23 +1516,23 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 				held.ReceiptDigest != finalization.ReceiptDigest ||
 				held.ScratchRootID != finalization.ScratchRootID {
 				return false, exit.New(exit.Conflict,
-					"artifact output %s already has a different typed final intent",
+					"weights output %s already has a different typed final intent",
 					finalization.OutputSlot)
 			}
 			continue
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
-			return false, exit.Internalf("cannot read artifact final intent %s of %s: %s",
+			return false, exit.Internalf("cannot read weights final intent %s of %s: %s",
 				finalization.OutputSlot, t.RequestID, err)
 		}
-		if _, err := tx.Exec(`INSERT INTO artifact_finalizations(request_id,attempt,instance_id,
+		if _, err := tx.Exec(`INSERT INTO weights_finalizations(request_id,attempt,instance_id,
 			owner_scope,invocation_digest,output_slot,disposition,receipt_digest,scratch_root_id,
 			recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
 			finalization.RequestID, finalization.Attempt, finalization.InstanceID,
 			finalization.OwnerScope, finalization.InvocationDigest, finalization.OutputSlot,
 			finalization.Disposition, finalization.ReceiptDigest, finalization.ScratchRootID,
 			visible); err != nil {
-			return false, exit.Internalf("cannot record artifact final intent %s of %s#%d: %s",
+			return false, exit.Internalf("cannot record weights final intent %s of %s#%d: %s",
 				finalization.OutputSlot, t.RequestID, t.Attempt, err)
 		}
 	}
@@ -1675,7 +1675,7 @@ func (s *Store) ReadyRequeues() ([]Request, *exit.Error) {
 
 func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error) {
 	rows, err := s.db.Query(`SELECT request_id,attempt,attempt_key,instance_id,session_id,
-		invocation_digest,invocation,artifact_outputs,state,plan_digest,construction,plan_summary,terminal_id,
+		invocation_digest,invocation,weights_outputs,state,plan_digest,construction,plan_summary,terminal_id,
 		terminal_digest,terminal_status,terminal_cause,safe_message,triage_subject,
 		triage_digest,triage_length,triage_path,
 		COALESCE(terminal_body,x''),dispatched_at,accepted_at,closed_at
@@ -1688,7 +1688,7 @@ func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error
 	for rows.Next() {
 		var a Attempt
 		if err := rows.Scan(&a.RequestID, &a.Attempt, &a.AttemptKey, &a.InstanceID, &a.SessionID,
-			&a.InvocationDigest, &a.InvocationCanonical, &a.ArtifactOutputs, &a.State, &a.PlanDigest, &a.Construction,
+			&a.InvocationDigest, &a.InvocationCanonical, &a.WeightsOutputs, &a.State, &a.PlanDigest, &a.Construction,
 			&a.PlanSummary, &a.TerminalID, &a.TerminalDigest, &a.TerminalStatus, &a.TerminalCause,
 			&a.SafeMessage, &a.TriageSubject, &a.TriageDigest, &a.TriageLength, &a.TriagePath,
 			&a.TerminalBody, &a.DispatchedAt, &a.AcceptedAt, &a.ClosedAt); err != nil {
@@ -1699,13 +1699,13 @@ func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error
 	return out, nil
 }
 
-const artifactFinalizationCols = `request_id,attempt,instance_id,owner_scope,invocation_digest,
+const weightsFinalizationCols = `request_id,attempt,instance_id,owner_scope,invocation_digest,
 	output_slot,disposition,receipt_digest,scratch_root_id,result_outcome,
 	result_receipt_digest,result_receipt_bytes,
 	recorded_at,completed_at`
 
-func scanArtifactFinalization(row interface{ Scan(...any) error }) (ArtifactFinalization, error) {
-	var f ArtifactFinalization
+func scanWeightsFinalization(row interface{ Scan(...any) error }) (WeightsFinalization, error) {
+	var f WeightsFinalization
 	err := row.Scan(&f.RequestID, &f.Attempt, &f.InstanceID, &f.OwnerScope,
 		&f.InvocationDigest, &f.OutputSlot, &f.Disposition, &f.ReceiptDigest,
 		&f.ScratchRootID, &f.ResultOutcome, &f.ResultReceiptDigest, &f.ResultReceiptBytes,
@@ -1713,82 +1713,82 @@ func scanArtifactFinalization(row interface{ Scan(...any) error }) (ArtifactFina
 	return f, err
 }
 
-// ArtifactFinalization reads the exact first-wins intent for one semantic output.
-func (s *Store) ArtifactFinalization(requestID, invocationDigest, outputSlot string) (*ArtifactFinalization, *exit.Error) {
-	f, err := scanArtifactFinalization(s.db.QueryRow(`SELECT `+artifactFinalizationCols+`
-		FROM artifact_finalizations WHERE request_id=? AND invocation_digest=? AND output_slot=?`,
+// WeightsFinalization reads the exact first-wins intent for one semantic output.
+func (s *Store) WeightsFinalization(requestID, invocationDigest, outputSlot string) (*WeightsFinalization, *exit.Error) {
+	f, err := scanWeightsFinalization(s.db.QueryRow(`SELECT `+weightsFinalizationCols+`
+		FROM weights_finalizations WHERE request_id=? AND invocation_digest=? AND output_slot=?`,
 		requestID, invocationDigest, outputSlot))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, exit.Internalf("cannot read artifact finalization %s/%s: %s",
+		return nil, exit.Internalf("cannot read weights finalization %s/%s: %s",
 			requestID, outputSlot, err)
 	}
 	return &f, nil
 }
 
-// PendingArtifactFinalizations is the exact decision set that must be (re)sent before
+// PendingWeightsFinalizations is the exact decision set that must be (re)sent before
 // this attempt's outcome may be acknowledged. Ordering by slot makes replay deterministic.
-func (s *Store) PendingArtifactFinalizations(requestID string, attempt int64) ([]ArtifactFinalization, *exit.Error) {
-	rows, err := s.db.Query(`SELECT `+artifactFinalizationCols+` FROM artifact_finalizations
+func (s *Store) PendingWeightsFinalizations(requestID string, attempt int64) ([]WeightsFinalization, *exit.Error) {
+	rows, err := s.db.Query(`SELECT `+weightsFinalizationCols+` FROM weights_finalizations
 		WHERE request_id=? AND attempt=? AND completed_at='' ORDER BY output_slot`, requestID, attempt)
 	if err != nil {
-		return nil, exit.Internalf("cannot read pending artifact finalizations of %s#%d: %s",
+		return nil, exit.Internalf("cannot read pending weights finalizations of %s#%d: %s",
 			requestID, attempt, err)
 	}
 	defer rows.Close()
-	out := []ArtifactFinalization{}
+	out := []WeightsFinalization{}
 	for rows.Next() {
-		f, err := scanArtifactFinalization(rows)
+		f, err := scanWeightsFinalization(rows)
 		if err != nil {
-			return nil, exit.Internalf("cannot read an artifact finalization row: %s", err)
+			return nil, exit.Internalf("cannot read a weights finalization row: %s", err)
 		}
 		out = append(out, f)
 	}
 	return out, nil
 }
 
-func (s *Store) ArtifactFinalizationsOf(requestID string) ([]ArtifactFinalization, *exit.Error) {
-	rows, err := s.db.Query(`SELECT `+artifactFinalizationCols+` FROM artifact_finalizations
+func (s *Store) WeightsFinalizationsOf(requestID string) ([]WeightsFinalization, *exit.Error) {
+	rows, err := s.db.Query(`SELECT `+weightsFinalizationCols+` FROM weights_finalizations
 		WHERE request_id=? ORDER BY attempt,output_slot`, requestID)
 	if err != nil {
-		return nil, exit.Internalf("cannot read artifact finalizations of %s: %s", requestID, err)
+		return nil, exit.Internalf("cannot read weights finalizations of %s: %s", requestID, err)
 	}
 	defer rows.Close()
-	out := []ArtifactFinalization{}
+	out := []WeightsFinalization{}
 	for rows.Next() {
-		f, err := scanArtifactFinalization(rows)
+		f, err := scanWeightsFinalization(rows)
 		if err != nil {
-			return nil, exit.Internalf("cannot read an artifact finalization row: %s", err)
+			return nil, exit.Internalf("cannot read a weights finalization row: %s", err)
 		}
 		out = append(out, f)
 	}
 	return out, nil
 }
 
-// RecordArtifactFinalizeResult journals Runtime's typed replayable result. The same result is
+// RecordWeightsFinalizeResult journals Runtime's typed replayable result. The same result is
 // idempotent; a changed result for the first-wins decision conflicts forever.
-func (s *Store) RecordArtifactFinalizeResult(result ArtifactFinalization) (applied bool, e *exit.Error) {
+func (s *Store) RecordWeightsFinalizeResult(result WeightsFinalization) (applied bool, e *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return false, exit.Internalf("cannot begin the artifact finalize result transaction: %s", err)
+		return false, exit.Internalf("cannot begin the weights finalize result transaction: %s", err)
 	}
 	defer tx.Rollback()
-	held, err := scanArtifactFinalization(tx.QueryRow(`SELECT `+artifactFinalizationCols+`
-		FROM artifact_finalizations WHERE request_id=? AND invocation_digest=? AND output_slot=?`,
+	held, err := scanWeightsFinalization(tx.QueryRow(`SELECT `+weightsFinalizationCols+`
+		FROM weights_finalizations WHERE request_id=? AND invocation_digest=? AND output_slot=?`,
 		result.RequestID, result.InvocationDigest, result.OutputSlot))
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, exit.New(exit.NotFound, "no artifact final intent for %s/%s",
+		return false, exit.New(exit.NotFound, "no weights final intent for %s/%s",
 			result.RequestID, result.OutputSlot)
 	}
 	if err != nil {
-		return false, exit.Internalf("cannot read artifact final intent %s/%s: %s",
+		return false, exit.Internalf("cannot read weights final intent %s/%s: %s",
 			result.RequestID, result.OutputSlot, err)
 	}
 	if held.InstanceID != result.InstanceID {
 		return false, exit.New(exit.Conflict,
-			"artifact finalize result for %s/%s came from worker %s; %s owns the transaction",
+			"weights finalize result for %s/%s came from worker %s; %s owns the transaction",
 			result.RequestID, result.OutputSlot, result.InstanceID, held.InstanceID)
 	}
 	if held.CompletedAt != "" {
@@ -1796,27 +1796,27 @@ func (s *Store) RecordArtifactFinalizeResult(result ArtifactFinalization) (appli
 			held.ResultReceiptDigest != result.ResultReceiptDigest ||
 			!bytes.Equal(held.ResultReceiptBytes, result.ResultReceiptBytes) {
 			return false, exit.New(exit.Conflict,
-				"artifact finalization %s/%s already completed with a different typed result",
+				"weights finalization %s/%s already completed with a different typed result",
 				result.RequestID, result.OutputSlot)
 		}
 		return false, nil
 	}
 	completed := now()
-	updated, err := tx.Exec(`UPDATE artifact_finalizations SET result_outcome=?,
+	updated, err := tx.Exec(`UPDATE weights_finalizations SET result_outcome=?,
 		result_receipt_digest=?,result_receipt_bytes=?,completed_at=?
 		WHERE request_id=? AND invocation_digest=? AND output_slot=? AND completed_at=''`,
 		result.ResultOutcome, result.ResultReceiptDigest, blob(result.ResultReceiptBytes), completed,
 		result.RequestID, result.InvocationDigest, result.OutputSlot)
 	if err != nil {
-		return false, exit.Internalf("cannot record artifact finalize result %s/%s: %s",
+		return false, exit.Internalf("cannot record weights finalize result %s/%s: %s",
 			result.RequestID, result.OutputSlot, err)
 	}
 	if n, _ := updated.RowsAffected(); n != 1 {
-		return false, exit.New(exit.Conflict, "artifact finalization %s/%s moved while completing",
+		return false, exit.New(exit.Conflict, "weights finalization %s/%s moved while completing",
 			result.RequestID, result.OutputSlot)
 	}
 	if err := tx.Commit(); err != nil {
-		return false, exit.Internalf("cannot commit artifact finalize result %s/%s: %s",
+		return false, exit.Internalf("cannot commit weights finalize result %s/%s: %s",
 			result.RequestID, result.OutputSlot, err)
 	}
 	return true, nil

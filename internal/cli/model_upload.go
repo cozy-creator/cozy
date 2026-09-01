@@ -125,7 +125,7 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 	if kind == "model-download" && effectiveRental {
 		return exit.Named(exit.Unavailable, "model_download.rented_return_unavailable",
 			"rented model download cannot yet return an output to local TensorFS").
-			WithRemedy("run locally until the negotiated artifact-read return plane is active")
+			WithRemedy("run locally until the negotiated weights-read return plane is active")
 	}
 	if producerName == "" && effectiveRental {
 		return exit.Named(exit.Unavailable, "model_transfer.rented_pass_through_unavailable",
@@ -461,7 +461,7 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 	for _, slot := range job.Models {
 		plan.SourceProfiles[slot.Param] = slot.SourceProfile
 	}
-	for _, output := range job.ArtifactOutputs {
+	for _, output := range job.WeightsOutputs {
 		plan.Outputs = append(plan.Outputs, modeltransfer.OutputPin{Name: output.OutputID,
 			RequiredContract: output.RequiredContract})
 	}
@@ -609,11 +609,11 @@ func validateProducerJob(name string, job *launch.Entrypoint) *exit.Error {
 				"producer job %s requires argument %s", name, field.Name)
 		}
 	}
-	if len(job.ArtifactOutputs) == 0 {
+	if len(job.WeightsOutputs) == 0 {
 		return exit.Named(exit.Validation, "model_producer.outputs_absent",
-			"producer job %s has no ArtifactSink model output", name)
+			"producer job %s has no WeightsSink model output", name)
 	}
-	for _, output := range job.ArtifactOutputs {
+	for _, output := range job.WeightsOutputs {
 		if output.RequiredContract == nil {
 			return exit.Named(exit.Validation, "model_producer.output_contract_absent",
 				"producer job %s output %s has no required model contract", name, output.OutputID)

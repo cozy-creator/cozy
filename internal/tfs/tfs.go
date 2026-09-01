@@ -491,7 +491,7 @@ func (t *Tool) InstallLocal(session, name, sourceSelection, observed, sourceURI,
 }
 
 // ReplaceLocal atomically points Creator's one local alias at an already verified
-// ArtifactSink Manifest. TensorFS owns the evidence parse, manifest verification,
+// WeightsSink Manifest. TensorFS owns the evidence parse, manifest verification,
 // repository bytes, and compare-and-swap; Creator supplies only frozen identities.
 type ExpectedModelContract struct {
 	TopologyDigest string

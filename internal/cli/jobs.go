@@ -189,18 +189,18 @@ func jobFields(state api.JobState, full bool) []output.Field {
 		}
 		fields = append(fields, output.Field{K: "outputs", V: outs})
 	}
-	if len(state.Artifacts) > 0 {
-		artifacts := make([]string, 0, len(state.Artifacts))
-		for _, artifact := range state.Artifacts {
-			state := strings.ToLower(artifact.Disposition)
-			if artifact.Outcome != "" {
-				state = strings.ToLower(artifact.Outcome)
+	if len(state.Weights) > 0 {
+		weights := make([]string, 0, len(state.Weights))
+		for _, row := range state.Weights {
+			state := strings.ToLower(row.Disposition)
+			if row.Outcome != "" {
+				state = strings.ToLower(row.Outcome)
 			}
-			artifacts = append(artifacts, fmt.Sprintf("#%d %s %s receipt=%s root=%s",
-				artifact.Attempt, artifact.OutputSlot, state,
-				artifact.ReceiptDigest, artifact.ScratchRootID))
+			weights = append(weights, fmt.Sprintf("#%d %s %s receipt=%s root=%s",
+				row.Attempt, row.OutputSlot, state,
+				row.ReceiptDigest, row.ScratchRootID))
 		}
-		fields = append(fields, output.Field{K: "artifacts", V: artifacts})
+		fields = append(fields, output.Field{K: "weights", V: weights})
 	}
 	if state.Result != nil {
 		fields = append(fields, output.Field{K: "result", V: state.Result})

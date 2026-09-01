@@ -520,19 +520,19 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 				"remote job %s model parameter %s uses unsupported stamps", function, slot.Param)
 		}
 	}
-	artifacts := make([]orchestrator.ArtifactOutput, 0, len(job.ArtifactOutputs))
+	weights := make([]orchestrator.WeightsOutput, 0, len(job.WeightsOutputs))
 	profiles := make(map[string]string, len(job.Models))
 	for _, model := range job.Models {
 		profiles[model.Param] = model.SourceProfile
 	}
 	outputs := launch.AssetPaths(job.Result)
-	for _, output := range job.ArtifactOutputs {
+	for _, output := range job.WeightsOutputs {
 		var contract *records.ModelTransferContract
 		if output.RequiredContract != nil {
 			contract = &records.ModelTransferContract{TopologyDigest: output.RequiredContract.TopologyDigest,
 				Encodings: append([]string(nil), output.RequiredContract.Encodings...)}
 		}
-		artifacts = append(artifacts, orchestrator.ArtifactOutput{
+		weights = append(weights, orchestrator.WeightsOutput{
 			OutputID: output.OutputID, MimeType: output.MimeType, MaxBytes: output.MaxBytes,
 			RequiredContract: contract,
 		})
@@ -541,7 +541,7 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 	return orchestrator.LogicalJob{
 		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
 		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
-		ArtifactOutputs: artifacts, GPUCount: job.RequiredGPUCount(),
+		WeightsOutputs: weights, GPUCount: job.RequiredGPUCount(),
 		Requires: job.Resources.Requires, Models: models,
 		SourceProfiles: profiles,
 	}, job, nil

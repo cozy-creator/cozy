@@ -132,7 +132,7 @@ type ModelTransferObject struct {
 	UpdateSequence, Transferred                int64
 }
 
-type ModelTransferArtifact struct {
+type ModelTransferWeights struct {
 	RequestID, OutputSlot, ManifestID, FinalID     string
 	InvocationDigest, TransactionID, ReceiptDigest string
 	ManifestLength, Attempt                        int64
@@ -410,7 +410,7 @@ func sourceStateRank(state string) int {
 	}
 }
 
-func (s *Store) RecordModelTransferArtifact(row ModelTransferArtifact) *exit.Error {
+func (s *Store) RecordModelTransferWeights(row ModelTransferWeights) *exit.Error {
 	if row.Evidence == nil {
 		row.Evidence = []byte{}
 	}
@@ -422,7 +422,7 @@ func (s *Store) RecordModelTransferArtifact(row ModelTransferArtifact) *exit.Err
 	row.Objects = objectsCopy
 	tx, err := s.db.Begin()
 	if err != nil {
-		return exit.Internalf("cannot begin model transfer artifact: %s", err)
+		return exit.Internalf("cannot begin model transfer weights: %s", err)
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(`INSERT INTO request_model_transfer_outputs
@@ -432,13 +432,13 @@ func (s *Store) RecordModelTransferArtifact(row ModelTransferArtifact) *exit.Err
 		row.OutputSlot, row.ManifestID, row.ManifestLength, row.Evidence, row.Attempt,
 		row.InvocationDigest, row.TransactionID, row.ReceiptDigest, row.Receipt)
 	if err != nil {
-		return exit.Internalf("cannot record model transfer artifact: %s", err)
+		return exit.Internalf("cannot record model transfer weights: %s", err)
 	}
 	if changed, _ := result.RowsAffected(); changed == 1 {
 		previous := ""
 		for _, object := range row.Objects {
 			if object.ObjectID == "" || object.ObjectID <= previous || object.Length <= 0 || object.SourceRef == "" {
-				return exit.New(exit.Validation, "model transfer artifact object inventory is invalid")
+				return exit.New(exit.Validation, "model transfer weights object inventory is invalid")
 			}
 			previous = object.ObjectID
 			if _, err := tx.Exec(`INSERT INTO request_model_transfer_objects
@@ -449,19 +449,19 @@ func (s *Store) RecordModelTransferArtifact(row ModelTransferArtifact) *exit.Err
 			}
 		}
 		if err := tx.Commit(); err != nil {
-			return exit.Internalf("cannot commit model transfer artifact: %s", err)
+			return exit.Internalf("cannot commit model transfer weights: %s", err)
 		}
 		return nil
 	}
 	_ = tx.Rollback()
-	held, problem := s.ModelTransferArtifact(row.RequestID, row.Attempt, row.OutputSlot)
+	held, problem := s.ModelTransferWeights(row.RequestID, row.Attempt, row.OutputSlot)
 	if problem != nil || held == nil || held.ManifestID != row.ManifestID ||
 		held.ManifestLength != row.ManifestLength || string(held.Evidence) != string(row.Evidence) ||
 		held.Attempt != row.Attempt || held.InvocationDigest != row.InvocationDigest ||
 		held.TransactionID != row.TransactionID || held.ReceiptDigest != row.ReceiptDigest ||
 		string(held.Receipt) != string(row.Receipt) ||
 		string(mustJSON(held.Objects)) != string(mustJSON(row.Objects)) {
-		return exit.Named(exit.Conflict, "model_transfer.artifact_changed",
+		return exit.Named(exit.Conflict, "model_transfer.weights_changed",
 			"model transfer output %s replay changed identity", row.OutputSlot)
 	}
 	return nil
@@ -469,8 +469,8 @@ func (s *Store) RecordModelTransferArtifact(row ModelTransferArtifact) *exit.Err
 
 func mustJSON(value any) []byte { data, _ := json.Marshal(value); return data }
 
-func (s *Store) ModelTransferArtifact(requestID string, attempt int64, slot string) (*ModelTransferArtifact, *exit.Error) {
-	var row ModelTransferArtifact
+func (s *Store) ModelTransferWeights(requestID string, attempt int64, slot string) (*ModelTransferWeights, *exit.Error) {
+	var row ModelTransferWeights
 	err := s.db.QueryRow(`SELECT request_id,output_slot,manifest_id,manifest_length,evidence,
 		attempt,invocation_digest,transaction_id,receipt_digest,receipt,final_id
 		FROM request_model_transfer_outputs WHERE request_id=? AND attempt=? AND output_slot=?`, requestID, attempt, slot).
@@ -491,16 +491,16 @@ func (s *Store) ModelTransferArtifact(requestID string, attempt int64, slot stri
 	return &row, nil
 }
 
-func (s *Store) ModelTransferArtifacts(requestID string, attempt int64) ([]ModelTransferArtifact, *exit.Error) {
+func (s *Store) AllModelTransferWeights(requestID string, attempt int64) ([]ModelTransferWeights, *exit.Error) {
 	rows, err := s.db.Query(`SELECT request_id,output_slot,manifest_id,manifest_length,evidence,
 		attempt,invocation_digest,transaction_id,receipt_digest,receipt,final_id
 		FROM request_model_transfer_outputs WHERE request_id=? AND attempt=? ORDER BY output_slot`, requestID, attempt)
 	if err != nil {
 		return nil, exit.Internalf("cannot list model transfer outputs: %s", err)
 	}
-	var out []ModelTransferArtifact
+	var out []ModelTransferWeights
 	for rows.Next() {
-		var row ModelTransferArtifact
+		var row ModelTransferWeights
 		if err := rows.Scan(&row.RequestID, &row.OutputSlot, &row.ManifestID, &row.ManifestLength,
 			&row.Evidence, &row.Attempt, &row.InvocationDigest, &row.TransactionID,
 			&row.ReceiptDigest, &row.Receipt, &row.FinalID); err != nil {
@@ -643,7 +643,7 @@ func (s *Store) CompleteModelTransferOutput(requestID string, attempt int64, slo
 	if changed, _ := result.RowsAffected(); changed == 1 {
 		return nil
 	}
-	held, problem := s.ModelTransferArtifact(requestID, attempt, slot)
+	held, problem := s.ModelTransferWeights(requestID, attempt, slot)
 	if problem != nil || held == nil || held.FinalID != finalID {
 		return exit.Named(exit.Conflict, "model_transfer.final_id_changed",
 			"model transfer output %s already names another finalization", slot)

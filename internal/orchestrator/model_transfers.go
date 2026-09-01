@@ -66,11 +66,11 @@ func (c *Orchestrator) runModelPassThrough(req records.Request) {
 	c.forgetTransferProgress(req.ID)
 }
 
-func (c *Orchestrator) moveModelTransferArtifact(ctx context.Context,
-	artifact records.ModelTransferArtifact, operationID string,
-	decisions []ArtifactTransferDecision,
+func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
+	weights records.ModelTransferWeights, operationID string,
+	decisions []WeightsTransferDecision,
 ) *exit.Error {
-	request, problem := c.opt.Store.RequestRow(artifact.RequestID)
+	request, problem := c.opt.Store.RequestRow(weights.RequestID)
 	if problem != nil || request == nil {
 		return problem
 	}
@@ -78,22 +78,22 @@ func (c *Orchestrator) moveModelTransferArtifact(ctx context.Context,
 		return exit.Named(exit.Structural, "model_transfer.remote_mover_not_needed",
 			"local model transfer output is already in Creator TensorFS")
 	}
-	byObject := make(map[string]ArtifactTransferDecision, len(decisions))
-	known := make(map[string]int64, len(artifact.Objects))
-	for _, object := range artifact.Objects {
+	byObject := make(map[string]WeightsTransferDecision, len(decisions))
+	known := make(map[string]int64, len(weights.Objects))
+	for _, object := range weights.Objects {
 		known[object.ObjectID] = object.Length
 	}
 	for _, decision := range decisions {
 		if decision.ObjectID == "" || decision.Length <= 0 || known[decision.ObjectID] != decision.Length ||
 			byObject[decision.ObjectID].ObjectID != "" {
 			return exit.Named(exit.Validation, "model_transfer.transfer_decision_invalid",
-				"artifact transfer decisions changed the adopted object inventory")
+				"weights transfer decisions changed the adopted object inventory")
 		}
 		byObject[decision.ObjectID] = decision
 	}
 	for {
-		objects, problem := c.opt.Store.ModelTransferObjects(artifact.RequestID,
-			artifact.Attempt, artifact.OutputSlot)
+		objects, problem := c.opt.Store.ModelTransferObjects(weights.RequestID,
+			weights.Attempt, weights.OutputSlot)
 		if problem != nil {
 			return problem
 		}
@@ -105,11 +105,11 @@ func (c *Orchestrator) moveModelTransferArtifact(ctx context.Context,
 			if object.State == "failed" {
 				if strings.Contains(strings.ToLower(object.SafeCode), "expired") {
 					return exit.Named(exit.Unavailable, object.SafeCode,
-						"worker artifact transfer %s needs a refreshed grant: %s",
+						"worker weights transfer %s needs a refreshed grant: %s",
 						object.ObjectID, object.SafeDetail)
 				}
 				return exit.Named(exit.Failed, "model_transfer.object_failed",
-					"worker artifact transfer %s failed: %s", object.ObjectID,
+					"worker weights transfer %s failed: %s", object.ObjectID,
 					object.SafeDetail)
 			}
 			complete = complete && (object.State == "uploaded" ||
@@ -120,18 +120,18 @@ func (c *Orchestrator) moveModelTransferArtifact(ctx context.Context,
 		}
 		session, problem := c.rentalControl(request.Worker)
 		if problem != nil {
-			if wait := c.waitTransfer(ctx, artifact.RequestID); wait != nil {
+			if wait := c.waitTransfer(ctx, weights.RequestID); wait != nil {
 				return wait
 			}
 			continue
 		}
-		specDigest, err := canonical.Raw(artifact.InvocationDigest)
+		specDigest, err := canonical.Raw(weights.InvocationDigest)
 		if err != nil {
-			return exit.Internalf("persisted artifact invocation digest is malformed: %s", err)
+			return exit.Internalf("persisted weights invocation digest is malformed: %s", err)
 		}
-		receiptDigest, err := canonical.Raw(artifact.ReceiptDigest)
+		receiptDigest, err := canonical.Raw(weights.ReceiptDigest)
 		if err != nil {
-			return exit.Internalf("persisted artifact receipt digest is malformed: %s", err)
+			return exit.Internalf("persisted weights receipt digest is malformed: %s", err)
 		}
 		for _, object := range objects {
 			decision, selected := byObject[object.ObjectID]
@@ -139,14 +139,14 @@ func (c *Orchestrator) moveModelTransferArtifact(ctx context.Context,
 				object.State == "held" {
 				continue
 			}
-			request := &pb.ArtifactTransferRequest{RecordOwnerEpoch: recordOwnerEpoch,
+			request := &pb.WeightsTransferRequest{RecordOwnerEpoch: recordOwnerEpoch,
 				ControlStreamGeneration: session.generation, WorkerBootId: session.bootID,
-				RequestId: artifact.RequestID, AttemptOrdinal: uint64(artifact.Attempt),
-				InvocationSpecDigest: specDigest, OutputSlot: artifact.OutputSlot,
-				ArtifactTransactionId: artifact.TransactionID, ArtifactReceiptDigest: receiptDigest,
+				RequestId: weights.RequestID, AttemptOrdinal: uint64(weights.Attempt),
+				InvocationSpecDigest: specDigest, OutputSlot: weights.OutputSlot,
+				WeightsTransactionId: weights.TransactionID, WeightsReceiptDigest: receiptDigest,
 				OperationId: operationID, GrantRevision: uint64(object.GrantRevision + 1)}
 			if decision.Held {
-				request.Decision = &pb.ArtifactTransferRequest_Held{Held: &pb.ArtifactObjectRef{
+				request.Decision = &pb.WeightsTransferRequest_Held{Held: &pb.WeightsObjectRef{
 					ObjectId: object.ObjectID, Length: uint64(decision.Length)}}
 			} else {
 				names := make([]string, 0, len(decision.Headers))
@@ -154,18 +154,18 @@ func (c *Orchestrator) moveModelTransferArtifact(ctx context.Context,
 					names = append(names, name)
 				}
 				sort.Strings(names)
-				headers := make([]*pb.ArtifactUploadHeader, 0, len(names))
+				headers := make([]*pb.WeightsUploadHeader, 0, len(names))
 				for _, name := range names {
-					headers = append(headers, &pb.ArtifactUploadHeader{Name: name, Value: decision.Headers[name]})
+					headers = append(headers, &pb.WeightsUploadHeader{Name: name, Value: decision.Headers[name]})
 				}
-				request.Decision = &pb.ArtifactTransferRequest_UploadGrant{UploadGrant: &pb.ArtifactUploadGrant{
+				request.Decision = &pb.WeightsTransferRequest_UploadGrant{UploadGrant: &pb.WeightsUploadGrant{
 					ObjectId: object.ObjectID, Length: uint64(decision.Length), Url: decision.URL,
 					RequiredHeaders: headers, ExpiresAtUnix: decision.ExpiresAtUnix}}
 			}
-			session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ArtifactTransferRequest{
-				ArtifactTransferRequest: request}})
+			session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_WeightsTransferRequest{
+				WeightsTransferRequest: request}})
 		}
-		if wait := c.waitTransfer(ctx, artifact.RequestID); wait != nil {
+		if wait := c.waitTransfer(ctx, weights.RequestID); wait != nil {
 			return wait
 		}
 	}
@@ -355,10 +355,10 @@ func (c *Orchestrator) finalizeModelTransfer(ctx context.Context, requestID stri
 			"this daemon has no model transfer finalizer")
 	} else if problem = c.opt.Store.BeginModelTransferFinalization(requestID); problem == nil {
 		problem = c.opt.ModelTransfers.Finalize(ctx, requestID,
-			func(ctx context.Context, artifact records.ModelTransferArtifact, operationID string,
-				decisions []ArtifactTransferDecision,
+			func(ctx context.Context, weights records.ModelTransferWeights, operationID string,
+				decisions []WeightsTransferDecision,
 			) *exit.Error {
-				return c.moveModelTransferArtifact(ctx, artifact, operationID, decisions)
+				return c.moveModelTransferWeights(ctx, weights, operationID, decisions)
 			})
 	}
 	if problem != nil {

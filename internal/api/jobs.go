@@ -212,19 +212,19 @@ func validateModelTransferSubmission(spec orchestrator.Submission) *exit.Error {
 		}
 		return nil
 	}
-	if len(intent.SourceProfiles) == 0 || len(intent.Outputs) != len(spec.ArtifactOutputs) ||
+	if len(intent.SourceProfiles) == 0 || len(intent.Outputs) != len(spec.WeightsOutputs) ||
 		!sameProfileMap(intent.SourceProfiles, spec.ProducerProfiles) {
 		return exit.New(exit.Validation, "producer transfer inputs/outputs do not match the job descriptor")
 	}
-	declared := make(map[string]bool, len(spec.ArtifactOutputs))
-	for _, output := range spec.ArtifactOutputs {
+	declared := make(map[string]bool, len(spec.WeightsOutputs))
+	for _, output := range spec.WeightsOutputs {
 		declared[output.OutputID] = true
 	}
 	for _, output := range intent.Outputs {
-		var declaredOutput *orchestrator.ArtifactOutput
-		for i := range spec.ArtifactOutputs {
-			if spec.ArtifactOutputs[i].OutputID == output.Name {
-				declaredOutput = &spec.ArtifactOutputs[i]
+		var declaredOutput *orchestrator.WeightsOutput
+		for i := range spec.WeightsOutputs {
+			if spec.WeightsOutputs[i].OutputID == output.Name {
+				declaredOutput = &spec.WeightsOutputs[i]
 			}
 		}
 		if !declared[output.Name] || output.RequiredContract == nil || declaredOutput == nil ||
@@ -271,11 +271,11 @@ func replayJobSubmission(sub JobSubmission,
 	if len(models) == 0 && recorded.ModelTransfer == nil {
 		models = append(models, recorded.Models...)
 	}
-	var artifactOutputs []orchestrator.ArtifactOutput
-	if recorded.ArtifactOutputs != "" {
-		if err := json.Unmarshal([]byte(recorded.ArtifactOutputs), &artifactOutputs); err != nil {
+	var weightsOutputs []orchestrator.WeightsOutput
+	if recorded.WeightsOutputs != "" {
+		if err := json.Unmarshal([]byte(recorded.WeightsOutputs), &weightsOutputs); err != nil {
 			return orchestrator.Submission{}, exit.Internalf(
-				"cannot replay job %s artifact outputs: %s", recorded.ID, err)
+				"cannot replay job %s weights outputs: %s", recorded.ID, err)
 		}
 	}
 	outputs := []string(nil)
@@ -307,7 +307,7 @@ func replayJobSubmission(sub JobSubmission,
 		InstallID: recorded.InstallID, Release: recorded.Release,
 		ReleaseDigest:        recorded.PackageRevisionDigest,
 		PrivatePackageDigest: recorded.PrivatePackageDigest,
-		PlanID:               recorded.PlanID, Outputs: outputs, ArtifactOutputs: artifactOutputs,
+		PlanID:               recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
 		JobGPUCount: recorded.JobGPUCount, Trees: trees, Worker: recorded.Worker,
 		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
 		Models: models, ModelTransfer: transfer, ProducerProfiles: profiles}, nil
@@ -377,7 +377,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			return out, problem
 		}
 		out.PlanID, out.Outputs = logical.DescriptorID, logical.Outputs
-		out.ArtifactOutputs, out.JobGPUCount = logical.ArtifactOutputs, logical.GPUCount
+		out.WeightsOutputs, out.JobGPUCount = logical.WeightsOutputs, logical.GPUCount
 		out.JobRequires = logical.Requires
 		out.ProducerProfiles = logical.SourceProfiles
 		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
@@ -417,7 +417,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		}
 		out.PlanID = job.DescriptorID
 		out.Outputs = job.Outputs
-		out.ArtifactOutputs = job.ArtifactOutputs
+		out.WeightsOutputs = job.WeightsOutputs
 		out.JobGPUCount = job.GPUCount
 		out.JobRequires = job.Requires
 		out.ProducerProfiles = job.SourceProfiles
@@ -468,7 +468,7 @@ func (s *Server) resolvePrivateJob(ctx context.Context, sub JobSubmission,
 			continue
 		}
 		out.PlanID, out.Outputs = job.DescriptorID, job.Outputs
-		out.ArtifactOutputs, out.JobGPUCount = job.ArtifactOutputs, job.GPUCount
+		out.WeightsOutputs, out.JobGPUCount = job.WeightsOutputs, job.GPUCount
 		out.JobRequires = job.Requires
 		out.ProducerProfiles = job.SourceProfiles
 		if problem := validateJobPayload(job, out.Payload); problem != nil {
@@ -514,9 +514,9 @@ func validOrg(org string) *exit.Error {
 }
 
 func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
-	artifactOutputs := make([]canonical.Value, 0, len(spec.ArtifactOutputs))
-	for _, output := range spec.ArtifactOutputs {
-		artifactOutputs = append(artifactOutputs, map[string]canonical.Value{
+	weightsOutputs := make([]canonical.Value, 0, len(spec.WeightsOutputs))
+	for _, output := range spec.WeightsOutputs {
+		weightsOutputs = append(weightsOutputs, map[string]canonical.Value{
 			"max_bytes": int64(output.MaxBytes), "mime_type": output.MimeType,
 			"output_id": output.OutputID,
 		})
@@ -532,18 +532,18 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		})
 	}
 	doc := map[string]canonical.Value{
-		"kind":             "job",
-		"package":          spec.Package,
-		"function":         spec.Entrypoint,
-		"plan_id":          spec.PlanID,
-		"install_id":       spec.InstallID,
-		"org":              spec.Org,
-		"input":            base64.StdEncoding.EncodeToString(spec.Payload),
-		"outputs":          strings.Join(spec.Outputs, ","),
-		"artifact_outputs": artifactOutputs,
-		"trees":            strings.Join(spec.Trees, ","),
-		"job_gpu_count":    spec.JobGPUCount,
-		"models":           models,
+		"kind":            "job",
+		"package":         spec.Package,
+		"function":        spec.Entrypoint,
+		"plan_id":         spec.PlanID,
+		"install_id":      spec.InstallID,
+		"org":             spec.Org,
+		"input":           base64.StdEncoding.EncodeToString(spec.Payload),
+		"outputs":         strings.Join(spec.Outputs, ","),
+		"weights_outputs": weightsOutputs,
+		"trees":           strings.Join(spec.Trees, ","),
+		"job_gpu_count":   spec.JobGPUCount,
+		"models":          models,
 	}
 	if spec.Rental {
 		doc["rental"] = true
@@ -600,7 +600,7 @@ type JobState struct {
 	Error            string            `json:"error,omitempty"`
 	Result           any               `json:"result,omitempty"`
 	Outputs          []MediaRef        `json:"outputs"`
-	Artifacts        []ArtifactRef     `json:"artifacts,omitempty"`
+	Weights          []WeightsRef      `json:"weights,omitempty"`
 	Checkpoints      []JobCheckpoint   `json:"checkpoints,omitempty"`
 	ModelOutputs     map[string]string `json:"model_outputs,omitempty"`
 	ModelDestination string            `json:"model_destination,omitempty"`
@@ -613,15 +613,15 @@ type JobState struct {
 	EventsURL string     `json:"events_url"`
 }
 
-// ArtifactRef is Cozy's durable scratch adoption projection. It exposes no path or
+// WeightsRef is Cozy's durable scratch adoption projection. It exposes no path or
 // TensorFS internals: the exact Runtime receipt digest and Cozy-derived private root id
 // are the handles a later explicit promotion will consume.
-type ArtifactRef struct {
+type WeightsRef struct {
 	Attempt       int64  `json:"attempt"`
 	OutputSlot    string `json:"output_slot"`
 	Disposition   string `json:"disposition"`
 	Outcome       string `json:"outcome,omitempty"`
-	ReceiptDigest string `json:"artifact_receipt_digest,omitempty"`
+	ReceiptDigest string `json:"weights_receipt_digest,omitempty"`
 	ScratchRootID string `json:"scratch_root_id,omitempty"`
 }
 
@@ -699,10 +699,10 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 			for slot, checkpoint := range transfer.Checkpoints {
 				state.ModelOutputs[slot] = checkpoint
 			}
-			if artifacts, artifactProblem := s.store.ModelTransferArtifacts(row.ID, row.Ordinal); artifactProblem == nil {
-				for _, artifact := range artifacts {
-					if artifact.FinalID != "" {
-						state.ModelOutputs[artifact.OutputSlot] = artifact.ManifestID
+			if rows, weightsProblem := s.store.AllModelTransferWeights(row.ID, row.Ordinal); weightsProblem == nil {
+				for _, weights := range rows {
+					if weights.FinalID != "" {
+						state.ModelOutputs[weights.OutputSlot] = weights.ManifestID
 					}
 				}
 			}
@@ -754,16 +754,16 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 			Entries: p.Entries, Bytes: p.Bytes, CommittedAt: p.CommittedAt,
 		}
 	}
-	if artifacts, e := s.store.ArtifactFinalizationsOf(row.ID); e == nil {
-		for _, artifact := range artifacts {
-			receiptDigest := artifact.ReceiptDigest
+	if rows, e := s.store.WeightsFinalizationsOf(row.ID); e == nil {
+		for _, weights := range rows {
+			receiptDigest := weights.ReceiptDigest
 			if receiptDigest == "" {
-				receiptDigest = artifact.ResultReceiptDigest
+				receiptDigest = weights.ResultReceiptDigest
 			}
-			state.Artifacts = append(state.Artifacts, ArtifactRef{
-				Attempt: artifact.Attempt, OutputSlot: artifact.OutputSlot,
-				Disposition: artifact.Disposition, Outcome: artifact.ResultOutcome,
-				ReceiptDigest: receiptDigest, ScratchRootID: artifact.ScratchRootID,
+			state.Weights = append(state.Weights, WeightsRef{
+				Attempt: weights.Attempt, OutputSlot: weights.OutputSlot,
+				Disposition: weights.Disposition, Outcome: weights.ResultOutcome,
+				ReceiptDigest: receiptDigest, ScratchRootID: weights.ScratchRootID,
 			})
 		}
 	}
