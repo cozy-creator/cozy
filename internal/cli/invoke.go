@@ -608,9 +608,12 @@ func handleRunCancel(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	if before.Kind == "job" {
+		return handleJobCancel(ctx)
+	}
 	if invocationSettled(before.Status) {
 		fields := append(invocationFields(before), output.Field{K: "changed", V: false})
-		return emit(ctx, compactRecord(fields, "id", "target", "status", "changed"))
+		return emit(ctx, compactRecord(fields, "number", "target", "status", "changed"))
 	}
 	if problem := client.Cancel(id); problem != nil {
 		return problem
@@ -623,7 +626,7 @@ func handleRunCancel(ctx *Context) *exit.Error {
 		return problem
 	}
 	fields := append(invocationFields(after), output.Field{K: "changed", V: true})
-	return emit(ctx, compactRecord(fields, "id", "target", "status", "changed"))
+	return emit(ctx, compactRecord(fields, "number", "target", "status", "changed"))
 }
 
 func handleRunList(ctx *Context) *exit.Error {
@@ -645,8 +648,8 @@ func handleRunList(ctx *Context) *exit.Error {
 	}
 	pkg := strings.TrimSpace(ctx.Inv.Value("--package"))
 	list := output.List{
-		Name: "invocations", Fields: []string{"id", "kind", "target", "status"},
-		AllFields: []string{"id", "kind", "target", "status", "attempts", "created"},
+		Name: "invocations", Fields: []string{"number", "target", "status", "elapsed"},
+		AllFields: []string{"number", "id", "kind", "target", "status", "elapsed", "attempts", "created"},
 	}
 	states := map[string]int{}
 	for _, life := range rows {
@@ -658,8 +661,9 @@ func handleRunList(ctx *Context) *exit.Error {
 			kind = "invocation"
 		}
 		list.Rows = append(list.Rows, map[string]string{
-			"id": life.RequestID, "kind": kind,
+			"number": strconv.FormatInt(life.Number, 10), "id": life.RequestID, "kind": kind,
 			"target": life.Package + "/" + life.Function, "status": life.Status,
+			"elapsed":  fmt.Sprintf("%.1fs", float64(life.ElapsedMS)/1000),
 			"attempts": strconv.Itoa(life.Attempts), "created": life.CreatedAt,
 		})
 		states[life.Status]++
@@ -681,7 +685,7 @@ func invocationFields(life api.Lifecycle) []output.Field {
 		kind = "invocation"
 	}
 	return []output.Field{
-		{K: "id", V: life.RequestID}, {K: "kind", V: kind},
+		{K: "number", V: life.Number}, {K: "id", V: life.RequestID}, {K: "kind", V: kind},
 		{K: "target", V: life.Package + "/" + life.Function},
 		{K: "status", V: life.Status}, {K: "attempts", V: life.Attempts},
 	}
@@ -718,8 +722,9 @@ func observe(ctx *Context, c *localapi.Client, requestID string, stream bool,
 
 func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Error {
 	status := runStatus(life.Status)
+	reference := runReference(life.Number, life.RequestID)
 	fields := []output.Field{
-		{K: "run", V: life.RequestID},
+		{K: "run", V: reference}, {K: "id", V: life.RequestID},
 		{K: "target", V: life.Package + "/" + life.Function},
 		{K: "status", V: status},
 	}
@@ -740,8 +745,8 @@ func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Er
 	defaults = append(defaults, "run")
 	rec := compactRecord(fields, defaults...)
 	rec.Next = []string{
-		"cozy run watch " + life.RequestID,
-		"cozy run cancel " + life.RequestID,
+		"cozy run watch " + reference,
+		"cozy run cancel " + reference,
 	}
 	return emit(ctx, rec)
 }
@@ -1234,7 +1239,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		status = "deadline"
 	}
 	fields := []output.Field{
-		{K: "id", V: life.RequestID},
+		{K: "number", V: life.Number}, {K: "id", V: life.RequestID},
 		{K: "target", V: life.Package + "/" + life.Function},
 		{K: "package", V: life.Package},
 		{K: "function", V: life.Function},
@@ -1316,6 +1321,13 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 			WithNext("cozy run list --full")
 	}
 	return e
+}
+
+func runReference(number int64, id string) string {
+	if number > 0 {
+		return strconv.FormatInt(number, 10)
+	}
+	return id
 }
 
 // expandSavedResult avoids printing an asset handle twice: once as an internal JSON

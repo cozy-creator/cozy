@@ -1,9 +1,11 @@
 package producttest
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -105,6 +107,74 @@ func TestProductPath(t *testing.T) {
 	must(t, err)
 	if len(fixed) != 1 || !requestOutputName(fixed[0].Name(), ".webp") {
 		t.Fatalf("the same explicit payload did not resolve to one stable filename: %v", fixed)
+	}
+
+	type listedRun struct {
+		Number  string `json:"number"`
+		ID      string `json:"id"`
+		Kind    string `json:"kind"`
+		Target  string `json:"target"`
+		Status  string `json:"status"`
+		Elapsed string `json:"elapsed"`
+	}
+	listRuns := func() []listedRun {
+		t.Helper()
+		code, out := runCozy(t, root, "run", "list", "--json", "--full")
+		var document struct {
+			Invocations []listedRun `json:"invocations"`
+		}
+		if code != 0 {
+			t.Fatalf("run list failed [exit %d]\n%s", code, out)
+		}
+		if err := json.Unmarshal([]byte(out), &document); err != nil {
+			t.Fatalf("run list returned invalid JSON: %v\n%s", err, out)
+		}
+		return document.Invocations
+	}
+	runs := listRuns()
+	if len(runs) < 4 {
+		t.Fatalf("run list omitted recorded invocations: %+v", runs)
+	}
+	for index, row := range runs {
+		number, err := strconv.ParseInt(row.Number, 10, 64)
+		if err != nil || number < 1 || !strings.HasPrefix(row.ID, "req-") ||
+			row.Kind != "invocation" || !strings.HasSuffix(row.Elapsed, "s") {
+			t.Fatalf("run list row %d is not useful: %+v (%v)", index, row, err)
+		}
+		if index > 0 {
+			prior, _ := strconv.ParseInt(runs[index-1].Number, 10, 64)
+			if prior <= number {
+				t.Fatalf("run list is not newest-first by local number: %+v", runs)
+			}
+		}
+	}
+	latest := runs[0]
+	if code, out := runCozy(t, root, "run", "watch", latest.Number, "--json"); code != 0 ||
+		!strings.Contains(out, `"status":"completed"`) {
+		t.Fatalf("numeric run watch failed [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "run", "cancel", latest.Number, "--json"); code != 0 ||
+		!strings.Contains(out, `"changed":false`) {
+		t.Fatalf("numeric run cancel was not idempotent [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "run", "list", "--limit", "2"); code != 0 ||
+		!strings.Contains(out, "NUMBER") || !strings.Contains(out, "ELAPSED") ||
+		strings.Contains(out, "KIND") || strings.Index(out, runs[0].Number) > strings.Index(out, runs[1].Number) {
+		t.Fatalf("human run list columns/order are not useful [exit %d]\n%s", code, out)
+	}
+
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job",
+		"size=8", "seed=11", "--await", "--json")
+	if code != 0 || !strings.Contains(out, `"status":"completed"`) {
+		t.Fatalf("local job did not complete [exit %d]\n%s", code, out)
+	}
+	runs = listRuns()
+	if len(runs) == 0 || runs[0].Kind != "job" {
+		t.Fatalf("full run list did not retain the job kind: %+v", runs)
+	}
+	if code, out := runCozy(t, root, "run", "watch", runs[0].Number, "--json"); code != 0 ||
+		!strings.Contains(out, `"status":"completed"`) {
+		t.Fatalf("numeric job watch failed [exit %d]\n%s", code, out)
 	}
 
 	detachedDir := filepath.Join(root, "detached-output")

@@ -47,17 +47,17 @@ const (
 )
 
 func (s *Server) requestEvents(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	row, e := s.store.RequestRow(id)
+	reference := r.PathValue("id")
+	row, e := s.store.RequestByReference(reference)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
 	if row == nil {
-		s.refuse(w, r, http.StatusNotFound, "not_found", "no request "+id+" on this host", "")
+		s.refuse(w, r, http.StatusNotFound, "not_found", "no request "+reference+" on this host", "")
 		return
 	}
-	s.stream(w, r, id)
+	s.stream(w, r, row.ID)
 }
 
 // stream serves one request's durable and live events.
