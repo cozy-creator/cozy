@@ -118,7 +118,7 @@ func cleanupTestGeneration(l home.Layout, id, version string) records.PackageIns
 		ID: id, Package: "cozy/example", Major: 1, Version: version,
 		SourceKind: "tensorhub", SourceRef: "cozy/example@" + version,
 		SourceDigest: "sha256:" + id + id + id + id, Verified: true,
-		Dir: l.GenerationDir(id),
+		Dir: l.InstallDir(id),
 	}
 }
 
