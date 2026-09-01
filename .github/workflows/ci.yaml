@@ -32,6 +32,48 @@ jobs:
       - run: nice -n 19 go test ./... -timeout 20m
       - run: python3 scripts/fence.py
 
+  # THE WORKER-IMAGE ROSTER CHECK. `internal/packagepublish/base-distributions.json` is
+  # cozy-runtime's generated file, copied. It decides what `uv export --prune` strips from
+  # a publication, so drift between the copy and the original either strips a wheel the
+  # package needs or uploads one the worker will refuse — which is exactly what had already
+  # happened, by three names, when the two lists were separately authored.
+  #
+  # The always-armed half runs in `checks` with no credential: it proves the Go side prunes
+  # exactly the vendored roster and nothing else. This job is the ceiling — the byte
+  # comparison against cozy-runtime itself — and it self-arms the moment a read credential
+  # for the private sibling exists, rather than sitting red or hiding behind a flipped
+  # variable.
+  runtime-roster:
+    runs-on: ubuntu-latest
+    env:
+      COZY_RUNTIME_TOKEN: ${{ secrets.COZY_RUNTIME_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: cozy
+      - name: Check out the runtime peer
+        if: env.COZY_RUNTIME_TOKEN != ''
+        uses: actions/checkout@v4
+        with:
+          repository: cozy-creator/cozy-runtime-v2
+          path: cozy-runtime
+          token: ${{ env.COZY_RUNTIME_TOKEN }}
+      - uses: actions/setup-go@v5
+        if: env.COZY_RUNTIME_TOKEN != ''
+        with:
+          go-version: stable
+      - name: Compare the vendored roster against cozy-runtime
+        if: env.COZY_RUNTIME_TOKEN != ''
+        working-directory: cozy
+        run: |
+          nice -n 19 go test ./tests/product/ -run TestVendoredBaseDistributions -v -timeout 5m \
+            -cozy-runtime-repo="$GITHUB_WORKSPACE/cozy-runtime" \
+            -require-cozy-runtime-peer
+      - name: Report unarmed roster comparison
+        if: env.COZY_RUNTIME_TOKEN == ''
+        run: |
+          echo '::warning::COZY_RUNTIME_TOKEN is absent, so the vendored base-distributions.json was not byte-compared against cozy-runtime. This is a missing ceiling, not a missing floor: the always-armed half ran in `checks` and proves the publish prune list is derived from these bytes with nothing added or dropped.'
+
   # THE VENDORED-BINDING CHECK. `protocol/` is copied, never imported as a module, so
   # worker-protocol regenerates from its own .proto with its pinned toolchain and
   # byte-compares against what is vendored here. Exact source custody belongs at build

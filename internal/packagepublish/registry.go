@@ -21,21 +21,6 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// A rental cannot replace these image-owned platform families and their small declared native
-// closure. Other libraries stay package-owned even when one image happens to carry a copy;
-// Runtime compares these requirements against the actual selected base before installation.
-var remoteBaseRoots = map[string]bool{
-	"cozy-runtime": true, //cozy:allow base distribution identity, not executable access
-	"msgspec":      true,
-	"numpy":        true,
-	"pillow":       true,
-	"tensorfs":     true,
-	"torch":        true,
-	"torchaudio":   true,
-	"torchvision":  true,
-	"triton":       true,
-}
-
 type registryLock struct {
 	LockVersion string            `toml:"lock-version"`
 	Packages    []registryPackage `toml:"packages"`
@@ -64,12 +49,7 @@ func collectRegistryDependencies(ctx context.Context, project, stage string, exi
 	lockPath := filepath.Join(stage, "pylock.registry.toml")
 	args := []string{"export", "--locked", "--no-dev", "--no-emit-project", "--no-emit-local",
 		"--format", "pylock.toml", "--output-file", lockPath, "--no-progress", "--directory", project}
-	roots := make([]string, 0, len(remoteBaseRoots))
-	for name := range remoteBaseRoots {
-		roots = append(roots, name)
-	}
-	sort.Strings(roots)
-	for _, name := range roots {
+	for _, name := range PrunedDistributions() {
 		args = append(args, "--prune", name)
 	}
 	command := exec.CommandContext(ctx, "uv", args...)
