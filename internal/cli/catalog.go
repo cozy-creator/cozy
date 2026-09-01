@@ -42,7 +42,8 @@ func handlePackageSearch(ctx *Context) *exit.Error { return handleResourceSearch
 func handleModelSearch(ctx *Context) *exit.Error   { return handleResourceSearch(ctx, "model") }
 
 func handleResourceSearch(ctx *Context, kind string) *exit.Error {
-	if len(ctx.Inv.Args) == 1 {
+	family := strings.TrimSpace(ctx.Inv.Value("--family"))
+	if len(ctx.Inv.Args) == 1 && family == "" {
 		if ref, problem := hub.ParseRef(ctx.Inv.Args[0]); problem == nil {
 			if kind == "model" {
 				return handleModelShow(ctx, ref)
@@ -68,7 +69,7 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	if kind == "package" {
 		resources, search, e = c.Packages(hctx, query)
 	} else {
-		resources, search, e = c.Models(hctx, query)
+		resources, search, e = c.Models(hctx, query, family)
 	}
 	if e != nil {
 		return e
@@ -80,8 +81,8 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	l := output.List{Name: kind + "s", Fields: []string{"ref"},
 		AllFields: []string{"ref", "created", "org", "name"}, Total: search.Total}
 	if kind == "model" {
-		l.Fields = []string{"model", "lanes"}
-		l.AllFields = []string{"model", "lanes", "created", "org", "name"}
+		l.Fields = []string{"model", "family", "lanes"}
+		l.AllFields = []string{"model", "family", "lanes", "created", "org", "name"}
 	}
 	for _, r := range resources {
 		row := map[string]string{
@@ -122,8 +123,8 @@ func handleModelShow(ctx *Context, ref hub.Ref) *exit.Error {
 		return problem
 	}
 	return emit(ctx, output.List{
-		Name: "models", Fields: []string{"model", "lanes"},
-		AllFields: []string{"model", "lanes", "created", "org", "name"},
+		Name: "models", Fields: []string{"model", "family", "lanes"},
+		AllFields: []string{"model", "family", "lanes", "created", "org", "name"},
 		Rows:      []map[string]string{modelSearchRow(card)}, Total: 1,
 	})
 }
@@ -150,9 +151,37 @@ func modelSearchRow(card hub.ModelCard) map[string]string {
 	}
 	sort.Strings(coordinates)
 	return map[string]string{
-		"model": card.Model.Ref(), "lanes": strings.Join(coordinates, ", "),
+		"model": card.Model.Ref(), "family": card.Model.Family,
+		"lanes":   strings.Join(coordinates, ", "),
 		"created": stamp(card.Model.CreatedAt), "org": card.Model.Org, "name": card.Model.Name,
 	}
+}
+
+func handleModelFamily(ctx *Context) *exit.Error {
+	ref, problem := hub.ParseRef(ctx.Inv.Args[0])
+	if problem != nil {
+		return problem
+	}
+	family := strings.TrimSpace(ctx.Inv.Value("--family"))
+	clear := ctx.Inv.Bool("--clear")
+	if clear && family != "" {
+		return exit.Usagef("provide a family or --clear, not both")
+	}
+	if !clear && family == "" {
+		return exit.Usagef("provide one recognized family or --clear")
+	}
+	if clear {
+		family = ""
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	model, problem := client(ctx).SetModelFamily(hctx, ref, family)
+	if problem != nil {
+		return problem
+	}
+	return emit(ctx, compactRecord([]output.Field{
+		{K: "model", V: model.Ref()}, {K: "family", V: model.Family}, {K: "status", V: "updated"},
+	}, "model", "family", "status"))
 }
 
 func handlePackageShow(ctx *Context, ref hub.Ref) *exit.Error {

@@ -108,6 +108,7 @@ func (c *PackagePublishCmd) Run(r *Runtime) error {
 
 type ModelCmd struct {
 	Search   ModelSearchCmd   `cmd:"" help:"Search the model catalog."`
+	Family   ModelFamilyCmd   `cmd:"" help:"Set a model repository's discovery family."`
 	Import   ModelImportCmd   `cmd:"" help:"Import a foreign model into local TensorFS."`
 	Download ModelDownloadCmd `cmd:"" help:"Download a model into the local TensorFS store."`
 	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model repositories."`
@@ -130,13 +131,25 @@ func (c *ModelImportCmd) Run(r *Runtime) error {
 }
 
 type ModelSearchCmd struct {
-	Query []string `arg:"" optional:"" name:"query" help:"Search text or an exact org/name."`
-	Limit int      `help:"Maximum results." default:"20"`
+	Query  []string `arg:"" optional:"" name:"query" help:"Search text or an exact org/name."`
+	Limit  int      `help:"Maximum results." default:"20"`
+	Family string   `help:"Only show one recognized model family."`
 }
 
 func (c *ModelSearchCmd) Run(r *Runtime) error {
 	return r.call(handleModelSearch, c.Query, nil,
-		values("--limit", intText(c.Limit)), false)
+		values("--limit", intText(c.Limit), "--family", c.Family), false)
+}
+
+type ModelFamilyCmd struct {
+	Model  string `arg:"" name:"model" help:"Model repository as org/name."`
+	Family string `arg:"" optional:"" name:"family" help:"Recognized family value."`
+	Clear  bool   `help:"Clear the repository family."`
+}
+
+func (c *ModelFamilyCmd) Run(r *Runtime) error {
+	return r.call(handleModelFamily, []string{c.Model}, bools("--clear", c.Clear),
+		values("--family", c.Family), true)
 }
 
 type ModelDownloadCmd struct {
