@@ -27,6 +27,9 @@ jobs:
       # The 90 frozen vectors and their .verdict files: every canonical document kind,
       # its exact object id, its typed refusal code, and one-byte mutants of each.
       - run: ./target/release/tfs vectors verify
+      # Every reference decoder in the harness, qualified bit-for-bit against the
+      # producer-mined vectors, and every deliberately-wrong arm required to FAIL.
+      - run: ./target/release/tfs conform
       # The format gate: the production Rust codec and an independent Python codec over
       # the same green/red corpus, both required to agree byte for byte.
       - run: >-
