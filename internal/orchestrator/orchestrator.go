@@ -769,6 +769,10 @@ func retirementGround(w *worker) string {
 		return fmt.Sprintf("this owner refused its claim (%s: %s)",
 			w.refusal.ErrName(), w.refusal.Message)
 	}
+	if w.spec.Connection == nil && w.desiredRefusal != nil {
+		return fmt.Sprintf("it refused the desired placement (%s: %s)",
+			w.desiredRefusal.ErrName(), w.desiredRefusal.Message)
+	}
 	if w.faulted {
 		return fmt.Sprintf("it reported a FAILED worker/placement axis: %s", w.fault)
 	}

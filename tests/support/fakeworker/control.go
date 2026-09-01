@@ -156,7 +156,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 					bindingDigests = append(bindingDigests, digest)
 				}
 			}
-			r.Placements = []*pb.PlacementStatus{{
+			placement := &pb.PlacementStatus{
 				PlacementId:        placementID,
 				Materialization:    pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
 				Serving:            pb.ServingState_SERVING_STATE_DISPATCHABLE,
@@ -165,7 +165,18 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				PackageRevisionDigest: packageRevision,
 				EnvironmentDigest:     environmentDigest,
 				ConfigDigest:          configDigest,
-			}}
+			}
+			if f.arm == "placement-failed" {
+				placement.Materialization = pb.MaterializationState_MATERIALIZATION_STATE_FAILED
+				placement.Serving = pb.ServingState_SERVING_STATE_OFFLINE
+				placement.DispatchableBindingDigests = nil
+				placement.Faults = []*pb.Fault{{
+					Kind: pb.FaultKind_FAULT_KIND_CONFIG_REFUSED, Subject: placementID,
+					Reason: "package_descriptor_invalid",
+					Detail: "the installed Runtime cannot read this package descriptor",
+				}}
+			}
+			r.Placements = []*pb.PlacementStatus{placement}
 		}
 		env(func(e, g uint64, b string) {
 			r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId = e, g, b

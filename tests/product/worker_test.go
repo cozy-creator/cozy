@@ -139,6 +139,39 @@ func TestDesiredStatePreconditionFailsWithoutReconnect(t *testing.T) {
 	}
 }
 
+func TestQueuedLocalRequestReplacesTerminallyFaultedWarmWorker(t *testing.T) {
+	healthy := fakeSpec("stale-runtime-replacement", "0", "--arm", "output")
+	healthy.Args = append(healthy.Args, "--cozy-home",
+		filepath.Join(os.TempDir(), "cozy-product-test", "stale-runtime-replacement"))
+	o := hostOwnerWithLauncher(t, "stale-runtime-replacement", fixedLauncher{healthy})
+
+	stale := fakeSpec("stale-runtime-replacement", "0", "--arm", "placement-failed")
+	instance, _, problem := o.c.EnsureWorker(stale)
+	fatal(t, problem)
+	problem = o.c.EnsurePlacementReady(instance, planIDOf(t, stale))
+	if problem == nil || !strings.Contains(problem.Message, "package_descriptor_invalid") {
+		t.Fatalf("stale Runtime did not report its terminal placement refusal: %v", problem)
+	}
+	staleFacts := o.c.Worker(instance)
+	if staleFacts == nil || staleFacts.PID <= 0 {
+		t.Fatalf("terminally faulted worker disappeared before replacement proof: %#v", staleFacts)
+	}
+
+	requestID, _, problem := o.c.Submit(submission(planIDOf(t, healthy),
+		"fake/stale-runtime-replacement", "stale-runtime-replacement",
+		map[string]any{"message": "marco"}))
+	fatal(t, problem)
+	result, problem := o.c.AwaitSettled(requestID, 10*time.Second)
+	if problem != nil || result.Status != "SUCCEEDED" {
+		t.Fatalf("queued local request did not run on the replacement Runtime: %#v, %v", result, problem)
+	}
+	replacement := o.c.Worker(instance)
+	if replacement == nil || replacement.PID <= 0 || replacement.PID == staleFacts.PID {
+		t.Fatalf("local request reused terminally faulted Runtime process: %#v -> %#v",
+			staleFacts, replacement)
+	}
+}
+
 func TestPackageScopedUnloadPreservesUnrelatedWarmWorker(t *testing.T) {
 	o := hostOwner(t, "package-scoped-unload")
 	for _, id := range []string{"old-editable-install", "current-editable-install"} {

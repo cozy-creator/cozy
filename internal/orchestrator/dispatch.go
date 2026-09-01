@@ -538,7 +538,12 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			// Found live by cl-004's escape arm, which changes the descriptor and
 			// therefore the job descriptor id: six queued jobs waited on a worker holding
 			// the previous digest, forever.
-			if staged(w, req.PlanID) {
+			// A worker that has already answered that this placement cannot run is not
+			// warm capacity. This occurs naturally when the host Runtime is upgraded while
+			// the long-lived daemon still owns a worker loaded from the previous install.
+			// Replace that process once; the new launch below either serves the request with
+			// the current Runtime or gives the request its own prompt terminal answer.
+			if staged(w, req.PlanID) && retirementGround(w) == "" {
 				c.mu.Unlock()
 				return
 			}
