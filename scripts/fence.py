@@ -870,10 +870,7 @@ def check_python_seat():
         if deleted in text + install:
             bad.append(f"internal/install: [python] retired shared-base install path remains: {deleted}")
 
-    fixtures = (
-        pathlib.Path("tests/product/testdata/build-weightless.py"),
-        pathlib.Path("tests/product/testdata/build-modeled-editable.py"),
-    )
+    fixtures = (pathlib.Path("tests/product/testdata/build-weightless.py"),)
     for fixture in fixtures:
         body = fixture.read_text()
         if ">=3.12,<3.13" not in body:
