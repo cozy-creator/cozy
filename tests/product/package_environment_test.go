@@ -154,12 +154,12 @@ func TestPublishedPackageInstallsSourceCarriedTensorFSLocally(t *testing.T) {
 	fatal(t, pack.Build(context.Background()))
 	defer pack.Close()
 	if len(pack.DependencyWheels) != 1 {
-		t.Fatalf("TensorFS entered the rental dependency overlay: %+v", pack.DependencyWheels)
+		t.Fatalf("TensorFS entered rental package dependencies: %+v", pack.DependencyWheels)
 	}
 	runtimeIdentity, problem := wheel.InspectIdentity(pack.DependencyWheels[0].Path)
 	fatal(t, problem)
 	if runtimeIdentity.Distribution != "cozy-runtime" { //cozy:allow distribution assertion, not executable access
-		t.Fatalf("published dependency overlay = %+v, want Runtime only", runtimeIdentity)
+		t.Fatalf("published package dependencies = %+v, want Runtime only", runtimeIdentity)
 	}
 
 	exact := func(path string) hub.ExactDocument {

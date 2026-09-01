@@ -166,7 +166,7 @@ func validatePublished(gen records.PackageInstall, published *PublishedSource) *
 	for _, wheel := range published.LocalWheels {
 		if wheel.Distribution != "tensorfs" || seenDependencies[wheel.Distribution] {
 			return exit.Named(exit.Conflict, "package_local_wheel_invalid",
-				"published local materialization wheel must be TensorFS outside the dependency overlay")
+				"published local materialization wheel must be TensorFS outside package dependencies")
 		}
 	}
 	return nil
