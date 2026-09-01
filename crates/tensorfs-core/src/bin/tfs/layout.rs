@@ -20,7 +20,7 @@ use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::Store;
 
-use crate::{bail, flag, rss_kb, Flags};
+use crate::{bail, flag, flag_on, rss_kb, Flags};
 
 macro_rules! ok {
     ($e:expr) => {
@@ -427,6 +427,9 @@ fn emit_bytes(bytes: &[u8], flags: &Flags) {
 /// `check_compatibility` over two documents on disk. Zero tensor bytes are read: the whole
 /// decision is a function of a code topology, a header and a closure, which is exactly why
 /// it is decidable before a download.
+///
+/// `--json` prints `{"details":[...],"report":"sha256:...","satisfied":bool}` and nothing
+/// else. That is the surface a program should read; the human print below is for people.
 pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
     let code = ok!(CodeTopology::parse(&rd!(code_p)));
     let header = ok!(Header::parse(&rd!(header_p)));
@@ -460,6 +463,47 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
     let us = t.elapsed().as_secs_f64() * 1e6;
     let report = ok!(CompatibilityReport::of(&code, &header, lane, &out));
     emit(&report, flags);
+
+    // The machine surface. A caller that shells out to this command must not have to
+    // recognise a verdict by matching a column-aligned print; tensorhub did exactly that
+    // and would have failed closed on any reformat.
+    if flag_on(flags, "json") {
+        let details = match &out.satisfaction {
+            Satisfaction::Satisfied => Vec::new(),
+            Satisfaction::Mismatch(d) => vec![tensorfs_core::canon::Value::obj(vec![
+                ("code", tensorfs_core::canon::Value::str(d.code.as_str())),
+                (
+                    "component",
+                    tensorfs_core::canon::Value::str(d.component.clone()),
+                ),
+                ("key", tensorfs_core::canon::Value::str(d.key.clone())),
+                (
+                    "required",
+                    tensorfs_core::canon::Value::str(side(&d.required)),
+                ),
+                (
+                    "present",
+                    tensorfs_core::canon::Value::str(side(&d.present)),
+                ),
+            ])],
+        };
+        let doc = tensorfs_core::canon::Value::obj(vec![
+            (
+                "satisfied",
+                tensorfs_core::canon::Value::Bool(details.is_empty()),
+            ),
+            ("details", tensorfs_core::canon::Value::arr(details)),
+            (
+                "report",
+                tensorfs_core::canon::Value::str(report.object_id()),
+            ),
+        ]);
+        println!(
+            "{}",
+            String::from_utf8_lossy(&tensorfs_core::canon::write(&doc))
+        );
+        return ExitCode::SUCCESS;
+    }
 
     println!("lane         {}", lane.name());
     println!(
