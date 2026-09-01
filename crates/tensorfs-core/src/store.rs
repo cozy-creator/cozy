@@ -409,7 +409,6 @@ impl Store {
         }
         let classification = match mutation {
             crate::repository::Mutation::PutCheckpoint { manifest, .. }
-            | crate::repository::Mutation::PutRelease { manifest, .. }
             | crate::repository::Mutation::ReplaceLocal { manifest, .. } => {
                 let parsed = self.read_manifest(manifest)?;
                 for (_, entry) in parsed.entries() {
@@ -422,21 +421,6 @@ impl Store {
                         );
                     }
                 }
-                let metadata = match mutation {
-                    crate::repository::Mutation::PutRelease { metadata, .. } => metadata.as_ref(),
-                    crate::repository::Mutation::PutCheckpoint { .. }
-                    | crate::repository::Mutation::ReplaceLocal { .. } => None,
-                    _ => unreachable!("classification mutation was matched above"),
-                };
-                if let Some(metadata) = metadata {
-                    let file = self.open_verified(&metadata.sha256)?;
-                    if file.len() != metadata.length {
-                        return refuse(
-                            Code::LENGTH_MISMATCH,
-                            format!("{} length differs from release metadata", metadata.id()),
-                        );
-                    }
-                }
                 match parsed.header() {
                     Some(header_ref) => {
                         let header = crate::checkpoint::load_header(self, header_ref)?;
@@ -446,8 +430,37 @@ impl Store {
                     None => None,
                 }
             }
+            crate::repository::Mutation::UpdateRelease { set, .. } => {
+                for lane in set {
+                    let parsed = self.read_manifest(&lane.manifest)?;
+                    for (_, entry) in parsed.entries() {
+                        let object = entry.blob();
+                        let file = self.open_verified(&object.sha256)?;
+                        if file.len() != object.length {
+                            return refuse(
+                                Code::LENGTH_MISMATCH,
+                                format!("{} length differs from manifest", object.id()),
+                            );
+                        }
+                    }
+                    if let Some(metadata) = &lane.metadata {
+                        let file = self.open_verified(&metadata.sha256)?;
+                        if file.len() != metadata.length {
+                            return refuse(
+                                Code::LENGTH_MISMATCH,
+                                format!("{} length differs from release metadata", metadata.id()),
+                            );
+                        }
+                    }
+                    if let Some(header_ref) = parsed.header() {
+                        crate::checkpoint::load_header(self, header_ref)?;
+                        crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;
+                    }
+                }
+                None
+            }
             crate::repository::Mutation::RemoveCheckpoint { .. }
-            | crate::repository::Mutation::RemoveRelease { .. }
+            | crate::repository::Mutation::YankRelease { .. }
             | crate::repository::Mutation::DeleteRepository { .. } => None,
         };
         let replacement = crate::repository::apply(observed, mutation, classification.as_deref())?;

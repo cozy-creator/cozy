@@ -219,13 +219,23 @@ class Store:
         declared_license: str,
     ) -> PreparedModelSources: ...
     def release_model_source(self, operation_id: str) -> None: ...
-    def remove_release(
+    def update_release(
         self,
         current: bytes,
         org: str,
         name: str,
         version: str,
-        lane: str,
+        expected_revision: int,
+        set: list[tuple[str, str, int]],
+        remove: list[str],
+    ) -> bytes: ...
+    def yank_release(
+        self,
+        current: bytes,
+        org: str,
+        name: str,
+        version: str,
+        expected_revision: int,
     ) -> bytes: ...
     def put_file(
         self, path: str, expect: str | None = ..., expect_length: int | None = ...

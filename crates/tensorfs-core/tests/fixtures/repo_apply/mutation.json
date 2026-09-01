@@ -1,1 +1,1 @@
-{"action":"put_release","lane":"cpu","manifest":{"length":160,"sha256":"08eff27435bd16bdb609e659362b2480f2934084d2d0790f955a7107f94ba631"},"repo":{"name":"marco-polo","org":"tensorhub"},"version":"1.0.0"}
+{"action":"update_release","expected_revision":0,"remove":[],"repo":{"name":"marco-polo","org":"tensorhub"},"set":[{"lane":"cpu","manifest":{"length":160,"sha256":"08eff27435bd16bdb609e659362b2480f2934084d2d0790f955a7107f94ba631"}}],"version":"1.0.0"}

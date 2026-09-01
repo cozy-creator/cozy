@@ -13,7 +13,7 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Body, Header};
 use crate::ids::{hex64, Doc, ObjectRef};
 use crate::manifest::{Entry, Manifest};
-use crate::repository::{Release, Repository, RepositoryName};
+use crate::repository::{Release, ReleaseLane, Repository, RepositoryName};
 
 fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
     Refusal {
@@ -155,6 +155,7 @@ pub struct CheckpointRow {
     pub manifest_sha256: String,
     pub name: String,
     pub org: String,
+    pub published: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +170,8 @@ pub struct ReleaseRow {
     pub object_bytes: u64,
     pub object_count: u64,
     pub org: String,
+    pub release_revision: u64,
+    pub release_yanked: bool,
     pub topology_digest: Option<String>,
     pub version: String,
 }
@@ -244,6 +247,7 @@ impl Projection {
                 ("manifest_sha256", Value::str(row.manifest_sha256.clone())),
                 ("name", Value::str(row.name.clone())),
                 ("org", Value::str(row.org.clone())),
+                ("published", Value::Bool(row.published)),
             ];
             if let Some(evidence) = &row.evidence_json {
                 fields.push((
@@ -264,6 +268,8 @@ impl Projection {
                 ("object_bytes", Value::uint(row.object_bytes)),
                 ("object_count", Value::uint(row.object_count)),
                 ("org", Value::str(row.org.clone())),
+                ("release_revision", Value::uint(row.release_revision)),
+                ("release_yanked", Value::Bool(row.release_yanked)),
                 ("version", Value::str(row.version.clone())),
             ];
             if let Some(evidence) = &row.evidence_json {
@@ -504,6 +510,7 @@ impl Census {
         repository: &Repository,
         repository_bytes: &[u8],
         release: &Release,
+        lane: &ReleaseLane,
         manifest_bytes: &[u8],
         header_bytes: Option<&[u8]>,
         inventory: BTreeMap<String, InventoryEntry>,
@@ -514,13 +521,13 @@ impl Census {
                 "repository projection bytes are not the canonical repository",
             );
         }
-        if !repository.releases.contains(release) {
+        if !repository.releases.contains(release) || !release.lanes.contains(lane) {
             return refuse(
                 Code::RELEASE_ABSENT,
                 "projected release is not present in replacement repository",
             );
         }
-        if ObjectRef::of(manifest_bytes) != release.manifest {
+        if ObjectRef::of(manifest_bytes) != lane.manifest {
             return refuse(
                 Code::OBJECT_ID_MISMATCH,
                 "staged manifest bytes disagree with the release reference",
@@ -554,7 +561,7 @@ impl Census {
 
         let mut manifests = BTreeMap::new();
         manifests.insert(
-            release.manifest.sha256.clone(),
+            lane.manifest.sha256.clone(),
             (manifest, manifest_bytes.to_vec()),
         );
         let census = Self {
@@ -581,9 +588,16 @@ impl Census {
                     manifest_sha256: checkpoint.manifest.sha256.clone(),
                     name: repository.repo.name.clone(),
                     org: repository.repo.org.clone(),
+                    published: checkpoint.published,
                 }
             }));
-        census.project_release_with_header(repository, release, &mut projection, header_bytes)?;
+        census.project_release_lane_with_header(
+            repository,
+            release,
+            lane,
+            &mut projection,
+            header_bytes,
+        )?;
         Ok(projection)
     }
 
@@ -654,6 +668,7 @@ impl Census {
                         manifest_sha256: checkpoint.manifest.sha256.clone(),
                         name: repository.repo.name.clone(),
                         org: repository.repo.org.clone(),
+                        published: checkpoint.published,
                     }
                 }));
             for release in &repository.releases {
@@ -689,6 +704,7 @@ impl Census {
                     manifest_sha256: checkpoint.manifest.sha256.clone(),
                     name: repository.repo.name.clone(),
                     org: repository.repo.org.clone(),
+                    published: checkpoint.published,
                 }
             }));
         for release in &repository.releases {
@@ -828,21 +844,25 @@ impl Census {
         release: &Release,
         projection: &mut Projection,
     ) -> Result<()> {
-        self.project_release_with_header(repository, release, projection, None)
+        for lane in &release.lanes {
+            self.project_release_lane_with_header(repository, release, lane, projection, None)?;
+        }
+        Ok(())
     }
 
-    fn project_release_with_header(
+    fn project_release_lane_with_header(
         &self,
         repository: &Repository,
         release: &Release,
+        lane: &ReleaseLane,
         projection: &mut Projection,
         header_bytes: Option<&[u8]>,
     ) -> Result<()> {
-        let (manifest, _) = self.manifest(&release.manifest)?;
+        let (manifest, _) = self.manifest(&lane.manifest)?;
         let checkpoint = repository
             .checkpoints
             .iter()
-            .find(|checkpoint| checkpoint.manifest == release.manifest)
+            .find(|checkpoint| checkpoint.manifest == lane.manifest)
             .ok_or_else(|| Refusal {
                 code: Code::CHECKPOINT_ABSENT,
                 detail: "release checkpoint is absent from repository roots".into(),
@@ -923,7 +943,7 @@ impl Census {
                 entry.blob(),
             )?;
         }
-        if let Some(metadata) = &release.metadata {
+        if let Some(metadata) = &lane.metadata {
             insert_ref(&mut objects, "metadata", metadata)?;
         }
         if let Some((_, header, _)) = &model {
@@ -980,7 +1000,7 @@ impl Census {
                     detail: "release object bytes overflow".into(),
                 })?;
             projection.objects.push(ReleaseObjectRow {
-                lane: release.lane.clone(),
+                lane: lane.lane.clone(),
                 length: object.length,
                 name: repository.repo.name.clone(),
                 object_kind: (*kind).to_string(),
@@ -998,13 +1018,15 @@ impl Census {
             header_sha256: model
                 .as_ref()
                 .map(|(reference, _, _)| reference.sha256.clone()),
-            lane: release.lane.clone(),
-            manifest_length: release.manifest.length,
-            manifest_sha256: release.manifest.sha256.clone(),
+            lane: lane.lane.clone(),
+            manifest_length: lane.manifest.length,
+            manifest_sha256: lane.manifest.sha256.clone(),
             name: repository.repo.name.clone(),
             object_bytes,
             object_count: objects.len() as u64,
             org: repository.repo.org.clone(),
+            release_revision: release.revision,
+            release_yanked: release.yanked,
             topology_digest: model.as_ref().map(|(_, _, digest)| digest.clone()),
             version: release.version.clone(),
         });
@@ -1022,7 +1044,7 @@ impl Census {
                 projection.encodings.push(ReleaseEncodingRow {
                     alias: None,
                     encoding_id,
-                    lane: release.lane.clone(),
+                    lane: lane.lane.clone(),
                     name: repository.repo.name.clone(),
                     org: repository.repo.org.clone(),
                     version: release.version.clone(),
@@ -1032,7 +1054,7 @@ impl Census {
                     projection.encodings.push(ReleaseEncodingRow {
                         alias: Some(alias),
                         encoding_id: encoding_id.clone(),
-                        lane: release.lane.clone(),
+                        lane: lane.lane.clone(),
                         name: repository.repo.name.clone(),
                         org: repository.repo.org.clone(),
                         version: release.version.clone(),
@@ -1043,7 +1065,7 @@ impl Census {
         for (component, _) in &header.components {
             projection.components.push(ReleaseComponentRow {
                 component: component.clone(),
-                lane: release.lane.clone(),
+                lane: lane.lane.clone(),
                 name: repository.repo.name.clone(),
                 org: repository.repo.org.clone(),
                 version: release.version.clone(),
@@ -1052,7 +1074,7 @@ impl Census {
         for (config, reference) in &header.configs {
             projection.configs.push(ReleaseConfigRow {
                 config: config.clone(),
-                lane: release.lane.clone(),
+                lane: lane.lane.clone(),
                 length: reference.length,
                 media_type: reference.media_type.clone(),
                 name: repository.repo.name.clone(),
@@ -1328,29 +1350,30 @@ pub fn repository_release_lines(root: &Path) -> Result<Vec<Vec<u8>>> {
     let mut lines = Vec::new();
     for (repository, _) in read_repositories(root)? {
         for release in &repository.releases {
-            let checkpoint = repository
-                .checkpoints
-                .iter()
-                .find(|checkpoint| checkpoint.manifest == release.manifest)
-                .expect("validated repository release checkpoint");
-            let mut fields = vec![
-                ("lane", Value::str(release.lane.clone())),
-                ("manifest_length", Value::uint(release.manifest.length)),
-                (
-                    "manifest_sha256",
-                    Value::str(release.manifest.sha256.clone()),
-                ),
-                ("name", Value::str(repository.repo.name.clone())),
-                ("org", Value::str(repository.repo.org.clone())),
-                ("version", Value::str(release.version.clone())),
-            ];
-            if let Some(evidence) = &checkpoint.evidence {
-                fields.push(("evidence", evidence.to_value()));
+            for lane in &release.lanes {
+                let checkpoint = repository
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.manifest == lane.manifest)
+                    .expect("validated repository release checkpoint");
+                let mut fields = vec![
+                    ("lane", Value::str(lane.lane.clone())),
+                    ("manifest_length", Value::uint(lane.manifest.length)),
+                    ("manifest_sha256", Value::str(lane.manifest.sha256.clone())),
+                    ("name", Value::str(repository.repo.name.clone())),
+                    ("org", Value::str(repository.repo.org.clone())),
+                    ("release_revision", Value::uint(release.revision)),
+                    ("release_yanked", Value::Bool(release.yanked)),
+                    ("version", Value::str(release.version.clone())),
+                ];
+                if let Some(evidence) = &checkpoint.evidence {
+                    fields.push(("evidence", evidence.to_value()));
+                }
+                if let Some(metadata) = &lane.metadata {
+                    fields.push(("metadata", metadata.to_value()));
+                }
+                lines.push(crate::canon::write(&Value::obj(fields)));
             }
-            if let Some(metadata) = &release.metadata {
-                fields.push(("metadata", metadata.to_value()));
-            }
-            lines.push(crate::canon::write(&Value::obj(fields)));
         }
     }
     Ok(lines)
@@ -1433,9 +1456,10 @@ mod tests {
         observed: Option<&[u8]>,
         release: &Mutation,
     ) -> Result<Option<Repository>> {
-        let Mutation::PutRelease { repo, manifest, .. } = release else {
-            panic!("apply_release requires PutRelease")
+        let Mutation::UpdateRelease { repo, set, .. } = release else {
+            panic!("apply_release requires UpdateRelease")
         };
+        let manifest = &set.first().expect("release test sets one lane").manifest;
         let checkpointed = store
             .apply_repository(
                 observed,
@@ -1454,18 +1478,32 @@ mod tests {
         )
     }
 
+    fn release_mutation(
+        repo: &RepositoryName,
+        version: &str,
+        lane: &str,
+        manifest: &ObjectRef,
+        expected_revision: u64,
+    ) -> Mutation {
+        Mutation::UpdateRelease {
+            expected_revision,
+            repo: repo.clone(),
+            remove: Vec::new(),
+            set: vec![ReleaseLane {
+                lane: lane.into(),
+                manifest: manifest.clone(),
+                metadata: None,
+            }],
+            version: version.into(),
+        }
+    }
+
     #[test]
     fn local_repo_commit_rebuild_and_gc_follow_only_the_repo_graph() {
         let root = temporary("repo-graph");
         let _ = fs::remove_dir_all(&root);
         let (store, repo, manifest) = fixture(&root);
-        let put = Mutation::PutRelease {
-            repo: repo.clone(),
-            lane: "cpu".into(),
-            manifest: manifest.clone(),
-            metadata: None,
-            version: "1.0.0".into(),
-        };
+        let put = release_mutation(&repo, "1.0.0", "cpu", &manifest, 0);
         apply_release(&store, None, &put).unwrap();
         let bytes = fs::read(store.repository_path(&repo)).unwrap();
         assert_eq!(
@@ -1525,13 +1563,7 @@ mod tests {
                 apply_release(
                     &store,
                     None,
-                    &Mutation::PutRelease {
-                        repo,
-                        lane: "cpu".into(),
-                        manifest,
-                        metadata: None,
-                        version: version.into(),
-                    },
+                    &release_mutation(&repo, version, "cpu", &manifest, 0),
                 )
             }));
         }
@@ -1566,20 +1598,26 @@ mod tests {
             ingest: None,
             verification: None,
         };
-        let release = Release {
+        let lane = ReleaseLane {
             lane: "cpu".into(),
             manifest: manifest_ref.clone(),
             metadata: None,
+        };
+        let release = Release {
+            lanes: vec![lane.clone()],
+            revision: 1,
             version: "1.0.0".into(),
+            yanked: false,
         };
         let repository = Repository::empty(repo)
             .put_checkpoint(Checkpoint {
                 manifest: manifest_ref.clone(),
                 evidence: Some(checkpoint_evidence),
+                published: false,
                 source_selection: None,
             })
             .unwrap()
-            .put_release(release.clone())
+            .update_release("1.0.0", 0, vec![lane.clone()], Vec::new())
             .unwrap();
         let repository_bytes = repository.canonical_bytes();
         let inventory = inventory_from_tree(&root).unwrap();
@@ -1587,6 +1625,7 @@ mod tests {
             &repository,
             &repository_bytes,
             &release,
+            &lane,
             &manifest_bytes,
             Some(&header_bytes),
             inventory.clone(),
@@ -1607,7 +1646,7 @@ mod tests {
             .unwrap()
             .obj;
         let evidence_checkpoint = Checkpoint {
-            manifest: release.manifest.clone(),
+            manifest: lane.manifest.clone(),
             evidence: Some(CheckpointEvidence {
                 classification_digest: Header::parse(&header_bytes).unwrap().topology_digest(),
                 ingest: Some(IngestProvenance {
@@ -1623,18 +1662,20 @@ mod tests {
                     recipe,
                 }),
             }),
+            published: false,
             source_selection: None,
         };
         let evidence_repository = Repository::empty(repository.repo.clone())
             .put_checkpoint(evidence_checkpoint)
             .unwrap()
-            .put_release(release.clone())
+            .update_release("1.0.0", 0, vec![lane.clone()], Vec::new())
             .unwrap();
         assert_eq!(
             Census::project_release_inputs(
                 &evidence_repository,
                 &evidence_repository.canonical_bytes(),
                 &release,
+                &lane,
                 &manifest_bytes,
                 Some(&header_bytes),
                 inventory_from_tree(&root).unwrap(),
@@ -1651,6 +1692,7 @@ mod tests {
                 &repository,
                 &repository_bytes,
                 &release,
+                &lane,
                 &manifest_bytes,
                 Some(&header_bytes),
                 missing_header,
@@ -1664,6 +1706,7 @@ mod tests {
                 &repository,
                 &repository_bytes,
                 &release,
+                &lane,
                 &manifest_bytes,
                 Some(b"not the header"),
                 BTreeMap::new(),
@@ -1683,35 +1726,23 @@ mod tests {
         apply_release(
             &store,
             None,
-            &Mutation::PutRelease {
-                repo: repo.clone(),
-                lane: "cpu".into(),
-                manifest: manifest.clone(),
-                metadata: None,
-                version: "1.0.0".into(),
-            },
+            &release_mutation(&repo, "1.0.0", "cpu", &manifest, 0),
         )
         .unwrap();
         let before_remove = fs::read(store.repository_path(&repo)).unwrap();
         store
             .apply_repository(
                 Some(&before_remove),
-                &Mutation::RemoveRelease {
+                &Mutation::YankRelease {
+                    expected_revision: 1,
                     repo: repo.clone(),
                     version: "1.0.0".into(),
-                    lane: "cpu".into(),
                 },
                 &Fault::default(),
             )
             .unwrap();
         let after_remove = fs::read(store.repository_path(&repo)).unwrap();
-        let append = Mutation::PutRelease {
-            repo: repo.clone(),
-            lane: "cpu".into(),
-            manifest,
-            metadata: None,
-            version: "2.0.0".into(),
-        };
+        let append = release_mutation(&repo, "2.0.0", "cpu", &manifest, 0);
         assert_eq!(
             store
                 .apply_repository(Some(&before_remove), &append, &Fault::default())
@@ -1801,13 +1832,7 @@ mod tests {
         apply_release(
             &store,
             None,
-            &Mutation::PutRelease {
-                repo,
-                lane: "cpu".into(),
-                manifest: manifest_ref,
-                metadata: None,
-                version: "1.0.0".into(),
-            },
+            &release_mutation(&repo, "1.0.0", "cpu", &manifest_ref, 0),
         )
         .unwrap();
         catalog.complete_operation("acquire-1").unwrap();
