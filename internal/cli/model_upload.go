@@ -453,7 +453,7 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 	plan := &producerPlan{Name: target.Selector + "/" + target.Function,
 		InstallID: selected.InstallID, Release: selected.Release,
 		ReleaseDigest: selected.ReleaseDigest,
-		Descriptor:    descriptor, Job: job, GPUCount: job.Resources.GPUCount,
+		Descriptor:    descriptor, Job: job, GPUCount: job.RequiredGPUCount(),
 		SourceProfiles: map[string]string{}}
 	plan.Pin = modeltransfer.JobPin{Callable: plan.Name, Package: target.Package,
 		Function: target.Function, InstallID: selected.InstallID, Release: selected.Release,

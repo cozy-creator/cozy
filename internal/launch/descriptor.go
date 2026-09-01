@@ -82,6 +82,17 @@ type ResourceRequirements struct {
 	Requires  string `json:"requires"`
 }
 
+// RequiredGPUCount is the callable's one machine-class fact. A typed Model parameter
+// requires a GPU unless the author made a stronger explicit declaration; weightless
+// callables remain CPU-class. Multi-GPU declarations stay visible for the current
+// producer admission refusal rather than being silently clamped to one.
+func (ep *Entrypoint) RequiredGPUCount() int64 {
+	if ep.Resources.GPUCount == 0 && len(ep.Models) > 0 {
+		return 1
+	}
+	return ep.Resources.GPUCount
+}
+
 type ArtifactModelContract struct {
 	TopologyDigest string   `json:"topology_digest"`
 	Encodings      []string `json:"encodings"`
