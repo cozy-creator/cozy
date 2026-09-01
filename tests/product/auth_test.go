@@ -101,6 +101,23 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 				return
 			}
 			writeAuthToken(t, w, "second-access-token", expires)
+		case "/v1/auth/device-keys/revoke-others":
+			if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer first-access-token" {
+				t.Errorf("revoke others = %s auth %q", r.Method, r.Header.Get("Authorization"))
+				return
+			}
+			var body map[string]any
+			if !decodeAuthBody(t, r, &body) || len(body) != 0 {
+				t.Errorf("revoke others body = %+v", body)
+				return
+			}
+			writeAuthJSON(t, w, http.StatusOK, map[string]bool{"ok": true})
+		case "/v1/auth/device-keys/" + authTestDeviceID:
+			if r.Method != http.MethodDelete || r.Header.Get("Authorization") != "Bearer second-access-token" {
+				t.Errorf("logout = %s auth %q", r.Method, r.Header.Get("Authorization"))
+				return
+			}
+			writeAuthJSON(t, w, http.StatusOK, map[string]bool{"ok": true})
 		case "/v1/accounts/current":
 			if authorization := r.Header.Get("Authorization"); authorization != "Bearer first-access-token" && authorization != "Bearer second-access-token" {
 				t.Errorf("current-account read carried %q", authorization)
@@ -243,10 +260,25 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	if rental, problem := hubClient.Rent(context.Background(), requestBody, "auth proof", "auth-proof"); problem != nil || rental.ID != "rental-auth-proof" {
 		t.Fatalf("authenticated hub mutation = %+v, %v", rental, problem)
 	}
+	revoked := runAuthCozy(t, root, server.URL, "123456\n", "auth", "revoke-other-machines", "--json")
+	if revoked.code != 0 || !strings.Contains(revoked.stdout, `"status":"other machines revoked"`) ||
+		!strings.Contains(revoked.stderr, "A verification code was sent") {
+		t.Fatalf("revoke other machines [exit %d]\nstdout: %s\nstderr: %s",
+			revoked.code, revoked.stdout, revoked.stderr)
+	}
+	loggedOut := runAuthCozy(t, root, server.URL, "", "auth", "logout", "--json")
+	if loggedOut.code != 0 || !strings.Contains(loggedOut.stdout, `"status":"logged out"`) || loggedOut.stderr != "" {
+		t.Fatalf("logout [exit %d]\nstdout: %s\nstderr: %s", loggedOut.code, loggedOut.stdout, loggedOut.stderr)
+	}
+	afterLogout := runAuthCozy(t, root, server.URL, "", "auth", "--json")
+	if afterLogout.code != 0 || !strings.Contains(afterLogout.stdout, `"status":"not logged in"`) || afterLogout.stderr != "" {
+		t.Fatalf("status after logout [exit %d]\nstdout: %s\nstderr: %s",
+			afterLogout.code, afterLogout.stdout, afterLogout.stderr)
+	}
 	mu.Lock()
 	defer mu.Unlock()
-	if enrollBegins != 1 || loginBegins != 6 {
-		t.Fatalf("auth begin calls = enroll %d login %d, want 1/6", enrollBegins, loginBegins)
+	if enrollBegins != 2 || loginBegins != 8 {
+		t.Fatalf("auth begin calls = enroll %d login %d, want 2/8", enrollBegins, loginBegins)
 	}
 	if foreignModelRequests != 0 {
 		t.Fatalf("foreign model requests = %d, want 0", foreignModelRequests)

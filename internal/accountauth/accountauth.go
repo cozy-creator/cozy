@@ -56,10 +56,90 @@ type Session struct {
 // Enrollment is an in-memory transaction. Its private key is never persisted until
 // AuthKit has verified both the email code and possession signature.
 type Enrollment struct {
-	id        string
-	challenge []byte
-	private   ed25519.PrivateKey
-	email     string
+	id          string
+	challenge   []byte
+	private     ed25519.PrivateKey
+	email       string
+	deviceKeyID string
+}
+
+// BeginEmailProof proves current mailbox control for a destructive machine-key
+// operation without creating or replacing this machine's key.
+func (m *Manager) BeginEmailProof(ctx context.Context) (*Enrollment, time.Time, *exit.Error) {
+	stored, private, problem := m.load()
+	if problem != nil {
+		return nil, time.Time{}, problem
+	}
+	public := private.Public().(ed25519.PublicKey)
+	var begun struct {
+		EnrollmentID string `json:"enrollment_id"`
+		Challenge    string `json:"challenge"`
+		ExpiresAt    string `json:"expires_at"`
+	}
+	if problem := m.post(ctx, "/v1/auth/device-keys/enroll/begin", map[string]string{
+		"email": stored.Email, "public_key": rawBase64.EncodeToString(public),
+	}, &begun); problem != nil {
+		return nil, time.Time{}, problem
+	}
+	challenge, problem := challengeBytes(begun.Challenge)
+	if problem != nil || begun.EnrollmentID == "" {
+		return nil, time.Time{}, exit.Named(exit.Internal, "auth.unreadable_challenge",
+			"Tensorhub returned an invalid email-proof challenge")
+	}
+	expires, problem := parseExpiry(begun.ExpiresAt)
+	if problem != nil {
+		return nil, time.Time{}, problem
+	}
+	return &Enrollment{id: begun.EnrollmentID, challenge: challenge, private: private,
+		email: stored.Email, deviceKeyID: stored.DeviceKeyID}, expires, nil
+}
+
+// FinishEmailProof returns the short token that proves both the existing
+// machine key and current control of its account email.
+func (m *Manager) FinishEmailProof(ctx context.Context, enrollment *Enrollment, code string) (Session, *exit.Error) {
+	if enrollment == nil || enrollment.deviceKeyID == "" {
+		return Session{}, exit.Internalf("email proof was not started")
+	}
+	var answer tokenAnswer
+	if problem := m.post(ctx, "/v1/auth/device-keys/enroll/finish", map[string]string{
+		"enrollment_id": enrollment.id,
+		"code":          strings.TrimSpace(code),
+		"signature":     rawBase64.EncodeToString(sign(enrollment.private, enrollDomain, enrollment.challenge)),
+	}, &answer); problem != nil {
+		return Session{}, problem
+	}
+	session, problem := answer.session(enrollment.email)
+	if problem != nil {
+		return Session{}, problem
+	}
+	if session.DeviceKeyID != enrollment.deviceKeyID {
+		return Session{}, exit.Named(exit.Internal, "auth.wrong_machine",
+			"Tensorhub returned an email proof for a different machine")
+	}
+	m.mu.Lock()
+	m.session = session
+	m.mu.Unlock()
+	return session, nil
+}
+
+// DeleteCredential erases exactly the credential whose server revocation was
+// confirmed. A mismatched concurrent login is retained.
+func (m *Manager) DeleteCredential(deviceKeyID string) *exit.Error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	stored, _, problem := m.load()
+	if problem != nil {
+		return problem
+	}
+	if stored.DeviceKeyID != deviceKeyID {
+		return exit.Named(exit.Internal, "auth.machine_changed",
+			"the local machine credential changed while logout was in progress")
+	}
+	if err := os.Remove(m.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return exit.Internalf("cannot erase the machine credential: %s", err)
+	}
+	m.session = Session{}
+	return nil
 }
 
 // Manager owns one Tensorhub origin's machine key and memory-only access token.
