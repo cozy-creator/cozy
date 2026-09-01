@@ -438,9 +438,13 @@ fn emit_bytes(bytes: &[u8], flags: &Flags) {
 /// walks the whole topology, which is what RANKING needs: the worst fact is not in general
 /// the first, and only a full report may be graded by `grade_all`.
 ///
-/// `--json` prints `{"depth":..,"details":[...],"report":"sha256:...","satisfied":bool}` and
-/// nothing else. That is the surface a program should read; the human print below is for
-/// people.
+/// `--json` prints ONE object and nothing else -- the surface a program should read; the
+/// human print below is for people. It is TOTAL: `satisfied`, `depth`, `details`,
+/// `encodings`, `report` and the four `topology_*` index keys are present on every answer.
+/// `encodings` is the set the CHECKPOINT carries, and it is here because "these bytes can
+/// be read" and "some card has a qualified implementation for them" are two independent
+/// questions; the second is `tfs capability`, and a caller cannot ask it without knowing
+/// which pairs to ask about.
 pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
     let code = ok!(CodeTopology::parse(&rd!(code_p)));
     let header = ok!(Header::parse(&rd!(header_p)));
@@ -512,10 +516,34 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
         // exact digests equal -> the pair is already an exact-index hit; only the shape
         // digests equal -> it differs by dtype or encoding alone and is worth grading;
         // neither -> a different model, refused without grading at all.
+        // WHICH ENCODINGS THE CHECKPOINT ACTUALLY CARRIES, sorted and deduplicated. The
+        // format answer above says the bytes can be read; it says nothing about whether any
+        // card has a qualified implementation for them. That is a second, independent
+        // question (`tfs capability`), and the caller cannot ask it without knowing which
+        // pairs to ask about. Emitting the set here costs nothing -- the report already
+        // holds it -- and saves the hub from parsing a header it is not allowed to parse.
+        let mut encodings: Vec<String> = Vec::new();
+        for f in &report.facts {
+            for e in &f.present_encodings {
+                if !encodings.contains(&e.encoding) {
+                    encodings.push(e.encoding.clone());
+                }
+            }
+        }
+        encodings.sort();
         let doc = tensorfs_core::canon::Value::obj(vec![
             (
                 "satisfied",
                 tensorfs_core::canon::Value::Bool(details.is_empty()),
+            ),
+            (
+                "encodings",
+                tensorfs_core::canon::Value::arr(
+                    encodings
+                        .into_iter()
+                        .map(tensorfs_core::canon::Value::str)
+                        .collect(),
+                ),
             ),
             ("depth", tensorfs_core::canon::Value::str(depth.name())),
             ("details", tensorfs_core::canon::Value::arr(details)),
