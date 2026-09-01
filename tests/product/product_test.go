@@ -547,7 +547,7 @@ func TestRentalCommandsSeparateInventoryFromCatalog(t *testing.T) {
 		t.Fatalf("rental new did not show the SKU catalog [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozyDir(t, root, ".", []string{"TENSORHUB_URL=" + server.URL},
-		"rental", "new", "--name", "studio"); code != 2 ||
+		"rental", "new", "--timeout", "1m"); code != 2 ||
 		!strings.Contains(out, "options require a GPU SKU") {
 		t.Fatalf("catalog view silently accepted rental options [exit %d]\n%s", code, out)
 	}

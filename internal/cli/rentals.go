@@ -61,9 +61,8 @@ func rentalStores(ctx *Context) (home.Layout, *records.Store, *exit.Error) {
 
 func handleRent(ctx *Context) *exit.Error {
 	skuName := strings.TrimSpace(ctx.Inv.Args[0])
-	requestedMachineName := strings.TrimSpace(ctx.Inv.Value("--name"))
 	if skuName == "" {
-		if requestedMachineName != "" || ctx.Inv.Value("--idempotency-key") != "" ||
+		if ctx.Inv.Value("--idempotency-key") != "" ||
 			ctx.Inv.Value("--timeout") != "" {
 			return exit.Usagef("rental options require a GPU SKU").
 				WithRemedy("use `cozy rental new` alone to list available machines")
@@ -75,10 +74,6 @@ func handleRent(ctx *Context) *exit.Error {
 			return e
 		}
 		return emitRentalCatalog(ctx, skus)
-	}
-	if requestedMachineName != "" && !rentalid.ValidMachineName(requestedMachineName) {
-		return exit.Usagef("--name %q is not a machine name", requestedMachineName).
-			WithRemedy("use 1-32 lowercase letters, numbers, and hyphens; local is reserved")
 	}
 	reason := "cozy rental new " + skuName
 	// The wait's ONLY caller-supplied bound. Absent, the wait ends on what the hub says
@@ -119,7 +114,7 @@ func handleRent(ctx *Context) *exit.Error {
 		operationKey = mintKey()
 	}
 
-	row, attachable, replay, e := acquireRental(ctx, l, st, skuName, requestedMachineName,
+	row, attachable, replay, e := acquireRental(ctx, l, st, skuName,
 		operationKey, reason, hourlyRate, ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "")
 	if e != nil {
 		return e
@@ -169,16 +164,16 @@ func handleRent(ctx *Context) *exit.Error {
 // acquireRental is the one paid mutation used by both `cozy rental new` and
 // `cozy run --rental`. It returns only after the immutable retail rate and the
 // worker's authenticated attach projection are durable locally.
-func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName, requestedMachineName,
+func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName,
 	operationKey, reason string, hourlyRateUSDMicros, fleetCapUSDMicros int64,
 	deadline time.Time, managedRequestID string,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
-	return acquireRentalContext(context.Background(), ctx, l, st, skuName, requestedMachineName,
+	return acquireRentalContext(context.Background(), ctx, l, st, skuName,
 		operationKey, reason, hourlyRateUSDMicros, fleetCapUSDMicros, deadline, managedRequestID)
 }
 
 func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout,
-	st *records.Store, skuName, requestedMachineName, operationKey, reason string,
+	st *records.Store, skuName, operationKey, reason string,
 	hourlyRateUSDMicros, fleetCapUSDMicros int64, deadline time.Time, managedRequestID string,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
 	c := client(ctx)
@@ -196,6 +191,14 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 			"rental operation %s is %s and still names rental %s", operationKey, existing.State, existing.RentalID).
 			WithRemedy("release the existing rental before starting another operation").
 			WithNext("cozy rental end " + existing.RentalID)
+	}
+	machineName := ""
+	if existing == nil {
+		var err error
+		machineName, err = rentalid.NewMachineName()
+		if err != nil {
+			return records.Rental{}, hub.Rental{}, false, exit.Internalf("cannot mint a private rental name: %s", err)
+		}
 	}
 	var token secret.Value
 	var creator rental.CreatorIdentity
@@ -217,7 +220,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	if existing != nil {
 		requestBody = append([]byte(nil), existing.RequestBody...)
 	} else {
-		requestBody, e = hub.RentalRequestBytes(skuName, secret.HashHex(token),
+		requestBody, e = hub.RentalRequestBytes(machineName, skuName, secret.HashHex(token),
 			creator.PublicKey())
 		if e != nil {
 			return records.Rental{}, hub.Rental{}, false, e
@@ -239,9 +242,11 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 			"rental operation %s already names a different hub or request body", operationKey).
 			WithRemedy("reuse a key only for the exact same hub, GPU SKU, media token, and Creator key")
 	}
-	if _, e := hub.ParseRentalRequestBytes(op.RequestBody); e != nil {
+	request, e := hub.ParseRentalRequestBytes(op.RequestBody)
+	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
+	machineName = request.Name
 	if !replay {
 		fmt.Fprintf(ctx.Err, "  rental operation %s persisted; reuse this key to resume\n", operationKey)
 	}
@@ -264,6 +269,11 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	if e := st.AdvanceRentalOperation(operationKey, remote.ID, remote.State); e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
+	if remote.Name != machineName {
+		return records.Rental{}, remote, false, exit.Named(exit.Conflict, "rental.machine_name_changed",
+			"Tensorhub returned private rental name %s, not %s", remote.Name, machineName).
+			WithRemedy("do not attach a provider machine under a different local identity")
+	}
 	if lifecycle.Err() != nil {
 		return records.Rental{}, remote, false, exit.New(exit.Canceled,
 			"rental %s was acquired after model transfer cancellation", remote.ID)
@@ -278,10 +288,6 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 			remote.ID, remote.HourlyRateUSDMicros, hourlyRateUSDMicros).
 			WithRemedy("Creator requested immediate release and retained the operation until Tensorhub proves absence")
 	}
-	machineName := requestedMachineName
-	if machineName == "" {
-		machineName = rentalid.MachineName(remote.ID)
-	}
 	row := records.Rental{
 		ID: remote.ID, MachineName: machineName, SKU: skuName,
 		AcceleratorModel: remote.AcceleratorModel, HourlyRateUSDMicros: remote.HourlyRateUSDMicros,
@@ -292,10 +298,10 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		return records.Rental{}, hub.Rental{}, false, problem
 	}
 	if stored != nil {
-		if requestedMachineName != "" && requestedMachineName != stored.MachineName {
+		if machineName != stored.MachineName {
 			return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.machine_name_changed",
 				"rental %s is already named %s", remote.ID, stored.MachineName).
-				WithRemedy("resume it without --name, or use --name %s", stored.MachineName)
+				WithRemedy("resume the original operation; its private rental name is immutable")
 		}
 		if stored.ManagedRequestID != managedRequestID {
 			return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.management_changed",
@@ -313,6 +319,10 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		return records.Rental{}, hub.Rental{}, false, e
 	}
 	observe := func(seen hub.Rental) *exit.Error {
+		if seen.Name != row.MachineName {
+			return exit.Named(exit.Conflict, "rental.machine_name_changed",
+				"rental %s changed its name from %s to %s", seen.ID, row.MachineName, seen.Name)
+		}
 		if seen.HourlyRateUSDMicros != row.HourlyRateUSDMicros {
 			return exit.Named(exit.Conflict, "rental.hourly_rate_changed",
 				"rental %s changed its Cozy retail hourly rate from %d to %d USD micros",

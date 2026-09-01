@@ -4,11 +4,15 @@
 package rentalid
 
 import (
-	"crypto/sha256"
+	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"regexp"
 	"strings"
 )
+
+var adjectives = [...]string{"brisk", "bright", "calm", "gentle", "lucid", "quiet", "swift", "vivid"}
+var nouns = [...]string{"badger", "falcon", "heron", "otter", "raven", "tiger", "turtle", "wolf"}
 
 var pattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 var machinePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
@@ -33,8 +37,13 @@ func ValidMachineName(name string) bool {
 	return name != "local" && machinePattern.MatchString(name)
 }
 
-// MachineName derives the stable fallback shown when the renter did not choose --name.
-func MachineName(id string) string {
-	sum := sha256.Sum256([]byte(id))
-	return "rental-" + hex.EncodeToString(sum[:4])
+// NewMachineName returns a private, memorable provider name with 64 bits of
+// random collision resistance. It carries no package, model, or workload fact.
+func NewMachineName() (string, error) {
+	var raw [10]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("mint private rental name: %w", err)
+	}
+	return adjectives[int(raw[0])%len(adjectives)] + "-" +
+		nouns[int(raw[1])%len(nouns)] + "-" + hex.EncodeToString(raw[2:]), nil
 }

@@ -223,23 +223,25 @@ With Tensorhub configured, rent generic private capacity:
 
 ```sh
 cozy rental new                    # Cozy GPUs, VRAM, and retail hourly prices
-cozy rental new h200 --name studio \
+cozy rental new h200                # prints e.g. bright-otter-4e81b938cf114e25
+cozy rental new h200 \
   --idempotency-key <unique-key>
 
 cozy rental                        # current rented machines
 cozy run org/package/generate --rental prompt="moonlit lake"
-cozy rental end studio
+cozy rental end bright-otter-4e81b938cf114e25
 ```
 
 GPU names and prices come from Tensorhub's Cozy-owned rental catalog. Creator never exposes or
 reads RunPod SKU names or provider prices. `cozy run` is local-only by default, while
 `--rental` permits Creator to reuse or acquire remote capacity only when ready local capacity cannot
 run the request. `--rental-only` deliberately bypasses local capacity and requires an external
-rental. Both modes remain under the configured fleet ceiling. Callers never name
-a worker. Creator-managed rentals stop after their assigned queue is fully mirrored; manual
+rental. Both modes remain under the configured fleet ceiling. Creator gives every private rental
+a safe semantic name and RunPod shows that exact same name; the name carries no workload facts.
+Creator-managed rentals stop after their assigned queue is fully mirrored; manual
 rentals stop only through `cozy rental end`.
 
-Rental creation sends only the SKU and introduction credential material—never a package, model,
+Rental creation sends only that private machine name, the SKU, and introduction credential material—never a package, model,
 request, profile, image, or placement. Tensorhub readiness means the worker location and TLS identity
 are attachable. Creator then claims that worker directly and sends signed exact package and model
 release refs; no WorkerControl frame is relayed through Tensorhub. Creator learns the derived

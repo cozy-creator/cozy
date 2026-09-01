@@ -294,14 +294,13 @@ type RentalCmd struct {
 
 type RentalNewCmd struct {
 	SKU            string `arg:"" optional:"" name:"gpu" help:"Cozy GPU SKU, such as h200."`
-	Name           string `help:"Memorable name for this rented machine."`
 	IdempotencyKey string `help:"Stable paid-operation identity."`
 	Timeout        string `help:"Caller wait deadline; does not release the rental."`
 }
 
 func (c *RentalNewCmd) Run(r *Runtime) error {
 	return r.call(handleRent, []string{c.SKU}, nil, values(
-		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--name", c.Name), false)
+		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout), false)
 }
 
 type RentalEndCmd struct {

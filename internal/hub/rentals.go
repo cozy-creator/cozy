@@ -28,8 +28,8 @@ import (
 //
 //	GET    /v1/rental-skus           -> [{name, accelerator_model, compute_capability,
 //	                                 vram_gb, price_usd_micros_per_hour}]
-//	POST   /v1/rentals               {sku, media_token_sha256:<64 hex>, creator_public_key}
-//	                                 -> 202 {rental_id, state, ...}
+//	POST   /v1/rentals               {name, sku, media_token_sha256:<64 hex>, creator_public_key}
+//	                                 -> 202 {rental_id, name, state, ...}
 //	GET    /v1/rentals/{id}          -> {state, worker_address, cert_pem, media_address,
 //	                                     detail, worker_id, worker_boot_id,
 //	                                     media_token_sha256:[...]}
@@ -56,6 +56,7 @@ const (
 // Creator key is part of this view.
 type Rental struct {
 	ID               string
+	Name             string
 	State            string
 	AcceleratorModel string
 	Address          string
@@ -108,6 +109,7 @@ func (r Rental) HoldsMediaHash(hash string) bool {
 // wireRental is the answer's own shape.
 type wireRental struct {
 	ID                  string   `json:"rental_id"`
+	Name                string   `json:"name"`
 	State               string   `json:"state"`
 	AcceleratorModel    string   `json:"requested_accelerator_model"`
 	WorkerAddress       string   `json:"worker_address"`
@@ -137,7 +139,7 @@ func validateRentalID(id string) *exit.Error {
 
 func (w wireRental) rental() Rental {
 	return Rental{
-		ID: w.ID, State: w.State,
+		ID: w.ID, Name: w.Name, State: w.State,
 		AcceleratorModel: w.AcceleratorModel,
 		Address:          w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, MediaAddress: w.MediaAddress,
@@ -152,25 +154,27 @@ func (w wireRental) rental() Rental {
 // datacenter, offer, image, cache volume, disk, and ports do not have fields
 // here: Tensorhub resolves and selects them.
 type RentalRequest struct {
+	Name             string `json:"name"`
+	SKU              string `json:"sku"`
 	MediaTokenSHA256 string `json:"media_token_sha256"`
 	CreatorPublicKey string `json:"creator_public_key"`
-	SKU              string `json:"sku"`
 }
 
 // RentalRequestBytes authors the exact bytes persisted before POST and replayed
 // unchanged after response loss. There is one encoder, not a digest struct plus
 // a separately marshaled transport map that can drift.
-func RentalRequestBytes(sku, mediaTokenSHA256, creatorPublicKey string) ([]byte, *exit.Error) {
+func RentalRequestBytes(name, sku, mediaTokenSHA256, creatorPublicKey string) ([]byte, *exit.Error) {
 	req := RentalRequest{
+		Name:             strings.TrimSpace(name),
 		SKU:              strings.TrimSpace(sku),
 		MediaTokenSHA256: strings.TrimPrefix(strings.TrimSpace(mediaTokenSHA256), "sha256:"),
 		CreatorPublicKey: strings.TrimSpace(creatorPublicKey),
 	}
 	public, publicErr := base64.RawURLEncoding.DecodeString(req.CreatorPublicKey)
-	if req.SKU == "" || !bareSHA256Pattern.MatchString(req.MediaTokenSHA256) ||
+	if !rentalid.ValidMachineName(req.Name) || req.SKU == "" || !bareSHA256Pattern.MatchString(req.MediaTokenSHA256) ||
 		publicErr != nil || len(public) != 32 {
 		return nil, exit.Named(exit.Validation, "rental.intent_incomplete",
-			"sku, media token hash, and one Ed25519 Creator public key are required")
+			"a safe name, sku, media token hash, and one Ed25519 Creator public key are required")
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {
@@ -195,7 +199,7 @@ func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
 		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
 			"persisted rental intent has trailing data")
 	}
-	canonical, problem := RentalRequestBytes(req.SKU, req.MediaTokenSHA256, req.CreatorPublicKey)
+	canonical, problem := RentalRequestBytes(req.Name, req.SKU, req.MediaTokenSHA256, req.CreatorPublicKey)
 	if problem != nil || !bytes.Equal(canonical, raw) {
 		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
 			"persisted rental intent is not its exact canonical request")
@@ -274,6 +278,11 @@ func (w wireRental) named(what string) *exit.Error {
 		return exit.Named(exit.Conflict, "hub.rental_hourly_rate_missing",
 			"the hub %s without a positive locked Cozy retail hourly rate", what).
 			WithRemedy("upgrade Tensorhub before accepting a rental")
+	}
+	if !rentalid.ValidMachineName(w.Name) {
+		return exit.Named(exit.Conflict, "hub.rental_name_invalid",
+			"the hub %s with invalid private rental name %q", what, w.Name).
+			WithRemedy("Tensorhub must return the exact safe name Creator sent at rental creation")
 	}
 	return validateRentalID(w.ID)
 }

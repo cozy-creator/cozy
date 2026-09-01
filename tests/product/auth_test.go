@@ -188,7 +188,7 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 				return
 			}
 			writeAuthJSON(t, w, http.StatusAccepted, map[string]any{
-				"rental_id": "rental-auth-proof", "state": "pending_acquisition",
+				"rental_id": "rental-auth-proof", "name": "swift-heron-0123456789abcdef", "state": "pending_acquisition",
 				"hourly_rate_usd_micros": int64(100_000),
 			})
 		case "/v1/models/foreign/model", "/v1/models/foreign/model/releases/stable":
@@ -272,7 +272,7 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	}
 	manager := accountauth.New(config.Config{Home: root, HubURL: server.URL})
 	hubClient := hub.New(config.Config{HubURL: server.URL}, "cozy-product-auth-test").WithTokenSource(manager)
-	requestBody, problem := hub.RentalRequestBytes("cpu", strings.Repeat("1", 64),
+	requestBody, problem := hub.RentalRequestBytes("swift-heron-0123456789abcdef", "cpu", strings.Repeat("1", 64),
 		authBase64.EncodeToString(bytes.Repeat([]byte{1}, ed25519.PublicKeySize)))
 	if problem != nil {
 		t.Fatal(problem)
