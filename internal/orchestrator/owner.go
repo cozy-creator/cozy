@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -45,6 +46,14 @@ type session struct {
 	epoch      uint64
 	instanceID string
 	out        chan *pb.RecordOwnerFrame
+	// host is the pod's PodHost lane (proto-025), on the same pinned connection as the
+	// control stream; nil for a local worker, whose host is this daemon in-process. claim is
+	// the exact Claim this session presented, re-presented on every host call.
+	host  pb.PodHostClient
+	claim *pb.Claim
+	// hostSnapshotDigest is the host document this session acknowledged, so a later
+	// SnapshotAck echoes what was actually reconciled.
+	hostSnapshotDigest []byte
 }
 
 func (s *session) send(m *pb.RecordOwnerFrame) (sent bool) {
@@ -286,17 +295,21 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		}
 		proof = signed
 		claimWorkerID, claimBootID = w.spec.Connection.WorkerID, w.spec.Connection.WorkerBootID
+		s.host = pb.NewPodHostClient(conn)
 	} else {
 		proof = []byte(w.bootstrap.Reveal())
 	}
-	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_Claim{Claim: &pb.Claim{
+	s.claim = &pb.Claim{
 		RecordOwnerEpoch: recordOwnerEpoch,
 		RecordOwnerId:    recordOwnerID,
 		WorkerId:         claimWorkerID,
 		WorkerBootId:     claimBootID,
 		WireMinor:        pb.WireMinor,
 		Proof:            proof,
-	}}}) //cozy:allow-reveal local bootstrap or signed rental ClaimProof crosses only on Claim
+	}
+	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_Claim{
+		Claim: proto.Clone(s.claim).(*pb.Claim),
+	}}) //cozy:allow-reveal local bootstrap or signed rental ClaimProof crosses only on Claim
 
 	// WatchProgress rides a PHYSICALLY separate connection (01), opened at the snapshot
 	// barrier below -- not at ClaimAck, which does not by itself complete the control
@@ -619,18 +632,41 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 
 	held := doc.List("held_attempts")
 	heldSet := make(map[string]bool, len(held))
-	for _, ha := range held {
-		requestID, ordinal := ha.Str("request_id"), uint64(ha.Int("attempt_ordinal"))
-		heldSet[key(requestID, ordinal)] = true
-		if e := c.opt.Store.Recover(requestID, int64(ordinal), s.bootID); e != nil {
-			c.logf("held attempt %s#%d REFUSED: %s", requestID, ordinal, e.Message)
-			continue
+	reconcileHeld := func(rows []canonical.Doc, holder string) {
+		for _, ha := range rows {
+			requestID, ordinal := ha.Str("request_id"), uint64(ha.Int("attempt_ordinal"))
+			heldSet[key(requestID, ordinal)] = true
+			if e := c.opt.Store.Recover(requestID, int64(ordinal), s.bootID); e != nil {
+				c.logf("%s attempt %s#%d REFUSED: %s", holder, requestID, ordinal, e.Message)
+				continue
+			}
+			_, blocked := c.opt.Store.NextOrdinal(requestID)
+			c.logf("%s attempt %s#%d (%s) is an OPEN OBLIGATION — the ordinal gate now "+
+				"refuses: %s", holder, requestID, ordinal,
+				trimEnum(pb.AttemptState_name[int32(ha.Int("state"))], "ATTEMPT_STATE_"),
+				briefOf(blocked))
 		}
-		_, blocked := c.opt.Store.NextOrdinal(requestID)
-		c.logf("held attempt %s#%d (%s) is an OPEN OBLIGATION — the ordinal gate now "+
-			"refuses: %s", requestID, ordinal,
-			trimEnum(pb.AttemptState_name[int32(ha.Int("state"))], "ATTEMPT_STATE_"),
-			briefOf(blocked))
+	}
+	reconcileHeld(held, "held")
+	// THE HOST'S OWN DOCUMENT (proto-025). A pod host between this owner and the worker
+	// holds outcomes the live child may not name (a replaced child's survivors) and announces
+	// the receipts it replays after this ack. It is fenced exactly like the worker's document
+	// and reconciled before the same ack; the worker's bytes above are the worker's own.
+	var hostHeld []canonical.Doc
+	if len(snap.HostSnapshotCanonicalBytes) > 0 || len(snap.HostSnapshotDigest) > 0 {
+		computed := canonical.Digest(snap.HostSnapshotCanonicalBytes)
+		if !bytes.Equal(computed, snap.HostSnapshotDigest) {
+			refuse("host_snapshot_digest %x does not hash the %d resident host bytes (%x)",
+				snap.HostSnapshotDigest, len(snap.HostSnapshotCanonicalBytes), computed)
+			return false
+		}
+		hostDoc, err := canonical.Read(snap.HostSnapshotCanonicalBytes, &pb.HostSnapshotBody{})
+		if err != nil {
+			refuse("the host snapshot document is inadmissible (%s)", err)
+			return false
+		}
+		hostHeld = hostDoc.List("held_outcomes")
+		reconcileHeld(hostHeld, "host-held")
 	}
 	continuations := c.reconcileSnapshotAbsence(w, heldSet)
 	// The worker's own admission facts arrive with the snapshot, so the barrier's other
@@ -645,12 +681,14 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	w.phase = pb.WorkerPhase(doc.Int("worker_phase"))
 	c.mu.Unlock()
 
-	ackMsg := &pb.SnapshotAck{SnapshotId: snap.SnapshotId, SnapshotDigest: snap.SnapshotDigest}
+	ackMsg := &pb.SnapshotAck{SnapshotId: snap.SnapshotId, SnapshotDigest: snap.SnapshotDigest,
+		HostSnapshotDigest: append([]byte(nil), snap.HostSnapshotDigest...)}
 	ackMsg.RecordOwnerEpoch, ackMsg.ControlStreamEpoch, ackMsg.WorkerBootId =
 		recordOwnerEpoch, s.epoch, s.bootID
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_SnapshotAck{SnapshotAck: ackMsg}}) {
 		return false
 	}
+	s.hostSnapshotDigest = ackMsg.HostSnapshotDigest
 	c.mu.Lock()
 	w.snapshotAcknowledged = true
 	c.mu.Unlock()
@@ -658,10 +696,11 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		c.afterAck(continuation.request, continuation.attempt, w)
 	}
 	c.retryMediaCleanup(w)
-	c.logf("snapshot %s (%s, %d B) acknowledged: %d held attempt(s), accepted revision %d, "+
-		"converged %d; dispatch is open", snap.SnapshotId,
+	c.logf("snapshot %s (%s, %d B) acknowledged: %d held attempt(s), %d host-held outcome(s), "+
+		"accepted revision %d, converged %d; dispatch is open", snap.SnapshotId,
 		shortDigest(shortNone(snap.SnapshotDigest)), len(snap.SnapshotCanonicalBytes),
-		len(held), doc.Int("accepted_desired_state_revision"), doc.Int("converged_revision"))
+		len(held), len(hostHeld), doc.Int("accepted_desired_state_revision"),
+		doc.Int("converged_revision"))
 	if w.spec.IsJob() {
 		c.signalAllTransfers()
 		_ = c.sendJobDirective(s, w)

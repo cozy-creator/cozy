@@ -371,6 +371,9 @@ type worker struct {
 	// desiredPrivatePlacement is the signed model-only join for the already-prepared private
 	// revision. It survives a control reconnect so pod-supervisor can replay its exact journal.
 	desiredPrivatePlacement *pb.DesiredPrivatePlacementSet
+	// hostPrepareSeq numbers the logical desires issued through PodHost (proto-025); a
+	// prepare that completes for an older number sends nothing.
+	hostPrepareSeq uint64
 
 	// what the worker itself reported; the orchestrator echoes, never invents
 	exited bool
