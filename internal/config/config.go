@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -62,6 +63,11 @@ type Config struct {
 	RentalsMaxHourlySpendUSDMicros int64
 	RentalsMaxHourlySpendSource    string
 
+	// DaemonIdleShutdown is how long "nothing to manage" must stay true before the daemon
+	// exits on its own. It is a debounce over an observed fact, never the decision; zero
+	// keeps the daemon up until `cozy down`.
+	DaemonIdleShutdown time.Duration
+
 	// Bootstrap is launcher-only. It is admitted from the process environment,
 	// never config.yaml, argv, or a child inheritance list.
 	Bootstrap secret.Value
@@ -80,6 +86,7 @@ type values struct {
 	TensorFSRegistry         string `name:"tensorfs_registry"`
 	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
 	RentalsMaxHourlySpendUSD string `name:"rentals_max_hourly_spend_usd" default:"0"`
+	DaemonIdleShutdownS      int64  `name:"daemon_idle_shutdown_s" default:"900"`
 	Port                     int    `name:"port" default:"8818"`
 	Yield                    string `name:"yield" default:"smart" enum:"smart,always,never"`
 	Bootstrap                string `name:"bootstrap"`
@@ -98,6 +105,9 @@ func (v *values) Validate() error {
 	if _, err := usdMicros(v.RentalsMaxHourlySpendUSD); err != nil {
 		return fmt.Errorf("rentals.max_hourly_spend_usd %q is not a non-negative USD amount with at most six decimal places", v.RentalsMaxHourlySpendUSD)
 	}
+	if v.DaemonIdleShutdownS < 0 {
+		return fmt.Errorf("daemon.idle_shutdown_s must be non-negative; zero disables idle shutdown")
+	}
 	if v.Port < 0 || v.Port > 65535 {
 		return fmt.Errorf("port %d is not a TCP port or zero for automatic selection", v.Port)
 	}
@@ -114,10 +124,14 @@ var fileKeys = map[string]bool{
 	"port":                          true,
 	"yield":                         true,
 	"rentals":                       true,
+	"daemon":                        true,
 }
 
-var rentalFileKeys = map[string]string{
-	"max_hourly_spend_usd": "rentals_max_hourly_spend_usd",
+// nestedFileKeys are the one-level sections config.yaml admits, each mapping its
+// nested spelling to the flat grammar name.
+var nestedFileKeys = map[string]map[string]string{
+	"rentals": {"max_hourly_spend_usd": "rentals_max_hourly_spend_usd"},
+	"daemon":  {"idle_shutdown_s": "daemon_idle_shutdown_s"},
 }
 
 var environmentNames = map[string]string{
@@ -190,6 +204,7 @@ func load() (Config, *exit.Error) {
 		LocalRateSource:                sourceOf("local_rate_micro_usd_per_hour", file, environment, "unset"),
 		RentalsMaxHourlySpendUSDMicros: rentalCap,
 		RentalsMaxHourlySpendSource:    sourceOf("rentals_max_hourly_spend_usd", file, environment, "unset"),
+		DaemonIdleShutdown:             time.Duration(input.DaemonIdleShutdownS) * time.Second,
 		Bootstrap:                      secret.New(input.Bootstrap),
 		inherited:                      inherited,
 	}
@@ -284,12 +299,14 @@ func sourceOf(name string, file, environment *resolver, fallback string) string 
 func knownFileKeys() string {
 	keys := make([]string, 0, len(fileKeys))
 	for key := range fileKeys {
-		if key == "rentals" {
+		if section, nested := nestedFileKeys[key]; nested {
+			for name := range section {
+				keys = append(keys, key+"."+name)
+			}
 			continue
 		}
 		keys = append(keys, key)
 	}
-	keys = append(keys, "rentals.max_hourly_spend_usd")
 	sort.Strings(keys)
 	return strings.Join(keys, ", ")
 }
@@ -364,21 +381,22 @@ func strictYAML(reader io.Reader) (*resolver, error) {
 		if _, exists := values[key.Value]; exists {
 			return nil, fmt.Errorf("line %d names %q twice", key.Line, key.Value)
 		}
-		if key.Value == "rentals" {
+		if section, nested := nestedFileKeys[key.Value]; nested {
 			if value.Kind != yaml.MappingNode {
 				return nil, fmt.Errorf("line %d value for %q is not a mapping", value.Line, key.Value)
 			}
 			for j := 0; j < len(value.Content); j += 2 {
 				nestedKey, nestedValue := value.Content[j], value.Content[j+1]
-				name, ok := rentalFileKeys[nestedKey.Value]
+				spelled := key.Value + "." + nestedKey.Value
+				name, ok := section[nestedKey.Value]
 				if nestedKey.Kind != yaml.ScalarNode || !ok {
-					return nil, fmt.Errorf("line %d names unknown key %q", nestedKey.Line, "rentals."+nestedKey.Value)
+					return nil, fmt.Errorf("line %d names unknown key %q", nestedKey.Line, spelled)
 				}
 				if _, exists := values[name]; exists {
-					return nil, fmt.Errorf("line %d names %q twice", nestedKey.Line, "rentals."+nestedKey.Value)
+					return nil, fmt.Errorf("line %d names %q twice", nestedKey.Line, spelled)
 				}
 				if nestedValue.Kind != yaml.ScalarNode {
-					return nil, fmt.Errorf("line %d value for %q is not a scalar", nestedValue.Line, "rentals."+nestedKey.Value)
+					return nil, fmt.Errorf("line %d value for %q is not a scalar", nestedValue.Line, spelled)
 				}
 				values[name] = nestedValue.Value
 			}

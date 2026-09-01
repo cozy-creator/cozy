@@ -268,6 +268,14 @@ cozy down --all   # cancel all work, end all rentals, then stop the daemon
 None of them deletes installed package or model bytes. A failed partial `down --all` leaves the
 daemon running so cancellation and paid-resource reconciliation can continue.
 
+The daemon also leaves on its own once it has had nothing to manage for `daemon.idle_shutdown_s`
+(default 900): no rental it owns, no request or attempt it owes, no transfer, export, launch or
+teardown in flight, no event stream attached. User interaction is not the signal, and an idle
+warm local worker is not work — the exit drains it exactly as `down` does. A managed rental
+holds the daemon until its own idle release has confirmed the pod gone; a manual rental holds it
+until `cozy rental end`. Set `idle_shutdown_s: 0` to keep the daemon up until `cozy down`. The
+next command that needs the daemon starts it again.
+
 The launch web UI is currently a stub rooted in [`web/`](web/). The daemon already serves
 opaque output media and a bounded authenticated content-addressed upload API; full browser
 authentication, upload-to-invocation binding, and media-history UX come with the real frontend.
@@ -287,6 +295,8 @@ port: 8818
 local_rate_micro_usd_per_hour: 250000
 rentals:
   max_hourly_spend_usd: 4.00
+daemon:
+  idle_shutdown_s: 900
 ```
 
 Without a configured `port`, Cozy prefers `127.0.0.1:8818` and falls back to an available

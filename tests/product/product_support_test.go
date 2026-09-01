@@ -208,6 +208,9 @@ func countEvents(o *owner, substr string) int {
 type daemonProcess struct {
 	root, addr, token string
 	cmd               *exec.Cmd
+	// exited delivers the daemon's own exit code once, for the arms where leaving is
+	// the behaviour under test rather than the suite's cleanup.
+	exited <-chan int
 }
 
 func startDaemonProcess(t *testing.T, root string) *daemonProcess {
@@ -222,10 +225,14 @@ func startDaemonProcess(t *testing.T, root string) *daemonProcess {
 	setProcessGroup(cmd)
 	must(t, cmd.Start())
 
-	s := &daemonProcess{root: root, cmd: cmd}
+	exited := make(chan int, 1)
+	go func() {
+		_ = cmd.Wait()
+		exited <- cmd.ProcessState.ExitCode()
+	}()
+	s := &daemonProcess{root: root, cmd: cmd, exited: exited}
 	t.Cleanup(func() {
 		_ = killGroup(cmd.Process.Pid)
-		go func() { _ = cmd.Wait() }()
 		log.Close()
 	})
 	deadline := time.Now().Add(30 * time.Second)

@@ -188,6 +188,14 @@ CREATE TABLE IF NOT EXISTS weights_finalizations (
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`}
 
+// The ONE spelling of "still owes work or a terminal". Every lifecycle fence — the down
+// refusal, the idle exit, the unload safety check — reads these; a request in any other
+// state is settled and an attempt in any other state is closed.
+const (
+	activeRequestStates = `'submitted','queued','dispatching','requeue_pending','finalizing'`
+	openAttemptStates   = `'preparing','offered','accepted','recovered_open','terminal'`
+)
+
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
 // NewID mints an opaque local id. Attempt keys are opaque on purpose: a triage bundle is
@@ -828,7 +836,7 @@ func (s *Store) RequestsOfKind(kind, state string, limit int) ([]Request, *exit.
 // listing: omitting row 501 from a safety fence would make `exit` destructive by accident.
 func (s *Store) ActiveRequests() ([]Request, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests
-		WHERE state IN ('submitted','queued','dispatching','requeue_pending','finalizing')
+		WHERE state IN (` + activeRequestStates + `)
 		ORDER BY created_at,id`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list active requests: %s", err)
@@ -855,7 +863,7 @@ func (s *Store) Owed() ([]Request, *exit.Error) {
 		  AND NOT (r.package='cozy/platform' AND r.entrypoint='model-pass-through' AND EXISTS
 		      (SELECT 1 FROM request_model_transfers t WHERE t.request_id=r.id))
 		  AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.request_id=r.id
-		                  AND a.state IN ('preparing','offered','accepted','recovered_open','terminal'))
+		                  AND a.state IN (` + openAttemptStates + `))
 		ORDER BY r.created_at, r.id`)
 	if err != nil {
 		return nil, exit.Internalf("cannot read the owed requests: %s", err)
@@ -879,7 +887,7 @@ func (s *Store) Owed() ([]Request, *exit.Error) {
 func (s *Store) Unsettled() ([]Request, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests r
 		WHERE EXISTS (SELECT 1 FROM attempts a WHERE a.request_id=r.id
-		              AND a.state IN ('preparing','offered','accepted','recovered_open','terminal'))
+		              AND a.state IN (` + openAttemptStates + `))
 		ORDER BY r.created_at, r.id`)
 	if err != nil {
 		return nil, exit.Internalf("cannot read the unsettled requests: %s", err)
@@ -1656,8 +1664,7 @@ func (s *Store) Attempts(requestID string) ([]Attempt, *exit.Error) {
 // finished and not failed — they are unsettled, and the only thing that can settle one is
 // the supervisor's own journal, replayed by a worker in the SAME slot.
 func (s *Store) OpenAttemptsOf(instanceID string) ([]Attempt, *exit.Error) {
-	return s.attemptsWhere(
-		`instance_id=? AND state IN ('preparing','offered','accepted','recovered_open','terminal')`, instanceID)
+	return s.attemptsWhere(`instance_id=? AND state IN (`+openAttemptStates+`)`, instanceID)
 }
 
 // ReadyRequeues are committed retry decisions whose old terminal has crossed the

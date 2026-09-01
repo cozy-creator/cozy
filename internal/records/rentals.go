@@ -164,12 +164,15 @@ func (s *Store) RentalOperation(key string) (*RentalOperation, *exit.Error) {
 	return &op, nil
 }
 
+// finalRentalOperationStates is the one spelling of "this paid operation is over".
+const finalRentalOperationStates = `'released','rejected'`
+
 // ActiveRentalOperations is every paid acquisition/release operation whose absence has
 // not been proved. A row may precede its provider rental id, so a safe daemon exit
 // must fence on the operation key as well as on attached rental rows.
 func (s *Store) ActiveRentalOperations() ([]RentalOperation, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + rentalOperationCols + ` FROM rental_operations
-		WHERE state NOT IN ('released','rejected') ORDER BY created_at,operation_key`)
+		WHERE state NOT IN (` + finalRentalOperationStates + `) ORDER BY created_at,operation_key`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list active rental operations: %s", err)
 	}
@@ -535,7 +538,7 @@ func rentalFleetTotals(q interface{ QueryRow(string, ...any) *sql.Row }) (int, i
 		UNION ALL
 		SELECT o.operation_key,o.hourly_rate_usd_micros FROM rental_operations o
 		LEFT JOIN rentals r ON r.id=o.rental_id
-		WHERE o.state NOT IN ('released','rejected') AND r.id IS NULL
+		WHERE o.state NOT IN (`+finalRentalOperationStates+`) AND r.id IS NULL
 	)`).Scan(&count, &burn)
 	if err != nil {
 		return 0, 0, exit.Internalf("cannot total the rental fleet: %s", err)

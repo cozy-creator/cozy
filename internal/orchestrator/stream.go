@@ -86,6 +86,13 @@ func (c *Orchestrator) LatestFrame(requestID string) (Frame, bool) {
 	return frame, ok
 }
 
+// count is how many clients are attached right now — the API's open SSE streams.
+func (f *fanout) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.subs)
+}
+
 // publish hands a frame to every matching subscriber, shedding rather than blocking.
 func (f *fanout) publish(frame Frame) {
 	f.mu.Lock()

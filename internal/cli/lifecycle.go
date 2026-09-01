@@ -256,32 +256,15 @@ func offlineDownBlockers(ctx *Context) ([]string, *exit.Error) {
 		return nil, problem
 	}
 	defer store.Close()
+	obligations, problem := store.Obligations()
+	if problem != nil {
+		return nil, problem
+	}
 	var blockers []string
-	requests, problem := store.ActiveRequests()
-	if problem != nil {
-		return nil, problem
-	}
-	for _, request := range requests {
-		kind := "invocation"
-		if request.IsJob() {
-			kind = "job"
-		}
-		blockers = append(blockers, fmt.Sprintf("%s %s (%s)", kind, request.ID, request.State))
-	}
-	rentals, problem := store.Rentals()
-	if problem != nil {
-		return nil, problem
-	}
-	for _, rental := range rentals {
-		blockers = append(blockers, fmt.Sprintf("rental %s (%s)", rental.ID, rental.State))
-	}
-	operations, problem := store.ActiveRentalOperations()
-	if problem != nil {
-		return nil, problem
-	}
-	for _, operation := range operations {
-		if operation.RentalID == "" {
-			blockers = append(blockers, fmt.Sprintf("rental operation %s (%s)", operation.Key, operation.State))
+	for _, o := range obligations {
+		switch o.Kind {
+		case "invocation", "job", "rental", "rental_operation":
+			blockers = append(blockers, o.String())
 		}
 	}
 	return blockers, nil

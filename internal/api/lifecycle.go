@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -16,7 +15,7 @@ import (
 
 // LifecycleIdentity is one durable obligation that prevents a safe daemon down.
 // Kind distinguishes ordinary invocations, run-once jobs, provider rentals, and paid
-// acquisition operations that have not learned a provider rental id yet.
+// acquisition operations no rental row stands for yet.
 type LifecycleIdentity struct {
 	Kind  string `json:"kind"`
 	ID    string `json:"id"`
@@ -126,54 +125,47 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 	go s.shutdown()
 }
 
-func (s *Server) downBlockers() ([]LifecycleIdentity, []LifecycleIdentity, *exit.Error) {
-	requests, problem := s.store.ActiveRequests()
-	if problem != nil {
-		return nil, nil, problem
+// StopUnlessManaging is the idle exit's last word. It re-reads `managing` UNDER the
+// shutdown-admission gate — the same boundary `down` closes — so a submission cannot
+// commit between the daemon's last "nothing to manage" sample and the listener close.
+// An empty answer there marks the server shutting down and fires the shutdown hook; a
+// non-empty one is returned so the caller can say what held the daemon up.
+func (s *Server) StopUnlessManaging(managing func() ([]string, *exit.Error)) ([]string, *exit.Error) {
+	s.shutdownAdmission.Lock()
+	defer s.shutdownAdmission.Unlock()
+	if s.shuttingDown {
+		return nil, nil
 	}
-	active := make([]LifecycleIdentity, 0, len(requests))
-	for _, row := range requests {
-		kind := "invocation"
-		if row.IsJob() {
-			kind = "job"
-		}
-		active = append(active, LifecycleIdentity{Kind: kind, ID: row.ID, State: row.State})
+	held, problem := managing()
+	if problem != nil || len(held) > 0 {
+		return held, problem
 	}
+	if s.shutdown == nil {
+		return nil, exit.Internalf("this server was built with no shutdown hook")
+	}
+	s.shuttingDown = true
+	go s.shutdown()
+	return nil, nil
+}
 
-	rows, problem := s.store.Rentals()
+// downBlockers is the subset of the daemon's obligations `down` refuses on: the work it
+// can cancel and the paid pods it must see ended. An attempt awaiting its ack and an
+// export mid-copy are on their way to settlement and are drained by the close itself.
+func (s *Server) downBlockers() ([]LifecycleIdentity, []LifecycleIdentity, *exit.Error) {
+	obligations, problem := s.store.Obligations()
 	if problem != nil {
 		return nil, nil, problem
 	}
-	rentals := make([]LifecycleIdentity, 0, len(rows))
-	known := make(map[string]bool, len(rows))
-	for _, row := range rows {
-		known[row.ID] = true
-		rentals = append(rentals, LifecycleIdentity{Kind: "rental", ID: row.ID, State: row.State})
-	}
-	operations, problem := s.store.ActiveRentalOperations()
-	if problem != nil {
-		return nil, nil, problem
-	}
-	for _, operation := range operations {
-		if operation.RentalID != "" {
-			if !known[operation.RentalID] {
-				known[operation.RentalID] = true
-				rentals = append(rentals, LifecycleIdentity{
-					Kind: "rental", ID: operation.RentalID, State: operation.State,
-				})
-			}
-			continue
+	active, rentals := []LifecycleIdentity{}, []LifecycleIdentity{}
+	for _, o := range obligations {
+		identity := LifecycleIdentity{Kind: o.Kind, ID: o.ID, State: o.State}
+		switch o.Kind {
+		case "invocation", "job":
+			active = append(active, identity)
+		case "rental", "rental_operation":
+			rentals = append(rentals, identity)
 		}
-		rentals = append(rentals, LifecycleIdentity{
-			Kind: "rental_operation", ID: operation.Key, State: operation.State,
-		})
 	}
-	sort.Slice(rentals, func(i, j int) bool {
-		if rentals[i].Kind != rentals[j].Kind {
-			return rentals[i].Kind < rentals[j].Kind
-		}
-		return rentals[i].ID < rentals[j].ID
-	})
 	return active, rentals, nil
 }
 
