@@ -159,15 +159,18 @@ func validatePublished(gen records.PackageInstall, published *PublishedSource) *
 		}
 		seenDependencies[wheel.Distribution] = true
 	}
-	if len(published.LocalWheels) > 1 {
+	if len(published.LocalWheels) > 2 {
 		return exit.Named(exit.Conflict, "package_local_wheel_count_invalid",
-			"published package carries more than one local materialization wheel")
+			"published package carries more than two local materialization wheels")
 	}
+	seenLocal := map[string]bool{}
 	for _, wheel := range published.LocalWheels {
-		if wheel.Distribution != "tensorfs" || seenDependencies[wheel.Distribution] {
+		allowed := wheel.Distribution == "cozy-runtime" || wheel.Distribution == "tensorfs"
+		if !allowed || seenLocal[wheel.Distribution] || seenDependencies[wheel.Distribution] {
 			return exit.Named(exit.Conflict, "package_local_wheel_invalid",
-				"published local materialization wheel must be TensorFS outside package dependencies")
+				"published local materialization wheels must be unique Runtime/TensorFS distributions outside package dependencies")
 		}
+		seenLocal[wheel.Distribution] = true
 	}
 	return nil
 }

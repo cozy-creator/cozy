@@ -421,11 +421,10 @@ func runPublishedSelection(l home.Layout, gen records.PackageInstall,
 	return answer.PlacementSet, nil
 }
 
-// The package venv runs the exact cozy-runtime wheel selected by uv.lock. Passing that
-// wheel back to its own prepare-package command as a package-owned dependency makes Runtime
-// revalidate itself against the deliberately narrow protected-base observation, which cannot
-// and should not duplicate uv's complete dependency check. All other dependency wheels remain
-// explicit package inputs.
+// The package venv runs the exact cozy-runtime wheel selected by uv.lock. Older releases may
+// still carry it as a dependency wheel; passing it back to its own prepare-package command as
+// package-owned would shadow the selected worker image. New releases carry it only in the local
+// materialization lane. All ordinary dependency wheels remain explicit package inputs.
 func runtimePreparationDependency(wheel PublishedWheel) bool {
 	return wheel.Distribution != "cozy-runtime"
 }

@@ -12,9 +12,9 @@ import (
 )
 
 // MaxPackageInstallDownloads is one project wheel, the complete bounded rental
-// dependency-wheel closure, and one source-carried TensorFS wheel used only to
-// materialize Creator's independent local environment.
-const MaxPackageInstallDownloads = 130
+// dependency-wheel closure, and the source-carried Runtime/TensorFS wheels used
+// only to materialize Creator's independent local environment.
+const MaxPackageInstallDownloads = 131
 
 type PackageUpload struct {
 	Kind            string            `json:"kind,omitempty"`
