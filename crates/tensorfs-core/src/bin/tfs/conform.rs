@@ -12,7 +12,10 @@
 
 use std::process::ExitCode;
 
+use tensorfs_core::canon::Value;
+use tensorfs_core::capability::CapabilityRecord;
 use tensorfs_core::dtype::Dtype;
+use tensorfs_core::err::Code;
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::vectors::{Case, EncodingVectors};
@@ -624,13 +627,88 @@ pub fn cmd_mine(rows: &std::path::Path, name: &str, f: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The machine surface of a capability decision, in the house shape of `compat check
+/// --json` and `grade --json`: TOTAL, so every key is present on every answer and empty
+/// where that answer does not carry it. A consumer that must fail closed decodes ONE shape
+/// and reads `admitted`; it never discovers which keys this verdict happened to emit.
+/// tensorhub decodes with unknown fields refused, so an absent key and a new key are
+/// equally fatal there.
+///
+/// `qualified_devices` is the remedy half, and it is why this is not a bare boolean: "this
+/// encoding is qualified, but somewhere else" is a different fact from "nothing anywhere
+/// runs this", and a caller that can tell them apart can route instead of giving up.
+fn capability_json(
+    admitted: Option<&CapabilityRecord>,
+    encoding: &str,
+    device: &str,
+    refusal: &str,
+    qualified: &[&str],
+) -> Vec<u8> {
+    let (implementation, vectors, note) = match admitted {
+        Some(r) => (r.implementation.as_str(), r.vectors.id(), r.note.as_str()),
+        None => ("", String::new(), ""),
+    };
+    let doc = Value::obj(vec![
+        ("admitted", Value::Bool(admitted.is_some())),
+        (
+            "code",
+            Value::str(if admitted.is_some() {
+                ""
+            } else {
+                Code::CAPABILITY_UNQUALIFIED.as_str()
+            }),
+        ),
+        ("device", Value::str(device)),
+        ("encoding", Value::str(encoding)),
+        ("implementation", Value::str(implementation)),
+        ("note", Value::str(note)),
+        (
+            "qualified_devices",
+            Value::arr(qualified.iter().map(|d| Value::str(*d)).collect()),
+        ),
+        ("reason", Value::str(refusal)),
+        ("vectors", Value::str(vectors)),
+    ]);
+    tensorfs_core::canon::write(&doc)
+}
+
+/// `tfs capability <encoding> <device> [--alias <a>] [--records <path>] [--json]` — the ONE
+/// admission
+/// question, asked from outside the process.
+///
+/// `--json` prints one `capability_json` object on stdout and nothing else, and exits
+/// SUCCESS on both verdicts: the answer is `admitted`, exactly as `compat check --json`
+/// answers in `satisfied` and `grade --json` answers in `grade`. The column-aligned print
+/// keeps its non-zero exit on a refusal and is for people; no program may match on it.
 pub fn cmd_capability(encoding: &str, device: &str, f: &Flags) -> ExitCode {
-    let recs = registry::capability_records();
-    println!(
-        "capability records: {} ({} qualified pairs)",
-        recs.records.len(),
-        recs.records.len()
-    );
+    // The compiled-in records speak only for the reference decoders in this harness, on
+    // the CPU they run on. TensorFS holds no accelerator and must never guess about one,
+    // so an accelerator answer can only come from an OBSERVED record set handed in here by
+    // the component that held the card. Absent one, an accelerator pair refuses -- which is
+    // the absence of evidence answering, exactly as intended.
+    let mut recs = registry::capability_records();
+    if let Some(p) = flag(f, "records") {
+        let bytes = match std::fs::read(p) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("{p}: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let observed = match tensorfs_core::capability::CapabilityRecords::parse_observed(&bytes) {
+            Ok(o) => o,
+            Err(e) => return bail(e),
+        };
+        recs = recs.with_observed(observed);
+    }
+    let json = flag(f, "json").is_some();
+    if !json {
+        println!(
+            "capability records: {} ({} qualified pairs)",
+            recs.records.len(),
+            recs.records.len()
+        );
+    }
     let enc = match flag(f, "alias") {
         Some(a) => match registry::seeds().iter().find(|s| s.alias == a) {
             Some(s) => s.spec.object_id(),
@@ -646,7 +724,25 @@ pub fn cmd_capability(encoding: &str, device: &str, f: &Flags) -> ExitCode {
         }
         None => encoding.to_string(),
     };
-    match recs.admit(&enc, device) {
+    let decision = recs.admit(&enc, device);
+    if json {
+        let qualified: Vec<&str> = recs
+            .records
+            .iter()
+            .filter(|r| r.encoding == enc)
+            .map(|r| r.device.as_str())
+            .collect();
+        let (record, refusal) = match &decision {
+            Ok(r) => (Some(*r), String::new()),
+            Err(e) => (None, e.detail.clone()),
+        };
+        println!(
+            "{}",
+            String::from_utf8_lossy(&capability_json(record, &enc, device, &refusal, &qualified))
+        );
+        return ExitCode::SUCCESS;
+    }
+    match decision {
         Ok(r) => {
             println!("ADMITTED ({enc}, {device})");
             println!("  implementation {}", r.implementation);
@@ -654,5 +750,110 @@ pub fn cmd_capability(encoding: &str, device: &str, f: &Flags) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => bail(e),
+    }
+}
+
+#[cfg(test)]
+mod capability_surface {
+    use super::*;
+
+    /// Every key on every verdict. The whole reason this shape is TOTAL is that tensorhub
+    /// decodes it with unknown fields refused, so a key that appears only on one verdict
+    /// is a decoder failure on the other.
+    const KEYS: [&str; 9] = [
+        "admitted",
+        "code",
+        "device",
+        "encoding",
+        "implementation",
+        "note",
+        "qualified_devices",
+        "reason",
+        "vectors",
+    ];
+
+    fn keys(bytes: &[u8]) -> Vec<String> {
+        match tensorfs_core::canon::parse_canonical(bytes, 1 << 20)
+            .expect("capability --json is canonical JSON")
+        {
+            tensorfs_core::canon::Value::Obj(pairs) => pairs.into_iter().map(|(k, _)| k).collect(),
+            other => panic!("capability --json is an object, got {}", other.kind()),
+        }
+    }
+
+    fn plain() -> String {
+        registry::seeds()
+            .iter()
+            .find(|s| s.alias == "plain/1")
+            .expect("plain/1 is entry zero of the registry")
+            .spec
+            .object_id()
+    }
+
+    #[test]
+    fn admitted_and_refused_carry_the_same_keys() {
+        let recs = registry::capability_records();
+        let enc = plain();
+        let admitted = recs
+            .admit(&enc, "cpu")
+            .expect("plain/1 is qualified on cpu");
+        let yes = capability_json(Some(admitted), &enc, "cpu", "", &["cpu"]);
+        let refusal = recs
+            .admit(&enc, "cuda.sm89")
+            .expect_err("no accelerator class is qualified yet");
+        let no = capability_json(None, &enc, "cuda.sm89", &refusal.detail, &["cpu"]);
+        assert_eq!(keys(&yes), KEYS);
+        assert_eq!(keys(&no), KEYS);
+    }
+
+    /// The device axis answering NO is a NAMED refusal with its own code, never a bare
+    /// false: a caller that cannot read `CAPABILITY_UNQUALIFIED` off the answer cannot
+    /// tell "this card cannot run it" from "the weights do not fit the code".
+    #[test]
+    fn a_refusal_names_its_code_and_the_devices_that_would_work() {
+        let recs = registry::capability_records();
+        let enc = plain();
+        let refusal = recs.admit(&enc, "cuda.sm89").expect_err("unqualified");
+        let no = capability_json(None, &enc, "cuda.sm89", &refusal.detail, &["cpu"]);
+        let text = String::from_utf8(no).expect("canonical JSON is UTF-8");
+        assert!(text.contains(r#""admitted":false"#), "{text}");
+        assert!(
+            text.contains(r#""code":"CAPABILITY_UNQUALIFIED""#),
+            "{text}"
+        );
+        assert!(text.contains(r#""qualified_devices":["cpu"]"#), "{text}");
+        assert!(text.contains(r#""implementation":"""#), "{text}");
+    }
+
+    /// A vectorless spec is structurally unqualifiable, so it refuses on the very device
+    /// the reference decoders run on, and says so with an EMPTY qualified set.
+    #[test]
+    fn a_vectorless_spec_is_qualified_nowhere() {
+        let recs = registry::capability_records();
+        let enc = registry::seeds()
+            .iter()
+            .find(|s| s.spec.vectors.is_none())
+            .expect("the registry seeds at least one vectorless spec")
+            .spec
+            .object_id();
+        let refusal = recs
+            .admit(&enc, "cpu")
+            .expect_err("vectorless never qualifies");
+        let no = capability_json(None, &enc, "cpu", &refusal.detail, &[]);
+        let text = String::from_utf8(no).expect("canonical JSON is UTF-8");
+        assert!(text.contains(r#""qualified_devices":[]"#), "{text}");
+    }
+
+    /// The refusal detail rides into a canonical document, and this layer is
+    /// printable-ASCII only. A stray em dash would make the answer unreadable by the
+    /// strict reader on the other side.
+    #[test]
+    fn the_refusal_detail_stays_printable_ascii() {
+        let recs = registry::capability_records();
+        let enc = plain();
+        let refusal = recs.admit(&enc, "cuda.sm89").expect_err("unqualified");
+        let no = capability_json(None, &enc, "cuda.sm89", &refusal.detail, &["cpu"]);
+        tensorfs_core::canon::parse_canonical(&no, 1 << 20)
+            .expect("the strict reader accepts its own output");
     }
 }

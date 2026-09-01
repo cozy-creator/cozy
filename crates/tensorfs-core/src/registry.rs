@@ -367,6 +367,16 @@ pub fn seeds() -> Vec<Seed> {
     out
 }
 
+/// Every VECTORED seed, as (spec digest, the vector set it pins). This is the evidence
+/// index a capability record is checked against: a record names the exact vector set its
+/// implementation passed, and the only way that name can be true is if the spec pins it.
+pub fn vector_refs() -> Vec<(String, crate::ids::ObjectRef)> {
+    seeds()
+        .iter()
+        .filter_map(|s| s.spec.vectors.clone().map(|v| (s.spec.object_id(), v)))
+        .collect()
+}
+
 /// The qualified (encoding, device) pairs. FAIL-CLOSED: anything absent here refuses, and
 /// a record cannot exist without naming the vector set its implementation passed.
 pub fn capability_records() -> crate::capability::CapabilityRecords {

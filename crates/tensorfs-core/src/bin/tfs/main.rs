@@ -27,6 +27,16 @@
 //!   tfs structure list                                  the bank, with provenance
 //!   tfs structure match <root> <hex>                    does this checkpoint match one?
 //!
+//! Qualification (tfs-008): what an (encoding, device) pair is QUALIFIED to execute.
+//! FAIL-CLOSED -- an absent pair refuses, because an unrecognised device is the absence of
+//! evidence and never permission. The compiled-in records speak only for the reference
+//! decoders in `tfs conform`, on the CPU they run on; an accelerator answer exists only
+//! once a component that HELD the card hands one in through `--records`.
+//!
+//!   tfs conform [<what>]                             qualify the reference decoders
+//!   tfs vectors mine <rows> <name>                   mine a producer's vectors
+//!   tfs capability <encoding> <device> [--alias <a>] [--records <observed.json>] [--json]
+//!
 //! The repository/manifest/blob store (tfs-034).
 //!
 //!   tfs manifest build <entries.jsonl> --out <manifest.json>
