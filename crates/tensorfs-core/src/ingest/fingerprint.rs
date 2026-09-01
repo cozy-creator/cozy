@@ -282,6 +282,74 @@ impl FingerprintRegistry {
         }
     }
 
+    /// Return the exact provider members named by a set of reviewed source profiles.
+    ///
+    /// This is deliberately a metadata-only query: callers can narrow a provider's
+    /// file inventory before any model body is transferred. Prefix-bound or unbound
+    /// components cannot name an exact carrier without inspecting the provider
+    /// inventory, so they refuse instead of widening the download.
+    pub fn exact_source_members(&self, profile_names: &[String]) -> Result<Vec<String>> {
+        if profile_names.is_empty() {
+            return refuse(Code::MISSING_FIELD, "no source profile requested");
+        }
+        let mut requested: Vec<&str> = profile_names.iter().map(String::as_str).collect();
+        requested.sort();
+        if requested.windows(2).any(|window| window[0] == window[1]) {
+            return refuse(Code::DUPLICATE_KEY, "source profiles must be unique");
+        }
+
+        let mut members = Vec::new();
+        for name in requested {
+            let Some(profile) = self
+                .source_profiles
+                .iter()
+                .find(|profile| profile.name == name)
+            else {
+                return refuse(
+                    Code::UNREGISTERED_FINGERPRINT,
+                    format!("reviewed source profile {name:?} is absent"),
+                );
+            };
+            for component in &profile.components {
+                match (&component.source_member, &component.source_member_prefix) {
+                    (Some(member), None) => members.push(member.clone()),
+                    (None, Some(prefix)) => {
+                        return refuse(
+                            Code::AMBIGUOUS_CLASSIFICATION,
+                            format!(
+                                "source profile {name:?} component {:?} names member prefix \
+                                 {prefix:?}, not one exact provider member",
+                                component.component
+                            ),
+                        )
+                    }
+                    (None, None) => {
+                        return refuse(
+                            Code::MISSING_FIELD,
+                            format!(
+                                "source profile {name:?} component {:?} names no exact \
+                                 provider member",
+                                component.component
+                            ),
+                        )
+                    }
+                    (Some(_), Some(_)) => {
+                        unreachable!("registry parser rejects dual member bindings")
+                    }
+                }
+            }
+        }
+        members.sort();
+        members.dedup();
+        if members.is_empty() {
+            return refuse(
+                Code::MISSING_FIELD,
+                "source profiles name no exact provider members",
+            );
+        }
+        Ok(members)
+    }
+
     /// The verdict as an authorization, with the three refusals spelled out at one site.
     pub fn authorize(&self, what: &str, fp: &Fingerprint) -> Result<Banked> {
         match self.classify(fp) {
@@ -923,6 +991,69 @@ mod tests {
         assert_eq!(
             FingerprintRegistry::parse(old.as_bytes()).unwrap_err().code,
             Code::UNKNOWN_FIELD
+        );
+    }
+
+    fn source_component(member: Option<&str>, prefix: Option<&str>) -> SourceProfileComponent {
+        SourceProfileComponent {
+            component: "model".into(),
+            source_member: member.map(str::to_string),
+            source_member_prefix: prefix.map(str::to_string),
+            target_encoding: "bf16".into(),
+            variants: vec![SourceProfileVariant {
+                keyset_digest: object_id(b"keys"),
+                construction_order: vec!["weight".into()],
+            }],
+        }
+    }
+
+    #[test]
+    fn exact_source_members_unions_profiles_without_guessing() {
+        let mut registry = registry();
+        registry.source_profiles = vec![
+            SourceProfile {
+                name: "profile/a".into(),
+                components: vec![source_component(Some("a/model.index.json"), None)],
+            },
+            SourceProfile {
+                name: "profile/b".into(),
+                components: vec![
+                    source_component(Some("b/model.safetensors"), None),
+                    source_component(Some("a/model.index.json"), None),
+                ],
+            },
+        ];
+        assert_eq!(
+            registry
+                .exact_source_members(&["profile/b".into(), "profile/a".into()])
+                .unwrap(),
+            vec![
+                "a/model.index.json".to_string(),
+                "b/model.safetensors".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_source_members_refuses_missing_or_non_exact_profiles() {
+        let mut registry = registry();
+        registry.source_profiles = vec![SourceProfile {
+            name: "profile/prefix".into(),
+            components: vec![source_component(None, Some("weights/"))],
+        }];
+        assert_eq!(
+            registry
+                .exact_source_members(&["profile/missing".into()])
+                .unwrap_err()
+                .code,
+            Code::UNREGISTERED_FINGERPRINT
+        );
+        assert_eq!(
+            registry
+                .exact_source_members(&["profile/prefix".into()])
+                .unwrap_err()
+                .code,
+            Code::AMBIGUOUS_CLASSIFICATION
         );
     }
 }

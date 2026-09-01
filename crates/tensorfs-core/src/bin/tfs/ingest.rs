@@ -184,6 +184,28 @@ fn load_registry(f: &Flags) -> Result<FingerprintRegistry, ExitCode> {
     }
 }
 
+/// Print the exact provider members named by reviewed source profiles. This
+/// reads only the small registry and is the pre-body selection seam used by
+/// callers that already hold provider metadata.
+pub fn cmd_source_members(profiles: &[&str], f: &Flags) -> ExitCode {
+    let registry = match load_registry(f) {
+        Ok(registry) => registry,
+        Err(code) => return code,
+    };
+    let profiles: Vec<String> = profiles
+        .iter()
+        .map(|profile| (*profile).to_string())
+        .collect();
+    let members = match registry.exact_source_members(&profiles) {
+        Ok(members) => members,
+        Err(error) => return bail(error),
+    };
+    for member in members {
+        println!("{member}");
+    }
+    ExitCode::SUCCESS
+}
+
 // ------------------------------------------------------------------ marker evidence
 
 /// One decoded `.comfy_quant` payload, JOINED to the companion roles its own module
