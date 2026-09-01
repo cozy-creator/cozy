@@ -28,8 +28,8 @@ import (
 
 const weightlessRef = "cozy/cozy-weightless-package"
 const localWeightlessRef = "local/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "6d7da5997d1f6a7a4997ef80541d8e22f555cff7"
-const editableTensorFSFixtureSHA = "0f49a4bf3fbe6fc8d41713b7ce9041c80161b7e6"
+const editableRuntimeFixtureSHA = "d0884f452859898f4aca44c43413884a40892284"
+const editableTensorFSFixtureSHA = "4452d758a1020668f980030b15b1cd65956ca25e"
 
 func TestHumanQueuePositionLabelKeepsMachineKey(t *testing.T) {
 	record := output.Record{Fields: []output.Field{{K: "queue_position", V: "9/9"}}}
