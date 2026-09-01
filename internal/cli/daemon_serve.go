@@ -14,6 +14,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -132,6 +133,13 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 	go fleet.releaseOrphaned()
 
+	// cl-076: an install directory is reachable only through its record, so a records.db
+	// that was lost or rebuilt strands every one of them on disk with no verb able to
+	// touch it. The sweep runs here — after reconcile has closed the worker rows that
+	// would otherwise still reference a generation, and before the API is served — and it
+	// is never fatal: what it removes is a venv `cozy package install` rebuilds.
+	swept, sweepNote := sweepInstalls(l, st)
+
 	// One per-launch CLI credential is handed over through a 0600 file. It is never
 	// printed, logged, or placed on argv, and dies with this process. The public web stub
 	// exposes no state; full browser authorization is a later, separately reviewed door.
@@ -159,6 +167,8 @@ func serveDaemon(ctx *Context) *exit.Error {
 
 	fmt.Fprintf(ctx.Out, "Cozy daemon up: api %s (%s, loopback only) · worker socket %s\n",
 		addr, strings.Join(bound, "+"), socket)
+	fmt.Fprintf(ctx.Out, "  install sweep: reclaimed %d of %d director(ies), freed %s exclusive%s\n",
+		swept.Removed, swept.Scanned, output.Bytes(swept.Bytes), sweepNote)
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s · reconcile killed %d orphan(s), forgot %d stale row(s)\n",
 		l.DB, yield, killed, forgotten)
 	fmt.Fprintf(ctx.Out, "  client credential %s (%s, mode 0600)\n", creds.CLI.Digest(), l.Client)
@@ -177,4 +187,22 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fleet.close()
 	c.Close(orchestrator.StopGrace)
 	return nil
+}
+
+// sweepInstalls takes the single-writer lock the install transaction takes, sweeps, and
+// answers a note for the startup banner instead of an error. Every outcome here is
+// recoverable by reinstalling one package, so none of them may keep the daemon down: a
+// concurrent writer defers the sweep to the next start, and a directory that refuses to
+// go is reported and left where it is.
+func sweepInstalls(l home.Layout, st *records.Store) (install.Swept, string) {
+	writer, problem := install.Lock(l)
+	if problem != nil {
+		return install.Swept{}, " · deferred: " + problem.Message
+	}
+	defer writer.Unlock()
+	swept, problem := install.Sweep(l, st)
+	if problem != nil {
+		return swept, " · incomplete: " + problem.Message
+	}
+	return swept, ""
 }
