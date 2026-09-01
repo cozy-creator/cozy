@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"math"
 	"os"
 	"path/filepath"
@@ -22,8 +23,40 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// worker-protocol's frozen corpus, checked out beside this repo.
-const fixtureDir = "/home/fidika/cozy_v2/worker-protocol/fixtures"
+// worker-protocol's frozen corpus. CI provisions it and points
+// WORKER_PROTOCOL_FIXTURES at it; a checkout beside this repo is the local fallback.
+const localFixtureDir = "/home/fidika/cozy_v2/worker-protocol/fixtures"
+
+var workerProtocolFixtures = flag.String("worker-protocol-fixtures", "",
+	"worker-protocol's frozen fixtures/ directory; CI passes the checkout it provisioned")
+var requireWorkerProtocolFixtures = flag.Bool("require-worker-protocol-fixtures", false,
+	"a frozen corpus that is absent is a failure rather than a skip")
+
+// resolveFixtureDir returns the corpus path, or "" when there is genuinely no corpus on
+// this disk. A corpus that was PROMISED and is not there is a hard failure, never a skip:
+// this is the workspace's only automated cross-language canonical-identity check, and a
+// silent skip is indistinguishable from a pass. CI passes
+// -require-worker-protocol-fixtures once it has arranged for the corpus to exist.
+func resolveFixtureDir(t *testing.T) string {
+	t.Helper()
+	dir, required := *workerProtocolFixtures, *requireWorkerProtocolFixtures
+	if dir == "" {
+		if required {
+			t.Fatal("-require-worker-protocol-fixtures is set but -worker-protocol-fixtures " +
+				"is empty: the frozen corpus was not provisioned")
+		}
+		dir = localFixtureDir
+	} else {
+		required = true
+	}
+	if _, err := os.Stat(filepath.Join(dir, "MANIFEST.json")); err != nil {
+		if required {
+			t.Fatalf("the frozen corpus was promised at %s and is not readable: %v", dir, err)
+		}
+		return ""
+	}
+	return dir
+}
 
 func TestCanonicalFormatsAreVersionOne(t *testing.T) {
 	for _, msg := range []proto.Message{
@@ -49,15 +82,27 @@ func TestCanonicalFormatsAreVersionOne(t *testing.T) {
 // digests, plan ids, terminal admission — agrees at all. It is the cheapest test here and
 // the one whose failure is least visible any other way.
 func TestCanonicalDocuments(t *testing.T) {
-	if _, err := os.Stat(fixtureDir); err != nil {
-		t.Skipf("worker-protocol's frozen corpus is not on this disk: %s", fixtureDir)
+	fixtureDir := resolveFixtureDir(t)
+	if fixtureDir == "" {
+		t.Skipf("worker-protocol's frozen corpus is not on this disk: %s "+
+			"(pass -worker-protocol-fixtures=<checkout>/fixtures to run it)", localFixtureDir)
 	}
 	var manifest struct {
 		Canonical map[string]struct{ ID, Type, Document string } `json:"canonical"`
+		WireMinor uint32                                         `json:"wire_minor"`
 	}
 	data, err := os.ReadFile(filepath.Join(fixtureDir, "MANIFEST.json"))
 	must(t, err)
 	must(t, json.Unmarshal(data, &manifest))
+
+	// The corpus names the wire minor it was frozen at. This repo is the RecordOwner, so a
+	// stale vendored binding here advertises a minor the workers have already moved past on
+	// every Claim and DesiredWorkerState. The document bytes below do not move on an
+	// additive bump, so nothing else in this test would notice.
+	if pb.WireMinor != manifest.WireMinor {
+		t.Errorf("vendored wire minor %d != the frozen corpus's %d: re-vendor protocol/ from "+
+			"worker-protocol", pb.WireMinor, manifest.WireMinor)
+	}
 
 	// This Go writer against the frozen documents, and this Go reader back over them.
 	names := make([]string, 0, len(manifest.Canonical))
@@ -65,6 +110,7 @@ func TestCanonicalDocuments(t *testing.T) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	arms := 0
 	for _, name := range names {
 		row := manifest.Canonical[name]
 		msg := messageFor(row.Type)
@@ -96,6 +142,12 @@ func TestCanonicalDocuments(t *testing.T) {
 		if _, rerr := canonical.Read(frozen, msg); rerr != nil {
 			t.Errorf("%s: this reader refused the frozen document: %v", name, rerr)
 		}
+		arms++
+	}
+	// A corpus that shrank to nothing would otherwise pass this test green, which is the
+	// same vacuous pass a silent skip gives. Every canonical document must be exercised.
+	if arms != len(manifest.Canonical) || arms == 0 {
+		t.Fatalf("exercised %d of %d canonical documents", arms, len(manifest.Canonical))
 	}
 
 	// RED: every frozen SEMANTIC TWIN — one frozen document with exactly one rule broken —
@@ -115,6 +167,7 @@ func TestCanonicalDocuments(t *testing.T) {
 		if got := canonical.Code(rerr); got != want.code {
 			t.Errorf("%s: refused as %q, wanted %q", name, got, want.code)
 		}
+		arms++
 	}
 
 	// RED: the document plane's own refusals. The `format` tag domain-separates two
@@ -139,6 +192,10 @@ func TestCanonicalDocuments(t *testing.T) {
 	if canonical.Code(cerr) != "non_ascii_field" {
 		t.Errorf("a non-ASCII field was not refused: %v", cerr)
 	}
+	arms += 5 // the wire-minor agreement and the document plane's own refusals, above
+	t.Logf("%s: %d arms at wire minor %d (%d canonical documents, 4 semantic twins, "+
+		"4 plane refusals, 1 wire-minor agreement)",
+		fixtureDir, arms, manifest.WireMinor, len(manifest.Canonical))
 }
 
 func messageFor(name string) proto.Message {
