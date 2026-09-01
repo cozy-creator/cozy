@@ -1735,8 +1735,6 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     let session = tensorfs_core::ingest::transaction::IngestSession {
         session: "e3b0c44298fc1c14".to_string(),
         tenant: "acme".to_string(),
-        created: 1787600000,
-        expires_at: 1787603600,
         candidates: vec![ObjectRef::of(b"a candidate header")],
     };
     cases.push(ok_case(
@@ -1744,7 +1742,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "ingest-session",
         "session",
         session.canonical_bytes(),
-        "an expiring temporary session: a candidate is never a release",
+        "a temporary session: a candidate is never a release",
     ));
 
     // --- ingest reds

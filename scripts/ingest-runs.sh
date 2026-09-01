@@ -545,8 +545,8 @@ echo "  before: $BEFORE"
 echo "  after:  $("$TFS" ingest sessions "$STORE" | tail -1)"
 red ROOT_ABSENT "installing a session the crash never completed" \
     "$TFS" ingest install "$STORE" crashed proof crashed 1.0.0 local
-echo "  reaping the expiring sessions:"
-"$TFS" ingest reap "$STORE" --now | sed 's/^/    /'
+echo "  explicitly reaping abandoned sessions:"
+"$TFS" ingest reap "$STORE" | sed 's/^/    /'
 red ROOT_ABSENT "installing after the session was reaped" \
     "$TFS" ingest install "$STORE" rekey proof rekey 1.0.0 local
 echo "  released manifests after the crash and the reap:"

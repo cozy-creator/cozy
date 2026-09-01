@@ -1678,7 +1678,7 @@ mod tests {
         let repo = RepositoryName::new("org", "held-model").unwrap();
         let catalog = crate::catalog::Catalog::open(&root).unwrap();
         let guard = catalog
-            .begin_operation("acquire-1", &repo.org, &repo.name, 10)
+            .begin_operation("acquire-1", &repo.org, &repo.name)
             .unwrap();
         let spec = crate::registry::seeds()
             .into_iter()

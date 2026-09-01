@@ -191,7 +191,7 @@ def main() -> None:
     store = tensorfs.Store.open(str(args.store))
     source = store.manifest(source_id)
     source_document = source["manifest"]
-    operation = store.begin_operation("derived-source", "proof", "h3-source", 1)
+    operation = store.begin_operation("derived-source", "proof", "h3-source")
     operation.hold_manifest(source_id, len(source_document))
     for reached in store.walk(source_id):
         operation.hold_blob(reached["id"], reached["length"])

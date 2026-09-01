@@ -71,7 +71,7 @@ def main() -> None:
     store = tensorfs.Store.open(str(args.store))
     source = store.manifest(source_id)
     source_length = len(source["manifest"])
-    operation = store.begin_operation("registry-source", "proof", "plain-source", 1)
+    operation = store.begin_operation("registry-source", "proof", "plain-source")
     operation.hold_manifest(source_id, source_length)
     for reached in store.walk(source_id):
         operation.hold_blob(reached["id"], reached["length"])

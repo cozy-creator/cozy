@@ -93,7 +93,7 @@ assert st["items"] > 0 and st["bytes"] > 0
 
 with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
     destination = tensorfs.Store.init(transfer_root)
-    operation = destination.begin_operation("wheel-acquire", "tensorhub", "smoke", 10)
+    operation = destination.begin_operation("wheel-acquire", "tensorhub", "smoke")
     operation.hold_manifest(snap, len(info["manifest"]))
     closure = store.walk(snap)
     for reached in closure:
@@ -103,7 +103,6 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
         store, destination, snap, len(info["manifest"])
     )
     assert admitted_manifest["id"] == "sha256:" + snap
-    operation.progress(11, len(closure) + 1, sum(row["length"] for row in closure) + len(info["manifest"]))
     evidence = json.dumps(
         {"classification_digest": tensorfs.topology_digest(info["header"])},
         sort_keys=True,

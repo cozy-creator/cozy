@@ -1063,11 +1063,7 @@ fn prepare_model_source_with_registry(
     let fences = validate_request(request, &registry)?;
     let digest = request_digest(request, registry_bytes);
     let catalog = crate::catalog::Catalog::open(store.root())?;
-    let writer = match catalog.begin_source_preparation(
-        &request.operation_id,
-        &digest,
-        crate::meta::now_secs(),
-    )? {
+    let writer = match catalog.begin_source_preparation(&request.operation_id, &digest)? {
         crate::catalog::SourcePreparation::Prepared(rows) => {
             if rows.len() != request.profiles.len()
                 || rows
@@ -1147,12 +1143,6 @@ fn prepare_model_source_with_registry(
             checkpoint_evidence_canonical_bytes,
         });
         validate_prepared_result(store, sources.last().expect("just pushed source result"))?;
-        catalog.progress(
-            &request.operation_id,
-            crate::meta::now_secs(),
-            sources.len() as u64,
-            sources.iter().map(|source| source.manifest_length).sum(),
-        )?;
     }
     for fence in &fences {
         fence.check()?;
@@ -1186,8 +1176,7 @@ pub fn prepare_model_source(
 }
 
 pub fn release_model_source(store: &Store, operation_id: &str) -> Result<()> {
-    crate::catalog::Catalog::open(store.root())?
-        .release_source_preparation(operation_id, crate::meta::now_secs())
+    crate::catalog::Catalog::open(store.root())?.release_source_preparation(operation_id)
 }
 
 #[cfg(test)]
@@ -1438,7 +1427,7 @@ mod tests {
         let digest = request_digest(&request, &registry);
         let catalog = Catalog::open(store.root()).unwrap();
         let open = catalog
-            .begin_source_preparation(&request.operation_id, &digest, crate::meta::now_secs())
+            .begin_source_preparation(&request.operation_id, &digest)
             .unwrap();
         assert!(matches!(open, crate::catalog::SourcePreparation::Open(_)));
         drop(open);

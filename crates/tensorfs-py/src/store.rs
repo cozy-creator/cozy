@@ -660,12 +660,11 @@ impl PyStore {
         operation_id: &str,
         org: &str,
         name: &str,
-        now: u64,
     ) -> PyResult<PyOperation> {
         let repo = RepositoryName::new(org, name).or_refuse(py)?;
         let catalog = Catalog::open(self.store.root()).or_refuse(py)?;
         let guard = catalog
-            .resume_operation(operation_id, &repo.org, &repo.name, now)
+            .resume_operation(operation_id, &repo.org, &repo.name)
             .or_refuse(py)?;
         Ok(PyOperation {
             store: Arc::clone(&self.store),
@@ -1279,12 +1278,6 @@ impl PyOperation {
         let key = storage::manifest_key(digest).or_refuse(py)?;
         self.catalog
             .hold(&self.operation_id, &key, length)
-            .or_refuse(py)
-    }
-
-    fn progress(&self, py: Python<'_>, now: u64, objects: u64, bytes: u64) -> PyResult<()> {
-        self.catalog
-            .progress(&self.operation_id, now, objects, bytes)
             .or_refuse(py)
     }
 

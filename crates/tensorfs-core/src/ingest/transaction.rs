@@ -1,15 +1,15 @@
-//! The ingest TRANSACTION: everything a border run produces lands under an expiring
+//! The ingest TRANSACTION: everything a border run produces lands under a temporary
 //! candidate directory under `tmp/`, and a separate explicit act installs it.
 //!
 //! The property this file exists to hold: **a crash, a timeout, a rejection or a walked-away
 //! session leaves no visible checkpoint.** Candidate objects may well be in the CAS — they
-//! are content-addressed and harmless there — but nothing NAMES them except a root that
-//! expires. `install` is the coordinator's act, performed against a receipt that binds the
-//! exact subject/manifest/header triple, and it is the only repository-release writer.
+//! are content-addressed and harmless there — but nothing NAMES them except a candidate root.
+//! `install` is the coordinator's act, performed against a receipt that binds the exact
+//! subject/manifest/header triple, and it is the only repository-release writer.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use crate::canon::{as_arr, Fields, Value};
 use crate::checkpoint::{self as ck, build_manifest};
@@ -36,13 +36,6 @@ fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
     }
 }
 
-pub fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 // ---------------------------------------------------------------- the resumable session
 
 /// The candidate namespace. Written first, deleted by reap, promoted only by `install`.
@@ -50,8 +43,6 @@ pub fn now_secs() -> u64 {
 pub struct IngestSession {
     pub session: String,
     pub tenant: String,
-    pub created: u64,
-    pub expires_at: u64,
     pub candidates: Vec<ObjectRef>,
 }
 
@@ -64,8 +55,6 @@ impl Plain for IngestSession {
         for c in as_arr("IngestSession", "candidates", f.req("candidates")?)? {
             candidates.push(ObjectRef::from_value("candidate", c)?);
         }
-        let created = f.req_uint("created")?;
-        let expires_at = f.req_uint("expires_at")?;
         let session = f.req_str("session")?.to_string();
         let tenant = f.req_str("tenant")?.to_string();
         f.done()?;
@@ -74,8 +63,6 @@ impl Plain for IngestSession {
         Ok(IngestSession {
             session,
             tenant,
-            created,
-            expires_at,
             candidates,
         })
     }
@@ -86,8 +73,6 @@ impl Plain for IngestSession {
                 "candidates",
                 Value::arr(self.candidates.iter().map(|c| c.to_value()).collect()),
             ),
-            ("created", Value::uint(self.created)),
-            ("expires_at", Value::uint(self.expires_at)),
             ("session", Value::str(self.session.clone())),
             ("tenant", Value::str(self.tenant.clone())),
         ])
@@ -107,47 +92,30 @@ pub fn open_root(
     store: &Store,
     session: &str,
     tenant: &str,
-    ttl: u64,
 ) -> Result<(IngestSession, crate::catalog::WriterGuard)> {
     let store_root = store.root();
     let dir = candidate_dir(store_root, session);
     if dir.is_dir() {
         let root = read_session(store_root, session)?;
-        let recorded_ttl = if root.expires_at == 0 {
-            0
-        } else {
-            root.expires_at.saturating_sub(root.created)
-        };
-        if root.tenant != tenant || recorded_ttl != ttl {
+        if root.tenant != tenant {
             return refuse(
                 Code::TRANSACTION_CONFLICT,
-                "same ingest session was opened with different tenant or TTL semantics",
+                "same ingest session was opened for a different tenant",
             );
         }
-        let writer = crate::catalog::Catalog::open(store.root())?.resume_operation(
-            session,
-            tenant,
-            "ingest",
-            now_secs(),
-        )?;
+        let writer = crate::catalog::Catalog::open(store.root())?
+            .resume_operation(session, tenant, "ingest")?;
         return Ok((root, writer));
     }
     fs::create_dir_all(&dir).map_err(|e| io("mkdir ingest candidate", e))?;
-    let now = now_secs();
     let root = IngestSession {
         session: session.to_string(),
         tenant: tenant.to_string(),
-        created: now,
-        expires_at: if ttl == 0 { 0 } else { now.saturating_add(ttl) },
         candidates: Vec::new(),
     };
     write_session(store_root, &root)?;
-    let writer = crate::catalog::Catalog::open(store.root())?.begin_operation(
-        session,
-        tenant,
-        "ingest",
-        now_secs(),
-    )?;
+    let writer =
+        crate::catalog::Catalog::open(store.root())?.begin_operation(session, tenant, "ingest")?;
     Ok((root, writer))
 }
 
@@ -161,7 +129,7 @@ pub fn resume_operation(
 ) -> Result<crate::catalog::WriterGuard> {
     let catalog = crate::catalog::Catalog::open(store.root())?;
     let root = read_session(store.root(), session)?;
-    let writer = catalog.resume_operation(session, &root.tenant, "ingest", now_secs())?;
+    let writer = catalog.resume_operation(session, &root.tenant, "ingest")?;
     catalog.hold(
         session,
         &crate::storage::manifest_key(&manifest_ref.sha256)?,
@@ -196,12 +164,11 @@ pub fn read_session(store_root: &Path, session: &str) -> Result<IngestSession> {
     }
 }
 
-/// Age-bounded reap. An expired session is removed; its candidate blobs remain unreferenced
+/// Explicitly abandon every session whose writer is gone. Candidate blobs remain unreferenced
 /// content-addressed bytes until ordinary GC.
 ///
 /// The operation's retained writer marker arbitrates this against a live worker or install.
-/// An expired operation can be abandoned only after that marker is provably unlocked.
-pub fn reap(store: &Store, now: u64) -> Result<(Vec<String>, Vec<String>)> {
+pub fn reap(store: &Store) -> Result<(Vec<String>, Vec<String>)> {
     let store_root = store.root();
     let base = store_root.join("tmp").join("ingest");
     let (mut gone, mut kept) = (Vec::new(), Vec::new());
@@ -211,30 +178,14 @@ pub fn reap(store: &Store, now: u64) -> Result<(Vec<String>, Vec<String>)> {
     };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        let expired = match fs::read(e.path().join("session.json")) {
-            // An unparsable or headless session directory is debris by construction: nothing
-            // can install from it, so it reaps rather than living forever.
-            Ok(b) => IngestSession::parse(&b)
-                .map(|r| now == u64::MAX || (r.expires_at != 0 && r.expires_at <= now))
-                .unwrap_or(true),
-            Err(_) => true,
-        };
-        if expired {
-            let catalog = crate::catalog::Catalog::open(store.root())?;
-            match catalog.abandon(&name, true) {
-                Ok(()) => {
-                    fs::remove_dir_all(e.path()).map_err(|err| io("reap session", err))?;
-                    gone.push(name);
-                }
-                Err(error)
-                    if error.code == Code::ROOT_EXPIRED || error.code == Code::STORE_BUSY =>
-                {
-                    kept.push(name)
-                }
-                Err(error) => return Err(error),
+        let catalog = crate::catalog::Catalog::open(store.root())?;
+        match catalog.abandon(&name, true) {
+            Ok(()) => {
+                fs::remove_dir_all(e.path()).map_err(|err| io("reap session", err))?;
+                gone.push(name);
             }
-        } else {
-            kept.push(name);
+            Err(error) if error.code == Code::STORE_BUSY => kept.push(name),
+            Err(error) => return Err(error),
         }
     }
     gone.sort();
@@ -242,8 +193,21 @@ pub fn reap(store: &Store, now: u64) -> Result<(Vec<String>, Vec<String>)> {
     Ok((gone, kept))
 }
 
+pub fn sessions(store: &Store) -> Vec<String> {
+    let base = store.root().join("tmp").join("ingest");
+    let mut sessions: Vec<String> = fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    sessions.sort();
+    sessions
+}
+
 /// The coordinator's act. The receipt must bind the exact triple it is presented with, the
-/// manifest must walk, and the root must not have expired.
+/// manifest must walk, and the candidate root must still exist.
 ///
 /// Durable visibility is the repository release CAS. The operation's exact SQLite holds
 /// bridge every final key to that CAS and release only after it commits.
@@ -284,17 +248,7 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
     // Containment is not residency: a root never commits over missing objects (tfs-020).
     walk.require_resident(store)?;
     let id = snap.manifest_id();
-    let root = read_session(store.root(), session)?;
-    if root.expires_at != 0 && root.expires_at <= now_secs() {
-        return refuse(
-            Code::ROOT_EXPIRED,
-            format!(
-                "ingest session {session:?} expired at {} — a candidate never installs after \
-                 its root does",
-                root.expires_at
-            ),
-        );
-    }
+    read_session(store.root(), session)?;
     let mut sources = subject.sources.clone();
     sources.sort();
     sources.dedup();
@@ -731,40 +685,39 @@ mod tests {
     fn same_session_retry_claims_the_existing_root_and_changed_meaning_refuses() {
         let path = temporary("resume");
         let store = Store::init(&path).unwrap();
-        let (first, live) = open_root(&store, "session", "tenant", 60).unwrap();
+        let (first, live) = open_root(&store, "session", "tenant").unwrap();
         assert_eq!(
-            open_root(&store, "session", "tenant", 60).unwrap_err().code,
+            open_root(&store, "session", "tenant").unwrap_err().code,
             Code::STORE_BUSY
         );
         drop(live);
-        let (resumed, resumed_writer) = open_root(&store, "session", "tenant", 60).unwrap();
+        let (resumed, resumed_writer) = open_root(&store, "session", "tenant").unwrap();
         assert_eq!(resumed, first);
         drop(resumed_writer);
         assert_eq!(
-            open_root(&store, "session", "other", 60).unwrap_err().code,
-            Code::TRANSACTION_CONFLICT
-        );
-        assert_eq!(
-            open_root(&store, "session", "tenant", 61).unwrap_err().code,
+            open_root(&store, "session", "other").unwrap_err().code,
             Code::TRANSACTION_CONFLICT
         );
         let _ = fs::remove_dir_all(path);
     }
 
     #[test]
-    fn untimed_session_survives_elapsed_time_and_explicit_reap_wins() {
-        let path = temporary("untimed");
+    fn session_has_no_clock_and_explicit_reap_waits_for_the_writer() {
+        let path = temporary("explicit-reap");
         let store = Store::init(&path).unwrap();
-        let (root, writer) = open_root(&store, "session", "tenant", 0).unwrap();
-        assert_eq!(root.expires_at, 0);
-        drop(writer);
+        let (root, writer) = open_root(&store, "session", "tenant").unwrap();
+        assert_eq!(
+            root.canonical_bytes(),
+            br#"{"candidates":[],"session":"session","tenant":"tenant"}"#
+        );
 
-        let (gone, kept) = reap(&store, u64::MAX - 1).unwrap();
+        let (gone, kept) = reap(&store).unwrap();
         assert!(gone.is_empty());
         assert_eq!(kept, ["session"]);
         assert!(candidate_dir(&path, "session").is_dir());
 
-        let (gone, kept) = reap(&store, u64::MAX).unwrap();
+        drop(writer);
+        let (gone, kept) = reap(&store).unwrap();
         assert_eq!(gone, ["session"]);
         assert!(kept.is_empty());
         assert!(!candidate_dir(&path, "session").exists());
