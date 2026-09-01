@@ -13,8 +13,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRecordsSchemasSixAndSevenMigrateWithoutDroppingPackageInventory(t *testing.T) {
-	for _, version := range []int{6, 7} {
+func TestRecordsSchemasSixThroughEightMigrateWithoutDroppingDurableRows(t *testing.T) {
+	for _, version := range []int{6, 7, 8} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			root := t.TempDir()
 			database := filepath.Join(root, "records.db")
@@ -23,6 +23,13 @@ func TestRecordsSchemasSixAndSevenMigrateWithoutDroppingPackageInventory(t *test
 			fatal(t, problem)
 			_, problem = store.Activate(generation)
 			fatal(t, problem)
+			rental := records.Rental{ID: "rental-migrate", MachineName: "migrate-pod",
+				SKU: "cpu-proof", AcceleratorModel: "CPU", HourlyRateUSDMicros: 125_000,
+				Address: "127.0.0.1:9443", CertPath: "/proof/rental.crt", State: "ready",
+				Hub: "https://tensorhub.example", RentedAt: "2026-08-31T00:00:00Z",
+				MediaAddress: "127.0.0.1:9444", ExpectedWorkerID: "worker-proof",
+				ExpectedWorkerBootID: "boot-proof"}
+			fatal(t, store.RecordRental(rental))
 			_, _, problem = store.BeginModelProduction(records.ModelProductionOperation{
 				ID: "modelpub-pre-account", PlanDigest: "sha256:" + strings.Repeat("c", 64),
 				Plan: []byte(`{}`),
@@ -54,6 +61,11 @@ func TestRecordsSchemasSixAndSevenMigrateWithoutDroppingPackageInventory(t *test
 			if request == nil || request.InstallID != generation.ID || request.RentalRequired {
 				t.Fatalf("schema migration dropped or changed request row: %#v", request)
 			}
+			migratedRental, problem := store.RentalRow(rental.ID)
+			fatal(t, problem)
+			if migratedRental == nil || *migratedRental != rental {
+				t.Fatalf("schema migration dropped or changed rental row: %#v", migratedRental)
+			}
 			productions, problem := store.ModelProductions("any", 50)
 			fatal(t, problem)
 			if len(productions) != 0 {
@@ -66,20 +78,27 @@ func TestRecordsSchemasSixAndSevenMigrateWithoutDroppingPackageInventory(t *test
 func TestExplicitPackageInventoryRecoveryUsesExactRowsAndFiles(t *testing.T) {
 	root := t.TempDir()
 	generation := recoverablePackageGeneration(t, root, "fedcba9876543210", "proof/marco")
-	sourcePath := filepath.Join(root, "records.schema6.backup")
+	sourcePath := filepath.Join(root, "records.schema8.backup")
 	source, problem := records.Open(sourcePath)
 	fatal(t, problem)
 	_, problem = source.Activate(generation)
 	fatal(t, problem)
 	source.Close()
-	stampRecordsVersion(t, sourcePath, 6)
+	stampRecordsVersion(t, sourcePath, 8)
+
+	current := recoverablePackageGeneration(t, root, "0011223344556677", "proof/current")
+	destination, problem := records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	_, problem = destination.Activate(current)
+	fatal(t, problem)
+	destination.Close()
 
 	code, out := runCozy(t, root, "package", "recover", sourcePath, "--json")
 	if code != 0 || !strings.Contains(out, `"status":"recovered"`) ||
 		!strings.Contains(out, `"generations":1`) || !strings.Contains(out, `"models_changed":false`) {
 		t.Fatalf("explicit package inventory recovery [exit %d]\n%s", code, out)
 	}
-	destination, problem := records.Open(filepath.Join(root, "records.db"))
+	destination, problem = records.Open(filepath.Join(root, "records.db"))
 	fatal(t, problem)
 	_, installed, problem := destination.ActivePackage("proof/marco")
 	fatal(t, problem)
@@ -87,10 +106,47 @@ func TestExplicitPackageInventoryRecoveryUsesExactRowsAndFiles(t *testing.T) {
 		installed.PlacementSetDigest != generation.PlacementSetDigest {
 		t.Fatalf("recovered package identity changed: %#v", installed)
 	}
+	_, kept, problem := destination.ActivePackage(current.Package)
+	fatal(t, problem)
+	if kept == nil || kept.ID != current.ID {
+		t.Fatalf("recovery changed the existing package inventory: %#v", kept)
+	}
 	destination.Close()
 	code, out = runCozy(t, root, "package", "recover", sourcePath, "--json")
-	if code != 1 || !strings.Contains(out, `"code":"package_inventory_not_empty"`) {
-		t.Fatalf("non-empty recovery did not refuse ambiguity [exit %d]\n%s", code, out)
+	if code != 0 || !strings.Contains(out, `"generations":0`) {
+		t.Fatalf("identical recovery was not idempotent [exit %d]\n%s", code, out)
+	}
+}
+
+func TestPackageInventoryRecoveryRefusesPinCollisionAtomically(t *testing.T) {
+	root := t.TempDir()
+	current := recoverablePackageGeneration(t, root, "1111222233334444", "proof/collision")
+	destination, problem := records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	_, problem = destination.Activate(current)
+	fatal(t, problem)
+	destination.Close()
+
+	backup := recoverablePackageGeneration(t, root, "aaaabbbbccccdddd", "proof/collision")
+	sourcePath := filepath.Join(root, "records.schema8.backup")
+	source, problem := records.Open(sourcePath)
+	fatal(t, problem)
+	_, problem = source.Activate(backup)
+	fatal(t, problem)
+	source.Close()
+	stampRecordsVersion(t, sourcePath, 8)
+
+	code, out := runCozy(t, root, "package", "recover", sourcePath, "--json")
+	if code != 1 || !strings.Contains(out, `"code":"package_pin_recovery_collision"`) {
+		t.Fatalf("pin collision did not refuse recovery [exit %d]\n%s", code, out)
+	}
+	destination, problem = records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	defer destination.Close()
+	inserted, problem := destination.Install(backup.ID)
+	fatal(t, problem)
+	if inserted != nil {
+		t.Fatalf("refused recovery partially inserted generation: %#v", inserted)
 	}
 }
 
@@ -98,19 +154,21 @@ func stampRecordsVersion(t *testing.T, path string, version int) {
 	t.Helper()
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
-	_, err = db.Exec(`DROP INDEX rentals_machine_name; ALTER TABLE rentals RENAME TO rentals_current`)
-	must(t, err)
-	_, err = db.Exec(testPriorRentalsDDL)
-	must(t, err)
-	_, err = db.Exec(`INSERT INTO rentals
+	if version < 8 {
+		_, err = db.Exec(`DROP INDEX rentals_machine_name; ALTER TABLE rentals RENAME TO rentals_current`)
+		must(t, err)
+		_, err = db.Exec(testPriorRentalsDDL)
+		must(t, err)
+		_, err = db.Exec(`INSERT INTO rentals
 		(id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,managed_request_id,address,
 		 cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id)
 		 SELECT id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,managed_request_id,address,
 		 cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id
 		 FROM rentals_current; DROP TABLE rentals_current`)
-	must(t, err)
-	_, err = db.Exec(testPriorRentalIndexDDL)
-	must(t, err)
+		must(t, err)
+		_, err = db.Exec(testPriorRentalIndexDDL)
+		must(t, err)
+	}
 	if version == 6 {
 		_, err = db.Exec(`ALTER TABLE requests DROP COLUMN rental_required`)
 		must(t, err)

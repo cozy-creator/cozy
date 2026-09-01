@@ -104,7 +104,7 @@ func TestRecordsRefusesMalformedPreV9VersionsWithoutMutation(t *testing.T) {
 	}
 }
 
-func TestRecordsRetiresExactV8WithoutMutation(t *testing.T) {
+func TestRecordsMigratesExactV8WithoutDDL(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -118,21 +118,16 @@ func TestRecordsRetiresExactV8WithoutMutation(t *testing.T) {
 	must(t, db.Close())
 
 	opened, problem := records.Open(path)
-	if opened != nil {
-		opened.Close()
-		t.Fatal("retired v8 records schema opened")
-	}
-	if problem == nil || problem.ErrName() != "records.schema_reset_required" {
-		t.Fatalf("v8 retirement refusal = %#v", problem)
-	}
+	fatal(t, problem)
+	opened.Close()
 	db, err = sql.Open("sqlite", path)
 	must(t, err)
 	defer db.Close()
 	var version, after int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
-	if version != 8 || after != before {
-		t.Fatalf("refused v8 schema mutated: version=%d schema_version=%d->%d",
+	if version != 9 || after != before {
+		t.Fatalf("exact v8 migration performed DDL or missed stamp: version=%d schema_version=%d->%d",
 			version, before, after)
 	}
 }
