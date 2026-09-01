@@ -1172,7 +1172,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     }
     let session = session_of(f, &p);
     let tenant = flag(f, "tenant").unwrap_or("dev").to_string();
-    let ttl: u64 = flag_num(f, "ttl", limits::INGEST_ROOT_TTL_SECS);
+    let ttl: u64 = flag_num(f, "ttl", 0);
     let store = ok!(Store::init(root));
 
     // The root goes down FIRST. From this line on the session is reapable whatever happens.
@@ -1427,10 +1427,17 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     println!("  candidates {}", stamped.stamp.candidate_set);
     println!("  golden     {}", stamped.stamp.golden);
     println!("receipt      {}", receipt_ref.id());
-    println!(
-        "candidate    {} expires at {} — NOT a checkpoint until `tfs ingest install`",
-        session, ingest_root.expires_at
-    );
+    if ingest_root.expires_at == 0 {
+        println!(
+            "candidate    {} is resumable until explicit reap — NOT a checkpoint until `tfs ingest install`",
+            session
+        );
+    } else {
+        println!(
+            "candidate    {} expires at caller-selected {} — NOT a checkpoint until `tfs ingest install`",
+            session, ingest_root.expires_at
+        );
+    }
     ExitCode::SUCCESS
 }
 
@@ -1516,7 +1523,7 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
         &store,
         &session,
         &tenant,
-        flag_num(f, "ttl", limits::INGEST_ROOT_TTL_SECS)
+        flag_num(f, "ttl", 0)
     ));
     let out = ok!(tx::execute(
         &store,
@@ -1627,7 +1634,7 @@ pub fn cmd_install(
 
 pub fn cmd_reap(root: &Path, f: &Flags) -> ExitCode {
     let store = ok!(Store::open(root));
-    // `--now` reaps every root regardless of age: the operator asserting the timeout.
+    // `--now` is the operator's explicit abandonment act; elapsed time grants no authority.
     let now = if flag_on(f, "now") {
         u64::MAX
     } else {

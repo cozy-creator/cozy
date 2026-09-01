@@ -42,7 +42,7 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-// ---------------------------------------------------------------- the expiring session
+// ---------------------------------------------------------------- the resumable session
 
 /// The candidate namespace. Written first, deleted by reap, promoted only by `install`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +112,12 @@ pub fn open_root(
     let dir = candidate_dir(store_root, session);
     if dir.is_dir() {
         let root = read_session(store_root, session)?;
-        if root.tenant != tenant || root.expires_at.saturating_sub(root.created) != ttl {
+        let recorded_ttl = if root.expires_at == 0 {
+            0
+        } else {
+            root.expires_at.saturating_sub(root.created)
+        };
+        if root.tenant != tenant || recorded_ttl != ttl {
             return refuse(
                 Code::TRANSACTION_CONFLICT,
                 "same ingest session was opened with different tenant or TTL semantics",
@@ -132,7 +137,7 @@ pub fn open_root(
         session: session.to_string(),
         tenant: tenant.to_string(),
         created: now,
-        expires_at: now + ttl,
+        expires_at: if ttl == 0 { 0 } else { now.saturating_add(ttl) },
         candidates: Vec::new(),
     };
     write_session(store_root, &root)?;
@@ -209,13 +214,13 @@ pub fn reap(store: &Store, now: u64) -> Result<(Vec<String>, Vec<String>)> {
             // An unparsable or headless session directory is debris by construction: nothing
             // can install from it, so it reaps rather than living forever.
             Ok(b) => IngestSession::parse(&b)
-                .map(|r| r.expires_at <= now)
+                .map(|r| now == u64::MAX || (r.expires_at != 0 && r.expires_at <= now))
                 .unwrap_or(true),
             Err(_) => true,
         };
         if expired {
             let catalog = crate::catalog::Catalog::open(store.root())?;
-            match catalog.abandon(&name, now, true) {
+            match catalog.abandon(&name, true) {
                 Ok(()) => {
                     fs::remove_dir_all(e.path()).map_err(|err| io("reap session", err))?;
                     gone.push(name);
@@ -279,7 +284,7 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
     walk.require_resident(store)?;
     let id = snap.manifest_id();
     let root = read_session(store.root(), session)?;
-    if root.expires_at <= now_secs() {
+    if root.expires_at != 0 && root.expires_at <= now_secs() {
         return refuse(
             Code::ROOT_EXPIRED,
             format!(
@@ -729,6 +734,26 @@ mod tests {
             open_root(&store, "session", "tenant", 61).unwrap_err().code,
             Code::TRANSACTION_CONFLICT
         );
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn untimed_session_survives_elapsed_time_and_explicit_reap_wins() {
+        let path = temporary("untimed");
+        let store = Store::init(&path).unwrap();
+        let (root, writer) = open_root(&store, "session", "tenant", 0).unwrap();
+        assert_eq!(root.expires_at, 0);
+        drop(writer);
+
+        let (gone, kept) = reap(&store, u64::MAX - 1).unwrap();
+        assert!(gone.is_empty());
+        assert_eq!(kept, ["session"]);
+        assert!(candidate_dir(&path, "session").is_dir());
+
+        let (gone, kept) = reap(&store, u64::MAX).unwrap();
+        assert_eq!(gone, ["session"]);
+        assert!(kept.is_empty());
+        assert!(!candidate_dir(&path, "session").exists());
         let _ = fs::remove_dir_all(path);
     }
 }

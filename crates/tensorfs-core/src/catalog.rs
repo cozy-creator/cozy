@@ -11,7 +11,6 @@ use rusqlite::{params, Connection};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::storage::Projection;
 
-const ABANDON_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
 const SCHEMA_VERSION: u64 = 1;
 
 const SCHEMA: &[(&str, &[&str])] = &[
@@ -719,9 +718,8 @@ impl Catalog {
         Ok(())
     }
 
-    /// Explicit abandonment. Seven progress-free days only makes this transition eligible;
-    /// it never fires the transition itself.
-    pub fn abandon(&self, operation: &str, now: u64, grants_revoked: bool) -> Result<()> {
+    /// Explicit abandonment after every writer grant is revoked and the writer is gone.
+    pub fn abandon(&self, operation: &str, grants_revoked: bool) -> Result<()> {
         if !grants_revoked {
             return refuse(Code::STORE_BUSY, "abandon requires revoked/expired grants");
         }
@@ -729,19 +727,13 @@ impl Catalog {
         let transaction = connection
             .transaction()
             .map_err(|error| sql("begin abandon", error))?;
-        let (writer_marker, last_progress): (String, u64) = transaction
+        let writer_marker: String = transaction
             .query_row(
-                "SELECT writer_marker,last_progress_at FROM tensorfs_operations WHERE id=?1",
+                "SELECT writer_marker FROM tensorfs_operations WHERE id=?1",
                 [operation],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .map_err(|error| sql("read abandon candidate", error))?;
-        if now.saturating_sub(last_progress) < ABANDON_AFTER_SECS {
-            return refuse(
-                Code::ROOT_EXPIRED,
-                "operation has not been progress-free for seven days",
-            );
-        }
         if marker_is_live(Path::new(&writer_marker))? {
             return refuse(Code::STORE_BUSY, "operation writer is still live");
         }
@@ -1119,23 +1111,11 @@ mod tests {
         );
         catalog.progress("op", 20, 1, 7).unwrap();
         assert_eq!(
-            catalog
-                .abandon("op", 20 + ABANDON_AFTER_SECS - 1, true)
-                .unwrap_err()
-                .code,
-            Code::ROOT_EXPIRED
-        );
-        assert_eq!(
-            catalog
-                .abandon("op", 20 + ABANDON_AFTER_SECS, true)
-                .unwrap_err()
-                .code,
+            catalog.abandon("op", true).unwrap_err().code,
             Code::STORE_BUSY
         );
         drop(guard);
-        catalog
-            .abandon("op", 20 + ABANDON_AFTER_SECS, true)
-            .unwrap();
+        catalog.abandon("op", true).unwrap();
         let connection = catalog.connection().unwrap();
         let holds: u64 = connection
             .query_row("SELECT count(*) FROM tensorfs_holds", [], |row| row.get(0))

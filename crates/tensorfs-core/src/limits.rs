@@ -54,9 +54,6 @@ pub const CARRIER_HEADER_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// a streaming transform). Above this a converter refuses rather than growing without bound;
 /// identity/inherit ops never buffer and are not subject to it.
 pub const CONVERT_TENSOR_MAX_BYTES: u64 = 512 * 1024 * 1024;
-/// Temporary candidate roots expire. A crash, a timeout, or a walked-away session leaves only a
-/// reapable root and never an installed checkpoint.
-pub const INGEST_ROOT_TTL_SECS: u64 = 3600;
 /// Streaming copy buffer at the border — the peak-RSS floor of an identity-class ingest.
 pub const INGEST_STREAM_BUF: usize = 4 * 1024 * 1024;
 
