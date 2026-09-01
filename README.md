@@ -1,6 +1,6 @@
 # TensorFS
 
-The current release is `0.0.8`.
+The current release is `0.0.9`.
 
 TensorFS stores every domain repository as the same graph:
 
@@ -158,8 +158,14 @@ model headers additionally recover the diagnostic projection emitted by `store r
 
 Foreign carrier paths never name components. A review act may bank one whole-source profile beside
 the existing fingerprint entries; the profile supplies the exact required component set, target
-encodings, and canonical construction traversal. An optional canonical provider member/slot binds a
-component only when bytes cannot distinguish it, such as byte-identical H3 DiT headers:
+encodings, and canonical construction traversal for each reviewed key-set variant. The registry may
+bank several exact topology observations for one `(key set, component)`; the observed header still
+has to match one of them exactly. This lets one SDXL profile cover reviewed FP16, BF16, and mixed
+component topologies without 16 source-specific code paths. An optional canonical provider
+member/slot binds a component only when bytes cannot distinguish it, such as byte-identical H3 DiT
+headers. A reviewed member prefix may admit interchangeable objects from one provider namespace;
+the generic SDXL profile uses `civitai/files/`. Omitting both bindings remains local-only, so a
+local profile cannot steal a provider candidate:
 
 ```text
 tfs ingest bank <dialect> <family> <variant> <converter> \
