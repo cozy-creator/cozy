@@ -18,7 +18,7 @@ func followModelProduction(ctx *Context, client *localclient.Client,
 ) *exit.Error {
 	progress := NewModelProductionProgress(ctx.Err, !ctx.Mode().JSON, state.Steps)
 	if state.Changed {
-		progress.Accepted(state.ID, len(state.Lanes))
+		progress.Accepted(state.ID, len(state.Outputs))
 	} else {
 		progress.Resume(state.ID, modelProductionStage(state))
 	}
@@ -48,7 +48,7 @@ func followModelProduction(ctx *Context, client *localclient.Client,
 			}
 		}
 	}
-	if state.Status == "completed" {
+	if state.Status == "completed" || state.Status == "partial" {
 		return emitModelProductionState(ctx, state, state.Changed)
 	}
 	if state.Status == "canceled" {
@@ -64,14 +64,13 @@ func emitModelProductionState(ctx *Context, state api.ModelProductionState,
 ) *exit.Error {
 	fields := []output.Field{
 		{K: "id", V: state.ID}, {K: "kind", V: state.Kind},
-		{K: "model", V: state.Model}, {K: "release", V: state.Release},
-		{K: "status", V: state.Status}, {K: "lanes", V: state.Lanes},
-		{K: "manifest_ids", V: state.ManifestIDs}, {K: "rental", V: state.Rental},
-		{K: "committed", V: state.Committed}, {K: "cleanup", V: state.Cleanup},
+		{K: "model", V: state.Model}, {K: "status", V: state.Status},
+		{K: "outputs", V: state.Outputs}, {K: "checkpoints", V: state.Checkpoints},
+		{K: "rental", V: state.Rental}, {K: "cleanup", V: state.Cleanup},
 		{K: "changed", V: changed},
 	}
-	record := compactRecord(fields, "id", "kind", "model", "release", "status", "lanes",
-		"committed", "cleanup", "changed")
+	record := compactRecord(fields, "id", "kind", "model", "status", "outputs",
+		"checkpoints", "cleanup", "changed")
 	if !modelProductionSettled(state.Status) {
 		record.Next = []string{"cozy run cancel " + state.ID}
 	}
@@ -106,7 +105,7 @@ func handleModelProductionCancel(ctx *Context) *exit.Error {
 
 func modelProductionSettled(state string) bool {
 	switch state {
-	case "completed", "failed", "canceled":
+	case "completed", "partial", "failed", "canceled":
 		return true
 	}
 	return false
@@ -125,11 +124,9 @@ func modelProductionStage(state api.ModelProductionState) string {
 	case "step_running":
 		return fmt.Sprintf("step %d/%d", min(int(state.StepIndex)+1, state.Steps), state.Steps)
 	case "outputs_preparing":
-		return "required lane publications prepared; release cut follows"
-	case "release_cut":
-		return "release committed; rental cleanup follows"
+		return "required output checkpoints are being retained"
 	case "cleanup_pending":
-		return "release committed; confirming provider absence"
+		return "checkpoints retained; confirming provider absence"
 	default:
 		return state.Status
 	}

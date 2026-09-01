@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -125,43 +126,183 @@ func TestModelProductionGrammar(t *testing.T) {
 	}))
 	defer server.Close()
 	accountEnv := []string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}
-	code, help := runCozy(t, root, "model", "publish", "--help")
+	code, help := runCozy(t, root, "model", "upload", "--help")
 	if code != 0 || !strings.Contains(help, "<source>") ||
-		!strings.Contains(help, "--release") || !strings.Contains(help, "--producer") ||
+		strings.Contains(help, "--release") || !strings.Contains(help, "--producer") ||
 		!strings.Contains(help, "--lane") || !strings.Contains(help, "--rental") ||
 		!strings.Contains(help, "--dry-run") || !strings.Contains(help, "--detach") ||
 		strings.Contains(help, "<manifest>") || strings.Contains(help, "--token-stdin") ||
 		strings.Contains(help, "--cloud") || strings.Contains(help, "--remote") ||
 		strings.Contains(help, "--machine") || strings.Contains(help, "--max-cost") {
-		t.Fatalf("model publish grammar drifted [exit %d]\n%s", code, help)
+		t.Fatalf("model upload grammar drifted [exit %d]\n%s", code, help)
 	}
-	code, out := runCozy(t, root, "model", "publish", "acme/model",
-		"hf://acme/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	if code != 2 || !strings.Contains(out, "--release") {
-		t.Fatalf("model publish accepted missing release [exit %d]\n%s", code, out)
+	code, out := runCozy(t, root, "model", "upload", "acme/model")
+	if code != 2 || !strings.Contains(out, "<source>") {
+		t.Fatalf("model upload accepted missing source [exit %d]\n%s", code, out)
 	}
 	local := filepath.Join(root, "source.safetensors")
 	must(t, os.WriteFile(local, []byte("header-only-grammar-fixture"), 0o600))
-	code, out = runCozyDir(t, root, ".", accountEnv, "--json", "model", "publish", "acme/model", local,
-		"--release", "1.2.3", "--dry-run")
-	if code != 0 || !strings.Contains(out, `"kind":"model-publication"`) ||
-		!strings.Contains(out, `"status":"planned"`) || !strings.Contains(out, `"id":"modelpub-`) {
+	code, out = runCozyDir(t, root, ".", accountEnv, "--json", "model", "upload", "acme/model", local,
+		"--dry-run")
+	if code != 0 || !strings.Contains(out, `"kind":"model-upload"`) ||
+		!strings.Contains(out, `"status":"planned"`) || !strings.Contains(out, `"id":"modelupload-`) {
 		t.Fatalf("source-driven dry-run failed [exit %d]\n%s", code, out)
 	}
-	code, out = runCozyDir(t, root, ".", accountEnv, "model", "publish", "other/model", local,
-		"--release", "1.2.3", "--dry-run")
+	code, out = runCozyDir(t, root, ".", accountEnv, "model", "upload", "other/model", local,
+		"--dry-run")
 	if code != 2 || !strings.Contains(out, "logged in as Tensorhub account acme") ||
 		!strings.Contains(out, "publish as acme/model") {
-		t.Fatalf("cross-account model publication was not refused [exit %d]\n%s", code, out)
+		t.Fatalf("cross-account model upload was not refused [exit %d]\n%s", code, out)
 	}
-	code, out = runCozy(t, root, "model", "publish", "acme/model", local,
-		"--release", "1.2.3", "--dry-run", "--detach")
+	code, out = runCozy(t, root, "model", "upload", "acme/model", local,
+		"--dry-run", "--detach")
 	if code != 2 || !strings.Contains(out, "conflict") {
 		t.Fatalf("dry-run plus detach was accepted [exit %d]\n%s", code, out)
+	}
+	code, help = runCozy(t, root, "model", "publish", "--help")
+	if code != 0 || strings.Contains(help, "<source>") || !strings.Contains(help, "--release") ||
+		!strings.Contains(help, "--lane") || !strings.Contains(help, "--remove-lane") ||
+		!strings.Contains(help, "last lane") ||
+		strings.Contains(help, "--producer") || strings.Contains(help, "--rental") ||
+		strings.Contains(help, "--dry-run") || strings.Contains(help, "--detach") {
+		t.Fatalf("model publish grammar drifted [exit %d]\n%s", code, help)
+	}
+	code, out = runCozy(t, root, "model", "publish", "acme/model", "--release", "1.2.3")
+	if code != 2 || !strings.Contains(out, "requires --lane") {
+		t.Fatalf("model publish accepted no lane changes [exit %d]\n%s", code, out)
+	}
+	code, out = runCozy(t, root, "model", "publish", "acme/model", "--release", "bad label",
+		"--lane", "bf16=sha256:"+strings.Repeat("a", 64))
+	if code != 2 || !strings.Contains(out, "must start alphanumeric") {
+		t.Fatalf("model publish accepted an unsafe release label [exit %d]\n%s", code, out)
+	}
+	code, help = runCozy(t, root, "model", "yank", "--help")
+	if code != 0 || !strings.Contains(help, "--release") {
+		t.Fatalf("model yank grammar drifted [exit %d]\n%s", code, help)
 	}
 	code, help = runCozy(t, root, "model", "download", "--help")
 	if code != 0 || strings.Contains(strings.ToLower(help), "snapshot") {
 		t.Fatalf("model download retained snapshot vocabulary [exit %d]\n%s", code, help)
+	}
+}
+
+func TestModelReleaseUpdateAndYankCLIContracts(t *testing.T) {
+	checkpoint := "sha256:" + strings.Repeat("a", 64)
+	requests := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(requests) {
+		case 1, 4:
+			if r.Method != http.MethodGet || r.URL.Path != "/v1/accounts/current" {
+				t.Fatalf("account request = %s %s", r.Method, r.URL.Path)
+			}
+			_, _ = io.WriteString(w, `{"name":"acme"}`)
+		case 2:
+			if r.Method != http.MethodGet || r.URL.Path != "/v1/models/acme/model" {
+				t.Fatalf("release read = %s %s", r.Method, r.URL.Path)
+			}
+			_, _ = io.WriteString(w, `{"model":{"org":"acme","name":"model","created_at":"2026-09-01T00:00:00Z"},"releases":[{"release":"stable","revision":4,"cut_at":"2026-09-01T00:00:00Z","lanes":[{"lane":"broken","manifest_id":"`+checkpoint+`"}]}]}`)
+		case 3:
+			if r.Method != http.MethodPost || r.URL.Path != "/v1/models/acme/model/releases/stable" ||
+				r.Header.Get("X-Tensorhub-Reason") != "cozy model publish acme/model@stable" {
+				t.Fatalf("release update = %s %s %#v", r.Method, r.URL.Path, r.Header)
+			}
+			var body struct {
+				ExpectedRevision int64             `json:"expected_revision"`
+				SetLanes         map[string]string `json:"set_lanes"`
+				RemoveLanes      []string          `json:"remove_lanes"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ExpectedRevision != 4 ||
+				body.SetLanes["fp8"] != checkpoint || !reflect.DeepEqual(body.RemoveLanes, []string{"broken"}) {
+				t.Fatalf("release update body = %#v, %v", body, err)
+			}
+			_, _ = io.WriteString(w, `{"release":"stable","revision":5,"yanked":false,"lanes":[{"lane":"fp8","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["fp8"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("d", 64)+`","changed":true}`)
+		case 5:
+			if r.Method != http.MethodDelete || r.URL.Path != "/v1/models/acme/model/releases/stable" ||
+				r.Header.Get("X-Tensorhub-Reason") != "cozy model yank acme/model@stable" {
+				t.Fatalf("release yank = %s %s %#v", r.Method, r.URL.Path, r.Header)
+			}
+			_, _ = io.WriteString(w, `{"release":"stable","revision":6,"yanked":true,"lanes":[{"lane":"fp8","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["fp8"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("e", 64)+`","changed":true}`)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	env := []string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}
+	root := t.TempDir()
+	code, out := runCozyDir(t, root, ".", env, "--json", "model", "publish", "acme/model",
+		"--release", "stable", "--lane", "fp8="+checkpoint, "--remove-lane", "broken")
+	if code != 0 || !strings.Contains(out, `"revision":5`) || !strings.Contains(out, `"status":"published"`) {
+		t.Fatalf("model release update [exit %d]\n%s", code, out)
+	}
+	code, out = runCozyDir(t, root, ".", env, "--json", "model", "yank", "acme/model",
+		"--release", "stable")
+	if code != 0 || !strings.Contains(out, `"revision":6`) || !strings.Contains(out, `"status":"yanked"`) {
+		t.Fatalf("model release yank [exit %d]\n%s", code, out)
+	}
+}
+
+func TestModelPublishRefusesFinalLaneRemovalBeforeMutation(t *testing.T) {
+	checkpoint := "sha256:" + strings.Repeat("a", 64)
+	mutations := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current":
+			_, _ = io.WriteString(w, `{"name":"acme"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/acme/model":
+			_, _ = io.WriteString(w, `{"model":{"org":"acme","name":"model","created_at":"2026-09-01T00:00:00Z"},"releases":[{"release":"stable","revision":4,"cut_at":"2026-09-01T00:00:00Z","lanes":[{"lane":"bf16","manifest_id":"`+checkpoint+`"}]}]}`)
+		default:
+			mutations++
+			http.Error(w, "unexpected mutation", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+	code, out := runCozyDir(t, t.TempDir(), ".", []string{
+		"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token",
+	}, "model", "publish", "acme/model", "--release", "stable", "--remove-lane", "bf16")
+	if code != 2 || mutations != 0 || !strings.Contains(out, "retain at least one lane") ||
+		!strings.Contains(out, "cozy model yank acme/model --release stable") {
+		t.Fatalf("final lane removal [exit %d mutations %d]\n%s", code, mutations, out)
+	}
+}
+
+func TestModelPublishExactReplayUsesCurrentRevision(t *testing.T) {
+	checkpoint := "sha256:" + strings.Repeat("a", 64)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		switch requests {
+		case 1:
+			_, _ = io.WriteString(w, `{"name":"acme"}`)
+		case 2:
+			if r.Method != http.MethodGet || r.URL.Path != "/v1/models/acme/model" {
+				t.Fatalf("release card = %s %s", r.Method, r.URL.Path)
+			}
+			_, _ = io.WriteString(w, `{"model":{"org":"acme","name":"model","created_at":"2026-09-01T00:00:00Z"},"releases":[{"release":"stable","revision":5,"cut_at":"2026-09-01T00:00:00Z","lanes":[{"lane":"fp8","manifest_id":"`+checkpoint+`"}]}]}`)
+		case 3:
+			var body struct {
+				ExpectedRevision int64 `json:"expected_revision"`
+			}
+			if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&body) != nil ||
+				body.ExpectedRevision != 5 {
+				t.Fatalf("replay update = %s revision %d", r.Method, body.ExpectedRevision)
+			}
+			_, _ = io.WriteString(w, `{"release":"stable","revision":5,"yanked":false,"lanes":[{"lane":"fp8","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["fp8"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("c", 64)+`","changed":false}`)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	code, out := runCozyDir(t, t.TempDir(), ".", []string{
+		"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token",
+	}, "--json", "model", "publish", "acme/model", "--release", "stable",
+		"--lane", "fp8="+checkpoint)
+	if code != 0 || requests != 3 || !strings.Contains(out, `"revision":5`) ||
+		!strings.Contains(out, `"changed":false`) {
+		t.Fatalf("exact release replay [exit %d requests %d]\n%s", code, requests, out)
 	}
 }
 

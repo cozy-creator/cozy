@@ -183,7 +183,8 @@ type ModelLaneSummary struct {
 
 type ModelReleaseSummary struct {
 	ReleaseSummary
-	Lanes []ModelLaneSummary `json:"lanes"`
+	Revision int64              `json:"revision"`
+	Lanes    []ModelLaneSummary `json:"lanes"`
 }
 
 type ModelCard struct {

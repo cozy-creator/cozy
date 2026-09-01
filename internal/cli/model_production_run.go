@@ -77,19 +77,19 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 	} else {
 		progress.Accepted(operation.ID, len(plan.Production.Outputs))
 	}
-	if operation.State == "completed" {
-		return emitCompletedProduction(ctx, plan, &operation, true)
+	if operation.State == "completed" || operation.State == "partial" {
+		return emitCompletedProduction(ctx, store, plan, &operation, true)
 	}
 	if operation.State == "failed" || operation.State == "canceled" {
 		return exit.Named(exit.Conflict, "model_production.settled",
 			"model production %s is already %s: %s", operation.ID, operation.State,
 			operation.SafeDetail)
 	}
-	if operation.State == "release_cut" || operation.State == "cleanup_pending" {
+	if operation.State == "cleanup_pending" {
 		return resumeProductionCleanup(ctx, store, plan, operation, replay, progress)
 	}
 	if operation.State == "outputs_preparing" {
-		if problem := cutProductionRelease(runCtx, ctx, store, plan, progress); problem != nil {
+		if problem := finishProductionOutputs(runCtx, store, plan, progress); problem != nil {
 			return problem
 		}
 		current, problem := store.ModelProduction(operation.ID)
@@ -158,20 +158,6 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 			return failAndReleaseProduction(ctx, store, operation.ID, rentalID,
 				exit.Internalf("model production step %s has no exact job pin", step.Name), progress)
 		}
-		packageName, function, _ := splitProductionCallable(step.Callable)
-		models := make([]orchestrator.ModelRef, 0, len(step.Models))
-		for parameter, reference := range step.Models {
-			manifest, ok := manifests[reference]
-			if !ok {
-				return failAndReleaseProduction(ctx, store, operation.ID, rentalID,
-					exit.Named(exit.Conflict, "model_production.input_absent",
-						"step %s input %s has no prepared Manifest", step.Name, reference), progress)
-			}
-			models = append(models, orchestrator.ModelRef{Package: packageName, Slot: parameter,
-				Model: operation.ID + "/" + reference, Manifest: manifest.ID,
-				ManifestLength: manifest.Length})
-		}
-		sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
 		row, problem := store.BeginModelProductionStep(records.ModelProductionStep{
 			OperationID: operation.ID, StepIndex: int64(index), StepName: step.Name,
 			State: "pending",
@@ -179,11 +165,53 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 		if problem != nil {
 			return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
 		}
+		if row.State == "failed" || row.State == "skipped" {
+			if row.State == "failed" {
+				progress.StepFailed(index, step.Name)
+			} else {
+				progress.StepSkipped(index, step.Name)
+			}
+			if problem = advanceProductionStep(store, operation.ID, rentalID, int64(index+1),
+				index == len(ordered)-1); problem != nil {
+				return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
+			}
+			continue
+		}
 		stepCompleted := row.State == "completed"
 		if !stepCompleted {
 			progress.StepStarting(index, step.Name, step.Callable, row.RequestID != "")
-		}
-		if row.State != "completed" {
+			packageName, function, _ := splitProductionCallable(step.Callable)
+			models := make([]orchestrator.ModelRef, 0, len(step.Models))
+			missingDependency := ""
+			for parameter, reference := range step.Models {
+				manifest, available := manifests[reference]
+				if !available {
+					if _, sourceSlot := plan.Production.Sources[reference]; sourceSlot {
+						return failAndReleaseProduction(ctx, store, operation.ID, rentalID,
+							exit.Named(exit.Conflict, "model_production.source_input_absent",
+								"step %s source input %s has no prepared Manifest", step.Name,
+								reference), progress)
+					}
+					missingDependency = reference
+					break
+				}
+				models = append(models, orchestrator.ModelRef{Package: packageName, Slot: parameter,
+					Model: operation.ID + "/" + reference, Manifest: manifest.ID,
+					ManifestLength: manifest.Length})
+			}
+			if missingDependency != "" {
+				if problem = store.SetModelProductionStepRequest(operation.ID, int64(index),
+					step.Name, row.RequestID, "skipped"); problem != nil {
+					return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
+				}
+				progress.StepSkipped(index, step.Name)
+				if problem = advanceProductionStep(store, operation.ID, rentalID, int64(index+1),
+					index == len(ordered)-1); problem != nil {
+					return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
+				}
+				continue
+			}
+			sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
 			handle, submitProblem := local.SubmitJob(api.JobSubmission{
 				Package: packageName, Function: function, Input: []byte("{}"),
 				Release: pin.Release, ReleaseDigest: pin.ReleaseDigest,
@@ -197,7 +225,21 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 			}
 			if problem = waitProductionJob(runCtx, local, store, operation.ID, handle.JobID,
 				progress, index, step.Name); problem != nil {
-				return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
+				if problem.Code != exit.Failed {
+					return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
+				}
+				if recordProblem := store.SetModelProductionStepRequest(operation.ID, int64(index),
+					step.Name, handle.JobID, "failed"); recordProblem != nil {
+					return failAndReleaseProduction(ctx, store, operation.ID, rentalID, recordProblem,
+						progress)
+				}
+				progress.StepFailed(index, step.Name)
+				if advanceProblem := advanceProductionStep(store, operation.ID, rentalID,
+					int64(index+1), index == len(ordered)-1); advanceProblem != nil {
+					return failAndReleaseProduction(ctx, store, operation.ID, rentalID,
+						advanceProblem, progress)
+				}
+				continue
 			}
 		}
 		artifacts, problem := waitStepArtifacts(runCtx, store, operation.ID, step.Name,
@@ -230,24 +272,10 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 		}
 	}
 
-	if problem = cutProductionRelease(runCtx, ctx, store, plan, progress); problem != nil {
-		if problem.Name == "model_production.cut_verdict_unknown" {
-			// The cut may already be committed. Keep the exact rental/source/artifact
-			// joins intact until replay learns the verdict; releasing here would turn
-			// an ambiguous response into an unrecoverable second topology.
-			releaseOwed = false
-			return problem
-		}
+	if problem = finishProductionOutputs(runCtx, store, plan, progress); problem != nil {
 		return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
 	}
 	current, problem := store.ModelProduction(operation.ID)
-	if problem != nil {
-		return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
-	}
-	if current != nil && current.State == "release_cut" {
-		problem = store.AdvanceModelProduction(operation.ID, "release_cut", "cleanup_pending",
-			current.StepIndex, rentalID)
-	}
 	if problem != nil {
 		return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
 	}
@@ -262,45 +290,30 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 	if problem != nil {
 		return problem
 	}
-	if current != nil && current.State == "cleanup_pending" {
-		problem = store.AdvanceModelProduction(operation.ID, "cleanup_pending", "completed",
-			current.StepIndex, rentalID)
-	}
+	current, problem = settleProductionUpload(store, plan, current)
 	if problem != nil {
 		return problem
 	}
-	current, _ = store.ModelProduction(operation.ID)
-	return emitCompletedProduction(ctx, plan, current, replay)
+	return emitCompletedProduction(ctx, store, plan, current, replay)
 }
 
 func resumeProductionCleanup(ctx *Context, store *records.Store, plan modelproduction.Plan,
 	operation records.ModelProductionOperation, replay bool, progress *productionProgress,
 ) *exit.Error {
-	if operation.State == "release_cut" {
-		if problem := store.AdvanceModelProduction(operation.ID, "release_cut", "cleanup_pending",
-			operation.StepIndex, operation.RentalID); problem != nil {
-			return problem
-		}
-		operation.State = "cleanup_pending"
-	}
 	if operation.RentalID != "" {
 		progress.RentalReleaseStarting(operation.RentalID)
 		if problem := endRentalSilently(ctx, operation.RentalID); problem != nil {
 			progress.RentalReleaseUnconfirmed(operation.RentalID)
-			return problem.WithRemedy("the model release is already cut; confirm rental %s absence to finish cleanup",
+			return problem.WithRemedy("the model checkpoints are retained; confirm rental %s absence to finish cleanup",
 				operation.RentalID).WithNext("cozy rental end " + operation.RentalID)
 		}
 		progress.RentalReleased(operation.RentalID)
 	}
-	if problem := store.AdvanceModelProduction(operation.ID, "cleanup_pending", "completed",
-		operation.StepIndex, operation.RentalID); problem != nil {
-		return problem
-	}
-	completed, problem := store.ModelProduction(operation.ID)
+	settled, problem := settleProductionUpload(store, plan, &operation)
 	if problem != nil {
 		return problem
 	}
-	return emitCompletedProduction(ctx, plan, completed, replay)
+	return emitCompletedProduction(ctx, store, plan, settled, replay)
 }
 
 func ensureProductionRental(runCtx context.Context, ctx *Context, layout home.Layout, store *records.Store,
@@ -381,7 +394,7 @@ func ensureProductionRental(runCtx context.Context, ctx *Context, layout home.La
 	}
 	progress.RentalSelecting(sku.Name)
 	row, _, _, problem := acquireRentalContext(runCtx, ctx, layout, store, sku.Name, "",
-		operationKey, "cozy model publish "+plan.Destination,
+		operationKey, "cozy model upload "+plan.Destination,
 		rate, ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, "")
 	if problem != nil {
 		operation, readProblem := store.RentalOperation(operationKey)
@@ -553,7 +566,7 @@ func productionSourceProgress(files []records.ModelProductionSourceFile) (transf
 }
 
 func productionResumeStage(operation records.ModelProductionOperation,
-	ordered []launch.ModelProductionStep, transferred, total int64, lanes int,
+	ordered []launch.ModelProductionStep, transferred, total int64, outputs int,
 ) string {
 	rental := operation.RentalID
 	if rental == "" {
@@ -578,9 +591,7 @@ func productionResumeStage(operation records.ModelProductionOperation,
 		step := ordered[index]
 		return fmt.Sprintf("step %d/%d %s (%s)", index+1, len(ordered), step.Name, step.Callable)
 	case "outputs_preparing":
-		return fmt.Sprintf("all %d steps complete; preparing %d lane publications", len(ordered), lanes)
-	case "release_cut":
-		return "release cut; rental cleanup remains for " + rental
+		return fmt.Sprintf("all %d steps complete; retaining %d output checkpoints", len(ordered), outputs)
 	case "cleanup_pending":
 		return "confirming provider absence for rental " + rental
 	case "completed":
@@ -699,9 +710,7 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 	contract, final := productionContract(plan, source)
 	if !final {
 		// Intermediate Manifests stay under the worker's adopted artifact root and
-		// feed the next step directly. Final lane closures contain their inherited
-		// bytes, so opening extra Hub publications here would add no durability to
-		// the release and would leave uncut prepared sessions behind.
+		// feed the next step directly. Only named outputs become owner checkpoints.
 		return productionManifest{ID: artifact.ManifestID, Length: artifact.ManifestLength,
 			Evidence: base64.StdEncoding.EncodeToString(artifact.CheckpointEvidence)}, nil
 	}
@@ -721,11 +730,11 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 	for _, object := range objects {
 		hubObjects = append(hubObjects, hub.Object{ID: object.ObjectID, Length: object.Length})
 	}
-	lane := contract.LaneKey
-	progress.PublicationStarting(lane)
+	outputName := contract.Name
+	progress.PublicationStarting(outputName)
 	publicationOperation := productionPublicationOperation(plan.ID(), artifact.StepName,
 		artifact.OutputSlot)
-	reason := "cozy model publish " + plan.Destination + "@" + plan.Release
+	reason := "cozy model upload " + plan.Destination
 	ref, parseProblem := hub.ParseRef(plan.Destination)
 	if parseProblem != nil {
 		return productionManifest{}, parseProblem
@@ -737,7 +746,7 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 	if problem != nil {
 		if runCtx.Err() != nil {
 			return productionManifest{}, exit.New(exit.Canceled,
-				"model production %s was interrupted while opening lane %s", plan.ID(), lane)
+				"model upload %s was interrupted while opening output %s", plan.ID(), outputName)
 		}
 		return productionManifest{}, problem
 	}
@@ -758,8 +767,8 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 		if grantProblem != nil {
 			if runCtx.Err() != nil {
 				return productionManifest{}, exit.New(exit.Canceled,
-					"model production %s was interrupted while granting lane %s transfers",
-					plan.ID(), lane)
+					"model upload %s was interrupted while granting output %s transfers",
+					plan.ID(), outputName)
 			}
 			return productionManifest{}, grantProblem
 		}
@@ -789,7 +798,7 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 		if problem != nil {
 			if runCtx.Err() != nil {
 				return productionManifest{}, exit.New(exit.Canceled,
-					"model production %s was interrupted while transferring lane %s", plan.ID(), lane)
+					"model upload %s was interrupted while transferring output %s", plan.ID(), outputName)
 			}
 			return productionManifest{}, problem
 		}
@@ -806,7 +815,7 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 	if problem != nil {
 		if runCtx.Err() != nil {
 			return productionManifest{}, exit.New(exit.Canceled,
-				"model production %s was interrupted while finalizing lane %s", plan.ID(), lane)
+				"model upload %s was interrupted while finalizing output %s", plan.ID(), outputName)
 		}
 		return productionManifest{}, problem
 	}
@@ -824,13 +833,13 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 		!sameStrings(checkpoint.Contract.Encoding.Set, contract.Encodings) {
 		return productionManifest{}, exit.Named(exit.Conflict,
 			"model_production.contract_mismatch",
-			"Tensorhub-derived contract for lane %s does not match the reviewed production", lane)
+			"Tensorhub-derived contract for output %s does not match the reviewed production", outputName)
 	}
 	if problem = store.MarkModelProductionArtifactPublished(plan.ID(), artifact.StepName,
 		artifact.OutputSlot, checkpoint.PublishID); problem != nil {
 		return productionManifest{}, problem
 	}
-	progress.PublicationPrepared(lane)
+	progress.PublicationPrepared(outputName)
 	return productionManifest{ID: artifact.ManifestID, Length: artifact.ManifestLength,
 		Evidence: base64.StdEncoding.EncodeToString(artifact.CheckpointEvidence)}, nil
 }
@@ -845,7 +854,7 @@ func productionContract(plan modelproduction.Plan, source string) (
 ) {
 	for _, output := range plan.Production.Outputs {
 		if output.Source == source {
-			return modelproductionContract{LaneKey: output.LaneKey,
+			return modelproductionContract{Name: output.Name,
 				TopologyDigest: output.RequiredContract.TopologyDigest,
 				Encodings:      output.RequiredContract.Encodings}, true
 		}
@@ -854,7 +863,7 @@ func productionContract(plan modelproduction.Plan, source string) (
 }
 
 type modelproductionContract struct {
-	LaneKey        string
+	Name           string
 	TopologyDigest string
 	Encodings      []string
 }
@@ -874,7 +883,7 @@ func advanceProductionStep(store *records.Store, operationID, rentalID string,
 		return problem
 	}
 	if current.State == "step_running" && current.StepIndex >= next ||
-		current.State == "outputs_preparing" || current.State == "release_cut" ||
+		current.State == "outputs_preparing" ||
 		current.State == "cleanup_pending" || current.State == "completed" {
 		return nil
 	}
@@ -895,75 +904,32 @@ func advanceProductionStep(store *records.Store, operationID, rentalID string,
 	return store.AdvanceModelProduction(operationID, "step_running", to, next, rentalID)
 }
 
-func cutProductionRelease(runCtx context.Context, ctx *Context, store *records.Store,
-	plan modelproduction.Plan,
-	progress *productionProgress,
+func finishProductionOutputs(runCtx context.Context, store *records.Store,
+	plan modelproduction.Plan, progress *productionProgress,
 ) *exit.Error {
 	current, problem := store.ModelProduction(plan.ID())
 	if problem != nil || current == nil {
 		return problem
 	}
-	if current.State == "release_cut" || current.State == "cleanup_pending" ||
-		current.State == "completed" {
+	if current.State == "cleanup_pending" || current.State == "completed" {
 		return nil
 	}
 	if current.State != "outputs_preparing" {
-		return exit.Named(exit.Conflict, "model_production.cut_state_invalid",
-			"model production %s is %s before release cut", plan.ID(), current.State)
+		return exit.Named(exit.Conflict, "model_upload.output_state_invalid",
+			"model upload %s is %s before output completion", plan.ID(), current.State)
 	}
 	if problem = productionCancellation(runCtx, store, plan.ID()); problem != nil {
 		return problem
 	}
-	artifacts, problem := store.ModelProductionArtifacts(plan.ID())
+	checkpoints, problem := modelProductionCheckpoints(store, plan)
 	if problem != nil {
 		return problem
 	}
-	bySource := make(map[string]records.ModelProductionArtifact, len(artifacts))
-	for _, artifact := range artifacts {
-		bySource[artifact.StepName+"."+artifact.OutputSlot] = artifact
-	}
-	laneCheckpoints := make(map[string]string, len(plan.Production.Outputs))
-	for _, output := range plan.Production.Outputs {
-		artifact, ok := bySource[output.Source]
-		if !ok || artifact.PublicationID == "" || artifact.ManifestID == "" {
-			return exit.Named(exit.Conflict, "model_production.output_not_prepared",
-				"required lane %s has no prepared publication", output.LaneKey)
-		}
-		laneCheckpoints[output.LaneKey] = artifact.ManifestID
-	}
-	lanes := plan.Lanes()
-	progress.ReleaseStarting(plan.Release, lanes)
-	ref, parseProblem := hub.ParseRef(plan.Destination)
-	if parseProblem != nil {
-		return parseProblem
-	}
-	hctx, cancel := hub.LongContext()
-	cut, problem := client(ctx).CutRelease(hctx, ref, plan.Release, plan.ID(), laneCheckpoints,
-		"cozy model publish "+plan.Destination+"@"+plan.Release)
-	cancel()
-	if problem != nil {
-		if problem.Code == exit.Unavailable || problem.Code == exit.Deadline {
-			return exit.Named(problem.Code, "model_production.cut_verdict_unknown",
-				"release cut verdict is unknown; replaying the same operation: %s", problem.Message)
-		}
-		return problem
-	}
-	if cut.Release != plan.Release || len(cut.Lanes) != len(plan.Production.Outputs) {
-		return exit.Named(exit.Conflict, "model_production.cut_changed",
-			"Tensorhub cut an incomplete or different model release")
-	}
-	if problem = store.AdvanceModelProduction(plan.ID(), "outputs_preparing", "release_cut",
+	if problem = store.AdvanceModelProduction(plan.ID(), "outputs_preparing", "cleanup_pending",
 		current.StepIndex, current.RentalID); problem != nil {
 		return problem
 	}
-	// Cancellation racing the unary cut is observed only after its exact response is
-	// journaled. A committed cut wins and cleanup continues; it is never rewritten
-	// as a failed or invisible publication.
-	if cancelProblem := productionCancellation(runCtx, store, plan.ID()); cancelProblem != nil &&
-		cancelProblem.Code != exit.Canceled {
-		return cancelProblem
-	}
-	progress.ReleaseCut(plan.Release, len(lanes))
+	progress.OutputsRetained(len(checkpoints))
 	return nil
 }
 
@@ -1015,7 +981,7 @@ func failAndReleaseProduction(ctx *Context, store *records.Store, operationID, r
 func failProduction(store *records.Store, operationID string, cause *exit.Error) *exit.Error {
 	current, problem := store.ModelProduction(operationID)
 	if problem == nil && current != nil && current.State != "failed" && current.State != "canceled" &&
-		current.State != "completed" {
+		current.State != "completed" && current.State != "partial" {
 		if cause.Code == exit.Canceled {
 			_ = store.CancelModelProduction(operationID, current.State, cause.Message)
 		} else {
@@ -1025,19 +991,82 @@ func failProduction(store *records.Store, operationID string, cause *exit.Error)
 	return cause
 }
 
-func emitCompletedProduction(ctx *Context, plan modelproduction.Plan,
+func emitCompletedProduction(ctx *Context, store *records.Store, plan modelproduction.Plan,
 	operation *records.ModelProductionOperation, replay bool,
 ) *exit.Error {
 	rentalID := ""
 	if operation != nil {
 		rentalID = operation.RentalID
 	}
+	checkpoints, problem := modelProductionCheckpoints(store, plan)
+	if problem != nil {
+		return problem
+	}
 	return emit(ctx, compactRecord([]output.Field{
-		{K: "id", V: plan.ID()}, {K: "kind", V: "model-publication"},
-		{K: "model", V: plan.Destination}, {K: "release", V: plan.Release},
-		{K: "lanes", V: plan.Lanes()}, {K: "rental", V: rentalID},
-		{K: "status", V: "completed"}, {K: "changed", V: !replay},
-	}, "model", "release", "lanes", "status", "changed"))
+		{K: "id", V: plan.ID()}, {K: "kind", V: "model-upload"},
+		{K: "model", V: plan.Destination}, {K: "checkpoints", V: checkpoints},
+		{K: "rental", V: rentalID},
+		{K: "status", V: operation.State}, {K: "changed", V: !replay},
+	}, "model", "checkpoints", "status", "changed"))
+}
+
+func settleProductionUpload(store *records.Store, plan modelproduction.Plan,
+	operation *records.ModelProductionOperation,
+) (*records.ModelProductionOperation, *exit.Error) {
+	if operation == nil {
+		return nil, exit.Internalf("model upload %s disappeared before settlement", plan.ID())
+	}
+	if operation.State == "completed" || operation.State == "partial" {
+		return operation, nil
+	}
+	if operation.State != "cleanup_pending" {
+		return nil, exit.Named(exit.Conflict, "model_upload.settlement_state_invalid",
+			"model upload %s is %s before settlement", plan.ID(), operation.State)
+	}
+	checkpoints, problem := modelProductionCheckpoints(store, plan)
+	if problem != nil {
+		return nil, problem
+	}
+	if len(checkpoints) == 0 {
+		if problem = store.FailModelProduction(plan.ID(), "cleanup_pending", "model_upload.no_outputs",
+			"no named output checkpoint survived"); problem != nil {
+			return nil, problem
+		}
+		failed, readProblem := store.ModelProduction(plan.ID())
+		if readProblem != nil {
+			return nil, readProblem
+		}
+		return failed, exit.Named(exit.Failed, "model_upload.no_outputs",
+			"model upload %s produced no checkpoint", plan.ID())
+	}
+	status := "completed"
+	if len(checkpoints) != len(plan.Production.Outputs) {
+		status = "partial"
+	}
+	if problem = store.AdvanceModelProduction(plan.ID(), "cleanup_pending", status,
+		operation.StepIndex, operation.RentalID); problem != nil {
+		return nil, problem
+	}
+	return store.ModelProduction(plan.ID())
+}
+
+func modelProductionCheckpoints(store *records.Store, plan modelproduction.Plan) (map[string]string, *exit.Error) {
+	artifacts, problem := store.ModelProductionArtifacts(plan.ID())
+	if problem != nil {
+		return nil, problem
+	}
+	bySource := make(map[string]records.ModelProductionArtifact, len(artifacts))
+	for _, artifact := range artifacts {
+		bySource[artifact.StepName+"."+artifact.OutputSlot] = artifact
+	}
+	checkpoints := make(map[string]string, len(plan.Production.Outputs))
+	for _, output := range plan.Production.Outputs {
+		artifact, ok := bySource[output.Source]
+		if ok && artifact.PublicationID != "" && artifact.ManifestID != "" {
+			checkpoints[output.Name] = artifact.ManifestID
+		}
+	}
+	return checkpoints, nil
 }
 
 func firstNonempty(values ...string) string {

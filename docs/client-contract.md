@@ -264,10 +264,10 @@ URLs but remain local-scope rows in the same guarded route table.
 | `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists |
 | `POST /v1/local/jobs/{id}/cancel` | local | yes | request cancellation; a queued job leaves the queue, a running one gets its terminal |
-| `POST /v1/local/model-productions` | local | yes | accept one canonical model-publication instruction and start daemon-owned advancement |
-| `GET /v1/local/model-productions` | local | yes | list durable model publications from the existing records authority |
-| `GET /v1/local/model-productions/{id}` | local | yes | read one durable model publication for reconnect and follow |
-| `POST /v1/local/model-productions/{id}/cancel` | local | yes | request durable model-publication cancellation and tree cleanup |
+| `POST /v1/local/model-productions` | local | yes | accept one canonical model-upload instruction and start daemon-owned advancement |
+| `GET /v1/local/model-productions` | local | yes | list durable model uploads from the existing records authority |
+| `GET /v1/local/model-productions/{id}` | local | yes | read one durable model upload for reconnect and follow |
+| `POST /v1/local/model-productions/{id}/cancel` | local | yes | request durable model-upload cancellation and tree cleanup |
 | `POST /v1/local/model-productions/{id}` | local | yes | drive one credential-free source or artifact host exchange on an attached rental |
 | `GET /{$}` | local | no | embedded localhost web UI entrypoint |
 | `GET /app.css` | local | no | embedded localhost web UI stylesheet |

@@ -527,7 +527,7 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane str
 	if ref.Org == "local" {
 		return empty, exit.Named(exit.Unavailable, "rental_local_model_sync_required",
 			"%s is a private local model and cannot be granted to a rented worker by path", ref.String()).
-			WithRemedy("publish it under a non-local org, or explicitly sync/upload it through the model publication workflow")
+			WithRemedy("upload it under a non-local org, or explicitly sync it through the model upload workflow")
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
@@ -594,7 +594,7 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane str
 
 func handleRunCancel(ctx *Context) *exit.Error {
 	id := ctx.Inv.Args[0]
-	if strings.HasPrefix(id, "modelpub-") {
+	if strings.HasPrefix(id, "modelupload-") {
 		return handleModelProductionCancel(ctx)
 	}
 	if strings.HasPrefix(id, "job-") {
@@ -675,7 +675,7 @@ func handleRunList(ctx *Context) *exit.Error {
 		}
 		list.Rows = append(list.Rows, map[string]string{
 			"id": production.ID, "kind": production.Kind,
-			"target": production.Model + "@" + production.Release,
+			"target": production.Model,
 			"status": production.Status, "attempts": "1", "created": production.CreatedAt,
 		})
 		states[production.Status]++

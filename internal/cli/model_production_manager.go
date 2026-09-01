@@ -6,7 +6,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/config"
@@ -42,18 +41,13 @@ func newModelProductionManager(cfg config.Config, store *records.Store,
 func (m *modelProductionManager) SubmitModelProduction(_ context.Context,
 	instruction modelproduction.Instruction,
 ) (records.ModelProductionOperation, bool, *exit.Error) {
-	if instruction.Destination == "" || instruction.Release == "" || instruction.Source == "" ||
+	if instruction.Destination == "" || instruction.Source == "" ||
 		instruction.Producer == "" || !instruction.Rental {
 		return records.ModelProductionOperation{}, false, exit.New(exit.Validation,
-			"durable model production requires destination, release, pinned source, producer, and rental approval")
+			"durable model upload requires destination, pinned source, producer, and rental approval")
 	}
 	if _, problem := hub.ParseRef(instruction.Destination); problem != nil {
 		return records.ModelProductionOperation{}, false, problem
-	}
-	if !modelReleasePattern.MatchString(instruction.Release) {
-		return records.ModelProductionOperation{}, false, exit.Usagef(
-			"model production release %q is not an immutable N.M.P semantic version",
-			instruction.Release)
 	}
 	if _, problem := canonicalProductionSource(&Context{Inv: productionInvocation(instruction)},
 		instruction.Source); problem != nil {
@@ -136,7 +130,7 @@ func (m *modelProductionManager) CancelModelProduction(id string) *exit.Error {
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
-	} else if operation.State != "completed" && operation.State != "failed" &&
+	} else if operation.State != "completed" && operation.State != "partial" && operation.State != "failed" &&
 		operation.State != "canceled" {
 		m.kick(*operation)
 	}
@@ -168,7 +162,7 @@ func (m *modelProductionManager) Start() {
 }
 
 func (m *modelProductionManager) kick(operation records.ModelProductionOperation) {
-	if operation.State == "resolving" || operation.State == "completed" ||
+	if operation.State == "resolving" || operation.State == "completed" || operation.State == "partial" ||
 		operation.State == "failed" || operation.State == "canceled" {
 		return
 	}
@@ -213,7 +207,7 @@ func (m *modelProductionManager) advance(runCtx context.Context,
 	resolveCtx := &Context{Inv: productionInvocation(plan.Instruction), Out: io.Discard,
 		Err: m.log, Cfg: m.cfg, AccountAuth: m.auth}
 	var source publishSource
-	if operation.State != "outputs_preparing" && operation.State != "release_cut" &&
+	if operation.State != "outputs_preparing" &&
 		operation.State != "cleanup_pending" {
 		var problem *exit.Error
 		source, problem = resolvePublishSource(resolveCtx, plan.Instruction.Source)
@@ -231,19 +225,7 @@ func (m *modelProductionManager) advance(runCtx context.Context,
 		}
 	}
 	ctx := resolveCtx
-	for {
-		problem := runRentedModelProduction(ctx, runCtx, plan, source)
-		if problem == nil || problem.Name != "model_production.cut_verdict_unknown" {
-			return
-		}
-		select {
-		case <-runCtx.Done():
-			// Cut itself is not canceled. Replay once more to learn whether it won;
-			// the post-cut cancellation fence will then choose cleanup or no visibility.
-			runCtx = context.Background()
-		case <-time.After(2 * time.Second):
-		}
-	}
+	_ = runRentedModelProduction(ctx, runCtx, plan, source)
 }
 
 func (m *modelProductionManager) resolve(instruction modelproduction.Instruction) (
@@ -264,8 +246,8 @@ func (m *modelProductionManager) resolve(instruction modelproduction.Instruction
 			"model production instruction names no reviewed producer")
 	}
 	plan := modelproduction.Plan{Instruction: instruction,
-		Destination: instruction.Destination, Release: instruction.Release,
-		Source: source.Canonical, SourceSelection: source.Selection,
+		Destination: instruction.Destination,
+		Source:      source.Canonical, SourceSelection: source.Selection,
 		SourceLicense: source.License, InputLane: source.Lane, SourceFiles: source.Exact,
 		Producer: producer.Name, ProducerInstallID: producer.InstallID,
 		ProducerRelease: producer.Release, ProducerDigest: producer.ReleaseDigest,
@@ -277,6 +259,6 @@ func (m *modelProductionManager) resolve(instruction modelproduction.Instruction
 func productionInvocation(instruction modelproduction.Instruction) *Invocation {
 	return &Invocation{Args: []string{instruction.Destination, instruction.Source},
 		Bools: bools("--rental", instruction.Rental), Values: values(
-			"--release", instruction.Release, "--producer", instruction.Producer,
+			"--producer", instruction.Producer,
 			"--lane", instruction.InputLane)}
 }

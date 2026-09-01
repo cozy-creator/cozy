@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS model_production_objects (
     REFERENCES model_production_artifacts(operation_id,step_name,output_slot)
 )`}
 
-// ModelProductionOperation is one durable source-to-release instruction. Plan
+// ModelProductionOperation is one durable source-to-checkpoints instruction. Plan
 // contains only immutable identities; transient access and execution facts stay
 // in their owning ledgers and joins.
 type ModelProductionOperation struct {
@@ -305,7 +305,7 @@ func (s *Store) ModelProduction(id string) (*ModelProductionOperation, *exit.Err
 
 func (s *Store) ActiveModelProductions() ([]ModelProductionOperation, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + modelProductionCols + ` FROM model_productions
-		WHERE state NOT IN ('completed','failed','canceled') ORDER BY created_at,id`)
+		WHERE state NOT IN ('completed','partial','failed','canceled') ORDER BY created_at,id`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list active model productions: %s", err)
 	}
@@ -364,7 +364,7 @@ func (s *Store) SelectModelProductionSKU(id, sku string) *exit.Error {
 
 func (s *Store) RequestModelProductionCancel(id string) *exit.Error {
 	result, err := s.db.Exec(`UPDATE model_productions SET cancel_requested=1,updated_at=?
-		WHERE id=? AND state NOT IN ('completed','failed','canceled')`, now(), id)
+		WHERE id=? AND state NOT IN ('completed','partial','failed','canceled')`, now(), id)
 	if err != nil {
 		return exit.Internalf("cannot request model production cancellation: %s", err)
 	}
@@ -454,7 +454,7 @@ func (s *Store) AdvanceModelProduction(id, from, to string, stepIndex int64, ren
 
 func modelProductionTransition(from, to string) bool {
 	if to == "failed" || to == "canceled" {
-		return from != "completed" && from != "failed" && from != "canceled"
+		return from != "completed" && from != "partial" && from != "failed" && from != "canceled"
 	}
 	switch from + "\x00" + to {
 	case "accepted\x00source_preparing",
@@ -462,9 +462,9 @@ func modelProductionTransition(from, to string) bool {
 		"source_prepared\x00step_running",
 		"step_running\x00step_running",
 		"step_running\x00outputs_preparing",
-		"outputs_preparing\x00release_cut",
-		"release_cut\x00cleanup_pending",
-		"cleanup_pending\x00completed":
+		"outputs_preparing\x00cleanup_pending",
+		"cleanup_pending\x00completed",
+		"cleanup_pending\x00partial":
 		return true
 	}
 	return false

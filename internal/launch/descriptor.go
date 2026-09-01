@@ -102,7 +102,6 @@ type ResourceRequirements struct {
 type ModelProductionOutput struct {
 	Name             string                  `json:"name"`
 	Source           string                  `json:"source"`
-	LaneKey          string                  `json:"lane_key"`
 	RequiredContract ModelProductionContract `json:"required_contract"`
 }
 
@@ -334,7 +333,7 @@ func validateProductionKeys(raw json.RawMessage) error {
 		}
 		for _, rawOutput := range outputs {
 			output, err := exactKeys(rawOutput,
-				[]string{"lane_key", "name", "required_contract", "source"}, nil)
+				[]string{"name", "required_contract", "source"}, nil)
 			if err != nil {
 				return err
 			}
@@ -579,14 +578,13 @@ func validateProduction(production *ModelProduction) *exit.Error {
 	if len(production.Outputs) < 1 || len(production.Outputs) > 16 {
 		return badProduction(production, "must declare 1 through 16 required outputs")
 	}
-	outputNames, lanes := map[string]bool{}, map[string]bool{}
+	outputNames := map[string]bool{}
 	for _, output := range production.Outputs {
 		if !productionNamePattern.MatchString(output.Name) || outputNames[output.Name] ||
-			!productionNamePattern.MatchString(output.LaneKey) || lanes[output.LaneKey] ||
 			!declaredOutputs[output.Source] {
 			return badProduction(production, "has an invalid, duplicate, or unresolved required output")
 		}
-		outputNames[output.Name], lanes[output.LaneKey] = true, true
+		outputNames[output.Name] = true
 		contract := output.RequiredContract
 		if !productionDigestPattern.MatchString(contract.TopologyDigest) ||
 			!validProductionDigestList(contract.Encodings, 32) {

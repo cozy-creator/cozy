@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -31,7 +30,7 @@ import (
 func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.T) {
 	var stderr bytes.Buffer
 	progress := cli.NewModelProductionProgress(&stderr, true, 10)
-	progress.Accepted("modelpub-proof", 4)
+	progress.Accepted("modelupload-proof", 4)
 	progress.RentalSelecting("h200-sxm")
 	progress.RentalReady("rental-1", "ready", "h200-sxm")
 	progress.WorkerWaiting("rental-1")
@@ -57,15 +56,13 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 		progress.StepStarting(index, name, callable, false)
 		progress.StepCompleted(index, name, callable)
 	}
-	lanes := []string{"bf16-adaln-pruned", "bf16-full", "fp8-adaln-pruned", "mxfp8-adaln-pruned"}
-	progress.ReleaseStarting("1.0.0", lanes)
-	progress.ReleaseCut("1.0.0", len(lanes))
+	progress.OutputsRetained(4)
 	progress.RentalReleaseStarting("rental-1")
 	progress.RentalReleased("rental-1")
 
 	human := stderr.String()
 	for _, want := range []string{
-		"Model production modelpub-proof accepted: 10 steps, 4 lanes.",
+		"Model upload modelupload-proof accepted: 10 steps, 4 outputs.",
 		"Rental rental-1: ready (h200-sxm).",
 		"Worker: ready on rental rental-1.",
 		"Source: preparing 27 files (100.0MiB).",
@@ -75,9 +72,9 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 		"Step 1/10: assemble-full — constructing (20%).",
 		"Step 1/10: assemble-full — verifying (10%).",
 		"Artifact: adopted output 1/1 for step 1/10 assemble-full.",
-		"Publication: lane bf16-full prepared.",
+		"Checkpoint: output bf16-full retained.",
 		"Step 1/10: completed assemble-full (tensorhub/minimax-h3-tools/assemble).",
-		"Release: 1.0.0 cut atomically with 4 lanes.",
+		"Upload: retained 4 owner-only checkpoints.",
 		"Cleanup: rental rental-1 released; provider absence confirmed.",
 	} {
 		if !strings.Contains(human, want) {
@@ -99,7 +96,7 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 
 	var disabled bytes.Buffer
 	machineProgress := cli.NewModelProductionProgress(&disabled, false, 10)
-	machineProgress.Accepted("modelpub-proof", 4)
+	machineProgress.Accepted("modelupload-proof", 4)
 	machineProgress.SourceProgress(50, 100)
 	machineProgress.StepStarting(0, "assemble-full", "tensorhub/minimax-h3-tools/assemble", false)
 	machineProgress.RentalReleased("rental-1")
@@ -109,12 +106,12 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 	var resumed bytes.Buffer
 	resumeProgress := cli.NewModelProductionProgress(&resumed, true, 10)
 	resumeProgress.SeedSourceProgress(40<<20, 100<<20)
-	resumeProgress.Resume("modelpub-proof", "source preparation has transferred 40.0MiB / 100.0MiB")
+	resumeProgress.Resume("modelupload-proof", "source preparation has transferred 40.0MiB / 100.0MiB")
 	for range 100 {
 		resumeProgress.SourceProgress(40<<20, 100<<20)
 	}
 	resumeProgress.SourceProgress(50<<20, 100<<20)
-	if got := resumed.String(); !strings.Contains(got, "Resuming model production modelpub-proof") ||
+	if got := resumed.String(); !strings.Contains(got, "Resuming model upload modelupload-proof") ||
 		strings.Contains(got, "Source: downloaded 40.0MiB") ||
 		strings.Count(got, "Source: downloaded") != 1 {
 		t.Fatalf("resume repeated already-rendered progress:\n%s", got)
@@ -133,7 +130,7 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 	defer accountServer.Close()
 	code, stdout, jsonStderr := runCozyDirStreams(t, root, ".",
 		[]string{"TENSORHUB_URL=" + accountServer.URL, "TENSORHUB_TOKEN=proof-token"},
-		"--json", "model", "publish", "acme/proof", source, "--release", "1.0.0", "--dry-run")
+		"--json", "model", "upload", "acme/proof", source, "--dry-run")
 	var document map[string]any
 	if code != 0 || json.Unmarshal([]byte(stdout), &document) != nil || document["status"] != "planned" ||
 		strings.TrimSpace(jsonStderr) != "" {
@@ -144,20 +141,157 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 func TestModelProductionCancellationReportsCleanupTruth(t *testing.T) {
 	var confirmed, pending bytes.Buffer
 	finished := cli.NewModelProductionProgress(&confirmed, true, 10)
-	finished.Cancellation("modelpub-cancel")
+	finished.Cancellation("modelupload-cancel")
 	finished.RentalReleaseStarting("rental-cancel")
 	finished.RentalReleased("rental-cancel")
-	if got := confirmed.String(); !strings.Contains(got, "Cancellation: model production modelpub-cancel stopped") ||
+	if got := confirmed.String(); !strings.Contains(got, "Cancellation: model upload modelupload-cancel stopped") ||
 		!strings.Contains(got, "provider absence confirmed") {
 		t.Fatalf("confirmed cancellation cleanup changed:\n%s", got)
 	}
 	unconfirmed := cli.NewModelProductionProgress(&pending, true, 10)
-	unconfirmed.Cancellation("modelpub-cancel")
+	unconfirmed.Cancellation("modelupload-cancel")
 	unconfirmed.RentalReleaseStarting("rental-cancel")
 	unconfirmed.RentalReleaseUnconfirmed("rental-cancel")
 	if got := pending.String(); !strings.Contains(got, "release is not yet confirmed") ||
 		strings.Contains(got, "provider absence confirmed") {
 		t.Fatalf("unconfirmed cancellation cleanup overstated reality:\n%s", got)
+	}
+}
+
+func TestFailedModelUploadKeepsCompletedCheckpointVisible(t *testing.T) {
+	root := t.TempDir()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	instruction := modelproduction.Instruction{Destination: "acme/model",
+		Source:   "hf://acme/source@" + strings.Repeat("a", 40),
+		Producer: "acme/tools/build", Rental: true}
+	production := &launch.ModelProduction{Name: "build",
+		Outputs: []launch.ModelProductionOutput{
+			{Name: "finished", Source: "build.finished"},
+			{Name: "failed", Source: "build.failed"},
+		}}
+	plan := modelproduction.Plan{Instruction: instruction, Destination: instruction.Destination,
+		Source: instruction.Source, Producer: instruction.Producer, Production: production,
+		Jobs: []modelproduction.JobPin{{Step: "build", Callable: "acme/tools@v1/build"}}}
+	instructionBytes, err := instruction.Bytes()
+	must(t, err)
+	instructionDigest, err := instruction.Digest()
+	must(t, err)
+	_, _, problem = store.BeginModelProductionInstruction(instruction.ID(), instructionDigest,
+		instructionBytes)
+	fatal(t, problem)
+	planBytes, err := plan.Bytes()
+	must(t, err)
+	planDigest, err := plan.Digest()
+	must(t, err)
+	_, _, problem = store.AttachModelProductionPlan(instruction.ID(), instructionDigest,
+		instructionBytes, planBytes, planDigest)
+	fatal(t, problem)
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "accepted", "source_preparing", 0, "rental-proof"))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_preparing", "source_prepared", 0, "rental-proof"))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_prepared", "step_running", 0, "rental-proof"))
+	checkpoint := "sha256:" + strings.Repeat("d", 64)
+	fatal(t, store.RecordModelProductionArtifact(records.ModelProductionArtifact{
+		OperationID: instruction.ID(), StepName: "build", OutputSlot: "finished",
+		RequestID: "job-proof", Attempt: 1, InvocationDigest: "sha256:" + strings.Repeat("b", 64),
+		TransactionID: "transaction-proof", WriterGeneration: 1,
+		ReceiptDigest: "sha256:" + strings.Repeat("c", 64), Receipt: []byte(`{"format":"proof/1"}`),
+		ManifestID: checkpoint, ManifestLength: 128,
+		CheckpointEvidence: []byte(`{"format":"evidence/1"}`),
+	}, nil))
+	fatal(t, store.MarkModelProductionArtifactPublished(instruction.ID(), "build", "finished", "upload-proof"))
+	fatal(t, store.FailModelProduction(instruction.ID(), "step_running", "second_output_failed",
+		"the independent second output failed"))
+	store.Close()
+
+	daemon := startDaemonProcess(t, root)
+	reply := daemon.call(t, http.MethodGet, "/v1/local/model-productions/"+instruction.ID(), nil)
+	var state api.ModelProductionState
+	if reply.Status != http.StatusOK || json.Unmarshal(reply.Body, &state) != nil ||
+		state.Status != "failed" || state.Checkpoints["finished"] != checkpoint ||
+		state.Checkpoints["failed"] != "" {
+		t.Fatalf("failed upload lost its completed checkpoint: %s", reply.brief())
+	}
+}
+
+func TestModelUploadSettlesPartialWhenIndependentBranchSucceeds(t *testing.T) {
+	root := t.TempDir()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	instruction := modelproduction.Instruction{Destination: "acme/model",
+		Source:   "hf://acme/source@" + strings.Repeat("a", 40),
+		Producer: "acme/tools/build", Rental: true}
+	production := &launch.ModelProduction{Name: "branches", Sources: map[string]string{"source": "proof/source/1"},
+		Steps: []launch.ModelProductionStep{
+			{Name: "fails", Callable: "acme/tools@v1/fails",
+				Models: map[string]string{"source": "source"}, Outputs: []string{"model"}},
+			{Name: "succeeds", Callable: "acme/tools@v1/succeeds",
+				Models: map[string]string{"source": "source"}, Outputs: []string{"model"}},
+		}, Outputs: []launch.ModelProductionOutput{
+			{Name: "failed-branch", Source: "fails.model"},
+			{Name: "successful-branch", Source: "succeeds.model"},
+		}}
+	plan := modelproduction.Plan{Instruction: instruction, Destination: instruction.Destination,
+		Source: instruction.Source, Producer: instruction.Producer, Production: production,
+		Jobs: []modelproduction.JobPin{
+			{Step: "fails", Callable: "acme/tools@v1/fails"},
+			{Step: "succeeds", Callable: "acme/tools@v1/succeeds"},
+		}}
+	instructionBytes, err := instruction.Bytes()
+	must(t, err)
+	instructionDigest, err := instruction.Digest()
+	must(t, err)
+	_, _, problem = store.BeginModelProductionInstruction(instruction.ID(), instructionDigest,
+		instructionBytes)
+	fatal(t, problem)
+	planBytes, err := plan.Bytes()
+	must(t, err)
+	planDigest, err := plan.Digest()
+	must(t, err)
+	_, _, problem = store.AttachModelProductionPlan(instruction.ID(), instructionDigest,
+		instructionBytes, planBytes, planDigest)
+	fatal(t, problem)
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "accepted", "source_preparing", 0, ""))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_preparing", "source_prepared", 0, ""))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_prepared", "step_running", 0, ""))
+	_, problem = store.BeginModelProductionStep(records.ModelProductionStep{OperationID: instruction.ID(),
+		StepIndex: 0, StepName: "fails", RequestID: "job-fails", State: "failed"})
+	fatal(t, problem)
+	_, problem = store.BeginModelProductionStep(records.ModelProductionStep{OperationID: instruction.ID(),
+		StepIndex: 1, StepName: "succeeds", RequestID: "job-succeeds", State: "completed"})
+	fatal(t, problem)
+	checkpoint := "sha256:" + strings.Repeat("d", 64)
+	fatal(t, store.RecordModelProductionArtifact(records.ModelProductionArtifact{
+		OperationID: instruction.ID(), StepName: "succeeds", OutputSlot: "model",
+		RequestID: "job-succeeds", Attempt: 1,
+		InvocationDigest: "sha256:" + strings.Repeat("b", 64), TransactionID: "transaction-proof",
+		WriterGeneration: 1, ReceiptDigest: "sha256:" + strings.Repeat("c", 64),
+		Receipt: []byte(`{"format":"proof/1"}`), ManifestID: checkpoint, ManifestLength: 128,
+		CheckpointEvidence: []byte(`{"format":"evidence/1"}`),
+	}, nil))
+	fatal(t, store.MarkModelProductionArtifactPublished(instruction.ID(), "succeeds", "model", "upload-proof"))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "step_running", "outputs_preparing", 2, ""))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "outputs_preparing", "cleanup_pending", 2, ""))
+	store.Close()
+
+	daemon := startDaemonProcess(t, root)
+	deadline := time.Now().Add(5 * time.Second)
+	var state api.ModelProductionState
+	for time.Now().Before(deadline) {
+		reply := daemon.call(t, http.MethodGet, "/v1/local/model-productions/"+instruction.ID(), nil)
+		if reply.Status == http.StatusOK && json.Unmarshal(reply.Body, &state) == nil &&
+			state.Status == "partial" {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if state.Status != "partial" || state.Checkpoints["successful-branch"] != checkpoint ||
+		state.Checkpoints["failed-branch"] != "" {
+		t.Fatalf("branch-local model upload result = %+v", state)
 	}
 }
 
@@ -182,9 +316,9 @@ func TestForeignModelProductionRefusesBeforeWriteOrSpend(t *testing.T) {
 		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\n"), 0o600))
 	daemon := startDaemonProcess(t, root)
 	instruction := modelproduction.Instruction{
-		Destination: "foreign/output", Release: "1.0.0",
-		Source:   "hf://source/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		Producer: "proof/tools@v1/build", Rental: true,
+		Destination: "foreign/output",
+		Source:      "hf://source/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Producer:    "proof/tools@v1/build", Rental: true,
 	}
 	reply := daemon.call(t, http.MethodPost, "/v1/local/model-productions",
 		map[string]any{"instruction": instruction})
@@ -235,7 +369,7 @@ func TestModelProductionSourceRequestHonorsCancellationContext(t *testing.T) {
 	requestCtx, cancel := context.WithCancel(context.Background())
 	result := make(chan *exit.Error, 1)
 	go func() {
-		_, callProblem := client.ModelProductionActionContext(requestCtx, "modelpub-cancel",
+		_, callProblem := client.ModelProductionActionContext(requestCtx, "modelupload-cancel",
 			api.ModelProductionAction{Action: "prepare_source", RentalID: "rental-1"})
 		result <- callProblem
 	}()
@@ -256,7 +390,7 @@ func TestModelProductionSourceRequestHonorsCancellationContext(t *testing.T) {
 }
 
 func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.T) {
-	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}],"models":[{"class":"ProofModel","component_use":{},"path":"assemble.models.source","stamps":{}}],"name":"assemble","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-producer@v2/assemble","models":{"source":"source"},"name":"assemble","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}},{"callable":"proof/remote-job@v3/derive","models":{"source":"assemble.model"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
+	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}],"models":[{"class":"ProofModel","component_use":{},"path":"assemble.models.source","stamps":{}}],"name":"assemble","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-producer@v2/assemble","models":{"source":"source"},"name":"assemble","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}},{"callable":"proof/remote-job@v3/derive","models":{"source":"assemble.model"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
 	producer, problem := launch.DecodeDescriptor(producerBytes)
 	fatal(t, problem)
 	if _, invalid := launch.DecodeDescriptor(bytes.ReplaceAll(producerBytes,
@@ -346,8 +480,8 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
 		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\nrentals:\n  max_hourly_spend_usd: 10\n"), 0o600))
 	code, out := runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
-		"--json", "--full", "model", "publish", "acme/output", "acme/input@1.0.0",
-		"--release", "1.0.0", "--producer", "proof/remote-producer@v2/build",
+		"--json", "--full", "model", "upload", "acme/output", "acme/input@1.0.0",
+		"--producer", "proof/remote-producer@v2/build",
 		"--rental", "--dry-run")
 	if code != 0 || !strings.Contains(out, `"status":"planned"`) ||
 		!strings.Contains(out, `"producer":"proof/remote-producer@v2/build@2.0.0"`) {
@@ -371,14 +505,14 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 	requests = nil
 	producerCardReads = 0
 	code, out = runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
-		"model", "publish", "acme/output", "acme/input@1.0.0", "--release", "1.0.0",
+		"model", "upload", "acme/output", "acme/input@1.0.0",
 		"--producer", "proof/remote-producer@v2/build", "--rental", "--dry-run")
 	if code == 0 || !strings.Contains(out, "no active immutable release in v3") {
 		t.Fatalf("missing production callable major [exit %d]\n%s", code, out)
 	}
 	requests = nil
 	code, out = runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
-		"model", "publish", "acme/output", "acme/input@1.0.0", "--release", "1.0.0",
+		"model", "upload", "acme/output", "acme/input@1.0.0",
 		"--producer", "proof/remote-producer@v2/build", "--dry-run")
 	if code == 0 || !strings.Contains(out, "not installed") {
 		t.Fatalf("local production stopped requiring a local install [exit %d]\n%s", code, out)
@@ -389,7 +523,7 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 }
 
 func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *testing.T) {
-	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-job@v3/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
+	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-job@v3/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
 	producer, problem := launch.DecodeDescriptor(producerBytes)
 	fatal(t, problem)
 	jobBytes := []byte(`{"application":"remote_job:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}],"models":[{"class":"ProofModel","component_use":{},"path":"derive.models.source","stamps":{}}],"name":"derive","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}],"model_productions":[]}`)
@@ -468,12 +602,12 @@ func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *test
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
 		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\nrentals:\n  max_hourly_spend_usd: 10\n"), 0o600))
-	args := []string{"--json", "--full", "model", "publish", "acme/output", "acme/input@1.0.0",
-		"--release", "1.0.0", "--producer", "proof/remote-producer/build", "--rental", "--detach"}
+	args := []string{"--json", "--full", "model", "upload", "acme/output", "acme/input@1.0.0",
+		"--producer", "proof/remote-producer/build", "--rental", "--detach"}
 	code, out := runCozy(t, root, args...)
 	var accepted api.ModelProductionState
 	if err := json.Unmarshal([]byte(out), &accepted); code != 0 || err != nil ||
-		!strings.HasPrefix(accepted.ID, "modelpub-") || accepted.Kind != "model-publication" {
+		!strings.HasPrefix(accepted.ID, "modelupload-") || accepted.Kind != "model-upload" {
 		t.Fatalf("detached acceptance [exit %d, parse %v]\n%s", code, err, out)
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -537,7 +671,7 @@ func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *test
 		t.Fatalf("follow interrupt canceled durable work: %+v", stillRunning)
 	}
 	if code, listed := runCozy(t, root, "--json", "run", "list"); code != 0 ||
-		!strings.Contains(listed, accepted.ID) || !strings.Contains(listed, "model-publication") {
+		!strings.Contains(listed, accepted.ID) || !strings.Contains(listed, "model-upload") {
 		t.Fatalf("run list omitted model production [exit %d]\n%s", code, listed)
 	}
 
@@ -574,13 +708,13 @@ func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *test
 
 func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) {
 	instruction := modelproduction.Instruction{
-		Destination: "tensorhub/minimax-h3", Release: "h3-2026-08-31",
-		Source:   "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("a", 40),
-		Producer: "tensorhub/minimax-h3-tools/four-lane", Rental: true,
+		Destination: "tensorhub/minimax-h3",
+		Source:      "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("a", 40),
+		Producer:    "tensorhub/minimax-h3-tools/four-lane", Rental: true,
 	}
 	plan := modelproduction.Plan{
-		Instruction: instruction,
-		Destination: "tensorhub/minimax-h3", Release: "1.0.0",
+		Instruction:     instruction,
+		Destination:     "tensorhub/minimax-h3",
 		Source:          "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("a", 40),
 		SourceSelection: "sha256:" + strings.Repeat("b", 64),
 		SourceFiles: []modelproduction.SourceFile{{
@@ -664,15 +798,15 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 	}
 }
 
-func TestModelProductionCancelCutOrderingAndUnattachedProviderAbsence(t *testing.T) {
+func TestModelProductionCancelCheckpointOrderingAndUnattachedProviderAbsence(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
 	fatal(t, problem)
-	makeOperation := func(release string) (string, modelproduction.Plan) {
-		instruction := modelproduction.Instruction{Destination: "acme/model", Release: release,
-			Source:   "hf://acme/model@" + strings.Repeat("a", 40),
+	makeOperation := func(key string) (string, modelproduction.Plan) {
+		instruction := modelproduction.Instruction{Destination: "acme/model",
+			Source:   "hf://acme/model@" + strings.Repeat(key, 40),
 			Producer: "acme/tools/build", Rental: true}
 		plan := modelproduction.Plan{Instruction: instruction, Destination: instruction.Destination,
-			Release: release, Source: instruction.Source}
+			Source: instruction.Source}
 		instructionBytes, err := instruction.Bytes()
 		must(t, err)
 		instructionDigest, err := instruction.Digest()
@@ -693,7 +827,7 @@ func TestModelProductionCancelCutOrderingAndUnattachedProviderAbsence(t *testing
 		fatal(t, store.AdvanceModelProduction(instruction.ID(), "step_running", "outputs_preparing", 1, "rental-proof"))
 		return instruction.ID(), plan
 	}
-	beforeID, _ := makeOperation("before-cut")
+	beforeID, _ := makeOperation("a")
 	fatal(t, store.RequestModelProductionCancel(beforeID))
 	fatal(t, store.CancelModelProduction(beforeID, "outputs_preparing", "cancel won before cut"))
 	before, problem := store.ModelProduction(beforeID)
@@ -702,10 +836,9 @@ func TestModelProductionCancelCutOrderingAndUnattachedProviderAbsence(t *testing
 		t.Fatalf("cancel-before-cut state = %+v", before)
 	}
 
-	afterID, _ := makeOperation("after-cut")
-	fatal(t, store.AdvanceModelProduction(afterID, "outputs_preparing", "release_cut", 1, "rental-proof"))
+	afterID, _ := makeOperation("b")
+	fatal(t, store.AdvanceModelProduction(afterID, "outputs_preparing", "cleanup_pending", 1, "rental-proof"))
 	fatal(t, store.RequestModelProductionCancel(afterID))
-	fatal(t, store.AdvanceModelProduction(afterID, "release_cut", "cleanup_pending", 1, "rental-proof"))
 	fatal(t, store.AdvanceModelProduction(afterID, "cleanup_pending", "completed", 1, "rental-proof"))
 	after, problem := store.ModelProduction(afterID)
 	fatal(t, problem)
@@ -753,28 +886,9 @@ func TestModelProductionCancelCutOrderingAndUnattachedProviderAbsence(t *testing
 	}
 }
 
-func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.T) {
-	var mu sync.Mutex
-	cutBodies := []string{}
+func TestModelUploadPreparedOutputsCompleteAfterDaemonRestart(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/models/acme/output/releases/ambiguous":
-			body, _ := io.ReadAll(r.Body)
-			mu.Lock()
-			cutBodies = append(cutBodies, string(body))
-			attempt := len(cutBodies)
-			mu.Unlock()
-			w.Header().Set("Content-Type", "application/json")
-			if attempt == 1 {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				_, _ = io.WriteString(w, `{"error":{"code":"cut_unavailable","message":"cut response was lost"}}`)
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"operation": "modelpub-proof", "release": "ambiguous",
-				"repository_sha256": "sha256:" + strings.Repeat("f", 64), "duplicate": true,
-				"lanes": []map[string]any{{"lane": "bf16", "checkpoint_id": "sha256:" + strings.Repeat("d", 64)}},
-			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/rental-cut-proof":
 			http.NotFound(w, r)
 		default:
@@ -789,15 +903,15 @@ func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
-	instruction := modelproduction.Instruction{Destination: "acme/output", Release: "ambiguous",
+	instruction := modelproduction.Instruction{Destination: "acme/output",
 		Source:   "hf://acme/model@" + strings.Repeat("a", 40),
 		Producer: "acme/tools/build", Rental: true}
 	production := &launch.ModelProduction{Name: "build", Sources: map[string]string{"source": "proof/source/1"},
 		Steps: []launch.ModelProductionStep{{Name: "derive", Callable: "acme/job@v1/derive",
 			Models: map[string]string{"source": "source"}, Outputs: []string{"model"}}},
-		Outputs: []launch.ModelProductionOutput{{Name: "bf16", Source: "derive.model", LaneKey: "bf16"}}}
+		Outputs: []launch.ModelProductionOutput{{Name: "bf16", Source: "derive.model"}}}
 	plan := modelproduction.Plan{Instruction: instruction, Destination: instruction.Destination,
-		Release: instruction.Release, Source: instruction.Source, Producer: instruction.Producer,
+		Source: instruction.Source, Producer: instruction.Producer,
 		Production: production, Jobs: []modelproduction.JobPin{{Step: "derive", Callable: "acme/job@v1/derive"}}}
 	instructionBytes, err := instruction.Bytes()
 	must(t, err)
@@ -848,11 +962,8 @@ func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.
 	operation, problem := store.ModelProduction(instruction.ID())
 	store.Close()
 	fatal(t, problem)
-	mu.Lock()
-	bodies := append([]string(nil), cutBodies...)
-	mu.Unlock()
-	if operation == nil || operation.State != "completed" || len(bodies) != 2 || bodies[0] != bodies[1] {
-		t.Fatalf("ambiguous cut recovery = operation %+v bodies %#v", operation, bodies)
+	if operation == nil || operation.State != "completed" {
+		t.Fatalf("prepared output recovery = operation %+v", operation)
 	}
 	terminateTestDaemon(t, root)
 }
@@ -861,7 +972,7 @@ func TestModelProductionJoinsStepArtifactAndTransferBeforeReplay(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
 	fatal(t, problem)
 	defer store.Close()
-	plan := modelproduction.Plan{Destination: "acme/model", Release: "1.0.0",
+	plan := modelproduction.Plan{Destination: "acme/model",
 		Source:          "hf://acme/model@" + strings.Repeat("a", 40),
 		SourceSelection: "sha256:" + strings.Repeat("b", 64)}
 	data, err := plan.Bytes()

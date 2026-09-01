@@ -428,7 +428,7 @@ func (s *Store) MarkModelProductionArtifactPublished(operationID, stepName, outp
 		AND (publication_id='' OR publication_id=?)`, publicationID, operationID, stepName,
 		outputSlot, publicationID)
 	if err != nil {
-		return exit.Internalf("cannot record prepared model publication: %s", err)
+		return exit.Internalf("cannot record prepared checkpoint upload: %s", err)
 	}
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return exit.Named(exit.Conflict, "model_production.publication_conflict",

@@ -247,7 +247,7 @@ func TestOwnerCheckpointReadRoutesAuthenticate(t *testing.T) {
 	}
 }
 
-func TestPublicationFinalizesCheckpointAndCutsLaneMap(t *testing.T) {
+func TestPublicationFinalizesCheckpointThenUpdatesLaneMap(t *testing.T) {
 	evidenceBase64 := base64.StdEncoding.EncodeToString(releaseEvidence())
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -286,14 +286,17 @@ func TestPublicationFinalizesCheckpointAndCutsLaneMap(t *testing.T) {
 				t.Fatalf("cut request = %s %s", r.Method, r.URL.Path)
 			}
 			var body struct {
-				Operation string            `json:"operation"`
-				Lanes     map[string]string `json:"lanes"`
+				ExpectedRevision int64             `json:"expected_revision"`
+				SetLanes         map[string]string `json:"set_lanes"`
+				RemoveLanes      []string          `json:"remove_lanes"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Operation != "cut-manifest-proof" ||
-				!reflect.DeepEqual(body.Lanes, map[string]string{namedLane: "sha256:" + manifestA}) {
-				t.Fatalf("cut body = %#v, %v", body, err)
+			raw, readErr := io.ReadAll(r.Body)
+			if err := json.Unmarshal(raw, &body); readErr != nil || err != nil || body.ExpectedRevision != 0 ||
+				!reflect.DeepEqual(body.SetLanes, map[string]string{namedLane: "sha256:" + manifestA}) ||
+				len(body.RemoveLanes) != 0 || !bytes.Contains(raw, []byte(`"remove_lanes":[]`)) {
+				t.Fatalf("release update body = %#v, read %v", body, readErr)
 			}
-			_, _ = io.WriteString(w, `{"operation":"cut-manifest-proof","release":"1.0.0","repository_sha256":"`+manifestA+`","lanes":[{"lane":"`+namedLane+`","manifest":{"sha256":"`+manifestA+`","length":2},"contract":{"stamps":{},"structure":"sha256:`+topologyC+`","encoding":{"set":["bf16"]}},"objects":1,"bytes":7,"checkpoint_id":"sha256:`+manifestA+`"}],"duplicate":false}`)
+			_, _ = io.WriteString(w, `{"release":"1.0.0","revision":1,"yanked":false,"repository_sha256":"`+manifestA+`","lanes":[{"lane":"`+namedLane+`","checkpoint_id":"sha256:`+manifestA+`"}],"changed":true}`)
 		default:
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
@@ -319,11 +322,11 @@ func TestPublicationFinalizesCheckpointAndCutsLaneMap(t *testing.T) {
 		checkpoint.CheckpointEvidenceBase64 != evidenceBase64 {
 		t.Fatalf("FinalizePublication = %#v, %v", checkpoint, problem)
 	}
-	cut, problem := client.CutRelease(context.Background(), ref, "1.0.0", "cut-manifest-proof",
-		map[string]string{namedLane: checkpoint.CheckpointID}, "proof")
-	if problem != nil || cut.Operation != "cut-manifest-proof" || len(cut.Lanes) != 1 ||
-		cut.Lanes[0].Checkpoint != checkpoint.CheckpointID || cut.Lanes[0].Lane != namedLane {
-		t.Fatalf("CutRelease = %#v, %v", cut, problem)
+	updated, problem := client.UpdateModelRelease(context.Background(), ref, "1.0.0", 0,
+		map[string]string{namedLane: checkpoint.CheckpointID}, nil, "proof")
+	if problem != nil || updated.Revision != 1 || len(updated.Lanes) != 1 ||
+		updated.Lanes[0].CheckpointID != checkpoint.CheckpointID || updated.Lanes[0].Lane != namedLane {
+		t.Fatalf("UpdateModelRelease = %#v, %v", updated, problem)
 	}
 }
 
@@ -341,28 +344,28 @@ func TestPublicationResponsesRejectUnknownFields(t *testing.T) {
 	}
 }
 
-func TestNamedLanePublicationOperationIdentity(t *testing.T) {
+func TestCheckpointUploadOperationIdentity(t *testing.T) {
 	ref := hub.Ref{Org: "acme", Name: "model"}
 	manifestID := "sha256:" + manifestA
-	exact := transfer.PublicationOperationID(ref, "1.0.0", namedLane, manifestID)
-	wantSum := sha256.Sum256([]byte("model-publication-named-lane/1\x00" + ref.String() +
-		"\x00" + "1.0.0" + "\x00" + namedLane + "\x00" + manifestID))
+	exact := transfer.CheckpointOperationID(ref, manifestID)
+	wantSum := sha256.Sum256([]byte("model-checkpoint-upload/1\x00" + ref.String() +
+		"\x00" + manifestID))
 	if want := "manifest-" + hex.EncodeToString(wantSum[:]); exact != want {
-		t.Fatalf("named-lane operation = %s, want %s", exact, want)
+		t.Fatalf("checkpoint upload operation = %s, want %s", exact, want)
 	}
-	if replay := transfer.PublicationOperationID(ref, "1.0.0", namedLane, manifestID); replay != exact {
-		t.Fatalf("exact named-lane replay operation = %s, want %s", replay, exact)
+	if replay := transfer.CheckpointOperationID(ref, manifestID); replay != exact {
+		t.Fatalf("exact checkpoint replay operation = %s, want %s", replay, exact)
 	}
-	if changed := transfer.PublicationOperationID(ref, "1.0.0", "fp16", manifestID); changed == exact {
-		t.Fatalf("changed lane intent reused operation %s", exact)
+	if changed := transfer.CheckpointOperationID(ref, "sha256:"+strings.Repeat("b", 64)); changed == exact {
+		t.Fatalf("changed checkpoint reused operation %s", exact)
 	}
-	legacySum := sha256.Sum256([]byte(ref.String() + "\x00" + "1.0.0" + "\x00" + namedLane + "\x00" + manifestID))
+	legacySum := sha256.Sum256([]byte(ref.String() + "\x00" + manifestID))
 	if legacy := "manifest-" + hex.EncodeToString(legacySum[:]); legacy == exact {
-		t.Fatalf("named-lane protocol reused legacy operation %s", legacy)
+		t.Fatalf("checkpoint upload reused legacy operation %s", legacy)
 	}
 }
 
-func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
+func TestModelUploadBatchesFinalizesAndReplays(t *testing.T) {
 	const objectCount = 257
 	manifestID := "sha256:" + manifestA
 	manifest := []byte(`{}`)
@@ -404,7 +407,7 @@ func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
 	}
 	tool := &tfs.Tool{Bin: tfsPath, Root: toolDir}
 
-	var openCalls, grantCalls, uploadCalls, finalizeCalls, cutCalls atomic.Int32
+	var openCalls, grantCalls, uploadCalls, finalizeCalls atomic.Int32
 	publicationPath := "/v1/models/acme/model/publications/batch-proof"
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -453,14 +456,6 @@ func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
 					Encoding: hub.Encoding{Set: []string{"bf16"}}},
 				TopologyDigest: "sha256:" + topologyC, Objects: objectCount, Bytes: objectCount,
 				CheckpointEvidenceBase64: evidenceBase64, State: "checkpointed", Duplicate: call > 1})
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/models/acme/model/releases/1.0.0":
-			call := cutCalls.Add(1)
-			_ = json.NewEncoder(w).Encode(hub.CutReleaseResponse{Operation: "cut-batch-proof", Release: "1.0.0",
-				RepositorySHA256: manifestA, Lanes: []hub.CutLane{{Lane: namedLane,
-					Manifest: hub.ManifestRef{SHA256: manifestA, Length: int64(len(manifest))},
-					Contract: hub.Contract{Stamps: map[string][]string{}, Structure: "sha256:" + topologyC,
-						Encoding: hub.Encoding{Set: []string{"bf16"}}},
-					Objects: objectCount, Bytes: objectCount, Checkpoint: manifestID}}, Duplicate: call > 1})
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "unexpected", http.StatusNotFound)
@@ -468,11 +463,11 @@ func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
 	}))
 	defer server.Close()
 
-	publish := transfer.Publish{Tool: tool,
+	upload := transfer.Upload{Tool: tool,
 		Hub: hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("token")}, "test"),
 		Ref: hub.Ref{Org: "acme", Name: "model"}, ManifestID: manifestID,
-		Release: "1.0.0", Lane: namedLane, Session: "batch-proof", Reason: "proof", Scratch: t.TempDir()}
-	result, problem := publish.Run(context.Background())
+		Session: "batch-proof", Reason: "proof", Scratch: t.TempDir()}
+	result, problem := upload.Run(context.Background())
 	if problem != nil {
 		t.Fatal(problem)
 	}
@@ -480,7 +475,7 @@ func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
 		result.Moved != int64(objectCount+len(manifest)) {
 		t.Fatalf("publication result = %#v", result)
 	}
-	replayed, problem := publish.Run(context.Background())
+	replayed, problem := upload.Run(context.Background())
 	if problem != nil {
 		t.Fatal(problem)
 	}
@@ -488,15 +483,15 @@ func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
 		replayed.Deduped != int64(objectCount+len(manifest)) || replayed.Verified != objectCount {
 		t.Fatalf("replayed publication result = %#v", replayed)
 	}
-	publish.DryRun = true
-	planned, problem := publish.Run(context.Background())
+	upload.DryRun = true
+	planned, problem := upload.Run(context.Background())
 	if problem != nil || planned.Uploaded != 0 ||
 		planned.Deduped != int64(objectCount+len(manifest)) || planned.Verified != 0 {
 		t.Fatalf("committed dry-run result = %#v, %v", planned, problem)
 	}
 	if openCalls.Load() != 3 || grantCalls.Load() != 3 || uploadCalls.Load() != objectCount+1 ||
-		finalizeCalls.Load() != 2 || cutCalls.Load() != 2 {
-		t.Fatalf("publication calls: open=%d grants=%d uploads=%d finalize=%d cut=%d",
-			openCalls.Load(), grantCalls.Load(), uploadCalls.Load(), finalizeCalls.Load(), cutCalls.Load())
+		finalizeCalls.Load() != 2 {
+		t.Fatalf("upload calls: open=%d grants=%d uploads=%d finalize=%d",
+			openCalls.Load(), grantCalls.Load(), uploadCalls.Load(), finalizeCalls.Load())
 	}
 }

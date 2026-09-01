@@ -21,7 +21,7 @@ type productionProgress struct {
 }
 
 // NewModelProductionProgress is exported only across Cozy's internal product-test
-// boundary; the public CLI surface remains the model publish command itself.
+// boundary; the public CLI surface remains the model upload command itself.
 func NewModelProductionProgress(w io.Writer, human bool, totalSteps int) *productionProgress {
 	return &productionProgress{w: w, enabled: human, totalSteps: totalSteps,
 		stepStage: map[int]string{}, stepBand: map[int]int{}}
@@ -34,12 +34,12 @@ func (p *productionProgress) line(format string, args ...any) {
 	_ = output.Progress(p.w, fmt.Sprintf(format, args...))
 }
 
-func (p *productionProgress) Accepted(id string, lanes int) {
-	p.line("Model production %s accepted: %d steps, %d lanes.", id, p.totalSteps, lanes)
+func (p *productionProgress) Accepted(id string, outputs int) {
+	p.line("Model upload %s accepted: %d steps, %d outputs.", id, p.totalSteps, outputs)
 }
 
 func (p *productionProgress) Resume(id, stage string) {
-	p.line("Resuming model production %s: %s.", id, strings.TrimSuffix(stage, "."))
+	p.line("Resuming model upload %s: %s.", id, strings.TrimSuffix(stage, "."))
 }
 
 func (p *productionProgress) RentalSelecting(sku string) {
@@ -131,32 +131,36 @@ func (p *productionProgress) ArtifactAdopted(stepIndex, outputIndex, outputs int
 		stepIndex+1, p.totalSteps, stepName)
 }
 
-func (p *productionProgress) PublicationStarting(lane string) {
-	p.line("Publication: preparing lane %s.", lane)
+func (p *productionProgress) PublicationStarting(outputName string) {
+	p.line("Checkpoint: uploading output %s.", outputName)
 }
 
-func (p *productionProgress) PublicationPrepared(lane string) {
-	p.line("Publication: lane %s prepared.", lane)
+func (p *productionProgress) PublicationPrepared(outputName string) {
+	p.line("Checkpoint: output %s retained.", outputName)
 }
 
 func (p *productionProgress) StepCompleted(index int, name, callable string) {
 	p.line("Step %d/%d: completed %s (%s).", index+1, p.totalSteps, name, callable)
 }
 
-func (p *productionProgress) ReleaseStarting(release string, lanes []string) {
-	p.line("Release: cutting %s with %d lanes: %s.", release, len(lanes), strings.Join(lanes, ", "))
+func (p *productionProgress) StepFailed(index int, name string) {
+	p.line("Step %d/%d: %s failed; independent branches continue.", index+1, p.totalSteps, name)
 }
 
-func (p *productionProgress) ReleaseCut(release string, lanes int) {
-	p.line("Release: %s cut atomically with %d lanes.", release, lanes)
+func (p *productionProgress) StepSkipped(index int, name string) {
+	p.line("Step %d/%d: skipped %s because a dependency failed.", index+1, p.totalSteps, name)
+}
+
+func (p *productionProgress) OutputsRetained(outputs int) {
+	p.line("Upload: retained %d owner-only checkpoints.", outputs)
 }
 
 func (p *productionProgress) Cancellation(id string) {
-	p.line("Cancellation: model production %s stopped; cleanup is continuing.", id)
+	p.line("Cancellation: model upload %s stopped; cleanup is continuing.", id)
 }
 
 func (p *productionProgress) Failed(id string) {
-	p.line("Failure: model production %s stopped; cleanup is continuing.", id)
+	p.line("Failure: model upload %s stopped; cleanup is continuing.", id)
 }
 
 func (p *productionProgress) RentalReleaseStarting(id string) {
