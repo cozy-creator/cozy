@@ -659,8 +659,7 @@ func staged(w *worker, planID string) bool {
 
 func stagedFor(w *worker, req records.Request) bool {
 	if req.Worker != "" && w.spec.Connection != nil && !req.IsJob() {
-		_, ok := w.remotePlacements[remotePlanKey(pinnedPackage(req.Package, req.Worker), req.PlanID)]
-		return ok
+		return w.remoteStaged(pinnedPackage(req.Package, req.Worker), req.PlanID)
 	}
 	return staged(w, req.PlanID)
 }

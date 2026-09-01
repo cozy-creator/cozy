@@ -326,17 +326,19 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				row := remotePlacementObservation{
 					placementID: p.PlacementId, packageRevision: p.PackageRevisionDigest,
 					environmentDigest: p.EnvironmentDigest, configDigest: p.ConfigDigest,
-					serving: p.Serving, dispatchablePlanIDs: map[string]bool{},
+					serving: p.Serving, dispatchablePlanIDs: map[string]bool{}, knownPlanIDs: map[string]bool{},
 				}
 				for _, digest := range p.DispatchableBindingDigests {
 					planID := spellOf(digest)
 					row.dispatchablePlanIDs[planID] = true
+					row.knownPlanIDs[planID] = true
 					if p.Serving == pb.ServingState_SERVING_STATE_DISPATCHABLE {
 						dispatchable[planID] = true
 					}
 				}
 				for _, digest := range p.MaterializableBindingDigests {
 					planID := spellOf(digest)
+					row.knownPlanIDs[planID] = true
 					materializable[planID] = true
 				}
 				observed[p.PackageRevisionDigest] = row

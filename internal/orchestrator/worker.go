@@ -465,6 +465,7 @@ type remotePlacementObservation struct {
 	configDigest        string
 	serving             pb.ServingState
 	dispatchablePlanIDs map[string]bool
+	knownPlanIDs        map[string]bool
 }
 
 // dispatchableFor is the ROUTING GATE, and it is two questions with two owners (#482).
@@ -491,6 +492,15 @@ func (w *worker) remoteDispatchable(placement DesiredPlacement, planID string) b
 	return placement.PlacementIDValue != "" &&
 		observed.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
 		observed.dispatchablePlanIDs[planID]
+}
+
+func (w *worker) remoteStaged(packageName, planID string) bool {
+	placement, ok := w.remotePlacements[remotePlanKey(packageName, planID)]
+	if !ok {
+		return false
+	}
+	observed, ok := w.observedRemote[placement.PackageRevisionDigest]
+	return ok && observed.placementID == placement.PlacementIDValue && observed.knownPlanIDs[planID]
 }
 
 // admissible answers the worker-level half. CLOSED is STRUCTURAL (pre-snapshot-barrier,
