@@ -38,6 +38,7 @@ func (c *Orchestrator) runModelPassThrough(req records.Request) {
 		if problem != nil {
 			c.logf("pass-through model transfer %s settlement failed: %s", req.ID, problem.Message)
 		}
+		c.forgetTransferProgress(req.ID)
 		return
 	}
 	if problem == nil && transfer != nil {
@@ -48,7 +49,7 @@ func (c *Orchestrator) runModelPassThrough(req records.Request) {
 		if permanentTransferFailure(problem) {
 			_ = c.opt.Store.FailModelTransfer(req.ID, problem.ErrName(), problem.Message)
 			_, _ = c.opt.Store.SettleModelTransferRequest(req.ID, 0)
-			c.frames.forget(req.ID)
+			c.forgetTransferProgress(req.ID)
 			c.signalClosed(requestWaitKey(req.ID), problem)
 		} else {
 			time.AfterFunc(2*time.Second, func() { c.runModelPassThrough(req) })
@@ -62,6 +63,7 @@ func (c *Orchestrator) runModelPassThrough(req records.Request) {
 	if _, problem := c.opt.Store.SettleModelTransferRequest(req.ID, 0); problem != nil {
 		c.logf("pass-through model transfer %s settlement failed: %s", req.ID, problem.Message)
 	}
+	c.forgetTransferProgress(req.ID)
 }
 
 func (c *Orchestrator) moveModelTransferArtifact(ctx context.Context,
@@ -239,6 +241,13 @@ func (c *Orchestrator) publishTransferProgress(requestID string, value map[strin
 	c.mu.Unlock()
 	c.frames.publish(Frame{RequestID: requestID, Attempt: 0, Seq: seq,
 		Type: "progress", Value: value})
+}
+
+func (c *Orchestrator) forgetTransferProgress(requestID string) {
+	c.mu.Lock()
+	delete(c.transferProgressSeq, requestID)
+	c.mu.Unlock()
+	c.frames.forget(requestID)
 }
 
 func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req records.Request,

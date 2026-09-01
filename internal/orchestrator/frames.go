@@ -738,7 +738,11 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 		c.Requeue(req.ID, attempt.TerminalStatus+"/"+attempt.TerminalCause)
 		return
 	}
-	c.frames.forget(req.ID)
+	if req.ModelTransfer != nil {
+		c.forgetTransferProgress(req.ID)
+	} else {
+		c.frames.forget(req.ID)
+	}
 	c.signalClosed(requestWaitKey(req.ID), verdict)
 	c.releaseManaged(req)
 }

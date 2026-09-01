@@ -812,6 +812,7 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 			return
 		}
 		go c.cleanupRequestAssets(*row)
+		c.forgetTransferProgress(requestID)
 		c.logf("%s FAILED before any offer: %s", requestID, cause.Message)
 		c.signalClosed(requestWaitKey(requestID), cause)
 		return

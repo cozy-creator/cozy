@@ -466,6 +466,7 @@ func (c *Orchestrator) kickQueuedTransferDispatch(req records.Request) {
 		}
 		if problem.Code != exit.Unavailable && problem.Code != exit.Conflict {
 			c.failQueued(req.ID, problem)
+			go c.drain()
 			return
 		}
 		current, readProblem := c.opt.Store.RequestRow(req.ID)
@@ -811,7 +812,11 @@ func (c *Orchestrator) CancelQueued(requestID string) *exit.Error {
 	}
 	abortProblem := c.cancelPrivateTransfer(requestID)
 	c.forget(requestID)
-	c.frames.forget(requestID)
+	if row.ModelTransfer != nil {
+		c.forgetTransferProgress(requestID)
+	} else {
+		c.frames.forget(requestID)
+	}
 	c.logf("%s left the dispatch queue: canceled before any attempt", requestID)
 	c.signalClosed(requestWaitKey(requestID),
 		exit.New(exit.Canceled, "%s was canceled before any attempt was dispatched", requestID))
