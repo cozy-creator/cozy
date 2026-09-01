@@ -70,6 +70,9 @@ type Submission struct {
 	// Trees are the job's typed input TREES as `ref=dir`, one grant input each.
 	Trees       []string
 	JobGPUCount int64
+	// JobRequires is descriptor-derived admission data used to validate a
+	// model-transfer resource envelope before persistence.
+	JobRequires string
 
 	// Worker pins this request to an ATTACHED remote worker (a rental id resolved
 	// through Options.Rentals). Empty = any local worker.
@@ -324,7 +327,9 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 		return 0, nil
 	}
 	if req.RentalRequired && req.Worker == "" {
-		c.enqueue(req.ID)
+		if !c.enqueue(req.ID) {
+			return 0, nil
+		}
 		c.emit(req.ID, "request.queued", 0, map[string]any{
 			"reason":   "remote rental required; local capacity is intentionally skipped",
 			"position": c.QueuePosition(req.ID),
@@ -340,7 +345,9 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 	// submissions settled FIRST. So: with a queue, join it; the drain below still runs
 	// immediately, so the head goes out now rather than at the next Report (cr-019).
 	if c.queueDepth() > 0 {
-		c.enqueue(req.ID)
+		if !c.enqueue(req.ID) {
+			return 0, nil
+		}
 		c.emit(req.ID, "request.queued", 0, map[string]any{
 			"reason":   "the dispatch queue is not empty; this request joins it in submission order",
 			"position": c.QueuePosition(req.ID),
@@ -361,7 +368,9 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 			c.failQueued(req.ID, e)
 			return 0, e
 		}
-		c.enqueue(req.ID)
+		if !c.enqueue(req.ID) {
+			return 0, nil
+		}
 		c.emit(req.ID, "request.queued", 0, map[string]any{"reason": e.Message})
 		c.logf("%s QUEUED for capacity: %s", req.ID, e.Message)
 		c.selectOrStart(req)
@@ -818,6 +827,7 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 		if _, problem := c.opt.Store.FailModelTransferRequest(requestID, cause.ErrName(),
 			cause.Message, payload); problem != nil {
 			c.logf("%s model transfer failure could not settle: %s", requestID, problem.Message)
+			time.AfterFunc(2*time.Second, func() { c.failQueued(requestID, cause) })
 			return
 		}
 		go c.cleanupRequestAssets(*row)
@@ -826,8 +836,14 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 		c.signalClosed(requestWaitKey(requestID), cause)
 		return
 	}
-	if e := c.opt.Store.SettleRequest(requestID, "failed"); e != nil {
+	applied, e := c.opt.Store.FailQueuedRequest(requestID, payload)
+	if e != nil {
 		c.logf("%s could not be settled: %s", requestID, e.Message)
+		time.AfterFunc(2*time.Second, func() { c.failQueued(requestID, cause) })
+		return
+	}
+	if !applied {
+		return
 	} else {
 		// An --out row is created with the request, before attempt 1 exists. Failure at
 		// placement therefore still owes that row a durable `skipped` settlement; leaving
@@ -838,7 +854,6 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 	if row, e := c.opt.Store.RequestRow(requestID); e == nil && row != nil {
 		go c.cleanupRequestAssets(*row)
 	}
-	c.emit(requestID, "request.failed", 0, payload)
 	c.logf("%s FAILED before any offer: %s", requestID, cause.Message)
 	c.signalClosed(requestWaitKey(requestID), cause)
 	if row, problem := c.opt.Store.RequestRow(requestID); problem == nil && row != nil {

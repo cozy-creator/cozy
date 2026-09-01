@@ -49,8 +49,8 @@ func (s *Server) unload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
-	s.lifecycle.Lock()
-	defer s.lifecycle.Unlock()
+	s.shutdownAdmission.Lock()
+	defer s.shutdownAdmission.Unlock()
 	if s.shuttingDown {
 		s.ok(w, r, http.StatusAccepted, DownResult{ShuttingDown: true})
 		return

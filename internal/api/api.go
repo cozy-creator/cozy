@@ -86,11 +86,11 @@ type Server struct {
 	// cooperative tier (#449). The route refuses when the builder wired none.
 	shutdown func()
 
-	// lifecycle serializes ordinary mutations against the safe-down fence. Once down
-	// commits, no request can slip in after the active-work read and before listeners
-	// close; mutations already in flight finish before the fence reads the records.
-	lifecycle    sync.RWMutex
-	shuttingDown bool
+	// shutdownAdmission closes one race: a mutation may not commit between `down`'s
+	// active-work read and listener shutdown. Handlers hold the shared side only for
+	// bounded admission work; provider acquisition and execution start afterward.
+	shutdownAdmission sync.RWMutex
+	shuttingDown      bool
 }
 
 // Resolver exposes control-plane placement facts separately from a local worker launch.
@@ -105,8 +105,7 @@ type Resolver interface {
 	ResolveRemoteRelease(pkg, release, digest, function string, models []orchestrator.ModelRef) (
 		orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error)
 	ResolveRemoteJob(pkg, release, digest, function string, models []orchestrator.ModelRef,
-		deferredModels bool) (
-		orchestrator.LogicalJob, *exit.Error)
+		deferredModels bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error)
 	Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error)
 	// Jobs names the `@job` functions one installed package registers, with the
 	// descriptor id each resolves to. The job submit route resolves a function to its
@@ -142,6 +141,37 @@ func New(opt Options) *Server {
 		addr: opt.Addr, log: opt.Log, web: opt.Web, packages: opt.Packages,
 		rentals: opt.Rentals, shutdown: opt.Shutdown,
 	}
+}
+
+// activateRecorded starts capacity selection only after the HTTP authority has durably
+// recorded the request. Provider acquisition and worker preparation may take minutes; neither
+// belongs under the short shutdown-admission gate.
+func (s *Server) activateRecorded(request records.Request) {
+	go func() {
+		if _, problem := s.orchestrator.ActivateRecordedRequest(request); problem != nil {
+			fmt.Fprintf(s.log, "request %s activation: %s\n", request.ID, problem.Message)
+		}
+	}()
+}
+
+// recordSubmission is the complete shutdown race boundary. Descriptor resolution and
+// payload validation happen before it; provider work happens after it. The lock protects
+// only the durable row insertion against `down`'s final active-work snapshot.
+func (s *Server) recordSubmission(spec orchestrator.Submission,
+	newRequest bool,
+) (records.Request, bool, *exit.Error) {
+	if newRequest && spec.Rental && s.cfg.RentalsMaxHourlySpendUSDMicros <= 0 {
+		return records.Request{}, false, exit.Named(exit.Validation,
+			"rental.spend_cap_required",
+			"rented execution requires a positive rentals.max_hourly_spend_usd")
+	}
+	s.shutdownAdmission.RLock()
+	defer s.shutdownAdmission.RUnlock()
+	if s.shuttingDown {
+		return records.Request{}, false, exit.Named(exit.Unavailable,
+			"daemon_shutting_down", "the daemon has accepted shutdown and no longer admits work")
+	}
+	return s.orchestrator.RecordSubmission(spec)
 }
 
 // Handler is the whole surface, wrapped in the guard chain. Routes are registered FROM
@@ -269,9 +299,10 @@ func (s *Server) guard(route Route, h http.HandlerFunc) http.Handler {
 				"one key names one request forever; retrying under it is safe by construction")
 			return
 		}
-		if route.Mutation && route.Path != "/v1/local/daemon/down" {
-			s.lifecycle.RLock()
-			defer s.lifecycle.RUnlock()
+		if route.Mutation && route.Path != "/v1/local/daemon/down" &&
+			route.Path != "/v1/requests" && route.Path != "/v1/local/jobs" {
+			s.shutdownAdmission.RLock()
+			defer s.shutdownAdmission.RUnlock()
 			if s.shuttingDown {
 				s.refuse(w, r, http.StatusServiceUnavailable, "daemon_shutting_down",
 					"the daemon has accepted shutdown and no longer admits mutations",

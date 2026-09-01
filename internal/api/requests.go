@@ -169,21 +169,19 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	spec.BodyDigest = digest
 
-	requestID, attempt, fresh, e := s.orchestrator.SubmitDetail(spec)
+	recorded, fresh, e := s.recordSubmission(spec, existing == nil)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	row, e := s.store.RequestRow(requestID)
-	if e != nil || row == nil {
-		s.refuse(w, r, http.StatusInternalServerError, "internal",
-			"the request was recorded and cannot be read back", "")
-		return
+	attempt := uint64(recorded.Ordinal)
+	if fresh {
+		defer s.activateRecorded(recorded)
 	}
-	handle := s.handleOf(*row, attempt)
+	handle := s.handleOf(recorded, attempt)
 	handle.Replay = !fresh
 	if handle.Replay && (handle.Status == "completed" || handle.Status == "failed" || handle.Status == "canceled") {
-		s.orchestrator.RetryOutputExport(row.ID)
+		s.orchestrator.RetryOutputExport(recorded.ID)
 	}
 	// 202 means "this host started work", and it may not be said twice for one key.
 	// A recorded answer is a 200 with the same handle: the client already has it.

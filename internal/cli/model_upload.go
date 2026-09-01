@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -585,37 +584,10 @@ func parseProductionCallable(value string) (productionCallable, *exit.Error) {
 		Function: parts[2]}, nil
 }
 
-var productionResourcePattern = regexp.MustCompile(`^(sm|vram|ram)([1-9][0-9]*)(\+|g)?$`)
-
 func productionResourceNeeds(gpuCount int64, requires []string) (modeltransfer.ResourceNeeds, *exit.Error) {
-	needs := modeltransfer.ResourceNeeds{GPUCount: gpuCount}
-	for _, value := range requires {
-		match := productionResourcePattern.FindStringSubmatch(strings.ToLower(value))
-		if len(match) != 4 || match[1] == "sm" && match[3] != "+" ||
-			match[1] != "sm" && match[3] != "g" {
-			return needs, exit.Named(exit.Validation, "model_transfer.resource_unknown",
-				"producer resource requirement %q is not smN+, vramNg, or ramNg", value)
-		}
-		amount, err := strconv.ParseInt(match[2], 10, 64)
-		if err != nil {
-			return needs, exit.Named(exit.Validation, "model_transfer.resource_invalid",
-				"producer resource requirement %q is outside the supported range", value)
-		}
-		switch match[1] {
-		case "sm":
-			needs.MinSM = max(needs.MinSM, amount)
-		case "vram":
-			needs.VRAMGB = max(needs.VRAMGB, amount)
-		case "ram":
-			needs.RAMGB = max(needs.RAMGB, amount)
-		}
-	}
-	if needs.GPUCount == 0 && needs.MinSM == 0 && needs.VRAMGB == 0 {
-		return needs, nil
-	}
-	if needs.GPUCount != 1 || needs.MinSM == 0 || needs.VRAMGB == 0 || needs.RAMGB == 0 {
-		return needs, exit.Named(exit.Validation, "model_transfer.resources_incomplete",
-			"rented producer job requires exactly one GPU plus explicit smN+, vramNg, and ramNg floors")
+	needs, err := modeltransfer.ParseResourceNeeds(gpuCount, strings.Join(requires, ","))
+	if err != nil {
+		return needs, exit.Named(exit.Validation, "model_transfer.resource_invalid", "%s", err)
 	}
 	return needs, nil
 }

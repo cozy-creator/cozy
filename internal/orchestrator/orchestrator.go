@@ -143,6 +143,7 @@ type LogicalJob struct {
 	Outputs         []string
 	ArtifactOutputs []ArtifactOutput
 	GPUCount        int64
+	Requires        string
 	Models          []ModelRef
 	SourceProfiles  map[string]string
 }
@@ -381,15 +382,24 @@ func (c *Orchestrator) signalClosed(k string, e *exit.Error) {
 }
 
 // enqueue parks a request until some worker advertises its binding as ready.
-func (c *Orchestrator) enqueue(requestID string) {
+func (c *Orchestrator) enqueue(requestID string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Cancellation and asynchronous activation race at this boundary. Read the
+	// durable state while holding the same lock CancelQueued uses to remove an id:
+	// either activation appends first and cancel removes it, or activation observes
+	// the absorbing terminal and appends nothing.
+	row, problem := c.opt.Store.RequestRow(requestID)
+	if problem != nil || row == nil || settledState(row.State) {
+		return false
+	}
 	for _, id := range c.pending {
 		if id == requestID {
-			return
+			return true
 		}
 	}
 	c.pending = append(c.pending, requestID)
+	return true
 }
 
 // drain dispatches everything the newly-ready capacity can now take. Called when a
@@ -409,6 +419,10 @@ func (c *Orchestrator) drain() {
 	for _, id := range queued {
 		req, e := c.opt.Store.RequestRow(id)
 		if e != nil || req == nil {
+			c.forget(id)
+			continue
+		}
+		if settledState(req.State) {
 			c.forget(id)
 			continue
 		}

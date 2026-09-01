@@ -449,60 +449,60 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function st
 func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string,
 	models []orchestrator.ModelRef, deferredModels bool,
 ) (
-	orchestrator.LogicalJob, *exit.Error,
+	orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error,
 ) {
 	var empty orchestrator.LogicalJob
 	if _, err := canonical.Raw(releaseDigest); err != nil || release == "" {
-		return empty, exit.Named(exit.Structural, "rental.package_release_digest_invalid",
+		return empty, nil, exit.Named(exit.Structural, "rental.package_release_digest_invalid",
 			"remote package release identity is incomplete")
 	}
 	ref, problem := hub.ParseRef(pkg)
 	if problem != nil {
-		return empty, problem
+		return empty, nil, problem
 	}
 	ctx, cancel := hub.Context()
 	defer cancel()
 	detail, problem := r.catalog.PackageRelease(ctx, ref, release)
 	if problem != nil {
-		return empty, problem
+		return empty, nil, problem
 	}
 	if detail.Release.Release != release || detail.Release.ReleaseDigest != releaseDigest ||
 		detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
-		return empty, exit.Named(exit.Conflict, "rental.package_release_changed",
+		return empty, nil, exit.Named(exit.Conflict, "rental.package_release_changed",
 			"Tensorhub release %s@%s does not match the queued immutable release", pkg, release)
 	}
 	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
 	if problem != nil || descriptor.Digest != detail.Release.PackageDescriptorDigest {
-		return empty, exit.Named(exit.Conflict, "rental.package_descriptor_digest_mismatch",
+		return empty, nil, exit.Named(exit.Conflict, "rental.package_descriptor_digest_mismatch",
 			"Tensorhub descriptor bytes do not match their release fact")
 	}
 	job, problem := descriptor.Function(function)
 	if problem != nil {
-		return empty, problem
+		return empty, nil, problem
 	}
 	if job.Kind != "job" || job.DescriptorID == "" {
-		return empty, exit.Named(exit.Validation, "rental.job_descriptor_invalid",
+		return empty, nil, exit.Named(exit.Validation, "rental.job_descriptor_invalid",
 			"%s is not a published job callable", function)
 	}
 	models = append([]orchestrator.ModelRef(nil), models...)
 	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
 	if !deferredModels && len(models) != len(job.Models) {
-		return empty, exit.Named(exit.Validation, "rental.job_model_selection_incomplete",
+		return empty, nil, exit.Named(exit.Validation, "rental.job_model_selection_incomplete",
 			"remote job %s requires exactly %d model Manifest binding(s)", function, len(job.Models))
 	}
 	byParam := make(map[string]orchestrator.ModelRef, len(models))
 	for _, model := range models {
 		if model.Package != pkg || model.Slot == "" || model.Model == "" ||
 			model.ManifestLength <= 0 || model.ManifestLength > (int64(1)<<53)-1 {
-			return empty, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
+			return empty, nil, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
 				"remote job %s carries an incomplete model Manifest binding", function)
 		}
 		if _, exists := byParam[model.Slot]; exists {
-			return empty, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
+			return empty, nil, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
 				"remote job %s repeats model parameter %s", function, model.Slot)
 		}
 		if _, err := canonical.Raw(model.Manifest); err != nil {
-			return empty, exit.Named(exit.Validation, "rental.job_model_manifest_invalid",
+			return empty, nil, exit.Named(exit.Validation, "rental.job_model_manifest_invalid",
 				"remote job %s model parameter %s has no exact Manifest digest", function, model.Slot)
 		}
 		byParam[model.Slot] = model
@@ -512,11 +512,11 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 			continue
 		}
 		if _, ok := byParam[slot.Param]; !ok {
-			return empty, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
+			return empty, nil, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
 				"remote job %s does not bind model parameter %s", function, slot.Param)
 		}
 		if len(slot.Stamps) != 0 {
-			return empty, exit.Named(exit.Unavailable, "rental.job_model_stamps_unsupported",
+			return empty, nil, exit.Named(exit.Unavailable, "rental.job_model_stamps_unsupported",
 				"remote job %s model parameter %s uses unsupported stamps", function, slot.Param)
 		}
 	}
@@ -541,9 +541,10 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 	return orchestrator.LogicalJob{
 		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
 		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
-		ArtifactOutputs: artifacts, GPUCount: job.Resources.GPUCount, Models: models,
+		ArtifactOutputs: artifacts, GPUCount: job.Resources.GPUCount,
+		Requires: job.Resources.Requires, Models: models,
 		SourceProfiles: profiles,
-	}, nil
+	}, job, nil
 }
 
 func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error) {

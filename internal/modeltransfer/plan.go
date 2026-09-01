@@ -10,7 +10,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/launch"
 )
@@ -107,6 +110,49 @@ type ResourceNeeds struct {
 	MinSM    int64 `json:"min_sm"`
 	VRAMGB   int64 `json:"vram_gb"`
 	RAMGB    int64 `json:"ram_gb"`
+}
+
+var resourcePattern = regexp.MustCompile(`^(sm|vram|ram)([1-9][0-9]*)(\+|g)$`)
+var cudaResourcePattern = regexp.MustCompile(`^cuda[1-9][0-9]*\.[0-9]+\+$`)
+
+// ParseResourceNeeds is the one translation from a PackageDescriptor resource string
+// to the exact rental-sizing facts retained by a model transfer. CUDA compatibility is
+// selected by the base worker image and therefore contributes no sizing field here.
+func ParseResourceNeeds(gpuCount int64, requires string) (ResourceNeeds, error) {
+	needs := ResourceNeeds{GPUCount: gpuCount}
+	for _, raw := range strings.Split(requires, ",") {
+		value := strings.ToLower(strings.TrimSpace(raw))
+		if value == "" {
+			continue
+		}
+		if cudaResourcePattern.MatchString(value) {
+			continue
+		}
+		match := resourcePattern.FindStringSubmatch(value)
+		if len(match) != 4 || match[1] == "sm" && match[3] != "+" ||
+			match[1] != "sm" && match[3] != "g" {
+			return needs, fmt.Errorf("resource requirement %q is not smN+, vramNg, ramNg, or cudaN.N+", raw)
+		}
+		amount, err := strconv.ParseInt(match[2], 10, 64)
+		if err != nil {
+			return needs, fmt.Errorf("resource requirement %q is outside the supported range", raw)
+		}
+		switch match[1] {
+		case "sm":
+			needs.MinSM = max(needs.MinSM, amount)
+		case "vram":
+			needs.VRAMGB = max(needs.VRAMGB, amount)
+		case "ram":
+			needs.RAMGB = max(needs.RAMGB, amount)
+		}
+	}
+	if needs.GPUCount == 0 && needs.MinSM == 0 && needs.VRAMGB == 0 {
+		return needs, nil
+	}
+	if needs.GPUCount != 1 || needs.MinSM == 0 || needs.VRAMGB == 0 || needs.RAMGB == 0 {
+		return needs, fmt.Errorf("GPU producer requires exactly one GPU plus explicit smN+, vramNg, and ramNg floors")
+	}
+	return needs, nil
 }
 
 // Bytes is the restart record. It contains only immutable identities and
