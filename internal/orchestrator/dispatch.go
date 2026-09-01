@@ -142,8 +142,8 @@ func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.E
 	return req.ID, attempt, true, e
 }
 
-// ActivateRecordedRequest is the second half used by model productions after
-// their step row has durably joined the freshly minted request id.
+// ActivateRecordedRequest is the second half for callers that transactionally
+// attach request sidecars before ordinary queue activation.
 func (c *Orchestrator) ActivateRecordedRequest(req records.Request) (uint64, *exit.Error) {
 	return c.activateRecorded(req)
 }

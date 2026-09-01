@@ -59,11 +59,11 @@ func ParseInstruction(data []byte) (Instruction, error) {
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
-		return instruction, fmt.Errorf("model production instruction carries trailing JSON")
+		return instruction, fmt.Errorf("model transfer instruction carries trailing JSON")
 	}
 	canonical, err := instruction.Bytes()
 	if err != nil || !bytes.Equal(canonical, data) {
-		return instruction, fmt.Errorf("model production instruction is not the one canonical spelling")
+		return instruction, fmt.Errorf("model transfer instruction is not the one canonical spelling")
 	}
 	return instruction, nil
 }
@@ -123,11 +123,11 @@ func Parse(data []byte) (Plan, error) {
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
-		return plan, fmt.Errorf("model production plan carries trailing JSON")
+		return plan, fmt.Errorf("model transfer plan carries trailing JSON")
 	}
 	canonical, err := plan.Bytes()
 	if err != nil || !bytes.Equal(canonical, data) {
-		return plan, fmt.Errorf("model production plan is not the one canonical spelling")
+		return plan, fmt.Errorf("model transfer plan is not the one canonical spelling")
 	}
 	return plan, nil
 }

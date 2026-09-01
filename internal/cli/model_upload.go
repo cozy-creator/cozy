@@ -302,7 +302,7 @@ func canonicalProductionSource(ctx *Context, raw string) (string, *exit.Error) {
 	}
 	name, release, pinned := strings.Cut(raw, "@")
 	if !pinned || strings.TrimSpace(release) == "" {
-		return "", exit.Usagef("model production source %q is not pinned to one Tensorhub release", raw).
+		return "", exit.Usagef("model transfer source %q is not pinned to one Tensorhub release", raw).
 			WithRemedy("use org/model@release; mutable source latest cannot enter operation identity")
 	}
 	ref, problem := hub.ParseRef(name)
@@ -493,7 +493,7 @@ func resolveProductionPackage(ctx *Context, packageName string, remote bool) (pr
 		install, problem := installedPackage(ctx, key)
 		if problem != nil {
 			return productionPackage{}, problem.WithRemedy(
-				"install every exact production package before running it locally")
+				"install the exact producer package before running it locally")
 		}
 		facts, problem := launch.Read(*install, ctx.Cfg.Home, ctx.Cfg.Tool())
 		if problem != nil {
@@ -589,12 +589,12 @@ func productionResourceNeeds(gpuCount int64, requires []string) (modeltransfer.R
 		if len(match) != 4 || match[1] == "sm" && match[3] != "+" ||
 			match[1] != "sm" && match[3] != "g" {
 			return needs, exit.Named(exit.Validation, "model_transfer.resource_unknown",
-				"production resource requirement %q is not smN+, vramNg, or ramNg", value)
+				"producer resource requirement %q is not smN+, vramNg, or ramNg", value)
 		}
 		amount, err := strconv.ParseInt(match[2], 10, 64)
 		if err != nil {
 			return needs, exit.Named(exit.Validation, "model_transfer.resource_invalid",
-				"production resource requirement %q is outside the supported range", value)
+				"producer resource requirement %q is outside the supported range", value)
 		}
 		switch match[1] {
 		case "sm":
@@ -610,7 +610,7 @@ func productionResourceNeeds(gpuCount int64, requires []string) (modeltransfer.R
 	}
 	if needs.GPUCount != 1 || needs.MinSM == 0 || needs.VRAMGB == 0 || needs.RAMGB == 0 {
 		return needs, exit.Named(exit.Validation, "model_transfer.resources_incomplete",
-			"rented model production requires exactly one GPU plus explicit smN+, vramNg, and ramNg floors")
+			"rented producer job requires exactly one GPU plus explicit smN+, vramNg, and ramNg floors")
 	}
 	return needs, nil
 }
