@@ -66,6 +66,77 @@ func handleAuthStatus(ctx *Context) *exit.Error {
 	return emitAuthSession(ctx, session, "logged in", nil, "cozy auth login <email>")
 }
 
+func handleAuthLogout(ctx *Context) *exit.Error {
+	manager := ctx.AccountAuth
+	if manager == nil {
+		manager = accountauth.New(ctx.Cfg)
+	}
+	hctx, cancel := hub.Context()
+	session, problem := manager.Authenticate(hctx)
+	cancel()
+	if problem != nil {
+		return problem
+	}
+	hctx, cancel = hub.Context()
+	problem = client(ctx).WithToken(session.AccessToken, "machine login").RevokeDeviceKey(hctx, session.DeviceKeyID)
+	cancel()
+	if problem != nil {
+		return problem
+	}
+	if problem := manager.DeleteCredential(session.DeviceKeyID); problem != nil {
+		return problem
+	}
+	return emit(ctx, compactRecord([]output.Field{
+		{K: "status", V: "logged out"},
+		{K: "email", V: session.Email},
+		{K: "hub", V: ctx.Cfg.HubURL},
+	}, "status", "email"))
+}
+
+func handleAuthRevokeOtherMachines(ctx *Context) *exit.Error {
+	manager := ctx.AccountAuth
+	if manager == nil {
+		manager = accountauth.New(ctx.Cfg)
+	}
+	hctx, cancel := hub.Context()
+	session, problem := manager.Authenticate(hctx)
+	cancel()
+	if problem != nil {
+		return problem
+	}
+	hctx, cancel = hub.Context()
+	enrollment, expires, problem := manager.BeginEmailProof(hctx)
+	cancel()
+	if problem != nil {
+		return problem
+	}
+	input := bufio.NewReader(os.Stdin) //cozy:stdin-value email recovery proof never enters argv
+	fmt.Fprintf(ctx.Err, "A verification code was sent to %s (expires %s).\nCode: ",
+		session.Email, expires.Local().Format("15:04:05 MST"))
+	code, err := input.ReadString('\n')
+	if err != nil && strings.TrimSpace(code) == "" {
+		return exit.Named(exit.Credential, "auth.code_unreadable",
+			"the email verification code could not be read: %s", err)
+	}
+	hctx, cancel = hub.Context()
+	proof, problem := manager.FinishEmailProof(hctx, enrollment, code)
+	cancel()
+	if problem != nil {
+		return problem
+	}
+	hctx, cancel = hub.Context()
+	problem = client(ctx).WithToken(proof.AccessToken, "verified email").RevokeOtherDeviceKeys(hctx)
+	cancel()
+	if problem != nil {
+		return problem
+	}
+	return emit(ctx, compactRecord([]output.Field{
+		{K: "status", V: "other machines revoked"},
+		{K: "email", V: session.Email},
+		{K: "hub", V: ctx.Cfg.HubURL},
+	}, "status", "email"))
+}
+
 func canEnroll(problem *exit.Error) bool {
 	if problem == nil {
 		return false

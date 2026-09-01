@@ -234,8 +234,8 @@ func (c *Client) WithToken(v secret.Value, source string) *Client {
 	return &d
 }
 
-// WithTokenSource returns a copy that obtains a short user bearer when no explicit
-// operator token is configured. A configured token remains an intentional override.
+// WithTokenSource returns a copy that prefers a short user bearer. A configured
+// operator token is only the fallback when this machine has never enrolled.
 func (c *Client) WithTokenSource(source TokenSource) *Client {
 	d := *c
 	d.tokens = source
@@ -326,10 +326,12 @@ func resourcePath(collection string, ref Ref) string {
 
 func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	token := c.token
-	if cl.auth && !token.Present() && c.tokens != nil {
-		var problem *exit.Error
-		token, problem = c.tokens.AccessToken(ctx)
-		if problem != nil {
+	if cl.auth && c.tokens != nil {
+		userToken, problem := c.tokens.AccessToken(ctx)
+		switch {
+		case problem == nil:
+			token = userToken
+		case !token.Present() || problem.ErrName() != "auth.machine_key_missing":
 			return problem
 		}
 	}

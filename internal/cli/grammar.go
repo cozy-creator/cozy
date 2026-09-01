@@ -18,8 +18,10 @@ type CLI struct {
 }
 
 type AuthCmd struct {
-	Login   AuthLoginCmd `cmd:"" help:"Register or authenticate this machine by email."`
-	Current AuthCurrent  `cmd:"" default:"1" hidden:""`
+	Login               AuthLoginCmd               `cmd:"" help:"Register or authenticate this machine by email."`
+	Logout              AuthLogoutCmd              `cmd:"" help:"Revoke this machine and erase its local key."`
+	RevokeOtherMachines AuthRevokeOtherMachinesCmd `cmd:"" help:"Revoke every other machine after email verification."`
+	Current             AuthCurrent                `cmd:"" default:"1" hidden:""`
 }
 
 type AuthCurrent struct{}
@@ -34,6 +36,18 @@ type AuthLoginCmd struct {
 
 func (c *AuthLoginCmd) Run(r *Runtime) error {
 	return r.call(handleAuthLogin, []string{c.Email}, nil, nil, false)
+}
+
+type AuthLogoutCmd struct{}
+
+func (c *AuthLogoutCmd) Run(r *Runtime) error {
+	return r.call(handleAuthLogout, nil, nil, nil, false)
+}
+
+type AuthRevokeOtherMachinesCmd struct{}
+
+func (c *AuthRevokeOtherMachinesCmd) Run(r *Runtime) error {
+	return r.call(handleAuthRevokeOtherMachines, nil, nil, nil, false)
 }
 
 type PackageCmd struct {
