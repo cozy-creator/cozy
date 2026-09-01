@@ -2,8 +2,13 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -63,11 +68,18 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	}); problem != nil {
 		return problem
 	}
-	paths := packagepublish.Paths(pack.Files)
-	dependencyWheels := packagepublish.WheelFilenames(pack.DependencyWheels)
-	packagePublishStatus(ctx, "Declaring %d source files and %d dependency wheels...",
-		len(paths), len(dependencyWheels))
-	draft, problem := c.DeclarePackageRelease(hctx, ref, release, paths, dependencyWheels, reason)
+	if problem := packagePublishStage(ctx, "Deriving evidence for declared model pairs", func() *exit.Error {
+		return pack.DeriveEvidence(hctx, account.Name, deriveInputResolver(c))
+	}); problem != nil {
+		return problem
+	}
+	declared, registry, locals, problem := packageDeclaration(pack)
+	if problem != nil {
+		return problem
+	}
+	packagePublishStatus(ctx, "Declaring %d files and %d registry rows...",
+		len(declared), len(registry))
+	draft, problem := c.DeclarePackageRelease(hctx, ref, release, declared, reason)
 	if problem != nil {
 		return problem
 	}
@@ -76,7 +88,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	}
 	var moved int64
 	if draft.State == "pending" {
-		moved, problem = uploadPackageFiles(hctx, pack, draft.Uploads,
+		moved, problem = uploadPackageFiles(hctx, declared, locals, draft.Files,
 			packageUploadCounter(ctx))
 		if problem != nil {
 			return problem
@@ -87,7 +99,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	var done hub.PackageReleaseCommit
 	problem = packagePublishStage(ctx, "Committing exact package release", func() *exit.Error {
 		var finalProblem *exit.Error
-		done, finalProblem = c.CommitPackageRelease(hctx, ref, release, reason)
+		done, finalProblem = c.CommitPackageRelease(hctx, ref, release, declared, registry, reason)
 		return finalProblem
 	})
 	if problem != nil {
@@ -143,72 +155,126 @@ func handlePackageYank(ctx *Context) *exit.Error {
 	}, "package", "release", "status"))
 }
 
+// deriveInputResolver turns a declared "org/model/lane" profile into the
+// evidence run's exact inputs through the hub's derive-inputs read.
+func deriveInputResolver(c *hub.Client) packagepublish.ProfileResolver {
+	return func(ctx context.Context, model, lane string) (packagepublish.DeriveInput, *exit.Error) {
+		ref, problem := hub.ParseRef(model)
+		if problem != nil {
+			return packagepublish.DeriveInput{}, problem.
+				WithRemedy("declare the source profile as <org>/<model>/<lane>")
+		}
+		resolved, problem := c.ModelDeriveInputs(ctx, ref, lane)
+		if problem != nil {
+			return packagepublish.DeriveInput{}, problem
+		}
+		config, err := base64.StdEncoding.DecodeString(resolved.ConfigBase64)
+		if err != nil || int64(len(config)) != resolved.ConfigLength {
+			return packagepublish.DeriveInput{}, exit.Named(exit.Structural,
+				"hub.derive_inputs_invalid", "Tensorhub returned invalid derive inputs for %s", model)
+		}
+		sum := sha256.Sum256(config)
+		if resolved.ConfigDigest != "sha256:"+hex.EncodeToString(sum[:]) {
+			return packagepublish.DeriveInput{}, exit.Named(exit.Conflict,
+				"hub.derive_inputs_invalid", "derive-input config bytes do not match their digest")
+		}
+		return packagepublish.DeriveInput{Snapshot: resolved.Snapshot,
+			ConfigDigest: resolved.ConfigDigest, ConfigBytes: config,
+			Variants: resolved.HardwareVariants}, nil
+	}
+}
+
+// packageDeclaration renders the complete digest declaration: every local
+// subject hashed here, plus the registry rows the hub fetches itself.
+func packageDeclaration(pack *packagepublish.Package) (
+	[]hub.PackageDeclaredFile, []hub.PackageRegistryRow, map[string]string, *exit.Error,
+) {
+	locals := map[string]string{}
+	for path, local := range pack.Files {
+		locals[path] = local
+	}
+	locals["project.whl"] = pack.Wheel
+	locals["descriptor.json"] = pack.Descriptor
+	for _, dependency := range pack.DependencyWheels {
+		locals[dependency.Filename] = dependency.Path
+	}
+	for path, local := range pack.Evidence {
+		locals[path] = local
+	}
+	kindOf := func(path string) string {
+		switch {
+		case path == "project.whl":
+			return "project_wheel"
+		case path == "descriptor.json":
+			return "descriptor"
+		case strings.HasPrefix(path, "evidence/"):
+			return "derive_evidence"
+		case strings.HasSuffix(path, ".whl") && !strings.Contains(path, "/"):
+			return "dependency_wheel"
+		}
+		return "source"
+	}
+	declared := make([]hub.PackageDeclaredFile, 0, len(locals))
+	for path, local := range locals {
+		raw, err := os.ReadFile(local)
+		if err != nil {
+			return nil, nil, nil, exit.Named(exit.Structural, "package_source_unreadable",
+				"%s is unreadable: %v", path, err)
+		}
+		sum := sha256.Sum256(raw)
+		declared = append(declared, hub.PackageDeclaredFile{
+			Digest: "sha256:" + hex.EncodeToString(sum[:]), Kind: kindOf(path),
+			Length: int64(len(raw)), Path: path})
+	}
+	sort.Slice(declared, func(i, j int) bool { return declared[i].Path < declared[j].Path })
+	registry := make([]hub.PackageRegistryRow, 0, len(pack.Registry))
+	for _, row := range pack.Registry {
+		registry = append(registry, hub.PackageRegistryRow{Name: row.Name, SHA256: row.SHA256,
+			Size: row.Size, URL: row.URL, Version: row.Version})
+	}
+	return declared, registry, locals, nil
+}
+
 type packageFile struct {
 	subject string
 	path    string
-	upload  hub.PackageUpload
+	upload  hub.PackagePresignedUpload
 }
 
 const maxConcurrentPackageUploads = 16
 
-func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package,
-	uploads []hub.PackageUpload, progress func(completed, total int),
+// uploadPackageFiles PUTs every absent subject under its checksum-pinned grant.
+// A 412 stands as success (the content-addressed key already holds these exact
+// bytes); the hub's finalize re-hashes everything regardless.
+func uploadPackageFiles(ctx context.Context, declared []hub.PackageDeclaredFile,
+	locals map[string]string, grants []hub.PackageFileGrant,
+	progress func(completed, total int),
 ) (int64, *exit.Error) {
-	files := make([]packageFile, 0, len(uploads))
-	wantSources := make(map[string]string, len(pack.Files))
-	for path, local := range pack.Files {
-		wantSources[path] = local
+	want := make(map[string]hub.PackageDeclaredFile, len(declared))
+	for _, file := range declared {
+		want[file.Path] = file
 	}
-	wantDependencies := make(map[string]string, len(pack.DependencyWheels))
-	for _, dependency := range pack.DependencyWheels {
-		wantDependencies[dependency.Filename] = dependency.Path
-	}
-	wantProject := true
-	wantDescriptor := true
-	for _, upload := range uploads {
-		var local string
-		var ok bool
-		switch upload.Kind {
-		case "project_wheel":
-			if !wantProject || upload.Path != "project.whl" {
-				return 0, exit.Internalf("package uploads returned unknown project wheel %q", upload.Path)
-			}
-			local, ok = pack.Wheel, true
-			wantProject = false
-		case "descriptor":
-			if !wantDescriptor || upload.Path != "descriptor.json" || pack.Descriptor == "" {
-				return 0, exit.Internalf("package uploads returned unknown descriptor %q", upload.Path)
-			}
-			local, ok = pack.Descriptor, true
-			wantDescriptor = false
-		case "source":
-			local, ok = wantSources[upload.Path]
-			delete(wantSources, upload.Path)
-		case "dependency_wheel":
-			local, ok = wantDependencies[upload.Path]
-			delete(wantDependencies, upload.Path)
-		default:
-			return 0, exit.Internalf("package uploads returned invalid kind %q for %q", upload.Kind, upload.Path)
+	pending := make([]packageFile, 0, len(grants))
+	for _, grant := range grants {
+		claim, ok := want[grant.Path]
+		if !ok || claim != grant.PackageDeclaredFile {
+			return 0, exit.Internalf("package grants answered an undeclared subject %q", grant.Path)
 		}
-		if !ok {
-			return 0, exit.Internalf("package uploads returned unknown or duplicate %s path %q", upload.Kind, upload.Path)
-		}
-		files = append(files, packageFile{subject: upload.Path, path: local, upload: upload})
-	}
-	if wantProject || wantDescriptor || len(wantSources) != 0 || len(wantDependencies) != 0 {
-		return 0, exit.Internalf("package uploads omitted %d source files and %d dependency wheels",
-			len(wantSources), len(wantDependencies))
-	}
-
-	pending := make([]packageFile, 0, len(files))
-	for _, file := range files {
-		if file.upload.AlreadyUploaded {
+		delete(want, grant.Path)
+		if grant.Present {
 			continue
 		}
-		if file.upload.URL == "" {
-			return 0, exit.Internalf("package upload returned no URL for %s", file.subject)
+		if grant.Upload == nil || grant.Upload.URL == "" {
+			return 0, exit.Internalf("package grant for %s is neither present nor uploadable", grant.Path)
 		}
-		pending = append(pending, file)
+		local, ok := locals[grant.Path]
+		if !ok {
+			return 0, exit.Internalf("package grant names unknown local subject %q", grant.Path)
+		}
+		pending = append(pending, packageFile{subject: grant.Path, path: local, upload: *grant.Upload})
+	}
+	if len(want) != 0 {
+		return 0, exit.Internalf("package grants omitted %d declared subjects", len(want))
 	}
 	if progress != nil {
 		progress(0, len(pending))

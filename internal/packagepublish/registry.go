@@ -1,19 +1,21 @@
 package packagepublish
 
+// cl-078: the client no longer proxies PyPI. `uv export --locked` still authors
+// the pylock and every row still passes the exact discipline the download had —
+// the pinned index, the files.pythonhosted.org origin shape, the bounded
+// sha256/size identity, the pure-wheel selection, the platform-root refusal —
+// but the bytes never move through this machine: publish sends the rows and
+// Tensorhub fetches, verifies with its own hash, and stores content-addressed.
+
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -40,12 +42,22 @@ type registryWheel struct {
 	URL    string            `toml:"url"`
 }
 
+// RegistryRow is one locked registry dependency for Tensorhub to fetch itself:
+// exactly the pylock facts, nothing derived.
+type RegistryRow struct {
+	Name    string `json:"name"`
+	SHA256  string `json:"sha256"`
+	Size    int64  `json:"size"`
+	URL     string `json:"url"`
+	Version string `json:"version"`
+}
+
 type exactDependency struct {
 	digest  string
 	version string
 }
 
-func collectRegistryDependencies(ctx context.Context, project, stage string, existing []DependencyWheel) ([]DependencyWheel, *exit.Error) {
+func collectRegistryRows(ctx context.Context, project, stage string, existing []DependencyWheel) ([]RegistryRow, *exit.Error) {
 	lockPath := filepath.Join(stage, "pylock.registry.toml")
 	args := []string{"export", "--locked", "--no-dev", "--no-emit-project", "--no-emit-local",
 		"--format", "pylock.toml", "--output-file", lockPath, "--no-progress", "--directory", project}
@@ -73,16 +85,15 @@ func collectRegistryDependencies(ctx context.Context, project, stage string, exi
 		return nil, exit.Named(exit.Structural, "registry_dependency_export_invalid",
 			"uv export did not produce a non-empty pylock.toml at or below %d B", maxLockBytes)
 	}
-	return registryDependenciesFromLock(ctx, raw, filepath.Join(stage, "dependencies", "registry"), existing, registryClient())
+	return RegistryRowsFromLock(raw, existing)
 }
 
-func registryDependenciesFromLock(ctx context.Context, raw []byte, stage string, existing []DependencyWheel, client *http.Client) ([]DependencyWheel, *exit.Error) {
+func RegistryRowsFromLock(raw []byte, existing []DependencyWheel) ([]RegistryRow, *exit.Error) {
 	var lock registryLock
 	if err := toml.Unmarshal(raw, &lock); err != nil || lock.LockVersion != "1.0" {
 		return nil, exit.Named(exit.Validation, "registry_dependency_lock_invalid",
 			"uv export produced an invalid PEP 751 pylock.toml")
 	}
-	out := append([]DependencyWheel(nil), existing...)
 	seen := make(map[string]exactDependency, len(existing)+len(lock.Packages))
 	var total int64
 	for _, dependency := range existing {
@@ -97,6 +108,8 @@ func registryDependenciesFromLock(ctx context.Context, raw []byte, stage string,
 		seen[identity.Distribution] = exactDependency{digest: digest, version: identity.Version}
 		total += identity.Length
 	}
+	out := []RegistryRow{}
+	count := len(existing)
 	for _, pkg := range lock.Packages {
 		name := normalizedProjectName(pkg.Name)
 		if name == "" || strings.TrimSpace(pkg.Version) == "" {
@@ -115,40 +128,61 @@ func registryDependenciesFromLock(ctx context.Context, raw []byte, stage string,
 		if problem != nil {
 			return nil, problem
 		}
-		path, digest, problem := downloadRegistryWheel(ctx, client, stage, name, pkg.Version, candidate)
+		digest, problem := registryWheelIdentity(name, pkg.Version, candidate)
 		if problem != nil {
 			return nil, problem
-		}
-		identity, problem := wheel.InspectIdentity(path)
-		if problem != nil {
-			return nil, problem
-		}
-		if identity.Distribution != name || identity.Version != pkg.Version {
-			return nil, exit.Named(exit.Validation, "registry_dependency_identity_mismatch",
-				"lock declares %s==%s but %s contains %s==%s",
-				name, pkg.Version, identity.Filename, identity.Distribution, identity.Version)
 		}
 		if prior, ok := seen[name]; ok {
-			if prior.version == identity.Version && prior.digest == digest {
-				_ = os.Remove(path)
+			// The same exact bytes may ride as an already-built local wheel; a
+			// DIFFERENT resolution of one normalized name is still a refusal.
+			if prior.version == pkg.Version && prior.digest == "sha256:"+digest {
 				continue
 			}
 			return nil, exit.Named(exit.Validation, "dependency_wheel_duplicate",
 				"normalized dependency %s resolves to more than one exact wheel", name)
 		}
-		if len(out) >= MaxDependencyWheels {
+		if count >= MaxDependencyWheels {
 			return nil, tooManyDependencies()
 		}
-		if identity.Length > MaxDependencyWheelBytes-total {
+		if candidate.Size > MaxDependencyWheelBytes-total {
 			return nil, exit.Named(exit.Validation, "dependency_wheels_too_large",
 				"dependency wheels exceed %d B combined", MaxDependencyWheelBytes)
 		}
-		total += identity.Length
-		seen[name] = exactDependency{digest: digest, version: identity.Version}
-		out = append(out, DependencyWheel{Filename: identity.Filename, Path: path})
+		total += candidate.Size
+		count++
+		seen[name] = exactDependency{digest: "sha256:" + digest, version: pkg.Version}
+		out = append(out, RegistryRow{Name: name, SHA256: digest, Size: candidate.Size,
+			URL: candidate.URL, Version: pkg.Version})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Filename < out[j].Filename })
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// registryWheelIdentity is the whole per-row discipline, minus the transfer:
+// bounded sha256/size identity and the exact files.pythonhosted.org origin
+// shape. Tensorhub re-runs the same checks and then hashes what it fetched.
+func registryWheelIdentity(name, version string, selected registryWheel) (string, *exit.Error) {
+	digest := selected.Hashes["sha256"]
+	if selected.Size <= 0 || selected.Size > MaxDependencyWheelBytes || len(digest) != 64 {
+		return "", exit.Named(exit.Validation, "registry_dependency_identity_invalid",
+			"%s==%s has no bounded SHA-256 wheel identity", name, version)
+	}
+	if _, err := hex.DecodeString(digest); err != nil || strings.ToLower(digest) != digest {
+		return "", exit.Named(exit.Validation, "registry_dependency_identity_invalid",
+			"%s==%s has an invalid SHA-256", name, version)
+	}
+	parsed, err := url.Parse(selected.URL)
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() != "files.pythonhosted.org" ||
+		parsed.Port() != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", exit.Named(exit.Validation, "registry_dependency_origin_refused",
+			"%s==%s wheel is not an exact files.pythonhosted.org HTTPS object", name, version)
+	}
+	filename, err := url.PathUnescape(filepath.Base(parsed.Path))
+	if err != nil || filepath.Base(filename) != filename || !strings.HasSuffix(strings.ToLower(filename), "-py3-none-any.whl") {
+		return "", exit.Named(exit.Validation, "registry_dependency_wheel_invalid",
+			"%s==%s does not name one pure py3-none-any wheel", name, version)
+	}
+	return digest, nil
 }
 
 func pureRegistryWheel(name string, pkg registryPackage) (registryWheel, *exit.Error) {
@@ -158,105 +192,23 @@ func pureRegistryWheel(name string, pkg registryPackage) (registryWheel, *exit.E
 		if err != nil {
 			continue
 		}
-		filename, err := url.PathUnescape(filepath.Base(parsed.Path))
-		if err == nil && strings.HasSuffix(strings.ToLower(filename), "-py3-none-any.whl") {
+		base, err := url.PathUnescape(filepath.Base(parsed.Path))
+		if err != nil {
+			continue
+		}
+		if strings.HasSuffix(strings.ToLower(base), "-py3-none-any.whl") {
 			candidates = append(candidates, candidate)
 		}
 	}
 	if len(candidates) == 0 {
-		code, message := "registry_dependency_native_only", "has no pure py3-none-any wheel"
+		refusal, detail := "registry_dependency_native_only", "has no pure py3-none-any wheel"
 		if len(pkg.Wheels) == 0 && pkg.Sdist != nil {
-			code, message = "registry_dependency_source_only", "is available only as source"
+			refusal, detail = "registry_dependency_source_only", "is available only as source"
 		}
-		return registryWheel{}, exit.Named(exit.Validation, code, "%s==%s %s", name, pkg.Version, message).
+		return registryWheel{}, exit.Named(exit.Validation, refusal,
+			"%s==%s %s", name, pkg.Version, detail).
 			WithRemedy("use a pure-Python PyPI dependency or publish an explicit local custom wheel")
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].URL < candidates[j].URL })
 	return candidates[len(candidates)-1], nil
-}
-
-func downloadRegistryWheel(ctx context.Context, client *http.Client, stage, name, version string, selected registryWheel) (string, string, *exit.Error) {
-	digest := selected.Hashes["sha256"]
-	if selected.Size <= 0 || selected.Size > MaxDependencyWheelBytes || len(digest) != 64 {
-		return "", "", exit.Named(exit.Validation, "registry_dependency_identity_invalid",
-			"%s==%s has no bounded SHA-256 wheel identity", name, version)
-	}
-	if _, err := hex.DecodeString(digest); err != nil || strings.ToLower(digest) != digest {
-		return "", "", exit.Named(exit.Validation, "registry_dependency_identity_invalid",
-			"%s==%s has an invalid SHA-256", name, version)
-	}
-	parsed, err := url.Parse(selected.URL)
-	if err != nil || parsed.Scheme != "https" || parsed.Hostname() != "files.pythonhosted.org" ||
-		parsed.Port() != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", "", exit.Named(exit.Validation, "registry_dependency_origin_refused",
-			"%s==%s wheel is not an exact files.pythonhosted.org HTTPS object", name, version)
-	}
-	filename, err := url.PathUnescape(filepath.Base(parsed.Path))
-	if err != nil || filepath.Base(filename) != filename || !strings.HasSuffix(strings.ToLower(filename), "-py3-none-any.whl") {
-		return "", "", exit.Named(exit.Validation, "registry_dependency_wheel_invalid",
-			"%s==%s does not name one pure py3-none-any wheel", name, version)
-	}
-	if err := os.MkdirAll(stage, 0o700); err != nil {
-		return "", "", exit.Internalf("cannot create registry dependency staging: %s", err)
-	}
-	partial := filepath.Join(stage, filename+".partial")
-	path := filepath.Join(stage, filename)
-	_ = os.Remove(partial)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, selected.URL, nil)
-	if err != nil {
-		return "", "", exit.Internalf("cannot request registry dependency: %s", err)
-	}
-	response, err := client.Do(request)
-	if err != nil {
-		return "", "", exit.Named(exit.Structural, "registry_dependency_download_failed",
-			"cannot download %s==%s: %s", name, version, err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK || (response.ContentLength >= 0 && response.ContentLength != selected.Size) {
-		return "", "", exit.Named(exit.Structural, "registry_dependency_download_failed",
-			"%s==%s returned HTTP %d with length %d", name, version, response.StatusCode, response.ContentLength)
-	}
-	file, err := os.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return "", "", exit.Internalf("cannot stage registry dependency: %s", err)
-	}
-	hash := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(file, hash), io.LimitReader(response.Body, selected.Size+1))
-	closeErr := file.Close()
-	actual := hex.EncodeToString(hash.Sum(nil))
-	if copyErr != nil || closeErr != nil || written != selected.Size || actual != digest {
-		_ = os.Remove(partial)
-		return "", "", exit.Named(exit.Validation, "registry_dependency_identity_mismatch",
-			"downloaded %s==%s does not match its locked size and SHA-256", name, version)
-	}
-	if err := os.Rename(partial, path); err != nil {
-		_ = os.Remove(partial)
-		return "", "", exit.Internalf("cannot commit registry dependency staging: %s", err)
-	}
-	return path, "sha256:" + digest, nil
-}
-
-func dependencyDigest(path string) (string, *exit.Error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", exit.Named(exit.Structural, "dependency_wheel_unreadable", "%s: %v", path, err)
-	}
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		file.Close()
-		return "", exit.Named(exit.Structural, "dependency_wheel_unreadable", "%s: %v", path, err)
-	}
-	if err := file.Close(); err != nil {
-		return "", exit.Named(exit.Structural, "dependency_wheel_unreadable", "%s: %v", path, err)
-	}
-	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
-}
-
-func registryClient() *http.Client {
-	return &http.Client{
-		Timeout: 2 * time.Minute,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return fmt.Errorf("registry wheel redirect refused")
-		},
-	}
 }

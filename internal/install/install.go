@@ -62,6 +62,12 @@ type PublishedSource struct {
 	Wheels        []PublishedWheel
 	Models        []PublishedModel
 	Selection     Selection
+	// ReportDefect relays a descriptor falsification observed during LOCAL
+	// preparation (cl-078). Best-effort: the hub's sound authorization wants a
+	// rental chain, which a local install does not hold, so only an
+	// admin-credentialed daemon's report lands; everyone else still refuses the
+	// install locally, which is the load-bearing half.
+	ReportDefect func(code, detail string)
 }
 
 type PublishedModel struct {

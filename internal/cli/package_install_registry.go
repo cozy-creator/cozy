@@ -186,6 +186,7 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 		Pyproject:     pyproject,
 		UVLock:        uvLock,
 		Selection:     install.Selection{PackageDescriptor: packageDescriptor},
+		ReportDefect:  localDefectReporter(cli, ref, release),
 	}
 	seen := map[string]bool{}
 	type job struct {

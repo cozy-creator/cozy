@@ -352,7 +352,14 @@ type worker struct {
 	// locally reconstructed placement.
 	desiredPackages []*pb.DownloadPackageRef
 	desiredModels   []*pb.DownloadModelRef
-	desiredMu       sync.Mutex
+	// desiredDelegation/Signature retain the exact signed authority the current
+	// package_set was sent under: a descriptor-falsifying refusal is relayed to
+	// the hub with this chain (cl-078/th-106). defectReported latches per
+	// revision so one falsification files one report.
+	desiredDelegation          []byte
+	desiredDelegationSignature []byte
+	defectReportedRevision     uint64
+	desiredMu                  sync.Mutex
 	// A rental is one machine and may host several package environments. Keep the
 	// worker-reported placement for every binding instead of overwriting package A when
 	// package B joins the same desired set.
