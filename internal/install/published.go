@@ -22,7 +22,7 @@ import (
 // PublishedPreparationFile retains the bounded exact wheel inventory already verified
 // during code installation. It is not an identity document or executable authority:
 // Runtime re-verifies every wheel and authors the exact PlacementSet only after an
-// invocation selects model Manifests. A fixed file avoids rediscovering generation files.
+// invocation selects model Manifests. A fixed file avoids rediscovering install files.
 const PublishedPreparationFile = "package-preparation.json"
 
 type publishedPreparation struct {
@@ -59,11 +59,11 @@ func hasWeightlessCallable(descriptor *launch.PackageDescriptor) bool {
 // preparePublished materializes the release's complete frozen uv environment, then asks
 // that environment's Runtime to author its resident routing facts. Creator compares the
 // derived descriptor with the committed publication descriptor.
-func preparePublished(l home.Layout, genDir string, published *PublishedSource) (
+func preparePublished(l home.Layout, installDir string, published *PublishedSource) (
 	*launch.PackageDescriptor, ExactDocument, string, *EnvironmentReceipt, *exit.Error,
 ) {
 	var empty ExactDocument
-	sourceDir := filepath.Join(genDir, "source")
+	sourceDir := filepath.Join(installDir, "source")
 	if err := os.MkdirAll(sourceDir, 0o700); err != nil {
 		return nil, empty, "", nil, exit.Internalf("cannot create package metadata directory: %s", err)
 	}
@@ -77,7 +77,7 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 			return nil, empty, "", nil, exit.Internalf("cannot retain exact %s: %s", name, err)
 		}
 	}
-	cache := filepath.Join(genDir, "artifact-cache")
+	cache := filepath.Join(installDir, "artifact-cache")
 	setDir := filepath.Join(cache, "sets", "package")
 	if err := os.MkdirAll(setDir, 0o700); err != nil {
 		return nil, empty, "", nil, exit.Internalf("cannot create package wheel cache: %s", err)
@@ -95,7 +95,7 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 			return nil, empty, "", nil, problem
 		}
 	}
-	venvDir := filepath.Join(genDir, "venv")
+	venvDir := filepath.Join(installDir, "venv")
 	environment, problem := MaterializePublishedEnvironment(sourceDir, venvDir,
 		published.ProjectWheel, published.Wheels, published.LocalWheels)
 	if problem != nil {
@@ -120,7 +120,7 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 		if err != nil {
 			return nil, empty, "", nil, exit.Internalf("cannot encode package preparation: %s", err)
 		}
-		if err := os.WriteFile(filepath.Join(genDir, PublishedPreparationFile), inventory, 0o400); err != nil {
+		if err := os.WriteFile(filepath.Join(installDir, PublishedPreparationFile), inventory, 0o400); err != nil {
 			return nil, empty, "", nil, exit.Internalf(
 				"cannot retain code-only package preparation: %s", err)
 		}
@@ -267,23 +267,23 @@ func describePublished(runtimeBin, sourceDir string, committed ExactDocument) (
 	return descriptor, nil
 }
 
-// PreparePublishedSelection turns one installed code/environment generation plus exact
+// PreparePublishedSelection turns one installed code/environment tree plus exact
 // invocation-selected model Manifests into Runtime's immutable PlacementSet. It never
 // resolves a human model ref and never downloads bytes; those are Creator's preceding
 // control/transfer steps. Repeating it with the same inputs returns the same digest.
-func PreparePublishedSelection(l home.Layout, gen records.PackageInstall,
+func PreparePublishedSelection(l home.Layout, inst records.PackageInstall,
 	models []PublishedModel,
 ) (ExactDocument, *exit.Error) {
 	var empty ExactDocument
-	if gen.SourceKind != "tensorhub" || gen.Runtime == "" || len(models) == 0 {
+	if inst.SourceKind != "tensorhub" || inst.Runtime == "" || len(models) == 0 {
 		return empty, exit.Named(exit.Structural, "package_model_selection_incomplete",
-			"install %s has no complete published model selection", gen.ID).
+			"install %s has no complete published model selection", inst.ID).
 			WithRemedy("select one exact model for every callable slot")
 	}
-	seedBytes, err := os.ReadFile(filepath.Join(gen.Dir, PublishedPreparationFile))
+	seedBytes, err := os.ReadFile(filepath.Join(inst.Dir, PublishedPreparationFile))
 	if err != nil {
 		return empty, exit.Named(exit.Conflict, "package_code_preparation_missing",
-			"%s was installed without reusable code-only preparation: %s", gen.Package, err).
+			"%s was installed without reusable code-only preparation: %s", inst.Package, err).
 			WithRemedy("reinstall the package; model weights are not required for reinstall")
 	}
 	var inventory publishedPreparation
@@ -294,13 +294,13 @@ func PreparePublishedSelection(l home.Layout, gen records.PackageInstall,
 	if decodeErr == nil {
 		decodeErr = decoder.Decode(&trailing)
 	}
-	if decodeErr != io.EOF || inventory.Package != gen.Package ||
-		inventory.Release != gen.Version || inventory.SourceDigest != gen.SourceDigest ||
+	if decodeErr != io.EOF || inventory.Package != inst.Package ||
+		inventory.Release != inst.Version || inventory.SourceDigest != inst.SourceDigest ||
 		len(inventory.Wheels) > 128 {
 		return empty, exit.Named(exit.Conflict, "package_code_preparation_changed",
-			"%s code-only preparation does not match install %s", gen.Package, gen.ID)
+			"%s code-only preparation does not match install %s", inst.Package, inst.ID)
 	}
-	cache := filepath.Join(gen.Dir, "artifact-cache")
+	cache := filepath.Join(inst.Dir, "artifact-cache")
 	setDir := filepath.Join(cache, "sets", "package")
 	wheelFrom := func(wheel PublishedWheel) (PublishedWheel, *exit.Error) {
 		digest, digestErr := canonical.Raw(wheel.Digest)
@@ -331,25 +331,25 @@ func PreparePublishedSelection(l home.Layout, gen records.PackageInstall,
 		}
 		dependencies = append(dependencies, wheel)
 	}
-	descriptorBytes, err := os.ReadFile(launch.DescriptorPath(gen.Dir))
+	descriptorBytes, err := os.ReadFile(launch.DescriptorPath(inst.Dir))
 	if err != nil {
 		return empty, exit.New(exit.NotFound, "cannot read installed package descriptor: %s", err)
 	}
 	descriptorDigest, _ := canonical.Spell(canonical.Digest(descriptorBytes))
-	if descriptorDigest != gen.PackageDescriptor {
+	if descriptorDigest != inst.PackageDescriptor {
 		return empty, exit.Named(exit.Conflict, "package_descriptor_changed",
-			"installed package descriptor does not match %s", gen.PackageDescriptor)
+			"installed package descriptor does not match %s", inst.PackageDescriptor)
 	}
-	published := &PublishedSource{Package: gen.Package, Release: gen.Version,
-		SourceDigest: gen.SourceDigest, ProjectWheel: project, Wheels: dependencies,
+	published := &PublishedSource{Package: inst.Package, Release: inst.Version,
+		SourceDigest: inst.SourceDigest, ProjectWheel: project, Wheels: dependencies,
 		Models: append([]PublishedModel(nil), models...), Selection: Selection{
 			PackageDescriptor: ExactDocument{Bytes: descriptorBytes, Digest: descriptorDigest,
 				Length: int64(len(descriptorBytes))},
 		}}
-	return runPublishedSelection(l, gen, published)
+	return runPublishedSelection(l, inst, published)
 }
 
-func runPublishedSelection(l home.Layout, gen records.PackageInstall,
+func runPublishedSelection(l home.Layout, inst records.PackageInstall,
 	published *PublishedSource,
 ) (ExactDocument, *exit.Error) {
 	var empty ExactDocument
@@ -359,8 +359,8 @@ func runPublishedSelection(l home.Layout, gen records.PackageInstall,
 		"--release", published.Release,
 		"--release-digest", published.SourceDigest,
 		"--project-wheel", published.ProjectWheel.Path,
-		"--artifact-cache", filepath.Join(gen.Dir, "artifact-cache"),
-		"--environment-python", home.VenvPython(filepath.Join(gen.Dir, "venv")),
+		"--artifact-cache", filepath.Join(inst.Dir, "artifact-cache"),
+		"--environment-python", home.VenvPython(filepath.Join(inst.Dir, "venv")),
 	}
 	for _, wheel := range published.Wheels {
 		if runtimePreparationDependency(wheel) {
@@ -374,18 +374,18 @@ func runPublishedSelection(l home.Layout, gen records.PackageInstall,
 		}
 		args = append(args, "--model", string(raw))
 	}
-	cmd := exec.Command(gen.Runtime, args...)
+	cmd := exec.Command(inst.Runtime, args...)
 	cmd.Env = config.Frozen().Tool("COZY_HOME=" + l.Root)
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
 	if cmd.ProcessState == nil {
-		return empty, exit.Internalf("cannot run %s: %s", gen.Runtime, err)
+		return empty, exit.Internalf("cannot run %s: %s", inst.Runtime, err)
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
 		problem := metadataRefusal(code, "prepare-package", stderr.String())
 		return empty, exit.Named(problem.Code, "model_selection_incompatible",
-			"selected model does not satisfy %s: %s", gen.Package, problem.Message).
+			"selected model does not satisfy %s: %s", inst.Package, problem.Message).
 			WithRemedy("choose a model matching the callable's slot class and stamps; %s", problem.Remedy)
 	}
 	var answer struct {
@@ -401,7 +401,7 @@ func runPublishedSelection(l home.Layout, gen records.PackageInstall,
 	if decodeErr == nil {
 		decodeErr = decoder.Decode(&trailing)
 	}
-	if decodeErr != io.EOF || answer.Package != gen.Package || answer.Release != gen.Version ||
+	if decodeErr != io.EOF || answer.Package != inst.Package || answer.Release != inst.Version ||
 		!validRuntimeExact(answer.PackageDescriptor) || !validRuntimeExact(answer.PlacementSet) ||
 		!bytes.Equal(answer.PackageDescriptor.Bytes, published.Selection.PackageDescriptor.Bytes) {
 		return empty, exit.Named(exit.Structural, "package_prepare_invalid",
@@ -413,7 +413,7 @@ func runPublishedSelection(l home.Layout, gen records.PackageInstall,
 		return empty, exit.Named(exit.Structural, "package_model_selection_empty",
 			"cozy-runtime selected no runnable entrypoint for the requested model slots")
 	}
-	path := filepath.Join(gen.Dir, "artifact-cache",
+	path := filepath.Join(inst.Dir, "artifact-cache",
 		strings.TrimPrefix(answer.PlacementSet.Digest, "sha256:"))
 	if err := os.WriteFile(path, answer.PlacementSet.Bytes, 0o600); err != nil {
 		return empty, exit.Internalf("cannot retain selected package placement: %s", err)

@@ -21,12 +21,12 @@ import (
 
 // The LOCAL module's package resolver: `org/name` -> the spec that makes its worker
 // resident. ONE source, and it is the only one a user's machine will ever use — the
-// INSTALL GENERATION and its pin (cl-009's rows), resolved through internal/launch.
+// INSTALL and its pin (cl-009's rows), resolved through internal/launch.
 //
 // cl-006 shipped a second source, `--dev-package <file>`: a hand-written PackageSpec
-// document, because the generation could not yet carry the launch facts a supervisor
+// document, because the install could not yet carry the launch facts a supervisor
 // needs and guessing an interpreter would have been worse than refusing. cl-010 DELETES
-// it — a generation carries a venv, a proven descriptor and a binding table, which is
+// it — an install carries a venv, a proven descriptor and a binding table, which is
 // every fact that document supplied. Nothing coexists "temporarily": the flag, the
 // loader, and the driver's writer are all gone, and the live driver installs a package
 // exactly as a user does.
@@ -39,7 +39,7 @@ type Resolver struct {
 	store       *records.Store
 	cfg         config.Config
 	// cache holds the specs already derived this launch. Deriving one reads a descriptor
-	// and asks the runtime for its artifact index; a generation is IMMUTABLE, so doing it
+	// and asks the runtime for its artifact index; an install is IMMUTABLE, so doing it
 	// twice would answer the same thing twice.
 	cache    map[string]orchestrator.WorkerLaunchSpec
 	selected map[string]orchestrator.WorkerLaunchSpec
@@ -94,14 +94,14 @@ func (r *Resolver) PrivateRevision(installID, digest string) (privatepackage.Rev
 }
 
 // RefreshEditable is the daemon-owned pre-invocation fence for live source trees.
-// It snapshots the current tree, builds a complete replacement generation when it
+// It snapshots the current tree, builds a complete replacement install when it
 // moved, and swaps the active pin only after Runtime accepted the replacement.
-// A failure returns a typed refusal and leaves the last good generation active.
+// A failure returns a typed refusal and leaves the last good install active.
 func (r *Resolver) RefreshEditable(pkg string) (installID string, editable, changed bool, problem *exit.Error) {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
 	pkg = strings.TrimSpace(pkg)
-	current, problem := r.generation(pkg)
+	current, problem := r.activeInstall(pkg)
 	if problem != nil {
 		return "", false, false, problem
 	}
@@ -110,7 +110,7 @@ func (r *Resolver) RefreshEditable(pkg string) (installID string, editable, chan
 	}
 	refreshFailure := func(cause *exit.Error) (string, bool, bool, *exit.Error) {
 		return current.ID, true, false, exit.Named(cause.Code, "editable_refresh_failed",
-			"editable package %s could not refresh; generation %s remains active",
+			"editable package %s could not refresh; install %s remains active",
 			pkg, short12(current.ID)).
 			WithRemedy("%s: %s", cause.ErrName(), cause.Message)
 	}
@@ -141,7 +141,7 @@ func (r *Resolver) RefreshEditable(pkg string) (installID string, editable, chan
 		return refreshFailure(problem)
 	}
 	defer writer.Unlock()
-	latest, problem := r.generation(pkg)
+	latest, problem := r.activeInstall(pkg)
 	if problem != nil {
 		return refreshFailure(problem)
 	}
@@ -172,16 +172,16 @@ func (r *Resolver) RefreshEditable(pkg string) (installID string, editable, chan
 	delete(r.cache, pkg)
 	delete(r.placements, pkg)
 	r.mu.Unlock()
-	if result.Gen.ID == "" {
-		return refreshFailure(exit.Internalf("editable refresh returned no active generation"))
+	if result.Install.ID == "" {
+		return refreshFailure(exit.Internalf("editable refresh returned no active install"))
 	}
 	if result.Superseded != "" {
 		// Activation already committed the replacement. Reclaim the now-unpinned immutable
-		// generation just like an explicit install does; an exceptional cleanup failure must
+		// tree just like an explicit install does; an exceptional cleanup failure must
 		// not misreport the newly active environment as a failed refresh.
 		_, _ = install.Reclaim(layout, r.store, result.Superseded)
 	}
-	return result.Gen.ID, true, !result.Idempotent, nil
+	return result.Install.ID, true, !result.Idempotent, nil
 }
 
 func short12(value string) string {
@@ -214,11 +214,11 @@ func (r *Resolver) ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, 
 	if ok {
 		return placement, nil
 	}
-	gen, e := r.generation(pkg)
+	inst, e := r.activeInstall(pkg)
 	if e != nil {
 		return orchestrator.DesiredPlacement{}, e
 	}
-	facts, e := launch.Read(*gen, r.cfg.Home, r.cfg.Tool())
+	facts, e := launch.Read(*inst, r.cfg.Home, r.cfg.Tool())
 	if e != nil {
 		return orchestrator.DesiredPlacement{}, e
 	}
@@ -241,11 +241,11 @@ func (r *Resolver) Resolve(pkg string) (orchestrator.WorkerLaunchSpec, *exit.Err
 	if ok {
 		return spec, nil
 	}
-	gen, e := r.generation(pkg)
+	inst, e := r.activeInstall(pkg)
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
-	facts, e := launch.Read(*gen, r.cfg.Home, r.cfg.Tool())
+	facts, e := launch.Read(*inst, r.cfg.Home, r.cfg.Tool())
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
@@ -598,17 +598,17 @@ func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
 }
 
 // ResolveJob answers with the spec that makes ONE job function's worker resident. It is
-// the same generation, the same venv and the same device envelope as `Resolve` — what
+// the same install, the same venv and the same device envelope as `Resolve` — what
 // differs is the plan record staged for it and the Directive mode it boots into.
 //
 // It is NOT cached: a job spec is per-function, and caching by package alone was exactly
 // the shape that would hand a serving spec to a job.
 func (r *Resolver) ResolveJob(pkg, function string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
-	gen, e := r.generation(strings.TrimSpace(pkg))
+	inst, e := r.activeInstall(strings.TrimSpace(pkg))
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
-	facts, e := launch.Read(*gen, r.cfg.Home, r.cfg.Tool())
+	facts, e := launch.Read(*inst, r.cfg.Home, r.cfg.Tool())
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
@@ -630,11 +630,11 @@ func (r *Resolver) ResolveJobInstall(installID, function string) (orchestrator.W
 // Jobs names the `@job` functions one installed package registers, with the descriptor
 // id each resolves to. `cozy run list` and the API's job listing read it.
 func (r *Resolver) Jobs(pkg string) ([]launch.JobFacts, *exit.Error) {
-	gen, e := r.generation(strings.TrimSpace(pkg))
+	inst, e := r.activeInstall(strings.TrimSpace(pkg))
 	if e != nil {
 		return nil, e
 	}
-	facts, e := launch.Read(*gen, r.cfg.Home, r.cfg.Tool())
+	facts, e := launch.Read(*inst, r.cfg.Home, r.cfg.Tool())
 	if e != nil {
 		return nil, e
 	}
@@ -662,9 +662,9 @@ func jobsOf(facts *launch.Facts) ([]launch.JobFacts, *exit.Error) {
 	return out, nil
 }
 
-// generation resolves an active package pin. Internal callers may name a major as
+// activeInstall resolves an active package pin. Internal callers may name a major as
 // `org/name@v2`; otherwise the newest installed major wins.
-func (r *Resolver) generation(ref string) (*records.PackageInstall, *exit.Error) {
+func (r *Resolver) activeInstall(ref string) (*records.PackageInstall, *exit.Error) {
 	pkg, major, hasMajor := splitMajor(ref)
 	if r.store == nil {
 		return nil, exit.Unavailablef("this Cozy daemon has no install records")
@@ -692,15 +692,15 @@ func (r *Resolver) generation(ref string) (*records.PackageInstall, *exit.Error)
 				WithNext("cozy package list")
 		}
 	}
-	gen, e := r.store.Install(chosen.InstallID)
+	inst, e := r.store.Install(chosen.InstallID)
 	if e != nil {
 		return nil, e
 	}
-	if gen == nil {
-		return nil, exit.Internalf("%s is pinned to generation %s and that row is gone",
+	if inst == nil {
+		return nil, exit.Internalf("%s is pinned to install %s and that row is gone",
 			pkg, chosen.InstallID)
 	}
-	return gen, nil
+	return inst, nil
 }
 
 // splitMajor cuts `org/name@vN` into its parts.

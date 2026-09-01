@@ -23,7 +23,7 @@ func freeBytes(dir string) (int64, bool) {
 
 // Windows' FileInfo carries no link count (the Win32 find data has none), so a
 // hardlinked file is indistinguishable from an exclusive one here and every byte is
-// charged to this generation. It over-reports exclusive bytes; it never invents shared
+// charged to this install. It over-reports exclusive bytes; it never invents shared
 // ones, and `cozy package list` prints a number that is at worst pessimistic.
 func hardlinked(fs.FileInfo) bool { return false }
 

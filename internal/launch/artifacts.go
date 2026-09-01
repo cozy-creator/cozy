@@ -14,11 +14,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// GenerationToolEnv makes one installed generation's exact Runtime discoverable through the
+// InstallToolEnv makes one installed package's exact Runtime discoverable through the
 // already-frozen child environment without reading ambient process state.
-func GenerationToolEnv(generation records.PackageInstall, env []string) []string {
+func InstallToolEnv(inst records.PackageInstall, env []string) []string {
 	out := append([]string(nil), env...)
-	prefix := filepath.Dir(Binary(generation))
+	prefix := filepath.Dir(Binary(inst))
 	for index, value := range out {
 		if strings.HasPrefix(value, "PATH=") {
 			out[index] = "PATH=" + prefix + string(os.PathListSeparator) + strings.TrimPrefix(value, "PATH=")
@@ -48,7 +48,7 @@ const DefaultRuntimeQueryTimeout = 5 * time.Second
 // no longer exit 4 on the owner's box before a request is even sent, it is a typed
 // BINDING_UNAVAILABLE from the pod that would have served it, naming that pod's own index.
 
-// RuntimeCLI is one generation's own cozy-runtime binary, run against a named local root.
+// RuntimeCLI is one install's own cozy-runtime binary, run against a named local root.
 // Every question this host asks the runtime goes through here, so there is one place
 // that knows how to invoke it and one place that renders its refusals.
 type RuntimeCLI struct {
@@ -60,14 +60,14 @@ type RuntimeCLI struct {
 	QueryTimeout time.Duration // metadata-query bound; zero selects DefaultRuntimeQueryTimeout
 }
 
-// Binary is the runtime a generation carries. An install already refused a generation
-// whose venv provides none (cl-009's `runtime_missing`), so this is the same claim,
+// Binary is the runtime an install carries. The install transaction already refused a
+// venv that provides none (cl-009's `runtime_missing`), so this is the same claim,
 // re-asserted where it is used.
-func Binary(generation records.PackageInstall) string {
-	if generation.Runtime != "" {
-		return generation.Runtime
+func Binary(inst records.PackageInstall) string {
+	if inst.Runtime != "" {
+		return inst.Runtime
 	}
-	return home.VenvTool(filepath.Join(generation.Dir, "venv"), "cozy-runtime")
+	return home.VenvTool(filepath.Join(inst.Dir, "venv"), "cozy-runtime")
 }
 
 // HostRuntime is the package-independent local worker control process. Package code runs

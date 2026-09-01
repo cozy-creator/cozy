@@ -115,19 +115,19 @@ func handlePackageRecover(ctx *Context) *exit.Error {
 }
 
 func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *install.Result) *exit.Error {
-	g := res.Gen
+	inst := res.Install
 	fields := []output.Field{
-		{K: "package", V: g.Package}, {K: "major", V: g.Major},
-		{K: "version", V: g.Version}, {K: "status", V: "installed"},
-		{K: "disk", V: diskText(g)}, {K: "changed", V: !res.Idempotent},
-		{K: "generation", V: g.ID}, {K: "source", V: g.SourceKind + " " + g.SourceRef},
-		{K: "source_digest", V: g.SourceDigest}, {K: "verified", V: g.Verified},
-		{K: "python", V: g.Python}, {K: "uv", V: g.UV}, {K: "lock", V: g.LockDigest},
-		{K: "platform", V: g.Platform}, {K: "cuda_extra", V: orNone(g.Extra)},
-		{K: "packages", V: g.Packages},
-		{K: "closure", V: strings.ReplaceAll(g.Closure, "\n", " ")},
-		{K: "package_descriptor", V: g.PackageDescriptor},
-		{K: "placement_set", V: g.PlacementSetDigest},
+		{K: "package", V: inst.Package}, {K: "major", V: inst.Major},
+		{K: "version", V: inst.Version}, {K: "status", V: "installed"},
+		{K: "disk", V: diskText(inst)}, {K: "changed", V: !res.Idempotent},
+		{K: "install_id", V: inst.ID}, {K: "source", V: inst.SourceKind + " " + inst.SourceRef},
+		{K: "source_digest", V: inst.SourceDigest}, {K: "verified", V: inst.Verified},
+		{K: "python", V: inst.Python}, {K: "uv", V: inst.UV}, {K: "lock", V: inst.LockDigest},
+		{K: "platform", V: inst.Platform}, {K: "cuda_extra", V: orNone(inst.Extra)},
+		{K: "packages", V: inst.Packages},
+		{K: "closure", V: strings.ReplaceAll(inst.Closure, "\n", " ")},
+		{K: "package_descriptor", V: inst.PackageDescriptor},
+		{K: "placement_set", V: inst.PlacementSetDigest},
 		{K: "model_download", V: orNone(res.ModelStatus)},
 		{K: "model_download_error", V: res.ModelError},
 	}
@@ -168,27 +168,27 @@ func handleLs(ctx *Context) *exit.Error {
 	l := output.List{
 		Name:      "packages",
 		Fields:    []string{"package", "version", "disk"},
-		AllFields: []string{"package", "major", "version", "disk", "placement_set", "generation", "source", "verified", "installed", "exclusive", "shared"},
+		AllFields: []string{"package", "major", "version", "disk", "placement_set", "install_id", "source", "verified", "installed", "exclusive", "shared"},
 	}
-	for _, g := range rows {
+	for _, inst := range rows {
 		l.Rows = append(l.Rows, map[string]string{
-			"package":            g.Package,
-			"major":              fmt.Sprintf("v%d", g.Major),
-			"version":            g.Version,
-			"generation":         g.ID,
-			"disk":               diskText(g),
-			"exclusive":          output.Bytes(g.BytesExcl),
-			"shared":             output.Bytes(g.BytesShared),
-			"python":             g.Python,
-			"uv":                 g.UV,
-			"cuda_extra":         orNone(g.Extra),
-			"packages":           fmt.Sprintf("%d", g.Packages),
-			"closure":            strings.ReplaceAll(g.Closure, "\n", " "),
-			"package_descriptor": g.PackageDescriptor,
-			"placement_set":      g.PlacementSetDigest,
-			"source":             g.SourceKind + " " + g.SourceRef,
-			"verified":           fmt.Sprintf("%t", g.Verified),
-			"installed":          g.CreatedAt,
+			"package":            inst.Package,
+			"major":              fmt.Sprintf("v%d", inst.Major),
+			"version":            inst.Version,
+			"install_id":         inst.ID,
+			"disk":               diskText(inst),
+			"exclusive":          output.Bytes(inst.BytesExcl),
+			"shared":             output.Bytes(inst.BytesShared),
+			"python":             inst.Python,
+			"uv":                 inst.UV,
+			"cuda_extra":         orNone(inst.Extra),
+			"packages":           fmt.Sprintf("%d", inst.Packages),
+			"closure":            strings.ReplaceAll(inst.Closure, "\n", " "),
+			"package_descriptor": inst.PackageDescriptor,
+			"placement_set":      inst.PlacementSetDigest,
+			"source":             inst.SourceKind + " " + inst.SourceRef,
+			"verified":           fmt.Sprintf("%t", inst.Verified),
+			"installed":          inst.CreatedAt,
 		})
 	}
 	if len(l.Rows) == 0 {
@@ -209,7 +209,7 @@ func handleRm(ctx *Context) *exit.Error {
 	removed := output.List{
 		Name:      "packages",
 		Fields:    []string{"package", "reclaimed"},
-		AllFields: []string{"package", "major", "reclaimed", "generation"},
+		AllFields: []string{"package", "major", "reclaimed", "install_id"},
 	}
 	var freed int64
 	for _, arg := range ctx.Inv.Args {
@@ -238,25 +238,25 @@ func handleRm(ctx *Context) *exit.Error {
 			removed.Rows = append(removed.Rows, map[string]string{
 				"package":    p.Package,
 				"major":      fmt.Sprintf("v%d", p.Major),
-				"generation": p.InstallID,
+				"install_id": p.InstallID,
 				"reclaimed":  output.Bytes(n),
 			})
 		}
 	}
-	// Removing a package also clears superseded generations for the same selected
+	// Removing a package also clears superseded installs for the same selected
 	// major. Active requests/workers were fenced above and the database claim rechecks.
 	unreferenced, e := st.Unreferenced()
 	if e != nil {
 		return e
 	}
-	for _, generation := range unreferenced {
+	for _, superseded := range unreferenced {
 		selected := false
 		for _, arg := range ctx.Inv.Args {
 			ref, problem := install.ParseRef(arg)
 			if problem != nil {
 				return problem
 			}
-			selected = ref.Package == generation.Package
+			selected = ref.Package == superseded.Package
 			if selected {
 				break
 			}
@@ -264,7 +264,7 @@ func handleRm(ctx *Context) *exit.Error {
 		if !selected {
 			continue
 		}
-		n, problem := install.Reclaim(l, st, generation.ID)
+		n, problem := install.Reclaim(l, st, superseded.ID)
 		if problem != nil {
 			return problem
 		}
@@ -280,7 +280,7 @@ func handleRm(ctx *Context) *exit.Error {
 		removed.Aggregates = []output.Field{{K: "changed", V: false}}
 		return emit(ctx, removed)
 	}
-	// The pin is gone before residency changes. Accepted work keeps its exact generation;
+	// The pin is gone before residency changes. Accepted work keeps its exact install;
 	// the daemon retires only workers it can prove idle.
 	w.Unlock()
 	st.Close()
@@ -306,11 +306,11 @@ func handleRm(ctx *Context) *exit.Error {
 	return emit(ctx, removed)
 }
 
-func diskText(g records.PackageInstall) string {
-	if g.BytesShared == 0 {
-		return output.Bytes(g.BytesExcl)
+func diskText(inst records.PackageInstall) string {
+	if inst.BytesShared == 0 {
+		return output.Bytes(inst.BytesExcl)
 	}
-	return fmt.Sprintf("%s (+%s shared)", output.Bytes(g.BytesExcl), output.Bytes(g.BytesShared))
+	return fmt.Sprintf("%s (+%s shared)", output.Bytes(inst.BytesExcl), output.Bytes(inst.BytesShared))
 }
 
 func orNone(s string) string {

@@ -952,7 +952,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	if e := c.opt.Store.SpawnWorker(records.WorkerProcess{
 		InstanceID:            instanceID,
 		Package:               spec.Placement.Package,
-		Generation:            spec.Placement.InstallID,
+		InstallID:             spec.Placement.InstallID,
 		PackageRevisionDigest: spec.Placement.PackageRevisionDigest,
 		WorkerID:              "local",
 		Devices:               spec.Devices,
@@ -1194,7 +1194,7 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	if e := c.opt.Store.AttachWorker(records.WorkerProcess{
 		InstanceID:            instanceID,
 		Package:               spec.Placement.Package,
-		Generation:            spec.Placement.InstallID,
+		InstallID:             spec.Placement.InstallID,
 		PackageRevisionDigest: spec.Placement.PackageRevisionDigest,
 		WorkerID:              "remote",
 	}); e != nil {

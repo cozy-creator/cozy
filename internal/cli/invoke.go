@@ -1478,7 +1478,7 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 		return Target{}, nil, problem
 	}
 	if rentalRequested(ctx) && strings.HasPrefix(target.Package, "local/") {
-		facts, problem := generationFacts(ctx, target.Package)
+		facts, problem := activeInstallFacts(ctx, target.Package)
 		if problem != nil {
 			return Target{}, nil, problem
 		}
@@ -1521,12 +1521,12 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 		target.Release, target.ReleaseDigest = release, detail.Release.ReleaseDigest
 		return target, descriptor, nil
 	}
-	facts, problem := generationFacts(ctx, target.Package)
+	facts, problem := activeInstallFacts(ctx, target.Package)
 	if problem != nil && problem.Code == exit.NotFound {
 		if problem = autoInstallPackage(ctx, target.Package); problem != nil {
 			return Target{}, nil, problem
 		}
-		facts, problem = generationFacts(ctx, target.Package)
+		facts, problem = activeInstallFacts(ctx, target.Package)
 	}
 	if problem != nil {
 		return Target{}, nil, problem
@@ -1616,8 +1616,8 @@ func autoInstallPackage(ctx *Context, pkg string) *exit.Error {
 	return nil
 }
 
-// generationFacts resolves the package's one active install.
-func generationFacts(ctx *Context, pkg string) (*launch.Facts, *exit.Error) {
+// activeInstallFacts resolves the package's one active install.
+func activeInstallFacts(ctx *Context, pkg string) (*launch.Facts, *exit.Error) {
 	install, e := installedPackage(ctx, pkg)
 	if e != nil {
 		return nil, e

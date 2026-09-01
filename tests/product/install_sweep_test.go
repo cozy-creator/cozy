@@ -26,17 +26,17 @@ func TestInstallSweep(t *testing.T) {
 	}
 	defer store.Close()
 
-	pinned := cleanupTestGeneration(l, "aaaaaaaaaaaaaaaa", "1.0.0")
-	retired := cleanupTestGeneration(l, "bbbbbbbbbbbbbbbb", "1.0.1")
+	pinned := cleanupTestInstall(l, "aaaaaaaaaaaaaaaa", "1.0.0")
+	retired := cleanupTestInstall(l, "bbbbbbbbbbbbbbbb", "1.0.1")
 	retired.Package, retired.BytesExcl = "cozy/retired", 4096
-	serving := cleanupTestGeneration(l, "cccccccccccccccc", "1.0.0")
+	serving := cleanupTestInstall(l, "cccccccccccccccc", "1.0.0")
 	serving.Package = "cozy/serving"
-	for _, generation := range []records.PackageInstall{retired, serving, pinned} {
-		if _, problem := store.Activate(generation); problem != nil {
+	for _, inst := range []records.PackageInstall{retired, serving, pinned} {
+		if _, problem := store.Activate(inst); problem != nil {
 			t.Fatal(problem)
 		}
 	}
-	// The retired generation loses its pin the way `cozy package remove` drops it; the
+	// The retired install loses its pin the way `cozy package remove` drops it; the
 	// serving one keeps a submitted request, which is the reference the claim must honour.
 	if problem := store.Unpin(retired.Package, retired.Major); problem != nil {
 		t.Fatal(problem)
@@ -55,13 +55,13 @@ func TestInstallSweep(t *testing.T) {
 	// The defect itself: a directory whose row is GONE. No pin names it, no verb reaches
 	// it, and before cl-076 nothing could remove it.
 	stranded := l.InstallDir("dddddddddddddddd")
-	for _, generation := range []string{pinned.Dir, retired.Dir, serving.Dir, stranded} {
-		writeReadOnlyPackage(t, filepath.Join(generation, "venv", "lib", "python3.12",
+	for _, inst := range []string{pinned.Dir, retired.Dir, serving.Dir, stranded} {
+		writeReadOnlyPackage(t, filepath.Join(inst, "venv", "lib", "python3.12",
 			"site-packages", "hidiffusion"))
 	}
 	t.Cleanup(func() {
-		for _, generation := range []string{pinned.Dir, serving.Dir} {
-			restoreDirectoryWrites(filepath.Join(generation, "venv", "lib", "python3.12",
+		for _, inst := range []string{pinned.Dir, serving.Dir} {
+			restoreDirectoryWrites(filepath.Join(inst, "venv", "lib", "python3.12",
 				"site-packages", "hidiffusion"))
 		}
 	})
@@ -102,8 +102,8 @@ func TestInstallSweep(t *testing.T) {
 			t.Fatalf("referenced install %s was swept: %v", kept, err)
 		}
 	}
-	if generation, readProblem := store.Install(serving.ID); readProblem != nil || generation == nil {
-		t.Fatalf("in-flight generation record = %+v, %v", generation, readProblem)
+	if inst, readProblem := store.Install(serving.ID); readProblem != nil || inst == nil {
+		t.Fatalf("in-flight install record = %+v, %v", inst, readProblem)
 	}
 	if got, err := os.ReadFile(sentinel); err != nil || string(got) != "keep" {
 		t.Fatalf("symlinked directory outside the install root changed: %q, %v", got, err)

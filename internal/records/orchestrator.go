@@ -16,7 +16,7 @@ import (
 
 // The orchestrator's half of the ONE lifecycle authority (cl-001). Worker processes,
 // their sessions, requests, attempts and outputs are rows in the SAME database as the
-// install generations and pins — one authority, one transaction boundary, no second
+// package installs and pins — one authority, one transaction boundary, no second
 // lifecycle store anywhere (the fence's `store` family proves the absence).
 //
 // Two properties this file exists for:
@@ -55,17 +55,17 @@ CREATE TABLE IF NOT EXISTS requests (
   worker       TEXT    NOT NULL DEFAULT '',
   rental       INTEGER NOT NULL DEFAULT 0,
   rental_required INTEGER NOT NULL DEFAULT 0,
-  install_id   TEXT    REFERENCES install_generations(id),
+  install_id   TEXT    REFERENCES installs(id),
   assets       TEXT    NOT NULL DEFAULT '[]',
   models       TEXT    NOT NULL DEFAULT '[]',
   weights_outputs TEXT NOT NULL DEFAULT '[]'
 )`
 
-var orchestratorSchema = []string{`
+const workerProcessesDDL = `
 CREATE TABLE IF NOT EXISTS worker_processes (
   instance_id     TEXT PRIMARY KEY,
   package        TEXT    NOT NULL,
-  generation      TEXT    REFERENCES install_generations(id),
+  install_id      TEXT    REFERENCES installs(id),
   package_revision_digest      TEXT    NOT NULL,
   worker_id       TEXT    NOT NULL,
   devices         TEXT    NOT NULL,
@@ -75,9 +75,18 @@ CREATE TABLE IF NOT EXISTS worker_processes (
 	state           TEXT    NOT NULL,
   opened_at       TEXT    NOT NULL,
   closed_at       TEXT    NOT NULL DEFAULT ''
-)`, `
+)`
+
+const workerSessionIndex = `
 CREATE UNIQUE INDEX IF NOT EXISTS worker_session ON worker_processes(session_id)
-  WHERE session_id IS NOT NULL`, requestsDDL, `
+  WHERE session_id IS NOT NULL`
+
+// workerProcessCols is the whole row, in table order: the schema-12 rebuild copies every
+// column across by name rather than trusting positional SELECT *.
+const workerProcessCols = `instance_id,package,install_id,package_revision_digest,worker_id,
+	devices,pid,birth,session_id,state,opened_at,closed_at`
+
+var orchestratorSchema = []string{workerProcessesDDL, workerSessionIndex, requestsDDL, `
 -- The PUBLICATION (cl-004). One row per job request, written INSIDE the terminal
 -- transaction: a publication that a terminal did not commit does not exist, which is
 -- what "killing before commit exposes no partial bundle" means as a schema property
@@ -192,12 +201,12 @@ func NewID(prefix string) string {
 // --------------------------------------------------------------------------- workers
 
 // WorkerProcess is one package worker: its OS process-birth identity, the protocol
-// identities it reported, and the generation-scoped device grant it holds. The grant is
-// this row's `Devices` field — one process, one visible device set, one generation.
+// identities it reported, and the install-scoped device grant it holds. The grant is
+// this row's `Devices` field — one process, one visible device set, one install.
 type WorkerProcess struct {
 	InstanceID            string
 	Package               string
-	Generation            string
+	InstallID             string
 	PackageRevisionDigest string
 	WorkerID              string
 	Devices               []string
@@ -229,7 +238,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 	}
 	clauses := make([]string, 0, len(w.Devices))
 	args := []any{
-		w.InstanceID, w.Package, nullable(w.Generation), w.PackageRevisionDigest, w.WorkerID,
+		w.InstanceID, w.Package, nullable(w.InstallID), w.PackageRevisionDigest, w.WorkerID,
 		deviceList(w.Devices), w.PID, w.Birth, "spawned_without_birth", now(),
 	}
 	for _, d := range w.Devices {
@@ -244,7 +253,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 	// this statement is the fence against a DIFFERENT slot.
 	args = append(args, w.InstanceID)
 	res, err := s.db.Exec(`
-		INSERT INTO worker_processes(instance_id,package,generation,package_revision_digest,worker_id,
+		INSERT INTO worker_processes(instance_id,package,install_id,package_revision_digest,worker_id,
 		  devices,pid,birth,state,opened_at)
 		SELECT ?,?,?,?,?,?,?,?,?,?
 		WHERE NOT EXISTS (
@@ -252,7 +261,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 		strings.Join(clauses, " OR ")+`) AND w.instance_id != ?)
 		ON CONFLICT(instance_id) DO UPDATE SET
 		  pid=excluded.pid, birth=excluded.birth, devices=excluded.devices,
-		  generation=excluded.generation, package_revision_digest=excluded.package_revision_digest,
+		  install_id=excluded.install_id, package_revision_digest=excluded.package_revision_digest,
 		  session_id=NULL,
 		  state='spawned_without_birth', opened_at=excluded.opened_at, closed_at=''`, args...)
 	if err != nil {
@@ -279,14 +288,14 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 // one rental lands on its own row rather than accumulating one per request.
 func (s *Store) AttachWorker(w WorkerProcess) *exit.Error {
 	if _, err := s.db.Exec(`
-		INSERT INTO worker_processes(instance_id,package,generation,package_revision_digest,worker_id,
+		INSERT INTO worker_processes(instance_id,package,install_id,package_revision_digest,worker_id,
 		  devices,pid,birth,state,opened_at)
 		VALUES(?,?,?,?,?,'',0,'','spawned',?)
 		ON CONFLICT(instance_id) DO UPDATE SET
-		  generation=excluded.generation, package_revision_digest=excluded.package_revision_digest,
+		  install_id=excluded.install_id, package_revision_digest=excluded.package_revision_digest,
 		  session_id=NULL,
 		  state='spawned', opened_at=excluded.opened_at, closed_at=''`,
-		w.InstanceID, w.Package, nullable(w.Generation), w.PackageRevisionDigest, w.WorkerID,
+		w.InstanceID, w.Package, nullable(w.InstallID), w.PackageRevisionDigest, w.WorkerID,
 		now()); err != nil {
 		return exit.Internalf("cannot journal the attached worker %s: %s", w.InstanceID, err)
 	}
@@ -378,7 +387,7 @@ func (s *Store) CloseWorker(instanceID string) *exit.Error {
 // LiveWorkers is every process row this root still believes in. Restart reconciliation
 // reads it and checks each against its OS process-birth identity before adopting.
 func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
-	rows, err := s.db.Query(`SELECT instance_id,package,COALESCE(generation,''),package_revision_digest,
+	rows, err := s.db.Query(`SELECT instance_id,package,COALESCE(install_id,''),package_revision_digest,
 		worker_id,devices,pid,birth,COALESCE(session_id,''),state,opened_at FROM worker_processes WHERE state != 'closed'
 		ORDER BY opened_at`)
 	if err != nil {
@@ -389,7 +398,7 @@ func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
 	for rows.Next() {
 		var w WorkerProcess
 		var devices string
-		if err := rows.Scan(&w.InstanceID, &w.Package, &w.Generation, &w.PackageRevisionDigest,
+		if err := rows.Scan(&w.InstanceID, &w.Package, &w.InstallID, &w.PackageRevisionDigest,
 			&w.WorkerID, &devices, &w.PID, &w.Birth, &w.SessionID, &w.State, &w.OpenedAt); err != nil {
 			return nil, exit.Internalf("cannot read a worker process row: %s", err)
 		}
@@ -457,7 +466,7 @@ type Request struct {
 	Rental bool
 	// RentalRequired forbids local placement for the hidden development/E2E override.
 	RentalRequired bool
-	// InstallID pins the exact immutable local metadata generation resolved before
+	// InstallID pins the exact immutable local install resolved before
 	// submission. The initial remote lane reads only its published release and descriptor.
 	InstallID string
 	// Assets are the request's durable input-asset bindings. LocalPath points into the
@@ -933,8 +942,8 @@ func (s *Store) PrivatePackageInUse(digest, packageName, release,
 		return true, nil
 	}
 	if err := s.db.QueryRow(`SELECT EXISTS(
-		SELECT 1 FROM pins p JOIN install_generations g ON g.id=p.generation
-		WHERE g.package=? AND g.version=? AND g.source_kind='local' AND g.source_digest=?)`,
+		SELECT 1 FROM pins p JOIN installs i ON i.id=p.install_id
+		WHERE i.package=? AND i.version=? AND i.source_kind='local' AND i.source_digest=?)`,
 		packageName, release, sourceDigest).Scan(&used); err != nil {
 		return false, exit.Internalf("cannot read current editable private package ownership: %s", err)
 	}

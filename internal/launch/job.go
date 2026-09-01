@@ -10,7 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// THE JOB HALF of an installed generation (cl-004). A job is an attempt class on the one
+// THE JOB HALF of an installed package (cl-004). A job is an attempt class on the one
 // machinery (cr-009), so this file mints exactly what the serving half mints — a local
 // plan record and the digest that names it — over the descriptor's `jobs` list instead of
 // its `entrypoints` list.
@@ -24,7 +24,7 @@ import (
 // JobResourceCap is the orchestrator's declared host-memory bound for one local job attempt.
 const jobRSSBudget = orchestrator.DefaultJobRSSCap
 
-// JobFacts is one resolved `@job` on an installed generation.
+// JobFacts is one resolved `@job` on an installed package.
 type JobFacts struct {
 	Name string
 	// Request is the exact callable schema used by the admission authority before

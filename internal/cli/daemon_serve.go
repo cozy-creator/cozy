@@ -136,7 +136,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// cl-076: an install directory is reachable only through its record, so a records.db
 	// that was lost or rebuilt strands every one of them on disk with no verb able to
 	// touch it. The sweep runs here — after reconcile has closed the worker rows that
-	// would otherwise still reference a generation, and before the API is served — and it
+	// would otherwise still reference an install, and before the API is served — and it
 	// is never fatal: what it removes is a venv `cozy package install` rebuilds.
 	swept, sweepNote := sweepInstalls(l, st)
 
