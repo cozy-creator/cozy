@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 )
@@ -15,10 +16,14 @@ func publicationAccount(ctx *Context) (*hub.Client, hub.Account, *exit.Error) {
 }
 
 func ownedPublication(ctx *Context, ref hub.Ref) (*hub.Client, *exit.Error) {
-	// An explicitly configured token may be an operator or automation credential
-	// with authority over more than one account. Tensorhub is the authority for
-	// that scope; an end-user account lookup would incorrectly narrow it here.
-	if ctx.Cfg.HubToken.Present() {
+	// An operator token is a fallback for unenrolled automation only. Once this
+	// machine has a user key, that identity wins even if stale operator config
+	// remains on disk.
+	auth := ctx.AccountAuth
+	if auth == nil {
+		auth = accountauth.New(ctx.Cfg)
+	}
+	if ctx.Cfg.HubToken.Present() && !auth.CredentialPresent() {
 		return client(ctx), nil
 	}
 	c, account, problem := publicationAccount(ctx)

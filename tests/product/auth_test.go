@@ -297,7 +297,8 @@ type authCozyResult struct {
 func runAuthCozy(t *testing.T, root, hubURL, stdin string, args ...string) authCozyResult {
 	t.Helper()
 	cmd := exec.Command(cozyBin, args...)
-	cmd.Env = childEnv(t, root, "TENSORHUB_URL="+hubURL)
+	// A stale operator token must not shadow a valid machine key.
+	cmd.Env = childEnv(t, root, "TENSORHUB_URL="+hubURL, "TENSORHUB_TOKEN=stale-static-token")
 	cmd.Stdin = strings.NewReader(stdin) //cozy:stdin-value test drives the real email-code prompt
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr

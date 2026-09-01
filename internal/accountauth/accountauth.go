@@ -171,6 +171,13 @@ func (m *Manager) AccessToken(ctx context.Context) (secret.Value, *exit.Error) {
 	return session.AccessToken, problem
 }
 
+// CredentialPresent reports whether this Tensorhub origin has a local machine
+// record. It does not read or validate secret bytes.
+func (m *Manager) CredentialPresent() bool {
+	_, err := os.Stat(m.path)
+	return err == nil
+}
+
 // Authenticate silently proves the persisted machine key and returns a short bearer.
 func (m *Manager) Authenticate(ctx context.Context) (Session, *exit.Error) {
 	m.mu.Lock()
