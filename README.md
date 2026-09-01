@@ -69,12 +69,12 @@ cozy package list
 
 An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path) creates a
 local-only editable install after a bounded source scan. Every invocation checks that live tree;
-a change atomically prepares a new generation and restarts stale execution state. A failed refresh
-keeps the last good generation pinned and refuses the invocation. Editable installs are neither
+a change atomically prepares a new install and restarts stale execution state. A failed refresh
+keeps the last good install pinned and refuses the invocation. Editable installs are neither
 published releases nor rentable deployments. Model bindings resolve the exact release and lane
 declared in `package.toml` from the local TensorFS store; they never synthesize Hub release records.
 
-Remove local package generations with:
+Remove local package installs with:
 
 ```sh
 cozy package remove org/name
@@ -176,7 +176,7 @@ consumers follow a release lane so fixes take effect; accepted runs freeze the c
 With `--rental`, producer and job packages resolve directly to their latest non-yanked immutable
 Tensorhub releases; their exact release and descriptor identities are pinned in the transfer intent.
 They do not need to be installable in the laptop's local Python environment. Local production still
-uses the ordinary installed package generation. `--rental-only` skips local capacity and requires an
+uses the ordinary installed package. `--rental-only` skips local capacity and requires an
 external attempt. Downloads that could rent currently refuse until Creator wires the negotiated
 weights-read return plane; local-only sources under `--rental` remain local.
 

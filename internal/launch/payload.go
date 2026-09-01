@@ -22,7 +22,7 @@ import (
 // rendered schema says int, never because the string looked numeric — the difference shows
 // up the first time a package declares a string field whose value is digits. The schema
 // is the surface the release's own runtime vouched for at install, read back from the
-// generation, so this costs microseconds and no subprocess: cozy-creator.md's
+// install, so this costs microseconds and no subprocess: cozy-creator.md's
 // "payload validation is client-side from the recorded schema, near-instant".
 //
 // An undeclared key refuses HERE, before a request is recorded and long before a model

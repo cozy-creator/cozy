@@ -245,7 +245,7 @@ func TestProductPath(t *testing.T) {
 	}
 	second := activePackageInstall(t, root)
 	if second.ID == first.ID || second.SourceDigest == first.SourceDigest {
-		t.Fatalf("body edit did not advance the editable generation: %#v -> %#v", first, second)
+		t.Fatalf("body edit did not advance the editable install: %#v -> %#v", first, second)
 	}
 
 	pyproject := filepath.Join(project, "pyproject.toml")
@@ -276,13 +276,13 @@ func TestProductPath(t *testing.T) {
 	}
 	failed := activePackageInstall(t, root)
 	if failed.ID != third.ID || failed.SourceDigest != third.SourceDigest {
-		t.Fatalf("failed refresh displaced the last good generation: %#v -> %#v", third, failed)
+		t.Fatalf("failed refresh displaced the last good install: %#v -> %#v", third, failed)
 	}
 	must(t, os.WriteFile(pyproject, goodMetadata, 0o644))
 	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"revision":"second"`) {
-		t.Fatalf("restored source did not reuse the last good generation [exit %d]\n%s", code, out)
+		t.Fatalf("restored source did not reuse the last good install [exit %d]\n%s", code, out)
 	}
 }
 
@@ -323,7 +323,7 @@ func weightlessProject(t *testing.T) string {
 	t.Helper()
 	home, err := os.UserHomeDir()
 	must(t, err)
-	repo := filepath.Join(home, "cozy_v2", "cozy-runtime") //cozy:allow peer source; the fixture builds the exact generation Runtime
+	repo := filepath.Join(home, "cozy_v2", "cozy-runtime") //cozy:allow peer source; the fixture builds the exact install Runtime
 	if _, err := os.Stat(filepath.Join(repo, "pyproject.toml")); err != nil {
 		t.Skipf("no cozy-runtime peer at %s: %v", repo, err)
 	}

@@ -22,7 +22,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 )
 
-// EnvironmentReceipt is the environment record: exactly what produced this generation's venv.
+// EnvironmentReceipt is the environment record: exactly what produced this install's venv.
 type EnvironmentReceipt struct {
 	Python     string
 	UV         string
@@ -178,8 +178,8 @@ func runUV(dir string, env []string, code, message string, args ...string) *exit
 	return nil
 }
 
-// Disk measures one generation exactly once, at install: bytes only this generation
-// holds, and bytes it shares with another venv through a hardlink. `cozy package list` reads
+// Disk measures one install exactly once, at install: the bytes only this tree
+// holds, and the bytes it shares with another venv through a hardlink. `cozy package list` reads
 // these numbers back out of the record — it never walks 122k files.
 func Disk(dir string) (exclusive, shared int64) {
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {

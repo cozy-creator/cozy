@@ -247,7 +247,7 @@ func replayJobSubmission(sub JobSubmission,
 }
 
 // resolveJob turns package+function into the orchestrator's Submission. The
-// `job_descriptor_id` is resolved HERE, from the installed generation's own descriptor —
+// `job_descriptor_id` is resolved HERE, from the installed package's own descriptor —
 // a client never names a digest, exactly as it never names a binding plan id.
 func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrator.Submission, *exit.Error) {
 	if sub.ModelTransfer != nil && sub.Package == "" && sub.Function == "" {

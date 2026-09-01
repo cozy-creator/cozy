@@ -11,8 +11,8 @@ import (
 )
 
 // TestOutputRetention is the plan/perform split on the one verb that removes a user's
-// bytes. Reclaiming a superseded package generation deletes a read-only tree the owner
-// made unwritable on purpose, must not touch the ACTIVE generation beside it, must not
+// bytes. Reclaiming a superseded package install deletes a read-only tree the owner
+// made unwritable on purpose, must not touch the ACTIVE install beside it, must not
 // follow a symlink out of the layout, and must refuse outright a recorded directory the
 // layout does not own. Nothing here is mocked: a real home layout, a real records store,
 // and the product's own install.Reclaim against real files.
@@ -27,8 +27,8 @@ func TestOutputRetention(t *testing.T) {
 	}
 	defer store.Close()
 
-	retired := cleanupTestGeneration(l, "1111111111111111", "1.0.0")
-	active := cleanupTestGeneration(l, "2222222222222222", "1.0.1")
+	retired := cleanupTestInstall(l, "1111111111111111", "1.0.0")
+	active := cleanupTestInstall(l, "2222222222222222", "1.0.1")
 	retired.BytesExcl = 123
 	if _, problem = store.Activate(retired); problem != nil {
 		t.Fatal(problem)
@@ -60,7 +60,7 @@ func TestOutputRetention(t *testing.T) {
 		t.Fatalf("reclaim = %d, %v", reclaimed, problem)
 	}
 	if _, err := os.Stat(retired.Dir); !os.IsNotExist(err) {
-		t.Fatalf("retired generation remains: %v", err)
+		t.Fatalf("retired install remains: %v", err)
 	}
 	if got, err := os.ReadFile(sentinel); err != nil || string(got) != "keep" {
 		t.Fatalf("out-of-tree symlink target changed: %q, %v", got, err)
@@ -68,11 +68,11 @@ func TestOutputRetention(t *testing.T) {
 	if mode, err := packageMode(activePackage); err != nil || mode != 0o555 {
 		t.Fatalf("active package environment mode = %o, %v", mode, err)
 	}
-	if generation, readProblem := store.Install(retired.ID); readProblem != nil || generation != nil {
-		t.Fatalf("retired record = %+v, %v", generation, readProblem)
+	if inst, readProblem := store.Install(retired.ID); readProblem != nil || inst != nil {
+		t.Fatalf("retired record = %+v, %v", inst, readProblem)
 	}
 
-	// A RECORDED DIRECTORY OUTSIDE THE GENERATION ROOT is refused whole: the row is a
+	// A RECORDED DIRECTORY OUTSIDE THE INSTALL ROOT is refused whole: the row is a
 	// pointer, not a licence, and reclaiming it would delete bytes this layout never owned.
 	// The refusal keeps both the file and the record.
 	foreignLayout, problem := home.Open(t.TempDir())
@@ -93,9 +93,9 @@ func TestOutputRetention(t *testing.T) {
 	if err := os.WriteFile(keeper, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	recorded := cleanupTestGeneration(foreignLayout, "3333333333333333", "1.0.0")
+	recorded := cleanupTestInstall(foreignLayout, "3333333333333333", "1.0.0")
 	recorded.Dir = foreign
-	successor := cleanupTestGeneration(foreignLayout, "4444444444444444", "1.0.1")
+	successor := cleanupTestInstall(foreignLayout, "4444444444444444", "1.0.1")
 	if _, problem = foreignStore.Activate(recorded); problem != nil {
 		t.Fatal(problem)
 	}
@@ -103,17 +103,17 @@ func TestOutputRetention(t *testing.T) {
 		t.Fatal(problem)
 	}
 	if _, problem = install.Reclaim(foreignLayout, foreignStore, recorded.ID); problem == nil {
-		t.Fatal("out-of-tree generation directory was accepted")
+		t.Fatal("out-of-tree install directory was accepted")
 	}
 	if got, err := os.ReadFile(keeper); err != nil || string(got) != "keep" {
 		t.Fatalf("out-of-tree file changed: %q, %v", got, err)
 	}
-	if generation, readProblem := foreignStore.Install(recorded.ID); readProblem != nil || generation == nil {
-		t.Fatalf("refused generation record = %+v, %v", generation, readProblem)
+	if inst, readProblem := foreignStore.Install(recorded.ID); readProblem != nil || inst == nil {
+		t.Fatalf("refused install record = %+v, %v", inst, readProblem)
 	}
 }
 
-func cleanupTestGeneration(l home.Layout, id, version string) records.PackageInstall {
+func cleanupTestInstall(l home.Layout, id, version string) records.PackageInstall {
 	return records.PackageInstall{
 		ID: id, Package: "cozy/example", Major: 1, Version: version,
 		SourceKind: "tensorhub", SourceRef: "cozy/example@" + version,

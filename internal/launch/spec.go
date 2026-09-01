@@ -19,20 +19,20 @@ type Facts struct {
 	RuntimeCLI        RuntimeCLI
 }
 
-// Read gathers a generation's facts: where its source is, the surface it proved at
+// Read gathers an install's facts: where its source is, the surface it proved at
 // install, and the runtime that proved it.
-func Read(gen records.PackageInstall, cozyHome string, env []string) (*Facts, *exit.Error) {
-	source := SourceDir(gen)
-	d, e := ReadDescriptor(DescriptorPath(gen.Dir), gen.PackageDescriptor)
+func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *exit.Error) {
+	source := SourceDir(inst)
+	d, e := ReadDescriptor(DescriptorPath(inst.Dir), inst.PackageDescriptor)
 	if e != nil {
 		return nil, e
 	}
-	runtimeBin, descriptor := Binary(gen), ""
-	if gen.SourceKind == "tensorhub" {
-		descriptor = DescriptorPath(gen.Dir)
+	runtimeBin, descriptor := Binary(inst), ""
+	if inst.SourceKind == "tensorhub" {
+		descriptor = DescriptorPath(inst.Dir)
 	}
 	return &Facts{
-		Install:           gen,
+		Install:           inst,
 		Source:            source,
 		PackageDescriptor: d,
 		RuntimeCLI: RuntimeCLI{
@@ -41,22 +41,22 @@ func Read(gen records.PackageInstall, cozyHome string, env []string) (*Facts, *e
 	}, nil
 }
 
-// SourceDir is where a generation's package tree lives. Editable installs retain
+// SourceDir is where an install's package tree lives. Editable installs retain
 // their explicit absolute author-controlled path.
-func SourceDir(gen records.PackageInstall) string {
-	if gen.ProjectDir != "" {
-		return gen.ProjectDir
+func SourceDir(inst records.PackageInstall) string {
+	if inst.ProjectDir != "" {
+		return inst.ProjectDir
 	}
-	if gen.SourceKind == "local" && gen.SourceRef != "" {
-		return gen.SourceRef
+	if inst.SourceKind == "local" && inst.SourceRef != "" {
+		return inst.SourceRef
 	}
-	return filepath.Join(gen.Dir, "source")
+	return filepath.Join(inst.Dir, "source")
 }
 
 // PackageRevisionDigest is the exact published release or editable source digest
-// this generation serves. The same digest pins invocation and worker identity.
-func PackageRevisionDigest(gen records.PackageInstall) string {
-	return gen.SourceDigest
+// this install serves. The same digest pins invocation and worker identity.
+func PackageRevisionDigest(inst records.PackageInstall) string {
+	return inst.SourceDigest
 }
 
 // Placement reads the exact Hub-selected PlacementSet stored at install. Creator never
@@ -86,7 +86,7 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 }
 
 // Spec adds this host's target-environment materialization to a placement. The trusted
-// host Runtime owns worker control; the generation venv supplies the selected executor.
+// host Runtime owns worker control; the install venv supplies the selected executor.
 // A connected worker never calls this method.
 func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	placement, e := f.Placement()

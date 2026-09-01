@@ -181,7 +181,7 @@ RUNTIME_SITES = {
 }
 RUNTIME_BIN = re.compile(r'"cozy-runtime"')
 # (cl-028) The INDIRECTIONS to the same binary, which the literal above cannot see:
-# `launch.Binary()` resolves the generation venv's cozy-runtime and `launch.RuntimeCLI{}`
+# `launch.Binary()` resolves the install venv's cozy-runtime and `launch.RuntimeCLI{}`
 # is its invoker. Product code outside internal/launch reaching either is the same second
 # execution door the literal rule refuses; only the verification driver may (with a door).
 RUNTIME_INDIRECT = re.compile(r"launch\.Binary\s*\(|launch\.RuntimeCLI\s*\{")

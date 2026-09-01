@@ -547,7 +547,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			// request's plan is already resident or loading, and its READY drains the
 			// queue — which is exactly how several submitted jobs queue against ONE
 			// worker (cr-019). A worker in the same slot that staged a DIFFERENT plan is
-			// STALE: the generation's surface moved under it, and treating it as capacity
+			// STALE: the install's surface moved under it, and treating it as capacity
 			// queues the request behind a worker that will never advertise what it needs.
 			// Found live by cl-004's escape arm, which changes the descriptor and
 			// therefore the job descriptor id: six queued jobs waited on a worker holding

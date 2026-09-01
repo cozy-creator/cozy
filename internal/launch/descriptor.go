@@ -1,10 +1,10 @@
-// Package launch turns an INSTALLED GENERATION into the facts needed to serve it: the
+// Package launch turns an INSTALLED PACKAGE into the facts needed to serve it: the
 // package's verified surface, the artifact its binding selects, and the PackageSpec the
 // orchestrator launches. It is what replaces cl-006's `--dev-package` document (cl-010).
 //
 // Nothing here re-derives a fact its owner already produced:
 //
-//   - THE SURFACE is a generation-private descriptor derived once by the release's own
+//   - THE SURFACE is an install-private descriptor derived once by the release's own
 //     Runtime at install. Reading it back costs microseconds; re-running `describe` per
 //     invocation would import the package's module graph to learn a fact already frozen.
 //     The recorded semantic digest is checked on every read.
@@ -37,7 +37,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
-// DescriptorFile is Runtime's derived document inside an immutable generation. It is
+// DescriptorFile is Runtime's derived document inside an immutable install. It is
 // never committed in package source.
 const DescriptorFile = "descriptor.json"
 const descriptorFormat = "cozy.package.descriptor/1"
@@ -446,9 +446,9 @@ func validDescriptorDigestList(values []string, cap int) bool {
 	return true
 }
 
-// DescriptorPath is the one generation-private location for Runtime-derived bytes.
-func DescriptorPath(generationDir string) string {
-	return filepath.Join(generationDir, "documents", DescriptorFile)
+// DescriptorPath is the one install-private location for Runtime-derived bytes.
+func DescriptorPath(installDir string) string {
+	return filepath.Join(installDir, "documents", DescriptorFile)
 }
 
 // ReadDescriptor reads the private descriptor and joins it to the install record.
@@ -456,7 +456,7 @@ func ReadDescriptor(path, expectDigest string) (*PackageDescriptor, *exit.Error)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "descriptor_absent",
-			"this generation carries no private %s", DescriptorFile).
+			"this install carries no private %s", DescriptorFile).
 			WithRemedy("reinstall from the original source so its Runtime can derive the descriptor")
 	}
 	d, problem := DecodeDescriptor(data)
@@ -466,7 +466,7 @@ func ReadDescriptor(path, expectDigest string) (*PackageDescriptor, *exit.Error)
 	if expectDigest != "" && d.Digest != expectDigest {
 		return nil, exit.Named(exit.Conflict, "descriptor_stale",
 			"the private descriptor content digests to %s and this install recorded %s", d.Digest, expectDigest).
-			WithRemedy("the immutable generation is corrupt; reinstall it from its original source")
+			WithRemedy("the immutable install is corrupt; reinstall it from its original source")
 	}
 	return d, nil
 }

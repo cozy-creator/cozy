@@ -1,8 +1,8 @@
 // Package install is the staged install transaction (cozy-creator.md function 2):
 // stage → verify source → build venv → verify descriptor → activate the pin in ONE
-// database transaction. An install is an IMMUTABLE GENERATION plus a pin. The active
-// generation is never extracted over, rebuilt in place, or mutated; a kill at any
-// pre-activation stage leaves the previous pin runnable.
+// database transaction. An install is an IMMUTABLE TREE plus a pin. The active install is
+// never extracted over, rebuilt in place, or mutated; a kill at any pre-activation stage
+// leaves the previous pin runnable.
 package install
 
 import (
@@ -118,7 +118,7 @@ type Selection struct {
 	PackageDescriptor ExactDocument
 }
 
-func validatePublished(gen records.PackageInstall, published *PublishedSource) *exit.Error {
+func validatePublished(inst records.PackageInstall, published *PublishedSource) *exit.Error {
 	descriptor := published.Selection.PackageDescriptor
 	digest, err := canonical.Raw(descriptor.Digest)
 	if err != nil || descriptor.Length != int64(len(descriptor.Bytes)) ||
@@ -126,11 +126,11 @@ func validatePublished(gen records.PackageInstall, published *PublishedSource) *
 		return exit.Named(exit.Conflict, "package_descriptor_identity_mismatch",
 			"published descriptor bytes do not match their digest and length")
 	}
-	if published.ProjectWheel.Distribution != gen.Package[strings.LastIndex(gen.Package, "/")+1:] ||
-		published.ProjectWheel.Version != gen.Version ||
+	if published.ProjectWheel.Distribution != inst.Package[strings.LastIndex(inst.Package, "/")+1:] ||
+		published.ProjectWheel.Version != inst.Version ||
 		published.ProjectWheel.Digest == "" || published.ProjectWheel.Path == "" {
 		return exit.Named(exit.Conflict, "package_wheel_release_mismatch",
-			"published project wheel does not name %s@%s", gen.Package, gen.Version)
+			"published project wheel does not name %s@%s", inst.Package, inst.Version)
 	}
 	config := published.PackageConfig
 	configDigest, err := canonical.Raw(config.Digest)
@@ -181,7 +181,7 @@ type Timing struct {
 }
 
 type Result struct {
-	Gen        records.PackageInstall
+	Install    records.PackageInstall
 	Superseded string
 	Idempotent bool
 	Timings    []Timing
@@ -195,18 +195,18 @@ type Result struct {
 }
 
 // Run executes the whole transaction. Every refusal before Activate leaves the
-// records untouched, so the previously pinned generation stays runnable.
+// records untouched, so the previously pinned install stays runnable.
 func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if (req.Published == nil) == (req.Local == nil) {
 		return nil, exit.Usagef("`cozy package install` needs exactly one package source").
 			WithRemedy("pass org/package for Tensorhub, or an explicit directory such as . or ./project").
 			WithNext("cozy help package install")
 	}
-	id, e := newGenerationID()
+	id, e := newInstallID()
 	if e != nil {
 		return nil, e
 	}
-	genDir := l.InstallDir(id)
+	installDir := l.InstallDir(id)
 	res := &Result{}
 	clock := time.Now()
 	mark := func(stage string) {
@@ -214,11 +214,11 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		clock = time.Now()
 	}
 	fail := func(err *exit.Error) (*Result, *exit.Error) {
-		_ = os.RemoveAll(genDir)
+		_ = os.RemoveAll(installDir)
 		return nil, err
 	}
 
-	gen := records.PackageInstall{ID: id, Dir: genDir}
+	inst := records.PackageInstall{ID: id, Dir: installDir}
 
 	// ---- stage: bytes land under bounds; no code from the release has run ----
 	var sourceDir string
@@ -228,14 +228,14 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			req.Published.ProjectWheel.Path == "" {
 			return fail(exit.Internalf("published package source is incomplete"))
 		}
-		sourceDir = genDir
-		if err := os.MkdirAll(genDir, 0o700); err != nil {
-			return fail(exit.Internalf("cannot create package generation: %s", err))
+		sourceDir = installDir
+		if err := os.MkdirAll(installDir, 0o700); err != nil {
+			return fail(exit.Internalf("cannot create the package install directory: %s", err))
 		}
-		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "tensorhub", req.Published.Package+"@"+req.Published.Release, req.Published.SourceDigest
-		gen.Package, gen.Version, gen.ProjectDir = req.Published.Package, req.Published.Release,
-			filepath.Join(genDir, "source")
-		if e := validatePublished(gen, req.Published); e != nil {
+		inst.SourceKind, inst.SourceRef, inst.SourceDigest = "tensorhub", req.Published.Package+"@"+req.Published.Release, req.Published.SourceDigest
+		inst.Package, inst.Version, inst.ProjectDir = req.Published.Package, req.Published.Release,
+			filepath.Join(installDir, "source")
+		if e := validatePublished(inst, req.Published); e != nil {
 			return fail(e)
 		}
 		res.Files, res.Bytes = req.Published.Files, req.Published.Bytes
@@ -249,37 +249,37 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			return fail(exit.Usagef("local package directory %q is not resolvable: %s", local.Tree, err))
 		}
 		sourceDir = abs
-		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "local", abs, local.SourceDigest
-		gen.Package, gen.Version = local.Package, local.Release
+		inst.SourceKind, inst.SourceRef, inst.SourceDigest = "local", abs, local.SourceDigest
+		inst.Package, inst.Version = local.Package, local.Release
 		res.Files, res.Bytes = local.Files, local.Bytes
 	}
 	mark("stage")
 
 	// ---- verify: source identity settles BEFORE anything can execute ----
-	if e := verifySource(&gen, &res.Warnings); e != nil {
+	if e := verifySource(&inst, &res.Warnings); e != nil {
 		return fail(e)
 	}
-	if e := resolveTarget(&gen, req.Ref); e != nil {
+	if e := resolveTarget(&inst, req.Ref); e != nil {
 		return fail(e)
 	}
 	mark("verify")
 
 	// The pin decision is made before the expensive step, never after it.
-	prior, priorGen, e := st.ActivePackage(gen.Package)
+	prior, priorInstall, e := st.ActivePackage(inst.Package)
 	if e != nil {
 		return fail(e)
 	}
-	if prior != nil && priorGen != nil && priorGen.SourceDigest == gen.SourceDigest {
+	if prior != nil && priorInstall != nil && priorInstall.SourceDigest == inst.SourceDigest {
 		res.Idempotent = true
-		res.Gen = *priorGen
-		_ = os.RemoveAll(genDir)
+		res.Install = *priorInstall
+		_ = os.RemoveAll(installDir)
 		return res, nil
 	}
 	if prior != nil && !req.Force {
-		_ = os.RemoveAll(genDir)
+		_ = os.RemoveAll(installDir)
 		return nil, exit.New(exit.Conflict,
-			"%s is already installed and pinned to generation %s", gen.Package+majorSuffix(gen.Major), short12(prior.InstallID)).
-			WithRemedy("install never silently upgrades; rerun the same source command with --force to build and swap a new generation").
+			"%s is already installed and pinned to install %s", inst.Package+majorSuffix(inst.Major), short12(prior.InstallID)).
+			WithRemedy("install never silently upgrades; rerun the same source command with --force to build and swap a new install").
 			WithNext("cozy package list")
 	}
 	// A --force that fails must keep the working install: exit 13, nothing mutated.
@@ -287,10 +287,10 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		if prior == nil {
 			return fail(err)
 		}
-		_ = os.RemoveAll(genDir)
+		_ = os.RemoveAll(installDir)
 		return nil, exit.New(exit.Conflict,
-			"the replacement generation for %s failed; the working install (generation %s) is untouched and still runnable",
-			gen.Package+majorSuffix(gen.Major), short12(prior.InstallID)).
+			"the replacement install for %s failed; the working install (%s) is untouched and still runnable",
+			inst.Package+majorSuffix(inst.Major), short12(prior.InstallID)).
 			WithRemedy("cause: %s — %s", err.ErrName(), err.Message).
 			WithNext("cozy package list")
 	}
@@ -300,22 +300,22 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 
 	// ---- environment: the first code-executing step, on verified source only ----
-	venvDir := filepath.Join(genDir, "venv")
+	venvDir := filepath.Join(installDir, "venv")
 	var env *EnvironmentReceipt
 	var descriptor *launch.PackageDescriptor
 	var placement ExactDocument
 	var err *exit.Error
 	if req.Published != nil {
-		descriptor, placement, gen.Runtime, env, err = preparePublished(l, genDir, req.Published)
+		descriptor, placement, inst.Runtime, env, err = preparePublished(l, installDir, req.Published)
 	} else {
 		env, err = MaterializeEnvironment(sourceDir, venvDir)
 	}
 	if err != nil {
 		return guard(err)
 	}
-	gen.Python, gen.UV, gen.LockDigest = env.Python, env.UV, env.LockDigest
-	gen.Platform, gen.Extra = env.Platform, env.Extra
-	gen.Packages, gen.Closure = env.Packages, env.Closure
+	inst.Python, inst.UV, inst.LockDigest = env.Python, env.UV, env.LockDigest
+	inst.Platform, inst.Extra = env.Platform, env.Extra
+	inst.Packages, inst.Closure = env.Packages, env.Closure
 	res.Warnings = append(res.Warnings, env.Warnings...)
 	mark("environment")
 
@@ -328,16 +328,16 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			return guard(e)
 		}
 	}
-	descriptorPath := launch.DescriptorPath(genDir)
+	descriptorPath := launch.DescriptorPath(installDir)
 	if err := os.MkdirAll(filepath.Dir(descriptorPath), 0o700); err != nil {
 		return guard(exit.Internalf("cannot create private descriptor root: %s", err))
 	}
 	if err := os.WriteFile(descriptorPath, descriptor.Raw, 0o600); err != nil {
 		return guard(exit.Internalf("cannot store private descriptor: %s", err))
 	}
-	gen.PackageDescriptor = descriptor.Digest
+	inst.PackageDescriptor = descriptor.Digest
 	if req.Local != nil {
-		cache := filepath.Join(genDir, "artifact-cache")
+		cache := filepath.Join(installDir, "artifact-cache")
 		if err := os.MkdirAll(cache, 0o700); err != nil {
 			return guard(exit.Internalf("cannot create editable placement cache: %s", err))
 		}
@@ -346,7 +346,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			return guard(exit.Internalf("cannot store editable PlacementSet: %s", err))
 		}
 	}
-	gen.PlacementSetDigest = placement.Digest
+	inst.PlacementSetDigest = placement.Digest
 	mark("package_descriptor")
 	if req.Local != nil {
 		current, problem := packagepublish.PrepareLocalFrom(sourceDir)
@@ -366,21 +366,21 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 
 	// Disk is measured once, here, and read back from the record forever after.
-	gen.BytesExcl, gen.BytesShared = Disk(genDir)
+	inst.BytesExcl, inst.BytesShared = Disk(installDir)
 
-	// ---- activate: the generation row and the pin swap commit together ----
-	superseded, e := st.Activate(gen)
+	// ---- activate: the install row and the pin swap commit together ----
+	superseded, e := st.Activate(inst)
 	if e != nil {
 		return guard(e)
 	}
-	res.Gen, res.Superseded = gen, superseded
+	res.Install, res.Superseded = inst, superseded
 	mark("activate")
 	return res, nil
 }
 
-// deriveDescriptor runs the generation's own Runtime over its source. Runtime emits the
+// deriveDescriptor runs the install's own Runtime over its source. Runtime emits the
 // complete descriptor without writing the source tree; Cozy validates the closed grammar
-// and stores the canonical bytes under the immutable generation root.
+// and stores the canonical bytes under the immutable install root.
 func deriveDevelopmentPlacement(venvDir, sourceDir, artifactStore string, local LocalSource) (
 	*launch.PackageDescriptor, ExactDocument, *exit.Error,
 ) {
@@ -388,7 +388,7 @@ func deriveDevelopmentPlacement(venvDir, sourceDir, artifactStore string, local 
 	bin := home.VenvTool(venvDir, "cozy-runtime")
 	if _, err := os.Stat(bin); err != nil {
 		return nil, empty, exit.Named(exit.Structural, "runtime_missing",
-			"this generation's venv provides no cozy-runtime at %s", bin).
+			"this install's venv provides no cozy-runtime at %s", bin).
 			WithRemedy("a package depends on cozy-runtime; its surface is described by the runtime the release itself pinned, never this host's").
 			WithNext("cozy help package install")
 	}
@@ -473,7 +473,7 @@ func metadataRefusal(code int, verb, stderr string) *exit.Error {
 	}
 	if json.Unmarshal([]byte(stderr), &doc) != nil || doc.Error.Message == "" {
 		return exit.Named(c, "runtime_metadata_refused",
-			"`cozy-runtime %s` refused this generation (exit %d)", verb, code).
+			"`cozy-runtime %s` refused this install (exit %d)", verb, code).
 			WithRemedy("%s", condense(stderr))
 	}
 	name := doc.Error.Name
@@ -486,48 +486,48 @@ func metadataRefusal(code int, verb, stderr string) *exit.Error {
 }
 
 // verifySource settles source identity before any build backend or import can run.
-func verifySource(gen *records.PackageInstall, warn *[]string) *exit.Error {
-	if gen.SourceKind == "tensorhub" {
-		gen.Verified = true
+func verifySource(inst *records.PackageInstall, warn *[]string) *exit.Error {
+	if inst.SourceKind == "tensorhub" {
+		inst.Verified = true
 		return nil
 	}
-	if gen.SourceKind == "local" {
-		gen.Verified = false
+	if inst.SourceKind == "local" {
+		inst.Verified = false
 		*warn = append(*warn,
 			"local directory install: source bytes are pinned locally but are not a published Tensorhub release")
 		return nil
 	}
-	return exit.Internalf("unknown package source kind %q", gen.SourceKind)
+	return exit.Internalf("unknown package source kind %q", inst.SourceKind)
 }
 
 // resolveTarget reconciles what the release says with what the caller asked for.
-func resolveTarget(gen *records.PackageInstall, ref Ref) *exit.Error {
-	if gen.SourceKind == "local" {
-		major, e := MajorOf(gen.Version)
+func resolveTarget(inst *records.PackageInstall, ref Ref) *exit.Error {
+	if inst.SourceKind == "local" {
+		major, e := MajorOf(inst.Version)
 		if e != nil {
 			return e
 		}
-		gen.Major = major
+		inst.Major = major
 		return nil
 	}
-	if gen.Package == "" || gen.Version == "" {
+	if inst.Package == "" || inst.Version == "" {
 		return exit.Named(exit.Validation, "release_undeclared", "the package source declares no package and version")
 	}
-	if gen.Package != ref.Package {
+	if inst.Package != ref.Package {
 		return exit.Named(exit.Validation, "release_mismatch",
-			"the package source names %q but %q was requested", gen.Package, ref.Package).
+			"the package source names %q but %q was requested", inst.Package, ref.Package).
 			WithRemedy("install the package named by its project metadata")
 	}
-	major, e := MajorOf(gen.Version)
+	major, e := MajorOf(inst.Version)
 	if e != nil {
 		return e
 	}
 	if ref.HasMajor && ref.Major != major {
 		return exit.Named(exit.Validation, "release_mismatch",
-			"%s was requested but the archive publishes version %s (major %d)", ref.String(), gen.Version, major).
+			"%s was requested but the archive publishes version %s (major %d)", ref.String(), inst.Version, major).
 			WithRemedy("install the requested release; one package has only one active version")
 	}
-	gen.Major = major
+	inst.Major = major
 	return nil
 }
 
@@ -543,37 +543,37 @@ func checkCapacity(dir string, staged int64) *exit.Error {
 		return nil
 	}
 	return exit.New(exit.Capacity,
-		"not enough disk to build this generation: needed %s, had %s, short by %s on %s",
+		"not enough disk to build this install: needed %s, had %s, short by %s on %s",
 		units.Bytes(need), units.Bytes(free), units.Bytes(need-free), dir).
 		WithRemedy("free space, remove an installed package, or move COZY_HOME to a larger filesystem").
 		WithNext("cozy package list")
 }
 
-// Remove drops one install: its pin, generation row, and exclusive directory.
+// Remove drops one install: its pin, install row, and exclusive directory.
 // Shared TensorFS bytes are never touched here.
 func Remove(l home.Layout, st *records.Store, pkg string, major int) (int64, *exit.Error) {
-	pin, gen, e := st.ActivePin(pkg, major)
+	pin, inst, e := st.ActivePin(pkg, major)
 	if e != nil || pin == nil {
 		return 0, e
 	}
 	if e := st.Unpin(pkg, major); e != nil {
 		return 0, e
 	}
-	if gen == nil {
+	if inst == nil {
 		return 0, nil
 	}
-	return Reclaim(l, st, gen.ID)
+	return Reclaim(l, st, inst.ID)
 }
 
-// Reclaim removes an unpinned generation immediately. The database claim wins
-// before filesystem deletion, so a newly pinned generation is never removed. Only
+// Reclaim removes an unpinned install immediately. The database claim wins
+// before filesystem deletion, so a newly pinned install is never removed. Only
 // after that claim may the read-only published tree be made removable.
 func Reclaim(l home.Layout, st *records.Store, id string) (int64, *exit.Error) {
-	gen, problem := st.Install(id)
-	if problem != nil || gen == nil {
+	inst, problem := st.Install(id)
+	if problem != nil || inst == nil {
 		return 0, problem
 	}
-	target, problem := generationRemovalTarget(l, *gen)
+	target, problem := recordedRemovalTarget(l, *inst)
 	if problem != nil {
 		return 0, problem
 	}
@@ -584,7 +584,7 @@ func Reclaim(l home.Layout, st *records.Store, id string) (int64, *exit.Error) {
 	if problem := removeInstallTree(target); problem != nil {
 		return 0, problem
 	}
-	return gen.BytesExcl, nil
+	return inst.BytesExcl, nil
 }
 
 // Swept is what one sweep of the install root did. Bytes is EXCLUSIVE bytes: an install
@@ -644,16 +644,16 @@ func sweepInstall(l home.Layout, st *records.Store, id string) (int64, bool, *ex
 	if problem != nil {
 		return 0, false, problem
 	}
-	gen, problem := st.Install(id)
+	inst, problem := st.Install(id)
 	if problem != nil {
 		return 0, false, problem
 	}
-	if gen != nil {
+	if inst != nil {
 		freed, problem := Reclaim(l, st, id)
 		if problem != nil {
 			return 0, false, problem
 		}
-		// Reclaim answers bytes, not verdict, and a generation may record zero exclusive
+		// Reclaim answers bytes, not verdict, and an install may record zero exclusive
 		// bytes. The directory itself is the one honest count of what the sweep removed.
 		_, err := os.Lstat(target)
 		return freed, os.IsNotExist(err), nil
@@ -673,23 +673,23 @@ func installRemovalTarget(l home.Layout, id string) (string, *exit.Error) {
 		return "", exit.Internalf("cannot resolve the install root %s: %s", l.Installs, err)
 	}
 	if id == "" || id == "." || id == ".." || filepath.Base(id) != id {
-		return "", exit.Internalf("refusing to remove generation with unsafe id %q", id)
+		return "", exit.Internalf("refusing to remove an install with unsafe id %q", id)
 	}
 	target := filepath.Join(root, id)
 	if filepath.Dir(target) != root {
-		return "", exit.Internalf("refusing to remove generation %s outside %s", id, root)
+		return "", exit.Internalf("refusing to remove install %s outside %s", id, root)
 	}
 	return target, nil
 }
 
-func generationRemovalTarget(l home.Layout, gen records.PackageInstall) (string, *exit.Error) {
-	target, problem := installRemovalTarget(l, gen.ID)
+func recordedRemovalTarget(l home.Layout, inst records.PackageInstall) (string, *exit.Error) {
+	target, problem := installRemovalTarget(l, inst.ID)
 	if problem != nil {
 		return "", problem
 	}
-	recorded, err := filepath.Abs(gen.Dir)
+	recorded, err := filepath.Abs(inst.Dir)
 	if err != nil || filepath.Clean(recorded) != target {
-		return "", exit.Internalf("refusing to remove generation %s outside %s", gen.ID, filepath.Dir(target))
+		return "", exit.Internalf("refusing to remove install %s outside %s", inst.ID, filepath.Dir(target))
 	}
 	return target, nil
 }
@@ -697,16 +697,16 @@ func generationRemovalTarget(l home.Layout, gen records.PackageInstall) (string,
 // removeInstallTree deletes one resolved install directory. Only after the caller has
 // settled that nothing references it may the read-only published tree be made removable.
 func removeInstallTree(target string) *exit.Error {
-	if err := makeGenerationRemovable(target); err != nil {
-		return exit.Internalf("cannot prepare retired generation directory %s for removal: %s", target, err)
+	if err := makeInstallRemovable(target); err != nil {
+		return exit.Internalf("cannot prepare the retired install directory %s for removal: %s", target, err)
 	}
 	if err := os.RemoveAll(target); err != nil {
-		return exit.Internalf("cannot remove generation directory %s: %s", target, err)
+		return exit.Internalf("cannot remove the install directory %s: %s", target, err)
 	}
 	return nil
 }
 
-func makeGenerationRemovable(root string) error {
+func makeInstallRemovable(root string) error {
 	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if os.IsNotExist(walkErr) {
@@ -729,10 +729,10 @@ func makeGenerationRemovable(root string) error {
 	})
 }
 
-func newGenerationID() (string, *exit.Error) {
+func newInstallID() (string, *exit.Error) {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
-		return "", exit.Internalf("cannot mint a generation id: %s", err)
+		return "", exit.Internalf("cannot mint an install id: %s", err)
 	}
 	return hex.EncodeToString(b), nil
 }

@@ -143,10 +143,10 @@ func (l Layout) PendingRentalCreatorIdentity(operationKey string) string {
 // public — trusting exactly this PEM and no CA is what makes the pin a pin (#445).
 func (l Layout) RentalCert(id string) string { return filepath.Join(l.Rentals, id+".pem") }
 
-// InstallDir is where one install's source tree and venv live. The id is still an
-// install-generation id: the directory is replaced wholesale, never mutated. "generations"
-// was the wrong name for the FOLDER -- in a product that generates media, a top-level
-// `generations/` reads as the output namespace, which is `outputs/`.
+// InstallDir is where one install's source tree and venv live. The directory is replaced
+// wholesale, never mutated. "generations" was the wrong name for the FOLDER -- in a product
+// that generates media, a top-level `generations/` reads as the output namespace, which is
+// `outputs/`.
 func (l Layout) InstallDir(id string) string { return filepath.Join(l.Installs, id) }
 
 // WorkerDir is one worker session's own root: its journal, its log, and the binding

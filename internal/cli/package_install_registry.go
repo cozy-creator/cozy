@@ -66,14 +66,14 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	_, generation, problem := existing.ActivePackage(ref.String())
+	_, existingInstall, problem := existing.ActivePackage(ref.String())
 	if problem != nil {
 		existing.Close()
 		return problem
 	}
-	if generation != nil && generation.SourceDigest == releaseDigest {
+	if existingInstall != nil && existingInstall.SourceDigest == releaseDigest {
 		defer existing.Close()
-		result := &install.Result{Gen: *generation, Idempotent: true}
+		result := &install.Result{Install: *existingInstall, Idempotent: true}
 		if err := os.MkdirAll(existingLayout.Transfer, 0o700); err != nil {
 			return exit.Internalf("cannot create model prefetch scratch: %s", err)
 		}
@@ -82,7 +82,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 			return exit.Internalf("cannot create model prefetch scratch: %s", err)
 		}
 		defer os.RemoveAll(modelScratch)
-		bestEffortDefaultModels(hctx, ctx, modelScratch, generation.Runtime,
+		bestEffortDefaultModels(hctx, ctx, modelScratch, existingInstall.Runtime,
 			&install.PublishedSource{Package: ref.String(), Release: release,
 				SourceDigest: releaseDigest, PackageConfig: packageConfig,
 				Selection: install.Selection{PackageDescriptor: packageDescriptor}}, result)
@@ -125,7 +125,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	}
 	st.Close()
 	writer.Unlock()
-	bestEffortDefaultModels(hctx, ctx, scratch, result.Gen.Runtime, published, result)
+	bestEffortDefaultModels(hctx, ctx, scratch, result.Install.Runtime, published, result)
 	_, outputStore, outputWriter, problem := open(ctx.Cfg, true)
 	if problem != nil {
 		return problem
