@@ -1,0 +1,1 @@
+{"grade":{"source":"this checkpoint's bf16 tensors","t":"PRODUCIBLE","target":"f8_e4m3fn at transformer/blocks.0.attn.to_q.weight"},"report":"sha256:3c7a0543498900ee84ed2992e7acd9e40e18b4d1514f068efb0cd8b42e998e19"}

@@ -24,9 +24,43 @@ jobs:
       - run: python3 scripts/fence.py
       - run: python3 scripts/version_contract.py source
       - run: cargo build --release --bin tfs
-      # The 90 frozen vectors and their .verdict files: every canonical document kind,
-      # its exact object id, its typed refusal code, and one-byte mutants of each.
+      # The frozen vectors and their .verdict files: every canonical document kind,
+      # its exact object id, its typed refusal code, and one-byte mutants of each. The
+      # grading plane's documents are IN here (conversion_registration, grade_decision,
+      # all four grades and a fifth-grade red arm), so the closed four-level ladder and
+      # the registration's canonical form are frozen like everything else.
       - run: ./target/release/tfs vectors verify
+      # The registration ACT, in the shipped binary. This RUNS bf16 -> f32 -> bf16 over
+      # the COMPLETE 16-bit domain — all 65,536 representable inputs — and the
+      # registration exists only because that came back byte-identical. A proof, not a
+      # sample, and CI is where it should run rather than where someone remembers to.
+      - run: ./target/release/tfs grade register bf16-to-f32 widen bf16:f32
+      # The counterpart, and the arm that matters most: a re-quantization structurally
+      # CANNOT register. f32 -> bf16 discards mantissa bits, so the round trip is not
+      # byte-identical and the registration is refused ROUND_TRIP_LOSSY. Required to fail,
+      # and required to fail for THAT reason — a refusal for some other cause would hide a
+      # gone fence behind a passing step.
+      - run: |
+          python3 -c "import struct,sys; sys.stdout.buffer.write(b''.join(
+            struct.pack('<f', 1.0 + i * 1e-6) for i in range(4096)))" > "${RUNNER_TEMP}/f32.bin"
+          if ./target/release/tfs grade register f32-to-bf16 widen f32:bf16 \
+              --corpus "${RUNNER_TEMP}/f32.bin" 2> "${RUNNER_TEMP}/lossy.err"; then
+            echo "a lossy cast registered: the round-trip fence is gone" >&2
+            exit 1
+          fi
+          grep -q ROUND_TRIP_LOSSY "${RUNNER_TEMP}/lossy.err" || {
+            echo "refused, but not as a lossy round trip:" >&2
+            cat "${RUNNER_TEMP}/lossy.err" >&2
+            exit 1
+          }
+      # Qualification: an unrecognised (encoding, device) pair is the ABSENCE of evidence,
+      # never permission. The admitted arm and the refused arm both run.
+      - run: ./target/release/tfs capability --alias plain/1 x cpu
+      - run: |
+          if ./target/release/tfs capability --alias plain/1 x cuda; then
+            echo "an unqualified device was admitted" >&2
+            exit 1
+          fi
       # Every reference decoder in the harness, qualified bit-for-bit against the
       # producer-mined vectors, and every deliberately-wrong arm required to FAIL.
       - run: ./target/release/tfs conform

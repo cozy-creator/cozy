@@ -3,9 +3,17 @@ name = "tensorfs-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["grade"]
+# Hub-side catalog grading (grade.rs, verifier.rs). The worker wheel builds WITHOUT it
+# (tensorfs-py sets default-features = false), so catalog-grading vocabulary stays out of
+# the serving path; the tfs CLI requires it.
+grade = []
+
 [[bin]]
 name = "tfs"
 path = "src/bin/tfs/main.rs"
+required-features = ["grade"]
 
 [dependencies]
 fs2 = "0.4"
