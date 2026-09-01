@@ -13,6 +13,9 @@ import (
 )
 
 func (c *Orchestrator) runModelPassThrough(req records.Request) {
+	// This continuation owns only privileged source/destination I/O for the one
+	// ordinary attempt-zero request. It is restartable from the sidecar and has no
+	// scheduler, graph, retry budget, route, id namespace, or terminal of its own.
 	c.mu.Lock()
 	if c.transferRunning[req.ID] {
 		c.mu.Unlock()

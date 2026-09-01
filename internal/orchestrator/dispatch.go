@@ -317,6 +317,9 @@ func (c *Orchestrator) logRecordedReplay(req records.Request, idempotencyKey str
 func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Error) {
 	if req.ModelTransfer != nil && req.Package == "cozy/platform" &&
 		req.Entrypoint == "model-pass-through" {
+		// Narrow attempt-zero exception: an unchanged verified Manifest has no code
+		// to execute and no bytes to reproduce. The boundary hooks settle the same
+		// ordinary request/events/watch/cancel surface; producer transfers never enter here.
 		go c.runModelPassThrough(req)
 		return 0, nil
 	}
