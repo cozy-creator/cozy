@@ -1,4 +1,4 @@
 doc: grade_decision
 expect: ok
-id: sha256:a15983e4e7c1395f4cf37a7d771d8ac3eb00857a1264b1bfbdceaf282823f149
+id: sha256:af87fa36e43a107529799333642a238fe19792a6084381228d42021872dc1d2d
 note: a different model, not a different packaging

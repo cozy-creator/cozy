@@ -161,6 +161,7 @@ codes![
     // the layout plane: hub grading (tfs-009)
     ROUND_TRIP_LOSSY,
     UNREGISTERED_CONVERSION,
+    PARTIAL_MISMATCH_SET,
     // roots, holds and GC (tfs-006)
     LOCK_CONTENDED,
     ROOT_GENERATION,

@@ -257,6 +257,7 @@ pub fn run_doc<'p>(
     result.set_item("id", outcome.id)?;
     result.set_item("topology", outcome.topology)?;
     result.set_item("manifest", outcome.manifest)?;
+    result.set_item("grade", outcome.grade)?;
     Ok(result)
 }
 

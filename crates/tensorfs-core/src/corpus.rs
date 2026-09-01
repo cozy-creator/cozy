@@ -16,13 +16,19 @@ use crate::spec::EncodingSpec;
 use crate::vectors::EncodingVectors;
 
 /// What a vector's bytes turned into. `id` is the universal identity law
-/// (`sha256(stored_bytes)`); the other two are present only for the documents that project
+/// (`sha256(stored_bytes)`); the others are present only for the documents that project
 /// them, and their absence is itself part of the frozen verdict.
+///
+/// `grade` is the hub verdict a compatibility report earns, at the depth that report was
+/// taken. It is projected here so the corpus freezes the DECISION and not merely the bytes:
+/// a grader that regressed to reading the first fact of a multi-fact report would still
+/// produce a byte-identical document, and only a frozen verdict notices.
 #[derive(Debug, Clone)]
 pub struct DocOutcome {
     pub id: String,
     pub topology: Option<String>,
     pub manifest: Option<String>,
+    pub grade: Option<String>,
 }
 
 pub const DOC_KINDS: &[&str] = &[
@@ -51,6 +57,7 @@ pub fn run_doc(
     platform: &[String],
 ) -> Result<DocOutcome> {
     let id = crate::ids::object_id(bytes);
+    let mut grade: Option<String> = None;
     let (topology, manifest) = match doc {
         "header" => Header::parse(bytes).and_then(|h| {
             h.validate(closure)?;
@@ -89,7 +96,17 @@ pub fn run_doc(
             crate::compat::CodeTopology::parse(bytes).map(|c| (Some(c.topology_digest()), None))?
         }
         "compat_report" => {
-            crate::compat::CompatibilityReport::parse(bytes).map(|_| (None, None))?
+            let report = crate::compat::CompatibilityReport::parse(bytes)?;
+            #[cfg(feature = "grade")]
+            {
+                grade = Some(
+                    crate::grade::grade_report(&report, &crate::grade::Registry::default())?
+                        .name()
+                        .to_string(),
+                );
+            }
+            let _ = &report;
+            (None, None)
         }
         // The grading plane's two documents. They are in THIS dispatch — the one the CLI
         // and the Python facade share — so the wheel and the binary verify the same corpus
@@ -111,6 +128,7 @@ pub fn run_doc(
         id,
         topology,
         manifest,
+        grade,
     })
 }
 

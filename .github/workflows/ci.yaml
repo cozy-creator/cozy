@@ -29,6 +29,12 @@ jobs:
       # grading plane's documents are IN here (conversion_registration, grade_decision,
       # all four grades and a fifth-grade red arm), so the closed four-level ladder and
       # the registration's canonical form are frozen like everything else.
+      #
+      # A compat_report's frozen verdict carries the GRADE it earns, not only its bytes, so
+      # tfs-037's red arm runs here: one contract and one checkpoint produce two reports,
+      # PRODUCIBLE when the walk stops at the first fact and INCOMPATIBLE when it walks the
+      # whole set. A ranking path that regressed to reading the first fact would still emit
+      # byte-identical documents and only these verdicts would notice.
       - run: ./target/release/tfs vectors verify
       # The registration ACT, in the shipped binary. This RUNS bf16 -> f32 -> bf16 over
       # the COMPLETE 16-bit domain — all 65,536 representable inputs — and the

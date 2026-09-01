@@ -76,6 +76,8 @@ def main() -> int:
                     bad.append(f"topology {ok['topology']!r} != frozen {v['topology']}")
                 if "manifest" in v and ok["manifest"] != v["manifest"]:
                     bad.append(f"manifest {ok['manifest']!r} != frozen {v['manifest']}")
+                if "grade" in v and ok["grade"] != v["grade"]:
+                    bad.append(f"grade {ok['grade']!r} != frozen {v['grade']}")
                 good = not bad
                 why = "; ".join(bad) if bad else f"id={str(ok['id'])[7:19]}"
         elif expect == "refuse":

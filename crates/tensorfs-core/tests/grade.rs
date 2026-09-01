@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use tensorfs_core::compat::{self, CodeTopology, CompatibilityReport, Lane};
+use tensorfs_core::compat::{self, CodeTopology, CompatibilityReport, Depth, Lane};
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::err::Code;
 use tensorfs_core::grade::{
@@ -129,14 +129,37 @@ fn frozen_pair() -> (CodeTopology, Header, Closure, Vec<String>) {
     (code, header, closure, pin)
 }
 
+fn report_at(
+    code: &CodeTopology,
+    pair: &(CodeTopology, Header, Closure, Vec<String>),
+    depth: Depth,
+) -> CompatibilityReport {
+    let (_, header, closure, pin) = pair;
+    let out = compat::check_compatibility(code, header, closure, pin, Lane::Canonical, &[], depth)
+        .expect("check");
+    CompatibilityReport::of(code, header, Lane::Canonical, &out).expect("report")
+}
+
 fn report_for(
     code: &CodeTopology,
     pair: &(CodeTopology, Header, Closure, Vec<String>),
 ) -> CompatibilityReport {
-    let (_, header, closure, pin) = pair;
-    let out = compat::check_compatibility(code, header, closure, pin, Lane::Canonical, &[])
-        .expect("check");
-    CompatibilityReport::of(code, header, Lane::Canonical, &out).expect("report")
+    report_at(code, pair, Depth::FirstMismatch)
+}
+
+/// The contract of the red arm: the FIRST key asks for a dtype the checkpoint can only be
+/// converted down to (PRODUCIBLE on its own) and the LAST asks for a shape the checkpoint
+/// does not have (INCOMPATIBLE on its own). Keys are compared in canonical order, so the
+/// producible fact is genuinely the one a first-mismatch walk stops on.
+fn cast_first_then_shape(code: &CodeTopology) -> CodeTopology {
+    let mut out = code.clone();
+    let keys: usize = out.components.iter().map(|(_, k)| k.len()).sum();
+    assert!(keys >= 2, "the arm needs two keys to have a second fact");
+    out.components[0].1[0].1.dtype = Dtype::F8E4M3FN;
+    let last = out.components.len() - 1;
+    let tail = out.components[last].1.len() - 1;
+    out.components[last].1[tail].1.shape = vec![7];
+    out
 }
 
 fn retype(code: &CodeTopology, to: Dtype) -> CodeTopology {
@@ -309,6 +332,234 @@ fn a_shape_mismatch_stays_incompatible_under_a_full_registry() {
     grade::guard_over_constraint(&report, &registry, &graded).expect("not a cast-only mismatch");
 }
 
+// ------------------------------------------- tfs-037: the worst fact, not the first
+
+/// THE RED ARM. A pair whose FIRST mismatch is a dtype cast and whose SECOND is a shape
+/// mismatch. Graded on the first fact it reads PRODUCIBLE — "we could run this if you
+/// convert it" — and it is a lie: the shape mismatch is a different model and no conversion
+/// reaches it. A catalog search built on the first fact would systematically over-promise,
+/// which is why ranking walks the whole set.
+#[test]
+fn the_worst_fact_decides_a_ranking_not_the_first() {
+    let pair = frozen_pair();
+    let contract = cast_first_then_shape(&pair.0);
+    let registry = bf16_to_f32();
+
+    // The preflight walk stops on the cast, and the cast alone is PRODUCIBLE.
+    let preflight = report_at(&contract, &pair, Depth::FirstMismatch);
+    assert_eq!(preflight.mismatches.len(), 1, "one fact answers preflight");
+    assert_eq!(preflight.mismatches[0].code, Code::DTYPE_MISMATCH);
+    assert!(
+        matches!(
+            grade::grade(&preflight, &registry),
+            Grade::Producible { .. }
+        ),
+        "the first fact really is a producible cast — that is what makes this a trap"
+    );
+
+    // The full walk finds the shape mismatch behind it, and the WORST fact decides.
+    let full = report_at(&contract, &pair, Depth::Full);
+    assert_eq!(
+        full.mismatches.len(),
+        2,
+        "the second fact is the one that decides"
+    );
+    assert_eq!(full.mismatches[0].code, Code::DTYPE_MISMATCH);
+    assert_eq!(full.mismatches[1].code, Code::SHAPE_MISMATCH);
+    match grade::grade_all(&full, &registry).expect("a full report may be ranked") {
+        Grade::Incompatible { reason } => assert!(
+            reason.contains("shapes disagree"),
+            "the verdict names the fact that blocked it: {reason}"
+        ),
+        other => panic!("expected INCOMPATIBLE from the whole set, got {other:?}"),
+    }
+
+    // And the first-fact grade is still available and still PRODUCIBLE: the two answers are
+    // different questions, not a bug fixed by deleting one.
+    assert!(matches!(
+        grade::grade(&full, &registry),
+        Grade::Producible { .. }
+    ));
+}
+
+/// Ranking a report that STOPPED at the first fact is refused, not guessed. Once the depth
+/// is dropped a stopped walk and a complete one are indistinguishable, and "the worst fact
+/// of a set that holds one" is the over-promise above wearing the right function's name.
+#[test]
+fn a_stopped_walk_cannot_be_ranked() {
+    let pair = frozen_pair();
+    let contract = cast_first_then_shape(&pair.0);
+    let preflight = report_at(&contract, &pair, Depth::FirstMismatch);
+    let err =
+        grade::grade_all(&preflight, &bf16_to_f32()).expect_err("a partial set must not be ranked");
+    assert_eq!(refusal_code(err), Code::PARTIAL_MISMATCH_SET.as_str());
+
+    // `grade_report` asks the document which question it answers, so it never has to guess.
+    assert!(matches!(
+        grade::grade_report(&preflight, &bf16_to_f32()).expect("preflight grades"),
+        Grade::Producible { .. }
+    ));
+}
+
+/// Law 2 THROUGH the selection. The worst fact here is the second one, and its remedy must
+/// come from the CONTRACT side of THAT fact — not from the first fact's contract, and not
+/// from anything the walk observed. Selecting a level from one fact and a target from
+/// another is exactly the v1 bug class with a new way in.
+#[test]
+fn the_worst_grades_remedy_comes_from_its_own_facts_contract() {
+    let pair = frozen_pair();
+    // First key: a registered lossless widening — CONVERTIBLE, the mildest non-compatible
+    // grade. Second key: a downward cast to the contract's f8_e4m3fn — PRODUCIBLE, worse.
+    let mut contract = pair.0.clone();
+    contract.components[0].1[0].1.dtype = Dtype::F32;
+    contract.components[0].1[1].1.dtype = Dtype::F8E4M3FN;
+    let full = report_at(&contract, &pair, Depth::Full);
+    assert_eq!(full.mismatches.len(), 2);
+
+    match grade::grade_all(&full, &bf16_to_f32()).expect("rank") {
+        Grade::Producible { target, source } => {
+            assert!(
+                target.contains("f8_e4m3fn"),
+                "the target is the SECOND fact's contract dtype: {target}"
+            );
+            assert!(
+                target.contains("blocks.0.norm.weight"),
+                "and the second fact's key, not the first's: {target}"
+            );
+            assert!(
+                !target.contains("f32"),
+                "the first fact's contract must not leak into the worst fact's remedy: {target}"
+            );
+            assert!(
+                source.contains("bf16"),
+                "source is the observation: {source}"
+            );
+        }
+        other => panic!("expected PRODUCIBLE from the worst fact, got {other:?}"),
+    }
+}
+
+/// The over-constraint guard, read over the WHOLE set. A covered cast sorted ahead of a
+/// shape mismatch does not make the INCOMPATIBLE verdict over-constraint: the shape
+/// mismatch is real and no registration touches it. A guard that read only the first fact
+/// would refuse this correct verdict outright.
+#[test]
+fn the_guard_reads_the_whole_set_before_it_fires() {
+    let pair = frozen_pair();
+    let mut contract = pair.0.clone();
+    contract.components[0].1[0].1.dtype = Dtype::F32; // covered by bf16-to-f32
+    contract.components[0].1[1].1.shape = vec![7]; // covered by nothing at all
+    let full = report_at(&contract, &pair, Depth::Full);
+    let registry = bf16_to_f32();
+
+    let graded = grade::grade_all(&full, &registry).expect(
+        "a covered cast beside a shape \
+                                                            mismatch is honestly INCOMPATIBLE",
+    );
+    assert!(matches!(graded, Grade::Incompatible { .. }), "{graded:?}");
+
+    // And it still fires when EVERY fact is a covered cast: that is the v1 shortcut.
+    let all_casts = retype(&pair.0, Dtype::F32);
+    let covered = report_at(&all_casts, &pair, Depth::Full);
+    let planted = Grade::Incompatible {
+        reason: "the shortcut a red arm plants".into(),
+    };
+    let err = grade::guard_over_constraint(&covered, &registry, &planted)
+        .expect_err("forbidden over-constraint must refuse");
+    assert_eq!(refusal_code(err), Code::UNREGISTERED_CONVERSION.as_str());
+}
+
+/// The cheap path is CHEAP, and both paths are the same code. Preflight stops at the first
+/// blocking fact and pays for nothing after it; the full walk pays for the whole topology
+/// and is the only one that may be ranked. The numbers are printed rather than asserted —
+/// a wall-clock threshold in CI is a flake, and what must hold is the work done, which the
+/// mismatch counts state exactly.
+#[test]
+fn preflight_stops_and_the_full_walk_does_not() {
+    use std::time::Instant;
+    use tensorfs_core::compat::{Accepts, Requirement};
+    use tensorfs_core::header::{Part, Tensor};
+
+    const KEYS: usize = 4096;
+    let spec = tensorfs_core::registry::seeds()
+        .into_iter()
+        .find(|s| s.alias == "plain/1")
+        .expect("plain/1")
+        .spec;
+    let encoding = spec.object_id();
+    let tensors: Vec<(String, Tensor)> = (0..KEYS)
+        .map(|i| {
+            (
+                format!("blocks.{i:05}.weight"),
+                Tensor {
+                    dtype: Dtype::Bf16,
+                    shape: vec![1],
+                    encoding: encoding.clone(),
+                    parts: vec![("value".into(), Part::plan(Dtype::Bf16, vec![1], &[0, 0]))],
+                },
+            )
+        })
+        .collect();
+    let header = Header {
+        configs: vec![],
+        assets: vec![],
+        encodings: vec![spec],
+        components: vec![("core".into(), tensors.clone())],
+    };
+    // EVERY key disagrees, so the full walk records KEYS facts and preflight records one.
+    let code = CodeTopology {
+        contract: tensorfs_core::ids::object_id(b"depth-cost"),
+        components: vec![(
+            "core".into(),
+            tensors
+                .iter()
+                .map(|(k, _)| {
+                    (
+                        k.clone(),
+                        Requirement {
+                            dtype: Dtype::F8E4M3FN,
+                            shape: vec![1],
+                            accepts: Accepts::Any,
+                        },
+                    )
+                })
+                .collect(),
+        )],
+    };
+    let pin = vec![encoding];
+
+    let mut timing = Vec::new();
+    for depth in [Depth::FirstMismatch, Depth::Full] {
+        let t = Instant::now();
+        let mut out = None;
+        for _ in 0..50 {
+            out = Some(
+                compat::check_compatibility(
+                    &code,
+                    &header,
+                    &Closure::default(),
+                    &pin,
+                    Lane::Canonical,
+                    &[],
+                    depth,
+                )
+                .expect("check"),
+            );
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / 50.0;
+        let out = out.unwrap();
+        timing.push((depth, us, out.mismatches.len()));
+    }
+    for (depth, us, n) in &timing {
+        eprintln!(
+            "{KEYS} keys, depth {:<14} {us:9.1} us   {n} fact(s)",
+            depth.name()
+        );
+    }
+    assert_eq!(timing[0].2, 1, "preflight records ONE fact");
+    assert_eq!(timing[1].2, KEYS, "the full walk records every one");
+}
+
 /// The decision document is what a hub stores and a consumer reads back. Each grade must
 /// survive its canonical encoding intact — a remedy that did not round-trip would be a
 /// remedy the consumer never sees.
@@ -367,8 +618,18 @@ fn field(json: &str, key: &str) -> String {
 }
 
 fn graded_json(dir: &Path, name: &str, code: &CodeTopology, registry: Option<&Path>) -> String {
+    graded_json_at(dir, name, code, registry, Depth::FirstMismatch)
+}
+
+fn graded_json_at(
+    dir: &Path,
+    name: &str,
+    code: &CodeTopology,
+    registry: Option<&Path>,
+    depth: Depth,
+) -> String {
     let pair = frozen_pair();
-    let report = report_for(code, &pair);
+    let report = report_at(code, &pair, depth);
     let report_path = dir.join(format!("{name}.report"));
     std::fs::write(&report_path, report.canonical_bytes()).expect("write report");
     let report_arg = report_path.to_string_lossy().to_string();
@@ -409,7 +670,9 @@ fn the_json_surface_is_total_and_carries_the_remedy() {
 
     let every_key = [
         "decision",
+        "depth",
         "grade",
+        "mismatches",
         "reason",
         "remedy_mapping",
         "remedy_registration",
@@ -453,8 +716,41 @@ fn the_json_surface_is_total_and_carries_the_remedy() {
     assert_eq!(field(&incompatible, "grade"), "INCOMPATIBLE");
     assert!(!field(&incompatible, "reason").is_empty());
 
+    // tfs-037 over the seam tensorhub reads. The SAME contract, graded from a report that
+    // stopped at the first fact and from one that walked the whole topology: PRODUCIBLE
+    // against INCOMPATIBLE. A catalog search that read the first would offer a conversion
+    // that cannot work, and `depth` is how a consumer tells which answer it holds.
+    let contract = cast_first_then_shape(&pair.0);
+    let stopped = graded_json_at(
+        &dir,
+        "worst-first-fact",
+        &contract,
+        Some(&registry_path),
+        Depth::FirstMismatch,
+    );
+    assert_eq!(field(&stopped, "grade"), "PRODUCIBLE");
+    assert_eq!(field(&stopped, "depth"), "first-mismatch");
+    assert!(stopped.contains("\"mismatches\":1"), "{stopped}");
+
+    let ranked = graded_json_at(
+        &dir,
+        "worst-full",
+        &contract,
+        Some(&registry_path),
+        Depth::Full,
+    );
+    assert_eq!(field(&ranked, "grade"), "INCOMPATIBLE");
+    assert_eq!(field(&ranked, "depth"), "full");
+    assert!(ranked.contains("\"mismatches\":2"), "{ranked}");
+    assert!(field(&ranked, "reason").contains("shapes disagree"));
+    assert_eq!(
+        field(&ranked, "remedy_target"),
+        "",
+        "totality holds on the worst grade too"
+    );
+
     for key in every_key {
-        for json in [&convertible, &producible, &incompatible] {
+        for json in [&convertible, &producible, &incompatible, &stopped, &ranked] {
             assert!(
                 json.contains(&format!("\"{key}\":")),
                 "{key} absent: {json}"
