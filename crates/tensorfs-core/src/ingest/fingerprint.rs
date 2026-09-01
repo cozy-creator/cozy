@@ -193,11 +193,18 @@ pub struct SourceProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceProfileComponent {
     pub component: String,
-    pub keyset_digest: String,
     /// Optional reviewed provider/source slot. Required only when carrier bytes
     /// cannot distinguish components (for example H3's identical DiT headers).
     pub source_member: Option<String>,
+    /// Optional reviewed provider namespace for structurally interchangeable members.
+    pub source_member_prefix: Option<String>,
     pub target_encoding: String,
+    pub variants: Vec<SourceProfileVariant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceProfileVariant {
+    pub keyset_digest: String,
     pub construction_order: Vec<String>,
 }
 
@@ -250,15 +257,27 @@ impl FingerprintRegistry {
         if keyset.is_empty() {
             return Verdict::Unregistered;
         }
-        let hits: Vec<&&Banked> = keyset
+        let component: Vec<&Banked> = keyset
             .iter()
+            .copied()
             .filter(|e| e.component == fp.component)
             .collect();
-        match hits.len() {
-            0 => Verdict::ComponentAmbiguous {
+        if component.is_empty() {
+            return Verdict::ComponentAmbiguous {
                 banked_as: keyset.iter().map(|e| name_of(e)).collect(),
-            },
-            1 => Verdict::Authorized(Box::new((*hits[0]).clone())),
+            };
+        }
+        let hits: Vec<&Banked> = component
+            .iter()
+            .copied()
+            .filter(|e| {
+                e.topology_digest == fp.topology_digest
+                    && e.logical_keys as usize == fp.logical_keys
+            })
+            .collect();
+        match hits.len() {
+            0 => Verdict::Unregistered,
+            1 => Verdict::Authorized(Box::new(hits[0].clone())),
             _ => Verdict::Ambiguous(hits.iter().map(|e| name_of(e)).collect()),
         }
     }
@@ -301,16 +320,20 @@ impl FingerprintRegistry {
     }
 
     pub fn merge(&mut self, e: Banked) {
-        match self
-            .entries
-            .iter_mut()
-            .find(|x| x.keyset_digest == e.keyset_digest && x.component == e.component)
-        {
+        match self.entries.iter_mut().find(|x| {
+            x.keyset_digest == e.keyset_digest
+                && x.component == e.component
+                && x.topology_digest == e.topology_digest
+        }) {
             Some(slot) => *slot = e,
             None => self.entries.push(e),
         }
         self.entries.sort_by(|a, b| {
-            (&a.keyset_digest, &a.component).cmp(&(&b.keyset_digest, &b.component))
+            (&a.keyset_digest, &a.component, &a.topology_digest).cmp(&(
+                &b.keyset_digest,
+                &b.component,
+                &b.topology_digest,
+            ))
         });
     }
 
@@ -414,38 +437,46 @@ impl FingerprintRegistry {
             Some(value) => parse_source_profiles(value)?,
         };
         f.done()?;
-        let mut seen: Vec<(&str, &str)> = entries
+        let mut seen: Vec<(&str, &str, &str)> = entries
             .iter()
-            .map(|e| (e.keyset_digest.as_str(), e.component.as_str()))
+            .map(|e| {
+                (
+                    e.keyset_digest.as_str(),
+                    e.component.as_str(),
+                    e.topology_digest.as_str(),
+                )
+            })
             .collect();
         let given = seen.clone();
         seen.sort();
         if seen != given {
             return refuse(
                 Code::SORT_ORDER,
-                "registry entries must be sorted by (keyset_digest, component)",
+                "registry entries must be sorted by (keyset_digest, component, topology_digest)",
             );
         }
         seen.dedup();
         if seen.len() != entries.len() {
             return refuse(
                 Code::DUPLICATE_KEY,
-                "two entries bank the same (keyset_digest, component)",
+                "two entries bank the same (keyset_digest, component, topology_digest)",
             );
         }
         for profile in &source_profiles {
             for component in &profile.components {
-                if !entries.iter().any(|entry| {
-                    entry.component == component.component
-                        && entry.keyset_digest == component.keyset_digest
-                }) {
-                    return refuse(
-                        Code::UNREGISTERED_FINGERPRINT,
-                        format!(
-                            "source profile {:?} cites unbanked component {:?} / {}",
-                            profile.name, component.component, component.keyset_digest
-                        ),
-                    );
+                for variant in &component.variants {
+                    if !entries.iter().any(|entry| {
+                        entry.component == component.component
+                            && entry.keyset_digest == variant.keyset_digest
+                    }) {
+                        return refuse(
+                            Code::UNREGISTERED_FINGERPRINT,
+                            format!(
+                                "source profile {:?} cites unbanked component {:?} / {}",
+                                profile.name, component.component, variant.keyset_digest
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -501,23 +532,36 @@ impl FingerprintRegistry {
                                                         Value::str(component.component.clone()),
                                                     ),
                                                     (
-                                                        "construction_order",
-                                                        Value::arr(
-                                                            component
-                                                                .construction_order
-                                                                .iter()
-                                                                .map(|key| Value::str(key.clone()))
-                                                                .collect(),
-                                                        ),
-                                                    ),
-                                                    (
-                                                        "keyset_digest",
-                                                        Value::str(component.keyset_digest.clone()),
-                                                    ),
-                                                    (
                                                         "target_encoding",
                                                         Value::str(
                                                             component.target_encoding.clone(),
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "variants",
+                                                        Value::arr(
+                                                            component
+                                                                .variants
+                                                                .iter()
+                                                                .map(|variant| {
+                                                                    Value::obj(vec![
+                                                                        (
+                                                                            "construction_order",
+                                                                            Value::arr(
+                                                                                variant
+                                                                                    .construction_order
+                                                                                    .iter()
+                                                                                    .map(|key| Value::str(key.clone()))
+                                                                                    .collect(),
+                                                                            ),
+                                                                        ),
+                                                                        (
+                                                                            "keyset_digest",
+                                                                            Value::str(variant.keyset_digest.clone()),
+                                                                        ),
+                                                                    ])
+                                                                })
+                                                                .collect(),
                                                         ),
                                                     ),
                                                 ];
@@ -525,6 +569,12 @@ impl FingerprintRegistry {
                                                     fields.push((
                                                         "source_member",
                                                         Value::str(member.clone()),
+                                                    ));
+                                                }
+                                                if let Some(prefix) = &component.source_member_prefix {
+                                                    fields.push((
+                                                        "source_member_prefix",
+                                                        Value::str(prefix.clone()),
                                                     ));
                                                 }
                                                 Value::obj(fields)
@@ -558,27 +608,61 @@ fn parse_source_profiles(value: &Value) -> Result<Vec<SourceProfile>> {
                 &component,
                 limits::MAX_NAME_BYTES,
             )?;
-            let keyset_digest = prefixed(
-                "source profile keyset_digest",
-                component_fields.req_str("keyset_digest")?,
-            )?;
             let target_encoding = component_fields.req_str("target_encoding")?.to_string();
             ascii_name(
                 "source profile target_encoding",
                 &target_encoding,
                 limits::MAX_NAME_BYTES,
             )?;
-            let construction_order = as_arr(
+            let mut variants = Vec::new();
+            for value in as_arr(
                 "SourceProfileComponent",
-                "construction_order",
-                component_fields.req("construction_order")?,
-            )?
-            .iter()
-            .map(|value| {
-                as_str("SourceProfileComponent", "construction_order", value)
-                    .map(ToString::to_string)
-            })
-            .collect::<Result<Vec<_>>>()?;
+                "variants",
+                component_fields.req("variants")?,
+            )? {
+                let mut variant_fields = Fields::new("SourceProfileVariant", value)?;
+                let keyset_digest = prefixed(
+                    "source profile keyset_digest",
+                    variant_fields.req_str("keyset_digest")?,
+                )?;
+                let construction_order = as_arr(
+                    "SourceProfileVariant",
+                    "construction_order",
+                    variant_fields.req("construction_order")?,
+                )?
+                .iter()
+                .map(|value| {
+                    as_str("SourceProfileVariant", "construction_order", value)
+                        .map(ToString::to_string)
+                })
+                .collect::<Result<Vec<_>>>()?;
+                variant_fields.done()?;
+                if construction_order.is_empty() {
+                    return refuse(
+                        Code::CONSTRUCTION_ORDER_REQUIRED,
+                        format!(
+                            "source profile {name:?} component {component:?} variant \
+                             {keyset_digest} has no order"
+                        ),
+                    );
+                }
+                let mut unique = construction_order.clone();
+                unique.sort();
+                unique.dedup();
+                if unique.len() != construction_order.len() {
+                    return refuse(
+                        Code::DUPLICATE_KEY,
+                        format!(
+                            "source profile {name:?} component {component:?} variant \
+                             {keyset_digest} repeats a key"
+                        ),
+                    );
+                }
+                variants.push(SourceProfileVariant {
+                    keyset_digest,
+                    construction_order,
+                });
+            }
             let source_member = match component_fields.opt("source_member") {
                 Some(value) => {
                     let member = as_str("SourceProfileComponent", "source_member", value)?;
@@ -587,28 +671,58 @@ fn parse_source_profiles(value: &Value) -> Result<Vec<SourceProfile>> {
                 }
                 None => None,
             };
+            let source_member_prefix = match component_fields.opt("source_member_prefix") {
+                Some(value) => {
+                    let prefix = as_str("SourceProfileComponent", "source_member_prefix", value)?;
+                    validate_source_member_prefix(prefix)?;
+                    Some(prefix.to_string())
+                }
+                None => None,
+            };
             component_fields.done()?;
-            if construction_order.is_empty() {
-                return refuse(
-                    Code::CONSTRUCTION_ORDER_REQUIRED,
-                    format!("source profile {name:?} component {component:?} has no order"),
-                );
-            }
-            let mut unique = construction_order.clone();
-            unique.sort();
-            unique.dedup();
-            if unique.len() != construction_order.len() {
+            if source_member.is_some() && source_member_prefix.is_some() {
                 return refuse(
                     Code::DUPLICATE_KEY,
-                    format!("source profile {name:?} component {component:?} repeats a key"),
+                    format!(
+                        "source profile {name:?} component {component:?} binds both an exact \
+                         member and a member prefix"
+                    ),
+                );
+            }
+            if variants.is_empty() {
+                return refuse(
+                    Code::MISSING_FIELD,
+                    format!("source profile {name:?} component {component:?} has no variants"),
+                );
+            }
+            let mut keysets: Vec<&str> = variants
+                .iter()
+                .map(|variant| variant.keyset_digest.as_str())
+                .collect();
+            let given = keysets.clone();
+            keysets.sort();
+            if keysets != given {
+                return refuse(
+                    Code::SORT_ORDER,
+                    format!(
+                        "source profile {name:?} component {component:?} variants must be \
+                         sorted by keyset_digest"
+                    ),
+                );
+            }
+            keysets.dedup();
+            if keysets.len() != variants.len() {
+                return refuse(
+                    Code::DUPLICATE_KEY,
+                    format!("source profile {name:?} component {component:?} repeats a variant"),
                 );
             }
             components.push(SourceProfileComponent {
                 component,
-                keyset_digest,
                 source_member,
+                source_member_prefix,
                 target_encoding,
-                construction_order,
+                variants,
             });
         }
         fields.done()?;
@@ -661,6 +775,16 @@ pub fn validate_source_member(member: &str) -> Result<()> {
         return refuse(
             Code::KEY_GRAMMAR,
             format!("source member {member:?} is not a safe canonical relative member"),
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_source_member_prefix(prefix: &str) -> Result<()> {
+    if !prefix.ends_with('/') || validate_source_member(&format!("{prefix}member")).is_err() {
+        return refuse(
+            Code::KEY_GRAMMAR,
+            format!("source member prefix {prefix:?} is not a safe canonical prefix"),
         );
     }
     Ok(())

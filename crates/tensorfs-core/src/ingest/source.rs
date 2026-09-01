@@ -149,11 +149,12 @@ struct SourceAssignment {
     component: String,
     carrier: usize,
     projected: bool,
+    variant: usize,
 }
 
 fn enumerate_assignments(
     index: usize,
-    candidates: &[Vec<(usize, bool)>],
+    candidates: &[Vec<(usize, bool, usize)>],
     uses: &mut [CarrierUse],
     current: &mut Vec<SourceAssignment>,
     components: &[SourceProfileComponent],
@@ -166,7 +167,7 @@ fn enumerate_assignments(
         solutions.push(current.clone());
         return;
     }
-    for (carrier, projected) in &candidates[index] {
+    for (carrier, projected, variant) in &candidates[index] {
         let prior = uses[*carrier];
         let allowed = if *projected {
             matches!(prior, CarrierUse::Unused | CarrierUse::Projected)
@@ -185,6 +186,7 @@ fn enumerate_assignments(
             component: components[index].component.clone(),
             carrier: *carrier,
             projected: *projected,
+            variant: *variant,
         });
         enumerate_assignments(index + 1, candidates, uses, current, components, solutions);
         current.pop();
@@ -200,34 +202,46 @@ fn profile_assignments(
 ) -> Vec<Vec<SourceAssignment>> {
     let mut candidates = Vec::new();
     for component in &profile.components {
-        let Some(entry) = registry.entries.iter().find(|entry| {
-            entry.component == component.component && entry.keyset_digest == component.keyset_digest
-        }) else {
-            return Vec::new();
-        };
-        let projected = entry.converter == "single_file.identity/1";
         let mut hits = Vec::new();
-        for (index, header) in headers.iter().enumerate() {
-            if component.source_member != carriers[index].member {
-                continue;
-            }
-            let view = if projected {
-                match convert::single_file_component(&component.component, header) {
-                    Ok(view) => view,
-                    Err(_) => continue,
+        for (variant_index, variant) in component.variants.iter().enumerate() {
+            for entry in registry.entries.iter().filter(|entry| {
+                entry.component == component.component
+                    && entry.keyset_digest == variant.keyset_digest
+            }) {
+                let projected = entry.converter == "single_file.identity/1";
+                for (index, header) in headers.iter().enumerate() {
+                    let member_matches = match (
+                        component.source_member.as_deref(),
+                        component.source_member_prefix.as_deref(),
+                        carriers[index].member.as_deref(),
+                    ) {
+                        (Some(expected), None, Some(observed)) => expected == observed,
+                        (None, Some(prefix), Some(observed)) => observed.starts_with(prefix),
+                        (None, None, None) => true,
+                        _ => false,
+                    };
+                    if !member_matches {
+                        continue;
+                    }
+                    let view = if projected {
+                        match convert::single_file_component(&component.component, header) {
+                            Ok(view) => view,
+                            Err(_) => continue,
+                        }
+                    } else {
+                        header.clone()
+                    };
+                    let observed = match fingerprint::fingerprint(&component.component, &view) {
+                        Ok(observed) => observed,
+                        Err(_) => continue,
+                    };
+                    if observed.keyset_digest == variant.keyset_digest
+                        && observed.topology_digest == entry.topology_digest
+                        && observed.logical_keys as u64 == entry.logical_keys
+                    {
+                        hits.push((index, projected, variant_index));
+                    }
                 }
-            } else {
-                header.clone()
-            };
-            let observed = match fingerprint::fingerprint(&component.component, &view) {
-                Ok(observed) => observed,
-                Err(_) => continue,
-            };
-            if observed.keyset_digest == component.keyset_digest
-                && observed.topology_digest == entry.topology_digest
-                && observed.logical_keys as u64 == entry.logical_keys
-            {
-                hits.push((index, projected));
             }
         }
         if hits.is_empty() {
@@ -572,7 +586,11 @@ fn plan_source_prepared(
         .components
         .iter()
         .flat_map(|component| {
-            component
+            let assignment = assignments
+                .iter()
+                .find(|assignment| assignment.component == component.component)
+                .expect("profile assignment covers every component");
+            component.variants[assignment.variant]
                 .construction_order
                 .iter()
                 .map(|key| (component.component.clone(), key.clone()))
@@ -1241,10 +1259,13 @@ mod tests {
             name: profile.into(),
             components: vec![SourceProfileComponent {
                 component: component.into(),
-                keyset_digest: observed.keyset_digest,
                 source_member: Some(member.into()),
+                source_member_prefix: None,
                 target_encoding: encoding.into(),
-                construction_order: vec!["weight".into()],
+                variants: vec![super::fingerprint::SourceProfileVariant {
+                    keyset_digest: observed.keyset_digest,
+                    construction_order: vec!["weight".into()],
+                }],
             }],
         };
         (entry, source_profile)

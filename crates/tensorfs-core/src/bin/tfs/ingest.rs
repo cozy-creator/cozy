@@ -32,7 +32,7 @@ use tensorfs_core::ids::{ConfigRef, ObjectRef, Plain};
 use tensorfs_core::ingest::carrier::{self, SourceHeader};
 use tensorfs_core::ingest::convert::{self, Class, Effect, Rekey, Source, Target};
 use tensorfs_core::ingest::fingerprint::{
-    self, Banked, FingerprintRegistry, SourceProfile, SourceProfileComponent,
+    self, Banked, FingerprintRegistry, SourceProfile, SourceProfileComponent, SourceProfileVariant,
 };
 use tensorfs_core::ingest::source as source_core;
 use tensorfs_core::ingest::stamp::{self, Stamp};
@@ -496,7 +496,6 @@ pub fn cmd_bank(
             }
             components.push(SourceProfileComponent {
                 component: component.clone(),
-                keyset_digest: keyset_digest.clone(),
                 source_member: match members
                     .iter()
                     .filter(|(name, _)| name == component)
@@ -513,12 +512,16 @@ pub fn cmd_bank(
                         return ExitCode::FAILURE;
                     }
                 },
+                source_member_prefix: None,
                 target_encoding: hits[0].to_string(),
-                construction_order: order
-                    .iter()
-                    .filter(|(name, _)| name == component)
-                    .map(|(_, key)| key.clone())
-                    .collect(),
+                variants: vec![SourceProfileVariant {
+                    keyset_digest: keyset_digest.clone(),
+                    construction_order: order
+                        .iter()
+                        .filter(|(name, _)| name == component)
+                        .map(|(_, key)| key.clone())
+                        .collect(),
+                }],
             });
         }
         if components.len() != reviewed.len()
