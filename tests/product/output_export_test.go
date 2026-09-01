@@ -2,16 +2,105 @@ package producttest
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
 )
+
+func TestAwaitedRunReportsAttemptZeroFailureWithoutWaitingForOutputExport(t *testing.T) {
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "await-attempt-zero-output")
+	must(t, os.RemoveAll(root))
+	must(t, os.MkdirAll(root, 0o755))
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "down", "--all")
+		_ = os.RemoveAll(root)
+	})
+
+	project := weightlessProject(t)
+	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+		t.Fatalf("local package install [exit %d]\n%s", code, out)
+	}
+	install := activePackageInstall(t, root)
+	runtime := launch.Binary(install) //cozy:allow product red arm makes the selected worker executable unstartable
+	info, err := os.Stat(runtime)
+	must(t, err)
+	// The selected generation stays structurally valid, but its worker process cannot
+	// start. This is the live failure class: the request has an --out intent, reaches a
+	// request.failed terminal while still at attempt zero, and has no bytes to publish.
+	must(t, os.Chmod(runtime, info.Mode().Perm()&^0o111))
+
+	destination := filepath.Join(root, "never-published")
+	commandCtx, stop := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stop()
+	cmd := exec.CommandContext(commandCtx, "/usr/bin/nice", "-n", "19", cozyBin,
+		"run", localWeightlessRef+"/tile", "size=32", "--out", destination, "--await")
+	cmd.Env = childEnv(t, root)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	began := time.Now()
+	_ = cmd.Run()
+	if commandCtx.Err() != nil {
+		t.Fatalf("--await outlived its request.failed terminal:\nstdout:\n%s\nstderr:\n%s",
+			stdout.String(), stderr.String())
+	}
+	if code := cmd.ProcessState.ExitCode(); code != 1 {
+		t.Fatalf("attempt-zero failure exited %d, want operational 1\nstdout:\n%s\nstderr:\n%s",
+			code, stdout.String(), stderr.String())
+	}
+	if took := time.Since(began); took > 5*time.Second {
+		t.Fatalf("attempt-zero terminal took %s to reach --await", took)
+	}
+	answer := stdout.String() + stderr.String()
+	if !strings.Contains(answer, "ended failed") ||
+		!strings.Contains(answer, "cannot start the package worker") {
+		t.Fatalf("attempt-zero failure was not explained\nstdout:\n%s\nstderr:\n%s",
+			stdout.String(), stderr.String())
+	}
+	for _, noise := range []string{
+		"cancel requested", "the attempt's own terminal still settles it", "second interrupt",
+	} {
+		if strings.Contains(answer, noise) {
+			t.Fatalf("ordinary failure emitted cancellation noise %q\n%s", noise, answer)
+		}
+	}
+
+	store, problem := records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	defer store.Close()
+	requests, problem := store.RequestsOfKind("serving", "", 10)
+	fatal(t, problem)
+	if len(requests) != 1 || requests[0].State != "failed" {
+		t.Fatalf("attempt-zero request state = %#v", requests)
+	}
+	request := requests[0]
+	attempts, problem := store.Attempts(request.ID)
+	fatal(t, problem)
+	if len(attempts) != 0 {
+		t.Fatalf("worker-start failure minted attempts: %#v", attempts)
+	}
+	events, problem := store.EventsAfter(request.ID, 0, 100)
+	fatal(t, problem)
+	if len(events) == 0 || events[len(events)-1].Type != "request.failed" {
+		t.Fatalf("attempt-zero stream has no failed terminal: %#v", events)
+	}
+	export, problem := store.OutputExportOf(request.ID)
+	fatal(t, problem)
+	if export == nil || export.State != "skipped" ||
+		!strings.Contains(export.SafeError, "published no successful result") {
+		t.Fatalf("failed request left its output export unsettled: %#v", export)
+	}
+}
 
 func TestOutputExportResumesFromTerminalAfterOwnerRestart(t *testing.T) {
 	root := t.TempDir()

@@ -782,6 +782,10 @@ func (c *Orchestrator) CancelQueued(requestID string) *exit.Error {
 	if !applied {
 		return nil
 	}
+	// CancelQueuedRequest committed the request terminal and its event together. Settle
+	// the independent --out obligation too: attempt zero can never produce publishable
+	// bytes, and `pending` must not outlive an absorbing request terminal.
+	c.RetryOutputExport(requestID)
 	row, problem := c.opt.Store.RequestRow(requestID)
 	if problem != nil || row == nil {
 		if problem != nil {

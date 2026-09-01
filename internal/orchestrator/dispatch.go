@@ -372,6 +372,7 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 		c.logf("%s NOT requeued (%s): %s", requestID, why, e.Message)
 		c.forget(requestID)
 		_ = c.opt.Store.SettleRequest(requestID, "failed")
+		c.RetryOutputExport(requestID)
 		c.frames.forget(requestID)
 		c.emit(requestID, "request.failed", 0, map[string]any{
 			"status": "FAILED", "cause": "REQUEUE_BUDGET_EXHAUSTED",
@@ -756,6 +757,12 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 	}
 	if e := c.opt.Store.SettleRequest(requestID, "failed"); e != nil {
 		c.logf("%s could not be settled: %s", requestID, e.Message)
+	} else {
+		// An --out row is created with the request, before attempt 1 exists. Failure at
+		// placement therefore still owes that row a durable `skipped` settlement; leaving
+		// it pending made the CLI consume the terminal and then wait forever for bytes a
+		// failed request can never publish.
+		c.RetryOutputExport(requestID)
 	}
 	if row, e := c.opt.Store.RequestRow(requestID); e == nil && row != nil {
 		go c.cleanupRequestAssets(*row)

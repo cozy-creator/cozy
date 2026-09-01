@@ -774,6 +774,14 @@ func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Er
 }
 
 func waitOutputExport(c *localapi.Client, life api.Lifecycle) (api.Lifecycle, *exit.Error) {
+	// Publication is an obligation of a SUCCESSFUL execution. A failed or canceled run
+	// has no accepted output bytes to publish, so its terminal must reach the caller even
+	// if an older daemon left the separately-settled export row pending. This is also the
+	// client-side fence for the terminal/export race: execution failure is already an
+	// absorbing answer and can never become success by waiting on that row.
+	if life.Status == "failed" || life.Status == "canceled" {
+		return life, nil
+	}
 	for life.OutputExport != nil {
 		export := life.OutputExport
 		switch export.State {
