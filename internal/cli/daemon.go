@@ -90,8 +90,6 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 		}
 	}()
 
-	deadline := time.NewTimer(15 * time.Second)
-	defer deadline.Stop()
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -125,17 +123,9 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 		select {
 		case result := <-done:
 			// Another concurrent auto-start may be the winner. Keep observing the
-			// shared lock/credential readiness until it appears or the startup bound ends.
+			// shared lock/credential readiness until it appears or that process exits.
 			childResult, child = &result, nil
 		case <-tick.C:
-		case <-deadline.C:
-			if childResult != nil {
-				return daemon.State{}, false, daemonStartupFailure(*childResult)
-			}
-			return daemon.State{}, false, exit.Named(exit.Conflict,
-				"daemon_startup_incomplete",
-				"the Cozy daemon did not become healthy within 15s").
-				WithRemedy("retry `cozy up`; startup is complete only after the authenticated API and web UI answer")
 		}
 	}
 }

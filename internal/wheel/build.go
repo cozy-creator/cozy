@@ -5,13 +5,11 @@ package wheel
 import (
 	"bytes"
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,21 +29,15 @@ type Result struct {
 }
 
 const (
-	buildActivitySample = 15 * time.Second
-	buildStillSamples   = 8
-	maxBuildLogBytes    = 1 << 20
+	maxBuildLogBytes = 1 << 20
 )
 
-var errBuildStalled = errors.New("wheel build stopped making progress")
-
 type buildLog struct {
-	mu      sync.Mutex
-	buffer  bytes.Buffer
-	written atomic.Int64
+	mu     sync.Mutex
+	buffer bytes.Buffer
 }
 
 func (w *buildLog) Write(p []byte) (int, error) {
-	w.written.Add(int64(len(p)))
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if room := maxBuildLogBytes - w.buffer.Len(); room > 0 {
@@ -106,8 +98,6 @@ func Build(req Request) (*Result, *exit.Error) {
 	}
 	log := &buildLog{}
 	cmd.Stdout, cmd.Stderr = log, log
-	done := make(chan struct{})
-	go monitorBuild(ctx, cancel, done, log, buildActivitySample, buildStillSamples)
 	runErr := cmd.Start()
 	var containmentErr error
 	if runErr == nil {
@@ -123,13 +113,7 @@ func Build(req Request) (*Result, *exit.Error) {
 		_ = processtree.Kill(pid, syscall.SIGKILL)
 		processtree.Release(pid)
 	}
-	close(done)
 	body := log.String()
-	if errors.Is(context.Cause(ctx), errBuildStalled) {
-		return nil, exit.Named(exit.Deadline, "project_wheel_build_stalled",
-			"uv build stopped producing output for %s", buildActivitySample*buildStillSamples).
-			WithRemedy("run `uv build --wheel` locally and fix the build backend stage that does not finish")
-	}
 	if parent.Err() != nil {
 		return nil, exit.Named(exit.Canceled, "project_wheel_build_canceled", "uv build was canceled")
 	}
@@ -161,31 +145,4 @@ func Build(req Request) (*Result, *exit.Error) {
 			"uv build output is not one regular wheel at or below %d B", MaxWheelBytes)
 	}
 	return &Result{Path: wheels[0]}, nil
-}
-
-func monitorBuild(ctx context.Context, cancel context.CancelCauseFunc, done <-chan struct{}, log *buildLog,
-	sample time.Duration, stillLimit int,
-) {
-	ticker := time.NewTicker(sample)
-	defer ticker.Stop()
-	last, still := int64(-1), 0
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-done:
-			return
-		case <-ticker.C:
-			at := log.written.Load()
-			if at > last {
-				last, still = at, 0
-				continue
-			}
-			still++
-			if still >= stillLimit {
-				cancel(errBuildStalled)
-				return
-			}
-		}
-	}
 }
