@@ -48,9 +48,9 @@ type JobPlan struct {
 	WeightsOutputs []WeightsOutput
 	// Record is the closed key set `plan.py::JobBinding.read` accepts. An unknown key is
 	// a refusal at the worker, which is what makes "closed at both ends" a fact.
-	Record   map[string]any
-	RSSCap   int64
-	GPUCount int64
+	Record           map[string]any
+	RSSCap           int64
+	NeedsAccelerator bool
 }
 
 const DefaultJobRSSCap int64 = 8 << 30
@@ -141,11 +141,8 @@ func (c *Orchestrator) ConvergeRemoteJob(instanceID string, spec WorkerLaunchSpe
 }
 
 func gpuCountOf(p *JobPlan) int64 {
-	if p.GPUCount > 0 {
-		return p.GPUCount
-	}
-	if n, ok := p.Record["gpu_count"].(int64); ok {
-		return n
+	if p.NeedsAccelerator {
+		return 1
 	}
 	return 0
 }

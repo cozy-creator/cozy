@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -40,18 +39,16 @@ type sourceCapability struct {
 }
 
 type producerPlan struct {
-	Name           string
-	InstallID      string
-	Release        string
-	ReleaseDigest  string
-	Descriptor     *launch.PackageDescriptor
-	Job            *launch.Entrypoint
-	Pin            modeltransfer.JobPin
-	SourceProfiles map[string]string
-	Outputs        []modeltransfer.OutputPin
-	GPUCount       int64
-	Requires       []string
-	Needs          modeltransfer.ResourceNeeds
+	Name             string
+	InstallID        string
+	Release          string
+	ReleaseDigest    string
+	Descriptor       *launch.PackageDescriptor
+	Job              *launch.Entrypoint
+	Pin              modeltransfer.JobPin
+	SourceProfiles   map[string]string
+	Outputs          []modeltransfer.OutputPin
+	NeedsAccelerator bool
 }
 
 func handleModelUpload(ctx *Context) *exit.Error {
@@ -162,7 +159,6 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 		plan.ProducerDigest, plan.DescriptorDigest = producer.ReleaseDigest, producer.Descriptor.Digest
 		pin := producer.Pin
 		plan.Job, plan.SourceProfiles, plan.Outputs = &pin, producer.SourceProfiles, producer.Outputs
-		plan.Resources = producer.Needs
 	} else {
 		plan.Outputs = []modeltransfer.OutputPin{{Name: "model"}}
 	}
@@ -193,8 +189,7 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 				output.Field{K: "source_profiles", V: plan.ProfileNames()},
 				output.Field{K: "steps", V: 1},
 				output.Field{K: "outputs", V: plan.OutputNames()},
-				output.Field{K: "gpu_count", V: producer.GPUCount},
-				output.Field{K: "requires", V: producer.Requires},
+				output.Field{K: "needs_accelerator", V: producer.NeedsAccelerator},
 			)
 		}
 		defaults := []string{"id", "kind", "model", "source"}
@@ -281,8 +276,7 @@ func modelTransferIntent(plan modeltransfer.Plan) records.ModelTransferIntent {
 	return records.ModelTransferIntent{Kind: plan.Instruction.Kind, Destination: plan.Destination,
 		Source: plan.Source, SourceSelection: plan.SourceSelection, SourceLicense: plan.SourceLicense,
 		SourceFiles: files, InputLane: plan.InputLane, SourceProfiles: plan.SourceProfiles,
-		Outputs: outputs, GPUCount: plan.Resources.GPUCount, MinSM: plan.Resources.MinSM,
-		VRAMGB: plan.Resources.VRAMGB, RAMGB: plan.Resources.RAMGB}
+		Outputs: outputs}
 }
 
 func canonicalProductionSource(ctx *Context, raw string) (string, *exit.Error) {
@@ -453,7 +447,7 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 	plan := &producerPlan{Name: target.Selector + "/" + target.Function,
 		InstallID: selected.InstallID, Release: selected.Release,
 		ReleaseDigest: selected.ReleaseDigest,
-		Descriptor:    descriptor, Job: job, GPUCount: job.RequiredGPUCount(),
+		Descriptor:    descriptor, Job: job, NeedsAccelerator: job.NeedsAccelerator(),
 		SourceProfiles: map[string]string{}}
 	plan.Pin = modeltransfer.JobPin{Callable: plan.Name, Package: target.Package,
 		Function: target.Function, InstallID: selected.InstallID, Release: selected.Release,
@@ -464,20 +458,6 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 	for _, output := range job.WeightsOutputs {
 		plan.Outputs = append(plan.Outputs, modeltransfer.OutputPin{Name: output.OutputID,
 			RequiredContract: output.RequiredContract})
-	}
-	requires := map[string]bool{}
-	for _, token := range strings.Split(job.Resources.Requires, ",") {
-		if token = strings.TrimSpace(token); token != "" {
-			requires[token] = true
-		}
-	}
-	for token := range requires {
-		plan.Requires = append(plan.Requires, token)
-	}
-	sort.Strings(plan.Requires)
-	plan.Needs, problem = productionResourceNeeds(plan.GPUCount, plan.Requires)
-	if problem != nil {
-		return nil, problem
 	}
 	return plan, nil
 }
@@ -582,14 +562,6 @@ func parseProductionCallable(value string) (productionCallable, *exit.Error) {
 	}
 	return productionCallable{Package: selector.Package, Selector: selector.String(),
 		Function: parts[2]}, nil
-}
-
-func productionResourceNeeds(gpuCount int64, requires []string) (modeltransfer.ResourceNeeds, *exit.Error) {
-	needs, err := modeltransfer.ParseResourceNeeds(gpuCount, strings.Join(requires, ","))
-	if err != nil {
-		return needs, exit.Named(exit.Validation, "model_transfer.resource_invalid", "%s", err)
-	}
-	return needs, nil
 }
 
 func validateProducerJob(name string, job *launch.Entrypoint) *exit.Error {

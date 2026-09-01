@@ -68,11 +68,10 @@ type Submission struct {
 	// Org is the publishing org whose scratch repo this job publishes into.
 	Org string
 	// Trees are the job's typed input TREES as `ref=dir`, one grant input each.
-	Trees       []string
-	JobGPUCount int64
-	// JobRequires is descriptor-derived admission data used to validate a
-	// model-transfer resource envelope before persistence.
-	JobRequires string
+	Trees []string
+	// NeedsAccelerator is derived from the selected callable's typed Model parameters.
+	// It is the only machine-class decision retained on a request.
+	NeedsAccelerator bool
 
 	// Worker pins this request to an ATTACHED remote worker (a rental id resolved
 	// through Options.Rentals). Empty = any local worker.
@@ -229,7 +228,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		PrivatePackageDigest: s.PrivatePackageDigest,
 		Outputs:              strings.Join(s.Outputs, ","),
 		Assets:               s.Assets, WeightsOutputs: string(weightsBytes),
-		Kind: s.Kind, JobGPUCount: s.JobGPUCount, Org: s.Org, Trees: strings.Join(s.Trees, ","),
+		Kind: s.Kind, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, Models: s.Models,
 		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer,
@@ -726,7 +725,8 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 	logical := LogicalPackage{Package: req.Package, Release: req.Release,
 		ReleaseDigest: req.PackageRevisionDigest, Function: req.Entrypoint,
 		Outputs: strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
-		PlanID:  req.PlanID, Models: append([]ModelRef(nil), req.Models...)}
+		PlanID:  req.PlanID, Models: append([]ModelRef(nil), req.Models...),
+		NeedsAccelerator: req.NeedsAccelerator}
 	instance, _, _, e := c.EnsureRental(req.Worker)
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
@@ -788,7 +788,8 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 			PackageRevisionDigest: logical.ReleaseDigest,
 			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,
 				Outputs:        strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
-				WeightsOutputs: weights, RSSCap: DefaultJobRSSCap, GPUCount: req.JobGPUCount}},
+				WeightsOutputs: weights, RSSCap: DefaultJobRSSCap,
+				NeedsAccelerator: req.NeedsAccelerator}},
 		}}
 		if e := c.ConvergeRemoteJob(instance, spec); e != nil {
 			return WorkerLaunchSpec{}, "", e

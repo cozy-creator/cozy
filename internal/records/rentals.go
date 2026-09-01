@@ -561,9 +561,9 @@ func (s *Store) RentalRunCounts(id string) (queued, running int, problem *exit.E
 // Creator already bought. Package and model identities remain local; the only class
 // distinction used to select a generic rental is CPU versus GPU.
 func (s *Store) AssignManagedRentalClass(id string, cpu bool) *exit.Error {
-	predicate := "NOT (job_gpu_count=0 AND models='[]')"
+	predicate := "needs_accelerator=1"
 	if cpu {
-		predicate = "job_gpu_count=0 AND models='[]'"
+		predicate = "needs_accelerator=0"
 	}
 	if _, err := s.db.Exec(`UPDATE requests SET worker=? WHERE rental=1 AND worker=''
 		AND state IN ('submitted','queued','requeue_pending') AND (`+predicate+`)`, id); err != nil {

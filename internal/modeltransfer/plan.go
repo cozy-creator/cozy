@@ -10,10 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"regexp"
 	"sort"
-	"strconv"
-	"strings"
 
 	"github.com/cozy-creator/cozy/internal/launch"
 )
@@ -102,89 +99,6 @@ type Plan struct {
 	Job               *JobPin
 	SourceProfiles    map[string]string
 	Outputs           []OutputPin
-	Resources         ResourceNeeds
-}
-
-type ResourceNeeds struct {
-	GPUCount int64 `json:"gpu_count"`
-	MinSM    int64 `json:"min_sm"`
-	VRAMGB   int64 `json:"vram_gb"`
-	RAMGB    int64 `json:"ram_gb"`
-}
-
-var resourcePattern = regexp.MustCompile(`^(sm|vram|ram)([1-9][0-9]*)(\+|g)$`)
-var cudaResourcePattern = regexp.MustCompile(`^cuda[1-9][0-9]*\.[0-9]+\+$`)
-
-// ParseResourceNeeds is the one translation from a PackageDescriptor resource string
-// to the exact rental-sizing facts retained by a model transfer. CUDA compatibility is
-// selected by the base worker image and therefore contributes no sizing field here.
-func ParseResourceNeeds(gpuCount int64, requires string) (ResourceNeeds, error) {
-	needs := ResourceNeeds{GPUCount: gpuCount}
-	if gpuCount != 0 && gpuCount != 1 {
-		return needs, fmt.Errorf("GPU producer count must be zero or one, not %d", gpuCount)
-	}
-	declaredGPURequirement := false
-	for _, raw := range strings.Split(requires, ",") {
-		value := strings.ToLower(strings.TrimSpace(raw))
-		if value == "" {
-			continue
-		}
-		if cudaResourcePattern.MatchString(value) {
-			declaredGPURequirement = true
-			continue
-		}
-		match := resourcePattern.FindStringSubmatch(value)
-		if len(match) != 4 || match[1] == "sm" && match[3] != "+" ||
-			match[1] != "sm" && match[3] != "g" {
-			return needs, fmt.Errorf("resource requirement %q is not smN+, vramNg, ramNg, or cudaN.N+", raw)
-		}
-		amount, err := strconv.ParseInt(match[2], 10, 64)
-		if err != nil {
-			return needs, fmt.Errorf("resource requirement %q is outside the supported range", raw)
-		}
-		declaredGPURequirement = true
-		switch match[1] {
-		case "sm":
-			needs.MinSM = max(needs.MinSM, amount)
-		case "vram":
-			needs.VRAMGB = max(needs.VRAMGB, amount)
-		case "ram":
-			needs.RAMGB = max(needs.RAMGB, amount)
-		}
-	}
-	if gpuCount == 0 && declaredGPURequirement {
-		return needs, fmt.Errorf("CPU producer cannot declare GPU resource requirements")
-	}
-	return needs, nil
-}
-
-// AcceptsGPU checks only hard floors the package actually declared. The caller already
-// selected a GPU-class SKU from the catalog; an omitted floor is deliberately no filter.
-func (n ResourceNeeds) AcceptsGPU(computeCapability string, vramGB, ramGB int64) bool {
-	if n.GPUCount != 1 {
-		return false
-	}
-	if n.MinSM > 0 {
-		sm, err := computeSM(computeCapability)
-		if err != nil || sm < n.MinSM {
-			return false
-		}
-	}
-	return (n.VRAMGB == 0 || vramGB >= n.VRAMGB) &&
-		(n.RAMGB == 0 || ramGB >= n.RAMGB)
-}
-
-func computeSM(capability string) (int64, error) {
-	parts := strings.Split(capability, ".")
-	if len(parts) != 2 {
-		return 0, fmt.Errorf("invalid compute capability")
-	}
-	major, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	minor, err := strconv.ParseInt(parts[1], 10, 64)
-	return major*10 + minor, err
 }
 
 // Bytes is the restart record. It contains only immutable identities and
@@ -221,7 +135,7 @@ func (p Plan) Digest() (string, error) {
 
 // ID is stable across detach/follow, attempts, rental replacement, capability
 // refresh, pricing, and replay. Descriptor identity already binds step edges,
-// assets, resources, required output names, and required contracts.
+// assets, required output names, and required contracts.
 func (p Plan) ID() string {
 	if p.Instruction.Destination != "" {
 		return p.Instruction.ID()
@@ -245,11 +159,6 @@ func (p Plan) ID() string {
 			_, _ = io.WriteString(hash, value)
 			_, _ = hash.Write([]byte{0})
 		}
-	}
-	for _, value := range []int64{p.Resources.GPUCount, p.Resources.MinSM,
-		p.Resources.VRAMGB, p.Resources.RAMGB} {
-		_, _ = io.WriteString(hash, fmt.Sprint(value))
-		_, _ = hash.Write([]byte{0})
 	}
 	return "modeltransfer-" + hex.EncodeToString(hash.Sum(nil))
 }

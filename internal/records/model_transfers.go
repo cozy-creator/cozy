@@ -108,10 +108,6 @@ type ModelTransferIntent struct {
 	SourceProfiles  map[string]string         `json:"source_profiles,omitempty"`
 	Outputs         []ModelTransferOutput     `json:"outputs"`
 	LocalOnly       bool                      `json:"local_only,omitempty"`
-	GPUCount        int64                     `json:"gpu_count,omitempty"`
-	MinSM           int64                     `json:"min_sm,omitempty"`
-	VRAMGB          int64                     `json:"vram_gb,omitempty"`
-	RAMGB           int64                     `json:"ram_gb,omitempty"`
 }
 
 type ModelTransfer struct {
@@ -148,9 +144,6 @@ func NormalizeModelTransferIntent(intent *ModelTransferIntent) *exit.Error {
 		intent.Destination == "" || intent.Source == "" || intent.SourceSelection == "" ||
 		len(intent.Outputs) == 0 {
 		return exit.New(exit.Validation, "model transfer intent is incomplete")
-	}
-	if intent.GPUCount < 0 || intent.MinSM < 0 || intent.VRAMGB < 0 || intent.RAMGB < 0 {
-		return exit.New(exit.Validation, "model transfer resource floors are non-negative")
 	}
 	localSource := strings.HasPrefix(intent.Source, "file:") || strings.HasPrefix(intent.Source, "local/")
 	if intent.LocalOnly != localSource {

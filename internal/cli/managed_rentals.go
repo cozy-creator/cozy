@@ -10,7 +10,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -72,18 +71,10 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 	if problem := m.reconcileLocked(); problem != nil {
 		return "", "", problem
 	}
-	needsCPU := len(req.Models) == 0 && req.JobGPUCount == 0
-	transfer, problem := m.store.ModelTransferOf(req.ID)
-	if problem != nil {
-		return "", "", problem
-	}
+	needsCPU := !req.NeedsAccelerator
 	skus, problem := m.catalogLocked()
 	if problem != nil {
 		return "", "", problem
-	}
-	byName := make(map[string]hub.RentalSKU, len(skus))
-	for _, sku := range skus {
-		byName[sku.Name] = sku
 	}
 	rows, problem := m.store.Rentals()
 	if problem != nil {
@@ -96,12 +87,6 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		return rows[i].ID < rows[j].ID
 	})
 	for _, row := range rows {
-		if transfer != nil && transfer.GPUCount > 0 {
-			sku, current := byName[row.SKU]
-			if !current || !transferSKUCompatible(transfer, sku) {
-				continue
-			}
-		}
 		if (row.AcceleratorModel == "CPU") != needsCPU {
 			continue
 		}
@@ -129,7 +114,7 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 
 	compatible := skus[:0]
 	for _, sku := range skus {
-		if (sku.AcceleratorModel == "CPU") == needsCPU && transferSKUCompatible(transfer, sku) {
+		if (sku.AcceleratorModel == "CPU") == needsCPU {
 			compatible = append(compatible, sku)
 		}
 	}
@@ -179,18 +164,6 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 	}
 	line, problem := m.lineLocked()
 	return row.ID, line, problem
-}
-
-func transferSKUCompatible(transfer *records.ModelTransfer, sku hub.RentalSKU) bool {
-	if transfer == nil || transfer.GPUCount == 0 {
-		return true
-	}
-	return (modeltransfer.ResourceNeeds{
-		GPUCount: transfer.GPUCount,
-		MinSM:    transfer.MinSM,
-		VRAMGB:   transfer.VRAMGB,
-		RAMGB:    transfer.RAMGB,
-	}).AcceptsGPU(sku.ComputeCapability, sku.VRAMGB, sku.MinimumRAMPerGPUGB)
 }
 
 func (m *managedRentals) catalogLocked() ([]hub.RentalSKU, *exit.Error) {

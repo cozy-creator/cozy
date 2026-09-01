@@ -17,7 +17,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -207,9 +206,6 @@ func validateModelTransferSubmission(spec orchestrator.Submission) *exit.Error {
 			intent.Outputs[0].RequiredContract != nil {
 			return exit.New(exit.Validation, "platform pass-through requires exactly output model")
 		}
-		if intent.GPUCount != 0 || intent.MinSM != 0 || intent.VRAMGB != 0 || intent.RAMGB != 0 {
-			return exit.New(exit.Validation, "platform pass-through declares no compute resource floor")
-		}
 		return nil
 	}
 	if len(intent.SourceProfiles) == 0 || len(intent.Outputs) != len(spec.WeightsOutputs) ||
@@ -235,15 +231,6 @@ func validateModelTransferSubmission(spec orchestrator.Submission) *exit.Error {
 			return exit.New(exit.Validation,
 				"producer transfer output %s lacks its descriptor contract", output.Name)
 		}
-	}
-	needs, err := modeltransfer.ParseResourceNeeds(spec.JobGPUCount, spec.JobRequires)
-	if err != nil {
-		return exit.Named(exit.Structural, "descriptor_resource_invalid", "%s", err)
-	}
-	if intent.GPUCount != needs.GPUCount || intent.MinSM != needs.MinSM ||
-		intent.VRAMGB != needs.VRAMGB || intent.RAMGB != needs.RAMGB {
-		return exit.New(exit.Validation,
-			"model transfer resource envelope does not match its producer descriptor")
 	}
 	return nil
 }
@@ -308,7 +295,7 @@ func replayJobSubmission(sub JobSubmission,
 		ReleaseDigest:        recorded.PackageRevisionDigest,
 		PrivatePackageDigest: recorded.PrivatePackageDigest,
 		PlanID:               recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
-		JobGPUCount: recorded.JobGPUCount, Trees: trees, Worker: recorded.Worker,
+		NeedsAccelerator: recorded.NeedsAccelerator, Trees: trees, Worker: recorded.Worker,
 		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
 		Models: models, ModelTransfer: transfer, ProducerProfiles: profiles}, nil
 }
@@ -377,8 +364,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			return out, problem
 		}
 		out.PlanID, out.Outputs = logical.DescriptorID, logical.Outputs
-		out.WeightsOutputs, out.JobGPUCount = logical.WeightsOutputs, logical.GPUCount
-		out.JobRequires = logical.Requires
+		out.WeightsOutputs, out.NeedsAccelerator = logical.WeightsOutputs, logical.NeedsAccelerator
 		out.ProducerProfiles = logical.SourceProfiles
 		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
 		return out, nil
@@ -418,8 +404,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.PlanID = job.DescriptorID
 		out.Outputs = job.Outputs
 		out.WeightsOutputs = job.WeightsOutputs
-		out.JobGPUCount = job.GPUCount
-		out.JobRequires = job.Requires
+		out.NeedsAccelerator = job.NeedsAccelerator
 		out.ProducerProfiles = job.SourceProfiles
 		if problem := validateJobPayload(job, out.Payload); problem != nil {
 			return out, problem
@@ -468,8 +453,7 @@ func (s *Server) resolvePrivateJob(ctx context.Context, sub JobSubmission,
 			continue
 		}
 		out.PlanID, out.Outputs = job.DescriptorID, job.Outputs
-		out.WeightsOutputs, out.JobGPUCount = job.WeightsOutputs, job.GPUCount
-		out.JobRequires = job.Requires
+		out.WeightsOutputs, out.NeedsAccelerator = job.WeightsOutputs, job.NeedsAccelerator
 		out.ProducerProfiles = job.SourceProfiles
 		if problem := validateJobPayload(job, out.Payload); problem != nil {
 			return out, problem
@@ -542,7 +526,6 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"outputs":         strings.Join(spec.Outputs, ","),
 		"weights_outputs": weightsOutputs,
 		"trees":           strings.Join(spec.Trees, ","),
-		"job_gpu_count":   spec.JobGPUCount,
 		"models":          models,
 	}
 	if spec.Rental {
