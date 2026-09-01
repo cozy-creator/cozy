@@ -314,6 +314,8 @@ Register or recover this Creator installation directly from the CLI:
 ```sh
 cozy auth login person@example.com
 cozy auth
+cozy auth revoke-other-machines
+cozy auth logout
 ```
 
 Tensorhub emails a one-time code. After it is entered, Cozy stores only this installation's
@@ -322,7 +324,9 @@ tokens stay in memory. A new user also chooses one immutable Tensorhub account n
 login; existing accounts skip that prompt. Later authenticated commands sign a one-time challenge
 automatically; there is no refresh token or repeated login command. `cozy auth` verifies the stored
 key, shows the email and Tensorhub account name, or reports `not logged in` when this installation
-has no usable key.
+has no usable key. Revoking other machines asks for a fresh email code. Logout revokes this
+machine before erasing its local key. Once enrolled, the machine key takes precedence over a stale
+configured `tensorhub_token`; that operator token remains a fallback only for unenrolled automation.
 
 ## Output and automation
 
