@@ -246,9 +246,17 @@ fn main() -> ExitCode {
         ["compat", "check", c, h] => layout::cmd_check(Path::new(c), Path::new(h), &flags),
         ["compat", "release-cut", r] => layout::cmd_release_cut(Path::new(r)),
         ["grade", "decision", d] => layout::cmd_decision(Path::new(d)),
+        // The BATCH surface (tfs-039). Grading is microseconds; the wall was the process
+        // around it. `batch` reads a file of canonical reports, `serve` reads them from
+        // stdin and flushes per line, and both emit exactly the bytes `grade --json` emits
+        // for the same document — so the single-pair form below is untouched.
+        ["grade", "batch", p] => layout::cmd_grade_stream(Some(Path::new(p)), &flags),
+        ["grade", "serve"] => layout::cmd_grade_stream(None, &flags),
         ["grade", r] => layout::cmd_grade(Path::new(r), &flags),
         ["grade", "register", n, k, s] => layout::cmd_register(n, k, s, &flags),
         ["verify-request", c, h] => layout::cmd_request(Path::new(c), Path::new(h), &flags),
+        ["verify-compat", "serve"] => layout::cmd_verify_stream(None),
+        ["verify-compat", "batch", p] => layout::cmd_verify_stream(Some(Path::new(p))),
         ["verify-compat", q, o] => layout::cmd_verify(Path::new(q), Path::new(o), &flags),
         ["verify-consume", q, o] => layout::cmd_consume(Path::new(q), Path::new(o)),
         ["registry"] => cmd_registry(),
@@ -900,6 +908,8 @@ fn layout_plane_docs(
     ConversionRegistration,
     CompatibilityReport,
     CompatibilityReport,
+    CodeTopology,
+    CompatibilityReport,
 )> {
     let code = CodeTopology {
         contract: tensorfs_core::ids::object_id(b"ModelConstructionContract:corpus"),
@@ -974,7 +984,39 @@ fn layout_plane_docs(
     }
     let first_fact = reports.pop().unwrap();
     let whole_set = reports.pop().unwrap();
-    Ok((code, report, reg, whole_set, first_fact))
+
+    // THE SHAPE-BUCKET ARM (tfs-038). The same contract with every required dtype recast
+    // and NOTHING else touched. Keys and shapes are untouched, so the shape-only projection
+    // is byte-identical to the header's while the exact projection is not — which is the
+    // whole point: an exact-index miss that is a shape-index HIT is the CONVERTIBLE and
+    // PRODUCIBLE half of a catalog, and grading it is worth the microseconds. Frozen as a
+    // pair so the day the shape projection stops eliding the dtype, or starts eliding
+    // something else, one of these two digests moves and the corpus says so.
+    let mut recast = code.clone();
+    for (_, keys) in recast.components.iter_mut() {
+        for (_, r) in keys.iter_mut() {
+            r.dtype = Dtype::F8E4M3FN;
+        }
+    }
+    let out = compat::check_compatibility(
+        &recast,
+        h,
+        closure,
+        &pin,
+        Lane::Canonical,
+        &[],
+        compat::Depth::Full,
+    )?;
+    let recast_report = CompatibilityReport::of(&recast, h, Lane::Canonical, &out)?;
+    Ok((
+        code,
+        report,
+        reg,
+        whole_set,
+        first_fact,
+        recast,
+        recast_report,
+    ))
 }
 
 fn receipt(
@@ -1200,7 +1242,8 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     ));
 
     // --- the layout plane (tfs-009): code topology, report, registration
-    let (code, report, reg, worst_full, worst_first) = layout_plane_docs(&ha, &closure)?;
+    let (code, report, reg, worst_full, worst_first, recast, recast_report) =
+        layout_plane_docs(&ha, &closure)?;
     cases.push(ok_case(
         "layout",
         "code-topology",
@@ -1233,6 +1276,22 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         worst_first.canonical_bytes(),
         "the same pair stopped at the first fact: PRODUCIBLE, which is why ranking may not \
          stop there",
+    ));
+    cases.push(ok_case(
+        "layout",
+        "code-topology-recast",
+        "code_topology",
+        recast.canonical_bytes(),
+        "the same contract with only the dtypes recast: a DIFFERENT exact topology digest \
+         and the SAME shape digest",
+    ));
+    cases.push(ok_case(
+        "layout",
+        "report-recast",
+        "compat_report",
+        recast_report.canonical_bytes(),
+        "an exact-index MISS that is a shape-index HIT: differs by dtype alone, so it is a \
+         candidate to grade rather than a pair to skip",
     ));
     cases.push(red_case(
         "layout-red",
@@ -1982,6 +2041,14 @@ fn cmd_gen(dir: &Path) -> ExitCode {
             if c.doc == "header" {
                 let h = Header::parse(&c.bytes).unwrap();
                 v += &format!("topology: {}\n", h.topology_digest());
+                v += &format!("shape: {}\n", h.topology_shape_digest());
+            }
+            // tfs-038: the code side freezes BOTH projections too, so a dtype-only recast
+            // of one contract is provably the same shape bucket and a different exact one.
+            if c.doc == "code_topology" {
+                let code = tensorfs_core::compat::CodeTopology::parse(&c.bytes).unwrap();
+                v += &format!("topology: {}\n", code.topology_digest());
+                v += &format!("shape: {}\n", code.topology_shape_digest());
             }
             if c.doc == "manifest" {
                 let m = Manifest::parse(&c.bytes).unwrap();
@@ -2019,6 +2086,7 @@ enum Outcome {
     Ok {
         id: String,
         topology: Option<String>,
+        shape: Option<String>,
         manifest: Option<String>,
         grade: Option<String>,
     },
@@ -2031,6 +2099,7 @@ fn run_doc(doc: &str, bytes: &[u8], closure: &Closure, platform: &[String]) -> O
         Ok(o) => Outcome::Ok {
             id: o.id,
             topology: o.topology,
+            shape: o.shape,
             manifest: o.manifest,
             grade: o.grade,
         },
@@ -2106,6 +2175,7 @@ fn cmd_verify(dir: &Path) -> ExitCode {
                     Outcome::Ok {
                         id,
                         topology,
+                        shape,
                         manifest,
                         grade,
                     },
@@ -2117,6 +2187,11 @@ fn cmd_verify(dir: &Path) -> ExitCode {
                     if let Some(t) = field(&v, "topology") {
                         if topology.as_deref() != Some(t.as_str()) {
                             bad.push(format!("topology {topology:?} != frozen {t}"));
+                        }
+                    }
+                    if let Some(t) = field(&v, "shape") {
+                        if shape.as_deref() != Some(t.as_str()) {
+                            bad.push(format!("shape {shape:?} != frozen {t}"));
                         }
                     }
                     if let Some(expected) = field(&v, "manifest") {
@@ -2192,6 +2267,12 @@ fn cmd_verify(dir: &Path) -> ExitCode {
             _ => String::new(),
         }
     };
+    let shapeof = |n: &str| -> String {
+        match get(n) {
+            Some(Outcome::Ok { shape: Some(s), .. }) => s.clone(),
+            _ => String::new(),
+        }
+    };
     let cpof = |n: &str| -> String {
         match get(n) {
             Some(Outcome::Ok {
@@ -2228,6 +2309,23 @@ fn cmd_verify(dir: &Path) -> ExitCode {
         idof("header/plain-fp8") != idof("header/plain-fp8-reordered")
             && topof("header/plain-fp8") == topof("header/plain-fp8-reordered"),
         topof("header/plain-fp8-reordered"),
+    ));
+    // tfs-038's red arm, as a CROSS assertion over two frozen documents: recasting only the
+    // dtypes must move the exact digest and leave the shape digest exactly where it was. If
+    // the shape projection ever stopped eliding the dtype the first half fails; if it began
+    // eliding a shape the second half fails.
+    cross.push((
+        "a dtype-only recast flips topology_digest, not the shape digest".into(),
+        topof("layout/code-topology") != topof("layout/code-topology-recast")
+            && shapeof("layout/code-topology") == shapeof("layout/code-topology-recast")
+            && !shapeof("layout/code-topology").is_empty(),
+        shapeof("layout/code-topology-recast"),
+    ));
+    cross.push((
+        "the shape projection is not the exact one".into(),
+        topof("layout/code-topology") != shapeof("layout/code-topology")
+            && !shapeof("layout/code-topology").is_empty(),
+        short(shapeof("layout/code-topology")),
     ));
     cross.push((
         "one more sibling file flips manifest_id only".into(),

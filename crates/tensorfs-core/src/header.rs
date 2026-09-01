@@ -286,18 +286,53 @@ impl Part {
 /// so existing topology digests do not move; it is not a stored document format.
 pub const TOPOLOGY_IDENTITY_DOMAIN: &str = "cozytensors.topology/1";
 
+/// Domain separator for the SHAPE-ONLY projection. A distinct literal on purpose: the two
+/// projections are different questions, and a shared domain would let a shape digest be
+/// mistaken for an exact one in a bucket key.
+pub const TOPOLOGY_SHAPE_DOMAIN: &str = "cozytensors.topology.shape/1";
+
+/// Which topology question a digest answers.
+///
+/// `Identity` is the exact index: a hit means the logical {dtype, shape} sets agree.
+/// `ShapeOnly` elides the dtype leaf, so everything that differs ONLY by dtype or encoding
+/// lands in one bucket — which is exactly the CONVERTIBLE/PRODUCIBLE candidate set. Catalog
+/// search is then three cheap steps: an exact-digest hit is COMPATIBLE, a shape-digest hit
+/// is worth grading, and everything else is INCOMPATIBLE without grading at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Projection {
+    Identity,
+    ShapeOnly,
+}
+
+impl Projection {
+    pub fn domain(self) -> &'static str {
+        match self {
+            Projection::Identity => TOPOLOGY_IDENTITY_DOMAIN,
+            Projection::ShapeOnly => TOPOLOGY_SHAPE_DOMAIN,
+        }
+    }
+}
+
 /// The ONE topology projection: component → key → logical {dtype, shape}. A real header and
 /// reviewed structure data must produce the same bytes for the same structure, so they call
 /// the same function over the same iterator shape rather than each building a map.
-pub fn topology_value<'a>(
+///
+/// Both digests come out of THIS body. The only thing `projection` changes is whether the
+/// leaf carries its dtype and which domain separator is stamped; grouping, ordering and
+/// canonical form are shared code, so the exact digest and the shape digest cannot drift
+/// apart under an edit — a change to how a topology is projected moves both or neither.
+pub fn topology_projection<'a>(
+    projection: Projection,
     items: impl Iterator<Item = (&'a str, &'a str, Dtype, &'a [u64])>,
 ) -> Value {
     let mut comps: Vec<(String, Vec<(String, Value)>)> = Vec::new();
     for (c, k, dtype, shape) in items {
-        let leaf = Value::obj(vec![
-            ("dtype", Value::str(dtype.name())),
-            ("shape", shape_value(shape)),
-        ]);
+        let mut leaf = Vec::with_capacity(2);
+        if projection == Projection::Identity {
+            leaf.push(("dtype", Value::str(dtype.name())));
+        }
+        leaf.push(("shape", shape_value(shape)));
+        let leaf = Value::obj(leaf);
         match comps.iter_mut().find(|(n, _)| n == c) {
             Some((_, ks)) => ks.push((k.to_string(), leaf)),
             None => comps.push((c.to_string(), vec![(k.to_string(), leaf)])),
@@ -313,8 +348,23 @@ pub fn topology_value<'a>(
                     .collect(),
             ),
         ),
-        ("projection", Value::str(TOPOLOGY_IDENTITY_DOMAIN)),
+        ("projection", Value::str(projection.domain())),
     ])
+}
+
+/// The exact projection. Kept as its own name because it is the identity index every
+/// existing document already froze.
+pub fn topology_value<'a>(
+    items: impl Iterator<Item = (&'a str, &'a str, Dtype, &'a [u64])>,
+) -> Value {
+    topology_projection(Projection::Identity, items)
+}
+
+/// The shape-only projection — the same body with the dtype leaf elided.
+pub fn topology_shape_value<'a>(
+    items: impl Iterator<Item = (&'a str, &'a str, Dtype, &'a [u64])>,
+) -> Value {
+    topology_projection(Projection::ShapeOnly, items)
 }
 
 pub fn topology_digest_of(v: &Value) -> String {
@@ -328,15 +378,26 @@ impl Header {
             .flat_map(|(c, ts)| ts.iter().map(move |(k, t)| (c, k, t)))
     }
 
-    pub fn topology_value(&self) -> Value {
-        topology_value(
+    pub fn projected(&self, projection: Projection) -> Value {
+        topology_projection(
+            projection,
             self.tensors()
                 .map(|(c, k, t)| (c.as_str(), k.as_str(), t.dtype, t.shape.as_slice())),
         )
     }
 
+    pub fn topology_value(&self) -> Value {
+        self.projected(Projection::Identity)
+    }
+
     pub fn topology_digest(&self) -> String {
         topology_digest_of(&self.topology_value())
+    }
+
+    /// The shape-only bucket key. Two checkpoints differing only by dtype or encoding share
+    /// it; it is a SEARCH bucket, never a decision.
+    pub fn topology_shape_digest(&self) -> String {
+        topology_digest_of(&self.projected(Projection::ShapeOnly))
     }
 
     /// Closure-independent schema, geometry, ordering and aggregate-limit validation.

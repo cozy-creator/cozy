@@ -2,4 +2,5 @@ doc: header
 expect: ok
 id: sha256:eb57dc0ebc03a4d73aea7d4df13c5c1c50d1e416d7aafab47c3bc27672f6591c
 topology: sha256:14fc85f36f84019391ce2691f0b206faebd505b37727f34fcc4deb6177ed918f
+shape: sha256:a1c61fad25156e0ed3b044d5fb42590be8500a89bece19270c4bde631eb5179a
 note: inline at the 256 B cap + segmented data

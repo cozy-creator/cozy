@@ -233,6 +233,14 @@ pub fn topology_digest(py: Python<'_>, data: &[u8]) -> PyResult<String> {
     Ok(Header::parse(data).or_refuse(py)?.topology_digest())
 }
 
+/// The SHAPE-ONLY projection of the same header (tfs-038): the same digest with the dtype
+/// leaf elided, so two checkpoints differing only by dtype or encoding share one bucket key.
+/// An index for catalog search, never a decision.
+#[pyfunction]
+pub fn topology_shape_digest(py: Python<'_>, data: &[u8]) -> PyResult<String> {
+    Ok(Header::parse(data).or_refuse(py)?.topology_shape_digest())
+}
+
 /// Validate canonical Manifest bytes.
 #[pyfunction]
 pub fn parse_manifest<'p>(py: Python<'p>, data: &[u8]) -> PyResult<Bound<'p, PyAny>> {
@@ -256,6 +264,7 @@ pub fn run_doc<'p>(
     let result = PyDict::new(py);
     result.set_item("id", outcome.id)?;
     result.set_item("topology", outcome.topology)?;
+    result.set_item("shape", outcome.shape)?;
     result.set_item("manifest", outcome.manifest)?;
     result.set_item("grade", outcome.grade)?;
     Ok(result)

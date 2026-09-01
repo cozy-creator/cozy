@@ -2,4 +2,5 @@ doc: header
 expect: ok
 id: sha256:a04c6db1093628ae5bedc75e820442f3c0f7f11aea17cbd2be1fd0a53d79d326
 topology: sha256:925c155c8788036cc9d9a5da70528a60d9eb5c277468352d2aa84cb68abdd29f
+shape: sha256:989d2ed9ce65a940d3db7ebf3fd3d5705ac17b7a73043724496596be1319c851
 note: a pin-absent spec object validates as data

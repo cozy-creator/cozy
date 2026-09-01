@@ -5,6 +5,7 @@
 //! has to; it never decides one.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -507,6 +508,10 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
                 ])
             })
             .collect();
+        // The two index keys, both sides, so a catalog search can bucket off ONE call:
+        // exact digests equal -> the pair is already an exact-index hit; only the shape
+        // digests equal -> it differs by dtype or encoding alone and is worth grading;
+        // neither -> a different model, refused without grading at all.
         let doc = tensorfs_core::canon::Value::obj(vec![
             (
                 "satisfied",
@@ -517,6 +522,22 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
             (
                 "report",
                 tensorfs_core::canon::Value::str(report.object_id()),
+            ),
+            (
+                "topology_required",
+                tensorfs_core::canon::Value::str(report.topology_required.clone()),
+            ),
+            (
+                "topology_present",
+                tensorfs_core::canon::Value::str(report.topology_present.clone()),
+            ),
+            (
+                "topology_shape_required",
+                tensorfs_core::canon::Value::str(report.topology_shape_required.clone()),
+            ),
+            (
+                "topology_shape_present",
+                tensorfs_core::canon::Value::str(report.topology_shape_present.clone()),
             ),
         ]);
         println!(
@@ -535,6 +556,16 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
             "the fast-path index HITS (an index, never the decision)"
         } else {
             "index miss; the decision is the document comparison below"
+        }
+    );
+    println!(
+        "shape        required {} / present {} — {}",
+        &report.topology_shape_required[7..19],
+        &report.topology_shape_present[7..19],
+        if report.topology_shape_required == report.topology_shape_present {
+            "same shapes, so any difference is dtype or encoding alone (a search bucket)"
+        } else {
+            "different shapes: a different model, not a different packaging"
         }
     );
     if out.mismatches.is_empty() {
@@ -894,6 +925,145 @@ pub fn cmd_grade(report_p: &Path, flags: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ------------------------------------------------------------------ the batch surface
+
+/// One canonical document per line, bounded, in the order the caller wrote them.
+///
+/// Grading is MICROSECONDS — the frozen reports grade in 1-2 us each. `tfs grade <file>` is
+/// one report per process, so the wall was never the decision, it was the ~2.5 ms of
+/// process spawn wrapped around it. For a preflight check that is irrelevant. For a catalog
+/// search it was the entire cost, and it made ranking a catalog a thing you budget for
+/// rather than a thing you do.
+///
+/// The framing is the documents' own canonical form: these are printable-ASCII JSON with
+/// every control character escaped, so a document can never contain a newline and a line IS
+/// a document. Nothing new is invented to carry them.
+///
+/// **A partial answer is not an answer.** A line that does not decode is not written out as
+/// some fifth verdict and it does not silently disappear from the stream — the batch stops
+/// there, names the line, and exits failure. Everything already written is a complete
+/// verdict about a document the caller supplied; nothing after the bad line is claimed. The
+/// alternative — an output line that carries a refusal in the same shape as a grade — would
+/// be a fifth grade with a different spelling, which the closed four-level ladder forbids.
+fn each_line(
+    reader: &mut impl BufRead,
+    flush_each: bool,
+    mut on_line: impl FnMut(&[u8]) -> Result<Vec<u8>, tensorfs_core::err::Refusal>,
+) -> ExitCode {
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let (mut n, t) = (0u64, Instant::now());
+    loop {
+        let mut line = Vec::new();
+        // Bounded per line: a document that never ends is not a document.
+        match reader
+            .by_ref()
+            .take(limits::DOC_MAX_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("REFUSED IO_FAILED: line {}: {e}", n + 1);
+                return ExitCode::FAILURE;
+            }
+        }
+        while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() > limits::DOC_MAX_BYTES {
+            eprintln!(
+                "REFUSED SIZE_CAP: line {} is over the {} B document cap",
+                n + 1,
+                limits::DOC_MAX_BYTES
+            );
+            return ExitCode::FAILURE;
+        }
+        match on_line(&line) {
+            Ok(answer) => {
+                if out
+                    .write_all(&answer)
+                    .and_then(|_| out.write_all(b"\n"))
+                    .is_err()
+                {
+                    return ExitCode::FAILURE;
+                }
+                if flush_each && out.flush().is_err() {
+                    return ExitCode::FAILURE;
+                }
+                n += 1;
+            }
+            Err(e) => {
+                let _ = out.flush();
+                eprintln!("REFUSED {}: line {}: {}", e.code.as_str(), n + 1, e.detail);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if out.flush().is_err() {
+        return ExitCode::FAILURE;
+    }
+    let secs = t.elapsed().as_secs_f64();
+    eprintln!(
+        "{n} document(s) in {:.1} ms — {:.0}/s",
+        secs * 1000.0,
+        n as f64 / secs.max(1e-9)
+    );
+    ExitCode::SUCCESS
+}
+
+fn stream_in(path: Option<&Path>) -> Result<(Box<dyn BufRead>, bool), ExitCode> {
+    match path {
+        None => Ok((Box::new(BufReader::new(std::io::stdin())), true)),
+        Some(p) => match fs::File::open(p) {
+            Ok(f) => Ok((Box::new(BufReader::new(f)), false)),
+            Err(e) => {
+                eprintln!("REFUSED IO_FAILED: read {}: {e}", p.display());
+                Err(ExitCode::FAILURE)
+            }
+        },
+    }
+}
+
+/// `tfs grade batch <file>` and `tfs grade serve` (stdin): JSONL of reports in, one
+/// `grade_json` object per line out, in input order.
+///
+/// The per-line answer is byte-identical to what `tfs grade <file> --json` prints for the
+/// same document — literally the same `grade_json` — so the single-pair form is not a
+/// different surface with a shared name, and a preflight caller is never made to batch.
+///
+/// The registry is loaded ONCE for the whole stream. `--prove-with` (`--code`/`--header`)
+/// is single-pair only: proving a registration closes the whole gap needs both documents of
+/// THAT pair, and a batch has one registry and many pairs.
+pub fn cmd_grade_stream(path: Option<&Path>, flags: &Flags) -> ExitCode {
+    if flag(flags, "code").is_some() || flag(flags, "header").is_some() {
+        eprintln!(
+            "REFUSED UNKNOWN_FIELD: --prove-with is single-pair only: it holds the code \
+             topology and header of ONE pair, and a batch carries many"
+        );
+        return ExitCode::FAILURE;
+    }
+    let reg = match load_registry(flags) {
+        Ok(r) => r,
+        Err(c) => return c,
+    };
+    let (mut reader, flush_each) = match stream_in(path) {
+        Ok(v) => v,
+        Err(c) => return c,
+    };
+    each_line(&mut reader, flush_each, |line| {
+        let report = CompatibilityReport::parse(line)?;
+        let decision = GradeDecision {
+            report: report.object_id(),
+            grade: grade::grade_report(&report, &reg)?,
+        };
+        Ok(grade_json(&decision, &report))
+    })
+}
+
 // ------------------------------------------------------------------ the hermetic verifier
 
 /// Build a request out of loose documents, so the seam can be driven by hand.
@@ -963,6 +1133,23 @@ pub fn cmd_verify(req_p: &Path, out_p: &Path, flags: &Flags) -> ExitCode {
         rss_kb("VmHWM") as f64 / 1024.0
     );
     ExitCode::SUCCESS
+}
+
+/// The verifier as a STREAM, over the same bounded document interface: one canonical
+/// `VerifyRequest` per line in, one canonical `VerifyResponse` per line out, each response
+/// still naming the sha256 of its own request. `verifier::run` is unchanged and still the
+/// whole verifier as a pure function of bytes to bytes — this only stops paying a process
+/// for each call to it, which is the end-to-end shape a catalog search wants: one code
+/// topology against many checkpoints without a fork per pair.
+///
+/// Every input still arrives inside its request, so the loop resolves no digest, opens no
+/// store and reaches no network. Long-lived does not mean stateful.
+pub fn cmd_verify_stream(path: Option<&Path>) -> ExitCode {
+    let (mut reader, flush_each) = match stream_in(path) {
+        Ok(v) => v,
+        Err(c) => return c,
+    };
+    each_line(&mut reader, flush_each, verifier::run)
 }
 
 /// The hub's side: consume a response, or refuse. Nothing between those two.
