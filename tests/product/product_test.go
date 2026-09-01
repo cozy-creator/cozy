@@ -800,7 +800,7 @@ func TestPackagePublishPrunesRuntimeOwnedTensorFS(t *testing.T) {
 	identity, problem := wheel.InspectIdentity(pack.DependencyWheels[0].Path)
 	fatal(t, problem)
 	if identity.Distribution != "cozy-runtime" { //cozy:allow distribution assertion, not executable access
-		t.Fatalf("production overlay retained base-owned TensorFS: %+v", identity)
+		t.Fatalf("rental package dependencies retained base-owned TensorFS: %+v", identity)
 	}
 }
 
