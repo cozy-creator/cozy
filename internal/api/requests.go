@@ -707,7 +707,8 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	}
 	attempts, _ := s.store.Attempts(row.ID)
 	life.Attempts = len(attempts)
-	life.ElapsedMS = elapsedMS(row, attempts)
+	terminalAt, _ := s.store.TerminalEventAt(row.ID)
+	life.ElapsedMS = elapsedMS(row, attempts, terminalAt)
 	outs, _ := s.store.VisibleOutputs(row.ID)
 	for _, o := range outs {
 		life.Outputs = append(life.Outputs, MediaRef{
