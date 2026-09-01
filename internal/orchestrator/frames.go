@@ -326,7 +326,8 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				row := remotePlacementObservation{
 					placementID: p.PlacementId, packageRevision: p.PackageRevisionDigest,
 					environmentDigest: p.EnvironmentDigest, configDigest: p.ConfigDigest,
-					serving: p.Serving, dispatchablePlanIDs: map[string]bool{}, knownPlanIDs: map[string]bool{},
+					materialization: p.Materialization, serving: p.Serving,
+					dispatchablePlanIDs: map[string]bool{}, knownPlanIDs: map[string]bool{},
 				}
 				for _, digest := range p.DispatchableBindingDigests {
 					planID := spellOf(digest)
@@ -407,9 +408,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		// kill authority merely because it shares the diagnostic list with fatal faults.
 		w.faulted = faulted(status, r)
 		if w.spec.Connection != nil && !w.spec.IsJob() {
-			for _, placement := range r.Placements {
-				w.faulted = w.faulted || faulted(placement, r)
-			}
+			w.faulted = r.WorkerPhase == pb.WorkerPhase_WORKER_PHASE_FAILED
 		}
 		if w.faulted {
 			if w.errorSince.IsZero() {

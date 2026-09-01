@@ -463,6 +463,7 @@ type remotePlacementObservation struct {
 	packageRevision     string
 	environmentDigest   string
 	configDigest        string
+	materialization     pb.MaterializationState
 	serving             pb.ServingState
 	dispatchablePlanIDs map[string]bool
 	knownPlanIDs        map[string]bool
@@ -756,9 +757,12 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 		w := c.workers[instanceID]
 		gone := w == nil || w.exited
 		var refused, desiredRefusal *exit.Error
+		placementFailed := false
 		if w != nil {
 			refused, desiredRefusal = w.refusal, w.desiredRefusal
 			observed := w.observedRemote[logical.ReleaseDigest]
+			placementFailed = observed.materialization ==
+				pb.MaterializationState_MATERIALIZATION_STATE_FAILED
 			planID := logical.PlanID
 			if planID == "" && len(logical.Models) > 0 {
 				for candidate, dispatchable := range observed.dispatchablePlanIDs {
@@ -811,6 +815,10 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 			return WorkerLaunchSpec{}, "", refused
 		case desiredRefusal != nil:
 			return WorkerLaunchSpec{}, "", desiredRefusal
+		case placementFailed:
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Failed,
+				"rental.package_materialization_failed",
+				"the rented worker could not materialize package %s", logical.Package)
 		case gone:
 			return WorkerLaunchSpec{}, "", exit.New(exit.Failed,
 				"the rented worker exited before making package %s ready", logical.Package)
