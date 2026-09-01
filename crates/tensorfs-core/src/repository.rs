@@ -720,27 +720,6 @@ impl Repository {
         {
             Ok(index) => {
                 if next.releases[index].revision != expected_revision {
-                    let immediate_replay = expected_revision
-                        .checked_add(1)
-                        .is_some_and(|revision| revision == next.releases[index].revision)
-                        && set.iter().all(|lane| {
-                            next.releases[index]
-                                .lanes
-                                .binary_search_by(|candidate| candidate.key().cmp(lane.key()))
-                                .ok()
-                                .is_some_and(|position| {
-                                    next.releases[index].lanes[position] == *lane
-                                })
-                        })
-                        && remove.iter().all(|name| {
-                            next.releases[index]
-                                .lanes
-                                .binary_search_by(|candidate| candidate.key().cmp(name))
-                                .is_err()
-                        });
-                    if immediate_replay {
-                        return Ok(next);
-                    }
                     return refuse(
                         Code::RELEASE_CONFLICT,
                         format!(
@@ -834,13 +813,6 @@ impl Repository {
                 detail: format!("release {version:?} does not exist"),
             })?;
         if next.releases[index].revision != expected_revision {
-            if next.releases[index].yanked
-                && expected_revision
-                    .checked_add(1)
-                    .is_some_and(|revision| revision == next.releases[index].revision)
-            {
-                return Ok(next);
-            }
             return refuse(
                 Code::RELEASE_CONFLICT,
                 format!(

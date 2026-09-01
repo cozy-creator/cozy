@@ -1407,7 +1407,11 @@ mod tests {
         let bytes = fs::read(store.repository_path(&repo)).unwrap();
         assert_eq!(
             store
-                .apply_repository(Some(&bytes), &put, &Fault::default())
+                .apply_repository(
+                    Some(&bytes),
+                    &release_mutation(&repo, "1.0.0", "cpu", &manifest, 1),
+                    &Fault::default(),
+                )
                 .unwrap()
                 .unwrap()
                 .canonical_bytes(),
