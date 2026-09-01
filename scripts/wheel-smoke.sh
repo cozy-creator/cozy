@@ -117,6 +117,7 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
         "org": "tensorhub",
         "name": "smoke",
         "version": "1.0.0",
+        "revision": 1,
         "lane": "cpu",
         "manifest_digest": "sha256:" + snap,
         "manifest_length": len(info["manifest"]),

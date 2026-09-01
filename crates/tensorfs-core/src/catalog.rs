@@ -833,7 +833,7 @@ impl Catalog {
 }
 
 fn insert_projection(transaction: &Connection, projection: &Projection) -> Result<()> {
-    for row in &projection.releases {
+    for row in projection.checkpoints.iter().filter(|row| row.published) {
         transaction
             .execute(
                 "INSERT INTO tensorfs_released_manifests(org,name,manifest_sha256)

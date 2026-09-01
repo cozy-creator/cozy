@@ -20,7 +20,8 @@ use crate::ids::{ascii_name, hex64, Doc, ObjectRef, Plain};
 use crate::limits;
 use crate::manifest::Manifest;
 use crate::repository::{
-    CheckpointEvidence, IngestProvenance, Mutation, RepositoryName, VerificationEvidence,
+    CheckpointEvidence, IngestProvenance, Mutation, ReleaseLane, RepositoryName,
+    VerificationEvidence,
 };
 use crate::spec::EncodingSpec;
 use crate::store::{Store, Verdict};
@@ -333,25 +334,19 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
     };
     let checkpoint_manifest = manifest.clone();
     let checkpoint_evidence = evidence.clone();
-    let mutation = if repo.org == "local" {
+    let local_mutation = if repo.org == "local" {
         if lane != "local" {
             return refuse(Code::KEY_GRAMMAR, "local ingest requires lane local");
         }
         hex64("local source selection", version)?;
-        Mutation::ReplaceLocal {
+        Some(Mutation::ReplaceLocal {
             repo: repo.clone(),
-            manifest,
+            manifest: manifest.clone(),
             version: version.to_string(),
             evidence: Box::new(evidence),
-        }
+        })
     } else {
-        Mutation::PutRelease {
-            repo: repo.clone(),
-            lane: lane.to_string(),
-            manifest,
-            metadata: None,
-            version: version.to_string(),
-        }
+        None
     };
     let path = store.repository_path(&repo);
     let current = match fs::read(&path) {
@@ -393,7 +388,11 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
         }
     }
     if repo.org == "local" {
-        store.apply_repository(current.as_deref(), &mutation, &Default::default())?;
+        store.apply_repository(
+            current.as_deref(),
+            local_mutation.as_ref().expect("local mutation"),
+            &Default::default(),
+        )?;
     } else {
         let checkpointed = store
             .apply_repository(
@@ -406,6 +405,21 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
                 &Default::default(),
             )?
             .expect("put_checkpoint retains the repository");
+        let expected_revision = checkpointed
+            .releases
+            .iter()
+            .find(|release| release.version == version)
+            .map_or(0, |release| release.revision);
+        let mutation = Mutation::UpdateRelease {
+            expected_revision,
+            repo: repo.clone(),
+            remove: Vec::new(),
+            set: vec![ReleaseLane {
+                lane: lane.to_string(),
+                manifest,
+            }],
+            version: version.to_string(),
+        };
         store.apply_repository(
             Some(&checkpointed.canonical_bytes()),
             &mutation,

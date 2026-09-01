@@ -31,7 +31,7 @@ use tensorfs_core::meta::{Hold, Meta};
 use tensorfs_core::project;
 use tensorfs_core::read::{self, ObjectRange, ReadLease as CoreLease, Source as ReadSource};
 use tensorfs_core::receipt::Receipts;
-use tensorfs_core::repository::{Mutation, Repository, RepositoryName};
+use tensorfs_core::repository::{Mutation, ReleaseLane, Repository, RepositoryName};
 use tensorfs_core::storage;
 use tensorfs_core::store::{Fault, Store as CoreStore, Verdict};
 
@@ -511,7 +511,7 @@ impl PyStore {
         let release = repository
             .releases
             .iter()
-            .find(|release| release.version == version && release.lane == lane)
+            .find(|release| release.version == version && !release.yanked)
             .ok_or_else(|| {
                 to_py(
                     py,
@@ -523,13 +523,29 @@ impl PyStore {
                     },
                 )
             })?;
+        let selected = release
+            .lanes
+            .iter()
+            .find(|candidate| candidate.lane == lane)
+            .ok_or_else(|| {
+                to_py(
+                    py,
+                    &Refusal {
+                        code: Code::RELEASE_ABSENT,
+                        detail: format!(
+                            "repository {org}/{name} release {version:?} has no lane {lane:?}"
+                        ),
+                    },
+                )
+            })?;
         let out = PyDict::new(py);
         out.set_item("org", org)?;
         out.set_item("name", name)?;
         out.set_item("version", &release.version)?;
-        out.set_item("lane", &release.lane)?;
-        out.set_item("manifest_digest", release.manifest.id())?;
-        out.set_item("manifest_length", release.manifest.length)?;
+        out.set_item("revision", release.revision)?;
+        out.set_item("lane", &selected.lane)?;
+        out.set_item("manifest_digest", selected.manifest.id())?;
+        out.set_item("manifest_length", selected.manifest.length)?;
         Ok(out)
     }
 
@@ -704,19 +720,33 @@ impl PyStore {
             .or_refuse(py)
     }
 
-    fn remove_release<'p>(
+    #[allow(clippy::too_many_arguments)]
+    fn update_release<'p>(
         &self,
         py: Python<'p>,
         current: &[u8],
         org: &str,
         name: &str,
         version: &str,
-        lane: &str,
+        expected_revision: u64,
+        set: Vec<(String, String, u64)>,
+        remove: Vec<String>,
     ) -> PyResult<Bound<'p, PyBytes>> {
-        let mutation = Mutation::RemoveRelease {
+        let set = set
+            .into_iter()
+            .map(|(lane, digest, length)| {
+                Ok(ReleaseLane {
+                    lane,
+                    manifest: obj_ref(py, &digest, length)?,
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let mutation = Mutation::UpdateRelease {
+            expected_revision,
             repo: RepositoryName::new(org, name).or_refuse(py)?,
+            remove,
+            set,
             version: version.to_string(),
-            lane: lane.to_string(),
         };
         let repository = py
             .detach(|| {
@@ -724,7 +754,31 @@ impl PyStore {
                     .apply_repository(Some(current), &mutation, &Fault::default())
             })
             .or_refuse(py)?
-            .expect("release removal retains the repository");
+            .expect("release update retains the repository");
+        Ok(PyBytes::new(py, &repository.canonical_bytes()))
+    }
+
+    fn yank_release<'p>(
+        &self,
+        py: Python<'p>,
+        current: &[u8],
+        org: &str,
+        name: &str,
+        version: &str,
+        expected_revision: u64,
+    ) -> PyResult<Bound<'p, PyBytes>> {
+        let mutation = Mutation::YankRelease {
+            expected_revision,
+            repo: RepositoryName::new(org, name).or_refuse(py)?,
+            version: version.to_string(),
+        };
+        let repository = py
+            .detach(|| {
+                self.store
+                    .apply_repository(Some(current), &mutation, &Fault::default())
+            })
+            .or_refuse(py)?
+            .expect("release yank retains the repository");
         Ok(PyBytes::new(py, &repository.canonical_bytes()))
     }
 
@@ -1236,19 +1290,27 @@ impl PyOperation {
                 tensorfs_core::repository::CheckpointEvidence::parse(evidence).or_refuse(py)?,
             )),
         };
-        let mutation = Mutation::PutRelease {
-            repo: self.repo.clone(),
-            version: version.to_string(),
-            lane: lane.to_string(),
-            manifest,
-            metadata: None,
-        };
         let repository = py
             .detach(|| {
                 let checkpointed = self
                     .store
                     .apply_repository(current, &checkpoint, &Fault::default())?
                     .expect("put_checkpoint retains the repository");
+                let expected_revision = checkpointed
+                    .releases
+                    .iter()
+                    .find(|release| release.version == version)
+                    .map_or(0, |release| release.revision);
+                let mutation = Mutation::UpdateRelease {
+                    expected_revision,
+                    repo: self.repo.clone(),
+                    remove: Vec::new(),
+                    set: vec![ReleaseLane {
+                        lane: lane.to_string(),
+                        manifest,
+                    }],
+                    version: version.to_string(),
+                };
                 self.store.apply_repository(
                     Some(&checkpointed.canonical_bytes()),
                     &mutation,
@@ -1256,7 +1318,7 @@ impl PyOperation {
                 )
             })
             .or_refuse(py)?
-            .expect("put_release retains the repository");
+            .expect("update_release retains the repository");
         self.catalog
             .complete_operation(&self.operation_id)
             .or_refuse(py)?;

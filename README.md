@@ -1,6 +1,6 @@
 # TensorFS
 
-The current release is `0.0.6`.
+The current release is `0.0.7`.
 
 TensorFS stores every domain repository as the same graph:
 
@@ -13,10 +13,10 @@ checkouts/<manifest-sha256>/...    # optional disposable local view
 tmp/                               # all transient local state; delete when stopped
 ```
 
-Repository files are authoritative mutable checkpoint roots plus immutable release indexes. Manifests are immutable virtual file
-trees. Blobs are immutable content bytes. The same engine is used independently for model,
-package-source, dataset, and user-file stores; the physical domain/bucket supplies access and
-erasure isolation, not a different catalog format. SQLite locally and PostgreSQL in Tensorhub are
+Repository files are authoritative checkpoint roots plus revisioned model release pointers.
+Manifests are immutable virtual file trees. Blobs are immutable content bytes. TensorFS backs model
+and dataset CAS domains; package source and user media are ordinary object storage. SQLite locally
+and PostgreSQL in Tensorhub are
 local indexes and coordination. Repository files rebuild released-manifest lookup; open operation
 holds protect in-flight writes from GC; derived transactions are resumable local work; verified
 blob rows avoid rehashing unchanged files. SQL never makes repository content durable.
@@ -112,21 +112,20 @@ bytes, and prints their ObjectRef. Local and cloud callers use this seam instead
 second source-tree codec.
 
 Publication order is blobs, manifest, checkpoint-root compare-and-swap, then an optional release
-compare-and-swap and released-manifest index. `put_checkpoint` retains one exact Manifest ObjectRef;
-`remove_checkpoint` refuses while any release lane references it. `put_release` only maps a bounded
-`(version,lane)` to an already retained checkpoint, so one checkpoint can be reused by many lanes or
-releases. A crash before checkpoint replacement leaves harmless unreachable content. A crash
+compare-and-swap and public-checkpoint index. `put_checkpoint` retains one exact Manifest ObjectRef.
+`update_release` adds/repoints supplied lanes, removes explicit lanes, preserves omissions, and
+increments one release revision. First publication permanently marks the checkpoint public;
+`remove_checkpoint` therefore accepts only never-public, unreferenced checkpoints. A crash
 afterward leaves a durable unreleased checkpoint; `store rebuild` catches SQL projections up. The
 database never leads the repository file.
 
 Each model row emitted by `repo list` carries the repository's exact canonical `evidence` object.
-Clients may preserve those bytes opaquely and base64-wrap them for a later `put_release`; TensorFS
+Clients may preserve those bytes opaquely and base64-wrap them for a later `put_checkpoint`; TensorFS
 remains the only parser and canonical writer. Ordinary release rows omit evidence.
 
-Evidence is present only for a Manifest containing one typed CozyTensors header. Ordinary releases
-do not fabricate model classification. A release may carry one optional `metadata` blob ref;
-package repositories use it for their exact PackageRelease while datasets and user files may omit
-it. Rebuild always recovers the repository, metadata, Manifest, and complete reached blob set;
+Evidence is present only for a Manifest containing one typed CozyTensors header. Ordinary files do
+not fabricate model classification. Rebuild always recovers the repository, Manifest, and complete
+reached blob set;
 model headers additionally recover the diagnostic projection emitted by `store rebuild --rows`.
 
 ## Reviewed source planning and ingest
