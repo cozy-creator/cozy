@@ -367,27 +367,6 @@ pub fn seeds() -> Vec<Seed> {
     out
 }
 
-/// The qualified (encoding, device) pairs. FAIL-CLOSED: anything absent here refuses, and
-/// a record cannot exist without naming the vector set its implementation passed.
-pub fn capability_records() -> crate::capability::CapabilityRecords {
-    let mut records = Vec::new();
-    for s in seeds() {
-        // Only a VECTORED spec can be qualified at all. The reference decoders in the `tfs`
-        // conformance harness are what these records qualify, on the CPU they run on;
-        // every accelerator class is absent until something is qualified there.
-        if let Some(v) = s.spec.vectors.clone() {
-            records.push(crate::capability::CapabilityRecord {
-                encoding: s.spec.object_id(),
-                device: "cpu".to_string(),
-                implementation: "tfs-conform-reference".to_string(),
-                vectors: v,
-                note: "reference decoder in the tfs conformance harness, qualified bit-for-bit against producer-mined vectors".to_string(),
-            });
-        }
-    }
-    crate::capability::CapabilityRecords { records }
-}
-
 /// Launch border policy admits platform-aliased spec digests only.
 pub fn platform_digests() -> Vec<String> {
     seeds().iter().map(|s| s.spec.object_id()).collect()

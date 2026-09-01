@@ -30,15 +30,9 @@ reason it exists (tfs-005 measured the drain at ~10%).
 
 from __future__ import annotations
 
-import sys as _sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
-
-if _sys.implementation.name != "cpython" or _sys.version_info[:2] != (3, 12):
-    raise ImportError("tensorfs requires normal GIL-enabled CPython 3.12")
-
-del _sys
 
 from . import errors
 from ._ext import (

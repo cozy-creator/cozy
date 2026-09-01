@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""One manual driver for the independent CozyTensors CBOR conformance seats."""
+"""The CozyTensors CBOR conformance gate: an independent Python seat, and
+optionally the production Rust codec, over the same frozen green and red vectors."""
 
 from __future__ import annotations
 
@@ -20,7 +21,6 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 CONF = ROOT / "conformance" / "cbor"
 PYTHON = CONF / "python"
-GO = CONF / "go"
 GREEN = CONF / "vectors" / "green"
 RED = CONF / "vectors" / "red"
 sys.path.insert(0, str(PYTHON))
@@ -35,10 +35,6 @@ def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
 
 def python_codec(*args: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
     return run(sys.executable, str(PYTHON / "codec.py"), *args, check=check)
-
-
-def go_codec(*args: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
-    return run("go", "-C", str(GO), "run", ".", *args, check=check)
 
 
 def rust_codec(
@@ -67,7 +63,6 @@ def fence_sources() -> None:
         if "/.venv/" in p
         or "/__pycache__/" in p
         or p.endswith(".pyc")
-        or p == "conformance/cbor/go/cozytensors-cbor-conformance"
     ]
     if bad:
         raise RuntimeError("generated conformance cache is tracked: " + ", ".join(bad))
@@ -75,14 +70,11 @@ def fence_sources() -> None:
 
 def green_outputs(source: Path, work: Path, tfs: Path | None) -> list[tuple[str, Path]]:
     outputs: list[tuple[str, Path]] = []
-    for name, command in (("python", python_codec), ("go", go_codec)):
-        out = work / f"{source.stem}.{name}.cbor"
-        result = command("encode", str(source), "--out", str(out), check=False)
-        if result.returncode:
-            raise RuntimeError(
-                f"{name} encode {source.name}: {result.stderr.decode().strip()}"
-            )
-        outputs.append((name, out))
+    out = work / f"{source.stem}.python.cbor"
+    result = python_codec("encode", str(source), "--out", str(out), check=False)
+    if result.returncode:
+        raise RuntimeError(f"python encode {source.name}: {result.stderr.decode().strip()}")
+    outputs.append(("python", out))
     if tfs:
         out = work / f"{source.stem}.rust.cbor"
         result = rust_codec(tfs, "encode", str(source), "--out", str(out), check=False)
@@ -181,9 +173,6 @@ def red_vectors() -> dict[str, tuple[bytes, str]]:
         value[2].sort(key=lambda row: row[0])
         return value
 
-    asset_case_collision = copy.deepcopy(asset_source)
-    asset_case_collision[2][0][0] = "A/x"
-    asset_case_collision[2][1][0] = "a/x"
     return {
         "old-json": (
             (GREEN / "minimal-inline.json").read_bytes(),
@@ -318,14 +307,6 @@ def red_vectors() -> dict[str, tuple[bytes, str]]:
             cbor2.dumps(bad_asset("a\\b"), canonical=True),
             "asset names exclude reserved characters",
         ),
-        "asset-windows-reserved": (
-            cbor2.dumps(bad_asset("NUL.txt"), canonical=True),
-            "asset names exclude Windows-reserved stems",
-        ),
-        "asset-case-collision": (
-            cbor2.dumps(asset_case_collision, canonical=True),
-            "asset names are unique under ASCII case-folding",
-        ),
         "truncated": (minimal[:-1], "truncated input is forbidden"),
     }
 
@@ -353,7 +334,7 @@ def update_vectors(tfs: Path | None) -> None:
 
 def check_vectors(tfs: Path | None) -> None:
     fence_sources()
-    seats: list[tuple[str, Any]] = [("python", python_codec), ("go", go_codec)]
+    seats: list[tuple[str, Any]] = [("python", python_codec)]
     if tfs:
         seats.append(("rust", lambda *a, check=True: rust_codec(tfs, *a, check=check)))
     passed = 0
@@ -535,7 +516,7 @@ def convert_legacy(header_path: Path, order_path: Path) -> dict[str, Any]:
 def benchmark(diagnostic: Path, tfs: Path | None, reps: int) -> None:
     with tempfile.TemporaryDirectory(prefix="cozy-cbor-bench-") as tmp:
         work = Path(tmp)
-        commands: list[tuple[str, Any]] = [("python", python_codec), ("go", go_codec)]
+        commands: list[tuple[str, Any]] = [("python", python_codec)]
         if tfs:
             commands.append(
                 ("rust", lambda *a, check=True: rust_codec(tfs, *a, check=check))

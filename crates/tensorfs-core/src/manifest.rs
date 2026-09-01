@@ -53,11 +53,9 @@ pub struct Manifest {
     entries: Vec<(String, Entry)>,
 }
 
-const RESERVED: [&str; 22] = [
-    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
-    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
-];
-
+/// Traversal and ambiguity only. A manifest path is a key in a VIRTUAL tree: nothing here
+/// touches a real filesystem, so nothing here is entitled to a filesystem's opinions.
+/// Windows device stems and case folding are a CHECKOUT law and live in `project.rs`.
 pub(crate) fn check_path(path: &str) -> Result<()> {
     if path.is_empty() || path.len() > limits::MAX_KEY_BYTES {
         return refuse(
@@ -86,17 +84,6 @@ pub(crate) fn check_path(path: &str) -> Result<()> {
             .any(|byte| matches!(byte, b'\\' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|'))
         {
             return refuse(Code::PATH_ILLEGAL, format!("{path:?}: reserved character"));
-        }
-        let stem = component
-            .split('.')
-            .next()
-            .unwrap_or(component)
-            .to_ascii_lowercase();
-        if RESERVED.contains(&stem.as_str()) {
-            return refuse(
-                Code::PATH_RESERVED,
-                format!("{path:?}: Windows reserved stem {stem:?}"),
-            );
         }
     }
     Ok(())
@@ -148,7 +135,6 @@ impl Manifest {
             return refuse(Code::COUNT_CAP, "manifest entry count exceeds cap");
         }
         let mut previous: Option<&str> = None;
-        let mut folded = Vec::with_capacity(self.entries.len());
         let mut cozytensors = 0usize;
         for (path, entry) in &self.entries {
             check_path(path)?;
@@ -159,7 +145,6 @@ impl Manifest {
                 );
             }
             previous = Some(path);
-            folded.push(path.to_ascii_lowercase());
             crate::ids::hex64("Manifest.entry.blob", &entry.blob().sha256)?;
             if entry.blob().length == 0 && matches!(entry, Entry::CozyTensors(_)) {
                 return refuse(Code::LENGTH_MISMATCH, format!("{path:?}: zero-length blob"));
@@ -167,13 +152,6 @@ impl Manifest {
             if matches!(entry, Entry::CozyTensors(_)) {
                 cozytensors += 1;
             }
-        }
-        folded.sort();
-        if let Some(pair) = folded.windows(2).find(|pair| pair[0] == pair[1]) {
-            return refuse(
-                Code::PATH_CASE_COLLISION,
-                format!("two entries case-fold onto {:?}", pair[0]),
-            );
         }
         if cozytensors > 1 {
             return refuse(

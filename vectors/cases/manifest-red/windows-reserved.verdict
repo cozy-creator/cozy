@@ -1,4 +1,0 @@
-doc: manifest
-expect: refuse
-code: PATH_RESERVED
-note: portable paths reject Windows reserved stems

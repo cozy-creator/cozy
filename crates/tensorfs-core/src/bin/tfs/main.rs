@@ -85,7 +85,6 @@ use tensorfs_core::canon;
 use tensorfs_core::compat::{self, Accepts, CodeTopology, CompatibilityReport, Lane, Requirement};
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::err::Refusal;
-use tensorfs_core::grade::{self, ConversionRegistration, Mapping};
 use tensorfs_core::header::{Asset, Body, Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef, Plain};
 use tensorfs_core::ingest::stamp::Stamp;
@@ -104,7 +103,7 @@ type TfsResult<T> = tensorfs_core::err::Result<T>;
 ///
 /// FLAG values are deliberately untouched: `--pin` and its kind already take the prefixed
 /// spelling on the way in, so they were never the inconsistent half, and rewriting them
-/// broke `verify-compat` the first time this was applied to the whole argv. And only the
+/// broke a flag-carried digest the first time this was applied to the whole argv. Only the
 /// CLI is loosened either way — a canonical DOCUMENT still holds each field to its one
 /// spelling, which is what keeps digests stable.
 fn accept_printed_ids(args: Vec<String>) -> Vec<String> {
@@ -146,7 +145,6 @@ fn main() -> ExitCode {
         ["checkpoint", "admit", r, h] => ckpt::cmd_admit(Path::new(r), h, &flags),
         ["conform"] => conform::cmd_conform(None, &flags),
         ["conform", w] => conform::cmd_conform(Some(w), &flags),
-        ["capability", e, d] => conform::cmd_capability(e, d, &flags),
         ["vectors", "mine", rows, name] => conform::cmd_mine(Path::new(rows), name, &flags),
         ["structure", "bank", rows, fam, var] => {
             fixtures::cmd_bank_rows(Path::new(rows), fam, var, &flags)
@@ -245,12 +243,6 @@ fn main() -> ExitCode {
         ["compat", "topology", r, h] => layout::cmd_topology(Path::new(r), h, &flags),
         ["compat", "check", c, h] => layout::cmd_check(Path::new(c), Path::new(h), &flags),
         ["compat", "release-cut", r] => layout::cmd_release_cut(Path::new(r)),
-        ["grade", "decision", d] => layout::cmd_decision(Path::new(d)),
-        ["grade", r] => layout::cmd_grade(Path::new(r), &flags),
-        ["grade", "register", n, k, s] => layout::cmd_register(n, k, s, &flags),
-        ["verify-request", c, h] => layout::cmd_request(Path::new(c), Path::new(h), &flags),
-        ["verify-compat", q, o] => layout::cmd_verify(Path::new(q), Path::new(o), &flags),
-        ["verify-consume", q, o] => layout::cmd_consume(Path::new(q), Path::new(o)),
         ["registry"] => cmd_registry(),
         ["vectors", "gen"] => cmd_gen(&default_dir()),
         ["vectors", "gen", dir] => cmd_gen(Path::new(dir)),
@@ -886,14 +878,14 @@ fn stamp_doc(
     })
 }
 
-/// The layout plane's three frozen documents, all derived from the corpus header so the
+/// The layout plane's two frozen documents, both derived from the corpus header so the
 /// vector and the live path cannot describe different things. The code topology is the
 /// header's OWN topology (a contract that asks for exactly what is there is the Satisfied
-/// case), and the registration is run, not asserted.
+/// case).
 fn layout_plane_docs(
     h: &Header,
     closure: &Closure,
-) -> TfsResult<(CodeTopology, CompatibilityReport, ConversionRegistration)> {
+) -> TfsResult<(CodeTopology, CompatibilityReport)> {
     let code = CodeTopology {
         contract: tensorfs_core::ids::object_id(b"ModelConstructionContract:corpus"),
         components: h
@@ -921,15 +913,7 @@ fn layout_plane_docs(
     let pin: Vec<String> = h.encodings.iter().map(EncodingSpec::object_id).collect();
     let out = compat::check_compatibility(&code, h, closure, &pin, Lane::Canonical, &[])?;
     let report = CompatibilityReport::of(&code, h, Lane::Canonical, &out)?;
-    let reg = ConversionRegistration::register(
-        "bf16-to-f32",
-        Mapping::Widen {
-            from: Dtype::Bf16,
-            to: Dtype::F32,
-        },
-        &grade::complete_domain_16(),
-    )?;
-    Ok((code, report, reg))
+    Ok((code, report))
 }
 
 fn receipt(
@@ -1154,8 +1138,8 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "one evidence arm; signer in the envelope; binds its stamp",
     ));
 
-    // --- the layout plane (tfs-009): code topology, report, registration
-    let (code, report, _reg) = layout_plane_docs(&ha, &closure)?;
+    // --- the layout plane (tfs-009): code topology and report
+    let (code, report) = layout_plane_docs(&ha, &closure)?;
     cases.push(ok_case(
         "layout",
         "code-topology",
@@ -1436,7 +1420,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "no components",
     ));
 
-    // ---- tfs-015: hostile native bytes, keys, totals, capability ----
+    // ---- tfs-015: hostile native bytes, keys, totals ----
     cases.push(red_case(
         g,
         "digest-31-bytes",
@@ -1686,34 +1670,6 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         draft.canonical_bytes(),
         "PATH_ILLEGAL",
         "dot components are unrepresentable",
-    ));
-    let mut draft = Draft::of(&snap);
-    draft.entries.push((
-        "TOKENIZER.MODEL".to_string(),
-        Entry::File(ObjectRef::of(b"case")),
-    ));
-    draft.entries.sort_by(|left, right| left.0.cmp(&right.0));
-    cases.push(red_case(
-        "manifest-red",
-        "case-collision",
-        "manifest",
-        draft.canonical_bytes(),
-        "PATH_CASE_COLLISION",
-        "portable paths cannot collide under ASCII case folding",
-    ));
-    let mut draft = Draft::of(&snap);
-    draft.entries.push((
-        "CON.txt".to_string(),
-        Entry::File(ObjectRef::of(b"reserved")),
-    ));
-    draft.entries.sort_by(|left, right| left.0.cmp(&right.0));
-    cases.push(red_case(
-        "manifest-red",
-        "windows-reserved",
-        "manifest",
-        draft.canonical_bytes(),
-        "PATH_RESERVED",
-        "portable paths reject Windows reserved stems",
     ));
     let mut draft = Draft::of(&snap);
     draft.entries.push((

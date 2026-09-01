@@ -5,7 +5,6 @@
 
 pub mod b64;
 pub mod canon;
-pub mod capability;
 pub mod catalog;
 mod cbor;
 pub mod checkpoint;
@@ -16,8 +15,6 @@ pub mod dtype;
 pub mod err;
 pub mod fetch;
 pub mod fill;
-#[cfg(feature = "grade")]
-pub mod grade;
 pub mod header;
 pub mod ids;
 pub mod ingest;
@@ -36,5 +33,3 @@ pub mod storage;
 pub mod store;
 pub mod structure;
 pub mod vectors;
-#[cfg(feature = "grade")]
-pub mod verifier;

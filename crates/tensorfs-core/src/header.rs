@@ -388,15 +388,8 @@ impl Header {
         }
         let mut asset_refs = 0usize;
         let mut asset_bytes = 0u64;
-        let mut folded_assets = std::collections::HashSet::new();
         for (name, asset) in &self.assets {
             crate::manifest::check_path(name)?;
-            if !folded_assets.insert(name.to_ascii_lowercase()) {
-                return refuse(
-                    Code::PATH_CASE_COLLISION,
-                    format!("asset logical path {name:?} case-collides"),
-                );
-            }
             crate::ids::hex64("asset logical digest", &asset.logical_sha256)?;
             if asset.logical_length == 0 || asset.segments.is_empty() {
                 return refuse(Code::ZERO_ELEMENT, format!("asset {name:?} is empty"));

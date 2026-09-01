@@ -23,30 +23,6 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 VEC = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "vectors"
 
 
-def _model_source_type_surface(
-    store: tensorfs.Store,
-    files: list[tuple[str, str, int, str]],
-) -> None:
-    """Static consumer seat for RuntimePreparation.PrepareModelSource."""
-    prepared = store.prepare_model_source(
-        "modelpub-example",
-        "sha256:" + "0" * 64,
-        [("dits", "hf/minimax-h3/native-dual-bf16/1")],
-        files,
-        "hf://org/model@" + "1" * 40,
-        "other",
-    )
-    replayed: bool = prepared["replayed"]
-    for source in prepared["sources"]:
-        slot: str = source["slot"]
-        profile: str = source["profile"]
-        manifest: str = source["manifest_digest"]
-        length: int = source["manifest_length"]
-        evidence: bytes = source["checkpoint_evidence_canonical_bytes"]
-        _ = (slot, profile, manifest, length, evidence, replayed)
-    store.release_model_source("modelpub-example")
-
-
 def verdict(path: pathlib.Path) -> dict[str, str]:
     out = {}
     for line in path.read_text().splitlines():
