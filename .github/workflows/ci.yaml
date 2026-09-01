@@ -37,16 +37,13 @@ jobs:
   # real store — lease, plan in the caller's traversal order, slot ring, digest, blob and
   # manifest transfer, repository CAS, local alias replace/remove, and the typed refusal
   # arms — then run the whole frozen corpus back through the Python facade.
-  wheels:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, target: x86_64, native: true }
-          - { os: ubuntu-latest, target: aarch64, native: false }
-          - { os: macos-latest, target: aarch64, native: true }
-          - { os: macos-latest, target: x86_64, native: false }
-    runs-on: ${{ matrix.os }}
+  #
+  # ONE target. cozy-runtime vendors exactly one wheel (manylinux x86_64) and no other
+  # tensorfs wheel exists in either consumer at any version. The old matrix built four,
+  # declared two of them un-runnable in its own comments, and archived them. Re-add a
+  # target the day a consumer names one.
+  wheel:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -54,7 +51,7 @@ jobs:
           python-version: "3.12"
       - uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.target }}
+          target: x86_64
           args: --release --out dist
           manylinux: auto
       - run: |
@@ -63,11 +60,8 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          name: wheel-linux-x86_64
           path: dist
-      - if: matrix.native
-        run: |
-          bash scripts/wheel-smoke.sh "${RUNNER_TEMP}/smoke-3.12" python3.12 \
+      - run: |
+          bash scripts/wheel-smoke.sh "${RUNNER_TEMP}/smoke" python3.12 \
             --skip-build --wheels "$PWD/dist"
-      - if: ${{ !matrix.native }}
-        run: echo "cross-built for ${{ matrix.target }} — archived, not executed here"
