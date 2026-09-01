@@ -51,9 +51,6 @@ type session struct {
 	// the exact Claim this session presented, re-presented on every host call.
 	host  pb.PodHostClient
 	claim *pb.Claim
-	// hostSnapshotDigest is the host document this session acknowledged, so a later
-	// SnapshotAck echoes what was actually reconciled.
-	hostSnapshotDigest []byte
 }
 
 func (s *session) send(m *pb.RecordOwnerFrame) (sent bool) {
@@ -688,7 +685,6 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_SnapshotAck{SnapshotAck: ackMsg}}) {
 		return false
 	}
-	s.hostSnapshotDigest = ackMsg.HostSnapshotDigest
 	c.mu.Lock()
 	w.snapshotAcknowledged = true
 	c.mu.Unlock()
