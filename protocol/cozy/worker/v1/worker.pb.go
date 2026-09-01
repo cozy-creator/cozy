@@ -2808,7 +2808,8 @@ type RecordOwnerFrame_ArtifactTransferRequest struct {
 }
 
 type RecordOwnerFrame_ArtifactReadRequest struct {
-	// pod-supervisor -> Runtime injection. An external RecordOwner MUST NOT author it.
+	// Authenticated external RecordOwner -> pod-supervisor, or pod-supervisor -> Runtime.
+	// The supervisor validates the exact durable receipt/object/range before forwarding.
 	ArtifactReadRequest *ArtifactReadRequest `protobuf:"bytes,21,opt,name=artifact_read_request,json=artifactReadRequest,proto3,oneof"`
 }
 
@@ -3125,7 +3126,8 @@ type WorkerFrame_ArtifactReceipt struct {
 }
 
 type WorkerFrame_ArtifactReadResult struct {
-	// Runtime -> pod-supervisor only. The supervisor consumes it instead of forwarding bytes.
+	// Runtime -> pod-supervisor. The supervisor consumes an internal read result or forwards an
+	// exact externally requested result to the authenticated RecordOwner that owns read_id.
 	ArtifactReadResult *ArtifactReadResult `protobuf:"bytes,19,opt,name=artifact_read_result,json=artifactReadResult,proto3,oneof"`
 }
 
@@ -7915,9 +7917,10 @@ func (x *ArtifactTransactionStatus) GetArtifactReceiptDigest() []byte {
 	return nil
 }
 
-// The supervisor reads produced objects without receiving a path or giving Runtime a network
-// destination. It requests one exact bounded range from the opaque source_ref in the committed
-// inventory. External RecordOwners cannot author this host-child frame.
+// A supervisor or authenticated external RecordOwner reads a produced object without receiving a
+// path or giving Runtime a network destination. The supervisor first binds one exact bounded range
+// to the committed receipt inventory, then forwards this same frame to Runtime. read_id is unique
+// among pending reads on one claimed stream and routes the exact result; it is not durable state.
 type ArtifactReadRequest struct {
 	state                   protoimpl.MessageState `protogen:"open.v1"`
 	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
