@@ -100,10 +100,14 @@ func (m *Manager) FinishEmailProof(ctx context.Context, enrollment *Enrollment, 
 	if enrollment == nil || enrollment.deviceKeyID == "" {
 		return Session{}, exit.Internalf("email proof was not started")
 	}
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return Session{}, exit.Usagef("the email verification code is empty")
+	}
 	var answer tokenAnswer
 	if problem := m.post(ctx, "/v1/auth/device-keys/enroll/finish", map[string]string{
 		"enrollment_id": enrollment.id,
-		"code":          strings.TrimSpace(code),
+		"code":          code,
 		"signature":     rawBase64.EncodeToString(sign(enrollment.private, enrollDomain, enrollment.challenge)),
 	}, &answer); problem != nil {
 		return Session{}, problem
@@ -175,7 +179,7 @@ func (m *Manager) AccessToken(ctx context.Context) (secret.Value, *exit.Error) {
 // record. It does not read or validate secret bytes.
 func (m *Manager) CredentialPresent() bool {
 	_, err := os.Stat(m.path)
-	return err == nil
+	return !errors.Is(err, os.ErrNotExist)
 }
 
 // Authenticate silently proves the persisted machine key and returns a short bearer.
