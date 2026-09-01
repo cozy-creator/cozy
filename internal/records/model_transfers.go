@@ -40,7 +40,6 @@ CREATE TABLE IF NOT EXISTS request_model_transfer_outputs (
   manifest_id      TEXT NOT NULL,
   manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),
   evidence         BLOB NOT NULL,
-  objects           TEXT NOT NULL,
   attempt           INTEGER NOT NULL,
   invocation_digest TEXT NOT NULL,
   transaction_id    TEXT NOT NULL,
@@ -391,20 +390,16 @@ func (s *Store) RecordModelTransferArtifact(row ModelTransferArtifact) *exit.Err
 	objectsCopy := append([]ModelTransferObject(nil), row.Objects...)
 	sort.Slice(objectsCopy, func(i, j int) bool { return objectsCopy[i].ObjectID < objectsCopy[j].ObjectID })
 	row.Objects = objectsCopy
-	objects, err := json.Marshal(row.Objects)
-	if err != nil {
-		return exit.Internalf("cannot encode model transfer artifact objects: %s", err)
-	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return exit.Internalf("cannot begin model transfer artifact: %s", err)
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(`INSERT INTO request_model_transfer_outputs
-		(request_id,output_slot,manifest_id,manifest_length,evidence,objects,attempt,
+		(request_id,output_slot,manifest_id,manifest_length,evidence,attempt,
 		 invocation_digest,transaction_id,receipt_digest,receipt)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(request_id,attempt,output_slot) DO NOTHING`, row.RequestID,
-		row.OutputSlot, row.ManifestID, row.ManifestLength, row.Evidence, string(objects), row.Attempt,
+		VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(request_id,attempt,output_slot) DO NOTHING`, row.RequestID,
+		row.OutputSlot, row.ManifestID, row.ManifestLength, row.Evidence, row.Attempt,
 		row.InvocationDigest, row.TransactionID, row.ReceiptDigest, row.Receipt)
 	if err != nil {
 		return exit.Internalf("cannot record model transfer artifact: %s", err)
@@ -435,7 +430,7 @@ func (s *Store) RecordModelTransferArtifact(row ModelTransferArtifact) *exit.Err
 		held.Attempt != row.Attempt || held.InvocationDigest != row.InvocationDigest ||
 		held.TransactionID != row.TransactionID || held.ReceiptDigest != row.ReceiptDigest ||
 		string(held.Receipt) != string(row.Receipt) ||
-		string(mustJSON(held.Objects)) != string(objects) {
+		string(mustJSON(held.Objects)) != string(mustJSON(row.Objects)) {
 		return exit.Named(exit.Conflict, "model_transfer.artifact_changed",
 			"model transfer output %s replay changed identity", row.OutputSlot)
 	}
@@ -446,40 +441,50 @@ func mustJSON(value any) []byte { data, _ := json.Marshal(value); return data }
 
 func (s *Store) ModelTransferArtifact(requestID string, attempt int64, slot string) (*ModelTransferArtifact, *exit.Error) {
 	var row ModelTransferArtifact
-	var objects string
-	err := s.db.QueryRow(`SELECT request_id,output_slot,manifest_id,manifest_length,evidence,objects,
+	err := s.db.QueryRow(`SELECT request_id,output_slot,manifest_id,manifest_length,evidence,
 		attempt,invocation_digest,transaction_id,receipt_digest,receipt,final_id
 		FROM request_model_transfer_outputs WHERE request_id=? AND attempt=? AND output_slot=?`, requestID, attempt, slot).
 		Scan(&row.RequestID, &row.OutputSlot, &row.ManifestID, &row.ManifestLength,
-			&row.Evidence, &objects, &row.Attempt, &row.InvocationDigest, &row.TransactionID,
+			&row.Evidence, &row.Attempt, &row.InvocationDigest, &row.TransactionID,
 			&row.ReceiptDigest, &row.Receipt, &row.FinalID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
-	if err != nil || json.Unmarshal([]byte(objects), &row.Objects) != nil {
+	if err != nil {
 		return nil, exit.Internalf("cannot decode model transfer output %s/%s", requestID, slot)
 	}
+	objects, problem := s.ModelTransferObjects(requestID, attempt, slot)
+	if problem != nil {
+		return nil, problem
+	}
+	row.Objects = objects
 	return &row, nil
 }
 
 func (s *Store) ModelTransferArtifacts(requestID string, attempt int64) ([]ModelTransferArtifact, *exit.Error) {
-	rows, err := s.db.Query(`SELECT request_id,output_slot,manifest_id,manifest_length,evidence,objects,
+	rows, err := s.db.Query(`SELECT request_id,output_slot,manifest_id,manifest_length,evidence,
 		attempt,invocation_digest,transaction_id,receipt_digest,receipt,final_id
 		FROM request_model_transfer_outputs WHERE request_id=? AND attempt=? ORDER BY output_slot`, requestID, attempt)
 	if err != nil {
 		return nil, exit.Internalf("cannot list model transfer outputs: %s", err)
 	}
-	defer rows.Close()
 	var out []ModelTransferArtifact
 	for rows.Next() {
 		var row ModelTransferArtifact
-		var objects string
 		if err := rows.Scan(&row.RequestID, &row.OutputSlot, &row.ManifestID, &row.ManifestLength,
-			&row.Evidence, &objects, &row.Attempt, &row.InvocationDigest, &row.TransactionID,
-			&row.ReceiptDigest, &row.Receipt, &row.FinalID); err != nil || json.Unmarshal([]byte(objects), &row.Objects) != nil {
+			&row.Evidence, &row.Attempt, &row.InvocationDigest, &row.TransactionID,
+			&row.ReceiptDigest, &row.Receipt, &row.FinalID); err != nil {
 			return nil, exit.Internalf("cannot decode model transfer output row")
 		}
 		out = append(out, row)
+	}
+	rows.Close()
+	for i := range out {
+		var problem *exit.Error
+		out[i].Objects, problem = s.ModelTransferObjects(requestID, attempt, out[i].OutputSlot)
+		if problem != nil {
+			return nil, problem
+		}
 	}
 	return out, nil
 }
