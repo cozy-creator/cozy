@@ -759,13 +759,18 @@ func TestCanceledResolvingModelProductionRendersAfterDaemonRestart(t *testing.T)
 		Destination: "acme/output", Source: "acme/missing@1.0.0",
 		Producer: "acme/tools/build", Rental: true,
 	}
-	bytes, err := instruction.Bytes()
+	instructionBytes, err := instruction.Bytes()
 	must(t, err)
 	digest, err := instruction.Digest()
 	must(t, err)
-	operation, _, problem := store.BeginModelProductionInstruction(instruction.ID(), digest, bytes)
+	operation, _, problem := store.BeginModelProductionInstruction(instruction.ID(), digest, instructionBytes)
 	fatal(t, problem)
 	fatal(t, store.CancelModelProduction(operation.ID, "resolving", "canceled before plan acceptance"))
+	replayed, replay, problem := store.BeginModelProductionInstruction(operation.ID, digest, instructionBytes)
+	fatal(t, problem)
+	if !replay || replayed.State != "canceled" || !bytes.Equal(replayed.Plan, instructionBytes) {
+		t.Fatalf("canceled pre-plan replay = %+v replay=%t", replayed, replay)
+	}
 	store.Close()
 
 	daemon := startDaemonProcess(t, root)
