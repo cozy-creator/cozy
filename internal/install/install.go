@@ -581,29 +581,129 @@ func Reclaim(l home.Layout, st *records.Store, id string) (int64, *exit.Error) {
 	if problem != nil || !claimed {
 		return 0, problem
 	}
-	if err := makeGenerationRemovable(target); err != nil {
-		return 0, exit.Internalf("cannot prepare retired generation directory %s for removal: %s", target, err)
-	}
-	if err := os.RemoveAll(target); err != nil {
-		return 0, exit.Internalf("cannot remove generation directory %s: %s", target, err)
+	if problem := removeInstallTree(target); problem != nil {
+		return 0, problem
 	}
 	return gen.BytesExcl, nil
 }
 
-func generationRemovalTarget(l home.Layout, gen records.PackageInstall) (string, *exit.Error) {
+// Swept is what one sweep of the install root did. Bytes is EXCLUSIVE bytes: an install
+// tree is hardlinked against the shared uv cache, so removing it frees only the bytes
+// whose last link went away — never the tree's apparent size.
+type Swept struct {
+	Scanned int
+	Removed int
+	Bytes   int64
+}
+
+// Sweep reclaims every install directory no record references. Reclaim is reached only
+// through a row, so a records.db that was lost or rebuilt strands every directory on
+// disk: unreferenced, and unreachable by any verb (cl-076). The sweep walks the
+// DIRECTORY instead and lets the refcounted database claim decide, so an install that
+// is still pinned, still serving a request, or still held by a live worker survives.
+// Callers hold the single-writer lock: an install stages its directory before it commits
+// the row that names it.
+func Sweep(l home.Layout, st *records.Store) (Swept, *exit.Error) {
+	entries, err := os.ReadDir(l.Installs)
+	if err != nil {
+		return Swept{}, exit.Internalf("cannot scan the install root %s: %s", l.Installs, err)
+	}
+	var swept Swept
+	var first *exit.Error
+	for _, entry := range entries {
+		// A DirEntry's type is its own lstat, so a symlink is skipped as a symlink: the
+		// sweep removes trees this root owns and nothing it merely names.
+		if !entry.IsDir() {
+			continue
+		}
+		swept.Scanned++
+		freed, removed, problem := sweepInstall(l, st, entry.Name())
+		if problem != nil {
+			// Each entry is independent, so one directory that will not go is not worth
+			// abandoning the rest of the sweep for. The first refusal is returned once
+			// the pass finishes; the directory itself waits for the next sweep.
+			if first == nil {
+				first = problem
+			}
+			continue
+		}
+		if removed {
+			swept.Removed++
+			swept.Bytes += freed
+		}
+	}
+	return swept, first
+}
+
+// sweepInstall reclaims one directory under the install root. A recorded install goes
+// through Reclaim so the claim still decides; a directory with NO record has no claim
+// left to win and nothing that can reference it, and its bytes are measured here because
+// the row that would have remembered them is exactly what went missing.
+func sweepInstall(l home.Layout, st *records.Store, id string) (int64, bool, *exit.Error) {
+	target, problem := installRemovalTarget(l, id)
+	if problem != nil {
+		return 0, false, problem
+	}
+	gen, problem := st.Install(id)
+	if problem != nil {
+		return 0, false, problem
+	}
+	if gen != nil {
+		freed, problem := Reclaim(l, st, id)
+		if problem != nil {
+			return 0, false, problem
+		}
+		// Reclaim answers bytes, not verdict, and a generation may record zero exclusive
+		// bytes. The directory itself is the one honest count of what the sweep removed.
+		_, err := os.Lstat(target)
+		return freed, os.IsNotExist(err), nil
+	}
+	freed, _ := Disk(target)
+	if problem := removeInstallTree(target); problem != nil {
+		return 0, false, problem
+	}
+	return freed, true, nil
+}
+
+// installRemovalTarget resolves one install id under the install root. An id that is
+// anything but a single path element, or that resolves anywhere else, is refused.
+func installRemovalTarget(l home.Layout, id string) (string, *exit.Error) {
 	root, err := filepath.Abs(l.Installs)
 	if err != nil {
 		return "", exit.Internalf("cannot resolve the install root %s: %s", l.Installs, err)
 	}
-	if gen.ID == "" || gen.ID == "." || gen.ID == ".." || filepath.Base(gen.ID) != gen.ID {
-		return "", exit.Internalf("refusing to remove generation with unsafe id %q", gen.ID)
+	if id == "" || id == "." || id == ".." || filepath.Base(id) != id {
+		return "", exit.Internalf("refusing to remove generation with unsafe id %q", id)
 	}
-	target := filepath.Join(root, gen.ID)
-	recorded, err := filepath.Abs(gen.Dir)
-	if err != nil || filepath.Dir(target) != root || filepath.Clean(recorded) != target {
-		return "", exit.Internalf("refusing to remove generation %s outside %s", gen.ID, root)
+	target := filepath.Join(root, id)
+	if filepath.Dir(target) != root {
+		return "", exit.Internalf("refusing to remove generation %s outside %s", id, root)
 	}
 	return target, nil
+}
+
+func generationRemovalTarget(l home.Layout, gen records.PackageInstall) (string, *exit.Error) {
+	target, problem := installRemovalTarget(l, gen.ID)
+	if problem != nil {
+		return "", problem
+	}
+	recorded, err := filepath.Abs(gen.Dir)
+	if err != nil || filepath.Clean(recorded) != target {
+		return "", exit.Internalf("refusing to remove generation %s outside %s", gen.ID, filepath.Dir(target))
+	}
+	return target, nil
+}
+
+// removeInstallTree deletes one resolved install directory. Only after the caller has
+// settled that nothing references it may the read-only published tree be made removable.
+func removeInstallTree(target string) *exit.Error {
+	if err := makeGenerationRemovable(target); err != nil {
+		return exit.Internalf("cannot prepare retired generation directory %s for removal: %s", target, err)
+	}
+	if err := os.RemoveAll(target); err != nil {
+		return exit.Internalf("cannot remove generation directory %s: %s", target, err)
+	}
+	return nil
 }
 
 func makeGenerationRemovable(root string) error {
