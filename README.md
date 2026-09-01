@@ -238,8 +238,15 @@ reads RunPod SKU names or provider prices. `cozy run` is local-only by default, 
 run the request. `--rental-only` deliberately bypasses local capacity and requires an external
 rental. Both modes remain under the configured fleet ceiling. Creator gives every private rental
 a safe semantic name and RunPod shows that exact same name; the name carries no workload facts.
-Creator-managed rentals stop after their assigned queue is fully mirrored; manual
-rentals stop only through `cozy rental end`.
+
+Every rental the daemon owns — bought for a request or started with `cozy rental new` — ends on
+its own once nothing has been queued, running, or owed on it for `rentals.idle_release_s`
+(default 300). Running work on it is what keeps it: the clock restarts at each settled attempt,
+and a rental that never ran anything counts from the moment Tensorhub first reported it `ready`,
+so a pod still booting is never ended. A managed rental whose job is done goes at once.
+`cozy rental` shows each machine's idle time and when it will be released; `cozy rental end`
+ends one now. A release Tensorhub does not confirm is retried until it does. Set
+`idle_release_s: 0` to leave every rental to `cozy rental end`.
 
 Rental creation sends only that private machine name, the SKU, and introduction credential material—never a package, model,
 request, profile, image, or placement. Tensorhub readiness means the worker location and TLS identity
@@ -271,10 +278,10 @@ daemon running so cancellation and paid-resource reconciliation can continue.
 The daemon also leaves on its own once it has had nothing to manage for `daemon.idle_shutdown_s`
 (default 900): no rental it owns, no request or attempt it owes, no transfer, export, launch or
 teardown in flight, no event stream attached. User interaction is not the signal, and an idle
-warm local worker is not work — the exit drains it exactly as `down` does. A managed rental
-holds the daemon until its own idle release has confirmed the pod gone; a manual rental holds it
-until `cozy rental end`. Set `idle_shutdown_s: 0` to keep the daemon up until `cozy down`. The
-next command that needs the daemon starts it again.
+warm local worker is not work — the exit drains it exactly as `down` does. A rental holds the
+daemon until its idle release, or `cozy rental end`, has confirmed the pod gone. Set
+`idle_shutdown_s: 0` to keep the daemon up until `cozy down`. The next command that needs the
+daemon starts it again.
 
 The launch web UI is currently a stub rooted in [`web/`](web/). The daemon already serves
 opaque output media and a bounded authenticated content-addressed upload API; full browser
@@ -295,6 +302,7 @@ port: 8818
 local_rate_micro_usd_per_hour: 250000
 rentals:
   max_hourly_spend_usd: 4.00
+  idle_release_s: 300
 daemon:
   idle_shutdown_s: 900
 ```

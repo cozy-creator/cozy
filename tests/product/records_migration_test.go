@@ -12,9 +12,10 @@ import (
 
 // TestRecordsMigrationFromEleven migrates a REAL schema-11 database — the exact released
 // DDL, dumped from that schema's own sqlite_master and checked in beside this test — and
-// proves the schema-12 rename carried its rows. The owner's machine holds one of these, so
-// the property under test is not "a fresh database has the new names" but "an existing
-// database keeps its installs, pins, workers and requests while the names change".
+// proves the schema-12 rename and the schema-13 rental column carried its rows. The owner's
+// machine holds one of these, so the property under test is not "a fresh database has the
+// new names" but "an existing database keeps its installs, pins, workers, requests and
+// rentals while the shape changes".
 func TestRecordsMigrationFromEleven(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.db")
 	writeSchemaElevenDatabase(t, path)
@@ -48,7 +49,7 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 12 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 13 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	for table, want := range map[string]string{"pins": "install_id", "worker_processes": "install_id"} {
@@ -67,6 +68,13 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	if err := db.QueryRow(`SELECT install_id FROM requests WHERE id='request-1'`).
 		Scan(&requestInstall); err != nil || requestInstall != "1111111111111111" {
 		t.Fatalf("request install after migration = %q, %v", requestInstall, err)
+	}
+	// A rental that was already ready when the schema moved keeps its row and gets no
+	// invented ready_at: its idle clock starts at its next settlement.
+	rented, problem := store.RentalRow("rental-1")
+	if problem != nil || rented == nil || rented.State != "ready" || rented.ReadyAt != "" ||
+		rented.MachineName != "quiet-heron-0000000000000011" {
+		t.Fatalf("rental after migration = %+v, %v", rented, problem)
 	}
 }
 
@@ -99,6 +107,10 @@ func writeSchemaElevenDatabase(t *testing.T, path string) {
 		  created_at,install_id)
 		VALUES('request-1','idem-1','sha256:ee','cozy/example','predict','plan-1',x'00',
 		  'queued','2026-01-01T00:00:00Z','1111111111111111')`, `
+		INSERT INTO rentals(id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,address,
+		  cert_path,state,hub,rented_at)
+		VALUES('rental-1','quiet-heron-0000000000000011','cpu','CPU',100000,'127.0.0.1:1',
+		  '/tmp/rental-1.pem','ready','https://hub.invalid','2026-01-01T00:00:00Z')`, `
 		PRAGMA user_version=11`} {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatalf("cannot build the schema-11 fixture: %v", err)

@@ -172,6 +172,12 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s · reconcile killed %d orphan(s), forgot %d stale row(s)\n",
 		l.DB, yield, killed, forgotten)
 	fmt.Fprintf(ctx.Out, "  client credential %s (%s, mode 0600)\n", creds.CLI.Digest(), l.Client)
+	if ctx.Cfg.RentalsIdleRelease > 0 {
+		fmt.Fprintf(ctx.Out, "  rentals: released after %s with nothing queued, running, or owed (rentals.idle_release_s)\n",
+			ctx.Cfg.RentalsIdleRelease)
+	} else {
+		fmt.Fprintln(ctx.Out, "  rentals: never idle-released (rentals.idle_release_s=0); each ends with cozy rental end")
+	}
 	if ctx.Cfg.DaemonIdleShutdown > 0 {
 		fmt.Fprintf(ctx.Out, "  next: cozy run list · stop with cozy down · exits on its own after %s with nothing to manage\n",
 			ctx.Cfg.DaemonIdleShutdown)
@@ -188,6 +194,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// The idle exit takes exactly the path a SIGTERM takes: the server's shutdown hook
 	// feeds the same channel, and everything after `<-stop` is shared.
 	quit := make(chan struct{})
+	go fleet.watch(quit)
 	if ctx.Cfg.DaemonIdleShutdown > 0 {
 		go idleWatch{debounce: ctx.Cfg.DaemonIdleShutdown, store: st, owner: c,
 			server: server, log: ctx.Out}.run(quit)

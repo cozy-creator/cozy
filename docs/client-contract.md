@@ -66,9 +66,11 @@ Creator reconciles every locally known rental with Tensorhub and sums the immuta
 retail hourly rate locked into each rental. Every potentially billing manual or managed
 rental counts until Tensorhub confirms release or absence. A new managed rental is allowed
 only when its locked rate fits under `rentals.max_hourly_spend_usd`. Creator reuses the
-cheapest idle rental first, otherwise buys the cheapest offered SKU. Manual rentals remain
-until `cozy rental end`; Creator-managed rentals are released after all assigned requests
-are terminal, their output bytes are mirrored, and their outcome acknowledgements are sent.
+cheapest idle rental first, otherwise buys the cheapest offered SKU. Every rental, manual or
+Creator-managed, is released once nothing has been queued, running, or owed on it for
+`rentals.idle_release_s`; a managed rental whose assigned requests are terminal, their output
+bytes mirrored, and their outcome acknowledgements sent is released at once when its work was
+a job. `cozy rental end` releases one now.
 
 A generic rental becomes attachable when Tensorhub publishes its pinned worker location.
 The paid request contains only the SKU, media-token hash, and Creator public key; package and

@@ -135,7 +135,8 @@ func handleRent(ctx *Context) *exit.Error {
 		return e.WithRemedy("the paid rental is attached on this host; keep `cozy run list` running and resume with the same --idempotency-key")
 	}
 	ready := attachable
-	notes := []string{"billing continues until `cozy rental end " + ready.ID + "` confirms release"}
+	notes := []string{"billing continues until `cozy rental end " + ready.ID + "` confirms release",
+		idleReleaseNote(ctx.Cfg.RentalsIdleRelease)}
 	if line, problem := fleet.status(); problem == nil {
 		notes = append(notes, line)
 	}
@@ -558,26 +559,29 @@ func handleRentLs(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
+	grace := ctx.Cfg.RentalsIdleRelease
 	list := output.List{
 		Name:      "rentals",
-		Fields:    []string{"machine", "sku", "state", "uptime", "queued", "running"},
-		AllFields: []string{"machine", "sku", "state", "uptime", "queued", "running", "utilization", "rental", "accelerator", "address", "media", "hub", "rented"},
+		Fields:    []string{"machine", "sku", "state", "uptime", "queued", "running", "idle", "release"},
+		AllFields: []string{"machine", "sku", "state", "uptime", "queued", "running", "idle", "release", "utilization", "rental", "accelerator", "address", "media", "hub", "rented", "ready"},
 		Next:      []string{"cozy help rental new"},
-		Notes:     []string{line},
+		Notes:     []string{line, idleReleaseNote(grace)},
 	}
 	for _, r := range rows {
-		queued, running, problem := st.RentalRunCounts(r.ID)
+		idle, problem := observeRentalIdle(st, r)
 		if problem != nil {
 			return problem
 		}
+		idleFor, release := rentalIdleColumns(r, idle, grace)
 		list.Rows = append(list.Rows, map[string]string{
 			"machine": r.MachineName, "sku": orNone(r.SKU),
 			"state": r.State, "uptime": rentalUptime(r.RentedAt),
-			"queued": strconv.Itoa(queued), "running": strconv.Itoa(running),
+			"queued": strconv.Itoa(idle.Queued), "running": strconv.Itoa(idle.Running),
+			"idle": idleFor, "release": release,
 			"utilization": "not reported", "rental": r.ID,
 			"accelerator": r.AcceleratorModel, "address": r.Address,
 			"media": r.MediaAddress, "hub": r.Hub,
-			"rented": stamp(r.RentedAt),
+			"rented": stamp(r.RentedAt), "ready": orNone(stamp(r.ReadyAt)),
 		})
 	}
 	if len(list.Rows) > 0 {
@@ -591,7 +595,10 @@ func rentalUptime(started string) string {
 	if err != nil {
 		return "unknown"
 	}
-	d := time.Since(stamp)
+	return roughDuration(time.Since(stamp))
+}
+
+func roughDuration(d time.Duration) string {
 	if d < 0 {
 		d = 0
 	}
@@ -599,6 +606,37 @@ func rentalUptime(started string) string {
 		return "<1m"
 	}
 	return d.Round(time.Minute).String()
+}
+
+// rentalIdleColumns says how long a rental has been idle and when the daemon will end it,
+// so a listing shows why a pod is about to go.
+func rentalIdleColumns(r records.Rental, idle rentalIdleness, grace time.Duration) (string, string) {
+	idleFor := "booting"
+	switch {
+	case idle.busy():
+		idleFor = "busy"
+	case !idle.Since.IsZero():
+		idleFor = roughDuration(time.Since(idle.Since))
+	}
+	switch due, eligible := idle.releaseAt(grace); {
+	case r.State == hub.RentalReleaseRequested:
+		return idleFor, "requested"
+	case grace <= 0:
+		return idleFor, "cozy rental end"
+	case !eligible:
+		return idleFor, "when idle for " + grace.String()
+	case time.Now().Before(due):
+		return idleFor, "in " + roughDuration(time.Until(due))
+	}
+	return idleFor, "due"
+}
+
+func idleReleaseNote(grace time.Duration) string {
+	if grace <= 0 {
+		return "rentals.idle_release_s is 0: a rental ends only through `cozy rental end`"
+	}
+	return fmt.Sprintf("the daemon ends a rental once nothing has been queued, running, or owed on it for %s "+
+		"(rentals.idle_release_s); running work on it is what keeps it", grace)
 }
 
 // handleRentRelease is idempotent and ends only on provider ABSENCE: the hub reporting the
