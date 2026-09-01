@@ -59,7 +59,8 @@ uv run --no-project --python 3.12 python scripts/fence.py
 uv run --no-project --python 3.12 python scripts/version_contract.py source
 ```
 
-The CBOR gate runs independent Rust, Go, and Python codecs over the same green and red vectors.
+The CBOR gate runs the production Rust codec and an independent Python codec over the same
+green and red vectors.
 
 ## Store commands
 

@@ -1,14 +1,14 @@
 # CozyTensors CBOR conformance
 
 This directory is the independent tfs-027 format gate. TensorFS Rust remains the only
-production codec. Python (`cbor2==6.1.4`) and Go (`fxamacker/cbor/v2==v2.9.3`) independently
-validate the closed schema, encode it with RFC 8949 Core Deterministic CBOR, strictly decode,
-and require deterministic re-encoding to reproduce the resident bytes.
+production codec. One independent Python seat (`cbor2==6.1.4`) validates the closed schema,
+encodes it with RFC 8949 Core Deterministic CBOR, strictly decodes, and requires
+deterministic re-encoding to reproduce the resident bytes.
 
-Neither implementation imports Runtime, Tensorhub, or TensorFS internals. They are format
-conformance tools, not product parsers.
+It imports no Runtime, Tensorhub or TensorFS internals. It is a format conformance tool,
+not a product parser.
 
-The diagnostic JSON accepted by all three seats is projection-only:
+The diagnostic JSON accepted by both seats is projection-only:
 
 ```text
 {
@@ -24,7 +24,7 @@ The diagnostic JSON accepted by all three seats is projection-only:
 }
 ```
 
-Run the two independent seats:
+Run the independent seat:
 
 ```bash
 uv run --python 3.12 --project conformance/cbor/python \
