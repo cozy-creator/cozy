@@ -220,7 +220,8 @@ func (o *modelTransferOwner) Finalize(ctx context.Context, requestID string,
 	checkpoints := make(map[string]string, len(artifacts))
 	for _, artifact := range artifacts {
 		contract, declared := contracts[artifact.OutputSlot]
-		if !declared || (request.Package != "cozy/platform" && contract == nil) {
+		passThrough := request.Package == "cozy/platform" && request.Entrypoint == "model-pass-through"
+		if !declared || (!passThrough && contract == nil) {
 			return exit.Named(exit.Conflict, "model_transfer.output_undeclared",
 				"artifact output %s is absent from the accepted producer descriptor",
 				artifact.OutputSlot)
@@ -314,9 +315,12 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	if problem != nil {
 		return "", problem
 	}
-	_ = opened
+	totals, problem := transfer.ValidateOpenedPublication(opened, operation, objects)
+	if problem != nil {
+		return "", problem
+	}
 	const batch = 128
-	for start := 0; start < len(objects); start += batch {
+	for start := 0; opened.Publication.State == "open" && start < len(objects); start += batch {
 		end := min(start+batch, len(objects))
 		ids := make([]string, 0, end-start)
 		for _, object := range objects[start:end] {
@@ -353,6 +357,10 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 			ExpectedContract:         expectedHubContract(contract)},
 		"cozy model upload "+intent.Source+" "+intent.Destination)
 	if problem != nil {
+		return "", problem
+	}
+	if problem := transfer.ValidateFinalizedCheckpoint(checkpoint, operation,
+		artifact.ManifestID, artifact.ManifestLength, artifact.Evidence, totals); problem != nil {
 		return "", problem
 	}
 	if contract != nil && (checkpoint.TopologyDigest != contract.TopologyDigest ||

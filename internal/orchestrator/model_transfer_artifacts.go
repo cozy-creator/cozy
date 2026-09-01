@@ -89,7 +89,7 @@ func (c *Orchestrator) onModelTransferArtifactReceipt(s *session, frame *pb.Arti
 	}
 }
 
-func (c *Orchestrator) onModelTransferArtifactStatus(_ *session,
+func (c *Orchestrator) onModelTransferArtifactStatus(s *session,
 	frame *pb.ArtifactTransferStatus,
 ) {
 	artifact, problem := c.opt.Store.ModelTransferArtifact(frame.RequestId,
@@ -100,6 +100,13 @@ func (c *Orchestrator) onModelTransferArtifactStatus(_ *session,
 	invocation := canonicalSpell(frame.InvocationSpecDigest)
 	if artifact.Attempt != int64(frame.AttemptOrdinal) || artifact.InvocationDigest != invocation ||
 		artifact.TransactionID != frame.ArtifactTransactionId {
+		return
+	}
+	request, problem := c.opt.Store.RequestRow(frame.RequestId)
+	attempt, attemptProblem := c.opt.Store.AttemptRow(frame.RequestId, int64(frame.AttemptOrdinal))
+	if problem != nil || attemptProblem != nil || request == nil || attempt == nil ||
+		request.Worker == "" || rentalInstanceID(request.Worker) != s.instanceID ||
+		attempt.InstanceID != s.instanceID {
 		return
 	}
 	state := trimEnum(pb.ArtifactTransferState_name[int32(frame.State)], "ARTIFACT_TRANSFER_STATE_")

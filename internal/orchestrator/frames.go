@@ -619,10 +619,11 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	requeuing := requeueable(status, cause, origin, executionStarted)
 	kept := triage.keep(status, cause, doc.Str("safe_message"), outputs, requeuing)
 	requestState := requeueState(status, requeuing)
-	if req.ModelTransfer != nil && status == "SUCCEEDED" && !requeuing {
+	if req.ModelTransfer != nil && !requeuing {
 		requestState = "finalizing"
 		kept.Type = "request.finalizing"
-		kept.Payload = map[string]any{"status": "FINALIZING", "outputs": []any{}, "requeuing": false}
+		kept.Payload = map[string]any{"status": "FINALIZING", "execution_status": status,
+			"outputs": []any{}, "requeuing": false}
 	}
 	artifactFinalizations, e := artifactFinalizationIntents(
 		*req, *attemptRow, status, requeuing, receiptsBySlot)
@@ -728,6 +729,9 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 		if transfer, problem := c.opt.Store.ModelTransferOf(req.ID); problem == nil && transfer != nil {
 			verdict = exit.Named(exit.Failed, transfer.ErrorCode, "%s", transfer.SafeError)
 		}
+	}
+	if req.ModelTransfer != nil && req.State == "canceled" {
+		verdict = exit.New(exit.Canceled, "model transfer %s finalization was canceled", req.ID)
 	}
 	c.signalClosed(key(req.ID, uint64(attempt.Attempt)), verdict)
 	if requeue {

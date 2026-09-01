@@ -10,10 +10,12 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
 func TestModelTransferInstructionIsSourceFirstAndPlacementIsFrozen(t *testing.T) {
@@ -30,6 +32,71 @@ func TestModelTransferInstructionIsSourceFirstAndPlacementIsFrozen(t *testing.T)
 	download.Kind, download.Destination, download.Placement = "model-download", "local/model", ""
 	if !strings.HasPrefix(download.ID(), "modeltransfer-") || download.ID() == upload.ID() {
 		t.Fatal("transfer kind and destination are not part of canonical run identity")
+	}
+}
+
+func TestModelTransferFinalizationCancelAndPartialOutputsStayVisible(t *testing.T) {
+	store, problem := records.Open(t.TempDir() + "/records.db")
+	fatal(t, problem)
+	defer store.Close()
+	request := transferRequest("job-transfer-cancel-finalize")
+	request.ModelTransfer.Outputs = append(request.ModelTransfer.Outputs,
+		records.ModelTransferOutput{Name: "second", RequiredContract: &records.ModelTransferContract{
+			TopologyDigest: digest("c"), Encodings: []string{digest("d")}}})
+	_, _, problem = store.Submit(request)
+	fatal(t, problem)
+	fatal(t, store.BeginModelTransferMaterialization(request.ID))
+	fatal(t, store.CompleteModelTransferMaterialization(request.ID, nil))
+	fatal(t, store.BeginModelTransferFinalization(request.ID))
+	fatal(t, store.SettleRequest(request.ID, "finalizing"))
+	artifact := records.ModelTransferArtifact{RequestID: request.ID, Attempt: 0,
+		OutputSlot: "model", ManifestID: digest("e"), ManifestLength: 8,
+		Evidence: []byte("proof")}
+	fatal(t, store.RecordModelTransferArtifact(artifact))
+	fatal(t, store.CompleteModelTransferOutput(request.ID, 0, "model", "publish-proof"))
+	fatal(t, store.RequestModelTransferCancellation(request.ID))
+	state, problem := store.SettleModelTransferRequest(request.ID, 0)
+	fatal(t, problem)
+	if state != "canceled" {
+		t.Fatalf("finalizing cancellation settled %s", state)
+	}
+	artifacts, problem := store.ModelTransferArtifacts(request.ID, 0)
+	fatal(t, problem)
+	if len(artifacts) != 1 || artifacts[0].FinalID != "publish-proof" ||
+		artifacts[0].ManifestID != digest("e") {
+		t.Fatalf("retained partial output disappeared: %+v", artifacts)
+	}
+	events, problem := store.EventsAfter(request.ID, 0, 10)
+	fatal(t, problem)
+	if len(events) != 1 || events[0].Type != "request.canceled" {
+		t.Fatalf("canceled finalization event = %+v", events)
+	}
+}
+
+func TestPublicationValidationRefusesChangedOpenAndFinalize(t *testing.T) {
+	manifest := hub.Object{ID: digest("a"), Length: 11}
+	blob := hub.Object{ID: digest("b"), Length: 29}
+	declared := []hub.Object{manifest, blob}
+	opened := hub.OpenPublicationResponse{Publication: hub.Session{Operation: "publish-proof",
+		State: "open", Objects: []hub.Transfer{{ObjectID: manifest.ID, Length: manifest.Length,
+			State: "accepted"}, {ObjectID: blob.ID, Length: blob.Length, State: "claimed"}}}}
+	totals, problem := transfer.ValidateOpenedPublication(opened, "publish-proof", declared)
+	fatal(t, problem)
+	changed := opened
+	changed.Publication.Operation = "other"
+	if _, problem := transfer.ValidateOpenedPublication(changed, "publish-proof", declared); problem == nil {
+		t.Fatal("changed publication operation was accepted")
+	}
+	evidence := []byte("evidence")
+	checkpoint := hub.CheckpointPublication{PublishID: "publish-proof", CheckpointID: manifest.ID,
+		Manifest: hub.ManifestRef{SHA256: strings.TrimPrefix(manifest.ID, "sha256:"), Length: manifest.Length},
+		Objects:  1, Bytes: blob.Length, CheckpointEvidenceBase64: hub.B64(evidence), State: "checkpointed"}
+	fatal(t, transfer.ValidateFinalizedCheckpoint(checkpoint, "publish-proof", manifest.ID,
+		manifest.Length, evidence, totals))
+	checkpoint.Manifest.Length++
+	if problem := transfer.ValidateFinalizedCheckpoint(checkpoint, "publish-proof", manifest.ID,
+		manifest.Length, evidence, totals); problem == nil {
+		t.Fatal("changed finalized Manifest length was accepted")
 	}
 }
 

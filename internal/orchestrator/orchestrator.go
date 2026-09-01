@@ -199,8 +199,10 @@ type Orchestrator struct {
 	// the records authority; these two are the whole event surface cl-006 serves.
 	frames *fanout
 	// transferWake is a lossy nudge over durable request-attached transfer rows.
-	transferWake    map[string]chan struct{}
-	transferRunning map[string]bool
+	transferWake        map[string]chan struct{}
+	transferRunning     map[string]bool
+	transferDispatching map[string]bool
+	transferCancels     map[string]context.CancelFunc
 	// privateTransfers is command-scoped, lossy progress over Creator's durable request
 	// row and sealed revision. A restart simply replays exact chunks from those authorities.
 	privateTransfers map[string]*privateTransfer
@@ -225,20 +227,22 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		opt.Yield = "smart"
 	}
 	c := &Orchestrator{
-		opt:              opt,
-		done:             make(chan struct{}),
-		sessions:         map[string]*session{},
-		workers:          map[string]*worker{},
-		waits:            map[string]*wait{},
-		offers:           map[string]*dispatchReservation{},
-		mediaCleaning:    map[string]bool{},
-		outputExporting:  map[string]bool{},
-		starting:         map[string]bool{},
-		ensuring:         map[string]chan struct{}{},
-		frames:           newFanout(),
-		transferWake:     make(map[string]chan struct{}),
-		transferRunning:  make(map[string]bool),
-		privateTransfers: make(map[string]*privateTransfer),
+		opt:                 opt,
+		done:                make(chan struct{}),
+		sessions:            map[string]*session{},
+		workers:             map[string]*worker{},
+		waits:               map[string]*wait{},
+		offers:              map[string]*dispatchReservation{},
+		mediaCleaning:       map[string]bool{},
+		outputExporting:     map[string]bool{},
+		starting:            map[string]bool{},
+		ensuring:            map[string]chan struct{}{},
+		frames:              newFanout(),
+		transferWake:        make(map[string]chan struct{}),
+		transferRunning:     make(map[string]bool),
+		transferDispatching: make(map[string]bool),
+		transferCancels:     make(map[string]context.CancelFunc),
+		privateTransfers:    make(map[string]*privateTransfer),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a
 	// SAMPLING resolution, never a verdict: every verdict it acts on is the worker's own
@@ -410,6 +414,13 @@ func (c *Orchestrator) drain() {
 			c.selectOrStart(*req)
 			continue
 		}
+		if req.ModelTransfer != nil {
+			transfer, problem := c.opt.Store.ModelTransferOf(req.ID)
+			if problem == nil && transfer != nil && transfer.State != "materialized" {
+				c.kickQueuedTransferDispatch(*req)
+				return // preserve FIFO while materialization runs outside drainMu
+			}
+		}
 		attempt, e := c.dispatch(*req)
 		if e != nil {
 			// NO CAPACITY and AN ORDINAL THE LAW WILL NOT MINT YET are both "wait"; every
@@ -428,6 +439,39 @@ func (c *Orchestrator) drain() {
 		c.forget(id)
 		c.logf("%s left the dispatch queue as attempt %d", id, attempt)
 	}
+}
+
+func (c *Orchestrator) kickQueuedTransferDispatch(req records.Request) {
+	c.mu.Lock()
+	if c.transferDispatching[req.ID] {
+		c.mu.Unlock()
+		return
+	}
+	c.transferDispatching[req.ID] = true
+	c.mu.Unlock()
+	go func() {
+		defer func() {
+			c.mu.Lock()
+			delete(c.transferDispatching, req.ID)
+			c.mu.Unlock()
+		}()
+		attempt, problem := c.dispatch(req)
+		if problem == nil {
+			c.forget(req.ID)
+			c.logf("%s left the dispatch queue as attempt %d", req.ID, attempt)
+			go c.drain()
+			return
+		}
+		if problem.Code != exit.Unavailable && problem.Code != exit.Conflict {
+			c.failQueued(req.ID, problem)
+			return
+		}
+		current, readProblem := c.opt.Store.RequestRow(req.ID)
+		if readProblem == nil && current != nil && !settledState(current.State) {
+			c.selectOrStart(*current)
+			time.AfterFunc(2*time.Second, func() { c.kickQueuedTransferDispatch(*current) })
+		}
+	}()
 }
 
 // QueuePosition is where a waiting request sits in the dispatch queue, counted from 1.

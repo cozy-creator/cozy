@@ -134,30 +134,31 @@ Model releases live in the local TensorFS store:
 
 ```sh
 cozy model search flux
-cozy model download org/model@release --lane task=text-to-image
+cozy model download org/model@release local/flux --lane task=text-to-image
 cozy model list
-cozy model remove org/model
+cozy model remove local/flux
 ```
 
-Upload an existing canonical TensorFS manifest directly, or execute one package-reviewed production
-whose named outputs become owner-only immutable checkpoints. `--lane` on upload selects only an
-existing input release; producers do not choose public lane names. The destination owner must match
-the account shown by `cozy auth`:
+Upload a pinned source directly, or execute one package-reviewed producer job whose named outputs
+become owner-only immutable checkpoints. `--lane` on upload selects only an existing input release;
+producers do not choose public lane names. A local alias can be uploaded without copying its
+already-canonical objects. The destination owner must match the account shown by `cozy auth`:
 
 ```sh
-cozy model upload org/model sha256:<manifest>
+cozy model upload local/model org/model
 
-cozy model upload tensorhub/minimax-h3 \
-  hf://MiniMaxAI/MiniMax-H3@<full-commit> \
-  --producer tensorhub/minimax-h3-tools/four-lane \
-  --rental
+cozy model upload hf://MiniMaxAI/MiniMax-H3@<full-commit> \
+  tensorhub/minimax-h3 \
+  --producer tensorhub/minimax-h3-tools@v2/four-lane \
+  --rental-only --await
 ```
 
-`--dry-run` resolves the immutable source, producer, job releases, resource floors, and named outputs
-without moving model bodies or authorizing rental spend. Upload follows by default and a repeat of the
-same command resumes the durable operation. Successful checkpoints stay retained even when a later
-output fails; only that output's transitive dependants are skipped, independent branches continue,
-and surviving outputs return with `status: partial`. Upload never makes them public.
+`--dry-run` resolves the immutable source, producer release, resource floors, and named outputs
+without moving model bodies or authorizing rental spend. Submission records an ordinary `job-*` run
+and returns immediately; `--await` watches it, and `cozy run watch <job-id>` attaches later. Repeating
+the exact normalized transfer safely returns the same durable request. A checkpoint retained before a
+later destination failure remains visible in `model_outputs`, while the request reports the failure.
+Upload never makes checkpoints public.
 
 Publish, repoint, add, or remove release lanes separately. Omitted lanes stay unchanged:
 
@@ -173,9 +174,11 @@ Checkpoint IDs are immutable. Release labels and their lane maps are mutable own
 consumers follow a release lane so fixes take effect; accepted runs freeze the checkpoint they resolved.
 
 With `--rental`, producer and job packages resolve directly to their latest non-yanked immutable
-Tensorhub releases; their exact release and descriptor identities are pinned in the production plan.
+Tensorhub releases; their exact release and descriptor identities are pinned in the transfer intent.
 They do not need to be installable in the laptop's local Python environment. Local production still
-uses the ordinary installed package generations.
+uses the ordinary installed package generation. `--rental-only` skips local capacity and requires an
+external attempt. Downloads that could rent currently refuse until Creator wires the negotiated
+artifact-read return plane; local-only sources under `--rental` remain local.
 
 ## Run packages and jobs
 

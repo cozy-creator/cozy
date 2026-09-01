@@ -81,10 +81,15 @@ func (c *Orchestrator) rentalControl(rentalID string) (*session, *exit.Error) {
 	return s, nil
 }
 
-func (c *Orchestrator) onModelSourceFileStatus(_ *session, frame *pb.ModelSourceFileStatus) {
+func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSourceFileStatus) {
 	selection, err := canonical.Spell(frame.SourceSelectionDigest)
 	transfer, problem := c.opt.Store.ModelTransferOf(frame.OperationId)
 	if err != nil || problem != nil || transfer == nil || selection != transfer.SourceSelection {
+		return
+	}
+	request, problem := c.opt.Store.RequestRow(frame.OperationId)
+	if problem != nil || request == nil || request.Worker == "" ||
+		rentalInstanceID(request.Worker) != s.instanceID {
 		return
 	}
 	var expected *records.ModelTransferSourceFile
@@ -117,7 +122,7 @@ func (c *Orchestrator) onModelSourceFileStatus(_ *session, frame *pb.ModelSource
 	c.signalTransfer(frame.OperationId)
 }
 
-func (c *Orchestrator) onModelSourcePrepared(_ *session, frame *pb.ModelSourcePrepared) {
+func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePrepared) {
 	selection, err := canonical.Spell(frame.SourceSelectionDigest)
 	transfer, problem := c.opt.Store.ModelTransferOf(frame.OperationId)
 	if err != nil || problem != nil || transfer == nil || selection != transfer.SourceSelection {
@@ -133,7 +138,8 @@ func (c *Orchestrator) onModelSourcePrepared(_ *session, frame *pb.ModelSourcePr
 		return
 	}
 	request, problem := c.opt.Store.RequestRow(frame.OperationId)
-	if problem != nil || request == nil {
+	if problem != nil || request == nil || request.Worker == "" ||
+		rentalInstanceID(request.Worker) != s.instanceID {
 		return
 	}
 	rows := make([]records.ModelRef, 0, len(frame.Sources))

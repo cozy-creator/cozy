@@ -314,16 +314,19 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 	}
 }
 
-func (c *Orchestrator) finalizeModelTransfer(requestID string) *exit.Error {
+func (c *Orchestrator) finalizeModelTransfer(ctx context.Context, requestID string) *exit.Error {
 	transfer, problem := c.opt.Store.ModelTransferOf(requestID)
 	if problem != nil || transfer == nil || transfer.State == "completed" {
 		return problem
+	}
+	if transfer.State == "canceled" {
+		return exit.New(exit.Canceled, "model transfer %s finalization was canceled", requestID)
 	}
 	if c.opt.ModelTransfers == nil {
 		problem = exit.Named(exit.Unavailable, "model_transfer.owner_absent",
 			"this daemon has no model transfer finalizer")
 	} else if problem = c.opt.Store.BeginModelTransferFinalization(requestID); problem == nil {
-		problem = c.opt.ModelTransfers.Finalize(context.Background(), requestID,
+		problem = c.opt.ModelTransfers.Finalize(ctx, requestID,
 			func(ctx context.Context, artifact records.ModelTransferArtifact, operationID string,
 				decisions []ArtifactTransferDecision,
 			) *exit.Error {
@@ -358,18 +361,22 @@ func (c *Orchestrator) kickModelTransferFinalizer(s *session, requestID string, 
 		return
 	}
 	c.transferRunning[requestID] = true
+	runCtx, cancel := context.WithCancel(context.Background())
+	c.transferCancels[requestID] = cancel
 	c.mu.Unlock()
 	go func() {
 		defer func() {
 			c.mu.Lock()
 			delete(c.transferRunning, requestID)
+			delete(c.transferCancels, requestID)
 			c.mu.Unlock()
+			cancel()
 		}()
-		problem := c.finalizeModelTransfer(requestID)
+		problem := c.finalizeModelTransfer(runCtx, requestID)
 		if problem != nil {
 			c.logf("model transfer %s finalization failed: %s", requestID, problem.Message)
 			transfer, _ := c.opt.Store.ModelTransferOf(requestID)
-			if transfer == nil || transfer.State != "failed" {
+			if transfer == nil || (transfer.State != "failed" && transfer.State != "canceled") {
 				time.AfterFunc(2*time.Second, func() {
 					c.kickModelTransferFinalizer(s, requestID, attempt)
 				})
@@ -378,6 +385,20 @@ func (c *Orchestrator) kickModelTransferFinalizer(s *session, requestID string, 
 		}
 		c.ackSettledOutcome(s, requestID, uint64(attempt))
 	}()
+}
+
+func (c *Orchestrator) CancelModelTransferFinalization(requestID string) *exit.Error {
+	if problem := c.opt.Store.RequestModelTransferCancellation(requestID); problem != nil {
+		return problem
+	}
+	c.mu.Lock()
+	cancel := c.transferCancels[requestID]
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	c.signalTransfer(requestID)
+	return nil
 }
 
 func (c *Orchestrator) finishModelTransferRequest(requestID string, attempt int64) {
@@ -442,20 +463,29 @@ func (c *Orchestrator) kickRecoveredLocalTransfer(requestID string, attempt int6
 		return
 	}
 	c.transferRunning[requestID] = true
+	runCtx, cancel := context.WithCancel(context.Background())
+	c.transferCancels[requestID] = cancel
 	c.mu.Unlock()
 	go func() {
 		defer func() {
 			c.mu.Lock()
 			delete(c.transferRunning, requestID)
+			delete(c.transferCancels, requestID)
 			c.mu.Unlock()
+			cancel()
 		}()
-		if problem := c.finalizeModelTransfer(requestID); problem != nil {
-			transfer, _ := c.opt.Store.ModelTransferOf(requestID)
-			if transfer == nil || transfer.State != "failed" {
-				time.AfterFunc(2*time.Second, func() {
-					c.kickRecoveredLocalTransfer(requestID, attempt)
-				})
-				return
+		transfer, _ := c.opt.Store.ModelTransferOf(requestID)
+		if transfer == nil || (transfer.State != "failed" && transfer.State != "canceled") {
+			if problem := c.finalizeModelTransfer(runCtx, requestID); problem != nil {
+				transfer, _ = c.opt.Store.ModelTransferOf(requestID)
+				if transfer != nil && (transfer.State == "failed" || transfer.State == "canceled") {
+					// The ordinary terminal owns the verdict; only closure/teardown remains.
+				} else {
+					time.AfterFunc(2*time.Second, func() {
+						c.kickRecoveredLocalTransfer(requestID, attempt)
+					})
+					return
+				}
 			}
 		}
 		if problem := c.opt.Store.Closed(requestID, attempt); problem != nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -325,11 +326,16 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if state.Publication != nil {
 		defaults = append(defaults, "publication")
 	}
+	if len(state.ModelOutputs) > 0 {
+		defaults = append(defaults, "model_outputs")
+	}
 	defaults = append(defaults, "wall_ms")
 	rec := compactRecord(fields, defaults...)
 	code := exit.JobTerminal(mapTerminal(status))
 	if code == exit.OK {
-		if state.Publication != nil {
+		if hint := modelPublishHint(state); hint != "" {
+			rec.Next = []string{hint}
+		} else if state.Publication != nil {
 			rec.Next = []string{"cozy run list --full"}
 		}
 		return emit(ctx, rec)
@@ -346,7 +352,27 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if state.Triage != nil {
 		err.WithNext("cozy run list --full")
 	}
+	if hint := modelPublishHint(state); hint != "" {
+		err.WithNext(hint)
+	}
 	return err
+}
+
+func modelPublishHint(state api.JobState) string {
+	if state.ModelDestination == "" || len(state.ModelOutputs) == 0 ||
+		strings.HasPrefix(state.ModelDestination, "local/") {
+		return ""
+	}
+	names := make([]string, 0, len(state.ModelOutputs))
+	for name := range state.ModelOutputs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	command := "cozy model publish " + state.ModelDestination + " --release <label>"
+	for _, name := range names {
+		command += " --lane " + name + "=" + state.ModelOutputs[name]
+	}
+	return command
 }
 
 // ---------------------------------------------------------------------- job cancel

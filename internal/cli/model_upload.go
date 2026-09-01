@@ -232,7 +232,12 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 			submission.Org = strings.Split(destination, "/")[0]
 		}
 	}
-	handle, problem := local.SubmitJob(submission, mintKey())
+	planDigest, err := plan.Digest()
+	if err != nil {
+		return exit.Internalf("cannot digest model transfer submission: %s", err)
+	}
+	handle, problem := local.SubmitJob(submission,
+		"model-transfer-"+strings.TrimPrefix(planDigest, "sha256:"))
 	if problem != nil {
 		return problem
 	}

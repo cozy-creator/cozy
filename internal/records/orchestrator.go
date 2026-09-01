@@ -1472,6 +1472,18 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 		requestState, t.RequestID); err != nil {
 		return false, exit.Internalf("cannot settle request %s: %s", t.RequestID, err)
 	}
+	if requestState == "failed" || requestState == "canceled" || requestState == "refused" ||
+		requestState == "abandoned" || (requestState == "finalizing" && t.Status != "SUCCEEDED") {
+		transferState := "failed"
+		if requestState == "canceled" || t.Status == "CANCELED" {
+			transferState = "canceled"
+		}
+		if _, err := tx.Exec(`UPDATE request_model_transfers SET state=?,error_code=?,safe_error=?,
+			updated_at=? WHERE request_id=? AND state NOT IN ('completed','failed','canceled')`,
+			transferState, t.Cause, t.SafeMessage, now(), t.RequestID); err != nil {
+			return false, exit.Internalf("cannot settle model transfer %s: %s", t.RequestID, err)
+		}
+	}
 	// THE PUBLICATION rides the same commit as the terminal and the outputs (cl-004).
 	// "The bundle is visible" and "the terminal was accepted" are therefore one fact:
 	// a kill before this commit leaves the bytes on disk with nothing claiming them,

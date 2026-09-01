@@ -13,8 +13,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRecordsSchemasSixThroughEightMigrateWithoutDroppingDurableRows(t *testing.T) {
-	for _, version := range []int{6, 7, 8} {
+func TestRecordsSchemasSixThroughNineMigrateWithoutDroppingDurableRows(t *testing.T) {
+	for _, version := range []int{6, 7, 8, 9} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			root := t.TempDir()
 			database := filepath.Join(root, "records.db")
@@ -60,6 +60,19 @@ func TestRecordsSchemasSixThroughEightMigrateWithoutDroppingDurableRows(t *testi
 			fatal(t, problem)
 			if migratedRental == nil || *migratedRental != rental {
 				t.Fatalf("schema migration dropped or changed rental row: %#v", migratedRental)
+			}
+			checkDB, err := sql.Open("sqlite", database)
+			must(t, err)
+			var currentVersion, retired, transfers int
+			must(t, checkDB.QueryRow(`PRAGMA user_version`).Scan(&currentVersion))
+			must(t, checkDB.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+				WHERE type='table' AND name='model_productions'`).Scan(&retired))
+			must(t, checkDB.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+				WHERE type='table' AND name='request_model_transfers'`).Scan(&transfers))
+			must(t, checkDB.Close())
+			if currentVersion != 10 || retired != 0 || transfers != 1 {
+				t.Fatalf("migration shape = version:%d retired:%d transfers:%d",
+					currentVersion, retired, transfers)
 			}
 		})
 	}
@@ -143,6 +156,20 @@ func TestPackageInventoryRecoveryRefusesPinCollisionAtomically(t *testing.T) {
 func stampRecordsVersion(t *testing.T, path string, version int) {
 	t.Helper()
 	db, err := sql.Open("sqlite", path)
+	must(t, err)
+	for _, table := range []string{"request_model_transfer_objects", "request_model_transfer_outputs",
+		"request_model_transfer_files", "request_model_transfers"} {
+		_, err = db.Exec(`DROP TABLE ` + table)
+		must(t, err)
+	}
+	for _, statement := range records.SchemaNineMigrationDDL() {
+		_, err = db.Exec(statement)
+		must(t, err)
+	}
+	_, err = db.Exec(`INSERT INTO model_productions
+		(id,plan_digest,plan,state,created_at,updated_at)
+		VALUES('retired-proof','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+		x'7b7d','accepted','2026-08-31T00:00:00Z','2026-08-31T00:00:00Z')`)
 	must(t, err)
 	if version < 8 {
 		_, err = db.Exec(`DROP INDEX rentals_machine_name; ALTER TABLE rentals RENAME TO rentals_current`)

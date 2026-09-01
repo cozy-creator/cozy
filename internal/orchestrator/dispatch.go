@@ -384,14 +384,25 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 		// settled for ten minutes. Observed live, in cl-003's ARM 3.
 		c.logf("%s NOT requeued (%s): %s", requestID, why, e.Message)
 		c.forget(requestID)
-		_ = c.opt.Store.SettleRequest(requestID, "failed")
-		c.RetryOutputExport(requestID)
-		c.frames.forget(requestID)
-		c.emit(requestID, "request.failed", 0, map[string]any{
+		payload := map[string]any{
 			"status": "FAILED", "cause": "REQUEUE_BUDGET_EXHAUSTED",
 			"error_type": e.ErrName(), "error": e.Message,
 			"outputs": []any{}, "requeuing": false,
-		})
+		}
+		row, read := c.opt.Store.RequestRow(requestID)
+		if read == nil && row != nil && row.ModelTransfer != nil {
+			if problem := c.releaseManagedNow(*row); problem != nil {
+				c.logf("%s model transfer provider cleanup remains pending: %s", requestID, problem.Message)
+				time.AfterFunc(2*time.Second, func() { c.Requeue(requestID, why) })
+				return
+			}
+			_, _ = c.opt.Store.FailModelTransferRequest(requestID, e.ErrName(), e.Message, payload)
+		} else {
+			_ = c.opt.Store.SettleRequest(requestID, "failed")
+			c.emit(requestID, "request.failed", 0, payload)
+		}
+		c.RetryOutputExport(requestID)
+		c.frames.forget(requestID)
 		c.signalClosed(requestWaitKey(requestID), e)
 		if row, read := c.opt.Store.RequestRow(requestID); read == nil && row != nil {
 			go c.cleanupRequestAssets(*row)
@@ -780,9 +791,30 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 	// overwritten to `failed` after its publication had already committed. The request's
 	// own settled state is the authority; nothing that happens to a process afterwards may
 	// contradict it.
-	if row, e := c.opt.Store.RequestRow(requestID); e == nil && row != nil && settledState(row.State) {
+	row, readProblem := c.opt.Store.RequestRow(requestID)
+	if readProblem == nil && row != nil && settledState(row.State) {
 		c.logf("%s already settled %s — NOT failing it over: %s",
 			requestID, row.State, cause.Message)
+		return
+	}
+	payload := map[string]any{"status": "FAILED", "cause": cause.ErrName(),
+		"error_type": cause.ErrName(), "error": cause.Message,
+		"outputs": []any{}, "requeuing": false}
+	if row != nil && row.ModelTransfer != nil {
+		if problem := c.releaseManagedNow(*row); problem != nil {
+			c.logf("%s model transfer provider cleanup remains pending: %s", requestID, problem.Message)
+			time.AfterFunc(2*time.Second, func() { c.failQueued(requestID, cause) })
+			return
+		}
+		if _, problem := c.opt.Store.FailModelTransferRequest(requestID, cause.ErrName(),
+			cause.Message, payload); problem != nil {
+			c.logf("%s model transfer failure could not settle: %s", requestID, problem.Message)
+			return
+		}
+		go c.cleanupRequestAssets(*row)
+		c.logf("%s FAILED before any offer: %s", requestID, cause.Message)
+		c.signalClosed(requestWaitKey(requestID), cause)
+		c.releaseManaged(*row)
 		return
 	}
 	if e := c.opt.Store.SettleRequest(requestID, "failed"); e != nil {
@@ -797,11 +829,7 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 	if row, e := c.opt.Store.RequestRow(requestID); e == nil && row != nil {
 		go c.cleanupRequestAssets(*row)
 	}
-	c.emit(requestID, "request.failed", 0, map[string]any{
-		"status": "FAILED", "cause": cause.ErrName(),
-		"error_type": cause.ErrName(), "error": cause.Message,
-		"outputs": []any{}, "requeuing": false,
-	})
+	c.emit(requestID, "request.failed", 0, payload)
 	c.logf("%s FAILED before any offer: %s", requestID, cause.Message)
 	c.signalClosed(requestWaitKey(requestID), cause)
 	if row, problem := c.opt.Store.RequestRow(requestID); problem == nil && row != nil {

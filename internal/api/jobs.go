@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -161,7 +162,25 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// orchestrator records the row, queues it and makes the worker resident; several jobs
 	// submitted at once queue against ONE worker and drain in submission order
 	// (owner directive, decisions #394 / cr-019).
-	jobID, attempt, fresh, e := s.orchestrator.SubmitDetail(spec)
+	var jobID string
+	var attempt uint64
+	var fresh bool
+	if spec.ModelTransfer != nil {
+		var recorded records.Request
+		recorded, fresh, e = s.orchestrator.RecordSubmission(spec)
+		if e == nil {
+			jobID, attempt = recorded.ID, uint64(recorded.Ordinal)
+		}
+		if e == nil && fresh {
+			go func() {
+				if _, problem := s.orchestrator.ActivateRecordedRequest(recorded); problem != nil {
+					fmt.Fprintf(s.log, "model transfer %s activation: %s\n", recorded.ID, problem.Message)
+				}
+			}()
+		}
+	} else {
+		jobID, attempt, fresh, e = s.orchestrator.SubmitDetail(spec)
+	}
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
@@ -198,7 +217,11 @@ func validateModelTransferSubmission(spec orchestrator.Submission) *exit.Error {
 	if intent == nil {
 		return nil
 	}
-	if spec.Package == "cozy/platform" {
+	platformPassThrough := spec.Package == "cozy/platform" && spec.Entrypoint == "model-pass-through"
+	if spec.Package == "cozy/platform" || spec.Entrypoint == "model-pass-through" {
+		if !platformPassThrough {
+			return exit.New(exit.Validation, "platform pass-through requires exact package and function")
+		}
 		if len(intent.Outputs) != 1 || intent.Outputs[0].Name != "model" ||
 			intent.Outputs[0].RequiredContract != nil {
 			return exit.New(exit.Validation, "platform pass-through requires exactly output model")
@@ -252,7 +275,7 @@ func replayJobSubmission(sub JobSubmission,
 		payload = []byte("{}")
 	}
 	models := append([]orchestrator.ModelRef(nil), sub.Models...)
-	if len(models) == 0 {
+	if len(models) == 0 && recorded.ModelTransfer == nil {
 		models = append(models, recorded.Models...)
 	}
 	var artifactOutputs []orchestrator.ArtifactOutput
@@ -282,6 +305,10 @@ func replayJobSubmission(sub JobSubmission,
 	if packageName == "" && function == "" {
 		packageName, function = recorded.Package, recorded.Entrypoint
 	}
+	profiles := map[string]string(nil)
+	if transfer != nil {
+		profiles = transfer.SourceProfiles
+	}
 	return orchestrator.Submission{Kind: "job", Package: packageName,
 		Entrypoint: function, Payload: payload, Org: org,
 		InstallID: recorded.InstallID, Release: recorded.Release,
@@ -290,7 +317,7 @@ func replayJobSubmission(sub JobSubmission,
 		PlanID:               recorded.PlanID, Outputs: outputs, ArtifactOutputs: artifactOutputs,
 		JobGPUCount: recorded.JobGPUCount, Trees: trees, Worker: recorded.Worker,
 		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
-		Models: models, ModelTransfer: transfer}, nil
+		Models: models, ModelTransfer: transfer, ProducerProfiles: profiles}, nil
 }
 
 // resolveJob turns package+function into the orchestrator's Submission. The
@@ -553,20 +580,21 @@ type JobState struct {
 	// Requeues and RetryBudget are the orchestrator's RETRY PROJECTION made visible: how
 	// much of the durable budget the neutral outcomes have already spent, and what the
 	// bound is. A settlement that exhausted it names the budget in `error`.
-	Requeues     int64             `json:"requeues"`
-	RetryBudget  int64             `json:"retry_budget"`
-	Progress     map[string]any    `json:"progress,omitempty"`
-	Stage        string            `json:"stage,omitempty"`
-	ElapsedMS    int64             `json:"elapsed_ms"`
-	Metrics      map[string]any    `json:"metrics,omitempty"`
-	ErrorType    string            `json:"error_type,omitempty"`
-	Error        string            `json:"error,omitempty"`
-	Result       any               `json:"result,omitempty"`
-	Outputs      []MediaRef        `json:"outputs"`
-	Artifacts    []ArtifactRef     `json:"artifacts,omitempty"`
-	Checkpoints  []JobCheckpoint   `json:"checkpoints,omitempty"`
-	ModelOutputs map[string]string `json:"model_outputs,omitempty"`
-	Publication  *PublicationRef   `json:"publication,omitempty"`
+	Requeues         int64             `json:"requeues"`
+	RetryBudget      int64             `json:"retry_budget"`
+	Progress         map[string]any    `json:"progress,omitempty"`
+	Stage            string            `json:"stage,omitempty"`
+	ElapsedMS        int64             `json:"elapsed_ms"`
+	Metrics          map[string]any    `json:"metrics,omitempty"`
+	ErrorType        string            `json:"error_type,omitempty"`
+	Error            string            `json:"error,omitempty"`
+	Result           any               `json:"result,omitempty"`
+	Outputs          []MediaRef        `json:"outputs"`
+	Artifacts        []ArtifactRef     `json:"artifacts,omitempty"`
+	Checkpoints      []JobCheckpoint   `json:"checkpoints,omitempty"`
+	ModelOutputs     map[string]string `json:"model_outputs,omitempty"`
+	ModelDestination string            `json:"model_destination,omitempty"`
+	Publication      *PublicationRef   `json:"publication,omitempty"`
 	// Bill is ABSENT unless this host was configured with an explicit local rate. There
 	// is no `$0.00`: a fabricated zero is a claim about money nobody made (cl-004).
 	Bill      *JobBill   `json:"bill,omitempty"`
@@ -656,7 +684,18 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	}
 	if row.ModelTransfer != nil {
 		if transfer, problem := s.store.ModelTransferOf(row.ID); problem == nil && transfer != nil {
-			state.ModelOutputs = transfer.Checkpoints
+			state.ModelDestination = transfer.Destination
+			state.ModelOutputs = make(map[string]string, len(transfer.Checkpoints))
+			for slot, checkpoint := range transfer.Checkpoints {
+				state.ModelOutputs[slot] = checkpoint
+			}
+			if artifacts, artifactProblem := s.store.ModelTransferArtifacts(row.ID, row.Ordinal); artifactProblem == nil {
+				for _, artifact := range artifacts {
+					if artifact.FinalID != "" {
+						state.ModelOutputs[artifact.OutputSlot] = artifact.ManifestID
+					}
+				}
+			}
 			if row.State == "failed" {
 				state.ErrorType, state.Error = transfer.ErrorCode, transfer.SafeError
 			}
@@ -837,6 +876,17 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if last.State == "terminal" {
+		if row.ModelTransfer != nil && row.State == "finalizing" {
+			if e := s.orchestrator.CancelModelTransferFinalization(row.ID); e != nil {
+				s.refuseTyped(w, r, e)
+				return
+			}
+			s.ok(w, r, http.StatusAccepted, map[string]any{
+				"job_id": row.ID, "attempt": last.Attempt, "status": "cancel_requested",
+				"note": "destination finalization is stopping; provider teardown precedes the canceled terminal",
+			})
+			return
+		}
 		s.refuse(w, r, http.StatusConflict, "terminal_ack_pending",
 			"the current job attempt has a terminal whose retry/settlement projection is not acknowledged yet",
 			"retry cancellation after the terminal ack")

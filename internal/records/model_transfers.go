@@ -682,6 +682,23 @@ func (s *Store) FailModelTransfer(requestID, code, detail string) *exit.Error {
 	return exit.New(exit.Conflict, "model transfer %s cannot fail from its current state", requestID)
 }
 
+func (s *Store) RequestModelTransferCancellation(requestID string) *exit.Error {
+	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='canceled',
+		error_code='CLIENT_CANCELED',safe_error='model transfer finalization canceled by client',
+		updated_at=? WHERE request_id=? AND state='finalizing'`, now(), requestID)
+	if err != nil {
+		return exit.Internalf("cannot request model transfer cancellation: %s", err)
+	}
+	if changed, _ := result.RowsAffected(); changed == 1 {
+		return nil
+	}
+	transfer, problem := s.ModelTransferOf(requestID)
+	if problem == nil && transfer != nil && transfer.State == "canceled" {
+		return nil
+	}
+	return exit.New(exit.Conflict, "model transfer %s is not finalizing", requestID)
+}
+
 // SettleModelTransferRequest atomically projects destination retention into the
 // ordinary request terminal and its absorbing event. Provider teardown happens first.
 func (s *Store) SettleModelTransferRequest(requestID string, attempt int64) (string, *exit.Error) {
@@ -709,6 +726,11 @@ func (s *Store) SettleModelTransferRequest(requestID string, attempt int64) (str
 		state, eventType = "succeeded", "request.completed"
 		payload = map[string]any{"status": "SUCCEEDED", "cause": "COMPLETED",
 			"outputs": []any{}, "requeuing": false}
+	} else if transferState == "canceled" {
+		state, eventType = "canceled", "request.canceled"
+		payload = map[string]any{"status": "CANCELED", "cause": "CLIENT_CANCELED",
+			"error_type": "CLIENT_CANCELED", "error": detail,
+			"outputs": []any{}, "requeuing": false}
 	} else if transferState != "failed" {
 		return "", exit.New(exit.Conflict, "model transfer %s is %s before settlement",
 			requestID, transferState)
@@ -728,4 +750,38 @@ func (s *Store) SettleModelTransferRequest(requestID string, attempt int64) (str
 		return "", exit.Internalf("cannot commit model transfer settlement: %s", err)
 	}
 	return state, nil
+}
+
+// FailModelTransferRequest atomically settles a pre-attempt hook failure and its
+// ordinary absorbing event. It never overwrites cancellation or a completed request.
+func (s *Store) FailModelTransferRequest(requestID, code, detail string,
+	payload map[string]any,
+) (bool, *exit.Error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, exit.Internalf("cannot begin model transfer failure: %s", err)
+	}
+	defer tx.Rollback()
+	var state string
+	if err := tx.QueryRow(`SELECT state FROM requests WHERE id=?`, requestID).Scan(&state); err != nil {
+		return false, exit.Internalf("cannot read model transfer request %s: %s", requestID, err)
+	}
+	if settledRequestState(state) {
+		return false, nil
+	}
+	if _, err := tx.Exec(`UPDATE request_model_transfers SET state='failed',error_code=?,
+		safe_error=?,updated_at=? WHERE request_id=? AND state NOT IN ('completed','canceled')`,
+		code, detail, now(), requestID); err != nil {
+		return false, exit.Internalf("cannot fail model transfer sidecar: %s", err)
+	}
+	if _, err := tx.Exec(`UPDATE requests SET state='failed' WHERE id=?`, requestID); err != nil {
+		return false, exit.Internalf("cannot fail model transfer request: %s", err)
+	}
+	if err := appendEventTx(tx, requestID, "request.failed", 0, payload); err != nil {
+		return false, exit.Internalf("cannot append model transfer failure: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, exit.Internalf("cannot commit model transfer failure: %s", err)
+	}
+	return true, nil
 }
