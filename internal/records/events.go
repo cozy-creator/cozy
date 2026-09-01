@@ -133,6 +133,45 @@ func (s *Store) CancelQueuedRequest(requestID string, payload map[string]any) (b
 	return true, nil
 }
 
+// FailQueuedRequest atomically records the typed pre-attempt failure and its terminal
+// event. After a 202 response, status and watch must never disagree about why activation
+// failed merely because one of two separate writes was lost.
+func (s *Store) FailQueuedRequest(requestID string, payload map[string]any) (bool, *exit.Error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, exit.Internalf("cannot begin queued failure: %s", err)
+	}
+	defer tx.Rollback()
+	var state string
+	var openAttempts int
+	if err := tx.QueryRow(`SELECT state,(SELECT COUNT(*) FROM attempts WHERE request_id=r.id
+		AND state IN ('preparing','offered','accepted','recovered_open','terminal'))
+		FROM requests r WHERE id=?`, requestID).Scan(&state, &openAttempts); err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, exit.Internalf("cannot read queued request %s: %s", requestID, err)
+	}
+	if state == "canceled" || state == "succeeded" || state == "failed" ||
+		state == "refused" || state == "abandoned" {
+		return false, nil
+	}
+	if openAttempts != 0 {
+		return false, exit.New(exit.Conflict,
+			"request %s has an attempt and is not a queued failure", requestID)
+	}
+	if _, err := tx.Exec(`UPDATE requests SET state='failed' WHERE id=?`, requestID); err != nil {
+		return false, exit.Internalf("cannot settle queued request %s: %s", requestID, err)
+	}
+	if err := appendEventTx(tx, requestID, "request.failed", 0, payload); err != nil {
+		return false, exit.Internalf("cannot append queued failure for %s: %s", requestID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, exit.Internalf("cannot commit queued failure for %s: %s", requestID, err)
+	}
+	return true, nil
+}
+
 // EventsAfter reads durable events strictly after `cursor`. An empty requestID reads the
 // MULTIPLEXED stream — every request, one order, one cursor. The browser opens exactly
 // one of these instead of one connection per request (the connection-cap reason the

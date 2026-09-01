@@ -30,6 +30,9 @@ const jobRSSBudget = orchestrator.DefaultJobRSSCap
 // JobFacts is one resolved `@job` on an installed generation.
 type JobFacts struct {
 	Name string
+	// Request is the exact callable schema used by the admission authority before
+	// the request enters the ordinary queue.
+	Request Struct
 	// DescriptorID is `job_descriptor_id`: sha256 over the canonical bytes of
 	// `{"format":"cozy.runtime.JobDescriptor/1", …the job's own descriptor entry}`.
 	// DERIVED, never stored (cr-009's seam) — every environment of one release computes
@@ -44,6 +47,7 @@ type JobFacts struct {
 	// DECLARATION, never off the kind (cr-009).
 	Publishes bool
 	GPUCount  int64
+	Requires  string
 }
 
 // JobSpec builds the WorkerLaunchSpec that makes ONE job function's worker resident. It
@@ -171,9 +175,10 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		outputs = append(outputs, output.OutputID)
 	}
 	facts := &JobFacts{
-		Name: function, DescriptorID: said.DescriptorID, Outputs: outputs,
+		Name: function, Request: declared.Request, DescriptorID: said.DescriptorID, Outputs: outputs,
 		ArtifactOutputs: artifactOutputs,
 		Publishes:       declared.Publishes, GPUCount: declared.Resources.GPUCount,
+		Requires: declared.Resources.Requires,
 	}
 	if len(declared.Models) > 0 {
 		facts.SourceProfiles = make(map[string]string, len(declared.Models))

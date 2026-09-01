@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -18,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -162,46 +162,26 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// orchestrator records the row, queues it and makes the worker resident; several jobs
 	// submitted at once queue against ONE worker and drain in submission order
 	// (owner directive, decisions #394 / cr-019).
-	var jobID string
-	var attempt uint64
-	var fresh bool
-	if spec.ModelTransfer != nil {
-		var recorded records.Request
-		recorded, fresh, e = s.orchestrator.RecordSubmission(spec)
-		if e == nil {
-			jobID, attempt = recorded.ID, uint64(recorded.Ordinal)
-		}
-		if e == nil && fresh {
-			go func() {
-				if _, problem := s.orchestrator.ActivateRecordedRequest(recorded); problem != nil {
-					fmt.Fprintf(s.log, "model transfer %s activation: %s\n", recorded.ID, problem.Message)
-				}
-			}()
-		}
-	} else {
-		jobID, attempt, fresh, e = s.orchestrator.SubmitDetail(spec)
-	}
+	recorded, fresh, e := s.recordSubmission(spec, existing == nil)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	row, e := s.store.RequestRow(jobID)
-	if e != nil || row == nil {
-		s.refuse(w, r, http.StatusInternalServerError, "internal",
-			"the job was recorded and cannot be read back", "")
-		return
+	jobID, attempt := recorded.ID, uint64(recorded.Ordinal)
+	if fresh {
+		defer s.activateRecorded(recorded)
 	}
 	handle := JobHandle{
-		JobID: jobID, Status: contractStatus(row.State), Attempt: attempt,
-		Package: row.Package, Function: row.Entrypoint,
-		Repo:      home.ScratchRepo(row.Org, row.ID),
+		JobID: jobID, Status: contractStatus(recorded.State), Attempt: attempt,
+		Package: recorded.Package, Function: recorded.Entrypoint,
+		Repo:      home.ScratchRepo(recorded.Org, recorded.ID),
 		StatusURL: "/v1/local/jobs/" + jobID,
 		CancelURL: "/v1/local/jobs/" + jobID + "/cancel",
 		EventsURL: "/v1/requests/" + jobID + "/events",
 		Replay:    !fresh,
 	}
 	if handle.Status == "queued" {
-		if position, depth := s.orchestrator.QueueState(row.ID); position > 0 {
+		if position, depth := s.orchestrator.QueueState(recorded.ID); position > 0 {
 			handle.QueuePosition, handle.QueueDepth = &position, &depth
 		}
 	}
@@ -225,6 +205,9 @@ func validateModelTransferSubmission(spec orchestrator.Submission) *exit.Error {
 		if len(intent.Outputs) != 1 || intent.Outputs[0].Name != "model" ||
 			intent.Outputs[0].RequiredContract != nil {
 			return exit.New(exit.Validation, "platform pass-through requires exactly output model")
+		}
+		if intent.GPUCount != 0 || intent.MinSM != 0 || intent.VRAMGB != 0 || intent.RAMGB != 0 {
+			return exit.New(exit.Validation, "platform pass-through declares no compute resource floor")
 		}
 		return nil
 	}
@@ -251,6 +234,15 @@ func validateModelTransferSubmission(spec orchestrator.Submission) *exit.Error {
 			return exit.New(exit.Validation,
 				"producer transfer output %s lacks its descriptor contract", output.Name)
 		}
+	}
+	needs, err := modeltransfer.ParseResourceNeeds(spec.JobGPUCount, spec.JobRequires)
+	if err != nil {
+		return exit.Named(exit.Structural, "descriptor_resource_invalid", "%s", err)
+	}
+	if intent.GPUCount != needs.GPUCount || intent.MinSM != needs.MinSM ||
+		intent.VRAMGB != needs.VRAMGB || intent.RAMGB != needs.RAMGB {
+		return exit.New(exit.Validation,
+			"model transfer resource envelope does not match its producer descriptor")
 	}
 	return nil
 }
@@ -374,14 +366,18 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			return out, exit.Named(exit.Validation, "rental.job_release_incomplete",
 				"remote jobs require one exact published release and no local input trees")
 		}
-		logical, problem := s.packages.ResolveRemoteJob(
+		logical, job, problem := s.packages.ResolveRemoteJob(
 			sub.Package, sub.Release, sub.ReleaseDigest, sub.Function, sub.Models,
 			sub.ModelTransfer != nil)
 		if problem != nil {
 			return out, problem
 		}
+		if problem := launch.ValidatePayload(job, out.Payload); problem != nil {
+			return out, problem
+		}
 		out.PlanID, out.Outputs = logical.DescriptorID, logical.Outputs
 		out.ArtifactOutputs, out.JobGPUCount = logical.ArtifactOutputs, logical.GPUCount
+		out.JobRequires = logical.Requires
 		out.ProducerProfiles = logical.SourceProfiles
 		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
 		return out, nil
@@ -422,7 +418,11 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.Outputs = job.Outputs
 		out.ArtifactOutputs = job.ArtifactOutputs
 		out.JobGPUCount = job.GPUCount
+		out.JobRequires = job.Requires
 		out.ProducerProfiles = job.SourceProfiles
+		if problem := validateJobPayload(job, out.Payload); problem != nil {
+			return out, problem
+		}
 	}
 	if out.PlanID == "" {
 		return out, exit.Named(exit.NotFound, "unknown_job",
@@ -468,7 +468,11 @@ func (s *Server) resolvePrivateJob(ctx context.Context, sub JobSubmission,
 		}
 		out.PlanID, out.Outputs = job.DescriptorID, job.Outputs
 		out.ArtifactOutputs, out.JobGPUCount = job.ArtifactOutputs, job.GPUCount
+		out.JobRequires = job.Requires
 		out.ProducerProfiles = job.SourceProfiles
+		if problem := validateJobPayload(job, out.Payload); problem != nil {
+			return out, problem
+		}
 	}
 	if out.PlanID == "" {
 		return out, exit.Named(exit.NotFound, "unknown_job",
@@ -482,6 +486,10 @@ func (s *Server) resolvePrivateJob(ctx context.Context, sub JobSubmission,
 	out.Release, out.ReleaseDigest = revision.Release, revision.SourceDigest
 	out.PrivatePackageDigest = revision.Digest
 	return out, nil
+}
+
+func validateJobPayload(job launch.JobFacts, payload json.RawMessage) *exit.Error {
+	return launch.ValidatePayload(&launch.Entrypoint{Name: job.Name, Request: job.Request}, payload)
 }
 
 // validOrg keeps the SCRATCH REPO's name spellable. The org is one path segment of

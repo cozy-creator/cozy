@@ -35,6 +35,19 @@ func TestModelTransferInstructionIsSourceFirstAndPlacementIsFrozen(t *testing.T)
 	}
 }
 
+func TestModelTransferResourceNeedsHaveOneStrictParser(t *testing.T) {
+	needs, err := modeltransfer.ParseResourceNeeds(1, "ram64g,sm90+,vram80g,cuda13.0+")
+	if err != nil || needs != (modeltransfer.ResourceNeeds{GPUCount: 1, MinSM: 90,
+		VRAMGB: 80, RAMGB: 64}) {
+		t.Fatalf("H3 resource needs = %+v, %v", needs, err)
+	}
+	for _, invalid := range []string{"cudaevil+", "sm90", "vram80g+", "ram0g"} {
+		if _, err := modeltransfer.ParseResourceNeeds(1, invalid); err == nil {
+			t.Errorf("invalid resource %q was accepted", invalid)
+		}
+	}
+}
+
 func TestModelTransferFinalizationCancelAndPartialOutputsStayVisible(t *testing.T) {
 	store, problem := records.Open(t.TempDir() + "/records.db")
 	fatal(t, problem)

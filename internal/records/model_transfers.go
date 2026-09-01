@@ -4,11 +4,18 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 )
+
+var modelTransferSlug = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$`)
+
+const maxModelTransferSourceFiles = 20_000
+const maxExactJSONInteger = (int64(1) << 53) - 1
 
 var modelTransferSchema = []string{`
 CREATE TABLE IF NOT EXISTS request_model_transfers (
@@ -142,17 +149,40 @@ func NormalizeModelTransferIntent(intent *ModelTransferIntent) *exit.Error {
 		len(intent.Outputs) == 0 {
 		return exit.New(exit.Validation, "model transfer intent is incomplete")
 	}
+	if intent.GPUCount < 0 || intent.MinSM < 0 || intent.VRAMGB < 0 || intent.RAMGB < 0 {
+		return exit.New(exit.Validation, "model transfer resource floors are non-negative")
+	}
+	localSource := strings.HasPrefix(intent.Source, "file:") || strings.HasPrefix(intent.Source, "local/")
+	if intent.LocalOnly != localSource {
+		return exit.New(exit.Validation, "model transfer local_only does not match its source")
+	}
+	parts := strings.Split(intent.Destination, "/")
+	if intent.Kind == "model-upload" {
+		if len(parts) != 2 || parts[0] == "local" || !modelTransferSlug.MatchString(parts[0]) ||
+			!modelTransferSlug.MatchString(parts[1]) {
+			return exit.New(exit.Validation, "model upload destination is not one org/model")
+		}
+	} else if len(parts) != 2 || parts[0] != "local" || !modelTransferSlug.MatchString(parts[1]) {
+		return exit.New(exit.Validation, "model download destination is not local/name")
+	}
 	intent.SourceFiles = append([]ModelTransferSourceFile(nil), intent.SourceFiles...)
+	if len(intent.SourceFiles) > maxModelTransferSourceFiles {
+		return exit.New(exit.Validation, "model transfer source inventory exceeds %d files",
+			maxModelTransferSourceFiles)
+	}
 	sort.Slice(intent.SourceFiles, func(i, j int) bool {
 		return intent.SourceFiles[i].Member < intent.SourceFiles[j].Member
 	})
 	previousFile := ""
+	var sourceBytes int64
 	for _, file := range intent.SourceFiles {
 		_, digestErr := canonical.Raw("sha256:" + file.SHA256)
 		if file.Member == "" || file.Member <= previousFile || file.Length <= 0 ||
+			file.Length > maxExactJSONInteger-sourceBytes ||
 			digestErr != nil {
 			return exit.New(exit.Validation, "model transfer source inventory is invalid")
 		}
+		sourceBytes += file.Length
 		previousFile = file.Member
 	}
 	if _, err := canonical.Raw(intent.SourceSelection); err != nil {
