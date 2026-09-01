@@ -34,7 +34,7 @@ var livePackageE2E = flag.String("live-package-e2e", "", "real worker package E2
 var livePrivatePackageE2E = flag.String("live-private-package-e2e", "",
 	"real worker private-package E2E config JSON")
 var liveProductionDescriptor = flag.String("live-production-descriptor", "",
-	"exact published model-production descriptor JSON")
+	"exact published ordinary H3 producer descriptor JSON")
 var liveQuantizeDescriptor = flag.String("live-quantize-descriptor", "",
 	"exact published quantization descriptor JSON")
 
@@ -46,17 +46,15 @@ func TestLiveModelProductionDescriptor(t *testing.T) {
 	must(t, err)
 	descriptor, problem := launch.DecodeDescriptor(raw)
 	fatal(t, problem)
-	production, problem := descriptor.Production("four-lane")
+	producer, problem := descriptor.Function("four-lane")
 	fatal(t, problem)
-	ordered, problem := production.OrderedSteps()
-	fatal(t, problem)
-	if len(ordered) != 10 || len(production.Outputs) != 4 || len(production.Sources) != 2 {
-		t.Fatalf("published production shape = %d steps, %d outputs, %d sources",
-			len(ordered), len(production.Outputs), len(production.Sources))
+	if producer.Kind != "job" || len(producer.ArtifactOutputs) != 4 || len(producer.Models) != 2 {
+		t.Fatalf("published producer shape = kind %s, %d outputs, %d sources",
+			producer.Kind, len(producer.ArtifactOutputs), len(producer.Models))
 	}
 	outputs := map[string]bool{}
-	for _, output := range production.Outputs {
-		outputs[output.Name] = true
+	for _, output := range producer.ArtifactOutputs {
+		outputs[output.OutputID] = output.RequiredContract != nil
 	}
 	for _, name := range []string{"bf16-full", "bf16-adaln-pruned", "fp8-adaln-pruned",
 		"mxfp8-adaln-pruned"} {
@@ -64,11 +62,10 @@ func TestLiveModelProductionDescriptor(t *testing.T) {
 			t.Fatalf("published production omits output %s", name)
 		}
 	}
-	for _, step := range ordered {
-		if !strings.HasPrefix(step.Callable, "tensorhub/minimax-h3-tools/") &&
-			!strings.HasPrefix(step.Callable, "tensorhub/quantize/") {
-			t.Fatalf("production step %s references unexpected callable %s", step.Name,
-				step.Callable)
+	for _, model := range producer.Models {
+		if !strings.HasPrefix(model.SourceProfile, "hf/minimax-h3/") {
+			t.Fatalf("producer input %s has unexpected source profile %s", model.Param,
+				model.SourceProfile)
 		}
 	}
 }

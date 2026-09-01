@@ -205,7 +205,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS rentals_machine_name
 func recoverablePackageGeneration(t *testing.T, root, id, pkg string) records.PackageInstall {
 	t.Helper()
 	dir := filepath.Join(root, "generations", id)
-	descriptor := []byte(`{"application":"proof:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[]}`)
+	descriptor := []byte(`{"application":"proof:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[]}`)
 	placement := []byte(`{"format":"cozy.worker.v1.PlacementSet/1","placements":[]}`)
 	descriptorDigest := testSHA256(descriptor)
 	placementDigest := testSHA256(placement)

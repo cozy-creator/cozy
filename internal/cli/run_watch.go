@@ -23,7 +23,7 @@ func handleRunWatch(ctx *Context) *exit.Error {
 		return problem
 	}
 	switch {
-	case strings.HasPrefix(id, "modelupload-"):
+	case strings.HasPrefix(id, "modelupload-") || strings.HasPrefix(id, "modeldownload-"):
 		state, problem := client.ModelProduction(id)
 		if problem != nil {
 			return problem

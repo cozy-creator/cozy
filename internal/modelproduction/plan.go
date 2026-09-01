@@ -16,12 +16,18 @@ import (
 )
 
 type JobPin struct {
-	Step          string
-	Callable      string
-	InstallID     string
-	Release       string
-	ReleaseDigest string
-	DescriptorID  string
+	Callable      string `json:"callable"`
+	Package       string `json:"package"`
+	Function      string `json:"function"`
+	InstallID     string `json:"install_id,omitempty"`
+	Release       string `json:"release"`
+	ReleaseDigest string `json:"release_digest"`
+	DescriptorID  string `json:"descriptor_id"`
+}
+
+type OutputPin struct {
+	Name             string                        `json:"name"`
+	RequiredContract *launch.ArtifactModelContract `json:"required_contract,omitempty"`
 }
 
 type SourceFile struct {
@@ -34,11 +40,12 @@ type SourceFile struct {
 // selector is resolved. Its identity deliberately excludes every resolved release,
 // descriptor, source inventory, worker, rental, price, credential, and attempt fact.
 type Instruction struct {
+	Kind        string `json:"kind"`
 	Destination string `json:"destination"`
 	Source      string `json:"source"`
 	InputLane   string `json:"input_lane,omitempty"`
-	Producer    string `json:"producer"`
-	Rental      bool   `json:"rental"`
+	Producer    string `json:"producer,omitempty"`
+	Placement   string `json:"placement,omitempty"`
 }
 
 func (i Instruction) Bytes() ([]byte, error) { return json.Marshal(i) }
@@ -72,8 +79,12 @@ func (i Instruction) Digest() (string, error) {
 
 func (i Instruction) ID() string {
 	data, _ := i.Bytes()
-	sum := sha256.Sum256(append([]byte("cozy-model-upload-instruction/1\x00"), data...))
-	return "modelupload-" + hex.EncodeToString(sum[:])
+	sum := sha256.Sum256(append([]byte("cozy-model-transfer-instruction/1\x00"), data...))
+	prefix := "modelupload-"
+	if i.Kind == "model-download" {
+		prefix = "modeldownload-"
+	}
+	return prefix + hex.EncodeToString(sum[:])
 }
 
 type Plan struct {
@@ -89,8 +100,9 @@ type Plan struct {
 	ProducerRelease   string
 	ProducerDigest    string
 	DescriptorDigest  string
-	Production        *launch.ModelProduction
-	Jobs              []JobPin
+	Job               *JobPin
+	SourceProfiles    map[string]string
+	Outputs           []OutputPin
 	Resources         ResourceNeeds
 }
 
@@ -150,15 +162,10 @@ func (p Plan) ID() string {
 		_, _ = io.WriteString(hash, value)
 		_, _ = hash.Write([]byte{0})
 	}
-	if p.Production != nil {
-		_, _ = io.WriteString(hash, p.Production.Name)
-		_, _ = hash.Write([]byte{0})
-	}
-	jobs := append([]JobPin(nil), p.Jobs...)
-	sort.Slice(jobs, func(i, j int) bool { return jobs[i].Step < jobs[j].Step })
-	for _, job := range jobs {
+	if p.Job != nil {
+		job := *p.Job
 		for _, value := range []string{
-			job.Step, job.Callable, job.InstallID, job.Release, job.ReleaseDigest,
+			job.Callable, job.Package, job.Function, job.InstallID, job.Release, job.ReleaseDigest,
 			job.DescriptorID,
 		} {
 			_, _ = io.WriteString(hash, value)
@@ -174,23 +181,17 @@ func (p Plan) ID() string {
 }
 
 func (p Plan) OutputNames() []string {
-	if p.Production == nil {
-		return nil
-	}
-	names := make([]string, 0, len(p.Production.Outputs))
-	for _, output := range p.Production.Outputs {
+	names := make([]string, 0, len(p.Outputs))
+	for _, output := range p.Outputs {
 		names = append(names, output.Name)
 	}
 	sort.Strings(names)
 	return names
 }
 
-func (p Plan) SourceProfiles() []string {
-	if p.Production == nil {
-		return nil
-	}
-	profiles := make([]string, 0, len(p.Production.Sources))
-	for _, profile := range p.Production.Sources {
+func (p Plan) ProfileNames() []string {
+	profiles := make([]string, 0, len(p.SourceProfiles))
+	for _, profile := range p.SourceProfiles {
 		profiles = append(profiles, profile)
 	}
 	sort.Strings(profiles)

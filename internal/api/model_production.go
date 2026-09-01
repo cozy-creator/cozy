@@ -156,7 +156,7 @@ func (s *Server) cancelModelProduction(w http.ResponseWriter, r *http.Request) {
 func (s *Server) modelProductionState(operation records.ModelProductionOperation,
 	changed bool,
 ) (ModelProductionState, *exit.Error) {
-	state := ModelProductionState{ID: operation.ID, Kind: "model-upload",
+	state := ModelProductionState{ID: operation.ID,
 		Status: operation.State, StepIndex: operation.StepIndex, Rental: operation.RentalID,
 		CancelRequested: operation.CancelRequested, ErrorCode: operation.SafeCode,
 		Error: operation.SafeDetail, CreatedAt: operation.CreatedAt, UpdatedAt: operation.UpdatedAt,
@@ -173,6 +173,7 @@ func (s *Server) modelProductionState(operation records.ModelProductionOperation
 	}
 	if instruction != nil {
 		state.Model, state.Source = instruction.Destination, instruction.Source
+		state.Kind = instruction.Kind
 		state.Producer = instruction.Producer
 	} else {
 		parsed, err := modelproduction.Parse(operation.Plan)
@@ -181,13 +182,18 @@ func (s *Server) modelProductionState(operation records.ModelProductionOperation
 		}
 		plan = &parsed
 		state.Model, state.Source = plan.Destination, plan.Source
-		state.Producer, state.Outputs, state.Steps = plan.Producer, plan.OutputNames(), len(plan.Jobs)
+		state.Kind, state.Producer, state.Outputs = plan.Instruction.Kind, plan.Producer, plan.OutputNames()
+		if plan.Job != nil {
+			state.Steps = 1
+		}
 	}
 	switch {
 	case operation.State == "cleanup_pending":
 		state.Cleanup = "pending"
 	case (operation.State == "completed" || operation.State == "partial") && operation.RentalID != "":
 		state.Cleanup = "provider_absent"
+	case operation.State == "completed" || operation.State == "partial":
+		state.Cleanup = "settled"
 	case operation.State == "failed" || operation.State == "canceled":
 		state.Cleanup = "settled"
 	default:
@@ -198,12 +204,12 @@ func (s *Server) modelProductionState(operation records.ModelProductionOperation
 		return state, problem
 	}
 	if plan != nil {
-		bySource := make(map[string]records.ModelProductionArtifact, len(artifacts))
+		byOutput := make(map[string]records.ModelProductionArtifact, len(artifacts))
 		for _, artifact := range artifacts {
-			bySource[artifact.StepName+"."+artifact.OutputSlot] = artifact
+			byOutput[artifact.OutputSlot] = artifact
 		}
-		for _, output := range plan.Production.Outputs {
-			artifact, ok := bySource[output.Source]
+		for _, output := range plan.Outputs {
+			artifact, ok := byOutput[output.Name]
 			if ok && artifact.PublicationID != "" && artifact.ManifestID != "" {
 				if state.Checkpoints == nil {
 					state.Checkpoints = map[string]string{}

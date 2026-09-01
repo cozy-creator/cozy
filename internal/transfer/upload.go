@@ -56,6 +56,10 @@ type Upload struct {
 	// Empty uses Ref. A local/name alias can therefore publish to an unrelated
 	// remote org/name without pretending the destination already owns its bytes.
 	EvidenceRef hub.Ref
+	// CheckpointEvidence is the exact ArtifactSink evidence for an unretained local
+	// output. When present, it avoids inventing a temporary repository merely so
+	// the privileged transfer finalizer can read bytes it already owns.
+	CheckpointEvidence []byte
 	// ManifestID is the local canonical manifest being published.
 	ManifestID string
 	Session    string
@@ -84,6 +88,7 @@ type Result struct {
 	Deduped        int64
 	Manifest       hub.ManifestRef
 	TopologyDigest string
+	EncodingSet    []string
 	Dup            bool
 	MS             map[string]int64
 }
@@ -112,10 +117,14 @@ func (p *Upload) Run(ctx context.Context) (Result, *exit.Error) {
 	if evidenceRef.Org == "" {
 		evidenceRef = p.Ref
 	}
-	evidence, e := p.Tool.CheckpointEvidence(evidenceRef.Org, evidenceRef.Name, p.ManifestID,
-		filepath.Join(p.Scratch, "repo-releases.jsonl"))
-	if e != nil {
-		return res, e
+	evidence := append([]byte(nil), p.CheckpointEvidence...)
+	if len(evidence) == 0 {
+		var e *exit.Error
+		evidence, e = p.Tool.CheckpointEvidence(evidenceRef.Org, evidenceRef.Name, p.ManifestID,
+			filepath.Join(p.Scratch, "repo-releases.jsonl"))
+		if e != nil {
+			return res, e
+		}
 	}
 	objects, e := p.Tool.ManifestObjects(p.ManifestID, filepath.Join(p.Scratch, "objects.jsonl"))
 	if e != nil {
@@ -232,6 +241,7 @@ func (p *Upload) finalize(ctx context.Context, request hub.FinalizePublicationRe
 		return res, exit.Internalf("Tensorhub retained a different checkpoint identity")
 	}
 	res.Manifest, res.TopologyDigest, res.Verified = checkpoint.Manifest, checkpoint.TopologyDigest, checkpoint.Objects
+	res.EncodingSet = append([]string(nil), checkpoint.Contract.Encoding.Set...)
 	res.Dup = checkpoint.Duplicate
 	if checkpoint.Duplicate {
 		p.say("this exact checkpoint was already retained")

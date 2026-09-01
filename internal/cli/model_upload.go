@@ -1,6 +1,9 @@
 package cli
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,7 +20,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/modelproduction"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/output"
-	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
 type publishSource struct {
@@ -32,67 +34,85 @@ type publishSource struct {
 }
 
 type producerPlan struct {
-	Name          string
-	InstallID     string
-	Release       string
-	ReleaseDigest string
-	Descriptor    *launch.PackageDescriptor
-	Production    *launch.ModelProduction
-	Jobs          []modelproduction.JobPin
-	GPUCount      int64
-	Requires      []string
-	Needs         modelproduction.ResourceNeeds
+	Name           string
+	InstallID      string
+	Release        string
+	ReleaseDigest  string
+	Descriptor     *launch.PackageDescriptor
+	Job            *launch.Entrypoint
+	Pin            modelproduction.JobPin
+	SourceProfiles map[string]string
+	Outputs        []modelproduction.OutputPin
+	GPUCount       int64
+	Requires       []string
+	Needs          modelproduction.ResourceNeeds
 }
 
 func handleModelUpload(ctx *Context) *exit.Error {
-	destination, problem := hub.ParseRef(ctx.Inv.Args[0])
-	if problem != nil {
-		return problem
-	}
-	if destination.Org == "local" {
-		return exit.Usagef("local/ is reserved for private aliases and cannot be a Tensorhub destination").
-			WithRemedy("publish under your Tensorhub account, for example alice/%s", destination.Name)
-	}
-	dryRun := ctx.Inv.Bool("--dry-run")
-	rental := ctx.Inv.Bool("--rental")
-	detach := ctx.Inv.Bool("--detach")
-	producerName := strings.TrimSpace(ctx.Inv.Value("--producer"))
-	_, manifestProblem := tfs.ManifestID(ctx.Inv.Args[1])
-	direct := producerName == "" && !rental &&
-		(strings.HasPrefix(ctx.Inv.Args[1], "local/") || manifestProblem == nil)
+	return handleModelTransfer(ctx, "model-upload")
+}
 
-	if dryRun && detach {
-		return exit.Usagef("--dry-run and --detach conflict: a dry-run creates no durable operation")
-	}
-	if !dryRun && !direct && (!rental || producerName == "") {
-		return exit.Named(exit.Unavailable, "model_upload_execution_unavailable",
-			"model production execution requires both --rental and --producer").
-			WithRemedy("use --dry-run to inspect another source or producer mode")
-	}
-	if direct {
-		if detach {
-			return exit.Usagef("--detach requires a durable model production")
-		}
-		return handleDirectModelUpload(ctx)
-	}
-	if rental {
-		if problem := validateRunPlacement(ctx); problem != nil {
+func handleModelDownload(ctx *Context) *exit.Error {
+	return handleModelTransfer(ctx, "model-download")
+}
+
+func handleModelTransfer(ctx *Context, kind string) *exit.Error {
+	sourceArg, destinationArg := ctx.Inv.Args[0], strings.TrimSpace(ctx.Inv.Args[1])
+	destination := destinationArg
+	if kind == "model-upload" {
+		ref, problem := hub.ParseRef(destinationArg)
+		if problem != nil {
 			return problem
 		}
+		if ref.Org == "local" {
+			return exit.Usagef("local/ is reserved for private aliases and cannot be a Tensorhub destination").
+				WithRemedy("upload under your Tensorhub account, for example alice/%s", ref.Name)
+		}
+		destination = ref.String()
+	} else {
+		if !strings.HasPrefix(destinationArg, "local/") {
+			return exit.Usagef("model download destination %q is not local/name", destinationArg)
+		}
+		if problem := modelsource.LocalName(strings.TrimPrefix(destinationArg, "local/")); problem != nil {
+			return problem
+		}
+		if rentalRequested(ctx) {
+			return exit.Named(exit.Unavailable, "model_download.rented_return_unavailable",
+				"rented model download cannot yet return an output to local TensorFS").
+				WithRemedy("run without --rental or --rental-only; tracked remote-return support is not landed")
+		}
 	}
+	if ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--await") {
+		return exit.Usagef("--dry-run and --await conflict: a dry-run creates no durable run")
+	}
+	if problem := validateRunPlacement(ctx); problem != nil {
+		return problem
+	}
+	producerName := strings.TrimSpace(ctx.Inv.Value("--producer"))
 	if producerName != "" {
 		if _, problem := parseProductionCallable(producerName); problem != nil {
 			return problem
 		}
 	}
-	instructionSource, problem := canonicalProductionSource(ctx, ctx.Inv.Args[1])
+	if producerName == "" && rentalRequested(ctx) {
+		return exit.Named(exit.Unavailable, "model_transfer.rented_pass_through_unavailable",
+			"rented pass-through cannot choose a TensorFS source profile without a producer job").
+			WithRemedy("omit the rental flag for local pass-through, or select a typed --producer")
+	}
+	instructionSource, problem := canonicalProductionSource(ctx, sourceArg)
 	if problem != nil {
 		return problem
 	}
-	instruction := modelproduction.Instruction{Destination: destination.String(),
+	placement := ""
+	if ctx.Inv.Bool("--rental") {
+		placement = "rental"
+	} else if ctx.Inv.Bool("--rental-only") {
+		placement = "rental-only"
+	}
+	instruction := modelproduction.Instruction{Kind: kind, Destination: destination,
 		Source: instructionSource, InputLane: strings.TrimSpace(ctx.Inv.Value("--lane")),
-		Producer: producerName, Rental: rental}
-	if !dryRun {
+		Producer: producerName, Placement: placement}
+	if !ctx.Inv.Bool("--dry-run") {
 		daemonState, _, problem := ensureDaemon(ctx)
 		if problem != nil {
 			return problem
@@ -106,13 +126,13 @@ func handleModelUpload(ctx *Context) *exit.Error {
 		if problem != nil {
 			return problem
 		}
-		if detach {
-			return emitModelProductionState(ctx, productionState, productionState.Changed)
+		if ctx.Inv.Bool("--await") {
+			return followModelProduction(ctx, local, productionState)
 		}
-		return followModelProduction(ctx, local, productionState)
+		return emitModelProductionState(ctx, productionState, true)
 	}
 
-	source, problem := resolvePublishSource(ctx, ctx.Inv.Args[1])
+	source, problem := resolvePublishSource(ctx, sourceArg)
 	if problem != nil {
 		return problem
 	}
@@ -122,7 +142,7 @@ func handleModelUpload(ctx *Context) *exit.Error {
 	}
 	plan := modelproduction.Plan{
 		Instruction: instruction,
-		Destination: destination.String(),
+		Destination: destination,
 		Source:      source.Canonical, SourceSelection: source.Selection,
 		SourceLicense: source.License, InputLane: source.Lane,
 		SourceFiles: source.Exact,
@@ -131,36 +151,51 @@ func handleModelUpload(ctx *Context) *exit.Error {
 		plan.Producer, plan.ProducerInstallID = producer.Name, producer.InstallID
 		plan.ProducerRelease = producer.Release
 		plan.ProducerDigest, plan.DescriptorDigest = producer.ReleaseDigest, producer.Descriptor.Digest
-		plan.Production, plan.Jobs = producer.Production, producer.Jobs
+		pin := producer.Pin
+		plan.Job, plan.SourceProfiles, plan.Outputs = &pin, producer.SourceProfiles, producer.Outputs
 		plan.Resources = producer.Needs
+	} else {
+		plan.Outputs = []modelproduction.OutputPin{{Name: "model"}}
 	}
-	if _, problem := ownedPublication(ctx, destination); problem != nil {
-		return problem
+	if kind == "model-download" && len(plan.Outputs) != 1 {
+		return exit.Named(exit.Unavailable, "model_download.multiple_outputs_unavailable",
+			"model download producer %s emits %d outputs; one local alias currently retains exactly one",
+			producerName, len(plan.Outputs)).WithRemedy(
+			"use a one-output producer or model upload until tracked multi-output local aliases land")
 	}
-	fields := []output.Field{
-		{K: "id", V: plan.ID()}, {K: "kind", V: "model-upload"},
-		{K: "model", V: destination.String()},
-		{K: "source", V: source.Canonical}, {K: "source_selection", V: source.Selection},
-		{K: "source_files", V: source.Files}, {K: "source_bytes", V: output.Bytes(source.Bytes)},
-		{K: "status", V: "planned"}, {K: "changed", V: false},
+	id := plan.ID()
+	if ctx.Inv.Bool("--dry-run") {
+		if kind == "model-upload" {
+			ref, _ := hub.ParseRef(destination)
+			if _, problem := ownedPublication(ctx, ref); problem != nil {
+				return problem
+			}
+		}
+		fields := []output.Field{
+			{K: "id", V: id}, {K: "kind", V: kind},
+			{K: "model", V: destination},
+			{K: "source", V: source.Canonical}, {K: "source_selection", V: source.Selection},
+			{K: "source_files", V: source.Files}, {K: "source_bytes", V: output.Bytes(source.Bytes)},
+			{K: "status", V: "planned"}, {K: "changed", V: false},
+		}
+		if producer != nil {
+			fields = append(fields,
+				output.Field{K: "producer", V: producer.Name + "@" + producer.Release},
+				output.Field{K: "source_profiles", V: plan.ProfileNames()},
+				output.Field{K: "steps", V: 1},
+				output.Field{K: "outputs", V: plan.OutputNames()},
+				output.Field{K: "gpu_count", V: producer.GPUCount},
+				output.Field{K: "requires", V: producer.Requires},
+			)
+		}
+		defaults := []string{"id", "kind", "model", "source"}
+		if producer != nil {
+			defaults = append(defaults, "producer", "outputs")
+		}
+		defaults = append(defaults, "status", "changed")
+		return emit(ctx, compactRecord(fields, defaults...))
 	}
-	if producer != nil {
-		fields = append(fields,
-			output.Field{K: "producer", V: producer.Name + "@" + producer.Release},
-			output.Field{K: "production", V: producer.Production.Name},
-			output.Field{K: "source_profiles", V: plan.SourceProfiles()},
-			output.Field{K: "steps", V: len(producer.Jobs)},
-			output.Field{K: "outputs", V: plan.OutputNames()},
-			output.Field{K: "gpu_count", V: producer.GPUCount},
-			output.Field{K: "requires", V: producer.Requires},
-		)
-	}
-	defaults := []string{"id", "kind", "model", "source"}
-	if producer != nil {
-		defaults = append(defaults, "producer", "production", "outputs")
-	}
-	defaults = append(defaults, "status", "changed")
-	return emit(ctx, compactRecord(fields, defaults...))
+	return nil
 }
 
 func canonicalProductionSource(ctx *Context, raw string) (string, *exit.Error) {
@@ -233,7 +268,21 @@ func resolvePublishSource(ctx *Context, raw string) (publishSource, *exit.Error)
 				return publishSource{}, exit.Usagef("a local model file cannot be read by a rented worker").
 					WithRemedy("import it locally or use an addressable pinned foreign source")
 			}
-			return publishSource{Canonical: parsed.Canonical, Files: 1, Bytes: parsed.Bytes}, nil
+			file, err := os.Open(parsed.Path)
+			if err != nil {
+				return publishSource{}, exit.New(exit.NotFound, "cannot open local model source: %s", err)
+			}
+			defer file.Close()
+			hash := sha256.New()
+			length, err := io.Copy(hash, file)
+			if err != nil || length != parsed.Bytes {
+				return publishSource{}, exit.Named(exit.Conflict, "model_source.local_changed",
+					"local model source changed while measuring its exact identity")
+			}
+			digest := hex.EncodeToString(hash.Sum(nil))
+			return publishSource{Canonical: parsed.Canonical, Selection: "sha256:" + digest,
+				Files: 1, Bytes: parsed.Bytes, Exact: []modelproduction.SourceFile{{
+					Member: filepath.Base(parsed.Path), SHA256: digest, Length: parsed.Bytes}}}, nil
 		}
 		var token = ctx.Cfg.HuggingFaceToken
 		if parsed.Kind == modelsource.Civitai {
@@ -297,73 +346,43 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 	if raw == "" {
 		return nil, nil
 	}
-	parts := strings.Split(raw, "/")
-	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return nil, exit.Usagef("--producer %q is not org/package[@vN]/production", raw)
-	}
-	packageName := parts[0] + "/" + parts[1]
-	producerSelector, problem := packageref.ParseRef(packageName)
+	target, problem := parseProductionCallable(raw)
 	if problem != nil {
 		return nil, problem
 	}
-	remote := ctx.Inv.Bool("--rental")
-	packages := map[string]productionPackage{}
-	selected, problem := resolveProductionPackage(ctx, producerSelector.String(), remote, packages)
+	selected, problem := resolveProductionPackage(ctx, target.Selector, rentalRequested(ctx))
 	if problem != nil {
 		return nil, problem
-	}
-	if major, majorProblem := packageref.MajorOf(selected.Release); majorProblem == nil {
-		// Self-steps select the producer's major but must reuse the already-frozen
-		// producer release, even if the catalog advances during this one plan.
-		packages[producerSelector.Package+"@v"+strconv.Itoa(major)] = selected
 	}
 	descriptor := selected.Descriptor
-	production, problem := descriptor.Production(parts[2])
-	if problem != nil {
+	job, problem := descriptor.Function(target.Function)
+	if problem != nil || job.Kind != "job" {
+		return nil, exit.Named(exit.Validation, "model_producer.not_job",
+			"--producer %s does not name one ordinary job callable", raw)
+	}
+	if problem := validateProducerJob(raw, job); problem != nil {
 		return nil, problem
 	}
-	ordered, problem := production.OrderedSteps()
-	if problem != nil {
-		return nil, problem
-	}
-	plan := &producerPlan{Name: raw, InstallID: selected.InstallID, Release: selected.Release,
+	plan := &producerPlan{Name: target.Selector + "/" + target.Function,
+		InstallID: selected.InstallID, Release: selected.Release,
 		ReleaseDigest: selected.ReleaseDigest,
-		Descriptor:    descriptor, Production: production}
+		Descriptor:    descriptor, Job: job, GPUCount: job.Resources.GPUCount,
+		SourceProfiles: map[string]string{}}
+	plan.Pin = modelproduction.JobPin{Callable: plan.Name, Package: target.Package,
+		Function: target.Function, InstallID: selected.InstallID, Release: selected.Release,
+		ReleaseDigest: selected.ReleaseDigest, DescriptorID: job.DescriptorID}
+	for _, slot := range job.Models {
+		plan.SourceProfiles[slot.Param] = slot.SourceProfile
+	}
+	for _, output := range job.ArtifactOutputs {
+		plan.Outputs = append(plan.Outputs, modelproduction.OutputPin{Name: output.OutputID,
+			RequiredContract: output.RequiredContract})
+	}
 	requires := map[string]bool{}
-	for _, step := range ordered {
-		target, parseProblem := parseProductionCallable(step.Callable)
-		if parseProblem != nil {
-			return nil, exit.Named(exit.Validation, "model_production_callable_invalid",
-				"production step %s does not name one job callable", step.Name)
+	for _, token := range strings.Split(job.Resources.Requires, ",") {
+		if token = strings.TrimSpace(token); token != "" {
+			requires[token] = true
 		}
-		stepPackage, packageProblem := resolveProductionPackage(ctx, target.Selector, remote,
-			packages)
-		if packageProblem != nil {
-			return nil, packageProblem
-		}
-		stepDescriptor := stepPackage.Descriptor
-		job, jobProblem := stepDescriptor.Function(target.Function)
-		if jobProblem != nil || job.Kind != "job" {
-			return nil, exit.Named(exit.Validation, "model_production_callable_not_job",
-				"production step %s callable %s is not one job", step.Name, step.Callable)
-		}
-		if validation := validateProductionInvocation(step, job); validation != nil {
-			return nil, validation
-		}
-		gpu := max(step.Resources.GPUCount, job.Resources.GPUCount)
-		plan.GPUCount = max(plan.GPUCount, gpu)
-		for _, value := range []string{step.Resources.Requires, job.Resources.Requires} {
-			for _, token := range strings.Split(value, ",") {
-				if token = strings.TrimSpace(token); token != "" {
-					requires[token] = true
-				}
-			}
-		}
-		plan.Jobs = append(plan.Jobs, modelproduction.JobPin{
-			Step: step.Name, Callable: step.Callable, Release: stepPackage.Release,
-			InstallID: stepPackage.InstallID, ReleaseDigest: stepPackage.ReleaseDigest,
-			DescriptorID: job.DescriptorID,
-		})
 	}
 	for token := range requires {
 		plan.Requires = append(plan.Requires, token)
@@ -381,17 +400,12 @@ type productionPackage struct {
 	Descriptor                        *launch.PackageDescriptor
 }
 
-func resolveProductionPackage(ctx *Context, packageName string, remote bool,
-	cache map[string]productionPackage,
-) (productionPackage, *exit.Error) {
+func resolveProductionPackage(ctx *Context, packageName string, remote bool) (productionPackage, *exit.Error) {
 	selector, problem := packageref.ParseRef(packageName)
 	if problem != nil {
 		return productionPackage{}, problem
 	}
 	key := selector.String()
-	if selected, ok := cache[key]; ok {
-		return selected, nil
-	}
 	if !remote {
 		install, problem := installedPackage(ctx, key)
 		if problem != nil {
@@ -404,7 +418,6 @@ func resolveProductionPackage(ctx *Context, packageName string, remote bool,
 		}
 		selected := productionPackage{InstallID: install.ID, Release: install.Version,
 			ReleaseDigest: install.SourceDigest, Descriptor: facts.PackageDescriptor}
-		cache[key] = selected
 		return selected, nil
 	}
 
@@ -464,7 +477,6 @@ func resolveProductionPackage(ctx *Context, packageName string, remote bool,
 	}
 	selected := productionPackage{Release: release, ReleaseDigest: detail.Release.ReleaseDigest,
 		Descriptor: descriptor}
-	cache[key] = selected
 	return selected, nil
 }
 
@@ -510,6 +522,9 @@ func productionResourceNeeds(gpuCount int64, requires []string) (modelproduction
 			needs.RAMGB = max(needs.RAMGB, amount)
 		}
 	}
+	if needs.GPUCount == 0 && needs.MinSM == 0 && needs.VRAMGB == 0 {
+		return needs, nil
+	}
 	if needs.GPUCount != 1 || needs.MinSM == 0 || needs.VRAMGB == 0 || needs.RAMGB == 0 {
 		return needs, exit.Named(exit.Validation, "model_production_resources_incomplete",
 			"rented model production requires exactly one GPU plus explicit smN+, vramNg, and ramNg floors")
@@ -517,52 +532,32 @@ func productionResourceNeeds(gpuCount int64, requires []string) (modelproduction
 	return needs, nil
 }
 
-func validateProductionInvocation(step launch.ModelProductionStep, job *launch.Entrypoint) *exit.Error {
-	models := map[string]bool{}
-	for _, slot := range job.Models {
-		models[slot.Param] = true
+func validateProducerJob(name string, job *launch.Entrypoint) *exit.Error {
+	if len(job.Models) == 0 {
+		return exit.Named(exit.Validation, "model_producer.source_inputs_absent",
+			"producer job %s has no typed model input", name)
 	}
-	if !sameNames(models, keys(step.Models)) {
-		return exit.Named(exit.Validation, "model_production_model_inputs_mismatch",
-			"production step %s model inputs do not match job %s", step.Name, job.Name)
+	for _, slot := range job.Models {
+		if slot.SourceProfile == "" {
+			return exit.Named(exit.Validation, "model_producer.source_profile_absent",
+				"producer job %s model input %s has no TensorFS source profile", name, slot.Param)
+		}
 	}
 	for _, field := range job.Request.Fields {
 		if field.Wire == "required" {
-			return exit.Named(exit.Validation, "model_production_argument_missing",
-				"production step %s job %s requires argument %s", step.Name, job.Name, field.Name)
+			return exit.Named(exit.Validation, "model_producer.argument_missing",
+				"producer job %s requires argument %s", name, field.Name)
 		}
 	}
-	outputs := map[string]bool{}
+	if len(job.ArtifactOutputs) == 0 {
+		return exit.Named(exit.Validation, "model_producer.outputs_absent",
+			"producer job %s has no ArtifactSink model output", name)
+	}
 	for _, output := range job.ArtifactOutputs {
-		outputs[output.OutputID] = true
-	}
-	wanted := make(map[string]bool, len(step.Outputs))
-	for _, output := range step.Outputs {
-		wanted[output] = true
-	}
-	if !sameNames(outputs, wanted) {
-		return exit.Named(exit.Validation, "model_production_outputs_mismatch",
-			"production step %s outputs do not match job %s ArtifactSink slots", step.Name, job.Name)
+		if output.RequiredContract == nil {
+			return exit.Named(exit.Validation, "model_producer.output_contract_absent",
+				"producer job %s output %s has no required model contract", name, output.OutputID)
+		}
 	}
 	return nil
-}
-
-func keys(values map[string]string) map[string]bool {
-	out := make(map[string]bool, len(values))
-	for key := range values {
-		out[key] = true
-	}
-	return out
-}
-
-func sameNames(first, second map[string]bool) bool {
-	if len(first) != len(second) {
-		return false
-	}
-	for name := range first {
-		if !second[name] {
-			return false
-		}
-	}
-	return true
 }

@@ -597,7 +597,7 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane str
 
 func handleRunCancel(ctx *Context) *exit.Error {
 	id := ctx.Inv.Args[0]
-	if strings.HasPrefix(id, "modelupload-") {
+	if strings.HasPrefix(id, "modelupload-") || strings.HasPrefix(id, "modeldownload-") {
 		return handleModelProductionCancel(ctx)
 	}
 	if strings.HasPrefix(id, "job-") {

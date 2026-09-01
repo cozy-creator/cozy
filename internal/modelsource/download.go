@@ -58,9 +58,9 @@ func (r *Resolver) Stage(ctx context.Context, plan Plan, root string, headersOnl
 		need = plan.Bytes + missing + 512<<20
 	}
 	if free, err := availableBytes(root); err == nil && uint64(need) > free {
-		return nil, exit.Named(exit.Capacity, "model_import_disk_shortfall",
-			"model import needs %d bytes of staging/store headroom; %d bytes are free", need, free).
-			WithRemedy("free local disk space or import on a rented worker")
+		return nil, exit.Named(exit.Capacity, "model_transfer.disk_shortfall",
+			"model transfer needs %d bytes of staging/store headroom; %d bytes are free", need, free).
+			WithRemedy("free local disk space or authorize a rented upload")
 	}
 	staged := make([]StagedFile, 0, len(plan.Files))
 	for _, file := range plan.Files {

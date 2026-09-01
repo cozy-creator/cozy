@@ -1,4 +1,4 @@
-// Package modelsource owns the foreign-source spelling accepted by model import.
+// Package modelsource owns the foreign-source spelling accepted by model download/upload.
 // It identifies a source; TensorFS remains the only code that interprets model bytes.
 package modelsource
 
@@ -39,7 +39,7 @@ type Source struct {
 func Parse(raw, cwd string) (Source, *exit.Error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return Source{}, exit.Usagef("model import requires a source")
+		return Source{}, exit.Usagef("model transfer requires a source")
 	}
 	switch {
 	case strings.HasPrefix(raw, "hf://"):

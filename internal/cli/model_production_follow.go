@@ -32,14 +32,14 @@ func followModelProduction(ctx *Context, client *localclient.Client,
 		select {
 		case <-interrupt:
 			if !ctx.Mode().JSON {
-				fmt.Fprintf(ctx.Err, "\ndetached from model production %s; durable work continues\n", state.ID)
+				fmt.Fprintf(ctx.Err, "\ndetached from model transfer %s; durable work continues\n", state.ID)
 			}
 			state.Changed = false
 			return emitModelProductionState(ctx, state, false)
 		case <-ticker.C:
 			current, problem := client.ModelProduction(state.ID)
 			if problem != nil {
-				return problem.WithRemedy("the model production remains durable; reconnect with the same publish instruction")
+				return problem.WithRemedy("the model transfer remains durable; reconnect with `cozy run watch %s`", state.ID)
 			}
 			state = current
 			if state.Status != last {
@@ -53,10 +53,10 @@ func followModelProduction(ctx *Context, client *localclient.Client,
 	}
 	if state.Status == "canceled" {
 		return exit.Named(exit.Canceled, firstNonempty(state.ErrorCode, "model_production.canceled"),
-			"model production %s was canceled: %s", state.ID, state.Error)
+			"model transfer %s was canceled: %s", state.ID, state.Error)
 	}
 	return exit.Named(exit.Failed, firstNonempty(state.ErrorCode, "model_production.failed"),
-		"model production %s failed: %s", state.ID, state.Error)
+		"model transfer %s failed: %s", state.ID, state.Error)
 }
 
 func emitModelProductionState(ctx *Context, state api.ModelProductionState,
@@ -72,7 +72,7 @@ func emitModelProductionState(ctx *Context, state api.ModelProductionState,
 	record := compactRecord(fields, "id", "kind", "model", "status", "outputs",
 		"checkpoints", "cleanup", "changed")
 	if !modelProductionSettled(state.Status) {
-		record.Next = []string{"cozy run cancel " + state.ID}
+		record.Next = []string{"cozy run watch " + state.ID, "cozy run cancel " + state.ID}
 	}
 	return emit(ctx, record)
 }
@@ -116,9 +116,12 @@ func modelProductionStage(state api.ModelProductionState) string {
 	case "resolving":
 		return "resolving immutable source and package releases"
 	case "accepted":
-		return "exact plan accepted; rental selection"
+		return "exact plan accepted; waiting for execution"
 	case "source_preparing":
-		return "source preparation on rental " + state.Rental
+		if state.Rental != "" {
+			return "source preparation on rental " + state.Rental
+		}
+		return "source preparation in local TensorFS"
 	case "source_prepared":
 		return "source prepared; step execution follows"
 	case "step_running":

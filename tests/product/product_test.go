@@ -113,7 +113,7 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 	}
 }
 
-func TestModelProductionGrammar(t *testing.T) {
+func TestModelTransferGrammar(t *testing.T) {
 	root := t.TempDir()
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -126,41 +126,42 @@ func TestModelProductionGrammar(t *testing.T) {
 	if code != 0 || !strings.Contains(help, "<source>") ||
 		strings.Contains(help, "--release") || !strings.Contains(help, "--producer") ||
 		!strings.Contains(help, "--lane") || !strings.Contains(help, "--rental") ||
-		!strings.Contains(help, "--dry-run") || !strings.Contains(help, "--detach") ||
+		!strings.Contains(help, "--rental-only") || !strings.Contains(help, "--dry-run") ||
+		!strings.Contains(help, "--await") || strings.Contains(help, "--detach") ||
 		strings.Contains(help, "<manifest>") || strings.Contains(help, "--token-stdin") ||
 		strings.Contains(help, "--cloud") || strings.Contains(help, "--remote") ||
 		strings.Contains(help, "--machine") || strings.Contains(help, "--max-cost") {
 		t.Fatalf("model upload grammar drifted [exit %d]\n%s", code, help)
 	}
-	code, out := runCozy(t, root, "model", "upload", "acme/model")
-	if code != 2 || !strings.Contains(out, "<source>") {
-		t.Fatalf("model upload accepted missing source [exit %d]\n%s", code, out)
+	code, out := runCozy(t, root, "model", "upload", "source-only")
+	if code != 2 || !strings.Contains(out, "<model>") {
+		t.Fatalf("model upload accepted missing destination [exit %d]\n%s", code, out)
 	}
 	local := filepath.Join(root, "source.safetensors")
 	must(t, os.WriteFile(local, []byte("header-only-grammar-fixture"), 0o600))
-	code, out = runCozyDir(t, root, ".", accountEnv, "--json", "model", "upload", "acme/model", local,
+	code, out = runCozyDir(t, root, ".", accountEnv, "--json", "model", "upload", local, "acme/model",
 		"--dry-run")
 	if code != 0 || !strings.Contains(out, `"kind":"model-upload"`) ||
 		!strings.Contains(out, `"status":"planned"`) || !strings.Contains(out, `"id":"modelupload-`) {
 		t.Fatalf("source-driven dry-run failed [exit %d]\n%s", code, out)
 	}
-	code, out = runCozyDir(t, root, ".", accountEnv, "model", "upload", "other/model", local,
+	code, out = runCozyDir(t, root, ".", accountEnv, "model", "upload", local, "other/model",
 		"--dry-run")
 	if code != 0 || !strings.Contains(out, "status:  planned") || requests != 0 {
 		t.Fatalf("configured publication token was narrowed client-side [exit %d requests %d]\n%s",
 			code, requests, out)
 	}
-	code, out = runCozy(t, root, "model", "upload", "acme/model", local,
-		"--dry-run", "--detach")
+	code, out = runCozy(t, root, "model", "upload", local, "acme/model",
+		"--dry-run", "--await")
 	if code != 2 || !strings.Contains(out, "conflict") {
-		t.Fatalf("dry-run plus detach was accepted [exit %d]\n%s", code, out)
+		t.Fatalf("dry-run plus await was accepted [exit %d]\n%s", code, out)
 	}
 	code, help = runCozy(t, root, "model", "publish", "--help")
 	if code != 0 || strings.Contains(help, "<source>") || !strings.Contains(help, "--release") ||
 		!strings.Contains(help, "--lane") || !strings.Contains(help, "--remove-lane") ||
 		!strings.Contains(help, "last lane") ||
 		strings.Contains(help, "--producer") || strings.Contains(help, "--rental") ||
-		strings.Contains(help, "--dry-run") || strings.Contains(help, "--detach") {
+		strings.Contains(help, "--dry-run") || strings.Contains(help, "--await") {
 		t.Fatalf("model publish grammar drifted [exit %d]\n%s", code, help)
 	}
 	code, out = runCozy(t, root, "model", "publish", "acme/model", "--release", "1.2.3")
@@ -177,8 +178,19 @@ func TestModelProductionGrammar(t *testing.T) {
 		t.Fatalf("model yank grammar drifted [exit %d]\n%s", code, help)
 	}
 	code, help = runCozy(t, root, "model", "download", "--help")
-	if code != 0 || strings.Contains(strings.ToLower(help), "snapshot") {
+	if code != 0 || strings.Contains(strings.ToLower(help), "snapshot") ||
+		!strings.Contains(help, "<source>") || !strings.Contains(help, "<model>") ||
+		!strings.Contains(help, "--producer") || !strings.Contains(help, "--await") ||
+		!strings.Contains(help, "--rental-only") {
 		t.Fatalf("model download retained snapshot vocabulary [exit %d]\n%s", code, help)
+	}
+	code, out = runCozy(t, root, "model", "import", "--help")
+	if code == 0 || !strings.Contains(out, "unexpected argument import") {
+		t.Fatalf("retired model import remains callable [exit %d]\n%s", code, out)
+	}
+	code, out = runCozy(t, root, "model", "download", "local/source", "local/copy", "--rental-only")
+	if code != 9 || !strings.Contains(out, "rented model download cannot yet return") {
+		t.Fatalf("rented local return was not explicitly refused [exit %d]\n%s", code, out)
 	}
 }
 
@@ -1045,7 +1057,7 @@ module-root = ""
 def main():
     root = pathlib.Path(sys.argv[sys.argv.index("--dir") + 1])
     application = tomllib.loads((root / "package.toml").read_text())["application"]["object"]
-    print(json.dumps({"application": application, "entrypoints": [{"name": "proof", "request": {"fields": []}, "result": {"fields": []}}], "format": "cozy.package.descriptor/1", "jobs": [], "model_productions": []}, separators=(",", ":"), sort_keys=True))
+    print(json.dumps({"application": application, "entrypoints": [{"name": "proof", "request": {"fields": []}, "result": {"fields": []}}], "format": "cozy.package.descriptor/1", "jobs": []}, separators=(",", ":"), sort_keys=True))
 `), 0o644))
 }
 
