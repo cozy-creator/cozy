@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +55,18 @@ func (m *modelProductionManager) SubmitModelProduction(_ context.Context,
 			"model production release %q is not an immutable N.M.P semantic version",
 			instruction.Release)
 	}
+	if _, problem := canonicalProductionSource(&Context{Inv: productionInvocation(instruction)},
+		instruction.Source); problem != nil {
+		return records.ModelProductionOperation{}, false, problem
+	}
+	if _, problem := parseProductionCallable(instruction.Producer); problem != nil {
+		return records.ModelProductionOperation{}, false, problem
+	}
+	if strings.HasPrefix(instruction.Source, "local/") {
+		return records.ModelProductionOperation{}, false, exit.Usagef(
+			"a %s alias cannot be read by a rented worker", instruction.Source).
+			WithRemedy("use its addressable Tensorhub release or original pinned foreign source")
+	}
 	if problem := m.owns(instruction.Destination); problem != nil {
 		return records.ModelProductionOperation{}, false, problem
 	}
@@ -100,9 +113,7 @@ func (m *modelProductionManager) SubmitModelProduction(_ context.Context,
 			return operation, changed, problem
 		}
 	}
-	if problem := m.kick(operation, true); problem != nil {
-		return operation, changed, problem
-	}
+	m.kick(operation)
 	return operation, changed, nil
 }
 
@@ -127,7 +138,7 @@ func (m *modelProductionManager) CancelModelProduction(id string) *exit.Error {
 		cancel()
 	} else if operation.State != "completed" && operation.State != "failed" &&
 		operation.State != "canceled" {
-		_ = m.kick(*operation, true)
+		m.kick(*operation)
 	}
 	return nil
 }
@@ -151,34 +162,20 @@ func (m *modelProductionManager) Start() {
 				_, _, _ = m.SubmitModelProduction(context.Background(), instruction)
 				continue
 			}
-			_ = m.kick(operation, false)
+			m.kick(operation)
 		}
 	}()
 }
 
-func (m *modelProductionManager) kick(operation records.ModelProductionOperation,
-	owned bool,
-) *exit.Error {
+func (m *modelProductionManager) kick(operation records.ModelProductionOperation) {
 	if operation.State == "resolving" || operation.State == "completed" ||
 		operation.State == "failed" || operation.State == "canceled" {
-		return nil
-	}
-	if !owned {
-		plan, err := modelproduction.Parse(operation.Plan)
-		if err != nil {
-			problem := exit.Named(exit.Structural, "model_production.plan_invalid", "%s", err)
-			failProduction(m.store, operation.ID, problem)
-			return problem
-		}
-		if problem := m.owns(plan.Destination); problem != nil {
-			failProduction(m.store, operation.ID, problem)
-			return problem
-		}
+		return
 	}
 	m.mu.Lock()
 	if _, exists := m.running[operation.ID]; exists {
 		m.mu.Unlock()
-		return nil
+		return
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	m.running[operation.ID] = cancel
@@ -191,7 +188,6 @@ func (m *modelProductionManager) kick(operation records.ModelProductionOperation
 		}()
 		m.advance(runCtx, operation)
 	}()
-	return nil
 }
 
 func (m *modelProductionManager) owns(destination string) *exit.Error {

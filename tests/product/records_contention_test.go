@@ -11,7 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRecordsSchemaIsExactV8AndStable(t *testing.T) {
+func TestRecordsSchemaIsExactV9AndStable(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -22,8 +22,8 @@ func TestRecordsSchemaIsExactV8AndStable(t *testing.T) {
 	var version, before int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
-	if version != 8 {
-		t.Fatalf("fresh records version = %d, want exact v8", version)
+	if version != 9 {
+		t.Fatalf("fresh records version = %d, want exact v9", version)
 	}
 	for _, column := range []string{
 		"rental", "rental_required", "package_revision_digest", "environment_digest", "config_digest",
@@ -64,12 +64,12 @@ func TestRecordsSchemaIsExactV8AndStable(t *testing.T) {
 	var after int
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
 	if after != before {
-		t.Fatalf("exact v8 reopen performed DDL: schema_version %d -> %d", before, after)
+		t.Fatalf("exact v9 reopen performed DDL: schema_version %d -> %d", before, after)
 	}
 }
 
-func TestRecordsRefusesMalformedPreV8VersionsWithoutMutation(t *testing.T) {
-	for _, older := range []int{1, 2, 3, 4, 5, 6, 7} {
+func TestRecordsRefusesMalformedPreV9VersionsWithoutMutation(t *testing.T) {
+	for _, older := range []int{1, 2, 3, 4, 5, 6, 7, 8} {
 		t.Run(fmt.Sprintf("v%d", older), func(t *testing.T) {
 			path := t.TempDir() + "/records.db"
 			db, err := sql.Open("sqlite", path)
@@ -84,11 +84,11 @@ func TestRecordsRefusesMalformedPreV8VersionsWithoutMutation(t *testing.T) {
 			opened, problem := records.Open(path)
 			if opened != nil {
 				opened.Close()
-				t.Fatal("pre-v8 records schema opened")
+				t.Fatal("pre-v9 records schema opened")
 			}
 			if problem == nil || problem.ErrName() != "records.schema_reset_required" ||
 				!strings.Contains(problem.Remedy, "move") {
-				t.Fatalf("pre-v8 schema refusal = %#v", problem)
+				t.Fatalf("pre-v9 schema refusal = %#v", problem)
 			}
 			db, err = sql.Open("sqlite", path)
 			must(t, err)
@@ -101,6 +101,39 @@ func TestRecordsRefusesMalformedPreV8VersionsWithoutMutation(t *testing.T) {
 					older, version, before, after)
 			}
 		})
+	}
+}
+
+func TestRecordsRetiresExactV8WithoutMutation(t *testing.T) {
+	path := t.TempDir() + "/records.db"
+	store, problem := records.Open(path)
+	fatal(t, problem)
+	store.Close()
+	db, err := sql.Open("sqlite", path)
+	must(t, err)
+	_, err = db.Exec(`PRAGMA user_version=8`)
+	must(t, err)
+	var before int
+	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
+	must(t, db.Close())
+
+	opened, problem := records.Open(path)
+	if opened != nil {
+		opened.Close()
+		t.Fatal("retired v8 records schema opened")
+	}
+	if problem == nil || problem.ErrName() != "records.schema_reset_required" {
+		t.Fatalf("v8 retirement refusal = %#v", problem)
+	}
+	db, err = sql.Open("sqlite", path)
+	must(t, err)
+	defer db.Close()
+	var version, after int
+	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
+	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
+	if version != 8 || after != before {
+		t.Fatalf("refused v8 schema mutated: version=%d schema_version=%d->%d",
+			version, before, after)
 	}
 }
 

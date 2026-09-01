@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -162,63 +161,50 @@ func TestModelProductionCancellationReportsCleanupTruth(t *testing.T) {
 	}
 }
 
-func TestPersistedForeignModelProductionRefusesBeforeSpend(t *testing.T) {
-	var unexpected atomic.Int64
+func TestForeignModelProductionRefusesBeforeWriteOrSpend(t *testing.T) {
+	var mu sync.Mutex
+	accountReads, unexpected := 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
 		if r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current" {
+			accountReads++
 			_ = json.NewEncoder(w).Encode(map[string]string{"name": "acme"})
 			return
 		}
-		unexpected.Add(1)
-		http.Error(w, "unexpected paid/publication call", http.StatusInternalServerError)
+		unexpected++
+		http.Error(w, "unexpected provider/publication call", http.StatusInternalServerError)
 	}))
 	defer server.Close()
 
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
 		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\n"), 0o600))
+	daemon := startDaemonProcess(t, root)
+	instruction := modelproduction.Instruction{
+		Destination: "foreign/output", Release: "1.0.0",
+		Source:   "hf://source/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Producer: "proof/tools@v1/build", Rental: true,
+	}
+	reply := daemon.call(t, http.MethodPost, "/v1/local/model-productions",
+		map[string]any{"instruction": instruction})
+	if reply.Status != http.StatusBadRequest || reply.code() != "usage" ||
+		!strings.Contains(string(reply.Body), "logged in as Tensorhub account acme") {
+		t.Fatalf("foreign production acceptance = %s", reply.brief())
+	}
 	layout, problem := home.Open(root)
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
-	plan := modelproduction.Plan{
-		Instruction: modelproduction.Instruction{
-			Destination: "foreign/output", Release: "1.0.0",
-			Source:   "hf://source/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			Producer: "proof/tools@v1/build", Rental: true,
-		},
-		Destination: "foreign/output", Release: "1.0.0",
-	}
-	planBytes, err := plan.Bytes()
-	must(t, err)
-	planDigest, err := plan.Digest()
-	must(t, err)
-	seeded, _, problem := store.BeginModelProduction(records.ModelProductionOperation{
-		ID: plan.ID(), PlanDigest: planDigest, Plan: planBytes,
-	})
-	fatal(t, problem)
+	rows, problem := store.ModelProductions("any", 50)
 	store.Close()
-
-	_ = startDaemonProcess(t, root)
-	deadline := time.Now().Add(5 * time.Second)
-	var observed *records.ModelProductionOperation
-	for time.Now().Before(deadline) {
-		store, problem = records.Open(layout.DB)
-		fatal(t, problem)
-		observed, problem = store.ModelProduction(seeded.ID)
-		store.Close()
-		fatal(t, problem)
-		if observed != nil && observed.State == "failed" {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if observed == nil || observed.State != "failed" ||
-		!strings.Contains(observed.SafeDetail, "logged in as Tensorhub account acme") {
-		t.Fatalf("persisted foreign plan was not fenced: %+v", observed)
-	}
-	if calls := unexpected.Load(); calls != 0 {
-		t.Fatalf("persisted foreign plan made %d rental/provider/publication calls", calls)
+	fatal(t, problem)
+	mu.Lock()
+	reads, other := accountReads, unexpected
+	mu.Unlock()
+	if len(rows) != 0 || reads != 1 || other != 0 {
+		t.Fatalf("foreign production crossed boundary: rows=%d account_reads=%d other_calls=%d",
+			len(rows), reads, other)
 	}
 }
 
@@ -772,8 +758,6 @@ func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.
 	cutBodies := []string{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current":
-			_ = json.NewEncoder(w).Encode(map[string]string{"name": "acme"})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/models/acme/output/releases/ambiguous":
 			body, _ := io.ReadAll(r.Body)
 			mu.Lock()

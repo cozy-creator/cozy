@@ -67,7 +67,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 8
+const schemaVersion = 9
 
 // schema is the only records shape this pre-launch build accepts.
 var schema = append([]string{`
@@ -141,7 +141,7 @@ func Open(path string) (*Store, *exit.Error) {
 			return nil, e
 		}
 	} else if version == 6 || version == 7 {
-		if e := migrateToEight(db, path, version); e != nil {
+		if e := migrateToNine(db, path, version); e != nil {
 			db.Close()
 			return nil, e
 		}
@@ -163,8 +163,9 @@ func Open(path string) (*Store, *exit.Error) {
 
 // Schema 7 removed one retired rental observation; schema 6 additionally lacks the
 // default-false rental_required request column. Both released predecessors migrate in
-// place: replacing the database would lose package generations and their active pins.
-func migrateToEight(db *sql.DB, path string, sourceVersion int) *exit.Error {
+// place to preserve package inventory. Their model-production rows are deliberately
+// retired: they predate named-account validation and may not resume under schema 9.
+func migrateToNine(db *sql.DB, path string, sourceVersion int) *exit.Error {
 	if e := verifyPriorSchema(db, path, sourceVersion); e != nil {
 		return e
 	}
@@ -199,6 +200,19 @@ func migrateToEight(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			return e
 		}
 	}
+	for _, table := range []string{
+		"model_production_objects",
+		"model_production_artifacts",
+		"model_production_steps",
+		"model_production_sources",
+		"model_production_source_files",
+		"model_productions",
+	} {
+		if _, err := tx.Exec(`DELETE FROM ` + table); err != nil {
+			return exit.Internalf("cannot retire pre-account %s rows while migrating %s: %s",
+				table, path, err)
+		}
+	}
 	if _, err := tx.Exec(`DROP INDEX rentals_machine_name`); err != nil {
 		return exit.Internalf("cannot stage rental index while migrating %s: %s", path, err)
 	}
@@ -218,7 +232,7 @@ func migrateToEight(db *sql.DB, path string, sourceVersion int) *exit.Error {
 	if _, err := tx.Exec(rentalSchema[3]); err != nil {
 		return exit.Internalf("cannot restore rental index while migrating %s: %s", path, err)
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=8`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=9`); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
 	if e := commitMigration(tx, path); e != nil {
@@ -363,7 +377,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=8`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=9`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {

@@ -23,6 +23,11 @@ func TestRecordsSchemasSixAndSevenMigrateWithoutDroppingPackageInventory(t *test
 			fatal(t, problem)
 			_, problem = store.Activate(generation)
 			fatal(t, problem)
+			_, _, problem = store.BeginModelProduction(records.ModelProductionOperation{
+				ID: "modelpub-pre-account", PlanDigest: "sha256:" + strings.Repeat("c", 64),
+				Plan: []byte(`{}`),
+			})
+			fatal(t, problem)
 			store.Close()
 			db, err := sql.Open("sqlite", database)
 			must(t, err)
@@ -48,6 +53,11 @@ func TestRecordsSchemasSixAndSevenMigrateWithoutDroppingPackageInventory(t *test
 			fatal(t, problem)
 			if request == nil || request.InstallID != generation.ID || request.RentalRequired {
 				t.Fatalf("schema migration dropped or changed request row: %#v", request)
+			}
+			productions, problem := store.ModelProductions("any", 50)
+			fatal(t, problem)
+			if len(productions) != 0 {
+				t.Fatalf("schema migration retained pre-account model productions: %+v", productions)
 			}
 		})
 	}

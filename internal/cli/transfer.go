@@ -101,10 +101,6 @@ func handleDirectModelPublish(ctx *Context) *exit.Error {
 			return e
 		}
 	}
-	publicationClient, e := ownedPublication(ctx, ref)
-	if e != nil {
-		return e
-	}
 	var evidenceRef hub.Ref
 	if localName != "" {
 		tool, _, problem := localTensorFS(ctx)
@@ -117,6 +113,10 @@ func handleDirectModelPublish(ctx *Context) *exit.Error {
 		}
 		manifestID = row.ManifestDigest
 		evidenceRef = hub.Ref{Org: "local", Name: localName}
+	}
+	publicationClient, e := ownedPublication(ctx, ref)
+	if e != nil {
+		return e
 	}
 	reason := "cozy model publish " + ref.String() + " " + manifestID + " --release " + release + " --lane " + lane
 	// The versioned operation binds the complete named-lane intent without
