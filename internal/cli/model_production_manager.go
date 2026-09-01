@@ -225,7 +225,7 @@ func (m *modelProductionManager) advance(runCtx context.Context,
 		}
 	}
 	ctx := resolveCtx
-	_ = runRentedModelProduction(ctx, runCtx, plan, source)
+	_ = runRentedModelProduction(ctx, runCtx, operation, plan, source)
 }
 
 func (m *modelProductionManager) resolve(instruction modelproduction.Instruction) (

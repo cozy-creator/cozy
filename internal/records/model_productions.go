@@ -124,51 +124,6 @@ func scanModelProduction(row interface{ Scan(...any) error }) (ModelProductionOp
 	return operation, err
 }
 
-// BeginModelProduction creates the operation before any worker/rental act. An
-// exact replay returns the same row; an identity collision always conflicts.
-func (s *Store) BeginModelProduction(operation ModelProductionOperation) (ModelProductionOperation, bool, *exit.Error) {
-	if operation.ID == "" || operation.PlanDigest == "" || len(operation.Plan) == 0 {
-		return ModelProductionOperation{}, false, exit.New(exit.Validation,
-			"model production needs one id, plan digest, and restart plan")
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return ModelProductionOperation{}, false, exit.Internalf("cannot begin model production: %s", err)
-	}
-	defer tx.Rollback()
-	stored, err := scanModelProduction(tx.QueryRow(
-		`SELECT `+modelProductionCols+` FROM model_productions WHERE id=?`, operation.ID))
-	if err == nil {
-		if stored.PlanDigest != operation.PlanDigest || !bytes.Equal(stored.Plan, operation.Plan) {
-			return ModelProductionOperation{}, false, exit.Named(exit.Conflict,
-				"model_production.identity_conflict",
-				"model production %s already binds different immutable plan bytes", operation.ID)
-		}
-		if err := tx.Commit(); err != nil {
-			return ModelProductionOperation{}, false, exit.Internalf("cannot read replayed model production: %s", err)
-		}
-		return stored, true, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return ModelProductionOperation{}, false, exit.Internalf("cannot read model production: %s", err)
-	}
-	stamp := now()
-	if _, err := tx.Exec(`INSERT INTO model_productions(`+modelProductionCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, operation.ID, operation.PlanDigest, operation.Plan,
-		"accepted", 0, "", "", false, "", "", stamp, stamp); err != nil {
-		return ModelProductionOperation{}, false, exit.Internalf("cannot record model production: %s", err)
-	}
-	stored, err = scanModelProduction(tx.QueryRow(
-		`SELECT `+modelProductionCols+` FROM model_productions WHERE id=?`, operation.ID))
-	if err != nil {
-		return ModelProductionOperation{}, false, exit.Internalf("cannot read recorded model production: %s", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return ModelProductionOperation{}, false, exit.Internalf("cannot commit model production: %s", err)
-	}
-	return stored, false, nil
-}
-
 // BeginModelProductionInstruction records caller intent before resolving any
 // mutable package selector. While resolving, the existing plan columns hold the
 // canonical instruction bytes; AttachModelProductionPlan replaces them exactly

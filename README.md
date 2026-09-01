@@ -139,10 +139,10 @@ cozy model list
 cozy model remove org/model
 ```
 
-Upload a pinned source directly, or execute one package-reviewed production whose named outputs
-become owner-only immutable checkpoints. `--lane` on upload selects only an existing input release;
-producers do not choose public lane names. An existing canonical TensorFS manifest can be uploaded
-directly. The destination owner must match the account shown by `cozy auth`:
+Upload an existing canonical TensorFS manifest directly, or execute one package-reviewed production
+whose named outputs become owner-only immutable checkpoints. `--lane` on upload selects only an
+existing input release; producers do not choose public lane names. The destination owner must match
+the account shown by `cozy auth`:
 
 ```sh
 cozy model upload org/model sha256:<manifest>

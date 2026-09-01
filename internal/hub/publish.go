@@ -84,10 +84,6 @@ type HeldTransfer struct {
 	Transfer
 	TransferID     string  `json:"transfer_id"`
 	GrantExpiresAt *string `json:"grant_expires_at,omitempty"`
-	ReceivedBytes  int64   `json:"received_bytes"`
-	VerifiedBytes  int64   `json:"verified_bytes"`
-	LastProgressAt string  `json:"last_progress_at"`
-	AcceptedAt     *string `json:"accepted_at,omitempty"`
 	RefusalCode    *string `json:"refusal_code,omitempty"`
 	RefusalDetail  *string `json:"refusal_detail,omitempty"`
 }
