@@ -331,63 +331,53 @@ func (f *Fetch) round(ctx context.Context, row hub.ModelManifest, name string, o
 		return nil
 	}
 
-	ids := make([]string, 0, len(want))
-	for _, o := range want {
-		ids = append(ids, o.ID)
-	}
-	reads, e := f.Hub.ReleaseReads(ctx, f.Ref, row.Release, row.Lane, ids)
-	if e != nil {
-		return e
-	}
-	at := map[string]hub.Read{}
-	for _, r := range reads {
-		at[r.ObjectID] = r
-	}
-
 	dir := filepath.Join(f.Scratch, "in")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return exit.Internalf("cannot create the fetch scratch: %s", err)
 	}
-	var plan strings.Builder
-	batch := 0
 	admitted, skipped := out.Admitted, out.Skipped
-	commit := func() *exit.Error {
-		if batch == 0 {
-			return nil
+	const batchObjects = 64
+	for start := 0; start < len(want); start += batchObjects {
+		end := min(start+batchObjects, len(want))
+		batch := want[start:end]
+		ids := make([]string, 0, len(batch))
+		for _, o := range batch {
+			ids = append(ids, o.ID)
 		}
-		if e := f.install(plan.String(), out); e != nil {
-			return e
-		}
-		plan.Reset()
-		batch = 0
-		return nil
-	}
-	for _, o := range want {
-		r, ok := at[o.ID]
-		if !ok {
-			return exit.Named(exit.NotFound, "hub.object_unavailable",
-				"the hub granted no read for %s", short1(o.ID)).
-				WithRemedy("the manifest's catalog row and its object custody disagree; the hub owns that reconciliation")
-		}
-		dst := filepath.Join(dir, strings.TrimPrefix(o.ID, "sha256:"))
-		n, e := download(ctx, r.URL, dst, o.Length)
+		// The Hub custody-checks and signs every requested object before it sends
+		// headers. Acquire only the grants this install batch will consume: a large
+		// closure must not become one closure-sized silent control-plane call, and
+		// later grants must not age while earlier objects move.
+		reads, e := f.Hub.ReleaseReads(ctx, f.Ref, row.Release, row.Lane, ids)
 		if e != nil {
 			return e
 		}
-		out.Moved += n
-		fmt.Fprintf(&plan, "%s %d %s\n", strings.TrimPrefix(o.ID, "sha256:"), o.Length, dst)
-		batch++
-		// A killed transfer keeps every completed batch in TensorFS's verified
-		// journal. Batching avoids both one giant all-or-nothing round and one process
-		// per object when a Manifest reaches thousands of shards.
-		if batch == 64 {
-			if e := commit(); e != nil {
+		at := map[string]hub.Read{}
+		for _, r := range reads {
+			at[r.ObjectID] = r
+		}
+
+		var plan strings.Builder
+		for _, o := range batch {
+			r, ok := at[o.ID]
+			if !ok {
+				return exit.Named(exit.NotFound, "hub.object_unavailable",
+					"the hub granted no read for %s", short1(o.ID)).
+					WithRemedy("the manifest's catalog row and its object custody disagree; the hub owns that reconciliation")
+			}
+			dst := filepath.Join(dir, strings.TrimPrefix(o.ID, "sha256:"))
+			n, e := download(ctx, r.URL, dst, o.Length)
+			if e != nil {
 				return e
 			}
+			out.Moved += n
+			fmt.Fprintf(&plan, "%s %d %s\n", strings.TrimPrefix(o.ID, "sha256:"), o.Length, dst)
 		}
-	}
-	if e := commit(); e != nil {
-		return e
+		// A killed transfer keeps every completed batch in TensorFS's verified
+		// journal. The next run asks only for objects the store does not hold.
+		if e := f.install(plan.String(), out); e != nil {
+			return e
+		}
 	}
 	f.say("%s: installed %d, skipped %d already verified here",
 		name, out.Admitted-admitted, out.Skipped-skipped)
