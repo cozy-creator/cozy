@@ -8,7 +8,7 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-type ArtifactTransferDecision struct {
+type WeightsTransferDecision struct {
 	ObjectID      string            `json:"object_id"`
 	Length        int64             `json:"length"`
 	URL           string            `json:"url,omitempty"`
@@ -17,7 +17,7 @@ type ArtifactTransferDecision struct {
 	Held          bool              `json:"held,omitempty"`
 }
 
-func (c *Orchestrator) onModelTransferArtifactReceipt(s *session, frame *pb.ArtifactReceiptFrame) {
+func (c *Orchestrator) onModelTransferWeightsReceipt(s *session, frame *pb.WeightsReceiptFrame) {
 	transfer, problem := c.opt.Store.ModelTransferOf(frame.RequestId)
 	if problem != nil || transfer == nil {
 		return
@@ -35,22 +35,22 @@ func (c *Orchestrator) onModelTransferArtifactReceipt(s *session, frame *pb.Arti
 	if frame.Manifest != nil {
 		manifestDigest, _ = canonical.Spell(frame.Manifest.Digest)
 	}
-	if err != nil || invocationDigest != attempt.InvocationDigest || frame.ArtifactReceipt == nil ||
+	if err != nil || invocationDigest != attempt.InvocationDigest || frame.WeightsReceipt == nil ||
 		frame.Manifest == nil || manifestDigest == "" || frame.Manifest.Length == 0 ||
-		frame.WriterGeneration == 0 || frame.ArtifactTransactionId == "" {
+		frame.WriterGeneration == 0 || frame.WeightsTransactionId == "" {
 		return
 	}
-	receipt, problem := parseArtifactReceiptRef(canonical.Doc{
-		"artifact_receipt_digest": canonicalSpell(frame.ArtifactReceipt.ArtifactReceiptDigest),
-		"artifact_receipt_canonical_bytes": base64.StdEncoding.EncodeToString(
-			frame.ArtifactReceipt.ArtifactReceiptCanonicalBytes),
+	receipt, problem := parseWeightsReceiptRef(canonical.Doc{
+		"weights_receipt_digest": canonicalSpell(frame.WeightsReceipt.WeightsReceiptDigest),
+		"weights_receipt_canonical_bytes": base64.StdEncoding.EncodeToString(
+			frame.WeightsReceipt.WeightsReceiptCanonicalBytes),
 	})
 	if problem != nil || receipt.RequestID != frame.RequestId ||
 		receipt.InvocationDigest != invocationDigest || receipt.OutputSlot != frame.OutputSlot {
 		return
 	}
-	receiptDoc, err := canonical.Read(receipt.ReceiptBytes, &pb.ArtifactReceipt{})
-	if err != nil || receiptDoc.Str("artifact_transaction_id") != frame.ArtifactTransactionId {
+	receiptDoc, err := canonical.Read(receipt.ReceiptBytes, &pb.WeightsReceipt{})
+	if err != nil || receiptDoc.Str("weights_transaction_id") != frame.WeightsTransactionId {
 		return
 	}
 	evidence, err := base64.StdEncoding.Strict().DecodeString(
@@ -78,28 +78,28 @@ func (c *Orchestrator) onModelTransferArtifactReceipt(s *session, frame *pb.Arti
 	if len(objects) == 0 || !manifestPresent {
 		return
 	}
-	problem = c.opt.Store.RecordModelTransferArtifact(records.ModelTransferArtifact{
+	problem = c.opt.Store.RecordModelTransferWeights(records.ModelTransferWeights{
 		RequestID: frame.RequestId, OutputSlot: frame.OutputSlot, ManifestID: manifestDigest,
 		ManifestLength: int64(frame.Manifest.Length), Evidence: evidence, Objects: objects,
 		Attempt: int64(frame.AttemptOrdinal), InvocationDigest: invocationDigest,
-		TransactionID: frame.ArtifactTransactionId, ReceiptDigest: receipt.ReceiptDigest,
+		TransactionID: frame.WeightsTransactionId, ReceiptDigest: receipt.ReceiptDigest,
 		Receipt: receipt.ReceiptBytes})
 	if problem == nil {
 		c.signalTransfer(frame.RequestId)
 	}
 }
 
-func (c *Orchestrator) onModelTransferArtifactStatus(s *session,
-	frame *pb.ArtifactTransferStatus,
+func (c *Orchestrator) onModelTransferWeightsStatus(s *session,
+	frame *pb.WeightsTransferStatus,
 ) {
-	artifact, problem := c.opt.Store.ModelTransferArtifact(frame.RequestId,
+	weights, problem := c.opt.Store.ModelTransferWeights(frame.RequestId,
 		int64(frame.AttemptOrdinal), frame.OutputSlot)
-	if problem != nil || artifact == nil || frame.Length == 0 || frame.Length > uint64(^uint64(0)>>1) {
+	if problem != nil || weights == nil || frame.Length == 0 || frame.Length > uint64(^uint64(0)>>1) {
 		return
 	}
 	invocation := canonicalSpell(frame.InvocationSpecDigest)
-	if artifact.Attempt != int64(frame.AttemptOrdinal) || artifact.InvocationDigest != invocation ||
-		artifact.TransactionID != frame.ArtifactTransactionId {
+	if weights.Attempt != int64(frame.AttemptOrdinal) || weights.InvocationDigest != invocation ||
+		weights.TransactionID != frame.WeightsTransactionId {
 		return
 	}
 	request, problem := c.opt.Store.RequestRow(frame.RequestId)
@@ -109,7 +109,7 @@ func (c *Orchestrator) onModelTransferArtifactStatus(s *session,
 		attempt.InstanceID != s.instanceID {
 		return
 	}
-	state := trimEnum(pb.ArtifactTransferState_name[int32(frame.State)], "ARTIFACT_TRANSFER_STATE_")
+	state := trimEnum(pb.WeightsTransferState_name[int32(frame.State)], "WEIGHTS_TRANSFER_STATE_")
 	state = map[string]string{"ACCEPTED": "accepted", "READING": "reading",
 		"UPLOADING": "uploading", "UPLOADED": "uploaded", "ALREADY_PRESENT": "already_present",
 		"HELD": "held", "FAILED": "failed"}[state]

@@ -363,28 +363,28 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			c.onPrivatePackageAbortStatus(s, status)
-		case *pb.WorkerFrame_ArtifactReceipt:
-			receipt := m.ArtifactReceipt
+		case *pb.WorkerFrame_WeightsReceipt:
+			receipt := m.WeightsReceipt
 			if c.fenced(s, receipt.RecordOwnerEpoch, receipt.ControlStreamGeneration,
 				receipt.WorkerBootId) {
 				continue
 			}
-			c.onModelTransferArtifactReceipt(s, receipt)
-		case *pb.WorkerFrame_ArtifactTransferStatus:
-			status := m.ArtifactTransferStatus
+			c.onModelTransferWeightsReceipt(s, receipt)
+		case *pb.WorkerFrame_WeightsTransferStatus:
+			status := m.WeightsTransferStatus
 			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamGeneration,
 				status.WorkerBootId) {
 				continue
 			}
-			c.onModelTransferArtifactStatus(s, status)
+			c.onModelTransferWeightsStatus(s, status)
 		case *pb.WorkerFrame_CheckpointAck:
 			// the worker's echo of a receipt already durable here; nothing to apply
-		case *pb.WorkerFrame_ArtifactFinalizeResult:
-			r := m.ArtifactFinalizeResult
+		case *pb.WorkerFrame_WeightsFinalizeResult:
+			r := m.WeightsFinalizeResult
 			if c.fenced(s, r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId) {
 				continue
 			}
-			c.onArtifactFinalizeResult(s, r)
+			c.onWeightsFinalizeResult(s, r)
 		}
 	}
 }

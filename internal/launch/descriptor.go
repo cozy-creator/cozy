@@ -14,7 +14,7 @@
 //     default, in the runtime's own grammar and vocabulary.
 //
 // For a wholly weightless package the installed runtime is the sole canonical plan writer:
-// `bindings --json` reports exact ArtifactSubjects before spawn and
+// `bindings --json` reports exact WeightsSubjects before spawn and
 // `serve --weightless-package` privately stages the same bytes. Cozy consumes the
 // identities as record-owner intent and never reconstructs the documents. The older local
 // pinned-binding writer below remains only for the modeled path that still carries it.
@@ -63,17 +63,17 @@ type Entrypoint struct {
 	Request      Struct `json:"request"`
 	Result       Struct `json:"result"`
 	Publishes    bool   `json:"publishes"`
-	// ArtifactOutputs is the job's explicit ArtifactSink slot set. It is separate from
+	// WeightsOutputs is the job's explicit WeightsSink slot set. It is separate from
 	// result asset fields because worker-protocol rev5 OutputBinding has no kind.
-	ArtifactOutputs []ArtifactOutput     `json:"artifact_outputs"`
-	Resources       ResourceRequirements `json:"resources"`
+	WeightsOutputs []WeightsOutput      `json:"weights_outputs"`
+	Resources      ResourceRequirements `json:"resources"`
 }
 
-type ArtifactOutput struct {
-	OutputID         string                 `json:"output_id"`
-	MimeType         string                 `json:"mime_type"`
-	MaxBytes         uint64                 `json:"max_bytes"`
-	RequiredContract *ArtifactModelContract `json:"required_contract,omitempty"`
+type WeightsOutput struct {
+	OutputID         string                `json:"output_id"`
+	MimeType         string                `json:"mime_type"`
+	MaxBytes         uint64                `json:"max_bytes"`
+	RequiredContract *WeightsModelContract `json:"required_contract,omitempty"`
 }
 
 type ResourceRequirements struct {
@@ -93,7 +93,7 @@ func (ep *Entrypoint) RequiredGPUCount() int64 {
 	return ep.Resources.GPUCount
 }
 
-type ArtifactModelContract struct {
+type WeightsModelContract struct {
 	TopologyDigest string   `json:"topology_digest"`
 	Encodings      []string `json:"encodings"`
 }
@@ -214,7 +214,7 @@ func validateClosedDescriptor(data []byte) error {
 			optional := []string{"models"}
 			if kind == "job" {
 				required = append(required, "publishes")
-				optional = append(optional, "resources", "artifact_outputs")
+				optional = append(optional, "resources", "weights_outputs")
 			}
 			callable, err := exactKeys(row, required, optional)
 			if err != nil {
@@ -243,7 +243,7 @@ func validateClosedDescriptor(data []byte) error {
 					return err
 				}
 			}
-			if outputs := callable["artifact_outputs"]; outputs != nil {
+			if outputs := callable["weights_outputs"]; outputs != nil {
 				var rows []json.RawMessage
 				if err := json.Unmarshal(outputs, &rows); err != nil {
 					return err
@@ -459,30 +459,30 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 			}
 		}
 	}
-	if ep.Kind != "job" && len(ep.ArtifactOutputs) > 0 {
-		return exit.New(exit.Validation, "%s declares artifact outputs outside the job surface", ep.Name)
+	if ep.Kind != "job" && len(ep.WeightsOutputs) > 0 {
+		return exit.New(exit.Validation, "%s declares weights outputs outside the job surface", ep.Name)
 	}
 	if ep.Resources.GPUCount < 0 ||
 		(ep.Resources.Placement != "" && ep.Resources.Placement != "single_node" &&
 			ep.Resources.Placement != "any") {
 		return exit.New(exit.Validation, "%s has invalid resource requirements", ep.Name)
 	}
-	seenArtifacts := map[string]bool{}
-	for _, output := range ep.ArtifactOutputs {
-		if output.OutputID == "" || seenArtifacts[output.OutputID] || output.MaxBytes == 0 ||
-			output.MaxBytes > (uint64(1)<<53)-1 || output.MimeType != orchestrator.ArtifactManifestMime {
+	seenWeights := map[string]bool{}
+	for _, output := range ep.WeightsOutputs {
+		if output.OutputID == "" || seenWeights[output.OutputID] || output.MaxBytes == 0 ||
+			output.MaxBytes > (uint64(1)<<53)-1 || output.MimeType != orchestrator.WeightsManifestMime {
 			return exit.New(exit.Validation,
-				"%s has an invalid artifact output %q: slots are unique snapshot MIME rows with a 1..2^53-1 byte cap",
+				"%s has an invalid weights output %q: slots are unique snapshot MIME rows with a 1..2^53-1 byte cap",
 				ep.Name, output.OutputID)
 		}
 		if contract := output.RequiredContract; contract != nil &&
 			(!descriptorDigestPattern.MatchString(contract.TopologyDigest) ||
 				!validDescriptorDigestList(contract.Encodings, 32)) {
 			return exit.New(exit.Validation,
-				"%s artifact output %s has an invalid required model contract",
+				"%s weights output %s has an invalid required model contract",
 				ep.Name, output.OutputID)
 		}
-		seenArtifacts[output.OutputID] = true
+		seenWeights[output.OutputID] = true
 	}
 	return nil
 }

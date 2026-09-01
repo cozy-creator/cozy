@@ -101,8 +101,8 @@ type ModelTransferOwner interface {
 	PassThrough(context.Context, string, records.ModelTransferIntent) *exit.Error
 }
 
-type ModelTransferMover func(context.Context, records.ModelTransferArtifact,
-	string, []ArtifactTransferDecision) *exit.Error
+type ModelTransferMover func(context.Context, records.ModelTransferWeights,
+	string, []WeightsTransferDecision) *exit.Error
 
 // Launcher resolves a package ref along the two boundaries #484 split: the
 // platform-neutral desired placement and the local target-environment launch. A connected
@@ -135,17 +135,17 @@ type LogicalPackage struct {
 }
 
 type LogicalJob struct {
-	Package         string
-	Release         string
-	ReleaseDigest   string
-	Function        string
-	DescriptorID    string
-	Outputs         []string
-	ArtifactOutputs []ArtifactOutput
-	GPUCount        int64
-	Requires        string
-	Models          []ModelRef
-	SourceProfiles  map[string]string
+	Package        string
+	Release        string
+	ReleaseDigest  string
+	Function       string
+	DescriptorID   string
+	Outputs        []string
+	WeightsOutputs []WeightsOutput
+	GPUCount       int64
+	Requires       string
+	Models         []ModelRef
+	SourceProfiles map[string]string
 }
 
 type ModelRef = records.ModelRef

@@ -612,7 +612,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		return
 	}
 	// 2. The document is parsed under UNKNOWN-FIELD REFUSAL and the re-emit law. It is the
-	//    sole pre-release AttemptOutcomeBody/1 shape, including exact artifact receipts.
+	//    sole pre-release AttemptOutcomeBody/1 shape, including exact weights receipts.
 	doc, err := canonical.Read(t.OutcomeCanonicalBytes, &pb.AttemptOutcomeBody{})
 	if err != nil {
 		refuse("the outcome document is inadmissible (%s)", err)
@@ -660,16 +660,16 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		refuse("no assigned attempt row to settle")
 		return
 	}
-	declaredArtifactOutputs, e := decodeArtifactOutputs(attemptRow.ArtifactOutputs)
+	declaredWeightsOutputs, e := decodeWeightsOutputs(attemptRow.WeightsOutputs)
 	if e != nil {
 		refuse("%s", e.Message)
 		return
 	}
-	if len(declaredArtifactOutputs) > 0 && len(doc.Sub("output_manifest").List("outputs")) > 0 {
-		refuse("artifact-only job also returned ordinary output-manifest entries")
+	if len(declaredWeightsOutputs) > 0 && len(doc.Sub("output_manifest").List("outputs")) > 0 {
+		refuse("weights-only job also returned ordinary output-manifest entries")
 		return
 	}
-	artifactReceipts, receiptsBySlot, e := artifactReceiptsFromOutcome(*req, *attemptRow, doc)
+	weightsReceipts, receiptsBySlot, e := weightsReceiptsFromOutcome(*req, *attemptRow, doc)
 	if e != nil {
 		refuse("%s", e.Message)
 		return
@@ -725,7 +725,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		kept.Payload = map[string]any{"status": "FINALIZING", "execution_status": status,
 			"outputs": []any{}, "requeuing": false}
 	}
-	artifactFinalizations, e := artifactFinalizationIntents(
+	weightsFinalizations, e := weightsFinalizationIntents(
 		*req, *attemptRow, status, requeuing, receiptsBySlot)
 	if e != nil {
 		refuse("%s", e.Message)
@@ -744,7 +744,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	// goes on to succeed. Observed live: attempt 1 of a killed job committed an empty
 	// `local/_job-…` publication seconds before attempt 2 published the real one.
 	var publication *records.Publication
-	if req.IsJob() && len(declaredArtifactOutputs) == 0 && !requeuing && !knownReplay {
+	if req.IsJob() && len(declaredWeightsOutputs) == 0 && !requeuing && !knownReplay {
 		if e := c.promote(*req, ordinal, outputs); e != nil {
 			refuse("%s", e.Message)
 			return
@@ -761,8 +761,8 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		TriageSubject: triage.Subject, TriageDigest: triage.Digest,
 		TriageLength: triage.Length, TriagePath: triage.Path,
 		Body: t.OutcomeCanonicalBytes, Outputs: outputs,
-		ArtifactFinalizations: artifactFinalizations,
-		EventType:             kept.Type, EventPayload: kept.Payload,
+		WeightsFinalizations: weightsFinalizations,
+		EventType:            kept.Type, EventPayload: kept.Payload,
 		// A requeueing request is QUEUED for its next ordinal, not failed. Writing the
 		// attempt's own status onto the request row would make the status document say
 		// `failed` for a request that is still going.
@@ -784,9 +784,9 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 			"became visible in the SAME transaction", t.RequestId, ordinal, status, cause,
 			origin, executionStarted, float64(time.Since(began).Microseconds())/1000,
 			len(outputs))
-		if len(artifactReceipts) > 0 {
+		if len(weightsReceipts) > 0 {
 			c.logf("AttemptOutcome %s#%d durably recorded %s before acknowledgement",
-				t.RequestId, ordinal, artifactReceiptSummary(artifactReceipts))
+				t.RequestId, ordinal, weightsReceiptSummary(weightsReceipts))
 		}
 		if publication != nil {
 			c.logf("publication %s committed: %d entr(y|ies), %d B, root %s",
@@ -803,15 +803,15 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		c.RetryOutputExport(t.RequestId)
 	}
 
-	// Artifact decisions are independent frames, but the worker may reclaim after Ack. Send
+	// Weights decisions are independent frames, but the worker may reclaim after Ack. Send
 	// every persisted first-wins intent now and withhold Ack until their exact results land.
-	pending, e := c.sendPendingArtifactFinalizations(s, t.RequestId, int64(ordinal))
+	pending, e := c.sendPendingWeightsFinalizations(s, t.RequestId, int64(ordinal))
 	if e != nil {
-		refuse("artifact finalization remains pending: %s", e.Message)
+		refuse("weights finalization remains pending: %s", e.Message)
 		return
 	}
 	if pending > 0 {
-		c.logf("AttemptOutcome %s#%d remains unacked behind %d artifact finalization(s)",
+		c.logf("AttemptOutcome %s#%d remains unacked behind %d weights finalization(s)",
 			t.RequestId, ordinal, pending)
 		return
 	}
@@ -1071,7 +1071,7 @@ func requeueable(status, cause, origin string, executionStarted bool) bool {
 		return false
 	}
 	switch cause {
-	case "EXECUTOR_FAULT", "GRANT_EXPIRED", "ARTIFACT_UNFETCHABLE", "CAPABILITY_UNAVAILABLE":
+	case "EXECUTOR_FAULT", "GRANT_EXPIRED", "WEIGHTS_UNFETCHABLE", "CAPABILITY_UNAVAILABLE":
 		return true
 	}
 	return false

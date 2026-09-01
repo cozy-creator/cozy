@@ -47,11 +47,11 @@ type Submission struct {
 	// by field path with exact set equality is what makes a two-output result
 	// unswappable; a positional grant would silently cross them (decisions #248).
 	Outputs []string
-	// ArtifactOutputs is the explicit Runtime-authored ArtifactSink subset. Rev5's generic
+	// WeightsOutputs is the explicit Runtime-authored WeightsSink subset. Rev5's generic
 	// OutputBinding carries no kind, so this is persisted beside the InvocationSpec and is
-	// never inferred from an arriving receipt. The M0 lane is artifact-only: when non-empty,
+	// never inferred from an arriving receipt. The M0 lane is weights-only: when non-empty,
 	// this set is the complete output set for the job.
-	ArtifactOutputs  []ArtifactOutput
+	WeightsOutputs   []WeightsOutput
 	ProducerProfiles map[string]string
 
 	// BodyDigest is the caller's own digest of the WHOLE submission it is making
@@ -93,11 +93,11 @@ type Submission struct {
 	ModelTransfer *records.ModelTransferIntent
 }
 
-const ArtifactManifestMime = "application/vnd.cozy.model-manifest"
+const WeightsManifestMime = "application/vnd.cozy.model-manifest"
 
-// ArtifactOutput is one bounded ArtifactSink slot projected from the installed job
+// WeightsOutput is one bounded WeightsSink slot projected from the installed job
 // descriptor. MaxBytes bounds only newly written table/config bytes, not inherited closure.
-type ArtifactOutput struct {
+type WeightsOutput struct {
 	OutputID         string                         `json:"output_id"`
 	MimeType         string                         `json:"mime_type"`
 	MaxBytes         uint64                         `json:"max_bytes"`
@@ -173,11 +173,11 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	if s.RentalRequired {
 		s.Rental = true
 	}
-	artifactOutputs, artifactBytes, e := normalizeArtifactOutputs(s)
+	weightsOutputs, weightsBytes, e := normalizeWeightsOutputs(s)
 	if e != nil {
 		return records.Request{}, nil, e
 	}
-	s.ArtifactOutputs = artifactOutputs
+	s.WeightsOutputs = weightsOutputs
 	bodyDigest := s.BodyDigest
 	if bodyDigest == "" {
 		identity := s.Payload
@@ -228,7 +228,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Release: s.Release, PackageRevisionDigest: s.ReleaseDigest,
 		PrivatePackageDigest: s.PrivatePackageDigest,
 		Outputs:              strings.Join(s.Outputs, ","),
-		Assets:               s.Assets, ArtifactOutputs: string(artifactBytes),
+		Assets:               s.Assets, WeightsOutputs: string(weightsBytes),
 		Kind: s.Kind, JobGPUCount: s.JobGPUCount, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, Models: s.Models,
@@ -237,7 +237,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	event := map[string]any{
 		"package": s.Package, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
-		"artifact_outputs": artifactOutputs,
+		"weights_outputs": weightsOutputs,
 	}
 	if s.Rental {
 		event["rental"] = true
@@ -251,61 +251,61 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	return req, event, nil
 }
 
-func normalizeArtifactOutputs(s Submission) ([]ArtifactOutput, []byte, *exit.Error) {
-	if len(s.ArtifactOutputs) == 0 {
+func normalizeWeightsOutputs(s Submission) ([]WeightsOutput, []byte, *exit.Error) {
+	if len(s.WeightsOutputs) == 0 {
 		return nil, []byte("[]"), nil
 	}
 	if s.Kind != "job" {
-		return nil, nil, exit.Named(exit.Validation, "artifact_output_not_job",
-			"artifact outputs are valid only on a job submission")
+		return nil, nil, exit.Named(exit.Validation, "weights_output_not_job",
+			"weights outputs are valid only on a job submission")
 	}
-	if len(s.ArtifactOutputs) > pb.MaxArtifactReceipts {
-		return nil, nil, exit.Named(exit.Validation, "artifact_output_count_cap",
-			"%d artifact outputs exceeds the protocol cap of %d",
-			len(s.ArtifactOutputs), pb.MaxArtifactReceipts)
+	if len(s.WeightsOutputs) > pb.MaxWeightsReceipts {
+		return nil, nil, exit.Named(exit.Validation, "weights_output_count_cap",
+			"%d weights outputs exceeds the protocol cap of %d",
+			len(s.WeightsOutputs), pb.MaxWeightsReceipts)
 	}
-	rows := append([]ArtifactOutput(nil), s.ArtifactOutputs...)
+	rows := append([]WeightsOutput(nil), s.WeightsOutputs...)
 	sort.Slice(rows, func(i, j int) bool { return rows[i].OutputID < rows[j].OutputID })
 	ids := make(map[string]bool, len(rows))
 	for _, row := range rows {
 		if row.OutputID == "" || ids[row.OutputID] {
-			return nil, nil, exit.Named(exit.Validation, "artifact_output_identity",
-				"artifact output slots are non-empty and unique; %q is repeated or empty", row.OutputID)
+			return nil, nil, exit.Named(exit.Validation, "weights_output_identity",
+				"weights output slots are non-empty and unique; %q is repeated or empty", row.OutputID)
 		}
-		if row.MimeType != ArtifactManifestMime || row.MaxBytes == 0 || row.MaxBytes > (uint64(1)<<53)-1 {
-			return nil, nil, exit.Named(exit.Validation, "artifact_output_contract",
-				"artifact output %s must declare MIME %s and a new-byte cap in 1..2^53-1",
-				row.OutputID, ArtifactManifestMime)
+		if row.MimeType != WeightsManifestMime || row.MaxBytes == 0 || row.MaxBytes > (uint64(1)<<53)-1 {
+			return nil, nil, exit.Named(exit.Validation, "weights_output_contract",
+				"weights output %s must declare MIME %s and a new-byte cap in 1..2^53-1",
+				row.OutputID, WeightsManifestMime)
 		}
 		ids[row.OutputID] = true
 	}
-	// OutputBinding/1 has no kind. Until that schema gap is closed, an ArtifactSink job is
-	// artifact-only so a missing receipt can be classified without guessing about asset slots.
+	// OutputBinding/1 has no kind. Until that schema gap is closed, an WeightsSink job is
+	// weights-only so a missing receipt can be classified without guessing about asset slots.
 	if len(ids) != len(s.Outputs) {
 		return nil, nil, exit.Named(exit.Structural, "mixed_job_output_kinds",
-			"this rev5 lane requires artifact-only jobs; %d artifact slots do not close %d outputs",
+			"this rev5 lane requires weights-only jobs; %d weights slots do not close %d outputs",
 			len(ids), len(s.Outputs))
 	}
 	for _, id := range s.Outputs {
 		if !ids[id] {
 			return nil, nil, exit.Named(exit.Structural, "mixed_job_output_kinds",
-				"job output %q is not in the explicit artifact-output set", id)
+				"job output %q is not in the explicit weights-output set", id)
 		}
 	}
 	data, err := json.Marshal(rows)
 	if err != nil {
-		return nil, nil, exit.Internalf("cannot persist artifact output declarations: %s", err)
+		return nil, nil, exit.Internalf("cannot persist weights output declarations: %s", err)
 	}
 	return rows, data, nil
 }
 
-func decodeArtifactOutputs(data string) ([]ArtifactOutput, *exit.Error) {
+func decodeWeightsOutputs(data string) ([]WeightsOutput, *exit.Error) {
 	if data == "" {
 		return nil, nil
 	}
-	var rows []ArtifactOutput
+	var rows []WeightsOutput
 	if err := json.Unmarshal([]byte(data), &rows); err != nil {
-		return nil, exit.Internalf("cannot decode persisted artifact output declarations: %s", err)
+		return nil, exit.Internalf("cannot decode persisted weights output declarations: %s", err)
 	}
 	return rows, nil
 }
@@ -779,7 +779,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		if e := c.waitPackageStaged(instance); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
-		artifacts, e := decodeArtifactOutputs(req.ArtifactOutputs)
+		weights, e := decodeWeightsOutputs(req.WeightsOutputs)
 		if e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
@@ -787,8 +787,8 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
 			PackageRevisionDigest: logical.ReleaseDigest,
 			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,
-				Outputs:         strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
-				ArtifactOutputs: artifacts, RSSCap: DefaultJobRSSCap, GPUCount: req.JobGPUCount}},
+				Outputs:        strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
+				WeightsOutputs: weights, RSSCap: DefaultJobRSSCap, GPUCount: req.JobGPUCount}},
 		}}
 		if e := c.ConvergeRemoteJob(instance, spec); e != nil {
 			return WorkerLaunchSpec{}, "", e
@@ -949,7 +949,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	if e != nil {
 		return 0, e
 	}
-	artifactOutputs, e := decodeArtifactOutputs(req.ArtifactOutputs)
+	weightsOutputs, e := decodeWeightsOutputs(req.WeightsOutputs)
 	if e != nil {
 		return 0, e
 	}
@@ -964,7 +964,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		ConfigDigest:      configDigest,
 		PayloadDigest:     payloadDigest,
 		Inputs:            inputBindings(req, payloadDigest),
-		Outputs:           invocationOutputBindings(splitList(req.Outputs), artifactOutputs, outputLimit),
+		Outputs:           invocationOutputBindings(splitList(req.Outputs), weightsOutputs, outputLimit),
 		Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{
 			EntrypointBindingDigest: req.PlanID,
 			// With no adapters the binding IS the plan, so the two ids are equal by
@@ -981,7 +981,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			JobDescriptorId: req.PlanID,
 			PublicationContract: &pb.PublicationContract{
 				GrantId: home.ScratchRepo(req.Org, req.ID),
-				Outputs: invocationOutputBindings(splitList(req.Outputs), artifactOutputs, outputLimit),
+				Outputs: invocationOutputBindings(splitList(req.Outputs), weightsOutputs, outputLimit),
 			},
 		}}
 	}
@@ -998,7 +998,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	ordinal, e := c.opt.Store.Dispatch(records.Attempt{
 		RequestID: req.ID, InstanceID: w.instanceID,
 		SessionID: w.bootID, InvocationDigest: spelled, InvocationCanonical: canonicalBytes,
-		ArtifactOutputs: req.ArtifactOutputs,
+		WeightsOutputs: req.WeightsOutputs,
 	})
 	if e != nil {
 		return 0, e
@@ -1247,17 +1247,17 @@ func downloadModelRefs(models []ModelRef) []*pb.DownloadModelRef {
 	return out
 }
 
-func invocationOutputBindings(ids []string, artifacts []ArtifactOutput, defaultMax uint64) []*pb.OutputBinding {
-	byID := map[string]ArtifactOutput{}
-	for _, output := range artifacts {
+func invocationOutputBindings(ids []string, weights []WeightsOutput, defaultMax uint64) []*pb.OutputBinding {
+	byID := map[string]WeightsOutput{}
+	for _, output := range weights {
 		byID[output.OutputID] = output
 	}
 	out := make([]*pb.OutputBinding, 0, len(ids))
 	for _, id := range ids {
 		binding := &pb.OutputBinding{OutputId: id, MaxBytes: defaultMax}
-		if artifact, ok := byID[id]; ok {
-			binding.MimeType = artifact.MimeType
-			binding.MaxBytes = artifact.MaxBytes
+		if weights, ok := byID[id]; ok {
+			binding.MimeType = weights.MimeType
+			binding.MaxBytes = weights.MaxBytes
 		}
 		out = append(out, binding)
 	}

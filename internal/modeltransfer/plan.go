@@ -29,8 +29,8 @@ type JobPin struct {
 }
 
 type OutputPin struct {
-	Name             string                        `json:"name"`
-	RequiredContract *launch.ArtifactModelContract `json:"required_contract,omitempty"`
+	Name             string                       `json:"name"`
+	RequiredContract *launch.WeightsModelContract `json:"required_contract,omitempty"`
 }
 
 type SourceFile struct {

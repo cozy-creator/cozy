@@ -40,9 +40,9 @@ type JobFacts struct {
 	DescriptorID string
 	// Outputs are the job's declared asset result field paths. They ARE the output ids
 	// the publication grant names, one destination each.
-	Outputs         []string
-	ArtifactOutputs []orchestrator.ArtifactOutput
-	SourceProfiles  map[string]string
+	Outputs        []string
+	WeightsOutputs []orchestrator.WeightsOutput
+	SourceProfiles map[string]string
 	// Publishes is the job's own `publishes=` declaration. A grant mints off the
 	// DECLARATION, never off the kind (cr-009).
 	Publishes bool
@@ -85,10 +85,10 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	cache := filepath.Join(f.Install.Dir, "artifact-cache")
 	environmentPython := home.VenvPython(filepath.Join(f.Install.Dir, "venv"))
 	placement.Jobs = []*orchestrator.JobPlan{{
-		Function:        facts.Name,
-		DescriptorID:    facts.DescriptorID,
-		Outputs:         facts.Outputs,
-		ArtifactOutputs: facts.ArtifactOutputs,
+		Function:       facts.Name,
+		DescriptorID:   facts.DescriptorID,
+		Outputs:        facts.Outputs,
+		WeightsOutputs: facts.WeightsOutputs,
 		// The record's key set is CLOSED at both ends: `plan.py::JobBinding.read`
 		// refuses an unknown key, exactly as the binding record's reader does.
 		Record: map[string]any{
@@ -155,20 +155,20 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 			WithRemedy("the id is the runtime's own derivation (cr-016); a release pinning an older runtime cannot be dispatched by it")
 	}
 	assets := AssetPaths(declared.Result)
-	if len(assets) > 0 && len(declared.ArtifactOutputs) > 0 {
+	if len(assets) > 0 && len(declared.WeightsOutputs) > 0 {
 		return nil, exit.Named(exit.Structural, "mixed_job_output_kinds",
-			"job %s mixes %d result asset output(s) with %d artifact output(s); rev5 OutputBinding cannot distinguish them",
-			function, len(assets), len(declared.ArtifactOutputs))
+			"job %s mixes %d result asset output(s) with %d weights output(s); rev5 OutputBinding cannot distinguish them",
+			function, len(assets), len(declared.WeightsOutputs))
 	}
-	artifactOutputs := make([]orchestrator.ArtifactOutput, 0, len(declared.ArtifactOutputs))
+	weightsOutputs := make([]orchestrator.WeightsOutput, 0, len(declared.WeightsOutputs))
 	outputs := append([]string(nil), assets...)
-	for _, output := range declared.ArtifactOutputs {
+	for _, output := range declared.WeightsOutputs {
 		var contract *records.ModelTransferContract
 		if output.RequiredContract != nil {
 			contract = &records.ModelTransferContract{TopologyDigest: output.RequiredContract.TopologyDigest,
 				Encodings: append([]string(nil), output.RequiredContract.Encodings...)}
 		}
-		artifactOutputs = append(artifactOutputs, orchestrator.ArtifactOutput{
+		weightsOutputs = append(weightsOutputs, orchestrator.WeightsOutput{
 			OutputID: output.OutputID, MimeType: output.MimeType, MaxBytes: output.MaxBytes,
 			RequiredContract: contract,
 		})
@@ -176,8 +176,8 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	}
 	facts := &JobFacts{
 		Name: function, Request: declared.Request, DescriptorID: said.DescriptorID, Outputs: outputs,
-		ArtifactOutputs: artifactOutputs,
-		Publishes:       declared.Publishes, GPUCount: declared.RequiredGPUCount(),
+		WeightsOutputs: weightsOutputs,
+		Publishes:      declared.Publishes, GPUCount: declared.RequiredGPUCount(),
 		Requires: declared.Resources.Requires,
 	}
 	if len(declared.Models) > 0 {

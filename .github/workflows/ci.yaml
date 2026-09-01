@@ -21,12 +21,14 @@ jobs:
       # the real system — the real orchestrator, an auto-started Cozy daemon process, and
       # `tests/support/fakeworker`, a second independent implementation of the worker protocol —
       # and observes what it does. Nothing in it is a mock. The tests that need a peer this
-      # runner does not have (worker-protocol's frozen corpus or a cozy-runtime checkout)
-      # SKIP by name rather than passing vacuously.
+      # runner does not have (a cozy-runtime checkout) SKIP by name rather than passing
+      # vacuously.
       #
-      # A skip is still a green, so the frozen-corpus skip is not left to this job to notice:
-      # `vendored-protocol` below provisions the corpus and runs TestCanonicalDocuments with
-      # -require-worker-protocol-fixtures, where a skip is a hard failure instead.
+      # worker-protocol's frozen corpus is no longer one of them. It is vendored at
+      # tests/product/testdata/worker-protocol under its own digest manifest, so the
+      # cross-language identity fence and both vendored-tree guards run HERE, with no token
+      # and no sibling checkout. `vendored-protocol` below adds upstream provenance on top;
+      # it is a ceiling, not the floor.
       - run: nice -n 19 go test ./... -timeout 20m
       - run: python3 scripts/fence.py
 
@@ -66,24 +68,27 @@ jobs:
       - name: Compare against current peer
         if: env.WORKER_PROTOCOL_TOKEN != ''
         run: worker-protocol/scripts/vendored-diff.sh cozy/protocol/cozy/worker/v1
-      # THE CROSS-LANGUAGE IDENTITY FENCE. TestCanonicalDocuments reproduces worker-protocol's
-      # frozen documents against this repo's production Go writer and checks the vendored wire
-      # minor against the one the corpus was frozen at. The corpus lives in the private schema
-      # repo, so this job — the one that already has it checked out — is where the test can
-      # actually run. -require-worker-protocol-fixtures turns a missing corpus from a silent
-      # skip into a failure: the skip is how a whole wire minor of skew went unnoticed.
-      - name: Cross-language canonical identity fence
+      # The peer half of the vendored guard, for BOTH vendored trees: the generated bindings
+      # and the frozen canonical corpus. vendored-diff.sh above proves the bindings match a
+      # REGENERATION; this proves both trees are the bytes of the commit their SOURCE names,
+      # and says so loudly when upstream has frozen a newer one. -require-worker-protocol-peer
+      # turns an unwired checkout into a failure rather than a pass — a skip is how a whole
+      # wire minor of skew went unnoticed.
+      #
+      # The cross-language identity fence itself is NOT here any more. The corpus is vendored
+      # at cozy/tests/product/testdata/worker-protocol, so TestCanonicalDocuments runs in the
+      # ordinary `checks` job with no token at all. This job adds provenance on top of it.
+      - name: Vendored provenance and drift
         if: env.WORKER_PROTOCOL_TOKEN != ''
         working-directory: cozy
         run: |
-          nice -n 19 go test ./tests/product/ -run 'TestCanonical' -v -timeout 10m \
-            -worker-protocol-fixtures="$GITHUB_WORKSPACE/worker-protocol/fixtures" \
-            -require-worker-protocol-fixtures
+          nice -n 19 go test ./tests/product/ -run 'TestVendor|TestWireMinor|TestCorpus' -v -timeout 5m \
+            -worker-protocol-repo="$GITHUB_WORKSPACE/worker-protocol" \
+            -require-worker-protocol-peer
       - name: Report unarmed peer drift check
         if: env.WORKER_PROTOCOL_TOKEN == ''
         run: |
-          echo '::warning::WORKER_PROTOCOL_TOKEN is absent; Git tracks local vendored-byte changes, but private-upstream provenance and drift were not queried'
-          echo '::warning::WORKER_PROTOCOL_TOKEN is absent; the frozen corpus could not be checked out, so TestCanonicalDocuments SKIPPED and no cross-language canonical identity was verified'
+          echo '::warning::WORKER_PROTOCOL_TOKEN is absent; private-upstream provenance and drift were not queried. This is a missing ceiling, not a missing floor: the always-armed half ran in `checks` with no token — SOURCE digests and exact file lists over both vendored trees, compiled WireMinor against the recorded wire_minor and the frozen corpus, and the full TestCanonicalDocuments cross-language identity fence against the vendored corpus.'
 
   # cl-013's SHIPPED GUARD. A green `checks` is a fact about the source tree; this job is a
   # fact about the artifact a user would install. They are separate evidence axes and a

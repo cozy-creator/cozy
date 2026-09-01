@@ -267,7 +267,7 @@ func migrateRequestsSix(tx *sql.Tx, path string) *exit.Error {
 	columns := `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
 		package_revision_digest,private_package_digest,private_package_uploaded_boot_id,
 		environment_digest,config_digest,payload,outputs,state,ordinal,requeues,created_at,kind,
-		job_gpu_count,org,trees,worker,rental,install_id,assets,models,artifact_outputs`
+		job_gpu_count,org,trees,worker,rental,install_id,assets,models,weights_outputs`
 	if _, err := tx.Exec(`INSERT INTO requests(` + columns + `) SELECT ` + columns +
 		` FROM requests_schema6`); err != nil {
 		return exit.Internalf("cannot preserve request rows while migrating %s: %s", path, err)

@@ -30,6 +30,19 @@
 // BYTES NAMING LAW: a `bytes` field named `digest`, `*_digest`, or repeated `*_digests` IS a
 // 32-byte SHA-256; every other `bytes` field is an opaque payload (base64 in documents).
 //
+// THE CONTROL STREAM CARRIES CONTROL, NOT CONTENT. No frame moves an object's bytes. Every
+// content-bearing field is bounded by a constant, and every one of those constants is <=
+// `MaxInlineControlBytes` (4 MiB) PER TRANSFER -- not per chunk. The distinction is the whole
+// rule: a 4 MiB frame is fine, and a 4 MiB frame sent 2,048 times to move 8 GiB is the defect,
+// because the total it moves is bounded by nothing. Anything larger than the ceiling travels
+// as a presigned URL to the process that holds the bytes, which is what `WeightsUploadGrant`
+// and `DeliveryGrant.outputs` already do. `MaxWeightsReadBytes` is a bounded RANGE of an
+// object an owner explicitly asked for, not a quantum of an unbounded whole.
+//
+// Private package upload does not obey this yet (`MaxPrivatePackageFileBytes` 512 MiB,
+// `MaxPrivatePackageAggregateBytes` 1 GiB, moved in 1 MiB chunks). It is tracked as th-094 and
+// the mechanical fence lands with it, because a rule with a carve-out is worse than no rule.
+//
 // DOCUMENT VERSIONS. Every current pre-release document is `/1`. A digest-fenced document is NOT
 // additively versioned: an unknown key REFUSES, and shape changes hardcut the `/1` definition
 // across every writer, reader, and stored byte together. The canonical `format` tag is the

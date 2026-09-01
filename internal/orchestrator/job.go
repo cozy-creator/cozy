@@ -43,9 +43,9 @@ type JobPlan struct {
 	// Outputs are the job's declared asset result field paths — the output ids the
 	// publication grant names, one destination each. Grants mint off the DECLARATION.
 	Outputs []string
-	// ArtifactOutputs is the explicit ArtifactSink subset. Empty keeps an ordinary asset
-	// job on the existing publication path; non-empty is the M0 artifact-only contract.
-	ArtifactOutputs []ArtifactOutput
+	// WeightsOutputs is the explicit WeightsSink subset. Empty keeps an ordinary asset
+	// job on the existing publication path; non-empty is the M0 weights-only contract.
+	WeightsOutputs []WeightsOutput
 	// Record is the closed key set `plan.py::JobBinding.read` accepts. An unknown key is
 	// a refusal at the worker, which is what makes "closed at both ends" a fact.
 	Record   map[string]any
@@ -102,7 +102,7 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker) *exit.Error {
 			// drains a queue publishes into a different scratch repo per request.
 			PublicationContract: &pb.PublicationContract{
 				GrantId: home.ScratchRepo("local", "queue"),
-				Outputs: invocationOutputBindings(plan.Outputs, plan.ArtifactOutputs, c.maxOutputBytes()),
+				Outputs: invocationOutputBindings(plan.Outputs, plan.WeightsOutputs, c.maxOutputBytes()),
 			},
 			// TERMINAL AND RECLAIM, everywhere. A job worker is one immutable build
 			// running one bounded attempt; deep queueing is the orchestrator's dispatch
@@ -211,7 +211,7 @@ func (c *Orchestrator) jobGrant(req records.Request, attempt uint64) (*pb.Delive
 		// NO EXPIRY — the same reading as the serving grant, and a job is where the old
 		// constant did real damage: 6 hours is a ceiling on what a run-to-completion
 		// conversion may be, and job-001 is the incident where one of these killed a
-		// 99 GB artifact that had already landed. The stage's lifetime is the ATTEMPT's:
+		// 99 GB weights that had already landed. The stage's lifetime is the ATTEMPT's:
 		// `promote` moves the bytes across once the terminal is verified, and that is the
 		// event that ends this grant's usefulness. A clock never knew about it.
 		ExpiresAtUnix: 0,

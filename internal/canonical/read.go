@@ -93,90 +93,90 @@ func parseObject(data []byte) (Doc, error) {
 func semantics(name string, d Doc) error {
 	switch name {
 	case "cozy.worker.v1.AttemptOutcomeBody":
-		return artifactReceiptList(d)
-	case "cozy.worker.v1.ArtifactReceipt":
-		return artifactReceipt(d)
+		return weightsReceiptList(d)
+	case "cozy.worker.v1.WeightsReceipt":
+		return weightsReceipt(d)
 	}
 	return nil
 }
 
-func artifactReceiptList(d Doc) error {
-	raw, present := d["artifact_receipts"]
+func weightsReceiptList(d Doc) error {
+	raw, present := d["weights_receipts"]
 	if !present {
 		return nil
 	}
 	items, ok := raw.([]Value)
 	if !ok || len(items) == 0 {
-		return refuse("artifact_receipt_shape", "artifact_receipts is a non-empty list when present")
+		return refuse("weights_receipt_shape", "weights_receipts is a non-empty list when present")
 	}
-	if len(items) > pb.MaxArtifactReceipts {
-		return refuse("artifact_receipt_count_cap", "%d receipts exceeds the %d-item cap",
-			len(items), pb.MaxArtifactReceipts)
+	if len(items) > pb.MaxWeightsReceipts {
+		return refuse("weights_receipt_count_cap", "%d receipts exceeds the %d-item cap",
+			len(items), pb.MaxWeightsReceipts)
 	}
 	aggregate, prior := 0, ""
 	for _, item := range items {
 		fields, ok := item.(map[string]Value)
 		if !ok {
-			return refuse("artifact_receipt_shape", "an artifact_receipts item is not an object")
+			return refuse("weights_receipt_shape", "an weights_receipts item is not an object")
 		}
-		receipt, size, err := readArtifactReceiptRef(Doc(fields))
+		receipt, size, err := readWeightsReceiptRef(Doc(fields))
 		if err != nil {
 			return err
 		}
 		aggregate += size
 		slot := receipt.Str("output_slot")
 		if slot <= prior {
-			return refuse("artifact_receipt_order", "output slot %q is not strictly after %q", slot, prior)
+			return refuse("weights_receipt_order", "output slot %q is not strictly after %q", slot, prior)
 		}
 		prior = slot
 	}
-	if aggregate > pb.MaxArtifactReceiptAggregateBytes {
-		return refuse("artifact_receipt_aggregate_cap", "%d receipt bytes exceeds the %d-byte cap",
-			aggregate, pb.MaxArtifactReceiptAggregateBytes)
+	if aggregate > pb.MaxWeightsReceiptAggregateBytes {
+		return refuse("weights_receipt_aggregate_cap", "%d receipt bytes exceeds the %d-byte cap",
+			aggregate, pb.MaxWeightsReceiptAggregateBytes)
 	}
 	return nil
 }
 
-func artifactReceipt(d Doc) error {
+func weightsReceipt(d Doc) error {
 	for _, field := range []string{"owner_authority_scope", "request_id", "invocation_spec_digest",
-		"output_slot", "artifact_transaction_id", "tensorfs_receipt_digest",
+		"output_slot", "weights_transaction_id", "tensorfs_receipt_digest",
 		"tensorfs_receipt_canonical_bytes"} {
 		if d.Str(field) == "" {
-			return refuse("artifact_receipt_incomplete", "%s is empty or absent", field)
+			return refuse("weights_receipt_incomplete", "%s is empty or absent", field)
 		}
 	}
 	nested, err := decodeCanonicalBytes(d.Str("tensorfs_receipt_canonical_bytes"))
 	if err != nil {
-		return refuse("artifact_receipt_nested_malformed", "%s", err)
+		return refuse("weights_receipt_nested_malformed", "%s", err)
 	}
 	if !sameDigest(nested, d.Str("tensorfs_receipt_digest")) {
-		return refuse("artifact_receipt_nested_digest_mismatch",
+		return refuse("weights_receipt_nested_digest_mismatch",
 			"tensorfs_receipt_digest does not hash the exact carried bytes")
 	}
 	if _, err := Raw(d.Str("invocation_spec_digest")); err != nil {
-		return refuse("artifact_receipt_identity_malformed", "invocation_spec_digest: %s", err)
+		return refuse("weights_receipt_identity_malformed", "invocation_spec_digest: %s", err)
 	}
 	return nil
 }
 
-func readArtifactReceiptRef(ref Doc) (Doc, int, error) {
-	if len(ref) != 2 || ref.Str("artifact_receipt_digest") == "" ||
-		ref.Str("artifact_receipt_canonical_bytes") == "" {
-		return nil, 0, refuse("artifact_receipt_ref_shape", "the reference has exactly digest and bytes")
+func readWeightsReceiptRef(ref Doc) (Doc, int, error) {
+	if len(ref) != 2 || ref.Str("weights_receipt_digest") == "" ||
+		ref.Str("weights_receipt_canonical_bytes") == "" {
+		return nil, 0, refuse("weights_receipt_ref_shape", "the reference has exactly digest and bytes")
 	}
-	data, err := decodeCanonicalBytes(ref.Str("artifact_receipt_canonical_bytes"))
+	data, err := decodeCanonicalBytes(ref.Str("weights_receipt_canonical_bytes"))
 	if err != nil {
-		return nil, 0, refuse("artifact_receipt_malformed", "%s", err)
+		return nil, 0, refuse("weights_receipt_malformed", "%s", err)
 	}
-	if len(data) == 0 || len(data) > pb.MaxArtifactReceiptBytes {
-		return nil, 0, refuse("artifact_receipt_item_cap", "%d B is outside the 1..%d B range",
-			len(data), pb.MaxArtifactReceiptBytes)
+	if len(data) == 0 || len(data) > pb.MaxWeightsReceiptBytes {
+		return nil, 0, refuse("weights_receipt_item_cap", "%d B is outside the 1..%d B range",
+			len(data), pb.MaxWeightsReceiptBytes)
 	}
-	if !sameDigest(data, ref.Str("artifact_receipt_digest")) {
-		return nil, 0, refuse("artifact_receipt_digest_mismatch",
-			"artifact_receipt_digest does not hash the exact carried bytes")
+	if !sameDigest(data, ref.Str("weights_receipt_digest")) {
+		return nil, 0, refuse("weights_receipt_digest_mismatch",
+			"weights_receipt_digest does not hash the exact carried bytes")
 	}
-	receipt, err := Read(data, &pb.ArtifactReceipt{})
+	receipt, err := Read(data, &pb.WeightsReceipt{})
 	return receipt, len(data), err
 }
 
