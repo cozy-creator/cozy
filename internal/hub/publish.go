@@ -138,9 +138,15 @@ func (c *Client) GrantKnownTransfers(ctx context.Context, ref Ref, operation str
 }
 
 type FinalizePublicationRequest struct {
-	ManifestID               string `json:"manifest_id"`
-	ManifestLength           int64  `json:"manifest_length"`
-	CheckpointEvidenceBase64 string `json:"checkpoint_evidence_base64"`
+	ManifestID               string                 `json:"manifest_id"`
+	ManifestLength           int64                  `json:"manifest_length"`
+	CheckpointEvidenceBase64 string                 `json:"checkpoint_evidence_base64"`
+	ExpectedContract         *ExpectedModelContract `json:"expected_contract,omitempty"`
+}
+
+type ExpectedModelContract struct {
+	TopologyDigest string   `json:"topology_digest"`
+	Encodings      []string `json:"encodings"`
 }
 
 type ManifestRef struct {

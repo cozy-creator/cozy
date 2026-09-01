@@ -493,12 +493,24 @@ func (t *Tool) InstallLocal(session, name, sourceSelection, observed, sourceURI,
 // ReplaceLocal atomically points Creator's one local alias at an already verified
 // ArtifactSink Manifest. TensorFS owns the evidence parse, manifest verification,
 // repository bytes, and compare-and-swap; Creator supplies only frozen identities.
+type ExpectedModelContract struct {
+	TopologyDigest string
+	Encodings      []string
+}
+
 func (t *Tool) ReplaceLocal(name, sourceSelection, observed, manifestID string,
-	manifestLength int64, evidencePath string,
+	manifestLength int64, evidencePath string, contract *ExpectedModelContract,
 ) (LocalAlias, *exit.Error) {
-	out, problem := t.run("local", "replace", t.Root, name, sourceSelection,
+	args := []string{"local", "replace", t.Root, name, sourceSelection,
 		manifestID, strconv.FormatInt(manifestLength, 10), "--observed", observed,
-		"--evidence", evidencePath)
+		"--evidence", evidencePath}
+	if contract != nil {
+		args = append(args, "--expected-topology", contract.TopologyDigest)
+		for _, encoding := range contract.Encodings {
+			args = append(args, "--expected-encoding", encoding)
+		}
+	}
+	out, problem := t.run(args...)
 	if problem != nil {
 		return LocalAlias{}, problem
 	}

@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/modelproduction"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -31,13 +30,6 @@ func TestRecordsSchemasSixThroughEightMigrateWithoutDroppingDurableRows(t *testi
 				MediaAddress: "127.0.0.1:9444", ExpectedWorkerID: "worker-proof",
 				ExpectedWorkerBootID: "boot-proof"}
 			fatal(t, store.RecordRental(rental))
-			instruction := modelproduction.Instruction{Destination: "proof/migrate",
-				Source:   "hf://proof/source@" + strings.Repeat("c", 40),
-				Producer: "proof/tools/build", Rental: true}
-			beginAcceptedModelProduction(t, store, modelproduction.Plan{
-				Instruction: instruction, Destination: instruction.Destination,
-				Source: instruction.Source,
-			})
 			store.Close()
 			db, err := sql.Open("sqlite", database)
 			must(t, err)
@@ -68,11 +60,6 @@ func TestRecordsSchemasSixThroughEightMigrateWithoutDroppingDurableRows(t *testi
 			fatal(t, problem)
 			if migratedRental == nil || *migratedRental != rental {
 				t.Fatalf("schema migration dropped or changed rental row: %#v", migratedRental)
-			}
-			productions, problem := store.ModelProductions("any", 50)
-			fatal(t, problem)
-			if len(productions) != 0 {
-				t.Fatalf("schema migration retained pre-account model productions: %+v", productions)
 			}
 		})
 	}

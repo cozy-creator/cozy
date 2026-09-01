@@ -86,8 +86,6 @@ type Server struct {
 	// cooperative tier (#449). The route refuses when the builder wired none.
 	shutdown func()
 
-	modelProductions ModelProductionController
-
 	// lifecycle serializes ordinary mutations against the safe-down fence. Once down
 	// commits, no request can slip in after the active-work read and before listeners
 	// close; mutations already in flight finish before the fence reads the records.
@@ -106,7 +104,8 @@ type Resolver interface {
 	ResolveInstall(installID string, models []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error)
 	ResolveRemoteRelease(pkg, release, digest, function string, models []orchestrator.ModelRef) (
 		orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error)
-	ResolveRemoteJob(pkg, release, digest, function string, models []orchestrator.ModelRef) (
+	ResolveRemoteJob(pkg, release, digest, function string, models []orchestrator.ModelRef,
+		deferredModels bool) (
 		orchestrator.LogicalJob, *exit.Error)
 	Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error)
 	// Jobs names the `@job` functions one installed package registers, with the
@@ -130,9 +129,6 @@ type Options struct {
 	Rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 	// Shutdown is the cooperative-down hook the shutdown route calls (#449).
 	Shutdown func()
-	// ModelProductions is the daemon-owned submit/resume/cancel driver. The API
-	// still reads lifecycle rows from the one records store.
-	ModelProductions ModelProductionController
 }
 
 // New builds the server and its route table. It binds nothing; Listeners does that.
@@ -145,7 +141,6 @@ func New(opt Options) *Server {
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
 		addr: opt.Addr, log: opt.Log, web: opt.Web, packages: opt.Packages,
 		rentals: opt.Rentals, shutdown: opt.Shutdown,
-		modelProductions: opt.ModelProductions,
 	}
 }
 
@@ -155,29 +150,24 @@ func New(opt Options) *Server {
 func (s *Server) Handler() (http.Handler, *exit.Error) {
 	mux := http.NewServeMux()
 	handlers := map[string]http.HandlerFunc{
-		"POST /v1/requests":                            s.submit,
-		"GET /v1/requests":                             s.listRequests,
-		"GET /v1/requests/{id}":                        s.getRequest,
-		"POST /v1/requests/{id}/cancel":                s.cancelRequest,
-		"GET /v1/requests/{id}/events":                 s.requestEvents,
-		"GET /v1/media/{media_id}":                     s.media,
-		"POST /v1/uploads":                             s.putUpload,
-		"GET /v1/uploads/{upload_id}":                  s.getUpload,
-		"POST /v1/local/rentals/{rental_id}/claim":     s.claimRental,
-		"DELETE /v1/local/rentals/{rental_id}/claim":   s.detachRental,
-		"POST /v1/local/daemon/unload":                 s.unload,
-		"POST /v1/local/daemon/down":                   s.downDaemon,
-		"POST /v1/local/jobs":                          s.submitJob,
-		"GET /v1/local/jobs/{id}":                      s.getJob,
-		"POST /v1/local/jobs/{id}/cancel":              s.cancelJob,
-		"POST /v1/local/model-productions":             s.submitModelProduction,
-		"GET /v1/local/model-productions":              s.listModelProductions,
-		"GET /v1/local/model-productions/{id}":         s.getModelProduction,
-		"POST /v1/local/model-productions/{id}/cancel": s.cancelModelProduction,
-		"POST /v1/local/model-productions/{id}":        s.modelProductionAction,
-		"GET /{$}":                                     s.webUI,
-		"GET /app.css":                                 s.webUI,
-		"GET /app.js":                                  s.webUI,
+		"POST /v1/requests":                          s.submit,
+		"GET /v1/requests":                           s.listRequests,
+		"GET /v1/requests/{id}":                      s.getRequest,
+		"POST /v1/requests/{id}/cancel":              s.cancelRequest,
+		"GET /v1/requests/{id}/events":               s.requestEvents,
+		"GET /v1/media/{media_id}":                   s.media,
+		"POST /v1/uploads":                           s.putUpload,
+		"GET /v1/uploads/{upload_id}":                s.getUpload,
+		"POST /v1/local/rentals/{rental_id}/claim":   s.claimRental,
+		"DELETE /v1/local/rentals/{rental_id}/claim": s.detachRental,
+		"POST /v1/local/daemon/unload":               s.unload,
+		"POST /v1/local/daemon/down":                 s.downDaemon,
+		"POST /v1/local/jobs":                        s.submitJob,
+		"GET /v1/local/jobs/{id}":                    s.getJob,
+		"POST /v1/local/jobs/{id}/cancel":            s.cancelJob,
+		"GET /{$}":                                   s.webUI,
+		"GET /app.css":                               s.webUI,
+		"GET /app.js":                                s.webUI,
 	}
 	registered := map[string]bool{}
 	for _, r := range Routes {

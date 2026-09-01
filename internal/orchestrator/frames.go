@@ -32,7 +32,7 @@ func (c *Orchestrator) dropSession(s *session) {
 	c.mu.Unlock()
 	// The out channel is closed by `converse`'s own defer — one owner, one close.
 	c.logf("control stream for boot %s closed", s.bootID)
-	c.signalAllProductions()
+	c.signalAllTransfers()
 }
 
 // jobMode answers whether the worker behind this session was launched in job mode.
@@ -618,6 +618,12 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	// being minted.
 	requeuing := requeueable(status, cause, origin, executionStarted)
 	kept := triage.keep(status, cause, doc.Str("safe_message"), outputs, requeuing)
+	requestState := requeueState(status, requeuing)
+	if req.ModelTransfer != nil && status == "SUCCEEDED" && !requeuing {
+		requestState = "finalizing"
+		kept.Type = "request.finalizing"
+		kept.Payload = map[string]any{"status": "FINALIZING", "outputs": []any{}, "requeuing": false}
+	}
 	artifactFinalizations, e := artifactFinalizationIntents(
 		*req, *attemptRow, status, requeuing, receiptsBySlot)
 	if e != nil {
@@ -659,7 +665,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		// A requeueing request is QUEUED for its next ordinal, not failed. Writing the
 		// attempt's own status onto the request row would make the status document say
 		// `failed` for a request that is still going.
-		RequestState: requeueState(status, requeuing),
+		RequestState: requestState,
 		Publication:  publication,
 	})
 	if e != nil {
@@ -718,6 +724,11 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 	requeue := req.State == "requeue_pending"
 	c.cleanupAttempt(req, uint64(attempt.Attempt), holder, !requeue)
 	verdict := outcomeError(attempt.TerminalStatus, attempt.TerminalCause, attempt.SafeMessage)
+	if req.ModelTransfer != nil && req.State == "failed" {
+		if transfer, problem := c.opt.Store.ModelTransferOf(req.ID); problem == nil && transfer != nil {
+			verdict = exit.Named(exit.Failed, transfer.ErrorCode, "%s", transfer.SafeError)
+		}
+	}
 	c.signalClosed(key(req.ID, uint64(attempt.Attempt)), verdict)
 	if requeue {
 		c.Requeue(req.ID, attempt.TerminalStatus+"/"+attempt.TerminalCause)

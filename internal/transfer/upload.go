@@ -60,6 +60,7 @@ type Upload struct {
 	// output. When present, it avoids inventing a temporary repository merely so
 	// the privileged transfer finalizer can read bytes it already owns.
 	CheckpointEvidence []byte
+	ExpectedContract   *hub.ExpectedModelContract
 	// ManifestID is the local canonical manifest being published.
 	ManifestID string
 	Session    string
@@ -143,6 +144,7 @@ func (p *Upload) Run(ctx context.Context) (Result, *exit.Error) {
 	finalize := hub.FinalizePublicationRequest{
 		ManifestID: p.ManifestID, ManifestLength: manifestInfo.Size(),
 		CheckpointEvidenceBase64: hub.B64(evidence),
+		ExpectedContract:         p.ExpectedContract,
 	}
 	declared := make([]hub.Object, 0, len(objects)+1)
 	for _, o := range objects {

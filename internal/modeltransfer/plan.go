@@ -1,7 +1,7 @@
-// Package modelproduction owns the stable identity of one source-to-checkpoints
+// Package modeltransfer owns the stable identity of one source-to-destination request.
 // instruction. It deliberately contains no scheduler, provider capability, URL,
 // worker, rental, grant, clock, or retry field.
-package modelproduction
+package modeltransfer
 
 import (
 	"bytes"
@@ -80,11 +80,7 @@ func (i Instruction) Digest() (string, error) {
 func (i Instruction) ID() string {
 	data, _ := i.Bytes()
 	sum := sha256.Sum256(append([]byte("cozy-model-transfer-instruction/1\x00"), data...))
-	prefix := "modelupload-"
-	if i.Kind == "model-download" {
-		prefix = "modeldownload-"
-	}
-	return prefix + hex.EncodeToString(sum[:])
+	return "modeltransfer-" + hex.EncodeToString(sum[:])
 }
 
 type Plan struct {
@@ -177,7 +173,7 @@ func (p Plan) ID() string {
 		_, _ = io.WriteString(hash, fmt.Sprint(value))
 		_, _ = hash.Write([]byte{0})
 	}
-	return "modelupload-" + hex.EncodeToString(hash.Sum(nil))
+	return "modeltransfer-" + hex.EncodeToString(hash.Sum(nil))
 }
 
 func (p Plan) OutputNames() []string {

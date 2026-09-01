@@ -539,7 +539,7 @@ def check_manifest():
         "List PackageListCmd", "Publish PackagePublishCmd",
         "Search ModelSearchCmd", "Download ModelDownloadCmd", "Remove ModelRemoveCmd",
         "List ModelListCmd", "Upload ModelUploadCmd", "Publish ModelPublishCmd", "Yank ModelYankCmd",
-        "Execute RunExecuteCmd", "Cancel RunCancelCmd", "List RunListCmd",
+        "Execute RunExecuteCmd", "Cancel RunCancelCmd", "List RunListCmd", "Watch RunWatchCmd",
         "Current RentalListCmd", "New RentalNewCmd", "End RentalEndCmd",
     )
     bad = [f"[grammar] missing Kong command field {item!r}" for item in required if item not in fields]
@@ -560,8 +560,17 @@ def check_manifest():
     for path, spelling in derived_audits.items():
         if spelling not in pathlib.Path(path).read_text():
             bad.append(f"[grammar] {path} no longer derives its internal audit reason from exact operation facts")
-    if '"cozy-model-upload/1"' not in pathlib.Path("internal/modelproduction/plan.go").read_text():
-        bad.append("[grammar] model upload no longer derives one domain-separated operation identity")
+    transfer_plan = pathlib.Path("internal/modeltransfer/plan.go")
+    if not transfer_plan.is_file() or '"cozy-model-transfer-instruction/1\\x00"' not in transfer_plan.read_text():
+        bad.append("[grammar] model transfer dry-run identity lost its domain separation")
+    for retired in (
+        "internal/api/model_production.go",
+        "internal/cli/model_production_manager.go",
+        "internal/cli/model_production_run.go",
+        "internal/records/model_productions.go",
+    ):
+        if pathlib.Path(retired).exists():
+            bad.append(f"[grammar] retired special model-production lifecycle remains: {retired}")
     app = pathlib.Path("internal/cli/app.go").read_text()
     for spelling in VERSION_SPELLINGS:
         if spelling not in app:

@@ -46,13 +46,8 @@ type JobSubmission struct {
 	Worker string `json:"worker,omitempty"`
 	// Models are exact derive-only Manifest capabilities. No path or model bytes
 	// cross this local API.
-	Models []orchestrator.ModelRef `json:"models,omitempty"`
-	// Production fields are private two-phase journal joins. They let the daemon
-	// bind the request id before dispatch, so an immediate ArtifactReceipt cannot
-	// outrun its owning model-production row.
-	ProductionOperationID string `json:"production_operation_id,omitempty"`
-	ProductionStep        string `json:"production_step,omitempty"`
-	ProductionStepIndex   int64  `json:"production_step_index,omitempty"`
+	Models        []orchestrator.ModelRef      `json:"models,omitempty"`
+	ModelTransfer *records.ModelTransferIntent `json:"model_transfer,omitempty"`
 	// Org is the publishing org whose SCRATCH repo this job lands in
 	// (`<org>/_job-<request-id>`). It defaults to `local` — a local host has no identity
 	// plane yet (decisions #229) and inventing one would be a fake account.
@@ -108,7 +103,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			"the submission is not one closed JSON object: "+detail, "")
 		return
 	}
-	if sub.Package == "" || sub.Function == "" {
+	passThrough := sub.ModelTransfer != nil && sub.Package == "" && sub.Function == ""
+	if !passThrough && (sub.Package == "" || sub.Function == "") {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
 			"a job submission names a package and a job function",
 			`{"package":"org/name","function":"census","input":{…}}`)
@@ -117,9 +113,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// A job's trees name HOST DIRECTORIES that become read/write worker grants — the same
 	// authority local_assets carry on /v1/requests (requests.go) — so they take the same
 	// gate: a browser bearer must never name host paths (credentials.go).
-	production := sub.ProductionOperationID != "" || sub.ProductionStep != "" ||
-		sub.ProductionStepIndex != 0
-	if (len(sub.Trees) > 0 || sub.Worker != "" || len(sub.Models) > 0 || production) &&
+	if (len(sub.Trees) > 0 || sub.Worker != "" || len(sub.Models) > 0 ||
+		sub.ModelTransfer != nil) &&
 		!s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"trees name host filesystem directories and require the OS-protected CLI credential",
@@ -146,6 +141,14 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, e)
 		return
 	}
+	if e = validateModelTransferSubmission(spec); e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
+	if e = records.NormalizeModelTransferIntent(spec.ModelTransfer); e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
 	spec.IdemKey = key
 	digest, e := jobSubmissionDigest(spec)
 	if e != nil {
@@ -158,31 +161,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// orchestrator records the row, queues it and makes the worker resident; several jobs
 	// submitted at once queue against ONE worker and drain in submission order
 	// (owner directive, decisions #394 / cr-019).
-	var jobID string
-	var attempt uint64
-	var fresh bool
-	if production {
-		if sub.ProductionOperationID == "" || sub.ProductionStep == "" ||
-			sub.ProductionStepIndex < 0 {
-			s.refuse(w, r, http.StatusBadRequest, "model_production.step_identity_invalid",
-				"production job submission requires operation, step, and non-negative index", "")
-			return
-		}
-		var recorded records.Request
-		recorded, fresh, e = s.orchestrator.RecordSubmission(spec)
-		if e == nil {
-			jobID = recorded.ID
-			e = s.store.SetModelProductionStepRequest(sub.ProductionOperationID,
-				sub.ProductionStepIndex, sub.ProductionStep, jobID, "submitted")
-		}
-		if e == nil && fresh {
-			attempt, e = s.orchestrator.ActivateRecordedRequest(recorded)
-		} else if e == nil {
-			attempt = uint64(recorded.Ordinal)
-		}
-	} else {
-		jobID, attempt, fresh, e = s.orchestrator.SubmitDetail(spec)
-	}
+	jobID, attempt, fresh, e := s.orchestrator.SubmitDetail(spec)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
@@ -212,6 +191,57 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 	}
 	s.ok(w, r, status, handle)
+}
+
+func validateModelTransferSubmission(spec orchestrator.Submission) *exit.Error {
+	intent := spec.ModelTransfer
+	if intent == nil {
+		return nil
+	}
+	if spec.Package == "cozy/platform" {
+		if len(intent.Outputs) != 1 || intent.Outputs[0].Name != "model" ||
+			intent.Outputs[0].RequiredContract != nil {
+			return exit.New(exit.Validation, "platform pass-through requires exactly output model")
+		}
+		return nil
+	}
+	if len(intent.SourceProfiles) == 0 || len(intent.Outputs) != len(spec.ArtifactOutputs) ||
+		!sameProfileMap(intent.SourceProfiles, spec.ProducerProfiles) {
+		return exit.New(exit.Validation, "producer transfer inputs/outputs do not match the job descriptor")
+	}
+	declared := make(map[string]bool, len(spec.ArtifactOutputs))
+	for _, output := range spec.ArtifactOutputs {
+		declared[output.OutputID] = true
+	}
+	for _, output := range intent.Outputs {
+		var declaredOutput *orchestrator.ArtifactOutput
+		for i := range spec.ArtifactOutputs {
+			if spec.ArtifactOutputs[i].OutputID == output.Name {
+				declaredOutput = &spec.ArtifactOutputs[i]
+			}
+		}
+		if !declared[output.Name] || output.RequiredContract == nil || declaredOutput == nil ||
+			declaredOutput.RequiredContract == nil ||
+			output.RequiredContract.TopologyDigest != declaredOutput.RequiredContract.TopologyDigest ||
+			strings.Join(output.RequiredContract.Encodings, "\x00") !=
+				strings.Join(declaredOutput.RequiredContract.Encodings, "\x00") {
+			return exit.New(exit.Validation,
+				"producer transfer output %s lacks its descriptor contract", output.Name)
+		}
+	}
+	return nil
+}
+
+func sameProfileMap(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if right[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func replayJobSubmission(sub JobSubmission,
@@ -244,27 +274,46 @@ func replayJobSubmission(sub JobSubmission,
 	if org == "" {
 		org = recorded.Org
 	}
-	return orchestrator.Submission{Kind: "job", Package: sub.Package,
-		Entrypoint: sub.Function, Payload: payload, Org: org,
+	transfer := sub.ModelTransfer
+	if transfer == nil {
+		transfer = recorded.ModelTransfer
+	}
+	packageName, function := sub.Package, sub.Function
+	if packageName == "" && function == "" {
+		packageName, function = recorded.Package, recorded.Entrypoint
+	}
+	return orchestrator.Submission{Kind: "job", Package: packageName,
+		Entrypoint: function, Payload: payload, Org: org,
 		InstallID: recorded.InstallID, Release: recorded.Release,
 		ReleaseDigest:        recorded.PackageRevisionDigest,
 		PrivatePackageDigest: recorded.PrivatePackageDigest,
 		PlanID:               recorded.PlanID, Outputs: outputs, ArtifactOutputs: artifactOutputs,
 		JobGPUCount: recorded.JobGPUCount, Trees: trees, Worker: recorded.Worker,
 		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
-		Models: models}, nil
+		Models: models, ModelTransfer: transfer}, nil
 }
 
 // resolveJob turns package+function into the orchestrator's Submission. The
 // `job_descriptor_id` is resolved HERE, from the installed generation's own descriptor —
 // a client never names a digest, exactly as it never names a binding plan id.
 func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrator.Submission, *exit.Error) {
+	if sub.ModelTransfer != nil && sub.Package == "" && sub.Function == "" {
+		if sub.Rental || sub.RentalRequired {
+			return orchestrator.Submission{}, exit.Named(exit.Unavailable,
+				"model_transfer.rented_pass_through_unavailable",
+				"rented pass-through has no typed TensorFS source profiles")
+		}
+		return orchestrator.Submission{Kind: "job", Package: "cozy/platform",
+			Entrypoint: "model-pass-through", Payload: []byte("{}"), Org: "local",
+			PlanID: "sha256:" + strings.Repeat("0", 64), ModelTransfer: sub.ModelTransfer}, nil
+	}
 	out := orchestrator.Submission{
 		Kind: "job", Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org),
 		Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
 		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
 		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
+		ModelTransfer: sub.ModelTransfer,
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
@@ -299,12 +348,14 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 				"remote jobs require one exact published release and no local input trees")
 		}
 		logical, problem := s.packages.ResolveRemoteJob(
-			sub.Package, sub.Release, sub.ReleaseDigest, sub.Function, sub.Models)
+			sub.Package, sub.Release, sub.ReleaseDigest, sub.Function, sub.Models,
+			sub.ModelTransfer != nil)
 		if problem != nil {
 			return out, problem
 		}
 		out.PlanID, out.Outputs = logical.DescriptorID, logical.Outputs
 		out.ArtifactOutputs, out.JobGPUCount = logical.ArtifactOutputs, logical.GPUCount
+		out.ProducerProfiles = logical.SourceProfiles
 		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
 		return out, nil
 	}
@@ -344,6 +395,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.Outputs = job.Outputs
 		out.ArtifactOutputs = job.ArtifactOutputs
 		out.JobGPUCount = job.GPUCount
+		out.ProducerProfiles = job.SourceProfiles
 	}
 	if out.PlanID == "" {
 		return out, exit.Named(exit.NotFound, "unknown_job",
@@ -389,6 +441,7 @@ func (s *Server) resolvePrivateJob(ctx context.Context, sub JobSubmission,
 		}
 		out.PlanID, out.Outputs = job.DescriptorID, job.Outputs
 		out.ArtifactOutputs, out.JobGPUCount = job.ArtifactOutputs, job.GPUCount
+		out.ProducerProfiles = job.SourceProfiles
 	}
 	if out.PlanID == "" {
 		return out, exit.Named(exit.NotFound, "unknown_job",
@@ -464,6 +517,13 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	if spec.RentalRequired {
 		doc["rental_required"] = true
 	}
+	if spec.ModelTransfer != nil {
+		encoded, err := json.Marshal(spec.ModelTransfer)
+		if err != nil {
+			return "", exit.Internalf("cannot encode model transfer intent: %s", err)
+		}
+		doc["model_transfer"] = base64.StdEncoding.EncodeToString(encoded)
+	}
 	data, err := canonical.Write(doc)
 	if err != nil {
 		return "", exit.Internalf("cannot canonicalize the job submission: %s", err)
@@ -493,19 +553,20 @@ type JobState struct {
 	// Requeues and RetryBudget are the orchestrator's RETRY PROJECTION made visible: how
 	// much of the durable budget the neutral outcomes have already spent, and what the
 	// bound is. A settlement that exhausted it names the budget in `error`.
-	Requeues    int64           `json:"requeues"`
-	RetryBudget int64           `json:"retry_budget"`
-	Progress    map[string]any  `json:"progress,omitempty"`
-	Stage       string          `json:"stage,omitempty"`
-	ElapsedMS   int64           `json:"elapsed_ms"`
-	Metrics     map[string]any  `json:"metrics,omitempty"`
-	ErrorType   string          `json:"error_type,omitempty"`
-	Error       string          `json:"error,omitempty"`
-	Result      any             `json:"result,omitempty"`
-	Outputs     []MediaRef      `json:"outputs"`
-	Artifacts   []ArtifactRef   `json:"artifacts,omitempty"`
-	Checkpoints []JobCheckpoint `json:"checkpoints,omitempty"`
-	Publication *PublicationRef `json:"publication,omitempty"`
+	Requeues     int64             `json:"requeues"`
+	RetryBudget  int64             `json:"retry_budget"`
+	Progress     map[string]any    `json:"progress,omitempty"`
+	Stage        string            `json:"stage,omitempty"`
+	ElapsedMS    int64             `json:"elapsed_ms"`
+	Metrics      map[string]any    `json:"metrics,omitempty"`
+	ErrorType    string            `json:"error_type,omitempty"`
+	Error        string            `json:"error,omitempty"`
+	Result       any               `json:"result,omitempty"`
+	Outputs      []MediaRef        `json:"outputs"`
+	Artifacts    []ArtifactRef     `json:"artifacts,omitempty"`
+	Checkpoints  []JobCheckpoint   `json:"checkpoints,omitempty"`
+	ModelOutputs map[string]string `json:"model_outputs,omitempty"`
+	Publication  *PublicationRef   `json:"publication,omitempty"`
 	// Bill is ABSENT unless this host was configured with an explicit local rate. There
 	// is no `$0.00`: a fabricated zero is a claim about money nobody made (cl-004).
 	Bill      *JobBill   `json:"bill,omitempty"`
@@ -593,6 +654,14 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		Outputs: []MediaRef{}, CreatedAt: row.CreatedAt,
 		EventsURL: "/v1/requests/" + row.ID + "/events",
 	}
+	if row.ModelTransfer != nil {
+		if transfer, problem := s.store.ModelTransferOf(row.ID); problem == nil && transfer != nil {
+			state.ModelOutputs = transfer.Checkpoints
+			if row.State == "failed" {
+				state.ErrorType, state.Error = transfer.ErrorCode, transfer.SafeError
+			}
+		}
+	}
 	if row.Ordinal == 0 && (row.State == "submitted" || row.State == "queued") {
 		if position, depth := s.orchestrator.QueueState(row.ID); position > 0 {
 			state.QueuePosition, state.QueueDepth = &position, &depth
@@ -677,7 +746,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		"runtime_ms": metrics.Int("runtime_ms"), "queue_ms": metrics.Int("queue_ms"),
 		"handler_ms": metrics.Int("handler_ms"),
 	}
-	if last.TerminalStatus != "SUCCEEDED" {
+	if last.TerminalStatus != "SUCCEEDED" && state.ErrorType == "" {
 		state.ErrorType, state.Error = last.TerminalCause, last.SafeMessage
 	}
 	if inline := doc.Sub("result").Str("inline_result"); inline != "" {

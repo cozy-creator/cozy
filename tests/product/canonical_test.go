@@ -18,7 +18,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/modelproduction"
+	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -369,16 +369,16 @@ func TestProducerJobDescriptor(t *testing.T) {
 }
 
 func TestModelTransferOperationIdentity(t *testing.T) {
-	instruction := modelproduction.Instruction{Kind: "model-upload",
+	instruction := modeltransfer.Instruction{Kind: "model-upload",
 		Destination: "tensorhub/minimax-h3",
 		Source:      "hf://MiniMaxAI/MiniMax-H3@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		Producer:    "tensorhub/minimax-h3-tools@v2/four-lane", Placement: "rental-only"}
-	base := modelproduction.Plan{Instruction: instruction,
+	base := modeltransfer.Plan{Instruction: instruction,
 		Destination: instruction.Destination, Source: instruction.Source,
 		SourceSelection: "sha256:" + strings.Repeat("b", 64),
 		SourceProfiles:  map[string]string{"shared": "hf/minimax-h3/shared-bf16/1", "dits": "hf/minimax-h3/native-dual-bf16/1"},
-		Outputs:         []modelproduction.OutputPin{{Name: "bf16-full"}, {Name: "fp8"}}}
-	if !strings.HasPrefix(base.ID(), "modelupload-") {
+		Outputs:         []modeltransfer.OutputPin{{Name: "bf16-full"}, {Name: "fp8"}}}
+	if !strings.HasPrefix(base.ID(), "modeltransfer-") {
 		t.Fatal("upload transfer identity has the wrong run kind")
 	}
 	replay := base
@@ -388,7 +388,7 @@ func TestModelTransferOperationIdentity(t *testing.T) {
 	}
 	download := instruction
 	download.Kind, download.Destination = "model-download", "local/minimax-h3"
-	if !strings.HasPrefix(download.ID(), "modeldownload-") || download.ID() == instruction.ID() {
+	if !strings.HasPrefix(download.ID(), "modeltransfer-") || download.ID() == instruction.ID() {
 		t.Fatal("download and upload instructions did not receive distinct run identities")
 	}
 	if got := strings.Join(base.ProfileNames(), ","); got != "hf/minimax-h3/native-dual-bf16/1,hf/minimax-h3/shared-bf16/1" {

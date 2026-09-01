@@ -176,6 +176,9 @@ func jobFields(state api.JobState, full bool) []output.Field {
 		}
 		fields = append(fields, output.Field{K: "checkpoints_declared", V: rows})
 	}
+	if len(state.ModelOutputs) > 0 {
+		fields = append(fields, output.Field{K: "model_outputs", V: state.ModelOutputs})
+	}
 	if len(state.Outputs) > 0 {
 		outs := make([]string, 0, len(state.Outputs))
 		for _, o := range state.Outputs {

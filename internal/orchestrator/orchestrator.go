@@ -70,6 +70,7 @@ type Options struct {
 	RentalFleet          func() (string, *exit.Error)
 	AcquireManagedRental func(records.Request) (string, string, *exit.Error)
 	ReleaseManagedRental func(string) (string, *exit.Error)
+	ModelTransfers       ModelTransferOwner
 	// ConfigDigest is the local evaluated-config identity. Environment identity
 	// comes only from the exact selected PlacementSet.
 	ConfigDigest string
@@ -92,6 +93,16 @@ type RentalObservation struct {
 	WorkerID               string
 	WorkerBootID           string
 }
+
+type ModelTransferOwner interface {
+	MaterializeLocal(context.Context, string, records.ModelTransferIntent) ([]ModelRef, *exit.Error)
+	RefreshRemoteSource(context.Context, records.ModelTransferIntent) ([]ModelSourceCapability, *exit.Error)
+	Finalize(context.Context, string, ModelTransferMover) *exit.Error
+	PassThrough(context.Context, string, records.ModelTransferIntent) *exit.Error
+}
+
+type ModelTransferMover func(context.Context, records.ModelTransferArtifact,
+	string, []ArtifactTransferDecision) *exit.Error
 
 // Launcher resolves a package ref along the two boundaries #484 split: the
 // platform-neutral desired placement and the local target-environment launch. A connected
@@ -133,6 +144,7 @@ type LogicalJob struct {
 	ArtifactOutputs []ArtifactOutput
 	GPUCount        int64
 	Models          []ModelRef
+	SourceProfiles  map[string]string
 }
 
 type ModelRef = records.ModelRef
@@ -186,10 +198,9 @@ type Orchestrator struct {
 	// frames is the LOSSY live lane's fanout (stream.go). The durable lane is rows in
 	// the records authority; these two are the whole event surface cl-006 serves.
 	frames *fanout
-	// productionWake is a lossy in-process nudge over the durable model-production rows.
-	// Source/artifact statuses are committed before signaling; restart/reconnect rereads rows.
-	productionWake    map[string]chan struct{}
-	productionRunning map[string]bool
+	// transferWake is a lossy nudge over durable request-attached transfer rows.
+	transferWake    map[string]chan struct{}
+	transferRunning map[string]bool
 	// privateTransfers is command-scoped, lossy progress over Creator's durable request
 	// row and sealed revision. A restart simply replays exact chunks from those authorities.
 	privateTransfers map[string]*privateTransfer
@@ -214,20 +225,20 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		opt.Yield = "smart"
 	}
 	c := &Orchestrator{
-		opt:               opt,
-		done:              make(chan struct{}),
-		sessions:          map[string]*session{},
-		workers:           map[string]*worker{},
-		waits:             map[string]*wait{},
-		offers:            map[string]*dispatchReservation{},
-		mediaCleaning:     map[string]bool{},
-		outputExporting:   map[string]bool{},
-		starting:          map[string]bool{},
-		ensuring:          map[string]chan struct{}{},
-		frames:            newFanout(),
-		productionWake:    make(map[string]chan struct{}),
-		productionRunning: make(map[string]bool),
-		privateTransfers:  make(map[string]*privateTransfer),
+		opt:              opt,
+		done:             make(chan struct{}),
+		sessions:         map[string]*session{},
+		workers:          map[string]*worker{},
+		waits:            map[string]*wait{},
+		offers:           map[string]*dispatchReservation{},
+		mediaCleaning:    map[string]bool{},
+		outputExporting:  map[string]bool{},
+		starting:         map[string]bool{},
+		ensuring:         map[string]chan struct{}{},
+		frames:           newFanout(),
+		transferWake:     make(map[string]chan struct{}),
+		transferRunning:  make(map[string]bool),
+		privateTransfers: make(map[string]*privateTransfer),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a
 	// SAMPLING resolution, never a verdict: every verdict it acts on is the worker's own
@@ -523,6 +534,11 @@ func (c *Orchestrator) settleLocalProcessDeath(attempt records.Attempt) {
 		return
 	}
 	if attempt.State == "terminal" {
+		if req, read := c.opt.Store.RequestRow(attempt.RequestID); read == nil && req != nil &&
+			req.ModelTransfer != nil && req.State == "finalizing" {
+			c.kickRecoveredLocalTransfer(attempt.RequestID, attempt.Attempt)
+			return
+		}
 		if e := c.opt.Store.Closed(attempt.RequestID, attempt.Attempt); e != nil {
 			c.logf("local Runtime death could not close %s#%d: %s",
 				attempt.RequestID, attempt.Attempt, e.Message)

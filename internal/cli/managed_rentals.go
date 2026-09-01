@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,10 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		return "", "", problem
 	}
 	needsCPU := len(req.Models) == 0 && req.JobGPUCount == 0
+	transfer, problem := m.store.ModelTransferOf(req.ID)
+	if problem != nil {
+		return "", "", problem
+	}
 	rows, problem := m.store.Rentals()
 	if problem != nil {
 		return "", "", problem
@@ -83,6 +88,9 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		return rows[i].ID < rows[j].ID
 	})
 	for _, row := range rows {
+		if transfer != nil && transfer.GPUCount > 0 {
+			continue // an old rental row does not retain the exact SKU resource envelope
+		}
 		if (row.AcceleratorModel == "CPU") != needsCPU {
 			continue
 		}
@@ -114,7 +122,7 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 	}
 	compatible := skus[:0]
 	for _, sku := range skus {
-		if (sku.AcceleratorModel == "CPU") == needsCPU {
+		if (sku.AcceleratorModel == "CPU") == needsCPU && transferSKUCompatible(transfer, sku) {
 			compatible = append(compatible, sku)
 		}
 	}
@@ -164,6 +172,28 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 	}
 	line, problem := m.lineLocked()
 	return row.ID, line, problem
+}
+
+func transferSKUCompatible(transfer *records.ModelTransfer, sku hub.RentalSKU) bool {
+	if transfer == nil || transfer.GPUCount == 0 {
+		return true
+	}
+	sm, err := rentalComputeSM(sku.ComputeCapability)
+	return err == nil && sm >= transfer.MinSM && sku.VRAMGB >= transfer.VRAMGB &&
+		sku.MinimumRAMPerGPUGB >= transfer.RAMGB
+}
+
+func rentalComputeSM(capability string) (int64, error) {
+	parts := strings.Split(capability, ".")
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("invalid compute capability")
+	}
+	major, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	minor, err := strconv.ParseInt(parts[1], 10, 64)
+	return major*10 + minor, err
 }
 
 func (m *managedRentals) catalogLocked() ([]hub.RentalSKU, *exit.Error) {

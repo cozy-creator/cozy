@@ -38,7 +38,7 @@ var liveProductionDescriptor = flag.String("live-production-descriptor", "",
 var liveQuantizeDescriptor = flag.String("live-quantize-descriptor", "",
 	"exact published quantization descriptor JSON")
 
-func TestLiveModelProductionDescriptor(t *testing.T) {
+func TestLiveModelProducerDescriptor(t *testing.T) {
 	if *liveProductionDescriptor == "" {
 		t.Skip("-live-production-descriptor is not set")
 	}

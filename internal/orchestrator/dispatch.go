@@ -51,7 +51,8 @@ type Submission struct {
 	// OutputBinding carries no kind, so this is persisted beside the InvocationSpec and is
 	// never inferred from an arriving receipt. The M0 lane is artifact-only: when non-empty,
 	// this set is the complete output set for the job.
-	ArtifactOutputs []ArtifactOutput
+	ArtifactOutputs  []ArtifactOutput
+	ProducerProfiles map[string]string
 
 	// BodyDigest is the caller's own digest of the WHOLE submission it is making
 	// idempotent, not merely of the payload. cl-006 supplies the digest of
@@ -84,6 +85,9 @@ type Submission struct {
 	// OutputExport is the descriptor-derived local destination requested by the CLI.
 	// It changes no execution fact and is settled independently after terminal mirror.
 	OutputExport *records.OutputExportIntent
+	// ModelTransfer is a privileged materializer/finalizer attached to this
+	// ordinary request. It changes no lifecycle, placement, attempt, or event fact.
+	ModelTransfer *records.ModelTransferIntent
 }
 
 const ArtifactManifestMime = "application/vnd.cozy.model-manifest"
@@ -91,9 +95,10 @@ const ArtifactManifestMime = "application/vnd.cozy.model-manifest"
 // ArtifactOutput is one bounded ArtifactSink slot projected from the installed job
 // descriptor. MaxBytes bounds only newly written table/config bytes, not inherited closure.
 type ArtifactOutput struct {
-	OutputID string `json:"output_id"`
-	MimeType string `json:"mime_type"`
-	MaxBytes uint64 `json:"max_bytes"`
+	OutputID         string                         `json:"output_id"`
+	MimeType         string                         `json:"mime_type"`
+	MaxBytes         uint64                         `json:"max_bytes"`
+	RequiredContract *records.ModelTransferContract `json:"required_contract,omitempty"`
 }
 
 // Result is what one closed attempt produced.
@@ -224,7 +229,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Kind: s.Kind, JobGPUCount: s.JobGPUCount, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, Models: s.Models,
-		OutputExport: s.OutputExport,
+		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer,
 	}
 	event := map[string]any{
 		"package": s.Package, "function": s.Entrypoint,
@@ -310,6 +315,11 @@ func (c *Orchestrator) logRecordedReplay(req records.Request, idempotencyKey str
 }
 
 func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Error) {
+	if req.ModelTransfer != nil && req.Package == "cozy/platform" &&
+		req.Entrypoint == "model-pass-through" {
+		go c.runModelPassThrough(req)
+		return 0, nil
+	}
 	if req.RentalRequired && req.Worker == "" {
 		c.enqueue(req.ID)
 		c.emit(req.ID, "request.queued", 0, map[string]any{
@@ -619,7 +629,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		if req.InstallID != "" {
 			if req.IsJob() {
 				spec, e := c.opt.Packages.ResolveJobInstall(req.InstallID, req.Entrypoint)
-				return spec, req.PlanID, e
+				return c.exactLocalTransferProducer(req, spec, e)
 			}
 			spec, e := c.opt.Packages.ResolveInstall(req.InstallID, req.Models)
 			if e != nil {
@@ -636,6 +646,9 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		spec, e := c.opt.Packages.Resolve(req.Package)
 		if req.IsJob() {
 			spec, e = c.opt.Packages.ResolveJob(req.Package, req.Entrypoint)
+			if req.ModelTransfer != nil {
+				return c.exactLocalTransferProducer(req, spec, e)
+			}
 		}
 		return spec, req.PlanID, e
 	}
@@ -734,6 +747,20 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 	return spec, planID, nil
 }
 
+func (c *Orchestrator) exactLocalTransferProducer(req records.Request, spec WorkerLaunchSpec,
+	problem *exit.Error,
+) (WorkerLaunchSpec, string, *exit.Error) {
+	if problem != nil {
+		return spec, req.PlanID, problem
+	}
+	if req.Release != "" && (spec.Placement.Release != req.Release ||
+		spec.Placement.PackageRevisionDigest != req.PackageRevisionDigest) {
+		return WorkerLaunchSpec{}, req.PlanID, exit.Unavailablef(
+			"local producer does not exactly match frozen %s@%s", req.Package, req.Release)
+	}
+	return spec, req.PlanID, nil
+}
+
 // failQueued settles a request that can never be placed. It is a request-level terminal:
 // no offer crossed to a worker, so there is no worker terminal to replay and the request
 // row is what settles. A closed dispatch_aborted row may remain as preparation history.
@@ -823,6 +850,18 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			c.releaseDispatch(reservation)
 		}
 	}()
+	if req.ModelTransfer != nil && req.Rental && w.spec.Connection == nil && req.Release != "" &&
+		(w.spec.Placement.Release != req.Release ||
+			w.spec.Placement.PackageRevisionDigest != req.PackageRevisionDigest) {
+		return 0, exit.Unavailablef("ready local producer does not exactly match frozen %s@%s",
+			req.Package, req.Release)
+	}
+	// A model transfer materializes its verified model inputs only after ordinary
+	// placement selected the exact worker, but before InvocationSpec identity is minted.
+	req, e = c.materializeModelTransfer(req, w)
+	if e != nil {
+		return 0, e
+	}
 
 	// The InvocationSpec DOCUMENT (#439): everything that gives the invocation meaning —
 	// the payload digest, the ORDERED input identities, the output contracts, the

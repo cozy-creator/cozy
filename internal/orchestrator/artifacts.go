@@ -305,6 +305,20 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 		c.logf("OutcomeAck %s#%d not sent: the durable request cannot be read", requestID, ordinal)
 		return
 	}
+	c.mu.Lock()
+	holder := c.workers[s.instanceID]
+	c.mu.Unlock()
+	if req.ModelTransfer != nil && attempt.TerminalStatus == "SUCCEEDED" {
+		transfer, problem := c.opt.Store.ModelTransferOf(requestID)
+		if problem != nil {
+			c.logf("OutcomeAck %s#%d not sent: model transfer cannot be read", requestID, ordinal)
+			return
+		}
+		if transfer != nil && transfer.State != "completed" && transfer.State != "failed" {
+			c.kickModelTransferFinalizer(s, requestID, int64(ordinal))
+			return
+		}
+	}
 	specDigest, err := canonical.Raw(attempt.InvocationDigest)
 	if err != nil {
 		c.logf("OutcomeAck %s#%d not sent: malformed persisted invocation digest", requestID, ordinal)
@@ -329,9 +343,10 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 		c.logf("OutcomeAck %s#%d was queued but closure is still owed: %s", requestID, ordinal, e.Message)
 		return
 	}
-	c.mu.Lock()
-	holder := c.workers[s.instanceID]
-	c.mu.Unlock()
+	if req.ModelTransfer != nil && attempt.TerminalStatus == "SUCCEEDED" {
+		go c.finishModelTransferRequest(requestID, int64(ordinal))
+		return
+	}
 	c.afterAck(*req, *attempt, holder)
 }
 

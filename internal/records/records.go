@@ -102,8 +102,8 @@ CREATE TABLE IF NOT EXISTS pins (
   generation   TEXT    NOT NULL REFERENCES install_generations(id),
   activated_at TEXT    NOT NULL,
   PRIMARY KEY (package)
-)`}, append(modelProductionSchema,
-	append(orchestratorSchema, append(eventSchema, rentalSchema...)...)...)...)
+)`}, append(orchestratorSchema,
+	append(modelTransferSchema, append(eventSchema, rentalSchema...)...)...)...)
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
@@ -199,19 +199,6 @@ func migrateToNine(db *sql.DB, path string, sourceVersion int) *exit.Error {
 	if sourceVersion == 6 {
 		if e := migrateRequestsSix(tx, path); e != nil {
 			return e
-		}
-	}
-	for _, table := range []string{
-		"model_production_objects",
-		"model_production_artifacts",
-		"model_production_steps",
-		"model_production_sources",
-		"model_production_source_files",
-		"model_productions",
-	} {
-		if _, err := tx.Exec(`DELETE FROM ` + table); err != nil {
-			return exit.Internalf("cannot retire pre-account %s rows while migrating %s: %s",
-				table, path, err)
 		}
 	}
 	if sourceVersion < 8 {

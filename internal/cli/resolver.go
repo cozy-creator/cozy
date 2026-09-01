@@ -447,7 +447,7 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function st
 }
 
 func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string,
-	models []orchestrator.ModelRef,
+	models []orchestrator.ModelRef, deferredModels bool,
 ) (
 	orchestrator.LogicalJob, *exit.Error,
 ) {
@@ -486,7 +486,7 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 	}
 	models = append([]orchestrator.ModelRef(nil), models...)
 	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
-	if len(models) != len(job.Models) {
+	if !deferredModels && len(models) != len(job.Models) {
 		return empty, exit.Named(exit.Validation, "rental.job_model_selection_incomplete",
 			"remote job %s requires exactly %d model Manifest binding(s)", function, len(job.Models))
 	}
@@ -508,6 +508,9 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 		byParam[model.Slot] = model
 	}
 	for _, slot := range job.Models {
+		if deferredModels {
+			continue
+		}
 		if _, ok := byParam[slot.Param]; !ok {
 			return empty, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
 				"remote job %s does not bind model parameter %s", function, slot.Param)
@@ -518,10 +521,20 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 		}
 	}
 	artifacts := make([]orchestrator.ArtifactOutput, 0, len(job.ArtifactOutputs))
+	profiles := make(map[string]string, len(job.Models))
+	for _, model := range job.Models {
+		profiles[model.Param] = model.SourceProfile
+	}
 	outputs := launch.AssetPaths(job.Result)
 	for _, output := range job.ArtifactOutputs {
+		var contract *records.ModelTransferContract
+		if output.RequiredContract != nil {
+			contract = &records.ModelTransferContract{TopologyDigest: output.RequiredContract.TopologyDigest,
+				Encodings: append([]string(nil), output.RequiredContract.Encodings...)}
+		}
 		artifacts = append(artifacts, orchestrator.ArtifactOutput{
 			OutputID: output.OutputID, MimeType: output.MimeType, MaxBytes: output.MaxBytes,
+			RequiredContract: contract,
 		})
 		outputs = append(outputs, output.OutputID)
 	}
@@ -529,6 +542,7 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
 		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
 		ArtifactOutputs: artifacts, GPUCount: job.Resources.GPUCount, Models: models,
+		SourceProfiles: profiles,
 	}, nil
 }
 

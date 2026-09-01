@@ -467,6 +467,9 @@ type Request struct {
 	// OutputExport is a CLI-authenticated, descriptor-derived local publication intent.
 	// It is recorded in its own durable row in the same transaction as this request.
 	OutputExport *OutputExportIntent
+	// ModelTransfer is a source materializer/output finalizer attached to this
+	// ordinary request. It owns no lifecycle, placement, attempt, or event identity.
+	ModelTransfer *ModelTransferIntent
 }
 
 // AssetBinding ties one payload asset field to the exact local bytes the request owns.
@@ -537,6 +540,14 @@ func (s *Store) RequestRow(id string) (*Request, *exit.Error) {
 	}
 	if err != nil {
 		return nil, exit.Internalf("cannot read request %s: %s", id, err)
+	}
+	transfer, problem := s.ModelTransferOf(id)
+	if problem != nil {
+		return nil, problem
+	}
+	if transfer != nil {
+		r.ModelTransfer = &transfer.ModelTransferIntent
+		r.Models = append([]ModelRef(nil), transfer.Models...)
 	}
 	return &r, nil
 }
@@ -685,6 +696,14 @@ func (s *Store) RequestByIdempotencyKey(key string) (*Request, *exit.Error) {
 	if err != nil {
 		return nil, exit.Internalf("cannot read request for idempotency key %s: %s", key, err)
 	}
+	transfer, problem := s.ModelTransferOf(r.ID)
+	if problem != nil {
+		return nil, problem
+	}
+	if transfer != nil {
+		r.ModelTransfer = &transfer.ModelTransferIntent
+		r.Models = append([]ModelRef(nil), transfer.Models...)
+	}
 	return &r, nil
 }
 
@@ -734,7 +753,7 @@ func (s *Store) RequestsOfKind(kind, state string, limit int) ([]Request, *exit.
 // listing: omitting row 501 from a safety fence would make `exit` destructive by accident.
 func (s *Store) ActiveRequests() ([]Request, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests
-		WHERE state IN ('submitted','queued','dispatching','requeue_pending')
+		WHERE state IN ('submitted','queued','dispatching','requeue_pending','finalizing')
 		ORDER BY created_at,id`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list active requests: %s", err)
@@ -758,6 +777,8 @@ func (s *Store) ActiveRequests() ([]Request, *exit.Error) {
 func (s *Store) Owed() ([]Request, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests r
 		WHERE r.state IN ('submitted','queued')
+		  AND NOT (r.package='cozy/platform' AND EXISTS
+		      (SELECT 1 FROM request_model_transfers t WHERE t.request_id=r.id))
 		  AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.request_id=r.id
 		                  AND a.state IN ('preparing','offered','accepted','recovered_open','terminal'))
 		ORDER BY r.created_at, r.id`)
@@ -921,6 +942,9 @@ func (s *Store) BeginRequeue(id string, max int64) (count int64, started, cancel
 // same body digest answers the SAME request; the same key with a different body is a
 // conflict, never a second execution wearing one name.
 func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
+	if problem := NormalizeModelTransferIntent(r.ModelTransfer); problem != nil {
+		return Request{}, false, problem
+	}
 	r, assets, models, exportOutputs, problem := prepareRequest(r)
 	if problem != nil {
 		return Request{}, false, problem
@@ -1001,6 +1025,9 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	if problem := recordOutputExportTx(tx, r.ID, r.OutputExport, exportOutputs); problem != nil {
+		return Request{}, false, problem
+	}
+	if problem := recordModelTransferTx(tx, r.ID, r.ModelTransfer); problem != nil {
 		return Request{}, false, problem
 	}
 	return r, true, nil

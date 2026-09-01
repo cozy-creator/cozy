@@ -40,18 +40,16 @@ func TestRecordsSchemaIsExactV9AndStable(t *testing.T) {
 	if deleted != 0 {
 		t.Fatal("exact requests schema retained max_cost_usd_micros")
 	}
-	var steps, legacyTables, stepIndex, stepName int
+	var transfers, legacyTables, outputs int
 	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
-		WHERE type='table' AND name='model_production_steps'`).Scan(&steps))
+		WHERE type='table' AND name='request_model_transfers'`).Scan(&transfers))
 	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
-		WHERE type='table' AND name='model_production_nodes'`).Scan(&legacyTables))
-	must(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('model_production_steps')
-		WHERE name='step_index'`).Scan(&stepIndex))
-	must(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('model_production_steps')
-		WHERE name='step_name'`).Scan(&stepName))
-	if steps != 1 || legacyTables != 0 || stepIndex != 1 || stepName != 1 {
-		t.Fatalf("production step schema = steps:%d legacy:%d index:%d name:%d",
-			steps, legacyTables, stepIndex, stepName)
+		WHERE type='table' AND name='model_productions'`).Scan(&legacyTables))
+	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+		WHERE type='table' AND name='request_model_transfer_outputs'`).Scan(&outputs))
+	if transfers != 1 || legacyTables != 0 || outputs != 1 {
+		t.Fatalf("model transfer schema = transfers:%d legacy:%d outputs:%d",
+			transfers, legacyTables, outputs)
 	}
 	must(t, db.Close())
 

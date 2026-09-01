@@ -28,7 +28,7 @@ import (
 
 const weightlessRef = "cozy/cozy-weightless-package"
 const localWeightlessRef = "local/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "ebdcb4a319dd1d6d2afa352d9dfe824c2bca2b57"
+const editableRuntimeFixtureSHA = "6d7da5997d1f6a7a4997ef80541d8e22f555cff7"
 const editableTensorFSFixtureSHA = "0f49a4bf3fbe6fc8d41713b7ce9041c80161b7e6"
 
 func TestHumanQueuePositionLabelKeepsMachineKey(t *testing.T) {
@@ -142,7 +142,7 @@ func TestModelTransferGrammar(t *testing.T) {
 	code, out = runCozyDir(t, root, ".", accountEnv, "--json", "model", "upload", local, "acme/model",
 		"--dry-run")
 	if code != 0 || !strings.Contains(out, `"kind":"model-upload"`) ||
-		!strings.Contains(out, `"status":"planned"`) || !strings.Contains(out, `"id":"modelupload-`) {
+		!strings.Contains(out, `"status":"planned"`) || !strings.Contains(out, `"id":"modeltransfer-`) {
 		t.Fatalf("source-driven dry-run failed [exit %d]\n%s", code, out)
 	}
 	code, out = runCozyDir(t, root, ".", accountEnv, "model", "upload", local, "other/model",
@@ -189,7 +189,7 @@ func TestModelTransferGrammar(t *testing.T) {
 		t.Fatalf("retired model import remains callable [exit %d]\n%s", code, out)
 	}
 	code, out = runCozy(t, root, "model", "download", "local/source", "local/copy", "--rental-only")
-	if code != 9 || !strings.Contains(out, "rented model download cannot yet return") {
+	if code != 1 || !strings.Contains(out, "rented model download cannot yet return") {
 		t.Fatalf("rented local return was not explicitly refused [exit %d]\n%s", code, out)
 	}
 }
