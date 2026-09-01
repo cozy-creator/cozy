@@ -1412,6 +1412,123 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "UNKNOWN_FIELD",
         "a fifth grade below the hub: the four levels are the closed set",
     ));
+    // --- the machine surfaces (proto-020): the `--json` documents tensorhub decodes.
+    //
+    // These are the only documents in this corpus that nothing STORES — they are a CLI
+    // projection. They are frozen anyway, because they are a producer/consumer contract
+    // across two repositories and two languages and until now nothing held it: tensorfs
+    // grew `depth`, then the four `topology_*` keys, and both times tensorhub's decoder
+    // refused every real answer while both repositories' CI stayed green. Freezing them
+    // here means `tfs vectors verify` re-emits each one from the frozen report beside it
+    // and requires byte identity, so a key added to any surface fails on the PRODUCER,
+    // naming the consumer, before it can ship.
+    let registry_with_widening = grade::Registry {
+        registrations: vec![reg.clone()],
+    };
+    for (name, source, note) in [
+        (
+            "check-satisfied",
+            &report,
+            "Satisfied: `details` empty, `encodings` carrying the pairs the DEVICE axis is \
+             then asked about one at a time",
+        ),
+        (
+            "check-worst-full",
+            &worst_full,
+            "a full walk: `details` is the WHOLE mismatch set and `depth` says so",
+        ),
+        (
+            "check-worst-first-fact",
+            &worst_first,
+            "the same pair stopped at the first fact: one detail, `depth` first-mismatch",
+        ),
+        (
+            "check-recast",
+            &recast_report,
+            "an exact-index miss that is a shape-index hit: the four topology_* keys are \
+             what makes that readable without parsing a header",
+        ),
+    ] {
+        cases.push(ok_case(
+            "machine",
+            name,
+            "machine_check",
+            tensorfs_core::machine::check_json(source),
+            note,
+        ));
+    }
+    for (name, source, registry, note) in [
+        (
+            "grade-compatible",
+            &report,
+            &grade::Registry::default(),
+            "COMPATIBLE carries no remedy, and every remedy_* key is present and empty",
+        ),
+        (
+            "grade-producible",
+            &worst_first,
+            &grade::Registry::default(),
+            "PRODUCIBLE names the CONTRACT's target in remedy_target, never the observed \
+             encoding",
+        ),
+        (
+            "grade-incompatible",
+            &worst_full,
+            &grade::Registry::default(),
+            "INCOMPATIBLE carries the reason and no remedy: a different model, not a \
+             different packaging",
+        ),
+        (
+            "grade-convertible",
+            &recast_report,
+            &registry_with_widening,
+            "CONVERTIBLE names the registration that closes the gap",
+        ),
+    ] {
+        let decision = grade::GradeDecision {
+            report: source.object_id(),
+            grade: grade::grade_report(source, registry)?,
+        };
+        cases.push(ok_case(
+            "machine",
+            name,
+            "machine_grade",
+            tensorfs_core::machine::grade_json(&decision, source),
+            note,
+        ));
+    }
+    {
+        let records = registry::capability_records();
+        let plain_id = seed_spec("plain/1", 0).object_id();
+        let admitted = records
+            .admit(&plain_id, "cpu")
+            .expect("plain/1 is qualified on the CPU the reference decoders run on");
+        cases.push(ok_case(
+            "machine",
+            "capability-admitted",
+            "machine_capability",
+            tensorfs_core::machine::capability_json(Some(admitted), &plain_id, "cpu", "", &["cpu"]),
+            "ADMITTED: the implementation and the exact vector set it passed bit-for-bit",
+        ));
+        let refusal = records
+            .admit(&plain_id, "cuda.sm89")
+            .expect_err("no accelerator class is qualified in the compiled-in records");
+        cases.push(ok_case(
+            "machine",
+            "capability-unqualified",
+            "machine_capability",
+            tensorfs_core::machine::capability_json(
+                None,
+                &plain_id,
+                "cuda.sm89",
+                &refusal.detail,
+                &["cpu"],
+            ),
+            "REFUSED with qualified_devices non-empty: routable elsewhere, which is a \
+             different answer from nothing anywhere runs this",
+        ));
+    }
+
     // --- restricted deterministic CBOR representations (all red)
     let g = "canonical";
     cases.push(red_case(
@@ -2374,6 +2491,169 @@ fn cmd_verify(dir: &Path) -> ExitCode {
         seeds_match,
         String::new(),
     ));
+
+    // proto-020: the MACHINE SURFACES, re-emitted live and required to be byte identical
+    // to the frozen documents. This is the arm the `tfs` JSON seam never had.
+    //
+    // Every other document here is frozen bytes re-read by its own reader. A `--json`
+    // projection has no reader, so freezing its bytes alone would be vacuous — the file
+    // would only ever be compared to itself, which is exactly how tensorhub's recorded
+    // samples went stale twice while staying green. So the emitter is run HERE, over the
+    // frozen `compat_report` beside it, and its output is diffed against the frozen
+    // document. Add a key to `compat check --json`, `grade --json` or `capability --json`
+    // and this FAILS, on the producer, before the consumer ever sees it.
+    let case_bytes = |rel: &str| fs::read(dir.join("cases").join(rel)).unwrap_or_default();
+    let report_named = |name: &str| CompatibilityReport::parse(&case_bytes(name));
+    let widening = grade::Registry {
+        registrations: match ConversionRegistration::parse(&case_bytes(
+            "layout/conversion-registration.json",
+        )) {
+            Ok(r) => vec![r],
+            Err(_) => Vec::new(),
+        },
+    };
+    let mut reemitted: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
+    for (surface, source) in [
+        ("check-satisfied", "layout/report-satisfied.json"),
+        ("check-worst-full", "layout/report-worst-full.json"),
+        (
+            "check-worst-first-fact",
+            "layout/report-worst-first-fact.json",
+        ),
+        ("check-recast", "layout/report-recast.json"),
+    ] {
+        let live = match report_named(source) {
+            Ok(r) => tensorfs_core::machine::check_json(&r),
+            Err(e) => {
+                fail += 1;
+                println!("FAIL machine/{surface:<36} re-emit  {source} does not parse: {e}");
+                continue;
+            }
+        };
+        reemitted.push((
+            surface.to_string(),
+            live,
+            case_bytes(&format!("machine/{surface}.json")),
+        ));
+    }
+    for (surface, source, registry) in [
+        (
+            "grade-compatible",
+            "layout/report-satisfied.json",
+            &grade::Registry::default(),
+        ),
+        (
+            "grade-producible",
+            "layout/report-worst-first-fact.json",
+            &grade::Registry::default(),
+        ),
+        (
+            "grade-incompatible",
+            "layout/report-worst-full.json",
+            &grade::Registry::default(),
+        ),
+        ("grade-convertible", "layout/report-recast.json", &widening),
+    ] {
+        let live = match report_named(source)
+            .and_then(|r| Ok((grade::grade_report(&r, registry)?, r)))
+            .map(|(g, r)| {
+                let decision = grade::GradeDecision {
+                    report: r.object_id(),
+                    grade: g,
+                };
+                tensorfs_core::machine::grade_json(&decision, &r)
+            }) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                fail += 1;
+                println!("FAIL machine/{surface:<36} re-emit  {source} does not grade: {e}");
+                continue;
+            }
+        };
+        reemitted.push((
+            surface.to_string(),
+            live,
+            case_bytes(&format!("machine/{surface}.json")),
+        ));
+    }
+    {
+        let records = registry::capability_records();
+        let plain_id = seed_spec("plain/1", 0).object_id();
+        match records.admit(&plain_id, "cpu") {
+            Ok(record) => reemitted.push((
+                "capability-admitted".to_string(),
+                tensorfs_core::machine::capability_json(
+                    Some(record),
+                    &plain_id,
+                    "cpu",
+                    "",
+                    &["cpu"],
+                ),
+                case_bytes("machine/capability-admitted.json"),
+            )),
+            Err(e) => {
+                fail += 1;
+                println!("FAIL machine/capability-admitted          re-emit  plain/1 on cpu: {e}");
+            }
+        }
+        match records.admit(&plain_id, "cuda.sm89") {
+            Ok(_) => {
+                fail += 1;
+                println!(
+                    "FAIL machine/capability-unqualified       re-emit  an accelerator class \
+                     was admitted from the compiled-in records"
+                );
+            }
+            Err(e) => reemitted.push((
+                "capability-unqualified".to_string(),
+                tensorfs_core::machine::capability_json(
+                    None,
+                    &plain_id,
+                    "cuda.sm89",
+                    &e.detail,
+                    &["cpu"],
+                ),
+                case_bytes("machine/capability-unqualified.json"),
+            )),
+        }
+    }
+    for (surface, live, frozen) in &reemitted {
+        if live == frozen {
+            pass += 1;
+            println!(
+                "PASS machine/{surface:<36} contract id={}",
+                &tensorfs_core::ids::object_id(live)[7..19]
+            );
+            continue;
+        }
+        fail += 1;
+        let live_keys = tensorfs_core::machine::document_keys(live).unwrap_or_default();
+        let frozen_keys = tensorfs_core::machine::document_keys(frozen).unwrap_or_default();
+        let what = if live_keys == frozen_keys {
+            "the VALUES moved".to_string()
+        } else {
+            format!("the KEYS moved: this build emits {live_keys:?}, frozen is {frozen_keys:?}")
+        };
+        println!(
+            "FAIL machine/{surface:<36} contract this build's `--json` output is not the \
+             frozen document — {what}. {}",
+            tensorfs_core::machine::CONSUMER_REMEDY
+        );
+    }
+    // The corpus must actually HOLD one document per surface. A machine vector that is
+    // deleted rather than regenerated would otherwise leave the surface silently unfrozen.
+    for (kind, _) in tensorfs_core::machine::SURFACES {
+        let held = reemitted.iter().filter(|(n, _, _)| match *kind {
+            "machine_check" => n.starts_with("check-"),
+            "machine_grade" => n.starts_with("grade-"),
+            _ => n.starts_with("capability-"),
+        });
+        cross.push((
+            format!("{kind} is frozen by at least one machine vector"),
+            held.count() > 0,
+            String::new(),
+        ));
+    }
 
     for (what, ok, detail) in &cross {
         if *ok {

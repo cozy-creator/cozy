@@ -22,6 +22,7 @@ pub mod header;
 pub mod ids;
 pub mod ingest;
 pub mod limits;
+pub mod machine;
 pub mod manifest;
 pub mod meta;
 pub mod project;

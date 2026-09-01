@@ -1,0 +1,4 @@
+doc: machine_check
+expect: ok
+id: sha256:13188966270d6a737ee3c987cf35eeaa441c8077357d1b1e7e1f46b2d6f09212
+note: a full walk: `details` is the WHOLE mismatch set and `depth` says so

@@ -36,6 +36,31 @@ jobs:
       # whole set. A ranking path that regressed to reading the first fact would still emit
       # byte-identical documents and only these verdicts would notice.
       - run: ./target/release/tfs vectors verify
+      # proto-020: the SHIPPED BINARY's `--json` path, not only the library emitter the
+      # corpus calls. `tfs vectors verify` proves the emitter still produces the frozen
+      # machine documents; this proves the CLI still routes to that emitter, over the same
+      # frozen inputs. These three documents are a producer/consumer contract with
+      # tensorhub, which vendors them and asserts its decoder against them; adding a key to
+      # any of them fails HERE, before it can break the consumer at runtime.
+      - run: |
+          set -e
+          m=vectors/cases/machine
+          diff <(cat "$m/check-satisfied.json"; echo) <(./target/release/tfs compat check \
+            vectors/cases/layout/code-topology.json vectors/cases/header/plain-fp8.cbor \
+            --depth full --json)
+          diff <(cat "$m/grade-compatible.json"; echo) <(./target/release/tfs grade \
+            vectors/cases/layout/report-satisfied.json --json)
+          diff <(cat "$m/grade-producible.json"; echo) <(./target/release/tfs grade \
+            vectors/cases/layout/report-worst-first-fact.json --json)
+          diff <(cat "$m/grade-incompatible.json"; echo) <(./target/release/tfs grade \
+            vectors/cases/layout/report-worst-full.json --json)
+          diff <(cat "$m/grade-convertible.json"; echo) <(./target/release/tfs grade \
+            vectors/cases/layout/report-recast.json \
+            --registry vectors/cases/layout/conversion-registration.json --json)
+          diff <(cat "$m/capability-admitted.json"; echo) <(./target/release/tfs capability \
+            --alias plain/1 x cpu --json)
+          diff <(cat "$m/capability-unqualified.json"; echo) <(./target/release/tfs capability \
+            --alias plain/1 x cuda.sm89 --json)
       # The BATCH grading surface (tfs-039). Grading is microseconds; `tfs grade <file>` is
       # one report per process, so the wall was the ~2.5 ms of spawn around it — irrelevant
       # for a preflight check and the entire cost of a catalog search. Every frozen report

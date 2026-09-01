@@ -1,0 +1,4 @@
+doc: machine_check
+expect: ok
+id: sha256:5f2ad2b1b46116f58948c022ef5f48f9375f18db84f4f25275241fa32d55a82c
+note: an exact-index miss that is a shape-index hit: the four topology_* keys are what makes that readable without parsing a header
