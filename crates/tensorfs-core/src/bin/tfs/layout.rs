@@ -716,8 +716,57 @@ pub fn cmd_decision(p: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The machine surface of a grade. TOTAL on purpose: every key is present on every grade,
+/// empty where that grade does not carry it. A consumer that fails closed must be able to
+/// decode one shape and read `grade`, not discover which keys this variant happened to
+/// emit — and tensorhub decodes with unknown fields refused, so an absent key and a new key
+/// are equally fatal there.
+///
+/// `remedy_*` is the whole point of the four levels: PRODUCIBLE names the encoding/dtype
+/// the CONTRACT requires, so "we could run this if you convert it to X" is distinguishable
+/// from "no".
+fn grade_json(decision: &GradeDecision) -> Vec<u8> {
+    let (registration, mapping, target, source, reason) = match &decision.grade {
+        Grade::Compatible => ("", "", "", "", ""),
+        Grade::Convertible {
+            registration,
+            mapping,
+        } => (registration.as_str(), mapping.as_str(), "", "", ""),
+        Grade::Producible { target, source } => ("", "", target.as_str(), source.as_str(), ""),
+        Grade::Incompatible { reason } => ("", "", "", "", reason.as_str()),
+    };
+    let v = tensorfs_core::canon::Value::obj(vec![
+        (
+            "decision",
+            tensorfs_core::canon::Value::str(tensorfs_core::ids::object_id(
+                &decision.canonical_bytes(),
+            )),
+        ),
+        (
+            "grade",
+            tensorfs_core::canon::Value::str(decision.grade.name()),
+        ),
+        (
+            "report",
+            tensorfs_core::canon::Value::str(decision.report.clone()),
+        ),
+        (
+            "remedy_registration",
+            tensorfs_core::canon::Value::str(registration),
+        ),
+        ("remedy_mapping", tensorfs_core::canon::Value::str(mapping)),
+        ("remedy_target", tensorfs_core::canon::Value::str(target)),
+        ("remedy_source", tensorfs_core::canon::Value::str(source)),
+        ("reason", tensorfs_core::canon::Value::str(reason)),
+    ]);
+    tensorfs_core::canon::write(&v)
+}
+
 /// The hub's grading, over a report. Both sides are already named in the report, so this
 /// reads no header, no store and no network.
+///
+/// `--json` prints one `grade_json` object and nothing else — the surface a program reads.
+/// The column-aligned print below is for people, and no caller may match on it.
 pub fn cmd_grade(report_p: &Path, flags: &Flags) -> ExitCode {
     let report = ok!(CompatibilityReport::parse(&rd!(report_p)));
     let reg = match load_registry(flags) {
@@ -768,6 +817,10 @@ pub fn cmd_grade(report_p: &Path, flags: &Flags) -> ExitCode {
         grade: g.clone(),
     };
     emit_bytes(&decision.canonical_bytes(), flags);
+    if flag_on(flags, "json") {
+        println!("{}", String::from_utf8_lossy(&grade_json(&decision)));
+        return ExitCode::SUCCESS;
+    }
     println!("grade        {}", g.name());
     match &g {
         Grade::Compatible => {}

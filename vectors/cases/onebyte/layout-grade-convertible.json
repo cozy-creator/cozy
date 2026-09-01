@@ -1,0 +1,1 @@
+{"grade":{"mapping":"widen bf16 -> f32","registration":"bg16-to-f32","t":"CONVERTIBLE"},"report":"sha256:3c7a0543498900ee84ed2992e7acd9e40e18b4d1514f068efb0cd8b42e998e19"}

@@ -1155,7 +1155,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     ));
 
     // --- the layout plane (tfs-009): code topology, report, registration
-    let (code, report, _reg) = layout_plane_docs(&ha, &closure)?;
+    let (code, report, reg) = layout_plane_docs(&ha, &closure)?;
     cases.push(ok_case(
         "layout",
         "code-topology",
@@ -1193,6 +1193,76 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         ),
         "MISSING_FIELD",
         "an empty accepts list admits nothing and says nothing",
+    ));
+    // The grading plane's documents. The registration above was RUN, not asserted: these
+    // bytes exist only because bf16 -> f32 -> bf16 came back identical over all 65,536
+    // representable inputs, and freezing them puts that document's canonical form under
+    // `tfs vectors verify` and the cross-language facade diff.
+    cases.push(ok_case(
+        "layout",
+        "conversion-registration",
+        "conversion_registration",
+        reg.canonical_bytes(),
+        "a lossless widening, proved over the complete 16-bit domain",
+    ));
+    for (name, note, graded) in [
+        (
+            "grade-compatible",
+            "the contract asks for exactly what is there",
+            grade::Grade::Compatible,
+        ),
+        (
+            "grade-convertible",
+            "a registered lossless cast names the registration that closes it",
+            grade::Grade::Convertible {
+                registration: reg.name.clone(),
+                mapping: reg.mapping.describe(),
+            },
+        ),
+        (
+            "grade-producible",
+            "the remedy names the CONTRACT's target, never the observed encoding",
+            grade::Grade::Producible {
+                target: "f8_e4m3fn at transformer/blocks.0.attn.to_q.weight".to_string(),
+                source: "this checkpoint's bf16 tensors".to_string(),
+            },
+        ),
+        (
+            "grade-incompatible",
+            "a different model, not a different packaging",
+            grade::Grade::Incompatible {
+                reason: "transformer/blocks.0.attn.to_q.weight: logical shapes disagree"
+                    .to_string(),
+            },
+        ),
+    ] {
+        cases.push(ok_case(
+            "layout",
+            name,
+            "grade_decision",
+            grade::GradeDecision {
+                report: report.object_id(),
+                grade: graded,
+            }
+            .canonical_bytes(),
+            note,
+        ));
+    }
+    cases.push(red_case(
+        "layout-red",
+        "fifth-grade",
+        "grade_decision",
+        sub(
+            &grade::GradeDecision {
+                report: report.object_id(),
+                grade: grade::Grade::Compatible,
+            }
+            .canonical_bytes(),
+            "\"t\":\"COMPATIBLE\"",
+            "\"t\":\"PROBABLY\"",
+        ),
+        "UNKNOWN_FIELD",
+        "a fifth grade below the hub: the four levels are the closed set",
     ));
     // --- restricted deterministic CBOR representations (all red)
     let g = "canonical";

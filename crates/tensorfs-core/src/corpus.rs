@@ -38,6 +38,10 @@ pub const DOC_KINDS: &[&str] = &[
     "stamp",
     "code_topology",
     "compat_report",
+    #[cfg(feature = "grade")]
+    "conversion_registration",
+    #[cfg(feature = "grade")]
+    "grade_decision",
 ];
 
 pub fn run_doc(
@@ -87,6 +91,15 @@ pub fn run_doc(
         "compat_report" => {
             crate::compat::CompatibilityReport::parse(bytes).map(|_| (None, None))?
         }
+        // The grading plane's two documents. They are in THIS dispatch — the one the CLI
+        // and the Python facade share — so the wheel and the binary verify the same corpus
+        // rather than two corpora that agree only where they overlap.
+        #[cfg(feature = "grade")]
+        "conversion_registration" => {
+            crate::grade::ConversionRegistration::parse(bytes).map(|_| (None, None))?
+        }
+        #[cfg(feature = "grade")]
+        "grade_decision" => crate::grade::GradeDecision::parse(bytes).map(|_| (None, None))?,
         other => {
             return refuse(
                 Code::UNKNOWN_FORMAT,
