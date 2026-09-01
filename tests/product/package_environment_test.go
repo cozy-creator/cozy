@@ -2,15 +2,129 @@ package producttest
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
+
+func TestPublishedPackageDoesNotFeedRuntimeItsOwnWheel(t *testing.T) {
+	homeDir, err := os.UserHomeDir()
+	must(t, err)
+	runtimeRepo := filepath.Join(homeDir, "cozy_v2", "cozy-runtime") //cozy:allow peer source; exact current Runtime wheel
+	if _, err := os.Stat(filepath.Join(runtimeRepo, "pyproject.toml")); err != nil {
+		t.Skipf("no cozy-runtime peer at %s: %v", runtimeRepo, err)
+	}
+	fixtureRoot := t.TempDir()
+	project := filepath.Join(fixtureRoot, "source")
+	build := exec.Command("python3", "tests/product/testdata/build-weightless.py",
+		"--runtime-repo", runtimeRepo, "--runtime-sha", "HEAD", "--out", fixtureRoot,
+		"--source-out", project, "--version", "1.0.4")
+	build.Dir = "../.."
+	build.Env = childEnv(t, runtimeRepo, "RUNTIME_REPO="+runtimeRepo)
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build current Runtime package fixture: %v\n%s", err, output)
+	}
+	must(t, os.Mkdir(filepath.Join(project, "weightless"), 0o755))
+	must(t, os.Rename(filepath.Join(project, "weightless.py"),
+		filepath.Join(project, "weightless", "__init__.py")))
+	appendProjectTOML(t, project, `
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
+
+[project.entry-points."cozy.application"]
+default = "weightless:app"
+
+[tool.uv.build-backend]
+module-name = "weightless"
+module-root = ""
+`)
+	lockPublishProject(t, project)
+	pack, problem := packagepublish.PrepareFrom(project)
+	fatal(t, problem)
+	fatal(t, pack.Build(context.Background()))
+	defer pack.Close()
+
+	exact := func(path string) hub.ExactDocument {
+		raw, err := os.ReadFile(path)
+		must(t, err)
+		digest := sha256.Sum256(raw)
+		return hub.ExactDocument{CanonicalBytes: raw,
+			Digest: "sha256:" + hex.EncodeToString(digest[:]), Length: int64(len(raw))}
+	}
+	type servedWheel struct {
+		body []byte
+	}
+	served := map[string]servedWheel{}
+	addWheel := func(path string, kind string) hub.PackageInstallDownload {
+		body, err := os.ReadFile(path)
+		must(t, err)
+		fact, inspectProblem := wheel.InspectIdentity(path)
+		fatal(t, inspectProblem)
+		digest := sha256.Sum256(body)
+		served[fact.Filename] = servedWheel{body: body}
+		return hub.PackageInstallDownload{
+			Digest: "sha256:" + hex.EncodeToString(digest[:]), Distribution: fact.Distribution,
+			Kind: kind, Length: fact.Length, Path: fact.Filename, Tags: []string{"py3-none-any"},
+			Version: fact.Version,
+		}
+	}
+	downloads := []hub.PackageInstallDownload{addWheel(pack.Wheel, "project_wheel")}
+	for _, dependency := range pack.DependencyWheels {
+		downloads = append(downloads, addWheel(dependency.Path, "dependency_wheel"))
+	}
+	if len(downloads) < 2 || downloads[1].Distribution != "cozy-runtime" { //cozy:allow distribution assertion, not executable access
+		t.Fatalf("fixture did not carry the exact Runtime dependency: %+v", downloads)
+	}
+
+	plan := hub.PackageDownloadPlan{
+		Downloads: downloads, PackageConfig: exact(filepath.Join(project, "package.toml")),
+		PackageDescriptor: exact(pack.Descriptor), Pyproject: exact(filepath.Join(project, "pyproject.toml")),
+		Release: pack.Release, ReleaseDigest: "sha256:" + strings.Repeat("a", 64),
+		UVLock: exact(filepath.Join(project, "uv.lock")),
+	}
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path ==
+			"/v1/packages/proof/cozy-weightless-package/download":
+			for index := range plan.Downloads {
+				plan.Downloads[index].URL = server.URL + "/files/" + plan.Downloads[index].Path
+			}
+			_ = json.NewEncoder(w).Encode(plan)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/files/"):
+			item, ok := served[strings.TrimPrefix(r.URL.Path, "/files/")]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(item.body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	code, output := runCozyDir(t, root, "", []string{"TENSORHUB_URL=" + server.URL},
+		"package", "install", "proof/cozy-weightless-package", "--version", pack.Release,
+		"--no-model-download", "--json")
+	if code != 0 || !strings.Contains(output, `"package":"proof/cozy-weightless-package"`) {
+		t.Fatalf("published package install [exit %d]\n%s", code, output)
+	}
+}
 
 func TestPublishedPackageEnvironmentsKeepPythonAndTorchIndependent(t *testing.T) {
 	type installed struct {

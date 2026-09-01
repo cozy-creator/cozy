@@ -134,7 +134,9 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 		"--environment-python", home.VenvPython(venvDir),
 	}
 	for _, wheel := range published.Wheels {
-		args = append(args, "--dependency-wheel", wheel.Path)
+		if runtimePreparationDependency(wheel) {
+			args = append(args, "--dependency-wheel", wheel.Path)
+		}
 	}
 	for _, model := range published.Models {
 		raw, err := json.Marshal(model)
@@ -211,7 +213,7 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 		return nil, empty, "", nil, exit.Internalf("cannot remove prepared project-wheel view: %s", err)
 	}
 	for _, wheel := range published.Wheels {
-		if !selectedDependencies[wheel.Digest] {
+		if runtimePreparationDependency(wheel) && !selectedDependencies[wheel.Digest] {
 			return nil, empty, "", nil, exit.Named(exit.Structural,
 				"package_placement_incomplete",
 				"cozy-runtime omitted published dependency %s from the local package placement",
@@ -350,7 +352,9 @@ func runPublishedSelection(l home.Layout, gen records.PackageInstall,
 		"--environment-python", home.VenvPython(filepath.Join(gen.Dir, "venv")),
 	}
 	for _, wheel := range published.Wheels {
-		args = append(args, "--dependency-wheel", wheel.Path)
+		if runtimePreparationDependency(wheel) {
+			args = append(args, "--dependency-wheel", wheel.Path)
+		}
 	}
 	for _, model := range published.Models {
 		raw, err := json.Marshal(model)
@@ -404,6 +408,15 @@ func runPublishedSelection(l home.Layout, gen records.PackageInstall,
 		return empty, exit.Internalf("cannot retain selected package placement: %s", err)
 	}
 	return answer.PlacementSet, nil
+}
+
+// The package venv runs the exact cozy-runtime wheel selected by uv.lock. Passing that
+// wheel back to its own prepare-package command as a package-owned dependency makes Runtime
+// revalidate itself against the deliberately narrow protected-base observation, which cannot
+// and should not duplicate uv's complete dependency check. All other dependency wheels remain
+// explicit package inputs.
+func runtimePreparationDependency(wheel PublishedWheel) bool {
+	return wheel.Distribution != "cozy-runtime"
 }
 
 func stagePublishedWheel(cache, setDir string, wheel *PublishedWheel) *exit.Error {
