@@ -255,8 +255,9 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		Proof:            proof,
 	}}}) //cozy:allow-reveal local bootstrap or signed rental ClaimProof crosses only on Claim
 
-	// WatchProgress rides a PHYSICALLY separate connection (01) once the claim lands;
-	// opened after ClaimAck below.
+	// WatchProgress rides a PHYSICALLY separate connection (01), opened at the snapshot
+	// barrier below -- not at ClaimAck, which does not by itself complete the control
+	// transition the lossy lane must not race.
 	var watchCancel context.CancelFunc
 	defer func() {
 		if watchCancel != nil {
@@ -722,8 +723,9 @@ func (c *Orchestrator) reconcileSnapshotAbsence(w *worker, held map[string]bool)
 	return continuations
 }
 
-// openWatch opens the LOSSY progress lane on its own connection, bound to the claimed
-// generation. Its death is invisible to control; the redial cycle reopens it.
+// openWatch opens the LOSSY progress lane on its own connection after the snapshot
+// barrier, bound to the claimed generation. Its death is invisible to control; the
+// redial cycle reopens it.
 func (c *Orchestrator) openWatch(addr string, w *worker, s *session) context.CancelFunc {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
