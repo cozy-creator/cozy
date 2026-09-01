@@ -39,6 +39,7 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	accountName := ""
 	foreignModelRequests := 0
 	logoutAttempts := 0
+	rateLimitEnrollment := false
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -46,7 +47,15 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 		case "/v1/auth/device-keys/enroll/begin":
 			mu.Lock()
 			enrollBegins++
+			limited := rateLimitEnrollment
 			mu.Unlock()
+			if limited {
+				writeAuthJSON(t, w, http.StatusTooManyRequests, map[string]any{"error": map[string]any{
+					"code": "rate_limited", "message": "Too many requests. Please try again later.",
+					"metadata": map[string]int{"retry_after_seconds": 36},
+				}})
+				return
+			}
 			var body struct {
 				Email     string `json:"email"`
 				PublicKey string `json:"public_key"`
@@ -295,9 +304,18 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 			afterLogout.code, afterLogout.stdout, afterLogout.stderr)
 	}
 	mu.Lock()
+	rateLimitEnrollment = true
+	mu.Unlock()
+	limited := runAuthCozy(t, root, server.URL, "", "auth", "login", "person@example.com", "--json")
+	if limited.code == 0 || !strings.Contains(limited.stdout, `"code":"rate_limited"`) ||
+		!strings.Contains(limited.stdout, `"remedy":"retry after 36 seconds"`) {
+		t.Fatalf("rate-limit retry interval [exit %d]\nstdout: %s\nstderr: %s",
+			limited.code, limited.stdout, limited.stderr)
+	}
+	mu.Lock()
 	defer mu.Unlock()
-	if enrollBegins != 2 || loginBegins != 9 {
-		t.Fatalf("auth begin calls = enroll %d login %d, want 2/9", enrollBegins, loginBegins)
+	if enrollBegins != 3 || loginBegins != 9 {
+		t.Fatalf("auth begin calls = enroll %d login %d, want 3/9", enrollBegins, loginBegins)
 	}
 	if foreignModelRequests != 0 {
 		t.Fatalf("foreign model requests = %d, want 0", foreignModelRequests)
