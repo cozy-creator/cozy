@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -142,7 +143,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	if e = validateModelTransferSubmission(spec); e != nil {
+	if e = modeltransfer.ValidateSubmission(spec); e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
@@ -190,61 +191,6 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 	}
 	s.ok(w, r, status, handle)
-}
-
-func validateModelTransferSubmission(spec orchestrator.Submission) *exit.Error {
-	intent := spec.ModelTransfer
-	if intent == nil {
-		return nil
-	}
-	platformPassThrough := spec.Package == "cozy/platform" && spec.Entrypoint == "model-pass-through"
-	if spec.Package == "cozy/platform" || spec.Entrypoint == "model-pass-through" {
-		if !platformPassThrough {
-			return exit.New(exit.Validation, "platform pass-through requires exact package and function")
-		}
-		if len(intent.Outputs) != 1 || intent.Outputs[0].Name != "model" ||
-			intent.Outputs[0].RequiredContract != nil {
-			return exit.New(exit.Validation, "platform pass-through requires exactly output model")
-		}
-		return nil
-	}
-	if len(intent.SourceProfiles) == 0 || len(intent.Outputs) != len(spec.WeightsOutputs) ||
-		!sameProfileMap(intent.SourceProfiles, spec.ProducerProfiles) {
-		return exit.New(exit.Validation, "producer transfer inputs/outputs do not match the job descriptor")
-	}
-	declared := make(map[string]bool, len(spec.WeightsOutputs))
-	for _, output := range spec.WeightsOutputs {
-		declared[output.OutputID] = true
-	}
-	for _, output := range intent.Outputs {
-		var declaredOutput *orchestrator.WeightsOutput
-		for i := range spec.WeightsOutputs {
-			if spec.WeightsOutputs[i].OutputID == output.Name {
-				declaredOutput = &spec.WeightsOutputs[i]
-			}
-		}
-		if !declared[output.Name] || output.RequiredContract == nil || declaredOutput == nil ||
-			declaredOutput.RequiredContract == nil ||
-			output.RequiredContract.TopologyDigest != declaredOutput.RequiredContract.TopologyDigest ||
-			strings.Join(output.RequiredContract.Encodings, "\x00") !=
-				strings.Join(declaredOutput.RequiredContract.Encodings, "\x00") {
-			return exit.New(exit.Validation,
-				"producer transfer output %s lacks its descriptor contract", output.Name)
-		}
-	}
-	return nil
-}
-
-func sameProfileMap(left, right map[string]string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for key, value := range left {
-		if right[key] != value {
-			return false
-		}
-	}
-	return true
 }
 
 func replayJobSubmission(sub JobSubmission,

@@ -441,7 +441,7 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 		return nil, exit.Named(exit.Validation, "model_producer.not_job",
 			"--producer %s does not name one ordinary job callable", raw)
 	}
-	if problem := validateProducerJob(raw, job); problem != nil {
+	if problem := modeltransfer.ValidateProducer(raw, job); problem != nil {
 		return nil, problem
 	}
 	plan := &producerPlan{Name: target.Selector + "/" + target.Function,
@@ -562,34 +562,4 @@ func parseProductionCallable(value string) (productionCallable, *exit.Error) {
 	}
 	return productionCallable{Package: selector.Package, Selector: selector.String(),
 		Function: parts[2]}, nil
-}
-
-func validateProducerJob(name string, job *launch.Entrypoint) *exit.Error {
-	if len(job.Models) == 0 {
-		return exit.Named(exit.Validation, "model_producer.source_inputs_absent",
-			"producer job %s has no typed model input", name)
-	}
-	for _, slot := range job.Models {
-		if slot.SourceProfile == "" {
-			return exit.Named(exit.Validation, "model_producer.source_profile_absent",
-				"producer job %s model input %s has no TensorFS source profile", name, slot.Param)
-		}
-	}
-	for _, field := range job.Request.Fields {
-		if field.Wire == "required" {
-			return exit.Named(exit.Validation, "model_producer.argument_missing",
-				"producer job %s requires argument %s", name, field.Name)
-		}
-	}
-	if len(job.WeightsOutputs) == 0 {
-		return exit.Named(exit.Validation, "model_producer.outputs_absent",
-			"producer job %s has no WeightsSink model output", name)
-	}
-	for _, output := range job.WeightsOutputs {
-		if output.RequiredContract == nil {
-			return exit.Named(exit.Validation, "model_producer.output_contract_absent",
-				"producer job %s output %s has no required model contract", name, output.OutputID)
-		}
-	}
-	return nil
 }

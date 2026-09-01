@@ -223,8 +223,7 @@ func (o *modelTransferOwner) Finalize(ctx context.Context, requestID string,
 	checkpoints := make(map[string]string, len(rows))
 	for _, weights := range rows {
 		contract, declared := contracts[weights.OutputSlot]
-		passThrough := request.Package == "cozy/platform" && request.Entrypoint == "model-pass-through"
-		if !declared || (!passThrough && contract == nil) {
+		if !declared {
 			return exit.Named(exit.Conflict, "model_transfer.output_undeclared",
 				"weights output %s is absent from the accepted producer descriptor",
 				weights.OutputSlot)
