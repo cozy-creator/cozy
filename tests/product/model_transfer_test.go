@@ -73,6 +73,49 @@ func TestModelTransferFinalizationCancelAndPartialOutputsStayVisible(t *testing.
 	}
 }
 
+func TestFailedAndCanceledProducerAttemptsTerminalizeTransferBeforeAck(t *testing.T) {
+	for _, test := range []struct{ status, sidecar, request string }{
+		{"FAILED", "failed", "failed"}, {"CANCELED", "canceled", "canceled"},
+	} {
+		t.Run(strings.ToLower(test.status), func(t *testing.T) {
+			store, problem := records.Open(t.TempDir() + "/records.db")
+			fatal(t, problem)
+			defer store.Close()
+			request := transferRequest("job-terminal-" + strings.ToLower(test.status))
+			_, _, problem = store.Submit(request)
+			fatal(t, problem)
+			fatal(t, store.CompleteModelTransferMaterialization(request.ID, nil))
+			worker := "worker-" + strings.ToLower(test.status)
+			fatal(t, store.AttachWorker(records.WorkerProcess{InstanceID: worker,
+				Package: request.Package, WorkerID: worker}))
+			attempt, problem := store.Dispatch(records.Attempt{RequestID: request.ID,
+				InstanceID: worker, SessionID: "boot", InvocationDigest: digest("1"),
+				InvocationCanonical: []byte(`{}`)})
+			fatal(t, problem)
+			fatal(t, store.OfferDispatch(request.ID, attempt, "boot"))
+			applied, problem := store.AcceptTerminal(records.Terminal{RequestID: request.ID,
+				Attempt: attempt, SessionID: "boot", InvocationDigest: digest("1"),
+				TerminalID: "terminal", TerminalDigest: digest("2"), Status: test.status,
+				Cause: test.status, SafeMessage: "producer stopped", RequestState: "finalizing",
+				EventType: "request.finalizing", EventPayload: map[string]any{"status": "FINALIZING"}})
+			fatal(t, problem)
+			if !applied {
+				t.Fatal("producer terminal was not applied")
+			}
+			transferRow, problem := store.ModelTransferOf(request.ID)
+			fatal(t, problem)
+			if transferRow.State != test.sidecar {
+				t.Fatalf("%s attempt left sidecar %s", test.status, transferRow.State)
+			}
+			settled, problem := store.SettleModelTransferRequest(request.ID, attempt)
+			fatal(t, problem)
+			if settled != test.request {
+				t.Fatalf("%s attempt settled request %s", test.status, settled)
+			}
+		})
+	}
+}
+
 func TestPublicationValidationRefusesChangedOpenAndFinalize(t *testing.T) {
 	manifest := hub.Object{ID: digest("a"), Length: 11}
 	blob := hub.Object{ID: digest("b"), Length: 29}
@@ -118,6 +161,21 @@ func TestPassThroughTransferResumesAndCancelCannotBeOverwritten(t *testing.T) {
 		_, _, problem = controller.Reconcile()
 		fatal(t, problem)
 		waitTransferRequestState(t, store, request.ID, "succeeded")
+	})
+
+	t.Run("wrong-platform-function-stays-owed", func(t *testing.T) {
+		store, problem := records.Open(t.TempDir() + "/records.db")
+		fatal(t, problem)
+		defer store.Close()
+		request := passThroughRequest("job-pass-wrong-function")
+		request.Entrypoint = "other"
+		_, _, problem = store.Submit(request)
+		fatal(t, problem)
+		owed, problem := store.Owed()
+		fatal(t, problem)
+		if len(owed) != 1 || owed[0].ID != request.ID {
+			t.Fatalf("non-pass-through cozy/platform request disappeared on restart: %+v", owed)
+		}
 	})
 
 	t.Run("cancel", func(t *testing.T) {

@@ -699,6 +699,21 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 			if row.State == "failed" {
 				state.ErrorType, state.Error = transfer.ErrorCode, transfer.SafeError
 			}
+			if transfer.State == "materializing" {
+				state.Stage = "source materialization"
+				if statuses, statusProblem := s.store.ModelTransferSourceStatuses(row.ID); statusProblem == nil {
+					var transferred, total int64
+					for _, status := range statuses {
+						transferred += status.Transferred
+						total += status.Length
+					}
+					state.Progress = map[string]any{"stage": state.Stage,
+						"transferred_bytes": transferred, "total_bytes": total}
+					if total > 0 {
+						state.Progress["fraction"] = float64(transferred) / float64(total)
+					}
+				}
+			}
 		}
 	}
 	if row.Ordinal == 0 && (row.State == "submitted" || row.State == "queued") {

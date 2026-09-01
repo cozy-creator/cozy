@@ -185,6 +185,8 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 	if problem := c.opt.Store.BeginModelTransferMaterialization(req.ID); problem != nil {
 		return req, problem
 	}
+	c.publishTransferProgress(req.ID, map[string]any{"stage": "source materialization",
+		"transferred_bytes": int64(0), "total_bytes": transferSourceBytes(transfer.SourceFiles)})
 	var models []ModelRef
 	if w.spec.Connection == nil {
 		models, problem = c.opt.ModelTransfers.MaterializeLocal(context.Background(), req.ID,
@@ -220,6 +222,23 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 	req.Models = append([]ModelRef(nil), models...)
 	c.emit(req.ID, "request.inputs_materialized", 0, map[string]any{"models": len(models)})
 	return req, nil
+}
+
+func transferSourceBytes(files []records.ModelTransferSourceFile) int64 {
+	var total int64
+	for _, file := range files {
+		total += file.Length
+	}
+	return total
+}
+
+func (c *Orchestrator) publishTransferProgress(requestID string, value map[string]any) {
+	c.mu.Lock()
+	c.transferProgressSeq[requestID]++
+	seq := c.transferProgressSeq[requestID]
+	c.mu.Unlock()
+	c.frames.publish(Frame{RequestID: requestID, Attempt: 0, Seq: seq,
+		Type: "progress", Value: value})
 }
 
 func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req records.Request,

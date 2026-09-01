@@ -814,7 +814,6 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 		go c.cleanupRequestAssets(*row)
 		c.logf("%s FAILED before any offer: %s", requestID, cause.Message)
 		c.signalClosed(requestWaitKey(requestID), cause)
-		c.releaseManaged(*row)
 		return
 	}
 	if e := c.opt.Store.SettleRequest(requestID, "failed"); e != nil {

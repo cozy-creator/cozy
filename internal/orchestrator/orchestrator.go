@@ -203,6 +203,7 @@ type Orchestrator struct {
 	transferRunning     map[string]bool
 	transferDispatching map[string]bool
 	transferCancels     map[string]context.CancelFunc
+	transferProgressSeq map[string]uint64
 	// privateTransfers is command-scoped, lossy progress over Creator's durable request
 	// row and sealed revision. A restart simply replays exact chunks from those authorities.
 	privateTransfers map[string]*privateTransfer
@@ -242,6 +243,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		transferRunning:     make(map[string]bool),
 		transferDispatching: make(map[string]bool),
 		transferCancels:     make(map[string]context.CancelFunc),
+		transferProgressSeq: make(map[string]uint64),
 		privateTransfers:    make(map[string]*privateTransfer),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a

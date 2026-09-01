@@ -119,6 +119,19 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 	if state == "failed" && frame.SafeCode != "capability_expired" {
 		_ = c.opt.Store.FailModelTransfer(frame.OperationId, frame.SafeCode, frame.SafeDetail)
 	}
+	if statuses, problem := c.opt.Store.ModelTransferSourceStatuses(frame.OperationId); problem == nil {
+		var transferred, total int64
+		for _, status := range statuses {
+			transferred += status.Transferred
+			total += status.Length
+		}
+		value := map[string]any{"stage": "source download", "member": frame.Member,
+			"state": state, "transferred_bytes": transferred, "total_bytes": total}
+		if total > 0 {
+			value["fraction"] = float64(transferred) / float64(total)
+		}
+		c.publishTransferProgress(frame.OperationId, value)
+	}
 	c.signalTransfer(frame.OperationId)
 }
 
