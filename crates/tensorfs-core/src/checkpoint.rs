@@ -95,6 +95,7 @@ pub fn objectize_held<R: Read>(
         src.read_exact(&mut buf)
             .map_err(|e| io(format!("{what}: read {want} inline bytes"), e))?;
         h.update(&buf);
+        store.moved(want);
         return Ok(Written {
             part: Part {
                 dtype,

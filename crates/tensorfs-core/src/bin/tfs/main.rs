@@ -5,7 +5,7 @@
 //!   tfs cbor encode|decode|check <file>  header conformance seam; JSON is diagnostic only
 //!
 //! The object store (tfs-002). Flags: --expect <hex> --expect-length <n> --out <path>
-//! --range <off>:<len> --rate <f> --pass <n> --max-age <s> --slow-ms <n>
+//! --range <off>:<len> --rate <f> --pass <n> --slow-ms <n>
 //! --size <bytes> --small <n>, plus the dev-only kill points --fault <stage> --ready <path>.
 //!
 //!   tfs store init|info <root>
@@ -15,7 +15,7 @@
 //!   tfs contains <root> <hex>    the presence HINT, and what it is worth
 //!   tfs verify <root> <hex>      verification record or rehash; remove corrupt bytes
 //!   tfs scrub <root>             one rate knob over the whole store
-//!   tfs reap <root>              age-bounded temp reap
+//!   tfs reap <root>              reap admission temps whose writer is gone
 //!   tfs fill <root> <plan>       resumable fill: skip only verified objects
 //!   tfs bench-store <root>       put/read/range/rehash throughput + peak RSS
 //!
@@ -140,7 +140,7 @@ fn main() -> ExitCode {
         ["contains", r, h] => cmd_contains(Path::new(r), h),
         ["verify", r, h] => cmd_verify_object(Path::new(r), h, &flags),
         ["scrub", r] => cmd_scrub(Path::new(r), &flags),
-        ["reap", r] => cmd_reap(Path::new(r), &flags),
+        ["reap", r] => cmd_reap(Path::new(r)),
         ["fill", r, p] => cmd_fill(Path::new(r), Path::new(p), &flags),
         ["bench-store", r] => cmd_bench_store(Path::new(r), &flags),
         ["checkpoint", "write", r] => ckpt::cmd_write(Path::new(r), &flags),
@@ -344,6 +344,7 @@ mod layout;
 mod rd;
 mod repo;
 mod snap;
+mod watch;
 
 fn cmd_store(root: &Path, verb: &str) -> ExitCode {
     let s = match verb {
@@ -502,11 +503,10 @@ fn cmd_scrub(root: &Path, f: &Flags) -> ExitCode {
     ExitCode::from(if r.removed > 0 { 1 } else { 0 })
 }
 
-fn cmd_reap(root: &Path, f: &Flags) -> ExitCode {
+fn cmd_reap(root: &Path) -> ExitCode {
     let s = ok!(Store::open(root));
-    let age = flag_num(f, "max-age", 3600u64);
-    let (gone, kept) = ok!(s.reap(age));
-    println!("reap max-age={age}s: removed {gone} temps, kept {kept}");
+    let (gone, kept) = ok!(s.reap());
+    println!("reap: removed {gone} orphaned temps, kept {kept} with a live writer");
     ExitCode::SUCCESS
 }
 

@@ -595,7 +595,9 @@ pub fn execute(
                             );
                         }
                     }
-                    inherited += checked_bytes(&what, &r.shape, r.dtype)?;
+                    let bytes = checked_bytes(&what, &r.shape, r.dtype)?;
+                    inherited += bytes;
+                    store.moved(bytes);
                     segments += part.segments().len();
                     (**part).clone()
                 }
