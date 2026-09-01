@@ -13,7 +13,7 @@ use tensorfs_core::repository::{self, Mutation, Repository};
 use tensorfs_core::storage::{
     self, Census, CheckpointFacts as CensusCheckpointFacts, InventoryEntry,
 };
-use tensorfs_core::store::{Fault, Store};
+use tensorfs_core::store::{ExpectedCheckpointContract, Fault, Store};
 
 use crate::{bail, flag, Flags};
 
@@ -412,6 +412,29 @@ pub fn cmd_local_replace(
         Ok(store) => store,
         Err(error) => return bail(error),
     };
+    let topologies: Vec<&str> = flags
+        .iter()
+        .filter(|(name, _)| name == "expected-topology")
+        .map(|(_, value)| value.as_str())
+        .collect();
+    if topologies.len() > 1 {
+        return bail(Refusal {
+            code: Code::ATTACHMENT_CARDINALITY,
+            detail: "--expected-topology must appear at most once".into(),
+        });
+    }
+    let encoding_ids: Vec<String> = flags
+        .iter()
+        .filter(|(name, _)| name == "expected-encoding")
+        .map(|(_, value)| value.clone())
+        .collect();
+    let expected = match ExpectedCheckpointContract::optional(
+        topologies.first().copied(),
+        (!encoding_ids.is_empty()).then_some(encoding_ids),
+    ) {
+        Ok(expected) => expected,
+        Err(error) => return bail(error),
+    };
     let observed = match observed_local(&store, name, observed) {
         Ok(observed) => observed,
         Err(error) => return bail(error),
@@ -454,7 +477,12 @@ pub fn cmd_local_replace(
         version: selection,
         evidence: Box::new(evidence),
     };
-    match store.apply_repository(observed.as_deref(), &mutation, &Fault::default()) {
+    match store.apply_repository_with_expected_local(
+        observed.as_deref(),
+        &mutation,
+        expected.as_ref(),
+        &Fault::default(),
+    ) {
         Ok(Some(repository)) => match print_local(&repository) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => bail(error),

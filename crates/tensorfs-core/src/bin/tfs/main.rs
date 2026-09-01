@@ -38,6 +38,7 @@
 //!   tfs repo commit <store> <current.json|-> <mutation.json>
 //!   tfs local resolve <store> <name>
 //!   tfs local replace <store> <name> <source-sha256> <manifest> <length>
+//!     [--expected-topology <sha256>] [--expected-encoding <sha256>]...
 //!                     --observed <repository-sha256|absent> --evidence <evidence.json>
 //!   tfs local remove <store> <name> --observed <repository-sha256>
 //!   tfs key blob|manifest <sha256> | repo <org> <name>
