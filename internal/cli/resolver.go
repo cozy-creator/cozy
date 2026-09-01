@@ -374,6 +374,10 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function st
 		return empty, nil, exit.Named(exit.Conflict, "rental.package_release_changed",
 			"Tensorhub release %s@%s does not match the queued immutable release", pkg, release)
 	}
+	requirements, problem := detail.Requirements()
+	if problem != nil {
+		return empty, nil, problem
+	}
 	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
 	if problem != nil {
 		return empty, nil, problem
@@ -442,7 +446,7 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function st
 	return orchestrator.LogicalPackage{
 		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
 		Function: function, Outputs: launch.AssetPaths(entrypoint.Result), PlanID: planID,
-		Models: models, NeedsAccelerator: entrypoint.NeedsAccelerator(),
+		Models: models, NeedsAccelerator: launch.AcceleratorRequired(requirements),
 	}, entrypoint, nil
 }
 
@@ -470,6 +474,10 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 		detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
 		return empty, nil, exit.Named(exit.Conflict, "rental.package_release_changed",
 			"Tensorhub release %s@%s does not match the queued immutable release", pkg, release)
+	}
+	requirements, problem := detail.Requirements()
+	if problem != nil {
+		return empty, nil, problem
 	}
 	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
 	if problem != nil || descriptor.Digest != detail.Release.PackageDescriptorDigest {
@@ -541,17 +549,18 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 	return orchestrator.LogicalJob{
 		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
 		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
-		WeightsOutputs: weights, NeedsAccelerator: job.NeedsAccelerator(), Models: models,
+		WeightsOutputs: weights, NeedsAccelerator: launch.AcceleratorRequired(requirements), Models: models,
 		SourceProfiles: profiles,
 	}, job, nil
 }
 
-func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error) {
-	_, descriptor, problem := r.installDescriptor(installID)
+func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, bool, *exit.Error) {
+	install, descriptor, problem := r.installDescriptor(installID)
 	if problem != nil {
-		return nil, problem
+		return nil, false, problem
 	}
-	return descriptor.Function(name)
+	entrypoint, problem := descriptor.Function(name)
+	return entrypoint, launch.AcceleratorRequired(strings.Split(install.Closure, "\n")), problem
 }
 
 func (r *Resolver) installRecord(installID string) (*records.PackageInstall, *exit.Error) {

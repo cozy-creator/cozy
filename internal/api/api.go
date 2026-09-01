@@ -106,7 +106,7 @@ type Resolver interface {
 		orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error)
 	ResolveRemoteJob(pkg, release, digest, function string, models []orchestrator.ModelRef,
 		deferredModels bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error)
-	Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error)
+	Entrypoint(installID, name string) (*launch.Entrypoint, bool, *exit.Error)
 	// Jobs names the `@job` functions one installed package registers, with the
 	// descriptor id each resolves to. The job submit route resolves a function to its
 	// digest through this and never lets a client name one (cl-004).

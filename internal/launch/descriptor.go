@@ -75,10 +75,6 @@ type WeightsOutput struct {
 	RequiredContract *WeightsModelContract `json:"required_contract,omitempty"`
 }
 
-// NeedsAccelerator is the callable's only derived machine-class fact. Typed Model
-// parameters route to one accelerator; weightless callables route to CPU capacity.
-func (ep *Entrypoint) NeedsAccelerator() bool { return len(ep.Models) > 0 }
-
 type WeightsModelContract struct {
 	TopologyDigest string   `json:"topology_digest"`
 	Encodings      []string `json:"encodings"`

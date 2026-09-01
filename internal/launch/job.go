@@ -176,8 +176,9 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	}
 	facts := &JobFacts{
 		Name: function, Request: declared.Request, DescriptorID: said.DescriptorID, Outputs: outputs,
-		WeightsOutputs: weightsOutputs,
-		Publishes:      declared.Publishes, NeedsAccelerator: declared.NeedsAccelerator(),
+		WeightsOutputs:   weightsOutputs,
+		Publishes:        declared.Publishes,
+		NeedsAccelerator: AcceleratorRequired(strings.Split(f.Install.Closure, "\n")),
 	}
 	if len(declared.Models) > 0 {
 		facts.SourceProfiles = make(map[string]string, len(declared.Models))

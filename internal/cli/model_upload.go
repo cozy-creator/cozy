@@ -479,8 +479,9 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 	plan := &producerPlan{Name: target.Selector + "/" + target.Function,
 		InstallID: selected.InstallID, Release: selected.Release,
 		ReleaseDigest: selected.ReleaseDigest,
-		Descriptor:    descriptor, Job: job, NeedsAccelerator: job.NeedsAccelerator(),
-		SourceProfiles: map[string]string{}}
+		Descriptor:    descriptor, Job: job,
+		NeedsAccelerator: launch.AcceleratorRequired(selected.Requirements),
+		SourceProfiles:   map[string]string{}}
 	plan.Pin = modeltransfer.JobPin{Callable: plan.Name, Package: target.Package,
 		Function: target.Function, InstallID: selected.InstallID, Release: selected.Release,
 		ReleaseDigest: selected.ReleaseDigest, DescriptorID: job.DescriptorID}
@@ -497,6 +498,7 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 type productionPackage struct {
 	InstallID, Release, ReleaseDigest string
 	Descriptor                        *launch.PackageDescriptor
+	Requirements                      []string
 }
 
 func resolveProductionPackage(ctx *Context, packageName string, remote bool) (productionPackage, *exit.Error) {
@@ -516,7 +518,8 @@ func resolveProductionPackage(ctx *Context, packageName string, remote bool) (pr
 			return productionPackage{}, problem
 		}
 		selected := productionPackage{InstallID: install.ID, Release: install.Version,
-			ReleaseDigest: install.SourceDigest, Descriptor: facts.PackageDescriptor}
+			ReleaseDigest: install.SourceDigest, Descriptor: facts.PackageDescriptor,
+			Requirements: strings.Split(install.Closure, "\n")}
 		return selected, nil
 	}
 
@@ -566,6 +569,10 @@ func resolveProductionPackage(ctx *Context, packageName string, remote bool) (pr
 			"Tensorhub package %s@%s has no exact immutable release digest",
 			selector.Package, release)
 	}
+	requirements, problem := detail.Requirements()
+	if problem != nil {
+		return productionPackage{}, problem
+	}
 	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
 	if problem != nil {
 		return productionPackage{}, problem
@@ -575,7 +582,7 @@ func resolveProductionPackage(ctx *Context, packageName string, remote bool) (pr
 			"Tensorhub package descriptor does not match its release fact")
 	}
 	selected := productionPackage{Release: release, ReleaseDigest: detail.Release.ReleaseDigest,
-		Descriptor: descriptor}
+		Descriptor: descriptor, Requirements: requirements}
 	return selected, nil
 }
 
