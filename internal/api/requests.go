@@ -58,6 +58,7 @@ type Submission struct {
 // AsyncRequestHandle cozy.art consumes, plus `attempt` (which a local client can act on
 // because there is no queue-position story to tell yet).
 type Handle struct {
+	Number        int64  `json:"number"`
 	RequestID     string `json:"request_id"`
 	Status        string `json:"status"`
 	Attempt       uint64 `json:"attempt"`
@@ -298,7 +299,7 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 func (s *Server) handleOf(row records.Request, attempt uint64) Handle {
 	base := "/v1/requests/" + row.ID
 	h := Handle{
-		RequestID: row.ID, Status: contractStatus(row.State), Attempt: attempt,
+		Number: row.Number, RequestID: row.ID, Status: contractStatus(row.State), Attempt: attempt,
 		StatusURL: base, ResponseURL: base, CancelURL: base + "/cancel",
 		EventsURL: base + "/events",
 	}
@@ -605,6 +606,7 @@ func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBind
 // fields a local client has and a cloud one does not need to presign: the typed result,
 // the visible media by OPAQUE id, and the triage handle.
 type Lifecycle struct {
+	Number        int64            `json:"number"`
 	Kind          string           `json:"kind"`
 	RequestID     string           `json:"request_id"`
 	Status        string           `json:"status"`
@@ -612,6 +614,7 @@ type Lifecycle struct {
 	Function      string           `json:"function"`
 	Attempt       uint64           `json:"attempt"`
 	Attempts      int              `json:"attempts"`
+	ElapsedMS     int64            `json:"elapsed_ms"`
 	ResponseURL   string           `json:"response_url"`
 	Metrics       map[string]any   `json:"metrics,omitempty"`
 	ErrorType     string           `json:"error_type,omitempty"`
@@ -658,15 +661,15 @@ type TriageRef struct {
 }
 
 func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	row, e := s.store.RequestRow(id)
+	reference := r.PathValue("id")
+	row, e := s.store.RequestByReference(reference)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
 	if row == nil {
 		s.refuse(w, r, http.StatusNotFound, "not_found",
-			"no request "+id+" on this host", "")
+			"no request "+reference+" on this host", "")
 		return
 	}
 	s.ok(w, r, http.StatusOK, s.lifecycleOf(*row))
@@ -678,7 +681,8 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		kind = "job"
 	}
 	life := Lifecycle{
-		Kind: kind, RequestID: row.ID, Status: contractStatus(row.State), Package: row.Package,
+		Number: row.Number, Kind: kind, RequestID: row.ID,
+		Status: contractStatus(row.State), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
 		Outputs: []MediaRef{}, Rental: row.Rental,
@@ -703,6 +707,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	}
 	attempts, _ := s.store.Attempts(row.ID)
 	life.Attempts = len(attempts)
+	life.ElapsedMS = elapsedMS(row, attempts)
 	outs, _ := s.store.VisibleOutputs(row.ID)
 	for _, o := range outs {
 		life.Outputs = append(life.Outputs, MediaRef{
@@ -792,16 +797,17 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 // ------------------------------------------------------------------------- cancel
 
 func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	row, e := s.store.RequestRow(id)
+	reference := r.PathValue("id")
+	row, e := s.store.RequestByReference(reference)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
 	if row == nil {
-		s.refuse(w, r, http.StatusNotFound, "not_found", "no request "+id+" on this host", "")
+		s.refuse(w, r, http.StatusNotFound, "not_found", "no request "+reference+" on this host", "")
 		return
 	}
+	id := row.ID
 	if status := contractStatus(row.State); status == "completed" || status == "failed" || status == "canceled" {
 		s.ok(w, r, http.StatusOK, s.lifecycleOf(*row))
 		return

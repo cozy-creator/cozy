@@ -89,8 +89,9 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 }
 
 func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Error {
+	reference := runReference(state.Number, state.JobID)
 	fields := []output.Field{
-		{K: "run", V: state.JobID},
+		{K: "run", V: reference}, {K: "id", V: state.JobID},
 		{K: "target", V: state.Package + "/" + state.Function},
 		{K: "status", V: runStatus(state.Status)},
 	}
@@ -107,8 +108,8 @@ func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Er
 	defaults = append(defaults, "run")
 	rec := compactRecord(fields, defaults...)
 	rec.Next = []string{
-		"cozy run watch " + state.JobID,
-		"cozy run cancel " + state.JobID,
+		"cozy run watch " + reference,
+		"cozy run cancel " + reference,
 	}
 	return emit(ctx, rec)
 }
@@ -139,7 +140,8 @@ func parseTrees(values []string) ([]string, *exit.Error) {
 
 func jobFields(state api.JobState, full bool) []output.Field {
 	fields := []output.Field{
-		{K: "job", V: state.JobID},
+		{K: "job", V: runReference(state.Number, state.JobID)},
+		{K: "id", V: state.JobID},
 		{K: "package", V: state.Package},
 		{K: "function", V: state.Function},
 		{K: "status", V: state.Status},

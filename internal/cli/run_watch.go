@@ -30,7 +30,18 @@ func handleRunWatch(ctx *Context) *exit.Error {
 		}
 		return watchJob(ctx, client, state)
 	default:
-		return watchInvocation(ctx, client, id)
+		life, problem := client.Request(id)
+		if problem != nil {
+			return problem
+		}
+		if life.Kind == "job" {
+			state, problem := client.Job(id)
+			if problem != nil {
+				return problem
+			}
+			return watchJob(ctx, client, state)
+		}
+		return watchInvocation(ctx, client, life.RequestID)
 	}
 }
 

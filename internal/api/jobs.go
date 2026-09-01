@@ -60,6 +60,7 @@ type JobSubmission struct {
 
 // JobHandle is the 202 answer.
 type JobHandle struct {
+	Number        int64  `json:"number"`
 	JobID         string `json:"job_id"`
 	Status        string `json:"status"`
 	Attempt       uint64 `json:"attempt"`
@@ -172,7 +173,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		defer s.activateRecorded(recorded)
 	}
 	handle := JobHandle{
-		JobID: jobID, Status: contractStatus(recorded.State), Attempt: attempt,
+		Number: recorded.Number, JobID: jobID, Status: contractStatus(recorded.State), Attempt: attempt,
 		Package: recorded.Package, Function: recorded.Entrypoint,
 		Repo:      home.ScratchRepo(recorded.Org, recorded.ID),
 		StatusURL: "/v1/local/jobs/" + jobID,
@@ -575,6 +576,7 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 // JobState is one job's document: the lifecycle a request has, plus the two facts only a
 // job has — its publication and its running bill.
 type JobState struct {
+	Number   int64  `json:"number"`
 	JobID    string `json:"job_id"`
 	Status   string `json:"status"`
 	Package  string `json:"package"`
@@ -668,14 +670,14 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) jobRow(w http.ResponseWriter, r *http.Request) (records.Request, bool) {
-	id := r.PathValue("id")
-	row, e := s.store.RequestRow(id)
+	reference := r.PathValue("id")
+	row, e := s.store.RequestByReference(reference)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return records.Request{}, false
 	}
 	if row == nil || !row.IsJob() {
-		s.refuse(w, r, http.StatusNotFound, "not_found", "no job "+id+" on this host",
+		s.refuse(w, r, http.StatusNotFound, "not_found", "no job "+reference+" on this host",
 			"`cozy run list` lists the jobs this host recorded")
 		return records.Request{}, false
 	}
@@ -684,7 +686,7 @@ func (s *Server) jobRow(w http.ResponseWriter, r *http.Request) (records.Request
 
 func (s *Server) jobStateOf(row records.Request) JobState {
 	state := JobState{
-		JobID: row.ID, Status: contractStatus(row.State), Package: row.Package,
+		Number: row.Number, JobID: row.ID, Status: contractStatus(row.State), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		Requeues: row.Requeues, RetryBudget: orchestrator.MaxRequeues,
 		Outputs: []MediaRef{}, CreatedAt: row.CreatedAt,

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -405,6 +406,10 @@ func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
 // --------------------------------------------------------------------------- requests
 
 type Request struct {
+	// Number is this host's short user-facing request reference. The globally unique ID
+	// remains the durable internal/Hub identity; Number is derived from the retained local
+	// request chronology and is never sent across the worker protocol.
+	Number     int64
 	ID         string
 	IdemKey    string
 	BodyDigest string
@@ -509,15 +514,16 @@ const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_
 	state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,rental_required,
 	COALESCE(install_id,''),assets,models,artifact_outputs`
 
-func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
-	var r Request
-	var assets, models string
-	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
+func requestScanTargets(r *Request, assets, models *string) []any {
+	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
 		&r.Release, &r.PackageRevisionDigest, &r.PrivatePackageDigest,
 		&r.PrivatePackageUploadedBootID, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.JobGPUCount, &r.Org, &r.Trees, &r.Worker, &r.Rental, &r.RentalRequired,
-		&r.InstallID, &assets, &models, &r.ArtifactOutputs)
+		&r.InstallID, assets, models, &r.ArtifactOutputs}
+}
+
+func finishRequestScan(r Request, assets, models string, err error) (Request, error) {
 	if err == nil && assets != "" {
 		err = json.Unmarshal([]byte(assets), &r.Assets)
 	}
@@ -525,6 +531,21 @@ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 		err = json.Unmarshal([]byte(models), &r.Models)
 	}
 	return r, err
+}
+
+func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
+	var r Request
+	var assets, models string
+	err := row.Scan(requestScanTargets(&r, &assets, &models)...)
+	return finishRequestScan(r, assets, models, err)
+}
+
+func scanNumberedRequest(row interface{ Scan(...any) error }) (Request, error) {
+	var r Request
+	var assets, models string
+	targets := append([]any{&r.Number}, requestScanTargets(&r, &assets, &models)...)
+	err := row.Scan(targets...)
+	return finishRequestScan(r, assets, models, err)
 }
 
 // IsJob answers the attempt class. The default spelling is `serving` so a row written
@@ -550,6 +571,48 @@ func (s *Store) RequestRow(id string) (*Request, *exit.Error) {
 		r.Models = append([]ModelRef(nil), transfer.Models...)
 	}
 	return &r, nil
+}
+
+// RequestByReference resolves the LOCAL short number or the globally unique durable id.
+// Internal lifecycle code continues to use RequestRow so a number can never cross into the
+// worker/Hub identity plane by accident.
+func (s *Store) RequestByReference(reference string) (*Request, *exit.Error) {
+	reference = strings.TrimSpace(reference)
+	if number, err := strconv.ParseInt(reference, 10, 64); err == nil && number > 0 &&
+		strconv.FormatInt(number, 10) == reference {
+		var id string
+		err := s.db.QueryRow(`SELECT id FROM requests ORDER BY created_at,id LIMIT 1 OFFSET ?`,
+			number-1).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, exit.Internalf("cannot resolve local request number %d: %s", number, err)
+		}
+		row, problem := s.RequestRow(id)
+		if row != nil {
+			row.Number = number
+		}
+		return row, problem
+	}
+	row, problem := s.RequestRow(reference)
+	if problem != nil || row == nil {
+		return row, problem
+	}
+	number, err := requestNumber(s.db, *row)
+	if err != nil {
+		return nil, exit.Internalf("cannot number request %s: %s", row.ID, err)
+	}
+	row.Number = number
+	return row, nil
+}
+
+func requestNumber(q interface{ QueryRow(string, ...any) *sql.Row }, row Request) (int64, error) {
+	var number int64
+	err := q.QueryRow(`SELECT COUNT(*) FROM requests
+		WHERE created_at < ? OR (created_at = ? AND id <= ?)`,
+		row.CreatedAt, row.CreatedAt, row.ID).Scan(&number)
+	return number, err
 }
 
 // BindRemoteInvocation records the exact invocation identity learned from the worker
@@ -716,7 +779,8 @@ func (s *Store) Requests(state string, limit int) ([]Request, *exit.Error) {
 // RequestsOfKind narrows the same listing to one ATTEMPT CLASS. `cozy run list` reads jobs
 // and the request listing reads serving rows — one table, one reader, two questions.
 func (s *Store) RequestsOfKind(kind, state string, limit int) ([]Request, *exit.Error) {
-	query := `SELECT ` + requestCols + ` FROM requests`
+	query := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number, ` +
+		requestCols + ` FROM requests) SELECT * FROM numbered`
 	where := []string{}
 	args := []any{}
 	if kind != "" {
@@ -739,7 +803,7 @@ func (s *Store) RequestsOfKind(kind, state string, limit int) ([]Request, *exit.
 	defer rows.Close()
 	var out []Request
 	for rows.Next() {
-		r, err := scanRequest(rows)
+		r, err := scanNumberedRequest(rows)
 		if err != nil {
 			return nil, exit.Internalf("cannot read a request row: %s", err)
 		}
@@ -1004,6 +1068,10 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 				WithRemedy("one key, one body: %s was recorded, %s was submitted",
 					short(existing.BodyDigest), short(r.BodyDigest))
 		}
+		existing.Number, err = requestNumber(tx, existing)
+		if err != nil {
+			return Request{}, false, exit.Internalf("cannot number request %s: %s", existing.ID, err)
+		}
 		return existing, false, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -1029,6 +1097,10 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	}
 	if problem := recordModelTransferTx(tx, r.ID, r.ModelTransfer); problem != nil {
 		return Request{}, false, problem
+	}
+	r.Number, err = requestNumber(tx, r)
+	if err != nil {
+		return Request{}, false, exit.Internalf("cannot number request %s: %s", r.ID, err)
 	}
 	return r, true, nil
 }
