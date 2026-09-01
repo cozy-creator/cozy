@@ -206,7 +206,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if e != nil {
 		return nil, e
 	}
-	genDir := l.GenerationDir(id)
+	genDir := l.InstallDir(id)
 	res := &Result{}
 	clock := time.Now()
 	mark := func(stage string) {
@@ -295,7 +295,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			WithNext("cozy package list")
 	}
 
-	if e := checkCapacity(l.Generations, res.Bytes); e != nil {
+	if e := checkCapacity(l.Installs, res.Bytes); e != nil {
 		return guard(e)
 	}
 
@@ -591,9 +591,9 @@ func Reclaim(l home.Layout, st *records.Store, id string) (int64, *exit.Error) {
 }
 
 func generationRemovalTarget(l home.Layout, gen records.PackageInstall) (string, *exit.Error) {
-	root, err := filepath.Abs(l.Generations)
+	root, err := filepath.Abs(l.Installs)
 	if err != nil {
-		return "", exit.Internalf("cannot resolve the generation root %s: %s", l.Generations, err)
+		return "", exit.Internalf("cannot resolve the install root %s: %s", l.Installs, err)
 	}
 	if gen.ID == "" || gen.ID == "." || gen.ID == ".." || filepath.Base(gen.ID) != gen.ID {
 		return "", exit.Internalf("refusing to remove generation with unsafe id %q", gen.ID)

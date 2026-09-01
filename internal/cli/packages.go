@@ -104,14 +104,14 @@ func handlePackageRecover(ctx *Context) *exit.Error {
 	}
 	defer st.Close()
 	defer writer.Unlock()
-	count, problem := st.RecoverPackageInventory(ctx.Inv.Args[0], layout.Generations)
+	count, problem := st.RecoverPackageInventory(ctx.Inv.Args[0], layout.Installs)
 	if problem != nil {
 		return problem
 	}
 	return emit(ctx, compactRecord([]output.Field{
-		{K: "status", V: "recovered"}, {K: "generations", V: count},
+		{K: "status", V: "recovered"}, {K: "installs", V: count},
 		{K: "source", V: ctx.Inv.Args[0]}, {K: "models_changed", V: false},
-	}, "status", "generations", "models_changed"))
+	}, "status", "installs", "models_changed"))
 }
 
 func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *install.Result) *exit.Error {

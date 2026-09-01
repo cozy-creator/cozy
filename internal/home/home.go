@@ -18,7 +18,7 @@ import (
 type Layout struct {
 	Root        string
 	DB          string // the one local SQLite lifecycle database
-	Generations string // one immutable directory per install generation
+	Installs string // one immutable directory per package install
 	Lock        string // the single-writer flock file
 	Daemon      string // the Cozy daemon's liveness lock (cl-001; held, never read)
 	Workers     string // per-worker roots: journal, logs, staged binding plans
@@ -78,7 +78,7 @@ func Open(root string) (Layout, *exit.Error) {
 	l := Layout{
 		Root:        root,
 		DB:          filepath.Join(root, "records.db"),
-		Generations: filepath.Join(root, "generations"),
+		Installs:    filepath.Join(root, "installs"),
 		Lock:        filepath.Join(root, "writer.lock"),
 		Daemon:      filepath.Join(root, "daemon.lock"),
 		Workers:     filepath.Join(root, "workers"),
@@ -93,7 +93,7 @@ func Open(root string) (Layout, *exit.Error) {
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
 	l.PrivatePackages = filepath.Join(root, "private-packages")
-	for _, dir := range []string{l.Generations, l.Workers, l.Outputs, l.Triage, l.Publications} {
+	for _, dir := range []string{l.Installs, l.Workers, l.Outputs, l.Triage, l.Publications} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}
@@ -143,8 +143,11 @@ func (l Layout) PendingRentalCreatorIdentity(operationKey string) string {
 // public — trusting exactly this PEM and no CA is what makes the pin a pin (#445).
 func (l Layout) RentalCert(id string) string { return filepath.Join(l.Rentals, id+".pem") }
 
-// GenerationDir is where one generation's source tree and venv live.
-func (l Layout) GenerationDir(id string) string { return filepath.Join(l.Generations, id) }
+// InstallDir is where one install's source tree and venv live. The id is still an
+// install-generation id: the directory is replaced wholesale, never mutated. "generations"
+// was the wrong name for the FOLDER -- in a product that generates media, a top-level
+// `generations/` reads as the output namespace, which is `outputs/`.
+func (l Layout) InstallDir(id string) string { return filepath.Join(l.Installs, id) }
 
 // WorkerDir is one worker session's own root: its journal, its log, and the binding
 // plan records the runtime resolves out of its COZY_HOME.
