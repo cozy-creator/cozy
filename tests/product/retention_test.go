@@ -10,7 +10,13 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestReclaimRemovesOnlyRetiredReadOnlyGeneration(t *testing.T) {
+// TestOutputRetention is the plan/perform split on the one verb that removes a user's
+// bytes. Reclaiming a superseded package generation deletes a read-only tree the owner
+// made unwritable on purpose, must not touch the ACTIVE generation beside it, must not
+// follow a symlink out of the layout, and must refuse outright a recorded directory the
+// layout does not own. Nothing here is mocked: a real home layout, a real records store,
+// and the product's own install.Reclaim against real files.
+func TestOutputRetention(t *testing.T) {
 	l, problem := home.Open(t.TempDir())
 	if problem != nil {
 		t.Fatal(problem)
@@ -65,44 +71,44 @@ func TestReclaimRemovesOnlyRetiredReadOnlyGeneration(t *testing.T) {
 	if generation, readProblem := store.Install(retired.ID); readProblem != nil || generation != nil {
 		t.Fatalf("retired record = %+v, %v", generation, readProblem)
 	}
-}
 
-func TestReclaimRefusesRecordedDirectoryOutsideGenerationRoot(t *testing.T) {
-	l, problem := home.Open(t.TempDir())
+	// A RECORDED DIRECTORY OUTSIDE THE GENERATION ROOT is refused whole: the row is a
+	// pointer, not a licence, and reclaiming it would delete bytes this layout never owned.
+	// The refusal keeps both the file and the record.
+	foreignLayout, problem := home.Open(t.TempDir())
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	store, problem := records.Open(l.DB)
+	foreignStore, problem := records.Open(foreignLayout.DB)
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	defer store.Close()
+	defer foreignStore.Close()
 
-	outside := filepath.Join(t.TempDir(), "recorded-elsewhere")
-	if err := os.MkdirAll(outside, 0o700); err != nil {
+	foreign := filepath.Join(t.TempDir(), "recorded-elsewhere")
+	if err := os.MkdirAll(foreign, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	sentinel := filepath.Join(outside, "sentinel")
-	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+	keeper := filepath.Join(foreign, "sentinel")
+	if err := os.WriteFile(keeper, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	retired := cleanupTestGeneration(l, "3333333333333333", "1.0.0")
-	retired.Dir = outside
-	active := cleanupTestGeneration(l, "4444444444444444", "1.0.1")
-	if _, problem = store.Activate(retired); problem != nil {
+	recorded := cleanupTestGeneration(foreignLayout, "3333333333333333", "1.0.0")
+	recorded.Dir = foreign
+	successor := cleanupTestGeneration(foreignLayout, "4444444444444444", "1.0.1")
+	if _, problem = foreignStore.Activate(recorded); problem != nil {
 		t.Fatal(problem)
 	}
-	if _, problem = store.Activate(active); problem != nil {
+	if _, problem = foreignStore.Activate(successor); problem != nil {
 		t.Fatal(problem)
 	}
-
-	if _, problem = install.Reclaim(l, store, retired.ID); problem == nil {
+	if _, problem = install.Reclaim(foreignLayout, foreignStore, recorded.ID); problem == nil {
 		t.Fatal("out-of-tree generation directory was accepted")
 	}
-	if got, err := os.ReadFile(sentinel); err != nil || string(got) != "keep" {
+	if got, err := os.ReadFile(keeper); err != nil || string(got) != "keep" {
 		t.Fatalf("out-of-tree file changed: %q, %v", got, err)
 	}
-	if generation, readProblem := store.Install(retired.ID); readProblem != nil || generation == nil {
+	if generation, readProblem := foreignStore.Install(recorded.ID); readProblem != nil || generation == nil {
 		t.Fatalf("refused generation record = %+v, %v", generation, readProblem)
 	}
 }

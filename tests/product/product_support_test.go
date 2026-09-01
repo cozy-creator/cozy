@@ -17,7 +17,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -27,26 +26,6 @@ import (
 
 // The two binaries the suite drives as real processes, built once by TestMain.
 var cozyBin, fakeWorkerBin string
-
-func terminateTestDaemon(t *testing.T, root string) {
-	t.Helper()
-	state := daemon.Probe(config.Config{Home: root})
-	if !state.Up || state.PID <= 0 {
-		return
-	}
-	process, err := os.FindProcess(state.PID)
-	if err == nil {
-		_ = process.Signal(os.Interrupt)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if !daemon.Probe(config.Config{Home: root}).Up {
-			return
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	t.Errorf("test-owned Cozy daemon %d did not stop", state.PID)
-}
 
 func TestMain(m *testing.M) {
 	if len(os.Args) == 2 && strings.HasPrefix(os.Args[1], "--cozy-test-daemon-parent=") {
@@ -96,16 +75,6 @@ type owner struct {
 }
 
 func hostOwner(t *testing.T, name string) *owner {
-	return hostOwnerWithLauncher(t, name, nil)
-}
-
-func hostOwnerWithLauncher(t *testing.T, name string, launcher orchestrator.Launcher) *owner {
-	return hostOwnerConfigured(t, name, launcher, nil)
-}
-
-func hostOwnerConfigured(t *testing.T, name string, launcher orchestrator.Launcher,
-	configure func(*orchestrator.Options),
-) *owner {
 	t.Helper()
 	root := filepath.Join(os.TempDir(), "cozy-product-test", name)
 	must(t, os.RemoveAll(root))
@@ -121,14 +90,10 @@ func hostOwnerConfigured(t *testing.T, name string, launcher orchestrator.Launch
 	fatal(t, e)
 	log, err := os.Create(filepath.Join(root, "orchestrator.log"))
 	must(t, err)
-	options := orchestrator.Options{
+	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: cfg, Layout: l, Store: st, Yield: "smart", Log: log,
-		Packages: launcher, ConfigDigest: "sha256:" + strings.Repeat("22", 32), MaxOutputMiB: 8,
-	}
-	if configure != nil {
-		configure(&options)
-	}
-	c, e := orchestrator.Open(options)
+		ConfigDigest: "sha256:" + strings.Repeat("22", 32), MaxOutputMiB: 8,
+	})
 	fatal(t, e)
 	go func() { _ = c.Serve() }()
 	o := &owner{root: root, cfg: cfg, l: l, store: st, c: c}
@@ -197,12 +162,6 @@ func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec
 		Placement: placement,
 	}
 }
-
-var fakeRelease = func() string {
-	digest := sha256.Sum256([]byte("fake-release"))
-	value, _ := canonical.Spell(digest[:])
-	return value
-}()
 
 func planIDOf(t *testing.T, spec orchestrator.WorkerLaunchSpec) string {
 	t.Helper()
@@ -368,14 +327,9 @@ func (s *daemonProcess) callBytes(t *testing.T, method, path string, body []byte
 // child's environment comes through the PRODUCT's own allowlist: the suite has no business
 // inventing a second child-env mechanism, and the env fence says there is one reader.
 func runCozy(t *testing.T, root string, args ...string) (int, string) {
-	return runCozyDir(t, root, "", nil, args...)
-}
-
-func runCozyDir(t *testing.T, root, dir string, imposed []string, args ...string) (int, string) {
 	t.Helper()
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
-	cmd.Env = childEnv(t, root, imposed...)
-	cmd.Dir = dir
+	cmd.Env = childEnv(t, root)
 	data, _ := cmd.CombinedOutput()
 	code := 0
 	if cmd.ProcessState != nil {
@@ -385,16 +339,9 @@ func runCozyDir(t *testing.T, root, dir string, imposed []string, args ...string
 }
 
 func runCozyStreams(t *testing.T, root string, args ...string) (int, string, string) {
-	return runCozyDirStreams(t, root, "", nil, args...)
-}
-
-func runCozyDirStreams(t *testing.T, root, dir string, imposed []string,
-	args ...string,
-) (int, string, string) {
 	t.Helper()
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
-	cmd.Env = childEnv(t, root, imposed...)
-	cmd.Dir = dir
+	cmd.Env = childEnv(t, root)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	_ = cmd.Run()

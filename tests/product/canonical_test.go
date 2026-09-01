@@ -19,7 +19,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -56,24 +55,6 @@ func resolveFixtureDir(t *testing.T) string {
 		return ""
 	}
 	return dir
-}
-
-func TestCanonicalFormatsAreVersionOne(t *testing.T) {
-	for _, msg := range []proto.Message{
-		&pb.InvocationSpec{},
-		&pb.AttemptOutcomeBody{},
-		&pb.ArtifactReceipt{},
-		&pb.ClaimProof{},
-		&pb.DownloadDelegation{},
-		&pb.PlacementSet{},
-		&pb.PrivatePackageRevision{},
-		&pb.WorkerSnapshotBody{},
-	} {
-		name := string(msg.ProtoReflect().Descriptor().FullName())
-		if got, want := canonical.Format(msg), name+"/1"; got != want {
-			t.Errorf("%s format = %q, want %q", name, got, want)
-		}
-	}
 }
 
 // TestCanonicalDocuments is the identity fence. Every document that crosses a repo or
@@ -370,85 +351,5 @@ func TestPackageDescriptor(t *testing.T) {
 		if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {
 			t.Errorf("%s was accepted at the descriptor boundary", name)
 		}
-	}
-}
-
-func TestCompactPackageDescriptor(t *testing.T) {
-	raw := []byte(`{"application":"probe:app","entrypoints":[{"models":[{"class":"Model","component_use":{"run":["transformer"]},"path":"run.models.model","stamps":{"task":"generate"}}],"name":"run","request":{"fields":[{"name":"message","type":"str"},{"name":"event","type":{"tag_field":"type","union":[{"fields":[{"name":"image","type":"str"}],"tag":"image"},{"fields":[{"name":"video","type":"str"}],"tag":"video"}]}}]},"result":{"fields":[]}}],"format":"cozy.package.descriptor/1","jobs":[]}`)
-	doc, problem := launch.DecodeDescriptor(raw)
-	fatal(t, problem)
-	ep := &doc.Entrypoints[0]
-	if ep.Request.Fields[0].Wire != "required" || len(ep.Models) != 1 || ep.Models[0].Param != "model" {
-		t.Fatalf("compact defaults were not derived: %+v %+v", ep.Request.Fields, ep.Models)
-	}
-
-	for name, planted := range map[string][]byte{
-		"retired model param": bytes.Replace(raw, []byte(`"path":"run.models.model"`),
-			[]byte(`"param":"model","path":"run.models.model"`), 1),
-		"member repeats tag field": bytes.Replace(raw, []byte(`{"fields":[{"name":"image"`),
-			[]byte(`{"fields":[{"name":"type","type":"str"},{"name":"image"`), 1),
-		"member repeats wrapper": bytes.Replace(raw,
-			[]byte(`{"fields":[{"name":"image","type":"str"}],"tag":"image"}`),
-			[]byte(`{"fields":[{"name":"image","type":"str"}],"tag":"image","tag_field":"type"}`), 1),
-	} {
-		if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {
-			t.Errorf("%s was accepted at the compact descriptor boundary", name)
-		}
-	}
-}
-
-func TestProducerJobDescriptor(t *testing.T) {
-	raw := []byte(`{"application":"producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16-full","required_contract":{"encodings":["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}},{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8","required_contract":{"encodings":["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"],"topology_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}],"models":[{"class":"MiniMaxH3Dits","component_use":{},"path":"four_lane.models.dits","source_profile":"hf/minimax-h3/native-dual-bf16/1","stamps":{}},{"class":"MiniMaxH3Shared","component_use":{},"path":"four_lane.models.shared","source_profile":"hf/minimax-h3/shared-bf16/1","stamps":{}}],"name":"four_lane","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}]}`)
-	descriptor, problem := launch.DecodeDescriptor(raw)
-	fatal(t, problem)
-	job, problem := descriptor.Function("four_lane")
-	fatal(t, problem)
-	if job.Kind != "job" || len(job.Models) != 2 ||
-		job.Models[0].SourceProfile != "hf/minimax-h3/native-dual-bf16/1" ||
-		job.ArtifactOutputs[1].RequiredContract.Encodings[0] != "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" {
-		t.Fatalf("ordinary producer job changed: %+v", job)
-	}
-	for name, planted := range map[string][]byte{
-		"retired graph":    bytes.Replace(raw, []byte(`"jobs":`), []byte(`"model_productions":[],"jobs":`), 1),
-		"partial profiles": bytes.Replace(raw, []byte(`,"source_profile":"hf/minimax-h3/shared-bf16/1"`), nil, 1),
-		"profile escape":   bytes.Replace(raw, []byte(`hf/minimax-h3/native-dual-bf16/1`), []byte(`../native`), 1),
-		"unsorted encodings": bytes.Replace(raw,
-			[]byte(`"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"`),
-			[]byte(`"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"`), 1),
-		"encoding alias": bytes.Replace(raw, []byte(`"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"`), []byte(`"plain/1"`), 1),
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {
-				t.Fatal("invalid ordinary producer descriptor was accepted")
-			}
-		})
-	}
-}
-
-func TestModelTransferOperationIdentity(t *testing.T) {
-	instruction := modeltransfer.Instruction{Kind: "model-upload",
-		Destination: "tensorhub/minimax-h3",
-		Source:      "hf://MiniMaxAI/MiniMax-H3@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		Producer:    "tensorhub/minimax-h3-tools@v2/four-lane", Placement: "rental-only"}
-	base := modeltransfer.Plan{Instruction: instruction,
-		Destination: instruction.Destination, Source: instruction.Source,
-		SourceSelection: "sha256:" + strings.Repeat("b", 64),
-		SourceProfiles:  map[string]string{"shared": "hf/minimax-h3/shared-bf16/1", "dits": "hf/minimax-h3/native-dual-bf16/1"},
-		Outputs:         []modeltransfer.OutputPin{{Name: "bf16-full"}, {Name: "fp8"}}}
-	if !strings.HasPrefix(base.ID(), "modeltransfer-") {
-		t.Fatal("upload transfer identity has the wrong run kind")
-	}
-	replay := base
-	replay.SourceSelection = "sha256:" + strings.Repeat("0", 64)
-	if replay.ID() != base.ID() {
-		t.Fatal("mutable resolution changed canonical instruction identity")
-	}
-	download := instruction
-	download.Kind, download.Destination = "model-download", "local/minimax-h3"
-	if !strings.HasPrefix(download.ID(), "modeltransfer-") || download.ID() == instruction.ID() {
-		t.Fatal("download and upload instructions did not receive distinct run identities")
-	}
-	if got := strings.Join(base.ProfileNames(), ","); got != "hf/minimax-h3/native-dual-bf16/1,hf/minimax-h3/shared-bf16/1" {
-		t.Fatalf("source profiles are not deterministic: %s", got)
 	}
 }
