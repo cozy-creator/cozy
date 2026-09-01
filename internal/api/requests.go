@@ -220,7 +220,8 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		PrivatePackageDigest: recorded.PrivatePackageDigest,
 		Rental:               sub.Rental || sub.RentalRequired,
 		RentalRequired:       sub.RentalRequired,
-		Models:               models, OutputExport: outputExportInput(sub),
+		Models:               models, NeedsAccelerator: recorded.NeedsAccelerator,
+		OutputExport: outputExportInput(sub),
 	}
 }
 
@@ -381,6 +382,7 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 		}
 		out.PlanID = logical.PlanID
 		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
+		out.NeedsAccelerator = logical.NeedsAccelerator
 		if len(out.Outputs) == 0 {
 			out.Outputs = logical.Outputs
 		}
@@ -439,6 +441,7 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 	if e := validateInputs(entrypoint, &out); e != nil {
 		return out, e
 	}
+	out.NeedsAccelerator = entrypoint.NeedsAccelerator()
 	if e := deriveOutputExport(entrypoint, &out); e != nil {
 		return out, e
 	}
@@ -519,6 +522,7 @@ func (s *Server) resolvePrivateServing(ctx context.Context, sub Submission,
 	if problem := validateInputs(entrypoint, &out); problem != nil {
 		return out, problem
 	}
+	out.NeedsAccelerator = entrypoint.NeedsAccelerator()
 	revision, problem := s.packages.PreparePrivate(ctx, installID)
 	if problem != nil {
 		return out, problem

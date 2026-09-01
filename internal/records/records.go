@@ -67,7 +67,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 10
+const schemaVersion = 11
 
 // schema is the only records shape this pre-launch build accepts.
 var schema = append([]string{`
@@ -141,7 +141,7 @@ func Open(path string) (*Store, *exit.Error) {
 			return nil, e
 		}
 	} else if version >= 6 && version < schemaVersion {
-		if e := migrateToTen(db, path, version); e != nil {
+		if e := migrateToEleven(db, path, version); e != nil {
 			db.Close()
 			return nil, e
 		}
@@ -161,11 +161,12 @@ func Open(path string) (*Store, *exit.Error) {
 	return &Store{db: db}, nil
 }
 
-// Schemas 6 through 9 migrate in place. Package, request, event, and rental rows survive;
+// Schemas 6 through 10 migrate in place. Schema 11 replaces authored GPU counts with
+// the one derived accelerator-class fact. Package, request, event, and rental rows survive;
 // only schema 9's superseded special model-production subsystem is dropped. Schema 10
-// creates empty request-attached transfer sidecars because those old rows cannot be
-// translated into ordinary request identity safely.
-func migrateToTen(db *sql.DB, path string, sourceVersion int) *exit.Error {
+// creates empty request-attached transfer sidecars because older rows cannot be translated
+// into ordinary request identity safely.
+func migrateToEleven(db *sql.DB, path string, sourceVersion int) *exit.Error {
 	if e := verifyPriorSchema(db, path, sourceVersion); e != nil {
 		return e
 	}
@@ -195,10 +196,8 @@ func migrateToTen(db *sql.DB, path string, sourceVersion int) *exit.Error {
 	if version != sourceVersion {
 		return schemaReset(path, "records database changed to user_version %d while migrating", version)
 	}
-	if sourceVersion == 6 {
-		if e := migrateRequestsSix(tx, path); e != nil {
-			return e
-		}
+	if e := migrateRequestsToEleven(tx, path, sourceVersion); e != nil {
+		return e
 	}
 	if sourceVersion < 8 {
 		if _, err := tx.Exec(`DROP INDEX rentals_machine_name`); err != nil {
@@ -221,19 +220,21 @@ func migrateToTen(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			return exit.Internalf("cannot restore rental index while migrating %s: %s", path, err)
 		}
 	}
-	for _, table := range []string{"model_production_objects", "model_production_artifacts",
-		"model_production_steps", "model_production_sources", "model_production_source_files",
-		"model_productions"} {
-		if _, err := tx.Exec(`DROP TABLE ` + table); err != nil {
-			return exit.Internalf("cannot retire schema-9 %s while migrating %s: %s", table, path, err)
+	if sourceVersion < 10 {
+		for _, table := range []string{"model_production_objects", "model_production_artifacts",
+			"model_production_steps", "model_production_sources", "model_production_source_files",
+			"model_productions"} {
+			if _, err := tx.Exec(`DROP TABLE ` + table); err != nil {
+				return exit.Internalf("cannot retire schema-9 %s while migrating %s: %s", table, path, err)
+			}
+		}
+		for _, statement := range modelTransferSchema {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot create model transfer sidecars while migrating %s: %s", path, err)
+			}
 		}
 	}
-	for _, statement := range modelTransferSchema {
-		if _, err := tx.Exec(statement); err != nil {
-			return exit.Internalf("cannot create model transfer sidecars while migrating %s: %s", path, err)
-		}
-	}
-	if _, err := tx.Exec(`PRAGMA user_version=10`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=11`); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
 	if e := commitMigration(tx, path); e != nil {
@@ -257,22 +258,31 @@ func migrateToTen(db *sql.DB, path string, sourceVersion int) *exit.Error {
 	return nil
 }
 
-func migrateRequestsSix(tx *sql.Tx, path string) *exit.Error {
-	if _, err := tx.Exec(`ALTER TABLE requests RENAME TO requests_schema6`); err != nil {
+func migrateRequestsToEleven(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
+	if _, err := tx.Exec(`ALTER TABLE requests RENAME TO requests_prior`); err != nil {
 		return exit.Internalf("cannot stage request rows while migrating %s: %s", path, err)
 	}
 	if _, err := tx.Exec(requestsDDL); err != nil {
 		return exit.Internalf("cannot create current requests table while migrating %s: %s", path, err)
 	}
-	columns := `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
+	destinationColumns := `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
 		package_revision_digest,private_package_digest,private_package_uploaded_boot_id,
 		environment_digest,config_digest,payload,outputs,state,ordinal,requeues,created_at,kind,
-		job_gpu_count,org,trees,worker,rental,install_id,assets,models,weights_outputs`
-	if _, err := tx.Exec(`INSERT INTO requests(` + columns + `) SELECT ` + columns +
-		` FROM requests_schema6`); err != nil {
+		needs_accelerator,org,trees,worker,rental,rental_required,install_id,assets,models,weights_outputs`
+	rentalRequired := "rental_required"
+	if sourceVersion == 6 {
+		rentalRequired = "0"
+	}
+	selectColumns := `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
+		package_revision_digest,private_package_digest,private_package_uploaded_boot_id,
+		environment_digest,config_digest,payload,outputs,state,ordinal,requeues,created_at,kind,
+		CASE WHEN job_gpu_count>0 OR (kind!='job' AND models!='[]') THEN 1 ELSE 0 END,
+		org,trees,worker,rental,` + rentalRequired + `,install_id,assets,models,weights_outputs`
+	if _, err := tx.Exec(`INSERT INTO requests(` + destinationColumns + `) SELECT ` + selectColumns +
+		` FROM requests_prior`); err != nil {
 		return exit.Internalf("cannot preserve request rows while migrating %s: %s", path, err)
 	}
-	if _, err := tx.Exec(`DROP TABLE requests_schema6`); err != nil {
+	if _, err := tx.Exec(`DROP TABLE requests_prior`); err != nil {
 		return exit.Internalf("cannot finish request migration in %s: %s", path, err)
 	}
 	return nil
@@ -303,17 +313,24 @@ func priorSchema(version int) ([]string, error) {
 	}
 	defer db.Close()
 	priorRequests := strings.Replace(requestsDDL,
+		"  needs_accelerator INTEGER NOT NULL DEFAULT 0,\n",
+		"  job_gpu_count INTEGER NOT NULL DEFAULT 0,\n", 1)
+	priorRequestsSix := strings.Replace(priorRequests,
 		"  rental_required INTEGER NOT NULL DEFAULT 0,\n", "", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
-		if !containsStatement(modelTransferSchema, statement) {
+		if version >= 10 || !containsStatement(modelTransferSchema, statement) {
 			statements = append(statements, statement)
 		}
 	}
-	statements = append(statements, schemaNineModelProduction...)
+	if version < 10 {
+		statements = append(statements, schemaNineModelProduction...)
+	}
 	for _, stmt := range statements {
 		switch {
 		case stmt == requestsDDL && version == 6:
+			stmt = priorRequestsSix
+		case stmt == requestsDDL:
 			stmt = priorRequests
 		case stmt == rentalsDDL && version < 8:
 			stmt = rentalsDDLPrior
@@ -394,7 +411,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=10`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=11`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {

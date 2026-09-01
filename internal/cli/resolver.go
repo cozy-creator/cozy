@@ -442,7 +442,7 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function st
 	return orchestrator.LogicalPackage{
 		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
 		Function: function, Outputs: launch.AssetPaths(entrypoint.Result), PlanID: planID,
-		Models: models,
+		Models: models, NeedsAccelerator: entrypoint.NeedsAccelerator(),
 	}, entrypoint, nil
 }
 
@@ -541,8 +541,7 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 	return orchestrator.LogicalJob{
 		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
 		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
-		WeightsOutputs: weights, GPUCount: job.RequiredGPUCount(),
-		Requires: job.Resources.Requires, Models: models,
+		WeightsOutputs: weights, NeedsAccelerator: job.NeedsAccelerator(), Models: models,
 		SourceProfiles: profiles,
 	}, job, nil
 }

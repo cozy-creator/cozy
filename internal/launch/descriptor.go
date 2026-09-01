@@ -65,8 +65,7 @@ type Entrypoint struct {
 	Publishes    bool   `json:"publishes"`
 	// WeightsOutputs is the job's explicit WeightsSink slot set. It is separate from
 	// result asset fields because worker-protocol rev5 OutputBinding has no kind.
-	WeightsOutputs []WeightsOutput      `json:"weights_outputs"`
-	Resources      ResourceRequirements `json:"resources"`
+	WeightsOutputs []WeightsOutput `json:"weights_outputs"`
 }
 
 type WeightsOutput struct {
@@ -76,22 +75,9 @@ type WeightsOutput struct {
 	RequiredContract *WeightsModelContract `json:"required_contract,omitempty"`
 }
 
-type ResourceRequirements struct {
-	GPUCount  int64  `json:"gpu_count"`
-	Placement string `json:"placement"`
-	Requires  string `json:"requires"`
-}
-
-// RequiredGPUCount is the callable's one machine-class fact. A typed Model parameter
-// requires a GPU unless the author made a stronger explicit declaration; weightless
-// callables remain CPU-class. Multi-GPU declarations stay visible for the current
-// producer admission refusal rather than being silently clamped to one.
-func (ep *Entrypoint) RequiredGPUCount() int64 {
-	if ep.Resources.GPUCount == 0 && len(ep.Models) > 0 {
-		return 1
-	}
-	return ep.Resources.GPUCount
-}
+// NeedsAccelerator is the callable's only derived machine-class fact. Typed Model
+// parameters route to one accelerator; weightless callables route to CPU capacity.
+func (ep *Entrypoint) NeedsAccelerator() bool { return len(ep.Models) > 0 }
 
 type WeightsModelContract struct {
 	TopologyDigest string   `json:"topology_digest"`
@@ -214,7 +200,7 @@ func validateClosedDescriptor(data []byte) error {
 			optional := []string{"models"}
 			if kind == "job" {
 				required = append(required, "publishes")
-				optional = append(optional, "resources", "weights_outputs")
+				optional = append(optional, "weights_outputs")
 			}
 			callable, err := exactKeys(row, required, optional)
 			if err != nil {
@@ -236,11 +222,6 @@ func validateClosedDescriptor(data []byte) error {
 						[]string{"source_profile"}); err != nil {
 						return err
 					}
-				}
-			}
-			if resources := callable["resources"]; resources != nil {
-				if err := validateResourceKeys(resources); err != nil {
-					return err
 				}
 			}
 			if outputs := callable["weights_outputs"]; outputs != nil {
@@ -266,36 +247,6 @@ func validateClosedDescriptor(data []byte) error {
 					}
 				}
 			}
-		}
-	}
-	return nil
-}
-
-func validateResourceKeys(raw json.RawMessage) error {
-	object, err := exactKeys(raw, nil, []string{"gpu_count", "placement", "requires"})
-	if err != nil {
-		return err
-	}
-	if len(object) == 0 {
-		return fmt.Errorf("resources must not be empty")
-	}
-	if value := object["gpu_count"]; value != nil {
-		var count int64
-		if json.Unmarshal(value, &count) != nil || count < 1 {
-			return fmt.Errorf("resources.gpu_count must be a positive integer")
-		}
-	}
-	if value := object["placement"]; value != nil {
-		var placement string
-		if json.Unmarshal(value, &placement) != nil ||
-			(placement != "single_node" && placement != "any") {
-			return fmt.Errorf("resources.placement must be single_node or any")
-		}
-	}
-	if value := object["requires"]; value != nil {
-		var requires string
-		if json.Unmarshal(value, &requires) != nil || strings.TrimSpace(requires) == "" {
-			return fmt.Errorf("resources.requires must be a non-empty string")
 		}
 	}
 	return nil
@@ -461,11 +412,6 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 	}
 	if ep.Kind != "job" && len(ep.WeightsOutputs) > 0 {
 		return exit.New(exit.Validation, "%s declares weights outputs outside the job surface", ep.Name)
-	}
-	if ep.Resources.GPUCount < 0 ||
-		(ep.Resources.Placement != "" && ep.Resources.Placement != "single_node" &&
-			ep.Resources.Placement != "any") {
-		return exit.New(exit.Validation, "%s has invalid resource requirements", ep.Name)
 	}
 	seenWeights := map[string]bool{}
 	for _, output := range ep.WeightsOutputs {

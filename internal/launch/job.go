@@ -21,10 +21,7 @@ import (
 // component set and no construction digest on a job record — a job has no model
 // residency at all (cr-009 §2).
 
-// JobResourceCap is the orchestrator's declared bound for one local job attempt. Jobs are
-// CPU-class here: the census-shaped work this host runs reads canonical headers and
-// derives projections, and a job that needs a card declares `gpu_count` on its own
-// surface, which the record below carries as a FLOOR.
+// JobResourceCap is the orchestrator's declared host-memory bound for one local job attempt.
 const jobRSSBudget = orchestrator.DefaultJobRSSCap
 
 // JobFacts is one resolved `@job` on an installed generation.
@@ -45,9 +42,8 @@ type JobFacts struct {
 	SourceProfiles map[string]string
 	// Publishes is the job's own `publishes=` declaration. A grant mints off the
 	// DECLARATION, never off the kind (cr-009).
-	Publishes bool
-	GPUCount  int64
-	Requires  string
+	Publishes        bool
+	NeedsAccelerator bool
 }
 
 // JobSpec builds the WorkerLaunchSpec that makes ONE job function's worker resident. It
@@ -74,6 +70,10 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}
+	deviceCount := int64(0)
+	if facts.NeedsAccelerator {
+		deviceCount = 1
+	}
 	runtimeBin, e := HostRuntime()
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
@@ -99,14 +99,14 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 			"python":                      environmentPython,
 			"environment_content_digest":  PackageRevisionDigest(f.Install),
 			"job":                         facts.Name,
-			"gpu_count":                   facts.GPUCount,
+			"gpu_count":                   deviceCount,
 			"publishes":                   facts.Publishes,
 			"emits_media":                 false,
 			"gpu_rate_micro_usd_per_hour": int64(0),
 			"cap_micro_usd":               int64(0),
 			"reclaim_on_terminal":         true,
 		},
-		RSSCap: jobRSSBudget, GPUCount: facts.GPUCount,
+		RSSCap: jobRSSBudget, NeedsAccelerator: facts.NeedsAccelerator,
 	}}
 	spec := orchestrator.WorkerLaunchSpec{
 		Placement: placement,
@@ -177,8 +177,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	facts := &JobFacts{
 		Name: function, Request: declared.Request, DescriptorID: said.DescriptorID, Outputs: outputs,
 		WeightsOutputs: weightsOutputs,
-		Publishes:      declared.Publishes, GPUCount: declared.RequiredGPUCount(),
-		Requires: declared.Resources.Requires,
+		Publishes:      declared.Publishes, NeedsAccelerator: declared.NeedsAccelerator(),
 	}
 	if len(declared.Models) > 0 {
 		facts.SourceProfiles = make(map[string]string, len(declared.Models))
