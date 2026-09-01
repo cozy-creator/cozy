@@ -213,10 +213,24 @@ func modelReleasePath(ref Ref, release string) string {
 }
 
 func (c *Client) ModelRelease(ctx context.Context, ref Ref, release string) (ModelRelease, *exit.Error) {
-	var out ModelRelease
-	e := c.do(ctx, call{method: http.MethodGet, path: modelReleasePath(ref, release),
-		auth: true, strict: true}, &out)
-	return out, e
+	card, problem := c.ModelCard(ctx, ref)
+	if problem != nil {
+		return ModelRelease{}, problem
+	}
+	for _, summary := range card.Releases {
+		if summary.Release != release {
+			continue
+		}
+		lanes := make([]ModelReleaseLane, 0, len(summary.Lanes))
+		for _, lane := range summary.Lanes {
+			lanes = append(lanes, ModelReleaseLane{Lane: lane.Lane,
+				CheckpointID: lane.ManifestID})
+		}
+		return ModelRelease{Release: summary.Release, Revision: summary.Revision,
+			Lanes: lanes}, nil
+	}
+	return ModelRelease{}, exit.New(exit.NotFound, "model release %s@%s is absent",
+		ref.String(), release)
 }
 
 func (c *Client) UpdateModelRelease(ctx context.Context, ref Ref, release string,

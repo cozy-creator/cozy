@@ -194,10 +194,10 @@ func TestModelReleaseUpdateAndYankCLIContracts(t *testing.T) {
 			}
 			_, _ = io.WriteString(w, `{"name":"acme"}`)
 		case 2:
-			if r.Method != http.MethodGet || r.URL.Path != "/v1/models/acme/model/releases/stable" {
+			if r.Method != http.MethodGet || r.URL.Path != "/v1/models/acme/model" {
 				t.Fatalf("release read = %s %s", r.Method, r.URL.Path)
 			}
-			_, _ = io.WriteString(w, `{"release":"stable","revision":4,"yanked":false,"lanes":[{"lane":"broken","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["bf16"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("c", 64)+`","changed":false}`)
+			_, _ = io.WriteString(w, `{"model":{"org":"acme","name":"model","created_at":"2026-09-01T00:00:00Z"},"releases":[{"release":"stable","revision":4,"cut_at":"2026-09-01T00:00:00Z","lanes":[{"lane":"broken","manifest_id":"`+checkpoint+`"}]}]}`)
 		case 3:
 			if r.Method != http.MethodPost || r.URL.Path != "/v1/models/acme/model/releases/stable" ||
 				r.Header.Get("X-Tensorhub-Reason") != "cozy model publish acme/model@stable" {
@@ -246,8 +246,8 @@ func TestModelPublishRefusesFinalLaneRemovalBeforeMutation(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current":
 			_, _ = io.WriteString(w, `{"name":"acme"}`)
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/acme/model/releases/stable":
-			_, _ = io.WriteString(w, `{"release":"stable","revision":4,"yanked":false,"lanes":[{"lane":"bf16","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["bf16"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("c", 64)+`","changed":false}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/acme/model":
+			_, _ = io.WriteString(w, `{"model":{"org":"acme","name":"model","created_at":"2026-09-01T00:00:00Z"},"releases":[{"release":"stable","revision":4,"cut_at":"2026-09-01T00:00:00Z","lanes":[{"lane":"bf16","manifest_id":"`+checkpoint+`"}]}]}`)
 		default:
 			mutations++
 			http.Error(w, "unexpected mutation", http.StatusInternalServerError)
@@ -273,7 +273,10 @@ func TestModelPublishExactReplayUsesCurrentRevision(t *testing.T) {
 		case 1:
 			_, _ = io.WriteString(w, `{"name":"acme"}`)
 		case 2:
-			_, _ = io.WriteString(w, `{"release":"stable","revision":5,"yanked":false,"lanes":[{"lane":"fp8","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["fp8"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("c", 64)+`","changed":false}`)
+			if r.Method != http.MethodGet || r.URL.Path != "/v1/models/acme/model" {
+				t.Fatalf("release card = %s %s", r.Method, r.URL.Path)
+			}
+			_, _ = io.WriteString(w, `{"model":{"org":"acme","name":"model","created_at":"2026-09-01T00:00:00Z"},"releases":[{"release":"stable","revision":5,"cut_at":"2026-09-01T00:00:00Z","lanes":[{"lane":"fp8","manifest_id":"`+checkpoint+`"}]}]}`)
 		case 3:
 			var body struct {
 				ExpectedRevision int64 `json:"expected_revision"`
