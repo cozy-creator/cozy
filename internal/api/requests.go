@@ -434,14 +434,14 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 	if len(out.Outputs) == 0 {
 		out.Outputs = outputs
 	}
-	entrypoint, e := s.packages.Entrypoint(placement.InstallID, sub.Function)
+	entrypoint, needsAccelerator, e := s.packages.Entrypoint(placement.InstallID, sub.Function)
 	if e != nil {
 		return out, e
 	}
 	if e := validateInputs(entrypoint, &out); e != nil {
 		return out, e
 	}
-	out.NeedsAccelerator = entrypoint.NeedsAccelerator()
+	out.NeedsAccelerator = needsAccelerator
 	if e := deriveOutputExport(entrypoint, &out); e != nil {
 		return out, e
 	}
@@ -515,14 +515,14 @@ func (s *Server) resolvePrivateServing(ctx context.Context, sub Submission,
 	if problem != nil {
 		return out, problem
 	}
-	entrypoint, problem := s.packages.Entrypoint(installID, sub.Function)
+	entrypoint, needsAccelerator, problem := s.packages.Entrypoint(installID, sub.Function)
 	if problem != nil {
 		return out, problem
 	}
 	if problem := validateInputs(entrypoint, &out); problem != nil {
 		return out, problem
 	}
-	out.NeedsAccelerator = entrypoint.NeedsAccelerator()
+	out.NeedsAccelerator = needsAccelerator
 	revision, problem := s.packages.PreparePrivate(ctx, installID)
 	if problem != nil {
 		return out, problem

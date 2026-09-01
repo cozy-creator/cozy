@@ -69,7 +69,7 @@ type Submission struct {
 	Org string
 	// Trees are the job's typed input TREES as `ref=dir`, one grant input each.
 	Trees []string
-	// NeedsAccelerator is derived from the selected callable's typed Model parameters.
+	// NeedsAccelerator is derived from the selected package's immutable dependency facts.
 	// It is the only machine-class decision retained on a request.
 	NeedsAccelerator bool
 

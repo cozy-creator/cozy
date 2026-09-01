@@ -319,23 +319,28 @@ func TestPackageDescriptor(t *testing.T) {
 		}
 	}
 
-	// The typed Model parameter is the sole machine-class fact. There is no author-supplied
-	// GPU count, hardware floor, or second resource envelope.
+	// Model inputs are not hardware facts: this job could transform their TensorFS bytes on
+	// CPU. The immutable release dependency set selects the machine class instead.
 	gpuRaw := []byte(`{"application":"h3:tools","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"H3Dits","component_use":{},"path":"four_lane.models.dits","source_profile":"hf/minimax-h3/native-dual-bf16/1","stamps":{}}],"name":"four_lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	gpuDescriptor, problem := launch.DecodeDescriptor(gpuRaw)
 	fatal(t, problem)
-	job, problem := gpuDescriptor.Function("four_lane")
+	_, problem = gpuDescriptor.Function("four_lane")
 	fatal(t, problem)
-	if !job.NeedsAccelerator() {
-		t.Fatal("typed Model parameter did not select accelerator capacity")
+	if launch.AcceleratorRequired([]string{
+		"cozy-jobs==0.0.14", "cozy-runtime<1.0.0,>=0.0.34",
+	}) {
+		t.Fatal("the SDXL TensorFS/NumPy release selected accelerator capacity")
 	}
 	cpuRaw := []byte(`{"application":"probe:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"name":"scan","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	cpuDescriptor, problem := launch.DecodeDescriptor(cpuRaw)
 	fatal(t, problem)
-	cpuJob, problem := cpuDescriptor.Function("scan")
+	_, problem = cpuDescriptor.Function("scan")
 	fatal(t, problem)
-	if cpuJob.NeedsAccelerator() {
-		t.Fatal("weightless callable selected accelerator capacity")
+	if !launch.AcceleratorRequired([]string{
+		"cozy-jobs==0.0.13", "cozy-runtime<1.0.0,>=0.0.33", "msgspec>=0.19",
+		"numpy>=1.26", "torch<3,>=2.13",
+	}) {
+		t.Fatal("the H3 release's exact torch requirement did not select accelerator capacity")
 	}
 	authoredResources := bytes.Replace(cpuRaw, []byte(`"publishes":false`),
 		[]byte(`"publishes":false,"resources":{"gpu_count":1,"requires":"sm90+"}`), 1)

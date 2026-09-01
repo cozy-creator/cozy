@@ -112,24 +112,11 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		return row.ID, line, lineProblem
 	}
 
-	compatible := skus[:0]
-	for _, sku := range skus {
-		if (sku.AcceleratorModel == "CPU") == needsCPU {
-			compatible = append(compatible, sku)
-		}
-	}
-	skus = compatible
-	if len(skus) == 0 {
+	sku, found := rental.CheapestCompatibleSKU(skus, req.NeedsAccelerator)
+	if !found {
 		return "", "", exit.Named(exit.Capacity, "rental.no_skus",
 			"Tensorhub currently offers no compatible rental SKU")
 	}
-	sort.Slice(skus, func(i, j int) bool {
-		if skus[i].PriceUSDMicrosPerHour != skus[j].PriceUSDMicrosPerHour {
-			return skus[i].PriceUSDMicrosPerHour < skus[j].PriceUSDMicrosPerHour
-		}
-		return skus[i].Name < skus[j].Name
-	})
-	sku := skus[0]
 	if problem := m.admitLocked(sku); problem != nil {
 		return "", "", problem
 	}

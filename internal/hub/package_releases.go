@@ -4,6 +4,8 @@ package hub
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -54,6 +56,35 @@ type PackageReleaseDetail struct {
 	} `json:"release"`
 	Document          json.RawMessage `json:"document"`
 	PackageDescriptor json.RawMessage `json:"package_descriptor"`
+}
+
+// Requirements returns the immutable execution dependencies from the exact
+// PackageRelease/1 bytes. Creator needs only this one release fact to choose a
+// CPU or accelerator product; it does not reinterpret the package descriptor's
+// model inputs as hardware requirements.
+func (d PackageReleaseDetail) Requirements() ([]string, *exit.Error) {
+	sum := sha256.Sum256(d.Document)
+	want := "sha256:" + hex.EncodeToString(sum[:])
+	if d.Release.ReleaseDigest != want {
+		return nil, exit.Named(exit.Conflict, "hub.package_release_digest_mismatch",
+			"Tensorhub package release bytes do not match release digest %s", d.Release.ReleaseDigest)
+	}
+	var document struct {
+		Format       string   `json:"format"`
+		Requirements []string `json:"requirements"`
+	}
+	if err := json.Unmarshal(d.Document, &document); err != nil ||
+		document.Format != "cozy.package.release/1" || document.Requirements == nil {
+		return nil, exit.Named(exit.Structural, "hub.package_release_invalid",
+			"Tensorhub returned an invalid PackageRelease/1 document")
+	}
+	for i, requirement := range document.Requirements {
+		if requirement == "" || i > 0 && requirement <= document.Requirements[i-1] {
+			return nil, exit.Named(exit.Structural, "hub.package_release_invalid",
+				"Tensorhub returned unsorted or empty package requirements")
+		}
+	}
+	return append([]string(nil), document.Requirements...), nil
 }
 
 type PackageInstallDownload struct {

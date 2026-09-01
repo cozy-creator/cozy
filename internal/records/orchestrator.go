@@ -440,8 +440,8 @@ type Request struct {
 	// re-derive the same class without a client saying so again (cr-009: a job is an
 	// attempt class on the one machinery, not a second runtime).
 	Kind string
-	// NeedsAccelerator is derived once from the selected callable's typed Model
-	// parameters. It is not an author-supplied resource request.
+	// NeedsAccelerator is derived once from the selected package's immutable
+	// dependency facts. It is not an author-supplied resource request.
 	NeedsAccelerator bool
 	// Org is the publishing org a job's scratch repo is named under. Empty for serving.
 	Org string
