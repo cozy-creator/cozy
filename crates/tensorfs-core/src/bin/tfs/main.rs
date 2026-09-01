@@ -246,9 +246,17 @@ fn main() -> ExitCode {
         ["compat", "check", c, h] => layout::cmd_check(Path::new(c), Path::new(h), &flags),
         ["compat", "release-cut", r] => layout::cmd_release_cut(Path::new(r)),
         ["grade", "decision", d] => layout::cmd_decision(Path::new(d)),
+        // The BATCH surface (tfs-039). Grading is microseconds; the wall was the process
+        // around it. `batch` reads a file of canonical reports, `serve` reads them from
+        // stdin and flushes per line, and both emit exactly the bytes `grade --json` emits
+        // for the same document — so the single-pair form below is untouched.
+        ["grade", "batch", p] => layout::cmd_grade_stream(Some(Path::new(p)), &flags),
+        ["grade", "serve"] => layout::cmd_grade_stream(None, &flags),
         ["grade", r] => layout::cmd_grade(Path::new(r), &flags),
         ["grade", "register", n, k, s] => layout::cmd_register(n, k, s, &flags),
         ["verify-request", c, h] => layout::cmd_request(Path::new(c), Path::new(h), &flags),
+        ["verify-compat", "serve"] => layout::cmd_verify_stream(None),
+        ["verify-compat", "batch", p] => layout::cmd_verify_stream(Some(Path::new(p))),
         ["verify-compat", q, o] => layout::cmd_verify(Path::new(q), Path::new(o), &flags),
         ["verify-consume", q, o] => layout::cmd_consume(Path::new(q), Path::new(o)),
         ["registry"] => cmd_registry(),

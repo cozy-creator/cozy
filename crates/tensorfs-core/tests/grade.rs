@@ -759,3 +759,265 @@ fn the_json_surface_is_total_and_carries_the_remedy() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ------------------------------------------------------- tfs-039: the batch grading surface
+
+/// Every frozen `compat_report` vector, once per line, as a JSONL batch document.
+fn frozen_reports() -> Vec<Vec<u8>> {
+    let dir = vectors().join("cases/layout");
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("the layout vectors")
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+        .collect();
+    paths.sort();
+    let reports: Vec<Vec<u8>> = paths
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .filter(|b| CompatibilityReport::parse(b).is_ok())
+        .collect();
+    assert!(
+        reports.len() >= 4,
+        "the corpus carries {} frozen reports",
+        reports.len()
+    );
+    reports
+}
+
+fn tfs_status(args: &[&str], stdin: Option<&[u8]>) -> (bool, String, String) {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tfs");
+    {
+        let mut pipe = child.stdin.take().expect("stdin");
+        if let Some(bytes) = stdin {
+            pipe.write_all(bytes).expect("write stdin");
+        }
+    }
+    let out = child.wait_with_output().expect("wait");
+    (
+        out.status.success(),
+        String::from_utf8(out.stdout).expect("utf8"),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// The batch line is the SAME bytes the single-pair `--json` prints. Not "the same fields"
+/// — the same `grade_json`, so there is one machine surface with two ways in and a
+/// preflight caller is never made to batch to keep getting the answer it already decodes.
+#[test]
+fn a_batch_line_is_byte_identical_to_the_single_pair_json() {
+    let dir = std::env::temp_dir().join(format!("tfs-batch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let reports = frozen_reports();
+
+    let mut jsonl = Vec::new();
+    let mut singles = Vec::new();
+    for (i, bytes) in reports.iter().enumerate() {
+        let p = dir.join(format!("{i}.json"));
+        std::fs::write(&p, bytes).unwrap();
+        singles.push(tfs(&[
+            "grade",
+            p.to_str().unwrap(),
+            "--json",
+            "--registry",
+            "",
+        ]));
+        jsonl.extend_from_slice(bytes);
+        jsonl.push(b'\n');
+    }
+    let batch_path = dir.join("batch.jsonl");
+    std::fs::write(&batch_path, &jsonl).unwrap();
+
+    let batched = tfs(&[
+        "grade",
+        "batch",
+        batch_path.to_str().unwrap(),
+        "--registry",
+        "",
+    ]);
+    let lines: Vec<&str> = batched.lines().collect();
+    assert_eq!(
+        lines.len(),
+        reports.len(),
+        "one answer per document, in order"
+    );
+    for (line, single) in lines.iter().zip(singles.iter()) {
+        assert_eq!(
+            *line,
+            single.trim_end(),
+            "the batch line is the --json line"
+        );
+    }
+
+    // `serve` reads the same framing from stdin and answers identically.
+    let (ok, served, _) = tfs_status(&["grade", "serve", "--registry", ""], Some(&jsonl));
+    assert!(ok);
+    assert_eq!(served, batched);
+
+    // Blank lines are framing, not documents.
+    let mut padded = Vec::new();
+    for bytes in &reports {
+        padded.push(b'\n');
+        padded.extend_from_slice(bytes);
+        padded.push(b'\n');
+    }
+    let (ok, spaced, _) = tfs_status(&["grade", "serve", "--registry", ""], Some(&padded));
+    assert!(ok);
+    assert_eq!(spaced, batched);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A partial answer is not an answer. A line that does not decode stops the batch, names
+/// the line, and exits failure — it never becomes an output line in the grade shape, which
+/// would be a fifth grade with a different spelling.
+#[test]
+fn a_batch_refuses_at_the_line_it_cannot_grade() {
+    let reports = frozen_reports();
+    let mut jsonl = Vec::new();
+    for bytes in reports.iter().take(2) {
+        jsonl.extend_from_slice(bytes);
+        jsonl.push(b'\n');
+    }
+    jsonl.extend_from_slice(br#"{"contract":"nonsense"}"#);
+    jsonl.push(b'\n');
+    jsonl.extend_from_slice(&reports[0]);
+    jsonl.push(b'\n');
+
+    let (ok, out, err) = tfs_status(&["grade", "serve", "--registry", ""], Some(&jsonl));
+    assert!(!ok, "a batch with an undecodable line fails");
+    assert_eq!(out.lines().count(), 2, "the verdicts before it still stand");
+    assert!(err.contains("line 3"), "the refusal names the line: {err}");
+    assert!(err.starts_with("REFUSED "), "{err}");
+    for line in out.lines() {
+        assert!(line.contains("\"grade\":\""), "{line}");
+    }
+}
+
+/// The ranking law survives the batch: a report taken at `first-mismatch` carrying a full
+/// set is `PARTIAL_MISMATCH_SET`, and it refuses in a stream exactly as it does alone.
+#[test]
+fn the_depth_law_holds_inside_a_batch() {
+    let red = std::fs::read(vectors().join("cases/layout-red/worst-graded-partial.json"))
+        .expect("the frozen red arm");
+    let mut jsonl = frozen_reports()[0].clone();
+    jsonl.push(b'\n');
+    jsonl.extend_from_slice(&red);
+    jsonl.push(b'\n');
+
+    let (ok, out, err) = tfs_status(&["grade", "serve", "--registry", ""], Some(&jsonl));
+    assert!(!ok);
+    assert_eq!(out.lines().count(), 1);
+    assert!(
+        err.contains("PARTIAL_MISMATCH_SET"),
+        "a stopped walk relabelled full is refused in a batch too: {err}"
+    );
+}
+
+/// `--prove-with` holds ONE pair's two documents. A batch carries many, so it is refused
+/// rather than silently applied to the first or to none.
+#[test]
+fn prove_with_is_refused_on_a_batch() {
+    let reports = frozen_reports();
+    let mut jsonl = reports[0].clone();
+    jsonl.push(b'\n');
+    let (ok, out, err) = tfs_status(
+        &[
+            "grade",
+            "serve",
+            "--registry",
+            "",
+            "--code",
+            "/nonexistent",
+            "--header",
+            "/nonexistent",
+        ],
+        Some(&jsonl),
+    );
+    assert!(!ok);
+    assert!(out.is_empty());
+    assert!(err.contains("single-pair only"), "{err}");
+}
+
+/// The verifier as a stream: `verifier::run` unchanged, one request per line, and every
+/// response still names the sha256 of ITS OWN request — so a batch cannot cross answers.
+#[test]
+fn the_verifier_stream_answers_each_request_by_its_own_digest() {
+    let dir = std::env::temp_dir().join(format!("tfs-vstream-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let closure_dir = vectors().join("closure");
+    let closure: Vec<String> = {
+        let mut v: Vec<String> = std::fs::read_dir(&closure_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path().display().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+
+    // Two DIFFERENT pairs over one header: the identity contract and the dtype recast.
+    let mut requests = Vec::new();
+    for code in ["code-topology", "code-topology-recast"] {
+        let out = dir.join(format!("{code}.req"));
+        tfs(&[
+            "verify-request",
+            vectors()
+                .join(format!("cases/layout/{code}.json"))
+                .to_str()
+                .unwrap(),
+            vectors()
+                .join("cases/header/plain-fp8.cbor")
+                .to_str()
+                .unwrap(),
+            "--closure",
+            &closure.join(","),
+            "--out",
+            out.to_str().unwrap(),
+        ]);
+        requests.push(std::fs::read(&out).unwrap());
+    }
+
+    let mut jsonl = Vec::new();
+    for r in &requests {
+        jsonl.extend_from_slice(r);
+        jsonl.push(b'\n');
+    }
+    let (ok, out, _) = tfs_status(&["verify-compat", "serve"], Some(&jsonl));
+    assert!(ok);
+    let responses: Vec<&str> = out.lines().collect();
+    assert_eq!(responses.len(), 2);
+
+    // Each response consumes against ITS request and refuses against the other one's.
+    for (i, resp) in responses.iter().enumerate() {
+        let (report, decision) = tensorfs_core::verifier::consume(&requests[i], resp.as_bytes())
+            .expect("the response answers its own request");
+        assert_eq!(decision.report, report.object_id());
+        let other = 1 - i;
+        let crossed = tensorfs_core::verifier::consume(&requests[other], resp.as_bytes())
+            .expect_err("a response is about ONE pair");
+        assert_eq!(crossed.code, Code::VERIFIER_OUTPUT_INCOMPLETE);
+    }
+
+    // And they are the two answers the shape bucket predicts: an exact hit, and an
+    // exact miss that is a shape hit.
+    let (hit, hit_decision) =
+        tensorfs_core::verifier::consume(&requests[0], responses[0].as_bytes()).unwrap();
+    assert_eq!(hit.topology_required, hit.topology_present);
+    assert_eq!(hit_decision.grade.name(), "COMPATIBLE");
+    let (candidate, candidate_decision) =
+        tensorfs_core::verifier::consume(&requests[1], responses[1].as_bytes()).unwrap();
+    assert_ne!(candidate.topology_required, candidate.topology_present);
+    assert_eq!(
+        candidate.topology_shape_required,
+        candidate.topology_shape_present
+    );
+    assert_eq!(candidate_decision.grade.name(), "PRODUCIBLE");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

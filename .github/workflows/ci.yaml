@@ -36,6 +36,31 @@ jobs:
       # whole set. A ranking path that regressed to reading the first fact would still emit
       # byte-identical documents and only these verdicts would notice.
       - run: ./target/release/tfs vectors verify
+      # The BATCH grading surface (tfs-039). Grading is microseconds; `tfs grade <file>` is
+      # one report per process, so the wall was the ~2.5 ms of spawn around it — irrelevant
+      # for a preflight check and the entire cost of a catalog search. Every frozen report
+      # goes through in ONE process here, and the first line is required to be BYTE
+      # IDENTICAL to what the single-pair `--json` prints for the same document: one machine
+      # surface with two ways in, not two surfaces that happen to agree today.
+      - run: |
+          : > "${RUNNER_TEMP}/reports.jsonl"
+          for r in $(ls vectors/cases/layout/report-*.json | sort); do
+            cat "$r" >> "${RUNNER_TEMP}/reports.jsonl"
+            echo >> "${RUNNER_TEMP}/reports.jsonl"
+          done
+          ./target/release/tfs grade batch "${RUNNER_TEMP}/reports.jsonl" \
+            > "${RUNNER_TEMP}/graded.jsonl"
+          first=$(ls vectors/cases/layout/report-*.json | sort | head -1)
+          ./target/release/tfs grade "$first" --json > "${RUNNER_TEMP}/single.json"
+          head -1 "${RUNNER_TEMP}/graded.jsonl" > "${RUNNER_TEMP}/batched.json"
+          diff "${RUNNER_TEMP}/single.json" "${RUNNER_TEMP}/batched.json"
+          # A partial answer is not an answer: an undecodable line stops the batch and
+          # names it, rather than emitting a fifth verdict in the grade's shape.
+          printf '{"contract":"nonsense"}\n' > "${RUNNER_TEMP}/bad.jsonl"
+          if ./target/release/tfs grade batch "${RUNNER_TEMP}/bad.jsonl"; then
+            echo "a batch graded an undecodable document" >&2
+            exit 1
+          fi
       # The registration ACT, in the shipped binary. This RUNS bf16 -> f32 -> bf16 over
       # the COMPLETE 16-bit domain — all 65,536 representable inputs — and the
       # registration exists only because that came back byte-identical. A proof, not a
