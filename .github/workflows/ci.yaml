@@ -27,15 +27,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv run --no-project --python 3.12 python scripts/version_contract.py source
-      - name: Refuse other CPython lines
-        run: |
-          for version in 3.11 3.13; do
-            if uv run --no-project --python "$version" python scripts/version_contract.py source >"python-${version}.log" 2>&1; then
-              cat "python-${version}.log"
-              exit 1
-            fi
-            grep -F "TensorFS tooling requires CPython 3.12" "python-${version}.log"
-          done
       # --strict over the py.typed surface AND the drivers that consume it. No per-module
       # suppressions: a facade that needs one is a facade whose types are wrong.
       - run: >-

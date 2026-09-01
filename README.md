@@ -37,9 +37,8 @@ rows—not additional stored document formats.
 
 ## Build and test
 
-The Python package supports normal GIL-enabled CPython 3.12 only. Its native wheel is
-`cp312-abi3`; other Python implementations and CPython lines are refused at the tooling and import
-boundaries.
+The native wheel is `cp312-abi3`, so CPython 3.12 is the floor and every later CPython loads
+the same wheel.
 
 `tensorfs.CodeTensor(component, key, dtype, shape, accepts)` and
 `tensorfs.code_topology(contract_digest, tensors)` are the one Python author seam for canonical

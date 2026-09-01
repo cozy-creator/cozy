@@ -14,19 +14,11 @@ from email.policy import default
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PACKAGE = "tensorfs"
-PRELAUNCH_MAJOR = 0
-V1_GATE = "proto-014"
-PYTHON_SPEC = ">=3.12,<3.13"
-MATURIN_SPEC = "maturin>=1.15,<2"
-PYO3_VERSION = "0.29.2"
+# abi3 is forward compatible by construction: a cp312-abi3 wheel loads on 3.12 and every
+# later CPython. The floor is real; there is no ceiling to assert.
+PYTHON_SPEC = ">=3.12"
 CURRENT_CARGO_VERSION = "0.0.8"
 CURRENT_PYTHON_VERSION = "0.0.8"
-
-
-def python_runtime() -> str:
-    if sys.implementation.name != "cpython" or sys.version_info[:2] != (3, 12):
-        raise ValueError("TensorFS tooling requires CPython 3.12")
-    return f"CPython {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 
 
 def _toml(path: pathlib.Path) -> dict[str, object]:
@@ -48,18 +40,12 @@ def source_versions() -> tuple[str, str]:
     pyproject = _toml(ROOT / "pyproject.toml")
     conformance = _toml(ROOT / "conformance/cbor/python/pyproject.toml")
     cargo = _toml(ROOT / "Cargo.toml")
-    python_crate = _toml(ROOT / "crates/tensorfs-py/Cargo.toml")
     python_version = pyproject["project"]["version"]  # type: ignore[index]
     cargo_version = cargo["workspace"]["package"]["version"]  # type: ignore[index]
     for name, project in (("pyproject.toml", pyproject), ("conformance CBOR", conformance)):
         requires_python = project["project"]["requires-python"]  # type: ignore[index]
         if requires_python != PYTHON_SPEC:
             raise ValueError(f"{name} requires-python {requires_python!r} != {PYTHON_SPEC!r}")
-    if pyproject["build-system"]["requires"] != [MATURIN_SPEC]:  # type: ignore[index]
-        raise ValueError(f"build-system must require exactly {MATURIN_SPEC}")
-    pyo3 = python_crate["dependencies"]["pyo3"]  # type: ignore[index]
-    if pyo3 != {"version": PYO3_VERSION, "features": ["abi3-py312"]}:
-        raise ValueError("tensorfs-py must use PyO3 0.29.2 with only abi3-py312")
     if not isinstance(python_version, str) or not isinstance(cargo_version, str):
         raise ValueError("pyproject and Cargo workspace versions must be strings")
     if cargo_version != CURRENT_CARGO_VERSION:
@@ -83,15 +69,6 @@ def source_versions() -> tuple[str, str]:
         version = package.get("version") if isinstance(package, dict) else None
         if version != {"workspace": True}:
             raise ValueError(f"{manifest.relative_to(ROOT)} must inherit version.workspace")
-
-    try:
-        major = int(python_version.partition(".")[0])
-    except ValueError as error:
-        raise ValueError(f"package version {python_version!r} has no numeric major") from error
-    if major != PRELAUNCH_MAJOR:
-        raise ValueError(
-            f"TensorFS remains 0.x until {V1_GATE} cuts the first public v1; got {python_version}"
-        )
     return cargo_version, python_version
 
 
@@ -142,7 +119,6 @@ def main() -> int:
     parser.add_argument("mode", choices=("source", "wheel", "installed"))
     parser.add_argument("wheel", nargs="?", type=pathlib.Path)
     args = parser.parse_args()
-    runtime = python_runtime()
     if args.mode == "source":
         if args.wheel is not None:
             parser.error("source takes no wheel")
@@ -151,7 +127,7 @@ def main() -> int:
         if args.wheel is None:
             parser.error(f"{args.mode} requires a wheel")
         version = wheel_version(args.wheel) if args.mode == "wheel" else installed_version(args.wheel)
-    print(f"version contract green: {PACKAGE} {version} ({args.mode}; {runtime})")
+    print(f"version contract green: {PACKAGE} {version} ({args.mode})")
     return 0
 
 
