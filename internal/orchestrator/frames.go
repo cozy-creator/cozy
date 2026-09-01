@@ -221,6 +221,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	var status *pb.PlacementStatus
 	var desiredRevision uint64
+	workerTerminal := false
 	c.mu.Lock()
 	w := c.workers[s.instanceID]
 	if w != nil && w.bootID != s.bootID {
@@ -342,6 +343,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
 			}
 		}
+		workerTerminal = retirementGround(w) != ""
 	}
 	phase := trimEnum(pb.WorkerPhase_name[int32(r.WorkerPhase)], "WORKER_PHASE_")
 	c.mu.Unlock()
@@ -373,6 +375,11 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		}
 	} else if w != nil && w.spec.IsJob() && r.GetJobCapacity().GetJobsAvailable() > 0 {
 		go c.drain()
+	} else if workerTerminal {
+		// A FAILED axis or permanent desired-state refusal is the worker's answer, not a
+		// stall timer to begin. Re-ask the queued head immediately so it can replace a
+		// stale process or receive the replacement's typed refusal.
+		go c.checkRetirement()
 	}
 	if r.GetJobCapacity() != nil {
 		c.logf("observed phase=%s accepted=%d converged=%d jobs_available=%d jobs_in_flight=%d",

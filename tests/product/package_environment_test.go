@@ -117,12 +117,29 @@ module-root = ""
 	}))
 	defer server.Close()
 
-	root := t.TempDir()
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "published-offline-run")
+	must(t, os.RemoveAll(root))
+	must(t, os.MkdirAll(root, 0o755))
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	code, output := runCozyDir(t, root, "", []string{"TENSORHUB_URL=" + server.URL},
 		"package", "install", "proof/cozy-weightless-package", "--version", pack.Release,
 		"--no-model-download", "--json")
 	if code != 0 || !strings.Contains(output, `"package":"proof/cozy-weightless-package"`) {
 		t.Fatalf("published package install [exit %d]\n%s", code, output)
+	}
+
+	// Installation is the network boundary. Once the exact package is present, ordinary
+	// local invocation reads only Creator's local records and package environment; the Hub
+	// may be completely unavailable. Run twice to prove both cold launch and warm reuse.
+	server.Close()
+	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
+	for invocation := 1; invocation <= 2; invocation++ {
+		code, output = runCozyDir(t, root, "", []string{"TENSORHUB_URL=" + server.URL},
+			"run", "proof/cozy-weightless-package/tile", "size=8", "--await", "--json")
+		if code != 0 || !strings.Contains(output, `"status":"completed"`) {
+			t.Fatalf("offline local invocation %d [exit %d]\n%s\n%s",
+				invocation, code, output, productWorkerLogs(root))
+		}
 	}
 }
 
