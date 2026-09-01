@@ -66,7 +66,8 @@ type Options struct {
 	RentalPackageSet RentalPackageSetSource
 	// RentalFleet renders the one fleet burn line after reconciling every local
 	// rental with Tensorhub. AcquireManagedRental durably assigns one --rental
-	// request; ReleaseManagedRental tears down an idle Creator-managed pod.
+	// request; ReleaseManagedRental observes a rental as a request pinned to it
+	// settles and tears it down once nothing is left on it.
 	RentalFleet          func() (string, *exit.Error)
 	AcquireManagedRental func(records.Request) (string, string, *exit.Error)
 	ReleaseManagedRental func(string) (string, *exit.Error)

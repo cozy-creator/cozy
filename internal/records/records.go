@@ -67,7 +67,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 12
+const schemaVersion = 13
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -165,10 +165,11 @@ func Open(path string) (*Store, *exit.Error) {
 	return &Store{db: db}, nil
 }
 
-// Schemas 6 through 11 migrate in place. Schema 11 replaces authored GPU counts with
+// Schemas 6 through 12 migrate in place. Schema 11 replaces authored GPU counts with
 // the one derived accelerator-class fact; schema 12 gives the install table and its two
-// foreign keys the one word the row actually names. Package, request, event, and rental
-// rows survive; only schema 9's superseded special model-production subsystem is dropped.
+// foreign keys the one word the row actually names; schema 13 records when a rental was
+// first seen ready. Package, request, event, and rental rows survive; only schema 9's
+// superseded special model-production subsystem is dropped.
 // Schema 10 creates empty request-attached transfer sidecars because older rows cannot be
 // translated into ordinary request identity safely.
 func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
@@ -207,26 +208,8 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 	if e := migrateRequests(tx, path, sourceVersion); e != nil {
 		return e
 	}
-	if sourceVersion < 8 {
-		if _, err := tx.Exec(`DROP INDEX rentals_machine_name`); err != nil {
-			return exit.Internalf("cannot stage rental index while migrating %s: %s", path, err)
-		}
-		if _, err := tx.Exec(`ALTER TABLE rentals RENAME TO rentals_prior`); err != nil {
-			return exit.Internalf("cannot stage rental rows while migrating %s: %s", path, err)
-		}
-		if _, err := tx.Exec(rentalsDDL); err != nil {
-			return exit.Internalf("cannot create current rentals table while migrating %s: %s", path, err)
-		}
-		if _, err := tx.Exec(`INSERT INTO rentals(` + rentalCols + `) SELECT ` + rentalCols +
-			` FROM rentals_prior`); err != nil {
-			return exit.Internalf("cannot preserve rental rows while migrating %s: %s", path, err)
-		}
-		if _, err := tx.Exec(`DROP TABLE rentals_prior`); err != nil {
-			return exit.Internalf("cannot finish rental migration in %s: %s", path, err)
-		}
-		if _, err := tx.Exec(rentalSchema[3]); err != nil {
-			return exit.Internalf("cannot restore rental index while migrating %s: %s", path, err)
-		}
+	if e := migrateRentals(tx, path); e != nil {
+		return e
 	}
 	if sourceVersion < 10 {
 		for _, table := range []string{"model_production_objects", "model_production_artifacts",
@@ -242,7 +225,7 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			}
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=12`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=13`); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
 	if e := commitMigration(tx, path); e != nil {
@@ -295,6 +278,33 @@ func migrateInstalls(tx *sql.Tx, path string) *exit.Error {
 		if _, err := tx.Exec(statement); err != nil {
 			return exit.Internalf("cannot rename the install table while migrating %s: %s", path, err)
 		}
+	}
+	return nil
+}
+
+// migrateRentals rebuilds the rentals table on every migration: schema 13 added ready_at,
+// and every earlier shape carries the released column list without it. A rental that was
+// already ready when the schema moved gets no ready_at; its idle clock starts at its next
+// settlement, never at a guess.
+func migrateRentals(tx *sql.Tx, path string) *exit.Error {
+	if _, err := tx.Exec(`DROP INDEX rentals_machine_name`); err != nil {
+		return exit.Internalf("cannot stage rental index while migrating %s: %s", path, err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE rentals RENAME TO rentals_prior`); err != nil {
+		return exit.Internalf("cannot stage rental rows while migrating %s: %s", path, err)
+	}
+	if _, err := tx.Exec(rentalsDDL); err != nil {
+		return exit.Internalf("cannot create current rentals table while migrating %s: %s", path, err)
+	}
+	if _, err := tx.Exec(`INSERT INTO rentals(` + rentalColsPriorThirteen + `) SELECT ` +
+		rentalColsPriorThirteen + ` FROM rentals_prior`); err != nil {
+		return exit.Internalf("cannot preserve rental rows while migrating %s: %s", path, err)
+	}
+	if _, err := tx.Exec(`DROP TABLE rentals_prior`); err != nil {
+		return exit.Internalf("cannot finish rental migration in %s: %s", path, err)
+	}
+	if _, err := tx.Exec(rentalSchema[3]); err != nil {
+		return exit.Internalf("cannot restore rental index while migrating %s: %s", path, err)
 	}
 	return nil
 }
@@ -362,6 +372,9 @@ func priorStatements(version int) []string {
 		"  job_gpu_count INTEGER NOT NULL DEFAULT 0,\n", 1)
 	priorRequestsSix := strings.Replace(priorRequests,
 		"  rental_required INTEGER NOT NULL DEFAULT 0,\n", "", 1)
+	priorRentals := strings.Replace(rentalsDDL,
+		"  expected_worker_boot_id    TEXT NOT NULL DEFAULT '',\n  ready_at          TEXT NOT NULL DEFAULT ''\n",
+		"  expected_worker_boot_id    TEXT NOT NULL DEFAULT ''\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
 		if version >= 10 || !containsStatement(modelTransferSchema, statement) {
@@ -379,6 +392,8 @@ func priorStatements(version int) []string {
 			stmt = priorRequests
 		case stmt == rentalsDDL && version < 8:
 			stmt = rentalsDDLPrior
+		case stmt == rentalsDDL && version < 13:
+			stmt = priorRentals
 		}
 		if version < 12 {
 			stmt = priorInstallNames(stmt)
@@ -485,7 +500,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=12`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=13`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {

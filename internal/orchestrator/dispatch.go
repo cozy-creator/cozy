@@ -891,7 +891,7 @@ func (c *Orchestrator) releaseManaged(req records.Request) {
 	}
 	go func() {
 		if problem := c.releaseManagedNow(req); problem != nil {
-			c.logf("managed rental %s release deferred: %s", req.Worker, problem.Message)
+			c.logf("rental %s release deferred: %s", req.Worker, problem.Message)
 		}
 	}()
 }
