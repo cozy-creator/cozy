@@ -264,6 +264,13 @@ func (c *dependencyCollector) collectWheel(req requirement, source string) *exit
 }
 
 func (c *dependencyCollector) add(identity wheel.Identity, path string) *exit.Error {
+	// Runtime is carried so Creator can build its independent local venv, then omitted
+	// when Runtime authors the rental placement. Every other remote base root must stay
+	// out of DependencyWheels entirely; TensorFS local custody is the exact source member
+	// referenced by uv.lock, returned separately by Tensorhub's local install plan.
+	if remoteBaseRoots[identity.Distribution] && identity.Distribution != "cozy-runtime" { //cozy:allow base distribution identity, not executable access
+		return nil
+	}
 	if len(c.wheels) >= MaxDependencyWheels {
 		return tooManyDependencies()
 	}

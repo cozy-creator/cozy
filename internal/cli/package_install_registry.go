@@ -196,7 +196,7 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 	for _, download := range plan.Downloads {
 		var dst string
 		switch download.Kind {
-		case "project_wheel", "dependency_wheel":
+		case "project_wheel", "dependency_wheel", "local_materialization_wheel":
 			if filepath.Base(download.Path) != download.Path || !strings.HasSuffix(download.Path, ".whl") {
 				return nil, exit.Internalf("Tensorhub returned unsafe package wheel path %q", download.Path)
 			}
@@ -209,8 +209,13 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 					Distribution: download.Distribution, Filename: download.Path,
 					ImportRoots: append([]string(nil), download.ImportRoots...), Length: download.Length,
 					Path: dst, Tags: append([]string(nil), download.Tags...), Version: download.Version}
-			} else {
+			} else if download.Kind == "dependency_wheel" {
 				published.Wheels = append(published.Wheels, install.PublishedWheel{Digest: download.Digest,
+					Distribution: download.Distribution, Filename: download.Path,
+					ImportRoots: append([]string(nil), download.ImportRoots...), Length: download.Length,
+					Path: dst, Tags: append([]string(nil), download.Tags...), Version: download.Version})
+			} else {
+				published.LocalWheels = append(published.LocalWheels, install.PublishedWheel{Digest: download.Digest,
 					Distribution: download.Distribution, Filename: download.Path,
 					ImportRoots: append([]string(nil), download.ImportRoots...), Length: download.Length,
 					Path: dst, Tags: append([]string(nil), download.Tags...), Version: download.Version})

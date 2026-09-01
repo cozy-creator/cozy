@@ -55,6 +55,7 @@ type PublishedSource struct {
 	PackageConfig ExactDocument
 	Pyproject     ExactDocument
 	ProjectWheel  PublishedWheel
+	LocalWheels   []PublishedWheel
 	Release       string
 	SourceDigest  string
 	UVLock        ExactDocument
@@ -148,6 +149,24 @@ func validatePublished(gen records.PackageInstall, published *PublishedSource) *
 			!bytes.Equal(canonical.Digest(document.Bytes), digest) {
 			return exit.Named(exit.Conflict, "package_environment_document_identity_mismatch",
 				"published %s bytes do not match their digest and length", name)
+		}
+	}
+	seenDependencies := map[string]bool{}
+	for _, wheel := range published.Wheels {
+		if wheel.Distribution == "" || seenDependencies[wheel.Distribution] {
+			return exit.Named(exit.Conflict, "package_dependency_wheel_duplicate",
+				"published package repeats dependency distribution %q", wheel.Distribution)
+		}
+		seenDependencies[wheel.Distribution] = true
+	}
+	if len(published.LocalWheels) > 1 {
+		return exit.Named(exit.Conflict, "package_local_wheel_count_invalid",
+			"published package carries more than one local materialization wheel")
+	}
+	for _, wheel := range published.LocalWheels {
+		if wheel.Distribution != "tensorfs" || seenDependencies[wheel.Distribution] {
+			return exit.Named(exit.Conflict, "package_local_wheel_invalid",
+				"published local materialization wheel must be TensorFS outside the dependency overlay")
 		}
 	}
 	return nil

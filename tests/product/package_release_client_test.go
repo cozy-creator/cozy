@@ -187,7 +187,7 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 }
 
 func TestPackageDownloadPlanMirrorsPublicationWheelBoundary(t *testing.T) {
-	if hub.MaxPackageInstallDownloads != packagepublish.MaxDependencyWheels+1 {
+	if hub.MaxPackageInstallDownloads != packagepublish.MaxDependencyWheels+2 {
 		t.Fatalf("package install downloads=%d, publication dependency wheels=%d",
 			hub.MaxPackageInstallDownloads, packagepublish.MaxDependencyWheels)
 	}
