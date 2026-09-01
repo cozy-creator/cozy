@@ -26,7 +26,7 @@ type fakeControl struct {
 	root      string // this worker's OWN filesystem root
 	verify    func(string) bool
 
-	generation   uint64
+	epoch        uint64
 	snapshotSent atomic.Bool
 }
 
@@ -45,14 +45,14 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 		f.say("first frame was not a Claim; closing")
 		return nil
 	}
-	f.generation++
-	env := func(set func(epoch, gen uint64, boot string)) {
-		set(claim.RecordOwnerEpoch, f.generation, f.bootID)
+	f.epoch++
+	env := func(set func(owner, control uint64, boot string)) {
+		set(claim.RecordOwnerEpoch, f.epoch, f.bootID)
 	}
 	// The worker-level admission fence. It is a CONSTANT here on purpose: this adversary
 	// never respawns an executor, so an offer echoing anything else is an owner dispatching
 	// against capacity it did not observe.
-	const admissionGeneration = 1
+	const admissionEpoch = 1
 	var sendMu sync.Mutex
 	send := func(m *pb.WorkerFrame) {
 		sendMu.Lock()
@@ -64,7 +64,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	refuseClaim := func(reason pb.ClaimRejection, why string) {
 		ack := &pb.ClaimAck{Accepted: false, Rejection: reason, WireMinor: pb.WireMinor}
 		env(func(e, g uint64, b string) {
-			ack.RecordOwnerEpoch, ack.ControlStreamGeneration, ack.WorkerBootId = e, g, b
+			ack.RecordOwnerEpoch, ack.ControlStreamEpoch, ack.WorkerBootId = e, g, b
 		})
 		send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: ack}})
 		f.say("Claim REFUSED (%s): %s", pb.ClaimRejection_name[int32(reason)], why)
@@ -80,7 +80,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 		Resources: &pb.WorkerResources{Platform: "fake"},
 	}
 	env(func(e, g uint64, b string) {
-		ack.RecordOwnerEpoch, ack.ControlStreamGeneration, ack.WorkerBootId = e, g, b
+		ack.RecordOwnerEpoch, ack.ControlStreamEpoch, ack.WorkerBootId = e, g, b
 	})
 	send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: ack}})
 	f.say("ClaimAck sent: boot=%s instance=%s release=%s minor=%d",
@@ -97,7 +97,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	bodyBytes, bodyDigest, err := canonical.Identity(&pb.WorkerSnapshotBody{
 		WorkerPhase:                pb.WorkerPhase_WORKER_PHASE_ONLINE,
 		AdmissionState:             pb.AdmissionState_ADMISSION_STATE_CLOSED,
-		AdmissionGeneration:        1,
+		AdmissionEpoch:             1,
 		AcceptedPlacementSetDigest: emptySetDigest,
 	})
 	if err != nil {
@@ -107,7 +107,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	snap := &pb.WorkerSnapshot{SnapshotId: snapshotID, SnapshotDigest: bodyDigest,
 		SnapshotCanonicalBytes: bodyBytes, AcceptedPlacementSetCanonicalBytes: emptySet}
 	env(func(e, g uint64, b string) {
-		snap.RecordOwnerEpoch, snap.ControlStreamGeneration, snap.WorkerBootId = e, g, b
+		snap.RecordOwnerEpoch, snap.ControlStreamEpoch, snap.WorkerBootId = e, g, b
 	})
 	send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_Snapshot{Snapshot: snap}})
 	f.snapshotSent.Store(true)
@@ -121,11 +121,11 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			WorkerPhase:                pb.WorkerPhase_WORKER_PHASE_ONLINE,
 			AppliedWireMinor:           pb.WireMinor,
 			AdmissionState:             pb.AdmissionState_ADMISSION_STATE_OPEN,
-			AdmissionGeneration:        admissionGeneration, AvailableAttemptSlots: availableSlots,
+			AdmissionEpoch:             admissionEpoch, AvailableAttemptSlots: availableSlots,
 		}
 		r.Placements = placements
 		env(func(e, g uint64, b string) {
-			r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId = e, g, b
+			r.RecordOwnerEpoch, r.ControlStreamEpoch, r.WorkerBootId = e, g, b
 		})
 		send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: r}})
 	}
@@ -141,7 +141,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 		}
 		return &pb.PlacementStatus{
 			PlacementId: placementID, Materialization: pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
-			Serving: pb.ServingState_SERVING_STATE_DISPATCHABLE, ExecutorGeneration: 1,
+			Serving: pb.ServingState_SERVING_STATE_DISPATCHABLE, ExecutorEpoch: 1,
 			DispatchableBindingDigests: bindingDigests, PlacementSetDigest: setDigest,
 			PackageRevisionDigest: packageRevision, EnvironmentDigest: environmentDigest,
 			ConfigDigest: configDigest,
@@ -149,7 +149,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	}
 	outcome := func(t *pb.AttemptOutcome) {
 		env(func(e, g uint64, b string) {
-			t.RecordOwnerEpoch, t.ControlStreamGeneration, t.WorkerBootId = e, g, b
+			t.RecordOwnerEpoch, t.ControlStreamEpoch, t.WorkerBootId = e, g, b
 		})
 		send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptOutcome{AttemptOutcome: t}})
 	}
@@ -217,15 +217,15 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 		case *pb.RecordOwnerFrame_AttemptOffer:
 			offer := m.AttemptOffer
 			f.say("AttemptOffer %s#%d placement=%s admission=%d", offer.RequestId,
-				offer.AttemptOrdinal, offer.PlacementId, offer.AdmissionGeneration)
+				offer.AttemptOrdinal, offer.PlacementId, offer.AdmissionEpoch)
 			// EVERY OFFER GETS A JOURNALED ANSWER (#472f/#480b). A stale admission
-			// generation is refused with an OUTCOME, never with silence — and the outcome
+			// epoch is refused with an OUTCOME, never with silence — and the outcome
 			// says `execution_started: false`, which is the STRUCTURAL billing fact.
-			if offer.AdmissionGeneration != admissionGeneration {
+			if offer.AdmissionEpoch != admissionEpoch {
 				t, _ := outcomeFor(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
 					pb.OutcomeStatus_OUTCOME_STATUS_REFUSED,
-					"the echoed admission generation is not current",
-					pb.CauseCode_CAUSE_CODE_ADMISSION_GENERATION_STALE,
+					"the echoed admission epoch is not current",
+					pb.CauseCode_CAUSE_CODE_ADMISSION_EPOCH_STALE,
 					pb.CauseOrigin_CAUSE_ORIGIN_WORKER, false)
 				t.PlacementId = offer.PlacementId
 				outcome(t)
@@ -237,10 +237,10 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				PlanDigest:              canonical.Digest([]byte("fake-plan")),
 				ModelConstructionDigest: canonical.Digest([]byte("fake-construction")),
 				Plan:                    &pb.AttemptPlanSummary{Delivery: "native", Placement: "all_resident"},
-				PlacementId:             offer.PlacementId, ExecutorGeneration: 1,
+				PlacementId:             offer.PlacementId, ExecutorEpoch: 1,
 			}
 			env(func(e, g uint64, b string) {
-				accepted.RecordOwnerEpoch, accepted.ControlStreamGeneration, accepted.WorkerBootId = e, g, b
+				accepted.RecordOwnerEpoch, accepted.ControlStreamEpoch, accepted.WorkerBootId = e, g, b
 			})
 			send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptAccepted{AttemptAccepted: accepted}})
 			switch f.arm {

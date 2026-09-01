@@ -26,7 +26,7 @@ import (
 // "owner" is retired and the formal role is RecordOwner): the WORKER hosts `WorkerControl`
 // and THIS side dials it, claims it, reconciles its ONE snapshot, and only then
 // dispatches. One goroutine per worker owns the whole conversation; the `session` is that
-// stream's sender half, fenced by the control stream generation the worker minted.
+// stream's sender half, fenced by the control stream epoch the worker minted.
 //
 // LAUNCH TIER (#437): record_owner_epoch is the constant 1 — this daemon is the one
 // RecordOwner of every worker it spawns or connects to; the machinery that MINTS competing
@@ -42,7 +42,7 @@ const recordOwnerID = "cozy-local-client"
 type session struct {
 	ctx        context.Context
 	bootID     string
-	generation uint64
+	epoch      uint64
 	instanceID string
 	out        chan *pb.RecordOwnerFrame
 }
@@ -78,13 +78,13 @@ func (s *session) trySend(m *pb.RecordOwnerFrame) (sent bool) {
 // attach owns one worker's control conversation for the life of its process: read the
 // published address, dial, claim, reconcile, direct, then pump frames. On a stream drop
 // with the process still alive it re-dials and RE-CLAIMS the same boot (the worker mints
-// a fresh control generation and resends its snapshot; replay covers the durables).
+// a fresh control epoch and resends its snapshot; replay covers the durables).
 //
 // A RECORDED REFUSAL ENDS THE LOOP. The verdicts this owner reaches at claim time — a
 // foreign instance identity or an unpinned release — are facts about the THING AT THE
 // OTHER END, and redialing cannot change any of them. Left
-// running, the loop burns one of the worker's control generations every 200 ms forever;
-// observed at 1,111 generations against a pre-rev-2 worker while a waiter sat on a
+// running, the loop burns one of the worker's control epochs every 200 ms forever;
+// observed at 1,111 epochs against a pre-rev-2 worker while a waiter sat on a
 // readiness poll that was never going to end. The refusal is already the waiter's answer
 // (`EnsurePlacementReady` reads it first) — this stops the conversation from outliving it.
 func (c *Orchestrator) attach(w *worker) {
@@ -283,7 +283,7 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				c.refuseClaim(w, problem)
 				return fmt.Errorf("%s", problem.Message)
 			}
-			s.bootID, s.generation = ack.WorkerBootId, ack.ControlStreamGeneration
+			s.bootID, s.epoch = ack.WorkerBootId, ack.ControlStreamEpoch
 			if e := c.onClaimAck(w, s, ack); e != nil {
 				return fmt.Errorf("%s", e.Message)
 			}
@@ -292,7 +292,7 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				pb.BootFailureReason_name[int32(m.BootFailure.Reason)], m.BootFailure.Detail)
 			return nil
 		case *pb.WorkerFrame_Snapshot:
-			if c.fenced(s, m.Snapshot.RecordOwnerEpoch, m.Snapshot.ControlStreamGeneration,
+			if c.fenced(s, m.Snapshot.RecordOwnerEpoch, m.Snapshot.ControlStreamEpoch,
 				m.Snapshot.WorkerBootId) {
 				continue
 			}
@@ -307,25 +307,25 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			}
 		case *pb.WorkerFrame_ObservedState:
 			r := m.ObservedState
-			if c.fenced(s, r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId) {
+			if c.fenced(s, r.RecordOwnerEpoch, r.ControlStreamEpoch, r.WorkerBootId) {
 				continue
 			}
 			c.onObserved(s, r)
 		case *pb.WorkerFrame_AttemptAccepted:
 			a := m.AttemptAccepted
-			if c.fenced(s, a.RecordOwnerEpoch, a.ControlStreamGeneration, a.WorkerBootId) {
+			if c.fenced(s, a.RecordOwnerEpoch, a.ControlStreamEpoch, a.WorkerBootId) {
 				continue
 			}
 			c.onAccepted(s, a)
 		case *pb.WorkerFrame_AttemptOutcome:
 			t := m.AttemptOutcome
-			if c.fenced(s, t.RecordOwnerEpoch, t.ControlStreamGeneration, t.WorkerBootId) {
+			if c.fenced(s, t.RecordOwnerEpoch, t.ControlStreamEpoch, t.WorkerBootId) {
 				continue
 			}
 			c.onOutcome(s, t)
 		case *pb.WorkerFrame_CheckpointRequest:
 			r := m.CheckpointRequest
-			if c.fenced(s, r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId) {
+			if c.fenced(s, r.RecordOwnerEpoch, r.ControlStreamEpoch, r.WorkerBootId) {
 				continue
 			}
 			if !c.jobMode(s) {
@@ -338,42 +338,42 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			c.onCheckpoint(s, r)
 		case *pb.WorkerFrame_ModelSourceFileStatus:
 			status := m.ModelSourceFileStatus
-			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamGeneration,
+			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamEpoch,
 				status.WorkerBootId) {
 				continue
 			}
 			c.onModelSourceFileStatus(s, status)
 		case *pb.WorkerFrame_ModelSourcePrepared:
 			prepared := m.ModelSourcePrepared
-			if c.fenced(s, prepared.RecordOwnerEpoch, prepared.ControlStreamGeneration,
+			if c.fenced(s, prepared.RecordOwnerEpoch, prepared.ControlStreamEpoch,
 				prepared.WorkerBootId) {
 				continue
 			}
 			c.onModelSourcePrepared(s, prepared)
 		case *pb.WorkerFrame_PrivatePackageFileStatus:
 			status := m.PrivatePackageFileStatus
-			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamGeneration,
+			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamEpoch,
 				status.WorkerBootId) {
 				continue
 			}
 			c.onPrivatePackageFileStatus(s, status)
 		case *pb.WorkerFrame_PrivatePackageAbortStatus:
 			status := m.PrivatePackageAbortStatus
-			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamGeneration,
+			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamEpoch,
 				status.WorkerBootId) {
 				continue
 			}
 			c.onPrivatePackageAbortStatus(s, status)
 		case *pb.WorkerFrame_WeightsReceipt:
 			receipt := m.WeightsReceipt
-			if c.fenced(s, receipt.RecordOwnerEpoch, receipt.ControlStreamGeneration,
+			if c.fenced(s, receipt.RecordOwnerEpoch, receipt.ControlStreamEpoch,
 				receipt.WorkerBootId) {
 				continue
 			}
 			c.onModelTransferWeightsReceipt(s, receipt)
 		case *pb.WorkerFrame_WeightsTransferStatus:
 			status := m.WeightsTransferStatus
-			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamGeneration,
+			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamEpoch,
 				status.WorkerBootId) {
 				continue
 			}
@@ -382,7 +382,7 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			// the worker's echo of a receipt already durable here; nothing to apply
 		case *pb.WorkerFrame_WeightsFinalizeResult:
 			r := m.WeightsFinalizeResult
-			if c.fenced(s, r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId) {
+			if c.fenced(s, r.RecordOwnerEpoch, r.ControlStreamEpoch, r.WorkerBootId) {
 				continue
 			}
 			c.onWeightsFinalizeResult(s, r)
@@ -392,13 +392,13 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 
 // fenced evaluates the three-field envelope in its fixed order, BEFORE any body field is
 // interpreted (02 §0).
-func (c *Orchestrator) fenced(s *session, epoch, generation uint64, bootID string) bool {
-	if epoch != recordOwnerEpoch {
-		c.logf("DROPPED: epoch %d is not this owner's %d", epoch, recordOwnerEpoch)
+func (c *Orchestrator) fenced(s *session, owner, controlStream uint64, bootID string) bool {
+	if owner != recordOwnerEpoch {
+		c.logf("DROPPED: epoch %d is not this owner's %d", owner, recordOwnerEpoch)
 		return true
 	}
-	if generation != s.generation {
-		c.logf("DROPPED: superseded control generation %d (live %d)", generation, s.generation)
+	if controlStream != s.epoch {
+		c.logf("DROPPED: superseded control epoch %d (live %d)", controlStream, s.epoch)
 		return true
 	}
 	if bootID != s.bootID {
@@ -411,8 +411,8 @@ func (c *Orchestrator) fenced(s *session, epoch, generation uint64, bootID strin
 // onClaimAck binds the claimed boot to the worker slot: identity checks, the durable
 // binding, and the session registry (the ClaimAck is the flip's Register successor).
 func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit.Error {
-	c.logf("ClaimAck boot=%s generation=%d instance=%s minor=%d backend=%q device=%q",
-		ack.WorkerBootId, ack.ControlStreamGeneration, ack.WorkerInstanceId, ack.WireMinor,
+	c.logf("ClaimAck boot=%s epoch=%d instance=%s minor=%d backend=%q device=%q",
+		ack.WorkerBootId, ack.ControlStreamEpoch, ack.WorkerInstanceId, ack.WireMinor,
 		ack.Resources.GetBackend(), ack.Resources.GetDeviceName())
 	if e := instancePin(w, ack.WorkerInstanceId); e != nil {
 		// Nothing is dispatched to it; the stream ends on the next recv when we stop
@@ -596,15 +596,15 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	c.mu.Lock()
 	w.acceptedRevision = uint64(doc.Int("accepted_desired_state_revision"))
 	w.convergedRevision = uint64(doc.Int("converged_revision"))
-	w.admissionGen = uint64(doc.Int("admission_generation"))
+	w.admissionEpoch = uint64(doc.Int("admission_epoch"))
 	w.admission = pb.AdmissionState(doc.Int("admission_state"))
 	w.observeSlots(int(doc.Int("available_attempt_slots")))
 	w.phase = pb.WorkerPhase(doc.Int("worker_phase"))
 	c.mu.Unlock()
 
 	ackMsg := &pb.SnapshotAck{SnapshotId: snap.SnapshotId, SnapshotDigest: snap.SnapshotDigest}
-	ackMsg.RecordOwnerEpoch, ackMsg.ControlStreamGeneration, ackMsg.WorkerBootId =
-		recordOwnerEpoch, s.generation, s.bootID
+	ackMsg.RecordOwnerEpoch, ackMsg.ControlStreamEpoch, ackMsg.WorkerBootId =
+		recordOwnerEpoch, s.epoch, s.bootID
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_SnapshotAck{SnapshotAck: ackMsg}}) {
 		return false
 	}
@@ -724,7 +724,7 @@ func (c *Orchestrator) reconcileSnapshotAbsence(w *worker, held map[string]bool)
 }
 
 // openWatch opens the LOSSY progress lane on its own connection after the snapshot
-// barrier, bound to the claimed generation. Its death is invisible to control; the
+// barrier, bound to the claimed epoch. Its death is invisible to control; the
 // redial cycle reopens it.
 func (c *Orchestrator) openWatch(addr string, w *worker, s *session) context.CancelFunc {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -735,8 +735,8 @@ func (c *Orchestrator) openWatch(addr string, w *worker, s *session) context.Can
 		}
 		defer conn.Close()
 		open := &pb.ProgressOpen{}
-		open.RecordOwnerEpoch, open.ControlStreamGeneration, open.WorkerBootId =
-			recordOwnerEpoch, s.generation, s.bootID
+		open.RecordOwnerEpoch, open.ControlStreamEpoch, open.WorkerBootId =
+			recordOwnerEpoch, s.epoch, s.bootID
 		watch, err := pb.NewWorkerControlClient(conn).WatchProgress(ctx, open)
 		if err != nil {
 			return

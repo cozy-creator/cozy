@@ -111,7 +111,7 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker) *exit.Error {
 			DeviceCount:       uint32(gpuCountOf(plan)),
 		}},
 	}
-	d.RecordOwnerEpoch, d.ControlStreamGeneration, d.WorkerBootId = recordOwnerEpoch, s.generation, s.bootID
+	d.RecordOwnerEpoch, d.ControlStreamEpoch, d.WorkerBootId = recordOwnerEpoch, s.epoch, s.bootID
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}}) {
 		return exit.Unavailablef("worker %s control stream closed before job directive send", w.instanceID)
 	}
@@ -386,8 +386,8 @@ func checkpointReceipt(s *session, r *pb.JobCheckpointRequest, receiptID string,
 		LogicalKey: r.LogicalKey, ContentDigest: r.ContentDigest,
 		ReceiptId: receiptID, Outcome: outcome,
 	}
-	receipt.RecordOwnerEpoch, receipt.ControlStreamGeneration, receipt.WorkerBootId =
-		recordOwnerEpoch, s.generation, s.bootID
+	receipt.RecordOwnerEpoch, receipt.ControlStreamEpoch, receipt.WorkerBootId =
+		recordOwnerEpoch, s.epoch, s.bootID
 	if detail != "" {
 		receipt.Fault = &pb.CheckpointFault{Code: code, Detail: detail}
 	}

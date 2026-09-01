@@ -16,7 +16,7 @@ type privateTransfer struct {
 	revision           string
 	source             []byte
 	instanceID, bootID string
-	generation         uint64
+	epoch              uint64
 	canceled           bool
 	files              map[string]privateTransferFile
 	status             map[string]privateTransferStatus
@@ -207,8 +207,8 @@ func (c *Orchestrator) transferPrivatePackage(instanceID, operationID string,
 		// would re-grant forever without ever waiting for an answer.
 		before := c.clearPrivateStalls(operationID)
 		frame := &pb.PrivatePackageFetchRequest{RecordOwnerEpoch: recordOwnerEpoch,
-			ControlStreamGeneration: selectedSession.generation,
-			WorkerBootId:            selectedSession.bootID, OperationId: operationID,
+			ControlStreamEpoch: selectedSession.epoch,
+			WorkerBootId:       selectedSession.bootID, OperationId: operationID,
 			SourceDigest: held.source, Files: granted}
 		if !selectedSession.send(&pb.RecordOwnerFrame{
 			Msg: &pb.RecordOwnerFrame_PrivatePackageFetchRequest{
@@ -353,9 +353,9 @@ func (c *Orchestrator) bindPrivateTransfer(instanceID, operationID string,
 		c.privateTransfers[operationID] = held
 	}
 	if held.instanceID != instanceID || held.bootID != current.bootID ||
-		held.generation != current.generation {
-		held.instanceID, held.bootID, held.generation = instanceID, current.bootID,
-			current.generation
+		held.epoch != current.epoch {
+		held.instanceID, held.bootID, held.epoch = instanceID, current.bootID,
+			current.epoch
 		held.status = make(map[string]privateTransferStatus, len(held.files))
 	}
 	return held, nil
@@ -372,7 +372,7 @@ func (c *Orchestrator) cancelPrivateTransfer(operationID string) *exit.Error {
 	transfer.status = nil
 	s := c.sessions[transfer.bootID]
 	c.mu.Unlock()
-	if s == nil || s.instanceID != transfer.instanceID || s.generation != transfer.generation {
+	if s == nil || s.instanceID != transfer.instanceID || s.epoch != transfer.epoch {
 		return exit.Unavailablef("private package transfer has no current worker session to abort")
 	}
 	privateDigest, privateErr := canonical.Raw(transfer.revision)
@@ -380,7 +380,7 @@ func (c *Orchestrator) cancelPrivateTransfer(operationID string) *exit.Error {
 		return exit.Internalf("cannot decode private package abort identity: %s", privateErr)
 	}
 	abort := &pb.PrivatePackageAbort{RecordOwnerEpoch: recordOwnerEpoch,
-		ControlStreamGeneration: s.generation, WorkerBootId: s.bootID,
+		ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID,
 		OperationId: operationID, SourceDigest: append([]byte(nil), transfer.source...),
 		PrivateRevisionDigest: privateDigest}
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_PrivatePackageAbort{
@@ -407,7 +407,7 @@ func (c *Orchestrator) privateTransferVerified(operationID, revision string,
 	transfer := c.privateTransfers[operationID]
 	if transfer == nil || transfer.revision != revision || current == nil ||
 		transfer.instanceID != current.instanceID || transfer.bootID != current.bootID ||
-		transfer.generation != current.generation {
+		transfer.epoch != current.epoch {
 		return false
 	}
 	for digest, file := range transfer.files {
@@ -551,7 +551,7 @@ func (c *Orchestrator) onPrivatePackageFileStatus(current *session,
 	transfer := c.privateTransfers[frame.OperationId]
 	if err != nil || transfer == nil || transfer.canceled || current == nil ||
 		transfer.instanceID != current.instanceID || transfer.bootID != current.bootID ||
-		transfer.generation != current.generation ||
+		transfer.epoch != current.epoch ||
 		!bytes.Equal(frame.SourceDigest, transfer.source) {
 		return
 	}
@@ -582,7 +582,7 @@ func (c *Orchestrator) onPrivatePackageAbortStatus(current *session,
 	c.mu.Lock()
 	transfer := c.privateTransfers[frame.OperationId]
 	if transfer == nil || current == nil || transfer.instanceID != current.instanceID ||
-		transfer.bootID != current.bootID || transfer.generation != current.generation ||
+		transfer.bootID != current.bootID || transfer.epoch != current.epoch ||
 		!bytes.Equal(frame.SourceDigest, transfer.source) {
 		c.mu.Unlock()
 		return
@@ -616,7 +616,7 @@ func (c *Orchestrator) replayPrivateAborts(current *session, workerID string) {
 		}
 		_ = current.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_PrivatePackageAbort{
 			PrivatePackageAbort: &pb.PrivatePackageAbort{RecordOwnerEpoch: recordOwnerEpoch,
-				ControlStreamGeneration: current.generation, WorkerBootId: current.bootID,
+				ControlStreamEpoch: current.epoch, WorkerBootId: current.bootID,
 				OperationId: row.ID, SourceDigest: source, PrivateRevisionDigest: revision}}})
 	}
 }
@@ -635,7 +635,7 @@ func (c *Orchestrator) issuePrivatePackageSet(s *session, w *worker,
 	w.desiredPackages, w.desiredModels = nil, nil
 	c.mu.Unlock()
 	desired := &pb.DesiredWorkerState{RecordOwnerEpoch: recordOwnerEpoch,
-		ControlStreamGeneration: s.generation, WorkerBootId: s.bootID, Revision: revision,
+		ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, Revision: revision,
 		Posture: pb.Posture_POSTURE_ACCEPTING, WireMinor: pb.WireMinor,
 		Mode: &pb.DesiredWorkerState_PrivatePackageSet{PrivatePackageSet: selected}}
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: desired}}) {
@@ -700,7 +700,7 @@ func (c *Orchestrator) issuePrivatePlacementSet(s *session, w *worker,
 	w.desiredPrivatePlacement = clonePrivatePlacementSet(selected)
 	c.mu.Unlock()
 	desired := &pb.DesiredWorkerState{RecordOwnerEpoch: recordOwnerEpoch,
-		ControlStreamGeneration: s.generation, WorkerBootId: s.bootID, Revision: revision,
+		ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, Revision: revision,
 		Posture: pb.Posture_POSTURE_ACCEPTING, WireMinor: pb.WireMinor,
 		Mode: &pb.DesiredWorkerState_PrivatePlacementSet{PrivatePlacementSet: selected}}
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: desired}}) {

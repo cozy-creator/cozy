@@ -28,7 +28,7 @@ import (
 
 // PackageInstall is one immutable install: a materialized environment plus the evidence
 // that produced it. Rows are never updated — a rebuild is a NEW install. It is deliberately
-// not a "generation": the wire spends that word on the executor and admission fences, the
+// not a fencing counter: the wire spends `epoch` on the executor and admission fences, the
 // local install is neither, and one word for three things is how they drift (#484).
 type PackageInstall struct {
 	ID                 string

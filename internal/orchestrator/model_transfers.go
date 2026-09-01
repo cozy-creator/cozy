@@ -140,7 +140,7 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 				continue
 			}
 			request := &pb.WeightsTransferRequest{RecordOwnerEpoch: recordOwnerEpoch,
-				ControlStreamGeneration: session.generation, WorkerBootId: session.bootID,
+				ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
 				RequestId: weights.RequestID, AttemptOrdinal: uint64(weights.Attempt),
 				InvocationSpecDigest: specDigest, OutputSlot: weights.OutputSlot,
 				WeightsTransactionId: weights.TransactionID, WeightsReceiptDigest: receiptDigest,
@@ -315,7 +315,7 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 			}
 			access := byMember[status.Member]
 			request := &pb.ModelSourceFileRequest{RecordOwnerEpoch: recordOwnerEpoch,
-				ControlStreamGeneration: session.generation, WorkerBootId: session.bootID,
+				ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
 				OperationId: req.ID, SourceSelectionDigest: selection, Member: status.Member,
 				ObjectId: "sha256:" + file.SHA256, Length: uint64(file.Length),
 				Provider: access.Provider, Url: access.URL, ExpiresAtUnix: access.ExpiresAtUnix,
@@ -331,7 +331,7 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 			sort.Slice(profiles, func(i, j int) bool { return profiles[i].Slot < profiles[j].Slot })
 			session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourcePrepareRequest{
 				ModelSourcePrepareRequest: &pb.ModelSourcePrepareRequest{
-					RecordOwnerEpoch: recordOwnerEpoch, ControlStreamGeneration: session.generation,
+					RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: session.epoch,
 					WorkerBootId: session.bootID, OperationId: req.ID,
 					SourceSelectionDigest: selection, Profiles: profiles,
 					SourceUri: intent.Source, DeclaredLicense: intent.SourceLicense}}})

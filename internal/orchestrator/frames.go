@@ -173,7 +173,7 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 	w.desiredPrivatePlacement = nil
 	c.mu.Unlock()
 	d := &pb.DesiredWorkerState{
-		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamGeneration: s.generation,
+		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch,
 		WorkerBootId: s.bootID, Revision: revision, Posture: pb.Posture_POSTURE_ACCEPTING,
 		WireMinor: pb.WireMinor,
 		Mode: &pb.DesiredWorkerState_PackageSet{PackageSet: &pb.DesiredPackageSet{
@@ -257,7 +257,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 		// that left the posture ACCEPTING would be asking for work it has nowhere to run.
 		d.Posture = pb.Posture_POSTURE_DRAINING
 	}
-	d.RecordOwnerEpoch, d.ControlStreamGeneration, d.WorkerBootId = recordOwnerEpoch, s.generation, s.bootID
+	d.RecordOwnerEpoch, d.ControlStreamEpoch, d.WorkerBootId = recordOwnerEpoch, s.epoch, s.bootID
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}})
 	c.logf("DesiredWorkerState revision=%d posture=%s placements=%d set=%s (%d canonical bytes) -> %s",
 		rev, trimEnum(pb.Posture_name[int32(d.Posture)], "POSTURE_"), len(placements),
@@ -291,7 +291,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		// THE ONE ADMISSION FENCE, worker-level. Per-placement credits are gone: the seats
 		// are a property of the machine, and `available_attempt_slots` already counts both
 		// running attempts and outcomes this owner has not acked (#480d).
-		w.admission, w.admissionGen = r.AdmissionState, r.AdmissionGeneration
+		w.admission, w.admissionEpoch = r.AdmissionState, r.AdmissionEpoch
 		w.observeSlots(int(r.AvailableAttemptSlots))
 		w.acceptedRevision = r.AcceptedDesiredStateRevision
 		w.convergedRevision = r.ConvergedRevision
@@ -360,7 +360,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.materialization, w.serving = status.Materialization, status.Serving
 				w.packageRevisionDigest = status.PackageRevisionDigest
 				w.environmentDigest, w.configDigest = status.EnvironmentDigest, status.ConfigDigest
-				w.generation = status.ExecutorGeneration
+				w.executorEpoch = status.ExecutorEpoch
 				w.heldSetDigest = status.PlacementSetDigest
 				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
 				w.acquisition = placementAcquisitionOf(status)
@@ -380,7 +380,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.packageRevisionDigest = status.PackageRevisionDigest
 				w.environmentDigest = status.EnvironmentDigest
 				w.configDigest = status.ConfigDigest
-				w.generation = status.ExecutorGeneration
+				w.executorEpoch = status.ExecutorEpoch
 				w.heldSetDigest = status.PlacementSetDigest
 				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
 				w.acquisition = placementAcquisitionOf(status)
@@ -481,14 +481,14 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		return
 	}
 	if status != nil {
-		c.logf("observed phase=%s accepted=%d converged=%d placement=%s %s/%s generation=%d "+
+		c.logf("observed phase=%s accepted=%d converged=%d placement=%s %s/%s epoch=%d "+
 			"admission=%s/%d slots=%d dispatchable=%d held=%d",
 			phase, r.AcceptedDesiredStateRevision, r.ConvergedRevision, status.PlacementId,
 			trimEnum(pb.MaterializationState_name[int32(status.Materialization)], "MATERIALIZATION_STATE_"),
 			trimEnum(pb.ServingState_name[int32(status.Serving)], "SERVING_STATE_"),
-			status.ExecutorGeneration,
+			status.ExecutorEpoch,
 			trimEnum(pb.AdmissionState_name[int32(r.AdmissionState)], "ADMISSION_STATE_"),
-			r.AdmissionGeneration, r.AvailableAttemptSlots,
+			r.AdmissionEpoch, r.AvailableAttemptSlots,
 			len(status.DispatchableBindingDigests), len(r.HeldAttempts))
 		return
 	}
@@ -567,8 +567,8 @@ func (c *Orchestrator) onAccepted(s *session, a *pb.AttemptAccepted) {
 	}
 	c.mu.Unlock()
 	c.settleDispatch(a.RequestId, ordinal, true)
-	c.logf("AttemptAccepted %s#%d placement=%s generation=%d plan=%s construction=%s [%s]",
-		a.RequestId, ordinal, a.PlacementId, a.ExecutorGeneration,
+	c.logf("AttemptAccepted %s#%d placement=%s epoch=%d plan=%s construction=%s [%s]",
+		a.RequestId, ordinal, a.PlacementId, a.ExecutorEpoch,
 		shortDigest(planDigest), shortDigest(construction), summary)
 	c.emit(a.RequestId, "request.accepted", ordinal, map[string]any{
 		"plan_digest": planDigest, "construction_digest": construction, "plan": summary,
@@ -1083,7 +1083,7 @@ func requeueable(status, cause, origin string, executionStarted bool) bool {
 // and settling is the conservative answer.
 func preExecution(cause string) bool {
 	switch cause {
-	case "NO_CAPACITY", "ADMISSION_GENERATION_STALE", "UNKNOWN_PLACEMENT",
+	case "NO_CAPACITY", "ADMISSION_EPOCH_STALE", "UNKNOWN_PLACEMENT",
 		"PLACEMENT_NOT_DISPATCHABLE":
 		return true
 	}

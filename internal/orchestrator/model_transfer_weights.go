@@ -37,7 +37,7 @@ func (c *Orchestrator) onModelTransferWeightsReceipt(s *session, frame *pb.Weigh
 	}
 	if err != nil || invocationDigest != attempt.InvocationDigest || frame.WeightsReceipt == nil ||
 		frame.Manifest == nil || manifestDigest == "" || frame.Manifest.Length == 0 ||
-		frame.WriterGeneration == 0 || frame.WeightsTransactionId == "" {
+		frame.WriterEpoch == 0 || frame.WeightsTransactionId == "" {
 		return
 	}
 	receipt, problem := parseWeightsReceiptRef(canonical.Doc{
