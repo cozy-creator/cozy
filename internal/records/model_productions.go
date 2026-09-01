@@ -188,9 +188,8 @@ func (s *Store) BeginModelProductionInstruction(id, digest string, instruction [
 	stored, err := scanModelProduction(tx.QueryRow(
 		`SELECT `+modelProductionCols+` FROM model_productions WHERE id=?`, id))
 	if err == nil {
-		matches := stored.State == "resolving" && stored.PlanDigest == digest &&
-			bytes.Equal(stored.Plan, instruction)
-		if stored.State != "resolving" {
+		matches := stored.PlanDigest == digest && bytes.Equal(stored.Plan, instruction)
+		if !matches && stored.State != "resolving" {
 			matches = planInstructionMatches(stored.Plan, instruction, digest)
 		}
 		if !matches {
