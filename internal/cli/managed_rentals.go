@@ -149,7 +149,7 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		return "", "", exit.New(exit.Canceled, "request %s settled before rental acquisition", req.ID)
 	}
 	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s\n", sku.Name, usdPerHour(sku.PriceUSDMicrosPerHour))
-	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name, "",
+	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name,
 		"managed-rental-"+req.ID, "",
 		sku.PriceUSDMicrosPerHour, m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID)
 	if problem != nil {

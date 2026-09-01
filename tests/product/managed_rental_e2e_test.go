@@ -23,6 +23,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rentalid"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
@@ -172,7 +173,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			}
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"rental_id": activeRentalID, "state": "pending_acquisition",
+				"rental_id": activeRentalID, "name": rentalRequest["name"], "state": "pending_acquisition",
 				"requested_accelerator_model": accelerator, "hourly_rate_usd_micros": rate,
 			})
 		case r.Method == http.MethodDelete && r.URL.Path == "/v1/rentals/"+activeRentalID:
@@ -181,12 +182,12 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/pr-idle-h200":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"rental_id": "pr-idle-h200", "state": "ready",
+				"rental_id": "pr-idle-h200", "name": "idle-h200", "state": "ready",
 				"requested_accelerator_model": "H200", "hourly_rate_usd_micros": 6_000_000,
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/pr-idle-cpu-old":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"rental_id": "pr-idle-cpu-old", "state": "ready",
+				"rental_id": "pr-idle-cpu-old", "name": "idle-cpu-old", "state": "ready",
 				"requested_accelerator_model": "CPU", "hourly_rate_usd_micros": 70_000,
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/"+activeRentalID:
@@ -199,7 +200,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 				accelerator, rate = "CPU", 70_000
 			}
 			answer := map[string]any{
-				"rental_id": activeRentalID, "state": state,
+				"rental_id": activeRentalID, "name": rentalRequest["name"], "state": state,
 				"requested_accelerator_model": accelerator, "hourly_rate_usd_micros": rate,
 			}
 			if state == "ready" {
@@ -317,6 +318,9 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 		body["sku"] != "cpu" ||
 		body["max_cost_usd_micros"] != nil || body["max_duration_seconds"] != nil {
 		t.Fatalf("managed lifecycle request=%+v posts=%d deletes=%d body=%v", request, gotPosts, gotDeletes, body)
+	}
+	if name, _ := body["name"].(string); !rentalid.ValidMachineName(name) || len(strings.Split(name, "-")) != 3 {
+		t.Fatalf("managed rental did not mint one semantic private name: %v", body)
 	}
 	if gotCreateReason != "" || gotDeleteReason != "" ||
 		strings.Contains(fmt.Sprint(body), localWeightlessRef) || strings.Contains(fmt.Sprint(body), "cozy/tiny") {

@@ -32,9 +32,11 @@ func TestManagedRentalHubRecordLossFailsClosed(t *testing.T) {
 			}})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/rentals":
 			posts.Add(1)
+			var request map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&request)
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"rental_id": "pr-wrong-replacement", "state": "failed",
+				"rental_id": "pr-wrong-replacement", "name": request["name"], "state": "failed",
 				"requested_accelerator_model": "H200", "hourly_rate_usd_micros": 6_000_000,
 			})
 		default:

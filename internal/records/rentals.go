@@ -341,9 +341,6 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 			return exit.Internalf("cannot read rental %s local identity: %s", r.ID, err)
 		}
 	}
-	if r.MachineName == "" {
-		r.MachineName = rentalid.MachineName(r.ID)
-	}
 	if r.HourlyRateUSDMicros <= 0 {
 		return exit.Named(exit.Conflict, "rental.hourly_rate_missing",
 			"rental %s has no positive locked Cozy retail hourly rate", r.ID).
@@ -361,7 +358,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 	if err == nil {
 		return exit.Named(exit.Conflict, "rental.machine_name_conflict",
 			"machine name %q already identifies rental %s", r.MachineName, conflictingID).
-			WithRemedy("choose another --name")
+			WithRemedy("use the immutable name from the original rental operation")
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return exit.Internalf("cannot check rental machine name %s: %s", r.MachineName, err)

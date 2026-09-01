@@ -20,9 +20,60 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/rentalid"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
+
+func TestPrivateRentalNamesAreSafeSemanticAndCollisionResistant(t *testing.T) {
+	seen := map[string]bool{}
+	for range 100 {
+		name, err := rentalid.NewMachineName()
+		must(t, err)
+		parts := strings.Split(name, "-")
+		if !rentalid.ValidMachineName(name) || len(parts) != 3 || len(parts[2]) != 16 {
+			t.Fatalf("generated private rental name is not adjective-noun-random: %q", name)
+		}
+		if seen[name] {
+			t.Fatalf("random private rental name repeated: %q", name)
+		}
+		seen[name] = true
+	}
+}
+
+func TestPrivateRentalNameSurvivesOperationStoreRestart(t *testing.T) {
+	layout, problem := home.Open(t.TempDir())
+	fatal(t, problem)
+	raw, problem := hub.RentalRequestBytes("lucid-wolf-0123456789abcdef", "cpu",
+		strings.Repeat("1", 64), base64.RawURLEncoding.EncodeToString(make([]byte, 32)))
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	_, replay, problem := store.BeginRentalOperation(records.RentalOperation{
+		Key: "name-restart-proof", RequestDigest: "sha256:name-restart-proof",
+		RequestBody: raw, Hub: "https://tensorhub.example", HourlyRateUSDMicros: 1,
+	}, 10)
+	fatal(t, problem)
+	if replay {
+		t.Fatal("first private rental operation was a replay")
+	}
+	store.Close()
+
+	store, problem = records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	op, problem := store.RentalOperation("name-restart-proof")
+	fatal(t, problem)
+	if op == nil {
+		t.Fatal("private rental operation disappeared across store restart")
+	}
+	request, problem := hub.ParseRentalRequestBytes(op.RequestBody)
+	fatal(t, problem)
+	if request.Name != "lucid-wolf-0123456789abcdef" {
+		t.Fatalf("private rental name after restart = %q", request.Name)
+	}
+}
 
 func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 	layout, problem := home.Open(t.TempDir())
@@ -131,7 +182,7 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 		t.Fatal("empty package/model delegation was admitted")
 	}
 
-	request, problem := hub.RentalRequestBytes("cpu", strings.Repeat("1", 64),
+	request, problem := hub.RentalRequestBytes("swift-heron-0123456789abcdef", "cpu", strings.Repeat("1", 64),
 		identity.PublicKey())
 	fatal(t, problem)
 	var body map[string]any
@@ -143,7 +194,7 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 	}
 	parsed, problem := hub.ParseRentalRequestBytes(request)
 	fatal(t, problem)
-	if parsed.SKU != "cpu" || parsed.CreatorPublicKey != identity.PublicKey() ||
+	if parsed.Name != "swift-heron-0123456789abcdef" || parsed.SKU != "cpu" || parsed.CreatorPublicKey != identity.PublicKey() ||
 		parsed.MediaTokenSHA256 != strings.Repeat("1", 64) {
 		t.Fatalf("persisted rental intent did not reopen exactly: %+v", parsed)
 	}
