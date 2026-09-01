@@ -9,6 +9,10 @@ const MaxWeightsInventoryBytes = 4 << 20
 const MaxWeightsObjects = 65536
 const MaxWeightsReadBytes = 4 << 20
 const MaxWeightsGrantURLBytes = 16 << 10
+
+// MaxInlineControlBytes is the ceiling every content-bearing bound above must respect: the
+// control stream carries control, not content. See the schema header; th-094 lands the fence.
+const MaxInlineControlBytes = 4 << 20
 const MaxModelSourceFiles = 4096
 const MaxModelSourceProfiles = 16
 const MaxModelSourceMemberBytes = 1024
