@@ -172,7 +172,12 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s · reconcile killed %d orphan(s), forgot %d stale row(s)\n",
 		l.DB, yield, killed, forgotten)
 	fmt.Fprintf(ctx.Out, "  client credential %s (%s, mode 0600)\n", creds.CLI.Digest(), l.Client)
-	fmt.Fprintf(ctx.Out, "  next: cozy run list · stop with cozy down\n")
+	if ctx.Cfg.DaemonIdleShutdown > 0 {
+		fmt.Fprintf(ctx.Out, "  next: cozy run list · stop with cozy down · exits on its own after %s with nothing to manage\n",
+			ctx.Cfg.DaemonIdleShutdown)
+	} else {
+		fmt.Fprintf(ctx.Out, "  next: cozy run list · stop with cozy down\n")
+	}
 
 	go func() { _ = http.Serve(v4, handler) }()
 	if v6 != nil {
@@ -180,8 +185,17 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 	go func() { _ = c.Serve() }()
 
+	// The idle exit takes exactly the path a SIGTERM takes: the server's shutdown hook
+	// feeds the same channel, and everything after `<-stop` is shared.
+	quit := make(chan struct{})
+	if ctx.Cfg.DaemonIdleShutdown > 0 {
+		go idleWatch{debounce: ctx.Cfg.DaemonIdleShutdown, store: st, owner: c,
+			server: server, log: ctx.Out}.run(quit)
+	}
+
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
+	close(quit)
 	fmt.Fprintln(ctx.Out, "draining package processes…")
 	closeListeners()
 	fleet.close()
