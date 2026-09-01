@@ -594,7 +594,7 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane str
 
 func handleRunCancel(ctx *Context) *exit.Error {
 	id := ctx.Inv.Args[0]
-	if strings.HasPrefix(id, "modelpub-") {
+	if strings.HasPrefix(id, "modelupload-") {
 		return handleModelProductionCancel(ctx)
 	}
 	if strings.HasPrefix(id, "job-") {
@@ -675,7 +675,7 @@ func handleRunList(ctx *Context) *exit.Error {
 		}
 		list.Rows = append(list.Rows, map[string]string{
 			"id": production.ID, "kind": production.Kind,
-			"target": production.Model + "@" + production.Release,
+			"target": production.Model,
 			"status": production.Status, "attempts": "1", "created": production.CreatedAt,
 		})
 		states[production.Status]++

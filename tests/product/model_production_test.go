@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -31,7 +30,7 @@ import (
 func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.T) {
 	var stderr bytes.Buffer
 	progress := cli.NewModelProductionProgress(&stderr, true, 10)
-	progress.Accepted("modelpub-proof", 4)
+	progress.Accepted("modelupload-proof", 4)
 	progress.RentalSelecting("h200-sxm")
 	progress.RentalReady("rental-1", "ready", "h200-sxm")
 	progress.WorkerWaiting("rental-1")
@@ -57,15 +56,13 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 		progress.StepStarting(index, name, callable, false)
 		progress.StepCompleted(index, name, callable)
 	}
-	lanes := []string{"bf16-adaln-pruned", "bf16-full", "fp8-adaln-pruned", "mxfp8-adaln-pruned"}
-	progress.ReleaseStarting("1.0.0", lanes)
-	progress.ReleaseCut("1.0.0", len(lanes))
+	progress.OutputsRetained(4)
 	progress.RentalReleaseStarting("rental-1")
 	progress.RentalReleased("rental-1")
 
 	human := stderr.String()
 	for _, want := range []string{
-		"Model production modelpub-proof accepted: 10 steps, 4 lanes.",
+		"Model upload modelupload-proof accepted: 10 steps, 4 outputs.",
 		"Rental rental-1: ready (h200-sxm).",
 		"Worker: ready on rental rental-1.",
 		"Source: preparing 27 files (100.0MiB).",
@@ -75,9 +72,9 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 		"Step 1/10: assemble-full — constructing (20%).",
 		"Step 1/10: assemble-full — verifying (10%).",
 		"Artifact: adopted output 1/1 for step 1/10 assemble-full.",
-		"Publication: lane bf16-full prepared.",
+		"Checkpoint: output bf16-full retained.",
 		"Step 1/10: completed assemble-full (tensorhub/minimax-h3-tools/assemble).",
-		"Release: 1.0.0 cut atomically with 4 lanes.",
+		"Upload: retained 4 owner-only checkpoints.",
 		"Cleanup: rental rental-1 released; provider absence confirmed.",
 	} {
 		if !strings.Contains(human, want) {
@@ -133,7 +130,7 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 	defer accountServer.Close()
 	code, stdout, jsonStderr := runCozyDirStreams(t, root, ".",
 		[]string{"TENSORHUB_URL=" + accountServer.URL, "TENSORHUB_TOKEN=proof-token"},
-		"--json", "model", "publish", "acme/proof", source, "--release", "1.0.0", "--dry-run")
+		"--json", "model", "upload", "acme/proof", source, "--dry-run")
 	var document map[string]any
 	if code != 0 || json.Unmarshal([]byte(stdout), &document) != nil || document["status"] != "planned" ||
 		strings.TrimSpace(jsonStderr) != "" {
@@ -182,9 +179,9 @@ func TestForeignModelProductionRefusesBeforeWriteOrSpend(t *testing.T) {
 		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\n"), 0o600))
 	daemon := startDaemonProcess(t, root)
 	instruction := modelproduction.Instruction{
-		Destination: "foreign/output", Release: "1.0.0",
-		Source:   "hf://source/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		Producer: "proof/tools@v1/build", Rental: true,
+		Destination: "foreign/output",
+		Source:      "hf://source/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Producer:    "proof/tools@v1/build", Rental: true,
 	}
 	reply := daemon.call(t, http.MethodPost, "/v1/local/model-productions",
 		map[string]any{"instruction": instruction})
@@ -256,7 +253,7 @@ func TestModelProductionSourceRequestHonorsCancellationContext(t *testing.T) {
 }
 
 func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.T) {
-	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}],"models":[{"class":"ProofModel","component_use":{},"path":"assemble.models.source","stamps":{}}],"name":"assemble","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-producer@v2/assemble","models":{"source":"source"},"name":"assemble","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}},{"callable":"proof/remote-job@v3/derive","models":{"source":"assemble.model"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
+	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}],"models":[{"class":"ProofModel","component_use":{},"path":"assemble.models.source","stamps":{}}],"name":"assemble","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-producer@v2/assemble","models":{"source":"source"},"name":"assemble","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}},{"callable":"proof/remote-job@v3/derive","models":{"source":"assemble.model"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
 	producer, problem := launch.DecodeDescriptor(producerBytes)
 	fatal(t, problem)
 	if _, invalid := launch.DecodeDescriptor(bytes.ReplaceAll(producerBytes,
@@ -346,8 +343,8 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
 		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\nrentals:\n  max_hourly_spend_usd: 10\n"), 0o600))
 	code, out := runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
-		"--json", "--full", "model", "publish", "acme/output", "acme/input@1.0.0",
-		"--release", "1.0.0", "--producer", "proof/remote-producer@v2/build",
+		"--json", "--full", "model", "upload", "acme/output", "acme/input@1.0.0",
+		"--producer", "proof/remote-producer@v2/build",
 		"--rental", "--dry-run")
 	if code != 0 || !strings.Contains(out, `"status":"planned"`) ||
 		!strings.Contains(out, `"producer":"proof/remote-producer@v2/build@2.0.0"`) {
@@ -371,14 +368,14 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 	requests = nil
 	producerCardReads = 0
 	code, out = runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
-		"model", "publish", "acme/output", "acme/input@1.0.0", "--release", "1.0.0",
+		"model", "upload", "acme/output", "acme/input@1.0.0",
 		"--producer", "proof/remote-producer@v2/build", "--rental", "--dry-run")
 	if code == 0 || !strings.Contains(out, "no active immutable release in v3") {
 		t.Fatalf("missing production callable major [exit %d]\n%s", code, out)
 	}
 	requests = nil
 	code, out = runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
-		"model", "publish", "acme/output", "acme/input@1.0.0", "--release", "1.0.0",
+		"model", "upload", "acme/output", "acme/input@1.0.0",
 		"--producer", "proof/remote-producer@v2/build", "--dry-run")
 	if code == 0 || !strings.Contains(out, "not installed") {
 		t.Fatalf("local production stopped requiring a local install [exit %d]\n%s", code, out)
@@ -389,7 +386,7 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 }
 
 func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *testing.T) {
-	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-job@v3/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
+	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-job@v3/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
 	producer, problem := launch.DecodeDescriptor(producerBytes)
 	fatal(t, problem)
 	jobBytes := []byte(`{"application":"remote_job:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}],"models":[{"class":"ProofModel","component_use":{},"path":"derive.models.source","stamps":{}}],"name":"derive","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}],"model_productions":[]}`)
@@ -468,12 +465,12 @@ func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *test
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
 		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\nrentals:\n  max_hourly_spend_usd: 10\n"), 0o600))
-	args := []string{"--json", "--full", "model", "publish", "acme/output", "acme/input@1.0.0",
-		"--release", "1.0.0", "--producer", "proof/remote-producer/build", "--rental", "--detach"}
+	args := []string{"--json", "--full", "model", "upload", "acme/output", "acme/input@1.0.0",
+		"--producer", "proof/remote-producer/build", "--rental", "--detach"}
 	code, out := runCozy(t, root, args...)
 	var accepted api.ModelProductionState
 	if err := json.Unmarshal([]byte(out), &accepted); code != 0 || err != nil ||
-		!strings.HasPrefix(accepted.ID, "modelpub-") || accepted.Kind != "model-publication" {
+		!strings.HasPrefix(accepted.ID, "modelupload-") || accepted.Kind != "model-upload" {
 		t.Fatalf("detached acceptance [exit %d, parse %v]\n%s", code, err, out)
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -574,13 +571,13 @@ func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *test
 
 func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) {
 	instruction := modelproduction.Instruction{
-		Destination: "tensorhub/minimax-h3", Release: "h3-2026-08-31",
-		Source:   "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("a", 40),
-		Producer: "tensorhub/minimax-h3-tools/four-lane", Rental: true,
+		Destination: "tensorhub/minimax-h3",
+		Source:      "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("a", 40),
+		Producer:    "tensorhub/minimax-h3-tools/four-lane", Rental: true,
 	}
 	plan := modelproduction.Plan{
-		Instruction: instruction,
-		Destination: "tensorhub/minimax-h3", Release: "1.0.0",
+		Instruction:     instruction,
+		Destination:     "tensorhub/minimax-h3",
 		Source:          "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("a", 40),
 		SourceSelection: "sha256:" + strings.Repeat("b", 64),
 		SourceFiles: []modelproduction.SourceFile{{
@@ -664,15 +661,15 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 	}
 }
 
-func TestModelProductionCancelCutOrderingAndUnattachedProviderAbsence(t *testing.T) {
+func TestModelProductionCancelCheckpointOrderingAndUnattachedProviderAbsence(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
 	fatal(t, problem)
-	makeOperation := func(release string) (string, modelproduction.Plan) {
-		instruction := modelproduction.Instruction{Destination: "acme/model", Release: release,
-			Source:   "hf://acme/model@" + strings.Repeat("a", 40),
+	makeOperation := func(key string) (string, modelproduction.Plan) {
+		instruction := modelproduction.Instruction{Destination: "acme/model",
+			Source:   "hf://acme/model@" + strings.Repeat(key, 40),
 			Producer: "acme/tools/build", Rental: true}
 		plan := modelproduction.Plan{Instruction: instruction, Destination: instruction.Destination,
-			Release: release, Source: instruction.Source}
+			Source: instruction.Source}
 		instructionBytes, err := instruction.Bytes()
 		must(t, err)
 		instructionDigest, err := instruction.Digest()
@@ -693,7 +690,7 @@ func TestModelProductionCancelCutOrderingAndUnattachedProviderAbsence(t *testing
 		fatal(t, store.AdvanceModelProduction(instruction.ID(), "step_running", "outputs_preparing", 1, "rental-proof"))
 		return instruction.ID(), plan
 	}
-	beforeID, _ := makeOperation("before-cut")
+	beforeID, _ := makeOperation("a")
 	fatal(t, store.RequestModelProductionCancel(beforeID))
 	fatal(t, store.CancelModelProduction(beforeID, "outputs_preparing", "cancel won before cut"))
 	before, problem := store.ModelProduction(beforeID)
@@ -702,10 +699,9 @@ func TestModelProductionCancelCutOrderingAndUnattachedProviderAbsence(t *testing
 		t.Fatalf("cancel-before-cut state = %+v", before)
 	}
 
-	afterID, _ := makeOperation("after-cut")
-	fatal(t, store.AdvanceModelProduction(afterID, "outputs_preparing", "release_cut", 1, "rental-proof"))
+	afterID, _ := makeOperation("b")
+	fatal(t, store.AdvanceModelProduction(afterID, "outputs_preparing", "cleanup_pending", 1, "rental-proof"))
 	fatal(t, store.RequestModelProductionCancel(afterID))
-	fatal(t, store.AdvanceModelProduction(afterID, "release_cut", "cleanup_pending", 1, "rental-proof"))
 	fatal(t, store.AdvanceModelProduction(afterID, "cleanup_pending", "completed", 1, "rental-proof"))
 	after, problem := store.ModelProduction(afterID)
 	fatal(t, problem)
@@ -753,28 +749,9 @@ func TestModelProductionCancelCutOrderingAndUnattachedProviderAbsence(t *testing
 	}
 }
 
-func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.T) {
-	var mu sync.Mutex
-	cutBodies := []string{}
+func TestModelUploadPreparedOutputsCompleteAfterDaemonRestart(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/models/acme/output/releases/ambiguous":
-			body, _ := io.ReadAll(r.Body)
-			mu.Lock()
-			cutBodies = append(cutBodies, string(body))
-			attempt := len(cutBodies)
-			mu.Unlock()
-			w.Header().Set("Content-Type", "application/json")
-			if attempt == 1 {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				_, _ = io.WriteString(w, `{"error":{"code":"cut_unavailable","message":"cut response was lost"}}`)
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"operation": "modelpub-proof", "release": "ambiguous",
-				"repository_sha256": "sha256:" + strings.Repeat("f", 64), "duplicate": true,
-				"lanes": []map[string]any{{"lane": "bf16", "checkpoint_id": "sha256:" + strings.Repeat("d", 64)}},
-			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/rental-cut-proof":
 			http.NotFound(w, r)
 		default:
@@ -789,15 +766,15 @@ func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
-	instruction := modelproduction.Instruction{Destination: "acme/output", Release: "ambiguous",
+	instruction := modelproduction.Instruction{Destination: "acme/output",
 		Source:   "hf://acme/model@" + strings.Repeat("a", 40),
 		Producer: "acme/tools/build", Rental: true}
 	production := &launch.ModelProduction{Name: "build", Sources: map[string]string{"source": "proof/source/1"},
 		Steps: []launch.ModelProductionStep{{Name: "derive", Callable: "acme/job@v1/derive",
 			Models: map[string]string{"source": "source"}, Outputs: []string{"model"}}},
-		Outputs: []launch.ModelProductionOutput{{Name: "bf16", Source: "derive.model", LaneKey: "bf16"}}}
+		Outputs: []launch.ModelProductionOutput{{Name: "bf16", Source: "derive.model"}}}
 	plan := modelproduction.Plan{Instruction: instruction, Destination: instruction.Destination,
-		Release: instruction.Release, Source: instruction.Source, Producer: instruction.Producer,
+		Source: instruction.Source, Producer: instruction.Producer,
 		Production: production, Jobs: []modelproduction.JobPin{{Step: "derive", Callable: "acme/job@v1/derive"}}}
 	instructionBytes, err := instruction.Bytes()
 	must(t, err)
@@ -848,11 +825,8 @@ func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.
 	operation, problem := store.ModelProduction(instruction.ID())
 	store.Close()
 	fatal(t, problem)
-	mu.Lock()
-	bodies := append([]string(nil), cutBodies...)
-	mu.Unlock()
-	if operation == nil || operation.State != "completed" || len(bodies) != 2 || bodies[0] != bodies[1] {
-		t.Fatalf("ambiguous cut recovery = operation %+v bodies %#v", operation, bodies)
+	if operation == nil || operation.State != "completed" {
+		t.Fatalf("prepared output recovery = operation %+v", operation)
 	}
 	terminateTestDaemon(t, root)
 }
@@ -861,7 +835,7 @@ func TestModelProductionJoinsStepArtifactAndTransferBeforeReplay(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
 	fatal(t, problem)
 	defer store.Close()
-	plan := modelproduction.Plan{Destination: "acme/model", Release: "1.0.0",
+	plan := modelproduction.Plan{Destination: "acme/model",
 		Source:          "hf://acme/model@" + strings.Repeat("a", 40),
 		SourceSelection: "sha256:" + strings.Repeat("b", 64)}
 	data, err := plan.Bytes()

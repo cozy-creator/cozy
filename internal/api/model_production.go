@@ -23,26 +23,24 @@ type ModelProductionController interface {
 }
 
 type ModelProductionState struct {
-	ID              string   `json:"id"`
-	Kind            string   `json:"kind"`
-	Model           string   `json:"model"`
-	Release         string   `json:"release"`
-	Source          string   `json:"source"`
-	Producer        string   `json:"producer,omitempty"`
-	Status          string   `json:"status"`
-	StepIndex       int64    `json:"step_index"`
-	Steps           int      `json:"steps"`
-	Lanes           []string `json:"lanes,omitempty"`
-	ManifestIDs     []string `json:"manifest_ids,omitempty"`
-	Rental          string   `json:"rental,omitempty"`
-	CancelRequested bool     `json:"cancel_requested"`
-	Committed       bool     `json:"committed"`
-	Cleanup         string   `json:"cleanup"`
-	ErrorCode       string   `json:"error_code,omitempty"`
-	Error           string   `json:"error,omitempty"`
-	CreatedAt       string   `json:"created_at"`
-	UpdatedAt       string   `json:"updated_at"`
-	Changed         bool     `json:"changed"`
+	ID              string            `json:"id"`
+	Kind            string            `json:"kind"`
+	Model           string            `json:"model"`
+	Source          string            `json:"source"`
+	Producer        string            `json:"producer,omitempty"`
+	Status          string            `json:"status"`
+	StepIndex       int64             `json:"step_index"`
+	Steps           int               `json:"steps"`
+	Outputs         []string          `json:"outputs,omitempty"`
+	Checkpoints     map[string]string `json:"checkpoints,omitempty"`
+	Rental          string            `json:"rental,omitempty"`
+	CancelRequested bool              `json:"cancel_requested"`
+	Cleanup         string            `json:"cleanup"`
+	ErrorCode       string            `json:"error_code,omitempty"`
+	Error           string            `json:"error,omitempty"`
+	CreatedAt       string            `json:"created_at"`
+	UpdatedAt       string            `json:"updated_at"`
+	Changed         bool              `json:"changed"`
 }
 
 func (s *Server) submitModelProduction(w http.ResponseWriter, r *http.Request) {
@@ -158,7 +156,7 @@ func (s *Server) cancelModelProduction(w http.ResponseWriter, r *http.Request) {
 func (s *Server) modelProductionState(operation records.ModelProductionOperation,
 	changed bool,
 ) (ModelProductionState, *exit.Error) {
-	state := ModelProductionState{ID: operation.ID, Kind: "model-publication",
+	state := ModelProductionState{ID: operation.ID, Kind: "model-upload",
 		Status: operation.State, StepIndex: operation.StepIndex, Rental: operation.RentalID,
 		CancelRequested: operation.CancelRequested, ErrorCode: operation.SafeCode,
 		Error: operation.SafeDetail, CreatedAt: operation.CreatedAt, UpdatedAt: operation.UpdatedAt,
@@ -168,22 +166,18 @@ func (s *Server) modelProductionState(operation records.ModelProductionOperation
 		if err != nil {
 			return state, exit.Internalf("cannot read model production %s instruction: %s", operation.ID, err)
 		}
-		state.Model, state.Release, state.Source = instruction.Destination, instruction.Release, instruction.Source
+		state.Model, state.Source = instruction.Destination, instruction.Source
 		state.Producer = instruction.Producer
 	} else {
 		plan, err := modelproduction.Parse(operation.Plan)
 		if err != nil {
 			return state, exit.Internalf("cannot read model production %s plan: %s", operation.ID, err)
 		}
-		state.Model, state.Release, state.Source = plan.Destination, plan.Release, plan.Source
-		state.Producer, state.Lanes, state.Steps = plan.Producer, plan.Lanes(), len(plan.Jobs)
-	}
-	switch operation.State {
-	case "release_cut", "cleanup_pending", "completed":
-		state.Committed = true
+		state.Model, state.Source = plan.Destination, plan.Source
+		state.Producer, state.Outputs, state.Steps = plan.Producer, plan.OutputNames(), len(plan.Jobs)
 	}
 	switch {
-	case operation.State == "cleanup_pending" || operation.State == "release_cut":
+	case operation.State == "cleanup_pending":
 		state.Cleanup = "pending"
 	case operation.State == "completed" && operation.RentalID != "":
 		state.Cleanup = "provider_absent"
@@ -196,11 +190,20 @@ func (s *Server) modelProductionState(operation records.ModelProductionOperation
 	if problem != nil {
 		return state, problem
 	}
-	seen := map[string]bool{}
-	for _, artifact := range artifacts {
-		if artifact.ManifestID != "" && !seen[artifact.ManifestID] {
-			seen[artifact.ManifestID] = true
-			state.ManifestIDs = append(state.ManifestIDs, artifact.ManifestID)
+	if operation.State != "resolving" {
+		plan, _ := modelproduction.Parse(operation.Plan)
+		bySource := make(map[string]records.ModelProductionArtifact, len(artifacts))
+		for _, artifact := range artifacts {
+			bySource[artifact.StepName+"."+artifact.OutputSlot] = artifact
+		}
+		for _, output := range plan.Production.Outputs {
+			artifact, ok := bySource[output.Source]
+			if ok && artifact.PublicationID != "" && artifact.ManifestID != "" {
+				if state.Checkpoints == nil {
+					state.Checkpoints = map[string]string{}
+				}
+				state.Checkpoints[output.Name] = artifact.ManifestID
+			}
 		}
 	}
 	return state, nil

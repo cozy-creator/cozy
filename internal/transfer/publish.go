@@ -34,12 +34,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
-const modelPublicationOperationVersion = "model-publication-named-lane/1\x00"
+const modelUploadOperationVersion = "model-checkpoint-upload/1\x00"
 
-// PublicationOperationID binds one named-lane publication intent. The version
-// keeps operations opened under older request semantics out of this replay key.
-func PublicationOperationID(ref hub.Ref, release, lane, manifestID string) string {
-	subject := modelPublicationOperationVersion + ref.String() + "\x00" + release + "\x00" + lane + "\x00" + manifestID
+// CheckpointOperationID binds one checkpoint upload intent.
+func CheckpointOperationID(ref hub.Ref, manifestID string) string {
+	subject := modelUploadOperationVersion + ref.String() + "\x00" + manifestID
 	sum := sha256.Sum256([]byte(subject))
 	return "manifest-" + hex.EncodeToString(sum[:])
 }
@@ -48,8 +47,8 @@ func PublicationOperationID(ref hub.Ref, release, lane, manifestID string) strin
 // clock — see `mover`. The 30-minute constant that used to live here said in its own
 // comment that it was standing in for a byte meter.
 
-// Publish is one incremental model publication, start to finish.
-type Publish struct {
+// Upload is one incremental owner-only checkpoint upload, start to finish.
+type Upload struct {
 	Tool *tfs.Tool
 	Hub  *hub.Client
 	Ref  hub.Ref
@@ -59,8 +58,6 @@ type Publish struct {
 	EvidenceRef hub.Ref
 	// ManifestID is the local canonical manifest being published.
 	ManifestID string
-	Release    string
-	Lane       string
 	Session    string
 	Reason     string
 	DryRun     bool
@@ -71,7 +68,7 @@ type Publish struct {
 	Scratch string
 }
 
-// Result is what a publish did.
+// Result is what an upload did.
 type Result struct {
 	PublishID string
 	Created   bool
@@ -87,23 +84,19 @@ type Result struct {
 	Deduped        int64
 	Manifest       hub.ManifestRef
 	TopologyDigest string
-	CutOperation   string
-	RepositorySHA  string
 	Dup            bool
 	MS             map[string]int64
 }
 
-func (p *Publish) say(format string, args ...any) {
+func (p *Upload) say(format string, args ...any) {
 	if p.Progress != nil {
 		p.Progress(fmt.Sprintf(format, args...))
 	}
 }
 
-// Run opens an incremental publication, claims the exact known-object transfers,
-// uploads only what is not already accepted, finalizes the server-derived output,
-// then cuts that one publication into the release. Tensorhub's rows are the only
-// restart journal.
-func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
+// Run uploads only missing objects and finalizes one owner-only checkpoint.
+// Release pointers are a separate operation.
+func (p *Upload) Run(ctx context.Context) (Result, *exit.Error) {
 	var res Result
 	ms := map[string]int64{}
 	res.MS = ms
@@ -219,10 +212,10 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 		p.say("0 bytes to upload: every transfer is ready for final verification")
 	}
 
-	return p.finalizeAndCut(ctx, finalize, res, ms)
+	return p.finalize(ctx, finalize, res, ms)
 }
 
-func (p *Publish) finalizeAndCut(ctx context.Context, request hub.FinalizePublicationRequest,
+func (p *Upload) finalize(ctx context.Context, request hub.FinalizePublicationRequest,
 	res Result, ms map[string]int64,
 ) (Result, *exit.Error) {
 	t0 := time.Now()
@@ -239,30 +232,12 @@ func (p *Publish) finalizeAndCut(ctx context.Context, request hub.FinalizePublic
 		return res, exit.Internalf("Tensorhub retained a different checkpoint identity")
 	}
 	res.Manifest, res.TopologyDigest, res.Verified = checkpoint.Manifest, checkpoint.TopologyDigest, checkpoint.Objects
+	res.Dup = checkpoint.Duplicate
 	if checkpoint.Duplicate {
 		p.say("this exact checkpoint was already retained")
 	}
 	p.say("Tensorhub verified %d declared objects and retained checkpoint %s", res.Verified, checkpoint.CheckpointID)
 
-	t0 = time.Now()
-	res.CutOperation = "cut-" + res.PublishID
-	cut, e := p.Hub.CutRelease(ctx, p.Ref, p.Release, res.CutOperation,
-		map[string]string{p.Lane: checkpoint.CheckpointID}, p.Reason)
-	if e != nil {
-		return res, e
-	}
-	ms["cut"] = since(t0)
-	if cut.Operation != res.CutOperation || cut.Release != p.Release || len(cut.Lanes) != 1 ||
-		cut.Lanes[0].Lane != p.Lane || cut.Lanes[0].Manifest != checkpoint.Manifest ||
-		cut.Lanes[0].Checkpoint != checkpoint.CheckpointID || cut.Lanes[0].Objects != checkpoint.Objects ||
-		cut.Lanes[0].Bytes != checkpoint.Bytes {
-		return res, exit.Internalf("Tensorhub cut a different release output")
-	}
-	res.RepositorySHA, res.Dup = cut.RepositorySHA256, cut.Duplicate
-	if res.Dup {
-		p.say("this exact release cut was already committed")
-	}
-	p.say("Tensorhub cut release %s with lane %s", p.Release, p.Lane)
 	p.say("timing: %s", Timing(ms))
 	return res, nil
 }
@@ -305,7 +280,7 @@ type uploadOutcome struct {
 	err      *exit.Error
 }
 
-func (p *Publish) upload(ctx context.Context, transfers []hub.Transfer, res *Result, ms map[string]int64) *exit.Error {
+func (p *Upload) upload(ctx context.Context, transfers []hub.Transfer, res *Result, ms map[string]int64) *exit.Error {
 	started := time.Now()
 	for offset := 0; offset < len(transfers); offset += publicationObjectBatch {
 		end := min(offset+publicationObjectBatch, len(transfers))
@@ -319,7 +294,7 @@ func (p *Publish) upload(ctx context.Context, transfers []hub.Transfer, res *Res
 	return nil
 }
 
-func (p *Publish) uploadBatch(ctx context.Context, transfers []hub.Transfer, indexBase int,
+func (p *Upload) uploadBatch(ctx context.Context, transfers []hub.Transfer, indexBase int,
 	res *Result,
 ) *exit.Error {
 	objectIDs := make([]string, 0, len(transfers))
@@ -423,7 +398,7 @@ func (p *Publish) uploadBatch(ctx context.Context, transfers []hub.Transfer, ind
 	return primary
 }
 
-func (p *Publish) uploadOne(ctx context.Context, index int, transfer hub.Transfer, grant hub.Grant,
+func (p *Upload) uploadOne(ctx context.Context, index int, transfer hub.Transfer, grant hub.Grant,
 ) uploadOutcome {
 	outcome := uploadOutcome{index: index}
 	staged := filepath.Join(p.Scratch, fmt.Sprintf("object-%06d", index))

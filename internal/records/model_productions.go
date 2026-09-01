@@ -462,8 +462,7 @@ func modelProductionTransition(from, to string) bool {
 		"source_prepared\x00step_running",
 		"step_running\x00step_running",
 		"step_running\x00outputs_preparing",
-		"outputs_preparing\x00release_cut",
-		"release_cut\x00cleanup_pending",
+		"outputs_preparing\x00cleanup_pending",
 		"cleanup_pending\x00completed":
 		return true
 	}

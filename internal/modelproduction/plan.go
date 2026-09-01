@@ -35,7 +35,6 @@ type SourceFile struct {
 // descriptor, source inventory, worker, rental, price, credential, and attempt fact.
 type Instruction struct {
 	Destination string `json:"destination"`
-	Release     string `json:"release"`
 	Source      string `json:"source"`
 	InputLane   string `json:"input_lane,omitempty"`
 	Producer    string `json:"producer"`
@@ -73,14 +72,13 @@ func (i Instruction) Digest() (string, error) {
 
 func (i Instruction) ID() string {
 	data, _ := i.Bytes()
-	sum := sha256.Sum256(append([]byte("cozy-model-production-instruction/1\x00"), data...))
-	return "modelpub-" + hex.EncodeToString(sum[:])
+	sum := sha256.Sum256(append([]byte("cozy-model-upload-instruction/1\x00"), data...))
+	return "modelupload-" + hex.EncodeToString(sum[:])
 }
 
 type Plan struct {
 	Instruction       Instruction
 	Destination       string
-	Release           string
 	Source            string
 	SourceSelection   string
 	SourceLicense     string
@@ -137,14 +135,14 @@ func (p Plan) Digest() (string, error) {
 
 // ID is stable across detach/follow, attempts, rental replacement, capability
 // refresh, pricing, and replay. Descriptor identity already binds step edges,
-// assets, resources, required outputs, lane keys, and required contracts.
+// assets, resources, required output names, and required contracts.
 func (p Plan) ID() string {
 	if p.Instruction.Destination != "" {
 		return p.Instruction.ID()
 	}
 	hash := sha256.New()
 	for _, value := range []string{
-		"cozy-model-production/1", p.Destination, p.Release, p.Source,
+		"cozy-model-upload/1", p.Destination, p.Source,
 		p.SourceSelection, p.SourceLicense, p.InputLane, p.Producer,
 		p.ProducerInstallID, p.ProducerRelease, p.ProducerDigest,
 		p.DescriptorDigest,
@@ -172,19 +170,19 @@ func (p Plan) ID() string {
 		_, _ = io.WriteString(hash, fmt.Sprint(value))
 		_, _ = hash.Write([]byte{0})
 	}
-	return "modelpub-" + hex.EncodeToString(hash.Sum(nil))
+	return "modelupload-" + hex.EncodeToString(hash.Sum(nil))
 }
 
-func (p Plan) Lanes() []string {
+func (p Plan) OutputNames() []string {
 	if p.Production == nil {
 		return nil
 	}
-	lanes := make([]string, 0, len(p.Production.Outputs))
+	names := make([]string, 0, len(p.Production.Outputs))
 	for _, output := range p.Production.Outputs {
-		lanes = append(lanes, output.LaneKey)
+		names = append(names, output.Name)
 	}
-	sort.Strings(lanes)
-	return lanes
+	sort.Strings(names)
+	return names
 }
 
 func (p Plan) SourceProfiles() []string {

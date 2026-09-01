@@ -125,39 +125,53 @@ func TestModelProductionGrammar(t *testing.T) {
 	}))
 	defer server.Close()
 	accountEnv := []string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}
-	code, help := runCozy(t, root, "model", "publish", "--help")
+	code, help := runCozy(t, root, "model", "upload", "--help")
 	if code != 0 || !strings.Contains(help, "<source>") ||
-		!strings.Contains(help, "--release") || !strings.Contains(help, "--producer") ||
+		strings.Contains(help, "--release") || !strings.Contains(help, "--producer") ||
 		!strings.Contains(help, "--lane") || !strings.Contains(help, "--rental") ||
 		!strings.Contains(help, "--dry-run") || !strings.Contains(help, "--detach") ||
 		strings.Contains(help, "<manifest>") || strings.Contains(help, "--token-stdin") ||
 		strings.Contains(help, "--cloud") || strings.Contains(help, "--remote") ||
 		strings.Contains(help, "--machine") || strings.Contains(help, "--max-cost") {
-		t.Fatalf("model publish grammar drifted [exit %d]\n%s", code, help)
+		t.Fatalf("model upload grammar drifted [exit %d]\n%s", code, help)
 	}
-	code, out := runCozy(t, root, "model", "publish", "acme/model",
-		"hf://acme/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	if code != 2 || !strings.Contains(out, "--release") {
-		t.Fatalf("model publish accepted missing release [exit %d]\n%s", code, out)
+	code, out := runCozy(t, root, "model", "upload", "acme/model")
+	if code != 2 || !strings.Contains(out, "<source>") {
+		t.Fatalf("model upload accepted missing source [exit %d]\n%s", code, out)
 	}
 	local := filepath.Join(root, "source.safetensors")
 	must(t, os.WriteFile(local, []byte("header-only-grammar-fixture"), 0o600))
-	code, out = runCozyDir(t, root, ".", accountEnv, "--json", "model", "publish", "acme/model", local,
-		"--release", "1.2.3", "--dry-run")
-	if code != 0 || !strings.Contains(out, `"kind":"model-publication"`) ||
-		!strings.Contains(out, `"status":"planned"`) || !strings.Contains(out, `"id":"modelpub-`) {
+	code, out = runCozyDir(t, root, ".", accountEnv, "--json", "model", "upload", "acme/model", local,
+		"--dry-run")
+	if code != 0 || !strings.Contains(out, `"kind":"model-upload"`) ||
+		!strings.Contains(out, `"status":"planned"`) || !strings.Contains(out, `"id":"modelupload-`) {
 		t.Fatalf("source-driven dry-run failed [exit %d]\n%s", code, out)
 	}
-	code, out = runCozyDir(t, root, ".", accountEnv, "model", "publish", "other/model", local,
-		"--release", "1.2.3", "--dry-run")
+	code, out = runCozyDir(t, root, ".", accountEnv, "model", "upload", "other/model", local,
+		"--dry-run")
 	if code != 2 || !strings.Contains(out, "logged in as Tensorhub account acme") ||
 		!strings.Contains(out, "publish as acme/model") {
 		t.Fatalf("cross-account model publication was not refused [exit %d]\n%s", code, out)
 	}
-	code, out = runCozy(t, root, "model", "publish", "acme/model", local,
-		"--release", "1.2.3", "--dry-run", "--detach")
+	code, out = runCozy(t, root, "model", "upload", "acme/model", local,
+		"--dry-run", "--detach")
 	if code != 2 || !strings.Contains(out, "conflict") {
 		t.Fatalf("dry-run plus detach was accepted [exit %d]\n%s", code, out)
+	}
+	code, help = runCozy(t, root, "model", "publish", "--help")
+	if code != 0 || strings.Contains(help, "<source>") || !strings.Contains(help, "--release") ||
+		!strings.Contains(help, "--lane") || !strings.Contains(help, "--remove-lane") ||
+		strings.Contains(help, "--producer") || strings.Contains(help, "--rental") ||
+		strings.Contains(help, "--dry-run") || strings.Contains(help, "--detach") {
+		t.Fatalf("model publish grammar drifted [exit %d]\n%s", code, help)
+	}
+	code, out = runCozy(t, root, "model", "publish", "acme/model", "--release", "1.2.3")
+	if code != 2 || !strings.Contains(out, "requires --lane") {
+		t.Fatalf("model publish accepted no lane changes [exit %d]\n%s", code, out)
+	}
+	code, help = runCozy(t, root, "model", "yank", "--help")
+	if code != 0 || !strings.Contains(help, "--release") {
+		t.Fatalf("model yank grammar drifted [exit %d]\n%s", code, help)
 	}
 	code, help = runCozy(t, root, "model", "download", "--help")
 	if code != 0 || strings.Contains(strings.ToLower(help), "snapshot") {

@@ -342,7 +342,7 @@ func TestCompactPackageDescriptor(t *testing.T) {
 }
 
 func TestModelProductionDescriptor(t *testing.T) {
-	raw := []byte(`{"application":"producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"two-lane","steps":[{"callable":"tensorhub/quantize@v1/fp8","models":{"source":"assemble.model"},"name":"quantize","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g"}},{"callable":"tensorhub/minimax-h3-tools@v2/assemble","models":{"dits":"dits","shared":"shared"},"name":"assemble","outputs":["model"]}],"outputs":[{"lane_key":"bf16-full","name":"full","required_contract":{"encodings":["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"source":"assemble.model"},{"lane_key":"fp8-pruned","name":"fp8","required_contract":{"encodings":["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"],"topology_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"source":"quantize.model"}],"sources":{"dits":"hf/minimax-h3/native-dits-bf16","shared":"hf/minimax-h3/shared-diffusers"}}]}`)
+	raw := []byte(`{"application":"producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"two-lane","steps":[{"callable":"tensorhub/quantize@v1/fp8","models":{"source":"assemble.model"},"name":"quantize","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g"}},{"callable":"tensorhub/minimax-h3-tools@v2/assemble","models":{"dits":"dits","shared":"shared"},"name":"assemble","outputs":["model"]}],"outputs":[{"name":"full","required_contract":{"encodings":["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"source":"assemble.model"},{"name":"fp8","required_contract":{"encodings":["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"],"topology_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"source":"quantize.model"}],"sources":{"dits":"hf/minimax-h3/native-dits-bf16","shared":"hf/minimax-h3/shared-diffusers"}}]}`)
 	descriptor, problem := launch.DecodeDescriptor(raw)
 	fatal(t, problem)
 	production, problem := descriptor.Production("two-lane")
@@ -363,8 +363,10 @@ func TestModelProductionDescriptor(t *testing.T) {
 			[]byte(`hf/minimax-h3/native-dits-bf16`), []byte(`../native-dits-bf16`), 1),
 		"unknown edge": bytes.Replace(raw,
 			[]byte(`"source":"assemble.model"`), []byte(`"source":"missing.model"`), 1),
-		"duplicate lane": bytes.Replace(raw,
-			[]byte(`"lane_key":"fp8-pruned"`), []byte(`"lane_key":"bf16-full"`), 1),
+		"duplicate output": bytes.Replace(raw,
+			[]byte(`"name":"fp8"`), []byte(`"name":"full"`), 1),
+		"retired lane key": bytes.Replace(raw,
+			[]byte(`"name":"fp8"`), []byte(`"lane_key":"fp8","name":"fp8"`), 1),
 		"zero gpu":               bytes.Replace(raw, []byte(`"gpu_count":1`), []byte(`"gpu_count":0`), 1),
 		"unversioned callable":   bytes.Replace(raw, []byte(`quantize@v1/fp8`), []byte(`quantize/fp8`), 1),
 		"retired task alias":     bytes.Replace(raw, []byte(`"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"`), []byte(`"structure":"h3/full","tasks":["fl2va"]`), 1),
@@ -381,12 +383,12 @@ func TestModelProductionDescriptor(t *testing.T) {
 
 func TestModelProductionOperationIdentity(t *testing.T) {
 	production := &launch.ModelProduction{Name: "four-lane", Outputs: []launch.ModelProductionOutput{
-		{LaneKey: "bf16-full"}, {LaneKey: "fp8-adaln-pruned"},
+		{Name: "bf16-full"}, {Name: "fp8-adaln-pruned"},
 	}, Sources: map[string]string{
 		"shared": "hf/minimax-h3/shared-diffusers", "dits": "hf/minimax-h3/native-dits-bf16",
 	}}
 	base := modelproduction.Plan{
-		Destination: "tensorhub/minimax-h3", Release: "1.0.0",
+		Destination:      "tensorhub/minimax-h3",
 		Source:           "hf://MiniMaxAI/MiniMax-H3@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		SourceSelection:  "sha256:" + strings.Repeat("b", 64),
 		Producer:         "tensorhub/minimax-h3-tools/four-lane",
@@ -401,7 +403,7 @@ func TestModelProductionOperationIdentity(t *testing.T) {
 	}
 	reordered := base
 	reordered.Jobs = []modelproduction.JobPin{base.Jobs[1], base.Jobs[0]}
-	if base.ID() != reordered.ID() || !strings.HasPrefix(base.ID(), "modelpub-") {
+	if base.ID() != reordered.ID() || !strings.HasPrefix(base.ID(), "modelupload-") {
 		t.Fatal("attempt-independent production identity is not stable")
 	}
 	planBytes, err := base.Bytes()

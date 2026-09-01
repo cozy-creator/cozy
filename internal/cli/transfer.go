@@ -17,7 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
-// The model transfer verbs (cl-012). `model publish` is th-002's declare-first protocol
+// The model transfer verbs (cl-012). `model upload` is th-002's declare-first protocol
 // driven from this side; `model download` is its inverse into the local canonical store. Neither owns a
 // byte or a protocol: the byte plane is TensorFS's (internal/tfs) and the protocol is
 // the hub's (internal/hub). What these own is the argument surface, the progress
@@ -74,18 +74,14 @@ func progress(ctx *Context) func(string) {
 	return func(line string) { _ = output.Progress(ctx.Err, line) }
 }
 
-func handleDirectModelPublish(ctx *Context) *exit.Error {
+func handleDirectModelUpload(ctx *Context) *exit.Error {
 	ref, e := hub.ParseRef(ctx.Inv.Args[0])
 	if e != nil {
 		return e
 	}
 	if ref.Org == "local" {
 		return exit.Usagef("local/ is reserved for private aliases and cannot be a Tensorhub destination").
-			WithRemedy("publish under your Tensorhub account, for example alice/%s", ref.Name)
-	}
-	release, lane := strings.TrimSpace(ctx.Inv.Value("--release")), strings.TrimSpace(ctx.Inv.Value("--lane"))
-	if release == "" || lane == "" {
-		return exit.Usagef("model publish requires --release and --lane")
+			WithRemedy("upload under your Tensorhub account, for example alice/%s", ref.Name)
 	}
 	subject := ctx.Inv.Args[1]
 	localName := ""
@@ -118,17 +114,15 @@ func handleDirectModelPublish(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	reason := "cozy model publish " + ref.String() + " " + manifestID + " --release " + release + " --lane " + lane
-	// The versioned operation binds the complete named-lane intent without
-	// colliding with publications opened under earlier request semantics.
-	session := transfer.PublicationOperationID(ref, release, lane, manifestID)
+	reason := "cozy model upload " + ref.String() + " " + manifestID
+	session := transfer.CheckpointOperationID(ref, manifestID)
 	tool, _, layout, e := tooling(ctx)
 	if e != nil {
 		return e
 	}
-	p := &transfer.Publish{
+	p := &transfer.Upload{
 		Tool: tool, Hub: publicationClient, Ref: ref, EvidenceRef: evidenceRef,
-		ManifestID: manifestID, Release: release, Lane: lane, Session: session,
+		ManifestID: manifestID, Session: session,
 		Reason: reason, DryRun: ctx.Inv.Bool("--dry-run"),
 		Progress: progress(ctx), Scratch: scratch(layout, manifestID),
 	}
@@ -139,15 +133,13 @@ func handleDirectModelPublish(ctx *Context) *exit.Error {
 		return e
 	}
 
-	status, changed := "published", !res.Dup
+	status, changed := "uploaded", !res.Dup
 	if p.DryRun {
 		status, changed = "planned", false
 	}
 	fields := []output.Field{
 		{K: "model", V: ref.String()},
-		{K: "manifest_id", V: manifestID},
-		{K: "release", V: release},
-		{K: "lane", V: lane},
+		{K: "checkpoint_id", V: manifestID},
 		{K: "status", V: status},
 		{K: "changed", V: changed},
 		{K: "publish_id", V: res.PublishID},
@@ -161,7 +153,7 @@ func handleDirectModelPublish(ctx *Context) *exit.Error {
 		fields = append(fields,
 			output.Field{K: "missing", V: res.Totals.MissingObjects},
 			output.Field{K: "held", V: res.Totals.HeldObjects})
-		rec := compactRecord(fields, "model", "release", "lane", "manifest_id", "status", "missing", "changed")
+		rec := compactRecord(fields, "model", "checkpoint_id", "status", "missing", "changed")
 		rec.Next = []string{reason}
 		return emit(ctx, rec)
 	}
@@ -170,12 +162,10 @@ func handleDirectModelPublish(ctx *Context) *exit.Error {
 		output.Field{K: "verified", V: res.Verified},
 		output.Field{K: "manifest_length", V: res.Manifest.Length},
 		output.Field{K: "topology", V: res.TopologyDigest},
-		output.Field{K: "release_operation", V: res.CutOperation},
-		output.Field{K: "repository_sha256", V: res.RepositorySHA},
 		output.Field{K: "duplicate", V: res.Dup},
 	)
 	return emit(ctx, compactRecord(fields,
-		"model", "release", "lane", "manifest_id", "status", "moved", "deduped", "changed"))
+		"model", "checkpoint_id", "status", "moved", "deduped", "changed"))
 }
 
 func handleModelDownload(ctx *Context) *exit.Error {

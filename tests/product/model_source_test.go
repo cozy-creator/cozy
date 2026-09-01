@@ -90,8 +90,8 @@ func TestProviderSecretsRequireOwnerOnlyNonsymlinkConfig(t *testing.T) {
 func TestTensorhubDestinationCannotUseLocalNamespace(t *testing.T) {
 	root := t.TempDir()
 	result := runCozyEnv([]string{"COZY_HOME=" + root, "PATH=/usr/local/bin:/usr/bin:/bin"},
-		"model", "publish", "local/model", "hf://org/model@"+strings.Repeat("a", 40),
-		"--release", "1.0.0", "--dry-run")
+		"model", "upload", "local/model", "hf://org/model@"+strings.Repeat("a", 40),
+		"--dry-run")
 	if result.code != 2 || !strings.Contains(result.output, "local/ is reserved") {
 		t.Fatalf("local Tensorhub destination = exit %d\n%s", result.code, result.output)
 	}
@@ -110,8 +110,8 @@ func TestForeignSourceLaneRefusesBeforeProviderNetwork(t *testing.T) {
 	defer server.Close()
 	result := runCozyEnv([]string{"COZY_HOME=" + root, "PATH=/usr/local/bin:/usr/bin:/bin",
 		"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"},
-		"model", "publish", "acme/model", "hf://org/model@"+strings.Repeat("a", 40),
-		"--release", "1.0.0", "--lane", "bf16")
+		"model", "upload", "acme/model", "hf://org/model@"+strings.Repeat("a", 40),
+		"--lane", "bf16")
 	if result.code != 2 || !strings.Contains(result.output, "--lane selects only") {
 		t.Fatalf("recognized foreign source = exit %d\n%s", result.code, result.output)
 	}
@@ -133,8 +133,7 @@ func TestMissingLocalPublishAliasRefusesBeforeAccountLookup(t *testing.T) {
 		"echo 'REFUSED NOT_FOUND: local alias missing' >&2\nexit 1\n"), 0o700))
 	result := runCozyEnv([]string{"COZY_HOME=" + root, "PATH=/usr/local/bin:/usr/bin:/bin",
 		"COZY_TFS=" + tfs, "TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"},
-		"model", "publish", "acme/model", "local/missing",
-		"--release", "1.0.0", "--lane", "bf16")
+		"model", "upload", "acme/model", "local/missing")
 	if result.code == 0 || accountReads != 0 || !strings.Contains(result.output, "missing") {
 		t.Fatalf("missing local alias = exit %d account reads %d\n%s",
 			result.code, accountReads, result.output)

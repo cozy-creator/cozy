@@ -20,8 +20,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
-var modelReleasePattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
-
 type publishSource struct {
 	Canonical string
 	Selection string
@@ -46,7 +44,7 @@ type producerPlan struct {
 	Needs         modelproduction.ResourceNeeds
 }
 
-func handleModelPublish(ctx *Context) *exit.Error {
+func handleModelUpload(ctx *Context) *exit.Error {
 	destination, problem := hub.ParseRef(ctx.Inv.Args[0])
 	if problem != nil {
 		return problem
@@ -54,10 +52,6 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	if destination.Org == "local" {
 		return exit.Usagef("local/ is reserved for private aliases and cannot be a Tensorhub destination").
 			WithRemedy("publish under your Tensorhub account, for example alice/%s", destination.Name)
-	}
-	release := strings.TrimSpace(ctx.Inv.Value("--release"))
-	if !modelReleasePattern.MatchString(release) {
-		return exit.Usagef("--release %q is not an immutable N.M.P semantic version", release)
 	}
 	if ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--detach") {
 		return exit.Usagef("--dry-run and --detach conflict: a dry-run creates no durable operation")
@@ -79,14 +73,14 @@ func handleModelPublish(ctx *Context) *exit.Error {
 			if ctx.Inv.Bool("--detach") {
 				return exit.Usagef("--detach requires a durable model production")
 			}
-			return handleDirectModelPublish(ctx)
+			return handleDirectModelUpload(ctx)
 		}
 	}
 	instructionSource, problem := canonicalProductionSource(ctx, ctx.Inv.Args[1])
 	if problem != nil {
 		return problem
 	}
-	instruction := modelproduction.Instruction{Destination: destination.String(), Release: release,
+	instruction := modelproduction.Instruction{Destination: destination.String(),
 		Source: instructionSource, InputLane: strings.TrimSpace(ctx.Inv.Value("--lane")),
 		Producer: producerName, Rental: ctx.Inv.Bool("--rental")}
 	if !ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--rental") && producerName != "" {
@@ -119,8 +113,8 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	}
 	plan := modelproduction.Plan{
 		Instruction: instruction,
-		Destination: destination.String(), Release: release,
-		Source: source.Canonical, SourceSelection: source.Selection,
+		Destination: destination.String(),
+		Source:      source.Canonical, SourceSelection: source.Selection,
 		SourceLicense: source.License, InputLane: source.Lane,
 		SourceFiles: source.Exact,
 	}
@@ -137,8 +131,8 @@ func handleModelPublish(ctx *Context) *exit.Error {
 			return problem
 		}
 		fields := []output.Field{
-			{K: "id", V: id}, {K: "kind", V: "model-publication"},
-			{K: "model", V: destination.String()}, {K: "release", V: release},
+			{K: "id", V: id}, {K: "kind", V: "model-upload"},
+			{K: "model", V: destination.String()},
 			{K: "source", V: source.Canonical}, {K: "source_selection", V: source.Selection},
 			{K: "source_files", V: source.Files}, {K: "source_bytes", V: output.Bytes(source.Bytes)},
 			{K: "status", V: "planned"}, {K: "changed", V: false},
@@ -149,20 +143,20 @@ func handleModelPublish(ctx *Context) *exit.Error {
 				output.Field{K: "production", V: producer.Production.Name},
 				output.Field{K: "source_profiles", V: plan.SourceProfiles()},
 				output.Field{K: "steps", V: len(producer.Jobs)},
-				output.Field{K: "lanes", V: plan.Lanes()},
+				output.Field{K: "outputs", V: plan.OutputNames()},
 				output.Field{K: "gpu_count", V: producer.GPUCount},
 				output.Field{K: "requires", V: producer.Requires},
 			)
 		}
-		defaults := []string{"id", "kind", "model", "release", "source"}
+		defaults := []string{"id", "kind", "model", "source"}
 		if producer != nil {
-			defaults = append(defaults, "producer", "production", "lanes")
+			defaults = append(defaults, "producer", "production", "outputs")
 		}
 		defaults = append(defaults, "status", "changed")
 		return emit(ctx, compactRecord(fields, defaults...))
 	}
-	return exit.Named(exit.Unavailable, "model_publication_execution_unavailable",
-		"model publication %s is planned, but this build cannot yet submit its durable source publication", id)
+	return exit.Named(exit.Unavailable, "model_upload_execution_unavailable",
+		"model upload %s is planned, but this build cannot yet submit its durable source upload", id)
 }
 
 func canonicalProductionSource(ctx *Context, raw string) (string, *exit.Error) {

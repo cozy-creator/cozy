@@ -112,7 +112,9 @@ type ModelCmd struct {
 	Download ModelDownloadCmd `cmd:"" help:"Download a model into the local TensorFS store."`
 	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model repositories."`
 	List     ModelListCmd     `cmd:"" help:"List local model releases."`
-	Publish  ModelPublishCmd  `cmd:"" help:"Publish a source directly or through one reviewed model production."`
+	Upload   ModelUploadCmd   `cmd:"" help:"Upload owner-only checkpoints from a source or reviewed producer."`
+	Publish  ModelPublishCmd  `cmd:"" help:"Update a release's mutable lane pointers."`
+	Yank     ModelYankCmd     `cmd:"" help:"Yank a model release."`
 }
 
 type ModelImportCmd struct {
@@ -164,10 +166,9 @@ func (c *ModelListCmd) Run(r *Runtime) error {
 	return r.call(handleModelList, nil, nil, nil, false)
 }
 
-type ModelPublishCmd struct {
+type ModelUploadCmd struct {
 	Ref      string `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
 	Source   string `arg:"" name:"source" help:"Manifest, pinned foreign source, Tensorhub model release, local alias, or explicit local file."`
-	Release  string `help:"Immutable semantic release version." required:""`
 	Producer string `help:"Reviewed org/package@vN/production declaration to execute."`
 	Lane     string `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental   bool   `help:"Authorize one Creator-managed rental for this operation."`
@@ -175,10 +176,31 @@ type ModelPublishCmd struct {
 	Detach   bool   `help:"Return after durable acceptance instead of following."`
 }
 
-func (c *ModelPublishCmd) Run(r *Runtime) error {
-	return r.call(handleModelPublish, []string{c.Ref, c.Source}, bools(
+func (c *ModelUploadCmd) Run(r *Runtime) error {
+	return r.call(handleModelUpload, []string{c.Ref, c.Source}, bools(
 		"--rental", c.Rental, "--dry-run", c.DryRun, "--detach", c.Detach),
-		values("--release", c.Release, "--producer", c.Producer, "--lane", c.Lane), false)
+		values("--producer", c.Producer, "--lane", c.Lane), false)
+}
+
+type ModelPublishCmd struct {
+	Ref        string   `arg:"" name:"model" help:"Tensorhub model repository (org/name)."`
+	Release    string   `help:"Mutable release label." required:""`
+	Lanes      []string `name:"lane" help:"Set a lane pointer as name=checkpoint-id."`
+	RemoveLane []string `help:"Remove a lane pointer by name."`
+}
+
+func (c *ModelPublishCmd) Run(r *Runtime) error {
+	return r.call(handleModelPublish, []string{c.Ref}, nil,
+		values("--release", c.Release, "--lane", c.Lanes, "--remove-lane", c.RemoveLane), false)
+}
+
+type ModelYankCmd struct {
+	Ref     string `arg:"" name:"model" help:"Tensorhub model repository (org/name)."`
+	Release string `help:"Release label to yank." required:""`
+}
+
+func (c *ModelYankCmd) Run(r *Runtime) error {
+	return r.call(handleModelYank, []string{c.Ref}, nil, values("--release", c.Release), false)
 }
 
 type RunCmd struct {

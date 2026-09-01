@@ -54,14 +54,14 @@ func TestLiveModelProductionDescriptor(t *testing.T) {
 		t.Fatalf("published production shape = %d steps, %d outputs, %d sources",
 			len(ordered), len(production.Outputs), len(production.Sources))
 	}
-	lanes := map[string]bool{}
+	outputs := map[string]bool{}
 	for _, output := range production.Outputs {
-		lanes[output.LaneKey] = true
+		outputs[output.Name] = true
 	}
-	for _, lane := range []string{"bf16-full", "bf16-adaln-pruned", "fp8-adaln-pruned",
+	for _, name := range []string{"bf16-full", "bf16-adaln-pruned", "fp8-adaln-pruned",
 		"mxfp8-adaln-pruned"} {
-		if !lanes[lane] {
-			t.Fatalf("published production omits lane %s", lane)
+		if !outputs[name] {
+			t.Fatalf("published production omits output %s", name)
 		}
 	}
 	for _, step := range ordered {
