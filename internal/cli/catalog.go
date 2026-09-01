@@ -135,19 +135,23 @@ func modelSearchRow(card hub.ModelCard) map[string]string {
 		if release.Yanked {
 			continue
 		}
+		releaseName := strings.TrimSpace(release.Release)
+		if releaseName == "" {
+			continue
+		}
 		for _, lane := range release.Lanes {
 			if name := strings.TrimSpace(lane.Lane); name != "" {
-				seen[name] = true
+				seen[releaseName+"/"+name] = true
 			}
 		}
 	}
-	lanes := make([]string, 0, len(seen))
-	for lane := range seen {
-		lanes = append(lanes, lane)
+	coordinates := make([]string, 0, len(seen))
+	for coordinate := range seen {
+		coordinates = append(coordinates, coordinate)
 	}
-	sort.Strings(lanes)
+	sort.Strings(coordinates)
 	return map[string]string{
-		"model": card.Model.Ref(), "lanes": strings.Join(lanes, ", "),
+		"model": card.Model.Ref(), "lanes": strings.Join(coordinates, ", "),
 		"created": stamp(card.Model.CreatedAt), "org": card.Model.Org, "name": card.Model.Name,
 	}
 }
