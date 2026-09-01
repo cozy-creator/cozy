@@ -90,7 +90,60 @@ func (c *Orchestrator) ConvergePackageSet(instanceID string, packages []*pb.Down
 	if s == nil {
 		return exit.Unavailablef("worker %s holds no claimed control stream", instanceID)
 	}
+	// DesiredWorkerState is a complete replacement. A request for package B therefore
+	// carries the already-selected package A as well; sending only B unloads A and turns
+	// one rented machine into a single-package slot again. Serialize the read/merge/send so
+	// concurrent requests cannot each erase the other's addition.
+	w.desiredMu.Lock()
+	defer w.desiredMu.Unlock()
+	c.mu.Lock()
+	packages, models = mergePackageSet(w.desiredPackages, w.desiredModels, packages, models)
+	c.mu.Unlock()
 	return c.issuePackageSet(s, w, packages, models)
+}
+
+func mergePackageSet(currentPackages []*pb.DownloadPackageRef, currentModels []*pb.DownloadModelRef,
+	requestedPackages []*pb.DownloadPackageRef, requestedModels []*pb.DownloadModelRef,
+) ([]*pb.DownloadPackageRef, []*pb.DownloadModelRef) {
+	replaced := make(map[string]bool, len(requestedPackages))
+	for _, row := range requestedPackages {
+		if row != nil {
+			replaced[row.Package] = true
+		}
+	}
+	packages := make([]*pb.DownloadPackageRef, 0, len(currentPackages)+len(requestedPackages))
+	for _, row := range currentPackages {
+		if row != nil && !replaced[row.Package] {
+			packages = append(packages, row)
+		}
+	}
+	for _, row := range requestedPackages {
+		if row != nil {
+			packages = append(packages, row)
+		}
+	}
+	models := make([]*pb.DownloadModelRef, 0, len(currentModels)+len(requestedModels))
+	for _, row := range currentModels {
+		if row != nil && !replaced[row.Package] {
+			models = append(models, row)
+		}
+	}
+	for _, row := range requestedModels {
+		if row != nil {
+			models = append(models, row)
+		}
+	}
+	sort.Slice(packages, func(i, j int) bool {
+		return packages[i].Package+"\x00"+packages[i].Release < packages[j].Package+"\x00"+packages[j].Release
+	})
+	sort.Slice(models, func(i, j int) bool {
+		left := models[i].Package + "\x00" + models[i].Slot + "\x00" + models[i].Model + "\x00" +
+			models[i].Release + "\x00" + models[i].Manifest
+		right := models[j].Package + "\x00" + models[j].Slot + "\x00" + models[j].Model + "\x00" +
+			models[j].Release + "\x00" + models[j].Manifest
+		return left < right
+	})
+	return clonePackageRefs(packages), cloneModelRefs(models)
 }
 
 func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.DownloadPackageRef,
@@ -258,16 +311,68 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			if w.admission == pb.AdmissionState_ADMISSION_STATE_UNSPECIFIED {
 				w.admission = pb.AdmissionState_ADMISSION_STATE_OPEN
 			}
-		} else {
-			if w.spec.Connection != nil && w.spec.Placement.PlacementSetDigest == "" &&
-				len(r.Placements) == 1 {
-				status = r.Placements[0]
-				w.placementID = status.PlacementId
-			} else {
-				for _, p := range r.Placements {
-					if p.PlacementId == w.placementID {
-						status = p
+		} else if w.spec.Connection != nil && w.spec.Placement.PlacementSetDigest == "" {
+			// A private rental reports every co-fitting placement on the one worker. Keep
+			// all of them: collapsing this list to one status made adding package B erase
+			// Creator's ability to route the still-live package A.
+			observed := make(map[string]remotePlacementObservation, len(r.Placements))
+			for _, p := range r.Placements {
+				if p == nil {
+					continue
+				}
+				if status == nil || p.Serving == pb.ServingState_SERVING_STATE_DISPATCHABLE {
+					status = p
+				}
+				row := remotePlacementObservation{
+					placementID: p.PlacementId, packageRevision: p.PackageRevisionDigest,
+					environmentDigest: p.EnvironmentDigest, configDigest: p.ConfigDigest,
+					materialization: p.Materialization, serving: p.Serving,
+					dispatchablePlanIDs: map[string]bool{}, knownPlanIDs: map[string]bool{},
+				}
+				for _, digest := range p.DispatchableBindingDigests {
+					planID := spellOf(digest)
+					row.dispatchablePlanIDs[planID] = true
+					row.knownPlanIDs[planID] = true
+					if p.Serving == pb.ServingState_SERVING_STATE_DISPATCHABLE {
+						dispatchable[planID] = true
 					}
+				}
+				for _, digest := range p.MaterializableBindingDigests {
+					planID := spellOf(digest)
+					row.knownPlanIDs[planID] = true
+					materializable[planID] = true
+				}
+				observed[p.PackageRevisionDigest] = row
+				for _, f := range p.Faults {
+					w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
+				}
+			}
+			w.observedRemote = observed
+			w.planIDs = keysOf(dispatchable)
+			for planID := range materializable {
+				if !dispatchable[planID] {
+					w.planIDs = append(w.planIDs, planID)
+				}
+			}
+			sort.Strings(w.planIDs)
+			if status != nil {
+				w.placementID = status.PlacementId
+				w.materialization, w.serving = status.Materialization, status.Serving
+				w.packageRevisionDigest = status.PackageRevisionDigest
+				w.environmentDigest, w.configDigest = status.EnvironmentDigest, status.ConfigDigest
+				w.generation = status.ExecutorGeneration
+				w.heldSetDigest = status.PlacementSetDigest
+				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
+				w.acquisition = placementAcquisitionOf(status)
+			} else {
+				w.materialization = pb.MaterializationState_MATERIALIZATION_STATE_UNSPECIFIED
+				w.serving = pb.ServingState_SERVING_STATE_UNSPECIFIED
+				w.packageRevisionDigest, w.environmentDigest, w.configDigest = "", "", ""
+			}
+		} else {
+			for _, p := range r.Placements {
+				if p.PlacementId == w.placementID {
+					status = p
 				}
 			}
 			if status != nil {
@@ -275,12 +380,6 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.packageRevisionDigest = status.PackageRevisionDigest
 				w.environmentDigest = status.EnvironmentDigest
 				w.configDigest = status.ConfigDigest
-				if w.spec.Connection != nil && w.spec.Placement.PlacementSetDigest == "" &&
-					w.spec.Placement.Package != "" {
-					w.spec.Placement.PackageRevisionDigest = status.PackageRevisionDigest
-					w.spec.Placement.EnvironmentDigest = status.EnvironmentDigest
-					w.spec.Placement.ConfigDigest = status.ConfigDigest
-				}
 				w.generation = status.ExecutorGeneration
 				w.heldSetDigest = status.PlacementSetDigest
 				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
@@ -290,15 +389,6 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				}
 				for _, digest := range status.MaterializableBindingDigests {
 					materializable[spellOf(digest)] = true
-				}
-				if w.spec.Connection != nil && w.spec.Placement.PlacementSetDigest == "" {
-					w.planIDs = keysOf(dispatchable)
-					for planID := range materializable {
-						if !dispatchable[planID] {
-							w.planIDs = append(w.planIDs, planID)
-						}
-					}
-					sort.Strings(w.planIDs)
 				}
 				for _, f := range status.Faults {
 					w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
@@ -317,6 +407,9 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		// BINDING_DEGRADED explicitly means "the worker still serves" and must never become
 		// kill authority merely because it shares the diagnostic list with fatal faults.
 		w.faulted = faulted(status, r)
+		if w.spec.Connection != nil && !w.spec.IsJob() {
+			w.faulted = r.WorkerPhase == pb.WorkerPhase_WORKER_PHASE_FAILED
+		}
 		if w.faulted {
 			if w.errorSince.IsZero() {
 				w.errorSince = time.Now()

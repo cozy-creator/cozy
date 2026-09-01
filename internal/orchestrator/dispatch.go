@@ -524,8 +524,14 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 	}
 	stale := ""
 	for _, w := range c.workers {
-		if w.exited || w.stopping || w.spec.Placement.Package != pinnedPackage(req.Package, req.Worker) ||
-			w.spec.IsJob() != req.IsJob() {
+		if w.exited || w.stopping || w.spec.IsJob() != req.IsJob() {
+			continue
+		}
+		if req.Worker != "" && w.spec.Connection != nil {
+			if w.instanceID != rentalInstanceID(req.Worker) {
+				continue
+			}
+		} else if w.spec.Placement.Package != pinnedPackage(req.Package, req.Worker) {
 			continue
 		}
 		if req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {
@@ -552,9 +558,14 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			// the long-lived daemon still owns a worker loaded from the previous install.
 			// Replace that process once; the new launch below either serves the request with
 			// the current Runtime or gives the request its own prompt terminal answer.
-			if staged(w, req.PlanID) && retirementGround(w) == "" {
+			if stagedFor(w, req) && retirementGround(w) == "" {
 				c.mu.Unlock()
 				return
+			}
+			if req.Worker != "" && w.spec.Connection != nil {
+				// The rental is the slot. A different package is an addition to this
+				// machine, not evidence that its existing worker is stale.
+				continue
 			}
 			stale = w.instanceID
 		}
@@ -644,6 +655,13 @@ func staged(w *worker, planID string) bool {
 		}
 	}
 	return false
+}
+
+func stagedFor(w *worker, req records.Request) bool {
+	if req.Worker != "" && w.spec.Connection != nil && !req.IsJob() {
+		return w.remoteStaged(pinnedPackage(req.Package, req.Worker), req.PlanID)
+	}
+	return staged(w, req.PlanID)
 }
 
 // settledState answers whether the authority has already recorded this request's outcome.
@@ -1000,7 +1018,13 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	}
 	grant.InvocationSpecDigest = digest
 
+	c.mu.Lock()
 	placementID := w.placementID
+	if placement, ok := w.remotePlacements[remotePlanKey(
+		pinnedPackage(req.Package, req.Worker), req.PlanID)]; w.spec.Connection != nil && ok {
+		placementID = placement.PlacementIDValue
+	}
+	c.mu.Unlock()
 	if req.IsJob() {
 		placementID = "" // job mode routes by the directive, not a placement (#446/#481)
 	}
@@ -1092,6 +1116,10 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 	req records.Request) (packageRevision, environment, config string, e *exit.Error) {
 	c.mu.Lock()
 	placement, remote, instanceID := w.spec.Placement, w.spec.Connection != nil, w.instanceID
+	if selected, ok := w.remotePlacements[remotePlanKey(
+		pinnedPackage(req.Package, req.Worker), req.PlanID)]; remote && ok {
+		placement = selected
+	}
 	localConfig := w.configDigest
 	c.mu.Unlock()
 	packageRevision = placement.PackageRevisionDigest
@@ -1264,7 +1292,16 @@ func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *di
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, w := range c.workers {
-		if w.exited || w.stopping || w.spec.Placement.Package != slot {
+		if w.exited || w.stopping {
+			continue
+		}
+		if req.Worker != "" && !req.IsJob() && w.spec.Connection != nil {
+			placement, ok := w.remotePlacements[remotePlanKey(slot, planID)]
+			if w.instanceID != rentalInstanceID(req.Worker) || !ok ||
+				placement.Package != slot || !w.remoteDispatchable(placement, planID) {
+				continue
+			}
+		} else if w.spec.Placement.Package != slot {
 			continue
 		}
 		if req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {

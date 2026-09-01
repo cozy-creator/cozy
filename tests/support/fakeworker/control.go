@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,17 +21,23 @@ import (
 
 type fakeControl struct {
 	pb.UnimplementedWorkerControlServer
-	say                func(string, ...any)
-	arm                string
-	bootID             string
-	instance           string
-	releaseID          string
-	root               string // this worker's OWN filesystem root
-	verify             func(string) bool
-	dynamicPlan        string
-	dynamicRelease     string
-	dynamicEnvironment string
-	dynamicConfig      string
+	say                 func(string, ...any)
+	arm                 string
+	bootID              string
+	instance            string
+	releaseID           string
+	root                string // this worker's OWN filesystem root
+	verify              func(string) bool
+	dynamicPlan         string
+	dynamicPackage      string
+	dynamicRelease      string
+	dynamicEnvironment  string
+	dynamicConfig       string
+	dynamicPackageB     string
+	dynamicPlanB        string
+	dynamicReleaseB     string
+	dynamicEnvironmentB string
+	dynamicConfigB      string
 
 	generation   uint64
 	snapshotSent atomic.Bool
@@ -131,9 +138,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	f.say("WorkerSnapshot %s sent (%d B); admission is CLOSED until the ack", snapshotID, len(bodyBytes))
 
 	dynamicSlots := uint32(1)
-	observed := func(revision uint64, placementID string, setDigest []byte, planIDs []string,
-		packageRevision, environmentDigest, configDigest string,
-	) {
+	observedMany := func(revision uint64, setDigest []byte, placements []*pb.PlacementStatus) {
 		availableSlots := uint32(2)
 		if f.arm == "delayed-output" {
 			availableSlots = 1
@@ -148,40 +153,41 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			AdmissionState:             pb.AdmissionState_ADMISSION_STATE_OPEN,
 			AdmissionGeneration:        admissionGeneration, AvailableAttemptSlots: availableSlots,
 		}
-		if placementID != "" {
-			var bindingDigests [][]byte
-			for _, planID := range planIDs {
-				digest, err := canonical.Raw(planID)
-				if err == nil {
-					bindingDigests = append(bindingDigests, digest)
-				}
-			}
-			placement := &pb.PlacementStatus{
-				PlacementId:        placementID,
-				Materialization:    pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
-				Serving:            pb.ServingState_SERVING_STATE_DISPATCHABLE,
-				ExecutorGeneration: 1, DispatchableBindingDigests: bindingDigests,
-				PlacementSetDigest:    setDigest,
-				PackageRevisionDigest: packageRevision,
-				EnvironmentDigest:     environmentDigest,
-				ConfigDigest:          configDigest,
-			}
-			if f.arm == "placement-failed" {
+		if f.arm == "placement-failed" {
+			for _, placement := range placements {
 				placement.Materialization = pb.MaterializationState_MATERIALIZATION_STATE_FAILED
 				placement.Serving = pb.ServingState_SERVING_STATE_OFFLINE
 				placement.DispatchableBindingDigests = nil
 				placement.Faults = []*pb.Fault{{
-					Kind: pb.FaultKind_FAULT_KIND_CONFIG_REFUSED, Subject: placementID,
+					Kind: pb.FaultKind_FAULT_KIND_CONFIG_REFUSED, Subject: placement.PlacementId,
 					Reason: "package_descriptor_invalid",
 					Detail: "the installed Runtime cannot read this package descriptor",
 				}}
 			}
-			r.Placements = []*pb.PlacementStatus{placement}
 		}
+		r.Placements = placements
 		env(func(e, g uint64, b string) {
 			r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId = e, g, b
 		})
 		send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: r}})
+	}
+	placementStatus := func(placementID string, setDigest []byte, planIDs []string,
+		packageRevision, environmentDigest, configDigest string,
+	) *pb.PlacementStatus {
+		var bindingDigests [][]byte
+		for _, planID := range planIDs {
+			digest, err := canonical.Raw(planID)
+			if err == nil {
+				bindingDigests = append(bindingDigests, digest)
+			}
+		}
+		return &pb.PlacementStatus{
+			PlacementId: placementID, Materialization: pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
+			Serving: pb.ServingState_SERVING_STATE_DISPATCHABLE, ExecutorGeneration: 1,
+			DispatchableBindingDigests: bindingDigests, PlacementSetDigest: setDigest,
+			PackageRevisionDigest: packageRevision, EnvironmentDigest: environmentDigest,
+			ConfigDigest: configDigest,
+		}
 	}
 	outcome := func(t *pb.AttemptOutcome) {
 		env(func(e, g uint64, b string) {
@@ -192,9 +198,8 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 
 	var dropAck *pb.AttemptOutcome
 	var currentRevision uint64
-	var currentPlacementID, currentPackageRevision, currentEnvironmentDigest, currentConfigDigest string
 	var currentSetDigest []byte
-	var currentPlanIDs []string
+	var currentPlacements []*pb.PlacementStatus
 	for {
 		frame, err := stream.Recv()
 		if err != nil {
@@ -224,15 +229,30 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				return status.Error(codes.FailedPrecondition,
 					"Runtime package preparation failed: proof package is incompatible")
 			}
-			placementID, planIDs, setDigest := "", []string(nil), []byte(nil)
-			packageRevision, environmentDigest, configDigest := "", "", ""
+			setDigest := []byte(nil)
+			placements := []*pb.PlacementStatus(nil)
 			if f.arm == "dynamic-output" && d.GetPackageSet() != nil {
-				placementID = "plc-dynamic-package"
-				planIDs = []string{f.dynamicPlan}
-				packageRevision = f.dynamicRelease
-				environmentDigest = f.dynamicEnvironment
-				configDigest = f.dynamicConfig
-				setDigest = canonical.Digest([]byte("dynamic package set"))
+				delegation := d.GetPackageSet().DownloadDelegation
+				doc, err := canonical.Read(delegation, &pb.DownloadDelegation{})
+				if err != nil {
+					f.say("ARM: dynamic package delegation is inadmissible: %v", err)
+					continue
+				}
+				setDigest = canonical.Digest(delegation)
+				for index, selected := range doc.List("packages") {
+					packageName := selected.Str("package")
+					planID, release, environment, config := f.dynamicPlan, f.dynamicRelease, f.dynamicEnvironment, f.dynamicConfig
+					if packageName == f.dynamicPackageB {
+						planID, release = f.dynamicPlanB, f.dynamicReleaseB
+						environment, config = f.dynamicEnvironmentB, f.dynamicConfigB
+					} else if f.dynamicPackage != "" && packageName != f.dynamicPackage {
+						f.say("ARM: no dynamic fixture for package %s", packageName)
+						continue
+					}
+					placements = append(placements, placementStatus(
+						fmt.Sprintf("plc-dynamic-package-%d", index+1), setDigest, []string{planID},
+						release, environment, config))
+				}
 			} else if ds := d.GetPlacementSet(); ds != nil {
 				// THE BYTES ARE THE SET. Recompute BEFORE parsing a single field — a
 				// mismatch is a typed refusal with the desired state UNAPPLIED.
@@ -248,26 +268,27 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 					continue
 				}
 				for _, p := range doc.List("placements") {
-					placementID = p.Str("placement_id")
-					packageRevision = p.Sub("package").Str("release_digest")
-					environmentDigest = p.Str("environment_digest")
+					planIDs := []string(nil)
 					emptyConfig, _ := canonical.Write(map[string]canonical.Value{})
-					configDigest, _ = canonical.Spell(canonical.Digest(emptyConfig))
+					configDigest, _ := canonical.Spell(canonical.Digest(emptyConfig))
 					for _, entrypoint := range p.List("entrypoints") {
 						planIDs = append(planIDs, entrypoint.Str("entrypoint_binding_digest"))
 					}
+					placements = append(placements, placementStatus(p.Str("placement_id"), setDigest,
+						planIDs, p.Sub("package").Str("release_digest"),
+						p.Str("environment_digest"), configDigest))
 				}
 			}
-			f.say("DesiredWorkerState revision=%d placement=%s plans=%d", d.Revision,
-				placementID, len(planIDs))
-			currentRevision, currentPlacementID = d.Revision, placementID
+			plans := 0
+			for _, placement := range placements {
+				plans += len(placement.DispatchableBindingDigests)
+			}
+			f.say("DesiredWorkerState revision=%d placements=%d plans=%d", d.Revision,
+				len(placements), plans)
+			currentRevision = d.Revision
 			currentSetDigest = append(currentSetDigest[:0], setDigest...)
-			currentPlanIDs = append(currentPlanIDs[:0], planIDs...)
-			currentPackageRevision = packageRevision
-			currentEnvironmentDigest = environmentDigest
-			currentConfigDigest = configDigest
-			observed(d.Revision, placementID, setDigest, planIDs,
-				packageRevision, environmentDigest, configDigest)
+			currentPlacements = append(currentPlacements[:0], placements...)
+			observedMany(d.Revision, setDigest, placements)
 		case *pb.RecordOwnerFrame_AttemptOffer:
 			offer := m.AttemptOffer
 			f.say("AttemptOffer %s#%d placement=%s admission=%d", offer.RequestId,
@@ -339,13 +360,11 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				go func() { time.Sleep(3 * time.Second); os.Exit(0) }()
 			}
 			if f.arm == "delayed-output" {
-				observed(currentRevision, currentPlacementID, currentSetDigest, currentPlanIDs,
-					currentPackageRevision, currentEnvironmentDigest, currentConfigDigest)
+				observedMany(currentRevision, currentSetDigest, currentPlacements)
 			}
 			if f.arm == "dynamic-output" {
 				dynamicSlots = 1
-				observed(currentRevision, currentPlacementID, currentSetDigest, currentPlanIDs,
-					currentPackageRevision, currentEnvironmentDigest, currentConfigDigest)
+				observedMany(currentRevision, currentSetDigest, currentPlacements)
 			}
 		case *pb.RecordOwnerFrame_CancelAttempt:
 			f.say("CancelAttempt %s#%d", m.CancelAttempt.RequestId, m.CancelAttempt.AttemptOrdinal)

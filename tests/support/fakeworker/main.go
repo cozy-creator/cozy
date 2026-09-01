@@ -27,21 +27,27 @@ var (
 	socket = flag.String("socket", "", "the listen grant: a unix path or host:port")
 	out    = flag.String("out", "", "the run root whose control.addr publishes the bound address")
 	// --fake-instance lets an arm replace the process identity this worker normally mints.
-	fakeInstance       = flag.String("fake-instance", "", "report an instance identity nobody spawned")
-	releaseID          = flag.String("release-id", "", "")
-	arm                = flag.String("arm", "idle", "idle|noinstance|badcred|badrelease|precondition|placement-failed|steal|badterminal|dropack|output|delayed-output|missing-output|snapshotbarrier")
-	session            = flag.String("session", "", "a fixed worker_boot_id (the collision arm)")
-	cozyHome           = flag.String("cozy-home", "", "this worker's own root")
-	stealRequest       = flag.String("request", "", "the steal arm's victim request")
-	stealAttempt       = flag.Uint64("attempt", 1, "the steal arm's victim ordinal")
-	stealSpec          = flag.String("spec", "", "the steal arm's victim invocation digest, hex")
-	dynamicPlan        = flag.String("dynamic-plan", "", "binding digest returned by the dynamic package-set arm")
-	dynamicRelease     = flag.String("dynamic-release", "", "package release digest returned by the dynamic package-set arm")
-	dynamicEnvironment = flag.String("dynamic-environment", "", "environment digest returned by the dynamic package-set arm")
-	dynamicConfig      = flag.String("dynamic-config", "", "config digest returned by the dynamic package-set arm")
-	_                  = flag.String("devices", "", "")
-	_                  = flag.String("grace", "", "")
-	_                  = flag.Bool("no-warm", false, "")
+	fakeInstance        = flag.String("fake-instance", "", "report an instance identity nobody spawned")
+	releaseID           = flag.String("release-id", "", "")
+	arm                 = flag.String("arm", "idle", "idle|noinstance|badcred|badrelease|precondition|placement-failed|steal|badterminal|dropack|output|delayed-output|missing-output|snapshotbarrier")
+	session             = flag.String("session", "", "a fixed worker_boot_id (the collision arm)")
+	cozyHome            = flag.String("cozy-home", "", "this worker's own root")
+	stealRequest        = flag.String("request", "", "the steal arm's victim request")
+	stealAttempt        = flag.Uint64("attempt", 1, "the steal arm's victim ordinal")
+	stealSpec           = flag.String("spec", "", "the steal arm's victim invocation digest, hex")
+	dynamicPlan         = flag.String("dynamic-plan", "", "binding digest returned by the dynamic package-set arm")
+	dynamicPackage      = flag.String("dynamic-package", "", "package served by the first dynamic binding")
+	dynamicRelease      = flag.String("dynamic-release", "", "package release digest returned by the dynamic package-set arm")
+	dynamicEnvironment  = flag.String("dynamic-environment", "", "environment digest returned by the dynamic package-set arm")
+	dynamicConfig       = flag.String("dynamic-config", "", "config digest returned by the dynamic package-set arm")
+	dynamicPackageB     = flag.String("dynamic-package-b", "", "optional second package served by the dynamic package-set arm")
+	dynamicPlanB        = flag.String("dynamic-plan-b", "", "binding digest for the optional second package")
+	dynamicReleaseB     = flag.String("dynamic-release-b", "", "release digest for the optional second package")
+	dynamicEnvironmentB = flag.String("dynamic-environment-b", "", "environment digest for the optional second package")
+	dynamicConfigB      = flag.String("dynamic-config-b", "", "config digest for the optional second package")
+	_                   = flag.String("devices", "", "")
+	_                   = flag.String("grace", "", "")
+	_                   = flag.Bool("no-warm", false, "")
 )
 
 func main() { os.Exit(run()) }
@@ -111,8 +117,11 @@ func run() int {
 	pb.RegisterWorkerControlServer(server, &fakeControl{
 		say: say, arm: *arm, bootID: boot, instance: instance, releaseID: release,
 		root: *cozyHome, verify: verify, dynamicPlan: *dynamicPlan,
-		dynamicRelease: *dynamicRelease, dynamicEnvironment: *dynamicEnvironment,
-		dynamicConfig: *dynamicConfig,
+		dynamicPackage: *dynamicPackage, dynamicRelease: *dynamicRelease,
+		dynamicEnvironment: *dynamicEnvironment, dynamicConfig: *dynamicConfig,
+		dynamicPackageB: *dynamicPackageB, dynamicPlanB: *dynamicPlanB,
+		dynamicReleaseB: *dynamicReleaseB, dynamicEnvironmentB: *dynamicEnvironmentB,
+		dynamicConfigB: *dynamicConfigB,
 	})
 	if err := server.Serve(ln); err != nil {
 		say("serve ended: %v", err)

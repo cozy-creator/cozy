@@ -287,7 +287,7 @@ func TestReadyManagedRentalDispatchesAgainAfterOutcomeAck(t *testing.T) {
 	}
 }
 
-func TestDynamicRemotePackageDispatchesAgainAfterOutcomeAck(t *testing.T) {
+func TestDynamicRemotePackagesShareOneWarmRental(t *testing.T) {
 	spell := func(label string) string {
 		digest := sha256.Sum256([]byte(label))
 		value, _ := canonical.Spell(digest[:])
@@ -295,6 +295,10 @@ func TestDynamicRemotePackageDispatchesAgainAfterOutcomeAck(t *testing.T) {
 	}
 	planID, releaseDigest := spell("dynamic plan"), spell("dynamic release")
 	environmentDigest, configDigest := spell("dynamic environment"), spell("dynamic config")
+	// Weightless functions with the same name have the same binding digest. Package is
+	// therefore part of Creator's routing key; plan id alone cannot distinguish A from B.
+	planIDB, releaseDigestB := planID, spell("dynamic release b")
+	environmentDigestB, configDigestB := spell("dynamic environment b"), spell("dynamic config b")
 	workerRoot := t.TempDir()
 	workerLogPath := filepath.Join(workerRoot, "worker.log")
 	workerLog, err := os.Create(workerLogPath)
@@ -302,8 +306,12 @@ func TestDynamicRemotePackageDispatchesAgainAfterOutcomeAck(t *testing.T) {
 	worker := exec.Command(fakeWorkerBin,
 		"--socket", "127.0.0.1:0", "--out", workerRoot,
 		"--arm", "dynamic-output", "--session", "boot-dynamic",
-		"--dynamic-plan", planID, "--dynamic-release", releaseDigest,
-		"--dynamic-environment", environmentDigest, "--dynamic-config", configDigest)
+		"--dynamic-package", "paul/marco-polo", "--dynamic-plan", planID,
+		"--dynamic-release", releaseDigest, "--dynamic-environment", environmentDigest,
+		"--dynamic-config", configDigest,
+		"--dynamic-package-b", "paul/marco-polo-b", "--dynamic-plan-b", planIDB,
+		"--dynamic-release-b", releaseDigestB, "--dynamic-environment-b", environmentDigestB,
+		"--dynamic-config-b", configDigestB)
 	worker.Stdout, worker.Stderr = workerLog, workerLog
 	must(t, worker.Start())
 	t.Cleanup(func() {
@@ -354,6 +362,7 @@ func TestDynamicRemotePackageDispatchesAgainAfterOutcomeAck(t *testing.T) {
 			Addr: mediaAddr, Token: secret.New("dynamic-media-token"),
 		},
 	}
+	signedSets := make(chan []string, 4)
 	var owner *owner
 	owner = hostOwnerConfigured(t, "dynamic-managed-rental-warm-wake", nil,
 		func(options *orchestrator.Options) {
@@ -370,6 +379,11 @@ func TestDynamicRemotePackageDispatchesAgainAfterOutcomeAck(t *testing.T) {
 			options.RentalPackageSet = func(_ *orchestrator.WorkerConnection,
 				packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRef,
 			) ([]byte, []byte, *exit.Error) {
+				names := make([]string, 0, len(packages))
+				for _, row := range packages {
+					names = append(names, row.Package)
+				}
+				signedSets <- names
 				delegation := &pb.DownloadDelegation{
 					ExpiresAtUnix: uint64(time.Now().Add(time.Hour).Unix()), RentalId: connection.RentalID,
 					WorkerId: connection.WorkerID, WorkerBootId: connection.WorkerBootID,
@@ -391,29 +405,46 @@ func TestDynamicRemotePackageDispatchesAgainAfterOutcomeAck(t *testing.T) {
 			}
 		})
 
-	for run := 1; run <= 2; run++ {
+	runs := []struct {
+		packageName, planID, releaseDigest, environmentDigest, configDigest string
+	}{
+		{"paul/marco-polo", planID, releaseDigest, environmentDigest, configDigest},
+		{"paul/marco-polo-b", planIDB, releaseDigestB, environmentDigestB, configDigestB},
+		{"paul/marco-polo", planID, releaseDigest, environmentDigest, configDigest},
+	}
+	for index, run := range runs {
 		request := orchestrator.Submission{
-			IdemKey: fmt.Sprintf("dynamic-rental-reuse-%d", run),
-			Package: "paul/marco-polo", Entrypoint: "marco", PlanID: planID,
-			Release: "1.0.4", ReleaseDigest: releaseDigest,
+			IdemKey: fmt.Sprintf("dynamic-rental-reuse-%d", index+1),
+			Package: run.packageName, Entrypoint: "marco", PlanID: run.planID,
+			Release: "1.0.4", ReleaseDigest: run.releaseDigest,
 			Payload: []byte(`{"message":"marco"}`), Rental: true,
 		}
 		id, attempt, problem := owner.c.Submit(request)
 		fatal(t, problem)
 		if attempt != 0 {
-			t.Fatalf("run %d: unassigned dynamic rental dispatched attempt %d", run, attempt)
+			t.Fatalf("run %d: unassigned dynamic rental dispatched attempt %d", index+1, attempt)
 		}
 		result, problem := owner.c.AwaitSettled(id, 5*time.Second)
 		if problem != nil || result.Status != "SUCCEEDED" || result.Attempt != 1 {
 			t.Fatalf("run %d: dynamic rental did not return its warm seat: result=%+v problem=%v\nworker:\n%s",
-				run, result, problem, readWorkerLog())
+				index+1, result, problem, readWorkerLog())
 		}
 		row, problem := owner.store.RequestRow(id)
 		if problem != nil || row == nil || row.Worker != connection.RentalID ||
-			row.EnvironmentDigest != environmentDigest || row.ConfigDigest != configDigest {
+			row.EnvironmentDigest != run.environmentDigest || row.ConfigDigest != run.configDigest {
 			t.Fatalf("run %d: worker-derived invocation identity was not bound: row=%+v problem=%v",
-				run, row, problem)
+				index+1, row, problem)
 		}
+	}
+	first, second := <-signedSets, <-signedSets
+	if strings.Join(first, ",") != "paul/marco-polo" ||
+		strings.Join(second, ",") != "paul/marco-polo,paul/marco-polo-b" {
+		t.Fatalf("desired package sets replaced an incumbent: first=%v second=%v", first, second)
+	}
+	select {
+	case extra := <-signedSets:
+		t.Fatalf("returning to resident package A reissued desired state: %v", extra)
+	default:
 	}
 }
 
