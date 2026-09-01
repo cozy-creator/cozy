@@ -295,7 +295,9 @@ func TestDynamicRemotePackagesShareOneWarmRental(t *testing.T) {
 	}
 	planID, releaseDigest := spell("dynamic plan"), spell("dynamic release")
 	environmentDigest, configDigest := spell("dynamic environment"), spell("dynamic config")
-	planIDB, releaseDigestB := spell("dynamic plan b"), spell("dynamic release b")
+	// Weightless functions with the same name have the same binding digest. Package is
+	// therefore part of Creator's routing key; plan id alone cannot distinguish A from B.
+	planIDB, releaseDigestB := planID, spell("dynamic release b")
 	environmentDigestB, configDigestB := spell("dynamic environment b"), spell("dynamic config b")
 	workerRoot := t.TempDir()
 	workerLogPath := filepath.Join(workerRoot, "worker.log")

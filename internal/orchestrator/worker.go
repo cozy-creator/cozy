@@ -459,12 +459,12 @@ type worker struct {
 }
 
 type remotePlacementObservation struct {
-	placementID           string
-	packageRevision       string
-	environmentDigest     string
-	configDigest          string
-	serving               pb.ServingState
-	dispatchablePlanIDs   map[string]bool
+	placementID         string
+	packageRevision     string
+	environmentDigest   string
+	configDigest        string
+	serving             pb.ServingState
+	dispatchablePlanIDs map[string]bool
 }
 
 // dispatchableFor is the ROUTING GATE, and it is two questions with two owners (#482).
@@ -474,10 +474,23 @@ type remotePlacementObservation struct {
 // is on disk.
 func (w *worker) dispatchableFor(planID string) bool {
 	if w.spec.Connection != nil && !w.spec.IsJob() {
-		placement, known := w.remotePlacements[planID]
-		return known && placement.PlacementIDValue != "" && w.dispatchable[planID]
+		for key, placement := range w.remotePlacements {
+			if strings.HasSuffix(key, "\x00"+planID) && w.remoteDispatchable(placement, planID) {
+				return true
+			}
+		}
+		return false
 	}
 	return w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE && w.dispatchable[planID]
+}
+
+func remotePlanKey(packageName, planID string) string { return packageName + "\x00" + planID }
+
+func (w *worker) remoteDispatchable(placement DesiredPlacement, planID string) bool {
+	observed := w.observedRemote[placement.PackageRevisionDigest]
+	return placement.PlacementIDValue != "" &&
+		observed.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
+		observed.dispatchablePlanIDs[planID]
 }
 
 // admissible answers the worker-level half. CLOSED is STRUCTURAL (pre-snapshot-barrier,
@@ -772,7 +785,7 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 					Entrypoints: []Entrypoint{{Name: logical.Function, Digest: planID,
 						Outputs: append([]string(nil), logical.Outputs...)}},
 				}
-				w.remotePlacements[planID] = placement
+				w.remotePlacements[remotePlanKey(placement.Package, planID)] = placement
 				spec := w.spec
 				spec.Placement = placement
 				c.mu.Unlock()
@@ -863,7 +876,7 @@ func hostsPlans(w *worker, p DesiredPlacement) bool {
 	}
 	if w.spec.Connection != nil && !w.spec.IsJob() {
 		for id := range want {
-			if _, ok := w.remotePlacements[id]; !ok {
+			if _, ok := w.remotePlacements[remotePlanKey(p.Package, id)]; !ok {
 				return false
 			}
 		}
