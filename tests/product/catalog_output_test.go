@@ -15,7 +15,7 @@ import (
 
 func TestModelSearchShowsAuthoritativeAvailableReleaseLanes(t *testing.T) {
 	manifest := "sha256:" + strings.Repeat("a", 64)
-	searches, alphaCards, betaCards, packageSearches := 0, 0, 0, 0
+	searches, alphaCards, betaCards, packageSearches, packageCards := 0, 0, 0, 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -34,6 +34,9 @@ func TestModelSearchShowsAuthoritativeAvailableReleaseLanes(t *testing.T) {
 		case "/v1/packages":
 			packageSearches++
 			_, _ = io.WriteString(w, `{"packages":[{"org":"acme","name":"package","created_at":"2026-09-03T00:00:00Z"}],"search":{"total":1,"limit":1000,"capped":false,"q":""}}`)
+		case "/v1/packages/acme/package":
+			packageCards++
+			_, _ = io.WriteString(w, `{"package":{"org":"acme","name":"package","created_at":"2026-09-03T00:00:00Z"}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -65,9 +68,14 @@ func TestModelSearchShowsAuthoritativeAvailableReleaseLanes(t *testing.T) {
 	if code != 0 || strings.TrimSpace(out) != "- acme/package" {
 		t.Fatalf("package search output changed [exit %d]\n%s", code, out)
 	}
-	if searches != 1 || alphaCards != 2 || betaCards != 1 || packageSearches != 1 {
-		t.Fatalf("catalog requests = searches %d alpha %d beta %d packages %d",
-			searches, alphaCards, betaCards, packageSearches)
+	code, out = runCozyDir(t, t.TempDir(), ".", env, "package", "search", "acme/package")
+	if code != 0 || !strings.Contains(out, "ref:     acme/package") ||
+		!strings.Contains(out, "created: 2026-09-03T00:00:00Z") {
+		t.Fatalf("exact package search output changed [exit %d]\n%s", code, out)
+	}
+	if searches != 1 || alphaCards != 2 || betaCards != 1 || packageSearches != 1 || packageCards != 1 {
+		t.Fatalf("catalog requests = searches %d alpha %d beta %d package searches %d cards %d",
+			searches, alphaCards, betaCards, packageSearches, packageCards)
 	}
 }
 

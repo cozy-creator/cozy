@@ -294,15 +294,6 @@ func (c *Client) PackageCard(ctx context.Context, ref Ref) (PackageCard, *exit.E
 	return out, e
 }
 
-// Model resolves one model through its typed public route.
-func (c *Client) Model(ctx context.Context, ref Ref) (Resource, *exit.Error) {
-	var out struct {
-		Model Resource `json:"model"`
-	}
-	e := c.do(ctx, call{method: http.MethodGet, path: resourcePath("models", ref)}, &out)
-	return out.Model, e
-}
-
 func (c *Client) ModelCard(ctx context.Context, ref Ref) (ModelCard, *exit.Error) {
 	var out ModelCard
 	e := c.do(ctx, call{method: http.MethodGet, path: resourcePath("models", ref)}, &out)

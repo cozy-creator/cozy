@@ -47,7 +47,7 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 			if kind == "model" {
 				return handleModelShow(ctx, ref)
 			}
-			return handleResourceShow(ctx, kind)
+			return handlePackageShow(ctx, ref)
 		}
 	}
 	query := strings.ToLower(strings.TrimSpace(strings.Join(ctx.Inv.Args, " ")))
@@ -155,31 +155,18 @@ func modelSearchRow(card hub.ModelCard) map[string]string {
 	}
 }
 
-func handleResourceShow(ctx *Context, kind string) *exit.Error {
-	ref, e := hub.ParseRef(ctx.Inv.Args[0])
-	if e != nil {
-		return e
-	}
+func handlePackageShow(ctx *Context, ref hub.Ref) *exit.Error {
 	c := client(ctx)
 	hctx, cancel := hub.Context()
 	defer cancel()
-	var r hub.Resource
-	if kind == "package" {
-		r, e = c.Package(hctx, ref)
-	} else {
-		r, e = c.Model(hctx, ref)
-	}
+	r, e := c.Package(hctx, ref)
 	if e != nil {
 		return e
 	}
-	rec := output.Record{
+	return emit(ctx, output.Record{
 		Fields: []output.Field{
 			{K: "ref", V: r.Ref()},
 			{K: "created", V: stamp(r.CreatedAt)},
 		},
-	}
-	if kind == "model" {
-		rec.Next = []string{"cozy model download " + r.Ref()}
-	}
-	return emit(ctx, rec)
+	})
 }
