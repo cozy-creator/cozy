@@ -911,18 +911,25 @@ fn stamp_doc(
 /// header's OWN topology (a contract that asks for exactly what is there is the Satisfied
 /// case), and the registration is run, not asserted.
 #[allow(clippy::type_complexity)]
-fn layout_plane_docs(
-    h: &Header,
-    closure: &Closure,
-) -> TfsResult<(
-    CodeTopology,
-    CompatibilityReport,
-    ConversionRegistration,
-    CompatibilityReport,
-    CompatibilityReport,
-    CodeTopology,
-    CompatibilityReport,
-)> {
+/// The layout plane's frozen documents, produced together because every one of them is a
+/// projection of the SAME header and the same base contract — which is what makes the
+/// verdicts they earn comparable.
+struct LayoutPlane {
+    code: CodeTopology,
+    report: CompatibilityReport,
+    registration: ConversionRegistration,
+    worst_full: CompatibilityReport,
+    worst_first: CompatibilityReport,
+    recast: CodeTopology,
+    recast_report: CompatibilityReport,
+    /// The CONVERTIBLE arm: every required dtype widened to f32, which the registered
+    /// lossless bf16 -> f32 mapping closes. CONVERTIBLE is the only grade that populates
+    /// `remedy_registration` and `remedy_mapping`, and tensorhub reads both, so the machine
+    /// surface needs a real one rather than a hand-built decision.
+    widen_report: CompatibilityReport,
+}
+
+fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
     let code = CodeTopology {
         contract: tensorfs_core::ids::object_id(b"ModelConstructionContract:corpus"),
         components: h
@@ -1020,15 +1027,35 @@ fn layout_plane_docs(
         compat::Depth::Full,
     )?;
     let recast_report = CompatibilityReport::of(&recast, h, Lane::Canonical, &out)?;
-    Ok((
+
+    // THE CONVERTIBLE ARM. Same shape as the recast above, widened the other way: every
+    // required dtype becomes f32, so the gap is exactly the lossless cast `reg` registers.
+    let mut widen = code.clone();
+    for (_, keys) in widen.components.iter_mut() {
+        for (_, r) in keys.iter_mut() {
+            r.dtype = Dtype::F32;
+        }
+    }
+    let out = compat::check_compatibility(
+        &widen,
+        h,
+        closure,
+        &pin,
+        Lane::Canonical,
+        &[],
+        compat::Depth::Full,
+    )?;
+    let widen_report = CompatibilityReport::of(&widen, h, Lane::Canonical, &out)?;
+    Ok(LayoutPlane {
         code,
         report,
-        reg,
-        whole_set,
-        first_fact,
+        registration: reg,
+        worst_full: whole_set,
+        worst_first: first_fact,
         recast,
         recast_report,
-    ))
+        widen_report,
+    })
 }
 
 fn receipt(
@@ -1254,8 +1281,16 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     ));
 
     // --- the layout plane (tfs-009): code topology, report, registration
-    let (code, report, reg, worst_full, worst_first, recast, recast_report) =
-        layout_plane_docs(&ha, &closure)?;
+    let LayoutPlane {
+        code,
+        report,
+        registration: reg,
+        worst_full,
+        worst_first,
+        recast,
+        recast_report,
+        widen_report,
+    } = layout_plane_docs(&ha, &closure)?;
     cases.push(ok_case(
         "layout",
         "code-topology",
@@ -1296,6 +1331,15 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         recast.canonical_bytes(),
         "the same contract with only the dtypes recast: a DIFFERENT exact topology digest \
          and the SAME shape digest",
+    ));
+    cases.push(ok_case(
+        "layout",
+        "report-widen",
+        "compat_report",
+        widen_report.canonical_bytes(),
+        "every required dtype widened to f32. With no registry the gap is unclosable and \
+         the frozen grade is INCOMPATIBLE; load the registered lossless cast and the same \
+         report grades CONVERTIBLE, which is the whole point of the rung",
     ));
     cases.push(ok_case(
         "layout",
@@ -1480,7 +1524,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         ),
         (
             "grade-convertible",
-            &recast_report,
+            &widen_report,
             &registry_with_widening,
             "CONVERTIBLE names the registration that closes the gap",
         ),
@@ -2552,7 +2596,7 @@ fn cmd_verify(dir: &Path) -> ExitCode {
             "layout/report-worst-full.json",
             &grade::Registry::default(),
         ),
-        ("grade-convertible", "layout/report-recast.json", &widening),
+        ("grade-convertible", "layout/report-widen.json", &widening),
     ] {
         let live = match report_named(source)
             .and_then(|r| Ok((grade::grade_report(&r, registry)?, r)))

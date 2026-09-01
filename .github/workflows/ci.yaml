@@ -55,7 +55,7 @@ jobs:
           diff <(cat "$m/grade-incompatible.json"; echo) <(./target/release/tfs grade \
             vectors/cases/layout/report-worst-full.json --json)
           diff <(cat "$m/grade-convertible.json"; echo) <(./target/release/tfs grade \
-            vectors/cases/layout/report-recast.json \
+            vectors/cases/layout/report-widen.json \
             --registry vectors/cases/layout/conversion-registration.json --json)
           diff <(cat "$m/capability-admitted.json"; echo) <(./target/release/tfs capability \
             --alias plain/1 x cpu --json)
