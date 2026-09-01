@@ -266,7 +266,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	}
 	if lifecycle.Err() != nil {
 		return records.Rental{}, remote, false, exit.New(exit.Canceled,
-			"rental %s was acquired after model production cancellation", remote.ID)
+			"rental %s was acquired after model transfer cancellation", remote.ID)
 	}
 	if remote.HourlyRateUSDMicros != hourlyRateUSDMicros {
 		_ = st.AdvanceRentalOperation(operationKey, remote.ID, hub.RentalReleaseRequested)

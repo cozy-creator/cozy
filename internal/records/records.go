@@ -67,7 +67,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 9
+const schemaVersion = 10
 
 // schema is the only records shape this pre-launch build accepts.
 var schema = append([]string{`
@@ -102,8 +102,8 @@ CREATE TABLE IF NOT EXISTS pins (
   generation   TEXT    NOT NULL REFERENCES install_generations(id),
   activated_at TEXT    NOT NULL,
   PRIMARY KEY (package)
-)`}, append(modelProductionSchema,
-	append(orchestratorSchema, append(eventSchema, rentalSchema...)...)...)...)
+)`}, append(orchestratorSchema,
+	append(modelTransferSchema, append(eventSchema, rentalSchema...)...)...)...)
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
@@ -141,7 +141,7 @@ func Open(path string) (*Store, *exit.Error) {
 			return nil, e
 		}
 	} else if version >= 6 && version < schemaVersion {
-		if e := migrateToNine(db, path, version); e != nil {
+		if e := migrateToTen(db, path, version); e != nil {
 			db.Close()
 			return nil, e
 		}
@@ -161,12 +161,11 @@ func Open(path string) (*Store, *exit.Error) {
 	return &Store{db: db}, nil
 }
 
-// Schema 8 has the current physical shape but predates named-account validation.
-// Schema 7 additionally has the retired wheelhouse rental column; schema 6 also lacks
-// the default-false rental_required request column. Every released predecessor migrates
-// in place so package, request, and rental rows survive. Model-production rows alone are
-// deliberately retired: they may not resume under schema 9's account authority.
-func migrateToNine(db *sql.DB, path string, sourceVersion int) *exit.Error {
+// Schemas 6 through 9 migrate in place. Package, request, event, and rental rows survive;
+// only schema 9's superseded special model-production subsystem is dropped. Schema 10
+// creates empty request-attached transfer sidecars because those old rows cannot be
+// translated into ordinary request identity safely.
+func migrateToTen(db *sql.DB, path string, sourceVersion int) *exit.Error {
 	if e := verifyPriorSchema(db, path, sourceVersion); e != nil {
 		return e
 	}
@@ -201,19 +200,6 @@ func migrateToNine(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			return e
 		}
 	}
-	for _, table := range []string{
-		"model_production_objects",
-		"model_production_artifacts",
-		"model_production_steps",
-		"model_production_sources",
-		"model_production_source_files",
-		"model_productions",
-	} {
-		if _, err := tx.Exec(`DELETE FROM ` + table); err != nil {
-			return exit.Internalf("cannot retire pre-account %s rows while migrating %s: %s",
-				table, path, err)
-		}
-	}
 	if sourceVersion < 8 {
 		if _, err := tx.Exec(`DROP INDEX rentals_machine_name`); err != nil {
 			return exit.Internalf("cannot stage rental index while migrating %s: %s", path, err)
@@ -235,7 +221,19 @@ func migrateToNine(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			return exit.Internalf("cannot restore rental index while migrating %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=9`); err != nil {
+	for _, table := range []string{"model_production_objects", "model_production_artifacts",
+		"model_production_steps", "model_production_sources", "model_production_source_files",
+		"model_productions"} {
+		if _, err := tx.Exec(`DROP TABLE ` + table); err != nil {
+			return exit.Internalf("cannot retire schema-9 %s while migrating %s: %s", table, path, err)
+		}
+	}
+	for _, statement := range modelTransferSchema {
+		if _, err := tx.Exec(statement); err != nil {
+			return exit.Internalf("cannot create model transfer sidecars while migrating %s: %s", path, err)
+		}
+	}
+	if _, err := tx.Exec(`PRAGMA user_version=10`); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
 	if e := commitMigration(tx, path); e != nil {
@@ -306,7 +304,14 @@ func priorSchema(version int) ([]string, error) {
 	defer db.Close()
 	priorRequests := strings.Replace(requestsDDL,
 		"  rental_required INTEGER NOT NULL DEFAULT 0,\n", "", 1)
-	for _, stmt := range schema {
+	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
+	for _, statement := range schema {
+		if !containsStatement(modelTransferSchema, statement) {
+			statements = append(statements, statement)
+		}
+	}
+	statements = append(statements, schemaNineModelProduction...)
+	for _, stmt := range statements {
 		switch {
 		case stmt == requestsDDL && version == 6:
 			stmt = priorRequests
@@ -318,6 +323,15 @@ func priorSchema(version int) ([]string, error) {
 		}
 	}
 	return schemaSnapshot(db)
+}
+
+func containsStatement(statements []string, wanted string) bool {
+	for _, statement := range statements {
+		if statement == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func verifyPriorSchema(db *sql.DB, path string, version int) *exit.Error {
@@ -380,7 +394,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=9`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=10`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {

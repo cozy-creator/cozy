@@ -18,7 +18,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/modelproduction"
+	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -256,7 +256,7 @@ func TestNumberProfile(t *testing.T) {
 // authors and Cozy consumes at install. Identity is the canonical content and nothing
 // else, and a descriptor that cannot be read exactly is refused rather than guessed at.
 func TestPackageDescriptor(t *testing.T) {
-	raw := []byte(`{"application":"probe:app","entrypoints":[{"name":"run","request":{"fields":[{"constraints":{"gt":0},"name":"strength","type":"float"},{"name":"mode","type":{"literal":["fast","quality"]}}]},"result":{"fields":[]}}],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[]}`)
+	raw := []byte(`{"application":"probe:app","entrypoints":[{"name":"run","request":{"fields":[{"constraints":{"gt":0},"name":"strength","type":"float"},{"name":"mode","type":{"literal":["fast","quality"]}}]},"result":{"fields":[]}}],"format":"cozy.package.descriptor/1","jobs":[]}`)
 	want, err := canonical.Spell(canonical.Digest(raw))
 	must(t, err)
 	doc, problem := launch.DecodeDescriptor(raw)
@@ -281,7 +281,7 @@ func TestPackageDescriptor(t *testing.T) {
 	// Whitespace and key order are NOT identity; a meaning change is.
 	for _, same := range [][]byte{
 		bytes.Replace(raw, []byte(`,"entrypoints"`), []byte(", \"entrypoints\""), 1),
-		[]byte(`{"model_productions":[],"jobs":[],"format":"cozy.package.descriptor/1","entrypoints":[{"result":{"fields":[]},"request":{"fields":[{"type":"float","name":"strength","constraints":{"gt":0}},{"type":{"literal":["fast","quality"]},"name":"mode"}]},"name":"run"}],"application":"probe:app"}`),
+		[]byte(`{"jobs":[],"format":"cozy.package.descriptor/1","entrypoints":[{"result":{"fields":[]},"request":{"fields":[{"type":"float","name":"strength","constraints":{"gt":0}},{"type":{"literal":["fast","quality"]},"name":"mode"}]},"name":"run"}],"application":"probe:app"}`),
 	} {
 		got, problem := launch.DecodeDescriptor(same)
 		if problem != nil || got.Digest != want || !bytes.Equal(got.Raw, raw) {
@@ -307,9 +307,8 @@ func TestPackageDescriptor(t *testing.T) {
 		"unsupported constraint": bytes.Replace(raw, []byte(`"gt":0`), []byte(`"lt":1`), 1),
 		"retired enum grammar": bytes.Replace(raw, []byte(`{"literal":["fast","quality"]}`),
 			[]byte(`{"enum":"Mode","values":["fast","quality"]}`), 1),
-		"model production omitted": bytes.Replace(raw, []byte(`,"model_productions":[]`), nil, 1),
-		"non-empty model production": bytes.Replace(raw, []byte(`"model_productions":[]`),
-			[]byte(`"model_productions":[{}]`), 1),
+		"retired model production graph": bytes.Replace(raw, []byte(`"jobs":[]`),
+			[]byte(`"jobs":[],"model_productions":[]`), 1),
 	} {
 		if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {
 			t.Errorf("%s was accepted at the descriptor boundary", name)
@@ -318,7 +317,7 @@ func TestPackageDescriptor(t *testing.T) {
 }
 
 func TestCompactPackageDescriptor(t *testing.T) {
-	raw := []byte(`{"application":"probe:app","entrypoints":[{"models":[{"class":"Model","component_use":{"run":["transformer"]},"path":"run.models.model","stamps":{"task":"generate"}}],"name":"run","request":{"fields":[{"name":"message","type":"str"},{"name":"event","type":{"tag_field":"type","union":[{"fields":[{"name":"image","type":"str"}],"tag":"image"},{"fields":[{"name":"video","type":"str"}],"tag":"video"}]}}]},"result":{"fields":[]}}],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[]}`)
+	raw := []byte(`{"application":"probe:app","entrypoints":[{"models":[{"class":"Model","component_use":{"run":["transformer"]},"path":"run.models.model","stamps":{"task":"generate"}}],"name":"run","request":{"fields":[{"name":"message","type":"str"},{"name":"event","type":{"tag_field":"type","union":[{"fields":[{"name":"image","type":"str"}],"tag":"image"},{"fields":[{"name":"video","type":"str"}],"tag":"video"}]}}]},"result":{"fields":[]}}],"format":"cozy.package.descriptor/1","jobs":[]}`)
 	doc, problem := launch.DecodeDescriptor(raw)
 	fatal(t, problem)
 	ep := &doc.Entrypoints[0]
@@ -341,83 +340,58 @@ func TestCompactPackageDescriptor(t *testing.T) {
 	}
 }
 
-func TestModelProductionDescriptor(t *testing.T) {
-	raw := []byte(`{"application":"producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"two-lane","steps":[{"callable":"tensorhub/quantize@v1/fp8","models":{"source":"assemble.model"},"name":"quantize","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g"}},{"callable":"tensorhub/minimax-h3-tools@v2/assemble","models":{"dits":"dits","shared":"shared"},"name":"assemble","outputs":["model"]}],"outputs":[{"name":"full","required_contract":{"encodings":["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"source":"assemble.model"},{"name":"fp8","required_contract":{"encodings":["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"],"topology_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"source":"quantize.model"}],"sources":{"dits":"hf/minimax-h3/native-dits-bf16","shared":"hf/minimax-h3/shared-diffusers"}}]}`)
+func TestProducerJobDescriptor(t *testing.T) {
+	raw := []byte(`{"application":"producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16-full","required_contract":{"encodings":["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}},{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8","required_contract":{"encodings":["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"],"topology_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}],"models":[{"class":"MiniMaxH3Dits","component_use":{},"path":"four_lane.models.dits","source_profile":"hf/minimax-h3/native-dual-bf16/1","stamps":{}},{"class":"MiniMaxH3Shared","component_use":{},"path":"four_lane.models.shared","source_profile":"hf/minimax-h3/shared-bf16/1","stamps":{}}],"name":"four_lane","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}]}`)
 	descriptor, problem := launch.DecodeDescriptor(raw)
 	fatal(t, problem)
-	production, problem := descriptor.Production("two-lane")
+	job, problem := descriptor.Function("four_lane")
 	fatal(t, problem)
-	ordered, problem := production.OrderedSteps()
-	fatal(t, problem)
-	if len(ordered) != 2 || ordered[0].Name != "assemble" || ordered[1].Name != "quantize" ||
-		production.Sources["dits"] != "hf/minimax-h3/native-dits-bf16" ||
-		production.Outputs[1].RequiredContract.Encodings[0] != "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" {
-		t.Fatalf("production graph changed: %+v", production)
+	if job.Kind != "job" || len(job.Models) != 2 ||
+		job.Models[0].SourceProfile != "hf/minimax-h3/native-dual-bf16/1" ||
+		job.ArtifactOutputs[1].RequiredContract.Encodings[0] != "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" {
+		t.Fatalf("ordinary producer job changed: %+v", job)
 	}
 	for name, planted := range map[string][]byte{
-		"retired nodes field": bytes.Replace(raw, []byte(`"steps":`), []byte(`"nodes":`), 1),
-		"retired single source": bytes.Replace(raw,
-			[]byte(`"sources":{"dits":"hf/minimax-h3/native-dits-bf16","shared":"hf/minimax-h3/shared-diffusers"}`),
-			[]byte(`"source":"dits"`), 1),
-		"profile escape": bytes.Replace(raw,
-			[]byte(`hf/minimax-h3/native-dits-bf16`), []byte(`../native-dits-bf16`), 1),
-		"unknown edge": bytes.Replace(raw,
-			[]byte(`"source":"assemble.model"`), []byte(`"source":"missing.model"`), 1),
-		"duplicate output": bytes.Replace(raw,
-			[]byte(`"name":"fp8"`), []byte(`"name":"full"`), 1),
-		"retired lane key": bytes.Replace(raw,
-			[]byte(`"name":"fp8"`), []byte(`"lane_key":"fp8","name":"fp8"`), 1),
-		"zero gpu":               bytes.Replace(raw, []byte(`"gpu_count":1`), []byte(`"gpu_count":0`), 1),
-		"unversioned callable":   bytes.Replace(raw, []byte(`quantize@v1/fp8`), []byte(`quantize/fp8`), 1),
-		"retired task alias":     bytes.Replace(raw, []byte(`"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"`), []byte(`"structure":"h3/full","tasks":["fl2va"]`), 1),
-		"package asset in graph": bytes.Replace(raw, []byte(`"callable":"tensorhub/quantize@v1/fp8"`), []byte(`"assets":{"plan":"assets/quant.json"},"callable":"tensorhub/quantize@v1/fp8"`), 1),
-		"encoding aliases":       bytes.Replace(raw, []byte(`"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"`), []byte(`"plain/1"`), 1),
+		"retired graph":    bytes.Replace(raw, []byte(`"jobs":`), []byte(`"model_productions":[],"jobs":`), 1),
+		"partial profiles": bytes.Replace(raw, []byte(`,"source_profile":"hf/minimax-h3/shared-bf16/1"`), nil, 1),
+		"profile escape":   bytes.Replace(raw, []byte(`hf/minimax-h3/native-dual-bf16/1`), []byte(`../native`), 1),
+		"unsorted encodings": bytes.Replace(raw,
+			[]byte(`"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"`),
+			[]byte(`"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"`), 1),
+		"encoding alias": bytes.Replace(raw, []byte(`"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"`), []byte(`"plain/1"`), 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {
-				t.Fatal("invalid model production was accepted")
+				t.Fatal("invalid ordinary producer descriptor was accepted")
 			}
 		})
 	}
 }
 
-func TestModelProductionOperationIdentity(t *testing.T) {
-	production := &launch.ModelProduction{Name: "four-lane", Outputs: []launch.ModelProductionOutput{
-		{Name: "bf16-full"}, {Name: "fp8-adaln-pruned"},
-	}, Sources: map[string]string{
-		"shared": "hf/minimax-h3/shared-diffusers", "dits": "hf/minimax-h3/native-dits-bf16",
-	}}
-	base := modelproduction.Plan{
-		Destination:      "tensorhub/minimax-h3",
-		Source:           "hf://MiniMaxAI/MiniMax-H3@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		SourceSelection:  "sha256:" + strings.Repeat("b", 64),
-		Producer:         "tensorhub/minimax-h3-tools/four-lane",
-		ProducerRelease:  "1.0.0",
-		ProducerDigest:   "sha256:" + strings.Repeat("c", 64),
-		DescriptorDigest: "sha256:" + strings.Repeat("d", 64),
-		Production:       production,
-		Jobs: []modelproduction.JobPin{
-			{Step: "quantize", Callable: "tensorhub/quantize@v1/fp8", Release: "1.2.0", ReleaseDigest: "sha256:" + strings.Repeat("e", 64)},
-			{Step: "assemble", Callable: "tensorhub/minimax-h3-tools@v2/assemble", Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("f", 64)},
-		},
+func TestModelTransferOperationIdentity(t *testing.T) {
+	instruction := modeltransfer.Instruction{Kind: "model-upload",
+		Destination: "tensorhub/minimax-h3",
+		Source:      "hf://MiniMaxAI/MiniMax-H3@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Producer:    "tensorhub/minimax-h3-tools@v2/four-lane", Placement: "rental-only"}
+	base := modeltransfer.Plan{Instruction: instruction,
+		Destination: instruction.Destination, Source: instruction.Source,
+		SourceSelection: "sha256:" + strings.Repeat("b", 64),
+		SourceProfiles:  map[string]string{"shared": "hf/minimax-h3/shared-bf16/1", "dits": "hf/minimax-h3/native-dual-bf16/1"},
+		Outputs:         []modeltransfer.OutputPin{{Name: "bf16-full"}, {Name: "fp8"}}}
+	if !strings.HasPrefix(base.ID(), "modeltransfer-") {
+		t.Fatal("upload transfer identity has the wrong run kind")
 	}
-	reordered := base
-	reordered.Jobs = []modelproduction.JobPin{base.Jobs[1], base.Jobs[0]}
-	if base.ID() != reordered.ID() || !strings.HasPrefix(base.ID(), "modelupload-") {
-		t.Fatal("attempt-independent production identity is not stable")
+	replay := base
+	replay.SourceSelection = "sha256:" + strings.Repeat("0", 64)
+	if replay.ID() != base.ID() {
+		t.Fatal("mutable resolution changed canonical instruction identity")
 	}
-	planBytes, err := base.Bytes()
-	must(t, err)
-	legacy := bytes.Replace(planBytes, []byte(`"Step":`), []byte(`"Node":`), 1)
-	if _, err := modelproduction.Parse(legacy); err == nil {
-		t.Fatal("legacy production plan JobPin.Node was accepted")
+	download := instruction
+	download.Kind, download.Destination = "model-download", "local/minimax-h3"
+	if !strings.HasPrefix(download.ID(), "modeltransfer-") || download.ID() == instruction.ID() {
+		t.Fatal("download and upload instructions did not receive distinct run identities")
 	}
-	changed := base
-	changed.SourceSelection = "sha256:" + strings.Repeat("0", 64)
-	if changed.ID() == base.ID() {
-		t.Fatal("changed pinned source did not move production identity")
-	}
-	if got := strings.Join(base.SourceProfiles(), ","); got != "hf/minimax-h3/native-dits-bf16,hf/minimax-h3/shared-diffusers" {
+	if got := strings.Join(base.ProfileNames(), ","); got != "hf/minimax-h3/native-dual-bf16/1,hf/minimax-h3/shared-bf16/1" {
 		t.Fatalf("source profiles are not deterministic: %s", got)
 	}
 }

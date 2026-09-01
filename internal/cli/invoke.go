@@ -597,9 +597,6 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane str
 
 func handleRunCancel(ctx *Context) *exit.Error {
 	id := ctx.Inv.Args[0]
-	if strings.HasPrefix(id, "modelupload-") {
-		return handleModelProductionCancel(ctx)
-	}
 	if strings.HasPrefix(id, "job-") {
 		return handleJobCancel(ctx)
 	}
@@ -646,10 +643,6 @@ func handleRunList(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	productions, problem := client.ModelProductions("", limit)
-	if problem != nil {
-		return problem
-	}
 	pkg := strings.TrimSpace(ctx.Inv.Value("--package"))
 	list := output.List{
 		Name: "invocations", Fields: []string{"id", "kind", "target", "status"},
@@ -671,18 +664,6 @@ func handleRunList(ctx *Context) *exit.Error {
 		})
 		states[life.Status]++
 	}
-	for _, production := range productions {
-		if pkg != "" && production.Model != pkg ||
-			!modelProductionMatchesFilter(production.Status, ctx.Inv.Value("--state")) {
-			continue
-		}
-		list.Rows = append(list.Rows, map[string]string{
-			"id": production.ID, "kind": production.Kind,
-			"target": production.Model,
-			"status": production.Status, "attempts": "1", "created": production.CreatedAt,
-		})
-		states[production.Status]++
-	}
 	keys := make([]string, 0, len(states))
 	for state := range states {
 		keys = append(keys, state)
@@ -692,20 +673,6 @@ func handleRunList(ctx *Context) *exit.Error {
 		list.Aggregates = append(list.Aggregates, output.Field{K: state, V: states[state]})
 	}
 	return emit(ctx, list)
-}
-
-func modelProductionMatchesFilter(status, filter string) bool {
-	switch strings.TrimSpace(filter) {
-	case "", "any":
-		return true
-	case "queued":
-		return status == "resolving" || status == "accepted"
-	case "in_progress":
-		return status != "resolving" && status != "accepted" &&
-			!modelProductionSettled(status)
-	default:
-		return status == filter
-	}
 }
 
 func invocationFields(life api.Lifecycle) []output.Field {

@@ -369,14 +369,14 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				receipt.WorkerBootId) {
 				continue
 			}
-			c.onProductionArtifactReceipt(s, receipt)
+			c.onModelTransferArtifactReceipt(s, receipt)
 		case *pb.WorkerFrame_ArtifactTransferStatus:
 			status := m.ArtifactTransferStatus
 			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamGeneration,
 				status.WorkerBootId) {
 				continue
 			}
-			c.onProductionArtifactTransferStatus(s, status)
+			c.onModelTransferArtifactStatus(s, status)
 		case *pb.WorkerFrame_CheckpointAck:
 			// the worker's echo of a receipt already durable here; nothing to apply
 		case *pb.WorkerFrame_ArtifactFinalizeResult:
@@ -619,12 +619,12 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		shortDigest(shortNone(snap.SnapshotDigest)), len(snap.SnapshotCanonicalBytes),
 		len(held), doc.Int("accepted_desired_state_revision"), doc.Int("converged_revision"))
 	if w.spec.IsJob() {
-		c.signalAllProductions()
+		c.signalAllTransfers()
 		_ = c.sendJobDirective(s, w)
 		return true
 	}
 	if w.spec.Connection != nil {
-		c.signalAllProductions()
+		c.signalAllTransfers()
 		c.replayPrivateAborts(s, w.spec.Connection.RentalID)
 		c.mu.Lock()
 		private := clonePrivatePackageSet(w.desiredPrivate)

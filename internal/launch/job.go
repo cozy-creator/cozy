@@ -7,6 +7,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // THE JOB HALF of an installed generation (cl-004). A job is an attempt class on the one
@@ -38,6 +39,7 @@ type JobFacts struct {
 	// the publication grant names, one destination each.
 	Outputs         []string
 	ArtifactOutputs []orchestrator.ArtifactOutput
+	SourceProfiles  map[string]string
 	// Publishes is the job's own `publishes=` declaration. A grant mints off the
 	// DECLARATION, never off the kind (cr-009).
 	Publishes bool
@@ -157,8 +159,14 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	artifactOutputs := make([]orchestrator.ArtifactOutput, 0, len(declared.ArtifactOutputs))
 	outputs := append([]string(nil), assets...)
 	for _, output := range declared.ArtifactOutputs {
+		var contract *records.ModelTransferContract
+		if output.RequiredContract != nil {
+			contract = &records.ModelTransferContract{TopologyDigest: output.RequiredContract.TopologyDigest,
+				Encodings: append([]string(nil), output.RequiredContract.Encodings...)}
+		}
 		artifactOutputs = append(artifactOutputs, orchestrator.ArtifactOutput{
 			OutputID: output.OutputID, MimeType: output.MimeType, MaxBytes: output.MaxBytes,
+			RequiredContract: contract,
 		})
 		outputs = append(outputs, output.OutputID)
 	}
@@ -166,6 +174,12 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		Name: function, DescriptorID: said.DescriptorID, Outputs: outputs,
 		ArtifactOutputs: artifactOutputs,
 		Publishes:       declared.Publishes, GPUCount: declared.Resources.GPUCount,
+	}
+	if len(declared.Models) > 0 {
+		facts.SourceProfiles = make(map[string]string, len(declared.Models))
+		for _, model := range declared.Models {
+			facts.SourceProfiles[model.Param] = model.SourceProfile
+		}
 	}
 	return facts, nil
 }

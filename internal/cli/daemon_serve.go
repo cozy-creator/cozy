@@ -108,12 +108,14 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// guard): left unset, dispatch froze empty strings into every persisted invocation.
 	configDigest := localConfigDigest(ctx.Cfg)
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
+	transfers := newModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
 		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSigner(l),
 		RentalFleet: fleet.status, AcquireManagedRental: fleet.acquire,
 		ReleaseManagedRental: fleet.release,
+		ModelTransfers:       transfers,
 		ConfigDigest:         configDigest,
 	})
 	if e != nil {
@@ -142,12 +144,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// route is the ask a platform with no process signal still has (#449), and it takes
 	// exactly the path a SIGTERM takes.
 	stop := make(chan os.Signal, 1)
-	productions := newModelProductionManager(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
 	server := api.New(api.Options{
 		Orchestrator: c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
-		Shutdown:         func() { stop <- syscall.SIGTERM },
-		ModelProductions: productions,
+		Shutdown: func() { stop <- syscall.SIGTERM },
 	})
 	handler, e := server.Handler()
 	if e != nil {
@@ -167,7 +167,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 		go func() { _ = http.Serve(v6, handler) }()
 	}
 	go func() { _ = c.Serve() }()
-	productions.Start()
 
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop

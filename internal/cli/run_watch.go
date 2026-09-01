@@ -23,12 +23,6 @@ func handleRunWatch(ctx *Context) *exit.Error {
 		return problem
 	}
 	switch {
-	case strings.HasPrefix(id, "modelupload-"):
-		state, problem := client.ModelProduction(id)
-		if problem != nil {
-			return problem
-		}
-		return followModelProduction(ctx, client, state)
 	case strings.HasPrefix(id, "job-"):
 		state, problem := client.Job(id)
 		if problem != nil {

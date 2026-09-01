@@ -385,9 +385,27 @@ func (p SourcePlan) SameSelection(other SourcePlan) bool {
 // reviewed whole-source profiles. Creator never parses tensor headers or maps
 // filenames to components.
 func (t *Tool) PlanSource(registry string, carriers []SourceCarrier, outPath string) (SourcePlan, *exit.Error) {
+	return t.planSource(registry, "", carriers, outPath)
+}
+
+func (t *Tool) PlanSourceProfile(registry, profile string, carriers []SourceCarrier,
+	outPath string,
+) (SourcePlan, *exit.Error) {
+	if strings.TrimSpace(profile) == "" {
+		return SourcePlan{}, exit.New(exit.Validation, "source profile is empty")
+	}
+	return t.planSource(registry, profile, carriers, outPath)
+}
+
+func (t *Tool) planSource(registry, profile string, carriers []SourceCarrier,
+	outPath string,
+) (SourcePlan, *exit.Error) {
 	args := []string{"ingest", "source-plan", "--out", outPath}
 	if registry != "" {
 		args = append(args, "--registry", registry)
+	}
+	if profile != "" {
+		args = append(args, "--source-profile", profile)
 	}
 	for _, carrier := range carriers {
 		value := carrier.Path
@@ -470,6 +488,33 @@ func (t *Tool) InstallLocal(session, name, sourceSelection, observed, sourceURI,
 	}
 	_, problem := t.run(args...)
 	return problem
+}
+
+// ReplaceLocal atomically points Creator's one local alias at an already verified
+// ArtifactSink Manifest. TensorFS owns the evidence parse, manifest verification,
+// repository bytes, and compare-and-swap; Creator supplies only frozen identities.
+type ExpectedModelContract struct {
+	TopologyDigest string
+	Encodings      []string
+}
+
+func (t *Tool) ReplaceLocal(name, sourceSelection, observed, manifestID string,
+	manifestLength int64, evidencePath string, contract *ExpectedModelContract,
+) (LocalAlias, *exit.Error) {
+	args := []string{"local", "replace", t.Root, name, sourceSelection,
+		manifestID, strconv.FormatInt(manifestLength, 10), "--observed", observed,
+		"--evidence", evidencePath}
+	if contract != nil {
+		args = append(args, "--expected-topology", contract.TopologyDigest)
+		for _, encoding := range contract.Encodings {
+			args = append(args, "--expected-encoding", encoding)
+		}
+	}
+	out, problem := t.run(args...)
+	if problem != nil {
+		return LocalAlias{}, problem
+	}
+	return parseLocalAlias(out)
 }
 
 func parseLocalAlias(raw string) (LocalAlias, *exit.Error) {

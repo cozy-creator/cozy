@@ -1744,5 +1744,8 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	if problem := c.ResumeOutputExports(); problem != nil {
 		return killed, forgotten, problem
 	}
+	if problem := c.ResumeModelTransfers(); problem != nil {
+		return killed, forgotten, problem
+	}
 	return killed, forgotten, nil
 }

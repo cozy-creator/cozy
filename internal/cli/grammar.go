@@ -123,25 +123,12 @@ func (c *PackagePublishCmd) Run(r *Runtime) error {
 type ModelCmd struct {
 	Search   ModelSearchCmd   `cmd:"" help:"Search the model catalog."`
 	Family   ModelFamilyCmd   `cmd:"" help:"Set a model repository's discovery family."`
-	Import   ModelImportCmd   `cmd:"" help:"Import a foreign model into local TensorFS."`
-	Download ModelDownloadCmd `cmd:"" help:"Download a model into the local TensorFS store."`
+	Download ModelDownloadCmd `cmd:"" help:"Acquire a source, optionally run one producer job, and retain it locally."`
 	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model repositories."`
 	List     ModelListCmd     `cmd:"" help:"List local model releases."`
-	Upload   ModelUploadCmd   `cmd:"" help:"Upload owner-only checkpoints from a source or reviewed producer."`
+	Upload   ModelUploadCmd   `cmd:"" help:"Acquire a source, optionally run one producer job, and retain owner-only checkpoints."`
 	Publish  ModelPublishCmd  `cmd:"" help:"Update a release's mutable lane pointers."`
 	Yank     ModelYankCmd     `cmd:"" help:"Yank a model release."`
-}
-
-type ModelImportCmd struct {
-	Source     string `arg:"" name:"source" help:"Pinned Hugging Face/Civitai source, allowlisted provider URL, or explicit local file."`
-	Name       string `help:"Local model name under local/." required:""`
-	DryRun     bool   `help:"Resolve and validate the import plan without moving model bodies."`
-	TokenStdin bool   `help:"Read this local import's provider token from stdin."`
-}
-
-func (c *ModelImportCmd) Run(r *Runtime) error {
-	return r.call(handleModelImport, []string{c.Source}, bools(
-		"--dry-run", c.DryRun, "--token-stdin", c.TokenStdin), values("--name", c.Name), false)
 }
 
 type ModelSearchCmd struct {
@@ -167,16 +154,21 @@ func (c *ModelFamilyCmd) Run(r *Runtime) error {
 }
 
 type ModelDownloadCmd struct {
-	Ref        string `arg:"" name:"model" help:"Model release ref."`
-	Lane       string `help:"Resolve one release lane."`
-	DryRun     bool   `help:"Show the transfer plan without moving bytes."`
-	TokenStdin bool   `help:"Read this invocation's hub token from stdin."`
+	Source     string `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
+	Ref        string `arg:"" name:"model" help:"Local destination (local/name)."`
+	Producer   string `help:"Ordinary producer job as org/package@vN/function."`
+	Lane       string `help:"Select an input lane when source is a Tensorhub model release."`
+	Rental     bool   `help:"Permit a managed rental when compatible local capacity is unavailable."`
+	RentalOnly bool   `help:"Require a remote rental instead of local capacity."`
+	DryRun     bool   `help:"Resolve the exact transfer plan without moving bodies or spending."`
+	Await      bool   `help:"Watch the accepted run until it settles."`
 }
 
 func (c *ModelDownloadCmd) Run(r *Runtime) error {
-	return r.call(handleModelDownload, []string{c.Ref}, bools(
-		"--dry-run", c.DryRun, "--token-stdin", c.TokenStdin),
-		values("--lane", c.Lane), false)
+	return r.call(handleModelDownload, []string{c.Source, c.Ref}, bools(
+		"--rental", c.Rental, "--rental-only", c.RentalOnly,
+		"--dry-run", c.DryRun, "--await", c.Await),
+		values("--producer", c.Producer, "--lane", c.Lane), false)
 }
 
 type ModelRemoveCmd struct {
@@ -194,18 +186,20 @@ func (c *ModelListCmd) Run(r *Runtime) error {
 }
 
 type ModelUploadCmd struct {
-	Ref      string `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
-	Source   string `arg:"" name:"source" help:"Manifest, pinned foreign source, Tensorhub model release, local alias, or explicit local file."`
-	Producer string `help:"Reviewed org/package@vN/production declaration to execute."`
-	Lane     string `help:"Select an input lane when source is a Tensorhub model release."`
-	Rental   bool   `help:"Authorize one Creator-managed rental for this operation."`
-	DryRun   bool   `help:"Resolve the exact production plan without moving model bodies or spending."`
-	Detach   bool   `help:"Return after durable acceptance instead of following."`
+	Source     string `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
+	Ref        string `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
+	Producer   string `help:"Ordinary producer job as org/package@vN/function."`
+	Lane       string `help:"Select an input lane when source is a Tensorhub model release."`
+	Rental     bool   `help:"Permit a managed rental when compatible local capacity is unavailable."`
+	RentalOnly bool   `help:"Require a remote rental instead of local capacity."`
+	DryRun     bool   `help:"Resolve the exact transfer plan without moving bodies or spending."`
+	Await      bool   `help:"Watch the accepted run until it settles."`
 }
 
 func (c *ModelUploadCmd) Run(r *Runtime) error {
-	return r.call(handleModelUpload, []string{c.Ref, c.Source}, bools(
-		"--rental", c.Rental, "--dry-run", c.DryRun, "--detach", c.Detach),
+	return r.call(handleModelUpload, []string{c.Source, c.Ref}, bools(
+		"--rental", c.Rental, "--rental-only", c.RentalOnly,
+		"--dry-run", c.DryRun, "--await", c.Await),
 		values("--producer", c.Producer, "--lane", c.Lane), false)
 }
 

@@ -10,12 +10,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/modelproduction"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRecordsSchemasSixThroughEightMigrateWithoutDroppingDurableRows(t *testing.T) {
-	for _, version := range []int{6, 7, 8} {
+func TestRecordsSchemasSixThroughNineMigrateWithoutDroppingDurableRows(t *testing.T) {
+	for _, version := range []int{6, 7, 8, 9} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			root := t.TempDir()
 			database := filepath.Join(root, "records.db")
@@ -31,13 +30,6 @@ func TestRecordsSchemasSixThroughEightMigrateWithoutDroppingDurableRows(t *testi
 				MediaAddress: "127.0.0.1:9444", ExpectedWorkerID: "worker-proof",
 				ExpectedWorkerBootID: "boot-proof"}
 			fatal(t, store.RecordRental(rental))
-			instruction := modelproduction.Instruction{Destination: "proof/migrate",
-				Source:   "hf://proof/source@" + strings.Repeat("c", 40),
-				Producer: "proof/tools/build", Rental: true}
-			beginAcceptedModelProduction(t, store, modelproduction.Plan{
-				Instruction: instruction, Destination: instruction.Destination,
-				Source: instruction.Source,
-			})
 			store.Close()
 			db, err := sql.Open("sqlite", database)
 			must(t, err)
@@ -69,10 +61,18 @@ func TestRecordsSchemasSixThroughEightMigrateWithoutDroppingDurableRows(t *testi
 			if migratedRental == nil || *migratedRental != rental {
 				t.Fatalf("schema migration dropped or changed rental row: %#v", migratedRental)
 			}
-			productions, problem := store.ModelProductions("any", 50)
-			fatal(t, problem)
-			if len(productions) != 0 {
-				t.Fatalf("schema migration retained pre-account model productions: %+v", productions)
+			checkDB, err := sql.Open("sqlite", database)
+			must(t, err)
+			var currentVersion, retired, transfers int
+			must(t, checkDB.QueryRow(`PRAGMA user_version`).Scan(&currentVersion))
+			must(t, checkDB.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+				WHERE type='table' AND name='model_productions'`).Scan(&retired))
+			must(t, checkDB.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+				WHERE type='table' AND name='request_model_transfers'`).Scan(&transfers))
+			must(t, checkDB.Close())
+			if currentVersion != 10 || retired != 0 || transfers != 1 {
+				t.Fatalf("migration shape = version:%d retired:%d transfers:%d",
+					currentVersion, retired, transfers)
 			}
 		})
 	}
@@ -157,6 +157,20 @@ func stampRecordsVersion(t *testing.T, path string, version int) {
 	t.Helper()
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
+	for _, table := range []string{"request_model_transfer_objects", "request_model_transfer_outputs",
+		"request_model_transfer_files", "request_model_transfers"} {
+		_, err = db.Exec(`DROP TABLE ` + table)
+		must(t, err)
+	}
+	for _, statement := range records.SchemaNineMigrationDDL() {
+		_, err = db.Exec(statement)
+		must(t, err)
+	}
+	_, err = db.Exec(`INSERT INTO model_productions
+		(id,plan_digest,plan,state,created_at,updated_at)
+		VALUES('retired-proof','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+		x'7b7d','accepted','2026-08-31T00:00:00Z','2026-08-31T00:00:00Z')`)
+	must(t, err)
 	if version < 8 {
 		_, err = db.Exec(`DROP INDEX rentals_machine_name; ALTER TABLE rentals RENAME TO rentals_current`)
 		must(t, err)
@@ -205,7 +219,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS rentals_machine_name
 func recoverablePackageGeneration(t *testing.T, root, id, pkg string) records.PackageInstall {
 	t.Helper()
 	dir := filepath.Join(root, "generations", id)
-	descriptor := []byte(`{"application":"proof:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[]}`)
+	descriptor := []byte(`{"application":"proof:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[]}`)
 	placement := []byte(`{"format":"cozy.worker.v1.PlacementSet/1","placements":[]}`)
 	descriptorDigest := testSHA256(descriptor)
 	placementDigest := testSHA256(placement)

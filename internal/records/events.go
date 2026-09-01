@@ -120,6 +120,10 @@ func (s *Store) CancelQueuedRequest(requestID string, payload map[string]any) (b
 	if _, err := tx.Exec(`UPDATE requests SET state='canceled' WHERE id=?`, requestID); err != nil {
 		return false, exit.Internalf("cannot settle queued request %s: %s", requestID, err)
 	}
+	if _, err := tx.Exec(`UPDATE request_model_transfers SET state='canceled',updated_at=?
+		WHERE request_id=? AND state NOT IN ('completed','failed','canceled')`, now(), requestID); err != nil {
+		return false, exit.Internalf("cannot cancel model transfer %s: %s", requestID, err)
+	}
 	if err := appendEventTx(tx, requestID, "request.canceled", 0, payload); err != nil {
 		return false, exit.Internalf("cannot append queued cancellation for %s: %s", requestID, err)
 	}

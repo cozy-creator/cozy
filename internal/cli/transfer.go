@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,9 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/secret"
 	"github.com/cozy-creator/cozy/internal/tfs"
-	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
 // The model transfer verbs (cl-012). `model upload` is th-002's declare-first protocol
@@ -34,34 +31,7 @@ func tooling(ctx *Context) (*tfs.Tool, *hub.Client, home.Layout, *exit.Error) {
 	if e != nil {
 		return nil, nil, layout, e
 	}
-	c := client(ctx)
-	if ctx.Inv.Bool("--token-stdin") {
-		v, e := readToken(ctx)
-		if e != nil {
-			return nil, nil, layout, e
-		}
-		c = c.WithToken(v, "stdin")
-	}
-	return tool, c, layout, nil
-}
-
-// readToken takes the invocation's credential off stdin. It is a VALUE read, never a
-// prompt: nothing is printed, nothing is waited on interactively, and an empty stdin
-// is a typed refusal rather than a hang. argv is world-readable, which is why the
-// flag has no argument at all (cl-011's secret fence).
-func readToken(ctx *Context) (secret.Value, *exit.Error) {
-	raw, err := io.ReadAll(io.LimitReader(os.Stdin, 8<<10)) //cozy:stdin-value the credential arrives as a value on stdin
-	if err != nil {
-		return secret.Value{}, exit.Internalf("reading the credential from stdin failed: %s", err)
-	}
-	v := secret.New(string(raw))
-	if !v.Present() {
-		return secret.Value{}, exit.Named(exit.Credential, "token.empty_stdin",
-			"--token-stdin was given and stdin carried no credential").
-			WithRemedy("pipe the token in: printf %%s \"$TOKEN\" | cozy … --token-stdin").
-			WithNext("cozy package search")
-	}
-	return v, nil
+	return tool, client(ctx), layout, nil
 }
 
 // scratch is this transfer's own staging directory, named by its subject so two
@@ -72,154 +42,6 @@ func scratch(layout home.Layout, subject string) string {
 
 func progress(ctx *Context) func(string) {
 	return func(line string) { _ = output.Progress(ctx.Err, line) }
-}
-
-func handleDirectModelUpload(ctx *Context) *exit.Error {
-	ref, e := hub.ParseRef(ctx.Inv.Args[0])
-	if e != nil {
-		return e
-	}
-	if ref.Org == "local" {
-		return exit.Usagef("local/ is reserved for private aliases and cannot be a Tensorhub destination").
-			WithRemedy("upload under your Tensorhub account, for example alice/%s", ref.Name)
-	}
-	subject := ctx.Inv.Args[1]
-	localName := ""
-	manifestID := ""
-	if strings.HasPrefix(subject, "local/") {
-		localName = strings.TrimPrefix(subject, "local/")
-		if problem := modelsource.LocalName(localName); problem != nil {
-			return problem
-		}
-	} else {
-		manifestID, e = tfs.ManifestID(subject)
-		if e != nil {
-			return e
-		}
-	}
-	var evidenceRef hub.Ref
-	if localName != "" {
-		tool, _, problem := localTensorFS(ctx)
-		if problem != nil {
-			return problem
-		}
-		row, problem := tool.ResolveLocal(localName)
-		if problem != nil {
-			return problem
-		}
-		manifestID = row.ManifestDigest
-		evidenceRef = hub.Ref{Org: "local", Name: localName}
-	}
-	publicationClient, e := ownedPublication(ctx, ref)
-	if e != nil {
-		return e
-	}
-	reason := "cozy model upload " + ref.String() + " " + manifestID
-	session := transfer.CheckpointOperationID(ref, manifestID)
-	tool, _, layout, e := tooling(ctx)
-	if e != nil {
-		return e
-	}
-	p := &transfer.Upload{
-		Tool: tool, Hub: publicationClient, Ref: ref, EvidenceRef: evidenceRef,
-		ManifestID: manifestID, Session: session,
-		Reason: reason, DryRun: ctx.Inv.Bool("--dry-run"),
-		Progress: progress(ctx), Scratch: scratch(layout, manifestID),
-	}
-	hctx, cancel := hub.LongContext()
-	defer cancel()
-	res, e := p.Run(hctx)
-	if e != nil {
-		return e
-	}
-
-	status, changed := "uploaded", !res.Dup
-	if p.DryRun {
-		status, changed = "planned", false
-	}
-	fields := []output.Field{
-		{K: "model", V: ref.String()},
-		{K: "checkpoint_id", V: manifestID},
-		{K: "status", V: status},
-		{K: "changed", V: changed},
-		{K: "publish_id", V: res.PublishID},
-		{K: "session", V: res.Session},
-		{K: "objects", V: res.Totals.DeclaredObjects},
-		{K: "bytes", V: output.Bytes(res.Totals.DeclaredBytes)},
-		{K: "moved", V: output.Bytes(res.Moved)},
-		{K: "deduped", V: output.Bytes(res.Deduped)},
-	}
-	if p.DryRun {
-		fields = append(fields,
-			output.Field{K: "missing", V: res.Totals.MissingObjects},
-			output.Field{K: "held", V: res.Totals.HeldObjects})
-		rec := compactRecord(fields, "model", "checkpoint_id", "status", "missing", "changed")
-		rec.Next = []string{reason}
-		return emit(ctx, rec)
-	}
-	fields = append(fields,
-		output.Field{K: "uploaded", V: res.Uploaded},
-		output.Field{K: "verified", V: res.Verified},
-		output.Field{K: "manifest_length", V: res.Manifest.Length},
-		output.Field{K: "topology", V: res.TopologyDigest},
-		output.Field{K: "duplicate", V: res.Dup},
-	)
-	return emit(ctx, compactRecord(fields,
-		"model", "checkpoint_id", "status", "moved", "deduped", "changed"))
-}
-
-func handleModelDownload(ctx *Context) *exit.Error {
-	spec := ctx.Inv.Args[0]
-	tool, c, layout, e := tooling(ctx)
-	if e != nil {
-		return e
-	}
-	f := &transfer.Fetch{
-		Tool: tool, Hub: c, Spec: spec, Lane: strings.TrimSpace(ctx.Inv.Value("--lane")),
-		DryRun: ctx.Inv.Bool("--dry-run"), Progress: progress(ctx),
-	}
-	hctx, cancel := hub.LongContext()
-	defer cancel()
-	row, e := f.Resolve(hctx)
-	if e != nil {
-		return e
-	}
-	ref := f.Ref
-	f.Scratch = scratch(layout, row.ManifestID)
-	res, e := f.Acquire(hctx, row)
-	if e != nil {
-		return e
-	}
-
-	status, changed := "downloaded", res.Moved > 0
-	if f.DryRun {
-		status, changed = "planned", false
-	}
-	fields := []output.Field{
-		{K: "model", V: ref.String()},
-		{K: "manifest_id", V: res.ManifestID},
-		{K: "release", V: res.Release},
-		{K: "lane", V: res.Lane},
-		{K: "status", V: status},
-		{K: "changed", V: changed},
-		{K: "objects", V: res.Objects},
-		{K: "bytes", V: output.Bytes(res.Bytes)},
-		{K: "moved", V: output.Bytes(res.Moved)},
-		{K: "deduped", V: output.Bytes(res.Held)},
-	}
-	if f.DryRun {
-		rec := compactRecord(fields, "model", "release", "lane", "manifest_id", "status", "bytes", "changed")
-		rec.Next = []string{"cozy model download " + ref.String() + "@" + res.Release + " --lane " + res.Lane}
-		return emit(ctx, rec)
-	}
-	fields = append(fields,
-		output.Field{K: "header", V: res.HeaderID},
-		output.Field{K: "admitted", V: res.Admitted},
-		output.Field{K: "skipped", V: res.Skipped},
-		output.Field{K: "store", V: tool.Root},
-	)
-	return emit(ctx, compactRecord(fields,
-		"model", "release", "lane", "manifest_id", "status", "moved", "deduped", "changed"))
 }
 
 func localTensorFS(ctx *Context) (*tfs.Tool, home.Layout, *exit.Error) {

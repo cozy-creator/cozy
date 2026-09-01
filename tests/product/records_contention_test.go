@@ -11,7 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRecordsSchemaIsExactV9AndStable(t *testing.T) {
+func TestRecordsSchemaIsExactV10AndStable(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -22,8 +22,8 @@ func TestRecordsSchemaIsExactV9AndStable(t *testing.T) {
 	var version, before int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
-	if version != 9 {
-		t.Fatalf("fresh records version = %d, want exact v9", version)
+	if version != 10 {
+		t.Fatalf("fresh records version = %d, want exact v10", version)
 	}
 	for _, column := range []string{
 		"rental", "rental_required", "package_revision_digest", "environment_digest", "config_digest",
@@ -40,18 +40,16 @@ func TestRecordsSchemaIsExactV9AndStable(t *testing.T) {
 	if deleted != 0 {
 		t.Fatal("exact requests schema retained max_cost_usd_micros")
 	}
-	var steps, legacyTables, stepIndex, stepName int
+	var transfers, legacyTables, outputs int
 	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
-		WHERE type='table' AND name='model_production_steps'`).Scan(&steps))
+		WHERE type='table' AND name='request_model_transfers'`).Scan(&transfers))
 	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
-		WHERE type='table' AND name='model_production_nodes'`).Scan(&legacyTables))
-	must(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('model_production_steps')
-		WHERE name='step_index'`).Scan(&stepIndex))
-	must(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('model_production_steps')
-		WHERE name='step_name'`).Scan(&stepName))
-	if steps != 1 || legacyTables != 0 || stepIndex != 1 || stepName != 1 {
-		t.Fatalf("production step schema = steps:%d legacy:%d index:%d name:%d",
-			steps, legacyTables, stepIndex, stepName)
+		WHERE type='table' AND name='model_productions'`).Scan(&legacyTables))
+	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+		WHERE type='table' AND name='request_model_transfer_outputs'`).Scan(&outputs))
+	if transfers != 1 || legacyTables != 0 || outputs != 1 {
+		t.Fatalf("model transfer schema = transfers:%d legacy:%d outputs:%d",
+			transfers, legacyTables, outputs)
 	}
 	must(t, db.Close())
 
@@ -64,12 +62,12 @@ func TestRecordsSchemaIsExactV9AndStable(t *testing.T) {
 	var after int
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
 	if after != before {
-		t.Fatalf("exact v9 reopen performed DDL: schema_version %d -> %d", before, after)
+		t.Fatalf("exact v10 reopen performed DDL: schema_version %d -> %d", before, after)
 	}
 }
 
-func TestRecordsRefusesMalformedPreV9VersionsWithoutMutation(t *testing.T) {
-	for _, older := range []int{1, 2, 3, 4, 5, 6, 7, 8} {
+func TestRecordsRefusesMalformedPreV10VersionsWithoutMutation(t *testing.T) {
+	for _, older := range []int{1, 2, 3, 4, 5, 6, 7, 8, 9} {
 		t.Run(fmt.Sprintf("v%d", older), func(t *testing.T) {
 			path := t.TempDir() + "/records.db"
 			db, err := sql.Open("sqlite", path)
@@ -84,7 +82,7 @@ func TestRecordsRefusesMalformedPreV9VersionsWithoutMutation(t *testing.T) {
 			opened, problem := records.Open(path)
 			if opened != nil {
 				opened.Close()
-				t.Fatal("pre-v9 records schema opened")
+				t.Fatal("pre-v10 records schema opened")
 			}
 			if problem == nil || problem.ErrName() != "records.schema_reset_required" ||
 				!strings.Contains(problem.Remedy, "move") {
@@ -101,34 +99,6 @@ func TestRecordsRefusesMalformedPreV9VersionsWithoutMutation(t *testing.T) {
 					older, version, before, after)
 			}
 		})
-	}
-}
-
-func TestRecordsMigratesExactV8WithoutDDL(t *testing.T) {
-	path := t.TempDir() + "/records.db"
-	store, problem := records.Open(path)
-	fatal(t, problem)
-	store.Close()
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	_, err = db.Exec(`PRAGMA user_version=8`)
-	must(t, err)
-	var before int
-	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
-	must(t, db.Close())
-
-	opened, problem := records.Open(path)
-	fatal(t, problem)
-	opened.Close()
-	db, err = sql.Open("sqlite", path)
-	must(t, err)
-	defer db.Close()
-	var version, after int
-	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
-	if version != 9 || after != before {
-		t.Fatalf("exact v8 migration performed DDL or missed stamp: version=%d schema_version=%d->%d",
-			version, before, after)
 	}
 }
 
