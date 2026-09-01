@@ -44,6 +44,12 @@ frozen corpus verifies every one:
 | `IngestVerificationReceipt`, `Stamp` | ingest evidence, digested but not path-typed |
 | `CodeTopology`, `CompatibilityReport` | the layout plane's inputs and output |
 
+Three more are neither stored nor exchanged as documents but are a cross-repository contract
+all the same: the `--json` output of `compat check`, `grade` and `capability`, which tensorhub
+shells out for and decodes. They are frozen in `vectors/cases/machine/` and RE-EMITTED by
+`tfs vectors verify`, so adding a key to any of them fails here, on the producer, naming the
+consumer — instead of breaking it silently at runtime, which it did twice.
+
 Plus one bounded operational DTO, `source-plan.json`, specified below. Naming these does not
 make them stored formats; refusing to name them only made the count look smaller than the
 system.

@@ -1,0 +1,4 @@
+doc: machine_grade
+expect: ok
+id: sha256:f28c08b2e8f48f1675593cbdb86682e6526c3bbbc57346e71b96c9616a96b498
+note: INCOMPATIBLE carries the reason and no remedy: a different model, not a different packaging

@@ -49,6 +49,11 @@ pub const DOC_KINDS: &[&str] = &[
     "stamp",
     "code_topology",
     "compat_report",
+    // proto-020: the CLI's `--json` machine surfaces, frozen like every other
+    // cross-boundary document because they ARE one — tensorhub decodes them.
+    "machine_check",
+    "machine_grade",
+    "machine_capability",
     #[cfg(feature = "grade")]
     "conversion_registration",
     #[cfg(feature = "grade")]
@@ -112,6 +117,14 @@ pub fn run_doc(
                 None,
             )
         })?,
+        // The machine surfaces (proto-020). The document is a projection, not a stored
+        // object, so there is no reader to round-trip it through: what a consumer needs
+        // held is its KEY SET, and that is what this compares against the key list this
+        // build's emitter compiles in. The refusal names tensorhub.
+        "machine_check" | "machine_grade" | "machine_capability" => {
+            crate::machine::check_surface(doc, bytes)?;
+            (None, None, None)
+        }
         "compat_report" => {
             let report = crate::compat::CompatibilityReport::parse(bytes)?;
             #[cfg(feature = "grade")]

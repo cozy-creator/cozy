@@ -1,0 +1,3 @@
+doc: machine_grade
+expect: mutant
+note: one byte flipped at offset 114 of sha256:c42fed942e628205971fcbf2358b11fa4933b16250906c091c812240bf6b351e

@@ -483,94 +483,16 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
     let report = ok!(CompatibilityReport::of(&code, &header, lane, &out));
     emit(&report, flags);
 
-    // The machine surface. A caller that shells out to this command must not have to
-    // recognise a verdict by matching a column-aligned print; tensorhub did exactly that
-    // and would have failed closed on any reformat.
+    // The machine surface (proto-020). A caller that shells out to this command must not
+    // have to recognise a verdict by matching a column-aligned print; tensorhub did exactly
+    // that and would have failed closed on any reformat. The document itself is built in
+    // `tensorfs_core::machine`, where it is frozen as a vector and re-emitted by
+    // `tfs vectors verify` — so growing a key fails HERE, naming the consumer, rather than
+    // silently breaking it at runtime.
     if flag_on(flags, "json") {
-        // `details` was always an array; now it is the WHOLE set at the requested depth
-        // rather than an array that only ever held one. `depth` says which, so a consumer
-        // can tell a set of one from a walk that stopped.
-        let details: Vec<tensorfs_core::canon::Value> = out
-            .mismatches
-            .iter()
-            .map(|d| {
-                tensorfs_core::canon::Value::obj(vec![
-                    ("code", tensorfs_core::canon::Value::str(d.code.as_str())),
-                    (
-                        "component",
-                        tensorfs_core::canon::Value::str(d.component.clone()),
-                    ),
-                    ("key", tensorfs_core::canon::Value::str(d.key.clone())),
-                    (
-                        "required",
-                        tensorfs_core::canon::Value::str(side(&d.required)),
-                    ),
-                    (
-                        "present",
-                        tensorfs_core::canon::Value::str(side(&d.present)),
-                    ),
-                ])
-            })
-            .collect();
-        // The two index keys, both sides, so a catalog search can bucket off ONE call:
-        // exact digests equal -> the pair is already an exact-index hit; only the shape
-        // digests equal -> it differs by dtype or encoding alone and is worth grading;
-        // neither -> a different model, refused without grading at all.
-        // WHICH ENCODINGS THE CHECKPOINT ACTUALLY CARRIES, sorted and deduplicated. The
-        // format answer above says the bytes can be read; it says nothing about whether any
-        // card has a qualified implementation for them. That is a second, independent
-        // question (`tfs capability`), and the caller cannot ask it without knowing which
-        // pairs to ask about. Emitting the set here costs nothing -- the report already
-        // holds it -- and saves the hub from parsing a header it is not allowed to parse.
-        let mut encodings: Vec<String> = Vec::new();
-        for f in &report.facts {
-            for e in &f.present_encodings {
-                if !encodings.contains(&e.encoding) {
-                    encodings.push(e.encoding.clone());
-                }
-            }
-        }
-        encodings.sort();
-        let doc = tensorfs_core::canon::Value::obj(vec![
-            (
-                "satisfied",
-                tensorfs_core::canon::Value::Bool(details.is_empty()),
-            ),
-            (
-                "encodings",
-                tensorfs_core::canon::Value::arr(
-                    encodings
-                        .into_iter()
-                        .map(tensorfs_core::canon::Value::str)
-                        .collect(),
-                ),
-            ),
-            ("depth", tensorfs_core::canon::Value::str(depth.name())),
-            ("details", tensorfs_core::canon::Value::arr(details)),
-            (
-                "report",
-                tensorfs_core::canon::Value::str(report.object_id()),
-            ),
-            (
-                "topology_required",
-                tensorfs_core::canon::Value::str(report.topology_required.clone()),
-            ),
-            (
-                "topology_present",
-                tensorfs_core::canon::Value::str(report.topology_present.clone()),
-            ),
-            (
-                "topology_shape_required",
-                tensorfs_core::canon::Value::str(report.topology_shape_required.clone()),
-            ),
-            (
-                "topology_shape_present",
-                tensorfs_core::canon::Value::str(report.topology_shape_present.clone()),
-            ),
-        ]);
         println!(
             "{}",
-            String::from_utf8_lossy(&tensorfs_core::canon::write(&doc))
+            String::from_utf8_lossy(&tensorfs_core::machine::check_json(&report))
         );
         return ExitCode::SUCCESS;
     }
@@ -797,65 +719,6 @@ pub fn cmd_decision(p: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The machine surface of a grade. TOTAL on purpose: every key is present on every grade,
-/// empty where that grade does not carry it. A consumer that fails closed must be able to
-/// decode one shape and read `grade`, not discover which keys this variant happened to
-/// emit — and tensorhub decodes with unknown fields refused, so an absent key and a new key
-/// are equally fatal there.
-///
-/// `remedy_*` is the whole point of the four levels: PRODUCIBLE names the encoding/dtype
-/// the CONTRACT requires, so "we could run this if you convert it to X" is distinguishable
-/// from "no".
-///
-/// `depth` and `mismatches` say WHICH question the grade answers. A `full` grade is the
-/// worst fact of the whole set — the one a catalog may rank on; a `first-mismatch` grade is
-/// the preflight answer off one fact, and ranking on it over-promises. Same keys either
-/// way: the consumer decodes one shape and reads the depth.
-fn grade_json(decision: &GradeDecision, report: &CompatibilityReport) -> Vec<u8> {
-    let (registration, mapping, target, source, reason) = match &decision.grade {
-        Grade::Compatible => ("", "", "", "", ""),
-        Grade::Convertible {
-            registration,
-            mapping,
-        } => (registration.as_str(), mapping.as_str(), "", "", ""),
-        Grade::Producible { target, source } => ("", "", target.as_str(), source.as_str(), ""),
-        Grade::Incompatible { reason } => ("", "", "", "", reason.as_str()),
-    };
-    let v = tensorfs_core::canon::Value::obj(vec![
-        (
-            "decision",
-            tensorfs_core::canon::Value::str(tensorfs_core::ids::object_id(
-                &decision.canonical_bytes(),
-            )),
-        ),
-        (
-            "grade",
-            tensorfs_core::canon::Value::str(decision.grade.name()),
-        ),
-        (
-            "report",
-            tensorfs_core::canon::Value::str(decision.report.clone()),
-        ),
-        (
-            "remedy_registration",
-            tensorfs_core::canon::Value::str(registration),
-        ),
-        ("remedy_mapping", tensorfs_core::canon::Value::str(mapping)),
-        ("remedy_target", tensorfs_core::canon::Value::str(target)),
-        ("remedy_source", tensorfs_core::canon::Value::str(source)),
-        ("reason", tensorfs_core::canon::Value::str(reason)),
-        (
-            "depth",
-            tensorfs_core::canon::Value::str(report.depth.name()),
-        ),
-        (
-            "mismatches",
-            tensorfs_core::canon::Value::uint(report.mismatches.len() as u64),
-        ),
-    ]);
-    tensorfs_core::canon::write(&v)
-}
-
 /// The hub's grading, over a report. Both sides are already named in the report, so this
 /// reads no header, no store and no network.
 ///
@@ -916,7 +779,7 @@ pub fn cmd_grade(report_p: &Path, flags: &Flags) -> ExitCode {
     if flag_on(flags, "json") {
         println!(
             "{}",
-            String::from_utf8_lossy(&grade_json(&decision, &report))
+            String::from_utf8_lossy(&tensorfs_core::machine::grade_json(&decision, &report))
         );
         return ExitCode::SUCCESS;
     }
@@ -1088,7 +951,7 @@ pub fn cmd_grade_stream(path: Option<&Path>, flags: &Flags) -> ExitCode {
             report: report.object_id(),
             grade: grade::grade_report(&report, &reg)?,
         };
-        Ok(grade_json(&decision, &report))
+        Ok(tensorfs_core::machine::grade_json(&decision, &report))
     })
 }
 

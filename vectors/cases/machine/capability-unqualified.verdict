@@ -1,0 +1,4 @@
+doc: machine_capability
+expect: ok
+id: sha256:c50efed28526eb7e49cd4b6e0e23b4ba6df4887ea162948283bc51c1d4db9ec8
+note: REFUSED with qualified_devices non-empty: routable elsewhere, which is a different answer from nothing anywhere runs this
