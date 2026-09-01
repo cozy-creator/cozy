@@ -16,13 +16,13 @@ import (
 
 // Layout is the resolved set of paths every cl-009 verb works against.
 type Layout struct {
-	Root        string
-	DB          string // the one local SQLite lifecycle database
+	Root     string
+	DB       string // the one local SQLite lifecycle database
 	Installs string // one immutable directory per package install
-	Lock        string // the single-writer flock file
-	Daemon      string // the Cozy daemon's liveness lock (cl-001; held, never read)
-	Workers     string // per-worker roots: journal, logs, staged binding plans
-	Outputs     string // the local output namespace the orchestrator grants into
+	Lock     string // the single-writer flock file
+	Daemon   string // the Cozy daemon's liveness lock (cl-001; held, never read)
+	Workers  string // per-worker roots: journal, logs, staged binding plans
+	Outputs  string // the local output namespace the orchestrator grants into
 	// Inputs is the immutable, content-addressed staging area for caller-owned assets.
 	// Request rows point here so requeue never depends on the submitting CLI or its
 	// original path still existing.
@@ -76,19 +76,19 @@ func Open(root string) (Layout, *exit.Error) {
 		return Layout{}, exit.Internalf("cannot protect the private local root %s: %s", root, err)
 	}
 	l := Layout{
-		Root:        root,
-		DB:          filepath.Join(root, "records.db"),
-		Installs:    filepath.Join(root, "installs"),
-		Lock:        filepath.Join(root, "writer.lock"),
-		Daemon:      filepath.Join(root, "daemon.lock"),
-		Workers:     filepath.Join(root, "workers"),
-		Outputs:     filepath.Join(root, "outputs"),
-		Inputs:      filepath.Join(root, "inputs"),
-		Uploads:     filepath.Join(root, "uploads", "sha256"),
-		CAS:         filepath.Join(root, "cas"),
-		Transfer:    filepath.Join(root, "transfer"),
-		Triage:      filepath.Join(root, "triage"),
-		Client:      filepath.Join(root, "client.cred"),
+		Root:     root,
+		DB:       filepath.Join(root, "records.db"),
+		Installs: filepath.Join(root, "installs"),
+		Lock:     filepath.Join(root, "writer.lock"),
+		Daemon:   filepath.Join(root, "daemon.lock"),
+		Workers:  filepath.Join(root, "workers"),
+		Outputs:  filepath.Join(root, "outputs"),
+		Inputs:   filepath.Join(root, "inputs"),
+		Uploads:  filepath.Join(root, "uploads", "sha256"),
+		CAS:      filepath.Join(root, "cas"),
+		Transfer: filepath.Join(root, "transfer"),
+		Triage:   filepath.Join(root, "triage"),
+		Client:   filepath.Join(root, "client.cred"),
 	}
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
