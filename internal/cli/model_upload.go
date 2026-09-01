@@ -123,6 +123,11 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 			WithRemedy("omit --rental-only or use an addressable provider/Tensorhub source")
 	}
 	effectiveRental := rentalRequested(ctx) && !localOnly
+	if kind == "model-download" && effectiveRental {
+		return exit.Named(exit.Unavailable, "model_download.rented_return_unavailable",
+			"rented model download cannot yet return an output to local TensorFS").
+			WithRemedy("run locally until the negotiated artifact-read return plane is active")
+	}
 	if producerName == "" && effectiveRental {
 		return exit.Named(exit.Unavailable, "model_transfer.rented_pass_through_unavailable",
 			"rented pass-through cannot choose a TensorFS source profile without a producer job").
