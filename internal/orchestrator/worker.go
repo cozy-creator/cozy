@@ -550,7 +550,10 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 	if live != nil {
 		// The worker is here. Does it already host what is wanted? The placement's
 		// identity for this purpose is its plan set, which is what the desired set names.
-		if hostsPlans(live, spec.Placement) {
+		c.mu.Lock()
+		hosts := c.workers[instanceID] == live && hostsPlans(live, spec.Placement)
+		c.mu.Unlock()
+		if hosts {
 			return instanceID, ChangeNone, nil
 		}
 		if live.spec.Connection != nil {
