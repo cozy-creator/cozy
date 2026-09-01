@@ -197,6 +197,7 @@ func TestLocalAPIDoor(t *testing.T) {
 	fatal(t, problem)
 	fatal(t, store.RecordRental(records.Rental{
 		ID:               "rental-down-arm",
+		MachineName:      "quiet-heron-0000000000000001",
 		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,
 		State: "ready", Hub: "https://hub.invalid",
 	}))
