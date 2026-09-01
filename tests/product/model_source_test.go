@@ -111,7 +111,7 @@ func TestForeignSourceLaneRefusesBeforeProviderNetwork(t *testing.T) {
 	result := runCozyEnv([]string{"COZY_HOME=" + root, "PATH=/usr/local/bin:/usr/bin:/bin",
 		"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"},
 		"model", "upload", "acme/model", "hf://org/model@"+strings.Repeat("a", 40),
-		"--lane", "bf16")
+		"--lane", "bf16", "--dry-run")
 	if result.code != 2 || !strings.Contains(result.output, "--lane selects only") {
 		t.Fatalf("recognized foreign source = exit %d\n%s", result.code, result.output)
 	}
