@@ -1,0 +1,4 @@
+doc: compat_report
+expect: refuse
+code: PARTIAL_MISMATCH_SET
+note: a full mismatch set relabelled as a stopped walk: ranking refuses rather than reading a truncated set

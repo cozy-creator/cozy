@@ -890,10 +890,17 @@ fn stamp_doc(
 /// vector and the live path cannot describe different things. The code topology is the
 /// header's OWN topology (a contract that asks for exactly what is there is the Satisfied
 /// case), and the registration is run, not asserted.
+#[allow(clippy::type_complexity)]
 fn layout_plane_docs(
     h: &Header,
     closure: &Closure,
-) -> TfsResult<(CodeTopology, CompatibilityReport, ConversionRegistration)> {
+) -> TfsResult<(
+    CodeTopology,
+    CompatibilityReport,
+    ConversionRegistration,
+    CompatibilityReport,
+    CompatibilityReport,
+)> {
     let code = CodeTopology {
         contract: tensorfs_core::ids::object_id(b"ModelConstructionContract:corpus"),
         components: h
@@ -919,7 +926,15 @@ fn layout_plane_docs(
             .collect(),
     };
     let pin: Vec<String> = h.encodings.iter().map(EncodingSpec::object_id).collect();
-    let out = compat::check_compatibility(&code, h, closure, &pin, Lane::Canonical, &[])?;
+    let out = compat::check_compatibility(
+        &code,
+        h,
+        closure,
+        &pin,
+        Lane::Canonical,
+        &[],
+        compat::Depth::Full,
+    )?;
     let report = CompatibilityReport::of(&code, h, Lane::Canonical, &out)?;
     let reg = ConversionRegistration::register(
         "bf16-to-f32",
@@ -929,7 +944,37 @@ fn layout_plane_docs(
         },
         &grade::complete_domain_16(),
     )?;
-    Ok((code, report, reg))
+
+    // THE RED ARM (tfs-037), as a pair of frozen reports over ONE contract.
+    //
+    // The contract's first key asks for f8_e4m3fn where the checkpoint holds bf16 — a
+    // downward cast, PRODUCIBLE on its own — and its last key asks for a shape the
+    // checkpoint does not have, which is a different model and INCOMPATIBLE on its own.
+    // Graded on the FIRST fact the pair reads PRODUCIBLE and a catalog would offer the
+    // conversion; graded on the WHOLE set it is INCOMPATIBLE. Both reports are frozen with
+    // their verdicts so the two answers cannot silently become one.
+    let mut worst = code.clone();
+    let keys: usize = worst.components.iter().map(|(_, k)| k.len()).sum();
+    if keys < 2 {
+        return Err(tensorfs_core::err::Refusal {
+            code: tensorfs_core::err::Code::MISSING_FIELD,
+            detail: "the worst-grade arm needs a contract with at least two keys".into(),
+        });
+    }
+    let last = worst.components.len() - 1;
+    worst.components[0].1[0].1.dtype = Dtype::F8E4M3FN;
+    let tail = worst.components[last].1.len() - 1;
+    worst.components[last].1[tail].1.shape = vec![7];
+
+    let mut reports = Vec::new();
+    for depth in [compat::Depth::Full, compat::Depth::FirstMismatch] {
+        let out =
+            compat::check_compatibility(&worst, h, closure, &pin, Lane::Canonical, &[], depth)?;
+        reports.push(CompatibilityReport::of(&worst, h, Lane::Canonical, &out)?);
+    }
+    let first_fact = reports.pop().unwrap();
+    let whole_set = reports.pop().unwrap();
+    Ok((code, report, reg, whole_set, first_fact))
 }
 
 fn receipt(
@@ -1155,7 +1200,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     ));
 
     // --- the layout plane (tfs-009): code topology, report, registration
-    let (code, report, reg) = layout_plane_docs(&ha, &closure)?;
+    let (code, report, reg, worst_full, worst_first) = layout_plane_docs(&ha, &closure)?;
     cases.push(ok_case(
         "layout",
         "code-topology",
@@ -1169,6 +1214,38 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "compat_report",
         report.canonical_bytes(),
         "Satisfied, with the component-granular encoding facts grading needs",
+    ));
+    // tfs-037. Two reports, ONE contract, one checkpoint: the only difference is how far
+    // the walk went, and it is the difference between offering a conversion and refusing
+    // one. Their frozen `grade:` lines are what notices if the ranking path ever regresses
+    // to reading the first fact.
+    cases.push(ok_case(
+        "layout",
+        "report-worst-full",
+        "compat_report",
+        worst_full.canonical_bytes(),
+        "a dtype cast FIRST and a shape mismatch SECOND: the whole set grades INCOMPATIBLE",
+    ));
+    cases.push(ok_case(
+        "layout",
+        "report-worst-first-fact",
+        "compat_report",
+        worst_first.canonical_bytes(),
+        "the same pair stopped at the first fact: PRODUCIBLE, which is why ranking may not \
+         stop there",
+    ));
+    cases.push(red_case(
+        "layout-red",
+        "worst-graded-partial",
+        "compat_report",
+        sub(
+            &worst_full.canonical_bytes(),
+            "\"depth\":\"full\"",
+            "\"depth\":\"first-mismatch\"",
+        ),
+        "PARTIAL_MISMATCH_SET",
+        "a full mismatch set relabelled as a stopped walk: ranking refuses rather than \
+         reading a truncated set",
     ));
     cases.push(red_case(
         "layout-red",
@@ -1910,6 +1987,19 @@ fn cmd_gen(dir: &Path) -> ExitCode {
                 let m = Manifest::parse(&c.bytes).unwrap();
                 v += &format!("manifest: {}\n", m.manifest_id());
             }
+            // The hub verdict a report earns, frozen alongside its bytes: the corpus holds
+            // the DECISION, not merely the canonical form the decision was read from.
+            if c.doc == "compat_report" {
+                let closure = Closure::default();
+                let outcome = tensorfs_core::corpus::run_doc(
+                    c.doc,
+                    &c.bytes,
+                    &closure,
+                    &registry::platform_digests(),
+                )
+                .unwrap();
+                v += &format!("grade: {}\n", outcome.grade.unwrap());
+            }
         }
         v += &format!("note: {}\n", c.note);
         fs::write(d.join(format!("{}.verdict", c.name)), v).unwrap();
@@ -1930,6 +2020,7 @@ enum Outcome {
         id: String,
         topology: Option<String>,
         manifest: Option<String>,
+        grade: Option<String>,
     },
     Refused(Refusal),
 }
@@ -1941,6 +2032,7 @@ fn run_doc(doc: &str, bytes: &[u8], closure: &Closure, platform: &[String]) -> O
             id: o.id,
             topology: o.topology,
             manifest: o.manifest,
+            grade: o.grade,
         },
         Err(e) => Outcome::Refused(e),
     }
@@ -2015,6 +2107,7 @@ fn cmd_verify(dir: &Path) -> ExitCode {
                         id,
                         topology,
                         manifest,
+                        grade,
                     },
                 ) => {
                     let mut bad = Vec::new();
@@ -2029,6 +2122,11 @@ fn cmd_verify(dir: &Path) -> ExitCode {
                     if let Some(expected) = field(&v, "manifest") {
                         if manifest.as_deref() != Some(expected.as_str()) {
                             bad.push(format!("manifest {manifest:?} != frozen {expected}"));
+                        }
+                    }
+                    if let Some(expected) = field(&v, "grade") {
+                        if grade.as_deref() != Some(expected.as_str()) {
+                            bad.push(format!("grade {grade:?} != frozen {expected}"));
                         }
                     }
                     if bad.is_empty() {

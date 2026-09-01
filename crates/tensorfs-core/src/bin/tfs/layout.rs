@@ -432,8 +432,14 @@ fn emit_bytes(bytes: &[u8], flags: &Flags) {
 /// decision is a function of a code topology, a header and a closure, which is exactly why
 /// it is decidable before a download.
 ///
-/// `--json` prints `{"details":[...],"report":"sha256:...","satisfied":bool}` and nothing
-/// else. That is the surface a program should read; the human print below is for people.
+/// `--depth` picks the question. The default is `first-mismatch` — PREFLIGHT, "can this
+/// run", answered by one blocking fact and paying for nothing after it. `--depth full`
+/// walks the whole topology, which is what RANKING needs: the worst fact is not in general
+/// the first, and only a full report may be graded by `grade_all`.
+///
+/// `--json` prints `{"depth":..,"details":[...],"report":"sha256:...","satisfied":bool}` and
+/// nothing else. That is the surface a program should read; the human print below is for
+/// people.
 pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
     let code = ok!(CodeTopology::parse(&rd!(code_p)));
     let header = ok!(Header::parse(&rd!(header_p)));
@@ -455,6 +461,9 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
         }
     };
     let lane = ok!(Lane::parse(flag(flags, "lane").unwrap_or("canonical")));
+    let depth = ok!(compat::Depth::parse(
+        flag(flags, "depth").unwrap_or("first-mismatch")
+    ));
     let t = Instant::now();
     let out = ok!(compat::check_compatibility(
         &code,
@@ -462,7 +471,8 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
         &closure,
         &pin,
         lane,
-        &markers()
+        &markers(),
+        depth
     ));
     let us = t.elapsed().as_secs_f64() * 1e6;
     let report = ok!(CompatibilityReport::of(&code, &header, lane, &out));
@@ -472,30 +482,37 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
     // recognise a verdict by matching a column-aligned print; tensorhub did exactly that
     // and would have failed closed on any reformat.
     if flag_on(flags, "json") {
-        let details = match &out.satisfaction {
-            Satisfaction::Satisfied => Vec::new(),
-            Satisfaction::Mismatch(d) => vec![tensorfs_core::canon::Value::obj(vec![
-                ("code", tensorfs_core::canon::Value::str(d.code.as_str())),
-                (
-                    "component",
-                    tensorfs_core::canon::Value::str(d.component.clone()),
-                ),
-                ("key", tensorfs_core::canon::Value::str(d.key.clone())),
-                (
-                    "required",
-                    tensorfs_core::canon::Value::str(side(&d.required)),
-                ),
-                (
-                    "present",
-                    tensorfs_core::canon::Value::str(side(&d.present)),
-                ),
-            ])],
-        };
+        // `details` was always an array; now it is the WHOLE set at the requested depth
+        // rather than an array that only ever held one. `depth` says which, so a consumer
+        // can tell a set of one from a walk that stopped.
+        let details: Vec<tensorfs_core::canon::Value> = out
+            .mismatches
+            .iter()
+            .map(|d| {
+                tensorfs_core::canon::Value::obj(vec![
+                    ("code", tensorfs_core::canon::Value::str(d.code.as_str())),
+                    (
+                        "component",
+                        tensorfs_core::canon::Value::str(d.component.clone()),
+                    ),
+                    ("key", tensorfs_core::canon::Value::str(d.key.clone())),
+                    (
+                        "required",
+                        tensorfs_core::canon::Value::str(side(&d.required)),
+                    ),
+                    (
+                        "present",
+                        tensorfs_core::canon::Value::str(side(&d.present)),
+                    ),
+                ])
+            })
+            .collect();
         let doc = tensorfs_core::canon::Value::obj(vec![
             (
                 "satisfied",
                 tensorfs_core::canon::Value::Bool(details.is_empty()),
             ),
+            ("depth", tensorfs_core::canon::Value::str(depth.name())),
             ("details", tensorfs_core::canon::Value::arr(details)),
             (
                 "report",
@@ -520,11 +537,16 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
             "index miss; the decision is the document comparison below"
         }
     );
-    match &out.satisfaction {
-        Satisfaction::Satisfied => println!("verdict      Satisfied"),
-        Satisfaction::Mismatch(d) => {
-            println!("verdict      Mismatch {}", d.code.as_str());
-            println!("  first      {}/{}", d.component, d.key);
+    if out.mismatches.is_empty() {
+        println!("verdict      Satisfied");
+    } else {
+        println!(
+            "verdict      Mismatch — {} fact(s) at depth {}",
+            out.mismatches.len(),
+            depth.name()
+        );
+        for d in &out.mismatches {
+            println!("  {:<10} {}/{}", d.code.as_str(), d.component, d.key);
             println!("  required   {}", side(&d.required));
             println!("  present    {}", side(&d.present));
         }
@@ -725,7 +747,12 @@ pub fn cmd_decision(p: &Path) -> ExitCode {
 /// `remedy_*` is the whole point of the four levels: PRODUCIBLE names the encoding/dtype
 /// the CONTRACT requires, so "we could run this if you convert it to X" is distinguishable
 /// from "no".
-fn grade_json(decision: &GradeDecision) -> Vec<u8> {
+///
+/// `depth` and `mismatches` say WHICH question the grade answers. A `full` grade is the
+/// worst fact of the whole set — the one a catalog may rank on; a `first-mismatch` grade is
+/// the preflight answer off one fact, and ranking on it over-promises. Same keys either
+/// way: the consumer decodes one shape and reads the depth.
+fn grade_json(decision: &GradeDecision, report: &CompatibilityReport) -> Vec<u8> {
     let (registration, mapping, target, source, reason) = match &decision.grade {
         Grade::Compatible => ("", "", "", "", ""),
         Grade::Convertible {
@@ -758,12 +785,26 @@ fn grade_json(decision: &GradeDecision) -> Vec<u8> {
         ("remedy_target", tensorfs_core::canon::Value::str(target)),
         ("remedy_source", tensorfs_core::canon::Value::str(source)),
         ("reason", tensorfs_core::canon::Value::str(reason)),
+        (
+            "depth",
+            tensorfs_core::canon::Value::str(report.depth.name()),
+        ),
+        (
+            "mismatches",
+            tensorfs_core::canon::Value::uint(report.mismatches.len() as u64),
+        ),
     ]);
     tensorfs_core::canon::write(&v)
 }
 
 /// The hub's grading, over a report. Both sides are already named in the report, so this
 /// reads no header, no store and no network.
+///
+/// The report says which question was asked. A `full` report is graded by its WORST fact —
+/// the ranking answer, which is what a catalog search must read; a `first-mismatch` report
+/// is graded by its one fact. The caller does not choose: it produced the report, and
+/// pretending a stopped walk was a complete one is the over-promise this whole path exists
+/// to prevent.
 ///
 /// `--json` prints one `grade_json` object and nothing else — the surface a program reads.
 /// The column-aligned print below is for people, and no caller may match on it.
@@ -805,11 +846,7 @@ pub fn cmd_grade(report_p: &Path, flags: &Flags) -> ExitCode {
             ))
             .1
         }
-        _ => {
-            let g = grade::grade(&report, &reg);
-            ok!(grade::guard_over_constraint(&report, &reg, &g));
-            g
-        }
+        _ => ok!(grade::grade_report(&report, &reg)),
     };
     let us = t.elapsed().as_secs_f64() * 1e6;
     let decision = GradeDecision {
@@ -818,10 +855,22 @@ pub fn cmd_grade(report_p: &Path, flags: &Flags) -> ExitCode {
     };
     emit_bytes(&decision.canonical_bytes(), flags);
     if flag_on(flags, "json") {
-        println!("{}", String::from_utf8_lossy(&grade_json(&decision)));
+        println!(
+            "{}",
+            String::from_utf8_lossy(&grade_json(&decision, &report))
+        );
         return ExitCode::SUCCESS;
     }
-    println!("grade        {}", g.name());
+    println!(
+        "grade        {} — the {} of {} fact(s) at depth {}",
+        g.name(),
+        match report.depth {
+            compat::Depth::Full => "WORST",
+            compat::Depth::FirstMismatch => "first",
+        },
+        report.mismatches.len(),
+        report.depth.name()
+    );
     match &g {
         Grade::Compatible => {}
         Grade::Convertible {
@@ -923,13 +972,15 @@ pub fn cmd_consume(req_p: &Path, resp_p: &Path) -> ExitCode {
     let (report, decision) = ok!(verifier::consume(&req, &resp));
     println!("report       {}", report.object_id());
     println!("lane         {}", report.lane.name());
-    match &report.satisfaction {
+    match report.satisfaction() {
         Satisfaction::Satisfied => println!("satisfaction Satisfied"),
         Satisfaction::Mismatch(d) => println!(
-            "satisfaction Mismatch {} at {}/{}",
+            "satisfaction Mismatch {} at {}/{} ({} fact(s) at depth {})",
             d.code.as_str(),
             d.component,
-            d.key
+            d.key,
+            report.mismatches.len(),
+            report.depth.name()
         ),
     }
     println!("grade        {}", decision.grade.name());

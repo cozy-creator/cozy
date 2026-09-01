@@ -8,6 +8,13 @@
 //! layer below the hub would be a third vocabulary for one decision chain, and the fence in
 //! `scripts/fence.py` keeps that vocabulary out of this file.
 //!
+//! `Depth` is what separates the two questions asked of it. PREFLIGHT — "can this run" — is
+//! answered by ONE blocking fact, so the walk stops there and the caller pays for nothing
+//! after it. RANKING a catalog needs the WORST fact, which is not in general the first: a
+//! pair whose first mismatch is a dtype cast and whose second is a shape mismatch reads
+//! PRODUCIBLE off the first and is actually INCOMPATIBLE. The depth travels with the report
+//! so a grader can never mistake a stopped walk for a complete one.
+//!
 //! What crosses the boundary is a DOCUMENT, not a foreign schema. cozy-runtime owns
 //! `ModelConstructionContract` (cr-004) and TensorFS must never grow a second parser for it
 //! (tfs-013's zero-foreign-schemas fence), so the contract PROJECTS to `CodeTopology` — the
@@ -333,9 +340,8 @@ impl Side {
     }
 }
 
-/// The FIRST disagreeing tensor, both sides, plus the component-granular encoding facts a
-/// grader needs. Nothing here proposes a remedy or a verdict: the whole point of the split
-/// is that this layer reports and the hub decides.
+/// ONE disagreeing tensor, both sides. Nothing here proposes a remedy or a verdict: the
+/// whole point of the split is that this layer reports and the hub decides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Details {
     pub code: Code,
@@ -354,6 +360,42 @@ pub enum Satisfaction {
 impl Satisfaction {
     pub fn is_satisfied(&self) -> bool {
         matches!(self, Satisfaction::Satisfied)
+    }
+}
+
+/// How far a walk goes, and the only thing that separates the two questions this file is
+/// asked.
+///
+/// PREFLIGHT asks "can this run", and ONE blocking fact answers it — so the walk stops
+/// there and the caller never pays for the rest of the topology. RANKING a catalog asks
+/// "how bad is this", and the answer is the WORST fact, which is not in general the first:
+/// a pair whose first mismatch is a dtype cast and whose second is a shape mismatch is
+/// INCOMPATIBLE, and a ranking built on the first fact alone would offer it as a
+/// conversion. The depth travels with the report so a grader can never mistake a stopped
+/// walk for a complete one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    FirstMismatch,
+    Full,
+}
+
+impl Depth {
+    pub fn name(self) -> &'static str {
+        match self {
+            Depth::FirstMismatch => "first-mismatch",
+            Depth::Full => "full",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Depth> {
+        match s {
+            "first-mismatch" => Ok(Depth::FirstMismatch),
+            "full" => Ok(Depth::Full),
+            o => refuse(
+                Code::UNKNOWN_FIELD,
+                format!("depth {o:?} is outside {{first-mismatch, full}}"),
+            ),
+        }
     }
 }
 
@@ -390,15 +432,62 @@ pub struct ComponentFacts {
     pub present_encodings: Vec<EncodingFact>,
 }
 
-/// Everything one call produced: the two-valued satisfaction, the component-granular facts
-/// grading consumes, and the UNCONSUMED set — extra keys a local un-bordered manifest
-/// carried that nothing classified. The unconsumed set is a recorded fact, never a third
-/// verdict: `release_cut` is what refuses on it.
+/// Everything one call produced: the mismatch set, the component-granular facts grading
+/// consumes, and the UNCONSUMED set — extra keys a local un-bordered manifest carried that
+/// nothing classified. The unconsumed set is a recorded fact, never a third verdict:
+/// `release_cut` is what refuses on it.
+///
+/// `mismatches` is the one place a disagreement is recorded, so the two-valued satisfaction
+/// is DERIVED from it rather than stored beside it — there is no second copy of the first
+/// fact for the two to disagree about. At `Depth::FirstMismatch` it holds at most one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
-    pub satisfaction: Satisfaction,
+    pub mismatches: Vec<Details>,
+    pub depth: Depth,
     pub facts: Vec<ComponentFacts>,
     pub unconsumed: Vec<String>,
+}
+
+impl Outcome {
+    pub fn is_satisfied(&self) -> bool {
+        self.mismatches.is_empty()
+    }
+
+    /// The runtime's two-valued answer: the FIRST blocking fact, which is what "can this
+    /// run" is answered by.
+    pub fn satisfaction(&self) -> Satisfaction {
+        satisfaction_of(&self.mismatches)
+    }
+}
+
+fn satisfaction_of(mismatches: &[Details]) -> Satisfaction {
+    match mismatches.first() {
+        None => Satisfaction::Satisfied,
+        Some(d) => Satisfaction::Mismatch(Box::new(d.clone())),
+    }
+}
+
+/// A name -> position index over one component's keys, sorted once and binary-searched.
+///
+/// Both sides used to be scanned linearly per key, which is quadratic in the tensor count
+/// and dominated the walk long before the depth did: a 4096-tensor checkpoint spent 37 ms
+/// answering a question that stops at the first fact. Sortedness is an invariant of the
+/// canonical documents, but it is not assumed here — the index is built from what was
+/// handed in, so an in-memory topology assembled by a caller behaves the same.
+fn index_of<T>(keys: &[(String, T)]) -> Vec<(&str, usize)> {
+    let mut ix: Vec<(&str, usize)> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, (k, _))| (k.as_str(), i))
+        .collect();
+    ix.sort_unstable_by_key(|(k, _)| *k);
+    ix
+}
+
+fn lookup(ix: &[(&str, usize)], key: &str) -> Option<usize> {
+    ix.binary_search_by(|(k, _)| (*k).cmp(key))
+        .ok()
+        .map(|i| ix[i].1)
 }
 
 fn hist(mut v: Vec<Dtype>) -> Vec<(Dtype, u64)> {
@@ -413,14 +502,14 @@ fn hist(mut v: Vec<Dtype>) -> Vec<(Dtype, u64)> {
     out
 }
 
-fn mismatch(code: Code, component: &str, key: &str, required: Side, present: Side) -> Satisfaction {
-    Satisfaction::Mismatch(Box::new(Details {
+fn mismatch(code: Code, component: &str, key: &str, required: Side, present: Side) -> Details {
+    Details {
         code,
         component: component.to_string(),
         key: key.to_string(),
         required,
         present,
-    }))
+    }
 }
 
 /// The one deterministic comparison. Iteration is over the CODE side first, in canonical
@@ -437,10 +526,18 @@ pub fn check_compatibility(
     pin: &[String],
     lane: Lane,
     known_markers: &[String],
+    depth: Depth,
 ) -> Result<Outcome> {
     let mut facts: Vec<ComponentFacts> = Vec::new();
     let mut unconsumed: Vec<String> = Vec::new();
-    let mut verdict = Satisfaction::Satisfied;
+    let mut mismatches: Vec<Details> = Vec::new();
+    // The cheap path, in one predicate: at FirstMismatch depth every comparison after the
+    // first blocking fact is skipped outright — not performed and discarded.
+    macro_rules! stop {
+        () => {
+            depth == Depth::FirstMismatch && !mismatches.is_empty()
+        };
+    }
 
     // -- the required side, in canonical order.
     for (comp, reqs) in &code.components {
@@ -448,8 +545,8 @@ pub fn check_compatibility(
         let tensors: &[(String, crate::header::Tensor)] = match present {
             Some((_, t)) => t.as_slice(),
             None => {
-                if verdict.is_satisfied() {
-                    verdict = mismatch(
+                if !stop!() {
+                    mismatches.push(mismatch(
                         Code::MISSING_COMPONENT,
                         comp,
                         &reqs[0].0,
@@ -460,7 +557,7 @@ pub fn check_compatibility(
                             ..Side::default()
                         },
                         Side::default(),
-                    );
+                    ));
                 }
                 &[]
             }
@@ -530,43 +627,51 @@ pub fn check_compatibility(
             continue;
         }
 
+        let present_index = index_of(tensors);
         for (key, req) in reqs {
-            let want = Side {
+            if stop!() {
+                break;
+            }
+            // Both sides are built ONLY where a fact is recorded. Materialising them for
+            // every key cost two shape clones and an accepts render per tensor whether or
+            // not anything disagreed, which on the satisfied path is the whole walk.
+            let want = || Side {
                 dtype: Some(req.dtype),
                 shape: Some(req.shape.clone()),
                 accepts: Some(accepts_text(&req.accepts)),
                 encoding: None,
             };
-            let t = match tensors.iter().find(|(k, _)| k == key) {
-                Some((_, t)) => t,
+            let t = match lookup(&present_index, key).map(|i| &tensors[i].1) {
+                Some(t) => t,
                 None => {
                     // Missing keys ALWAYS refuse, on every lane. Nothing downstream can
                     // invent a tensor the checkpoint does not carry.
-                    if verdict.is_satisfied() {
-                        verdict = mismatch(Code::MISSING_TENSOR, comp, key, want, Side::default());
-                    }
+                    mismatches.push(mismatch(
+                        Code::MISSING_TENSOR,
+                        comp,
+                        key,
+                        want(),
+                        Side::default(),
+                    ));
                     continue;
                 }
             };
-            let got = Side {
+            let got = || Side {
                 dtype: Some(t.dtype),
                 shape: Some(t.shape.clone()),
                 encoding: Some(t.encoding.clone()),
                 accepts: None,
             };
-            if !verdict.is_satisfied() {
-                continue;
-            }
             if t.shape != req.shape {
-                verdict = mismatch(Code::SHAPE_MISMATCH, comp, key, want, got);
+                mismatches.push(mismatch(Code::SHAPE_MISMATCH, comp, key, want(), got()));
                 continue;
             }
             if t.dtype != req.dtype {
-                verdict = mismatch(Code::DTYPE_MISMATCH, comp, key, want, got);
+                mismatches.push(mismatch(Code::DTYPE_MISMATCH, comp, key, want(), got()));
                 continue;
             }
             if !req.accepts.admits(&t.encoding) {
-                verdict = mismatch(Code::ENCODING_MISMATCH, comp, key, want, got);
+                mismatches.push(mismatch(Code::ENCODING_MISMATCH, comp, key, want(), got()));
                 continue;
             }
             // Encoding assignments against the PINNED registry. cozytensors/1 carries its
@@ -581,37 +686,46 @@ pub fn check_compatibility(
                     .find(|candidate| candidate.object_id() == t.encoding)
             });
             if spec.is_none() {
-                verdict = mismatch(Code::UNKNOWN_ENCODING, comp, key, want, got);
+                mismatches.push(mismatch(Code::UNKNOWN_ENCODING, comp, key, want(), got()));
                 continue;
             }
             if !pin.contains(&t.encoding) {
-                verdict = mismatch(Code::UNKNOWN_TO_LOCAL_CAPABILITY, comp, key, want, got);
+                mismatches.push(mismatch(
+                    Code::UNKNOWN_TO_LOCAL_CAPABILITY,
+                    comp,
+                    key,
+                    want(),
+                    got(),
+                ));
                 continue;
             }
             let spec = spec.unwrap();
             let want_roles: Vec<&str> = spec.roles.iter().map(|(n, _)| n.as_str()).collect();
             let got_roles: Vec<&str> = t.parts.iter().map(|(n, _)| n.as_str()).collect();
             if want_roles != got_roles {
-                verdict = mismatch(Code::ROLE_SET_MISMATCH, comp, key, want, got);
+                mismatches.push(mismatch(Code::ROLE_SET_MISMATCH, comp, key, want(), got()));
             }
         }
     }
 
-    // -- the present side: components and keys the code never asked for.
+    // -- the present side: components and keys the code never asked for. The unconsumed set
+    // is recorded at EVERY depth: it is not a mismatch, and a release cut refuses on it
+    // whether or not the walk also found a blocking fact.
     for (comp, tensors) in &header.components {
         let reqs = code.components.iter().find(|(c, _)| c == comp);
         let known: &[(String, Requirement)] = match reqs {
             Some((_, r)) => r.as_slice(),
             None => {
                 surplus(
-                    &mut verdict,
+                    &mut mismatches,
                     &mut unconsumed,
                     lane,
                     known_markers,
+                    depth,
                     Code::EXTRA_COMPONENT,
                     comp,
                     &tensors[0].0,
-                    Side {
+                    || Side {
                         dtype: Some(tensors[0].1.dtype),
                         shape: Some(tensors[0].1.shape.clone()),
                         encoding: Some(tensors[0].1.encoding.clone()),
@@ -621,19 +735,21 @@ pub fn check_compatibility(
                 continue;
             }
         };
+        let known_index = index_of(known);
         for (key, t) in tensors {
-            if known.iter().any(|(k, _)| k == key) {
+            if lookup(&known_index, key).is_some() {
                 continue;
             }
             surplus(
-                &mut verdict,
+                &mut mismatches,
                 &mut unconsumed,
                 lane,
                 known_markers,
+                depth,
                 Code::EXTRA_TENSOR,
                 comp,
                 key,
-                Side {
+                || Side {
                     dtype: Some(t.dtype),
                     shape: Some(t.shape.clone()),
                     encoding: Some(t.encoding.clone()),
@@ -645,7 +761,8 @@ pub fn check_compatibility(
     unconsumed.sort();
 
     Ok(Outcome {
-        satisfaction: verdict,
+        mismatches,
+        depth,
         facts,
         unconsumed,
     })
@@ -707,9 +824,10 @@ mod inline_spec_tests {
             std::slice::from_ref(&encoding),
             Lane::Canonical,
             &[],
+            Depth::FirstMismatch,
         )
         .unwrap();
-        assert!(outcome.satisfaction.is_satisfied());
+        assert!(outcome.is_satisfied());
 
         let mut missing = header;
         missing.encodings.clear();
@@ -720,10 +838,11 @@ mod inline_spec_tests {
             &[encoding],
             Lane::Canonical,
             &[],
+            Depth::FirstMismatch,
         )
         .unwrap();
         assert!(matches!(
-            outcome.satisfaction,
+            outcome.satisfaction(),
             Satisfaction::Mismatch(details) if details.code == Code::UNKNOWN_ENCODING
         ));
     }
@@ -738,23 +857,25 @@ mod inline_spec_tests {
 /// unconsumed set so a release cut can refuse on it later.
 #[allow(clippy::too_many_arguments)]
 fn surplus(
-    verdict: &mut Satisfaction,
+    mismatches: &mut Vec<Details>,
     unconsumed: &mut Vec<String>,
     lane: Lane,
     known_markers: &[String],
+    depth: Depth,
     code: Code,
     comp: &str,
     key: &str,
-    got: Side,
+    got: impl FnOnce() -> Side,
 ) {
     let is_marker = known_markers.iter().any(|m| key.ends_with(m.as_str()));
     if lane == Lane::LocalUnbordered && !is_marker {
         unconsumed.push(format!("{comp}/{key}"));
         return;
     }
-    if verdict.is_satisfied() {
-        *verdict = mismatch(code, comp, key, Side::default(), got);
+    if depth == Depth::FirstMismatch && !mismatches.is_empty() {
+        return;
     }
+    mismatches.push(mismatch(code, comp, key, Side::default(), got()));
 }
 
 fn accepts_text(a: &Accepts) -> String {
@@ -770,6 +891,10 @@ fn accepts_text(a: &Accepts) -> String {
 /// bounded document interface, and what the hub grades. It carries facts and a
 /// two-valued satisfaction; a `verdict`, `grade` or `remedy` field here would be grading
 /// below the hub, which the fence forbids.
+///
+/// `depth` travels WITH the mismatch set because a grader cannot otherwise tell a complete
+/// set from a stopped one, and grading a stopped set as if it were complete is exactly the
+/// over-promise this document exists to prevent: the second fact is the one that decides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompatibilityReport {
     pub contract: String,
@@ -777,7 +902,8 @@ pub struct CompatibilityReport {
     pub topology_required: String,
     pub topology_present: String,
     pub lane: Lane,
-    pub satisfaction: Satisfaction,
+    pub depth: Depth,
+    pub mismatches: Vec<Details>,
     pub facts: Vec<ComponentFacts>,
     pub unconsumed: Vec<String>,
 }
@@ -795,10 +921,21 @@ impl CompatibilityReport {
             topology_required: code.topology_digest(),
             topology_present: header.topology_digest(),
             lane,
-            satisfaction: o.satisfaction.clone(),
+            depth: o.depth,
+            mismatches: o.mismatches.clone(),
             facts: o.facts.clone(),
             unconsumed: o.unconsumed.clone(),
         })
+    }
+
+    /// The runtime's two-valued answer: the FIRST blocking fact. Derived, never stored, so
+    /// the report cannot carry a satisfaction that disagrees with its own mismatch set.
+    pub fn satisfaction(&self) -> Satisfaction {
+        satisfaction_of(&self.mismatches)
+    }
+
+    pub fn is_satisfied(&self) -> bool {
+        self.mismatches.is_empty()
     }
 
     /// A release cut takes only a manifest whose extras were all classified. An
@@ -816,9 +953,9 @@ impl CompatibilityReport {
                 ),
             );
         }
-        match &self.satisfaction {
-            Satisfaction::Satisfied => Ok(()),
-            Satisfaction::Mismatch(d) => refuse(
+        match self.mismatches.first() {
+            None => Ok(()),
+            Some(d) => refuse(
                 d.code,
                 format!(
                     "{}/{}: the cut candidate does not satisfy its contract",
@@ -844,6 +981,42 @@ fn dtype_hist_from(what: &str, v: &Value) -> Result<Vec<(Dtype, u64)>> {
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
+}
+
+fn details_value(d: &Details) -> Value {
+    Value::obj(vec![
+        ("code", Value::str(d.code.as_str())),
+        ("component", Value::str(d.component.clone())),
+        ("key", Value::str(d.key.clone())),
+        ("present", d.present.to_value()),
+        ("required", d.required.to_value()),
+    ])
+}
+
+fn details_from(v: &Value) -> Result<Details> {
+    let mut df = Fields::new("details", v)?;
+    let code = as_str("details", "code", df.req("code")?)?.to_string();
+    let component = df.req_str("component")?.to_string();
+    let key = df.req_str("key")?.to_string();
+    let present = Side::from_value(df.req("present")?)?;
+    let required = Side::from_value(df.req("required")?)?;
+    df.done()?;
+    let code = match Code::ALL.iter().find(|c| c.as_str() == code) {
+        Some(c) => *c,
+        None => {
+            return refuse(
+                Code::UNKNOWN_FIELD,
+                format!("mismatch code {code:?} is outside the closed code set"),
+            )
+        }
+    };
+    Ok(Details {
+        code,
+        component,
+        key,
+        required,
+        present,
+    })
 }
 
 impl Plain for CompatibilityReport {
@@ -912,39 +1085,30 @@ impl Plain for CompatibilityReport {
                 present_encodings,
             });
         }
+        let depth = Depth::parse(f.req_str("depth")?)?;
         let header = prefixed("report.header", f.req_str("header")?)?;
         let lane = Lane::parse(f.req_str("lane")?)?;
-        let satisfaction = {
+        let mismatches = {
             let mut sf = Fields::new("satisfaction", f.req("satisfaction")?)?;
             let t = as_str("satisfaction", "t", sf.req("t")?)?.to_string();
             match t.as_str() {
                 "satisfied" => {
                     sf.done()?;
-                    Satisfaction::Satisfied
+                    Vec::new()
                 }
                 "mismatch" => {
-                    let code = as_str("satisfaction", "code", sf.req("code")?)?.to_string();
-                    let component = sf.req_str("component")?.to_string();
-                    let key = sf.req_str("key")?.to_string();
-                    let present = Side::from_value(sf.req("present")?)?;
-                    let required = Side::from_value(sf.req("required")?)?;
+                    let mut out = Vec::new();
+                    for dv in as_arr("satisfaction", "details", sf.req("details")?)? {
+                        out.push(details_from(dv)?);
+                    }
                     sf.done()?;
-                    let code = match Code::ALL.iter().find(|c| c.as_str() == code) {
-                        Some(c) => *c,
-                        None => {
-                            return refuse(
-                                Code::UNKNOWN_FIELD,
-                                format!("mismatch code {code:?} is outside the closed code set"),
-                            )
-                        }
-                    };
-                    Satisfaction::Mismatch(Box::new(Details {
-                        code,
-                        component,
-                        key,
-                        required,
-                        present,
-                    }))
+                    if out.is_empty() {
+                        return refuse(
+                            Code::MISSING_FIELD,
+                            "a mismatch satisfaction with an empty detail set names nothing",
+                        );
+                    }
+                    out
                 }
                 o => {
                     return refuse(
@@ -962,32 +1126,48 @@ impl Plain for CompatibilityReport {
             unconsumed.push(as_str("unconsumed", "key", u)?.to_string());
         }
         f.done()?;
+        // A walk that stopped at the first fact cannot have recorded a second one. The
+        // depth is what a grader reads to decide whether the set may be ranked, so a
+        // document whose depth and set disagree is refused rather than believed.
+        if depth == Depth::FirstMismatch && mismatches.len() > 1 {
+            return refuse(
+                Code::PARTIAL_MISMATCH_SET,
+                format!(
+                    "depth {:?} with {} facts: a stopped walk records one, so this document \
+                     mislabels either its depth or its set",
+                    depth.name(),
+                    mismatches.len()
+                ),
+            );
+        }
         Ok(CompatibilityReport {
             contract,
             header,
             topology_required,
             topology_present,
             lane,
-            satisfaction,
+            depth,
+            mismatches,
             facts,
             unconsumed,
         })
     }
 
     fn to_value(&self) -> Value {
-        let satisfaction = match &self.satisfaction {
-            Satisfaction::Satisfied => Value::obj(vec![("t", Value::str("satisfied"))]),
-            Satisfaction::Mismatch(d) => Value::obj(vec![
-                ("code", Value::str(d.code.as_str())),
-                ("component", Value::str(d.component.clone())),
-                ("key", Value::str(d.key.clone())),
-                ("present", d.present.to_value()),
-                ("required", d.required.to_value()),
+        let satisfaction = if self.mismatches.is_empty() {
+            Value::obj(vec![("t", Value::str("satisfied"))])
+        } else {
+            Value::obj(vec![
+                (
+                    "details",
+                    Value::arr(self.mismatches.iter().map(details_value).collect()),
+                ),
                 ("t", Value::str("mismatch")),
-            ]),
+            ])
         };
         Value::obj(vec![
             ("contract", Value::str(self.contract.clone())),
+            ("depth", Value::str(self.depth.name())),
             (
                 "facts",
                 Value::arr(

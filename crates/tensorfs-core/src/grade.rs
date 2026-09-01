@@ -21,9 +21,14 @@
 //! And the recorded v1 recovery, now hub law: a cast-only mismatch grading flat
 //! INCOMPATIBLE is forbidden over-constraint. `guard_over_constraint` is that law with an
 //! exit code.
+//!
+//! Two questions, two functions. `grade` answers PREFLIGHT — "can this run" — off the first
+//! blocking fact, which is all one fact can answer. `grade_all` answers RANKING — "how bad
+//! is this" — off the WHOLE mismatch set, because the worst fact is not in general the
+//! first, and a catalog search built on the first would offer conversions that cannot work.
 
 use crate::canon::{self, as_arr, as_str, Fields, Value};
-use crate::compat::{CompatibilityReport, Satisfaction};
+use crate::compat::{CompatibilityReport, Details};
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Result};
 use crate::ids::{prefixed, ObjectRef};
@@ -558,13 +563,25 @@ fn precision_rank(d: Dtype) -> u8 {
     }
 }
 
-/// The ONE grading decision, over the report and the registry. Header-derived on both
-/// sides, so it is decidable before a byte of weight is downloaded.
+/// The PREFLIGHT grading: the first blocking fact, graded. "Can this run" is answered by
+/// one fact, so this reads one. It is NOT an answer to "how bad is this" — for that the
+/// whole mismatch set has to be walked, which is `grade_all`.
 pub fn grade(report: &CompatibilityReport, reg: &Registry) -> Grade {
-    let d = match &report.satisfaction {
-        Satisfaction::Satisfied => return Grade::Compatible,
-        Satisfaction::Mismatch(d) => d,
-    };
+    match report.mismatches.first() {
+        None => Grade::Compatible,
+        Some(d) => grade_detail(d, reg),
+    }
+}
+
+/// The ONE grading decision, over ONE fact and the registry. Header-derived on both sides,
+/// so it is decidable before a byte of weight is downloaded.
+///
+/// Every remedy this function builds reads `d.required` — the CONTRACT side — for the
+/// target and `d.present` only for the source. That is law 2, and it is held HERE, once,
+/// so that no caller which selects among facts can reconstruct a remedy out of the wrong
+/// side: a selector picks a whole `Grade` this function built, never a level from one fact
+/// and a target from another.
+fn grade_detail(d: &Details, reg: &Registry) -> Grade {
     let where_ = format!("{}/{}", d.component, d.key);
     match d.code {
         // A mapping cannot invent bytes that are not there. A registered RENAME can make
@@ -649,6 +666,68 @@ pub fn grade(report: &CompatibilityReport, reg: &Registry) -> Grade {
     }
 }
 
+/// Where a grade sits on the ladder. `COMPATIBLE < CONVERTIBLE < PRODUCIBLE < INCOMPATIBLE`
+/// is a total order over four levels, so "the worst of a set" is well defined.
+pub fn severity(g: &Grade) -> u8 {
+    match g {
+        Grade::Compatible => 0,
+        Grade::Convertible { .. } => 1,
+        Grade::Producible { .. } => 2,
+        Grade::Incompatible { .. } => 3,
+    }
+}
+
+/// The RANKING grading: the WORST grade across the WHOLE mismatch set.
+///
+/// This is the function a catalog search needs and `grade` is not. An assignment whose
+/// first mismatch is a dtype cast and whose second is a shape mismatch grades PRODUCIBLE on
+/// the first fact and is actually INCOMPATIBLE; a search built on the first fact would
+/// systematically over-promise, offering users conversions that cannot work.
+///
+/// It refuses a report taken at `Depth::FirstMismatch` rather than ranking it. A stopped
+/// walk and a complete one are indistinguishable once the depth is dropped, and "the worst
+/// fact in a set that stopped at the first" is precisely the over-promise above with a
+/// different function name on it.
+///
+/// Law 2 survives selection because what is selected is a whole `Grade` that `grade_detail`
+/// built from ITS OWN fact's contract side. The remedy and the level always come from the
+/// same fact; ties keep the earliest in canonical order, so the answer is deterministic.
+pub fn grade_all(report: &CompatibilityReport, reg: &Registry) -> Result<Grade> {
+    if report.depth != crate::compat::Depth::Full {
+        return refuse(
+            Code::PARTIAL_MISMATCH_SET,
+            format!(
+                "this report was taken at depth {:?} and carries {} fact(s): the WORST fact \
+                 cannot be read off a walk that stopped at the first. Re-check at full depth",
+                report.depth.name(),
+                report.mismatches.len()
+            ),
+        );
+    }
+    let mut worst = Grade::Compatible;
+    for d in &report.mismatches {
+        let g = grade_detail(d, reg);
+        if severity(&g) > severity(&worst) {
+            worst = g;
+        }
+    }
+    guard_over_constraint(report, reg, &worst)?;
+    Ok(worst)
+}
+
+/// Grade the report AT THE DEPTH IT WAS TAKEN. The document says which question was asked;
+/// the caller does not get to pretend it asked the other one.
+pub fn grade_report(report: &CompatibilityReport, reg: &Registry) -> Result<Grade> {
+    match report.depth {
+        crate::compat::Depth::Full => grade_all(report, reg),
+        crate::compat::Depth::FirstMismatch => {
+            let g = grade(report, reg);
+            guard_over_constraint(report, reg, &g)?;
+            Ok(g)
+        }
+    }
+}
+
 /// Apply a registered mapping to the CODE side, producing the contract a checkpoint in the
 /// mapped form would have to satisfy. Only the mappings whose effect is expressible at the
 /// topology layer participate: a rename moves keys, a widening moves the required dtype
@@ -683,10 +762,13 @@ pub fn apply(
     Some(out)
 }
 
-/// The FULL grading: check, and where a registration might close the gap, apply it and
-/// check AGAIN. `CONVERTIBLE` is returned only when the mapped topology is Satisfied — the
-/// registration is proved to close the whole gap, not merely to touch the first key that
-/// disagreed. One matching name is not a conversion.
+/// The FULL grading: check the WHOLE topology, and where a registration might close the
+/// gap, apply it and check AGAIN. `CONVERTIBLE` is returned only when the mapped topology
+/// is Satisfied — the registration is proved to close the whole gap, not merely to touch
+/// the first key that disagreed. One matching name is not a conversion.
+///
+/// The verdict it falls through to is `grade_all`, so the same whole-topology standard now
+/// holds for PRODUCIBLE: it is the worst of every fact, not the grade of the first.
 ///
 /// Bounded by the registration count, and every pass is header-only, so the whole thing
 /// still decides pre-download.
@@ -700,9 +782,20 @@ pub fn resolve(
     known_markers: &[String],
     reg: &Registry,
 ) -> Result<(CompatibilityReport, Grade)> {
-    let out = crate::compat::check_compatibility(code, header, closure, pin, lane, known_markers)?;
+    // The FIRST walk is FULL: the report this returns is the hub's document, and the hub
+    // ranks. The re-checks below ask only "does the mapped topology satisfy outright", and
+    // one fact answers that, so they take the cheap path.
+    let out = crate::compat::check_compatibility(
+        code,
+        header,
+        closure,
+        pin,
+        lane,
+        known_markers,
+        crate::compat::Depth::Full,
+    )?;
     let report = CompatibilityReport::of(code, header, lane, &out)?;
-    if out.satisfaction.is_satisfied() {
+    if out.is_satisfied() {
         return Ok((report, Grade::Compatible));
     }
     for r in &reg.registrations {
@@ -710,9 +803,16 @@ pub fn resolve(
             Some(m) => m,
             None => continue,
         };
-        let re =
-            crate::compat::check_compatibility(&mapped, header, closure, pin, lane, known_markers)?;
-        if re.satisfaction.is_satisfied() {
+        let re = crate::compat::check_compatibility(
+            &mapped,
+            header,
+            closure,
+            pin,
+            lane,
+            known_markers,
+            crate::compat::Depth::FirstMismatch,
+        )?;
+        if re.is_satisfied() {
             return Ok((
                 report,
                 Grade::Convertible {
@@ -722,49 +822,57 @@ pub fn resolve(
             ));
         }
     }
-    let g = grade(&report, reg);
-    guard_over_constraint(&report, reg, &g)?;
+    let g = grade_all(&report, reg)?;
     Ok((report, g))
 }
 
-/// The v1 recovery with an exit code: a cast-only mismatch that a registration covers can
+/// The v1 recovery with an exit code: a mismatch set that is cast-only and COVERED can
 /// NEVER be graded INCOMPATIBLE. Run after every grading; a red arm plants the shortcut and
 /// watches this fire.
+///
+/// It reads the WHOLE set, and every fact in it must be a covered cast before it fires.
+/// Reading only the first fact would make the guard refuse an honest INCOMPATIBLE the
+/// moment a covered cast happened to sort ahead of a shape mismatch — the mirror image of
+/// the defect `grade_all` exists to fix, and it would refuse a correct verdict rather than
+/// merely over-promise.
 pub fn guard_over_constraint(
     report: &CompatibilityReport,
     reg: &Registry,
     g: &Grade,
 ) -> Result<()> {
-    let d = match &report.satisfaction {
-        Satisfaction::Satisfied => return Ok(()),
-        Satisfaction::Mismatch(d) => d,
-    };
-    if d.code != Code::DTYPE_MISMATCH {
+    if report.mismatches.is_empty() || !matches!(g, Grade::Incompatible { .. }) {
         return Ok(());
     }
-    let (p, r) = match (d.present.dtype, d.required.dtype) {
-        (Some(p), Some(r)) => (p, r),
-        _ => return Ok(()),
-    };
-    if let Some(hit) = reg.covering_cast(p, r) {
-        if matches!(g, Grade::Incompatible { .. }) {
-            return refuse(
-                Code::UNREGISTERED_CONVERSION,
-                format!(
-                    "{}/{}: graded INCOMPATIBLE while registration {:?} covers the cast {} -> \
-                     {} with a {} round trip — forbidden over-constraint (v1 recovery, now hub \
-                     law): a cast-only mismatch names the registered lossless conversion",
-                    d.component,
-                    d.key,
-                    hit.name,
-                    p.name(),
-                    r.name(),
-                    hit.round_trip.coverage
-                ),
-            );
+    let mut covered = Vec::new();
+    for d in &report.mismatches {
+        if d.code != Code::DTYPE_MISMATCH {
+            return Ok(());
+        }
+        match (d.present.dtype, d.required.dtype) {
+            (Some(p), Some(r)) => match reg.covering_cast(p, r) {
+                Some(hit) => covered.push((d, p, r, hit)),
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
         }
     }
-    Ok(())
+    let (d, p, r, hit) = covered[0];
+    refuse(
+        Code::UNREGISTERED_CONVERSION,
+        format!(
+            "{}/{}: graded INCOMPATIBLE while registration {:?} covers the cast {} -> {} with \
+             a {} round trip, and all {} mismatch(es) are covered casts — forbidden \
+             over-constraint (v1 recovery, now hub law): a cast-only mismatch names the \
+             registered lossless conversion",
+            d.component,
+            d.key,
+            hit.name,
+            p.name(),
+            r.name(),
+            hit.round_trip.coverage,
+            report.mismatches.len()
+        ),
+    )
 }
 
 // ---------------------------------------------------------------- the decision document
