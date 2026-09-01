@@ -573,19 +573,8 @@ func (c *Orchestrator) settleLocalProcessDeath(attempt records.Attempt) {
 	})
 }
 
-// NoProgressReports is how many SUCCESSIVE worker reports must both declare a wedge and
-// show no movement on any reported axis before the worker is retired on the no-progress
-// ground. A COUNT of the worker's own reports, never a duration (decisions #613): the
-// judgment "nothing is moving" is made by the process that can see movement — the worker's
-// liveness monitor, which is itself clock-free — and this only asks that the declared
-// verdict persist rather than flicker. A legitimately slow fill never meets it, because a
-// worker making progress does not declare a wedge.
-const NoProgressReports = 15
-
-// retirementLoop samples the retirement grounds on the worker report cadence, for as long
-// as this daemon lives. A ticker is needed because ground 2 is the ABSENCE of reports —
-// a dead worker produces no frame for a frame handler to run on. The tick itself decides
-// nothing; every ground below is the worker's own word or its silence.
+// retirementLoop samples typed worker/refusal grounds. The ticker schedules observation;
+// elapsed time and a count of unchanged reports grant no retirement authority.
 func (c *Orchestrator) retirementLoop() {
 	tick := time.NewTicker(ReportCadence)
 	defer tick.Stop()
@@ -609,16 +598,9 @@ func (c *Orchestrator) retirementLoop() {
 //  1. WORKER-DECLARED FAILURE — a FAILED axis is the worker saying "I cannot" and is
 //     acted on immediately. Fault rows only explain an axis: BINDING_DEGRADED explicitly
 //     coexists with service. A claim this owner REFUSED is the same terminal class.
-//  2. LIVENESS DEATH — the worker owes an ObservedWorkerState every `ReportCadence` and
-//     has missed `SilentReports` of them. A count of missed heartbeats, never a guess
-//     about how long a load takes: a worker filling for an hour reports on every one.
-//  3. WORKER-DECLARED NO-PROGRESS — the worker's own liveness monitor declared a subject
-//     WEDGED (its verdict is clock-free: consecutive observations of an unmoved monotone
-//     position), and that declaration has persisted across `NoProgressReports` successive
-//     reports in which no reported axis moved either.
 //
-// A worker that is merely SLOW — materializing, activating, filling — is none of these,
-// however long it takes, and nothing here may kill it.
+// Stream/process exit is observed by the worker owner elsewhere. A worker that is merely
+// silent or slow is not failed or replaced by this loop.
 func (c *Orchestrator) checkRetirement() {
 	c.mu.Lock()
 	head, closing := "", c.closing
@@ -641,7 +623,7 @@ func (c *Orchestrator) checkRetirement() {
 			if w.exited || w.stopping || !eligible(w) {
 				continue
 			}
-			if retirementGround(w, nil) != "" {
+			if retirementGround(w) != "" {
 				out = append(out, candidate{worker: w,
 					state: fmt.Sprintf("%s/%s",
 						trimEnum(pb.MaterializationState_name[int32(w.materialization)], "MATERIALIZATION_STATE_"),
@@ -653,11 +635,11 @@ func (c *Orchestrator) checkRetirement() {
 		})
 		return out
 	}
-	retire := func(victim candidate, subject string, attempts []records.Attempt) bool {
+	retire := func(victim candidate, subject string) bool {
 		w := victim.worker
 		c.mu.Lock()
 		current := c.workers[w.instanceID] == w && !w.exited && !w.stopping
-		ground := retirementGround(w, attempts)
+		ground := retirementGround(w)
 		c.mu.Unlock()
 		if !current || ground == "" {
 			return false
@@ -675,19 +657,15 @@ func (c *Orchestrator) checkRetirement() {
 		return true
 	}
 
-	// An accepted attempt is its own obligation. A completely unrelated queue head must
-	// neither mask its wedge nor become the subject printed in its retirement evidence.
-	// Only a worker that DECLARED a wedged subject needs its open attempts read to decide
-	// whether the wedge is on accepted work; the other grounds never depend on them.
 	active := snapshot(func(w *worker) bool {
-		return len(w.wedgedSubjects) > 0 || retirementGround(w, []records.Attempt{}) != ""
+		return retirementGround(w) != ""
 	})
 	for _, victim := range active {
 		open, e := c.opt.Store.OpenAttemptsOf(victim.worker.instanceID)
 		if e != nil || len(open) == 0 {
 			continue
 		}
-		if retire(victim, open[0].RequestID, open) {
+		if retire(victim, open[0].RequestID) {
 			return
 		}
 	}
@@ -717,43 +695,19 @@ func (c *Orchestrator) checkRetirement() {
 			!(w.spec.IsJob() && w.dispatchable[req.PlanID])
 	})
 	for _, victim := range queued {
-		if retire(victim, head, nil) {
+		if retire(victim, head) {
 			return
 		}
 	}
 }
 
-func retirementGround(w *worker, attempts []records.Attempt) string {
+func retirementGround(w *worker) string {
 	if w.refusal != nil {
 		return fmt.Sprintf("this owner refused its claim (%s: %s)",
 			w.refusal.ErrName(), w.refusal.Message)
 	}
 	if w.faulted {
 		return fmt.Sprintf("it reported a FAILED worker/placement axis: %s", w.fault)
-	}
-	quiet := time.Duration(0)
-	if !w.lastReport.IsZero() {
-		quiet = time.Since(w.lastReport)
-	} else if !w.spawned.IsZero() {
-		quiet = time.Since(w.spawned)
-	}
-	if quiet > SilentReports*ReportCadence {
-		return fmt.Sprintf("it reported no observed state for %s — %d missed reports of %s",
-			quiet.Round(time.Second), SilentReports, ReportCadence)
-	}
-	wedgeApplies := w.wedged
-	if attempts != nil {
-		wedgeApplies = false
-		for _, attempt := range attempts {
-			if w.wedgedSubjects[fmt.Sprintf("%s#%d", attempt.RequestID, attempt.Attempt)] {
-				wedgeApplies = true
-				break
-			}
-		}
-	}
-	if wedgeApplies && w.noProgress >= NoProgressReports {
-		return fmt.Sprintf("it declared itself WEDGED and %d successive reports moved no axis",
-			w.noProgress)
 	}
 	return ""
 }

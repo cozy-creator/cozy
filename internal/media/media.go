@@ -63,12 +63,9 @@ type Client struct {
 	maxObject int64
 }
 
-// Budget is the STALL allowance: how long a call may go with no byte moving in either
-// direction before it is called dead. It is DERIVED, not chosen: the caller passes the
-// same silence budget the pod's CONTROL leg is already judged by — the count of report
-// periods a worker may miss before it is called stalled
-// (`orchestrator.SilentReports * orchestrator.ReportCadence`). A transfer that keeps moving
-// bytes, however slowly, is never failed by it: total wall time is not a bandwidth claim.
+// Budget is the I/O stall allowance: how long one call may go with no byte moving in either
+// direction. A transfer that keeps moving bytes, however slowly, is never failed by it:
+// total wall time is not a bandwidth claim, and this bound cannot settle or retire a worker.
 //
 // It is not optional, and the reason is an observation: a client with no bound at all hung
 // on `connect()` against a REAL rented pod whose provider had mapped the control port and

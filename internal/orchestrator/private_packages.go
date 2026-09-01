@@ -245,9 +245,6 @@ func (c *Orchestrator) cancelPrivateTransfer(operationID string) *exit.Error {
 		return nil
 	case <-s.ctx.Done():
 		return exit.Unavailablef("worker control stream closed during private package abort")
-	case <-time.After(SilentReports * ReportCadence):
-		return exit.Named(exit.Failed, "private_package_abort_silent",
-			"worker did not acknowledge private package abort")
 	}
 }
 
@@ -346,7 +343,6 @@ func (c *Orchestrator) transferPrivateFile(instanceID, operationID string,
 }
 
 func (c *Orchestrator) privateControl(instanceID string) (*worker, *session, *exit.Error) {
-	silent := SilentReports * ReportCadence
 	for {
 		c.mu.Lock()
 		w := c.workers[instanceID]
@@ -355,15 +351,9 @@ func (c *Orchestrator) privateControl(instanceID string) (*worker, *session, *ex
 			s = c.sessions[w.bootID]
 		}
 		gone := w == nil || w.exited
-		quiet := time.Duration(0)
 		var refused *exit.Error
 		if w != nil {
 			refused = w.refusal
-			if !w.lastReport.IsZero() {
-				quiet = time.Since(w.lastReport)
-			} else if !w.spawned.IsZero() {
-				quiet = time.Since(w.spawned)
-			}
 		}
 		c.mu.Unlock()
 		switch {
@@ -374,9 +364,6 @@ func (c *Orchestrator) privateControl(instanceID string) (*worker, *session, *ex
 		case gone:
 			return nil, nil, exit.New(exit.Failed,
 				"the rented worker exited during private package transfer")
-		case quiet > silent:
-			return nil, nil, exit.Named(exit.Failed, "worker_silent",
-				"the rented worker stopped reporting during private package transfer")
 		}
 		select {
 		case <-c.done:
@@ -389,8 +376,6 @@ func (c *Orchestrator) privateControl(instanceID string) (*worker, *session, *ex
 func (c *Orchestrator) awaitPrivateProgress(instanceID, operationID, digest string,
 	before uint64, sent *session,
 ) *exit.Error {
-	reports := 0
-	var lastReport time.Time
 	for {
 		status := c.privateStatus(operationID, digest)
 		if status.received > before ||
@@ -402,19 +387,9 @@ func (c *Orchestrator) awaitPrivateProgress(instanceID, operationID, digest stri
 		w := c.workers[instanceID]
 		current := w != nil && c.sessions[w.bootID] == sent
 		gone := w == nil || w.exited
-		quiet := time.Duration(0)
 		var refused *exit.Error
 		if w != nil {
 			refused = w.refusal
-			if !w.lastReport.IsZero() {
-				quiet = time.Since(w.lastReport)
-				if w.lastReport.After(lastReport) {
-					lastReport = w.lastReport
-					reports++
-				}
-			} else if !w.spawned.IsZero() {
-				quiet = time.Since(w.spawned)
-			}
 		}
 		c.mu.Unlock()
 		switch {
@@ -425,12 +400,6 @@ func (c *Orchestrator) awaitPrivateProgress(instanceID, operationID, digest stri
 		case gone:
 			return exit.New(exit.Failed,
 				"the rented worker exited during private package transfer")
-		case quiet > SilentReports*ReportCadence:
-			return exit.Named(exit.Failed, "worker_silent",
-				"the rented worker stopped reporting during private package transfer")
-		case reports > NoProgressReports:
-			return exit.Named(exit.Failed, "private_package_no_progress",
-				"the worker reported %d times without acknowledging a private package chunk", reports)
 		}
 		select {
 		case <-c.done:

@@ -442,34 +442,13 @@ type worker struct {
 	fault      string
 	faulted    bool
 	errorSince time.Time
-	// lastReport is when this worker last said ANYTHING. The ObservedWorkerState cadence
-	// is a protocol fact rather than a choice made here, which is what makes silence
-	// measurable: a worker that is loading for twenty minutes still reports every
-	// period, so "has not reported" is a stall and never merely "is slow".
+	// lastReport is telemetry only. Elapsed time since it never settles or retires work.
 	lastReport time.Time
-	// spawned starts the silence clock BEFORE the first report: a worker that never
-	// claims at all owes its first one on the same cadence, and a wait with no clock
-	// until the first frame is a wait that cannot end (found by the flip: a pre-flip
-	// runtime wheel that cannot host left the readiness wait spinning forever).
-	// For an ATTACHED worker it is zero until its first ClaimAck: the dial / plan delivery
-	// phase is bounded by its own measured progress, not by the report cadence.
-	spawned time.Time
 	// LRU is dispatch-based, not report-based: reports say the worker lives, while an
 	// accepted attempt says a user actually used it. Never-used workers fall back to
 	// residentRevision so two cold holders still have a deterministic oldest member.
 	residentRevision uint64
 	lastUseRevision  uint64
-
-	// THE NO-PROGRESS GROUND'S STATE (cl-025). progressSig is a signature over every
-	// axis the last report carried — states, revisions, plan sets, the activity lane's
-	// high-water sequence — so "no axis moved" is a comparison of two reports, never a
-	// clock. wedged is whether the worker's own liveness monitor currently declares a
-	// WEDGED subject (its verdict rides the activity lane), and noProgress counts the
-	// SUCCESSIVE reports that both declared it and moved nothing. Any movement resets.
-	progressSig    string
-	wedged         bool
-	wedgedSubjects map[string]bool
-	noProgress     int
 }
 
 // dispatchableFor is the ROUTING GATE, and it is two questions with two owners (#482).
@@ -701,22 +680,15 @@ func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *e
 }
 
 func (c *Orchestrator) ensureWorkerClaimed(instanceID string) *exit.Error {
-	silent := SilentReports * ReportCadence
 	for {
 		c.mu.Lock()
 		w := c.workers[instanceID]
 		claimed := w != nil && !w.exited && w.bootID != "" && !w.lastReport.IsZero() &&
 			w.snapshotAcknowledged
 		gone := w == nil || w.exited
-		quiet := time.Duration(0)
 		var refused *exit.Error
 		if w != nil {
 			refused = w.refusal
-			if !w.lastReport.IsZero() {
-				quiet = time.Since(w.lastReport)
-			} else if !w.spawned.IsZero() {
-				quiet = time.Since(w.spawned)
-			}
 		}
 		c.mu.Unlock()
 		switch {
@@ -726,9 +698,6 @@ func (c *Orchestrator) ensureWorkerClaimed(instanceID string) *exit.Error {
 			return refused
 		case gone:
 			return exit.New(exit.Failed, "the rented worker exited before accepting this Creator claim")
-		case quiet > silent:
-			return exit.Named(exit.Failed, "worker_silent",
-				"the rented worker did not accept this Creator claim across %d report periods", SilentReports)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -736,20 +705,13 @@ func (c *Orchestrator) ensureWorkerClaimed(instanceID string) *exit.Error {
 
 func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 	logical LogicalPackage) (WorkerLaunchSpec, string, *exit.Error) {
-	silent := SilentReports * ReportCadence
 	for {
 		c.mu.Lock()
 		w := c.workers[instanceID]
 		gone := w == nil || w.exited
-		quiet := time.Duration(0)
 		var refused, desiredRefusal *exit.Error
 		if w != nil {
 			refused, desiredRefusal = w.refusal, w.desiredRefusal
-			if !w.lastReport.IsZero() {
-				quiet = time.Since(w.lastReport)
-			} else if !w.spawned.IsZero() {
-				quiet = time.Since(w.spawned)
-			}
 			planID := logical.PlanID
 			if planID == "" && len(logical.Models) > 0 {
 				for candidate, dispatchable := range w.dispatchable {
@@ -803,16 +765,12 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 		case gone:
 			return WorkerLaunchSpec{}, "", exit.New(exit.Failed,
 				"the rented worker exited before making package %s ready", logical.Package)
-		case quiet > silent:
-			return WorkerLaunchSpec{}, "", exit.Named(exit.Failed, "worker_silent",
-				"the rented worker stopped reporting while preparing package %s", logical.Package)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 }
 
 func (c *Orchestrator) waitPackageStaged(instanceID string) *exit.Error {
-	silent := SilentReports * ReportCadence
 	for {
 		c.mu.Lock()
 		w := c.workers[instanceID]
@@ -820,16 +778,10 @@ func (c *Orchestrator) waitPackageStaged(instanceID string) *exit.Error {
 			w.acceptedRevision >= w.revision &&
 			w.materialization == pb.MaterializationState_MATERIALIZATION_STATE_STAGED
 		gone := w == nil || w.exited
-		quiet := time.Duration(0)
 		var refused, desiredRefusal *exit.Error
 		faulted := false
 		if w != nil {
 			refused, desiredRefusal, faulted = w.refusal, w.desiredRefusal, w.faulted
-			if !w.lastReport.IsZero() {
-				quiet = time.Since(w.lastReport)
-			} else if !w.spawned.IsZero() {
-				quiet = time.Since(w.spawned)
-			}
 		}
 		c.mu.Unlock()
 		switch {
@@ -843,9 +795,6 @@ func (c *Orchestrator) waitPackageStaged(instanceID string) *exit.Error {
 			return exit.New(exit.Failed, "the rented worker refused package preparation")
 		case gone:
 			return exit.New(exit.Failed, "the rented worker exited while preparing the package")
-		case quiet > silent:
-			return exit.Named(exit.Failed, "worker_silent",
-				"the rented worker stopped reporting while preparing the package")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -1137,9 +1086,6 @@ func newWorker(instanceID string, spec WorkerLaunchSpec) *worker {
 		stopped:        make(chan struct{}),
 		attachDone:     make(chan struct{}),
 	}
-	if spec.Connection == nil {
-		w.spawned = time.Now()
-	}
 	return w
 }
 
@@ -1161,10 +1107,8 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 				"because the pod cannot reach them").
 			WithNext("cozy rental")
 	}
-	// THE SAME SILENCE BUDGET THE CONTROL LEG LIVES UNDER. One pod, two listeners, one
-	// standard for "has not answered": a byte plane that misses what eight report periods
-	// cost is judged exactly as a worker that misses eight reports.
-	byteplane, e := media.Dial(*spec.Connection.Media, SilentReports*ReportCadence,
+	// This is a per-I/O byte-stall bound, not a worker lifecycle deadline.
+	byteplane, e := media.Dial(*spec.Connection.Media, mediaIOStallBudget,
 		int64(c.maxOutputBytes()))
 	if e != nil {
 		return "", e
@@ -1213,11 +1157,9 @@ func graceOr(v float64) float64 {
 // always see a desired state it issued that has not converged.
 const ReportCadence = 2 * time.Second
 
-// SilentReports is how many of those periods may pass with NOTHING arriving before the
-// worker is called silent. A COUNT of missed heartbeats, which is why it is not a guess
-// about how long a load takes: a worker resident-loading a 20 GB binding for half an hour
-// reports on every one of them, and only a worker that has stopped talking misses them.
-const SilentReports = 8
+// mediaIOStallBudget bounds one socket operation that moves no bytes. It does not settle,
+// retire, or reclaim a worker and resets whenever bytes move.
+const mediaIOStallBudget = 16 * time.Second
 
 // EnsurePlacementReady blocks until the placement's SERVING AXIS says DISPATCHABLE for
 // this plan — a real activation completed, never merely "connected" and never merely
@@ -1229,10 +1171,9 @@ const SilentReports = 8
 // from `dispatch`, 10 from `cozy warm`, two different ceilings on the same cold start —
 // and that number was a ceiling on how large a model may be, not a bound on anything that
 // had gone wrong. Every way this can actually fail is already visible: the worker EXITS,
-// reports a FAILED axis, or goes SILENT. A worker that is
-// materializing is none of those, however long it takes.
+// reports a FAILED axis, or its process/stream exits. A worker that is materializing is none
+// of those, however long it takes.
 func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Error {
-	silent := SilentReports * ReportCadence
 	for {
 		c.mu.Lock()
 		w := c.workers[instanceID]
@@ -1240,18 +1181,12 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 		gone := w == nil || w.exited
 		logPath, fault, code := "", "", 0
 		workerFaulted := false
-		quiet := time.Duration(0)
 		unstaged, holds := false, ""
 		var refused, desiredRefusal *exit.Error
 		if w != nil {
 			logPath, fault, code, refused = w.logPath, w.fault, w.exitCode, w.refusal
 			desiredRefusal = w.desiredRefusal
 			workerFaulted = w.faulted
-			if !w.lastReport.IsZero() {
-				quiet = time.Since(w.lastReport)
-			} else if !w.spawned.IsZero() {
-				quiet = time.Since(w.spawned)
-			}
 			if !w.exited && !staged(w, planID) {
 				unstaged, holds = true, strings.Join(w.planIDs, ", ")
 			}
@@ -1260,10 +1195,8 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 		if ok {
 			return nil
 		}
-		// THIS OWNER'S OWN VERDICT COMES FIRST. A worker whose claim was refused here is
-		// not slow and not silent — this side has decided not to converse with it — and
-		// waiting out eight missed report periods to say "it is stalled" would report a
-		// network symptom for an identity fact this process already established.
+		// THIS OWNER'S OWN VERDICT COMES FIRST. A worker whose claim was refused here has
+		// already received an identity verdict from this side.
 		if refused != nil {
 			return refused
 		}
@@ -1302,15 +1235,6 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 			// FAILED/fault is the worker's settled typed answer, not a timer start.
 			// Transient work remains MATERIALIZING/ACTIVATING and keeps reporting progress.
 			return workerError(fault).WithRemedy("its log is %s", logPath)
-		}
-		if quiet > silent {
-			// STALLED, and said as an observation rather than as an elapsed time: this
-			// worker owes a Report every `ReportCadence` and has missed `SilentReports`
-			// of them. A slow load is not this — a loading worker keeps reporting.
-			return exit.Named(exit.Failed, "worker_silent",
-				"the package worker has reported no observed state for %s, which is %d missed "+
-					"periods of %s: it is stalled, not slow", quiet.Round(time.Second),
-				SilentReports, ReportCadence).WithRemedy("its log is %s", logPath)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
