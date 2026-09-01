@@ -186,7 +186,7 @@ func (c *Orchestrator) sendPendingWeightsFinalizations(s *session, requestID str
 			}
 		}
 		request := &pb.WeightsFinalizeRequest{
-			RecordOwnerEpoch: recordOwnerEpoch, ControlStreamGeneration: s.generation,
+			RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch,
 			WorkerBootId: s.bootID, RequestId: row.RequestID,
 			InvocationSpecDigest: specDigest, OutputSlot: row.OutputSlot,
 			Disposition:          pb.WeightsFinalizeDisposition(disposition),
@@ -333,7 +333,7 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 	ack := &pb.AttemptOutcomeAck{
 		RequestId: requestID, AttemptOrdinal: ordinal, InvocationSpecDigest: specDigest,
 		OutcomeId: attempt.TerminalID, OutcomeDigest: outcomeDigest,
-		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamGeneration: s.generation,
+		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch,
 		WorkerBootId: s.bootID,
 	}
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_OutcomeAck{OutcomeAck: ack}}) {

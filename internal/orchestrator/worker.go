@@ -397,7 +397,7 @@ type worker struct {
 	phase             pb.WorkerPhase          // machine lifecycle, out of the placement enum
 	materialization   pb.MaterializationState // axis 1: what is on disk
 	serving           pb.ServingState         // axis 2: what it will take
-	generation        uint64                  // THIS placement's executor generation
+	executorEpoch     uint64                  // THIS placement's executor epoch
 	dispatchable      map[string]bool         // dispatchable_plan_ids
 	materializable    map[string]bool         // DISJOINT from dispatchable
 	heldSetDigest     []byte                  // parent set the placement actually holds
@@ -406,8 +406,8 @@ type worker struct {
 	// THE ONE ADMISSION FENCE (#472e/#482/#486c). Per-placement credits are DELETED: N
 	// counters over ONE serialized device advertise N x the real capacity. Capacity is a
 	// WORKER property; dispatchability is a PLACEMENT property.
-	admission    pb.AdmissionState
-	admissionGen uint64 // echoed on every offer; a stale echo refuses deterministically
+	admission      pb.AdmissionState
+	admissionEpoch uint64 // echoed on every offer; a stale echo refuses deterministically
 	// reportedSlots is the worker's last available_attempt_slots. reservedSlots is the
 	// owner's reservation from choosing a worker until its offer is accepted or refused.
 	// Keeping them separate prevents a Report racing preparation or send from reopening it.
@@ -863,7 +863,7 @@ func validDigest(value string) bool {
 }
 
 // DetachRental stops this daemon's control loop for one rented worker. It waits for an
-// in-flight attach to finish choosing the slot, then waits for the exact worker generation
+// in-flight attach to finish choosing the slot, then waits for the exact worker epoch
 // to quiesce. The caller may delete the rental's pinned certificate only after this returns.
 func (c *Orchestrator) DetachRental(id string) bool {
 	instanceID := rentalInstanceID(id)
@@ -1356,7 +1356,7 @@ type WorkerFacts struct {
 	PlacementSetDigest        string   `json:"placement_set_digest"`
 	RetainedFallbackSetDigest string   `json:"retained_fallback_placement_set_digest"`
 	PID                       int      `json:"pid"`
-	Generation                uint64   `json:"executor_generation"`
+	ExecutorEpoch             uint64   `json:"executor_epoch"`
 	Exited                    bool     `json:"exited"`
 	Devices                   []string `json:"devices"`
 
@@ -1368,9 +1368,9 @@ type WorkerFacts struct {
 	Dispatchable   []string `json:"dispatchable_plan_ids"`
 	Materializable []string `json:"materializable_plan_ids"`
 
-	Admission           string `json:"admission_state"`
-	AdmissionGeneration uint64 `json:"admission_generation"`
-	AvailableSlots      int    `json:"available_attempt_slots"`
+	Admission      string `json:"admission_state"`
+	AdmissionEpoch uint64 `json:"admission_epoch"`
+	AvailableSlots int    `json:"available_attempt_slots"`
 	// UnackedOutcomes is what this owner holds without having acked. The worker counts
 	// them against its own free seats, so a rising number here is an owner starving its
 	// own admission — which is the point of making boundedness structural (#480d).
@@ -1411,7 +1411,7 @@ func factsOf(w *worker) WorkerFacts {
 	f := WorkerFacts{
 		InstanceID: w.instanceID, Package: w.spec.Placement.Package,
 		PackageRevisionDigest: w.spec.Placement.PackageRevisionDigest, BootID: w.bootID,
-		PlacementID: w.placementID, Generation: w.generation,
+		PlacementID: w.placementID, ExecutorEpoch: w.executorEpoch,
 		Exited: w.exited, Devices: w.spec.Devices,
 
 		Phase:           trimEnum(pb.WorkerPhase_name[int32(w.phase)], "WORKER_PHASE_"),
@@ -1420,10 +1420,10 @@ func factsOf(w *worker) WorkerFacts {
 		Dispatchable:    keysOf(w.dispatchable),
 		Materializable:  keysOf(w.materializable),
 
-		Admission:           trimEnum(pb.AdmissionState_name[int32(w.admission)], "ADMISSION_STATE_"),
-		AdmissionGeneration: w.admissionGen,
-		AvailableSlots:      w.slots,
-		UnackedOutcomes:     w.unacked,
+		Admission:       trimEnum(pb.AdmissionState_name[int32(w.admission)], "ADMISSION_STATE_"),
+		AdmissionEpoch:  w.admissionEpoch,
+		AvailableSlots:  w.slots,
+		UnackedOutcomes: w.unacked,
 
 		DesiredRevision:   w.revision,
 		AcceptedRevision:  w.acceptedRevision,
@@ -1499,14 +1499,14 @@ func keysOf(m map[string]bool) []string {
 // SIGTERM deserved three budgets.
 const StopGrace = 30 * time.Second
 
-// retireWorker is the generation-fenced retirement used by the stall path. A recovered
+// retireWorker is the epoch-fenced retirement used by the stall path. A recovered
 // worker intentionally reuses instance and placement ids; only the exact object whose
 // observations established the retirement ground may receive the empty desired set.
 func (c *Orchestrator) retireWorker(w *worker) *exit.Error {
 	c.mu.Lock()
 	if c.workers[w.instanceID] != w || w.exited || w.stopping {
 		c.mu.Unlock()
-		return exit.New(exit.NotFound, "worker %s is no longer the observed generation", w.instanceID)
+		return exit.New(exit.NotFound, "worker %s is no longer the observed epoch", w.instanceID)
 	}
 	s := c.sessions[w.bootID]
 	c.mu.Unlock()

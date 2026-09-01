@@ -917,9 +917,9 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	}
 	// PLACEMENT is the orchestrator's: the caller names the binding, and dispatch picks a
 	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence
-	// is open. `pick` also returns the admission generation it OBSERVED, which is what
+	// is open. `pick` also returns the admission epoch it OBSERVED, which is what
 	// makes a stale offer refuse deterministically rather than race.
-	w, sess, admissionGen, reservation, e := c.pick(req)
+	w, sess, admissionEpoch, reservation, e := c.pick(req)
 	if e != nil {
 		return 0, e
 	}
@@ -1035,13 +1035,13 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	offer := &pb.AttemptOffer{
 		RequestId: req.ID, AttemptOrdinal: attempt, InvocationSpecDigest: digest,
 		Grant: grant, InvocationSpecCanonicalBytes: canonicalBytes, PlacementId: placementID,
-		// THE GENERATION THIS OWNER OBSERVED WHEN IT DISPATCHED. The worker admits only if
+		// THE EPOCH THIS OWNER OBSERVED WHEN IT DISPATCHED. The worker admits only if
 		// this is still current; a stale echo refuses deterministically — same input, same
 		// verdict, no race window — instead of running under capacity meaning that moved.
-		AdmissionGeneration: admissionGen,
+		AdmissionEpoch: admissionEpoch,
 	}
-	offer.RecordOwnerEpoch, offer.ControlStreamGeneration, offer.WorkerBootId =
-		recordOwnerEpoch, sess.generation, sess.bootID
+	offer.RecordOwnerEpoch, offer.ControlStreamEpoch, offer.WorkerBootId =
+		recordOwnerEpoch, sess.epoch, sess.bootID
 	if !c.commitDispatch(reservation, req.ID, attempt) {
 		cause := exit.Unavailablef("the worker selected for %s#%d left before its offer", req.ID, attempt)
 		c.rollbackGrant(req, attempt, w)
@@ -1061,7 +1061,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	}
 	c.logf("AttemptOffer %s#%d spec=%s (%d canonical bytes) placement=%s admission=%d outputs=%s on %s",
 		req.ID, attempt, shortDigest(spelled), len(canonicalBytes), placementID,
-		admissionGen, req.Outputs, w.instanceID)
+		admissionEpoch, req.Outputs, w.instanceID)
 	c.emit(req.ID, "request.dispatched", attempt, map[string]any{
 		"instance_id": w.instanceID, "invocation_digest": spelled,
 	})
@@ -1271,7 +1271,7 @@ func invocationOutputBindings(ids []string, weights []WeightsOutput, defaultMax 
 //
 // TWO GATES, TWO OWNERS (#472e/#482). Dispatchability is a PLACEMENT property — the
 // serving axis and `dispatchable_plan_ids`. Capacity is a WORKER property — the admission
-// state, its generation, and the one shared seat window. Per-placement `attempt_credits`
+// state, its epoch, and the one shared seat window. Per-placement `attempt_credits`
 // are DELETED because N counters over ONE serialized device advertise N times the real
 // capacity, and that defect is arithmetic rather than a race.
 //
@@ -1325,7 +1325,7 @@ func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *di
 			if w.jobsAvail <= 0 {
 				w.dispatchable[planID] = false
 			}
-			return w, sess, w.admissionGen,
+			return w, sess, w.admissionEpoch,
 				&dispatchReservation{worker: w, job: true, planID: planID}, nil
 		}
 		if !w.dispatchableFor(planID) {
@@ -1340,7 +1340,7 @@ func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *di
 		}
 		w.reservedSlots++
 		w.slots = max(0, w.reportedSlots-w.reservedSlots)
-		return w, sess, w.admissionGen, &dispatchReservation{worker: w}, nil
+		return w, sess, w.admissionEpoch, &dispatchReservation{worker: w}, nil
 	}
 	return nil, nil, 0, nil, exit.Unavailablef(
 		"no claimed worker in %s has a DISPATCHABLE placement for %s with a free attempt slot",
@@ -1693,8 +1693,8 @@ func (c *Orchestrator) Cancel(requestID string, attempt uint64, reason pb.Cancel
 		RequestId: requestID, AttemptOrdinal: attempt, Reason: reason,
 		GraceMs: graceMS, InvocationSpecDigest: raw,
 	}
-	cancel.RecordOwnerEpoch, cancel.ControlStreamGeneration, cancel.WorkerBootId =
-		recordOwnerEpoch, sess.generation, sess.bootID
+	cancel.RecordOwnerEpoch, cancel.ControlStreamEpoch, cancel.WorkerBootId =
+		recordOwnerEpoch, sess.epoch, sess.bootID
 	if !sess.trySend(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_CancelAttempt{CancelAttempt: cancel}}) {
 		return exit.Unavailablef("the control stream for %s#%d cannot accept cancellation now",
 			requestID, attempt)

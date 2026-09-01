@@ -51,16 +51,17 @@
 //
 // THE ENVELOPE (every message, fields 1-3): the ownership + boot fence, checked BEFORE any body
 // field is read, in this order:
-//   1 `record_owner_epoch`        - durable monotonic AUTHORITY generation, minted by whatever
-//                                   grants ownership. Older than the accepted claim => dropped.
-//   2 `control_stream_generation` - worker-minted, incremented for EVERY accepted control
-//                                   stream; a frame from a superseded stream is dropped.
-//   3 `worker_boot_id`            - minted at worker-process boot, never reused; a frame
-//                                   addressed to a dead boot is dropped.
+//   1 `record_owner_epoch`     - durable monotonic AUTHORITY epoch, minted by whatever
+//                                grants ownership. Older than the accepted claim => dropped.
+//   2 `control_stream_epoch`   - worker-minted, incremented for EVERY accepted control
+//                                stream; a frame from a superseded stream is dropped.
+//   3 `worker_boot_id`         - minted at worker-process boot, never reused; a frame
+//                                addressed to a dead boot is dropped. An id, not an epoch:
+//                                it need only DIFFER, never be greater.
 // FIELD 4 IS RESERVED IN EVERY MESSAGE (#446): the old global `executor_incarnation` is GONE.
-// The worker BOOT generation is machine truth; each placement's EXECUTOR generation is placement
-// truth (`PlacementStatus.executor_generation`) and rides attempt-scoped facts, not the
-// envelope. The attempt fence triple is (request_id, attempt_ordinal, invocation_spec_digest).
+// The worker BOOT id is machine truth; each placement's EXECUTOR epoch is placement truth
+// (`PlacementStatus.executor_epoch`) and rides attempt-scoped facts, not the envelope. The
+// attempt fence triple is (request_id, attempt_ordinal, invocation_spec_digest).
 //
 // PLACEMENTS (#481; renamed from DEPLOYMENTS — tensorhub's "deployment" is an id-less semantic
 // tuple and the collision was real). `placement_id` is the RecordOwner-minted routing + journal
@@ -77,12 +78,13 @@
 // lifecycle is `WorkerPhase`, pulled out of the placement enum; the old `IntakeState` is retired
 // with both of its uses. "prepared"/"warming"/"ready" are retired as state words.
 //
-// ONE ADMISSION FENCE (#472e/#482/#486c): per-placement `attempt_credits` are DELETED — N
+// ONE ADMISSION GATE (#472e/#482/#486c): per-placement `attempt_credits` are DELETED — N
 // counters over ONE serialized device advertise N x the real capacity, and the defect is
-// arithmetic. Execution capacity is a WORKER property (`admission_generation` +
+// arithmetic. Execution capacity is a WORKER property (`admission_epoch` +
 // `admission_state` + `available_attempt_slots`); dispatchability is a PLACEMENT property (the
-// serving axis + dispatchable_binding_digests). Per-placement `readiness_epoch` is DELETED, not
-// renamed: one fence, not two to keep consistent.
+// serving axis + dispatchable_binding_digests). Only `admission_epoch` FENCES; the other two are
+// the GATE — "not accepting" / "full" — not a fence against a stale actor. Per-placement
+// `readiness_epoch` is DELETED, not renamed: one fence, not two to keep consistent.
 //
 // EVERY OFFER GETS A JOURNALED OUTCOME (#472f/#480b): an AttemptOffer receives either
 // AttemptAccepted or a JOURNALED AttemptOutcome(REFUSED) — never silence and never an
@@ -646,7 +648,7 @@ const (
 	// REFUSED — pre-execution, origin WORKER (rev-2 §6/§7). Zero billed execution budget;
 	// execution_started is false; the ordinal is consumed and the next one may go elsewhere now.
 	CauseCode_CAUSE_CODE_NO_CAPACITY                CauseCode = 17 // admission CLOSED, or OPEN with no free slot
-	CauseCode_CAUSE_CODE_ADMISSION_GENERATION_STALE CauseCode = 18 // the echoed generation is not current
+	CauseCode_CAUSE_CODE_ADMISSION_EPOCH_STALE      CauseCode = 18 // the echoed epoch is not current
 	CauseCode_CAUSE_CODE_UNKNOWN_PLACEMENT          CauseCode = 19
 	CauseCode_CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE CauseCode = 20
 )
@@ -672,7 +674,7 @@ var (
 		15: "CAUSE_CODE_SUPERSEDED_CANCEL",
 		16: "CAUSE_CODE_EXECUTOR_INVALIDATED",
 		17: "CAUSE_CODE_NO_CAPACITY",
-		18: "CAUSE_CODE_ADMISSION_GENERATION_STALE",
+		18: "CAUSE_CODE_ADMISSION_EPOCH_STALE",
 		19: "CAUSE_CODE_UNKNOWN_PLACEMENT",
 		20: "CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE",
 	}
@@ -695,7 +697,7 @@ var (
 		"CAUSE_CODE_SUPERSEDED_CANCEL":          15,
 		"CAUSE_CODE_EXECUTOR_INVALIDATED":       16,
 		"CAUSE_CODE_NO_CAPACITY":                17,
-		"CAUSE_CODE_ADMISSION_GENERATION_STALE": 18,
+		"CAUSE_CODE_ADMISSION_EPOCH_STALE":      18,
 		"CAUSE_CODE_UNKNOWN_PLACEMENT":          19,
 		"CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE": 20,
 	}
@@ -3353,16 +3355,16 @@ func (*WorkerFrame_PrivatePackageAbortStatus) isWorkerFrame_Msg() {}
 func (*WorkerFrame_WeightsUploadResult) isWorkerFrame_Msg() {}
 
 type Claim struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`                      // envelope; the claimed authority generation
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"` // 0 on Claim (none minted yet)
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`                                   // empty on a fresh dial; set when re-dialing a known boot
-	RecordOwnerId           string                 `protobuf:"bytes,5,opt,name=record_owner_id,json=recordOwnerId,proto3" json:"record_owner_id,omitempty"`                                // stable identity of the claiming RecordOwner
-	WorkerId                string                 `protobuf:"bytes,6,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`                                                 // the worker identity the RecordOwner expects to be claiming
-	WireMinor               uint32                 `protobuf:"varint,7,opt,name=wire_minor,json=wireMinor,proto3" json:"wire_minor,omitempty"`                                             // highest minor the RECORDOWNER implements
-	Proof                   []byte                 `protobuf:"bytes,8,opt,name=proof,proto3" json:"proof,omitempty"`                                                                       // 64-byte Ed25519 signature over canonical ClaimProof/1 on
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`       // envelope; the claimed authority epoch
+	ControlStreamEpoch uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"` // 0 on Claim (none minted yet)
+	WorkerBootId       string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`                    // empty on a fresh dial; set when re-dialing a known boot
+	RecordOwnerId      string                 `protobuf:"bytes,5,opt,name=record_owner_id,json=recordOwnerId,proto3" json:"record_owner_id,omitempty"`                 // stable identity of the claiming RecordOwner
+	WorkerId           string                 `protobuf:"bytes,6,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`                                  // the worker identity the RecordOwner expects to be claiming
+	WireMinor          uint32                 `protobuf:"varint,7,opt,name=wire_minor,json=wireMinor,proto3" json:"wire_minor,omitempty"`                              // highest minor the RECORDOWNER implements
+	Proof              []byte                 `protobuf:"bytes,8,opt,name=proof,proto3" json:"proof,omitempty"`                                                        // 64-byte Ed25519 signature over canonical ClaimProof/1 on
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *Claim) Reset() {
@@ -3402,9 +3404,9 @@ func (x *Claim) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *Claim) GetControlStreamGeneration() uint64 {
+func (x *Claim) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -3518,19 +3520,19 @@ func (x *ClaimProof) GetWorkerTlsCertificateDigest() []byte {
 
 // Claim proof is evaluated before readiness or ownership mutation. A bad proof answers
 // UNAUTHENTICATED even before ready. A valid proof while the worker's post-bind readiness barrier
-// is closed answers UNDURABLE without minting a control_stream_generation. On acceptance the
-// worker fences the previous stream (if any), increments
-// control_stream_generation, and answers with its identity + one WorkerSnapshot. DISPATCH STAYS
-// CLOSED until the RecordOwner's SnapshotAck (02 §6) — admission_state reports CLOSED until then.
+// is closed answers UNDURABLE without minting a control_stream_epoch. On acceptance the worker
+// fences the previous stream (if any), increments control_stream_epoch, and answers with its
+// identity + one WorkerSnapshot. DISPATCH STAYS CLOSED until the RecordOwner's SnapshotAck
+// (02 §6) — admission_state reports CLOSED until then.
 type ClaimAck struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`                      // echo of the accepted epoch
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"` // newly minted for this stream
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`                                   // this boot's identity
-	Accepted                bool                   `protobuf:"varint,5,opt,name=accepted,proto3" json:"accepted,omitempty"`                                                                // false => `rejection` set; stream then closes
-	Rejection               ClaimRejection         `protobuf:"varint,6,opt,name=rejection,proto3,enum=cozy.worker.v1.ClaimRejection" json:"rejection,omitempty"`
-	WireMinor               uint32                 `protobuf:"varint,7,opt,name=wire_minor,json=wireMinor,proto3" json:"wire_minor,omitempty"` // highest minor the WORKER implements
-	WorkerId                string                 `protobuf:"bytes,8,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`     // CREDENTIAL subject; cross-checked vs the worker's server
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`       // echo of the accepted epoch
+	ControlStreamEpoch uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"` // newly minted for this stream
+	WorkerBootId       string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`                    // this boot's identity
+	Accepted           bool                   `protobuf:"varint,5,opt,name=accepted,proto3" json:"accepted,omitempty"`                                                 // false => `rejection` set; stream then closes
+	Rejection          ClaimRejection         `protobuf:"varint,6,opt,name=rejection,proto3,enum=cozy.worker.v1.ClaimRejection" json:"rejection,omitempty"`
+	WireMinor          uint32                 `protobuf:"varint,7,opt,name=wire_minor,json=wireMinor,proto3" json:"wire_minor,omitempty"` // highest minor the WORKER implements
+	WorkerId           string                 `protobuf:"bytes,8,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`     // CREDENTIAL subject; cross-checked vs the worker's server
 	// identity (02 §4)
 	WorkerInstanceId string `protobuf:"bytes,9,opt,name=worker_instance_id,json=workerInstanceId,proto3" json:"worker_instance_id,omitempty"` // ONE provisioned instance lifetime; outcome-replay
 	// authorization keys on this, never worker_id
@@ -3584,9 +3586,9 @@ func (x *ClaimAck) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *ClaimAck) GetControlStreamGeneration() uint64 {
+func (x *ClaimAck) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -3663,19 +3665,19 @@ func (x *ClaimAck) GetResources() *WorkerResources {
 
 // Authenticated boot-fatal delivery: the worker accepted a stream but cannot serve.
 type BootFailure struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	WorkerId                string                 `protobuf:"bytes,5,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
-	WorkerInstanceId        string                 `protobuf:"bytes,6,opt,name=worker_instance_id,json=workerInstanceId,proto3" json:"worker_instance_id,omitempty"`
-	Reason                  BootFailureReason      `protobuf:"varint,7,opt,name=reason,proto3,enum=cozy.worker.v1.BootFailureReason" json:"reason,omitempty"`
-	Detail                  string                 `protobuf:"bytes,8,opt,name=detail,proto3" json:"detail,omitempty"`                                                            // bounded <= 1024 bytes, sanitized
-	Resources               *WorkerResources       `protobuf:"bytes,9,opt,name=resources,proto3" json:"resources,omitempty"`                                                      // whatever was measurable
-	ControlRuntimeDigest    string                 `protobuf:"bytes,10,opt,name=control_runtime_digest,json=controlRuntimeDigest,proto3" json:"control_runtime_digest,omitempty"` // same measured control Runtime provenance as ClaimAck 11
-	WorkerReleaseId         string                 `protobuf:"bytes,11,opt,name=worker_release_id,json=workerReleaseId,proto3" json:"worker_release_id,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch     uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch   uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId         string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	WorkerId             string                 `protobuf:"bytes,5,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	WorkerInstanceId     string                 `protobuf:"bytes,6,opt,name=worker_instance_id,json=workerInstanceId,proto3" json:"worker_instance_id,omitempty"`
+	Reason               BootFailureReason      `protobuf:"varint,7,opt,name=reason,proto3,enum=cozy.worker.v1.BootFailureReason" json:"reason,omitempty"`
+	Detail               string                 `protobuf:"bytes,8,opt,name=detail,proto3" json:"detail,omitempty"`                                                            // bounded <= 1024 bytes, sanitized
+	Resources            *WorkerResources       `protobuf:"bytes,9,opt,name=resources,proto3" json:"resources,omitempty"`                                                      // whatever was measurable
+	ControlRuntimeDigest string                 `protobuf:"bytes,10,opt,name=control_runtime_digest,json=controlRuntimeDigest,proto3" json:"control_runtime_digest,omitempty"` // same measured control Runtime provenance as ClaimAck 11
+	WorkerReleaseId      string                 `protobuf:"bytes,11,opt,name=worker_release_id,json=workerReleaseId,proto3" json:"worker_release_id,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *BootFailure) Reset() {
@@ -3715,9 +3717,9 @@ func (x *BootFailure) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *BootFailure) GetControlStreamGeneration() uint64 {
+func (x *BootFailure) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -3781,7 +3783,7 @@ func (x *BootFailure) GetWorkerReleaseId() string {
 type WorkerSnapshot struct {
 	state                              protoimpl.MessageState `protogen:"open.v1"`
 	RecordOwnerEpoch                   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration            uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
+	ControlStreamEpoch                 uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
 	WorkerBootId                       string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
 	SnapshotId                         string                 `protobuf:"bytes,5,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`                                                                               // worker-minted; names this exact snapshot
 	SnapshotDigest                     []byte                 `protobuf:"bytes,6,opt,name=snapshot_digest,json=snapshotDigest,proto3" json:"snapshot_digest,omitempty"`                                                                   // class (a): sha256 over EXACTLY the bytes in 7
@@ -3828,9 +3830,9 @@ func (x *WorkerSnapshot) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *WorkerSnapshot) GetControlStreamGeneration() uint64 {
+func (x *WorkerSnapshot) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -3890,7 +3892,7 @@ type WorkerSnapshotBody struct {
 	WorkerPhase           WorkerPhase                 `protobuf:"varint,4,opt,name=worker_phase,json=workerPhase,proto3,enum=cozy.worker.v1.WorkerPhase" json:"worker_phase,omitempty"` // machine lifecycle
 	Placements            []*PlacementStatus          `protobuf:"bytes,5,rep,name=placements,proto3" json:"placements,omitempty"`                                                       // sorted by placement_id
 	ConvergedRevision     uint64                      `protobuf:"varint,6,opt,name=converged_revision,json=convergedRevision,proto3" json:"converged_revision,omitempty"`               // advances ONLY when observed satisfies accepted
-	AdmissionGeneration   uint64                      `protobuf:"varint,7,opt,name=admission_generation,json=admissionGeneration,proto3" json:"admission_generation,omitempty"`
+	AdmissionEpoch        uint64                      `protobuf:"varint,7,opt,name=admission_epoch,json=admissionEpoch,proto3" json:"admission_epoch,omitempty"`
 	AdmissionState        AdmissionState              `protobuf:"varint,8,opt,name=admission_state,json=admissionState,proto3,enum=cozy.worker.v1.AdmissionState" json:"admission_state,omitempty"`
 	AvailableAttemptSlots uint32                      `protobuf:"varint,9,opt,name=available_attempt_slots,json=availableAttemptSlots,proto3" json:"available_attempt_slots,omitempty"`
 	HeldAttempts          []*HeldAttempt              `protobuf:"bytes,10,rep,name=held_attempts,json=heldAttempts,proto3" json:"held_attempts,omitempty"`                      // running attempts AND outcomes pending ack
@@ -3971,9 +3973,9 @@ func (x *WorkerSnapshotBody) GetConvergedRevision() uint64 {
 	return 0
 }
 
-func (x *WorkerSnapshotBody) GetAdmissionGeneration() uint64 {
+func (x *WorkerSnapshotBody) GetAdmissionEpoch() uint64 {
 	if x != nil {
-		return x.AdmissionGeneration
+		return x.AdmissionEpoch
 	}
 	return 0
 }
@@ -4007,14 +4009,14 @@ func (x *WorkerSnapshotBody) GetWeightsTransactions() []*WeightsTransactionStatu
 }
 
 type SnapshotAck struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	SnapshotId              string                 `protobuf:"bytes,5,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`             // echo of the exact snapshot durably reconciled
-	SnapshotDigest          []byte                 `protobuf:"bytes,6,opt,name=snapshot_digest,json=snapshotDigest,proto3" json:"snapshot_digest,omitempty"` // echo; COMPARED, never recomputed by the worker. An ack
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId       string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	SnapshotId         string                 `protobuf:"bytes,5,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`             // echo of the exact snapshot durably reconciled
+	SnapshotDigest     []byte                 `protobuf:"bytes,6,opt,name=snapshot_digest,json=snapshotDigest,proto3" json:"snapshot_digest,omitempty"` // echo; COMPARED, never recomputed by the worker. An ack
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *SnapshotAck) Reset() {
@@ -4054,9 +4056,9 @@ func (x *SnapshotAck) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *SnapshotAck) GetControlStreamGeneration() uint64 {
+func (x *SnapshotAck) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -4083,11 +4085,11 @@ func (x *SnapshotAck) GetSnapshotDigest() []byte {
 }
 
 type DesiredWorkerState struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	Revision                uint64                 `protobuf:"varint,5,opt,name=revision,proto3" json:"revision,omitempty"` // RecordOwner-owned, monotonic; older ignored, equal
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId       string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	Revision           uint64                 `protobuf:"varint,5,opt,name=revision,proto3" json:"revision,omitempty"` // RecordOwner-owned, monotonic; older ignored, equal
 	// idempotent, newer applies; equal revision + different
 	// bytes is a protocol error (02 §3 — now byte-checkable
 	// rather than claim-checkable)
@@ -4145,9 +4147,9 @@ func (x *DesiredWorkerState) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *DesiredWorkerState) GetControlStreamGeneration() uint64 {
+func (x *DesiredWorkerState) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -5962,21 +5964,22 @@ func (x *JobDirective) GetDeviceCount() uint32 {
 // converged_revision < accepted_desired_state_revision is the normal, visible state of a
 // convergence in progress or a latched failure — never an error, always readable.
 type ObservedWorkerState struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	AppliedWireMinor        uint32                 `protobuf:"varint,8,opt,name=applied_wire_minor,json=appliedWireMinor,proto3" json:"applied_wire_minor,omitempty"` // stale echo is a visible skew fact, never a refusal
-	HeldAttempts            []*HeldAttempt         `protobuf:"bytes,9,rep,name=held_attempts,json=heldAttempts,proto3" json:"held_attempts,omitempty"`                // running attempts AND outcomes pending ack
-	Faults                  []*Fault               `protobuf:"bytes,10,rep,name=faults,proto3" json:"faults,omitempty"`                                               // MACHINE-scope faults; placement faults ride their status
-	Activity                []*ActivityEvent       `protobuf:"bytes,11,rep,name=activity,proto3" json:"activity,omitempty"`                                           // the non-attempt activity lane (durable)
-	JobCapacity             *JobCapacity           `protobuf:"bytes,13,opt,name=job_capacity,json=jobCapacity,proto3" json:"job_capacity,omitempty"`                  // job mode only
-	Placements              []*PlacementStatus     `protobuf:"bytes,15,rep,name=placements,proto3" json:"placements,omitempty"`                                       // serving mode only; sorted by placement_id
-	// The ONE worker-level admission fence (§6). The RecordOwner dispatches against the generation
-	// it last saw; the worker admits only if the echoed generation is CURRENT, admission_state is
-	// OPEN, and a slot is free. A stale generation refuses DETERMINISTICALLY — same input, same
-	// verdict, no race window.
-	AdmissionGeneration uint64 `protobuf:"varint,16,opt,name=admission_generation,json=admissionGeneration,proto3" json:"admission_generation,omitempty"` // bumps whenever admission MEANING changes (executor
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId       string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	AppliedWireMinor   uint32                 `protobuf:"varint,8,opt,name=applied_wire_minor,json=appliedWireMinor,proto3" json:"applied_wire_minor,omitempty"` // stale echo is a visible skew fact, never a refusal
+	HeldAttempts       []*HeldAttempt         `protobuf:"bytes,9,rep,name=held_attempts,json=heldAttempts,proto3" json:"held_attempts,omitempty"`                // running attempts AND outcomes pending ack
+	Faults             []*Fault               `protobuf:"bytes,10,rep,name=faults,proto3" json:"faults,omitempty"`                                               // MACHINE-scope faults; placement faults ride their status
+	Activity           []*ActivityEvent       `protobuf:"bytes,11,rep,name=activity,proto3" json:"activity,omitempty"`                                           // the non-attempt activity lane (durable)
+	JobCapacity        *JobCapacity           `protobuf:"bytes,13,opt,name=job_capacity,json=jobCapacity,proto3" json:"job_capacity,omitempty"`                  // job mode only
+	Placements         []*PlacementStatus     `protobuf:"bytes,15,rep,name=placements,proto3" json:"placements,omitempty"`                                       // serving mode only; sorted by placement_id
+	// The ONE worker-level admission gate (§6). The RecordOwner dispatches against the epoch it
+	// last saw; the worker admits only if the echoed epoch is CURRENT, admission_state is OPEN,
+	// and a slot is free. A stale epoch refuses DETERMINISTICALLY — same input, same verdict, no
+	// race window. Only the epoch FENCES: state and slots say "not accepting" / "full", which is a
+	// gate, not a fence against a stale actor.
+	AdmissionEpoch uint64 `protobuf:"varint,16,opt,name=admission_epoch,json=admissionEpoch,proto3" json:"admission_epoch,omitempty"` // bumps whenever admission MEANING changes (executor
 	// respawn, window resize, phase change, cutover)
 	AdmissionState AdmissionState `protobuf:"varint,17,opt,name=admission_state,json=admissionState,proto3,enum=cozy.worker.v1.AdmissionState" json:"admission_state,omitempty"` // CLOSED is STRUCTURAL (pre-snapshot-barrier,
 	// draining, mid-cutover); OPEN with zero slots is TRANSIENT
@@ -6032,9 +6035,9 @@ func (x *ObservedWorkerState) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *ObservedWorkerState) GetControlStreamGeneration() uint64 {
+func (x *ObservedWorkerState) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -6088,9 +6091,9 @@ func (x *ObservedWorkerState) GetPlacements() []*PlacementStatus {
 	return nil
 }
 
-func (x *ObservedWorkerState) GetAdmissionGeneration() uint64 {
+func (x *ObservedWorkerState) GetAdmissionEpoch() uint64 {
 	if x != nil {
-		return x.AdmissionGeneration
+		return x.AdmissionEpoch
 	}
 	return 0
 }
@@ -6155,7 +6158,7 @@ func (x *ObservedWorkerState) GetWorkerPhase() WorkerPhase {
 type PlacementStatus struct {
 	state                        protoimpl.MessageState    `protogen:"open.v1"`
 	PlacementId                  string                    `protobuf:"bytes,1,opt,name=placement_id,json=placementId,proto3" json:"placement_id,omitempty"`
-	ExecutorGeneration           uint64                    `protobuf:"varint,4,opt,name=executor_generation,json=executorGeneration,proto3" json:"executor_generation,omitempty"` // THIS placement's executor fence; bumps on its respawn
+	ExecutorEpoch                uint64                    `protobuf:"varint,4,opt,name=executor_epoch,json=executorEpoch,proto3" json:"executor_epoch,omitempty"` // THIS placement's executor fence; bumps on its respawn
 	DispatchableBindingDigests   [][]byte                  `protobuf:"bytes,6,rep,name=dispatchable_binding_digests,json=dispatchableBindingDigests,proto3" json:"dispatchable_binding_digests,omitempty"`
 	MaterializableBindingDigests [][]byte                  `protobuf:"bytes,7,rep,name=materializable_binding_digests,json=materializableBindingDigests,proto3" json:"materializable_binding_digests,omitempty"` // DISJOINT from dispatchable
 	Faults                       []*Fault                  `protobuf:"bytes,8,rep,name=faults,proto3" json:"faults,omitempty"`                                                                                   // placement-scoped
@@ -6218,9 +6221,9 @@ func (x *PlacementStatus) GetPlacementId() string {
 	return ""
 }
 
-func (x *PlacementStatus) GetExecutorGeneration() uint64 {
+func (x *PlacementStatus) GetExecutorEpoch() uint64 {
 	if x != nil {
-		return x.ExecutorGeneration
+		return x.ExecutorEpoch
 	}
 	return 0
 }
@@ -6621,12 +6624,12 @@ func (x *ActivityEvent) GetAtUnixMs() uint64 {
 // is an ordinary outcome rather than an exception. EVERY offer receives either AttemptAccepted or
 // a JOURNALED AttemptOutcome(REFUSED) — never silence.
 type AttemptOffer struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	RequestId               string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`                 // fence (a)
-	AttemptOrdinal          uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"` // fence (b); RecordOwner-bumped only. EVERY offer consumes
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId       string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	RequestId          string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`                 // fence (a)
+	AttemptOrdinal     uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"` // fence (b); RecordOwner-bumped only. EVERY offer consumes
 	// its ordinal — what a pre-execution refusal does not
 	// consume is BUDGET (#480b; 02 §6's "only a proven decline
 	// is non-consuming" is retired with the decline).
@@ -6640,9 +6643,9 @@ type AttemptOffer struct {
 	// in job mode); unknown id refuses
 	// FAULT_KIND_UNKNOWN_PLACEMENT as a JOURNALED REFUSED
 	// outcome
-	AdmissionGeneration uint64 `protobuf:"varint,12,opt,name=admission_generation,json=admissionGeneration,proto3" json:"admission_generation,omitempty"` // the generation the RecordOwner OBSERVED when it
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	AdmissionEpoch uint64 `protobuf:"varint,12,opt,name=admission_epoch,json=admissionEpoch,proto3" json:"admission_epoch,omitempty"` // the epoch the RecordOwner OBSERVED when it
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *AttemptOffer) Reset() {
@@ -6682,9 +6685,9 @@ func (x *AttemptOffer) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *AttemptOffer) GetControlStreamGeneration() uint64 {
+func (x *AttemptOffer) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -6738,9 +6741,9 @@ func (x *AttemptOffer) GetPlacementId() string {
 	return ""
 }
 
-func (x *AttemptOffer) GetAdmissionGeneration() uint64 {
+func (x *AttemptOffer) GetAdmissionEpoch() uint64 {
 	if x != nil {
-		return x.AdmissionGeneration
+		return x.AdmissionEpoch
 	}
 	return 0
 }
@@ -6748,7 +6751,7 @@ func (x *AttemptOffer) GetAdmissionGeneration() uint64 {
 type AttemptAccepted struct {
 	state                   protoimpl.MessageState `protogen:"open.v1"`
 	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
+	ControlStreamEpoch      uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
 	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
 	RequestId               string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	AttemptOrdinal          uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
@@ -6757,7 +6760,7 @@ type AttemptAccepted struct {
 	ModelConstructionDigest []byte                 `protobuf:"bytes,9,opt,name=model_construction_digest,json=modelConstructionDigest,proto3" json:"model_construction_digest,omitempty"` // class (a): ModelConstructionContract (cr-004)
 	Plan                    *AttemptPlanSummary    `protobuf:"bytes,10,opt,name=plan,proto3" json:"plan,omitempty"`                                                                       // the CLOSED observable projection of the chosen plan
 	PlacementId             string                 `protobuf:"bytes,11,opt,name=placement_id,json=placementId,proto3" json:"placement_id,omitempty"`                                      // echo
-	ExecutorGeneration      uint64                 `protobuf:"varint,12,opt,name=executor_generation,json=executorGeneration,proto3" json:"executor_generation,omitempty"`                // the placement executor generation the attempt runs under,
+	ExecutorEpoch           uint64                 `protobuf:"varint,12,opt,name=executor_epoch,json=executorEpoch,proto3" json:"executor_epoch,omitempty"`                               // the placement executor epoch the attempt runs under,
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
@@ -6799,9 +6802,9 @@ func (x *AttemptAccepted) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *AttemptAccepted) GetControlStreamGeneration() uint64 {
+func (x *AttemptAccepted) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -6862,9 +6865,9 @@ func (x *AttemptAccepted) GetPlacementId() string {
 	return ""
 }
 
-func (x *AttemptAccepted) GetExecutorGeneration() uint64 {
+func (x *AttemptAccepted) GetExecutorEpoch() uint64 {
 	if x != nil {
-		return x.ExecutorGeneration
+		return x.ExecutorEpoch
 	}
 	return 0
 }
@@ -6965,17 +6968,17 @@ func (x *AttemptPlanSummary) GetDecisionExplanation() string {
 // No placement_id here: the fence triple resolves against the journaled acceptance, which
 // records the placement.
 type CancelAttempt struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	RequestId               string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	AttemptOrdinal          uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
-	Reason                  CancelReason           `protobuf:"varint,7,opt,name=reason,proto3,enum=cozy.worker.v1.CancelReason" json:"reason,omitempty"`
-	GraceMs                 uint64                 `protobuf:"varint,8,opt,name=grace_ms,json=graceMs,proto3" json:"grace_ms,omitempty"`                                         // operator override; 0 = worker default. Never author-set.
-	InvocationSpecDigest    []byte                 `protobuf:"bytes,9,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"` // full-triple fence; stale/mismatched cancel is DROPPED
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch     uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch   uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId         string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	RequestId            string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	AttemptOrdinal       uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
+	Reason               CancelReason           `protobuf:"varint,7,opt,name=reason,proto3,enum=cozy.worker.v1.CancelReason" json:"reason,omitempty"`
+	GraceMs              uint64                 `protobuf:"varint,8,opt,name=grace_ms,json=graceMs,proto3" json:"grace_ms,omitempty"`                                         // operator override; 0 = worker default. Never author-set.
+	InvocationSpecDigest []byte                 `protobuf:"bytes,9,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"` // full-triple fence; stale/mismatched cancel is DROPPED
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *CancelAttempt) Reset() {
@@ -7015,9 +7018,9 @@ func (x *CancelAttempt) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *CancelAttempt) GetControlStreamGeneration() uint64 {
+func (x *CancelAttempt) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -7071,19 +7074,19 @@ func (x *CancelAttempt) GetInvocationSpecDigest() []byte {
 // must agree with it. journal-before-send applies unchanged, INCLUDING to refusals: the outcome
 // is persisted before it is sent and replays until AttemptOutcomeAck.
 type AttemptOutcome struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	RequestId               string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`                                        // routing copy; must agree with the document
-	AttemptOrdinal          uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`                        // routing copy
-	InvocationSpecDigest    []byte                 `protobuf:"bytes,7,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`     // routing copy
-	OutcomeId               string                 `protobuf:"bytes,8,opt,name=outcome_id,json=outcomeId,proto3" json:"outcome_id,omitempty"`                                        // WORKER-minted observation id; stable across replays
-	OutcomeDigest           []byte                 `protobuf:"bytes,9,opt,name=outcome_digest,json=outcomeDigest,proto3" json:"outcome_digest,omitempty"`                            // class (a): sha256 over EXACTLY the bytes in 10
-	OutcomeCanonicalBytes   []byte                 `protobuf:"bytes,10,opt,name=outcome_canonical_bytes,json=outcomeCanonicalBytes,proto3" json:"outcome_canonical_bytes,omitempty"` // the AttemptOutcomeBody DOCUMENT, canonical JSON bytes
-	PlacementId             string                 `protobuf:"bytes,11,opt,name=placement_id,json=placementId,proto3" json:"placement_id,omitempty"`                                 // routing
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch      uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch    uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId          string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	RequestId             string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`                                        // routing copy; must agree with the document
+	AttemptOrdinal        uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`                        // routing copy
+	InvocationSpecDigest  []byte                 `protobuf:"bytes,7,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`     // routing copy
+	OutcomeId             string                 `protobuf:"bytes,8,opt,name=outcome_id,json=outcomeId,proto3" json:"outcome_id,omitempty"`                                        // WORKER-minted observation id; stable across replays
+	OutcomeDigest         []byte                 `protobuf:"bytes,9,opt,name=outcome_digest,json=outcomeDigest,proto3" json:"outcome_digest,omitempty"`                            // class (a): sha256 over EXACTLY the bytes in 10
+	OutcomeCanonicalBytes []byte                 `protobuf:"bytes,10,opt,name=outcome_canonical_bytes,json=outcomeCanonicalBytes,proto3" json:"outcome_canonical_bytes,omitempty"` // the AttemptOutcomeBody DOCUMENT, canonical JSON bytes
+	PlacementId           string                 `protobuf:"bytes,11,opt,name=placement_id,json=placementId,proto3" json:"placement_id,omitempty"`                                 // routing
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *AttemptOutcome) Reset() {
@@ -7123,9 +7126,9 @@ func (x *AttemptOutcome) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *AttemptOutcome) GetControlStreamGeneration() uint64 {
+func (x *AttemptOutcome) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -7546,22 +7549,22 @@ func (x *WeightsObjectSource) GetSourceRef() string {
 }
 
 // Runtime asks its authenticated host to commit semantic intent before the first TensorFS write.
-// requested_writer_generation == 0 means first open or replacement-child rejoin. Once ACKed, an
-// identical retry from the same child echoes the generation and receives the same ACK without
+// requested_writer_epoch == 0 means first open or replacement-child rejoin. Once ACKed, an
+// identical retry from the same child echoes the epoch and receives the same ACK without
 // fencing itself. The attempt ordinal is routing only and does not enter transaction identity.
 // The TensorFS declaration is carried directly: it is not wrapped in a second Worker Protocol
 // document. Its digest and exact bytes are the durable conflict/replay fence.
 type WeightsIntentFrame struct {
 	state                             protoimpl.MessageState `protogen:"open.v1"`
 	RecordOwnerEpoch                  uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration           uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
+	ControlStreamEpoch                uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
 	WorkerBootId                      string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
 	RequestId                         string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	AttemptOrdinal                    uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
 	InvocationSpecDigest              []byte                 `protobuf:"bytes,7,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
 	OutputSlot                        string                 `protobuf:"bytes,8,opt,name=output_slot,json=outputSlot,proto3" json:"output_slot,omitempty"`
 	TensorfsDeclarationDigest         []byte                 `protobuf:"bytes,9,opt,name=tensorfs_declaration_digest,json=tensorfsDeclarationDigest,proto3" json:"tensorfs_declaration_digest,omitempty"`
-	RequestedWriterGeneration         uint64                 `protobuf:"varint,10,opt,name=requested_writer_generation,json=requestedWriterGeneration,proto3" json:"requested_writer_generation,omitempty"`
+	RequestedWriterEpoch              uint64                 `protobuf:"varint,10,opt,name=requested_writer_epoch,json=requestedWriterEpoch,proto3" json:"requested_writer_epoch,omitempty"`
 	TensorfsDeclarationCanonicalBytes []byte                 `protobuf:"bytes,11,opt,name=tensorfs_declaration_canonical_bytes,json=tensorfsDeclarationCanonicalBytes,proto3" json:"tensorfs_declaration_canonical_bytes,omitempty"`
 	unknownFields                     protoimpl.UnknownFields
 	sizeCache                         protoimpl.SizeCache
@@ -7604,9 +7607,9 @@ func (x *WeightsIntentFrame) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *WeightsIntentFrame) GetControlStreamGeneration() uint64 {
+func (x *WeightsIntentFrame) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -7653,9 +7656,9 @@ func (x *WeightsIntentFrame) GetTensorfsDeclarationDigest() []byte {
 	return nil
 }
 
-func (x *WeightsIntentFrame) GetRequestedWriterGeneration() uint64 {
+func (x *WeightsIntentFrame) GetRequestedWriterEpoch() uint64 {
 	if x != nil {
-		return x.RequestedWriterGeneration
+		return x.RequestedWriterEpoch
 	}
 	return 0
 }
@@ -7669,19 +7672,19 @@ func (x *WeightsIntentFrame) GetTensorfsDeclarationCanonicalBytes() []byte {
 
 // One ACK type covers intent and receipt durability. The supervisor injects it into Runtime only
 // after its one SQLite transaction commits. A replacement child receives the same transaction id
-// and a newly fenced writer generation; if a receipt already exists it is replayed here and no
-// TensorFS write occurs. REFUSED carries no usable generation or transaction authority.
+// and a newly fenced writer epoch; if a receipt already exists it is replayed here and no
+// TensorFS write occurs. REFUSED carries no usable epoch or transaction authority.
 type WeightsHostAck struct {
 	state                     protoimpl.MessageState `protogen:"open.v1"`
 	RecordOwnerEpoch          uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration   uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
+	ControlStreamEpoch        uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
 	WorkerBootId              string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
 	RequestId                 string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	AttemptOrdinal            uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
 	InvocationSpecDigest      []byte                 `protobuf:"bytes,7,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
 	OutputSlot                string                 `protobuf:"bytes,8,opt,name=output_slot,json=outputSlot,proto3" json:"output_slot,omitempty"`
 	WeightsTransactionId      string                 `protobuf:"bytes,9,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
-	WriterGeneration          uint64                 `protobuf:"varint,10,opt,name=writer_generation,json=writerGeneration,proto3" json:"writer_generation,omitempty"`
+	WriterEpoch               uint64                 `protobuf:"varint,10,opt,name=writer_epoch,json=writerEpoch,proto3" json:"writer_epoch,omitempty"`
 	TensorfsDeclarationDigest []byte                 `protobuf:"bytes,11,opt,name=tensorfs_declaration_digest,json=tensorfsDeclarationDigest,proto3" json:"tensorfs_declaration_digest,omitempty"`
 	Stage                     WeightsHostStage       `protobuf:"varint,12,opt,name=stage,proto3,enum=cozy.worker.v1.WeightsHostStage" json:"stage,omitempty"`
 	Outcome                   WeightsHostOutcome     `protobuf:"varint,13,opt,name=outcome,proto3,enum=cozy.worker.v1.WeightsHostOutcome" json:"outcome,omitempty"`
@@ -7729,9 +7732,9 @@ func (x *WeightsHostAck) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *WeightsHostAck) GetControlStreamGeneration() uint64 {
+func (x *WeightsHostAck) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -7778,9 +7781,9 @@ func (x *WeightsHostAck) GetWeightsTransactionId() string {
 	return ""
 }
 
-func (x *WeightsHostAck) GetWriterGeneration() uint64 {
+func (x *WeightsHostAck) GetWriterEpoch() uint64 {
 	if x != nil {
-		return x.WriterGeneration
+		return x.WriterEpoch
 	}
 	return 0
 }
@@ -7828,19 +7831,19 @@ func (x *WeightsHostAck) GetManifest() *Ref {
 }
 
 // Runtime sends the exact committed receipt and exact local source inventory together. The
-// supervisor validates all routing copies and writer_generation, commits both before ACK, and then
+// supervisor validates all routing copies and writer_epoch, commits both before ACK, and then
 // may forward this frame to the external RecordOwner. A stale child cannot publish a late receipt.
 type WeightsReceiptFrame struct {
 	state                     protoimpl.MessageState `protogen:"open.v1"`
 	RecordOwnerEpoch          uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration   uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
+	ControlStreamEpoch        uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
 	WorkerBootId              string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
 	RequestId                 string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	AttemptOrdinal            uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
 	InvocationSpecDigest      []byte                 `protobuf:"bytes,7,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
 	OutputSlot                string                 `protobuf:"bytes,8,opt,name=output_slot,json=outputSlot,proto3" json:"output_slot,omitempty"`
 	WeightsTransactionId      string                 `protobuf:"bytes,9,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
-	WriterGeneration          uint64                 `protobuf:"varint,10,opt,name=writer_generation,json=writerGeneration,proto3" json:"writer_generation,omitempty"`
+	WriterEpoch               uint64                 `protobuf:"varint,10,opt,name=writer_epoch,json=writerEpoch,proto3" json:"writer_epoch,omitempty"`
 	TensorfsDeclarationDigest []byte                 `protobuf:"bytes,11,opt,name=tensorfs_declaration_digest,json=tensorfsDeclarationDigest,proto3" json:"tensorfs_declaration_digest,omitempty"`
 	WeightsReceipt            *WeightsReceiptRef     `protobuf:"bytes,12,opt,name=weights_receipt,json=weightsReceipt,proto3" json:"weights_receipt,omitempty"`
 	Objects                   []*WeightsObjectSource `protobuf:"bytes,13,rep,name=objects,proto3" json:"objects,omitempty"` // sorted uniquely by object_id; committed in the
@@ -7887,9 +7890,9 @@ func (x *WeightsReceiptFrame) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *WeightsReceiptFrame) GetControlStreamGeneration() uint64 {
+func (x *WeightsReceiptFrame) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -7936,9 +7939,9 @@ func (x *WeightsReceiptFrame) GetWeightsTransactionId() string {
 	return ""
 }
 
-func (x *WeightsReceiptFrame) GetWriterGeneration() uint64 {
+func (x *WeightsReceiptFrame) GetWriterEpoch() uint64 {
 	if x != nil {
-		return x.WriterGeneration
+		return x.WriterEpoch
 	}
 	return 0
 }
@@ -7982,7 +7985,7 @@ type WeightsTransactionStatus struct {
 	AttemptOrdinal            uint64                  `protobuf:"varint,3,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
 	InvocationSpecDigest      string                  `protobuf:"bytes,4,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
 	OutputSlot                string                  `protobuf:"bytes,5,opt,name=output_slot,json=outputSlot,proto3" json:"output_slot,omitempty"`
-	WriterGeneration          uint64                  `protobuf:"varint,6,opt,name=writer_generation,json=writerGeneration,proto3" json:"writer_generation,omitempty"`
+	WriterEpoch               uint64                  `protobuf:"varint,6,opt,name=writer_epoch,json=writerEpoch,proto3" json:"writer_epoch,omitempty"`
 	State                     WeightsTransactionState `protobuf:"varint,7,opt,name=state,proto3,enum=cozy.worker.v1.WeightsTransactionState" json:"state,omitempty"`
 	TensorfsDeclarationDigest []byte                  `protobuf:"bytes,8,opt,name=tensorfs_declaration_digest,json=tensorfsDeclarationDigest,proto3" json:"tensorfs_declaration_digest,omitempty"`
 	WeightsReceiptDigest      []byte                  `protobuf:"bytes,9,opt,name=weights_receipt_digest,json=weightsReceiptDigest,proto3" json:"weights_receipt_digest,omitempty"` // absent in INTENT; exact replay fence in RECEIPT
@@ -8055,9 +8058,9 @@ func (x *WeightsTransactionStatus) GetOutputSlot() string {
 	return ""
 }
 
-func (x *WeightsTransactionStatus) GetWriterGeneration() uint64 {
+func (x *WeightsTransactionStatus) GetWriterEpoch() uint64 {
 	if x != nil {
-		return x.WriterGeneration
+		return x.WriterEpoch
 	}
 	return 0
 }
@@ -8088,19 +8091,19 @@ func (x *WeightsTransactionStatus) GetWeightsReceiptDigest() []byte {
 // to the committed receipt inventory, then forwards this same frame to Runtime. read_id is unique
 // among pending reads on one claimed stream and routes the exact result; it is not durable state.
 type WeightsReadRequest struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	WeightsTransactionId    string                 `protobuf:"bytes,5,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
-	WriterGeneration        uint64                 `protobuf:"varint,6,opt,name=writer_generation,json=writerGeneration,proto3" json:"writer_generation,omitempty"`
-	ObjectId                string                 `protobuf:"bytes,7,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
-	SourceRef               string                 `protobuf:"bytes,8,opt,name=source_ref,json=sourceRef,proto3" json:"source_ref,omitempty"`
-	ReadId                  string                 `protobuf:"bytes,9,opt,name=read_id,json=readId,proto3" json:"read_id,omitempty"`
-	Offset                  uint64                 `protobuf:"varint,10,opt,name=offset,proto3" json:"offset,omitempty"`
-	MaxBytes                uint32                 `protobuf:"varint,11,opt,name=max_bytes,json=maxBytes,proto3" json:"max_bytes,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch     uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch   uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId         string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	WeightsTransactionId string                 `protobuf:"bytes,5,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
+	WriterEpoch          uint64                 `protobuf:"varint,6,opt,name=writer_epoch,json=writerEpoch,proto3" json:"writer_epoch,omitempty"`
+	ObjectId             string                 `protobuf:"bytes,7,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
+	SourceRef            string                 `protobuf:"bytes,8,opt,name=source_ref,json=sourceRef,proto3" json:"source_ref,omitempty"`
+	ReadId               string                 `protobuf:"bytes,9,opt,name=read_id,json=readId,proto3" json:"read_id,omitempty"`
+	Offset               uint64                 `protobuf:"varint,10,opt,name=offset,proto3" json:"offset,omitempty"`
+	MaxBytes             uint32                 `protobuf:"varint,11,opt,name=max_bytes,json=maxBytes,proto3" json:"max_bytes,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *WeightsReadRequest) Reset() {
@@ -8140,9 +8143,9 @@ func (x *WeightsReadRequest) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *WeightsReadRequest) GetControlStreamGeneration() uint64 {
+func (x *WeightsReadRequest) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -8161,9 +8164,9 @@ func (x *WeightsReadRequest) GetWeightsTransactionId() string {
 	return ""
 }
 
-func (x *WeightsReadRequest) GetWriterGeneration() uint64 {
+func (x *WeightsReadRequest) GetWriterEpoch() uint64 {
 	if x != nil {
-		return x.WriterGeneration
+		return x.WriterEpoch
 	}
 	return 0
 }
@@ -8204,23 +8207,23 @@ func (x *WeightsReadRequest) GetMaxBytes() uint32 {
 }
 
 type WeightsReadResult struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	WeightsTransactionId    string                 `protobuf:"bytes,5,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
-	WriterGeneration        uint64                 `protobuf:"varint,6,opt,name=writer_generation,json=writerGeneration,proto3" json:"writer_generation,omitempty"`
-	ObjectId                string                 `protobuf:"bytes,7,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
-	SourceRef               string                 `protobuf:"bytes,8,opt,name=source_ref,json=sourceRef,proto3" json:"source_ref,omitempty"`
-	ReadId                  string                 `protobuf:"bytes,9,opt,name=read_id,json=readId,proto3" json:"read_id,omitempty"`
-	Offset                  uint64                 `protobuf:"varint,10,opt,name=offset,proto3" json:"offset,omitempty"`
-	Outcome                 WeightsReadOutcome     `protobuf:"varint,11,opt,name=outcome,proto3,enum=cozy.worker.v1.WeightsReadOutcome" json:"outcome,omitempty"`
-	Data                    []byte                 `protobuf:"bytes,12,opt,name=data,proto3" json:"data,omitempty"`
-	DataDigest              []byte                 `protobuf:"bytes,13,opt,name=data_digest,json=dataDigest,proto3" json:"data_digest,omitempty"`
-	Refusal                 WeightsReadRefusal     `protobuf:"varint,14,opt,name=refusal,proto3,enum=cozy.worker.v1.WeightsReadRefusal" json:"refusal,omitempty"`
-	SafeDetail              string                 `protobuf:"bytes,15,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch     uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch   uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId         string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	WeightsTransactionId string                 `protobuf:"bytes,5,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
+	WriterEpoch          uint64                 `protobuf:"varint,6,opt,name=writer_epoch,json=writerEpoch,proto3" json:"writer_epoch,omitempty"`
+	ObjectId             string                 `protobuf:"bytes,7,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
+	SourceRef            string                 `protobuf:"bytes,8,opt,name=source_ref,json=sourceRef,proto3" json:"source_ref,omitempty"`
+	ReadId               string                 `protobuf:"bytes,9,opt,name=read_id,json=readId,proto3" json:"read_id,omitempty"`
+	Offset               uint64                 `protobuf:"varint,10,opt,name=offset,proto3" json:"offset,omitempty"`
+	Outcome              WeightsReadOutcome     `protobuf:"varint,11,opt,name=outcome,proto3,enum=cozy.worker.v1.WeightsReadOutcome" json:"outcome,omitempty"`
+	Data                 []byte                 `protobuf:"bytes,12,opt,name=data,proto3" json:"data,omitempty"`
+	DataDigest           []byte                 `protobuf:"bytes,13,opt,name=data_digest,json=dataDigest,proto3" json:"data_digest,omitempty"`
+	Refusal              WeightsReadRefusal     `protobuf:"varint,14,opt,name=refusal,proto3,enum=cozy.worker.v1.WeightsReadRefusal" json:"refusal,omitempty"`
+	SafeDetail           string                 `protobuf:"bytes,15,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *WeightsReadResult) Reset() {
@@ -8260,9 +8263,9 @@ func (x *WeightsReadResult) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *WeightsReadResult) GetControlStreamGeneration() uint64 {
+func (x *WeightsReadResult) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -8281,9 +8284,9 @@ func (x *WeightsReadResult) GetWeightsTransactionId() string {
 	return ""
 }
 
-func (x *WeightsReadResult) GetWriterGeneration() uint64 {
+func (x *WeightsReadResult) GetWriterEpoch() uint64 {
 	if x != nil {
-		return x.WriterGeneration
+		return x.WriterEpoch
 	}
 	return 0
 }
@@ -8546,18 +8549,18 @@ func (x *WeightsUploadGrant) GetExpiresAtUnix() uint64 {
 // capability without changing weights identity. RecordOwners pipeline several requests instead
 // of putting thousands of presigned URLs in one protobuf.
 type WeightsTransferRequest struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	RequestId               string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	AttemptOrdinal          uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
-	InvocationSpecDigest    []byte                 `protobuf:"bytes,7,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
-	OutputSlot              string                 `protobuf:"bytes,8,opt,name=output_slot,json=outputSlot,proto3" json:"output_slot,omitempty"`
-	WeightsTransactionId    string                 `protobuf:"bytes,9,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
-	WeightsReceiptDigest    []byte                 `protobuf:"bytes,10,opt,name=weights_receipt_digest,json=weightsReceiptDigest,proto3" json:"weights_receipt_digest,omitempty"`
-	OperationId             string                 `protobuf:"bytes,11,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	GrantRevision           uint64                 `protobuf:"varint,12,opt,name=grant_revision,json=grantRevision,proto3" json:"grant_revision,omitempty"`
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch     uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch   uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId         string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	RequestId            string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	AttemptOrdinal       uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
+	InvocationSpecDigest []byte                 `protobuf:"bytes,7,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
+	OutputSlot           string                 `protobuf:"bytes,8,opt,name=output_slot,json=outputSlot,proto3" json:"output_slot,omitempty"`
+	WeightsTransactionId string                 `protobuf:"bytes,9,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
+	WeightsReceiptDigest []byte                 `protobuf:"bytes,10,opt,name=weights_receipt_digest,json=weightsReceiptDigest,proto3" json:"weights_receipt_digest,omitempty"`
+	OperationId          string                 `protobuf:"bytes,11,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	GrantRevision        uint64                 `protobuf:"varint,12,opt,name=grant_revision,json=grantRevision,proto3" json:"grant_revision,omitempty"`
 	// Types that are valid to be assigned to Decision:
 	//
 	//	*WeightsTransferRequest_UploadGrant
@@ -8604,9 +8607,9 @@ func (x *WeightsTransferRequest) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *WeightsTransferRequest) GetControlStreamGeneration() uint64 {
+func (x *WeightsTransferRequest) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -8721,20 +8724,20 @@ func (*WeightsTransferRequest_Held) isWeightsTransferRequest_Decision() {}
 // with WeightsUploadResult. It is the supervisor's ledger, not this frame, that decides what
 // was written -- custody is recorded before the writer opens and again when it closes.
 type WeightsUploadRequest struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	WeightsTransactionId    string                 `protobuf:"bytes,5,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
-	WriterGeneration        uint64                 `protobuf:"varint,6,opt,name=writer_generation,json=writerGeneration,proto3" json:"writer_generation,omitempty"`
-	ObjectId                string                 `protobuf:"bytes,7,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
-	SourceRef               string                 `protobuf:"bytes,8,opt,name=source_ref,json=sourceRef,proto3" json:"source_ref,omitempty"`
-	Length                  uint64                 `protobuf:"varint,9,opt,name=length,proto3" json:"length,omitempty"`
-	OperationId             string                 `protobuf:"bytes,10,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	GrantRevision           uint64                 `protobuf:"varint,11,opt,name=grant_revision,json=grantRevision,proto3" json:"grant_revision,omitempty"`
-	Grant                   *WeightsUploadGrant    `protobuf:"bytes,12,opt,name=grant,proto3" json:"grant,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch     uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch   uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId         string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	WeightsTransactionId string                 `protobuf:"bytes,5,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
+	WriterEpoch          uint64                 `protobuf:"varint,6,opt,name=writer_epoch,json=writerEpoch,proto3" json:"writer_epoch,omitempty"`
+	ObjectId             string                 `protobuf:"bytes,7,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
+	SourceRef            string                 `protobuf:"bytes,8,opt,name=source_ref,json=sourceRef,proto3" json:"source_ref,omitempty"`
+	Length               uint64                 `protobuf:"varint,9,opt,name=length,proto3" json:"length,omitempty"`
+	OperationId          string                 `protobuf:"bytes,10,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	GrantRevision        uint64                 `protobuf:"varint,11,opt,name=grant_revision,json=grantRevision,proto3" json:"grant_revision,omitempty"`
+	Grant                *WeightsUploadGrant    `protobuf:"bytes,12,opt,name=grant,proto3" json:"grant,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *WeightsUploadRequest) Reset() {
@@ -8774,9 +8777,9 @@ func (x *WeightsUploadRequest) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *WeightsUploadRequest) GetControlStreamGeneration() uint64 {
+func (x *WeightsUploadRequest) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -8795,9 +8798,9 @@ func (x *WeightsUploadRequest) GetWeightsTransactionId() string {
 	return ""
 }
 
-func (x *WeightsUploadRequest) GetWriterGeneration() uint64 {
+func (x *WeightsUploadRequest) GetWriterEpoch() uint64 {
 	if x != nil {
-		return x.WriterGeneration
+		return x.WriterEpoch
 	}
 	return 0
 }
@@ -8849,24 +8852,24 @@ func (x *WeightsUploadRequest) GetGrant() *WeightsUploadGrant {
 // and the store independently enforced the same digest through the grant's signed checksum
 // header, so neither party is trusted alone.
 type WeightsUploadResult struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	WeightsTransactionId    string                 `protobuf:"bytes,5,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
-	WriterGeneration        uint64                 `protobuf:"varint,6,opt,name=writer_generation,json=writerGeneration,proto3" json:"writer_generation,omitempty"`
-	ObjectId                string                 `protobuf:"bytes,7,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
-	OperationId             string                 `protobuf:"bytes,8,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	GrantRevision           uint64                 `protobuf:"varint,9,opt,name=grant_revision,json=grantRevision,proto3" json:"grant_revision,omitempty"`
-	Outcome                 WeightsUploadOutcome   `protobuf:"varint,10,opt,name=outcome,proto3,enum=cozy.worker.v1.WeightsUploadOutcome" json:"outcome,omitempty"`
-	TransferredBytes        uint64                 `protobuf:"varint,11,opt,name=transferred_bytes,json=transferredBytes,proto3" json:"transferred_bytes,omitempty"`
-	HttpStatus              uint32                 `protobuf:"varint,12,opt,name=http_status,json=httpStatus,proto3" json:"http_status,omitempty"`
-	Etag                    string                 `protobuf:"bytes,13,opt,name=etag,proto3" json:"etag,omitempty"`
-	ChecksumSha256          string                 `protobuf:"bytes,14,opt,name=checksum_sha256,json=checksumSha256,proto3" json:"checksum_sha256,omitempty"` // lowercase sha256:<64 hex> measured while streaming
-	Refusal                 WeightsUploadRefusal   `protobuf:"varint,15,opt,name=refusal,proto3,enum=cozy.worker.v1.WeightsUploadRefusal" json:"refusal,omitempty"`
-	SafeDetail              string                 `protobuf:"bytes,16,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch     uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch   uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId         string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	WeightsTransactionId string                 `protobuf:"bytes,5,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
+	WriterEpoch          uint64                 `protobuf:"varint,6,opt,name=writer_epoch,json=writerEpoch,proto3" json:"writer_epoch,omitempty"`
+	ObjectId             string                 `protobuf:"bytes,7,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
+	OperationId          string                 `protobuf:"bytes,8,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	GrantRevision        uint64                 `protobuf:"varint,9,opt,name=grant_revision,json=grantRevision,proto3" json:"grant_revision,omitempty"`
+	Outcome              WeightsUploadOutcome   `protobuf:"varint,10,opt,name=outcome,proto3,enum=cozy.worker.v1.WeightsUploadOutcome" json:"outcome,omitempty"`
+	TransferredBytes     uint64                 `protobuf:"varint,11,opt,name=transferred_bytes,json=transferredBytes,proto3" json:"transferred_bytes,omitempty"`
+	HttpStatus           uint32                 `protobuf:"varint,12,opt,name=http_status,json=httpStatus,proto3" json:"http_status,omitempty"`
+	Etag                 string                 `protobuf:"bytes,13,opt,name=etag,proto3" json:"etag,omitempty"`
+	ChecksumSha256       string                 `protobuf:"bytes,14,opt,name=checksum_sha256,json=checksumSha256,proto3" json:"checksum_sha256,omitempty"` // lowercase sha256:<64 hex> measured while streaming
+	Refusal              WeightsUploadRefusal   `protobuf:"varint,15,opt,name=refusal,proto3,enum=cozy.worker.v1.WeightsUploadRefusal" json:"refusal,omitempty"`
+	SafeDetail           string                 `protobuf:"bytes,16,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *WeightsUploadResult) Reset() {
@@ -8906,9 +8909,9 @@ func (x *WeightsUploadResult) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *WeightsUploadResult) GetControlStreamGeneration() uint64 {
+func (x *WeightsUploadResult) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -8927,9 +8930,9 @@ func (x *WeightsUploadResult) GetWeightsTransactionId() string {
 	return ""
 }
 
-func (x *WeightsUploadResult) GetWriterGeneration() uint64 {
+func (x *WeightsUploadResult) GetWriterEpoch() uint64 {
 	if x != nil {
-		return x.WriterGeneration
+		return x.WriterEpoch
 	}
 	return 0
 }
@@ -9007,30 +9010,30 @@ func (x *WeightsUploadResult) GetSafeDetail() string {
 // Durable supervisor -> RecordOwner observation. Intermediate observations are monotonic by
 // update_sequence; terminal observations replay after reconnect or exact TransferRequest replay.
 type WeightsTransferStatus struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	RequestId               string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	AttemptOrdinal          uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
-	InvocationSpecDigest    []byte                 `protobuf:"bytes,7,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
-	OutputSlot              string                 `protobuf:"bytes,8,opt,name=output_slot,json=outputSlot,proto3" json:"output_slot,omitempty"`
-	WeightsTransactionId    string                 `protobuf:"bytes,9,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
-	OperationId             string                 `protobuf:"bytes,10,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	GrantRevision           uint64                 `protobuf:"varint,11,opt,name=grant_revision,json=grantRevision,proto3" json:"grant_revision,omitempty"`
-	ObjectId                string                 `protobuf:"bytes,12,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
-	Length                  uint64                 `protobuf:"varint,13,opt,name=length,proto3" json:"length,omitempty"`
-	UpdateSequence          uint64                 `protobuf:"varint,14,opt,name=update_sequence,json=updateSequence,proto3" json:"update_sequence,omitempty"`
-	State                   WeightsTransferState   `protobuf:"varint,15,opt,name=state,proto3,enum=cozy.worker.v1.WeightsTransferState" json:"state,omitempty"`
-	TransferredBytes        uint64                 `protobuf:"varint,16,opt,name=transferred_bytes,json=transferredBytes,proto3" json:"transferred_bytes,omitempty"`
-	HttpStatus              uint32                 `protobuf:"varint,17,opt,name=http_status,json=httpStatus,proto3" json:"http_status,omitempty"`
-	Etag                    string                 `protobuf:"bytes,18,opt,name=etag,proto3" json:"etag,omitempty"`
-	ChecksumSha256          string                 `protobuf:"bytes,19,opt,name=checksum_sha256,json=checksumSha256,proto3" json:"checksum_sha256,omitempty"`
-	Attempts                uint32                 `protobuf:"varint,20,opt,name=attempts,proto3" json:"attempts,omitempty"`
-	SafeCode                string                 `protobuf:"bytes,21,opt,name=safe_code,json=safeCode,proto3" json:"safe_code,omitempty"`
-	SafeDetail              string                 `protobuf:"bytes,22,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch     uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch   uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId         string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	RequestId            string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	AttemptOrdinal       uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
+	InvocationSpecDigest []byte                 `protobuf:"bytes,7,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
+	OutputSlot           string                 `protobuf:"bytes,8,opt,name=output_slot,json=outputSlot,proto3" json:"output_slot,omitempty"`
+	WeightsTransactionId string                 `protobuf:"bytes,9,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
+	OperationId          string                 `protobuf:"bytes,10,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	GrantRevision        uint64                 `protobuf:"varint,11,opt,name=grant_revision,json=grantRevision,proto3" json:"grant_revision,omitempty"`
+	ObjectId             string                 `protobuf:"bytes,12,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
+	Length               uint64                 `protobuf:"varint,13,opt,name=length,proto3" json:"length,omitempty"`
+	UpdateSequence       uint64                 `protobuf:"varint,14,opt,name=update_sequence,json=updateSequence,proto3" json:"update_sequence,omitempty"`
+	State                WeightsTransferState   `protobuf:"varint,15,opt,name=state,proto3,enum=cozy.worker.v1.WeightsTransferState" json:"state,omitempty"`
+	TransferredBytes     uint64                 `protobuf:"varint,16,opt,name=transferred_bytes,json=transferredBytes,proto3" json:"transferred_bytes,omitempty"`
+	HttpStatus           uint32                 `protobuf:"varint,17,opt,name=http_status,json=httpStatus,proto3" json:"http_status,omitempty"`
+	Etag                 string                 `protobuf:"bytes,18,opt,name=etag,proto3" json:"etag,omitempty"`
+	ChecksumSha256       string                 `protobuf:"bytes,19,opt,name=checksum_sha256,json=checksumSha256,proto3" json:"checksum_sha256,omitempty"`
+	Attempts             uint32                 `protobuf:"varint,20,opt,name=attempts,proto3" json:"attempts,omitempty"`
+	SafeCode             string                 `protobuf:"bytes,21,opt,name=safe_code,json=safeCode,proto3" json:"safe_code,omitempty"`
+	SafeDetail           string                 `protobuf:"bytes,22,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *WeightsTransferStatus) Reset() {
@@ -9070,9 +9073,9 @@ func (x *WeightsTransferStatus) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *WeightsTransferStatus) GetControlStreamGeneration() uint64 {
+func (x *WeightsTransferStatus) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -9217,21 +9220,21 @@ func (x *WeightsTransferStatus) GetSafeDetail() string {
 // refresh access but cannot change member/ObjectRef/source selection. Broad account tokens are not
 // representable.
 type ModelSourceFileRequest struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	OperationId             string                 `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	SourceSelectionDigest   []byte                 `protobuf:"bytes,6,opt,name=source_selection_digest,json=sourceSelectionDigest,proto3" json:"source_selection_digest,omitempty"`
-	Member                  string                 `protobuf:"bytes,7,opt,name=member,proto3" json:"member,omitempty"`
-	ObjectId                string                 `protobuf:"bytes,8,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"` // lowercase sha256:<64 hex>
-	Length                  uint64                 `protobuf:"varint,9,opt,name=length,proto3" json:"length,omitempty"`
-	Provider                ModelSourceProvider    `protobuf:"varint,10,opt,name=provider,proto3,enum=cozy.worker.v1.ModelSourceProvider" json:"provider,omitempty"`
-	Url                     string                 `protobuf:"bytes,11,opt,name=url,proto3" json:"url,omitempty"`                                             // memory-only access; never echoed in status/snapshot/loopback
-	ExpiresAtUnix           uint64                 `protobuf:"varint,12,opt,name=expires_at_unix,json=expiresAtUnix,proto3" json:"expires_at_unix,omitempty"` // zero only for an immutable public URL
-	CapabilityRevision      uint64                 `protobuf:"varint,13,opt,name=capability_revision,json=capabilityRevision,proto3" json:"capability_revision,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch      uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch    uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId          string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	OperationId           string                 `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	SourceSelectionDigest []byte                 `protobuf:"bytes,6,opt,name=source_selection_digest,json=sourceSelectionDigest,proto3" json:"source_selection_digest,omitempty"`
+	Member                string                 `protobuf:"bytes,7,opt,name=member,proto3" json:"member,omitempty"`
+	ObjectId              string                 `protobuf:"bytes,8,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"` // lowercase sha256:<64 hex>
+	Length                uint64                 `protobuf:"varint,9,opt,name=length,proto3" json:"length,omitempty"`
+	Provider              ModelSourceProvider    `protobuf:"varint,10,opt,name=provider,proto3,enum=cozy.worker.v1.ModelSourceProvider" json:"provider,omitempty"`
+	Url                   string                 `protobuf:"bytes,11,opt,name=url,proto3" json:"url,omitempty"`                                             // memory-only access; never echoed in status/snapshot/loopback
+	ExpiresAtUnix         uint64                 `protobuf:"varint,12,opt,name=expires_at_unix,json=expiresAtUnix,proto3" json:"expires_at_unix,omitempty"` // zero only for an immutable public URL
+	CapabilityRevision    uint64                 `protobuf:"varint,13,opt,name=capability_revision,json=capabilityRevision,proto3" json:"capability_revision,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *ModelSourceFileRequest) Reset() {
@@ -9271,9 +9274,9 @@ func (x *ModelSourceFileRequest) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *ModelSourceFileRequest) GetControlStreamGeneration() uint64 {
+func (x *ModelSourceFileRequest) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -9349,23 +9352,23 @@ func (x *ModelSourceFileRequest) GetCapabilityRevision() uint64 {
 }
 
 type ModelSourceFileStatus struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	OperationId             string                 `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	SourceSelectionDigest   []byte                 `protobuf:"bytes,6,opt,name=source_selection_digest,json=sourceSelectionDigest,proto3" json:"source_selection_digest,omitempty"`
-	Member                  string                 `protobuf:"bytes,7,opt,name=member,proto3" json:"member,omitempty"`
-	ObjectId                string                 `protobuf:"bytes,8,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
-	Length                  uint64                 `protobuf:"varint,9,opt,name=length,proto3" json:"length,omitempty"`
-	CapabilityRevision      uint64                 `protobuf:"varint,10,opt,name=capability_revision,json=capabilityRevision,proto3" json:"capability_revision,omitempty"`
-	State                   ModelSourceFileState   `protobuf:"varint,11,opt,name=state,proto3,enum=cozy.worker.v1.ModelSourceFileState" json:"state,omitempty"`
-	TransferredBytes        uint64                 `protobuf:"varint,12,opt,name=transferred_bytes,json=transferredBytes,proto3" json:"transferred_bytes,omitempty"`
-	Attempts                uint32                 `protobuf:"varint,13,opt,name=attempts,proto3" json:"attempts,omitempty"`
-	SafeCode                string                 `protobuf:"bytes,14,opt,name=safe_code,json=safeCode,proto3" json:"safe_code,omitempty"`
-	SafeDetail              string                 `protobuf:"bytes,15,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch      uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch    uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId          string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	OperationId           string                 `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	SourceSelectionDigest []byte                 `protobuf:"bytes,6,opt,name=source_selection_digest,json=sourceSelectionDigest,proto3" json:"source_selection_digest,omitempty"`
+	Member                string                 `protobuf:"bytes,7,opt,name=member,proto3" json:"member,omitempty"`
+	ObjectId              string                 `protobuf:"bytes,8,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
+	Length                uint64                 `protobuf:"varint,9,opt,name=length,proto3" json:"length,omitempty"`
+	CapabilityRevision    uint64                 `protobuf:"varint,10,opt,name=capability_revision,json=capabilityRevision,proto3" json:"capability_revision,omitempty"`
+	State                 ModelSourceFileState   `protobuf:"varint,11,opt,name=state,proto3,enum=cozy.worker.v1.ModelSourceFileState" json:"state,omitempty"`
+	TransferredBytes      uint64                 `protobuf:"varint,12,opt,name=transferred_bytes,json=transferredBytes,proto3" json:"transferred_bytes,omitempty"`
+	Attempts              uint32                 `protobuf:"varint,13,opt,name=attempts,proto3" json:"attempts,omitempty"`
+	SafeCode              string                 `protobuf:"bytes,14,opt,name=safe_code,json=safeCode,proto3" json:"safe_code,omitempty"`
+	SafeDetail            string                 `protobuf:"bytes,15,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *ModelSourceFileStatus) Reset() {
@@ -9405,9 +9408,9 @@ func (x *ModelSourceFileStatus) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *ModelSourceFileStatus) GetControlStreamGeneration() uint64 {
+func (x *ModelSourceFileStatus) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -9500,17 +9503,17 @@ func (x *ModelSourceFileStatus) GetSafeDetail() string {
 // against the downloaded headers and emits exact TensorFS Manifest refs. Pinned source URI and
 // declared license are credential-free provenance, not authorization.
 type ModelSourcePrepareRequest struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	OperationId             string                 `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	SourceSelectionDigest   []byte                 `protobuf:"bytes,6,opt,name=source_selection_digest,json=sourceSelectionDigest,proto3" json:"source_selection_digest,omitempty"`
-	Profiles                []*ModelSourceProfile  `protobuf:"bytes,7,rep,name=profiles,proto3" json:"profiles,omitempty"`                                      // sorted unique by slot
-	SourceUri               string                 `protobuf:"bytes,8,opt,name=source_uri,json=sourceUri,proto3" json:"source_uri,omitempty"`                   // credential-free pinned provenance
-	DeclaredLicense         string                 `protobuf:"bytes,9,opt,name=declared_license,json=declaredLicense,proto3" json:"declared_license,omitempty"` // bounded printable provenance; empty means undeclared
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch      uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch    uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId          string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	OperationId           string                 `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	SourceSelectionDigest []byte                 `protobuf:"bytes,6,opt,name=source_selection_digest,json=sourceSelectionDigest,proto3" json:"source_selection_digest,omitempty"`
+	Profiles              []*ModelSourceProfile  `protobuf:"bytes,7,rep,name=profiles,proto3" json:"profiles,omitempty"`                                      // sorted unique by slot
+	SourceUri             string                 `protobuf:"bytes,8,opt,name=source_uri,json=sourceUri,proto3" json:"source_uri,omitempty"`                   // credential-free pinned provenance
+	DeclaredLicense       string                 `protobuf:"bytes,9,opt,name=declared_license,json=declaredLicense,proto3" json:"declared_license,omitempty"` // bounded printable provenance; empty means undeclared
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *ModelSourcePrepareRequest) Reset() {
@@ -9550,9 +9553,9 @@ func (x *ModelSourcePrepareRequest) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *ModelSourcePrepareRequest) GetControlStreamGeneration() uint64 {
+func (x *ModelSourcePrepareRequest) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -9600,18 +9603,18 @@ func (x *ModelSourcePrepareRequest) GetDeclaredLicense() string {
 }
 
 type ModelSourcePrepared struct {
-	state                   protoimpl.MessageState    `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                    `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                    `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                    `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	OperationId             string                    `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	SourceSelectionDigest   []byte                    `protobuf:"bytes,6,opt,name=source_selection_digest,json=sourceSelectionDigest,proto3" json:"source_selection_digest,omitempty"`
-	Outcome                 ModelSourcePrepareOutcome `protobuf:"varint,7,opt,name=outcome,proto3,enum=cozy.worker.v1.ModelSourcePrepareOutcome" json:"outcome,omitempty"`
-	Sources                 []*PreparedModelSource    `protobuf:"bytes,8,rep,name=sources,proto3" json:"sources,omitempty"` // sorted unique by slot; exact requested set on success
-	SafeCode                string                    `protobuf:"bytes,9,opt,name=safe_code,json=safeCode,proto3" json:"safe_code,omitempty"`
-	SafeDetail              string                    `protobuf:"bytes,10,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                 protoimpl.MessageState    `protogen:"open.v1"`
+	RecordOwnerEpoch      uint64                    `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch    uint64                    `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId          string                    `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	OperationId           string                    `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	SourceSelectionDigest []byte                    `protobuf:"bytes,6,opt,name=source_selection_digest,json=sourceSelectionDigest,proto3" json:"source_selection_digest,omitempty"`
+	Outcome               ModelSourcePrepareOutcome `protobuf:"varint,7,opt,name=outcome,proto3,enum=cozy.worker.v1.ModelSourcePrepareOutcome" json:"outcome,omitempty"`
+	Sources               []*PreparedModelSource    `protobuf:"bytes,8,rep,name=sources,proto3" json:"sources,omitempty"` // sorted unique by slot; exact requested set on success
+	SafeCode              string                    `protobuf:"bytes,9,opt,name=safe_code,json=safeCode,proto3" json:"safe_code,omitempty"`
+	SafeDetail            string                    `protobuf:"bytes,10,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *ModelSourcePrepared) Reset() {
@@ -9651,9 +9654,9 @@ func (x *ModelSourcePrepared) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *ModelSourcePrepared) GetControlStreamGeneration() uint64 {
+func (x *ModelSourcePrepared) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -9804,15 +9807,15 @@ func (x *PrivatePackageFileGrant) GetUrl() string {
 // frame carrying fresh URLs continues from that prefix. Only bytes that are not the named
 // object refuse, because a wrong prefix poisons every retry.
 type PrivatePackageFetchRequest struct {
-	state                   protoimpl.MessageState     `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                     `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                     `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                     `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	OperationId             string                     `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	SourceDigest            []byte                     `protobuf:"bytes,6,opt,name=source_digest,json=sourceDigest,proto3" json:"source_digest,omitempty"`
-	Files                   []*PrivatePackageFileGrant `protobuf:"bytes,7,rep,name=files,proto3" json:"files,omitempty"` // sorted unique by digest; <= MaxPrivatePackageFiles
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state              protoimpl.MessageState     `protogen:"open.v1"`
+	RecordOwnerEpoch   uint64                     `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch uint64                     `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId       string                     `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	OperationId        string                     `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	SourceDigest       []byte                     `protobuf:"bytes,6,opt,name=source_digest,json=sourceDigest,proto3" json:"source_digest,omitempty"`
+	Files              []*PrivatePackageFileGrant `protobuf:"bytes,7,rep,name=files,proto3" json:"files,omitempty"` // sorted unique by digest; <= MaxPrivatePackageFiles
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *PrivatePackageFetchRequest) Reset() {
@@ -9852,9 +9855,9 @@ func (x *PrivatePackageFetchRequest) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *PrivatePackageFetchRequest) GetControlStreamGeneration() uint64 {
+func (x *PrivatePackageFetchRequest) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -9892,22 +9895,22 @@ func (x *PrivatePackageFetchRequest) GetFiles() []*PrivatePackageFileGrant {
 // RECEIVING status CARRYING a safe code is a resumable stall -- the granted URL aged out, or the
 // stream broke -- and the owner answers it with a fresh PrivatePackageFetchRequest.
 type PrivatePackageFileStatus struct {
-	state                   protoimpl.MessageState  `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                  `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                  `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                  `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	OperationId             string                  `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	SourceDigest            []byte                  `protobuf:"bytes,6,opt,name=source_digest,json=sourceDigest,proto3" json:"source_digest,omitempty"`
-	Digest                  []byte                  `protobuf:"bytes,7,opt,name=digest,proto3" json:"digest,omitempty"`
-	Filename                string                  `protobuf:"bytes,8,opt,name=filename,proto3" json:"filename,omitempty"`
-	Kind                    LocalDownloadKind       `protobuf:"varint,9,opt,name=kind,proto3,enum=cozy.worker.v1.LocalDownloadKind" json:"kind,omitempty"`
-	Length                  uint64                  `protobuf:"varint,10,opt,name=length,proto3" json:"length,omitempty"`
-	State                   PrivatePackageFileState `protobuf:"varint,11,opt,name=state,proto3,enum=cozy.worker.v1.PrivatePackageFileState" json:"state,omitempty"`
-	ReceivedBytes           uint64                  `protobuf:"varint,12,opt,name=received_bytes,json=receivedBytes,proto3" json:"received_bytes,omitempty"`
-	SafeCode                string                  `protobuf:"bytes,13,opt,name=safe_code,json=safeCode,proto3" json:"safe_code,omitempty"`
-	SafeDetail              string                  `protobuf:"bytes,14,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state              protoimpl.MessageState  `protogen:"open.v1"`
+	RecordOwnerEpoch   uint64                  `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch uint64                  `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId       string                  `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	OperationId        string                  `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	SourceDigest       []byte                  `protobuf:"bytes,6,opt,name=source_digest,json=sourceDigest,proto3" json:"source_digest,omitempty"`
+	Digest             []byte                  `protobuf:"bytes,7,opt,name=digest,proto3" json:"digest,omitempty"`
+	Filename           string                  `protobuf:"bytes,8,opt,name=filename,proto3" json:"filename,omitempty"`
+	Kind               LocalDownloadKind       `protobuf:"varint,9,opt,name=kind,proto3,enum=cozy.worker.v1.LocalDownloadKind" json:"kind,omitempty"`
+	Length             uint64                  `protobuf:"varint,10,opt,name=length,proto3" json:"length,omitempty"`
+	State              PrivatePackageFileState `protobuf:"varint,11,opt,name=state,proto3,enum=cozy.worker.v1.PrivatePackageFileState" json:"state,omitempty"`
+	ReceivedBytes      uint64                  `protobuf:"varint,12,opt,name=received_bytes,json=receivedBytes,proto3" json:"received_bytes,omitempty"`
+	SafeCode           string                  `protobuf:"bytes,13,opt,name=safe_code,json=safeCode,proto3" json:"safe_code,omitempty"`
+	SafeDetail         string                  `protobuf:"bytes,14,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *PrivatePackageFileStatus) Reset() {
@@ -9947,9 +9950,9 @@ func (x *PrivatePackageFileStatus) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *PrivatePackageFileStatus) GetControlStreamGeneration() uint64 {
+func (x *PrivatePackageFileStatus) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -10035,15 +10038,15 @@ func (x *PrivatePackageFileStatus) GetSafeDetail() string {
 // author it. The supervisor journals abandonment before deleting this operation's partial/final
 // carriers; an already-prepared PlacementSet/environment remains intact.
 type PrivatePackageAbort struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	OperationId             string                 `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	SourceDigest            []byte                 `protobuf:"bytes,6,opt,name=source_digest,json=sourceDigest,proto3" json:"source_digest,omitempty"`
-	PrivateRevisionDigest   []byte                 `protobuf:"bytes,7,opt,name=private_revision_digest,json=privateRevisionDigest,proto3" json:"private_revision_digest,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch      uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch    uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId          string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	OperationId           string                 `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	SourceDigest          []byte                 `protobuf:"bytes,6,opt,name=source_digest,json=sourceDigest,proto3" json:"source_digest,omitempty"`
+	PrivateRevisionDigest []byte                 `protobuf:"bytes,7,opt,name=private_revision_digest,json=privateRevisionDigest,proto3" json:"private_revision_digest,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *PrivatePackageAbort) Reset() {
@@ -10083,9 +10086,9 @@ func (x *PrivatePackageAbort) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *PrivatePackageAbort) GetControlStreamGeneration() uint64 {
+func (x *PrivatePackageAbort) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -10121,18 +10124,18 @@ func (x *PrivatePackageAbort) GetPrivateRevisionDigest() []byte {
 // Durable supervisor acknowledgement. Exact replay returns REPLAYED; a changed identity or a
 // later chunk/desired state under the tombstoned operation refuses with bounded safe detail.
 type PrivatePackageAbortStatus struct {
-	state                   protoimpl.MessageState     `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                     `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                     `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                     `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	OperationId             string                     `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	SourceDigest            []byte                     `protobuf:"bytes,6,opt,name=source_digest,json=sourceDigest,proto3" json:"source_digest,omitempty"`
-	PrivateRevisionDigest   []byte                     `protobuf:"bytes,7,opt,name=private_revision_digest,json=privateRevisionDigest,proto3" json:"private_revision_digest,omitempty"`
-	Outcome                 PrivatePackageAbortOutcome `protobuf:"varint,8,opt,name=outcome,proto3,enum=cozy.worker.v1.PrivatePackageAbortOutcome" json:"outcome,omitempty"`
-	SafeCode                string                     `protobuf:"bytes,9,opt,name=safe_code,json=safeCode,proto3" json:"safe_code,omitempty"`
-	SafeDetail              string                     `protobuf:"bytes,10,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                 protoimpl.MessageState     `protogen:"open.v1"`
+	RecordOwnerEpoch      uint64                     `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch    uint64                     `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId          string                     `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	OperationId           string                     `protobuf:"bytes,5,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	SourceDigest          []byte                     `protobuf:"bytes,6,opt,name=source_digest,json=sourceDigest,proto3" json:"source_digest,omitempty"`
+	PrivateRevisionDigest []byte                     `protobuf:"bytes,7,opt,name=private_revision_digest,json=privateRevisionDigest,proto3" json:"private_revision_digest,omitempty"`
+	Outcome               PrivatePackageAbortOutcome `protobuf:"varint,8,opt,name=outcome,proto3,enum=cozy.worker.v1.PrivatePackageAbortOutcome" json:"outcome,omitempty"`
+	SafeCode              string                     `protobuf:"bytes,9,opt,name=safe_code,json=safeCode,proto3" json:"safe_code,omitempty"`
+	SafeDetail            string                     `protobuf:"bytes,10,opt,name=safe_detail,json=safeDetail,proto3" json:"safe_detail,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *PrivatePackageAbortStatus) Reset() {
@@ -10172,9 +10175,9 @@ func (x *PrivatePackageAbortStatus) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *PrivatePackageAbortStatus) GetControlStreamGeneration() uint64 {
+func (x *PrivatePackageAbortStatus) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -10232,19 +10235,19 @@ func (x *PrivatePackageAbortStatus) GetSafeDetail() string {
 // record owner journals the decision fields before send; Runtime journals the result fields
 // before reply. Replay keys on the request tuple and compares the typed fields.
 type WeightsFinalizeRequest struct {
-	state                   protoimpl.MessageState     `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                     `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                     `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                     `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	RequestId               string                     `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	InvocationSpecDigest    []byte                     `protobuf:"bytes,6,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
-	OutputSlot              string                     `protobuf:"bytes,7,opt,name=output_slot,json=outputSlot,proto3" json:"output_slot,omitempty"`
-	Disposition             WeightsFinalizeDisposition `protobuf:"varint,8,opt,name=disposition,proto3,enum=cozy.worker.v1.WeightsFinalizeDisposition" json:"disposition,omitempty"`
-	WeightsReceiptDigest    []byte                     `protobuf:"bytes,9,opt,name=weights_receipt_digest,json=weightsReceiptDigest,proto3" json:"weights_receipt_digest,omitempty"`
-	ScratchRootId           string                     `protobuf:"bytes,10,opt,name=scratch_root_id,json=scratchRootId,proto3" json:"scratch_root_id,omitempty"`
-	OwnerAuthorityScope     string                     `protobuf:"bytes,11,opt,name=owner_authority_scope,json=ownerAuthorityScope,proto3" json:"owner_authority_scope,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                protoimpl.MessageState     `protogen:"open.v1"`
+	RecordOwnerEpoch     uint64                     `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch   uint64                     `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId         string                     `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	RequestId            string                     `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	InvocationSpecDigest []byte                     `protobuf:"bytes,6,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
+	OutputSlot           string                     `protobuf:"bytes,7,opt,name=output_slot,json=outputSlot,proto3" json:"output_slot,omitempty"`
+	Disposition          WeightsFinalizeDisposition `protobuf:"varint,8,opt,name=disposition,proto3,enum=cozy.worker.v1.WeightsFinalizeDisposition" json:"disposition,omitempty"`
+	WeightsReceiptDigest []byte                     `protobuf:"bytes,9,opt,name=weights_receipt_digest,json=weightsReceiptDigest,proto3" json:"weights_receipt_digest,omitempty"`
+	ScratchRootId        string                     `protobuf:"bytes,10,opt,name=scratch_root_id,json=scratchRootId,proto3" json:"scratch_root_id,omitempty"`
+	OwnerAuthorityScope  string                     `protobuf:"bytes,11,opt,name=owner_authority_scope,json=ownerAuthorityScope,proto3" json:"owner_authority_scope,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *WeightsFinalizeRequest) Reset() {
@@ -10284,9 +10287,9 @@ func (x *WeightsFinalizeRequest) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *WeightsFinalizeRequest) GetControlStreamGeneration() uint64 {
+func (x *WeightsFinalizeRequest) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -10350,18 +10353,18 @@ func (x *WeightsFinalizeRequest) GetOwnerAuthorityScope() string {
 // Durable worker->owner result. A commit-first ABANDON_UNCOMMITTED race carries the released
 // receipt as evidence; other outcomes may omit it. No extra acknowledgement exists.
 type WeightsFinalizeResult struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	RequestId               string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	InvocationSpecDigest    []byte                 `protobuf:"bytes,6,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
-	OutputSlot              string                 `protobuf:"bytes,7,opt,name=output_slot,json=outputSlot,proto3" json:"output_slot,omitempty"`
-	Outcome                 WeightsFinalizeOutcome `protobuf:"varint,8,opt,name=outcome,proto3,enum=cozy.worker.v1.WeightsFinalizeOutcome" json:"outcome,omitempty"`
-	WeightsReceipt          *WeightsReceiptRef     `protobuf:"bytes,9,opt,name=weights_receipt,json=weightsReceipt,proto3" json:"weights_receipt,omitempty"`
-	OwnerAuthorityScope     string                 `protobuf:"bytes,10,opt,name=owner_authority_scope,json=ownerAuthorityScope,proto3" json:"owner_authority_scope,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch     uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch   uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId         string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	RequestId            string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	InvocationSpecDigest []byte                 `protobuf:"bytes,6,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
+	OutputSlot           string                 `protobuf:"bytes,7,opt,name=output_slot,json=outputSlot,proto3" json:"output_slot,omitempty"`
+	Outcome              WeightsFinalizeOutcome `protobuf:"varint,8,opt,name=outcome,proto3,enum=cozy.worker.v1.WeightsFinalizeOutcome" json:"outcome,omitempty"`
+	WeightsReceipt       *WeightsReceiptRef     `protobuf:"bytes,9,opt,name=weights_receipt,json=weightsReceipt,proto3" json:"weights_receipt,omitempty"`
+	OwnerAuthorityScope  string                 `protobuf:"bytes,10,opt,name=owner_authority_scope,json=ownerAuthorityScope,proto3" json:"owner_authority_scope,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *WeightsFinalizeResult) Reset() {
@@ -10401,9 +10404,9 @@ func (x *WeightsFinalizeResult) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *WeightsFinalizeResult) GetControlStreamGeneration() uint64 {
+func (x *WeightsFinalizeResult) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -10756,17 +10759,17 @@ func (x *ResourceShortfall) GetEvidenceClass() string {
 }
 
 type AttemptOutcomeAck struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	RequestId               string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	AttemptOrdinal          uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
-	InvocationSpecDigest    []byte                 `protobuf:"bytes,7,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
-	OutcomeId               string                 `protobuf:"bytes,8,opt,name=outcome_id,json=outcomeId,proto3" json:"outcome_id,omitempty"`             // echo; a mismatched ack is NOT an ack — replay continues
-	OutcomeDigest           []byte                 `protobuf:"bytes,9,opt,name=outcome_digest,json=outcomeDigest,proto3" json:"outcome_digest,omitempty"` // echo; compared, never recomputed
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch     uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch   uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId         string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	RequestId            string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	AttemptOrdinal       uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
+	InvocationSpecDigest []byte                 `protobuf:"bytes,7,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
+	OutcomeId            string                 `protobuf:"bytes,8,opt,name=outcome_id,json=outcomeId,proto3" json:"outcome_id,omitempty"`             // echo; a mismatched ack is NOT an ack — replay continues
+	OutcomeDigest        []byte                 `protobuf:"bytes,9,opt,name=outcome_digest,json=outcomeDigest,proto3" json:"outcome_digest,omitempty"` // echo; compared, never recomputed
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *AttemptOutcomeAck) Reset() {
@@ -10806,9 +10809,9 @@ func (x *AttemptOutcomeAck) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *AttemptOutcomeAck) GetControlStreamGeneration() uint64 {
+func (x *AttemptOutcomeAck) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -10856,19 +10859,19 @@ func (x *AttemptOutcomeAck) GetOutcomeDigest() []byte {
 }
 
 type JobCheckpointRequest struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	RequestId               string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	AttemptOrdinal          uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
-	OperationKey            string                 `protobuf:"bytes,7,opt,name=operation_key,json=operationKey,proto3" json:"operation_key,omitempty"`    // worker-minted, attempt-scoped idempotency key
-	LogicalKey              string                 `protobuf:"bytes,8,opt,name=logical_key,json=logicalKey,proto3" json:"logical_key,omitempty"`          // author-stable checkpoint slot
-	ContentDigest           []byte                 `protobuf:"bytes,9,opt,name=content_digest,json=contentDigest,proto3" json:"content_digest,omitempty"` // class (b): the checkpoint artifact's bytes
-	Seq                     uint64                 `protobuf:"varint,10,opt,name=seq,proto3" json:"seq,omitempty"`                                        // ordering only, never identity
-	Artifact                *OutputEntry           `protobuf:"bytes,11,opt,name=artifact,proto3" json:"artifact,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId       string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	RequestId          string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	AttemptOrdinal     uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
+	OperationKey       string                 `protobuf:"bytes,7,opt,name=operation_key,json=operationKey,proto3" json:"operation_key,omitempty"`    // worker-minted, attempt-scoped idempotency key
+	LogicalKey         string                 `protobuf:"bytes,8,opt,name=logical_key,json=logicalKey,proto3" json:"logical_key,omitempty"`          // author-stable checkpoint slot
+	ContentDigest      []byte                 `protobuf:"bytes,9,opt,name=content_digest,json=contentDigest,proto3" json:"content_digest,omitempty"` // class (b): the checkpoint artifact's bytes
+	Seq                uint64                 `protobuf:"varint,10,opt,name=seq,proto3" json:"seq,omitempty"`                                        // ordering only, never identity
+	Artifact           *OutputEntry           `protobuf:"bytes,11,opt,name=artifact,proto3" json:"artifact,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *JobCheckpointRequest) Reset() {
@@ -10908,9 +10911,9 @@ func (x *JobCheckpointRequest) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *JobCheckpointRequest) GetControlStreamGeneration() uint64 {
+func (x *JobCheckpointRequest) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -10972,20 +10975,20 @@ func (x *JobCheckpointRequest) GetArtifact() *OutputEntry {
 }
 
 type JobCheckpointReceipt struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	RequestId               string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	AttemptOrdinal          uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
-	OperationKey            string                 `protobuf:"bytes,7,opt,name=operation_key,json=operationKey,proto3" json:"operation_key,omitempty"`    // echo
-	LogicalKey              string                 `protobuf:"bytes,8,opt,name=logical_key,json=logicalKey,proto3" json:"logical_key,omitempty"`          // echo
-	ContentDigest           []byte                 `protobuf:"bytes,9,opt,name=content_digest,json=contentDigest,proto3" json:"content_digest,omitempty"` // echo; mismatch vs recorded identity is a conflict
-	ReceiptId               string                 `protobuf:"bytes,10,opt,name=receipt_id,json=receiptId,proto3" json:"receipt_id,omitempty"`            // RecordOwner-minted durable record id
-	Outcome                 CheckpointOutcome      `protobuf:"varint,11,opt,name=outcome,proto3,enum=cozy.worker.v1.CheckpointOutcome" json:"outcome,omitempty"`
-	Fault                   *CheckpointFault       `protobuf:"bytes,12,opt,name=fault,proto3" json:"fault,omitempty"` // set iff CONFLICT or REFUSED
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId       string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	RequestId          string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	AttemptOrdinal     uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
+	OperationKey       string                 `protobuf:"bytes,7,opt,name=operation_key,json=operationKey,proto3" json:"operation_key,omitempty"`    // echo
+	LogicalKey         string                 `protobuf:"bytes,8,opt,name=logical_key,json=logicalKey,proto3" json:"logical_key,omitempty"`          // echo
+	ContentDigest      []byte                 `protobuf:"bytes,9,opt,name=content_digest,json=contentDigest,proto3" json:"content_digest,omitempty"` // echo; mismatch vs recorded identity is a conflict
+	ReceiptId          string                 `protobuf:"bytes,10,opt,name=receipt_id,json=receiptId,proto3" json:"receipt_id,omitempty"`            // RecordOwner-minted durable record id
+	Outcome            CheckpointOutcome      `protobuf:"varint,11,opt,name=outcome,proto3,enum=cozy.worker.v1.CheckpointOutcome" json:"outcome,omitempty"`
+	Fault              *CheckpointFault       `protobuf:"bytes,12,opt,name=fault,proto3" json:"fault,omitempty"` // set iff CONFLICT or REFUSED
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *JobCheckpointReceipt) Reset() {
@@ -11025,9 +11028,9 @@ func (x *JobCheckpointReceipt) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *JobCheckpointReceipt) GetControlStreamGeneration() uint64 {
+func (x *JobCheckpointReceipt) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -11156,17 +11159,17 @@ func (x *CheckpointFault) GetRecordedContentDigest() []byte {
 }
 
 type JobCheckpointAck struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	RequestId               string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	AttemptOrdinal          uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
-	OperationKey            string                 `protobuf:"bytes,7,opt,name=operation_key,json=operationKey,proto3" json:"operation_key,omitempty"`
-	ReceiptId               string                 `protobuf:"bytes,8,opt,name=receipt_id,json=receiptId,proto3" json:"receipt_id,omitempty"` // echo; a mismatched ack is not an ack
-	ContentDigest           []byte                 `protobuf:"bytes,9,opt,name=content_digest,json=contentDigest,proto3" json:"content_digest,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId       string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	RequestId          string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	AttemptOrdinal     uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
+	OperationKey       string                 `protobuf:"bytes,7,opt,name=operation_key,json=operationKey,proto3" json:"operation_key,omitempty"`
+	ReceiptId          string                 `protobuf:"bytes,8,opt,name=receipt_id,json=receiptId,proto3" json:"receipt_id,omitempty"` // echo; a mismatched ack is not an ack
+	ContentDigest      []byte                 `protobuf:"bytes,9,opt,name=content_digest,json=contentDigest,proto3" json:"content_digest,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *JobCheckpointAck) Reset() {
@@ -11206,9 +11209,9 @@ func (x *JobCheckpointAck) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *JobCheckpointAck) GetControlStreamGeneration() uint64 {
+func (x *JobCheckpointAck) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -11256,13 +11259,13 @@ func (x *JobCheckpointAck) GetContentDigest() []byte {
 }
 
 type ProgressOpen struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"` // binds the watch to the fenced control stream
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	RequestId               string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"` // empty = all attempts on this stream
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"` // binds the watch to the fenced control stream
+	WorkerBootId       string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	RequestId          string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"` // empty = all attempts on this stream
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *ProgressOpen) Reset() {
@@ -11302,9 +11305,9 @@ func (x *ProgressOpen) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *ProgressOpen) GetControlStreamGeneration() uint64 {
+func (x *ProgressOpen) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -11324,13 +11327,13 @@ func (x *ProgressOpen) GetRequestId() string {
 }
 
 type AttemptProgress struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	RecordOwnerEpoch        uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
-	ControlStreamGeneration uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
-	WorkerBootId            string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	RequestId               string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	AttemptOrdinal          uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
-	Seq                     uint64                 `protobuf:"varint,7,opt,name=seq,proto3" json:"seq,omitempty"` // starts at 1, strictly increasing per (request_id,
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	RecordOwnerEpoch   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
+	ControlStreamEpoch uint64                 `protobuf:"varint,2,opt,name=control_stream_epoch,json=controlStreamEpoch,proto3" json:"control_stream_epoch,omitempty"`
+	WorkerBootId       string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
+	RequestId          string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	AttemptOrdinal     uint64                 `protobuf:"varint,6,opt,name=attempt_ordinal,json=attemptOrdinal,proto3" json:"attempt_ordinal,omitempty"`
+	Seq                uint64                 `protobuf:"varint,7,opt,name=seq,proto3" json:"seq,omitempty"` // starts at 1, strictly increasing per (request_id,
 	// attempt_ordinal); gaps are VISIBLE and the only loss
 	// allowed
 	ContentType   string `protobuf:"bytes,8,opt,name=content_type,json=contentType,proto3" json:"content_type,omitempty"`
@@ -11377,9 +11380,9 @@ func (x *AttemptProgress) GetRecordOwnerEpoch() uint64 {
 	return 0
 }
 
-func (x *AttemptProgress) GetControlStreamGeneration() uint64 {
+func (x *AttemptProgress) GetControlStreamEpoch() uint64 {
 	if x != nil {
-		return x.ControlStreamGeneration
+		return x.ControlStreamEpoch
 	}
 	return 0
 }
@@ -12014,14 +12017,14 @@ func (x *OutputAccess) GetUrl() string {
 }
 
 type DeliveryAccessCredential struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Issuer        string                 `protobuf:"bytes,1,opt,name=issuer,proto3" json:"issuer,omitempty"`
-	KeyId         string                 `protobuf:"bytes,2,opt,name=key_id,json=keyId,proto3" json:"key_id,omitempty"`
-	Epoch         uint64                 `protobuf:"varint,3,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	ExpiresAtUnix uint64                 `protobuf:"varint,4,opt,name=expires_at_unix,json=expiresAtUnix,proto3" json:"expires_at_unix,omitempty"`
-	Token         []byte                 `protobuf:"bytes,5,opt,name=token,proto3" json:"token,omitempty"` // STRUCTURALLY SECRET; never in a digest, a log, or an
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Issuer          string                 `protobuf:"bytes,1,opt,name=issuer,proto3" json:"issuer,omitempty"`
+	KeyId           string                 `protobuf:"bytes,2,opt,name=key_id,json=keyId,proto3" json:"key_id,omitempty"`
+	CredentialEpoch uint64                 `protobuf:"varint,3,opt,name=credential_epoch,json=credentialEpoch,proto3" json:"credential_epoch,omitempty"`
+	ExpiresAtUnix   uint64                 `protobuf:"varint,4,opt,name=expires_at_unix,json=expiresAtUnix,proto3" json:"expires_at_unix,omitempty"`
+	Token           []byte                 `protobuf:"bytes,5,opt,name=token,proto3" json:"token,omitempty"` // STRUCTURALLY SECRET; never in a digest, a log, or an
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *DeliveryAccessCredential) Reset() {
@@ -12068,9 +12071,9 @@ func (x *DeliveryAccessCredential) GetKeyId() string {
 	return ""
 }
 
-func (x *DeliveryAccessCredential) GetEpoch() uint64 {
+func (x *DeliveryAccessCredential) GetCredentialEpoch() uint64 {
 	if x != nil {
-		return x.Epoch
+		return x.CredentialEpoch
 	}
 	return 0
 }
@@ -12449,10 +12452,10 @@ type HeldAttempt struct {
 	Kind                 AttemptKind            `protobuf:"varint,3,opt,name=kind,proto3,enum=cozy.worker.v1.AttemptKind" json:"kind,omitempty"`
 	State                AttemptState           `protobuf:"varint,4,opt,name=state,proto3,enum=cozy.worker.v1.AttemptState" json:"state,omitempty"`
 	InvocationSpecDigest []byte                 `protobuf:"bytes,5,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
-	PlacementId          string                 `protobuf:"bytes,6,opt,name=placement_id,json=placementId,proto3" json:"placement_id,omitempty"`                       // the executing placement; empty in job mode
-	ExecutorGeneration   uint64                 `protobuf:"varint,7,opt,name=executor_generation,json=executorGeneration,proto3" json:"executor_generation,omitempty"` // the generation it runs/ran under
-	OutcomeId            string                 `protobuf:"bytes,8,opt,name=outcome_id,json=outcomeId,proto3" json:"outcome_id,omitempty"`                             // set iff state is OUTCOME_PENDING_ACK
-	OutcomeDigest        []byte                 `protobuf:"bytes,9,opt,name=outcome_digest,json=outcomeDigest,proto3" json:"outcome_digest,omitempty"`                 // class (a); set iff state is OUTCOME_PENDING_ACK
+	PlacementId          string                 `protobuf:"bytes,6,opt,name=placement_id,json=placementId,proto3" json:"placement_id,omitempty"`        // the executing placement; empty in job mode
+	ExecutorEpoch        uint64                 `protobuf:"varint,7,opt,name=executor_epoch,json=executorEpoch,proto3" json:"executor_epoch,omitempty"` // the epoch it runs/ran under
+	OutcomeId            string                 `protobuf:"bytes,8,opt,name=outcome_id,json=outcomeId,proto3" json:"outcome_id,omitempty"`              // set iff state is OUTCOME_PENDING_ACK
+	OutcomeDigest        []byte                 `protobuf:"bytes,9,opt,name=outcome_digest,json=outcomeDigest,proto3" json:"outcome_digest,omitempty"`  // class (a); set iff state is OUTCOME_PENDING_ACK
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -12529,9 +12532,9 @@ func (x *HeldAttempt) GetPlacementId() string {
 	return ""
 }
 
-func (x *HeldAttempt) GetExecutorGeneration() uint64 {
+func (x *HeldAttempt) GetExecutorEpoch() uint64 {
 	if x != nil {
-		return x.ExecutorGeneration
+		return x.ExecutorEpoch
 	}
 	return 0
 }
@@ -13027,10 +13030,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x1bprivate_package_file_status\x18\x17 \x01(\v2(.cozy.worker.v1.PrivatePackageFileStatusH\x00R\x18privatePackageFileStatus\x12l\n" +
 	"\x1cprivate_package_abort_status\x18\x18 \x01(\v2).cozy.worker.v1.PrivatePackageAbortStatusH\x00R\x19privatePackageAbortStatus\x12Y\n" +
 	"\x15weights_upload_result\x18\x19 \x01(\v2#.cozy.worker.v1.WeightsUploadResultH\x00R\x13weightsUploadResultB\x05\n" +
-	"\x03msgJ\x04\b\r\x10\x0eJ\x04\b\x0e\x10\x0fJ\x04\b\x0f\x10\x10\"\xb1\x02\n" +
+	"\x03msgJ\x04\b\r\x10\x0eJ\x04\b\x0e\x10\x0fJ\x04\b\x0f\x10\x10\"\xa7\x02\n" +
 	"\x05Claim\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12&\n" +
 	"\x0frecord_owner_id\x18\x05 \x01(\tR\rrecordOwnerId\x12\x1b\n" +
 	"\tworker_id\x18\x06 \x01(\tR\bworkerId\x12\x1d\n" +
@@ -13043,10 +13046,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x02 \x01(\tR\fworkerBootId\x12\x1b\n" +
 	"\tworker_id\x18\x03 \x01(\tR\bworkerId\x12A\n" +
-	"\x1dworker_tls_certificate_digest\x18\x04 \x01(\fR\x1aworkerTlsCertificateDigest\"\xbe\x04\n" +
+	"\x1dworker_tls_certificate_digest\x18\x04 \x01(\fR\x1aworkerTlsCertificateDigest\"\xb4\x04\n" +
 	"\bClaimAck\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1a\n" +
 	"\baccepted\x18\x05 \x01(\bR\baccepted\x12<\n" +
 	"\trejection\x18\x06 \x01(\x0e2\x1e.cozy.worker.v1.ClaimRejectionR\trejection\x12\x1d\n" +
@@ -13059,10 +13062,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x16control_runtime_digest\x18\v \x01(\tR\x14controlRuntimeDigest\x12\x1d\n" +
 	"\n" +
 	"git_commit\x18\f \x01(\tR\tgitCommit\x12=\n" +
-	"\tresources\x18\r \x01(\v2\x1f.cozy.worker.v1.WorkerResourcesR\tresourcesJ\x04\b\x04\x10\x05J\x04\b\x0e\x10\x0fR\x12wire_schema_digest\"\xe2\x03\n" +
+	"\tresources\x18\r \x01(\v2\x1f.cozy.worker.v1.WorkerResourcesR\tresourcesJ\x04\b\x04\x10\x05J\x04\b\x0e\x10\x0fR\x12wire_schema_digest\"\xd8\x03\n" +
 	"\vBootFailure\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1b\n" +
 	"\tworker_id\x18\x05 \x01(\tR\bworkerId\x12,\n" +
 	"\x12worker_instance_id\x18\x06 \x01(\tR\x10workerInstanceId\x129\n" +
@@ -13071,16 +13074,16 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\tresources\x18\t \x01(\v2\x1f.cozy.worker.v1.WorkerResourcesR\tresources\x124\n" +
 	"\x16control_runtime_digest\x18\n" +
 	" \x01(\tR\x14controlRuntimeDigest\x12*\n" +
-	"\x11worker_release_id\x18\v \x01(\tR\x0fworkerReleaseIdJ\x04\b\x04\x10\x05\"\xfe\x02\n" +
+	"\x11worker_release_id\x18\v \x01(\tR\x0fworkerReleaseIdJ\x04\b\x04\x10\x05\"\xf4\x02\n" +
 	"\x0eWorkerSnapshot\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1f\n" +
 	"\vsnapshot_id\x18\x05 \x01(\tR\n" +
 	"snapshotId\x12'\n" +
 	"\x0fsnapshot_digest\x18\x06 \x01(\fR\x0esnapshotDigest\x128\n" +
 	"\x18snapshot_canonical_bytes\x18\a \x01(\fR\x16snapshotCanonicalBytes\x12R\n" +
-	"&accepted_placement_set_canonical_bytes\x18\b \x01(\fR\"acceptedPlacementSetCanonicalBytesJ\x04\b\x04\x10\x05\"\xce\x05\n" +
+	"&accepted_placement_set_canonical_bytes\x18\b \x01(\fR\"acceptedPlacementSetCanonicalBytesJ\x04\b\x04\x10\x05\"\xc4\x05\n" +
 	"\x12WorkerSnapshotBody\x12E\n" +
 	"\x1faccepted_desired_state_revision\x18\x01 \x01(\x04R\x1cacceptedDesiredStateRevision\x12A\n" +
 	"\x1daccepted_placement_set_digest\x18\x02 \x01(\fR\x1aacceptedPlacementSetDigest\x12+\n" +
@@ -13089,23 +13092,23 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\n" +
 	"placements\x18\x05 \x03(\v2\x1f.cozy.worker.v1.PlacementStatusR\n" +
 	"placements\x12-\n" +
-	"\x12converged_revision\x18\x06 \x01(\x04R\x11convergedRevision\x121\n" +
-	"\x14admission_generation\x18\a \x01(\x04R\x13admissionGeneration\x12G\n" +
+	"\x12converged_revision\x18\x06 \x01(\x04R\x11convergedRevision\x12'\n" +
+	"\x0fadmission_epoch\x18\a \x01(\x04R\x0eadmissionEpoch\x12G\n" +
 	"\x0fadmission_state\x18\b \x01(\x0e2\x1e.cozy.worker.v1.AdmissionStateR\x0eadmissionState\x126\n" +
 	"\x17available_attempt_slots\x18\t \x01(\rR\x15availableAttemptSlots\x12@\n" +
 	"\rheld_attempts\x18\n" +
 	" \x03(\v2\x1b.cozy.worker.v1.HeldAttemptR\fheldAttempts\x12[\n" +
-	"\x14weights_transactions\x18\v \x03(\v2(.cozy.worker.v1.WeightsTransactionStatusR\x13weightsTransactions\"\xed\x01\n" +
+	"\x14weights_transactions\x18\v \x03(\v2(.cozy.worker.v1.WeightsTransactionStatusR\x13weightsTransactions\"\xe3\x01\n" +
 	"\vSnapshotAck\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1f\n" +
 	"\vsnapshot_id\x18\x05 \x01(\tR\n" +
 	"snapshotId\x12'\n" +
-	"\x0fsnapshot_digest\x18\x06 \x01(\fR\x0esnapshotDigestJ\x04\b\x04\x10\x05\"\xe0\x05\n" +
+	"\x0fsnapshot_digest\x18\x06 \x01(\fR\x0esnapshotDigestJ\x04\b\x04\x10\x05\"\xd6\x05\n" +
 	"\x12DesiredWorkerState\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1a\n" +
 	"\brevision\x18\x05 \x01(\x04R\brevision\x121\n" +
 	"\aposture\x18\x06 \x01(\x0e2\x17.cozy.worker.v1.PostureR\aposture\x12\x1d\n" +
@@ -13245,10 +13248,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\rresource_caps\x18\x03 \x01(\v2\x1c.cozy.worker.v1.ResourceCapsR\fresourceCaps\x12V\n" +
 	"\x14publication_contract\x18\x04 \x01(\v2#.cozy.worker.v1.PublicationContractR\x13publicationContract\x12.\n" +
 	"\x13reclaim_on_terminal\x18\x05 \x01(\bR\x11reclaimOnTerminal\x12!\n" +
-	"\fdevice_count\x18\x06 \x01(\rR\vdeviceCount\"\xa7\b\n" +
+	"\fdevice_count\x18\x06 \x01(\rR\vdeviceCount\"\x93\b\n" +
 	"\x13ObservedWorkerState\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12,\n" +
 	"\x12applied_wire_minor\x18\b \x01(\rR\x10appliedWireMinor\x12@\n" +
 	"\rheld_attempts\x18\t \x03(\v2\x1b.cozy.worker.v1.HeldAttemptR\fheldAttempts\x12-\n" +
@@ -13258,17 +13261,17 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\fjob_capacity\x18\r \x01(\v2\x1b.cozy.worker.v1.JobCapacityR\vjobCapacity\x12?\n" +
 	"\n" +
 	"placements\x18\x0f \x03(\v2\x1f.cozy.worker.v1.PlacementStatusR\n" +
-	"placements\x121\n" +
-	"\x14admission_generation\x18\x10 \x01(\x04R\x13admissionGeneration\x12G\n" +
+	"placements\x12'\n" +
+	"\x0fadmission_epoch\x18\x10 \x01(\x04R\x0eadmissionEpoch\x12G\n" +
 	"\x0fadmission_state\x18\x11 \x01(\x0e2\x1e.cozy.worker.v1.AdmissionStateR\x0eadmissionState\x126\n" +
 	"\x17available_attempt_slots\x18\x12 \x01(\rR\x15availableAttemptSlots\x12E\n" +
 	"\x1faccepted_desired_state_revision\x18\x13 \x01(\x04R\x1cacceptedDesiredStateRevision\x12A\n" +
 	"\x1daccepted_placement_set_digest\x18\x14 \x01(\fR\x1aacceptedPlacementSetDigest\x12-\n" +
 	"\x12converged_revision\x18\x15 \x01(\x04R\x11convergedRevision\x12>\n" +
-	"\fworker_phase\x18\x16 \x01(\x0e2\x1b.cozy.worker.v1.WorkerPhaseR\vworkerPhaseJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\f\x10\rJ\x04\b\x0e\x10\x0fJ\x04\b\x17\x10\x18J\x04\b\x18\x10\x19J\x04\b\x19\x10\x1aR\x19applied_artifact_grant_idR\x16applied_grant_revisionR\x0fartifact_intent\"\xe7\x06\n" +
+	"\fworker_phase\x18\x16 \x01(\x0e2\x1b.cozy.worker.v1.WorkerPhaseR\vworkerPhaseJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\f\x10\rJ\x04\b\x0e\x10\x0fJ\x04\b\x17\x10\x18J\x04\b\x18\x10\x19J\x04\b\x19\x10\x1aR\x19applied_artifact_grant_idR\x16applied_grant_revisionR\x0fartifact_intent\"\xdd\x06\n" +
 	"\x0fPlacementStatus\x12!\n" +
-	"\fplacement_id\x18\x01 \x01(\tR\vplacementId\x12/\n" +
-	"\x13executor_generation\x18\x04 \x01(\x04R\x12executorGeneration\x12@\n" +
+	"\fplacement_id\x18\x01 \x01(\tR\vplacementId\x12%\n" +
+	"\x0eexecutor_epoch\x18\x04 \x01(\x04R\rexecutorEpoch\x12@\n" +
 	"\x1cdispatchable_binding_digests\x18\x06 \x03(\fR\x1adispatchableBindingDigests\x12D\n" +
 	"\x1ematerializable_binding_digests\x18\a \x03(\fR\x1cmaterializableBindingDigests\x12-\n" +
 	"\x06faults\x18\b \x03(\v2\x15.cozy.worker.v1.FaultR\x06faults\x12J\n" +
@@ -13305,10 +13308,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x04kind\x18\x02 \x01(\tR\x04kind\x12\x12\n" +
 	"\x04step\x18\x03 \x01(\tR\x04step\x12\x1c\n" +
 	"\n" +
-	"at_unix_ms\x18\x04 \x01(\x04R\batUnixMs\"\xf4\x03\n" +
+	"at_unix_ms\x18\x04 \x01(\x04R\batUnixMs\"\xe0\x03\n" +
 	"\fAttemptOffer\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
@@ -13317,11 +13320,11 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x05grant\x18\b \x01(\v2\x1d.cozy.worker.v1.DeliveryGrantR\x05grant\x12E\n" +
 	"\x1finvocation_spec_canonical_bytes\x18\t \x01(\fR\x1cinvocationSpecCanonicalBytes\x12!\n" +
 	"\fplacement_id\x18\n" +
-	" \x01(\tR\vplacementId\x121\n" +
-	"\x14admission_generation\x18\f \x01(\x04R\x13admissionGenerationJ\x04\b\x04\x10\x05\"\x8e\x04\n" +
+	" \x01(\tR\vplacementId\x12'\n" +
+	"\x0fadmission_epoch\x18\f \x01(\x04R\x0eadmissionEpochJ\x04\b\x04\x10\x05\"\xfa\x03\n" +
 	"\x0fAttemptAccepted\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
@@ -13332,8 +13335,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x19model_construction_digest\x18\t \x01(\fR\x17modelConstructionDigest\x126\n" +
 	"\x04plan\x18\n" +
 	" \x01(\v2\".cozy.worker.v1.AttemptPlanSummaryR\x04plan\x12!\n" +
-	"\fplacement_id\x18\v \x01(\tR\vplacementId\x12/\n" +
-	"\x13executor_generation\x18\f \x01(\x04R\x12executorGenerationJ\x04\b\x04\x10\x05\"\xc1\x02\n" +
+	"\fplacement_id\x18\v \x01(\tR\vplacementId\x12%\n" +
+	"\x0eexecutor_epoch\x18\f \x01(\x04R\rexecutorEpochJ\x04\b\x04\x10\x05\"\xc1\x02\n" +
 	"\x12AttemptPlanSummary\x12\x1a\n" +
 	"\bdelivery\x18\x01 \x01(\tR\bdelivery\x12(\n" +
 	"\x0fmaterialization\x18\x02 \x01(\tR\x0fmaterialization\x12#\n" +
@@ -13341,20 +13344,20 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\tplacement\x18\x04 \x01(\tR\tplacement\x12?\n" +
 	"\x1creserved_device_memory_bytes\x18\x05 \x01(\x04R\x19reservedDeviceMemoryBytes\x12.\n" +
 	"\x13reserved_host_bytes\x18\x06 \x01(\x04R\x11reservedHostBytes\x121\n" +
-	"\x14decision_explanation\x18\a \x01(\tR\x13decisionExplanation\"\xf4\x02\n" +
+	"\x14decision_explanation\x18\a \x01(\tR\x13decisionExplanation\"\xea\x02\n" +
 	"\rCancelAttempt\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
 	"\x0fattempt_ordinal\x18\x06 \x01(\x04R\x0eattemptOrdinal\x124\n" +
 	"\x06reason\x18\a \x01(\x0e2\x1c.cozy.worker.v1.CancelReasonR\x06reason\x12\x19\n" +
 	"\bgrace_ms\x18\b \x01(\x04R\agraceMs\x124\n" +
-	"\x16invocation_spec_digest\x18\t \x01(\fR\x14invocationSpecDigestJ\x04\b\x04\x10\x05\"\xc5\x03\n" +
+	"\x16invocation_spec_digest\x18\t \x01(\fR\x14invocationSpecDigestJ\x04\b\x04\x10\x05\"\xbb\x03\n" +
 	"\x0eAttemptOutcome\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
@@ -13399,10 +13402,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\tobject_id\x18\x01 \x01(\tR\bobjectId\x12\x16\n" +
 	"\x06length\x18\x02 \x01(\x04R\x06length\x12\x1d\n" +
 	"\n" +
-	"source_ref\x18\x03 \x01(\tR\tsourceRef\"\x9a\x04\n" +
+	"source_ref\x18\x03 \x01(\tR\tsourceRef\"\x86\x04\n" +
 	"\x12WeightsIntentFrame\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
@@ -13410,13 +13413,13 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x16invocation_spec_digest\x18\a \x01(\fR\x14invocationSpecDigest\x12\x1f\n" +
 	"\voutput_slot\x18\b \x01(\tR\n" +
 	"outputSlot\x12>\n" +
-	"\x1btensorfs_declaration_digest\x18\t \x01(\fR\x19tensorfsDeclarationDigest\x12>\n" +
-	"\x1brequested_writer_generation\x18\n" +
-	" \x01(\x04R\x19requestedWriterGeneration\x12O\n" +
-	"$tensorfs_declaration_canonical_bytes\x18\v \x01(\fR!tensorfsDeclarationCanonicalBytesJ\x04\b\x04\x10\x05\"\x99\x06\n" +
+	"\x1btensorfs_declaration_digest\x18\t \x01(\fR\x19tensorfsDeclarationDigest\x124\n" +
+	"\x16requested_writer_epoch\x18\n" +
+	" \x01(\x04R\x14requestedWriterEpoch\x12O\n" +
+	"$tensorfs_declaration_canonical_bytes\x18\v \x01(\fR!tensorfsDeclarationCanonicalBytesJ\x04\b\x04\x10\x05\"\x85\x06\n" +
 	"\x0eWeightsHostAck\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
@@ -13424,18 +13427,18 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x16invocation_spec_digest\x18\a \x01(\fR\x14invocationSpecDigest\x12\x1f\n" +
 	"\voutput_slot\x18\b \x01(\tR\n" +
 	"outputSlot\x124\n" +
-	"\x16weights_transaction_id\x18\t \x01(\tR\x14weightsTransactionId\x12+\n" +
-	"\x11writer_generation\x18\n" +
-	" \x01(\x04R\x10writerGeneration\x12>\n" +
+	"\x16weights_transaction_id\x18\t \x01(\tR\x14weightsTransactionId\x12!\n" +
+	"\fwriter_epoch\x18\n" +
+	" \x01(\x04R\vwriterEpoch\x12>\n" +
 	"\x1btensorfs_declaration_digest\x18\v \x01(\fR\x19tensorfsDeclarationDigest\x126\n" +
 	"\x05stage\x18\f \x01(\x0e2 .cozy.worker.v1.WeightsHostStageR\x05stage\x12<\n" +
 	"\aoutcome\x18\r \x01(\x0e2\".cozy.worker.v1.WeightsHostOutcomeR\aoutcome\x12<\n" +
 	"\arefusal\x18\x0e \x01(\x0e2\".cozy.worker.v1.WeightsHostRefusalR\arefusal\x12J\n" +
 	"\x0fweights_receipt\x18\x0f \x01(\v2!.cozy.worker.v1.WeightsReceiptRefR\x0eweightsReceipt\x12/\n" +
-	"\bmanifest\x18\x10 \x01(\v2\x13.cozy.worker.v1.RefR\bmanifestJ\x04\b\x04\x10\x05\"\xa9\x05\n" +
+	"\bmanifest\x18\x10 \x01(\v2\x13.cozy.worker.v1.RefR\bmanifestJ\x04\b\x04\x10\x05\"\x95\x05\n" +
 	"\x13WeightsReceiptFrame\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
@@ -13443,13 +13446,13 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x16invocation_spec_digest\x18\a \x01(\fR\x14invocationSpecDigest\x12\x1f\n" +
 	"\voutput_slot\x18\b \x01(\tR\n" +
 	"outputSlot\x124\n" +
-	"\x16weights_transaction_id\x18\t \x01(\tR\x14weightsTransactionId\x12+\n" +
-	"\x11writer_generation\x18\n" +
-	" \x01(\x04R\x10writerGeneration\x12>\n" +
+	"\x16weights_transaction_id\x18\t \x01(\tR\x14weightsTransactionId\x12!\n" +
+	"\fwriter_epoch\x18\n" +
+	" \x01(\x04R\vwriterEpoch\x12>\n" +
 	"\x1btensorfs_declaration_digest\x18\v \x01(\fR\x19tensorfsDeclarationDigest\x12J\n" +
 	"\x0fweights_receipt\x18\f \x01(\v2!.cozy.worker.v1.WeightsReceiptRefR\x0eweightsReceipt\x12=\n" +
 	"\aobjects\x18\r \x03(\v2#.cozy.worker.v1.WeightsObjectSourceR\aobjects\x12/\n" +
-	"\bmanifest\x18\x0e \x01(\v2\x13.cozy.worker.v1.RefR\bmanifestJ\x04\b\x04\x10\x05\"\xd1\x03\n" +
+	"\bmanifest\x18\x0e \x01(\v2\x13.cozy.worker.v1.RefR\bmanifestJ\x04\b\x04\x10\x05\"\xc7\x03\n" +
 	"\x18WeightsTransactionStatus\x124\n" +
 	"\x16weights_transaction_id\x18\x01 \x01(\tR\x14weightsTransactionId\x12\x1d\n" +
 	"\n" +
@@ -13457,30 +13460,30 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0fattempt_ordinal\x18\x03 \x01(\x04R\x0eattemptOrdinal\x124\n" +
 	"\x16invocation_spec_digest\x18\x04 \x01(\tR\x14invocationSpecDigest\x12\x1f\n" +
 	"\voutput_slot\x18\x05 \x01(\tR\n" +
-	"outputSlot\x12+\n" +
-	"\x11writer_generation\x18\x06 \x01(\x04R\x10writerGeneration\x12=\n" +
+	"outputSlot\x12!\n" +
+	"\fwriter_epoch\x18\x06 \x01(\x04R\vwriterEpoch\x12=\n" +
 	"\x05state\x18\a \x01(\x0e2'.cozy.worker.v1.WeightsTransactionStateR\x05state\x12>\n" +
 	"\x1btensorfs_declaration_digest\x18\b \x01(\fR\x19tensorfsDeclarationDigest\x124\n" +
-	"\x16weights_receipt_digest\x18\t \x01(\fR\x14weightsReceiptDigest\"\x97\x03\n" +
+	"\x16weights_receipt_digest\x18\t \x01(\fR\x14weightsReceiptDigest\"\x83\x03\n" +
 	"\x12WeightsReadRequest\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x124\n" +
-	"\x16weights_transaction_id\x18\x05 \x01(\tR\x14weightsTransactionId\x12+\n" +
-	"\x11writer_generation\x18\x06 \x01(\x04R\x10writerGeneration\x12\x1b\n" +
+	"\x16weights_transaction_id\x18\x05 \x01(\tR\x14weightsTransactionId\x12!\n" +
+	"\fwriter_epoch\x18\x06 \x01(\x04R\vwriterEpoch\x12\x1b\n" +
 	"\tobject_id\x18\a \x01(\tR\bobjectId\x12\x1d\n" +
 	"\n" +
 	"source_ref\x18\b \x01(\tR\tsourceRef\x12\x17\n" +
 	"\aread_id\x18\t \x01(\tR\x06readId\x12\x16\n" +
 	"\x06offset\x18\n" +
 	" \x01(\x04R\x06offset\x12\x1b\n" +
-	"\tmax_bytes\x18\v \x01(\rR\bmaxBytesJ\x04\b\x04\x10\x05\"\xcb\x04\n" +
+	"\tmax_bytes\x18\v \x01(\rR\bmaxBytesJ\x04\b\x04\x10\x05\"\xb7\x04\n" +
 	"\x11WeightsReadResult\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x124\n" +
-	"\x16weights_transaction_id\x18\x05 \x01(\tR\x14weightsTransactionId\x12+\n" +
-	"\x11writer_generation\x18\x06 \x01(\x04R\x10writerGeneration\x12\x1b\n" +
+	"\x16weights_transaction_id\x18\x05 \x01(\tR\x14weightsTransactionId\x12!\n" +
+	"\fwriter_epoch\x18\x06 \x01(\x04R\vwriterEpoch\x12\x1b\n" +
 	"\tobject_id\x18\a \x01(\tR\bobjectId\x12\x1d\n" +
 	"\n" +
 	"source_ref\x18\b \x01(\tR\tsourceRef\x12\x17\n" +
@@ -13505,10 +13508,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x06length\x18\x02 \x01(\x04R\x06length\x12\x10\n" +
 	"\x03url\x18\x03 \x01(\tR\x03url\x12N\n" +
 	"\x10required_headers\x18\x04 \x03(\v2#.cozy.worker.v1.WeightsUploadHeaderR\x0frequiredHeaders\x12&\n" +
-	"\x0fexpires_at_unix\x18\x05 \x01(\x04R\rexpiresAtUnix\"\x90\x05\n" +
+	"\x0fexpires_at_unix\x18\x05 \x01(\x04R\rexpiresAtUnix\"\x86\x05\n" +
 	"\x16WeightsTransferRequest\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
@@ -13524,13 +13527,13 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\fupload_grant\x18\r \x01(\v2\".cozy.worker.v1.WeightsUploadGrantH\x00R\vuploadGrant\x126\n" +
 	"\x04held\x18\x0e \x01(\v2 .cozy.worker.v1.WeightsObjectRefH\x00R\x04heldB\n" +
 	"\n" +
-	"\bdecisionJ\x04\b\x04\x10\x05\"\xe7\x03\n" +
+	"\bdecisionJ\x04\b\x04\x10\x05\"\xd3\x03\n" +
 	"\x14WeightsUploadRequest\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x124\n" +
-	"\x16weights_transaction_id\x18\x05 \x01(\tR\x14weightsTransactionId\x12+\n" +
-	"\x11writer_generation\x18\x06 \x01(\x04R\x10writerGeneration\x12\x1b\n" +
+	"\x16weights_transaction_id\x18\x05 \x01(\tR\x14weightsTransactionId\x12!\n" +
+	"\fwriter_epoch\x18\x06 \x01(\x04R\vwriterEpoch\x12\x1b\n" +
 	"\tobject_id\x18\a \x01(\tR\bobjectId\x12\x1d\n" +
 	"\n" +
 	"source_ref\x18\b \x01(\tR\tsourceRef\x12\x16\n" +
@@ -13538,13 +13541,13 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\foperation_id\x18\n" +
 	" \x01(\tR\voperationId\x12%\n" +
 	"\x0egrant_revision\x18\v \x01(\x04R\rgrantRevision\x128\n" +
-	"\x05grant\x18\f \x01(\v2\".cozy.worker.v1.WeightsUploadGrantR\x05grantJ\x04\b\x04\x10\x05\"\xa1\x05\n" +
+	"\x05grant\x18\f \x01(\v2\".cozy.worker.v1.WeightsUploadGrantR\x05grantJ\x04\b\x04\x10\x05\"\x8d\x05\n" +
 	"\x13WeightsUploadResult\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x124\n" +
-	"\x16weights_transaction_id\x18\x05 \x01(\tR\x14weightsTransactionId\x12+\n" +
-	"\x11writer_generation\x18\x06 \x01(\x04R\x10writerGeneration\x12\x1b\n" +
+	"\x16weights_transaction_id\x18\x05 \x01(\tR\x14weightsTransactionId\x12!\n" +
+	"\fwriter_epoch\x18\x06 \x01(\x04R\vwriterEpoch\x12\x1b\n" +
 	"\tobject_id\x18\a \x01(\tR\bobjectId\x12!\n" +
 	"\foperation_id\x18\b \x01(\tR\voperationId\x12%\n" +
 	"\x0egrant_revision\x18\t \x01(\x04R\rgrantRevision\x12>\n" +
@@ -13557,10 +13560,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0fchecksum_sha256\x18\x0e \x01(\tR\x0echecksumSha256\x12>\n" +
 	"\arefusal\x18\x0f \x01(\x0e2$.cozy.worker.v1.WeightsUploadRefusalR\arefusal\x12\x1f\n" +
 	"\vsafe_detail\x18\x10 \x01(\tR\n" +
-	"safeDetailJ\x04\b\x04\x10\x05\"\xcb\x06\n" +
+	"safeDetailJ\x04\b\x04\x10\x05\"\xc1\x06\n" +
 	"\x15WeightsTransferStatus\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
@@ -13584,10 +13587,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\battempts\x18\x14 \x01(\rR\battempts\x12\x1b\n" +
 	"\tsafe_code\x18\x15 \x01(\tR\bsafeCode\x12\x1f\n" +
 	"\vsafe_detail\x18\x16 \x01(\tR\n" +
-	"safeDetailJ\x04\b\x04\x10\x05\"\x82\x04\n" +
+	"safeDetailJ\x04\b\x04\x10\x05\"\xf8\x03\n" +
 	"\x16ModelSourceFileRequest\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12!\n" +
 	"\foperation_id\x18\x05 \x01(\tR\voperationId\x126\n" +
 	"\x17source_selection_digest\x18\x06 \x01(\fR\x15sourceSelectionDigest\x12\x16\n" +
@@ -13598,10 +13601,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	" \x01(\x0e2#.cozy.worker.v1.ModelSourceProviderR\bprovider\x12\x10\n" +
 	"\x03url\x18\v \x01(\tR\x03url\x12&\n" +
 	"\x0fexpires_at_unix\x18\f \x01(\x04R\rexpiresAtUnix\x12/\n" +
-	"\x13capability_revision\x18\r \x01(\x04R\x12capabilityRevisionJ\x04\b\x04\x10\x05\"\xc9\x04\n" +
+	"\x13capability_revision\x18\r \x01(\x04R\x12capabilityRevisionJ\x04\b\x04\x10\x05\"\xbf\x04\n" +
 	"\x15ModelSourceFileStatus\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12!\n" +
 	"\foperation_id\x18\x05 \x01(\tR\voperationId\x126\n" +
 	"\x17source_selection_digest\x18\x06 \x01(\fR\x15sourceSelectionDigest\x12\x16\n" +
@@ -13615,20 +13618,20 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\battempts\x18\r \x01(\rR\battempts\x12\x1b\n" +
 	"\tsafe_code\x18\x0e \x01(\tR\bsafeCode\x12\x1f\n" +
 	"\vsafe_detail\x18\x0f \x01(\tR\n" +
-	"safeDetailJ\x04\b\x04\x10\x05\"\x96\x03\n" +
+	"safeDetailJ\x04\b\x04\x10\x05\"\x8c\x03\n" +
 	"\x19ModelSourcePrepareRequest\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12!\n" +
 	"\foperation_id\x18\x05 \x01(\tR\voperationId\x126\n" +
 	"\x17source_selection_digest\x18\x06 \x01(\fR\x15sourceSelectionDigest\x12>\n" +
 	"\bprofiles\x18\a \x03(\v2\".cozy.worker.v1.ModelSourceProfileR\bprofiles\x12\x1d\n" +
 	"\n" +
 	"source_uri\x18\b \x01(\tR\tsourceUri\x12)\n" +
-	"\x10declared_license\x18\t \x01(\tR\x0fdeclaredLicenseJ\x04\b\x04\x10\x05\"\xc8\x03\n" +
+	"\x10declared_license\x18\t \x01(\tR\x0fdeclaredLicenseJ\x04\b\x04\x10\x05\"\xbe\x03\n" +
 	"\x13ModelSourcePrepared\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12!\n" +
 	"\foperation_id\x18\x05 \x01(\tR\voperationId\x126\n" +
 	"\x17source_selection_digest\x18\x06 \x01(\fR\x15sourceSelectionDigest\x12C\n" +
@@ -13643,17 +13646,17 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\bfilename\x18\x02 \x01(\tR\bfilename\x125\n" +
 	"\x04kind\x18\x03 \x01(\x0e2!.cozy.worker.v1.LocalDownloadKindR\x04kind\x12\x16\n" +
 	"\x06length\x18\x04 \x01(\x04R\x06length\x12\x10\n" +
-	"\x03url\x18\x05 \x01(\tR\x03url\"\xb9\x02\n" +
+	"\x03url\x18\x05 \x01(\tR\x03url\"\xaf\x02\n" +
 	"\x1aPrivatePackageFetchRequest\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12!\n" +
 	"\foperation_id\x18\x05 \x01(\tR\voperationId\x12#\n" +
 	"\rsource_digest\x18\x06 \x01(\fR\fsourceDigest\x12=\n" +
-	"\x05files\x18\a \x03(\v2'.cozy.worker.v1.PrivatePackageFileGrantR\x05filesJ\x04\b\x04\x10\x05\"\x9f\x04\n" +
+	"\x05files\x18\a \x03(\v2'.cozy.worker.v1.PrivatePackageFileGrantR\x05filesJ\x04\b\x04\x10\x05\"\x95\x04\n" +
 	"\x18PrivatePackageFileStatus\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12!\n" +
 	"\foperation_id\x18\x05 \x01(\tR\voperationId\x12#\n" +
 	"\rsource_digest\x18\x06 \x01(\fR\fsourceDigest\x12\x16\n" +
@@ -13666,17 +13669,17 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0ereceived_bytes\x18\f \x01(\x04R\rreceivedBytes\x12\x1b\n" +
 	"\tsafe_code\x18\r \x01(\tR\bsafeCode\x12\x1f\n" +
 	"\vsafe_detail\x18\x0e \x01(\tR\n" +
-	"safeDetailJ\x04\b\x04\x10\x05\"\xab\x02\n" +
+	"safeDetailJ\x04\b\x04\x10\x05\"\xa1\x02\n" +
 	"\x13PrivatePackageAbort\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12!\n" +
 	"\foperation_id\x18\x05 \x01(\tR\voperationId\x12#\n" +
 	"\rsource_digest\x18\x06 \x01(\fR\fsourceDigest\x126\n" +
-	"\x17private_revision_digest\x18\a \x01(\fR\x15privateRevisionDigestJ\x04\b\x04\x10\x05\"\xb5\x03\n" +
+	"\x17private_revision_digest\x18\a \x01(\fR\x15privateRevisionDigestJ\x04\b\x04\x10\x05\"\xab\x03\n" +
 	"\x19PrivatePackageAbortStatus\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12!\n" +
 	"\foperation_id\x18\x05 \x01(\tR\voperationId\x12#\n" +
 	"\rsource_digest\x18\x06 \x01(\fR\fsourceDigest\x126\n" +
@@ -13685,10 +13688,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\tsafe_code\x18\t \x01(\tR\bsafeCode\x12\x1f\n" +
 	"\vsafe_detail\x18\n" +
 	" \x01(\tR\n" +
-	"safeDetailJ\x04\b\x04\x10\x05\"\x84\x04\n" +
+	"safeDetailJ\x04\b\x04\x10\x05\"\xfa\x03\n" +
 	"\x16WeightsFinalizeRequest\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x124\n" +
@@ -13699,10 +13702,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x16weights_receipt_digest\x18\t \x01(\fR\x14weightsReceiptDigest\x12&\n" +
 	"\x0fscratch_root_id\x18\n" +
 	" \x01(\tR\rscratchRootId\x122\n" +
-	"\x15owner_authority_scope\x18\v \x01(\tR\x13ownerAuthorityScopeJ\x04\b\x04\x10\x05\"\xe5\x03\n" +
+	"\x15owner_authority_scope\x18\v \x01(\tR\x13ownerAuthorityScopeJ\x04\b\x04\x10\x05\"\xdb\x03\n" +
 	"\x15WeightsFinalizeResult\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x124\n" +
@@ -13736,10 +13739,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\fneeded_bytes\x18\x03 \x01(\x04R\vneededBytes\x12'\n" +
 	"\x0favailable_bytes\x18\x04 \x01(\x04R\x0eavailableBytes\x12#\n" +
 	"\rrequest_shape\x18\x05 \x01(\tR\frequestShape\x12%\n" +
-	"\x0eevidence_class\x18\x06 \x01(\tR\revidenceClass\"\xed\x02\n" +
+	"\x0eevidence_class\x18\x06 \x01(\tR\revidenceClass\"\xe3\x02\n" +
 	"\x11AttemptOutcomeAck\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
@@ -13747,10 +13750,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x16invocation_spec_digest\x18\a \x01(\fR\x14invocationSpecDigest\x12\x1d\n" +
 	"\n" +
 	"outcome_id\x18\b \x01(\tR\toutcomeId\x12%\n" +
-	"\x0eoutcome_digest\x18\t \x01(\fR\routcomeDigestJ\x04\b\x04\x10\x05\"\xac\x03\n" +
+	"\x0eoutcome_digest\x18\t \x01(\fR\routcomeDigestJ\x04\b\x04\x10\x05\"\xa2\x03\n" +
 	"\x14JobCheckpointRequest\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
@@ -13761,10 +13764,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0econtent_digest\x18\t \x01(\fR\rcontentDigest\x12\x10\n" +
 	"\x03seq\x18\n" +
 	" \x01(\x04R\x03seq\x127\n" +
-	"\bartifact\x18\v \x01(\v2\x1b.cozy.worker.v1.OutputEntryR\bartifactJ\x04\b\x04\x10\x05\"\xf4\x03\n" +
+	"\bartifact\x18\v \x01(\v2\x1b.cozy.worker.v1.OutputEntryR\bartifactJ\x04\b\x04\x10\x05\"\xea\x03\n" +
 	"\x14JobCheckpointReceipt\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
@@ -13781,10 +13784,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0fCheckpointFault\x127\n" +
 	"\x04code\x18\x01 \x01(\x0e2#.cozy.worker.v1.CheckpointFaultCodeR\x04code\x12\x16\n" +
 	"\x06detail\x18\x02 \x01(\tR\x06detail\x126\n" +
-	"\x17recorded_content_digest\x18\x03 \x01(\fR\x15recordedContentDigest\"\xdb\x02\n" +
+	"\x17recorded_content_digest\x18\x03 \x01(\fR\x15recordedContentDigest\"\xd1\x02\n" +
 	"\x10JobCheckpointAck\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
@@ -13792,16 +13795,16 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\roperation_key\x18\a \x01(\tR\foperationKey\x12\x1d\n" +
 	"\n" +
 	"receipt_id\x18\b \x01(\tR\treceiptId\x12%\n" +
-	"\x0econtent_digest\x18\t \x01(\fR\rcontentDigestJ\x04\b\x04\x10\x05\"\xc3\x01\n" +
+	"\x0econtent_digest\x18\t \x01(\fR\rcontentDigestJ\x04\b\x04\x10\x05\"\xb9\x01\n" +
 	"\fProgressOpen\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x05 \x01(\tR\trequestIdJ\x04\b\x04\x10\x05\"\xdb\x02\n" +
+	"request_id\x18\x05 \x01(\tR\trequestIdJ\x04\b\x04\x10\x05\"\xd1\x02\n" +
 	"\x0fAttemptProgress\x12,\n" +
-	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
-	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
+	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
+	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12'\n" +
@@ -13853,11 +13856,11 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x03url\x18\x02 \x01(\tR\x03url\"=\n" +
 	"\fOutputAccess\x12\x1b\n" +
 	"\toutput_id\x18\x01 \x01(\tR\boutputId\x12\x10\n" +
-	"\x03url\x18\x02 \x01(\tR\x03url\"\x9d\x01\n" +
+	"\x03url\x18\x02 \x01(\tR\x03url\"\xb2\x01\n" +
 	"\x18DeliveryAccessCredential\x12\x16\n" +
 	"\x06issuer\x18\x01 \x01(\tR\x06issuer\x12\x15\n" +
-	"\x06key_id\x18\x02 \x01(\tR\x05keyId\x12\x14\n" +
-	"\x05epoch\x18\x03 \x01(\x04R\x05epoch\x12&\n" +
+	"\x06key_id\x18\x02 \x01(\tR\x05keyId\x12)\n" +
+	"\x10credential_epoch\x18\x03 \x01(\x04R\x0fcredentialEpoch\x12&\n" +
 	"\x0fexpires_at_unix\x18\x04 \x01(\x04R\rexpiresAtUnix\x12\x14\n" +
 	"\x05token\x18\x05 \x01(\fR\x05token\"\xb8\x01\n" +
 	"\fResourceCaps\x12'\n" +
@@ -13894,7 +13897,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\vJobCapacity\x12$\n" +
 	"\x0ejobs_in_flight\x18\x01 \x01(\rR\fjobsInFlight\x12%\n" +
 	"\x0ejobs_available\x18\x02 \x01(\rR\rjobsAvailable\x12&\n" +
-	"\x0ffree_disk_bytes\x18\x04 \x01(\x04R\rfreeDiskBytesJ\x04\b\x03\x10\x04\"\x8a\x03\n" +
+	"\x0ffree_disk_bytes\x18\x04 \x01(\x04R\rfreeDiskBytesJ\x04\b\x03\x10\x04\"\x80\x03\n" +
 	"\vHeldAttempt\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12'\n" +
@@ -13902,8 +13905,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x04kind\x18\x03 \x01(\x0e2\x1b.cozy.worker.v1.AttemptKindR\x04kind\x122\n" +
 	"\x05state\x18\x04 \x01(\x0e2\x1c.cozy.worker.v1.AttemptStateR\x05state\x124\n" +
 	"\x16invocation_spec_digest\x18\x05 \x01(\fR\x14invocationSpecDigest\x12!\n" +
-	"\fplacement_id\x18\x06 \x01(\tR\vplacementId\x12/\n" +
-	"\x13executor_generation\x18\a \x01(\x04R\x12executorGeneration\x12\x1d\n" +
+	"\fplacement_id\x18\x06 \x01(\tR\vplacementId\x12%\n" +
+	"\x0eexecutor_epoch\x18\a \x01(\x04R\rexecutorEpoch\x12\x1d\n" +
 	"\n" +
 	"outcome_id\x18\b \x01(\tR\toutcomeId\x12%\n" +
 	"\x0eoutcome_digest\x18\t \x01(\fR\routcomeDigest\"\x80\x01\n" +
@@ -13988,7 +13991,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x16OUTCOME_STATUS_REFUSED\x10\x02\x12\x19\n" +
 	"\x15OUTCOME_STATUS_FAILED\x10\x03\x12\x1b\n" +
 	"\x17OUTCOME_STATUS_CANCELED\x10\x04\x12\x1c\n" +
-	"\x18OUTCOME_STATUS_ABANDONED\x10\x05*\xc4\x05\n" +
+	"\x18OUTCOME_STATUS_ABANDONED\x10\x05*\xbf\x05\n" +
 	"\tCauseCode\x12\x1a\n" +
 	"\x16CAUSE_CODE_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aCAUSE_CODE_INVALID_REQUEST\x10\x01\x12 \n" +
@@ -14008,8 +14011,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x18CAUSE_CODE_POLICY_CANCEL\x10\x0e\x12 \n" +
 	"\x1cCAUSE_CODE_SUPERSEDED_CANCEL\x10\x0f\x12#\n" +
 	"\x1fCAUSE_CODE_EXECUTOR_INVALIDATED\x10\x10\x12\x1a\n" +
-	"\x16CAUSE_CODE_NO_CAPACITY\x10\x11\x12)\n" +
-	"%CAUSE_CODE_ADMISSION_GENERATION_STALE\x10\x12\x12 \n" +
+	"\x16CAUSE_CODE_NO_CAPACITY\x10\x11\x12$\n" +
+	" CAUSE_CODE_ADMISSION_EPOCH_STALE\x10\x12\x12 \n" +
 	"\x1cCAUSE_CODE_UNKNOWN_PLACEMENT\x10\x13\x12)\n" +
 	"%CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE\x10\x14*\xe2\x01\n" +
 	"\vCauseOrigin\x12\x1c\n" +

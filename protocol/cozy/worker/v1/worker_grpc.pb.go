@@ -51,16 +51,17 @@
 //
 // THE ENVELOPE (every message, fields 1-3): the ownership + boot fence, checked BEFORE any body
 // field is read, in this order:
-//   1 `record_owner_epoch`        - durable monotonic AUTHORITY generation, minted by whatever
-//                                   grants ownership. Older than the accepted claim => dropped.
-//   2 `control_stream_generation` - worker-minted, incremented for EVERY accepted control
-//                                   stream; a frame from a superseded stream is dropped.
-//   3 `worker_boot_id`            - minted at worker-process boot, never reused; a frame
-//                                   addressed to a dead boot is dropped.
+//   1 `record_owner_epoch`     - durable monotonic AUTHORITY epoch, minted by whatever
+//                                grants ownership. Older than the accepted claim => dropped.
+//   2 `control_stream_epoch`   - worker-minted, incremented for EVERY accepted control
+//                                stream; a frame from a superseded stream is dropped.
+//   3 `worker_boot_id`         - minted at worker-process boot, never reused; a frame
+//                                addressed to a dead boot is dropped. An id, not an epoch:
+//                                it need only DIFFER, never be greater.
 // FIELD 4 IS RESERVED IN EVERY MESSAGE (#446): the old global `executor_incarnation` is GONE.
-// The worker BOOT generation is machine truth; each placement's EXECUTOR generation is placement
-// truth (`PlacementStatus.executor_generation`) and rides attempt-scoped facts, not the
-// envelope. The attempt fence triple is (request_id, attempt_ordinal, invocation_spec_digest).
+// The worker BOOT id is machine truth; each placement's EXECUTOR epoch is placement truth
+// (`PlacementStatus.executor_epoch`) and rides attempt-scoped facts, not the envelope. The
+// attempt fence triple is (request_id, attempt_ordinal, invocation_spec_digest).
 //
 // PLACEMENTS (#481; renamed from DEPLOYMENTS — tensorhub's "deployment" is an id-less semantic
 // tuple and the collision was real). `placement_id` is the RecordOwner-minted routing + journal
@@ -77,12 +78,13 @@
 // lifecycle is `WorkerPhase`, pulled out of the placement enum; the old `IntakeState` is retired
 // with both of its uses. "prepared"/"warming"/"ready" are retired as state words.
 //
-// ONE ADMISSION FENCE (#472e/#482/#486c): per-placement `attempt_credits` are DELETED — N
+// ONE ADMISSION GATE (#472e/#482/#486c): per-placement `attempt_credits` are DELETED — N
 // counters over ONE serialized device advertise N x the real capacity, and the defect is
-// arithmetic. Execution capacity is a WORKER property (`admission_generation` +
+// arithmetic. Execution capacity is a WORKER property (`admission_epoch` +
 // `admission_state` + `available_attempt_slots`); dispatchability is a PLACEMENT property (the
-// serving axis + dispatchable_binding_digests). Per-placement `readiness_epoch` is DELETED, not
-// renamed: one fence, not two to keep consistent.
+// serving axis + dispatchable_binding_digests). Only `admission_epoch` FENCES; the other two are
+// the GATE — "not accepting" / "full" — not a fence against a stale actor. Per-placement
+// `readiness_epoch` is DELETED, not renamed: one fence, not two to keep consistent.
 //
 // EVERY OFFER GETS A JOURNALED OUTCOME (#472f/#480b): an AttemptOffer receives either
 // AttemptAccepted or a JOURNALED AttemptOutcome(REFUSED) — never silence and never an
