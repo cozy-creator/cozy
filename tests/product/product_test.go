@@ -738,7 +738,7 @@ func TestPackagePublishPrunesRuntimeOwnedTensorFS(t *testing.T) {
 	appendProjectTOML(t, runtimeFixture,
 		"\n[project.optional-dependencies]\nmodel-execution = [\"tensorfs==0.0.6\"]\n")
 	writePublishProject(t, project, "modeled", "1.0.0",
-		[]string{"cozy-runtime[model-execution]==0.0.11"},
+		[]string{"cozy-runtime[model-execution]==0.0.11", "tensorfs==0.0.6"},
 		fmt.Sprintf("cozy-runtime = { path = %q, editable = true }\n"+
 			"tensorfs = { path = %q, editable = true }\n", runtimeFixture, tensorFSFixture), true)
 	appendProjectTOML(t, project,

@@ -90,9 +90,14 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 			return nil, empty, "", nil, problem
 		}
 	}
+	for index := range published.LocalWheels {
+		if problem := stagePublishedWheel(cache, setDir, &published.LocalWheels[index]); problem != nil {
+			return nil, empty, "", nil, problem
+		}
+	}
 	venvDir := filepath.Join(genDir, "venv")
 	environment, problem := MaterializePublishedEnvironment(sourceDir, venvDir,
-		published.ProjectWheel, published.Wheels)
+		published.ProjectWheel, published.Wheels, published.LocalWheels)
 	if problem != nil {
 		return nil, empty, "", nil, problem
 	}
@@ -136,6 +141,12 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 	for _, wheel := range published.Wheels {
 		if runtimePreparationDependency(wheel) {
 			args = append(args, "--dependency-wheel", wheel.Path)
+		}
+	}
+	for _, wheel := range published.LocalWheels {
+		if err := os.Remove(wheel.Path); err != nil {
+			return nil, empty, "", nil, exit.Internalf(
+				"cannot remove local materialization-wheel view: %s", err)
 		}
 	}
 	for _, model := range published.Models {

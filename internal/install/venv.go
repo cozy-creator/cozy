@@ -91,7 +91,7 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 // dependencies come from uv.lock; wheel paths replace only distributions whose published
 // bytes are authoritative. Nothing is inherited from Creator's own Python environment.
 func MaterializePublishedEnvironment(sourceDir, venvDir string, project PublishedWheel,
-	dependencies []PublishedWheel,
+	dependencies, localWheels []PublishedWheel,
 ) (*EnvironmentReceipt, *exit.Error) {
 	lock := filepath.Join(sourceDir, "uv.lock")
 	lockDigest, err := fileDigest(lock)
@@ -125,6 +125,14 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string, project Publishe
 		seen[name] = true
 		args = append(args, "--no-emit-package", name)
 	}
+	for _, wheel := range localWheels {
+		name := strings.TrimSpace(wheel.Distribution)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		args = append(args, "--no-emit-package", name)
+	}
 	if problem := runUV(sourceDir, config.Frozen().Tool(), "locked_environment_refused",
 		"the published lock cannot export its exact registry closure", args...); problem != nil {
 		return nil, problem
@@ -136,6 +144,7 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string, project Publishe
 		return nil, problem
 	}
 	wheels := append([]PublishedWheel{project}, dependencies...)
+	wheels = append(wheels, localWheels...)
 	args = []string{"pip", "install", "--offline", "--no-index", "--no-deps", "--no-build",
 		"--python", home.VenvPython(venvDir)}
 	for _, wheel := range wheels {

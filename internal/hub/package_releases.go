@@ -11,9 +11,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-// MaxPackageInstallDownloads is one project wheel plus the complete bounded
-// dependency-wheel closure accepted by package publication.
-const MaxPackageInstallDownloads = 129
+// MaxPackageInstallDownloads is one project wheel, the complete bounded rental
+// dependency-wheel closure, and one source-carried TensorFS wheel used only to
+// materialize Creator's independent local environment.
+const MaxPackageInstallDownloads = 130
 
 type PackageUpload struct {
 	Kind            string            `json:"kind,omitempty"`

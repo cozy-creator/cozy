@@ -126,6 +126,111 @@ module-root = ""
 	}
 }
 
+func TestPublishedPackageInstallsSourceCarriedTensorFSLocally(t *testing.T) {
+	fixtureRoot := t.TempDir()
+	runtimeSource := filepath.Join(fixtureRoot, "runtime")
+	writeRuntimeFixture(t, runtimeSource)
+	mutateFixtureFile(t, filepath.Join(runtimeSource, "cozy_runtime", "__init__.py"),
+		`"entrypoints": [{"name": "proof",`,
+		`"entrypoints": [{"models": [{"class": "proof", "component_use": {}, "path": "proof.models.model", "stamps": {}}], "name": "proof",`)
+	appendProjectTOML(t, runtimeSource,
+		"\n[project.optional-dependencies]\nmodel-execution = [\"tensorfs==0.0.6\"]\n")
+	tensorFSSource := filepath.Join(fixtureRoot, "tensorfs")
+	writePublishProject(t, tensorFSSource, "tensorfs", "0.0.6", nil, "", false)
+
+	project := filepath.Join(fixtureRoot, "source")
+	vendor := filepath.Join(project, "vendor")
+	must(t, os.MkdirAll(vendor, 0o755))
+	tensorFSWheel, problem := wheel.Build(wheel.Request{Context: context.Background(),
+		Tree: tensorFSSource, OutDir: vendor})
+	fatal(t, problem)
+	writePublishProject(t, project, "custody-package", "1.0.0",
+		[]string{"cozy-runtime[model-execution]==0.0.11", "tensorfs==0.0.6"},
+		"cozy-runtime = { path = "+quote(runtimeSource)+", editable = true }\n"+
+			"tensorfs = { path = "+quote("vendor/"+filepath.Base(tensorFSWheel.Path))+" }\n", true)
+	lockPublishProject(t, project)
+	pack, problem := packagepublish.PrepareFrom(project)
+	fatal(t, problem)
+	fatal(t, pack.Build(context.Background()))
+	defer pack.Close()
+	if len(pack.DependencyWheels) != 1 {
+		t.Fatalf("TensorFS entered the rental dependency overlay: %+v", pack.DependencyWheels)
+	}
+	runtimeIdentity, problem := wheel.InspectIdentity(pack.DependencyWheels[0].Path)
+	fatal(t, problem)
+	if runtimeIdentity.Distribution != "cozy-runtime" { //cozy:allow distribution assertion, not executable access
+		t.Fatalf("published dependency overlay = %+v, want Runtime only", runtimeIdentity)
+	}
+
+	exact := func(path string) hub.ExactDocument {
+		raw, err := os.ReadFile(path)
+		must(t, err)
+		sum := sha256.Sum256(raw)
+		return hub.ExactDocument{CanonicalBytes: raw,
+			Digest: "sha256:" + hex.EncodeToString(sum[:]), Length: int64(len(raw))}
+	}
+	type servedWheel struct{ body []byte }
+	served := map[string]servedWheel{}
+	addWheel := func(path, kind string) hub.PackageInstallDownload {
+		body, err := os.ReadFile(path)
+		must(t, err)
+		identity, inspectProblem := wheel.InspectIdentity(path)
+		fatal(t, inspectProblem)
+		sum := sha256.Sum256(body)
+		served[identity.Filename] = servedWheel{body: body}
+		return hub.PackageInstallDownload{Digest: "sha256:" + hex.EncodeToString(sum[:]),
+			Distribution: identity.Distribution, Kind: kind, Length: identity.Length,
+			Path: identity.Filename, Tags: []string{"py3-none-any"}, Version: identity.Version}
+	}
+	downloads := []hub.PackageInstallDownload{addWheel(pack.Wheel, "project_wheel")}
+	for _, dependency := range pack.DependencyWheels {
+		downloads = append(downloads, addWheel(dependency.Path, "dependency_wheel"))
+	}
+	downloads = append(downloads, addWheel(tensorFSWheel.Path, "local_materialization_wheel"))
+	plan := hub.PackageDownloadPlan{Downloads: downloads,
+		PackageConfig:     exact(filepath.Join(project, "package.toml")),
+		PackageDescriptor: exact(pack.Descriptor), Pyproject: exact(filepath.Join(project, "pyproject.toml")),
+		Release: pack.Release, ReleaseDigest: "sha256:" + strings.Repeat("b", 64),
+		UVLock: exact(filepath.Join(project, "uv.lock"))}
+	// The published install must not reopen the author's vendor path.
+	must(t, os.Remove(tensorFSWheel.Path))
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/packages/proof/custody-package/download":
+			for index := range plan.Downloads {
+				plan.Downloads[index].URL = server.URL + "/files/" + plan.Downloads[index].Path
+			}
+			_ = json.NewEncoder(w).Encode(plan)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/files/"):
+			item, ok := served[strings.TrimPrefix(r.URL.Path, "/files/")]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(item.body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	code, output := runCozyDir(t, root, "", []string{"TENSORHUB_URL=" + server.URL},
+		"package", "install", "proof/custody-package", "--version", pack.Release,
+		"--no-model-download", "--json")
+	if code != 0 || !strings.Contains(output, `"package":"proof/custody-package"`) {
+		t.Fatalf("source-carried TensorFS install [exit %d]\n%s", code, output)
+	}
+	installed := activeInstall(t, root, "proof/custody-package")
+	probe := exec.Command(filepath.Join(installed.Dir, "venv", "bin", "python"),
+		"-c", "import tensorfs; print(tensorfs.VALUE)")
+	if out, err := probe.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "1" {
+		t.Fatalf("installed local TensorFS custody is absent: %v\n%s", err, out)
+	}
+}
+
 func TestPublishedPackageEnvironmentsKeepPythonAndTorchIndependent(t *testing.T) {
 	type installed struct {
 		python string
@@ -169,7 +274,7 @@ func TestPublishedPackageEnvironmentsKeepPythonAndTorchIndependent(t *testing.T)
 		environment := filepath.Join(root, "environment")
 		receipt, problem := install.MaterializePublishedEnvironment(project, environment,
 			install.PublishedWheel{Distribution: "package-" + fixture.name, Path: projectWheel.Path},
-			[]install.PublishedWheel{{Distribution: "torch", Path: torchWheel.Path}})
+			[]install.PublishedWheel{{Distribution: "torch", Path: torchWheel.Path}}, nil)
 		fatal(t, problem)
 		python := filepath.Join(environment, "bin", "python")
 		command := exec.Command(python, "-c",
@@ -189,7 +294,7 @@ func TestPublishedPackageEnvironmentsKeepPythonAndTorchIndependent(t *testing.T)
 	}
 	_, problem := install.MaterializePublishedEnvironment(oldProject, filepath.Join(t.TempDir(), "bad"),
 		install.PublishedWheel{Distribution: "package-old", Path: oldProjectWheel},
-		[]install.PublishedWheel{{Distribution: "torch", Path: newTorchWheel}})
+		[]install.PublishedWheel{{Distribution: "torch", Path: newTorchWheel}}, nil)
 	if problem == nil || problem.Name != "package_requirement_incompatible" ||
 		!strings.Contains(problem.Message, "torch==1.0.0") {
 		t.Fatalf("true locked conflict did not name its exact requirement: %#v", problem)
