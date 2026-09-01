@@ -162,6 +162,7 @@ func TestModelProductionGrammar(t *testing.T) {
 	code, help = runCozy(t, root, "model", "publish", "--help")
 	if code != 0 || strings.Contains(help, "<source>") || !strings.Contains(help, "--release") ||
 		!strings.Contains(help, "--lane") || !strings.Contains(help, "--remove-lane") ||
+		!strings.Contains(help, "last lane") ||
 		strings.Contains(help, "--producer") || strings.Contains(help, "--rental") ||
 		strings.Contains(help, "--dry-run") || strings.Contains(help, "--detach") {
 		t.Fatalf("model publish grammar drifted [exit %d]\n%s", code, help)
@@ -234,6 +235,66 @@ func TestModelReleaseUpdateAndYankCLIContracts(t *testing.T) {
 		"--release", "stable")
 	if code != 0 || !strings.Contains(out, `"revision":6`) || !strings.Contains(out, `"status":"yanked"`) {
 		t.Fatalf("model release yank [exit %d]\n%s", code, out)
+	}
+}
+
+func TestModelPublishRefusesFinalLaneRemovalBeforeMutation(t *testing.T) {
+	checkpoint := "sha256:" + strings.Repeat("a", 64)
+	mutations := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current":
+			_, _ = io.WriteString(w, `{"name":"acme"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/acme/model/releases/stable":
+			_, _ = io.WriteString(w, `{"release":"stable","revision":4,"yanked":false,"lanes":[{"lane":"bf16","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["bf16"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("c", 64)+`","changed":false}`)
+		default:
+			mutations++
+			http.Error(w, "unexpected mutation", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+	code, out := runCozyDir(t, t.TempDir(), ".", []string{
+		"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token",
+	}, "model", "publish", "acme/model", "--release", "stable", "--remove-lane", "bf16")
+	if code != 2 || mutations != 0 || !strings.Contains(out, "retain at least one lane") ||
+		!strings.Contains(out, "cozy model yank acme/model --release stable") {
+		t.Fatalf("final lane removal [exit %d mutations %d]\n%s", code, mutations, out)
+	}
+}
+
+func TestModelPublishExactReplayUsesCurrentRevision(t *testing.T) {
+	checkpoint := "sha256:" + strings.Repeat("a", 64)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		switch requests {
+		case 1:
+			_, _ = io.WriteString(w, `{"name":"acme"}`)
+		case 2:
+			_, _ = io.WriteString(w, `{"release":"stable","revision":5,"yanked":false,"lanes":[{"lane":"fp8","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["fp8"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("c", 64)+`","changed":false}`)
+		case 3:
+			var body struct {
+				ExpectedRevision int64 `json:"expected_revision"`
+			}
+			if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&body) != nil ||
+				body.ExpectedRevision != 5 {
+				t.Fatalf("replay update = %s revision %d", r.Method, body.ExpectedRevision)
+			}
+			_, _ = io.WriteString(w, `{"release":"stable","revision":5,"yanked":false,"lanes":[{"lane":"fp8","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["fp8"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("c", 64)+`","changed":false}`)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	code, out := runCozyDir(t, t.TempDir(), ".", []string{
+		"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token",
+	}, "--json", "model", "publish", "acme/model", "--release", "stable",
+		"--lane", "fp8="+checkpoint)
+	if code != 0 || requests != 3 || !strings.Contains(out, `"revision":5`) ||
+		!strings.Contains(out, `"changed":false`) {
+		t.Fatalf("exact release replay [exit %d requests %d]\n%s", code, requests, out)
 	}
 }
 

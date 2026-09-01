@@ -186,7 +186,7 @@ type ModelPublishCmd struct {
 	Ref        string   `arg:"" name:"model" help:"Tensorhub model repository (org/name)."`
 	Release    string   `help:"Mutable release label." required:""`
 	Lanes      []string `name:"lane" help:"Set a lane pointer as name=checkpoint-id."`
-	RemoveLane []string `help:"Remove a lane pointer by name."`
+	RemoveLane []string `help:"Remove a lane pointer by name; yank the release instead of removing its last lane."`
 }
 
 func (c *ModelPublishCmd) Run(r *Runtime) error {

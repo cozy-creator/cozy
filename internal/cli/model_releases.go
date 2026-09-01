@@ -128,6 +128,11 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	for _, lane := range remove {
 		delete(expectedLanes, lane)
 	}
+	if len(expectedLanes) == 0 {
+		return exit.Usagef("a model release must retain at least one lane").
+			WithRemedy("yank %s@%s to hide the entire release", ref.String(), release).
+			WithNext("cozy model yank " + ref.String() + " --release " + release)
+	}
 	reason := "cozy model publish " + ref.String() + "@" + release
 	updated, problem := c.UpdateModelRelease(hctx, ref, release, expectedRevision, set, remove, reason)
 	if problem != nil {
