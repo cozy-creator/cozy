@@ -125,7 +125,6 @@ func handleModelShow(ctx *Context, ref hub.Ref) *exit.Error {
 		Name: "models", Fields: []string{"model", "lanes"},
 		AllFields: []string{"model", "lanes", "created", "org", "name"},
 		Rows:      []map[string]string{modelSearchRow(card)}, Total: 1,
-		Next: []string{"cozy model download " + ref.String()},
 	})
 }
 
