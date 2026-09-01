@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -82,6 +83,32 @@ func TestRentalLastSettlementDistinguishesWarmServingFromJobs(t *testing.T) {
 	last, found, problem = store.RentalLastSettlement("pr-warm")
 	if problem != nil || !found || last.RequestID != job.ID || last.Kind != "job" || !last.ClosedAt.IsZero() {
 		t.Fatalf("job settlement = %+v found=%v problem=%v", last, found, problem)
+	}
+}
+
+func TestManagedRentalBatchAssignsQueuedCompatibilityClass(t *testing.T) {
+	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
+	fatal(t, problem)
+	defer store.Close()
+	for _, request := range []records.Request{
+		{ID: "req-cpu-one", IdemKey: "cpu-one", BodyDigest: "cpu-one", Payload: []byte(`{}`), Rental: true},
+		{ID: "req-cpu-two", IdemKey: "cpu-two", BodyDigest: "cpu-two", Payload: []byte(`{}`), Rental: true},
+		{ID: "req-gpu", IdemKey: "gpu", BodyDigest: "gpu", Payload: []byte(`{}`), Rental: true,
+			Models: []records.ModelRef{{Model: "proof/model"}}},
+	} {
+		_, fresh, problem := store.Submit(request)
+		if problem != nil || !fresh {
+			t.Fatalf("submit %s: fresh=%v problem=%v", request.ID, fresh, problem)
+		}
+	}
+	fatal(t, store.AssignManagedRentalClass("rental-cpu", true))
+	for _, id := range []string{"req-cpu-one", "req-cpu-two", "req-gpu"} {
+		row, problem := store.RequestRow(id)
+		fatal(t, problem)
+		if (id == "req-gpu" && row.Worker != "") ||
+			(id != "req-gpu" && row.Worker != "rental-cpu") {
+			t.Fatalf("request %s assigned to %q", id, row.Worker)
+		}
 	}
 }
 
@@ -168,6 +195,51 @@ func TestRentalPermissionPrefersLocalAndRentalOnlySkipsIt(t *testing.T) {
 	row := waitRequestState(t, owner, remoteID, "failed")
 	if !row.Rental || !row.RentalRequired || row.Worker != "" || row.Ordinal != 0 {
 		t.Fatalf("forced rental crossed into local dispatch: %+v", row)
+	}
+}
+
+func TestRentalOnlyRequirementSurvivesOwnerRestart(t *testing.T) {
+	first := hostOwner(t, "rental-only-restart")
+	recorded, fresh, problem := first.store.Submit(records.Request{
+		ID: "req-rental-only-restart", IdemKey: "rental-only-restart",
+		BodyDigest: "rental-only-restart-body", Package: "proof/package",
+		Entrypoint: "marco", Payload: []byte(`{}`), Rental: true, RentalRequired: true,
+	})
+	if problem != nil || !fresh {
+		t.Fatalf("record rental-only request: fresh=%v problem=%v", fresh, problem)
+	}
+	first.close()
+
+	store, problem := records.Open(first.l.DB)
+	fatal(t, problem)
+	defer store.Close()
+	acquired := make(chan records.Request, 1)
+	restarted, problem := orchestrator.Open(orchestrator.Options{
+		Cfg: first.cfg, Layout: first.l, Store: store, Yield: "smart", Log: io.Discard,
+		RentalFleet: func() (string, *exit.Error) { return "rentals: restart", nil },
+		AcquireManagedRental: func(request records.Request) (string, string, *exit.Error) {
+			acquired <- request
+			return "", "", exit.Named(exit.Capacity, "rental.restart_refusal",
+				"the restart proof supplies no remote capacity")
+		},
+	})
+	fatal(t, problem)
+	go func() { _ = restarted.Serve() }()
+	defer restarted.Close(time.Second)
+	_, _, problem = restarted.Reconcile()
+	fatal(t, problem)
+
+	select {
+	case request := <-acquired:
+		if request.ID != recorded.ID || !request.Rental || !request.RentalRequired || request.Worker != "" {
+			t.Fatalf("restart acquisition saw %+v", request)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("restart did not resume the rental-only request")
+	}
+	row := waitRequestState(t, &owner{store: store}, recorded.ID, "failed")
+	if !row.RentalRequired || row.Worker != "" || row.Ordinal != 0 {
+		t.Fatalf("restart fell back to local placement: %+v", row)
 	}
 }
 

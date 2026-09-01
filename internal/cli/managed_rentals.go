@@ -92,12 +92,8 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		if row.Address == "" || row.CertPath == "" {
 			continue
 		}
-		queued, running, countsProblem := m.store.RentalRunCounts(row.ID)
-		if countsProblem != nil {
-			return "", "", countsProblem
-		}
-		if queued != 0 || running != 0 {
-			continue
+		if batchProblem := m.store.AssignManagedRentalClass(row.ID, needsCPU); batchProblem != nil {
+			return "", "", batchProblem
 		}
 		assigned, assignProblem := m.store.AssignManagedRental(req.ID, row.ID)
 		if assignProblem != nil {
@@ -150,6 +146,9 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		sku.PriceUSDMicrosPerHour, m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID)
 	if problem != nil {
 		return "", "", problem
+	}
+	if batchProblem := m.store.AssignManagedRentalClass(row.ID, needsCPU); batchProblem != nil {
+		return "", "", batchProblem
 	}
 	assigned, problem := m.store.AssignManagedRental(req.ID, row.ID)
 	if problem != nil {
@@ -215,6 +214,14 @@ func (m *managedRentals) releaseOrphaned() {
 	}
 	for _, row := range rows {
 		if row.ManagedRequestID == "" {
+			continue
+		}
+		owner, ownerProblem := m.store.RequestRow(row.ManagedRequestID)
+		if ownerProblem != nil {
+			fmt.Fprintf(m.ctx.Out, "managed rental %s release deferred: %s\n", row.ID, ownerProblem.Message)
+			continue
+		}
+		if owner != nil && !settledRequest(owner.State) {
 			continue
 		}
 		queued, running, countsProblem := m.store.RentalRunCounts(row.ID)

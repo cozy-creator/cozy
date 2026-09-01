@@ -560,6 +560,21 @@ func (s *Store) RentalRunCounts(id string) (queued, running int, problem *exit.E
 	return queued, running, nil
 }
 
+// AssignManagedRentalClass batches every queued request that fits the pod class
+// Creator already bought. Package and model identities remain local; the only class
+// distinction used to select a generic rental is CPU versus GPU.
+func (s *Store) AssignManagedRentalClass(id string, cpu bool) *exit.Error {
+	predicate := "NOT (job_gpu_count=0 AND models='[]')"
+	if cpu {
+		predicate = "job_gpu_count=0 AND models='[]'"
+	}
+	if _, err := s.db.Exec(`UPDATE requests SET worker=? WHERE rental=1 AND worker=''
+		AND state IN ('submitted','queued','requeue_pending') AND (`+predicate+`)`, id); err != nil {
+		return exit.Internalf("cannot batch queued requests onto rental %s: %s", id, err)
+	}
+	return nil
+}
+
 // RentalLastSettlement returns the newest settled request assigned to one rental and
 // the time its final attempt became durable. A zero ClosedAt means the request settled
 // before an attempt crossed the terminal boundary.
