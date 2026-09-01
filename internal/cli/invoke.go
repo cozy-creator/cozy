@@ -527,7 +527,7 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane str
 	if ref.Org == "local" {
 		return empty, exit.Named(exit.Unavailable, "rental_local_model_sync_required",
 			"%s is a private local model and cannot be granted to a rented worker by path", ref.String()).
-			WithRemedy("publish it under a non-local org, or explicitly sync/upload it through the model publication workflow")
+			WithRemedy("upload it under a non-local org, or explicitly sync it through the model upload workflow")
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()

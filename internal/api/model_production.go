@@ -161,6 +161,7 @@ func (s *Server) modelProductionState(operation records.ModelProductionOperation
 		CancelRequested: operation.CancelRequested, ErrorCode: operation.SafeCode,
 		Error: operation.SafeDetail, CreatedAt: operation.CreatedAt, UpdatedAt: operation.UpdatedAt,
 		Changed: changed}
+	var plan *modelproduction.Plan
 	if operation.State == "resolving" {
 		instruction, err := modelproduction.ParseInstruction(operation.Plan)
 		if err != nil {
@@ -169,10 +170,11 @@ func (s *Server) modelProductionState(operation records.ModelProductionOperation
 		state.Model, state.Source = instruction.Destination, instruction.Source
 		state.Producer = instruction.Producer
 	} else {
-		plan, err := modelproduction.Parse(operation.Plan)
+		parsed, err := modelproduction.Parse(operation.Plan)
 		if err != nil {
 			return state, exit.Internalf("cannot read model production %s plan: %s", operation.ID, err)
 		}
+		plan = &parsed
 		state.Model, state.Source = plan.Destination, plan.Source
 		state.Producer, state.Outputs, state.Steps = plan.Producer, plan.OutputNames(), len(plan.Jobs)
 	}
@@ -190,8 +192,7 @@ func (s *Server) modelProductionState(operation records.ModelProductionOperation
 	if problem != nil {
 		return state, problem
 	}
-	if operation.State != "resolving" {
-		plan, _ := modelproduction.Parse(operation.Plan)
+	if plan != nil {
 		bySource := make(map[string]records.ModelProductionArtifact, len(artifacts))
 		for _, artifact := range artifacts {
 			bySource[artifact.StepName+"."+artifact.OutputSlot] = artifact
@@ -210,7 +211,7 @@ func (s *Server) modelProductionState(operation records.ModelProductionOperation
 }
 
 // ModelProductionAction is the one private daemon seam used by `cozy model
-// publish --rental`. The descriptor-derived graph never crosses this route: the
+// upload --rental`. The descriptor-derived graph never crosses this route: the
 // CLI asks the connected record owner to perform one typed host exchange at a time.
 type ModelProductionAction struct {
 	Action   string                         `json:"action"`

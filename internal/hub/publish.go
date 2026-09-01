@@ -1,11 +1,10 @@
 package hub
 
-// Tensorhub's incremental model-publication protocol and manifest reads, as methods
+// Tensorhub's incremental model-upload protocol and manifest reads, as methods
 // on the ONE client. `do` still owns request construction, credentials, reasons, and
 // error mapping. A publication opens under a stable operation id, claims known object
 // transfers, uploads through bounded grants, finalizes one owner checkpoint, then
-// maps that checkpoint into the immutable model release. The retired declare-whole,
-// per-object settlement, and seal routes have no compatibility path.
+// retains that checkpoint owner-only. Mutable release pointers are a separate call.
 
 import (
 	"context"
@@ -336,7 +335,7 @@ func (c *Client) ReleaseReads(ctx context.Context, ref Ref, release, lane string
 			"the hub at %s serves no object-read route: POST %s answered %q", c.base,
 			"…/releases/{release}/lanes/{lane}/reads", e.Name).
 			WithRemedy("this hub can take custody of bytes and cannot hand them back yet; the read grant is the missing half of th-002's transfer protocol").
-			WithNext("cozy model publish <org/model> <source> --release 1.0.0 --dry-run",
+			WithNext("cozy model upload <org/model> <source> --dry-run",
 				"cozy model download --dry-run "+ref.String())
 	}
 	return out.Reads, e

@@ -139,25 +139,37 @@ cozy model list
 cozy model remove org/model
 ```
 
-Publish a pinned source directly, or execute one package-reviewed production whose fixed outputs
-become the release's lanes. `--lane` selects only an existing input release; it never names an
-output lane. An existing canonical TensorFS manifest can still be published directly as one
-immutable release lane. The destination owner must match the account shown by `cozy auth`:
+Upload a pinned source directly, or execute one package-reviewed production whose named outputs
+become owner-only immutable checkpoints. `--lane` on upload selects only an existing input release;
+producers do not choose public lane names. An existing canonical TensorFS manifest can be uploaded
+directly. The destination owner must match the account shown by `cozy auth`:
 
 ```sh
-cozy model publish org/model sha256:<manifest> --release 1.0.0 --lane <derived-lane>
+cozy model upload org/model sha256:<manifest>
 
-cozy model publish tensorhub/minimax-h3 \
+cozy model upload tensorhub/minimax-h3 \
   hf://MiniMaxAI/MiniMax-H3@<full-commit> \
-  --release 1.0.0 \
   --producer tensorhub/minimax-h3-tools/four-lane \
   --rental
 ```
 
-`--dry-run` resolves the immutable source, producer, job releases, resource floors, and fixed lanes
-without moving model bodies or authorizing rental spend. Publication follows by default and a repeat
-of the same command resumes the durable operation. Download and publication verify content identities
-before making a local or remote release visible.
+`--dry-run` resolves the immutable source, producer, job releases, resource floors, and named outputs
+without moving model bodies or authorizing rental spend. Upload follows by default and a repeat of the
+same command resumes the durable operation. Successful checkpoints stay retained even when a later
+output fails; upload never makes them public.
+
+Publish, repoint, add, or remove release lanes separately. Omitted lanes stay unchanged:
+
+```sh
+cozy model publish org/model --release 1.0.0 \
+  --lane bf16=sha256:<checkpoint> \
+  --lane fp8=sha256:<checkpoint>
+cozy model publish org/model --release 1.0.0 --remove-lane defective
+cozy model yank org/model --release 1.0.0
+```
+
+Checkpoint IDs are immutable. Release labels and their lane maps are mutable owner pointers. Ordinary
+consumers follow a release lane so fixes take effect; accepted runs freeze the checkpoint they resolved.
 
 With `--rental`, producer and job packages resolve directly to their latest non-yanked immutable
 Tensorhub releases; their exact release and descriptor identities are pinned in the production plan.

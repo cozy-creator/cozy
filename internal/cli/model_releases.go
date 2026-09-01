@@ -67,6 +67,22 @@ func releaseLaneChanges(setSpecs, removeSpecs []string) (map[string]string, []st
 	return set, remove, nil
 }
 
+func modelReleaseLaneMap(release hub.ModelRelease) (map[string]string, *exit.Error) {
+	lanes := make(map[string]string, len(release.Lanes))
+	for _, lane := range release.Lanes {
+		name, problem := modelLabel("release lane", lane.Lane)
+		if problem != nil {
+			return nil, exit.Internalf("Tensorhub returned an invalid model release lane")
+		}
+		checkpoint, problem := tfs.ManifestID(lane.CheckpointID)
+		if problem != nil || lanes[name] != "" {
+			return nil, exit.Internalf("Tensorhub returned an invalid model release lane")
+		}
+		lanes[name] = checkpoint
+	}
+	return lanes, nil
+}
+
 func handleModelPublish(ctx *Context) *exit.Error {
 	ref, problem := hub.ParseRef(strings.TrimSpace(ctx.Inv.Args[0]))
 	if problem != nil {
@@ -95,27 +111,49 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		return lookup
 	}
 	expectedRevision := int64(0)
+	expectedLanes := map[string]string{}
 	if lookup == nil {
 		if current.Release != release || current.Revision < 1 || current.Yanked {
 			return exit.Internalf("Tensorhub returned an invalid current model release")
 		}
 		expectedRevision = current.Revision
+		expectedLanes, problem = modelReleaseLaneMap(current)
+		if problem != nil {
+			return problem
+		}
+	}
+	for lane, checkpoint := range set {
+		expectedLanes[lane] = checkpoint
+	}
+	for _, lane := range remove {
+		delete(expectedLanes, lane)
 	}
 	reason := "cozy model publish " + ref.String() + "@" + release
 	updated, problem := c.UpdateModelRelease(hctx, ref, release, expectedRevision, set, remove, reason)
 	if problem != nil {
 		return problem
 	}
-	if updated.Release != release || updated.Revision <= expectedRevision || updated.Yanked {
+	if updated.Release != release || updated.Revision < 1 || updated.Yanked {
 		return exit.Internalf("Tensorhub returned an invalid model release update")
 	}
-	lanes := make(map[string]string, len(updated.Lanes))
-	for _, lane := range updated.Lanes {
-		checkpoint, parseProblem := tfs.ManifestID(lane.CheckpointID)
-		if parseProblem != nil || lane.Lane == "" || lanes[lane.Lane] != "" {
-			return exit.Internalf("Tensorhub returned an invalid model release lane")
+	if updated.Changed {
+		if updated.Revision <= expectedRevision {
+			return exit.Internalf("Tensorhub returned an invalid model release update")
 		}
-		lanes[lane.Lane] = checkpoint
+	} else if updated.Revision != expectedRevision {
+		return exit.Internalf("Tensorhub returned an invalid model release update")
+	}
+	lanes, problem := modelReleaseLaneMap(updated)
+	if problem != nil {
+		return problem
+	}
+	if len(lanes) != len(expectedLanes) {
+		return exit.Internalf("Tensorhub returned a different model release lane map")
+	}
+	for lane, checkpoint := range expectedLanes {
+		if lanes[lane] != checkpoint {
+			return exit.Internalf("Tensorhub returned a different model release lane map")
+		}
 	}
 	return emit(ctx, compactRecord([]output.Field{
 		{K: "model", V: ref.String()}, {K: "release", V: release},

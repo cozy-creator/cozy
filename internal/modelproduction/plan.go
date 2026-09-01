@@ -1,4 +1,4 @@
-// Package modelproduction owns the stable identity of one source-to-release
+// Package modelproduction owns the stable identity of one source-to-checkpoints
 // instruction. It deliberately contains no scheduler, provider capability, URL,
 // worker, rental, grant, clock, or retry field.
 package modelproduction

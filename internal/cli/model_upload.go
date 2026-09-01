@@ -273,7 +273,7 @@ func resolvePublishSource(ctx *Context, raw string) (publishSource, *exit.Error)
 	}
 	if resolved.Release == "" || resolved.Lane == "" || resolved.ManifestID == "" {
 		return publishSource{}, exit.Named(exit.Structural, "model_source_resolution_incomplete",
-			"Tensorhub did not resolve one immutable model release lane")
+			"Tensorhub did not resolve one exact checkpoint from the model release lane")
 	}
 	return publishSource{Canonical: resolved.Model + "@" + resolved.Release,
 		Selection: resolved.ManifestID, Lane: resolved.Lane,

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -151,7 +152,7 @@ func TestModelProductionGrammar(t *testing.T) {
 		"--dry-run")
 	if code != 2 || !strings.Contains(out, "logged in as Tensorhub account acme") ||
 		!strings.Contains(out, "publish as acme/model") {
-		t.Fatalf("cross-account model publication was not refused [exit %d]\n%s", code, out)
+		t.Fatalf("cross-account model upload was not refused [exit %d]\n%s", code, out)
 	}
 	code, out = runCozy(t, root, "model", "upload", "acme/model", local,
 		"--dry-run", "--detach")
@@ -176,6 +177,63 @@ func TestModelProductionGrammar(t *testing.T) {
 	code, help = runCozy(t, root, "model", "download", "--help")
 	if code != 0 || strings.Contains(strings.ToLower(help), "snapshot") {
 		t.Fatalf("model download retained snapshot vocabulary [exit %d]\n%s", code, help)
+	}
+}
+
+func TestModelReleaseUpdateAndYankCLIContracts(t *testing.T) {
+	checkpoint := "sha256:" + strings.Repeat("a", 64)
+	requests := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(requests) {
+		case 1, 4:
+			if r.Method != http.MethodGet || r.URL.Path != "/v1/accounts/current" {
+				t.Fatalf("account request = %s %s", r.Method, r.URL.Path)
+			}
+			_, _ = io.WriteString(w, `{"name":"acme"}`)
+		case 2:
+			if r.Method != http.MethodGet || r.URL.Path != "/v1/models/acme/model/releases/stable" {
+				t.Fatalf("release read = %s %s", r.Method, r.URL.Path)
+			}
+			_, _ = io.WriteString(w, `{"release":"stable","revision":4,"yanked":false,"lanes":[{"lane":"broken","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["bf16"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("c", 64)+`","changed":false}`)
+		case 3:
+			if r.Method != http.MethodPost || r.URL.Path != "/v1/models/acme/model/releases/stable" ||
+				r.Header.Get("X-Tensorhub-Reason") != "cozy model publish acme/model@stable" {
+				t.Fatalf("release update = %s %s %#v", r.Method, r.URL.Path, r.Header)
+			}
+			var body struct {
+				ExpectedRevision int64             `json:"expected_revision"`
+				SetLanes         map[string]string `json:"set_lanes"`
+				RemoveLanes      []string          `json:"remove_lanes"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ExpectedRevision != 4 ||
+				body.SetLanes["fp8"] != checkpoint || !reflect.DeepEqual(body.RemoveLanes, []string{"broken"}) {
+				t.Fatalf("release update body = %#v, %v", body, err)
+			}
+			_, _ = io.WriteString(w, `{"release":"stable","revision":5,"yanked":false,"lanes":[{"lane":"fp8","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["fp8"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("d", 64)+`","changed":true}`)
+		case 5:
+			if r.Method != http.MethodDelete || r.URL.Path != "/v1/models/acme/model/releases/stable" ||
+				r.Header.Get("X-Tensorhub-Reason") != "cozy model yank acme/model@stable" {
+				t.Fatalf("release yank = %s %s %#v", r.Method, r.URL.Path, r.Header)
+			}
+			_, _ = io.WriteString(w, `{"release":"stable","revision":6,"yanked":true,"lanes":[{"lane":"fp8","checkpoint_id":"`+checkpoint+`","contract":{"stamps":{},"structure":"sha256:`+strings.Repeat("b", 64)+`","encoding":{"set":["fp8"]}},"objects":1,"bytes":7}],"repository_sha256":"`+strings.Repeat("e", 64)+`","changed":true}`)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	env := []string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}
+	root := t.TempDir()
+	code, out := runCozyDir(t, root, ".", env, "--json", "model", "publish", "acme/model",
+		"--release", "stable", "--lane", "fp8="+checkpoint, "--remove-lane", "broken")
+	if code != 0 || !strings.Contains(out, `"revision":5`) || !strings.Contains(out, `"status":"published"`) {
+		t.Fatalf("model release update [exit %d]\n%s", code, out)
+	}
+	code, out = runCozyDir(t, root, ".", env, "--json", "model", "yank", "acme/model",
+		"--release", "stable")
+	if code != 0 || !strings.Contains(out, `"revision":6`) || !strings.Contains(out, `"status":"yanked"`) {
+		t.Fatalf("model release yank [exit %d]\n%s", code, out)
 	}
 }
 

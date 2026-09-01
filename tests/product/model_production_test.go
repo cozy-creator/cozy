@@ -96,7 +96,7 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 
 	var disabled bytes.Buffer
 	machineProgress := cli.NewModelProductionProgress(&disabled, false, 10)
-	machineProgress.Accepted("modelpub-proof", 4)
+	machineProgress.Accepted("modelupload-proof", 4)
 	machineProgress.SourceProgress(50, 100)
 	machineProgress.StepStarting(0, "assemble-full", "tensorhub/minimax-h3-tools/assemble", false)
 	machineProgress.RentalReleased("rental-1")
@@ -106,12 +106,12 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 	var resumed bytes.Buffer
 	resumeProgress := cli.NewModelProductionProgress(&resumed, true, 10)
 	resumeProgress.SeedSourceProgress(40<<20, 100<<20)
-	resumeProgress.Resume("modelpub-proof", "source preparation has transferred 40.0MiB / 100.0MiB")
+	resumeProgress.Resume("modelupload-proof", "source preparation has transferred 40.0MiB / 100.0MiB")
 	for range 100 {
 		resumeProgress.SourceProgress(40<<20, 100<<20)
 	}
 	resumeProgress.SourceProgress(50<<20, 100<<20)
-	if got := resumed.String(); !strings.Contains(got, "Resuming model production modelpub-proof") ||
+	if got := resumed.String(); !strings.Contains(got, "Resuming model upload modelupload-proof") ||
 		strings.Contains(got, "Source: downloaded 40.0MiB") ||
 		strings.Count(got, "Source: downloaded") != 1 {
 		t.Fatalf("resume repeated already-rendered progress:\n%s", got)
@@ -141,15 +141,15 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 func TestModelProductionCancellationReportsCleanupTruth(t *testing.T) {
 	var confirmed, pending bytes.Buffer
 	finished := cli.NewModelProductionProgress(&confirmed, true, 10)
-	finished.Cancellation("modelpub-cancel")
+	finished.Cancellation("modelupload-cancel")
 	finished.RentalReleaseStarting("rental-cancel")
 	finished.RentalReleased("rental-cancel")
-	if got := confirmed.String(); !strings.Contains(got, "Cancellation: model production modelpub-cancel stopped") ||
+	if got := confirmed.String(); !strings.Contains(got, "Cancellation: model upload modelupload-cancel stopped") ||
 		!strings.Contains(got, "provider absence confirmed") {
 		t.Fatalf("confirmed cancellation cleanup changed:\n%s", got)
 	}
 	unconfirmed := cli.NewModelProductionProgress(&pending, true, 10)
-	unconfirmed.Cancellation("modelpub-cancel")
+	unconfirmed.Cancellation("modelupload-cancel")
 	unconfirmed.RentalReleaseStarting("rental-cancel")
 	unconfirmed.RentalReleaseUnconfirmed("rental-cancel")
 	if got := pending.String(); !strings.Contains(got, "release is not yet confirmed") ||
@@ -232,7 +232,7 @@ func TestModelProductionSourceRequestHonorsCancellationContext(t *testing.T) {
 	requestCtx, cancel := context.WithCancel(context.Background())
 	result := make(chan *exit.Error, 1)
 	go func() {
-		_, callProblem := client.ModelProductionActionContext(requestCtx, "modelpub-cancel",
+		_, callProblem := client.ModelProductionActionContext(requestCtx, "modelupload-cancel",
 			api.ModelProductionAction{Action: "prepare_source", RentalID: "rental-1"})
 		result <- callProblem
 	}()
@@ -534,7 +534,7 @@ func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *test
 		t.Fatalf("follow interrupt canceled durable work: %+v", stillRunning)
 	}
 	if code, listed := runCozy(t, root, "--json", "run", "list"); code != 0 ||
-		!strings.Contains(listed, accepted.ID) || !strings.Contains(listed, "model-publication") {
+		!strings.Contains(listed, accepted.ID) || !strings.Contains(listed, "model-upload") {
 		t.Fatalf("run list omitted model production [exit %d]\n%s", code, listed)
 	}
 

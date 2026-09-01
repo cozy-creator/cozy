@@ -538,7 +538,7 @@ def check_manifest():
         "Search PackageSearchCmd", "Install PackageInstallCmd", "Remove PackageRemoveCmd",
         "List PackageListCmd", "Publish PackagePublishCmd",
         "Search ModelSearchCmd", "Download ModelDownloadCmd", "Remove ModelRemoveCmd",
-        "List ModelListCmd", "Publish ModelPublishCmd",
+        "List ModelListCmd", "Upload ModelUploadCmd", "Publish ModelPublishCmd", "Yank ModelYankCmd",
         "Execute RunExecuteCmd", "Cancel RunCancelCmd", "List RunListCmd",
         "Current RentalListCmd", "New RentalNewCmd", "End RentalEndCmd",
     )
@@ -560,8 +560,8 @@ def check_manifest():
     for path, spelling in derived_audits.items():
         if spelling not in pathlib.Path(path).read_text():
             bad.append(f"[grammar] {path} no longer derives its internal audit reason from exact operation facts")
-    if '"cozy-model-production/1"' not in pathlib.Path("internal/modelproduction/plan.go").read_text():
-        bad.append("[grammar] model publication no longer derives one domain-separated operation identity")
+    if '"cozy-model-upload/1"' not in pathlib.Path("internal/modelproduction/plan.go").read_text():
+        bad.append("[grammar] model upload no longer derives one domain-separated operation identity")
     app = pathlib.Path("internal/cli/app.go").read_text()
     for spelling in VERSION_SPELLINGS:
         if spelling not in app:
@@ -789,7 +789,8 @@ def check_typed_resources():
         "Search  PackageSearchCmd", "Install PackageInstallCmd", "Remove  PackageRemoveCmd",
         "List    PackageListCmd", "Publish PackagePublishCmd",
         "Search   ModelSearchCmd", "Download ModelDownloadCmd", "Remove   ModelRemoveCmd",
-        "List     ModelListCmd", "Publish  ModelPublishCmd",
+        "List     ModelListCmd", "Upload   ModelUploadCmd", "Publish  ModelPublishCmd",
+        "Yank     ModelYankCmd",
     )
     for command in required_commands:
         if command not in manifest:
@@ -809,7 +810,7 @@ def check_typed_resources():
         bad.append("internal/wheel/build.go: [env] uv build inherits the parent environment; "
                    "the PEP 517 backend executes project code and must receive only Tool()")
     retired_debug = (pathlib.Path("internal/transfer/fetch.go").read_text() +
-                     pathlib.Path("internal/transfer/publish.go").read_text() +
+                     pathlib.Path("internal/transfer/upload.go").read_text() +
                      pathlib.Path("internal/cli/transfer.go").read_text())
     for retired in ("FailAfter", "--crash-after", "devKill", '"/seal"'):
         if retired in retired_debug:

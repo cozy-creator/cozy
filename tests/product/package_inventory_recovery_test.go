@@ -31,7 +31,7 @@ func TestRecordsSchemasSixThroughEightMigrateWithoutDroppingDurableRows(t *testi
 				ExpectedWorkerBootID: "boot-proof"}
 			fatal(t, store.RecordRental(rental))
 			_, _, problem = store.BeginModelProduction(records.ModelProductionOperation{
-				ID: "modelpub-pre-account", PlanDigest: "sha256:" + strings.Repeat("c", 64),
+				ID: "modelupload-pre-account", PlanDigest: "sha256:" + strings.Repeat("c", 64),
 				Plan: []byte(`{}`),
 			})
 			fatal(t, problem)

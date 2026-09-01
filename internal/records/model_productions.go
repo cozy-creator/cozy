@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS model_production_objects (
     REFERENCES model_production_artifacts(operation_id,step_name,output_slot)
 )`}
 
-// ModelProductionOperation is one durable source-to-release instruction. Plan
+// ModelProductionOperation is one durable source-to-checkpoints instruction. Plan
 // contains only immutable identities; transient access and execution facts stay
 // in their owning ledgers and joins.
 type ModelProductionOperation struct {

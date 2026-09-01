@@ -21,7 +21,7 @@ type productionProgress struct {
 }
 
 // NewModelProductionProgress is exported only across Cozy's internal product-test
-// boundary; the public CLI surface remains the model publish command itself.
+// boundary; the public CLI surface remains the model upload command itself.
 func NewModelProductionProgress(w io.Writer, human bool, totalSteps int) *productionProgress {
 	return &productionProgress{w: w, enabled: human, totalSteps: totalSteps,
 		stepStage: map[int]string{}, stepBand: map[int]int{}}
@@ -39,7 +39,7 @@ func (p *productionProgress) Accepted(id string, outputs int) {
 }
 
 func (p *productionProgress) Resume(id, stage string) {
-	p.line("Resuming model production %s: %s.", id, strings.TrimSuffix(stage, "."))
+	p.line("Resuming model upload %s: %s.", id, strings.TrimSuffix(stage, "."))
 }
 
 func (p *productionProgress) RentalSelecting(sku string) {
@@ -148,11 +148,11 @@ func (p *productionProgress) OutputsRetained(outputs int) {
 }
 
 func (p *productionProgress) Cancellation(id string) {
-	p.line("Cancellation: model production %s stopped; cleanup is continuing.", id)
+	p.line("Cancellation: model upload %s stopped; cleanup is continuing.", id)
 }
 
 func (p *productionProgress) Failed(id string) {
-	p.line("Failure: model production %s stopped; cleanup is continuing.", id)
+	p.line("Failure: model upload %s stopped; cleanup is continuing.", id)
 }
 
 func (p *productionProgress) RentalReleaseStarting(id string) {

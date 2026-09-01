@@ -1,16 +1,16 @@
-// Package transfer is the order of operations for moving a canonical manifest
+// Package transfer is the order of operations for moving a canonical Manifest
 // between the local store and the hub (cl-012). It owns no bytes and no protocol:
 // TensorFS owns the byte plane (every question crosses internal/tfs) and tensorhub
-// owns the incremental publication protocol (every call crosses internal/hub). What lives here
-// is the SEQUENCE, and the two properties the sequence must have:
+// owns the incremental upload protocol (every call crosses internal/hub). What lives here
+// is the sequence, with two required properties:
 //
-//   - resumability. There is no client-side journal. A publication resumes from the
+//   - resumability. There is no client-side journal. An upload resumes from the
 //     hub's durable transfer rows, and a fetch resumes because
 //     the local store's verification records already say which objects are good.
 //     A transfer that kept its own progress file would have a third opinion about
 //     what is done, and the third opinion is always the wrong one.
 //   - honest accounting. Every progress line separates bytes MOVED from bytes
-//     DEDUPED. A publish that sends nothing and prints the artifact's size is
+//     DEDUPED. An upload that sends nothing and prints the artifact's size is
 //     claiming credit for work it did not do.
 package transfer
 
@@ -163,8 +163,8 @@ func (p *Upload) Run(ctx context.Context) (Result, *exit.Error) {
 	}
 	p.say("%s publication %s in state %s", verb, res.PublishID, publication.State)
 	if publication.State != "open" && publication.State != "checkpointed" {
-		return res, exit.New(exit.Conflict, "publication %s is %s", publication.Operation, publication.State).
-			WithRemedy("use a new model publication after repairing or abandoning the refused operation")
+		return res, exit.New(exit.Conflict, "upload %s is %s", publication.Operation, publication.State).
+			WithRemedy("use a new model upload after repairing or abandoning the refused operation")
 	}
 
 	// 3. The idempotent PUT froze and returned the exact object set in every state.
