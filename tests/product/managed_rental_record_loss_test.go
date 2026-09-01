@@ -90,7 +90,7 @@ func TestManagedRentalHubRecordLossFailsClosed(t *testing.T) {
 		t.Fatalf("Hub record loss was not a typed conflict [exit %d]\n%s", code, out)
 	}
 	code, out := runCozy(t, root, "run", localWeightlessRef+"/tile", "size=32", "seed=7",
-		"--rental", "--force-rental", "--idempotency-key", "db-loss-replacement", "--json")
+		"--rental-only", "--idempotency-key", "db-loss-replacement", "--json")
 	if code != 1 || !strings.Contains(out, "rental.hub_record_missing") {
 		t.Fatalf("subsequent rental acquisition did not fail closed [exit %d]\n%s", code, out)
 	}

@@ -124,8 +124,8 @@ func TestRentalRequestRequiresTheExplicitAcquisitionSeam(t *testing.T) {
 	}
 }
 
-func TestRentalPermissionPrefersLocalAndForceRentalSkipsIt(t *testing.T) {
-	name := "force-rental-local"
+func TestRentalPermissionPrefersLocalAndRentalOnlySkipsIt(t *testing.T) {
+	name := "rental-only-local"
 	root := filepath.Join(os.TempDir(), "cozy-product-test", name)
 	spec := fakeSpec(name, "0", "--arm", "output", "--cozy-home", root)
 	var acquisitions atomic.Int64

@@ -110,17 +110,20 @@ func handleRunExecute(ctx *Context) *exit.Error {
 }
 
 func validateRunPlacement(ctx *Context) *exit.Error {
+	if ctx.Inv.Bool("--rental") && ctx.Inv.Bool("--rental-only") {
+		return exit.Usagef("--rental and --rental-only are mutually exclusive")
+	}
 	managedRental := rentalRequested(ctx)
 	if managedRental && ctx.Cfg.RentalsMaxHourlySpendUSDMicros <= 0 {
 		return exit.Named(exit.Usage, "rental.spend_cap_required",
-			"--rental requires a positive rentals.max_hourly_spend_usd in %s", filepath.Join(ctx.Cfg.Home, "config.yaml")).
+			"rented execution requires a positive rentals.max_hourly_spend_usd in %s", filepath.Join(ctx.Cfg.Home, "config.yaml")).
 			WithRemedy("set the fleet-wide hourly ceiling before authorizing rental spend")
 	}
 	return nil
 }
 
 func rentalRequested(ctx *Context) bool {
-	return ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--force-rental")
+	return ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--rental-only")
 }
 
 func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
@@ -186,7 +189,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Package: target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
 		Release: target.Release, ReleaseDigest: target.ReleaseDigest, Rental: managedRental,
-		RentalRequired:  ctx.Inv.Bool("--force-rental"),
+		RentalRequired:  ctx.Inv.Bool("--rental-only"),
 		Models:          models,
 		OutputDirectory: outputDirectory, OutputPayloadHash: outputIntentHash,
 	}, key)
@@ -769,7 +772,10 @@ func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Er
 	fields = append(fields, output.Field{K: "changed", V: changed})
 	defaults = append(defaults, "run")
 	rec := compactRecord(fields, defaults...)
-	rec.Next = []string{"cozy run cancel " + life.RequestID}
+	rec.Next = []string{
+		"cozy run watch " + life.RequestID,
+		"cozy run cancel " + life.RequestID,
+	}
 	return emit(ctx, rec)
 }
 

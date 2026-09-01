@@ -62,7 +62,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		Package: target.Package, Function: target.Function, Input: input,
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, ReleaseDigest: target.ReleaseDigest, Rental: rentalRequested(ctx),
-		RentalRequired: ctx.Inv.Bool("--force-rental"),
+		RentalRequired: ctx.Inv.Bool("--rental-only"),
 	}, key)
 	if e != nil {
 		return e
@@ -105,7 +105,10 @@ func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Er
 	fields = append(fields, output.Field{K: "changed", V: changed})
 	defaults = append(defaults, "run")
 	rec := compactRecord(fields, defaults...)
-	rec.Next = []string{"cozy run cancel " + state.JobID}
+	rec.Next = []string{
+		"cozy run watch " + state.JobID,
+		"cozy run cancel " + state.JobID,
+	}
 	return emit(ctx, rec)
 }
 
