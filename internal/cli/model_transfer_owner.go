@@ -190,6 +190,9 @@ func (o *modelTransferOwner) PassThrough(parent context.Context, requestID strin
 	if problem := o.store.CompleteModelTransferMaterialization(requestID, nil); problem != nil {
 		return problem
 	}
+	if problem := o.store.BeginModelTransferFinalization(requestID); problem != nil {
+		return problem
+	}
 	return o.Finalize(ctx, requestID, nil)
 }
 

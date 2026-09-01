@@ -579,6 +579,31 @@ func (t *Tool) observedRepository(org, name, scratch string) (string, *exit.Erro
 	return current, nil
 }
 
+func releaseRevision(path, version string) (uint64, *exit.Error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, exit.Internalf("the current TensorFS repository is unreadable: %s", err)
+	}
+	var repository struct {
+		Releases []struct {
+			Revision uint64 `json:"revision"`
+			Version  string `json:"version"`
+		} `json:"releases"`
+	}
+	if err := json.Unmarshal(raw, &repository); err != nil {
+		return 0, exit.Internalf("the current TensorFS repository cannot be decoded: %s", err)
+	}
+	for _, release := range repository.Releases {
+		if release.Version == version {
+			if release.Revision == 0 {
+				return 0, exit.Internalf("TensorFS returned release %s with revision zero", version)
+			}
+			return release.Revision, nil
+		}
+	}
+	return 0, nil
+}
+
 // CommitRelease makes one verified manifest visible under the local repository.
 func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length int64,
 	evidence []byte, scratch string,
@@ -606,11 +631,17 @@ func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length
 	if _, e = t.run("repo", "get", t.Root, org, name, "--out", checkpointed); e != nil {
 		return e
 	}
-	releaseMutation := filepath.Join(scratch, "repo-put-release.json")
+	expectedRevision, e := releaseRevision(checkpointed, version)
+	if e != nil {
+		return e
+	}
+	releaseMutation := filepath.Join(scratch, "repo-update-release.json")
 	if e := writeJSON(releaseMutation, map[string]any{
-		"action": "put_release", "lane": lane,
-		"manifest": map[string]any{"length": length, "sha256": hex(manifestID)},
-		"repo":     map[string]string{"name": name, "org": org}, "version": version,
+		"action": "update_release", "expected_revision": expectedRevision,
+		"remove": []string{}, "repo": map[string]string{"name": name, "org": org},
+		"set": []map[string]any{{"lane": lane,
+			"manifest": map[string]any{"length": length, "sha256": hex(manifestID)}}},
+		"version": version,
 	}); e != nil {
 		return e
 	}
