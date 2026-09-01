@@ -98,7 +98,7 @@ func handleModelUpload(ctx *Context) *exit.Error {
 			return problem
 		}
 		if ctx.Inv.Bool("--detach") {
-			return emitModelProductionState(ctx, productionState, true)
+			return emitModelProductionState(ctx, productionState, productionState.Changed)
 		}
 		return followModelProduction(ctx, local, productionState)
 	}
