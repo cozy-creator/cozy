@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -366,6 +367,7 @@ type civitaiVersion struct {
 		ID          uint64  `json:"id"`
 		Name        string  `json:"name"`
 		SizeKB      float64 `json:"sizeKB"`
+		Primary     bool    `json:"primary"`
 		DownloadURL string  `json:"downloadUrl"`
 		Hashes      struct {
 			SHA256 string `json:"SHA256"`
@@ -397,9 +399,21 @@ func (r *Resolver) resolveCivitai(ctx context.Context, source Source) (Plan, *ex
 	if problem := r.json(ctx, "https://civitai.com/api/v1/models/"+strconv.FormatUint(version.ModelID, 10), &model); problem != nil {
 		return Plan{}, problem
 	}
-	files := make([]File, 0)
+	primary := 0
 	for _, remote := range version.Files {
-		if remote.ID == 0 || !strings.HasSuffix(strings.ToLower(remote.Name), ".safetensors") ||
+		if remote.Primary && strings.HasSuffix(strings.ToLower(remote.Name), ".safetensors") &&
+			(remote.Metadata.Format == "" || strings.EqualFold(remote.Metadata.Format, "SafeTensor")) {
+			primary++
+		}
+	}
+	if primary != 1 {
+		return Plan{}, exit.Named(exit.Validation, "model_source_primary_ambiguous",
+			"Civitai version %d declares %d primary SafeTensor files; exactly one is required",
+			version.ID, primary)
+	}
+	files := make([]File, 0, 1)
+	for _, remote := range version.Files {
+		if !remote.Primary || remote.ID == 0 || !strings.HasSuffix(strings.ToLower(remote.Name), ".safetensors") ||
 			(remote.Metadata.Format != "" && !strings.EqualFold(remote.Metadata.Format, "SafeTensor")) {
 			continue
 		}
@@ -411,9 +425,13 @@ func (r *Resolver) resolveCivitai(ctx context.Context, source Source) (Plan, *ex
 		if remote.DownloadURL == "" {
 			remote.DownloadURL = "https://civitai.com/api/download/models/" + strconv.FormatUint(version.ID, 10)
 		}
-		length, problem := r.measure(ctx, remote.DownloadURL)
-		if problem != nil {
-			return Plan{}, problem
+		length, exact := civitaiLength(remote.SizeKB)
+		if !exact {
+			var problem *exit.Error
+			length, problem = r.measure(ctx, remote.DownloadURL)
+			if problem != nil {
+				return Plan{}, problem
+			}
 		}
 		files = append(files, File{Member: "civitai/files/" + strconv.FormatUint(remote.ID, 10),
 			URL: remote.DownloadURL, SHA256: sha, Length: length, Carrier: true})
@@ -426,6 +444,16 @@ func (r *Resolver) resolveCivitai(ctx context.Context, source Source) (Plan, *ex
 	license := fmt.Sprintf("civitai:no-credit=%t;commercial=%s;derivatives=%t;different-license=%t",
 		model.AllowNoCredit, strings.Join(model.AllowCommercialUse, ","), model.AllowDerivatives, model.AllowDifferentLicense)
 	return finishPlan(source, license, files)
+}
+
+func civitaiLength(sizeKB float64) (int64, bool) {
+	bytes := sizeKB * 1024
+	if math.IsNaN(bytes) || math.IsInf(bytes, 0) || bytes <= 0 || bytes > float64(maxSourceSize) ||
+		math.Trunc(bytes) != bytes {
+		return 0, false
+	}
+	length := int64(bytes)
+	return length, float64(length)/1024 == sizeKB
 }
 
 func (r *Resolver) measure(ctx context.Context, location string) (int64, *exit.Error) {
