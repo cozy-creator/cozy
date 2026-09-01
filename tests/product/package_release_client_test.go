@@ -226,6 +226,8 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current":
+			_, _ = io.WriteString(w, `{"name":"proof"}`)
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/storage/"):
 			at := active.Add(1)
 			defer active.Add(-1)

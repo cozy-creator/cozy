@@ -95,16 +95,6 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 				return
 			}
 			writeAuthToken(t, w, "second-access-token", expires)
-		case "/v1/auth/me":
-			if authorization := r.Header.Get("Authorization"); authorization != "Bearer first-access-token" && authorization != "Bearer second-access-token" {
-				t.Errorf("current-user read carried %q", authorization)
-				return
-			}
-			writeAuthJSON(t, w, http.StatusOK, map[string]any{
-				"id": "140e338a-ebd5-48c5-a124-703f2457195a", "email": "person@example.com",
-				"email_verified": true, "entitlements": []string{},
-				"availability": []map[string]any{{"action": "update_username", "allowed": true}},
-			})
 		case "/v1/accounts/current":
 			if authorization := r.Header.Get("Authorization"); authorization != "Bearer first-access-token" && authorization != "Bearer second-access-token" {
 				t.Errorf("current-account read carried %q", authorization)

@@ -14,7 +14,7 @@ import (
 
 func handleAuthLogin(ctx *Context) *exit.Error {
 	manager := accountauth.New(ctx.Cfg)
-	input := bufio.NewReader(os.Stdin)
+	input := bufio.NewReader(os.Stdin) //cozy:stdin-value login owns the two interactive values
 	hctx, cancel := hub.Context()
 	session, problem := manager.Authenticate(hctx)
 	cancel()

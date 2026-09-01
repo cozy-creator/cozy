@@ -80,7 +80,6 @@ def main() -> int:
             f'dependencies = ["cozy-runtime[media]=={runtime_version}"]\n\n'
             "[tool.uv.sources]\n"
             f'cozy-runtime = {{ path = "vendor/{wheels[0].name}" }}\n'
-            '\n[tool.cozy]\norganization = "cozy"\n'
         )
         run("uv", "lock", "--quiet", cwd=tree)
         run("uv", "sync", "--locked", "--quiet", cwd=tree)

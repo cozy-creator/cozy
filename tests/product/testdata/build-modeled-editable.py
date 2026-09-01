@@ -79,8 +79,6 @@ def main() -> int:
             "[tool.uv.sources]\n"
             f'cozy-runtime = {{ path = "vendor/{runtime_wheel.name}" }}\n'
             f'tensorfs = {{ path = "vendor/{tensorfs_wheel.name}" }}\n\n'
-            "[tool.cozy]\n"
-            'organization = "cozy"\n\n'
             "[build-system]\n"
             'requires = ["hatchling"]\n'
             'build-backend = "hatchling.build"\n\n'

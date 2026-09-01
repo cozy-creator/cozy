@@ -81,11 +81,15 @@ func handleDirectModelPublish(ctx *Context) *exit.Error {
 	}
 	if ref.Org == "local" {
 		return exit.Usagef("local/ is reserved for private aliases and cannot be a Tensorhub destination").
-			WithRemedy("publish under your Tensorhub organization, for example alice/%s", ref.Name)
+			WithRemedy("publish under your Tensorhub account, for example alice/%s", ref.Name)
 	}
 	release, lane := strings.TrimSpace(ctx.Inv.Value("--release")), strings.TrimSpace(ctx.Inv.Value("--lane"))
 	if release == "" || lane == "" {
 		return exit.Usagef("model publish requires --release and --lane")
+	}
+	publicationClient, e := ownedPublication(ctx, ref)
+	if e != nil {
+		return e
 	}
 	subject := ctx.Inv.Args[1]
 	var evidenceRef hub.Ref
@@ -124,12 +128,12 @@ func handleDirectModelPublish(ctx *Context) *exit.Error {
 	// The versioned operation binds the complete named-lane intent without
 	// colliding with publications opened under earlier request semantics.
 	session := transfer.PublicationOperationID(ref, release, lane, manifestID)
-	tool, c, layout, e := tooling(ctx)
+	tool, _, layout, e := tooling(ctx)
 	if e != nil {
 		return e
 	}
 	p := &transfer.Publish{
-		Tool: tool, Hub: c, Ref: ref, EvidenceRef: evidenceRef,
+		Tool: tool, Hub: publicationClient, Ref: ref, EvidenceRef: evidenceRef,
 		ManifestID: manifestID, Release: release, Lane: lane, Session: session,
 		Reason: reason, DryRun: ctx.Inv.Bool("--dry-run"),
 		Progress: progress(ctx), Scratch: scratch(layout, manifestID),

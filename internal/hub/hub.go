@@ -247,23 +247,6 @@ type ResourceSearch struct {
 	Query  string `json:"q"`
 }
 
-type CurrentUser struct {
-	ID string `json:"id"`
-}
-
-// CurrentUser reads AuthKit's canonical current-user route through Tensorhub's mount.
-func (c *Client) CurrentUser(ctx context.Context) (CurrentUser, *exit.Error) {
-	var out CurrentUser
-	// AuthKit owns and may extend this document. Decode the stable id projection
-	// without applying Creator's strict decoder for Creator-owned contracts.
-	problem := c.do(ctx, call{method: http.MethodGet, path: "/v1/auth/me", auth: true}, &out)
-	if problem == nil && out.ID == "" {
-		problem = exit.Named(exit.Internal, "auth.current_user_invalid",
-			"AuthKit returned a current-user document without an id")
-	}
-	return out, problem
-}
-
 // Packages searches package resources server-side. Public — no credential.
 func (c *Client) Packages(ctx context.Context, query string) ([]Resource, ResourceSearch, *exit.Error) {
 	var out struct {

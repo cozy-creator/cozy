@@ -40,7 +40,6 @@ type Package struct {
 	DependencyWheels []DependencyWheel
 	Tree             string
 	Root             string // disposable wheel output, empty until Build
-	Organization     string
 	Name             string
 	Release          string
 }
@@ -67,16 +66,15 @@ func Prepare() (*Package, *exit.Error) {
 // PrepareFrom exists so the product suite can drive publication staging from
 // an isolated project directory without changing the process working directory.
 func PrepareFrom(projectDir string) (*Package, *exit.Error) {
-	return prepareFrom(projectDir, true)
+	return prepareFrom(projectDir)
 }
 
-// PrepareLocalFrom applies the same bounded source rules without requiring a publishable
-// organization. Local installs live under Creator's reserved local/ namespace.
+// PrepareLocalFrom applies the same bounded source rules to a local install.
 func PrepareLocalFrom(projectDir string) (*Package, *exit.Error) {
-	return prepareFrom(projectDir, false)
+	return prepareFrom(projectDir)
 }
 
-func prepareFrom(projectDir string, publication bool) (*Package, *exit.Error) {
+func prepareFrom(projectDir string) (*Package, *exit.Error) {
 	tree, files, problem := sourceTree(projectDir)
 	if problem != nil {
 		return nil, problem
@@ -89,16 +87,8 @@ func prepareFrom(projectDir string, publication bool) (*Package, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
-	if publication {
-		metadata, problem = document.publicationMetadata()
-		if problem != nil {
-			return nil, problem
-		}
-	} else {
-		metadata.Organization = "local"
-	}
 	return &Package{
-		Files: files, Tree: tree, Organization: metadata.Organization,
+		Files: files, Tree: tree,
 		Name: normalizedProjectName(metadata.Name), Release: metadata.Version,
 	}, nil
 }
@@ -234,9 +224,6 @@ type projectMetadata struct {
 		OptionalDependencies map[string][]string `toml:"optional-dependencies"`
 	} `toml:"project"`
 	Tool struct {
-		Cozy struct {
-			Organization string `toml:"organization"`
-		} `toml:"cozy"`
 		UV struct {
 			Sources   map[string]any `toml:"sources"`
 			Workspace struct {
@@ -261,27 +248,11 @@ func readProjectDocument(path string) (projectMetadata, *exit.Error) {
 	return document, nil
 }
 
-func (document projectMetadata) publicationMetadata() (struct {
-	Name, Version, Organization string
-}, *exit.Error) {
-	out, problem := document.projectIdentity()
-	if problem != nil {
-		return out, problem
-	}
-	out.Organization = strings.TrimSpace(document.Tool.Cozy.Organization)
-	if out.Organization == "" || out.Organization != document.Tool.Cozy.Organization {
-		return out, exit.Named(exit.Validation, "project_organization_missing",
-			"pyproject.toml must declare [tool.cozy] organization").
-			WithRemedy("add `[tool.cozy]` and `organization = \"your-org\"`")
-	}
-	return out, nil
-}
-
 func (document projectMetadata) projectIdentity() (struct {
-	Name, Version, Organization string
+	Name, Version string
 }, *exit.Error) {
 	var out struct {
-		Name, Version, Organization string
+		Name, Version string
 	}
 	out.Name = strings.TrimSpace(document.Project.Name)
 	out.Version = strings.TrimSpace(document.Project.Version)

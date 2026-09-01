@@ -106,14 +106,11 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			}
 			loginFinishes++
 			writeAuthToken(t, w, daemonToken, authExpires)
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/auth/me":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current":
 			if r.Header.Get("Authorization") != "Bearer "+enrollmentToken {
-				t.Errorf("enrollment identity read carried %q", r.Header.Get("Authorization"))
+				t.Errorf("account read carried %q", r.Header.Get("Authorization"))
 			}
-			writeAuthJSON(t, w, http.StatusOK, map[string]any{
-				"id": "managed-rental-user", "email": "person@example.com",
-				"email_verified": true, "entitlements": []string{}, "availability": []any{},
-			})
+			writeAuthJSON(t, w, http.StatusOK, map[string]string{"name": "cozy"})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/cozy/tiny":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"model": map[string]any{"org": "cozy", "name": "tiny"},
