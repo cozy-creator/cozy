@@ -74,7 +74,7 @@ func progress(ctx *Context) func(string) {
 	return func(line string) { _ = output.Progress(ctx.Err, line) }
 }
 
-func handleDirectModelPublish(ctx *Context, publicationClient *hub.Client) *exit.Error {
+func handleDirectModelPublish(ctx *Context) *exit.Error {
 	ref, e := hub.ParseRef(ctx.Inv.Args[0])
 	if e != nil {
 		return e
@@ -88,37 +88,35 @@ func handleDirectModelPublish(ctx *Context, publicationClient *hub.Client) *exit
 		return exit.Usagef("model publish requires --release and --lane")
 	}
 	subject := ctx.Inv.Args[1]
-	var evidenceRef hub.Ref
-	var manifestID string
+	localName := ""
+	manifestID := ""
 	if strings.HasPrefix(subject, "local/") {
-		name := strings.TrimPrefix(subject, "local/")
-		if problem := modelsource.LocalName(name); problem != nil {
+		localName = strings.TrimPrefix(subject, "local/")
+		if problem := modelsource.LocalName(localName); problem != nil {
 			return problem
 		}
+	} else {
+		manifestID, e = tfs.ManifestID(subject)
+		if e != nil {
+			return e
+		}
+	}
+	publicationClient, e := ownedPublication(ctx, ref)
+	if e != nil {
+		return e
+	}
+	var evidenceRef hub.Ref
+	if localName != "" {
 		tool, _, problem := localTensorFS(ctx)
 		if problem != nil {
 			return problem
 		}
-		row, problem := tool.ResolveLocal(name)
+		row, problem := tool.ResolveLocal(localName)
 		if problem != nil {
 			return problem
 		}
 		manifestID = row.ManifestDigest
-		evidenceRef = hub.Ref{Org: "local", Name: name}
-	} else {
-		manifestID, e = tfs.ManifestID(subject)
-		if e != nil {
-			cwd, err := os.Getwd()
-			if err != nil {
-				return exit.Internalf("cannot resolve the current directory: %s", err)
-			}
-			if source, sourceProblem := modelsource.Parse(subject, cwd); sourceProblem == nil {
-				return exit.Named(exit.Structural, "model_source_planner_unavailable",
-					"%s is a valid model source, but this TensorFS build cannot derive its closed ingest plan", source.Canonical).
-					WithRemedy("the byte plane must supply reviewed component, encoding, and construction-order facts; Creator will not infer them from filenames")
-			}
-			return e
-		}
+		evidenceRef = hub.Ref{Org: "local", Name: localName}
 	}
 	reason := "cozy model publish " + ref.String() + " " + manifestID + " --release " + release + " --lane " + lane
 	// The versioned operation binds the complete named-lane intent without

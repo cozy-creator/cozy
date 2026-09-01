@@ -100,6 +100,10 @@ func emitAuthSession(ctx *Context, session accountauth.Session, status string,
 		account, problem = c.RegisterAccount(hctx, name)
 		cancel()
 	}
+	if problem != nil && problem.ErrName() == "account.name_required" && input == nil {
+		account.Name = "not registered"
+		problem = nil
+	}
 	if problem != nil {
 		return problem
 	}

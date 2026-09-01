@@ -10,6 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/modelproduction"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -44,6 +45,17 @@ func (m *modelProductionManager) SubmitModelProduction(_ context.Context,
 		instruction.Producer == "" || !instruction.Rental {
 		return records.ModelProductionOperation{}, false, exit.New(exit.Validation,
 			"durable model production requires destination, release, pinned source, producer, and rental approval")
+	}
+	if _, problem := hub.ParseRef(instruction.Destination); problem != nil {
+		return records.ModelProductionOperation{}, false, problem
+	}
+	if !modelReleasePattern.MatchString(instruction.Release) {
+		return records.ModelProductionOperation{}, false, exit.Usagef(
+			"model production release %q is not an immutable N.M.P semantic version",
+			instruction.Release)
+	}
+	if problem := m.owns(instruction.Destination); problem != nil {
+		return records.ModelProductionOperation{}, false, problem
 	}
 	instructionBytes, err := instruction.Bytes()
 	if err != nil {
@@ -88,7 +100,9 @@ func (m *modelProductionManager) SubmitModelProduction(_ context.Context,
 			return operation, changed, problem
 		}
 	}
-	m.kick(operation)
+	if problem := m.kick(operation, true); problem != nil {
+		return operation, changed, problem
+	}
 	return operation, changed, nil
 }
 
@@ -113,7 +127,7 @@ func (m *modelProductionManager) CancelModelProduction(id string) *exit.Error {
 		cancel()
 	} else if operation.State != "completed" && operation.State != "failed" &&
 		operation.State != "canceled" {
-		m.kick(*operation)
+		_ = m.kick(*operation, true)
 	}
 	return nil
 }
@@ -134,26 +148,37 @@ func (m *modelProductionManager) Start() {
 						"model_production.instruction_invalid", err.Error())
 					continue
 				}
-				accepted, _, submitProblem := m.SubmitModelProduction(context.Background(), instruction)
-				if submitProblem == nil {
-					m.kick(accepted)
-				}
+				_, _, _ = m.SubmitModelProduction(context.Background(), instruction)
 				continue
 			}
-			m.kick(operation)
+			_ = m.kick(operation, false)
 		}
 	}()
 }
 
-func (m *modelProductionManager) kick(operation records.ModelProductionOperation) {
+func (m *modelProductionManager) kick(operation records.ModelProductionOperation,
+	owned bool,
+) *exit.Error {
 	if operation.State == "resolving" || operation.State == "completed" ||
 		operation.State == "failed" || operation.State == "canceled" {
-		return
+		return nil
+	}
+	if !owned {
+		plan, err := modelproduction.Parse(operation.Plan)
+		if err != nil {
+			problem := exit.Named(exit.Structural, "model_production.plan_invalid", "%s", err)
+			failProduction(m.store, operation.ID, problem)
+			return problem
+		}
+		if problem := m.owns(plan.Destination); problem != nil {
+			failProduction(m.store, operation.ID, problem)
+			return problem
+		}
 	}
 	m.mu.Lock()
 	if _, exists := m.running[operation.ID]; exists {
 		m.mu.Unlock()
-		return
+		return nil
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	m.running[operation.ID] = cancel
@@ -166,6 +191,18 @@ func (m *modelProductionManager) kick(operation records.ModelProductionOperation
 		}()
 		m.advance(runCtx, operation)
 	}()
+	return nil
+}
+
+func (m *modelProductionManager) owns(destination string) *exit.Error {
+	ref, problem := hub.ParseRef(destination)
+	if problem != nil {
+		return problem
+	}
+	ctx := &Context{Inv: &Invocation{}, Out: io.Discard, Err: m.log,
+		Cfg: m.cfg, AccountAuth: m.auth}
+	_, problem = ownedPublication(ctx, ref)
+	return problem
 }
 
 func (m *modelProductionManager) advance(runCtx context.Context,

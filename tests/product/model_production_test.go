@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -158,6 +159,66 @@ func TestModelProductionCancellationReportsCleanupTruth(t *testing.T) {
 	if got := pending.String(); !strings.Contains(got, "release is not yet confirmed") ||
 		strings.Contains(got, "provider absence confirmed") {
 		t.Fatalf("unconfirmed cancellation cleanup overstated reality:\n%s", got)
+	}
+}
+
+func TestPersistedForeignModelProductionRefusesBeforeSpend(t *testing.T) {
+	var unexpected atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/accounts/current" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"name": "acme"})
+			return
+		}
+		unexpected.Add(1)
+		http.Error(w, "unexpected paid/publication call", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
+		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\n"), 0o600))
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	plan := modelproduction.Plan{
+		Instruction: modelproduction.Instruction{
+			Destination: "foreign/output", Release: "1.0.0",
+			Source:   "hf://source/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Producer: "proof/tools@v1/build", Rental: true,
+		},
+		Destination: "foreign/output", Release: "1.0.0",
+	}
+	planBytes, err := plan.Bytes()
+	must(t, err)
+	planDigest, err := plan.Digest()
+	must(t, err)
+	seeded, _, problem := store.BeginModelProduction(records.ModelProductionOperation{
+		ID: plan.ID(), PlanDigest: planDigest, Plan: planBytes,
+	})
+	fatal(t, problem)
+	store.Close()
+
+	_ = startDaemonProcess(t, root)
+	deadline := time.Now().Add(5 * time.Second)
+	var observed *records.ModelProductionOperation
+	for time.Now().Before(deadline) {
+		store, problem = records.Open(layout.DB)
+		fatal(t, problem)
+		observed, problem = store.ModelProduction(seeded.ID)
+		store.Close()
+		fatal(t, problem)
+		if observed != nil && observed.State == "failed" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if observed == nil || observed.State != "failed" ||
+		!strings.Contains(observed.SafeDetail, "logged in as Tensorhub account acme") {
+		t.Fatalf("persisted foreign plan was not fenced: %+v", observed)
+	}
+	if calls := unexpected.Load(); calls != 0 {
+		t.Fatalf("persisted foreign plan made %d rental/provider/publication calls", calls)
 	}
 }
 
@@ -307,10 +368,11 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 		t.Fatalf("metadata-only remote production [exit %d]\n%s", code, out)
 	}
 	if got := strings.Join(requests, "\n"); strings.Contains(got, "/download") ||
-		got != "GET /v1/accounts/current\nGET /v1/models/resolve\nGET /v1/packages/proof/remote-producer\n"+
+		got != "GET /v1/models/resolve\nGET /v1/packages/proof/remote-producer\n"+
 			"GET /v1/packages/proof/remote-producer/releases/2.0.0\n"+
 			"GET /v1/packages/proof/remote-job\n"+
-			"GET /v1/packages/proof/remote-job/releases/3.0.0" {
+			"GET /v1/packages/proof/remote-job/releases/3.0.0\n"+
+			"GET /v1/accounts/current" {
 		t.Fatalf("remote production metadata routes =\n%s", got)
 	}
 	if producerCardReads != 1 {
@@ -335,7 +397,7 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 	if code == 0 || !strings.Contains(out, "not installed") {
 		t.Fatalf("local production stopped requiring a local install [exit %d]\n%s", code, out)
 	}
-	if got := strings.Join(requests, "\n"); got != "GET /v1/accounts/current\nGET /v1/models/resolve" {
+	if got := strings.Join(requests, "\n"); got != "GET /v1/models/resolve" {
 		t.Fatalf("local production unexpectedly resolved remote package metadata:\n%s", got)
 	}
 }
