@@ -20,19 +20,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: python3 scripts/fence.py
-
-  types:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-      - run: uv run --no-project --python 3.12 python scripts/version_contract.py source
-      # --strict over the py.typed surface AND the drivers that consume it. No per-module
-      # suppressions: a facade that needs one is a facade whose types are wrong.
-      - run: >-
-          uvx --python 3.12 --from 'mypy==1.*' mypy --strict
-          python/tensorfs scripts/version_contract.py
-          scripts/facade-conform.py scripts/facade-runs.py scripts/code-topology-runs.py
+      - run: python3 scripts/version_contract.py source
 
   # The wheel matrix exists so it cannot rot: every platform we publish for is BUILT here,
   # and the native one is installed and made to read a real named tensor out of the

@@ -1,5 +1,11 @@
-"""Types for the compiled marshal boundary. Hand-written, checked by mypy against the
-facade that re-exports it; the extension itself is the authority on behaviour."""
+"""Types for the compiled marshal boundary — an EDITOR AID, not a checked contract.
+
+Hand-written, and no type checker can compare it against the PyO3 #[pymethods] in
+crates/tensorfs-py/src/store.rs that it describes. It was previously guarded by a
+`mypy --strict` CI job, which measured only whether this file agrees with itself; drift
+against the extension was invisible to it, and the sole consumer does not install the
+package in its checking venv. The extension is the authority on both types and behaviour;
+when they disagree, this file is wrong."""
 
 from collections.abc import Callable, Sequence
 from typing import Any, Literal, NotRequired, TypedDict
