@@ -117,7 +117,7 @@ func TestForeignSourceLaneRefusesBeforeProviderNetwork(t *testing.T) {
 	}
 }
 
-func TestMissingLocalPublishAliasRefusesBeforeAccountLookup(t *testing.T) {
+func TestMissingLocalUploadAliasRefusesBeforeAccountLookup(t *testing.T) {
 	accountReads := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/accounts/current" {

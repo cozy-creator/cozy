@@ -222,6 +222,12 @@ func (c *Client) ModelRelease(ctx context.Context, ref Ref, release string) (Mod
 func (c *Client) UpdateModelRelease(ctx context.Context, ref Ref, release string,
 	expectedRevision int64, setLanes map[string]string, removeLanes []string, reason string,
 ) (ModelRelease, *exit.Error) {
+	if setLanes == nil {
+		setLanes = map[string]string{}
+	}
+	if removeLanes == nil {
+		removeLanes = []string{}
+	}
 	var out ModelRelease
 	e := c.do(ctx, call{method: http.MethodPost, path: modelReleasePath(ref, release),
 		auth: true, reason: reason, patient: true, strict: true,

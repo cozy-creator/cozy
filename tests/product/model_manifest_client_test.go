@@ -290,10 +290,11 @@ func TestPublicationFinalizesCheckpointThenUpdatesLaneMap(t *testing.T) {
 				SetLanes         map[string]string `json:"set_lanes"`
 				RemoveLanes      []string          `json:"remove_lanes"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ExpectedRevision != 0 ||
+			raw, readErr := io.ReadAll(r.Body)
+			if err := json.Unmarshal(raw, &body); readErr != nil || err != nil || body.ExpectedRevision != 0 ||
 				!reflect.DeepEqual(body.SetLanes, map[string]string{namedLane: "sha256:" + manifestA}) ||
-				len(body.RemoveLanes) != 0 {
-				t.Fatalf("release update body = %#v, %v", body, err)
+				len(body.RemoveLanes) != 0 || !bytes.Contains(raw, []byte(`"remove_lanes":[]`)) {
+				t.Fatalf("release update body = %#v, read %v", body, readErr)
 			}
 			_, _ = io.WriteString(w, `{"release":"1.0.0","revision":1,"yanked":false,"repository_sha256":"`+manifestA+`","lanes":[{"lane":"`+namedLane+`","checkpoint_id":"sha256:`+manifestA+`"}],"changed":true}`)
 		default:
