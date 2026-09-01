@@ -1,8 +1,9 @@
 # Vendored worker protocol
 
 This directory contains the Go files Cozy needs from
-`cozy-creator/worker-protocol-v2` commit
-`cf377265f984eebd55345aa22085db8e849e2521`.
+`cozy-creator/worker-protocol-v2`. `cozy/worker/v1/SOURCE` names the exact
+commit and the sha256 of every vendored file; that file, not this prose, is the
+provenance record.
 
 The four files under `cozy/worker/v1/` are byte-identical to that commit's
 `gen/go/cozy/worker/v1/` output. They were generated with official protoc 35.1,
@@ -14,8 +15,10 @@ worker-protocol; do not hand-edit generated files here.
 service path. `WireMinor` is its additive compatibility level. Additive changes bump the
 minor; a breaking change creates `cozy.worker.v2` instead of revising v1 in place.
 
-Git records the exact vendored bytes and every local change to them. A checksum file committed
-beside the files would merely hash one part of the same commit and would add no provenance.
-When CI has permission to read the private worker-protocol repository, its independent
-`vendored-diff.sh` comparison checks this complete generated set against upstream. Without that
-credential, Cozy makes no independent upstream-provenance or drift claim.
+`SOURCE` pins the upstream commit and per-file digests, matching what tensorhub and
+cozy-runtime already carry, so a hand edit or a stale re-vendor is detectable from this
+repository alone. When CI has permission to read the private worker-protocol repository, its
+independent `vendored-diff.sh` comparison additionally regenerates from the `.proto` and
+byte-compares this complete generated set against upstream. That job is gated on the
+`WORKER_PROTOCOL_TOKEN` secret; while the secret is unset it is a no-op and Cozy makes no
+independent upstream-provenance or drift claim beyond `SOURCE`.
