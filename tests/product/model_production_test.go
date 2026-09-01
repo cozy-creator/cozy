@@ -307,11 +307,10 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 		t.Fatalf("metadata-only remote production [exit %d]\n%s", code, out)
 	}
 	if got := strings.Join(requests, "\n"); strings.Contains(got, "/download") ||
-		got != "GET /v1/models/resolve\nGET /v1/packages/proof/remote-producer\n"+
+		got != "GET /v1/accounts/current\nGET /v1/models/resolve\nGET /v1/packages/proof/remote-producer\n"+
 			"GET /v1/packages/proof/remote-producer/releases/2.0.0\n"+
 			"GET /v1/packages/proof/remote-job\n"+
-			"GET /v1/packages/proof/remote-job/releases/3.0.0\n"+
-			"GET /v1/accounts/current" {
+			"GET /v1/packages/proof/remote-job/releases/3.0.0" {
 		t.Fatalf("remote production metadata routes =\n%s", got)
 	}
 	if producerCardReads != 1 {
@@ -336,7 +335,7 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 	if code == 0 || !strings.Contains(out, "not installed") {
 		t.Fatalf("local production stopped requiring a local install [exit %d]\n%s", code, out)
 	}
-	if got := strings.Join(requests, "\n"); got != "GET /v1/models/resolve" {
+	if got := strings.Join(requests, "\n"); got != "GET /v1/accounts/current\nGET /v1/models/resolve" {
 		t.Fatalf("local production unexpectedly resolved remote package metadata:\n%s", got)
 	}
 }

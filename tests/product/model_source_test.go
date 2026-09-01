@@ -1,6 +1,8 @@
 package producttest
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -95,9 +97,19 @@ func TestTensorhubDestinationCannotUseLocalNamespace(t *testing.T) {
 	}
 }
 
-func TestForeignSourceLaneRefusesBeforeNetwork(t *testing.T) {
+func TestForeignSourceLaneRefusesBeforeProviderNetwork(t *testing.T) {
 	root := t.TempDir()
-	result := runCozyEnv([]string{"COZY_HOME=" + root, "PATH=/usr/local/bin:/usr/bin:/bin"},
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/accounts/current" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"name":"acme"}`))
+	}))
+	defer server.Close()
+	result := runCozyEnv([]string{"COZY_HOME=" + root, "PATH=/usr/local/bin:/usr/bin:/bin",
+		"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"},
 		"model", "publish", "acme/model", "hf://org/model@"+strings.Repeat("a", 40),
 		"--release", "1.0.0", "--lane", "bf16")
 	if result.code != 2 || !strings.Contains(result.output, "--lane selects only") {

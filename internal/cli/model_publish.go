@@ -67,6 +67,10 @@ func handleModelPublish(ctx *Context) *exit.Error {
 			return problem
 		}
 	}
+	publicationClient, problem := ownedPublication(ctx, destination)
+	if problem != nil {
+		return problem
+	}
 	producerName := strings.TrimSpace(ctx.Inv.Value("--producer"))
 	if producerName == "" && !ctx.Inv.Bool("--rental") {
 		_, manifestProblem := tfs.ManifestID(ctx.Inv.Args[1])
@@ -74,7 +78,7 @@ func handleModelPublish(ctx *Context) *exit.Error {
 			if ctx.Inv.Bool("--detach") {
 				return exit.Usagef("--detach requires a durable model production")
 			}
-			return handleDirectModelPublish(ctx)
+			return handleDirectModelPublish(ctx, publicationClient)
 		}
 	}
 	instructionSource, problem := canonicalProductionSource(ctx, ctx.Inv.Args[1])
@@ -85,9 +89,6 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		Source: instructionSource, InputLane: strings.TrimSpace(ctx.Inv.Value("--lane")),
 		Producer: producerName, Rental: ctx.Inv.Bool("--rental")}
 	if !ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--rental") && producerName != "" {
-		if _, problem := ownedPublication(ctx, destination); problem != nil {
-			return problem
-		}
 		daemonState, _, problem := ensureDaemon(ctx)
 		if problem != nil {
 			return problem
@@ -131,9 +132,6 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	}
 	id := plan.ID()
 	if ctx.Inv.Bool("--dry-run") {
-		if _, problem := ownedPublication(ctx, destination); problem != nil {
-			return problem
-		}
 		fields := []output.Field{
 			{K: "id", V: id}, {K: "kind", V: "model-publication"},
 			{K: "model", V: destination.String()}, {K: "release", V: release},

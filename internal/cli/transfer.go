@@ -74,7 +74,7 @@ func progress(ctx *Context) func(string) {
 	return func(line string) { _ = output.Progress(ctx.Err, line) }
 }
 
-func handleDirectModelPublish(ctx *Context) *exit.Error {
+func handleDirectModelPublish(ctx *Context, publicationClient *hub.Client) *exit.Error {
 	ref, e := hub.ParseRef(ctx.Inv.Args[0])
 	if e != nil {
 		return e
@@ -86,10 +86,6 @@ func handleDirectModelPublish(ctx *Context) *exit.Error {
 	release, lane := strings.TrimSpace(ctx.Inv.Value("--release")), strings.TrimSpace(ctx.Inv.Value("--lane"))
 	if release == "" || lane == "" {
 		return exit.Usagef("model publish requires --release and --lane")
-	}
-	publicationClient, e := ownedPublication(ctx, ref)
-	if e != nil {
-		return e
 	}
 	subject := ctx.Inv.Args[1]
 	var evidenceRef hub.Ref
