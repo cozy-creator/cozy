@@ -170,7 +170,7 @@ type LogicalJob struct {
 	WeightsOutputs   []WeightsOutput
 	NeedsAccelerator bool
 	Models           []ModelRef
-	SourceProfiles   map[string]string
+	ProducerParams   []string
 }
 
 type ModelRef = records.ModelRef

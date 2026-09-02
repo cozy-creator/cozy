@@ -1,11 +1,14 @@
 package packagepublish
 
-// cl-078: the author derives. When the descriptor declares source profiles, the
-// publish runs cozy-model-contract-proof in the project's own locked venv over
-// the hub-resolved (snapshot, config, hardware variants) per declared pair, and
-// uploads the produced envelope — result.json plus the digest-named contract and
-// code-topology documents — beside the descriptor. The hub validates those
-// documents statically and never executes package code (th-106).
+// cr-077: the author derives SLOT FACTS. A slot's entire declaration is its class
+// annotation; per slot class the publish derives exactly two facts — the shape-only
+// code topology digest and the acceptable encodings set — by running the class's
+// factory on the meta device in the project's own locked venv. The construction SEED
+// (which checkpoint snapshot/config the factory runs against) comes from the slot's
+// default `package.toml [bindings]` entry; its identity never enters the published
+// facts. The hub validates the produced envelope statically and never executes
+// package code (th-106); compatibility is graded on demand from
+// grade(code topology × checkpoint topology) + encoding/device qualification.
 
 import (
 	"context"
@@ -23,10 +26,13 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/wheel"
+	"github.com/pelletier/go-toml/v2"
 )
 
-// DeriveInput is one resolved source profile: the exact snapshot manifest, the
-// canonical construction config bytes, and the hub's active hardware variants.
+// DeriveInput is one resolved construction seed: the exact snapshot manifest, the
+// canonical construction config bytes (the runtime-parity document — one config, or
+// the assembled name-keyed mapping of every named config), and the hub's active
+// hardware variants.
 type DeriveInput struct {
 	Snapshot     string
 	ConfigDigest string
@@ -34,22 +40,20 @@ type DeriveInput struct {
 	Variants     []string
 }
 
-// ProfileResolver answers one declared "org/model/release/lane[/config]"
-// profile from the hub. config is the optional fifth segment (th-114): the
-// named construction config of a multi-config checkpoint, empty when the
-// profile declares none.
-type ProfileResolver func(ctx context.Context, model, release, lane, config string) (DeriveInput, *exit.Error)
+// SeedResolver answers one fully named default binding — model, release, lane —
+// from the hub's derive-inputs read.
+type SeedResolver func(ctx context.Context, model, release, lane string) (DeriveInput, *exit.Error)
 
 var evidenceDocName = regexp.MustCompile(`^[0-9a-f]{64}\.json$`)
 
-type declaredBinding struct {
-	path    string
-	profile string
+type declaredSlot struct {
+	path  string
+	class string
 }
 
-// declaredBindings reads the descriptor's profiled model slots. The descriptor
-// was just produced by describe, so this is a projection, not a validation.
-func declaredBindings(descriptorPath string) ([]declaredBinding, *exit.Error) {
+// declaredSlots reads every model slot of the descriptor. The descriptor was just
+// produced by describe, so this is a projection, not a validation.
+func declaredSlots(descriptorPath string) ([]declaredSlot, *exit.Error) {
 	raw, err := os.ReadFile(descriptorPath)
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "package_descriptor_invalid",
@@ -58,14 +62,14 @@ func declaredBindings(descriptorPath string) ([]declaredBinding, *exit.Error) {
 	var document struct {
 		Entrypoints []struct {
 			Models []struct {
-				Path          string `json:"path"`
-				SourceProfile string `json:"source_profile"`
+				Path  string `json:"path"`
+				Class string `json:"class"`
 			} `json:"models"`
 		} `json:"entrypoints"`
 		Jobs []struct {
 			Models []struct {
-				Path          string `json:"path"`
-				SourceProfile string `json:"source_profile"`
+				Path  string `json:"path"`
+				Class string `json:"class"`
 			} `json:"models"`
 		} `json:"jobs"`
 	}
@@ -73,65 +77,148 @@ func declaredBindings(descriptorPath string) ([]declaredBinding, *exit.Error) {
 		return nil, exit.Named(exit.Structural, "package_descriptor_invalid",
 			"the built descriptor is not JSON: %v", err)
 	}
-	out := []declaredBinding{}
+	out := []declaredSlot{}
 	for _, callable := range document.Entrypoints {
 		for _, slot := range callable.Models {
-			if slot.SourceProfile != "" {
-				out = append(out, declaredBinding{path: slot.Path, profile: slot.SourceProfile})
-			}
+			out = append(out, declaredSlot{path: slot.Path, class: slot.Class})
 		}
 	}
 	for _, callable := range document.Jobs {
 		for _, slot := range callable.Models {
-			if slot.SourceProfile != "" {
-				out = append(out, declaredBinding{path: slot.Path, profile: slot.SourceProfile})
-			}
+			out = append(out, declaredSlot{path: slot.Path, class: slot.Class})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].path < out[j].path })
 	return out, nil
 }
 
-// DeriveEvidence produces the publish-time envelope for every declared pair.
-// A package with no declared profiles produces none, and that is the design:
-// static grading exists exactly for the pairs the author declared and tested.
-func (p *Package) DeriveEvidence(ctx context.Context, org string, resolve ProfileResolver) *exit.Error {
+// seedRef is one fully named default binding: the checkpoint the class's factory
+// derives against. Anything less than model+release+lane is not a derivation seed.
+type seedRef struct {
+	model   string
+	release string
+	lane    string
+}
+
+func (s seedRef) key() string { return s.model + "/" + s.release + "/" + s.lane }
+
+// slotSeeds resolves each slot's default binding from package.toml [bindings],
+// with the runtime's exact precedence: the path spelling wins over the class
+// spelling. A slot with no complete binding derives no facts and is reported as
+// skipped — publishable, but ungradeable until the author names a default. Two
+// slots of one class resolving different seeds refuse: a class carries exactly
+// one topology fact.
+func slotSeeds(tree string, slots []declaredSlot) (map[string]seedRef, []string, *exit.Error) {
+	raw, err := os.ReadFile(filepath.Join(tree, "package.toml"))
+	if err != nil {
+		return nil, nil, exit.Named(exit.Validation, "package_config_unreadable",
+			"package.toml is unreadable: %v", err)
+	}
+	var document struct {
+		Bindings map[string]struct {
+			Model   string `toml:"model"`
+			Release string `toml:"release"`
+			Lane    string `toml:"lane"`
+		} `toml:"bindings"`
+	}
+	if err := toml.Unmarshal(raw, &document); err != nil {
+		return nil, nil, exit.Named(exit.Validation, "package_config_invalid",
+			"package.toml is not valid TOML: %v", err)
+	}
+	known := map[string]bool{}
+	for _, slot := range slots {
+		known[slot.path] = true
+		known[slot.class] = true
+	}
+	for key := range document.Bindings {
+		if !known[key] {
+			return nil, nil, exit.Named(exit.Validation, "slot_binding_unknown",
+				"package.toml binds %q, which this release declares no slot for", key).
+				WithRemedy("bind a declared slot path or model class, or remove the entry")
+		}
+	}
+	seeds := map[string]seedRef{}
+	skipped := []string{}
+	for _, slot := range slots {
+		entry, held := document.Bindings[slot.path]
+		if !held {
+			entry, held = document.Bindings[slot.class]
+		}
+		if !held || entry.Model == "" || entry.Release == "" || entry.Lane == "" {
+			if _, derived := seeds[slot.class]; !derived {
+				skipped = append(skipped, slot.class)
+			}
+			continue
+		}
+		seed := seedRef{model: entry.Model, release: entry.Release, lane: entry.Lane}
+		if previous, held := seeds[slot.class]; held && previous != seed {
+			return nil, nil, exit.Named(exit.Validation, "slot_binding_divergent",
+				"class %s is bound to both %s and %s; one slot class carries one topology fact",
+				slot.class, previous.key(), seed.key()).
+				WithRemedy("bind every slot of the class to one default checkpoint")
+		}
+		seeds[slot.class] = seed
+	}
+	// A class is skipped only when NO slot of it produced a seed.
+	kept := []string{}
+	for _, class := range skipped {
+		if _, derived := seeds[class]; !derived {
+			kept = append(kept, class)
+		}
+	}
+	sort.Strings(kept)
+	return seeds, dedupe(kept), nil
+}
+
+func dedupe(values []string) []string {
+	out := values[:0]
+	for i, value := range values {
+		if i == 0 || values[i-1] != value {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+// DeriveEvidence produces the publish-time slot-facts envelope: per slot class with
+// a complete default binding, the shape-only code topology and the acceptable
+// encodings set. A package with no seeded slots produces none, and that is the
+// design: preflight for its slots answers "no facts" until a default is named.
+func (p *Package) DeriveEvidence(ctx context.Context, org string, resolve SeedResolver) *exit.Error {
 	if p.Root == "" || p.Descriptor == "" || p.Wheel == "" {
 		return exit.Internalf("DeriveEvidence before Build")
 	}
-	bindings, problem := declaredBindings(p.Descriptor)
+	slots, problem := declaredSlots(p.Descriptor)
 	if problem != nil {
 		return problem
 	}
-	if len(bindings) == 0 {
+	if len(slots) == 0 {
 		return nil
 	}
-	inputs := map[string]DeriveInput{}
+	seeds, skipped, problem := slotSeeds(p.Tree, slots)
+	if problem != nil {
+		return problem
+	}
+	p.SlotFactsSkipped = skipped
+	if len(seeds) == 0 {
+		return nil
+	}
+	classes := make([]string, 0, len(seeds))
+	for class := range seeds {
+		classes = append(classes, class)
+	}
+	sort.Strings(classes)
 	stage := filepath.Join(p.Root, "evidence-inputs")
 	if err := os.MkdirAll(stage, 0o700); err != nil {
 		return exit.Internalf("stage evidence inputs: %v", err)
 	}
-	requestBindings := make([]map[string]any, 0, len(bindings))
-	for i, binding := range bindings {
-		// Model releases are mutable pointers with unordered labels (#689), so a
-		// model has no default release and the declared profile must name one:
-		// <org>/<model>/<release>/<lane>. A fifth segment (th-114) names the
-		// construction config of a multi-config checkpoint.
-		segments := strings.Split(binding.profile, "/")
-		if len(segments) < 4 || len(segments) > 5 ||
-			(len(segments) == 5 && segments[4] == "") {
-			return exit.Named(exit.Validation, "source_profile_unresolvable",
-				"%s declares source profile %q; evidence resolution needs org/model/release/lane with an optional /config",
-				binding.path, binding.profile).
-				WithRemedy("declare the profile as <org>/<model>/<release>/<lane>[/<config>]")
-		}
-		config := ""
-		if len(segments) == 5 {
-			config = segments[4]
-		}
-		input, held := inputs[binding.profile]
+	inputs := map[string]DeriveInput{}
+	requestSlots := make([]map[string]any, 0, len(classes))
+	for i, class := range classes {
+		seed := seeds[class]
+		input, held := inputs[seed.key()]
 		if !held {
-			resolved, problem := resolve(ctx, segments[0]+"/"+segments[1], segments[2], segments[3], config)
+			resolved, problem := resolve(ctx, seed.model, seed.release, seed.lane)
 			if problem != nil {
 				return problem
 			}
@@ -139,7 +226,7 @@ func (p *Package) DeriveEvidence(ctx context.Context, org string, resolve Profil
 				return exit.Named(exit.Unavailable, "derive_inputs_unavailable",
 					"the hub advertises no active hardware variants to derive against")
 			}
-			inputs[binding.profile] = resolved
+			inputs[seed.key()] = resolved
 			input = resolved
 		}
 		configPath := filepath.Join(stage, fmt.Sprintf("config-%02d.json", i))
@@ -148,8 +235,8 @@ func (p *Package) DeriveEvidence(ctx context.Context, org string, resolve Profil
 		}
 		variants := append([]string(nil), input.Variants...)
 		sort.Strings(variants)
-		requestBindings = append(requestBindings, map[string]any{
-			"path":     binding.path,
+		requestSlots = append(requestSlots, map[string]any{
+			"class":    class,
 			"snapshot": input.Snapshot,
 			"config": map[string]any{"digest": input.ConfigDigest,
 				"length": len(input.ConfigBytes), "path": configPath},
@@ -170,7 +257,7 @@ func (p *Package) DeriveEvidence(ctx context.Context, org string, resolve Profil
 	}
 	descriptorSum := sha256.Sum256(descriptorRaw)
 	request := map[string]any{
-		"bindings": requestBindings,
+		"slots": requestSlots,
 		"package": map[string]any{
 			"package": org + "/" + p.Name,
 			"release": p.Release,
@@ -208,7 +295,7 @@ func (p *Package) DeriveEvidence(ctx context.Context, org string, resolve Profil
 		}
 		return exit.Named(exit.Validation, "derive_evidence_refused",
 			"cozy-model-contract-proof refused: %s", detail).
-			WithRemedy("repair the declared model pairs, then publish again")
+			WithRemedy("repair the slot classes or their default bindings, then publish again")
 	}
 	// The proof publishes a read-only tree (0o500 directories); reopen it so
 	// Package.Close's RemoveAll can reap the disposable root.
@@ -225,21 +312,20 @@ func (p *Package) DeriveEvidence(ctx context.Context, org string, resolve Profil
 			"the evidence run produced no result.json")
 	}
 	evidence["evidence/result.json"] = index
-	for _, directory := range []string{"contracts", "code-topologies"} {
-		entries, err := os.ReadDir(filepath.Join(outDir, directory))
-		if err != nil {
+	entries, err := os.ReadDir(filepath.Join(outDir, "code-topologies"))
+	if err != nil {
+		return exit.Named(exit.Structural, "derive_evidence_invalid",
+			"the evidence run produced no code-topologies documents")
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !evidenceDocName.MatchString(entry.Name()) {
 			return exit.Named(exit.Structural, "derive_evidence_invalid",
-				"the evidence run produced no %s documents", directory)
+				"the evidence run produced an unexpected code-topologies entry %q", entry.Name())
 		}
-		for _, entry := range entries {
-			if entry.IsDir() || !evidenceDocName.MatchString(entry.Name()) {
-				return exit.Named(exit.Structural, "derive_evidence_invalid",
-					"the evidence run produced an unexpected %s entry %q", directory, entry.Name())
-			}
-			evidence["evidence/"+directory+"/"+entry.Name()] =
-				filepath.Join(outDir, directory, entry.Name())
-		}
+		evidence["evidence/code-topologies/"+entry.Name()] =
+			filepath.Join(outDir, "code-topologies", entry.Name())
 	}
 	p.Evidence = evidence
+	p.SlotFacts = classes
 	return nil
 }

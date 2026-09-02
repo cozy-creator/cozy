@@ -517,11 +517,7 @@ func resolveProducerPlan(ctx *Context, raw string, supplied map[string]string) (
 		Function: target.Function, InstallID: selected.InstallID, Release: selected.Release,
 		ReleaseDigest: selected.ReleaseDigest, DescriptorID: job.DescriptorID}
 	for _, slot := range job.Models {
-		profile := slot.SourceProfile
-		if profile == "" {
-			profile = supplied[slot.Param]
-		}
-		plan.SourceProfiles[slot.Param] = profile
+		plan.SourceProfiles[slot.Param] = supplied[slot.Param]
 	}
 	for _, output := range job.WeightsOutputs {
 		plan.Outputs = append(plan.Outputs, modeltransfer.OutputPin{Name: output.OutputID,

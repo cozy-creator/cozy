@@ -531,9 +531,9 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 		}
 	}
 	weights := make([]orchestrator.WeightsOutput, 0, len(job.WeightsOutputs))
-	profiles := make(map[string]string, len(job.Models))
+	params := make([]string, 0, len(job.Models))
 	for _, model := range job.Models {
-		profiles[model.Param] = model.SourceProfile
+		params = append(params, model.Param)
 	}
 	outputs := launch.AssetPaths(job.Result)
 	for _, output := range job.WeightsOutputs {
@@ -552,7 +552,7 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
 		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
 		WeightsOutputs: weights, NeedsAccelerator: launch.AcceleratorRequired(requirements), Models: models,
-		SourceProfiles: profiles,
+		ProducerParams: params,
 	}, job, nil
 }
 

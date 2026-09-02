@@ -53,11 +53,15 @@ Cozy runs `uv build --wheel` against the current tree. `uv` invokes the
 project's declared PEP 517 backend; Cozy does not maintain another Python
 package builder. Cozy verifies that every local wheel's name and version agrees with its project and
 the parent requirement. It also derives the canonical descriptor with the project's locked
-`cozy-runtime describe` command, and — when the descriptor declares `source_profiles` — runs
-`cozy-model-contract-proof` in the same locked venv over the hub-resolved
-(snapshot, config, hardware variants) per declared pair, producing the derive-evidence
-envelope that publishes beside the descriptor (cl-078; the hub validates it statically and
-never executes package code). Each of these runs to its own completion: Cozy waits on the
+`cozy-runtime describe` command, and — for every model slot class whose default
+`package.toml [bindings]` entry fully names a checkpoint (model, release, lane) — runs
+`cozy-model-contract-proof` in the same locked venv over the hub-resolved construction
+seed (snapshot, canonical config, hardware variants), producing the slot-facts envelope
+that publishes beside the descriptor (cr-077; per class exactly two facts, the shape-only
+code topology and the acceptable encodings set — the hub validates them statically, never
+executes package code, and grades compatibility on demand). A slot class with no complete
+default is skipped and reported; its preflight answers "no facts" until one is named.
+Each of these runs to its own completion: Cozy waits on the
 child process and reads its exit, and imposes no clock of its own on it.
 
 Publication is one small digest-declared transaction (the th-094 shape):

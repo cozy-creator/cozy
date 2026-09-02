@@ -12,6 +12,8 @@ import (
 // ValidateProducer checks only the callable shape model download/upload needs.
 // A producer may leave its output contract open when the exact source determines
 // the topology; TensorFS still derives and verifies the produced checkpoint facts.
+// The descriptor declares no source selection (cr-077): every model input is bound
+// by the caller's --source-profile at dispatch.
 func ValidateProducer(name string, job *launch.Entrypoint, supplied map[string]string) *exit.Error {
 	if len(job.Models) == 0 {
 		return exit.Named(exit.Validation, "model_producer.source_inputs_absent",
@@ -20,13 +22,9 @@ func ValidateProducer(name string, job *launch.Entrypoint, supplied map[string]s
 	declared := map[string]bool{}
 	for _, slot := range job.Models {
 		declared[slot.Param] = true
-		if slot.SourceProfile != "" && supplied[slot.Param] != "" {
-			return exit.Named(exit.Validation, "model_producer.source_profile_conflict",
-				"producer job %s model input %s declares a TensorFS source profile; --source-profile cannot override it", name, slot.Param)
-		}
-		if slot.SourceProfile == "" && supplied[slot.Param] == "" {
+		if supplied[slot.Param] == "" {
 			return exit.Named(exit.Validation, "model_producer.source_profile_absent",
-				"producer job %s model input %s has no TensorFS source profile; declare one or pass --source-profile %s=<reviewed profile>", name, slot.Param, slot.Param)
+				"producer job %s model input %s is unbound; pass --source-profile %s=<reviewed profile>", name, slot.Param, slot.Param)
 		}
 	}
 	for param := range supplied {
@@ -68,7 +66,7 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 		return nil
 	}
 	if len(intent.SourceProfiles) == 0 || len(intent.Outputs) != len(spec.WeightsOutputs) ||
-		!profilesSatisfyDeclarations(intent.SourceProfiles, spec.ProducerProfiles) {
+		!profilesCoverParams(intent.SourceProfiles, spec.ProducerParams) {
 		return exit.New(exit.Validation, "producer transfer inputs/outputs do not match the job descriptor")
 	}
 	declared := make(map[string]*orchestrator.WeightsOutput, len(spec.WeightsOutputs))
@@ -86,19 +84,15 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 	return nil
 }
 
-// profilesSatisfyDeclarations holds the descriptor as the single authority
-// where it declares a slot's profile, and requires the caller's intent
-// (--source-profile) to fill exactly the slots it leaves undeclared.
-func profilesSatisfyDeclarations(intent, declared map[string]string) bool {
-	if len(intent) != len(declared) {
+// profilesCoverParams requires the caller's intent (--source-profile) to bind
+// exactly the job's model inputs: the descriptor declares no source selection
+// (cr-077), so dispatch is the one place a producer's sources are named.
+func profilesCoverParams(intent map[string]string, params []string) bool {
+	if len(intent) != len(params) {
 		return false
 	}
-	for slot, declaredProfile := range declared {
-		supplied, ok := intent[slot]
-		if !ok || supplied == "" {
-			return false
-		}
-		if declaredProfile != "" && supplied != declaredProfile {
+	for _, param := range params {
+		if intent[param] == "" {
 			return false
 		}
 	}

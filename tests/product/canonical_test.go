@@ -326,7 +326,7 @@ func TestPackageDescriptor(t *testing.T) {
 
 	// Model inputs are not hardware facts: this job could transform their TensorFS bytes on
 	// CPU. The immutable release dependency set selects the machine class instead.
-	gpuRaw := []byte(`{"application":"h3:tools","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"H3Dits","component_use":{},"path":"four_lane.models.dits","source_profile":"hf/minimax-h3/native-dual-bf16/1","stamps":{}}],"name":"four_lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+	gpuRaw := []byte(`{"application":"h3:tools","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"H3Dits","component_use":{},"path":"four_lane.models.dits","stamps":{}}],"name":"four_lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	gpuDescriptor, problem := launch.DecodeDescriptor(gpuRaw)
 	fatal(t, problem)
 	_, problem = gpuDescriptor.Function("four_lane")
@@ -358,23 +358,23 @@ func TestPackageDescriptor(t *testing.T) {
 // source-derived producer cannot name one topology before it sees the selected source,
 // while an H3-style producer that does declare a contract must still match it exactly.
 func TestDynamicProducerOutputContracts(t *testing.T) {
-	raw := []byte(`{"application":"quantize:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"QuantizationSource","component_use":{},"path":"produce.models.source","source_profile":"civitai/sdxl/single-file/1","stamps":{}}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"mxfp8"}]}]}`)
+	raw := []byte(`{"application":"quantize:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"QuantizationSource","component_use":{},"path":"produce.models.source","stamps":{}}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"mxfp8"}]}]}`)
 	descriptor, problem := launch.DecodeDescriptor(raw)
 	fatal(t, problem)
 	job, problem := descriptor.Function("produce")
 	fatal(t, problem)
-	if problem := modeltransfer.ValidateProducer("paul/quantize@v1/produce", job, nil); problem != nil {
+	profiles := map[string]string{"source": "civitai/sdxl/single-file/1"}
+	if problem := modeltransfer.ValidateProducer("paul/quantize@v1/produce", job, profiles); problem != nil {
 		t.Fatalf("generic model producer was refused before source-derived contracts exist: %s", problem.Message)
 	}
 
-	profiles := map[string]string{"source": "civitai/sdxl/single-file/1"}
 	intent := &records.ModelTransferIntent{Kind: "model-upload", Destination: "paul/sdxl",
 		Source: "civitai://1", SourceSelection: "sha256:" + strings.Repeat("1", 64),
 		SourceProfiles: profiles, Outputs: []records.ModelTransferOutput{
 			{Name: "bf16"}, {Name: "fp8"}, {Name: "mxfp8"},
 		}}
 	spec := orchestrator.Submission{Package: "paul/quantize", Entrypoint: "produce",
-		ModelTransfer: intent, ProducerProfiles: profiles, WeightsOutputs: []orchestrator.WeightsOutput{
+		ModelTransfer: intent, ProducerParams: []string{"source"}, WeightsOutputs: []orchestrator.WeightsOutput{
 			{OutputID: "bf16"}, {OutputID: "fp8"}, {OutputID: "mxfp8"},
 		}}
 	if problem := modeltransfer.ValidateSubmission(spec); problem != nil {
@@ -403,9 +403,9 @@ func TestDynamicProducerOutputContracts(t *testing.T) {
 	}
 }
 
-// TestSuppliedSourceProfiles: --source-profile fills a producer slot the descriptor
-// leaves undeclared (the H3 ingest shape after minimax-h3-tools 2.2.0 dropped its
-// premature declarations), never overrides a declared one, and never invents slots.
+// TestSuppliedSourceProfiles: the descriptor declares no source selection
+// (cr-077) — --source-profile binds every producer model input at dispatch,
+// refuses when one is missing, and never invents slots.
 func TestSuppliedSourceProfiles(t *testing.T) {
 	raw := []byte(`{"application":"h3:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"H3FullTransformer","component_use":{},"path":"four-lane.models.dits","stamps":{}},{"class":"H3FullTransformer","component_use":{},"path":"four-lane.models.shared","stamps":{}}],"name":"four-lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"full"}]}]}`)
 	descriptor, problem := launch.DecodeDescriptor(raw)
@@ -430,21 +430,15 @@ func TestSuppliedSourceProfiles(t *testing.T) {
 		t.Fatalf("unknown slot must refuse, got %v", problem)
 	}
 
-	declared := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"S","component_use":{},"path":"produce.models.source","source_profile":"civitai/sdxl/single-file/1","stamps":{}}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"}]}]}`)
-	descriptor2, problem := launch.DecodeDescriptor(declared)
-	fatal(t, problem)
-	job2, problem := descriptor2.Function("produce")
-	fatal(t, problem)
-	if problem := modeltransfer.ValidateProducer("paul/q@v1/produce", job2,
-		map[string]string{"source": "other/profile/x/1"}); problem == nil ||
-		problem.ErrName() != "model_producer.source_profile_conflict" {
-		t.Fatalf("override of a declared profile must refuse, got %v", problem)
+	stale := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"S","component_use":{},"path":"produce.models.source","source_profile":"civitai/sdxl/single-file/1","stamps":{}}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"}]}]}`)
+	if _, problem := launch.DecodeDescriptor(stale); problem == nil {
+		t.Fatal("a stale descriptor still carrying source_profile must refuse (cr-077 hard cut)")
 	}
 }
 
 // TestSubmissionFillsUndeclaredProfiles mirrors the H3 four-lane dispatch: the
-// published descriptor leaves both slots undeclared, the caller's intent fills
-// them, and the descriptor stays the single authority where it does declare.
+// published descriptor declares no source selection (cr-077): the caller's
+// intent binds every producer model input, and a missing or extra one refuses.
 func TestSubmissionFillsUndeclaredProfiles(t *testing.T) {
 	intent := &records.ModelTransferIntent{Kind: "model-upload", Destination: "paul/minimax-h3",
 		Source: "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("4", 40), SourceSelection: "sha256:" + strings.Repeat("2", 64),
@@ -454,18 +448,18 @@ func TestSubmissionFillsUndeclaredProfiles(t *testing.T) {
 		},
 		Outputs: []records.ModelTransferOutput{{Name: "full"}}}
 	spec := orchestrator.Submission{Package: "paul/minimax-h3-tools", Entrypoint: "four-lane",
-		ModelTransfer: intent,
-		ProducerProfiles: map[string]string{"dits": "", "shared": ""},
-		WeightsOutputs:   []orchestrator.WeightsOutput{{OutputID: "full"}}}
+		ModelTransfer:  intent,
+		ProducerParams: []string{"dits", "shared"},
+		WeightsOutputs: []orchestrator.WeightsOutput{{OutputID: "full"}}}
 	if problem := modeltransfer.ValidateSubmission(spec); problem != nil {
-		t.Fatalf("intent must fill undeclared slots: %s", problem.Message)
+		t.Fatalf("intent must bind every model input: %s", problem.Message)
 	}
-	spec.ProducerProfiles = map[string]string{"dits": "declared/elsewhere/x/1", "shared": ""}
+	spec.ProducerParams = []string{"dits", "shared", "third"}
 	if problem := modeltransfer.ValidateSubmission(spec); problem == nil {
-		t.Fatal("intent contradicting a declared profile must refuse")
+		t.Fatal("unfilled model input must refuse")
 	}
-	spec.ProducerProfiles = map[string]string{"dits": "", "shared": "", "third": ""}
+	spec.ProducerParams = []string{"dits"}
 	if problem := modeltransfer.ValidateSubmission(spec); problem == nil {
-		t.Fatal("unfilled undeclared slot must refuse")
+		t.Fatal("an intent naming more inputs than the job declares must refuse")
 	}
 }

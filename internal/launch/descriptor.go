@@ -82,12 +82,11 @@ type WeightsModelContract struct {
 
 // Slot is one declared model binding path — capability, never selection.
 type Slot struct {
-	Class         string              `json:"class"`
-	Path          string              `json:"path"`
-	Param         string              `json:"-"`
-	SourceProfile string              `json:"source_profile,omitempty"`
-	Stamps        map[string]string   `json:"stamps"`
-	ComponentUse  map[string][]string `json:"component_use"`
+	Class        string              `json:"class"`
+	Path         string              `json:"path"`
+	Param        string              `json:"-"`
+	Stamps       map[string]string   `json:"stamps"`
+	ComponentUse map[string][]string `json:"component_use"`
 }
 
 // Struct is a rendered msgspec struct.
@@ -215,7 +214,7 @@ func validateClosedDescriptor(data []byte) error {
 				for _, slot := range slots {
 					if _, err := exactKeys(slot,
 						[]string{"class", "component_use", "path", "stamps"},
-						[]string{"source_profile"}); err != nil {
+						nil); err != nil {
 						return err
 					}
 				}
@@ -369,7 +368,6 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 	if ep.Name == "" {
 		return exit.New(exit.Validation, "descriptor carries an unnamed %s", ep.Kind)
 	}
-	profiledModels := 0
 	for i := range ep.Models {
 		slot := &ep.Models[i]
 		prefix := ep.Name + ".models."
@@ -379,17 +377,6 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 				"%s has invalid model path %q; it must be %s<parameter>", ep.Name, slot.Path, prefix)
 		}
 		slot.Param = param
-		if slot.SourceProfile != "" {
-			profiledModels++
-			if !sourceProfilePattern.MatchString(slot.SourceProfile) {
-				return exit.New(exit.Validation, "%s model %s has invalid source profile %q",
-					ep.Name, param, slot.SourceProfile)
-			}
-		}
-	}
-	if profiledModels != 0 && profiledModels != len(ep.Models) {
-		return exit.New(exit.Validation,
-			"%s source profiles must be absent or cover every model input", ep.Name)
 	}
 	for _, pair := range []struct {
 		name string
@@ -429,10 +416,7 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 	return nil
 }
 
-var (
-	sourceProfilePattern    = regexp.MustCompile(`^[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*$`)
-	descriptorDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-)
+var descriptorDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 func validDescriptorDigestList(values []string, cap int) bool {
 	if len(values) < 1 || len(values) > cap {
