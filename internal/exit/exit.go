@@ -90,11 +90,11 @@ func JobTerminal(state string) Code {
 // Error is the one typed CLI error. Name may be more specific than the matrix
 // name (for example not_implemented under usage), but Code is always a matrix code.
 type Error struct {
-	Code    Code
-	Name    string
-	Message string
-	Remedy  string
-	Next    []string
+	Code    Code     `json:"code"`
+	Name    string   `json:"name,omitempty"`
+	Message string   `json:"message"`
+	Remedy  string   `json:"remedy,omitempty"`
+	Next    []string `json:"next,omitempty"`
 }
 
 func (e *Error) Error() string { return fmt.Sprintf("error(%s): %s", e.ErrName(), e.Message) }

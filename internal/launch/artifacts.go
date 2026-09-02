@@ -71,18 +71,6 @@ func Binary(inst records.PackageInstall) string {
 	return home.VenvTool(filepath.Join(inst.Dir, "venv"), "cozy-runtime")
 }
 
-// HostRuntime is the package-independent local worker control process. Package code runs
-// through the separately selected venv interpreter.
-func HostRuntime() (string, *exit.Error) {
-	path, err := exec.LookPath("cozy-runtime")
-	if err != nil {
-		return "", exit.Named(exit.Structural, "host_runtime_missing",
-			"this host has no cozy-runtime command on PATH").
-			WithRemedy("install the Cozy Runtime tool that ships with this Cozy release")
-	}
-	return path, nil
-}
-
 // json runs one verb and decodes its `--json` document.
 func (r RuntimeCLI) call(out any, verb ...string) *exit.Error {
 	return r.callContext(context.Background(), out, verb...)

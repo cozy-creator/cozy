@@ -15,6 +15,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -50,6 +51,14 @@ func serveDaemon(ctx *Context) *exit.Error {
 			{K: "daemon", V: "running"}, {K: "address", V: st.Addr},
 			{K: "socket", V: st.Socket}, {K: "pid", V: st.PID}, {K: "since", V: st.Since},
 		}, Notes: []string{"already running: `cozy run list` is idempotent"}})
+	}
+
+	// THE HOST RUNTIME IS ADMITTED BEFORE THE DAEMON EXISTS. A cozy-runtime on PATH that
+	// speaks an older wire minor cannot bring a worker READY, and a daemon that starts over
+	// one queues every local run silently (cl-086). A host with NO tool starts: rentals and
+	// the hub need none, and the launch itself refuses `host_runtime_missing` by name.
+	if _, e := launch.HostRuntime(ctx.Cfg.Tool()); e != nil && e.ErrName() != "host_runtime_missing" {
+		return e
 	}
 
 	socket := l.Root + "/worker.sock"

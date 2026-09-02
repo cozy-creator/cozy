@@ -419,7 +419,7 @@ func invocationDefaultBindings(ctx *Context, target Target) (
 		if problem != nil {
 			return nil, problem
 		}
-		runtimeBin, problem = launch.HostRuntime()
+		runtimeBin, problem = launch.HostRuntime(ctx.Cfg.Tool())
 		if problem != nil {
 			return nil, problem
 		}

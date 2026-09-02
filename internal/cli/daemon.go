@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -66,13 +67,40 @@ func RunDaemon(stdout, stderr io.Writer) int {
 		Out: stdout, Err: stderr, Cfg: cfg, AccountAuth: accountauth.New(cfg),
 	}
 	if problem := serveDaemon(ctx); problem != nil {
-		fmt.Fprintln(stderr, problem.Error())
+		// The parent `cozy up` reads this pipe: one typed document, so the refusal reaches
+		// the human under its own name and remedy rather than as startup prose.
+		fmt.Fprintln(stderr, string(startupRefusal{Error: problem}.encode()))
 		if problem.Code.Valid() && problem.Code != exit.OK {
 			return int(problem.Code)
 		}
 		return int(exit.Internal)
 	}
 	return 0
+}
+
+// startupRefusal is the daemon's last word on stderr when it refuses to start: the typed
+// error itself, so `daemonStartupFailure` re-raises it verbatim.
+type startupRefusal struct {
+	Error *exit.Error `json:"error"`
+}
+
+func (r startupRefusal) encode() []byte {
+	data, err := json.Marshal(r)
+	if err != nil {
+		return []byte(r.Error.Error())
+	}
+	return data
+}
+
+// startupRefusalOf reads the daemon's typed refusal back out of its startup diagnostic.
+func startupRefusalOf(diagnostic string) *exit.Error {
+	lines := strings.Split(strings.TrimSpace(diagnostic), "\n")
+	var doc startupRefusal
+	if json.Unmarshal([]byte(lines[len(lines)-1]), &doc) != nil || doc.Error == nil ||
+		doc.Error.Message == "" || !doc.Error.Code.Valid() {
+		return nil
+	}
+	return doc.Error
 }
 
 func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
@@ -209,6 +237,9 @@ func readBoundedDiagnostic(reader io.Reader) string {
 }
 
 func daemonStartupFailure(result daemonExit) *exit.Error {
+	if refusal := startupRefusalOf(result.diagnostic); refusal != nil {
+		return refusal
+	}
 	diagnostic := strings.TrimSpace(result.diagnostic)
 	if diagnostic == "" && result.err != nil {
 		diagnostic = result.err.Error()
