@@ -610,9 +610,16 @@ func (s *Store) Rentals() ([]Rental, *exit.Error) {
 	return out, nil
 }
 
+// absentRentalStates is the one spelling of "the hub proved the provider holds
+// nothing for this rental": terminal states the hub commits only after
+// readback-agreed absence. A row in one is a record to close, never a machine
+// that is running or spending.
+const absentRentalStates = `'failed','released'`
+
 // RentalFleetTotals counts each potentially billing obligation once. A rental
 // operation with no local rental row covers the response-loss window; once its
 // row exists, the immutable row rate replaces that reservation in the sum.
+// Rentals in a proven-absent terminal state are out of both numbers.
 func (s *Store) RentalFleetTotals() (count int, hourlyRateUSDMicros int64, problem *exit.Error) {
 	return rentalFleetTotals(s.db)
 }
@@ -622,10 +629,12 @@ func rentalFleetTotals(q interface{ QueryRow(string, ...any) *sql.Row }) (int, i
 	var burn int64
 	err := q.QueryRow(`SELECT COUNT(*),COALESCE(SUM(hourly_rate_usd_micros),0) FROM (
 		SELECT id AS identity,hourly_rate_usd_micros FROM rentals
+		WHERE state NOT IN (`+absentRentalStates+`)
 		UNION ALL
 		SELECT o.operation_key,o.hourly_rate_usd_micros FROM rental_operations o
 		LEFT JOIN rentals r ON r.id=o.rental_id
-		WHERE o.state NOT IN (`+finalRentalOperationStates+`) AND r.id IS NULL
+		WHERE o.state NOT IN (`+finalRentalOperationStates+`)
+		  AND o.state NOT IN (`+absentRentalStates+`) AND r.id IS NULL
 	)`).Scan(&count, &burn)
 	if err != nil {
 		return 0, 0, exit.Internalf("cannot total the rental fleet: %s", err)
