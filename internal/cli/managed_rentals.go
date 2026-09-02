@@ -103,6 +103,16 @@ func (i rentalIdleness) releaseAt(grace time.Duration) (time.Time, bool) {
 	return i.Since.Add(grace), true
 }
 
+// totals is the reconciled fleet count and hourly burn, for a caller that spells them itself.
+func (m *managedRentals) totals() (int, int64, *exit.Error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if problem := m.reconcileLocked(); problem != nil {
+		return 0, 0, problem
+	}
+	return m.totalsLocked()
+}
+
 func (m *managedRentals) status() (string, *exit.Error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -530,12 +540,17 @@ func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
 }
 
 func usdPerHour(micros int64) string {
+	return usdPerHourBare(micros) + "/hour"
+}
+
+// usdPerHourBare is the dollar figure alone, for a line that already says "per hour".
+func usdPerHourBare(micros int64) string {
 	whole, fraction := micros/1_000_000, micros%1_000_000
 	decimal := fmt.Sprintf("%06d", fraction)
 	for len(decimal) > 2 && decimal[len(decimal)-1] == '0' {
 		decimal = decimal[:len(decimal)-1]
 	}
-	return fmt.Sprintf("$%d.%s/hour", whole, decimal)
+	return fmt.Sprintf("$%d.%s", whole, decimal)
 }
 
 func settledRequest(state string) bool {

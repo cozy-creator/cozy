@@ -158,15 +158,15 @@ func (c *ModelFamilyCmd) Run(r *Runtime) error {
 }
 
 type ModelDownloadCmd struct {
-	Source     string `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
-	Ref        string `arg:"" name:"model" help:"Local destination (local/name)."`
-	Producer   string `help:"Ordinary producer job as org/package@vN/function."`
+	Source         string   `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
+	Ref            string   `arg:"" name:"model" help:"Local destination (local/name)."`
+	Producer       string   `help:"Ordinary producer job as org/package@vN/function."`
 	SourceProfiles []string `name:"source-profile" help:"Bind a producer model input to a reviewed TensorFS source profile as slot=profile (repeatable; only for inputs the job leaves undeclared)."`
-	Lane       string `help:"Select an input lane when source is a Tensorhub model release."`
-	Rental     bool   `help:"Permit a managed rental when compatible local capacity is unavailable."`
-	RentalOnly bool   `help:"Require a remote rental instead of local capacity."`
-	DryRun     bool   `help:"Resolve the exact transfer plan without moving bodies or spending."`
-	Await      bool   `help:"Watch the accepted run until it settles."`
+	Lane           string   `help:"Select an input lane when source is a Tensorhub model release."`
+	Rental         bool     `help:"Permit a managed rental when compatible local capacity is unavailable."`
+	RentalOnly     bool     `help:"Require a remote rental instead of local capacity."`
+	DryRun         bool     `help:"Resolve the exact transfer plan without moving bodies or spending."`
+	Await          bool     `help:"Watch the accepted run until it settles."`
 }
 
 func (c *ModelDownloadCmd) Run(r *Runtime) error {
@@ -192,15 +192,15 @@ func (c *ModelListCmd) Run(r *Runtime) error {
 }
 
 type ModelUploadCmd struct {
-	Source     string `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
-	Ref        string `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
-	Producer   string `help:"Ordinary producer job as org/package@vN/function."`
+	Source         string   `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
+	Ref            string   `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
+	Producer       string   `help:"Ordinary producer job as org/package@vN/function."`
 	SourceProfiles []string `name:"source-profile" help:"Bind a producer model input to a reviewed TensorFS source profile as slot=profile (repeatable; only for inputs the job leaves undeclared)."`
-	Lane       string `help:"Select an input lane when source is a Tensorhub model release."`
-	Rental     bool   `help:"Permit a managed rental when compatible local capacity is unavailable."`
-	RentalOnly bool   `help:"Require a remote rental instead of local capacity."`
-	DryRun     bool   `help:"Resolve the exact transfer plan without moving bodies or spending."`
-	Await      bool   `help:"Watch the accepted run until it settles."`
+	Lane           string   `help:"Select an input lane when source is a Tensorhub model release."`
+	Rental         bool     `help:"Permit a managed rental when compatible local capacity is unavailable."`
+	RentalOnly     bool     `help:"Require a remote rental instead of local capacity."`
+	DryRun         bool     `help:"Resolve the exact transfer plan without moving bodies or spending."`
+	Await          bool     `help:"Watch the accepted run until it settles."`
 }
 
 func (c *ModelUploadCmd) Run(r *Runtime) error {

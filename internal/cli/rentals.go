@@ -536,7 +536,7 @@ func handleRentLs(ctx *Context) *exit.Error {
 		return e
 	}
 	defer st.Close()
-	line, e := (&managedRentals{ctx: ctx, layout: l, store: st}).status()
+	count, burn, e := (&managedRentals{ctx: ctx, layout: l, store: st}).totals()
 	if e != nil {
 		return e
 	}
@@ -549,8 +549,10 @@ func handleRentLs(ctx *Context) *exit.Error {
 		Name:      "rentals",
 		Fields:    []string{"machine", "sku", "state", "uptime", "queued", "running", "idle", "release"},
 		AllFields: []string{"machine", "sku", "state", "uptime", "queued", "running", "idle", "release", "utilization", "rental", "accelerator", "address", "media", "hub", "rented", "ready"},
-		Next:      []string{"cozy help rental new"},
-		Notes:     []string{line, idleReleaseNote(grace)},
+		Lead: []string{fmt.Sprintf("Remote machines running: %d", count),
+			"Current spend per hour: " + usdPerHourBare(burn)},
+		Trail: []string{idleShutdownNote(grace)},
+		Next:  []string{"cozy help rental new"},
 	}
 	for _, r := range rows {
 		idle, problem := observeRentalIdle(st, r)
@@ -614,6 +616,32 @@ func rentalIdleColumns(r records.Rental, idle rentalIdleness, grace time.Duratio
 		return idleFor, "in " + roughDuration(time.Until(due))
 	}
 	return idleFor, "due"
+}
+
+// idleShutdownNote is the one sentence the rental list owes: what ends an idle machine.
+func idleShutdownNote(grace time.Duration) string {
+	if grace <= 0 {
+		return "Idle machines are never shut down automatically; end them with `cozy rental end`."
+	}
+	return "Idle machines shut down after " + plainDuration(grace) + "."
+}
+
+// plainDuration spells a grace the way a person would: "5 minutes", "90 seconds", "2 hours".
+func plainDuration(d time.Duration) string {
+	switch {
+	case d%time.Hour == 0:
+		return plural(int(d/time.Hour), "hour")
+	case d%time.Minute == 0:
+		return plural(int(d/time.Minute), "minute")
+	}
+	return plural(int(d/time.Second), "second")
+}
+
+func plural(n int, unit string) string {
+	if n == 1 {
+		return "1 " + unit
+	}
+	return fmt.Sprintf("%d %ss", n, unit)
 }
 
 func idleReleaseNote(grace time.Duration) string {
