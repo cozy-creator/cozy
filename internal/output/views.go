@@ -45,8 +45,13 @@ type List struct {
 	Machine    []string
 	Total      int
 	Aggregates []Field
-	Notes      []string
-	Next       []string
+	// Lead lines stand above the table: the facts a human reads first. A list that has a
+	// lead and no rows shows the lead alone — the lead already says there is nothing.
+	// Trail lines stand below it, plain, before the guidance.
+	Lead  []string
+	Trail []string
+	Notes []string
+	Next  []string
 }
 
 // Human is an aggregate value with its own terminal sentence; JSON carries the value
@@ -211,8 +216,17 @@ func writeHumanList(w io.Writer, list List, columns []string, shown []map[string
 	total int, document map[string]any, full bool,
 ) error {
 	var rendered strings.Builder
+	for _, line := range list.Lead {
+		rendered.WriteString(line)
+		rendered.WriteByte('\n')
+	}
+	if len(list.Lead) > 0 && len(shown) > 0 {
+		rendered.WriteByte('\n')
+	}
 	if len(shown) == 0 {
-		fmt.Fprintf(&rendered, "No %s found.\n", list.Name)
+		if len(list.Lead) == 0 {
+			fmt.Fprintf(&rendered, "No %s found.\n", list.Name)
+		}
 	} else if len(columns) == 1 {
 		for _, row := range shown {
 			rendered.WriteString("- ")
@@ -247,7 +261,19 @@ func writeHumanList(w io.Writer, list List, columns []string, shown []map[string
 			wroteAggregate = true
 		}
 	}
-	writeHumanGuidance(&rendered, list.Notes, list.Next)
+	if len(list.Trail) > 0 && rendered.Len() > 0 {
+		rendered.WriteByte('\n')
+	}
+	for _, line := range list.Trail {
+		rendered.WriteString(line)
+		rendered.WriteByte('\n')
+	}
+	if len(list.Trail) > 0 {
+		// The trail already sits apart from the table; the guidance follows it directly.
+		writeGuidanceLines(&rendered, list.Notes, list.Next)
+	} else {
+		writeHumanGuidance(&rendered, list.Notes, list.Next)
+	}
 	_, err := io.WriteString(w, rendered.String())
 	return err
 }
@@ -315,10 +341,14 @@ func writeHumanGuidance(rendered *strings.Builder, notes, next []string) {
 	if rendered.Len() > 0 {
 		rendered.WriteByte('\n')
 	}
+	writeGuidanceLines(rendered, notes, next)
+}
+
+func writeGuidanceLines(rendered *strings.Builder, notes, next []string) {
 	for _, note := range notes {
 		fmt.Fprintf(rendered, "Note: %s\n", strings.TrimSpace(note))
 	}
-	for _, command := range next {
+	for _, command := range trimNext(next) {
 		fmt.Fprintf(rendered, "Next: %s\n", strings.TrimSpace(command))
 	}
 }
