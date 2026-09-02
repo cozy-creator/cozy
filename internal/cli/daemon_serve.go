@@ -229,11 +229,12 @@ func serveDaemon(ctx *Context) *exit.Error {
 	if _, e := startEditableSync(l, st, resolver, c, ctx.Out, quit); e != nil {
 		fmt.Fprintf(ctx.Out, "editable watch unavailable: %s\n", e.Message)
 	}
+	idle := idleWatch{debounce: ctx.Cfg.DaemonIdleShutdown, store: st, owner: c,
+		server: server, log: ctx.Out}
 	if ctx.Cfg.DaemonIdleShutdown > 0 {
-		go idleWatch{debounce: ctx.Cfg.DaemonIdleShutdown, store: st, owner: c,
-			server: server, log: ctx.Out}.run(quit)
+		go idle.run(quit)
 	}
-	if sweep, ok := newGCCron(ctx.Cfg, l, st, ctx.Out); ok {
+	if sweep, ok := newGCCron(ctx.Cfg, l, idle, ctx.Out); ok {
 		go sweep.run(quit)
 	}
 

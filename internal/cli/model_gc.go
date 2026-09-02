@@ -29,19 +29,22 @@ func handleModelGC(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	// A download's admitted objects are unnamed until its commit: a pass beside an active
+	// request could take bytes that request is still moving in.
+	if len(active) > 0 {
+		return exit.New(exit.Conflict, "%d active request(s) may still be moving bytes into the store", len(active)).
+			WithRemedy("let them settle, or cancel them, then reclaim").
+			WithNext("cozy run list")
+	}
 	tool, _, problem := localTensorFS(ctx)
 	if problem != nil {
 		return problem
 	}
-	report, problem := tool.GC(len(active) == 0)
+	report, problem := tool.GC(true)
 	if problem != nil {
 		return problem
 	}
-	record := output.Record{Fields: reclaimFields(report)}
-	if report.KeptObjects > 0 && len(active) > 0 {
-		record.Notes = []string{fmt.Sprintf("%d active request(s): ingest sessions were not abandoned", len(active))}
-	}
-	return emit(ctx, record)
+	return emit(ctx, output.Record{Fields: reclaimFields(report)})
 }
 
 // reclaimed is the `reclaimed` field: a program gets the pass, a person gets the bytes.

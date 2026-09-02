@@ -211,10 +211,17 @@ func removeModels(ctx *Context, tool *tfs.Tool, layout home.Layout, quiet bool) 
 		delete(held, ref.String())
 	}
 	removed.Aggregates = []output.Field{{K: "changed", V: len(removed.Rows) > 0}}
-	// Reclamation is part of the act: the name is gone, so its bytes go now. A store the
-	// byte plane will not sweep right now (a live holder) keeps the name removed and says
-	// what deferred it; `cozy model gc` finishes the job.
-	report, problem := tool.GC(quiet)
+	// Reclamation is part of the act: the name is gone, so its bytes go now — unless the
+	// daemon owes a request that may still be moving bytes into the store (a download's
+	// admitted objects are unnamed until its commit), or the byte plane names a live
+	// holder. Either keeps the name removed and says what deferred it; `cozy model gc`
+	// finishes the job.
+	if !quiet {
+		removed.Notes = []string{"reclamation deferred: an active request may still be moving bytes into the store"}
+		removed.Next = []string{"cozy model gc"}
+		return emit(ctx, removed)
+	}
+	report, problem := tool.GC(true)
 	if problem != nil {
 		removed.Notes = []string{"reclamation deferred: " + problem.Message}
 		removed.Next = []string{"cozy model gc"}
