@@ -328,6 +328,14 @@ func handleRm(ctx *Context) *exit.Error {
 			return problem
 		}
 		freed += n
+		// A reclaimed unpinned install is a removal the human sees too; without its row
+		// the verb reported "No packages found." and changed: false while deleting it.
+		removed.Rows = append(removed.Rows, map[string]string{
+			"package":    superseded.Package,
+			"major":      fmt.Sprintf("v%d", superseded.Major),
+			"install_id": superseded.ID,
+			"reclaimed":  output.Bytes(n),
+		})
 	}
 	unlockPrivate := privatepackage.Guard()
 	privateProblem := privatepackage.Sweep(l, st)
@@ -343,6 +351,11 @@ func handleRm(ctx *Context) *exit.Error {
 	// the daemon retires only workers it can prove idle.
 	w.Unlock()
 	st.Close()
+	state, _, problem := ensureDaemon(ctx)
+	if problem != nil {
+		return problem
+	}
+	ctx.Daemon = state
 	client, problem := dial(ctx)
 	if problem == nil {
 		unloaded, unloadProblem := client.Unload()
