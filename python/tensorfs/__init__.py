@@ -45,8 +45,12 @@ from ._ext import (
     ReadPlan,
     Store,
     __version__,
+    capability,
+    config_digest,
+    digests,
     dtypes,
     doc_kinds,
+    fit,
     fetch_admit,
     fetch_complete,
     fetch_plan,
@@ -62,8 +66,8 @@ from ._ext import (
     render,
     run_doc,
     seed_digests,
+    shape_digest,
     topology_digest,
-    topology_shape_digest,
     transfer_object,
     transfer_manifest,
 )
@@ -71,15 +75,28 @@ from ._ext import (
 
 @dataclass(frozen=True)
 class CodeTensor:
+    """One destination the factory constructs: its shape, constructed dtype, which stored
+    encodings it accepts (`"any"` under ``encoded_leaves="accept"``, a digest list
+    otherwise), and whether the dtype is PINNED (an integer buffer, an fp32 island)."""
+
     component: str
     key: str
     dtype: str
     shape: Sequence[int]
     accepts: Literal["any"] | Sequence[str]
+    pinned: bool = False
 
 
-def code_topology(contract_digest: str, tensors: Sequence[CodeTensor]) -> bytes:
-    """Author canonical CodeTopology bytes from exact projected logical tensors."""
+def code_topology(
+    contract_digest: str,
+    tensors: Sequence[CodeTensor],
+    constructed_components: Sequence[str] | None = None,
+) -> bytes:
+    """Author canonical CodeTopology bytes from the meta-device census rows.
+
+    `constructed_components` is the factory's construction order (D9); it defaults to the
+    order the components first appear in `tensors`.
+    """
     rows = [
         (
             tensor.component,
@@ -87,10 +104,13 @@ def code_topology(contract_digest: str, tensors: Sequence[CodeTensor]) -> bytes:
             tensor.dtype,
             list(tensor.shape),
             None if tensor.accepts == "any" else list(tensor.accepts),
+            bool(tensor.pinned),
         )
         for tensor in tensors
     ]
-    return _code_topology(contract_digest, rows)
+    if constructed_components is None:
+        constructed_components = list(dict.fromkeys(tensor.component for tensor in tensors))
+    return _code_topology(contract_digest, rows, list(constructed_components))
 
 #: The closed carrier/logical dtype enum and its element sizes. The ONE export of dtype
 #: knowledge: a consumer sizing a `torch.frombuffer` reads it from here, never from a
@@ -108,9 +128,13 @@ __all__ = [
     "ReadPlan",
     "Store",
     "__version__",
+    "capability",
     "code_topology",
+    "config_digest",
+    "digests",
     "dtypes",
     "doc_kinds",
+    "fit",
     "errors",
     "fetch_admit",
     "fetch_complete",
@@ -127,8 +151,8 @@ __all__ = [
     "render",
     "run_doc",
     "seed_digests",
+    "shape_digest",
     "topology_digest",
-    "topology_shape_digest",
     "transfer_object",
     "transfer_manifest",
 ]

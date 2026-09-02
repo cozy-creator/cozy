@@ -4,9 +4,9 @@
 //!
 //! * **Filenames never authorize.** Nothing here reads a path. A verdict comes from the KEY
 //!   SET and the shapes, which are the only things a publisher cannot rename away.
-//! * **A registry entry is platform-reviewed DATA, not uploader input.** Entries use the
-//!   same closed provenance rule as tfs-008's structure fixtures: a
-//!   `real` claim without its source digest is an unfalsifiable claim and refuses.
+//! * **A registry entry is platform-reviewed DATA, not uploader input.** Entries carry a
+//!   closed provenance: a `real` claim without its source digest is an unfalsifiable claim
+//!   and refuses.
 //! * **Surviving ambiguity refuses loudly.** Two entries matching one carrier is not a
 //!   tiebreak, it is a review defect; the border names both and stops.
 //! * **A key set does not name a component.** MiniMax-H3 ships `transformer` and
@@ -15,15 +15,28 @@
 //!   The component the caller declares participates in the match, and a key set banked
 //!   only under other components refuses by naming them.
 
+use super::carrier::SourceHeader;
 use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Result};
 use crate::header::{topology_digest_of, topology_value};
 use crate::ids::{ascii_name, hex64, object_id, prefixed};
 use crate::limits;
-use crate::structure::{Provenance, REAL, SYNTHETIC};
 
-use super::carrier::SourceHeader;
+/// Where a banked entry's shapes came from. Closed: `real` or `synthetic`, never absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    pub kind: String,
+    /// Human-readable name of the source artifact.
+    pub source: String,
+    /// sha256 of the exact source bytes. REQUIRED when `kind` is `real`.
+    pub source_sha256: Option<String>,
+    /// What was derived rather than read — the honest part.
+    pub note: String,
+}
+
+pub const REAL: &str = "real";
+pub const SYNTHETIC: &str = "synthetic";
 
 // ---------------------------------------------------------------- foreign quant markers
 
@@ -93,9 +106,10 @@ pub fn refuse_bnb<T>(key: &str) -> Result<T> {
 // ---------------------------------------------------------------- the computed fingerprint
 
 /// The observation, computed from the header alone. `keyset_digest` is deliberately
-/// shape-free: it answers "which architecture is this", and stays stable across a family's
-/// resolutions and precisions. `topology_digest` is the exact artifact, in the SAME digest
-/// space as a banked structure fixture and a real header's projection.
+/// shape-free: it answers "which carrier dialect is this", and stays stable across a
+/// family's resolutions and precisions. `topology_digest` is the exact artifact, in the
+/// same digest space as a real header's projection. Neither is a compatibility claim —
+/// that is `fit`'s question, asked of the canonical header, never of a source carrier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fingerprint {
     /// What the caller is ingesting this carrier AS. Carried on the observation rather than
@@ -165,8 +179,6 @@ pub fn fingerprint(component: &str, h: &SourceHeader) -> Result<Fingerprint> {
 pub struct Banked {
     pub keyset_digest: String,
     pub dialect: String,
-    pub task_family: String,
-    pub structural_variant: String,
     pub component: String,
     /// The named reviewed converter this dialect binds to (see `convert::CONVERTERS`).
     pub converter: String,
@@ -217,7 +229,7 @@ pub enum Verdict {
     /// set ALONE cannot decide — it is banked under the components named here — so this is
     /// a typed ambiguity, not an absence: the remedy is a review act, not a rename.
     ComponentAmbiguous {
-        /// `task_family/structural_variant as <component>` for every entry on this key set.
+        /// `<keyset> as <component> via <dialect>` for every entry on this key set.
         banked_as: Vec<String>,
     },
     /// More than one entry banks the same (key set, component): a review defect, refused
@@ -230,8 +242,10 @@ pub enum Verdict {
 
 fn name_of(e: &Banked) -> String {
     format!(
-        "{}/{} as {} via {}",
-        e.task_family, e.structural_variant, e.component, e.dialect
+        "{} as {} via {}",
+        &e.keyset_digest[..19],
+        e.component,
+        e.dialect
     )
 }
 
@@ -474,8 +488,6 @@ impl FingerprintRegistry {
             let keyset_digest = crate::ids::prefixed("keyset_digest", e.req_str("keyset_digest")?)?;
             let logical_keys = e.req_uint("logical_keys")?;
             let provenance = provenance_from(e.req("provenance")?)?;
-            let structural_variant = e.req_str("structural_variant")?.to_string();
-            let task_family = e.req_str("task_family")?.to_string();
             let topology_digest =
                 crate::ids::prefixed("topology_digest", e.req_str("topology_digest")?)?;
             e.done()?;
@@ -483,16 +495,12 @@ impl FingerprintRegistry {
                 ("component", &component),
                 ("converter", &converter),
                 ("dialect", &dialect),
-                ("task_family", &task_family),
-                ("structural_variant", &structural_variant),
             ] {
                 ascii_name(what, s, limits::MAX_NAME_BYTES)?;
             }
             entries.push(Banked {
                 keyset_digest,
                 dialect,
-                task_family,
-                structural_variant,
                 component,
                 converter,
                 topology_digest,
@@ -568,11 +576,6 @@ impl FingerprintRegistry {
                             ("keyset_digest", Value::str(e.keyset_digest.clone())),
                             ("logical_keys", Value::uint(e.logical_keys)),
                             ("provenance", provenance_value(&e.provenance)),
-                            (
-                                "structural_variant",
-                                Value::str(e.structural_variant.clone()),
-                            ),
-                            ("task_family", Value::str(e.task_family.clone())),
                             ("topology_digest", Value::str(e.topology_digest.clone())),
                         ])
                     })
@@ -961,8 +964,6 @@ mod tests {
             entries: vec![Banked {
                 keyset_digest: object_id(b"keys"),
                 dialect: "safetensors.diffusers".into(),
-                task_family: "test".into(),
-                structural_variant: "minimal".into(),
                 component: "model".into(),
                 converter: "identity/1".into(),
                 topology_digest: object_id(b"topology"),

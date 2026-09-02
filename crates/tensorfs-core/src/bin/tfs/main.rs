@@ -19,13 +19,12 @@
 //!   tfs fill <root> <plan>       resumable fill: skip only verified objects
 //!   tfs bench-store <root>       put/read/range/rehash throughput + peak RSS
 //!
-//! Structure fixtures (tfs-008). Flags: --provenance real|synthetic --source <name>
-//! --source-sha256 <hex> --note <text>
+//! Fit (tfs-042): the ONE code <-> checkpoint matching function. Exit 0 on `ok`, one
+//! distinct code per refusal (10..16, see `Fit::exit_code`); `--json` prints the machine
+//! document.
 //!
-//!   tfs structure bank <rows> <family> <variant>        bank TRANSCRIBED evidence rows
-//!   tfs structure bank-header <root> <hex> <fam> <var>  bank from a live header
-//!   tfs structure list                                  the bank, with provenance
-//!   tfs structure match <root> <hex>                    does this checkpoint match one?
+//!   tfs fit <code-topology.json> <root> <header> [--custody canonical|local]
+//!       [--device <class> --observations <obs.json>] [--json]
 //!
 //! Qualification (tfs-008): what an (encoding, device) pair is QUALIFIED to execute.
 //! FAIL-CLOSED -- an absent pair refuses, because an unrecognised device is the absence of
@@ -44,6 +43,7 @@
 //!   tfs manifest inspect <manifest.json> --refs <jsonl>
 //!   tfs repo inspect <repo.json> --rows <jsonl>
 //!   tfs repo list <store> --rows <jsonl>     every release lane, with its checkpoint evidence
+//!   tfs repo migrate <store>                 re-derive every checkpoint row's digests from its header
 //!   tfs repo usage <store> --rows <jsonl>    blob bytes per repo: total, and unique to it
 //!   tfs repo apply <current.json|-> <mutation.json> --out <replacement> --rows <jsonl>
 //!                  put_checkpoint requires --manifest, --header and --inventory
@@ -65,7 +65,6 @@
 //!   tfs checkpoint read <root> <hex>         reconstruct every part, byte-identity checked
 //!   tfs checkpoint info <root> <hex>         component/scope query, zero tensor-byte reads
 //!   tfs checkpoint locate <root> <hex> <component> <key> <role> <off> <len>
-//!   tfs checkpoint admit <root> <hex>        serving admission against the local pin
 //!   tfs checkpoint reproduce <root> <header.json> <entries.json>
 //!                                            verified refs -> canonical header + manifest
 //!   tfs checkpoint caps                      whole-document total caps, armed live
@@ -95,9 +94,9 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use tensorfs_core::canon;
-use tensorfs_core::compat::{self, Accepts, CodeTopology, CompatibilityReport, Lane, Requirement};
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::err::Refusal;
+use tensorfs_core::fit::{self, Accepts, CodeTopology, CompatibilityReport, Custody, Requirement};
 use tensorfs_core::grade::{self, ConversionRegistration, Mapping};
 use tensorfs_core::header::{Asset, Body, Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef, Plain};
@@ -117,8 +116,8 @@ type TfsResult<T> = tensorfs_core::err::Result<T>;
 ///
 /// FLAG values are deliberately untouched: `--pin` and its kind already take the prefixed
 /// spelling on the way in, so they were never the inconsistent half, and rewriting them
-/// broke `verify-compat` the first time this was applied to the whole argv. And only the
-/// CLI is loosened either way — a canonical DOCUMENT still holds each field to its one
+/// broke a flag-carried digest the first time this was applied to the whole argv. And only
+/// the CLI is loosened either way — a canonical DOCUMENT still holds each field to its one
 /// spelling, which is what keeps digests stable.
 fn accept_printed_ids(args: Vec<String>) -> Vec<String> {
     args.into_iter()
@@ -156,19 +155,11 @@ fn main() -> ExitCode {
             len.parse().unwrap_or(0),
             &flags,
         ),
-        ["checkpoint", "admit", r, h] => ckpt::cmd_admit(Path::new(r), h, &flags),
         ["conform"] => conform::cmd_conform(None, &flags),
         ["conform", w] => conform::cmd_conform(Some(w), &flags),
         ["capability", e, d] => conform::cmd_capability(e, d, &flags),
         ["vectors", "mine", rows, name] => conform::cmd_mine(Path::new(rows), name, &flags),
-        ["structure", "bank", rows, fam, var] => {
-            fixtures::cmd_bank_rows(Path::new(rows), fam, var, &flags)
-        }
-        ["structure", "bank-header", r, h, fam, var] => {
-            fixtures::cmd_bank_header(Path::new(r), h, fam, var, &flags)
-        }
-        ["structure", "list"] => fixtures::cmd_list(),
-        ["structure", "match", r, h] => fixtures::cmd_match(Path::new(r), h),
+        ["fit", c, r, h] => layout::cmd_fit(Path::new(c), Path::new(r), h, &flags),
         ["manifest", "show", r, h] => snap::cmd_show(Path::new(r), h),
         ["manifest", "get", r, h] => snap::cmd_get(Path::new(r), h, &flags),
         ["manifest", "admit", r, p] => snap::cmd_admit(Path::new(r), Path::new(p), &flags),
@@ -181,6 +172,7 @@ fn main() -> ExitCode {
         ["manifest", "inspect", p] => repo::cmd_manifest_inspect(Path::new(p), &flags),
         ["repo", "inspect", p] => repo::cmd_repo_inspect(Path::new(p), &flags),
         ["repo", "list", r] => repo::cmd_repo_list(Path::new(r), &flags),
+        ["repo", "migrate", r] => repo::cmd_repo_migrate(Path::new(r), &flags),
         ["repo", "usage", r] => repo::cmd_repo_usage(Path::new(r), &flags),
         ["repo", "get", r, org, name] => repo::cmd_repo_get(Path::new(r), org, name, &flags),
         ["repo", "apply", current, mutation] => {
@@ -203,7 +195,7 @@ fn main() -> ExitCode {
         ["gguf", "admit", f] => ingest::cmd_gguf_plan(Path::new(f), true, &flags),
         ["ingest", "converters"] => ingest::cmd_converters(),
         ["ingest", "golden"] => ingest::cmd_golden(),
-        ["ingest", "bank", dia, fam, var, conv] => ingest::cmd_bank(dia, fam, var, conv, &flags),
+        ["ingest", "bank", dia, conv] => ingest::cmd_bank(dia, conv, &flags),
         ["ingest", "source-members", profiles @ ..] => ingest::cmd_source_members(profiles, &flags),
         ["ingest", "source-plan"] => ingest::cmd_source_plan(&flags),
         ["ingest", "plan"] => match flag(&flags, "source-plan") {
@@ -269,11 +261,6 @@ fn main() -> ExitCode {
         ["grade", "serve"] => layout::cmd_grade_stream(None, &flags),
         ["grade", r] => layout::cmd_grade(Path::new(r), &flags),
         ["grade", "register", n, k, s] => layout::cmd_register(n, k, s, &flags),
-        ["verify-request", c, h] => layout::cmd_request(Path::new(c), Path::new(h), &flags),
-        ["verify-compat", "serve"] => layout::cmd_verify_stream(None),
-        ["verify-compat", "batch", p] => layout::cmd_verify_stream(Some(Path::new(p))),
-        ["verify-compat", q, o] => layout::cmd_verify(Path::new(q), Path::new(o), &flags),
-        ["verify-consume", q, o] => layout::cmd_consume(Path::new(q), Path::new(o)),
         ["registry"] => cmd_registry(),
         ["vectors", "gen"] => cmd_gen(&default_dir()),
         ["vectors", "gen", dir] => cmd_gen(Path::new(dir)),
@@ -341,7 +328,6 @@ macro_rules! ok {
 mod ckpt;
 mod conform;
 mod fetch;
-mod fixtures;
 mod ingest;
 mod layout;
 mod rd;
@@ -925,6 +911,9 @@ struct LayoutPlane {
     worst_first: CompatibilityReport,
     recast: CodeTopology,
     recast_report: CompatibilityReport,
+    /// The planted contract behind `worst_*`: a dtype cast on the first key and a shape
+    /// edit on the last, the `tfs fit` shape-mismatch arm.
+    worst: CodeTopology,
     /// The CONVERTIBLE arm: every required dtype widened to f32, which the registered
     /// lossless bf16 -> f32 mapping closes. CONVERTIBLE is the only grade that populates
     /// `remedy_registration` and `remedy_mapping`, and tensorhub reads both, so the machine
@@ -934,7 +923,7 @@ struct LayoutPlane {
 
 fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
     let code = CodeTopology {
-        contract: tensorfs_core::ids::object_id(b"ModelConstructionContract:corpus"),
+        contract: tensorfs_core::ids::object_id(b"CodeTopology:corpus"),
         components: h
             .components
             .iter()
@@ -949,6 +938,7 @@ fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
                                     dtype: t.dtype,
                                     shape: t.shape.clone(),
                                     accepts: Accepts::Any,
+                                    pinned: false,
                                 },
                             )
                         })
@@ -956,18 +946,18 @@ fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
                 )
             })
             .collect(),
+        constructed_components: h.components.iter().map(|(c, _)| c.clone()).collect(),
     };
     let pin: Vec<String> = h.encodings.iter().map(EncodingSpec::object_id).collect();
-    let out = compat::check_compatibility(
+    let out = fit::check_compatibility(
         &code,
         h,
         closure,
         &pin,
-        Lane::Canonical,
-        &[],
-        compat::Depth::Full,
+        Custody::Canonical,
+        fit::Depth::Full,
     )?;
-    let report = CompatibilityReport::of(&code, h, Lane::Canonical, &out)?;
+    let report = CompatibilityReport::of(&code, h, Custody::Canonical, &out)?;
     let reg = ConversionRegistration::register(
         "bf16-to-f32",
         Mapping::Widen {
@@ -999,10 +989,14 @@ fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
     worst.components[last].1[tail].1.shape = vec![7];
 
     let mut reports = Vec::new();
-    for depth in [compat::Depth::Full, compat::Depth::FirstMismatch] {
-        let out =
-            compat::check_compatibility(&worst, h, closure, &pin, Lane::Canonical, &[], depth)?;
-        reports.push(CompatibilityReport::of(&worst, h, Lane::Canonical, &out)?);
+    for depth in [fit::Depth::Full, fit::Depth::FirstMismatch] {
+        let out = fit::check_compatibility(&worst, h, closure, &pin, Custody::Canonical, depth)?;
+        reports.push(CompatibilityReport::of(
+            &worst,
+            h,
+            Custody::Canonical,
+            &out,
+        )?);
     }
     let first_fact = reports.pop().unwrap();
     let whole_set = reports.pop().unwrap();
@@ -1020,16 +1014,15 @@ fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
             r.dtype = Dtype::F8E4M3FN;
         }
     }
-    let out = compat::check_compatibility(
+    let out = fit::check_compatibility(
         &recast,
         h,
         closure,
         &pin,
-        Lane::Canonical,
-        &[],
-        compat::Depth::Full,
+        Custody::Canonical,
+        fit::Depth::Full,
     )?;
-    let recast_report = CompatibilityReport::of(&recast, h, Lane::Canonical, &out)?;
+    let recast_report = CompatibilityReport::of(&recast, h, Custody::Canonical, &out)?;
 
     // THE CONVERTIBLE ARM. Same shape as the recast above, widened the other way: every
     // required dtype becomes f32, so the gap is exactly the lossless cast `reg` registers.
@@ -1039,16 +1032,15 @@ fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
             r.dtype = Dtype::F32;
         }
     }
-    let out = compat::check_compatibility(
+    let out = fit::check_compatibility(
         &widen,
         h,
         closure,
         &pin,
-        Lane::Canonical,
-        &[],
-        compat::Depth::Full,
+        Custody::Canonical,
+        fit::Depth::Full,
     )?;
-    let widen_report = CompatibilityReport::of(&widen, h, Lane::Canonical, &out)?;
+    let widen_report = CompatibilityReport::of(&widen, h, Custody::Canonical, &out)?;
     Ok(LayoutPlane {
         code,
         report,
@@ -1057,6 +1049,7 @@ fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
         worst_first: first_fact,
         recast,
         recast_report,
+        worst,
         widen_report,
     })
 }
@@ -1292,6 +1285,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         worst_first,
         recast,
         recast_report,
+        worst,
         widen_report,
     } = layout_plane_docs(&ha, &closure)?;
     cases.push(ok_case(
@@ -1299,14 +1293,15 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "code-topology",
         "code_topology",
         code.canonical_bytes(),
-        "the bounded projection of a ModelConstructionContract",
+        "the meta-device census of factory(config), projected: accepts, pinned dtypes, \
+         constructed components",
     ));
     cases.push(ok_case(
         "layout",
         "report-satisfied",
         "compat_report",
         report.canonical_bytes(),
-        "Satisfied, with the component-granular encoding facts grading needs",
+        "no fact recorded, with the component-granular encoding facts grading needs",
     ));
     // tfs-037. Two reports, ONE contract, one checkpoint: the only difference is how far
     // the walk went, and it is the difference between offering a conversion and refusing
@@ -1367,15 +1362,27 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     ));
     cases.push(red_case(
         "layout-red",
-        "third-verdict",
+        "third-custody",
         "compat_report",
         sub(
             &report.canonical_bytes(),
-            "\"t\":\"satisfied\"",
-            "\"t\":\"derivable\"",
+            "\"custody\":\"canonical\"",
+            "\"custody\":\"borrowed\"",
         ),
         "UNKNOWN_FIELD",
-        "a third satisfaction verdict below the hub",
+        "a third custody: canonical and local are the closed set (D5)",
+    ));
+    cases.push(red_case(
+        "layout-red",
+        "unconstructed-component",
+        "code_topology",
+        sub(
+            &code.canonical_bytes(),
+            "\"constructed_components\":[",
+            "\"constructed_components\":[\"ghost\",",
+        ),
+        "MISSING_COMPONENT",
+        "constructed_components names exactly the components the topology carries",
     ));
     cases.push(red_case(
         "layout-red",
@@ -1542,6 +1549,28 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
             "machine_grade",
             tensorfs_core::machine::grade_json(&decision, source),
             note,
+        ));
+    }
+    // `tfs fit --json` (tfs-042): the one code <-> checkpoint answer, frozen on the ok arm
+    // and on a planted shape edit so the eight-code vocabulary and its §3 text are held.
+    {
+        let ok = fit::fit(&code, &ha, Custody::Canonical, Some("cpu"), None)?;
+        cases.push(ok_case(
+            "machine",
+            "fit-ok",
+            "machine_fit",
+            tensorfs_core::machine::fit_json(&ok, Custody::Canonical),
+            "the code constructs exactly what the checkpoint carries: `ok`, routes counted, \
+             encoded leaves qualified on the device asked about",
+        ));
+        let planted = fit::fit(&worst, &ha, Custody::Canonical, None, None)?;
+        cases.push(ok_case(
+            "machine",
+            "fit-shape-mismatch",
+            "machine_fit",
+            tensorfs_core::machine::fit_json(&planted, Custody::Canonical),
+            "rule (2) before rule (3): the planted shape edit answers even though a dtype \
+             cast comes first in walk order",
         ));
     }
     {
@@ -2217,14 +2246,14 @@ fn cmd_gen(dir: &Path) -> ExitCode {
             if c.doc == "header" {
                 let h = Header::parse(&c.bytes).unwrap();
                 v += &format!("topology: {}\n", h.topology_digest());
-                v += &format!("shape: {}\n", h.topology_shape_digest());
+                v += &format!("shape: {}\n", h.shape_digest());
             }
             // tfs-038: the code side freezes BOTH projections too, so a dtype-only recast
             // of one contract is provably the same shape bucket and a different exact one.
             if c.doc == "code_topology" {
-                let code = tensorfs_core::compat::CodeTopology::parse(&c.bytes).unwrap();
+                let code = tensorfs_core::fit::CodeTopology::parse(&c.bytes).unwrap();
                 v += &format!("topology: {}\n", code.topology_digest());
-                v += &format!("shape: {}\n", code.topology_shape_digest());
+                v += &format!("shape: {}\n", code.shape_digest());
             }
             if c.doc == "manifest" {
                 let m = Manifest::parse(&c.bytes).unwrap();

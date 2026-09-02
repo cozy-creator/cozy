@@ -22,7 +22,7 @@
 
 use crate::canon::{write, Value};
 use crate::capability::CapabilityRecord;
-use crate::compat::{CompatibilityReport, Side};
+use crate::fit::{CompatibilityReport, Fit, Side};
 use crate::ids::Plain;
 
 #[cfg(feature = "grade")]
@@ -79,13 +79,78 @@ pub const CAPABILITY_KEYS: &[&str] = &[
     "vectors",
 ];
 
+/// `tfs fit ... --json` (tfs-042). TOTAL like the rest: `component`, `key`, `encoding` and
+/// `device` are empty where the code does not name one, and `routes` and `ignored` carry
+/// zeros and an empty list off every refusal.
+pub const FIT_KEYS: &[&str] = &[
+    "code",
+    "component",
+    "custody",
+    "detail",
+    "device",
+    "encoding",
+    "ignored",
+    "key",
+    "routes",
+];
+
 /// The surfaces, by the corpus doc kind that verifies them. `corpus::run_doc` reads this,
 /// so a new surface is one row here and one frozen vector — never a second dispatch.
 pub const SURFACES: &[(&str, &[&str])] = &[
     ("machine_check", CHECK_KEYS),
     ("machine_grade", GRADE_KEYS),
     ("machine_capability", CAPABILITY_KEYS),
+    ("machine_fit", FIT_KEYS),
 ];
+
+/// `tfs fit --json`: the one Fit code, its §3 text, and the fields the text was built
+/// from, so a caller branches on `code` and prints `detail` without re-deriving either.
+pub fn fit_json(fit: &Fit, custody: crate::fit::Custody) -> Vec<u8> {
+    let (component, key, encoding, device) = match fit {
+        Fit::Ok { device, .. } => ("", "", "", device.as_deref().unwrap_or("")),
+        Fit::ComponentMissing { component, .. } => (component.as_str(), "", "", ""),
+        Fit::TensorMissing { component, key }
+        | Fit::ShapeMismatch { component, key, .. }
+        | Fit::DtypePinnedMismatch { component, key, .. }
+        | Fit::ExtraTensor { component, key } => (component.as_str(), key.as_str(), "", ""),
+        Fit::EncodingUnsupported {
+            component,
+            key,
+            encoding,
+            ..
+        } => (component.as_str(), key.as_str(), encoding.as_str(), ""),
+        Fit::EncodingUnqualified {
+            encoding, device, ..
+        } => ("", "", encoding.as_str(), device.as_str()),
+    };
+    let (routes, ignored) = match fit {
+        Fit::Ok {
+            routes, ignored, ..
+        } => (routes.clone(), ignored.clone()),
+        _ => (crate::fit::Routes::default(), Vec::new()),
+    };
+    write(&Value::obj(vec![
+        ("code", Value::str(fit.code())),
+        ("component", Value::str(component)),
+        ("custody", Value::str(custody.name())),
+        ("detail", Value::str(fit.text())),
+        ("device", Value::str(device)),
+        ("encoding", Value::str(encoding)),
+        (
+            "ignored",
+            Value::arr(ignored.into_iter().map(Value::str).collect()),
+        ),
+        ("key", Value::str(key)),
+        (
+            "routes",
+            Value::obj(vec![
+                ("decoded_float", Value::uint(routes.decoded_float)),
+                ("encoded_gemm", Value::uint(routes.encoded_gemm)),
+                ("verbatim", Value::uint(routes.verbatim)),
+            ]),
+        ),
+    ]))
+}
 
 /// One side of a disagreement, rendered for a person reading the machine document. The
 /// consumer treats it as opaque text; it is here so the two callers cannot render it two
@@ -165,11 +230,11 @@ pub fn check_json(report: &CompatibilityReport) -> Vec<u8> {
         ),
         (
             "topology_shape_required",
-            Value::str(report.topology_shape_required.clone()),
+            Value::str(report.shape_required.clone()),
         ),
         (
             "topology_shape_present",
-            Value::str(report.topology_shape_present.clone()),
+            Value::str(report.shape_present.clone()),
         ),
     ]))
 }
@@ -328,11 +393,11 @@ mod surface {
             header: crate::ids::object_id(b"header"),
             topology_required: crate::ids::object_id(b"required"),
             topology_present: crate::ids::object_id(b"present"),
-            topology_shape_required: crate::ids::object_id(b"shape-required"),
-            topology_shape_present: crate::ids::object_id(b"shape-present"),
-            lane: crate::compat::Lane::Canonical,
-            depth: crate::compat::Depth::Full,
-            mismatches: vec![crate::compat::Details {
+            shape_required: crate::ids::object_id(b"shape-required"),
+            shape_present: crate::ids::object_id(b"shape-present"),
+            custody: crate::fit::Custody::Canonical,
+            depth: crate::fit::Depth::Full,
+            mismatches: vec![crate::fit::Details {
                 code: crate::err::Code::DTYPE_MISMATCH,
                 component: "transformer".to_string(),
                 key: "blocks.0.attn.to_q.weight".to_string(),
@@ -392,6 +457,22 @@ mod surface {
         let no = capability_json(None, &enc, "cuda.sm89", &refusal.detail, &["cpu"]);
         assert_eq!(keys(&yes), CAPABILITY_KEYS);
         assert_eq!(keys(&no), CAPABILITY_KEYS);
+        let ok = Fit::Ok {
+            routes: crate::fit::Routes::default(),
+            ignored: vec!["unet/extra".to_string()],
+            device: Some("sm89".to_string()),
+        };
+        let no = Fit::ShapeMismatch {
+            component: "unet".to_string(),
+            key: "conv_in.weight".to_string(),
+            code: vec![320, 4, 3, 3],
+            checkpoint: vec![320, 9, 3, 3],
+        };
+        assert_eq!(keys(&fit_json(&ok, crate::fit::Custody::Local)), FIT_KEYS);
+        assert_eq!(
+            keys(&fit_json(&no, crate::fit::Custody::Canonical)),
+            FIT_KEYS
+        );
     }
 
     /// The same assertion for the grading surface, on every one of the four grades — the

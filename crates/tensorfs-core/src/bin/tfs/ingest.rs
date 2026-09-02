@@ -36,6 +36,7 @@ use tensorfs_core::ingest::convert::{self, Class, Effect, Rekey, Source, Target}
 use tensorfs_core::ingest::fingerprint::{
     self, Banked, FingerprintRegistry, SourceProfile, SourceProfileComponent, SourceProfileVariant,
 };
+use tensorfs_core::ingest::fingerprint::{Provenance, REAL};
 use tensorfs_core::ingest::source as source_core;
 use tensorfs_core::ingest::stamp::{self, Stamp};
 use tensorfs_core::ingest::transaction::{self as tx};
@@ -44,7 +45,6 @@ use tensorfs_core::limits;
 use tensorfs_core::manifest::{Draft, Entry};
 use tensorfs_core::registry;
 use tensorfs_core::store::{Progress, Store};
-use tensorfs_core::structure::{Provenance, REAL};
 
 use crate::watch::{self, Verdict, PROGRESS_PREFIX};
 use crate::{bail, flag, flag_num, flag_on, rss_kb, Flags};
@@ -364,8 +364,8 @@ pub fn cmd_inspect(f: &Flags) -> ExitCode {
             None => println!("  verdict      (no registry loaded)"),
             Some(r) => match r.classify(&fp) {
                 fingerprint::Verdict::Authorized(b) => println!(
-                    "  verdict      AUTHORIZED {}/{} via {} -> {}",
-                    b.task_family, b.structural_variant, b.dialect, b.converter
+                    "  verdict      AUTHORIZED {} via {} -> {}",
+                    b.component, b.dialect, b.converter
                 ),
                 fingerprint::Verdict::ComponentAmbiguous { banked_as } => println!(
                     "  verdict      AMBIGUOUS — this key set is reviewed, but not as \
@@ -396,13 +396,7 @@ pub fn cmd_inspect(f: &Flags) -> ExitCode {
 
 /// Bank a reviewed registry entry. This is the REVIEW ACT, performed by a platform operator
 /// against bytes they have in hand — never by an uploader and never from a filename.
-pub fn cmd_bank(
-    dialect: &str,
-    family: &str,
-    variant: &str,
-    converter: &str,
-    f: &Flags,
-) -> ExitCode {
+pub fn cmd_bank(dialect: &str, converter: &str, f: &Flags) -> ExitCode {
     let srcs = match sources(f) {
         Ok(s) => s,
         Err(c) => return c,
@@ -440,8 +434,6 @@ pub fn cmd_bank(
         reg.merge(Banked {
             keyset_digest: fp.keyset_digest.clone(),
             dialect: dialect.to_string(),
-            task_family: family.to_string(),
-            structural_variant: variant.to_string(),
             component: component.clone(),
             converter: converter.to_string(),
             topology_digest: fp.topology_digest.clone(),
@@ -1028,8 +1020,8 @@ pub fn cmd_plan(target: &str, f: &Flags) -> ExitCode {
     }
     for (i, b) in p.verdicts.iter().enumerate() {
         println!(
-            "verdict      {} -> {}/{} via {} ({} keys)",
-            b.component, b.task_family, b.structural_variant, b.dialect, p.fps[i].logical_keys
+            "verdict      {} via {} -> {} ({} keys)",
+            b.component, b.dialect, b.converter, p.fps[i].logical_keys
         );
     }
     print_plan(&p);

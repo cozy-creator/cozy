@@ -54,6 +54,7 @@ pub const DOC_KINDS: &[&str] = &[
     "machine_check",
     "machine_grade",
     "machine_capability",
+    "machine_fit",
     #[cfg(feature = "grade")]
     "conversion_registration",
     #[cfg(feature = "grade")]
@@ -71,21 +72,13 @@ pub fn run_doc(
     let (topology, shape, manifest) = match doc {
         "header" => Header::parse(bytes).and_then(|h| {
             h.validate(closure)?;
-            Ok((
-                Some(h.topology_digest()),
-                Some(h.topology_shape_digest()),
-                None,
-            ))
+            Ok((Some(h.topology_digest()), Some(h.shape_digest()), None))
         })?,
         // Serving admission is a SECOND gate over the same bytes: `header` says the document
         // is valid data, `header-serving` says this runtime may execute it.
         "header-serving" => Header::parse(bytes).and_then(|h| {
             h.admit_for_serving(closure, platform)?;
-            Ok((
-                Some(h.topology_digest()),
-                Some(h.topology_shape_digest()),
-                None,
-            ))
+            Ok((Some(h.topology_digest()), Some(h.shape_digest()), None))
         })?,
         "encoding" => EncodingSpec::decode_nested(bytes).map(|_| (None, None, None))?,
         "vectors" => EncodingVectors::parse_fixture(bytes).and_then(|v| {
@@ -110,23 +103,18 @@ pub fn run_doc(
         "stamp" => crate::ingest::stamp::Stamp::parse(bytes).map(|_| (None, None, None))?,
         // The layout plane's documents (tfs-009). A code topology projects to the SAME
         // frozen projection a header does, so its digest is reported here too.
-        "code_topology" => crate::compat::CodeTopology::parse(bytes).map(|c| {
-            (
-                Some(c.topology_digest()),
-                Some(c.topology_shape_digest()),
-                None,
-            )
-        })?,
+        "code_topology" => crate::fit::CodeTopology::parse(bytes)
+            .map(|c| (Some(c.topology_digest()), Some(c.shape_digest()), None))?,
         // The machine surfaces (proto-020). The document is a projection, not a stored
         // object, so there is no reader to round-trip it through: what a consumer needs
         // held is its KEY SET, and that is what this compares against the key list this
         // build's emitter compiles in. The refusal names tensorhub.
-        "machine_check" | "machine_grade" | "machine_capability" => {
+        "machine_check" | "machine_grade" | "machine_capability" | "machine_fit" => {
             crate::machine::check_surface(doc, bytes)?;
             (None, None, None)
         }
         "compat_report" => {
-            let report = crate::compat::CompatibilityReport::parse(bytes)?;
+            let report = crate::fit::CompatibilityReport::parse(bytes)?;
             #[cfg(feature = "grade")]
             {
                 grade = Some(

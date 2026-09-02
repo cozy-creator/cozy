@@ -1,4 +1,4 @@
 doc: machine_check
 expect: ok
-id: sha256:b0fa7ea8fe98386906a91d6deab43966ac1b1d2332bd52317a88548dfb568dd6
+id: sha256:3baaa94385895a79461e03398d9318b4c8f1a569b9babf563286bfe891e99730
 note: the same pair stopped at the first fact: one detail, `depth` first-mismatch

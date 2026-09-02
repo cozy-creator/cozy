@@ -762,7 +762,7 @@ fn execute_prepared(
     sources.sort();
     sources.dedup();
     let evidence = CheckpointEvidence {
-        classification_digest: outcome.header.topology_digest(),
+        digests: outcome.header.digests(),
         ingest: Some(IngestProvenance {
             source_dialect: prepared.conv.dialect.to_string(),
             converter_build: converter_build.clone(),
@@ -1035,12 +1035,7 @@ fn validate_prepared_result(store: &Store, source: &PreparedModelSource) -> Resu
         detail: "prepared model Manifest has no CozyTensors header".into(),
     })?;
     let header = crate::checkpoint::load_header(store, header_ref)?;
-    if evidence.classification_digest != header.topology_digest() {
-        return refuse(
-            Code::TOPOLOGY_MISMATCH,
-            "prepared CheckpointEvidence classification differs from its header",
-        );
-    }
+    crate::repository::require_digests(&evidence.digests, &header.digests())?;
     for (path, required) in evidence.required_files()? {
         if !manifest
             .entries()
@@ -1201,8 +1196,8 @@ pub fn release_model_source(store: &Store, operation_id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::catalog::Catalog;
+    use crate::ingest::fingerprint::{Provenance, REAL};
     use crate::storage::Census;
-    use crate::structure::{Provenance, REAL};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary(name: &str) -> PathBuf {
@@ -1238,8 +1233,6 @@ mod tests {
         let entry = Banked {
             keyset_digest: observed.keyset_digest.clone(),
             dialect: "safetensors.diffusers".into(),
-            task_family: "fixture".into(),
-            structural_variant: "one".into(),
             component: component.into(),
             converter: "diffusers.identity/1".into(),
             topology_digest: observed.topology_digest,

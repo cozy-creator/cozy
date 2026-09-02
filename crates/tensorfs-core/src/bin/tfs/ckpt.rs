@@ -543,13 +543,16 @@ pub fn cmd_read(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-// ------------------------------------------------------------------ info / locate / admit
+// ------------------------------------------------------------------ info / locate
 
 pub fn cmd_info(root: &Path, hex: &str) -> ExitCode {
     let (store, href) = opened!(root, hex);
     let header = ok!(ck::load_header(&store, &href));
     println!("header {} ({} B)", href.id(), href.length);
-    println!("topology_digest {}", header.topology_digest());
+    let digests = header.digests();
+    println!("topology_digest {}", digests.topology_digest);
+    println!("shape_digest    {}", digests.shape_digest);
+    println!("config_digest   {}", digests.config_digest);
     for (name, c) in &header.configs {
         println!(
             "config {name:<14} sha256:{} {} B {}",
@@ -649,29 +652,6 @@ pub fn cmd_locate(
         }
     }
     ExitCode::SUCCESS
-}
-
-pub fn cmd_admit(root: &Path, hex: &str, f: &Flags) -> ExitCode {
-    let (store, href) = opened!(root, hex);
-    let header = ok!(ck::load_header(&store, &href));
-    let closure = ok!(ck::load_closure(&store, &header));
-    let pin: Vec<String> = match flag(f, "pin") {
-        Some("empty") => Vec::new(),
-        Some(alias) => registry::seeds()
-            .iter()
-            .filter(|s| s.alias == alias)
-            .map(|s| s.spec.object_id())
-            .collect(),
-        None => registry::platform_digests(),
-    };
-    println!("local pin: {} aliased spec digests", pin.len());
-    match header.admit_for_serving(&closure, &pin) {
-        Ok(()) => {
-            println!("ADMITTED for serving: every cited spec digest carries a local alias");
-            ExitCode::SUCCESS
-        }
-        Err(e) => bail(e),
-    }
 }
 
 // ------------------------------------------------------------------ caps / size

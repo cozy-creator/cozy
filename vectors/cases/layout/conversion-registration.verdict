@@ -1,4 +1,4 @@
 doc: conversion_registration
 expect: ok
-id: sha256:a520caac04de0cd0bdf128a18c855e7ed26fa9024bceef9ebdfe6975fbde176a
+id: sha256:9a457ade6cbd92479891d70237fe0390bc69406ce27675b8d324491fd412617b
 note: a lossless widening, proved over the complete 16-bit domain

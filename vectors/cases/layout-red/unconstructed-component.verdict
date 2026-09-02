@@ -1,0 +1,4 @@
+doc: code_topology
+expect: refuse
+code: MISSING_COMPONENT
+note: constructed_components names exactly the components the topology carries

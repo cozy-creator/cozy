@@ -1,4 +1,4 @@
 doc: grade_decision
 expect: ok
-id: sha256:70f6c82d9fab36850e0e086262e22085183481a74645725f8f6a8e3c5dcfcde2
+id: sha256:8ace0d290e54811bd44b3601e6459c7270cd90ae98db4254577d90f41992c189
 note: the contract asks for exactly what is there

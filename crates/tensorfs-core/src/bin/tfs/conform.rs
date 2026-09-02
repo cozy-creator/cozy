@@ -596,7 +596,10 @@ pub fn cmd_mine(rows: &std::path::Path, name: &str, f: &Flags) -> ExitCode {
     if let Err(e) = EncodingVectors::parse_fixture(&bytes) {
         return bail(e);
     }
-    let d = crate::fixtures::dir().parent().unwrap().join("mined");
+    let d: std::path::PathBuf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../vectors/mined")
+        .components()
+        .collect();
     if let Err(e) = std::fs::create_dir_all(&d) {
         eprintln!("{}: {e}", d.display());
         return ExitCode::FAILURE;

@@ -7,9 +7,10 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tensorfs_core::canon::Value;
-use tensorfs_core::compat::{Accepts, CodeTopology, Requirement};
+use tensorfs_core::capability::CapabilityRecords;
 use tensorfs_core::corpus;
 use tensorfs_core::dtype::Dtype;
+use tensorfs_core::fit::{Accepts, CodeTopology, Custody, Requirement};
 use tensorfs_core::header::{Closure as CoreClosure, Header};
 use tensorfs_core::ids::{self, Doc, Plain};
 use tensorfs_core::manifest::Manifest;
@@ -18,15 +19,16 @@ use tensorfs_core::spec::EncodingSpec;
 
 use crate::errors::IntoPy;
 
-type CodeTensorRow = (String, String, String, Vec<u64>, Option<Vec<String>>);
+type CodeTensorRow = (String, String, String, Vec<u64>, Option<Vec<String>>, bool);
 
-/// Author one canonical CodeTopology from already-projected MCC logical tensors.
-/// TensorFS receives exact component/key fields; it never parses MCC or guesses prefixes.
+/// Author one canonical CodeTopology from the meta-device census rows. TensorFS receives
+/// exact component/key fields; it never runs package code or guesses prefixes.
 #[pyfunction(name = "_code_topology")]
 pub fn code_topology<'p>(
     py: Python<'p>,
     contract_digest: &str,
     tensors: Vec<CodeTensorRow>,
+    constructed_components: Vec<String>,
 ) -> PyResult<Bound<'p, PyBytes>> {
     if tensors.is_empty() {
         return tensorfs_core::err::refuse(
@@ -37,7 +39,7 @@ pub fn code_topology<'p>(
     }
     let mut components: Vec<(String, Vec<(String, Requirement)>)> = Vec::new();
     let mut prior: Option<(String, String)> = None;
-    for (component, key, dtype, shape, accepts) in tensors {
+    for (component, key, dtype, shape, accepts, pinned) in tensors {
         let identity = (component.clone(), key.clone());
         if prior.as_ref().is_some_and(|held| held >= &identity) {
             return tensorfs_core::err::refuse(
@@ -51,6 +53,7 @@ pub fn code_topology<'p>(
             dtype: Dtype::parse(&dtype).or_refuse(py)?,
             shape,
             accepts: accepts.map(Accepts::OneOf).unwrap_or(Accepts::Any),
+            pinned,
         };
         match components.last_mut() {
             Some((held, keys)) if held == &component => keys.push((key, requirement)),
@@ -60,10 +63,78 @@ pub fn code_topology<'p>(
     let topology = CodeTopology {
         contract: contract_digest.to_string(),
         components,
+        constructed_components,
     };
     let raw = topology.canonical_bytes();
     CodeTopology::parse(&raw).or_refuse(py)?;
     Ok(PyBytes::new(py, &raw))
+}
+
+/// `tensorfs.fit(code_topology, header, *, custody, device=None, observations=None)`:
+/// the one code <-> checkpoint answer (design §3), as the same total document `tfs fit
+/// --json` prints, plus `ok`.
+#[pyfunction(name = "fit")]
+#[pyo3(signature = (code_topology, header, *, custody, device=None, observations=None))]
+pub fn py_fit<'p>(
+    py: Python<'p>,
+    code_topology: &[u8],
+    header: &[u8],
+    custody: &str,
+    device: Option<&str>,
+    observations: Option<&[u8]>,
+) -> PyResult<Bound<'p, PyDict>> {
+    let code = CodeTopology::parse(code_topology).or_refuse(py)?;
+    let header = Header::parse(header).or_refuse(py)?;
+    let custody = Custody::parse(custody).or_refuse(py)?;
+    let observed = match observations {
+        Some(bytes) => Some(CapabilityRecords::parse_observed(bytes).or_refuse(py)?),
+        None => None,
+    };
+    let verdict = tensorfs_core::fit::fit(&code, &header, custody, device, observed.as_ref())
+        .or_refuse(py)?;
+    let doc = tensorfs_core::machine::fit_json(&verdict, custody);
+    let value = tensorfs_core::canon::parse_canonical(&doc, tensorfs_core::limits::DOC_MAX_BYTES)
+        .or_refuse(py)?;
+    let out = marshal(py, &value)?.cast_into::<PyDict>()?;
+    out.set_item("ok", verdict.is_ok())?;
+    Ok(out)
+}
+
+/// `tensorfs.capability(encoding, device, observations=None)`: is this (encoding, device)
+/// pair qualified — the compiled-in reference records widened by what a card observed.
+#[pyfunction]
+#[pyo3(signature = (encoding, device, observations=None))]
+pub fn capability<'p>(
+    py: Python<'p>,
+    encoding: &str,
+    device: &str,
+    observations: Option<&[u8]>,
+) -> PyResult<Bound<'p, PyDict>> {
+    let mut records = registry::capability_records();
+    if let Some(bytes) = observations {
+        records = records.with_observed(CapabilityRecords::parse_observed(bytes).or_refuse(py)?);
+    }
+    let encoding = registry::seeds()
+        .iter()
+        .find(|s| s.alias == encoding)
+        .map(|s| s.spec.object_id())
+        .unwrap_or_else(|| encoding.to_string());
+    let decision = records.admit(&encoding, device);
+    let qualified: Vec<&str> = records
+        .records
+        .iter()
+        .filter(|r| r.encoding == encoding)
+        .map(|r| r.device.as_str())
+        .collect();
+    let (record, refusal) = match &decision {
+        Ok(r) => (Some(*r), String::new()),
+        Err(e) => (None, e.detail.clone()),
+    };
+    let doc =
+        tensorfs_core::machine::capability_json(record, &encoding, device, &refusal, &qualified);
+    let value = tensorfs_core::canon::parse_canonical(&doc, tensorfs_core::limits::DOC_MAX_BYTES)
+        .or_refuse(py)?;
+    Ok(marshal(py, &value)?.cast_into::<PyDict>()?)
 }
 
 /// Canonical `Value` -> plain Python data. The document's shape survives; its Rust types do
@@ -233,12 +304,29 @@ pub fn topology_digest(py: Python<'_>, data: &[u8]) -> PyResult<String> {
     Ok(Header::parse(data).or_refuse(py)?.topology_digest())
 }
 
-/// The SHAPE-ONLY projection of the same header (tfs-038): the same digest with the dtype
-/// leaf elided, so two checkpoints differing only by dtype or encoding share one bucket key.
-/// An index for catalog search, never a decision.
+/// The FIT index (D4): the same projection with the dtype leaf elided. Two checkpoints with
+/// equal `shape_digest` fit the same code.
 #[pyfunction]
-pub fn topology_shape_digest(py: Python<'_>, data: &[u8]) -> PyResult<String> {
-    Ok(Header::parse(data).or_refuse(py)?.topology_shape_digest())
+pub fn shape_digest(py: Python<'_>, data: &[u8]) -> PyResult<String> {
+    Ok(Header::parse(data).or_refuse(py)?.shape_digest())
+}
+
+/// The construction document's identity: the header's own `configs` map, digested.
+#[pyfunction]
+pub fn config_digest(py: Python<'_>, data: &[u8]) -> PyResult<String> {
+    Ok(Header::parse(data).or_refuse(py)?.config_digest())
+}
+
+/// All three catalog digests of a header: `{"topology_digest", "shape_digest",
+/// "config_digest"}` — what `tfs ingest` stores on the checkpoint row.
+#[pyfunction]
+pub fn digests<'p>(py: Python<'p>, data: &[u8]) -> PyResult<Bound<'p, PyDict>> {
+    let d = Header::parse(data).or_refuse(py)?.digests();
+    let out = PyDict::new(py);
+    out.set_item("topology_digest", d.topology_digest)?;
+    out.set_item("shape_digest", d.shape_digest)?;
+    out.set_item("config_digest", d.config_digest)?;
+    Ok(out)
 }
 
 /// Validate canonical Manifest bytes.

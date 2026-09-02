@@ -1,3 +1,3 @@
 doc: grade_decision
 expect: mutant
-note: one byte flipped at offset 57 of sha256:2a5d0aedb9dcc6cf2e7005587be87207e3430c78b44c70d4b1d891776b8925a0
+note: one byte flipped at offset 57 of sha256:b17e7ce158effa0fad5de2b69c0160520b3bc38938c7443568742271a45e2034

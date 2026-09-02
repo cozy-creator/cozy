@@ -51,15 +51,7 @@ fn bank(
     order_path: &Path,
 ) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tfs"));
-    command.args([
-        "ingest",
-        "bank",
-        dialect,
-        "source-plan-test",
-        profile,
-        converter,
-        "--registry",
-    ]);
+    command.args(["ingest", "bank", dialect, converter, "--registry"]);
     command.arg(registry);
     command.args(["--source-profile", profile, "--order"]);
     command.arg(order_path);

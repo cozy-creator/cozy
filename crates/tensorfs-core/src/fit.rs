@@ -1,41 +1,27 @@
-//! `check_compatibility` — the layout plane's SECOND operation (Stamp at the border is the
-//! first). It compares a bound model's CODE TOPOLOGY with a checkpoint's topology and
-//! validates encoding assignments against the pinned registry.
+//! `fit` — the ONE code <-> checkpoint matching function (tfs-042, design
+//! `tracker/cross-cutting/model-code-fit.md` §3).
 //!
-//! It returns the ONE runtime-satisfaction vocabulary: `Satisfied | Mismatch(details)`.
-//! It plans nothing, executes nothing, and names no remedy. **Grading a mismatch into
-//! COMPATIBLE/CONVERTIBLE/PRODUCIBLE/INCOMPATIBLE is the hub's job** — a second grading
-//! layer below the hub would be a third vocabulary for one decision chain, and the fence in
-//! `scripts/fence.py` keeps that vocabulary out of this file.
+//! Two inputs, one answer. The code side is a `CodeTopology`: what the package's factory
+//! constructs from the checkpoint's own config document, censused on the meta device —
+//! `component -> key -> {dtype, shape, accepts, pinned}` plus the constructed component
+//! list. The checkpoint side is its `Header`. `fit` returns exactly one `Fit` code with the
+//! text a human reads; it plans nothing, grades nothing and names no remedy.
 //!
-//! `Depth` is what separates the two questions asked of it. PREFLIGHT — "can this run" — is
-//! answered by ONE blocking fact, so the walk stops there and the caller pays for nothing
-//! after it. RANKING a catalog needs the WORST fact, which is not in general the first: a
-//! pair whose first mismatch is a dtype cast and whose second is a shape mismatch reads
-//! PRODUCIBLE off the first and is actually INCOMPATIBLE. The depth travels with the report
-//! so a grader can never mistake a stopped walk for a complete one.
+//! Rules, in order (§3): (1) every constructed component exists; components the checkpoint
+//! carries that the code does not construct are ignored (D6); (2) every constructed key
+//! exists at the same logical shape; (3) a key whose destination PINS a dtype must be
+//! supplied at that dtype or through a lossless widening — otherwise dtype is delivery's
+//! business (D4); (4) on `canonical` custody a stored key inside a constructed component
+//! that the code does not consume refuses, on `local` it is listed and ignored (D5); (5)
+//! every stored encoding must be admitted by the row's `accepts`; (6) with a device, every
+//! encoded leaf must have a qualification observation for that device class.
 //!
-//! What crosses the boundary is a DOCUMENT, not a foreign schema. cozy-runtime owns
-//! `ModelConstructionContract` (cr-004) and TensorFS must never grow a second parser for it
-//! (tfs-013's zero-foreign-schemas fence), so the contract PROJECTS to `CodeTopology` — the
-//! same `component -> key -> {dtype, shape}` projection the header already computes, plus
-//! the per-key encoding requirement. `contract` records the digest of the foreign document
-//! it was projected from; TensorFS records that digest and never interprets it.
-//!
-//! The containment ladder is the authority on what matching may look at:
-//!   structure projection [keys+shapes] ⊂ checkpoint topology [+encoding ids] ⊂ header
-//!   [+parts, objects, configs]
-//! Parts and objects are the header's fill and transfer layers, BELOW the topology and
-//! invisible to matching. `topology_digest` is the fast-path index, never the decision.
-//!
-//! It ships with a SECOND index (tfs-038): the same projection with the dtype elided. The
-//! exact digest finds the pairs that already agree; the shape digest finds the pairs that
-//! differ only by dtype or encoding — the CONVERTIBLE and PRODUCIBLE half a catalog search
-//! is actually looking for, which exact equality is structurally blind to. Both ride on
-//! every report, so a search is three cheap steps: exact hit, shape hit worth grading, and
-//! everything else refused without grading at all. Both are indexes. Neither is a decision.
+//! The walk itself (`check_compatibility`) records EVERY fact at `Depth::Full`; `fit` reads
+//! the first fact in RULE order off it, and the grade plane (`grade.rs`, search only — D11)
+//! ranks the whole set. One walk, two readers, so the two cannot disagree about a key.
 
 use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
+use crate::capability::CapabilityRecords;
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Result};
 use crate::header::{Closure, Header};
@@ -48,7 +34,7 @@ use crate::limits;
 /// an absent field defaulting to "anything" is how a lane silently widens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Accepts {
-    /// Any encoding the pinned registry knows. Plain-only destinations do NOT spell this.
+    /// Any encoding the pinned registry knows (`encoded_leaves="accept"`).
     Any,
     /// Exactly these spec digests, sorted and unique.
     OneOf(Vec<String>),
@@ -105,20 +91,28 @@ impl Accepts {
 }
 
 /// One code destination: what `load()` actually constructs, as a byte contract.
+///
+/// `pinned` says the destination fixes its dtype (an integer buffer, an fp32 island): the
+/// checkpoint must supply that dtype or one that widens into it losslessly. An unpinned
+/// dtype is the constructed default and is delivery's business, not fit's (D4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requirement {
     pub dtype: Dtype,
     pub shape: Vec<u64>,
     pub accepts: Accepts,
+    pub pinned: bool,
 }
 
-/// The bounded projection of a ModelConstructionContract. TensorFS's whole view of the
-/// code side, and the only thing that crosses into the verifier.
+/// The code side: the meta-device census of `factory(config)`, projected to TensorFS's
+/// vocabulary. `contract` is the digest of the census this was projected from — recorded,
+/// never parsed. `constructed_components` is the same set as `components`' keys, in the
+/// order the factory constructed them (D9); the map is canonical (sorted) and the list is
+/// where the order survives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeTopology {
-    /// Digest of the FOREIGN document this was projected from. Recorded, never parsed.
     pub contract: String,
     pub components: Vec<(String, Vec<(String, Requirement)>)>,
+    pub constructed_components: Vec<String>,
 }
 
 impl CodeTopology {
@@ -132,9 +126,16 @@ impl CodeTopology {
         self.components.iter().map(|(_, k)| k.len()).sum()
     }
 
-    /// The SAME projection function a header computes, so the fast-path index is comparable
-    /// on both sides. A digest hit means the logical {dtype, shape} sets agree — it never
-    /// means the encodings do, which is why it can only ever be an index.
+    pub fn requirement(&self, component: &str, key: &str) -> Option<&Requirement> {
+        self.components
+            .iter()
+            .find(|(c, _)| c == component)
+            .and_then(|(_, ks)| ks.iter().find(|(k, _)| k == key))
+            .map(|(_, r)| r)
+    }
+
+    /// The SAME projection function a header computes, so the indexes are comparable on
+    /// both sides. A digest hit means the logical sets agree — never that the encodings do.
     pub fn projected(&self, projection: crate::header::Projection) -> crate::canon::Value {
         crate::header::topology_projection(
             projection,
@@ -147,11 +148,9 @@ impl CodeTopology {
         crate::header::topology_digest_of(&self.projected(crate::header::Projection::Identity))
     }
 
-    /// The shape-only bucket key, by the same code path with the dtype leaf elided. An
-    /// exact-digest miss with a shape-digest HIT is precisely the interesting half of a
-    /// catalog: the pairs that differ only by dtype or encoding, which are the CONVERTIBLE
-    /// and PRODUCIBLE candidates. Still an index; still never the decision.
-    pub fn topology_shape_digest(&self) -> String {
+    /// The FIT index (D4): the same projection with the dtype elided. Equal to a
+    /// checkpoint's `shape_digest` exactly when the key sets and shapes agree.
+    pub fn shape_digest(&self) -> String {
         crate::header::topology_digest_of(&self.projected(crate::header::Projection::ShapeOnly))
     }
 }
@@ -181,6 +180,16 @@ impl Plain for CodeTopology {
                 let mut rf = Fields::new("Requirement", rv)?;
                 let accepts = Accepts::from_value("Requirement", rf.req("accepts")?)?;
                 let dtype = Dtype::parse(as_str("Requirement", "dtype", rf.req("dtype")?)?)?;
+                let pinned = match rf.opt("pinned") {
+                    None => false,
+                    Some(Value::Bool(true)) => true,
+                    Some(_) => {
+                        return refuse(
+                            Code::WRONG_TYPE,
+                            format!("{name}/{key}: pinned is `true` or absent"),
+                        )
+                    }
+                };
                 let sa = as_arr("Requirement", "shape", rf.req("shape")?)?;
                 if sa.len() > limits::MAX_RANK {
                     return refuse(Code::RANK_CAP, format!("{name}/{key}: rank over cap"));
@@ -197,6 +206,7 @@ impl Plain for CodeTopology {
                         dtype,
                         shape,
                         accepts,
+                        pinned,
                     },
                 ));
             }
@@ -208,13 +218,36 @@ impl Plain for CodeTopology {
             }
             components.push((name.clone(), keys));
         }
+        let mut constructed_components = Vec::new();
+        for x in as_arr(
+            "CodeTopology",
+            "constructed_components",
+            f.req("constructed_components")?,
+        )? {
+            constructed_components
+                .push(as_str("CodeTopology", "constructed_components", x)?.to_string());
+        }
         f.done()?;
         if components.is_empty() || components.len() > limits::MAX_COMPONENTS {
             return refuse(Code::EMPTY_COMPONENTS, "component count out of bounds");
         }
+        let mut listed = constructed_components.clone();
+        listed.sort();
+        listed.dedup();
+        let named: Vec<&String> = components.iter().map(|(c, _)| c).collect();
+        if listed.len() != constructed_components.len() || listed.iter().ne(named.iter().copied()) {
+            return refuse(
+                Code::MISSING_COMPONENT,
+                format!(
+                    "constructed_components {constructed_components:?} must name exactly the \
+                     components the topology carries ({named:?}), once each"
+                ),
+            );
+        }
         Ok(CodeTopology {
             contract,
             components,
+            constructed_components,
         })
     }
 
@@ -231,22 +264,23 @@ impl Plain for CodeTopology {
                                 Value::map(
                                     ks.iter()
                                         .map(|(k, r)| {
-                                            (
-                                                k.clone(),
-                                                Value::obj(vec![
-                                                    ("accepts", r.accepts.to_value()),
-                                                    ("dtype", Value::str(r.dtype.name())),
-                                                    (
-                                                        "shape",
-                                                        Value::arr(
-                                                            r.shape
-                                                                .iter()
-                                                                .map(|d| Value::uint(*d))
-                                                                .collect(),
-                                                        ),
-                                                    ),
-                                                ]),
-                                            )
+                                            let mut row = vec![
+                                                ("accepts", r.accepts.to_value()),
+                                                ("dtype", Value::str(r.dtype.name())),
+                                            ];
+                                            if r.pinned {
+                                                row.push(("pinned", Value::Bool(true)));
+                                            }
+                                            row.push((
+                                                "shape",
+                                                Value::arr(
+                                                    r.shape
+                                                        .iter()
+                                                        .map(|d| Value::uint(*d))
+                                                        .collect(),
+                                                ),
+                                            ));
+                                            (k.clone(), Value::obj(row))
                                         })
                                         .collect(),
                                 ),
@@ -255,41 +289,52 @@ impl Plain for CodeTopology {
                         .collect(),
                 ),
             ),
+            (
+                "constructed_components",
+                Value::arr(
+                    self.constructed_components
+                        .iter()
+                        .map(|c| Value::str(c.clone()))
+                        .collect(),
+                ),
+            ),
             ("contract", Value::str(self.contract.clone())),
         ])
     }
 }
 
-// ---------------------------------------------------------------- the verdict
+// ---------------------------------------------------------------- custody
 
-/// Where the checkpoint came from, which is the ONLY thing that changes the extra-key rule.
-/// Missing keys refuse on both.
+/// Where the checkpoint came from, which is the ONLY thing that changes the extra-key rule
+/// (D5). Missing keys refuse on both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lane {
-    /// The border classified every key. A surplus at serve time is drift or corruption.
+pub enum Custody {
+    /// The border classified every key. A stored key the code does not consume is drift.
     Canonical,
-    /// A local manifest that never crossed the border: unknown extras are confessed.
-    LocalUnbordered,
+    /// A local manifest that never crossed the border: extras are listed and ignored.
+    Local,
 }
 
-impl Lane {
+impl Custody {
     pub fn name(self) -> &'static str {
         match self {
-            Lane::Canonical => "canonical",
-            Lane::LocalUnbordered => "local_unbordered",
+            Custody::Canonical => "canonical",
+            Custody::Local => "local",
         }
     }
-    pub fn parse(s: &str) -> Result<Lane> {
+    pub fn parse(s: &str) -> Result<Custody> {
         match s {
-            "canonical" => Ok(Lane::Canonical),
-            "local_unbordered" => Ok(Lane::LocalUnbordered),
+            "canonical" => Ok(Custody::Canonical),
+            "local" => Ok(Custody::Local),
             o => refuse(
                 Code::UNKNOWN_FIELD,
-                format!("lane {o:?} is outside {{canonical, local_unbordered}}"),
+                format!("custody {o:?} is outside {{canonical, local}}"),
             ),
         }
     }
 }
+
+// ---------------------------------------------------------------- the walk
 
 /// One side of a disagreement, printed and stored verbatim. A refusal that names only the
 /// key teaches nothing; a refusal that names both sides is a diff.
@@ -360,8 +405,7 @@ impl Side {
     }
 }
 
-/// ONE disagreeing tensor, both sides. Nothing here proposes a remedy or a verdict: the
-/// whole point of the split is that this layer reports and the hub decides.
+/// ONE disagreeing tensor, both sides. A fact, never a verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Details {
     pub code: Code,
@@ -371,28 +415,9 @@ pub struct Details {
     pub present: Side,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Satisfaction {
-    Satisfied,
-    Mismatch(Box<Details>),
-}
-
-impl Satisfaction {
-    pub fn is_satisfied(&self) -> bool {
-        matches!(self, Satisfaction::Satisfied)
-    }
-}
-
-/// How far a walk goes, and the only thing that separates the two questions this file is
-/// asked.
-///
-/// PREFLIGHT asks "can this run", and ONE blocking fact answers it — so the walk stops
-/// there and the caller never pays for the rest of the topology. RANKING a catalog asks
-/// "how bad is this", and the answer is the WORST fact, which is not in general the first:
-/// a pair whose first mismatch is a dtype cast and whose second is a shape mismatch is
-/// INCOMPATIBLE, and a ranking built on the first fact alone would offer it as a
-/// conversion. The depth travels with the report so a grader can never mistake a stopped
-/// walk for a complete one.
+/// How far a walk goes. `fit` always walks `Full`; `FirstMismatch` is the grade plane's
+/// cheap re-check, and the depth travels with a report so a ranking can never mistake a
+/// stopped walk for a complete one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Depth {
     FirstMismatch,
@@ -420,10 +445,7 @@ impl Depth {
 }
 
 /// The MEASURED geometry of one role, read out of the header. Never inferred from a dtype
-/// spelling: h3-evidence measures ComfyUI shipping rank-0 scalar `weight_scale` for
-/// `fp8_scaled`, rank-2 `[out, 1]` for `int8_convrot` and rank-2 F8_E4M3 block scales for
-/// `nvfp4_awq` — in ONE repository (decisions #244). A grader keyed on "fp8 implies rank-2"
-/// misreads the largest H3 distribution by download count, so the facts carry what was read.
+/// spelling: scale rank is a per-producer fact (decisions #244).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleFact {
     pub role: String,
@@ -452,14 +474,9 @@ pub struct ComponentFacts {
     pub present_encodings: Vec<EncodingFact>,
 }
 
-/// Everything one call produced: the mismatch set, the component-granular facts grading
-/// consumes, and the UNCONSUMED set — extra keys a local un-bordered manifest carried that
-/// nothing classified. The unconsumed set is a recorded fact, never a third verdict:
-/// `release_cut` is what refuses on it.
-///
-/// `mismatches` is the one place a disagreement is recorded, so the two-valued satisfaction
-/// is DERIVED from it rather than stored beside it — there is no second copy of the first
-/// fact for the two to disagree about. At `Depth::FirstMismatch` it holds at most one.
+/// Everything one walk produced: the fact set, the component-granular facts grading
+/// consumes, and the UNCONSUMED set — stored keys inside constructed components that the
+/// code does not consume, on local custody (listed, ignored).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     pub mismatches: Vec<Details>,
@@ -472,28 +489,9 @@ impl Outcome {
     pub fn is_satisfied(&self) -> bool {
         self.mismatches.is_empty()
     }
-
-    /// The runtime's two-valued answer: the FIRST blocking fact, which is what "can this
-    /// run" is answered by.
-    pub fn satisfaction(&self) -> Satisfaction {
-        satisfaction_of(&self.mismatches)
-    }
-}
-
-fn satisfaction_of(mismatches: &[Details]) -> Satisfaction {
-    match mismatches.first() {
-        None => Satisfaction::Satisfied,
-        Some(d) => Satisfaction::Mismatch(Box::new(d.clone())),
-    }
 }
 
 /// A name -> position index over one component's keys, sorted once and binary-searched.
-///
-/// Both sides used to be scanned linearly per key, which is quadratic in the tensor count
-/// and dominated the walk long before the depth did: a 4096-tensor checkpoint spent 37 ms
-/// answering a question that stops at the first fact. Sortedness is an invariant of the
-/// canonical documents, but it is not assumed here — the index is built from what was
-/// handed in, so an in-memory topology assembled by a caller behaves the same.
 fn index_of<T>(keys: &[(String, T)]) -> Vec<(&str, usize)> {
     let mut ix: Vec<(&str, usize)> = keys
         .iter()
@@ -532,34 +530,26 @@ fn mismatch(code: Code, component: &str, key: &str, required: Side, present: Sid
     }
 }
 
-/// The one deterministic comparison. Iteration is over the CODE side first, in canonical
-/// (sorted) order, so "first disagreeing tensor" means the same tensor on every machine.
-///
-/// `known_markers` is DATA supplied by the caller, not a vocabulary compiled in here: the
-/// moment this file carries a marker taxonomy it becomes a second classifier on the serve
-/// path, which is the defect the border exists to prevent. The border owns the list
-/// (`ingest::fingerprint::MARKER_SUFFIXES`); this applies a rule to what it is handed.
+/// The one deterministic walk. Iteration is over the CODE side first, in canonical (sorted)
+/// order, so "first disagreeing tensor" means the same tensor on every machine. Components
+/// the checkpoint carries that the code does not construct are never visited (D6).
 pub fn check_compatibility(
     code: &CodeTopology,
     header: &Header,
     closure: &Closure,
     pin: &[String],
-    lane: Lane,
-    known_markers: &[String],
+    custody: Custody,
     depth: Depth,
 ) -> Result<Outcome> {
     let mut facts: Vec<ComponentFacts> = Vec::new();
     let mut unconsumed: Vec<String> = Vec::new();
     let mut mismatches: Vec<Details> = Vec::new();
-    // The cheap path, in one predicate: at FirstMismatch depth every comparison after the
-    // first blocking fact is skipped outright — not performed and discarded.
     macro_rules! stop {
         () => {
             depth == Depth::FirstMismatch && !mismatches.is_empty()
         };
     }
 
-    // -- the required side, in canonical order.
     for (comp, reqs) in &code.components {
         let present = header.components.iter().find(|(c, _)| c == comp);
         let tensors: &[(String, crate::header::Tensor)] = match present {
@@ -584,7 +574,7 @@ pub fn check_compatibility(
         };
 
         let mut present_encodings: Vec<EncodingFact> = Vec::new();
-        for (key, t) in tensors {
+        for (_, t) in tensors {
             match present_encodings
                 .iter_mut()
                 .find(|e| e.encoding == t.encoding)
@@ -596,24 +586,21 @@ pub fn check_compatibility(
                         e.logical_dtypes.sort();
                     }
                 }
-                None => {
-                    let _ = key;
-                    present_encodings.push(EncodingFact {
-                        encoding: t.encoding.clone(),
-                        keys: 1,
-                        logical_dtypes: vec![t.dtype],
-                        roles: t
-                            .parts
-                            .iter()
-                            .map(|(n, p)| RoleFact {
-                                role: n.clone(),
-                                carrier: p.dtype,
-                                rank: p.shape.len() as u64,
-                                shape: p.shape.clone(),
-                            })
-                            .collect(),
-                    });
-                }
+                None => present_encodings.push(EncodingFact {
+                    encoding: t.encoding.clone(),
+                    keys: 1,
+                    logical_dtypes: vec![t.dtype],
+                    roles: t
+                        .parts
+                        .iter()
+                        .map(|(n, p)| RoleFact {
+                            role: n.clone(),
+                            carrier: p.dtype,
+                            rank: p.shape.len() as u64,
+                            shape: p.shape.clone(),
+                        })
+                        .collect(),
+                }),
             }
         }
         present_encodings.sort_by(|a, b| a.encoding.cmp(&b.encoding));
@@ -652,9 +639,6 @@ pub fn check_compatibility(
             if stop!() {
                 break;
             }
-            // Both sides are built ONLY where a fact is recorded. Materialising them for
-            // every key cost two shape clones and an accepts render per tensor whether or
-            // not anything disagreed, which on the satisfied path is the whole walk.
             let want = || Side {
                 dtype: Some(req.dtype),
                 shape: Some(req.shape.clone()),
@@ -664,8 +648,6 @@ pub fn check_compatibility(
             let t = match lookup(&present_index, key).map(|i| &tensors[i].1) {
                 Some(t) => t,
                 None => {
-                    // Missing keys ALWAYS refuse, on every lane. Nothing downstream can
-                    // invent a tensor the checkpoint does not carry.
                     mismatches.push(mismatch(
                         Code::MISSING_TENSOR,
                         comp,
@@ -696,19 +678,18 @@ pub fn check_compatibility(
             }
             // Encoding assignments against the PINNED registry. cozytensors/1 carries its
             // specs inline; the optional closure remains current for standalone layout
-            // inputs. A spec absent from both is not a checkpoint at all; a spec the local pin does not alias is
-            // valid data whose execution is unsupported here, and offline the two reasons
-            // for that ("unregistered" vs "newer than my pin") are indistinguishable.
+            // inputs. A spec absent from both is not a checkpoint at all; a spec the local
+            // pin does not alias is valid data whose execution is unsupported here.
             let spec = closure.get(&t.encoding).or_else(|| {
                 header
                     .encodings
                     .iter()
                     .find(|candidate| candidate.object_id() == t.encoding)
             });
-            if spec.is_none() {
+            let Some(spec) = spec else {
                 mismatches.push(mismatch(Code::UNKNOWN_ENCODING, comp, key, want(), got()));
                 continue;
-            }
+            };
             if !pin.contains(&t.encoding) {
                 mismatches.push(mismatch(
                     Code::UNKNOWN_TO_LOCAL_CAPABILITY,
@@ -719,63 +700,40 @@ pub fn check_compatibility(
                 ));
                 continue;
             }
-            let spec = spec.unwrap();
             let want_roles: Vec<&str> = spec.roles.iter().map(|(n, _)| n.as_str()).collect();
             let got_roles: Vec<&str> = t.parts.iter().map(|(n, _)| n.as_str()).collect();
             if want_roles != got_roles {
                 mismatches.push(mismatch(Code::ROLE_SET_MISMATCH, comp, key, want(), got()));
             }
         }
-    }
 
-    // -- the present side: components and keys the code never asked for. The unconsumed set
-    // is recorded at EVERY depth: it is not a mismatch, and a release cut refuses on it
-    // whether or not the walk also found a blocking fact.
-    for (comp, tensors) in &header.components {
-        let reqs = code.components.iter().find(|(c, _)| c == comp);
-        let known: &[(String, Requirement)] = match reqs {
-            Some((_, r)) => r.as_slice(),
-            None => {
-                surplus(
-                    &mut mismatches,
-                    &mut unconsumed,
-                    lane,
-                    known_markers,
-                    depth,
-                    Code::EXTRA_COMPONENT,
-                    comp,
-                    &tensors[0].0,
-                    || Side {
-                        dtype: Some(tensors[0].1.dtype),
-                        shape: Some(tensors[0].1.shape.clone()),
-                        encoding: Some(tensors[0].1.encoding.clone()),
-                        accepts: None,
-                    },
-                );
-                continue;
-            }
-        };
-        let known_index = index_of(known);
+        // The present side of THIS component: stored keys the code never asked for. On
+        // canonical custody a surplus is drift and refuses by name; on local custody it is
+        // listed and ignored, at every depth.
+        let known_index = index_of(reqs);
         for (key, t) in tensors {
             if lookup(&known_index, key).is_some() {
                 continue;
             }
-            surplus(
-                &mut mismatches,
-                &mut unconsumed,
-                lane,
-                known_markers,
-                depth,
+            if custody == Custody::Local {
+                unconsumed.push(format!("{comp}/{key}"));
+                continue;
+            }
+            if stop!() {
+                continue;
+            }
+            mismatches.push(mismatch(
                 Code::EXTRA_TENSOR,
                 comp,
                 key,
-                || Side {
+                Side::default(),
+                Side {
                     dtype: Some(t.dtype),
                     shape: Some(t.shape.clone()),
                     encoding: Some(t.encoding.clone()),
                     accepts: None,
                 },
-            );
+            ));
         }
     }
     unconsumed.sort();
@@ -788,116 +746,6 @@ pub fn check_compatibility(
     })
 }
 
-#[cfg(test)]
-mod inline_spec_tests {
-    use super::*;
-    use crate::header::{Closure, Header, Part, Tensor};
-
-    fn pair() -> (CodeTopology, Header, String) {
-        let spec = crate::registry::seeds()
-            .into_iter()
-            .find(|seed| seed.alias == "plain/1")
-            .unwrap()
-            .spec;
-        let encoding = spec.object_id();
-        let header = Header {
-            configs: vec![],
-            assets: vec![],
-            encodings: vec![spec],
-            components: vec![(
-                "core".into(),
-                vec![(
-                    "weight".into(),
-                    Tensor {
-                        dtype: Dtype::Bf16,
-                        shape: vec![1],
-                        encoding: encoding.clone(),
-                        parts: vec![("value".into(), Part::plan(Dtype::Bf16, vec![1], &[0, 0]))],
-                    },
-                )],
-            )],
-        };
-        let code = CodeTopology {
-            contract: crate::ids::object_id(b"inline-spec-test"),
-            components: vec![(
-                "core".into(),
-                vec![(
-                    "weight".into(),
-                    Requirement {
-                        dtype: Dtype::Bf16,
-                        shape: vec![1],
-                        accepts: Accepts::Any,
-                    },
-                )],
-            )],
-        };
-        (code, header, encoding)
-    }
-
-    #[test]
-    fn inline_header_spec_is_the_current_checkpoint_closure() {
-        let (code, header, encoding) = pair();
-        let outcome = check_compatibility(
-            &code,
-            &header,
-            &Closure::default(),
-            std::slice::from_ref(&encoding),
-            Lane::Canonical,
-            &[],
-            Depth::FirstMismatch,
-        )
-        .unwrap();
-        assert!(outcome.is_satisfied());
-
-        let mut missing = header;
-        missing.encodings.clear();
-        let outcome = check_compatibility(
-            &code,
-            &missing,
-            &Closure::default(),
-            &[encoding],
-            Lane::Canonical,
-            &[],
-            Depth::FirstMismatch,
-        )
-        .unwrap();
-        assert!(matches!(
-            outcome.satisfaction(),
-            Satisfaction::Mismatch(details) if details.code == Code::UNKNOWN_ENCODING
-        ));
-    }
-}
-
-/// The direction asymmetry, in one place.
-///
-/// Canonical lane: the border classified every key, so a surplus is drift or corruption
-/// evidence and refuses naming it. Local un-bordered lane: a KNOWN marker is a fact on the
-/// wrong side of the boundary — it should have been transcribed into an encoding role at
-/// the border and refuses here; an UNKNOWN extra is warn-ignore-confess, recorded in the
-/// unconsumed set so a release cut can refuse on it later.
-#[allow(clippy::too_many_arguments)]
-fn surplus(
-    mismatches: &mut Vec<Details>,
-    unconsumed: &mut Vec<String>,
-    lane: Lane,
-    known_markers: &[String],
-    depth: Depth,
-    code: Code,
-    comp: &str,
-    key: &str,
-    got: impl FnOnce() -> Side,
-) {
-    let is_marker = known_markers.iter().any(|m| key.ends_with(m.as_str()));
-    if lane == Lane::LocalUnbordered && !is_marker {
-        unconsumed.push(format!("{comp}/{key}"));
-        return;
-    }
-    if depth == Depth::FirstMismatch && !mismatches.is_empty() {
-        return;
-    }
-    mismatches.push(mismatch(code, comp, key, Side::default(), got()));
-}
-
 fn accepts_text(a: &Accepts) -> String {
     match a {
         Accepts::Any => "any".to_string(),
@@ -905,28 +753,454 @@ fn accepts_text(a: &Accepts) -> String {
     }
 }
 
+// ---------------------------------------------------------------- fit
+
+/// A dtype that widens into another with every value preserved: format containment, the
+/// same fact `grade::ConversionRegistration` proves over the complete 16-bit domain.
+pub fn lossless_widening(from: Dtype, to: Dtype) -> bool {
+    use Dtype::*;
+    if from == to {
+        return true;
+    }
+    matches!(
+        (from, to),
+        (F8E4M3FN | F8E5M2, F16 | Bf16 | F32 | F64)
+            | (F16 | Bf16, F32 | F64)
+            | (F32, F64)
+            | (I8, I16 | I32 | I64)
+            | (U8, I16 | I32 | I64)
+            | (I16, I32 | I64)
+            | (I32, I64)
+    )
+}
+
+/// How many constructed keys take each delivery route on an `ok` fit. Informational: the
+/// route itself is the plan's business.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Routes {
+    /// Stored plain: the bytes are the logical tensor.
+    pub verbatim: u64,
+    /// Stored encoded, admitted by an explicit accepts list: decoded to float on the way in.
+    pub decoded_float: u64,
+    /// Stored encoded under `accepts: any`: an encoded linear op is swapped in under the code.
+    pub encoded_gemm: u64,
+}
+
+/// Exactly one of the eight codes of design §3. `text()` is what a human reads, prefixed
+/// by the caller with `<package>@<release> <slot> does not fit <org/model>@<release>/<lane>:`.
+/// There is no grade (D11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fit {
+    Ok {
+        routes: Routes,
+        /// `component/key` the checkpoint stores and the code does not consume, on local
+        /// custody. Empty on canonical custody by construction.
+        ignored: Vec<String>,
+        /// The device class the encoded leaves were qualified on, when one was asked.
+        device: Option<String>,
+    },
+    ComponentMissing {
+        component: String,
+        present: Vec<String>,
+    },
+    TensorMissing {
+        component: String,
+        key: String,
+    },
+    ShapeMismatch {
+        component: String,
+        key: String,
+        code: Vec<u64>,
+        checkpoint: Vec<u64>,
+    },
+    DtypePinnedMismatch {
+        component: String,
+        key: String,
+        pinned: Dtype,
+        stored: Dtype,
+    },
+    ExtraTensor {
+        component: String,
+        key: String,
+    },
+    EncodingUnsupported {
+        component: String,
+        key: String,
+        encoding: String,
+        accepts: Accepts,
+    },
+    EncodingUnqualified {
+        encoding: String,
+        device: String,
+        qualified_on: Vec<String>,
+    },
+}
+
+impl Fit {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Fit::Ok { .. } => "ok",
+            Fit::ComponentMissing { .. } => "component_missing",
+            Fit::TensorMissing { .. } => "tensor_missing",
+            Fit::ShapeMismatch { .. } => "shape_mismatch",
+            Fit::DtypePinnedMismatch { .. } => "dtype_pinned_mismatch",
+            Fit::ExtraTensor { .. } => "extra_tensor",
+            Fit::EncodingUnsupported { .. } => "encoding_unsupported",
+            Fit::EncodingUnqualified { .. } => "encoding_unqualified",
+        }
+    }
+
+    pub const CODES: [&'static str; 8] = [
+        "ok",
+        "component_missing",
+        "tensor_missing",
+        "shape_mismatch",
+        "dtype_pinned_mismatch",
+        "extra_tensor",
+        "encoding_unsupported",
+        "encoding_unqualified",
+    ];
+
+    pub fn is_ok(&self) -> bool {
+        matches!(self, Fit::Ok { .. })
+    }
+
+    /// Process exit status for `tfs fit`: 0 on `ok`, and one distinct code per refusal so a
+    /// caller can branch without parsing.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Fit::Ok { .. } => 0,
+            Fit::ComponentMissing { .. } => 10,
+            Fit::TensorMissing { .. } => 11,
+            Fit::ShapeMismatch { .. } => 12,
+            Fit::DtypePinnedMismatch { .. } => 13,
+            Fit::ExtraTensor { .. } => 14,
+            Fit::EncodingUnsupported { .. } => 15,
+            Fit::EncodingUnqualified { .. } => 16,
+        }
+    }
+
+    /// The detail text of design §3, ASCII so it can ride a canonical document.
+    pub fn text(&self) -> String {
+        match self {
+            Fit::Ok {
+                routes,
+                ignored,
+                device,
+            } => {
+                let mut s = format!(
+                    "fits (routes: verbatim x{}, decoded_float x{}, encoded_gemm x{}",
+                    routes.verbatim, routes.decoded_float, routes.encoded_gemm
+                );
+                if let Some(d) = device {
+                    let encoded = routes.decoded_float + routes.encoded_gemm;
+                    if encoded == 0 {
+                        s.push_str(&format!("; nothing to qualify on {d}"));
+                    } else {
+                        s.push_str(&format!(
+                            "; {encoded} encoded {} qualified on {d}",
+                            if encoded == 1 { "leaf" } else { "leaves" }
+                        ));
+                    }
+                }
+                if !ignored.is_empty() {
+                    s.push_str(&format!(
+                        "; {} stored key(s) not constructed, ignored on local custody",
+                        ignored.len()
+                    ));
+                }
+                s.push(')');
+                s
+            }
+            Fit::ComponentMissing { component, present } => format!(
+                "the code constructs {component}; the checkpoint has {}",
+                present.join(", ")
+            ),
+            Fit::TensorMissing { component, key } => format!(
+                "{component}.{key}: the code constructs it; the checkpoint does not supply it"
+            ),
+            Fit::ShapeMismatch {
+                component,
+                key,
+                code,
+                checkpoint,
+            } => format!(
+                "{component}.{key}: code {}, checkpoint {}",
+                dims(code),
+                dims(checkpoint)
+            ),
+            Fit::DtypePinnedMismatch {
+                component,
+                key,
+                pinned,
+                stored,
+            } => format!(
+                "{component}.{key} pins {}; stored {}, no lossless mapping registered",
+                pinned.name(),
+                stored.name()
+            ),
+            Fit::ExtraTensor { component, key } => format!(
+                "{component}.{key}: stored but not constructed, on a canonical checkpoint \
+                 (conversion drift)"
+            ),
+            Fit::EncodingUnsupported {
+                component,
+                key,
+                encoding,
+                accepts,
+            } => {
+                let admitted = match accepts {
+                    Accepts::Any => "any registered encoding".to_string(),
+                    Accepts::OneOf(v) => {
+                        v.iter().map(|d| alias_of(d)).collect::<Vec<_>>().join(", ")
+                    }
+                };
+                let leaves = match accepts {
+                    Accepts::OneOf(v) if v.iter().all(|d| d == &plain_digest()) => {
+                        " (encoded_leaves=refuse)"
+                    }
+                    _ => "",
+                };
+                format!(
+                    "{component}.{key} is stored {}; this package accepts {admitted} only{leaves}",
+                    alias_of(encoding)
+                )
+            }
+            Fit::EncodingUnqualified {
+                encoding,
+                device,
+                qualified_on,
+            } => format!(
+                "{} has no qualification observation on {device} (qualified on: {})",
+                alias_of(encoding),
+                if qualified_on.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    qualified_on.join(", ")
+                }
+            ),
+        }
+    }
+}
+
+fn dims(shape: &[u64]) -> String {
+    format!(
+        "[{}]",
+        shape
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+/// The registry alias of a spec digest (display), or the digest when nothing aliases it.
+pub fn alias_of(digest: &str) -> String {
+    crate::registry::seeds()
+        .iter()
+        .find(|s| s.spec.object_id() == digest)
+        .map(|s| s.alias.to_string())
+        .unwrap_or_else(|| digest.to_string())
+}
+
+fn plain_digest() -> String {
+    crate::registry::seeds()
+        .into_iter()
+        .find(|s| s.alias == "plain/1")
+        .expect("plain/1 is entry zero of the registry")
+        .spec
+        .object_id()
+}
+
+/// `fit(code, checkpoint, custody, device, observations) -> Fit` — design §3.
+///
+/// `observations` widens the compiled-in qualification records (the reference decoders on
+/// cpu) with what a component holding a card measured; `device` is the class the caller
+/// will execute on. Without a device rule (6) is not asked. Plain storage is verbatim and
+/// has nothing to qualify.
+pub fn fit(
+    code: &CodeTopology,
+    header: &Header,
+    custody: Custody,
+    device: Option<&str>,
+    observations: Option<&CapabilityRecords>,
+) -> Result<Fit> {
+    // One registry walk per fit: `seeds()` re-parses the mined vector fixtures each call.
+    let seeds = crate::registry::seeds();
+    let plain = seeds
+        .iter()
+        .find(|s| s.alias == "plain/1")
+        .expect("plain/1 is entry zero of the registry")
+        .spec
+        .object_id();
+    let mut pin: Vec<String> = seeds.iter().map(|s| s.spec.object_id()).collect();
+    pin.extend(header.encodings.iter().map(|s| s.object_id()));
+    let out = check_compatibility(
+        code,
+        header,
+        &Closure::default(),
+        &pin,
+        custody,
+        Depth::Full,
+    )?;
+
+    // Rule (1).
+    if let Some(d) = out
+        .mismatches
+        .iter()
+        .find(|d| d.code == Code::MISSING_COMPONENT)
+    {
+        return Ok(Fit::ComponentMissing {
+            component: d.component.clone(),
+            present: header.components.iter().map(|(c, _)| c.clone()).collect(),
+        });
+    }
+    // Rule (2).
+    if let Some(d) = out
+        .mismatches
+        .iter()
+        .find(|d| matches!(d.code, Code::MISSING_TENSOR | Code::SHAPE_MISMATCH))
+    {
+        return Ok(match d.code {
+            Code::MISSING_TENSOR => Fit::TensorMissing {
+                component: d.component.clone(),
+                key: d.key.clone(),
+            },
+            _ => Fit::ShapeMismatch {
+                component: d.component.clone(),
+                key: d.key.clone(),
+                code: d.required.shape.clone().unwrap_or_default(),
+                checkpoint: d.present.shape.clone().unwrap_or_default(),
+            },
+        });
+    }
+    // Rule (3): dtype only through pinned destinations.
+    for d in out
+        .mismatches
+        .iter()
+        .filter(|d| d.code == Code::DTYPE_MISMATCH)
+    {
+        let (Some(pinned), Some(stored)) = (d.required.dtype, d.present.dtype) else {
+            continue;
+        };
+        let is_pinned = code
+            .requirement(&d.component, &d.key)
+            .is_some_and(|r| r.pinned);
+        if is_pinned && !lossless_widening(stored, pinned) {
+            return Ok(Fit::DtypePinnedMismatch {
+                component: d.component.clone(),
+                key: d.key.clone(),
+                pinned,
+                stored,
+            });
+        }
+    }
+    // Rule (4).
+    if let Some(d) = out.mismatches.iter().find(|d| d.code == Code::EXTRA_TENSOR) {
+        return Ok(Fit::ExtraTensor {
+            component: d.component.clone(),
+            key: d.key.clone(),
+        });
+    }
+    // Rule (5). A spec this build does not register is unsupported here for the same
+    // reason a refused one is: nothing on this side can execute it.
+    if let Some(d) = out.mismatches.iter().find(|d| {
+        matches!(
+            d.code,
+            Code::ENCODING_MISMATCH | Code::UNKNOWN_TO_LOCAL_CAPABILITY
+        )
+    }) {
+        let accepts = code
+            .requirement(&d.component, &d.key)
+            .map(|r| r.accepts.clone())
+            .unwrap_or(Accepts::Any);
+        return Ok(Fit::EncodingUnsupported {
+            component: d.component.clone(),
+            key: d.key.clone(),
+            encoding: d.present.encoding.clone().unwrap_or_default(),
+            accepts,
+        });
+    }
+    // Anything else the walk recorded is a malformed checkpoint, not a fit answer.
+    if let Some(d) = out.mismatches.first() {
+        return refuse(
+            d.code,
+            format!(
+                "{}/{}: the checkpoint header is not a fit input ({})",
+                d.component,
+                d.key,
+                d.code.as_str()
+            ),
+        );
+    }
+
+    // Routes, and rule (6) over the encoded leaves the code actually consumes.
+    let mut routes = Routes::default();
+    let mut encoded: Vec<String> = Vec::new();
+    for (comp, key, req) in code.tensors() {
+        let stored = header
+            .components
+            .iter()
+            .find(|(c, _)| c == comp)
+            .and_then(|(_, ts)| ts.iter().find(|(k, _)| k == key))
+            .map(|(_, t)| &t.encoding)
+            .expect("rules (1) and (2) proved every constructed key present");
+        if *stored == plain {
+            routes.verbatim += 1;
+            continue;
+        }
+        match req.accepts {
+            Accepts::Any => routes.encoded_gemm += 1,
+            Accepts::OneOf(_) => routes.decoded_float += 1,
+        }
+        if !encoded.contains(stored) {
+            encoded.push(stored.clone());
+        }
+    }
+    if let Some(device) = device {
+        let mut records = crate::registry::capability_records();
+        if let Some(observed) = observations {
+            records = records.with_observed(observed.clone());
+        }
+        encoded.sort();
+        for e in &encoded {
+            if records.admit(e, device).is_err() {
+                let mut qualified_on: Vec<String> = records
+                    .records
+                    .iter()
+                    .filter(|r| &r.encoding == e)
+                    .map(|r| r.device.clone())
+                    .collect();
+                qualified_on.sort();
+                qualified_on.dedup();
+                return Ok(Fit::EncodingUnqualified {
+                    encoding: e.clone(),
+                    device: device.to_string(),
+                    qualified_on,
+                });
+            }
+        }
+    }
+    Ok(Fit::Ok {
+        routes,
+        ignored: out.unconsumed,
+        device: device.map(str::to_string),
+    })
+}
+
 // ---------------------------------------------------------------- the report document
 
-/// The canonical, digest-fenced result. This is what crosses the hermetic verifier's
-/// bounded document interface, and what the hub grades. It carries facts and a
-/// two-valued satisfaction; a `verdict`, `grade` or `remedy` field here would be grading
-/// below the hub, which the fence forbids.
-///
-/// `depth` travels WITH the mismatch set because a grader cannot otherwise tell a complete
-/// set from a stopped one, and grading a stopped set as if it were complete is exactly the
-/// over-promise this document exists to prevent: the second fact is the one that decides.
+/// The canonical, digest-fenced walk result the grade plane ranks (search only, D11). It
+/// carries facts and the whole fact set; a verdict lives in `Fit`, never here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompatibilityReport {
     pub contract: String,
     pub header: String,
     pub topology_required: String,
     pub topology_present: String,
-    /// The shape-only projections of the same two sides. Equal here with the exact digests
-    /// unequal is the search signal: the pair differs only by dtype or encoding, so it is
-    /// worth grading rather than skipping.
-    pub topology_shape_required: String,
-    pub topology_shape_present: String,
-    pub lane: Lane,
+    pub shape_required: String,
+    pub shape_present: String,
+    pub custody: Custody,
     pub depth: Depth,
     pub mismatches: Vec<Details>,
     pub facts: Vec<ComponentFacts>,
@@ -937,7 +1211,7 @@ impl CompatibilityReport {
     pub fn of(
         code: &CodeTopology,
         header: &Header,
-        lane: Lane,
+        custody: Custody,
         o: &Outcome,
     ) -> Result<CompatibilityReport> {
         Ok(CompatibilityReport {
@@ -945,9 +1219,9 @@ impl CompatibilityReport {
             header: header.object_id()?,
             topology_required: code.topology_digest(),
             topology_present: header.topology_digest(),
-            topology_shape_required: code.topology_shape_digest(),
-            topology_shape_present: header.topology_shape_digest(),
-            lane,
+            shape_required: code.shape_digest(),
+            shape_present: header.shape_digest(),
+            custody,
             depth: o.depth,
             mismatches: o.mismatches.clone(),
             facts: o.facts.clone(),
@@ -955,25 +1229,18 @@ impl CompatibilityReport {
         })
     }
 
-    /// The runtime's two-valued answer: the FIRST blocking fact. Derived, never stored, so
-    /// the report cannot carry a satisfaction that disagrees with its own mismatch set.
-    pub fn satisfaction(&self) -> Satisfaction {
-        satisfaction_of(&self.mismatches)
-    }
-
     pub fn is_satisfied(&self) -> bool {
         self.mismatches.is_empty()
     }
 
-    /// A release cut takes only a manifest whose extras were all classified. An
-    /// un-bordered manifest that quietly carried unknown keys never becomes a catalog
-    /// release: warn-ignore-confess is a LOCAL affordance, not a publication policy.
+    /// A release cut takes only a manifest whose extras were all consumed: listing and
+    /// ignoring is a LOCAL affordance, not a publication policy.
     pub fn release_cut(&self) -> Result<()> {
         if !self.unconsumed.is_empty() {
             return refuse(
                 Code::UNCLASSIFIED_EXTRAS,
                 format!(
-                    "{} unclassified extra key(s), first {:?}: an un-bordered manifest with \
+                    "{} unconsumed extra key(s), first {:?}: a local manifest with \
                      unconsumed keys never cuts into a catalog release",
                     self.unconsumed.len(),
                     self.unconsumed[0]
@@ -1052,6 +1319,8 @@ impl Plain for CompatibilityReport {
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("CompatibilityReport", v)?;
         let contract = prefixed("report.contract", f.req_str("contract")?)?;
+        let custody = Custody::parse(f.req_str("custody")?)?;
+        let depth = Depth::parse(f.req_str("depth")?)?;
         let mut facts = Vec::new();
         for fv in as_arr("CompatibilityReport", "facts", f.req("facts")?)? {
             let mut cf = Fields::new("ComponentFacts", fv)?;
@@ -1112,58 +1381,22 @@ impl Plain for CompatibilityReport {
                 present_encodings,
             });
         }
-        let depth = Depth::parse(f.req_str("depth")?)?;
         let header = prefixed("report.header", f.req_str("header")?)?;
-        let lane = Lane::parse(f.req_str("lane")?)?;
-        let mismatches = {
-            let mut sf = Fields::new("satisfaction", f.req("satisfaction")?)?;
-            let t = as_str("satisfaction", "t", sf.req("t")?)?.to_string();
-            match t.as_str() {
-                "satisfied" => {
-                    sf.done()?;
-                    Vec::new()
-                }
-                "mismatch" => {
-                    let mut out = Vec::new();
-                    for dv in as_arr("satisfaction", "details", sf.req("details")?)? {
-                        out.push(details_from(dv)?);
-                    }
-                    sf.done()?;
-                    if out.is_empty() {
-                        return refuse(
-                            Code::MISSING_FIELD,
-                            "a mismatch satisfaction with an empty detail set names nothing",
-                        );
-                    }
-                    out
-                }
-                o => {
-                    return refuse(
-                        Code::UNKNOWN_FIELD,
-                        format!("satisfaction {o:?} is outside {{satisfied, mismatch}} — the ONE runtime vocabulary"),
-                    )
-                }
-            }
-        };
+        let mut mismatches = Vec::new();
+        for dv in as_arr("CompatibilityReport", "mismatches", f.req("mismatches")?)? {
+            mismatches.push(details_from(dv)?);
+        }
+        let shape_present = prefixed("report.shape_present", f.req_str("shape_present")?)?;
+        let shape_required = prefixed("report.shape_required", f.req_str("shape_required")?)?;
         let topology_present = prefixed("report.topology_present", f.req_str("topology_present")?)?;
         let topology_required =
             prefixed("report.topology_required", f.req_str("topology_required")?)?;
-        let topology_shape_present = prefixed(
-            "report.topology_shape_present",
-            f.req_str("topology_shape_present")?,
-        )?;
-        let topology_shape_required = prefixed(
-            "report.topology_shape_required",
-            f.req_str("topology_shape_required")?,
-        )?;
         let mut unconsumed = Vec::new();
         for u in as_arr("CompatibilityReport", "unconsumed", f.req("unconsumed")?)? {
             unconsumed.push(as_str("unconsumed", "key", u)?.to_string());
         }
         f.done()?;
-        // A walk that stopped at the first fact cannot have recorded a second one. The
-        // depth is what a grader reads to decide whether the set may be ranked, so a
-        // document whose depth and set disagree is refused rather than believed.
+        // A walk that stopped at the first fact cannot have recorded a second one.
         if depth == Depth::FirstMismatch && mismatches.len() > 1 {
             return refuse(
                 Code::PARTIAL_MISMATCH_SET,
@@ -1180,9 +1413,9 @@ impl Plain for CompatibilityReport {
             header,
             topology_required,
             topology_present,
-            topology_shape_required,
-            topology_shape_present,
-            lane,
+            shape_required,
+            shape_present,
+            custody,
             depth,
             mismatches,
             facts,
@@ -1191,19 +1424,9 @@ impl Plain for CompatibilityReport {
     }
 
     fn to_value(&self) -> Value {
-        let satisfaction = if self.mismatches.is_empty() {
-            Value::obj(vec![("t", Value::str("satisfied"))])
-        } else {
-            Value::obj(vec![
-                (
-                    "details",
-                    Value::arr(self.mismatches.iter().map(details_value).collect()),
-                ),
-                ("t", Value::str("mismatch")),
-            ])
-        };
         Value::obj(vec![
             ("contract", Value::str(self.contract.clone())),
+            ("custody", Value::str(self.custody.name())),
             ("depth", Value::str(self.depth.name())),
             (
                 "facts",
@@ -1288,8 +1511,12 @@ impl Plain for CompatibilityReport {
                 ),
             ),
             ("header", Value::str(self.header.clone())),
-            ("lane", Value::str(self.lane.name())),
-            ("satisfaction", satisfaction),
+            (
+                "mismatches",
+                Value::arr(self.mismatches.iter().map(details_value).collect()),
+            ),
+            ("shape_present", Value::str(self.shape_present.clone())),
+            ("shape_required", Value::str(self.shape_required.clone())),
             (
                 "topology_present",
                 Value::str(self.topology_present.clone()),
@@ -1297,14 +1524,6 @@ impl Plain for CompatibilityReport {
             (
                 "topology_required",
                 Value::str(self.topology_required.clone()),
-            ),
-            (
-                "topology_shape_present",
-                Value::str(self.topology_shape_present.clone()),
-            ),
-            (
-                "topology_shape_required",
-                Value::str(self.topology_shape_required.clone()),
             ),
             (
                 "unconsumed",
@@ -1316,5 +1535,82 @@ impl Plain for CompatibilityReport {
                 ),
             ),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::header::{Closure, Header, Part, Tensor};
+
+    fn pair() -> (CodeTopology, Header, String) {
+        let spec = crate::registry::seeds()
+            .into_iter()
+            .find(|seed| seed.alias == "plain/1")
+            .unwrap()
+            .spec;
+        let encoding = spec.object_id();
+        let header = Header {
+            configs: vec![],
+            assets: vec![],
+            encodings: vec![spec],
+            components: vec![(
+                "core".into(),
+                vec![(
+                    "weight".into(),
+                    Tensor {
+                        dtype: Dtype::Bf16,
+                        shape: vec![1],
+                        encoding: encoding.clone(),
+                        parts: vec![("value".into(), Part::plan(Dtype::Bf16, vec![1], &[0, 0]))],
+                    },
+                )],
+            )],
+        };
+        let code = CodeTopology {
+            contract: crate::ids::object_id(b"inline-spec-test"),
+            components: vec![(
+                "core".into(),
+                vec![(
+                    "weight".into(),
+                    Requirement {
+                        dtype: Dtype::Bf16,
+                        shape: vec![1],
+                        accepts: Accepts::Any,
+                        pinned: false,
+                    },
+                )],
+            )],
+            constructed_components: vec!["core".into()],
+        };
+        (code, header, encoding)
+    }
+
+    #[test]
+    fn inline_header_spec_is_the_current_checkpoint_closure() {
+        let (code, header, encoding) = pair();
+        let outcome = check_compatibility(
+            &code,
+            &header,
+            &Closure::default(),
+            std::slice::from_ref(&encoding),
+            Custody::Canonical,
+            Depth::FirstMismatch,
+        )
+        .unwrap();
+        assert!(outcome.is_satisfied());
+
+        let mut missing = header;
+        missing.encodings.clear();
+        let outcome = check_compatibility(
+            &code,
+            &missing,
+            &Closure::default(),
+            &[encoding],
+            Custody::Canonical,
+            Depth::FirstMismatch,
+        )
+        .unwrap();
+        assert_eq!(outcome.mismatches[0].code, Code::UNKNOWN_ENCODING);
     }
 }

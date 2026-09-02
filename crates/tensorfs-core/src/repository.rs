@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 
 use crate::canon::{as_arr, as_str, Fields, Value};
 use crate::err::{refuse, Code, Result};
+use crate::header::Digests;
 use crate::ids::{ascii_name, hex64, prefixed, Doc, ObjectRef};
 
 pub const MAX_REPOSITORY_BYTES: usize = 8 * 1024 * 1024;
@@ -100,12 +101,14 @@ pub enum VerificationEvidence {
     },
 }
 
-/// Rust always derives classification from the exact header and closure. When a checkpoint
-/// came through the ingest border, its bounded provenance and one receipt verdict ride here
-/// instead of becoming separately stored documents.
+/// What the checkpoint row carries beside its manifest: the three digests tfs derives from
+/// the header (design §2 — identity, the fit index, the construction document), and, when
+/// the checkpoint came through the ingest border, its bounded provenance and one receipt
+/// verdict. Rust always re-derives the digests from the exact header; a row that disagrees
+/// with its header is refused, never believed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointEvidence {
-    pub classification_digest: String,
+    pub digests: Digests,
     pub ingest: Option<IngestProvenance>,
     pub verification: Option<VerificationEvidence>,
 }
@@ -143,10 +146,20 @@ impl CheckpointEvidence {
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut fields = Fields::new("Release.evidence", v)?;
-        let classification_digest = prefixed(
-            "Release.evidence.classification_digest",
-            fields.req_str("classification_digest")?,
-        )?;
+        let digests = Digests {
+            config_digest: prefixed(
+                "Release.evidence.config_digest",
+                fields.req_str("config_digest")?,
+            )?,
+            shape_digest: prefixed(
+                "Release.evidence.shape_digest",
+                fields.req_str("shape_digest")?,
+            )?,
+            topology_digest: prefixed(
+                "Release.evidence.topology_digest",
+                fields.req_str("topology_digest")?,
+            )?,
+        };
         let ingest = fields
             .opt("ingest")
             .map(|value| {
@@ -266,7 +279,7 @@ impl CheckpointEvidence {
         }
         fields.done()?;
         let evidence = Self {
-            classification_digest,
+            digests,
             ingest,
             verification,
         };
@@ -277,10 +290,20 @@ impl CheckpointEvidence {
     }
 
     pub fn to_value(&self) -> Value {
-        let mut fields = vec![(
-            "classification_digest",
-            Value::str(self.classification_digest.clone()),
-        )];
+        let mut fields = vec![
+            (
+                "config_digest",
+                Value::str(self.digests.config_digest.clone()),
+            ),
+            (
+                "shape_digest",
+                Value::str(self.digests.shape_digest.clone()),
+            ),
+            (
+                "topology_digest",
+                Value::str(self.digests.topology_digest.clone()),
+            ),
+        ];
         if let Some(ingest) = &self.ingest {
             let mut ingest_fields = vec![
                 (
@@ -1044,13 +1067,39 @@ impl Mutation {
     }
 }
 
+/// The row's digests must be what the header derives, all three. A caller that transcribes
+/// a stale or foreign digest into evidence is refused here rather than indexed wrong.
+pub fn require_digests(claimed: &Digests, derived: &Digests) -> Result<()> {
+    for (name, c, d) in [
+        (
+            "topology_digest",
+            &claimed.topology_digest,
+            &derived.topology_digest,
+        ),
+        ("shape_digest", &claimed.shape_digest, &derived.shape_digest),
+        (
+            "config_digest",
+            &claimed.config_digest,
+            &derived.config_digest,
+        ),
+    ] {
+        if c != d {
+            return refuse(
+                Code::TOPOLOGY_MISMATCH,
+                format!("checkpoint evidence {name} {c} differs from the header's {d}"),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Apply against the exact bytes the caller observed. The returned `None` means conditional
 /// repository deletion; `Some` is the exact replacement body. The backend supplies the
 /// observed bytes/ETag as its CAS precondition, never an embedded generation number.
 pub fn apply(
     current: Option<&[u8]>,
     mutation: &Mutation,
-    classification_digest: Option<&str>,
+    derived: Option<&Digests>,
 ) -> Result<Option<Repository>> {
     let existing = current.map(Repository::parse).transpose()?;
     if existing
@@ -1074,19 +1123,8 @@ pub fn apply(
                     "local repositories require replace_local",
                 );
             }
-            match (evidence.as_deref(), classification_digest) {
-                (Some(evidence), Some(classification_digest)) => {
-                    let derived = prefixed("classification_digest", classification_digest)?;
-                    if evidence.classification_digest != derived {
-                        return refuse(
-                            Code::TOPOLOGY_MISMATCH,
-                            format!(
-                                "checkpoint evidence classification {} differs from derived {derived}",
-                                evidence.classification_digest
-                            ),
-                        );
-                    }
-                }
+            match (evidence.as_deref(), derived) {
+                (Some(evidence), Some(derived)) => require_digests(&evidence.digests, derived)?,
                 (None, None) => {}
                 (Some(_), None) => {
                     return refuse(
@@ -1174,22 +1212,11 @@ pub fn apply(
                 return refuse(Code::KEY_GRAMMAR, "replace_local requires org local");
             }
             hex64("local source selection", version)?;
-            let derived = prefixed(
-                "classification_digest",
-                classification_digest.ok_or_else(|| crate::err::Refusal {
-                    code: Code::MISSING_FIELD,
-                    detail: "a local CozyTensors alias requires model classification".into(),
-                })?,
-            )?;
-            if evidence.classification_digest != derived {
-                return refuse(
-                    Code::TOPOLOGY_MISMATCH,
-                    format!(
-                        "local evidence classification {} differs from derived {derived}",
-                        evidence.classification_digest
-                    ),
-                );
-            }
+            let derived = derived.ok_or_else(|| crate::err::Refusal {
+                code: Code::MISSING_FIELD,
+                detail: "a local CozyTensors alias requires the header-derived digests".into(),
+            })?;
+            require_digests(&evidence.digests, derived)?;
             let repository = Repository {
                 checkpoints: vec![Checkpoint {
                     manifest: manifest.clone(),
@@ -1220,9 +1247,18 @@ pub fn compare_release_key(left: &Release, right: &Release) -> Ordering {
 mod tests {
     use super::*;
 
+    fn seeded(seed: u8) -> Digests {
+        let d = |tag: u8| format!("sha256:{}", format!("{:02x}", seed ^ tag).repeat(32));
+        Digests {
+            topology_digest: d(0),
+            shape_digest: d(1),
+            config_digest: d(2),
+        }
+    }
+
     fn evidence(seed: u8) -> CheckpointEvidence {
         CheckpointEvidence {
-            classification_digest: format!("sha256:{}", format!("{seed:02x}").repeat(32)),
+            digests: seeded(seed),
             ingest: None,
             verification: None,
         }
@@ -1473,7 +1509,7 @@ mod tests {
         };
         let source_uri = format!("hf://org/model@{}", "88".repeat(20));
         let evidence = CheckpointEvidence {
-            classification_digest: format!("sha256:{}", "55".repeat(32)),
+            digests: seeded(0x55),
             ingest: Some(IngestProvenance {
                 source_dialect: "safetensors.diffusers".into(),
                 converter_build: format!("sha256:{}", "66".repeat(32)),

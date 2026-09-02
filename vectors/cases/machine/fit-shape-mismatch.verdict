@@ -1,0 +1,4 @@
+doc: machine_fit
+expect: ok
+id: sha256:2b324e10d95f9211d1bd844fc4be98a365710802426b731f2feced09e4cf72d8
+note: rule (2) before rule (3): the planted shape edit answers even though a dtype cast comes first in walk order

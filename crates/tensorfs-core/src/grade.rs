@@ -28,9 +28,9 @@
 //! first, and a catalog search built on the first would offer conversions that cannot work.
 
 use crate::canon::{self, as_arr, as_str, Fields, Value};
-use crate::compat::{CompatibilityReport, Details};
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Result};
+use crate::fit::{CompatibilityReport, Details};
 use crate::ids::{prefixed, ObjectRef};
 use crate::limits;
 
@@ -693,7 +693,7 @@ pub fn severity(g: &Grade) -> u8 {
 /// built from ITS OWN fact's contract side. The remedy and the level always come from the
 /// same fact; ties keep the earliest in canonical order, so the answer is deterministic.
 pub fn grade_all(report: &CompatibilityReport, reg: &Registry) -> Result<Grade> {
-    if report.depth != crate::compat::Depth::Full {
+    if report.depth != crate::fit::Depth::Full {
         return refuse(
             Code::PARTIAL_MISMATCH_SET,
             format!(
@@ -719,8 +719,8 @@ pub fn grade_all(report: &CompatibilityReport, reg: &Registry) -> Result<Grade> 
 /// the caller does not get to pretend it asked the other one.
 pub fn grade_report(report: &CompatibilityReport, reg: &Registry) -> Result<Grade> {
     match report.depth {
-        crate::compat::Depth::Full => grade_all(report, reg),
-        crate::compat::Depth::FirstMismatch => {
+        crate::fit::Depth::Full => grade_all(report, reg),
+        crate::fit::Depth::FirstMismatch => {
             let g = grade(report, reg);
             guard_over_constraint(report, reg, &g)?;
             Ok(g)
@@ -734,10 +734,7 @@ pub fn grade_report(report: &CompatibilityReport, reg: &Registry) -> Result<Grad
 /// down to the form the mapping can widen FROM. A regroup changes key counts and shapes and
 /// is deliberately not auto-applied — it is a real conversion whose plan belongs to a job,
 /// and a grader that pretended otherwise would be planning.
-pub fn apply(
-    m: &Mapping,
-    code: &crate::compat::CodeTopology,
-) -> Option<crate::compat::CodeTopology> {
+pub fn apply(m: &Mapping, code: &crate::fit::CodeTopology) -> Option<crate::fit::CodeTopology> {
     let mut out = code.clone();
     match m {
         Mapping::Rename { pairs } => {
@@ -772,29 +769,26 @@ pub fn apply(
 ///
 /// Bounded by the registration count, and every pass is header-only, so the whole thing
 /// still decides pre-download.
-#[allow(clippy::too_many_arguments)]
 pub fn resolve(
-    code: &crate::compat::CodeTopology,
+    code: &crate::fit::CodeTopology,
     header: &crate::header::Header,
     closure: &crate::header::Closure,
     pin: &[String],
-    lane: crate::compat::Lane,
-    known_markers: &[String],
+    custody: crate::fit::Custody,
     reg: &Registry,
 ) -> Result<(CompatibilityReport, Grade)> {
     // The FIRST walk is FULL: the report this returns is the hub's document, and the hub
     // ranks. The re-checks below ask only "does the mapped topology satisfy outright", and
     // one fact answers that, so they take the cheap path.
-    let out = crate::compat::check_compatibility(
+    let out = crate::fit::check_compatibility(
         code,
         header,
         closure,
         pin,
-        lane,
-        known_markers,
-        crate::compat::Depth::Full,
+        custody,
+        crate::fit::Depth::Full,
     )?;
-    let report = CompatibilityReport::of(code, header, lane, &out)?;
+    let report = CompatibilityReport::of(code, header, custody, &out)?;
     if out.is_satisfied() {
         return Ok((report, Grade::Compatible));
     }
@@ -803,14 +797,13 @@ pub fn resolve(
             Some(m) => m,
             None => continue,
         };
-        let re = crate::compat::check_compatibility(
+        let re = crate::fit::check_compatibility(
             &mapped,
             header,
             closure,
             pin,
-            lane,
-            known_markers,
-            crate::compat::Depth::FirstMismatch,
+            custody,
+            crate::fit::Depth::FirstMismatch,
         )?;
         if re.is_satisfied() {
             return Ok((

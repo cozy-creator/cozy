@@ -21,10 +21,16 @@ tensors = [
 raw = tensorfs.code_topology(contract, tensors)
 document: dict[str, object] = json.loads(raw)
 assert document["contract"] == contract
+assert document["constructed_components"] == ["dit"]
 components = document["components"]
 assert isinstance(components, dict)
 assert list(components) == ["dit"]
+assert "pinned" not in components["dit"]["block.0.weight"]
 assert tensorfs.object_id(raw).startswith("sha256:")
+pinned = tensorfs.code_topology(
+    contract, [tensorfs.CodeTensor("dit", "ids", "i64", [77], "any", pinned=True)]
+)
+assert json.loads(pinned)["components"]["dit"]["ids"]["pinned"] is True
 
 
 def refuses(code: str, call: Callable[[], bytes]) -> None:
@@ -37,6 +43,10 @@ def refuses(code: str, call: Callable[[], bytes]) -> None:
 
 
 refuses("EMPTY_COMPONENTS", lambda: tensorfs.code_topology(contract, []))
+refuses(
+    "MISSING_COMPONENT",
+    lambda: tensorfs.code_topology(contract, tensors, constructed_components=["vae"]),
+)
 refuses(
     "SORT_ORDER",
     lambda: tensorfs.code_topology(contract, [tensors[1], tensors[0]]),

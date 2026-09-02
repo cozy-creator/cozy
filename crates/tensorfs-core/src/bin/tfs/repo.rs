@@ -180,10 +180,15 @@ fn checkpoint_fact_rows(
         ("object_count", Value::uint(facts.object_count)),
         ("org", Value::str(repository.repo.org.clone())),
     ];
-    if let (Some(header), Some(topology)) = (&facts.header, &facts.topology_digest) {
+    if let (Some(header), Some(digests)) = (&facts.header, &facts.digests) {
+        fields.push(("config_digest", Value::str(digests.config_digest.clone())));
         fields.push(("header_length", Value::uint(header.length)));
         fields.push(("header_sha256", Value::str(header.sha256.clone())));
-        fields.push(("topology_digest", Value::str(topology.clone())));
+        fields.push(("shape_digest", Value::str(digests.shape_digest.clone())));
+        fields.push((
+            "topology_digest",
+            Value::str(digests.topology_digest.clone()),
+        ));
     }
     let mut rows = vec![tensorfs_core::canon::write(&Value::obj(fields))];
     for (object_kind, object) in &facts.objects {
@@ -271,6 +276,150 @@ pub fn cmd_repo_list(root: &Path, flags: &Flags) -> ExitCode {
         .and_then(|lines| storage::write_json_lines(Path::new(rows), &lines))
     {
         return bail(error);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `tfs repo migrate <store>`: re-derive every checkpoint row's `topology_digest`,
+/// `shape_digest` and `config_digest` from the header its manifest names, and rewrite
+/// the repository document when the row disagrees or predates the three-digest row
+/// (tfs-042 — such a row carried one `classification_digest`). Reads the documents
+/// loosely on purpose: a row this verb exists to fix does not parse strictly. Follow with
+/// `tfs store rebuild <store> --sqlite <store>/tensorfs.sqlite`.
+pub fn cmd_repo_migrate(root: &Path, flags: &Flags) -> ExitCode {
+    let store = match Store::open(root) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    let _rebuild = match WriterGuard::lock_rebuild(root) {
+        Ok(guard) => guard,
+        Err(error) => return bail(error),
+    };
+    let dry = flag(flags, "dry-run").is_some();
+    let mut paths = Vec::new();
+    for org in fs::read_dir(root.join("repos"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        for entry in fs::read_dir(org.path()).into_iter().flatten().flatten() {
+            if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
+                paths.push(entry.path());
+            }
+        }
+    }
+    paths.sort();
+    let (mut rewritten, mut rows) = (0usize, 0usize);
+    for path in paths {
+        let bytes = match read(&path) {
+            Ok(value) => value,
+            Err(error) => return bail(error),
+        };
+        let mut document = match tensorfs_core::canon::parse(
+            &bytes,
+            tensorfs_core::repository::MAX_REPOSITORY_BYTES,
+        ) {
+            Ok(value) => value,
+            Err(error) => return bail(error),
+        };
+        let Value::Obj(fields) = &mut document else {
+            eprintln!("REFUSED WRONG_TYPE: {} is not an object", path.display());
+            return ExitCode::FAILURE;
+        };
+        let Some((_, Value::Arr(checkpoints))) =
+            fields.iter_mut().find(|(k, _)| k == "checkpoints")
+        else {
+            eprintln!(
+                "REFUSED MISSING_FIELD: {} has no checkpoints",
+                path.display()
+            );
+            return ExitCode::FAILURE;
+        };
+        for checkpoint in checkpoints.iter_mut() {
+            let Value::Obj(row) = checkpoint else {
+                continue;
+            };
+            let manifest = match row.iter().find(|(k, _)| k == "manifest") {
+                Some((_, value)) => match ObjectRef::from_value("checkpoint.manifest", value) {
+                    Ok(value) => value,
+                    Err(error) => return bail(error),
+                },
+                None => continue,
+            };
+            let Some((_, Value::Obj(evidence))) = row.iter_mut().find(|(k, _)| k == "evidence")
+            else {
+                continue;
+            };
+            let manifest = match store.read_manifest(&manifest) {
+                Ok(value) => value,
+                Err(error) => return bail(error),
+            };
+            let Some(header_ref) = manifest.header() else {
+                continue;
+            };
+            let header = match tensorfs_core::checkpoint::load_header(&store, header_ref) {
+                Ok(value) => value,
+                Err(error) => return bail(error),
+            };
+            let digests = header.digests();
+            evidence.retain(|(k, _)| {
+                !matches!(
+                    k.as_str(),
+                    "classification_digest" | "topology_digest" | "shape_digest" | "config_digest"
+                )
+            });
+            evidence.push((
+                "config_digest".to_string(),
+                Value::str(digests.config_digest),
+            ));
+            evidence.push(("shape_digest".to_string(), Value::str(digests.shape_digest)));
+            evidence.push((
+                "topology_digest".to_string(),
+                Value::str(digests.topology_digest),
+            ));
+            evidence.sort_by(|a, b| a.0.cmp(&b.0));
+            rows += 1;
+        }
+        let replacement = match Repository::parse(&tensorfs_core::canon::write(&document)) {
+            Ok(value) => value.canonical_bytes(),
+            Err(error) => return bail(error),
+        };
+        if replacement == bytes {
+            continue;
+        }
+        rewritten += 1;
+        println!("migrate      {}", path.display());
+        if dry {
+            continue;
+        }
+        let temporary = path.with_extension(format!("json.migrate.{}", std::process::id()));
+        if let Err(error) = write(&temporary, &replacement).and_then(|()| {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).map_err(
+                |error| Refusal {
+                    code: Code::IO_FAILED,
+                    detail: format!("chmod {}: {error}", temporary.display()),
+                },
+            )?;
+            fs::rename(&temporary, &path).map_err(|error| Refusal {
+                code: Code::IO_FAILED,
+                detail: format!("rename {}: {error}", path.display()),
+            })
+        }) {
+            let _ = fs::remove_file(&temporary);
+            return bail(error);
+        }
+    }
+    println!(
+        "{rows} checkpoint row(s) re-derived, {rewritten} repository document(s) {}",
+        if dry { "would change" } else { "rewritten" }
+    );
+    if rewritten > 0 && !dry {
+        println!(
+            "next: tfs store rebuild {} --sqlite {}",
+            root.display(),
+            root.join("tensorfs.sqlite").display()
+        );
     }
     ExitCode::SUCCESS
 }
@@ -598,7 +747,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                 Ok(value) => value,
                 Err(error) => return bail(error),
             };
-            let (header_bytes, classification) = match (parsed.header(), flag(flags, "header")) {
+            let (header_bytes, derived) = match (parsed.header(), flag(flags, "header")) {
                 (Some(header_ref), Some(header_path)) => {
                     let bytes = match read(Path::new(header_path)) {
                         Ok(value) => value,
@@ -614,9 +763,11 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                         Ok(value) => value,
                         Err(error) => return bail(error),
                     };
-                    let topology = header.topology_digest();
-                    println!("topology_digest {topology}");
-                    (Some(bytes), Some(topology))
+                    let digests = header.digests();
+                    println!("topology_digest {}", digests.topology_digest);
+                    println!("shape_digest    {}", digests.shape_digest);
+                    println!("config_digest   {}", digests.config_digest);
+                    (Some(bytes), Some(digests))
                 }
                 (None, None) => (None, None),
                 (Some(_), None) => {
@@ -632,7 +783,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                 Ok(value) => value,
                 Err(error) => return bail(error),
             };
-            Some((manifest_bytes, header_bytes, inventory, classification))
+            Some((manifest_bytes, header_bytes, inventory, derived))
         }
         Mutation::RemoveCheckpoint { .. }
         | Mutation::UpdateRelease { .. }
@@ -640,8 +791,8 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
         | Mutation::DeleteRepository { .. } => None,
     };
 
-    let classification = inputs.as_ref().and_then(|inputs| inputs.3.as_deref());
-    let replacement = match repository::apply(current_bytes.as_deref(), &mutation, classification) {
+    let derived = inputs.as_ref().and_then(|inputs| inputs.3.as_ref());
+    let replacement = match repository::apply(current_bytes.as_deref(), &mutation, derived) {
         Ok(value) => value,
         Err(error) => return bail(error),
     };

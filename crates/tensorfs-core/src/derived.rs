@@ -2496,12 +2496,7 @@ fn receipt_from(store: &Store, row: &TransactionRow) -> Result<ReceiptFacts> {
         );
     }
     let header_bytes = checkpoint::load_header(store, &header)?;
-    if evidence.classification_digest != header_bytes.topology_digest() {
-        return refuse(
-            Code::TOPOLOGY_MISMATCH,
-            "derived CheckpointEvidence classification differs from its final header",
-        );
-    }
+    crate::repository::require_digests(&evidence.digests, &header_bytes.digests())?;
     Ok(ReceiptFacts {
         transaction: row.id.clone(),
         declaration,
@@ -2554,7 +2549,7 @@ pub fn commit(
         );
     }
     let checkpoint_evidence = crate::repository::CheckpointEvidence {
-        classification_digest: header.topology_digest(),
+        digests: header.digests(),
         ingest: None,
         verification: None,
     }

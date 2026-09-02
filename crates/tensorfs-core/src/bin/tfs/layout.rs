@@ -1,8 +1,8 @@
-//! The layout plane's CLI (tfs-009): `check_compatibility`, hub grading, the round-trip
-//! registration act, and the hermetic verifier's bounded document interface.
+//! The fit and layout CLI: `tfs fit` (tfs-042, the one code <-> checkpoint answer), the
+//! grade plane's walk and ranking (search only, D11), and the round-trip registration act.
 //!
-//! This file is a CONSUMER of the two decision modules. It prints grades because someone
-//! has to; it never decides one.
+//! This file is a CONSUMER of the decision modules. It prints answers because someone has
+//! to; it never decides one.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -10,20 +10,19 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use tensorfs_core::capability::CapabilityRecords;
 use tensorfs_core::checkpoint as ck;
-use tensorfs_core::compat::{
-    self, Accepts, CodeTopology, CompatibilityReport, Lane, Requirement, Satisfaction,
-};
 use tensorfs_core::dtype::Dtype;
+use tensorfs_core::fit::{
+    self, Accepts, CodeTopology, CompatibilityReport, Custody, Fit, Requirement,
+};
 use tensorfs_core::grade::{self, ConversionRegistration, Grade, GradeDecision, Mapping, Registry};
 use tensorfs_core::header::Header;
 use tensorfs_core::ids::{ObjectRef, Plain};
-use tensorfs_core::ingest::fingerprint::MARKER_SUFFIXES;
 use tensorfs_core::limits;
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::Store;
-use tensorfs_core::verifier::{self, VerifyRequest};
 
 use crate::{bail, flag, flag_on, rss_kb, Flags};
 
@@ -34,10 +33,6 @@ macro_rules! ok {
             Err(e) => return bail(e),
         }
     };
-}
-
-fn markers() -> Vec<String> {
-    MARKER_SUFFIXES.iter().map(|s| s.to_string()).collect()
 }
 
 fn read(p: &Path) -> Result<Vec<u8>, ExitCode> {
@@ -83,6 +78,7 @@ pub fn cmd_topology(root: &Path, hex: &str, flags: &Flags) -> ExitCode {
     println!("contract     {}", code.contract);
     println!("tensors      {}", code.count());
     println!("topology     {}", code.topology_digest());
+    println!("shape        {}", code.shape_digest());
     ExitCode::SUCCESS
 }
 
@@ -103,6 +99,7 @@ pub fn project(h: &Header, contract_name: &str) -> CodeTopology {
                                     dtype: t.dtype,
                                     shape: t.shape.clone(),
                                     accepts: Accepts::OneOf(vec![t.encoding.clone()]),
+                                    pinned: false,
                                 },
                             )
                         })
@@ -110,7 +107,86 @@ pub fn project(h: &Header, contract_name: &str) -> CodeTopology {
                 )
             })
             .collect(),
+        constructed_components: h.components.iter().map(|(c, _)| c.clone()).collect(),
     }
+}
+
+/// `tfs fit <code-topology.json> <root> <header> [--custody local] [--device <class>
+/// --observations <obs.json>] [--json]` — design §3, the only compatibility verdict.
+///
+/// `<header>` is a header object id in `<root>` or a path to header bytes. Exit 0 on
+/// `ok`; every refusal has its own exit code so a caller can branch without parsing, and
+/// `--json` prints the total machine document (`machine::fit_json`).
+pub fn cmd_fit(code_p: &Path, root: &Path, header_arg: &str, flags: &Flags) -> ExitCode {
+    let code = ok!(CodeTopology::parse(&rd!(code_p)));
+    let header = match tensorfs_core::ids::hex64("header", header_arg) {
+        Ok(_) => {
+            let store = ok!(Store::open(root));
+            let length = match fs::metadata(store.object_path(header_arg)) {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    eprintln!("REFUSED OBJECT_ABSENT: {header_arg}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            ok!(ck::load_header(
+                &store,
+                &ObjectRef {
+                    sha256: header_arg.to_string(),
+                    length,
+                }
+            ))
+        }
+        Err(_) => ok!(Header::parse(&rd!(Path::new(header_arg)))),
+    };
+    let custody = ok!(Custody::parse(
+        flag(flags, "custody").unwrap_or("canonical")
+    ));
+    let observations = match flag(flags, "observations") {
+        Some(p) => Some(ok!(CapabilityRecords::parse_observed(&rd!(Path::new(p))))),
+        None => None,
+    };
+    let device = flag(flags, "device");
+    if observations.is_some() && device.is_none() {
+        eprintln!("REFUSED MISSING_FIELD: --observations names records for a --device");
+        return ExitCode::FAILURE;
+    }
+    let t = Instant::now();
+    let verdict = ok!(fit::fit(
+        &code,
+        &header,
+        custody,
+        device,
+        observations.as_ref()
+    ));
+    let us = t.elapsed().as_secs_f64() * 1e6;
+    if flag_on(flags, "json") {
+        println!(
+            "{}",
+            String::from_utf8_lossy(&tensorfs_core::machine::fit_json(&verdict, custody))
+        );
+        return ExitCode::from(verdict.exit_code());
+    }
+    println!("fit          {}", verdict.code());
+    println!("detail       {}", verdict.text());
+    println!("custody      {}", custody.name());
+    println!(
+        "shape        code {} / checkpoint {} — {}",
+        &code.shape_digest()[7..19],
+        &header.shape_digest()[7..19],
+        if code.shape_digest() == header.shape_digest() {
+            "the fit index HITS"
+        } else {
+            "index miss; the answer is the walk above"
+        }
+    );
+    if let Fit::Ok { ignored, .. } = &verdict {
+        for key in ignored {
+            println!("ignored      {key}");
+        }
+    }
+    println!("in {us:.0} us");
+    ExitCode::from(verdict.exit_code())
 }
 
 /// Build a canonical header + code topology out of NEUTRAL measured rows.
@@ -266,6 +342,7 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
                 dtype,
                 shape,
                 accepts: Accepts::OneOf(vec![sid]),
+                pinned: false,
             },
         ));
     }
@@ -302,7 +379,8 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
     ok!(header.validate(&closure));
     let code = CodeTopology {
         contract: tensorfs_core::ids::object_id(provenance.as_bytes()),
-        components: vec![(component, reqs)],
+        components: vec![(component.clone(), reqs)],
+        constructed_components: vec![component],
     };
     if let Some(p) = flag(flags, "out-header") {
         let _ = fs::write(p, ok!(header.canonical_bytes()));
@@ -465,22 +543,18 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
             v
         }
     };
-    let lane = ok!(Lane::parse(flag(flags, "lane").unwrap_or("canonical")));
-    let depth = ok!(compat::Depth::parse(
+    let custody = ok!(Custody::parse(
+        flag(flags, "custody").unwrap_or("canonical")
+    ));
+    let depth = ok!(fit::Depth::parse(
         flag(flags, "depth").unwrap_or("first-mismatch")
     ));
     let t = Instant::now();
-    let out = ok!(compat::check_compatibility(
-        &code,
-        &header,
-        &closure,
-        &pin,
-        lane,
-        &markers(),
-        depth
+    let out = ok!(fit::check_compatibility(
+        &code, &header, &closure, &pin, custody, depth
     ));
     let us = t.elapsed().as_secs_f64() * 1e6;
-    let report = ok!(CompatibilityReport::of(&code, &header, lane, &out));
+    let report = ok!(CompatibilityReport::of(&code, &header, custody, &out));
     emit(&report, flags);
 
     // The machine surface (proto-020). A caller that shells out to this command must not
@@ -497,7 +571,7 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    println!("lane         {}", lane.name());
+    println!("custody      {}", custody.name());
     println!(
         "topology     required {} / present {} — {}",
         &report.topology_required[7..19],
@@ -510,9 +584,9 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
     );
     println!(
         "shape        required {} / present {} — {}",
-        &report.topology_shape_required[7..19],
-        &report.topology_shape_present[7..19],
-        if report.topology_shape_required == report.topology_shape_present {
+        &report.shape_required[7..19],
+        &report.shape_present[7..19],
+        if report.shape_required == report.shape_present {
             "same shapes, so any difference is dtype or encoding alone (a search bucket)"
         } else {
             "different shapes: a different model, not a different packaging"
@@ -556,7 +630,7 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
     }
     if !out.unconsumed.is_empty() {
         println!(
-            "unconsumed   {} key(s) warned-ignored-confessed, first {:?}",
+            "unconsumed   {} key(s) listed and ignored on local custody, first {:?}",
             out.unconsumed.len(),
             out.unconsumed[0]
         );
@@ -569,7 +643,7 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn side(s: &compat::Side) -> String {
+fn side(s: &fit::Side) -> String {
     let mut v = Vec::new();
     if let Some(d) = s.dtype {
         v.push(d.name().to_string());
@@ -736,8 +810,8 @@ pub fn cmd_grade(report_p: &Path, flags: &Flags) -> ExitCode {
         Ok(r) => r,
         Err(c) => return c,
     };
-    // Grading over a report ALONE cannot prove a registration closes the whole gap — only
-    // `verify-compat`, which holds both documents, can. `--prove-with` supplies them here.
+    // Grading over a report ALONE cannot prove a registration closes the whole gap; holding
+    // both documents can. `--code`/`--header` supply them here.
     let t = Instant::now();
     let g = match (flag(flags, "code"), flag(flags, "header")) {
         (Some(c), Some(h)) => {
@@ -762,8 +836,7 @@ pub fn cmd_grade(report_p: &Path, flags: &Flags) -> ExitCode {
                 &header,
                 &closure,
                 &pin,
-                report.lane,
-                &markers(),
+                report.custody,
                 &reg
             ))
             .1
@@ -787,8 +860,8 @@ pub fn cmd_grade(report_p: &Path, flags: &Flags) -> ExitCode {
         "grade        {} — the {} of {} fact(s) at depth {}",
         g.name(),
         match report.depth {
-            compat::Depth::Full => "WORST",
-            compat::Depth::FirstMismatch => "first",
+            fit::Depth::Full => "WORST",
+            fit::Depth::FirstMismatch => "first",
         },
         report.mismatches.len(),
         report.depth.name()
@@ -953,114 +1026,4 @@ pub fn cmd_grade_stream(path: Option<&Path>, flags: &Flags) -> ExitCode {
         };
         Ok(tensorfs_core::machine::grade_json(&decision, &report))
     })
-}
-
-// ------------------------------------------------------------------ the hermetic verifier
-
-/// Build a request out of loose documents, so the seam can be driven by hand.
-pub fn cmd_request(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
-    let code_topology = rd!(code_p);
-    let header_bytes = rd!(header_p);
-    let header = ok!(Header::parse(&header_bytes));
-    let mut closure = Vec::new();
-    for p in flag(flags, "closure").unwrap_or("").split(',') {
-        if !p.is_empty() {
-            closure.push(rd!(Path::new(p)));
-        }
-    }
-    let mut registrations = Vec::new();
-    for p in flag(flags, "registry").unwrap_or("").split(',') {
-        if !p.is_empty() {
-            registrations.push(rd!(Path::new(p)));
-        }
-    }
-    let pin: Vec<String> = match flag(flags, "pin") {
-        Some(p) if !p.is_empty() => p.split(',').map(|s| s.to_string()).collect(),
-        _ => header
-            .encodings
-            .iter()
-            .map(EncodingSpec::object_id)
-            .collect(),
-    };
-    let req = VerifyRequest {
-        code_topology,
-        header: header_bytes,
-        closure,
-        registrations,
-        lane: ok!(Lane::parse(flag(flags, "lane").unwrap_or("canonical"))),
-        pin,
-        known_markers: markers(),
-    };
-    emit(&req, flags);
-    println!("request      {}", req.object_id());
-    println!("bytes        {}", req.canonical_bytes().len());
-    ExitCode::SUCCESS
-}
-
-/// The verifier process. One file in, one file out, written whole or not at all.
-pub fn cmd_verify(req_p: &Path, out_p: &Path, flags: &Flags) -> ExitCode {
-    let bytes = rd!(req_p);
-    if bytes.len() > limits::DOC_MAX_BYTES {
-        eprintln!("REFUSED SIZE_CAP: request over the document cap");
-        return ExitCode::FAILURE;
-    }
-    let t = Instant::now();
-    let response = ok!(verifier::run(&bytes));
-    // A dev-only truncation point, so the CONSUMER's partial-output refusal can be armed
-    // against a real short file rather than described.
-    let response = match flag(flags, "truncate-at") {
-        Some(n) => response[..n.parse::<usize>().unwrap_or(0).min(response.len())].to_vec(),
-        None => response,
-    };
-    let tmp = out_p.with_extension("partial");
-    if let Err(e) = fs::write(&tmp, &response).and_then(|_| fs::rename(&tmp, out_p)) {
-        eprintln!("REFUSED IO_FAILED: write response: {e}");
-        return ExitCode::FAILURE;
-    }
-    println!(
-        "verified     {} B response in {:.2} ms, peak RSS {:.1} MiB",
-        response.len(),
-        t.elapsed().as_secs_f64() * 1000.0,
-        rss_kb("VmHWM") as f64 / 1024.0
-    );
-    ExitCode::SUCCESS
-}
-
-/// The verifier as a STREAM, over the same bounded document interface: one canonical
-/// `VerifyRequest` per line in, one canonical `VerifyResponse` per line out, each response
-/// still naming the sha256 of its own request. `verifier::run` is unchanged and still the
-/// whole verifier as a pure function of bytes to bytes — this only stops paying a process
-/// for each call to it, which is the end-to-end shape a catalog search wants: one code
-/// topology against many checkpoints without a fork per pair.
-///
-/// Every input still arrives inside its request, so the loop resolves no digest, opens no
-/// store and reaches no network. Long-lived does not mean stateful.
-pub fn cmd_verify_stream(path: Option<&Path>) -> ExitCode {
-    let (mut reader, flush_each) = match stream_in(path) {
-        Ok(v) => v,
-        Err(c) => return c,
-    };
-    each_line(&mut reader, flush_each, verifier::run)
-}
-
-/// The hub's side: consume a response, or refuse. Nothing between those two.
-pub fn cmd_consume(req_p: &Path, resp_p: &Path) -> ExitCode {
-    let req = rd!(req_p);
-    let resp = fs::read(resp_p).unwrap_or_default();
-    let (report, decision) = ok!(verifier::consume(&req, &resp));
-    println!("report       {}", report.object_id());
-    println!("lane         {}", report.lane.name());
-    match report.satisfaction() {
-        Satisfaction::Satisfied => println!("satisfaction Satisfied"),
-        Satisfaction::Mismatch(d) => println!(
-            "satisfaction Mismatch {} at {}/{} ({} fact(s) at depth {})",
-            d.code.as_str(),
-            d.component,
-            d.key,
-            report.mismatches.len(),
-            report.depth.name()
-        ),
-    }
-    println!("grade        {}", decision.grade.name());
-    ExitCode::SUCCESS
 }
