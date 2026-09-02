@@ -1344,6 +1344,9 @@ pub fn write_json_lines(path: &Path, lines: &[Vec<u8>]) -> Result<()> {
     fs::write(path, bytes).map_err(|error| io(format!("write {}", path.display()), error))
 }
 
+/// Every addressable retained checkpoint: one `kind: "release"` row per release lane, and
+/// one `kind: "local"` row for a local alias, which is a checkpoint with a source selection
+/// and no release at all.
 pub fn repository_release_lines(root: &Path) -> Result<Vec<Vec<u8>>> {
     let mut lines = Vec::new();
     for (repository, _) in read_repositories(root)? {
@@ -1355,6 +1358,7 @@ pub fn repository_release_lines(root: &Path) -> Result<Vec<Vec<u8>>> {
                     .find(|checkpoint| checkpoint.manifest == lane.manifest)
                     .expect("validated repository release checkpoint");
                 let mut fields = vec![
+                    ("kind", Value::str("release")),
                     ("lane", Value::str(lane.lane.clone())),
                     ("manifest_length", Value::uint(lane.manifest.length)),
                     ("manifest_sha256", Value::str(lane.manifest.sha256.clone())),
@@ -1363,6 +1367,31 @@ pub fn repository_release_lines(root: &Path) -> Result<Vec<Vec<u8>>> {
                     ("release_revision", Value::uint(release.revision)),
                     ("release_yanked", Value::Bool(release.yanked)),
                     ("version", Value::str(release.version.clone())),
+                ];
+                if let Some(evidence) = &checkpoint.evidence {
+                    fields.push(("evidence", evidence.to_value()));
+                }
+                lines.push(crate::canon::write(&Value::obj(fields)));
+            }
+        }
+        if repository.repo.org == "local" {
+            if let Ok(checkpoint) = repository.local_checkpoint() {
+                let mut fields = vec![
+                    ("kind", Value::str("local")),
+                    ("manifest_length", Value::uint(checkpoint.manifest.length)),
+                    (
+                        "manifest_sha256",
+                        Value::str(checkpoint.manifest.sha256.clone()),
+                    ),
+                    ("name", Value::str(repository.repo.name.clone())),
+                    ("org", Value::str(repository.repo.org.clone())),
+                    (
+                        "source_selection",
+                        Value::str(format!(
+                            "sha256:{}",
+                            checkpoint.source_selection.as_deref().unwrap_or_default()
+                        )),
+                    ),
                 ];
                 if let Some(evidence) = &checkpoint.evidence {
                     fields.push(("evidence", evidence.to_value()));

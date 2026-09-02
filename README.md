@@ -117,6 +117,7 @@ tfs manifest get <store> <manifest_id> --out <manifest.json>
 tfs manifest admit <store> <manifest.json> --expect <sha256> [--expect-length <bytes>]
 tfs repo inspect <repo.json> --rows <rows.jsonl>
 tfs repo list <store> --rows <rows.jsonl>
+tfs repo usage <store> --rows <rows.jsonl>
 tfs repo get <store> <org> <name> --out <current.json>
 tfs repo apply <current.json|-> <mutation.json> \
   --manifest <manifest.json> --header <header.cbor> --inventory <blobs.jsonl> \
@@ -153,9 +154,19 @@ unique. TensorFS derives both sides from the resident Manifest, `cozytensors/1` 
 evidence before the Repository CAS. It accepts no encoding alias and leaves the prior alias intact
 on any mismatch.
 
-Each model row emitted by `repo list` carries the repository's exact canonical `evidence` object.
-Clients may preserve those bytes opaquely and base64-wrap them for a later `put_checkpoint`; TensorFS
-remains the only parser and canonical writer. Ordinary release rows omit evidence.
+`repo list` emits one `kind: "release"` row per release lane and one `kind: "local"` row per local
+alias (a checkpoint with a `source_selection` and no release). Each model row carries the
+repository's exact canonical `evidence` object. Clients may preserve those bytes opaquely and
+base64-wrap them for a later `put_checkpoint`; TensorFS remains the only parser and canonical
+writer. Ordinary release rows omit evidence.
+
+`repo usage` emits one `kind: "repo"` row per repository — `bytes_total`, the union of blobs its
+retained checkpoints reach through the same closure GC keeps alive (manifest entries plus the
+header's configs, assets and tensor segments), and `bytes_unique`, the part no other repository
+reaches, i.e. what deleting only it would free — then one `kind: "store"` row with the referenced
+union (`bytes_total`), `bytes_unique_sum`, `bytes_unreferenced` (verified blobs nothing retained
+reaches) and `repos`. Manifests are not counted; a blob counts once per repository however many
+paths list it.
 
 Evidence is present only for a Manifest containing one typed CozyTensors header. Ordinary files do
 not fabricate model classification. Rebuild always recovers the repository, Manifest, and complete

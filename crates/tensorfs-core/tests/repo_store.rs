@@ -257,6 +257,33 @@ fn local_alias_is_one_atomic_replaceable_checkpoint() {
         .unwrap();
     assert!(resolve.status.success());
     assert_eq!(resolve.stdout, replace.stdout);
+    // The alias has no release, and `repo list` lists it anyway: it is the one row a
+    // consumer can find a local model by.
+    let list = |root: &Path| -> String {
+        let rows = root.join("list.jsonl");
+        assert!(Command::new(env!("CARGO_BIN_EXE_tfs"))
+            .args([
+                "repo",
+                "list",
+                root.to_str().unwrap(),
+                "--rows",
+                rows.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success());
+        String::from_utf8(fs::read(rows).unwrap()).unwrap()
+    };
+    assert_eq!(
+        list(&root),
+        format!(
+            "{{\"evidence\":{},\"kind\":\"local\",\"manifest_length\":{},\"manifest_sha256\":\"{}\",\"name\":\"h3-dev\",\"org\":\"local\",\"source_selection\":\"sha256:{}\"}}\n",
+            String::from_utf8_lossy(&evidence_b.canonical_bytes()),
+            manifest_b.length,
+            manifest_b.sha256,
+            "33".repeat(32)
+        )
+    );
     let current = Repository::parse(&fs::read(store.repository_path(&repo)).unwrap()).unwrap();
     let digest = format!("sha256:{}", current.document_sha256());
     let remove = Command::new(env!("CARGO_BIN_EXE_tfs"))
@@ -275,6 +302,7 @@ fn local_alias_is_one_atomic_replaceable_checkpoint() {
         "{}",
         String::from_utf8_lossy(&remove.stderr)
     );
+    assert_eq!(list(&root), "");
     let _ = fs::remove_dir_all(root);
 }
 
