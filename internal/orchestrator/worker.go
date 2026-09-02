@@ -489,6 +489,12 @@ type worker struct {
 	refused map[string]*refusedOutcome
 	// lastReport is telemetry only. Elapsed time since it never settles or retires work.
 	lastReport time.Time
+	// activitySeq is the last activity entry logged from this worker's reports; a report
+	// whose newest entry is below it is a restarted worker whose lane starts over.
+	activitySeq uint64
+	// loggedFaults is every fault line this owner has logged from the worker's reports
+	// and not yet seen absent, so a fault repeating on the report cadence logs once.
+	loggedFaults map[string]bool
 	// LRU is dispatch-based, not report-based: reports say the worker lives, while an
 	// accepted attempt says a user actually used it. Never-used workers fall back to
 	// residentRevision so two cold holders still have a deterministic oldest member.
@@ -1998,4 +2004,52 @@ func (c *Orchestrator) ResumeQueuedRequests() *exit.Error {
 		c.selectOrStart(req)
 	}
 	return nil
+}
+
+// freshActivity is the report's activity entries this owner has not logged yet, in
+// order. Callers hold c.mu.
+func (w *worker) freshActivity(entries []*pb.ActivityEvent) []*pb.ActivityEvent {
+	var newest uint64
+	for _, a := range entries {
+		if a != nil && a.Seq > newest {
+			newest = a.Seq
+		}
+	}
+	if newest < w.activitySeq {
+		w.activitySeq = 0
+	}
+	var out []*pb.ActivityEvent
+	for _, a := range entries {
+		if a == nil || a.Seq <= w.activitySeq {
+			continue
+		}
+		w.activitySeq = a.Seq
+		out = append(out, a)
+	}
+	return out
+}
+
+// freshFaults is the report's worker and placement faults this owner has not logged
+// since they last appeared. A fault absent from a report is forgotten, so its return is
+// news again. Callers hold c.mu.
+func (w *worker) freshFaults(worker, placement []*pb.Fault) (fresh, freshPlacement []*pb.Fault) {
+	seen := map[string]bool{}
+	pick := func(scope string, faults []*pb.Fault) []*pb.Fault {
+		var out []*pb.Fault
+		for _, f := range faults {
+			if f == nil {
+				continue
+			}
+			key := fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s", scope, f.Kind, f.Subject, f.Reason, f.Detail)
+			seen[key] = true
+			if !w.loggedFaults[key] {
+				out = append(out, f)
+			}
+		}
+		return out
+	}
+	fresh = pick("worker", worker)
+	freshPlacement = pick("placement", placement)
+	w.loggedFaults = seen
+	return fresh, freshPlacement
 }

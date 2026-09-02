@@ -277,6 +277,7 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		return nil, exit.Named(exit.Conflict, "model_transfer.source_capability_incomplete",
 			"refreshed provider access returned %d of %d selected files", len(byMember), len(expected))
 	}
+	asked := false
 	for {
 		transfer, problem := c.opt.Store.ModelTransferOf(req.ID)
 		if problem != nil {
@@ -324,6 +325,12 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 				ModelSourceFileRequest: request}})
 		}
 		if allVerified {
+			if !asked {
+				asked = true
+				c.logf("model transfer %s: all %d source file(s) verified on %s; asking it to "+
+					"prepare %d profile(s) — the request stays queued until the pod answers",
+					req.ID, len(expected), session.instanceID, len(intent.SourceProfiles))
+			}
 			profiles := make([]*pb.ModelSourceProfile, 0, len(intent.SourceProfiles))
 			for slot, profile := range intent.SourceProfiles {
 				profiles = append(profiles, &pb.ModelSourceProfile{Slot: slot, Profile: profile})

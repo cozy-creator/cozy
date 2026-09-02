@@ -490,21 +490,34 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	for _, held := range heldVerdicts {
 		c.settleRefusedOutcome(s, held.requestID, held.ordinal, held.outcome)
 	}
-	// A latched fault is reported every ReportCadence; its first report is logged and the
-	// verdict on its repetition is logged once, above. The replays in between say nothing.
-	if !repeatedFault {
-		for _, f := range r.Faults {
-			c.logf("worker fault %s on %s: %s (%s)", pb.FaultKind_name[int32(f.Kind)],
-				f.Subject, f.Reason, f.Detail)
+	// A fault rides every ReportCadence until it clears; it is logged when it first
+	// appears and again only after it has been absent. The worker likewise puts its last
+	// few activity entries on EVERY report; an entry is logged once, when its seq first
+	// appears (cl-099: one executor spawn re-logged on every 2 s report read as a boot
+	// loop of hundreds of spawns on the owner's box).
+	if w != nil {
+		var placementFaults []*pb.Fault
+		if status != nil {
+			placementFaults = status.Faults
 		}
-	}
-	for _, a := range r.Activity {
-		c.logf("activity seq=%d %s: %s", a.Seq, a.Kind, a.Step)
-	}
-	if status != nil && !repeatedFault {
-		for _, f := range status.Faults {
-			c.logf("placement fault %s on %s: %s (%s)", pb.FaultKind_name[int32(f.Kind)],
-				f.Subject, f.Reason, f.Detail)
+		c.mu.Lock()
+		workerFaults, placementFaults := w.freshFaults(r.Faults, placementFaults)
+		fresh := w.freshActivity(r.Activity)
+		c.mu.Unlock()
+		if !repeatedFault {
+			for _, f := range workerFaults {
+				c.logf("worker fault %s on %s: %s (%s)", pb.FaultKind_name[int32(f.Kind)],
+					f.Subject, f.Reason, f.Detail)
+			}
+		}
+		for _, a := range fresh {
+			c.logf("activity seq=%d %s: %s", a.Seq, a.Kind, a.Step)
+		}
+		if !repeatedFault {
+			for _, f := range placementFaults {
+				c.logf("placement fault %s on %s: %s (%s)", pb.FaultKind_name[int32(f.Kind)],
+					f.Subject, f.Reason, f.Detail)
+			}
 		}
 	}
 	// DISPATCHABLE is the only state that can change the queue's answer. A free local
