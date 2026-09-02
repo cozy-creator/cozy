@@ -1042,7 +1042,7 @@ impl TransactionRow {
                     .as_bytes()
                     .to_vec();
                 let evidence = crate::repository::CheckpointEvidence::parse(&bytes)?;
-                if evidence.ingest.is_some() || evidence.verification.is_some() {
+                if evidence.ingest()?.is_some() || evidence.verification()?.is_some() {
                     return refuse(
                         Code::UNKNOWN_FIELD,
                         "derived CheckpointEvidence cannot claim foreign ingest or verification",
@@ -2489,7 +2489,7 @@ fn receipt_from(store: &Store, row: &TransactionRow) -> Result<ReceiptFacts> {
         })?;
     let evidence =
         crate::repository::CheckpointEvidence::parse(&checkpoint_evidence_canonical_bytes)?;
-    if evidence.ingest.is_some() || evidence.verification.is_some() {
+    if evidence.ingest()?.is_some() || evidence.verification()?.is_some() {
         return refuse(
             Code::UNKNOWN_FIELD,
             "derived CheckpointEvidence cannot claim foreign ingest or verification",
@@ -2497,7 +2497,7 @@ fn receipt_from(store: &Store, row: &TransactionRow) -> Result<ReceiptFacts> {
     }
     let header_bytes = checkpoint::load_header(store, &header)?;
     crate::repository::require_digests(
-        &evidence.digests,
+        evidence.digests()?.as_ref(),
         &checkpoint::digests(store, &header_bytes)?,
     )?;
     Ok(ReceiptFacts {
@@ -2551,11 +2551,11 @@ pub fn commit(
             "the addition set changed while commit constructed the target; retry commit",
         );
     }
-    let checkpoint_evidence = crate::repository::CheckpointEvidence {
-        digests: checkpoint::digests(store, &header)?,
-        ingest: None,
-        verification: None,
-    }
+    let checkpoint_evidence = crate::repository::CheckpointEvidence::new(
+        Some(checkpoint::digests(store, &header)?),
+        None,
+        None,
+    )
     .canonical_bytes();
     crate::repository::CheckpointEvidence::parse(&checkpoint_evidence)?;
     row.state = TransactionState::Committed(Disposition::Pending);

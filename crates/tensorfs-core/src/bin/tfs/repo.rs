@@ -9,7 +9,7 @@ use tensorfs_core::err::{Code, Refusal};
 use tensorfs_core::header::{Body, Header};
 use tensorfs_core::ids::{hex64, prefixed, Doc, ObjectRef};
 use tensorfs_core::manifest::{Entry, Manifest};
-use tensorfs_core::repository::{self, Mutation, Repository};
+use tensorfs_core::repository::{self, CheckpointEvidence, Mutation, Repository};
 use tensorfs_core::storage::{
     self, Census, CheckpointFacts as CensusCheckpointFacts, InventoryEntry, StagedCheckpoint,
 };
@@ -282,12 +282,11 @@ pub fn cmd_repo_list(root: &Path, flags: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `tfs repo migrate <store>`: re-derive every checkpoint row's `topology_digest`,
-/// `shape_digest` and `config_digest` from the header its manifest names, and rewrite
-/// the repository document when the row disagrees or predates the three-digest row
-/// (tfs-042 — such a row carried one `classification_digest`). Reads the documents
-/// loosely on purpose: a row this verb exists to fix does not parse strictly. Follow with
-/// `tfs store rebuild <store> --sqlite <store>/tensorfs.sqlite`.
+/// `tfs repo migrate <store>`: re-author every model checkpoint row's evidence in the
+/// current writer's shape — the three digests re-derived from the header its manifest
+/// names, plus the ingest provenance and verdict the row carries — and rewrite the
+/// repository document when that differs from what is stored. A key this build does not
+/// know is dropped. Follow with `tfs store rebuild <store> --sqlite <store>/tensorfs.sqlite`.
 pub fn cmd_repo_migrate(root: &Path, flags: &Flags) -> ExitCode {
     let store = match Store::open(root) {
         Ok(value) => value,
@@ -317,42 +316,15 @@ pub fn cmd_repo_migrate(root: &Path, flags: &Flags) -> ExitCode {
             Ok(value) => value,
             Err(error) => return bail(error),
         };
-        let mut document = match tensorfs_core::canon::parse(
-            &bytes,
-            tensorfs_core::repository::MAX_REPOSITORY_BYTES,
-        ) {
+        let mut repository = match Repository::parse(&bytes) {
             Ok(value) => value,
             Err(error) => return bail(error),
         };
-        let Value::Obj(fields) = &mut document else {
-            eprintln!("REFUSED WRONG_TYPE: {} is not an object", path.display());
-            return ExitCode::FAILURE;
-        };
-        let Some((_, Value::Arr(checkpoints))) =
-            fields.iter_mut().find(|(k, _)| k == "checkpoints")
-        else {
-            eprintln!(
-                "REFUSED MISSING_FIELD: {} has no checkpoints",
-                path.display()
-            );
-            return ExitCode::FAILURE;
-        };
-        for checkpoint in checkpoints.iter_mut() {
-            let Value::Obj(row) = checkpoint else {
+        for checkpoint in &mut repository.checkpoints {
+            let Some(evidence) = &checkpoint.evidence else {
                 continue;
             };
-            let manifest = match row.iter().find(|(k, _)| k == "manifest") {
-                Some((_, value)) => match ObjectRef::from_value("checkpoint.manifest", value) {
-                    Ok(value) => value,
-                    Err(error) => return bail(error),
-                },
-                None => continue,
-            };
-            let Some((_, Value::Obj(evidence))) = row.iter_mut().find(|(k, _)| k == "evidence")
-            else {
-                continue;
-            };
-            let manifest = match store.read_manifest(&manifest) {
+            let manifest = match store.read_manifest(&checkpoint.manifest) {
                 Ok(value) => value,
                 Err(error) => return bail(error),
             };
@@ -363,31 +335,21 @@ pub fn cmd_repo_migrate(root: &Path, flags: &Flags) -> ExitCode {
                 Ok(value) => value,
                 Err(error) => return bail(error),
             };
-            let digests = match tensorfs_core::checkpoint::digests(&store, &header) {
-                Ok(value) => value,
+            let rewritten =
+                tensorfs_core::checkpoint::digests(&store, &header).and_then(|digests| {
+                    Ok(CheckpointEvidence::new(
+                        Some(digests),
+                        evidence.ingest()?,
+                        evidence.verification()?,
+                    ))
+                });
+            checkpoint.evidence = match rewritten {
+                Ok(value) => Some(value),
                 Err(error) => return bail(error),
             };
-            evidence.retain(|(k, _)| {
-                !matches!(
-                    k.as_str(),
-                    "classification_digest" | "topology_digest" | "shape_digest" | "config_digest"
-                )
-            });
-            if let Some(config) = digests.config_digest {
-                evidence.push(("config_digest".to_string(), Value::str(config)));
-            }
-            evidence.push(("shape_digest".to_string(), Value::str(digests.shape_digest)));
-            evidence.push((
-                "topology_digest".to_string(),
-                Value::str(digests.topology_digest),
-            ));
-            evidence.sort_by(|a, b| a.0.cmp(&b.0));
             rows += 1;
         }
-        let replacement = match Repository::parse(&tensorfs_core::canon::write(&document)) {
-            Ok(value) => value.canonical_bytes(),
-            Err(error) => return bail(error),
-        };
+        let replacement = repository.canonical_bytes();
         if replacement == bytes {
             continue;
         }
@@ -633,12 +595,11 @@ pub fn cmd_local_replace(
             })
         }
     };
-    let evidence = match read(Path::new(evidence_path))
-        .and_then(|bytes| tensorfs_core::repository::CheckpointEvidence::parse(&bytes))
-    {
-        Ok(evidence) => evidence,
-        Err(error) => return bail(error),
-    };
+    let evidence =
+        match read(Path::new(evidence_path)).and_then(|bytes| CheckpointEvidence::parse(&bytes)) {
+            Ok(evidence) => evidence,
+            Err(error) => return bail(error),
+        };
     let manifest = ObjectRef {
         sha256: manifest_id.trim_start_matches("sha256:").to_string(),
         length,

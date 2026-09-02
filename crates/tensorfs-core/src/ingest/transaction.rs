@@ -280,11 +280,11 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
         sha256: id.trim_start_matches("sha256:").to_string(),
         length: snap.canonical_bytes().len() as u64,
     };
-    let evidence = CheckpointEvidence {
-        digests: ck::digests(store, header)?,
-        ingest: Some(ingest),
-        verification: Some(verification),
-    };
+    let evidence = CheckpointEvidence::new(
+        Some(ck::digests(store, header)?),
+        Some(ingest),
+        Some(verification),
+    );
     let checkpoint_manifest = manifest.clone();
     let checkpoint_evidence = evidence.clone();
     let local_mutation = if repo.org == "local" {
