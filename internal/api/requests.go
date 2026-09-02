@@ -622,24 +622,28 @@ func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBind
 // fields a local client has and a cloud one does not need to presign: the typed result,
 // the visible media by OPAQUE id, and the triage handle.
 type Lifecycle struct {
-	Number        int64            `json:"number"`
-	Kind          string           `json:"kind"`
-	RequestID     string           `json:"request_id"`
-	Status        string           `json:"status"`
-	Package       string           `json:"package"`
-	Function      string           `json:"function"`
-	Attempt       uint64           `json:"attempt"`
-	Attempts      int              `json:"attempts"`
-	QueuedMS      int64            `json:"queued_ms"`
-	ExecutionMS   int64            `json:"execution_ms"`
-	ResponseURL   string           `json:"response_url"`
-	Metrics       map[string]any   `json:"metrics,omitempty"`
-	ErrorType     string           `json:"error_type,omitempty"`
-	Error         string           `json:"error,omitempty"`
-	Result        any              `json:"result,omitempty"`
-	Outputs       []MediaRef       `json:"outputs"`
-	Triage        *TriageRef       `json:"triage,omitempty"`
-	Rental        bool             `json:"rental,omitempty"`
+	Number      int64          `json:"number"`
+	Kind        string         `json:"kind"`
+	RequestID   string         `json:"request_id"`
+	Status      string         `json:"status"`
+	Package     string         `json:"package"`
+	Function    string         `json:"function"`
+	Attempt     uint64         `json:"attempt"`
+	Attempts    int            `json:"attempts"`
+	QueuedMS    int64          `json:"queued_ms"`
+	ExecutionMS int64          `json:"execution_ms"`
+	ResponseURL string         `json:"response_url"`
+	Metrics     map[string]any `json:"metrics,omitempty"`
+	ErrorType   string         `json:"error_type,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	Result      any            `json:"result,omitempty"`
+	Outputs     []MediaRef     `json:"outputs"`
+	Triage      *TriageRef     `json:"triage,omitempty"`
+	Rental      bool           `json:"rental,omitempty"`
+	// Machine is the venue this request's work landed on: `local` for a worker this host
+	// spawned, the rental's owner-scoped machine name once a rental claims the request
+	// (cl-090), blank while unassigned. It never changes request identity or numbering.
+	Machine       string           `json:"machine"`
 	CreatedAt     string           `json:"created_at"`
 	QueuePosition *int             `json:"queue_position,omitempty"`
 	QueueDepth    *int             `json:"queue_depth,omitempty"`
@@ -720,6 +724,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	}
 	attempts, _ := s.store.Attempts(row.ID)
 	life.Attempts = len(attempts)
+	life.Machine = s.machineOf(row, len(attempts) > 0)
 	terminalAt, _ := s.store.TerminalEventAt(row.ID)
 	life.QueuedMS = queuedMS(row, attempts, terminalAt)
 	life.ExecutionMS = executionMS(row, attempts, terminalAt)
@@ -770,6 +775,23 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		}
 	}
 	return life
+}
+
+// machineOf reads the venue from current placement state, not submission state. A rental
+// claim is `requests.worker` (AssignManagedRental, or a pinned submission); every other
+// attempt runs on a worker this host spawned. A released rental's name may be gone from
+// the rentals table, so the immutable rental id stands in rather than a stale word.
+func (s *Server) machineOf(row records.Request, attempted bool) string {
+	if row.Worker != "" {
+		if rental, _ := s.store.RentalByMachine(row.Worker); rental != nil && rental.MachineName != "" {
+			return rental.MachineName
+		}
+		return row.Worker
+	}
+	if attempted {
+		return "local"
+	}
+	return ""
 }
 
 func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
