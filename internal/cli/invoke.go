@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/mattn/go-isatty"
+	"golang.org/x/term"
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -628,8 +630,8 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		return output.List{}, problem
 	}
 	list := output.List{
-		Name: "invocations", Fields: []string{"number", "target", "machine", "status", "queued", "execution"},
-		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status", "queued", "execution", "attempts", "created"},
+		Name: "invocations", Fields: []string{"number", "target", "machine", "status", "completion", "execution"},
+		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status", "completion", "progress_stage", "queued", "execution", "attempts", "created"},
 		// The raw rental id is a machine fact: JSON always carries it, the compact
 		// human table never does — the human word is the MACHINE column (cl-107).
 		Machine: []string{"rental_id"},
@@ -649,10 +651,12 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		list.Rows = append(list.Rows, map[string]string{
 			"number": strconv.FormatInt(life.Number, 10), "id": life.RequestID, "kind": kind,
 			"target": life.Package + "/" + life.Function, "machine": life.Machine,
-			"rental_id": life.RentalID,
-			"status":    status,
-			"queued":    seconds(life.QueuedMS), "execution": seconds(life.ExecutionMS),
-			"attempts": strconv.Itoa(life.Attempts), "created": life.CreatedAt,
+			"rental_id":  life.RentalID,
+			"status":     status,
+			"completion": completion(life), "progress_stage": life.ProgressStage,
+			"queued":    seconds(life.QueuedMS),
+			"execution": seconds(life.ExecutionMS),
+			"attempts":  strconv.Itoa(life.Attempts), "created": life.CreatedAt,
 		})
 		states[life.Status]++
 	}
@@ -667,29 +671,66 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 	return list, nil
 }
 
+func completion(life api.Lifecycle) string {
+	if life.Status != "in_progress" || life.Completion == nil {
+		return ""
+	}
+	value := fmt.Sprintf("%.0f%%", *life.Completion*100)
+	if life.RemainingMS != nil {
+		value += " · ~" + shortDuration(time.Duration(*life.RemainingMS)*time.Millisecond)
+	}
+	return value
+}
+
 func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error {
-	watchCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	if _, err := io.WriteString(ctx.Out, "\x1b[?1049h\x1b[?25l"); err != nil {
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	watchCtx, cancel := context.WithCancel(signalCtx)
+	defer stopSignals()
+	defer cancel()
+	navigation := make(chan runListNavigation, 32)
+	restoreInput, mouse := startRunListInput(cancel, navigation)
+	controls := "\x1b[?1049h\x1b[?25l"
+	if mouse {
+		controls += "\x1b[?1000h\x1b[?1006h"
+	}
+	if _, err := io.WriteString(ctx.Out, controls); err != nil {
+		restoreInput()
 		return exit.As(err)
 	}
-	defer func() { _, _ = io.WriteString(ctx.Out, "\x1b[?25h\x1b[?1049l") }()
-	render := func() *exit.Error {
-		list, problem := runList(watchCtx, client, ctx.Inv.Value("--state"), ctx.Inv.Value("--package"), limit)
-		if problem != nil {
-			return problem
+	defer func() {
+		if mouse {
+			_, _ = io.WriteString(ctx.Out, "\x1b[?1006l\x1b[?1000l")
 		}
-		list.Trail = append(list.Trail, "Refreshing every second · Ctrl-C to exit")
+		_, _ = io.WriteString(ctx.Out, "\x1b[?25h\x1b[?1049l")
+		restoreInput()
+	}()
+	var viewport runListViewport
+	draw := func() *exit.Error {
+		list := viewport.page(terminalHeight(ctx.Out), ctx.Mode().Full)
 		var frame strings.Builder
 		if err := list.Emit(&frame, ctx.Mode()); err != nil {
 			return exit.As(err)
 		}
-		if _, err := fmt.Fprintf(ctx.Out, "\x1b[H\x1b[J%s", frame.String()); err != nil {
+		body := frame.String()
+		if mouse {
+			// MakeRaw disables terminal newline translation. An explicit carriage return keeps
+			// every table row in column one on every refresh.
+			body = strings.ReplaceAll(body, "\n", "\r\n")
+		}
+		if _, err := fmt.Fprintf(ctx.Out, "\x1b[H\x1b[J%s", body); err != nil {
 			return exit.As(err)
 		}
 		return nil
 	}
-	if problem := render(); problem != nil {
+	refresh := func() *exit.Error {
+		list, problem := runList(watchCtx, client, ctx.Inv.Value("--state"), ctx.Inv.Value("--package"), limit)
+		if problem != nil {
+			return problem
+		}
+		viewport.update(list)
+		return draw()
+	}
+	if problem := refresh(); problem != nil {
 		if watchCtx.Err() != nil {
 			return nil
 		}
@@ -701,8 +742,13 @@ func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error 
 		select {
 		case <-watchCtx.Done():
 			return nil
+		case move := <-navigation:
+			viewport.move(move, terminalHeight(ctx.Out), ctx.Mode().Full)
+			if problem := draw(); problem != nil {
+				return problem
+			}
 		case <-ticker.C:
-			if problem := render(); problem != nil {
+			if problem := refresh(); problem != nil {
 				if watchCtx.Err() != nil {
 					return nil
 				}
@@ -710,6 +756,185 @@ func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error 
 			}
 		}
 	}
+}
+
+type runListNavigation uint8
+
+const (
+	runListUp runListNavigation = iota + 1
+	runListDown
+	runListPageUp
+	runListPageDown
+	runListHome
+	runListEnd
+)
+
+type runListViewport struct {
+	list   output.List
+	top    int
+	anchor string
+}
+
+func (v *runListViewport) update(list output.List) {
+	if v.top > 0 && v.anchor != "" {
+		for index, row := range list.Rows {
+			if row["id"] == v.anchor {
+				v.top = index
+				break
+			}
+		}
+	}
+	v.list = list
+}
+
+func (v *runListViewport) capacity(height int, full bool) int {
+	if height <= 0 {
+		height = 24
+	}
+	rows := max(1, height-len(v.list.Aggregates)-4)
+	if !full {
+		rows = min(rows, 20)
+	}
+	return rows
+}
+
+func (v *runListViewport) clamp(pageRows int) {
+	v.top = min(max(v.top, 0), max(0, len(v.list.Rows)-pageRows))
+	if v.top == 0 || len(v.list.Rows) == 0 {
+		v.anchor = ""
+		return
+	}
+	v.anchor = v.list.Rows[v.top]["id"]
+}
+
+func (v *runListViewport) move(move runListNavigation, height int, full bool) {
+	pageRows := v.capacity(height, full)
+	switch move {
+	case runListUp:
+		v.top--
+	case runListDown:
+		v.top++
+	case runListPageUp:
+		v.top -= pageRows
+	case runListPageDown:
+		v.top += pageRows
+	case runListHome:
+		v.top = 0
+	case runListEnd:
+		v.top = len(v.list.Rows)
+	}
+	v.clamp(pageRows)
+}
+
+func (v *runListViewport) page(height int, full bool) output.List {
+	pageRows := v.capacity(height, full)
+	v.clamp(pageRows)
+	end := min(v.top+pageRows, len(v.list.Rows))
+	page := v.list
+	page.Rows = v.list.Rows[v.top:end]
+	page.Total = len(page.Rows)
+	location := "no rows"
+	if end > v.top {
+		location = fmt.Sprintf("rows %d-%d/%d", v.top+1, end, len(v.list.Rows))
+	}
+	page.Trail = []string{fmt.Sprintf(
+		"1s refresh · %s · wheel/↑↓/PgUp/PgDn/Home/End · q/Ctrl-C exits", location)}
+	return page
+}
+
+func terminalHeight(w io.Writer) int {
+	file, ok := w.(*os.File)
+	if !ok {
+		return 0
+	}
+	_, height, err := term.GetSize(int(file.Fd()))
+	if err != nil {
+		return 0
+	}
+	return height
+}
+
+func startRunListInput(cancel context.CancelFunc, navigation chan<- runListNavigation) (func(), bool) {
+	fd := int(os.Stdin.Fd()) //cozy:stdin-value live-list navigation, never a prompt
+	if !term.IsTerminal(fd) {
+		return func() {}, false
+	}
+	state, err := term.MakeRaw(fd)
+	if err != nil {
+		return func() {}, false
+	}
+	go readRunListInput(bufio.NewReader(os.Stdin), cancel, navigation) //cozy:stdin-value navigation only
+	return func() { _ = term.Restore(fd, state) }, true
+}
+
+func readRunListInput(in *bufio.Reader, cancel context.CancelFunc, navigation chan<- runListNavigation) {
+	send := func(move runListNavigation) {
+		select {
+		case navigation <- move:
+		default:
+		}
+	}
+	for {
+		key, err := in.ReadByte()
+		if err != nil {
+			return
+		}
+		switch key {
+		case 3, 'q', 'Q':
+			cancel()
+			return
+		case 'k':
+			send(runListUp)
+		case 'j':
+			send(runListDown)
+		case 'g':
+			send(runListHome)
+		case 'G':
+			send(runListEnd)
+		case 0x1b:
+			if next, err := in.ReadByte(); err == nil && next == '[' {
+				if sequence := readRunListCSI(in); sequence != "" {
+					switch {
+					case sequence == "A":
+						send(runListUp)
+					case sequence == "B":
+						send(runListDown)
+					case sequence == "5~":
+						send(runListPageUp)
+					case sequence == "6~":
+						send(runListPageDown)
+					case sequence == "H", sequence == "1~", sequence == "7~":
+						send(runListHome)
+					case sequence == "F", sequence == "4~", sequence == "8~":
+						send(runListEnd)
+					case strings.HasPrefix(sequence, "<64;") && strings.HasSuffix(sequence, "M"):
+						for range 3 {
+							send(runListUp)
+						}
+					case strings.HasPrefix(sequence, "<65;") && strings.HasSuffix(sequence, "M"):
+						for range 3 {
+							send(runListDown)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func readRunListCSI(in *bufio.Reader) string {
+	var sequence strings.Builder
+	for sequence.Len() < 64 {
+		value, err := in.ReadByte()
+		if err != nil {
+			return ""
+		}
+		sequence.WriteByte(value)
+		if value >= 0x40 && value <= 0x7e {
+			return sequence.String()
+		}
+	}
+	return ""
 }
 
 func invocationFields(life api.Lifecycle) []output.Field {

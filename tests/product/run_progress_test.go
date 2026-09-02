@@ -4,6 +4,7 @@ package producttest
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -21,6 +23,12 @@ const ptyColumns = 80
 // ptyRun runs the product binary with a real pseudo-terminal on stdout/stderr, so the
 // suite observes exactly the bytes a person's terminal receives — escapes included.
 func ptyRun(t *testing.T, root string, args ...string) (int, string) {
+	return ptyRunInput(t, root, 24, nil, args...)
+}
+
+// ptyRunInput additionally binds stdin to the pseudo-terminal and sends each input after
+// a short observation window. This drives terminal interaction itself, not parser helpers.
+func ptyRunInput(t *testing.T, root string, rows uint16, input [][]byte, args ...string) (int, string) {
 	t.Helper()
 	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
 	must(t, err)
@@ -29,14 +37,22 @@ func ptyRun(t *testing.T, root string, args ...string) (int, string) {
 	number, err := unix.IoctlGetInt(int(master.Fd()), unix.TIOCGPTN)
 	must(t, err)
 	must(t, unix.IoctlSetWinsize(int(master.Fd()), unix.TIOCSWINSZ,
-		&unix.Winsize{Row: 24, Col: ptyColumns}))
+		&unix.Winsize{Row: rows, Col: ptyColumns}))
 	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", number), os.O_RDWR, 0)
 	must(t, err)
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
 	cmd.Env = childEnv(t, root)
-	cmd.Stdout, cmd.Stderr = slave, slave
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave //cozy:stdin-value test pty navigation
 	must(t, cmd.Start())
 	must(t, slave.Close()) // the child holds the slave now; EOF/EIO on master ends the read
+	timedOut := time.AfterFunc(10*time.Second, func() { _ = cmd.Process.Kill() })
+	defer timedOut.Stop()
+	go func() {
+		for _, keys := range input {
+			time.Sleep(500 * time.Millisecond)
+			_, _ = master.Write(keys)
+		}
+	}()
 	var out bytes.Buffer
 	_, _ = io.Copy(&out, master)
 	_ = cmd.Wait()
@@ -137,5 +153,64 @@ func TestRunProgressSurfaces(t *testing.T) {
 	}
 	if strings.ContainsAny(stderr, "\r\033") || strings.Contains(stderr, "tile_steps") {
 		t.Fatalf("--json stderr shows renderer output\n%q", stderr)
+	}
+
+	// The list reuses the same lossy Runtime progress lane. It reports actual completion
+	// only while the attempt is live; terminal rows go back to an empty machine value (a
+	// dash in the human table), because 100% beside "completed" would add no information.
+	code, _ = runCozy(t, root, "run", localWeightlessRef+"/tile",
+		"size=32", "seed=6", "delay_ms=6000")
+	if code != 0 {
+		t.Fatalf("detached progress run failed [exit %d]", code)
+	}
+	type completionRow struct {
+		Number     string `json:"number"`
+		Status     string `json:"status"`
+		Completion string `json:"completion"`
+	}
+	list := func() completionRow {
+		t.Helper()
+		code, out := runCozy(t, root, "--json", "--full", "run", "list", "--limit", "1")
+		var document struct {
+			Invocations []completionRow `json:"invocations"`
+		}
+		if code != 0 || json.Unmarshal([]byte(out), &document) != nil || len(document.Invocations) != 1 {
+			t.Fatalf("could not read the live completion row [exit %d]\n%s", code, out)
+		}
+		return document.Invocations[0]
+	}
+	live := list()
+	percent := regexp.MustCompile(`^[1-9][0-9]?% · ~[0-9.]+[a-z]+$`)
+	if live.Status != "in_progress" || !percent.MatchString(live.Completion) {
+		t.Fatalf("live run has no measured completion: %+v", live)
+	}
+	if code, out := runCozy(t, root, "run", "watch", live.Number, "--json"); code != 0 ||
+		!strings.Contains(out, `"status":"completed"`) {
+		t.Fatalf("completion proof run did not settle [exit %d]\n%s", code, out)
+	}
+	if terminal := list(); terminal.Status != "completed" || terminal.Completion != "" {
+		t.Fatalf("terminal run retained a redundant completion value: %+v", terminal)
+	}
+
+	// The live inventory is a real terminal viewport: a wheel event moves the bounded page,
+	// q exits cleanly, and every input/mouse/output mode is restored without echoing keys.
+	code, tty = ptyRunInput(t, root, 8,
+		[][]byte{[]byte("\x1b[<65;2;3M"), []byte("q")}, "run", "list", "--limit", "10")
+	if code != 0 {
+		t.Fatalf("q did not exit the live list cleanly [exit %d]\n%q", code, tty)
+	}
+	for _, control := range []string{
+		"\x1b[?1049h", "\x1b[?1049l", "\x1b[?25l", "\x1b[?25h",
+		"\x1b[?1000h", "\x1b[?1000l", "\x1b[?1006h", "\x1b[?1006l",
+	} {
+		if !strings.Contains(tty, control) {
+			t.Fatalf("live list did not emit terminal restoration %q\n%q", control, tty)
+		}
+	}
+	if !strings.Contains(tty, "rows 1-3/4") || !strings.Contains(tty, "rows 2-4/4") {
+		t.Fatalf("mouse wheel did not move the live viewport\n%q", tty)
+	}
+	if strings.Contains(tty, "[<65;2;3M") || strings.Contains(tty, "\x1b[<65;2;3Mq") {
+		t.Fatalf("terminal input was echoed as output\n%q", tty)
 	}
 }

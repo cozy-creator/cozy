@@ -45,14 +45,18 @@ type subscriber struct {
 }
 
 type fanout struct {
-	mu     sync.Mutex
-	next   uint64
-	subs   map[uint64]*subscriber
-	latest map[string]Frame // the most recent progress tick per request
+	mu       sync.Mutex
+	next     uint64
+	subs     map[uint64]*subscriber
+	latest   map[string]Frame // the most recent progress tick per request
+	progress map[string]progressAccumulator
 }
 
 func newFanout() *fanout {
-	return &fanout{subs: map[uint64]*subscriber{}, latest: map[string]Frame{}}
+	return &fanout{
+		subs: map[uint64]*subscriber{}, latest: map[string]Frame{},
+		progress: map[string]progressAccumulator{},
+	}
 }
 
 // Subscribe opens a live frame feed. An empty requestID takes every request's frames.
@@ -86,6 +90,78 @@ func (c *Orchestrator) LatestFrame(requestID string) (Frame, bool) {
 	return frame, ok
 }
 
+// ProgressSnapshot is the latest real work coordinate Runtime reported and an optional
+// estimate from the mean measured step time. It is observational and live-only.
+type ProgressSnapshot struct {
+	Stage       string
+	Fraction    float64
+	RemainingMS int64
+	Estimated   bool
+}
+
+type progressAccumulator struct {
+	attempt   uint64
+	stage     string
+	fraction  float64
+	position  float64
+	stepMSSum float64
+	samples   int64
+}
+
+func (c *Orchestrator) LatestProgress(requestID string, attempt uint64) (ProgressSnapshot, bool) {
+	f := c.frames
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	progress, ok := f.progress[requestID]
+	if !ok || progress.attempt != attempt {
+		return ProgressSnapshot{}, false
+	}
+	snapshot := ProgressSnapshot{Stage: progress.stage, Fraction: progress.fraction}
+	if progress.samples > 0 && progress.position > 0 && progress.fraction > 0 {
+		total := progress.position / progress.fraction
+		remaining := max(0, total-progress.position)
+		snapshot.RemainingMS = int64(remaining * progress.stepMSSum / float64(progress.samples))
+		snapshot.Estimated = true
+	}
+	return snapshot, true
+}
+
+func progressCoordinates(value any) (stage string, fraction, position, stepMS float64, ok bool) {
+	if direct, isNumber := value.(float64); isNumber {
+		return "", direct, 0, 0, direct >= 0 && direct <= 1
+	}
+	fields, isMap := value.(map[string]any)
+	if !isMap {
+		return "", 0, 0, 0, false
+	}
+	stage, _ = fields["name"].(string)
+	fraction, ok = fields["fraction"].(float64)
+	if !ok {
+		fraction, ok = fields["value"].(float64)
+	}
+	position, _ = fields["position"].(float64)
+	stepMS, _ = fields["step_ms"].(float64)
+	return stage, fraction, position, stepMS, ok && fraction >= 0 && fraction <= 1
+}
+
+func (f *fanout) observeProgress(frame Frame) {
+	stage, fraction, position, stepMS, ok := progressCoordinates(frame.Value)
+	if !ok {
+		return
+	}
+	progress := f.progress[frame.RequestID]
+	if progress.attempt != frame.Attempt || progress.stage != stage ||
+		position > 0 && progress.position > 0 && position <= progress.position {
+		progress = progressAccumulator{attempt: frame.Attempt, stage: stage}
+	}
+	progress.fraction, progress.position = fraction, position
+	if stepMS > 0 {
+		progress.stepMSSum += stepMS
+		progress.samples++
+	}
+	f.progress[frame.RequestID] = progress
+}
+
 // count is how many clients are attached right now — the API's open SSE streams.
 func (f *fanout) count() int {
 	f.mu.Lock()
@@ -99,6 +175,7 @@ func (f *fanout) publish(frame Frame) {
 	defer f.mu.Unlock()
 	if frame.Type == "progress" {
 		f.latest[frame.RequestID] = frame
+		f.observeProgress(frame)
 	}
 	for _, s := range f.subs {
 		if s.requestID != "" && s.requestID != frame.RequestID {
@@ -117,6 +194,7 @@ func (f *fanout) forget(requestID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.latest, requestID)
+	delete(f.progress, requestID)
 }
 
 // frameOf decodes one AttemptProgress into the live shape. The runtime's payload is a
