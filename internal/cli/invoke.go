@@ -595,8 +595,8 @@ func handleRunList(ctx *Context) *exit.Error {
 	}
 	pkg := strings.TrimSpace(ctx.Inv.Value("--package"))
 	list := output.List{
-		Name: "invocations", Fields: []string{"number", "target", "status", "queued", "execution"},
-		AllFields: []string{"number", "id", "kind", "target", "status", "queued", "execution", "attempts", "created"},
+		Name: "invocations", Fields: []string{"number", "target", "machine", "status", "queued", "execution"},
+		AllFields: []string{"number", "id", "kind", "target", "machine", "status", "queued", "execution", "attempts", "created"},
 	}
 	states := map[string]int{}
 	for _, life := range rows {
@@ -609,7 +609,8 @@ func handleRunList(ctx *Context) *exit.Error {
 		}
 		list.Rows = append(list.Rows, map[string]string{
 			"number": strconv.FormatInt(life.Number, 10), "id": life.RequestID, "kind": kind,
-			"target": life.Package + "/" + life.Function, "status": life.Status,
+			"target": life.Package + "/" + life.Function, "machine": life.Machine,
+			"status": life.Status,
 			"queued": seconds(life.QueuedMS), "execution": seconds(life.ExecutionMS),
 			"attempts": strconv.Itoa(life.Attempts), "created": life.CreatedAt,
 		})
@@ -634,6 +635,7 @@ func invocationFields(life api.Lifecycle) []output.Field {
 	return []output.Field{
 		{K: "number", V: life.Number}, {K: "id", V: life.RequestID}, {K: "kind", V: kind},
 		{K: "target", V: life.Package + "/" + life.Function},
+		{K: "machine", V: life.Machine},
 		{K: "status", V: life.Status}, {K: "attempts", V: life.Attempts},
 	}
 }
@@ -673,9 +675,13 @@ func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Er
 	fields := []output.Field{
 		{K: "run", V: reference}, {K: "id", V: life.RequestID},
 		{K: "target", V: life.Package + "/" + life.Function},
+		{K: "machine", V: life.Machine},
 		{K: "status", V: status},
 	}
 	defaults := []string{"target", "status"}
+	if life.Machine != "" {
+		defaults = append(defaults, "machine")
+	}
 	if life.QueuePosition != nil {
 		queue := strconv.Itoa(*life.QueuePosition)
 		if life.QueueDepth != nil && *life.QueueDepth >= *life.QueuePosition {
@@ -1199,6 +1205,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		{K: "target", V: life.Package + "/" + life.Function},
 		{K: "package", V: life.Package},
 		{K: "function", V: life.Function},
+		{K: "machine", V: life.Machine},
 		{K: "status", V: shownStatus},
 		{K: "attempts", V: life.Attempts},
 	}
@@ -1250,6 +1257,9 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		output.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
 
 	defaults := []string{"target", "status"}
+	if life.Machine != "" {
+		defaults = append(defaults, "machine")
+	}
 	if life.Result != nil {
 		defaults = append(defaults, "result")
 	}

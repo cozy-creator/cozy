@@ -132,10 +132,11 @@ func TestProductPath(t *testing.T) {
 	}
 
 	type listedRun struct {
-		Number  string `json:"number"`
-		ID      string `json:"id"`
-		Kind    string `json:"kind"`
-		Target  string `json:"target"`
+		Number    string `json:"number"`
+		ID        string `json:"id"`
+		Kind      string `json:"kind"`
+		Target    string `json:"target"`
+		Machine   string `json:"machine"`
 		Status    string `json:"status"`
 		Queued    string `json:"queued"`
 		Execution string `json:"execution"`
@@ -165,6 +166,10 @@ func TestProductPath(t *testing.T) {
 			!strings.HasSuffix(row.Execution, "s") {
 			t.Fatalf("run list row %d is not useful: %+v (%v)", index, row, err)
 		}
+		if row.Machine != "local" {
+			t.Fatalf("a run attempted on this host's own worker is MACHINE %q, not local: %+v",
+				row.Machine, row)
+		}
 		if index > 0 {
 			prior, _ := strconv.ParseInt(runs[index-1].Number, 10, 64)
 			if prior <= number {
@@ -174,15 +179,18 @@ func TestProductPath(t *testing.T) {
 	}
 	latest := runs[0]
 	if code, out := runCozy(t, root, "run", "watch", latest.Number, "--json"); code != 0 ||
-		!strings.Contains(out, `"status":"completed"`) {
-		t.Fatalf("numeric run watch failed [exit %d]\n%s", code, out)
+		!strings.Contains(out, `"status":"completed"`) ||
+		!strings.Contains(out, `"machine":"local"`) {
+		t.Fatalf("numeric run watch failed or lost its machine [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", "cancel", latest.Number, "--json"); code != 0 ||
 		!strings.Contains(out, `"changed":false`) {
 		t.Fatalf("numeric run cancel was not idempotent [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", "list", "--limit", "2"); code != 0 ||
-		!strings.Contains(out, "NUMBER") || !strings.Contains(out, "QUEUED") || !strings.Contains(out, "EXECUTION") ||
+		!strings.Contains(out, "NUMBER") || !strings.Contains(out, "MACHINE") ||
+		!strings.Contains(out, "QUEUED") || !strings.Contains(out, "EXECUTION") ||
+		!strings.Contains(out, "local") ||
 		strings.Contains(out, "KIND") || strings.Index(out, runs[0].Number) > strings.Index(out, runs[1].Number) {
 		t.Fatalf("human run list columns/order are not useful [exit %d]\n%s", code, out)
 	}
@@ -202,6 +210,9 @@ func TestProductPath(t *testing.T) {
 	if runs[0].Kind != "job" || runs[0].Status != "failed" ||
 		err != nil || jobQueued < 0 || jobQueued > 10 || runs[0].Execution != "0.0s" {
 		t.Fatalf("pre-attempt job row lost its kind or its clocks: %+v (%v)", runs, err)
+	}
+	if runs[0].Machine != "" {
+		t.Fatalf("a request that never landed anywhere claims MACHINE %q: %+v", runs[0].Machine, runs[0])
 	}
 	if code, out := runCozy(t, root, "run", "watch", runs[0].Number, "--json"); code == 0 ||
 		!strings.Contains(out, "editable_jobs_unsupported") {
