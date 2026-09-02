@@ -1,4 +1,4 @@
-package cli
+package producttest
 
 import (
 	"bytes"
@@ -8,44 +8,46 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/cli"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/output"
 )
 
-// cl-103: the default human wait line says what the queue is DOING — no digests, no
-// dispatcher vocabulary. The raw diagnostic lives in --stream/--json/--full, and joins
-// the human line only after waitPatience.
+// cl-103's render half: the default human wait line says what the queue is DOING — no
+// digests, no dispatcher vocabulary. The raw diagnostic lives in --stream/--json/--full
+// and joins the human line only after WaitPatience. The events fed here are exactly the
+// payloads TestQueueWaitCauses proves the orchestrator emits.
 
 const rawDiagnostic = "no claimed worker in paul/anima has a DISPATCHABLE placement for " +
 	"sha256:fc1db0000000000000000000000000000000000000000000000000000000000 with a free attempt slot"
 
-// syncBuffer takes the patience timer's own goroutine writes.
-type syncBuffer struct {
+// renderBuffer takes the patience timer's own goroutine writes.
+type renderBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
 }
 
-func (s *syncBuffer) Write(p []byte) (int, error) {
+func (s *renderBuffer) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.b.Write(p)
 }
 
-func (s *syncBuffer) String() string {
+func (s *renderBuffer) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.b.String()
 }
 
-func progressSink(mode output.Mode, stream bool) (*runProgress, *syncBuffer) {
-	buf := &syncBuffer{}
-	ctx := &Context{Inv: &Invocation{Mode: mode}, Out: buf, Err: buf}
-	return newProgress(ctx, stream, time.Now()), buf
+func progressSink(mode output.Mode, stream bool) (*cli.RunProgress, *renderBuffer) {
+	buf := &renderBuffer{}
+	ctx := &cli.Context{Inv: &cli.Invocation{Mode: mode}, Out: buf, Err: buf}
+	return cli.NewProgress(ctx, stream, time.Now()), buf
 }
 
-func waitEvent(eventType string, at time.Time, payload map[string]any) localapi.Event {
-	return localapi.Event{Type: eventType, RequestID: "req-wait", At: at.UTC().Format(time.RFC3339Nano),
-		Payload: payload}
+func waitEnvelope(eventType string, at time.Time, payload map[string]any) localapi.Event {
+	return localapi.Event{Type: eventType, RequestID: "req-wait",
+		At: at.UTC().Format(time.RFC3339Nano), Payload: payload}
 }
 
 func TestWaitLinesAreStageHonest(t *testing.T) {
@@ -73,8 +75,8 @@ func TestWaitLinesAreStageHonest(t *testing.T) {
 		for _, eventType := range []string{"request.queued", "request.parked"} {
 			c.payload["reason"] = rawDiagnostic
 			p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
-			p.on(waitEvent(eventType, time.Now(), c.payload))
-			p.done()
+			p.On(waitEnvelope(eventType, time.Now(), c.payload))
+			p.Done()
 			got := buf.String()
 			if !strings.Contains(got, c.want) {
 				t.Errorf("%s %s renders %q, want %q", c.name, eventType, got, c.want)
@@ -95,26 +97,26 @@ func TestWaitDetailArrivesWithPatience(t *testing.T) {
 
 	// A fresh wait stays calm.
 	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
-	p.on(waitEvent("request.parked", time.Now(), payload))
+	p.On(waitEnvelope("request.parked", time.Now(), payload))
 	if got := buf.String(); strings.Contains(got, "DISPATCHABLE") {
-		t.Errorf("the diagnostic surfaced before waitPatience: %q", got)
+		t.Errorf("the diagnostic surfaced before WaitPatience: %q", got)
 	}
-	p.done()
+	p.Done()
 
-	// A wait that already outlived waitPatience (the event's own recorded time — a
+	// A wait that already outlived WaitPatience (by the event's own recorded time — a
 	// reattached watcher inherits the wait served) carries the raw diagnostic.
 	p, buf = progressSink(output.Mode{Human: true, Color: true}, false)
-	p.on(waitEvent("request.parked", time.Now().Add(-2*waitPatience), payload))
+	p.On(waitEnvelope("request.parked", time.Now().Add(-2*cli.WaitPatience), payload))
 	got := buf.String()
 	if !strings.Contains(got, "waiting for a free slot on shidehiko") || !strings.Contains(got, rawDiagnostic) {
 		t.Errorf("a long wait must carry both the calm line and the diagnostic: %q", got)
 	}
-	p.done()
+	p.Done()
 
 	// The stuck case: ONE event, then silence. The patience timer re-renders with the
 	// detail even though nothing new arrives.
 	p, buf = progressSink(output.Mode{Human: true, Color: true}, false)
-	p.on(waitEvent("request.parked", time.Now().Add(-waitPatience+50*time.Millisecond), payload))
+	p.On(waitEnvelope("request.parked", time.Now().Add(-cli.WaitPatience+50*time.Millisecond), payload))
 	if got := buf.String(); strings.Contains(got, "DISPATCHABLE") {
 		t.Fatalf("detail arrived before the threshold: %q", got)
 	}
@@ -125,7 +127,7 @@ func TestWaitDetailArrivesWithPatience(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	p.done()
+	p.Done()
 }
 
 func TestDiagnosticSurfacesKeepTheRawCause(t *testing.T) {
@@ -133,15 +135,15 @@ func TestDiagnosticSurfacesKeepTheRawCause(t *testing.T) {
 
 	// --full: the lossless human diagnostic stream.
 	p, buf := progressSink(output.Mode{Human: true, Full: true}, false)
-	p.on(waitEvent("request.queued", time.Now(), payload))
-	p.on(waitEvent("request.parked", time.Now(), payload))
+	p.On(waitEnvelope("request.queued", time.Now(), payload))
+	p.On(waitEnvelope("request.parked", time.Now(), payload))
 	if got := buf.String(); strings.Count(got, rawDiagnostic) != 2 {
 		t.Errorf("--full must keep the verbatim diagnostic for queued and parked: %q", got)
 	}
 
 	// --stream: the typed envelope, unchanged.
 	p, buf = progressSink(output.Mode{Human: true}, true)
-	p.on(waitEvent("request.parked", time.Now(), payload))
+	p.On(waitEnvelope("request.parked", time.Now(), payload))
 	var envelope localapi.Event
 	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &envelope); err != nil {
 		t.Fatalf("stream did not emit one JSON envelope: %v", err)

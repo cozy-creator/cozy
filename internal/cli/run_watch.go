@@ -107,9 +107,9 @@ func watchRunStream(ctx *Context, client *localclient.Client, id string,
 		case <-done:
 		}
 	}()
-	lines := newProgress(ctx, false, began)
-	terminal, problem := client.WatchContext(watchCtx, id, 0, lines.on)
-	lines.done()
+	lines := NewProgress(ctx, false, began)
+	terminal, problem := client.WatchContext(watchCtx, id, 0, lines.On)
+	lines.Done()
 	wasDetached := false
 	select {
 	case <-detached:

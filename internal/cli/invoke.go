@@ -663,9 +663,9 @@ func observe(ctx *Context, c *localapi.Client, requestID string, stream bool,
 ) (*localapi.Event, *exit.Error) {
 	watchCtx, stop := context.WithTimeout(context.Background(), window)
 	defer stop()
-	lines := newProgress(ctx, stream, began)
-	terminal, problem := c.WatchContext(watchCtx, requestID, 0, lines.on)
-	lines.done()
+	lines := NewProgress(ctx, stream, began)
+	terminal, problem := c.WatchContext(watchCtx, requestID, 0, lines.On)
+	lines.Done()
 	return terminal, problem
 }
 
@@ -884,9 +884,9 @@ func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 		}
 	}()
 
-	lines := newProgress(ctx, stream, began)
-	terminal, e := c.WatchContext(watchCtx, requestID, 0, lines.on)
-	lines.done()
+	lines := NewProgress(ctx, stream, began)
+	terminal, e := c.WatchContext(watchCtx, requestID, 0, lines.On)
+	lines.Done()
 	select {
 	case problem := <-cancelFailed:
 		return nil, "cancel_failed", problem
@@ -931,8 +931,9 @@ func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
 
 // progress renders the live lane. Two shapes, and they are not the same surface:
 // `--stream` is NDJSON of the typed envelope for a machine, and the default is one
-// rewritten line for a person.
-type runProgress struct {
+// rewritten line for a person. Exported — with HumanWaitLine and WaitPatience — so the
+// product suite (#661: verification's one home) drives this exact render path.
+type RunProgress struct {
 	ctx         *Context
 	stream      bool
 	mu          sync.Mutex
@@ -948,11 +949,11 @@ type runProgress struct {
 	stepSamples int
 }
 
-func newProgress(ctx *Context, stream bool, began time.Time) *runProgress {
-	return &runProgress{ctx: ctx, stream: stream, began: began}
+func NewProgress(ctx *Context, stream bool, began time.Time) *RunProgress {
+	return &RunProgress{ctx: ctx, stream: stream, began: began}
 }
 
-func (p *runProgress) on(e localapi.Event) bool {
+func (p *RunProgress) On(e localapi.Event) bool {
 	if p.stream {
 		data, err := json.Marshal(e)
 		if err == nil {
@@ -977,7 +978,7 @@ func (p *runProgress) on(e localapi.Event) bool {
 }
 
 // render rewrites the status line. Callers hold p.mu.
-func (p *runProgress) render(line string) {
+func (p *RunProgress) render(line string) {
 	if line == "" || line == p.last {
 		return
 	}
@@ -994,7 +995,7 @@ func (p *runProgress) render(line string) {
 // observeWait keeps the wait clock. It starts on a queued/parked event — at the event's
 // own recorded time, so a reattached watcher inherits the wait already served — and
 // stops on any event that says the queue let go of the request. Callers hold p.mu.
-func (p *runProgress) observeWait(e localapi.Event) {
+func (p *RunProgress) observeWait(e localapi.Event) {
 	switch strings.TrimPrefix(e.Type, "request.") {
 	case "queued", "parked":
 		p.waitEvent = e
@@ -1010,16 +1011,16 @@ func (p *runProgress) observeWait(e localapi.Event) {
 	}
 }
 
-// armPatience schedules the one time-driven render: a wait that outlives waitPatience
+// armPatience schedules the one time-driven render: a wait that outlives WaitPatience
 // re-renders with the diagnostic even when no new event arrives — the stuck case emits
 // exactly one parked event and then silence. Only the human status line needs it; the
 // diagnostic surfaces (--full, --stream, --json) carry the detail from the start.
 // Callers hold p.mu.
-func (p *runProgress) armPatience() {
+func (p *RunProgress) armPatience() {
 	if !p.ctx.Mode().Color || p.ctx.Mode().Full {
 		return
 	}
-	remaining := max(waitPatience-time.Since(p.waitedSince), 0)
+	remaining := max(WaitPatience-time.Since(p.waitedSince), 0)
 	p.patience = time.AfterFunc(remaining, func() {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -1030,7 +1031,7 @@ func (p *runProgress) armPatience() {
 	})
 }
 
-func (p *runProgress) disarmPatience() {
+func (p *RunProgress) disarmPatience() {
 	if p.patience != nil {
 		p.patience.Stop()
 		p.patience = nil
@@ -1045,7 +1046,7 @@ func eventTime(e localapi.Event) time.Time {
 	return time.Now()
 }
 
-func (p *runProgress) line(e localapi.Event, full bool) string {
+func (p *RunProgress) line(e localapi.Event, full bool) string {
 	if full {
 		return diagnosticProgressLine(e)
 	}
@@ -1135,7 +1136,7 @@ func shortDuration(value time.Duration) string {
 	return value.Round(time.Second).String()
 }
 
-func (p *runProgress) done() {
+func (p *RunProgress) Done() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.closed = true
@@ -1161,7 +1162,7 @@ func progressLine(e localapi.Event, full bool) string {
 	case "metric":
 		return ""
 	case "queued", "parked":
-		return humanWaitLine(e.Payload)
+		return HumanWaitLine(e.Payload)
 	case "rentals":
 		if line, ok := e.Payload["line"].(string); ok {
 			return line
@@ -1203,16 +1204,16 @@ func humanProgress(value any) string {
 	return fmt.Sprintf("  %s — %.0f%%", name, fraction*100)
 }
 
-// waitPatience is how long a wait stays a calm one-liner (cl-103). Past it, the
+// WaitPatience is how long a wait stays a calm one-liner (cl-103). Past it, the
 // dispatcher's own diagnostic joins the line: a long wait is the abnormal case, and the
 // detail is how a person sees exactly what the queue is stuck on. The full diagnostic is
 // always in --full and --stream/--json regardless.
-const waitPatience = 90 * time.Second
+const WaitPatience = 90 * time.Second
 
-// humanWaitLine says what the queue is DOING, never how it thinks: the event's stable
+// HumanWaitLine says what the queue is DOING, never how it thinks: the event's stable
 // `wait` cause becomes a calm stage line with no digests and no dispatcher vocabulary.
 // The verbatim diagnostic stays in the payload's `reason` for the machine surfaces.
-func humanWaitLine(payload map[string]any) string {
+func HumanWaitLine(payload map[string]any) string {
 	pkg, _ := payload["package"].(string)
 	on, _ := payload["waiting_on"].(string)
 	cause, _ := payload["wait"].(string)
@@ -1245,11 +1246,11 @@ func humanWaitLine(payload map[string]any) string {
 	return "  waiting for capacity"
 }
 
-// waitLine is humanWaitLine plus patience: once the wait outlives waitPatience the raw
+// waitLine is HumanWaitLine plus patience: once the wait outlives WaitPatience the raw
 // diagnostic earns its place on the human line too. Callers hold p.mu.
-func (p *runProgress) waitLine(e localapi.Event) string {
-	line := humanWaitLine(e.Payload)
-	if p.waitedSince.IsZero() || time.Since(p.waitedSince) < waitPatience {
+func (p *RunProgress) waitLine(e localapi.Event) string {
+	line := HumanWaitLine(e.Payload)
+	if p.waitedSince.IsZero() || time.Since(p.waitedSince) < WaitPatience {
 		return line
 	}
 	reason, _ := e.Payload["reason"].(string)
