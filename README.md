@@ -1,6 +1,6 @@
 # TensorFS
 
-The current release is `0.1.1`.
+The current release is `0.1.2`.
 
 TensorFS stores every domain repository as the same graph:
 
