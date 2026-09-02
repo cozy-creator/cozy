@@ -1945,5 +1945,27 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	if problem := c.ResumeModelTransfers(); problem != nil {
 		return killed, forgotten, problem
 	}
+	if problem := c.ResumeQueuedRequests(); problem != nil {
+		return killed, forgotten, problem
+	}
 	return killed, forgotten, nil
+}
+
+// ResumeQueuedRequests re-enters the one placement path for every request a
+// prior daemon accepted but never made resident. A submission's selectOrStart
+// dies with its daemon, and a queued row with no attempt then waits forever —
+// the "worst of both" selectOrStart's own comment warns about (live: three
+// four-lane submissions orphaned by daemon restarts, 2026-09-02). A rental
+// request whose prior daemon had already acquired may briefly double-rent;
+// the idle-release timer reaps the orphan.
+func (c *Orchestrator) ResumeQueuedRequests() *exit.Error {
+	queued, problem := c.opt.Store.Requests("queued", 512)
+	if problem != nil {
+		return problem
+	}
+	for _, req := range queued {
+		c.logf("%s was queued when a prior daemon exited; resuming its placement", req.ID)
+		c.selectOrStart(req)
+	}
+	return nil
 }
