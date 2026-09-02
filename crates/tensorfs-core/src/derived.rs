@@ -2496,7 +2496,10 @@ fn receipt_from(store: &Store, row: &TransactionRow) -> Result<ReceiptFacts> {
         );
     }
     let header_bytes = checkpoint::load_header(store, &header)?;
-    crate::repository::require_digests(&evidence.digests, &header_bytes.digests())?;
+    crate::repository::require_digests(
+        &evidence.digests,
+        &checkpoint::digests(store, &header_bytes)?,
+    )?;
     Ok(ReceiptFacts {
         transaction: row.id.clone(),
         declaration,
@@ -2549,7 +2552,7 @@ pub fn commit(
         );
     }
     let checkpoint_evidence = crate::repository::CheckpointEvidence {
-        digests: header.digests(),
+        digests: checkpoint::digests(store, &header)?,
         ingest: None,
         verification: None,
     }

@@ -549,10 +549,12 @@ pub fn cmd_info(root: &Path, hex: &str) -> ExitCode {
     let (store, href) = opened!(root, hex);
     let header = ok!(ck::load_header(&store, &href));
     println!("header {} ({} B)", href.id(), href.length);
-    let digests = header.digests();
+    let digests = ok!(ck::digests(&store, &header));
     println!("topology_digest {}", digests.topology_digest);
     println!("shape_digest    {}", digests.shape_digest);
-    println!("config_digest   {}", digests.config_digest);
+    if let Some(config) = &digests.config_digest {
+        println!("config_digest   {config}");
+    }
     for (name, c) in &header.configs {
         println!(
             "config {name:<14} sha256:{} {} B {}",

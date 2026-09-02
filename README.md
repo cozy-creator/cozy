@@ -91,10 +91,13 @@ Exit 0 on `ok`, one distinct code per refusal (10..16). The same answer is
 no grade in a fit; `tfs compat check` / `tfs grade` are the search plane's ranking over the same
 walk.
 
-Every checkpoint row carries three header-derived digests, printed by `tfs checkpoint info` and
-`tfs repo list`: `topology_digest` (identity), `shape_digest` (the fit index — dtype elided) and
-`config_digest` (the header's `configs` map, i.e. the construction document). `tfs repo migrate
-<store>` re-derives them for rows written before tfs-042.
+Every checkpoint row carries three digests, printed by `tfs checkpoint info` and `tfs repo list`:
+`topology_digest` (identity), `shape_digest` (the fit index — dtype elided) and `config_digest` —
+sha256 of the construction document: the config the header names, or the name-keyed map of
+several, in RFC 8785 form (`jcs.rs`; the same bytes the hub's header route and cozy-runtime's
+`construction_document` produce). It is absent when the header names no config. `tfs repo
+migrate <store>` re-derives all three for rows written before tfs-043; `tfs repo apply` needs
+`--config <path>` for every config the header names.
 
 Everything below is what CI runs, in the same order.
 

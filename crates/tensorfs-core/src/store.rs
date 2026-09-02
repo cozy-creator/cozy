@@ -571,7 +571,10 @@ impl Store {
                         let header = crate::checkpoint::load_header(self, header_ref)?;
                         crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;
                         let contract = ExpectedCheckpointContract::from_header(&header);
-                        (Some(header.digests()), Some(contract))
+                        (
+                            Some(crate::checkpoint::digests(self, &header)?),
+                            Some(contract),
+                        )
                     }
                     None => (None, None),
                 }

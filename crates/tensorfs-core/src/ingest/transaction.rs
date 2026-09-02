@@ -281,7 +281,7 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
         length: snap.canonical_bytes().len() as u64,
     };
     let evidence = CheckpointEvidence {
-        digests: header.digests(),
+        digests: ck::digests(store, header)?,
         ingest: Some(ingest),
         verification: Some(verification),
     };
