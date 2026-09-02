@@ -363,7 +363,7 @@ func TestDynamicProducerOutputContracts(t *testing.T) {
 	fatal(t, problem)
 	job, problem := descriptor.Function("produce")
 	fatal(t, problem)
-	if problem := modeltransfer.ValidateProducer("paul/quantize@v1/produce", job); problem != nil {
+	if problem := modeltransfer.ValidateProducer("paul/quantize@v1/produce", job, nil); problem != nil {
 		t.Fatalf("generic model producer was refused before source-derived contracts exist: %s", problem.Message)
 	}
 
@@ -400,5 +400,44 @@ func TestDynamicProducerOutputContracts(t *testing.T) {
 		WeightsOutputs: []orchestrator.WeightsOutput{{OutputID: "ordinary-job-output"}},
 	}); problem != nil {
 		t.Fatalf("ordinary job publication was changed by model-transfer validation: %s", problem.Message)
+	}
+}
+
+// TestSuppliedSourceProfiles: --source-profile fills a producer slot the descriptor
+// leaves undeclared (the H3 ingest shape after minimax-h3-tools 2.2.0 dropped its
+// premature declarations), never overrides a declared one, and never invents slots.
+func TestSuppliedSourceProfiles(t *testing.T) {
+	raw := []byte(`{"application":"h3:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"H3FullTransformer","component_use":{},"path":"four-lane.models.dits","stamps":{}},{"class":"H3FullTransformer","component_use":{},"path":"four-lane.models.shared","stamps":{}}],"name":"four-lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"full"}]}]}`)
+	descriptor, problem := launch.DecodeDescriptor(raw)
+	fatal(t, problem)
+	job, problem := descriptor.Function("four-lane")
+	fatal(t, problem)
+
+	if problem := modeltransfer.ValidateProducer("paul/minimax-h3-tools@v2/four-lane", job, nil); problem == nil ||
+		problem.ErrName() != "model_producer.source_profile_absent" {
+		t.Fatalf("undeclared, unsupplied slot must refuse source_profile_absent, got %v", problem)
+	}
+	supplied := map[string]string{
+		"dits":   "hf/minimax-h3/native-dual-bf16/1",
+		"shared": "hf/minimax-h3/shared-bf16/1",
+	}
+	if problem := modeltransfer.ValidateProducer("paul/minimax-h3-tools@v2/four-lane", job, supplied); problem != nil {
+		t.Fatalf("supplied profiles must satisfy undeclared slots: %s", problem.Message)
+	}
+	if problem := modeltransfer.ValidateProducer("paul/minimax-h3-tools@v2/four-lane", job,
+		map[string]string{"dits": "x/y/z/1", "shared": "x/y/z/1", "extra": "x/y/z/1"}); problem == nil ||
+		problem.ErrName() != "model_producer.source_profile_unknown_slot" {
+		t.Fatalf("unknown slot must refuse, got %v", problem)
+	}
+
+	declared := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"S","component_use":{},"path":"produce.models.source","source_profile":"civitai/sdxl/single-file/1","stamps":{}}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"}]}]}`)
+	descriptor2, problem := launch.DecodeDescriptor(declared)
+	fatal(t, problem)
+	job2, problem := descriptor2.Function("produce")
+	fatal(t, problem)
+	if problem := modeltransfer.ValidateProducer("paul/q@v1/produce", job2,
+		map[string]string{"source": "other/profile/x/1"}); problem == nil ||
+		problem.ErrName() != "model_producer.source_profile_conflict" {
+		t.Fatalf("override of a declared profile must refuse, got %v", problem)
 	}
 }

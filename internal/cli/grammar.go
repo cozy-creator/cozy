@@ -160,6 +160,7 @@ type ModelDownloadCmd struct {
 	Source     string `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
 	Ref        string `arg:"" name:"model" help:"Local destination (local/name)."`
 	Producer   string `help:"Ordinary producer job as org/package@vN/function."`
+	SourceProfiles []string `name:"source-profile" help:"Bind a producer model input to a reviewed TensorFS source profile as slot=profile (repeatable; only for inputs the job leaves undeclared)."`
 	Lane       string `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental     bool   `help:"Permit a managed rental when compatible local capacity is unavailable."`
 	RentalOnly bool   `help:"Require a remote rental instead of local capacity."`
@@ -171,7 +172,8 @@ func (c *ModelDownloadCmd) Run(r *Runtime) error {
 	return r.call(handleModelDownload, []string{c.Source, c.Ref}, bools(
 		"--rental", c.Rental, "--rental-only", c.RentalOnly,
 		"--dry-run", c.DryRun, "--await", c.Await),
-		values("--producer", c.Producer, "--lane", c.Lane), false)
+		values("--producer", c.Producer, "--lane", c.Lane,
+			"--source-profile", c.SourceProfiles), false)
 }
 
 type ModelRemoveCmd struct {
@@ -192,6 +194,7 @@ type ModelUploadCmd struct {
 	Source     string `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
 	Ref        string `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
 	Producer   string `help:"Ordinary producer job as org/package@vN/function."`
+	SourceProfiles []string `name:"source-profile" help:"Bind a producer model input to a reviewed TensorFS source profile as slot=profile (repeatable; only for inputs the job leaves undeclared)."`
 	Lane       string `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental     bool   `help:"Permit a managed rental when compatible local capacity is unavailable."`
 	RentalOnly bool   `help:"Require a remote rental instead of local capacity."`
@@ -203,7 +206,8 @@ func (c *ModelUploadCmd) Run(r *Runtime) error {
 	return r.call(handleModelUpload, []string{c.Source, c.Ref}, bools(
 		"--rental", c.Rental, "--rental-only", c.RentalOnly,
 		"--dry-run", c.DryRun, "--await", c.Await),
-		values("--producer", c.Producer, "--lane", c.Lane), false)
+		values("--producer", c.Producer, "--lane", c.Lane,
+			"--source-profile", c.SourceProfiles), false)
 }
 
 type ModelPublishCmd struct {

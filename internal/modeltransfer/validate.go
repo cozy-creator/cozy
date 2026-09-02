@@ -12,15 +12,27 @@ import (
 // ValidateProducer checks only the callable shape model download/upload needs.
 // A producer may leave its output contract open when the exact source determines
 // the topology; TensorFS still derives and verifies the produced checkpoint facts.
-func ValidateProducer(name string, job *launch.Entrypoint) *exit.Error {
+func ValidateProducer(name string, job *launch.Entrypoint, supplied map[string]string) *exit.Error {
 	if len(job.Models) == 0 {
 		return exit.Named(exit.Validation, "model_producer.source_inputs_absent",
 			"producer job %s has no typed model input", name)
 	}
+	declared := map[string]bool{}
 	for _, slot := range job.Models {
-		if slot.SourceProfile == "" {
+		declared[slot.Param] = true
+		if slot.SourceProfile != "" && supplied[slot.Param] != "" {
+			return exit.Named(exit.Validation, "model_producer.source_profile_conflict",
+				"producer job %s model input %s declares a TensorFS source profile; --source-profile cannot override it", name, slot.Param)
+		}
+		if slot.SourceProfile == "" && supplied[slot.Param] == "" {
 			return exit.Named(exit.Validation, "model_producer.source_profile_absent",
-				"producer job %s model input %s has no TensorFS source profile", name, slot.Param)
+				"producer job %s model input %s has no TensorFS source profile; declare one or pass --source-profile %s=<reviewed profile>", name, slot.Param, slot.Param)
+		}
+	}
+	for param := range supplied {
+		if !declared[param] {
+			return exit.Named(exit.Validation, "model_producer.source_profile_unknown_slot",
+				"--source-profile names %s, which is not a model input of producer job %s", param, name)
 		}
 	}
 	for _, field := range job.Request.Fields {

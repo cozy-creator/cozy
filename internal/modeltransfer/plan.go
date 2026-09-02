@@ -46,6 +46,10 @@ type Instruction struct {
 	InputLane   string `json:"input_lane,omitempty"`
 	Producer    string `json:"producer,omitempty"`
 	Placement   string `json:"placement,omitempty"`
+	// SourceProfiles is the caller's slot=profile narrowing for a producer whose
+	// descriptor declares none. Caller intent, so it is identity; a declared
+	// profile is descriptor-derived and stays out.
+	SourceProfiles map[string]string `json:"source_profiles,omitempty"`
 }
 
 func (i Instruction) Bytes() ([]byte, error) { return json.Marshal(i) }
