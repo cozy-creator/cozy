@@ -18,7 +18,6 @@ package tfs
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -274,15 +273,14 @@ func (t *Tool) VerifyManifest(id string) *exit.Error {
 // lane (`kind: "release"`, with a version and lane) or a local alias (`kind: "local"`,
 // with the source selection it was made from and no release at all).
 type Release struct {
-	Kind            string          `json:"kind"`
-	Org             string          `json:"org"`
-	Name            string          `json:"name"`
-	Version         string          `json:"version"`
-	Lane            string          `json:"lane"`
-	SourceSelection string          `json:"source_selection"`
-	ManifestSHA256  string          `json:"manifest_sha256"`
-	ManifestLength  int64           `json:"manifest_length"`
-	Evidence        json.RawMessage `json:"evidence"`
+	Kind            string `json:"kind"`
+	Org             string `json:"org"`
+	Name            string `json:"name"`
+	Version         string `json:"version"`
+	Lane            string `json:"lane"`
+	SourceSelection string `json:"source_selection"`
+	ManifestSHA256  string `json:"manifest_sha256"`
+	ManifestLength  int64  `json:"manifest_length"`
 }
 
 // Releases lists repository metadata through TensorFS, never through SQLite or
@@ -302,7 +300,7 @@ func (t *Tool) Releases(outPath string) ([]Release, *exit.Error) {
 		}
 		var row Release
 		if err := json.Unmarshal([]byte(text), &row); err != nil || row.Org == "" || row.Name == "" ||
-			len(row.ManifestSHA256) != 64 || row.ManifestLength <= 0 || len(row.Evidence) == 0 {
+			len(row.ManifestSHA256) != 64 || row.ManifestLength <= 0 {
 			return nil, exit.Internalf("tfs returned an invalid repository row at line %d", line+1)
 		}
 		switch row.Kind {
@@ -385,36 +383,6 @@ func (t *Tool) Usage(outPath string) (StoreUsage, *exit.Error) {
 		return StoreUsage{}, exit.Internalf("tfs returned no store usage row")
 	}
 	return usage, nil
-}
-
-// CheckpointEvidence returns the exact canonical evidence attached to a retained
-// manifest. Repeated equal bytes are harmless; disagreement or absence refuses.
-func (t *Tool) CheckpointEvidence(org, name, manifestID, outPath string) ([]byte, *exit.Error) {
-	rows, e := t.Releases(outPath)
-	if e != nil {
-		return nil, e
-	}
-	var evidence []byte
-	for _, row := range rows {
-		if row.Org != org || row.Name != name || "sha256:"+row.ManifestSHA256 != manifestID {
-			continue
-		}
-		if evidence == nil {
-			evidence = append([]byte(nil), row.Evidence...)
-			continue
-		}
-		if !bytes.Equal(evidence, row.Evidence) {
-			return nil, exit.Named(exit.Conflict, "model.checkpoint_evidence_ambiguous",
-				"local repository %s/%s carries conflicting evidence for manifest %s", org, name, manifestID).
-				WithRemedy("remove the contradictory local release before publishing")
-		}
-	}
-	if evidence == nil {
-		return nil, exit.Named(exit.NotFound, "model.checkpoint_evidence_absent",
-			"local repository %s/%s has no release for manifest %s", org, name, manifestID).
-			WithRemedy("ingest or download the manifest into this model repository before publishing it")
-	}
-	return evidence, nil
 }
 
 // LocalAlias is TensorFS's exact device-local alias projection. The repository
@@ -602,19 +570,18 @@ func (t *Tool) InstallLocal(session, name, sourceSelection, observed, sourceURI,
 }
 
 // ReplaceLocal atomically points Creator's one local alias at an already verified
-// WeightsSink Manifest. TensorFS owns the evidence parse, manifest verification,
-// repository bytes, and compare-and-swap; Creator supplies only frozen identities.
+// WeightsSink Manifest. TensorFS owns manifest verification, repository bytes, and
+// compare-and-swap; Creator supplies only frozen identities.
 type ExpectedModelContract struct {
 	TopologyDigest string
 	Encodings      []string
 }
 
 func (t *Tool) ReplaceLocal(name, sourceSelection, observed, manifestID string,
-	manifestLength int64, evidencePath string, contract *ExpectedModelContract,
+	manifestLength int64, contract *ExpectedModelContract,
 ) (LocalAlias, *exit.Error) {
 	args := []string{"local", "replace", t.Root, name, sourceSelection,
-		manifestID, strconv.FormatInt(manifestLength, 10), "--observed", observed,
-		"--evidence", evidencePath}
+		manifestID, strconv.FormatInt(manifestLength, 10), "--observed", observed}
 	if contract != nil {
 		args = append(args, "--expected-topology", contract.TopologyDigest)
 		for _, encoding := range contract.Encodings {
@@ -717,21 +684,17 @@ func releaseRevision(path, version string) (uint64, *exit.Error) {
 
 // CommitRelease makes one verified manifest visible under the local repository.
 func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length int64,
-	evidence []byte, scratch string,
+	scratch string,
 ) *exit.Error {
-	if len(evidence) == 0 {
-		return exit.Internalf("cannot commit a model release without exact evidence")
-	}
 	current, e := t.observedRepository(org, name, scratch)
 	if e != nil {
 		return e
 	}
 	checkpointMutation := filepath.Join(scratch, "repo-put-checkpoint.json")
 	if e := writeJSON(checkpointMutation, map[string]any{
-		"action":          "put_checkpoint",
-		"evidence_base64": base64.StdEncoding.EncodeToString(evidence),
-		"manifest":        map[string]any{"length": length, "sha256": hex(manifestID)},
-		"repo":            map[string]string{"name": name, "org": org},
+		"action":   "put_checkpoint",
+		"manifest": map[string]any{"length": length, "sha256": hex(manifestID)},
+		"repo":     map[string]string{"name": name, "org": org},
 	}); e != nil {
 		return e
 	}

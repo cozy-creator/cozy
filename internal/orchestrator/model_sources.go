@@ -185,8 +185,6 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 	for _, source := range frame.Sources {
 		if source == nil || source.Manifest == nil || len(source.Manifest.Digest) != 32 ||
 			source.Manifest.Length == 0 || source.Manifest.Length > uint64(^uint64(0)>>1) ||
-			len(source.CheckpointEvidenceCanonicalBytes) == 0 ||
-			len(source.CheckpointEvidenceCanonicalBytes) > pb.MaxCheckpointEvidenceBytes ||
 			transfer.SourceProfiles[source.Slot] != source.Profile {
 			return
 		}

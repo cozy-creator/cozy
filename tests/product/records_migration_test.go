@@ -94,6 +94,9 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	if columns := columnNames(t, db, "request_output_exports"); columns["payload_hash"] || !columns["directory"] {
 		t.Fatalf("request_output_exports columns after migration = %v", columns)
 	}
+	if columns := columnNames(t, db, "request_model_transfer_outputs"); columns["evidence"] {
+		t.Fatalf("request_model_transfer_outputs still carries checkpoint evidence: %v", columns)
+	}
 	export, problem := store.OutputExportOf("request-1")
 	if problem != nil || export == nil || export.State != "published" ||
 		len(export.PublishedPaths) != 1 || export.PublishedPaths[0] != "/tmp/out/abc.png" ||

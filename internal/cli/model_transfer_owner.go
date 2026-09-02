@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -188,18 +187,11 @@ func (o *modelTransferOwner) PassThrough(parent context.Context, requestID strin
 		if problem != nil {
 			return problem
 		}
-		evidence, problem := tool.CheckpointEvidence("local", temporary, alias.ManifestDigest,
-			filepath.Join(work.Path, "temp-evidence.jsonl"))
-		if problem != nil {
-			return problem
-		}
-		source.manifestID, source.manifestLength, source.evidence = alias.ManifestDigest,
-			alias.ManifestLength, evidence
+		source.manifestID, source.manifestLength = alias.ManifestDigest, alias.ManifestLength
 		defer tool.RemoveLocal(temporary, alias.RepositoryDigest)
 	}
 	weights := records.ModelTransferWeights{RequestID: requestID, OutputSlot: "model",
-		ManifestID: source.manifestID, ManifestLength: source.manifestLength,
-		Evidence: source.evidence}
+		ManifestID: source.manifestID, ManifestLength: source.manifestLength}
 	if problem := o.store.RecordModelTransferWeights(weights); problem != nil {
 		return problem
 	}
@@ -292,13 +284,9 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 		if problem != nil {
 			return "", problem
 		}
-		evidencePath := filepath.Join(work.Path, "local-evidence-"+weights.OutputSlot+".json")
-		if err := os.WriteFile(evidencePath, weights.Evidence, 0o600); err != nil {
-			return "", exit.Internalf("cannot stage local checkpoint evidence: %s", err)
-		}
 		alias, problem := tool.ReplaceLocal(name,
 			localFinalizationSelection(weights.RequestID, weights.OutputSlot), observed,
-			weights.ManifestID, weights.ManifestLength, evidencePath, expectedTFSContract(contract))
+			weights.ManifestID, weights.ManifestLength, expectedTFSContract(contract))
 		if problem != nil {
 			return "", problem
 		}
@@ -323,10 +311,10 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 		}
 		defer work.Release()
 		upload := &transfer.Upload{Tool: tool, Hub: publicationClient, Ref: ref,
-			ManifestID: weights.ManifestID, CheckpointEvidence: weights.Evidence,
-			Session: transferOutputOperation(weights.RequestID, weights.OutputSlot),
-			Reason:  "cozy model upload " + intent.Source + " " + intent.Destination,
-			Scratch: work.Path, Progress: progress(cli),
+			ManifestID: weights.ManifestID,
+			Session:    transferOutputOperation(weights.RequestID, weights.OutputSlot),
+			Reason:     "cozy model upload " + intent.Source + " " + intent.Destination,
+			Scratch:    work.Path, Progress: progress(cli),
 			ExpectedContract: expectedHubContract(contract)}
 		result, problem := upload.Run(ctx)
 		if problem != nil {
@@ -390,15 +378,14 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	}
 	checkpoint, problem := publicationClient.FinalizePublication(ctx, ref, operation,
 		hub.FinalizePublicationRequest{ManifestID: weights.ManifestID,
-			ManifestLength:           weights.ManifestLength,
-			CheckpointEvidenceBase64: hub.B64(weights.Evidence),
-			ExpectedContract:         expectedHubContract(contract)},
+			ManifestLength:   weights.ManifestLength,
+			ExpectedContract: expectedHubContract(contract)},
 		"cozy model upload "+intent.Source+" "+intent.Destination)
 	if problem != nil {
 		return "", problem
 	}
 	if problem := transfer.ValidateFinalizedCheckpoint(checkpoint, operation,
-		weights.ManifestID, weights.ManifestLength, weights.Evidence, totals); problem != nil {
+		weights.ManifestID, weights.ManifestLength, totals); problem != nil {
 		return "", problem
 	}
 	if contract != nil && (checkpoint.TopologyDigest != contract.TopologyDigest ||

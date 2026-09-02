@@ -67,7 +67,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 17
+const schemaVersion = 18
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -165,7 +165,7 @@ func Open(path string) (*Store, *exit.Error) {
 	return &Store{db: db}, nil
 }
 
-// Schemas 6 through 16 migrate in place. Schema 11 replaces authored GPU counts with
+// Schemas 6 through 18 migrate in place. Schema 11 replaces authored GPU counts with
 // the one derived accelerator-class fact; schema 12 gives the install table and its two
 // foreign keys the one word the row actually names; schema 13 records when a rental was
 // first seen ready; schema 14 drops the output export's pre-execution payload hash — a
@@ -173,8 +173,10 @@ func Open(path string) (*Store, *exit.Error) {
 // revision columns `local_package_*` (proto-027: one word for a local package); schema 16
 // adds the package_events table (cl-097); schema 17 records the rental's machine word on
 // the request (cl-107) — existing rows joinable to a surviving rental get their word,
-// unjoinable history stays blank. Package, request, event, export, and rental rows
-// survive; only schema 9's superseded special model-production subsystem is dropped.
+// unjoinable history stays blank; schema 18 removes checkpoint evidence from
+// model-transfer outputs. Package, request, event, export, and rental rows survive;
+// only schema 9's superseded special
+// model-production subsystem is dropped.
 // Schema 10 creates empty request-attached transfer sidecars because older rows cannot be
 // translated into ordinary request identity safely.
 func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
@@ -238,6 +240,11 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			}
 		}
 	}
+	if sourceVersion >= 10 && sourceVersion < 18 {
+		if e := migrateModelTransferOutputs(tx, path); e != nil {
+			return e
+		}
+	}
 	if sourceVersion < 10 {
 		for _, table := range []string{"model_production_objects", "model_production_artifacts",
 			"model_production_steps", "model_production_sources", "model_production_source_files",
@@ -252,7 +259,7 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			}
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=17`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=18`); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
 	if e := commitMigration(tx, path); e != nil {
@@ -353,6 +360,27 @@ func migrateOutputExports(tx *sql.Tx, path string) *exit.Error {
 	}
 	if _, err := tx.Exec(`DROP TABLE request_output_exports_prior`); err != nil {
 		return exit.Internalf("cannot finish output export migration in %s: %s", path, err)
+	}
+	return nil
+}
+
+// migrateModelTransferOutputs drops the checkpoint evidence payload. The Manifest/header is
+// the checkpoint authority; a transfer row keeps only the exact receipt and object inventory.
+func migrateModelTransferOutputs(tx *sql.Tx, path string) *exit.Error {
+	for _, statement := range []string{
+		`ALTER TABLE request_model_transfer_outputs RENAME TO request_model_transfer_outputs_prior`,
+		modelTransferSchema[2],
+		`INSERT INTO request_model_transfer_outputs(
+		  request_id,output_slot,manifest_id,manifest_length,attempt,invocation_digest,
+		  transaction_id,receipt_digest,receipt,final_id)
+		 SELECT request_id,output_slot,manifest_id,manifest_length,attempt,invocation_digest,
+		  transaction_id,receipt_digest,receipt,final_id
+		 FROM request_model_transfer_outputs_prior`,
+		`DROP TABLE request_model_transfer_outputs_prior`,
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return exit.Internalf("cannot remove model-transfer evidence while migrating %s: %s", path, err)
+		}
 	}
 	return nil
 }
@@ -467,6 +495,10 @@ func priorStatements(version int) []string {
 			stmt = priorRentals
 		case stmt == outputExportSchema && version < 14:
 			stmt = priorOutputExports
+		case stmt == modelTransferSchema[2] && version < 18:
+			stmt = strings.Replace(stmt,
+				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n",
+				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n  evidence         BLOB NOT NULL,\n", 1)
 		}
 		if version < 12 {
 			stmt = priorInstallNames(stmt)
@@ -581,7 +613,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=17`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=18`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {

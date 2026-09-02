@@ -59,10 +59,8 @@ func TestModelListShowsEachModelsBytesAndWhatItShares(t *testing.T) {
 			configBlob.length, configBlob.sha256)
 		manifest := store.reproduce(name, header, entries, `[["model","own"],["model","shared"]]`)
 		manifestBytes[name] = manifest.length
-		evidence := filepath.Join(store.work, name+"-evidence.json")
-		must(t, os.WriteFile(evidence, []byte(`{"classification_digest":"`+store.topology(manifest.header)+`"}`), 0o600))
 		if _, e := tool.ReplaceLocal(name, "sha256:"+shared.sha256, "absent", "sha256:"+manifest.sha256,
-			manifest.length, evidence, nil); e != nil {
+			manifest.length, nil); e != nil {
 			t.Fatalf("local/%s: %s", name, briefly(e))
 		}
 		return store.walk(manifest.sha256)

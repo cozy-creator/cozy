@@ -46,7 +46,6 @@ CREATE TABLE IF NOT EXISTS request_model_transfer_outputs (
   output_slot      TEXT NOT NULL,
   manifest_id      TEXT NOT NULL,
   manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),
-  evidence         BLOB NOT NULL,
   attempt           INTEGER NOT NULL,
   invocation_digest TEXT NOT NULL,
   transaction_id    TEXT NOT NULL,
@@ -132,7 +131,7 @@ type ModelTransferWeights struct {
 	RequestID, OutputSlot, ManifestID, FinalID     string
 	InvocationDigest, TransactionID, ReceiptDigest string
 	ManifestLength, Attempt                        int64
-	Evidence, Receipt                              []byte
+	Receipt                                        []byte
 	Objects                                        []ModelTransferObject
 }
 
@@ -404,9 +403,6 @@ func sourceStateRank(state string) int {
 }
 
 func (s *Store) RecordModelTransferWeights(row ModelTransferWeights) *exit.Error {
-	if row.Evidence == nil {
-		row.Evidence = []byte{}
-	}
 	if row.Receipt == nil {
 		row.Receipt = []byte{}
 	}
@@ -419,10 +415,10 @@ func (s *Store) RecordModelTransferWeights(row ModelTransferWeights) *exit.Error
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(`INSERT INTO request_model_transfer_outputs
-		(request_id,output_slot,manifest_id,manifest_length,evidence,attempt,
+		(request_id,output_slot,manifest_id,manifest_length,attempt,
 		 invocation_digest,transaction_id,receipt_digest,receipt)
-		VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(request_id,attempt,output_slot) DO NOTHING`, row.RequestID,
-		row.OutputSlot, row.ManifestID, row.ManifestLength, row.Evidence, row.Attempt,
+		VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(request_id,attempt,output_slot) DO NOTHING`, row.RequestID,
+		row.OutputSlot, row.ManifestID, row.ManifestLength, row.Attempt,
 		row.InvocationDigest, row.TransactionID, row.ReceiptDigest, row.Receipt)
 	if err != nil {
 		return exit.Internalf("cannot record model transfer weights: %s", err)
@@ -449,7 +445,7 @@ func (s *Store) RecordModelTransferWeights(row ModelTransferWeights) *exit.Error
 	_ = tx.Rollback()
 	held, problem := s.ModelTransferWeights(row.RequestID, row.Attempt, row.OutputSlot)
 	if problem != nil || held == nil || held.ManifestID != row.ManifestID ||
-		held.ManifestLength != row.ManifestLength || string(held.Evidence) != string(row.Evidence) ||
+		held.ManifestLength != row.ManifestLength ||
 		held.Attempt != row.Attempt || held.InvocationDigest != row.InvocationDigest ||
 		held.TransactionID != row.TransactionID || held.ReceiptDigest != row.ReceiptDigest ||
 		string(held.Receipt) != string(row.Receipt) ||
@@ -464,11 +460,11 @@ func mustJSON(value any) []byte { data, _ := json.Marshal(value); return data }
 
 func (s *Store) ModelTransferWeights(requestID string, attempt int64, slot string) (*ModelTransferWeights, *exit.Error) {
 	var row ModelTransferWeights
-	err := s.db.QueryRow(`SELECT request_id,output_slot,manifest_id,manifest_length,evidence,
+	err := s.db.QueryRow(`SELECT request_id,output_slot,manifest_id,manifest_length,
 		attempt,invocation_digest,transaction_id,receipt_digest,receipt,final_id
 		FROM request_model_transfer_outputs WHERE request_id=? AND attempt=? AND output_slot=?`, requestID, attempt, slot).
 		Scan(&row.RequestID, &row.OutputSlot, &row.ManifestID, &row.ManifestLength,
-			&row.Evidence, &row.Attempt, &row.InvocationDigest, &row.TransactionID,
+			&row.Attempt, &row.InvocationDigest, &row.TransactionID,
 			&row.ReceiptDigest, &row.Receipt, &row.FinalID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -485,7 +481,7 @@ func (s *Store) ModelTransferWeights(requestID string, attempt int64, slot strin
 }
 
 func (s *Store) AllModelTransferWeights(requestID string, attempt int64) ([]ModelTransferWeights, *exit.Error) {
-	rows, err := s.db.Query(`SELECT request_id,output_slot,manifest_id,manifest_length,evidence,
+	rows, err := s.db.Query(`SELECT request_id,output_slot,manifest_id,manifest_length,
 		attempt,invocation_digest,transaction_id,receipt_digest,receipt,final_id
 		FROM request_model_transfer_outputs WHERE request_id=? AND attempt=? ORDER BY output_slot`, requestID, attempt)
 	if err != nil {
@@ -495,7 +491,7 @@ func (s *Store) AllModelTransferWeights(requestID string, attempt int64) ([]Mode
 	for rows.Next() {
 		var row ModelTransferWeights
 		if err := rows.Scan(&row.RequestID, &row.OutputSlot, &row.ManifestID, &row.ManifestLength,
-			&row.Evidence, &row.Attempt, &row.InvocationDigest, &row.TransactionID,
+			&row.Attempt, &row.InvocationDigest, &row.TransactionID,
 			&row.ReceiptDigest, &row.Receipt, &row.FinalID); err != nil {
 			return nil, exit.Internalf("cannot decode model transfer output row")
 		}
