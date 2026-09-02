@@ -105,8 +105,12 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
         store, destination, snap, len(info["manifest"])
     )
     assert admitted_manifest["id"] == "sha256:" + snap
-    digests = tensorfs.digests(info["header"], {})
-    assert digests["config_digest"] is None  # the synthetic header names no config
+    # The construction document is assembled from the config bytes the header names;
+    # its digest is what the hub's header route and cozy-runtime compute from the same bytes.
+    configs = {name: bytes(store.document(row["sha256"])) for name, row in header["configs"].items()}
+    digests = tensorfs.digests(info["header"], configs)
+    document = tensorfs.construction_document(info["header"], configs)
+    assert digests["config_digest"] == "sha256:" + hashlib.sha256(document).hexdigest()
     evidence = json.dumps(
         {key: value for key, value in digests.items() if value is not None},
         sort_keys=True,
