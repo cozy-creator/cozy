@@ -1,4 +1,4 @@
-package hub
+package producttest
 
 import (
 	"context"
@@ -9,6 +9,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
@@ -40,18 +41,23 @@ func (staleSource) AccessToken(context.Context) (secret.Value, *exit.Error) {
 func hubAccepting(accept string, requests *atomic.Int32) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
 		if r.Header.Get("Authorization") != "Bearer "+accept {
-			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"error":{"code":"invalid_credentials","message":"authenticate with cozy auth login"}}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{}`))
+		_, _ = w.Write([]byte(`{"name":"paul"}`))
 	}))
 }
 
-// A hub that restarted forgets our session without expiring our copy. The client
-// re-mints from the machine key once and replays; the caller never sees the 401.
+func remintClient(url string, source hub.TokenSource) *hub.Client {
+	return hub.New(config.Config{HubURL: url}, "producttest").WithTokenSource(source)
+}
+
+// A hub that restarted forgets our session without expiring our copy of it. The
+// client re-mints from the machine key once and replays; the caller never sees
+// the 401 that killed run 97 one minute after an air rebuild bounced the dev hub.
 func TestUnauthorizedBearerIsRemintedOnce(t *testing.T) {
 	var requests atomic.Int32
 	server := hubAccepting("fresh", &requests)
@@ -59,10 +65,13 @@ func TestUnauthorizedBearerIsRemintedOnce(t *testing.T) {
 	source := &mintingSource{}
 	stale := "stale"
 	source.token.Store(&stale)
-	c := New(config.Config{HubURL: server.URL}, "test").WithTokenSource(source)
 
-	if e := c.do(context.Background(), call{method: http.MethodGet, path: "/v1/probe", auth: true}, nil); e != nil {
+	account, e := remintClient(server.URL, source).CurrentAccount(context.Background())
+	if e != nil {
 		t.Fatalf("the reminted call failed: %s", e)
+	}
+	if account.Name != "paul" {
+		t.Fatalf("the reminted call answered account %q", account.Name)
 	}
 	if got := source.invalidated.Load(); got != 1 {
 		t.Fatalf("the source was invalidated %d times", got)
@@ -76,9 +85,8 @@ func TestUnauthorizedBearerWithoutRemintSurfaces(t *testing.T) {
 	var requests atomic.Int32
 	server := hubAccepting("fresh", &requests)
 	defer server.Close()
-	c := New(config.Config{HubURL: server.URL}, "test").WithTokenSource(staleSource{})
 
-	e := c.do(context.Background(), call{method: http.MethodGet, path: "/v1/probe", auth: true}, nil)
+	_, e := remintClient(server.URL, staleSource{}).CurrentAccount(context.Background())
 	if e == nil || e.ErrName() != "invalid_credentials" {
 		t.Fatalf("expected the refusal to surface, got %v", e)
 	}
@@ -95,9 +103,8 @@ func TestPersistentUnauthorizedStopsAfterOneReplay(t *testing.T) {
 	source := &mintingSource{}
 	stale := "stale"
 	source.token.Store(&stale)
-	c := New(config.Config{HubURL: server.URL}, "test").WithTokenSource(source)
 
-	e := c.do(context.Background(), call{method: http.MethodGet, path: "/v1/probe", auth: true}, nil)
+	_, e := remintClient(server.URL, source).CurrentAccount(context.Background())
 	if e == nil || e.ErrName() != "invalid_credentials" {
 		t.Fatalf("expected the refusal to surface, got %v", e)
 	}
