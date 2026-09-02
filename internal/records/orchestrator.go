@@ -634,6 +634,34 @@ func requestNumber(q interface{ QueryRow(string, ...any) *sql.Row }, row Request
 	return number, err
 }
 
+// BindRequestPlan records the binding a rental request routes on once the rented worker
+// has resolved it. A published request that names models freezes no plan at submit; the
+// drain re-reads the row before every route, so a plan learned only in memory never
+// reaches the route and the worker's DISPATCHABLE placement stays invisible to its own
+// request (found live: the queue re-prepared the same package on a busy pod).
+func (s *Store) BindRequestPlan(id, planID string) *exit.Error {
+	if id == "" || planID == "" {
+		return exit.Internalf("cannot bind an empty request plan")
+	}
+	result, err := s.db.Exec(`UPDATE requests SET plan_id=? WHERE id=? AND (plan_id='' OR plan_id=?)`,
+		planID, id, planID)
+	if err != nil {
+		return exit.Internalf("cannot bind request %s plan: %s", id, err)
+	}
+	if changed, err := result.RowsAffected(); err == nil && changed == 1 {
+		return nil
+	}
+	var held string
+	if err := s.db.QueryRow(`SELECT plan_id FROM requests WHERE id=?`, id).Scan(&held); err != nil {
+		return exit.Internalf("cannot read request %s plan: %s", id, err)
+	}
+	if held != planID {
+		return exit.Named(exit.Conflict, "request_invocation_identity_changed",
+			"request %s already binds plan %s, not %s", id, held, planID)
+	}
+	return nil
+}
+
 // BindRemoteInvocation records the exact invocation identity learned from the worker
 // after logical package_set resolution. The client never supplies these values.
 func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, config string) *exit.Error {
