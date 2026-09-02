@@ -85,11 +85,11 @@ func TestUnresolvableSourceProfilesRefuseBeforeAnyDerivation(t *testing.T) {
 	pack := &packagepublish.Package{Root: root, Descriptor: descriptor,
 		Wheel: descriptor /* never reached */, Tree: root, Name: "thing", Release: "1.0.0"}
 	problem := pack.DeriveEvidence(t.Context(), "acme",
-		func(_ context.Context, model, lane string) (packagepublish.DeriveInput, *exit.Error) {
-			t.Fatalf("resolver reached for %s/%s", model, lane)
+		func(_ context.Context, model, release, lane string) (packagepublish.DeriveInput, *exit.Error) {
+			t.Fatalf("resolver reached for %s@%s/%s", model, release, lane)
 			return packagepublish.DeriveInput{}, nil
 		})
 	if problem == nil || problem.Name != "source_profile_unresolvable" {
-		t.Fatalf("two-segment profile answered %v", problem)
+		t.Fatalf("one-segment profile answered %v", problem)
 	}
 }

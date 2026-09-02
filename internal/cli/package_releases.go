@@ -158,13 +158,13 @@ func handlePackageYank(ctx *Context) *exit.Error {
 // deriveInputResolver turns a declared "org/model/lane" profile into the
 // evidence run's exact inputs through the hub's derive-inputs read.
 func deriveInputResolver(c *hub.Client) packagepublish.ProfileResolver {
-	return func(ctx context.Context, model, lane string) (packagepublish.DeriveInput, *exit.Error) {
+	return func(ctx context.Context, model, release, lane string) (packagepublish.DeriveInput, *exit.Error) {
 		ref, problem := hub.ParseRef(model)
 		if problem != nil {
 			return packagepublish.DeriveInput{}, problem.
-				WithRemedy("declare the source profile as <org>/<model>/<lane>")
+				WithRemedy("declare the source profile as <org>/<model>/<release>/<lane>")
 		}
-		resolved, problem := c.ModelDeriveInputs(ctx, ref, lane)
+		resolved, problem := c.ModelDeriveInputs(ctx, ref, release, lane)
 		if problem != nil {
 			return packagepublish.DeriveInput{}, problem
 		}
