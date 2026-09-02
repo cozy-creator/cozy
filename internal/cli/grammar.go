@@ -161,7 +161,8 @@ type ModelCmd struct {
 	Search   ModelSearchCmd   `cmd:"" help:"Search the model catalog."`
 	Family   ModelFamilyCmd   `cmd:"" help:"Set a model repository's discovery family."`
 	Download ModelDownloadCmd `cmd:"" help:"Acquire a source, optionally run one producer job, and retain it locally."`
-	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model repositories."`
+	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model repositories and reclaim their bytes."`
+	GC       ModelGCCmd       `cmd:"" name:"gc" help:"Reclaim the bytes no local model references."`
 	List     ModelListCmd     `cmd:"" help:"List local model releases."`
 	Upload   ModelUploadCmd   `cmd:"" help:"Acquire a source, optionally run one producer job, and retain owner-only checkpoints."`
 	Publish  ModelPublishCmd  `cmd:"" help:"Update a release's mutable lane pointers."`
@@ -217,6 +218,12 @@ type ModelRemoveCmd struct {
 
 func (c *ModelRemoveCmd) Run(r *Runtime) error {
 	return r.call(handleModelRemove, c.Refs, nil, nil, false)
+}
+
+type ModelGCCmd struct{}
+
+func (c *ModelGCCmd) Run(r *Runtime) error {
+	return r.call(handleModelGC, nil, nil, nil, false)
 }
 
 type ModelListCmd struct{}

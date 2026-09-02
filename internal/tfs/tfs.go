@@ -760,8 +760,43 @@ func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length
 	return e
 }
 
-// DeleteRepository removes the local durable name. Blobs and manifests remain
-// until TensorFS's later reachability GC.
+// GCReport is one reclamation pass as TensorFS reports it (`tfs gc --json`).
+type GCReport struct {
+	DryRun             bool     `json:"dry_run"`
+	ReclaimedBytes     int64    `json:"reclaimed_bytes"`
+	ReclaimedBlobs     int64    `json:"reclaimed_blobs"`
+	ReclaimedManifests int64    `json:"reclaimed_manifests"`
+	KeptBytes          int64    `json:"kept_bytes"`
+	KeptObjects        int64    `json:"kept_objects"`
+	Sessions           []string `json:"sessions"`
+	ScratchReaped      int64    `json:"scratch_reaped"`
+}
+
+// GC is the reclamation act over the local store (owner ruling 2026-09-02): TensorFS
+// removes every blob and manifest no repository names, deciding from its own filesystem
+// census — repos, manifests, blobs — never from a database. A live writer or read lease
+// refuses by name; an open ingest session keeps what it names. `abandonSessions` first
+// abandons every session whose writer is gone (`tfs ingest reap`); a caller says so only
+// when none of its own transfers can still stand between `ingest run` and `ingest install`.
+func (t *Tool) GC(abandonSessions bool) (GCReport, *exit.Error) {
+	if abandonSessions {
+		if _, problem := t.run("ingest", "reap", t.Root); problem != nil {
+			return GCReport{}, problem
+		}
+	}
+	out, problem := t.run("gc", t.Root, "--json")
+	if problem != nil {
+		return GCReport{}, problem
+	}
+	var report GCReport
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &report); err != nil {
+		return GCReport{}, exit.Internalf("tfs gc returned an unreadable report: %s", err)
+	}
+	return report, nil
+}
+
+// DeleteRepository removes the local durable name. Its bytes are reclaimed by the GC that
+// follows the removal.
 func (t *Tool) DeleteRepository(org, name, scratch string) *exit.Error {
 	current, e := t.observedRepository(org, name, scratch)
 	if e != nil {
