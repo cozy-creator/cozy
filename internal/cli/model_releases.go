@@ -163,6 +163,52 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	}, "model", "release", "revision", "lanes", "status", "changed"))
 }
 
+func handleModelRetarget(ctx *Context) *exit.Error {
+	ref, problem := hub.ParseRef(strings.TrimSpace(ctx.Inv.Args[0]))
+	if problem != nil {
+		return problem
+	}
+	release, problem := modelLabel("--release", ctx.Inv.Value("--release"))
+	if problem != nil {
+		return problem
+	}
+	lane, problem := modelLabel("--lane", ctx.Inv.Value("--lane"))
+	if problem != nil {
+		return problem
+	}
+	checkpoint, problem := tfs.ManifestID(ctx.Inv.Value("--to"))
+	if problem != nil {
+		return problem.WithRemedy("use --to sha256:<64 lowercase hex>")
+	}
+	c, problem := ownedPublication(ctx, ref)
+	if problem != nil {
+		return problem
+	}
+	hctx, cancel := hub.LongContext()
+	defer cancel()
+	updated, problem := c.RetargetModelLane(hctx, ref, release, lane, checkpoint,
+		"cozy model retarget "+ref.String()+"@"+release+"/"+lane)
+	if problem != nil {
+		return problem
+	}
+	if updated.Release != release || updated.Revision < 1 || updated.Yanked {
+		return exit.Internalf("Tensorhub returned an invalid model release update")
+	}
+	lanes, problem := modelReleaseLaneMap(updated)
+	if problem != nil {
+		return problem
+	}
+	if lanes[lane] != checkpoint {
+		return exit.Internalf("Tensorhub returned a different lane pointer")
+	}
+	return emit(ctx, compactRecord([]output.Field{
+		{K: "model", V: ref.String()}, {K: "release", V: release},
+		{K: "lane", V: lane}, {K: "checkpoint", V: checkpoint},
+		{K: "revision", V: updated.Revision}, {K: "status", V: "retargeted"},
+		{K: "changed", V: updated.Changed},
+	}, "model", "release", "lane", "checkpoint", "revision", "status", "changed"))
+}
+
 func handleModelYank(ctx *Context) *exit.Error {
 	ref, problem := hub.ParseRef(strings.TrimSpace(ctx.Inv.Args[0]))
 	if problem != nil {

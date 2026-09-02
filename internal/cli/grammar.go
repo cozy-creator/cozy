@@ -131,6 +131,7 @@ type ModelCmd struct {
 	List     ModelListCmd     `cmd:"" help:"List local model releases."`
 	Upload   ModelUploadCmd   `cmd:"" help:"Acquire a source, optionally run one producer job, and retain owner-only checkpoints."`
 	Publish  ModelPublishCmd  `cmd:"" help:"Update a release's mutable lane pointers."`
+	Retarget ModelRetargetCmd `cmd:"" help:"Move one existing release lane to another retained checkpoint."`
 	Yank     ModelYankCmd     `cmd:"" help:"Yank a model release."`
 }
 
@@ -220,6 +221,18 @@ type ModelPublishCmd struct {
 func (c *ModelPublishCmd) Run(r *Runtime) error {
 	return r.call(handleModelPublish, []string{c.Ref}, nil,
 		values("--release", c.Release, "--lane", c.Lanes, "--remove-lane", c.RemoveLane), false)
+}
+
+type ModelRetargetCmd struct {
+	Ref     string `arg:"" name:"model" help:"Tensorhub model repository (org/name)."`
+	Release string `help:"Mutable release label." required:""`
+	Lane    string `help:"Existing lane to move; retarget never cuts one." required:""`
+	To      string `help:"Retained checkpoint id (sha256:<64 hex>)." required:""`
+}
+
+func (c *ModelRetargetCmd) Run(r *Runtime) error {
+	return r.call(handleModelRetarget, []string{c.Ref}, nil,
+		values("--release", c.Release, "--lane", c.Lane, "--to", c.To), false)
 }
 
 type ModelYankCmd struct {
