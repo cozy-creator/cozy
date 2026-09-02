@@ -13,7 +13,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/scratch"
 	"github.com/cozy-creator/cozy/internal/tfs"
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
@@ -25,19 +24,16 @@ type localPreparedSource struct {
 	plan           *tfs.SourcePlan
 }
 
-func prepareLocalTransferSources(runCtx context.Context, ctx *Context, requestID string,
+// prepareLocalTransferSources stages the source under root — the request's own
+// `tmp/<request-id>/`, claimed and released by the caller — and leaves its CozyTensors in
+// the CAS. Nothing here outlives the caller's Release.
+func prepareLocalTransferSources(runCtx context.Context, ctx *Context, root string,
 	intent records.ModelTransferIntent, slots map[string]string,
 ) (map[string]localPreparedSource, *exit.Error) {
-	tool, layout, problem := localTensorFS(ctx)
+	tool, _, problem := localTensorFS(ctx)
 	if problem != nil {
 		return nil, problem
 	}
-	work, problem := scratch.Temp(layout.Transfer, "model-transfer-")
-	if problem != nil {
-		return nil, problem
-	}
-	defer work.Release()
-	root := work.Path
 	if strings.HasPrefix(intent.Source, "local/") {
 		name := strings.TrimPrefix(intent.Source, "local/")
 		alias, problem := tool.ResolveLocal(name)

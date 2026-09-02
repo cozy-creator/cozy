@@ -14,6 +14,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -74,7 +75,12 @@ func (o *modelTransferOwner) MaterializeLocal(parent context.Context, requestID 
 ) ([]orchestrator.ModelRef, *exit.Error) {
 	ctx, cancel := o.requestContext(parent, requestID)
 	defer cancel()
-	prepared, problem := prepareLocalTransferSources(ctx, o.cliContext(intent, false), requestID,
+	work, problem := o.requestScratch(requestID)
+	if problem != nil {
+		return nil, problem
+	}
+	defer work.Release()
+	prepared, problem := prepareLocalTransferSources(ctx, o.cliContext(intent, false), work.Path,
 		intent, intent.SourceProfiles)
 	if problem != nil {
 		return nil, problem
@@ -149,21 +155,24 @@ func (o *modelTransferOwner) PassThrough(parent context.Context, requestID strin
 	}
 	ctx, cancel := o.requestContext(parent, requestID)
 	defer cancel()
-	prepared, problem := prepareLocalTransferSources(ctx, o.cliContext(intent, false), requestID,
+	// The request's scratch holds the downloaded source only until its CozyTensors are in
+	// the CAS; it is released before finalization, which claims it again for its own
+	// small exchange files.
+	work, problem := o.requestScratch(requestID)
+	if problem != nil {
+		return problem
+	}
+	defer work.Release()
+	prepared, problem := prepareLocalTransferSources(ctx, o.cliContext(intent, false), work.Path,
 		intent, map[string]string{"model": ""})
 	if problem != nil {
 		return problem
 	}
 	source := prepared["model"]
-	tool, layout, problem := localTensorFS(o.cliContext(intent, false))
+	tool, _, problem := localTensorFS(o.cliContext(intent, false))
 	if problem != nil {
 		return problem
 	}
-	work, problem := scratch.Temp(layout.Transfer, "model-transfer-")
-	if problem != nil {
-		return problem
-	}
-	defer work.Release()
 	if source.plan != nil {
 		temporary := "transfer-" + shortTransferID(requestID)
 		observed, problem := tool.ObserveLocal(temporary,
@@ -200,7 +209,18 @@ func (o *modelTransferOwner) PassThrough(parent context.Context, requestID strin
 	if problem := o.store.BeginModelTransferFinalization(requestID); problem != nil {
 		return problem
 	}
+	work.Release()
 	return o.Finalize(ctx, requestID, nil)
+}
+
+// requestScratch is `tmp/<request-id>/`: the one directory a model transfer may write
+// bytes in flight to, released by the phase that claimed it.
+func (o *modelTransferOwner) requestScratch(requestID string) (*scratch.Dir, *exit.Error) {
+	layout, problem := home.Open(o.cfg.Home)
+	if problem != nil {
+		return nil, problem
+	}
+	return scratch.Named(layout.Tmp, requestID)
 }
 
 func (o *modelTransferOwner) Finalize(ctx context.Context, requestID string,
@@ -257,11 +277,11 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 ) (string, *exit.Error) {
 	cli := o.cliContext(intent, worker != "")
 	if intent.Kind == "model-download" {
-		tool, layout, problem := localTensorFS(cli)
+		tool, _, problem := localTensorFS(cli)
 		if problem != nil {
 			return "", problem
 		}
-		work, problem := scratch.Temp(layout.Transfer, "model-transfer-")
+		work, problem := o.requestScratch(weights.RequestID)
 		if problem != nil {
 			return "", problem
 		}
@@ -293,11 +313,11 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 		return "", problem
 	}
 	if worker == "" {
-		tool, _, layout, problem := tooling(cli)
+		tool, _, _, problem := tooling(cli)
 		if problem != nil {
 			return "", problem
 		}
-		work, problem := scratch.Temp(layout.Transfer, "model-upload-")
+		work, problem := o.requestScratch(weights.RequestID)
 		if problem != nil {
 			return "", problem
 		}
