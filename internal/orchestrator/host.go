@@ -134,7 +134,7 @@ func (c *Orchestrator) hostPrepareRefused(s *session, w *worker, seq uint64, lab
 		w.desiredRefusal = exit.Named(exit.Structural, "worker.desired_state_refused",
 			"worker rejected desired revision %d before applying it: %s", revision, detail)
 	}
-	private := clonePrivatePackageSet(w.desiredPrivate)
+	private := cloneLocalPackageSet(w.desiredLocal)
 	privatePlacement := clonePrivatePlacementSet(w.desiredPrivatePlacement)
 	packages := clonePackageRefs(w.desiredPackages)
 	models := cloneModelRefs(w.desiredModels)
@@ -150,7 +150,7 @@ func (c *Orchestrator) hostPrepareRefused(s *session, w *worker, seq uint64, lab
 	var e *exit.Error
 	switch {
 	case private != nil:
-		e = c.issuePrivatePackageSet(s, w, private)
+		e = c.issueLocalPackageSet(s, w, private)
 	case privatePlacement != nil:
 		e = c.issuePrivatePlacementSet(s, w, privatePlacement)
 	default:

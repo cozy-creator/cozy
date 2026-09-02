@@ -36,10 +36,10 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/mediawire"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
 	"github.com/cozy-creator/cozy/internal/workertls"
@@ -71,19 +71,19 @@ type fakePod struct {
 	// every entrypoint advertised, one free seat. Offers are recorded, never answered.
 	serve bool
 
-	mu              sync.Mutex
-	acks            []*pb.SnapshotAck
-	desired         []*pb.DesiredWorkerState
-	prepares        []*pb.PreparePackageSetCall
-	privatePrepares []*pb.PreparePrivatePackageCall
-	grants          []*pb.PrivatePackageFileGrant
-	lanes           []string // the order lanes were used: fetch, prepare_private, placement_set
-	prepareCodes    []codes.Code
-	hostDigest      []byte
-	preparedSet     []byte
-	preparedDig     []byte
-	reports         map[string]int // fault text -> reports that carried it
-	offers          []*pb.AttemptOffer
+	mu            sync.Mutex
+	acks          []*pb.SnapshotAck
+	desired       []*pb.DesiredWorkerState
+	prepares      []*pb.PreparePackageSetCall
+	localPrepares []*pb.PrepareLocalPackageCall
+	grants        []*pb.LocalPackageFileGrant
+	lanes         []string // the order lanes were used: fetch, prepare_private, placement_set
+	prepareCodes  []codes.Code
+	hostDigest    []byte
+	preparedSet   []byte
+	preparedDig   []byte
+	reports       map[string]int // fault text -> reports that carried it
+	offers        []*pb.AttemptOffer
 }
 
 // served is the serve arm's ObservedWorkerState: the exact set accepted and converged,
@@ -106,7 +106,7 @@ func (p *fakePod) served(d *pb.DesiredWorkerState, epoch uint64) *pb.WorkerFrame
 		}
 		development := placement.Sub("development")
 		if development != nil {
-			row.PackageRevisionDigest = development.Str("private_revision_digest")
+			row.PackageRevisionDigest = development.Str("local_revision_digest")
 		} else {
 			row.PackageRevisionDigest = placement.Sub("package").Str("release_digest")
 		}
@@ -283,22 +283,22 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			p.mu.Lock()
 			p.offers = append(p.offers, m.AttemptOffer)
 			p.mu.Unlock()
-		case *pb.RecordOwnerFrame_PrivatePackageFetchRequest:
+		case *pb.RecordOwnerFrame_LocalPackageFetchRequest:
 			// th-094's pod half, minimally: every named wheel is reported VERIFIED at its
 			// full length. The grants are recorded so the test can read what was named.
-			request := m.PrivatePackageFetchRequest
+			request := m.LocalPackageFetchRequest
 			p.mu.Lock()
 			p.grants = append(p.grants, request.Files...)
 			p.lanes = append(p.lanes, "fetch")
 			p.mu.Unlock()
 			for _, grant := range request.Files {
-				if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_PrivatePackageFileStatus{
-					PrivatePackageFileStatus: &pb.PrivatePackageFileStatus{
+				if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_LocalPackageFileStatus{
+					LocalPackageFileStatus: &pb.LocalPackageFileStatus{
 						RecordOwnerEpoch: request.RecordOwnerEpoch, ControlStreamEpoch: request.ControlStreamEpoch,
 						WorkerBootId: request.WorkerBootId, OperationId: request.OperationId,
 						SourceDigest: request.SourceDigest, Digest: grant.Digest, Filename: grant.Filename,
 						Kind: grant.Kind, Length: grant.Length, ReceivedBytes: grant.Length,
-						State: pb.PrivatePackageFileState_PRIVATE_PACKAGE_FILE_STATE_VERIFIED,
+						State: pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED,
 					}}}); err != nil {
 					return err
 				}
@@ -307,18 +307,18 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 	}
 }
 
-// PreparePrivatePackage is the pod host's private lane: the set names wheels the pod
+// PrepareLocalPackage is the pod host's private lane: the set names wheels the pod
 // already holds verified, and the prepared placement is a development one carrying the
-// exact project wheel and the private revision digest, as Runtime authors it.
-func (p *fakePod) PreparePrivatePackage(call *pb.PreparePrivatePackageCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
+// exact project wheel and the local revision digest, as Runtime authors it.
+func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
 	if err := p.verifyClaim(call.Claim, false); err != nil {
 		return err
 	}
-	selected := call.PrivatePackageSet
+	selected := call.LocalPackageSet
 	if selected == nil || selected.Package == nil || len(selected.Files) == 0 {
-		return status.Error(codes.InvalidArgument, "no private package set")
+		return status.Error(codes.InvalidArgument, "no local package set")
 	}
-	var project *pb.PrivatePackageFileRef
+	var project *pb.LocalPackageFileRef
 	var total uint64
 	for _, file := range selected.Files {
 		total += file.Length
@@ -327,17 +327,17 @@ func (p *fakePod) PreparePrivatePackage(call *pb.PreparePrivatePackageCall, stre
 		}
 	}
 	if project == nil {
-		return status.Error(codes.FailedPrecondition, "the private package set names no project wheel")
+		return status.Error(codes.FailedPrecondition, "the local package set names no project wheel")
 	}
 	p.mu.Lock()
-	p.privatePrepares = append(p.privatePrepares, call)
+	p.localPrepares = append(p.localPrepares, call)
 	p.lanes = append(p.lanes, "prepare_private")
 	p.mu.Unlock()
 	setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{{
 		PlacementId: "package-" + selected.OperationId,
 		PackageMode: &pb.Placement_Development{Development: &pb.DevelopmentPackage{
 			Package: selected.Package.Package, Release: selected.Package.Release,
-			SourceDigest: selected.Package.SourceDigest, PrivateRevisionDigest: selected.Package.PrivateRevisionDigest,
+			SourceDigest: selected.Package.SourceDigest, LocalRevisionDigest: selected.Package.LocalRevisionDigest,
 			ProjectWheel: &pb.WheelFact{Ref: &pb.Ref{Digest: project.Digest, Length: project.Length},
 				Distribution: "weightless", Version: selected.Package.Release, Filename: project.Filename,
 				ImportRoots: []string{"weightless"}, Tags: []string{"py3-none-any"}}}},
@@ -497,7 +497,7 @@ func rentalWiring(connection *orchestrator.WorkerConnection, signer ed25519.Priv
 			}
 			return ed25519.Sign(signer, body), nil
 		}
-		o.PrivateWheels = func(_ context.Context, wheels []orchestrator.PrivateWheel) ([]string, *exit.Error) {
+		o.LocalWheels = func(_ context.Context, wheels []orchestrator.LocalWheel) ([]string, *exit.Error) {
 			urls := make([]string, 0, len(wheels))
 			for _, wheel := range wheels {
 				urls = append(urls, "https://store.invalid/private/"+wheel.Digest)
@@ -570,7 +570,7 @@ func TestPodHostThreeStepSequence(t *testing.T) {
 		t.Fatalf("the host call's Claim is stream-scoped or misaddressed: %+v", got)
 	}
 	for _, d := range pod.desired {
-		if d.GetPackageSet() != nil || d.GetPrivatePackageSet() != nil || d.GetPrivatePlacementSet() != nil {
+		if d.GetPackageSet() != nil || d.GetLocalPackageSet() != nil || d.GetPrivatePlacementSet() != nil {
 			t.Fatalf("a host mode crossed WorkerControl: %T", d.Mode)
 		}
 	}
@@ -623,25 +623,25 @@ func TestPodHostRefusesUnverifiedHostDocument(t *testing.T) {
 	}
 }
 
-// privateLauncher is the one Launcher method a rental-bound editable request uses: the
+// localLauncher is the one Launcher method a rental-bound editable request uses: the
 // sealed revision the request's install names. Everything local is out of scope on a pod.
-type privateLauncher struct {
+type localLauncher struct {
 	orchestrator.Launcher
-	revision privatepackage.Revision
+	revision localpackage.Revision
 }
 
-func (l privateLauncher) PrivateRevision(installID, digest string) (privatepackage.Revision, *exit.Error) {
+func (l localLauncher) LocalRevision(installID, digest string) (localpackage.Revision, *exit.Error) {
 	if digest != l.revision.Digest {
-		return privatepackage.Revision{}, exit.New(exit.NotFound, "no private revision %s", digest)
+		return localpackage.Revision{}, exit.New(exit.NotFound, "no local revision %s", digest)
 	}
 	return l.revision, nil
 }
 
-// stagePrivateRevision writes one project wheel and one dependency wheel under the root
-// and seals them the way `privatepackage.Stage` does: files sorted by digest, one project.
-func stagePrivateRevision(t *testing.T, root string) privatepackage.Revision {
+// stageLocalRevision writes one project wheel and one dependency wheel under the root
+// and seals them the way `localpackage.Stage` does: files sorted by digest, one project.
+func stageLocalRevision(t *testing.T, root string) localpackage.Revision {
 	t.Helper()
-	write := func(name string, body []byte) privatepackage.File {
+	write := func(name string, body []byte) localpackage.File {
 		path := filepath.Join(root, name)
 		must(t, os.WriteFile(path, body, 0o600))
 		digest, _ := canonical.Spell(sha256Of(body))
@@ -649,23 +649,23 @@ func stagePrivateRevision(t *testing.T, root string) privatepackage.Revision {
 		if strings.HasPrefix(name, "weightless-") {
 			kind = "project"
 		}
-		return privatepackage.File{Digest: digest, Filename: name, Kind: kind, Path: path, Length: int64(len(body))}
+		return localpackage.File{Digest: digest, Filename: name, Kind: kind, Path: path, Length: int64(len(body))}
 	}
-	files := []privatepackage.File{
+	files := []localpackage.File{
 		write("weightless-1.0.0-py3-none-any.whl", bytes.Repeat([]byte("project wheel bytes\n"), 180)),
 		write("helper-0.3.0-py3-none-any.whl", bytes.Repeat([]byte("dependency wheel bytes\n"), 90)),
 	}
 	if files[1].Digest < files[0].Digest {
 		files[0], files[1] = files[1], files[0]
 	}
-	return privatepackage.Revision{Package: "local/weightless", Release: "1.0.0",
+	return localpackage.Revision{Package: "local/weightless", Release: "1.0.0",
 		SourceDigest: "sha256:" + strings.Repeat("31", 32), Digest: "sha256:" + strings.Repeat("32", 32),
 		DescriptorDigest: "sha256:" + strings.Repeat("33", 32), DescriptorLength: 512, Files: files}
 }
 
 // submitPrivateRental records the editable install the request names and queues the
 // rental-bound request, exactly as `cozy run local/... --rental-only` does.
-func submitPrivateRental(t *testing.T, o *owner, revision privatepackage.Revision, idem string) string {
+func submitPrivateRental(t *testing.T, o *owner, revision localpackage.Revision, idem string) string {
 	t.Helper()
 	install := records.PackageInstall{ID: "inst-" + idem, Package: revision.Package, Major: 1, Version: revision.Release,
 		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"), SourceDigest: revision.SourceDigest,
@@ -676,27 +676,27 @@ func submitPrivateRental(t *testing.T, o *owner, revision privatepackage.Revisio
 	requestID, _, e := o.c.Submit(orchestrator.Submission{
 		IdemKey: idem, Package: revision.Package, Entrypoint: "tile", PlanID: planID,
 		Release: revision.Release, ReleaseDigest: revision.SourceDigest,
-		PrivatePackageDigest: revision.Digest, Payload: []byte(`{"size":48}`), Outputs: []string{"image"},
+		LocalPackageDigest: revision.Digest, Payload: []byte(`{"size":48}`), Outputs: []string{"image"},
 		Worker: podRental, InstallID: install.ID, Rental: true, RentalRequired: true,
 	})
 	fatal(t, e)
 	return requestID
 }
 
-// TestPodHostPrivateRevisionGrantsProjectWheel: a rental-bound editable request grants
+// TestPodHostLocalRevisionGrantsProjectWheel: a rental-bound editable request grants
 // every wheel of its sealed revision to the pod — the project wheel among them — BEFORE
 // the private set is prepared through PodHost, and the placement_set the owner then
 // sends is the exact bytes the host prepared, carrying that wheel.
-func TestPodHostPrivateRevisionGrantsProjectWheel(t *testing.T) {
+func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	pod := &fakePod{controlKey: public}
 	root := t.TempDir()
 	connection, _ := startFakePod(t, root, pod)
-	revision := stagePrivateRevision(t, root)
+	revision := stageLocalRevision(t, root)
 	pod.serve = true
 	o := hostOwner(t, "podhost-private", rentalWiring(connection, private), func(opt *orchestrator.Options) {
-		opt.Packages = privateLauncher{revision: revision}
+		opt.Packages = localLauncher{revision: revision}
 	})
 	requestID := submitPrivateRental(t, o, revision, "private-grants")
 
@@ -725,10 +725,10 @@ func TestPodHostPrivateRevisionGrantsProjectWheel(t *testing.T) {
 		t.Fatalf("%d grant(s) with %d project wheel(s); want %d grants naming exactly one project wheel",
 			len(pod.grants), project, len(revision.Files))
 	}
-	if len(pod.privatePrepares) != 1 || len(pod.privatePrepares[0].PrivatePackageSet.Files) != len(revision.Files) ||
-		pod.privatePrepares[0].PrivatePackageSet.OperationId != requestID {
-		t.Fatalf("PodHost.PreparePrivatePackage saw %d call(s) for %v; want one naming request %s and every wheel",
-			len(pod.privatePrepares), pod.privatePrepares, requestID)
+	if len(pod.localPrepares) != 1 || len(pod.localPrepares[0].LocalPackageSet.Files) != len(revision.Files) ||
+		pod.localPrepares[0].LocalPackageSet.OperationId != requestID {
+		t.Fatalf("PodHost.PrepareLocalPackage saw %d call(s) for %v; want one naming request %s and every wheel",
+			len(pod.localPrepares), pod.localPrepares, requestID)
 	}
 	sent := pod.desired[0].GetPlacementSet()
 	if sent == nil || !bytes.Equal(sent.PlacementSetCanonicalBytes, pod.preparedSet) {
@@ -742,13 +742,13 @@ func TestPodHostPrivateRevisionGrantsProjectWheel(t *testing.T) {
 	}
 	row, e := o.store.RequestRow(requestID)
 	fatal(t, e)
-	if row.PrivatePackageUploadedBootID != podBootID {
-		t.Fatalf("the request row records upload boot %q; want the pod's %s", row.PrivatePackageUploadedBootID, podBootID)
+	if row.LocalPackageUploadedBootID != podBootID {
+		t.Fatalf("the request row records upload boot %q; want the pod's %s", row.LocalPackageUploadedBootID, podBootID)
 	}
 	pod.mu.Unlock()
 	// THE POD SERVES: the request is DISPATCHED to the rented worker exactly once — the
 	// install that pins a local relaunch never hides the rental — and the spec names the
-	// private revision with no Environment identity, which development execution has none of.
+	// local revision with no Environment identity, which development execution has none of.
 	waitUntil(t, "the attempt offer on the pod", func() bool {
 		pod.mu.Lock()
 		defer pod.mu.Unlock()
@@ -763,7 +763,7 @@ func TestPodHostPrivateRevisionGrantsProjectWheel(t *testing.T) {
 	spec, err := canonical.Read(pod.offers[0].InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
 	must(t, err)
 	if spec.Str("package_revision_digest") != revision.Digest || spec.Str("environment_digest") != "" {
-		t.Fatalf("the InvocationSpec names revision %s and environment %q; want the private revision %s and no environment",
+		t.Fatalf("the InvocationSpec names revision %s and environment %q; want the local revision %s and no environment",
 			spec.Str("package_revision_digest"), spec.Str("environment_digest"), revision.Digest)
 	}
 }
@@ -779,9 +779,9 @@ func TestPodPlacementRefusedRepeats(t *testing.T) {
 	pod := &fakePod{controlKey: public}
 	root := t.TempDir()
 	connection, _ := startFakePod(t, root, pod)
-	revision := stagePrivateRevision(t, root)
+	revision := stageLocalRevision(t, root)
 	o := hostOwner(t, "podhost-latched", rentalWiring(connection, private), func(opt *orchestrator.Options) {
-		opt.Packages = privateLauncher{revision: revision}
+		opt.Packages = localLauncher{revision: revision}
 	})
 	missing := "sha256:" + strings.Repeat("2964e74c", 8) + " is reached by PlacementSet/1 and absent locally and from the plan"
 	first := &pb.Fault{Kind: pb.FaultKind_FAULT_KIND_ARTIFACT_FETCH_FAILED, Reason: "download_plan_missing", Detail: missing}

@@ -17,9 +17,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -144,7 +144,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		spec, e = replayJobSubmission(sub, *existing)
 	} else {
 		if sub.Rental || sub.RentalRequired {
-			unlock := privatepackage.Guard()
+			unlock := localpackage.Guard()
 			defer unlock()
 		}
 		spec, e = s.resolveJob(r.Context(), sub)
@@ -251,9 +251,9 @@ func replayJobSubmission(sub JobSubmission,
 	return orchestrator.Submission{Kind: "job", Package: packageName,
 		Entrypoint: function, Payload: payload, Org: org,
 		InstallID: recorded.InstallID, Release: recorded.Release,
-		ReleaseDigest:        recorded.PackageRevisionDigest,
-		PrivatePackageDigest: recorded.PrivatePackageDigest,
-		PlanID:               recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
+		ReleaseDigest:      recorded.PackageRevisionDigest,
+		LocalPackageDigest: recorded.LocalPackageDigest,
+		PlanID:             recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
 		NeedsAccelerator: recorded.NeedsAccelerator, Trees: trees, Worker: recorded.Worker,
 		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
 		Models: models, ModelTransfer: transfer, ProducerParams: params}, nil
@@ -304,10 +304,10 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 				return out, refreshProblem
 			}
 			if !editable {
-				return out, exit.Named(exit.Conflict, "private_package_install_invalid",
+				return out, exit.Named(exit.Conflict, "local_package_install_invalid",
 					"%s is not one editable local package", sub.Package)
 			}
-			return s.resolvePrivateJob(ctx, sub, out, refreshed)
+			return s.resolveLocalJob(ctx, sub, out, refreshed)
 		}
 		if sub.InstallID != "" || sub.Release == "" || sub.ReleaseDigest == "" || len(sub.Trees) > 0 {
 			return out, exit.Named(exit.Validation, "rental.job_release_incomplete",
@@ -388,7 +388,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 	return out, nil
 }
 
-func (s *Server) resolvePrivateJob(ctx context.Context, sub JobSubmission,
+func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 	out orchestrator.Submission, installID string,
 ) (orchestrator.Submission, *exit.Error) {
 	if len(sub.Trees) > 0 {
@@ -422,13 +422,13 @@ func (s *Server) resolvePrivateJob(ctx context.Context, sub JobSubmission,
 		return out, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", sub.Package, sub.Function)
 	}
-	revision, problem := s.packages.PreparePrivate(ctx, installID)
+	revision, problem := s.packages.PrepareLocal(ctx, installID)
 	if problem != nil {
 		return out, problem
 	}
 	out.InstallID = installID
 	out.Release, out.ReleaseDigest = revision.Release, revision.SourceDigest
-	out.PrivatePackageDigest = revision.Digest
+	out.LocalPackageDigest = revision.Digest
 	return out, nil
 }
 

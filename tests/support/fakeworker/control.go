@@ -330,11 +330,8 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			}
 			accepted := &pb.AttemptAccepted{
 				RequestId: offer.RequestId, AttemptOrdinal: offer.AttemptOrdinal,
-				InvocationSpecDigest:    offer.InvocationSpecDigest,
-				PlanDigest:              canonical.Digest([]byte("fake-plan")),
-				ModelConstructionDigest: canonical.Digest([]byte("fake-construction")),
-				Plan:                    &pb.AttemptPlanSummary{Delivery: "native", Placement: "all_resident"},
-				PlacementId:             offer.PlacementId, ExecutorEpoch: 1,
+				InvocationSpecDigest: offer.InvocationSpecDigest,
+				PlacementId:          offer.PlacementId, LaneId: laneOf(offer.PlacementId),
 			}
 			env(func(e, g uint64, b string) {
 				accepted.RecordOwnerEpoch, accepted.ControlStreamEpoch, accepted.WorkerBootId = e, g, b

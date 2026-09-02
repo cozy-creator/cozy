@@ -20,8 +20,8 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
-	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
@@ -97,7 +97,7 @@ func TestProjectWheelImportRoots(t *testing.T) {
 		t.Fatalf("a refused editable install left a pin behind [exit %d]\n%s", code, out)
 	}
 
-	// The fixed fixture installs, and the private revision a rental would receive
+	// The fixed fixture installs, and the local revision a rental would receive
 	// carries a project wheel that installs weightless.py and registers its application.
 	code, out = runCozy(t, root, "package", "install", project, "--editable")
 	if code != 0 {
@@ -105,15 +105,15 @@ func TestProjectWheelImportRoots(t *testing.T) {
 	}
 	layout, problem := home.Open(root)
 	fatal(t, problem)
-	revision, problem := privatepackage.Stage(t.Context(), layout, activePackageInstall(t, root))
+	revision, problem := localpackage.Stage(t.Context(), layout, activePackageInstall(t, root))
 	fatal(t, problem)
 	var transferred []string
 	for _, file := range revision.Files {
 		if file.Kind != "project" {
 			continue
 		}
-		if !strings.HasPrefix(file.Path, layout.PrivatePackages+string(os.PathSeparator)) {
-			t.Fatalf("project wheel staged outside private packages: %s", file.Path)
+		if !strings.HasPrefix(file.Path, layout.LocalPackages+string(os.PathSeparator)) {
+			t.Fatalf("project wheel staged outside local packages: %s", file.Path)
 		}
 		contents, problem := wheel.InspectContents(file.Path)
 		fatal(t, problem)
@@ -130,7 +130,7 @@ func TestProjectWheelImportRoots(t *testing.T) {
 		transferred = append(transferred, file.Filename)
 	}
 	if len(transferred) != 1 {
-		t.Fatalf("private revision carried %d project wheels: %v", len(transferred), revision.Files)
+		t.Fatalf("local revision carried %d project wheels: %v", len(transferred), revision.Files)
 	}
 }
 

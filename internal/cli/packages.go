@@ -12,9 +12,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
-	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -337,11 +337,11 @@ func handleRm(ctx *Context) *exit.Error {
 			"reclaimed":  output.Bytes(n),
 		})
 	}
-	unlockPrivate := privatepackage.Guard()
-	privateProblem := privatepackage.Sweep(l, st)
-	unlockPrivate()
-	if privateProblem != nil {
-		return privateProblem
+	unlockLocal := localpackage.Guard()
+	localProblem := localpackage.Sweep(l, st)
+	unlockLocal()
+	if localProblem != nil {
+		return localProblem
 	}
 	if len(removed.Rows) == 0 {
 		removed.Aggregates = []output.Field{{K: "changed", V: false}}

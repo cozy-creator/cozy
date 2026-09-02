@@ -31,7 +31,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/privatepackage"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -77,10 +77,10 @@ type Options struct {
 	AcquireManagedRental func(records.Request) (string, string, *exit.Error)
 	ReleaseManagedRental func(string) (string, *exit.Error)
 	ModelTransfers       ModelTransferOwner
-	// PrivateWheels puts an unpublished revision's wheels in the object store and answers
+	// LocalWheels puts an unpublished revision's wheels in the object store and answers
 	// with one read capability per wheel (th-094). Without it this daemon cannot transfer a
-	// private package: the control stream carries control, not content.
-	PrivateWheels PrivateWheelGrantSource
+	// local package: the control stream carries control, not content.
+	LocalWheels LocalWheelGrantSource
 	// ConfigDigest is the local evaluated-config identity. Environment identity
 	// comes only from the exact selected PlacementSet.
 	ConfigDigest string
@@ -146,7 +146,7 @@ type Launcher interface {
 	// the choice into the orchestrator, which resolves nothing.
 	ResolveJob(pkg, function string) (WorkerLaunchSpec, *exit.Error)
 	ResolveJobInstall(installID, function string) (WorkerLaunchSpec, *exit.Error)
-	PrivateRevision(installID, digest string) (privatepackage.Revision, *exit.Error)
+	LocalRevision(installID, digest string) (localpackage.Revision, *exit.Error)
 }
 
 type LogicalPackage struct {
@@ -230,9 +230,9 @@ type Orchestrator struct {
 	transferDispatching map[string]bool
 	transferCancels     map[string]context.CancelFunc
 	transferProgressSeq map[string]uint64
-	// privateTransfers is command-scoped, lossy progress over Creator's durable request
+	// localTransfers is command-scoped, lossy progress over Creator's durable request
 	// row and sealed revision. A restart simply replays exact chunks from those authorities.
-	privateTransfers map[string]*privateTransfer
+	localTransfers map[string]*localTransfer
 }
 
 type wait struct {
@@ -270,7 +270,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		transferDispatching: make(map[string]bool),
 		transferCancels:     make(map[string]context.CancelFunc),
 		transferProgressSeq: make(map[string]uint64),
-		privateTransfers:    make(map[string]*privateTransfer),
+		localTransfers:      make(map[string]*localTransfer),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a
 	// SAMPLING resolution, never a verdict: every verdict it acts on is the worker's own
@@ -853,7 +853,7 @@ func (c *Orchestrator) CancelQueued(requestID string) *exit.Error {
 		}
 		return exit.Internalf("canceled request %s cannot be read back", requestID)
 	}
-	abortProblem := c.cancelPrivateTransfer(requestID)
+	abortProblem := c.cancelLocalTransfer(requestID)
 	c.forget(requestID)
 	if row.ModelTransfer != nil {
 		c.forgetTransferProgress(requestID)

@@ -13,9 +13,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
-	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -52,46 +52,46 @@ type Resolver struct {
 	Devices []string
 }
 
-// PreparePrivate freezes one editable install into exact wheels before rental attachment.
+// PrepareLocal freezes one editable install into exact wheels before rental attachment.
 // Tensorhub selects the base; the worker validates the package against that exact base.
-func (r *Resolver) PreparePrivate(ctx context.Context, installID string) (
-	privatepackage.Revision, *exit.Error,
+func (r *Resolver) PrepareLocal(ctx context.Context, installID string) (
+	localpackage.Revision, *exit.Error,
 ) {
 	install, problem := r.store.Install(installID)
 	if problem != nil {
-		return privatepackage.Revision{}, problem
+		return localpackage.Revision{}, problem
 	}
 	if install == nil {
-		return privatepackage.Revision{}, exit.New(exit.NotFound, "install %s does not exist", installID)
+		return localpackage.Revision{}, exit.New(exit.NotFound, "install %s does not exist", installID)
 	}
 	layout, problem := home.Open(r.cfg.Home)
 	if problem != nil {
-		return privatepackage.Revision{}, problem
+		return localpackage.Revision{}, problem
 	}
-	if problem := privatepackage.Sweep(layout, r.store); problem != nil {
-		return privatepackage.Revision{}, problem
+	if problem := localpackage.Sweep(layout, r.store); problem != nil {
+		return localpackage.Revision{}, problem
 	}
-	revision, problem := privatepackage.Stage(ctx, layout, *install)
+	revision, problem := localpackage.Stage(ctx, layout, *install)
 	if problem != nil {
-		return privatepackage.Revision{}, problem
+		return localpackage.Revision{}, problem
 	}
 	return revision, nil
 }
 
-// PrivateRevision reopens the exact staged wheel set a durable request already names.
-func (r *Resolver) PrivateRevision(installID, digest string) (privatepackage.Revision, *exit.Error) {
+// LocalRevision reopens the exact staged wheel set a durable request already names.
+func (r *Resolver) LocalRevision(installID, digest string) (localpackage.Revision, *exit.Error) {
 	install, problem := r.store.Install(installID)
 	if problem != nil {
-		return privatepackage.Revision{}, problem
+		return localpackage.Revision{}, problem
 	}
 	if install == nil {
-		return privatepackage.Revision{}, exit.New(exit.NotFound, "install %s does not exist", installID)
+		return localpackage.Revision{}, exit.New(exit.NotFound, "install %s does not exist", installID)
 	}
 	layout, problem := home.Open(r.cfg.Home)
 	if problem != nil {
-		return privatepackage.Revision{}, problem
+		return localpackage.Revision{}, problem
 	}
-	return privatepackage.Open(layout, *install, digest)
+	return localpackage.Open(layout, *install, digest)
 }
 
 // RefreshEditable is the daemon-owned pre-invocation fence for live source trees.

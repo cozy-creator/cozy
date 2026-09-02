@@ -174,7 +174,7 @@ func closedAttempt(t *testing.T, l home.Layout, store *records.Store, requestID 
 		InvocationDigest: digest, InvocationCanonical: []byte("{}")})
 	fatal(t, problem)
 	fatal(t, store.OfferDispatch(requestID, attempt, session))
-	fatal(t, store.Accepted(requestID, attempt, session, "sha256:"+sixtyFour("b"), "", ""))
+	fatal(t, store.Accepted(requestID, attempt, session))
 	dir := l.AttemptDir(requestID, uint64(attempt))
 	must(t, os.MkdirAll(filepath.Join(dir, "in"), 0o755))
 	must(t, os.WriteFile(filepath.Join(dir, "in", "payload"), []byte(`{"size":32}`), 0o644))

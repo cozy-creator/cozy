@@ -67,7 +67,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 14
+const schemaVersion = 15
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -165,13 +165,14 @@ func Open(path string) (*Store, *exit.Error) {
 	return &Store{db: db}, nil
 }
 
-// Schemas 6 through 13 migrate in place. Schema 11 replaces authored GPU counts with
+// Schemas 6 through 14 migrate in place. Schema 11 replaces authored GPU counts with
 // the one derived accelerator-class fact; schema 12 gives the install table and its two
 // foreign keys the one word the row actually names; schema 13 records when a rental was
 // first seen ready; schema 14 drops the output export's pre-execution payload hash — a
-// file is named by its own content digest now. Package, request, event, export, and
-// rental rows survive; only schema 9's superseded special model-production subsystem is
-// dropped.
+// file is named by its own content digest now; schema 15 spells the request's editable
+// revision columns `local_package_*` (proto-027: one word for a local package). Package,
+// request, event, export, and rental rows survive; only schema 9's superseded special
+// model-production subsystem is dropped.
 // Schema 10 creates empty request-attached transfer sidecars because older rows cannot be
 // translated into ordinary request identity safely.
 func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
@@ -205,22 +206,25 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 		return schemaReset(path, "records database changed to user_version %d while migrating", version)
 	}
 	// Each rebuild runs only from a schema that still has the prior shape: the install
-	// rename is schema 12's, the request and rental rebuilds end at 13, the export table's
-	// payload hash goes at 14. A 13 → 14 migration touches exports alone.
+	// rename is schema 12's, the rental rebuild ends at 13, the export table's payload
+	// hash goes at 14, and the request rebuild ends at 15 (its column spelling). A 14 → 15
+	// migration touches requests alone.
 	if sourceVersion < 12 {
 		if e := migrateInstalls(tx, path); e != nil {
 			return e
 		}
 	}
 	if sourceVersion < 13 {
-		if e := migrateRequests(tx, path, sourceVersion); e != nil {
-			return e
-		}
 		if e := migrateRentals(tx, path); e != nil {
 			return e
 		}
 	}
-	if e := migrateOutputExports(tx, path); e != nil {
+	if sourceVersion < 14 {
+		if e := migrateOutputExports(tx, path); e != nil {
+			return e
+		}
+	}
+	if e := migrateRequests(tx, path, sourceVersion); e != nil {
 		return e
 	}
 	if sourceVersion < 10 {
@@ -237,7 +241,7 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			}
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=14`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=15`); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
 	if e := commitMigration(tx, path); e != nil {
@@ -343,8 +347,9 @@ func migrateOutputExports(tx *sql.Tx, path string) *exit.Error {
 }
 
 // migrateRequests rebuilds the requests table on every migration: before schema 11 to derive
-// the accelerator-class fact from the retired GPU count, and at schema 12 because the row's
-// own DDL text names the install table it references.
+// the accelerator-class fact from the retired GPU count, at schema 12 because the row's own
+// DDL text names the install table it references, and at schema 15 because the editable
+// revision columns are spelled `local_package_*`.
 func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	if _, err := tx.Exec(`ALTER TABLE requests RENAME TO requests_prior`); err != nil {
 		return exit.Internalf("cannot stage request rows while migrating %s: %s", path, err)
@@ -353,7 +358,7 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		return exit.Internalf("cannot create current requests table while migrating %s: %s", path, err)
 	}
 	destinationColumns := `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
-		package_revision_digest,private_package_digest,private_package_uploaded_boot_id,
+		package_revision_digest,local_package_digest,local_package_uploaded_boot_id,
 		environment_digest,config_digest,payload,outputs,state,ordinal,requeues,created_at,kind,
 		needs_accelerator,org,trees,worker,rental,rental_required,install_id,assets,models,weights_outputs`
 	rentalRequired := "rental_required"
@@ -411,6 +416,9 @@ func priorStatements(version int) []string {
 	priorOutputExports := strings.Replace(outputExportSchema,
 		"  directory        TEXT    NOT NULL,\n",
 		"  directory        TEXT    NOT NULL,\n  payload_hash     TEXT    NOT NULL,\n", 1)
+	priorRequests = priorLocalPackageNames(priorRequests)
+	priorRequestsSix = priorLocalPackageNames(priorRequestsSix)
+	priorRequestsFourteen := priorLocalPackageNames(requestsDDL)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
 		if version >= 10 || !containsStatement(modelTransferSchema, statement) {
@@ -426,6 +434,8 @@ func priorStatements(version int) []string {
 			stmt = priorRequestsSix
 		case stmt == requestsDDL && version < 11:
 			stmt = priorRequests
+		case stmt == requestsDDL && version < 15:
+			stmt = priorRequestsFourteen
 		case stmt == rentalsDDL && version < 8:
 			stmt = rentalsDDLPrior
 		case stmt == rentalsDDL && version < 13:
@@ -466,6 +476,14 @@ func priorInstallNames(stmt string) string {
 		"  install_id   TEXT    NOT NULL REFERENCES", "  generation   TEXT    NOT NULL REFERENCES", 1)
 	stmt = strings.Replace(stmt,
 		"  install_id      TEXT    REFERENCES", "  generation      TEXT    REFERENCES", 1)
+	return stmt
+}
+
+// priorLocalPackageNames restores the pre-15 spelling of the request's two editable
+// revision columns, which said `private_package_*` before proto-027 settled on one word.
+func priorLocalPackageNames(stmt string) string {
+	stmt = strings.Replace(stmt, "  local_package_digest TEXT", "  private_package_digest TEXT", 1)
+	stmt = strings.Replace(stmt, "  local_package_uploaded_boot_id TEXT", "  private_package_uploaded_boot_id TEXT", 1)
 	return stmt
 }
 
@@ -538,7 +556,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=14`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=15`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {

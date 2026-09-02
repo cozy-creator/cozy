@@ -13,7 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
-// th-094. Private package wheels used to be relayed to the pod as 1 MiB WorkerControl frames --
+// th-094. Local package wheels used to be relayed to the pod as 1 MiB WorkerControl frames --
 // up to 1 GiB an operation, through a supervisor that had no reason to hold them. This is the
 // owner half of the replacement: the daemon holds the bytes, so the daemon uploads them, and
 // the pod is handed one short-lived read capability per wheel instead.
@@ -22,7 +22,7 @@ import (
 // round is what turns a write capability into a read capability, and it is also how a stalled
 // transfer is answered -- re-granting costs one HTTP round and re-uploads nothing, because the
 // store already holds the objects.
-type privateWheelOwner struct {
+type localWheelOwner struct {
 	cfg     config.Config
 	auth    *accountauth.Manager
 	log     io.Writer
@@ -30,23 +30,23 @@ type privateWheelOwner struct {
 	account string
 }
 
-func newPrivateWheelOwner(cfg config.Config, log io.Writer,
+func newLocalWheelOwner(cfg config.Config, log io.Writer,
 	auth *accountauth.Manager,
-) *privateWheelOwner {
+) *localWheelOwner {
 	if log == nil {
 		log = io.Discard
 	}
-	return &privateWheelOwner{cfg: cfg, log: log, auth: auth}
+	return &localWheelOwner{cfg: cfg, log: log, auth: auth}
 }
 
-func (o *privateWheelOwner) client() *hub.Client {
+func (o *localWheelOwner) client() *hub.Client {
 	return client(&Context{Out: io.Discard, Err: o.log, Cfg: o.cfg, AccountAuth: o.auth})
 }
 
 // org is the one namespace these objects live under. It is read from the authenticated user
-// rather than from the revision, because a private revision's `local/...` ref is a device-local
+// rather than from the revision, because a local revision's `local/...` ref is a device-local
 // alias that names no Tensorhub organization at all.
-func (o *privateWheelOwner) org(ctx context.Context, c *hub.Client) (string, *exit.Error) {
+func (o *localWheelOwner) org(ctx context.Context, c *hub.Client) (string, *exit.Error) {
 	o.mu.Lock()
 	held := o.account
 	o.mu.Unlock()
@@ -63,10 +63,10 @@ func (o *privateWheelOwner) org(ctx context.Context, c *hub.Client) (string, *ex
 	return account.Name, nil
 }
 
-const privateWheelReason = "transfer a private package revision to a rented worker"
+const localWheelReason = "transfer a local package revision to a rented worker"
 
-// grants is the orchestrator's PrivateWheelGrantSource.
-func (o *privateWheelOwner) grants(ctx context.Context, wheels []orchestrator.PrivateWheel) (
+// grants is the orchestrator's LocalWheelGrantSource.
+func (o *localWheelOwner) grants(ctx context.Context, wheels []orchestrator.LocalWheel) (
 	[]string, *exit.Error,
 ) {
 	c := o.client()
@@ -74,12 +74,12 @@ func (o *privateWheelOwner) grants(ctx context.Context, wheels []orchestrator.Pr
 	if problem != nil {
 		return nil, problem
 	}
-	asked := make([]hub.PrivateWheelRequest, 0, len(wheels))
+	asked := make([]hub.LocalWheelRequest, 0, len(wheels))
 	for _, wheel := range wheels {
-		asked = append(asked, hub.PrivateWheelRequest{Digest: wheel.Digest,
+		asked = append(asked, hub.LocalWheelRequest{Digest: wheel.Digest,
 			Filename: wheel.Filename, Kind: wheel.Kind, Length: wheel.Length})
 	}
-	granted, problem := c.GrantPrivateWheels(ctx, org, asked, privateWheelReason)
+	granted, problem := c.GrantLocalWheels(ctx, org, asked, localWheelReason)
 	if problem != nil {
 		return nil, problem
 	}
@@ -102,19 +102,19 @@ func (o *privateWheelOwner) grants(ctx context.Context, wheels []orchestrator.Pr
 	}
 	// The second round is not a retry: it is the round that asks for READ capabilities, now
 	// that the store holds every object.
-	granted, problem = c.GrantPrivateWheels(ctx, org, asked, privateWheelReason)
+	granted, problem = c.GrantLocalWheels(ctx, org, asked, localWheelReason)
 	if problem != nil {
 		return nil, problem
 	}
 	return readGrants(granted)
 }
 
-func readGrants(granted []hub.PrivateWheelGrant) ([]string, *exit.Error) {
+func readGrants(granted []hub.LocalWheelGrant) ([]string, *exit.Error) {
 	urls := make([]string, 0, len(granted))
 	for _, grant := range granted {
 		if !grant.Present || grant.Download == "" {
-			return nil, exit.Named(exit.Conflict, "private_package.wheel_absent",
-				"Tensorhub does not hold private package wheel %s after it was uploaded",
+			return nil, exit.Named(exit.Conflict, "local_package.wheel_absent",
+				"Tensorhub does not hold local package wheel %s after it was uploaded",
 				grant.Filename)
 		}
 		urls = append(urls, grant.Download)

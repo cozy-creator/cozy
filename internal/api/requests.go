@@ -17,8 +17,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -154,7 +154,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		if sub.Rental || sub.RentalRequired {
-			unlock := privatepackage.Guard()
+			unlock := localpackage.Guard()
 			defer unlock()
 		}
 		spec, e = s.resolvePlan(r.Context(), sub)
@@ -244,10 +244,10 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Package: sub.Package, Entrypoint: sub.Function, Payload: payload,
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
 		InstallID: sub.InstallID, Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
-		PrivatePackageDigest: recorded.PrivatePackageDigest,
-		Rental:               sub.Rental || sub.RentalRequired,
-		RentalRequired:       sub.RentalRequired,
-		Models:               models, NeedsAccelerator: recorded.NeedsAccelerator,
+		LocalPackageDigest: recorded.LocalPackageDigest,
+		Rental:             sub.Rental || sub.RentalRequired,
+		RentalRequired:     sub.RentalRequired,
+		Models:             models, NeedsAccelerator: recorded.NeedsAccelerator,
 		OutputDirectory: sub.OutputDirectory,
 	}
 }
@@ -381,10 +381,10 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 				return out, refreshProblem
 			}
 			if !editable {
-				return out, exit.Named(exit.Conflict, "private_package_install_invalid",
+				return out, exit.Named(exit.Conflict, "local_package_install_invalid",
 					"%s is not one editable local package", sub.Package)
 			}
-			return s.resolvePrivateServing(ctx, sub, out, refreshed)
+			return s.resolveLocalServing(ctx, sub, out, refreshed)
 		}
 		if sub.InstallID != "" || sub.Release == "" || sub.ReleaseDigest == "" {
 			return out, exit.Unavailablef("remote execution requires one exact Tensorhub package release")
@@ -511,7 +511,7 @@ func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestr
 	return nil
 }
 
-func (s *Server) resolvePrivateServing(ctx context.Context, sub Submission,
+func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 	out orchestrator.Submission, installID string,
 ) (orchestrator.Submission, *exit.Error) {
 	spec, problem := s.packages.ResolveInstall(installID, sub.Models)
@@ -535,13 +535,13 @@ func (s *Server) resolvePrivateServing(ctx context.Context, sub Submission,
 		return out, problem
 	}
 	out.NeedsAccelerator = needsAccelerator
-	revision, problem := s.packages.PreparePrivate(ctx, installID)
+	revision, problem := s.packages.PrepareLocal(ctx, installID)
 	if problem != nil {
 		return out, problem
 	}
 	out.InstallID, out.PlanID = installID, planID
 	out.Release, out.ReleaseDigest = revision.Release, revision.SourceDigest
-	out.PrivatePackageDigest = revision.Digest
+	out.LocalPackageDigest = revision.Digest
 	if len(out.Outputs) == 0 {
 		out.Outputs = outputs
 	}
