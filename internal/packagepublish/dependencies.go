@@ -33,9 +33,24 @@ type DependencyWheel struct {
 	Path     string
 }
 
+// VendoredDependency names one auto-vendored, unpublished local dependency —
+// the input to the publish nudge (th-113).
+type VendoredDependency struct {
+	Name    string
+	Version string
+}
+
+// VendoredNote is the publish nudge for one auto-vendored local dependency:
+// vendoring stays legal, publishing to the org index is the encouraged path.
+func VendoredNote(org string, dependency VendoredDependency) string {
+	return fmt.Sprintf("Vendored %s %s (unpublished). Next: publish it and depend on %s/%s instead",
+		dependency.Name, dependency.Version, org, dependency.Name)
+}
+
 type requirement struct {
 	raw       string
 	name      string
+	spec      string
 	extras    []string
 	specifier pep440.Specifiers
 	hasSpec   bool
@@ -57,35 +72,40 @@ type dependencyCollector struct {
 	ctx      context.Context
 	stage    string
 	wheels   []DependencyWheel
+	vendored []VendoredDependency
 	byName   map[string]dependencyRecord
 	extras   map[string]map[string]bool
 	stack    map[string]bool
 	total    int64
 	count    int
 	registry bool
+	publish  bool
 }
 
 var requirementName = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?`)
 
-func collectLocalDependencies(ctx context.Context, root string, document projectMetadata, stage string) ([]DependencyWheel, bool, *exit.Error) {
+func collectLocalDependencies(ctx context.Context, root string, document projectMetadata, stage string, publish bool) ([]DependencyWheel, bool, []VendoredDependency, *exit.Error) {
 	canonical, problem := canonicalLocalPath(root)
 	if problem != nil {
-		return nil, false, problem
+		return nil, false, nil, problem
 	}
 	collector := &dependencyCollector{
 		ctx: ctx, stage: stage, byName: map[string]dependencyRecord{}, extras: map[string]map[string]bool{},
-		stack: map[string]bool{canonical: true},
+		stack: map[string]bool{canonical: true}, publish: publish,
 	}
 	if name := normalizedProjectName(document.Project.Name); name != "" {
 		collector.byName[name] = dependencyRecord{source: canonical, version: document.Project.Version}
 	}
 	if problem := collector.collectProject(canonical, document, nil, true); problem != nil {
-		return nil, false, problem
+		return nil, false, nil, problem
 	}
 	sort.Slice(collector.wheels, func(i, j int) bool {
 		return collector.wheels[i].Filename < collector.wheels[j].Filename
 	})
-	return collector.wheels, collector.registry, nil
+	sort.Slice(collector.vendored, func(i, j int) bool {
+		return collector.vendored[i].Name < collector.vendored[j].Name
+	})
+	return collector.wheels, collector.registry, collector.vendored, nil
 }
 
 func (c *dependencyCollector) collectProject(root string, document projectMetadata, extras []string, includeBase bool) *exit.Error {
@@ -108,6 +128,11 @@ func (c *dependencyCollector) collectProject(root string, document projectMetada
 		req, problem := parseRequirement(raw)
 		if problem != nil {
 			return problem
+		}
+		if c.publish {
+			if problem := refuseImageOwnedPin(req); problem != nil {
+				return problem
+			}
 		}
 		if req.direct {
 			return exit.Named(exit.Validation, "project_dependency_direct_url_unsupported",
@@ -282,6 +307,7 @@ func (c *dependencyCollector) add(identity wheel.Identity, path string) *exit.Er
 	}
 	c.total += identity.Length
 	c.wheels = append(c.wheels, DependencyWheel{Filename: identity.Filename, Path: path})
+	c.vendored = append(c.vendored, VendoredDependency{Name: identity.Distribution, Version: identity.Version})
 	return nil
 }
 
@@ -372,7 +398,7 @@ func parseRequirement(raw string) (requirement, *exit.Error) {
 	if err != nil {
 		return requirement{}, invalidRequirement(raw)
 	}
-	req.specifier, req.hasSpec = specifier, true
+	req.specifier, req.spec, req.hasSpec = specifier, rest, true
 	return req, nil
 }
 

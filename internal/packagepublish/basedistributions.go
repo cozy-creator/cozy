@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"sort"
+	"strings"
 )
 
 // base-distributions.json is cozy-runtime's own export of the worker-image-owned
@@ -35,6 +36,38 @@ type baseDistributions struct {
 // The `cuda-`/`nvidia-` prefix families are deliberately not enumerated: they arrive only
 // under torch, so `uv export --prune torch` already removes that whole subtree.
 var remoteBaseRoots = derivedBaseRoots()
+
+// remoteBasePrefixes is the roster's prefix families. Pruning never enumerates
+// them (they leave with torch), but publish-time image-owned rules (cl-084)
+// must recognize the whole family by name.
+var remoteBasePrefixes = derivedBasePrefixes()
+
+// imageOwnedDistribution says whether a normalized distribution name is owned
+// by the worker image: a roster name or a member of a roster prefix family.
+func imageOwnedDistribution(name string) bool {
+	if remoteBaseRoots[name] {
+		return true
+	}
+	for _, prefix := range remoteBasePrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func derivedBasePrefixes() []string {
+	var document baseDistributions
+	if err := json.Unmarshal(baseDistributionsJSON, &document); err != nil || len(document.Prefixes) == 0 {
+		panic("vendored base-distributions.json is not cozy-runtime's exported roster")
+	}
+	for _, prefix := range document.Prefixes {
+		if prefix == "" {
+			panic("vendored base-distributions.json holds an empty prefix")
+		}
+	}
+	return document.Prefixes
+}
 
 func derivedBaseRoots() map[string]bool {
 	var document baseDistributions

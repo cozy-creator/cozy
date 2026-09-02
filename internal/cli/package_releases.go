@@ -64,7 +64,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		return lookupProblem
 	}
 	if problem := packagePublishStage(ctx, "Building package wheel and local dependencies", func() *exit.Error {
-		return pack.Build(hctx)
+		return pack.BuildForPublish(hctx)
 	}); problem != nil {
 		return problem
 	}
@@ -122,7 +122,11 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		{K: "release_digest", V: done.ReleaseDigest},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}
-	return emit(ctx, compactRecord(fields, "package", "release", "status"))
+	record := compactRecord(fields, "package", "release", "status")
+	for _, dependency := range pack.Vendored {
+		record.Notes = append(record.Notes, packagepublish.VendoredNote(account.Name, dependency))
+	}
+	return emit(ctx, record)
 }
 
 func handlePackageYank(ctx *Context) *exit.Error {
