@@ -97,11 +97,17 @@ def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> Tile
     # replay every transient tick.
     time.sleep(0.05)
     remaining = payload.delay_ms
-    while remaining > 0:
-        ctx.raise_if_cancelled()
-        step = min(remaining, 25)
-        time.sleep(step / 1_000)
-        remaining -= step
+    if remaining > 0:
+        # cl-104: the delay is a MEASURED step loop — the fixture's stand-in for a
+        # denoising loop, one `on_step` per iteration (cancellation included).
+        on_step = tel.step_callback((remaining + 24) // 25, stage="tile_steps")
+        index = 0
+        while remaining > 0:
+            step = min(remaining, 25)
+            time.sleep(step / 1_000)
+            remaining -= step
+            on_step(index)
+            index += 1
     state = payload.seed & 0xFFFFFFFF
     with tel.stage("fill_pixels"):
         pixels = bytearray(side * side * 3)
@@ -149,11 +155,17 @@ def relay(
 ) -> RelayOutput:
     """CPU-only exact workflow handoff: decode the prior accepted image and save it again."""
     remaining = payload.delay_ms
-    while remaining > 0:
-        ctx.raise_if_cancelled()
-        step = min(remaining, 25)
-        time.sleep(step / 1_000)
-        remaining -= step
+    if remaining > 0:
+        # cl-104: the delay is a MEASURED step loop — the fixture's stand-in for a
+        # denoising loop, one `on_step` per iteration (cancellation included).
+        on_step = tel.step_callback((remaining + 24) // 25, stage="relay_steps")
+        index = 0
+        while remaining > 0:
+            step = min(remaining, 25)
+            time.sleep(step / 1_000)
+            remaining -= step
+            on_step(index)
+            index += 1
     image = decoder.decode_image(payload.image)
     return RelayOutput(
         image=out.save_image(ImageFrame(image.width, image.height, image.rgb), format="webp")
