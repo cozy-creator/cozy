@@ -765,7 +765,9 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 				"request %s no longer matches its sealed local package revision", req.ID)
 		}
 		if e := c.ConvergeLocalPackage(instance, req.ID, revision,
-			req.LocalPackageUploadedBootID); e != nil {
+			req.LocalPackageUploadedBootID, func(bootID string) *exit.Error {
+				return c.opt.Store.MarkLocalPackageUploaded(req.ID, revision.Digest, bootID)
+			}); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
 		logical.ReleaseDigest = req.LocalPackageDigest

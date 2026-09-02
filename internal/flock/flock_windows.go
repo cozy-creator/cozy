@@ -22,6 +22,12 @@ func Exclusive(f *os.File) error {
 		0, 1, 0, &windows.Overlapped{OffsetHigh: 1})
 }
 
+// Block is Exclusive without LOCKFILE_FAIL_IMMEDIATELY: it returns once the holder lets go.
+func Block(f *os.File) error {
+	return windows.LockFileEx(windows.Handle(f.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK,
+		0, 1, 0, &windows.Overlapped{OffsetHigh: 1})
+}
+
 func Release(f *os.File) error {
 	return windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0,
 		&windows.Overlapped{OffsetHigh: 1})

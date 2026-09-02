@@ -67,7 +67,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 15
+const schemaVersion = 16
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS pins (
 
 // schema is the only records shape this pre-launch build accepts.
 var schema = append([]string{installsDDL, pinsDDL}, append(orchestratorSchema,
-	append(modelTransferSchema, append(eventSchema, rentalSchema...)...)...)...)
+	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
@@ -170,8 +170,9 @@ func Open(path string) (*Store, *exit.Error) {
 // foreign keys the one word the row actually names; schema 13 records when a rental was
 // first seen ready; schema 14 drops the output export's pre-execution payload hash — a
 // file is named by its own content digest now; schema 15 spells the request's editable
-// revision columns `local_package_*` (proto-027: one word for a local package). Package,
-// request, event, export, and rental rows survive; only schema 9's superseded special
+// revision columns `local_package_*` (proto-027: one word for a local package); schema 16
+// adds the package_events table (cl-097) and touches nothing else. Package, request,
+// event, export, and rental rows survive; only schema 9's superseded special
 // model-production subsystem is dropped.
 // Schema 10 creates empty request-attached transfer sidecars because older rows cannot be
 // translated into ordinary request identity safely.
@@ -207,8 +208,8 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 	}
 	// Each rebuild runs only from a schema that still has the prior shape: the install
 	// rename is schema 12's, the rental rebuild ends at 13, the export table's payload
-	// hash goes at 14, and the request rebuild ends at 15 (its column spelling). A 14 → 15
-	// migration touches requests alone.
+	// hash goes at 14, the request rebuild ends at 15 (its column spelling), and package
+	// events arrive at 16. A 15 → 16 migration adds one table.
 	if sourceVersion < 12 {
 		if e := migrateInstalls(tx, path); e != nil {
 			return e
@@ -224,8 +225,17 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			return e
 		}
 	}
-	if e := migrateRequests(tx, path, sourceVersion); e != nil {
-		return e
+	if sourceVersion < 15 {
+		if e := migrateRequests(tx, path, sourceVersion); e != nil {
+			return e
+		}
+	}
+	if sourceVersion < 16 {
+		for _, statement := range packageEventSchema {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot create package events while migrating %s: %s", path, err)
+			}
+		}
 	}
 	if sourceVersion < 10 {
 		for _, table := range []string{"model_production_objects", "model_production_artifacts",
@@ -241,7 +251,7 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			}
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=15`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=16`); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
 	if e := commitMigration(tx, path); e != nil {
@@ -421,9 +431,11 @@ func priorStatements(version int) []string {
 	priorRequestsFourteen := priorLocalPackageNames(requestsDDL)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
-		if version >= 10 || !containsStatement(modelTransferSchema, statement) {
-			statements = append(statements, statement)
+		if version < 10 && containsStatement(modelTransferSchema, statement) ||
+			version < 16 && containsStatement(packageEventSchema, statement) {
+			continue
 		}
+		statements = append(statements, statement)
 	}
 	if version < 10 {
 		statements = append(statements, schemaNineModelProduction...)
@@ -556,7 +568,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=15`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=16`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {

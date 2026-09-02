@@ -50,7 +50,7 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 15 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 16 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	// Schema 15: the request's editable revision columns say local_package_*, one word.

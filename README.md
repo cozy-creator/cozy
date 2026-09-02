@@ -68,10 +68,13 @@ cozy package list
 ```
 
 An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path) creates a
-local-only editable install after a bounded source scan. Every invocation checks that live tree;
-a change atomically prepares a new install and restarts stale execution state. A failed refresh
-keeps the last good install pinned and refuses the invocation. Editable installs are neither
-published releases nor rentable deployments. Model bindings resolve the exact release and lane
+local-only editable install after a bounded source scan. While the daemon runs it watches that
+tree: an edit atomically prepares a new install and re-prepares every worker holding the
+package — the local one and each attached rental — so the next run is warm; every invocation
+still checks the tree itself. A failed rebuild (a syntax error mid-edit) keeps the last good
+install pinned, is logged typed in `cozy daemon log`, and refuses an invocation only if the tree
+is still broken. `cozy package list --full` shows `synced` or `stale <error>` for the tree.
+Editable installs are not published releases. Model bindings resolve the exact release and lane
 declared in `package.toml` from the local TensorFS store; they never synthesize Hub release records.
 
 Remove local package installs with:

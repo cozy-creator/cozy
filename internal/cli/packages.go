@@ -227,10 +227,14 @@ func handleLs(ctx *Context) *exit.Error {
 	l := output.List{
 		Name:      "packages",
 		Fields:    []string{"package", "version", "size", "dependencies"},
-		AllFields: []string{"package", "major", "version", "size", "dependencies", "placement_set", "install_id", "source", "verified", "installed"},
+		AllFields: []string{"package", "major", "version", "size", "dependencies", "placement_set", "install_id", "source", "synced", "verified", "installed"},
 		Bytes:     []string{"size", "dependencies"},
 	}
 	for _, inst := range rows {
+		synced, e := syncedText(st, inst)
+		if e != nil {
+			return e
+		}
 		l.Rows = append(l.Rows, map[string]string{
 			"package":            inst.Package,
 			"major":              fmt.Sprintf("v%d", inst.Major),
@@ -246,6 +250,7 @@ func handleLs(ctx *Context) *exit.Error {
 			"package_descriptor": inst.PackageDescriptor,
 			"placement_set":      inst.PlacementSetDigest,
 			"source":             inst.SourceKind + " " + inst.SourceRef,
+			"synced":             synced,
 			"verified":           fmt.Sprintf("%t", inst.Verified),
 			"installed":          inst.CreatedAt,
 		})
@@ -255,6 +260,29 @@ func handleLs(ctx *Context) *exit.Error {
 		return emit(ctx, l)
 	}
 	return emit(ctx, l)
+}
+
+// syncedText is what the daemon's source watcher last recorded about an editable install's
+// tree (cl-097): `synced` once its rebuild activated this install, `stale <error>` when the
+// last rebuild was refused, nothing for a published install or a tree no daemon has read.
+func syncedText(st *records.Store, inst records.PackageInstall) (string, *exit.Error) {
+	if inst.SourceKind != "local" {
+		return "", nil
+	}
+	event, e := st.LastPackageEvent(inst.Package)
+	if e != nil || event == nil {
+		return "", e
+	}
+	switch event.Type {
+	case "package.refreshed":
+		if install, _ := event.Payload["install"].(string); install == inst.ID {
+			return "synced", nil
+		}
+	case "package.refresh_failed":
+		cause, _ := event.Payload["error"].(string)
+		return "stale " + cause, nil
+	}
+	return "", nil
 }
 
 func handleRm(ctx *Context) *exit.Error {
