@@ -159,10 +159,11 @@ func (c *Client) Base() string { return c.base }
 // route. The route supplies the type; the document therefore carries no `kind`
 // discriminator and Cozy never guesses one from its contents.
 type Resource struct {
-	Org       string `json:"org"`
-	Name      string `json:"name"`
-	Family    string `json:"family,omitempty"`
-	CreatedAt string `json:"created_at"`
+	Org           string `json:"org"`
+	Name          string `json:"name"`
+	Family        string `json:"family,omitempty"`
+	CreatedAt     string `json:"created_at"`
+	LatestRelease string `json:"latest_release,omitempty"`
 }
 
 type ReleaseSummary struct {

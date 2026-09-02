@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -9,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/privatepackage"
@@ -114,11 +117,61 @@ func handlePackageRecover(ctx *Context) *exit.Error {
 	}, "status", "installs", "models_changed"))
 }
 
+// runExample renders one concrete invoke command for the install's first
+// callable so "what now?" is answered by the install itself. Best effort: a
+// package whose descriptor cannot be read still gets the bare form.
+func runExample(inst records.PackageInstall) string {
+	example := "cozy run " + inst.Package
+	raw, err := os.ReadFile(launch.DescriptorPath(inst.Dir))
+	if err != nil {
+		return example
+	}
+	d, problem := launch.DecodeDescriptor(raw)
+	if problem != nil {
+		return example
+	}
+	callables := append(append([]launch.Entrypoint{}, d.Entrypoints...), d.Jobs...)
+	if len(callables) == 0 {
+		return example
+	}
+	ep := callables[0]
+	example += "/" + ep.Name
+	for i := range ep.Request.Fields {
+		if i == 4 {
+			example += " ..."
+			break
+		}
+		field := &ep.Request.Fields[i]
+		var scalar string
+		var typed struct {
+			Asset   string   `json:"asset"`
+			Literal []string `json:"literal"`
+		}
+		switch {
+		case json.Unmarshal(field.Type, &scalar) == nil:
+			example += fmt.Sprintf(" %s=<%s>", field.Name, scalar)
+		case json.Unmarshal(field.Type, &typed) == nil && len(typed.Literal) == 1:
+			example += fmt.Sprintf(" %s=%s", field.Name, typed.Literal[0])
+		case len(typed.Literal) > 1:
+			example += fmt.Sprintf(" %s=<%s>", field.Name, strings.Join(typed.Literal, "|"))
+		case typed.Asset != "":
+			example += fmt.Sprintf(" %s=<%s-file>", field.Name, typed.Asset)
+		default:
+			example += fmt.Sprintf(" %s=...", field.Name)
+		}
+	}
+	return example
+}
+
 func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *install.Result) *exit.Error {
 	inst := res.Install
+	status := "installed"
+	if res.Idempotent {
+		status = "already installed"
+	}
 	fields := []output.Field{
 		{K: "package", V: inst.Package}, {K: "major", V: inst.Major},
-		{K: "version", V: inst.Version}, {K: "status", V: "installed"},
+		{K: "version", V: inst.Version}, {K: "status", V: status},
 		{K: "disk", V: diskText(inst)}, {K: "changed", V: !res.Idempotent},
 		{K: "install_id", V: inst.ID}, {K: "source", V: inst.SourceKind + " " + inst.SourceRef},
 		{K: "source_digest", V: inst.SourceDigest}, {K: "verified", V: inst.Verified},
@@ -132,7 +185,13 @@ func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *inst
 		{K: "model_download_error", V: res.ModelError},
 	}
 	if res.Idempotent {
-		return emit(ctx, compactRecord(fields, "package", "version", "status", "model_download", "changed"))
+		keys := []string{"package", "version", "status"}
+		if res.ModelStatus != "" && res.ModelStatus != "none" {
+			keys = append(keys, "model_download")
+		}
+		rec := compactRecord(fields, keys...)
+		rec.Next = []string{runExample(inst)}
+		return emit(ctx, rec)
 	}
 	fields = append(fields,
 		output.Field{K: "staged", V: fmt.Sprintf("%d files, %s", res.Files, output.Bytes(res.Bytes))},
@@ -149,9 +208,9 @@ func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *inst
 				output.Field{K: "reclaimed", V: output.Bytes(reclaimed)})
 		}
 	}
-	rec := compactRecord(fields, "package", "version", "status", "disk", "model_download", "changed")
+	rec := compactRecord(fields, "package", "version", "status", "disk", "model_download")
 	rec.Notes = append(rec.Notes, res.Warnings...)
-	rec.Next = []string{"cozy package list"}
+	rec.Next = []string{runExample(inst), "cozy package list"}
 	return emit(ctx, rec)
 }
 
