@@ -681,6 +681,11 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	for _, p := range doc.List("placements") {
 		w.lanes.route(p.Str("placement_id"), p.Str("device_lane_id"))
 	}
+	heldPlacements := make([]string, 0, len(held))
+	for _, ha := range held {
+		heldPlacements = append(heldPlacements, ha.Str("placement_id"))
+	}
+	w.observeHeld(heldPlacements)
 	w.phase = pb.WorkerPhase(doc.Int("worker_phase"))
 	c.mu.Unlock()
 	for _, breach := range laneBreaches {

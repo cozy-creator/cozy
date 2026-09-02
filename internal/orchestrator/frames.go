@@ -316,6 +316,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.lanes.route(p.PlacementId, p.DeviceLaneId)
 			}
 		}
+		w.observeHeld(heldPlacements(r.HeldAttempts))
 		w.acceptedRevision = r.AcceptedDesiredStateRevision
 		w.convergedRevision = r.ConvergedRevision
 		w.acceptedSetDigest = r.AcceptedPlacementSetDigest
@@ -538,6 +539,16 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	}
 	c.logf("observed phase=%s accepted=%d converged=%d (no placement applied yet)",
 		phase, r.AcceptedDesiredStateRevision, r.ConvergedRevision)
+}
+
+func heldPlacements(rows []*pb.HeldAttempt) []string {
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row != nil {
+			out = append(out, row.PlacementId)
+		}
+	}
+	return out
 }
 
 func permanentDesiredRefusal(kind pb.FaultKind) bool {

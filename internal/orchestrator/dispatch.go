@@ -936,10 +936,11 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence
 	// is open. `pick` also returns the admission epoch it OBSERVED, which is what
 	// makes a stale offer refuse deterministically rather than race.
-	w, sess, admissionEpoch, reservation, e := c.pick(req)
+	target, e := c.pick(req)
 	if e != nil {
 		return 0, e
 	}
+	w, sess, admissionEpoch, reservation := target.worker, target.sess, target.admissionEpoch, target.reservation
 	reserved := true
 	defer func() {
 		if reserved {
@@ -1022,6 +1023,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		return 0, e
 	}
 	attempt := uint64(ordinal)
+	c.logRouting(req.ID, attempt, target.routed)
 
 	// The grant names this attempt's own directory, so it is built after the ordinal is
 	// real. ACCESS ONLY (#439): urls under the ids the spec declares — a refresh can
@@ -1294,22 +1296,16 @@ func invocationOutputBindings(ids []string, weights []WeightsOutput, defaultMax 
 	return out
 }
 
-// pick resolves a worker whose PLACEMENT is DISPATCHABLE for this binding and whose
-// worker-level ADMISSION FENCE will take it. Compatibility and capacity matching stay
-// here, in the orchestrator, exactly as they do in the cloud.
+// pick resolves the worker and lane an offer for this request draws from: `route`'s
+// argmin over every claimed worker whose PLACEMENT is DISPATCHABLE for the binding and
+// whose lane has room (route.go), with the seat reserved. Compatibility and capacity
+// matching stay here, in the orchestrator, exactly as they do in the cloud.
 //
 // TWO GATES, TWO OWNERS (#472e/#482). Dispatchability is a PLACEMENT property — the
 // serving axis and `dispatchable_plan_ids`. Capacity is a WORKER property — the admission
 // state, its epoch, and the one shared seat window. Per-placement `attempt_credits`
 // are DELETED because N counters over ONE serialized device advertise N times the real
 // capacity, and that defect is arithmetic rather than a race.
-//
-// THE SLOT IS PART OF THE MATCH, not only the binding. Matching on the plan id alone sent
-// a request pinned to rental B to rental A's worker — same package, same plan digest, so
-// it looked like capacity — which made the pin advisory and, worse, let a request run on a
-// pod whose credential it never presented. It cuts the other way too: an UNPINNED request
-// must never land on a rented worker, because someone is being billed for that card and
-// nobody asked for it here.
 type dispatchReservation struct {
 	worker *worker
 	job    bool
@@ -1318,71 +1314,46 @@ type dispatchReservation struct {
 	laneID string
 }
 
-func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *dispatchReservation, *exit.Error) {
-	planID := req.PlanID
-	slot := pinnedPackage(req.Package, req.Worker)
-	var parked []string
+// offerTarget is pick's answer: the worker, its live session, the admission epoch this
+// owner observed, the reservation the offer holds, and the routing that chose it.
+type offerTarget struct {
+	worker         *worker
+	sess           *session
+	admissionEpoch uint64
+	reservation    *dispatchReservation
+	routed         routing
+}
+
+func (c *Orchestrator) pick(req records.Request) (offerTarget, *exit.Error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, w := range c.workers {
-		if w.exited || w.stopping {
-			continue
-		}
-		if req.Worker != "" && !req.IsJob() && w.spec.Connection != nil {
-			placement, ok := w.remotePlacements[remotePlanKey(slot, planID)]
-			if w.instanceID != rentalInstanceID(req.Worker) || !ok ||
-				placement.Package != slot || placement.PackageRevisionDigest != remoteRevision(req) ||
-				!w.remoteDispatchable(placement, planID) {
-				continue
-			}
-		} else if w.spec.Placement.Package != slot {
-			continue
-		} else if req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {
-			continue
-		}
-		sess := c.sessions[w.bootID]
-		if sess == nil {
-			continue
-		}
-		if w.spec.IsJob() {
-			// A JOB worker hosts no placement: its dispatchability IS its job capacity.
-			if !w.dispatchable[planID] || w.jobsAvail <= 0 {
-				continue
-			}
-			// RESERVE the seat this dispatch is about to consume. The worker's own next
-			// observed state is still the authority — this only stops ONE drain pass from
-			// handing two queued jobs to a one-attempt worker on one reading.
-			w.reservedJobs++
-			w.jobsAvail = max(0, w.reportedJobs-w.reservedJobs)
-			if w.jobsAvail <= 0 {
-				w.dispatchable[planID] = false
-			}
-			return w, sess, w.admissionEpoch,
-				&dispatchReservation{worker: w, job: true, planID: planID}, nil
-		}
-		if !w.dispatchableFor(planID) {
-			continue
-		}
-		// THE SEAT IS THE PLACEMENT'S LANE'S (proto-024). CLOSED, OPEN-with-no-seat and a
-		// saturated lane are ALL "not now", and they are deliberately distinguished on the
-		// worker facts rather than here: this side's answer is the same either way — the
-		// request parks in the deep queue, which is this owner's and never the worker's.
-		laneID, ok, why := w.seatFor(w.placementFor(slot, planID))
-		if !ok {
-			parked = append(parked, w.instanceID+": "+why)
-			continue
-		}
-		w.reserveSeat(laneID)
-		return w, sess, w.admissionEpoch, &dispatchReservation{worker: w, laneID: laneID}, nil
+	routed := c.route(req)
+	pick := routed.pick()
+	if pick == nil {
+		return offerTarget{}, routed.noCapacity(pinnedPackage(req.Package, req.Worker), req.PlanID)
 	}
-	if len(parked) > 0 {
-		return nil, nil, 0, nil, exit.Unavailablef(
-			"no claimed worker in %s has a DISPATCHABLE placement for %s with a free attempt "+
-				"slot (%s)", slot, planID, strings.Join(parked, "; "))
+	w := pick.worker
+	target := offerTarget{worker: w, sess: c.sessions[w.bootID], admissionEpoch: w.admissionEpoch,
+		routed: routed}
+	if w.spec.IsJob() {
+		// RESERVE the seat this dispatch is about to consume. The worker's own next
+		// observed state is still the authority — this only stops ONE drain pass from
+		// handing two queued jobs to a one-attempt worker on one reading.
+		w.reservedJobs++
+		w.jobsAvail = max(0, w.reportedJobs-w.reservedJobs)
+		if w.jobsAvail <= 0 {
+			w.dispatchable[req.PlanID] = false
+		}
+		target.reservation = &dispatchReservation{worker: w, job: true, planID: req.PlanID}
+		return target, nil
 	}
-	return nil, nil, 0, nil, exit.Unavailablef(
-		"no claimed worker in %s has a DISPATCHABLE placement for %s with a free attempt slot",
-		slot, planID)
+	// THE SEAT IS THE PLACEMENT'S LANE'S (proto-024). CLOSED, OPEN-with-no-seat and a
+	// saturated lane are ALL "not now", distinguished on the worker facts rather than
+	// here: this side's answer is the same either way — the request parks in the deep
+	// queue, which is this owner's and never the worker's.
+	w.reserveSeat(pick.laneID)
+	target.reservation = &dispatchReservation{worker: w, laneID: pick.laneID}
+	return target, nil
 }
 
 // A reservation starts while an offer is prepared and remains subtracted after emission
@@ -1431,6 +1402,7 @@ func (c *Orchestrator) settleDispatch(requestID string, attempt uint64, consumed
 		r.worker.reservedJobs = max(0, r.worker.reservedJobs-1)
 		if consumed {
 			r.worker.reportedJobs = max(0, r.worker.reportedJobs-1)
+			r.worker.held++
 		}
 		r.worker.observeJobs(r.worker.reportedJobs)
 		if !consumed && r.worker.jobsAvail > 0 {

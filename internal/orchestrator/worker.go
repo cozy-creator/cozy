@@ -429,6 +429,9 @@ type worker struct {
 	admissionEpoch uint64 // echoed on every offer; a stale echo refuses deterministically
 	seats          seatLedger
 	lanes          laneTable
+	// held is how many attempts the worker last reported holding, in every state from
+	// admission to ack; the lanes carry their own share (route.go reads both).
+	held int
 	// unacked is how many outcomes this owner HOLDS without having acked. The worker
 	// counts them against its own available_attempt_slots (#480d), so an owner that stops
 	// acking starves its own admission — boundedness is structural, and this is the number
@@ -539,12 +542,19 @@ func (w *worker) remoteStaged(packageName, planID, revision string) bool {
 // draining, mid-cutover); OPEN with zero seats is TRANSIENT saturation — both refuse under
 // CAUSE_CODE_NO_CAPACITY at the worker, and an owner backs off differently for each
 // (#486c), which is why they are two fields here and not one. The per-placement half —
-// the placement's own lane — is seatFor (lanes.go).
+// the placement's own lane — is roomFor (route.go).
 func (w *worker) admissible() bool {
 	return w.admission == pb.AdmissionState_ADMISSION_STATE_OPEN && w.seats.slots > 0
 }
 
 func (w *worker) observeSlots(n int) { w.seats.observe(n) }
+
+// observeHeld records the worker's held attempts, worker-wide and per lane, from the
+// placement each names.
+func (w *worker) observeHeld(placementIDs []string) {
+	w.held = len(placementIDs)
+	w.lanes.observeHeld(placementIDs)
+}
 
 func (w *worker) observeJobs(n int) {
 	w.reportedJobs = n
@@ -1478,6 +1488,8 @@ type WorkerFacts struct {
 	Admission      string `json:"admission_state"`
 	AdmissionEpoch uint64 `json:"admission_epoch"`
 	AvailableSlots int    `json:"available_attempt_slots"`
+	// HeldAttempts is what the worker last reported holding, admission to ack.
+	HeldAttempts int `json:"held_attempts"`
 	// Lanes is the worker's own account of its serialized resources (proto-024): one seat
 	// each, ordinals into the granted Devices. Empty for a worker that reports none.
 	// PlacementLane is the lane this slot's placement is on, "" until the worker says.
@@ -1535,6 +1547,7 @@ func factsOf(w *worker) WorkerFacts {
 		Admission:       trimEnum(pb.AdmissionState_name[int32(w.admission)], "ADMISSION_STATE_"),
 		AdmissionEpoch:  w.admissionEpoch,
 		AvailableSlots:  w.seats.slots,
+		HeldAttempts:    w.held,
 		UnackedOutcomes: w.unacked,
 		Lanes:           laneFactsOf(w),
 		PlacementLane:   w.laneOf(w.placementID),
