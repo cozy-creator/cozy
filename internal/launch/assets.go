@@ -37,6 +37,21 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 			return nil, nil, exit.Usagef("--asset %q is not <field-path>=<file>", spec).
 				WithRemedy("examples: `--asset first_frame=frame.png` or `--asset references.0.image=ref.jpg`")
 		}
+		parts, e := assetPath(fieldPath)
+		if e != nil {
+			return nil, nil, e
+		}
+		// The same case-insensitive NAME fold ParsePayload applies (canonicalFieldKey):
+		// the top-level segment folds onto the descriptor's spelling, so the binding,
+		// the payload ref, and the worker-protocol input id all carry the canonical name.
+		folded, e := canonicalFieldKey(ep, parts[0])
+		if e != nil {
+			return nil, nil, e
+		}
+		if folded != parts[0] {
+			parts[0] = folded
+			fieldPath = strings.Join(parts, ".")
+		}
 		if seen[fieldPath] {
 			return nil, nil, exit.New(exit.Validation, "input asset field %q was supplied more than once", fieldPath)
 		}
@@ -44,11 +59,6 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 			return nil, nil, e
 		}
 		seen[fieldPath] = true
-
-		parts, e := assetPath(fieldPath)
-		if e != nil {
-			return nil, nil, e
-		}
 		if !assetAt(ep.Request, parts) {
 			return nil, nil, exit.New(exit.Validation,
 				"%s.%s is not an asset field in this release's request schema", ep.Name, fieldPath).

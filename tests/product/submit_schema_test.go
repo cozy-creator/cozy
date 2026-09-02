@@ -82,6 +82,32 @@ func TestSubmitSchemaValidation(t *testing.T) {
 		t.Fatalf("the human refusal lost its fields or usage line [exit %d]\n%s", code, out)
 	}
 
+	// Field NAMES are case-insensitive at the CLI composition seam (Paul, 2026-09-02):
+	// a typed key folds onto the descriptor's spelling and the wire carries ONLY the
+	// canonical name — PROMPT= composes exactly what prompt= composes, so the daemon's
+	// strict validator misses first_frame alone.
+	for _, spelling := range []string{"PROMPT=fold", "Prompt=fold"} {
+		code, out = runCozy(t, root, "--json", "run", video, spelling)
+		folded := refusalOf(t, out)
+		if code != 1 || folded.Code != "request_payload_invalid" ||
+			!strings.Contains(folded.Message, `missing required field "first_frame"`) ||
+			strings.Contains(folded.Message, `"prompt"`) {
+			t.Fatalf("%s did not fold onto prompt [exit %d]\n%s", spelling, code, out)
+		}
+	}
+	// The same fold reaches --asset field paths: PROMPT folds to prompt, and the walk's
+	// canonical refusal names the descriptor's spelling.
+	code, out = runCozy(t, root, "run", video, "prompt=x", "--asset", "PROMPT=missing.png")
+	if code != 1 || !strings.Contains(out, "video_transport.prompt is not an asset field") {
+		t.Fatalf("--asset PROMPT did not fold onto prompt [exit %d]\n%s", code, out)
+	}
+	// A genuinely unknown name is never guessed at: it refuses with the contract in hand.
+	code, out = runCozy(t, root, "run", video, "prompts=x")
+	if code != 1 || !strings.Contains(out, `no request field "prompts"`) ||
+		!strings.Contains(out, "prompt, first_frame") {
+		t.Fatalf("an unknown name did not refuse with the declared fields [exit %d]\n%s", code, out)
+	}
+
 	// The same law for a WIRE-DRIVEN client: no CLI composed this payload, and the daemon
 	// still refuses an unknown field by name before anything is recorded.
 	daemon := attachDaemon(t, root)
