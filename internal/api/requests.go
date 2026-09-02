@@ -135,6 +135,22 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		// below, so a different body conflicts, but neither its source nor the reclaimed
 		// staging object is opened merely to answer an already-recorded request.
 		spec = replaySubmission(sub, *existing)
+		// The digest covers the DERIVED export rows, and a replay resolves no
+		// entrypoint to re-derive them from. The recorded export row is that exact
+		// derivation, frozen at first submit; the caller still asserts directory and
+		// payload hash, so a replay naming a different --out conflicts loudly. Without
+		// this, "repeat the same idempotency key" — the product's own durable-export
+		// remedy — could never match its own recorded body.
+		if spec.OutputExport != nil {
+			recorded, e := s.store.OutputExportOf(existing.ID)
+			if e != nil {
+				s.refuseTyped(w, r, e)
+				return
+			}
+			if recorded != nil {
+				spec.OutputExport.Outputs = append([]records.OutputExportEntry(nil), recorded.Outputs...)
+			}
+		}
 	} else {
 		if sub.Rental || sub.RentalRequired {
 			unlock := privatepackage.Guard()
@@ -144,6 +160,16 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			s.refuseTyped(w, r, e)
 			return
+		}
+		// The DAEMON is the process that publishes --out, so the daemon probes the
+		// destination — here, where the path is finally resolved, before a byte is
+		// staged or a row recorded. A doomed export refuses in milliseconds instead
+		// of after GPU minutes.
+		if spec.OutputExport != nil {
+			if e := resultfiles.Preflight(spec.OutputExport.Directory); e != nil {
+				s.refuseTyped(w, r, e)
+				return
+			}
 		}
 		spec.Assets, e = s.stageAssets(spec.Assets)
 		if e != nil {

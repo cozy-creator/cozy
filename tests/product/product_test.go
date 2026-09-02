@@ -225,6 +225,59 @@ func TestProductPath(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 
+	// cl-089 first half: an unwritable --out refuses AT SUBMIT, typed, before any GPU
+	// time — and before any request row exists to retry.
+	unwritableDir := filepath.Join(root, "unwritable-output")
+	must(t, os.MkdirAll(unwritableDir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(unwritableDir, 0o755) })
+	before := len(listRuns())
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile",
+		"size=32", "--out", unwritableDir, "--await", "--json")
+	if code != 1 || !strings.Contains(out, `"code":"output_destination_unwritable"`) ||
+		!strings.Contains(out, unwritableDir) {
+		t.Fatalf("mode-500 --out was not refused typed at submit [exit %d]\n%s", code, out)
+	}
+	if after := len(listRuns()); after != before {
+		t.Fatalf("a refused --out submission recorded a request row: %d -> %d", before, after)
+	}
+
+	// cl-089 second half: the incident's exact shape — the destination dies AFTER the
+	// preflight passed. The run's verdict stays completed; the export is reported as
+	// owed, distinctly, never as run failure; and once the directory is restored the
+	// same idempotency key re-triggers the durable export and the bytes land.
+	incidentDir := filepath.Join(root, "incident-output")
+	code, stdout, stderr = runCozyStreams(t, root, "--json", "run", localWeightlessRef+"/tile",
+		"size=32", "seed=13", "delay_ms=4500", "--out", incidentDir,
+		"--idempotency-key", "incident-cl089")
+	if code != 0 {
+		t.Fatalf("incident submit failed [exit %d]\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	idMatch := regexp.MustCompile(`"run":"([^"]+)"`).FindStringSubmatch(stdout)
+	if idMatch == nil {
+		t.Fatalf("detached incident run printed no run reference\n%s", stdout)
+	}
+	must(t, os.Chmod(incidentDir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(incidentDir, 0o755) })
+	code, out = runCozy(t, root, "run", "watch", idMatch[1], "--json")
+	if code != 0 ||
+		!strings.Contains(out, `"status":"completed (export pending: output_export_io)"`) ||
+		!strings.Contains(out, "daemon retries this durable export") {
+		t.Fatalf("succeeded run with failed export did not report the distinct verdict [exit %d]\n%s", code, out)
+	}
+	must(t, os.Chmod(incidentDir, 0o755))
+	code, out = runCozy(t, root, "--json", "run", localWeightlessRef+"/tile",
+		"size=32", "seed=13", "delay_ms=4500", "--out", incidentDir,
+		"--idempotency-key", "incident-cl089", "--await")
+	if code != 0 || !strings.Contains(out, `"status":"completed"`) ||
+		strings.Contains(out, "export pending") {
+		t.Fatalf("restored destination did not publish on the same key [exit %d]\n%s", code, out)
+	}
+	incidentFiles, err := os.ReadDir(incidentDir)
+	must(t, err)
+	if len(incidentFiles) != 1 || !requestOutputName(incidentFiles[0].Name(), ".webp") {
+		t.Fatalf("restored export did not land the WebP: %v", incidentFiles)
+	}
+
 	code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=7", "--full", "--await")
 	if code != 0 || !strings.Contains(stderr, "progress fraction=") {

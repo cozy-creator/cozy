@@ -713,10 +713,10 @@ func waitOutputExport(c *localapi.Client, life api.Lifecycle) (api.Lifecycle, *e
 		case "published", "skipped":
 			return life, nil
 		case "failed":
-			return life, exit.Named(exit.Unavailable, "output_export_failed",
-				"run %s completed, but output export failed: %s — %s",
-				life.RequestID, export.ErrorCode, export.Error).
-				WithRemedy("fix the recorded destination and repeat the same idempotency key; the daemon retries this durable export")
+			// A failed export is NOT a run failure: the run's own terminal stands, the
+			// bytes are safe in internal media, and the export stays a durable obligation
+			// the daemon retries. renderRun reports the completed-with-export-owed verdict.
+			return life, nil
 		case "pending", "exporting":
 			time.Sleep(50 * time.Millisecond)
 			updated, problem := c.Request(life.RequestID)
@@ -1185,12 +1185,21 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		// The DEADLINE is why this ended, and the shared matrix has a code for it.
 		status = "deadline"
 	}
+	// A SUCCEEDED run whose export failed is a completed run with an export still owed —
+	// the daemon retries the durable obligation — and it must never wear a run-failure
+	// verdict. The status says both facts; the exit code stays the run terminal's own.
+	export := life.OutputExport
+	exportOwed := export != nil && export.State == "failed" && mapTerminal(status) == "succeeded"
+	shownStatus := life.Status
+	if exportOwed {
+		shownStatus = life.Status + " (export pending: " + export.ErrorCode + ")"
+	}
 	fields := []output.Field{
 		{K: "number", V: life.Number}, {K: "id", V: life.RequestID},
 		{K: "target", V: life.Package + "/" + life.Function},
 		{K: "package", V: life.Package},
 		{K: "function", V: life.Function},
-		{K: "status", V: life.Status},
+		{K: "status", V: shownStatus},
 		{K: "attempts", V: life.Attempts},
 	}
 	if life.Result != nil {
@@ -1204,6 +1213,12 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		fields = append(fields, output.Field{K: "outputs", V: outs})
 	}
 	notes := []string{}
+	if exportOwed {
+		notes = append(notes, fmt.Sprintf(
+			"output export to %s failed (%s): %s — fix the recorded destination and repeat "+
+				"the same idempotency key; the daemon retries this durable export",
+			export.Directory, export.ErrorCode, export.Error))
+	}
 	if len(saved) > 0 {
 		paths := make([]string, 0, len(saved))
 		opaque := false
