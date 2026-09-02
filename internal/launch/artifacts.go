@@ -3,6 +3,7 @@ package launch
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -103,7 +104,8 @@ func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *e
 			WithRemedy("a package's surface is answered by the runtime the release itself pinned")
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return runtimeRefusal(code, strings.Join(verb, " "), stdout.String(), stderr.String())
+		return RuntimeExit(code, strings.Join(verb, " "), "runtime_query_failed",
+			stdout.String(), stderr.String())
 	}
 	if out == nil {
 		return nil
@@ -115,16 +117,16 @@ func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *e
 	return nil
 }
 
-// runtimeRefusal renders the runtime's own words under its own exit code. The matrix is
-// SHARED (cozy-runtime-cli.md), so a runtime exit is already a cozy exit — mapping it to
-// something else here would be inventing a second vocabulary for one refusal.
-func runtimeRefusal(code int, verb, stdout, stderr string) *exit.Error {
-	said := strings.TrimSpace(stderr)
-	if said == "" {
-		said = strings.TrimSpace(stdout)
-	}
-	// The runtime's --json refusal is one document; render its message rather than the
-	// raw JSON when it parses.
+// RuntimeExit is the ONE reading of a cozy-runtime child that exited non-zero. The exit
+// matrix is SHARED (cozy-runtime-cli.md), so a runtime exit is already a cozy exit and the
+// `--json` refusal it wrote is already the answer: code, name, message and remedy pass
+// through as themselves. Nothing here re-labels. The runtime is the only layer that
+// evaluated the wheels, the GPU, the CAS or the models, so it alone names the verdict —
+// preparation, wheel, GPU, CAS and network refusals keep their names, and "does not fit"
+// is said by a Fit and nobody else (model-code-fit §3). A child that died without a
+// document (a signal, a traceback) is `untyped`, with the tail of what it wrote as the
+// detail, because the end of a traceback is where the exception is.
+func RuntimeExit(code int, verb, untyped, stdout, stderr string) *exit.Error {
 	var doc struct {
 		Error struct {
 			Name    string `json:"name"`
@@ -132,22 +134,40 @@ func runtimeRefusal(code int, verb, stdout, stderr string) *exit.Error {
 			Remedy  string `json:"remedy"`
 		} `json:"error"`
 	}
-	name, remedy := "runtime_refused", ""
-	if json.Unmarshal([]byte(stderr), &doc) == nil && doc.Error.Message != "" {
-		said, remedy = doc.Error.Message, doc.Error.Remedy
-		if doc.Error.Name != "" {
-			name = doc.Error.Name
-		}
-	}
 	c := exit.Code(code)
 	if !c.Valid() {
 		c = exit.Internal
 	}
-	e := exit.Named(c, name, "`cozy-runtime %s`: %s", verb, condense(said))
-	if remedy != "" {
-		e.WithRemedy("%s", remedy)
+	if json.Unmarshal([]byte(stderr), &doc) == nil && doc.Error.Message != "" {
+		name := doc.Error.Name
+		if name == "" {
+			name = untyped
+		}
+		e := exit.Named(c, name, "%s", doc.Error.Message)
+		if doc.Error.Remedy != "" {
+			e.WithRemedy("%s", doc.Error.Remedy)
+		}
+		return e
 	}
-	return e
+	said := strings.TrimSpace(stderr)
+	if said == "" {
+		said = strings.TrimSpace(stdout)
+	}
+	what := fmt.Sprintf("exited %d", code)
+	if code < 0 {
+		what = "was killed"
+	}
+	return exit.Named(c, untyped, "`cozy-runtime %s` %s without a typed refusal: %s",
+		verb, what, tail(said))
+}
+
+// tail keeps the END of what a child wrote; a traceback names its exception last.
+func tail(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > 400 {
+		return "…" + string(r[len(r)-400:])
+	}
+	return s
 }
 
 func condense(s string) string {
