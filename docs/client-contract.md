@@ -76,7 +76,7 @@ A generic rental becomes attachable when Tensorhub publishes its pinned worker l
 The paid request contains only the SKU, media-token hash, and Creator public key; package and
 model choices remain local until Creator attaches. Creator reuses an idle rental whose observed
 hardware fits the request, then sends the exact published release as a signed logical
-`package_set`, or an exact private revision as `private_package_set`; the worker's observed-state
+`package_set`, or an exact local revision as `local_package_set`; the worker's observed-state
 stream supplies the derived placement, dispatchable binding, and exact release/environment/config
 identities. Runtime observes the actual worker environment and refuses protected platform-package
 conflicts before offline installation. Tensorhub's immutable release detail supplies the verified

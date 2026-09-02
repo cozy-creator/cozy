@@ -17,8 +17,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/media"
-	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -174,7 +174,7 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 	w.desiredModels = cloneModelRefs(models)
 	w.desiredDelegation = append([]byte(nil), delegation...)
 	w.desiredDelegationSignature = append([]byte(nil), signature...)
-	w.desiredPrivate = nil
+	w.desiredLocal = nil
 	w.desiredPrivatePlacement = nil
 	c.mu.Unlock()
 	call := &pb.PreparePackageSetCall{Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
@@ -613,10 +613,10 @@ func (c *Orchestrator) onAccepted(s *session, a *pb.AttemptAccepted) {
 			a.RequestId, ordinal, spelled, row.InvocationDigest)
 		return
 	}
-	planDigest, _ := canonical.Spell(a.PlanDigest)
-	construction, _ := canonical.Spell(a.ModelConstructionDigest)
-	summary := planSummary(a.Plan)
-	if e := c.opt.Store.Accepted(a.RequestId, int64(ordinal), s.bootID, planDigest, construction, summary); e != nil {
+	// Acceptance is queue ADMISSION (minor 23, proto-026): journaled, hydrated, queued on a
+	// lane. It binds neither a plan nor an executor; both bind at device entry and ride
+	// HeldAttempt from RUNNING on.
+	if e := c.opt.Store.Accepted(a.RequestId, int64(ordinal), s.bootID); e != nil {
 		c.logf("AttemptAccepted for %s#%d REFUSED: %s", a.RequestId, ordinal, e.Message)
 		return
 	}
@@ -627,28 +627,9 @@ func (c *Orchestrator) onAccepted(s *session, a *pb.AttemptAccepted) {
 	}
 	c.mu.Unlock()
 	c.settleDispatch(a.RequestId, ordinal, true)
-	c.logf("AttemptAccepted %s#%d placement=%s epoch=%d plan=%s construction=%s [%s]",
-		a.RequestId, ordinal, a.PlacementId, a.ExecutorEpoch,
-		shortDigest(planDigest), shortDigest(construction), summary)
-	c.emit(a.RequestId, "request.accepted", ordinal, map[string]any{
-		"plan_digest": planDigest, "construction_digest": construction, "plan": summary,
-	})
+	c.logf("AttemptAccepted %s#%d placement=%s lane=%s", a.RequestId, ordinal, a.PlacementId, a.LaneId)
+	c.emit(a.RequestId, "request.accepted", ordinal, map[string]any{"lane_id": a.LaneId})
 	c.signalAccepted(key(a.RequestId, ordinal))
-}
-
-// planSummary renders the CLOSED observable projection of the chosen plan. The
-// orchestrator sees WHAT was chosen, not only that something was — and it renders those
-// facts without ever choosing one.
-func planSummary(p *pb.AttemptPlanSummary) string {
-	if p == nil {
-		return ""
-	}
-	// `p.Placement` is TENSOR RESIDENCY and has nothing to do with a placement_id — the
-	// protocol's own field name, transported and rendered, never chosen here. #510i renames
-	// it to `residency` on the protocol's next touch; until then the comment is the fence.
-	return fmt.Sprintf("%s/%s %s %s device=%dB host=%dB",
-		p.Delivery, p.Materialization, p.ComputeDtype, p.Placement,
-		p.ReservedDeviceMemoryBytes, p.ReservedHostBytes)
 }
 
 // --------------------------------------------------------------------------- outcome
@@ -1092,14 +1073,14 @@ func (c *Orchestrator) cleanupRequestAssets(req records.Request) {
 		c.logf("request %s input asset cleanup deferred: %s", req.ID, e.Message)
 	}
 	unlock()
-	if req.PrivatePackageDigest == "" {
+	if req.LocalPackageDigest == "" {
 		return
 	}
-	unlockPrivate := privatepackage.Guard()
-	defer unlockPrivate()
-	if e := privatepackage.DropDigestUnowned(c.opt.Layout, c.opt.Store,
-		req.PrivatePackageDigest); e != nil {
-		c.logf("request %s private package cleanup deferred: %s", req.ID, e.Message)
+	unlockLocal := localpackage.Guard()
+	defer unlockLocal()
+	if e := localpackage.DropDigestUnowned(c.opt.Layout, c.opt.Store,
+		req.LocalPackageDigest); e != nil {
+		c.logf("request %s local package cleanup deferred: %s", req.ID, e.Message)
 	}
 }
 

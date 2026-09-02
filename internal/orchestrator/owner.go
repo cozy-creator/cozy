@@ -403,20 +403,20 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			c.onModelSourcePrepared(s, prepared)
-		case *pb.WorkerFrame_PrivatePackageFileStatus:
-			status := m.PrivatePackageFileStatus
+		case *pb.WorkerFrame_LocalPackageFileStatus:
+			status := m.LocalPackageFileStatus
 			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamEpoch,
 				status.WorkerBootId) {
 				continue
 			}
-			c.onPrivatePackageFileStatus(s, status)
-		case *pb.WorkerFrame_PrivatePackageAbortStatus:
-			status := m.PrivatePackageAbortStatus
+			c.onLocalPackageFileStatus(s, status)
+		case *pb.WorkerFrame_LocalPackageAbortStatus:
+			status := m.LocalPackageAbortStatus
 			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamEpoch,
 				status.WorkerBootId) {
 				continue
 			}
-			c.onPrivatePackageAbortStatus(s, status)
+			c.onLocalPackageAbortStatus(s, status)
 		case *pb.WorkerFrame_WeightsReceipt:
 			receipt := m.WeightsReceipt
 			if c.fenced(s, receipt.RecordOwnerEpoch, receipt.ControlStreamEpoch,
@@ -718,16 +718,16 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	}
 	if w.spec.Connection != nil {
 		c.signalAllTransfers()
-		c.replayPrivateAborts(s, w.spec.Connection.RentalID)
+		c.replayLocalAborts(s, w.spec.Connection.RentalID)
 		c.mu.Lock()
-		private := clonePrivatePackageSet(w.desiredPrivate)
+		private := cloneLocalPackageSet(w.desiredLocal)
 		privatePlacement := clonePrivatePlacementSet(w.desiredPrivatePlacement)
 		packages := clonePackageRefs(w.desiredPackages)
 		models := cloneModelRefs(w.desiredModels)
 		c.mu.Unlock()
 		if private != nil {
-			if e := c.issuePrivatePackageSet(s, w, private); e != nil {
-				c.logf("rental %s private_package_set could not be issued: %s",
+			if e := c.issueLocalPackageSet(s, w, private); e != nil {
+				c.logf("rental %s local_package_set could not be issued: %s",
 					w.spec.Connection.RentalID, e.Message)
 			}
 			return true

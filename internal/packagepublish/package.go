@@ -108,7 +108,7 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 
 // BuildForPublish is Build plus the publish-only refusals (cl-084): a uv.lock
 // row that lives only on the author's machine and an image-owned pin cannot
-// enter a published release, while an editable or private install of the same
+// enter a published release, while an editable or local install of the same
 // tree stays legal.
 func (p *Package) BuildForPublish(ctx context.Context) *exit.Error {
 	return p.build(ctx, true)
@@ -293,7 +293,7 @@ func applicationObject(path string) (string, *exit.Error) {
 // VerifyProjectWheel is the same fence for an editable install: the tree must build
 // into a wheel a worker could run BEFORE it is pinned, so `cozy run --rental` never
 // discovers on a paid pod what `cozy package install` could have said at once. The
-// wheel is disposable; the private revision builds its own from the pinned source.
+// wheel is disposable; the local revision builds its own from the pinned source.
 func VerifyProjectWheel(ctx context.Context, tree, name, release string) *exit.Error {
 	out, err := os.MkdirTemp("", "cozy-project-wheel-")
 	if err != nil {

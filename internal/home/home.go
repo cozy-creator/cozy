@@ -65,9 +65,9 @@ type Layout struct {
 	// address, pod id, state — are rows in the one records authority; only what must not
 	// be readable by another user on this host lives out here as files.
 	Rentals string
-	// PrivatePackages holds exact ephemeral wheel revisions for rented local-package commands.
-	// It is Creator-private staging, never a catalog or mutable checkout.
-	PrivatePackages string
+	// LocalPackages holds exact ephemeral wheel revisions for rented local-package commands.
+	// It is staging the daemon alone writes, never a catalog or mutable checkout.
+	LocalPackages string
 	// Log is the Cozy daemon's own log: the orchestrator's words and the process's
 	// banner, bounded by rotation on an observed size (internal/daemon.OpenLog). Its one
 	// rotated predecessor is Log + ".1". Read with `cozy daemon log`.
@@ -105,19 +105,32 @@ func Open(root string) (Layout, *exit.Error) {
 	}
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
-	l.PrivatePackages = filepath.Join(root, "private-packages")
+	l.LocalPackages = filepath.Join(root, "local-packages")
 	l.Log = filepath.Join(root, "daemon.log")
+	// The revision store was `private-packages/` before the vocabulary hard-cut (proto-027).
+	// A root written by that build keeps what it holds: the directory moves, once, and the
+	// local-package sweep retires any revision written under the old document format.
+	if prior := filepath.Join(root, "private-packages"); dirExists(prior) && !dirExists(l.LocalPackages) {
+		if err := os.Rename(prior, l.LocalPackages); err != nil {
+			return Layout{}, exit.Internalf("cannot move %s to %s: %s", prior, l.LocalPackages, err)
+		}
+	}
 	for _, dir := range []string{l.Installs, l.Workers, l.Attempts, l.Outputs, l.Triage, l.Publications} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}
 	}
-	for _, dir := range []string{l.Inputs, l.Uploads, l.PrivatePackages} {
+	for _, dir := range []string{l.Inputs, l.Uploads, l.LocalPackages} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}
 	}
 	return l, nil
+}
+
+func dirExists(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.IsDir()
 }
 
 // InputAsset resolves one verified sha256 digest into its private immutable staging

@@ -76,7 +76,7 @@ func Build(req Request) (*Result, *exit.Error) {
 	}
 	if held, _ := filepath.Glob(filepath.Join(out, "*.whl")); len(held) != 0 {
 		return nil, exit.Named(exit.Conflict, "project_wheel_output_not_empty",
-			"private wheel staging already contains %d wheel(s)", len(held))
+			"local wheel staging already contains %d wheel(s)", len(held))
 	}
 
 	ctx, cancel := context.WithCancelCause(parent)

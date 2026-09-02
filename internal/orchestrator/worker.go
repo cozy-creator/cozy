@@ -18,8 +18,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/media"
-	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/processtree"
 	"github.com/cozy-creator/cozy/internal/reclaim"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -368,9 +368,9 @@ type worker struct {
 	// package B joins the same desired set.
 	remotePlacements map[string]DesiredPlacement
 	observedRemote   map[string]remotePlacementObservation
-	// desiredPrivate is the exact command-scoped private wheel inventory. It survives
+	// desiredLocal is the exact command-scoped local wheel inventory. It survives
 	// control reconnect so a prepared pod can replay its ledgered PlacementSet directly.
-	desiredPrivate *pb.DesiredPrivatePackageSet
+	desiredLocal *pb.DesiredLocalPackageSet
 	// desiredPrivatePlacement is the signed model-only join for the already-prepared private
 	// revision. It survives a control reconnect so pod-supervisor can replay its exact journal.
 	desiredPrivatePlacement *pb.DesiredPrivatePlacementSet
@@ -1292,7 +1292,7 @@ const mediaIOStallBudget = StillFactor * ReportCadence
 // accepted but not converged. The Runtime LATCHES a materialization refusal for a desired
 // revision — in its own words, "retry is a RecordOwner act: a NEW revision, or a grant
 // refresh" — and reports it unchanged on every ReportCadence until one arrives. Neither
-// is this owner's to give from here: a rental's private wheels travelled as capabilities
+// is this owner's to give from here: a rental's local wheels travelled as capabilities
 // the pod has already spent, and a local plan has nothing to refresh. So the same fault
 // repeating across StillFactor consecutive reports, with no revision issued in between
 // and no placement progressing, is the worker's final word on that revision, and the
@@ -1870,9 +1870,9 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	if e != nil {
 		return 0, 0, e
 	}
-	unlockPrivate := privatepackage.Guard()
-	e = privatepackage.Sweep(c.opt.Layout, c.opt.Store)
-	unlockPrivate()
+	unlockLocal := localpackage.Guard()
+	e = localpackage.Sweep(c.opt.Layout, c.opt.Store)
+	unlockLocal()
 	if e != nil {
 		return 0, 0, e
 	}

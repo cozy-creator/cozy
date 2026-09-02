@@ -162,8 +162,8 @@ func messageFor(name string) proto.Message {
 		return &pb.DownloadDelegation{}
 	case "cozy.worker.v1.PlacementSet":
 		return &pb.PlacementSet{}
-	case "cozy.worker.v1.PrivatePackageRevision":
-		return &pb.PrivatePackageRevision{}
+	case "cozy.worker.v1.LocalPackageRevision":
+		return &pb.LocalPackageRevision{}
 	case "cozy.worker.v1.WorkerSnapshotBody":
 		return &pb.WorkerSnapshotBody{}
 	case "cozy.worker.v1.HostSnapshotBody":

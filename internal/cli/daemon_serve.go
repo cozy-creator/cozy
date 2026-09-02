@@ -122,7 +122,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	configDigest := localConfigDigest(ctx.Cfg)
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	transfers := newModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
-	privateWheels := newPrivateWheelOwner(ctx.Cfg, ctx.Out, ctx.AccountAuth)
+	localWheels := newLocalWheelOwner(ctx.Cfg, ctx.Out, ctx.AccountAuth)
 	defects := newDefectReporter(ctx.Cfg, ctx.Out, ctx.AccountAuth)
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
@@ -131,7 +131,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		RentalFleet: fleet.status, AcquireManagedRental: fleet.acquire,
 		ReleaseManagedRental: fleet.release,
 		ModelTransfers:       transfers,
-		PrivateWheels:        privateWheels.grants,
+		LocalWheels:          localWheels.grants,
 		ReportReleaseDefect:  defects.report,
 		ConfigDigest:         configDigest,
 	})

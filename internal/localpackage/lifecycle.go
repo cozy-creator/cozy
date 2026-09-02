@@ -1,6 +1,7 @@
-package privatepackage
+package localpackage
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,36 +30,42 @@ type durableIdentity struct {
 func readDurableIdentity(root, digest string) (durableIdentity, *exit.Error) {
 	var out durableIdentity
 	if !validDigest(digest) {
-		return out, exit.New(exit.Validation, "private package revision digest %q is invalid", digest)
+		return out, exit.New(exit.Validation, "local package revision digest %q is invalid", digest)
 	}
 	info, err := os.Lstat(root)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return out, exit.Named(exit.Structural, "private_package_revision_invalid",
-			"private package revision root is not one real directory")
+		return out, exit.Named(exit.Structural, "local_package_revision_invalid",
+			"local package revision root is not one real directory")
 	}
-	raw, err := os.ReadFile(filepath.Join(root, privateRevisionFile))
+	raw, err := os.ReadFile(filepath.Join(root, localRevisionFile))
 	if err != nil || len(raw) == 0 || len(raw) > canonical.DocMax {
-		return out, exit.Named(exit.Structural, "private_package_revision_invalid",
-			"private package revision document is absent or over its bound")
+		return out, exit.Named(exit.Structural, "local_package_revision_invalid",
+			"local package revision document is absent or over its bound")
 	}
 	spelled, err := canonical.Spell(canonical.Digest(raw))
 	if err != nil || spelled != digest {
-		return out, exit.Named(exit.Conflict, "private_package_revision_changed",
-			"private package revision document no longer matches %s", digest)
+		return out, exit.Named(exit.Conflict, "local_package_revision_changed",
+			"local package revision document no longer matches %s", digest)
 	}
-	doc, err := canonical.Read(raw, &pb.PrivatePackageRevision{})
+	doc, err := canonical.Read(raw, &pb.LocalPackageRevision{})
 	if err != nil {
-		return out, exit.Named(exit.Structural, "private_package_revision_invalid", "%s", err)
+		var refusal *canonical.Error
+		if errors.As(err, &refusal) && refusal.Code == "unknown_format" {
+			// The bytes hash to the directory's name, so this is one of ours — written under
+			// a document format this build no longer reads. Nothing can use it again.
+			return out, exit.Named(exit.Structural, "local_package_revision_retired", "%s", err)
+		}
+		return out, exit.Named(exit.Structural, "local_package_revision_invalid", "%s", err)
 	}
 	out.digest, out.packageName, out.release = digest, doc.Str("package"), doc.Str("release")
 	out.sourceDigest = doc.Str("source_digest")
 	if _, err := canonical.Raw(out.sourceDigest); err != nil {
 		return durableIdentity{}, exit.Named(exit.Structural,
-			"private_package_revision_invalid", "source digest: %s", err)
+			"local_package_revision_invalid", "source digest: %s", err)
 	}
 	if out.packageName == "" || out.release == "" {
 		return durableIdentity{}, exit.Named(exit.Structural,
-			"private_package_revision_invalid", "private package revision identity is incomplete")
+			"local_package_revision_invalid", "local package revision identity is incomplete")
 	}
 	return out, nil
 }
@@ -66,20 +73,20 @@ func readDurableIdentity(root, digest string) (durableIdentity, *exit.Error) {
 // Drop removes one exact, self-identifying revision directory. RemoveAll never follows child
 // symlinks, and the root itself is Lstat-fenced before deletion.
 func Drop(layout home.Layout, digest string) *exit.Error {
-	root := filepath.Join(layout.PrivatePackages, strings.TrimPrefix(digest, "sha256:"))
+	root := filepath.Join(layout.LocalPackages, strings.TrimPrefix(digest, "sha256:"))
 	if _, err := os.Lstat(root); os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
-		return exit.Internalf("cannot inspect private package revision %s: %s", digest, err)
+		return exit.Internalf("cannot inspect local package revision %s: %s", digest, err)
 	}
 	if _, problem := readDurableIdentity(root, digest); problem != nil {
 		return problem
 	}
 	if err := os.RemoveAll(root); err != nil {
-		return exit.Internalf("cannot remove private package revision %s: %s", digest, err)
+		return exit.Internalf("cannot remove local package revision %s: %s", digest, err)
 	}
-	if err := syncDirectory(layout.PrivatePackages); err != nil {
-		return exit.Internalf("cannot sync private package cleanup: %s", err)
+	if err := syncDirectory(layout.LocalPackages); err != nil {
+		return exit.Internalf("cannot sync local package cleanup: %s", err)
 	}
 	return nil
 }
@@ -87,17 +94,17 @@ func Drop(layout home.Layout, digest string) *exit.Error {
 // DropDigestUnowned is the terminal/restart form: its canonical revision document supplies the
 // source declaration even if the mutable checkout or install row has already disappeared.
 func DropDigestUnowned(layout home.Layout, store *records.Store, digest string) *exit.Error {
-	root := filepath.Join(layout.PrivatePackages, strings.TrimPrefix(digest, "sha256:"))
+	root := filepath.Join(layout.LocalPackages, strings.TrimPrefix(digest, "sha256:"))
 	if _, err := os.Lstat(root); os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
-		return exit.Internalf("cannot inspect private package revision %s: %s", digest, err)
+		return exit.Internalf("cannot inspect local package revision %s: %s", digest, err)
 	}
 	identity, problem := readDurableIdentity(root, digest)
 	if problem != nil {
 		return problem
 	}
-	used, problem := store.PrivatePackageInUse(identity.digest, identity.packageName,
+	used, problem := store.LocalPackageInUse(identity.digest, identity.packageName,
 		identity.release, identity.sourceDigest)
 	if problem != nil || used {
 		return problem
@@ -108,16 +115,16 @@ func DropDigestUnowned(layout home.Layout, store *records.Store, digest string) 
 // Sweep removes dead staging directories and committed revisions left without a live request or
 // current editable declaration. Unrecognized paths are never guessed to be ours.
 func Sweep(layout home.Layout, store *records.Store) *exit.Error {
-	entries, err := os.ReadDir(layout.PrivatePackages)
+	entries, err := os.ReadDir(layout.LocalPackages)
 	if err != nil {
-		return exit.Internalf("cannot scan private package revisions: %s", err)
+		return exit.Internalf("cannot scan local package revisions: %s", err)
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		path := filepath.Join(layout.PrivatePackages, name)
+		path := filepath.Join(layout.LocalPackages, name)
 		if strings.HasPrefix(name, ".stage-") {
 			if err := os.RemoveAll(path); err != nil {
-				return exit.Internalf("cannot remove orphan private package staging %s: %s", name, err)
+				return exit.Internalf("cannot remove orphan local package staging %s: %s", name, err)
 			}
 			continue
 		}
@@ -126,10 +133,16 @@ func Sweep(layout home.Layout, store *records.Store) *exit.Error {
 			continue
 		}
 		identity, problem := readDurableIdentity(path, digest)
+		if problem != nil && problem.Name == "local_package_revision_retired" {
+			if err := os.RemoveAll(path); err != nil {
+				return exit.Internalf("cannot retire local package revision %s: %s", name, err)
+			}
+			continue
+		}
 		if problem != nil {
 			return problem
 		}
-		used, problem := store.PrivatePackageInUse(identity.digest, identity.packageName,
+		used, problem := store.LocalPackageInUse(identity.digest, identity.packageName,
 			identity.release, identity.sourceDigest)
 		if problem != nil {
 			return problem

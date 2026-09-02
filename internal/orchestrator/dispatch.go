@@ -30,10 +30,10 @@ type Submission struct {
 	PlanID        string // the entrypoint_binding_plan_id this attempt binds
 	Release       string // immutable remote package release; empty for local execution
 	ReleaseDigest string // exact remote release.json identity
-	// PrivatePackageDigest is the exact staged wheel-set identity for one editable rental.
+	// LocalPackageDigest is the exact staged wheel-set identity for one editable rental.
 	// ReleaseDigest remains Runtime's source identity; this names the carriers.
-	PrivatePackageDigest string
-	Models               []ModelRef
+	LocalPackageDigest string
+	Models             []ModelRef
 
 	// Payload is the request body, verbatim. It rides the DeliveryGrant as the input
 	// `payload` — a grant input, never a wire field, so refreshing the grant can never
@@ -201,24 +201,24 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		}
 		bodyDigest = spelled
 	}
-	if s.PrivatePackageDigest != "" {
-		if !s.Rental || s.InstallID == "" || !validDigest(s.PrivatePackageDigest) {
+	if s.LocalPackageDigest != "" {
+		if !s.Rental || s.InstallID == "" || !validDigest(s.LocalPackageDigest) {
 			return records.Request{}, nil, exit.Named(exit.Structural,
-				"private_package_request_invalid",
-				"a private package revision requires one editable rental install")
+				"local_package_request_invalid",
+				"a local package revision requires one editable rental install")
 		}
 		identity, err := canonical.Write(map[string]canonical.Value{
-			"body_digest":            bodyDigest,
-			"private_package_digest": s.PrivatePackageDigest,
+			"body_digest":          bodyDigest,
+			"local_package_digest": s.LocalPackageDigest,
 		})
 		if err != nil {
 			return records.Request{}, nil, exit.Internalf(
-				"cannot encode the private package request identity: %s", err)
+				"cannot encode the local package request identity: %s", err)
 		}
 		bodyDigest, err = canonical.Spell(canonical.Digest(identity))
 		if err != nil {
 			return records.Request{}, nil, exit.Internalf(
-				"cannot digest the private package request identity: %s", err)
+				"cannot digest the local package request identity: %s", err)
 		}
 	}
 	id := records.NewID("req")
@@ -229,9 +229,9 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
 		Package: s.Package, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
 		Release: s.Release, PackageRevisionDigest: s.ReleaseDigest,
-		PrivatePackageDigest: s.PrivatePackageDigest,
-		Outputs:              strings.Join(s.Outputs, ","),
-		Assets:               s.Assets, WeightsOutputs: string(weightsBytes),
+		LocalPackageDigest: s.LocalPackageDigest,
+		Outputs:            strings.Join(s.Outputs, ","),
+		Assets:             s.Assets, WeightsOutputs: string(weightsBytes),
 		Kind: s.Kind, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, Models: s.Models,
@@ -247,8 +247,8 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		event["rental_required"] = s.RentalRequired
 		event["release"] = s.Release
 		event["release_digest"] = s.ReleaseDigest
-		if s.PrivatePackageDigest != "" {
-			event["private_package_digest"] = s.PrivatePackageDigest
+		if s.LocalPackageDigest != "" {
+			event["local_package_digest"] = s.LocalPackageDigest
 		}
 	}
 	return req, event, nil
@@ -538,12 +538,12 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			continue
 		}
 		// An install pins a LOCAL relaunch. On a rental the exact identity is the sealed
-		// private revision the request carries, and stagedFor holds the worker to it.
+		// local revision the request carries, and stagedFor holds the worker to it.
 		if req.InstallID != "" && w.spec.Connection == nil && w.spec.Placement.InstallID != req.InstallID {
 			continue
 		}
 		if !req.IsJob() || w.spec.Placement.Jobs[0].Function == req.Entrypoint {
-			// A private package_set request learns its binding digest from the worker.
+			// A local package_set request learns its binding digest from the worker.
 			// Until that happens an empty plan is neither staged nor stale; resolveFor
 			// sends the signed logical set and binds the observed answer.
 			if req.Worker != "" && req.PlanID == "" {
@@ -674,8 +674,8 @@ func stagedFor(w *worker, req records.Request) bool {
 // the pod holds under the same plan id for an EARLIER revision of the same package — an
 // edit that left the descriptor alone — is not this request's code.
 func remoteRevision(req records.Request) string {
-	if req.PrivatePackageDigest != "" {
-		return req.PrivatePackageDigest
+	if req.LocalPackageDigest != "" {
+		return req.LocalPackageDigest
 	}
 	return req.PackageRevisionDigest
 }
@@ -749,26 +749,26 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		return WorkerLaunchSpec{}, "", e
 	}
 	if req.InstallID != "" {
-		if c.opt.Packages == nil || !validDigest(req.PrivatePackageDigest) {
+		if c.opt.Packages == nil || !validDigest(req.LocalPackageDigest) {
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
-				"private_package_request_incomplete",
-				"editable rental request %s names no sealed private package revision", req.ID)
+				"local_package_request_incomplete",
+				"editable rental request %s names no sealed local package revision", req.ID)
 		}
-		revision, problem := c.opt.Packages.PrivateRevision(req.InstallID, req.PrivatePackageDigest)
+		revision, problem := c.opt.Packages.LocalRevision(req.InstallID, req.LocalPackageDigest)
 		if problem != nil {
 			return WorkerLaunchSpec{}, "", problem
 		}
 		if revision.Package != req.Package || revision.Release != req.Release ||
-			revision.SourceDigest != req.PackageRevisionDigest || revision.Digest != req.PrivatePackageDigest {
+			revision.SourceDigest != req.PackageRevisionDigest || revision.Digest != req.LocalPackageDigest {
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict,
-				"private_package_revision_changed",
-				"request %s no longer matches its sealed private package revision", req.ID)
+				"local_package_revision_changed",
+				"request %s no longer matches its sealed local package revision", req.ID)
 		}
-		if e := c.ConvergePrivatePackage(instance, req.ID, revision,
-			req.PrivatePackageUploadedBootID); e != nil {
+		if e := c.ConvergeLocalPackage(instance, req.ID, revision,
+			req.LocalPackageUploadedBootID); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
-		logical.ReleaseDigest = req.PrivatePackageDigest
+		logical.ReleaseDigest = req.LocalPackageDigest
 		if !req.IsJob() && len(logical.Models) > 0 {
 			models := downloadModelRefs(logical.Models)
 			if len(models) != len(logical.Models) {
@@ -777,12 +777,12 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 					"private serving requires exact published model releases")
 			}
 			if e := c.ConvergePrivatePlacement(instance, req.ID,
-				req.PrivatePackageDigest, models); e != nil {
+				req.LocalPackageDigest, models); e != nil {
 				return WorkerLaunchSpec{}, "", e
 			}
 		}
 	} else {
-		if c.opt.RentalPackageSet == nil || req.PrivatePackageDigest != "" {
+		if c.opt.RentalPackageSet == nil || req.LocalPackageDigest != "" {
 			return WorkerLaunchSpec{}, "", exit.Unavailablef(
 				"published remote package preparation requires a package_set signer")
 		}
@@ -1178,17 +1178,17 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 				"worker %s no longer matches the invocation identity pinned to request %s",
 				instanceID, req.ID)
 		}
-		// A private revision is DEVELOPMENT execution on the pod, and development execution
+		// A local revision is DEVELOPMENT execution on the pod, and development execution
 		// has no published Environment identity: the worker refuses a spec that names one
 		// (development_environment_present). The pod's prepared Environment is still bound
 		// to the row, so a requeue derives the same identity; only the spec omits it.
 		specEnvironment := environment
-		if req.PrivatePackageDigest != "" {
+		if req.LocalPackageDigest != "" {
 			specEnvironment = ""
 		}
 		if req.EnvironmentDigest == "" && req.ConfigDigest == "" {
-			if req.PrivatePackageDigest != "" {
-				e = c.opt.Store.BindPrivateRemoteInvocation(req.ID, req.PlanID,
+			if req.LocalPackageDigest != "" {
+				e = c.opt.Store.BindLocalRemoteInvocation(req.ID, req.PlanID,
 					packageRevision, environment, placement.ConfigDigest)
 			} else {
 				e = c.opt.Store.BindRemoteInvocation(req.ID, req.PlanID,

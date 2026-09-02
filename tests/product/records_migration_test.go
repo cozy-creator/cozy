@@ -12,8 +12,8 @@ import (
 
 // TestRecordsMigrationFromEleven migrates a REAL schema-11 database — the exact released
 // DDL, dumped from that schema's own sqlite_master and checked in beside this test — and
-// proves the schema-12 rename, the schema-13 rental column, and the schema-14 export table
-// carried their rows. The owner's
+// proves the schema-12 rename, the schema-13 rental column, the schema-14 export table, and
+// the schema-15 request column spelling carried their rows. The owner's
 // machine holds one of these, so the property under test is not "a fresh database has the
 // new names" but "an existing database keeps its installs, pins, workers, requests and
 // rentals while the shape changes".
@@ -50,8 +50,13 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 14 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 15 {
 		t.Fatalf("user_version = %d, %v", version, err)
+	}
+	// Schema 15: the request's editable revision columns say local_package_*, one word.
+	if columns := columnNames(t, db, "requests"); !columns["local_package_digest"] ||
+		!columns["local_package_uploaded_boot_id"] || columns["private_package_digest"] {
+		t.Fatalf("requests columns after migration = %v", columns)
 	}
 	for table, want := range map[string]string{"pins": "install_id", "worker_processes": "install_id"} {
 		columns := columnNames(t, db, table)

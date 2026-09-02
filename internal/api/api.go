@@ -55,8 +55,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -98,8 +98,8 @@ type Server struct {
 // start may require the target environment through Resolve.
 type Resolver interface {
 	RefreshEditable(pkg string) (installID string, editable, changed bool, problem *exit.Error)
-	PreparePrivate(context.Context, string) (privatepackage.Revision, *exit.Error)
-	PrivateRevision(string, string) (privatepackage.Revision, *exit.Error)
+	PrepareLocal(context.Context, string) (localpackage.Revision, *exit.Error)
+	LocalRevision(string, string) (localpackage.Revision, *exit.Error)
 	ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error)
 	ResolveInstall(installID string, models []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error)
 	ResolveRemoteRelease(pkg, release, digest, function string, models []orchestrator.ModelRef) (

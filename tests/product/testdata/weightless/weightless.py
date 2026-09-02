@@ -125,7 +125,7 @@ def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> Tile
 
 @app.job
 def tile_job(payload: TileInput) -> TileJobOutput:
-    """Weightless remote-job fixture; its value proves frozen private revision replay."""
+    """Weightless remote-job fixture; its value proves frozen local revision replay."""
     return TileJobOutput(size=payload.size, seed=payload.seed, revision=REVISION)
 
 

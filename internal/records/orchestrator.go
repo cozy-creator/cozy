@@ -38,8 +38,8 @@ CREATE TABLE IF NOT EXISTS requests (
   plan_id      TEXT    NOT NULL,
   package_release TEXT NOT NULL DEFAULT '',
   package_revision_digest TEXT NOT NULL DEFAULT '',
-  private_package_digest TEXT NOT NULL DEFAULT '',
-  private_package_uploaded_boot_id TEXT NOT NULL DEFAULT '',
+  local_package_digest TEXT NOT NULL DEFAULT '',
+  local_package_uploaded_boot_id TEXT NOT NULL DEFAULT '',
   environment_digest TEXT NOT NULL DEFAULT '',
   config_digest TEXT NOT NULL DEFAULT '',
   payload      BLOB    NOT NULL,
@@ -438,13 +438,13 @@ type Request struct {
 	// Placement. They are CAS-bound with PlanID before the first offer so a retry or
 	// reconnect cannot silently change the execution named by this request.
 	PackageRevisionDigest string
-	// PrivatePackageDigest names Creator's sealed carrier set. UploadedBootID binds the
+	// LocalPackageDigest names Creator's sealed carrier set. UploadedBootID binds the
 	// completed transfer to the exact pod generation that acknowledged every file.
-	PrivatePackageDigest         string
-	PrivatePackageUploadedBootID string
-	EnvironmentDigest            string
-	ConfigDigest                 string
-	Payload                      []byte
+	LocalPackageDigest         string
+	LocalPackageUploadedBootID string
+	EnvironmentDigest          string
+	ConfigDigest               string
+	Payload                    []byte
 	// Outputs names one destination per RESULT FIELD PATH. It lives on the request
 	// because a REQUEUE re-derives the same grant shape without a client saying so again.
 	Outputs   string
@@ -528,15 +528,15 @@ type ModelRef struct {
 }
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
-	package_revision_digest,private_package_digest,private_package_uploaded_boot_id,
+	package_revision_digest,local_package_digest,local_package_uploaded_boot_id,
 	environment_digest,config_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,rental,rental_required,
 	COALESCE(install_id,''),assets,models,weights_outputs`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
-		&r.Release, &r.PackageRevisionDigest, &r.PrivatePackageDigest,
-		&r.PrivatePackageUploadedBootID, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
+		&r.Release, &r.PackageRevisionDigest, &r.LocalPackageDigest,
+		&r.LocalPackageUploadedBootID, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Rental, &r.RentalRequired,
 		&r.InstallID, assets, models, &r.WeightsOutputs}
@@ -669,70 +669,70 @@ func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, c
 	return nil
 }
 
-// BindPrivateRemoteInvocation records worker-derived serving identity while retaining the
-// checkout source digest separately in package_revision_digest. private_package_digest is the
+// BindLocalRemoteInvocation records worker-derived serving identity while retaining the
+// checkout source digest separately in package_revision_digest. local_package_digest is the
 // exact execution identity and must already equal the Runtime-reported revision.
-func (s *Store) BindPrivateRemoteInvocation(id, planID, privateRevision,
+func (s *Store) BindLocalRemoteInvocation(id, planID, localRevision,
 	environment, config string,
 ) *exit.Error {
-	if id == "" || planID == "" || privateRevision == "" || environment == "" || config == "" {
-		return exit.Internalf("cannot bind an incomplete private remote invocation identity")
+	if id == "" || planID == "" || localRevision == "" || environment == "" || config == "" {
+		return exit.Internalf("cannot bind an incomplete local package remote invocation identity")
 	}
 	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,environment_digest=?,config_digest=?
-    WHERE id=? AND private_package_digest=? AND (plan_id='' OR plan_id=?) AND
+    WHERE id=? AND local_package_digest=? AND (plan_id='' OR plan_id=?) AND
     environment_digest='' AND config_digest=''`, planID, environment, config, id,
-		privateRevision, planID)
+		localRevision, planID)
 	if err != nil {
-		return exit.Internalf("cannot bind request %s private invocation: %s", id, err)
+		return exit.Internalf("cannot bind request %s local package invocation: %s", id, err)
 	}
 	if changed, err := result.RowsAffected(); err == nil && changed == 1 {
 		return nil
 	}
-	var heldPlan, heldPrivate, heldEnvironment, heldConfig string
-	if err := s.db.QueryRow(`SELECT plan_id,private_package_digest,environment_digest,config_digest
-    FROM requests WHERE id=?`, id).Scan(&heldPlan, &heldPrivate, &heldEnvironment,
+	var heldPlan, heldLocal, heldEnvironment, heldConfig string
+	if err := s.db.QueryRow(`SELECT plan_id,local_package_digest,environment_digest,config_digest
+    FROM requests WHERE id=?`, id).Scan(&heldPlan, &heldLocal, &heldEnvironment,
 		&heldConfig); err != nil {
-		return exit.Internalf("cannot read request %s private invocation binding: %s", id, err)
+		return exit.Internalf("cannot read request %s local package invocation binding: %s", id, err)
 	}
-	if heldPlan != planID || heldPrivate != privateRevision || heldEnvironment != environment ||
+	if heldPlan != planID || heldLocal != localRevision || heldEnvironment != environment ||
 		heldConfig != config {
 		return exit.Named(exit.Conflict, "request_invocation_identity_changed",
-			"request %s already binds a different private invocation identity", id)
+			"request %s already binds a different local package invocation identity", id)
 	}
 	return nil
 }
 
-// MarkPrivatePackageUploaded crosses the durable boundary between verified carrier
-// acknowledgements and DesiredPrivatePackageSet. The caller proves every acknowledgement belongs
+// MarkLocalPackageUploaded crosses the durable boundary between verified carrier
+// acknowledgements and DesiredLocalPackageSet. The caller proves every acknowledgement belongs
 // to this exact boot/session before moving the marker; a replacement boot therefore overwrites an
 // old marker only after it has independently re-received and verified the whole revision.
-func (s *Store) MarkPrivatePackageUploaded(id, digest, bootID string) *exit.Error {
+func (s *Store) MarkLocalPackageUploaded(id, digest, bootID string) *exit.Error {
 	if id == "" || digest == "" || bootID == "" {
-		return exit.Internalf("cannot record an incomplete private package upload")
+		return exit.Internalf("cannot record an incomplete local package upload")
 	}
-	result, err := s.db.Exec(`UPDATE requests SET private_package_uploaded_boot_id=?
-		WHERE id=? AND private_package_digest=?`, bootID, id, digest)
+	result, err := s.db.Exec(`UPDATE requests SET local_package_uploaded_boot_id=?
+		WHERE id=? AND local_package_digest=?`, bootID, id, digest)
 	if err != nil {
-		return exit.Internalf("cannot record request %s private package upload: %s", id, err)
+		return exit.Internalf("cannot record request %s local package upload: %s", id, err)
 	}
 	changed, err := result.RowsAffected()
 	if err != nil {
-		return exit.Internalf("cannot read request %s private package upload result: %s", id, err)
+		return exit.Internalf("cannot read request %s local package upload result: %s", id, err)
 	}
 	if changed == 1 {
 		return nil
 	}
 	var heldDigest string
-	if err := s.db.QueryRow(`SELECT private_package_digest FROM requests WHERE id=?`, id).
+	if err := s.db.QueryRow(`SELECT local_package_digest FROM requests WHERE id=?`, id).
 		Scan(&heldDigest); err != nil {
-		return exit.Internalf("cannot read request %s private package upload: %s", id, err)
+		return exit.Internalf("cannot read request %s local package upload: %s", id, err)
 	}
 	if heldDigest != digest {
-		return exit.Named(exit.Conflict, "private_package_revision_changed",
-			"request %s already names another private package revision", id)
+		return exit.Named(exit.Conflict, "local_package_revision_changed",
+			"request %s already names another local package revision", id)
 	}
-	return exit.Named(exit.Conflict, "private_package_request_changed",
-		"request %s cannot record its verified private package boot", id)
+	return exit.Named(exit.Conflict, "local_package_request_changed",
+		"request %s cannot record its verified local package boot", id)
 }
 
 // AssignManagedRental pins one still-queued --rental request to the exact pod
@@ -953,18 +953,18 @@ func (s *Store) AssetInUse(digest string) (bool, *exit.Error) {
 	return false, nil
 }
 
-// PrivatePackageInUse keeps one exact wheel revision while executable work or the current
+// LocalPackageInUse keeps one exact wheel revision while executable work or the current
 // editable declaration can still select it. Terminal request rows retain audit identity but no
 // bytes; an edited pin stops retaining the superseded source revision.
-func (s *Store) PrivatePackageInUse(digest, packageName, release,
+func (s *Store) LocalPackageInUse(digest, packageName, release,
 	sourceDigest string,
 ) (bool, *exit.Error) {
 	var used int
 	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests
-		WHERE private_package_digest=?
+		WHERE local_package_digest=?
 		  AND state IN ('submitted','queued','dispatching','requeue_pending'))`, digest).
 		Scan(&used); err != nil {
-		return false, exit.Internalf("cannot read live private package ownership: %s", err)
+		return false, exit.Internalf("cannot read live local package ownership: %s", err)
 	}
 	if used != 0 {
 		return true, nil
@@ -973,31 +973,31 @@ func (s *Store) PrivatePackageInUse(digest, packageName, release,
 		SELECT 1 FROM pins p JOIN installs i ON i.id=p.install_id
 		WHERE i.package=? AND i.version=? AND i.source_kind='local' AND i.source_digest=?)`,
 		packageName, release, sourceDigest).Scan(&used); err != nil {
-		return false, exit.Internalf("cannot read current editable private package ownership: %s", err)
+		return false, exit.Internalf("cannot read current editable local package ownership: %s", err)
 	}
 	return used != 0, nil
 }
 
-// CanceledPrivatePackages are durable transfer tombstones owed to one attached worker. Replaying
+// CanceledLocalPackages are durable transfer tombstones owed to one attached worker. Replaying
 // them on every claimed session is idempotent and finishes cleanup after a daemon/stream crash.
-func (s *Store) CanceledPrivatePackages(workerID string) ([]Request, *exit.Error) {
+func (s *Store) CanceledLocalPackages(workerID string) ([]Request, *exit.Error) {
 	rows, err := s.db.Query(`SELECT `+requestCols+` FROM requests
-		WHERE state='canceled' AND worker=? AND private_package_digest<>''
+		WHERE state='canceled' AND worker=? AND local_package_digest<>''
 		ORDER BY created_at,id`, workerID)
 	if err != nil {
-		return nil, exit.Internalf("cannot read canceled private package transfers: %s", err)
+		return nil, exit.Internalf("cannot read canceled local package transfers: %s", err)
 	}
 	defer rows.Close()
 	var out []Request
 	for rows.Next() {
 		row, err := scanRequest(rows)
 		if err != nil {
-			return nil, exit.Internalf("cannot scan canceled private package transfer: %s", err)
+			return nil, exit.Internalf("cannot scan canceled local package transfer: %s", err)
 		}
 		out = append(out, row)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, exit.Internalf("cannot finish canceled private package transfers: %s", err)
+		return nil, exit.Internalf("cannot finish canceled local package transfers: %s", err)
 	}
 	return out, nil
 }
@@ -1117,14 +1117,14 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
-		plan_id,package_release,package_revision_digest,private_package_digest,
-		private_package_uploaded_boot_id,environment_digest,config_digest,
+		plan_id,package_release,package_revision_digest,local_package_digest,
+		local_package_uploaded_boot_id,environment_digest,config_digest,
 		payload,outputs,state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,rental,rental_required,install_id,assets,models,
 		weights_outputs)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
-		r.Release, r.PackageRevisionDigest, r.PrivatePackageDigest,
-		r.PrivatePackageUploadedBootID, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
+		r.Release, r.PackageRevisionDigest, r.LocalPackageDigest,
+		r.LocalPackageUploadedBootID, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.NeedsAccelerator, r.Org, r.Trees, r.Worker, r.Rental,
 		r.RentalRequired,
 		nullable(r.InstallID),
@@ -1365,12 +1365,12 @@ func (s *Store) MarkMediaCleaned(requestID string, attempt int64) *exit.Error {
 	return nil
 }
 
-// Accepted records AttemptAccepted's journaled digests. They never move afterwards.
-func (s *Store) Accepted(requestID string, attempt int64, sessionID, planDigest, construction, summary string) *exit.Error {
-	res, err := s.db.Exec(`UPDATE attempts SET state='accepted', plan_digest=?, construction=?,
-		plan_summary=?, accepted_at=?
+// Accepted records queue admission. The plan and construction digests bind at device entry,
+// not here: they arrive on HeldAttempt from RUNNING on (proto-026).
+func (s *Store) Accepted(requestID string, attempt int64, sessionID string) *exit.Error {
+	res, err := s.db.Exec(`UPDATE attempts SET state='accepted', accepted_at=?
 		WHERE request_id=? AND attempt=? AND session_id=? AND state IN ('offered','recovered_open')`,
-		planDigest, construction, summary, now(), requestID, attempt, sessionID)
+		now(), requestID, attempt, sessionID)
 	if err != nil {
 		return exit.Internalf("cannot record acceptance of %s#%d: %s", requestID, attempt, err)
 	}
