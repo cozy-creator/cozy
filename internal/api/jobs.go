@@ -319,7 +319,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		if problem != nil {
 			return out, problem
 		}
-		if problem := launch.ValidatePayload(job, out.Payload); problem != nil {
+		if problem := launch.ValidatePayload(sub.Package, job, out.Payload); problem != nil {
 			return out, problem
 		}
 		out.PlanID, out.Outputs = logical.DescriptorID, logical.Outputs
@@ -365,7 +365,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.WeightsOutputs = job.WeightsOutputs
 		out.NeedsAccelerator = job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
-		if problem := validateJobPayload(job, out.Payload); problem != nil {
+		if problem := validateJobPayload(sub.Package, job, out.Payload); problem != nil {
 			return out, problem
 		}
 	}
@@ -414,7 +414,7 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 		out.PlanID, out.Outputs = job.DescriptorID, job.Outputs
 		out.WeightsOutputs, out.NeedsAccelerator = job.WeightsOutputs, job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
-		if problem := validateJobPayload(job, out.Payload); problem != nil {
+		if problem := validateJobPayload(sub.Package, job, out.Payload); problem != nil {
 			return out, problem
 		}
 	}
@@ -432,8 +432,9 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 	return out, nil
 }
 
-func validateJobPayload(job launch.JobFacts, payload json.RawMessage) *exit.Error {
-	return launch.ValidatePayload(&launch.Entrypoint{Name: job.Name, Request: job.Request}, payload)
+func validateJobPayload(pkg string, job launch.JobFacts, payload json.RawMessage) *exit.Error {
+	return launch.ValidatePayload(pkg,
+		&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request}, payload)
 }
 
 // validOrg keeps the SCRATCH REPO's name spellable. The org is one path segment of

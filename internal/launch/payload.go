@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -126,37 +127,81 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (json.RawMessag
 }
 
 // ValidatePayload checks one already-rendered request object against the exact descriptor
-// schema. It is the API side of the same recorded-schema gate ParsePayload
-// applies while building a CLI payload.
-func ValidatePayload(ep *Entrypoint, payload json.RawMessage) *exit.Error {
+// schema — the daemon-submit half of the same recorded-schema gate ParsePayload applies
+// while building a CLI payload. It fires BEFORE a request row exists or an idempotency
+// key is recorded (cl-105): every offending field is named in ONE typed
+// `request_payload_invalid` refusal whose remedy is the callable's usage line. A
+// descriptor the validator itself cannot read stays a structural refusal: that is a host
+// fault, not a payload fault.
+func ValidatePayload(pkg string, ep *Entrypoint, payload json.RawMessage) *exit.Error {
+	target := ep.Name
+	if pkg != "" {
+		target = pkg + "/" + ep.Name
+	}
+	refuse := func(problems []string) *exit.Error {
+		return exit.Named(exit.Validation, "request_payload_invalid",
+			"%s request payload is invalid: %s", target, strings.Join(problems, "; ")).
+			WithRemedy("%s", UsageLine(target, ep))
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.UseNumber()
 	var document map[string]any
 	if err := decoder.Decode(&document); err != nil || document == nil {
-		return exit.New(exit.Validation, "%s payload is not one JSON object", ep.Name)
+		return refuse([]string{"the payload is not one JSON object"})
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return exit.New(exit.Validation, "%s payload carries trailing JSON", ep.Name)
+		return refuse([]string{"the payload carries trailing JSON"})
 	}
-	fieldsByName := map[string]Field{}
+	var problems []string
+	known := map[string]bool{}
+	var missing []string
 	for _, field := range ep.Request.Fields {
-		fieldsByName[field.Name] = field
+		known[field.Name] = true
 		if field.Wire == "required" {
 			if _, ok := document[field.Name]; !ok {
-				return exit.New(exit.Validation, "%s payload omits required field %q", ep.Name, field.Name)
+				missing = append(missing, strconv.Quote(field.Name))
 			}
 		}
 	}
-	for name, value := range document {
-		field, ok := fieldsByName[name]
-		if !ok {
-			return declared(ep, name)
-		}
-		if problem := validateField(field, value, name); problem != nil {
-			return problem
+	if len(missing) > 0 {
+		problems = append(problems, "missing required "+fieldWord(len(missing))+" "+
+			strings.Join(missing, ", "))
+	}
+	var unknown []string
+	for name := range document {
+		if !known[name] {
+			unknown = append(unknown, strconv.Quote(name))
 		}
 	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		problems = append(problems, "unknown "+fieldWord(len(unknown))+" "+
+			strings.Join(unknown, ", ")+" (it declares: "+
+			strings.Join(ep.RequestFields(), ", ")+")")
+	}
+	for _, field := range ep.Request.Fields {
+		value, ok := document[field.Name]
+		if !ok {
+			continue
+		}
+		if problem := validateField(field, value, field.Name); problem != nil {
+			if problem.Code != exit.Validation {
+				return problem
+			}
+			problems = append(problems, problem.Message)
+		}
+	}
+	if len(problems) > 0 {
+		return refuse(problems)
+	}
 	return nil
+}
+
+func fieldWord(n int) string {
+	if n == 1 {
+		return "field"
+	}
+	return "fields"
 }
 
 func validateField(field Field, value any, path string) *exit.Error {

@@ -300,13 +300,14 @@ type RunExecuteCmd struct {
 	Trees          []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
 	Org            string   `help:"Job publication organization (defaults to local)."`
 	Await          bool     `help:"Wait for the terminal result instead of returning after the short optimistic observation."`
+	Describe       bool     `help:"Print the callable's request contract instead of running it."`
 }
 
 func (c *RunExecuteCmd) Run(r *Runtime) error {
 	args := append([]string{c.Target}, c.Input...)
 	return r.call(handleRunExecute, args, bools(
 		"--stream", c.Stream, "--await", c.Await, "--rental", c.Rental,
-		"--rental-only", c.RentalOnly), values(
+		"--rental-only", c.RentalOnly, "--describe", c.Describe), values(
 		"--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets,
 		"--model", c.Models,

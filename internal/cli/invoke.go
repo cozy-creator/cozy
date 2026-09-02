@@ -79,6 +79,9 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if problem != nil {
 		return unknownFunction(target, descriptor)
 	}
+	if ctx.Inv.Bool("--describe") {
+		return emitDescribe(ctx, target, descriptor, callable)
+	}
 	if callable.Kind != "job" {
 		if len(ctx.Inv.Values["--input"]) > 0 {
 			return exit.Usagef("--input-tree applies only to a job callable")
@@ -1613,6 +1616,43 @@ func newestPackageRelease(releases []hub.ReleaseSummary, majors ...int) (string,
 		return "", exit.New(exit.NotFound, "package has no non-yanked numeric release")
 	}
 	return best, nil
+}
+
+// emitDescribe prints the callable's contract from the descriptor — the SAME facts
+// submit validates the payload against (cl-105/cl-106), rendered by the one contract
+// printer. JSON mode emits the raw request struct verbatim.
+func emitDescribe(ctx *Context, target Target, descriptor *launch.PackageDescriptor,
+	ep *launch.Entrypoint,
+) *exit.Error {
+	if ctx.Mode().JSON {
+		raw, ok := descriptor.RawRequest(ep.Name)
+		if !ok {
+			return exit.Internalf("the descriptor does not carry %s's request struct", ep.Name)
+		}
+		fmt.Fprintln(ctx.Out, string(raw))
+		return nil
+	}
+	fmt.Fprint(ctx.Out, launch.DescribeContract(target.Package+"/"+ep.Name, ep,
+		describeBindings(ctx, target, ep)))
+	return nil
+}
+
+// describeBindings resolves each slot's CURRENT default binding — the same mutable hub
+// pointers a bare run resolves (th-116) — best effort: the contract stays readable
+// offline, with an unreadable default rendered as no default rather than a refusal.
+func describeBindings(ctx *Context, target Target, ep *launch.Entrypoint) map[string]string {
+	if len(ep.Models) == 0 || strings.HasPrefix(target.Package, "local/") {
+		return nil
+	}
+	rows, problem := invocationDefaultBindings(ctx, target)
+	if problem != nil {
+		return nil
+	}
+	out := make(map[string]string, len(rows))
+	for slot, row := range rows {
+		out[slot] = row.Ref()
+	}
+	return out
 }
 
 func emitFunctions(ctx *Context, target Target, descriptor *launch.PackageDescriptor) *exit.Error {

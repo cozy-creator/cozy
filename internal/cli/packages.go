@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -134,33 +133,9 @@ func runExample(inst records.PackageInstall) string {
 	if len(callables) == 0 {
 		return example
 	}
-	ep := callables[0]
-	example += "/" + ep.Name
-	for i := range ep.Request.Fields {
-		if i == 4 {
-			example += " ..."
-			break
-		}
-		field := &ep.Request.Fields[i]
-		var scalar string
-		var typed struct {
-			Asset   string   `json:"asset"`
-			Literal []string `json:"literal"`
-		}
-		switch {
-		case json.Unmarshal(field.Type, &scalar) == nil:
-			example += fmt.Sprintf(" %s=<%s>", field.Name, scalar)
-		case json.Unmarshal(field.Type, &typed) == nil && len(typed.Literal) == 1:
-			example += fmt.Sprintf(" %s=%s", field.Name, typed.Literal[0])
-		case len(typed.Literal) > 1:
-			example += fmt.Sprintf(" %s=<%s>", field.Name, strings.Join(typed.Literal, "|"))
-		case typed.Asset != "":
-			example += fmt.Sprintf(" %s=<%s-file>", field.Name, typed.Asset)
-		default:
-			example += fmt.Sprintf(" %s=...", field.Name)
-		}
-	}
-	return example
+	// The ONE contract printer (launch.UsageLine) renders the hint, the `--describe`
+	// contract, and the submit refusal's remedy from the same descriptor facts.
+	return launch.UsageLine(inst.Package+"/"+callables[0].Name, &callables[0])
 }
 
 func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *install.Result) *exit.Error {

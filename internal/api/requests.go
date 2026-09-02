@@ -559,7 +559,7 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 // validateInputs checks the payload and every local asset against the entrypoint that
 // will run it — the same law for a local install and a rental's frozen descriptor.
 func validateInputs(entrypoint *launch.Entrypoint, out *orchestrator.Submission) *exit.Error {
-	if e := launch.ValidatePayload(entrypoint, out.Payload); e != nil {
+	if e := launch.ValidatePayload(out.Package, entrypoint, out.Payload); e != nil {
 		return e
 	}
 	for index := range out.Assets {
