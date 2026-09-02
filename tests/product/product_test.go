@@ -5,12 +5,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/units"
 )
 
 const localWeightlessRef = "local/cozy-weightless-package"
@@ -41,6 +43,26 @@ func TestProductPath(t *testing.T) {
 	if code, out := runCozy(t, root, "package", "list", "--full", "--json"); code != 0 ||
 		!strings.Contains(out, localWeightlessRef) || !strings.Contains(out, `"source":"local `) {
 		t.Fatalf("package list omitted the install [exit %d]\n%s", code, out)
+	}
+	// Disk is two byte columns: the package's own bytes and its shared dependencies —
+	// integers for a program, binary units for a person.
+	code, out = runCozy(t, root, "package", "list", "--json")
+	var listed struct {
+		Packages []struct {
+			Package      string `json:"package"`
+			Size         int64  `json:"size"`
+			Dependencies int64  `json:"dependencies"`
+		} `json:"packages"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &listed) != nil || len(listed.Packages) != 1 ||
+		listed.Packages[0].Package != localWeightlessRef || listed.Packages[0].Size <= 0 ||
+		listed.Packages[0].Dependencies <= 0 {
+		t.Fatalf("package list --json lacks integer size and dependencies [exit %d]\n%s", code, out)
+	}
+	code, out = runCozy(t, root, "package", "list")
+	if code != 0 || !regexp.MustCompile(`VERSION +SIZE +DEPENDENCIES\n`).MatchString(out) ||
+		!strings.Contains(out, units.Bytes(listed.Packages[0].Size)+"  "+units.Bytes(listed.Packages[0].Dependencies)) {
+		t.Fatalf("package list does not show SIZE and DEPENDENCIES in units [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", localWeightlessRef); code != 0 ||
 		!strings.Contains(out, "- tile") || !strings.Contains(out, "- refuse") {

@@ -365,7 +365,7 @@ cozy package search
 # - cozy/marco-polo-cu130
 # - cozy/marco-polo-launch1
 
-cozy package list --fields package,version,disk
+cozy package list --fields package,version,size
 cozy run list --json
 cozy model search flux --full
 ```
