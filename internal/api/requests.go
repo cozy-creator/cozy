@@ -20,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/resultfiles"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 

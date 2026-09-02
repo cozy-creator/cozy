@@ -24,9 +24,11 @@ const editableRuntimeFixtureSHA = "5f2aea3625ea31c82f82f01ec3510c128411b74c"
 // binary against a real daemon on a real root; the only fixture is the weightless
 // package, which has no weights and so needs no card.
 func TestProductPath(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "editable-refresh")
-	must(t, os.RemoveAll(root))
-	must(t, os.MkdirAll(root, 0o755))
+	// A per-process root: sessions on one box run this suite concurrently, and a shared
+	// fixed path let one run's setup wipe another's mid-flight. Short on purpose — the
+	// daemon's worker socket lives under it and unix socket paths are bounded.
+	root, err := os.MkdirTemp(os.TempDir(), "cozy-product-")
+	must(t, err)
 	t.Cleanup(func() {
 		_, _ = runCozy(t, root, "down", "--all")
 		_ = os.RemoveAll(root)
