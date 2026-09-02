@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"math"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -1112,16 +1111,18 @@ func (c *Orchestrator) abortDispatch(requestID string, attempt uint64, sessionID
 	return cause
 }
 
+// rollbackGrant undoes what minting the grant created. A local serving grant creates
+// nothing — it names the store directory and carries the payload inline — so only a
+// remote reservation or a job's publication stage has anything to roll back.
 func (c *Orchestrator) rollbackGrant(req records.Request, attempt uint64, w *worker) {
 	if w.media != nil {
 		c.cleanupRemote(req.ID, attempt, w)
 		return
 	}
-	path := c.opt.Layout.AttemptDir(req.ID, attempt)
-	if req.IsJob() {
-		path = c.opt.Layout.PublicationStage(req.Org, req.ID, attempt)
+	if !req.IsJob() {
+		return
 	}
-	if err := os.RemoveAll(path); err != nil {
+	if err := os.RemoveAll(c.opt.Layout.PublicationStage(req.Org, req.ID, attempt)); err != nil {
 		c.logf("%s#%d local grant rollback failed: %s", req.ID, attempt, err)
 	}
 }
@@ -1538,25 +1539,21 @@ func modelAccess(req records.Request) []*pb.InputAccess {
 	return rows
 }
 
-// grant builds the LOCAL delivery grant: a payload input, every bound model, and one
-// destination per result field path, under this attempt's own working directory
-// (attempts/<request>/<attempt>). Nothing durable lives there: the payload and every
-// other input sit under `in/`, result files are exported by their content digest into
-// the package's store or the caller's --out, and the directory is reclaimed. There is
-// no credential — a local grant is a CAS root plus a directory, and a fabricated token
-// would be a lie about authority nobody issued.
+// grant builds the LOCAL delivery grant: the payload INLINE, every bound model, every
+// input asset at its immutable store path, and one destination per result field path —
+// the store directory itself (`outputs/<org>-<package>/` or the caller's --out), which
+// the worker names the file in by its content digest, `<sha256>.<ext>`. Nothing is
+// staged on this side and nothing is copied afterwards: the granted directory is where
+// the file lives for good, and the terminal is verified against exactly that name. There
+// is no credential — a local grant is a CAS root plus a directory, and a fabricated
+// token would be a lie about authority nobody issued.
 func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Request) (*pb.DeliveryGrant, *exit.Error) {
-	dir := c.opt.Layout.AttemptDir(requestID, attempt)
-	inDir := filepath.Join(dir, "in")
-	if err := os.MkdirAll(inDir, 0o755); err != nil {
-		return nil, exit.Internalf("cannot create the attempt directory %s: %s", dir, err)
-	}
-	payloadPath := filepath.Join(inDir, "payload")
-	if err := os.WriteFile(payloadPath, req.Payload, 0o644); err != nil {
-		return nil, exit.Internalf("cannot stage the request payload: %s", err)
+	dir, e := c.outputDirectory(req)
+	if e != nil {
+		return nil, e
 	}
 	g := &pb.DeliveryGrant{
-		FileBaseUrl: "file://" + dir,
+		FileBaseUrl: "file://" + dir + "/",
 		// NO EXPIRY, because this host mints no deadline to derive one from. A grant lasts
 		// as long as the attempt it was minted for (cr-009), and the attempt's bound is the
 		// caller's deadline — which `dispatch` never sets, because there is no wire field
@@ -1566,7 +1563,7 @@ func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Reque
 		ExpiresAtUnix: 0,
 		// ACCESS ONLY (#439): the identities (digest, length, media kind) live in the
 		// spec's bindings, inside the invocation digest.
-		Inputs: []*pb.InputAccess{{InputId: "payload", Url: "file://" + payloadPath}},
+		Inputs: []*pb.InputAccess{{InputId: "payload", Url: payloadURL(req.Payload)}},
 	}
 	g.Inputs = append(g.Inputs, modelAccess(req)...)
 	for _, asset := range req.Assets {
@@ -1585,12 +1582,30 @@ func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Reque
 		if e := FenceOutputID(id); e != nil {
 			return nil, e
 		}
-		g.Outputs = append(g.Outputs, &pb.OutputAccess{
-			OutputId: id,
-			Url:      "file://" + filepath.Join(dir, id),
-		})
+		g.Outputs = append(g.Outputs, &pb.OutputAccess{OutputId: id, Url: "file://" + dir + "/"})
 	}
 	return g, nil
+}
+
+// payloadURL is the request document as a `data:` URL: the grant IS the bytes, so a
+// worker on this host reads the payload from the grant and nothing is written to disk
+// to hand it over. The worker still verifies them against the spec's digest and length.
+func payloadURL(payload []byte) string {
+	return "data:application/json;base64," + base64.StdEncoding.EncodeToString(payload)
+}
+
+// outputDirectory is where one serving request's result files live: the directory its
+// export row names (the caller's --out, else the package's store) — the same directory
+// the grant hands the worker and the terminal is verified against.
+func (c *Orchestrator) outputDirectory(req records.Request) (string, *exit.Error) {
+	export, e := c.opt.Store.OutputExportOf(req.ID)
+	if e != nil {
+		return "", e
+	}
+	if export != nil {
+		return export.Directory, nil
+	}
+	return c.opt.Layout.PackageOutputs(req.Package), nil
 }
 
 // Await blocks until the attempt is closed — the terminal accepted, its outputs visible,

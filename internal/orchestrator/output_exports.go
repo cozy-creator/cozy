@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"path/filepath"
+
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/reclaim"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -9,10 +11,11 @@ import (
 )
 
 // RetryOutputExport settles one daemon-owned publication obligation — the package's
-// store under outputs/ or the caller's --out — from the already-verified internal media.
-// It never changes the execution terminal and never trusts a terminal path. Once a
-// serving run's files are published its output rows point at them and the attempt
-// working directory is reclaimed.
+// store under outputs/ or the caller's --out. The files are already there: the grant
+// named that directory, the worker wrote each result under its digest name, and the
+// terminal was verified against exactly those paths. Settling is proving the accepted
+// set matches the pre-execution contract and recording the paths; nothing is copied.
+// It never changes the execution terminal and never trusts a terminal path.
 func (c *Orchestrator) RetryOutputExport(requestID string) {
 	c.mu.Lock()
 	if c.outputExporting[requestID] {
@@ -55,44 +58,35 @@ func (c *Orchestrator) RetryOutputExport(requestID string) {
 		c.failOutputExport(requestID, problem)
 		return
 	}
-	entries, problem := outputExportEntries(*export, outputs)
+	paths, problem := outputExportPaths(*export, outputs)
 	if problem != nil {
 		c.failOutputExport(requestID, problem)
 		return
 	}
-	if problem := c.opt.Store.BeginOutputExport(requestID); problem != nil {
-		if problem.ErrName() != "output_export_not_pending" {
-			c.logf("output export %s could not begin: %s", requestID, problem.Message)
-		}
-		return
-	}
-	paths, problem := resultfiles.Publish(export.Directory, entries)
-	if problem != nil {
-		c.failOutputExport(requestID, problem)
-		return
-	}
-	published := make([]records.PublishedOutput, 0, len(entries))
-	for i, entry := range entries {
-		published = append(published, records.PublishedOutput{
-			OutputID: entry.OutputID, Source: entry.Source, Path: paths[i],
-		})
-	}
-	// A job's files stay in its publication root (its durable plane); a serving attempt's
-	// only durable home is the exported file, so its rows move there.
-	relocate := !request.IsJob()
-	if problem := c.opt.Store.CompleteOutputExport(requestID, published, relocate); problem != nil {
-		c.logf("output export %s reached disk but settlement failed: %s", requestID, problem.Message)
+	if problem := c.opt.Store.CompleteOutputExport(requestID, paths); problem != nil {
+		c.logf("output export %s settlement failed: %s", requestID, problem.Message)
 		return
 	}
 	c.logf("output export %s published %d file(s) under %s", requestID, len(paths), export.Directory)
-	if relocate {
-		c.reclaimAttempts(requestID)
+	c.reclaimTmp(requestID)
+}
+
+// reclaimTmp removes one settled request's `tmp/<id>/` if its writer did not — the
+// backstop, run after an ack and after the export settles; either may come second, and
+// both are safe to repeat.
+func (c *Orchestrator) reclaimTmp(requestID string) {
+	swept, problem := reclaim.Request(c.opt.Layout, c.opt.Store, requestID)
+	if problem != nil {
+		c.logf("tmp reclaim for %s deferred: %s", requestID, problem.Message)
+	}
+	if swept.Removed > 0 {
+		c.logf("tmp reclaim for %s: %s", requestID, units.Bytes(swept.Bytes))
 	}
 }
 
-func outputExportEntries(export records.OutputExport, outputs []records.Output) (
-	[]resultfiles.Entry, *exit.Error,
-) {
+// outputExportPaths proves the accepted outputs are the contracted set, each at the
+// digest name inside the contracted directory, and returns those paths in contract order.
+func outputExportPaths(export records.OutputExport, outputs []records.Output) ([]string, *exit.Error) {
 	if len(export.Outputs) != len(outputs) {
 		return nil, exit.Named(exit.Validation, "output_export_set_mismatch",
 			"output export expects %d files and terminal accepted %d", len(export.Outputs), len(outputs))
@@ -101,7 +95,7 @@ func outputExportEntries(export records.OutputExport, outputs []records.Output) 
 	for _, output := range outputs {
 		accepted[output.OutputID] = output
 	}
-	entries := make([]resultfiles.Entry, 0, len(export.Outputs))
+	paths := make([]string, 0, len(export.Outputs))
 	for _, intended := range export.Outputs {
 		output, ok := accepted[intended.OutputID]
 		if !ok || output.MimeType != intended.MediaType {
@@ -112,12 +106,14 @@ func outputExportEntries(export records.OutputExport, outputs []records.Output) 
 		if problem != nil {
 			return nil, problem
 		}
-		entries = append(entries, resultfiles.Entry{
-			OutputID: output.OutputID, MediaType: output.MimeType, Filename: filename,
-			Source: output.Path, Digest: output.Digest, Length: output.Length,
-		})
+		if want := filepath.Join(export.Directory, filename); output.Path != want {
+			return nil, exit.Named(exit.Conflict, "output_export_contract_mismatch",
+				"accepted output %s is recorded at %s, not at its contracted %s",
+				intended.OutputID, output.Path, want)
+		}
+		paths = append(paths, output.Path)
 	}
-	return entries, nil
+	return paths, nil
 }
 
 func (c *Orchestrator) failOutputExport(requestID string, problem *exit.Error) {
@@ -129,8 +125,8 @@ func (c *Orchestrator) failOutputExport(requestID string, problem *exit.Error) {
 	c.logf("output export %s failed (%s): %s", requestID, problem.ErrName(), problem.Message)
 }
 
-// ResumeOutputExports retries every terminal obligation before the restarted daemon starts
-// serving clients. Exact existing files replay; changed files remain typed conflicts.
+// ResumeOutputExports settles every terminal obligation before the restarted daemon
+// starts serving clients.
 func (c *Orchestrator) ResumeOutputExports() *exit.Error {
 	owed, problem := c.opt.Store.OutputExportsOwed()
 	if problem != nil {
@@ -140,18 +136,4 @@ func (c *Orchestrator) ResumeOutputExports() *exit.Error {
 		c.RetryOutputExport(export.RequestID)
 	}
 	return nil
-}
-
-// reclaimAttempts removes the attempt working directories of one request that nothing
-// references any more: closed, with their result files exported. It runs after an ack
-// and after an export settles; either may come second, and both are safe to repeat.
-func (c *Orchestrator) reclaimAttempts(requestID string) {
-	swept, problem := reclaim.Request(c.opt.Layout, c.opt.Store, requestID)
-	if problem != nil {
-		c.logf("attempt reclaim for %s deferred: %s", requestID, problem.Message)
-	}
-	if swept.Removed > 0 {
-		c.logf("attempt reclaim for %s: %d director(ies), %s", requestID, swept.Removed,
-			units.Bytes(swept.Bytes))
-	}
 }

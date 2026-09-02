@@ -40,14 +40,6 @@ type OutputExportIntent struct {
 	Outputs   []OutputExportEntry `json:"outputs"`
 }
 
-// PublishedOutput is one exported file: the output it carries, the verified source it
-// was copied from, and where it landed.
-type PublishedOutput struct {
-	OutputID string
-	Source   string
-	Path     string
-}
-
 // OutputExport is the durable daemon-owned publication obligation and its settlement.
 type OutputExport struct {
 	RequestID string
@@ -104,8 +96,7 @@ func (s *Store) OutputExportOf(requestID string) (*OutputExport, *exit.Error) {
 	return &row, nil
 }
 
-// OutputExportsOwed is every non-settled export. An `exporting` row means the daemon died
-// mid-copy and is deliberately retried from the exact internal media on restart.
+// OutputExportsOwed is every non-settled export of a request that has ended.
 func (s *Store) OutputExportsOwed() ([]OutputExport, *exit.Error) {
 	rows, err := s.db.Query(`SELECT e.request_id,e.directory,e.outputs,
 		e.state,e.attempts,e.error_code,e.safe_error,e.published_paths,e.updated_at
@@ -142,76 +133,20 @@ func scanOutputExport(row interface{ Scan(...any) error }) (OutputExport, error)
 	return out, err
 }
 
-// BeginOutputExport records an attempt before touching caller-owned disk.
-func (s *Store) BeginOutputExport(requestID string) *exit.Error {
-	result, err := s.db.Exec(`UPDATE request_output_exports SET state='exporting',
-		attempts=attempts+1,error_code='',safe_error='',updated_at=?
-		WHERE request_id=? AND state IN ('pending','exporting','failed')`, now(), requestID)
-	if err != nil {
-		return exit.Internalf("cannot begin output export for %s: %s", requestID, err)
-	}
-	if changed, _ := result.RowsAffected(); changed != 1 {
-		return exit.Named(exit.Conflict, "output_export_not_pending",
-			"output export for %s is not pending or retryable", requestID)
-	}
-	return nil
-}
-
-// CompleteOutputExport settles the row. With relocate, the request's output rows are
-// re-pointed at the exported files in the same transaction: a serving attempt's working
-// directory is then referenced by nothing and can be reclaimed, while the media route
-// keeps serving the same verified bytes from where the user can see them.
-func (s *Store) CompleteOutputExport(requestID string, published []PublishedOutput, relocate bool) *exit.Error {
-	paths := make([]string, 0, len(published))
-	for _, p := range published {
-		paths = append(paths, p.Path)
-	}
+// CompleteOutputExport settles the row with the paths the verified outputs already
+// occupy: the worker wrote each file at its digest name inside the contracted directory
+// and the terminal was accepted against exactly those paths.
+func (s *Store) CompleteOutputExport(requestID string, paths []string) *exit.Error {
 	encoded, err := json.Marshal(paths)
 	if err != nil {
 		return exit.Internalf("cannot encode output export paths: %s", err)
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return exit.Internalf("cannot settle output export for %s: %s", requestID, err)
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`UPDATE request_output_exports SET state='published',
+	if _, err := s.db.Exec(`UPDATE request_output_exports SET state='published',
 		published_paths=?,error_code='',safe_error='',updated_at=? WHERE request_id=?`,
 		string(encoded), now(), requestID); err != nil {
 		return exit.Internalf("cannot settle output export for %s: %s", requestID, err)
 	}
-	if relocate {
-		for _, p := range published {
-			if _, err := tx.Exec(`UPDATE outputs SET path=? WHERE request_id=? AND output_id=? AND path=?`,
-				p.Path, requestID, p.OutputID, p.Source); err != nil {
-				return exit.Internalf("cannot relocate output %s of %s: %s", p.OutputID, requestID, err)
-			}
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot settle output export for %s: %s", requestID, err)
-	}
 	return nil
-}
-
-// AttemptOutputPaths is where one attempt's recorded outputs live right now. The
-// attempt directory reclaim asks it: a path still under the directory is a claim on it.
-func (s *Store) AttemptOutputPaths(requestID string, attempt int64) ([]string, *exit.Error) {
-	rows, err := s.db.Query(`SELECT path FROM outputs WHERE request_id=? AND attempt=?`,
-		requestID, attempt)
-	if err != nil {
-		return nil, exit.Internalf("cannot read the output paths of %s#%d: %s", requestID, attempt, err)
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var path string
-		if err := rows.Scan(&path); err != nil {
-			return nil, exit.Internalf("cannot read an output path: %s", err)
-		}
-		out = append(out, path)
-	}
-	return out, nil
 }
 
 func (s *Store) FailOutputExport(requestID, code, message string) *exit.Error {

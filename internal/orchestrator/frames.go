@@ -20,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/resultfiles"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -1047,23 +1048,19 @@ func (c *Orchestrator) settleRefusedOutcome(s *session, requestID string, ordina
 }
 
 // cleanupAttempt runs only after the outcome's bytes were mirrored, its terminal commit
-// succeeded, and OutcomeAck was sent. The attempt working directory goes as soon as
-// nothing points into it — its staged inputs never outlive the attempt, and its result
-// files have either been exported (rows re-pointed) or are still recorded there, in
-// which case the directory waits for the export to settle. Request assets are dropped
-// only after the final attempt and only when no other live request owns the same
-// content digest.
+// succeeded, and OutcomeAck was sent. A local attempt leaves nothing behind — its result
+// files were written where they live and its inputs were never staged. A remote attempt
+// releases its reservation on the pod. Request assets and the request's `tmp/<id>/` are
+// dropped only after the final attempt (assets only when no other live request owns the
+// same content digest).
 func (c *Orchestrator) cleanupAttempt(req records.Request, attempt uint64, holder *worker, final bool) {
 	if holder != nil && holder.media != nil {
 		c.cleanupRemote(req.ID, attempt, holder)
 	}
-	if err := os.RemoveAll(filepath.Join(c.opt.Layout.AttemptDir(req.ID, attempt), "in")); err != nil {
-		c.logf("%s#%d local attempt input cleanup failed: %s", req.ID, attempt, err)
-	}
-	c.reclaimAttempts(req.ID)
 	if !final {
 		return
 	}
+	c.reclaimTmp(req.ID)
 	c.cleanupRequestAssets(req)
 }
 
@@ -1109,8 +1106,8 @@ func (c *Orchestrator) cleanupRemote(requestID string, attempt uint64, holder *w
 // Every remote Report retries the durable obligations still assigned to that worker.
 // DELETE is idempotent, and media_cleaned stops successful rows from being revisited.
 func (c *Orchestrator) retryMediaCleanup(holder *worker) {
-	// Local workers have no pod media plane. Their attempt directories are removed by
-	// cleanupAttempt; a recovered local snapshot must never try to call a nil client.
+	// Local workers have no pod media plane and leave nothing to clean; a recovered
+	// local snapshot must never try to call a nil client.
 	if holder == nil || holder.media == nil {
 		return
 	}
@@ -1308,20 +1305,27 @@ func (c *Orchestrator) mirrorOutputs(req records.Request, attempt uint64, doc ca
 	holder *worker) ([]records.Output, *exit.Error) {
 	manifest := doc.Sub("output_manifest")
 	list, _ := manifest["outputs"].([]canonical.Value)
-	// WHERE THE RECORD OWNER GRANTED. A serving attempt writes into its own disposable
-	// attempt directory; a job writes into the durable publication root, which is the
-	// same fact stated at the other end of the same grant.
-	dir := c.opt.Layout.AttemptDir(req.ID, attempt)
+	// WHERE THE RECORD OWNER GRANTED. A serving attempt writes into the store directory —
+	// the package's own or the caller's --out — under the file's digest name; a job writes
+	// into its publication stage, which is the same fact stated at the other end of the
+	// same grant.
+	var dir string
 	if req.IsJob() {
 		// Where the orchestrator GRANTED: an attempt in flight writes into its stage, and
 		// `promote` rewrites these paths when the bundle crosses into the publication.
 		dir = c.opt.Layout.PublicationStage(req.Org, req.ID, attempt)
+	} else {
+		var e *exit.Error
+		if dir, e = c.outputDirectory(req); e != nil {
+			return nil, e
+		}
 	}
 	// AND WHERE THE BYTES ACTUALLY ARE. For a pod attempt the granted destination is a
 	// directory on the pod, so "mirror" stops being a figure of speech: each declared
-	// output is FETCHED over the pod's media plane and landed here first. Everything after
-	// that is the local law unchanged — the bytes are at the path, their length and digest
-	// are recomputed here, and an output that cannot be shown is never acked.
+	// output is FETCHED over the pod's media plane and landed at its final name here.
+	// Everything after that is the local law unchanged — the bytes are at the path, their
+	// length and digest are recomputed here, and an output that cannot be shown is never
+	// acked.
 	if holder != nil && holder.media != nil {
 		if e := c.fetchOutputs(req, attempt, list, dir, holder); e != nil {
 			return nil, e
@@ -1336,7 +1340,7 @@ func (c *Orchestrator) mirrorOutputs(req records.Request, attempt uint64, doc ca
 		}
 		e := canonical.Doc(entry)
 		id := e.Str("output_id")
-		path, problem := outputDest(req, dir, id)
+		path, problem := outputDest(req, dir, e)
 		if problem != nil {
 			return nil, problem
 		}
@@ -1381,15 +1385,22 @@ func (c *Orchestrator) mirrorOutputs(req records.Request, attempt uint64, doc ca
 }
 
 // outputDest resolves where one declared output may land: a job's publication fence, or
-// a serving attempt's single-element id under its attempt directory.
-func outputDest(req records.Request, dir, id string) (string, *exit.Error) {
+// a serving result's digest name inside the granted store directory. The name is
+// recomputed HERE from the manifest's own digest and media type — the same closed
+// projection the worker used — so a terminal never names a path; it names bytes.
+func outputDest(req records.Request, dir string, entry canonical.Doc) (string, *exit.Error) {
+	id := entry.Str("output_id")
 	if req.IsJob() {
 		return publicationDest(dir, id)
 	}
 	if e := FenceOutputID(id); e != nil {
 		return "", e
 	}
-	return filepath.Join(dir, id), nil
+	name, e := resultfiles.Filename(entry.Str("digest"), entry.Str("mime_type"))
+	if e != nil {
+		return "", e
+	}
+	return filepath.Join(dir, name), nil
 }
 
 // fetchOutputs pulls one remote attempt's declared outputs across the pod's media plane
@@ -1416,7 +1427,7 @@ func (c *Orchestrator) fetchOutputs(req records.Request, attempt uint64,
 			continue
 		}
 		id := canonical.Doc(entry).Str("output_id")
-		destination, e := outputDest(req, dir, id)
+		destination, e := outputDest(req, dir, canonical.Doc(entry))
 		if e != nil {
 			return e
 		}

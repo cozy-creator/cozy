@@ -82,7 +82,7 @@ class RelayInput(msgspec.Struct, forbid_unknown_fields=True):
 
 
 class RelayOutput(msgspec.Struct):
-    image: ImageAsset
+    image: Annotated[ImageAsset, AssetBound(media_types=("image/webp",))]
 
 
 @app.entrypoint
@@ -148,7 +148,9 @@ def relay(
         time.sleep(step / 1_000)
         remaining -= step
     image = decoder.decode_image(payload.image)
-    return RelayOutput(image=out.save_image(ImageFrame(image.width, image.height, image.rgb)))
+    return RelayOutput(
+        image=out.save_image(ImageFrame(image.width, image.height, image.rgb), format="webp")
+    )
 
 
 @app.entrypoint
