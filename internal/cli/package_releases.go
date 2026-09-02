@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -68,11 +67,6 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	}); problem != nil {
 		return problem
 	}
-	if problem := packagePublishStage(ctx, "Deriving evidence for declared model pairs", func() *exit.Error {
-		return pack.DeriveEvidence(hctx, account.Name, deriveInputResolver(c))
-	}); problem != nil {
-		return problem
-	}
 	declared, registry, locals, problem := packageDeclaration(pack)
 	if problem != nil {
 		return problem
@@ -122,15 +116,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		{K: "release_digest", V: done.ReleaseDigest},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}
-	if len(pack.SlotFacts) > 0 {
-		fields = append(fields, output.Field{K: "slot_facts", V: strings.Join(pack.SlotFacts, ",")})
-	}
 	record := compactRecord(fields, "package", "release", "status")
-	for _, class := range pack.SlotFactsSkipped {
-		record.Notes = append(record.Notes, fmt.Sprintf(
-			"slot class %s has no complete [bindings] default (model/release/lane); no slot facts derived — preflight cannot grade it",
-			class))
-	}
 	for _, dependency := range pack.Vendored {
 		record.Notes = append(record.Notes, packagepublish.VendoredNote(account.Name, dependency))
 	}
@@ -167,36 +153,6 @@ func handlePackageYank(ctx *Context) *exit.Error {
 	}, "package", "release", "status"))
 }
 
-// deriveInputResolver turns one fully named default binding — model, release,
-// lane — into the slot-facts run's exact construction seed through the hub's
-// derive-inputs read.
-func deriveInputResolver(c *hub.Client) packagepublish.SeedResolver {
-	return func(ctx context.Context, model, release, lane string) (packagepublish.DeriveInput, *exit.Error) {
-		ref, problem := hub.ParseRef(model)
-		if problem != nil {
-			return packagepublish.DeriveInput{}, problem.
-				WithRemedy("bind the slot as [bindings] model/release/lane in package.toml")
-		}
-		resolved, problem := c.ModelDeriveInputs(ctx, ref, release, lane)
-		if problem != nil {
-			return packagepublish.DeriveInput{}, problem
-		}
-		configBytes, err := base64.StdEncoding.DecodeString(resolved.ConfigBase64)
-		if err != nil || int64(len(configBytes)) != resolved.ConfigLength {
-			return packagepublish.DeriveInput{}, exit.Named(exit.Structural,
-				"hub.derive_inputs_invalid", "Tensorhub returned invalid derive inputs for %s", model)
-		}
-		sum := sha256.Sum256(configBytes)
-		if resolved.ConfigDigest != "sha256:"+hex.EncodeToString(sum[:]) {
-			return packagepublish.DeriveInput{}, exit.Named(exit.Conflict,
-				"hub.derive_inputs_invalid", "derive-input config bytes do not match their digest")
-		}
-		return packagepublish.DeriveInput{Snapshot: resolved.Snapshot,
-			ConfigDigest: resolved.ConfigDigest, ConfigBytes: configBytes,
-			Variants: resolved.HardwareVariants}, nil
-	}
-}
-
 // packageDeclaration renders the complete digest declaration: every local
 // subject hashed here, plus the registry rows the hub fetches itself.
 func packageDeclaration(pack *packagepublish.Package) (
@@ -211,17 +167,12 @@ func packageDeclaration(pack *packagepublish.Package) (
 	for _, dependency := range pack.DependencyWheels {
 		locals[dependency.Filename] = dependency.Path
 	}
-	for path, local := range pack.Evidence {
-		locals[path] = local
-	}
 	kindOf := func(path string) string {
 		switch {
 		case path == "project.whl":
 			return "project_wheel"
 		case path == "descriptor.json":
 			return "descriptor"
-		case strings.HasPrefix(path, "evidence/"):
-			return "derive_evidence"
 		case strings.HasSuffix(path, ".whl") && !strings.Contains(path, "/"):
 			return "dependency_wheel"
 		}

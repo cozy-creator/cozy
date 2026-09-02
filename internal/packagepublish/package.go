@@ -42,9 +42,6 @@ type Package struct {
 	DependencyWheels []DependencyWheel
 	Vendored         []VendoredDependency // auto-vendored local deps, for the publish nudge (th-113)
 	Registry         []RegistryRow        // locked registry rows; Tensorhub fetches (cl-078)
-	Evidence         map[string]string    // envelope-relative path -> local path
-	SlotFacts        []string             // slot classes with derived facts (cr-077)
-	SlotFactsSkipped []string             // slot classes with no complete default binding
 	Tree             string
 	Root             string // disposable wheel output, empty until Build
 	Name             string
