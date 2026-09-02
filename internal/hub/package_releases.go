@@ -166,9 +166,13 @@ func packagePublishPath(ref Ref, release string) string {
 func (c *Client) DeclarePackageRelease(ctx context.Context, ref Ref, release string,
 	files []PackageDeclaredFile, reason string) (PackageReleaseDraft, *exit.Error) {
 	var out PackageReleaseDraft
+	// patient: the grant answers one store HEAD per declared subject — work
+	// bounded by the declaration itself, not by a wall clock. A 174-file
+	// declaration against remote object custody exceeded the 10s header clock.
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packagePublishPath(ref, release), auth: true, reason: reason,
-		body: map[string]any{"files": files}, strict: true, responseBytes: 16 << 20}, &out)
+		body: map[string]any{"files": files}, patient: true, strict: true,
+		responseBytes: 16 << 20}, &out)
 	return out, e
 }
 
