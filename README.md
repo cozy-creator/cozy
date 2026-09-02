@@ -285,6 +285,10 @@ cozy down --all   # cancel all work, end all rentals, then stop the daemon
 None of them deletes installed package or model bytes. A failed partial `down --all` leaves the
 daemon running so cancellation and paid-resource reconciliation can continue.
 
+The daemon's own words — the orchestrator's frame-by-frame account — are in
+`$COZY_HOME/daemon.log`, rotated once at 32 MiB (`daemon.log.1`). `cozy daemon log` prints it;
+`cozy daemon log -f` follows it.
+
 The daemon also leaves on its own once it has had nothing to manage for `daemon.idle_shutdown_s`
 (default 900): no rental it owns, no request or attempt it owes, no transfer, export, launch or
 teardown in flight, no event stream attached. User interaction is not the signal, and an idle

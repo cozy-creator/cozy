@@ -24,7 +24,7 @@ func TestDaemonIdleShutdown(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName),
 		[]byte("daemon:\n  idle_shutdown_s: 1\n"), 0o600))
 	probe := config.Config{Home: root, Port: config.DefaultPort}
-	logPath := filepath.Join(root, "daemon-test.log")
+	logPath := filepath.Join(root, "daemon.log")
 
 	// (a) Nothing to manage: the daemon says so, leaves cleanly, and releases the root.
 	idle := startDaemonProcess(t, root)
@@ -97,7 +97,7 @@ func awaitDaemonExit(t *testing.T, s *daemonProcess, within time.Duration) int {
 	case code := <-s.exited:
 		return code
 	case <-time.After(within):
-		t.Fatalf("the daemon did not leave within %s\n%s", within, tail(filepath.Join(s.root, "daemon-test.log")))
+		t.Fatalf("the daemon did not leave within %s\n%s", within, tail(filepath.Join(s.root, "daemon.log")))
 		return -1
 	}
 }

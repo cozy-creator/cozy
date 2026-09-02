@@ -15,6 +15,19 @@ type CLI struct {
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
 	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
 	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
+	Daemon  DaemonCmd  `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
+}
+
+type DaemonCmd struct {
+	Log DaemonLogCmd `cmd:"" help:"Print the cozy-daemon log ($COZY_HOME/daemon.log)."`
+}
+
+type DaemonLogCmd struct {
+	Follow bool `short:"f" help:"Keep printing as the daemon writes."`
+}
+
+func (c *DaemonLogCmd) Run(r *Runtime) error {
+	return r.call(handleDaemonLog, nil, bools("--follow", c.Follow), nil, false)
 }
 
 type AuthCmd struct {

@@ -68,6 +68,10 @@ type Layout struct {
 	// PrivatePackages holds exact ephemeral wheel revisions for rented local-package commands.
 	// It is Creator-private staging, never a catalog or mutable checkout.
 	PrivatePackages string
+	// Log is the Cozy daemon's own log: the orchestrator's words and the process's
+	// banner, bounded by rotation on an observed size (internal/daemon.OpenLog). Its one
+	// rotated predecessor is Log + ".1". Read with `cozy daemon log`.
+	Log string
 }
 
 func Open(root string) (Layout, *exit.Error) {
@@ -102,6 +106,7 @@ func Open(root string) (Layout, *exit.Error) {
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
 	l.PrivatePackages = filepath.Join(root, "private-packages")
+	l.Log = filepath.Join(root, "daemon.log")
 	for _, dir := range []string{l.Installs, l.Workers, l.Attempts, l.Outputs, l.Triage, l.Publications} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)

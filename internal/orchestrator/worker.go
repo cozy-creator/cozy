@@ -472,6 +472,10 @@ type worker struct {
 	latchedFault         string
 	latchedFaultRevision uint64
 	latchedFaultReports  int
+	// refused is, per attempt this worker holds, the outcome this owner could not honour
+	// and how many consecutive worker reports have restated it unchanged
+	// (observeRefusedOutcome).
+	refused map[string]*refusedOutcome
 	// lastReport is telemetry only. Elapsed time since it never settles or retires work.
 	lastReport time.Time
 	// LRU is dispatch-based, not report-based: reports say the worker lives, while an
@@ -1193,6 +1197,7 @@ func newWorker(instanceID string, spec WorkerLaunchSpec) *worker {
 		materializable:   map[string]bool{},
 		remotePlacements: map[string]DesiredPlacement{},
 		observedRemote:   map[string]remotePlacementObservation{},
+		refused:          map[string]*refusedOutcome{},
 		stopped:          make(chan struct{}),
 		attachDone:       make(chan struct{}),
 	}

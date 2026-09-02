@@ -3,6 +3,8 @@ package producttest
 import (
 	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -175,6 +177,59 @@ func TestWorkerRefusals(t *testing.T) {
 	if outputs, e := o.store.VisibleOutputs(requestC); e != nil || len(outputs) != 0 {
 		t.Errorf("the refused terminal exposed outputs: %d (%s)", len(outputs), briefly(e))
 	}
+	// A REFUSED OUTCOME SETTLES (cl-096). The worker holds the journaled outcome and restates
+	// it as a held row pending ack on every report; on StillFactor reports carrying it
+	// unchanged the owner fails the request typed, closes the attempt under the worker's
+	// own outcome identity, and acks so the worker drops it. Counted, never timed.
+	resultC, e := o.c.AwaitSettled(requestC, 60*time.Second)
+	if e == nil || e.ErrName() != "worker.outcome_refused" ||
+		!strings.Contains(e.Message, "omits granted output") {
+		t.Fatalf("the restated refused outcome did not settle typed: %s", briefly(e))
+	}
+	line, ok := waitEvent(o, "restated unchanged on 8 consecutive reports", 5*time.Second)
+	if !ok {
+		t.Error("no verdict line counted the worker's reports")
+	} else {
+		t.Logf("%s", trimLog(line))
+	}
+	if n := countEvents(o, "REFUSED: the terminal omits granted output \"image\""); n != 1 {
+		t.Errorf("%d refusal lines, wanted exactly 1: the held row restates, it is not re-refused", n)
+	}
+	rowC, e = o.store.AttemptRow(requestC, int64(attemptC))
+	fatal(t, e)
+	if rowC.State != "closed" || rowC.TerminalStatus != "FAILED" ||
+		rowC.TerminalCause != "worker.outcome_refused" || rowC.TerminalID == "" {
+		t.Errorf("the settled attempt row is %s/%s/%s id=%q", rowC.TerminalStatus,
+			rowC.TerminalCause, rowC.State, rowC.TerminalID)
+	}
+	if resultC == nil || resultC.Status != "FAILED" || len(resultC.Outputs) != 0 {
+		t.Errorf("the settled result is %#v", resultC)
+	}
+	if req, _ := o.store.RequestRow(requestC); req == nil || req.State != "failed" {
+		t.Errorf("the request row did not fail: %#v", req)
+	}
+	if line, ok := waitWorkerLog(o, instanceC, "the ack names held outcome", 10*time.Second); !ok {
+		t.Error("the worker never saw the ack that lets it drop the held outcome")
+	} else {
+		t.Logf("%s", line)
+	}
+}
+
+// waitWorkerLog watches one spawned worker's own log for a line: the peer's words about
+// what the owner sent it, never the owner's inference.
+func waitWorkerLog(o *owner, instanceID, substr string, timeout time.Duration) (string, bool) {
+	path := filepath.Join(o.l.WorkerDir(instanceID), "worker.log")
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		data, _ := os.ReadFile(path)
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.Contains(line, substr) {
+				return line, true
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return "", false
 }
 
 // TestDroppedOutcomeAck is the convergence half of the same contract. A worker whose

@@ -184,7 +184,7 @@ func TestLocalAPIDoor(t *testing.T) {
 	if info.Mode().Perm() != 0o600 {
 		t.Errorf("the CLI credential file is %v, wanted 0600", info.Mode().Perm())
 	}
-	log, _ := os.ReadFile(filepath.Join(root, "daemon-test.log"))
+	log, _ := os.ReadFile(filepath.Join(root, "daemon.log"))
 	if strings.Contains(string(log), svc.token) {
 		t.Error("the daemon's own log contains the credential")
 	}
