@@ -275,6 +275,31 @@ pub fn cmd_repo_list(root: &Path, flags: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+pub fn cmd_repo_usage(root: &Path, flags: &Flags) -> ExitCode {
+    let Some(rows) = flag(flags, "rows") else {
+        eprintln!("--rows <jsonl> is required");
+        return ExitCode::from(2);
+    };
+    let usage = match Store::open(root)
+        .and_then(|_| Census::open(root))
+        .and_then(|census| census.usage())
+    {
+        Ok(usage) => usage,
+        Err(error) => return bail(error),
+    };
+    if let Err(error) = storage::write_json_lines(Path::new(rows), &usage.json_lines()) {
+        return bail(error);
+    }
+    println!(
+        "{} repos: {} bytes referenced, {} bytes unique, {} bytes unreferenced",
+        usage.repos.len(),
+        usage.bytes_total,
+        usage.bytes_unique_sum,
+        usage.bytes_unreferenced
+    );
+    ExitCode::SUCCESS
+}
+
 pub fn cmd_repo_get(root: &Path, org: &str, name: &str, flags: &Flags) -> ExitCode {
     let Some(output) = flag(flags, "out") else {
         eprintln!("--out <current.json> is required");

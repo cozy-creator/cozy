@@ -901,6 +901,56 @@ impl Census {
         Ok(plan)
     }
 
+    /// The byte plane per repository: what each repository's retained checkpoints reach
+    /// (`bytes_total`) and what deleting only that repository would free (`bytes_unique`).
+    /// The closure is the one `gc_plan` keeps alive — manifest entries plus the CozyTensors
+    /// header's configs, assets and tensor segments — so `bytes_unique` is exactly the blob
+    /// bytes a later `gc plan` would list once that repository is gone. Manifests are not
+    /// counted, and a blob listed at several paths counts once per repository.
+    pub fn usage(&self) -> Result<StoreUsage> {
+        let mut closures = Vec::with_capacity(self.repositories.len());
+        let mut holders: BTreeMap<String, (u64, usize)> = BTreeMap::new();
+        for (repository, _) in &self.repositories {
+            let mut blobs = BTreeMap::new();
+            for checkpoint in &repository.checkpoints {
+                let (manifest, _) = self.manifest(&checkpoint.manifest)?;
+                for object in self.manifest_blob_refs(manifest, &checkpoint.manifest)? {
+                    blobs.insert(object.sha256, object.length);
+                }
+            }
+            for (sha256, length) in &blobs {
+                holders.entry(sha256.clone()).or_insert((*length, 0)).1 += 1;
+            }
+            closures.push((repository, blobs));
+        }
+        let mut usage = StoreUsage {
+            bytes_total: holders.values().map(|(length, _)| length).sum(),
+            bytes_unique_sum: 0,
+            bytes_unreferenced: self
+                .inventory
+                .values()
+                .filter(|entry| !holders.contains_key(&entry.sha256))
+                .map(|entry| entry.length)
+                .sum(),
+            repos: Vec::with_capacity(closures.len()),
+        };
+        for (repository, blobs) in closures {
+            let bytes_unique = blobs
+                .iter()
+                .filter(|(sha256, _)| holders[*sha256].1 == 1)
+                .map(|(_, length)| length)
+                .sum();
+            usage.bytes_unique_sum += bytes_unique;
+            usage.repos.push(RepositoryUsage {
+                org: repository.repo.org.clone(),
+                name: repository.repo.name.clone(),
+                bytes_total: blobs.values().sum(),
+                bytes_unique,
+            });
+        }
+        Ok(usage)
+    }
+
     fn manifest(&self, reference: &ObjectRef) -> Result<&(Manifest, Vec<u8>)> {
         let found = self
             .manifests
@@ -1055,6 +1105,51 @@ fn insert_ref(
             target.insert(object.sha256.clone(), (kind, object.clone()));
             Ok(())
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryUsage {
+    pub org: String,
+    pub name: String,
+    pub bytes_total: u64,
+    pub bytes_unique: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreUsage {
+    /// Bytes of the union of every blob some repository reaches.
+    pub bytes_total: u64,
+    pub bytes_unique_sum: u64,
+    /// Verified blobs in the store that no retained manifest reaches.
+    pub bytes_unreferenced: u64,
+    pub repos: Vec<RepositoryUsage>,
+}
+
+impl StoreUsage {
+    /// One `kind: "repo"` row per repository in census order, then one `kind: "store"` row.
+    pub fn json_lines(&self) -> Vec<Vec<u8>> {
+        let mut lines: Vec<Vec<u8>> = self
+            .repos
+            .iter()
+            .map(|repo| {
+                crate::canon::write(&Value::obj(vec![
+                    ("bytes_total", Value::uint(repo.bytes_total)),
+                    ("bytes_unique", Value::uint(repo.bytes_unique)),
+                    ("kind", Value::str("repo")),
+                    ("name", Value::str(repo.name.clone())),
+                    ("org", Value::str(repo.org.clone())),
+                ]))
+            })
+            .collect();
+        lines.push(crate::canon::write(&Value::obj(vec![
+            ("bytes_total", Value::uint(self.bytes_total)),
+            ("bytes_unique_sum", Value::uint(self.bytes_unique_sum)),
+            ("bytes_unreferenced", Value::uint(self.bytes_unreferenced)),
+            ("kind", Value::str("store")),
+            ("repos", Value::uint(self.repos.len() as u64)),
+        ])));
+        lines
     }
 }
 
@@ -1745,6 +1840,167 @@ mod tests {
             .gc_plan(&[])
             .unwrap()
             .is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// One segment-backed model per repository. `own` differs per repository; `shared` is
+    /// the same 300 bytes in both, so its one segment blob is reached from two headers.
+    fn segmented_model(store: &Store, own: u8) -> (ObjectRef, u64) {
+        let spec = crate::registry::seeds()
+            .into_iter()
+            .find(|seed| seed.alias == "plain/1")
+            .unwrap()
+            .spec;
+        let encoding = spec.object_id();
+        let tensor = |bytes: &[u8]| Tensor {
+            dtype: Dtype::F32,
+            shape: vec![75],
+            encoding: encoding.clone(),
+            parts: vec![("value".into(), Part::plan(Dtype::F32, vec![75], bytes))],
+        };
+        let shared_bytes = [7u8; 300];
+        let own_bytes = [own; 300];
+        let mut model_bytes = 0;
+        for bytes in [&shared_bytes[..], &own_bytes[..]] {
+            store
+                .put_stream(
+                    &mut &bytes[..],
+                    Some(&ObjectRef::of(bytes)),
+                    &Fault::default(),
+                )
+                .unwrap();
+            model_bytes += bytes.len() as u64;
+        }
+        let header = Header {
+            configs: Vec::new(),
+            assets: Vec::new(),
+            encodings: vec![spec],
+            components: vec![(
+                "model".into(),
+                vec![
+                    ("own".into(), tensor(&own_bytes)),
+                    ("shared".into(), tensor(&shared_bytes)),
+                ],
+            )],
+        };
+        header.validate(&Closure::default()).unwrap();
+        let header_bytes = header.canonical_bytes().unwrap();
+        let header_ref = store
+            .put_stream(
+                &mut header_bytes.as_slice(),
+                Some(&ObjectRef::of(&header_bytes)),
+                &Fault::default(),
+            )
+            .unwrap()
+            .obj;
+        model_bytes += header_ref.length;
+        // The shared segment is also an ordinary file, at two paths: a blob counts once per
+        // repository however many paths list it.
+        let manifest = Draft {
+            entries: vec![
+                (
+                    "copy/shared.bin".into(),
+                    Entry::File(ObjectRef::of(&shared_bytes)),
+                ),
+                ("model.cozytensors".into(), Entry::CozyTensors(header_ref)),
+                (
+                    "shared.bin".into(),
+                    Entry::File(ObjectRef::of(&shared_bytes)),
+                ),
+            ],
+        }
+        .seal()
+        .unwrap();
+        (store.put_manifest(&manifest).unwrap().obj, model_bytes)
+    }
+
+    #[test]
+    fn usage_counts_each_repo_closure_once_and_unique_bytes_are_what_gc_reclaims() {
+        let root = temporary("usage");
+        let _ = fs::remove_dir_all(&root);
+        let store = Store::init(&root).unwrap();
+        let alpha = RepositoryName::new("org", "alpha").unwrap();
+        let beta = RepositoryName::new("org", "beta").unwrap();
+        let (alpha_manifest, alpha_bytes) = segmented_model(&store, 1);
+        let (beta_manifest, beta_bytes) = segmented_model(&store, 2);
+        apply_release(
+            &store,
+            None,
+            &release_mutation(&alpha, "1.0.0", "cpu", &alpha_manifest, 0),
+        )
+        .unwrap();
+        apply_release(
+            &store,
+            None,
+            &release_mutation(&beta, "1.0.0", "cpu", &beta_manifest, 0),
+        )
+        .unwrap();
+        let orphan = [9u8; 1000];
+        store
+            .put_stream(
+                &mut &orphan[..],
+                Some(&ObjectRef::of(&orphan)),
+                &Fault::default(),
+            )
+            .unwrap();
+
+        let usage = Census::open(&root).unwrap().usage().unwrap();
+        let shared = 300;
+        assert_eq!(
+            usage.repos,
+            vec![
+                RepositoryUsage {
+                    org: "org".into(),
+                    name: "alpha".into(),
+                    bytes_total: alpha_bytes,
+                    bytes_unique: alpha_bytes - shared,
+                },
+                RepositoryUsage {
+                    org: "org".into(),
+                    name: "beta".into(),
+                    bytes_total: beta_bytes,
+                    bytes_unique: beta_bytes - shared,
+                },
+            ]
+        );
+        assert_eq!(usage.bytes_total, alpha_bytes + beta_bytes - shared);
+        assert_eq!(
+            usage.bytes_unique_sum,
+            alpha_bytes + beta_bytes - 2 * shared
+        );
+        assert_eq!(usage.bytes_unreferenced, orphan.len() as u64);
+        let lines = usage.json_lines();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            String::from_utf8(lines[2].clone()).unwrap(),
+            format!(
+                "{{\"bytes_total\":{},\"bytes_unique_sum\":{},\"bytes_unreferenced\":1000,\"kind\":\"store\",\"repos\":2}}",
+                usage.bytes_total, usage.bytes_unique_sum
+            )
+        );
+
+        // Deleting alpha reclaims exactly its unique bytes plus what was already unreferenced.
+        let alpha_document = fs::read(store.repository_path(&alpha)).unwrap();
+        store
+            .apply_repository(
+                Some(&alpha_document),
+                &Mutation::DeleteRepository { repo: alpha },
+                &Fault::default(),
+            )
+            .unwrap();
+        let after = Census::open(&root).unwrap();
+        let reclaimed: u64 = after
+            .gc_plan(&[])
+            .unwrap()
+            .iter()
+            .filter(|row| row.kind == "blob")
+            .map(|row| row.length)
+            .sum();
+        assert_eq!(reclaimed, usage.repos[0].bytes_unique + orphan.len() as u64);
+        let after_usage = after.usage().unwrap();
+        assert_eq!(after_usage.repos.len(), 1);
+        assert_eq!(after_usage.repos[0].bytes_unique, beta_bytes);
+        assert_eq!(after_usage.bytes_unreferenced, reclaimed);
         let _ = fs::remove_dir_all(root);
     }
 }
