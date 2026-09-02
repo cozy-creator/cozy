@@ -205,6 +205,14 @@ func (h *fakeRentalHub) add(id, machine string) {
 	}
 }
 
+// setRate moves one rental's served hourly rate, the way Tensorhub does when a
+// readback reconciles the quote to the provider's actual billed total (th-120).
+func (h *fakeRentalHub) setRate(id string, usdMicros int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.rentals[id]["hourly_rate_usd_micros"] = usdMicros
+}
+
 func (h *fakeRentalHub) releases(id string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
