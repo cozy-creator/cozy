@@ -264,7 +264,11 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		return records.Rental{}, remote, false, exit.New(exit.Canceled,
 			"rental %s was acquired after model transfer cancellation", remote.ID)
 	}
-	if remote.HourlyRateUSDMicros != hourlyRateUSDMicros {
+	// A fresh acceptance must lock the catalog quote the renter agreed to; a
+	// replayed ask for a rental already acquiring may answer with the hub's
+	// reconciled BILLED rate (th-120), and that is truth to adopt, never a
+	// reason to destroy a working pod.
+	if remote.State == "pending_acquisition" && remote.HourlyRateUSDMicros != hourlyRateUSDMicros {
 		_ = st.AdvanceRentalOperation(operationKey, remote.ID, hub.RentalReleaseRequested)
 		hctx, cancel := hub.Context()
 		_ = c.Release(hctx, remote.ID, "locked Cozy retail rate changed")
@@ -309,10 +313,10 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 			return exit.Named(exit.Conflict, "rental.machine_name_changed",
 				"rental %s changed its name from %s to %s", seen.ID, row.MachineName, seen.Name)
 		}
-		if seen.HourlyRateUSDMicros != row.HourlyRateUSDMicros {
-			return exit.Named(exit.Conflict, "rental.hourly_rate_changed",
-				"rental %s changed its Cozy retail hourly rate from %d to %d USD micros",
-				seen.ID, row.HourlyRateUSDMicros, seen.HourlyRateUSDMicros)
+		// The hub's rate is the provider's reconciled billed total once the
+		// pod is read back (th-120); the row and burn line adopt it.
+		if seen.HourlyRateUSDMicros > 0 {
+			row.HourlyRateUSDMicros = seen.HourlyRateUSDMicros
 		}
 		row.Address, row.State = seen.Address, seen.State
 		row.MediaAddress = seen.MediaAddress

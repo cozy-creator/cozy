@@ -496,9 +496,10 @@ func (m *managedRentals) reconcileLocked() *exit.Error {
 			}
 			return observed
 		}
-		if remote.HourlyRateUSDMicros != row.HourlyRateUSDMicros {
-			return exit.Named(exit.Conflict, "rental.hourly_rate_changed",
-				"rental %s changed its locked Cozy retail rate", row.ID)
+		// Adopt the hub's reconciled billed rate (th-120): the burn this host
+		// reports and caps on must be what the provider actually charges.
+		if remote.HourlyRateUSDMicros > 0 {
+			row.HourlyRateUSDMicros = remote.HourlyRateUSDMicros
 		}
 		if remote.State == hub.RentalReleased {
 			m.forgetIdleLocked(row.ID)

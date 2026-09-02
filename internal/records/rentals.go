@@ -400,6 +400,10 @@ func RentalReadyState(state string) bool { return state == "ready" || state == "
 // id is the hub's, not this host's: re-reading a rental that moved from acquisition to
 // ready must land on the same row rather than accumulate one per poll. State only moves
 // forward: a delayed poll answering `acquiring` after `ready` was recorded is stale.
+//
+// The hourly rate ADOPTS the hub's answer (th-120): once the hub reconciles a rental to
+// the provider's actual billed total — GPU plus storage adders — every later read serves
+// that figure, and this host's row and burn line must say it too, never a cached quote.
 func (s *Store) RecordRental(r Rental) *exit.Error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -468,7 +472,8 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		ON CONFLICT(id) DO UPDATE SET
 		  machine_name=CASE WHEN rentals.machine_name<>'' THEN rentals.machine_name ELSE excluded.machine_name END,
 		  sku=CASE WHEN rentals.sku<>'' THEN rentals.sku ELSE excluded.sku END,
-		  hourly_rate_usd_micros=rentals.hourly_rate_usd_micros,
+		  hourly_rate_usd_micros=CASE WHEN excluded.hourly_rate_usd_micros>0
+		    THEN excluded.hourly_rate_usd_micros ELSE rentals.hourly_rate_usd_micros END,
 		  managed_request_id=rentals.managed_request_id,
 		  address=CASE WHEN rentals.address<>'' THEN rentals.address ELSE excluded.address END,
 		  cert_path=CASE WHEN rentals.cert_path<>'' THEN rentals.cert_path ELSE excluded.cert_path END,
@@ -489,7 +494,8 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		return exit.Internalf("cannot read back rental %s: %s", r.ID, err)
 	}
 	if stored.MachineName != r.MachineName || stored.SKU != r.SKU ||
-		stored.HourlyRateUSDMicros != r.HourlyRateUSDMicros || stored.ManagedRequestID != r.ManagedRequestID ||
+		stored.HourlyRateUSDMicros != r.HourlyRateUSDMicros ||
+		stored.ManagedRequestID != r.ManagedRequestID ||
 		r.Address != "" && stored.Address != r.Address ||
 		r.MediaAddress != "" && stored.MediaAddress != r.MediaAddress ||
 		r.CertPath != "" && stored.CertPath != r.CertPath ||
