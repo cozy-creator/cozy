@@ -521,9 +521,9 @@ type ModelRef struct {
 	Release  string `json:"release"`
 	Lane     string `json:"lane,omitempty"`
 	Manifest string `json:"manifest"`
-	// ManifestLength is required for derive-only job Model inputs. Serving model
-	// downloads keep it zero because their catalog manifest is acquired through the
-	// package-set lane before an invocation exists.
+	// ManifestLength is the manifest's exact byte length. Only a JOB declares its models
+	// as invocation inputs (orchestrator.jobModels); a serving request's models reach
+	// the worker through the placement's package-set lane, never as inputs.
 	ManifestLength int64 `json:"manifest_length,omitempty"`
 }
 

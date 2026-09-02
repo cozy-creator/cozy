@@ -1202,7 +1202,10 @@ func spellOf(raw []byte) string {
 }
 
 // inputBindings is the spec's ORDERED input identity list (#439): the payload always,
-// plus a job's materialized trees (their verification is the store's own, so no digest).
+// a job's exact Model manifests, plus a job's materialized trees (their verification is
+// the store's own, so no digest). A SERVING request never declares a Model input: its
+// models arrive through the placement's package-set lane, and the worker refuses a
+// serving spec that carries one (grant_model_serving_refused).
 func inputBindings(req records.Request, payloadDigest string) []*pb.InputBinding {
 	rows := []*pb.InputBinding{{
 		InputId:  "payload",
@@ -1217,12 +1220,9 @@ func inputBindings(req records.Request, payloadDigest string) []*pb.InputBinding
 			KindMime: asset.MediaType, Order: asset.Order,
 		})
 	}
-	models := append([]ModelRef(nil), req.Models...)
+	models := jobModels(req)
 	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
 	for _, model := range models {
-		if model.ManifestLength <= 0 {
-			continue
-		}
 		rows = append(rows, &pb.InputBinding{
 			InputId: "model:" + model.Slot, Digest: model.Manifest,
 			Length:   uint64(model.ManifestLength),
@@ -1494,14 +1494,7 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 		ExpiresAtUnix: 0,
 		Inputs:        []*pb.InputAccess{{InputId: "payload", Url: "file://" + path}},
 	}
-	for _, model := range req.Models {
-		if model.ManifestLength <= 0 {
-			continue
-		}
-		g.Inputs = append(g.Inputs, &pb.InputAccess{
-			InputId: "model:" + model.Slot, Url: "model://" + model.Manifest,
-		})
-	}
+	g.Inputs = append(g.Inputs, modelAccess(req)...)
 	for index, asset := range req.Assets {
 		path, e := w.media.PutInputFile(slot+"-input-"+strconv.Itoa(index),
 			asset.LocalPath, asset.Digest, asset.Length)
@@ -1524,7 +1517,35 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 	return g, nil
 }
 
-// grant builds the LOCAL delivery grant: a payload input and one destination per result
+// jobModels is the set of Model inputs a request declares: a job's bound models with an
+// exact manifest; none for a serving request (see inputBindings).
+func jobModels(req records.Request) []ModelRef {
+	if !req.IsJob() {
+		return nil
+	}
+	var models []ModelRef
+	for _, model := range req.Models {
+		if model.ManifestLength > 0 {
+			models = append(models, model)
+		}
+	}
+	return models
+}
+
+// modelAccess is the access half of every Model input the spec declares (jobModels):
+// one row per model, the same on every grant, or the worker refuses
+// grant_binding_mismatch.
+func modelAccess(req records.Request) []*pb.InputAccess {
+	var rows []*pb.InputAccess
+	for _, model := range jobModels(req) {
+		rows = append(rows, &pb.InputAccess{
+			InputId: "model:" + model.Slot, Url: "model://" + model.Manifest,
+		})
+	}
+	return rows
+}
+
+// grant builds the LOCAL delivery grant: a payload input, every bound model, and one destination per result
 // field path, under this attempt's own directory. There is no credential — a local grant
 // is a CAS root plus an output dir, and a fabricated token would be a lie about
 // authority nobody issued.
@@ -1551,6 +1572,7 @@ func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Reque
 		// spec's bindings, inside the invocation digest.
 		Inputs: []*pb.InputAccess{{InputId: "payload", Url: "file://" + payloadPath}},
 	}
+	g.Inputs = append(g.Inputs, modelAccess(req)...)
 	for _, asset := range req.Assets {
 		limit := asset.MaxBytes
 		if limit <= 0 {

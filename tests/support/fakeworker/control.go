@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -300,6 +302,18 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				}
 				f.say("lane %s seat taken by %s#%d", laneID, offer.RequestId, offer.AttemptOrdinal)
 			}
+			// THE GRANT RULE the real worker applies (cozy-runtime grants.py): the spec's
+			// input-id set and the grant's must agree exactly, and a SERVING spec carries
+			// no `model:` input at all. Refused with an outcome, never silently.
+			if reason := grantMismatch(offer); reason != "" {
+				f.say("ARM: %s for %s#%d — REFUSED", reason, offer.RequestId, offer.AttemptOrdinal)
+				t, _ := outcomeFor(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
+					pb.OutcomeStatus_OUTCOME_STATUS_REFUSED, reason,
+					pb.CauseCode_CAUSE_CODE_PROTOCOL, pb.CauseOrigin_CAUSE_ORIGIN_WORKER, false)
+				t.PlacementId = offer.PlacementId
+				outcome(t)
+				continue
+			}
 			accepted := &pb.AttemptAccepted{
 				RequestId: offer.RequestId, AttemptOrdinal: offer.AttemptOrdinal,
 				InvocationSpecDigest:    offer.InvocationSpecDigest,
@@ -326,6 +340,8 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				}(offer)
 			case "badterminal":
 				f.badOutcomes(outcome, offer)
+			case "output":
+				f.outcomeWithOutput(outcome, offer)
 			case "dropack":
 				dropAck = f.outcomeWithOutput(outcome, offer)
 			case "missing-output":
@@ -519,4 +535,45 @@ func randomHex(n int) string {
 		panic("no randomness for a fake boot id: " + err.Error())
 	}
 	return hex.EncodeToString(b)
+}
+
+// grantMismatch is the worker's reading of one offer's spec against its grant: the
+// input-id sets must agree exactly, and a serving spec may not declare a Model input.
+func grantMismatch(offer *pb.AttemptOffer) string {
+	spec, err := canonical.Read(offer.InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
+	if err != nil {
+		return "invocation spec unreadable: " + err.Error()
+	}
+	specInputs := map[string]bool{}
+	for _, row := range spec.List("inputs") {
+		id := row.Str("input_id")
+		specInputs[id] = true
+		if strings.HasPrefix(id, "model:") && spec.Sub("job").Str("job_descriptor_id") == "" {
+			return "grant_model_serving_refused: serving InvocationSpec cannot carry job Model input " + id
+		}
+	}
+	grantInputs := map[string]bool{}
+	for _, row := range offer.GetGrant().GetInputs() {
+		grantInputs[row.InputId] = true
+	}
+	if len(specInputs) != len(grantInputs) {
+		return fmt.Sprintf("grant_binding_mismatch: spec inputs %v, grant inputs %v",
+			keysOf(specInputs), keysOf(grantInputs))
+	}
+	for id := range specInputs {
+		if !grantInputs[id] {
+			return fmt.Sprintf("grant_binding_mismatch: spec inputs %v, grant inputs %v",
+				keysOf(specInputs), keysOf(grantInputs))
+		}
+	}
+	return ""
+}
+
+func keysOf(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for key := range set {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
 }
