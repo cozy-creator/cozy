@@ -34,7 +34,7 @@ func ptyRun(t *testing.T, root string, args ...string) (int, string) {
 	must(t, err)
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
 	cmd.Env = childEnv(t, root)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
+	cmd.Stdout, cmd.Stderr = slave, slave
 	must(t, cmd.Start())
 	must(t, slave.Close()) // the child holds the slave now; EOF/EIO on master ends the read
 	var out bytes.Buffer
