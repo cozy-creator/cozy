@@ -96,6 +96,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<docs::PyClosure>()?;
 
     m.add_function(wrap_pyfunction!(store::plan, m)?)?;
+    m.add_function(wrap_pyfunction!(store::gc, m)?)?;
     m.add_function(wrap_pyfunction!(store::transfer_object, m)?)?;
     m.add_function(wrap_pyfunction!(store::transfer_manifest, m)?)?;
     m.add_function(wrap_pyfunction!(store::fetch_plan, m)?)?;

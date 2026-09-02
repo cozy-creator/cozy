@@ -2000,6 +2000,29 @@ impl PyBatch {
     }
 }
 
+// ---------------------------------------------------------------- reclamation
+
+/// One local reclamation pass (tensorfs_core::gc): remove every blob and manifest no
+/// repository or open ingest session names, from the filesystem census alone, under the
+/// store's exclusive lock. `dry_run` plans without deleting.
+#[pyfunction]
+#[pyo3(signature = (root, dry_run = false))]
+pub fn gc<'p>(py: Python<'p>, root: PathBuf, dry_run: bool) -> PyResult<Bound<'p, PyDict>> {
+    let report = py
+        .detach(|| tensorfs_core::gc::collect(&root, dry_run))
+        .or_refuse(py)?;
+    let result = PyDict::new(py);
+    result.set_item("dry_run", report.dry_run)?;
+    result.set_item("reclaimed_bytes", report.reclaimed_bytes)?;
+    result.set_item("reclaimed_blobs", report.reclaimed_blobs)?;
+    result.set_item("reclaimed_manifests", report.reclaimed_manifests)?;
+    result.set_item("kept_bytes", report.kept_bytes)?;
+    result.set_item("kept_objects", report.kept_objects)?;
+    result.set_item("sessions", report.sessions)?;
+    result.set_item("scratch_reaped", report.scratch_reaped)?;
+    Ok(result)
+}
+
 // ---------------------------------------------------------------- store transfer
 
 /// Move one exact object between TensorFS stores without exposing either store's layout.

@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use tensorfs_core::canon::Value;
 use tensorfs_core::catalog::{Catalog, WriterGuard};
 use tensorfs_core::err::{Code, Refusal};
+use tensorfs_core::gc;
 use tensorfs_core::header::{Body, Header};
 use tensorfs_core::ids::{hex64, prefixed, Doc, ObjectRef};
 use tensorfs_core::manifest::{Entry, Manifest};
@@ -1129,16 +1130,15 @@ pub fn cmd_gc_headers(census: &Path, flags: &Flags) -> ExitCode {
     }
 }
 
+/// The store's holds as the filesystem states them: every candidate an open ingest session
+/// root names (`tmp/ingest/<session>/session.json`). The catalog's hold rows are not read —
+/// the database is not the source of truth (tensorfs_core::gc).
 pub fn cmd_gc_holds(store: &Path, flags: &Flags) -> ExitCode {
     let Some(output) = flag(flags, "out") else {
         eprintln!("--out <holds.jsonl> is required");
         return ExitCode::from(2);
     };
-    let catalog = match Store::open(store).and_then(|_| Catalog::open(store)) {
-        Ok(catalog) => catalog,
-        Err(error) => return bail(error),
-    };
-    let holds = match catalog.held_keys() {
+    let (holds, _) = match Store::open(store).and_then(|store| gc::session_holds(&store)) {
         Ok(holds) => holds,
         Err(error) => return bail(error),
     };
@@ -1187,6 +1187,23 @@ pub fn cmd_gc_plan(census: &Path, flags: &Flags) -> ExitCode {
         }
         Err(error) => bail(error),
     }
+}
+
+/// `tfs gc <root> [--dry-run] [--json]`: one complete reclamation pass (tensorfs_core::gc).
+pub fn cmd_gc(root: &Path, flags: &Flags) -> ExitCode {
+    let report = match gc::collect(root, flag(flags, "dry-run").is_some()) {
+        Ok(report) => report,
+        Err(error) => return bail(error),
+    };
+    if flag(flags, "json").is_some() {
+        println!("{}", String::from_utf8_lossy(&report.json()));
+    } else {
+        println!("{}", report.line());
+        for session in &report.sessions {
+            println!("held by ingest session {session} (abandon with `tfs ingest reap`)");
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 pub fn cmd_rebuild(census: &Path, flags: &Flags) -> ExitCode {

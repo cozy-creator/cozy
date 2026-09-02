@@ -691,6 +691,7 @@ impl Catalog {
 
     /// Explicit abandonment after every writer grant is revoked and the writer is gone.
     pub fn abandon(&self, operation: &str, grants_revoked: bool) -> Result<()> {
+        use rusqlite::OptionalExtension;
         if !grants_revoked {
             return refuse(Code::STORE_BUSY, "abandon requires revoked grants");
         }
@@ -698,15 +699,20 @@ impl Catalog {
         let transaction = connection
             .transaction()
             .map_err(|error| sql("begin abandon", error))?;
-        let writer_marker: String = transaction
+        // A session root with no operation row (the catalog was rebuilt under exclusivity,
+        // so no writer of it was live) has nothing left to arbitrate against.
+        let writer_marker: Option<String> = transaction
             .query_row(
                 "SELECT writer_marker FROM tensorfs_operations WHERE id=?1",
                 [operation],
                 |row| row.get(0),
             )
+            .optional()
             .map_err(|error| sql("read abandon candidate", error))?;
-        if marker_is_live(Path::new(&writer_marker))? {
-            return refuse(Code::STORE_BUSY, "operation writer is still live");
+        if let Some(writer_marker) = writer_marker {
+            if marker_is_live(Path::new(&writer_marker))? {
+                return refuse(Code::STORE_BUSY, "operation writer is still live");
+            }
         }
         transaction
             .execute("DELETE FROM tensorfs_operations WHERE id=?1", [operation])
@@ -801,6 +807,33 @@ impl Catalog {
             );
         }
     }
+
+    /// Drop every verification row whose object `present` no longer finds: a row dies with
+    /// its object, after it, and a pass interrupted between the two converges here.
+    pub(crate) fn prune_verifications(&self, present: impl Fn(&str) -> bool) -> Result<u64> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT sha256 FROM tensorfs_verified_blobs")
+            .map_err(|error| sql("prepare verification census", error))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| sql("read verification census", error))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| sql("collect verification census", error))?;
+        let mut pruned = 0;
+        for sha256 in rows {
+            if !present(&sha256) {
+                connection
+                    .execute(
+                        "DELETE FROM tensorfs_verified_blobs WHERE sha256=?1",
+                        [&sha256],
+                    )
+                    .map_err(|error| sql("prune verification row", error))?;
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
 }
 
 fn insert_projection(transaction: &Connection, projection: &Projection) -> Result<()> {
@@ -876,10 +909,12 @@ impl WriterGuard {
             .write(true)
             .open(directory.join("recovery.lock"))
             .map_err(|error| io("open recovery lock", error))?;
-        recovery.try_lock_exclusive().map_err(|_| Refusal {
-            code: Code::STORE_BUSY,
-            detail: "a live writer blocks rebuild".into(),
-        })?;
+        if recovery.try_lock_exclusive().is_err() {
+            return refuse(
+                Code::STORE_BUSY,
+                format!("the store is held by {}", live_holders(root)?),
+            );
+        }
         for entry in fs::read_dir(&directory).map_err(|error| io("read writer markers", error))? {
             let path = entry
                 .map_err(|error| io("read writer marker", error))?
@@ -893,12 +928,61 @@ impl WriterGuard {
                 .open(&path)
                 .map_err(|error| io("open writer marker", error))?;
             if marker.try_lock_exclusive().is_err() {
-                return refuse(Code::STORE_BUSY, "a live writer blocks rebuild");
+                return refuse(
+                    Code::STORE_BUSY,
+                    format!("the store is held by {}", live_holders(root)?),
+                );
             }
             fs::remove_file(path).map_err(|error| io("reap dead writer marker", error))?;
         }
         Ok(RebuildGuard { _file: recovery })
     }
+}
+
+/// Who holds the store right now, by marker: `writer <pid>` for an open operation
+/// (`tmp/writers/<pid>-<nanos>.writer`) and `<kind> <pid>` for a lease
+/// (`tmp/leases/<kind>-<pid>-<nanos>.lease`). Liveness is the kernel lock on the marker;
+/// a marker whose lock can be taken belongs to nobody and is not named.
+fn live_holders(root: &Path) -> Result<String> {
+    let mut holders = Vec::new();
+    for (directory, extension) in [("tmp/writers", "writer"), ("tmp/leases", "lease")] {
+        let Ok(entries) = fs::read_dir(root.join(directory)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.map_err(|error| io("read marker", error))?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some(extension) {
+                continue;
+            }
+            let Ok(marker) = File::options().read(true).write(true).open(&path) else {
+                continue;
+            };
+            if marker.try_lock_exclusive().is_ok() {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("");
+            let mut parts = stem.rsplitn(2, '-');
+            let _nanos = parts.next();
+            let head = parts.next().unwrap_or(stem);
+            holders.push(match extension {
+                "writer" => format!("writer pid {head}"),
+                _ => head.rsplit_once('-').map_or_else(
+                    || head.to_string(),
+                    |(kind, pid)| format!("{kind} lease pid {pid}"),
+                ),
+            });
+        }
+    }
+    holders.sort();
+    holders.dedup();
+    Ok(if holders.is_empty() {
+        "another process (recovery lock shared)".to_string()
+    } else {
+        holders.join(", ")
+    })
 }
 
 /// Exclusive against every writer from census through catalog replacement.
