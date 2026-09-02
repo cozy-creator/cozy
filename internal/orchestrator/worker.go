@@ -479,6 +479,10 @@ type worker struct {
 	// held is how many attempts the worker last reported holding, in every state from
 	// admission to ack; the lanes carry their own share (route.go reads both).
 	held int
+	// heldManifests is the worker's last word on which TensorFS manifests its verified
+	// store holds complete (`held_manifests`, proto-026), placed or not — the disk-tier
+	// fact the capacity decision prefers a rental by (residency-aware-routing.md §3.2).
+	heldManifests map[string]bool
 	// unacked is how many outcomes this owner HOLDS without having acked. The worker
 	// counts them against its own available_attempt_slots (#480d), so an owner that stops
 	// acking starves its own admission — boundedness is structural, and this is the number

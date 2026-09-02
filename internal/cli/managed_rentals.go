@@ -145,23 +145,33 @@ func (m *managedRentals) admit(skuName string) (string, int64, *exit.Error) {
 		"Tensorhub currently offers no rental SKU %q", skuName)
 }
 
-func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Error) {
+// acquire is the capacity decision for a --rental request no rental holds a placement
+// for (residency-aware-routing.md §3.2, D4): among the ready rentals of the request's
+// class the orchestrator's RankRentals puts the one whose store already holds the
+// placement's manifests first, then the fewest missing bytes, then the most room. A
+// download — a ready rental that must fetch, or a bought pod — is chosen only with
+// `download`, which the orchestrator grants when no machine has the manifests on disk;
+// otherwise a rental that holds them or nothing. The chosen rental is pinned to THIS
+// request alone — every other queued --rental request keeps routing over local and every
+// rental by score, and takes its pin from dispatch (cl-092 step 4).
+func (m *managedRentals) acquire(req records.Request, download bool) (orchestrator.RentalDecision, string, *exit.Error) {
+	var none orchestrator.RentalDecision
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !req.Rental || req.Worker != "" {
-		return "", "", exit.Internalf("request %s is not an unassigned --rental request", req.ID)
+		return none, "", exit.Internalf("request %s is not an unassigned --rental request", req.ID)
 	}
 	if problem := m.reconcileLocked(); problem != nil {
-		return "", "", problem
+		return none, "", problem
 	}
 	needsCPU := !req.NeedsAccelerator
 	skus, problem := m.catalogLocked()
 	if problem != nil {
-		return "", "", problem
+		return none, "", problem
 	}
 	rows, problem := m.store.Rentals()
 	if problem != nil {
-		return "", "", problem
+		return none, "", problem
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].HourlyRateUSDMicros != rows[j].HourlyRateUSDMicros {
@@ -169,6 +179,7 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		}
 		return rows[i].ID < rows[j].ID
 	})
+	var ready []string
 	for _, row := range rows {
 		if (row.AcceleratorModel == "CPU") != needsCPU {
 			continue
@@ -179,68 +190,73 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		if row.Address == "" || row.CertPath == "" {
 			continue
 		}
-		if batchProblem := m.store.AssignManagedRentalClass(row.ID, needsCPU); batchProblem != nil {
-			return "", "", batchProblem
+		ready = append(ready, row.ID)
+	}
+	if len(ready) > 0 {
+		ranked := m.owner.RankRentals(ready, req.Models)
+		if !ranked[0].Holds && !download {
+			return none, "", nil
 		}
-		assigned, assignProblem := m.store.AssignManagedRental(req.ID, row.ID)
-		if assignProblem != nil {
-			return "", "", assignProblem
+		chosen := ranked[0].RentalID
+		pinned, pinProblem := m.store.PinRental(req.ID, chosen)
+		if pinProblem != nil {
+			return none, "", pinProblem
 		}
-		if !assigned {
-			return "", "", exit.New(exit.Canceled,
+		if !pinned {
+			return none, "", exit.New(exit.Canceled,
 				"request %s settled before rental assignment", req.ID)
 		}
 		line, lineProblem := m.lineLocked()
-		return row.ID, line, lineProblem
+		return orchestrator.RentalDecision{RentalID: chosen, Candidates: ranked}, line, lineProblem
 	}
 
+	if !download {
+		return none, "", nil
+	}
 	sku, mismatch, found := rental.CheapestCompatibleSKU(skus, req.NeedsAccelerator,
 		releaseConstraints(m.ctx, req))
 	if !found && mismatch != "" {
 		// Refused BEFORE the paid ask, in the pod's own vocabulary. Publication stays
 		// base-independent: the release is published and simply unqualified here.
-		return "", "", exit.Named(exit.Unavailable, "rental.package_base_incompatible",
+		return none, "", exit.Named(exit.Unavailable, "rental.package_base_incompatible",
 			"no rentable machine can run %s@%s — %s", req.Package, req.Release, mismatch).
 			WithRemedy("publish a release whose requirements one of Tensorhub's offered base images satisfies")
 	}
 	if !found {
-		return "", "", exit.Named(exit.Capacity, "rental.no_skus",
+		return none, "", exit.Named(exit.Capacity, "rental.no_skus",
 			"Tensorhub currently offers no compatible rental SKU")
 	}
 	if problem := m.admitLocked(sku); problem != nil {
-		return "", "", problem
+		return none, "", problem
 	}
 	current, currentProblem := m.store.RequestRow(req.ID)
 	if currentProblem != nil {
-		return "", "", currentProblem
+		return none, "", currentProblem
 	}
 	if current == nil || settledRequest(current.State) {
-		return "", "", exit.New(exit.Canceled, "request %s settled before rental acquisition", req.ID)
+		return none, "", exit.New(exit.Canceled, "request %s settled before rental acquisition", req.ID)
 	}
 	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s\n", sku.Name, usdPerHour(sku.PriceUSDMicrosPerHour))
 	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name,
 		"managed-rental-"+req.ID, "",
 		sku.PriceUSDMicrosPerHour, m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID)
 	if problem != nil {
-		return "", "", problem
+		return none, "", problem
 	}
-	if batchProblem := m.store.AssignManagedRentalClass(row.ID, needsCPU); batchProblem != nil {
-		return "", "", batchProblem
-	}
-	assigned, problem := m.store.AssignManagedRental(req.ID, row.ID)
+	pinned, problem := m.store.PinRental(req.ID, row.ID)
 	if problem != nil {
-		return "", "", problem
+		return none, "", problem
 	}
-	if !assigned {
+	if !pinned {
 		_, releaseProblem := m.releaseLocked(row.ID)
 		if releaseProblem != nil {
-			return "", "", releaseProblem
+			return none, "", releaseProblem
 		}
-		return "", "", exit.New(exit.Canceled,
+		return none, "", exit.New(exit.Canceled,
 			"request %s settled while rental %s was starting; the rental was released", req.ID, row.ID)
 	}
 	line, problem := m.lineLocked()
-	return row.ID, line, problem
+	return orchestrator.RentalDecision{RentalID: row.ID, Bought: true}, line, problem
 }
 
 func (m *managedRentals) catalogLocked() ([]hub.RentalSKU, *exit.Error) {

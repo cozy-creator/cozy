@@ -78,6 +78,9 @@ func (c *Orchestrator) classifyCapacityWait(req records.Request, r routing) wait
 			return waitFacts{cause: WaitWorkerWarming}
 		}
 	}
+	if req.Rental && req.Worker == "" {
+		return waitFacts{cause: WaitRental}
+	}
 	return waitFacts{cause: WaitWorkerStart}
 }
 

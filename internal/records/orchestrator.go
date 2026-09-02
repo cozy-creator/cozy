@@ -531,6 +531,10 @@ type ModelRef struct {
 	// as invocation inputs (orchestrator.jobModels); a serving request's models reach
 	// the worker through the placement's package-set lane, never as inputs.
 	ManifestLength int64 `json:"manifest_length,omitempty"`
+	// Bytes is the model tree's size as Tensorhub publishes it on the release card — the
+	// hub fact the capacity decision ranks a rental's missing download by (§3.2). Zero
+	// when the resolver did not carry it.
+	Bytes int64 `json:"bytes,omitempty"`
 }
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
@@ -769,12 +773,13 @@ func (s *Store) MarkLocalPackageUploaded(id, digest, bootID string) *exit.Error 
 		"request %s cannot record its verified local package boot", id)
 }
 
-// AssignManagedRental pins one still-queued --rental request to the exact pod
-// Creator acquired for it. A cancellation that wins first leaves worker empty,
-// which tells the caller to release the otherwise-unused rental. The claim also
-// records the rental's machine word on the request (cl-107): the word is history
-// the run keeps after the rental row is gone, never a read-time join.
-func (s *Store) AssignManagedRental(id, rentalID string) (bool, *exit.Error) {
+// PinRental pins one still-queued --rental request to the rental routing chose for it:
+// the argmin lane at dispatch, or the rental the capacity decision stages its placement
+// on (cl-092 step 4). A cancellation that wins first leaves worker empty, which tells a
+// caller that bought the rental to release it. The pin also records the rental's machine
+// word on the request (cl-107): the word is history the run keeps after the rental row
+// is gone, never a read-time join.
+func (s *Store) PinRental(id, rentalID string) (bool, *exit.Error) {
 	result, err := s.db.Exec(`UPDATE requests SET worker=?,
 		machine=COALESCE((SELECT machine_name FROM rentals WHERE id=?),machine)
 		WHERE id=? AND rental=1 AND worker='' AND

@@ -515,10 +515,12 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane str
 		return empty, exit.New(exit.NotFound, "model %s has no available release %q", ref.String(), release)
 	}
 	manifestLanes := map[string][]string{}
+	manifestBytes := map[string]int64{}
 	for _, lane := range selected.Lanes {
 		if (manifest == "" || lane.ManifestID == manifest) &&
 			(wantedLane == "" || lane.Lane == wantedLane) {
 			manifestLanes[lane.ManifestID] = append(manifestLanes[lane.ManifestID], lane.Lane)
+			manifestBytes[lane.ManifestID] = lane.Bytes
 		}
 	}
 	if manifest != "" && len(manifestLanes[manifest]) == 0 {
@@ -545,7 +547,8 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane str
 	lanes := manifestLanes[manifest]
 	sort.Strings(lanes)
 	return orchestrator.ModelRef{Package: packageName, Slot: slotPath,
-		Model: ref.String(), Release: release, Lane: lanes[0], Manifest: manifest}, nil
+		Model: ref.String(), Release: release, Lane: lanes[0], Manifest: manifest,
+		Bytes: manifestBytes[manifest]}, nil
 }
 
 func handleRunCancel(ctx *Context) *exit.Error {
