@@ -546,14 +546,15 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	}
 	if status != nil {
 		c.logf("observed phase=%s accepted=%d converged=%d placement=%s %s/%s epoch=%d "+
-			"admission=%s/%d slots=%d lanes=%s placement_lane=%s dispatchable=%d held=%d",
+			"admission=%s/%d slots=%d lanes=%s placement_lane=%s dispatchable=%d held=%d held_manifests=%v",
 			phase, r.AcceptedDesiredStateRevision, r.ConvergedRevision, status.PlacementId,
 			trimEnum(pb.MaterializationState_name[int32(status.Materialization)], "MATERIALIZATION_STATE_"),
 			trimEnum(pb.ServingState_name[int32(status.Serving)], "SERVING_STATE_"),
 			status.ExecutorEpoch,
 			trimEnum(pb.AdmissionState_name[int32(r.AdmissionState)], "ADMISSION_STATE_"),
 			r.AdmissionEpoch, r.AvailableAttemptSlots, laneSummary(r.Lanes),
-			orNone(status.DeviceLaneId), len(status.DispatchableBindingDigests), len(r.HeldAttempts))
+			orNone(status.DeviceLaneId), len(status.DispatchableBindingDigests), len(r.HeldAttempts),
+			r.HeldManifests)
 		return
 	}
 	c.logf("observed phase=%s accepted=%d converged=%d (no placement applied yet)",

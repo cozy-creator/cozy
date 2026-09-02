@@ -310,7 +310,7 @@ func laneSummary(lanes []*pb.DeviceLane) string {
 	}
 	parts := make([]string, 0, len(lanes))
 	for _, l := range lanes {
-		parts = append(parts, fmt.Sprintf("%s%v:%d", l.LaneId, l.DeviceOrdinals, l.AvailableAttemptSlots))
+		parts = append(parts, fmt.Sprintf("%s%v:%d resident=%v", l.LaneId, l.DeviceOrdinals, l.AvailableAttemptSlots, l.ResidentPlacementIds))
 	}
 	return strings.Join(parts, " ")
 }
