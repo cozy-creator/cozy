@@ -290,7 +290,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	var status *pb.PlacementStatus
 	var desiredRevision uint64
 	var laneBreaches []string
-	workerTerminal := false
+	workerTerminal, repeatedFault, verdict := false, false, ""
 	c.mu.Lock()
 	w := c.workers[s.instanceID]
 	if w != nil && w.bootID != s.bootID {
@@ -448,7 +448,8 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			if r.AcceptedDesiredStateRevision < desiredRevision &&
 				f.Subject == fmt.Sprintf("revision %d", desiredRevision) && permanentDesiredRefusal(f.Kind) {
 				w.desiredRefusal = exit.Named(exit.Structural, "placement_config_refused",
-					"the package worker refused its placement: %s — %s", f.Reason, brief(f.Detail, 240))
+					"the package worker refused its placement: %s — %s", f.Reason, brief(f.Detail, 240)).
+					WithRemedy("the installed package Runtime is incompatible with this Cozy build")
 				c.relayDescriptorDefect(w, desiredRevision, f)
 			}
 		}
@@ -460,6 +461,15 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
 			}
 		}
+		if refused := w.observeLatchedFault(r); refused != nil {
+			if w.desiredRefusal == nil {
+				verdict = fmt.Sprintf("worker %s: desired revision %d REFUSED — the placement fault "+
+					"repeated unchanged on %d consecutive reports and nothing here can answer it: %s",
+					w.instanceID, desiredRevision, w.latchedFaultReports, refused.Message)
+			}
+			w.desiredRefusal = refused
+		}
+		repeatedFault = w.latchedFaultReports > 1
 		workerTerminal = retirementGround(w) != ""
 	}
 	phase := trimEnum(pb.WorkerPhase_name[int32(r.WorkerPhase)], "WORKER_PHASE_")
@@ -470,14 +480,21 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	for _, breach := range laneBreaches {
 		c.logf("worker breach on %s: %s", s.instanceID, breach)
 	}
-	for _, f := range r.Faults {
-		c.logf("worker fault %s on %s: %s (%s)", pb.FaultKind_name[int32(f.Kind)],
-			f.Subject, f.Reason, f.Detail)
+	if verdict != "" {
+		c.logf("%s", verdict)
+	}
+	// A latched fault is reported every ReportCadence; its first report is logged and the
+	// verdict on its repetition is logged once, above. The replays in between say nothing.
+	if !repeatedFault {
+		for _, f := range r.Faults {
+			c.logf("worker fault %s on %s: %s (%s)", pb.FaultKind_name[int32(f.Kind)],
+				f.Subject, f.Reason, f.Detail)
+		}
 	}
 	for _, a := range r.Activity {
 		c.logf("activity seq=%d %s: %s", a.Seq, a.Kind, a.Step)
 	}
-	if status != nil {
+	if status != nil && !repeatedFault {
 		for _, f := range status.Faults {
 			c.logf("placement fault %s on %s: %s (%s)", pb.FaultKind_name[int32(f.Kind)],
 				f.Subject, f.Reason, f.Detail)

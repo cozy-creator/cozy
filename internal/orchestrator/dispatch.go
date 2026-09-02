@@ -533,7 +533,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		} else if w.spec.Placement.Package != pinnedPackage(req.Package, req.Worker) {
 			continue
 		}
-		if req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {
+		// An install pins a LOCAL relaunch. On a rental the exact identity is the sealed
+		// private revision the request carries, and stagedFor holds the worker to it.
+		if req.InstallID != "" && w.spec.Connection == nil && w.spec.Placement.InstallID != req.InstallID {
 			continue
 		}
 		if !req.IsJob() || w.spec.Placement.Jobs[0].Function == req.Entrypoint {
@@ -658,9 +660,20 @@ func staged(w *worker, planID string) bool {
 
 func stagedFor(w *worker, req records.Request) bool {
 	if req.Worker != "" && w.spec.Connection != nil && !req.IsJob() {
-		return w.remoteStaged(pinnedPackage(req.Package, req.Worker), req.PlanID)
+		return w.remoteStaged(pinnedPackage(req.Package, req.Worker), req.PlanID, remoteRevision(req))
 	}
 	return staged(w, req.PlanID)
+}
+
+// remoteRevision is the exact package revision a rental request binds: the sealed private
+// revision of an editable install, or the immutable published release digest. A placement
+// the pod holds under the same plan id for an EARLIER revision of the same package — an
+// edit that left the descriptor alone — is not this request's code.
+func remoteRevision(req records.Request) string {
+	if req.PrivatePackageDigest != "" {
+		return req.PrivatePackageDigest
+	}
+	return req.PackageRevisionDigest
 }
 
 // settledState answers whether the authority has already recorded this request's outcome.
@@ -1135,10 +1148,7 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 	c.mu.Unlock()
 	packageRevision = placement.PackageRevisionDigest
 	if req.IsJob() && remote {
-		expected := req.PackageRevisionDigest
-		if req.PrivatePackageDigest != "" {
-			expected = req.PrivatePackageDigest
-		}
+		expected := remoteRevision(req)
 		if expected == "" || expected != packageRevision {
 			return "", "", "", exit.Named(exit.Conflict,
 				"request_invocation_identity_changed",
@@ -1155,15 +1165,20 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 			"worker %s carries no selected environment digest", instanceID)
 	}
 	if remote {
-		expected := req.PackageRevisionDigest
-		if req.PrivatePackageDigest != "" {
-			expected = req.PrivatePackageDigest
-		}
+		expected := remoteRevision(req)
 		if expected == "" || expected != packageRevision {
 			return "", "", "", exit.Named(exit.Conflict,
 				"request_invocation_identity_changed",
 				"worker %s no longer matches the invocation identity pinned to request %s",
 				instanceID, req.ID)
+		}
+		// A private revision is DEVELOPMENT execution on the pod, and development execution
+		// has no published Environment identity: the worker refuses a spec that names one
+		// (development_environment_present). The pod's prepared Environment is still bound
+		// to the row, so a requeue derives the same identity; only the spec omits it.
+		specEnvironment := environment
+		if req.PrivatePackageDigest != "" {
+			specEnvironment = ""
 		}
 		if req.EnvironmentDigest == "" && req.ConfigDigest == "" {
 			if req.PrivatePackageDigest != "" {
@@ -1176,7 +1191,7 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 			if e != nil {
 				return "", "", "", e
 			}
-			return packageRevision, environment, placement.ConfigDigest, nil
+			return packageRevision, specEnvironment, placement.ConfigDigest, nil
 		}
 		if req.EnvironmentDigest != environment || req.ConfigDigest != placement.ConfigDigest {
 			return "", "", "", exit.Named(exit.Conflict,
@@ -1184,7 +1199,7 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 				"worker %s no longer matches the invocation identity pinned to request %s",
 				instanceID, req.ID)
 		}
-		return packageRevision, req.EnvironmentDigest, req.ConfigDigest, nil
+		return packageRevision, specEnvironment, req.ConfigDigest, nil
 	}
 	if !validDigest(localConfig) {
 		return "", "", "", exit.Named(exit.Structural, "placement_identity_missing",
@@ -1312,13 +1327,13 @@ func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *di
 		if req.Worker != "" && !req.IsJob() && w.spec.Connection != nil {
 			placement, ok := w.remotePlacements[remotePlanKey(slot, planID)]
 			if w.instanceID != rentalInstanceID(req.Worker) || !ok ||
-				placement.Package != slot || !w.remoteDispatchable(placement, planID) {
+				placement.Package != slot || placement.PackageRevisionDigest != remoteRevision(req) ||
+				!w.remoteDispatchable(placement, planID) {
 				continue
 			}
 		} else if w.spec.Placement.Package != slot {
 			continue
-		}
-		if req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {
+		} else if req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {
 			continue
 		}
 		sess := c.sessions[w.bootID]

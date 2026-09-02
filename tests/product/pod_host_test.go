@@ -6,6 +6,7 @@ package producttest
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -22,6 +23,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +39,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/mediawire"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
+	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -59,14 +63,118 @@ type fakePod struct {
 	// mutateHostDigest is the red arm: the host document's digest stops hashing its bytes.
 	mutateHostDigest bool
 
-	mu           sync.Mutex
-	acks         []*pb.SnapshotAck
-	desired      []*pb.DesiredWorkerState
-	prepares     []*pb.PreparePackageSetCall
-	prepareCodes []codes.Code
-	hostDigest   []byte
-	preparedSet  []byte
-	preparedDig  []byte
+	// latch is the materialization fault this pod keeps against every placement_set it
+	// accepts (the Runtime's own shape: accepted, never converged, the placement ABSENT
+	// and OFFLINE, the fault replayed on every report). Nil reports nothing.
+	latch *pb.Fault
+	// serve makes every accepted placement_set converge at once: STAGED, DISPATCHABLE,
+	// every entrypoint advertised, one free seat. Offers are recorded, never answered.
+	serve bool
+
+	mu              sync.Mutex
+	acks            []*pb.SnapshotAck
+	desired         []*pb.DesiredWorkerState
+	prepares        []*pb.PreparePackageSetCall
+	privatePrepares []*pb.PreparePrivatePackageCall
+	grants          []*pb.PrivatePackageFileGrant
+	lanes           []string // the order lanes were used: fetch, prepare_private, placement_set
+	prepareCodes    []codes.Code
+	hostDigest      []byte
+	preparedSet     []byte
+	preparedDig     []byte
+	reports         map[string]int // fault text -> reports that carried it
+	offers          []*pb.AttemptOffer
+}
+
+// served is the serve arm's ObservedWorkerState: the exact set accepted and converged,
+// the one placement staged and dispatchable under every binding it names.
+func (p *fakePod) served(d *pb.DesiredWorkerState, epoch uint64) *pb.WorkerFrame {
+	set := d.GetPlacementSet()
+	doc, err := canonical.Read(set.PlacementSetCanonicalBytes, &pb.PlacementSet{})
+	if err != nil {
+		return nil
+	}
+	var placements []*pb.PlacementStatus
+	for _, placement := range doc.List("placements") {
+		row := &pb.PlacementStatus{
+			PlacementId:     placement.Str("placement_id"),
+			Materialization: pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
+			Serving:         pb.ServingState_SERVING_STATE_DISPATCHABLE, ExecutorEpoch: 1,
+			PlacementSetDigest: set.PlacementSetDigest,
+			EnvironmentDigest:  placement.Str("environment_digest"),
+			ConfigDigest:       "sha256:" + strings.Repeat("26", 32),
+		}
+		development := placement.Sub("development")
+		if development != nil {
+			row.PackageRevisionDigest = development.Str("private_revision_digest")
+		} else {
+			row.PackageRevisionDigest = placement.Sub("package").Str("release_digest")
+		}
+		for _, entrypoint := range placement.List("entrypoints") {
+			if digest, err := canonical.Raw(entrypoint.Str("entrypoint_binding_digest")); err == nil {
+				row.DispatchableBindingDigests = append(row.DispatchableBindingDigests, digest)
+			}
+		}
+		placements = append(placements, row)
+	}
+	return &pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: &pb.ObservedWorkerState{
+		RecordOwnerEpoch: d.RecordOwnerEpoch, ControlStreamEpoch: epoch, WorkerBootId: podBootID,
+		AcceptedDesiredStateRevision: d.Revision, ConvergedRevision: d.Revision,
+		AcceptedPlacementSetDigest: set.PlacementSetDigest,
+		WorkerPhase:                pb.WorkerPhase_WORKER_PHASE_ONLINE, AppliedWireMinor: pb.WireMinor,
+		AdmissionState: pb.AdmissionState_ADMISSION_STATE_OPEN, AdmissionEpoch: 7, AvailableAttemptSlots: 1,
+		Placements: placements,
+	}}}
+}
+
+func (p *fakePod) setLatch(fault *pb.Fault) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.latch = fault
+}
+
+func (p *fakePod) reported(reason string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.reports[reason]
+}
+
+// report is the latch arm's ObservedWorkerState: the desired revision accepted and not
+// converged, the placement absent, and the fault, exactly as a Runtime that latched a
+// materialization refusal reports every ReportCadence.
+func (p *fakePod) report(d *pb.DesiredWorkerState, epoch uint64) *pb.WorkerFrame {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	fault := p.latch
+	if fault == nil {
+		return nil
+	}
+	if p.reports == nil {
+		p.reports = map[string]int{}
+	}
+	p.reports[fault.Reason+"/"+fault.Detail]++
+	set := d.GetPlacementSet()
+	doc, err := canonical.Read(set.PlacementSetCanonicalBytes, &pb.PlacementSet{})
+	if err != nil {
+		return nil
+	}
+	var placements []*pb.PlacementStatus
+	for _, placement := range doc.List("placements") {
+		placements = append(placements, &pb.PlacementStatus{
+			PlacementId:        placement.Str("placement_id"),
+			Materialization:    pb.MaterializationState_MATERIALIZATION_STATE_ABSENT,
+			Serving:            pb.ServingState_SERVING_STATE_OFFLINE,
+			PlacementSetDigest: set.PlacementSetDigest,
+		})
+	}
+	return &pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: &pb.ObservedWorkerState{
+		RecordOwnerEpoch: d.RecordOwnerEpoch, ControlStreamEpoch: epoch, WorkerBootId: podBootID,
+		AcceptedDesiredStateRevision: d.Revision, AcceptedPlacementSetDigest: set.PlacementSetDigest,
+		WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE, AppliedWireMinor: pb.WireMinor,
+		AdmissionState: pb.AdmissionState_ADMISSION_STATE_CLOSED, AdmissionEpoch: 4,
+		Placements: placements,
+		Faults:     []*pb.Fault{{Kind: fault.Kind, Subject: placements[0].PlacementId, Reason: fault.Reason, Detail: fault.Detail}},
+	}}}
 }
 
 func (p *fakePod) verifyClaim(claim *pb.Claim, stream bool) error {
@@ -145,9 +253,117 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 		case *pb.RecordOwnerFrame_DesiredState:
 			p.mu.Lock()
 			p.desired = append(p.desired, m.DesiredState)
+			p.lanes = append(p.lanes, "placement_set")
+			latched, serve := p.latch != nil, p.serve
 			p.mu.Unlock()
+			if serve && m.DesiredState.GetPlacementSet() != nil {
+				if frame := p.served(m.DesiredState, 1); frame != nil {
+					if err := stream.Send(frame); err != nil {
+						return err
+					}
+				}
+			}
+			if latched && m.DesiredState.GetPlacementSet() != nil {
+				go func(d *pb.DesiredWorkerState) {
+					for {
+						select {
+						case <-stream.Context().Done():
+							return
+						case <-time.After(25 * time.Millisecond):
+						}
+						if frame := p.report(d, 1); frame != nil {
+							if err := stream.Send(frame); err != nil {
+								return
+							}
+						}
+					}
+				}(m.DesiredState)
+			}
+		case *pb.RecordOwnerFrame_AttemptOffer:
+			p.mu.Lock()
+			p.offers = append(p.offers, m.AttemptOffer)
+			p.mu.Unlock()
+		case *pb.RecordOwnerFrame_PrivatePackageFetchRequest:
+			// th-094's pod half, minimally: every named wheel is reported VERIFIED at its
+			// full length. The grants are recorded so the test can read what was named.
+			request := m.PrivatePackageFetchRequest
+			p.mu.Lock()
+			p.grants = append(p.grants, request.Files...)
+			p.lanes = append(p.lanes, "fetch")
+			p.mu.Unlock()
+			for _, grant := range request.Files {
+				if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_PrivatePackageFileStatus{
+					PrivatePackageFileStatus: &pb.PrivatePackageFileStatus{
+						RecordOwnerEpoch: request.RecordOwnerEpoch, ControlStreamEpoch: request.ControlStreamEpoch,
+						WorkerBootId: request.WorkerBootId, OperationId: request.OperationId,
+						SourceDigest: request.SourceDigest, Digest: grant.Digest, Filename: grant.Filename,
+						Kind: grant.Kind, Length: grant.Length, ReceivedBytes: grant.Length,
+						State: pb.PrivatePackageFileState_PRIVATE_PACKAGE_FILE_STATE_VERIFIED,
+					}}}); err != nil {
+					return err
+				}
+			}
 		}
 	}
+}
+
+// PreparePrivatePackage is the pod host's private lane: the set names wheels the pod
+// already holds verified, and the prepared placement is a development one carrying the
+// exact project wheel and the private revision digest, as Runtime authors it.
+func (p *fakePod) PreparePrivatePackage(call *pb.PreparePrivatePackageCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
+	if err := p.verifyClaim(call.Claim, false); err != nil {
+		return err
+	}
+	selected := call.PrivatePackageSet
+	if selected == nil || selected.Package == nil || len(selected.Files) == 0 {
+		return status.Error(codes.InvalidArgument, "no private package set")
+	}
+	var project *pb.PrivatePackageFileRef
+	var total uint64
+	for _, file := range selected.Files {
+		total += file.Length
+		if file.Kind == pb.LocalDownloadKind_LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL {
+			project = file
+		}
+	}
+	if project == nil {
+		return status.Error(codes.FailedPrecondition, "the private package set names no project wheel")
+	}
+	p.mu.Lock()
+	p.privatePrepares = append(p.privatePrepares, call)
+	p.lanes = append(p.lanes, "prepare_private")
+	p.mu.Unlock()
+	setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{{
+		PlacementId: "package-" + selected.OperationId,
+		PackageMode: &pb.Placement_Development{Development: &pb.DevelopmentPackage{
+			Package: selected.Package.Package, Release: selected.Package.Release,
+			SourceDigest: selected.Package.SourceDigest, PrivateRevisionDigest: selected.Package.PrivateRevisionDigest,
+			ProjectWheel: &pb.WheelFact{Ref: &pb.Ref{Digest: project.Digest, Length: project.Length},
+				Distribution: "weightless", Version: selected.Package.Release, Filename: project.Filename,
+				ImportRoots: []string{"weightless"}, Tags: []string{"py3-none-any"}}}},
+		EnvironmentDigest: bytes.Repeat([]byte{0x23}, 32),
+		PackageDescriptor: &pb.Ref{Digest: bytes.Repeat([]byte{0x24}, 32), Length: 2048},
+		BindingsDigest:    bytes.Repeat([]byte{0x25}, 32),
+		Entrypoints:       []*pb.Entrypoint{{Name: "tile", EntrypointBindingDigest: bytes.Repeat([]byte{0x34}, 32)}},
+		Environment:       &pb.Environment{},
+	}}})
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.preparedSet, p.preparedDig = setBytes, setDigest
+	p.mu.Unlock()
+	for _, event := range []*pb.PrepareEvent{
+		{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED, TotalBytes: total, TransferredBytes: total},
+		{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARING, TotalBytes: total, TransferredBytes: total},
+		{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED, TotalBytes: total, TransferredBytes: total,
+			PlacementSet: &pb.DesiredPlacementSet{PlacementSetDigest: setDigest, PlacementSetCanonicalBytes: setBytes}},
+	} {
+		if err := stream.Send(event); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
@@ -227,12 +443,28 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 	go server.Serve(listener)
 	t.Cleanup(server.Stop)
 	rev := mediawire.ContractRev
+	mediaRoot := filepath.Join(root, "pod-media")
 	mediaPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/health" {
+		switch {
+		case r.URL.Path == "/v1/health":
 			_ = json.NewEncoder(w).Encode(mediawire.Health{Service: mediawire.Service, ContractRev: &rev})
-			return
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/inputs/"):
+			body, _ := io.ReadAll(r.Body)
+			path := filepath.Join(mediaRoot, "inputs", strings.TrimPrefix(r.URL.Path, "/v1/inputs/"))
+			_ = os.MkdirAll(filepath.Dir(path), 0o755)
+			_ = os.WriteFile(path, body, 0o644)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"path": path, "length": len(body)})
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/outputs/"):
+			dir := filepath.Join(mediaRoot, "outputs", strings.TrimPrefix(r.URL.Path, "/v1/outputs/"))
+			_ = os.MkdirAll(dir, 0o755)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"dir": dir})
+		case r.Method == http.MethodDelete:
+			_ = json.NewEncoder(w).Encode(map[string]any{})
+		default:
+			w.WriteHeader(http.StatusNotFound)
 		}
-		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(mediaPlane.Close)
 	return &orchestrator.WorkerConnection{
@@ -264,6 +496,13 @@ func rentalWiring(connection *orchestrator.WorkerConnection, signer ed25519.Priv
 				return nil, exit.Internalf("%v", err)
 			}
 			return ed25519.Sign(signer, body), nil
+		}
+		o.PrivateWheels = func(_ context.Context, wheels []orchestrator.PrivateWheel) ([]string, *exit.Error) {
+			urls := make([]string, 0, len(wheels))
+			for _, wheel := range wheels {
+				urls = append(urls, "https://store.invalid/private/"+wheel.Digest)
+			}
+			return urls, nil
 		}
 		o.RentalPackageSet = func(c *orchestrator.WorkerConnection, packages []*pb.DownloadPackageRef,
 			models []*pb.DownloadModelRef) ([]byte, []byte, *exit.Error) {
@@ -381,5 +620,226 @@ func TestPodHostRefusesUnverifiedHostDocument(t *testing.T) {
 	case e := <-done:
 		t.Fatalf("EnsureRental returned (%s) although the barrier never opened", briefly(e))
 	default:
+	}
+}
+
+// privateLauncher is the one Launcher method a rental-bound editable request uses: the
+// sealed revision the request's install names. Everything local is out of scope on a pod.
+type privateLauncher struct {
+	orchestrator.Launcher
+	revision privatepackage.Revision
+}
+
+func (l privateLauncher) PrivateRevision(installID, digest string) (privatepackage.Revision, *exit.Error) {
+	if digest != l.revision.Digest {
+		return privatepackage.Revision{}, exit.New(exit.NotFound, "no private revision %s", digest)
+	}
+	return l.revision, nil
+}
+
+// stagePrivateRevision writes one project wheel and one dependency wheel under the root
+// and seals them the way `privatepackage.Stage` does: files sorted by digest, one project.
+func stagePrivateRevision(t *testing.T, root string) privatepackage.Revision {
+	t.Helper()
+	write := func(name string, body []byte) privatepackage.File {
+		path := filepath.Join(root, name)
+		must(t, os.WriteFile(path, body, 0o600))
+		digest, _ := canonical.Spell(sha256Of(body))
+		kind := "dependency"
+		if strings.HasPrefix(name, "weightless-") {
+			kind = "project"
+		}
+		return privatepackage.File{Digest: digest, Filename: name, Kind: kind, Path: path, Length: int64(len(body))}
+	}
+	files := []privatepackage.File{
+		write("weightless-1.0.0-py3-none-any.whl", bytes.Repeat([]byte("project wheel bytes\n"), 180)),
+		write("helper-0.3.0-py3-none-any.whl", bytes.Repeat([]byte("dependency wheel bytes\n"), 90)),
+	}
+	if files[1].Digest < files[0].Digest {
+		files[0], files[1] = files[1], files[0]
+	}
+	return privatepackage.Revision{Package: "local/weightless", Release: "1.0.0",
+		SourceDigest: "sha256:" + strings.Repeat("31", 32), Digest: "sha256:" + strings.Repeat("32", 32),
+		DescriptorDigest: "sha256:" + strings.Repeat("33", 32), DescriptorLength: 512, Files: files}
+}
+
+// submitPrivateRental records the editable install the request names and queues the
+// rental-bound request, exactly as `cozy run local/... --rental-only` does.
+func submitPrivateRental(t *testing.T, o *owner, revision privatepackage.Revision, idem string) string {
+	t.Helper()
+	install := records.PackageInstall{ID: "inst-" + idem, Package: revision.Package, Major: 1, Version: revision.Release,
+		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"), SourceDigest: revision.SourceDigest,
+		Dir: filepath.Join(o.root, "installs", idem), Python: "/usr/bin/python3", Platform: "linux-x86"}
+	_, e := o.store.Activate(install)
+	fatal(t, e)
+	planID := "sha256:" + strings.Repeat("34", 32)
+	requestID, _, e := o.c.Submit(orchestrator.Submission{
+		IdemKey: idem, Package: revision.Package, Entrypoint: "tile", PlanID: planID,
+		Release: revision.Release, ReleaseDigest: revision.SourceDigest,
+		PrivatePackageDigest: revision.Digest, Payload: []byte(`{"size":48}`), Outputs: []string{"image"},
+		Worker: podRental, InstallID: install.ID, Rental: true, RentalRequired: true,
+	})
+	fatal(t, e)
+	return requestID
+}
+
+// TestPodHostPrivateRevisionGrantsProjectWheel: a rental-bound editable request grants
+// every wheel of its sealed revision to the pod — the project wheel among them — BEFORE
+// the private set is prepared through PodHost, and the placement_set the owner then
+// sends is the exact bytes the host prepared, carrying that wheel.
+func TestPodHostPrivateRevisionGrantsProjectWheel(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	pod := &fakePod{controlKey: public}
+	root := t.TempDir()
+	connection, _ := startFakePod(t, root, pod)
+	revision := stagePrivateRevision(t, root)
+	pod.serve = true
+	o := hostOwner(t, "podhost-private", rentalWiring(connection, private), func(opt *orchestrator.Options) {
+		opt.Packages = privateLauncher{revision: revision}
+	})
+	requestID := submitPrivateRental(t, o, revision, "private-grants")
+
+	waitUntil(t, "the prepared placement_set on WorkerControl", func() bool {
+		pod.mu.Lock()
+		defer pod.mu.Unlock()
+		return len(pod.desired) >= 1
+	})
+	pod.mu.Lock()
+	defer pod.mu.Unlock()
+	if got := strings.Join(pod.lanes, ","); got != "fetch,prepare_private,placement_set" {
+		t.Fatalf("the pod saw the lanes in the order %q; want fetch, prepare_private, placement_set", got)
+	}
+	project := 0
+	for _, grant := range pod.grants {
+		spelled, _ := canonical.Spell(grant.Digest)
+		if grant.Kind == pb.LocalDownloadKind_LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL {
+			project++
+			if spelled != revision.Files[0].Digest && spelled != revision.Files[1].Digest ||
+				!strings.HasPrefix(grant.Filename, "weightless-") || grant.Url == "" {
+				t.Fatalf("the project wheel grant names %s %s, not the sealed revision's wheel", spelled, grant.Filename)
+			}
+		}
+	}
+	if len(pod.grants) != len(revision.Files) || project != 1 {
+		t.Fatalf("%d grant(s) with %d project wheel(s); want %d grants naming exactly one project wheel",
+			len(pod.grants), project, len(revision.Files))
+	}
+	if len(pod.privatePrepares) != 1 || len(pod.privatePrepares[0].PrivatePackageSet.Files) != len(revision.Files) ||
+		pod.privatePrepares[0].PrivatePackageSet.OperationId != requestID {
+		t.Fatalf("PodHost.PreparePrivatePackage saw %d call(s) for %v; want one naming request %s and every wheel",
+			len(pod.privatePrepares), pod.privatePrepares, requestID)
+	}
+	sent := pod.desired[0].GetPlacementSet()
+	if sent == nil || !bytes.Equal(sent.PlacementSetCanonicalBytes, pod.preparedSet) {
+		t.Fatalf("the desired state does not carry the exact bytes the host prepared")
+	}
+	doc, err := canonical.Read(sent.PlacementSetCanonicalBytes, &pb.PlacementSet{})
+	must(t, err)
+	wheel := doc.List("placements")[0].Sub("development").Sub("project_wheel").Sub("ref").Str("digest")
+	if wheel != revision.Files[0].Digest && wheel != revision.Files[1].Digest {
+		t.Fatalf("the placement's project wheel %s is not one the owner granted", wheel)
+	}
+	row, e := o.store.RequestRow(requestID)
+	fatal(t, e)
+	if row.PrivatePackageUploadedBootID != podBootID {
+		t.Fatalf("the request row records upload boot %q; want the pod's %s", row.PrivatePackageUploadedBootID, podBootID)
+	}
+	pod.mu.Unlock()
+	// THE POD SERVES: the request is DISPATCHED to the rented worker exactly once — the
+	// install that pins a local relaunch never hides the rental — and the spec names the
+	// private revision with no Environment identity, which development execution has none of.
+	waitUntil(t, "the attempt offer on the pod", func() bool {
+		pod.mu.Lock()
+		defer pod.mu.Unlock()
+		return len(pod.offers) >= 1
+	})
+	time.Sleep(300 * time.Millisecond)
+	pod.mu.Lock()
+	if len(pod.offers) != 1 || len(pod.desired) != 1 {
+		t.Fatalf("%d offer(s) over %d desired state(s); want one offer over the one prepared set",
+			len(pod.offers), len(pod.desired))
+	}
+	spec, err := canonical.Read(pod.offers[0].InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
+	must(t, err)
+	if spec.Str("package_revision_digest") != revision.Digest || spec.Str("environment_digest") != "" {
+		t.Fatalf("the InvocationSpec names revision %s and environment %q; want the private revision %s and no environment",
+			spec.Str("package_revision_digest"), spec.Str("environment_digest"), revision.Digest)
+	}
+}
+
+// TestPodPlacementRefusedRepeats: a pod that latches one materialization fault against the
+// desired revision and replays it unchanged on every report is answered by a typed request
+// failure after the fleet's still-factor of identical reports — never a timer, never an
+// unbounded queue. A fault whose text changes starts the count over; the rental stays
+// attached for the idle release; the owner sends no second desired state.
+func TestPodPlacementRefusedRepeats(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	pod := &fakePod{controlKey: public}
+	root := t.TempDir()
+	connection, _ := startFakePod(t, root, pod)
+	revision := stagePrivateRevision(t, root)
+	o := hostOwner(t, "podhost-latched", rentalWiring(connection, private), func(opt *orchestrator.Options) {
+		opt.Packages = privateLauncher{revision: revision}
+	})
+	missing := "sha256:" + strings.Repeat("2964e74c", 8) + " is reached by PlacementSet/1 and absent locally and from the plan"
+	first := &pb.Fault{Kind: pb.FaultKind_FAULT_KIND_ARTIFACT_FETCH_FAILED, Reason: "download_plan_missing", Detail: missing}
+	pod.setLatch(first)
+	requestID := submitPrivateRental(t, o, revision, "latched")
+
+	state := func() string {
+		row, e := o.store.RequestRow(requestID)
+		fatal(t, e)
+		return row.State
+	}
+	// Six identical reports, then the text changes: the count starts over, and the request
+	// is still queued after fourteen reports that never agreed eight times running.
+	waitUntil(t, "six identical fault reports", func() bool { return pod.reported(first.Reason+"/"+first.Detail) >= 6 })
+	changed := &pb.Fault{Kind: first.Kind, Reason: first.Reason, Detail: missing + " (grant refreshed)"}
+	pod.setLatch(changed)
+	waitUntil(t, "six changed fault reports", func() bool { return pod.reported(changed.Reason+"/"+changed.Detail) >= 6 })
+	if got := state(); got != "submitted" && got != "queued" {
+		t.Fatalf("the request is %s after twelve reports of two different faults; want it still waiting", got)
+	}
+	// The same fault, eight reports running: the worker's final word on this revision.
+	pod.setLatch(first)
+	waitUntil(t, "the typed request failure", func() bool { return state() == "failed" })
+	rows, e := o.store.EventsAfter(requestID, 0, 100)
+	fatal(t, e)
+	var failed map[string]any
+	for _, row := range rows {
+		if row.Type == "request.failed" {
+			failed = row.Payload
+		}
+	}
+	if failed == nil || failed["error_type"] != "worker.placement_refused" ||
+		!strings.HasPrefix(failed["error"].(string), "download_plan_missing: "+missing) {
+		t.Fatalf("request.failed payload = %v; want worker.placement_refused carrying the fault text", failed)
+	}
+	if n := pod.reported(first.Reason + "/" + first.Detail); n < 6+orchestrator.StillFactor {
+		t.Fatalf("the owner failed the request after %d identical reports; want at least %d", n, 6+orchestrator.StillFactor)
+	}
+	pod.mu.Lock()
+	sent := len(pod.desired)
+	pod.mu.Unlock()
+	if sent != 1 {
+		t.Fatalf("the owner sent %d desired states; want the one — a latched fault is never answered by a re-send", sent)
+	}
+	row, e := o.store.RequestRow(requestID)
+	fatal(t, e)
+	if row.Requeues != 0 {
+		t.Fatalf("the request was requeued %d time(s); want 0", row.Requeues)
+	}
+	instance, _, _, e := o.c.EnsureRental(podRental)
+	fatal(t, e)
+	facts := o.c.Worker(instance)
+	if facts == nil || facts.Exited {
+		t.Fatalf("the rented worker is gone (%v); the rental is the idle release's to end", facts)
+	}
+	log, err := os.ReadFile(filepath.Join(o.root, "orchestrator.log"))
+	must(t, err)
+	if !strings.Contains(string(log), "repeated unchanged on "+strconv.Itoa(orchestrator.StillFactor)+" consecutive reports") {
+		t.Errorf("the owner log does not name the repetition verdict")
 	}
 }
