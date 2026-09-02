@@ -72,14 +72,13 @@ type Options struct {
 	// RentalFleet renders the one fleet burn line after reconciling every local
 	// rental with Tensorhub. AcquireManagedRental is the capacity decision for a --rental
 	// request no rental holds a placement for (residency-aware-routing.md §3.2): it pins
-	// the request to the ready rental RankRentals puts first and says which it chose
-	// over what. With `download` it may choose a rental that must fetch the manifests, or
-	// buy one — only when no machine has them on disk; without it, a ready rental whose
-	// store already holds them, or nothing (an empty RentalID: the request waits).
+	// the request to the ready rental RankRentals puts first — disk holdings ORDER the
+	// candidates, never veto — and says which it chose over what; with no ready rental it
+	// BUYS a pod (owner ruling 2026-09-03: --rental is permission AND intent to spend).
 	// ReleaseManagedRental observes a rental as a request pinned to it settles and tears
 	// it down once nothing is left on it.
 	RentalFleet          func() (string, *exit.Error)
-	AcquireManagedRental func(req records.Request, download bool) (RentalDecision, string, *exit.Error)
+	AcquireManagedRental func(req records.Request) (RentalDecision, string, *exit.Error)
 	ReleaseManagedRental func(string) (string, *exit.Error)
 	ModelTransfers       ModelTransferOwner
 	// LocalWheels puts an unpublished revision's wheels in the object store and answers

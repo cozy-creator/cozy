@@ -20,7 +20,7 @@ func TestFailedRentalLeavesTheFleetTotals(t *testing.T) {
 		t.Helper()
 		fatal(t, store.RecordRental(records.Rental{
 			ID: id, MachineName: id, SKU: "rtx-pro-4500",
-			AcceleratorModel: "NVIDIA RTX PRO 4500 Blackwell",
+			AcceleratorModel:    "NVIDIA RTX PRO 4500 Blackwell",
 			HourlyRateUSDMicros: rate, State: state, Hub: "http://127.0.0.1:1",
 		}))
 	}

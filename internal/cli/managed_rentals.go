@@ -148,13 +148,13 @@ func (m *managedRentals) admit(skuName string) (string, int64, *exit.Error) {
 // acquire is the capacity decision for a --rental request no rental holds a placement
 // for (residency-aware-routing.md §3.2, D4): among the ready rentals of the request's
 // class the orchestrator's RankRentals puts the one whose store already holds the
-// placement's manifests first, then the fewest missing bytes, then the most room. A
-// download — a ready rental that must fetch, or a bought pod — is chosen only with
-// `download`, which the orchestrator grants when no machine has the manifests on disk;
-// otherwise a rental that holds them or nothing. The chosen rental is pinned to THIS
-// request alone — every other queued --rental request keeps routing over local and every
-// rental by score, and takes its pin from dispatch (cl-092 step 4).
-func (m *managedRentals) acquire(req records.Request, download bool) (orchestrator.RentalDecision, string, *exit.Error) {
+// placement's manifests first, then the fewest missing bytes, then the most room — disk
+// holdings ORDER the candidates, never veto. With no ready rental it BUYS a pod: --rental
+// is permission AND intent to spend (owner ruling 2026-09-03), regardless of what local
+// holds on disk. The chosen rental is pinned to THIS request alone — every other queued
+// --rental request keeps routing over local and every rental by score, and takes its pin
+// from dispatch (cl-092 step 4).
+func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecision, string, *exit.Error) {
 	var none orchestrator.RentalDecision
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -194,9 +194,6 @@ func (m *managedRentals) acquire(req records.Request, download bool) (orchestrat
 	}
 	if len(ready) > 0 {
 		ranked := m.owner.RankRentals(ready, req.Models)
-		if !ranked[0].Holds && !download {
-			return none, "", nil
-		}
 		chosen := ranked[0].RentalID
 		pinned, pinProblem := m.store.PinRental(req.ID, chosen)
 		if pinProblem != nil {
@@ -210,9 +207,6 @@ func (m *managedRentals) acquire(req records.Request, download bool) (orchestrat
 		return orchestrator.RentalDecision{RentalID: chosen, Candidates: ranked}, line, lineProblem
 	}
 
-	if !download {
-		return none, "", nil
-	}
 	sku, mismatch, found := rental.CheapestCompatibleSKU(skus, req.NeedsAccelerator,
 		releaseConstraints(m.ctx, req))
 	if !found && mismatch != "" {
