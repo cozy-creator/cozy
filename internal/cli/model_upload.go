@@ -284,13 +284,7 @@ func modelTransferIntent(plan modeltransfer.Plan) records.ModelTransferIntent {
 	}
 	outputs := make([]records.ModelTransferOutput, 0, len(plan.Outputs))
 	for _, output := range plan.Outputs {
-		var contract *records.ModelTransferContract
-		if output.RequiredContract != nil {
-			contract = &records.ModelTransferContract{TopologyDigest: output.RequiredContract.TopologyDigest,
-				Encodings: append([]string(nil), output.RequiredContract.Encodings...)}
-		}
-		outputs = append(outputs, records.ModelTransferOutput{Name: output.Name,
-			RequiredContract: contract})
+		outputs = append(outputs, records.ModelTransferOutput{Name: output.Name})
 	}
 	return records.ModelTransferIntent{Kind: plan.Instruction.Kind, Destination: plan.Destination,
 		Source: plan.Source, SourceSelection: plan.SourceSelection, SourceLicense: plan.SourceLicense,
@@ -520,8 +514,7 @@ func resolveProducerPlan(ctx *Context, raw string, supplied map[string]string) (
 		plan.SourceProfiles[slot.Param] = supplied[slot.Param]
 	}
 	for _, output := range job.WeightsOutputs {
-		plan.Outputs = append(plan.Outputs, modeltransfer.OutputPin{Name: output.OutputID,
-			RequiredContract: output.RequiredContract})
+		plan.Outputs = append(plan.Outputs, modeltransfer.OutputPin{Name: output.OutputID})
 	}
 	return plan, nil
 }

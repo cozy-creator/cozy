@@ -100,10 +100,9 @@ const WeightsManifestMime = "application/vnd.cozy.model-manifest"
 // WeightsOutput is one bounded WeightsSink slot projected from the installed job
 // descriptor. MaxBytes bounds only newly written table/config bytes, not inherited closure.
 type WeightsOutput struct {
-	OutputID         string                         `json:"output_id"`
-	MimeType         string                         `json:"mime_type"`
-	MaxBytes         uint64                         `json:"max_bytes"`
-	RequiredContract *records.ModelTransferContract `json:"required_contract,omitempty"`
+	OutputID string `json:"output_id"`
+	MimeType string `json:"mime_type"`
+	MaxBytes uint64 `json:"max_bytes"`
 }
 
 // Result is what one closed attempt produced.
@@ -1088,7 +1087,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// the payload digest, the ORDERED input identities, the output contracts, the
 	// deadline — lives INSIDE the digest. Its key set is closed: no human model ref, no
 	// service class, no local extension has a slot.
-	packageRevision, environmentDigest, configDigest, e := c.invocationIdentity(w, req)
+	packageRevision, environmentDigest, e := c.invocationIdentity(w, req)
 	if e != nil {
 		return 0, e
 	}
@@ -1104,7 +1103,6 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		// for a native install with no OCI image at all. The value is the same one this
 		// daemon was frozen with — a request cannot choose the environment it runs under.
 		EnvironmentDigest: environmentDigest,
-		ConfigDigest:      configDigest,
 		PayloadDigest:     payloadDigest,
 		Inputs:            inputBindings(req, payloadDigest),
 		Outputs:           invocationOutputBindings(splitList(req.Outputs), weightsOutputs, outputLimit),
@@ -1269,37 +1267,36 @@ func (c *Orchestrator) maxOutputBytes() uint64 {
 // therefore have one writer: neither package preparation nor rental selection needs a
 // second identity path.
 func (c *Orchestrator) invocationIdentity(w *worker,
-	req records.Request) (packageRevision, environment, config string, e *exit.Error) {
+	req records.Request) (packageRevision, environment string, e *exit.Error) {
 	c.mu.Lock()
 	placement, remote, instanceID := w.spec.Placement, w.spec.Connection != nil, w.instanceID
 	if selected, ok := w.remotePlacements[remotePlanKey(
 		pinnedPackage(req.Package, req.Worker), req.PlanID)]; remote && ok {
 		placement = selected
 	}
-	localConfig := w.configDigest
 	c.mu.Unlock()
 	packageRevision = placement.PackageRevisionDigest
 	if req.IsJob() && remote {
 		expected := remoteRevision(req)
 		if expected == "" || expected != packageRevision {
-			return "", "", "", exit.Named(exit.Conflict,
+			return "", "", exit.Named(exit.Conflict,
 				"request_invocation_identity_changed",
 				"worker %s no longer matches the job release pinned to request %s", instanceID, req.ID)
 		}
-		return packageRevision, "", "", nil
+		return packageRevision, "", nil
 	}
 	environment = placement.EnvironmentDigest
 	if environment == "" {
 		if !remote && placement.SourceDigest != "" {
-			return packageRevision, "", c.opt.ConfigDigest, nil
+			return packageRevision, "", nil
 		}
-		return "", "", "", exit.Named(exit.Structural, "placement_identity_missing",
+		return "", "", exit.Named(exit.Structural, "placement_identity_missing",
 			"worker %s carries no selected environment digest", instanceID)
 	}
 	if remote {
 		expected := remoteRevision(req)
 		if expected == "" || expected != packageRevision {
-			return "", "", "", exit.Named(exit.Conflict,
+			return "", "", exit.Named(exit.Conflict,
 				"request_invocation_identity_changed",
 				"worker %s no longer matches the invocation identity pinned to request %s",
 				instanceID, req.ID)
@@ -1312,32 +1309,28 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 		if req.LocalPackageDigest != "" {
 			specEnvironment = ""
 		}
-		if req.EnvironmentDigest == "" && req.ConfigDigest == "" {
+		if req.EnvironmentDigest == "" {
 			if req.LocalPackageDigest != "" {
 				e = c.opt.Store.BindLocalRemoteInvocation(req.ID, req.PlanID,
-					packageRevision, environment, placement.ConfigDigest)
+					packageRevision, environment)
 			} else {
 				e = c.opt.Store.BindRemoteInvocation(req.ID, req.PlanID,
-					packageRevision, environment, placement.ConfigDigest)
+					packageRevision, environment)
 			}
 			if e != nil {
-				return "", "", "", e
+				return "", "", e
 			}
-			return packageRevision, specEnvironment, placement.ConfigDigest, nil
+			return packageRevision, specEnvironment, nil
 		}
-		if req.EnvironmentDigest != environment || req.ConfigDigest != placement.ConfigDigest {
-			return "", "", "", exit.Named(exit.Conflict,
+		if req.EnvironmentDigest != environment {
+			return "", "", exit.Named(exit.Conflict,
 				"request_invocation_identity_changed",
 				"worker %s no longer matches the invocation identity pinned to request %s",
 				instanceID, req.ID)
 		}
-		return packageRevision, specEnvironment, req.ConfigDigest, nil
+		return packageRevision, specEnvironment, nil
 	}
-	if !validDigest(localConfig) {
-		return "", "", "", exit.Named(exit.Structural, "placement_identity_missing",
-			"worker %s carries no installed package config digest", instanceID)
-	}
-	return packageRevision, environment, localConfig, nil
+	return packageRevision, environment, nil
 }
 
 func spellOf(raw []byte) string {

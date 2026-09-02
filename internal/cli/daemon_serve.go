@@ -117,9 +117,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 	rentals := rental.Resolver(l, st)
 	knownRentals := rental.Known(st)
 
-	// The two per-daemon identity digests every local InvocationSpec rides (cl-022's
-	// guard): left unset, dispatch froze empty strings into every persisted invocation.
-	configDigest := localConfigDigest(ctx.Cfg)
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	transfers := newModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
 	localWheels := newLocalWheelOwner(ctx.Cfg, ctx.Out, ctx.AccountAuth)
@@ -133,7 +130,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 		ModelTransfers:       transfers,
 		LocalWheels:          localWheels.grants,
 		ReportReleaseDefect:  defects.report,
-		ConfigDigest:         configDigest,
 	})
 	if e != nil {
 		closeListeners()

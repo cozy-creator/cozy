@@ -60,7 +60,7 @@ func TestModelListShowsEachModelsBytesAndWhatItShares(t *testing.T) {
 		manifest := store.reproduce(name, header, entries, `[["model","own"],["model","shared"]]`)
 		manifestBytes[name] = manifest.length
 		if _, e := tool.ReplaceLocal(name, "sha256:"+shared.sha256, "absent", "sha256:"+manifest.sha256,
-			manifest.length, nil); e != nil {
+			manifest.length); e != nil {
 			t.Fatalf("local/%s: %s", name, briefly(e))
 		}
 		return store.walk(manifest.sha256)
@@ -213,10 +213,9 @@ type reproduced struct {
 }
 
 var (
-	admittedLine   = regexp.MustCompile(`admitted sha256:([0-9a-f]{64}) length=(\d+)`)
-	headerLine     = regexp.MustCompile(`header\s+sha256:([0-9a-f]{64})`)
-	manifestLine   = regexp.MustCompile(`manifest\s+sha256:([0-9a-f]{64}) length=(\d+)`)
-	topologyDigest = regexp.MustCompile(`topology_digest (sha256:[0-9a-f]{64})`)
+	admittedLine = regexp.MustCompile(`admitted sha256:([0-9a-f]{64}) length=(\d+)`)
+	headerLine   = regexp.MustCompile(`header\s+sha256:([0-9a-f]{64})`)
+	manifestLine = regexp.MustCompile(`manifest\s+sha256:([0-9a-f]{64}) length=(\d+)`)
 )
 
 func (s tfsStore) run(args ...string) string {
@@ -260,15 +259,6 @@ func (s tfsStore) reproduce(name, header, entries, order string) reproduced {
 	}
 	length, _ := strconv.ParseInt(m[2], 10, 64)
 	return reproduced{blobRef: blobRef{sha256: m[1], length: length}, header: h[1]}
-}
-
-func (s tfsStore) topology(header string) string {
-	s.t.Helper()
-	m := topologyDigest.FindStringSubmatch(s.run("checkpoint", "info", s.root, header))
-	if m == nil {
-		s.t.Fatalf("tfs checkpoint info printed no topology digest")
-	}
-	return m[1]
 }
 
 // walk is the manifest's distinct blob closure by TensorFS's other surface.

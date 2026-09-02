@@ -558,13 +558,9 @@ func (t *Tool) ObserveLocal(name, outPath string) (string, *exit.Error) {
 	return alias.RepositoryDigest, nil
 }
 
-func (t *Tool) InstallLocal(session, name, sourceSelection, observed, sourceURI, license string) *exit.Error {
+func (t *Tool) InstallLocal(session, name, sourceSelection, observed string) *exit.Error {
 	args := []string{"ingest", "install", t.Root, session, "local", name,
-		strings.TrimPrefix(sourceSelection, "sha256:"), "local", "--observed", observed,
-		"--source-uri", sourceURI}
-	if license != "" {
-		args = append(args, "--declared-license", license)
-	}
+		strings.TrimPrefix(sourceSelection, "sha256:"), "local", "--observed", observed}
 	_, problem := t.run(args...)
 	return problem
 }
@@ -572,22 +568,11 @@ func (t *Tool) InstallLocal(session, name, sourceSelection, observed, sourceURI,
 // ReplaceLocal atomically points Creator's one local alias at an already verified
 // WeightsSink Manifest. TensorFS owns manifest verification, repository bytes, and
 // compare-and-swap; Creator supplies only frozen identities.
-type ExpectedModelContract struct {
-	TopologyDigest string
-	Encodings      []string
-}
-
 func (t *Tool) ReplaceLocal(name, sourceSelection, observed, manifestID string,
-	manifestLength int64, contract *ExpectedModelContract,
+	manifestLength int64,
 ) (LocalAlias, *exit.Error) {
 	args := []string{"local", "replace", t.Root, name, sourceSelection,
 		manifestID, strconv.FormatInt(manifestLength, 10), "--observed", observed}
-	if contract != nil {
-		args = append(args, "--expected-topology", contract.TopologyDigest)
-		for _, encoding := range contract.Encodings {
-			args = append(args, "--expected-encoding", encoding)
-		}
-	}
 	out, problem := t.run(args...)
 	if problem != nil {
 		return LocalAlias{}, problem

@@ -508,8 +508,8 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				}
 				row := remotePlacementObservation{
 					placementID: p.PlacementId, packageRevision: p.PackageRevisionDigest,
-					environmentDigest: p.EnvironmentDigest, configDigest: p.ConfigDigest,
-					materialization: p.Materialization, serving: p.Serving,
+					environmentDigest: p.EnvironmentDigest,
+					materialization:   p.Materialization, serving: p.Serving,
 					dispatchablePlanIDs: map[string]bool{}, knownPlanIDs: map[string]bool{},
 				}
 				for _, digest := range p.DispatchableBindingDigests {
@@ -542,7 +542,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.placementID = status.PlacementId
 				w.materialization, w.serving = status.Materialization, status.Serving
 				w.packageRevisionDigest = status.PackageRevisionDigest
-				w.environmentDigest, w.configDigest = status.EnvironmentDigest, status.ConfigDigest
+				w.environmentDigest = status.EnvironmentDigest
 				w.executorEpoch = status.ExecutorEpoch
 				w.heldSetDigest = status.PlacementSetDigest
 				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
@@ -550,7 +550,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			} else {
 				w.materialization = pb.MaterializationState_MATERIALIZATION_STATE_UNSPECIFIED
 				w.serving = pb.ServingState_SERVING_STATE_UNSPECIFIED
-				w.packageRevisionDigest, w.environmentDigest, w.configDigest = "", "", ""
+				w.packageRevisionDigest, w.environmentDigest = "", ""
 			}
 		} else {
 			for _, p := range r.Placements {
@@ -562,7 +562,6 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.materialization, w.serving = status.Materialization, status.Serving
 				w.packageRevisionDigest = status.PackageRevisionDigest
 				w.environmentDigest = status.EnvironmentDigest
-				w.configDigest = status.ConfigDigest
 				w.executorEpoch = status.ExecutorEpoch
 				w.heldSetDigest = status.PlacementSetDigest
 				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
@@ -582,7 +581,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				// dispatchable, which is exactly true.
 				w.materialization = pb.MaterializationState_MATERIALIZATION_STATE_UNSPECIFIED
 				w.serving = pb.ServingState_SERVING_STATE_UNSPECIFIED
-				w.packageRevisionDigest, w.environmentDigest, w.configDigest = "", "", ""
+				w.packageRevisionDigest, w.environmentDigest = "", ""
 			}
 		}
 		w.dispatchable, w.materializable = dispatchable, materializable

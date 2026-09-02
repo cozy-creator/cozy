@@ -86,7 +86,6 @@ type DesiredPlacement struct {
 	PlacementSetDigest string       `json:"placement_set_digest"`
 	PlacementSetBytes  []byte       `json:"placement_set_bytes"`
 	EnvironmentDigest  string       `json:"environment_digest"`
-	ConfigDigest       string       `json:"config_digest"`
 	Entrypoints        []Entrypoint `json:"entrypoints"`
 	PlacementIDValue   string       `json:"placement_id,omitempty"`
 	// Models is the exact selection this placement was resolved with (empty = the package's
@@ -503,7 +502,6 @@ type worker struct {
 	snapshotAcknowledged  bool
 	packageRevisionDigest string
 	environmentDigest     string
-	configDigest          string
 	// The job lane uses the same reported-versus-pre-offer split as serving. jobsAvail is
 	// the effective number dispatch reads.
 	reportedJobs int
@@ -549,7 +547,6 @@ type remotePlacementObservation struct {
 	placementID         string
 	packageRevision     string
 	environmentDigest   string
-	configDigest        string
 	materialization     pb.MaterializationState
 	serving             pb.ServingState
 	dispatchablePlanIDs map[string]bool
@@ -883,7 +880,7 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 				observed.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
 				w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision
 			if ready && (!validDigest(observed.packageRevision) ||
-				!validDigest(observed.environmentDigest) || !validDigest(observed.configDigest)) {
+				!validDigest(observed.environmentDigest)) {
 				c.mu.Unlock()
 				return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
 					"rental.invocation_identity_invalid",
@@ -900,8 +897,8 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 				placement := DesiredPlacement{
 					Package: pinnedPackage(logical.Package, rentalID), Release: logical.Release,
 					PackageRevisionDigest: observed.packageRevision,
-					EnvironmentDigest:     observed.environmentDigest, ConfigDigest: observed.configDigest,
-					PlacementIDValue: observed.placementID,
+					EnvironmentDigest:     observed.environmentDigest,
+					PlacementIDValue:      observed.placementID,
 					Entrypoints: []Entrypoint{{Name: logical.Function, Digest: planID,
 						Outputs: append([]string(nil), logical.Outputs...)}},
 					Models: append([]ModelRef(nil), logical.Models...),

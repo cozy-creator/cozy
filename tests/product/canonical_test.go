@@ -354,10 +354,10 @@ func TestPackageDescriptor(t *testing.T) {
 	}
 }
 
-// TestDynamicProducerOutputContracts is the model-upload dry-run boundary. A generic
-// source-derived producer cannot name one topology before it sees the selected source,
-// while an H3-style producer that does declare a contract must still match it exactly.
-func TestDynamicProducerOutputContracts(t *testing.T) {
+// TestDynamicProducerOutputs is the model-upload dry-run boundary. The selected
+// source determines the exact header; the descriptor and intent agree only on
+// output slot names, never a duplicate topology contract.
+func TestDynamicProducerOutputs(t *testing.T) {
 	raw := []byte(`{"application":"quantize:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"QuantizationSource","component_use":{},"path":"produce.models.source","stamps":{}}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"mxfp8"}]}]}`)
 	descriptor, problem := launch.DecodeDescriptor(raw)
 	fatal(t, problem)
@@ -365,7 +365,7 @@ func TestDynamicProducerOutputContracts(t *testing.T) {
 	fatal(t, problem)
 	profiles := map[string]string{"source": "civitai/sdxl/single-file/1"}
 	if problem := modeltransfer.ValidateProducer("paul/quantize@v1/produce", job, profiles); problem != nil {
-		t.Fatalf("generic model producer was refused before source-derived contracts exist: %s", problem.Message)
+		t.Fatalf("generic model producer was refused before its source is selected: %s", problem.Message)
 	}
 
 	intent := &records.ModelTransferIntent{Kind: "model-upload", Destination: "paul/sdxl",
@@ -378,23 +378,11 @@ func TestDynamicProducerOutputContracts(t *testing.T) {
 			{OutputID: "bf16"}, {OutputID: "fp8"}, {OutputID: "mxfp8"},
 		}}
 	if problem := modeltransfer.ValidateSubmission(spec); problem != nil {
-		t.Fatalf("matching open output contracts were refused: %s", problem.Message)
+		t.Fatalf("matching output slots were refused: %s", problem.Message)
 	}
-
-	contract := &records.ModelTransferContract{TopologyDigest: "sha256:" + strings.Repeat("2", 64),
-		Encodings: []string{"sha256:" + strings.Repeat("3", 64)}}
-	spec.ModelTransfer.Outputs[0].RequiredContract = contract
+	spec.ModelTransfer.Outputs[0].Name = "other"
 	if problem := modeltransfer.ValidateSubmission(spec); problem == nil {
-		t.Fatal("an intent-authored contract absent from the descriptor was accepted")
-	}
-	spec.WeightsOutputs[0].RequiredContract = &records.ModelTransferContract{
-		TopologyDigest: contract.TopologyDigest, Encodings: append([]string(nil), contract.Encodings...)}
-	if problem := modeltransfer.ValidateSubmission(spec); problem != nil {
-		t.Fatalf("an exact declared contract was refused: %s", problem.Message)
-	}
-	spec.WeightsOutputs[0].RequiredContract.TopologyDigest = "sha256:" + strings.Repeat("4", 64)
-	if problem := modeltransfer.ValidateSubmission(spec); problem == nil {
-		t.Fatal("a descriptor/intent topology mismatch was accepted")
+		t.Fatal("an intent output absent from the descriptor was accepted")
 	}
 	if problem := modeltransfer.ValidateSubmission(orchestrator.Submission{
 		WeightsOutputs: []orchestrator.WeightsOutput{{OutputID: "ordinary-job-output"}},

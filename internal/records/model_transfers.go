@@ -84,14 +84,8 @@ type ModelTransferSourceStatus struct {
 	Length, CapabilityRevision, Transferred                  int64
 }
 
-type ModelTransferContract struct {
-	TopologyDigest string   `json:"topology_digest"`
-	Encodings      []string `json:"encodings"`
-}
-
 type ModelTransferOutput struct {
-	Name             string                 `json:"name"`
-	RequiredContract *ModelTransferContract `json:"required_contract,omitempty"`
+	Name string `json:"name"`
 }
 
 // ModelTransferIntent is immutable request meaning. Credentials, URLs, workers,
@@ -189,19 +183,6 @@ func NormalizeModelTransferIntent(intent *ModelTransferIntent) *exit.Error {
 			return exit.New(exit.Validation, "model transfer output names are non-empty and unique")
 		}
 		seen[output.Name] = true
-		if output.RequiredContract != nil {
-			if _, err := canonical.Raw(output.RequiredContract.TopologyDigest); err != nil {
-				return exit.New(exit.Validation, "model transfer output %s topology is invalid", output.Name)
-			}
-			output.RequiredContract.Encodings = append([]string(nil), output.RequiredContract.Encodings...)
-			sort.Strings(output.RequiredContract.Encodings)
-			for index, encoding := range output.RequiredContract.Encodings {
-				if _, err := canonical.Raw(encoding); err != nil ||
-					(index > 0 && output.RequiredContract.Encodings[index-1] == encoding) {
-					return exit.New(exit.Validation, "model transfer output %s encodings are invalid", output.Name)
-				}
-			}
-		}
 	}
 	return nil
 }

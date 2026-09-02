@@ -175,7 +175,6 @@ func body(m protoreflect.Message) (map[string]Value, error) {
 }
 
 var explicitRepeated = map[string][]string{
-	"cozy.worker.v1.Config":               {"assets"},
 	"cozy.worker.v1.DownloadDelegation":   {"models", "packages"},
 	"cozy.worker.v1.Entrypoint":           {"slots"},
 	"cozy.worker.v1.Environment":          {"wheels"},

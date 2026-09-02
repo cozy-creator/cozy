@@ -106,7 +106,6 @@ func (p *fakePod) served(d *pb.DesiredWorkerState, epoch uint64) *pb.WorkerFrame
 			Serving:         pb.ServingState_SERVING_STATE_DISPATCHABLE, ExecutorEpoch: 1,
 			PlacementSetDigest: set.PlacementSetDigest,
 			EnvironmentDigest:  placement.Str("environment_digest"),
-			ConfigDigest:       "sha256:" + strings.Repeat("26", 32),
 		}
 		development := placement.Sub("development")
 		if development != nil {

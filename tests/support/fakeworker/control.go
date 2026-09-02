@@ -188,7 +188,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 		}
 	}
 	placementStatus := func(placementID string, setDigest []byte, planIDs []string,
-		packageRevision, environmentDigest, configDigest string,
+		packageRevision, environmentDigest string,
 	) *pb.PlacementStatus {
 		var bindingDigests [][]byte
 		for _, planID := range planIDs {
@@ -202,7 +202,6 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			Serving: pb.ServingState_SERVING_STATE_DISPATCHABLE, ExecutorEpoch: 1,
 			DispatchableBindingDigests: bindingDigests, PlacementSetDigest: setDigest,
 			PackageRevisionDigest: packageRevision, EnvironmentDigest: environmentDigest,
-			ConfigDigest: configDigest,
 		}
 	}
 	outcome := func(t *pb.AttemptOutcome) {
@@ -255,14 +254,12 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				}
 				for _, p := range doc.List("placements") {
 					planIDs := []string(nil)
-					emptyConfig, _ := canonical.Write(map[string]canonical.Value{})
-					configDigest, _ := canonical.Spell(canonical.Digest(emptyConfig))
 					for _, entrypoint := range p.List("entrypoints") {
 						planIDs = append(planIDs, entrypoint.Str("entrypoint_binding_digest"))
 					}
 					placements = append(placements, placementStatus(p.Str("placement_id"), setDigest,
 						planIDs, p.Sub("package").Str("release_digest"),
-						p.Str("environment_digest"), configDigest))
+						p.Str("environment_digest")))
 				}
 			}
 			plans := 0

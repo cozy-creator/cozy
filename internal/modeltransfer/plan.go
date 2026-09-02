@@ -11,8 +11,6 @@ import (
 	"fmt"
 	"io"
 	"sort"
-
-	"github.com/cozy-creator/cozy/internal/launch"
 )
 
 type JobPin struct {
@@ -26,8 +24,7 @@ type JobPin struct {
 }
 
 type OutputPin struct {
-	Name             string                       `json:"name"`
-	RequiredContract *launch.WeightsModelContract `json:"required_contract,omitempty"`
+	Name string `json:"name"`
 }
 
 type SourceFile struct {

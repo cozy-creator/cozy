@@ -138,14 +138,8 @@ func (c *Client) GrantKnownTransfers(ctx context.Context, ref Ref, operation str
 }
 
 type FinalizePublicationRequest struct {
-	ManifestID       string                 `json:"manifest_id"`
-	ManifestLength   int64                  `json:"manifest_length"`
-	ExpectedContract *ExpectedModelContract `json:"expected_contract,omitempty"`
-}
-
-type ExpectedModelContract struct {
-	TopologyDigest string   `json:"topology_digest"`
-	Encodings      []string `json:"encodings"`
+	ManifestID     string `json:"manifest_id"`
+	ManifestLength int64  `json:"manifest_length"`
 }
 
 type ManifestRef struct {
@@ -153,27 +147,15 @@ type ManifestRef struct {
 	Length int64  `json:"length"`
 }
 
-type Encoding struct {
-	Set []string `json:"set"`
-}
-
-type Contract struct {
-	Stamps    map[string][]string `json:"stamps"`
-	Structure string              `json:"structure"`
-	Encoding  Encoding            `json:"encoding"`
-}
-
 // CheckpointPublication is the durable owner-only checkpoint returned by finalize.
 type CheckpointPublication struct {
-	PublishID      string      `json:"publish_id"`
-	CheckpointID   string      `json:"checkpoint_id"`
-	Manifest       ManifestRef `json:"manifest"`
-	Contract       Contract    `json:"contract"`
-	TopologyDigest string      `json:"topology_digest"`
-	Objects        int         `json:"objects"`
-	Bytes          int64       `json:"bytes"`
-	State          string      `json:"state"`
-	Duplicate      bool        `json:"duplicate"`
+	PublishID    string      `json:"publish_id"`
+	CheckpointID string      `json:"checkpoint_id"`
+	Manifest     ManifestRef `json:"manifest"`
+	Objects      int         `json:"objects"`
+	Bytes        int64       `json:"bytes"`
+	State        string      `json:"state"`
+	Duplicate    bool        `json:"duplicate"`
 }
 
 func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation string,
@@ -190,11 +172,10 @@ func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation str
 }
 
 type ModelReleaseLane struct {
-	Lane         string   `json:"lane"`
-	CheckpointID string   `json:"checkpoint_id"`
-	Contract     Contract `json:"contract"`
-	Objects      int      `json:"objects"`
-	Bytes        int64    `json:"bytes"`
+	Lane         string `json:"lane"`
+	CheckpointID string `json:"checkpoint_id"`
+	Objects      int    `json:"objects"`
+	Bytes        int64  `json:"bytes"`
 }
 
 // ModelRelease is one revision of a mutable human release label. Checkpoints

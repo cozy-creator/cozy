@@ -41,7 +41,6 @@ CREATE TABLE IF NOT EXISTS requests (
   local_package_digest TEXT NOT NULL DEFAULT '',
   local_package_uploaded_boot_id TEXT NOT NULL DEFAULT '',
   environment_digest TEXT NOT NULL DEFAULT '',
-  config_digest TEXT NOT NULL DEFAULT '',
   payload      BLOB    NOT NULL,
   outputs      TEXT    NOT NULL DEFAULT '',
   state        TEXT    NOT NULL,
@@ -444,7 +443,6 @@ type Request struct {
 	LocalPackageDigest         string
 	LocalPackageUploadedBootID string
 	EnvironmentDigest          string
-	ConfigDigest               string
 	Payload                    []byte
 	// Outputs names one destination per RESULT FIELD PATH. It lives on the request
 	// because a REQUEUE re-derives the same grant shape without a client saying so again.
@@ -539,14 +537,14 @@ type ModelRef struct {
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
 	package_revision_digest,local_package_digest,local_package_uploaded_boot_id,
-	environment_digest,config_digest,payload,outputs,
+	environment_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
 	COALESCE(install_id,''),assets,models,weights_outputs`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
 		&r.Release, &r.PackageRevisionDigest, &r.LocalPackageDigest,
-		&r.LocalPackageUploadedBootID, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
+		&r.LocalPackageUploadedBootID, &r.EnvironmentDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
 		&r.InstallID, assets, models, &r.WeightsOutputs}
@@ -674,15 +672,14 @@ func (s *Store) BindRequestPlan(id, planID string) *exit.Error {
 
 // BindRemoteInvocation records the exact invocation identity learned from the worker
 // after logical package_set resolution. The client never supplies these values.
-func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, config string) *exit.Error {
-	if id == "" || planID == "" || packageRevision == "" || environment == "" || config == "" {
+func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment string) *exit.Error {
+	if id == "" || planID == "" || packageRevision == "" || environment == "" {
 		return exit.Internalf("cannot bind an incomplete remote invocation identity")
 	}
 	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,package_revision_digest=?,
-		environment_digest=?,config_digest=? WHERE id=? AND (plan_id='' OR plan_id=?) AND
+		environment_digest=? WHERE id=? AND (plan_id='' OR plan_id=?) AND
 		(package_revision_digest='' OR package_revision_digest=?) AND
-		environment_digest='' AND config_digest=''`,
-		planID, packageRevision, environment, config, id, planID, packageRevision)
+		environment_digest=''`, planID, packageRevision, environment, id, planID, packageRevision)
 	if err != nil {
 		return exit.Internalf("cannot bind request %s remote invocation: %s", id, err)
 	}
@@ -693,14 +690,13 @@ func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, c
 	if changed == 1 {
 		return nil
 	}
-	var heldPlan, heldPackage, heldEnvironment, heldConfig string
-	if err := s.db.QueryRow(`SELECT plan_id,package_revision_digest,environment_digest,config_digest
+	var heldPlan, heldPackage, heldEnvironment string
+	if err := s.db.QueryRow(`SELECT plan_id,package_revision_digest,environment_digest
 		FROM requests WHERE id=?`, id).Scan(
-		&heldPlan, &heldPackage, &heldEnvironment, &heldConfig); err != nil {
+		&heldPlan, &heldPackage, &heldEnvironment); err != nil {
 		return exit.Internalf("cannot read request %s remote invocation binding: %s", id, err)
 	}
-	if heldPlan != planID || heldPackage != packageRevision || heldEnvironment != environment ||
-		heldConfig != config {
+	if heldPlan != planID || heldPackage != packageRevision || heldEnvironment != environment {
 		return exit.Named(exit.Conflict, "request_invocation_identity_changed",
 			"request %s already binds a different worker-derived invocation identity", id)
 	}
@@ -711,14 +707,14 @@ func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, c
 // checkout source digest separately in package_revision_digest. local_package_digest is the
 // exact execution identity and must already equal the Runtime-reported revision.
 func (s *Store) BindLocalRemoteInvocation(id, planID, localRevision,
-	environment, config string,
+	environment string,
 ) *exit.Error {
-	if id == "" || planID == "" || localRevision == "" || environment == "" || config == "" {
+	if id == "" || planID == "" || localRevision == "" || environment == "" {
 		return exit.Internalf("cannot bind an incomplete local package remote invocation identity")
 	}
-	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,environment_digest=?,config_digest=?
+	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,environment_digest=?
     WHERE id=? AND local_package_digest=? AND (plan_id='' OR plan_id=?) AND
-    environment_digest='' AND config_digest=''`, planID, environment, config, id,
+    environment_digest=''`, planID, environment, id,
 		localRevision, planID)
 	if err != nil {
 		return exit.Internalf("cannot bind request %s local package invocation: %s", id, err)
@@ -726,14 +722,12 @@ func (s *Store) BindLocalRemoteInvocation(id, planID, localRevision,
 	if changed, err := result.RowsAffected(); err == nil && changed == 1 {
 		return nil
 	}
-	var heldPlan, heldLocal, heldEnvironment, heldConfig string
-	if err := s.db.QueryRow(`SELECT plan_id,local_package_digest,environment_digest,config_digest
-    FROM requests WHERE id=?`, id).Scan(&heldPlan, &heldLocal, &heldEnvironment,
-		&heldConfig); err != nil {
+	var heldPlan, heldLocal, heldEnvironment string
+	if err := s.db.QueryRow(`SELECT plan_id,local_package_digest,environment_digest
+	FROM requests WHERE id=?`, id).Scan(&heldPlan, &heldLocal, &heldEnvironment); err != nil {
 		return exit.Internalf("cannot read request %s local package invocation binding: %s", id, err)
 	}
-	if heldPlan != planID || heldLocal != localRevision || heldEnvironment != environment ||
-		heldConfig != config {
+	if heldPlan != planID || heldLocal != localRevision || heldEnvironment != environment {
 		return exit.Named(exit.Conflict, "request_invocation_identity_changed",
 			"request %s already binds a different local package invocation identity", id)
 	}
@@ -1174,14 +1168,14 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
 		plan_id,package_release,package_revision_digest,local_package_digest,
-		local_package_uploaded_boot_id,environment_digest,config_digest,
+		local_package_uploaded_boot_id,environment_digest,
 		payload,outputs,state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,models,
 		weights_outputs)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
 		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.PackageRevisionDigest, r.LocalPackageDigest,
-		r.LocalPackageUploadedBootID, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
+		r.LocalPackageUploadedBootID, r.EnvironmentDigest, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.NeedsAccelerator, r.Org, r.Trees, r.Worker,
 		r.Worker, r.Rental,
 		r.RentalRequired,

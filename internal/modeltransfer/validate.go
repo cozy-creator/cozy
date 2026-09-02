@@ -1,12 +1,9 @@
 package modeltransfer
 
 import (
-	"strings"
-
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // ValidateProducer checks only the callable shape model download/upload needs.
@@ -59,8 +56,7 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 		if !platformPassThrough {
 			return exit.New(exit.Validation, "platform pass-through requires exact package and function")
 		}
-		if len(intent.Outputs) != 1 || intent.Outputs[0].Name != "model" ||
-			intent.Outputs[0].RequiredContract != nil {
+		if len(intent.Outputs) != 1 || intent.Outputs[0].Name != "model" {
 			return exit.New(exit.Validation, "platform pass-through requires exactly output model")
 		}
 		return nil
@@ -69,16 +65,15 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 		!profilesCoverParams(intent.SourceProfiles, spec.ProducerParams) {
 		return exit.New(exit.Validation, "producer transfer inputs/outputs do not match the job descriptor")
 	}
-	declared := make(map[string]*orchestrator.WeightsOutput, len(spec.WeightsOutputs))
+	declared := make(map[string]bool, len(spec.WeightsOutputs))
 	for index := range spec.WeightsOutputs {
 		output := &spec.WeightsOutputs[index]
-		declared[output.OutputID] = output
+		declared[output.OutputID] = true
 	}
 	for _, output := range intent.Outputs {
-		declaredOutput := declared[output.Name]
-		if declaredOutput == nil || !sameContract(output.RequiredContract, declaredOutput.RequiredContract) {
+		if !declared[output.Name] {
 			return exit.New(exit.Validation,
-				"producer transfer output %s differs from its descriptor contract", output.Name)
+				"producer transfer output %s is absent from its descriptor", output.Name)
 		}
 	}
 	return nil
@@ -97,12 +92,4 @@ func profilesCoverParams(intent map[string]string, params []string) bool {
 		}
 	}
 	return true
-}
-
-func sameContract(left, right *records.ModelTransferContract) bool {
-	if left == nil || right == nil {
-		return left == nil && right == nil
-	}
-	return left.TopologyDigest == right.TopologyDigest &&
-		strings.Join(left.Encodings, "\x00") == strings.Join(right.Encodings, "\x00")
 }

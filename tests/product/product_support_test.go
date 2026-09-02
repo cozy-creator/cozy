@@ -94,7 +94,7 @@ func hostOwner(t *testing.T, name string, with ...func(*orchestrator.Options)) *
 	must(t, err)
 	options := orchestrator.Options{
 		Cfg: cfg, Layout: l, Store: st, Yield: "smart", Log: log,
-		ConfigDigest: "sha256:" + strings.Repeat("22", 32), MaxOutputMiB: 8,
+		MaxOutputMiB: 8,
 	}
 	for _, mutate := range with {
 		mutate(&options)

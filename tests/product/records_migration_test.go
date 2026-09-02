@@ -51,14 +51,14 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 17 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 19 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
-	// Schema 15: the request's editable revision columns say local_package_*, one word.
-	// Schema 17: the machine word column exists and the migration backfilled it.
+	// The request keeps the schema-15 local_package spelling, schema 17 records
+	// the machine word, and schema 19 deletes the duplicate config digest.
 	if columns := columnNames(t, db, "requests"); !columns["local_package_digest"] ||
 		!columns["local_package_uploaded_boot_id"] || columns["private_package_digest"] ||
-		!columns["machine"] {
+		!columns["machine"] || columns["config_digest"] {
 		t.Fatalf("requests columns after migration = %v", columns)
 	}
 	// Schema 17 backfill: a row whose rental row survives gets that rental's machine

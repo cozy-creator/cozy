@@ -84,10 +84,7 @@ type Options struct {
 	// LocalWheels puts an unpublished revision's wheels in the object store and answers
 	// with one read capability per wheel (th-094). Without it this daemon cannot transfer a
 	// local package: the control stream carries control, not content.
-	LocalWheels LocalWheelGrantSource
-	// ConfigDigest is the local evaluated-config identity. Environment identity
-	// comes only from the exact selected PlacementSet.
-	ConfigDigest string
+	LocalWheels  LocalWheelGrantSource
 	MaxOutputMiB int64
 }
 

@@ -28,7 +28,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -69,15 +68,9 @@ type Entrypoint struct {
 }
 
 type WeightsOutput struct {
-	OutputID         string                `json:"output_id"`
-	MimeType         string                `json:"mime_type"`
-	MaxBytes         uint64                `json:"max_bytes"`
-	RequiredContract *WeightsModelContract `json:"required_contract,omitempty"`
-}
-
-type WeightsModelContract struct {
-	TopologyDigest string   `json:"topology_digest"`
-	Encodings      []string `json:"encodings"`
+	OutputID string `json:"output_id"`
+	MimeType string `json:"mime_type"`
+	MaxBytes uint64 `json:"max_bytes"`
 }
 
 // Slot is one declared model binding path — capability, never selection. Its members
@@ -263,19 +256,8 @@ func validateClosedDescriptor(data []byte) error {
 				}
 				for _, output := range rows {
 					if _, err := exactKeys(output,
-						[]string{"max_bytes", "mime_type", "output_id"},
-						[]string{"required_contract"}); err != nil {
+						[]string{"max_bytes", "mime_type", "output_id"}, nil); err != nil {
 						return err
-					}
-					var fields map[string]json.RawMessage
-					if err := json.Unmarshal(output, &fields); err != nil {
-						return err
-					}
-					if contract := fields["required_contract"]; contract != nil {
-						if _, err := exactKeys(contract,
-							[]string{"encodings", "topology_digest"}, nil); err != nil {
-							return err
-						}
 					}
 				}
 			}
@@ -441,30 +423,9 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 				"%s has an invalid weights output %q: slots are unique snapshot MIME rows with a 1..2^53-1 byte cap",
 				ep.Name, output.OutputID)
 		}
-		if contract := output.RequiredContract; contract != nil &&
-			(!descriptorDigestPattern.MatchString(contract.TopologyDigest) ||
-				!validDescriptorDigestList(contract.Encodings, 32)) {
-			return exit.New(exit.Validation,
-				"%s weights output %s has an invalid required model contract",
-				ep.Name, output.OutputID)
-		}
 		seenWeights[output.OutputID] = true
 	}
 	return nil
-}
-
-var descriptorDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-
-func validDescriptorDigestList(values []string, cap int) bool {
-	if len(values) < 1 || len(values) > cap {
-		return false
-	}
-	for i, value := range values {
-		if !descriptorDigestPattern.MatchString(value) || i > 0 && values[i-1] >= value {
-			return false
-		}
-	}
-	return true
 }
 
 // DescriptorPath is the one install-private location for Runtime-derived bytes.

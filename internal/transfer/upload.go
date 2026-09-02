@@ -49,10 +49,9 @@ func CheckpointOperationID(ref hub.Ref, manifestID string) string {
 
 // Upload is one incremental owner-only checkpoint upload, start to finish.
 type Upload struct {
-	Tool             *tfs.Tool
-	Hub              *hub.Client
-	Ref              hub.Ref
-	ExpectedContract *hub.ExpectedModelContract
+	Tool *tfs.Tool
+	Hub  *hub.Client
+	Ref  hub.Ref
 	// ManifestID is the local canonical manifest being published.
 	ManifestID string
 	Session    string
@@ -77,13 +76,11 @@ type Result struct {
 	Verified  int
 	// Moved is bytes this invocation actually put on the wire; Deduped is what the
 	// hub already held. Their sum is the artifact.
-	Moved          int64
-	Deduped        int64
-	Manifest       hub.ManifestRef
-	TopologyDigest string
-	EncodingSet    []string
-	Dup            bool
-	MS             map[string]int64
+	Moved    int64
+	Deduped  int64
+	Manifest hub.ManifestRef
+	Dup      bool
+	MS       map[string]int64
 }
 
 func ValidateOpenedPublication(opened hub.OpenPublicationResponse, operation string,
@@ -164,7 +161,6 @@ func (p *Upload) Run(ctx context.Context) (Result, *exit.Error) {
 		Length: manifestInfo.Size()}
 	finalize := hub.FinalizePublicationRequest{
 		ManifestID: p.ManifestID, ManifestLength: manifestInfo.Size(),
-		ExpectedContract: p.ExpectedContract,
 	}
 	declared := make([]hub.Object, 0, len(objects)+1)
 	for _, o := range objects {
@@ -259,8 +255,7 @@ func (p *Upload) finalize(ctx context.Context, request hub.FinalizePublicationRe
 		res.Manifest.Length, res.Totals); problem != nil {
 		return res, problem
 	}
-	res.Manifest, res.TopologyDigest, res.Verified = checkpoint.Manifest, checkpoint.TopologyDigest, checkpoint.Objects
-	res.EncodingSet = append([]string(nil), checkpoint.Contract.Encoding.Set...)
+	res.Manifest, res.Verified = checkpoint.Manifest, checkpoint.Objects
 	res.Dup = checkpoint.Duplicate
 	if checkpoint.Duplicate {
 		p.say("this exact checkpoint was already retained")

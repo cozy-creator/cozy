@@ -609,14 +609,8 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 	}
 	outputs := launch.AssetPaths(job.Result)
 	for _, output := range job.WeightsOutputs {
-		var contract *records.ModelTransferContract
-		if output.RequiredContract != nil {
-			contract = &records.ModelTransferContract{TopologyDigest: output.RequiredContract.TopologyDigest,
-				Encodings: append([]string(nil), output.RequiredContract.Encodings...)}
-		}
 		weights = append(weights, orchestrator.WeightsOutput{
 			OutputID: output.OutputID, MimeType: output.MimeType, MaxBytes: output.MaxBytes,
-			RequiredContract: contract,
 		})
 		outputs = append(outputs, output.OutputID)
 	}

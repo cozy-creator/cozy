@@ -7,7 +7,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // THE JOB HALF of an installed package (cl-004). A job is an attempt class on the one
@@ -163,14 +162,8 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	weightsOutputs := make([]orchestrator.WeightsOutput, 0, len(declared.WeightsOutputs))
 	outputs := append([]string(nil), assets...)
 	for _, output := range declared.WeightsOutputs {
-		var contract *records.ModelTransferContract
-		if output.RequiredContract != nil {
-			contract = &records.ModelTransferContract{TopologyDigest: output.RequiredContract.TopologyDigest,
-				Encodings: append([]string(nil), output.RequiredContract.Encodings...)}
-		}
 		weightsOutputs = append(weightsOutputs, orchestrator.WeightsOutput{
 			OutputID: output.OutputID, MimeType: output.MimeType, MaxBytes: output.MaxBytes,
-			RequiredContract: contract,
 		})
 		outputs = append(outputs, output.OutputID)
 	}
