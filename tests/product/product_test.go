@@ -16,7 +16,7 @@ import (
 )
 
 const localWeightlessRef = "local/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "2e6e62aa82c80b45402c9221f8c3ebb87e215fc7"
+const editableRuntimeFixtureSHA = "c340491f28de998a79301e2532761c0e6120a513"
 
 // TestProductPath is the one end-to-end product path: a local package installed from
 // source, invoked as a user types it, answered with a typed result and real bytes on

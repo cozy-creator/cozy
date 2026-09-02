@@ -95,6 +95,8 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 	}
 	cache := filepath.Join(f.Install.Dir, "artifact-cache")
 	if f.Install.SourceKind == "local" {
+		// The install's own artifact cache is where the checkout's derived documents
+		// (descriptor, model configs) live for the worker to read — never under COZY_HOME.
 		return orchestrator.WorkerLaunchSpec{
 			Placement: placement,
 			Python:    Binary(f.Install), Args: []string{"serve",
@@ -103,6 +105,7 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 				"--development-release", placement.Release,
 				"--development-source-digest", placement.SourceDigest},
 			Dir: f.Source, Devices: devices, GraceSec: 3,
+			ArtifactCache: cache,
 			ArtifactStore: filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
 		}, nil
 	}
