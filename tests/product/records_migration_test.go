@@ -12,8 +12,9 @@ import (
 
 // TestRecordsMigrationFromEleven migrates a REAL schema-11 database — the exact released
 // DDL, dumped from that schema's own sqlite_master and checked in beside this test — and
-// proves the schema-12 rename, the schema-13 rental column, the schema-14 export table, and
-// the schema-15 request column spelling carried their rows. The owner's
+// proves the schema-12 rename, the schema-13 rental column, the schema-14 export table,
+// the schema-15 request column spelling, and the schema-17 machine-word backfill carried
+// their rows. The owner's
 // machine holds one of these, so the property under test is not "a fresh database has the
 // new names" but "an existing database keeps its installs, pins, workers, requests and
 // rentals while the shape changes".
@@ -50,13 +51,26 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 16 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 17 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	// Schema 15: the request's editable revision columns say local_package_*, one word.
+	// Schema 17: the machine word column exists and the migration backfilled it.
 	if columns := columnNames(t, db, "requests"); !columns["local_package_digest"] ||
-		!columns["local_package_uploaded_boot_id"] || columns["private_package_digest"] {
+		!columns["local_package_uploaded_boot_id"] || columns["private_package_digest"] ||
+		!columns["machine"] {
 		t.Fatalf("requests columns after migration = %v", columns)
+	}
+	// Schema 17 backfill: a row whose rental row survives gets that rental's machine
+	// word; a row whose rental is gone is unjoinable history and stays BLANK — the raw
+	// pr- id must never stand in for a name (cl-107). A row never bound stays blank too.
+	for id, want := range map[string]string{
+		"request-1": "", "request-rented": "quiet-heron-0000000000000011", "request-orphan": ""} {
+		var machine string
+		if err := db.QueryRow(`SELECT machine FROM requests WHERE id=?`, id).
+			Scan(&machine); err != nil || machine != want {
+			t.Fatalf("request %s machine after migration = %q, %v (want %q)", id, machine, err, want)
+		}
 	}
 	for table, want := range map[string]string{"pins": "install_id", "worker_processes": "install_id"} {
 		columns := columnNames(t, db, table)
@@ -124,6 +138,14 @@ func writeSchemaElevenDatabase(t *testing.T, path string) {
 		  created_at,install_id)
 		VALUES('request-1','idem-1','sha256:ee','cozy/example','predict','plan-1',x'00',
 		  'queued','2026-01-01T00:00:00Z','1111111111111111')`, `
+		INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,plan_id,payload,state,
+		  created_at,worker,rental)
+		VALUES('request-rented','idem-2','sha256:ee','cozy/example','predict','plan-2',x'00',
+		  'succeeded','2026-01-01T00:00:00Z','rental-1',1)`, `
+		INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,plan_id,payload,state,
+		  created_at,worker,rental)
+		VALUES('request-orphan','idem-3','sha256:ee','cozy/example','predict','plan-3',x'00',
+		  'failed','2026-01-01T00:00:00Z','rental-released-and-gone',1)`, `
 		INSERT INTO rentals(id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,address,
 		  cert_path,state,hub,rented_at)
 		VALUES('rental-1','quiet-heron-0000000000000011','cpu','CPU',100000,'127.0.0.1:1',

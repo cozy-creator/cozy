@@ -622,7 +622,10 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 	}
 	list := output.List{
 		Name: "invocations", Fields: []string{"number", "target", "machine", "status", "queued", "execution"},
-		AllFields: []string{"number", "id", "kind", "target", "machine", "status", "queued", "execution", "attempts", "created"},
+		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status", "queued", "execution", "attempts", "created"},
+		// The raw rental id is a machine fact: JSON always carries it, the compact
+		// human table never does — the human word is the MACHINE column (cl-107).
+		Machine: []string{"rental_id"},
 	}
 	states := map[string]int{}
 	for _, life := range rows {
@@ -633,8 +636,9 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		list.Rows = append(list.Rows, map[string]string{
 			"number": strconv.FormatInt(life.Number, 10), "id": life.RequestID, "kind": kind,
 			"target": life.Package + "/" + life.Function, "machine": life.Machine,
-			"status": life.Status,
-			"queued": seconds(life.QueuedMS), "execution": seconds(life.ExecutionMS),
+			"rental_id": life.RentalID,
+			"status":    life.Status,
+			"queued":    seconds(life.QueuedMS), "execution": seconds(life.ExecutionMS),
 			"attempts": strconv.Itoa(life.Attempts), "created": life.CreatedAt,
 		})
 		states[life.Status]++
@@ -704,6 +708,7 @@ func invocationFields(life api.Lifecycle) []output.Field {
 		{K: "number", V: life.Number}, {K: "id", V: life.RequestID}, {K: "kind", V: kind},
 		{K: "target", V: life.Package + "/" + life.Function},
 		{K: "machine", V: life.Machine},
+		{K: "rental_id", V: life.RentalID},
 		{K: "status", V: life.Status}, {K: "attempts", V: life.Attempts},
 	}
 }
@@ -744,6 +749,7 @@ func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Er
 		{K: "run", V: reference}, {K: "id", V: life.RequestID},
 		{K: "target", V: life.Package + "/" + life.Function},
 		{K: "machine", V: life.Machine},
+		{K: "rental_id", V: life.RentalID},
 		{K: "status", V: status},
 	}
 	defaults := []string{"target", "status"}
@@ -1526,6 +1532,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		{K: "package", V: life.Package},
 		{K: "function", V: life.Function},
 		{K: "machine", V: life.Machine},
+		{K: "rental_id", V: life.RentalID},
 		{K: "status", V: shownStatus},
 		{K: "attempts", V: life.Attempts},
 	}
