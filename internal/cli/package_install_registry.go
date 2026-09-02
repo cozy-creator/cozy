@@ -351,7 +351,7 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 	if problem != nil {
 		return empty, exit.Named(problem.Code, "model_resolution_unavailable",
 			"cannot resolve model %s for slot %s: %s", spec, slot, problem.Message).
-			WithRemedy("download another compatible model or override this slot with --model %s=org/model@release", slot)
+			WithRemedy("download another compatible model or override this slot with model.%s=org/model@release", slot[strings.LastIndex(slot, ".")+1:])
 	}
 	fetched, problem := fetch.Acquire(ctx, resolved)
 	if problem != nil {

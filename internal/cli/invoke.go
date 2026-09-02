@@ -103,9 +103,6 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		return exit.Named(exit.Unavailable, "rental.modeled_job_unsupported",
 			"remote jobs with model slots are not supported yet")
 	}
-	if len(ctx.Inv.Values["--model"]) > 0 {
-		return exit.Usagef("--model applies to serving callables; remote modeled jobs are not supported yet")
-	}
 	if rentalRequested(ctx) && len(ctx.Inv.Values["--input"]) > 0 {
 		return exit.Named(exit.Unavailable, "rental.job_input_tree_unsupported",
 			"remote jobs cannot grant a local input-tree directory")
@@ -152,7 +149,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 			"%s embeds file bytes into a JSON string and cannot name a remote input grant", legacy).
 			WithRemedy("use `--asset <field-path>=<file>`; the field path becomes the exact worker-protocol input id")
 	}
-	input, e := launch.ParsePayload(ep, ctx.Inv.Args[1:], ctx.Inv.Value("--in"))
+	input, overrides, e := launch.ParsePayload(ep, ctx.Inv.Args[1:], ctx.Inv.Value("--in"))
 	if e != nil {
 		return e
 	}
@@ -164,17 +161,9 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	models := []orchestrator.ModelRef(nil)
-	if managedRental {
-		models, e = resolveInvocationModels(ctx, target, ep, ctx.Inv.Values["--model"], true)
-		if e != nil {
-			return e
-		}
-	} else {
-		models, e = resolveInvocationModels(ctx, target, ep, ctx.Inv.Values["--model"], false)
-		if e != nil {
-			return e
-		}
+	models, e := resolveInvocationModels(ctx, target, ep, overrides, managedRental)
+	if e != nil {
+		return e
 	}
 	outputDirectory := ""
 	if requested := ctx.Inv.Value("--out"); requested != "" {
@@ -251,11 +240,11 @@ type invocationModelSpec struct {
 }
 
 // resolveInvocationModels applies the one binding ladder for both local and rented
-// execution: explicit --model, then package.toml default. Local acquisition freezes the
-// exact Manifest and length before submission; remote acquisition freezes the same
-// Manifest in the signed worker download request.
+// execution: an explicit `model.<param>=` run key, then the hub default binding. Local
+// acquisition freezes the exact Manifest and length before submission; remote
+// acquisition freezes the same Manifest in the signed worker download request.
 func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
-	raw []string, remote bool,
+	overrides map[string]string, remote bool,
 ) ([]orchestrator.ModelRef, *exit.Error) {
 	if target.InstallID != "" {
 		row, problem := exactInvocationInstall(ctx, target)
@@ -266,15 +255,15 @@ func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
 			// An editable install froze its exact model selection from package.toml at
 			// install; a local worker reads it from the PlacementSet and a rental is handed
 			// the same rows (cl-101). There is no hub default to ask for a `local/` package.
-			if len(raw) > 0 {
+			if len(overrides) > 0 {
 				return nil, exit.Named(exit.Unavailable, "editable_model_override_unsupported",
 					"editable package model overrides are not available on the published-package BYOM lane").
-					WithRemedy("publish the package code, then invoke it with --model [slot=]org/model@release")
+					WithRemedy("publish the package code, then invoke it with model.<param>=org/model@release")
 			}
 			return nil, nil
 		}
 	}
-	selected, problem := invocationModelSpecs(ctx, target, ep, raw)
+	selected, problem := invocationModelSpecs(ctx, target, ep, overrides)
 	if problem != nil || len(selected) == 0 {
 		return nil, problem
 	}
@@ -329,40 +318,31 @@ func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
 }
 
 func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
-	raw []string,
+	overrides map[string]string,
 ) ([]invocationModelSpec, *exit.Error) {
 	if len(ep.Models) == 0 {
-		if len(raw) > 0 {
-			return nil, exit.Usagef("%s declares no model slots", ep.Name)
-		}
 		return nil, nil
 	}
-	overrides := make(map[string]string, len(raw))
-	for _, value := range raw {
-		left, right, qualified := strings.Cut(strings.TrimSpace(value), "=")
-		if !qualified {
-			if len(ep.Models) != 1 || left == "" {
-				return nil, exit.Usagef("--model %q must name one of %d model slots", value, len(ep.Models)).
-					WithRemedy("use --model <slot>=org/model@release")
-			}
-			right = left
-			left = ep.Models[0].Path
-		}
-		left, right = strings.TrimSpace(left), strings.TrimSpace(right)
-		if left == "" || right == "" {
-			return nil, exit.Usagef("%q is not [slot=]org/model@release", value)
-		}
-		slot, problem := modelSlot(ep, left)
+	// ParsePayload already resolved every `model.<param>=` key onto a declared slot
+	// path; here each ref parses once through the one grammar, with the lane carried
+	// beside the ref the way the resolvers take it.
+	selected := make(map[string]invocationModelSpec, len(overrides))
+	for slotPath, raw := range overrides {
+		model, release, lane, manifest, problem := parseModelRef(raw)
 		if problem != nil {
 			return nil, problem
 		}
-		if _, exists := overrides[slot.Path]; exists {
-			return nil, exit.Usagef("model slot %s was bound more than once", slot.Path)
+		ref := model
+		if release != "" {
+			ref += "@" + release
 		}
-		overrides[slot.Path] = right
+		if manifest != "" {
+			ref += "#" + manifest
+		}
+		selected[slotPath] = invocationModelSpec{Slot: slotPath, Ref: ref, Lane: lane}
 	}
 	defaults := map[string]hub.PackageBindingRow{}
-	if len(overrides) < len(ep.Models) {
+	if len(selected) < len(ep.Models) {
 		var problem *exit.Error
 		defaults, problem = invocationDefaultBindings(ctx, target)
 		if problem != nil {
@@ -371,15 +351,15 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 	}
 	out := make([]invocationModelSpec, 0, len(ep.Models))
 	for _, slot := range ep.Models {
-		if ref, ok := overrides[slot.Path]; ok {
-			out = append(out, invocationModelSpec{Slot: slot.Path, Ref: ref})
+		if spec, ok := selected[slot.Path]; ok {
+			out = append(out, spec)
 			continue
 		}
 		binding, ok := defaults[slot.Path]
 		if !ok {
 			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable",
 				"%s has no usable configured default for model slot %s", target.Package, slot.Path).
-				WithRemedy("override it explicitly: --model %s=org/model@release, or bind a default: cozy package bind %s %s org/model@release", slot.Param, target.Package, slot.Path)
+				WithRemedy("override it explicitly: model.%s=org/model@release, or bind a default: cozy package bind %s %s org/model@release", slot.Param, target.Package, slot.Path)
 		}
 		out = append(out, invocationModelSpec{Slot: slot.Path, Ref: binding.Ref(), Lane: binding.Lane})
 	}
@@ -391,7 +371,8 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 // the hub (th-116). The rows are mutable pointers seeded from the shipped
 // package.toml at release commit and owner-retargetable afterwards; no
 // invocation re-reads the in-release toml, so an owner's retarget takes effect
-// on the very next bare run. `--model` still overrides per invocation.
+// on the very next bare run. A `model.<param>=` run key still overrides per
+// invocation.
 func invocationDefaultBindings(ctx *Context, target Target) (
 	map[string]hub.PackageBindingRow, *exit.Error,
 ) {
@@ -405,7 +386,7 @@ func invocationDefaultBindings(ctx *Context, target Target) (
 	if problem != nil {
 		return nil, exit.Named(problem.Code, "package_default_model_unavailable",
 			"%s default bindings are not readable: %s", target.Package, problem.Message).
-			WithRemedy("supply --model <slot>=org/model@release to bypass the hub default")
+			WithRemedy("supply model.<param>=org/model@release to bypass the hub default")
 	}
 	out := make(map[string]hub.PackageBindingRow, len(rows))
 	for _, row := range rows {
@@ -434,24 +415,6 @@ func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstal
 	return row, nil
 }
 
-func modelSlot(ep *launch.Entrypoint, asked string) (*launch.Slot, *exit.Error) {
-	var match *launch.Slot
-	for i := range ep.Models {
-		slot := &ep.Models[i]
-		if asked != slot.Path && asked != slot.Param {
-			continue
-		}
-		if match != nil {
-			return nil, exit.Usagef("model slot %q is ambiguous; use its full descriptor path", asked)
-		}
-		match = slot
-	}
-	if match == nil {
-		return nil, exit.Usagef("%q is not a model slot for %s", asked, ep.Name)
-	}
-	return match, nil
-}
-
 func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane string) (
 	orchestrator.ModelRef, *exit.Error,
 ) {
@@ -459,24 +422,16 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane str
 	// release card below must contain it in an exact lane before it enters request identity
 	// or a signed worker download delegation. No caller bytes or local path are trusted.
 	var empty orchestrator.ModelRef
-	if strings.Count(raw, "#") > 1 {
-		return empty, exit.Usagef("%q carries more than one manifest", raw)
+	modelName, release, refLane, manifest, problem := parseModelRef(raw)
+	if problem != nil {
+		return empty, problem
 	}
-	modelRelease, manifest, hasManifest := strings.Cut(raw, "#")
-	if hasManifest && manifest == "" {
-		return empty, exit.Usagef("%q carries an empty manifest", raw)
-	}
-	if manifest != "" {
-		if _, err := canonical.Raw(manifest); err != nil {
-			return empty, exit.Usagef("%q is not a sha256 model manifest", manifest)
+	if refLane != "" {
+		if wantedLane != "" && wantedLane != refLane {
+			return empty, exit.Usagef("%q asks for lane %q while lane %q was already selected",
+				raw, refLane, wantedLane)
 		}
-	}
-	if strings.Count(modelRelease, "@") > 1 {
-		return empty, exit.Usagef("%q carries more than one release", modelRelease)
-	}
-	modelName, release, hasRelease := strings.Cut(modelRelease, "@")
-	if hasRelease && release == "" {
-		return empty, exit.Usagef("%q carries an empty release", raw)
+		wantedLane = refLane
 	}
 	ref, problem := hub.ParseRef(modelName)
 	if problem != nil {
