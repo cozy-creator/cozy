@@ -204,14 +204,21 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 	if version != sourceVersion {
 		return schemaReset(path, "records database changed to user_version %d while migrating", version)
 	}
-	if e := migrateInstalls(tx, path); e != nil {
-		return e
+	// Each rebuild runs only from a schema that still has the prior shape: the install
+	// rename is schema 12's, the request and rental rebuilds end at 13, the export table's
+	// payload hash goes at 14. A 13 → 14 migration touches exports alone.
+	if sourceVersion < 12 {
+		if e := migrateInstalls(tx, path); e != nil {
+			return e
+		}
 	}
-	if e := migrateRequests(tx, path, sourceVersion); e != nil {
-		return e
-	}
-	if e := migrateRentals(tx, path); e != nil {
-		return e
+	if sourceVersion < 13 {
+		if e := migrateRequests(tx, path, sourceVersion); e != nil {
+			return e
+		}
+		if e := migrateRentals(tx, path); e != nil {
+			return e
+		}
 	}
 	if e := migrateOutputExports(tx, path); e != nil {
 		return e
