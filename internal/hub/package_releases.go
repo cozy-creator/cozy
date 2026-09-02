@@ -276,3 +276,66 @@ func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string) 
 	}
 	return out, e
 }
+
+// ---------------------------------------------------------------- bindings (th-116)
+
+// PackageBindingRow is one mutable hub default: which model a package slot
+// loads when no --model speaks. Seeded from the shipped package.toml at release
+// commit and owner-mutable afterwards; the hub row is the ONE source and the
+// in-release toml is never consulted post-seed.
+type PackageBindingRow struct {
+	Slot      string `json:"slot"`
+	Model     string `json:"model"`
+	Release   string `json:"release,omitempty"`
+	Lane      string `json:"lane,omitempty"`
+	Revision  int64  `json:"revision"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// Ref renders the row as the ladder's org/model[@release] spelling.
+func (b PackageBindingRow) Ref() string {
+	if b.Release == "" {
+		return b.Model
+	}
+	return b.Model + "@" + b.Release
+}
+
+// PackageBindings is the anonymous read of a package's current default bindings.
+func (c *Client) PackageBindings(ctx context.Context, ref Ref) ([]PackageBindingRow, *exit.Error) {
+	var out struct {
+		Bindings []PackageBindingRow `json:"bindings"`
+	}
+	e := c.do(ctx, call{method: http.MethodGet,
+		path: resourcePath("packages", ref) + "/bindings", strict: true}, &out)
+	if e != nil {
+		return nil, e
+	}
+	seen := make(map[string]bool, len(out.Bindings))
+	for _, row := range out.Bindings {
+		if row.Slot == "" || row.Model == "" || row.Revision < 1 || seen[row.Slot] {
+			return nil, exit.Named(exit.Structural, "hub.package_bindings_invalid",
+				"Tensorhub returned an incomplete or duplicate package binding row")
+		}
+		seen[row.Slot] = true
+	}
+	return out.Bindings, nil
+}
+
+type PackageBindingWrite struct {
+	Binding PackageBindingRow `json:"binding"`
+	Changed bool              `json:"changed"`
+}
+
+// BindPackageSlot moves one package slot's default to an arbitrary
+// model/release/lane under CAS on expectedRevision (0 creates an unseeded row).
+func (c *Client) BindPackageSlot(ctx context.Context, ref Ref, slot, model, release, lane string,
+	expectedRevision int64, reason string,
+) (PackageBindingWrite, *exit.Error) {
+	var out PackageBindingWrite
+	e := c.do(ctx, call{method: http.MethodPut,
+		path: resourcePath("packages", ref) + "/bindings/" + url.PathEscape(slot),
+		auth: true, reason: reason, strict: true,
+		body: map[string]any{"model": model, "release": release, "lane": lane,
+			"expected_revision": expectedRevision}}, &out)
+	return out, e
+}

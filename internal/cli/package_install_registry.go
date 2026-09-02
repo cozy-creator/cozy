@@ -3,22 +3,18 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/tfs"
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
@@ -81,7 +77,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 			return exit.Internalf("cannot create model prefetch scratch: %s", err)
 		}
 		defer os.RemoveAll(modelScratch)
-		bestEffortDefaultModels(hctx, ctx, modelScratch, existingInstall.Runtime,
+		bestEffortDefaultModels(hctx, ctx, modelScratch,
 			&install.PublishedSource{Package: ref.String(), Release: release,
 				SourceDigest: releaseDigest, PackageConfig: packageConfig,
 				Selection: install.Selection{PackageDescriptor: packageDescriptor}}, result)
@@ -124,7 +120,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	}
 	st.Close()
 	writer.Unlock()
-	bestEffortDefaultModels(hctx, ctx, scratch, result.Install.Runtime, published, result)
+	bestEffortDefaultModels(hctx, ctx, scratch, published, result)
 	_, outputStore, outputWriter, problem := open(ctx.Cfg, true)
 	if problem != nil {
 		return problem
@@ -134,21 +130,14 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	return emitInstallResult(ctx, layout, outputStore, result)
 }
 
-func bestEffortDefaultModels(hctx context.Context, ctx *Context, root, runtimeBin string,
+func bestEffortDefaultModels(hctx context.Context, ctx *Context, root string,
 	published *install.PublishedSource, result *install.Result,
 ) {
 	if ctx.Inv.Bool("--no-model-download") {
 		result.ModelStatus = "skipped"
 		return
 	}
-	if runtimeBin == "" {
-		result.ModelStatus = "failed"
-		result.ModelError = "installed Runtime path is absent"
-		result.Warnings = append(result.Warnings,
-			"package code is installed; default model prefetch was skipped because its Runtime path is absent")
-		return
-	}
-	if problem := downloadPublishedPackageModels(hctx, ctx, root, runtimeBin, published); problem != nil {
+	if problem := downloadPublishedPackageModels(hctx, ctx, root, published); problem != nil {
 		result.ModelStatus = "failed"
 		result.ModelError = problem.ErrName() + ": " + problem.Message
 		result.Warnings = append(result.Warnings,
@@ -287,22 +276,42 @@ func exactPackageInstallDocument(name string, document hub.ExactDocument) (insta
 		Digest: document.Digest, Length: document.Length}, nil
 }
 
-type publishedDefaultBinding struct {
-	ModelBindingPath string `json:"model_binding_path"`
-	ModelParameter   string `json:"model_parameter_name"`
-	ModelClass       string `json:"model_class"`
-	Ref              string `json:"ref"`
-	Lane             string `json:"lane"`
-	Source           string `json:"source"`
-}
-
-func downloadPublishedPackageModels(ctx context.Context, cli *Context, root, runtimeBin string,
+// downloadPublishedPackageModels prefetches the models the package's CURRENT
+// hub bindings select (th-116): the mutable rows seeded from the shipped
+// package.toml at release commit and owner-retargetable afterwards. The
+// installed toml is never consulted; only rows naming a slot this release's
+// descriptor declares are prefetched.
+func downloadPublishedPackageModels(ctx context.Context, cli *Context, root string,
 	published *install.PublishedSource,
 ) *exit.Error {
-	bindings, problem := publishedDefaultBindings(ctx, cli.Cfg, root, runtimeBin,
-		published.PackageConfig, published.Selection.PackageDescriptor)
-	if problem != nil || len(bindings) == 0 {
+	descriptor, problem := launch.DecodeDescriptor(published.Selection.PackageDescriptor.Bytes)
+	if problem != nil {
 		return problem
+	}
+	declared := map[string]bool{}
+	for _, callables := range [][]launch.Entrypoint{descriptor.Entrypoints, descriptor.Jobs} {
+		for i := range callables {
+			for _, slot := range callables[i].Models {
+				declared[slot.Path] = true
+			}
+		}
+	}
+	ref, problem := hub.ParseRef(published.Package)
+	if problem != nil {
+		return problem
+	}
+	rows, problem := client(cli).PackageBindings(ctx, ref)
+	if problem != nil {
+		return problem
+	}
+	bindings := make([]hub.PackageBindingRow, 0, len(rows))
+	for _, row := range rows {
+		if declared[row.Slot] {
+			bindings = append(bindings, row)
+		}
+	}
+	if len(bindings) == 0 {
+		return nil
 	}
 	if err := raiseOpenFileLimit(); err != nil {
 		return exit.Named(exit.Structural, "open_file_limit_unavailable",
@@ -315,9 +324,9 @@ func downloadPublishedPackageModels(ctx context.Context, cli *Context, root, run
 	}
 	hubClient := client(cli)
 	for index, binding := range bindings {
-		packagePublishStatus(cli, "Resolving model %s...", binding.Ref)
+		packagePublishStatus(cli, "Resolving model %s...", binding.Ref())
 		selected, problem := acquirePublishedModel(ctx, cli, tool, hubClient,
-			binding.Ref, binding.Lane, published.Package, binding.ModelBindingPath,
+			binding.Ref(), binding.Lane, published.Package, binding.Slot,
 			filepath.Join(root, "models", fmt.Sprintf("%03d", index)))
 		if problem != nil {
 			return problem
@@ -411,103 +420,3 @@ func exactLocalModel(tool *tfs.Tool, spec, lane, work string) (
 	return empty, false, nil
 }
 
-func publishedDefaultBindings(parent context.Context, cfg config.Config, root, runtimeBin string,
-	packageConfig, descriptor install.ExactDocument,
-) ([]publishedDefaultBinding, *exit.Error) {
-	metadataRoot := filepath.Join(root, "selection")
-	if err := os.MkdirAll(metadataRoot, 0o700); err != nil {
-		return nil, exit.Internalf("cannot create package selection scratch: %s", err)
-	}
-	packageConfigPath := filepath.Join(metadataRoot, "package.toml")
-	descriptorPath := filepath.Join(metadataRoot, "descriptor.json")
-	if err := os.WriteFile(packageConfigPath, packageConfig.Bytes, 0o600); err != nil {
-		return nil, exit.Internalf("cannot stage exact package.toml: %s", err)
-	}
-	if err := os.WriteFile(descriptorPath, descriptor.Bytes, 0o600); err != nil {
-		return nil, exit.Internalf("cannot stage exact package descriptor: %s", err)
-	}
-
-	// The install waits on the CHILD, not on a clock (xs-007 row 10). This call used to run
-	// under a 5-second deadline that refused the install whenever a Python cold start took
-	// longer — which on a loaded host it does. `parent` is the caller's own cancellation and
-	// remains the only bound.
-	cmd := exec.CommandContext(parent, runtimeBin, "--json", "--dir", metadataRoot,
-		"--descriptor", descriptorPath, "bindings")
-	cmd.WaitDelay = 250 * time.Millisecond
-	cmd.Env = cfg.Tool("COZY_HOME=" + cfg.Home)
-	var stdout, stderr strings.Builder
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-	if parent.Err() != nil {
-		return nil, exit.New(exit.Canceled, "`cozy-runtime bindings` was stopped: %s", parent.Err())
-	}
-	if cmd.ProcessState == nil {
-		return nil, exit.Named(exit.Structural, "runtime_missing",
-			"cannot run the trusted cozy-runtime at %s: %s", runtimeBin, err)
-	}
-	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return nil, publishedBindingsRefusal(code, stdout.String(), stderr.String())
-	}
-	var answer struct {
-		Bindings        []publishedDefaultBinding `json:"bindings"`
-		WeightlessPlans []json.RawMessage         `json:"weightless_plans,omitempty"`
-	}
-	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
-	decoder.DisallowUnknownFields()
-	decodeErr := decoder.Decode(&answer)
-	var trailing any
-	if decodeErr == nil {
-		decodeErr = decoder.Decode(&trailing)
-	}
-	if decodeErr != io.EOF {
-		return nil, exit.Named(exit.Structural, "runtime_bindings_invalid",
-			"cozy-runtime returned an invalid package binding document")
-	}
-	seen := make(map[string]bool, len(answer.Bindings))
-	for _, binding := range answer.Bindings {
-		if binding.ModelBindingPath == "" || binding.ModelParameter == "" ||
-			binding.ModelClass == "" || binding.Ref == "" || binding.Lane == "" ||
-			!strings.HasPrefix(binding.Source, "package.toml:") ||
-			seen[binding.ModelBindingPath] ||
-			strings.TrimSpace(binding.Ref) != binding.Ref || strings.TrimSpace(binding.Lane) != binding.Lane {
-			return nil, exit.Named(exit.Structural, "runtime_bindings_invalid",
-				"cozy-runtime returned an incomplete or duplicate package model binding")
-		}
-		seen[binding.ModelBindingPath] = true
-	}
-	return answer.Bindings, nil
-}
-
-func publishedBindingsRefusal(code int, stdout, stderr string) *exit.Error {
-	said := strings.TrimSpace(stderr)
-	if said == "" {
-		said = strings.TrimSpace(stdout)
-	}
-	var document struct {
-		Error struct {
-			Name    string `json:"name"`
-			Message string `json:"message"`
-			Remedy  string `json:"remedy"`
-		} `json:"error"`
-	}
-	name, remedy := "runtime_bindings_refused", ""
-	if json.Unmarshal([]byte(stderr), &document) == nil && document.Error.Message != "" {
-		said, remedy = document.Error.Message, document.Error.Remedy
-		if document.Error.Name != "" {
-			name = document.Error.Name
-		}
-	}
-	exitCode := exit.Code(code)
-	if !exitCode.Valid() {
-		exitCode = exit.Internal
-	}
-	if said == "" {
-		said = "the Runtime gave no diagnostic"
-	}
-	problem := exit.Named(exitCode, name, "`cozy-runtime bindings`: %s",
-		strings.Join(strings.Fields(said), " "))
-	if remedy != "" {
-		problem.WithRemedy("%s", remedy)
-	}
-	return problem
-}

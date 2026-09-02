@@ -24,7 +24,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -354,7 +353,7 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 		}
 		overrides[slot.Path] = right
 	}
-	defaults := map[string]publishedDefaultBinding{}
+	defaults := map[string]hub.PackageBindingRow{}
 	if len(overrides) < len(ep.Models) {
 		var problem *exit.Error
 		defaults, problem = invocationDefaultBindings(ctx, target)
@@ -372,91 +371,39 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 		if !ok {
 			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable",
 				"%s has no usable configured default for model slot %s", target.Package, slot.Path).
-				WithRemedy("override it explicitly: --model %s=org/model@release", slot.Param)
+				WithRemedy("override it explicitly: --model %s=org/model@release, or bind a default: cozy package bind %s %s org/model@release", slot.Param, target.Package, slot.Path)
 		}
-		out = append(out, invocationModelSpec{Slot: slot.Path, Ref: binding.Ref, Lane: binding.Lane})
+		out = append(out, invocationModelSpec{Slot: slot.Path, Ref: binding.Ref(), Lane: binding.Lane})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Slot < out[j].Slot })
 	return out, nil
 }
 
+// invocationDefaultBindings reads the package's CURRENT default bindings from
+// the hub (th-116). The rows are mutable pointers seeded from the shipped
+// package.toml at release commit and owner-retargetable afterwards; no
+// invocation re-reads the in-release toml, so an owner's retarget takes effect
+// on the very next bare run. `--model` still overrides per invocation.
 func invocationDefaultBindings(ctx *Context, target Target) (
-	map[string]publishedDefaultBinding, *exit.Error,
+	map[string]hub.PackageBindingRow, *exit.Error,
 ) {
-	var packageConfig, descriptor install.ExactDocument
-	runtimeBin := ""
-	if target.InstallID != "" {
-		row, problem := exactInvocationInstall(ctx, target)
-		if problem != nil {
-			return nil, problem
-		}
-		var problem2 *exit.Error
-		packageConfig, problem2 = exactInstalledDocument(filepath.Join(row.ProjectDir, "package.toml"))
-		if problem2 != nil {
-			return nil, problem2
-		}
-		descriptor, problem2 = exactInstalledDocument(launch.DescriptorPath(row.Dir))
-		if problem2 != nil {
-			return nil, problem2
-		}
-		runtimeBin = row.Runtime
-	} else {
-		ref, problem := hub.ParseRef(target.Package)
-		if problem != nil {
-			return nil, problem
-		}
-		hctx, cancel := hub.Context()
-		defer cancel()
-		plan, problem := client(ctx).PackageDownloads(hctx, ref, target.Release)
-		if problem != nil {
-			return nil, problem
-		}
-		packageConfig, problem = exactPackageInstallDocument("package.toml", plan.PackageConfig)
-		if problem != nil {
-			return nil, problem
-		}
-		descriptor, problem = exactPackageInstallDocument("package descriptor", plan.PackageDescriptor)
-		if problem != nil {
-			return nil, problem
-		}
-		runtimeBin, problem = launch.HostRuntime(ctx.Cfg.Tool())
-		if problem != nil {
-			return nil, problem
-		}
-	}
-	layout, problem := home.Open(ctx.Cfg.Home)
+	ref, problem := hub.ParseRef(target.Package)
 	if problem != nil {
 		return nil, problem
 	}
-	if err := os.MkdirAll(layout.Transfer, 0o700); err != nil {
-		return nil, exit.Internalf("cannot create binding metadata scratch: %s", err)
-	}
-	root, err := os.MkdirTemp(layout.Transfer, "binding-defaults-")
-	if err != nil {
-		return nil, exit.Internalf("cannot create binding metadata scratch: %s", err)
-	}
-	defer os.RemoveAll(root)
-	rows, problem := publishedDefaultBindings(context.Background(), ctx.Cfg, root,
-		runtimeBin, packageConfig, descriptor)
+	hctx, cancel := hub.Context()
+	defer cancel()
+	rows, problem := client(ctx).PackageBindings(hctx, ref)
 	if problem != nil {
-		return nil, exit.Named(problem.Code, "package_default_model_invalid",
-			"%s configured default model is not usable: %s", target.Package, problem.Message).
-			WithRemedy("supply --model <slot>=org/model@release to bypass the configured default")
+		return nil, exit.Named(problem.Code, "package_default_model_unavailable",
+			"%s default bindings are not readable: %s", target.Package, problem.Message).
+			WithRemedy("supply --model <slot>=org/model@release to bypass the hub default")
 	}
-	out := make(map[string]publishedDefaultBinding, len(rows))
+	out := make(map[string]hub.PackageBindingRow, len(rows))
 	for _, row := range rows {
-		out[row.ModelBindingPath] = row
+		out[row.Slot] = row
 	}
 	return out, nil
-}
-
-func exactInstalledDocument(path string) (install.ExactDocument, *exit.Error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return install.ExactDocument{}, exit.New(exit.NotFound, "cannot read installed metadata %s: %s", path, err)
-	}
-	digest, _ := canonical.Spell(canonical.Digest(raw))
-	return install.ExactDocument{Bytes: raw, Digest: digest, Length: int64(len(raw))}, nil
 }
 
 func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstall, *exit.Error) {
