@@ -276,9 +276,10 @@ impl VerificationEvidence {
 /// canonical bytes, so a reader re-emits what it read, including keys it does not know — and
 /// the typed views are formed on demand. Reading is total: an absent or unknown key answers
 /// "unknown", and only a key that is present and malformed refuses, at the view that needs
-/// it. Only writers require more: `apply` refuses a CozyTensors checkpoint row whose evidence
-/// carries no digests or whose digests differ from what the header derives
-/// (`require_digests`), and `required_files` refuses ingest provenance without its verdict.
+/// it. Only writers require more: `apply` stores a CozyTensors checkpoint row with the digests
+/// tfs derives from the resident header and refuses a supplied digest that differs
+/// (`authored`); the admission seam requires the published row to carry them
+/// (`require_digests`); `required_files` refuses ingest provenance without its verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointEvidence {
     value: Value,
@@ -376,6 +377,46 @@ impl CheckpointEvidence {
             .map(|value| understood(VerificationEvidence::from_value(value)))
             .transpose()
             .map(Option::flatten)
+    }
+
+    /// The row a writer stores for a checkpoint whose header is at hand: the digests are
+    /// tfs's own derivation — a supplied digest that differs is refused, an absent one is
+    /// filled in — beside the provenance the caller supplied, in the current shape.
+    pub fn authored(&self, derived: &Digests) -> Result<Self> {
+        for (name, claimed, derived) in [
+            (
+                "topology_digest",
+                self.digest("topology_digest")?,
+                Some(&derived.topology_digest),
+            ),
+            (
+                "shape_digest",
+                self.digest("shape_digest")?,
+                Some(&derived.shape_digest),
+            ),
+            (
+                "config_digest",
+                self.digest("config_digest")?,
+                derived.config_digest.as_ref(),
+            ),
+        ] {
+            if let Some(claimed) = claimed {
+                if Some(&claimed) != derived {
+                    return refuse(
+                        Code::TOPOLOGY_MISMATCH,
+                        format!(
+                            "checkpoint evidence {name} {claimed} differs from the checkpoint's {}",
+                            derived.map_or("absent", String::as_str)
+                        ),
+                    );
+                }
+            }
+        }
+        Ok(Self::new(
+            Some(derived.clone()),
+            self.ingest()?,
+            self.verification()?,
+        ))
     }
 
     /// The manifest files ingest provenance names. A writer's rule: provenance without its
@@ -1112,10 +1153,9 @@ impl Mutation {
     }
 }
 
-/// A writer's row must carry the digests, and they must be what the checkpoint derives, all
-/// three. A caller that transcribes a stale or foreign digest into evidence is refused here
-/// rather than indexed wrong; a caller that omits them is refused because the row it authors
-/// is what the catalog answers `fit` from without re-reading the header.
+/// A published row must carry the digests, and they must be what the checkpoint derives, all
+/// three: the admission seam and the receipt writers check the row they are about to serve
+/// against the header, so a stale or foreign transcription is refused rather than indexed.
 pub fn require_digests(claimed: Option<&Digests>, derived: &Digests) -> Result<()> {
     let Some(claimed) = claimed else {
         return refuse(
@@ -1150,6 +1190,11 @@ pub fn require_digests(claimed: Option<&Digests>, derived: &Digests) -> Result<(
 /// Apply against the exact bytes the caller observed. The returned `None` means conditional
 /// repository deletion; `Some` is the exact replacement body. The backend supplies the
 /// observed bytes/ETag as its CAS precondition, never an embedded generation number.
+///
+/// `derived` is what the resident header digests to, and it is the writer's: a CozyTensors
+/// checkpoint row is stored with those digests whether or not the incoming evidence carried
+/// them (`CheckpointEvidence::authored`), so a document from a hub or a peer written under
+/// an older vocabulary commits, and a digest it does claim must agree.
 pub fn apply(
     current: Option<&[u8]>,
     mutation: &Mutation,
@@ -1177,30 +1222,25 @@ pub fn apply(
                     "local repositories require replace_local",
                 );
             }
-            match (evidence.as_deref(), derived) {
-                (Some(evidence), Some(derived)) => {
-                    require_digests(evidence.digests()?.as_ref(), derived)?
+            let evidence = match (evidence.as_deref(), derived) {
+                (Some(evidence), Some(derived)) => Some(evidence.authored(derived)?),
+                (None, Some(derived)) => {
+                    Some(CheckpointEvidence::new(Some(derived.clone()), None, None))
                 }
-                (None, None) => {}
+                (None, None) => None,
                 (Some(_), None) => {
                     return refuse(
                         Code::ATTACHMENT_CARDINALITY,
                         "model evidence requires one CozyTensors manifest entry",
                     )
                 }
-                (None, Some(_)) => {
-                    return refuse(
-                        Code::MISSING_FIELD,
-                        "a CozyTensors checkpoint requires model evidence",
-                    )
-                }
-            }
+            };
             Ok(Some(
                 existing
                     .unwrap_or_else(|| Repository::empty(repo.clone()))
                     .put_checkpoint(Checkpoint {
                         manifest: manifest.clone(),
-                        evidence: evidence.as_deref().cloned(),
+                        evidence,
                         published: false,
                         source_selection: None,
                     })?,
@@ -1272,11 +1312,10 @@ pub fn apply(
                 code: Code::MISSING_FIELD,
                 detail: "a local CozyTensors alias requires the header-derived digests".into(),
             })?;
-            require_digests(evidence.digests()?.as_ref(), derived)?;
             let repository = Repository {
                 checkpoints: vec![Checkpoint {
                     manifest: manifest.clone(),
-                    evidence: Some((**evidence).clone()),
+                    evidence: Some(evidence.authored(derived)?),
                     published: false,
                     source_selection: Some(version.clone()),
                 }],
