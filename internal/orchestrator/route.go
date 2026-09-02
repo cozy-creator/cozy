@@ -52,11 +52,51 @@ func (k candidate) event() map[string]any {
 	}
 }
 
-// routing is one decision: every candidate with room, best first, and the workers that
-// would have been candidates but had no room, with why.
+// laneKey names one (worker, lane) two requests compete for; lane "" is the worker-level
+// window of a worker reporting no lanes, and matches every lane on that worker.
+type laneKey struct{ worker, lane string }
+
+func (k laneKey) String() string { return k.worker + "/" + orNone(k.lane) }
+
+func (k laneKey) covers(o laneKey) bool {
+	return k.worker == o.worker && (k.lane == "" || o.lane == "" || k.lane == o.lane)
+}
+
+// parking is what the queue knows about a request it skipped (cl-099): the lanes it is
+// eligible for — the lanes it competes on — how many later requests were dispatched onto
+// one of them past it, and the budget for that: its position in the queue when it first
+// parked (gpu-hot D6 mirrored — an attempt admitted behind k others is overtaken at most
+// k times; a request parked at the head is overtaken by nobody). Once the budget is spent
+// the request CLAIMS its lanes: `route` skips them for everything behind it, so
+// head-of-line blocking exists only among requests that compete for one lane and is
+// bounded there by twice the FIFO wait. `logged` is the last reason emitted, so a drain
+// that finds nothing changed says nothing.
+type parking struct {
+	lanes     []laneKey
+	overtaken int
+	budget    int
+	logged    string
+}
+
+func (p *parking) claims() bool { return p.overtaken >= p.budget }
+
+func (p *parking) competes(k laneKey) bool {
+	for _, l := range p.lanes {
+		if l.covers(k) {
+			return true
+		}
+	}
+	return false
+}
+
+// routing is one decision: every candidate with room, best first; the workers that
+// would have been candidates but had no room, with why; every lane the request is
+// eligible for (with or without room), and the lanes an earlier parked request claims.
 type routing struct {
 	candidates []candidate
 	parked     []string
+	lanes      []laneKey
+	claimed    []string
 }
 
 func (r routing) pick() *candidate {
@@ -72,6 +112,9 @@ func (r routing) event() map[string]any {
 		rows = append(rows, k.event())
 	}
 	out := map[string]any{"candidates": rows}
+	if len(r.claimed) > 0 {
+		out["claimed"] = r.claimed
+	}
 	if pick := r.pick(); pick != nil {
 		out["pick"] = map[string]any{"worker": pick.worker.instanceID, "lane": pick.laneID}
 	}
@@ -94,14 +137,21 @@ func (c *Orchestrator) route(req records.Request) routing {
 	planID := req.PlanID
 	slot := pinnedPackage(req.Package, req.Worker)
 	now := time.Now()
+	claims := c.claimsAhead(req.ID)
 	var out routing
 	for _, w := range c.workers {
 		if !c.eligible(w, req, slot, planID) {
 			continue
 		}
 		laneID, room, held, why := w.roomFor(w.placementFor(slot, planID), planID)
+		lane := laneKey{w.instanceID, laneID}
+		out.lanes = append(out.lanes, lane)
 		if room <= 0 {
 			out.parked = append(out.parked, w.instanceID+": "+why)
+			continue
+		}
+		if by, claimed := claims[lane]; claimed && room < 2 {
+			out.claimed = append(out.claimed, lane.String()+" by "+by)
 			continue
 		}
 		k := candidate{worker: w, laneID: laneID, held: held, cost: fillCost}
@@ -125,6 +175,73 @@ func (c *Orchestrator) route(req records.Request) routing {
 		return a.laneID < b.laneID
 	})
 	sort.Strings(out.parked)
+	sort.Strings(out.claimed)
+	return out
+}
+
+// claimsAhead is every lane claimed by a parked request queued ahead of this one (a
+// request not in the queue is behind everything in it), keyed by the lane it would
+// take. Callers hold c.mu.
+func (c *Orchestrator) claimsAhead(requestID string) map[laneKey]string {
+	claims := map[laneKey]string{}
+	for _, id := range c.pending {
+		if id == requestID {
+			break
+		}
+		p := c.parked[id]
+		if p == nil || !p.claims() {
+			continue
+		}
+		for _, w := range c.workers {
+			for _, lane := range w.laneKeys() {
+				if p.competes(lane) {
+					claims[lane] = id
+				}
+			}
+		}
+	}
+	return claims
+}
+
+// overtaken records one dispatch onto `lane` past every parked request queued ahead of
+// the dispatched one that competes for it. A budget spent here is a claim from the next
+// routing on. Callers hold c.mu.
+func (c *Orchestrator) overtaken(requestID string, lane laneKey) {
+	for _, id := range c.pending {
+		if id == requestID {
+			return
+		}
+		p := c.parked[id]
+		if p == nil || !p.competes(lane) {
+			continue
+		}
+		p.overtaken++
+		if p.overtaken == p.budget {
+			c.logf("%s was overtaken %d time(s) on its lane(s) by %s, its budget; it claims %s",
+				id, p.overtaken, requestID, laneStrings(p.lanes))
+		}
+	}
+}
+
+func laneStrings(lanes []laneKey) string {
+	parts := make([]string, 0, len(lanes))
+	for _, l := range lanes {
+		parts = append(parts, l.String())
+	}
+	return strings.Join(parts, ",")
+}
+
+// laneKeys is every lane a dispatch to this worker can draw from: its reported lanes,
+// or the worker-level window when it reports none.
+func (w *worker) laneKeys() []laneKey {
+	if !w.lanes.present() {
+		return []laneKey{{w.instanceID, ""}}
+	}
+	out := make([]laneKey, 0, len(w.lanes.lanes))
+	for id := range w.lanes.lanes {
+		out = append(out, laneKey{w.instanceID, id})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].lane < out[j].lane })
 	return out
 }
 
@@ -135,6 +252,9 @@ func (c *Orchestrator) route(req records.Request) routing {
 // let a request run on a pod whose credential it never presented.
 func (c *Orchestrator) eligible(w *worker, req records.Request, slot, planID string) bool {
 	if w.exited || w.stopping || c.sessions[w.bootID] == nil {
+		return false
+	}
+	if req.RentalRequired && w.spec.Connection == nil {
 		return false
 	}
 	if req.Worker != "" && !req.IsJob() && w.spec.Connection != nil {
@@ -173,28 +293,35 @@ func (w *worker) roomFor(placementID, planID string) (laneID string, room, held 
 		return "", 0, 0, "admission " +
 			trimEnum(pb.AdmissionState_name[int32(w.admission)], "ADMISSION_STATE_")
 	}
+	var l *lane
+	if w.lanes.present() {
+		if l = w.lanes.of(placementID); l == nil {
+			return "", 0, 0, fmt.Sprintf("placement %s is on none of the %d reported lane(s)",
+				placementID, len(w.lanes.lanes))
+		}
+		laneID = l.id
+		if l.outsideEnvelope {
+			return laneID, 0, 0, fmt.Sprintf("lane %s is outside the granted envelope", l.id)
+		}
+		if l.seats.slots <= 0 {
+			return laneID, 0, 0, fmt.Sprintf("lane %s has no free seat", l.id)
+		}
+	}
 	if w.seats.slots <= 0 {
-		return "", 0, 0, "no free attempt slot"
+		return laneID, 0, 0, "no free attempt slot"
 	}
-	if !w.lanes.present() {
-		return "", w.seats.slots, w.held + w.seats.reserved, ""
+	if l != nil {
+		return laneID, l.seats.slots, l.held + l.seats.reserved, ""
 	}
-	l := w.lanes.of(placementID)
-	if l == nil {
-		return "", 0, 0, fmt.Sprintf("placement %s is on none of the %d reported lane(s)",
-			placementID, len(w.lanes.lanes))
-	}
-	if l.outsideEnvelope {
-		return "", 0, 0, fmt.Sprintf("lane %s is outside the granted envelope", l.id)
-	}
-	if l.seats.slots <= 0 {
-		return "", 0, 0, fmt.Sprintf("lane %s has no free seat", l.id)
-	}
-	return l.id, l.seats.slots, l.held + l.seats.reserved, ""
+	return "", w.seats.slots, w.held + w.seats.reserved, ""
 }
 
 // noCapacity spells a routing with no pick as the request's queued reason.
 func (r routing) noCapacity(slot, planID string) *exit.Error {
+	if len(r.claimed) > 0 {
+		return exit.Unavailablef("every lane with room for %s in %s is claimed by a request "+
+			"queued ahead of it (%s)", planID, slot, strings.Join(r.claimed, "; "))
+	}
 	if len(r.parked) > 0 {
 		return exit.Unavailablef(
 			"no claimed worker in %s has a DISPATCHABLE placement for %s with a free attempt "+

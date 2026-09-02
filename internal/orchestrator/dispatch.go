@@ -1338,6 +1338,7 @@ func (c *Orchestrator) pick(req records.Request) (offerTarget, *exit.Error) {
 	w := pick.worker
 	target := offerTarget{worker: w, sess: c.sessions[w.bootID], admissionEpoch: w.admissionEpoch,
 		routed: routed}
+	c.overtaken(req.ID, laneKey{w.instanceID, pick.laneID})
 	if w.spec.IsJob() {
 		// RESERVE the seat this dispatch is about to consume. The worker's own next
 		// observed state is still the authority — this only stops ONE drain pass from

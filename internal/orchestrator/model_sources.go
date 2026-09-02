@@ -109,6 +109,14 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 	if state == "" {
 		return
 	}
+	previous := ""
+	if statuses, problem := c.opt.Store.ModelTransferSourceStatuses(frame.OperationId); problem == nil {
+		for _, status := range statuses {
+			if status.Member == frame.Member {
+				previous = status.State
+			}
+		}
+	}
 	if problem := c.opt.Store.RecordModelTransferSourceStatus(records.ModelTransferSourceStatus{
 		RequestID: frame.OperationId, Member: frame.Member, ObjectID: frame.ObjectId,
 		Length: int64(frame.Length), CapabilityRevision: int64(frame.CapabilityRevision),
@@ -121,9 +129,13 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 	}
 	if statuses, problem := c.opt.Store.ModelTransferSourceStatuses(frame.OperationId); problem == nil {
 		var transferred, total int64
+		verified := 0
 		for _, status := range statuses {
 			transferred += status.Transferred
 			total += status.Length
+			if status.State == "verified" {
+				verified++
+			}
 		}
 		value := map[string]any{"stage": "source download", "member": frame.Member,
 			"state": state, "transferred_bytes": transferred, "total_bytes": total}
@@ -131,6 +143,17 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 			value["fraction"] = float64(transferred) / float64(total)
 		}
 		c.publishTransferProgress(frame.OperationId, value)
+		// A member's state change is one line in the daemon log; byte progress is the
+		// live frame's alone. A queued transfer must be legible from the log (cl-099).
+		if state != previous {
+			detail := ""
+			if state == "failed" {
+				detail = " (" + frame.SafeCode + ": " + frame.SafeDetail + ")"
+			}
+			c.logf("model transfer %s: source %s %s on %s%s; %d of %d verified, %d/%d B",
+				frame.OperationId, frame.Member, state, s.instanceID, detail, verified,
+				len(transfer.SourceFiles), transferred, total)
+		}
 	}
 	c.signalTransfer(frame.OperationId)
 }
@@ -141,6 +164,9 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 	if err != nil || problem != nil || transfer == nil || selection != transfer.SourceSelection {
 		return
 	}
+	c.logf("model transfer %s: source prepare %s on %s (%d source(s)) %s %s", frame.OperationId,
+		trimEnum(pb.ModelSourcePrepareOutcome_name[int32(frame.Outcome)], "MODEL_SOURCE_PREPARE_OUTCOME_"),
+		s.instanceID, len(frame.Sources), frame.SafeCode, frame.SafeDetail)
 	if frame.Outcome == pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_REFUSED {
 		_ = c.opt.Store.FailModelTransfer(frame.OperationId, frame.SafeCode, frame.SafeDetail)
 		c.signalTransfer(frame.OperationId)

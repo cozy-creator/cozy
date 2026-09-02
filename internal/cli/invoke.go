@@ -1067,6 +1067,11 @@ func progressLine(e localapi.Event, full bool) string {
 		return ""
 	case "queued":
 		return "  preparing a local worker"
+	case "parked":
+		if reason, ok := e.Payload["reason"].(string); ok {
+			return "  queued — " + reason
+		}
+		return "  queued"
 	case "rentals":
 		if line, ok := e.Payload["line"].(string); ok {
 			return line
