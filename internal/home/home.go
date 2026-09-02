@@ -40,12 +40,14 @@ type Layout struct {
 	// this host. cozy-creator names it and never writes into it — every byte crosses
 	// through the tfs binary (cl-012).
 	CAS string
-	// Transfer is scratch for bytes in flight. It is not a journal: the CAS's own
-	// verification records are (a transfer resumes from what is VERIFIED, never from
-	// what happens to be lying in a temp directory). Every entry is claimed through
-	// internal/scratch by the live process using it; the daemon's start-time sweep
-	// removes what nobody holds. Only `locks/` is permanent.
-	Transfer string
+	// Tmp is THE ONE place for bytes in flight (owner ruling 2026-09-02): a model source
+	// downloaded for ingest lives in `tmp/<request-id>/` until its CozyTensors are in the
+	// CAS, a request's fetched remote input in `tmp/<request-id>/` until it settles, a
+	// verb's exchange files with the tfs binary in `tmp/<verb>-*/` for the verb's life.
+	// The process that writes an entry removes it the moment it is dead; every entry is
+	// claimed through internal/scratch and the daemon's start-time sweep is only the
+	// backstop for a crashed writer. `locks/` (model-acquisition flocks) is permanent.
+	Tmp string
 	// Triage holds WorkerTriageBundles copied out of worker roots (cl-006). A worker
 	// root does not outlive its worker — a one-shot run deletes it — so the bundle
 	// worth keeping is kept HERE, by the client that wanted it.
@@ -99,7 +101,7 @@ func Open(root string) (Layout, *exit.Error) {
 		Inputs:   filepath.Join(root, "inputs"),
 		Uploads:  filepath.Join(root, "uploads", "sha256"),
 		CAS:      filepath.Join(root, "cas"),
-		Transfer: filepath.Join(root, "transfer"),
+		Tmp:      filepath.Join(root, "tmp"),
 		Triage:   filepath.Join(root, "triage"),
 		Client:   filepath.Join(root, "client.cred"),
 	}

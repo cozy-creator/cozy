@@ -54,7 +54,7 @@ func handleModelList(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	work, problem := scratch.Temp(layout.Transfer, "repo-list-")
+	work, problem := scratch.Temp(layout.Tmp, "repo-list-")
 	if problem != nil {
 		return problem
 	}
@@ -159,7 +159,7 @@ func handleModelRemove(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	work, problem := scratch.Temp(layout.Transfer, "repo-remove-")
+	work, problem := scratch.Temp(layout.Tmp, "repo-remove-")
 	if problem != nil {
 		return problem
 	}

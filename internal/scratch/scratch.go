@@ -1,8 +1,9 @@
 // Package scratch is the ONE spelling of "a temporary directory owned by a live
-// process". Every entry under transfer/ is claimed through it: the owner holds a kernel
-// lock on `<dir>/.claim` for as long as it needs the bytes, and the lock dies with the
-// process, SIGKILL included. The daemon's start-time sweep reclaims exactly the entries
-// nobody holds — observed liveness, never elapsed time.
+// process". Every entry under tmp/ is claimed through it: the owner holds a kernel lock
+// on `<dir>/.claim` for as long as it needs the bytes, and the lock dies with the
+// process, SIGKILL included. The owner removes the directory the moment the bytes are
+// dead (Release); the daemon's start-time sweep is the backstop for a writer that
+// crashed — observed liveness and the request's recorded state, never elapsed time.
 package scratch
 
 import (
@@ -21,7 +22,8 @@ type Dir struct {
 	claim *os.File
 }
 
-// Temp creates a fresh, uniquely named directory under root and claims it.
+// Temp creates a fresh, uniquely named directory under root and claims it — a verb's
+// scratch, alive exactly as long as the verb.
 func Temp(root, prefix string) (*Dir, *exit.Error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, exit.Internalf("cannot create the scratch root %s: %s", root, err)
@@ -36,6 +38,25 @@ func Temp(root, prefix string) (*Dir, *exit.Error) {
 		return nil, problem
 	}
 	return dir, nil
+}
+
+// Named claims `<root>/<id>` — a request's scratch, named by the request so a restarted
+// daemon resumes what a crashed one left (a verified `.part` continues; anything else is
+// re-derived) and the sweep can read the request's state for it. What a previous holder
+// left is kept: the claim proves nothing live holds it, and every reader re-verifies
+// bytes before trusting them.
+func Named(root, id string) (*Dir, *exit.Error) {
+	if id == "" || filepath.Base(id) != id || id == "." || id == ".." {
+		return nil, exit.Internalf("refusing a scratch entry with unsafe id %q", id)
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, exit.Internalf("cannot create the scratch root %s: %s", root, err)
+	}
+	path := filepath.Join(root, id)
+	if err := os.Mkdir(path, 0o700); err != nil && !os.IsExist(err) {
+		return nil, exit.Internalf("cannot create scratch %s: %s", path, err)
+	}
+	return claim(path)
 }
 
 func claim(path string) (*Dir, *exit.Error) {

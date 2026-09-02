@@ -12,8 +12,7 @@ import (
 )
 
 // TestReclaimSweeps is the startup sweep over the three roots that used to grow without
-// bound (cl-090): attempt working directories, closed workers' roots, and transfer
-// scratch. Nothing is mocked — a real layout, a real records store, real directories,
+// bound (cl-091): attempt working directories, closed workers' roots, and tmp/. Nothing is mocked — a real layout, a real records store, real directories,
 // and the product's own reclaim package. Each root proves both halves: what nothing
 // references goes, and what a row or a live process still claims stays.
 func TestReclaimSweeps(t *testing.T) {
@@ -115,50 +114,58 @@ func TestReclaimSweeps(t *testing.T) {
 		t.Fatalf("live worker root was swept: %v", err)
 	}
 
-	// ---- transfer: a claim held by a live process keeps its scratch; an unheld
-	// directory, a stray file, and a crashed process's leftover go; locks/ stays.
-	held, problem := scratch.Temp(l.Transfer, "package-install-")
+	// ---- tmp: a claim held by a live process keeps its scratch; a crashed process's
+	// leftover, an unclaimed directory and a stray file go; an entry named for a request
+	// that has not settled (req-open) stays, one named for a settled request goes; locks/
+	// stays.
+	held, problem := scratch.Temp(l.Tmp, "package-install-")
 	if problem != nil {
 		t.Fatal(problem)
 	}
 	defer held.Release()
 	must(t, os.WriteFile(filepath.Join(held.Path, "wheel"), make([]byte, 100), 0o644))
 	// A crashed process's scratch: the claim file is there, the kernel lock died with it.
-	leftoverPath := filepath.Join(l.Transfer, "invoke-models-crashed")
+	leftoverPath := filepath.Join(l.Tmp, "invoke-models-crashed")
 	must(t, os.MkdirAll(leftoverPath, 0o700))
 	must(t, os.WriteFile(filepath.Join(leftoverPath, ".claim"), nil, 0o600))
 	must(t, os.WriteFile(filepath.Join(leftoverPath, "manifest.bin"), make([]byte, 2048), 0o644))
-	must(t, os.MkdirAll(filepath.Join(l.Transfer, "locks"), 0o700))
-	must(t, os.WriteFile(filepath.Join(l.Transfer, "locks", sixtyFour("e")+".lock"), nil, 0o600))
-	must(t, os.MkdirAll(filepath.Join(l.Transfer, "unclaimed-dir"), 0o700))
-	must(t, os.WriteFile(filepath.Join(l.Transfer, "stray-evidence.jsonl"), []byte("{}\n"), 0o600))
+	must(t, os.MkdirAll(filepath.Join(l.Tmp, "locks"), 0o700))
+	must(t, os.WriteFile(filepath.Join(l.Tmp, "locks", sixtyFour("e")+".lock"), nil, 0o600))
+	must(t, os.MkdirAll(filepath.Join(l.Tmp, "unclaimed-dir"), 0o700))
+	must(t, os.WriteFile(filepath.Join(l.Tmp, "stray-evidence.jsonl"), []byte("{}\n"), 0o600))
+	liveRequest := filepath.Join(l.Tmp, "req-open")
+	must(t, os.MkdirAll(liveRequest, 0o700))
+	must(t, os.WriteFile(filepath.Join(liveRequest, "model.safetensors.part"), make([]byte, 512), 0o600))
+	settledRequest := filepath.Join(l.Tmp, "req-exported")
+	must(t, os.MkdirAll(settledRequest, 0o700))
+	must(t, os.WriteFile(filepath.Join(settledRequest, "model.safetensors"), make([]byte, 512), 0o600))
 
-	transfer, problem := reclaim.Transfer(l)
+	tmp, problem := reclaim.Tmp(l, store)
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	if transfer.Scanned != 4 || transfer.Removed != 3 || transfer.Bytes < 2048 {
-		t.Fatalf("transfer sweep = %+v, want 4 scanned, 3 removed, the leftover's bytes freed", transfer)
+	if tmp.Scanned != 6 || tmp.Removed != 4 || tmp.Bytes < 2048+512 {
+		t.Fatalf("tmp sweep = %+v, want 6 scanned, 4 removed, the leftovers' bytes freed", tmp)
 	}
-	for _, gone := range []string{leftoverPath, filepath.Join(l.Transfer, "unclaimed-dir"),
-		filepath.Join(l.Transfer, "stray-evidence.jsonl")} {
+	for _, gone := range []string{leftoverPath, filepath.Join(l.Tmp, "unclaimed-dir"),
+		filepath.Join(l.Tmp, "stray-evidence.jsonl"), settledRequest} {
 		if _, err := os.Stat(gone); !os.IsNotExist(err) {
-			t.Fatalf("unheld transfer entry %s remains: %v", gone, err)
+			t.Fatalf("dead tmp entry %s remains: %v", gone, err)
 		}
 	}
-	for _, kept := range []string{filepath.Join(held.Path, "wheel"),
-		filepath.Join(l.Transfer, "locks", sixtyFour("e")+".lock")} {
+	for _, kept := range []string{filepath.Join(held.Path, "wheel"), liveRequest,
+		filepath.Join(l.Tmp, "locks", sixtyFour("e")+".lock")} {
 		if _, err := os.Stat(kept); err != nil {
-			t.Fatalf("held or lock entry %s was swept: %v", kept, err)
+			t.Fatalf("held, live-request or lock entry %s was swept: %v", kept, err)
 		}
 	}
 
 	// Every sweep is idempotent: a second pass over the survivors removes nothing.
 	again, _ := reclaim.Attempts(l, store)
 	againWorkers, _ := reclaim.Workers(l, store)
-	againTransfer, _ := reclaim.Transfer(l)
-	if again.Removed+againWorkers.Removed+againTransfer.Removed != 0 {
-		t.Fatalf("second sweeps removed something: %+v %+v %+v", again, againWorkers, againTransfer)
+	againTmp, _ := reclaim.Tmp(l, store)
+	if again.Removed+againWorkers.Removed+againTmp.Removed != 0 {
+		t.Fatalf("second sweeps removed something: %+v %+v %+v", again, againWorkers, againTmp)
 	}
 }
 

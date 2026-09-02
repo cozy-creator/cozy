@@ -70,7 +70,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if existingInstall != nil && existingInstall.SourceDigest == releaseDigest {
 		defer existing.Close()
 		result := &install.Result{Install: *existingInstall, Idempotent: true}
-		modelScratch, problem := scratch.Temp(existingLayout.Transfer, "package-model-prefetch-")
+		modelScratch, problem := scratch.Temp(existingLayout.Tmp, "package-model-prefetch-")
 		if problem != nil {
 			return problem
 		}
@@ -86,7 +86,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	work, problem := scratch.Temp(layout.Transfer, "package-install-")
+	work, problem := scratch.Temp(layout.Tmp, "package-install-")
 	if problem != nil {
 		return problem
 	}

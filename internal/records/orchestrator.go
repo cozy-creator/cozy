@@ -1002,6 +1002,15 @@ func (s *Store) CanceledLocalPackages(workerID string) ([]Request, *exit.Error) 
 	return out, nil
 }
 
+// Settled answers whether a request state is final: nothing will run for it again.
+func Settled(state string) bool {
+	switch state {
+	case "succeeded", "failed", "canceled", "refused", "abandoned":
+		return true
+	}
+	return false
+}
+
 // SettleRequest records the request's final state. Only a terminal the orchestrator
 // ACCEPTED can settle one.
 func (s *Store) SettleRequest(id, state string) *exit.Error {

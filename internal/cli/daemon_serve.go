@@ -153,11 +153,12 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// would otherwise still reference an install, and before the API is served — and it
 	// is never fatal: what it removes is a venv `cozy package install` rebuilds.
 	swept, sweepNote := sweepInstalls(l, st)
-	// The three roots that used to grow without bound. Each sweep lets the records
-	// authority — or a live process's kernel lock — decide what still has a claim.
+	// The three roots that used to grow without bound. The writer removes its own bytes
+	// when they die; these sweeps are the backstop for a crashed one, and each lets the
+	// records authority — or a live process's kernel lock — decide what still has a claim.
 	attempts, attemptsNote := reclaimNote(reclaim.Attempts(l, st))
 	workers, workersNote := reclaimNote(reclaim.Workers(l, st))
-	transfer, transferNote := reclaimNote(reclaim.Transfer(l))
+	tmp, tmpNote := reclaimNote(reclaim.Tmp(l, st))
 
 	// One per-launch CLI credential is handed over through a 0600 file. It is never
 	// printed, logged, or placed on argv, and dies with this process. The public web stub
@@ -192,8 +193,8 @@ func serveDaemon(ctx *Context) *exit.Error {
 		attempts.Removed, attempts.Scanned, output.Bytes(attempts.Bytes), attemptsNote)
 	fmt.Fprintf(ctx.Out, "  worker sweep: reclaimed %d of %d director(ies), freed %s%s\n",
 		workers.Removed, workers.Scanned, output.Bytes(workers.Bytes), workersNote)
-	fmt.Fprintf(ctx.Out, "  transfer sweep: reclaimed %d of %d entr(y|ies), freed %s%s\n",
-		transfer.Removed, transfer.Scanned, output.Bytes(transfer.Bytes), transferNote)
+	fmt.Fprintf(ctx.Out, "  tmp sweep: reclaimed %d of %d entr(y|ies), freed %s%s\n",
+		tmp.Removed, tmp.Scanned, output.Bytes(tmp.Bytes), tmpNote)
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s · reconcile killed %d orphan(s), forgot %d stale row(s)\n",
 		l.DB, yield, killed, forgotten)
 	fmt.Fprintf(ctx.Out, "  client credential %s (%s, mode 0600)\n", creds.CLI.Digest(), l.Client)

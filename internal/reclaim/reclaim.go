@@ -1,8 +1,9 @@
 // Package reclaim removes what nothing references any more under the three roots that
 // used to grow without bound: attempt working directories, closed workers' roots, and
-// transfer scratch. Each sweep mirrors install.Sweep: walk the DIRECTORY and let the
-// records authority (or a live process's kernel lock) decide what still has a claim.
-// A directory that refuses to go is reported and left for the next sweep.
+// tmp/. The process that wrote the bytes removes them when they die; each sweep here is
+// the BACKSTOP for a writer that crashed, and mirrors install.Sweep: walk the DIRECTORY
+// and let the records authority (or a live process's kernel lock) decide what still has
+// a claim. A directory that refuses to go is reported and left for the next sweep.
 package reclaim
 
 import (
@@ -105,21 +106,29 @@ func Attempt(l home.Layout, st *records.Store, requestID string, attempt uint64)
 	return freed, true, nil
 }
 
-// Request reclaims every reclaimable attempt directory of one request.
+// Request reclaims every reclaimable attempt directory of one request, and the
+// request's `tmp/<id>/` once the request has settled.
 func Request(l home.Layout, st *records.Store, requestID string) (Swept, *exit.Error) {
-	entries, err := os.ReadDir(l.RequestAttempts(requestID))
-	if err != nil {
-		return Swept{}, nil
-	}
 	var swept Swept
 	var first *exit.Error
-	for _, entry := range entries {
-		attempt, err := strconv.ParseUint(entry.Name(), 10, 64)
-		if !entry.IsDir() || err != nil {
-			continue
+	entries, err := os.ReadDir(l.RequestAttempts(requestID))
+	if err == nil {
+		for _, entry := range entries {
+			attempt, err := strconv.ParseUint(entry.Name(), 10, 64)
+			if !entry.IsDir() || err != nil {
+				continue
+			}
+			swept.Scanned++
+			freed, removed, problem := Attempt(l, st, requestID, attempt)
+			if problem != nil && first == nil {
+				first = problem
+			}
+			swept.add(freed, removed)
 		}
+	}
+	if _, err := os.Lstat(filepath.Join(l.Tmp, requestID)); err == nil {
 		swept.Scanned++
-		freed, removed, problem := Attempt(l, st, requestID, attempt)
+		freed, removed, problem := tmpEntry(l, st, requestID)
 		if problem != nil && first == nil {
 			first = problem
 		}
@@ -198,17 +207,19 @@ func Worker(l home.Layout, instanceID string, keepLog bool) (int64, *exit.Error)
 	return freed, nil
 }
 
-// ------------------------------------------------------------------ transfer
+// ------------------------------------------------------------------ tmp
 
-// Transfer reclaims every entry under transfer/ that no live process holds a scratch
-// claim on. `locks/` is the model-acquisition lock directory and stays.
-func Transfer(l home.Layout) (Swept, *exit.Error) {
-	entries, err := os.ReadDir(l.Transfer)
+// Tmp reclaims every entry under tmp/ that is dead: no live process holds its scratch
+// claim, and the request it is named for — if it names one — has settled. `locks/` is
+// the model-acquisition lock directory and stays. On a healthy box this reclaims 0: the
+// writer removed its own entry when the bytes died.
+func Tmp(l home.Layout, st *records.Store) (Swept, *exit.Error) {
+	entries, err := os.ReadDir(l.Tmp)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return Swept{}, nil
 		}
-		return Swept{}, exit.Internalf("cannot scan the transfer root %s: %s", l.Transfer, err)
+		return Swept{}, exit.Internalf("cannot scan the tmp root %s: %s", l.Tmp, err)
 	}
 	var swept Swept
 	var first *exit.Error
@@ -216,21 +227,44 @@ func Transfer(l home.Layout) (Swept, *exit.Error) {
 		if entry.Name() == "locks" {
 			continue
 		}
-		path := filepath.Join(l.Transfer, entry.Name())
 		swept.Scanned++
-		if entry.IsDir() && scratch.Held(path) {
-			continue
-		}
-		freed, problem := removeTree(path)
+		freed, removed, problem := tmpEntry(l, st, entry.Name())
 		if problem != nil {
 			if first == nil {
 				first = problem
 			}
 			continue
 		}
-		swept.add(freed, true)
+		swept.add(freed, removed)
 	}
 	return swept, first
+}
+
+// tmpEntry removes one `tmp/<name>` unless a live process holds it or it is named for a
+// request that has not settled.
+func tmpEntry(l home.Layout, st *records.Store, name string) (int64, bool, *exit.Error) {
+	path := filepath.Join(l.Tmp, name)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, false, nil
+	}
+	if info.IsDir() && scratch.Held(path) {
+		return 0, false, nil
+	}
+	if st != nil {
+		request, problem := st.RequestRow(name)
+		if problem != nil {
+			return 0, false, problem
+		}
+		if request != nil && !records.Settled(request.State) {
+			return 0, false, nil
+		}
+	}
+	freed, problem := removeTree(path)
+	if problem != nil {
+		return 0, false, problem
+	}
+	return freed, true, nil
 }
 
 // ------------------------------------------------------------------ helpers

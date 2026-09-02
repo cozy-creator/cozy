@@ -285,7 +285,7 @@ func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
 	if problem != nil {
 		return nil, problem
 	}
-	work, problem := scratch.Temp(layout.Transfer, "invoke-models-")
+	work, problem := scratch.Temp(layout.Tmp, "invoke-models-")
 	if problem != nil {
 		return nil, problem
 	}

@@ -51,7 +51,7 @@ func (f *Fetch) Acquire(ctx context.Context, row hub.ModelManifest) (Fetched, *e
 	if err := os.MkdirAll(f.Scratch, 0o700); err != nil {
 		return out, exit.Internalf("cannot create model acquisition scratch: %s", err)
 	}
-	locks := filepath.Join(filepath.Dir(f.Tool.Root), "transfer", "locks")
+	locks := filepath.Join(filepath.Dir(f.Tool.Root), "tmp", "locks")
 	if err := os.MkdirAll(locks, 0o700); err != nil {
 		return out, exit.Internalf("cannot create model acquisition locks: %s", err)
 	}

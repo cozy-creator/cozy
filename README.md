@@ -303,8 +303,23 @@ authentication, upload-to-invocation binding, and media-history UX come with the
 
 ## Configuration
 
-The default local root is `~/.cozy`. Configuration is read once from
-`~/.cozy/config.yaml`, then credential/location environment variables override it:
+The default local root is `~/.cozy`. What lives there:
+
+| path | what it is |
+|---|---|
+| `cas/` | the local TensorFS store: every model's canonical bytes, written only by `tfs` |
+| `installs/` | one immutable environment per installed package |
+| `outputs/<org>-<package>/` | result files, named by their own content digest |
+| `attempts/` | the daemon's per-attempt working area; removed once an attempt settles |
+| `workers/<instance>/` | a local worker's `run/` state and `worker.log`; removed when it exits, the log stays |
+| `tmp/<request-id>/` | bytes in flight: a model source downloaded for ingest, a fetched remote input; removed the moment the CozyTensors are in `cas/` or the request settles |
+| `records.db`, `daemon.log` | the one local lifecycle database and the daemon's own log |
+
+Nothing is kept on disk without a live reason; the daemon's start-time sweeps (`cozy up` prints
+them) are only the backstop for a process that crashed and report `reclaimed 0` on a healthy box.
+
+Configuration is read once from `~/.cozy/config.yaml`, then credential/location environment
+variables override it:
 
 ```yaml
 tensorhub_url: https://tensorhub.example
