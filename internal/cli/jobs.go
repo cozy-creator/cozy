@@ -280,9 +280,9 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 		}
 	}()
 
-	lines := newProgress(ctx, false, began)
-	terminal, e := c.WatchContext(watchCtx, jobID, 0, lines.on)
-	lines.done()
+	lines := NewProgress(ctx, false, began)
+	terminal, e := c.WatchContext(watchCtx, jobID, 0, lines.On)
+	lines.Done()
 	select {
 	case problem := <-cancelFailed:
 		return problem

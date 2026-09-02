@@ -471,7 +471,7 @@ func (c *Orchestrator) drain() {
 		}
 		if req.RentalRequired && req.Worker == "" {
 			c.selectOrStart(*req)
-			c.park(*req, position, "waiting for a rental to be assigned")
+			c.park(*req, position, waitFacts{cause: WaitRental}, "waiting for a rental to be assigned")
 			continue
 		}
 		if req.ModelTransfer != nil {
@@ -481,7 +481,8 @@ func (c *Orchestrator) drain() {
 				// worker before the ordinal exists. Meanwhile the request holds its place
 				// and its lanes like any other parked request.
 				c.kickQueuedTransferDispatch(*req)
-				c.park(*req, position, "model transfer "+transfer.State+" on the selected worker")
+				c.park(*req, position, waitFacts{cause: WaitModelTransfer},
+					"model transfer "+transfer.State+" on the selected worker")
 				continue
 			}
 		}
@@ -495,7 +496,7 @@ func (c *Orchestrator) drain() {
 			// `dispatch` refuses AFTER `pick` succeeded and the only branch here was
 			// `continue`.
 			if e.Code == exit.Unavailable || e.Code == exit.Conflict {
-				c.park(*req, position, e.Message)
+				c.park(*req, position, waitFacts{}, e.Message)
 				continue
 			}
 			c.failQueued(id, e)
@@ -510,7 +511,9 @@ func (c *Orchestrator) drain() {
 // for are read fresh every time (a worker may have appeared); the budget is fixed at the
 // first parking. Only a CHANGE is logged and emitted (`request.parked`): the drain runs
 // on every worker report, and a parked request that is still parked is not news.
-func (c *Orchestrator) park(req records.Request, position int, reason string) {
+// A caller that knows the blocking condition passes it; an empty waitFacts means "a
+// capacity refusal" and the condition is read from the same routing that names the lanes.
+func (c *Orchestrator) park(req records.Request, position int, facts waitFacts, reason string) {
 	c.mu.Lock()
 	if !c.queued(req.ID) {
 		c.mu.Unlock()
@@ -521,10 +524,14 @@ func (c *Orchestrator) park(req records.Request, position int, reason string) {
 		p = &parking{budget: position}
 		c.parked[req.ID] = p
 	}
-	lanes := c.route(req).lanes
+	r := c.route(req)
+	if facts.cause == "" {
+		facts = c.classifyCapacityWait(req, r)
+	}
+	lanes := r.lanes
 	sort.Slice(lanes, func(i, j int) bool { return lanes[i].String() < lanes[j].String() })
 	p.lanes = lanes
-	state := fmt.Sprintf("%s|%s|%t", reason, laneStrings(lanes), p.claims())
+	state := fmt.Sprintf("%s|%s|%s|%s|%t", reason, facts.cause, facts.on, laneStrings(lanes), p.claims())
 	changed := state != p.logged
 	p.logged = state
 	overtaken, budget, claims := p.overtaken, p.budget, p.claims()
@@ -538,10 +545,10 @@ func (c *Orchestrator) park(req records.Request, position int, reason string) {
 	for _, l := range lanes {
 		rows = append(rows, l.String())
 	}
-	c.emit(req.ID, "request.parked", 0, map[string]any{
+	c.emit(req.ID, "request.parked", 0, facts.decorate(map[string]any{
 		"reason": reason, "position": position + 1, "lanes": rows,
 		"overtaken": overtaken, "budget": budget, "claims": claims,
-	})
+	}, req))
 }
 
 // queued answers whether a request is still in the dispatch queue. Callers hold c.mu.
