@@ -281,10 +281,10 @@ func TestPackageDescriptor(t *testing.T) {
 	if ep.Request.Fields[0].Wire != "required" || ep.Request.Fields[1].Wire != "required" {
 		t.Fatalf("absent wire did not derive required: %+v", ep.Request.Fields)
 	}
-	if launch.ValidatePayload(ep, []byte(`{"strength":0,"mode":"fast"}`)) == nil {
+	if launch.ValidatePayload("probe/probe", ep, []byte(`{"strength":0,"mode":"fast"}`)) == nil {
 		t.Error("gt:0 admitted 0")
 	}
-	if e := launch.ValidatePayload(ep, []byte(`{"strength":0.25,"mode":"quality"}`)); e != nil {
+	if e := launch.ValidatePayload("probe/probe", ep, []byte(`{"strength":0.25,"mode":"quality"}`)); e != nil {
 		t.Errorf("a valid payload was refused: %s", e.Message)
 	}
 	// Whitespace and key order are NOT identity; a meaning change is.
