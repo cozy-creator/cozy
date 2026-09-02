@@ -837,15 +837,15 @@ func (s *Store) RequestByIdempotencyKey(key string) (*Request, *exit.Error) {
 	return &r, nil
 }
 
-// Requests lists rows newest-first, optionally filtered by state. `state=""` is every
-// request; the client contract's listing route reads exactly this.
-func (s *Store) Requests(state string, limit int) ([]Request, *exit.Error) {
-	return s.RequestsOfKind("", state, limit)
+// Requests lists rows newest-first, optionally filtered by state and package. Empty
+// filters select every value; the client contract's listing route reads exactly this.
+func (s *Store) Requests(state, packageName string, limit int) ([]Request, *exit.Error) {
+	return s.RequestsOfKind("", state, packageName, limit)
 }
 
 // RequestsOfKind narrows the same listing to one ATTEMPT CLASS. `cozy run list` reads jobs
 // and the request listing reads serving rows — one table, one reader, two questions.
-func (s *Store) RequestsOfKind(kind, state string, limit int) ([]Request, *exit.Error) {
+func (s *Store) RequestsOfKind(kind, state, packageName string, limit int) ([]Request, *exit.Error) {
 	query := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number, ` +
 		requestCols + ` FROM requests) SELECT * FROM numbered`
 	where := []string{}
@@ -857,6 +857,10 @@ func (s *Store) RequestsOfKind(kind, state string, limit int) ([]Request, *exit.
 	if state != "" {
 		where = append(where, `state=?`)
 		args = append(args, state)
+	}
+	if packageName != "" {
+		where = append(where, `package=?`)
+		args = append(args, packageName)
 	}
 	if len(where) > 0 {
 		query += ` WHERE ` + strings.Join(where, " AND ")

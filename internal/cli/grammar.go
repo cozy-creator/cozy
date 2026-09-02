@@ -333,10 +333,12 @@ type RunListCmd struct {
 	State   string `help:"Filter by lifecycle state."`
 	Package string `help:"Filter by package."`
 	Limit   int    `help:"Maximum rows." default:"50"`
+	Watch   bool   `help:"Refresh continuously (requires a terminal)."`
+	NoWatch bool   `help:"Print one snapshot even in a terminal."`
 }
 
 func (c *RunListCmd) Run(r *Runtime) error {
-	return r.call(handleRunList, nil, nil, values(
+	return r.call(handleRunList, nil, bools("--watch", c.Watch, "--no-watch", c.NoWatch), values(
 		"--state", c.State, "--package", c.Package, "--limit", intText(c.Limit)), true)
 }
 

@@ -188,7 +188,7 @@ func (c *Client) Request(id string) (api.Lifecycle, *exit.Error) {
 // Requests lists ordinary invocations and jobs through the one request lifecycle
 // authority. Kind distinguishes their execution expectation without creating a
 // second public inventory.
-func (c *Client) Requests(status string, limit int) ([]api.Lifecycle, *exit.Error) {
+func (c *Client) Requests(ctx context.Context, status, packageName string, limit int) ([]api.Lifecycle, *exit.Error) {
 	var out struct {
 		Requests []api.Lifecycle `json:"requests"`
 	}
@@ -196,7 +196,10 @@ func (c *Client) Requests(status string, limit int) ([]api.Lifecycle, *exit.Erro
 	if status != "" {
 		path += "&status=" + url.QueryEscape(status)
 	}
-	problem := c.call(http.MethodGet, path, nil, &out)
+	if packageName != "" {
+		path += "&package=" + url.QueryEscape(packageName)
+	}
+	problem := c.callContext(ctx, http.MethodGet, path, nil, &out)
 	return out.Requests, problem
 }
 

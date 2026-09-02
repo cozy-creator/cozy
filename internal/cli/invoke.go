@@ -595,20 +595,37 @@ func handleRunList(ctx *Context) *exit.Error {
 		}
 		limit = parsed
 	}
-	rows, problem := client.Requests(ctx.Inv.Value("--state"), limit)
+	explicit, disabled := ctx.Inv.Bool("--watch"), ctx.Inv.Bool("--no-watch")
+	if explicit && disabled {
+		return exit.Usagef("--watch and --no-watch cannot be used together")
+	}
+	watching := explicit || ctx.Mode().TTY && !disabled
+	if watching && (ctx.Mode().JSON || !ctx.Mode().TTY) {
+		return exit.Usagef("--watch requires interactive terminal output").
+			WithRemedy("omit --watch for one snapshot, or use --json for automation")
+	}
+	if watching {
+		return watchRunList(ctx, client, limit)
+	}
+	list, problem := runList(context.Background(), client, ctx.Inv.Value("--state"), ctx.Inv.Value("--package"), limit)
 	if problem != nil {
 		return problem
 	}
-	pkg := strings.TrimSpace(ctx.Inv.Value("--package"))
+	return emit(ctx, list)
+}
+
+func runList(requestCtx context.Context, client *localapi.Client, state, packageName string, limit int) (output.List, *exit.Error) {
+	pkg := strings.TrimSpace(packageName)
+	rows, problem := client.Requests(requestCtx, state, pkg, limit)
+	if problem != nil {
+		return output.List{}, problem
+	}
 	list := output.List{
 		Name: "invocations", Fields: []string{"number", "target", "machine", "status", "queued", "execution"},
 		AllFields: []string{"number", "id", "kind", "target", "machine", "status", "queued", "execution", "attempts", "created"},
 	}
 	states := map[string]int{}
 	for _, life := range rows {
-		if pkg != "" && life.Package != pkg {
-			continue
-		}
 		kind := life.Kind
 		if kind == "" {
 			kind = "invocation"
@@ -630,7 +647,52 @@ func handleRunList(ctx *Context) *exit.Error {
 	for _, state := range keys {
 		list.Aggregates = append(list.Aggregates, output.Field{K: state, V: states[state]})
 	}
-	return emit(ctx, list)
+	return list, nil
+}
+
+func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error {
+	watchCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if _, err := io.WriteString(ctx.Out, "\x1b[?1049h\x1b[?25l"); err != nil {
+		return exit.As(err)
+	}
+	defer func() { _, _ = io.WriteString(ctx.Out, "\x1b[?25h\x1b[?1049l") }()
+	render := func() *exit.Error {
+		list, problem := runList(watchCtx, client, ctx.Inv.Value("--state"), ctx.Inv.Value("--package"), limit)
+		if problem != nil {
+			return problem
+		}
+		list.Trail = append(list.Trail, "Refreshing every second · Ctrl-C to exit")
+		var frame strings.Builder
+		if err := list.Emit(&frame, ctx.Mode()); err != nil {
+			return exit.As(err)
+		}
+		if _, err := fmt.Fprintf(ctx.Out, "\x1b[H\x1b[J%s", frame.String()); err != nil {
+			return exit.As(err)
+		}
+		return nil
+	}
+	if problem := render(); problem != nil {
+		if watchCtx.Err() != nil {
+			return nil
+		}
+		return problem
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-watchCtx.Done():
+			return nil
+		case <-ticker.C:
+			if problem := render(); problem != nil {
+				if watchCtx.Err() != nil {
+					return nil
+				}
+				return problem
+			}
+		}
+	}
 }
 
 func invocationFields(life api.Lifecycle) []output.Field {

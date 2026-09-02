@@ -2031,7 +2031,7 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 // request whose prior daemon had already acquired may briefly double-rent;
 // the idle-release timer reaps the orphan.
 func (c *Orchestrator) ResumeQueuedRequests() *exit.Error {
-	queued, problem := c.opt.Store.Requests("queued", 512)
+	queued, problem := c.opt.Store.Requests("queued", "", 512)
 	if problem != nil {
 		return problem
 	}
