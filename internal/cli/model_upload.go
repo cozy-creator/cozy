@@ -111,6 +111,10 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 			return problem
 		}
 	}
+	suppliedProfiles, problem := parseSourceProfileFlags(ctx, producerName)
+	if problem != nil {
+		return problem
+	}
 	instructionSource, problem := canonicalProductionSource(ctx, sourceArg)
 	if problem != nil {
 		return problem
@@ -123,7 +127,7 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 	}
 	instruction := modeltransfer.Instruction{Kind: kind, Destination: destination,
 		Source: instructionSource, InputLane: strings.TrimSpace(ctx.Inv.Value("--lane")),
-		Producer: producerName, Placement: placement}
+		Producer: producerName, Placement: placement, SourceProfiles: suppliedProfiles}
 	localOnly := localOnlyModelSource(instructionSource)
 	if localOnly && ctx.Inv.Bool("--rental-only") {
 		return exit.Usagef("a local model source cannot run under --rental-only").
@@ -144,7 +148,7 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 		ctx.Inv.Bools["--rental"] = false
 		ctx.Inv.Bools["--rental-only"] = false
 	}
-	producer, problem := resolveProducerPlan(ctx, producerName)
+	producer, problem := resolveProducerPlan(ctx, producerName, suppliedProfiles)
 	if problem != nil {
 		return problem
 	}
@@ -455,7 +459,34 @@ func catalogModelSpelling(value string) bool {
 	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
 }
 
-func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) {
+// parseSourceProfileFlags reads repeatable --source-profile slot=profile pairs.
+// They bind a producer's model inputs to reviewed TensorFS source profiles when
+// the job declares none; pass-through has no slots and takes no profiles.
+func parseSourceProfileFlags(ctx *Context, producerName string) (map[string]string, *exit.Error) {
+	values := ctx.Inv.Values["--source-profile"]
+	if len(values) == 0 {
+		return nil, nil
+	}
+	if producerName == "" {
+		return nil, exit.Usagef("--source-profile binds a producer job's model inputs; pass-through takes no source profiles").
+			WithRemedy("select the producer job whose inputs these profiles narrow, e.g. --producer org/package@vN/function")
+	}
+	supplied := make(map[string]string, len(values))
+	for _, value := range values {
+		slot, profile, ok := strings.Cut(value, "=")
+		slot, profile = strings.TrimSpace(slot), strings.TrimSpace(profile)
+		if !ok || slot == "" || profile == "" {
+			return nil, exit.Usagef("--source-profile %q is not slot=profile", value)
+		}
+		if _, duplicate := supplied[slot]; duplicate {
+			return nil, exit.Usagef("--source-profile names slot %s twice", slot)
+		}
+		supplied[slot] = profile
+	}
+	return supplied, nil
+}
+
+func resolveProducerPlan(ctx *Context, raw string, supplied map[string]string) (*producerPlan, *exit.Error) {
 	if raw == "" {
 		return nil, nil
 	}
@@ -473,7 +504,7 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 		return nil, exit.Named(exit.Validation, "model_producer.not_job",
 			"--producer %s does not name one ordinary job callable", raw)
 	}
-	if problem := modeltransfer.ValidateProducer(raw, job); problem != nil {
+	if problem := modeltransfer.ValidateProducer(raw, job, supplied); problem != nil {
 		return nil, problem
 	}
 	plan := &producerPlan{Name: target.Selector + "/" + target.Function,
@@ -486,7 +517,11 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 		Function: target.Function, InstallID: selected.InstallID, Release: selected.Release,
 		ReleaseDigest: selected.ReleaseDigest, DescriptorID: job.DescriptorID}
 	for _, slot := range job.Models {
-		plan.SourceProfiles[slot.Param] = slot.SourceProfile
+		profile := slot.SourceProfile
+		if profile == "" {
+			profile = supplied[slot.Param]
+		}
+		plan.SourceProfiles[slot.Param] = profile
 	}
 	for _, output := range job.WeightsOutputs {
 		plan.Outputs = append(plan.Outputs, modeltransfer.OutputPin{Name: output.OutputID,
