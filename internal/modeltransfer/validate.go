@@ -68,7 +68,7 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 		return nil
 	}
 	if len(intent.SourceProfiles) == 0 || len(intent.Outputs) != len(spec.WeightsOutputs) ||
-		!sameProfileMap(intent.SourceProfiles, spec.ProducerProfiles) {
+		!profilesSatisfyDeclarations(intent.SourceProfiles, spec.ProducerProfiles) {
 		return exit.New(exit.Validation, "producer transfer inputs/outputs do not match the job descriptor")
 	}
 	declared := make(map[string]*orchestrator.WeightsOutput, len(spec.WeightsOutputs))
@@ -86,12 +86,19 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 	return nil
 }
 
-func sameProfileMap(left, right map[string]string) bool {
-	if len(left) != len(right) {
+// profilesSatisfyDeclarations holds the descriptor as the single authority
+// where it declares a slot's profile, and requires the caller's intent
+// (--source-profile) to fill exactly the slots it leaves undeclared.
+func profilesSatisfyDeclarations(intent, declared map[string]string) bool {
+	if len(intent) != len(declared) {
 		return false
 	}
-	for key, value := range left {
-		if right[key] != value {
+	for slot, declaredProfile := range declared {
+		supplied, ok := intent[slot]
+		if !ok || supplied == "" {
+			return false
+		}
+		if declaredProfile != "" && supplied != declaredProfile {
 			return false
 		}
 	}

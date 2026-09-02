@@ -441,3 +441,31 @@ func TestSuppliedSourceProfiles(t *testing.T) {
 		t.Fatalf("override of a declared profile must refuse, got %v", problem)
 	}
 }
+
+// TestSubmissionFillsUndeclaredProfiles mirrors the H3 four-lane dispatch: the
+// published descriptor leaves both slots undeclared, the caller's intent fills
+// them, and the descriptor stays the single authority where it does declare.
+func TestSubmissionFillsUndeclaredProfiles(t *testing.T) {
+	intent := &records.ModelTransferIntent{Kind: "model-upload", Destination: "paul/minimax-h3",
+		Source: "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("4", 40), SourceSelection: "sha256:" + strings.Repeat("2", 64),
+		SourceProfiles: map[string]string{
+			"dits":   "hf/minimax-h3/native-dual-bf16/1",
+			"shared": "hf/minimax-h3/shared-bf16/1",
+		},
+		Outputs: []records.ModelTransferOutput{{Name: "full"}}}
+	spec := orchestrator.Submission{Package: "paul/minimax-h3-tools", Entrypoint: "four-lane",
+		ModelTransfer: intent,
+		ProducerProfiles: map[string]string{"dits": "", "shared": ""},
+		WeightsOutputs:   []orchestrator.WeightsOutput{{OutputID: "full"}}}
+	if problem := modeltransfer.ValidateSubmission(spec); problem != nil {
+		t.Fatalf("intent must fill undeclared slots: %s", problem.Message)
+	}
+	spec.ProducerProfiles = map[string]string{"dits": "declared/elsewhere/x/1", "shared": ""}
+	if problem := modeltransfer.ValidateSubmission(spec); problem == nil {
+		t.Fatal("intent contradicting a declared profile must refuse")
+	}
+	spec.ProducerProfiles = map[string]string{"dits": "", "shared": "", "third": ""}
+	if problem := modeltransfer.ValidateSubmission(spec); problem == nil {
+		t.Fatal("unfilled undeclared slot must refuse")
+	}
+}
