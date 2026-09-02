@@ -22,7 +22,13 @@ type Layout struct {
 	Lock     string // the single-writer flock file
 	Daemon   string // the Cozy daemon's liveness lock (cl-001; held, never read)
 	Workers  string // per-worker roots: journal, logs, staged binding plans
-	Outputs  string // the local output namespace the orchestrator grants into
+	// Attempts is the orchestrator's INTERNAL working area: one directory per attempt
+	// holding the staged payload and the destinations the delivery grant names. It is
+	// reclaimed once the attempt is closed and its result files have moved out.
+	Attempts string
+	// Outputs is the user-facing store: `<org>-<package>/<digest>.<ext>`, one file per
+	// result file, named by its own content digest so a regenerated file lands on itself.
+	Outputs string
 	// Inputs is the immutable, content-addressed staging area for caller-owned assets.
 	// Request rows point here so requeue never depends on the submitting CLI or its
 	// original path still existing.
@@ -36,7 +42,9 @@ type Layout struct {
 	CAS string
 	// Transfer is scratch for bytes in flight. It is not a journal: the CAS's own
 	// verification records are (a transfer resumes from what is VERIFIED, never from
-	// what happens to be lying in a temp directory).
+	// what happens to be lying in a temp directory). Every entry is claimed through
+	// internal/scratch by the live process using it; the daemon's start-time sweep
+	// removes what nobody holds. Only `locks/` is permanent.
 	Transfer string
 	// Triage holds WorkerTriageBundles copied out of worker roots (cl-006). A worker
 	// root does not outlive its worker — a one-shot run deletes it — so the bundle
@@ -82,6 +90,7 @@ func Open(root string) (Layout, *exit.Error) {
 		Lock:     filepath.Join(root, "writer.lock"),
 		Daemon:   filepath.Join(root, "daemon.lock"),
 		Workers:  filepath.Join(root, "workers"),
+		Attempts: filepath.Join(root, "attempts"),
 		Outputs:  filepath.Join(root, "outputs"),
 		Inputs:   filepath.Join(root, "inputs"),
 		Uploads:  filepath.Join(root, "uploads", "sha256"),
@@ -93,7 +102,7 @@ func Open(root string) (Layout, *exit.Error) {
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
 	l.PrivatePackages = filepath.Join(root, "private-packages")
-	for _, dir := range []string{l.Installs, l.Workers, l.Outputs, l.Triage, l.Publications} {
+	for _, dir := range []string{l.Installs, l.Workers, l.Attempts, l.Outputs, l.Triage, l.Publications} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}
@@ -182,11 +191,23 @@ func (l Layout) PublicationStage(org, requestID string, attempt uint64) string {
 	return filepath.Join(l.PublicationRoot(org, requestID), ".staging", "a"+itoa(attempt))
 }
 
-// AttemptDir is the local output namespace for one attempt. The orchestrator grants
-// exactly this directory and nothing above it; the runtime writes under the grant and
-// never learns who may read it.
+// AttemptDir is one attempt's working directory. The orchestrator grants exactly this
+// directory and nothing above it; the runtime writes under the grant and never learns
+// who may read it. Nothing durable lives here: results move to PackageOutputs (or the
+// caller's --out) and the directory is reclaimed.
 func (l Layout) AttemptDir(requestID string, attempt uint64) string {
-	return filepath.Join(l.Outputs, requestID, "a"+itoa(attempt))
+	return filepath.Join(l.RequestAttempts(requestID), itoa(attempt))
+}
+
+// RequestAttempts is the parent of one request's attempt directories.
+func (l Layout) RequestAttempts(requestID string) string {
+	return filepath.Join(l.Attempts, requestID)
+}
+
+// PackageOutputs is where one package's result files are kept: `outputs/<org>-<name>`.
+// The org/name separator becomes a dash so a package is one directory, never a tree.
+func (l Layout) PackageOutputs(pkg string) string {
+	return filepath.Join(l.Outputs, strings.ReplaceAll(pkg, "/", "-"))
 }
 
 func itoa(n uint64) string {

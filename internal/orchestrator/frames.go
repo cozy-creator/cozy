@@ -875,17 +875,20 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 }
 
 // cleanupAttempt runs only after the outcome's bytes were mirrored, its terminal commit
-// succeeded, and OutcomeAck was sent. Per-attempt inputs are always disposable here;
-// request assets are dropped only after the final attempt and only when no other live
-// request owns the same content digest. Locally mirrored outputs remain addressable.
+// succeeded, and OutcomeAck was sent. The attempt working directory goes as soon as
+// nothing points into it — its staged inputs never outlive the attempt, and its result
+// files have either been exported (rows re-pointed) or are still recorded there, in
+// which case the directory waits for the export to settle. Request assets are dropped
+// only after the final attempt and only when no other live request owns the same
+// content digest.
 func (c *Orchestrator) cleanupAttempt(req records.Request, attempt uint64, holder *worker, final bool) {
 	if holder != nil && holder.media != nil {
 		c.cleanupRemote(req.ID, attempt, holder)
-	} else if !req.IsJob() {
-		if err := os.RemoveAll(filepath.Join(c.opt.Layout.AttemptDir(req.ID, attempt), "in")); err != nil {
-			c.logf("%s#%d local attempt input cleanup failed: %s", req.ID, attempt, err)
-		}
 	}
+	if err := os.RemoveAll(filepath.Join(c.opt.Layout.AttemptDir(req.ID, attempt), "in")); err != nil {
+		c.logf("%s#%d local attempt input cleanup failed: %s", req.ID, attempt, err)
+	}
+	c.reclaimAttempts(req.ID)
 	if !final {
 		return
 	}
