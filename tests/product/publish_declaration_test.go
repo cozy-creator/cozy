@@ -72,6 +72,87 @@ func TestRegistryLockRowsReplaceTheProxiedDownload(t *testing.T) {
 	}
 }
 
+// th-107: a native-only registry dependency selects its platform-target wheel
+// — pure stays first choice, the newest manylinux with the most specific
+// python tag wins among natives, and a foreign-platform-only package refuses
+// typed. The hf-xet rows are the real quality-judge uv.lock rows.
+const nativePylock = `lock-version = "1.0"
+created-by = "uv"
+
+[[packages]]
+name = "hf-xet"
+version = "1.6.0"
+index = "https://pypi.org/simple"
+
+[[packages.wheels]]
+url = "https://files.pythonhosted.org/packages/67/4e/a28359bf1c1ecf11eba22123168c138698f7cb576ac678f5a2e16cd5da08/hf_xet-1.6.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"
+size = 4464663
+
+[packages.wheels.hashes]
+sha256 = "d62671bb130879cef0ee4c9ebe47a14af6c66ec53e6d84dc15936e5ffdfac82f"
+
+[[packages.wheels]]
+url = "https://files.pythonhosted.org/packages/ab/5f/311725e2a905534dfee2dcb5b08414f249147f1f12252bfc2bd24caa075c/hf_xet-1.6.0-cp38-abi3-musllinux_1_2_x86_64.whl"
+size = 4675937
+
+[packages.wheels.hashes]
+sha256 = "8fb4f71cba6129110c3374a33f919001ff130488fc23553698e34cc1c2a1198c"
+`
+
+func TestNativeRegistryWheelsAdmitThePlatformTarget(t *testing.T) {
+	rows, problem := packagepublish.RegistryRowsFromLock([]byte(nativePylock), nil)
+	if problem != nil {
+		t.Fatalf("native-only pylock refused: %v", problem)
+	}
+	if len(rows) != 1 || !strings.HasSuffix(rows[0].URL,
+		"hf_xet-1.6.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl") ||
+		rows[0].SHA256 != "d62671bb130879cef0ee4c9ebe47a14af6c66ec53e6d84dc15936e5ffdfac82f" ||
+		rows[0].Size != 4464663 {
+		t.Fatalf("rows = %+v, want the manylinux cp38-abi3 wheel", rows)
+	}
+
+	// A wheel set for the wrong platforms only refuses with a typed reason.
+	wrong := strings.ReplaceAll(nativePylock,
+		"cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64", "cp38-abi3-win_amd64")
+	wrong = strings.ReplaceAll(wrong, "cp38-abi3-musllinux_1_2_x86_64", "cp311-cp311-macosx_11_0_arm64")
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(wrong), nil); problem == nil ||
+		problem.Name != "registry_dependency_platform_mismatch" {
+		t.Fatalf("wrong-platform wheels answered %v", problem)
+	}
+
+	// A pure wheel stays first choice over any native wheel.
+	pure := strings.Replace(nativePylock, "cp38-abi3-musllinux_1_2_x86_64", "py3-none-any", 1)
+	rows, problem = packagepublish.RegistryRowsFromLock([]byte(pure), nil)
+	if problem != nil || len(rows) != 1 || !strings.HasSuffix(rows[0].URL, "-py3-none-any.whl") {
+		t.Fatalf("pure preference answered rows=%+v problem=%v", rows, problem)
+	}
+
+	// Among natives the most specific python tag wins, then the newest manylinux.
+	specific := strings.Replace(nativePylock, "cp38-abi3-musllinux_1_2_x86_64",
+		"cp312-cp312-manylinux_2_17_x86_64", 1)
+	rows, problem = packagepublish.RegistryRowsFromLock([]byte(specific), nil)
+	if problem != nil || len(rows) != 1 || !strings.HasSuffix(rows[0].URL,
+		"hf_xet-1.6.0-cp312-cp312-manylinux_2_17_x86_64.whl") {
+		t.Fatalf("python specificity answered rows=%+v problem=%v", rows, problem)
+	}
+	newest := strings.Replace(nativePylock, "cp38-abi3-musllinux_1_2_x86_64",
+		"cp38-abi3-manylinux_2_28_x86_64", 1)
+	rows, problem = packagepublish.RegistryRowsFromLock([]byte(newest), nil)
+	if problem != nil || len(rows) != 1 || !strings.HasSuffix(rows[0].URL,
+		"hf_xet-1.6.0-cp38-abi3-manylinux_2_28_x86_64.whl") {
+		t.Fatalf("newest manylinux answered rows=%+v problem=%v", rows, problem)
+	}
+
+	// A manylinux floor above the fleet glibc cap is not admissible.
+	tooNew := strings.ReplaceAll(nativePylock,
+		"cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64", "cp38-abi3-manylinux_2_39_x86_64")
+	tooNew = strings.ReplaceAll(tooNew, "cp38-abi3-musllinux_1_2_x86_64", "cp38-abi3-win_amd64")
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(tooNew), nil); problem == nil ||
+		problem.Name != "registry_dependency_platform_mismatch" {
+		t.Fatalf("over-cap manylinux answered %v", problem)
+	}
+}
+
 func TestUnresolvableSourceProfilesRefuseBeforeAnyDerivation(t *testing.T) {
 	root := t.TempDir()
 	descriptor := filepath.Join(root, "descriptor.json")
