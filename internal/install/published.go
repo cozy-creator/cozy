@@ -56,9 +56,10 @@ func hasWeightlessCallable(descriptor *launch.PackageDescriptor) bool {
 	return false
 }
 
-// preparePublished materializes the release's complete frozen uv environment, then asks
-// that environment's Runtime to author its resident routing facts. Creator compares the
-// derived descriptor with the committed publication descriptor.
+// preparePublished materializes the release's complete frozen uv environment, asks that
+// environment's Runtime to describe the surface the release itself pinned, and asks THIS
+// host's Runtime to admit the environment and author its resident placement. Creator
+// compares the derived descriptor with the committed publication descriptor.
 func preparePublished(l home.Layout, installDir string, published *PublishedSource) (
 	*launch.PackageDescriptor, ExactDocument, string, *EnvironmentReceipt, *exit.Error,
 ) {
@@ -133,61 +134,15 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 		}
 	}
 
-	args := []string{"--json", "prepare-package",
-		"--artifact-store", l.CAS,
-		"--package", published.Package,
-		"--release", published.Release,
-		"--release-digest", published.SourceDigest,
-		"--project-wheel", published.ProjectWheel.Path,
-		"--artifact-cache", cache,
-		"--environment-python", home.VenvPython(venvDir),
-	}
-	for _, wheel := range published.Wheels {
-		if runtimePreparationDependency(wheel) {
-			args = append(args, "--dependency-wheel", wheel.Path)
-		}
-	}
 	for _, wheel := range published.LocalWheels {
 		if err := os.Remove(wheel.Path); err != nil {
 			return nil, empty, "", nil, exit.Internalf(
 				"cannot remove local materialization-wheel view: %s", err)
 		}
 	}
-	for _, model := range published.Models {
-		raw, err := json.Marshal(model)
-		if err != nil {
-			return nil, empty, "", nil, exit.Internalf("cannot encode selected package model: %s", err)
-		}
-		args = append(args, "--model", string(raw))
-	}
-	cmd := exec.Command(runtimeBin, args...)
-	cmd.Env = config.Frozen().Tool("COZY_HOME=" + l.Root)
-	var stdout, stderr strings.Builder
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-	if cmd.ProcessState == nil {
-		return nil, empty, "", nil, exit.Internalf("cannot run %s: %s", runtimeBin, err)
-	}
-	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return nil, empty, "", nil, metadataRefusal(code, "prepare-package", stderr.String())
-	}
-	var answer struct {
-		Package           string        `json:"package"`
-		Release           string        `json:"release"`
-		PackageDescriptor ExactDocument `json:"package_descriptor"`
-		PlacementSet      ExactDocument `json:"placement_set"`
-	}
-	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
-	decoder.DisallowUnknownFields()
-	decodeErr := decoder.Decode(&answer)
-	var trailing any
-	if decodeErr == nil {
-		decodeErr = decoder.Decode(&trailing)
-	}
-	if decodeErr != io.EOF || answer.Package != published.Package || answer.Release != published.Release ||
-		!validRuntimeExact(answer.PackageDescriptor) || !validRuntimeExact(answer.PlacementSet) {
-		return nil, empty, "", nil, exit.Named(exit.Structural, "package_prepare_invalid",
-			"cozy-runtime returned an invalid package preparation result")
+	answer, problem := preparePackageSet(l, installDir, published)
+	if problem != nil {
+		return nil, empty, "", nil, problem
 	}
 	if !bytes.Equal(answer.PackageDescriptor.Bytes, published.Selection.PackageDescriptor.Bytes) {
 		if published.ReportDefect != nil {
@@ -361,56 +316,16 @@ func runPublishedSelection(l home.Layout, inst records.PackageInstall,
 	published *PublishedSource,
 ) (ExactDocument, *exit.Error) {
 	var empty ExactDocument
-	args := []string{"--json", "prepare-package",
-		"--artifact-store", l.CAS,
-		"--package", published.Package,
-		"--release", published.Release,
-		"--release-digest", published.SourceDigest,
-		"--project-wheel", published.ProjectWheel.Path,
-		"--artifact-cache", filepath.Join(inst.Dir, "artifact-cache"),
-		"--environment-python", home.VenvPython(filepath.Join(inst.Dir, "venv")),
-	}
-	for _, wheel := range published.Wheels {
-		if runtimePreparationDependency(wheel) {
-			args = append(args, "--dependency-wheel", wheel.Path)
+	answer, problem := preparePackageSet(l, inst.Dir, published)
+	if problem != nil {
+		if problem.Name == "host_runtime_missing" {
+			return empty, problem
 		}
-	}
-	for _, model := range published.Models {
-		raw, err := json.Marshal(model)
-		if err != nil {
-			return empty, exit.Internalf("cannot encode selected package model: %s", err)
-		}
-		args = append(args, "--model", string(raw))
-	}
-	cmd := exec.Command(inst.Runtime, args...)
-	cmd.Env = config.Frozen().Tool("COZY_HOME=" + l.Root)
-	var stdout, stderr strings.Builder
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-	if cmd.ProcessState == nil {
-		return empty, exit.Internalf("cannot run %s: %s", inst.Runtime, err)
-	}
-	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		problem := metadataRefusal(code, "prepare-package", stderr.String())
 		return empty, exit.Named(problem.Code, "model_selection_incompatible",
 			"selected model does not satisfy %s: %s", inst.Package, problem.Message).
 			WithRemedy("choose a model matching the callable's slot class and stamps; %s", problem.Remedy)
 	}
-	var answer struct {
-		Package           string        `json:"package"`
-		Release           string        `json:"release"`
-		PackageDescriptor ExactDocument `json:"package_descriptor"`
-		PlacementSet      ExactDocument `json:"placement_set"`
-	}
-	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
-	decoder.DisallowUnknownFields()
-	decodeErr := decoder.Decode(&answer)
-	var trailing any
-	if decodeErr == nil {
-		decodeErr = decoder.Decode(&trailing)
-	}
-	if decodeErr != io.EOF || answer.Package != inst.Package || answer.Release != inst.Version ||
-		!validRuntimeExact(answer.PackageDescriptor) || !validRuntimeExact(answer.PlacementSet) ||
+	if answer.Package != inst.Package || answer.Release != inst.Version ||
 		!bytes.Equal(answer.PackageDescriptor.Bytes, published.Selection.PackageDescriptor.Bytes) {
 		return empty, exit.Named(exit.Structural, "package_prepare_invalid",
 			"cozy-runtime returned an invalid selected package preparation")
@@ -427,6 +342,78 @@ func runPublishedSelection(l home.Layout, inst records.PackageInstall,
 		return empty, exit.Internalf("cannot retain selected package placement: %s", err)
 	}
 	return answer.PlacementSet, nil
+}
+
+type packagePreparation struct {
+	Package           string        `json:"package"`
+	Release           string        `json:"release"`
+	PackageDescriptor ExactDocument `json:"package_descriptor"`
+	PlacementSet      ExactDocument `json:"placement_set"`
+}
+
+// preparePackageSet runs THIS host's Runtime over the install's venv: it admits every exact
+// wheel against this machine (interpreter seat, loader namespace, GPU), has the venv's own
+// pinned Runtime describe the package in an executor child, and authors the PlacementSet.
+// Admission is the installer's judgement, not the package's: the same host Runtime re-admits
+// the venv when it serves it (launch.Spec), and an admission fix reaches every installed
+// package at once instead of waiting for each release to re-lock a newer cozy-runtime. The
+// venv's own Runtime running this verb judged its own site-packages as "the base" and refused
+// every native dependency wheel it had just installed (hf_xet.abi3.so "already belongs to the
+// selected base").
+func preparePackageSet(l home.Layout, installDir string, published *PublishedSource,
+) (packagePreparation, *exit.Error) {
+	var empty packagePreparation
+	runtimeBin, problem := launch.HostRuntime()
+	if problem != nil {
+		return empty, problem
+	}
+	args := []string{"--json", "prepare-package",
+		"--artifact-store", l.CAS,
+		"--package", published.Package,
+		"--release", published.Release,
+		"--release-digest", published.SourceDigest,
+		"--project-wheel", published.ProjectWheel.Path,
+		"--artifact-cache", filepath.Join(installDir, "artifact-cache"),
+		"--environment-python", home.VenvPython(filepath.Join(installDir, "venv")),
+	}
+	for _, wheel := range published.Wheels {
+		if runtimePreparationDependency(wheel) {
+			args = append(args, "--dependency-wheel", wheel.Path)
+		}
+	}
+	for _, model := range published.Models {
+		raw, err := json.Marshal(model)
+		if err != nil {
+			return empty, exit.Internalf("cannot encode selected package model: %s", err)
+		}
+		args = append(args, "--model", string(raw))
+	}
+	cmd := exec.Command(runtimeBin, args...)
+	cmd.Env = config.Frozen().Tool("COZY_HOME=" + l.Root)
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	if cmd.ProcessState == nil {
+		return empty, exit.Internalf("cannot run %s: %s", runtimeBin, err)
+	}
+	if code := cmd.ProcessState.ExitCode(); code != 0 {
+		return empty, metadataRefusal(code, "prepare-package", stderr.String())
+	}
+	var answer packagePreparation
+	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
+	decoder.DisallowUnknownFields()
+	decodeErr := decoder.Decode(&answer)
+	var trailing any
+	if decodeErr == nil {
+		decodeErr = decoder.Decode(&trailing)
+	}
+	if decodeErr != io.EOF || answer.Package != published.Package ||
+		answer.Release != published.Release ||
+		!validRuntimeExact(answer.PackageDescriptor) || !validRuntimeExact(answer.PlacementSet) {
+		return empty, exit.Named(exit.Structural, "package_prepare_invalid",
+			"cozy-runtime returned an invalid package preparation result")
+	}
+	return answer, nil
 }
 
 // The package venv runs the exact cozy-runtime wheel selected by uv.lock. Older releases may
