@@ -3,9 +3,10 @@ package packagepublish
 // cl-078: the client no longer proxies PyPI. `uv export --locked` still authors
 // the pylock and every row still passes the exact discipline the download had —
 // the pinned index, the files.pythonhosted.org origin shape, the bounded
-// sha256/size identity, the pure-wheel selection, the platform-root refusal —
-// but the bytes never move through this machine: publish sends the rows and
-// Tensorhub fetches, verifies with its own hash, and stores content-addressed.
+// sha256/size identity, the platform-target wheel selection (th-107), the
+// platform-root refusal — but the bytes never move through this machine:
+// publish sends the rows and Tensorhub fetches, verifies with its own hash,
+// and stores content-addressed.
 
 import (
 	"context"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -124,7 +126,7 @@ func RegistryRowsFromLock(raw []byte, existing []DependencyWheel) ([]RegistryRow
 			return nil, exit.Named(exit.Validation, "registry_dependency_index_refused",
 				"%s==%s is not locked to the public PyPI index", name, pkg.Version)
 		}
-		candidate, problem := pureRegistryWheel(name, pkg)
+		candidate, problem := selectRegistryWheel(name, pkg)
 		if problem != nil {
 			return nil, problem
 		}
@@ -178,15 +180,35 @@ func registryWheelIdentity(name, version string, selected registryWheel) (string
 			"%s==%s wheel is not an exact files.pythonhosted.org HTTPS object", name, version)
 	}
 	filename, err := url.PathUnescape(filepath.Base(parsed.Path))
-	if err != nil || filepath.Base(filename) != filename || !strings.HasSuffix(strings.ToLower(filename), "-py3-none-any.whl") {
+	if err != nil || filepath.Base(filename) != filename {
 		return "", exit.Named(exit.Validation, "registry_dependency_wheel_invalid",
-			"%s==%s does not name one pure py3-none-any wheel", name, version)
+			"%s==%s does not name one safe wheel basename", name, version)
+	}
+	if pure, score := classifyWheelFilename(filename); !pure && score < 0 {
+		return "", exit.Named(exit.Validation, "registry_dependency_wheel_invalid",
+			"%s==%s does not name one wheel installable on the platform target", name, version)
 	}
 	return digest, nil
 }
 
-func pureRegistryWheel(name string, pkg registryPackage) (registryWheel, *exit.Error) {
-	candidates := make([]registryWheel, 0, 1)
+// The fleet's ONE platform target (th-107): CPython 3.12 on linux x86_64,
+// manylinux capped at the oldest fleet libc (glibc 2.36, python:3.12-slim-
+// bookworm; the CUDA bases and dev machines carry 2.39). A pure py3-none-any
+// wheel is universal and stays first choice; a native wheel is selected only
+// when no pure wheel exists. Tensorhub re-runs the same admission on the
+// declared rows and on the fetched wheel's exact WHEEL metadata.
+const (
+	targetPythonMinor = 12
+	targetGlibcMinor  = 36
+)
+
+// selectRegistryWheel picks the lock row wheel to publish: the pure wheel when
+// one exists (URL tie-break for determinism), otherwise the best admissible
+// native wheel under standard PEP 425 preference — more specific python tag
+// wins, newest manylinux wins.
+func selectRegistryWheel(name string, pkg registryPackage) (registryWheel, *exit.Error) {
+	var pure []registryWheel
+	best, bestScore := registryWheel{}, -1
 	for _, candidate := range pkg.Wheels {
 		parsed, err := url.Parse(candidate.URL)
 		if err != nil {
@@ -196,19 +218,138 @@ func pureRegistryWheel(name string, pkg registryPackage) (registryWheel, *exit.E
 		if err != nil {
 			continue
 		}
-		if strings.HasSuffix(strings.ToLower(base), "-py3-none-any.whl") {
-			candidates = append(candidates, candidate)
+		isPure, score := classifyWheelFilename(base)
+		if isPure {
+			pure = append(pure, candidate)
+		}
+		if score > bestScore || score == bestScore && candidate.URL > best.URL {
+			best, bestScore = candidate, score
 		}
 	}
-	if len(candidates) == 0 {
-		refusal, detail := "registry_dependency_native_only", "has no pure py3-none-any wheel"
-		if len(pkg.Wheels) == 0 && pkg.Sdist != nil {
-			refusal, detail = "registry_dependency_source_only", "is available only as source"
-		}
-		return registryWheel{}, exit.Named(exit.Validation, refusal,
-			"%s==%s %s", name, pkg.Version, detail).
-			WithRemedy("use a pure-Python PyPI dependency or publish an explicit local custom wheel")
+	if len(pure) > 0 {
+		sort.Slice(pure, func(i, j int) bool { return pure[i].URL < pure[j].URL })
+		return pure[len(pure)-1], nil
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].URL < candidates[j].URL })
-	return candidates[len(candidates)-1], nil
+	if bestScore >= 0 {
+		return best, nil
+	}
+	refusal, detail := "registry_dependency_platform_mismatch",
+		"has no py3-none-any or cp312 manylinux x86_64 wheel"
+	if len(pkg.Wheels) == 0 && pkg.Sdist != nil {
+		refusal, detail = "registry_dependency_source_only", "is available only as source"
+	}
+	return registryWheel{}, exit.Named(exit.Validation, refusal,
+		"%s==%s %s", name, pkg.Version, detail).
+		WithRemedy("use a PyPI dependency that ships a wheel for the platform target or publish an explicit local custom wheel")
+}
+
+// classifyWheelFilename reads a PEP 427 wheel filename's compressed tag sets.
+// pure reports a universal py3-none-any wheel; score is the best admissible
+// native triple's rank (-1 when none): python/abi specificity dominates
+// (cp312-cp312 > cp3N-abi3 > cp312-none > py312 > py3 > older py3N), the
+// manylinux glibc floor breaks ties.
+func classifyWheelFilename(filename string) (pure bool, score int) {
+	score = -1
+	stem, found := strings.CutSuffix(strings.ToLower(filename), ".whl")
+	parts := strings.Split(stem, "-")
+	if !found || len(parts) < 5 {
+		return false, -1
+	}
+	for _, python := range strings.Split(parts[len(parts)-3], ".") {
+		for _, abi := range strings.Split(parts[len(parts)-2], ".") {
+			for _, platform := range strings.Split(parts[len(parts)-1], ".") {
+				if platform == "any" {
+					pure = pure || abi == "none" && universalPythonTag(python)
+					continue
+				}
+				glibc, ok := manylinuxGlibcMinor(platform)
+				if !ok {
+					continue
+				}
+				if rank, ok := pythonABIRank(python, abi); ok && rank*1000+glibc > score {
+					score = rank*1000 + glibc
+				}
+			}
+		}
+	}
+	return pure, score
+}
+
+func pythonABIRank(python, abi string) (int, bool) {
+	switch abi {
+	case "cp312":
+		if python == "cp312" {
+			return 400, true
+		}
+	case "abi3":
+		if minor, ok := pythonTagMinor(python, "cp"); ok && minor <= targetPythonMinor {
+			return 300 + minor, true
+		}
+	case "none":
+		switch {
+		case python == "cp312":
+			return 200, true
+		case python == "py3":
+			return 112, true
+		default:
+			if minor, ok := pythonTagMinor(python, "py"); ok && minor <= targetPythonMinor {
+				if minor == targetPythonMinor {
+					return 113, true
+				}
+				return 100 + minor, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// universalPythonTag recognizes the python tags a pure any-platform wheel may
+// carry for CPython 3.12: py3, py3N at or below the target minor, or cp312.
+func universalPythonTag(python string) bool {
+	if python == "py3" || python == "cp312" {
+		return true
+	}
+	minor, ok := pythonTagMinor(python, "py")
+	return ok && minor <= targetPythonMinor
+}
+
+// pythonTagMinor reads the 3.N minor out of a prefix3N python tag ("cp38" -> 8).
+func pythonTagMinor(python, prefix string) (int, bool) {
+	digits, found := strings.CutPrefix(python, prefix+"3")
+	if !found || digits == "" {
+		return 0, false
+	}
+	minor, err := strconv.Atoi(digits)
+	if err != nil || minor < 0 {
+		return 0, false
+	}
+	return minor, true
+}
+
+// manylinuxGlibcMinor reads the glibc 2.N floor a manylinux x86_64 platform
+// tag demands, refusing tags above the fleet cap. The legacy aliases spell
+// exact glibc floors: manylinux1 is 2.5, manylinux2010 is 2.12, manylinux2014
+// is 2.17 (PEP 600). musllinux, plain linux, and foreign arches never match.
+func manylinuxGlibcMinor(platform string) (int, bool) {
+	switch platform {
+	case "manylinux1_x86_64":
+		return 5, true
+	case "manylinux2010_x86_64":
+		return 12, true
+	case "manylinux2014_x86_64":
+		return 17, true
+	}
+	body, found := strings.CutPrefix(platform, "manylinux_2_")
+	if !found {
+		return 0, false
+	}
+	digits, found := strings.CutSuffix(body, "_x86_64")
+	if !found {
+		return 0, false
+	}
+	minor, err := strconv.Atoi(digits)
+	if err != nil || minor < 0 || minor > targetGlibcMinor {
+		return 0, false
+	}
+	return minor, true
 }
