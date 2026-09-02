@@ -39,7 +39,7 @@ type JobFacts struct {
 	// the publication grant names, one destination each.
 	Outputs        []string
 	WeightsOutputs []orchestrator.WeightsOutput
-	SourceProfiles map[string]string
+	ModelParams []string
 	// Publishes is the job's own `publishes=` declaration. A grant mints off the
 	// DECLARATION, never off the kind (cr-009).
 	Publishes        bool
@@ -180,11 +180,8 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		Publishes:        declared.Publishes,
 		NeedsAccelerator: AcceleratorRequired(strings.Split(f.Install.Closure, "\n")),
 	}
-	if len(declared.Models) > 0 {
-		facts.SourceProfiles = make(map[string]string, len(declared.Models))
-		for _, model := range declared.Models {
-			facts.SourceProfiles[model.Param] = model.SourceProfile
-		}
+	for _, model := range declared.Models {
+		facts.ModelParams = append(facts.ModelParams, model.Param)
 	}
 	return facts, nil
 }

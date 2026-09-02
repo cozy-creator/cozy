@@ -153,50 +153,71 @@ func TestNativeRegistryWheelsAdmitThePlatformTarget(t *testing.T) {
 	}
 }
 
-func TestUnresolvableSourceProfilesRefuseBeforeAnyDerivation(t *testing.T) {
-	profiled := func(t *testing.T, profile string) *packagepublish.Package {
+func TestSlotSeedResolutionFromDefaultBindings(t *testing.T) {
+	staged := func(t *testing.T, bindings string) *packagepublish.Package {
 		root := t.TempDir()
 		descriptor := filepath.Join(root, "descriptor.json")
 		body := `{"format":"cozy.package.descriptor/1","application":"a:b",` +
 			`"entrypoints":[{"name":"generate","request":{},"result":{},` +
 			`"models":[{"class":"Denoiser","path":"generate.models.denoiser",` +
-			`"stamps":{},"component_use":{},"source_profile":"` + profile + `"}]}],"jobs":[]}`
+			`"stamps":{},"component_use":{}},` +
+			`{"class":"Denoiser","path":"generate.models.refiner",` +
+			`"stamps":{},"component_use":{}}]}],"jobs":[]}`
 		if err := os.WriteFile(descriptor, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "package.toml"),
+			[]byte("[application]\nobject = \"a:b\"\n"+bindings), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		return &packagepublish.Package{Root: root, Descriptor: descriptor,
 			Wheel: descriptor /* never reached */, Tree: root, Name: "thing", Release: "1.0.0"}
 	}
-	// Outside the four-or-five segment grammar the resolver is never reached.
-	for _, profile := range []string{"just-a-token", "a/b/c/d/e/f", "a/b/c/d/"} {
-		problem := profiled(t, profile).DeriveEvidence(t.Context(), "acme",
-			func(_ context.Context, model, release, lane, config string) (packagepublish.DeriveInput, *exit.Error) {
-				t.Fatalf("resolver reached for %s@%s/%s config %q", model, release, lane, config)
-				return packagepublish.DeriveInput{}, nil
-			})
-		if problem == nil || problem.Name != "source_profile_unresolvable" {
-			t.Fatalf("profile %q answered %v", profile, problem)
+	unreachable := func(t *testing.T) packagepublish.SeedResolver {
+		return func(_ context.Context, model, release, lane string) (packagepublish.DeriveInput, *exit.Error) {
+			t.Fatalf("resolver reached for %s@%s/%s", model, release, lane)
+			return packagepublish.DeriveInput{}, nil
 		}
 	}
-	// The optional fifth segment is the config selector (th-114): the resolver
-	// receives it exactly, and empty for a four-segment profile.
-	for profile, config := range map[string]string{
-		"acme/sd-turbo/1.0.0/bf16":      "",
-		"acme/sd-turbo/1.0.0/bf16/unet": "unet",
-	} {
-		stop := exit.Named(exit.Unavailable, "resolver_stopped", "recorded the parse")
-		var got [4]string
-		problem := profiled(t, profile).DeriveEvidence(t.Context(), "acme",
-			func(_ context.Context, model, release, lane, config string) (packagepublish.DeriveInput, *exit.Error) {
-				got = [4]string{model, release, lane, config}
+	// A bindings key naming no declared slot path or class refuses before resolution.
+	problem := staged(t, "[bindings.\"NoSuchClass\"]\nmodel = \"acme/sd\"\nrelease = \"1.0.0\"\nlane = \"bf16\"\n").
+		DeriveEvidence(t.Context(), "acme", unreachable(t))
+	if problem == nil || problem.Name != "slot_binding_unknown" {
+		t.Fatalf("unknown bindings key answered %v", problem)
+	}
+	// Two slots of one class bound to different seeds refuse: one class, one topology fact.
+	problem = staged(t, "[bindings.\"generate.models.denoiser\"]\nmodel = \"acme/sd\"\nrelease = \"1.0.0\"\nlane = \"bf16\"\n"+
+		"[bindings.\"generate.models.refiner\"]\nmodel = \"acme/other\"\nrelease = \"2.0.0\"\nlane = \"bf16\"\n").
+		DeriveEvidence(t.Context(), "acme", unreachable(t))
+	if problem == nil || problem.Name != "slot_binding_divergent" {
+		t.Fatalf("divergent class seeds answered %v", problem)
+	}
+	// An incomplete default (no release/lane) is not a seed: the class is skipped,
+	// visibly, and nothing derives.
+	pack := staged(t, "[bindings.\"Denoiser\"]\nmodel = \"acme/sd\"\n")
+	if problem := pack.DeriveEvidence(t.Context(), "acme", unreachable(t)); problem != nil {
+		t.Fatalf("incomplete default must skip, not refuse: %v", problem)
+	}
+	if len(pack.Evidence) != 0 || len(pack.SlotFacts) != 0 ||
+		len(pack.SlotFactsSkipped) != 1 || pack.SlotFactsSkipped[0] != "Denoiser" {
+		t.Fatalf("skip was not recorded: facts=%v skipped=%v", pack.SlotFacts, pack.SlotFactsSkipped)
+	}
+	// A complete class-keyed default resolves exactly once as (model, release, lane).
+	stop := exit.Named(exit.Unavailable, "resolver_stopped", "recorded the seed")
+	var got [3]string
+	calls := 0
+	problem = staged(t, "[bindings.\"Denoiser\"]\nmodel = \"acme/sd\"\nrelease = \"1.0.0\"\nlane = \"bf16\"\n").
+		DeriveEvidence(t.Context(), "acme",
+			func(_ context.Context, model, release, lane string) (packagepublish.DeriveInput, *exit.Error) {
+				calls++
+				got = [3]string{model, release, lane}
 				return packagepublish.DeriveInput{}, stop
 			})
-		if problem == nil || problem.Name != "resolver_stopped" {
-			t.Fatalf("profile %q answered %v", profile, problem)
-		}
-		if got != [4]string{"acme/sd-turbo", "1.0.0", "bf16", config} {
-			t.Fatalf("profile %q resolved as %v", profile, got)
-		}
+	if problem == nil || problem.Name != "resolver_stopped" {
+		t.Fatalf("seed resolution answered %v", problem)
+	}
+	if calls != 1 || got != [3]string{"acme/sd", "1.0.0", "bf16"} {
+		t.Fatalf("seed resolved %d times as %v", calls, got)
 	}
 }
 

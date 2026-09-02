@@ -185,9 +185,11 @@ func (c *Client) CommitPackageRelease(ctx context.Context, ref Ref, release stri
 	return out, e
 }
 
-// PackageDeriveInputs resolves one declared source profile's lane for the
-// author-side evidence run: exact snapshot, canonical config bytes, and the
-// hub's active hardware-variant vocabulary.
+// PackageDeriveInputs resolves one default binding's lane for the author-side
+// slot-facts run: exact snapshot, canonical construction config bytes (the
+// runtime-parity document), and the hub's active hardware-variant vocabulary.
+// Config is response tolerance for pre-cr-077 hubs, which echoed the retired
+// th-114 selector; current hubs no longer send it.
 type PackageDeriveInputs struct {
 	Model            string   `json:"model"`
 	Release          string   `json:"release"`
@@ -200,12 +202,9 @@ type PackageDeriveInputs struct {
 	HardwareVariants []string `json:"hardware_variants"`
 }
 
-func (c *Client) ModelDeriveInputs(ctx context.Context, ref Ref, release, lane, config string) (PackageDeriveInputs, *exit.Error) {
+func (c *Client) ModelDeriveInputs(ctx context.Context, ref Ref, release, lane string) (PackageDeriveInputs, *exit.Error) {
 	var out PackageDeriveInputs
 	query := url.Values{"lane": []string{lane}, "release": []string{release}}
-	if config != "" {
-		query.Set("config", config)
-	}
 	e := c.do(ctx, call{method: http.MethodGet,
 		path:   resourcePath("models", ref) + "/derive-inputs?" + query.Encode(),
 		strict: true, responseBytes: 16 << 20}, &out)

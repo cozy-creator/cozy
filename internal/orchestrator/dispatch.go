@@ -52,7 +52,7 @@ type Submission struct {
 	// never inferred from an arriving receipt. The M0 lane is weights-only: when non-empty,
 	// this set is the complete output set for the job.
 	WeightsOutputs   []WeightsOutput
-	ProducerProfiles map[string]string
+	ProducerParams []string
 
 	// BodyDigest is the caller's own digest of the WHOLE submission it is making
 	// idempotent, not merely of the payload. cl-006 supplies the digest of

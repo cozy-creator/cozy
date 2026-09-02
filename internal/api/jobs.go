@@ -241,9 +241,12 @@ func replayJobSubmission(sub JobSubmission,
 	if packageName == "" && function == "" {
 		packageName, function = recorded.Package, recorded.Entrypoint
 	}
-	profiles := map[string]string(nil)
+	params := []string(nil)
 	if transfer != nil {
-		profiles = transfer.SourceProfiles
+		for slot := range transfer.SourceProfiles {
+			params = append(params, slot)
+		}
+		sort.Strings(params)
 	}
 	return orchestrator.Submission{Kind: "job", Package: packageName,
 		Entrypoint: function, Payload: payload, Org: org,
@@ -253,7 +256,7 @@ func replayJobSubmission(sub JobSubmission,
 		PlanID:               recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
 		NeedsAccelerator: recorded.NeedsAccelerator, Trees: trees, Worker: recorded.Worker,
 		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
-		Models: models, ModelTransfer: transfer, ProducerProfiles: profiles}, nil
+		Models: models, ModelTransfer: transfer, ProducerParams: params}, nil
 }
 
 // resolveJob turns package+function into the orchestrator's Submission. The
@@ -321,7 +324,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		}
 		out.PlanID, out.Outputs = logical.DescriptorID, logical.Outputs
 		out.WeightsOutputs, out.NeedsAccelerator = logical.WeightsOutputs, logical.NeedsAccelerator
-		out.ProducerProfiles = logical.SourceProfiles
+		out.ProducerParams = logical.ProducerParams
 		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
 		return out, nil
 	}
@@ -361,7 +364,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.Outputs = job.Outputs
 		out.WeightsOutputs = job.WeightsOutputs
 		out.NeedsAccelerator = job.NeedsAccelerator
-		out.ProducerProfiles = job.SourceProfiles
+		out.ProducerParams = job.ModelParams
 		if problem := validateJobPayload(job, out.Payload); problem != nil {
 			return out, problem
 		}
@@ -410,7 +413,7 @@ func (s *Server) resolvePrivateJob(ctx context.Context, sub JobSubmission,
 		}
 		out.PlanID, out.Outputs = job.DescriptorID, job.Outputs
 		out.WeightsOutputs, out.NeedsAccelerator = job.WeightsOutputs, job.NeedsAccelerator
-		out.ProducerProfiles = job.SourceProfiles
+		out.ProducerParams = job.ModelParams
 		if problem := validateJobPayload(job, out.Payload); problem != nil {
 			return out, problem
 		}

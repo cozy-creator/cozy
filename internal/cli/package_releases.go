@@ -122,7 +122,15 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		{K: "release_digest", V: done.ReleaseDigest},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}
+	if len(pack.SlotFacts) > 0 {
+		fields = append(fields, output.Field{K: "slot_facts", V: strings.Join(pack.SlotFacts, ",")})
+	}
 	record := compactRecord(fields, "package", "release", "status")
+	for _, class := range pack.SlotFactsSkipped {
+		record.Notes = append(record.Notes, fmt.Sprintf(
+			"slot class %s has no complete [bindings] default (model/release/lane); no slot facts derived — preflight cannot grade it",
+			class))
+	}
 	for _, dependency := range pack.Vendored {
 		record.Notes = append(record.Notes, packagepublish.VendoredNote(account.Name, dependency))
 	}
@@ -159,17 +167,17 @@ func handlePackageYank(ctx *Context) *exit.Error {
 	}, "package", "release", "status"))
 }
 
-// deriveInputResolver turns a declared "org/model/release/lane[/config]"
-// profile into the evidence run's exact inputs through the hub's derive-inputs
-// read.
-func deriveInputResolver(c *hub.Client) packagepublish.ProfileResolver {
-	return func(ctx context.Context, model, release, lane, config string) (packagepublish.DeriveInput, *exit.Error) {
+// deriveInputResolver turns one fully named default binding — model, release,
+// lane — into the slot-facts run's exact construction seed through the hub's
+// derive-inputs read.
+func deriveInputResolver(c *hub.Client) packagepublish.SeedResolver {
+	return func(ctx context.Context, model, release, lane string) (packagepublish.DeriveInput, *exit.Error) {
 		ref, problem := hub.ParseRef(model)
 		if problem != nil {
 			return packagepublish.DeriveInput{}, problem.
-				WithRemedy("declare the source profile as <org>/<model>/<release>/<lane>[/<config>]")
+				WithRemedy("bind the slot as [bindings] model/release/lane in package.toml")
 		}
-		resolved, problem := c.ModelDeriveInputs(ctx, ref, release, lane, config)
+		resolved, problem := c.ModelDeriveInputs(ctx, ref, release, lane)
 		if problem != nil {
 			return packagepublish.DeriveInput{}, problem
 		}
