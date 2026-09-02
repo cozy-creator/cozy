@@ -492,3 +492,13 @@ func authRefusal(status int, data []byte) *exit.Error {
 	}
 	return problem
 }
+
+// Invalidate drops the cached session so the next call mints a fresh bearer from
+// the durable machine key. The hub client calls it when the hub refuses the
+// current bearer before its expiry -- a restarted hub forgets our session
+// without expiring our copy of it.
+func (m *Manager) Invalidate() {
+	m.mu.Lock()
+	m.session = Session{}
+	m.mu.Unlock()
+}
