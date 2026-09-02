@@ -11,11 +11,22 @@ import (
 // unmoved before it is called STALLED. A COUNT, not a duration — the same shape the
 // runtime's silence detector uses, and what makes the decision clock-free: it is not
 // "this took too long", it is "nothing arrived, repeatedly".
+//
+// Eight is the fleet's still-factor (xs-007 row 29): the figure `orchestrator`'s media
+// stall budget and the runtime's own liveness rule spend before calling a meter dead. The
+// point of a factor above one is that a single slow read, a GC pause, or a retry inside the
+// transport cannot be mistaken for a stall — only silence that repeats can.
 const stillSamples = 8
 
 // movingSample is how often the counter is READ. A sampling cadence is the resolution
 // of an observation, never a bound on one: a transfer moving one byte per sample is
 // never stalled, however long it takes.
+//
+// The resolution has to be coarse enough that a healthy-but-slow transport still moves a
+// byte between two reads. This codebase's figure for "an HTTP transfer that has moved
+// nothing for this long is not moving" is the media plane's own per-operation silence
+// budget (16s), so the counter is read just inside it: anything the transport itself still
+// considers alive registers here as movement.
 const movingSample = 15 * time.Second
 
 // mover watches BYTES, so a transfer is bounded by whether it is working rather than

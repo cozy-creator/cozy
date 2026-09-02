@@ -28,11 +28,13 @@ func InstallToolEnv(inst records.PackageInstall, env []string) []string {
 	return append(out, "PATH="+prefix)
 }
 
-// DefaultRuntimeQueryTimeout bounds metadata-only runtime questions used while selecting
-// or starting a worker. These verbs read declarations; they do not construct an package,
-// inspect a device, or load weights. A runtime that cannot answer them promptly is stalled,
-// and must not hold an orchestrator slot's in-memory starting fence forever.
-const DefaultRuntimeQueryTimeout = 5 * time.Second
+// NO CLOCK BOUNDS A RUNTIME QUESTION (xs-007 row 10). `describe` and `bindings` used to run
+// under a 5-second deadline whose expiry raised `runtime_query_stalled` and refused the job
+// dispatch or the install outright. Five seconds is not a fact about a metadata verb: it is a
+// guess about interpreter cold start, and a Python interpreter importing its entry module on
+// a loaded host exceeds it routinely — so a healthy release was refused for being slow to
+// start. The child's own exit is the answer, and it always was: a runtime that dies says so
+// through its exit code, and one still working is still working.
 
 // THE LOCAL ARTIFACT INDEX IS NOT READ HERE ANY MORE (#567e).
 //
@@ -52,12 +54,11 @@ const DefaultRuntimeQueryTimeout = 5 * time.Second
 // Every question this host asks the runtime goes through here, so there is one place
 // that knows how to invoke it and one place that renders its refusals.
 type RuntimeCLI struct {
-	Bin          string        // package Runtime for metadata; the control Runtime is selected separately
-	Dir          string        // the package project root
-	Descriptor   string        // exact published descriptor; empty for editable/source installs
-	Home         string        // COZY_HOME the runtime reads its artifact index out of
-	Env          []string      // the allowlisted child environment (config.Tool)
-	QueryTimeout time.Duration // metadata-query bound; zero selects DefaultRuntimeQueryTimeout
+	Bin        string   // package Runtime for metadata; the control Runtime is selected separately
+	Dir        string   // the package project root
+	Descriptor string   // exact published descriptor; empty for editable/source installs
+	Home       string   // COZY_HOME the runtime reads its artifact index out of
+	Env        []string // the allowlisted child environment (config.Tool)
 }
 
 // Binary is the runtime an install carries. The install transaction already refused a
@@ -87,19 +88,6 @@ func (r RuntimeCLI) call(out any, verb ...string) *exit.Error {
 	return r.callContext(context.Background(), out, verb...)
 }
 
-// query runs a metadata-only verb under the selection/start liveness bound. Fit and
-// doctor deliberately continue through call: they inspect a real host and may perform
-// work whose duration cannot honestly be represented by this metadata deadline.
-func (r RuntimeCLI) query(out any, verb ...string) *exit.Error {
-	timeout := r.QueryTimeout
-	if timeout <= 0 {
-		timeout = DefaultRuntimeQueryTimeout
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	return r.callContext(ctx, out, verb...)
-}
-
 func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *exit.Error {
 	args := []string{"--json", "--dir", r.Dir}
 	if r.Descriptor != "" {
@@ -107,20 +95,19 @@ func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *e
 	}
 	args = append(args, verb...)
 	cmd := exec.CommandContext(ctx, r.Bin, args...)
-	if _, bounded := ctx.Deadline(); bounded {
-		// CommandContext kills the direct child at the deadline. WaitDelay also closes a
-		// pipe retained by a misbehaving descendant, so the query itself remains bounded.
+	if ctx.Done() != nil {
+		// CommandContext kills the direct child when the CALLER's context ends. WaitDelay
+		// also closes a pipe a misbehaving descendant retained, so the cancellation the
+		// caller asked for actually completes. Nothing here starts a clock of its own.
 		cmd.WaitDelay = 250 * time.Millisecond
 	}
 	cmd.Env = append(append([]string{}, r.Env...), "COZY_HOME="+r.Home)
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
-	if ctx.Err() == context.DeadlineExceeded {
-		return exit.Named(exit.Deadline, "runtime_query_stalled",
-			"`cozy-runtime %s` did not answer its metadata query within %s",
-			strings.Join(verb, " "), r.queryTimeout()).
-			WithRemedy("the release's runtime must answer bindings and job-describe metadata without importing or constructing the package")
+	if ctx.Err() != nil {
+		return exit.New(exit.Canceled, "`cozy-runtime %s` was stopped: %s",
+			strings.Join(verb, " "), ctx.Err())
 	}
 	if cmd.ProcessState == nil {
 		return exit.Named(exit.Structural, "runtime_missing",
@@ -138,13 +125,6 @@ func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *e
 			strings.Join(verb, " "), err)
 	}
 	return nil
-}
-
-func (r RuntimeCLI) queryTimeout() time.Duration {
-	if r.QueryTimeout > 0 {
-		return r.QueryTimeout
-	}
-	return DefaultRuntimeQueryTimeout
 }
 
 // runtimeRefusal renders the runtime's own words under its own exit code. The matrix is
