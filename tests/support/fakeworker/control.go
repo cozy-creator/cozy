@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -113,6 +114,29 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	f.snapshotSent.Store(true)
 	f.say("WorkerSnapshot %s sent (%d B); admission is CLOSED until the ack", snapshotID, len(bodyBytes))
 
+	// THE LANES ARM (proto-024). Two device lanes over ordinals 0 and 1, ONE seat each,
+	// and every placement on lane-0 — so the worker-level count is 2 (the sum, exactly as
+	// the wire promises) while a placement can draw only ONE seat. An owner that reads the
+	// sum offers two attempts to one placement and gets the second refused
+	// CAUSE_CODE_NO_CAPACITY, journaled; an owner that reads lanes never offers it.
+	lanes := f.arm == "lanes"
+	var laneMu sync.Mutex
+	laneHeld := map[string]int{}  // lane id -> seats held by a live or unacked attempt
+	seatOf := map[string]string{} // "request#attempt" -> the lane whose seat it holds
+	laneOf := func(string) string { return "lane-0" }
+	laneRows := func() []*pb.DeviceLane {
+		laneMu.Lock()
+		defer laneMu.Unlock()
+		return []*pb.DeviceLane{
+			{LaneId: "lane-0", DeviceOrdinals: []uint32{0},
+				AvailableAttemptSlots: uint32(max(0, 1-laneHeld["lane-0"]))},
+			{LaneId: "lane-1", DeviceOrdinals: []uint32{1},
+				AvailableAttemptSlots: uint32(max(0, 1-laneHeld["lane-1"]))},
+		}
+	}
+	var lastRevision uint64
+	var lastSetDigest []byte
+	var lastPlacements []*pb.PlacementStatus
 	observedMany := func(revision uint64, setDigest []byte, placements []*pb.PlacementStatus) {
 		availableSlots := uint32(2)
 		r := &pb.ObservedWorkerState{
@@ -123,11 +147,30 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			AdmissionState:             pb.AdmissionState_ADMISSION_STATE_OPEN,
 			AdmissionEpoch:             admissionEpoch, AvailableAttemptSlots: availableSlots,
 		}
+		if lanes {
+			r.Lanes = laneRows()
+			r.AvailableAttemptSlots = 0
+			for _, l := range r.Lanes {
+				r.AvailableAttemptSlots += l.AvailableAttemptSlots
+				for _, p := range placements {
+					if laneOf(p.PlacementId) == l.LaneId {
+						l.PlacementIds = append(l.PlacementIds, p.PlacementId)
+					}
+				}
+			}
+			for _, p := range placements {
+				p.DeviceLaneId = laneOf(p.PlacementId)
+			}
+			lastRevision, lastSetDigest, lastPlacements = revision, setDigest, placements
+		}
 		r.Placements = placements
 		env(func(e, g uint64, b string) {
 			r.RecordOwnerEpoch, r.ControlStreamEpoch, r.WorkerBootId = e, g, b
 		})
 		send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: r}})
+		if lanes {
+			f.say("ObservedWorkerState slots=%d lanes=%d", r.AvailableAttemptSlots, len(r.Lanes))
+		}
 	}
 	placementStatus := func(placementID string, setDigest []byte, planIDs []string,
 		packageRevision, environmentDigest, configDigest string,
@@ -231,6 +274,32 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				outcome(t)
 				continue
 			}
+			if lanes {
+				// THE SEAT IS THE LANE'S. A second offer against a placement whose lane is
+				// full is refused exactly as a saturated window is: a journaled outcome,
+				// pre-execution, never silence and never a hold.
+				laneID := laneOf(offer.PlacementId)
+				laneMu.Lock()
+				full := laneHeld[laneID] >= 1
+				if !full {
+					laneHeld[laneID]++
+					seatOf[fmt.Sprintf("%s#%d", offer.RequestId, offer.AttemptOrdinal)] = laneID
+				}
+				laneMu.Unlock()
+				if full {
+					f.say("ARM: lane %s has no free seat for %s#%d — REFUSED NO_CAPACITY (journaled)",
+						laneID, offer.RequestId, offer.AttemptOrdinal)
+					t, _ := outcomeFor(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
+						pb.OutcomeStatus_OUTCOME_STATUS_REFUSED,
+						"lane "+laneID+" has no free seat",
+						pb.CauseCode_CAUSE_CODE_NO_CAPACITY,
+						pb.CauseOrigin_CAUSE_ORIGIN_WORKER, false)
+					t.PlacementId = offer.PlacementId
+					outcome(t)
+					continue
+				}
+				f.say("lane %s seat taken by %s#%d", laneID, offer.RequestId, offer.AttemptOrdinal)
+			}
 			accepted := &pb.AttemptAccepted{
 				RequestId: offer.RequestId, AttemptOrdinal: offer.AttemptOrdinal,
 				InvocationSpecDigest:    offer.InvocationSpecDigest,
@@ -244,6 +313,17 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			})
 			send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptAccepted{AttemptAccepted: accepted}})
 			switch f.arm {
+			case "lanes":
+				// The attempt runs for a moment and ends; the seat stays held until the
+				// ack, which is when the worker's next observed state frees it.
+				go func(offer *pb.AttemptOffer) {
+					time.Sleep(1500 * time.Millisecond)
+					t, _ := authorOutcome(offer.RequestId, offer.AttemptOrdinal,
+						offer.InvocationSpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_FAILED,
+						"the fake worker has no GPU")
+					t.PlacementId = offer.PlacementId
+					outcome(t)
+				}(offer)
 			case "badterminal":
 				f.badOutcomes(outcome, offer)
 			case "dropack":
@@ -258,6 +338,17 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 		case *pb.RecordOwnerFrame_OutcomeAck:
 			a := m.OutcomeAck
 			f.say("AttemptOutcomeAck for %s#%d", a.RequestId, a.AttemptOrdinal)
+			if lanes {
+				// Only an attempt that HELD a seat returns one: a refused offer took none.
+				laneMu.Lock()
+				seat := fmt.Sprintf("%s#%d", a.RequestId, a.AttemptOrdinal)
+				if laneID, held := seatOf[seat]; held {
+					laneHeld[laneID] = max(0, laneHeld[laneID]-1)
+					delete(seatOf, seat)
+				}
+				laneMu.Unlock()
+				observedMany(lastRevision, lastSetDigest, lastPlacements)
+			}
 			if f.arm == "badterminal" {
 				time.Sleep(500 * time.Millisecond)
 				return nil

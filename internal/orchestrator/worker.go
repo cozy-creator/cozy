@@ -416,17 +416,16 @@ type worker struct {
 	heldSetDigest     []byte                  // parent set the placement actually holds
 	fallbackSetDigest []byte                  // predecessor set kept for restore; empty = replacement PAUSED
 
-	// THE ONE ADMISSION FENCE (#472e/#482/#486c). Per-placement credits are DELETED: N
-	// counters over ONE serialized device advertise N x the real capacity. Capacity is a
-	// WORKER property; dispatchability is a PLACEMENT property.
+	// THE ADMISSION FENCE (#472e/#482/#486c), ONE COUNTER PER SERIALIZED RESOURCE. Per-
+	// placement credits are DELETED: N counters over ONE serialized device advertise N x
+	// the real capacity. With proto-024 the serialized resource is a device LANE and a
+	// worker may have several, so `seats` is the worker-level window (the reported sum)
+	// and `lanes` holds one window per reported lane; an offer for a placement draws from
+	// its lane's and the worker's. Dispatchability stays a PLACEMENT property.
 	admission      pb.AdmissionState
 	admissionEpoch uint64 // echoed on every offer; a stale echo refuses deterministically
-	// reportedSlots is the worker's last available_attempt_slots. reservedSlots is the
-	// owner's reservation from choosing a worker until its offer is accepted or refused.
-	// Keeping them separate prevents a Report racing preparation or send from reopening it.
-	reportedSlots int
-	reservedSlots int
-	slots         int // reportedSlots - reservedSlots, clamped at zero
+	seats          seatLedger
+	lanes          laneTable
 	// unacked is how many outcomes this owner HOLDS without having acked. The worker
 	// counts them against its own available_attempt_slots (#480d), so an owner that stops
 	// acking starves its own admission — boundedness is structural, and this is the number
@@ -501,6 +500,17 @@ func (w *worker) dispatchableFor(planID string) bool {
 
 func remotePlanKey(packageName, planID string) string { return packageName + "\x00" + planID }
 
+// placementFor names the placement an offer for this plan routes to: the one placement a
+// local slot hosts, or the rental placement advertising the plan under the pinned package.
+func (w *worker) placementFor(slot, planID string) string {
+	if w.spec.Connection != nil {
+		if placement, ok := w.remotePlacements[remotePlanKey(slot, planID)]; ok {
+			return placement.PlacementIDValue
+		}
+	}
+	return w.placementID
+}
+
 func (w *worker) remoteDispatchable(placement DesiredPlacement, planID string) bool {
 	observed := w.observedRemote[placement.PackageRevisionDigest]
 	return placement.PlacementIDValue != "" &&
@@ -520,15 +530,13 @@ func (w *worker) remoteStaged(packageName, planID string) bool {
 // admissible answers the worker-level half. CLOSED is STRUCTURAL (pre-snapshot-barrier,
 // draining, mid-cutover); OPEN with zero seats is TRANSIENT saturation — both refuse under
 // CAUSE_CODE_NO_CAPACITY at the worker, and an owner backs off differently for each
-// (#486c), which is why they are two fields here and not one.
+// (#486c), which is why they are two fields here and not one. The per-placement half —
+// the placement's own lane — is seatFor (lanes.go).
 func (w *worker) admissible() bool {
-	return w.admission == pb.AdmissionState_ADMISSION_STATE_OPEN && w.slots > 0
+	return w.admission == pb.AdmissionState_ADMISSION_STATE_OPEN && w.seats.slots > 0
 }
 
-func (w *worker) observeSlots(n int) {
-	w.reportedSlots = n
-	w.slots = max(0, n-w.reservedSlots)
-}
+func (w *worker) observeSlots(n int) { w.seats.observe(n) }
 
 func (w *worker) observeJobs(n int) {
 	w.reportedJobs = n
@@ -1391,6 +1399,11 @@ type WorkerFacts struct {
 	Admission      string `json:"admission_state"`
 	AdmissionEpoch uint64 `json:"admission_epoch"`
 	AvailableSlots int    `json:"available_attempt_slots"`
+	// Lanes is the worker's own account of its serialized resources (proto-024): one seat
+	// each, ordinals into the granted Devices. Empty for a worker that reports none.
+	// PlacementLane is the lane this slot's placement is on, "" until the worker says.
+	Lanes         []LaneFacts `json:"lanes,omitempty"`
+	PlacementLane string      `json:"placement_lane,omitempty"`
 	// UnackedOutcomes is what this owner holds without having acked. The worker counts
 	// them against its own free seats, so a rising number here is an owner starving its
 	// own admission — which is the point of making boundedness structural (#480d).
@@ -1442,8 +1455,10 @@ func factsOf(w *worker) WorkerFacts {
 
 		Admission:       trimEnum(pb.AdmissionState_name[int32(w.admission)], "ADMISSION_STATE_"),
 		AdmissionEpoch:  w.admissionEpoch,
-		AvailableSlots:  w.slots,
+		AvailableSlots:  w.seats.slots,
 		UnackedOutcomes: w.unacked,
+		Lanes:           laneFactsOf(w),
+		PlacementLane:   w.laneOf(w.placementID),
 
 		DesiredRevision:   w.revision,
 		AcceptedRevision:  w.acceptedRevision,
@@ -1696,7 +1711,7 @@ func (c *Orchestrator) unloadIdleLocalWorkers(pkg, keepInstallID string) ([]Work
 
 func (c *Orchestrator) idleLocalWorkerLocked(w *worker, active []records.Request) bool {
 	if w == nil || c.workers[w.instanceID] != w || w.exited || w.stopping ||
-		w.spec.Connection != nil || w.spec.IsJob() || w.reservedSlots != 0 || w.unacked != 0 {
+		w.spec.Connection != nil || w.spec.IsJob() || w.seats.reserved != 0 || w.unacked != 0 {
 		return false
 	}
 	for _, reservation := range c.offers {

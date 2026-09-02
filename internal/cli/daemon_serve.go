@@ -98,7 +98,9 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// The resolver is built BEFORE the orchestrator, because the orchestrator holds it:
 	// select-or-start is the scheduler's act, and a request whose binding no live worker
 	// advertises makes one rather than queueing for capacity nothing would create.
-	resolver := NewResolver(st, ctx.Cfg)
+	// The device envelope every local worker is granted; its reported lanes are ordinals
+	// into it, and dispatch draws a seat from the placement's lane (proto-024).
+	resolver := NewResolver(st, ctx.Cfg, orchestrator.LocalDeviceEnvelope())
 	// Two questions, deliberately not one object: the API resolves the persisted,
 	// non-secret attempt control (so a bad pin refuses before a request row), and the
 	// orchestrator resolves the dial triple at dial time. Only the second reads the token.

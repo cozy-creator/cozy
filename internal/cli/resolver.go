@@ -47,7 +47,8 @@ type Resolver struct {
 	// seam cl-020's verified control manifest will populate without a local venv.
 	placements map[string]orchestrator.DesiredPlacement
 	catalog    *hub.Client
-	// Devices is the device envelope a worker this host launches may SEE.
+	// Devices is the device envelope the daemon GRANTS a worker this host launches: what
+	// it may SEE, and the space the worker's reported lanes index into (proto-024).
 	Devices []string
 }
 
@@ -191,15 +192,16 @@ func short12(value string) string {
 	return value
 }
 
-// NewResolver builds the resolver over the lifecycle authority.
-func NewResolver(store *records.Store, cfg config.Config) *Resolver {
+// NewResolver builds the resolver over the lifecycle authority. `devices` is the envelope
+// the daemon grants every local worker it launches (orchestrator.LocalDeviceEnvelope).
+func NewResolver(store *records.Store, cfg config.Config, devices []string) *Resolver {
 	return &Resolver{
 		store: store, cfg: cfg,
 		cache:      map[string]orchestrator.WorkerLaunchSpec{},
 		selected:   map[string]orchestrator.WorkerLaunchSpec{},
 		placements: map[string]orchestrator.DesiredPlacement{},
 		catalog:    hub.New(cfg, "cozy-daemon"),
-		Devices:    []string{"0"},
+		Devices:    append([]string(nil), devices...),
 	}
 }
 

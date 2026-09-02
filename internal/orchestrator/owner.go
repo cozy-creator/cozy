@@ -675,8 +675,17 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	w.admissionEpoch = uint64(doc.Int("admission_epoch"))
 	w.admission = pb.AdmissionState(doc.Int("admission_state"))
 	w.observeSlots(int(doc.Int("available_attempt_slots")))
+	// The per-lane seats a reconnecting owner reconciles from (proto-024) ride the same
+	// digest-fenced document, beside the worker-level sum.
+	laneBreaches := w.lanes.observe(laneReportsOfDoc(doc.List("lanes")), w.spec.Devices)
+	for _, p := range doc.List("placements") {
+		w.lanes.route(p.Str("placement_id"), p.Str("device_lane_id"))
+	}
 	w.phase = pb.WorkerPhase(doc.Int("worker_phase"))
 	c.mu.Unlock()
+	for _, breach := range laneBreaches {
+		c.logf("worker breach on %s: %s", w.instanceID, breach)
+	}
 
 	ackMsg := &pb.SnapshotAck{SnapshotId: snap.SnapshotId, SnapshotDigest: snap.SnapshotDigest,
 		HostSnapshotDigest: append([]byte(nil), snap.HostSnapshotDigest...)}

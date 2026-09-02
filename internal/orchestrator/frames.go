@@ -258,6 +258,9 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 	d := &pb.DesiredWorkerState{
 		Revision: rev, WireMinor: pb.WireMinor,
 		Posture: pb.Posture_POSTURE_ACCEPTING,
+		// No `device_pins` (proto-024): this owner grants a one-device envelope, and width
+		// 1 pins nothing — the worker assigns the lane by measured fit. Where the pin lives
+		// and who authors a wider one are open group-lanes rulings, not this owner's call.
 		Mode: &pb.DesiredWorkerState_PlacementSet{PlacementSet: &pb.DesiredPlacementSet{
 			PlacementSetDigest:         digest,
 			PlacementSetCanonicalBytes: setBytes,
@@ -286,6 +289,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	var status *pb.PlacementStatus
 	var desiredRevision uint64
+	var laneBreaches []string
 	workerTerminal := false
 	c.mu.Lock()
 	w := c.workers[s.instanceID]
@@ -300,11 +304,18 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		desiredRevision = w.revision
 		w.lastReport = time.Now()
 		w.phase = r.WorkerPhase
-		// THE ONE ADMISSION FENCE, worker-level. Per-placement credits are gone: the seats
-		// are a property of the machine, and `available_attempt_slots` already counts both
-		// running attempts and outcomes this owner has not acked (#480d).
+		// THE ADMISSION FENCE, one counter per serialized resource. Per-placement credits
+		// are gone: `available_attempt_slots` is the machine's sum and already counts both
+		// running attempts and outcomes this owner has not acked (#480d). The lanes beside
+		// it (proto-024) are the resources that sum is over; an offer draws from ONE.
 		w.admission, w.admissionEpoch = r.AdmissionState, r.AdmissionEpoch
 		w.observeSlots(int(r.AvailableAttemptSlots))
+		laneBreaches = w.lanes.observe(laneReportsOf(r.Lanes), w.spec.Devices)
+		for _, p := range r.Placements {
+			if p != nil {
+				w.lanes.route(p.PlacementId, p.DeviceLaneId)
+			}
+		}
 		w.acceptedRevision = r.AcceptedDesiredStateRevision
 		w.convergedRevision = r.ConvergedRevision
 		w.acceptedSetDigest = r.AcceptedPlacementSetDigest
@@ -456,6 +467,9 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	if w != nil && w.media != nil {
 		go c.retryMediaCleanup(w)
 	}
+	for _, breach := range laneBreaches {
+		c.logf("worker breach on %s: %s", s.instanceID, breach)
+	}
 	for _, f := range r.Faults {
 		c.logf("worker fault %s on %s: %s (%s)", pb.FaultKind_name[int32(f.Kind)],
 			f.Subject, f.Reason, f.Detail)
@@ -495,14 +509,14 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	}
 	if status != nil {
 		c.logf("observed phase=%s accepted=%d converged=%d placement=%s %s/%s epoch=%d "+
-			"admission=%s/%d slots=%d dispatchable=%d held=%d",
+			"admission=%s/%d slots=%d lanes=%s placement_lane=%s dispatchable=%d held=%d",
 			phase, r.AcceptedDesiredStateRevision, r.ConvergedRevision, status.PlacementId,
 			trimEnum(pb.MaterializationState_name[int32(status.Materialization)], "MATERIALIZATION_STATE_"),
 			trimEnum(pb.ServingState_name[int32(status.Serving)], "SERVING_STATE_"),
 			status.ExecutorEpoch,
 			trimEnum(pb.AdmissionState_name[int32(r.AdmissionState)], "ADMISSION_STATE_"),
-			r.AdmissionEpoch, r.AvailableAttemptSlots,
-			len(status.DispatchableBindingDigests), len(r.HeldAttempts))
+			r.AdmissionEpoch, r.AvailableAttemptSlots, laneSummary(r.Lanes),
+			orNone(status.DeviceLaneId), len(status.DispatchableBindingDigests), len(r.HeldAttempts))
 		return
 	}
 	c.logf("observed phase=%s accepted=%d converged=%d (no placement applied yet)",

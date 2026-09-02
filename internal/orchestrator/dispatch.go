@@ -1020,10 +1020,11 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	grant.InvocationSpecDigest = digest
 
 	c.mu.Lock()
-	placementID := w.placementID
-	if placement, ok := w.remotePlacements[remotePlanKey(
-		pinnedPackage(req.Package, req.Worker), req.PlanID)]; w.spec.Connection != nil && ok {
-		placementID = placement.PlacementIDValue
+	placementID := w.placementFor(pinnedPackage(req.Package, req.Worker), req.PlanID)
+	laneID := reservation.laneID
+	var laneDevices []string
+	if l := w.lanes.get(laneID); l != nil {
+		laneDevices = devicesOf(l, w.spec.Devices)
 	}
 	c.mu.Unlock()
 	if req.IsJob() {
@@ -1059,12 +1060,21 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		cause := exit.Unavailablef("the control stream for %s#%d closed before its offer", req.ID, attempt)
 		return 0, c.abortDispatch(req.ID, attempt, w.bootID, cause)
 	}
-	c.logf("AttemptOffer %s#%d spec=%s (%d canonical bytes) placement=%s admission=%d outputs=%s on %s",
-		req.ID, attempt, shortDigest(spelled), len(canonicalBytes), placementID,
+	c.logf("AttemptOffer %s#%d spec=%s (%d canonical bytes) placement=%s lane=%s devices=%s "+
+		"admission=%d outputs=%s on %s", req.ID, attempt, shortDigest(spelled),
+		len(canonicalBytes), placementID, orNone(laneID), strings.Join(laneDevices, ","),
 		admissionEpoch, req.Outputs, w.instanceID)
-	c.emit(req.ID, "request.dispatched", attempt, map[string]any{
-		"instance_id": w.instanceID, "invocation_digest": spelled,
-	})
+	event := map[string]any{"instance_id": w.instanceID, "invocation_digest": spelled}
+	if placementID != "" {
+		event["placement_id"] = placementID
+	}
+	// THE LANE THE OFFER DRAWS FROM, and the granted devices it covers, ride the durable
+	// event (proto-024): a run's device is a fact a user can read back, not a log line.
+	if laneID != "" {
+		event["device_lane"] = laneID
+		event["devices"] = laneDevices
+	}
+	c.emit(req.ID, "request.dispatched", attempt, event)
 	return attempt, nil
 }
 
@@ -1285,11 +1295,14 @@ type dispatchReservation struct {
 	worker *worker
 	job    bool
 	planID string
+	// laneID is the lane the reserved seat draws from, "" for a worker that reports none.
+	laneID string
 }
 
 func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *dispatchReservation, *exit.Error) {
 	planID := req.PlanID
 	slot := pinnedPackage(req.Package, req.Worker)
+	var parked []string
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, w := range c.workers {
@@ -1331,16 +1344,22 @@ func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *di
 		if !w.dispatchableFor(planID) {
 			continue
 		}
-		if !w.admissible() {
-			// CLOSED and OPEN-with-no-seat are BOTH "not now", and they are deliberately
-			// distinguished on the worker facts rather than here: this side's answer is the
-			// same either way — the request parks in the deep queue, which is this owner's
-			// and never the worker's.
+		// THE SEAT IS THE PLACEMENT'S LANE'S (proto-024). CLOSED, OPEN-with-no-seat and a
+		// saturated lane are ALL "not now", and they are deliberately distinguished on the
+		// worker facts rather than here: this side's answer is the same either way — the
+		// request parks in the deep queue, which is this owner's and never the worker's.
+		laneID, ok, why := w.seatFor(w.placementFor(slot, planID))
+		if !ok {
+			parked = append(parked, w.instanceID+": "+why)
 			continue
 		}
-		w.reservedSlots++
-		w.slots = max(0, w.reportedSlots-w.reservedSlots)
-		return w, sess, w.admissionEpoch, &dispatchReservation{worker: w}, nil
+		w.reserveSeat(laneID)
+		return w, sess, w.admissionEpoch, &dispatchReservation{worker: w, laneID: laneID}, nil
+	}
+	if len(parked) > 0 {
+		return nil, nil, 0, nil, exit.Unavailablef(
+			"no claimed worker in %s has a DISPATCHABLE placement for %s with a free attempt "+
+				"slot (%s)", slot, planID, strings.Join(parked, "; "))
 	}
 	return nil, nil, 0, nil, exit.Unavailablef(
 		"no claimed worker in %s has a DISPATCHABLE placement for %s with a free attempt slot",
@@ -1374,8 +1393,7 @@ func (c *Orchestrator) releaseDispatch(r *dispatchReservation) {
 		}
 		return
 	}
-	r.worker.reservedSlots = max(0, r.worker.reservedSlots-1)
-	r.worker.observeSlots(r.worker.reportedSlots)
+	r.worker.releaseSeat(r.laneID)
 }
 
 // settleDispatch consumes a seat on Accepted/executed outcome and returns it on a
@@ -1401,11 +1419,7 @@ func (c *Orchestrator) settleDispatch(requestID string, attempt uint64, consumed
 		}
 		return
 	}
-	r.worker.reservedSlots = max(0, r.worker.reservedSlots-1)
-	if consumed {
-		r.worker.reportedSlots = max(0, r.worker.reportedSlots-1)
-	}
-	r.worker.observeSlots(r.worker.reportedSlots)
+	r.worker.settleSeat(r.laneID, consumed)
 }
 
 // grantFor picks the lane's grant. The lanes differ in exactly one thing that matters —
