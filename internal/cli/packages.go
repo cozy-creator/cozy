@@ -226,8 +226,9 @@ func handleLs(ctx *Context) *exit.Error {
 	}
 	l := output.List{
 		Name:      "packages",
-		Fields:    []string{"package", "version", "disk"},
-		AllFields: []string{"package", "major", "version", "disk", "placement_set", "install_id", "source", "verified", "installed", "exclusive", "shared"},
+		Fields:    []string{"package", "version", "size", "dependencies"},
+		AllFields: []string{"package", "major", "version", "size", "dependencies", "placement_set", "install_id", "source", "verified", "installed"},
+		Bytes:     []string{"size", "dependencies"},
 	}
 	for _, inst := range rows {
 		l.Rows = append(l.Rows, map[string]string{
@@ -235,9 +236,8 @@ func handleLs(ctx *Context) *exit.Error {
 			"major":              fmt.Sprintf("v%d", inst.Major),
 			"version":            inst.Version,
 			"install_id":         inst.ID,
-			"disk":               diskText(inst),
-			"exclusive":          output.Bytes(inst.BytesExcl),
-			"shared":             output.Bytes(inst.BytesShared),
+			"size":               output.Int(inst.BytesExcl),
+			"dependencies":       output.Int(inst.BytesShared),
 			"python":             inst.Python,
 			"uv":                 inst.UV,
 			"cuda_extra":         orNone(inst.Extra),

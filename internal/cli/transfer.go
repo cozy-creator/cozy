@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,20 +71,62 @@ func handleModelList(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	// The list stands without its byte columns: a store the byte plane refuses to
+	// measure is still a store with names in it, and the refusal is said, not hidden.
+	usage, usageProblem := tool.Usage(filepath.Join(scratch, "usage.jsonl"))
+	bytesOf := make(map[string]tfs.RepositoryUsage, len(usage.Repos))
+	for _, repo := range usage.Repos {
+		bytesOf[repo.Org+"/"+repo.Name] = repo
+	}
 	list := output.List{
-		Name: "models", Fields: []string{"model", "release", "lane"},
-		AllFields: []string{"model", "kind", "release", "lane", "manifest_id"},
+		Name: "models", Fields: []string{"model", "release", "lane", "size", "shared"},
+		AllFields: []string{"model", "kind", "release", "lane", "manifest_id", "size", "shared"},
+		Bytes:     []string{"size", "shared", "unique"},
+		// unique is the fact tfs computes; a program gets it, a table does not widen for it.
+		Machine: []string{"unique"},
 	}
 	for _, release := range releases {
 		row := map[string]string{"model": release.Org + "/" + release.Name,
 			"kind": "catalog", "release": release.Version, "lane": release.Lane,
 			"manifest_id": "sha256:" + release.ManifestSHA256}
-		if release.Org == "local" {
-			row["kind"], row["release"], row["lane"] = "local", "", ""
+		if release.Kind == "local" {
+			row["kind"] = "local"
+		}
+		if repo, ok := bytesOf[row["model"]]; ok {
+			row["size"] = output.Int(repo.Total)
+			row["shared"] = output.Int(repo.Total - repo.Unique)
+			row["unique"] = output.Int(repo.Unique)
 		}
 		list.Rows = append(list.Rows, row)
 	}
+	if usageProblem != nil {
+		list.Notes = []string{"disk usage is unavailable: " + usageProblem.Message}
+		return emit(ctx, list)
+	}
+	list.Aggregates = []output.Field{{K: "store", V: storeUsage{Size: usage.Total,
+		Unique: usage.UniqueSum, Unreferenced: usage.Unreferenced, Models: len(usage.Repos)}}}
 	return emit(ctx, list)
+}
+
+// storeUsage is the model list's footer: the store's byte plane for a program, one
+// sentence for a person — and only a sentence once there is something to reclaim.
+type storeUsage struct {
+	Size         int64 `json:"size"`   // the union every model reaches
+	Unique       int64 `json:"unique"` // the sum of every model's unique part
+	Unreferenced int64 `json:"unreferenced"`
+	Models       int   `json:"models"`
+}
+
+func (s storeUsage) Human() string {
+	if s.Unreferenced == 0 {
+		return ""
+	}
+	noun := "models"
+	if s.Models == 1 {
+		noun = "model"
+	}
+	return fmt.Sprintf("%s in %d %s · %s unreferenced",
+		output.Bytes(s.Size), s.Models, noun, output.Bytes(s.Unreferenced))
 }
 
 func handleModelRemove(ctx *Context) *exit.Error {

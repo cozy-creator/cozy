@@ -270,15 +270,19 @@ func (t *Tool) VerifyManifest(id string) *exit.Error {
 	return e
 }
 
-// Release is one authoritative local repository row returned by TensorFS.
+// Release is one authoritative local repository row returned by TensorFS: a release
+// lane (`kind: "release"`, with a version and lane) or a local alias (`kind: "local"`,
+// with the source selection it was made from and no release at all).
 type Release struct {
-	Org            string          `json:"org"`
-	Name           string          `json:"name"`
-	Version        string          `json:"version"`
-	Lane           string          `json:"lane"`
-	ManifestSHA256 string          `json:"manifest_sha256"`
-	ManifestLength int64           `json:"manifest_length"`
-	Evidence       json.RawMessage `json:"evidence"`
+	Kind            string          `json:"kind"`
+	Org             string          `json:"org"`
+	Name            string          `json:"name"`
+	Version         string          `json:"version"`
+	Lane            string          `json:"lane"`
+	SourceSelection string          `json:"source_selection"`
+	ManifestSHA256  string          `json:"manifest_sha256"`
+	ManifestLength  int64           `json:"manifest_length"`
+	Evidence        json.RawMessage `json:"evidence"`
 }
 
 // Releases lists repository metadata through TensorFS, never through SQLite or
@@ -298,13 +302,89 @@ func (t *Tool) Releases(outPath string) ([]Release, *exit.Error) {
 		}
 		var row Release
 		if err := json.Unmarshal([]byte(text), &row); err != nil || row.Org == "" || row.Name == "" ||
-			row.Version == "" || row.Lane == "" || len(row.ManifestSHA256) != 64 || row.ManifestLength <= 0 ||
-			len(row.Evidence) == 0 {
+			len(row.ManifestSHA256) != 64 || row.ManifestLength <= 0 || len(row.Evidence) == 0 {
 			return nil, exit.Internalf("tfs returned an invalid repository row at line %d", line+1)
+		}
+		switch row.Kind {
+		case "release":
+			if row.Version == "" || row.Lane == "" {
+				return nil, exit.Internalf("tfs returned a release row without a version and lane at line %d", line+1)
+			}
+		case "local":
+			if row.Org != "local" || !validID(row.SourceSelection) || row.Version != "" || row.Lane != "" {
+				return nil, exit.Internalf("tfs returned an invalid local alias row at line %d", line+1)
+			}
+		default:
+			return nil, exit.Internalf("tfs returned a repository row of unknown kind %q at line %d", row.Kind, line+1)
 		}
 		rows = append(rows, row)
 	}
 	return rows, nil
+}
+
+// RepositoryUsage is one repository's blob bytes: everything its retained checkpoints
+// reach, and the part no other repository reaches (what deleting only it would free).
+type RepositoryUsage struct {
+	Org    string `json:"org"`
+	Name   string `json:"name"`
+	Total  int64  `json:"bytes_total"`
+	Unique int64  `json:"bytes_unique"`
+}
+
+// StoreUsage is the store's byte plane as TensorFS measures it: the union every
+// repository reaches, the sum of their unique parts, and the verified blobs no retained
+// manifest reaches.
+type StoreUsage struct {
+	Total        int64             `json:"bytes_total"`
+	UniqueSum    int64             `json:"bytes_unique_sum"`
+	Unreferenced int64             `json:"bytes_unreferenced"`
+	Repos        []RepositoryUsage `json:"-"`
+}
+
+// Usage measures the store through TensorFS's own closure walk — the one its GC keeps
+// alive — never by summing files under blobs/.
+func (t *Tool) Usage(outPath string) (StoreUsage, *exit.Error) {
+	if _, e := t.run("repo", "usage", t.Root, "--rows", outPath); e != nil {
+		return StoreUsage{}, e
+	}
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		return StoreUsage{}, exit.Internalf("the usage rows tfs wrote are unreadable: %s", err)
+	}
+	var usage StoreUsage
+	store := false
+	for line, text := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		var kind struct {
+			Kind  string `json:"kind"`
+			Repos int    `json:"repos"`
+		}
+		if err := json.Unmarshal([]byte(text), &kind); err != nil {
+			return StoreUsage{}, exit.Internalf("tfs returned an invalid usage row at line %d", line+1)
+		}
+		switch kind.Kind {
+		case "repo":
+			var row RepositoryUsage
+			if err := json.Unmarshal([]byte(text), &row); err != nil || row.Org == "" || row.Name == "" ||
+				row.Unique > row.Total {
+				return StoreUsage{}, exit.Internalf("tfs returned an invalid usage row at line %d", line+1)
+			}
+			usage.Repos = append(usage.Repos, row)
+		case "store":
+			if store || json.Unmarshal([]byte(text), &usage) != nil || kind.Repos != len(usage.Repos) {
+				return StoreUsage{}, exit.Internalf("tfs returned an invalid store usage row at line %d", line+1)
+			}
+			store = true
+		default:
+			return StoreUsage{}, exit.Internalf("tfs returned an unknown usage row kind %q at line %d", kind.Kind, line+1)
+		}
+	}
+	if !store {
+		return StoreUsage{}, exit.Internalf("tfs returned no store usage row")
+	}
+	return usage, nil
 }
 
 // CheckpointEvidence returns the exact canonical evidence attached to a retained

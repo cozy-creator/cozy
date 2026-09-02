@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -31,14 +32,32 @@ type Record struct {
 }
 
 type List struct {
-	Name       string
-	Fields     []string
-	AllFields  []string
-	Rows       []map[string]string
+	Name      string
+	Fields    []string
+	AllFields []string
+	Rows      []map[string]string
+	// Bytes names the columns whose cells are byte counts, written as decimal integers
+	// (`Int`): the terminal shows binary units, JSON carries the integer. An empty cell is
+	// an absent fact in both.
+	Bytes []string
+	// Machine names columns every JSON document carries and the terminal never shows:
+	// facts a program wants that would only widen a table.
+	Machine    []string
 	Total      int
 	Aggregates []Field
 	Notes      []string
 	Next       []string
+}
+
+// Human is an aggregate value with its own terminal sentence; JSON carries the value
+// itself. An empty sentence keeps the aggregate out of the terminal.
+type Human interface {
+	Human() string
+}
+
+// Int writes a byte count for a `Bytes` column.
+func Int(n int64) string {
+	return strconv.FormatInt(n, 10)
 }
 
 func (r Record) Emit(w io.Writer, mode Mode) error {
@@ -73,6 +92,14 @@ func (l List) Emit(w io.Writer, mode Mode) error {
 	if err != nil {
 		return err
 	}
+	human := mode.Human && !mode.JSON
+	if !human && len(mode.Fields) == 0 {
+		for _, column := range l.Machine {
+			if !contains(columns, column) {
+				columns = append(columns, column)
+			}
+		}
+	}
 	shown := l.Rows
 	if !mode.Full && len(shown) > rowCap {
 		shown = shown[:rowCap]
@@ -85,10 +112,21 @@ func (l List) Emit(w io.Writer, mode Mode) error {
 		}
 		document[l.Name] = values
 	} else {
-		rows := make([]map[string]string, 0, len(shown))
+		rows := make([]map[string]any, 0, len(shown))
 		for _, source := range shown {
-			row := make(map[string]string, len(columns))
+			row := make(map[string]any, len(columns))
 			for _, column := range columns {
+				if contains(l.Bytes, column) {
+					if source[column] == "" {
+						continue
+					}
+					n, err := strconv.ParseInt(source[column], 10, 64)
+					if err != nil {
+						return fmt.Errorf("output column %q carries %q, not a byte count", column, source[column])
+					}
+					row[column] = n
+					continue
+				}
 				row[column] = Elide(source[column], cellCap, mode.Full)
 			}
 			rows = append(rows, row)
@@ -121,7 +159,7 @@ func (l List) Emit(w io.Writer, mode Mode) error {
 	if next := trimNext(l.Next); len(next) > 0 {
 		document["next"] = next
 	}
-	if mode.Human && !mode.JSON {
+	if human {
 		return writeHumanList(w, l, columns, shown, total, document, mode.Full)
 	}
 	return Write(w, document, mode)
@@ -182,7 +220,7 @@ func writeHumanList(w io.Writer, list List, columns []string, shown []map[string
 			rendered.WriteByte('\n')
 		}
 	} else {
-		writeHumanTable(&rendered, columns, shown, full)
+		writeHumanTable(&rendered, columns, humanBytes(list.Bytes, shown), full)
 	}
 	if omitted := total - len(shown); omitted > 0 {
 		fmt.Fprintf(&rendered, "%d more not shown. Use --full to show all.\n", omitted)
@@ -193,16 +231,46 @@ func writeHumanList(w io.Writer, list List, columns []string, shown []map[string
 			continue
 		}
 		if value, ok := document[aggregate.K]; ok {
+			text := ""
+			if spoken, ok := value.(Human); ok {
+				text = spoken.Human()
+			} else {
+				text = humanValue(value, full)
+			}
+			if text == "" {
+				continue
+			}
 			if !wroteAggregate && rendered.Len() > 0 {
 				rendered.WriteByte('\n')
 			}
-			fmt.Fprintf(&rendered, "%s: %s\n", aggregate.K, humanValue(value, full))
+			fmt.Fprintf(&rendered, "%s: %s\n", aggregate.K, text)
 			wroteAggregate = true
 		}
 	}
 	writeHumanGuidance(&rendered, list.Notes, list.Next)
 	_, err := io.WriteString(w, rendered.String())
 	return err
+}
+
+// humanBytes renders every byte column of every row in binary units; other cells pass.
+func humanBytes(byteColumns []string, rows []map[string]string) []map[string]string {
+	if len(byteColumns) == 0 {
+		return rows
+	}
+	out := make([]map[string]string, 0, len(rows))
+	for _, source := range rows {
+		row := make(map[string]string, len(source))
+		for column, value := range source {
+			if contains(byteColumns, column) && value != "" {
+				if n, err := strconv.ParseInt(value, 10, 64); err == nil {
+					value = Bytes(n)
+				}
+			}
+			row[column] = value
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 func writeHumanTable(rendered *strings.Builder, columns []string, rows []map[string]string, full bool) {
