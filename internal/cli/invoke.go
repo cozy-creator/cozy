@@ -169,16 +169,19 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 			return e
 		}
 	}
-	outputDirectory := ""
-	outputIntentHash := ""
-	if requested := ctx.Inv.Value("--out"); requested != "" {
-		absolute, err := filepath.Abs(requested)
-		if err != nil {
-			return exit.Usagef("cannot resolve --out %q: %s", requested, err)
-		}
-		outputDirectory = filepath.Clean(absolute)
-		outputIntentHash = outputHash
+	// Results are files a person wants to open: every run exports them, to --out or to
+	// the directory the command ran in, and says where. The attempt store under
+	// ~/.cozy/outputs keeps the durable copy; it is not the user-facing location.
+	requested := ctx.Inv.Value("--out")
+	if requested == "" {
+		requested = "."
 	}
+	absolute, err := filepath.Abs(requested)
+	if err != nil {
+		return exit.Usagef("cannot resolve --out %q: %s", requested, err)
+	}
+	outputDirectory := filepath.Clean(absolute)
+	outputIntentHash := outputHash
 
 	c, e := dial(ctx)
 	if e != nil {
@@ -204,8 +207,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 				handle.RequestID, handle.Attempt, handle.Status)
 		} else {
 			fmt.Fprintf(ctx.Err, "Invoking %s/%s...\n", target.Package, target.Function)
-			if dir := ctx.Inv.Value("--out"); dir != "" {
-				fmt.Fprintf(ctx.Err, "Saving outputs as %s\n", outputPathHint(ep, dir, outputHash))
+			if len(launch.AssetPaths(ep.Result)) > 0 {
+				fmt.Fprintf(ctx.Err, "Saving outputs as %s\n", outputPathHint(ep, outputDirectory, outputHash))
 			}
 		}
 		if handle.Replay {

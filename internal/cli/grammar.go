@@ -254,7 +254,7 @@ type RunCmd struct {
 type RunExecuteCmd struct {
 	Target         string   `arg:"" name:"target" help:"Package or callable as org/package[/function]."`
 	Input          []string `arg:"" optional:"" name:"input" help:"Primary value and field=value payload."`
-	Out            string   `help:"Output directory." type:"path"`
+	Out            string   `help:"Directory the result files are saved to (default: the current directory)." type:"path"`
 	Timeout        string   `help:"Request deadline."`
 	Stream         bool     `help:"Emit typed progress deltas."`
 	PayloadFile    string   `name:"in" help:"Read the whole payload from a JSON file, e.g. --in request.json." type:"path"`

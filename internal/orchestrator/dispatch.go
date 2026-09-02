@@ -51,7 +51,7 @@ type Submission struct {
 	// OutputBinding carries no kind, so this is persisted beside the InvocationSpec and is
 	// never inferred from an arriving receipt. The M0 lane is weights-only: when non-empty,
 	// this set is the complete output set for the job.
-	WeightsOutputs   []WeightsOutput
+	WeightsOutputs []WeightsOutput
 	ProducerParams []string
 
 	// BodyDigest is the caller's own digest of the WHOLE submission it is making
