@@ -14,13 +14,13 @@ import (
 )
 
 type JobPin struct {
-	Callable      string `json:"callable"`
-	Package       string `json:"package"`
-	Function      string `json:"function"`
-	InstallID     string `json:"install_id,omitempty"`
-	Release       string `json:"release"`
-	ReleaseDigest string `json:"release_digest"`
-	DescriptorID  string `json:"descriptor_id"`
+	Callable     string `json:"callable"`
+	Package      string `json:"package"`
+	Function     string `json:"function"`
+	InstallID    string `json:"install_id,omitempty"`
+	Release      string `json:"release"`
+	SourceDigest string `json:"source_digest,omitempty"`
+	DescriptorID string `json:"descriptor_id"`
 }
 
 type OutputPin struct {
@@ -35,7 +35,7 @@ type SourceFile struct {
 
 // Instruction is the canonical caller intent recorded before any mutable package
 // selector is resolved. Its identity deliberately excludes every resolved release,
-// descriptor, source inventory, worker, rental, price, credential, and attempt fact.
+// PackageInterface, source inventory, worker, rental, price, credential, and attempt fact.
 type Instruction struct {
 	Kind        string `json:"kind"`
 	Destination string `json:"destination"`
@@ -44,8 +44,8 @@ type Instruction struct {
 	Producer    string `json:"producer,omitempty"`
 	Placement   string `json:"placement,omitempty"`
 	// SourceProfiles is the caller's slot=profile narrowing for a producer whose
-	// descriptor declares none. Caller intent, so it is identity; a declared
-	// profile is descriptor-derived and stays out.
+	// PackageInterface declares none. Caller intent, so it is identity; a declared
+	// profile is PackageInterface-derived and stays out.
 	SourceProfiles map[string]string `json:"source_profiles,omitempty"`
 }
 
@@ -85,21 +85,21 @@ func (i Instruction) ID() string {
 }
 
 type Plan struct {
-	Instruction       Instruction
-	Destination       string
-	Source            string
-	SourceSelection   string
-	SourceLicense     string
-	SourceFiles       []SourceFile
-	InputLane         string
-	Producer          string
-	ProducerInstallID string
-	ProducerRelease   string
-	ProducerDigest    string
-	DescriptorDigest  string
-	Job               *JobPin
-	SourceProfiles    map[string]string
-	Outputs           []OutputPin
+	Instruction            Instruction
+	Destination            string
+	Source                 string
+	SourceSelection        string
+	SourceLicense          string
+	SourceFiles            []SourceFile
+	InputLane              string
+	Producer               string
+	ProducerInstallID      string
+	ProducerRelease        string
+	ProducerSourceDigest   string
+	PackageInterfaceDigest string
+	Job                    *JobPin
+	SourceProfiles         map[string]string
+	Outputs                []OutputPin
 }
 
 // Bytes is the restart record. It contains only immutable identities and
@@ -145,8 +145,8 @@ func (p Plan) ID() string {
 	for _, value := range []string{
 		"cozy-model-upload/1", p.Destination, p.Source,
 		p.SourceSelection, p.SourceLicense, p.InputLane, p.Producer,
-		p.ProducerInstallID, p.ProducerRelease, p.ProducerDigest,
-		p.DescriptorDigest,
+		p.ProducerInstallID, p.ProducerRelease, p.ProducerSourceDigest,
+		p.PackageInterfaceDigest,
 	} {
 		_, _ = io.WriteString(hash, value)
 		_, _ = hash.Write([]byte{0})
@@ -154,7 +154,7 @@ func (p Plan) ID() string {
 	if p.Job != nil {
 		job := *p.Job
 		for _, value := range []string{
-			job.Callable, job.Package, job.Function, job.InstallID, job.Release, job.ReleaseDigest,
+			job.Callable, job.Package, job.Function, job.InstallID, job.Release, job.SourceDigest,
 			job.DescriptorID,
 		} {
 			_, _ = io.WriteString(hash, value)

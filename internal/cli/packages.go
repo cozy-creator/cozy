@@ -118,14 +118,14 @@ func handlePackageRecover(ctx *Context) *exit.Error {
 
 // runExample renders one concrete invoke command for the install's first
 // callable so "what now?" is answered by the install itself. Best effort: a
-// package whose descriptor cannot be read still gets the bare form.
+// package whose PackageInterface cannot be read still gets the bare form.
 func runExample(inst records.PackageInstall) string {
 	example := "cozy run " + inst.Package
-	raw, err := os.ReadFile(launch.DescriptorPath(inst.Dir))
+	raw, err := os.ReadFile(launch.PackageInterfacePath(inst.Dir))
 	if err != nil {
 		return example
 	}
-	d, problem := launch.DecodeDescriptor(raw)
+	d, problem := launch.DecodePackageInterface(raw)
 	if problem != nil {
 		return example
 	}
@@ -134,7 +134,7 @@ func runExample(inst records.PackageInstall) string {
 		return example
 	}
 	// The ONE contract printer (launch.UsageLine) renders the hint, the `--describe`
-	// contract, and the submit refusal's remedy from the same descriptor facts.
+	// contract, and the submit refusal's remedy from the same PackageInterface facts.
 	return launch.UsageLine(inst.Package+"/"+callables[0].Name, &callables[0])
 }
 
@@ -154,7 +154,7 @@ func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *inst
 		{K: "platform", V: inst.Platform}, {K: "cuda_extra", V: orNone(inst.Extra)},
 		{K: "packages", V: inst.Packages},
 		{K: "closure", V: strings.ReplaceAll(inst.Closure, "\n", " ")},
-		{K: "package_descriptor", V: inst.PackageDescriptor},
+		{K: "package_interface", V: inst.PackageInterface},
 		{K: "placement_set", V: inst.PlacementSetDigest},
 		{K: "model_download", V: orNone(res.ModelStatus)},
 		{K: "model_download_error", V: res.ModelError},
@@ -211,23 +211,23 @@ func handleLs(ctx *Context) *exit.Error {
 			return e
 		}
 		l.Rows = append(l.Rows, map[string]string{
-			"package":            inst.Package,
-			"major":              fmt.Sprintf("v%d", inst.Major),
-			"version":            inst.Version,
-			"install_id":         inst.ID,
-			"size":               output.Int(inst.BytesExcl),
-			"dependencies":       output.Int(inst.BytesShared),
-			"python":             inst.Python,
-			"uv":                 inst.UV,
-			"cuda_extra":         orNone(inst.Extra),
-			"packages":           fmt.Sprintf("%d", inst.Packages),
-			"closure":            strings.ReplaceAll(inst.Closure, "\n", " "),
-			"package_descriptor": inst.PackageDescriptor,
-			"placement_set":      inst.PlacementSetDigest,
-			"source":             inst.SourceKind + " " + inst.SourceRef,
-			"synced":             synced,
-			"verified":           fmt.Sprintf("%t", inst.Verified),
-			"installed":          inst.CreatedAt,
+			"package":           inst.Package,
+			"major":             fmt.Sprintf("v%d", inst.Major),
+			"version":           inst.Version,
+			"install_id":        inst.ID,
+			"size":              output.Int(inst.BytesExcl),
+			"dependencies":      output.Int(inst.BytesShared),
+			"python":            inst.Python,
+			"uv":                inst.UV,
+			"cuda_extra":        orNone(inst.Extra),
+			"packages":          fmt.Sprintf("%d", inst.Packages),
+			"closure":           strings.ReplaceAll(inst.Closure, "\n", " "),
+			"package_interface": inst.PackageInterface,
+			"placement_set":     inst.PlacementSetDigest,
+			"source":            inst.SourceKind + " " + inst.SourceRef,
+			"synced":            synced,
+			"verified":          fmt.Sprintf("%t", inst.Verified),
+			"installed":         inst.CreatedAt,
 		})
 	}
 	if len(l.Rows) == 0 {

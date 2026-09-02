@@ -169,7 +169,7 @@ func (s *Store) RecoverPackageInventory(sourcePath, installsRoot string) (int, *
 			inst.SourceKind, inst.SourceRef, inst.SourceDigest, verified,
 			inst.Dir, inst.Python, inst.Runtime, inst.ProjectDir,
 			inst.UV, inst.LockDigest, inst.Platform, inst.Extra,
-			inst.Packages, inst.Closure, inst.PackageDescriptor,
+			inst.Packages, inst.Closure, inst.PackageInterface,
 			inst.PlacementSetDigest, inst.BytesExcl, inst.BytesShared,
 			inst.CreatedAt); err != nil {
 			return 0, exit.Internalf("cannot recover package install %s: %s", inst.ID, err)
@@ -189,7 +189,7 @@ func (s *Store) RecoverPackageInventory(sourcePath, installsRoot string) (int, *
 
 func verifyRecoverableInstall(inst PackageInstall, installsRoot string) *exit.Error {
 	if inst.ID == "" || inst.Package == "" || inst.Version == "" ||
-		inst.SourceDigest == "" || inst.PackageDescriptor == "" ||
+		(inst.SourceKind == "local" && inst.SourceDigest == "") || inst.PackageInterface == "" ||
 		inst.SourceKind != "tensorhub" && inst.SourceKind != "local" {
 		return exit.Named(exit.Validation, "package_install_recovery_invalid",
 			"backup install %q has incomplete immutable identity", inst.ID)
@@ -209,8 +209,8 @@ func verifyRecoverableInstall(inst PackageInstall, installsRoot string) *exit.Er
 		return exit.Named(exit.Validation, "package_install_recovery_path_invalid",
 			"backup install %s directory is absent, not a directory, or a symlink", inst.ID)
 	}
-	if problem := verifyRecoveryDigest(filepath.Join(inst.Dir, "documents", "descriptor.json"),
-		inst.PackageDescriptor); problem != nil {
+	if problem := verifyRecoveryDigest(filepath.Join(inst.Dir, "documents", "package-interface.json"),
+		inst.PackageInterface); problem != nil {
 		return problem
 	}
 	if inst.PlacementSetDigest != "" {
@@ -232,14 +232,14 @@ func verifyRecoveryDigest(path, spelled string) *exit.Error {
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
 		info.Size() < 1 || info.Size() > 16<<20 {
-		return exit.Named(exit.Validation, "package_install_recovery_evidence_invalid",
-			"install evidence %s is absent, unsafe, or over the 16 MiB bound", path)
+		return exit.Named(exit.Validation, "package_install_recovery_file_invalid",
+			"install file %s is absent, unsafe, or over the 16 MiB bound", path)
 	}
 	raw, err := os.ReadFile(path)
 	measured := sha256.Sum256(raw)
 	if err != nil || !bytes.Equal(want, measured[:]) {
-		return exit.Named(exit.Validation, "package_install_recovery_evidence_invalid",
-			"install evidence %s is absent or does not match %s", path, spelled)
+		return exit.Named(exit.Validation, "package_install_recovery_file_invalid",
+			"install file %s is absent or does not match %s", path, spelled)
 	}
 	return nil
 }

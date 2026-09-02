@@ -19,8 +19,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// MaxBytes is the compatibility fallback for an older descriptor with no effective
-// field bound. Current descriptors carry each field's selected max_bytes; no private
+// MaxBytes is the compatibility fallback for an older PackageInterface with no effective
+// field bound. Current PackageInterfaces carry each field's selected max_bytes; no private
 // aggregate cap exists here.
 const MaxBytes = int64(64 << 20)
 

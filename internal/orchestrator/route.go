@@ -345,7 +345,8 @@ func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) (
 	}
 	placement, ok := w.remotePlacements[remotePlanKey(slot, planID)]
 	return slot, ok && !w.spec.IsJob() && placement.Package == slot &&
-		placement.PackageRevisionDigest == remoteRevision(req) &&
+		placement.Release == req.Release &&
+		(req.LocalPackageDigest == "" || placement.LocalRevisionDigest == req.LocalPackageDigest) &&
 		w.remoteDispatchable(placement, planID)
 }
 

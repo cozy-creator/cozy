@@ -65,7 +65,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	handle, e := c.SubmitJob(api.JobSubmission{
 		Package: target.Package, Function: target.Function, Input: input,
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
-		Release: target.Release, ReleaseDigest: target.ReleaseDigest, Rental: rentalRequested(ctx),
+		Release: target.Release, Rental: rentalRequested(ctx),
 		RentalRequired: ctx.Inv.Bool("--rental-only"),
 	}, key)
 	if e != nil {

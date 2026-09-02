@@ -176,11 +176,12 @@ const (
 type LocalDownloadKind int32
 
 const (
-	LocalDownloadKind_LOCAL_DOWNLOAD_KIND_UNSPECIFIED      LocalDownloadKind = 0
-	LocalDownloadKind_LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL    LocalDownloadKind = 1
-	LocalDownloadKind_LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL LocalDownloadKind = 2
-	LocalDownloadKind_LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST   LocalDownloadKind = 3
-	LocalDownloadKind_LOCAL_DOWNLOAD_KIND_MODEL_OBJECT     LocalDownloadKind = 4
+	LocalDownloadKind_LOCAL_DOWNLOAD_KIND_UNSPECIFIED       LocalDownloadKind = 0
+	LocalDownloadKind_LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL     LocalDownloadKind = 1
+	LocalDownloadKind_LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL  LocalDownloadKind = 2
+	LocalDownloadKind_LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST    LocalDownloadKind = 3
+	LocalDownloadKind_LOCAL_DOWNLOAD_KIND_MODEL_OBJECT      LocalDownloadKind = 4
+	LocalDownloadKind_LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE LocalDownloadKind = 5
 )
 
 // Enum value maps for LocalDownloadKind.
@@ -191,13 +192,15 @@ var (
 		2: "LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL",
 		3: "LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST",
 		4: "LOCAL_DOWNLOAD_KIND_MODEL_OBJECT",
+		5: "LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE",
 	}
 	LocalDownloadKind_value = map[string]int32{
-		"LOCAL_DOWNLOAD_KIND_UNSPECIFIED":      0,
-		"LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL":    1,
-		"LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL": 2,
-		"LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST":   3,
-		"LOCAL_DOWNLOAD_KIND_MODEL_OBJECT":     4,
+		"LOCAL_DOWNLOAD_KIND_UNSPECIFIED":       0,
+		"LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL":     1,
+		"LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL":  2,
+		"LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST":    3,
+		"LOCAL_DOWNLOAD_KIND_MODEL_OBJECT":      4,
+		"LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE": 5,
 	}
 )
 
@@ -2986,8 +2989,8 @@ func (x *PrepareLocalPackageRequest) GetEnvironmentRoot() string {
 
 // Loopback-only model binding for one already-prepared local revision. The supervisor has
 // verified every downloaded model file and the Runtime has already retained the exact code,
-// descriptor, and Environment core named by local_revision_digest. Runtime alone joins the
-// model/config/component/stamp facts and authors the resulting PlacementSet.
+// package interface, and Environment core named by local_revision_digest. Runtime alone joins
+// the model/component/stamp facts and authors the resulting PlacementSet.
 type PreparePrivatePlacementRequest struct {
 	state               protoimpl.MessageState `protogen:"open.v1"`
 	OperationId         string                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
@@ -5357,18 +5360,18 @@ func (x *LocalPackageFileRef) GetLength() uint64 {
 }
 
 // DOCUMENT SHAPE: canonical `cozy.worker.v1.LocalPackageRevision/1`. Creator and Runtime
-// independently derive these bytes from one descriptor and the exact sorted wheel inventory.
+// independently derive these bytes from one package interface and the exact sorted wheel inventory.
 // Its digest is the local code revision that enters Placement/Invocation identity; source_digest
 // remains separate provenance for the checkout that produced those bytes.
 type LocalPackageRevision struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	Package           string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"`
-	Release           string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"`
-	SourceDigest      []byte                 `protobuf:"bytes,3,opt,name=source_digest,json=sourceDigest,proto3" json:"source_digest,omitempty"`
-	PackageDescriptor *Ref                   `protobuf:"bytes,4,opt,name=package_descriptor,json=packageDescriptor,proto3" json:"package_descriptor,omitempty"`
-	Files             []*LocalPackageFileRef `protobuf:"bytes,5,rep,name=files,proto3" json:"files,omitempty"` // sorted unique by digest; exactly one project wheel
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Package          string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"`
+	Release          string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"`
+	SourceDigest     []byte                 `protobuf:"bytes,3,opt,name=source_digest,json=sourceDigest,proto3" json:"source_digest,omitempty"`
+	PackageInterface *Ref                   `protobuf:"bytes,4,opt,name=package_interface,json=packageInterface,proto3" json:"package_interface,omitempty"`
+	Files            []*LocalPackageFileRef `protobuf:"bytes,5,rep,name=files,proto3" json:"files,omitempty"` // sorted unique by digest; exactly one project wheel
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *LocalPackageRevision) Reset() {
@@ -5422,9 +5425,9 @@ func (x *LocalPackageRevision) GetSourceDigest() []byte {
 	return nil
 }
 
-func (x *LocalPackageRevision) GetPackageDescriptor() *Ref {
+func (x *LocalPackageRevision) GetPackageInterface() *Ref {
 	if x != nil {
-		return x.PackageDescriptor
+		return x.PackageInterface
 	}
 	return nil
 }
@@ -5715,7 +5718,7 @@ type DownloadModelRef struct {
 	Model         string                 `protobuf:"bytes,2,opt,name=model,proto3" json:"model,omitempty"`       // org/name
 	Release       string                 `protobuf:"bytes,3,opt,name=release,proto3" json:"release,omitempty"`   // immutable author release
 	Package       string                 `protobuf:"bytes,4,opt,name=package,proto3" json:"package,omitempty"`   // one package named by this delegation
-	Slot          string                 `protobuf:"bytes,5,opt,name=slot,proto3" json:"slot,omitempty"`         // exact descriptor model-slot path; unique per package
+	Slot          string                 `protobuf:"bytes,5,opt,name=slot,proto3" json:"slot,omitempty"`         // exact package-interface model-slot path; unique per package
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5787,9 +5790,8 @@ func (x *DownloadModelRef) GetSlot() string {
 
 type DownloadPackageRef struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Package       string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"`                                  // org/name
-	Release       string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"`                                  // exact semver release
-	ReleaseDigest string                 `protobuf:"bytes,3,opt,name=release_digest,json=releaseDigest,proto3" json:"release_digest,omitempty"` // exact immutable PackageRelease/1 digest
+	Package       string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"` // org/name
+	Release       string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"` // exact semver release
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5838,13 +5840,6 @@ func (x *DownloadPackageRef) GetRelease() string {
 	return ""
 }
 
-func (x *DownloadPackageRef) GetReleaseDigest() string {
-	if x != nil {
-		return x.ReleaseDigest
-	}
-	return ""
-}
-
 type Placement struct {
 	state       protoimpl.MessageState `protogen:"open.v1"`
 	PlacementId string                 `protobuf:"bytes,1,opt,name=placement_id,json=placementId,proto3" json:"placement_id,omitempty"` // RecordOwner-minted routing + journal key; NEVER part of
@@ -5856,7 +5851,7 @@ type Placement struct {
 	//	*Placement_Development
 	PackageMode       isPlacement_PackageMode `protobuf_oneof:"package_mode"`
 	EnvironmentDigest []byte                  `protobuf:"bytes,3,opt,name=environment_digest,json=environmentDigest,proto3" json:"environment_digest,omitempty"` // class (a): exact selected Environment identity
-	PackageDescriptor *Ref                    `protobuf:"bytes,5,opt,name=package_descriptor,json=packageDescriptor,proto3" json:"package_descriptor,omitempty"` // exact PackageDescriptor bytes
+	PackageInterface  *Ref                    `protobuf:"bytes,5,opt,name=package_interface,json=packageInterface,proto3" json:"package_interface,omitempty"`    // exact PackageInterface bytes
 	BindingsDigest    []byte                  `protobuf:"bytes,6,opt,name=bindings_digest,json=bindingsDigest,proto3" json:"bindings_digest,omitempty"`          // class (a): sha256(canonical JSON of exactly
 	// {entrypoints:<field 8>,models:<field 7>})
 	Models        []*Model      `protobuf:"bytes,7,rep,name=models,proto3" json:"models,omitempty"`            // sorted unique by id; [] for a weightless package
@@ -5935,9 +5930,9 @@ func (x *Placement) GetEnvironmentDigest() []byte {
 	return nil
 }
 
-func (x *Placement) GetPackageDescriptor() *Ref {
+func (x *Placement) GetPackageInterface() *Ref {
 	if x != nil {
-		return x.PackageDescriptor
+		return x.PackageInterface
 	}
 	return nil
 }
@@ -6126,14 +6121,13 @@ func (x *WheelFact) GetTags() []string {
 	return nil
 }
 
-// The directly executable package identity. release_digest is provenance for the immutable
-// release.json that Tensorhub committed; it is deliberately digest-only because no worker fetch,
-// parse, or second package authority remains.
+// The directly executable published package identity. Tensorhub makes (package, release)
+// immutable; the exact execution bytes are independently bound by the project wheel,
+// package interface, Environment, bindings, and model refs in this Placement.
 type PackageSelection struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Package       string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"`                                  // exact org/name package identity
-	Release       string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"`                                  // exact semantic release
-	ReleaseDigest []byte                 `protobuf:"bytes,3,opt,name=release_digest,json=releaseDigest,proto3" json:"release_digest,omitempty"` // sha256 of release.json; provenance, never an artifact Ref
+	Package       string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"` // exact org/name package identity
+	Release       string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"` // exact semantic release
 	ProjectWheel  *WheelFact             `protobuf:"bytes,4,opt,name=project_wheel,json=projectWheel,proto3" json:"project_wheel,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -6181,13 +6175,6 @@ func (x *PackageSelection) GetRelease() string {
 		return x.Release
 	}
 	return ""
-}
-
-func (x *PackageSelection) GetReleaseDigest() []byte {
-	if x != nil {
-		return x.ReleaseDigest
-	}
-	return nil
 }
 
 func (x *PackageSelection) GetProjectWheel() *WheelFact {
@@ -7062,17 +7049,11 @@ type PlacementStatus struct {
 	Serving                            ServingState `protobuf:"varint,13,opt,name=serving,proto3,enum=cozy.worker.v1.ServingState" json:"serving,omitempty"`
 	RetainedFallbackPlacementSetDigest []byte       `protobuf:"bytes,14,opt,name=retained_fallback_placement_set_digest,json=retainedFallbackPlacementSetDigest,proto3" json:"retained_fallback_placement_set_digest,omitempty"` // class (a): predecessor set kept for restore
 	// (#474/#485c). Empty means replacement is PAUSED.
-	Acquisition *PlacementAcquisitionObservation `protobuf:"bytes,15,opt,name=acquisition,proto3" json:"acquisition,omitempty"` // OBSERVATION ONLY for this
-	// placement_set_digest. Never identity, readiness,
-	// convergence, or admission authority; no acceptance gate
-	// may read it. Terminal values remain visible after
-	// STAGED/DISPATCHABLE until the next acquisition for this
-	// placement starts or the placement leaves observed state.
-	PackageRevisionDigest string `protobuf:"bytes,16,opt,name=package_revision_digest,json=packageRevisionDigest,proto3" json:"package_revision_digest,omitempty"` // exact InvocationSpec package_revision_digest
-	EnvironmentDigest     string `protobuf:"bytes,17,opt,name=environment_digest,json=environmentDigest,proto3" json:"environment_digest,omitempty"`               // exact InvocationSpec environment_digest
-	DeviceLaneId          string `protobuf:"bytes,19,opt,name=device_lane_id,json=deviceLaneId,proto3" json:"device_lane_id,omitempty"`                            // proto-024: the ObservedWorkerState.lanes[] entry this
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	Acquisition       *PlacementAcquisitionObservation `protobuf:"bytes,15,opt,name=acquisition,proto3" json:"acquisition,omitempty"`                                      // OBSERVATION ONLY for this
+	EnvironmentDigest string                           `protobuf:"bytes,17,opt,name=environment_digest,json=environmentDigest,proto3" json:"environment_digest,omitempty"` // exact InvocationSpec environment_digest
+	DeviceLaneId      string                           `protobuf:"bytes,19,opt,name=device_lane_id,json=deviceLaneId,proto3" json:"device_lane_id,omitempty"`              // proto-024: the ObservedWorkerState.lanes[] entry this
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *PlacementStatus) Reset() {
@@ -7180,13 +7161,6 @@ func (x *PlacementStatus) GetAcquisition() *PlacementAcquisitionObservation {
 		return x.Acquisition
 	}
 	return nil
-}
-
-func (x *PlacementStatus) GetPackageRevisionDigest() string {
-	if x != nil {
-		return x.PackageRevisionDigest
-	}
-	return ""
 }
 
 func (x *PlacementStatus) GetEnvironmentDigest() string {
@@ -12307,13 +12281,12 @@ func (x *AttemptProgress) GetPlacementId() string {
 // model/adapter ref is spellable; unknown keys refuse on read and are unwritable on author.
 // placement_id is DELIBERATELY absent: the same invocation is the same work wherever it routes.
 type InvocationSpec struct {
-	state                 protoimpl.MessageState `protogen:"open.v1"`
-	PackageRevisionDigest string                 `protobuf:"bytes,1,opt,name=package_revision_digest,json=packageRevisionDigest,proto3" json:"package_revision_digest,omitempty"` // published release.json or development source digest
-	EnvironmentDigest     string                 `protobuf:"bytes,2,opt,name=environment_digest,json=environmentDigest,proto3" json:"environment_digest,omitempty"`               // class (a), sha256:<hex>: exact selected Environment
-	PayloadDigest         string                 `protobuf:"bytes,4,opt,name=payload_digest,json=payloadDigest,proto3" json:"payload_digest,omitempty"`                           // class (a): the canonical typed-argument document
-	Inputs                []*InputBinding        `protobuf:"bytes,5,rep,name=inputs,proto3" json:"inputs,omitempty"`                                                              // ORDERED input identities — INSIDE the digest
-	Outputs               []*OutputBinding       `protobuf:"bytes,6,rep,name=outputs,proto3" json:"outputs,omitempty"`                                                            // output ids/kinds/limits — INSIDE the digest
-	DeadlineUnixMs        uint64                 `protobuf:"varint,7,opt,name=deadline_unix_ms,json=deadlineUnixMs,proto3" json:"deadline_unix_ms,omitempty"`                     // absolute attempt deadline; worker-enforced; 0 = none
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	EnvironmentDigest string                 `protobuf:"bytes,2,opt,name=environment_digest,json=environmentDigest,proto3" json:"environment_digest,omitempty"` // class (a), sha256:<hex>: exact selected Environment
+	PayloadDigest     string                 `protobuf:"bytes,4,opt,name=payload_digest,json=payloadDigest,proto3" json:"payload_digest,omitempty"`             // class (a): the canonical typed-argument document
+	Inputs            []*InputBinding        `protobuf:"bytes,5,rep,name=inputs,proto3" json:"inputs,omitempty"`                                                // ORDERED input identities — INSIDE the digest
+	Outputs           []*OutputBinding       `protobuf:"bytes,6,rep,name=outputs,proto3" json:"outputs,omitempty"`                                              // output ids/kinds/limits — INSIDE the digest
+	DeadlineUnixMs    uint64                 `protobuf:"varint,7,opt,name=deadline_unix_ms,json=deadlineUnixMs,proto3" json:"deadline_unix_ms,omitempty"`       // absolute attempt deadline; worker-enforced; 0 = none
 	// Types that are valid to be assigned to Spec:
 	//
 	//	*InvocationSpec_Serving
@@ -12351,13 +12324,6 @@ func (x *InvocationSpec) ProtoReflect() protoreflect.Message {
 // Deprecated: Use InvocationSpec.ProtoReflect.Descriptor instead.
 func (*InvocationSpec) Descriptor() ([]byte, []int) {
 	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{105}
-}
-
-func (x *InvocationSpec) GetPackageRevisionDigest() string {
-	if x != nil {
-		return x.PackageRevisionDigest
-	}
-	return ""
 }
 
 func (x *InvocationSpec) GetEnvironmentDigest() string {
@@ -14106,12 +14072,12 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x06digest\x18\x01 \x01(\fR\x06digest\x12\x1a\n" +
 	"\bfilename\x18\x02 \x01(\tR\bfilename\x125\n" +
 	"\x04kind\x18\x03 \x01(\x0e2!.cozy.worker.v1.LocalDownloadKindR\x04kind\x12\x16\n" +
-	"\x06length\x18\x04 \x01(\x04R\x06length\"\xee\x01\n" +
+	"\x06length\x18\x04 \x01(\x04R\x06length\"\xec\x01\n" +
 	"\x14LocalPackageRevision\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
 	"\arelease\x18\x02 \x01(\tR\arelease\x12#\n" +
-	"\rsource_digest\x18\x03 \x01(\fR\fsourceDigest\x12B\n" +
-	"\x12package_descriptor\x18\x04 \x01(\v2\x13.cozy.worker.v1.RefR\x11packageDescriptor\x129\n" +
+	"\rsource_digest\x18\x03 \x01(\fR\fsourceDigest\x12@\n" +
+	"\x11package_interface\x18\x04 \x01(\v2\x13.cozy.worker.v1.RefR\x10packageInterface\x129\n" +
 	"\x05files\x18\x05 \x03(\v2#.cozy.worker.v1.LocalPackageFileRefR\x05files\"\xd5\x01\n" +
 	"\x13DesiredPlacementSet\x120\n" +
 	"\x14placement_set_digest\x18\x01 \x01(\fR\x12placementSetDigest\x12A\n" +
@@ -14138,17 +14104,16 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x18\n" +
 	"\arelease\x18\x03 \x01(\tR\arelease\x12\x18\n" +
 	"\apackage\x18\x04 \x01(\tR\apackage\x12\x12\n" +
-	"\x04slot\x18\x05 \x01(\tR\x04slot\"o\n" +
+	"\x04slot\x18\x05 \x01(\tR\x04slot\"^\n" +
 	"\x12DownloadPackageRef\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
-	"\arelease\x18\x02 \x01(\tR\arelease\x12%\n" +
-	"\x0erelease_digest\x18\x03 \x01(\tR\rreleaseDigest\"\xc3\x04\n" +
+	"\arelease\x18\x02 \x01(\tR\areleaseJ\x04\b\x03\x10\x04R\x0erelease_digest\"\xc1\x04\n" +
 	"\tPlacement\x12!\n" +
 	"\fplacement_id\x18\x01 \x01(\tR\vplacementId\x12<\n" +
 	"\apackage\x18\x02 \x01(\v2 .cozy.worker.v1.PackageSelectionH\x00R\apackage\x12F\n" +
 	"\vdevelopment\x18\v \x01(\v2\".cozy.worker.v1.DevelopmentPackageH\x00R\vdevelopment\x12-\n" +
-	"\x12environment_digest\x18\x03 \x01(\fR\x11environmentDigest\x12B\n" +
-	"\x12package_descriptor\x18\x05 \x01(\v2\x13.cozy.worker.v1.RefR\x11packageDescriptor\x12'\n" +
+	"\x12environment_digest\x18\x03 \x01(\fR\x11environmentDigest\x12@\n" +
+	"\x11package_interface\x18\x05 \x01(\v2\x13.cozy.worker.v1.RefR\x10packageInterface\x12'\n" +
 	"\x0fbindings_digest\x18\x06 \x01(\fR\x0ebindingsDigest\x12-\n" +
 	"\x06models\x18\a \x03(\v2\x15.cozy.worker.v1.ModelR\x06models\x12<\n" +
 	"\ventrypoints\x18\b \x03(\v2\x1a.cozy.worker.v1.EntrypointR\ventrypoints\x12=\n" +
@@ -14165,12 +14130,11 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\aversion\x18\x03 \x01(\tR\aversion\x12\x1a\n" +
 	"\bfilename\x18\x04 \x01(\tR\bfilename\x12!\n" +
 	"\fimport_roots\x18\x05 \x03(\tR\vimportRoots\x12\x12\n" +
-	"\x04tags\x18\x06 \x03(\tR\x04tags\"\xad\x01\n" +
+	"\x04tags\x18\x06 \x03(\tR\x04tags\"\x9c\x01\n" +
 	"\x10PackageSelection\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
-	"\arelease\x18\x02 \x01(\tR\arelease\x12%\n" +
-	"\x0erelease_digest\x18\x03 \x01(\fR\rreleaseDigest\x12>\n" +
-	"\rproject_wheel\x18\x04 \x01(\v2\x19.cozy.worker.v1.WheelFactR\fprojectWheel\"\xe1\x01\n" +
+	"\arelease\x18\x02 \x01(\tR\arelease\x12>\n" +
+	"\rproject_wheel\x18\x04 \x01(\v2\x19.cozy.worker.v1.WheelFactR\fprojectWheelJ\x04\b\x03\x10\x04R\x0erelease_digest\"\xe1\x01\n" +
 	"\x12DevelopmentPackage\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
 	"\arelease\x18\x02 \x01(\tR\arelease\x12#\n" +
@@ -14240,7 +14204,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0fdevice_ordinals\x18\x02 \x03(\rR\x0edeviceOrdinals\x126\n" +
 	"\x17available_attempt_slots\x18\x03 \x01(\rR\x15availableAttemptSlots\x12#\n" +
 	"\rplacement_ids\x18\x04 \x03(\tR\fplacementIds\x124\n" +
-	"\x16resident_placement_ids\x18\x05 \x03(\tR\x14residentPlacementIds\"\xf3\x06\n" +
+	"\x16resident_placement_ids\x18\x05 \x03(\tR\x14residentPlacementIds\"\xda\x06\n" +
 	"\x0fPlacementStatus\x12!\n" +
 	"\fplacement_id\x18\x01 \x01(\tR\vplacementId\x12%\n" +
 	"\x0eexecutor_epoch\x18\x04 \x01(\x04R\rexecutorEpoch\x12@\n" +
@@ -14252,10 +14216,9 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0fmaterialization\x18\f \x01(\x0e2$.cozy.worker.v1.MaterializationStateR\x0fmaterialization\x126\n" +
 	"\aserving\x18\r \x01(\x0e2\x1c.cozy.worker.v1.ServingStateR\aserving\x12R\n" +
 	"&retained_fallback_placement_set_digest\x18\x0e \x01(\fR\"retainedFallbackPlacementSetDigest\x12Q\n" +
-	"\vacquisition\x18\x0f \x01(\v2/.cozy.worker.v1.PlacementAcquisitionObservationR\vacquisition\x126\n" +
-	"\x17package_revision_digest\x18\x10 \x01(\tR\x15packageRevisionDigest\x12-\n" +
+	"\vacquisition\x18\x0f \x01(\v2/.cozy.worker.v1.PlacementAcquisitionObservationR\vacquisition\x12-\n" +
 	"\x12environment_digest\x18\x11 \x01(\tR\x11environmentDigest\x12$\n" +
-	"\x0edevice_lane_id\x18\x13 \x01(\tR\fdeviceLaneIdJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x05\x10\x06J\x04\b\x12\x10\x13R\rconfig_digest\"\xa7\x01\n" +
+	"\x0edevice_lane_id\x18\x13 \x01(\tR\fdeviceLaneIdJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x05\x10\x06J\x04\b\x10\x10\x11J\x04\b\x12\x10\x13R\x17package_revision_digestR\rconfig_digest\"\xa7\x01\n" +
 	"\x1fPlacementAcquisitionObservation\x12C\n" +
 	"\apackage\x18\x01 \x01(\v2).cozy.worker.v1.AcquisitionLegObservationR\apackage\x12?\n" +
 	"\x05model\x18\x02 \x01(\v2).cozy.worker.v1.AcquisitionLegObservationR\x05model\"\xc9\x01\n" +
@@ -14781,9 +14744,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\fcontent_type\x18\b \x01(\tR\vcontentType\x12\x12\n" +
 	"\x04data\x18\t \x01(\fR\x04data\x12!\n" +
 	"\fplacement_id\x18\n" +
-	" \x01(\tR\vplacementIdJ\x04\b\x04\x10\x05\"\xe2\x03\n" +
-	"\x0eInvocationSpec\x126\n" +
-	"\x17package_revision_digest\x18\x01 \x01(\tR\x15packageRevisionDigest\x12-\n" +
+	" \x01(\tR\vplacementIdJ\x04\b\x04\x10\x05\"\xc9\x03\n" +
+	"\x0eInvocationSpec\x12-\n" +
 	"\x12environment_digest\x18\x02 \x01(\tR\x11environmentDigest\x12%\n" +
 	"\x0epayload_digest\x18\x04 \x01(\tR\rpayloadDigest\x124\n" +
 	"\x06inputs\x18\x05 \x03(\v2\x1c.cozy.worker.v1.InputBindingR\x06inputs\x127\n" +
@@ -14791,7 +14753,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x10deadline_unix_ms\x18\a \x01(\x04R\x0edeadlineUnixMs\x12A\n" +
 	"\aserving\x18\b \x01(\v2%.cozy.worker.v1.ServingInvocationSpecH\x00R\aserving\x125\n" +
 	"\x03job\x18\t \x01(\v2!.cozy.worker.v1.JobInvocationSpecH\x00R\x03jobB\x06\n" +
-	"\x04specJ\x04\b\x03\x10\x04R\x12package_release_idR\rconfig_digest\"\x8c\x01\n" +
+	"\x04specJ\x04\b\x01\x10\x02J\x04\b\x03\x10\x04R\x17package_revision_digestR\x12package_release_idR\rconfig_digest\"\x8c\x01\n" +
 	"\fInputBinding\x12\x19\n" +
 	"\binput_id\x18\x01 \x01(\tR\ainputId\x12\x16\n" +
 	"\x06digest\x18\x02 \x01(\tR\x06digest\x12\x16\n" +
@@ -14918,13 +14880,14 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\n" +
 	"subject_id\x18\x01 \x01(\tR\tsubjectId\x120\n" +
 	"\x14write_receipt_digest\x18\x04 \x01(\fR\x12writeReceiptDigest\x12\x16\n" +
-	"\x06length\x18\x03 \x01(\x04R\x06lengthJ\x04\b\x02\x10\x03*\xd7\x01\n" +
+	"\x06length\x18\x03 \x01(\x04R\x06lengthJ\x04\b\x02\x10\x03*\x82\x02\n" +
 	"\x11LocalDownloadKind\x12#\n" +
 	"\x1fLOCAL_DOWNLOAD_KIND_UNSPECIFIED\x10\x00\x12%\n" +
 	"!LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL\x10\x01\x12(\n" +
 	"$LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL\x10\x02\x12&\n" +
 	"\"LOCAL_DOWNLOAD_KIND_MODEL_MANIFEST\x10\x03\x12$\n" +
-	" LOCAL_DOWNLOAD_KIND_MODEL_OBJECT\x10\x04*O\n" +
+	" LOCAL_DOWNLOAD_KIND_MODEL_OBJECT\x10\x04\x12)\n" +
+	"%LOCAL_DOWNLOAD_KIND_PACKAGE_INTERFACE\x10\x05*O\n" +
 	"\aPosture\x12\x17\n" +
 	"\x13POSTURE_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11POSTURE_ACCEPTING\x10\x01\x12\x14\n" +
@@ -15431,7 +15394,7 @@ var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	80,  // 83: cozy.worker.v1.DesiredLocalPackageSet.package:type_name -> cozy.worker.v1.DevelopmentPackage
 	68,  // 84: cozy.worker.v1.DesiredLocalPackageSet.files:type_name -> cozy.worker.v1.LocalPackageFileRef
 	0,   // 85: cozy.worker.v1.LocalPackageFileRef.kind:type_name -> cozy.worker.v1.LocalDownloadKind
-	77,  // 86: cozy.worker.v1.LocalPackageRevision.package_descriptor:type_name -> cozy.worker.v1.Ref
+	77,  // 86: cozy.worker.v1.LocalPackageRevision.package_interface:type_name -> cozy.worker.v1.Ref
 	68,  // 87: cozy.worker.v1.LocalPackageRevision.files:type_name -> cozy.worker.v1.LocalPackageFileRef
 	71,  // 88: cozy.worker.v1.DesiredPlacementSet.device_pins:type_name -> cozy.worker.v1.PlacementDevicePin
 	76,  // 89: cozy.worker.v1.PlacementSet.placements:type_name -> cozy.worker.v1.Placement
@@ -15439,7 +15402,7 @@ var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	75,  // 91: cozy.worker.v1.DownloadDelegation.packages:type_name -> cozy.worker.v1.DownloadPackageRef
 	79,  // 92: cozy.worker.v1.Placement.package:type_name -> cozy.worker.v1.PackageSelection
 	80,  // 93: cozy.worker.v1.Placement.development:type_name -> cozy.worker.v1.DevelopmentPackage
-	77,  // 94: cozy.worker.v1.Placement.package_descriptor:type_name -> cozy.worker.v1.Ref
+	77,  // 94: cozy.worker.v1.Placement.package_interface:type_name -> cozy.worker.v1.Ref
 	82,  // 95: cozy.worker.v1.Placement.models:type_name -> cozy.worker.v1.Model
 	83,  // 96: cozy.worker.v1.Placement.entrypoints:type_name -> cozy.worker.v1.Entrypoint
 	81,  // 97: cozy.worker.v1.Placement.environment:type_name -> cozy.worker.v1.Environment

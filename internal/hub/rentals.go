@@ -77,7 +77,7 @@ type Rental struct {
 	HourlyRateUSDMicros int64
 }
 
-// ExactDocument is the package descriptor returned with exact wheel downloads.
+// ExactDocument is the package interface returned with exact wheel downloads.
 type ExactDocument struct {
 	CanonicalBytes []byte `json:"canonical_bytes"`
 	Digest         string `json:"digest"`

@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS request_output_exports (
 )`
 
 // OutputExportEntry is one pre-execution output contract derived from the package
-// descriptor: which result field, and the one media type its bytes must carry. The
+// PackageInterface: which result field, and the one media type its bytes must carry. The
 // filename is not here — it is the verified file's own content digest plus the media
 // type's extension, known only once the terminal is accepted, and never a terminal's
 // to supply.

@@ -13,7 +13,8 @@ import (
 // TestRecordsMigrationFromEleven migrates a REAL schema-11 database — the exact released
 // DDL, dumped from that schema's own sqlite_master and checked in beside this test — and
 // proves the schema-12 rename, the schema-13 rental column, the schema-14 export table,
-// the schema-15 request column spelling, and the schema-17 machine-word backfill carried
+// the schema-15 request column spelling, schema-17 machine-word backfill, and schema-20
+// package-interface/digest cleanup carried
 // their rows. The owner's
 // machine holds one of these, so the property under test is not "a fresh database has the
 // new names" but "an existing database keeps its installs, pins, workers, requests and
@@ -51,14 +52,15 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 19 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 20 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	// The request keeps the schema-15 local_package spelling, schema 17 records
-	// the machine word, and schema 19 deletes the duplicate config digest.
+	// the machine word, schema 19 deletes the duplicate config digest, and schema 20
+	// deletes the obsolete aggregate package revision digest.
 	if columns := columnNames(t, db, "requests"); !columns["local_package_digest"] ||
 		!columns["local_package_uploaded_boot_id"] || columns["private_package_digest"] ||
-		!columns["machine"] || columns["config_digest"] {
+		!columns["machine"] || columns["config_digest"] || columns["package_revision_digest"] {
 		t.Fatalf("requests columns after migration = %v", columns)
 	}
 	// Schema 17 backfill: a row whose rental row survives gets that rental's machine
@@ -74,9 +76,12 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	for table, want := range map[string]string{"pins": "install_id", "worker_processes": "install_id"} {
 		columns := columnNames(t, db, table)
-		if !columns[want] || columns["generation"] {
+		if !columns[want] || columns["generation"] || columns["package_revision_digest"] {
 			t.Fatalf("%s columns after migration = %v", table, columns)
 		}
+	}
+	if columns := columnNames(t, db, "installs"); !columns["package_interface"] || columns["package_descriptor"] {
+		t.Fatalf("installs columns after migration = %v", columns)
 	}
 	var tables int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master

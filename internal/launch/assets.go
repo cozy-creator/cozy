@@ -42,7 +42,7 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 			return nil, nil, e
 		}
 		// The same case-insensitive NAME fold ParsePayload applies (canonicalFieldKey):
-		// the top-level segment folds onto the descriptor's spelling, so the binding,
+		// the top-level segment folds onto the PackageInterface's spelling, so the binding,
 		// the payload ref, and the worker-protocol input id all carry the canonical name.
 		folded, e := canonicalFieldKey(ep, parts[0])
 		if e != nil {
@@ -62,7 +62,7 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 		if !assetAt(ep.Request, parts) {
 			return nil, nil, exit.New(exit.Validation,
 				"%s.%s is not an asset field in this release's request schema", ep.Name, fieldPath).
-				WithRemedy("the installed package.descriptor.json declares %s's request schema", ep.Name)
+				WithRemedy("the installed package.package-interface.json declares %s's request schema", ep.Name)
 		}
 		assetSpec, _ := AssetSpec(ep, fieldPath)
 		maxBytes := assetSpec.MaxBytes
@@ -117,7 +117,7 @@ func assetPath(path string) ([]string, *exit.Error) {
 	for _, part := range parts {
 		if part == "" || strings.ContainsAny(part, `/\\`) {
 			return nil, exit.Usagef("--asset field path %q is malformed", path).
-				WithRemedy("use descriptor field names separated by dots; list positions are decimal indexes")
+				WithRemedy("use package-interface field names separated by dots; list positions are decimal indexes")
 		}
 	}
 	return parts, nil

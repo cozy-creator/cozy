@@ -71,19 +71,19 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		return exit.Usagef("--timeout requires --await").
 			WithRemedy("a detached run has no client waiting to enforce a caller deadline")
 	}
-	target, descriptor, problem := invocationTarget(ctx)
+	target, packageInterface, problem := invocationTarget(ctx)
 	if problem != nil {
 		return problem
 	}
 	if target.Function == "" {
-		return emitFunctions(ctx, target, descriptor)
+		return emitFunctions(ctx, target, packageInterface)
 	}
-	callable, problem := descriptor.Function(target.Function)
+	callable, problem := packageInterface.Function(target.Function)
 	if problem != nil {
-		return unknownFunction(target, descriptor)
+		return unknownFunction(target, packageInterface)
 	}
 	if ctx.Inv.Bool("--describe") {
-		return emitDescribe(ctx, target, descriptor, callable)
+		return emitDescribe(ctx, target, packageInterface, callable)
 	}
 	if callable.Kind != "job" {
 		if len(ctx.Inv.Values["--input"]) > 0 {
@@ -182,7 +182,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	handle, e := c.Submit(api.Submission{
 		Package: target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
-		Release: target.Release, ReleaseDigest: target.ReleaseDigest, Rental: managedRental,
+		Release: target.Release, Rental: managedRental,
 		RentalRequired:  ctx.Inv.Bool("--rental-only"),
 		Models:          models,
 		OutputDirectory: outputDirectory,
@@ -1984,11 +1984,10 @@ func finalizeInputPayload(ep *launch.Entrypoint, input json.RawMessage,
 
 // Target is one installed package and optional callable selected for invocation.
 type Target struct {
-	Package       string
-	Function      string
-	InstallID     string
-	Release       string
-	ReleaseDigest string
+	Package   string
+	Function  string
+	InstallID string
+	Release   string
 }
 
 // parseTarget reads the user-facing package grammar. Versions are flags, not path
@@ -2016,7 +2015,7 @@ func parseTarget(raw string) (Target, *exit.Error) {
 	return target, nil
 }
 
-func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Error) {
+func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) {
 	target, problem := parseTarget(ctx.Inv.Args[0])
 	if problem != nil {
 		return Target{}, nil, problem
@@ -2028,8 +2027,7 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 		}
 		target.InstallID = facts.Install.ID
 		target.Release = facts.Install.Version
-		target.ReleaseDigest = facts.Install.SourceDigest
-		return target, facts.PackageDescriptor, nil
+		return target, facts.PackageInterface, nil
 	}
 	if rentalRequested(ctx) {
 		ref, problem := hub.ParseRef(target.Package)
@@ -2051,19 +2049,18 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 		if problem != nil {
 			return Target{}, nil, problem
 		}
-		descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
-		if problem != nil || descriptor.Digest != detail.Release.PackageDescriptorDigest ||
-			detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
-			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_descriptor_invalid",
-				"Tensorhub returned an invalid package descriptor")
+		packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
+		if problem != nil || packageInterface.Digest != detail.Release.PackageInterfaceDigest ||
+			detail.Release.PackageInterfaceLength != int64(len(detail.PackageInterface)) {
+			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_interface_invalid",
+				"Tensorhub returned an invalid package interface")
 		}
-		if _, err := canonical.Raw(detail.Release.ReleaseDigest); err != nil ||
-			detail.Release.Release != release {
+		if detail.Release.Release != release {
 			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_release_invalid",
 				"Tensorhub returned no immutable package release identity")
 		}
-		target.Release, target.ReleaseDigest = release, detail.Release.ReleaseDigest
-		return target, descriptor, nil
+		target.Release = release
+		return target, packageInterface, nil
 	}
 	facts, problem := activeInstallFacts(ctx, target.Package)
 	if problem != nil && problem.Code == exit.NotFound {
@@ -2076,7 +2073,7 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 		return Target{}, nil, problem
 	}
 	target.InstallID = facts.Install.ID
-	return target, facts.PackageDescriptor, nil
+	return target, facts.PackageInterface, nil
 }
 
 func newestPackageRelease(releases []hub.ReleaseSummary, majors ...int) (string, *exit.Error) {
@@ -2118,16 +2115,16 @@ func newestPackageRelease(releases []hub.ReleaseSummary, majors ...int) (string,
 	return best, nil
 }
 
-// emitDescribe prints the callable's contract from the descriptor — the SAME facts
+// emitDescribe prints the callable's contract from the PackageInterface — the SAME facts
 // submit validates the payload against (cl-105/cl-106), rendered by the one contract
 // printer. JSON mode emits the raw request struct verbatim.
-func emitDescribe(ctx *Context, target Target, descriptor *launch.PackageDescriptor,
+func emitDescribe(ctx *Context, target Target, packageInterface *launch.PackageInterface,
 	ep *launch.Entrypoint,
 ) *exit.Error {
 	if ctx.Mode().JSON {
-		raw, ok := descriptor.RawRequest(ep.Name)
+		raw, ok := packageInterface.RawRequest(ep.Name)
 		if !ok {
-			return exit.Internalf("the descriptor does not carry %s's request struct", ep.Name)
+			return exit.Internalf("the package interface does not carry %s's request struct", ep.Name)
 		}
 		fmt.Fprintln(ctx.Out, string(raw))
 		return nil
@@ -2155,9 +2152,9 @@ func describeBindings(ctx *Context, target Target, ep *launch.Entrypoint) map[st
 	return out
 }
 
-func emitFunctions(ctx *Context, target Target, descriptor *launch.PackageDescriptor) *exit.Error {
+func emitFunctions(ctx *Context, target Target, packageInterface *launch.PackageInterface) *exit.Error {
 	list := output.List{Name: "functions", Fields: []string{"function"}, AllFields: []string{"function"}}
-	for _, name := range descriptor.Names() {
+	for _, name := range packageInterface.Names() {
 		list.Rows = append(list.Rows, map[string]string{"function": name})
 		if len(list.Next) < 2 {
 			list.Next = append(list.Next, "cozy run "+target.Package+"/"+name)
@@ -2166,8 +2163,8 @@ func emitFunctions(ctx *Context, target Target, descriptor *launch.PackageDescri
 	return emit(ctx, list)
 }
 
-func unknownFunction(target Target, descriptor *launch.PackageDescriptor) *exit.Error {
-	names := descriptor.Names()
+func unknownFunction(target Target, packageInterface *launch.PackageInterface) *exit.Error {
+	names := packageInterface.Names()
 	problem := exit.New(exit.NotFound, "%s registers no function %q", target.Package, target.Function)
 	if len(names) == 0 {
 		return problem.WithRemedy("this release registers no callable functions")

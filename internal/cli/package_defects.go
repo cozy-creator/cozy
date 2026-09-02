@@ -1,7 +1,7 @@
 package cli
 
 // cl-078/th-106: the defect relay's entrypoint half. The orchestrator holds no
-// Tensorhub client, so a descriptor-falsifying pod refusal reaches the hub
+// Tensorhub client, so a package-interface-falsifying pod refusal reaches the hub
 // through this owner — carrying the exact creator-signed delegation the
 // download ran under, which is the report's whole chain of authority. The hub's
 // tombstone is idempotent, so this is fire-and-forget: a failure is logged and
@@ -48,7 +48,7 @@ func (o *defectReporter) report(defect orchestrator.ReleaseDefect) {
 		RentalID:            defect.RentalID,
 		DelegationBase64URL: base64.RawURLEncoding.EncodeToString(defect.Delegation),
 		SignatureBase64URL:  base64.RawURLEncoding.EncodeToString(defect.Signature),
-	}, "descriptor-falsifying refusal on rental "+defect.RentalID)
+	}, "package-interface-falsifying refusal on rental "+defect.RentalID)
 	if problem != nil {
 		fmt.Fprintf(o.log, "defect report for %s@%s refused: %s\n",
 			defect.Package, defect.Release, problem.Message)
@@ -70,7 +70,7 @@ func localDefectReporter(cli *Context, ref hub.Ref, release string) func(code, d
 		defer cancel()
 		result, problem := c.ReportPackageDefect(hctx, ref, release, hub.PackageDefectReport{
 			Code: code, Detail: detail,
-		}, "descriptor falsification observed during local preparation")
+		}, "package-interface falsification observed during local preparation")
 		if problem != nil {
 			fmt.Fprintf(cli.Err, "defect report for %s@%s refused: %s\n",
 				ref.String(), release, problem.Message)

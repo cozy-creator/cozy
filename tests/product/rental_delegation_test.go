@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -137,7 +136,6 @@ const noBytesLandedRefusal = "refreshed download plan 1 expired with no new byte
 func delegatedPackages() []*pb.DownloadPackageRef {
 	return []*pb.DownloadPackageRef{{
 		Package: "acme/diffusion", Release: "0.4.2",
-		ReleaseDigest: "sha256:" + hex.EncodeToString(make([]byte, 32)),
 	}}
 }
 

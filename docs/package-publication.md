@@ -49,41 +49,39 @@ Cozy refuses `.env*`, credentials, keys, bytecode, and model-weight files instea
 omitting them. It skips VCS directories, virtual environments, caches, editor state, and build
 output. Modified and ordinary untracked files are published normally.
 
-Cozy runs `uv build --wheel` against the current tree. `uv` invokes the
-project's declared PEP 517 backend; Cozy does not maintain another Python
-package builder. Cozy verifies that every local wheel's name and version agrees with its project and
-the parent requirement. It also derives the canonical descriptor with the project's locked
-`cozy-runtime describe` command, and — for every model slot class whose default
-`package.toml [bindings]` entry fully names a checkpoint (model, release, lane) — runs
-`cozy-model-contract-proof` in the same locked venv over the hub-resolved construction
-seed (snapshot, canonical config, hardware variants), producing the slot-facts envelope
-that publishes beside the descriptor (cr-077; per class exactly two facts, the shape-only
-code topology and the acceptable encodings set — the hub validates them statically, never
-executes package code, and grades compatibility on demand). A slot class with no complete
-default is skipped and reported; its preflight answers "no facts" until one is named.
-Each of these runs to its own completion: Cozy waits on the
-child process and reads its exit, and imposes no clock of its own on it.
+Cozy runs `uv build --wheel` against the current tree. `uv` invokes the project's declared
+PEP 517 backend; Cozy does not maintain another Python package builder. Cozy verifies that
+every bundled local wheel's name and version agrees with its project and parent requirement.
+The only publish-time metadata derivation is the project's locked `cozy-runtime describe`;
+its canonical output is published as `metadata/package-interface.json`. Publication derives
+no checkpoint evidence, code topology, tensor requirements, or compatibility cache.
 
-Publication is one small digest-declared transaction (the th-094 shape):
+The uploaded ordinary file tree contains the source paths, the project wheel at
+`artifacts/project/<wheel>`, genuinely bundled dependency wheels at
+`artifacts/dependencies/<wheel>`, and `metadata/package-interface.json`. Registry wheels are
+external locked environment facts and are never re-uploaded.
+
+Publication is one bounded digest-declared session:
 
 1. Cozy checks whether the exact release already exists; a committed replay stops here.
-2. It builds the project wheel, dependency wheels, canonical descriptor, and any evidence,
-   and hashes every subject locally.
-3. `POST /v1/packages/{org}/{name}/publish/{release}` carries the complete declaration —
-   `{digest, path, kind, length}` per subject — and answers each from the store's own HEAD:
-   already present, or one checksum-pinned single-object PUT at its content-addressed key.
+2. It builds the project and bundled dependency wheels, derives the PackageInterface, and hashes
+   every ordinary file locally.
+3. `POST /v1/packages/{org}/{name}/publish/{release}` carries `{files:[{path,digest,length}]}`.
+   Tensorhub journals the declaration under a `publication_id` and answers each file from the
+   store's own HEAD: already present, or one checksum-pinned single-object PUT.
 4. Cozy PUTs only the absent subjects; a 412 stands as success (the key already holds these
    exact bytes), so an unchanged republish uploads nothing.
-5. It finalizes with the same declaration plus the registry lock rows; Tensorhub streams and
-   re-hashes every stored subject itself, fetches the registry wheels, validates the
-   descriptor and evidence grammars in full, and commits one `cozy.package.manifest/1`.
+5. It finalizes with `{publication_id,registry:[...]}`. Tensorhub streams and re-hashes the
+   session's stored files, fetches registry wheels, validates the PackageInterface and wheel
+   environment, and atomically commits the immutable release and ordinary file rows in Postgres.
+   There is no package manifest, aggregate release digest, or committed marker object.
 
 A committed replay skips every build and upload. At most 16 outstanding file uploads run concurrently.
 
 The declared digests are claims, never authority: Tensorhub's own hash of the stored bytes
 remains identity, and wrong bytes at any declared digest require a new release id. If a pod
-later derives a different descriptor than the committed one, its typed refusal
-(`package_prepare_descriptor_disagrees`) is relayed to
+later derives a different PackageInterface than the committed one, its typed refusal
+(`package_prepare_interface_disagrees`) is relayed to
 `POST /v1/packages/{org}/{name}/releases/{release}/defects` with the rental's signed
 delegation as the chain of authority, and the release is tombstoned until a corrected one
 is published.

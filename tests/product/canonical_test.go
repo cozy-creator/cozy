@@ -261,17 +261,17 @@ func TestNumberProfile(t *testing.T) {
 	}
 }
 
-// TestPackageDescriptor is the OTHER side of the identity plane: the grammar Runtime
+// TestPackageInterface is the OTHER side of the identity plane: the grammar Runtime
 // authors and Cozy consumes at install. Identity is the canonical content and nothing
-// else, and a descriptor that cannot be read exactly is refused rather than guessed at.
-func TestPackageDescriptor(t *testing.T) {
-	raw := []byte(`{"application":"probe:app","entrypoints":[{"name":"run","request":{"fields":[{"constraints":{"gt":0},"name":"strength","type":"float"},{"name":"mode","type":{"literal":["fast","quality"]}}]},"result":{"fields":[]}}],"format":"cozy.package.descriptor/1","jobs":[]}`)
+// else, and a PackageInterface that cannot be read exactly is refused rather than guessed at.
+func TestPackageInterface(t *testing.T) {
+	raw := []byte(`{"application":"probe:app","entrypoints":[{"name":"run","request":{"fields":[{"constraints":{"gt":0},"name":"strength","type":"float"},{"name":"mode","type":{"literal":["fast","quality"]}}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`)
 	want, err := canonical.Spell(canonical.Digest(raw))
 	must(t, err)
-	doc, problem := launch.DecodeDescriptor(raw)
+	doc, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
 	if doc.Digest != want {
-		t.Fatalf("descriptor identity %s != %s", doc.Digest, want)
+		t.Fatalf("package-interface identity %s != %s", doc.Digest, want)
 	}
 	if len(doc.Entrypoints) != 1 || doc.Entrypoints[0].Kind != "entrypoint" {
 		t.Fatalf("entrypoint kind is not inferred from collection membership: %+v", doc.Entrypoints)
@@ -290,16 +290,16 @@ func TestPackageDescriptor(t *testing.T) {
 	// Whitespace and key order are NOT identity; a meaning change is.
 	for _, same := range [][]byte{
 		bytes.Replace(raw, []byte(`,"entrypoints"`), []byte(", \"entrypoints\""), 1),
-		[]byte(`{"jobs":[],"format":"cozy.package.descriptor/1","entrypoints":[{"result":{"fields":[]},"request":{"fields":[{"type":"float","name":"strength","constraints":{"gt":0}},{"type":{"literal":["fast","quality"]},"name":"mode"}]},"name":"run"}],"application":"probe:app"}`),
+		[]byte(`{"jobs":[],"format":"cozy.package.interface/1","entrypoints":[{"result":{"fields":[]},"request":{"fields":[{"type":"float","name":"strength","constraints":{"gt":0}},{"type":{"literal":["fast","quality"]},"name":"mode"}]},"name":"run"}],"application":"probe:app"}`),
 	} {
-		got, problem := launch.DecodeDescriptor(same)
+		got, problem := launch.DecodePackageInterface(same)
 		if problem != nil || got.Digest != want || !bytes.Equal(got.Raw, raw) {
-			t.Errorf("a spelling change moved descriptor identity: %v", problem)
+			t.Errorf("a spelling change moved package-interface identity: %v", problem)
 		}
 	}
 	changed := bytes.Replace(raw, []byte(`"name":"run"`), []byte(`"name":"other"`), 1)
-	if got, problem := launch.DecodeDescriptor(changed); problem != nil || got.Digest == want {
-		t.Error("a meaning change did not move descriptor identity")
+	if got, problem := launch.DecodePackageInterface(changed); problem != nil || got.Digest == want {
+		t.Error("a meaning change did not move package-interface identity")
 	}
 	for name, planted := range map[string][]byte{
 		"duplicate key": bytes.Replace(raw, []byte(`{"application"`),
@@ -319,15 +319,15 @@ func TestPackageDescriptor(t *testing.T) {
 		"retired model production graph": bytes.Replace(raw, []byte(`"jobs":[]`),
 			[]byte(`"jobs":[],"model_productions":[]`), 1),
 	} {
-		if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {
-			t.Errorf("%s was accepted at the descriptor boundary", name)
+		if _, refusal := launch.DecodePackageInterface(planted); refusal == nil {
+			t.Errorf("%s was accepted at the package-interface boundary", name)
 		}
 	}
 
 	// Model inputs are not hardware facts: this job could transform their TensorFS bytes on
 	// CPU. The immutable release dependency set selects the machine class instead.
-	gpuRaw := []byte(`{"application":"h3:tools","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"H3Dits","component_use":{},"path":"four_lane.models.dits","stamps":{}}],"name":"four_lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
-	gpuDescriptor, problem := launch.DecodeDescriptor(gpuRaw)
+	gpuRaw := []byte(`{"application":"h3:tools","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"H3Dits","component_use":{},"path":"four_lane.models.dits","stamps":{}}],"name":"four_lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+	gpuDescriptor, problem := launch.DecodePackageInterface(gpuRaw)
 	fatal(t, problem)
 	_, problem = gpuDescriptor.Function("four_lane")
 	fatal(t, problem)
@@ -336,8 +336,8 @@ func TestPackageDescriptor(t *testing.T) {
 	}) {
 		t.Fatal("the SDXL TensorFS/NumPy release selected accelerator capacity")
 	}
-	cpuRaw := []byte(`{"application":"probe:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"name":"scan","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
-	cpuDescriptor, problem := launch.DecodeDescriptor(cpuRaw)
+	cpuRaw := []byte(`{"application":"probe:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"name":"scan","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+	cpuDescriptor, problem := launch.DecodePackageInterface(cpuRaw)
 	fatal(t, problem)
 	_, problem = cpuDescriptor.Function("scan")
 	fatal(t, problem)
@@ -349,19 +349,19 @@ func TestPackageDescriptor(t *testing.T) {
 	}
 	authoredResources := bytes.Replace(cpuRaw, []byte(`"publishes":false`),
 		[]byte(`"publishes":false,"resources":{"gpu_count":1,"requires":"sm90+"}`), 1)
-	if _, refusal := launch.DecodeDescriptor(authoredResources); refusal == nil {
+	if _, refusal := launch.DecodePackageInterface(authoredResources); refusal == nil {
 		t.Fatal("author-supplied resource requirements were accepted")
 	}
 }
 
 // TestDynamicProducerOutputs is the model-upload dry-run boundary. The selected
-// source determines the exact header; the descriptor and intent agree only on
+// source determines the exact header; the PackageInterface and intent agree only on
 // output slot names, never a duplicate topology contract.
 func TestDynamicProducerOutputs(t *testing.T) {
-	raw := []byte(`{"application":"quantize:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"QuantizationSource","component_use":{},"path":"produce.models.source","stamps":{}}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"mxfp8"}]}]}`)
-	descriptor, problem := launch.DecodeDescriptor(raw)
+	raw := []byte(`{"application":"quantize:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"QuantizationSource","component_use":{},"path":"produce.models.source","stamps":{}}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"mxfp8"}]}]}`)
+	packageInterface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
-	job, problem := descriptor.Function("produce")
+	job, problem := packageInterface.Function("produce")
 	fatal(t, problem)
 	profiles := map[string]string{"source": "civitai/sdxl/single-file/1"}
 	if problem := modeltransfer.ValidateProducer("paul/quantize@v1/produce", job, profiles); problem != nil {
@@ -382,7 +382,7 @@ func TestDynamicProducerOutputs(t *testing.T) {
 	}
 	spec.ModelTransfer.Outputs[0].Name = "other"
 	if problem := modeltransfer.ValidateSubmission(spec); problem == nil {
-		t.Fatal("an intent output absent from the descriptor was accepted")
+		t.Fatal("an intent output absent from the package interface was accepted")
 	}
 	if problem := modeltransfer.ValidateSubmission(orchestrator.Submission{
 		WeightsOutputs: []orchestrator.WeightsOutput{{OutputID: "ordinary-job-output"}},
@@ -391,14 +391,14 @@ func TestDynamicProducerOutputs(t *testing.T) {
 	}
 }
 
-// TestSuppliedSourceProfiles: the descriptor declares no source selection
+// TestSuppliedSourceProfiles: the PackageInterface declares no source selection
 // (cr-077) — --source-profile binds every producer model input at dispatch,
 // refuses when one is missing, and never invents slots.
 func TestSuppliedSourceProfiles(t *testing.T) {
-	raw := []byte(`{"application":"h3:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"H3FullTransformer","component_use":{},"path":"four-lane.models.dits","stamps":{}},{"class":"H3FullTransformer","component_use":{},"path":"four-lane.models.shared","stamps":{}}],"name":"four-lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"full"}]}]}`)
-	descriptor, problem := launch.DecodeDescriptor(raw)
+	raw := []byte(`{"application":"h3:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"H3FullTransformer","component_use":{},"path":"four-lane.models.dits","stamps":{}},{"class":"H3FullTransformer","component_use":{},"path":"four-lane.models.shared","stamps":{}}],"name":"four-lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"full"}]}]}`)
+	packageInterface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
-	job, problem := descriptor.Function("four-lane")
+	job, problem := packageInterface.Function("four-lane")
 	fatal(t, problem)
 
 	if problem := modeltransfer.ValidateProducer("paul/minimax-h3-tools@v2/four-lane", job, nil); problem == nil ||
@@ -418,14 +418,14 @@ func TestSuppliedSourceProfiles(t *testing.T) {
 		t.Fatalf("unknown slot must refuse, got %v", problem)
 	}
 
-	stale := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"models":[{"class":"S","component_use":{},"path":"produce.models.source","source_profile":"civitai/sdxl/single-file/1","stamps":{}}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"}]}]}`)
-	if _, problem := launch.DecodeDescriptor(stale); problem == nil {
-		t.Fatal("a stale descriptor still carrying source_profile must refuse (cr-077 hard cut)")
+	stale := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"S","component_use":{},"path":"produce.models.source","source_profile":"civitai/sdxl/single-file/1","stamps":{}}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"}]}]}`)
+	if _, problem := launch.DecodePackageInterface(stale); problem == nil {
+		t.Fatal("a stale package interface still carrying source_profile must refuse (cr-077 hard cut)")
 	}
 }
 
 // TestSubmissionFillsUndeclaredProfiles mirrors the H3 four-lane dispatch: the
-// published descriptor declares no source selection (cr-077): the caller's
+// published package interface declares no source selection (cr-077): the caller's
 // intent binds every producer model input, and a missing or extra one refuses.
 func TestSubmissionFillsUndeclaredProfiles(t *testing.T) {
 	intent := &records.ModelTransferIntent{Kind: "model-upload", Destination: "paul/minimax-h3",

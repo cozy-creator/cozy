@@ -1,5 +1,5 @@
 // Package install is the staged install transaction (cozy-creator.md function 2):
-// stage → verify source → build venv → verify descriptor → activate the pin in ONE
+// stage → verify source → build venv → verify package interface → activate the pin in ONE
 // database transaction. An install is an IMMUTABLE TREE plus a pin. The active install is
 // never extracted over, rebuilt in place, or mutated; a kill at any pre-activation stage
 // leaves the previous pin runnable.
@@ -58,12 +58,11 @@ type PublishedSource struct {
 	ProjectWheel  PublishedWheel
 	LocalWheels   []PublishedWheel
 	Release       string
-	SourceDigest  string
 	UVLock        ExactDocument
 	Wheels        []PublishedWheel
 	Models        []PublishedModel
 	Selection     Selection
-	// ReportDefect relays a descriptor falsification observed during LOCAL
+	// ReportDefect relays a package-interface falsification observed during LOCAL
 	// preparation (cl-078). Best-effort: the hub's sound authorization wants a
 	// rental chain, which a local install does not hold, so only an
 	// admin-credentialed daemon's report lands; everyone else still refuses the
@@ -122,16 +121,16 @@ type ExactDocument struct {
 }
 
 type Selection struct {
-	PackageDescriptor ExactDocument
+	PackageInterface ExactDocument
 }
 
 func validatePublished(inst records.PackageInstall, published *PublishedSource) *exit.Error {
-	descriptor := published.Selection.PackageDescriptor
-	digest, err := canonical.Raw(descriptor.Digest)
-	if err != nil || descriptor.Length != int64(len(descriptor.Bytes)) ||
-		!bytes.Equal(canonical.Digest(descriptor.Bytes), digest) {
-		return exit.Named(exit.Conflict, "package_descriptor_identity_mismatch",
-			"published descriptor bytes do not match their digest and length")
+	packageInterface := published.Selection.PackageInterface
+	digest, err := canonical.Raw(packageInterface.Digest)
+	if err != nil || packageInterface.Length != int64(len(packageInterface.Bytes)) ||
+		!bytes.Equal(canonical.Digest(packageInterface.Bytes), digest) {
+		return exit.Named(exit.Conflict, "package_interface_identity_mismatch",
+			"published package interface bytes do not match their digest and length")
 	}
 	if published.ProjectWheel.Distribution != inst.Package[strings.LastIndex(inst.Package, "/")+1:] ||
 		published.ProjectWheel.Version != inst.Version ||
@@ -231,7 +230,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	var sourceDir string
 	switch {
 	case req.Published != nil:
-		if req.Published.Package == "" || req.Published.Release == "" || req.Published.SourceDigest == "" ||
+		if req.Published.Package == "" || req.Published.Release == "" ||
 			req.Published.ProjectWheel.Path == "" {
 			return fail(exit.Internalf("published package source is incomplete"))
 		}
@@ -239,7 +238,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		if err := os.MkdirAll(installDir, 0o700); err != nil {
 			return fail(exit.Internalf("cannot create the package install directory: %s", err))
 		}
-		inst.SourceKind, inst.SourceRef, inst.SourceDigest = "tensorhub", req.Published.Package+"@"+req.Published.Release, req.Published.SourceDigest
+		inst.SourceKind, inst.SourceRef = "tensorhub", req.Published.Package+"@"+req.Published.Release
 		inst.Package, inst.Version, inst.ProjectDir = req.Published.Package, req.Published.Release,
 			filepath.Join(installDir, "source")
 		if e := validatePublished(inst, req.Published); e != nil {
@@ -276,7 +275,9 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if e != nil {
 		return fail(e)
 	}
-	if prior != nil && priorInstall != nil && priorInstall.SourceDigest == inst.SourceDigest &&
+	if prior != nil && priorInstall != nil && priorInstall.SourceKind == inst.SourceKind &&
+		priorInstall.Package == inst.Package && priorInstall.Version == inst.Version &&
+		(inst.SourceKind == "tensorhub" || priorInstall.SourceDigest == inst.SourceDigest) &&
 		!CompanionsStale(l.Companions, filepath.Join(priorInstall.Dir, "venv")) {
 		res.Idempotent = true
 		res.Install = *priorInstall
@@ -323,11 +324,11 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 	venvDir := filepath.Join(installDir, "venv")
 	var env *EnvironmentReceipt
-	var descriptor *launch.PackageDescriptor
+	var packageInterface *launch.PackageInterface
 	var placement ExactDocument
 	var err *exit.Error
 	if req.Published != nil {
-		descriptor, placement, inst.Runtime, env, err = preparePublished(l, installDir, req.Published)
+		packageInterface, placement, inst.Runtime, env, err = preparePublished(l, installDir, req.Published)
 	} else {
 		env, err = MaterializeEnvironment(sourceDir, venvDir, l.Companions)
 	}
@@ -340,23 +341,23 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	res.Warnings = append(res.Warnings, env.Warnings...)
 	mark("environment")
 
-	// ---- descriptor: Runtime authored both the imported published surface and its
+	// ---- package interface: Runtime authored both the imported published surface and its
 	// resident placement. Editable source retains its existing development path.
 	if req.Local != nil {
-		descriptor, placement, e = deriveDevelopmentPlacement(
+		packageInterface, placement, e = deriveDevelopmentPlacement(
 			venvDir, sourceDir, l.CAS, *req.Local)
 		if e != nil {
 			return guard(e)
 		}
 	}
-	descriptorPath := launch.DescriptorPath(installDir)
-	if err := os.MkdirAll(filepath.Dir(descriptorPath), 0o700); err != nil {
-		return guard(exit.Internalf("cannot create private descriptor root: %s", err))
+	packageInterfacePath := launch.PackageInterfacePath(installDir)
+	if err := os.MkdirAll(filepath.Dir(packageInterfacePath), 0o700); err != nil {
+		return guard(exit.Internalf("cannot create private package interface root: %s", err))
 	}
-	if err := os.WriteFile(descriptorPath, descriptor.Raw, 0o600); err != nil {
-		return guard(exit.Internalf("cannot store private descriptor: %s", err))
+	if err := os.WriteFile(packageInterfacePath, packageInterface.Raw, 0o600); err != nil {
+		return guard(exit.Internalf("cannot store private package interface: %s", err))
 	}
-	inst.PackageDescriptor = descriptor.Digest
+	inst.PackageInterface = packageInterface.Digest
 	if req.Local != nil {
 		cache := filepath.Join(installDir, "artifact-cache")
 		if err := os.MkdirAll(cache, 0o700); err != nil {
@@ -368,7 +369,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		}
 	}
 	inst.PlacementSetDigest = placement.Digest
-	mark("package_descriptor")
+	mark("package_interface")
 	if req.Local != nil {
 		current, problem := packagepublish.PrepareLocalFrom(sourceDir)
 		if problem != nil {
@@ -399,11 +400,11 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	return res, nil
 }
 
-// deriveDescriptor runs the install's own Runtime over its source. Runtime emits the
-// complete descriptor without writing the source tree; Cozy validates the closed grammar
+// deriveDevelopmentPlacement runs the install's own Runtime over its source. Runtime emits the
+// complete package interface without writing the source tree; Cozy validates the closed grammar
 // and stores the canonical bytes under the immutable install root.
 func deriveDevelopmentPlacement(venvDir, sourceDir, artifactStore string, local LocalSource) (
-	*launch.PackageDescriptor, ExactDocument, *exit.Error,
+	*launch.PackageInterface, ExactDocument, *exit.Error,
 ) {
 	var empty ExactDocument
 	bin := home.VenvTool(venvDir, "cozy-runtime")
@@ -434,11 +435,11 @@ func deriveDevelopmentPlacement(venvDir, sourceDir, artifactStore string, local 
 		Length int64  `json:"length"`
 	}
 	var answer struct {
-		Package           string `json:"package"`
-		Release           string `json:"release"`
-		SourceDigest      string `json:"source_digest"`
-		PlacementSet      exact  `json:"placement_set"`
-		PackageDescriptor exact  `json:"package_descriptor"`
+		Package          string `json:"package"`
+		Release          string `json:"release"`
+		SourceDigest     string `json:"source_digest"`
+		PlacementSet     exact  `json:"placement_set"`
+		PackageInterface exact  `json:"package_interface"`
 	}
 	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
 	decoder.DisallowUnknownFields()
@@ -457,14 +458,14 @@ func deriveDevelopmentPlacement(venvDir, sourceDir, artifactStore string, local 
 		return err == nil && value.Length == int64(len(value.Bytes)) &&
 			bytes.Equal(canonical.Digest(value.Bytes), digest)
 	}
-	if !validExact(answer.PlacementSet) || !validExact(answer.PackageDescriptor) {
+	if !validExact(answer.PlacementSet) || !validExact(answer.PackageInterface) {
 		return nil, empty, exit.Named(exit.Structural, "editable_placement_identity_mismatch",
 			"cozy-runtime development-placement returned bytes that do not match their digest and length")
 	}
-	descriptor, problem := launch.DecodeDescriptor(answer.PackageDescriptor.Bytes)
-	if problem != nil || descriptor.Digest != answer.PackageDescriptor.Digest {
-		return nil, empty, exit.Named(exit.Validation, "descriptor_invalid",
-			"cozy-runtime development-placement returned an invalid package descriptor")
+	packageInterface, problem := launch.DecodePackageInterface(answer.PackageInterface.Bytes)
+	if problem != nil || packageInterface.Digest != answer.PackageInterface.Digest {
+		return nil, empty, exit.Named(exit.Validation, "package_interface_invalid",
+			"cozy-runtime development-placement returned an invalid package interface")
 	}
 	set, readErr := canonical.Read(answer.PlacementSet.Bytes, &pb.PlacementSet{})
 	if readErr != nil || len(set.List("placements")) != 1 {
@@ -475,13 +476,13 @@ func deriveDevelopmentPlacement(venvDir, sourceDir, artifactStore string, local 
 	development := placement.Sub("development")
 	if development.Str("package") != local.Package || development.Str("release") != local.Release ||
 		development.Str("source_digest") != local.SourceDigest ||
-		placement.Sub("package_descriptor").Str("digest") != answer.PackageDescriptor.Digest ||
-		placement.Sub("package_descriptor").Int("length") != answer.PackageDescriptor.Length ||
+		placement.Sub("package_interface").Str("digest") != answer.PackageInterface.Digest ||
+		placement.Sub("package_interface").Int("length") != answer.PackageInterface.Length ||
 		placement.Str("environment_digest") != "" {
 		return nil, empty, exit.Named(exit.Structural, "editable_placement_invalid",
 			"cozy-runtime development PlacementSet mixes local source with published selection facts")
 	}
-	return descriptor, ExactDocument{Bytes: answer.PlacementSet.Bytes,
+	return packageInterface, ExactDocument{Bytes: answer.PlacementSet.Bytes,
 		Digest: answer.PlacementSet.Digest, Length: answer.PlacementSet.Length}, nil
 }
 

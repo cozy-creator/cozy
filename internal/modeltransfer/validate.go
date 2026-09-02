@@ -7,9 +7,9 @@ import (
 )
 
 // ValidateProducer checks only the callable shape model download/upload needs.
-// A producer may leave its output contract open when the exact source determines
-// the topology; TensorFS still derives and verifies the produced checkpoint facts.
-// The descriptor declares no source selection (cr-077): every model input is bound
+// Output tensor schemas depend on the selected source and remain owned by the produced
+// CozyTensors header; publication declares only bounded output slots here.
+// The PackageInterface declares no source selection (cr-077): every model input is bound
 // by the caller's --source-profile at dispatch.
 func ValidateProducer(name string, job *launch.Entrypoint, supplied map[string]string) *exit.Error {
 	if len(job.Models) == 0 {
@@ -43,9 +43,8 @@ func ValidateProducer(name string, job *launch.Entrypoint, supplied map[string]s
 	return nil
 }
 
-// ValidateSubmission binds a model transfer intent to the already-resolved job
-// descriptor. An omitted contract matches only another omission; when a producer
-// declares one, exact topology and encoding equality remains mandatory.
+// ValidateSubmission binds a model-transfer intent to the already-resolved job
+// PackageInterface by model-input and output-slot names only.
 func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 	intent := spec.ModelTransfer
 	if intent == nil {
@@ -63,7 +62,7 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 	}
 	if len(intent.SourceProfiles) == 0 || len(intent.Outputs) != len(spec.WeightsOutputs) ||
 		!profilesCoverParams(intent.SourceProfiles, spec.ProducerParams) {
-		return exit.New(exit.Validation, "producer transfer inputs/outputs do not match the job descriptor")
+		return exit.New(exit.Validation, "producer transfer inputs/outputs do not match the job PackageInterface")
 	}
 	declared := make(map[string]bool, len(spec.WeightsOutputs))
 	for index := range spec.WeightsOutputs {
@@ -73,14 +72,14 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 	for _, output := range intent.Outputs {
 		if !declared[output.Name] {
 			return exit.New(exit.Validation,
-				"producer transfer output %s is absent from its descriptor", output.Name)
+				"producer transfer output %s is absent from its PackageInterface", output.Name)
 		}
 	}
 	return nil
 }
 
 // profilesCoverParams requires the caller's intent (--source-profile) to bind
-// exactly the job's model inputs: the descriptor declares no source selection
+// exactly the job's model inputs: the PackageInterface declares no source selection
 // (cr-077), so dispatch is the one place a producer's sources are named.
 func profilesCoverParams(intent map[string]string, params []string) bool {
 	if len(intent) != len(params) {

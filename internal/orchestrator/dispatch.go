@@ -23,14 +23,12 @@ import (
 // Submission is one local request. The orchestrator owns everything in it that decides
 // WHAT runs; the runtime owns everything about HOW.
 type Submission struct {
-	IdemKey       string // the caller's idempotency key
-	Package       string // org/name
-	Entrypoint    string // the function
-	PlanID        string // the entrypoint_binding_plan_id this attempt binds
-	Release       string // immutable remote package release; empty for local execution
-	ReleaseDigest string // exact remote release.json identity
+	IdemKey    string // the caller's idempotency key
+	Package    string // org/name
+	Entrypoint string // the function
+	PlanID     string // the entrypoint_binding_plan_id this attempt binds
+	Release    string // immutable remote package release; empty for local execution
 	// LocalPackageDigest is the exact staged wheel-set identity for one editable rental.
-	// ReleaseDigest remains Runtime's source identity; this names the carriers.
 	LocalPackageDigest string
 	Models             []ModelRef
 
@@ -76,7 +74,7 @@ type Submission struct {
 	// through Options.Rentals). Empty = any local worker.
 	Worker string
 	// InstallID pins a durable request to one immutable local install resolution.
-	// Remote requests instead carry Release and ReleaseDigest.
+	// Remote requests instead carry their immutable Release.
 	InstallID string
 	// Rental authorizes placement on Creator-managed rented capacity.
 	Rental bool
@@ -226,7 +224,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	req := records.Request{
 		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
 		Package: s.Package, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
-		Release: s.Release, PackageRevisionDigest: s.ReleaseDigest,
+		Release:            s.Release,
 		LocalPackageDigest: s.LocalPackageDigest,
 		Outputs:            strings.Join(s.Outputs, ","),
 		Assets:             s.Assets, WeightsOutputs: string(weightsBytes),
@@ -244,7 +242,6 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		event["rental"] = true
 		event["rental_required"] = s.RentalRequired
 		event["release"] = s.Release
-		event["release_digest"] = s.ReleaseDigest
 		if s.LocalPackageDigest != "" {
 			event["local_package_digest"] = s.LocalPackageDigest
 		}
@@ -720,7 +717,7 @@ func (c *Orchestrator) rentalHeld(req records.Request) bool {
 			}
 			continue
 		}
-		if w.remoteStaged(slot, req.PlanID, remoteRevision(req)) {
+		if w.remoteStaged(slot, req.PlanID, req.Release, req.LocalPackageDigest) {
 			return true
 		}
 	}
@@ -771,20 +768,10 @@ func staged(w *worker, planID string) bool {
 
 func stagedFor(w *worker, req records.Request) bool {
 	if req.Worker != "" && w.spec.Connection != nil && !req.IsJob() {
-		return w.remoteStaged(pinnedPackage(req.Package, req.Worker), req.PlanID, remoteRevision(req))
+		return w.remoteStaged(pinnedPackage(req.Package, req.Worker), req.PlanID,
+			req.Release, req.LocalPackageDigest)
 	}
 	return staged(w, req.PlanID)
-}
-
-// remoteRevision is the exact package revision a rental request binds: the sealed private
-// revision of an editable install, or the immutable published release digest. A placement
-// the pod holds under the same plan id for an EARLIER revision of the same package — an
-// edit that left the descriptor alone — is not this request's code.
-func remoteRevision(req records.Request) string {
-	if req.LocalPackageDigest != "" {
-		return req.LocalPackageDigest
-	}
-	return req.PackageRevisionDigest
 }
 
 // settledState answers whether the authority has already recorded this request's outcome.
@@ -841,15 +828,15 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		return WorkerLaunchSpec{}, "", exit.Named(exit.Internal, "rental.target_incomplete",
 			"rental %s resolved without a complete remote target", req.Worker)
 	}
-	if req.Release == "" || !validDigest(req.PackageRevisionDigest) ||
+	if req.Release == "" ||
 		(len(req.Models) == 0 && !validDigest(req.PlanID)) {
 		return WorkerLaunchSpec{}, "", exit.Unavailablef(
 			"remote package preparation requires one exact package revision")
 	}
 	logical := LogicalPackage{Package: req.Package, Release: req.Release,
-		ReleaseDigest: req.PackageRevisionDigest, Function: req.Entrypoint,
-		Outputs: strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
-		PlanID:  req.PlanID, Models: append([]ModelRef(nil), req.Models...),
+		Function: req.Entrypoint,
+		Outputs:  strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
+		PlanID:   req.PlanID, Models: append([]ModelRef(nil), req.Models...),
 		NeedsAccelerator: req.NeedsAccelerator}
 	instance, _, _, e := c.EnsureRental(req.Worker)
 	if e != nil {
@@ -866,7 +853,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 			return WorkerLaunchSpec{}, "", problem
 		}
 		if revision.Package != req.Package || revision.Release != req.Release ||
-			revision.SourceDigest != req.PackageRevisionDigest || revision.Digest != req.LocalPackageDigest {
+			revision.Digest != req.LocalPackageDigest {
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict,
 				"local_package_revision_changed",
 				"request %s no longer matches its sealed local package revision", req.ID)
@@ -877,7 +864,6 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 			}); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
-		logical.ReleaseDigest = req.LocalPackageDigest
 		if !req.IsJob() && len(logical.Models) > 0 {
 			models := downloadModelRefs(logical.Models)
 			if len(models) != len(logical.Models) {
@@ -896,7 +882,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 				"published remote package preparation requires a package_set signer")
 		}
 		if e := c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
-			Package: logical.Package, Release: logical.Release, ReleaseDigest: logical.ReleaseDigest,
+			Package: logical.Package, Release: logical.Release,
 		}}, downloadModelRefs(logical.Models)); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
@@ -905,13 +891,24 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		if e := c.waitPackageStaged(instance); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
+		c.mu.Lock()
+		preparedSet := ""
+		if worker := c.workers[instance]; worker != nil {
+			preparedSet = spellOf(worker.setDigest)
+		}
+		c.mu.Unlock()
+		if !validDigest(preparedSet) {
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
+				"rental.package_preparation_identity_missing",
+				"the rented worker staged %s without an exact PlacementSet", req.Package)
+		}
 		weights, e := decodeWeightsOutputs(req.WeightsOutputs)
 		if e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
 		spec := WorkerLaunchSpec{Connection: remote.Connection, Placement: DesiredPlacement{
 			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
-			PackageRevisionDigest: logical.ReleaseDigest,
+			PlacementSetDigest: preparedSet,
 			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,
 				Outputs:        strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
 				WeightsOutputs: weights, RSSCap: DefaultJobRSSCap,
@@ -935,8 +932,7 @@ func (c *Orchestrator) exactLocalTransferProducer(req records.Request, spec Work
 	if problem != nil {
 		return spec, req.PlanID, problem
 	}
-	if req.Release != "" && (spec.Placement.Release != req.Release ||
-		spec.Placement.PackageRevisionDigest != req.PackageRevisionDigest) {
+	if req.Release != "" && spec.Placement.Release != req.Release {
 		return WorkerLaunchSpec{}, req.PlanID, exit.Unavailablef(
 			"local producer does not exactly match frozen %s@%s", req.Package, req.Release)
 	}
@@ -1071,8 +1067,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		target.routed.pinned = rentalID
 	}
 	if req.ModelTransfer != nil && req.Rental && w.spec.Connection == nil && req.Release != "" &&
-		(w.spec.Placement.Release != req.Release ||
-			w.spec.Placement.PackageRevisionDigest != req.PackageRevisionDigest) {
+		w.spec.Placement.Release != req.Release {
 		return 0, exit.Unavailablef("ready local producer does not exactly match frozen %s@%s",
 			req.Package, req.Release)
 	}
@@ -1087,7 +1082,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// the payload digest, the ORDERED input identities, the output contracts, the
 	// deadline — lives INSIDE the digest. Its key set is closed: no human model ref, no
 	// service class, no local extension has a slot.
-	packageRevision, environmentDigest, e := c.invocationIdentity(w, req)
+	environmentDigest, e := c.invocationIdentity(w, req)
 	if e != nil {
 		return 0, e
 	}
@@ -1098,7 +1093,6 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	payloadDigest := spellOf(canonical.Digest(req.Payload))
 	outputLimit := c.maxOutputBytes()
 	spec := &pb.InvocationSpec{
-		PackageRevisionDigest: packageRevision,
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
 		// for a native install with no OCI image at all. The value is the same one this
 		// daemon was frozen with — a request cannot choose the environment it runs under.
@@ -1118,7 +1112,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		// request's scratch repo, which is why a queue-serving worker can hold one
 		// directive and still publish each attempt into its own place.
 		spec.Spec = &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{
-			BuildId:         w.spec.Placement.PackageRevisionDigest,
+			BuildId:         w.spec.Placement.PlacementSetDigest,
 			JobDescriptorId: req.PlanID,
 			PublicationContract: &pb.PublicationContract{
 				GrantId: home.ScratchRepo(req.Org, req.ID),
@@ -1261,13 +1255,13 @@ func (c *Orchestrator) maxOutputBytes() uint64 {
 	return uint64(maxBytes) << 20
 }
 
-// invocationIdentity names the environment and optional local config digest an
+// invocationIdentity names the exact environment an
 // invocation on w rides. Remote identity becomes durable here, after a dispatchable
 // worker is selected and before the attempt ordinal is minted. Cold and warm requests
 // therefore have one writer: neither package preparation nor rental selection needs a
 // second identity path.
 func (c *Orchestrator) invocationIdentity(w *worker,
-	req records.Request) (packageRevision, environment string, e *exit.Error) {
+	req records.Request) (environment string, e *exit.Error) {
 	c.mu.Lock()
 	placement, remote, instanceID := w.spec.Placement, w.spec.Connection != nil, w.instanceID
 	if selected, ok := w.remotePlacements[remotePlanKey(
@@ -1275,32 +1269,23 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 		placement = selected
 	}
 	c.mu.Unlock()
-	packageRevision = placement.PackageRevisionDigest
+	if remote && (placement.Release != req.Release ||
+		(req.LocalPackageDigest != "" && placement.LocalRevisionDigest != req.LocalPackageDigest)) {
+		return "", exit.Named(exit.Conflict, "request_invocation_identity_changed",
+			"worker %s no longer matches the release pinned to request %s", instanceID, req.ID)
+	}
 	if req.IsJob() && remote {
-		expected := remoteRevision(req)
-		if expected == "" || expected != packageRevision {
-			return "", "", exit.Named(exit.Conflict,
-				"request_invocation_identity_changed",
-				"worker %s no longer matches the job release pinned to request %s", instanceID, req.ID)
-		}
-		return packageRevision, "", nil
+		return "", nil
 	}
 	environment = placement.EnvironmentDigest
 	if environment == "" {
 		if !remote && placement.SourceDigest != "" {
-			return packageRevision, "", nil
+			return "", nil
 		}
-		return "", "", exit.Named(exit.Structural, "placement_identity_missing",
+		return "", exit.Named(exit.Structural, "placement_identity_missing",
 			"worker %s carries no selected environment digest", instanceID)
 	}
 	if remote {
-		expected := remoteRevision(req)
-		if expected == "" || expected != packageRevision {
-			return "", "", exit.Named(exit.Conflict,
-				"request_invocation_identity_changed",
-				"worker %s no longer matches the invocation identity pinned to request %s",
-				instanceID, req.ID)
-		}
 		// A local revision is DEVELOPMENT execution on the pod, and development execution
 		// has no published Environment identity: the worker refuses a spec that names one
 		// (development_environment_present). The pod's prepared Environment is still bound
@@ -1310,27 +1295,21 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 			specEnvironment = ""
 		}
 		if req.EnvironmentDigest == "" {
-			if req.LocalPackageDigest != "" {
-				e = c.opt.Store.BindLocalRemoteInvocation(req.ID, req.PlanID,
-					packageRevision, environment)
-			} else {
-				e = c.opt.Store.BindRemoteInvocation(req.ID, req.PlanID,
-					packageRevision, environment)
-			}
+			e = c.opt.Store.BindRemoteInvocation(req.ID, req.PlanID, environment)
 			if e != nil {
-				return "", "", e
+				return "", e
 			}
-			return packageRevision, specEnvironment, nil
+			return specEnvironment, nil
 		}
 		if req.EnvironmentDigest != environment {
-			return "", "", exit.Named(exit.Conflict,
+			return "", exit.Named(exit.Conflict,
 				"request_invocation_identity_changed",
 				"worker %s no longer matches the invocation identity pinned to request %s",
 				instanceID, req.ID)
 		}
-		return packageRevision, specEnvironment, nil
+		return specEnvironment, nil
 	}
-	return packageRevision, environment, nil
+	return environment, nil
 }
 
 func spellOf(raw []byte) string {

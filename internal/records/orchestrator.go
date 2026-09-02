@@ -37,7 +37,6 @@ CREATE TABLE IF NOT EXISTS requests (
   entrypoint   TEXT    NOT NULL,
   plan_id      TEXT    NOT NULL,
   package_release TEXT NOT NULL DEFAULT '',
-  package_revision_digest TEXT NOT NULL DEFAULT '',
   local_package_digest TEXT NOT NULL DEFAULT '',
   local_package_uploaded_boot_id TEXT NOT NULL DEFAULT '',
   environment_digest TEXT NOT NULL DEFAULT '',
@@ -66,7 +65,6 @@ CREATE TABLE IF NOT EXISTS worker_processes (
   instance_id     TEXT PRIMARY KEY,
   package        TEXT    NOT NULL,
   install_id      TEXT    REFERENCES installs(id),
-  package_revision_digest      TEXT    NOT NULL,
   worker_id       TEXT    NOT NULL,
   devices         TEXT    NOT NULL,
 	pid             INTEGER NOT NULL,
@@ -83,7 +81,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS worker_session ON worker_processes(session_id)
 
 // workerProcessCols is the whole row, in table order: the schema-12 rebuild copies every
 // column across by name rather than trusting positional SELECT *.
-const workerProcessCols = `instance_id,package,install_id,package_revision_digest,worker_id,
+const workerProcessCols = `instance_id,package,install_id,worker_id,
 	devices,pid,birth,session_id,state,opened_at,closed_at`
 
 var orchestratorSchema = []string{workerProcessesDDL, workerSessionIndex, requestsDDL, `
@@ -212,17 +210,16 @@ func NewID(prefix string) string {
 // identities it reported, and the install-scoped device grant it holds. The grant is
 // this row's `Devices` field — one process, one visible device set, one install.
 type WorkerProcess struct {
-	InstanceID            string
-	Package               string
-	InstallID             string
-	PackageRevisionDigest string
-	WorkerID              string
-	Devices               []string
-	PID                   int
-	Birth                 string // the OS process-birth identity: /proc starttime, never the pid alone
-	SessionID             string
-	State                 string // spawned_without_birth | spawned | registered | closed
-	OpenedAt              string
+	InstanceID string
+	Package    string
+	InstallID  string
+	WorkerID   string
+	Devices    []string
+	PID        int
+	Birth      string // the OS process-birth identity: /proc starttime, never the pid alone
+	SessionID  string
+	State      string // spawned_without_birth | spawned | registered | closed
+	OpenedAt   string
 }
 
 func deviceMark(d string) string { return "|" + d + "|" }
@@ -246,7 +243,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 	}
 	clauses := make([]string, 0, len(w.Devices))
 	args := []any{
-		w.InstanceID, w.Package, nullable(w.InstallID), w.PackageRevisionDigest, w.WorkerID,
+		w.InstanceID, w.Package, nullable(w.InstallID), w.WorkerID,
 		deviceList(w.Devices), w.PID, w.Birth, "spawned_without_birth", now(),
 	}
 	for _, d := range w.Devices {
@@ -261,15 +258,15 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 	// this statement is the fence against a DIFFERENT slot.
 	args = append(args, w.InstanceID)
 	res, err := s.db.Exec(`
-		INSERT INTO worker_processes(instance_id,package,install_id,package_revision_digest,worker_id,
+		INSERT INTO worker_processes(instance_id,package,install_id,worker_id,
 		  devices,pid,birth,state,opened_at)
-		SELECT ?,?,?,?,?,?,?,?,?,?
+		SELECT ?,?,?,?,?,?,?,?,?
 		WHERE NOT EXISTS (
 		  SELECT 1 FROM worker_processes w WHERE w.state != 'closed' AND (`+
 		strings.Join(clauses, " OR ")+`) AND w.instance_id != ?)
 		ON CONFLICT(instance_id) DO UPDATE SET
 		  pid=excluded.pid, birth=excluded.birth, devices=excluded.devices,
-		  install_id=excluded.install_id, package_revision_digest=excluded.package_revision_digest,
+		  install_id=excluded.install_id,
 		  session_id=NULL,
 		  state='spawned_without_birth', opened_at=excluded.opened_at, closed_at=''`, args...)
 	if err != nil {
@@ -296,14 +293,14 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 // one rental lands on its own row rather than accumulating one per request.
 func (s *Store) AttachWorker(w WorkerProcess) *exit.Error {
 	if _, err := s.db.Exec(`
-		INSERT INTO worker_processes(instance_id,package,install_id,package_revision_digest,worker_id,
+		INSERT INTO worker_processes(instance_id,package,install_id,worker_id,
 		  devices,pid,birth,state,opened_at)
-		VALUES(?,?,?,?,?,'',0,'','spawned',?)
+		VALUES(?,?,?,?,'',0,'','spawned',?)
 		ON CONFLICT(instance_id) DO UPDATE SET
-		  install_id=excluded.install_id, package_revision_digest=excluded.package_revision_digest,
+		  install_id=excluded.install_id,
 		  session_id=NULL,
 		  state='spawned', opened_at=excluded.opened_at, closed_at=''`,
-		w.InstanceID, w.Package, nullable(w.InstallID), w.PackageRevisionDigest, w.WorkerID,
+		w.InstanceID, w.Package, nullable(w.InstallID), w.WorkerID,
 		now()); err != nil {
 		return exit.Internalf("cannot journal the attached worker %s: %s", w.InstanceID, err)
 	}
@@ -395,7 +392,7 @@ func (s *Store) CloseWorker(instanceID string) *exit.Error {
 // LiveWorkers is every process row this root still believes in. Restart reconciliation
 // reads it and checks each against its OS process-birth identity before adopting.
 func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
-	rows, err := s.db.Query(`SELECT instance_id,package,COALESCE(install_id,''),package_revision_digest,
+	rows, err := s.db.Query(`SELECT instance_id,package,COALESCE(install_id,''),
 		worker_id,devices,pid,birth,COALESCE(session_id,''),state,opened_at FROM worker_processes WHERE state != 'closed'
 		ORDER BY opened_at`)
 	if err != nil {
@@ -406,7 +403,7 @@ func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
 	for rows.Next() {
 		var w WorkerProcess
 		var devices string
-		if err := rows.Scan(&w.InstanceID, &w.Package, &w.InstallID, &w.PackageRevisionDigest,
+		if err := rows.Scan(&w.InstanceID, &w.Package, &w.InstallID,
 			&w.WorkerID, &devices, &w.PID, &w.Birth, &w.SessionID, &w.State, &w.OpenedAt); err != nil {
 			return nil, exit.Internalf("cannot read a worker process row: %s", err)
 		}
@@ -434,10 +431,6 @@ type Request struct {
 	Entrypoint string
 	PlanID     string
 	Release    string
-	// A remote worker derives these invocation identities from its exact accepted
-	// Placement. They are CAS-bound with PlanID before the first offer so a retry or
-	// reconnect cannot silently change the execution named by this request.
-	PackageRevisionDigest string
 	// LocalPackageDigest names Creator's sealed carrier set. UploadedBootID binds the
 	// completed transfer to the exact pod generation that acknowledged every file.
 	LocalPackageDigest         string
@@ -479,7 +472,7 @@ type Request struct {
 	// RentalRequired forbids local placement for the hidden development/E2E override.
 	RentalRequired bool
 	// InstallID pins the exact immutable local install resolved before
-	// submission. The initial remote lane reads only its published release and descriptor.
+	// submission. The initial remote lane reads only its published release and PackageInterface.
 	InstallID string
 	// Assets are the request's durable input-asset bindings. LocalPath points into the
 	// authority-owned immutable input store, not at the caller's original file: a requeue
@@ -492,7 +485,7 @@ type Request struct {
 	// InvocationSpec. Rev5 OutputBinding has no kind, so this may never be inferred from
 	// ordinary asset outputs or from whichever receipts happen to arrive.
 	WeightsOutputs string
-	// OutputExport is a CLI-authenticated, descriptor-derived local publication intent.
+	// OutputExport is a CLI-authenticated, PackageInterface-derived local publication intent.
 	// It is recorded in its own durable row in the same transaction as this request.
 	OutputExport *OutputExportIntent
 	// ModelTransfer is a source materializer/output finalizer attached to this
@@ -536,14 +529,14 @@ type ModelRef struct {
 }
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
-	package_revision_digest,local_package_digest,local_package_uploaded_boot_id,
+	local_package_digest,local_package_uploaded_boot_id,
 	environment_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
 	COALESCE(install_id,''),assets,models,weights_outputs`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
-		&r.Release, &r.PackageRevisionDigest, &r.LocalPackageDigest,
+		&r.Release, &r.LocalPackageDigest,
 		&r.LocalPackageUploadedBootID, &r.EnvironmentDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
@@ -672,14 +665,13 @@ func (s *Store) BindRequestPlan(id, planID string) *exit.Error {
 
 // BindRemoteInvocation records the exact invocation identity learned from the worker
 // after logical package_set resolution. The client never supplies these values.
-func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment string) *exit.Error {
-	if id == "" || planID == "" || packageRevision == "" || environment == "" {
+func (s *Store) BindRemoteInvocation(id, planID, environment string) *exit.Error {
+	if id == "" || planID == "" || environment == "" {
 		return exit.Internalf("cannot bind an incomplete remote invocation identity")
 	}
-	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,package_revision_digest=?,
-		environment_digest=? WHERE id=? AND (plan_id='' OR plan_id=?) AND
-		(package_revision_digest='' OR package_revision_digest=?) AND
-		environment_digest=''`, planID, packageRevision, environment, id, planID, packageRevision)
+	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,environment_digest=?
+		WHERE id=? AND (plan_id='' OR plan_id=?) AND environment_digest=''`,
+		planID, environment, id, planID)
 	if err != nil {
 		return exit.Internalf("cannot bind request %s remote invocation: %s", id, err)
 	}
@@ -690,46 +682,14 @@ func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment st
 	if changed == 1 {
 		return nil
 	}
-	var heldPlan, heldPackage, heldEnvironment string
-	if err := s.db.QueryRow(`SELECT plan_id,package_revision_digest,environment_digest
-		FROM requests WHERE id=?`, id).Scan(
-		&heldPlan, &heldPackage, &heldEnvironment); err != nil {
+	var heldPlan, heldEnvironment string
+	if err := s.db.QueryRow(`SELECT plan_id,environment_digest FROM requests WHERE id=?`, id).Scan(
+		&heldPlan, &heldEnvironment); err != nil {
 		return exit.Internalf("cannot read request %s remote invocation binding: %s", id, err)
 	}
-	if heldPlan != planID || heldPackage != packageRevision || heldEnvironment != environment {
+	if heldPlan != planID || heldEnvironment != environment {
 		return exit.Named(exit.Conflict, "request_invocation_identity_changed",
 			"request %s already binds a different worker-derived invocation identity", id)
-	}
-	return nil
-}
-
-// BindLocalRemoteInvocation records worker-derived serving identity while retaining the
-// checkout source digest separately in package_revision_digest. local_package_digest is the
-// exact execution identity and must already equal the Runtime-reported revision.
-func (s *Store) BindLocalRemoteInvocation(id, planID, localRevision,
-	environment string,
-) *exit.Error {
-	if id == "" || planID == "" || localRevision == "" || environment == "" {
-		return exit.Internalf("cannot bind an incomplete local package remote invocation identity")
-	}
-	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,environment_digest=?
-    WHERE id=? AND local_package_digest=? AND (plan_id='' OR plan_id=?) AND
-    environment_digest=''`, planID, environment, id,
-		localRevision, planID)
-	if err != nil {
-		return exit.Internalf("cannot bind request %s local package invocation: %s", id, err)
-	}
-	if changed, err := result.RowsAffected(); err == nil && changed == 1 {
-		return nil
-	}
-	var heldPlan, heldLocal, heldEnvironment string
-	if err := s.db.QueryRow(`SELECT plan_id,local_package_digest,environment_digest
-	FROM requests WHERE id=?`, id).Scan(&heldPlan, &heldLocal, &heldEnvironment); err != nil {
-		return exit.Internalf("cannot read request %s local package invocation binding: %s", id, err)
-	}
-	if heldPlan != planID || heldLocal != localRevision || heldEnvironment != environment {
-		return exit.Named(exit.Conflict, "request_invocation_identity_changed",
-			"request %s already binds a different local package invocation identity", id)
 	}
 	return nil
 }
@@ -1167,14 +1127,14 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
-		plan_id,package_release,package_revision_digest,local_package_digest,
+		plan_id,package_release,local_package_digest,
 		local_package_uploaded_boot_id,environment_digest,
 		payload,outputs,state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,models,
 		weights_outputs)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
 		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
-		r.Release, r.PackageRevisionDigest, r.LocalPackageDigest,
+		r.Release, r.LocalPackageDigest,
 		r.LocalPackageUploadedBootID, r.EnvironmentDigest, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.NeedsAccelerator, r.Org, r.Trees, r.Worker,
 		r.Worker, r.Rental,

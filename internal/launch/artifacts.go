@@ -55,11 +55,11 @@ func InstallToolEnv(inst records.PackageInstall, env []string) []string {
 // Every question this host asks the runtime goes through here, so there is one place
 // that knows how to invoke it and one place that renders its refusals.
 type RuntimeCLI struct {
-	Bin        string   // package Runtime for metadata; the control Runtime is selected separately
-	Dir        string   // the package project root
-	Descriptor string   // exact published descriptor; empty for editable/source installs
-	Home       string   // COZY_HOME the runtime reads its artifact index out of
-	Env        []string // the allowlisted child environment (config.Tool)
+	Bin              string   // package Runtime for metadata; the control Runtime is selected separately
+	Dir              string   // the package project root
+	PackageInterface string   // exact published package interface; empty for editable/source installs
+	Home             string   // COZY_HOME the runtime reads its artifact index out of
+	Env              []string // the allowlisted child environment (config.Tool)
 }
 
 // Binary is the runtime an install carries. The install transaction already refused a
@@ -79,8 +79,8 @@ func (r RuntimeCLI) call(out any, verb ...string) *exit.Error {
 
 func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *exit.Error {
 	args := []string{"--json", "--dir", r.Dir}
-	if r.Descriptor != "" {
-		args = append(args, "--descriptor", r.Descriptor)
+	if r.PackageInterface != "" {
+		args = append(args, "--package-interface", r.PackageInterface)
 	}
 	args = append(args, verb...)
 	cmd := exec.CommandContext(ctx, r.Bin, args...)

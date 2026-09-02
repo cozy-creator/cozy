@@ -188,7 +188,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 		}
 	}
 	placementStatus := func(placementID string, setDigest []byte, planIDs []string,
-		packageRevision, environmentDigest string,
+		environmentDigest string,
 	) *pb.PlacementStatus {
 		var bindingDigests [][]byte
 		for _, planID := range planIDs {
@@ -201,7 +201,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			PlacementId: placementID, Materialization: pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
 			Serving: pb.ServingState_SERVING_STATE_DISPATCHABLE, ExecutorEpoch: 1,
 			DispatchableBindingDigests: bindingDigests, PlacementSetDigest: setDigest,
-			PackageRevisionDigest: packageRevision, EnvironmentDigest: environmentDigest,
+			EnvironmentDigest: environmentDigest,
 		}
 	}
 	outcome := func(t *pb.AttemptOutcome) {
@@ -258,8 +258,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 						planIDs = append(planIDs, entrypoint.Str("entrypoint_binding_digest"))
 					}
 					placements = append(placements, placementStatus(p.Str("placement_id"), setDigest,
-						planIDs, p.Sub("package").Str("release_digest"),
-						p.Str("environment_digest")))
+						planIDs, p.Str("environment_digest")))
 				}
 			}
 			plans := 0

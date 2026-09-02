@@ -11,7 +11,7 @@ import (
 
 // THE JOB HALF of an installed package (cl-004). A job is an attempt class on the one
 // machinery (cr-009), so this file mints exactly what the serving half mints — a local
-// plan record and the digest that names it — over the descriptor's `jobs` list instead of
+// plan record and the digest that names it — over the PackageInterface's `jobs` list instead of
 // its `entrypoints` list.
 //
 // The two records are deliberately NOT the same document, because they resolve different
@@ -83,6 +83,10 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	}
 	cache := filepath.Join(f.Install.Dir, "artifact-cache")
 	environmentPython := home.VenvPython(filepath.Join(f.Install.Dir, "venv"))
+	environmentContent := placement.EnvironmentDigest
+	if environmentContent == "" {
+		environmentContent = f.Install.LockDigest
+	}
 	placement.Jobs = []*orchestrator.JobPlan{{
 		Function:       facts.Name,
 		DescriptorID:   facts.DescriptorID,
@@ -92,11 +96,11 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 		// refuses an unknown key, exactly as the binding record's reader does.
 		Record: map[string]any{
 			"job_descriptor_id":           facts.DescriptorID,
-			"build_id":                    PackageRevisionDigest(f.Install),
-			"application":                 f.PackageDescriptor.Application,
-			"package_descriptor":          DescriptorPath(f.Install.Dir),
+			"build_id":                    placement.PlacementSetDigest,
+			"application":                 f.PackageInterface.Application,
+			"package_interface":           PackageInterfacePath(f.Install.Dir),
 			"python":                      environmentPython,
-			"environment_content_digest":  PackageRevisionDigest(f.Install),
+			"environment_content_digest":  environmentContent,
 			"job":                         facts.Name,
 			"gpu_count":                   deviceCount,
 			"publishes":                   facts.Publishes,
@@ -123,23 +127,23 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 }
 
 // Job resolves one declared `@job` and READS its descriptor id from the runtime that owns
-// the derivation. cl-004 reproduced `internal/descriptor.py::job_descriptor_id` here in Go
+// the derivation. cl-004 reproduced `internal/package_interface.py::job_descriptor_id` here in Go
 // because no verb would say it; cr-016's `describe <job> --json` now carries it beside the
 // entry, so the second implementation of the canonical form — and the whole class of
 // refusals it owed for values the protocol profile cannot spell (a float bound, a null
 // default) — deletes with it.
 func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	var declared *Entrypoint
-	for i := range f.PackageDescriptor.Jobs {
-		if f.PackageDescriptor.Jobs[i].Name == function {
-			declared = &f.PackageDescriptor.Jobs[i]
+	for i := range f.PackageInterface.Jobs {
+		if f.PackageInterface.Jobs[i].Name == function {
+			declared = &f.PackageInterface.Jobs[i]
 			break
 		}
 	}
 	if declared == nil {
 		return nil, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", f.Install.Package, function).
-			WithRemedy("it registers: %s", strings.Join(f.PackageDescriptor.Names(), ", ")).
+			WithRemedy("it registers: %s", strings.Join(f.PackageInterface.Names(), ", ")).
 			WithNext("cozy package list --full")
 	}
 	var said struct {

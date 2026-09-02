@@ -26,7 +26,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// PackageInstall is one immutable install: a materialized environment plus the evidence
+// PackageInstall is one immutable install: a materialized environment plus the exact files
 // that produced it. Rows are never updated — a rebuild is a NEW install. It is deliberately
 // not a fencing counter: the wire spends `epoch` on the executor and admission fences, the
 // local install is neither, and one word for three things is how they drift (#484).
@@ -49,7 +49,7 @@ type PackageInstall struct {
 	Extra              string // the CUDA-extra pick ("" = none declared or no accelerator)
 	Packages           int
 	Closure            string // one "name==version" per line
-	PackageDescriptor  string // exact digest of the install-private Runtime-derived descriptor
+	PackageInterface   string // exact digest of the install-private Runtime-derived PackageInterface
 	PlacementSetDigest string // exact Hub-selected PlacementSet/1 stored in the artifact cache
 	BytesExcl          int64
 	BytesShared        int64
@@ -67,7 +67,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 19
+const schemaVersion = 20
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS installs (
   extra         TEXT    NOT NULL,
   packages      INTEGER NOT NULL,
   closure       TEXT    NOT NULL,
-  package_descriptor TEXT    NOT NULL,
+  package_interface TEXT    NOT NULL,
   placement_set_digest TEXT  NOT NULL DEFAULT '',
   bytes_excl    INTEGER NOT NULL,
   bytes_shared  INTEGER NOT NULL,
@@ -165,7 +165,7 @@ func Open(path string) (*Store, *exit.Error) {
 	return &Store{db: db}, nil
 }
 
-// Schemas 6 through 19 migrate in place. Schema 11 replaces authored GPU counts with
+// Schemas 6 through 20 migrate in place. Schema 11 replaces authored GPU counts with
 // the one derived accelerator-class fact; schema 12 gives the install table and its two
 // foreign keys the one word the row actually names; schema 13 records when a rental was
 // first seen ready; schema 14 drops the output export's pre-execution payload hash — a
@@ -175,7 +175,8 @@ func Open(path string) (*Store, *exit.Error) {
 // the request (cl-107) — existing rows joinable to a surviving rental get their word,
 // unjoinable history stays blank; schema 18 removes checkpoint evidence from
 // model-transfer outputs; schema 19 removes the duplicate request config digest now owned
-// by the CozyTensors header. Package, request, event, export, and rental rows survive;
+// by the CozyTensors header; schema 20 renames the installed package interface and removes
+// the obsolete aggregate package revision digest. Package, request, event, export, and rental rows survive;
 // only schema 9's superseded special
 // model-production subsystem is dropped.
 // Schema 10 creates empty request-attached transfer sidecars because older rows cannot be
@@ -214,8 +215,8 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 	// rename is schema 12's, the rental rebuild ends at 13, the export table's payload
 	// hash goes at 14, package events arrive at 16, and the request rebuild ends at 17
 	// (the recorded machine word), which is also where its rows get their backfill.
-	if sourceVersion < 12 {
-		if e := migrateInstalls(tx, path); e != nil {
+	if sourceVersion < 20 {
+		if e := migrateInstalls(tx, path, sourceVersion); e != nil {
 			return e
 		}
 	}
@@ -229,7 +230,7 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			return e
 		}
 	}
-	if sourceVersion < 19 {
+	if sourceVersion < 20 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
 		}
@@ -260,7 +261,7 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			}
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=19`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=20`); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
 	if e := commitMigration(tx, path); e != nil {
@@ -289,10 +290,15 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 // ALTERed: SQLite's own RENAME rewrites every referencing DDL with the new name QUOTED, and
 // verifySchema compares the stored text to the authored text character for character. Rows
 // move by column name, so the copy states what it preserves.
-func migrateInstalls(tx *sql.Tx, path string) *exit.Error {
+func migrateInstalls(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
+	priorTable, priorInstallID := "installs", "install_id"
+	if sourceVersion < 12 {
+		priorTable, priorInstallID = "install_generations", "generation"
+	}
+	priorInstallCols := strings.Replace(installCols(""), "package_interface", "package_descriptor", 1)
 	for _, statement := range []string{
 		`DROP INDEX worker_session`,
-		`ALTER TABLE install_generations RENAME TO installs_prior`,
+		`ALTER TABLE ` + priorTable + ` RENAME TO installs_prior`,
 		`ALTER TABLE pins RENAME TO pins_prior`,
 		`ALTER TABLE worker_processes RENAME TO worker_processes_prior`,
 		installsDDL,
@@ -300,16 +306,20 @@ func migrateInstalls(tx *sql.Tx, path string) *exit.Error {
 			` FROM installs_prior`,
 		pinsDDL,
 		`INSERT INTO pins(package,major,install_id,activated_at)
-			SELECT package,major,generation,activated_at FROM pins_prior`,
+			SELECT package,major,` + priorInstallID + `,activated_at FROM pins_prior`,
 		workerProcessesDDL,
 		`INSERT INTO worker_processes(` + workerProcessCols + `)
-			SELECT instance_id,package,generation,package_revision_digest,worker_id,
+			SELECT instance_id,package,` + priorInstallID + `,worker_id,
 			  devices,pid,birth,session_id,state,opened_at,closed_at FROM worker_processes_prior`,
 		workerSessionIndex,
 		`DROP TABLE worker_processes_prior`,
 		`DROP TABLE pins_prior`,
 		`DROP TABLE installs_prior`,
 	} {
+		if strings.HasPrefix(statement, `INSERT INTO installs(`) {
+			statement = `INSERT INTO installs(` + installCols("") + `) SELECT ` + priorInstallCols +
+				` FROM installs_prior`
+		}
 		if _, err := tx.Exec(statement); err != nil {
 			return exit.Internalf("cannot rename the install table while migrating %s: %s", path, err)
 		}
@@ -399,7 +409,7 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		return exit.Internalf("cannot create current requests table while migrating %s: %s", path, err)
 	}
 	destinationColumns := `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
-		package_revision_digest,local_package_digest,local_package_uploaded_boot_id,
+		local_package_digest,local_package_uploaded_boot_id,
 		environment_digest,payload,outputs,state,ordinal,requeues,created_at,kind,
 		needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,models,weights_outputs`
 	rentalRequired := "rental_required"
@@ -419,7 +429,7 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		machine = "machine"
 	}
 	selectColumns := `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
-		package_revision_digest,` + localPackage + `,
+		` + localPackage + `,
 		environment_digest,payload,outputs,state,ordinal,requeues,created_at,kind,` +
 		needsAccelerator + `,
 		org,trees,worker,` + machine + `,rental,` + rentalRequired +
@@ -455,7 +465,10 @@ CREATE TABLE IF NOT EXISTS rentals (
 // priorStatements is the released DDL of one earlier schema, derived from the current one
 // so a released shape is never a second copy that can drift from it.
 func priorStatements(version int) []string {
-	priorRequestsEighteen := strings.Replace(requestsDDL,
+	priorRequestsNineteen := strings.Replace(requestsDDL,
+		"  package_release TEXT NOT NULL DEFAULT '',\n",
+		"  package_release TEXT NOT NULL DEFAULT '',\n  package_revision_digest TEXT NOT NULL DEFAULT '',\n", 1)
+	priorRequestsEighteen := strings.Replace(priorRequestsNineteen,
 		"  environment_digest TEXT NOT NULL DEFAULT '',\n",
 		"  environment_digest TEXT NOT NULL DEFAULT '',\n  config_digest TEXT NOT NULL DEFAULT '',\n", 1)
 	// Every schema before 17 carried the requests row without its recorded machine word.
@@ -475,6 +488,11 @@ func priorStatements(version int) []string {
 	priorRequests = priorLocalPackageNames(priorRequests)
 	priorRequestsSix = priorLocalPackageNames(priorRequestsSix)
 	priorRequestsFourteen := priorLocalPackageNames(priorRequestsSixteen)
+	priorInstalls := strings.Replace(installsDDL,
+		"  package_interface TEXT    NOT NULL,\n", "  package_descriptor TEXT    NOT NULL,\n", 1)
+	priorWorkerProcesses := strings.Replace(workerProcessesDDL,
+		"  install_id      TEXT    REFERENCES installs(id),\n",
+		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
 		if version < 10 && containsStatement(modelTransferSchema, statement) ||
@@ -498,6 +516,12 @@ func priorStatements(version int) []string {
 			stmt = priorRequestsSixteen
 		case stmt == requestsDDL && version < 19:
 			stmt = priorRequestsEighteen
+		case stmt == requestsDDL && version < 20:
+			stmt = priorRequestsNineteen
+		case stmt == installsDDL && version < 20:
+			stmt = priorInstalls
+		case stmt == workerProcessesDDL && version < 20:
+			stmt = priorWorkerProcesses
 		case stmt == rentalsDDL && version < 8:
 			stmt = rentalsDDLPrior
 		case stmt == rentalsDDL && version < 13:
@@ -622,7 +646,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=19`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=20`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -703,7 +727,7 @@ func (s *Store) Close() { _ = s.db.Close() }
 var installFields = []string{
 	"id", "package", "major", "version", "source_kind", "source_ref", "source_digest",
 	"verified", "dir", "python", "runtime", "project_dir", "uv", "lock_digest", "platform", "extra",
-	"packages", "closure", "package_descriptor", "placement_set_digest", "bytes_excl", "bytes_shared", "created_at",
+	"packages", "closure", "package_interface", "placement_set_digest", "bytes_excl", "bytes_shared", "created_at",
 }
 
 // installCols is the select list, optionally table-qualified for a join.
@@ -724,7 +748,7 @@ func scanInstall(rows interface{ Scan(...any) error }) (PackageInstall, error) {
 	var verified int
 	err := rows.Scan(&inst.ID, &inst.Package, &inst.Major, &inst.Version, &inst.SourceKind, &inst.SourceRef,
 		&inst.SourceDigest, &verified, &inst.Dir, &inst.Python, &inst.Runtime, &inst.ProjectDir, &inst.UV, &inst.LockDigest, &inst.Platform,
-		&inst.Extra, &inst.Packages, &inst.Closure, &inst.PackageDescriptor, &inst.PlacementSetDigest,
+		&inst.Extra, &inst.Packages, &inst.Closure, &inst.PackageInterface, &inst.PlacementSetDigest,
 		&inst.BytesExcl, &inst.BytesShared, &inst.CreatedAt)
 	inst.Verified = verified == 1
 	return inst, err
@@ -756,7 +780,7 @@ func (s *Store) Activate(inst PackageInstall) (superseded string, e *exit.Error)
 		VALUES(`+placeholders()+`)`,
 		inst.ID, inst.Package, inst.Major, inst.Version, inst.SourceKind, inst.SourceRef, inst.SourceDigest,
 		verified, inst.Dir, inst.Python, inst.Runtime, inst.ProjectDir, inst.UV, inst.LockDigest, inst.Platform, inst.Extra,
-		inst.Packages, inst.Closure, inst.PackageDescriptor, inst.PlacementSetDigest,
+		inst.Packages, inst.Closure, inst.PackageInterface, inst.PlacementSetDigest,
 		inst.BytesExcl, inst.BytesShared, inst.CreatedAt); err != nil {
 		return "", exit.Internalf("cannot insert install %s: %s", inst.ID, err)
 	}

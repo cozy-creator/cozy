@@ -75,7 +75,6 @@ func (c *Orchestrator) PrepareRentalRevision(rentalID, operationID string,
 	if problem := c.ConvergeLocalPackage(instance, operationID, revision, "", nil); problem != nil {
 		return DesiredPlacement{}, problem
 	}
-	logical.ReleaseDigest = revision.Digest
 	if len(logical.Models) > 0 {
 		models := downloadModelRefs(logical.Models)
 		if len(models) != len(logical.Models) {

@@ -33,8 +33,8 @@ func TestReclaimSweeps(t *testing.T) {
 
 	// ---- two request rows the tmp sweep reads: one settled, one still open.
 	if problem := store.SpawnWorker(records.WorkerProcess{InstanceID: "ins-attempts", Package: "cozy/sweep",
-		PackageRevisionDigest: "sha256:" + sixtyFour("d"), WorkerID: "local",
-		Devices: []string{"cpu"}}); problem != nil {
+		WorkerID: "local",
+		Devices:  []string{"cpu"}}); problem != nil {
 		t.Fatal(problem)
 	}
 	settledRun(t, l, store, "req-exported")
@@ -53,8 +53,8 @@ func TestReclaimSweeps(t *testing.T) {
 	}
 	for index, id := range []string{"ins-live", "ins-closed"} {
 		if problem := store.SpawnWorker(records.WorkerProcess{InstanceID: id, Package: "cozy/sweep",
-			PackageRevisionDigest: "sha256:" + sixtyFour("d"), WorkerID: "local",
-			Devices: []string{"cuda:" + string(rune('1'+index))}}); problem != nil {
+			WorkerID: "local",
+			Devices:  []string{"cuda:" + string(rune('1'+index))}}); problem != nil {
 			t.Fatal(problem)
 		}
 	}

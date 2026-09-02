@@ -242,7 +242,7 @@ func (o *modelTransferOwner) Finalize(ctx context.Context, requestID string,
 	for _, weights := range rows {
 		if !declared[weights.OutputSlot] {
 			return exit.Named(exit.Conflict, "model_transfer.output_undeclared",
-				"weights output %s is absent from the accepted producer descriptor",
+				"weights output %s is absent from the accepted producer package interface",
 				weights.OutputSlot)
 		}
 		if weights.FinalID == "" {

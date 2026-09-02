@@ -80,7 +80,7 @@ hardware fits the request, then sends the exact published release as a signed lo
 stream supplies the derived placement, dispatchable binding, and exact release/environment/config
 identities. Runtime observes the actual worker environment and refuses protected platform-package
 conflicts before offline installation. Tensorhub's immutable release detail supplies the verified
-request/result descriptor.
+request/result PackageInterface.
 
 `local_assets` is the CLI-only local extension for `--asset
 <field-path>=<file>`. Each row names the exact request-schema field path plus a source

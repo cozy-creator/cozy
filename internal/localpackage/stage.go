@@ -23,9 +23,9 @@ import (
 )
 
 const (
-	maxFiles            = pb.MaxLocalPackageFiles
-	localDescriptorFile = "descriptor.json"
-	localRevisionFile   = "revision.json"
+	maxFiles                  = pb.MaxLocalPackageFiles
+	localPackageInterfaceFile = "package-interface.json"
+	localRevisionFile         = "revision.json"
 )
 
 type File struct {
@@ -34,9 +34,9 @@ type File struct {
 }
 
 type Revision struct {
-	Package, Release, SourceDigest, Digest, DescriptorDigest string
-	DescriptorLength                                         int64
-	Files                                                    []File
+	Package, Release, SourceDigest, Digest, PackageInterfaceDigest string
+	PackageInterfaceLength                                         int64
+	Files                                                          []File
 }
 
 func Stage(ctx context.Context, layout home.Layout, install records.PackageInstall) (Revision, *exit.Error) {
@@ -73,16 +73,16 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 			"editable source changed while its local wheel revision was being built").
 			WithRemedy("stop editing briefly and retry")
 	}
-	descriptorBytes, err := os.ReadFile(pack.Descriptor)
-	if err != nil || len(descriptorBytes) == 0 || len(descriptorBytes) > canonical.DocMax {
-		return Revision{}, exit.Named(exit.Structural, "local_package_descriptor_invalid",
-			"local package descriptor is absent or exceeds the canonical document bound")
+	packageInterfaceBytes, err := os.ReadFile(pack.PackageInterface)
+	if err != nil || len(packageInterfaceBytes) == 0 || len(packageInterfaceBytes) > canonical.DocMax {
+		return Revision{}, exit.Named(exit.Structural, "local_package_interface_invalid",
+			"local package interface is absent or exceeds the canonical document bound")
 	}
-	normalized, normalizeErr := canonical.NormalizeJCS(descriptorBytes)
-	descriptorDigest, err := canonical.Spell(canonical.Digest(descriptorBytes))
-	if normalizeErr != nil || err != nil || !bytes.Equal(normalized, descriptorBytes) {
-		return Revision{}, exit.Named(exit.Structural, "local_package_descriptor_invalid",
-			"local package descriptor bytes are not their canonical identity")
+	normalized, normalizeErr := canonical.NormalizeJCS(packageInterfaceBytes)
+	packageInterfaceDigest, err := canonical.Spell(canonical.Digest(packageInterfaceBytes))
+	if normalizeErr != nil || err != nil || !bytes.Equal(normalized, packageInterfaceBytes) {
+		return Revision{}, exit.Named(exit.Structural, "local_package_interface_invalid",
+			"local package interface bytes are not their canonical identity")
 	}
 	paths := []string{pack.Wheel}
 	for _, dependency := range pack.DependencyWheels {
@@ -102,7 +102,7 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 	if err := os.Mkdir(wheelDir, 0o700); err != nil {
 		return Revision{}, exit.Internalf("cannot create local wheel staging: %s", err)
 	}
-	if problem := copyDescriptor(descriptorBytes, filepath.Join(stage, localDescriptorFile)); problem != nil {
+	if problem := copyPackageInterface(packageInterfaceBytes, filepath.Join(stage, localPackageInterfaceFile)); problem != nil {
 		return Revision{}, problem
 	}
 	files := make([]File, 0, len(paths))
@@ -118,11 +118,11 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 		files = append(files, file)
 	}
 	revision, revisionBytes, problem := identity(install.Package, install.Version, sourceDigest,
-		descriptorDigest, int64(len(descriptorBytes)), files)
+		packageInterfaceDigest, int64(len(packageInterfaceBytes)), files)
 	if problem != nil {
 		return Revision{}, problem
 	}
-	if problem := copyDescriptor(revisionBytes,
+	if problem := copyPackageInterface(revisionBytes,
 		filepath.Join(stage, localRevisionFile)); problem != nil {
 		return Revision{}, problem
 	}
@@ -160,23 +160,23 @@ func Open(layout home.Layout, install records.PackageInstall, digest string) (Re
 	}
 	root := filepath.Join(layout.LocalPackages, strings.TrimPrefix(digest, "sha256:"))
 	entries, err := os.ReadDir(root)
-	if err != nil || len(entries) != 3 || entries[0].Name() != localDescriptorFile ||
+	if err != nil || len(entries) != 3 || entries[0].Name() != localPackageInterfaceFile ||
 		!entries[0].Type().IsRegular() || entries[1].Name() != localRevisionFile ||
 		!entries[1].Type().IsRegular() || entries[2].Name() != "wheels" || !entries[2].IsDir() {
 		return Revision{}, exit.Named(exit.NotFound, "local_package_revision_absent",
 			"local package revision %s is absent or incomplete", digest)
 	}
-	descriptorPath := filepath.Join(root, localDescriptorFile)
-	descriptorBytes, err := os.ReadFile(descriptorPath)
-	if err != nil || len(descriptorBytes) == 0 || len(descriptorBytes) > canonical.DocMax {
-		return Revision{}, exit.Named(exit.Structural, "local_package_descriptor_invalid",
-			"local package descriptor is absent or exceeds the canonical document bound")
+	packageInterfacePath := filepath.Join(root, localPackageInterfaceFile)
+	packageInterfaceBytes, err := os.ReadFile(packageInterfacePath)
+	if err != nil || len(packageInterfaceBytes) == 0 || len(packageInterfaceBytes) > canonical.DocMax {
+		return Revision{}, exit.Named(exit.Structural, "local_package_interface_invalid",
+			"local package interface is absent or exceeds the canonical document bound")
 	}
-	normalized, normalizeErr := canonical.NormalizeJCS(descriptorBytes)
-	descriptorDigest, err := canonical.Spell(canonical.Digest(descriptorBytes))
-	if normalizeErr != nil || err != nil || !bytes.Equal(normalized, descriptorBytes) {
-		return Revision{}, exit.Named(exit.Structural, "local_package_descriptor_invalid",
-			"local package descriptor bytes changed")
+	normalized, normalizeErr := canonical.NormalizeJCS(packageInterfaceBytes)
+	packageInterfaceDigest, err := canonical.Spell(canonical.Digest(packageInterfaceBytes))
+	if normalizeErr != nil || err != nil || !bytes.Equal(normalized, packageInterfaceBytes) {
+		return Revision{}, exit.Named(exit.Structural, "local_package_interface_invalid",
+			"local package interface bytes changed")
 	}
 	wheelDir := filepath.Join(root, "wheels")
 	wheels, err := os.ReadDir(wheelDir)
@@ -212,7 +212,7 @@ func Open(layout home.Layout, install records.PackageInstall, digest string) (Re
 			"local package revision has %d project wheels", projects)
 	}
 	revision, revisionBytes, problem := identity(install.Package, install.Version, install.SourceDigest,
-		descriptorDigest, int64(len(descriptorBytes)), files)
+		packageInterfaceDigest, int64(len(packageInterfaceBytes)), files)
 	if problem != nil {
 		return Revision{}, problem
 	}
@@ -259,16 +259,16 @@ func copyWheel(source, destination, kind string) (File, *exit.Error) {
 		Kind: kind, Length: written, Path: outputPath}, nil
 }
 
-func copyDescriptor(data []byte, destination string) *exit.Error {
+func copyPackageInterface(data []byte, destination string) *exit.Error {
 	output, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o400)
 	if err != nil {
-		return exit.Internalf("cannot stage local package descriptor: %s", err)
+		return exit.Internalf("cannot stage local package interface: %s", err)
 	}
 	written, writeErr := output.Write(data)
 	syncErr, closeErr := output.Sync(), output.Close()
 	if writeErr != nil || syncErr != nil || closeErr != nil || written != len(data) {
-		return exit.Named(exit.Structural, "local_package_descriptor_changed",
-			"local package descriptor changed while it was being staged")
+		return exit.Named(exit.Structural, "local_package_interface_changed",
+			"local package interface changed while it was being staged")
 	}
 	return nil
 }
@@ -288,8 +288,8 @@ func measured(path string, fact wheel.Identity, kind string) (File, *exit.Error)
 		Kind: kind, Length: length, Path: path}, nil
 }
 
-func identity(packageName, release, sourceDigest, descriptorDigest string,
-	descriptorLength int64, files []File,
+func identity(packageName, release, sourceDigest, packageInterfaceDigest string,
+	packageInterfaceLength int64, files []File,
 ) (Revision, []byte, *exit.Error) {
 	rows := append([]File(nil), files...)
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Digest < rows[j].Digest })
@@ -315,14 +315,14 @@ func identity(packageName, release, sourceDigest, descriptorDigest string,
 			Kind: kind, Length: uint64(file.Length)})
 	}
 	source, sourceErr := canonical.Raw(sourceDigest)
-	descriptor, descriptorErr := canonical.Raw(descriptorDigest)
-	if sourceErr != nil || descriptorErr != nil || descriptorLength <= 0 {
+	packageInterface, packageInterfaceErr := canonical.Raw(packageInterfaceDigest)
+	if sourceErr != nil || packageInterfaceErr != nil || packageInterfaceLength <= 0 {
 		return Revision{}, nil, exit.Named(exit.Structural, "local_package_revision_invalid",
-			"local package revision has invalid source or descriptor identity")
+			"local package revision has invalid source or package interface identity")
 	}
 	revisionBytes, rawDigest, err := canonical.Identity(&pb.LocalPackageRevision{Package: packageName,
-		Release: release, SourceDigest: source, PackageDescriptor: &pb.Ref{Digest: descriptor,
-			Length: uint64(descriptorLength)}, Files: refs})
+		Release: release, SourceDigest: source, PackageInterface: &pb.Ref{Digest: packageInterface,
+			Length: uint64(packageInterfaceLength)}, Files: refs})
 	if err != nil {
 		return Revision{}, nil, exit.Internalf("cannot digest local package identity: %s", err)
 	}
@@ -331,7 +331,7 @@ func identity(packageName, release, sourceDigest, descriptorDigest string,
 		return Revision{}, nil, exit.Internalf("cannot spell local package identity: %s", err)
 	}
 	return Revision{Package: packageName, Release: release, SourceDigest: sourceDigest,
-		Digest: digest, DescriptorDigest: descriptorDigest, DescriptorLength: descriptorLength,
+		Digest: digest, PackageInterfaceDigest: packageInterfaceDigest, PackageInterfaceLength: packageInterfaceLength,
 		Files: rows}, revisionBytes, nil
 }
 

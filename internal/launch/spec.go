@@ -13,30 +13,30 @@ import (
 
 // Facts is everything one package install needs to be served, gathered once.
 type Facts struct {
-	Install           records.PackageInstall
-	Source            string
-	PackageDescriptor *PackageDescriptor
-	RuntimeCLI        RuntimeCLI
+	Install          records.PackageInstall
+	Source           string
+	PackageInterface *PackageInterface
+	RuntimeCLI       RuntimeCLI
 }
 
 // Read gathers an install's facts: where its source is, the surface it proved at
 // install, and the runtime that proved it.
 func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *exit.Error) {
 	source := SourceDir(inst)
-	d, e := ReadDescriptor(DescriptorPath(inst.Dir), inst.PackageDescriptor)
+	d, e := ReadPackageInterface(PackageInterfacePath(inst.Dir), inst.PackageInterface)
 	if e != nil {
 		return nil, e
 	}
-	runtimeBin, descriptor := Binary(inst), ""
+	runtimeBin, packageInterface := Binary(inst), ""
 	if inst.SourceKind == "tensorhub" {
-		descriptor = DescriptorPath(inst.Dir)
+		packageInterface = PackageInterfacePath(inst.Dir)
 	}
 	return &Facts{
-		Install:           inst,
-		Source:            source,
-		PackageDescriptor: d,
+		Install:          inst,
+		Source:           source,
+		PackageInterface: d,
 		RuntimeCLI: RuntimeCLI{
-			Bin: runtimeBin, Dir: source, Descriptor: descriptor, Home: cozyHome, Env: env,
+			Bin: runtimeBin, Dir: source, PackageInterface: packageInterface, Home: cozyHome, Env: env,
 		},
 	}, nil
 }
@@ -51,12 +51,6 @@ func SourceDir(inst records.PackageInstall) string {
 		return inst.SourceRef
 	}
 	return filepath.Join(inst.Dir, "source")
-}
-
-// PackageRevisionDigest is the exact published release or editable source digest
-// this install serves. The same digest pins invocation and worker identity.
-func PackageRevisionDigest(inst records.PackageInstall) string {
-	return inst.SourceDigest
 }
 
 // Placement reads the exact Hub-selected PlacementSet stored at install. Creator never
@@ -77,8 +71,8 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 			"cannot read selected PlacementSet %s: %s", f.Install.PlacementSetDigest, err)
 	}
 	outputs := map[string][]string{}
-	for i := range f.PackageDescriptor.Entrypoints {
-		ep := &f.PackageDescriptor.Entrypoints[i]
+	for i := range f.PackageInterface.Entrypoints {
+		ep := &f.PackageInterface.Entrypoints[i]
 		outputs[ep.Name] = AssetPaths(ep.Result)
 	}
 	return orchestrator.PlacementFromExact(f.Install.Package, f.Install.ID,
@@ -95,8 +89,8 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 	}
 	cache := filepath.Join(f.Install.Dir, "artifact-cache")
 	if f.Install.SourceKind == "local" {
-		// The install's own artifact cache is where the checkout's derived documents
-		// (descriptor, model configs) live for the worker to read — never under COZY_HOME.
+		// The install's own artifact cache is where the checkout's derived package interface
+		// and model headers live for the worker to read — never under COZY_HOME.
 		return orchestrator.WorkerLaunchSpec{
 			Placement: placement,
 			Python:    Binary(f.Install), Args: []string{"serve",

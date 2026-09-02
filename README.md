@@ -187,7 +187,8 @@ Checkpoint IDs are immutable. Release labels and their lane maps are mutable own
 consumers follow a release lane so fixes take effect; accepted runs freeze the checkpoint they resolved.
 
 With `--rental`, producer and job packages resolve directly to their latest non-yanked immutable
-Tensorhub releases; their exact release and descriptor identities are pinned in the transfer intent.
+Tensorhub releases. The transfer intent pins `(package, release)`; downloaded execution files carry
+their own exact refs, including `metadata/package-interface.json`.
 They do not need to be installable in the laptop's local Python environment. Local production still
 uses the ordinary installed package. `--rental-only` skips local capacity and requires an
 external attempt. Downloads that could rent currently refuse until Creator wires the negotiated
@@ -195,7 +196,7 @@ weights-read return plane; local-only sources under `--rental` remain local.
 
 ## Run packages and jobs
 
-Serving entrypoints and bounded jobs use the same command. Cozy reads the installed package descriptor
+Serving entrypoints and bounded jobs use the same command. Cozy reads the installed package interface
 to determine the callable lifecycle:
 
 ```sh
@@ -274,8 +275,8 @@ Rental creation sends only that private machine name, the SKU, and introduction 
 request, profile, image, or placement. Tensorhub readiness means the worker location and TLS identity
 are attachable. Creator then claims that worker directly and sends signed exact package and model
 release refs; no WorkerControl frame is relayed through Tensorhub. Creator learns the derived
-placement/binding and exact invocation identities from the worker's existing
-observed-state stream before dispatch. Tensorhub's exact release descriptor validates request/result
+placement/binding and exact environment identities from the worker's existing
+observed-state stream before dispatch. Tensorhub's exact PackageInterface validates request/result
 shape; Creator never supplies a remote profile, CUDA choice, or precomputed PlacementSet.
 
 Each rental has one local Ed25519 Creator key and one separate media bearer. Both credentials are

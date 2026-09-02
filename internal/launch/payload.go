@@ -201,12 +201,12 @@ func modelOverrideSlot(ep *Entrypoint, asked string) (*Slot, *exit.Error) {
 		WithRemedy("%s declares: %s", ep.Name, strings.Join(params, ", "))
 }
 
-// ValidatePayload checks one already-rendered request object against the exact descriptor
+// ValidatePayload checks one already-rendered request object against the exact PackageInterface
 // schema — the daemon-submit half of the same recorded-schema gate ParsePayload applies
 // while building a CLI payload. It fires BEFORE a request row exists or an idempotency
 // key is recorded (cl-105): every offending field is named in ONE typed
 // `request_payload_invalid` refusal whose remedy is the callable's usage line. A
-// descriptor the validator itself cannot read stays a structural refusal: that is a host
+// PackageInterface the validator itself cannot read stays a structural refusal: that is a host
 // fault, not a payload fault.
 func ValidatePayload(pkg string, ep *Entrypoint, payload json.RawMessage) *exit.Error {
 	target := ep.Name
@@ -285,7 +285,7 @@ func validateField(field Field, value any, path string) *exit.Error {
 
 func validateFieldInto(field Field, value any, path string, assets *[]string) *exit.Error {
 	if len(field.Constraints.Unknown) > 0 {
-		return exit.Named(exit.Structural, "descriptor_constraint_unknown",
+		return exit.Named(exit.Structural, "package_interface_constraint_unknown",
 			"request field %s uses unsupported constraints: %s",
 			path, strings.Join(field.Constraints.Unknown, ", "))
 	}
@@ -300,7 +300,7 @@ func validateFieldInto(field Field, value any, path string, assets *[]string) *e
 		case []any:
 			length = int64(len(typed))
 		default:
-			return exit.Named(exit.Structural, "descriptor_constraint_unknown",
+			return exit.Named(exit.Structural, "package_interface_constraint_unknown",
 				"request field %s has length constraints on a non-string, non-list type", path)
 		}
 		if minimum := field.Constraints.MinLength; minimum != nil && length < *minimum {
@@ -315,7 +315,7 @@ func validateFieldInto(field Field, value any, path string, assets *[]string) *e
 	if field.Constraints.GT != nil || field.Constraints.GE != nil || field.Constraints.LE != nil {
 		number, ok := value.(json.Number)
 		if !ok {
-			return exit.Named(exit.Structural, "descriptor_constraint_unknown",
+			return exit.Named(exit.Structural, "package_interface_constraint_unknown",
 				"request field %s has numeric constraints on a non-numeric type", path)
 		}
 		parsed, err := strconv.ParseFloat(number.String(), 64)
@@ -367,15 +367,15 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 				return nil
 			}
 		default:
-			return exit.Named(exit.Structural, "descriptor_type_unknown",
-				"request field %s has unsupported descriptor scalar %q", path, scalar)
+			return exit.Named(exit.Structural, "package_interface_type_unknown",
+				"request field %s has unsupported package-interface scalar %q", path, scalar)
 		}
 		return exit.New(exit.Validation, "request field %s does not match declared %s", path, scalar)
 	}
 	var schema map[string]json.RawMessage
 	if json.Unmarshal(raw, &schema) != nil {
-		return exit.Named(exit.Structural, "descriptor_type_unknown",
-			"request field %s has an unreadable descriptor type", path)
+		return exit.Named(exit.Structural, "package_interface_type_unknown",
+			"request field %s has an unreadable package-interface type", path)
 	}
 	if _, ok := schema["asset"]; ok {
 		if ref, ok := value.(string); ok && ref != "" {
@@ -395,7 +395,7 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 	if literal, ok := schema["literal"]; ok {
 		var members []json.RawMessage
 		if json.Unmarshal(literal, &members) != nil || len(members) == 0 {
-			return exit.Named(exit.Structural, "descriptor_type_unknown",
+			return exit.Named(exit.Structural, "package_interface_type_unknown",
 				"request field %s has an unreadable literal", path)
 		}
 		actual, err := json.Marshal(value)
@@ -412,7 +412,7 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 	if union, ok := schema["union"]; ok {
 		var branches []json.RawMessage
 		if json.Unmarshal(union, &branches) != nil {
-			return exit.Named(exit.Structural, "descriptor_type_unknown",
+			return exit.Named(exit.Structural, "package_interface_type_unknown",
 				"request field %s has an unreadable union", path)
 		}
 		for _, branch := range branches {
@@ -442,7 +442,7 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 	if fields, ok := schema["fields"]; ok {
 		var nested Struct
 		if json.Unmarshal(raw, &nested) != nil {
-			return exit.Named(exit.Structural, "descriptor_type_unknown",
+			return exit.Named(exit.Structural, "package_interface_type_unknown",
 				"request field %s has unreadable nested fields", path)
 		}
 		object, ok := value.(map[string]any)
@@ -470,13 +470,13 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 		_ = fields
 		return nil
 	}
-	return exit.Named(exit.Structural, "descriptor_type_unknown",
-		"request field %s has an unsupported descriptor type", path)
+	return exit.Named(exit.Structural, "package_interface_type_unknown",
+		"request field %s has an unsupported package-interface type", path)
 }
 
-// canonicalFieldKey folds one typed argv key onto the descriptor's own field spelling
+// canonicalFieldKey folds one typed argv key onto the PackageInterface's own field spelling
 // (Paul, 2026-09-02): request-field NAMES are case-insensitive at the CLI composition
-// seam, the descriptor's spelling is canonical, and the wire carries ONLY the canonical
+// seam, the PackageInterface's spelling is canonical, and the wire carries ONLY the canonical
 // name — the daemon-side validator stays strict. An exact match always wins; a fold that
 // could reach two fields differing only by case refuses as ambiguous rather than
 // guessing. Values are untouched. An unmatched key returns unchanged so `declared`
@@ -566,7 +566,7 @@ func typedLiteral(ep *Entrypoint, key string, rendered json.RawMessage, raw stri
 		Literal []json.RawMessage `json:"literal"`
 	}
 	if json.Unmarshal(rendered, &schema) != nil || len(schema.Literal) == 0 {
-		return nil, exit.Named(exit.Structural, "descriptor_type_unknown",
+		return nil, exit.Named(exit.Structural, "package_interface_type_unknown",
 			"%s.%s has an unreadable literal type", ep.Name, key)
 	}
 	// A bare CLI token naturally spells a string literal. Check strings first so a
@@ -598,5 +598,5 @@ func typedLiteral(ep *Entrypoint, key string, rendered json.RawMessage, raw stri
 func wrongType(ep *Entrypoint, key, raw, want string) *exit.Error {
 	return exit.New(exit.Validation,
 		"%s.%s is declared %s and %q is not one", ep.Name, key, want, raw).
-		WithRemedy("the installed package.descriptor.json declares %s's request schema", ep.Name)
+		WithRemedy("the installed package.package-interface.json declares %s's request schema", ep.Name)
 }
