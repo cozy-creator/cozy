@@ -935,10 +935,13 @@ func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
 	return d, nil
 }
 
-// progress renders the live lane. Two shapes, and they are not the same surface:
-// `--stream` is NDJSON of the typed envelope for a machine, and the default is one
-// rewritten line for a person. Exported — with HumanWaitLine and WaitPatience — so the
-// product suite (#661: verification's one home) drives this exact render path.
+// progress renders the live lane. Three shapes, and they are not the same surface:
+// `--stream` is NDJSON of the typed envelope for a machine, a terminal gets ONE
+// carriage-return-rewritten line, and a redirected human command gets sparse
+// append-only lines — a stage change, each new tenth of the work, one line per five
+// quiet seconds — never the full lossy tick stream. --json stays untouched. Exported —
+// with HumanWaitLine and WaitPatience — so the product suite (#661: verification's one
+// home) drives this exact render path.
 type RunProgress struct {
 	ctx         *Context
 	stream      bool
@@ -953,10 +956,22 @@ type RunProgress struct {
 	stepStage   string
 	stepSeconds float64
 	stepSamples int
+
+	// The sparse lane's memory: which tenth of which stage was last appended, and when.
+	sparseStage  string
+	sparseDecile int
+	sparseAt     time.Time
+
+	// Injected clock and measure, so tests drive the REAL renderer deterministically.
+	now   func() time.Time
+	width func() int
 }
 
 func NewProgress(ctx *Context, stream bool, began time.Time) *RunProgress {
-	return &RunProgress{ctx: ctx, stream: stream, began: began}
+	return &RunProgress{
+		ctx: ctx, stream: stream, began: began, sparseDecile: -1,
+		now: time.Now, width: func() int { return terminalWidth(ctx.Err) },
+	}
 }
 
 func (p *RunProgress) On(e localapi.Event) bool {
@@ -973,10 +988,10 @@ func (p *RunProgress) On(e localapi.Event) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.observeWait(e)
-	// A redirected human command has no status line to rewrite. Its final result is the
-	// useful record; spraying every lossy tick into logs is neither progress nor a stable
-	// interface. --full deliberately restores the diagnostic stream.
+	// A redirected human command has no status line to rewrite: it gets the sparse
+	// append lane. --full deliberately restores the complete diagnostic stream.
 	if !p.ctx.Mode().Color && !p.ctx.Mode().Full {
+		p.sparse(e)
 		return true
 	}
 	p.render(p.line(e, p.ctx.Mode().Full))
@@ -992,7 +1007,10 @@ func (p *RunProgress) render(line string) {
 	// stderr, deliberately: stdout carries the RESULT, so a piped `cozy run` is not
 	// polluted by the progress of producing it.
 	if p.ctx.Mode().Color {
-		fmt.Fprintf(p.ctx.Err, "\r\033[K%s", line)
+		// The one in-place line. Clamped to the CURRENT terminal width on every write:
+		// a line that wraps leaves rows \r can never reach again, so on a narrow or
+		// just-resized terminal the tail is dropped instead.
+		fmt.Fprintf(p.ctx.Err, "\r\033[K%s", clampLine(line, p.width()))
 	} else {
 		fmt.Fprintln(p.ctx.Err, line)
 	}
@@ -1052,6 +1070,95 @@ func eventTime(e localapi.Event) time.Time {
 	return time.Now()
 }
 
+// sparse appends at most a few lines per stage to a redirected human stream: pass a
+// non-progress status line once, and pass step telemetry only on a stage change, on
+// each new tenth of the work, or after five quiet seconds.
+func (p *RunProgress) sparse(e localapi.Event) {
+	if strings.TrimPrefix(e.Type, "request.") != "progress" {
+		p.appendOnce(progressLine(e, false))
+		return
+	}
+	fields, ok := e.Payload["value"].(map[string]any)
+	if !ok {
+		p.appendOnce(humanProgress(e.Payload["value"]))
+		return
+	}
+	facts, ok := p.observe(fields)
+	if !ok {
+		p.appendOnce(humanStage(map[string]any{"name": stageLabel(facts.label)}))
+		return
+	}
+	decile := int(facts.fraction * 10)
+	stale := !p.sparseAt.IsZero() && p.now().Sub(p.sparseAt) >= 5*time.Second
+	if facts.label == p.sparseStage && decile == p.sparseDecile && !stale {
+		return
+	}
+	p.sparseStage, p.sparseDecile, p.sparseAt = facts.label, decile, p.now()
+	line := "  " + facts.label
+	if facts.counted {
+		line += fmt.Sprintf(" %d/%d", facts.current, facts.total)
+	}
+	line += fmt.Sprintf(" · %.0f%% · elapsed %s", facts.fraction*100, shortDuration(p.now().Sub(p.began)))
+	fmt.Fprintln(p.ctx.Err, line)
+}
+
+func (p *RunProgress) appendOnce(line string) {
+	if line == "" || line == p.last {
+		return
+	}
+	p.last = line
+	fmt.Fprintln(p.ctx.Err, line)
+}
+
+// stepFacts is one progress frame read through the accumulator: a display label, the
+// fraction, and — when the frame counts steps — current/total plus mean seconds per step.
+type stepFacts struct {
+	label    string
+	fraction float64
+	counted  bool
+	current  int64
+	total    int64
+	perStep  float64
+}
+
+// observe folds one progress payload into the per-stage step-time accumulator and
+// returns the frame's facts; ok is false when the frame carries no usable fraction.
+func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
+	name, _ := fields["name"].(string)
+	name = strings.TrimSpace(name)
+	fraction, fractionOK := number(fields["fraction"])
+	position, positionOK := number(fields["position"])
+	stepMS, stepOK := number(fields["step_ms"])
+	if name != "" && name != p.stepStage {
+		p.stepStage, p.stepSeconds, p.stepSamples = name, 0, 0
+	}
+	if stepOK && stepMS >= 0 {
+		p.stepSeconds += stepMS / 1000
+		p.stepSamples++
+	}
+	label := stageLabel(name)
+	if label == "" {
+		label = "running"
+	}
+	facts := stepFacts{label: label, fraction: fraction}
+	if !fractionOK || fraction < 0 || fraction > 1 {
+		facts.label = name
+		return facts, false
+	}
+	if positionOK && position > 0 && fraction > 0 {
+		facts.counted = true
+		facts.current = int64(position)
+		facts.total = int64(position/fraction + 0.5)
+		if facts.total < facts.current {
+			facts.total = facts.current
+		}
+	}
+	if p.stepSamples > 0 {
+		facts.perStep = p.stepSeconds / float64(p.stepSamples)
+	}
+	return facts, true
+}
+
 func (p *RunProgress) line(e localapi.Event, full bool) string {
 	if full {
 		return diagnosticProgressLine(e)
@@ -1067,46 +1174,35 @@ func (p *RunProgress) line(e localapi.Event, full bool) string {
 	if !ok {
 		return humanProgress(e.Payload["value"])
 	}
-	name, _ := fields["name"].(string)
-	name = strings.TrimSpace(name)
-	fraction, fractionOK := number(fields["fraction"])
-	position, positionOK := number(fields["position"])
-	stepMS, stepOK := number(fields["step_ms"])
-	if name != "" && name != p.stepStage {
-		p.stepStage, p.stepSeconds, p.stepSamples = name, 0, 0
+	facts, ok := p.observe(fields)
+	if !ok {
+		return humanStage(map[string]any{"name": stageLabel(facts.label)})
 	}
-	if stepOK && stepMS >= 0 {
-		p.stepSeconds += stepMS / 1000
-		p.stepSamples++
+	elapsed := p.now().Sub(p.began)
+	bar := progressBar(facts.fraction, 18)
+	if !facts.counted {
+		return fmt.Sprintf("  %s %s %.0f%% · %s", facts.label, bar, facts.fraction*100, shortDuration(elapsed))
 	}
-	if !fractionOK || fraction < 0 || fraction > 1 {
-		return humanStage(map[string]any{"name": stageLabel(name)})
-	}
-	elapsed := time.Since(p.began)
-	label := stageLabel(name)
-	if label == "" {
-		label = "running"
-	}
-	bar := progressBar(fraction, 18)
-	if !positionOK || position <= 0 || fraction <= 0 {
-		return fmt.Sprintf("  %s %s %.0f%% · %s", label, bar, fraction*100, shortDuration(elapsed))
-	}
-	total := int64(position/fraction + 0.5)
-	current := int64(position)
-	if total < current {
-		total = current
-	}
-	line := fmt.Sprintf("  %s %s %d/%d", label, bar, current, total)
-	if p.stepSamples > 0 {
-		seconds := p.stepSeconds / float64(p.stepSamples)
-		if seconds > 0 {
-			line += fmt.Sprintf(" · %.2fs/step · %.2f steps/s", seconds, 1/seconds)
-			remaining := time.Duration(float64(total-current) * seconds * float64(time.Second))
-			line += fmt.Sprintf(" · elapsed %s · ETA ~%s", shortDuration(elapsed), shortDuration(remaining))
-			return line
-		}
+	line := fmt.Sprintf("  %s %s %d/%d · %.0f%%", facts.label, bar, facts.current, facts.total, facts.fraction*100)
+	if facts.perStep > 0 {
+		line += fmt.Sprintf(" · %.2fs/step · %.2f steps/s", facts.perStep, 1/facts.perStep)
+		remaining := time.Duration(float64(facts.total-facts.current) * facts.perStep * float64(time.Second))
+		return line + fmt.Sprintf(" · elapsed %s · ETA ~%s", shortDuration(elapsed), shortDuration(remaining))
 	}
 	return line + " · elapsed " + shortDuration(elapsed)
+}
+
+// clampLine bounds one rewritten status line to the terminal: a wrapped line leaves
+// debris \r cannot reach.
+func clampLine(line string, width int) string {
+	if width <= 0 {
+		return line
+	}
+	runes := []rune(line)
+	if len(runes) < width {
+		return line
+	}
+	return string(runes[:width-1])
 }
 
 func progressBar(fraction float64, width int) string {
