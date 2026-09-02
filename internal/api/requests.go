@@ -630,29 +630,31 @@ func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBind
 // fields a local client has and a cloud one does not need to presign: the typed result,
 // the visible media by OPAQUE id, and the triage handle.
 type Lifecycle struct {
-	Number      int64          `json:"number"`
-	Kind        string         `json:"kind"`
-	RequestID   string         `json:"request_id"`
-	Status      string         `json:"status"`
-	Package     string         `json:"package"`
-	Function    string         `json:"function"`
-	Attempt     uint64         `json:"attempt"`
-	Attempts    int            `json:"attempts"`
-	QueuedMS    int64          `json:"queued_ms"`
-	ExecutionMS int64          `json:"execution_ms"`
-	Completion  *float64       `json:"completion,omitempty"`
-	ResponseURL string         `json:"response_url"`
-	Metrics     map[string]any `json:"metrics,omitempty"`
-	ErrorType   string         `json:"error_type,omitempty"`
-	Error       string         `json:"error,omitempty"`
+	Number        int64          `json:"number"`
+	Kind          string         `json:"kind"`
+	RequestID     string         `json:"request_id"`
+	Status        string         `json:"status"`
+	Package       string         `json:"package"`
+	Function      string         `json:"function"`
+	Attempt       uint64         `json:"attempt"`
+	Attempts      int            `json:"attempts"`
+	QueuedMS      int64          `json:"queued_ms"`
+	ExecutionMS   int64          `json:"execution_ms"`
+	Completion    *float64       `json:"completion,omitempty"`
+	RemainingMS   *int64         `json:"remaining_ms,omitempty"`
+	ProgressStage string         `json:"progress_stage,omitempty"`
+	ResponseURL   string         `json:"response_url"`
+	Metrics       map[string]any `json:"metrics,omitempty"`
+	ErrorType     string         `json:"error_type,omitempty"`
+	Error         string         `json:"error,omitempty"`
 	// CanceledBy is the recorded actor behind a canceled run (cl-108): the explicit
 	// `cozy run cancel`, a caller-authored --timeout, `cozy down --all` — never blank
 	// for a run this daemon canceled on request.
-	CanceledBy string `json:"canceled_by,omitempty"`
-	Result      any            `json:"result,omitempty"`
-	Outputs     []MediaRef     `json:"outputs"`
-	Triage      *TriageRef     `json:"triage,omitempty"`
-	Rental      bool           `json:"rental,omitempty"`
+	CanceledBy string     `json:"canceled_by,omitempty"`
+	Result     any        `json:"result,omitempty"`
+	Outputs    []MediaRef `json:"outputs"`
+	Triage     *TriageRef `json:"triage,omitempty"`
+	Rental     bool       `json:"rental,omitempty"`
 	// Machine is the venue this request's work landed on: `local` for a worker this host
 	// spawned, the rental's owner-scoped machine word recorded when a rental was bound to
 	// the request (cl-090, cl-107), blank while unassigned. The word is history the run
@@ -733,8 +735,12 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		}
 	}
 	if life.Status == "in_progress" {
-		if completion, ok := s.orchestrator.LatestCompletion(row.ID, life.Attempt); ok {
-			life.Completion = &completion
+		if progress, ok := s.orchestrator.LatestProgress(row.ID, life.Attempt); ok {
+			life.Completion = &progress.Fraction
+			life.ProgressStage = progress.Stage
+			if progress.Estimated {
+				life.RemainingMS = &progress.RemainingMS
+			}
 		}
 	}
 	if export, problem := s.store.OutputExportOf(row.ID); problem == nil && export != nil {

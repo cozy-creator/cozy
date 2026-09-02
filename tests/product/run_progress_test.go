@@ -165,7 +165,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 		return document.Invocations[0]
 	}
 	live := list()
-	percent := regexp.MustCompile(`^[1-9][0-9]?%$`)
+	percent := regexp.MustCompile(`^[1-9][0-9]?% · ~[0-9.]+[a-z]+$`)
 	if live.Status != "in_progress" || !percent.MatchString(live.Completion) {
 		t.Fatalf("live run has no measured completion: %+v", live)
 	}

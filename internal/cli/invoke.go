@@ -631,7 +631,7 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 	}
 	list := output.List{
 		Name: "invocations", Fields: []string{"number", "target", "machine", "status", "completion", "execution"},
-		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status", "completion", "queued", "execution", "attempts", "created"},
+		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status", "completion", "progress_stage", "queued", "execution", "attempts", "created"},
 		// The raw rental id is a machine fact: JSON always carries it, the compact
 		// human table never does — the human word is the MACHINE column (cl-107).
 		Machine: []string{"rental_id"},
@@ -653,7 +653,8 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 			"target": life.Package + "/" + life.Function, "machine": life.Machine,
 			"rental_id":  life.RentalID,
 			"status":     status,
-			"completion": completion(life), "queued": seconds(life.QueuedMS),
+			"completion": completion(life), "progress_stage": life.ProgressStage,
+			"queued":    seconds(life.QueuedMS),
 			"execution": seconds(life.ExecutionMS),
 			"attempts":  strconv.Itoa(life.Attempts), "created": life.CreatedAt,
 		})
@@ -674,7 +675,11 @@ func completion(life api.Lifecycle) string {
 	if life.Status != "in_progress" || life.Completion == nil {
 		return ""
 	}
-	return fmt.Sprintf("%.0f%%", *life.Completion*100)
+	value := fmt.Sprintf("%.0f%%", *life.Completion*100)
+	if life.RemainingMS != nil {
+		value += " · ~" + shortDuration(time.Duration(*life.RemainingMS)*time.Millisecond)
+	}
+	return value
 }
 
 func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error {
