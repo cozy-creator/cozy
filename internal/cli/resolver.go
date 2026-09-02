@@ -336,7 +336,7 @@ func (r *Resolver) ResolveInstall(installID string, models []orchestrator.ModelR
 				"package_model_binding_required",
 				"%s is installed as code but this modeled invocation supplied no exact model binding",
 				facts.Install.Package).
-				WithRemedy("invoke through `cozy run` so package defaults resolve, or pass --model [slot=]org/model@release")
+				WithRemedy("invoke through `cozy run` so package defaults resolve, or pass model.<param>=org/model@release")
 		}
 		return facts.Spec(r.Devices)
 	}
@@ -354,7 +354,7 @@ func (r *Resolver) ResolveInstall(installID string, models []orchestrator.ModelR
 				"editable_model_override_unsupported",
 				"%s is an editable install whose model selection was frozen at install",
 				facts.Install.Package).
-				WithRemedy("change package.toml and let the editable refresh re-derive it, or publish the package and use --model")
+				WithRemedy("change package.toml and let the editable refresh re-derive it, or publish the package and override with model.<param>=")
 		}
 		return spec, nil
 	}

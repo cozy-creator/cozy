@@ -284,9 +284,9 @@ func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string) 
 // ---------------------------------------------------------------- bindings (th-116)
 
 // PackageBindingRow is one mutable hub default: which model a package slot
-// loads when no --model speaks. Seeded from the shipped package.toml at release
-// commit and owner-mutable afterwards; the hub row is the ONE source and the
-// in-release toml is never consulted post-seed.
+// loads when no `model.<param>=` run key speaks. Seeded from the shipped
+// package.toml at release commit and owner-mutable afterwards; the hub row is
+// the ONE source and the in-release toml is never consulted post-seed.
 type PackageBindingRow struct {
 	Slot      string `json:"slot"`
 	Model     string `json:"model"`

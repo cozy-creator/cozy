@@ -39,11 +39,14 @@ import (
 func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.Error {
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA before a job exists — the same
 	// client-side check `cozy run` makes, over the job's own declared request struct.
-	input, e := launch.ParsePayload(&launch.Entrypoint{
-		Name: job.Name, Request: job.Request, Result: job.Result,
+	input, overrides, e := launch.ParsePayload(&launch.Entrypoint{
+		Name: job.Name, Request: job.Request, Result: job.Result, Models: job.Models,
 	}, ctx.Inv.Args[1:], ctx.Inv.Value("--in"))
 	if e != nil {
 		return e
+	}
+	if len(overrides) > 0 {
+		return exit.Usagef("model.<param>= applies to serving callables; remote modeled jobs are not supported yet")
 	}
 	trees, e := parseTrees(ctx.Inv.Values["--input"])
 	if e != nil {

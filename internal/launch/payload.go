@@ -29,41 +29,59 @@ import (
 // An undeclared key refuses HERE, before a request is recorded and long before a model
 // loads, because a typo should cost a millisecond.
 
-// ParsePayload builds one request document from the argv terms.
-func ParsePayload(ep *Entrypoint, terms []string, infile string) (json.RawMessage, *exit.Error) {
+// ParsePayload builds one request document from the argv terms, and collects the
+// reserved `model.<param>=<ref>` run keys beside it (cl-109). The exact-case dotted
+// `model.` prefix is matched BEFORE field case-folding and can never reach a payload
+// field — wire names carry no dot — so it routes to the returned override map, keyed
+// by the declared slot path. A bare `model=` term stays an ordinary payload field.
+func ParsePayload(ep *Entrypoint, terms []string, infile string) (
+	json.RawMessage, map[string]string, *exit.Error,
+) {
 	document := map[string]json.RawMessage{}
 
 	if infile != "" {
 		data, err := os.ReadFile(infile)
 		if err != nil {
-			return nil, exit.New(exit.NotFound, "--in %s: %s", infile, err).
+			return nil, nil, exit.New(exit.NotFound, "--in %s: %s", infile, err).
 				WithRemedy("--in takes one JSON file holding the whole payload")
 		}
 		var loaded map[string]json.RawMessage
 		if err := json.Unmarshal(data, &loaded); err != nil {
-			return nil, exit.New(exit.Validation, "--in %s does not hold one JSON object: %s", infile, err)
+			return nil, nil, exit.New(exit.Validation, "--in %s does not hold one JSON object: %s", infile, err)
 		}
 		for k, v := range loaded {
 			document[k] = v
 		}
 	}
 
+	overrides := map[string]string{}
 	var positional []string
 	for _, term := range terms {
+		if strings.HasPrefix(term, "model.") && strings.Contains(term, "=") {
+			slotPath, ref, e := modelOverrideTerm(ep, term)
+			if e != nil {
+				return nil, nil, e
+			}
+			if _, dup := overrides[slotPath]; dup {
+				return nil, nil, exit.Usagef("model slot %s was bound more than once", slotPath)
+			}
+			overrides[slotPath] = ref
+			continue
+		}
 		colon := strings.Index(term, ":=")
 		// `key:=json` only when the FIRST `=` is the one in `:=` — `a=b:=c` is a scalar.
 		if colon >= 0 && strings.Index(term, "=") == colon+1 {
 			key, raw := term[:colon], term[colon+2:]
 			if !json.Valid([]byte(raw)) {
-				return nil, exit.Usagef("%s:=… is not JSON: %s", key, raw).
+				return nil, nil, exit.Usagef("%s:=… is not JSON: %s", key, raw).
 					WithRemedy("`key:=<json>` carries a nested value verbatim; `key=value` is the scalar form")
 			}
 			key, e := canonicalFieldKey(ep, key)
 			if e != nil {
-				return nil, e
+				return nil, nil, e
 			}
 			if e := declared(ep, key); e != nil {
-				return nil, e
+				return nil, nil, e
 			}
 			document[key] = json.RawMessage(raw)
 			continue
@@ -71,33 +89,33 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (json.RawMessag
 		if key, raw, ok := strings.Cut(term, "="); ok {
 			key, e := canonicalFieldKey(ep, key)
 			if e != nil {
-				return nil, e
+				return nil, nil, e
 			}
 			if e := declared(ep, key); e != nil {
-				return nil, e
+				return nil, nil, e
 			}
 			if after, isFile := strings.CutPrefix(raw, "@"); isFile {
 				rendered, _ := ep.TypeOfField(key)
 				kind, _ := typeOf(rendered)
 				if kind == "asset" {
-					return nil, exit.New(exit.Validation,
+					return nil, nil, exit.New(exit.Validation,
 						"%s.%s is an input asset and key=@file has no grant identity", ep.Name, key).
 						WithRemedy("use `--asset %s=%s`; the schema field path becomes the input identity", key, after)
 				}
 				data, err := os.ReadFile(after)
 				if err != nil {
-					return nil, exit.New(exit.NotFound, "%s=@%s: %s", key, after, err)
+					return nil, nil, exit.New(exit.NotFound, "%s=@%s: %s", key, after, err)
 				}
 				encoded, err := json.Marshal(string(data))
 				if err != nil {
-					return nil, exit.Internalf("cannot carry %s: %s", after, err)
+					return nil, nil, exit.Internalf("cannot carry %s: %s", after, err)
 				}
 				document[key] = encoded
 				continue
 			}
 			value, e := typed(ep, key, raw)
 			if e != nil {
-				return nil, e
+				return nil, nil, e
 			}
 			document[key] = value
 			continue
@@ -113,25 +131,74 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (json.RawMessag
 			primary = ep.Request.Fields[0].Name
 		}
 		if primary == "" {
-			return nil, exit.Usagef("%s takes no positional value: it declares no request field", ep.Name)
+			return nil, nil, exit.Usagef("%s takes no positional value: it declares no request field", ep.Name)
 		}
 		if len(positional) > 1 {
-			return nil, exit.Usagef("%s takes ONE positional value (%s); got %d",
+			return nil, nil, exit.Usagef("%s takes ONE positional value (%s); got %d",
 				ep.Name, primary, len(positional)).
 				WithRemedy("every other field is `key=value`, `key=@file` or `key:=<json>`")
 		}
 		value, e := typed(ep, primary, positional[0])
 		if e != nil {
-			return nil, e
+			return nil, nil, e
 		}
 		document[primary] = value
 	}
 
 	data, err := json.Marshal(document)
 	if err != nil {
-		return nil, exit.Internalf("cannot render the payload: %s", err)
+		return nil, nil, exit.Internalf("cannot render the payload: %s", err)
 	}
-	return data, nil
+	return data, overrides, nil
+}
+
+// modelOverrideTerm claims one `model.`-prefixed argv term for the reserved run-key
+// grammar and resolves its `<param>` suffix onto a declared model slot. The structured
+// `model.<param>:={…}` form is refused: the ref suffix grammar already spells every
+// fact the resolver accepts.
+func modelOverrideTerm(ep *Entrypoint, term string) (slotPath, ref string, problem *exit.Error) {
+	colon := strings.Index(term, ":=")
+	if colon >= 0 && strings.Index(term, "=") == colon+1 {
+		return "", "", exit.Usagef("%s has no structured spelling", term[:colon]).
+			WithRemedy("the ref grammar carries every fact: %s=org/model[@release[/lane]][#sha256:<hex>]", term[:colon])
+	}
+	key, raw, _ := strings.Cut(term, "=")
+	slot, e := modelOverrideSlot(ep, strings.TrimPrefix(key, "model."))
+	if e != nil {
+		return "", "", e
+	}
+	return slot.Path, strings.TrimSpace(raw), nil
+}
+
+// modelOverrideSlot resolves a run key's `<param>` onto one declared slot. Params and
+// full slot paths are disjoint spellings (a param carries no dot, a path always does),
+// but the ambiguity guard stays: guessing between two slots is never right.
+func modelOverrideSlot(ep *Entrypoint, asked string) (*Slot, *exit.Error) {
+	var match *Slot
+	for i := range ep.Models {
+		slot := &ep.Models[i]
+		if asked != slot.Path && asked != slot.Param {
+			continue
+		}
+		if match != nil {
+			return nil, exit.Usagef("model slot %q is ambiguous; use its full descriptor path", asked)
+		}
+		match = slot
+	}
+	if match != nil {
+		return match, nil
+	}
+	if len(ep.Models) == 0 {
+		return nil, exit.Named(exit.Usage, "model_slot_unknown",
+			"no such model slot %q: %s declares no model slots", asked, ep.Name)
+	}
+	params := make([]string, 0, len(ep.Models))
+	for _, slot := range ep.Models {
+		params = append(params, slot.Param)
+	}
+	return nil, exit.Named(exit.Usage, "model_slot_unknown",
+		"no such model slot %q for %s", asked, ep.Name).
+		WithRemedy("%s declares: %s", ep.Name, strings.Join(params, ", "))
 }
 
 // ValidatePayload checks one already-rendered request object against the exact descriptor

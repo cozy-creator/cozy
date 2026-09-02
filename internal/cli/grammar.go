@@ -294,13 +294,12 @@ type RunCmd struct {
 
 type RunExecuteCmd struct {
 	Target         string   `arg:"" name:"target" help:"Package or callable as org/package[/function]."`
-	Input          []string `arg:"" optional:"" name:"input" help:"Primary value and field=value payload."`
+	Input          []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, and model.<param>=org/model[@release[/lane]][#sha256:<hex>] overrides."`
 	Out            string   `help:"Output directory." type:"path"`
 	Timeout        string   `help:"Request deadline."`
 	Stream         bool     `help:"Emit typed progress deltas."`
 	PayloadFile    string   `name:"in" help:"Read the whole payload from a JSON file, e.g. --in request.json." type:"path"`
 	Assets         []string `name:"asset" help:"Bind a local asset as field-path=file."`
-	Models         []string `name:"model" help:"Bind a model: --model org/model@release for one slot; --model slot=org/model@release for named slots."`
 	Rental         bool     `help:"Run on a Creator-managed rental."`
 	RentalOnly     bool     `help:"Require a remote rental even when local capacity is ready."`
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`
@@ -317,7 +316,6 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--rental-only", c.RentalOnly, "--describe", c.Describe), values(
 		"--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets,
-		"--model", c.Models,
 		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org), true)
 }
 
