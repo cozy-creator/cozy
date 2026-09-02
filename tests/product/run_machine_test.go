@@ -94,6 +94,20 @@ func TestRunListMachineColumn(t *testing.T) {
 		!strings.Contains(out, "MACHINE") || !strings.Contains(out, "otter") {
 		t.Fatalf("human run list does not show the MACHINE column [exit %d]\n%s", code, out)
 	}
+	// A pipe is always one snapshot: automation never inherits an endless refresh loop.
+	// Explicit watch likewise refuses without a terminal, and JSON is always snapshot-shaped.
+	if code, out := runCozy(t, root, "run", "list", "--watch"); code == 0 ||
+		!strings.Contains(out, "--watch requires interactive terminal output") {
+		t.Fatalf("piped watch did not refuse clearly [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "run", "list", "--watch", "--json"); code == 0 ||
+		!strings.Contains(out, "--watch requires interactive terminal output") {
+		t.Fatalf("JSON watch did not refuse clearly [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "run", "list", "--no-watch"); code != 0 ||
+		!strings.Contains(out, "MACHINE") {
+		t.Fatalf("explicit snapshot failed [exit %d]\n%s", code, out)
+	}
 
 	// The blank→name transition: the exact durable claim the fleet records, observed by
 	// the very next list. The list reads placement state as it is NOW, not as submitted.
