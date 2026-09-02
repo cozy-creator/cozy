@@ -58,6 +58,10 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (json.RawMessag
 				return nil, exit.Usagef("%s:=… is not JSON: %s", key, raw).
 					WithRemedy("`key:=<json>` carries a nested value verbatim; `key=value` is the scalar form")
 			}
+			key, e := canonicalFieldKey(ep, key)
+			if e != nil {
+				return nil, e
+			}
 			if e := declared(ep, key); e != nil {
 				return nil, e
 			}
@@ -65,6 +69,10 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (json.RawMessag
 			continue
 		}
 		if key, raw, ok := strings.Cut(term, "="); ok {
+			key, e := canonicalFieldKey(ep, key)
+			if e != nil {
+				return nil, e
+			}
 			if e := declared(ep, key); e != nil {
 				return nil, e
 			}
@@ -397,6 +405,36 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 	}
 	return exit.Named(exit.Structural, "descriptor_type_unknown",
 		"request field %s has an unsupported descriptor type", path)
+}
+
+// canonicalFieldKey folds one typed argv key onto the descriptor's own field spelling
+// (Paul, 2026-09-02): request-field NAMES are case-insensitive at the CLI composition
+// seam, the descriptor's spelling is canonical, and the wire carries ONLY the canonical
+// name — the daemon-side validator stays strict. An exact match always wins; a fold that
+// could reach two fields differing only by case refuses as ambiguous rather than
+// guessing. Values are untouched. An unmatched key returns unchanged so `declared`
+// refuses it with the contract remedy.
+func canonicalFieldKey(ep *Entrypoint, key string) (string, *exit.Error) {
+	if _, ok := ep.TypeOfField(key); ok {
+		return key, nil
+	}
+	match, count := "", 0
+	for _, field := range ep.Request.Fields {
+		if strings.EqualFold(field.Name, key) {
+			match = field.Name
+			count++
+		}
+	}
+	if count > 1 {
+		return "", exit.Named(exit.Validation, "request_field_case_ambiguous",
+			"%s declares %d request fields differing only by case; %q cannot fold onto one",
+			ep.Name, count, key).
+			WithRemedy("spell the field exactly; it declares: %s", strings.Join(ep.RequestFields(), ", "))
+	}
+	if count == 1 {
+		return match, nil
+	}
+	return key, nil
 }
 
 func declared(ep *Entrypoint, key string) *exit.Error {
