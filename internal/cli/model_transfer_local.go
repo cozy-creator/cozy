@@ -13,6 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/scratch"
 	"github.com/cozy-creator/cozy/internal/tfs"
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
@@ -31,9 +32,12 @@ func prepareLocalTransferSources(runCtx context.Context, ctx *Context, requestID
 	if problem != nil {
 		return nil, problem
 	}
-	if err := os.MkdirAll(layout.Transfer, 0o700); err != nil {
-		return nil, exit.Internalf("cannot create model transfer root: %s", err)
+	work, problem := scratch.Temp(layout.Transfer, "model-transfer-")
+	if problem != nil {
+		return nil, problem
 	}
+	defer work.Release()
+	root := work.Path
 	if strings.HasPrefix(intent.Source, "local/") {
 		name := strings.TrimPrefix(intent.Source, "local/")
 		alias, problem := tool.ResolveLocal(name)
@@ -41,7 +45,7 @@ func prepareLocalTransferSources(runCtx context.Context, ctx *Context, requestID
 			return nil, problem
 		}
 		evidence, problem := tool.CheckpointEvidence("local", name, alias.ManifestDigest,
-			filepath.Join(layout.Transfer, "model-transfer-local-evidence.jsonl"))
+			filepath.Join(root, "local-evidence.jsonl"))
 		if problem != nil {
 			return nil, problem
 		}
@@ -61,7 +65,7 @@ func prepareLocalTransferSources(runCtx context.Context, ctx *Context, requestID
 			return nil, exit.Named(exit.Conflict, "model_transfer.source_changed",
 				"Tensorhub source resolved to a different Manifest than the accepted request")
 		}
-		fetch.Scratch = scratch(layout, row.ManifestID)
+		fetch.Scratch = filepath.Join(root, "fetch")
 		fetched, problem := fetch.Acquire(hctx, row)
 		if problem != nil {
 			return nil, problem
@@ -78,11 +82,6 @@ func prepareLocalTransferSources(runCtx context.Context, ctx *Context, requestID
 	if problem != nil {
 		return nil, problem
 	}
-	root := filepath.Join(layout.Transfer, "model-transfer-"+shortTransferID(requestID))
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return nil, exit.Internalf("cannot create model transfer staging: %s", err)
-	}
-	defer os.RemoveAll(root)
 	selected, headerFiles, resolver, problem := stageLocalTransferHeaders(runCtx, ctx, parsed, root)
 	if problem != nil {
 		return nil, problem

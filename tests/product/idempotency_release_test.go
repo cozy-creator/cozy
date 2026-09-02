@@ -71,9 +71,12 @@ func TestCanceledRunReleasesItsIdempotencyKey(t *testing.T) {
 	if !released {
 		t.Fatal("a failed run's key must release once its cause is fixable")
 	}
-	fatal(t, func() *exit.Error { _, _, e := st.Submit(records.Request{
-		Kind: "job", Package: "paul/minimax-h3-tools", Entrypoint: "four-lane",
-		Org: "paul", ID: "req-idem-3", IdemKey: "keep-succeeded", Payload: []byte("{}")}); return e }())
+	fatal(t, func() *exit.Error {
+		_, _, e := st.Submit(records.Request{
+			Kind: "job", Package: "paul/minimax-h3-tools", Entrypoint: "four-lane",
+			Org: "paul", ID: "req-idem-3", IdemKey: "keep-succeeded", Payload: []byte("{}")})
+		return e
+	}())
 	if got, e := st.RequestByIdempotencyKey("keep-succeeded"); e != nil || got == nil {
 		t.Fatal("live key still replays")
 	}

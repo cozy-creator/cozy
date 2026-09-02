@@ -24,9 +24,11 @@ const editableRuntimeFixtureSHA = "5f2aea3625ea31c82f82f01ec3510c128411b74c"
 // binary against a real daemon on a real root; the only fixture is the weightless
 // package, which has no weights and so needs no card.
 func TestProductPath(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "editable-refresh")
-	must(t, os.RemoveAll(root))
-	must(t, os.MkdirAll(root, 0o755))
+	// A per-process root: sessions on one box run this suite concurrently, and a shared
+	// fixed path let one run's setup wipe another's mid-flight. Short on purpose — the
+	// daemon's worker socket lives under it and unix socket paths are bounded.
+	root, err := os.MkdirTemp(os.TempDir(), "cozy-product-")
+	must(t, err)
 	t.Cleanup(func() {
 		_, _ = runCozy(t, root, "down", "--all")
 		_ = os.RemoveAll(root)
@@ -73,13 +75,15 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("version-in-path remedy was not useful [exit %d]\n%s", code, out)
 	}
 
-	outputDir := filepath.Join(root, "human-run-output")
+	// THE DEFAULT LOCATION (cl-090): no --out, and the run still says where the file is —
+	// the package's own store, `outputs/<org>-<package>/<content digest>.<ext>`.
+	storeDir := filepath.Join(root, "outputs", "local-cozy-weightless-package")
 	code, stdout, stderr := runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
-		"size=32", "--out", outputDir, "--await")
+		"size=32", "--await")
 	if code != 0 {
 		t.Fatalf("human invocation failed [exit %d]\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
-	for _, useful := range []string{"pixels:", "revision:", "size:", "warm:", "saved:"} {
+	for _, useful := range []string{"pixels:", "revision:", "size:", "warm:", "saved:", storeDir + "/"} {
 		if !strings.Contains(stdout, useful) {
 			t.Errorf("human result omitted %q\n%s", useful, stdout)
 		}
@@ -94,28 +98,65 @@ func TestProductPath(t *testing.T) {
 			t.Errorf("redirected default progress exposed %q\n%s", raw, stderr)
 		}
 	}
-	files, err := os.ReadDir(outputDir)
+	if !strings.Contains(stderr, "Saving outputs to "+storeDir) {
+		t.Fatalf("invocation did not announce its real output directory before execution\n%s", stderr)
+	}
+	files, err := os.ReadDir(storeDir)
 	must(t, err)
 	if len(files) != 1 || !requestOutputName(files[0].Name(), ".webp") {
-		t.Fatalf("first invocation did not use one request-hash filename: %v", files)
-	}
-	if !strings.Contains(stderr, filepath.Join(outputDir, files[0].Name())) {
-		t.Fatalf("invocation did not announce its output hash before execution\n%s", stderr)
+		t.Fatalf("default location does not hold one content-digest file: %v", files)
 	}
 	firstOutput := files[0].Name()
-	code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
-		"size=32", "--out", outputDir)
+	if !strings.Contains(stdout, filepath.Join(storeDir, firstOutput)) {
+		t.Fatalf("saved: does not name the store path\n%s", stdout)
+	}
+	assertOnlyResultFiles(t, filepath.Join(root, "outputs"))
+	awaitAttemptsReclaimed(t, root)
+
+	// An unseeded run draws fresh entropy, so its bytes — and its name — differ.
+	code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile", "size=32")
 	if code != 0 {
 		t.Fatalf("second human invocation failed [exit %d]\n%s", code, stderr)
 	}
-	files, err = os.ReadDir(outputDir)
+	files, err = os.ReadDir(storeDir)
 	must(t, err)
 	if len(files) != 2 || files[0].Name() == files[1].Name() ||
 		!requestOutputName(files[0].Name(), ".webp") || !requestOutputName(files[1].Name(), ".webp") {
-		t.Fatalf("independent invocations did not retain two request-hash outputs: %v", files)
+		t.Fatalf("distinct results did not retain two content-digest files: %v", files)
 	}
-	if files[0].Name() != firstOutput && files[1].Name() != firstOutput {
-		t.Fatalf("second invocation replaced the first output %q: %v", firstOutput, files)
+	// The same bytes again land on the same name: one file, no second copy.
+	var stable string
+	for attempt := 0; attempt < 2; attempt++ {
+		code, stdout, _ = runCozyStreams(t, root, "run", localWeightlessRef+"/tile", "size=32", "seed=7", "--await")
+		if code != 0 || !strings.Contains(stdout, storeDir+"/") {
+			t.Fatalf("seeded invocation %d did not report its store path [exit %d]\n%s", attempt+1, code, stdout)
+		}
+		if files, err = os.ReadDir(storeDir); err != nil || len(files) != 3 {
+			t.Fatalf("seeded invocation %d did not land on one stable file: %v, %v", attempt+1, files, err)
+		}
+		reported := savedLine(stdout)
+		if stable == "" {
+			stable = reported
+		} else if stable != reported {
+			t.Fatalf("regenerating the same bytes reported a different path:\n%s\n%s", stable, reported)
+		}
+	}
+	assertOnlyResultFiles(t, filepath.Join(root, "outputs"))
+
+	// --out overrides the directory and keeps the naming.
+	outputDir := filepath.Join(root, "human-run-output")
+	code, stdout, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
+		"size=32", "seed=7", "--out", outputDir, "--await")
+	if code != 0 || !strings.Contains(stdout, outputDir+"/") {
+		t.Fatalf("--out invocation did not save under the requested directory [exit %d]\n%s\n%s",
+			code, stdout, stderr)
+	}
+	if outFiles, err := os.ReadDir(outputDir); err != nil || len(outFiles) != 1 ||
+		!strings.Contains(stable, outFiles[0].Name()) {
+		t.Fatalf("--out did not keep the content-digest name: %v, %v", outFiles, err)
+	}
+	if !strings.Contains(stderr, "Saving outputs to "+outputDir) {
+		t.Fatalf("--out invocation did not announce its directory\n%s", stderr)
 	}
 	fixedDir := filepath.Join(root, "fixed-seed-output")
 	for attempt := 0; attempt < 2; attempt++ {
@@ -130,6 +171,9 @@ func TestProductPath(t *testing.T) {
 	if len(fixed) != 1 || !requestOutputName(fixed[0].Name(), ".webp") {
 		t.Fatalf("the same explicit payload did not resolve to one stable filename: %v", fixed)
 	}
+	assertOnlyResultFiles(t, outputDir)
+	assertOnlyResultFiles(t, fixedDir)
+	awaitAttemptsReclaimed(t, root)
 
 	type listedRun struct {
 		Number  string `json:"number"`
@@ -212,9 +256,8 @@ func TestProductPath(t *testing.T) {
 	code, stdout, stderr = runCozyStreams(t, root, "--json", "run", localWeightlessRef+"/tile",
 		"size=32", "seed=9", "delay_ms=4500", "--out", detachedDir)
 	if code != 0 || !strings.Contains(stdout, `"status":"running"`) ||
-		!strings.Contains(stdout, `"output":"`+detachedDir) ||
-		!strings.Contains(stdout, `.webp"`) {
-		t.Fatalf("default run did not detach with its durable WebP destination [exit %d]\nstdout:\n%s\nstderr:\n%s",
+		!strings.Contains(stdout, `"output":"`+detachedDir+`"`) {
+		t.Fatalf("default run did not detach with its durable destination [exit %d]\nstdout:\n%s\nstderr:\n%s",
 			code, stdout, stderr)
 	}
 	deadline := time.Now().Add(10 * time.Second)
@@ -298,7 +341,8 @@ func TestProductPath(t *testing.T) {
 	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=7", "--idempotency-key", "placement-proof", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"revision":"first"`) ||
-		!strings.Contains(out, `"digest":`) || !strings.Contains(out, `"result":`) {
+		!strings.Contains(out, `"digest":`) || !strings.Contains(out, `"result":`) ||
+		!strings.Contains(out, `"saved":[{`) || !strings.Contains(out, `"path":"`+storeDir+"/") {
 		t.Fatalf("first editable invocation did not run source [exit %d]\n%s\n%s",
 			code, out, productWorkerLogs(root))
 	}
@@ -362,6 +406,64 @@ func TestProductPath(t *testing.T) {
 		"size=32", "seed=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"revision":"second"`) {
 		t.Fatalf("restored source did not reuse the last good install [exit %d]\n%s", code, out)
+	}
+}
+
+// savedLine is the one `saved:` entry of a human run document.
+func savedLine(stdout string) string {
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "- /") {
+			return strings.TrimSpace(line)
+		}
+	}
+	return ""
+}
+
+// assertOnlyResultFiles is the owner's rule for the user-facing store: nothing but
+// result files — `<content digest>.<ext>`, regular files — ever lands under outputs/ or
+// a --out directory. No payload, no manifest, no sidecar, no attempt directory.
+func assertOnlyResultFiles(t *testing.T, dir string) {
+	t.Helper()
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == dir {
+			return nil
+		}
+		rel, _ := filepath.Rel(dir, path)
+		if entry.IsDir() {
+			// The store is outputs/<org>-<package>/ and nothing deeper; --out is flat.
+			if filepath.Base(dir) != "outputs" || strings.Contains(rel, string(filepath.Separator)) ||
+				!strings.Contains(rel, "-") {
+				t.Errorf("%s holds a directory %s; the store is one flat directory per package", dir, rel)
+			}
+			return nil
+		}
+		if !entry.Type().IsRegular() || !requestOutputName(entry.Name(), filepath.Ext(entry.Name())) ||
+			filepath.Ext(entry.Name()) == "" {
+			t.Errorf("%s holds %s, which is not a <content digest>.<ext> result file", dir, rel)
+		}
+		return nil
+	})
+	must(t, err)
+}
+
+// awaitAttemptsReclaimed observes the attempt working directories go once every run has
+// settled and exported — the daemon's own act, not a client-side deletion.
+func awaitAttemptsReclaimed(t *testing.T, root string) {
+	t.Helper()
+	attempts := filepath.Join(root, "attempts")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		entries, err := os.ReadDir(attempts)
+		if err == nil && len(entries) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("attempt directories were not reclaimed after settlement: %v (%v)", entries, err)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 

@@ -12,7 +12,8 @@ import (
 
 // TestRecordsMigrationFromEleven migrates a REAL schema-11 database — the exact released
 // DDL, dumped from that schema's own sqlite_master and checked in beside this test — and
-// proves the schema-12 rename and the schema-13 rental column carried its rows. The owner's
+// proves the schema-12 rename, the schema-13 rental column, and the schema-14 export table
+// carried their rows. The owner's
 // machine holds one of these, so the property under test is not "a fresh database has the
 // new names" but "an existing database keeps its installs, pins, workers, requests and
 // rentals while the shape changes".
@@ -49,7 +50,7 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 13 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 14 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	for table, want := range map[string]string{"pins": "install_id", "worker_processes": "install_id"} {
@@ -68,6 +69,17 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	if err := db.QueryRow(`SELECT install_id FROM requests WHERE id='request-1'`).
 		Scan(&requestInstall); err != nil || requestInstall != "1111111111111111" {
 		t.Fatalf("request install after migration = %q, %v", requestInstall, err)
+	}
+	// A settled export keeps its published paths; the payload hash that used to name the
+	// file is gone with the column (schema 14: a file is named by its own content digest).
+	if columns := columnNames(t, db, "request_output_exports"); columns["payload_hash"] || !columns["directory"] {
+		t.Fatalf("request_output_exports columns after migration = %v", columns)
+	}
+	export, problem := store.OutputExportOf("request-1")
+	if problem != nil || export == nil || export.State != "published" ||
+		len(export.PublishedPaths) != 1 || export.PublishedPaths[0] != "/tmp/out/abc.png" ||
+		len(export.Outputs) != 1 || export.Outputs[0].OutputID != "image" {
+		t.Fatalf("output export after migration = %+v, %v", export, problem)
 	}
 	// A rental that was already ready when the schema moved keeps its row and gets no
 	// invented ready_at: its idle clock starts at its next settlement.
@@ -111,6 +123,11 @@ func writeSchemaElevenDatabase(t *testing.T, path string) {
 		  cert_path,state,hub,rented_at)
 		VALUES('rental-1','quiet-heron-0000000000000011','cpu','CPU',100000,'127.0.0.1:1',
 		  '/tmp/rental-1.pem','ready','https://hub.invalid','2026-01-01T00:00:00Z')`, `
+		INSERT INTO request_output_exports(request_id,directory,payload_hash,outputs,state,
+		  published_paths,updated_at)
+		VALUES('request-1','/tmp/out','abc',
+		  '[{"output_id":"image","media_type":"image/png","filename":"abc.png"}]',
+		  'published','["/tmp/out/abc.png"]','2026-01-01T00:00:00Z')`, `
 		PRAGMA user_version=11`} {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatalf("cannot build the schema-11 fixture: %v", err)

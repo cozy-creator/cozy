@@ -84,8 +84,12 @@ type Submission struct {
 	// RentalRequired is the explicit development/E2E override that forbids local capacity.
 	// It implies Rental and survives queue/restart scheduling in the request row.
 	RentalRequired bool
-	// OutputExport is the descriptor-derived local destination requested by the CLI.
-	// It changes no execution fact and is settled independently after terminal mirror.
+	// OutputDirectory is the caller's explicit --out; empty means the package's store.
+	// It is part of the submission's identity, where the derived intent below is not.
+	OutputDirectory string
+	// OutputExport is the derived publication obligation: the directory (explicit or
+	// default) and the result-file contract. It changes no execution fact and is settled
+	// independently after the terminal mirror.
 	OutputExport *records.OutputExportIntent
 	// ModelTransfer is a privileged materializer/finalizer attached to this
 	// ordinary request. It changes no lifecycle, placement, attempt, or event fact.
@@ -1545,10 +1549,13 @@ func modelAccess(req records.Request) []*pb.InputAccess {
 	return rows
 }
 
-// grant builds the LOCAL delivery grant: a payload input, every bound model, and one destination per result
-// field path, under this attempt's own directory. There is no credential — a local grant
-// is a CAS root plus an output dir, and a fabricated token would be a lie about
-// authority nobody issued.
+// grant builds the LOCAL delivery grant: a payload input, every bound model, and one
+// destination per result field path, under this attempt's own working directory
+// (attempts/<request>/<attempt>). Nothing durable lives there: the payload and every
+// other input sit under `in/`, result files are exported by their content digest into
+// the package's store or the caller's --out, and the directory is reclaimed. There is
+// no credential — a local grant is a CAS root plus a directory, and a fabricated token
+// would be a lie about authority nobody issued.
 func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Request) (*pb.DeliveryGrant, *exit.Error) {
 	dir := c.opt.Layout.AttemptDir(requestID, attempt)
 	inDir := filepath.Join(dir, "in")

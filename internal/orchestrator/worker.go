@@ -20,8 +20,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/processtree"
+	"github.com/cozy-creator/cozy/internal/reclaim"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
+	"github.com/cozy-creator/cozy/internal/units"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -1133,6 +1135,10 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 				return // the teardown that set stopping owns the row and recovery decision
 			}
 			<-w.attachDone
+			// Reclaimed BEFORE the row closes: the row holds the slot's device grant, so
+			// no replacement for this instance id can be spawned into the same root
+			// until it does.
+			c.reclaimWorker(instanceID)
 			closeProblem := c.opt.Store.CloseWorker(instanceID)
 			c.mu.Lock()
 			if c.workers[instanceID] == w {
@@ -1631,6 +1637,9 @@ func (c *Orchestrator) stopClaimedWorker(w *worker, grace time.Duration) bool {
 	if attachDone != nil {
 		<-attachDone
 	}
+	if w.media == nil {
+		c.reclaimWorker(w.instanceID) // before the row closes; see the exit path
+	}
 	closeProblem := c.opt.Store.CloseWorker(w.instanceID)
 	c.mu.Lock()
 	if c.workers[w.instanceID] == w {
@@ -1649,6 +1658,20 @@ func (c *Orchestrator) stopClaimedWorker(w *worker, grace time.Duration) bool {
 		c.logf("worker %s stopped; its device grant is released", w.instanceID)
 	}
 	return true
+}
+
+// reclaimWorker removes an exited local worker's root — its runtime home, scratch and
+// model-ingest copies — once its process is reaped and before its row closes. The log
+// stays until the next daemon start for the person the exit message pointed at it.
+func (c *Orchestrator) reclaimWorker(instanceID string) {
+	freed, problem := reclaim.Worker(c.opt.Layout, instanceID, true)
+	if problem != nil {
+		c.logf("worker %s root reclaim deferred: %s", instanceID, problem.Message)
+		return
+	}
+	if freed > 0 {
+		c.logf("worker %s root reclaimed: %s", instanceID, units.Bytes(freed))
+	}
 }
 
 // UnloadIdleLocalWorkers stops every definitely-idle local serving worker. Remote

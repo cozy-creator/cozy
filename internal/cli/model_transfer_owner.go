@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/scratch"
 	"github.com/cozy-creator/cozy/internal/tfs"
 	"github.com/cozy-creator/cozy/internal/transfer"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -158,10 +159,15 @@ func (o *modelTransferOwner) PassThrough(parent context.Context, requestID strin
 	if problem != nil {
 		return problem
 	}
+	work, problem := scratch.Temp(layout.Transfer, "model-transfer-")
+	if problem != nil {
+		return problem
+	}
+	defer work.Release()
 	if source.plan != nil {
 		temporary := "transfer-" + shortTransferID(requestID)
 		observed, problem := tool.ObserveLocal(temporary,
-			filepath.Join(layout.Transfer, "temp-observed.jsonl"))
+			filepath.Join(work.Path, "temp-observed.jsonl"))
 		if problem != nil {
 			return problem
 		}
@@ -174,7 +180,7 @@ func (o *modelTransferOwner) PassThrough(parent context.Context, requestID strin
 			return problem
 		}
 		evidence, problem := tool.CheckpointEvidence("local", temporary, alias.ManifestDigest,
-			filepath.Join(layout.Transfer, "temp-evidence.jsonl"))
+			filepath.Join(work.Path, "temp-evidence.jsonl"))
 		if problem != nil {
 			return problem
 		}
@@ -255,17 +261,21 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 		if problem != nil {
 			return "", problem
 		}
-		name := strings.TrimPrefix(intent.Destination, "local/")
-		observed, problem := tool.ObserveLocal(name,
-			filepath.Join(layout.Transfer, "local-observed.jsonl"))
+		work, problem := scratch.Temp(layout.Transfer, "model-transfer-")
 		if problem != nil {
 			return "", problem
 		}
-		evidencePath := filepath.Join(layout.Transfer, "local-evidence-"+weights.OutputSlot+".json")
+		defer work.Release()
+		name := strings.TrimPrefix(intent.Destination, "local/")
+		observed, problem := tool.ObserveLocal(name,
+			filepath.Join(work.Path, "local-observed.jsonl"))
+		if problem != nil {
+			return "", problem
+		}
+		evidencePath := filepath.Join(work.Path, "local-evidence-"+weights.OutputSlot+".json")
 		if err := os.WriteFile(evidencePath, weights.Evidence, 0o600); err != nil {
 			return "", exit.Internalf("cannot stage local checkpoint evidence: %s", err)
 		}
-		defer os.Remove(evidencePath)
 		alias, problem := tool.ReplaceLocal(name,
 			localFinalizationSelection(weights.RequestID, weights.OutputSlot), observed,
 			weights.ManifestID, weights.ManifestLength, evidencePath, expectedTFSContract(contract))
@@ -287,11 +297,16 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 		if problem != nil {
 			return "", problem
 		}
+		work, problem := scratch.Temp(layout.Transfer, "model-upload-")
+		if problem != nil {
+			return "", problem
+		}
+		defer work.Release()
 		upload := &transfer.Upload{Tool: tool, Hub: publicationClient, Ref: ref,
 			ManifestID: weights.ManifestID, CheckpointEvidence: weights.Evidence,
 			Session: transferOutputOperation(weights.RequestID, weights.OutputSlot),
 			Reason:  "cozy model upload " + intent.Source + " " + intent.Destination,
-			Scratch: scratch(layout, weights.ManifestID), Progress: progress(cli),
+			Scratch: work.Path, Progress: progress(cli),
 			ExpectedContract: expectedHubContract(contract)}
 		result, problem := upload.Run(ctx)
 		if problem != nil {
