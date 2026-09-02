@@ -110,6 +110,10 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 	descriptor, problem := describePublished(runtimeBin, sourceDir,
 		published.Selection.PackageDescriptor)
 	if problem != nil {
+		if published.ReportDefect != nil && problem.Name == "descriptor_mismatch" {
+			published.ReportDefect("package_prepare_descriptor_disagrees",
+				"local describe derived a different descriptor than the committed release")
+		}
 		return nil, empty, "", nil, problem
 	}
 	deferredModels := len(published.Models) == 0 && hasServingModelSlots(descriptor)
@@ -186,6 +190,10 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 			"cozy-runtime returned an invalid package preparation result")
 	}
 	if !bytes.Equal(answer.PackageDescriptor.Bytes, published.Selection.PackageDescriptor.Bytes) {
+		if published.ReportDefect != nil {
+			published.ReportDefect("package_prepare_descriptor_disagrees",
+				"local preparation derived a different descriptor than the committed release")
+		}
 		return nil, empty, "", nil, exit.Named(exit.Conflict, "descriptor_mismatch",
 			"the installed package describes a different callable surface than its committed release")
 	}

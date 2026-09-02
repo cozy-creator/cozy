@@ -169,6 +169,8 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 	w.revision, w.desiredRefusal = revision, nil
 	w.desiredPackages = clonePackageRefs(packages)
 	w.desiredModels = cloneModelRefs(models)
+	w.desiredDelegation = append([]byte(nil), delegation...)
+	w.desiredDelegationSignature = append([]byte(nil), signature...)
 	w.desiredPrivate = nil
 	w.desiredPrivatePlacement = nil
 	c.mu.Unlock()
@@ -426,6 +428,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				f.Subject == fmt.Sprintf("revision %d", desiredRevision) && permanentDesiredRefusal(f.Kind) {
 				w.desiredRefusal = exit.Named(exit.Structural, "placement_config_refused",
 					"the package worker refused its placement: %s — %s", f.Reason, brief(f.Detail, 240))
+				c.relayDescriptorDefect(w, desiredRevision, f)
 			}
 		}
 		if r.AcceptedDesiredStateRevision >= desiredRevision {
@@ -1338,4 +1341,40 @@ func shortNone(raw []byte) string {
 		return ""
 	}
 	return s
+}
+
+// descriptorDefectCode is the one pod refusal that falsifies a PUBLISHED
+// descriptor (cr-067): derivation on the pod disagreed with the committed
+// document. Every other preparation refusal is local to that worker.
+const descriptorDefectCode = "package_prepare_descriptor_disagrees"
+
+// relayDescriptorDefect files one defect report per desired revision when the
+// pod's typed refusal falsifies the published descriptor. The orchestrator
+// holds no hub client, so the report goes through the same kind of entrypoint
+// callback the package-set signer uses; the callback carries the exact signed
+// delegation this download ran under — the report's whole chain of authority.
+func (c *Orchestrator) relayDescriptorDefect(w *worker, revision uint64, f *pb.Fault) {
+	if c.opt.ReportReleaseDefect == nil || !strings.Contains(f.Detail, descriptorDefectCode) {
+		return
+	}
+	if w.spec.Connection == nil || w.spec.Connection.RentalID == "" ||
+		len(w.desiredDelegation) == 0 || len(w.desiredPackages) != 1 ||
+		w.defectReportedRevision == revision {
+		return
+	}
+	w.defectReportedRevision = revision
+	selected := w.desiredPackages[0]
+	report := ReleaseDefect{
+		Package:       selected.Package,
+		Release:       selected.Release,
+		ReleaseDigest: selected.ReleaseDigest,
+		RentalID:      w.spec.Connection.RentalID,
+		Delegation:    append([]byte(nil), w.desiredDelegation...),
+		Signature:     append([]byte(nil), w.desiredDelegationSignature...),
+		Code:          descriptorDefectCode,
+		Detail:        brief(f.Detail, 2048),
+	}
+	c.logf("relaying descriptor defect for %s@%s from rental %s",
+		report.Package, report.Release, report.RentalID)
+	go c.opt.ReportReleaseDefect(report)
 }

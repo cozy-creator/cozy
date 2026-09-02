@@ -48,7 +48,7 @@ func TestPublishedJobRentalClass(t *testing.T) {
 }
 
 func TestPackageReleaseRequirementsBindExactBytes(t *testing.T) {
-	raw := []byte(`{"format":"cozy.package.release/1","requirements":["cozy-runtime<1.0.0,>=0.0.34","torch<3,>=2.13"]}`)
+	raw := []byte(`{"format":"cozy.package.manifest/1","requirements":["cozy-runtime<1.0.0,>=0.0.34","torch<3,>=2.13"]}`)
 	sum := sha256.Sum256(raw)
 	// Go's outer JSON response encoder HTML-escapes `<` even though the stored
 	// PackageRelease writer does not. RawMessage therefore sees a different token

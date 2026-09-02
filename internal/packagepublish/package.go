@@ -38,6 +38,8 @@ type Package struct {
 	Descriptor       string
 	Wheel            string
 	DependencyWheels []DependencyWheel
+	Registry         []RegistryRow     // locked registry rows; Tensorhub fetches (cl-078)
+	Evidence         map[string]string // envelope-relative path -> local path
 	Tree             string
 	Root             string // disposable wheel output, empty until Build
 	Name             string
@@ -134,8 +136,9 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 		p.Root = ""
 		return problem
 	}
+	registry := []RegistryRow{}
 	if needsRegistry {
-		dependencies, problem = collectRegistryDependencies(ctx, p.Tree, root, dependencies)
+		registry, problem = collectRegistryRows(ctx, p.Tree, root, dependencies)
 		if problem != nil {
 			p.Close()
 			p.Root = ""
@@ -148,7 +151,7 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 		p.Root = ""
 		return problem
 	}
-	p.Wheel, p.Descriptor, p.DependencyWheels = project.Path, descriptor, dependencies
+	p.Wheel, p.Descriptor, p.DependencyWheels, p.Registry = project.Path, descriptor, dependencies, registry
 	return nil
 }
 
@@ -173,6 +176,16 @@ func describe(ctx context.Context, tree, root string) (string, *exit.Error) {
 		return "", exit.Internalf("cannot stage package descriptor: %s", err)
 	}
 	return path, nil
+}
+
+// Paths returns the sorted source-relative paths of one prepared tree.
+func Paths(files map[string]string) []string {
+	out := make([]string, 0, len(files))
+	for path := range files {
+		out = append(out, path)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // SourceIdentity binds an editable install to the exact publishable source tree.
@@ -397,25 +410,4 @@ func refusedSourceFile(name string) bool {
 		}
 	}
 	return false
-}
-
-func Paths(files map[string]string) []string {
-	paths := make([]string, 0, len(files))
-	for path := range files {
-		paths = append(paths, path)
-	}
-	sort.Strings(paths)
-	return paths
-}
-
-func WheelFilenames(wheels []DependencyWheel) []string {
-	if len(wheels) == 0 {
-		return nil
-	}
-	names := make([]string, 0, len(wheels))
-	for _, wheel := range wheels {
-		names = append(names, wheel.Filename)
-	}
-	sort.Strings(names)
-	return names
 }

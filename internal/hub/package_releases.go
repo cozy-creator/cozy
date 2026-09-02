@@ -19,17 +19,40 @@ import (
 // only to materialize Creator's independent local environment.
 const MaxPackageInstallDownloads = 131
 
-type PackageUpload struct {
-	Kind            string            `json:"kind,omitempty"`
-	Path            string            `json:"path,omitempty"`
+// PackageDeclaredFile is one publication subject: the caller's digest claim.
+// The hub answers each from the store's own HEAD (th-094 shape) and re-hashes
+// the stored bytes itself at finalize.
+type PackageDeclaredFile struct {
+	Digest string `json:"digest"`
+	Kind   string `json:"kind"`
+	Length int64  `json:"length"`
+	Path   string `json:"path"`
+}
+
+// PackageRegistryRow names one locked registry dependency for the hub to fetch
+// itself; the client never proxies registry bytes (cl-078).
+type PackageRegistryRow struct {
+	Name    string `json:"name"`
+	SHA256  string `json:"sha256"`
+	Size    int64  `json:"size"`
+	URL     string `json:"url"`
+	Version string `json:"version"`
+}
+
+type PackagePresignedUpload struct {
 	URL             string            `json:"url"`
 	RequiredHeaders map[string]string `json:"required_headers"`
-	AlreadyUploaded bool              `json:"already_uploaded"`
+}
+
+type PackageFileGrant struct {
+	PackageDeclaredFile
+	Present bool                    `json:"present"`
+	Upload  *PackagePresignedUpload `json:"upload,omitempty"`
 }
 
 type PackageReleaseDraft struct {
-	State   string          `json:"state"`
-	Uploads []PackageUpload `json:"uploads"`
+	State string             `json:"state"`
+	Files []PackageFileGrant `json:"files"`
 }
 
 type PackageReleaseCommit struct {
@@ -54,13 +77,16 @@ type PackageReleaseDetail struct {
 		CommittedAt             string `json:"committed_at,omitempty"`
 		Yanked                  bool   `json:"yanked,omitempty"`
 		YankedAt                string `json:"yanked_at,omitempty"`
+		Defective               bool   `json:"defective,omitempty"`
+		DefectiveAt             string `json:"defective_at,omitempty"`
+		DefectiveCode           string `json:"defective_code,omitempty"`
 	} `json:"release"`
 	Document          json.RawMessage `json:"document"`
 	PackageDescriptor json.RawMessage `json:"package_descriptor"`
 }
 
 // Requirements returns the immutable execution dependencies from the exact
-// PackageRelease/1 bytes. Creator needs only this one release fact to choose a
+// PackageManifest/1 bytes. Creator needs only this one release fact to choose a
 // CPU or accelerator product; it does not reinterpret the package descriptor's
 // model inputs as hardware requirements.
 func (d PackageReleaseDetail) Requirements() ([]string, *exit.Error) {
@@ -80,7 +106,7 @@ func (d PackageReleaseDetail) Constraints() ([]string, string, *exit.Error) {
 	canonicalDocument, err := canonical.NormalizeJCS(d.Document)
 	if err != nil {
 		return nil, "", exit.Named(exit.Structural, "hub.package_release_invalid",
-			"Tensorhub returned an invalid PackageRelease/1 document")
+			"Tensorhub returned an invalid PackageManifest/1 document")
 	}
 	sum := sha256.Sum256(canonicalDocument)
 	want := "sha256:" + hex.EncodeToString(sum[:])
@@ -94,9 +120,9 @@ func (d PackageReleaseDetail) Constraints() ([]string, string, *exit.Error) {
 		RequiresPython string   `json:"requires_python"`
 	}
 	if err := json.Unmarshal(canonicalDocument, &document); err != nil ||
-		document.Format != "cozy.package.release/1" || document.Requirements == nil {
+		document.Format != "cozy.package.manifest/1" || document.Requirements == nil {
 		return nil, "", exit.Named(exit.Structural, "hub.package_release_invalid",
-			"Tensorhub returned an invalid PackageRelease/1 document")
+			"Tensorhub returned an invalid PackageManifest/1 document")
 	}
 	for i, requirement := range document.Requirements {
 		if requirement == "" || i > 0 && requirement <= document.Requirements[i-1] {
@@ -138,19 +164,76 @@ func packagePublishPath(ref Ref, release string) string {
 }
 
 func (c *Client) DeclarePackageRelease(ctx context.Context, ref Ref, release string,
-	paths, dependencyWheels []string, reason string) (PackageReleaseDraft, *exit.Error) {
+	files []PackageDeclaredFile, reason string) (PackageReleaseDraft, *exit.Error) {
 	var out PackageReleaseDraft
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packagePublishPath(ref, release), auth: true, reason: reason,
-		body: map[string]any{"paths": paths, "dependency_wheels": dependencyWheels}, strict: true}, &out)
+		body: map[string]any{"files": files}, strict: true, responseBytes: 16 << 20}, &out)
 	return out, e
 }
 
-func (c *Client) CommitPackageRelease(ctx context.Context, ref Ref, release, reason string) (PackageReleaseCommit, *exit.Error) {
+func (c *Client) CommitPackageRelease(ctx context.Context, ref Ref, release string,
+	files []PackageDeclaredFile, registry []PackageRegistryRow, reason string,
+) (PackageReleaseCommit, *exit.Error) {
+	if registry == nil {
+		registry = []PackageRegistryRow{}
+	}
 	var out PackageReleaseCommit
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packagePublishPath(ref, release) + "/finalize", auth: true, reason: reason,
-		body: map[string]any{}, patient: true, strict: true}, &out)
+		body: map[string]any{"files": files, "registry": registry}, patient: true, strict: true}, &out)
+	return out, e
+}
+
+// PackageDeriveInputs resolves one declared source profile's lane for the
+// author-side evidence run: exact snapshot, canonical config bytes, and the
+// hub's active hardware-variant vocabulary.
+type PackageDeriveInputs struct {
+	Model            string   `json:"model"`
+	Release          string   `json:"release"`
+	Lane             string   `json:"lane"`
+	Snapshot         string   `json:"snapshot"`
+	ConfigBase64     string   `json:"config_base64"`
+	ConfigDigest     string   `json:"config_digest"`
+	ConfigLength     int64    `json:"config_length"`
+	HardwareVariants []string `json:"hardware_variants"`
+}
+
+func (c *Client) ModelDeriveInputs(ctx context.Context, ref Ref, lane string) (PackageDeriveInputs, *exit.Error) {
+	var out PackageDeriveInputs
+	query := url.Values{"lane": []string{lane}}
+	e := c.do(ctx, call{method: http.MethodGet,
+		path:   resourcePath("models", ref) + "/derive-inputs?" + query.Encode(),
+		strict: true, responseBytes: 16 << 20}, &out)
+	return out, e
+}
+
+type PackageDefectReport struct {
+	Code                string `json:"code"`
+	Detail              string `json:"detail"`
+	RentalID            string `json:"rental_id"`
+	DelegationBase64URL string `json:"delegation_base64url"`
+	SignatureBase64URL  string `json:"signature_base64url"`
+}
+
+type PackageDefectResult struct {
+	Changed    bool   `json:"changed"`
+	Code       string `json:"code"`
+	Release    string `json:"release"`
+	ReportedAt string `json:"reported_at"`
+	State      string `json:"state"`
+}
+
+// ReportPackageDefect relays a descriptor-falsifying pod refusal (th-106). The
+// hub authorizes the report by its chain: this account owns the named rental
+// and the presented creator-signed delegation named this exact release.
+func (c *Client) ReportPackageDefect(ctx context.Context, ref Ref, release string,
+	report PackageDefectReport, reason string,
+) (PackageDefectResult, *exit.Error) {
+	var out PackageDefectResult
+	e := c.do(ctx, call{method: http.MethodPost,
+		path: packageReleasePath(ref, release) + "/defects", auth: true, reason: reason,
+		body: report, strict: true}, &out)
 	return out, e
 }
 

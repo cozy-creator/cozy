@@ -2,7 +2,10 @@ package packagepublish
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -603,4 +606,19 @@ func canonicalLocalPath(value string) (string, *exit.Error) {
 		return "", exit.Named(exit.NotFound, "local_dependency_absent", "%s: %v", abs, err)
 	}
 	return filepath.Clean(canonical), nil
+}
+
+func dependencyDigest(path string) (string, *exit.Error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", exit.Named(exit.Structural, "dependency_wheel_unreadable",
+			"dependency wheel is unreadable: %s", path)
+	}
+	defer func() { _ = file.Close() }()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", exit.Named(exit.Structural, "dependency_wheel_unreadable",
+			"dependency wheel is unreadable: %s", path)
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
 }
