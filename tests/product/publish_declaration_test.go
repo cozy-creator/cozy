@@ -34,7 +34,7 @@ sha256 = "b09a2fe63e5e2249a4d0b5c086acc4372e1d44de2b76a4c72cebbdbef7231e67"
 `
 
 func TestRegistryLockRowsReplaceTheProxiedDownload(t *testing.T) {
-	rows, problem := packagepublish.RegistryRowsFromLock([]byte(frozenPylock), nil)
+	rows, problem := packagepublish.RegistryRowsFromLock([]byte(frozenPylock), nil, "")
 	if problem != nil {
 		t.Fatalf("frozen pylock refused: %v", problem)
 	}
@@ -50,23 +50,23 @@ func TestRegistryLockRowsReplaceTheProxiedDownload(t *testing.T) {
 
 	// The whole download discipline survives as row validation.
 	foreign := strings.Replace(frozenPylock, "files.pythonhosted.org", "evil.example.com", 1)
-	if _, problem := packagepublish.RegistryRowsFromLock([]byte(foreign), nil); problem == nil ||
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(foreign), nil, ""); problem == nil ||
 		problem.Name != "registry_dependency_origin_refused" {
 		t.Fatalf("foreign origin answered %v", problem)
 	}
 	otherIndex := strings.Replace(frozenPylock, "https://pypi.org/simple", "https://mirror.example/simple", 1)
-	if _, problem := packagepublish.RegistryRowsFromLock([]byte(otherIndex), nil); problem == nil ||
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(otherIndex), nil, ""); problem == nil ||
 		problem.Name != "registry_dependency_index_refused" {
 		t.Fatalf("unpinned index answered %v", problem)
 	}
 	rooted := strings.Replace(frozenPylock, `name = "annotated-doc"`, `name = "numpy"`, 1)
-	if _, problem := packagepublish.RegistryRowsFromLock([]byte(rooted), nil); problem == nil ||
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(rooted), nil, ""); problem == nil ||
 		problem.Name != "registry_dependency_platform_root_present" {
 		t.Fatalf("platform root answered %v", problem)
 	}
 	shortHash := strings.Replace(frozenPylock,
 		"b09a2fe63e5e2249a4d0b5c086acc4372e1d44de2b76a4c72cebbdbef7231e67", "b09a", 1)
-	if _, problem := packagepublish.RegistryRowsFromLock([]byte(shortHash), nil); problem == nil ||
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(shortHash), nil, ""); problem == nil ||
 		problem.Name != "registry_dependency_identity_invalid" {
 		t.Fatalf("unbounded identity answered %v", problem)
 	}
@@ -100,7 +100,7 @@ sha256 = "8fb4f71cba6129110c3374a33f919001ff130488fc23553698e34cc1c2a1198c"
 `
 
 func TestNativeRegistryWheelsAdmitThePlatformTarget(t *testing.T) {
-	rows, problem := packagepublish.RegistryRowsFromLock([]byte(nativePylock), nil)
+	rows, problem := packagepublish.RegistryRowsFromLock([]byte(nativePylock), nil, "")
 	if problem != nil {
 		t.Fatalf("native-only pylock refused: %v", problem)
 	}
@@ -115,14 +115,14 @@ func TestNativeRegistryWheelsAdmitThePlatformTarget(t *testing.T) {
 	wrong := strings.ReplaceAll(nativePylock,
 		"cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64", "cp38-abi3-win_amd64")
 	wrong = strings.ReplaceAll(wrong, "cp38-abi3-musllinux_1_2_x86_64", "cp311-cp311-macosx_11_0_arm64")
-	if _, problem := packagepublish.RegistryRowsFromLock([]byte(wrong), nil); problem == nil ||
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(wrong), nil, ""); problem == nil ||
 		problem.Name != "registry_dependency_platform_mismatch" {
 		t.Fatalf("wrong-platform wheels answered %v", problem)
 	}
 
 	// A pure wheel stays first choice over any native wheel.
 	pure := strings.Replace(nativePylock, "cp38-abi3-musllinux_1_2_x86_64", "py3-none-any", 1)
-	rows, problem = packagepublish.RegistryRowsFromLock([]byte(pure), nil)
+	rows, problem = packagepublish.RegistryRowsFromLock([]byte(pure), nil, "")
 	if problem != nil || len(rows) != 1 || !strings.HasSuffix(rows[0].URL, "-py3-none-any.whl") {
 		t.Fatalf("pure preference answered rows=%+v problem=%v", rows, problem)
 	}
@@ -130,14 +130,14 @@ func TestNativeRegistryWheelsAdmitThePlatformTarget(t *testing.T) {
 	// Among natives the most specific python tag wins, then the newest manylinux.
 	specific := strings.Replace(nativePylock, "cp38-abi3-musllinux_1_2_x86_64",
 		"cp312-cp312-manylinux_2_17_x86_64", 1)
-	rows, problem = packagepublish.RegistryRowsFromLock([]byte(specific), nil)
+	rows, problem = packagepublish.RegistryRowsFromLock([]byte(specific), nil, "")
 	if problem != nil || len(rows) != 1 || !strings.HasSuffix(rows[0].URL,
 		"hf_xet-1.6.0-cp312-cp312-manylinux_2_17_x86_64.whl") {
 		t.Fatalf("python specificity answered rows=%+v problem=%v", rows, problem)
 	}
 	newest := strings.Replace(nativePylock, "cp38-abi3-musllinux_1_2_x86_64",
 		"cp38-abi3-manylinux_2_28_x86_64", 1)
-	rows, problem = packagepublish.RegistryRowsFromLock([]byte(newest), nil)
+	rows, problem = packagepublish.RegistryRowsFromLock([]byte(newest), nil, "")
 	if problem != nil || len(rows) != 1 || !strings.HasSuffix(rows[0].URL,
 		"hf_xet-1.6.0-cp38-abi3-manylinux_2_28_x86_64.whl") {
 		t.Fatalf("newest manylinux answered rows=%+v problem=%v", rows, problem)
@@ -147,7 +147,7 @@ func TestNativeRegistryWheelsAdmitThePlatformTarget(t *testing.T) {
 	tooNew := strings.ReplaceAll(nativePylock,
 		"cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64", "cp38-abi3-manylinux_2_39_x86_64")
 	tooNew = strings.ReplaceAll(tooNew, "cp38-abi3-musllinux_1_2_x86_64", "cp38-abi3-win_amd64")
-	if _, problem := packagepublish.RegistryRowsFromLock([]byte(tooNew), nil); problem == nil ||
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(tooNew), nil, ""); problem == nil ||
 		problem.Name != "registry_dependency_platform_mismatch" {
 		t.Fatalf("over-cap manylinux answered %v", problem)
 	}
@@ -197,5 +197,65 @@ func TestUnresolvableSourceProfilesRefuseBeforeAnyDerivation(t *testing.T) {
 		if got != [4]string{"acme/sd-turbo", "1.0.0", "bf16", config} {
 			t.Fatalf("profile %q resolved as %v", profile, got)
 		}
+	}
+}
+
+// th-113 client half: a row locked to the publisher's OWN org index references
+// a wheel already in the hub's custody — publish declares nothing and ships
+// nothing for it; the published uv.lock carries its URL and hash and install
+// resolves it from the hub exactly like PyPI. Any other index still refuses.
+// The sdxl rows are the real quantize uv.lock rows against the dev hub.
+const orgIndexPylock = `lock-version = "1.0"
+created-by = "uv"
+
+[[packages]]
+name = "annotated-doc"
+version = "0.0.3"
+index = "https://pypi.org/simple"
+
+[[packages.wheels]]
+url = "https://files.pythonhosted.org/packages/d1/23/annotated_doc-0.0.3-py3-none-any.whl"
+size = 6118
+
+[packages.wheels.hashes]
+sha256 = "b09a2fe63e5e2249a4d0b5c086acc4372e1d44de2b76a4c72cebbdbef7231e67"
+
+[[packages]]
+name = "sdxl"
+version = "2.0.16"
+index = "http://127.0.0.1:8819/v1/index/paul/simple/"
+
+[[packages.wheels]]
+url = "http://127.0.0.1:8819/v1/index/paul/files/f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7/sdxl-2.0.16-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7"
+`
+
+func TestSameOrgIndexRowsRideTheLockAndDeclareNothing(t *testing.T) {
+	rows, problem := packagepublish.RegistryRowsFromLock([]byte(orgIndexPylock), nil, "paul")
+	if problem != nil {
+		t.Fatalf("same-org index row refused: %v", problem)
+	}
+	if len(rows) != 1 || rows[0].Name != "annotated-doc" {
+		t.Fatalf("rows = %+v, want only the PyPI row", rows)
+	}
+
+	// Another org's namespace is not this publisher's to link.
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(orgIndexPylock), nil, "acme"); problem == nil ||
+		problem.Name != "registry_dependency_index_refused" {
+		t.Fatalf("foreign-org index answered %v", problem)
+	}
+	// No declared organization admits no org index at all.
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(orgIndexPylock), nil, ""); problem == nil ||
+		problem.Name != "registry_dependency_index_refused" {
+		t.Fatalf("org-less publish answered %v", problem)
+	}
+	// The namespace is read from the one hub index shape, never a lookalike path.
+	lookalike := strings.Replace(orgIndexPylock,
+		"http://127.0.0.1:8819/v1/index/paul/simple/", "http://127.0.0.1:8819/paul/simple/", 1)
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(lookalike), nil, "paul"); problem == nil ||
+		problem.Name != "registry_dependency_index_refused" {
+		t.Fatalf("lookalike index path answered %v", problem)
 	}
 }

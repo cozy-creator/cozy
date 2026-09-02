@@ -59,7 +59,7 @@ type exactDependency struct {
 	version string
 }
 
-func collectRegistryRows(ctx context.Context, project, stage string, existing []DependencyWheel) ([]RegistryRow, *exit.Error) {
+func collectRegistryRows(ctx context.Context, project, stage, organization string, existing []DependencyWheel) ([]RegistryRow, *exit.Error) {
 	lockPath := filepath.Join(stage, "pylock.registry.toml")
 	args := []string{"export", "--locked", "--no-dev", "--no-emit-project", "--no-emit-local",
 		"--format", "pylock.toml", "--output-file", lockPath, "--no-progress", "--directory", project}
@@ -87,10 +87,26 @@ func collectRegistryRows(ctx context.Context, project, stage string, existing []
 		return nil, exit.Named(exit.Structural, "registry_dependency_export_invalid",
 			"uv export did not produce a non-empty pylock.toml at or below %d B", maxLockBytes)
 	}
-	return RegistryRowsFromLock(raw, existing)
+	return RegistryRowsFromLock(raw, existing, organization)
 }
 
-func RegistryRowsFromLock(raw []byte, existing []DependencyWheel) ([]RegistryRow, *exit.Error) {
+// orgIndexNamespace answers the org namespace when raw is one hub org index —
+// http(s), path exactly /v1/index/<org>/simple/ (th-113) — and "" otherwise.
+func orgIndexNamespace(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "index" || parts[3] != "simple" ||
+		parts[2] == "" {
+		return ""
+	}
+	return parts[2]
+}
+
+func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization string) ([]RegistryRow, *exit.Error) {
 	var lock registryLock
 	if err := toml.Unmarshal(raw, &lock); err != nil || lock.LockVersion != "1.0" {
 		return nil, exit.Named(exit.Validation, "registry_dependency_lock_invalid",
@@ -123,8 +139,16 @@ func RegistryRowsFromLock(raw []byte, existing []DependencyWheel) ([]RegistryRow
 				"uv export retained platform-owned root %s", name)
 		}
 		if pkg.Index != "https://pypi.org/simple" {
+			// th-113: a same-org index row references a wheel already in the hub's
+			// own custody. The published uv.lock carries its URL and hash; publish
+			// declares nothing and ships nothing for it, and install resolves it
+			// from the hub exactly like PyPI.
+			if organization != "" && orgIndexNamespace(pkg.Index) == organization {
+				continue
+			}
 			return nil, exit.Named(exit.Validation, "registry_dependency_index_refused",
-				"%s==%s is not locked to the public PyPI index", name, pkg.Version)
+				"%s==%s is locked to neither the public PyPI index nor this package's own org index",
+				name, pkg.Version)
 		}
 		candidate, problem := selectRegistryWheel(name, pkg)
 		if problem != nil {
