@@ -67,7 +67,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 16
+const schemaVersion = 17
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -165,15 +165,16 @@ func Open(path string) (*Store, *exit.Error) {
 	return &Store{db: db}, nil
 }
 
-// Schemas 6 through 14 migrate in place. Schema 11 replaces authored GPU counts with
+// Schemas 6 through 16 migrate in place. Schema 11 replaces authored GPU counts with
 // the one derived accelerator-class fact; schema 12 gives the install table and its two
 // foreign keys the one word the row actually names; schema 13 records when a rental was
 // first seen ready; schema 14 drops the output export's pre-execution payload hash — a
 // file is named by its own content digest now; schema 15 spells the request's editable
 // revision columns `local_package_*` (proto-027: one word for a local package); schema 16
-// adds the package_events table (cl-097) and touches nothing else. Package, request,
-// event, export, and rental rows survive; only schema 9's superseded special
-// model-production subsystem is dropped.
+// adds the package_events table (cl-097); schema 17 records the rental's machine word on
+// the request (cl-107) — existing rows joinable to a surviving rental get their word,
+// unjoinable history stays blank. Package, request, event, export, and rental rows
+// survive; only schema 9's superseded special model-production subsystem is dropped.
 // Schema 10 creates empty request-attached transfer sidecars because older rows cannot be
 // translated into ordinary request identity safely.
 func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
@@ -208,8 +209,8 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 	}
 	// Each rebuild runs only from a schema that still has the prior shape: the install
 	// rename is schema 12's, the rental rebuild ends at 13, the export table's payload
-	// hash goes at 14, the request rebuild ends at 15 (its column spelling), and package
-	// events arrive at 16. A 15 → 16 migration adds one table.
+	// hash goes at 14, package events arrive at 16, and the request rebuild ends at 17
+	// (the recorded machine word), which is also where its rows get their backfill.
 	if sourceVersion < 12 {
 		if e := migrateInstalls(tx, path); e != nil {
 			return e
@@ -225,7 +226,7 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			return e
 		}
 	}
-	if sourceVersion < 15 {
+	if sourceVersion < 17 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
 		}
@@ -251,7 +252,7 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			}
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=16`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=17`); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
 	if e := commitMigration(tx, path); e != nil {
@@ -358,8 +359,9 @@ func migrateOutputExports(tx *sql.Tx, path string) *exit.Error {
 
 // migrateRequests rebuilds the requests table on every migration: before schema 11 to derive
 // the accelerator-class fact from the retired GPU count, at schema 12 because the row's own
-// DDL text names the install table it references, and at schema 15 because the editable
-// revision columns are spelled `local_package_*`.
+// DDL text names the install table it references, at schema 15 because the editable
+// revision columns are spelled `local_package_*`, and at schema 17 to record the rental's
+// machine word — backfilled from a surviving rental row, blank for unjoinable history.
 func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	if _, err := tx.Exec(`ALTER TABLE requests RENAME TO requests_prior`); err != nil {
 		return exit.Internalf("cannot stage request rows while migrating %s: %s", path, err)
@@ -370,7 +372,7 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	destinationColumns := `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
 		package_revision_digest,local_package_digest,local_package_uploaded_boot_id,
 		environment_digest,config_digest,payload,outputs,state,ordinal,requeues,created_at,kind,
-		needs_accelerator,org,trees,worker,rental,rental_required,install_id,assets,models,weights_outputs`
+		needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,models,weights_outputs`
 	rentalRequired := "rental_required"
 	if sourceVersion == 6 {
 		rentalRequired = "0"
@@ -379,11 +381,17 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	if sourceVersion < 11 {
 		needsAccelerator = `CASE WHEN job_gpu_count>0 OR (kind!='job' AND models!='[]') THEN 1 ELSE 0 END`
 	}
+	localPackage := `private_package_digest,private_package_uploaded_boot_id`
+	if sourceVersion >= 15 {
+		localPackage = `local_package_digest,local_package_uploaded_boot_id`
+	}
+	machine := `COALESCE((SELECT machine_name FROM rentals WHERE rentals.id=requests_prior.worker),'')`
 	selectColumns := `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
-		package_revision_digest,private_package_digest,private_package_uploaded_boot_id,
+		package_revision_digest,` + localPackage + `,
 		environment_digest,config_digest,payload,outputs,state,ordinal,requeues,created_at,kind,` +
 		needsAccelerator + `,
-		org,trees,worker,rental,` + rentalRequired + `,install_id,assets,models,weights_outputs`
+		org,trees,worker,` + machine + `,rental,` + rentalRequired +
+		`,install_id,assets,models,weights_outputs`
 	if _, err := tx.Exec(`INSERT INTO requests(` + destinationColumns + `) SELECT ` + selectColumns +
 		` FROM requests_prior`); err != nil {
 		return exit.Internalf("cannot preserve request rows while migrating %s: %s", path, err)
@@ -415,7 +423,10 @@ CREATE TABLE IF NOT EXISTS rentals (
 // priorStatements is the released DDL of one earlier schema, derived from the current one
 // so a released shape is never a second copy that can drift from it.
 func priorStatements(version int) []string {
-	priorRequests := strings.Replace(requestsDDL,
+	// Every schema before 17 carried the requests row without its recorded machine word.
+	priorRequestsSixteen := strings.Replace(requestsDDL,
+		"  machine      TEXT    NOT NULL DEFAULT '',\n", "", 1)
+	priorRequests := strings.Replace(priorRequestsSixteen,
 		"  needs_accelerator INTEGER NOT NULL DEFAULT 0,\n",
 		"  job_gpu_count INTEGER NOT NULL DEFAULT 0,\n", 1)
 	priorRequestsSix := strings.Replace(priorRequests,
@@ -428,7 +439,7 @@ func priorStatements(version int) []string {
 		"  directory        TEXT    NOT NULL,\n  payload_hash     TEXT    NOT NULL,\n", 1)
 	priorRequests = priorLocalPackageNames(priorRequests)
 	priorRequestsSix = priorLocalPackageNames(priorRequestsSix)
-	priorRequestsFourteen := priorLocalPackageNames(requestsDDL)
+	priorRequestsFourteen := priorLocalPackageNames(priorRequestsSixteen)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
 		if version < 10 && containsStatement(modelTransferSchema, statement) ||
@@ -448,6 +459,8 @@ func priorStatements(version int) []string {
 			stmt = priorRequests
 		case stmt == requestsDDL && version < 15:
 			stmt = priorRequestsFourteen
+		case stmt == requestsDDL && version < 17:
+			stmt = priorRequestsSixteen
 		case stmt == rentalsDDL && version < 8:
 			stmt = rentalsDDLPrior
 		case stmt == rentalsDDL && version < 13:
@@ -568,7 +581,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=16`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=17`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {

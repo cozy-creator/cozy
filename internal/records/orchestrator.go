@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS requests (
   org          TEXT    NOT NULL DEFAULT '',
   trees        TEXT    NOT NULL DEFAULT '',
   worker       TEXT    NOT NULL DEFAULT '',
+  machine      TEXT    NOT NULL DEFAULT '',
   rental       INTEGER NOT NULL DEFAULT 0,
   rental_required INTEGER NOT NULL DEFAULT 0,
   install_id   TEXT    REFERENCES installs(id),
@@ -470,6 +471,11 @@ type Request struct {
 	// It lives on the request because a requeue must re-derive the same placement
 	// without a client saying so again. Empty = any local worker.
 	Worker string
+	// Machine is the human machine word of the rental this request was bound to,
+	// recorded when the word is known (acquisition start, claim, or pinned
+	// submission) and kept as history after the rental row is gone (cl-107).
+	// Empty = never bound to a rental.
+	Machine string
 	// Rental authorizes placement on Creator-managed rented capacity.
 	Rental bool
 	// RentalRequired forbids local placement for the hidden development/E2E override.
@@ -530,7 +536,7 @@ type ModelRef struct {
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
 	package_revision_digest,local_package_digest,local_package_uploaded_boot_id,
 	environment_digest,config_digest,payload,outputs,
-	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,rental,rental_required,
+	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
 	COALESCE(install_id,''),assets,models,weights_outputs`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
@@ -538,7 +544,7 @@ func requestScanTargets(r *Request, assets, models *string) []any {
 		&r.Release, &r.PackageRevisionDigest, &r.LocalPackageDigest,
 		&r.LocalPackageUploadedBootID, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
-		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Rental, &r.RentalRequired,
+		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
 		&r.InstallID, assets, models, &r.WeightsOutputs}
 }
 
@@ -765,10 +771,14 @@ func (s *Store) MarkLocalPackageUploaded(id, digest, bootID string) *exit.Error 
 
 // AssignManagedRental pins one still-queued --rental request to the exact pod
 // Creator acquired for it. A cancellation that wins first leaves worker empty,
-// which tells the caller to release the otherwise-unused rental.
+// which tells the caller to release the otherwise-unused rental. The claim also
+// records the rental's machine word on the request (cl-107): the word is history
+// the run keeps after the rental row is gone, never a read-time join.
 func (s *Store) AssignManagedRental(id, rentalID string) (bool, *exit.Error) {
-	result, err := s.db.Exec(`UPDATE requests SET worker=? WHERE id=? AND rental=1 AND worker='' AND
-		state IN ('submitted','queued','requeue_pending')`, rentalID, id)
+	result, err := s.db.Exec(`UPDATE requests SET worker=?,
+		machine=COALESCE((SELECT machine_name FROM rentals WHERE id=?),machine)
+		WHERE id=? AND rental=1 AND worker='' AND
+		state IN ('submitted','queued','requeue_pending')`, rentalID, rentalID, id)
 	if err != nil {
 		return false, exit.Internalf("cannot assign request %s to rental %s: %s", id, rentalID, err)
 	}
@@ -1160,13 +1170,15 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
 		plan_id,package_release,package_revision_digest,local_package_digest,
 		local_package_uploaded_boot_id,environment_digest,config_digest,
-		payload,outputs,state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,rental,rental_required,install_id,assets,models,
+		payload,outputs,state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,models,
 		weights_outputs)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
+		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.PackageRevisionDigest, r.LocalPackageDigest,
 		r.LocalPackageUploadedBootID, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
-		r.Outputs, r.State, r.CreatedAt, r.Kind, r.NeedsAccelerator, r.Org, r.Trees, r.Worker, r.Rental,
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.NeedsAccelerator, r.Org, r.Trees, r.Worker,
+		r.Worker, r.Rental,
 		r.RentalRequired,
 		nullable(r.InstallID),
 		assets, models, r.WeightsOutputs); err != nil {

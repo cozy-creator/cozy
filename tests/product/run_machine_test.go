@@ -8,15 +8,18 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// TestRunListMachineColumn is cl-090 as behaviour: `cozy run list` says WHERE each run
-// executes without changing the one monotonic numbering. A rental-claimed run carries the
-// rental's owner-scoped machine word (cl-088), an unclaimed one stays blank, and the fact
-// is read from current placement state — the same `requests.worker` row the fleet's
-// AssignManagedRental writes — so a queued run gains its machine the moment a rental
-// claims it. The local arm lives in TestProductPath, beside the runs that produce it.
+// TestRunListMachineColumn is cl-090 and cl-107 as behaviour: `cozy run list` says WHERE
+// each run executes without changing the one monotonic numbering. A rental-claimed run
+// carries the rental's owner-scoped machine word (cl-088), an unclaimed one stays blank,
+// and the word is RECORDED on the request when a rental is bound to it — never a
+// read-time join — so it survives the rental row's release, a run bound at acquisition
+// start names its machine even when acquisition fails before any claim, and the raw
+// `pr-…` id appears nowhere in default human output (it stays a --full/--json fact,
+// `rental_id`). The local arm lives in TestProductPath, beside the runs that produce it.
 func TestRunListMachineColumn(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-product-test", "machine-column")
 	must(t, os.RemoveAll(root))
@@ -63,10 +66,11 @@ func TestRunListMachineColumn(t *testing.T) {
 	}
 
 	type listedRun struct {
-		Number  string `json:"number"`
-		ID      string `json:"id"`
-		Machine string `json:"machine"`
-		Status  string `json:"status"`
+		Number   string `json:"number"`
+		ID       string `json:"id"`
+		Machine  string `json:"machine"`
+		RentalID string `json:"rental_id"`
+		Status   string `json:"status"`
 	}
 	listRuns := func() map[string]listedRun {
 		t.Helper()
@@ -133,5 +137,56 @@ func TestRunListMachineColumn(t *testing.T) {
 	}
 	if row := listRuns()["req-machine-unclaimed"]; row.Machine != "otter" {
 		t.Fatalf("the queued run did not gain its machine when the rental claimed it: %+v", row)
+	}
+
+	// cl-107: the word is HISTORY the run keeps, not a live join. Deleting the rental
+	// row — exactly what releasing a rental does — must leave every claimed run still
+	// saying `otter`, with the raw id kept as the --full/--json `rental_id` fact.
+	forgotten, problem := store.ForgetRental("pr-machine-column")
+	fatal(t, problem)
+	if !forgotten {
+		t.Fatal("the planted rental row was already gone")
+	}
+	rows = listRuns()
+	for _, id := range []string{"req-machine-claimed", "req-machine-unclaimed"} {
+		if row := rows[id]; row.Machine != "otter" || row.RentalID != "pr-machine-column" {
+			t.Fatalf("a released rental's word must persist on the run %s "+
+				"(machine word + rental_id): %+v", id, row)
+		}
+	}
+
+	// cl-107 addendum: a run BOUND at acquisition start names its machine even when
+	// acquisition fails before any claim. BeginRentalOperation mints the word and
+	// stamps it on the managed request in one transaction; no rental row exists yet and
+	// none ever will here (the hub is unreachable) — the shape a failed acquisition
+	// leaves behind, which must not render as `-`.
+	submit("req-machine-acquiring", "")
+	op, replay, problem := store.BeginRentalOperation(records.RentalOperation{
+		Key: "op-machine-acquiring", Hub: "http://127.0.0.1:1",
+		Reason:              "managed-rental-req-machine-acquiring",
+		HourlyRateUSDMicros: 100_000, ManagedRequestID: "req-machine-acquiring",
+	}, 10_000_000, func(machineName string) ([]byte, string, *exit.Error) {
+		return []byte(`{"name":"` + machineName + `"}`), "sha256:" + strings.Repeat("cd", 32), nil
+	})
+	fatal(t, problem)
+	if replay {
+		t.Fatal("a fresh rental operation replayed")
+	}
+	var minted struct {
+		Name string `json:"name"`
+	}
+	must(t, json.Unmarshal(op.RequestBody, &minted))
+	if minted.Name == "" {
+		t.Fatalf("the rental operation minted no machine word: %s", op.RequestBody)
+	}
+	if row := listRuns()["req-machine-acquiring"]; row.Machine != minted.Name || row.RentalID != "" {
+		t.Fatalf("a run bound at acquisition start must already name its machine "+
+			"(want %q, no rental id yet): %+v", minted.Name, row)
+	}
+
+	// The id string is a machine fact: absent from default human output entirely.
+	if code, out := runCozy(t, root, "run", "list"); code != 0 ||
+		!strings.Contains(out, "otter") || strings.Contains(out, "pr-") {
+		t.Fatalf("default human run list must show words, never a pr- id [exit %d]\n%s", code, out)
 	}
 }

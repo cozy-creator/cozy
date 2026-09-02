@@ -160,6 +160,15 @@ func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros int64
 	if e != nil {
 		return RentalOperation{}, false, e
 	}
+	// The word is bound to the managed request the moment it is minted (cl-107): an
+	// acquisition that fails before any claim still names the machine it was buying.
+	if op.ManagedRequestID != "" {
+		if _, err := tx.Exec(`UPDATE requests SET machine=? WHERE id=?`,
+			machineName, op.ManagedRequestID); err != nil {
+			return RentalOperation{}, false, exit.Internalf(
+				"cannot record machine %s on request %s: %s", machineName, op.ManagedRequestID, err)
+		}
+	}
 	if _, err := tx.Exec(`INSERT INTO rental_operations(`+rentalOperationCols+`)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, op.Key, op.RequestDigest, op.RequestBody, op.Hub, op.Reason,
 		op.HourlyRateUSDMicros, op.ManagedRequestID, op.RentalID, "pending_acquisition", stamp, stamp); err != nil {
@@ -673,8 +682,10 @@ func (s *Store) AssignManagedRentalClass(id string, cpu bool) *exit.Error {
 	if cpu {
 		predicate = "needs_accelerator=0"
 	}
-	if _, err := s.db.Exec(`UPDATE requests SET worker=? WHERE rental=1 AND worker=''
-		AND state IN ('submitted','queued','requeue_pending') AND (`+predicate+`)`, id); err != nil {
+	if _, err := s.db.Exec(`UPDATE requests SET worker=?,
+		machine=COALESCE((SELECT machine_name FROM rentals WHERE id=?),machine)
+		WHERE rental=1 AND worker=''
+		AND state IN ('submitted','queued','requeue_pending') AND (`+predicate+`)`, id, id); err != nil {
 		return exit.Internalf("cannot batch queued requests onto rental %s: %s", id, err)
 	}
 	return nil

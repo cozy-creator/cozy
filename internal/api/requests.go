@@ -649,9 +649,13 @@ type Lifecycle struct {
 	Triage      *TriageRef     `json:"triage,omitempty"`
 	Rental      bool           `json:"rental,omitempty"`
 	// Machine is the venue this request's work landed on: `local` for a worker this host
-	// spawned, the rental's owner-scoped machine name once a rental claims the request
-	// (cl-090), blank while unassigned. It never changes request identity or numbering.
-	Machine       string           `json:"machine"`
+	// spawned, the rental's owner-scoped machine word recorded when a rental was bound to
+	// the request (cl-090, cl-107), blank while unassigned. The word is history the run
+	// keeps after the rental is released. It never changes request identity or numbering.
+	Machine string `json:"machine"`
+	// RentalID is the raw immutable rental id (`pr-…`) behind Machine, for machines and
+	// --full readers; it never appears in default human output.
+	RentalID      string           `json:"rental_id,omitempty"`
 	CreatedAt     string           `json:"created_at"`
 	QueuePosition *int             `json:"queue_position,omitempty"`
 	QueueDepth    *int             `json:"queue_depth,omitempty"`
@@ -716,7 +720,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		Status: contractStatus(row.State), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
-		Outputs: []MediaRef{}, Rental: row.Rental,
+		Outputs: []MediaRef{}, Rental: row.Rental, RentalID: row.Worker,
 	}
 	if life.Status == "queued" {
 		if position, depth := s.orchestrator.QueueState(row.ID); position > 0 {
@@ -785,18 +789,16 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	return life
 }
 
-// machineOf reads the venue from current placement state, not submission state. A rental
-// claim is `requests.worker` (AssignManagedRental, or a pinned submission); every other
-// attempt runs on a worker this host spawned. A released rental's name may be gone from
-// the rentals table, so the immutable rental id stands in rather than a stale word.
+// machineOf reads the machine word RECORDED on the request (cl-107): stamped the moment
+// the run is bound to a rental — acquisition start, claim, or pinned submission — and
+// kept as history after the rental row is gone. The raw rental id never renders here;
+// pre-migration history no surviving rental row can name stays blank. A run with no
+// rental binding that attempted ran on a worker this host spawned: `local`.
 func (s *Server) machineOf(row records.Request, attempted bool) string {
-	if row.Worker != "" {
-		if rental, _ := s.store.RentalByMachine(row.Worker); rental != nil && rental.MachineName != "" {
-			return rental.MachineName
-		}
-		return row.Worker
+	if row.Machine != "" {
+		return row.Machine
 	}
-	if attempted {
+	if row.Worker == "" && attempted {
 		return "local"
 	}
 	return ""
