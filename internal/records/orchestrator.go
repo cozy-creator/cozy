@@ -767,6 +767,24 @@ func settledRequestState(state string) bool {
 	return false
 }
 
+// ReleaseCanceledIdempotencyKey frees a key whose run the caller explicitly
+// canceled. A cancellation is a withdrawal of the intent, not an outcome worth
+// replaying forever — without this, an identical resubmission has no honest
+// path. The row keeps its history under a derived key that can never collide
+// with a caller key (callers never contain "\x00").
+func (s *Store) ReleaseCanceledIdempotencyKey(key string) (bool, *exit.Error) {
+	result, err := s.db.Exec(
+		`UPDATE requests SET idem_key = idem_key || char(0) || id WHERE idem_key=? AND state='canceled'`, key)
+	if err != nil {
+		return false, exit.Internalf("cannot release canceled idempotency key: %s", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, exit.Internalf("cannot release canceled idempotency key: %s", err)
+	}
+	return n == 1, nil
+}
+
 // RequestByIdempotencyKey resolves the durable identity before a retry touches any
 // caller-owned resources. In particular, a settled request's original and staged asset
 // files may both be gone; its recorded semantic body is still the answer for that key.
