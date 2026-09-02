@@ -222,10 +222,12 @@ func TestSlotSeedResolutionFromDefaultBindings(t *testing.T) {
 }
 
 // th-113 client half: a row locked to the publisher's OWN org index references
-// a wheel already in the hub's custody — publish declares nothing and ships
-// nothing for it; the published uv.lock carries its URL and hash and install
-// resolves it from the hub exactly like PyPI. Any other index still refuses.
-// The sdxl rows are the real quantize uv.lock rows against the dev hub.
+// a wheel already in the hub's custody — publish DECLARES the row and ships
+// nothing for it. The hub custody-shares its committed org-index claim into
+// the release, and install serves the wheel from the plan like any registry
+// dependency. Size rides as 0 because index pages advertise none; the hub's
+// claim is the length authority. Any other index still refuses. The sdxl rows
+// are the real quantize uv.lock rows against the dev hub.
 const orgIndexPylock = `lock-version = "1.0"
 created-by = "uv"
 
@@ -253,13 +255,28 @@ url = "http://127.0.0.1:8819/v1/index/paul/files/f2926e8dd87777ed74e041fe2dfba89
 sha256 = "f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7"
 `
 
-func TestSameOrgIndexRowsRideTheLockAndDeclareNothing(t *testing.T) {
+func TestSameOrgIndexRowsAreDeclaredForCustodyShare(t *testing.T) {
 	rows, problem := packagepublish.RegistryRowsFromLock([]byte(orgIndexPylock), nil, "paul")
 	if problem != nil {
 		t.Fatalf("same-org index row refused: %v", problem)
 	}
-	if len(rows) != 1 || rows[0].Name != "annotated-doc" {
-		t.Fatalf("rows = %+v, want only the PyPI row", rows)
+	if len(rows) != 2 || rows[0].Name != "annotated-doc" || rows[1].Name != "sdxl" {
+		t.Fatalf("rows = %+v, want the PyPI row and the org row", rows)
+	}
+	sdxl := rows[1]
+	if sdxl.Version != "2.0.16" || sdxl.Size != 0 ||
+		sdxl.SHA256 != "f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7" ||
+		sdxl.URL != "http://127.0.0.1:8819/v1/index/paul/files/f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7/sdxl-2.0.16-py3-none-any.whl" {
+		t.Fatalf("org row = %+v, want the exact lock facts with size 0", sdxl)
+	}
+
+	// The URL must be the org's own file door for the locked sha256.
+	swapped := strings.Replace(orgIndexPylock,
+		"/v1/index/paul/files/f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7/",
+		"/v1/index/paul/files/"+strings.Repeat("0", 64)+"/", 1)
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(swapped), nil, "paul"); problem == nil ||
+		problem.Name != "registry_dependency_origin_refused" {
+		t.Fatalf("digest-swapped file URL answered %v", problem)
 	}
 
 	// Another org's namespace is not this publisher's to link.
