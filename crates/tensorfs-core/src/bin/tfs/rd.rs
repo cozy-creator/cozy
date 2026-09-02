@@ -63,7 +63,7 @@ pub fn cmd_lease(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let (s, m, _) = ok!(load(root, hex));
     let meta = ok!(Meta::open(&s));
     let t0 = Instant::now();
-    let (lease, rx) = ok!(read::acquire_manifest(&s, &meta, &m));
+    let (lease, rx) = ok!(read::acquire_cozytensors(&s, &meta, &m));
     println!("manifest:   sha256:{hex}");
     println!("hold:       {}", lease.hold_id());
     println!(
@@ -153,7 +153,7 @@ pub fn cmd_fill(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let plan = ok!(plan_of(&h, f));
     let workers: usize = flag_num(f, "workers", 4);
     let ring: u64 = flag_num(f, "ring", 256 << 20);
-    let (lease, mut rx) = ok!(read::acquire_manifest(&s, &meta, &m));
+    let (lease, mut rx) = ok!(read::acquire_cozytensors(&s, &meta, &m));
     if flag_on(f, "direct") {
         // The caller asked for O_DIRECT and did not get it. tensorfs.md §4 keeps direct I/O
         // deliberately non-default and NEVER a silent fallback where unsupported — so the
@@ -230,7 +230,7 @@ pub fn cmd_stream(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let workers: usize = flag_num(f, "workers", 4);
     let nslots: usize = flag_num(f, "slots", 4);
     let slot_bytes: usize = flag_num(f, "slot-bytes", 16 << 20);
-    let (lease, rx) = ok!(read::acquire_manifest(&s, &meta, &m));
+    let (lease, rx) = ok!(read::acquire_cozytensors(&s, &meta, &m));
     rx.print();
 
     let mut owned: Vec<Vec<u8>> = (0..nslots).map(|_| vec![0u8; slot_bytes]).collect();
@@ -351,7 +351,7 @@ pub fn cmd_span(root: &Path, hex: &str, ck: [&str; 3], off: u64, len: u64) -> Ex
             return ExitCode::FAILURE;
         }
     };
-    let (lease, _) = ok!(read::acquire_manifest(&s, &meta, &m));
+    let (lease, _) = ok!(read::acquire_cozytensors(&s, &meta, &m));
     let mut buf = vec![0u8; len as usize];
     let what = format!("{}/{}#{}", ck[0], ck[1], ck[2]);
     let r = read::read_part_into(&lease, &what, part, off, len, &mut buf);
@@ -518,7 +518,7 @@ pub fn cmd_prove(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let (s, m, h) = ok!(load(root, hex));
     let meta = ok!(Meta::open(&s));
     let sample: usize = flag_num(f, "sample", 64);
-    let (lease, _) = ok!(read::acquire_manifest(&s, &meta, &m));
+    let (lease, _) = ok!(read::acquire_cozytensors(&s, &meta, &m));
 
     let parts: Vec<(String, &tensorfs_core::header::Part)> = h
         .tensors()
@@ -628,7 +628,7 @@ pub fn cmd_swap(root: &Path, hex: &str) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let (lease, _) = ok!(read::acquire_manifest(&s, &meta, &m));
+    let (lease, _) = ok!(read::acquire_cozytensors(&s, &meta, &m));
     let keep = std::fs::read(&path).unwrap_or_default();
 
     // The swap, as an attacker would install it: same length, different bytes, atomic
@@ -722,7 +722,7 @@ pub fn cmd_tear(root: &Path, hex: &str) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let (lease, _) = ok!(read::acquire_manifest(&s, &meta, &m));
+    let (lease, _) = ok!(read::acquire_cozytensors(&s, &meta, &m));
     let keep = std::fs::read(&path).unwrap_or_default();
     let mut perms = md.permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o644);
@@ -854,7 +854,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         fired: 0,
         missed: 0,
     };
-    let (lease, _) = ok!(read::acquire_manifest(&s, &meta, &m));
+    let (lease, _) = ok!(read::acquire_cozytensors(&s, &meta, &m));
     let first = lease.objects()[0].clone();
 
     println!("read-path red arms, planted live:");

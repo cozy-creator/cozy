@@ -235,8 +235,8 @@ pub fn acquire(
     ))
 }
 
-/// Acquire over everything one manifest commits — the serving case. The transitive walk is
-/// the object set, so the lease covers exactly what the checkpoint declares and nothing else.
+/// Acquire over everything one Manifest commits, including ordinary snapshot siblings. Use this
+/// for full-snapshot operations; model execution uses `acquire_cozytensors` below.
 pub fn acquire_manifest(
     store: &Store,
     meta: &Meta,
