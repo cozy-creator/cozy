@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -19,7 +18,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
-	"github.com/cozy-creator/cozy/internal/rentalid"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
@@ -193,14 +191,6 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 			WithRemedy("release the existing rental before starting another operation").
 			WithNext("cozy rental end " + existing.RentalID)
 	}
-	machineName := ""
-	if existing == nil {
-		var err error
-		machineName, err = rentalid.NewMachineName()
-		if err != nil {
-			return records.Rental{}, hub.Rental{}, false, exit.Internalf("cannot mint a private rental name: %s", err)
-		}
-	}
 	var token secret.Value
 	var creator rental.CreatorIdentity
 	if existing != nil && existing.State == "attached" && existing.RentalID != "" {
@@ -217,28 +207,23 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
-	var requestBody []byte
-	if existing != nil {
-		requestBody = append([]byte(nil), existing.RequestBody...)
-	} else {
-		requestBody, e = hub.RentalRequestBytes(machineName, skuName, secret.HashHex(token),
-			creator.PublicKey())
+	// The machine word is the store's to reserve; the request is authored under it.
+	author := func(machineName string) ([]byte, string, *exit.Error) {
+		body, e := hub.RentalRequestBytes(machineName, skuName, secret.HashHex(token), creator.PublicKey())
 		if e != nil {
-			return records.Rental{}, hub.Rental{}, false, e
+			return nil, "", e
 		}
+		return body, rentalRequestDigest(c.Base(), body), nil
 	}
-	digest := rentalRequestDigest(c.Base(), requestBody)
 	op, replay, e := st.BeginRentalOperation(records.RentalOperation{
-		Key: operationKey, RequestDigest: digest, RequestBody: requestBody,
-		Hub: c.Base(), Reason: reason, HourlyRateUSDMicros: hourlyRateUSDMicros,
+		Key: operationKey, Hub: c.Base(), Reason: reason, HourlyRateUSDMicros: hourlyRateUSDMicros,
 		ManagedRequestID: managedRequestID,
-	}, fleetCapUSDMicros)
+	}, fleetCapUSDMicros, author)
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
-	if op.RequestDigest != digest || op.Hub != c.Base() || op.HourlyRateUSDMicros != hourlyRateUSDMicros ||
-		op.ManagedRequestID != managedRequestID ||
-		!bytes.Equal(op.RequestBody, requestBody) {
+	if op.RequestDigest != rentalRequestDigest(c.Base(), op.RequestBody) || op.Hub != c.Base() ||
+		op.HourlyRateUSDMicros != hourlyRateUSDMicros || op.ManagedRequestID != managedRequestID {
 		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.idempotency_conflict",
 			"rental operation %s already names a different hub or request body", operationKey).
 			WithRemedy("reuse a key only for the exact same hub, GPU SKU, media token, and Creator key")
@@ -247,7 +232,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
-	machineName = request.Name
+	machineName := request.Name
 	if !replay {
 		fmt.Fprintf(ctx.Err, "  rental operation %s persisted; reuse this key to resume\n", operationKey)
 	}

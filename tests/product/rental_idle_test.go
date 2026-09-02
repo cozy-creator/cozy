@@ -53,7 +53,7 @@ func TestRentalIdleRelease(t *testing.T) {
 	// (a) A manual rental — no managing request, never ran anything — has an idle clock
 	// from the moment it was recorded ready, and goes once that clock passes the grace.
 	// The daemon says so once before, and once after.
-	plant("rental-idle-manual", "quiet-heron-0000000000000021")
+	plant("rental-idle-manual", "heron")
 	daemon := startDaemonProcess(t, root)
 	awaitRentalGone(t, store, "rental-idle-manual", 15*time.Second, logPath)
 	if hub.releases("rental-idle-manual") != 1 {
@@ -61,14 +61,14 @@ func TestRentalIdleRelease(t *testing.T) {
 			hub.releases("rental-idle-manual"), tail(logPath))
 	}
 	log, _ := os.ReadFile(logPath)
-	if strings.Count(string(log), "rental rental-idle-manual (quiet-heron-0000000000000021) idle since") != 1 ||
-		!strings.Contains(string(log), "rental rental-idle-manual (quiet-heron-0000000000000021) released after") {
+	if strings.Count(string(log), "rental rental-idle-manual (heron) idle since") != 1 ||
+		!strings.Contains(string(log), "rental rental-idle-manual (heron) released after") {
 		t.Fatalf("the idle release did not say why, exactly once\n%s", tail(logPath))
 	}
 
 	// (b) Work pinned to a rental is what keeps it: a queued request holds the pod past
 	// several graces, the listing says so, and settling the request is what lets it go.
-	plant("rental-idle-busy", "quiet-heron-0000000000000022")
+	plant("rental-idle-busy", "otter")
 	if _, _, problem := store.Submit(records.Request{
 		ID: "req-rental-idle", IdemKey: "idem-rental-idle", BodyDigest: "sha256:" + strings.Repeat("ab", 32),
 		Package: "fake/idle", Entrypoint: "generate", Payload: []byte("{}"),
@@ -96,7 +96,7 @@ func TestRentalIdleRelease(t *testing.T) {
 	// until a rental command or a restart: with the hub gone the daemon says so once, keeps
 	// asking, and the pod is released as soon as the hub answers again.
 	hub.close()
-	plant("rental-idle-retry", "quiet-heron-0000000000000023")
+	plant("rental-idle-retry", "puffin")
 	awaitLog(t, logPath, "rental rental-idle-retry release deferred:", 15*time.Second)
 	time.Sleep(3 * time.Second)
 	log, _ = os.ReadFile(logPath)
@@ -107,7 +107,7 @@ func TestRentalIdleRelease(t *testing.T) {
 		t.Fatalf("a rental the hub never confirmed released was forgotten: %+v %v", row, problem)
 	}
 	hub = newFakeRentalHub(t, port)
-	hub.add("rental-idle-retry", "quiet-heron-0000000000000023")
+	hub.add("rental-idle-retry", "puffin")
 	awaitRentalGone(t, store, "rental-idle-retry", 15*time.Second, logPath)
 	if hub.releases("rental-idle-retry") != 1 {
 		t.Fatalf("the returned hub saw %d release(s), wanted 1\n%s", hub.releases("rental-idle-retry"), tail(logPath))

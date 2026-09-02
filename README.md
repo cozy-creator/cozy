@@ -223,21 +223,23 @@ With Tensorhub configured, rent generic private capacity:
 
 ```sh
 cozy rental new                    # Cozy GPUs, VRAM, and retail hourly prices
-cozy rental new h200                # prints e.g. bright-otter-4e81b938cf114e25
+cozy rental new h200                # prints e.g. otter
 cozy rental new h200 \
   --idempotency-key <unique-key>
 
 cozy rental                        # current rented machines
 cozy run org/package/generate --rental prompt="moonlit lake"
-cozy rental end bright-otter-4e81b938cf114e25
+cozy rental end otter
 ```
 
 GPU names and prices come from Tensorhub's Cozy-owned rental catalog. Creator never exposes or
 reads RunPod SKU names or provider prices. `cozy run` is local-only by default, while
 `--rental` permits Creator to reuse or acquire remote capacity only when ready local capacity cannot
 run the request. `--rental-only` deliberately bypasses local capacity and requires an external
-rental. Both modes remain under the configured fleet ceiling. Creator gives every private rental
-a safe semantic name and RunPod shows that exact same name; the name carries no workload facts.
+rental. Both modes remain under the configured fleet ceiling. Creator names every private rental
+with one memorable word, unique among this host's live rentals (a released word is drawn again);
+Tensorhub's identity for it is its `pr-…` id, which is what the provider-side pod is named after.
+The name carries no workload facts.
 
 Every rental the daemon owns — bought for a request or started with `cozy rental new` — ends on
 its own once nothing has been queued, running, or owed on it for `rentals.idle_release_s`
