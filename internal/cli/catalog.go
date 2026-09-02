@@ -78,15 +78,16 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 		resources = resources[:limit]
 	}
 
-	l := output.List{Name: kind + "s", Fields: []string{"ref"},
-		AllFields: []string{"ref", "created", "org", "name"}, Total: search.Total}
+	l := output.List{Name: kind + "s", Fields: []string{"ref", "latest"},
+		AllFields: []string{"ref", "latest", "created", "org", "name"}, Total: search.Total}
 	if kind == "model" {
 		l.Fields = []string{"model", "family", "lanes"}
 		l.AllFields = []string{"model", "family", "lanes", "created", "org", "name"}
 	}
 	for _, r := range resources {
 		row := map[string]string{
-			"ref": r.Ref(), "created": stamp(r.CreatedAt), "org": r.Org, "name": r.Name,
+			"ref": r.Ref(), "latest": r.LatestRelease,
+			"created": stamp(r.CreatedAt), "org": r.Org, "name": r.Name,
 		}
 		if kind == "model" {
 			card, problem := c.ModelCard(hctx, hub.Ref{Org: r.Org, Name: r.Name})
