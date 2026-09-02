@@ -1,7 +1,8 @@
 package wheel
 
-// Publication needs only a wheel's bounded name and version. Tensorhub owns
-// project-wheel and package-environment policy after the uploaded bytes cross its trust boundary.
+// Publication needs a wheel's bounded name and version, and for the project wheel
+// the import roots it installs (roots.go). Tensorhub owns package-environment
+// policy after the uploaded bytes cross its trust boundary.
 
 import (
 	"archive/zip"

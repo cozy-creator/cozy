@@ -72,12 +72,20 @@ def main() -> int:
 
         shutil.copy2(FIXTURE / "weightless.py", tree / "weightless.py")
         shutil.copy2(FIXTURE / "package.toml", tree / "package.toml")
+        # The backend is declared, and told exactly which file is the module. Left to
+        # guess a flat layout, setuptools shipped a wheel holding only .dist-info (its
+        # top_level.txt said `vendor`), which a rented pod refused minutes later.
         (tree / "pyproject.toml").write_text(
             "[project]\n"
             'name = "cozy-weightless-package"\n'
             f'version = "{args.version}"\n'
             'requires-python = ">=3.12,<3.13"\n'
             f'dependencies = ["cozy-runtime[media]=={runtime_version}"]\n\n'
+            "[build-system]\n"
+            'requires = ["hatchling"]\n'
+            'build-backend = "hatchling.build"\n\n'
+            "[tool.hatch.build.targets.wheel]\n"
+            'only-include = ["weightless.py"]\n\n'
             "[tool.uv.sources]\n"
             f'cozy-runtime = {{ path = "vendor/{wheels[0].name}" }}\n'
         )

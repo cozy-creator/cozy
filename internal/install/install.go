@@ -7,6 +7,7 @@ package install
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -294,10 +295,14 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			return fail(err)
 		}
 		_ = os.RemoveAll(installDir)
+		cause := err.ErrName() + " — " + err.Message
+		if err.Remedy != "" {
+			cause += "; try: " + err.Remedy
+		}
 		return nil, exit.New(exit.Conflict,
 			"the replacement install for %s failed; the working install (%s) is untouched and still runnable",
 			inst.Package+majorSuffix(inst.Major), short12(prior.InstallID)).
-			WithRemedy("cause: %s — %s", err.ErrName(), err.Message).
+			WithRemedy("cause: %s", cause).
 			WithNext("cozy package list")
 	}
 
@@ -306,6 +311,15 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 
 	// ---- environment: the first code-executing step, on verified source only ----
+	// An editable tree runs its own build backend first: a wheel a worker could not
+	// import from is refused here, not on the rented pod a later --rental reaches.
+	if req.Local != nil {
+		if e := packagepublish.VerifyProjectWheel(context.Background(), sourceDir,
+			strings.TrimPrefix(req.Local.Package, "local/"), req.Local.Release); e != nil {
+			return guard(e)
+		}
+		mark("wheel")
+	}
 	venvDir := filepath.Join(installDir, "venv")
 	var env *EnvironmentReceipt
 	var descriptor *launch.PackageDescriptor
