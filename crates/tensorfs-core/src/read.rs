@@ -253,6 +253,25 @@ pub fn acquire_manifest(
     )
 }
 
+/// Acquire only the self-contained CozyTensors runtime closure selected by a Manifest.
+/// Ordinary snapshot siblings remain retained by the Manifest but do not consume worker file
+/// descriptors and need not be resident for model execution.
+pub fn acquire_cozytensors(
+    store: &Store,
+    meta: &Meta,
+    snap: &Manifest,
+) -> Result<(ReadLease, Receipts)> {
+    let walk = checkpoint::walk_cozytensors(store, snap)?;
+    let objects: Vec<ObjectRef> = walk.distinct().into_iter().cloned().collect();
+    let hex = snap.manifest_id();
+    acquire(
+        store,
+        meta,
+        hex.strip_prefix("sha256:").unwrap_or(&hex),
+        objects,
+    )
+}
+
 // ---------------------------------------------------------------- the one byte door
 
 /// Fill a CALLER-OWNED buffer from one verified range, THROUGH THE LEASE'S PINNED

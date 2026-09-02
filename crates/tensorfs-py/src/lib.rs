@@ -101,6 +101,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(store::fetch_plan, m)?)?;
     m.add_function(wrap_pyfunction!(store::fetch_admit, m)?)?;
     m.add_function(wrap_pyfunction!(store::fetch_complete, m)?)?;
+    m.add_function(wrap_pyfunction!(store::fetch_complete_cozytensors, m)?)?;
     m.add_class::<store::PyStore>()?;
     m.add_class::<store::PyOperation>()?;
     m.add_class::<store::PyDerivedWriter>()?;
