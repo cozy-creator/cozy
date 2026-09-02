@@ -223,6 +223,8 @@ type daemonProcess struct {
 func startDaemonProcess(t *testing.T, root string) *daemonProcess {
 	t.Helper()
 	must(t, os.MkdirAll(root, 0o755))
+	// The daemon's words are its own bounded log, <root>/daemon.log (cl-096) — the
+	// product surface the arms read. stderr, the startup-refusal pipe, is kept beside it.
 	log, err := os.Create(filepath.Join(root, "daemon-test.log"))
 	must(t, err)
 	cmd := exec.Command(cozyBin)
@@ -259,7 +261,7 @@ func startDaemonProcess(t *testing.T, root string) *daemonProcess {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("the Cozy daemon did not publish its address in 30s\n%s", tail(filepath.Join(root, "daemon-test.log")))
+	t.Fatalf("the Cozy daemon did not publish its address in 30s\n%s", tail(filepath.Join(root, "daemon.log")))
 	return nil
 }
 

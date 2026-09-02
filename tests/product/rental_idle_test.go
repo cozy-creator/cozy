@@ -34,7 +34,7 @@ func TestRentalIdleRelease(t *testing.T) {
 			"tensorhub_token: rental-idle-test\n"+
 			"rentals:\n  max_hourly_spend_usd: 1.00\n  idle_release_s: 2\n"+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	logPath := filepath.Join(root, "daemon-test.log")
+	logPath := filepath.Join(root, "daemon.log")
 
 	hub := newFakeRentalHub(t, port)
 	store, problem := records.Open(filepath.Join(root, "records.db"))

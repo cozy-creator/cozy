@@ -9,7 +9,7 @@ import (
 
 func main() {
 	if cli.DaemonProcess(os.Args[0]) {
-		os.Exit(cli.RunDaemon(os.Stdout, os.Stderr))
+		os.Exit(cli.RunDaemon(os.Stderr))
 	}
 	os.Exit(cli.Run(os.Args[1:], os.Stdout, os.Stderr))
 }

@@ -46,8 +46,9 @@ func DaemonProcess(argv0 string) bool {
 }
 
 // RunDaemon owns the persistent loopback daemon. Public `up` and stateful
-// commands start this private process entrypoint.
-func RunDaemon(stdout, stderr io.Writer) int {
+// commands start this private process entrypoint. stderr is the parent's startup
+// diagnostic pipe; everything else the daemon says goes to its own log.
+func RunDaemon(stderr io.Writer) int {
 	ignoreDaemonBrokenPipe()
 	cfg, problem := config.Load()
 	if problem != nil {
@@ -61,15 +62,33 @@ func RunDaemon(stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "cannot raise cozy-daemon's open-file limit: %v\n", err)
 		return int(exit.Internal)
 	}
+	// THE DAEMON'S OWN LOG (cl-096). The process is detached from any terminal, so its
+	// words — the orchestrator's frame-by-frame account above all — go to
+	// $COZY_HOME/daemon.log, bounded by rotation on observed size (daemon.LogBytes, one
+	// predecessor). `cozy daemon log` reads it. stdout is never written: the parent hands
+	// this process /dev/null there, and a hand-started daemon needs no redirect.
+	layout, problem := home.Open(cfg.Home)
+	if problem != nil {
+		fmt.Fprintln(stderr, string(startupRefusal{Error: problem}.encode()))
+		return int(exit.Internal)
+	}
+	log, err := daemon.OpenLog(layout.Log)
+	if err != nil {
+		fmt.Fprintln(stderr, string(startupRefusal{Error: exit.Internalf("%s", err)}.encode()))
+		return int(exit.Internal)
+	}
+	defer log.Close()
 	ctx := &Context{
 		Inv: &Invocation{Bools: map[string]bool{}, Values: values(
 			"--port", intText(cfg.Port), "--yield", cfg.Yield), Mode: output.Mode{}},
-		Out: stdout, Err: stderr, Cfg: cfg, AccountAuth: accountauth.New(cfg),
+		Out: log, Err: stderr, Cfg: cfg, AccountAuth: accountauth.New(cfg),
 	}
 	if problem := serveDaemon(ctx); problem != nil {
 		// The parent `cozy up` reads this pipe: one typed document, so the refusal reaches
-		// the human under its own name and remedy rather than as startup prose.
+		// the human under its own name and remedy rather than as startup prose. The log
+		// keeps the same words, so the refusal outlives the pipe.
 		fmt.Fprintln(stderr, string(startupRefusal{Error: problem}.encode()))
+		fmt.Fprintf(log, "cozy-daemon refused to start: %s\n", problem.Error())
 		if problem.Code.Valid() && problem.Code != exit.OK {
 			return int(problem.Code)
 		}
@@ -163,9 +182,9 @@ func startDaemon(ctx *Context) (*daemonChild, *exit.Error) {
 	if err != nil {
 		return nil, exit.Internalf("cannot locate the Cozy executable: %s", err)
 	}
-	// The daemon is a background product process, not an attached Compose-style
-	// log producer. Runtime/request diagnostics are structured state; process chatter
-	// has no persistent user-facing log surface.
+	// The daemon is a background product process, not an attached Compose-style log
+	// producer: its stdout is nothing. Its words go to $COZY_HOME/daemon.log (RunDaemon),
+	// read with `cozy daemon log`; only the startup refusal crosses the stderr pipe.
 	discard, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
 		return nil, exit.Internalf("cannot open the null diagnostics sink: %s", err)
@@ -249,7 +268,7 @@ func daemonStartupFailure(result daemonExit) *exit.Error {
 	}
 	return exit.Named(result.code, "daemon_startup_failed",
 		"Cozy daemon startup failed: %s", diagnostic).
-		WithRemedy("correct the reported startup condition and retry `cozy up`; no persistent daemon log was created")
+		WithRemedy("correct the reported startup condition and retry `cozy up`; `cozy daemon log` keeps the daemon's own words")
 }
 
 func uiReady(address string) bool {

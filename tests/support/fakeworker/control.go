@@ -19,6 +19,9 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
+// reportCadence is cozy-runtime's ObservedWorkerState period (REPORT_SECONDS).
+const reportCadence = 2 * time.Second
+
 type fakeControl struct {
 	pb.UnimplementedWorkerControlServer
 	say       func(string, ...any)
@@ -139,6 +142,12 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	var lastRevision uint64
 	var lastSetDigest []byte
 	var lastPlacements []*pb.PlacementStatus
+	// THE HELD OUTCOME (missing-output). cozy-runtime journals an outcome before sending it
+	// and, until the owner's ack names it, restates it as a held_attempts row pending ack
+	// on every report — it does not resend the frame on a live stream. This arm does
+	// exactly that, so an owner that refuses the outcome sees what a real worker shows it.
+	var heldMu sync.Mutex
+	var heldOutcome *pb.HeldAttempt
 	observedMany := func(revision uint64, setDigest []byte, placements []*pb.PlacementStatus) {
 		availableSlots := uint32(2)
 		r := &pb.ObservedWorkerState{
@@ -163,9 +172,14 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			for _, p := range placements {
 				p.DeviceLaneId = laneOf(p.PlacementId)
 			}
-			lastRevision, lastSetDigest, lastPlacements = revision, setDigest, placements
 		}
+		lastRevision, lastSetDigest, lastPlacements = revision, setDigest, placements
 		r.Placements = placements
+		heldMu.Lock()
+		if heldOutcome != nil {
+			r.HeldAttempts = []*pb.HeldAttempt{heldOutcome}
+		}
+		heldMu.Unlock()
 		env(func(e, g uint64, b string) {
 			r.RecordOwnerEpoch, r.ControlStreamEpoch, r.WorkerBootId = e, g, b
 		})
@@ -348,12 +362,44 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				t, _ := authorOutcome(offer.RequestId, offer.AttemptOrdinal,
 					offer.InvocationSpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED,
 					"success that omits its granted output")
-				f.say("ARM: SUCCEEDED outcome omits the granted output")
+				t.PlacementId = offer.PlacementId
+				f.say("ARM: SUCCEEDED outcome %s omits the granted output", t.OutcomeId)
+				heldMu.Lock()
+				heldOutcome = &pb.HeldAttempt{
+					RequestId: offer.RequestId, AttemptOrdinal: offer.AttemptOrdinal,
+					Kind:                 pb.AttemptKind_ATTEMPT_KIND_SERVING,
+					State:                pb.AttemptState_ATTEMPT_STATE_OUTCOME_PENDING_ACK,
+					InvocationSpecDigest: offer.InvocationSpecDigest,
+					PlacementId:          offer.PlacementId, ExecutorEpoch: 1,
+					OutcomeId: t.OutcomeId, OutcomeDigest: t.OutcomeDigest,
+				}
+				heldMu.Unlock()
 				outcome(t)
+				// The report cadence, restating the held outcome until the ack drops it.
+				go func() {
+					for held := 1; ; held++ {
+						time.Sleep(reportCadence)
+						heldMu.Lock()
+						pending := heldOutcome != nil
+						heldMu.Unlock()
+						if !pending || stream.Context().Err() != nil {
+							return
+						}
+						f.say("ObservedWorkerState #%d restates the held outcome pending ack", held)
+						observedMany(lastRevision, lastSetDigest, lastPlacements)
+					}
+				}()
 			}
 		case *pb.RecordOwnerFrame_OutcomeAck:
 			a := m.OutcomeAck
 			f.say("AttemptOutcomeAck for %s#%d", a.RequestId, a.AttemptOrdinal)
+			heldMu.Lock()
+			if heldOutcome != nil && heldOutcome.OutcomeId == a.OutcomeId &&
+				bytes.Equal(heldOutcome.OutcomeDigest, a.OutcomeDigest) {
+				f.say("the ack names held outcome %s: dropped, the seat is free", a.OutcomeId)
+				heldOutcome = nil
+			}
+			heldMu.Unlock()
 			if lanes {
 				// Only an attempt that HELD a seat returns one: a refused offer took none.
 				laneMu.Lock()

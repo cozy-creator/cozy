@@ -290,6 +290,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	var status *pb.PlacementStatus
 	var desiredRevision uint64
 	var laneBreaches []string
+	var heldVerdicts []heldVerdict
 	workerTerminal, repeatedFault, verdict := false, false, ""
 	c.mu.Lock()
 	w := c.workers[s.instanceID]
@@ -317,6 +318,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 		}
 		w.observeHeld(heldPlacements(r.HeldAttempts))
+		heldVerdicts = c.observeHeldOutcomes(w, r.HeldAttempts)
 		w.acceptedRevision = r.AcceptedDesiredStateRevision
 		w.convergedRevision = r.ConvergedRevision
 		w.acceptedSetDigest = r.AcceptedPlacementSetDigest
@@ -483,6 +485,9 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	}
 	if verdict != "" {
 		c.logf("%s", verdict)
+	}
+	for _, held := range heldVerdicts {
+		c.settleRefusedOutcome(s, held.requestID, held.ordinal, held.outcome)
 	}
 	// A latched fault is reported every ReportCadence; its first report is logged and the
 	// verdict on its repetition is logged once, above. The replays in between say nothing.
@@ -653,10 +658,11 @@ func planSummary(p *pb.AttemptPlanSummary) string {
 // only the end of execution, because a pre-execution REFUSAL is a journaled outcome too.
 func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	ordinal := t.AttemptOrdinal
-	refuse := func(format string, args ...any) {
+	report := func(format string, args ...any) {
 		c.logf("AttemptOutcome %s#%d REFUSED: "+format,
 			append([]any{t.RequestId, ordinal}, args...)...)
 	}
+	refuse := report
 
 	// 1. The digest is RECOMPUTED over the resident bytes. A digest never bypasses the
 	//    lower check, and a mismatched one is not acked — the worker keeps replaying.
@@ -714,6 +720,27 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	if e != nil || attemptRow == nil {
 		refuse("no assigned attempt row to settle")
 		return
+	}
+	// FROM HERE A REFUSAL IS A JOURNALED FACT ON BOTH SIDES. The outcome is admissible and
+	// names an open attempt this session owns; the worker journaled it before sending and
+	// will restate it — replayed byte for byte, or held pending this owner's ack on every
+	// report — until an ack names it. Each restatement this owner refuses again is one
+	// observation, and on StillFactor of them the request settles typed
+	// (settleRefusedOutcome) instead of sitting in_progress behind a held outcome.
+	if attemptRow.SessionID == s.bootID && openAttempt(attemptRow.State) {
+		spelledDigest := shortNone(t.OutcomeDigest)
+		refuse = func(format string, args ...any) {
+			reason := fmt.Sprintf(format, args...)
+			c.logf("AttemptOutcome %s#%d REFUSED: %s", t.RequestId, ordinal, reason)
+			verdict := c.observeRefusedOutcome(s, t.RequestId, ordinal, refusedOutcome{
+				outcomeID: t.OutcomeId, digest: spelledDigest, reason: reason,
+				body: t.OutcomeCanonicalBytes, spec: spelledSpec,
+				consumed: status != "REFUSED" || executionStarted,
+			})
+			if verdict != nil {
+				c.settleRefusedOutcome(s, t.RequestId, ordinal, *verdict)
+			}
+		}
 	}
 	declaredWeightsOutputs, e := decodeWeightsOutputs(attemptRow.WeightsOutputs)
 	if e != nil {
@@ -834,6 +861,10 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	// it. The durable attempt row authenticates the causal answer; the frame cannot do so by
 	// naming a request id that happens to hold an offer.
 	c.settleDispatch(t.RequestId, ordinal, status != "REFUSED" || executionStarted)
+	// The outcome is accepted: whatever this owner refused before is forgotten, and an ack
+	// withheld behind weights finalization below is a wait, not a refusal.
+	c.forgetRefusedOutcome(s.instanceID, t.RequestId, ordinal)
+	refuse = report
 	if applied {
 		c.logf("AttemptOutcome %s#%d %s/%s(%s) started=%v applied in %.2f ms: %d output(s) "+
 			"became visible in the SAME transaction", t.RequestId, ordinal, status, cause,
@@ -900,6 +931,138 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 	}
 	c.signalClosed(requestWaitKey(req.ID), verdict)
 	c.releaseManaged(req)
+}
+
+// outcomeRefusedCause is the record owner's OWN terminal cause: the worker's journaled
+// outcome stands refused, and the request that waited on it is failed under this name.
+const outcomeRefusedCause = "worker.outcome_refused"
+
+// refusedOutcome is one outcome this owner could not honour, as the worker keeps
+// restating it: the identity refused, this owner's reason, the bytes the verdict will
+// journal, and how many consecutive worker reports have carried it unchanged.
+type refusedOutcome struct {
+	outcomeID string
+	digest    string
+	reason    string
+	body      []byte
+	spec      string
+	consumed  bool // the seat was spent: execution started, or the worker did not refuse
+	reports   int
+}
+
+func openAttempt(state string) bool {
+	return state == "offered" || state == "accepted" || state == "recovered_open"
+}
+
+// observeRefusedOutcome counts one worker report that restates a refused outcome. The
+// report is either the AttemptOutcome replayed byte for byte (the caller refused it
+// again) or a held_attempts row pending this owner's ack that names the same outcome id
+// and digest. A different outcome for the same attempt is a changed fact and restarts
+// the count; an accepted one forgets it (forgetRefusedOutcome).
+//
+// COUNTED, NOT TIMED, on StillFactor exactly as a latched placement fault is
+// (observeLatchedFault): the Runtime restates a held outcome on every ReportCadence, so
+// StillFactor consecutive reports carrying it unchanged is the worker's final word on
+// that attempt, and the answer is this owner's to give — nothing the worker can do
+// changes an outcome it already journaled.
+func (c *Orchestrator) observeRefusedOutcome(s *session, requestID string, ordinal uint64,
+	seen refusedOutcome) *refusedOutcome {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w := c.workers[s.instanceID]
+	if w == nil || w.bootID != s.bootID {
+		return nil
+	}
+	k := key(requestID, ordinal)
+	held := w.refused[k]
+	if held == nil || held.outcomeID != seen.outcomeID || held.digest != seen.digest {
+		seen.reports = 0
+		held = &seen
+		w.refused[k] = held
+	}
+	held.reason = seen.reason
+	held.reports++
+	if held.reports < StillFactor {
+		return nil
+	}
+	delete(w.refused, k)
+	verdict := *held
+	return &verdict
+}
+
+// observeHeldOutcomes reads one report's held_attempts rows against the outcomes this
+// owner refused: a row pending ack naming a refused outcome is the worker restating it.
+// It returns the verdicts reached, for the caller to settle outside the lock.
+func (c *Orchestrator) observeHeldOutcomes(w *worker, rows []*pb.HeldAttempt) []heldVerdict {
+	var verdicts []heldVerdict
+	for _, row := range rows {
+		if row == nil || row.State != pb.AttemptState_ATTEMPT_STATE_OUTCOME_PENDING_ACK {
+			continue
+		}
+		k := key(row.RequestId, row.AttemptOrdinal)
+		held := w.refused[k]
+		if held == nil || held.outcomeID != row.OutcomeId || held.digest != shortNone(row.OutcomeDigest) {
+			continue
+		}
+		held.reports++
+		if held.reports < StillFactor {
+			continue
+		}
+		delete(w.refused, k)
+		verdicts = append(verdicts, heldVerdict{requestID: row.RequestId,
+			ordinal: row.AttemptOrdinal, outcome: *held})
+	}
+	return verdicts
+}
+
+type heldVerdict struct {
+	requestID string
+	ordinal   uint64
+	outcome   refusedOutcome
+}
+
+func (c *Orchestrator) forgetRefusedOutcome(instanceID, requestID string, ordinal uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if w := c.workers[instanceID]; w != nil {
+		delete(w.refused, key(requestID, ordinal))
+	}
+}
+
+// settleRefusedOutcome is this owner's verdict on an outcome the worker restated
+// unchanged StillFactor times and this owner refused every time. The attempt closes under
+// the worker's OWN outcome identity — its id and digest are what the ack must echo and
+// what a later replay is matched against — with this owner's status and cause: FAILED,
+// worker.outcome_refused, the refusal as the message. The request fails typed, the seat
+// is released, the worker is acked so it drops the held outcome, and nothing waits on a
+// stream any more. The protocol has no ack-as-rejected: AttemptOutcomeAck is an echo, so
+// the same ack that closes an honoured outcome closes a refused one, and the refusal is
+// journaled here, in the attempt row, rather than on the wire.
+func (c *Orchestrator) settleRefusedOutcome(s *session, requestID string, ordinal uint64,
+	r refusedOutcome) {
+	verdict := fmt.Sprintf("%s: %s", outcomeRefusedCause, r.reason)
+	c.logf("worker %s: outcome %s for %s#%d REFUSED — restated unchanged on %d consecutive "+
+		"reports and nothing here can honour it; the request fails %s",
+		s.instanceID, r.outcomeID, requestID, ordinal, StillFactor, verdict)
+	applied, e := c.opt.Store.AcceptTerminal(records.Terminal{
+		RequestID: requestID, Attempt: int64(ordinal), SessionID: s.bootID,
+		InvocationDigest: r.spec, TerminalID: r.outcomeID, TerminalDigest: r.digest,
+		Status: "FAILED", Cause: outcomeRefusedCause, SafeMessage: r.reason, Body: r.body,
+		EventType: "request.failed",
+		EventPayload: map[string]any{"status": "FAILED", "cause": outcomeRefusedCause,
+			"error_type": outcomeRefusedCause, "error": r.reason,
+			"outputs": []any{}, "requeuing": false},
+		RequestState: "failed",
+	})
+	if e != nil {
+		c.logf("%s#%d could not settle %s: %s", requestID, ordinal, outcomeRefusedCause, e.Message)
+		return
+	}
+	c.settleDispatch(requestID, ordinal, r.consumed)
+	if applied {
+		c.RetryOutputExport(requestID)
+	}
+	c.ackSettledOutcome(s, requestID, ordinal)
 }
 
 // cleanupAttempt runs only after the outcome's bytes were mirrored, its terminal commit
@@ -1371,6 +1534,9 @@ func outcomeError(status, cause, message string) *exit.Error {
 		return exit.New(exit.Failed, "the attempt was abandoned (%s): %s", cause, message).
 			WithRemedy("an abandoned attempt is requeued as a NEW ordinal, never re-executed")
 	default:
+		if cause == outcomeRefusedCause {
+			return exit.Named(exit.Failed, cause, "%s", message)
+		}
 		return exit.New(exit.Failed, "the attempt failed (%s): %s", cause, message)
 	}
 }

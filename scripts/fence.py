@@ -582,7 +582,12 @@ def check_manifest():
 
 
 def check_web_boundary():
-    """cl-045: one embedded stub, bounded pathless uploads, and no log product."""
+    """cl-045: one embedded stub, bounded pathless uploads; cl-096: the daemon's ONE log.
+
+    cl-045 refused any persistent daemon log. cl-096 (owner, 2026-09-02) reverses that with
+    the smallest honest surface: the daemon writes its own words to $COZY_HOME/daemon.log,
+    bounded by rotation on observed bytes (never a timer), and `cozy daemon log` reads it.
+    stdout stays /dev/null — the log is the surface, not an attached stream."""
     bad = []
     for required in ("web/index.html", "web/app.css", "web/app.js", "web/embed.go",
                      "internal/api/uploads.go", "internal/upload/upload.go"):
@@ -593,8 +598,15 @@ def check_web_boundary():
                      "readBoundedDiagnostic", "daemonStartupFailure"):
         if required not in daemon:
             bad.append(f"[web] daemon startup boundary missing {required!r}")
-    if "daemon.log" in daemon:
-        bad.append("[web] persistent daemon.log surface remains")
+    if "daemon.OpenLog(layout.Log)" not in daemon:
+        bad.append("[web] the daemon does not write its own bounded log (daemon.OpenLog)")
+    daemon_log = pathlib.Path("internal/daemon/log.go")
+    if not daemon_log.is_file() or "const LogBytes = 32 << 20" not in daemon_log.read_text():
+        bad.append("[web] the daemon log is not bounded by rotation on observed bytes (daemon.LogBytes)")
+    if "time.After" in (daemon_log.read_text() if daemon_log.is_file() else ""):
+        bad.append("[web] the daemon log rotates on a timer; the bound is bytes")
+    if "func handleDaemonLog" not in pathlib.Path("internal/cli/daemon_log.go").read_text():
+        bad.append("[web] `cozy daemon log` is missing")
     for forbidden in ("os.FindProcess(", 'exec.Command("ps"', 'exec.Command("pgrep"', '"/proc/'):
         if forbidden in daemon:
             bad.append(f"[web] daemon singleton uses process-list evidence {forbidden!r}")
@@ -920,6 +932,6 @@ print(
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) "
-    f"web(stub+bounded-upload+no-log) retired-planes(absent) "
+    f"web(stub+bounded-upload+bounded-daemon-log) retired-planes(absent) "
     f"resources(typed package/model, no aliases) python(independent uv venvs) test(tests/product only)"
 )
