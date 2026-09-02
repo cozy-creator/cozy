@@ -27,7 +27,7 @@ daemon.
 | route | scope | auth | notes |
 |---|---|---|---|
 | `POST /v1/requests` | core | yes | submit; `Idempotency-Key` required; 202 fresh / 200 replay |
-| `GET /v1/requests` | core | yes | listing, newest first; `?status=`, `?limit=` |
+| `GET /v1/requests` | core | yes | listing, newest first; `?status=`, `?package=`, `?limit=` |
 | `GET /v1/requests/{id}` | core | yes | the lifecycle document |
 | `POST /v1/requests/{id}/cancel` | core | yes | requests cancellation; `?grace_ms=` |
 | `GET /v1/requests/{id}/events` | core | yes | SSE, one request, terminal-stop; `?cursor=` |

@@ -355,7 +355,7 @@ func TestProductPath(t *testing.T) {
 	}
 	store, problem := records.Open(filepath.Join(root, "records.db"))
 	fatal(t, problem)
-	requests, problem := store.RequestsOfKind("serving", "", 10)
+	requests, problem := store.RequestsOfKind("serving", "", "", 10)
 	fatal(t, problem)
 	store.Close()
 	if len(requests) == 0 || requests[0].Rental || requests[0].Worker != "" {

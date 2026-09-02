@@ -52,6 +52,15 @@ func TestRunListMachineColumn(t *testing.T) {
 	}
 	submit("req-machine-unclaimed", "")
 	submit("req-machine-claimed", "pr-machine-column")
+	for _, id := range []string{"newer-other-a", "newer-other-b", "newer-other-c"} {
+		if _, _, problem := store.Submit(records.Request{
+			ID: id, IdemKey: "idem-" + id, BodyDigest: "sha256:" + strings.Repeat("cd", 32),
+			Package: "other/package", Entrypoint: "generate", Payload: []byte("{}"),
+			Rental: true,
+		}); problem != nil {
+			t.Fatal(problem.Message)
+		}
+	}
 
 	type listedRun struct {
 		Number  string `json:"number"`
@@ -107,6 +116,12 @@ func TestRunListMachineColumn(t *testing.T) {
 	if code, out := runCozy(t, root, "run", "list", "--no-watch"); code != 0 ||
 		!strings.Contains(out, "MACHINE") {
 		t.Fatalf("explicit snapshot failed [exit %d]\n%s", code, out)
+	}
+	// Filtering happens in the store before LIMIT. Newer runs for another package may not
+	// hide an older matching run from a deliberately small result window.
+	if code, out := runCozy(t, root, "run", "list", "--package", "fake/machine", "--limit", "2", "--json", "--full"); code != 0 || strings.Contains(out, "other/package") ||
+		!strings.Contains(out, "req-machine-unclaimed") || !strings.Contains(out, "req-machine-claimed") {
+		t.Fatalf("package filtering did not precede the list limit [exit %d]\n%s", code, out)
 	}
 
 	// The blank→name transition: the exact durable claim the fleet records, observed by

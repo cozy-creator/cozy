@@ -827,7 +827,7 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 			"unknown status filter", "any | queued | in_progress | completed | failed | canceled")
 		return
 	}
-	rows, e := s.store.Requests(state, limit)
+	rows, e := s.store.Requests(state, strings.TrimSpace(r.URL.Query().Get("package")), limit)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return

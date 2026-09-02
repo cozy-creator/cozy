@@ -607,28 +607,25 @@ func handleRunList(ctx *Context) *exit.Error {
 	if watching {
 		return watchRunList(ctx, client, limit)
 	}
-	list, problem := runList(client, ctx.Inv.Value("--state"), ctx.Inv.Value("--package"), limit)
+	list, problem := runList(context.Background(), client, ctx.Inv.Value("--state"), ctx.Inv.Value("--package"), limit)
 	if problem != nil {
 		return problem
 	}
 	return emit(ctx, list)
 }
 
-func runList(client *localapi.Client, state, packageName string, limit int) (output.List, *exit.Error) {
-	rows, problem := client.Requests(state, limit)
+func runList(requestCtx context.Context, client *localapi.Client, state, packageName string, limit int) (output.List, *exit.Error) {
+	pkg := strings.TrimSpace(packageName)
+	rows, problem := client.Requests(requestCtx, state, pkg, limit)
 	if problem != nil {
 		return output.List{}, problem
 	}
-	pkg := strings.TrimSpace(packageName)
 	list := output.List{
 		Name: "invocations", Fields: []string{"number", "target", "machine", "status", "queued", "execution"},
 		AllFields: []string{"number", "id", "kind", "target", "machine", "status", "queued", "execution", "attempts", "created"},
 	}
 	states := map[string]int{}
 	for _, life := range rows {
-		if pkg != "" && life.Package != pkg {
-			continue
-		}
 		kind := life.Kind
 		if kind == "" {
 			kind = "invocation"
@@ -654,15 +651,14 @@ func runList(client *localapi.Client, state, packageName string, limit int) (out
 }
 
 func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error {
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(interrupt)
+	watchCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 	if _, err := io.WriteString(ctx.Out, "\x1b[?1049h\x1b[?25l"); err != nil {
 		return exit.As(err)
 	}
 	defer func() { _, _ = io.WriteString(ctx.Out, "\x1b[?25h\x1b[?1049l") }()
 	render := func() *exit.Error {
-		list, problem := runList(client, ctx.Inv.Value("--state"), ctx.Inv.Value("--package"), limit)
+		list, problem := runList(watchCtx, client, ctx.Inv.Value("--state"), ctx.Inv.Value("--package"), limit)
 		if problem != nil {
 			return problem
 		}
@@ -677,16 +673,22 @@ func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error 
 		return nil
 	}
 	if problem := render(); problem != nil {
+		if watchCtx.Err() != nil {
+			return nil
+		}
 		return problem
 	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-interrupt:
+		case <-watchCtx.Done():
 			return nil
 		case <-ticker.C:
 			if problem := render(); problem != nil {
+				if watchCtx.Err() != nil {
+					return nil
+				}
 				return problem
 			}
 		}
