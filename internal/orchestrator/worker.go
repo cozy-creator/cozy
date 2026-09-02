@@ -178,7 +178,43 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 		return DesiredPlacement{}, exit.Named(exit.Conflict, "bindings_identity_mismatch",
 			"bindings_digest does not hash the exact selected entrypoints and models")
 	}
+	if placement.SourceDigest != "" {
+		// A DEVELOPMENT placement froze its exact model selection at install, from the
+		// local store (cozy-runtime `_resolve_development_models`): repo, release, lane,
+		// manifest digest and length. Project it, so an editable request carries the same
+		// frozen intent to a rented worker that a local worker reads from the bytes (cl-101);
+		// a published placement's selection is resolved per request and stays empty here.
+		placement.Models = developmentModels(pkg, row)
+	}
 	return placement, nil
+}
+
+// developmentModels reads the exact model rows a development PlacementSet froze and names
+// each by the descriptor slot path its entrypoint binds it to — the spelling every
+// download delegation and private placement is addressed by.
+func developmentModels(pkg string, row canonical.Doc) []ModelRef {
+	byID := map[string]canonical.Doc{}
+	for _, model := range row.List("models") {
+		byID[model.Str("id")] = model
+	}
+	var out []ModelRef
+	seen := map[string]bool{}
+	for _, entrypoint := range row.List("entrypoints") {
+		for _, slot := range entrypoint.List("slots") {
+			model, ok := byID[slot.Str("reference_model_id")]
+			path := entrypoint.Str("name") + ".models." + slot.Str("slot")
+			if !ok || seen[path] {
+				continue
+			}
+			seen[path] = true
+			manifest := model.Sub("manifest")
+			out = append(out, ModelRef{Package: pkg, Slot: path,
+				Model: model.Str("repo"), Release: model.Str("version"), Lane: model.Str("lane"),
+				Manifest: manifest.Str("digest"), ManifestLength: manifest.Int("length")})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Slot < out[j].Slot })
+	return out
 }
 
 func arrayOrEmpty(value canonical.Value) canonical.Value {

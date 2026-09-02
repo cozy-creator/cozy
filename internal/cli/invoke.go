@@ -248,12 +248,15 @@ type invocationModelSpec struct {
 func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
 	raw []string, remote bool,
 ) ([]orchestrator.ModelRef, *exit.Error) {
-	if !remote && target.InstallID != "" {
+	if target.InstallID != "" {
 		row, problem := exactInvocationInstall(ctx, target)
 		if problem != nil {
 			return nil, problem
 		}
 		if row.SourceKind == "local" {
+			// An editable install froze its exact model selection from package.toml at
+			// install; a local worker reads it from the PlacementSet and a rental is handed
+			// the same rows (cl-101). There is no hub default to ask for a `local/` package.
 			if len(raw) > 0 {
 				return nil, exit.Named(exit.Unavailable, "editable_model_override_unsupported",
 					"editable package model overrides are not available on the published-package BYOM lane").
