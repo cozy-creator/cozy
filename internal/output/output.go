@@ -17,9 +17,12 @@ const maxNext = 2
 
 // Mode carries presentation choices that do not change command semantics.
 type Mode struct {
-	JSON   bool
-	Human  bool
-	Color  bool
+	JSON  bool
+	Human bool
+	Color bool
+	// TTY records that the result writer is a terminal; it gates output only a
+	// terminal can render, such as OSC 8 hyperlinks.
+	TTY    bool
 	Full   bool
 	Fields []string
 }

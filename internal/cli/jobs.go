@@ -138,7 +138,7 @@ func parseTrees(values []string) ([]string, *exit.Error) {
 
 // ---------------------------------------------------------------------- job status
 
-func jobFields(state api.JobState, full bool) []output.Field {
+func jobFields(mode output.Mode, state api.JobState, full bool) []output.Field {
 	fields := []output.Field{
 		{K: "job", V: runReference(state.Number, state.JobID)},
 		{K: "id", V: state.JobID},
@@ -168,7 +168,7 @@ func jobFields(state api.JobState, full bool) []output.Field {
 	if p := state.Publication; p != nil {
 		fields = append(fields,
 			output.Field{K: "publication", V: p.Repo},
-			output.Field{K: "publication_root", V: p.Root},
+			output.Field{K: "publication_root", V: mode.Hyperlink(p.Root)},
 			output.Field{K: "published", V: fmt.Sprintf("%d entr(y|ies), %s, verdict %s",
 				p.Entries, output.Bytes(p.Bytes), strings.ToLower(p.Status))})
 	}
@@ -320,7 +320,7 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		state.ErrorType, _ = terminal.Payload["error_type"].(string)
 		state.Error, _ = terminal.Payload["error"].(string)
 	}
-	fields := append(jobFields(state, true),
+	fields := append(jobFields(ctx.Mode(), state, true),
 		output.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
 	defaults := []string{"job", "status"}
 	if state.Result != nil {
@@ -393,7 +393,7 @@ func handleJobCancel(ctx *Context) *exit.Error {
 	// ALREADY TERMINAL = IDEMPOTENT 0 printing the terminal. A cancel that arrives after
 	// the terminal is late, not wrong.
 	if settled(state.Status) {
-		fields := append(jobFields(state, true), output.Field{K: "changed", V: false})
+		fields := append(jobFields(ctx.Mode(), state, true), output.Field{K: "changed", V: false})
 		return emit(ctx, compactRecord(fields, "job", "status", "changed"))
 	}
 	if e := c.CancelJob(jobID); e != nil {
@@ -408,7 +408,7 @@ func handleJobCancel(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	fields := append(jobFields(final, true), output.Field{K: "changed", V: true})
+	fields := append(jobFields(ctx.Mode(), final, true), output.Field{K: "changed", V: true})
 	return emit(ctx, compactRecord(fields, "job", "status", "changed"))
 }
 

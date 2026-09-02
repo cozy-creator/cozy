@@ -466,8 +466,13 @@ func Bytes(n int64) string {
 	return units.Bytes(n)
 }
 
-// Elide bounds a string by runes and reports the original size.
+// Elide bounds a string by runes and reports the original size. A string
+// carrying an OSC 8 hyperlink is never elided: cutting inside its escapes
+// would corrupt the terminal.
 func Elide(value string, limit int, full bool) string {
+	if strings.Contains(value, "\x1b]8;") {
+		return value
+	}
 	total := utf8.RuneCountInString(value)
 	if full || total <= limit || limit < 2 {
 		return value
