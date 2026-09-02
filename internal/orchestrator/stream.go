@@ -150,7 +150,8 @@ func (f *fanout) observeProgress(frame Frame) {
 		return
 	}
 	progress := f.progress[frame.RequestID]
-	if progress.attempt != frame.Attempt || progress.stage != stage {
+	if progress.attempt != frame.Attempt || progress.stage != stage ||
+		position > 0 && progress.position > 0 && position <= progress.position {
 		progress = progressAccumulator{attempt: frame.Attempt, stage: stage}
 	}
 	progress.fraction, progress.position = fraction, position
