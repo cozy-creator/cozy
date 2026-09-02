@@ -116,7 +116,8 @@ func hostOwner(t *testing.T, name string, with ...func(*orchestrator.Options)) *
 func (o *owner) close() { o.once.Do(o.closer) }
 
 // fakeSpec is a worker slot whose process is tests/support/fakeworker speaking raw protocol
-// bytes: a real process dialing the real socket over the committed contract.
+// bytes: a real process dialing the real socket over the committed contract. `device` is
+// the granted envelope, comma-separated for a multi-device one.
 func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec {
 	ref := func(label string) *pb.Ref {
 		digest := sha256.Sum256([]byte(label))
@@ -164,7 +165,7 @@ func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec
 	return orchestrator.WorkerLaunchSpec{
 		Python:    fakeWorkerBin,
 		Args:      args,
-		Devices:   []string{device},
+		Devices:   strings.Split(device, ","),
 		Placement: placement,
 	}
 }
