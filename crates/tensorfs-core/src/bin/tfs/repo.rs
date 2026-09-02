@@ -1094,11 +1094,8 @@ fn closure_refs(
 ) -> tensorfs_core::err::Result<BTreeMap<String, (&'static str, ObjectRef)>> {
     let mut refs = BTreeMap::new();
     insert(&mut refs, "header", header_ref)?;
-    for (_, entry) in manifest.entries() {
-        if let Entry::File(object) = entry {
-            insert(&mut refs, "file", object)?;
-        }
-    }
+    // A config is also a Manifest file entry; it is listed as `config` so a caller that
+    // stages the closure for `repo apply` can tell which objects to pass as `--config`.
     for (_, config) in &header.configs {
         insert(
             &mut refs,
@@ -1108,6 +1105,11 @@ fn closure_refs(
                 length: config.length,
             },
         )?;
+    }
+    for (_, entry) in manifest.entries() {
+        if let Entry::File(object) = entry {
+            insert(&mut refs, "file", object)?;
+        }
     }
     for (_, asset) in &header.assets {
         for object in &asset.segments {
