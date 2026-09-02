@@ -42,7 +42,7 @@ func ptyRunInput(t *testing.T, root string, rows uint16, input [][]byte, args ..
 	must(t, err)
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
 	cmd.Env = childEnv(t, root)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave //cozy:stdin-value test pty navigation
 	must(t, cmd.Start())
 	must(t, slave.Close()) // the child holds the slave now; EOF/EIO on master ends the read
 	timedOut := time.AfterFunc(10*time.Second, func() { _ = cmd.Process.Kill() })

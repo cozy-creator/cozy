@@ -855,7 +855,7 @@ func terminalHeight(w io.Writer) int {
 }
 
 func startRunListInput(cancel context.CancelFunc, navigation chan<- runListNavigation) (func(), bool) {
-	fd := int(os.Stdin.Fd())
+	fd := int(os.Stdin.Fd()) //cozy:stdin-value live-list navigation, never a prompt
 	if !term.IsTerminal(fd) {
 		return func() {}, false
 	}
@@ -863,7 +863,7 @@ func startRunListInput(cancel context.CancelFunc, navigation chan<- runListNavig
 	if err != nil {
 		return func() {}, false
 	}
-	go readRunListInput(bufio.NewReader(os.Stdin), cancel, navigation)
+	go readRunListInput(bufio.NewReader(os.Stdin), cancel, navigation) //cozy:stdin-value navigation only
 	return func() { _ = term.Restore(fd, state) }, true
 }
 
