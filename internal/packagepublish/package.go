@@ -110,25 +110,11 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 		return exit.Internalf("cannot create package publication staging: %s", err)
 	}
 	p.Root = root
-	project, problem := wheel.Build(wheel.Request{Context: ctx, Tree: p.Tree, OutDir: root})
+	project, problem := projectWheel(ctx, p.Tree, root, p.Name, p.Release)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
 		return problem
-	}
-	fact, problem := wheel.InspectIdentity(project.Path)
-	if problem != nil {
-		p.Close()
-		p.Root = ""
-		return problem
-	}
-	if p.Name != fact.Distribution || p.Release != fact.Version {
-		p.Close()
-		p.Root = ""
-		return exit.Named(exit.Validation, "project_metadata_mismatch",
-			"pyproject.toml declares %s==%s but the built wheel declares %s==%s",
-			p.Name, p.Release, fact.Distribution, fact.Version).
-			WithRemedy("fix the build backend so wheel identity comes from [project] name and version")
 	}
 	dependencies, needsRegistry, problem := collectLocalDependencies(ctx, p.Tree, document, root)
 	if problem != nil {
@@ -151,8 +137,57 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 		p.Root = ""
 		return problem
 	}
-	p.Wheel, p.Descriptor, p.DependencyWheels, p.Registry = project.Path, descriptor, dependencies, registry
+	p.Wheel, p.Descriptor, p.DependencyWheels, p.Registry = project, descriptor, dependencies, registry
 	return nil
+}
+
+// projectWheel builds the tree's own wheel and refuses one a worker could not run:
+// its identity must come from [project], and it must install at least one Python
+// module or package. A backend left to guess a flat layout can emit a wheel holding
+// nothing but .dist-info; that wheel would fail on a rented pod, so it fails here.
+func projectWheel(ctx context.Context, tree, out, name, release string) (string, *exit.Error) {
+	built, problem := wheel.Build(wheel.Request{Context: ctx, Tree: tree, OutDir: out})
+	if problem != nil {
+		return "", problem
+	}
+	fact, problem := wheel.InspectIdentity(built.Path)
+	if problem != nil {
+		return "", problem
+	}
+	if name != fact.Distribution || release != fact.Version {
+		return "", exit.Named(exit.Validation, "project_metadata_mismatch",
+			"pyproject.toml declares %s==%s but the built wheel declares %s==%s",
+			name, release, fact.Distribution, fact.Version).
+			WithRemedy("fix the build backend so wheel identity comes from [project] name and version")
+	}
+	contents, problem := wheel.InspectContents(built.Path)
+	if problem != nil {
+		return "", problem
+	}
+	if len(contents.ImportRoots) == 0 {
+		return "", exit.Named(exit.Validation, "project_wheel_no_import_roots",
+			"the built wheel %s installs no Python module or package: %s",
+			fact.Filename, contents.Describe()).
+			WithRemedy("declare the project's modules or packages for its build backend in " +
+				"pyproject.toml (hatchling: `[tool.hatch.build.targets.wheel] only-include = [...]`; " +
+				"setuptools: `[tool.setuptools] py-modules = [...]`), then confirm `uv build --wheel` " +
+				"lists them in the wheel's RECORD")
+	}
+	return built.Path, nil
+}
+
+// VerifyProjectWheel is the same fence for an editable install: the tree must build
+// into a wheel a worker could run BEFORE it is pinned, so `cozy run --rental` never
+// discovers on a paid pod what `cozy package install` could have said at once. The
+// wheel is disposable; the private revision builds its own from the pinned source.
+func VerifyProjectWheel(ctx context.Context, tree, name, release string) *exit.Error {
+	out, err := os.MkdirTemp("", "cozy-project-wheel-")
+	if err != nil {
+		return exit.Internalf("cannot create project wheel staging: %s", err)
+	}
+	defer os.RemoveAll(out)
+	_, problem := projectWheel(ctx, tree, out, name, release)
+	return problem
 }
 
 func describe(ctx context.Context, tree, root string) (string, *exit.Error) {
