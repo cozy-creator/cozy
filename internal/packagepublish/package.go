@@ -6,12 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -198,7 +200,91 @@ func projectWheel(ctx context.Context, tree, out, name, release string) (string,
 				"setuptools: `[tool.setuptools] py-modules = [...]`), then confirm `uv build --wheel` " +
 				"lists them in the wheel's RECORD")
 	}
+	if problem := applicationEntrypoint(tree, fact.Filename, contents); problem != nil {
+		return "", problem
+	}
 	return built.Path, nil
+}
+
+const applicationGroup = "cozy.application"
+
+// applicationEntrypoint holds the two application spellings to one object. An
+// editable run discovers the application from package.toml's [application]
+// object; a worker discovers it from the installed wheel's one `cozy.application`
+// entry point. A wheel that registers none, several, a different object, or an
+// object whose module the wheel does not ship runs locally and fails on the pod.
+func applicationEntrypoint(tree, filename string, contents wheel.Contents) *exit.Error {
+	object, problem := applicationObject(filepath.Join(tree, "package.toml"))
+	if problem != nil {
+		return problem
+	}
+	remedy := fmt.Sprintf("declare `[project.entry-points.%q]` in pyproject.toml with one entry, "+
+		"`default = %q`, matching package.toml's [application] object", applicationGroup, object)
+	entries := contents.Group(applicationGroup)
+	switch len(entries) {
+	case 0:
+		return exit.Named(exit.Validation, "project_wheel_application_entrypoint_missing",
+			"the built wheel %s registers no %s entry point; a worker discovers the application "+
+				"from the installed wheel, not from package.toml", filename, applicationGroup).
+			WithRemedy("%s", remedy)
+	case 1:
+	default:
+		spelled := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			spelled = append(spelled, entry.Name+" = "+entry.Object)
+		}
+		return exit.Named(exit.Validation, "project_wheel_application_entrypoint_ambiguous",
+			"the built wheel %s registers %d %s entry points (%s); exactly one is required",
+			filename, len(entries), applicationGroup, strings.Join(spelled, ", ")).
+			WithRemedy("%s", remedy)
+	}
+	entry := entries[0]
+	if entry.Object != object {
+		return exit.Named(exit.Validation, "project_wheel_application_entrypoint_mismatch",
+			"the built wheel %s registers %s entry point %s = %s, but package.toml's [application] "+
+				"object is %s; the two must name one object", filename, applicationGroup,
+			entry.Name, entry.Object, object).
+			WithRemedy("%s", remedy)
+	}
+	module, _, _ := strings.Cut(entry.Object, ":")
+	root, _, _ := strings.Cut(strings.TrimSpace(module), ".")
+	if !slices.Contains(contents.ImportRoots, root) {
+		return exit.Named(exit.Validation, "project_wheel_application_module_absent",
+			"the built wheel %s registers the application %s but installs no module %s "+
+				"(import roots: %s)", filename, entry.Object, root, strings.Join(contents.ImportRoots, ", ")).
+			WithRemedy("include the module that defines the application in the wheel: %s",
+				"hatchling `[tool.hatch.build.targets.wheel] only-include = [...]`, "+
+					"setuptools `[tool.setuptools] py-modules = [...]`")
+	}
+	return nil
+}
+
+// applicationObject is package.toml's [application] object, the spelling the
+// editable path runs from. It must be a `module:attribute` reference.
+func applicationObject(path string) (string, *exit.Error) {
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) == 0 || len(raw) > maxProjectMetadataBytes {
+		return "", exit.Named(exit.Validation, "package_config_unreadable",
+			"package.toml must be a non-empty TOML file at or below %d bytes", maxProjectMetadataBytes)
+	}
+	var document struct {
+		Application struct {
+			Object string `toml:"object"`
+		} `toml:"application"`
+	}
+	if err := toml.Unmarshal(raw, &document); err != nil {
+		return "", exit.Named(exit.Validation, "package_config_invalid",
+			"package.toml is not valid TOML: %v", err)
+	}
+	object := document.Application.Object
+	module, attribute, ok := strings.Cut(object, ":")
+	if !ok || strings.TrimSpace(object) != object || strings.TrimSpace(module) == "" ||
+		strings.TrimSpace(attribute) == "" {
+		return "", exit.Named(exit.Validation, "package_application_object_missing",
+			"package.toml [application] must name one object as `module:attribute`").
+			WithRemedy("set `[application] object = \"<module>:app\"` in package.toml")
+	}
+	return object, nil
 }
 
 // VerifyProjectWheel is the same fence for an editable install: the tree must build
