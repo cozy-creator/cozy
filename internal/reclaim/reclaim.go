@@ -1,17 +1,16 @@
-// Package reclaim removes what nothing references any more under the three roots that
-// used to grow without bound: attempt working directories, closed workers' roots, and
-// tmp/. The process that wrote the bytes removes them when they die; each sweep here is
-// the BACKSTOP for a writer that crashed, and mirrors install.Sweep: walk the DIRECTORY
-// and let the records authority (or a live process's kernel lock) decide what still has
-// a claim. A directory that refuses to go is reported and left for the next sweep.
+// Package reclaim removes what nothing references any more under the two roots that
+// used to grow without bound: closed workers' roots and tmp/. The process that wrote the
+// bytes removes them when they die; each sweep here is the BACKSTOP for a writer that
+// crashed, and mirrors install.Sweep: walk the DIRECTORY and let the records authority
+// (or a live process's kernel lock) decide what still has a claim. A directory that
+// refuses to go is reported and left for the next sweep. There is no attempt root: a
+// local attempt writes its result where it lives and stages nothing.
 package reclaim
 
 import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -34,107 +33,18 @@ func (s *Swept) add(freed int64, removed bool) {
 	}
 }
 
-// ------------------------------------------------------------------ attempts
-
-// Attempts reclaims every attempt directory whose attempt is closed and whose recorded
-// outputs have moved out — or that no attempt row references at all.
-func Attempts(l home.Layout, st *records.Store) (Swept, *exit.Error) {
-	requests, err := os.ReadDir(l.Attempts)
-	if err != nil {
-		return Swept{}, exit.Internalf("cannot scan the attempt root %s: %s", l.Attempts, err)
-	}
-	var swept Swept
-	var first *exit.Error
-	for _, request := range requests {
-		if !request.IsDir() {
-			continue
-		}
-		attempts, err := os.ReadDir(filepath.Join(l.Attempts, request.Name()))
-		if err != nil {
-			continue
-		}
-		for _, entry := range attempts {
-			if !entry.IsDir() {
-				continue
-			}
-			attempt, err := strconv.ParseUint(entry.Name(), 10, 64)
-			if err != nil {
-				continue
-			}
-			swept.Scanned++
-			freed, removed, problem := Attempt(l, st, request.Name(), attempt)
-			if problem != nil && first == nil {
-				first = problem
-			}
-			swept.add(freed, removed)
-		}
-		_ = os.Remove(l.RequestAttempts(request.Name())) // only when empty
-	}
-	return swept, first
-}
-
-// Attempt reclaims one attempt directory if nothing claims it. It is the settlement-time
-// call too, so the same rule runs after an ack and at the next daemon start.
-func Attempt(l home.Layout, st *records.Store, requestID string, attempt uint64) (int64, bool, *exit.Error) {
-	dir := l.AttemptDir(requestID, attempt)
-	if _, err := os.Lstat(dir); os.IsNotExist(err) {
-		return 0, false, nil
-	}
-	row, problem := st.AttemptRow(requestID, int64(attempt))
-	if problem != nil {
-		return 0, false, problem
-	}
-	if row != nil {
-		if row.State != "closed" && row.State != "dispatch_aborted" {
-			return 0, false, nil
-		}
-		paths, problem := st.AttemptOutputPaths(requestID, int64(attempt))
-		if problem != nil {
-			return 0, false, problem
-		}
-		for _, path := range paths {
-			if within(dir, path) {
-				return 0, false, nil
-			}
-		}
-	}
-	freed, problem := removeTree(dir)
-	if problem != nil {
-		return 0, false, problem
-	}
-	_ = os.Remove(l.RequestAttempts(requestID))
-	return freed, true, nil
-}
-
-// Request reclaims every reclaimable attempt directory of one request, and the
-// request's `tmp/<id>/` once the request has settled.
+// Request reclaims one request's `tmp/<id>/` once the request has settled. It is the
+// settlement-time call — after an ack and after the export settles — so the writer's own
+// removal is the rule and this is the backstop, safe to repeat.
 func Request(l home.Layout, st *records.Store, requestID string) (Swept, *exit.Error) {
 	var swept Swept
-	var first *exit.Error
-	entries, err := os.ReadDir(l.RequestAttempts(requestID))
-	if err == nil {
-		for _, entry := range entries {
-			attempt, err := strconv.ParseUint(entry.Name(), 10, 64)
-			if !entry.IsDir() || err != nil {
-				continue
-			}
-			swept.Scanned++
-			freed, removed, problem := Attempt(l, st, requestID, attempt)
-			if problem != nil && first == nil {
-				first = problem
-			}
-			swept.add(freed, removed)
-		}
+	if _, err := os.Lstat(filepath.Join(l.Tmp, requestID)); err != nil {
+		return swept, nil
 	}
-	if _, err := os.Lstat(filepath.Join(l.Tmp, requestID)); err == nil {
-		swept.Scanned++
-		freed, removed, problem := tmpEntry(l, st, requestID)
-		if problem != nil && first == nil {
-			first = problem
-		}
-		swept.add(freed, removed)
-	}
-	return swept, first
+	swept.Scanned++
+	freed, removed, problem := tmpEntry(l, st, requestID)
+	swept.add(freed, removed)
+	return swept, problem
 }
 
 // ------------------------------------------------------------------ workers
@@ -268,11 +178,6 @@ func tmpEntry(l home.Layout, st *records.Store, name string) (int64, bool, *exit
 }
 
 // ------------------------------------------------------------------ helpers
-
-func within(dir, path string) bool {
-	rel, err := filepath.Rel(dir, path)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
 
 // removeTree measures then removes one path. A tree a worker left read-only is made
 // removable first, the way a retired install is.

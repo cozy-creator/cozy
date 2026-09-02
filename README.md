@@ -216,14 +216,13 @@ omitted integer `seed`, so an unseeded run draws fresh entropy.
 Every run says where its files are. Result files land in the package's own store,
 `~/.cozy/outputs/<org>-<package>/`, or under `--out DIR`; either way each file is named by its own
 content digest, `<sha256>.<ext>`, so regenerating the same bytes lands on the same file and two
-different results never collide. Nothing but result files is ever written there — the request
-payload and other inputs live in an internal attempt directory that is reclaimed once the run
-settles. `saved:` lists the absolute paths (`saved[].path` under `--json`). The daemon probes the
-destination writable at submit and refuses typed (`output_destination_unwritable`) before any
-execution; it records the destination with the request and publishes the verified media after
-terminal, so closing the command or restarting Cozy does not abandon the export. A destination that
-dies after submit never turns a completed run into a failure: the verdict reads `completed (export
-pending: <code>)` and the daemon keeps retrying the durable export.
+different results never collide. Nothing but result files is ever written there, and nothing is
+staged anywhere first: the worker is granted that directory and writes each file into it under its
+digest name, the request payload rides the grant itself, and input assets are read from the
+immutable input store. `saved:` lists the absolute paths (`saved[].path` under `--json`). The
+daemon probes the destination writable at submit and refuses typed (`output_destination_unwritable`)
+before any execution, and records the destination with the request, so closing the command or
+restarting Cozy does not lose where the files are.
 
 Local Runtime workers start on demand. Successful serving workers may remain resident for warm
 reuse; job workers are reclaimed at terminal.

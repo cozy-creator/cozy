@@ -19,7 +19,7 @@ import (
 // differs is exactly what cr-009 says differs — a `JobDirective` instead of a
 // `ServingDirective`, a `JobExecutionSpec` instead of a `ServingExecutionSpec`, job
 // capacity instead of serving capacity, and a grant that writes into a DURABLE
-// PUBLICATION ROOT instead of a disposable attempt directory.
+// PUBLICATION ROOT instead of the package's result store.
 //
 // The two things this file owns that the serving lane has no version of:
 //
@@ -176,14 +176,15 @@ func FenceOutputID(id string) *exit.Error {
 	if id == "" || id == "." || id == ".." || strings.ContainsAny(id, `/\`) {
 		return exit.Named(exit.Validation, "output_id_escape",
 			"output id %q is not a single path element", id).
-			WithRemedy("an output is granted one file under its attempt directory and nowhere else")
+			WithRemedy("an output is granted one digest-named file in its store directory and nowhere else")
 	}
 	return nil
 }
 
-// jobGrant builds the LOCAL delivery grant for one job attempt: the payload as the input
-// `payload`, one input per MATERIALIZED input tree (`tree:<ref>`), and one destination per
-// granted result field path — every one of them under the publication root.
+// jobGrant builds the LOCAL delivery grant for one job attempt: the payload INLINE as the
+// input `payload`, one input per MATERIALIZED input tree (`tree:<ref>`), and one
+// destination per granted result field path — every one of them under the publication
+// root.
 //
 // There is no credential here either. A local grant is a CAS root plus a directory, and a
 // job's directory is the durable one.
@@ -192,16 +193,8 @@ func (c *Orchestrator) jobGrant(req records.Request, attempt uint64) (*pb.Delive
 	// is where a COMMITTED bundle lives; the stage is where an attempt in flight puts its
 	// bytes, and `promote` moves them across after the terminal is verified.
 	root := c.opt.Layout.PublicationStage(req.Org, req.ID, attempt)
-	inDir := filepath.Join(c.opt.Layout.AttemptDir(req.ID, attempt), "in")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, "", exit.Internalf("cannot create the publication stage %s: %s", root, err)
-	}
-	if err := os.MkdirAll(inDir, 0o755); err != nil {
-		return nil, "", exit.Internalf("cannot create the attempt input directory %s: %s", inDir, err)
-	}
-	payloadPath := filepath.Join(inDir, "payload")
-	if err := os.WriteFile(payloadPath, req.Payload, 0o644); err != nil {
-		return nil, "", exit.Internalf("cannot stage the job payload: %s", err)
 	}
 	g := &pb.DeliveryGrant{
 		FileBaseUrl: "file://" + root,
@@ -213,7 +206,7 @@ func (c *Orchestrator) jobGrant(req records.Request, attempt uint64) (*pb.Delive
 		// event that ends this grant's usefulness. A clock never knew about it.
 		ExpiresAtUnix: 0,
 		// ACCESS ONLY (#439): identities live in the InvocationSpec's bindings.
-		Inputs: []*pb.InputAccess{{InputId: "payload", Url: "file://" + payloadPath}},
+		Inputs: []*pb.InputAccess{{InputId: "payload", Url: payloadURL(req.Payload)}},
 	}
 	g.Inputs = append(g.Inputs, modelAccess(req)...)
 	// THE INPUT TREES. A tree's bytes are not re-hashed at the grant: a tree is a

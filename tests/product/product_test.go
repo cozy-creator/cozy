@@ -16,7 +16,7 @@ import (
 )
 
 const localWeightlessRef = "local/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "5f2aea3625ea31c82f82f01ec3510c128411b74c"
+const editableRuntimeFixtureSHA = "c340491f28de998a79301e2532761c0e6120a513"
 
 // TestProductPath is the one end-to-end product path: a local package installed from
 // source, invoked as a user types it, answered with a typed result and real bytes on
@@ -111,7 +111,7 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("saved: does not name the store path\n%s", stdout)
 	}
 	assertOnlyResultFiles(t, filepath.Join(root, "outputs"))
-	awaitAttemptsReclaimed(t, root)
+	assertNoAttemptRoot(t, root)
 
 	// An unseeded run draws fresh entropy, so its bytes — and its name — differ.
 	code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile", "size=32")
@@ -173,7 +173,7 @@ func TestProductPath(t *testing.T) {
 	}
 	assertOnlyResultFiles(t, outputDir)
 	assertOnlyResultFiles(t, fixedDir)
-	awaitAttemptsReclaimed(t, root)
+	assertNoAttemptRoot(t, root)
 
 	type listedRun struct {
 		Number    string `json:"number"`
@@ -299,14 +299,13 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("a refused --out submission recorded a request row: %d -> %d", before, after)
 	}
 
-	// cl-089 second half: the incident's exact shape — the destination dies AFTER the
-	// preflight passed. The run's verdict stays completed; the export is reported as
-	// owed, distinctly, never as run failure; and once the directory is restored the
-	// same idempotency key re-triggers the durable export and the bytes land.
+	// cl-089's incident shape — the destination dies AFTER the preflight passed — under
+	// direct writes: the worker writes the result where it lives and there is no second
+	// copy to publish later, so the run FAILS typed, naming the refused write, and a run
+	// after the directory is restored lands the file.
 	incidentDir := filepath.Join(root, "incident-output")
 	code, stdout, stderr = runCozyStreams(t, root, "--json", "run", localWeightlessRef+"/tile",
-		"size=32", "seed=13", "delay_ms=4500", "--out", incidentDir,
-		"--idempotency-key", "incident-cl089")
+		"size=32", "seed=13", "delay_ms=4500", "--out", incidentDir)
 	if code != 0 {
 		t.Fatalf("incident submit failed [exit %d]\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
@@ -317,23 +316,20 @@ func TestProductPath(t *testing.T) {
 	must(t, os.Chmod(incidentDir, 0o500))
 	t.Cleanup(func() { _ = os.Chmod(incidentDir, 0o755) })
 	code, out = runCozy(t, root, "run", "watch", idMatch[1], "--json")
-	if code != 0 ||
-		!strings.Contains(out, `"status":"completed (export pending: output_export_io)"`) ||
-		!strings.Contains(out, "daemon retries this durable export") {
-		t.Fatalf("succeeded run with failed export did not report the distinct verdict [exit %d]\n%s", code, out)
+	if code != 1 || !strings.Contains(out, `"code":"failed"`) ||
+		!strings.Contains(out, "output_spool_io") || !strings.Contains(out, "Permission denied") {
+		t.Fatalf("a destination that died after submit did not fail the run typed [exit %d]\n%s", code, out)
 	}
 	must(t, os.Chmod(incidentDir, 0o755))
 	code, out = runCozy(t, root, "--json", "run", localWeightlessRef+"/tile",
-		"size=32", "seed=13", "delay_ms=4500", "--out", incidentDir,
-		"--idempotency-key", "incident-cl089", "--await")
-	if code != 0 || !strings.Contains(out, `"status":"completed"`) ||
-		strings.Contains(out, "export pending") {
-		t.Fatalf("restored destination did not publish on the same key [exit %d]\n%s", code, out)
+		"size=32", "seed=13", "--out", incidentDir, "--await")
+	if code != 0 || !strings.Contains(out, `"status":"completed"`) {
+		t.Fatalf("restored destination did not take the result [exit %d]\n%s", code, out)
 	}
 	incidentFiles, err := os.ReadDir(incidentDir)
 	must(t, err)
 	if len(incidentFiles) != 1 || !requestOutputName(incidentFiles[0].Name(), ".webp") {
-		t.Fatalf("restored export did not land the WebP: %v", incidentFiles)
+		t.Fatalf("restored destination did not land the WebP: %v", incidentFiles)
 	}
 
 	code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
@@ -460,21 +456,12 @@ func assertOnlyResultFiles(t *testing.T, dir string) {
 	must(t, err)
 }
 
-// awaitAttemptsReclaimed observes the attempt working directories go once every run has
-// settled and exported — the daemon's own act, not a client-side deletion.
-func awaitAttemptsReclaimed(t *testing.T, root string) {
+// assertNoAttemptRoot is the owner's rule that a run stages nothing: the result is
+// written where it lives, the payload rides the grant, and no `attempts/` exists.
+func assertNoAttemptRoot(t *testing.T, root string) {
 	t.Helper()
-	attempts := filepath.Join(root, "attempts")
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		entries, err := os.ReadDir(attempts)
-		if err == nil && len(entries) == 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("attempt directories were not reclaimed after settlement: %v (%v)", entries, err)
-		}
-		time.Sleep(25 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(root, "attempts")); !os.IsNotExist(err) {
+		t.Fatalf("the local root holds an attempt working area: %v", err)
 	}
 }
 

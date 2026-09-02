@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
-	"github.com/cozy-creator/cozy/internal/home"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -512,27 +511,34 @@ func (f *fakeControl) badOutcomes(emit func(*pb.AttemptOutcome), offer *pb.Attem
 	send(t)
 }
 
-// outcomeWithOutput writes ONE real PNG under the attempt's granted directory and sends a
-// SUCCEEDED terminal declaring exactly those bytes. It returns the identical envelope,
-// which the `dropack` arm replays when the ack arrives.
+// outcomeWithOutput writes ONE real PNG where the grant says — the granted DIRECTORY,
+// under the file's own digest name, exactly as cozy-runtime's post phase does — and
+// sends a SUCCEEDED terminal declaring exactly those bytes. It returns the identical
+// envelope, which the `dropack` arm replays when the ack arrives.
 func (f *fakeControl) outcomeWithOutput(emit func(*pb.AttemptOutcome),
 	offer *pb.AttemptOffer) *pb.AttemptOutcome {
-	layout, e := home.Open(f.root)
-	if e != nil {
-		f.say("no layout: %s", e.Message)
-		return nil
+	var granted string
+	for _, row := range offer.GetGrant().GetOutputs() {
+		if row.OutputId == "image" {
+			granted = row.Url
+		}
 	}
-	dest := filepath.Join(layout.AttemptDir(offer.RequestId, offer.AttemptOrdinal), "image")
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		f.say("cannot write under the grant: %v", err)
+	dir, ok := strings.CutPrefix(granted, "file://")
+	if !ok || !strings.HasSuffix(dir, "/") {
+		f.say("the grant names no directory for `image`: %q", granted)
 		return nil
 	}
 	body, err := hex.DecodeString(onePixelPNG)
-	if err != nil || os.WriteFile(dest, body, 0o644) != nil {
-		f.say("cannot write the output")
+	if err != nil {
+		f.say("cannot decode the output")
 		return nil
 	}
 	sum := sha256.Sum256(body)
+	dest := filepath.Join(dir, hex.EncodeToString(sum[:])+".png")
+	if err := os.MkdirAll(dir, 0o755); err != nil || os.WriteFile(dest, body, 0o644) != nil {
+		f.say("cannot write under the grant: %v", err)
+		return nil
+	}
 	t, _ := authorOutcome(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
 		pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "one output, written where the grant said")
 	doc, err := canonical.Read(t.OutcomeCanonicalBytes, &pb.AttemptOutcomeBody{})

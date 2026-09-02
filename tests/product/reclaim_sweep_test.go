@@ -11,10 +11,12 @@ import (
 	"github.com/cozy-creator/cozy/internal/scratch"
 )
 
-// TestReclaimSweeps is the startup sweep over the three roots that used to grow without
-// bound (cl-091): attempt working directories, closed workers' roots, and tmp/. Nothing is mocked — a real layout, a real records store, real directories,
-// and the product's own reclaim package. Each root proves both halves: what nothing
-// references goes, and what a row or a live process still claims stays.
+// TestReclaimSweeps is the startup sweep over the two roots that used to grow without
+// bound (cl-091): closed workers' roots and tmp/. Nothing is mocked — a real layout, a
+// real records store, real directories, and the product's own reclaim package. Each root
+// proves both halves: what nothing references goes, and what a row or a live process
+// still claims stays. There is no attempt root to sweep: a local attempt writes its
+// result straight into the store and stages nothing.
 func TestReclaimSweeps(t *testing.T) {
 	l, problem := home.Open(t.TempDir())
 	if problem != nil {
@@ -25,49 +27,21 @@ func TestReclaimSweeps(t *testing.T) {
 		t.Fatal(problem)
 	}
 	defer store.Close()
+	if _, err := os.Stat(filepath.Join(l.Root, "attempts")); !os.IsNotExist(err) {
+		t.Fatalf("the layout still creates an attempt root: %v", err)
+	}
 
-	// ---- attempts: exported (reclaim), still holding its bytes (keep), open (keep),
-	// unrecorded (reclaim), and a non-attempt entry the sweep never touches.
+	// ---- two request rows the tmp sweep reads: one settled, one still open.
 	if problem := store.SpawnWorker(records.WorkerProcess{InstanceID: "ins-attempts", Package: "cozy/sweep",
 		PackageRevisionDigest: "sha256:" + sixtyFour("d"), WorkerID: "local",
 		Devices: []string{"cpu"}}); problem != nil {
 		t.Fatal(problem)
 	}
-	exported := closedAttempt(t, l, store, "req-exported", true)
-	resident := closedAttempt(t, l, store, "req-resident", false)
-	open := l.AttemptDir("req-open", 1)
-	must(t, os.MkdirAll(filepath.Join(open, "in"), 0o755))
+	settledRun(t, l, store, "req-exported")
 	submitSweepRequest(t, store, "req-open")
 	if _, problem := store.Dispatch(records.Attempt{RequestID: "req-open", SessionID: "s-open", InstanceID: "ins-attempts",
 		InvocationDigest: "sha256:" + sixtyFour("c"), InvocationCanonical: []byte("{}")}); problem != nil {
 		t.Fatal(problem)
-	}
-	stranded := l.AttemptDir("req-gone", 3)
-	must(t, os.MkdirAll(filepath.Join(stranded, "in"), 0o755))
-	must(t, os.WriteFile(filepath.Join(stranded, "in", "payload"), []byte("{}"), 0o644))
-	must(t, os.WriteFile(filepath.Join(l.Attempts, "notes.txt"), []byte("keep"), 0o644))
-
-	swept, problem := reclaim.Attempts(l, store)
-	if problem != nil {
-		t.Fatal(problem)
-	}
-	if swept.Scanned != 4 || swept.Removed != 2 || swept.Bytes <= 0 {
-		t.Fatalf("attempt sweep = %+v, want 4 scanned, 2 removed, bytes freed", swept)
-	}
-	for _, gone := range []string{exported, stranded, l.RequestAttempts("req-exported"), l.RequestAttempts("req-gone")} {
-		if _, err := os.Stat(gone); !os.IsNotExist(err) {
-			t.Fatalf("unreferenced attempt directory %s remains: %v", gone, err)
-		}
-	}
-	for _, kept := range []string{resident, open, filepath.Join(l.Attempts, "notes.txt")} {
-		if _, err := os.Stat(kept); err != nil {
-			t.Fatalf("claimed attempt directory %s was swept: %v", kept, err)
-		}
-	}
-	// The exported output is still served from where it went.
-	outputs, problem := store.VisibleOutputs("req-exported")
-	if problem != nil || len(outputs) != 1 || outputs[0].Path != filepath.Join(l.PackageOutputs("cozy/sweep"), "img.png") {
-		t.Fatalf("relocated output = %+v, %v", outputs, problem)
 	}
 
 	// ---- workers: a live row keeps its root, a closed row and an unrecorded root go.
@@ -161,18 +135,17 @@ func TestReclaimSweeps(t *testing.T) {
 	}
 
 	// Every sweep is idempotent: a second pass over the survivors removes nothing.
-	again, _ := reclaim.Attempts(l, store)
 	againWorkers, _ := reclaim.Workers(l, store)
 	againTmp, _ := reclaim.Tmp(l, store)
-	if again.Removed+againWorkers.Removed+againTmp.Removed != 0 {
-		t.Fatalf("second sweeps removed something: %+v %+v %+v", again, againWorkers, againTmp)
+	if againWorkers.Removed+againTmp.Removed != 0 {
+		t.Fatalf("second sweeps removed something: %+v %+v", againWorkers, againTmp)
 	}
 }
 
-// closedAttempt drives one request through the store to a closed attempt whose single
-// output was written under its attempt directory. With exported, the export row is
-// settled the way the daemon settles it, which re-points the output row at the store.
-func closedAttempt(t *testing.T, l home.Layout, store *records.Store, requestID string, exported bool) string {
+// settledRun drives one request through the store to a closed, succeeded attempt whose
+// single output sits in the package's store under its digest name — where the worker
+// wrote it — and settles its export row the way the daemon does.
+func settledRun(t *testing.T, l home.Layout, store *records.Store, requestID string) {
 	t.Helper()
 	submitSweepRequest(t, store, requestID)
 	session := "session-" + requestID
@@ -182,28 +155,20 @@ func closedAttempt(t *testing.T, l home.Layout, store *records.Store, requestID 
 	fatal(t, problem)
 	fatal(t, store.OfferDispatch(requestID, attempt, session))
 	fatal(t, store.Accepted(requestID, attempt, session))
-	dir := l.AttemptDir(requestID, uint64(attempt))
-	must(t, os.MkdirAll(filepath.Join(dir, "in"), 0o755))
-	must(t, os.WriteFile(filepath.Join(dir, "in", "payload"), []byte(`{"size":32}`), 0o644))
-	source := filepath.Join(dir, "image")
-	must(t, os.WriteFile(source, make([]byte, 1024), 0o600))
+	published := filepath.Join(l.PackageOutputs("cozy/sweep"), sixtyFour("0")+".png")
+	must(t, os.MkdirAll(filepath.Dir(published), 0o755))
+	must(t, os.WriteFile(published, make([]byte, 1024), 0o644))
 	if _, problem := store.AcceptTerminal(records.Terminal{RequestID: requestID, Attempt: attempt,
 		SessionID: session, InvocationDigest: digest, TerminalID: "out-" + requestID,
 		TerminalDigest: "sha256:" + sixtyFour("f"), Status: "SUCCEEDED", Cause: "COMPLETED",
-		Outputs: []records.Output{{OutputID: "image", MediaID: records.NewID("med"), Path: source,
+		Outputs: []records.Output{{OutputID: "image", MediaID: records.NewID("med"), Path: published,
 			Digest: "sha256:" + sixtyFour("0"), Length: 1024, MimeType: "image/png"}},
 		EventType: "request.succeeded", EventPayload: map[string]any{}, RequestState: "succeeded",
 	}); problem != nil {
 		t.Fatal(problem)
 	}
 	fatal(t, store.Closed(requestID, attempt))
-	if exported {
-		published := filepath.Join(l.PackageOutputs("cozy/sweep"), "img.png")
-		fatal(t, store.BeginOutputExport(requestID))
-		fatal(t, store.CompleteOutputExport(requestID,
-			[]records.PublishedOutput{{OutputID: "image", Source: source, Path: published}}, true))
-	}
-	return dir
+	fatal(t, store.CompleteOutputExport(requestID, []string{published}))
 }
 
 func submitSweepRequest(t *testing.T, store *records.Store, requestID string) {

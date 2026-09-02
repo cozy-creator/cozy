@@ -153,10 +153,9 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// would otherwise still reference an install, and before the API is served — and it
 	// is never fatal: what it removes is a venv `cozy package install` rebuilds.
 	swept, sweepNote := sweepInstalls(l, st)
-	// The three roots that used to grow without bound. The writer removes its own bytes
+	// The two roots that used to grow without bound. The writer removes its own bytes
 	// when they die; these sweeps are the backstop for a crashed one, and each lets the
 	// records authority — or a live process's kernel lock — decide what still has a claim.
-	attempts, attemptsNote := reclaimNote(reclaim.Attempts(l, st))
 	workers, workersNote := reclaimNote(reclaim.Workers(l, st))
 	tmp, tmpNote := reclaimNote(reclaim.Tmp(l, st))
 
@@ -189,8 +188,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 		addr, strings.Join(bound, "+"), socket)
 	fmt.Fprintf(ctx.Out, "  install sweep: reclaimed %d of %d director(ies), freed %s exclusive%s\n",
 		swept.Removed, swept.Scanned, output.Bytes(swept.Bytes), sweepNote)
-	fmt.Fprintf(ctx.Out, "  attempt sweep: reclaimed %d of %d director(ies), freed %s%s\n",
-		attempts.Removed, attempts.Scanned, output.Bytes(attempts.Bytes), attemptsNote)
 	fmt.Fprintf(ctx.Out, "  worker sweep: reclaimed %d of %d director(ies), freed %s%s\n",
 		workers.Removed, workers.Scanned, output.Bytes(workers.Bytes), workersNote)
 	fmt.Fprintf(ctx.Out, "  tmp sweep: reclaimed %d of %d entr(y|ies), freed %s%s\n",
