@@ -46,7 +46,7 @@ pub struct IngestProfile {
     pub source_dialect: String,
     pub converter_build: String,
     pub converter_recipe: ObjectRef,
-    pub expected_topology_digest: String,
+    pub expected_tensor_schema_digest: String,
     pub allowed_encodings: Vec<ObjectRef>,
     pub max_source_bytes: u64,
     pub max_tensors: u64,
@@ -99,9 +99,9 @@ impl Plain for IngestProfile {
         let converter_build = prefixed("converter.build", cf.req_str("build")?)?;
         let converter_recipe = ObjectRef::from_value("converter.recipe", cf.req("recipe")?)?;
         cf.done()?;
-        let expected_topology_digest = prefixed(
-            "expected_topology_digest",
-            f.req_str("expected_topology_digest")?,
+        let expected_tensor_schema_digest = prefixed(
+            "expected_tensor_schema_digest",
+            f.req_str("expected_tensor_schema_digest")?,
         )?;
         let mut allowed_encodings = Vec::new();
         for e in as_arr(
@@ -121,7 +121,7 @@ impl Plain for IngestProfile {
             source_dialect,
             converter_build,
             converter_recipe,
-            expected_topology_digest,
+            expected_tensor_schema_digest,
             allowed_encodings,
             max_source_bytes,
             max_tensors,
@@ -148,8 +148,8 @@ impl Plain for IngestProfile {
                 ]),
             ),
             (
-                "expected_topology_digest",
-                Value::str(self.expected_topology_digest.clone()),
+                "expected_tensor_schema_digest",
+                Value::str(self.expected_tensor_schema_digest.clone()),
             ),
             (
                 "limits",

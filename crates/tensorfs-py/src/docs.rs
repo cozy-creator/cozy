@@ -169,11 +169,7 @@ fn marshal_header<'p>(py: Python<'p>, header: &Header) -> PyResult<Bound<'p, PyA
 
     let configs = PyDict::new(py);
     for (name, config) in &header.configs {
-        let row = PyDict::new(py);
-        row.set_item("sha256", &config.sha256)?;
-        row.set_item("length", config.length)?;
-        row.set_item("media_type", &config.media_type)?;
-        configs.set_item(name, row)?;
+        configs.set_item(name, PyBytes::new(py, config))?;
     }
     root.set_item("configs", configs)?;
 
@@ -298,74 +294,6 @@ pub fn parse_header<'p>(
     marshal_header(py, &h)
 }
 
-/// The frozen topology projection of a header — logical dtype included, encodings not.
-#[pyfunction]
-pub fn topology_digest(py: Python<'_>, data: &[u8]) -> PyResult<String> {
-    Ok(Header::parse(data).or_refuse(py)?.topology_digest())
-}
-
-/// The FIT index (D4): the same projection with the dtype leaf elided. Two checkpoints with
-/// equal `shape_digest` fit the same code.
-#[pyfunction]
-pub fn shape_digest(py: Python<'_>, data: &[u8]) -> PyResult<String> {
-    Ok(Header::parse(data).or_refuse(py)?.shape_digest())
-}
-
-fn config_bytes(configs: &Bound<'_, PyDict>) -> PyResult<Vec<(String, Vec<u8>)>> {
-    configs
-        .iter()
-        .map(|(name, bytes)| Ok((name.extract::<String>()?, bytes.extract::<Vec<u8>>()?)))
-        .collect()
-}
-
-/// The construction document (model-code-fit §2) of a header, from the exact bytes of every
-/// config it names (`{name: bytes}`): the RFC 8785 bytes whose sha256 is `config_digest`,
-/// or `None` when the header names no config.
-#[pyfunction]
-pub fn construction_document<'p>(
-    py: Python<'p>,
-    data: &[u8],
-    configs: &Bound<'p, PyDict>,
-) -> PyResult<Option<Bound<'p, PyBytes>>> {
-    let header = Header::parse(data).or_refuse(py)?;
-    let document = header
-        .construction_document(&config_bytes(configs)?)
-        .or_refuse(py)?;
-    Ok(document.map(|bytes| PyBytes::new(py, &bytes)))
-}
-
-/// The construction document's identity, or `None` when the header names no config.
-#[pyfunction]
-pub fn config_digest(
-    py: Python<'_>,
-    data: &[u8],
-    configs: &Bound<'_, PyDict>,
-) -> PyResult<Option<String>> {
-    let header = Header::parse(data).or_refuse(py)?;
-    Ok(header
-        .digests(&config_bytes(configs)?)
-        .or_refuse(py)?
-        .config_digest)
-}
-
-/// All three catalog digests of a header: `{"topology_digest", "shape_digest",
-/// "config_digest"}` — what `tfs ingest` stores on the checkpoint row. `configs` maps
-/// each config name the header declares to its exact bytes.
-#[pyfunction]
-pub fn digests<'p>(
-    py: Python<'p>,
-    data: &[u8],
-    configs: &Bound<'p, PyDict>,
-) -> PyResult<Bound<'p, PyDict>> {
-    let header = Header::parse(data).or_refuse(py)?;
-    let d = header.digests(&config_bytes(configs)?).or_refuse(py)?;
-    let out = PyDict::new(py);
-    out.set_item("topology_digest", d.topology_digest)?;
-    out.set_item("shape_digest", d.shape_digest)?;
-    out.set_item("config_digest", d.config_digest)?;
-    Ok(out)
-}
-
 /// Validate canonical Manifest bytes.
 #[pyfunction]
 pub fn parse_manifest<'p>(py: Python<'p>, data: &[u8]) -> PyResult<Bound<'p, PyAny>> {
@@ -388,8 +316,7 @@ pub fn run_doc<'p>(
     let outcome = corpus::run_doc(doc, data, closure, &platform).or_refuse(py)?;
     let result = PyDict::new(py);
     result.set_item("id", outcome.id)?;
-    result.set_item("topology", outcome.topology)?;
-    result.set_item("shape", outcome.shape)?;
+    result.set_item("tensor_schema", outcome.tensor_schema)?;
     result.set_item("manifest", outcome.manifest)?;
     result.set_item("grade", outcome.grade)?;
     Ok(result)

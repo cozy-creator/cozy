@@ -6,14 +6,12 @@ use std::cmp::Ordering;
 
 use crate::canon::{as_arr, as_str, Fields, Value};
 use crate::err::{refuse, Code, Result};
-use crate::header::Digests;
-use crate::ids::{ascii_name, hex64, prefixed, Doc, ObjectRef};
+use crate::ids::{ascii_name, hex64, Doc, ObjectRef};
 
 pub const MAX_REPOSITORY_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CHECKPOINTS: usize = 4096;
 pub const MAX_RELEASES: usize = 4096;
 pub const MAX_RELEASE_LANES: usize = 4096;
-pub const MAX_EVIDENCE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryName {
@@ -64,397 +62,10 @@ impl RepositoryName {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IngestProvenance {
-    pub source_dialect: String,
-    pub converter_build: String,
-    pub converter_recipe: ObjectRef,
-    pub sources: Vec<(String, u64)>,
-    /// Canonical credential-free origin, for example hf://org/repo@<commit> or
-    /// civitai://<version>. Never a signed/access URL or a local path.
-    pub source_uri: Option<String>,
-    /// Upstream declaration retained as evidence, never a TensorFS eligibility verdict.
-    pub declared_license: Option<String>,
-}
-
-fn bounded_fact(what: &str, value: &str, max: usize) -> Result<()> {
-    if value.is_empty()
-        || value.len() > max
-        || value.chars().any(|character| character.is_control())
-    {
-        return refuse(
-            Code::SIZE_CAP,
-            format!("{what} must be 1..={max} non-control UTF-8 bytes"),
-        );
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VerificationEvidence {
-    ApprovedProducer {
-        implementation: String,
-        recipe: ObjectRef,
-    },
-    IndependentNumerical {
-        verifier_build: String,
-        report: ObjectRef,
-    },
-}
-
-/// A typed view a reader cannot form — a key it needs is absent, or a vocabulary it has never
-/// seen — is "unknown", never a refusal. A key that is present and malformed still refuses:
-/// leniency is about what is missing, never about believing garbage.
-fn understood<T>(result: Result<T>) -> Result<Option<T>> {
-    match result {
-        Ok(value) => Ok(Some(value)),
-        Err(refusal) if matches!(refusal.code, Code::MISSING_FIELD | Code::UNKNOWN_FIELD) => {
-            Ok(None)
-        }
-        Err(refusal) => Err(refusal),
-    }
-}
-
-impl IngestProvenance {
-    fn from_value(value: &Value) -> Result<Self> {
-        let mut ingest = Fields::new("Release.evidence.ingest", value)?;
-        let converter_build = prefixed(
-            "Release.evidence.ingest.converter_build",
-            ingest.req_str("converter_build")?,
-        )?;
-        let converter_recipe = ObjectRef::from_value(
-            "Release.evidence.ingest.converter_recipe",
-            ingest.req("converter_recipe")?,
-        )?;
-        let source_dialect = ingest.req_str("source_dialect")?.to_string();
-        ascii_name(
-            "Release.evidence.ingest.source_dialect",
-            &source_dialect,
-            128,
-        )?;
-        let mut sources = Vec::new();
-        for value in as_arr("Release.evidence.ingest", "sources", ingest.req("sources")?)? {
-            let mut source = Fields::new("Release.evidence.ingest.source", value)?;
-            let generation = source.req_uint("generation")?;
-            let digest = prefixed(
-                "Release.evidence.ingest.source.digest",
-                source.req_str("digest")?,
-            )?;
-            sources.push((digest, generation));
-        }
-        let source_uri = ingest
-            .opt("source_uri")
-            .map(|value| as_str("Release.evidence.ingest", "source_uri", value).map(str::to_string))
-            .transpose()?;
-        if let Some(value) = &source_uri {
-            bounded_fact("Release.evidence.ingest.source_uri", value, 2048)?;
-            if value.contains('?') || value.contains('#') {
-                return refuse(
-                    Code::KEY_GRAMMAR,
-                    "ingest source_uri must be canonical and query/fragment-free",
-                );
-            }
-        }
-        let declared_license = ingest
-            .opt("declared_license")
-            .map(|value| {
-                as_str("Release.evidence.ingest", "declared_license", value).map(str::to_string)
-            })
-            .transpose()?;
-        if let Some(value) = &declared_license {
-            bounded_fact("Release.evidence.ingest.declared_license", value, 512)?;
-        }
-        if sources.is_empty() || sources.len() > 256 {
-            return refuse(
-                Code::COUNT_CAP,
-                "ingest provenance source count is outside 1..=256",
-            );
-        }
-        if sources.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return refuse(
-                Code::SORT_ORDER,
-                "ingest provenance sources must be sorted and unique",
-            );
-        }
-        Ok(Self {
-            source_dialect,
-            converter_build,
-            converter_recipe,
-            sources,
-            source_uri,
-            declared_license,
-        })
-    }
-
-    fn to_value(&self) -> Value {
-        let mut fields = vec![
-            ("converter_build", Value::str(self.converter_build.clone())),
-            ("converter_recipe", self.converter_recipe.to_value()),
-            ("source_dialect", Value::str(self.source_dialect.clone())),
-            (
-                "sources",
-                Value::arr(
-                    self.sources
-                        .iter()
-                        .map(|(digest, generation)| {
-                            Value::obj(vec![
-                                ("digest", Value::str(digest.clone())),
-                                ("generation", Value::uint(*generation)),
-                            ])
-                        })
-                        .collect(),
-                ),
-            ),
-        ];
-        if let Some(value) = &self.source_uri {
-            fields.push(("source_uri", Value::str(value.clone())));
-        }
-        if let Some(value) = &self.declared_license {
-            fields.push(("declared_license", Value::str(value.clone())));
-        }
-        Value::obj(fields)
-    }
-}
-
-impl VerificationEvidence {
-    fn from_value(value: &Value) -> Result<Self> {
-        let mut verification = Fields::new("Release.evidence.verification", value)?;
-        match verification.req_str("kind")? {
-            "approved_producer" => Ok(Self::ApprovedProducer {
-                implementation: prefixed(
-                    "Release.evidence.verification.implementation",
-                    verification.req_str("implementation")?,
-                )?,
-                recipe: ObjectRef::from_value(
-                    "Release.evidence.verification.recipe",
-                    verification.req("recipe")?,
-                )?,
-            }),
-            "independent_numerical" => Ok(Self::IndependentNumerical {
-                verifier_build: prefixed(
-                    "Release.evidence.verification.verifier_build",
-                    verification.req_str("verifier_build")?,
-                )?,
-                report: ObjectRef::from_value(
-                    "Release.evidence.verification.report",
-                    verification.req("report")?,
-                )?,
-            }),
-            _ => refuse(Code::UNKNOWN_FIELD, "release verification kind is unknown"),
-        }
-    }
-
-    fn to_value(&self) -> Value {
-        match self {
-            Self::ApprovedProducer {
-                implementation,
-                recipe,
-            } => Value::obj(vec![
-                ("implementation", Value::str(implementation.clone())),
-                ("kind", Value::str("approved_producer")),
-                ("recipe", recipe.to_value()),
-            ]),
-            Self::IndependentNumerical {
-                verifier_build,
-                report,
-            } => Value::obj(vec![
-                ("kind", Value::str("independent_numerical")),
-                ("report", report.to_value()),
-                ("verifier_build", Value::str(verifier_build.clone())),
-            ]),
-        }
-    }
-}
-
-/// Ingest provenance a checkpoint row carries beside its manifest. Informational: serving
-/// reads the manifest and the header, never this. It records where the checkpoint came from
-/// (`ingest`: source dialect, converter build and recipe, source digests, canonical origin,
-/// declared license), the receipt verdict the ingest border reached (`verification`), and the
-/// three digests tfs derived from the header at write time (`digests`: topology identity,
-/// the dtype-elided shape digest the fit index joins on, the construction document's digest).
-///
-/// The row carries the exact canonical object it was written with — stored bytes are the
-/// canonical bytes, so a reader re-emits what it read, including keys it does not know — and
-/// the typed views are formed on demand. Reading is total: an absent or unknown key answers
-/// "unknown", and only a key that is present and malformed refuses, at the view that needs
-/// it. Only writers require more: `apply` stores a CozyTensors checkpoint row with the digests
-/// tfs derives from the resident header and refuses a supplied digest that differs
-/// (`authored`); the admission seam requires the published row to carry them
-/// (`require_digests`); `required_files` refuses ingest provenance without its verdict.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckpointEvidence {
-    value: Value,
-}
-
-impl CheckpointEvidence {
-    /// What a writer records: the current shape, every part it holds.
-    pub fn new(
-        digests: Option<Digests>,
-        ingest: Option<IngestProvenance>,
-        verification: Option<VerificationEvidence>,
-    ) -> Self {
-        let mut fields = Vec::new();
-        if let Some(digests) = digests {
-            if let Some(config) = digests.config_digest {
-                fields.push(("config_digest", Value::str(config)));
-            }
-            fields.push(("shape_digest", Value::str(digests.shape_digest)));
-            fields.push(("topology_digest", Value::str(digests.topology_digest)));
-        }
-        if let Some(ingest) = ingest {
-            fields.push(("ingest", ingest.to_value()));
-        }
-        if let Some(verification) = verification {
-            fields.push(("verification", verification.to_value()));
-        }
-        Self {
-            value: Value::obj(fields),
-        }
-    }
-
-    pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let value = crate::canon::parse_canonical(bytes, MAX_EVIDENCE_BYTES)?;
-        Self::from_value(&value)
-    }
-
-    fn from_value(v: &Value) -> Result<Self> {
-        Fields::new("Release.evidence", v)?;
-        if crate::canon::write(v).len() > MAX_EVIDENCE_BYTES {
-            return refuse(Code::SIZE_CAP, "release evidence exceeds 64 KiB");
-        }
-        Ok(Self { value: v.clone() })
-    }
-
-    pub fn to_value(&self) -> Value {
-        self.value.clone()
-    }
-
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        crate::canon::write(&self.value)
-    }
-
-    fn field(&self, key: &str) -> Option<&Value> {
-        let Value::Obj(fields) = &self.value else {
-            return None;
-        };
-        fields
-            .iter()
-            .find(|(candidate, _)| candidate == key)
-            .map(|(_, value)| value)
-    }
-
-    fn digest(&self, key: &str) -> Result<Option<String>> {
-        self.field(key)
-            .map(|value| prefixed("Release.evidence", as_str("Release.evidence", key, value)?))
-            .transpose()
-    }
-
-    /// The header-derived digests, when the row carries the topology/shape pair.
-    pub fn digests(&self) -> Result<Option<Digests>> {
-        Ok(
-            match (
-                self.digest("topology_digest")?,
-                self.digest("shape_digest")?,
-            ) {
-                (Some(topology_digest), Some(shape_digest)) => Some(Digests {
-                    topology_digest,
-                    shape_digest,
-                    config_digest: self.digest("config_digest")?,
-                }),
-                _ => None,
-            },
-        )
-    }
-
-    pub fn ingest(&self) -> Result<Option<IngestProvenance>> {
-        self.field("ingest")
-            .map(|value| understood(IngestProvenance::from_value(value)))
-            .transpose()
-            .map(Option::flatten)
-    }
-
-    pub fn verification(&self) -> Result<Option<VerificationEvidence>> {
-        self.field("verification")
-            .map(|value| understood(VerificationEvidence::from_value(value)))
-            .transpose()
-            .map(Option::flatten)
-    }
-
-    /// The row a writer stores for a checkpoint whose header is at hand: the digests are
-    /// tfs's own derivation — a supplied digest that differs is refused, an absent one is
-    /// filled in — beside the provenance the caller supplied, in the current shape.
-    pub fn authored(&self, derived: &Digests) -> Result<Self> {
-        for (name, claimed, derived) in [
-            (
-                "topology_digest",
-                self.digest("topology_digest")?,
-                Some(&derived.topology_digest),
-            ),
-            (
-                "shape_digest",
-                self.digest("shape_digest")?,
-                Some(&derived.shape_digest),
-            ),
-            (
-                "config_digest",
-                self.digest("config_digest")?,
-                derived.config_digest.as_ref(),
-            ),
-        ] {
-            if let Some(claimed) = claimed {
-                if Some(&claimed) != derived {
-                    return refuse(
-                        Code::TOPOLOGY_MISMATCH,
-                        format!(
-                            "checkpoint evidence {name} {claimed} differs from the checkpoint's {}",
-                            derived.map_or("absent", String::as_str)
-                        ),
-                    );
-                }
-            }
-        }
-        Ok(Self::new(
-            Some(derived.clone()),
-            self.ingest()?,
-            self.verification()?,
-        ))
-    }
-
-    /// The manifest files ingest provenance names. A writer's rule: provenance without its
-    /// verdict is refused here.
-    pub fn required_files(&self) -> Result<Vec<(&'static str, ObjectRef)>> {
-        let Some(ingest) = self.ingest()? else {
-            return Ok(Vec::new());
-        };
-        let mut files = vec![("evidence/converter-recipe", ingest.converter_recipe.clone())];
-        match self.verification()? {
-            Some(VerificationEvidence::ApprovedProducer { recipe, .. }) => {
-                if recipe != ingest.converter_recipe {
-                    return refuse(
-                        Code::OBJECT_ID_MISMATCH,
-                        "approved-producer recipe differs from ingest converter recipe",
-                    );
-                }
-            }
-            Some(VerificationEvidence::IndependentNumerical { report, .. }) => {
-                files.push(("evidence/verification-report", report));
-            }
-            None => {
-                return refuse(
-                    Code::MISSING_FIELD,
-                    "ingest provenance requires its verification verdict",
-                )
-            }
-        }
-        Ok(files)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     /// The checkpoint identity is exactly this Manifest digest. The Repository entry adds
-    /// retention and evidence, never a second checkpoint id or document.
+    /// retention, never a second checkpoint id or document.
     pub manifest: ObjectRef,
-    pub evidence: Option<CheckpointEvidence>,
     /// Monotone visibility fact. Once a public release has named this checkpoint, exact
     /// digest reads remain meaningful even after every movable lane points elsewhere.
     pub published: bool,
@@ -471,9 +82,6 @@ impl Checkpoint {
         if self.manifest.length == 0 {
             return refuse(Code::LENGTH_MISMATCH, "checkpoint manifest has zero length");
         }
-        if let Some(evidence) = &self.evidence {
-            CheckpointEvidence::from_value(&evidence.to_value())?;
-        }
         if let Some(source_selection) = &self.source_selection {
             hex64("Checkpoint.source_selection", source_selection)?;
         }
@@ -482,10 +90,6 @@ impl Checkpoint {
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut fields = Fields::new("Repository.checkpoint", v)?;
-        let evidence = fields
-            .opt("evidence")
-            .map(CheckpointEvidence::from_value)
-            .transpose()?;
         let manifest =
             ObjectRef::from_value("Repository.checkpoint.manifest", fields.req("manifest")?)?;
         let published = match fields.req("published")? {
@@ -512,7 +116,6 @@ impl Checkpoint {
         fields.done()?;
         let checkpoint = Self {
             manifest,
-            evidence,
             published,
             source_selection,
         };
@@ -525,9 +128,6 @@ impl Checkpoint {
             ("manifest", self.manifest.to_value()),
             ("published", Value::Bool(self.published)),
         ];
-        if let Some(evidence) = &self.evidence {
-            fields.push(("evidence", evidence.to_value()));
-        }
         if let Some(source_selection) = &self.source_selection {
             fields.push(("source_selection", Value::str(source_selection.clone())));
         }
@@ -1025,7 +625,6 @@ pub enum Mutation {
     PutCheckpoint {
         repo: RepositoryName,
         manifest: ObjectRef,
-        evidence: Option<Box<CheckpointEvidence>>,
     },
     RemoveCheckpoint {
         repo: RepositoryName,
@@ -1049,7 +648,6 @@ pub enum Mutation {
         repo: RepositoryName,
         manifest: ObjectRef,
         version: String,
-        evidence: Box<CheckpointEvidence>,
     },
     DeleteRepository {
         repo: RepositoryName,
@@ -1063,16 +661,6 @@ impl Mutation {
         let action = fields.req_str("action")?.to_string();
         let result = match action.as_str() {
             "put_checkpoint" => Mutation::PutCheckpoint {
-                evidence: fields
-                    .opt("evidence_base64")
-                    .map(|value| {
-                        let encoded =
-                            crate::canon::as_str("RepositoryMutation", "evidence_base64", value)?;
-                        Ok(Box::new(CheckpointEvidence::parse(&crate::b64::decode(
-                            encoded,
-                        )?)?))
-                    })
-                    .transpose()?,
                 manifest: ObjectRef::from_value(
                     "RepositoryMutation.manifest",
                     fields.req("manifest")?,
@@ -1111,22 +699,14 @@ impl Mutation {
                 repo: RepositoryName::from_value(fields.req("repo")?)?,
                 version: fields.req_str("version")?.to_string(),
             },
-            "replace_local" => {
-                let encoded = crate::canon::as_str(
-                    "RepositoryMutation",
-                    "evidence_base64",
-                    fields.req("evidence_base64")?,
-                )?;
-                Mutation::ReplaceLocal {
-                    evidence: Box::new(CheckpointEvidence::parse(&crate::b64::decode(encoded)?)?),
-                    manifest: ObjectRef::from_value(
-                        "RepositoryMutation.manifest",
-                        fields.req("manifest")?,
-                    )?,
-                    repo: RepositoryName::from_value(fields.req("repo")?)?,
-                    version: fields.req_str("version")?.to_string(),
-                }
-            }
+            "replace_local" => Mutation::ReplaceLocal {
+                manifest: ObjectRef::from_value(
+                    "RepositoryMutation.manifest",
+                    fields.req("manifest")?,
+                )?,
+                repo: RepositoryName::from_value(fields.req("repo")?)?,
+                version: fields.req_str("version")?.to_string(),
+            },
             "delete_repository" => Mutation::DeleteRepository {
                 repo: RepositoryName::from_value(fields.req("repo")?)?,
             },
@@ -1153,53 +733,11 @@ impl Mutation {
     }
 }
 
-/// A published row must carry the digests, and they must be what the checkpoint derives, all
-/// three: the admission seam and the receipt writers check the row they are about to serve
-/// against the header, so a stale or foreign transcription is refused rather than indexed.
-pub fn require_digests(claimed: Option<&Digests>, derived: &Digests) -> Result<()> {
-    let Some(claimed) = claimed else {
-        return refuse(
-            Code::MISSING_FIELD,
-            "checkpoint evidence carries no topology_digest/shape_digest",
-        );
-    };
-    let absent = "absent".to_string();
-    for (name, c, d) in [
-        (
-            "topology_digest",
-            &claimed.topology_digest,
-            &derived.topology_digest,
-        ),
-        ("shape_digest", &claimed.shape_digest, &derived.shape_digest),
-        (
-            "config_digest",
-            claimed.config_digest.as_ref().unwrap_or(&absent),
-            derived.config_digest.as_ref().unwrap_or(&absent),
-        ),
-    ] {
-        if c != d {
-            return refuse(
-                Code::TOPOLOGY_MISMATCH,
-                format!("checkpoint evidence {name} {c} differs from the checkpoint's {d}"),
-            );
-        }
-    }
-    Ok(())
-}
-
 /// Apply against the exact bytes the caller observed. The returned `None` means conditional
 /// repository deletion; `Some` is the exact replacement body. The backend supplies the
 /// observed bytes/ETag as its CAS precondition, never an embedded generation number.
 ///
-/// `derived` is what the resident header digests to, and it is the writer's: a CozyTensors
-/// checkpoint row is stored with those digests whether or not the incoming evidence carried
-/// them (`CheckpointEvidence::authored`), so a document from a hub or a peer written under
-/// an older vocabulary commits, and a digest it does claim must agree.
-pub fn apply(
-    current: Option<&[u8]>,
-    mutation: &Mutation,
-    derived: Option<&Digests>,
-) -> Result<Option<Repository>> {
+pub fn apply(current: Option<&[u8]>, mutation: &Mutation) -> Result<Option<Repository>> {
     let existing = current.map(Repository::parse).transpose()?;
     if existing
         .as_ref()
@@ -1211,36 +749,18 @@ pub fn apply(
         );
     }
     match mutation {
-        Mutation::PutCheckpoint {
-            repo,
-            manifest,
-            evidence,
-        } => {
+        Mutation::PutCheckpoint { repo, manifest } => {
             if repo.org == "local" {
                 return refuse(
                     Code::KEY_GRAMMAR,
                     "local repositories require replace_local",
                 );
             }
-            let evidence = match (evidence.as_deref(), derived) {
-                (Some(evidence), Some(derived)) => Some(evidence.authored(derived)?),
-                (None, Some(derived)) => {
-                    Some(CheckpointEvidence::new(Some(derived.clone()), None, None))
-                }
-                (None, None) => None,
-                (Some(_), None) => {
-                    return refuse(
-                        Code::ATTACHMENT_CARDINALITY,
-                        "model evidence requires one CozyTensors manifest entry",
-                    )
-                }
-            };
             Ok(Some(
                 existing
                     .unwrap_or_else(|| Repository::empty(repo.clone()))
                     .put_checkpoint(Checkpoint {
                         manifest: manifest.clone(),
-                        evidence,
                         published: false,
                         source_selection: None,
                     })?,
@@ -1302,20 +822,14 @@ pub fn apply(
             repo,
             manifest,
             version,
-            evidence,
         } => {
             if repo.org != "local" {
                 return refuse(Code::KEY_GRAMMAR, "replace_local requires org local");
             }
             hex64("local source selection", version)?;
-            let derived = derived.ok_or_else(|| crate::err::Refusal {
-                code: Code::MISSING_FIELD,
-                detail: "a local CozyTensors alias requires the header-derived digests".into(),
-            })?;
             let repository = Repository {
                 checkpoints: vec![Checkpoint {
                     manifest: manifest.clone(),
-                    evidence: Some(evidence.authored(derived)?),
                     published: false,
                     source_selection: Some(version.clone()),
                 }],
@@ -1342,19 +856,6 @@ pub fn compare_release_key(left: &Release, right: &Release) -> Ordering {
 mod tests {
     use super::*;
 
-    fn seeded(seed: u8) -> Digests {
-        let d = |tag: u8| format!("sha256:{}", format!("{:02x}", seed ^ tag).repeat(32));
-        Digests {
-            topology_digest: d(0),
-            shape_digest: d(1),
-            config_digest: Some(d(2)),
-        }
-    }
-
-    fn evidence(seed: u8) -> CheckpointEvidence {
-        CheckpointEvidence::new(Some(seeded(seed)), None, None)
-    }
-
     fn lane(lane: &str, seed: u8) -> ReleaseLane {
         ReleaseLane {
             lane: lane.into(),
@@ -1380,9 +881,6 @@ mod tests {
             .flat_map(|release| &release.lanes)
             .map(|lane| Checkpoint {
                 manifest: lane.manifest.clone(),
-                evidence: Some(evidence(
-                    u8::from_str_radix(&lane.manifest.sha256[..2], 16).unwrap() - 1,
-                )),
                 published: true,
                 source_selection: None,
             })
@@ -1396,9 +894,6 @@ mod tests {
         let selected = release.lanes[0].clone();
         Repository::empty(repo)
             .put_checkpoint(Checkpoint {
-                evidence: Some(evidence(
-                    u8::from_str_radix(&selected.manifest.sha256[..2], 16).unwrap() - 1,
-                )),
                 manifest: selected.manifest.clone(),
                 published: false,
                 source_selection: None,
@@ -1439,7 +934,6 @@ mod tests {
         };
         let repository = Repository::empty(name)
             .put_checkpoint(Checkpoint {
-                evidence: Some(evidence(1)),
                 manifest: first.manifest.clone(),
                 published: false,
                 source_selection: None,
@@ -1484,14 +978,12 @@ mod tests {
         };
         let repository = Repository::empty(RepositoryName::new("org", "model").unwrap())
             .put_checkpoint(Checkpoint {
-                evidence: Some(evidence(1)),
                 manifest: first.manifest.clone(),
                 published: false,
                 source_selection: None,
             })
             .unwrap()
             .put_checkpoint(Checkpoint {
-                evidence: Some(evidence(2)),
                 manifest: peer.manifest.clone(),
                 published: false,
                 source_selection: None,
@@ -1520,36 +1012,15 @@ mod tests {
     }
 
     #[test]
-    fn evidence_digests_require_the_sha256_prefix_and_repo_names_reject_dot_components() {
+    fn repo_names_reject_dot_components() {
         assert_eq!(
             RepositoryName::new(".", "model").unwrap_err().code,
             Code::KEY_GRAMMAR
         );
-        let good = repository_with_release(
-            RepositoryName::new("org", "model").unwrap(),
-            release("1.0.0", "X", 1),
-        )
-        .canonical_bytes();
-        let bad = String::from_utf8(good)
-            .unwrap()
-            .replace("sha256:0101", "0101010101");
-        // The document reads (evidence is informational); the digest view refuses.
-        let read = Repository::parse(bad.as_bytes()).unwrap();
-        assert_eq!(read.canonical_bytes(), bad.as_bytes());
-        assert_eq!(
-            read.checkpoints[0]
-                .evidence
-                .as_ref()
-                .unwrap()
-                .digests()
-                .unwrap_err()
-                .code,
-            Code::MALFORMED_DIGEST
-        );
     }
 
     #[test]
-    fn repository_and_evidence_caps_are_enforced_at_the_exact_writer() {
+    fn repository_caps_are_enforced_at_the_exact_writer() {
         let repo = RepositoryName::new("org", "model").unwrap();
         let releases: Vec<Release> = (0..MAX_RELEASES)
             .map(|index| release(&format!("{index:04}"), "X", (index % 200) as u8))
@@ -1575,7 +1046,6 @@ mod tests {
             Code::REPOSITORY_FULL
         );
 
-        assert!(evidence(1).to_value().kind() == "object");
         assert!(
             {
                 let releases: Vec<Release> = (0..MAX_RELEASES)
@@ -1598,50 +1068,6 @@ mod tests {
             .canonical_bytes()
             .len()
                 < MAX_REPOSITORY_BYTES
-        );
-    }
-
-    #[test]
-    fn ingest_origin_is_bounded_credential_free_evidence() {
-        let recipe = ObjectRef {
-            sha256: "44".repeat(32),
-            length: 12,
-        };
-        let source_uri = format!("hf://org/model@{}", "88".repeat(20));
-        let ingest = IngestProvenance {
-            source_dialect: "safetensors.diffusers".into(),
-            converter_build: format!("sha256:{}", "66".repeat(32)),
-            converter_recipe: recipe.clone(),
-            sources: vec![(format!("sha256:{}", "77".repeat(32)), 1)],
-            source_uri: Some(source_uri.clone()),
-            declared_license: Some("apache-2.0".into()),
-        };
-        let evidence = CheckpointEvidence::new(
-            Some(seeded(0x55)),
-            Some(ingest.clone()),
-            Some(VerificationEvidence::ApprovedProducer {
-                implementation: format!("sha256:{}", "66".repeat(32)),
-                recipe: recipe.clone(),
-            }),
-        );
-        let read = CheckpointEvidence::parse(&evidence.canonical_bytes()).unwrap();
-        assert_eq!(read, evidence);
-        assert_eq!(read.digests().unwrap(), Some(seeded(0x55)));
-        assert_eq!(read.ingest().unwrap(), Some(ingest));
-        assert_eq!(
-            read.required_files().unwrap(),
-            vec![("evidence/converter-recipe", recipe)]
-        );
-        let with_query = String::from_utf8(evidence.canonical_bytes())
-            .unwrap()
-            .replace(&source_uri, &format!("{source_uri}?token=secret"));
-        assert_eq!(
-            CheckpointEvidence::parse(with_query.as_bytes())
-                .unwrap()
-                .ingest()
-                .unwrap_err()
-                .code,
-            Code::KEY_GRAMMAR
         );
     }
 }

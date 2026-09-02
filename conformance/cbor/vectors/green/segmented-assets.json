@@ -44,7 +44,7 @@
       ]
     ]
   ],
-  "configs": [["video_vae", "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", 72, "application/json"]],
+  "configs": [["video_vae", "{\"channels\":4}"]],
   "encodings": [{"logical_dtypes":["bf16"],"roles":{"value":{"carrier":{"t":"same_as_logical"},"shape":{"t":"same"}}}}],
   "format": "cozytensors/1"
 }

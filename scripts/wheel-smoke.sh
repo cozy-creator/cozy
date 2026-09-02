@@ -51,7 +51,7 @@ echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/facade-conform.py
 
 "$work/venv/bin/python" - "$fixture" "$SNAP" <<'PY'
-import hashlib, json, pathlib, sys, tempfile
+import hashlib, pathlib, sys, tempfile
 
 store_path, snap = pathlib.Path(sys.argv[1]), sys.argv[2]
 import tensorfs
@@ -117,24 +117,8 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
     assert tensorfs.fetch_complete_cozytensors(destination, pull["document"]) == (
         len(info["manifest"]) + sum(length for _, length in declared)
     )
-    # The construction document is assembled from the config bytes the header names;
-    # its digest is what the hub's header route and cozy-runtime compute from the same bytes.
-    configs = {name: bytes(store.document(row["sha256"])) for name, row in header["configs"].items()}
-    digests = tensorfs.digests(info["header"], configs)
-    document = tensorfs.construction_document(info["header"], configs)
-    assert digests["config_digest"] == "sha256:" + hashlib.sha256(document).hexdigest()
-    evidence = json.dumps(
-        {key: value for key, value in digests.items() if value is not None},
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    expected = {
-        "expected_topology": tensorfs.topology_digest(info["header"]),
-        "expected_encodings": sorted(row["id"] for row in header["encodings"]),
-    }
-    repo_bytes = operation.commit_release(
-        None, "1.0.0", "cpu", snap, len(info["manifest"]), evidence
-    )
+    assert all(isinstance(config, bytes) for config in header["configs"].values())
+    repo_bytes = operation.commit_release(None, "1.0.0", "cpu", snap, len(info["manifest"]))
     assert destination.repo_get("tensorhub", "smoke") == repo_bytes
     assert destination.resolve_release("tensorhub", "smoke", "1.0.0", "cpu") == {
         "org": "tensorhub",
@@ -147,7 +131,7 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
     }
     local_a = destination.replace_local(
         None, "dev-model", "sha256:" + "11" * 32,
-        snap, len(info["manifest"]), evidence, **expected,
+        snap, len(info["manifest"]),
     )
     assert destination.resolve_local("dev-model") == {
         "name": "dev-model",
@@ -157,31 +141,18 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
     }
     local_b = destination.replace_local(
         local_a, "dev-model", "sha256:" + "22" * 32,
-        snap, len(info["manifest"]), evidence, **expected,
+        snap, len(info["manifest"]),
     )
     assert destination.repo_get("local", "dev-model") == local_b
     assert destination.resolve_local("dev-model")["source_selection"] == "sha256:" + "22" * 32
     try:
         destination.replace_local(
             local_a, "dev-model", "sha256:" + "33" * 32,
-            snap, len(info["manifest"]), evidence, **expected,
+            snap, len(info["manifest"]),
         )
         raise AssertionError("stale local alias replacement succeeded")
     except tensorfs.errors.RepositoryConflict:
         pass
-    for bad, error in [
-        ({**expected, "expected_topology": "sha256:" + "aa" * 32}, tensorfs.errors.TopologyMismatch),
-        ({**expected, "expected_encodings": ["sha256:" + "bb" * 32]}, tensorfs.errors.EncodingMismatch),
-        ({**expected, "expected_encodings": ["plain/1"]}, tensorfs.errors.MalformedDigest),
-    ]:
-        try:
-            destination.replace_local(
-                local_b, "dev-model", "sha256:" + "44" * 32,
-                snap, len(info["manifest"]), evidence, **bad,
-            )
-            raise AssertionError("wrong local output contract replaced the alias")
-        except error:
-            assert destination.repo_get("local", "dev-model") == local_b
     destination.remove_local(local_b, "dev-model")
     try:
         destination.resolve_local("dev-model")
@@ -210,7 +181,6 @@ except tensorfs.errors.MalformedCbor as e:
 try:
     store.prepare_model_source(
         "wheel-source-proof", "sha256:" + "44" * 32, [], [],
-        "hf://org/model@" + "55" * 20, "other",
     )
     raise AssertionError("empty model source preparation succeeded")
 except tensorfs.errors.CountCap as e:

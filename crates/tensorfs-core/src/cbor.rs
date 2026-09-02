@@ -7,7 +7,7 @@ use minicbor::{Decoder, Encoder};
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Asset, Body, Header, Part, Tensor};
-use crate::ids::{ConfigRef, ObjectRef};
+use crate::ids::ObjectRef;
 use crate::limits;
 use crate::relation::{Carrier, Dim, Relation};
 use crate::spec::{EncodingSpec, Role};
@@ -565,14 +565,9 @@ pub fn encode_header_unvalidated(header: &Header) -> Result<Vec<u8>> {
 
     emit("header.configs", e.array(header.configs.len() as u64))?;
     for (name, config) in &header.configs {
-        emit("config", e.array(4))?;
+        emit("config", e.array(2))?;
         emit("config.name", e.str(name))?;
-        emit(
-            "config.digest",
-            e.bytes(&digest_bytes("config digest", &config.sha256)?),
-        )?;
-        emit("config.length", e.u64(config.length))?;
-        emit("config.media_type", e.str(&config.media_type))?;
+        emit("config.canonical_json", e.bytes(config))?;
     }
 
     emit("header.assets", e.array(header.assets.len() as u64))?;
@@ -636,15 +631,18 @@ fn decode(bytes: &[u8]) -> Result<Header> {
     let mut configs = Vec::with_capacity(config_count);
     for i in 0..config_count {
         let what = format!("header.configs[{i}]");
-        exact_array(&mut d, &what, 4)?;
-        configs.push((
-            text(&mut d, &format!("{what}.name"), limits::MAX_NAME_BYTES)?,
-            ConfigRef {
-                sha256: digest_hex(&mut d, &format!("{what}.digest"))?,
-                length: uint(&mut d, &format!("{what}.length"))?,
-                media_type: text(&mut d, &format!("{what}.media_type"), 128)?,
-            },
-        ));
+        exact_array(&mut d, &what, 2)?;
+        let name = text(&mut d, &format!("{what}.name"), limits::MAX_NAME_BYTES)?;
+        let config = d
+            .bytes()
+            .map_err(|error| malformed(&format!("{what}.canonical_json"), error))?;
+        if config.len() > limits::DOC_MAX_BYTES {
+            return refuse(
+                Code::SIZE_CAP,
+                format!("{what}.canonical_json exceeds the document byte cap"),
+            );
+        }
+        configs.push((name, config.to_vec()));
     }
 
     let asset_count = list_len(&mut d, "header.assets", limits::MAX_ENTRIES, false)?;

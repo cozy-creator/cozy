@@ -77,8 +77,7 @@ pub fn cmd_topology(root: &Path, hex: &str, flags: &Flags) -> ExitCode {
     emit(&code, flags);
     println!("contract     {}", code.contract);
     println!("tensors      {}", code.count());
-    println!("topology     {}", code.topology_digest());
-    println!("shape        {}", code.shape_digest());
+    println!("tensor schema {}", code.tensor_schema_digest());
     ExitCode::SUCCESS
 }
 
@@ -170,16 +169,6 @@ pub fn cmd_fit(code_p: &Path, root: &Path, header_arg: &str, flags: &Flags) -> E
     println!("fit          {}", verdict.code());
     println!("detail       {}", verdict.text());
     println!("custody      {}", custody.name());
-    println!(
-        "shape        code {} / checkpoint {} — {}",
-        &code.shape_digest()[7..19],
-        &header.shape_digest()[7..19],
-        if code.shape_digest() == header.shape_digest() {
-            "the fit index HITS"
-        } else {
-            "index miss; the answer is the walk above"
-        }
-    );
     if let Fit::Ok { ignored, .. } = &verdict {
         for key in ignored {
             println!("ignored      {key}");
@@ -404,7 +393,7 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
     println!("  logical    REAL — keys/dtypes/shapes/roles off pinned upstream header bytes");
     println!("  parts      PLACEHOLDER object ids: no weight bytes transit this machine");
     println!("header       {}", ok!(header.object_id()));
-    println!("topology     {}", header.topology_digest());
+    println!("tensor schema {}", header.tensor_schema_digest());
     println!("code         {}", code.object_id());
     for (id, s) in &closure.specs {
         println!(
@@ -518,7 +507,7 @@ fn emit_bytes(bytes: &[u8], flags: &Flags) {
 ///
 /// `--json` prints ONE object and nothing else -- the surface a program should read; the
 /// human print below is for people. It is TOTAL: `satisfied`, `depth`, `details`,
-/// `encodings`, `report` and the four `topology_*` index keys are present on every answer.
+/// `encodings` and `report` are present on every answer.
 /// `encodings` is the set the CHECKPOINT carries, and it is here because "these bytes can
 /// be read" and "some card has a qualified implementation for them" are two independent
 /// questions; the second is `tfs capability`, and a caller cannot ask it without knowing
@@ -572,26 +561,6 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
     }
 
     println!("custody      {}", custody.name());
-    println!(
-        "topology     required {} / present {} — {}",
-        &report.topology_required[7..19],
-        &report.topology_present[7..19],
-        if report.topology_required == report.topology_present {
-            "the fast-path index HITS (an index, never the decision)"
-        } else {
-            "index miss; the decision is the document comparison below"
-        }
-    );
-    println!(
-        "shape        required {} / present {} — {}",
-        &report.shape_required[7..19],
-        &report.shape_present[7..19],
-        if report.shape_required == report.shape_present {
-            "same shapes, so any difference is dtype or encoding alone (a search bucket)"
-        } else {
-            "different shapes: a different model, not a different packaging"
-        }
-    );
     if out.mismatches.is_empty() {
         println!("verdict      Satisfied");
     } else {

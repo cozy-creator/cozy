@@ -1,5 +1,5 @@
 doc: compat_report
 expect: ok
-id: sha256:d618fe83b99ad0dc99c3139c4d4a81d3c10f78f0ee00c2a48ae89a7af5368f95
+id: sha256:4b33b79d02efad42cf9d87695f0caacb7806b94041d9d703a329b307dcf9f542
 grade: PRODUCIBLE
 note: the same pair stopped at the first fact: PRODUCIBLE, which is why ranking may not stop there

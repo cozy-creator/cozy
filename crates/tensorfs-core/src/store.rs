@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fs2::FileExt;
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::ids::{hex64, prefixed, Doc, ObjectRef};
+use crate::ids::{hex64, Doc, ObjectRef};
 use crate::sha256::{self, Sha256};
 
 const BUF: usize = 1 << 20;
@@ -38,88 +38,6 @@ fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
     Refusal {
         code: Code::IO_FAILED,
         detail: format!("{}: {e}", what.as_ref()),
-    }
-}
-
-/// The exact model contract a caller may require before replacing a local alias.
-/// TensorFS derives the resident side from the stored Manifest and `cozytensors/1`
-/// header; callers never parse either document themselves.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExpectedCheckpointContract {
-    topology_digest: String,
-    encoding_ids: Vec<String>,
-}
-
-impl ExpectedCheckpointContract {
-    /// Build the optional all-or-none gate used by both the CLI and Python facade.
-    /// Encoding IDs are a set with one canonical spelling: prefixed digests in strict
-    /// lexical order, with no aliases, duplicates, or caller-side normalization.
-    pub fn optional(
-        topology_digest: Option<&str>,
-        encoding_ids: Option<Vec<String>>,
-    ) -> Result<Option<Self>> {
-        match (topology_digest, encoding_ids) {
-            (None, None) => Ok(None),
-            (Some(topology), Some(encodings)) => {
-                let topology_digest = prefixed("expected topology", topology)?;
-                if encodings.is_empty() {
-                    return refuse(
-                        Code::COUNT_CAP,
-                        "expected encoding id set must not be empty",
-                    );
-                }
-                for encoding in &encodings {
-                    prefixed("expected encoding id", encoding)?;
-                }
-                if encodings.windows(2).any(|pair| pair[0] >= pair[1]) {
-                    return refuse(
-                        Code::SORT_ORDER,
-                        "expected encoding ids must be sorted and unique",
-                    );
-                }
-                Ok(Some(Self {
-                    topology_digest,
-                    encoding_ids: encodings,
-                }))
-            }
-            _ => refuse(
-                Code::MISSING_FIELD,
-                "expected topology and expected encoding ids must be supplied together",
-            ),
-        }
-    }
-
-    fn from_header(header: &crate::header::Header) -> Self {
-        Self {
-            topology_digest: header.topology_digest(),
-            encoding_ids: header
-                .encodings
-                .iter()
-                .map(crate::spec::EncodingSpec::object_id)
-                .collect(),
-        }
-    }
-
-    fn require(&self, actual: &Self) -> Result<()> {
-        if self.topology_digest != actual.topology_digest {
-            return refuse(
-                Code::TOPOLOGY_MISMATCH,
-                format!(
-                    "expected topology {} differs from resident {}",
-                    self.topology_digest, actual.topology_digest
-                ),
-            );
-        }
-        if self.encoding_ids != actual.encoding_ids {
-            return refuse(
-                Code::ENCODING_MISMATCH,
-                format!(
-                    "expected encoding ids {:?} differ from resident {:?}",
-                    self.encoding_ids, actual.encoding_ids
-                ),
-            );
-        }
-        Ok(())
     }
 }
 
@@ -517,27 +435,6 @@ impl Store {
         mutation: &crate::repository::Mutation,
         fault: &Fault,
     ) -> Result<Option<crate::repository::Repository>> {
-        self.apply_repository_with_expected_local(observed, mutation, None, fault)
-    }
-
-    /// The one Repository mutation path, with an optional exact contract gate restricted
-    /// to local replacement. A mismatch returns before the catalog transaction or the
-    /// durable Repository rename.
-    pub fn apply_repository_with_expected_local(
-        &self,
-        observed: Option<&[u8]>,
-        mutation: &crate::repository::Mutation,
-        expected: Option<&ExpectedCheckpointContract>,
-        fault: &Fault,
-    ) -> Result<Option<crate::repository::Repository>> {
-        if expected.is_some()
-            && !matches!(mutation, crate::repository::Mutation::ReplaceLocal { .. })
-        {
-            return refuse(
-                Code::KEY_GRAMMAR,
-                "an expected checkpoint contract is valid only for replace_local",
-            );
-        }
         let catalog = crate::catalog::Catalog::open(&self.root)?;
         let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
         let path = self.repository_path(mutation.repo());
@@ -552,7 +449,7 @@ impl Store {
                 "repository bytes changed since the caller observed them",
             );
         }
-        let (derived, actual_contract) = match mutation {
+        match mutation {
             crate::repository::Mutation::PutCheckpoint { manifest, .. }
             | crate::repository::Mutation::ReplaceLocal { manifest, .. } => {
                 let parsed = self.read_manifest(manifest)?;
@@ -566,17 +463,9 @@ impl Store {
                         );
                     }
                 }
-                match parsed.header() {
-                    Some(header_ref) => {
-                        let header = crate::checkpoint::load_header(self, header_ref)?;
-                        crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;
-                        let contract = ExpectedCheckpointContract::from_header(&header);
-                        (
-                            Some(crate::checkpoint::digests(self, &header)?),
-                            Some(contract),
-                        )
-                    }
-                    None => (None, None),
+                if let Some(header_ref) = parsed.header() {
+                    crate::checkpoint::load_header(self, header_ref)?;
+                    crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;
                 }
             }
             crate::repository::Mutation::UpdateRelease { set, .. } => {
@@ -597,20 +486,12 @@ impl Store {
                         crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;
                     }
                 }
-                (None, None)
             }
             crate::repository::Mutation::RemoveCheckpoint { .. }
             | crate::repository::Mutation::YankRelease { .. }
-            | crate::repository::Mutation::DeleteRepository { .. } => (None, None),
-        };
-        let replacement = crate::repository::apply(observed, mutation, derived.as_ref())?;
-        if let Some(expected) = expected {
-            let actual = actual_contract.as_ref().ok_or_else(|| Refusal {
-                code: Code::MISSING_FIELD,
-                detail: "expected model contract requires a resident cozytensors/1 header".into(),
-            })?;
-            expected.require(actual)?;
+            | crate::repository::Mutation::DeleteRepository { .. } => {}
         }
+        let replacement = crate::repository::apply(observed, mutation)?;
         if let Some(repository) = &replacement {
             for checkpoint in &repository.checkpoints {
                 self.read_manifest(&checkpoint.manifest)?;

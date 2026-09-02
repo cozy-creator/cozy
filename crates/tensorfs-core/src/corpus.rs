@@ -26,12 +26,7 @@ use crate::vectors::EncodingVectors;
 #[derive(Debug, Clone)]
 pub struct DocOutcome {
     pub id: String,
-    pub topology: Option<String>,
-    /// The SHAPE-ONLY projection of the same topology (tfs-038), frozen beside the exact
-    /// one. Two documents differing only in dtype must agree here and disagree above, and
-    /// freezing both is what notices if the shape projection ever stops eliding the dtype
-    /// — or starts eliding something else.
-    pub shape: Option<String>,
+    pub tensor_schema: Option<String>,
     pub manifest: Option<String>,
     pub grade: Option<String>,
 }
@@ -69,18 +64,18 @@ pub fn run_doc(
 ) -> Result<DocOutcome> {
     let id = crate::ids::object_id(bytes);
     let mut grade: Option<String> = None;
-    let (topology, shape, manifest) = match doc {
+    let (tensor_schema, manifest) = match doc {
         "header" => Header::parse(bytes).and_then(|h| {
             h.validate(closure)?;
-            Ok((Some(h.topology_digest()), Some(h.shape_digest()), None))
+            Ok((Some(h.tensor_schema_digest()), None))
         })?,
         // Serving admission is a SECOND gate over the same bytes: `header` says the document
         // is valid data, `header-serving` says this runtime may execute it.
         "header-serving" => Header::parse(bytes).and_then(|h| {
             h.admit_for_serving(closure, platform)?;
-            Ok((Some(h.topology_digest()), Some(h.shape_digest()), None))
+            Ok((Some(h.tensor_schema_digest()), None))
         })?,
-        "encoding" => EncodingSpec::decode_nested(bytes).map(|_| (None, None, None))?,
+        "encoding" => EncodingSpec::decode_nested(bytes).map(|_| (None, None))?,
         "vectors" => EncodingVectors::parse_fixture(bytes).and_then(|v| {
             let plain = registry::seeds()
                 .into_iter()
@@ -88,30 +83,30 @@ pub fn run_doc(
                 .expect("the plain/1 seed is compiled in")
                 .spec;
             v.check(&plain)?;
-            Ok((None, None, None))
+            Ok((None, None))
         })?,
         // A decode IS the path law now: `Manifest` cannot exist unvalidated, so
         // parsing is the whole check and there is no second validate() to forget.
-        "manifest" => Manifest::parse(bytes).map(|m| (None, None, Some(m.manifest_id())))?,
+        "manifest" => Manifest::parse(bytes).map(|m| (None, Some(m.manifest_id())))?,
         "profile" => IngestProfile::parse(bytes).and_then(|p| {
             p.validate(platform)?;
-            Ok((None, None, None))
+            Ok((None, None))
         })?,
-        "subject" => IngestSubject::parse(bytes).map(|_| (None, None, None))?,
-        "session" => IngestSession::parse(bytes).map(|_| (None, None, None))?,
-        "receipt" => IngestVerificationReceipt::parse(bytes).map(|_| (None, None, None))?,
-        "stamp" => crate::ingest::stamp::Stamp::parse(bytes).map(|_| (None, None, None))?,
+        "subject" => IngestSubject::parse(bytes).map(|_| (None, None))?,
+        "session" => IngestSession::parse(bytes).map(|_| (None, None))?,
+        "receipt" => IngestVerificationReceipt::parse(bytes).map(|_| (None, None))?,
+        "stamp" => crate::ingest::stamp::Stamp::parse(bytes).map(|_| (None, None))?,
         // The layout plane's documents (tfs-009). A code topology projects to the SAME
         // frozen projection a header does, so its digest is reported here too.
         "code_topology" => crate::fit::CodeTopology::parse(bytes)
-            .map(|c| (Some(c.topology_digest()), Some(c.shape_digest()), None))?,
+            .map(|c| (Some(c.tensor_schema_digest()), None))?,
         // The machine surfaces (proto-020). The document is a projection, not a stored
         // object, so there is no reader to round-trip it through: what a consumer needs
         // held is its KEY SET, and that is what this compares against the key list this
         // build's emitter compiles in. The refusal names tensorhub.
         "machine_check" | "machine_grade" | "machine_capability" | "machine_fit" => {
             crate::machine::check_surface(doc, bytes)?;
-            (None, None, None)
+            (None, None)
         }
         "compat_report" => {
             let report = crate::fit::CompatibilityReport::parse(bytes)?;
@@ -124,19 +119,17 @@ pub fn run_doc(
                 );
             }
             let _ = &report;
-            (None, None, None)
+            (None, None)
         }
         // The grading plane's two documents. They are in THIS dispatch — the one the CLI
         // and the Python facade share — so the wheel and the binary verify the same corpus
         // rather than two corpora that agree only where they overlap.
         #[cfg(feature = "grade")]
         "conversion_registration" => {
-            crate::grade::ConversionRegistration::parse(bytes).map(|_| (None, None, None))?
+            crate::grade::ConversionRegistration::parse(bytes).map(|_| (None, None))?
         }
         #[cfg(feature = "grade")]
-        "grade_decision" => {
-            crate::grade::GradeDecision::parse(bytes).map(|_| (None, None, None))?
-        }
+        "grade_decision" => crate::grade::GradeDecision::parse(bytes).map(|_| (None, None))?,
         other => {
             return refuse(
                 Code::UNKNOWN_FORMAT,
@@ -146,8 +139,7 @@ pub fn run_doc(
     };
     Ok(DocOutcome {
         id,
-        topology,
-        shape,
+        tensor_schema,
         manifest,
         grade,
     })

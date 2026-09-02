@@ -3,8 +3,8 @@
 //! A checkpoint's construction configs are `config.json` as diffusers/transformers wrote
 //! them: `beta_start: 0.00085`, `trained_betas: null`, free text. The header codec
 //! (`canon.rs`, tfs-013) is integer-only, printable-ASCII and null-free on purpose and
-//! cannot spell them, so the construction document (`config_digest`, model-code-fit §2)
-//! takes the interoperable JCS profile the hub (`internal/canonicaljson`) and cozy-runtime
+//! cannot spell them, so each config is stored as an opaque byte string in the interoperable
+//! JCS profile the hub (`internal/canonicaljson`) and cozy-runtime
 //! (`cozy_runtime.internal.canonical`) already write: keys in UTF-16 code-unit order, no
 //! whitespace, ECMAScript shortest round-trip numbers inside the I-JSON magnitude
 //! (|v| <= 2^53-1), `\uXXXX` (lowercase) only below U+0020, everything else raw UTF-8.

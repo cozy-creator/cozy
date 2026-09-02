@@ -10,11 +10,11 @@ use tensorfs_core::gc;
 use tensorfs_core::header::{Body, Header};
 use tensorfs_core::ids::{hex64, prefixed, Doc, ObjectRef};
 use tensorfs_core::manifest::{Entry, Manifest};
-use tensorfs_core::repository::{self, CheckpointEvidence, Mutation, Repository};
+use tensorfs_core::repository::{self, Mutation, Repository};
 use tensorfs_core::storage::{
     self, Census, CheckpointFacts as CensusCheckpointFacts, InventoryEntry, StagedCheckpoint,
 };
-use tensorfs_core::store::{ExpectedCheckpointContract, Fault, Store};
+use tensorfs_core::store::{Fault, Store};
 
 use crate::{bail, flag, Flags};
 
@@ -132,7 +132,7 @@ fn repo_rows(repository: &Repository, bytes: &[u8]) -> Vec<Vec<u8>> {
         ("org", Value::str(repository.repo.org.clone())),
     ]))];
     for checkpoint in &repository.checkpoints {
-        let mut fields = vec![
+        let fields = vec![
             ("kind", Value::str("checkpoint")),
             ("manifest_length", Value::uint(checkpoint.manifest.length)),
             (
@@ -143,9 +143,6 @@ fn repo_rows(repository: &Repository, bytes: &[u8]) -> Vec<Vec<u8>> {
             ("org", Value::str(repository.repo.org.clone())),
             ("published", Value::Bool(checkpoint.published)),
         ];
-        if let Some(evidence) = &checkpoint.evidence {
-            fields.push(("evidence", evidence.to_value()));
-        }
         rows.push(tensorfs_core::canon::write(&Value::obj(fields)));
     }
     for release in &repository.releases {
@@ -181,17 +178,9 @@ fn checkpoint_fact_rows(
         ("object_count", Value::uint(facts.object_count)),
         ("org", Value::str(repository.repo.org.clone())),
     ];
-    if let (Some(header), Some(digests)) = (&facts.header, &facts.digests) {
-        if let Some(config) = &digests.config_digest {
-            fields.push(("config_digest", Value::str(config.clone())));
-        }
+    if let Some(header) = &facts.header {
         fields.push(("header_length", Value::uint(header.length)));
         fields.push(("header_sha256", Value::str(header.sha256.clone())));
-        fields.push(("shape_digest", Value::str(digests.shape_digest.clone())));
-        fields.push((
-            "topology_digest",
-            Value::str(digests.topology_digest.clone()),
-        ));
     }
     let mut rows = vec![tensorfs_core::canon::write(&Value::obj(fields))];
     for (object_kind, object) in &facts.objects {
@@ -225,18 +214,6 @@ fn checkpoint_fact_rows(
             ("manifest_sha256", Value::str(manifest.sha256.clone())),
             ("name", Value::str(repository.repo.name.clone())),
             ("org", Value::str(repository.repo.org.clone())),
-        ])));
-    }
-    for (config, sha256, length, media_type) in &facts.configs {
-        rows.push(tensorfs_core::canon::write(&Value::obj(vec![
-            ("config", Value::str(config.clone())),
-            ("kind", Value::str("checkpoint_config")),
-            ("length", Value::uint(*length)),
-            ("manifest_sha256", Value::str(manifest.sha256.clone())),
-            ("media_type", Value::str(media_type.clone())),
-            ("name", Value::str(repository.repo.name.clone())),
-            ("org", Value::str(repository.repo.org.clone())),
-            ("sha256", Value::str(sha256.clone())),
         ])));
     }
     rows
@@ -282,115 +259,6 @@ pub fn cmd_repo_list(root: &Path, flags: &Flags) -> ExitCode {
     }
     ExitCode::SUCCESS
 }
-
-/// `tfs repo migrate <store>`: re-author every model checkpoint row's evidence in the
-/// current writer's shape — the three digests re-derived from the header its manifest
-/// names, plus the ingest provenance and verdict the row carries — and rewrite the
-/// repository document when that differs from what is stored. A key this build does not
-/// know is dropped. Follow with `tfs store rebuild <store> --sqlite <store>/tensorfs.sqlite`.
-pub fn cmd_repo_migrate(root: &Path, flags: &Flags) -> ExitCode {
-    let store = match Store::open(root) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let _rebuild = match WriterGuard::lock_rebuild(root) {
-        Ok(guard) => guard,
-        Err(error) => return bail(error),
-    };
-    let dry = flag(flags, "dry-run").is_some();
-    let mut paths = Vec::new();
-    for org in fs::read_dir(root.join("repos"))
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        for entry in fs::read_dir(org.path()).into_iter().flatten().flatten() {
-            if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
-                paths.push(entry.path());
-            }
-        }
-    }
-    paths.sort();
-    let (mut rewritten, mut rows) = (0usize, 0usize);
-    for path in paths {
-        let bytes = match read(&path) {
-            Ok(value) => value,
-            Err(error) => return bail(error),
-        };
-        let mut repository = match Repository::parse(&bytes) {
-            Ok(value) => value,
-            Err(error) => return bail(error),
-        };
-        for checkpoint in &mut repository.checkpoints {
-            let Some(evidence) = &checkpoint.evidence else {
-                continue;
-            };
-            let manifest = match store.read_manifest(&checkpoint.manifest) {
-                Ok(value) => value,
-                Err(error) => return bail(error),
-            };
-            let Some(header_ref) = manifest.header() else {
-                continue;
-            };
-            let header = match tensorfs_core::checkpoint::load_header(&store, header_ref) {
-                Ok(value) => value,
-                Err(error) => return bail(error),
-            };
-            let rewritten =
-                tensorfs_core::checkpoint::digests(&store, &header).and_then(|digests| {
-                    Ok(CheckpointEvidence::new(
-                        Some(digests),
-                        evidence.ingest()?,
-                        evidence.verification()?,
-                    ))
-                });
-            checkpoint.evidence = match rewritten {
-                Ok(value) => Some(value),
-                Err(error) => return bail(error),
-            };
-            rows += 1;
-        }
-        let replacement = repository.canonical_bytes();
-        if replacement == bytes {
-            continue;
-        }
-        rewritten += 1;
-        println!("migrate      {}", path.display());
-        if dry {
-            continue;
-        }
-        let temporary = path.with_extension(format!("json.migrate.{}", std::process::id()));
-        if let Err(error) = write(&temporary, &replacement).and_then(|()| {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).map_err(
-                |error| Refusal {
-                    code: Code::IO_FAILED,
-                    detail: format!("chmod {}: {error}", temporary.display()),
-                },
-            )?;
-            fs::rename(&temporary, &path).map_err(|error| Refusal {
-                code: Code::IO_FAILED,
-                detail: format!("rename {}: {error}", path.display()),
-            })
-        }) {
-            let _ = fs::remove_file(&temporary);
-            return bail(error);
-        }
-    }
-    println!(
-        "{rows} checkpoint row(s) re-derived, {rewritten} repository document(s) {}",
-        if dry { "would change" } else { "rewritten" }
-    );
-    if rewritten > 0 && !dry {
-        println!(
-            "next: tfs store rebuild {} --sqlite {}",
-            root.display(),
-            root.join("tensorfs.sqlite").display()
-        );
-    }
-    ExitCode::SUCCESS
-}
-
 pub fn cmd_repo_usage(root: &Path, flags: &Flags) -> ExitCode {
     let Some(rows) = flag(flags, "rows") else {
         eprintln!("--rows <jsonl> is required");
@@ -544,36 +412,12 @@ pub fn cmd_local_replace(
     manifest_length: &str,
     flags: &Flags,
 ) -> ExitCode {
-    let (Some(observed), Some(evidence_path)) = (flag(flags, "observed"), flag(flags, "evidence"))
-    else {
-        eprintln!("--observed <sha256:...|absent> and --evidence <evidence.json> are required");
+    let Some(observed) = flag(flags, "observed") else {
+        eprintln!("--observed <sha256:...|absent> is required");
         return ExitCode::from(2);
     };
     let store = match Store::open(root) {
         Ok(store) => store,
-        Err(error) => return bail(error),
-    };
-    let topologies: Vec<&str> = flags
-        .iter()
-        .filter(|(name, _)| name == "expected-topology")
-        .map(|(_, value)| value.as_str())
-        .collect();
-    if topologies.len() > 1 {
-        return bail(Refusal {
-            code: Code::ATTACHMENT_CARDINALITY,
-            detail: "--expected-topology must appear at most once".into(),
-        });
-    }
-    let encoding_ids: Vec<String> = flags
-        .iter()
-        .filter(|(name, _)| name == "expected-encoding")
-        .map(|(_, value)| value.clone())
-        .collect();
-    let expected = match ExpectedCheckpointContract::optional(
-        topologies.first().copied(),
-        (!encoding_ids.is_empty()).then_some(encoding_ids),
-    ) {
-        Ok(expected) => expected,
         Err(error) => return bail(error),
     };
     let observed = match observed_local(&store, name, observed) {
@@ -596,11 +440,6 @@ pub fn cmd_local_replace(
             })
         }
     };
-    let evidence =
-        match read(Path::new(evidence_path)).and_then(|bytes| CheckpointEvidence::parse(&bytes)) {
-            Ok(evidence) => evidence,
-            Err(error) => return bail(error),
-        };
     let manifest = ObjectRef {
         sha256: manifest_id.trim_start_matches("sha256:").to_string(),
         length,
@@ -615,14 +454,8 @@ pub fn cmd_local_replace(
         },
         manifest,
         version: selection,
-        evidence: Box::new(evidence),
     };
-    match store.apply_repository_with_expected_local(
-        observed.as_deref(),
-        &mutation,
-        expected.as_ref(),
-        &Fault::default(),
-    ) {
+    match store.apply_repository(observed.as_deref(), &mutation, &Fault::default()) {
         Ok(Some(repository)) => match print_local(&repository) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => bail(error),
@@ -673,39 +506,6 @@ pub fn cmd_local_remove(root: &Path, name: &str, flags: &Flags) -> ExitCode {
     }
 }
 
-/// The exact bytes of every config the header names, from the `--config <path>` files the
-/// caller staged (any number, matched by content). `repo apply` has no store to read
-/// them from, and `config_digest` is derived from the construction document those bytes
-/// carry — a header naming a config the caller did not stage cannot be applied.
-fn staged_configs(
-    header: &Header,
-    flags: &Flags,
-) -> tensorfs_core::err::Result<Vec<(String, Vec<u8>)>> {
-    let mut staged: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for (key, path) in flags {
-        if key != "config" {
-            continue;
-        }
-        let bytes = read(Path::new(path))?;
-        staged.insert(tensorfs_core::sha256::hex_digest(&bytes), bytes);
-    }
-    header
-        .configs
-        .iter()
-        .map(|(name, config)| match staged.get(&config.sha256) {
-            Some(bytes) => Ok((name.clone(), bytes.clone())),
-            None => Err(Refusal {
-                code: Code::MISSING_FIELD,
-                detail: format!(
-                    "the header names config {name:?} (sha256:{}) but it was not staged: \
-                     pass --config <path> for every config the header names",
-                    config.sha256
-                ),
-            }),
-        })
-        .collect()
-}
-
 pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode {
     let (Some(output), Some(rows)) = (flag(flags, "out"), flag(flags, "rows")) else {
         eprintln!("--out <replacement> and --rows <jsonl> are required");
@@ -746,7 +546,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                 Ok(value) => value,
                 Err(error) => return bail(error),
             };
-            let (header_bytes, configs, derived) = match (parsed.header(), flag(flags, "header")) {
+            let header_bytes = match (parsed.header(), flag(flags, "header")) {
                 (Some(header_ref), Some(header_path)) => {
                     let bytes = match read(Path::new(header_path)) {
                         Ok(value) => value,
@@ -758,26 +558,13 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                             detail: "staged header bytes disagree with manifest".into(),
                         });
                     }
-                    let header = match Header::parse(&bytes) {
-                        Ok(value) => value,
+                    match Header::parse(&bytes) {
+                        Ok(_) => {}
                         Err(error) => return bail(error),
-                    };
-                    let configs = match staged_configs(&header, flags) {
-                        Ok(value) => value,
-                        Err(error) => return bail(error),
-                    };
-                    let digests = match header.digests(&configs) {
-                        Ok(value) => value,
-                        Err(error) => return bail(error),
-                    };
-                    println!("topology_digest {}", digests.topology_digest);
-                    println!("shape_digest    {}", digests.shape_digest);
-                    if let Some(config) = &digests.config_digest {
-                        println!("config_digest   {config}");
                     }
-                    (Some(bytes), configs, Some(digests))
+                    Some(bytes)
                 }
-                (None, None) => (None, Vec::new(), None),
+                (None, None) => None,
                 (Some(_), None) => {
                     eprintln!("a CozyTensors manifest also requires --header <cbor>");
                     return ExitCode::from(2);
@@ -791,7 +578,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                 Ok(value) => value,
                 Err(error) => return bail(error),
             };
-            Some((manifest_bytes, header_bytes, configs, inventory, derived))
+            Some((manifest_bytes, header_bytes, inventory))
         }
         Mutation::RemoveCheckpoint { .. }
         | Mutation::UpdateRelease { .. }
@@ -799,8 +586,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
         | Mutation::DeleteRepository { .. } => None,
     };
 
-    let derived = inputs.as_ref().and_then(|inputs| inputs.4.as_ref());
-    let replacement = match repository::apply(current_bytes.as_deref(), &mutation, derived) {
+    let replacement = match repository::apply(current_bytes.as_deref(), &mutation) {
         Ok(value) => value,
         Err(error) => return bail(error),
     };
@@ -810,14 +596,13 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
             let lines = match (&mutation, inputs) {
                 (
                     Mutation::PutCheckpoint { manifest, .. },
-                    Some((manifest_bytes, header, configs, inventory, _)),
+                    Some((manifest_bytes, header, inventory)),
                 ) => {
                     let facts = match Census::validate_checkpoint_inputs(
                         manifest,
                         StagedCheckpoint {
                             manifest: &manifest_bytes,
                             header: header.as_deref(),
-                            configs: &configs,
                         },
                         &inventory,
                     ) {
@@ -830,14 +615,13 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                 }
                 (
                     Mutation::ReplaceLocal { manifest, .. },
-                    Some((manifest_bytes, header, configs, inventory, _)),
+                    Some((manifest_bytes, header, inventory)),
                 ) => {
                     let facts = match Census::validate_checkpoint_inputs(
                         manifest,
                         StagedCheckpoint {
                             manifest: &manifest_bytes,
                             header: header.as_deref(),
-                            configs: &configs,
                         },
                         &inventory,
                     ) {
@@ -1056,18 +840,6 @@ fn closure_refs(
 ) -> tensorfs_core::err::Result<BTreeMap<String, (&'static str, ObjectRef)>> {
     let mut refs = BTreeMap::new();
     insert(&mut refs, "header", header_ref)?;
-    // A config is also a Manifest file entry; it is listed as `config` so a caller that
-    // stages the closure for `repo apply` can tell which objects to pass as `--config`.
-    for (_, config) in &header.configs {
-        insert(
-            &mut refs,
-            "config",
-            &ObjectRef {
-                sha256: config.sha256.clone(),
-                length: config.length,
-            },
-        )?;
-    }
     for (_, asset) in &header.assets {
         for object in &asset.segments {
             insert(&mut refs, "model_asset", object)?;
@@ -1278,10 +1050,16 @@ mod tests {
                     .find_map(|(_, part)| part.segments().first().cloned())
             })
             .expect("frozen header has a segmented part");
+        let asset = header
+            .assets
+            .iter()
+            .find_map(|(_, asset)| asset.segments.first().cloned())
+            .expect("frozen header has a segmented asset");
         let mut draft = Draft::of(&manifest);
-        draft
-            .entries
-            .push(("weights/aliased-part.bin".into(), Entry::File(part.clone())));
+        draft.entries.extend([
+            ("assets/aliased-model.bin".into(), Entry::File(asset)),
+            ("weights/aliased-part.bin".into(), Entry::File(part.clone())),
+        ]);
         draft.entries.sort_by(|left, right| left.0.cmp(&right.0));
         let manifest = draft.seal().unwrap();
         let refs = closure_refs(&manifest, &header, &header_ref).unwrap();
@@ -1294,17 +1072,10 @@ mod tests {
             })
             .collect();
 
-        assert!(header
-            .configs
-            .iter()
-            .any(|(_, config)| file_ids.contains(config.sha256.as_str())));
         assert!(header.assets.iter().any(|(_, asset)| asset
             .segments
             .iter()
             .any(|segment| file_ids.contains(segment.sha256.as_str()))));
-        for (_, config) in &header.configs {
-            assert_eq!(refs[&config.sha256].0, "config");
-        }
         for (_, asset) in &header.assets {
             for segment in &asset.segments {
                 assert_eq!(refs[&segment.sha256].0, "model_asset");

@@ -16,7 +16,7 @@ use crate::storage::Projection;
 /// the floor under any patience a supervisor grants a worker that has gone quiet.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-const SCHEMA_VERSION: u64 = 1;
+const SCHEMA_VERSION: u64 = 2;
 
 const SCHEMA: &[(&str, &[&str])] = &[
     ("tensorfs_derived_transactions", &["id", "bytes"]),
@@ -41,7 +41,6 @@ const SCHEMA: &[(&str, &[&str])] = &[
             "profile",
             "manifest_sha256",
             "manifest_length",
-            "checkpoint_evidence",
         ],
     ),
     (
@@ -126,7 +125,6 @@ pub struct SourcePreparationResult {
     pub profile: String,
     pub manifest_sha256: String,
     pub manifest_length: u64,
-    pub checkpoint_evidence: Vec<u8>,
 }
 
 pub enum SourcePreparation {
@@ -259,7 +257,6 @@ impl Catalog {
                    profile TEXT NOT NULL,
                    manifest_sha256 TEXT NOT NULL,
                    manifest_length INTEGER NOT NULL,
-                   checkpoint_evidence BLOB NOT NULL,
                    PRIMARY KEY (operation_id,slot)
                  ) STRICT;
                  CREATE TABLE tensorfs_verified_blobs (
@@ -270,7 +267,7 @@ impl Catalog {
                    mtime_s INTEGER NOT NULL,
                    mtime_ns INTEGER NOT NULL
                  ) STRICT;
-                 PRAGMA user_version=1;
+                 PRAGMA user_version=2;
                  COMMIT;",
         );
         match result {
@@ -449,7 +446,7 @@ impl Catalog {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT slot,profile,manifest_sha256,manifest_length,checkpoint_evidence
+                "SELECT slot,profile,manifest_sha256,manifest_length
                  FROM tensorfs_source_results WHERE operation_id=?1 ORDER BY slot",
             )
             .map_err(|error| sql("prepare source results", error))?;
@@ -460,7 +457,6 @@ impl Catalog {
                     profile: row.get(1)?,
                     manifest_sha256: row.get(2)?,
                     manifest_length: row.get(3)?,
-                    checkpoint_evidence: row.get(4)?,
                 })
             })
             .map_err(|error| sql("read source results", error))?
@@ -507,7 +503,6 @@ impl Catalog {
                     "source preparation Manifest has zero length",
                 );
             }
-            crate::repository::CheckpointEvidence::parse(&result.checkpoint_evidence)?;
         }
         let request_digest = crate::ids::prefixed("source preparation request", request_digest)?;
         let mut connection = self.connection()?;
@@ -531,15 +526,14 @@ impl Catalog {
             transaction
                 .execute(
                     "INSERT INTO tensorfs_source_results
-                     (operation_id,slot,profile,manifest_sha256,manifest_length,checkpoint_evidence)
-                     VALUES (?1,?2,?3,?4,?5,?6)",
+                     (operation_id,slot,profile,manifest_sha256,manifest_length)
+                     VALUES (?1,?2,?3,?4,?5)",
                     params![
                         operation,
                         result.slot,
                         result.profile,
                         result.manifest_sha256,
                         result.manifest_length,
-                        result.checkpoint_evidence,
                     ],
                 )
                 .map_err(|error| sql("insert source result", error))?;

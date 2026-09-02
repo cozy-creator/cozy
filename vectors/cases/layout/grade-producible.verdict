@@ -1,4 +1,4 @@
 doc: grade_decision
 expect: ok
-id: sha256:db1112a790b5cc37ca5efb30d4ce6e59a162271ac91d37c01742afce2a07af0e
+id: sha256:ef343b51fc3817c2ca2cc6fd9793620a5e8fcad721ebe3238a0ade096b17bbeb
 note: the remedy names the CONTRACT's target, never the observed encoding

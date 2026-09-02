@@ -53,6 +53,30 @@ def refuse(code: str, detail: str) -> Never:
     raise Refusal(code, detail)
 
 
+def canonical_config(raw: bytes, where: str) -> bytes:
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                refuse("DUPLICATE_KEY", f"{where} repeats key {key!r}")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=unique,
+            parse_constant=lambda token: refuse(
+                "MALFORMED_JSON", f"{where} contains {token}"
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        refuse("MALFORMED_JSON", f"{where}: {error}")
+    if type(value) is not dict:
+        refuse("WRONG_TYPE", f"{where} is not a JSON object")
+    return raw
+
+
 def array(value: Any, arity: int | None, where: str) -> list[Any]:
     if type(value) is not list:
         refuse("WRONG_TYPE", f"{where} must be an array")
@@ -341,15 +365,22 @@ def normalize_header(document: Any, *, diagnostic: bool = False) -> list[Any]:
         refuse("COUNT_CAP", "config count exceeds its cap")
     configs: list[list[Any]] = []
     for i, value in enumerate(raw_configs):
-        row = array(value, 4, f"configs[{i}]")
+        row = array(value, 2, f"configs[{i}]")
+        if diagnostic:
+            if type(row[1]) is not str:
+                refuse("WRONG_TYPE", f"configs[{i}].canonical_json must be text")
+            config = row[1].encode("utf-8")
+        else:
+            if type(row[1]) is not bytes:
+                refuse("WRONG_TYPE", f"configs[{i}].canonical_json must be bytes")
+            config = row[1]
+        if len(config) > DOC_MAX:
+            refuse("SIZE_CAP", f"configs[{i}].canonical_json exceeds its cap")
+        canonical_config(config, f"configs[{i}].canonical_json")
         configs.append(
             [
                 name(row[0], f"configs[{i}].name", MAX_NAME),
-                diagnostic_digest(row[1], f"configs[{i}].digest")
-                if diagnostic
-                else digest(row[1], f"configs[{i}].digest"),
-                uint(row[2], f"configs[{i}].length", positive=True),
-                text(row[3], f"configs[{i}].media_type", MAX_NAME),
+                config,
             ]
         )
     sorted_unique(configs, 0, "configs")
@@ -398,10 +429,9 @@ def normalize_header(document: Any, *, diagnostic: bool = False) -> list[Any]:
     components: list[list[Any]] = []
     component_names: set[str] = set()
     tensor_count = 0
-    total_refs = len(configs) + sum(len(asset[4]) for asset in assets)
-    total_bytes = (
-        sum(config[2] for config in configs)
-        + sum(asset[2] for asset in assets)
+    total_refs = sum(len(asset[4]) for asset in assets)
+    total_bytes = sum(len(config[1]) for config in configs) + sum(
+        asset[2] for asset in assets
     )
     if total_refs > MAX_TOTAL_REFS or total_bytes > MAX_TOTAL_BYTES:
         refuse("TOTAL_REFS_CAP", "header aggregate work exceeds its cap")
@@ -542,7 +572,7 @@ def project(header: list[Any]) -> dict[str, Any]:
 
     return {
         "format": FORMAT,
-        "configs": [[r[0], "sha256:" + r[1].hex(), r[2], r[3]] for r in header[1]],
+        "configs": [[r[0], r[1].decode("utf-8")] for r in header[1]],
         "assets": [
             [r[0], "sha256:" + r[1].hex(), r[2], r[3], [ref(s) for s in r[4]]]
             for r in header[2]

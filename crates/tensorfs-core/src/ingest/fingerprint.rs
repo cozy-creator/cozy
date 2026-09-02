@@ -19,7 +19,7 @@ use super::carrier::SourceHeader;
 use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Result};
-use crate::header::{topology_digest_of, topology_value};
+use crate::header::{tensor_schema_digest_of, tensor_schema_value};
 use crate::ids::{ascii_name, hex64, object_id, prefixed};
 use crate::limits;
 
@@ -107,17 +107,17 @@ pub fn refuse_bnb<T>(key: &str) -> Result<T> {
 
 /// The observation, computed from the header alone. `keyset_digest` is deliberately
 /// shape-free: it answers "which carrier dialect is this", and stays stable across a
-/// family's resolutions and precisions. `topology_digest` is the exact artifact, in the
+/// family's resolutions and precisions. `tensor_schema_digest` is the exact artifact, in the
 /// same digest space as a real header's projection. Neither is a compatibility claim —
 /// that is `fit`'s question, asked of the canonical header, never of a source carrier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fingerprint {
     /// What the caller is ingesting this carrier AS. Carried on the observation rather than
     /// passed to `classify` separately, so a fingerprint can never be classified as a
-    /// component other than the one its `topology_digest` was projected under.
+    /// component other than the one its `tensor_schema_digest` was projected under.
     pub component: String,
     pub keyset_digest: String,
-    pub topology_digest: String,
+    pub tensor_schema_digest: String,
     pub logical_keys: usize,
     pub role_keys: usize,
     pub marker_keys: usize,
@@ -125,8 +125,8 @@ pub struct Fingerprint {
 }
 
 /// Project one carrier header. `component` is what the CALLER is ingesting this file as —
-/// it participates in the topology projection exactly as it will in the final header, so a
-/// source fingerprint and a canonical topology are directly comparable.
+/// it participates in the tensor schema exactly as it will in the final header, so a source
+/// fingerprint and a canonical tensor schema are directly comparable.
 pub fn fingerprint(component: &str, h: &SourceHeader) -> Result<Fingerprint> {
     let mut logical: Vec<(&str, Dtype, &[u64])> = Vec::new();
     let (mut role_keys, mut marker_keys) = (0usize, 0usize);
@@ -158,12 +158,12 @@ pub fn fingerprint(component: &str, h: &SourceHeader) -> Result<Fingerprint> {
     dtypes.sort();
 
     let keys = Value::arr(logical.iter().map(|(k, _, _)| Value::str(*k)).collect());
-    let topo = topology_value(logical.iter().map(|(k, d, s)| (component, *k, *d, *s)));
+    let schema = tensor_schema_value(logical.iter().map(|(k, d, s)| (component, *k, *d, *s)));
 
     Ok(Fingerprint {
         component: component.to_string(),
         keyset_digest: object_id(&crate::canon::write(&keys)),
-        topology_digest: topology_digest_of(&topo),
+        tensor_schema_digest: tensor_schema_digest_of(&schema),
         logical_keys: logical.len(),
         role_keys,
         marker_keys,
@@ -182,7 +182,7 @@ pub struct Banked {
     pub component: String,
     /// The named reviewed converter this dialect binds to (see `convert::CONVERTERS`).
     pub converter: String,
-    pub topology_digest: String,
+    pub tensor_schema_digest: String,
     pub logical_keys: u64,
     pub provenance: Provenance,
 }
@@ -285,7 +285,7 @@ impl FingerprintRegistry {
             .iter()
             .copied()
             .filter(|e| {
-                e.topology_digest == fp.topology_digest
+                e.tensor_schema_digest == fp.tensor_schema_digest
                     && e.logical_keys as usize == fp.logical_keys
             })
             .collect();
@@ -405,16 +405,16 @@ impl FingerprintRegistry {
         match self.entries.iter_mut().find(|x| {
             x.keyset_digest == e.keyset_digest
                 && x.component == e.component
-                && x.topology_digest == e.topology_digest
+                && x.tensor_schema_digest == e.tensor_schema_digest
         }) {
             Some(slot) => *slot = e,
             None => self.entries.push(e),
         }
         self.entries.sort_by(|a, b| {
-            (&a.keyset_digest, &a.component, &a.topology_digest).cmp(&(
+            (&a.keyset_digest, &a.component, &a.tensor_schema_digest).cmp(&(
                 &b.keyset_digest,
                 &b.component,
-                &b.topology_digest,
+                &b.tensor_schema_digest,
             ))
         });
     }
@@ -488,8 +488,8 @@ impl FingerprintRegistry {
             let keyset_digest = crate::ids::prefixed("keyset_digest", e.req_str("keyset_digest")?)?;
             let logical_keys = e.req_uint("logical_keys")?;
             let provenance = provenance_from(e.req("provenance")?)?;
-            let topology_digest =
-                crate::ids::prefixed("topology_digest", e.req_str("topology_digest")?)?;
+            let tensor_schema_digest =
+                crate::ids::prefixed("tensor_schema_digest", e.req_str("tensor_schema_digest")?)?;
             e.done()?;
             for (what, s) in [
                 ("component", &component),
@@ -503,7 +503,7 @@ impl FingerprintRegistry {
                 dialect,
                 component,
                 converter,
-                topology_digest,
+                tensor_schema_digest,
                 logical_keys,
                 provenance,
             });
@@ -519,7 +519,7 @@ impl FingerprintRegistry {
                 (
                     e.keyset_digest.as_str(),
                     e.component.as_str(),
-                    e.topology_digest.as_str(),
+                    e.tensor_schema_digest.as_str(),
                 )
             })
             .collect();
@@ -528,14 +528,14 @@ impl FingerprintRegistry {
         if seen != given {
             return refuse(
                 Code::SORT_ORDER,
-                "registry entries must be sorted by (keyset_digest, component, topology_digest)",
+                "registry entries must be sorted by (keyset_digest, component, tensor_schema_digest)",
             );
         }
         seen.dedup();
         if seen.len() != entries.len() {
             return refuse(
                 Code::DUPLICATE_KEY,
-                "two entries bank the same (keyset_digest, component, topology_digest)",
+                "two entries bank the same (keyset_digest, component, tensor_schema_digest)",
             );
         }
         for profile in &source_profiles {
@@ -576,7 +576,10 @@ impl FingerprintRegistry {
                             ("keyset_digest", Value::str(e.keyset_digest.clone())),
                             ("logical_keys", Value::uint(e.logical_keys)),
                             ("provenance", provenance_value(&e.provenance)),
-                            ("topology_digest", Value::str(e.topology_digest.clone())),
+                            (
+                                "tensor_schema_digest",
+                                Value::str(e.tensor_schema_digest.clone()),
+                            ),
                         ])
                     })
                     .collect(),
@@ -966,7 +969,7 @@ mod tests {
                 dialect: "safetensors.diffusers".into(),
                 component: "model".into(),
                 converter: "identity/1".into(),
-                topology_digest: object_id(b"topology"),
+                tensor_schema_digest: object_id(b"tensor-schema"),
                 logical_keys: 1,
                 provenance: Provenance {
                     kind: SYNTHETIC.into(),

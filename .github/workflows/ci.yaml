@@ -147,6 +147,9 @@ jobs:
       - run: >-
           uv run --python 3.12 --project conformance/cbor/python
           python scripts/cbor-conformance.py --tfs target/release/tfs conform
+      - run: >-
+          uv run --python 3.12 --project conformance/cbor/python
+          python scripts/migration-smoke.py target/release/tfs
 
   # THE end-to-end test: build the abi3 wheel, install it into a fresh venv, and drive a
   # real store — lease, plan in the caller's traversal order, slot ring, digest, blob and

@@ -257,26 +257,6 @@ pub fn load_header(store: &Store, r: &ObjectRef) -> Result<Header> {
     Header::parse(&read_object(store, r, limits::DOC_MAX_BYTES)?)
 }
 
-/// The exact bytes of every config the header names, read from the store in header order.
-pub fn load_configs(store: &Store, h: &Header) -> Result<Vec<(String, Vec<u8>)>> {
-    h.configs
-        .iter()
-        .map(|(name, c)| {
-            let r = ObjectRef {
-                sha256: c.sha256.clone(),
-                length: c.length,
-            };
-            Ok((name.clone(), read_object(store, &r, limits::DOC_MAX_BYTES)?))
-        })
-        .collect()
-}
-
-/// The three catalog digests of a stored checkpoint (design §2): the header's projections
-/// and the construction document assembled from the config objects the header names.
-pub fn digests(store: &Store, h: &Header) -> Result<crate::header::Digests> {
-    h.digests(&load_configs(store, h)?)
-}
-
 /// The closure the header's `encodings` list names. An absent spec object is state (3) of
 /// cozytensors.md §4 — it cannot install as self-describing at all.
 pub fn load_closure(store: &Store, h: &Header) -> Result<Closure> {
@@ -341,29 +321,20 @@ pub fn read_asset<W: Write>(
 /// One writer, two consumers (the synthetic checkpoint plane and the ingest border) — the
 /// alternative is two spellings of one tree, which `walk` would then have to forgive.
 pub fn build_manifest(header: &Header, href: &ObjectRef, _closure: &Closure) -> Result<Manifest> {
-    let mut entries: Vec<(String, crate::manifest::Entry)> = vec![(
-        "model.cozytensors".to_string(),
-        crate::manifest::Entry::CozyTensors(href.clone()),
-    )];
-    for (name, c) in &header.configs {
-        entries.push((
-            format!("{name}/config.json"),
-            crate::manifest::Entry::File(ObjectRef {
-                sha256: c.sha256.clone(),
-                length: c.length,
-            }),
-        ));
+    let _ = header;
+    crate::manifest::Draft {
+        entries: vec![(
+            "model.cozytensors".to_string(),
+            crate::manifest::Entry::CozyTensors(href.clone()),
+        )],
     }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    // Two specs may cite the SAME vector set: one object, one path, listed once.
-    entries.dedup_by(|a, b| a.0 == b.0);
-    crate::manifest::Draft { entries }.seal()
+    .seal()
 }
 
 // ------------------------------------------------------------------ the transitive root
 
 /// What one object was reached AS. The kind is the reason it is live, not a property of
-/// its bytes: the same object can be a config here and a plain asset there.
+/// its bytes: the same object can be a model asset here and a plain file there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reached {
     pub kind: &'static str,
@@ -438,18 +409,6 @@ pub fn walk_cozytensors(store: &Store, snap: &Manifest) -> Result<Walk> {
         obj: href.clone(),
     });
     let header = load_header(store, &href)?;
-
-    for (name, c) in &header.configs {
-        let r = ObjectRef {
-            sha256: c.sha256.clone(),
-            length: c.length,
-        };
-        let _ = name;
-        w.objects.push(Reached {
-            kind: "config",
-            obj: r,
-        });
-    }
 
     let mut closure = Closure::default();
     for spec in &header.encodings {

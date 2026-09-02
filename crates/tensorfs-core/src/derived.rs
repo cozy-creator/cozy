@@ -14,12 +14,12 @@ use crate::checkpoint::{self, build_manifest};
 use crate::dtype::{checked_bytes, Dtype};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Body, Closure, Header, Part, Tensor};
-use crate::ids::{ascii_name, prefixed, ConfigRef, ObjectRef};
+use crate::ids::{ascii_name, prefixed, ObjectRef};
 use crate::limits;
 use crate::manifest::Manifest;
 use crate::meta::{Hold, Meta};
 use crate::read::{self, ReadLease};
-use crate::store::{Fault, Store};
+use crate::store::Store;
 use crate::{registry, spec::EncodingSpec, vectors::EncodingVectors};
 
 fn arithmetic(what: impl Into<String>) -> Refusal {
@@ -113,15 +113,11 @@ pub enum ConfigDeclaration {
     },
     Add {
         target: String,
-        media_type: String,
-        length: u64,
     },
     Derive {
         target: String,
         source: String,
         source_config: String,
-        media_type: String,
-        length: u64,
     },
 }
 
@@ -333,21 +329,10 @@ impl Declaration {
                     }
                     name("source config", source_config)?;
                 }
-                ConfigDeclaration::Add {
-                    media_type, length, ..
-                } => {
-                    if media_type.is_empty() || media_type.len() > 128 {
-                        return refuse(Code::KEY_GRAMMAR, "config media_type out of bounds");
-                    }
-                    if *length == 0 {
-                        return refuse(Code::ZERO_ELEMENT, "added config length is zero");
-                    }
-                }
+                ConfigDeclaration::Add { .. } => {}
                 ConfigDeclaration::Derive {
                     source,
                     source_config,
-                    media_type,
-                    length,
                     ..
                 } => {
                     if !source_names.contains(source.as_str()) {
@@ -357,12 +342,6 @@ impl Declaration {
                         );
                     }
                     name("source config", source_config)?;
-                    if media_type.is_empty() || media_type.len() > 128 {
-                        return refuse(Code::KEY_GRAMMAR, "config media_type out of bounds");
-                    }
-                    if *length == 0 {
-                        return refuse(Code::ZERO_ELEMENT, "derived config length is zero");
-                    }
                 }
             }
         }
@@ -448,18 +427,6 @@ impl Declaration {
                             .ok_or_else(|| arithmetic("addition object count overflows"))?;
                     }
                 }
-            }
-        }
-        for config in &self.configs {
-            if let ConfigDeclaration::Add { length, .. }
-            | ConfigDeclaration::Derive { length, .. } = config
-            {
-                bytes = bytes
-                    .checked_add(*length)
-                    .ok_or_else(|| arithmetic("config byte total overflows"))?;
-                objects = objects
-                    .checked_add(1)
-                    .ok_or_else(|| arithmetic("config object count overflows"))?;
             }
         }
         Ok((bytes, objects))
@@ -557,37 +524,27 @@ impl Declaration {
         let mut configs = Vec::new();
         for (target, config_value) in as_obj("DerivedDeclaration", "configs", f.req("configs")?)? {
             let mut cf = Fields::new("DerivedDeclaration.config", config_value)?;
+            let kind = cf.req_str("kind")?;
             let source = cf.opt("source");
             let source_config = cf.opt("source_config");
-            let media_type = cf.opt("media_type");
-            let length = cf.opt("length");
-            let config = match (source, source_config, media_type, length) {
-                (Some(source), Some(source_config), None, None) => ConfigDeclaration::Copy {
+            let config = match (kind, source, source_config) {
+                ("copy", Some(source), Some(source_config)) => ConfigDeclaration::Copy {
                     target: target.clone(),
                     source: as_str("config", "source", source)?.to_string(),
                     source_config: as_str("config", "source_config", source_config)?.to_string(),
                 },
-                (None, None, Some(media_type), Some(length)) => ConfigDeclaration::Add {
+                ("add", None, None) => ConfigDeclaration::Add {
                     target: target.clone(),
-                    media_type: as_str("config", "media_type", media_type)?.to_string(),
-                    length: crate::canon::as_uint("config", "length", length)?,
                 },
-                (Some(source), Some(source_config), Some(media_type), Some(length)) => {
-                    ConfigDeclaration::Derive {
-                        target: target.clone(),
-                        source: as_str("config", "source", source)?.to_string(),
-                        source_config: as_str("config", "source_config", source_config)?
-                            .to_string(),
-                        media_type: as_str("config", "media_type", media_type)?.to_string(),
-                        length: crate::canon::as_uint("config", "length", length)?,
-                    }
-                }
+                ("derive", Some(source), Some(source_config)) => ConfigDeclaration::Derive {
+                    target: target.clone(),
+                    source: as_str("config", "source", source)?.to_string(),
+                    source_config: as_str("config", "source_config", source_config)?.to_string(),
+                },
                 _ => {
                     return refuse(
                         Code::MISSING_FIELD,
-                        format!(
-                            "config {target:?} must be copy (source+source_config), add (media_type+length), or derive (all four)"
-                        ),
+                        format!("config {target:?} has an invalid kind/source combination"),
                     )
                 }
             };
@@ -733,32 +690,23 @@ impl Declaration {
                             } => (
                                 target.clone(),
                                 Value::obj(vec![
+                                    ("kind", Value::str("copy")),
                                     ("source", Value::str(source.clone())),
                                     ("source_config", Value::str(source_config.clone())),
                                 ]),
                             ),
-                            ConfigDeclaration::Add {
-                                target,
-                                media_type,
-                                length,
-                            } => (
+                            ConfigDeclaration::Add { target } => (
                                 target.clone(),
-                                Value::obj(vec![
-                                    ("length", Value::uint(*length)),
-                                    ("media_type", Value::str(media_type.clone())),
-                                ]),
+                                Value::obj(vec![("kind", Value::str("add"))]),
                             ),
                             ConfigDeclaration::Derive {
                                 target,
                                 source,
                                 source_config,
-                                media_type,
-                                length,
                             } => (
                                 target.clone(),
                                 Value::obj(vec![
-                                    ("length", Value::uint(*length)),
-                                    ("media_type", Value::str(media_type.clone())),
+                                    ("kind", Value::str("derive")),
                                     ("source", Value::str(source.clone())),
                                     ("source_config", Value::str(source_config.clone())),
                                 ]),
@@ -849,7 +797,7 @@ pub(crate) struct AddedPart {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AddedConfig {
     pub(crate) name: String,
-    pub(crate) config: ConfigRef,
+    pub(crate) config: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -889,7 +837,6 @@ pub(crate) struct TransactionRow {
     pub(crate) inherited_payload_bytes: u64,
     pub(crate) header: Option<ObjectRef>,
     pub(crate) manifest: Option<ObjectRef>,
-    pub(crate) checkpoint_evidence: Option<Vec<u8>>,
 }
 
 fn part_value(part: &Part) -> Value {
@@ -988,7 +935,19 @@ impl TransactionRow {
             f.req("added_configs")?,
         )? {
             let mut af = Fields::new("DerivedTransaction.added_config", value)?;
-            let config = ConfigRef::from_value(af.req("config")?)?;
+            let config = as_str(
+                "DerivedTransaction.added_config",
+                "canonical_json",
+                af.req("canonical_json")?,
+            )?
+            .as_bytes()
+            .to_vec();
+            if crate::header::canonical_config("added config", &config)? != config {
+                return refuse(
+                    Code::NONCANONICAL_ENCODING,
+                    "added config is not canonical RFC 8785 JSON",
+                );
+            }
             let config_name = af.req_str("name")?.to_string();
             af.done()?;
             name("added config", &config_name)?;
@@ -1034,22 +993,6 @@ impl TransactionRow {
         let manifest = f
             .opt("manifest")
             .map(|v| ObjectRef::from_value("DerivedTransaction.manifest", v))
-            .transpose()?;
-        let checkpoint_evidence = f
-            .opt("checkpoint_evidence")
-            .map(|value| {
-                let bytes = as_str("DerivedTransaction", "checkpoint_evidence", value)?
-                    .as_bytes()
-                    .to_vec();
-                let evidence = crate::repository::CheckpointEvidence::parse(&bytes)?;
-                if evidence.ingest()?.is_some() || evidence.verification()?.is_some() {
-                    return refuse(
-                        Code::UNKNOWN_FIELD,
-                        "derived CheckpointEvidence cannot claim foreign ingest or verification",
-                    );
-                }
-                Ok(bytes)
-            })
             .transpose()?;
         let disposition = match f.opt("disposition") {
             None => None,
@@ -1140,7 +1083,6 @@ impl TransactionRow {
             inherited_payload_bytes,
             header,
             manifest,
-            checkpoint_evidence,
         };
         let before_parts = row.added_parts.clone();
         let before_configs = row.added_configs.clone();
@@ -1166,7 +1108,6 @@ impl TransactionRow {
                 if row.declaration.is_none()
                     || row.header.is_some()
                     || row.manifest.is_some()
-                    || row.checkpoint_evidence.is_some()
                     || row.inherited_payload_objects != 0
                     || row.inherited_payload_bytes != 0
                 {
@@ -1181,7 +1122,6 @@ impl TransactionRow {
                     || row.current_session.is_some()
                     || row.header.is_none()
                     || row.manifest.is_none()
-                    || row.checkpoint_evidence.is_none()
                     || row.inherited_payload_objects > limits::MAX_TOTAL_REFS as u64
                     || row.inherited_payload_bytes > limits::MAX_TOTAL_BYTES
                 {
@@ -1195,7 +1135,6 @@ impl TransactionRow {
                 if row.current_session.is_some()
                     || row.header.is_some()
                     || row.manifest.is_some()
-                    || row.checkpoint_evidence.is_some()
                     || !row.added_parts.is_empty()
                     || !row.added_configs.is_empty()
                     || row.inherited_payload_objects != 0
@@ -1220,7 +1159,13 @@ impl TransactionRow {
                         .iter()
                         .map(|added| {
                             Value::obj(vec![
-                                ("config", added.config.to_value()),
+                                (
+                                    "canonical_json",
+                                    Value::str(
+                                        std::str::from_utf8(&added.config)
+                                            .expect("validated config is UTF-8"),
+                                    ),
+                                ),
                                 ("name", Value::str(added.name.clone())),
                             ])
                         })
@@ -1302,15 +1247,6 @@ impl TransactionRow {
         }
         if let Some(manifest) = &self.manifest {
             fields.push(("manifest".to_string(), manifest.to_value()));
-        }
-        if let Some(evidence) = &self.checkpoint_evidence {
-            fields.push((
-                "checkpoint_evidence".to_string(),
-                Value::str(
-                    String::from_utf8(evidence.clone())
-                        .expect("canonical CheckpointEvidence is UTF-8"),
-                ),
-            ));
         }
         if let TransactionState::Committed(disposition) = &self.state {
             let value = match disposition {
@@ -1702,17 +1638,9 @@ fn build_header(
                     })?;
                 configs.push((target.clone(), value));
             }
-            ConfigDeclaration::Add {
-                target,
-                media_type,
-                length,
-            } => {
+            ConfigDeclaration::Add { target } => {
                 let value = if planned {
-                    ConfigRef {
-                        sha256: crate::sha256::hex_digest(target.as_bytes()),
-                        length: *length,
-                        media_type: media_type.clone(),
-                    }
+                    b"{}".to_vec()
                 } else {
                     added_configs
                         .iter()
@@ -1725,18 +1653,9 @@ fn build_header(
                 };
                 configs.push((target.clone(), value));
             }
-            ConfigDeclaration::Derive {
-                target,
-                media_type,
-                length,
-                ..
-            } => {
+            ConfigDeclaration::Derive { target, .. } => {
                 let value = if planned {
-                    ConfigRef {
-                        sha256: crate::sha256::hex_digest(target.as_bytes()),
-                        length: *length,
-                        media_type: media_type.clone(),
-                    }
+                    b"{}".to_vec()
                 } else {
                     added_configs
                         .iter()
@@ -1797,18 +1716,6 @@ fn build_header(
     }
     encodings.sort_by_key(crate::spec::EncodingSpec::object_id);
     configs.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut config_refs = HashSet::new();
-    for (config_name, config) in &configs {
-        if !config_refs.insert((config.sha256.clone(), config.length)) {
-            return refuse(
-                Code::NOT_CONTAINED,
-                format!(
-                    "target config {config_name:?} repeats sha256:{} length {}; one ConfigRef has exactly one manifest path",
-                    config.sha256, config.length
-                ),
-            );
-        }
-    }
     let header = Header {
         configs,
         assets: Vec::new(),
@@ -1835,7 +1742,6 @@ pub struct SourceView {
 #[derive(Debug, Clone)]
 pub struct InspectedConfig {
     pub name: String,
-    pub media_type: String,
     pub bytes: Vec<u8>,
 }
 
@@ -1846,7 +1752,7 @@ pub struct SourceInspection {
 }
 
 /// Bounded metadata/config preview for a source the caller already holds by exact manifest.
-/// The lease pins and verifies every config read; tensor payload ObjectRefs never leave TensorFS.
+/// Config bytes are inline in the verified header; tensor payload ObjectRefs never leave TensorFS.
 pub fn inspect_source(
     store: &Store,
     meta: &Meta,
@@ -1887,77 +1793,32 @@ pub fn inspect_source(
         code: Code::ROOT_ABSENT,
         detail: "source inspection resolved no source".into(),
     })?;
-    let mut config_refs = Vec::new();
-    for name in &config_names {
-        let config = source
-            .header
-            .configs
-            .iter()
-            .find(|(candidate, _)| candidate == name)
-            .map(|(_, config)| config)
-            .ok_or_else(|| Refusal {
-                code: Code::MISSING_FIELD,
-                detail: format!("source has no config {name:?}"),
-            })?;
-        config_refs.push(ObjectRef {
-            sha256: config.sha256.clone(),
-            length: config.length,
-        });
-    }
-    let (lease, _receipts) = read::acquire(store, meta, &source.fact.manifest.sha256, config_refs)?;
-    let result = (|| {
-        let mut configs = Vec::new();
-        for name in &config_names {
-            let config = source
+    let configs = config_names
+        .iter()
+        .map(|name| {
+            source
                 .header
                 .configs
                 .iter()
                 .find(|(candidate, _)| candidate == name)
-                .map(|(_, config)| config)
+                .map(|(_, config)| InspectedConfig {
+                    name: name.clone(),
+                    bytes: config.clone(),
+                })
                 .ok_or_else(|| Refusal {
                     code: Code::MISSING_FIELD,
                     detail: format!("source has no config {name:?}"),
-                })?;
-            if config.length > limits::DOC_MAX_BYTES as u64 {
-                return refuse(
-                    Code::SIZE_CAP,
-                    format!(
-                        "source config {name:?} is {} B over the {} B document cap",
-                        config.length,
-                        limits::DOC_MAX_BYTES
-                    ),
-                );
-            }
-            let mut bytes = vec![0u8; config.length as usize];
-            read::read_into(
-                &lease,
-                &read::ObjectRange {
-                    obj: ObjectRef {
-                        sha256: config.sha256.clone(),
-                        length: config.length,
-                    },
-                    off: 0,
-                    len: config.length,
-                },
-                &mut bytes,
-            )?;
-            configs.push(InspectedConfig {
-                name: name.clone(),
-                media_type: config.media_type.clone(),
-                bytes,
-            });
-        }
-        Ok(SourceInspection {
-            view: SourceView {
-                fact: source.fact.clone(),
-                header: source.header.clone(),
-                configs: config_names,
-            },
-            configs,
+                })
         })
-    })();
-    lease.release(meta)?;
-    result
+        .collect::<Result<Vec<_>>>()?;
+    Ok(SourceInspection {
+        view: SourceView {
+            fact: source.fact.clone(),
+            header: source.header.clone(),
+            configs: config_names,
+        },
+        configs,
+    })
 }
 
 fn release_guards(meta: &Meta, writer_hold: Option<Hold>, source_leases: Vec<(String, ReadLease)>) {
@@ -2096,7 +1957,6 @@ pub fn begin(
                 inherited_payload_bytes: 0,
                 header: None,
                 manifest: None,
-                checkpoint_evidence: None,
             });
             Ok(())
         }
@@ -2260,17 +2120,15 @@ pub fn add_part<R: Read>(
     txn.commit()?;
     Ok(written)
 }
-
 pub fn add_config<R: Read>(
-    store: &Store,
     meta: &Meta,
     transaction: &str,
     writer_session: u64,
     config_name: &str,
     reader: &mut R,
-) -> Result<ObjectRef> {
+) -> Result<()> {
     let transaction = transaction_id(transaction)?;
-    let (media_type, expected_length) = {
+    {
         let mut txn = meta.txn()?;
         let row = open_row(&mut txn.rows, &transaction, writer_session)?;
         if row
@@ -2284,59 +2142,33 @@ pub fn add_config<R: Read>(
             );
         }
         let declaration = declaration(row)?;
-        declaration
-            .configs
-            .iter()
-            .find_map(|config| match config {
-                ConfigDeclaration::Add {
-                    target,
-                    media_type,
-                    length,
-                }
-                | ConfigDeclaration::Derive {
-                    target,
-                    media_type,
-                    length,
-                    ..
-                } if target == config_name => Some((media_type.clone(), *length)),
-                _ => None,
-            })
-            .ok_or_else(|| Refusal {
-                code: Code::MISSING_FIELD,
-                detail: format!("{config_name:?} is not a declared added config"),
-            })?
-    };
+        if !declaration.configs.iter().any(|config| {
+            matches!(
+                config,
+                ConfigDeclaration::Add { target }
+                    | ConfigDeclaration::Derive { target, .. }
+                    if target == config_name
+            )
+        }) {
+            return refuse(
+                Code::MISSING_FIELD,
+                format!("{config_name:?} is not a declared added config"),
+            );
+        }
+    }
 
-    let mut limited = reader.take(expected_length);
-    let put = store.put_stream(&mut limited, None, &Fault::default())?;
-    if put.obj.length != expected_length {
-        return refuse(
-            Code::LENGTH_MISMATCH,
-            format!(
-                "config {config_name:?} streamed {} bytes, declaration requires {expected_length}",
-                put.obj.length
-            ),
-        );
+    let mut input = Vec::new();
+    reader
+        .take(limits::DOC_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut input)
+        .map_err(|error| Refusal {
+            code: Code::IO_FAILED,
+            detail: format!("read config: {error}"),
+        })?;
+    if input.len() > limits::DOC_MAX_BYTES {
+        return refuse(Code::SIZE_CAP, "config exceeds the document byte cap");
     }
-    let reader = limited.into_inner();
-    let mut extra = [0u8; 1];
-    if reader.read(&mut extra).map_err(|error| Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("read config tail: {error}"),
-    })? != 0
-    {
-        return refuse(
-            Code::LENGTH_MISMATCH,
-            format!("config {config_name:?} produced bytes beyond its declared length"),
-        );
-    }
-    let verified = store.open_verified(&put.obj.sha256)?;
-    if verified.len() != put.obj.length {
-        return refuse(
-            Code::LENGTH_MISMATCH,
-            "added config verified length changed",
-        );
-    }
+    let config = crate::header::canonical_config(&format!("config {config_name:?}"), &input)?;
 
     let mut txn = meta.txn()?;
     let row = open_row(&mut txn.rows, &transaction, writer_session)?;
@@ -2352,17 +2184,12 @@ pub fn add_config<R: Read>(
     }
     row.added_configs.push(AddedConfig {
         name: config_name.to_string(),
-        config: ConfigRef {
-            sha256: put.obj.sha256.clone(),
-            length: put.obj.length,
-            media_type,
-        },
+        config,
     });
     row.normalize();
     txn.commit()?;
-    Ok(put.obj)
+    Ok(())
 }
-
 #[derive(Debug, Clone)]
 pub struct ReceiptFacts {
     pub transaction: String,
@@ -2373,7 +2200,6 @@ pub struct ReceiptFacts {
     pub added_objects: Vec<ObjectRef>,
     pub inherited_payload_objects: u64,
     pub inherited_payload_bytes: u64,
-    pub checkpoint_evidence_canonical_bytes: Vec<u8>,
 }
 
 impl ReceiptFacts {
@@ -2395,13 +2221,6 @@ impl ReceiptFacts {
                 ]),
             ),
             ("manifest", self.manifest.to_value()),
-            (
-                "checkpoint_evidence_canonical_bytes",
-                Value::str(
-                    String::from_utf8(self.checkpoint_evidence_canonical_bytes.clone())
-                        .expect("canonical CheckpointEvidence is UTF-8"),
-                ),
-            ),
             (
                 "sources",
                 Value::arr(
@@ -2437,10 +2256,6 @@ fn added_objects(row: &TransactionRow) -> Vec<ObjectRef> {
         .added_parts
         .iter()
         .flat_map(|added| added.part.segments().iter().cloned())
-        .chain(row.added_configs.iter().map(|added| ObjectRef {
-            sha256: added.config.sha256.clone(),
-            length: added.config.length,
-        }))
         .collect();
     objects.sort_by(|a, b| (&a.sha256, a.length).cmp(&(&b.sha256, b.length)));
     objects.dedup();
@@ -2456,10 +2271,6 @@ fn inherit_observation(header: &Header, row: &TransactionRow) -> Result<(usize, 
         .tensors()
         .flat_map(|(_, _, tensor)| tensor.parts.iter())
         .flat_map(|(_, part)| part.segments().iter().cloned())
-        .chain(header.configs.iter().map(|(_, config)| ObjectRef {
-            sha256: config.sha256.clone(),
-            length: config.length,
-        }))
         .filter(|object| !added_set.contains(&(object.sha256.clone(), object.length)))
         .collect();
     inherited.sort_by(|a, b| (&a.sha256, a.length).cmp(&(&b.sha256, b.length)));
@@ -2472,7 +2283,7 @@ fn inherit_observation(header: &Header, row: &TransactionRow) -> Result<(usize, 
     Ok((inherited.len(), bytes))
 }
 
-fn receipt_from(store: &Store, row: &TransactionRow) -> Result<ReceiptFacts> {
+fn receipt_from(_store: &Store, row: &TransactionRow) -> Result<ReceiptFacts> {
     let declaration = declaration(row)?;
     let header = row.header.clone().ok_or_else(|| Refusal {
         code: Code::ARTIFACT_INCOMPLETE,
@@ -2482,24 +2293,6 @@ fn receipt_from(store: &Store, row: &TransactionRow) -> Result<ReceiptFacts> {
         code: Code::ARTIFACT_INCOMPLETE,
         detail: format!("committed transaction {} has no manifest", row.id),
     })?;
-    let checkpoint_evidence_canonical_bytes =
-        row.checkpoint_evidence.clone().ok_or_else(|| Refusal {
-            code: Code::ARTIFACT_INCOMPLETE,
-            detail: format!("committed transaction {} has no CheckpointEvidence", row.id),
-        })?;
-    let evidence =
-        crate::repository::CheckpointEvidence::parse(&checkpoint_evidence_canonical_bytes)?;
-    if evidence.ingest()?.is_some() || evidence.verification()?.is_some() {
-        return refuse(
-            Code::UNKNOWN_FIELD,
-            "derived CheckpointEvidence cannot claim foreign ingest or verification",
-        );
-    }
-    let header_bytes = checkpoint::load_header(store, &header)?;
-    crate::repository::require_digests(
-        evidence.digests()?.as_ref(),
-        &checkpoint::digests(store, &header_bytes)?,
-    )?;
     Ok(ReceiptFacts {
         transaction: row.id.clone(),
         declaration,
@@ -2509,7 +2302,6 @@ fn receipt_from(store: &Store, row: &TransactionRow) -> Result<ReceiptFacts> {
         added_objects: added_objects(row),
         inherited_payload_objects: row.inherited_payload_objects,
         inherited_payload_bytes: row.inherited_payload_bytes,
-        checkpoint_evidence_canonical_bytes,
     })
 }
 
@@ -2551,20 +2343,12 @@ pub fn commit(
             "the addition set changed while commit constructed the target; retry commit",
         );
     }
-    let checkpoint_evidence = crate::repository::CheckpointEvidence::new(
-        Some(checkpoint::digests(store, &header)?),
-        None,
-        None,
-    )
-    .canonical_bytes();
-    crate::repository::CheckpointEvidence::parse(&checkpoint_evidence)?;
     row.state = TransactionState::Committed(Disposition::Pending);
     row.current_session = None;
     row.header = Some(header_ref);
     row.manifest = Some(manifest_ref);
     row.inherited_payload_objects = inherited_payload_objects as u64;
     row.inherited_payload_bytes = inherited_payload_bytes;
-    row.checkpoint_evidence = Some(checkpoint_evidence);
     let committed = row.clone();
     txn.commit()?;
     receipt_from(store, &committed)
@@ -2634,7 +2418,6 @@ pub fn abandon(store: &Store, meta: &Meta, transaction: &str) -> Result<Option<R
                 inherited_payload_bytes: 0,
                 header: None,
                 manifest: None,
-                checkpoint_evidence: None,
             });
             None
         }
@@ -2827,7 +2610,6 @@ mod tests {
                 &Mutation::PutCheckpoint {
                     repo: repo.clone(),
                     manifest: manifest_ref.clone(),
-                    evidence: None,
                 },
                 &Fault::default(),
             )

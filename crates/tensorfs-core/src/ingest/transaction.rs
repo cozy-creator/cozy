@@ -19,10 +19,7 @@ use crate::header::{Closure, Header, Part, Tensor};
 use crate::ids::{ascii_name, hex64, Doc, ObjectRef, Plain};
 use crate::limits;
 use crate::manifest::Manifest;
-use crate::repository::{
-    CheckpointEvidence, IngestProvenance, Mutation, ReleaseLane, RepositoryName,
-    VerificationEvidence,
-};
+use crate::repository::{Mutation, ReleaseLane, RepositoryName};
 use crate::spec::EncodingSpec;
 use crate::store::{Store, Verdict};
 
@@ -218,12 +215,9 @@ pub struct Install<'a> {
     pub manifest: &'a Manifest,
     pub header: &'a Header,
     pub stamp: &'a super::stamp::Stamp,
-    pub profile: &'a super::IngestProfile,
     pub repo: RepositoryName,
     pub version: &'a str,
     pub lane: &'a str,
-    pub source_uri: Option<&'a str>,
-    pub declared_license: Option<&'a str>,
     pub observed_repository: Option<&'a str>,
 }
 
@@ -235,12 +229,9 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
         manifest: snap,
         header,
         stamp,
-        profile,
         repo,
         version,
         lane,
-        source_uri,
-        declared_license,
         observed_repository,
     } = request;
     receipt.binds(subject, snap, header, stamp)?;
@@ -249,44 +240,10 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
     walk.require_resident(store)?;
     let id = snap.manifest_id();
     read_session(store.root(), session)?;
-    let mut sources = subject.sources.clone();
-    sources.sort();
-    sources.dedup();
-    let ingest = IngestProvenance {
-        source_dialect: profile.source_dialect.clone(),
-        converter_build: profile.converter_build.clone(),
-        converter_recipe: profile.converter_recipe.clone(),
-        sources,
-        source_uri: source_uri.map(str::to_string),
-        declared_license: declared_license.map(str::to_string),
-    };
-    let verification = match &receipt.evidence {
-        super::Evidence::ApprovedProducer {
-            implementation,
-            recipe,
-        } => VerificationEvidence::ApprovedProducer {
-            implementation: implementation.clone(),
-            recipe: recipe.clone(),
-        },
-        super::Evidence::IndependentNumerical {
-            verifier_build,
-            report,
-        } => VerificationEvidence::IndependentNumerical {
-            verifier_build: verifier_build.clone(),
-            report: report.clone(),
-        },
-    };
     let manifest = ObjectRef {
         sha256: id.trim_start_matches("sha256:").to_string(),
         length: snap.canonical_bytes().len() as u64,
     };
-    let evidence = CheckpointEvidence::new(
-        Some(ck::digests(store, header)?),
-        Some(ingest),
-        Some(verification),
-    );
-    let checkpoint_manifest = manifest.clone();
-    let checkpoint_evidence = evidence.clone();
     let local_mutation = if repo.org == "local" {
         if lane != "local" {
             return refuse(Code::KEY_GRAMMAR, "local ingest requires lane local");
@@ -296,7 +253,6 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
             repo: repo.clone(),
             manifest: manifest.clone(),
             version: version.to_string(),
-            evidence: Box::new(evidence),
         })
     } else {
         None
@@ -352,8 +308,7 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
                 current.as_deref(),
                 &Mutation::PutCheckpoint {
                     repo: repo.clone(),
-                    manifest: checkpoint_manifest,
-                    evidence: Some(Box::new(checkpoint_evidence)),
+                    manifest: manifest.clone(),
                 },
                 &Default::default(),
             )?
@@ -437,7 +392,7 @@ pub fn execute(
     plan: &Plan,
     files: &[SourceFile],
     specs: &[(String, EncodingSpec)],
-    configs: &[(String, crate::ids::ConfigRef)],
+    configs: &[(String, Vec<u8>)],
     operation: &str,
 ) -> Result<Outcome> {
     plan.require_order()?;

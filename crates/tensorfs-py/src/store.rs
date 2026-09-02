@@ -33,7 +33,7 @@ use tensorfs_core::read::{self, ObjectRange, ReadLease as CoreLease, Source as R
 use tensorfs_core::receipt::Receipts;
 use tensorfs_core::repository::{Mutation, ReleaseLane, Repository, RepositoryName};
 use tensorfs_core::storage;
-use tensorfs_core::store::{ExpectedCheckpointContract, Fault, Store as CoreStore, Verdict};
+use tensorfs_core::store::{Fault, Store as CoreStore, Verdict};
 
 use crate::docs::marshal;
 use crate::errors::{to_py, IntoPy};
@@ -315,34 +315,27 @@ fn parse_declaration(
             py,
             value,
             &format!("config {target:?}"),
-            &["source", "source_config", "media_type", "length"],
+            &["kind", "source", "source_config"],
         )?;
+        let kind: String = required(py, value, "config", "kind")?.extract()?;
         let source = value.get_item("source")?;
         let source_config = value.get_item("source_config")?;
-        let media_type = value.get_item("media_type")?;
-        let length = value.get_item("length")?;
-        match (source, source_config, media_type, length) {
-            (Some(source), Some(source_config), None, None) => {
+        match (kind.as_str(), source, source_config) {
+            ("copy", Some(source), Some(source_config)) => {
                 config_rows.push(ConfigDeclaration::Copy {
                     target,
                     source: source.extract()?,
                     source_config: source_config.extract()?,
                 });
             }
-            (None, None, Some(media_type), Some(length)) => {
-                config_rows.push(ConfigDeclaration::Add {
-                    target,
-                    media_type: media_type.extract()?,
-                    length: length.extract()?,
-                });
+            ("add", None, None) => {
+                config_rows.push(ConfigDeclaration::Add { target });
             }
-            (Some(source), Some(source_config), Some(media_type), Some(length)) => {
+            ("derive", Some(source), Some(source_config)) => {
                 config_rows.push(ConfigDeclaration::Derive {
                     target,
                     source: source.extract()?,
                     source_config: source_config.extract()?,
-                    media_type: media_type.extract()?,
-                    length: length.extract()?,
                 });
             }
             _ => {
@@ -350,9 +343,7 @@ fn parse_declaration(
                     py,
                     &Refusal {
                         code: Code::MISSING_FIELD,
-                        detail: format!(
-                            "config {target:?} must be copy (source+source_config), add (media_type+length), or derive (all four)"
-                        ),
+                        detail: format!("config {target:?} has an invalid kind/source combination"),
                     },
                 ));
             }
@@ -419,12 +410,7 @@ fn source_component<'p>(
 }
 
 fn receipt<'p>(py: Python<'p>, receipt: &derived::ReceiptFacts) -> PyResult<Bound<'p, PyAny>> {
-    let value = marshal(py, &receipt.to_value())?;
-    value.cast::<PyDict>()?.set_item(
-        "checkpoint_evidence_canonical_bytes",
-        PyBytes::new(py, &receipt.checkpoint_evidence_canonical_bytes),
-    )?;
-    Ok(value)
+    marshal(py, &receipt.to_value())
 }
 
 // ---------------------------------------------------------------- store
@@ -607,9 +593,6 @@ impl PyStore {
         source_selection,
         manifest_id,
         manifest_length,
-        evidence,
-        expected_topology=None,
-        expected_encodings=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn replace_local<'p>(
@@ -620,29 +603,17 @@ impl PyStore {
         source_selection: &str,
         manifest_id: &str,
         manifest_length: u64,
-        evidence: &[u8],
-        expected_topology: Option<&str>,
-        expected_encodings: Option<Vec<String>>,
     ) -> PyResult<Bound<'p, PyBytes>> {
-        let expected = ExpectedCheckpointContract::optional(expected_topology, expected_encodings)
-            .or_refuse(py)?;
         let selection = prefixed("local source selection", source_selection).or_refuse(py)?;
         let mutation = Mutation::ReplaceLocal {
             repo: RepositoryName::new("local", name).or_refuse(py)?,
             version: selection.trim_start_matches("sha256:").to_string(),
             manifest: obj_ref(py, manifest_id, manifest_length)?,
-            evidence: Box::new(
-                tensorfs_core::repository::CheckpointEvidence::parse(evidence).or_refuse(py)?,
-            ),
         };
         let repository = py
             .detach(|| {
-                self.store.apply_repository_with_expected_local(
-                    current,
-                    &mutation,
-                    expected.as_ref(),
-                    &Fault::default(),
-                )
+                self.store
+                    .apply_repository(current, &mutation, &Fault::default())
             })
             .or_refuse(py)?
             .expect("replace_local retains the repository");
@@ -697,8 +668,6 @@ impl PyStore {
         source_selection_digest: &str,
         profiles: Vec<(String, String)>,
         files: Vec<(String, String, u64, PathBuf)>,
-        source_uri: &str,
-        declared_license: &str,
     ) -> PyResult<Bound<'p, PyDict>> {
         let request = PrepareModelSource {
             operation_id: operation_id.to_string(),
@@ -718,8 +687,6 @@ impl PyStore {
                     },
                 )
                 .collect(),
-            source_uri: source_uri.to_string(),
-            declared_license: declared_license.to_string(),
         };
         let prepared = py
             .detach(|| model_source::prepare_model_source(&self.store, &request))
@@ -733,10 +700,6 @@ impl PyStore {
             row.set_item("profile", source.profile)?;
             row.set_item("manifest_digest", source.manifest_digest)?;
             row.set_item("manifest_length", source.manifest_length)?;
-            row.set_item(
-                "checkpoint_evidence_canonical_bytes",
-                PyBytes::new(py, &source.checkpoint_evidence_canonical_bytes),
-            )?;
             rows.append(row)?;
         }
         out.set_item("sources", rows)?;
@@ -1149,7 +1112,6 @@ impl PyStore {
         for config in &inspection.configs {
             let row = PyDict::new(py);
             row.set_item("name", &config.name)?;
-            row.set_item("media_type", &config.media_type)?;
             row.set_item("data", PyBytes::new(py, &config.bytes))?;
             config_rows.append(row)?;
         }
@@ -1307,7 +1269,7 @@ impl PyOperation {
             .or_refuse(py)
     }
 
-    #[pyo3(signature = (current, version, lane, manifest_id, manifest_length, evidence))]
+    #[pyo3(signature = (current, version, lane, manifest_id, manifest_length))]
     #[allow(clippy::too_many_arguments)]
     fn commit_release<'p>(
         &mut self,
@@ -1317,15 +1279,11 @@ impl PyOperation {
         lane: &str,
         manifest_id: &str,
         manifest_length: u64,
-        evidence: &[u8],
     ) -> PyResult<Bound<'p, PyBytes>> {
         let manifest = obj_ref(py, manifest_id, manifest_length)?;
         let checkpoint = Mutation::PutCheckpoint {
             repo: self.repo.clone(),
             manifest: manifest.clone(),
-            evidence: Some(Box::new(
-                tensorfs_core::repository::CheckpointEvidence::parse(evidence).or_refuse(py)?,
-            )),
         };
         let repository = py
             .detach(|| {
@@ -1558,14 +1516,13 @@ impl PyDerivedWriter {
         py: Python<'p>,
         name: &str,
         reader: &Bound<'p, PyAny>,
-    ) -> PyResult<Bound<'p, PyDict>> {
+    ) -> PyResult<()> {
         let mut source = Readable {
             obj: reader.clone().unbind(),
             err: None,
         };
         let result = py.detach(|| {
             derived::add_config(
-                &self.store,
                 &self.meta,
                 &self.transaction_id,
                 self.writer_session_id,
@@ -1573,14 +1530,10 @@ impl PyDerivedWriter {
                 &mut source,
             )
         });
-        let result = match result {
-            Ok(value) => value,
-            Err(error) => return Err(source.err.take().unwrap_or_else(|| to_py(py, &error))),
-        };
-        let out = PyDict::new(py);
-        out.set_item("sha256", result.sha256)?;
-        out.set_item("length", result.length)?;
-        Ok(out)
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(source.err.take().unwrap_or_else(|| to_py(py, &error))),
+        }
     }
 
     fn commit<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {

@@ -1,5 +1,5 @@
 doc: compat_report
 expect: ok
-id: sha256:d302bb7a3a1203c666e45add64a633f0f922e001d0befc8d58867bb5c56e9e96
+id: sha256:655a41e5c771be39d5e2994804ac8ffcbf8ef97c92651b7a4fd5d17a13fab13e
 grade: PRODUCIBLE
-note: an exact-index MISS that is a shape-index HIT: differs by dtype alone, so it is a candidate to grade rather than a pair to skip
+note: differs by dtype alone, so the registered cast determines the grade

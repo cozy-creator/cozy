@@ -4,7 +4,7 @@
 //! Stamp runs INSIDE isolated ingest and verifies, against live bytes rather than against
 //! what the run reported: the exact IngestSubject/IngestProfile pair, the source
 //! generations, the converter build/lock/recipe, the source observations, the canonical
-//! CozyTensorsHeader, the computed `topology_digest`, the encoding part roles, the candidate
+//! CozyTensorsHeader, the computed `tensor_schema_digest`, the encoding part roles, the candidate
 //! object set, the golden-suite result and the bounded resource accounting.
 //!
 //! It emits ONE receipt carrying exactly ONE evidence arm — approved-producer
@@ -13,7 +13,7 @@
 //! here writes a root.
 //!
 //! The ledger is its own canonical document. The receipt ATTESTS; the Stamp records WHAT
-//! WAS VERIFIED, and the non-integer facts (topology digest, converter recipe digest, the
+//! WAS VERIFIED, and the non-integer facts (tensor schema digest, converter recipe digest, the
 //! candidate-set digest, the golden verdict, the isolation tier) have nowhere else to live.
 //! Without it every consumer re-derives them — which is a second decision layer wearing a
 //! consumer's clothes. th-002 verifies precisely this set.
@@ -42,7 +42,7 @@ pub struct Stamp {
     pub header: ObjectRef,
     pub manifest: ObjectRef,
     /// COMPUTED from the header that was actually written — never copied from the profile.
-    pub topology_digest: String,
+    pub tensor_schema_digest: String,
     pub converter_build: String,
     pub converter_recipe: ObjectRef,
     /// sha256 over the sorted candidate id list: the candidate SET as one comparable fact.
@@ -102,7 +102,10 @@ impl Plain for Stamp {
             sources.push((digest, generation));
         }
         let subject = ObjectRef::from_value("Stamp.subject", f.req("subject")?)?;
-        let topology_digest = prefixed("Stamp.topology_digest", f.req_str("topology_digest")?)?;
+        let tensor_schema_digest = prefixed(
+            "Stamp.tensor_schema_digest",
+            f.req_str("tensor_schema_digest")?,
+        )?;
         f.done()?;
         if ![GOLDEN_PASS, GOLDEN_FAIL, GOLDEN_ABSENT].contains(&golden.as_str()) {
             return refuse(
@@ -118,7 +121,7 @@ impl Plain for Stamp {
             profile,
             header,
             manifest,
-            topology_digest,
+            tensor_schema_digest,
             converter_build,
             converter_recipe,
             candidate_set,
@@ -163,7 +166,10 @@ impl Plain for Stamp {
                 ),
             ),
             ("subject", self.subject.to_value()),
-            ("topology_digest", Value::str(self.topology_digest.clone())),
+            (
+                "tensor_schema_digest",
+                Value::str(self.tensor_schema_digest.clone()),
+            ),
         ])
     }
 }
@@ -244,15 +250,15 @@ pub fn stamp(store: &Store, p: Presented) -> Result<Stamped> {
     let closure = ck::load_closure(store, &header)?;
     header.validate(&closure)?;
 
-    // 5. the computed topology digest against the profile's expectation. COMPUTED from the
+    // 5. the computed tensor schema digest against the profile's expectation. COMPUTED from the
     //    header just re-read, never carried over from the plan.
-    let topology_digest = header.topology_digest();
-    if topology_digest != p.profile.expected_topology_digest {
+    let tensor_schema_digest = header.tensor_schema_digest();
+    if tensor_schema_digest != p.profile.expected_tensor_schema_digest {
         return refuse(
             Code::TOPOLOGY_MISMATCH,
             format!(
-                "computed topology {topology_digest} != the profile's expected {}",
-                p.profile.expected_topology_digest
+                "computed tensor schema {tensor_schema_digest} != the profile's expected {}",
+                p.profile.expected_tensor_schema_digest
             ),
         );
     }
@@ -381,7 +387,7 @@ pub fn stamp(store: &Store, p: Presented) -> Result<Stamped> {
         profile: p.profile_ref.clone(),
         header: p.outcome.header_ref.clone(),
         manifest: p.outcome.manifest_ref.clone(),
-        topology_digest,
+        tensor_schema_digest,
         converter_build: p.profile.converter_build.clone(),
         converter_recipe: p.profile.converter_recipe.clone(),
         candidate_set: reached_set,

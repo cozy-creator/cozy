@@ -1,6 +1,5 @@
 doc: code_topology
 expect: ok
 id: sha256:567347c06e7eecb9e8eb5e6c89ead24c5a894362c3e92d836575f1d4bee3c940
-topology: sha256:14fc85f36f84019391ce2691f0b206faebd505b37727f34fcc4deb6177ed918f
-shape: sha256:a1c61fad25156e0ed3b044d5fb42590be8500a89bece19270c4bde631eb5179a
+tensor_schema: sha256:f46a7f4d483f3cb771cb5c2352fe79650b4a89cd788010bb4d7df5d1ccd5d1be
 note: the meta-device census of factory(config), projected: accepts, pinned dtypes, constructed components

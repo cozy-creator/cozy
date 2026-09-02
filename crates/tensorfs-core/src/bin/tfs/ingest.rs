@@ -29,8 +29,8 @@ use tensorfs_core::canon::{self, as_arr, as_str, Fields, Value};
 use tensorfs_core::checkpoint as ck;
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::err::Code;
-use tensorfs_core::header::topology_digest_of;
-use tensorfs_core::ids::{ConfigRef, ObjectRef, Plain};
+use tensorfs_core::header::tensor_schema_digest_of;
+use tensorfs_core::ids::{ObjectRef, Plain};
 use tensorfs_core::ingest::carrier::{self, SourceHeader};
 use tensorfs_core::ingest::convert::{self, Class, Effect, Rekey, Source, Target};
 use tensorfs_core::ingest::fingerprint::{
@@ -42,7 +42,6 @@ use tensorfs_core::ingest::stamp::{self, Stamp};
 use tensorfs_core::ingest::transaction::{self as tx};
 use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerificationReceipt};
 use tensorfs_core::limits;
-use tensorfs_core::manifest::{Draft, Entry};
 use tensorfs_core::registry;
 use tensorfs_core::store::{Progress, Store};
 
@@ -340,7 +339,7 @@ pub fn cmd_inspect(f: &Flags) -> ExitCode {
         println!("  dtypes       {}", dt.join(" · "));
         println!("  declared     {} B of tensor bytes", h.declared_bytes());
         println!("  keyset       {}", fp.keyset_digest);
-        println!("  topology     {}", fp.topology_digest);
+        println!("  tensor schema {}", fp.tensor_schema_digest);
         println!("  source       {}", source_core::source_digest(&h, &raw));
         if !stamps.is_empty() {
             for (k, v) in &stamps {
@@ -436,7 +435,7 @@ pub fn cmd_bank(dialect: &str, converter: &str, f: &Flags) -> ExitCode {
             dialect: dialect.to_string(),
             component: component.clone(),
             converter: converter.to_string(),
-            topology_digest: fp.topology_digest.clone(),
+            tensor_schema_digest: fp.tensor_schema_digest.clone(),
             logical_keys: fp.logical_keys as u64,
             provenance: Provenance {
                 kind: REAL.to_string(),
@@ -454,7 +453,7 @@ pub fn cmd_bank(dialect: &str, converter: &str, f: &Flags) -> ExitCode {
         });
         println!(
             "banked {component}  {}  {}",
-            fp.keyset_digest, fp.topology_digest
+            fp.keyset_digest, fp.tensor_schema_digest
         );
         reviewed.push((component.clone(), fp.keyset_digest));
     }
@@ -991,8 +990,8 @@ fn print_plan(p: &Prepared) {
         Err(e) => println!("declared     REFUSED {}: {}", e.code.as_str(), e.detail),
     }
     println!(
-        "topology     {}",
-        topology_digest_of(&source_core::plan_topology(pl))
+        "tensor schema {}",
+        tensor_schema_digest_of(&source_core::plan_tensor_schema(pl))
     );
     println!(
         "cost         {} B of headers read, {} tensor bytes read",
@@ -1291,8 +1290,8 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     // The root goes down FIRST. From this line on the session is reapable whatever happens.
     let (mut ingest_root, _operation_writer) = ok!(tx::open_root(&store, &session, &tenant));
 
-    // Configs are sidecar bytes the header commits BY REFERENCE.
-    let mut configs: Vec<(String, ConfigRef)> = Vec::new();
+    // Configs become canonical JSON bytes inside the CozyTensors header.
+    let mut configs = Vec::new();
     for (k, v) in f.iter() {
         if k != "config" {
             continue;
@@ -1311,19 +1310,9 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let put = ok!(store.put_stream_held(
-            &mut bytes.as_slice(),
-            Some(&ObjectRef::of(&bytes)),
-            &Default::default(),
-            Some(&session),
-        ));
         configs.push((
             name.to_string(),
-            ConfigRef {
-                sha256: put.obj.sha256,
-                length: put.obj.length,
-                media_type: "application/json".to_string(),
-            },
+            ok!(tensorfs_core::header::canonical_config("config", &bytes)),
         ));
     }
     configs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1333,7 +1322,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     let golden = ok!(source_core::golden_suite(p.conv));
     println!("golden       {golden} cases reassembled bit-for-bit");
 
-    let predicted = topology_digest_of(&source_core::plan_topology(&p.plan));
+    let predicted = tensor_schema_digest_of(&source_core::plan_tensor_schema(&p.plan));
     // Qualification fixtures are build data, not model-store objects.
     for (_, seed) in &p.seeds {
         if let Some(v) = &seed.vectors {
@@ -1348,11 +1337,11 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
         &configs,
         &session,
     ));
-    let got = out.header.topology_digest();
+    let got = out.header.tensor_schema_digest();
     if got != predicted {
         eprintln!(
-            "REFUSED TOPOLOGY_MISMATCH: the plan predicted {predicted} and the written \
-             header projects {got} — the preview and the run disagree"
+            "REFUSED TOPOLOGY_MISMATCH: the plan predicted tensor schema {predicted} and \
+             the written header projects {got} — the preview and the run disagree"
         );
         return ExitCode::FAILURE;
     }
@@ -1401,7 +1390,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
         source_dialect: p.conv.dialect.to_string(),
         converter_build: build.clone(),
         converter_recipe: recipe.clone(),
-        expected_topology_digest: predicted.clone(),
+        expected_tensor_schema_digest: predicted.clone(),
         allowed_encodings: {
             let mut v: Vec<ObjectRef> = p.seeds.iter().map(|(_, s)| s.spec.object_ref()).collect();
             v.sort_by(|a, b| a.sha256.cmp(&b.sha256));
@@ -1413,15 +1402,6 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     };
     ok!(profile.validate(&registry::platform_digests()));
     let profile_ref = profile.object_ref();
-
-    let mut manifest = Draft::of(&out.manifest);
-    manifest.entries.push((
-        "evidence/converter-recipe".to_string(),
-        Entry::File(recipe.clone()),
-    ));
-    manifest.entries.sort_by(|left, right| left.0.cmp(&right.0));
-    out.manifest = ok!(manifest.seal());
-    out.manifest_ref = ok!(store.put_manifest_held(&out.manifest, Some(&session))).obj;
 
     let subject = IngestSubject {
         profile: profile_ref,
@@ -1521,7 +1501,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     println!("candidate    header {}", out.header_ref.id());
     println!("candidate    manifest {}", out.manifest_ref.id());
     println!("stamp        {}", stamp_ref.id());
-    println!("  topology   {}", stamped.stamp.topology_digest);
+    println!("  tensor schema {}", stamped.stamp.tensor_schema_digest);
     println!("  candidates {}", stamped.stamp.candidate_set);
     println!("  golden     {}", stamped.stamp.golden);
     println!("receipt      {}", receipt_ref.id());
@@ -1685,7 +1665,7 @@ pub fn cmd_install(
     let receipt = ok!(IngestVerificationReceipt::parse(&rb));
     let subject = ok!(IngestSubject::parse(&sb));
     let stamp_doc = ok!(Stamp::parse(&tb));
-    let profile = ok!(IngestProfile::parse(&pb));
+    let _profile = ok!(IngestProfile::parse(&pb));
     let snap = ok!(ck::load_manifest(&store, &receipt.manifest));
     let header = ok!(ck::load_header(&store, &receipt.header));
     let repo = ok!(tensorfs_core::repository::RepositoryName::new(org, name));
@@ -1704,12 +1684,9 @@ pub fn cmd_install(
             manifest: &snap,
             header: &header,
             stamp: &stamp_doc,
-            profile: &profile,
             repo,
             version,
             lane,
-            source_uri: flag(flags, "source-uri"),
-            declared_license: flag(flags, "declared-license"),
             observed_repository: flag(flags, "observed"),
         },
     ));
@@ -1906,7 +1883,9 @@ pub fn cmd_restamp(root: &Path, session: &str, flags: &Flags) -> ExitCode {
     let plant = flag(flags, "plant").unwrap_or("");
     match plant {
         "" => {}
-        "topology" => profile.expected_topology_digest = tensorfs_core::ids::object_id(b"other"),
+        "tensor-schema" => {
+            profile.expected_tensor_schema_digest = tensorfs_core::ids::object_id(b"other")
+        }
         "candidate" => {
             subject.candidates.pop();
         }
@@ -1936,7 +1915,7 @@ pub fn cmd_restamp(root: &Path, session: &str, flags: &Flags) -> ExitCode {
         // any of its contents are read. This plant proves that binding on its own.
         "profile-bytes" => profile.max_tensors += 1,
         "structure" => {
-            // One tensor's logical shape moved: the header no longer projects the topology
+            // One tensor's logical shape moved: the header no longer projects the tensor schema
             // the profile pinned, and the manifest no longer describes what is in the store.
             if let Some((_, ts)) = out.header.components.first_mut() {
                 if let Some((_, t)) = ts.first_mut() {
@@ -1957,7 +1936,7 @@ pub fn cmd_restamp(root: &Path, session: &str, flags: &Flags) -> ExitCode {
     // `profile-bytes` plant is the one that deliberately does not, and proves the binding.
     if matches!(
         plant,
-        "topology" | "encoding" | "quota-tensors" | "quota-bytes"
+        "tensor-schema" | "encoding" | "quota-tensors" | "quota-bytes"
     ) {
         subject.profile = profile.object_ref();
     }
@@ -1977,7 +1956,7 @@ pub fn cmd_restamp(root: &Path, session: &str, flags: &Flags) -> ExitCode {
         }
     ));
     println!("restamped    {}", stamped.stamp.object_id());
-    println!("  topology   {}", stamped.stamp.topology_digest);
+    println!("  tensor schema {}", stamped.stamp.tensor_schema_digest);
     println!("  candidates {}", stamped.stamp.candidate_set);
     println!("receipt      {}", stamped.receipt.object_id());
     if stamped.receipt.object_id() == receipt.object_id() {

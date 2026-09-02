@@ -76,11 +76,6 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(docs::object_id, m)?)?;
     m.add_function(wrap_pyfunction!(docs::parse_header, m)?)?;
     m.add_function(wrap_pyfunction!(docs::parse_manifest, m)?)?;
-    m.add_function(wrap_pyfunction!(docs::topology_digest, m)?)?;
-    m.add_function(wrap_pyfunction!(docs::shape_digest, m)?)?;
-    m.add_function(wrap_pyfunction!(docs::config_digest, m)?)?;
-    m.add_function(wrap_pyfunction!(docs::construction_document, m)?)?;
-    m.add_function(wrap_pyfunction!(docs::digests, m)?)?;
     m.add_function(wrap_pyfunction!(docs::py_fit, m)?)?;
     m.add_function(wrap_pyfunction!(docs::capability, m)?)?;
     m.add_function(wrap_pyfunction!(docs::run_doc, m)?)?;

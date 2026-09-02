@@ -3,6 +3,7 @@
 //!   tfs registry                 print the seeded platform namespace (alias -> digest)
 //!   tfs id <file>                object id (+ derived ids) of a stored document
 //!   tfs cbor encode|decode|check <file>  header conformance seam; JSON is diagnostic only
+//!   tfs config canonicalize <config.json> --out <canonical.json>
 //!
 //! The object store (tfs-002). Flags: --expect <hex> --expect-length <n> --out <path>
 //! --range <off>:<len> --rate <f> --pass <n> --slow-ms <n>
@@ -42,17 +43,14 @@
 //!   tfs manifest admit|get|show|walk|verify <root> ...
 //!   tfs manifest inspect <manifest.json> --refs <jsonl>
 //!   tfs repo inspect <repo.json> --rows <jsonl>
-//!   tfs repo list <store> --rows <jsonl>     every release lane, with its checkpoint evidence
-//!   tfs repo migrate <store>                 re-derive every checkpoint row's digests from its header
+//!   tfs repo list <store> --rows <jsonl>     every release lane and local alias
 //!   tfs repo usage <store> --rows <jsonl>    blob bytes per repo: total, and unique to it
 //!   tfs repo apply <current.json|-> <mutation.json> --out <replacement> --rows <jsonl>
-//!                  put_checkpoint requires --manifest, --header and --inventory, plus
-//!                  --config <path> for every config the header names
+//!                  put_checkpoint requires --manifest, --header and --inventory
 //!   tfs repo commit <store> <current.json|-> <mutation.json>
 //!   tfs local resolve <store> <name>
 //!   tfs local replace <store> <name> <source-sha256> <manifest> <length>
-//!     [--expected-topology <sha256>] [--expected-encoding <sha256>]...
-//!                     --observed <repository-sha256|absent> --evidence <evidence.json>
+//!                     --observed <repository-sha256|absent>
 //!   tfs local remove <store> <name> --observed <repository-sha256>
 //!   tfs key blob|manifest <sha256> | repo <org> <name>
 //!   tfs gc headers <census> --out <requests.jsonl>
@@ -100,7 +98,7 @@ use tensorfs_core::err::Refusal;
 use tensorfs_core::fit::{self, Accepts, CodeTopology, CompatibilityReport, Custody, Requirement};
 use tensorfs_core::grade::{self, ConversionRegistration, Mapping};
 use tensorfs_core::header::{Asset, Body, Closure, Header, Part, Tensor};
-use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef, Plain};
+use tensorfs_core::ids::{Doc, ObjectRef, Plain};
 use tensorfs_core::ingest::stamp::Stamp;
 use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerificationReceipt};
 use tensorfs_core::manifest::{Draft, Entry, Manifest};
@@ -173,7 +171,6 @@ fn main() -> ExitCode {
         ["manifest", "inspect", p] => repo::cmd_manifest_inspect(Path::new(p), &flags),
         ["repo", "inspect", p] => repo::cmd_repo_inspect(Path::new(p), &flags),
         ["repo", "list", r] => repo::cmd_repo_list(Path::new(r), &flags),
-        ["repo", "migrate", r] => repo::cmd_repo_migrate(Path::new(r), &flags),
         ["repo", "usage", r] => repo::cmd_repo_usage(Path::new(r), &flags),
         ["repo", "get", r, org, name] => repo::cmd_repo_get(Path::new(r), org, name, &flags),
         ["repo", "apply", current, mutation] => {
@@ -272,10 +269,36 @@ fn main() -> ExitCode {
         ["cbor", "decode", f] => cmd_cbor("decode", Path::new(f), &flags),
         ["cbor", "check", f] => cmd_cbor("check", Path::new(f), &flags),
         ["cbor", "plant", f, kind] => cmd_cbor_plant(Path::new(f), kind, &flags),
+        ["config", "canonicalize", f] => cmd_config_canonicalize(Path::new(f), &flags),
         ["id", f] => cmd_id(Path::new(f)),
         _ => {
             eprintln!("usage: see the header of {}", file!());
             ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_config_canonicalize(path: &Path, flags: &Flags) -> ExitCode {
+    let Some(output) = flag(flags, "out") else {
+        eprintln!("--out <canonical.json> is required");
+        return ExitCode::from(2);
+    };
+    let input = match fs::read(path) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("REFUSED IO_FAILED: read {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let canonical = match tensorfs_core::header::canonical_config("config", &input) {
+        Ok(canonical) => canonical,
+        Err(error) => return bail(error),
+    };
+    match fs::write(output, canonical) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("REFUSED IO_FAILED: write {output}: {error}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -720,13 +743,8 @@ fn part_of(dt: Dtype, shape: Vec<u64>) -> Part {
     Part::plan(dt, shape, &bytes)
 }
 
-fn config_ref() -> ConfigRef {
-    let bytes = br#"{"hidden_size":1536}"#;
-    ConfigRef {
-        sha256: tensorfs_core::sha256::hex_digest(bytes),
-        length: bytes.len() as u64,
-        media_type: "application/json".to_string(),
-    }
+fn config_bytes() -> Vec<u8> {
+    br#"{"hidden_size":1536}"#.to_vec()
 }
 
 fn encodings_of(specs: &[&EncodingSpec]) -> Vec<EncodingSpec> {
@@ -736,7 +754,7 @@ fn encodings_of(specs: &[&EncodingSpec]) -> Vec<EncodingSpec> {
 }
 
 /// Positive header: plain inline tensor + an fp8-rowwise tensor (segments AND inline).
-fn header_a(config: Option<ConfigRef>) -> (Header, Closure) {
+fn header_a(config: Option<Vec<u8>>) -> (Header, Closure) {
     let plain = seed_spec("plain/1", 0);
     let fp8 = seed_spec("fp8-rowwise/1", 0);
     let mut closure = Closure::default();
@@ -817,28 +835,14 @@ fn header_nvfp4() -> (Header, EncodingSpec) {
 }
 
 fn manifest_checkpoint(header: &Header, extra_file: bool) -> TfsResult<Manifest> {
-    let mut entries = vec![
-        (
-            "model.cozytensors".to_string(),
-            Entry::CozyTensors(header.object_ref()?),
-        ),
-        (
-            "tokenizer.model".to_string(),
-            Entry::File(ObjectRef::of(&pattern(4096))),
-        ),
-        (
-            "transformer/config.json".to_string(),
-            Entry::File(ObjectRef::of(br#"{"hidden_size":1536}"#)),
-        ),
-        (
-            "assets/prompt.txt".to_string(),
-            Entry::File(ObjectRef::of(b"one\ntwo\n")),
-        ),
-    ];
+    let mut entries = vec![(
+        "model.cozytensors".to_string(),
+        Entry::CozyTensors(header.object_ref()?),
+    )];
     if extra_file {
         entries.push((
-            "transformer/generation.json".to_string(),
-            Entry::File(ObjectRef::of(br#"{"steps":30}"#)),
+            "README.txt".to_string(),
+            Entry::File(ObjectRef::of(b"sample model\n")),
         ));
     }
     entries.sort_by(|left, right| left.0.cmp(&right.0));
@@ -851,7 +855,7 @@ fn profile_normal(allowed: Vec<ObjectRef>, dialect: &str) -> IngestProfile {
         source_dialect: dialect.to_string(),
         converter_build: tensorfs_core::ids::object_id(b"converter-build-v1"),
         converter_recipe: ObjectRef::of(b"recipe"),
-        expected_topology_digest: tensorfs_core::ids::object_id(b"topology"),
+        expected_tensor_schema_digest: tensorfs_core::ids::object_id(b"tensor-schema"),
         allowed_encodings: allowed,
         max_source_bytes: 1 << 40,
         max_tensors: 100_000,
@@ -881,7 +885,7 @@ fn stamp_doc(
         profile: prof.object_ref(),
         header: header.object_ref()?,
         manifest: snap.object_ref(),
-        topology_digest: header.topology_digest(),
+        tensor_schema_digest: header.tensor_schema_digest(),
         converter_build: prof.converter_build.clone(),
         converter_recipe: prof.converter_recipe.clone(),
         candidate_set: tensorfs_core::ingest::stamp::candidate_set_digest(
@@ -1003,13 +1007,9 @@ fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
     let first_fact = reports.pop().unwrap();
     let whole_set = reports.pop().unwrap();
 
-    // THE SHAPE-BUCKET ARM (tfs-038). The same contract with every required dtype recast
-    // and NOTHING else touched. Keys and shapes are untouched, so the shape-only projection
-    // is byte-identical to the header's while the exact projection is not — which is the
-    // whole point: an exact-index miss that is a shape-index HIT is the CONVERTIBLE and
-    // PRODUCIBLE half of a catalog, and grading it is worth the microseconds. Frozen as a
-    // pair so the day the shape projection stops eliding the dtype, or starts eliding
-    // something else, one of these two digests moves and the corpus says so.
+    // The same contract with every required dtype recast and NOTHING else touched. This
+    // remains a compact regression for the dtype-remedy path after deleting the old
+    // shape-only catalog index.
     let mut recast = code.clone();
     for (_, keys) in recast.components.iter_mut() {
         for (_, r) in keys.iter_mut() {
@@ -1144,7 +1144,7 @@ fn binary_sub(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 
 fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     let mut cases: Vec<Case> = Vec::new();
-    let (ha, closure) = header_a(Some(config_ref()));
+    let (ha, closure) = header_a(Some(config_bytes()));
     let ha_bytes = ha.conformance_bytes()?;
     let (hn, _) = header_nvfp4();
     let plain = seed_spec("plain/1", 0);
@@ -1185,7 +1185,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "plain-fp8-noconfig",
         "header",
         ha2.conformance_bytes()?,
-        "same tensors, no configs: same topology, different header id",
+        "same tensors, no configs: same tensor schema, different header id",
     ));
     let mut reordered = ha.clone();
     reordered.components[0].1.reverse();
@@ -1194,7 +1194,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "plain-fp8-reordered",
         "header",
         reordered.conformance_bytes()?,
-        "same topology and objects, opposite identity-bearing tensor order",
+        "same tensor schema and objects, opposite identity-bearing tensor order",
     ));
     cases.push(ok_case(
         "encoding",
@@ -1329,8 +1329,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "code-topology-recast",
         "code_topology",
         recast.canonical_bytes(),
-        "the same contract with only the dtypes recast: a DIFFERENT exact topology digest \
-         and the SAME shape digest",
+        "the same contract with only the dtypes recast: a different tensor schema digest",
     ));
     cases.push(ok_case(
         "layout",
@@ -1346,8 +1345,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "report-recast",
         "compat_report",
         recast_report.canonical_bytes(),
-        "an exact-index MISS that is a shape-index HIT: differs by dtype alone, so it is a \
-         candidate to grade rather than a pair to skip",
+        "differs by dtype alone, so the registered cast determines the grade",
     ));
     cases.push(red_case(
         "layout-red",
@@ -1473,8 +1471,8 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     // These are the only documents in this corpus that nothing STORES — they are a CLI
     // projection. They are frozen anyway, because they are a producer/consumer contract
     // across two repositories and two languages and until now nothing held it: tensorfs
-    // grew `depth`, then the four `topology_*` keys, and both times tensorhub's decoder
-    // refused every real answer while both repositories' CI stayed green. Freezing them
+    // changed shape more than once, and tensorhub's decoder refused every real answer while
+    // both repositories' CI stayed green. Freezing them
     // here means `tfs vectors verify` re-emits each one from the frozen report beside it
     // and requires byte identity, so a key added to any surface fails on the PRODUCER,
     // naming the consumer, before it can ship.
@@ -1501,8 +1499,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         (
             "check-recast",
             &recast_report,
-            "an exact-index miss that is a shape-index hit: the four topology_* keys are \
-             what makes that readable without parsing a header",
+            "the same keys and shapes with a different required dtype",
         ),
     ] {
         cases.push(ok_case(
@@ -1867,7 +1864,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "a digest is exactly 32 native bytes",
     ));
     let mut h = ha.clone();
-    h.configs.push(("aaa".to_string(), config_ref()));
+    h.configs.push(("aaa".to_string(), config_bytes()));
     cases.push(red_case(
         g,
         "configs-unsorted",
@@ -1876,6 +1873,43 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "SORT_ORDER",
         "configs are a sorted set, not construction order",
     ));
+    for (name, bytes, code, note) in [
+        (
+            "config-not-canonical",
+            br#"{ "hidden_size": 1536 }"#.as_slice(),
+            "NONCANONICAL_ENCODING",
+            "inline configs store exactly their RFC 8785 bytes",
+        ),
+        (
+            "config-duplicate-key",
+            br#"{"hidden_size":1536,"hidden_size":2048}"#.as_slice(),
+            "DUPLICATE_KEY",
+            "duplicate JSON keys never acquire a value",
+        ),
+        (
+            "config-trailing-bytes",
+            br#"{"hidden_size":1536}x"#.as_slice(),
+            "TRAILING_BYTES",
+            "a config is one complete JSON value",
+        ),
+        (
+            "config-nonfinite",
+            br#"{"scale":NaN}"#.as_slice(),
+            "MALFORMED_JSON",
+            "non-finite values are outside JSON and JCS",
+        ),
+    ] {
+        let mut header = ha.clone();
+        header.configs[0].1 = bytes.to_vec();
+        cases.push(red_case(
+            g,
+            name,
+            "header",
+            header.conformance_bytes()?,
+            code,
+            note,
+        ));
+    }
     let mut h = ha.clone();
     h.encodings.reverse();
     cases.push(red_case(
@@ -2067,7 +2101,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     ));
 
     // --- location-typed Manifest reds
-    let manifest_bytes = snap.canonical_bytes();
+    let manifest_bytes = snap2.canonical_bytes();
     cases.push(red_case(
         "manifest-red",
         "entry-kind-symlink",
@@ -2247,15 +2281,11 @@ fn cmd_gen(dir: &Path) -> ExitCode {
             v += &format!("id: {}\n", tensorfs_core::ids::object_id(&c.bytes));
             if c.doc == "header" {
                 let h = Header::parse(&c.bytes).unwrap();
-                v += &format!("topology: {}\n", h.topology_digest());
-                v += &format!("shape: {}\n", h.shape_digest());
+                v += &format!("tensor_schema: {}\n", h.tensor_schema_digest());
             }
-            // tfs-038: the code side freezes BOTH projections too, so a dtype-only recast
-            // of one contract is provably the same shape bucket and a different exact one.
             if c.doc == "code_topology" {
                 let code = tensorfs_core::fit::CodeTopology::parse(&c.bytes).unwrap();
-                v += &format!("topology: {}\n", code.topology_digest());
-                v += &format!("shape: {}\n", code.shape_digest());
+                v += &format!("tensor_schema: {}\n", code.tensor_schema_digest());
             }
             if c.doc == "manifest" {
                 let m = Manifest::parse(&c.bytes).unwrap();
@@ -2292,8 +2322,7 @@ fn cmd_gen(dir: &Path) -> ExitCode {
 enum Outcome {
     Ok {
         id: String,
-        topology: Option<String>,
-        shape: Option<String>,
+        tensor_schema: Option<String>,
         manifest: Option<String>,
         grade: Option<String>,
     },
@@ -2305,8 +2334,7 @@ fn run_doc(doc: &str, bytes: &[u8], closure: &Closure, platform: &[String]) -> O
     match tensorfs_core::corpus::run_doc(doc, bytes, closure, platform) {
         Ok(o) => Outcome::Ok {
             id: o.id,
-            topology: o.topology,
-            shape: o.shape,
+            tensor_schema: o.tensor_schema,
             manifest: o.manifest,
             grade: o.grade,
         },
@@ -2381,8 +2409,7 @@ fn cmd_verify(dir: &Path) -> ExitCode {
                     "ok",
                     Outcome::Ok {
                         id,
-                        topology,
-                        shape,
+                        tensor_schema,
                         manifest,
                         grade,
                     },
@@ -2391,14 +2418,11 @@ fn cmd_verify(dir: &Path) -> ExitCode {
                     if field(&v, "id").as_deref() != Some(id.as_str()) {
                         bad.push(format!("id {id} != frozen {:?}", field(&v, "id")));
                     }
-                    if let Some(t) = field(&v, "topology") {
-                        if topology.as_deref() != Some(t.as_str()) {
-                            bad.push(format!("topology {topology:?} != frozen {t}"));
-                        }
-                    }
-                    if let Some(t) = field(&v, "shape") {
-                        if shape.as_deref() != Some(t.as_str()) {
-                            bad.push(format!("shape {shape:?} != frozen {t}"));
+                    if let Some(expected) = field(&v, "tensor_schema") {
+                        if tensor_schema.as_deref() != Some(expected.as_str()) {
+                            bad.push(format!(
+                                "tensor schema {tensor_schema:?} != frozen {expected}"
+                            ));
                         }
                     }
                     if let Some(expected) = field(&v, "manifest") {
@@ -2466,17 +2490,12 @@ fn cmd_verify(dir: &Path) -> ExitCode {
             _ => String::new(),
         }
     };
-    let topof = |n: &str| -> String {
+    let schemaof = |n: &str| -> String {
         match get(n) {
             Some(Outcome::Ok {
-                topology: Some(t), ..
-            }) => t.clone(),
-            _ => String::new(),
-        }
-    };
-    let shapeof = |n: &str| -> String {
-        match get(n) {
-            Some(Outcome::Ok { shape: Some(s), .. }) => s.clone(),
+                tensor_schema: Some(schema),
+                ..
+            }) => schema.clone(),
             _ => String::new(),
         }
     };
@@ -2506,40 +2525,23 @@ fn cmd_verify(dir: &Path) -> ExitCode {
         ),
     ));
     cross.push((
-        "a config change flips header id, not topology_digest".into(),
+        "a config change flips header id, not tensor_schema_digest".into(),
         idof("header/plain-fp8") != idof("header/plain-fp8-noconfig")
-            && topof("header/plain-fp8") == topof("header/plain-fp8-noconfig"),
-        topof("header/plain-fp8"),
+            && schemaof("header/plain-fp8") == schemaof("header/plain-fp8-noconfig"),
+        schemaof("header/plain-fp8"),
     ));
     cross.push((
-        "tensor reorder flips header id, not topology_digest".into(),
+        "tensor reorder flips header id, not tensor_schema_digest".into(),
         idof("header/plain-fp8") != idof("header/plain-fp8-reordered")
-            && topof("header/plain-fp8") == topof("header/plain-fp8-reordered"),
-        topof("header/plain-fp8-reordered"),
-    ));
-    // tfs-038's red arm, as a CROSS assertion over two frozen documents: recasting only the
-    // dtypes must move the exact digest and leave the shape digest exactly where it was. If
-    // the shape projection ever stopped eliding the dtype the first half fails; if it began
-    // eliding a shape the second half fails.
-    cross.push((
-        "a dtype-only recast flips topology_digest, not the shape digest".into(),
-        topof("layout/code-topology") != topof("layout/code-topology-recast")
-            && shapeof("layout/code-topology") == shapeof("layout/code-topology-recast")
-            && !shapeof("layout/code-topology").is_empty(),
-        shapeof("layout/code-topology-recast"),
-    ));
-    cross.push((
-        "the shape projection is not the exact one".into(),
-        topof("layout/code-topology") != shapeof("layout/code-topology")
-            && !shapeof("layout/code-topology").is_empty(),
-        short(shapeof("layout/code-topology")),
+            && schemaof("header/plain-fp8") == schemaof("header/plain-fp8-reordered"),
+        schemaof("header/plain-fp8-reordered"),
     ));
     cross.push((
         "one more sibling file flips manifest_id only".into(),
         cpof("manifest/checkpoint") != cpof("manifest/checkpoint-extra-file"),
         cpof("manifest/checkpoint-extra-file"),
     ));
-    let (cha, _) = header_a(Some(config_ref()));
+    let (cha, _) = header_a(Some(config_bytes()));
     let csnap = ok!(manifest_checkpoint(&cha, false));
     let cprof = profile_normal(
         vec![seed_spec("plain/1", 0).object_ref()],
@@ -2777,7 +2779,7 @@ fn cmd_id(p: &Path) -> ExitCode {
     println!("length:    {}", bytes.len());
     if let Ok(h) = Header::parse(&bytes) {
         println!("kind:      cozytensors/1 header");
-        println!("topology:  {}", h.topology_digest());
+        println!("schema:    {}", h.tensor_schema_digest());
         println!("tensors:   {}", h.tensors().count());
         match h.diagnostic_value() {
             Ok(value) => println!("pretty:\n{}", canon::pretty(&value, 0)),

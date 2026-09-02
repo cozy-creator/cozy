@@ -17,8 +17,8 @@
     ]
   ],
   "configs": [
-    ["text_encoder", "sha256:3333333333333333333333333333333333333333333333333333333333333333", 53, "application/json"],
-    ["transformer", "sha256:4444444444444444444444444444444444444444444444444444444444444444", 81, "application/json"]
+    ["text_encoder", "{\"hidden_size\":2048}"],
+    ["transformer", "{\"hidden_size\":1536,\"layers\":24}"]
   ],
   "encodings": [
     {"logical_dtypes":["bf16"],"roles":{"value":{"carrier":{"t":"same_as_logical"},"shape":{"t":"same"}}}},

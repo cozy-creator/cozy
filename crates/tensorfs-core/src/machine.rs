@@ -6,7 +6,7 @@
 //! long time nothing held it. tensorfs added `depth` to `compat check --json` and
 //! `depth`+`mismatches` to `grade --json`; tensorhub could then not decode a single real
 //! answer, and both repositories' CI stayed green throughout. It happened a second time
-//! with the four `topology_*` keys. A recorded sample on the consumer side is a snapshot,
+//! with an unversioned result shape. A recorded sample on the consumer side is a snapshot,
 //! not a contract: it goes stale the moment the producer grows a key, and says nothing.
 //!
 //! So the emitters live HERE, in the library, next to every other document this workspace
@@ -37,17 +37,7 @@ pub const CONSUMER_REMEDY: &str =
      IN THE SAME LANDING ORDER: tensorfs first, tensorhub second.";
 
 /// `tfs compat check --json`.
-pub const CHECK_KEYS: &[&str] = &[
-    "depth",
-    "details",
-    "encodings",
-    "report",
-    "satisfied",
-    "topology_present",
-    "topology_required",
-    "topology_shape_present",
-    "topology_shape_required",
-];
+pub const CHECK_KEYS: &[&str] = &["depth", "details", "encodings", "report", "satisfied"];
 
 /// One entry of `check --json`'s `details` array.
 pub const CHECK_DETAIL_KEYS: &[&str] = &["code", "component", "key", "present", "required"];
@@ -182,10 +172,8 @@ fn side(s: &Side) -> String {
 /// `tfs compat check --json`, as a pure function of the report the check produced.
 ///
 /// `details` is the WHOLE mismatch set at the depth the walk was taken; `depth` says which,
-/// so a consumer can tell a set of one from a walk that stopped after one. The four
-/// `topology_*` keys are a search INDEX, never the decision: exact digests equal is an
-/// exact-index hit, shape digests equal alone means the pair differs by dtype or encoding
-/// and is worth grading. `encodings` is what the CHECKPOINT carries — the input to the
+/// so a consumer can tell a set of one from a walk that stopped after one. `encodings` is
+/// what the CHECKPOINT carries — the input to the
 /// independent DEVICE question (`tfs capability`), which the consumer cannot ask without
 /// it, and must not parse a header to learn.
 pub fn check_json(report: &CompatibilityReport) -> Vec<u8> {
@@ -220,22 +208,6 @@ pub fn check_json(report: &CompatibilityReport) -> Vec<u8> {
         ("depth", Value::str(report.depth.name())),
         ("details", Value::arr(details)),
         ("report", Value::str(report.object_id())),
-        (
-            "topology_required",
-            Value::str(report.topology_required.clone()),
-        ),
-        (
-            "topology_present",
-            Value::str(report.topology_present.clone()),
-        ),
-        (
-            "topology_shape_required",
-            Value::str(report.shape_required.clone()),
-        ),
-        (
-            "topology_shape_present",
-            Value::str(report.shape_present.clone()),
-        ),
     ]))
 }
 
@@ -391,10 +363,6 @@ mod surface {
         CompatibilityReport {
             contract: "example.Contract".to_string(),
             header: crate::ids::object_id(b"header"),
-            topology_required: crate::ids::object_id(b"required"),
-            topology_present: crate::ids::object_id(b"present"),
-            shape_required: crate::ids::object_id(b"shape-required"),
-            shape_present: crate::ids::object_id(b"shape-present"),
             custody: crate::fit::Custody::Canonical,
             depth: crate::fit::Depth::Full,
             mismatches: vec![crate::fit::Details {

@@ -1,6 +1,6 @@
 # TensorFS
 
-The current release is `0.1.3`.
+The current release is `0.2.0`.
 
 TensorFS stores every domain repository as the same graph:
 
@@ -33,8 +33,9 @@ Three schemas are STORED — written to a path, digested, and identified by thei
 
 A model Manifest selects one typed CozyTensors entry and may also carry ordinary files
 such as a README, license, or sample image. `Store.walk_cozytensors` and
-`Store.acquire_cozytensors` cover only the selected header and its transitive configs, model
-assets, and tensor parts. The existing `Store.walk` and `Store.acquire_manifest` retain their
+`Store.acquire_cozytensors` cover only the selected header and its transitive model assets and
+tensor parts; configs are canonical JSON bytes inside the header. The existing
+`Store.walk` and `Store.acquire_manifest` retain their
 full-snapshot meaning, including every ordinary sibling.
 
 Those three are the durable format contract. They are not the whole document inventory, and
@@ -47,7 +48,7 @@ frozen corpus verifies every one:
 | `EncodingSpec` | nested CBOR inside the CozyTensors header |
 | `EncodingVectors` | compiled-in registry fixture |
 | `IngestProfile`, `IngestSubject`, `IngestSession` | the ingest border's own documents |
-| `IngestVerificationReceipt`, `Stamp` | ingest evidence, digested but not path-typed |
+| `IngestVerificationReceipt`, `Stamp` | transient candidate-byte admission proof, never release metadata |
 | `CodeTopology`, `CompatibilityReport` | `fit`'s code side, and the grade plane's walk record |
 
 Four more are neither stored nor exchanged as documents but are a cross-repository contract
@@ -97,13 +98,24 @@ Exit 0 on `ok`, one distinct code per refusal (10..16). The same answer is
 no grade in a fit; `tfs compat check` / `tfs grade` are the search plane's ranking over the same
 walk.
 
-Every checkpoint row carries three digests, printed by `tfs checkpoint info` and `tfs repo list`:
-`topology_digest` (identity), `shape_digest` (the fit index — dtype elided) and `config_digest` —
-sha256 of the construction document: the config the header names, or the name-keyed map of
-several, in RFC 8785 form (`jcs.rs`; the same bytes the hub's header route and cozy-runtime's
-`construction_document` produce). It is absent when the header names no config. `tfs repo
-migrate <store>` re-derives all three for rows written before tfs-043; `tfs repo apply` needs
-`--config <path>` for every config the header names.
+Each named construction config is one bounded RFC 8785 JSON-object byte string stored directly in
+the CozyTensors header. Header parsing refuses duplicate keys, trailing bytes, non-finite numbers,
+non-object JSON, oversized values, and any noncanonical spelling. TensorFS stores no separate
+config objects or aggregate config digest.
+
+TensorFS 0.2.0 intentionally has no 0.1.2 header reader. Existing roots migrate once with the
+standalone tool, first as a dry run and then explicitly:
+
+```bash
+uv run tools/migrate-0.1.2-to-0.2.0.py /var/lib/cozy/store \
+  --tfs /path/to/tensorfs-0.2.0/tfs
+uv run tools/migrate-0.1.2-to-0.2.0.py /var/lib/cozy/store \
+  --tfs /path/to/tensorfs-0.2.0/tfs --apply
+```
+
+It stages and validates all new headers, Manifests, and repositories before changing a root;
+repository documents remain under `migration-backup-0.1.2/`, and the v1 SQLite catalog remains as
+`tensorfs.sqlite.0.1.2.bak`.
 
 Everything below is what CI runs, in the same order.
 
@@ -167,8 +179,7 @@ tfs repo commit <store> <current.json|-> <mutation.json>
 
 tfs local resolve <store> <name>
 tfs local replace <store> <name> <source-sha256> <manifest> <length> \
-  --observed <repository-sha256|absent> --evidence <evidence.json> \
-  [--expected-topology <sha256> --expected-encoding <sha256> ...]
+  --observed <repository-sha256|absent>
 tfs local remove <store> <name> --observed <repository-sha256>
 
 tfs key blob <sha256>
@@ -189,34 +200,18 @@ increments one release revision. First publication permanently marks the checkpo
 afterward leaves a durable unreleased checkpoint; `store rebuild` catches SQL projections up. The
 database never leads the repository file.
 
-`local replace` may require an exact producer output contract. The topology and one or more
-repeated EncodingSpec digests are supplied together; encoding digests must already be sorted and
-unique. TensorFS derives both sides from the resident Manifest, `cozytensors/1` header, and model
-evidence before the Repository CAS. It accepts no encoding alias and leaves the prior alias intact
-on any mismatch.
-
 `repo list` emits one `kind: "release"` row per release lane and one `kind: "local"` row per local
-alias (a checkpoint with a `source_selection` and no release). Each model row carries the
-repository's exact canonical `evidence` object. Clients may preserve those bytes opaquely and
-base64-wrap them for a later `put_checkpoint`; TensorFS remains the only parser and canonical
-writer. Ordinary release rows omit evidence.
+alias (a checkpoint with a `source_selection` and no release). Repository rows carry only durable
+snapshot identity and release state; historical ingest evidence is not part of the repository.
 
 `repo usage` emits one `kind: "repo"` row per repository — `bytes_total`, the union of blobs its
 retained checkpoints reach through the same closure GC keeps alive (manifest entries plus the
-header's configs, assets and tensor segments), and `bytes_unique`, the part no other repository
+header's assets and tensor segments), and `bytes_unique`, the part no other repository
 reaches, i.e. what deleting only it would free — then one `kind: "store"` row with the referenced
 union (`bytes_total`), `bytes_unique_sum`, `bytes_unreferenced` (verified blobs nothing retained
 reaches) and `repos`. Manifests are not counted; a blob counts once per repository however many
 paths list it.
 
-A checkpoint row's `evidence` is ingest provenance — source dialect, converter build and recipe,
-source digests, the verification verdict, and the three header-derived digests (`topology_digest`,
-`shape_digest`, `config_digest`) — and it is informational: serving reads the manifest and the
-header, never evidence. Reading is total: every evidence key is optional, unknown keys are ignored,
-an absent digest answers "unknown". Only writers require more: `repo apply` refuses a CozyTensors
-checkpoint row whose evidence lacks the digests or whose digests differ from the header's (the row
-it authors is what the catalog serves `fit` from), and ingest provenance must name its verdict.
-`repo migrate` re-derives the three digests for every row and rewrites in the current shape.
 Rebuild always recovers the repository, Manifest, and complete reached blob set;
 model headers additionally recover the diagnostic projection emitted by `store rebuild --rows`.
 
@@ -225,7 +220,7 @@ model headers additionally recover the diagnostic projection emitted by `store r
 Foreign carrier paths never name components. A review act may bank one whole-source profile beside
 the existing fingerprint entries; the profile supplies the exact required component set, target
 encodings, and canonical construction traversal for each reviewed key-set variant. The registry may
-bank several exact topology observations for one `(key set, component)`; the observed header still
+bank several exact tensor-schema observations for one `(key set, component)`; the observed header still
 has to match one of them exactly. This lets one SDXL profile cover reviewed FP16, BF16, and mixed
 component topologies without 16 source-specific code paths. An optional canonical provider
 member/slot binds a component only when bytes cannot distinguish it, such as byte-identical H3 DiT
@@ -293,11 +288,8 @@ prepared = store.prepare_model_source(
     [("dits", "hf/minimax-h3/native-dual-bf16/1"),
      ("shared", "hf/minimax-h3/shared-bf16/1")],
     [(member, object_id, length, verified_path), ...],
-    "hf://MiniMaxAI/MiniMax-H3@<commit>",
-    declared_license,
 )
-# prepared = {replayed, sources:[{slot, profile, manifest_digest, manifest_length,
-#                                 checkpoint_evidence_canonical_bytes}]}
+# prepared = {replayed, sources:[{slot, profile, manifest_digest, manifest_length}]}
 store.release_model_source(operation_id)
 ```
 
@@ -306,11 +298,9 @@ ObjectRefs into operation identity and re-fences each regular non-symlink path b
 length, and change token before and after conversion. It deliberately does not perform a second
 whole-file SHA pass: the existing streaming ingest pass hashes every admitted tensor byte into the
 CAS. All profiles prepare under one operation; only a complete sorted result set becomes replayable.
-Each row carries the canonical `CheckpointEvidence/1` bytes bound to its header topology,
-converter recipe, credential-free source URI/license, and approved producer. Exact replay returns
-the same Manifest and evidence bytes; changed profile/file/provenance facts conflict, and explicit
-release removes only operation holds. Access URLs, credentials, repository names, and catalog
-release identity have no argument or durable field.
+Exact replay returns the same Manifest bytes; changed profile or file facts conflict, and explicit
+release removes only operation holds. Access URLs, credentials, provenance, repository names, and
+catalog release identity have no argument or durable field.
 
 `repo apply` validates the exact manifest, header, and complete blob inventory before the caller may
 perform its repository CAS, then records only `(org,name,manifest_sha256)` in SQLite. Missing or

@@ -134,24 +134,17 @@ impl CodeTopology {
             .map(|(_, r)| r)
     }
 
-    /// The SAME projection function a header computes, so the indexes are comparable on
-    /// both sides. A digest hit means the logical sets agree — never that the encodings do.
-    pub fn projected(&self, projection: crate::header::Projection) -> crate::canon::Value {
-        crate::header::topology_projection(
-            projection,
-            self.tensors()
-                .map(|(c, k, r)| (c, k, r.dtype, r.shape.as_slice())),
-        )
-    }
-
-    pub fn topology_digest(&self) -> String {
-        crate::header::topology_digest_of(&self.projected(crate::header::Projection::Identity))
-    }
-
-    /// The FIT index (D4): the same projection with the dtype elided. Equal to a
-    /// checkpoint's `shape_digest` exactly when the key sets and shapes agree.
-    pub fn shape_digest(&self) -> String {
-        crate::header::topology_digest_of(&self.projected(crate::header::Projection::ShapeOnly))
+    pub fn tensor_schema_digest(&self) -> String {
+        crate::header::tensor_schema_digest_of(&crate::header::tensor_schema_value(
+            self.tensors().map(|(component, key, requirement)| {
+                (
+                    component,
+                    key,
+                    requirement.dtype,
+                    requirement.shape.as_slice(),
+                )
+            }),
+        ))
     }
 }
 
@@ -1196,10 +1189,6 @@ pub fn fit(
 pub struct CompatibilityReport {
     pub contract: String,
     pub header: String,
-    pub topology_required: String,
-    pub topology_present: String,
-    pub shape_required: String,
-    pub shape_present: String,
     pub custody: Custody,
     pub depth: Depth,
     pub mismatches: Vec<Details>,
@@ -1217,10 +1206,6 @@ impl CompatibilityReport {
         Ok(CompatibilityReport {
             contract: code.contract.clone(),
             header: header.object_id()?,
-            topology_required: code.topology_digest(),
-            topology_present: header.topology_digest(),
-            shape_required: code.shape_digest(),
-            shape_present: header.shape_digest(),
             custody,
             depth: o.depth,
             mismatches: o.mismatches.clone(),
@@ -1386,11 +1371,6 @@ impl Plain for CompatibilityReport {
         for dv in as_arr("CompatibilityReport", "mismatches", f.req("mismatches")?)? {
             mismatches.push(details_from(dv)?);
         }
-        let shape_present = prefixed("report.shape_present", f.req_str("shape_present")?)?;
-        let shape_required = prefixed("report.shape_required", f.req_str("shape_required")?)?;
-        let topology_present = prefixed("report.topology_present", f.req_str("topology_present")?)?;
-        let topology_required =
-            prefixed("report.topology_required", f.req_str("topology_required")?)?;
         let mut unconsumed = Vec::new();
         for u in as_arr("CompatibilityReport", "unconsumed", f.req("unconsumed")?)? {
             unconsumed.push(as_str("unconsumed", "key", u)?.to_string());
@@ -1411,10 +1391,6 @@ impl Plain for CompatibilityReport {
         Ok(CompatibilityReport {
             contract,
             header,
-            topology_required,
-            topology_present,
-            shape_required,
-            shape_present,
             custody,
             depth,
             mismatches,
@@ -1514,16 +1490,6 @@ impl Plain for CompatibilityReport {
             (
                 "mismatches",
                 Value::arr(self.mismatches.iter().map(details_value).collect()),
-            ),
-            ("shape_present", Value::str(self.shape_present.clone())),
-            ("shape_required", Value::str(self.shape_required.clone())),
-            (
-                "topology_present",
-                Value::str(self.topology_present.clone()),
-            ),
-            (
-                "topology_required",
-                Value::str(self.topology_required.clone()),
             ),
             (
                 "unconsumed",

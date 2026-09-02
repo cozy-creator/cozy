@@ -150,7 +150,6 @@ pub struct RepoRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointRow {
-    pub evidence_json: Option<Vec<u8>>,
     pub manifest_length: u64,
     pub manifest_sha256: String,
     pub name: String,
@@ -180,9 +179,6 @@ pub struct CheckpointFactsRow {
     pub object_bytes: u64,
     pub object_count: u64,
     pub org: String,
-    pub topology_digest: Option<String>,
-    pub shape_digest: Option<String>,
-    pub config_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,23 +208,11 @@ pub struct CheckpointComponentRow {
     pub org: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckpointConfigRow {
-    pub config: String,
-    pub length: u64,
-    pub manifest_sha256: String,
-    pub media_type: String,
-    pub name: String,
-    pub org: String,
-    pub sha256: String,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Projection {
     pub checkpoints: Vec<CheckpointRow>,
     pub checkpoint_facts: Vec<CheckpointFactsRow>,
     pub components: Vec<CheckpointComponentRow>,
-    pub configs: Vec<CheckpointConfigRow>,
     pub encodings: Vec<CheckpointEncodingRow>,
     pub repos: Vec<RepoRow>,
     pub releases: Vec<ReleaseRow>,
@@ -247,7 +231,7 @@ impl Projection {
             ])));
         }
         for row in &self.checkpoints {
-            let mut fields = vec![
+            let fields = vec![
                 ("kind", Value::str("checkpoint")),
                 ("manifest_length", Value::uint(row.manifest_length)),
                 ("manifest_sha256", Value::str(row.manifest_sha256.clone())),
@@ -255,13 +239,6 @@ impl Projection {
                 ("org", Value::str(row.org.clone())),
                 ("published", Value::Bool(row.published)),
             ];
-            if let Some(evidence) = &row.evidence_json {
-                fields.push((
-                    "evidence",
-                    crate::canon::parse_canonical(evidence, crate::repository::MAX_EVIDENCE_BYTES)
-                        .expect("validated evidence bytes"),
-                ));
-            }
             lines.push(crate::canon::write(&Value::obj(fields)));
         }
         for row in &self.releases {
@@ -288,19 +265,9 @@ impl Projection {
                 ("object_count", Value::uint(row.object_count)),
                 ("org", Value::str(row.org.clone())),
             ];
-            if let (Some(sha256), Some(length), Some(topology), Some(shape)) = (
-                &row.header_sha256,
-                row.header_length,
-                &row.topology_digest,
-                &row.shape_digest,
-            ) {
-                if let Some(config) = &row.config_digest {
-                    fields.push(("config_digest", Value::str(config.clone())));
-                }
+            if let (Some(sha256), Some(length)) = (&row.header_sha256, row.header_length) {
                 fields.push(("header_length", Value::uint(length)));
                 fields.push(("header_sha256", Value::str(sha256.clone())));
-                fields.push(("shape_digest", Value::str(shape.clone())));
-                fields.push(("topology_digest", Value::str(topology.clone())));
             }
             lines.push(crate::canon::write(&Value::obj(fields)));
         }
@@ -337,18 +304,6 @@ impl Projection {
                 ("org", Value::str(row.org.clone())),
             ])));
         }
-        for row in &self.configs {
-            lines.push(crate::canon::write(&Value::obj(vec![
-                ("config", Value::str(row.config.clone())),
-                ("kind", Value::str("checkpoint_config")),
-                ("length", Value::uint(row.length)),
-                ("manifest_sha256", Value::str(row.manifest_sha256.clone())),
-                ("media_type", Value::str(row.media_type.clone())),
-                ("name", Value::str(row.name.clone())),
-                ("org", Value::str(row.org.clone())),
-                ("sha256", Value::str(row.sha256.clone())),
-            ])));
-        }
         lines
     }
 }
@@ -365,23 +320,19 @@ pub struct Census {
 #[derive(Debug, Clone)]
 pub struct CheckpointFacts {
     pub header: Option<ObjectRef>,
-    pub digests: Option<crate::header::Digests>,
     pub object_count: u64,
     pub object_bytes: u64,
     pub objects: Vec<(String, ObjectRef)>,
     pub encodings: Vec<(String, Option<String>)>,
     pub components: Vec<String>,
-    pub configs: Vec<(String, String, u64, String)>,
 }
 
 /// The exact bytes a publisher stages for one checkpoint: its Manifest, the CozyTensors
-/// header the Manifest names (absent for an ordinary-file checkpoint), and every config
-/// that header names.
+/// header the Manifest names (absent for an ordinary-file checkpoint).
 #[derive(Debug, Clone, Copy)]
 pub struct StagedCheckpoint<'a> {
     pub manifest: &'a [u8],
     pub header: Option<&'a [u8]>,
-    pub configs: &'a [(String, Vec<u8>)],
 }
 
 impl Census {
@@ -396,7 +347,6 @@ impl Census {
         let StagedCheckpoint {
             manifest: manifest_bytes,
             header: header_bytes,
-            configs,
         } = staged;
         if ObjectRef::of(manifest_bytes) != *manifest_ref {
             return refuse(
@@ -434,16 +384,6 @@ impl Census {
             insert_ref(&mut objects, "header", header_ref)?;
         }
         if let Some(header) = &header {
-            for (_, config) in &header.configs {
-                insert_ref(
-                    &mut objects,
-                    "config",
-                    &ObjectRef {
-                        sha256: config.sha256.clone(),
-                        length: config.length,
-                    },
-                )?;
-            }
             for (_, asset) in &header.assets {
                 for object in &asset.segments {
                     insert_ref(&mut objects, "model_asset", object)?;
@@ -488,10 +428,6 @@ impl Census {
         }
         let mut facts = CheckpointFacts {
             header: manifest.header().cloned(),
-            digests: header
-                .as_ref()
-                .map(|header| header.digests(configs))
-                .transpose()?,
             object_count: objects.len() as u64,
             object_bytes,
             objects: objects
@@ -500,7 +436,6 @@ impl Census {
                 .collect(),
             encodings: Vec::new(),
             components: Vec::new(),
-            configs: Vec::new(),
         };
         if let Some(header) = header {
             for spec in &header.encodings {
@@ -522,18 +457,6 @@ impl Census {
                 .components
                 .iter()
                 .map(|(component, _)| component.clone())
-                .collect();
-            facts.configs = header
-                .configs
-                .iter()
-                .map(|(config, value)| {
-                    (
-                        config.clone(),
-                        value.sha256.clone(),
-                        value.length,
-                        value.media_type.clone(),
-                    )
-                })
                 .collect();
         }
         Ok(facts)
@@ -570,26 +493,23 @@ impl Census {
         });
         projection
             .checkpoints
-            .extend(repository.checkpoints.iter().map(|checkpoint| {
-                CheckpointRow {
-                    evidence_json: checkpoint
-                        .evidence
-                        .as_ref()
-                        .map(|evidence| crate::canon::write(&evidence.to_value())),
-                    manifest_length: checkpoint.manifest.length,
-                    manifest_sha256: checkpoint.manifest.sha256.clone(),
-                    name: repository.repo.name.clone(),
-                    org: repository.repo.org.clone(),
-                    published: checkpoint.published,
-                }
-            }));
+            .extend(
+                repository
+                    .checkpoints
+                    .iter()
+                    .map(|checkpoint| CheckpointRow {
+                        manifest_length: checkpoint.manifest.length,
+                        manifest_sha256: checkpoint.manifest.sha256.clone(),
+                        name: repository.repo.name.clone(),
+                        org: repository.repo.org.clone(),
+                        published: checkpoint.published,
+                    }),
+            );
         let checkpoint = repository
             .checkpoints
             .iter()
             .find(|checkpoint| checkpoint.manifest == lane.manifest)
             .expect("validated release checkpoint");
-        let manifest = Manifest::parse(staged.manifest)?;
-        Self::require_checkpoint_evidence(&manifest, checkpoint, &facts)?;
         Self::append_checkpoint_facts(repository, checkpoint, facts, &mut projection);
         projection.releases.push(ReleaseRow {
             lane: lane.lane.clone(),
@@ -619,9 +539,6 @@ impl Census {
             object_bytes: facts.object_bytes,
             object_count: facts.object_count,
             org: repository.repo.org.clone(),
-            topology_digest: facts.digests.as_ref().map(|d| d.topology_digest.clone()),
-            shape_digest: facts.digests.as_ref().map(|d| d.shape_digest.clone()),
-            config_digest: facts.digests.as_ref().and_then(|d| d.config_digest.clone()),
         });
         projection
             .objects
@@ -662,57 +579,6 @@ impl Census {
                         org: repository.repo.org.clone(),
                     }),
             );
-        projection.configs.extend(facts.configs.into_iter().map(
-            |(config, sha256, length, media_type)| CheckpointConfigRow {
-                config,
-                length,
-                manifest_sha256: checkpoint.manifest.sha256.clone(),
-                media_type,
-                name: repository.repo.name.clone(),
-                org: repository.repo.org.clone(),
-                sha256,
-            },
-        ));
-    }
-
-    /// The admission seam's rule for the row a publisher authors: a CozyTensors checkpoint
-    /// carries evidence whose digests are the header's, and provenance names manifest files.
-    /// A rebuild (`project_checkpoint`) never asks this — the index is derived from the
-    /// header, and provenance is informational.
-    fn require_checkpoint_evidence(
-        manifest: &Manifest,
-        checkpoint: &Checkpoint,
-        facts: &CheckpointFacts,
-    ) -> Result<()> {
-        match (&facts.digests, &checkpoint.evidence) {
-            (Some(derived), Some(evidence)) => {
-                crate::repository::require_digests(evidence.digests()?.as_ref(), derived)?;
-                for (path, required) in evidence.required_files()? {
-                    match manifest.entries().iter().find(|(candidate, _)| candidate == path) {
-                        Some((_, Entry::File(actual))) if actual == &required => {}
-                        _ => {
-                            return refuse(
-                                Code::NOT_CONTAINED,
-                                format!(
-                                    "checkpoint evidence {} must be the ordinary manifest file {path:?}",
-                                    required.id()
-                                ),
-                            )
-                        }
-                    }
-                }
-                Ok(())
-            }
-            (Some(_), None) => refuse(
-                Code::MISSING_FIELD,
-                "a CozyTensors checkpoint requires model evidence",
-            ),
-            (None, Some(_)) => refuse(
-                Code::ATTACHMENT_CARDINALITY,
-                "model evidence requires one CozyTensors manifest entry",
-            ),
-            (None, None) => Ok(()),
-        }
     }
 
     pub fn open(root: &Path) -> Result<Self> {
@@ -774,19 +640,18 @@ impl Census {
             });
             projection
                 .checkpoints
-                .extend(repository.checkpoints.iter().map(|checkpoint| {
-                    CheckpointRow {
-                        evidence_json: checkpoint
-                            .evidence
-                            .as_ref()
-                            .map(|evidence| crate::canon::write(&evidence.to_value())),
-                        manifest_length: checkpoint.manifest.length,
-                        manifest_sha256: checkpoint.manifest.sha256.clone(),
-                        name: repository.repo.name.clone(),
-                        org: repository.repo.org.clone(),
-                        published: checkpoint.published,
-                    }
-                }));
+                .extend(
+                    repository
+                        .checkpoints
+                        .iter()
+                        .map(|checkpoint| CheckpointRow {
+                            manifest_length: checkpoint.manifest.length,
+                            manifest_sha256: checkpoint.manifest.sha256.clone(),
+                            name: repository.repo.name.clone(),
+                            org: repository.repo.org.clone(),
+                            published: checkpoint.published,
+                        }),
+                );
             if self.complete_inventory {
                 for checkpoint in &repository.checkpoints {
                     self.project_checkpoint(repository, checkpoint, &mut projection)?;
@@ -815,19 +680,18 @@ impl Census {
         });
         projection
             .checkpoints
-            .extend(repository.checkpoints.iter().map(|checkpoint| {
-                CheckpointRow {
-                    evidence_json: checkpoint
-                        .evidence
-                        .as_ref()
-                        .map(|evidence| crate::canon::write(&evidence.to_value())),
-                    manifest_length: checkpoint.manifest.length,
-                    manifest_sha256: checkpoint.manifest.sha256.clone(),
-                    name: repository.repo.name.clone(),
-                    org: repository.repo.org.clone(),
-                    published: checkpoint.published,
-                }
-            }));
+            .extend(
+                repository
+                    .checkpoints
+                    .iter()
+                    .map(|checkpoint| CheckpointRow {
+                        manifest_length: checkpoint.manifest.length,
+                        manifest_sha256: checkpoint.manifest.sha256.clone(),
+                        name: repository.repo.name.clone(),
+                        org: repository.repo.org.clone(),
+                        published: checkpoint.published,
+                    }),
+            );
         if self.complete_inventory {
             for checkpoint in &repository.checkpoints {
                 self.project_checkpoint(repository, checkpoint, &mut projection)?;
@@ -924,7 +788,7 @@ impl Census {
     /// The byte plane per repository: what each repository's retained checkpoints reach
     /// (`bytes_total`) and what deleting only that repository would free (`bytes_unique`).
     /// The closure is the one `gc_plan` keeps alive — manifest entries plus the CozyTensors
-    /// header's configs, assets and tensor segments — so `bytes_unique` is exactly the blob
+    /// header's assets and tensor segments — so `bytes_unique` is exactly the blob
     /// bytes a later `gc plan` would list once that repository is gone. Manifests are not
     /// counted, and a blob listed at several paths counts once per repository.
     pub fn usage(&self) -> Result<StoreUsage> {
@@ -1019,21 +883,6 @@ impl Census {
         Header::parse(&self.blob("CozyTensors header", reference)?)
     }
 
-    /// The exact bytes of every config a header names, from the staged blobs.
-    fn configs(&self, header: &Header) -> Result<Vec<(String, Vec<u8>)>> {
-        header
-            .configs
-            .iter()
-            .map(|(name, config)| {
-                let reference = ObjectRef {
-                    sha256: config.sha256.clone(),
-                    length: config.length,
-                };
-                Ok((name.clone(), self.blob("config", &reference)?))
-            })
-            .collect()
-    }
-
     fn project_checkpoint(
         &self,
         repository: &Repository,
@@ -1041,20 +890,19 @@ impl Census {
         projection: &mut Projection,
     ) -> Result<()> {
         let (manifest, manifest_bytes) = self.manifest(&checkpoint.manifest)?;
-        let (header_bytes, configs) = match manifest.header() {
+        let header_bytes = match manifest.header() {
             Some(reference) => {
                 let bytes = self.blob("CozyTensors header", reference)?;
-                let configs = self.configs(&Header::parse(&bytes)?)?;
-                (Some(bytes), configs)
+                Header::parse(&bytes)?;
+                Some(bytes)
             }
-            None => (None, Vec::new()),
+            None => None,
         };
         let facts = Self::validate_checkpoint_inputs(
             &checkpoint.manifest,
             StagedCheckpoint {
                 manifest: manifest_bytes,
                 header: header_bytes.as_deref(),
-                configs: &configs,
             },
             &self.inventory,
         )?;
@@ -1091,16 +939,6 @@ impl Census {
         if let Some(header_ref) = manifest.header() {
             insert_ref(&mut objects, "header", header_ref)?;
             let header = self.header(header_ref)?;
-            for (_, config) in &header.configs {
-                insert_ref(
-                    &mut objects,
-                    "config",
-                    &ObjectRef {
-                        sha256: config.sha256.clone(),
-                        length: config.length,
-                    },
-                )?;
-            }
             for (_, asset) in &header.assets {
                 for object in &asset.segments {
                     insert_ref(&mut objects, "model_asset", object)?;
@@ -1398,12 +1236,7 @@ pub fn repository_release_lines(root: &Path) -> Result<Vec<Vec<u8>>> {
     for (repository, _) in read_repositories(root)? {
         for release in &repository.releases {
             for lane in &release.lanes {
-                let checkpoint = repository
-                    .checkpoints
-                    .iter()
-                    .find(|checkpoint| checkpoint.manifest == lane.manifest)
-                    .expect("validated repository release checkpoint");
-                let mut fields = vec![
+                let fields = vec![
                     ("kind", Value::str("release")),
                     ("lane", Value::str(lane.lane.clone())),
                     ("manifest_length", Value::uint(lane.manifest.length)),
@@ -1414,15 +1247,12 @@ pub fn repository_release_lines(root: &Path) -> Result<Vec<Vec<u8>>> {
                     ("release_yanked", Value::Bool(release.yanked)),
                     ("version", Value::str(release.version.clone())),
                 ];
-                if let Some(evidence) = &checkpoint.evidence {
-                    fields.push(("evidence", evidence.to_value()));
-                }
                 lines.push(crate::canon::write(&Value::obj(fields)));
             }
         }
         if repository.repo.org == "local" {
             if let Ok(checkpoint) = repository.local_checkpoint() {
-                let mut fields = vec![
+                let fields = vec![
                     ("kind", Value::str("local")),
                     ("manifest_length", Value::uint(checkpoint.manifest.length)),
                     (
@@ -1439,9 +1269,6 @@ pub fn repository_release_lines(root: &Path) -> Result<Vec<Vec<u8>>> {
                         )),
                     ),
                 ];
-                if let Some(evidence) = &checkpoint.evidence {
-                    fields.push(("evidence", evidence.to_value()));
-                }
                 lines.push(crate::canon::write(&Value::obj(fields)));
             }
         }
@@ -1454,12 +1281,8 @@ mod tests {
     use super::*;
     use crate::dtype::Dtype;
     use crate::header::{Asset, Body, Closure, Header, Part, Tensor};
-    use crate::ids::ConfigRef;
     use crate::manifest::{Draft, Entry};
-    use crate::repository::{
-        Checkpoint, CheckpointEvidence, IngestProvenance, Mutation, Release, RepositoryName,
-        VerificationEvidence,
-    };
+    use crate::repository::{Checkpoint, Mutation, Release, RepositoryName};
     use crate::store::{Fault, Store};
 
     fn temporary(name: &str) -> PathBuf {
@@ -1524,14 +1347,7 @@ mod tests {
         let asset = ObjectRef::of(b"tokenizer vocabulary");
         let part = ObjectRef::of(&[0u8; 260]);
         let header = Header {
-            configs: vec![(
-                "model".into(),
-                ConfigRef {
-                    sha256: config.sha256.clone(),
-                    length: config.length,
-                    media_type: "application/json".into(),
-                },
-            )],
+            configs: vec![("model".into(), config_bytes.clone())],
             assets: vec![(
                 "tokenizer/vocab.txt".into(),
                 Asset {
@@ -1599,7 +1415,6 @@ mod tests {
             StagedCheckpoint {
                 manifest: &manifest_bytes,
                 header: Some(&header_bytes),
-                configs: &[("model".into(), config_bytes)],
             },
             &inventory,
         )
@@ -1610,20 +1425,10 @@ mod tests {
             .map(|(kind, object)| (object.sha256.as_str(), kind.as_str()))
             .collect();
         assert_eq!(kinds[header_ref.sha256.as_str()], "header");
-        assert_eq!(kinds[config.sha256.as_str()], "config");
+        assert_eq!(kinds[config.sha256.as_str()], "file");
         assert_eq!(kinds[asset.sha256.as_str()], "model_asset");
         assert_eq!(kinds[part.sha256.as_str()], "part");
         assert_eq!(kinds[readme.sha256.as_str()], "file");
-    }
-
-    fn evidence(store: &Store, manifest: &ObjectRef) -> CheckpointEvidence {
-        let manifest = store.read_manifest(manifest).unwrap();
-        let header = crate::checkpoint::load_header(store, manifest.header().unwrap()).unwrap();
-        CheckpointEvidence::new(
-            Some(crate::checkpoint::digests(store, &header).unwrap()),
-            None,
-            None,
-        )
     }
 
     fn apply_release(
@@ -1641,7 +1446,6 @@ mod tests {
                 &Mutation::PutCheckpoint {
                     repo: repo.clone(),
                     manifest: manifest.clone(),
-                    evidence: Some(Box::new(evidence(store, manifest))),
                 },
                 &Fault::default(),
             )?
@@ -1771,11 +1575,6 @@ mod tests {
         let manifest = Manifest::parse(&manifest_bytes).unwrap();
         let header_ref = manifest.header().unwrap();
         let header_bytes = fs::read(store.blob_path(&header_ref.sha256)).unwrap();
-        let checkpoint_evidence = CheckpointEvidence::new(
-            Some(Header::parse(&header_bytes).unwrap().digests(&[]).unwrap()),
-            None,
-            None,
-        );
         let lane = ReleaseLane {
             lane: "cpu".into(),
             manifest: manifest_ref.clone(),
@@ -1789,7 +1588,6 @@ mod tests {
         let repository = Repository::empty(repo)
             .put_checkpoint(Checkpoint {
                 manifest: manifest_ref.clone(),
-                evidence: Some(checkpoint_evidence),
                 published: false,
                 source_selection: None,
             })
@@ -1806,7 +1604,6 @@ mod tests {
             StagedCheckpoint {
                 manifest: &manifest_bytes,
                 header: Some(&header_bytes),
-                configs: &[],
             },
             inventory.clone(),
         )
@@ -1815,58 +1612,6 @@ mod tests {
         assert_eq!(projection.objects.len(), 1);
         assert!(!projection.encodings.is_empty());
         assert!(!projection.components.is_empty());
-
-        let recipe_bytes = b"resident evidence outside the manifest";
-        let recipe = store
-            .put_stream(
-                &mut recipe_bytes.as_slice(),
-                Some(&ObjectRef::of(recipe_bytes)),
-                &Fault::default(),
-            )
-            .unwrap()
-            .obj;
-        let evidence_checkpoint = Checkpoint {
-            manifest: lane.manifest.clone(),
-            evidence: Some(CheckpointEvidence::new(
-                Some(Header::parse(&header_bytes).unwrap().digests(&[]).unwrap()),
-                Some(IngestProvenance {
-                    source_dialect: "cozytensors".into(),
-                    converter_build: format!("sha256:{}", "22".repeat(32)),
-                    converter_recipe: recipe.clone(),
-                    sources: vec![(format!("sha256:{}", "33".repeat(32)), 1)],
-                    source_uri: None,
-                    declared_license: None,
-                }),
-                Some(VerificationEvidence::ApprovedProducer {
-                    implementation: format!("sha256:{}", "22".repeat(32)),
-                    recipe,
-                }),
-            )),
-            published: false,
-            source_selection: None,
-        };
-        let evidence_repository = Repository::empty(repository.repo.clone())
-            .put_checkpoint(evidence_checkpoint)
-            .unwrap()
-            .update_release("1.0.0", 0, vec![lane.clone()], Vec::new())
-            .unwrap();
-        assert_eq!(
-            Census::project_release_inputs(
-                &evidence_repository,
-                &evidence_repository.canonical_bytes(),
-                &release,
-                &lane,
-                StagedCheckpoint {
-                    manifest: &manifest_bytes,
-                    header: Some(&header_bytes),
-                    configs: &[],
-                },
-                inventory_from_tree(&root).unwrap(),
-            )
-            .unwrap_err()
-            .code,
-            Code::NOT_CONTAINED
-        );
 
         let mut missing_header = inventory;
         missing_header.remove(&header_ref.sha256);
@@ -1879,7 +1624,6 @@ mod tests {
                 StagedCheckpoint {
                     manifest: &manifest_bytes,
                     header: Some(&header_bytes),
-                    configs: &[],
                 },
                 missing_header,
             )
@@ -1896,7 +1640,6 @@ mod tests {
                 StagedCheckpoint {
                     manifest: &manifest_bytes,
                     header: Some(b"not the header"),
-                    configs: &[],
                 },
                 BTreeMap::new(),
             )

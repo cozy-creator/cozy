@@ -14,7 +14,7 @@ use std::time::Instant;
 use tensorfs_core::checkpoint::{self as ck, build_manifest};
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::header::{Asset, Body, Closure, Header, Located, Part, Tensor};
-use tensorfs_core::ids::{ConfigRef, ObjectRef};
+use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::limits;
 use tensorfs_core::registry;
 use tensorfs_core::relation::Carrier;
@@ -262,8 +262,7 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
     };
     let items = plan(blocks, scale, encoding);
 
-    // The closure first: spec objects and config objects are ordinary CAS objects, and the
-    // header commits them BY REFERENCE.
+    // The encoding closure first. Construction configs are canonical bytes inside the header.
     let mut aliases: Vec<&'static str> = items.iter().map(|i| i.alias).collect();
     aliases.sort_unstable();
     aliases.dedup();
@@ -278,28 +277,19 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
 
     // --no-configs is the TENSORS-ONLY shape: one header plus its closure, zero sibling
     // assets. The manifest id derives once from the virtual tree.
-    let mut cfg_refs: Vec<(String, ConfigRef)> = Vec::new();
+    let mut inline_configs = Vec::new();
     let cfgs = if flag_on(f, "no-configs") {
         Vec::new()
     } else {
         configs()
     };
     for (name, bytes) in cfgs {
-        let put = ok!(store.put_stream(
-            &mut &bytes[..],
-            Some(&ObjectRef::of(bytes)),
-            &Default::default()
-        ));
-        cfg_refs.push((
+        inline_configs.push((
             name.to_string(),
-            ConfigRef {
-                sha256: put.obj.sha256,
-                length: put.obj.length,
-                media_type: "application/json".to_string(),
-            },
+            ok!(tensorfs_core::header::canonical_config("config", bytes)),
         ));
     }
-    cfg_refs.sort_by(|a, b| a.0.cmp(&b.0));
+    inline_configs.sort_by(|a, b| a.0.cmp(&b.0));
     let asset_bytes = b"<pad>0</pad>\n<pad>1</pad>\n";
     let asset_object = ok!(store.put_stream(
         &mut &asset_bytes[..],
@@ -358,7 +348,7 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
     let write_s = t0.elapsed().as_secs_f64();
 
     let header = Header {
-        configs: cfg_refs,
+        configs: inline_configs,
         assets,
         encodings,
         components: comps,
@@ -377,7 +367,7 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
     println!("checkpoint written to {}", root.display());
     println!("  header_digest   {}", href.id());
     println!("  manifest_id     {}", sref.id());
-    println!("  topology_digest {}", header.topology_digest());
+    println!("  tensor_schema_digest {}", header.tensor_schema_digest());
     println!(
         "  components {}  tensors {}  parts {}  segments {}  inline {}",
         header.components.len(),
@@ -549,17 +539,8 @@ pub fn cmd_info(root: &Path, hex: &str) -> ExitCode {
     let (store, href) = opened!(root, hex);
     let header = ok!(ck::load_header(&store, &href));
     println!("header {} ({} B)", href.id(), href.length);
-    let digests = ok!(ck::digests(&store, &header));
-    println!("topology_digest {}", digests.topology_digest);
-    println!("shape_digest    {}", digests.shape_digest);
-    if let Some(config) = &digests.config_digest {
-        println!("config_digest   {config}");
-    }
     for (name, c) in &header.configs {
-        println!(
-            "config {name:<14} sha256:{} {} B {}",
-            c.sha256, c.length, c.media_type
-        );
+        println!("config {name:<14} {} inline B", c.len());
     }
     for r in &header.encodings {
         println!("encoding {} (inlined)", r.object_id());
@@ -863,7 +844,7 @@ pub fn cmd_size(n: usize) -> ExitCode {
     println!(
         "  encode {encode_ms:.1} ms   strict parse {parse_ms:.1} ms   validate {validate_ms:.1} ms"
     );
-    println!("  topology_digest {}", parsed.topology_digest());
+    println!("  tensor_schema_digest {}", parsed.tensor_schema_digest());
     println!("  peak RSS {:.1} MiB", rss_kb("VmHWM") as f64 / 1024.0);
     ExitCode::SUCCESS
 }
@@ -879,10 +860,10 @@ mod tests {
     use super::*;
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
-    const SCALED_TOPOLOGY: &str =
-        "sha256:b0bcb1d36deae42e880632817730172f6f6a14f2177bae0ea953cba2a64b0ccf";
-    const FULL_TOPOLOGY: &str =
-        "sha256:20568368a293a7d7fa7ab76d7dfece5c04616d3ff85f9e36656949eda35579d4";
+    const SCALED_SCHEMA: &str =
+        "sha256:b4cce0c745fe5bb0535827572791c37195c982e21b5d5fe9b30a9b2446bc8ea2";
+    const FULL_SCHEMA: &str =
+        "sha256:61e69d1fcc565583e90560cf0282f42a18d3cc65462a6a17eee5f69c64b0a6ba";
     const MIXED_BLOCK_ORDER: [&str; 5] = [
         "blocks.0.attn1.to_q.weight",
         "blocks.0.attn1.to_out.0.weight",
@@ -1017,7 +998,7 @@ mod tests {
             .iter()
             .all(|item| item.alias == "plain/1"));
         let full_plain = plan(12, 1, PlanEncoding::Plain);
-        let topology = tensorfs_core::header::topology_value(full_plain.iter().map(|item| {
+        let schema = tensorfs_core::header::tensor_schema_value(full_plain.iter().map(|item| {
             (
                 item.comp,
                 item.key.as_str(),
@@ -1026,8 +1007,8 @@ mod tests {
             )
         }));
         assert_eq!(
-            tensorfs_core::header::topology_digest_of(&topology),
-            FULL_TOPOLOGY
+            tensorfs_core::header::tensor_schema_digest_of(&schema),
+            FULL_SCHEMA
         );
     }
 
@@ -1063,7 +1044,7 @@ mod tests {
         assert_eq!(ids, closure_ids);
         assert!(ids.contains(&registry_seed("plain/1").spec.object_id()));
         assert_eq!(component_keys(&header, "unet"), MIXED_BLOCK_ORDER);
-        assert_eq!(header.topology_digest(), SCALED_TOPOLOGY);
+        assert_eq!(header.tensor_schema_digest(), SCALED_SCHEMA);
     }
 
     #[test]
@@ -1090,7 +1071,7 @@ mod tests {
             .tensors()
             .all(|(_, _, tensor)| tensor.parts.len() == 1 && tensor.parts[0].0 == "value"));
         assert_eq!(component_keys(&header, "unet"), PLAIN_BLOCK_ORDER);
-        assert_eq!(header.topology_digest(), SCALED_TOPOLOGY);
+        assert_eq!(header.tensor_schema_digest(), SCALED_SCHEMA);
         assert_eq!(cmd_read(&root.0, &href.sha256, &flags), ExitCode::SUCCESS);
     }
 }

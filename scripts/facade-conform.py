@@ -72,10 +72,11 @@ def main() -> int:
                 bad = []
                 if ok["id"] != v.get("id"):
                     bad.append(f"id {ok['id']} != frozen {v.get('id')!r}")
-                if "topology" in v and ok["topology"] != v["topology"]:
-                    bad.append(f"topology {ok['topology']!r} != frozen {v['topology']}")
-                if "shape" in v and ok["shape"] != v["shape"]:
-                    bad.append(f"shape {ok['shape']!r} != frozen {v['shape']}")
+                if "tensor_schema" in v and ok["tensor_schema"] != v["tensor_schema"]:
+                    bad.append(
+                        f"tensor schema {ok['tensor_schema']!r} "
+                        f"!= frozen {v['tensor_schema']}"
+                    )
                 if "manifest" in v and ok["manifest"] != v["manifest"]:
                     bad.append(f"manifest {ok['manifest']!r} != frozen {v['manifest']}")
                 if "grade" in v and ok["grade"] != v["grade"]:
@@ -114,11 +115,8 @@ def main() -> int:
     def idof(n: str) -> str:
         return str(outcomes.get(n, {}).get("id") or "")
 
-    def topof(n: str) -> str:
-        return str(outcomes.get(n, {}).get("topology") or "")
-
-    def shapeof(n: str) -> str:
-        return str(outcomes.get(n, {}).get("shape") or "")
+    def schemaof(n: str) -> str:
+        return str(outcomes.get(n, {}).get("tensor_schema") or "")
 
     def manifest_of(n: str) -> str:
         return str(outcomes.get(n, {}).get("manifest") or "")
@@ -141,36 +139,19 @@ def main() -> int:
     )
     cross.append(
         (
-            "a config change flips header id, not topology_digest",
+            "a config change flips header id, not tensor_schema_digest",
             idof("header/plain-fp8") != idof("header/plain-fp8-noconfig")
-            and topof("header/plain-fp8") == topof("header/plain-fp8-noconfig"),
-            topof("header/plain-fp8"),
+            and schemaof("header/plain-fp8") == schemaof("header/plain-fp8-noconfig"),
+            schemaof("header/plain-fp8"),
         )
     )
     cross.append(
         (
-            "tensor reorder flips header id, not topology_digest",
+            "tensor reorder flips header id, not tensor_schema_digest",
             idof("header/plain-fp8") != idof("header/plain-fp8-reordered")
-            and topof("header/plain-fp8")
-            == topof("header/plain-fp8-reordered"),
-            topof("header/plain-fp8-reordered"),
-        )
-    )
-    cross.append(
-        (
-            "a dtype-only recast flips topology_digest, not the shape digest",
-            topof("layout/code-topology") != topof("layout/code-topology-recast")
-            and shapeof("layout/code-topology") == shapeof("layout/code-topology-recast")
-            and bool(shapeof("layout/code-topology")),
-            shapeof("layout/code-topology-recast"),
-        )
-    )
-    cross.append(
-        (
-            "the shape projection is not the exact one",
-            topof("layout/code-topology") != shapeof("layout/code-topology")
-            and bool(shapeof("layout/code-topology")),
-            shapeof("layout/code-topology")[:19],
+            and schemaof("header/plain-fp8")
+            == schemaof("header/plain-fp8-reordered"),
+            schemaof("header/plain-fp8-reordered"),
         )
     )
     cross.append(

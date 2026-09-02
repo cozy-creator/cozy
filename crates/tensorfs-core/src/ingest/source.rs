@@ -12,11 +12,9 @@ use std::path::{Path, PathBuf};
 
 use crate::canon::{self, Value};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::header::{topology_digest_of, topology_value};
-use crate::ids::{ascii_name, object_id, prefixed, ConfigRef, ObjectRef};
-use crate::manifest::{Draft, Entry};
+use crate::header::{tensor_schema_digest_of, tensor_schema_value};
+use crate::ids::{ascii_name, object_id, prefixed, ObjectRef};
 use crate::registry;
-use crate::repository::{CheckpointEvidence, IngestProvenance, VerificationEvidence};
 use crate::spec::EncodingSpec;
 use crate::store::Store;
 
@@ -236,7 +234,7 @@ fn profile_assignments(
                         Err(_) => continue,
                     };
                     if observed.keyset_digest == variant.keyset_digest
-                        && observed.topology_digest == entry.topology_digest
+                        && observed.tensor_schema_digest == entry.tensor_schema_digest
                         && observed.logical_keys as u64 == entry.logical_keys
                     {
                         hits.push((index, projected, variant_index));
@@ -356,8 +354,8 @@ pub fn plain_specs(seeds: &[(String, registry::Seed)]) -> Vec<(String, EncodingS
         .collect()
 }
 
-pub fn plan_topology(plan: &Plan) -> Value {
-    topology_value(plan.ops.iter().map(|operation| {
+pub fn plan_tensor_schema(plan: &Plan) -> Value {
+    tensor_schema_value(plan.ops.iter().map(|operation| {
         (
             operation.component.as_str(),
             operation.out_key.as_str(),
@@ -453,8 +451,8 @@ pub fn session_of(prepared: &Prepared) -> String {
             ),
         ),
         (
-            "topology",
-            Value::str(topology_digest_of(&plan_topology(&prepared.plan))),
+            "tensor_schema",
+            Value::str(tensor_schema_digest_of(&plan_tensor_schema(&prepared.plan))),
         ),
         (
             "order",
@@ -643,34 +641,6 @@ pub fn plan_source(
     .map(|(plan, _)| plan)
 }
 
-fn recipe(prepared: &Prepared) -> Result<Vec<u8>> {
-    let mut target = Vec::new();
-    for (component, _) in &prepared.target.components {
-        if target
-            .iter()
-            .any(|(present, _): &(String, Value)| present == component)
-        {
-            continue;
-        }
-        target.push((
-            component.clone(),
-            Value::arr(
-                prepared
-                    .target
-                    .allowed(component)?
-                    .into_iter()
-                    .map(Value::str)
-                    .collect(),
-            ),
-        ));
-    }
-    Ok(canon::write(&Value::obj(vec![
-        ("class", Value::str(prepared.plan.class_name.clone())),
-        ("converter", Value::str(prepared.plan.converter.clone())),
-        ("target", Value::map(target)),
-    ])))
-}
-
 pub fn golden_bytes(name: &str, length: u64) -> Vec<u8> {
     let mut seed = u64::from_le_bytes(
         crate::sha256::digest(name.as_bytes())[0..8]
@@ -704,81 +674,29 @@ pub fn golden_suite(converter: &Converter) -> Result<usize> {
     Ok(count)
 }
 
-fn execute_prepared(
-    store: &Store,
-    operation: &str,
-    prepared: &Prepared,
-    source_uri: &str,
-    declared_license: &str,
-) -> Result<(ObjectRef, Vec<u8>)> {
+fn execute_prepared(store: &Store, operation: &str, prepared: &Prepared) -> Result<ObjectRef> {
     let _ = golden_suite(prepared.conv)?;
     for (_, seed) in &prepared.seeds {
         if let Some(vectors) = &seed.vectors {
             vectors.check(&seed.spec)?;
         }
     }
-    let predicted = topology_digest_of(&plan_topology(&prepared.plan));
-    let mut outcome = transaction::execute(
+    let predicted = tensor_schema_digest_of(&plan_tensor_schema(&prepared.plan));
+    let outcome = transaction::execute(
         store,
         &prepared.plan,
         &prepared.files,
         &plain_specs(&prepared.seeds),
-        &Vec::<(String, ConfigRef)>::new(),
+        &[],
         operation,
     )?;
-    if outcome.header.topology_digest() != predicted {
+    if outcome.header.tensor_schema_digest() != predicted {
         return refuse(
             Code::TOPOLOGY_MISMATCH,
-            "source plan and executed topology differ",
+            "source plan and executed tensor schema differ",
         );
     }
-    let recipe_bytes = recipe(prepared)?;
-    let recipe_ref = store
-        .put_stream_held(
-            &mut recipe_bytes.as_slice(),
-            Some(&ObjectRef::of(&recipe_bytes)),
-            &Default::default(),
-            Some(operation),
-        )?
-        .obj;
-    let mut manifest = Draft::of(&outcome.manifest);
-    manifest.entries.push((
-        "evidence/converter-recipe".to_string(),
-        Entry::File(recipe_ref.clone()),
-    ));
-    manifest.entries.sort_by(|left, right| left.0.cmp(&right.0));
-    outcome.manifest = manifest.seal()?;
-    let manifest = store
-        .put_manifest_held(&outcome.manifest, Some(operation))
-        .map(|put| put.obj)?;
-    let converter_build =
-        object_id(format!("{}|{}", prepared.conv.name, env!("CARGO_PKG_VERSION")).as_bytes());
-    let mut sources: Vec<(String, u64)> = prepared
-        .files
-        .iter()
-        .zip(prepared.raws.iter())
-        .map(|(file, raw)| (source_digest(&file.header, raw), 1))
-        .collect();
-    sources.sort();
-    sources.dedup();
-    let evidence = CheckpointEvidence::new(
-        Some(crate::checkpoint::digests(store, &outcome.header)?),
-        Some(IngestProvenance {
-            source_dialect: prepared.conv.dialect.to_string(),
-            converter_build: converter_build.clone(),
-            converter_recipe: recipe_ref.clone(),
-            sources,
-            source_uri: Some(source_uri.to_string()),
-            declared_license: (!declared_license.is_empty()).then(|| declared_license.to_string()),
-        }),
-        Some(VerificationEvidence::ApprovedProducer {
-            implementation: converter_build,
-            recipe: recipe_ref,
-        }),
-    );
-    let evidence_bytes = evidence.canonical_bytes();
-    CheckpointEvidence::parse(&evidence_bytes)?;
-    Ok((manifest, evidence_bytes))
+    Ok(outcome.manifest_ref)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -801,8 +719,6 @@ pub struct PrepareModelSource {
     pub source_selection_digest: String,
     pub profiles: Vec<ModelSourceProfile>,
     pub files: Vec<VerifiedModelSourceFile>,
-    pub source_uri: String,
-    pub declared_license: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -811,7 +727,6 @@ pub struct PreparedModelSource {
     pub profile: String,
     pub manifest_digest: String,
     pub manifest_length: u64,
-    pub checkpoint_evidence_canonical_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -901,19 +816,6 @@ impl FileFence {
     }
 }
 
-fn bounded_fact(what: &str, value: &str, max: usize, allow_empty: bool) -> Result<()> {
-    if (!allow_empty && value.is_empty())
-        || value.len() > max
-        || value.chars().any(char::is_control)
-    {
-        return refuse(
-            Code::SIZE_CAP,
-            format!("{what} is outside its bounded text grammar"),
-        );
-    }
-    Ok(())
-}
-
 fn validate_request(
     request: &PrepareModelSource,
     registry: &FingerprintRegistry,
@@ -924,16 +826,6 @@ fn validate_request(
         crate::limits::MAX_NAME_BYTES,
     )?;
     prefixed("source selection digest", &request.source_selection_digest)?;
-    bounded_fact("source URI", &request.source_uri, 2048, false)?;
-    if (!request.source_uri.starts_with("hf://") && !request.source_uri.starts_with("civitai://"))
-        || request.source_uri.contains(['?', '#'])
-    {
-        return refuse(
-            Code::KEY_GRAMMAR,
-            "source URI is not pinned credential-free provenance",
-        );
-    }
-    bounded_fact("declared license", &request.declared_license, 512, true)?;
     if request.profiles.is_empty() || request.profiles.len() > 16 {
         return refuse(Code::COUNT_CAP, "source profile count is outside 1..=16");
     }
@@ -999,13 +891,7 @@ fn request_digest(request: &PrepareModelSource, registry_bytes: &[u8]) -> String
     let mut hash = crate::sha256::Sha256::new();
     digest_field(&mut hash, b"tensorfs.model-source-preparation");
     digest_field(&mut hash, &crate::sha256::digest(registry_bytes));
-    for value in [
-        request.source_selection_digest.as_bytes(),
-        request.source_uri.as_bytes(),
-        request.declared_license.as_bytes(),
-    ] {
-        digest_field(&mut hash, value);
-    }
+    digest_field(&mut hash, request.source_selection_digest.as_bytes());
     for row in &request.profiles {
         digest_field(&mut hash, row.slot.as_bytes());
         digest_field(&mut hash, row.profile.as_bytes());
@@ -1029,43 +915,12 @@ fn validate_prepared_result(store: &Store, source: &PreparedModelSource) -> Resu
         length: source.manifest_length,
     };
     let manifest = store.read_manifest(&manifest_ref)?;
-    let evidence = CheckpointEvidence::parse(&source.checkpoint_evidence_canonical_bytes)?;
     let header_ref = manifest.header().ok_or_else(|| Refusal {
         code: Code::MISSING_FIELD,
         detail: "prepared model Manifest has no CozyTensors header".into(),
     })?;
-    let header = crate::checkpoint::load_header(store, header_ref)?;
-    crate::repository::require_digests(
-        evidence.digests()?.as_ref(),
-        &crate::checkpoint::digests(store, &header)?,
-    )?;
-    for (path, required) in evidence.required_files()? {
-        if !manifest
-            .entries()
-            .iter()
-            .any(|(candidate, entry)| candidate == path && entry == &Entry::File(required.clone()))
-        {
-            return refuse(
-                Code::NOT_CONTAINED,
-                format!("prepared CheckpointEvidence file {path:?} is outside its Manifest"),
-            );
-        }
-        let metadata =
-            fs::metadata(store.object_path(&required.sha256)).map_err(|error| Refusal {
-                code: Code::OBJECT_ABSENT,
-                detail: format!("prepared evidence object {}: {error}", required.id()),
-            })?;
-        if metadata.len() != required.length {
-            return refuse(
-                Code::LENGTH_MISMATCH,
-                format!(
-                    "prepared evidence object {} has the wrong length",
-                    required.id()
-                ),
-            );
-        }
-        store.verify(&required.sha256)?;
-    }
+    crate::checkpoint::load_header(store, header_ref)?;
+    crate::checkpoint::walk_cozytensors(store, &manifest)?.require_resident(store)?;
     Ok(())
 }
 
@@ -1103,7 +958,6 @@ fn prepare_model_source_with_registry(
                         profile: row.profile,
                         manifest_digest: format!("sha256:{}", row.manifest_sha256),
                         manifest_length: row.manifest_length,
-                        checkpoint_evidence_canonical_bytes: row.checkpoint_evidence,
                     })
                     .collect(),
             };
@@ -1144,19 +998,12 @@ fn prepare_model_source_with_registry(
                 }
             }
         }
-        let (manifest, checkpoint_evidence_canonical_bytes) = execute_prepared(
-            store,
-            &request.operation_id,
-            &prepared,
-            &request.source_uri,
-            &request.declared_license,
-        )?;
+        let manifest = execute_prepared(store, &request.operation_id, &prepared)?;
         sources.push(PreparedModelSource {
             slot: requested.slot.clone(),
             profile: requested.profile.clone(),
             manifest_digest: manifest.id(),
             manifest_length: manifest.length,
-            checkpoint_evidence_canonical_bytes,
         });
         validate_prepared_result(store, sources.last().expect("just pushed source result"))?;
     }
@@ -1173,7 +1020,6 @@ fn prepare_model_source_with_registry(
                 .trim_start_matches("sha256:")
                 .to_string(),
             manifest_length: source.manifest_length,
-            checkpoint_evidence: source.checkpoint_evidence_canonical_bytes.clone(),
         })
         .collect();
     catalog.commit_source_preparation(&request.operation_id, &digest, &rows)?;
@@ -1238,7 +1084,7 @@ mod tests {
             dialect: "safetensors.diffusers".into(),
             component: component.into(),
             converter: "diffusers.identity/1".into(),
-            topology_digest: observed.topology_digest,
+            tensor_schema_digest: observed.tensor_schema_digest,
             logical_keys: observed.logical_keys as u64,
             provenance: Provenance {
                 kind: REAL.into(),
@@ -1324,8 +1170,6 @@ mod tests {
                     path: second_path,
                 },
             ],
-            source_uri: format!("hf://org/model@{}", "22".repeat(20)),
-            declared_license: "apache-2.0".into(),
         };
         (store, registry.to_bytes(), request)
     }
@@ -1352,23 +1196,6 @@ mod tests {
                 length: source.manifest_length,
             };
             store.read_manifest(&reference).unwrap();
-            let evidence =
-                CheckpointEvidence::parse(&source.checkpoint_evidence_canonical_bytes).unwrap();
-            let ingest = evidence.ingest().unwrap().unwrap();
-            assert_eq!(
-                ingest.source_uri.as_deref(),
-                Some(request.source_uri.as_str())
-            );
-            assert_eq!(
-                ingest.declared_license.as_deref(),
-                Some(request.declared_license.as_str())
-            );
-            assert!(matches!(
-                evidence.verification().unwrap(),
-                Some(VerificationEvidence::ApprovedProducer { ref implementation, ref recipe })
-                    if implementation == &ingest.converter_build
-                        && recipe == &ingest.converter_recipe
-            ));
         }
         let catalog = Catalog::open(store.root()).unwrap();
         let holds = catalog.held_keys().unwrap();
@@ -1386,14 +1213,6 @@ mod tests {
         assert_eq!(replay.sources, first.sources);
 
         let mut changed = request.clone();
-        changed.declared_license = "other".into();
-        assert_eq!(
-            prepare_model_source_with_registry(&store, &changed, "fixture:registry", &registry,)
-                .unwrap_err()
-                .code,
-            Code::TRANSACTION_CONFLICT
-        );
-        changed = request.clone();
         changed.files[0].object_id = format!("sha256:{}", "33".repeat(32));
         assert_eq!(
             prepare_model_source_with_registry(&store, &changed, "fixture:registry", &registry,)

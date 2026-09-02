@@ -454,7 +454,6 @@ mod tests {
     use super::*;
     use crate::dtype::Dtype;
     use crate::header::{Asset, Body, Closure, Header, Part, Tensor};
-    use crate::ids::ConfigRef;
     use crate::manifest::{Draft, Entry, Manifest};
     use crate::meta::Meta;
     use crate::registry;
@@ -617,14 +616,7 @@ mod tests {
             .put_stream(&mut part_bytes.as_slice(), Some(&part), &Fault::default())
             .unwrap();
         let header_document = Header {
-            configs: vec![(
-                "model".into(),
-                ConfigRef {
-                    sha256: config.sha256.clone(),
-                    length: config.length,
-                    media_type: "application/json".into(),
-                },
-            )],
+            configs: vec![("model".into(), config_bytes.to_vec())],
             assets: vec![(
                 "tokenizer/vocab.txt".into(),
                 Asset {
@@ -684,17 +676,21 @@ mod tests {
 
         let runtime = checkpoint::walk_cozytensors(&store, &manifest).unwrap();
         assert_eq!(runtime.count("header"), 1);
-        assert_eq!(runtime.count("config"), 1);
+        assert_eq!(runtime.count("config"), 0);
         assert_eq!(runtime.count("model_asset"), 1);
         assert_eq!(runtime.count("part"), 1);
-        assert_eq!(runtime.distinct().len(), 4);
+        assert_eq!(runtime.distinct().len(), 3);
         assert!(runtime.siblings.is_empty());
         runtime.require_resident(&store).unwrap();
 
         let snapshot = checkpoint::walk(&store, &manifest).unwrap();
         assert_eq!(
             snapshot.siblings,
-            vec!["README.txt".to_string(), "samples/example.png".to_string()]
+            vec![
+                "README.txt".to_string(),
+                "model/config.json".to_string(),
+                "samples/example.png".to_string(),
+            ]
         );
         assert!(snapshot.objects.iter().any(|reached| reached.obj == readme));
         assert!(snapshot.objects.iter().any(|reached| reached.obj == sample));
@@ -703,14 +699,14 @@ mod tests {
             Code::OBJECT_ABSENT
         );
 
-        let declared = vec![header, config, tokenizer, part];
+        let declared = vec![header, tokenizer, part];
         let (plan, _) = FetchPlan::of(&store, "runtime", &manifest_ref, &declared).unwrap();
         plan.complete_cozytensors(&store).unwrap();
         assert_eq!(plan.complete(&store).unwrap_err().code, Code::NOT_CONTAINED);
 
         let meta = Meta::open(&store).unwrap();
         let (lease, _) = read::acquire_cozytensors(&store, &meta, &manifest).unwrap();
-        assert_eq!(lease.objects().len(), 4);
+        assert_eq!(lease.objects().len(), 3);
         lease.release(&meta).unwrap();
         assert_eq!(
             read::acquire_manifest(&store, &meta, &manifest)

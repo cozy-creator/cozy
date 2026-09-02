@@ -1,4 +1,4 @@
 doc: machine_grade
 expect: ok
-id: sha256:623096d2e2a764f2092061fd819447b13d34df530c1ddccc1a89a1d5b0cc3692
+id: sha256:77953b478236dd552e67ddd6bf21071f5b5eea00db91948a45f3c9ccf949a2e8
 note: COMPATIBLE carries no remedy, and every remedy_* key is present and empty

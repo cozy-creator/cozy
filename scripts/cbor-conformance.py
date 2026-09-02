@@ -97,8 +97,8 @@ def red_vectors() -> dict[str, tuple[bytes, str]]:
     long_digest[3] = [[b"\x11" * 33, 470]]
     unsorted = list(root)
     unsorted[1] = [
-        ["z", b"\x01" * 32, 1, "application/json"],
-        ["a", b"\x02" * 32, 1, "application/json"],
+        ["z", b"{}"],
+        ["a", b"{}"],
     ]
     rank = list(root)
     rank[4] = [
@@ -108,8 +108,8 @@ def red_vectors() -> dict[str, tuple[bytes, str]]:
     empty_segments[4][0][1][0][4][0][3] = []
     uncited = copy.deepcopy(root)
     uncited[3].append([b"\x22" * 32, 512])
-    zero_config = copy.deepcopy(root)
-    zero_config[1] = [["a", b"\x33" * 32, 0, "application/json"]]
+    empty_config = copy.deepcopy(root)
+    empty_config[1] = [["a", b""]]
     zero_encoding = copy.deepcopy(root)
     zero_encoding[3][0][1] = 0
     bool_bits = copy.deepcopy(root)
@@ -134,9 +134,9 @@ def red_vectors() -> dict[str, tuple[bytes, str]]:
     segmented_under = copy.deepcopy(root)
     segmented_under[4][0][1][0][4][0][3] = [[b"\xaa" * 32, 4]]
     overflow = copy.deepcopy(root)
-    overflow[1] = [
-        ["a", b"\x33" * 32, (1 << 64) - 1, "application/json"],
-        ["b", b"\x44" * 32, (1 << 64) - 1, "application/json"],
+    overflow[2] = [
+        ["a", b"\x33" * 32, (1 << 64) - 1, "application/octet-stream", [[b"\x33" * 32, (1 << 64) - 1]]],
+        ["b", b"\x44" * 32, (1 << 64) - 1, "application/octet-stream", [[b"\x44" * 32, (1 << 64) - 1]]],
     ]
     huge_encoding_index = copy.deepcopy(root)
     huge_encoding_index[4][0][1][0][3] = (1 << 64) - 1
@@ -146,7 +146,7 @@ def red_vectors() -> dict[str, tuple[bytes, str]]:
     def bad_name(field: str) -> list[Any]:
         value = copy.deepcopy(root)
         if field == "config":
-            value[1] = [["bad name", b"\x33" * 32, 1, "application/json"]]
+            value[1] = [["bad name", b"{}"]]
         elif field == "component":
             value[4][0][0] = "bad name"
         elif field == "tensor":
@@ -219,9 +219,9 @@ def red_vectors() -> dict[str, tuple[bytes, str]]:
             cbor2.dumps(uncited, canonical=True),
             "every encoding row is cited",
         ),
-        "zero-config-length": (
-            cbor2.dumps(zero_config, canonical=True),
-            "config objects are non-empty",
+        "empty-config": (
+            cbor2.dumps(empty_config, canonical=True),
+            "inline configs are JSON objects",
         ),
         "zero-encoding-length": (
             cbor2.dumps(zero_encoding, canonical=True),

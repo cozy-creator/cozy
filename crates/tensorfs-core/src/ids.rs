@@ -68,38 +68,6 @@ impl ObjectRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigRef {
-    pub sha256: String,
-    pub length: u64,
-    pub media_type: String,
-}
-
-impl ConfigRef {
-    pub fn from_value(v: &Value) -> Result<ConfigRef> {
-        let mut f = Fields::new("ConfigRef", v)?;
-        let length = f.req_uint("length")?;
-        let media_type = f.req_str("media_type")?.to_string();
-        let sha256 = hex64("ConfigRef", f.req_str("sha256")?)?;
-        f.done()?;
-        if media_type.is_empty() || media_type.len() > 128 {
-            return refuse(Code::KEY_GRAMMAR, "ConfigRef.media_type out of bounds");
-        }
-        Ok(ConfigRef {
-            sha256,
-            length,
-            media_type,
-        })
-    }
-    pub fn to_value(&self) -> Value {
-        Value::obj(vec![
-            ("length", Value::uint(self.length)),
-            ("media_type", Value::str(self.media_type.clone())),
-            ("sha256", Value::str(self.sha256.clone())),
-        ])
-    }
-}
-
 /// Every identity-bearing tensorfs document: one canonical encoding, one id.
 pub trait Doc: Sized {
     const FORMAT: &'static str;

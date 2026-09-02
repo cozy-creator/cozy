@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: NONCANONICAL_ENCODING
+note: inline configs store exactly their RFC 8785 bytes

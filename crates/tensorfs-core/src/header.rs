@@ -1,10 +1,10 @@
 //! The `cozytensors/1` header: one uniform per-tensor form (logical + spec-digest encoding
-//! + exact parts), configs by reference, and the frozen topology projection.
+//! + exact parts), inline canonical configs, and the frozen tensor-schema projection.
 
 use crate::canon::Value;
 use crate::dtype::{checked_bytes, checked_elements, Dtype};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::ids::{ascii_name, ConfigRef, ObjectRef};
+use crate::ids::{ascii_name, ObjectRef};
 use crate::limits;
 use crate::spec::EncodingSpec;
 
@@ -103,7 +103,8 @@ pub struct Asset {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Header {
-    pub configs: Vec<(String, ConfigRef)>,
+    /// Named construction configs as their exact canonical RFC 8785 JSON bytes.
+    pub configs: Vec<(String, Vec<u8>)>,
     pub assets: Vec<(String, Asset)>,
     pub encodings: Vec<EncodingSpec>,
     pub components: Vec<(String, Vec<(String, Tensor)>)>,
@@ -282,104 +283,50 @@ impl Part {
     }
 }
 
-/// Domain separator for topology identity. This exact literal remains in the hash preimage
-/// so existing topology digests do not move; it is not a stored document format.
-pub const TOPOLOGY_IDENTITY_DOMAIN: &str = "cozytensors.topology/1";
+/// Domain-separated exact logical tensor schema: component -> key -> {dtype, shape}.
+pub const TENSOR_SCHEMA_DOMAIN: &str = "cozytensors.tensor-schema/1";
 
-/// Domain separator for the SHAPE-ONLY projection. A distinct literal on purpose: the two
-/// projections are different questions, and a shared domain would let a shape digest be
-/// mistaken for an exact one in a bucket key.
-pub const TOPOLOGY_SHAPE_DOMAIN: &str = "cozytensors.topology.shape/1";
-
-/// What `tfs ingest` derives from a header and stores on the checkpoint row: identity,
-/// the fit index, and the construction document's identity (design §2). `config_digest`
-/// is absent exactly when the header names no config: there is no construction document
-/// to digest, and the hub refuses to serve one (`checkpoint.config_absent`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Digests {
-    pub topology_digest: String,
-    pub shape_digest: String,
-    pub config_digest: Option<String>,
-}
-
-/// Which topology question a digest answers.
-///
-/// `Identity` is the exact index: a hit means the logical {dtype, shape} sets agree.
-/// `ShapeOnly` elides the dtype leaf, so everything that differs ONLY by dtype or encoding
-/// lands in one bucket — which is exactly the CONVERTIBLE/PRODUCIBLE candidate set. Catalog
-/// search is then three cheap steps: an exact-digest hit is COMPATIBLE, a shape-digest hit
-/// is worth grading, and everything else is INCOMPATIBLE without grading at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Projection {
-    Identity,
-    ShapeOnly,
-}
-
-impl Projection {
-    pub fn domain(self) -> &'static str {
-        match self {
-            Projection::Identity => TOPOLOGY_IDENTITY_DOMAIN,
-            Projection::ShapeOnly => TOPOLOGY_SHAPE_DOMAIN,
-        }
-    }
-}
-
-/// The ONE topology projection: component → key → logical {dtype, shape}. A real header and
-/// reviewed structure data must produce the same bytes for the same structure, so they call
-/// the same function over the same iterator shape rather than each building a map.
-///
-/// Both digests come out of THIS body. The only thing `projection` changes is whether the
-/// leaf carries its dtype and which domain separator is stamped; grouping, ordering and
-/// canonical form are shared code, so the exact digest and the shape digest cannot drift
-/// apart under an edit — a change to how a topology is projected moves both or neither.
-pub fn topology_projection<'a>(
-    projection: Projection,
+pub fn tensor_schema_value<'a>(
     items: impl Iterator<Item = (&'a str, &'a str, Dtype, &'a [u64])>,
 ) -> Value {
-    let mut comps: Vec<(String, Vec<(String, Value)>)> = Vec::new();
-    for (c, k, dtype, shape) in items {
-        let mut leaf = Vec::with_capacity(2);
-        if projection == Projection::Identity {
-            leaf.push(("dtype", Value::str(dtype.name())));
-        }
-        leaf.push(("shape", shape_value(shape)));
-        let leaf = Value::obj(leaf);
-        match comps.iter_mut().find(|(n, _)| n == c) {
-            Some((_, ks)) => ks.push((k.to_string(), leaf)),
-            None => comps.push((c.to_string(), vec![(k.to_string(), leaf)])),
+    let mut components: Vec<(String, Vec<(String, Value)>)> = Vec::new();
+    for (component, key, dtype, shape) in items {
+        let tensor = Value::obj(vec![
+            ("dtype", Value::str(dtype.name())),
+            ("shape", shape_value(shape)),
+        ]);
+        match components.iter_mut().find(|(name, _)| name == component) {
+            Some((_, tensors)) => tensors.push((key.to_string(), tensor)),
+            None => components.push((component.to_string(), vec![(key.to_string(), tensor)])),
         }
     }
     Value::obj(vec![
         (
             "components",
             Value::map(
-                comps
+                components
                     .into_iter()
-                    .map(|(c, ks)| (c, Value::map(ks)))
+                    .map(|(name, tensors)| (name, Value::map(tensors)))
                     .collect(),
             ),
         ),
-        ("projection", Value::str(projection.domain())),
+        ("schema", Value::str(TENSOR_SCHEMA_DOMAIN)),
     ])
 }
 
-/// The exact projection. Kept as its own name because it is the identity index every
-/// existing document already froze.
-pub fn topology_value<'a>(
-    items: impl Iterator<Item = (&'a str, &'a str, Dtype, &'a [u64])>,
-) -> Value {
-    topology_projection(Projection::Identity, items)
+pub fn tensor_schema_digest_of(value: &Value) -> String {
+    crate::ids::object_id(&crate::canon::write(value))
 }
-
-/// The shape-only projection — the same body with the dtype leaf elided.
-pub fn topology_shape_value<'a>(
-    items: impl Iterator<Item = (&'a str, &'a str, Dtype, &'a [u64])>,
-) -> Value {
-    topology_projection(Projection::ShapeOnly, items)
-}
-
-pub fn topology_digest_of(v: &Value) -> String {
-    crate::ids::object_id(&crate::canon::write(v))
+/// Parse one bounded JSON object and return its single RFC 8785 byte spelling.
+pub fn canonical_config(what: &str, input: &[u8]) -> Result<Vec<u8>> {
+    let document = crate::jcs::parse(input, limits::DOC_MAX_BYTES).map_err(|error| Refusal {
+        code: error.code,
+        detail: format!("{what}: {}", error.detail),
+    })?;
+    if !matches!(document, crate::jcs::Json::Obj(_)) {
+        return refuse(Code::WRONG_TYPE, format!("{what} is not a JSON object"));
+    }
+    Ok(crate::jcs::write(&document))
 }
 
 impl Header {
@@ -389,102 +336,15 @@ impl Header {
             .flat_map(|(c, ts)| ts.iter().map(move |(k, t)| (c, k, t)))
     }
 
-    pub fn projected(&self, projection: Projection) -> Value {
-        topology_projection(
-            projection,
+    pub fn tensor_schema(&self) -> Value {
+        tensor_schema_value(
             self.tensors()
                 .map(|(c, k, t)| (c.as_str(), k.as_str(), t.dtype, t.shape.as_slice())),
         )
     }
 
-    pub fn topology_value(&self) -> Value {
-        self.projected(Projection::Identity)
-    }
-
-    pub fn topology_digest(&self) -> String {
-        topology_digest_of(&self.topology_value())
-    }
-
-    /// The FIT index (D4): the same projection with the dtype elided. Two checkpoints with
-    /// equal `shape_digest` fit the same code; `topology_digest` is identity.
-    pub fn shape_digest(&self) -> String {
-        topology_digest_of(&self.projected(Projection::ShapeOnly))
-    }
-
-    /// The construction document (design §2): what the factory consumes, assembled from
-    /// the exact bytes of every config the header names — one config is the document
-    /// itself; several become the name-keyed map — in the interoperable JCS profile
-    /// (`jcs.rs`). Byte-identical to the hub's `ConstructionDocument` and cozy-runtime's
-    /// `model_config.construction_document`, so its sha256 is the one `config_digest` a
-    /// derive is keyed by. `None` when the header names no config. The supplied bytes must
-    /// be exactly the objects the header references, by name, sha256 and length.
-    pub fn construction_document(&self, configs: &[(String, Vec<u8>)]) -> Result<Option<Vec<u8>>> {
-        if configs.len() != self.configs.len() {
-            return refuse(
-                Code::MISSING_FIELD,
-                format!(
-                    "header names {} configs, {} supplied",
-                    self.configs.len(),
-                    configs.len()
-                ),
-            );
-        }
-        let mut members = Vec::with_capacity(self.configs.len());
-        for (name, c) in &self.configs {
-            let Some((_, bytes)) = configs.iter().find(|(n, _)| n == name) else {
-                return refuse(Code::MISSING_FIELD, format!("config {name:?} not supplied"));
-            };
-            if bytes.len() as u64 != c.length {
-                return refuse(
-                    Code::LENGTH_MISMATCH,
-                    format!(
-                        "config {name:?}: {} bytes supplied, header says {}",
-                        bytes.len(),
-                        c.length
-                    ),
-                );
-            }
-            let got = crate::sha256::hex_digest(bytes);
-            if got != c.sha256 {
-                return refuse(
-                    Code::OBJECT_ID_MISMATCH,
-                    format!(
-                        "config {name:?}: sha256:{got} supplied, header says sha256:{}",
-                        c.sha256
-                    ),
-                );
-            }
-            let document =
-                crate::jcs::parse(bytes, limits::DOC_MAX_BYTES).map_err(|e| Refusal {
-                    code: e.code,
-                    detail: format!("config {name:?}: {}", e.detail),
-                })?;
-            if !matches!(document, crate::jcs::Json::Obj(_)) {
-                return refuse(
-                    Code::WRONG_TYPE,
-                    format!("config {name:?} is not an object"),
-                );
-            }
-            members.push((name.clone(), document));
-        }
-        let document = match members.len() {
-            0 => return Ok(None),
-            1 => members.pop().expect("one member").1,
-            _ => crate::jcs::Json::object(members)?,
-        };
-        Ok(Some(crate::jcs::write(&document)))
-    }
-
-    /// The three catalog digests a checkpoint row carries (design §2), from the header and
-    /// the exact bytes of the configs it names.
-    pub fn digests(&self, configs: &[(String, Vec<u8>)]) -> Result<Digests> {
-        Ok(Digests {
-            topology_digest: self.topology_digest(),
-            shape_digest: self.shape_digest(),
-            config_digest: self
-                .construction_document(configs)?
-                .map(|document| crate::ids::object_id(&document)),
-        })
+    pub fn tensor_schema_digest(&self) -> String {
+        tensor_schema_digest_of(&self.tensor_schema())
     }
 
     /// Closure-independent schema, geometry, ordering and aggregate-limit validation.
@@ -517,20 +377,10 @@ impl Header {
         )?;
         for (name, config) in &self.configs {
             ascii_name("config", name, limits::MAX_NAME_BYTES)?;
-            crate::ids::hex64("config digest", &config.sha256)?;
-            if config.length == 0 {
-                return refuse(Code::ZERO_ELEMENT, format!("config {name:?} is empty"));
-            }
-            if config.media_type.is_empty()
-                || config.media_type.len() > 128
-                || !config
-                    .media_type
-                    .bytes()
-                    .all(|byte| (0x20..=0x7e).contains(&byte))
-            {
+            if canonical_config(&format!("config {name:?}"), config)? != *config {
                 return refuse(
-                    Code::KEY_GRAMMAR,
-                    format!("config {name:?}: bad media type"),
+                    Code::NONCANONICAL_ENCODING,
+                    format!("config {name:?} is not its RFC 8785 canonical byte string"),
                 );
             }
         }
@@ -605,21 +455,18 @@ impl Header {
         let mut cited = vec![false; self.encodings.len()];
         let mut count = 0usize;
         // Whole-DOCUMENT totals, not only per-part counts.
-        let mut refs = self
+        let mut refs = asset_refs;
+        let mut total_bytes = self
             .configs
-            .len()
-            .checked_add(asset_refs)
-            .ok_or_else(|| Refusal {
-                code: Code::ARITH_OVERFLOW,
-                detail: "header reference total overflows".into(),
+            .iter()
+            .try_fold(asset_bytes, |total, (_, config)| {
+                total
+                    .checked_add(config.len() as u64)
+                    .ok_or_else(|| Refusal {
+                        code: Code::ARITH_OVERFLOW,
+                        detail: "header inline-byte total overflows".into(),
+                    })
             })?;
-        let mut total_bytes = asset_bytes;
-        for length in self.configs.iter().map(|(_, config)| config.length) {
-            total_bytes = total_bytes.checked_add(length).ok_or_else(|| Refusal {
-                code: Code::ARITH_OVERFLOW,
-                detail: "header referenced-byte total overflows".into(),
-            })?;
-        }
         if refs > limits::MAX_TOTAL_REFS {
             return refuse(Code::TOTAL_REFS_CAP, "header reference total over cap");
         }
@@ -933,14 +780,12 @@ impl Header {
             .enumerate()
         {
             let what = format!("configs[{i}]");
-            let values = row(&what, value, 4)?;
+            let values = row(&what, value, 2)?;
             configs.push((
                 as_str(&what, "name", &values[0])?.to_string(),
-                ConfigRef {
-                    sha256: digest(&what, &values[1])?,
-                    length: uint(&what, &values[2])?,
-                    media_type: as_str(&what, "media_type", &values[3])?.to_string(),
-                },
+                as_str(&what, "canonical_json", &values[1])?
+                    .as_bytes()
+                    .to_vec(),
             ));
         }
         let mut assets = Vec::new();
@@ -1118,9 +963,11 @@ impl Header {
                         .map(|(name, config)| {
                             Value::arr(vec![
                                 Value::str(name),
-                                Value::str(format!("sha256:{}", config.sha256)),
-                                Value::uint(config.length),
-                                Value::str(&config.media_type),
+                                Value::str(
+                                    std::str::from_utf8(config)
+                                        .expect("validated config is UTF-8")
+                                        .to_string(),
+                                ),
                             ])
                         })
                         .collect(),
@@ -1161,5 +1008,32 @@ impl crate::ids::StoredDoc for Header {
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
         crate::cbor::decode_header(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn construction_configs_have_one_bounded_canonical_json_spelling() {
+        assert_eq!(
+            canonical_config("config", br#" { "z":1.0, "a": -0 } "#).unwrap(),
+            br#"{"a":0,"z":1}"#
+        );
+        for (input, code) in [
+            (br#"{"a":1,"a":2}"#.as_slice(), Code::DUPLICATE_KEY),
+            (br#"{"a":1} trailing"#.as_slice(), Code::TRAILING_BYTES),
+            (br#"{"a":NaN}"#.as_slice(), Code::MALFORMED_JSON),
+            (br#"[1,2]"#.as_slice(), Code::WRONG_TYPE),
+        ] {
+            assert_eq!(canonical_config("config", input).unwrap_err().code, code);
+        }
+        assert_eq!(
+            canonical_config("config", &vec![b' '; limits::DOC_MAX_BYTES + 1])
+                .unwrap_err()
+                .code,
+            Code::SIZE_CAP
+        );
     }
 }

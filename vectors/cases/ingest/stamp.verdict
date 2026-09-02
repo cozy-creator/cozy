@@ -1,4 +1,4 @@
 doc: stamp
 expect: ok
-id: sha256:014f4ed600120d87413f37a68aa41425dafeef9c58a04d8a484628d0b6aaf551
+id: sha256:1618fa3d6fe7755070f3e5eb4e3b37070fbf6fd8ba77ac626570e3b925eb9b44
 note: the verified ledger: topology, candidate set, converter, golden, accounting

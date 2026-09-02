@@ -796,7 +796,13 @@ fn tfs_status(args: &[&str], stdin: Option<&[u8]>) -> (bool, String, String) {
     {
         let mut pipe = child.stdin.take().expect("stdin");
         if let Some(bytes) = stdin {
-            pipe.write_all(bytes).expect("write stdin");
+            if let Err(error) = pipe.write_all(bytes) {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe,
+                    "write stdin: {error}"
+                );
+            }
         }
     }
     let out = child.wait_with_output().expect("wait");

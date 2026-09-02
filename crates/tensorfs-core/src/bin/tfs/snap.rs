@@ -89,16 +89,6 @@ fn add_ref(refs: &mut BTreeMap<String, u64>, object: &ObjectRef, what: &str) -> 
 
 fn referenced_blobs(header: &Header, draft: &Draft) -> Result<BTreeMap<String, u64>> {
     let mut refs = BTreeMap::new();
-    for (_, config) in &header.configs {
-        add_ref(
-            &mut refs,
-            &ObjectRef {
-                sha256: config.sha256.clone(),
-                length: config.length,
-            },
-            "config",
-        )?;
-    }
     for (_, asset) in &header.assets {
         for segment in &asset.segments {
             add_ref(&mut refs, segment, "asset segment")?;

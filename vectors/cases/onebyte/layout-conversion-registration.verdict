@@ -1,3 +1,3 @@
 doc: conversion_registration
 expect: mutant
-note: one byte flipped at offset 93 of sha256:9a457ade6cbd92479891d70237fe0390bc69406ce27675b8d324491fd412617b
+note: one byte flipped at offset 93 of sha256:3313e97516b628c31a25ef37ae2a6cf190a04ca5336e0b5d9e8efc0411c11ad2

@@ -1,6 +1,5 @@
 doc: code_topology
 expect: ok
 id: sha256:751143c47937f0ef8bdbf9ed551bcf1fefb14297bc4d49dbf715e19ab4c89d4b
-topology: sha256:a9fa575cfde5f2af9350f2f24831f1bcd37df3124086d73aae9adedfaf9e610a
-shape: sha256:a1c61fad25156e0ed3b044d5fb42590be8500a89bece19270c4bde631eb5179a
-note: the same contract with only the dtypes recast: a DIFFERENT exact topology digest and the SAME shape digest
+tensor_schema: sha256:3c9af9e6769dc31e8e86ea1e5acbaeeb38780a7bb7e631bcec1e6271c59caa24
+note: the same contract with only the dtypes recast: a different tensor schema digest
