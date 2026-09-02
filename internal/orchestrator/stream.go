@@ -86,6 +86,29 @@ func (c *Orchestrator) LatestFrame(requestID string) (Frame, bool) {
 	return frame, ok
 }
 
+// LatestCompletion is the last real 0..1 completion fraction Runtime reported for this
+// attempt. It is live-only like the frame itself: enough for an observational UI, never a
+// durable lifecycle fact or an invented estimate.
+func (c *Orchestrator) LatestCompletion(requestID string, attempt uint64) (float64, bool) {
+	frame, ok := c.LatestFrame(requestID)
+	if !ok || frame.Attempt != attempt {
+		return 0, false
+	}
+	return progressFraction(frame.Value)
+}
+
+func progressFraction(value any) (float64, bool) {
+	fraction, ok := value.(float64)
+	if fields, isMap := value.(map[string]any); isMap {
+		for _, key := range []string{"fraction", "value"} {
+			if fraction, ok = fields[key].(float64); ok {
+				break
+			}
+		}
+	}
+	return fraction, ok && fraction >= 0 && fraction <= 1
+}
+
 // count is how many clients are attached right now — the API's open SSE streams.
 func (f *fanout) count() int {
 	f.mu.Lock()

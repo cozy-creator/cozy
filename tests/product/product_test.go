@@ -176,14 +176,15 @@ func TestProductPath(t *testing.T) {
 	assertNoAttemptRoot(t, root)
 
 	type listedRun struct {
-		Number    string `json:"number"`
-		ID        string `json:"id"`
-		Kind      string `json:"kind"`
-		Target    string `json:"target"`
-		Machine   string `json:"machine"`
-		Status    string `json:"status"`
-		Queued    string `json:"queued"`
-		Execution string `json:"execution"`
+		Number     string `json:"number"`
+		ID         string `json:"id"`
+		Kind       string `json:"kind"`
+		Target     string `json:"target"`
+		Machine    string `json:"machine"`
+		Status     string `json:"status"`
+		Completion string `json:"completion"`
+		Queued     string `json:"queued"`
+		Execution  string `json:"execution"`
 	}
 	listRuns := func() []listedRun {
 		t.Helper()
@@ -207,7 +208,7 @@ func TestProductPath(t *testing.T) {
 		number, err := strconv.ParseInt(row.Number, 10, 64)
 		if err != nil || number < 1 || !strings.HasPrefix(row.ID, "req-") ||
 			row.Kind != "invocation" || !strings.HasSuffix(row.Queued, "s") ||
-			!strings.HasSuffix(row.Execution, "s") {
+			!strings.HasSuffix(row.Execution, "s") || row.Completion != "" {
 			t.Fatalf("run list row %d is not useful: %+v (%v)", index, row, err)
 		}
 		if row.Machine != "local" {
@@ -233,7 +234,8 @@ func TestProductPath(t *testing.T) {
 	}
 	if code, out := runCozy(t, root, "run", "list", "--limit", "2"); code != 0 ||
 		!strings.Contains(out, "NUMBER") || !strings.Contains(out, "MACHINE") ||
-		!strings.Contains(out, "QUEUED") || !strings.Contains(out, "EXECUTION") ||
+		!strings.Contains(out, "COMPLETION") || !strings.Contains(out, "EXECUTION") ||
+		strings.Contains(out, "QUEUED") ||
 		!strings.Contains(out, "local") ||
 		strings.Contains(out, "KIND") || strings.Index(out, runs[0].Number) > strings.Index(out, runs[1].Number) {
 		t.Fatalf("human run list columns/order are not useful [exit %d]\n%s", code, out)

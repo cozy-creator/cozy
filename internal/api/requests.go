@@ -640,6 +640,7 @@ type Lifecycle struct {
 	Attempts    int            `json:"attempts"`
 	QueuedMS    int64          `json:"queued_ms"`
 	ExecutionMS int64          `json:"execution_ms"`
+	Completion  *float64       `json:"completion,omitempty"`
 	ResponseURL string         `json:"response_url"`
 	Metrics     map[string]any `json:"metrics,omitempty"`
 	ErrorType   string         `json:"error_type,omitempty"`
@@ -729,6 +730,11 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	if life.Status == "queued" {
 		if position, depth := s.orchestrator.QueueState(row.ID); position > 0 {
 			life.QueuePosition, life.QueueDepth = &position, &depth
+		}
+	}
+	if life.Status == "in_progress" {
+		if completion, ok := s.orchestrator.LatestCompletion(row.ID, life.Attempt); ok {
+			life.Completion = &completion
 		}
 	}
 	if export, problem := s.store.OutputExportOf(row.ID); problem == nil && export != nil {
