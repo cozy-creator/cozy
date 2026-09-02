@@ -106,7 +106,7 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 			ArtifactStore: filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
 		}, nil
 	}
-	runtimeBin, e := HostRuntime()
+	runtimeBin, e := HostRuntime(f.RuntimeCLI.Env)
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}

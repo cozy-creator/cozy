@@ -367,7 +367,7 @@ type packagePreparation struct {
 func preparePackageSet(l home.Layout, installDir string, published *PublishedSource,
 ) (answer packagePreparation, refusal, problem *exit.Error) {
 	var empty packagePreparation
-	runtimeBin, problem := launch.HostRuntime()
+	runtimeBin, problem := launch.HostRuntime(config.Frozen().Tool())
 	if problem != nil {
 		return empty, nil, problem
 	}

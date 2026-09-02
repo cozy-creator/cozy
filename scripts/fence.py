@@ -177,6 +177,7 @@ RUNTIME_SITES = {
     "internal/install/install.go",
     "internal/install/published.go",
     "internal/launch/artifacts.go",
+    "internal/launch/host_runtime.go",
     "internal/packagepublish/package.go",
 }
 RUNTIME_BIN = re.compile(r'"cozy-runtime"')
@@ -186,7 +187,7 @@ RUNTIME_BIN = re.compile(r'"cozy-runtime"')
 # execution door the literal rule refuses; only the verification driver may (with a door).
 RUNTIME_INDIRECT = re.compile(r"launch\.Binary\s*\(|launch\.RuntimeCLI\s*\{")
 RUNTIME_INDIRECT_HOME = "internal/launch/"
-RUNTIME_VERBS_OK = {"describe", "doctor", "fit", "bindings"}
+RUNTIME_VERBS_OK = {"describe", "doctor", "fit", "bindings", "version"}
 RUNTIME_VERBS_DENY = {"run", "job", "serve", "rm", "pull", "ingest", "new"}
 
 # (cl-028) EMBEDDED SCRIPTS ARE SOURCE TOO. The impl family scans Go with string literals
