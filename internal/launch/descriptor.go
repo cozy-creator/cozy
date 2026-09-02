@@ -80,13 +80,19 @@ type WeightsModelContract struct {
 	Encodings      []string `json:"encodings"`
 }
 
-// Slot is one declared model binding path — capability, never selection.
+// Slot is one declared model binding path — capability, never selection. Its members
+// mirror cozy-runtime's `internal/descriptor.py` slot (cr-078a): `{class, component_use,
+// path}` plus the class's one keyword `encoded_leaves` and an optional `sequence_parallel`
+// document. `stamps` is a RETIRED member: every release published before the cut ships an
+// empty map, which reads as nothing declared, and a value in it refuses by name below.
 type Slot struct {
-	Class        string              `json:"class"`
-	Path         string              `json:"path"`
-	Param        string              `json:"-"`
-	Stamps       map[string]string   `json:"stamps"`
-	ComponentUse map[string][]string `json:"component_use"`
+	Class            string              `json:"class"`
+	Path             string              `json:"path"`
+	Param            string              `json:"-"`
+	ComponentUse     map[string][]string `json:"component_use"`
+	EncodedLeaves    string              `json:"encoded_leaves,omitempty"`
+	SequenceParallel json.RawMessage     `json:"sequence_parallel,omitempty"`
+	Stamps           map[string]string   `json:"stamps,omitempty"`
 }
 
 // Struct is a rendered msgspec struct.
@@ -179,6 +185,27 @@ func exactKeys(raw json.RawMessage, required, optional []string) (map[string]jso
 	return object, nil
 }
 
+// refuseRetiredSlotMembers is the reader-side half of cr-078a's hard cut, the same rule
+// cozy-runtime's `_refuse_retired` keeps: an EMPTY `stamps` map is what every release
+// published before the cut carries and reads as nothing declared; a stamp in it, or any
+// `source_profile` (cr-077), is a member the grammar deleted and refuses by name.
+func refuseRetiredSlotMembers(members map[string]json.RawMessage) error {
+	if raw, ok := members["stamps"]; ok {
+		var stamps map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &stamps); err != nil {
+			return fmt.Errorf("stamps must be an object")
+		}
+		if len(stamps) != 0 {
+			return fmt.Errorf("stamps are retired (model-code-fit D1); a semantic twin is a " +
+				"component name or a config fact")
+		}
+	}
+	if _, ok := members["source_profile"]; ok {
+		return fmt.Errorf("source_profile is retired (cr-077); capability is the slot's class annotation")
+	}
+	return nil
+}
+
 func validateClosedDescriptor(data []byte) error {
 	root, err := exactKeys(data,
 		[]string{"application", "entrypoints", "format", "jobs"}, nil)
@@ -212,10 +239,20 @@ func validateClosedDescriptor(data []byte) error {
 					return err
 				}
 				for _, slot := range slots {
-					if _, err := exactKeys(slot,
-						[]string{"class", "component_use", "path", "stamps"},
-						nil); err != nil {
+					members, err := exactKeys(slot,
+						[]string{"class", "component_use", "path"},
+						[]string{"encoded_leaves", "sequence_parallel", "stamps", "source_profile"})
+					if err != nil {
 						return err
+					}
+					if err := refuseRetiredSlotMembers(members); err != nil {
+						return err
+					}
+					if leaves, ok := members["encoded_leaves"]; ok {
+						var value string
+						if json.Unmarshal(leaves, &value) != nil || (value != "refuse" && value != "accept") {
+							return fmt.Errorf("encoded_leaves must be \"refuse\" or \"accept\"")
+						}
 					}
 				}
 			}
