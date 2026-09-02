@@ -1843,8 +1843,17 @@ func (c *Orchestrator) AwaitAccepted(requestID string, attempt uint64, timeout t
 const ClientCancelGraceMS uint64 = 5000
 
 // CancelClient is the client-reason cancel, for the callers that have no business
-// naming a protocol enum.
-func (c *Orchestrator) CancelClient(requestID string, attempt, graceMS uint64) *exit.Error {
+// naming a protocol enum. The actor is journaled BEFORE the cancel frame goes out
+// (cl-108): the attempt's canceled terminal arrives later from the worker, and joining
+// it back to WHO asked must survive a daemon restart in between.
+func (c *Orchestrator) CancelClient(requestID string, attempt, graceMS uint64, actor string) *exit.Error {
+	if actor == "" {
+		actor = "an unnamed client"
+	}
+	if e := c.opt.Store.AppendEvent(requestID, "request.cancel_requested", int64(attempt),
+		map[string]any{"actor": actor, "grace_ms": graceMS}); e != nil {
+		return e
+	}
 	return c.Cancel(requestID, attempt, pb.CancelReason_CANCEL_REASON_CLIENT, graceMS)
 }
 

@@ -224,6 +224,38 @@ func (s *Store) TerminalEventAt(requestID string) (string, *exit.Error) {
 	return at, nil
 }
 
+// CancelAttribution is who canceled this request. Every cancellation path records its
+// actor durably — in the queued terminal's own payload, or in the request.cancel_requested
+// event that precedes a live attempt's cancel frame — so a canceled run can always say
+// WHO, not merely that it ended.
+func (s *Store) CancelAttribution(requestID string) (actor, errType, errText string, problem *exit.Error) {
+	rows, err := s.db.Query(`SELECT type, payload FROM request_events
+		WHERE request_id=? AND type IN ('request.cancel_requested','request.canceled')
+		ORDER BY seq DESC`, requestID)
+	if err != nil {
+		return "", "", "", exit.Internalf("cannot read cancellation events for %s: %s", requestID, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var eventType, body string
+		if err := rows.Scan(&eventType, &body); err != nil {
+			return "", "", "", exit.Internalf("cannot read a cancellation event row: %s", err)
+		}
+		var payload map[string]any
+		if json.Unmarshal([]byte(body), &payload) != nil {
+			continue
+		}
+		if actor == "" {
+			actor, _ = payload["actor"].(string)
+		}
+		if eventType == "request.canceled" && errText == "" {
+			errType, _ = payload["error_type"].(string)
+			errText, _ = payload["error"].(string)
+		}
+	}
+	return actor, errType, errText, nil
+}
+
 // LastEventSeq is the current head of the stream. A client that wants only what happens
 // NEXT opens at the head instead of replaying history.
 func (s *Store) LastEventSeq() (int64, *exit.Error) {

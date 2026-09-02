@@ -571,7 +571,7 @@ func handleRunCancel(ctx *Context) *exit.Error {
 		fields := append(invocationFields(before), output.Field{K: "changed", V: false})
 		return emit(ctx, compactRecord(fields, "number", "target", "status", "changed"))
 	}
-	if problem := client.Cancel(id); problem != nil {
+	if problem := client.Cancel(id, "cozy run cancel"); problem != nil {
 		return problem
 	}
 	if _, problem := client.Watch(id, 0, func(localapi.Event) bool { return true }); problem != nil {
@@ -582,7 +582,11 @@ func handleRunCancel(ctx *Context) *exit.Error {
 		return problem
 	}
 	fields := append(invocationFields(after), output.Field{K: "changed", V: true})
-	return emit(ctx, compactRecord(fields, "number", "target", "status", "changed"))
+	defaults := []string{"number", "target", "status", "changed"}
+	if after.CanceledBy != "" {
+		defaults = append(defaults, "canceled_by")
+	}
+	return emit(ctx, compactRecord(fields, defaults...))
 }
 
 func handleRunList(ctx *Context) *exit.Error {
@@ -636,11 +640,17 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		if kind == "" {
 			kind = "invocation"
 		}
+		// A canceled run is LOUD about its cause (cl-108): the status cell itself names
+		// the recorded actor, so a list is never a quiet no-output ending.
+		status := life.Status
+		if life.Status == "canceled" && life.CanceledBy != "" {
+			status = "canceled by " + life.CanceledBy
+		}
 		list.Rows = append(list.Rows, map[string]string{
 			"number": strconv.FormatInt(life.Number, 10), "id": life.RequestID, "kind": kind,
 			"target": life.Package + "/" + life.Function, "machine": life.Machine,
 			"rental_id": life.RentalID,
-			"status":    life.Status,
+			"status":    status,
 			"queued":    seconds(life.QueuedMS), "execution": seconds(life.ExecutionMS),
 			"attempts": strconv.Itoa(life.Attempts), "created": life.CreatedAt,
 		})
@@ -707,13 +717,17 @@ func invocationFields(life api.Lifecycle) []output.Field {
 	if kind == "" {
 		kind = "invocation"
 	}
-	return []output.Field{
+	fields := []output.Field{
 		{K: "number", V: life.Number}, {K: "id", V: life.RequestID}, {K: "kind", V: kind},
 		{K: "target", V: life.Package + "/" + life.Function},
 		{K: "machine", V: life.Machine},
 		{K: "rental_id", V: life.RentalID},
 		{K: "status", V: life.Status}, {K: "attempts", V: life.Attempts},
 	}
+	if life.CanceledBy != "" {
+		fields = append(fields, output.Field{K: "canceled_by", V: life.CanceledBy})
+	}
+	return fields
 }
 
 func invocationSettled(status string) bool {
@@ -895,9 +909,12 @@ func runStatus(status string) string {
 }
 
 // watch consumes the request's own event stream to its terminal, rendering progress as
-// it goes. SIGINT does not kill this process: it CANCELS the request through the
-// orchestrator and keeps watching, because the attempt's own journaled terminal is what
-// settles it and a client that walked away would leave the card held.
+// it goes. A SIGNAL NEVER CANCELS THE RUN (cl-108): SIGINT/SIGTERM merely DETACHES this
+// client — the daemon owns the accepted run, which keeps running, exports, and stays
+// watchable — because a dying watcher is not a person asking for cancellation, and the
+// recurring "CLIENT_CANCELED on disconnect" silent-cancel is exactly what that
+// translation produced. Only `cozy run cancel` and the caller-authored `--timeout`
+// deadline cancel, and both are attributed.
 // watch returns the terminal event and WHY the client stopped waiting, which is not the
 // same question as what the terminal says: a canceled terminal caused by `--timeout` is
 // exit 10, because a caller that set a deadline wants to know the deadline is what
@@ -911,37 +928,39 @@ func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 	watchCtx, stopWatch := context.WithCancel(context.Background())
 	defer stopWatch()
 	stopped := make(chan string, 1)
-	forced := make(chan struct{}, 1)
 	cancelFailed := make(chan *exit.Error, 1)
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
-		reason, message := "", ""
 		select {
 		case _, ok := <-interrupt:
 			if !ok {
 				return
 			}
-			reason, message = "canceled", "cancel requested"
+			stopped <- "detached"
+			fmt.Fprintf(ctx.Err,
+				"\ndetached — the run keeps running; `cozy run watch %s` reattaches, `cozy run cancel %s` cancels\n",
+				requestID, requestID)
+			stopWatch()
+			return
 		case <-deadlineC(deadline):
 			// `--timeout` is a REQUEST DEADLINE the client enforces the only way a client
 			// honestly can: by asking the orchestrator to cancel. It is not the
 			// supervisor's watchdog deadline (that one is on the attempt, and this host
 			// has no wire field for it) — walking away instead would leave the card held.
-			reason, message = "deadline", fmt.Sprintf("--timeout %s expired", deadline)
+			stopped <- "deadline"
+			fmt.Fprintf(ctx.Err,
+				"\n--timeout %s expired; cancel requested — the attempt's own terminal still settles it\n",
+				deadline)
 		case <-done:
 			return
 		}
-		stopped <- reason
-		fmt.Fprintf(ctx.Err, "\n%s — the attempt's own terminal still settles it\n", message)
 		cancelResult := make(chan *exit.Error, 1)
-		go func() { cancelResult <- c.Cancel(requestID) }()
+		go func() { cancelResult <- c.Cancel(requestID, fmt.Sprintf("cozy run --timeout %s", deadline)) }()
 		select {
 		case <-interrupt:
-			fmt.Fprintln(ctx.Err, "second interrupt — stopped waiting; the request remains recorded")
-			forced <- struct{}{}
+			fmt.Fprintln(ctx.Err, "detached — the canceled terminal still lands in `cozy run list`")
 			stopWatch()
-			return
 		case problem := <-cancelResult:
 			if problem != nil {
 				fmt.Fprintf(ctx.Err, "cancel: %s\n", problem.Message)
@@ -954,8 +973,7 @@ func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 		}
 		select {
 		case <-interrupt:
-			fmt.Fprintln(ctx.Err, "second interrupt — stopped waiting; the request remains recorded")
-			forced <- struct{}{}
+			fmt.Fprintln(ctx.Err, "detached — the canceled terminal still lands in `cozy run list`")
 			stopWatch()
 		case <-done:
 		}
@@ -967,13 +985,6 @@ func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 	select {
 	case problem := <-cancelFailed:
 		return nil, "cancel_failed", problem
-	default:
-	}
-	select {
-	case <-forced:
-		return nil, "interrupted", exit.New(exit.Canceled,
-			"stopped waiting for %s; it remains visible in `cozy run list`", requestID).
-			WithNext("cozy run list")
 	default:
 	}
 	reason := ""
@@ -1529,6 +1540,9 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	if exportOwed {
 		shownStatus = life.Status + " (export pending: " + export.ErrorCode + ")"
 	}
+	if life.Status == "canceled" && life.CanceledBy != "" {
+		shownStatus = "canceled by " + life.CanceledBy
+	}
 	fields := []output.Field{
 		{K: "number", V: life.Number}, {K: "id", V: life.RequestID},
 		{K: "target", V: life.Package + "/" + life.Function},
@@ -1538,6 +1552,9 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		{K: "rental_id", V: life.RentalID},
 		{K: "status", V: shownStatus},
 		{K: "attempts", V: life.Attempts},
+	}
+	if life.CanceledBy != "" {
+		fields = append(fields, output.Field{K: "canceled_by", V: life.CanceledBy})
 	}
 	if life.Result != nil {
 		fields = append(fields, output.Field{K: "result", V: life.Result})
@@ -1622,6 +1639,13 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	if why != "" {
 		e.Message = fmt.Sprintf("request %s ended %s: %s — %s",
 			life.RequestID, status, errType, why)
+	}
+	// A canceled run is LOUD about WHO ended it (cl-108) — never a quiet no-output end.
+	if mapTerminal(status) == "canceled" && life.CanceledBy != "" {
+		e.Message = fmt.Sprintf("request %s was canceled by %s", life.RequestID, life.CanceledBy)
+		if why != "" {
+			e.Message += ": " + why
+		}
 	}
 	if life.Triage != nil {
 		e.WithRemedy("%s", triageRemedy(ctx, life.Triage, terminal))

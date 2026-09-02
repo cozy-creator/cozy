@@ -422,7 +422,14 @@ func (c *Orchestrator) kickModelTransferFinalizer(s *session, requestID string, 
 	}()
 }
 
-func (c *Orchestrator) CancelModelTransferFinalization(requestID string) *exit.Error {
+func (c *Orchestrator) CancelModelTransferFinalization(requestID, actor string) *exit.Error {
+	if actor == "" {
+		actor = "an unnamed client"
+	}
+	if e := c.opt.Store.AppendEvent(requestID, "request.cancel_requested", 0,
+		map[string]any{"actor": actor}); e != nil {
+		return e
+	}
 	if problem := c.opt.Store.RequestModelTransferCancellation(requestID); problem != nil {
 		return problem
 	}
