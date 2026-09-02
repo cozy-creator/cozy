@@ -454,6 +454,29 @@ var ignoredFile = map[string]bool{
 	"package.evaluated-config.json": true,
 }
 
+// ignoredSourceFile is the file half of the source rules: the fixed names above plus an
+// editor's own scratch (vim swap and backup, emacs lock and autosave), which is never source.
+func ignoredSourceFile(name string) bool {
+	return ignoredFile[name] || strings.HasSuffix(name, ".swp") || strings.HasSuffix(name, ".swo") ||
+		strings.HasSuffix(name, ".swx") || strings.HasSuffix(name, "~") ||
+		strings.HasPrefix(name, ".#") || (strings.HasPrefix(name, "#") && strings.HasSuffix(name, "#"))
+}
+
+// IgnoredSourcePath answers whether a source-relative path falls outside the tree the
+// source rules read: an ignored directory on its way (`.egg-info`, `__pycache__`, a
+// root-level `.venv`/`build`) or an ignored file at its end. The editable watcher asks
+// this so what the walk would never hash never wakes it.
+func IgnoredSourcePath(rel string) bool {
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	for index, part := range parts {
+		name := strings.ToLower(part)
+		if ignoredDir[name] || strings.HasSuffix(name, ".egg-info") || (index == 0 && ignoredRootDir[name]) {
+			return true
+		}
+	}
+	return ignoredSourceFile(strings.ToLower(parts[len(parts)-1]))
+}
+
 func sourceTree(tree string) (string, map[string]string, *exit.Error) {
 	root, err := filepath.Abs(tree)
 	if err != nil {
@@ -490,7 +513,7 @@ func sourceTree(tree string) (string, map[string]string, *exit.Error) {
 			}
 			return nil
 		}
-		if ignoredFile[name] {
+		if ignoredSourceFile(name) {
 			return nil
 		}
 		rel, err := filepath.Rel(root, file)

@@ -89,6 +89,10 @@ type DesiredPlacement struct {
 	ConfigDigest       string       `json:"config_digest"`
 	Entrypoints        []Entrypoint `json:"entrypoints"`
 	PlacementIDValue   string       `json:"placement_id,omitempty"`
+	// Models is the exact selection this placement was resolved with (empty = the package's
+	// own defaults). A projection like Entrypoints, never identity: the editable refresh
+	// re-prepares a worker under the same selection a run gave it.
+	Models []ModelRef `json:"models,omitempty"`
 	// Hidden names the entrypoints this placement deliberately does NOT serve (#572d).
 	// Recorded so an operator reading a placement can tell "no binding was staged" from
 	// "a binding was staged and broke".
@@ -374,6 +378,13 @@ type worker struct {
 	// desiredPrivatePlacement is the signed model-only join for the already-prepared private
 	// revision. It survives a control reconnect so pod-supervisor can replay its exact journal.
 	desiredPrivatePlacement *pb.DesiredPrivatePlacementSet
+	// desiredEpoch is the control-stream epoch the local desire above was issued on. A
+	// desire issued on the live session and not refused is in flight or done; the same one
+	// asked again waits on the pod's report rather than asking the pod to prepare twice.
+	desiredEpoch uint64
+	// localMu serializes ConvergeLocalPackage on this worker. It is never held by the
+	// control stream's receive loop, whose reports the holder waits on.
+	localMu sync.Mutex
 	// hostPrepareSeq numbers the logical desires issued through PodHost (proto-025); a
 	// prepare that completes for an older number sends nothing.
 	hostPrepareSeq uint64
@@ -844,6 +855,7 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 					PlacementIDValue: observed.placementID,
 					Entrypoints: []Entrypoint{{Name: logical.Function, Digest: planID,
 						Outputs: append([]string(nil), logical.Outputs...)}},
+					Models: append([]ModelRef(nil), logical.Models...),
 				}
 				w.remotePlacements[remotePlanKey(placement.Package, planID)] = placement
 				spec := w.spec

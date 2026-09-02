@@ -67,18 +67,29 @@ type localTransferStatus struct {
 }
 
 // ConvergeLocalPackage streams one sealed editable revision and then selects it. The
-// request row is the recovery authority: once every file acknowledgement is durable there,
-// reconnect sends only the exact DesiredLocalPackageSet and the pod replays its ledger.
-func (c *Orchestrator) ConvergeLocalPackage(instanceID, requestID string,
-	revision localpackage.Revision, uploadedBootID string,
+// request row is the recovery authority: once every file acknowledgement is durable there
+// (`uploaded` records the boot that verified them), reconnect sends only the exact
+// DesiredLocalPackageSet and the pod replays its ledger. The editable refresh converges
+// with no request and no durable marker: its next run proves the bytes again if it must.
+func (c *Orchestrator) ConvergeLocalPackage(instanceID, operationID string,
+	revision localpackage.Revision, uploadedBootID string, uploaded func(bootID string) *exit.Error,
 ) *exit.Error {
-	selected, transfer, problem := localSelection(requestID, revision)
+	selected, transfer, problem := localSelection(operationID, revision)
 	if problem != nil {
 		return problem
 	}
 	w, s, problem := c.localControl(instanceID)
 	if problem != nil {
 		return problem
+	}
+	// One local preparation at a time per pod: a run and the editable refresh converging
+	// the same revision must not each ask the pod to prepare over the other's placement.
+	w.localMu.Lock()
+	defer w.localMu.Unlock()
+	if c.localIssued(w, s, revision.Digest) {
+		c.logf("worker %s already has local revision %s issued on this session; waiting on it",
+			instanceID, shortDigest(revision.Digest))
+		return nil
 	}
 	if uploadedBootID != "" && uploadedBootID != s.bootID {
 		// The exact revision remains durable, but carrier verification is boot-scoped.
@@ -87,33 +98,91 @@ func (c *Orchestrator) ConvergeLocalPackage(instanceID, requestID string,
 	}
 	if uploadedBootID == "" {
 		for uploadedBootID == "" {
-			if problem := c.transferLocalPackage(instanceID, requestID, transfer); problem != nil {
+			if problem := c.transferLocalPackage(instanceID, operationID, transfer); problem != nil {
 				return problem
 			}
 			w, s, problem = c.localControl(instanceID)
 			if problem != nil {
 				return problem
 			}
-			if !c.localTransferVerified(requestID, transfer.revision, s) {
+			if !c.localTransferVerified(operationID, transfer.revision, s) {
 				continue
 			}
-			if problem := c.opt.Store.MarkLocalPackageUploaded(requestID, revision.Digest,
-				s.bootID); problem != nil {
-				return problem
+			if uploaded != nil {
+				if problem := uploaded(s.bootID); problem != nil {
+					return problem
+				}
 			}
 			uploadedBootID = s.bootID
 		}
 	}
+	if problem := c.hostNothing(instanceID, revision.Digest); problem != nil {
+		return problem
+	}
 	for {
 		if problem := c.issueLocalPackageSet(s, w, selected); problem == nil {
 			c.mu.Lock()
-			delete(c.localTransfers, requestID)
+			delete(c.localTransfers, operationID)
 			c.mu.Unlock()
 			return nil
 		}
 		w, s, problem = c.localControl(instanceID)
 		if problem != nil {
 			return problem
+		}
+	}
+}
+
+// hostNothing empties a pod that holds placements of other revisions and waits for the
+// empty set to converge. The pod's Runtime prepares a package only into an empty worker —
+// `package_prepare_worker_busy: replace the active package through desired state` — so the
+// second revision of an editable package, the edit-and-run loop itself, must unload the
+// first before it can be prepared. A pod already holding this revision is left alone.
+func (c *Orchestrator) hostNothing(instanceID, revision string) *exit.Error {
+	c.mu.Lock()
+	w := c.workers[instanceID]
+	var s *session
+	held := 0
+	holdsRevision := false
+	if w != nil {
+		s = c.sessions[w.bootID]
+		held = len(w.observedRemote)
+		_, holdsRevision = w.observedRemote[revision]
+	}
+	c.mu.Unlock()
+	if w == nil || s == nil || held == 0 || holdsRevision {
+		return nil
+	}
+	c.logf("worker %s holds %d placement(s) of other revisions; asking it to host nothing "+
+		"before %s is prepared", instanceID, held, shortDigest(revision))
+	if problem := c.converge(s, w, nil); problem != nil {
+		return problem
+	}
+	c.mu.Lock()
+	rev := w.revision
+	c.mu.Unlock()
+	for {
+		c.mu.Lock()
+		current := c.workers[instanceID] == w && !w.exited
+		// The Runtime never reports an empty set converged (nothing is dispatchable in
+		// it); its acceptance plus a report naming no placement is the fact.
+		emptied := w.acceptedRevision >= rev && len(w.observedRemote) == 0
+		refused, desiredRefusal := w.refusal, w.desiredRefusal
+		c.mu.Unlock()
+		switch {
+		case emptied:
+			return nil
+		case refused != nil:
+			return refused
+		case desiredRefusal != nil:
+			return desiredRefusal
+		case !current:
+			return exit.New(exit.Failed, "the rented worker exited while unloading its placements")
+		}
+		select {
+		case <-c.done:
+			return exit.Unavailablef("the daemon stopped while the rented worker was unloading")
+		case <-time.After(20 * time.Millisecond):
 		}
 	}
 }
@@ -623,18 +692,65 @@ func (c *Orchestrator) replayLocalAborts(current *session, workerID string) {
 	}
 }
 
+// localIssued answers whether this owner already issued revision on the live session
+// and the pod has not refused it: prepared, or preparing and not yet reported. A second
+// convergence of the same revision then waits on the pod's report instead of asking again.
+func (c *Orchestrator) localIssued(w *worker, s *session, revision string) bool {
+	raw, err := canonical.Raw(revision)
+	if err != nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if w.desiredRefusal != nil || w.desiredEpoch != s.epoch {
+		return false
+	}
+	if w.desiredLocal != nil && bytes.Equal(w.desiredLocal.Package.GetLocalRevisionDigest(), raw) {
+		return true
+	}
+	return w.desiredPrivatePlacement != nil &&
+		bytes.Equal(w.desiredPrivatePlacement.LocalRevisionDigest, raw)
+}
+
+// localOperation names the operation the pod prepared revision under, when this owner
+// issued one: a model placement must bind over that operation, whoever converges it.
+func (c *Orchestrator) localOperation(w *worker, revision []byte, fallback string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if w.desiredLocal != nil && bytes.Equal(w.desiredLocal.Package.GetLocalRevisionDigest(), revision) {
+		return w.desiredLocal.OperationId
+	}
+	if w.desiredPrivatePlacement != nil && bytes.Equal(w.desiredPrivatePlacement.LocalRevisionDigest, revision) {
+		return w.desiredPrivatePlacement.OperationId
+	}
+	return fallback
+}
+
 func (c *Orchestrator) issueLocalPackageSet(s *session, w *worker,
 	selected *pb.DesiredLocalPackageSet,
 ) *exit.Error {
 	if selected == nil {
 		return exit.Internalf("cannot issue an empty local package set")
 	}
+	revision, err := canonical.Spell(selected.Package.GetLocalRevisionDigest())
+	if err != nil {
+		return exit.Internalf("cannot spell the local revision digest: %s", err)
+	}
 	c.mu.Lock()
 	w.delegationExpiry = time.Time{} // local wheels travel as minted capabilities, not a delegation
 	w.desiredLocal = cloneLocalPackageSet(selected)
 	w.desiredPrivatePlacement = nil
 	w.desiredPackages, w.desiredModels = nil, nil
+	w.desiredEpoch = s.epoch
+	_, held := w.observedRemote[revision]
 	c.mu.Unlock()
+	if held {
+		// The pod reports this exact revision already: nothing to prepare, and asking would
+		// be refused as busy. A reconnect re-issue lands here for the set the pod kept.
+		c.logf("worker %s already holds local revision %s; nothing to prepare",
+			w.instanceID, shortDigest(revision))
+		return nil
+	}
 	call := &pb.PrepareLocalPackageCall{Claim: s.claim, LocalPackageSet: cloneLocalPackageSet(selected)}
 	return c.issueThroughHost(s, w, hostLabel("local_package_set", selected.OperationId),
 		func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
@@ -677,6 +793,7 @@ func (c *Orchestrator) ConvergePrivatePlacement(instanceID, operationID,
 		return exit.Named(exit.Validation, "private_placement_delegation_incomplete",
 			"local package placement delegation is incomplete")
 	}
+	operationID = c.localOperation(w, revision, operationID)
 	selected := &pb.DesiredPrivatePlacementSet{OperationId: operationID,
 		LocalRevisionDigest: revision, DownloadDelegation: delegation,
 		DownloadDelegationSignature: signature}
@@ -693,6 +810,7 @@ func (c *Orchestrator) issuePrivatePlacementSet(s *session, w *worker,
 	w.delegationExpiry = delegationExpiryOf(selected.DownloadDelegation)
 	w.desiredLocal, w.desiredPackages, w.desiredModels = nil, nil, nil
 	w.desiredPrivatePlacement = clonePrivatePlacementSet(selected)
+	w.desiredEpoch = s.epoch
 	c.mu.Unlock()
 	call := &pb.PreparePrivatePlacementCall{Claim: s.claim, PrivatePlacementSet: clonePrivatePlacementSet(selected)}
 	return c.issueThroughHost(s, w, hostLabel("private_placement_set", selected.OperationId),

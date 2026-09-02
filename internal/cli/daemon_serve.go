@@ -221,6 +221,13 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// feeds the same channel, and everything after `<-stop` is shared.
 	quit := make(chan struct{})
 	go fleet.watch(quit)
+	// Every editable install's source tree is watched for as long as this daemon runs
+	// (cl-097): an edit is rebuilt and every worker holding the package re-prepared before
+	// the next run asks. A watch that cannot be set up is reported, not fatal — runs still
+	// refresh at submission.
+	if _, e := startEditableSync(l, st, resolver, c, ctx.Out, quit); e != nil {
+		fmt.Fprintf(ctx.Out, "editable watch unavailable: %s\n", e.Message)
+	}
 	if ctx.Cfg.DaemonIdleShutdown > 0 {
 		go idleWatch{debounce: ctx.Cfg.DaemonIdleShutdown, store: st, owner: c,
 			server: server, log: ctx.Out}.run(quit)

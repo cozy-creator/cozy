@@ -94,87 +94,148 @@ func (r *Resolver) LocalRevision(installID, digest string) (localpackage.Revisio
 	return localpackage.Open(layout, *install, digest)
 }
 
+// EditableSnapshot is one reading of an editable install's live source tree against the
+// install that was active when it was read. Close releases the prepared tree.
+type EditableSnapshot struct {
+	Package  string
+	Current  *records.PackageInstall
+	Editable bool
+	Digest   string
+	Files    int
+	Bytes    int64
+	pack     *packagepublish.Package
+}
+
+// Changed answers whether the tree no longer matches the install that was active.
+func (s *EditableSnapshot) Changed() bool {
+	return s.Editable && s.Digest != s.Current.SourceDigest
+}
+
+func (s *EditableSnapshot) Close() {
+	if s != nil && s.pack != nil {
+		s.pack.Close()
+		s.pack = nil
+	}
+}
+
 // RefreshEditable is the daemon-owned pre-invocation fence for live source trees.
 // It snapshots the current tree, builds a complete replacement install when it
 // moved, and swaps the active pin only after Runtime accepted the replacement.
 // A failure returns a typed refusal and leaves the last good install active.
 func (r *Resolver) RefreshEditable(pkg string) (installID string, editable, changed bool, problem *exit.Error) {
-	r.refreshMu.Lock()
-	defer r.refreshMu.Unlock()
+	snapshot, problem := r.SnapshotEditable(pkg)
+	if snapshot == nil {
+		return "", false, false, problem
+	}
+	defer snapshot.Close()
+	if problem != nil || !snapshot.Editable {
+		return snapshot.Current.ID, snapshot.Editable, false, problem
+	}
+	installID, changed, problem = r.RefreshSnapshot(snapshot)
+	return installID, true, changed, problem
+}
+
+// SnapshotEditable reads the tree once: the walk plus the hash of every source file. It
+// takes no lock, so the source watcher can read a tree that is still moving and read it
+// again; only RefreshSnapshot serializes. A tree that cannot be read answers the typed
+// refusal beside the snapshot that names the install still active.
+func (r *Resolver) SnapshotEditable(pkg string) (*EditableSnapshot, *exit.Error) {
 	pkg = strings.TrimSpace(pkg)
 	current, problem := r.activeInstall(pkg)
 	if problem != nil {
-		return "", false, false, problem
+		return nil, problem
 	}
+	snapshot := &EditableSnapshot{Package: pkg, Current: current}
 	if current.SourceKind != "local" {
-		return current.ID, false, false, nil
+		return snapshot, nil
 	}
-	refreshFailure := func(cause *exit.Error) (string, bool, bool, *exit.Error) {
-		return current.ID, true, false, exit.Named(cause.Code, "editable_refresh_failed",
-			"editable package %s could not refresh; install %s remains active",
-			pkg, short12(current.ID)).
-			WithRemedy("%s: %s", cause.ErrName(), cause.Message)
-	}
+	snapshot.Editable = true
 	pack, problem := packagepublish.PrepareLocalFrom(current.SourceRef)
 	if problem != nil {
-		return refreshFailure(problem)
+		return snapshot, refreshFailure(pkg, current, problem)
 	}
-	defer pack.Close()
 	if "local/"+pack.Name != current.Package || pack.Release != current.Version {
-		return refreshFailure(exit.Named(exit.Conflict, "editable_identity_changed",
+		pack.Close()
+		return snapshot, refreshFailure(pkg, current, exit.Named(exit.Conflict, "editable_identity_changed",
 			"editable metadata now names %s/%s@%s, not installed %s@%s",
 			"local", pack.Name, pack.Release, current.Package, current.Version).
 			WithRemedy("install the renamed package directory explicitly"))
 	}
 	digest, files, bytes, problem := pack.SourceIdentity()
 	if problem != nil {
-		return refreshFailure(problem)
+		pack.Close()
+		return snapshot, refreshFailure(pkg, current, problem)
 	}
+	snapshot.pack, snapshot.Digest, snapshot.Files, snapshot.Bytes = pack, digest, files, bytes
+	return snapshot, nil
+}
+
+func refreshFailure(pkg string, current *records.PackageInstall, cause *exit.Error) *exit.Error {
+	detail := cause.ErrName() + ": " + cause.Message
+	if cause.Remedy != "" {
+		detail += " — " + cause.Remedy
+	}
+	return exit.Named(cause.Code, "editable_refresh_failed",
+		"editable package %s could not refresh; install %s remains active",
+		pkg, short12(current.ID)).
+		WithRemedy("%s", detail)
+}
+
+// RefreshSnapshot builds the replacement install a moved snapshot calls for and swaps the
+// pin. It answers the active install afterwards and whether that is a new one; a snapshot
+// that matches the active install, or one the pin already moved past, changes nothing.
+func (r *Resolver) RefreshSnapshot(snapshot *EditableSnapshot) (installID string, changed bool, problem *exit.Error) {
+	r.refreshMu.Lock()
+	defer r.refreshMu.Unlock()
+	if !snapshot.Editable {
+		return snapshot.Current.ID, false, nil
+	}
+	pkg, current, pack, digest := snapshot.Package, snapshot.Current, snapshot.pack, snapshot.Digest
 	if digest == current.SourceDigest {
-		return current.ID, true, false, nil
+		return current.ID, false, nil
 	}
 	layout, problem := home.Open(r.cfg.Home)
 	if problem != nil {
-		return refreshFailure(problem)
+		return current.ID, false, refreshFailure(pkg, current, problem)
 	}
 	writer, problem := install.Lock(layout)
 	if problem != nil {
-		return refreshFailure(problem)
+		return current.ID, false, refreshFailure(pkg, current, problem)
 	}
 	defer writer.Unlock()
 	latest, problem := r.activeInstall(pkg)
 	if problem != nil {
-		return refreshFailure(problem)
+		return current.ID, false, refreshFailure(pkg, current, problem)
 	}
 	if latest.ID != current.ID {
 		current = latest
 		if current.SourceKind != "local" {
-			return current.ID, false, false, nil
+			return current.ID, false, nil
 		}
 		if current.SourceRef != pack.Tree || current.Package != "local/"+pack.Name ||
 			current.Version != pack.Release {
-			return refreshFailure(exit.Named(exit.Conflict, "editable_refresh_raced",
+			return current.ID, false, refreshFailure(pkg, current, exit.Named(exit.Conflict, "editable_refresh_raced",
 				"the active package changed while its editable source was being checked").
 				WithRemedy("retry against the current install"))
 		}
 		if current.SourceDigest == digest {
-			return current.ID, true, false, nil
+			return current.ID, false, nil
 		}
 	}
 	result, problem := install.Run(layout, r.store, install.Request{
 		Ref: install.Ref{Package: current.Package}, Force: true,
-		Local: &install.LocalSource{SourceDigest: digest, Bytes: bytes, Files: files,
+		Local: &install.LocalSource{SourceDigest: digest, Bytes: snapshot.Bytes, Files: snapshot.Files,
 			Package: current.Package, Release: current.Version, Tree: current.SourceRef},
 	})
 	if problem != nil {
-		return refreshFailure(problem)
+		return current.ID, false, refreshFailure(pkg, current, problem)
 	}
 	r.mu.Lock()
 	delete(r.cache, pkg)
 	delete(r.placements, pkg)
 	r.mu.Unlock()
 	if result.Install.ID == "" {
-		return refreshFailure(exit.Internalf("editable refresh returned no active install"))
+		return current.ID, false, refreshFailure(pkg, current, exit.Internalf("editable refresh returned no active install"))
 	}
 	if result.Superseded != "" {
 		// Activation already committed the replacement. Reclaim the now-unpinned immutable
@@ -182,7 +243,7 @@ func (r *Resolver) RefreshEditable(pkg string) (installID string, editable, chan
 		// not misreport the newly active environment as a failed refresh.
 		_, _ = install.Reclaim(layout, r.store, result.Superseded)
 	}
-	return result.Install.ID, true, !result.Idempotent, nil
+	return result.Install.ID, !result.Idempotent, nil
 }
 
 func short12(value string) string {
@@ -325,6 +386,7 @@ func (r *Resolver) ResolveInstall(installID string, models []orchestrator.ModelR
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
+	spec.Placement.Models = append([]orchestrator.ModelRef(nil), models...)
 	r.mu.Lock()
 	r.selected[key] = spec
 	r.mu.Unlock()

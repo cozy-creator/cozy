@@ -20,6 +20,12 @@ func Exclusive(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 }
 
+// Block asks for the same claim and waits for the holder to release it: the kernel wakes
+// the caller the moment the current writer is done, and nothing here samples.
+func Block(f *os.File) error {
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+}
+
 func Release(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
