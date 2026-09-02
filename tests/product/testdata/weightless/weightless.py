@@ -131,9 +131,16 @@ def tile_job(payload: TileInput) -> TileJobOutput:
 
 @app.entrypoint
 def refuse(payload: RefuseInput) -> TileOutput:
-    """The FAILED terminal on the same weightless path, so the fixture observes both
+    """The REFUSED terminal on the same weightless path, so the fixture observes both
     verdicts of the terminal transaction rather than only the happy one."""
     raise InvalidRequest(payload.why)
+
+
+@app.entrypoint
+def fail(payload: RefuseInput) -> TileOutput:
+    """The FAILED terminal: an exception the handler never typed. Its traceback is what a
+    triage bundle exists to carry off a dead pod (cl-101)."""
+    raise RuntimeError(payload.why)
 
 
 @app.entrypoint

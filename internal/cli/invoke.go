@@ -1302,10 +1302,47 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 			life.RequestID, status, errType, why)
 	}
 	if life.Triage != nil {
-		e.WithRemedy("the retained triage bundle explains it").
-			WithNext("cozy run list --full")
+		e.WithRemedy("%s", triageRemedy(ctx, life.Triage, terminal))
 	}
 	return e
+}
+
+// triageRemedy names the one document that explains a failed attempt, and says so when
+// it is not there. A kept bundle is a path on THIS host — a pod's bundle is fetched over
+// its media plane and kept here like a local worker's (cl-101) — and the traceback's tail
+// is the part a person reads first, so it is quoted rather than pointed at. A bundle that
+// was not kept names the fault the daemon recorded instead of pretending one exists.
+func triageRemedy(ctx *Context, ref *api.TriageRef, terminal *localapi.Event) string {
+	if !ref.Kept {
+		fault := eventText(terminal, "triage_fault")
+		if fault == "" {
+			fault = "no reason recorded"
+		}
+		return fmt.Sprintf("triage bundle %s was NOT kept: %s", ref.SubjectID, fault)
+	}
+	layout, problem := home.Open(ctx.Cfg.Home)
+	if problem != nil {
+		return "the retained triage bundle explains it"
+	}
+	path := layout.TriageFile(ref.SubjectID)
+	remedy := "triage bundle kept at " + path
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return remedy
+	}
+	var bundle struct {
+		Terminal struct {
+			Traceback string `json:"traceback"`
+		} `json:"terminal"`
+	}
+	if json.Unmarshal(data, &bundle) != nil || strings.TrimSpace(bundle.Terminal.Traceback) == "" {
+		return remedy
+	}
+	lines := strings.Split(strings.TrimRight(bundle.Terminal.Traceback, "\n"), "\n")
+	if len(lines) > 6 {
+		lines = lines[len(lines)-6:]
+	}
+	return remedy + "; the executor's traceback ends:\n  " + strings.Join(lines, "\n  ")
 }
 
 func runReference(number int64, id string) string {

@@ -22,7 +22,12 @@ const Service = "cozy-media"
 // MaxReceiptBytes below at compile time. The rest was operator telemetry no operator
 // fetched. A field an authenticated route publishes and nobody reads is not free: it is
 // pod state handed out on every pre-flight, and a shape both ends must keep agreeing on.
-const ContractRev = 2
+//
+// Rev 3 added `GET /v1/triage/{subject}` (cl-101): the worker's triage bundle for one
+// terminal attempt, read by the opaque subject the terminal named and bounded to the
+// protocol's 1 MiB. Before it, a pod attempt's bundle stayed on the pod and the owner
+// recorded `bundle_absent` for every remote failure.
+const ContractRev = 3
 
 // Health is the exact document `GET /v1/health` answers, and it is ONLY the contract: who
 // is answering and at which revision. That is the whole question the route exists to

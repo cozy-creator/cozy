@@ -482,10 +482,6 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function st
 			return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
 				"model selection does not bind exact slot %s", slot.Path)
 		}
-		if len(slot.Stamps) != 0 {
-			return empty, nil, exit.Named(exit.Unavailable, "rental.model_stamps_unsupported",
-				"model slot %s uses unsupported stamps", slot.Path)
-		}
 		if _, problem := hub.ParseRef(model.Model); problem != nil {
 			return empty, nil, problem
 		}
@@ -586,10 +582,6 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 		if _, ok := byParam[slot.Param]; !ok {
 			return empty, nil, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
 				"remote job %s does not bind model parameter %s", function, slot.Param)
-		}
-		if len(slot.Stamps) != 0 {
-			return empty, nil, exit.Named(exit.Unavailable, "rental.job_model_stamps_unsupported",
-				"remote job %s model parameter %s uses unsupported stamps", function, slot.Param)
 		}
 	}
 	weights := make([]orchestrator.WeightsOutput, 0, len(job.WeightsOutputs))

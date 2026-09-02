@@ -1209,6 +1209,13 @@ func (tr Triage) keep(status, cause, safeMessage string, outputs []records.Outpu
 // ACCEPTED. Reading the worker's journal instead would be trusting a file the worker can
 // still write. A mismatch is recorded as a fault on the attempt and the bytes are not
 // kept — a bundle that does not hash to what the terminal claimed is not evidence.
+//
+// WHERE THE BYTES ARE depends on the worker, exactly as it does for outputs. A local
+// worker shares this filesystem and its bundle is a file under its own root; a POD worker
+// wrote it on the pod, and it is FETCHED by subject over the pod's media plane before
+// the same verification runs here. Until cl-101 the pod path read the local path and
+// recorded `bundle_absent` for every remote failure — a pod's own explanation of its
+// failure was the one document the owner could never read.
 func (c *Orchestrator) captureTriage(s *session, requestID string, attempt uint64, ref canonical.Doc) Triage {
 	tr := Triage{Subject: ref.Str("subject_id")}
 	if tr.Subject == "" {
@@ -1223,12 +1230,25 @@ func (c *Orchestrator) captureTriage(s *session, requestID string, attempt uint6
 		tr.Fault = "the worker that wrote it is gone before its bundle could be copied"
 		return tr
 	}
-	source := filepath.Join(c.opt.Layout.WorkerDir(w.instanceID), "run", "triage", tr.Subject+".json")
-	data, err := os.ReadFile(source)
-	if err != nil {
-		tr.Fault = "bundle_absent: the terminal names a bundle that is not on disk"
-		c.logf("triage %s for %s#%d NOT kept: %s", tr.Subject, requestID, attempt, err)
-		return tr
+	var data []byte
+	if w.media != nil {
+		fetched, e := w.media.GetTriage(tr.Subject, tr.Digest, tr.Length)
+		if e != nil {
+			tr.Fault = "bundle_unfetched: " + e.Message
+			c.logf("triage %s for %s#%d NOT kept from %s: %s", tr.Subject, requestID, attempt,
+				w.media.Addr(), e.Message)
+			return tr
+		}
+		data = fetched
+	} else {
+		source := filepath.Join(c.opt.Layout.WorkerDir(w.instanceID), "run", "triage", tr.Subject+".json")
+		read, err := os.ReadFile(source)
+		if err != nil {
+			tr.Fault = "bundle_absent: the terminal names a bundle that is not on disk"
+			c.logf("triage %s for %s#%d NOT kept: %s", tr.Subject, requestID, attempt, err)
+			return tr
+		}
+		data = read
 	}
 	spelled, _ := canonical.Spell(canonical.Digest(data))
 	if int64(len(data)) != tr.Length || spelled != tr.Digest {
