@@ -43,6 +43,8 @@
 //!   tfs manifest admit|get|show|walk|verify <root> ...
 //!   tfs manifest inspect <manifest.json> --refs <jsonl>
 //!   tfs repo inspect <repo.json> --rows <jsonl>
+//!   tfs repo list <store> --rows <jsonl>     every release lane, with its checkpoint evidence
+//!   tfs repo usage <store> --rows <jsonl>    blob bytes per repo: total, and unique to it
 //!   tfs repo apply <current.json|-> <mutation.json> --out <replacement> --rows <jsonl>
 //!                  put_checkpoint requires --manifest, --header and --inventory
 //!   tfs repo commit <store> <current.json|-> <mutation.json>
@@ -179,6 +181,7 @@ fn main() -> ExitCode {
         ["manifest", "inspect", p] => repo::cmd_manifest_inspect(Path::new(p), &flags),
         ["repo", "inspect", p] => repo::cmd_repo_inspect(Path::new(p), &flags),
         ["repo", "list", r] => repo::cmd_repo_list(Path::new(r), &flags),
+        ["repo", "usage", r] => repo::cmd_repo_usage(Path::new(r), &flags),
         ["repo", "get", r, org, name] => repo::cmd_repo_get(Path::new(r), org, name, &flags),
         ["repo", "apply", current, mutation] => {
             repo::cmd_repo_apply(current, Path::new(mutation), &flags)
