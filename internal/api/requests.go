@@ -523,6 +523,11 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 		return out, exit.Named(exit.Conflict, "install_package_mismatch",
 			"install %s serves %s, not %s", installID, placement.Package, sub.Package)
 	}
+	if len(out.Models) == 0 {
+		// The editable install froze its model selection; the rental carries that exact
+		// intent (repo, release, lane, manifest) to the pod as its private placement.
+		out.Models = append([]orchestrator.ModelRef(nil), placement.Models...)
+	}
 	planID, outputs, problem := placementPlan(placement, sub.Function)
 	if problem != nil {
 		return out, problem

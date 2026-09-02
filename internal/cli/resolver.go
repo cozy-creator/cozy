@@ -340,6 +340,24 @@ func (r *Resolver) ResolveInstall(installID string, models []orchestrator.ModelR
 		}
 		return facts.Spec(r.Devices)
 	}
+	if facts.Install.SourceKind == "local" {
+		// An editable install's PlacementSet froze its selection at install; the rows a
+		// rental request carries are that projection handed back (cl-101), never a
+		// second selection to prepare. Anything else is an override this lane has no
+		// home for.
+		spec, e := facts.Spec(r.Devices)
+		if e != nil {
+			return orchestrator.WorkerLaunchSpec{}, e
+		}
+		if selectedInstallKey(installID, models) != selectedInstallKey(installID, spec.Placement.Models) {
+			return orchestrator.WorkerLaunchSpec{}, exit.Named(exit.Unavailable,
+				"editable_model_override_unsupported",
+				"%s is an editable install whose model selection was frozen at install",
+				facts.Install.Package).
+				WithRemedy("change package.toml and let the editable refresh re-derive it, or publish the package and use --model")
+		}
+		return spec, nil
+	}
 	key := selectedInstallKey(installID, models)
 	r.mu.Lock()
 	cached, ok := r.selected[key]

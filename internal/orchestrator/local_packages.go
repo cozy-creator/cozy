@@ -187,6 +187,41 @@ func (c *Orchestrator) hostNothing(instanceID, revision string) *exit.Error {
 	}
 }
 
+// awaitLocalRevision waits until the rented worker REPORTS the local revision among its
+// placements — the pod's prepare has landed — or the desire it rides is refused, the
+// worker goes, or the daemon stops. Observation only: there is no clock in it.
+func (c *Orchestrator) awaitLocalRevision(instanceID, revision string) *exit.Error {
+	for {
+		c.mu.Lock()
+		w := c.workers[instanceID]
+		var held, current bool
+		var refused, desiredRefusal *exit.Error
+		if w != nil {
+			_, held = w.observedRemote[revision]
+			current = !w.exited
+			refused, desiredRefusal = w.refusal, w.desiredRefusal
+		}
+		c.mu.Unlock()
+		switch {
+		case w == nil || !current:
+			return exit.New(exit.Failed, "the rented worker exited before it held local revision %s",
+				shortDigest(revision))
+		case held:
+			return nil
+		case refused != nil:
+			return refused
+		case desiredRefusal != nil:
+			return desiredRefusal
+		}
+		select {
+		case <-c.done:
+			return exit.Unavailablef("the daemon stopped while the rented worker was preparing %s",
+				shortDigest(revision))
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 func localSelection(operationID string, revision localpackage.Revision) (
 	*pb.DesiredLocalPackageSet, *localTransfer, *exit.Error,
 ) {
@@ -783,6 +818,13 @@ func (c *Orchestrator) ConvergePrivatePlacement(instanceID, operationID,
 	}
 	if s == nil {
 		return exit.Unavailablef("worker %s holds no claimed control stream", instanceID)
+	}
+	// The models bind OVER the local revision, so the pod must hold that revision first:
+	// `ConvergeLocalPackage` only ISSUES the prepare, and a private placement sent on its
+	// heels is refused `private_placement_invalid: private placement revision is not
+	// prepared` (found live, L4 `shiranui`, cl-101). Wait on the pod's own report of it.
+	if problem := c.awaitLocalRevision(instanceID, localRevisionDigest); problem != nil {
+		return problem
 	}
 	delegation, signature, problem := c.opt.RentalPackageSet(w.spec.Connection, nil, models)
 	if problem != nil {
