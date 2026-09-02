@@ -82,7 +82,9 @@ func fixturePyproject(dependencies ...string) string {
 		`name = "cozy-fixture-package"` + "\n" +
 		`version = "1.0.0"` + "\n" +
 		`requires-python = ">=3.12,<3.13"` + "\n" +
-		"dependencies = [" + strings.Join(quoted, ", ") + "]\n" +
+		"dependencies = [" + strings.Join(quoted, ", ") + "]\n\n" +
+		"[project.entry-points.\"cozy.application\"]\n" +
+		`default = "cozy_fixture_package:app"` + "\n" +
 		fixtureBuildSystem
 }
 

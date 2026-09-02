@@ -23,6 +23,24 @@ type Contents struct {
 	ImportRoots []string // sorted unique roots, the runtime's measurement
 	TopLevel    []string // the backend's top_level.txt lines, when it wrote one
 	Members     []string // sorted member paths outside .dist-info
+	EntryPoints []EntryPoint
+}
+
+// EntryPoint is one entry_points.txt row: what importlib.metadata reports for
+// the installed wheel, and so what a worker discovers an application from.
+type EntryPoint struct {
+	Group, Name, Object string
+}
+
+// Group returns the entry points registered under one group, in file order.
+func (c Contents) Group(group string) []EntryPoint {
+	out := []EntryPoint{}
+	for _, entry := range c.EntryPoints {
+		if entry.Group == group {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 var (
@@ -67,6 +85,13 @@ func InspectContents(file string) (Contents, *exit.Error) {
 					out.TopLevel = append(out.TopLevel, line)
 				}
 			}
+		}
+		if strings.HasSuffix(name, ".dist-info/entry_points.txt") && strings.Count(name, "/") == 1 {
+			body, problem := wheelMember(member)
+			if problem != nil {
+				return out, problem
+			}
+			out.EntryPoints = append(out.EntryPoints, parseEntryPoints(string(body))...)
 		}
 		if !strings.HasSuffix(name, "/") && !strings.HasSuffix(firstSegment(name), ".dist-info") {
 			out.Members = append(out.Members, name)
@@ -145,4 +170,28 @@ func hasAnySuffix(value string, suffixes []string) bool {
 		}
 	}
 	return false
+}
+
+// parseEntryPoints reads the entry_points.txt grammar: `[group]` headers, then
+// `name = module:object [extras]` rows; blank lines and `#` comments are skipped.
+func parseEntryPoints(body string) []EntryPoint {
+	out := []EntryPoint{}
+	group := ""
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			group = strings.TrimSpace(line[1 : len(line)-1])
+			continue
+		}
+		name, object, ok := strings.Cut(line, "=")
+		if !ok || group == "" {
+			continue
+		}
+		out = append(out, EntryPoint{Group: group, Name: strings.TrimSpace(name),
+			Object: strings.TrimSpace(object)})
+	}
+	return out
 }

@@ -1,12 +1,14 @@
 package producttest
 
-// The defect: `cozy package install --editable` accepted a tree whose build backend
-// produced a wheel holding nothing but .dist-info, `cozy run` worked locally from the
-// source tree, and the same package failed minutes later on a rented pod as
-// `runtime_preparation_failed`. The private revision Creator transferred carried a
-// 1144-byte project wheel whose top_level.txt said `vendor`. Every arm below drives
-// the real binary or the real staging code over a real tree from the real fixture
-// builder; the broken arm is the exact pyproject shape the builder used to emit.
+// The defect class: `cozy package install --editable` accepted a tree, `cozy run`
+// worked locally from the source tree, and the same package failed minutes later on
+// a rented pod. Twice: first the build backend produced a wheel holding nothing but
+// .dist-info (1144 bytes, top_level.txt said `vendor`), then the wheel carried the
+// module but no `cozy.application` entry point — a worker discovers the application
+// from the installed wheel, an editable run from package.toml, and only package.toml
+// was declared. Every arm below drives the real binary or the real staging code over
+// a real tree from the real fixture builder; each broken arm is the exact pyproject
+// shape the builder used to emit.
 
 import (
 	"archive/zip"
@@ -68,8 +70,35 @@ func TestProjectWheelImportRoots(t *testing.T) {
 		t.Fatalf("the backend's empty wheel measured as %+v", contents)
 	}
 
+	// The second shape: the module is in the wheel, the application is not. And a
+	// wheel whose entry point disagrees with package.toml is two applications, not one.
+	unregistered := weightlessVariant(t, project, func(pyproject string) string {
+		return strings.Replace(pyproject, applicationTable, "", 1)
+	})
+	code, out = runCozy(t, root, "package", "install", unregistered, "--editable", "--json")
+	if code != 1 || !strings.Contains(out, `"code":"project_wheel_application_entrypoint_missing"`) {
+		t.Fatalf("wheel without a cozy.application entry point was not refused at install [exit %d]\n%s", code, out)
+	}
+	for _, named := range []string{`[project.entry-points.\"cozy.application\"]`, `default = \"weightless:app\"`} {
+		if !strings.Contains(out, named) {
+			t.Errorf("entry point refusal omitted %q\n%s", named, out)
+		}
+	}
+	disagreeing := weightlessVariant(t, project, func(pyproject string) string {
+		return strings.Replace(pyproject, `default = "weightless:app"`, `default = "weightless:other"`, 1)
+	})
+	code, out = runCozy(t, root, "package", "install", disagreeing, "--editable", "--json")
+	if code != 1 || !strings.Contains(out, `"code":"project_wheel_application_entrypoint_mismatch"`) ||
+		!strings.Contains(out, "weightless:other") || !strings.Contains(out, "weightless:app") {
+		t.Fatalf("entry point disagreeing with package.toml was not refused at install [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "package", "list", "--json"); code != 0 ||
+		strings.Contains(out, localWeightlessRef) {
+		t.Fatalf("a refused editable install left a pin behind [exit %d]\n%s", code, out)
+	}
+
 	// The fixed fixture installs, and the private revision a rental would receive
-	// carries a project wheel that installs weightless.py.
+	// carries a project wheel that installs weightless.py and registers its application.
 	code, out = runCozy(t, root, "package", "install", project, "--editable")
 	if code != 0 {
 		t.Fatalf("fixed fixture install [exit %d]\n%s", code, out)
@@ -94,6 +123,10 @@ func TestProjectWheelImportRoots(t *testing.T) {
 		if record := wheelRecord(t, file.Path); !strings.Contains(record, "weightless.py,sha256=") {
 			t.Fatalf("transferred project wheel RECORD carries no weightless.py:\n%s", record)
 		}
+		applications := contents.Group("cozy.application")
+		if len(applications) != 1 || applications[0].Object != "weightless:app" {
+			t.Fatalf("transferred project wheel registers cozy.application %+v, want one weightless:app", applications)
+		}
 		transferred = append(transferred, file.Filename)
 	}
 	if len(transferred) != 1 {
@@ -101,35 +134,39 @@ func TestProjectWheelImportRoots(t *testing.T) {
 	}
 }
 
-// brokenWeightlessProject is the fixture tree under the pyproject the builder used to
-// emit: no [build-system], so setuptools guessed a flat layout and packaged nothing.
-func brokenWeightlessProject(t *testing.T, project string) string {
+const applicationTable = "[project.entry-points.\"cozy.application\"]\ndefault = \"weightless:app\"\n\n"
+
+// weightlessVariant is the fixture tree under a rewritten pyproject. The wheel fence
+// runs before uv.lock is consulted, so the lock is left as built.
+func weightlessVariant(t *testing.T, project string, rewrite func(pyproject string) string) string {
 	t.Helper()
-	broken := filepath.Join(t.TempDir(), "broken")
-	if out, err := exec.Command("cp", "-r", project, broken).CombinedOutput(); err != nil {
+	variant := filepath.Join(t.TempDir(), "variant")
+	if out, err := exec.Command("cp", "-r", project, variant).CombinedOutput(); err != nil {
 		t.Fatalf("copying the fixture: %v\n%s", err, out)
-	}
-	vendored, err := filepath.Glob(filepath.Join(broken, "vendor", "cozy_runtime-*.whl"))
-	must(t, err)
-	if len(vendored) != 1 {
-		t.Fatalf("fixture vendors %d runtime wheels", len(vendored))
 	}
 	metadata, err := os.ReadFile(filepath.Join(project, "pyproject.toml"))
 	must(t, err)
-	dependencies := ""
-	for _, line := range strings.Split(string(metadata), "\n") {
-		if strings.HasPrefix(line, "dependencies = ") {
-			dependencies = line
+	rewritten := rewrite(string(metadata))
+	if rewritten == string(metadata) {
+		t.Fatalf("the variant rewrite changed nothing:\n%s", metadata)
+	}
+	must(t, os.WriteFile(filepath.Join(variant, "pyproject.toml"), []byte(rewritten), 0o644))
+	return variant
+}
+
+// brokenWeightlessProject is the fixture tree under the pyproject the builder first
+// emitted: no [build-system] and no entry point, so setuptools guessed a flat layout
+// and packaged nothing.
+func brokenWeightlessProject(t *testing.T, project string) string {
+	t.Helper()
+	return weightlessVariant(t, project, func(pyproject string) string {
+		start := strings.Index(pyproject, applicationTable)
+		end := strings.Index(pyproject, "[tool.uv.sources]")
+		if start < 0 || end < start {
+			t.Fatalf("fixture pyproject lost its shape:\n%s", pyproject)
 		}
-	}
-	if dependencies == "" {
-		t.Fatalf("fixture pyproject declares no dependencies:\n%s", metadata)
-	}
-	must(t, os.WriteFile(filepath.Join(broken, "pyproject.toml"), []byte("[project]\n"+
-		"name = \"cozy-weightless-package\"\nversion = \"1.0.0\"\n"+
-		"requires-python = \">=3.12,<3.13\"\n"+dependencies+"\n\n"+
-		"[tool.uv.sources]\ncozy-runtime = { path = \"vendor/"+filepath.Base(vendored[0])+"\" }\n"), 0o644))
-	return broken
+		return pyproject[:start] + pyproject[end:]
+	})
 }
 
 func wheelRecord(t *testing.T, path string) string {
