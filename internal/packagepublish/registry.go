@@ -138,14 +138,8 @@ func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 			return nil, exit.Named(exit.Validation, "registry_dependency_platform_root_present",
 				"uv export retained platform-owned root %s", name)
 		}
-		if pkg.Index != "https://pypi.org/simple" {
-			// th-113: a same-org index row references a wheel already in the hub's
-			// own custody. The published uv.lock carries its URL and hash; publish
-			// declares nothing and ships nothing for it, and install resolves it
-			// from the hub exactly like PyPI.
-			if organization != "" && orgIndexNamespace(pkg.Index) == organization {
-				continue
-			}
+		orgRow := pkg.Index != "https://pypi.org/simple"
+		if orgRow && (organization == "" || orgIndexNamespace(pkg.Index) != organization) {
 			return nil, exit.Named(exit.Validation, "registry_dependency_index_refused",
 				"%s==%s is locked to neither the public PyPI index nor this package's own org index",
 				name, pkg.Version)
@@ -154,7 +148,16 @@ func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 		if problem != nil {
 			return nil, problem
 		}
-		digest, problem := registryWheelIdentity(name, pkg.Version, candidate)
+		// th-113: a same-org index row references a wheel already in the hub's
+		// own custody. Publish declares the row and ships nothing; the hub
+		// custody-shares the committed org-index claim into the release, and
+		// install serves it from the plan exactly like any registry wheel.
+		var digest string
+		if orgRow {
+			digest, problem = orgIndexWheelIdentity(name, pkg.Version, organization, candidate)
+		} else {
+			digest, problem = registryWheelIdentity(name, pkg.Version, candidate)
+		}
 		if problem != nil {
 			return nil, problem
 		}
@@ -204,6 +207,46 @@ func registryWheelIdentity(name, version string, selected registryWheel) (string
 			"%s==%s wheel is not an exact files.pythonhosted.org HTTPS object", name, version)
 	}
 	filename, err := url.PathUnescape(filepath.Base(parsed.Path))
+	if err != nil || filepath.Base(filename) != filename {
+		return "", exit.Named(exit.Validation, "registry_dependency_wheel_invalid",
+			"%s==%s does not name one safe wheel basename", name, version)
+	}
+	if pure, score := classifyWheelFilename(filename); !pure && score < 0 {
+		return "", exit.Named(exit.Validation, "registry_dependency_wheel_invalid",
+			"%s==%s does not name one wheel installable on the platform target", name, version)
+	}
+	return digest, nil
+}
+
+// orgIndexWheelIdentity is the identity discipline for a row locked to the
+// publisher's own org index (th-113): the hub's stable file URL shape
+// /v1/index/<org>/files/<sha256hex>/<filename>, whose path digest IS the
+// wheel's sha256. The index page advertises no size, so the lock's 0 is legal
+// here and the hub's committed claim supplies the length at declare.
+func orgIndexWheelIdentity(name, version, organization string, selected registryWheel) (string, *exit.Error) {
+	digest := selected.Hashes["sha256"]
+	if len(digest) != 64 || strings.ToLower(digest) != digest || selected.Size < 0 {
+		return "", exit.Named(exit.Validation, "registry_dependency_identity_invalid",
+			"%s==%s has no exact SHA-256 wheel identity", name, version)
+	}
+	if _, err := hex.DecodeString(digest); err != nil {
+		return "", exit.Named(exit.Validation, "registry_dependency_identity_invalid",
+			"%s==%s has an invalid SHA-256", name, version)
+	}
+	parsed, err := url.Parse(selected.URL)
+	if err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", exit.Named(exit.Validation, "registry_dependency_origin_refused",
+			"%s==%s wheel is not an exact org index file object", name, version)
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) != 6 || parts[0] != "v1" || parts[1] != "index" || parts[2] != organization ||
+		parts[3] != "files" || parts[4] != digest {
+		return "", exit.Named(exit.Validation, "registry_dependency_origin_refused",
+			"%s==%s wheel is not this package's own org index file for its locked sha256",
+			name, version)
+	}
+	filename, err := url.PathUnescape(parts[5])
 	if err != nil || filepath.Base(filename) != filename {
 		return "", exit.Named(exit.Validation, "registry_dependency_wheel_invalid",
 			"%s==%s does not name one safe wheel basename", name, version)
