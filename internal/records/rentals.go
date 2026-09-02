@@ -2,6 +2,7 @@ package records
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -104,9 +105,18 @@ func scanRentalOperation(row interface{ Scan(...any) error }) (RentalOperation, 
 	return op, err
 }
 
+// RentalRequestAuthor renders the exact request bytes, and their digest, under the machine
+// name the store reserved for a new operation.
+type RentalRequestAuthor func(machineName string) (body []byte, digest string, problem *exit.Error)
+
 // BeginRentalOperation durably installs the caller's operation identity. A replay returns
-// the existing row; the caller compares RequestDigest before making any network call.
-func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros int64) (RentalOperation, bool, *exit.Error) {
+// the existing row; the caller compares RequestDigest before making any network call. A new
+// operation is named here: the store draws a machine word no rental row or unsettled
+// operation on this host holds and has the request authored under it, inside the one
+// transaction that records it — so two acquisitions can never share a word, and
+// `cozy rental end <word>` is never ambiguous.
+func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros int64,
+	author RentalRequestAuthor) (RentalOperation, bool, *exit.Error) {
 	stamp := now()
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -137,6 +147,19 @@ func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros int64
 			"%d potentially billing rental(s) already reserve %d USD micros/hour; the next %d would exceed %d",
 			count, burn, op.HourlyRateUSDMicros, fleetCapUSDMicros)
 	}
+	taken, e := machineNamesInUse(tx)
+	if e != nil {
+		return RentalOperation{}, false, e
+	}
+	machineName, err := rentalid.NewMachineName(taken)
+	if err != nil {
+		return RentalOperation{}, false, exit.Named(exit.Capacity, "rental.machine_names_exhausted",
+			"%s", err).WithRemedy("release a rental before renting another")
+	}
+	op.RequestBody, op.RequestDigest, e = author(machineName)
+	if e != nil {
+		return RentalOperation{}, false, e
+	}
 	if _, err := tx.Exec(`INSERT INTO rental_operations(`+rentalOperationCols+`)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, op.Key, op.RequestDigest, op.RequestBody, op.Hub, op.Reason,
 		op.HourlyRateUSDMicros, op.ManagedRequestID, op.RentalID, "pending_acquisition", stamp, stamp); err != nil {
@@ -151,6 +174,55 @@ func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros int64
 		return RentalOperation{}, false, exit.Internalf("cannot commit rental operation: %s", err)
 	}
 	return stored, false, nil
+}
+
+// MachineNamesInUse is every word a rental row or an unsettled operation on this host
+// holds: exactly the set a new operation's word is drawn outside of.
+func (s *Store) MachineNamesInUse() (map[string]bool, *exit.Error) {
+	return machineNamesInUse(s.db)
+}
+
+type querier interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+func machineNamesInUse(q querier) (map[string]bool, *exit.Error) {
+	taken := map[string]bool{}
+	collect := func(query string, name func([]byte) string) *exit.Error {
+		rows, err := q.Query(query)
+		if err != nil {
+			return exit.Internalf("cannot list machine names in use: %s", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var value []byte
+			if err := rows.Scan(&value); err != nil {
+				return exit.Internalf("cannot read a machine name in use: %s", err)
+			}
+			if word := name(value); word != "" {
+				taken[word] = true
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return exit.Internalf("cannot list machine names in use: %s", err)
+		}
+		return nil
+	}
+	if e := collect(`SELECT machine_name FROM rentals`, func(v []byte) string { return string(v) }); e != nil {
+		return nil, e
+	}
+	// An unsettled operation holds its word inside the closed request document it replays.
+	if e := collect(`SELECT request_body FROM rental_operations WHERE state NOT IN (`+
+		finalRentalOperationStates+`)`, func(v []byte) string {
+		var request struct {
+			Name string `json:"name"`
+		}
+		_ = json.Unmarshal(v, &request)
+		return request.Name
+	}); e != nil {
+		return nil, e
+	}
+	return taken, nil
 }
 
 func (s *Store) RentalOperation(key string) (*RentalOperation, *exit.Error) {

@@ -45,7 +45,7 @@ func TestDaemonIdleShutdown(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	fatal(t, store.RecordRental(records.Rental{
-		ID: "rental-idle-arm", MachineName: "quiet-heron-0000000000000002",
+		ID: "rental-idle-arm", MachineName: "heron",
 		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,
 		State: "release_requested", Hub: "https://hub.invalid",
 	}))
