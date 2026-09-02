@@ -326,6 +326,24 @@ func resourcePath(collection string, ref Ref) string {
 }
 
 func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
+	status, e := c.doOnce(ctx, cl, out)
+	if status != http.StatusUnauthorized || !cl.auth || c.tokens == nil {
+		return e
+	}
+	// A bearer the hub no longer recognizes -- it restarted or rotated its signing
+	// state without expiring our cached copy -- is re-minted from the durable machine
+	// key exactly once. A 401 arrives before the hub does any work, so the replay is
+	// safe; a machine key the hub truly revoked fails the re-mint and surfaces there.
+	source, renewable := c.tokens.(interface{ Invalidate() })
+	if !renewable {
+		return e
+	}
+	source.Invalidate()
+	_, e = c.doOnce(ctx, cl, out)
+	return e
+}
+
+func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error) {
 	token := c.token
 	if cl.auth && c.tokens != nil {
 		userToken, problem := c.tokens.AccessToken(ctx)
@@ -333,32 +351,32 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 		case problem == nil:
 			token = userToken
 		case !token.Present() || problem.ErrName() != "auth.machine_key_missing":
-			return problem
+			return 0, problem
 		}
 	}
 	if cl.auth && !token.Present() {
-		return exit.Named(exit.Credential, "hub.token_missing",
+		return 0, exit.Named(exit.Credential, "hub.token_missing",
 			"%s %s requires a Tensorhub login", cl.method, cl.path).
 			WithNext("cozy auth login <email>")
 	}
 
 	var body io.Reader
 	if cl.body != nil && cl.bodyBytes != nil {
-		return exit.Internalf("hub call %s %s supplied both structured and exact request bytes", cl.method, cl.path)
+		return 0, exit.Internalf("hub call %s %s supplied both structured and exact request bytes", cl.method, cl.path)
 	}
 	if cl.bodyBytes != nil {
 		body = bytes.NewReader(cl.bodyBytes)
 	} else if cl.body != nil {
 		b, err := json.Marshal(cl.body)
 		if err != nil {
-			return exit.Internalf("encoding the request body failed: %s", err)
+			return 0, exit.Internalf("encoding the request body failed: %s", err)
 		}
 		body = bytes.NewReader(b)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, cl.method, c.base+cl.path, body)
 	if err != nil {
-		return exit.Usagef("%q is not a usable hub URL: %s", c.base, err).
+		return 0, exit.Usagef("%q is not a usable hub URL: %s", c.base, err).
 			WithRemedy("set TENSORHUB_URL to a base URL, e.g. https://hub.example.com")
 	}
 	req.Header.Set("Accept", "application/json")
@@ -395,7 +413,7 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 		if progress != nil {
 			progress.stop()
 		}
-		return c.transport(err)
+		return 0, c.transport(err)
 	}
 	defer resp.Body.Close()
 	if progress != nil {
@@ -417,18 +435,18 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	raw, err := io.ReadAll(io.LimitReader(responseBody, cap))
 	if err != nil {
 		if progress != nil && progress.stalled() {
-			return exit.Named(exit.Deadline, "hub.response_stalled",
+			return resp.StatusCode, exit.Named(exit.Deadline, "hub.response_stalled",
 				"the hub at %s stopped sending its response body for %s", c.base, Timeout).
 				WithRemedy("retry; if it persists the hub is up but its response stream is stalled")
 		}
-		return c.transport(err)
+		return resp.StatusCode, c.transport(err)
 	}
 	if resp.StatusCode >= 400 {
-		return c.refusal(resp.StatusCode, raw)
+		return resp.StatusCode, c.refusal(resp.StatusCode, raw)
 	}
 	if cl.raw != nil {
 		*cl.raw = raw
-		return nil
+		return resp.StatusCode, nil
 	}
 	if out != nil {
 		var err error
@@ -449,14 +467,14 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 			err = json.Unmarshal(raw, out)
 		}
 		if err != nil {
-			return exit.Named(exit.Internal, "hub.unreadable_answer",
+			return resp.StatusCode, exit.Named(exit.Internal, "hub.unreadable_answer",
 				"%s %s answered %d with a body this client cannot read: %s",
 				cl.method, cl.path, resp.StatusCode, err).
 				WithRemedy("check that TENSORHUB_URL names a tensorhub, not a proxy or a login page").
 				WithNext("cozy package search")
 		}
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 // transport maps a failure that never became an HTTP answer. Unreachable is 9;
