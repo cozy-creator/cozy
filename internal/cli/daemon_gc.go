@@ -9,7 +9,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/output"
-	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/tfs"
 	"github.com/robfig/cron/v3"
 )
@@ -17,18 +16,20 @@ import (
 // The store's scheduled reclamation. Owner ruling (2026-09-02): "garbage-collection for
 // repo-CAS (both local and on tensorhub) should run on a cron job." The schedule is a
 // cadence — when a pass runs — never the decision: what is reclaimed is TensorFS's, from
-// its filesystem census, and a live writer or read lease refuses the pass by name. Ingest
-// sessions whose writer is gone are abandoned only while this daemon owes no request, so a
-// transfer of its own is never caught between `ingest run` and `ingest install`.
+// its filesystem census, and a live writer or read lease refuses the pass by name. A pass
+// runs only while the daemon manages nothing (the idle predicate): a download's admitted
+// objects are unnamed until its commit, and an ingest of its own sits between `ingest run`
+// and `ingest install` with no live writer — a sweep beside either could take bytes the
+// daemon is still moving in.
 type gcCron struct {
 	schedule cron.Schedule
 	cfg      config.Config
 	layout   home.Layout
-	store    *records.Store
+	idle     idleWatch
 	log      io.Writer
 }
 
-func newGCCron(cfg config.Config, layout home.Layout, store *records.Store, log io.Writer) (gcCron, bool) {
+func newGCCron(cfg config.Config, layout home.Layout, idle idleWatch, log io.Writer) (gcCron, bool) {
 	if cfg.MaintenanceGCCron == "" {
 		return gcCron{}, false
 	}
@@ -38,7 +39,7 @@ func newGCCron(cfg config.Config, layout home.Layout, store *records.Store, log 
 		fmt.Fprintf(log, "gc: maintenance.gc_cron %q refused: %s\n", cfg.MaintenanceGCCron, err)
 		return gcCron{}, false
 	}
-	return gcCron{schedule: schedule, cfg: cfg, layout: layout, store: store, log: log}, true
+	return gcCron{schedule: schedule, cfg: cfg, layout: layout, idle: idle, log: log}, true
 }
 
 func (g gcCron) run(quit <-chan struct{}) {
@@ -56,17 +57,21 @@ func (g gcCron) run(quit <-chan struct{}) {
 }
 
 func (g gcCron) once() {
+	held, problem := g.idle.managed()
+	if problem != nil {
+		fmt.Fprintf(g.log, "gc: deferred: %s\n", problem.Message)
+		return
+	}
+	if len(held) > 0 {
+		fmt.Fprintf(g.log, "gc: deferred: the daemon manages %s\n", strings.Join(held, ", "))
+		return
+	}
 	tool, problem := tfs.Open(g.cfg, g.layout)
 	if problem != nil {
 		fmt.Fprintf(g.log, "gc: deferred: %s\n", problem.Message)
 		return
 	}
-	active, problem := g.store.ActiveRequests()
-	if problem != nil {
-		fmt.Fprintf(g.log, "gc: deferred: %s\n", problem.Message)
-		return
-	}
-	report, problem := tool.GC(len(active) == 0)
+	report, problem := tool.GC(true)
 	if problem != nil {
 		fmt.Fprintf(g.log, "gc: deferred: %s\n", problem.Message)
 		return
