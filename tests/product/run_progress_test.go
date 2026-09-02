@@ -4,6 +4,7 @@ package producttest
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -137,5 +138,42 @@ func TestRunProgressSurfaces(t *testing.T) {
 	}
 	if strings.ContainsAny(stderr, "\r\033") || strings.Contains(stderr, "tile_steps") {
 		t.Fatalf("--json stderr shows renderer output\n%q", stderr)
+	}
+
+	// The list reuses the same lossy Runtime progress lane. It reports actual completion
+	// only while the attempt is live; terminal rows go back to an empty machine value (a
+	// dash in the human table), because 100% beside "completed" would add no information.
+	code, _ = runCozy(t, root, "run", localWeightlessRef+"/tile",
+		"size=32", "seed=6", "delay_ms=6000")
+	if code != 0 {
+		t.Fatalf("detached progress run failed [exit %d]", code)
+	}
+	type completionRow struct {
+		Number     string `json:"number"`
+		Status     string `json:"status"`
+		Completion string `json:"completion"`
+	}
+	list := func() completionRow {
+		t.Helper()
+		code, out := runCozy(t, root, "--json", "--full", "run", "list", "--limit", "1")
+		var document struct {
+			Invocations []completionRow `json:"invocations"`
+		}
+		if code != 0 || json.Unmarshal([]byte(out), &document) != nil || len(document.Invocations) != 1 {
+			t.Fatalf("could not read the live completion row [exit %d]\n%s", code, out)
+		}
+		return document.Invocations[0]
+	}
+	live := list()
+	percent := regexp.MustCompile(`^[1-9][0-9]?%$`)
+	if live.Status != "in_progress" || !percent.MatchString(live.Completion) {
+		t.Fatalf("live run has no measured completion: %+v", live)
+	}
+	if code, out := runCozy(t, root, "run", "watch", live.Number, "--json"); code != 0 ||
+		!strings.Contains(out, `"status":"completed"`) {
+		t.Fatalf("completion proof run did not settle [exit %d]\n%s", code, out)
+	}
+	if terminal := list(); terminal.Status != "completed" || terminal.Completion != "" {
+		t.Fatalf("terminal run retained a redundant completion value: %+v", terminal)
 	}
 }
