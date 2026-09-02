@@ -1,6 +1,6 @@
 # TensorFS
 
-The current release is `0.1.2`.
+The current release is `0.1.3`.
 
 TensorFS stores every domain repository as the same graph:
 
@@ -344,24 +344,32 @@ original TensorFS store.
 ## GC and recovery
 
 ```text
+tfs gc <store> [--dry-run] [--json]
 tfs gc headers <census> --out <header-requests.jsonl>
 tfs gc holds <store> --out <holds.jsonl>
 tfs gc plan <census> --holds <holds.jsonl> --out <plan.jsonl>
 ```
 
-GC marks `repositories -> manifests -> blobs`, adds exact operation/read holds, and plans deletion
-of everything else. Inventory and hold JSONL rows contain only `{key,length}` and
-`{kind,key,length}`; the digest is derived from the canonical domain-local key. Any malformed
-metadata, missing referenced byte, length mismatch, incomplete/out-of-order inventory, or failed
-fence makes the pass delete nothing.
+`tfs gc <store>` is the local reclamation act: under the store's exclusive lock it marks
+`repositories -> manifests -> blobs` from the filesystem alone, keeps what an open ingest session
+root (`tmp/ingest/<session>/session.json`) names, deletes every other blob and manifest, and
+repairs the verified-blob rows so no row outlives its object. `tensorfs.sqlite` is never consulted
+for liveness — the database is not the source of truth; the filesystem is self-describing. It
+prints `reclaimed <bytes> B in <n> objects, kept <bytes> B in <m> held by <k> ingest sessions`
+(`--json` for a program), is idempotent, and converges after a crash (an object is unlinked before
+its row is dropped). A live writer or read lease refuses `STORE_BUSY` naming the holder; a session
+whose writer is gone is abandoned only by the explicit `tfs ingest reap`. `--dry-run` plans without
+deleting; `gc holds` + `gc plan` are the same plan as separate documents, which is how a cloud
+caller (tensorhub) supplies its own holds against a staged census.
+
+Inventory and hold JSONL rows contain only `{key,length}` and `{kind,key,length}`; the digest is
+derived from the canonical domain-local key. Any malformed metadata, missing referenced byte,
+length mismatch, incomplete/out-of-order inventory, or failed fence makes the pass delete nothing.
 
 All temporary admission files, ingest candidates, writer markers, and read-lease markers live under
-`tmp/`. The whole directory is disposable when no TensorFS process is running. Local writers retain
-advisory-locked marker files there, so database rebuild refuses while a writer is
-alive and reaps only markers whose lock the kernel releases. Open source preparations and ordinary
-operations hold exact keys.
-Seven days without accepted object/byte progress only makes an operation eligible for an explicit
-abandonment after its writer is gone and its grants are revoked; time never releases holds itself.
+`tmp/`. Local writers and read leases share the recovery lock there; `gc` and `store rebuild` take
+it exclusively, refuse while any holder is alive, and reap only markers whose lock the kernel
+releases. Time never releases a hold.
 
 Cloud storage uses the same Repository, Manifest, ObjectRef, projection, and reachability code.
 Tensorhub supplies R2 conditional writes/listing and PostgreSQL coordination; TensorFS does not add

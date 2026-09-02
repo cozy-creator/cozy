@@ -16,6 +16,7 @@ pub mod err;
 pub mod fetch;
 pub mod fill;
 pub mod fit;
+pub mod gc;
 #[cfg(feature = "grade")]
 pub mod grade;
 pub mod header;

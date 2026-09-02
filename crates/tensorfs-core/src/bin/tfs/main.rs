@@ -188,6 +188,7 @@ fn main() -> ExitCode {
         }
         ["local", "remove", store, name] => repo::cmd_local_remove(Path::new(store), name, &flags),
         ["key", kind, rest @ ..] => repo::cmd_key(kind, rest),
+        ["gc", root] => repo::cmd_gc(Path::new(root), &flags),
         ["gc", "headers", census] => repo::cmd_gc_headers(Path::new(census), &flags),
         ["gc", "holds", store] => repo::cmd_gc_holds(Path::new(store), &flags),
         ["gc", "plan", census] => repo::cmd_gc_plan(Path::new(census), &flags),
