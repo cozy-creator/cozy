@@ -3,6 +3,7 @@ package producttest
 import (
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -20,7 +21,7 @@ func TestCanceledRunReleasesItsIdempotencyKey(t *testing.T) {
 	defer st.Close()
 
 	recorded, fresh, e := st.Submit(records.Request{
-		Kind: "job", Package: "paul/minimax-h3-tools", Entrypoint: "four-lane",
+		ID: "req-idem-1", Kind: "job", Package: "paul/minimax-h3-tools", Entrypoint: "four-lane",
 		Org: "paul", IdemKey: "model-transfer-test", Payload: []byte("{}"),
 	})
 	fatal(t, e)
@@ -54,5 +55,34 @@ func TestCanceledRunReleasesItsIdempotencyKey(t *testing.T) {
 	fatal(t, e)
 	if row == nil || row.State != "canceled" {
 		t.Fatalf("history must survive under the derived key: %+v", row)
+	}
+
+	second, fresh2, e := st.Submit(records.Request{
+		ID: "req-idem-2", Kind: "job", Package: "paul/minimax-h3-tools", Entrypoint: "four-lane",
+		Org: "paul", IdemKey: "model-transfer-test", Payload: []byte("{}"),
+	})
+	fatal(t, e)
+	if !fresh2 || second.ID == recorded.ID {
+		t.Fatal("released key must admit a fresh run")
+	}
+	fatal(t, st.SettleRequest(second.ID, "failed"))
+	released, e = st.ReleaseCanceledIdempotencyKey("model-transfer-test")
+	fatal(t, e)
+	if !released {
+		t.Fatal("a failed run's key must release once its cause is fixable")
+	}
+	fatal(t, func() *exit.Error { _, _, e := st.Submit(records.Request{
+		Kind: "job", Package: "paul/minimax-h3-tools", Entrypoint: "four-lane",
+		Org: "paul", ID: "req-idem-3", IdemKey: "keep-succeeded", Payload: []byte("{}")}); return e }())
+	if got, e := st.RequestByIdempotencyKey("keep-succeeded"); e != nil || got == nil {
+		t.Fatal("live key still replays")
+	}
+	rows, e := st.RequestByIdempotencyKey("keep-succeeded")
+	fatal(t, e)
+	fatal(t, st.SettleRequest(rows.ID, "succeeded"))
+	released, e = st.ReleaseCanceledIdempotencyKey("keep-succeeded")
+	fatal(t, e)
+	if released {
+		t.Fatal("a succeeded run's key must never release")
 	}
 }

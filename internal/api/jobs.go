@@ -129,7 +129,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	if existing != nil && existing.State == "canceled" {
+	if existing != nil && (existing.State == "canceled" || existing.State == "failed" || existing.State == "refused") {
 		released, e := s.store.ReleaseCanceledIdempotencyKey(key)
 		if e != nil {
 			s.refuseTyped(w, r, e)
