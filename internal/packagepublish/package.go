@@ -150,7 +150,8 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 	}
 	registry := []RegistryRow{}
 	if needsRegistry {
-		registry, problem = collectRegistryRows(ctx, p.Tree, root, dependencies)
+		organization := strings.TrimSpace(document.Tool.Cozy.Organization)
+		registry, problem = collectRegistryRows(ctx, p.Tree, root, organization, dependencies)
 		if problem != nil {
 			p.Close()
 			p.Root = ""
@@ -383,6 +384,9 @@ type projectMetadata struct {
 		OptionalDependencies map[string][]string `toml:"optional-dependencies"`
 	} `toml:"project"`
 	Tool struct {
+		Cozy struct {
+			Organization string `toml:"organization"`
+		} `toml:"cozy"`
 		UV struct {
 			Sources   map[string]any `toml:"sources"`
 			Workspace struct {
