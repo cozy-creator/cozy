@@ -105,7 +105,10 @@ type PackageRemoveCmd struct {
 }
 
 func (c *PackageRemoveCmd) Run(r *Runtime) error {
-	return r.call(handleRm, c.Refs, nil, nil, true)
+	// The daemon is ensured inside the verb, after the removal: a daemon started here
+	// sweeps unreferenced installs on boot, and the verb would then find nothing to
+	// report for a package whose pin was already gone.
+	return r.call(handleRm, c.Refs, nil, nil, false)
 }
 
 type PackageListCmd struct{}
