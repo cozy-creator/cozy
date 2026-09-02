@@ -153,7 +153,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 func presentationMode(w io.Writer, json bool) output.Mode {
 	mode := output.Mode{JSON: json, Human: !json}
 	if file, ok := w.(*os.File); ok && !json {
-		mode.Color = isatty.IsTerminal(file.Fd()) || isatty.IsCygwinTerminal(file.Fd())
+		tty := isatty.IsTerminal(file.Fd()) || isatty.IsCygwinTerminal(file.Fd())
+		mode.Color, mode.TTY = tty, tty
 	}
 	return mode
 }

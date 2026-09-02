@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mattn/go-isatty"
+
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	localapi "github.com/cozy-creator/cozy/internal/client"
@@ -202,7 +204,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		} else {
 			fmt.Fprintf(ctx.Err, "Invoking %s/%s...\n", target.Package, target.Function)
 			if len(launch.AssetPaths(ep.Result)) > 0 {
-				fmt.Fprintf(ctx.Err, "Saving outputs to %s\n", outputDirectoryHint(ctx, target, outputDirectory))
+				fmt.Fprintf(ctx.Err, "Saving outputs to %s\n",
+					errLink(ctx, outputDirectoryHint(ctx, target, outputDirectory)))
 			}
 		}
 		if handle.Replay {
@@ -687,7 +690,7 @@ func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Er
 		defaults = append(defaults, "queue_position")
 	}
 	if export := life.OutputExport; export != nil {
-		fields = append(fields, output.Field{K: "output", V: outputExportHint(export)})
+		fields = append(fields, output.Field{K: "output", V: outputExportHint(ctx.Mode(), export)})
 		defaults = append(defaults, "output")
 	}
 	fields = append(fields, output.Field{K: "changed", V: changed})
@@ -734,14 +737,18 @@ func waitOutputExport(c *localapi.Client, life api.Lifecycle) (api.Lifecycle, *e
 	return life, nil
 }
 
-func outputExportHint(export *api.OutputExportRef) string {
+func outputExportHint(mode output.Mode, export *api.OutputExportRef) string {
 	if export == nil {
 		return ""
 	}
 	if len(export.Paths) > 0 {
-		return strings.Join(export.Paths, ", ")
+		paths := make([]string, 0, len(export.Paths))
+		for _, path := range export.Paths {
+			paths = append(paths, mode.Hyperlink(path))
+		}
+		return strings.Join(paths, ", ")
 	}
-	return export.Directory
+	return mode.Hyperlink(export.Directory)
 }
 
 // outputDirectoryHint is where this run's files will land: the caller's --out, else the
@@ -755,6 +762,19 @@ func outputDirectoryHint(ctx *Context, target Target, explicit string) string {
 		return filepath.Join(ctx.Cfg.Home, "outputs")
 	}
 	return layout.PackageOutputs(target.Package)
+}
+
+// errLink hyperlinks a path for the stderr progress lane. The gate is stderr's
+// own fd: the result writer's mode says nothing about where progress goes.
+func errLink(ctx *Context, path string) string {
+	file, ok := ctx.Err.(*os.File)
+	if !ok || ctx.Mode().JSON ||
+		!(isatty.IsTerminal(file.Fd()) || isatty.IsCygwinTerminal(file.Fd())) {
+		return path
+	}
+	mode := ctx.Mode()
+	mode.TTY = true
+	return mode.Hyperlink(path)
 }
 
 // savedFile is one exported result file as `cozy run` reports it: the path a person
@@ -1238,7 +1258,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		paths := make([]string, 0, len(saved))
 		opaque := false
 		for _, s := range saved {
-			paths = append(paths, s.Path+" ("+output.Bytes(s.Bytes)+")")
+			paths = append(paths, ctx.Mode().Hyperlink(s.Path)+" ("+output.Bytes(s.Bytes)+")")
 			opaque = opaque || s.Mime == opaqueType || s.Mime == ""
 		}
 		if ctx.Mode().JSON {
@@ -1325,7 +1345,7 @@ func triageRemedy(ctx *Context, ref *api.TriageRef, terminal *localapi.Event) st
 		return "the retained triage bundle explains it"
 	}
 	path := layout.TriageFile(ref.SubjectID)
-	remedy := "triage bundle kept at " + path
+	remedy := "triage bundle kept at " + ctx.Mode().Hyperlink(path)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return remedy
