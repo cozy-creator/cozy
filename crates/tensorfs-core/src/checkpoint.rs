@@ -419,9 +419,9 @@ impl Walk {
 }
 
 /// Manifest → CozyTensorsHeader → contained tensor rules → storage-part object runs.
-/// Reaches every and only the objects this manifest commits, and refuses when a reference
-/// the header makes is not CONTAINED in the manifest that carries it.
-pub fn walk(store: &Store, snap: &Manifest) -> Result<Walk> {
+/// Reaches the self-contained runtime closure and deliberately excludes ordinary files that
+/// happen to live beside the CozyTensors entry in the snapshot.
+pub fn walk_cozytensors(store: &Store, snap: &Manifest) -> Result<Walk> {
     // The path law already ran: a Manifest cannot exist unvalidated (manifest.rs).
     let mut w = Walk::default();
     let href = match snap.header() {
@@ -479,6 +479,15 @@ pub fn walk(store: &Store, snap: &Manifest) -> Result<Walk> {
             }
         }
     }
+
+    Ok(w)
+}
+
+/// Reach the complete snapshot: the CozyTensors runtime closure plus every ordinary sibling.
+/// Repository completeness, checkout, retention, and accounting use this full walk; workers
+/// use `walk_cozytensors` because an optional README or sample image is not a runtime input.
+pub fn walk(store: &Store, snap: &Manifest) -> Result<Walk> {
+    let mut w = walk_cozytensors(store, snap)?;
 
     // Anything listed that the header does not account for is a sibling asset — with two
     // audit-driven tightenings (external review, folded in at tfs-003):

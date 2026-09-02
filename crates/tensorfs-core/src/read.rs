@@ -235,14 +235,33 @@ pub fn acquire(
     ))
 }
 
-/// Acquire over everything one manifest commits — the serving case. The transitive walk is
-/// the object set, so the lease covers exactly what the checkpoint declares and nothing else.
+/// Acquire over everything one Manifest commits, including ordinary snapshot siblings. Use this
+/// for full-snapshot operations; model execution uses `acquire_cozytensors` below.
 pub fn acquire_manifest(
     store: &Store,
     meta: &Meta,
     snap: &Manifest,
 ) -> Result<(ReadLease, Receipts)> {
     let walk = checkpoint::walk(store, snap)?;
+    let objects: Vec<ObjectRef> = walk.distinct().into_iter().cloned().collect();
+    let hex = snap.manifest_id();
+    acquire(
+        store,
+        meta,
+        hex.strip_prefix("sha256:").unwrap_or(&hex),
+        objects,
+    )
+}
+
+/// Acquire only the self-contained CozyTensors runtime closure selected by a Manifest.
+/// Ordinary snapshot siblings remain retained by the Manifest but do not consume worker file
+/// descriptors and need not be resident for model execution.
+pub fn acquire_cozytensors(
+    store: &Store,
+    meta: &Meta,
+    snap: &Manifest,
+) -> Result<(ReadLease, Receipts)> {
+    let walk = checkpoint::walk_cozytensors(store, snap)?;
     let objects: Vec<ObjectRef> = walk.distinct().into_iter().cloned().collect();
     let hex = snap.manifest_id();
     acquire(

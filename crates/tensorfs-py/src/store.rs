@@ -175,6 +175,18 @@ fn missing(py: Python<'_>, what: &str, field: &str) -> PyErr {
     )
 }
 
+fn walk_rows<'p>(py: Python<'p>, walk: &checkpoint::Walk) -> PyResult<Bound<'p, PyList>> {
+    let rows = PyList::empty(py);
+    for reached in &walk.objects {
+        let row = PyDict::new(py);
+        row.set_item("id", reached.obj.id())?;
+        row.set_item("length", reached.obj.length)?;
+        row.set_item("kind", reached.kind)?;
+        rows.append(row)?;
+    }
+    Ok(rows)
+}
+
 fn required<'p>(
     py: Python<'p>,
     dict: &Bound<'p, PyDict>,
@@ -987,15 +999,16 @@ impl PyStore {
         let w = py
             .detach(|| checkpoint::walk(&self.store, &m))
             .or_refuse(py)?;
-        let l = PyList::empty(py);
-        for r in &w.objects {
-            let d = PyDict::new(py);
-            d.set_item("id", r.obj.id())?;
-            d.set_item("length", r.obj.length)?;
-            d.set_item("kind", r.kind)?;
-            l.append(d)?;
-        }
-        Ok(l)
+        walk_rows(py, &w)
+    }
+
+    /// The selected CozyTensors runtime closure, excluding ordinary snapshot siblings.
+    fn walk_cozytensors<'p>(&self, py: Python<'p>, hex: &str) -> PyResult<Bound<'p, PyList>> {
+        let (m, _, _) = self.load(py, hex)?;
+        let w = py
+            .detach(|| checkpoint::walk_cozytensors(&self.store, &m))
+            .or_refuse(py)?;
+        walk_rows(py, &w)
     }
 
     /// `ReadLease = store.acquire(manifest, object_set)`. Verifies every object first and
@@ -1027,6 +1040,19 @@ impl PyStore {
         let (m, _, _) = self.load(py, hex)?;
         let (lease, rx) = py
             .detach(|| read::acquire_manifest(&self.store, &self.meta, &m))
+            .or_refuse(py)?;
+        Ok(PyLease {
+            lease: Mutex::new(Some(lease)),
+            meta: self.meta.clone(),
+            receipts: rx,
+        })
+    }
+
+    /// Acquire the selected CozyTensors runtime closure without optional snapshot siblings.
+    fn acquire_cozytensors(&self, py: Python<'_>, hex: &str) -> PyResult<PyLease> {
+        let (m, _, _) = self.load(py, hex)?;
+        let (lease, rx) = py
+            .detach(|| read::acquire_cozytensors(&self.store, &self.meta, &m))
             .or_refuse(py)?;
         Ok(PyLease {
             lease: Mutex::new(Some(lease)),
@@ -2099,5 +2125,14 @@ pub fn fetch_admit<'p>(
 pub fn fetch_complete(py: Python<'_>, store: &PyStore, plan: &[u8]) -> PyResult<u64> {
     let plan = tensorfs_core::fetch::FetchPlan::parse(plan).or_refuse(py)?;
     py.detach(|| plan.complete(&store.store)).or_refuse(py)?;
+    Ok(plan.declared_bytes())
+}
+
+/// Prove the unchanged FetchPlan against Manifest + selected CozyTensors runtime objects only.
+#[pyfunction]
+pub fn fetch_complete_cozytensors(py: Python<'_>, store: &PyStore, plan: &[u8]) -> PyResult<u64> {
+    let plan = tensorfs_core::fetch::FetchPlan::parse(plan).or_refuse(py)?;
+    py.detach(|| plan.complete_cozytensors(&store.store))
+        .or_refuse(py)?;
     Ok(plan.declared_bytes())
 }

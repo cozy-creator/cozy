@@ -1067,11 +1067,6 @@ fn closure_refs(
             },
         )?;
     }
-    for (_, entry) in manifest.entries() {
-        if let Entry::File(object) = entry {
-            insert(&mut refs, "file", object)?;
-        }
-    }
     for (_, asset) in &header.assets {
         for object in &asset.segments {
             insert(&mut refs, "model_asset", object)?;
@@ -1084,6 +1079,13 @@ fn closure_refs(
                     insert(&mut refs, "part", object)?;
                 }
             }
+        }
+    }
+    // Runtime roles precede ordinary snapshot paths so an aliased README/sample path cannot
+    // relabel a required config, model asset, or tensor part as an ignorable file.
+    for (_, entry) in manifest.entries() {
+        if let Entry::File(object) = entry {
+            insert(&mut refs, "file", object)?;
         }
     }
     Ok(refs)
@@ -1229,4 +1231,80 @@ pub fn cmd_rebuild(census: &Path, flags: &Flags) -> ExitCode {
         projection.objects.len()
     );
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use tensorfs_core::manifest::Draft;
+
+    #[test]
+    fn inspect_closure_preserves_runtime_roles_over_aliased_files() {
+        let vectors = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors/cases");
+        let header = Header::parse(
+            &fs::read(vectors.join("header/plain-fp8.cbor")).expect("read frozen header"),
+        )
+        .unwrap();
+        let manifest = Manifest::parse(
+            &fs::read(vectors.join("manifest/checkpoint-extra-file.json"))
+                .expect("read frozen manifest"),
+        )
+        .unwrap();
+        let header_ref = manifest.header().unwrap().clone();
+        let part = header
+            .tensors()
+            .find_map(|(_, _, tensor)| {
+                tensor
+                    .parts
+                    .iter()
+                    .find_map(|(_, part)| part.segments().first().cloned())
+            })
+            .expect("frozen header has a segmented part");
+        let mut draft = Draft::of(&manifest);
+        draft
+            .entries
+            .push(("weights/aliased-part.bin".into(), Entry::File(part.clone())));
+        draft.entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let manifest = draft.seal().unwrap();
+        let refs = closure_refs(&manifest, &header, &header_ref).unwrap();
+        let file_ids: HashSet<&str> = manifest
+            .entries()
+            .iter()
+            .filter_map(|(_, entry)| match entry {
+                Entry::File(object) => Some(object.sha256.as_str()),
+                Entry::CozyTensors(_) => None,
+            })
+            .collect();
+
+        assert!(header
+            .configs
+            .iter()
+            .any(|(_, config)| file_ids.contains(config.sha256.as_str())));
+        assert!(header.assets.iter().any(|(_, asset)| asset
+            .segments
+            .iter()
+            .any(|segment| file_ids.contains(segment.sha256.as_str()))));
+        for (_, config) in &header.configs {
+            assert_eq!(refs[&config.sha256].0, "config");
+        }
+        for (_, asset) in &header.assets {
+            for segment in &asset.segments {
+                assert_eq!(refs[&segment.sha256].0, "model_asset");
+            }
+        }
+        assert_eq!(refs[&part.sha256].0, "part");
+
+        let runtime_ids: HashSet<&str> = refs
+            .values()
+            .filter(|(kind, _)| *kind != "file")
+            .map(|(_, object)| object.sha256.as_str())
+            .collect();
+        assert!(manifest.entries().iter().any(|(_, entry)| match entry {
+            Entry::File(object) => {
+                !runtime_ids.contains(object.sha256.as_str()) && refs[&object.sha256].0 == "file"
+            }
+            Entry::CozyTensors(_) => false,
+        }));
+    }
 }

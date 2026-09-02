@@ -1407,7 +1407,7 @@ fn resolve_sources(
         let header = checkpoint::load_header(store, &header_ref)?;
         let closure = checkpoint::load_closure(store, &header)?;
         header.validate(&closure)?;
-        let walk = checkpoint::walk(store, &manifest)?;
+        let walk = checkpoint::walk_cozytensors(store, &manifest)?;
         walk.require_resident(store)?;
         // This is the zero-read/zero-hash inherit gate: the verification record proves the
         // exact installed inode/length/generation without opening or hashing payload bytes.
@@ -2009,7 +2009,7 @@ pub fn begin(
     }
     let mut source_leases = Vec::new();
     for source in &sources {
-        match read::acquire_manifest(store, meta, &source.manifest) {
+        match read::acquire_cozytensors(store, meta, &source.manifest) {
             Ok((lease, receipts)) if receipts.0.is_empty() => {
                 source_leases.push((source.fact.alias.clone(), lease));
             }
@@ -2736,4 +2736,162 @@ pub fn dispose(store: &Store, meta: &Meta, transaction: &str) -> Result<Disposit
         receipt: receipt_from(store, &row)?,
         disposition: desired,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::header::{Closure, Part, Tensor};
+    use crate::ids::Doc;
+    use crate::manifest::{Draft, Entry};
+    use crate::repository::{Mutation, ReleaseLane, RepositoryName};
+    use crate::store::Fault;
+    use std::fs;
+
+    #[test]
+    fn derived_source_ignores_missing_snapshot_siblings() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-derived-runtime-closure-{}-{}",
+            std::process::id(),
+            crate::meta::now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let meta = Meta::open(&store).unwrap();
+        let spec = crate::registry::seeds()
+            .into_iter()
+            .find(|seed| seed.alias == "plain/1")
+            .unwrap()
+            .spec;
+        let header = Header {
+            configs: Vec::new(),
+            assets: Vec::new(),
+            encodings: vec![spec.clone()],
+            components: vec![(
+                "model".into(),
+                vec![(
+                    "weight".into(),
+                    Tensor {
+                        dtype: Dtype::F32,
+                        shape: vec![1],
+                        encoding: spec.object_id(),
+                        parts: vec![("value".into(), Part::plan(Dtype::F32, vec![1], &[0; 4]))],
+                    },
+                )],
+            )],
+        };
+        header.validate(&Closure::default()).unwrap();
+        let header_bytes = header.canonical_bytes().unwrap();
+        let header_ref = store
+            .put_stream(
+                &mut header_bytes.as_slice(),
+                Some(&ObjectRef::of(&header_bytes)),
+                &Fault::default(),
+            )
+            .unwrap()
+            .obj;
+        let readme_bytes = b"checkpoint notes";
+        let readme = store
+            .put_stream(
+                &mut readme_bytes.as_slice(),
+                Some(&ObjectRef::of(readme_bytes)),
+                &Fault::default(),
+            )
+            .unwrap()
+            .obj;
+        let sample_bytes = b"sample image";
+        let sample = store
+            .put_stream(
+                &mut sample_bytes.as_slice(),
+                Some(&ObjectRef::of(sample_bytes)),
+                &Fault::default(),
+            )
+            .unwrap()
+            .obj;
+        let manifest = Draft {
+            entries: vec![
+                ("README.txt".into(), Entry::File(readme.clone())),
+                (
+                    "model.cozytensors".into(),
+                    Entry::CozyTensors(header_ref.clone()),
+                ),
+                ("samples/example.png".into(), Entry::File(sample.clone())),
+            ],
+        }
+        .seal()
+        .unwrap();
+        let manifest_ref = store.put_manifest(&manifest).unwrap().obj;
+        let repo = RepositoryName::new("org", "derived-source").unwrap();
+        let checkpointed = store
+            .apply_repository(
+                None,
+                &Mutation::PutCheckpoint {
+                    repo: repo.clone(),
+                    manifest: manifest_ref.clone(),
+                    evidence: None,
+                },
+                &Fault::default(),
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .apply_repository(
+                Some(&checkpointed.canonical_bytes()),
+                &Mutation::UpdateRelease {
+                    expected_revision: 0,
+                    repo,
+                    remove: Vec::new(),
+                    set: vec![ReleaseLane {
+                        lane: "main".into(),
+                        manifest: manifest_ref.clone(),
+                    }],
+                    version: "1.0.0".into(),
+                },
+                &Fault::default(),
+            )
+            .unwrap();
+
+        fs::remove_file(store.blob_path(&readme.sha256)).unwrap();
+        fs::remove_file(store.blob_path(&sample.sha256)).unwrap();
+        assert_eq!(
+            checkpoint::walk(&store, &manifest)
+                .unwrap()
+                .require_resident(&store)
+                .unwrap_err()
+                .code,
+            Code::OBJECT_ABSENT
+        );
+
+        let transaction = format!("sha256:{}", "11".repeat(32));
+        let begun = begin(
+            &store,
+            &meta,
+            &transaction,
+            1,
+            Declaration {
+                sources: vec![Source {
+                    alias: "source".into(),
+                    manifest: manifest_ref,
+                }],
+                components: vec![ComponentDeclaration {
+                    target: "model".into(),
+                    source: Some("source".into()),
+                    source_component: Some("model".into()),
+                    drop: Vec::new(),
+                    add: Vec::new(),
+                }],
+                configs: Vec::new(),
+                order: vec![("model".into(), "weight".into())],
+                max_new_bytes: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(begun.source_views.len(), 1);
+        assert_eq!(begun.source_leases.len(), 1);
+        assert_eq!(begun.source_leases[0].1.objects(), &[header_ref]);
+        for (_, lease) in begun.source_leases {
+            lease.release(&meta).unwrap();
+        }
+        begun.writer_hold.release(&meta).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
 }

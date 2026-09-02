@@ -185,8 +185,23 @@ impl FetchPlan {
     /// This is deliberately not "the transfer reported success": a 200 on every GET says the
     /// remote answered, and says nothing about what is on this disk.
     pub fn complete(&self, store: &Store) -> Result<()> {
+        self.complete_with(store, crate::checkpoint::walk)
+    }
+
+    /// Prove completion of the selected CozyTensors runtime closure while ignoring ordinary
+    /// snapshot siblings. The FetchPlan document is unchanged; only its declared object set and
+    /// the authoritative walk it must equal differ.
+    pub fn complete_cozytensors(&self, store: &Store) -> Result<()> {
+        self.complete_with(store, crate::checkpoint::walk_cozytensors)
+    }
+
+    fn complete_with(
+        &self,
+        store: &Store,
+        walk: fn(&Store, &crate::manifest::Manifest) -> Result<crate::checkpoint::Walk>,
+    ) -> Result<()> {
         let manifest = store.read_manifest(&self.manifest)?;
-        let reached = crate::checkpoint::walk(store, &manifest)?;
+        let reached = walk(store, &manifest)?;
         let mut declared: Vec<ObjectRef> = self.held.iter().chain(&self.wanted).cloned().collect();
         declared
             .sort_by(|left, right| (&left.sha256, left.length).cmp(&(&right.sha256, right.length)));
@@ -438,10 +453,13 @@ impl DeliveryGrant {
 mod tests {
     use super::*;
     use crate::dtype::Dtype;
-    use crate::header::{Closure, Header, Part, Tensor};
+    use crate::header::{Asset, Body, Closure, Header, Part, Tensor};
+    use crate::ids::ConfigRef;
     use crate::manifest::{Draft, Entry, Manifest};
+    use crate::meta::Meta;
     use crate::registry;
     use crate::store::Fault;
+    use crate::{checkpoint, read};
     use std::fs;
 
     fn temporary(name: &str) -> std::path::PathBuf {
@@ -564,6 +582,145 @@ mod tests {
         assert!(!destination.manifest_path(&manifest.sha256).exists());
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(second);
+    }
+
+    #[test]
+    fn runtime_closure_ignores_missing_snapshot_siblings() {
+        let root = temporary("runtime-closure");
+        let store = Store::init(&root).unwrap();
+        let spec = registry::seeds()
+            .into_iter()
+            .find(|seed| seed.alias == "plain/1")
+            .unwrap()
+            .spec;
+        let config_bytes = b"{}";
+        let config = ObjectRef::of(config_bytes);
+        store
+            .put_stream(
+                &mut config_bytes.as_slice(),
+                Some(&config),
+                &Fault::default(),
+            )
+            .unwrap();
+        let tokenizer_bytes = b"tokenizer vocabulary";
+        let tokenizer = ObjectRef::of(tokenizer_bytes);
+        store
+            .put_stream(
+                &mut tokenizer_bytes.as_slice(),
+                Some(&tokenizer),
+                &Fault::default(),
+            )
+            .unwrap();
+        let part_bytes = vec![0u8; 260];
+        let part = ObjectRef::of(&part_bytes);
+        store
+            .put_stream(&mut part_bytes.as_slice(), Some(&part), &Fault::default())
+            .unwrap();
+        let header_document = Header {
+            configs: vec![(
+                "model".into(),
+                ConfigRef {
+                    sha256: config.sha256.clone(),
+                    length: config.length,
+                    media_type: "application/json".into(),
+                },
+            )],
+            assets: vec![(
+                "tokenizer/vocab.txt".into(),
+                Asset {
+                    logical_sha256: tokenizer.sha256.clone(),
+                    logical_length: tokenizer.length,
+                    media_type: "text/plain".into(),
+                    segments: vec![tokenizer.clone()],
+                },
+            )],
+            encodings: vec![spec.clone()],
+            components: vec![(
+                "model".into(),
+                vec![(
+                    "weight".into(),
+                    Tensor {
+                        dtype: Dtype::F32,
+                        shape: vec![65],
+                        encoding: spec.object_id(),
+                        parts: vec![(
+                            "value".into(),
+                            Part {
+                                dtype: Dtype::F32,
+                                shape: vec![65],
+                                body: Body::Segments(vec![part.clone()]),
+                            },
+                        )],
+                    },
+                )],
+            )],
+        };
+        header_document.validate(&Closure::default()).unwrap();
+        let header_bytes = header_document.canonical_bytes().unwrap();
+        let header = ObjectRef::of(&header_bytes);
+        store
+            .put_stream(
+                &mut header_bytes.as_slice(),
+                Some(&header),
+                &Fault::default(),
+            )
+            .unwrap();
+        let readme = ObjectRef::of(b"checkpoint notes");
+        let sample = ObjectRef::of(b"sample image bytes");
+        let manifest = Draft {
+            entries: vec![
+                ("README.txt".into(), Entry::File(readme.clone())),
+                (
+                    "model.cozytensors".into(),
+                    Entry::CozyTensors(header.clone()),
+                ),
+                ("model/config.json".into(), Entry::File(config.clone())),
+                ("samples/example.png".into(), Entry::File(sample.clone())),
+            ],
+        }
+        .seal()
+        .unwrap();
+        let manifest_ref = store.put_manifest(&manifest).unwrap().obj;
+
+        let runtime = checkpoint::walk_cozytensors(&store, &manifest).unwrap();
+        assert_eq!(runtime.count("header"), 1);
+        assert_eq!(runtime.count("config"), 1);
+        assert_eq!(runtime.count("model_asset"), 1);
+        assert_eq!(runtime.count("part"), 1);
+        assert_eq!(runtime.distinct().len(), 4);
+        assert!(runtime.siblings.is_empty());
+        runtime.require_resident(&store).unwrap();
+
+        let snapshot = checkpoint::walk(&store, &manifest).unwrap();
+        assert_eq!(
+            snapshot.siblings,
+            vec!["README.txt".to_string(), "samples/example.png".to_string()]
+        );
+        assert!(snapshot.objects.iter().any(|reached| reached.obj == readme));
+        assert!(snapshot.objects.iter().any(|reached| reached.obj == sample));
+        assert_eq!(
+            snapshot.require_resident(&store).unwrap_err().code,
+            Code::OBJECT_ABSENT
+        );
+
+        let declared = vec![header, config, tokenizer, part];
+        let (plan, _) = FetchPlan::of(&store, "runtime", &manifest_ref, &declared).unwrap();
+        plan.complete_cozytensors(&store).unwrap();
+        assert_eq!(plan.complete(&store).unwrap_err().code, Code::NOT_CONTAINED);
+
+        let meta = Meta::open(&store).unwrap();
+        let (lease, _) = read::acquire_cozytensors(&store, &meta, &manifest).unwrap();
+        assert_eq!(lease.objects().len(), 4);
+        lease.release(&meta).unwrap();
+        assert_eq!(
+            read::acquire_manifest(&store, &meta, &manifest)
+                .err()
+                .unwrap()
+                .code,
+            Code::OBJECT_ABSENT
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }
 
