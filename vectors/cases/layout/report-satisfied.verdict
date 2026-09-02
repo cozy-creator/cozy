@@ -1,5 +1,5 @@
 doc: compat_report
 expect: ok
-id: sha256:8331ff838e722d7844834cf518a12e288dd68bcdd764bf9a78bf86fa6259944c
+id: sha256:2da70c414acea0fbb959781cdc08c54a34065d2009294cabbc2ef9d7f14b24e0
 grade: COMPATIBLE
-note: Satisfied, with the component-granular encoding facts grading needs
+note: no fact recorded, with the component-granular encoding facts grading needs

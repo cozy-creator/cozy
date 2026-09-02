@@ -61,6 +61,28 @@ jobs:
             --alias plain/1 x cpu --json)
           diff <(cat "$m/capability-unqualified.json"; echo) <(./target/release/tfs capability \
             --alias plain/1 x cuda.sm89 --json)
+      # tfs-042: the ONE fit function, in the shipped binary, over the frozen pair. The ok arm
+      # exits 0 and prints the frozen machine document; the planted shape edit is the frozen
+      # `fit-shape-mismatch` document and MUST exit with the shape_mismatch code (12).
+      - run: |
+          set -e
+          m=vectors/cases/machine
+          diff <(cat "$m/fit-ok.json"; echo) <(./target/release/tfs fit \
+            vectors/cases/layout/code-topology.json . vectors/cases/header/plain-fp8.cbor \
+            --device cpu --json)
+          python3 - <<'PY'
+          import json
+          d = json.load(open("vectors/cases/layout/code-topology.json"))
+          keys = d["components"]["transformer"]
+          keys[sorted(keys)[-1]]["shape"] = [7]
+          open("planted.json", "w").write(json.dumps(d, sort_keys=True, separators=(",", ":")))
+          PY
+          set +e
+          ./target/release/tfs fit planted.json . vectors/cases/header/plain-fp8.cbor --json > planted.out
+          code=$?
+          set -e
+          diff <(cat "$m/fit-shape-mismatch.json"; echo) planted.out
+          test "$code" -eq 12
       # The BATCH grading surface (tfs-039). Grading is microseconds; `tfs grade <file>` is
       # one report per process, so the wall was the ~2.5 ms of spawn around it — irrelevant
       # for a preflight check and the entire cost of a catalog search. Every frozen report

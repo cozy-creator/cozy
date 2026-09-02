@@ -1,4 +1,4 @@
 doc: machine_check
 expect: ok
-id: sha256:604345c4ec79cb11c41f1634d4bccea65257c42ae8b10d0a626f86e0354b80a4
+id: sha256:1849257ed15a3156e31c2c121a311daf2d426381292d8e9a02a45f271bd4e560
 note: Satisfied: `details` empty, `encodings` carrying the pairs the DEVICE axis is then asked about one at a time

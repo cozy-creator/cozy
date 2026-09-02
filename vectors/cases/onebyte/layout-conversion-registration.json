@@ -1,1 +1,1 @@
-{"mapping":{"from":"bf16","t":"widen","to":"f32"},"name":"bf16-to-f32","registered_by":"tensosfs-core/0.0.8","round_trip":{"bytes":131072,"cases":1,"corpus":{"length":131072,"sha256":"68e419472d25e0b85e9917ccf692fd58245c5e95e9a46f07d1df81d2e9da246b"},"coverage":"complete-domain"}}
+{"mapping":{"from":"bf16","t":"widen","to":"f32"},"name":"bf16-to-f32","registered_by":"tensosfs-core/0.1.0","round_trip":{"bytes":131072,"cases":1,"corpus":{"length":131072,"sha256":"68e419472d25e0b85e9917ccf692fd58245c5e95e9a46f07d1df81d2e9da246b"},"coverage":"complete-domain"}}

@@ -1,5 +1,5 @@
-//! tensorfs-core — canonical documents, tensor rules, the structure function, and the
-//! encoding registry (tfs-013). See tracker-v2/cozytensors.md and tensorfs.md.
+//! tensorfs-core — canonical documents, tensor rules, the fit function, and the encoding
+//! registry (tfs-013). See tracker-v2/cozytensors.md and tensorfs.md.
 
 #![forbid(unsafe_code)]
 
@@ -9,13 +9,13 @@ pub mod capability;
 pub mod catalog;
 mod cbor;
 pub mod checkpoint;
-pub mod compat;
 pub mod corpus;
 pub mod derived;
 pub mod dtype;
 pub mod err;
 pub mod fetch;
 pub mod fill;
+pub mod fit;
 #[cfg(feature = "grade")]
 pub mod grade;
 pub mod header;
@@ -35,7 +35,4 @@ pub mod sha256;
 pub mod spec;
 pub mod storage;
 pub mod store;
-pub mod structure;
 pub mod vectors;
-#[cfg(feature = "grade")]
-pub mod verifier;

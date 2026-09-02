@@ -552,7 +552,7 @@ impl Store {
                 "repository bytes changed since the caller observed them",
             );
         }
-        let (classification, actual_contract) = match mutation {
+        let (derived, actual_contract) = match mutation {
             crate::repository::Mutation::PutCheckpoint { manifest, .. }
             | crate::repository::Mutation::ReplaceLocal { manifest, .. } => {
                 let parsed = self.read_manifest(manifest)?;
@@ -571,7 +571,7 @@ impl Store {
                         let header = crate::checkpoint::load_header(self, header_ref)?;
                         crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;
                         let contract = ExpectedCheckpointContract::from_header(&header);
-                        (Some(contract.topology_digest.clone()), Some(contract))
+                        (Some(header.digests()), Some(contract))
                     }
                     None => (None, None),
                 }
@@ -600,7 +600,7 @@ impl Store {
             | crate::repository::Mutation::YankRelease { .. }
             | crate::repository::Mutation::DeleteRepository { .. } => (None, None),
         };
-        let replacement = crate::repository::apply(observed, mutation, classification.as_deref())?;
+        let replacement = crate::repository::apply(observed, mutation, derived.as_ref())?;
         if let Some(expected) = expected {
             let actual = actual_contract.as_ref().ok_or_else(|| Refusal {
                 code: Code::MISSING_FIELD,

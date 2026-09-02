@@ -106,9 +106,7 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
     )
     assert admitted_manifest["id"] == "sha256:" + snap
     evidence = json.dumps(
-        {"classification_digest": tensorfs.topology_digest(info["header"])},
-        sort_keys=True,
-        separators=(",", ":"),
+        tensorfs.digests(info["header"]), sort_keys=True, separators=(",", ":")
     ).encode()
     expected = {
         "expected_topology": tensorfs.topology_digest(info["header"]),

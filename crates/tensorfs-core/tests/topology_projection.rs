@@ -17,10 +17,10 @@
 use std::path::PathBuf;
 
 use tensorfs_core::canon::{self, Value};
-use tensorfs_core::compat::{
-    self, Accepts, CodeTopology, CompatibilityReport, Depth, Lane, Requirement,
-};
 use tensorfs_core::dtype::Dtype;
+use tensorfs_core::fit::{
+    self as compat, Accepts, CodeTopology, CompatibilityReport, Custody, Depth, Requirement,
+};
 use tensorfs_core::header::{
     self, Closure, Header, Projection, TOPOLOGY_IDENTITY_DOMAIN, TOPOLOGY_SHAPE_DOMAIN,
 };
@@ -285,6 +285,7 @@ fn the_report_carries_both_projections_for_both_sides() {
                                     dtype: t.dtype,
                                     shape: t.shape.clone(),
                                     accepts: Accepts::Any,
+                                    pinned: false,
                                 },
                             )
                         })
@@ -292,6 +293,7 @@ fn the_report_carries_both_projections_for_both_sides() {
                 )
             })
             .collect(),
+        constructed_components: header.components.iter().map(|(c, _)| c.clone()).collect(),
     };
     let mut recast = identity.clone();
     for (_, keys) in recast.components.iter_mut() {
@@ -311,26 +313,25 @@ fn the_report_carries_both_projections_for_both_sides() {
             &header,
             &closure,
             &pin,
-            Lane::Canonical,
-            &[],
+            Custody::Canonical,
             Depth::Full,
         )
         .expect("the check runs");
-        CompatibilityReport::of(code, &header, Lane::Canonical, &out).expect("the report builds")
+        CompatibilityReport::of(code, &header, Custody::Canonical, &out).expect("the report builds")
     };
 
     // The exact-index HIT: both projections agree on both sides.
     let hit = report(&identity);
     assert!(hit.is_satisfied());
     assert_eq!(hit.topology_required, hit.topology_present);
-    assert_eq!(hit.topology_shape_required, hit.topology_shape_present);
+    assert_eq!(hit.shape_required, hit.shape_present);
 
     // The interesting half: an exact MISS that is a shape HIT.
     let candidate = report(&recast);
     assert!(!candidate.is_satisfied());
     assert_ne!(candidate.topology_required, candidate.topology_present);
     assert_eq!(
-        candidate.topology_shape_required, candidate.topology_shape_present,
+        candidate.shape_required, candidate.shape_present,
         "a dtype-only recast is the same shape bucket"
     );
 
@@ -340,18 +341,12 @@ fn the_report_carries_both_projections_for_both_sides() {
     let back = CompatibilityReport::parse(&bytes).expect("it re-parses");
     assert_eq!(back, candidate);
     let text = String::from_utf8(bytes).expect("canonical bytes are ASCII");
-    assert!(text.contains("\"topology_shape_present\":"));
-    assert!(text.contains("\"topology_shape_required\":"));
+    assert!(text.contains("\"shape_present\":"));
+    assert!(text.contains("\"shape_required\":"));
 
     // The shape digest is the header's own, by the same code path.
-    assert_eq!(
-        candidate.topology_shape_present,
-        header.topology_shape_digest()
-    );
-    assert_eq!(
-        candidate.topology_shape_required,
-        recast.topology_shape_digest()
-    );
+    assert_eq!(candidate.shape_present, header.shape_digest());
+    assert_eq!(candidate.shape_required, recast.shape_digest());
 }
 
 /// A report missing either shape digest is refused, not defaulted. An absent field that
@@ -364,8 +359,8 @@ fn a_report_without_its_shape_digests_is_refused() {
     // The plant renames the field's LAST character, so the key set stays sorted and the
     // refusal is about the missing field rather than about canonical ordering.
     for (field, planted) in [
-        ("topology_shape_present", "topology_shape_presenz"),
-        ("topology_shape_required", "topology_shape_requirez"),
+        ("shape_present", "shape_presenz"),
+        ("shape_required", "shape_requirez"),
     ] {
         let cut = text.replace(&format!("\"{field}\":"), &format!("\"{planted}\":"));
         assert_ne!(cut, text, "the plant applied");

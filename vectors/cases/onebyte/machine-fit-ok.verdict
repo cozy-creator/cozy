@@ -1,0 +1,3 @@
+doc: machine_fit
+expect: mutant
+note: one byte flipped at offset 88 of sha256:c69f9ecd538dec9dd2955a5f57ff4815200b70a90f8487246ac39aba03fa38a3

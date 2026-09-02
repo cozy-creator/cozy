@@ -77,8 +77,6 @@ fn plan(root: &Path, weight: &Path, bias: &Path) -> PathBuf {
         "ingest",
         "bank",
         "safetensors.diffusers",
-        "liveness-test",
-        "big",
         "diffusers.identity/1",
         "--registry",
     ]);

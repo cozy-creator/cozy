@@ -1,0 +1,4 @@
+doc: compat_report
+expect: refuse
+code: UNKNOWN_FIELD
+note: a third custody: canonical and local are the closed set (D5)

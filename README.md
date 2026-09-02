@@ -42,11 +42,11 @@ frozen corpus verifies every one:
 | `EncodingVectors` | compiled-in registry fixture |
 | `IngestProfile`, `IngestSubject`, `IngestSession` | the ingest border's own documents |
 | `IngestVerificationReceipt`, `Stamp` | ingest evidence, digested but not path-typed |
-| `CodeTopology`, `CompatibilityReport` | the layout plane's inputs and output |
+| `CodeTopology`, `CompatibilityReport` | `fit`'s code side, and the grade plane's walk record |
 
-Three more are neither stored nor exchanged as documents but are a cross-repository contract
-all the same: the `--json` output of `compat check`, `grade` and `capability`, which tensorhub
-shells out for and decodes. They are frozen in `vectors/cases/machine/` and RE-EMITTED by
+Four more are neither stored nor exchanged as documents but are a cross-repository contract
+all the same: the `--json` output of `fit`, `compat check`, `grade` and `capability`, which
+consumers shell out for and decode. They are frozen in `vectors/cases/machine/` and RE-EMITTED by
 `tfs vectors verify`, so adding a key to any of them fails here, on the producer, naming the
 consumer — instead of breaking it silently at runtime, which it did twice.
 
@@ -59,10 +59,42 @@ system.
 The native wheel is `cp312-abi3`, so CPython 3.12 is the floor and every later CPython loads
 the same wheel.
 
-`tensorfs.CodeTensor(component, key, dtype, shape, accepts)` and
-`tensorfs.code_topology(contract_digest, tensors)` are the one Python author seam for canonical
-CodeTopology bytes. Callers project exact component/key fields from their own code contract;
-TensorFS validates and writes them but never parses the foreign contract or guesses key prefixes.
+`tensorfs.CodeTensor(component, key, dtype, shape, accepts, pinned=False)` and
+`tensorfs.code_topology(contract_digest, tensors, constructed_components=None)` are the one
+Python author seam for canonical CodeTopology bytes: the meta-device census of `factory(config)`,
+which TensorFS validates and writes but never computes.
+
+## Fit
+
+`fit` is the ONE code <-> checkpoint matching function (tfs-042; design
+`tracker/cross-cutting/model-code-fit.md` §3). Two inputs — a `CodeTopology` and a `cozytensors/1`
+header — and exactly one of eight answers with the text a human reads:
+
+```text
+tfs fit <code-topology.json> <root> <header-id|header.cbor> [--custody canonical|local]
+    [--device <class> --observations <records.json>] [--json]
+```
+
+| code | rule |
+| --- | --- |
+| `ok` | routes counted: `verbatim` (plain), `decoded_float`, `encoded_gemm` |
+| `component_missing` | (1) every component the code constructs exists; extra components are ignored |
+| `tensor_missing`, `shape_mismatch` | (2) every constructed key exists at the same logical shape |
+| `dtype_pinned_mismatch` | (3) a `pinned` destination takes its dtype or a lossless widening; otherwise dtype is delivery's business |
+| `extra_tensor` | (4) a stored key inside a constructed component the code does not consume — refused on `canonical` custody, listed and ignored on `local` |
+| `encoding_unsupported` | (5) every stored encoding is admitted by the row's `accepts` |
+| `encoding_unqualified` | (6) with `--device`, every encoded leaf has a qualification record for that class (plain storage has nothing to qualify) |
+
+Exit 0 on `ok`, one distinct code per refusal (10..16). The same answer is
+`tensorfs.fit(code_topology, header, *, custody, device=None, observations=None) -> dict`, and
+`tensorfs.capability(encoding, device, observations=None)` answers the device axis alone. There is
+no grade in a fit; `tfs compat check` / `tfs grade` are the search plane's ranking over the same
+walk.
+
+Every checkpoint row carries three header-derived digests, printed by `tfs checkpoint info` and
+`tfs repo list`: `topology_digest` (identity), `shape_digest` (the fit index — dtype elided) and
+`config_digest` (the header's `configs` map, i.e. the construction document). `tfs repo migrate
+<store>` re-derives them for rows written before tfs-042.
 
 Everything below is what CI runs, in the same order.
 
@@ -168,8 +200,8 @@ union (`bytes_total`), `bytes_unique_sum`, `bytes_unreferenced` (verified blobs 
 reaches) and `repos`. Manifests are not counted; a blob counts once per repository however many
 paths list it.
 
-Evidence is present only for a Manifest containing one typed CozyTensors header. Ordinary files do
-not fabricate model classification. Rebuild always recovers the repository, Manifest, and complete
+Evidence is present only for a Manifest containing one typed CozyTensors header, and its three
+digests are re-derived from that header on every read. Ordinary files carry no digests. Rebuild always recovers the repository, Manifest, and complete
 reached blob set;
 model headers additionally recover the diagnostic projection emitted by `store rebuild --rows`.
 
@@ -187,7 +219,7 @@ the generic SDXL profile uses `civitai/files/`. Omitting both bindings remains l
 local profile cannot steal a provider candidate:
 
 ```text
-tfs ingest bank <dialect> <family> <variant> <converter> \
+tfs ingest bank <dialect> <converter> \
   --source <component>=<review-carrier>... --registry <registry.json> \
   --source-profile <name> --target <component>=<encoding>... \
   [--member <component>=<canonical-provider-member>]... --order <order.json>

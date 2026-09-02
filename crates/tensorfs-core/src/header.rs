@@ -291,6 +291,18 @@ pub const TOPOLOGY_IDENTITY_DOMAIN: &str = "cozytensors.topology/1";
 /// mistaken for an exact one in a bucket key.
 pub const TOPOLOGY_SHAPE_DOMAIN: &str = "cozytensors.topology.shape/1";
 
+/// Domain separator for the construction-document projection (`config_digest`).
+pub const CONFIG_DOMAIN: &str = "cozytensors.configs/1";
+
+/// What `tfs ingest` derives from a header and stores on the checkpoint row: identity,
+/// the fit index, and the construction document's identity (design §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Digests {
+    pub topology_digest: String,
+    pub shape_digest: String,
+    pub config_digest: String,
+}
+
 /// Which topology question a digest answers.
 ///
 /// `Identity` is the exact index: a hit means the logical {dtype, shape} sets agree.
@@ -394,10 +406,37 @@ impl Header {
         topology_digest_of(&self.topology_value())
     }
 
-    /// The shape-only bucket key. Two checkpoints differing only by dtype or encoding share
-    /// it; it is a SEARCH bucket, never a decision.
-    pub fn topology_shape_digest(&self) -> String {
+    /// The FIT index (D4): the same projection with the dtype elided. Two checkpoints with
+    /// equal `shape_digest` fit the same code; `topology_digest` is identity.
+    pub fn shape_digest(&self) -> String {
         topology_digest_of(&self.projected(Projection::ShapeOnly))
+    }
+
+    /// The construction document's identity: the header's own `configs` map — name to the
+    /// exact config bytes it references — under its own domain separator. Every party
+    /// that holds the header can compute it, and no config content has to be parsed.
+    pub fn config_digest(&self) -> String {
+        topology_digest_of(&Value::obj(vec![
+            (
+                "configs",
+                Value::map(
+                    self.configs
+                        .iter()
+                        .map(|(name, c)| (name.clone(), c.to_value()))
+                        .collect(),
+                ),
+            ),
+            ("projection", Value::str(CONFIG_DOMAIN)),
+        ]))
+    }
+
+    /// The three catalog digests a checkpoint row carries (design §2).
+    pub fn digests(&self) -> Digests {
+        Digests {
+            topology_digest: self.topology_digest(),
+            shape_digest: self.shape_digest(),
+            config_digest: self.config_digest(),
+        }
     }
 
     /// Closure-independent schema, geometry, ordering and aggregate-limit validation.

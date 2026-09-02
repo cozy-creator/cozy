@@ -181,6 +181,8 @@ pub struct CheckpointFactsRow {
     pub object_count: u64,
     pub org: String,
     pub topology_digest: Option<String>,
+    pub shape_digest: Option<String>,
+    pub config_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,11 +288,17 @@ impl Projection {
                 ("object_count", Value::uint(row.object_count)),
                 ("org", Value::str(row.org.clone())),
             ];
-            if let (Some(sha256), Some(length), Some(topology)) =
-                (&row.header_sha256, row.header_length, &row.topology_digest)
-            {
+            if let (Some(sha256), Some(length), Some(topology), Some(shape), Some(config)) = (
+                &row.header_sha256,
+                row.header_length,
+                &row.topology_digest,
+                &row.shape_digest,
+                &row.config_digest,
+            ) {
+                fields.push(("config_digest", Value::str(config.clone())));
                 fields.push(("header_length", Value::uint(length)));
                 fields.push(("header_sha256", Value::str(sha256.clone())));
+                fields.push(("shape_digest", Value::str(shape.clone())));
                 fields.push(("topology_digest", Value::str(topology.clone())));
             }
             lines.push(crate::canon::write(&Value::obj(fields)));
@@ -356,7 +364,7 @@ pub struct Census {
 #[derive(Debug, Clone)]
 pub struct CheckpointFacts {
     pub header: Option<ObjectRef>,
-    pub topology_digest: Option<String>,
+    pub digests: Option<crate::header::Digests>,
     pub object_count: u64,
     pub object_bytes: u64,
     pub objects: Vec<(String, ObjectRef)>,
@@ -465,7 +473,7 @@ impl Census {
         }
         let mut facts = CheckpointFacts {
             header: manifest.header().cloned(),
-            topology_digest: header.as_ref().map(Header::topology_digest),
+            digests: header.as_ref().map(Header::digests),
             object_count: objects.len() as u64,
             object_bytes,
             objects: objects
@@ -599,7 +607,9 @@ impl Census {
             object_bytes: facts.object_bytes,
             object_count: facts.object_count,
             org: repository.repo.org.clone(),
-            topology_digest: facts.topology_digest,
+            topology_digest: facts.digests.as_ref().map(|d| d.topology_digest.clone()),
+            shape_digest: facts.digests.as_ref().map(|d| d.shape_digest.clone()),
+            config_digest: facts.digests.as_ref().map(|d| d.config_digest.clone()),
         });
         projection
             .objects
@@ -658,8 +668,9 @@ impl Census {
         checkpoint: &Checkpoint,
         facts: &CheckpointFacts,
     ) -> Result<()> {
-        match (&facts.topology_digest, &checkpoint.evidence) {
-            (Some(topology), Some(evidence)) if topology == &evidence.classification_digest => {
+        match (&facts.digests, &checkpoint.evidence) {
+            (Some(derived), Some(evidence)) => {
+                crate::repository::require_digests(&evidence.digests, derived)?;
                 for (path, required) in evidence.required_files()? {
                     match manifest.entries().iter().find(|(candidate, _)| candidate == path) {
                         Some((_, Entry::File(actual))) if actual == &required => {}
@@ -676,13 +687,6 @@ impl Census {
                 }
                 Ok(())
             }
-            (Some(topology), Some(evidence)) => refuse(
-                Code::TOPOLOGY_MISMATCH,
-                format!(
-                    "checkpoint classification {} differs from header topology {topology}",
-                    evidence.classification_digest
-                ),
-            ),
             (Some(_), None) => refuse(
                 Code::MISSING_FIELD,
                 "a CozyTensors checkpoint requires model evidence",
@@ -1469,7 +1473,7 @@ mod tests {
         let manifest = store.read_manifest(manifest).unwrap();
         let header = crate::checkpoint::load_header(store, manifest.header().unwrap()).unwrap();
         CheckpointEvidence {
-            classification_digest: header.topology_digest(),
+            digests: header.digests(),
             ingest: None,
             verification: None,
         }
@@ -1621,7 +1625,7 @@ mod tests {
         let header_ref = manifest.header().unwrap();
         let header_bytes = fs::read(store.blob_path(&header_ref.sha256)).unwrap();
         let checkpoint_evidence = CheckpointEvidence {
-            classification_digest: Header::parse(&header_bytes).unwrap().topology_digest(),
+            digests: Header::parse(&header_bytes).unwrap().digests(),
             ingest: None,
             verification: None,
         };
@@ -1674,7 +1678,7 @@ mod tests {
         let evidence_checkpoint = Checkpoint {
             manifest: lane.manifest.clone(),
             evidence: Some(CheckpointEvidence {
-                classification_digest: Header::parse(&header_bytes).unwrap().topology_digest(),
+                digests: Header::parse(&header_bytes).unwrap().digests(),
                 ingest: Some(IngestProvenance {
                     source_dialect: "cozytensors".into(),
                     converter_build: format!("sha256:{}", "22".repeat(32)),

@@ -15,9 +15,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use tensorfs_core::compat::{self, CodeTopology, CompatibilityReport, Depth, Lane};
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::err::Code;
+use tensorfs_core::fit::{self, CodeTopology, CompatibilityReport, Custody, Depth};
 use tensorfs_core::grade::{
     self, complete_domain_16, ConversionRegistration, Grade, GradeDecision, Mapping, Registry,
 };
@@ -135,9 +135,9 @@ fn report_at(
     depth: Depth,
 ) -> CompatibilityReport {
     let (_, header, closure, pin) = pair;
-    let out = compat::check_compatibility(code, header, closure, pin, Lane::Canonical, &[], depth)
+    let out = fit::check_compatibility(code, header, closure, pin, Custody::Canonical, depth)
         .expect("check");
-    CompatibilityReport::of(code, header, Lane::Canonical, &out).expect("report")
+    CompatibilityReport::of(code, header, Custody::Canonical, &out).expect("report")
 }
 
 fn report_for(
@@ -235,8 +235,7 @@ fn resolve_proves_the_registration_closes_the_whole_topology() {
         &pair.1,
         &pair.2,
         &pair.3,
-        Lane::Canonical,
-        &[],
+        Custody::Canonical,
         &bf16_to_f32(),
     )
     .expect("resolve");
@@ -477,7 +476,7 @@ fn the_guard_reads_the_whole_set_before_it_fires() {
 #[test]
 fn preflight_stops_and_the_full_walk_does_not() {
     use std::time::Instant;
-    use tensorfs_core::compat::{Accepts, Requirement};
+    use tensorfs_core::fit::{Accepts, Requirement};
     use tensorfs_core::header::{Part, Tensor};
 
     const KEYS: usize = 4096;
@@ -520,11 +519,13 @@ fn preflight_stops_and_the_full_walk_does_not() {
                             dtype: Dtype::F8E4M3FN,
                             shape: vec![1],
                             accepts: Accepts::Any,
+                            pinned: false,
                         },
                     )
                 })
                 .collect(),
         )],
+        constructed_components: vec!["core".into()],
     };
     let pin = vec![encoding];
 
@@ -534,13 +535,12 @@ fn preflight_stops_and_the_full_walk_does_not() {
         let mut out = None;
         for _ in 0..50 {
             out = Some(
-                compat::check_compatibility(
+                fit::check_compatibility(
                     &code,
                     &header,
                     &Closure::default(),
                     &pin,
-                    Lane::Canonical,
-                    &[],
+                    Custody::Canonical,
                     depth,
                 )
                 .expect("check"),
@@ -943,81 +943,4 @@ fn prove_with_is_refused_on_a_batch() {
     assert!(!ok);
     assert!(out.is_empty());
     assert!(err.contains("single-pair only"), "{err}");
-}
-
-/// The verifier as a stream: `verifier::run` unchanged, one request per line, and every
-/// response still names the sha256 of ITS OWN request — so a batch cannot cross answers.
-#[test]
-fn the_verifier_stream_answers_each_request_by_its_own_digest() {
-    let dir = std::env::temp_dir().join(format!("tfs-vstream-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let closure_dir = vectors().join("closure");
-    let closure: Vec<String> = {
-        let mut v: Vec<String> = std::fs::read_dir(&closure_dir)
-            .unwrap()
-            .map(|e| e.unwrap().path().display().to_string())
-            .collect();
-        v.sort();
-        v
-    };
-
-    // Two DIFFERENT pairs over one header: the identity contract and the dtype recast.
-    let mut requests = Vec::new();
-    for code in ["code-topology", "code-topology-recast"] {
-        let out = dir.join(format!("{code}.req"));
-        tfs(&[
-            "verify-request",
-            vectors()
-                .join(format!("cases/layout/{code}.json"))
-                .to_str()
-                .unwrap(),
-            vectors()
-                .join("cases/header/plain-fp8.cbor")
-                .to_str()
-                .unwrap(),
-            "--closure",
-            &closure.join(","),
-            "--out",
-            out.to_str().unwrap(),
-        ]);
-        requests.push(std::fs::read(&out).unwrap());
-    }
-
-    let mut jsonl = Vec::new();
-    for r in &requests {
-        jsonl.extend_from_slice(r);
-        jsonl.push(b'\n');
-    }
-    let (ok, out, _) = tfs_status(&["verify-compat", "serve"], Some(&jsonl));
-    assert!(ok);
-    let responses: Vec<&str> = out.lines().collect();
-    assert_eq!(responses.len(), 2);
-
-    // Each response consumes against ITS request and refuses against the other one's.
-    for (i, resp) in responses.iter().enumerate() {
-        let (report, decision) = tensorfs_core::verifier::consume(&requests[i], resp.as_bytes())
-            .expect("the response answers its own request");
-        assert_eq!(decision.report, report.object_id());
-        let other = 1 - i;
-        let crossed = tensorfs_core::verifier::consume(&requests[other], resp.as_bytes())
-            .expect_err("a response is about ONE pair");
-        assert_eq!(crossed.code, Code::VERIFIER_OUTPUT_INCOMPLETE);
-    }
-
-    // And they are the two answers the shape bucket predicts: an exact hit, and an
-    // exact miss that is a shape hit.
-    let (hit, hit_decision) =
-        tensorfs_core::verifier::consume(&requests[0], responses[0].as_bytes()).unwrap();
-    assert_eq!(hit.topology_required, hit.topology_present);
-    assert_eq!(hit_decision.grade.name(), "COMPATIBLE");
-    let (candidate, candidate_decision) =
-        tensorfs_core::verifier::consume(&requests[1], responses[1].as_bytes()).unwrap();
-    assert_ne!(candidate.topology_required, candidate.topology_present);
-    assert_eq!(
-        candidate.topology_shape_required,
-        candidate.topology_shape_present
-    );
-    assert_eq!(candidate_decision.grade.name(), "PRODUCIBLE");
-
-    std::fs::remove_dir_all(&dir).ok();
 }

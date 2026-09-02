@@ -80,7 +80,7 @@ fn model_fixture(store: &Store, value: [u8; 4]) -> (ObjectRef, CheckpointEvidenc
     };
     header.validate(&Closure::default()).unwrap();
     let evidence = CheckpointEvidence {
-        classification_digest: header.topology_digest(),
+        digests: header.digests(),
         ingest: None,
         verification: None,
     };
@@ -127,7 +127,7 @@ fn apply_release(
                     .map(|header| {
                         tensorfs_core::checkpoint::load_header(store, header).map(|header| {
                             Box::new(CheckpointEvidence {
-                                classification_digest: header.topology_digest(),
+                                digests: header.digests(),
                                 ingest: None,
                                 verification: None,
                             })
@@ -313,7 +313,7 @@ fn expected_local_contract_gates_positive_mismatch_replay_and_cas() {
     let repo = tensorfs_core::repository::RepositoryName::new("local", "contract").unwrap();
     let (manifest_a, evidence_a) = model_fixture(&store, [0, 0, 0, 0]);
     let (manifest_b, evidence_b) = model_fixture(&store, [0, 0, 128, 63]);
-    let topology = evidence_b.classification_digest.clone();
+    let topology = evidence_b.digests.topology_digest.clone();
     let encoding = tensorfs_core::registry::seeds()
         .into_iter()
         .find(|seed| seed.alias == "plain/1")
@@ -936,8 +936,9 @@ fn committed_repo_apply_fixture_is_the_cross_process_projection_seam() {
     let manifest_bytes = fs::read(fixture.join("manifest.json")).unwrap();
     let manifest = ObjectRef::of(&manifest_bytes);
     let checkpoint_evidence = CheckpointEvidence {
-        classification_digest:
-            "sha256:070967dd3fa6e33a6993da22055d1216e6592903ac8d7b40f0299997b2518914".into(),
+        digests: Header::parse(&fs::read(fixture.join("header.cbor")).unwrap())
+            .unwrap()
+            .digests(),
         ingest: None,
         verification: None,
     };

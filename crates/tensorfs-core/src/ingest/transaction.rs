@@ -280,9 +280,8 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
         sha256: id.trim_start_matches("sha256:").to_string(),
         length: snap.canonical_bytes().len() as u64,
     };
-    let classification_digest = header.topology_digest();
     let evidence = CheckpointEvidence {
-        classification_digest: classification_digest.clone(),
+        digests: header.digests(),
         ingest: Some(ingest),
         verification: Some(verification),
     };
