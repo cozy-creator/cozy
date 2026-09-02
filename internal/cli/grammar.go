@@ -58,6 +58,27 @@ type PackageCmd struct {
 	List    PackageListCmd    `cmd:"" help:"List installed packages."`
 	Publish PackagePublishCmd `cmd:"" help:"Publish a package release."`
 	Yank    PackageYankCmd    `cmd:"" help:"Permanently yank a package release."`
+
+	Bind     PackageBindCmd     `cmd:"" help:"Point one package slot's default at another model release/lane."`
+	Bindings PackageBindingsCmd `cmd:"" help:"Show the package's current default bindings."`
+}
+
+type PackageBindCmd struct {
+	Ref  string `arg:"" name:"package" help:"Published package name (org/name)."`
+	Slot string `arg:"" name:"slot-path" help:"Declared slot path, e.g. generate.models.model."`
+	To   string `arg:"" name:"model" help:"org/model[@release[/lane]] — any repo; compatibility is preflight's flag, never a write gate."`
+}
+
+func (c *PackageBindCmd) Run(r *Runtime) error {
+	return r.call(handlePackageBind, []string{c.Ref, c.Slot, c.To}, nil, nil, false)
+}
+
+type PackageBindingsCmd struct {
+	Ref string `arg:"" name:"package" help:"Published package name (org/name)."`
+}
+
+func (c *PackageBindingsCmd) Run(r *Runtime) error {
+	return r.call(handlePackageBindings, []string{c.Ref}, nil, nil, false)
 }
 
 type PackageSearchCmd struct {
