@@ -38,8 +38,9 @@ type Package struct {
 	Descriptor       string
 	Wheel            string
 	DependencyWheels []DependencyWheel
-	Registry         []RegistryRow     // locked registry rows; Tensorhub fetches (cl-078)
-	Evidence         map[string]string // envelope-relative path -> local path
+	Vendored         []VendoredDependency // auto-vendored local deps, for the publish nudge (th-113)
+	Registry         []RegistryRow        // locked registry rows; Tensorhub fetches (cl-078)
+	Evidence         map[string]string    // envelope-relative path -> local path
 	Tree             string
 	Root             string // disposable wheel output, empty until Build
 	Name             string
@@ -98,6 +99,18 @@ func prepareFrom(projectDir string) (*Package, *exit.Error) {
 // Build runs the standard PEP 517 backend and builds local dependency wheels.
 // It is deliberately separate from Prepare so committed replays do no builds.
 func (p *Package) Build(ctx context.Context) *exit.Error {
+	return p.build(ctx, false)
+}
+
+// BuildForPublish is Build plus the publish-only refusals (cl-084): a uv.lock
+// row that lives only on the author's machine and an image-owned pin cannot
+// enter a published release, while an editable or private install of the same
+// tree stays legal.
+func (p *Package) BuildForPublish(ctx context.Context) *exit.Error {
+	return p.build(ctx, true)
+}
+
+func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 	if p.Root != "" || p.Wheel != "" {
 		return exit.Internalf("package publication wheel staging was built more than once")
 	}
@@ -105,18 +118,29 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	if publish {
+		canonicalTree, problem := canonicalLocalPath(p.Tree)
+		if problem != nil {
+			return problem
+		}
+		if problem := refuseAuthorLocalLockRows(canonicalTree, p.Files["uv.lock"]); problem != nil {
+			return problem
+		}
+	}
 	root, err := os.MkdirTemp("", "cozy-package-publish-")
 	if err != nil {
 		return exit.Internalf("cannot create package publication staging: %s", err)
 	}
 	p.Root = root
-	project, problem := projectWheel(ctx, p.Tree, root, p.Name, p.Release)
+	// Declared-metadata refusals and dependency staging run before the project
+	// wheel build, so a doomed publication is refused before the expensive work.
+	dependencies, needsRegistry, vendored, problem := collectLocalDependencies(ctx, p.Tree, document, root, publish)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
 		return problem
 	}
-	dependencies, needsRegistry, problem := collectLocalDependencies(ctx, p.Tree, document, root)
+	project, problem := projectWheel(ctx, p.Tree, root, p.Name, p.Release)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
@@ -138,6 +162,7 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 		return problem
 	}
 	p.Wheel, p.Descriptor, p.DependencyWheels, p.Registry = project, descriptor, dependencies, registry
+	p.Vendored = vendored
 	return nil
 }
 
