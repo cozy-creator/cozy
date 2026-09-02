@@ -39,7 +39,7 @@ type JobFacts struct {
 	// the publication grant names, one destination each.
 	Outputs        []string
 	WeightsOutputs []orchestrator.WeightsOutput
-	ModelParams []string
+	ModelParams    []string
 	// Publishes is the job's own `publishes=` declaration. A grant mints off the
 	// DECLARATION, never off the kind (cr-009).
 	Publishes        bool

@@ -145,7 +145,8 @@ func jobFields(state api.JobState, full bool) []output.Field {
 		{K: "package", V: state.Package},
 		{K: "function", V: state.Function},
 		{K: "status", V: state.Status},
-		{K: "elapsed", V: fmt.Sprintf("%.1fs", float64(state.ElapsedMS)/1000)},
+		{K: "queued", V: seconds(state.QueuedMS)},
+		{K: "execution", V: seconds(state.ExecutionMS)},
 	}
 	if state.QueuePosition != nil {
 		fields = append(fields, output.Field{K: "queue_position", V: *state.QueuePosition})
