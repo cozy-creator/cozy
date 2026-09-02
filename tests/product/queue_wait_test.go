@@ -93,7 +93,7 @@ func TestQueueWaitCauses(t *testing.T) {
 	if queuedW.Payload["wait"] != "worker_warming" {
 		t.Errorf("warming wait = %v, want worker_warming while the worker loads", queuedW.Payload["wait"])
 	}
-	fatal(t, o.c.CancelQueued(warmID))
+	fatal(t, o.c.CancelQueued(warmID, "test client"))
 }
 
 // awaitDurable is the first durable event of one type for a request, from the store the

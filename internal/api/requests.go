@@ -644,6 +644,10 @@ type Lifecycle struct {
 	Metrics     map[string]any `json:"metrics,omitempty"`
 	ErrorType   string         `json:"error_type,omitempty"`
 	Error       string         `json:"error,omitempty"`
+	// CanceledBy is the recorded actor behind a canceled run (cl-108): the explicit
+	// `cozy run cancel`, a caller-authored --timeout, `cozy down --all` — never blank
+	// for a run this daemon canceled on request.
+	CanceledBy string `json:"canceled_by,omitempty"`
 	Result      any            `json:"result,omitempty"`
 	Outputs     []MediaRef     `json:"outputs"`
 	Triage      *TriageRef     `json:"triage,omitempty"`
@@ -737,6 +741,16 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	attempts, _ := s.store.Attempts(row.ID)
 	life.Attempts = len(attempts)
 	life.Machine = s.machineOf(row, len(attempts) > 0)
+	if life.Status == "canceled" {
+		// A canceled run says WHO (cl-108). The actor rides the durable cancellation
+		// events; a queued cancel also has no attempt row, so its cause lives only there.
+		if actor, errType, errText, problem := s.store.CancelAttribution(row.ID); problem == nil {
+			life.CanceledBy = actor
+			if life.Error == "" && errText != "" {
+				life.ErrorType, life.Error = errType, errText
+			}
+		}
+	}
 	terminalAt, _ := s.store.TerminalEventAt(row.ID)
 	life.QueuedMS = queuedMS(row, attempts, terminalAt)
 	life.ExecutionMS = executionMS(row, attempts, terminalAt)
@@ -843,6 +857,23 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 
 // ------------------------------------------------------------------------- cancel
 
+// cancelActor reads WHO is canceling from the request body. Cancellation is an
+// attributed act (cl-108): a canceled run must always be able to say who ended it, so
+// an unnamed caller is recorded as exactly that rather than as nothing.
+func cancelActor(r *http.Request) string {
+	var body struct {
+		Actor string `json:"actor"`
+	}
+	data, _ := io.ReadAll(io.LimitReader(r.Body, 1<<12))
+	if len(data) > 0 {
+		_ = json.Unmarshal(data, &body)
+	}
+	if actor := strings.TrimSpace(body.Actor); actor != "" {
+		return actor
+	}
+	return "an unnamed api client"
+}
+
 func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 	reference := r.PathValue("id")
 	row, e := s.store.RequestByReference(reference)
@@ -855,6 +886,7 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := row.ID
+	actor := cancelActor(r)
 	if status := contractStatus(row.State); status == "completed" || status == "failed" || status == "canceled" {
 		s.ok(w, r, http.StatusOK, s.lifecycleOf(*row))
 		return
@@ -865,7 +897,7 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(attempts) == 0 {
-		if e := s.orchestrator.CancelQueued(id); e != nil {
+		if e := s.orchestrator.CancelQueued(id, actor); e != nil {
 			s.refuseTyped(w, r, e)
 			return
 		}
@@ -880,7 +912,7 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	last := attempts[len(attempts)-1]
 	if last.State == "closed" || last.State == "dispatch_aborted" {
-		if e := s.orchestrator.CancelQueued(id); e != nil {
+		if e := s.orchestrator.CancelQueued(id, actor); e != nil {
 			s.refuseTyped(w, r, e)
 			return
 		}
@@ -905,7 +937,7 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 			grace = n
 		}
 	}
-	if e := s.orchestrator.Cancel(id, uint64(last.Attempt), pb.CancelReason_CANCEL_REASON_CLIENT, grace); e != nil {
+	if e := s.orchestrator.CancelClient(id, uint64(last.Attempt), grace, actor); e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}

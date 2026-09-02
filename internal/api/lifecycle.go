@@ -178,17 +178,17 @@ func (s *Server) cancelForDown(row records.Request) (bool, *exit.Error) {
 		return false, problem
 	}
 	if len(attempts) == 0 {
-		return true, s.orchestrator.CancelQueued(row.ID)
+		return true, s.orchestrator.CancelQueued(row.ID, "cozy down --all")
 	}
 	last := attempts[len(attempts)-1]
 	switch last.State {
 	case "closed", "dispatch_aborted":
-		return true, s.orchestrator.CancelQueued(row.ID)
+		return true, s.orchestrator.CancelQueued(row.ID, "cozy down --all")
 	case "terminal":
 		return false, nil
 	default:
 		return true, s.orchestrator.CancelClient(
-			row.ID, uint64(last.Attempt), orchestrator.ClientCancelGraceMS)
+			row.ID, uint64(last.Attempt), orchestrator.ClientCancelGraceMS, "cozy down --all")
 	}
 }
 

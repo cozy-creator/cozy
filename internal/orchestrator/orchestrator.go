@@ -974,13 +974,18 @@ func (c *Orchestrator) queueDepth() int {
 
 // CancelQueued settles a request that is WAITING and has no attempt to cancel. It leaves
 // the queue and is settled canceled — a client that asked for a cancel is owed an answer,
-// and "it will start later anyway" is not one.
-func (c *Orchestrator) CancelQueued(requestID string) *exit.Error {
+// and "it will start later anyway" is not one. `actor` is who asked (cl-108): every
+// cancellation is attributed in its own durable terminal, never an anonymous verdict.
+func (c *Orchestrator) CancelQueued(requestID, actor string) *exit.Error {
+	if actor == "" {
+		actor = "an unnamed client"
+	}
 	payload := map[string]any{
 		"status": "CANCELED", "cause": "CLIENT_CANCELED",
-		"error_type": "CLIENT_CANCELED",
-		"error":      "canceled from the dispatch queue before any attempt was dispatched",
-		"outputs":    []any{}, "requeuing": false,
+		"error_type": "CLIENT_CANCELED", "actor": actor,
+		"error": fmt.Sprintf(
+			"canceled by %s from the dispatch queue before any attempt was dispatched", actor),
+		"outputs": []any{}, "requeuing": false,
 	}
 	applied, e := c.opt.Store.CancelQueuedRequest(requestID, payload)
 	if e != nil {

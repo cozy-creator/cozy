@@ -148,6 +148,9 @@ func jobFields(mode output.Mode, state api.JobState, full bool) []output.Field {
 		{K: "queued", V: seconds(state.QueuedMS)},
 		{K: "execution", V: seconds(state.ExecutionMS)},
 	}
+	if state.CanceledBy != "" {
+		fields = append(fields, output.Field{K: "canceled_by", V: state.CanceledBy})
+	}
 	if state.QueuePosition != nil {
 		fields = append(fields, output.Field{K: "queue_position", V: *state.QueuePosition})
 	}
@@ -237,8 +240,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	defer signal.Stop(interrupt)
 	watchCtx, stopWatch := context.WithCancel(context.Background())
 	defer stopWatch()
-	forced := make(chan struct{}, 1)
-	cancelFailed := make(chan *exit.Error, 1)
+	detached := make(chan struct{}, 1)
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -247,34 +249,13 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 			if !ok {
 				return
 			}
-			// SIGINT CANCELS, it does not abandon: the job's own journaled terminal is
-			// what settles it, and walking away would leave the worker running.
-			fmt.Fprintln(ctx.Err, "\ncancel requested — the job's own terminal still settles it")
-		case <-done:
-			return
-		}
-		cancelResult := make(chan *exit.Error, 1)
-		go func() { cancelResult <- c.CancelJob(jobID) }()
-		select {
-		case <-interrupt:
-			fmt.Fprintln(ctx.Err, "second interrupt — stopped waiting; the job remains recorded")
-			forced <- struct{}{}
-			stopWatch()
-			return
-		case problem := <-cancelResult:
-			if problem != nil {
-				fmt.Fprintf(ctx.Err, "cancel: %s\n", problem.Message)
-				cancelFailed <- problem
-				stopWatch()
-				return
-			}
-		case <-done:
-			return
-		}
-		select {
-		case <-interrupt:
-			fmt.Fprintln(ctx.Err, "second interrupt — stopped waiting; the job remains recorded")
-			forced <- struct{}{}
+			// A SIGNAL NEVER CANCELS THE JOB (cl-108): a dying follower is not a person
+			// asking for cancellation. The daemon owns the accepted job; this client
+			// merely detaches, and only an explicit `cozy job cancel` cancels.
+			fmt.Fprintf(ctx.Err,
+				"\ndetached — the job keeps running; `cozy run watch %s` reattaches, `cozy job cancel %s` cancels\n",
+				jobID, jobID)
+			detached <- struct{}{}
 			stopWatch()
 		case <-done:
 		}
@@ -283,24 +264,19 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	lines := NewProgress(ctx, false, began)
 	terminal, e := c.WatchContext(watchCtx, jobID, 0, lines.On)
 	lines.Done()
-	select {
-	case problem := <-cancelFailed:
-		return problem
-	default:
-	}
-	select {
-	case <-forced:
-		return exit.New(exit.Canceled,
-			"stopped waiting for %s; it remains visible in `cozy run list`", jobID).
-			WithNext("cozy run list")
-	default:
-	}
 	if e != nil {
 		return e
 	}
 	state, e := c.Job(jobID)
 	if e != nil {
 		return e
+	}
+	select {
+	case <-detached:
+		if !settled(state.Status) {
+			return renderSubmittedJob(ctx, state, false)
+		}
+	default:
 	}
 	return renderJobTerminal(ctx, state, terminal, began)
 }
@@ -347,6 +323,13 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if state.Error != "" {
 		err.Message = fmt.Sprintf("job %s ended %s: %s — %s",
 			state.JobID, status, state.ErrorType, state.Error)
+	}
+	// A canceled job is LOUD about WHO ended it (cl-108).
+	if mapTerminal(status) == "canceled" && state.CanceledBy != "" {
+		err.Message = fmt.Sprintf("job %s was canceled by %s", state.JobID, state.CanceledBy)
+		if state.Error != "" {
+			err.Message += ": " + state.Error
+		}
 	}
 	if state.Requeues > 0 {
 		err.WithRemedy("the orchestrator's retry projection spent %d of a %d-attempt budget "+
@@ -396,7 +379,7 @@ func handleJobCancel(ctx *Context) *exit.Error {
 		fields := append(jobFields(ctx.Mode(), state, true), output.Field{K: "changed", V: false})
 		return emit(ctx, compactRecord(fields, "job", "status", "changed"))
 	}
-	if e := c.CancelJob(jobID); e != nil {
+	if e := c.CancelJob(jobID, "cozy job cancel"); e != nil {
 		return e
 	}
 	// BLOCK UNTIL THE CANCELED TERMINAL. The request was made; the attempt's own

@@ -205,8 +205,10 @@ func (c *Client) Requests(ctx context.Context, status, packageName string, limit
 
 // Cancel REQUESTS cancellation. The attempt's own journaled terminal settles it, so this
 // returns as soon as the request is recorded and the caller keeps watching the stream.
-func (c *Client) Cancel(id string) *exit.Error {
-	return c.call("POST", "/v1/requests/"+id+"/cancel", nil, nil)
+// Cancel is an ATTRIBUTED act (cl-108): the actor names who is canceling — a person's
+// explicit `cozy run cancel`, a caller-authored deadline — and rides the durable record.
+func (c *Client) Cancel(id, actor string) *exit.Error {
+	return c.call("POST", "/v1/requests/"+id+"/cancel", map[string]string{"actor": actor}, nil)
 }
 
 // ------------------------------------------------------------ the LOCAL extension
@@ -273,7 +275,7 @@ func (c *Client) Job(id string) (api.JobState, *exit.Error) {
 }
 
 // CancelJob REQUESTS cancellation. A running job's own journaled terminal settles it; a
-// queued one leaves the queue and settles here.
-func (c *Client) CancelJob(id string) *exit.Error {
-	return c.call("POST", "/v1/local/jobs/"+id+"/cancel", nil, nil)
+// queued one leaves the queue and settles here. The actor names who is canceling.
+func (c *Client) CancelJob(id, actor string) *exit.Error {
+	return c.call("POST", "/v1/local/jobs/"+id+"/cancel", map[string]string{"actor": actor}, nil)
 }

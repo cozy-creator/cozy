@@ -542,6 +542,7 @@ type JobState struct {
 	Metrics          map[string]any    `json:"metrics,omitempty"`
 	ErrorType        string            `json:"error_type,omitempty"`
 	Error            string            `json:"error,omitempty"`
+	CanceledBy       string            `json:"canceled_by,omitempty"`
 	Result           any               `json:"result,omitempty"`
 	Outputs          []MediaRef        `json:"outputs"`
 	Weights          []WeightsRef      `json:"weights,omitempty"`
@@ -713,6 +714,14 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	}
 	// THE ELAPSED CLOCK is the authority's own timestamps, and the LIVE progress is the
 	// lossy lane's latest tick — replayed on connect, never durable, never load-bearing.
+	if state.Status == "canceled" {
+		if actor, errType, errText, problem := s.store.CancelAttribution(row.ID); problem == nil {
+			state.CanceledBy = actor
+			if state.Error == "" && errText != "" {
+				state.ErrorType, state.Error = errType, errText
+			}
+		}
+	}
 	terminalAt, _ := s.store.TerminalEventAt(row.ID)
 	state.QueuedMS = queuedMS(row, attempts, terminalAt)
 	state.ExecutionMS = executionMS(row, attempts, terminalAt)
@@ -842,6 +851,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	actor := cancelActor(r)
 	if status := contractStatus(row.State); status == "completed" || status == "failed" || status == "canceled" {
 		s.ok(w, r, http.StatusOK, s.jobStateOf(row))
 		return
@@ -854,7 +864,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	if len(attempts) == 0 {
 		// A QUEUED job has nothing running, and cancelling it is still a real act: it
 		// leaves the queue and settles, so a client that asked never has to wonder.
-		if e := s.orchestrator.CancelQueued(row.ID); e != nil {
+		if e := s.orchestrator.CancelQueued(row.ID, actor); e != nil {
 			s.refuseTyped(w, r, e)
 			return
 		}
@@ -869,7 +879,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	}
 	last := attempts[len(attempts)-1]
 	if last.State == "closed" || last.State == "dispatch_aborted" {
-		if e := s.orchestrator.CancelQueued(row.ID); e != nil {
+		if e := s.orchestrator.CancelQueued(row.ID, actor); e != nil {
 			s.refuseTyped(w, r, e)
 			return
 		}
@@ -884,7 +894,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	}
 	if last.State == "terminal" {
 		if row.ModelTransfer != nil && row.State == "finalizing" {
-			if e := s.orchestrator.CancelModelTransferFinalization(row.ID); e != nil {
+			if e := s.orchestrator.CancelModelTransferFinalization(row.ID, actor); e != nil {
 				s.refuseTyped(w, r, e)
 				return
 			}
@@ -905,7 +915,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 			grace = n
 		}
 	}
-	if e := s.orchestrator.CancelClient(row.ID, uint64(last.Attempt), grace); e != nil {
+	if e := s.orchestrator.CancelClient(row.ID, uint64(last.Attempt), grace, actor); e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
