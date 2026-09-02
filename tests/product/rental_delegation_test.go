@@ -149,14 +149,18 @@ type resolvedDelegation struct {
 	signed   bool
 }
 
-// standInPod is a second implementation of WorkerControl standing where a rented pod
-// stands: it claims over pinned TLS, mints its own canonical snapshot, and answers a
-// package_set by resolving the delegation exactly as tensorhub's resolve route would.
-// A refusal ends the stream as FailedPrecondition, which is what pod-supervisor does.
+// standInPod is a second implementation of the pod side standing where a rented pod
+// stands: WorkerControl and PodHost on one pinned TLS listener (proto-025). It claims,
+// mints its own canonical snapshot, and answers PodHost.PreparePackageSet by resolving the
+// delegation exactly as tensorhub's resolve route would. A refusal is the prepare stream's
+// terminal REFUSED event carrying the hub's code and words, which is what pod-supervisor
+// answers; the owner then sends the prepared placement_set itself on WorkerControl.
 type standInPod struct {
 	pb.UnimplementedWorkerControlServer
+	pb.UnimplementedPodHostServer
 	workerID, bootID, instance string
 	creatorPublicKey           ed25519.PublicKey
+	leafDigest                 []byte // the pinned leaf the owner's ClaimProof names
 
 	// holdFirstPastExpiry keeps the first delegation in hand until it has aged out, the
 	// way a transfer that is still landing bytes does.
@@ -223,14 +227,12 @@ func (p *standInPod) Control(stream pb.WorkerControl_ControlServer) error {
 			return nil
 		}
 		desired := frame.GetDesiredState()
-		if desired == nil || desired.GetPackageSet() == nil {
+		if desired == nil {
 			continue
 		}
-		set := desired.GetPackageSet()
-		if err := p.applyPackageSet(set.DownloadDelegation, set.DownloadDelegationSignature); err != nil {
-			// Exactly what pod-supervisor's proxy does with a package set it could not
-			// bring in: the stream ends carrying the reason.
-			return status.Error(codes.FailedPrecondition, err.Error())
+		if desired.GetPlacementSet() == nil {
+			// A host mode on the control stream is exactly what proto-025 retired.
+			return status.Error(codes.FailedPrecondition, "host modes are PodHost calls")
 		}
 		observed := &pb.ObservedWorkerState{
 			AcceptedDesiredStateRevision: desired.Revision, ConvergedRevision: desired.Revision,
@@ -247,6 +249,47 @@ func (p *standInPod) Control(stream pb.WorkerControl_ControlServer) error {
 			return nil
 		}
 	}
+}
+
+// PreparePackageSet is the host lane: the same delegation resolve, answered as prepare
+// events. The hub's refusal code and words ride the terminal REFUSED event exactly as
+// pod-supervisor forwards them, so the owner's lapse rule reads one text either way.
+func (p *standInPod) PreparePackageSet(call *pb.PreparePackageSetCall,
+	stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
+	if call.GetClaim() == nil || call.Claim.ControlStreamEpoch != 0 ||
+		!ed25519.Verify(p.creatorPublicKey, p.claimProof(call.Claim), call.Claim.Proof) {
+		return status.Error(codes.Unauthenticated, "the host call carries no valid ClaimProof")
+	}
+	set := call.GetPackageSet()
+	if set == nil {
+		return status.Error(codes.InvalidArgument, "no package set")
+	}
+	if err := stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED}); err != nil {
+		return err
+	}
+	if err := p.applyPackageSet(set.DownloadDelegation, set.DownloadDelegationSignature); err != nil {
+		code, detail, _ := strings.Cut(err.Error(), ": ")
+		return stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_REFUSED,
+			SafeCode: code, SafeDetail: detail})
+	}
+	emptySet, emptySetDigest, err := canonical.Identity(&pb.PlacementSet{})
+	if err != nil {
+		return err
+	}
+	return stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED,
+		PlacementSet: &pb.DesiredPlacementSet{PlacementSetDigest: emptySetDigest,
+			PlacementSetCanonicalBytes: emptySet}})
+}
+
+// claimProof rebuilds the ClaimProof/1 bytes the owner signed for this pod, from the pod's
+// own facts and the pinned leaf, exactly as pod-supervisor verifies a host call.
+func (p *standInPod) claimProof(claim *pb.Claim) []byte {
+	body, err := canonical.Bytes(&pb.ClaimProof{RecordOwnerEpoch: claim.RecordOwnerEpoch,
+		WorkerId: p.workerID, WorkerBootId: p.bootID, WorkerTlsCertificateDigest: p.leafDigest})
+	if err != nil {
+		return nil
+	}
+	return body
 }
 
 // applyPackageSet is the pod's download edge: read the delegation, take as long over it as
@@ -380,6 +423,9 @@ func attachStandInRental(t *testing.T, name string, lifetime time.Duration,
 	pod.creatorPublicKey = ed25519.PublicKey(key)
 
 	certPath := standInCertificate(t, o.root)
+	pin, err := workertls.LoadPin(certPath)
+	must(t, err)
+	pod.leafDigest = pin.Digest()
 	connection = &orchestrator.WorkerConnection{
 		RentalID: rentalID, WorkerID: pod.workerID, WorkerBootID: pod.bootID,
 		CACert: certPath, Addr: servePod(t, pod, certPath),
@@ -409,6 +455,7 @@ func servePod(t *testing.T, pod *standInPod, certPath string) string {
 	must(t, err)
 	server := grpc.NewServer(grpc.Creds(credentials.NewServerTLSFromCert(&certificate)))
 	pb.RegisterWorkerControlServer(server, pod)
+	pb.RegisterPodHostServer(server, pod)
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(server.Stop)
 	return listener.Addr().String()

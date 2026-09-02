@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"google.golang.org/grpc"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -165,11 +168,8 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 		return exit.Named(exit.Validation, "rental.delegation_invalid",
 			"package_set delegation is not canonical: %s", err)
 	}
-	expiry := time.Unix(document.Int("expires_at_unix"), 0)
-	revision := c.nextRevision()
 	c.mu.Lock()
-	w.revision, w.desiredRefusal = revision, nil
-	w.delegationExpiry = expiry
+	w.delegationExpiry = time.Unix(document.Int("expires_at_unix"), 0)
 	w.desiredPackages = clonePackageRefs(packages)
 	w.desiredModels = cloneModelRefs(models)
 	w.desiredDelegation = append([]byte(nil), delegation...)
@@ -177,21 +177,14 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 	w.desiredPrivate = nil
 	w.desiredPrivatePlacement = nil
 	c.mu.Unlock()
-	d := &pb.DesiredWorkerState{
-		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch,
-		WorkerBootId: s.bootID, Revision: revision, Posture: pb.Posture_POSTURE_ACCEPTING,
-		WireMinor: pb.WireMinor,
-		Mode: &pb.DesiredWorkerState_PackageSet{PackageSet: &pb.DesiredPackageSet{
-			DownloadDelegation:          append([]byte(nil), delegation...),
-			DownloadDelegationSignature: append([]byte(nil), signature...),
-		}},
-	}
-	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}}) {
-		return exit.Unavailablef("worker %s control stream closed before package_set send", w.instanceID)
-	}
-	c.logf("DesiredWorkerState revision=%d package_set delegation=%d B -> %s",
-		revision, len(delegation), s.bootID)
-	return nil
+	call := &pb.PreparePackageSetCall{Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
+		DownloadDelegation:          append([]byte(nil), delegation...),
+		DownloadDelegationSignature: append([]byte(nil), signature...),
+	}}
+	return c.issueThroughHost(s, w, hostLabel("package_set", fmt.Sprintf("%d packages, %d models", len(packages), len(models))),
+		func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
+			return s.host.PreparePackageSet(ctx, call)
+		})
 }
 
 // delegationExpiryOf reads the lifetime out of the exact delegation bytes this owner is

@@ -6,6 +6,8 @@ import (
 	"os"
 	"time"
 
+	"google.golang.org/grpc"
+
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/privatepackage"
@@ -627,24 +629,17 @@ func (c *Orchestrator) issuePrivatePackageSet(s *session, w *worker,
 	if selected == nil {
 		return exit.Internalf("cannot issue an empty private package set")
 	}
-	revision := c.nextRevision()
 	c.mu.Lock()
-	w.revision, w.desiredRefusal = revision, nil
 	w.delegationExpiry = time.Time{} // private wheels travel as minted capabilities, not a delegation
 	w.desiredPrivate = clonePrivatePackageSet(selected)
 	w.desiredPrivatePlacement = nil
 	w.desiredPackages, w.desiredModels = nil, nil
 	c.mu.Unlock()
-	desired := &pb.DesiredWorkerState{RecordOwnerEpoch: recordOwnerEpoch,
-		ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, Revision: revision,
-		Posture: pb.Posture_POSTURE_ACCEPTING, WireMinor: pb.WireMinor,
-		Mode: &pb.DesiredWorkerState_PrivatePackageSet{PrivatePackageSet: selected}}
-	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: desired}}) {
-		return exit.Unavailablef("worker %s control stream closed before private package send", w.instanceID)
-	}
-	c.logf("DesiredWorkerState revision=%d private_package_set operation=%s files=%d -> %s",
-		revision, selected.OperationId, len(selected.Files), s.bootID)
-	return nil
+	call := &pb.PreparePrivatePackageCall{Claim: s.claim, PrivatePackageSet: clonePrivatePackageSet(selected)}
+	return c.issueThroughHost(s, w, hostLabel("private_package_set", selected.OperationId),
+		func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
+			return s.host.PreparePrivatePackage(ctx, call)
+		})
 }
 
 // ConvergePrivatePlacement binds exact downloaded models to code already admitted under one
@@ -694,23 +689,16 @@ func (c *Orchestrator) issuePrivatePlacementSet(s *session, w *worker,
 	if selected == nil {
 		return exit.Internalf("cannot issue an empty private placement set")
 	}
-	revision := c.nextRevision()
 	c.mu.Lock()
-	w.revision, w.desiredRefusal = revision, nil
 	w.delegationExpiry = delegationExpiryOf(selected.DownloadDelegation)
 	w.desiredPrivate, w.desiredPackages, w.desiredModels = nil, nil, nil
 	w.desiredPrivatePlacement = clonePrivatePlacementSet(selected)
 	c.mu.Unlock()
-	desired := &pb.DesiredWorkerState{RecordOwnerEpoch: recordOwnerEpoch,
-		ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, Revision: revision,
-		Posture: pb.Posture_POSTURE_ACCEPTING, WireMinor: pb.WireMinor,
-		Mode: &pb.DesiredWorkerState_PrivatePlacementSet{PrivatePlacementSet: selected}}
-	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: desired}}) {
-		return exit.Unavailablef("worker %s control stream closed before private placement send", w.instanceID)
-	}
-	c.logf("DesiredWorkerState revision=%d private_placement_set operation=%s -> %s",
-		revision, selected.OperationId, s.bootID)
-	return nil
+	call := &pb.PreparePrivatePlacementCall{Claim: s.claim, PrivatePlacementSet: clonePrivatePlacementSet(selected)}
+	return c.issueThroughHost(s, w, hostLabel("private_placement_set", selected.OperationId),
+		func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
+			return s.host.PreparePrivatePlacement(ctx, call)
+		})
 }
 
 func clonePrivatePackageSet(in *pb.DesiredPrivatePackageSet) *pb.DesiredPrivatePackageSet {
