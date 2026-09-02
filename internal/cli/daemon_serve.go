@@ -201,6 +201,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 	} else {
 		fmt.Fprintln(ctx.Out, "  rentals: never idle-released (rentals.idle_release_s=0); each ends with cozy rental end")
 	}
+	if ctx.Cfg.MaintenanceGCCron != "" {
+		fmt.Fprintf(ctx.Out, "  store gc: on the schedule %q (maintenance.gc_cron); cozy model remove and cozy model gc reclaim on demand\n",
+			ctx.Cfg.MaintenanceGCCron)
+	}
 	if ctx.Cfg.DaemonIdleShutdown > 0 {
 		fmt.Fprintf(ctx.Out, "  next: cozy run list · stop with cozy down · exits on its own after %s with nothing to manage\n",
 			ctx.Cfg.DaemonIdleShutdown)
@@ -228,6 +232,9 @@ func serveDaemon(ctx *Context) *exit.Error {
 	if ctx.Cfg.DaemonIdleShutdown > 0 {
 		go idleWatch{debounce: ctx.Cfg.DaemonIdleShutdown, store: st, owner: c,
 			server: server, log: ctx.Out}.run(quit)
+	}
+	if sweep, ok := newGCCron(ctx.Cfg, l, st, ctx.Out); ok {
+		go sweep.run(quit)
 	}
 
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)

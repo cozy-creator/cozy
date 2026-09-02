@@ -54,8 +54,8 @@ type List struct {
 	Next  []string
 }
 
-// Human is an aggregate value with its own terminal sentence; JSON carries the value
-// itself. An empty sentence keeps the aggregate out of the terminal.
+// Human is a value with its own terminal sentence; JSON carries the value itself. An
+// empty sentence keeps an aggregate out of the terminal and shows a record field as `-`.
 type Human interface {
 	Human() string
 }
@@ -359,6 +359,8 @@ func humanValue(value any, full bool) string {
 	}
 	var text string
 	switch scalar := value.(type) {
+	case Human:
+		text = scalar.Human()
 	case string:
 		text = scalar
 	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64,

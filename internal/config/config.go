@@ -20,6 +20,7 @@ import (
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/secret"
+	"github.com/robfig/cron/v3"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -73,6 +74,13 @@ type Config struct {
 	// keeps the daemon up until `cozy down`.
 	DaemonIdleShutdown time.Duration
 
+	// MaintenanceGCCron is when the daemon runs the store's reclamation pass (owner ruling
+	// 2026-09-02: repo-CAS garbage collection runs on a cron job). A cadence, never a
+	// decision: what is reclaimed is TensorFS's call from its filesystem census. Standard
+	// five-field cron; empty disables the scheduled pass (`cozy model remove` and `cozy
+	// model gc` still reclaim on demand).
+	MaintenanceGCCron string
+
 	// Bootstrap is launcher-only. It is admitted from the process environment,
 	// never config.yaml, argv, or a child inheritance list.
 	Bootstrap secret.Value
@@ -93,6 +101,7 @@ type values struct {
 	RentalsMaxHourlySpendUSD string `name:"rentals_max_hourly_spend_usd" default:"0"`
 	RentalsIdleReleaseS      int64  `name:"rentals_idle_release_s" default:"300"`
 	DaemonIdleShutdownS      int64  `name:"daemon_idle_shutdown_s" default:"900"`
+	MaintenanceGCCron        string `name:"maintenance_gc_cron" default:"0 3 * * *"`
 	Port                     int    `name:"port" default:"8818"`
 	Yield                    string `name:"yield" default:"smart" enum:"smart,always,never"`
 	Bootstrap                string `name:"bootstrap"`
@@ -117,6 +126,11 @@ func (v *values) Validate() error {
 	if v.DaemonIdleShutdownS < 0 {
 		return fmt.Errorf("daemon.idle_shutdown_s must be non-negative; zero disables idle shutdown")
 	}
+	if expr := strings.TrimSpace(v.MaintenanceGCCron); expr != "" {
+		if _, err := cron.ParseStandard(expr); err != nil {
+			return fmt.Errorf("maintenance.gc_cron %q is not a five-field cron schedule: %w", expr, err)
+		}
+	}
 	if v.Port < 0 || v.Port > 65535 {
 		return fmt.Errorf("port %d is not a TCP port or zero for automatic selection", v.Port)
 	}
@@ -134,6 +148,7 @@ var fileKeys = map[string]bool{
 	"yield":                         true,
 	"rentals":                       true,
 	"daemon":                        true,
+	"maintenance":                   true,
 }
 
 // nestedFileKeys are the one-level sections config.yaml admits, each mapping its
@@ -141,7 +156,8 @@ var fileKeys = map[string]bool{
 var nestedFileKeys = map[string]map[string]string{
 	"rentals": {"max_hourly_spend_usd": "rentals_max_hourly_spend_usd",
 		"idle_release_s": "rentals_idle_release_s"},
-	"daemon": {"idle_shutdown_s": "daemon_idle_shutdown_s"},
+	"daemon":      {"idle_shutdown_s": "daemon_idle_shutdown_s"},
+	"maintenance": {"gc_cron": "maintenance_gc_cron"},
 }
 
 var environmentNames = map[string]string{
@@ -216,6 +232,7 @@ func load() (Config, *exit.Error) {
 		RentalsMaxHourlySpendSource:    sourceOf("rentals_max_hourly_spend_usd", file, environment, "unset"),
 		RentalsIdleRelease:             time.Duration(input.RentalsIdleReleaseS) * time.Second,
 		DaemonIdleShutdown:             time.Duration(input.DaemonIdleShutdownS) * time.Second,
+		MaintenanceGCCron:              strings.TrimSpace(input.MaintenanceGCCron),
 		Bootstrap:                      secret.New(input.Bootstrap),
 		inherited:                      inherited,
 	}

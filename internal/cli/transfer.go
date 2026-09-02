@@ -159,6 +159,10 @@ func handleModelRemove(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	return removeModels(ctx, tool, layout, len(active) == 0)
+}
+
+func removeModels(ctx *Context, tool *tfs.Tool, layout home.Layout, quiet bool) *exit.Error {
 	work, problem := scratch.Temp(layout.Tmp, "repo-remove-")
 	if problem != nil {
 		return problem
@@ -207,6 +211,15 @@ func handleModelRemove(ctx *Context) *exit.Error {
 		delete(held, ref.String())
 	}
 	removed.Aggregates = []output.Field{{K: "changed", V: len(removed.Rows) > 0}}
-	removed.Notes = []string{"local repositories were deleted; TensorFS garbage collection decides later byte reclamation"}
+	// Reclamation is part of the act: the name is gone, so its bytes go now. A store the
+	// byte plane will not sweep right now (a live holder) keeps the name removed and says
+	// what deferred it; `cozy model gc` finishes the job.
+	report, problem := tool.GC(quiet)
+	if problem != nil {
+		removed.Notes = []string{"reclamation deferred: " + problem.Message}
+		removed.Next = []string{"cozy model gc"}
+		return emit(ctx, removed)
+	}
+	removed.Aggregates = append(removed.Aggregates, reclaimFields(report)...)
 	return emit(ctx, removed)
 }

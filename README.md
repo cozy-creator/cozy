@@ -140,7 +140,15 @@ cozy model search flux
 cozy model download org/model@release local/flux --lane task=text-to-image
 cozy model list
 cozy model remove local/flux
+cozy model gc
 ```
+
+`model remove` deletes the repository name and reclaims its bytes in the same act, printing
+`reclaimed: 5.2GiB`; `model list` shows `unreferenced 0` after it. `model gc` reclaims what no
+local model names for any other reason (a crashed download, an abandoned ingest), and the daemon
+runs the same pass on `maintenance.gc_cron` (default `0 3 * * *`, while it is up). What is
+reclaimed is TensorFS's decision from its filesystem census — repos, manifests, blobs — never a
+database's; a live worker holding a model refuses the pass by name (`cozy unload` first).
 
 Upload a pinned source directly, or execute one package-reviewed producer job whose named outputs
 become owner-only immutable checkpoints. `--lane` on upload selects only an existing input release;
@@ -336,6 +344,8 @@ rentals:
   idle_release_s: 300
 daemon:
   idle_shutdown_s: 900
+maintenance:
+  gc_cron: "0 3 * * *"
 ```
 
 Without a configured `port`, Cozy prefers `127.0.0.1:8818` and falls back to an available

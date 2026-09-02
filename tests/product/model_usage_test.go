@@ -47,6 +47,7 @@ func TestModelListShowsEachModelsBytesAndWhatItShares(t *testing.T) {
 
 	configBlob := store.put("config.json", []byte(`{"kind":"shared-config"}`))
 	shared := store.put("shared.bin", bytes.Repeat([]byte{7}, 300))
+	manifestBytes := map[string]int64{}
 	model := func(name string, own byte) map[string]int64 {
 		ownBlob := store.put(name+"-own.bin", bytes.Repeat([]byte{own}, 300))
 		header := fmt.Sprintf(`{"format":"cozytensors/1","configs":[],"assets":[],"encodings":[%s],`+
@@ -57,6 +58,7 @@ func TestModelListShowsEachModelsBytesAndWhatItShares(t *testing.T) {
 		entries := fmt.Sprintf(`[["config.json","file",{"length":%d,"sha256":"%s"}],["model.cozytensors","cozytensors"]]`,
 			configBlob.length, configBlob.sha256)
 		manifest := store.reproduce(name, header, entries, `[["model","own"],["model","shared"]]`)
+		manifestBytes[name] = manifest.length
 		evidence := filepath.Join(store.work, name+"-evidence.json")
 		must(t, os.WriteFile(evidence, []byte(`{"classification_digest":"`+store.topology(manifest.header)+`"}`), 0o600))
 		if _, e := tool.ReplaceLocal(name, "sha256:"+shared.sha256, "absent", "sha256:"+manifest.sha256,
@@ -122,6 +124,36 @@ func TestModelListShowsEachModelsBytesAndWhatItShares(t *testing.T) {
 	}
 	if usage = modelListJSON(t, root); usage.Store.Unreferenced != orphan.length || usage.Store.Size != union {
 		t.Errorf("store json after an orphan = %+v, want unreferenced %d", usage.Store, orphan.length)
+	}
+
+	// `model gc` is the reclamation act for what nothing names: the orphan goes, the footer
+	// with it, and both models keep every byte.
+	code, out = runCozy(t, root, "model", "gc")
+	if code != 0 || !strings.Contains(out, "reclaimed: "+units.Bytes(orphan.length)) {
+		t.Errorf("model gc [exit %d]: want reclaimed %s\n%s", code, units.Bytes(orphan.length), out)
+	}
+	if usage = modelListJSON(t, root); usage.Store.Unreferenced != 0 || usage.Store.Size != union {
+		t.Errorf("store json after gc = %+v, want unreferenced 0 and size %d", usage.Store, union)
+	}
+	if !store.present(shared.sha256) || !store.present(configBlob.sha256) {
+		t.Fatalf("gc removed a referenced blob")
+	}
+
+	// `model remove` reclaims in the same act: alpha's own segment and its manifest go with
+	// its name; what beta shares stays, and nothing is left unreferenced.
+	code, out = runCozy(t, root, "model", "remove", "local/alpha")
+	reclaimed := sum(alpha) - sharedBytes + manifestBytes["alpha"]
+	if code != 0 || !strings.Contains(out, "reclaimed: "+units.Bytes(reclaimed)) {
+		t.Errorf("model remove [exit %d]: want reclaimed %s\n%s", code, units.Bytes(reclaimed), out)
+	}
+	usage = modelListJSON(t, root)
+	if len(usage.Models) != 1 || usage.Models[0].Model != "local/beta" || usage.Store.Size != sum(beta) ||
+		usage.Store.Unreferenced != 0 {
+		t.Errorf("store json after removing alpha = %+v (%d models), want beta alone at %d, unreferenced 0",
+			usage.Store, len(usage.Models), sum(beta))
+	}
+	if !store.present(shared.sha256) || !store.present(configBlob.sha256) {
+		t.Fatalf("removing alpha took a blob beta still reaches")
 	}
 }
 
@@ -198,6 +230,10 @@ func (s tfsStore) run(args ...string) string {
 		s.t.Fatalf("tfs %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
 	return string(out)
+}
+
+func (s tfsStore) present(sha256 string) bool {
+	return regexp.MustCompile(`contains:\s+true`).MatchString(s.run("contains", s.root, sha256))
 }
 
 func (s tfsStore) put(name string, content []byte) blobRef {
