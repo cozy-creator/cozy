@@ -158,7 +158,7 @@ def relay(
     if remaining > 0:
         # cl-104: the delay is a MEASURED step loop — the fixture's stand-in for a
         # denoising loop, one `on_step` per iteration (cancellation included).
-        on_step = tel.step_callback((remaining + 24) // 25, stage="tile_steps")
+        on_step = tel.step_callback((remaining + 24) // 25, stage="relay_steps")
         index = 0
         while remaining > 0:
             step = min(remaining, 25)
