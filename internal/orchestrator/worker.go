@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -463,6 +464,11 @@ type worker struct {
 	fault      string
 	faulted    bool
 	errorSince time.Time
+	// The fault the worker keeps against the desired revision it accepted, and how many
+	// consecutive reports have carried it unchanged (observeLatchedFault).
+	latchedFault         string
+	latchedFaultRevision uint64
+	latchedFaultReports  int
 	// lastReport is telemetry only. Elapsed time since it never settles or retires work.
 	lastReport time.Time
 	// LRU is dispatch-based, not report-based: reports say the worker lives, while an
@@ -520,9 +526,9 @@ func (w *worker) remoteDispatchable(placement DesiredPlacement, planID string) b
 		observed.dispatchablePlanIDs[planID]
 }
 
-func (w *worker) remoteStaged(packageName, planID string) bool {
+func (w *worker) remoteStaged(packageName, planID, revision string) bool {
 	placement, ok := w.remotePlacements[remotePlanKey(packageName, planID)]
-	if !ok {
+	if !ok || placement.PackageRevisionDigest != revision {
 		return false
 	}
 	observed, ok := w.observedRemote[placement.PackageRevisionDigest]
@@ -1251,16 +1257,84 @@ func graceOr(v float64) float64 {
 // always see a desired state it issued that has not converged.
 const ReportCadence = 2 * time.Second
 
+// StillFactor is the fleet's still-factor (xs-007 row 29): how many consecutive
+// observations may find a meter where they left it before the thing is called stopped
+// rather than slow. It is the count `transfer.stillSamples` spends before calling a
+// transfer stalled, and every silence budget this package derives comes from it, so one
+// slow read, a GC pause, or a retry inside a transport can never be mistaken for a stall —
+// only silence that repeats can.
+const StillFactor = 8
+
 // mediaIOStallBudget bounds one socket operation that moves no bytes. It does not settle,
 // retire, or reclaim a worker and resets whenever bytes move.
 //
-// The figure is DERIVED, not chosen (xs-007 row 29): a live pod proves it is there every
-// ReportCadence on the control stream, so eight consecutive report periods with not one
-// byte moving on the byte plane is silence by the pod's own published cadence. Eight is the
-// fleet's still-factor — the same count `transfer.stillSamples` spends before calling a
-// transfer stalled — so one slow read, a GC pause, or a retry inside the transport can
-// never be mistaken for a stall.
-const mediaIOStallBudget = 8 * ReportCadence
+// The figure is DERIVED, not chosen: a live pod proves it is there every ReportCadence on
+// the control stream, so StillFactor consecutive report periods with not one byte moving
+// on the byte plane is silence by the pod's own published cadence.
+const mediaIOStallBudget = StillFactor * ReportCadence
+
+// observeLatchedFault reads the fault a worker keeps against the desired revision it has
+// accepted but not converged. The Runtime LATCHES a materialization refusal for a desired
+// revision — in its own words, "retry is a RecordOwner act: a NEW revision, or a grant
+// refresh" — and reports it unchanged on every ReportCadence until one arrives. Neither
+// is this owner's to give from here: a rental's private wheels travelled as capabilities
+// the pod has already spent, and a local plan has nothing to refresh. So the same fault
+// repeating across StillFactor consecutive reports, with no revision issued in between
+// and no placement progressing, is the worker's final word on that revision, and the
+// request waiting on it fails typed instead of sitting queued behind a report loop.
+//
+// COUNTED, NOT TIMED. A materialization that is landing bytes reports MATERIALIZING and
+// never trips this; a fault whose text changes starts the count over; a new desired
+// revision clears it. A fault against a placement that still serves (fallback retention,
+// a degraded binding) is an explanation, not a stall, and is never counted.
+func (w *worker) observeLatchedFault(r *pb.ObservedWorkerState) *exit.Error {
+	reset := func() *exit.Error {
+		w.latchedFault, w.latchedFaultRevision, w.latchedFaultReports = "", 0, 0
+		return nil
+	}
+	if w.revision == 0 || r.AcceptedDesiredStateRevision < w.revision ||
+		r.ConvergedRevision >= w.revision {
+		return reset()
+	}
+	reported := make(map[string]*pb.PlacementStatus, len(r.Placements))
+	for _, p := range r.Placements {
+		if p == nil {
+			continue
+		}
+		if p.Materialization == pb.MaterializationState_MATERIALIZATION_STATE_MATERIALIZING {
+			return reset()
+		}
+		reported[p.PlacementId] = p
+	}
+	stalled := func(p *pb.PlacementStatus) bool {
+		return p == nil || p.Serving != pb.ServingState_SERVING_STATE_DISPATCHABLE
+	}
+	var fault *pb.Fault
+	for _, p := range r.Placements {
+		if p != nil && stalled(p) && len(p.Faults) > 0 {
+			fault = p.Faults[0]
+			break
+		}
+	}
+	for _, f := range r.Faults {
+		if fault == nil && f != nil && stalled(reported[f.Subject]) {
+			fault = f
+		}
+	}
+	if fault == nil {
+		return reset()
+	}
+	key := fmt.Sprintf("%d\x00%s\x00%s\x00%s", fault.Kind, fault.Subject, fault.Reason, fault.Detail)
+	if key != w.latchedFault || w.latchedFaultRevision != w.revision {
+		w.latchedFault, w.latchedFaultRevision, w.latchedFaultReports = key, w.revision, 0
+	}
+	w.latchedFaultReports++
+	if w.latchedFaultReports < StillFactor {
+		return nil
+	}
+	return exit.Named(exit.Failed, "worker.placement_refused", "%s: %s",
+		fault.Reason, brief(fault.Detail, 1024))
+}
 
 // EnsurePlacementReady blocks until the placement's SERVING AXIS says DISPATCHABLE for
 // this plan — a real activation completed, never merely "connected" and never merely
@@ -1302,8 +1376,7 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 			return refused
 		}
 		if desiredRefusal != nil {
-			return desiredRefusal.WithRemedy(
-				"the installed package Runtime is incompatible with this Cozy build")
+			return desiredRefusal
 		}
 		// A PLAN THE LAUNCHER NEVER STAGED CAN NEVER BECOME DISPATCHABLE (cl-022's
 		// corollary guard). The live case: submit, then an install --force moves the

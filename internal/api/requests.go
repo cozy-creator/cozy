@@ -545,6 +545,9 @@ func (s *Server) resolvePrivateServing(ctx context.Context, sub Submission,
 	if len(out.Outputs) == 0 {
 		out.Outputs = outputs
 	}
+	if problem := s.deriveOutputExport(entrypoint, &out); problem != nil {
+		return out, problem
+	}
 	return out, nil
 }
 
