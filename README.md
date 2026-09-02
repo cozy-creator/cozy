@@ -31,7 +31,7 @@ Three schemas are STORED — written to a path, digested, and identified by thei
 2. Manifest JSON, typed by `manifests/`.
 3. `cozytensors/1`, the portable CBOR tensor header, stored as a blob.
 
-A model Manifest selects at most one typed CozyTensors entry and may also carry ordinary files
+A model Manifest selects one typed CozyTensors entry and may also carry ordinary files
 such as a README, license, or sample image. `Store.walk_cozytensors` and
 `Store.acquire_cozytensors` cover only the selected header and its transitive configs, model
 assets, and tensor parts. The existing `Store.walk` and `Store.acquire_manifest` retain their
