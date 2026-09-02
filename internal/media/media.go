@@ -502,6 +502,63 @@ func (c *Client) GetOutputTo(slot, name, destination, wantDigest string,
 	return written, nil
 }
 
+// MaxTriageBundle is the protocol's bound on one triage bundle (`TriageBundleRef.length`
+// <= 1 MiB, worker-protocol/01). The pod's plane refuses to serve past it and this client
+// refuses to read past it, so the terminal's declared length is checked against a figure
+// both ends already hold.
+const MaxTriageBundle = 1 << 20
+
+// GetTriage reads one attempt's triage bundle by the OPAQUE subject its terminal named,
+// and proves the bytes are the ones the terminal claimed before handing them back. Like
+// GetOutputTo this is a transport check of the pod's own declaration; whether the bundle
+// is KEPT is the orchestrator's decision against the terminal it accepted.
+func (c *Client) GetTriage(subject, wantDigest string, wantLength int64) ([]byte, *exit.Error) {
+	if wantLength <= 0 || wantLength > MaxTriageBundle {
+		return nil, exit.Named(exit.Validation, "triage_length_invalid",
+			"the terminal declares triage bundle %s as %d B; the protocol bounds one at %d B",
+			subject, wantLength, MaxTriageBundle)
+	}
+	request, err := http.NewRequest(http.MethodGet, c.url("/v1/triage/"+subject), nil)
+	if err != nil {
+		return nil, exit.Internalf("cannot build the media triage request: %s", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+c.spec.Token.Reveal()) //cozy:allow-reveal
+	request, guard := c.stall(request)
+	defer guard.cancel()
+	response, err := c.http.Do(request)
+	if err != nil {
+		return nil, exit.Named(exit.Unavailable, "media_unreachable",
+			"the pod's media server at %s could not serve triage bundle %s: %s",
+			c.spec.Addr, subject, guard.why(err))
+	}
+	defer response.Body.Close()
+	body := guard.reader(response.Body)
+	if response.StatusCode >= 400 {
+		data, _ := io.ReadAll(io.LimitReader(body, 1<<20+1))
+		return nil, mediaRefusal(response.StatusCode, data)
+	}
+	if response.ContentLength >= 0 && response.ContentLength != wantLength {
+		return nil, exit.Named(exit.Failed, "media_length_mismatch",
+			"the pod declares triage bundle %s as %d B; its terminal declares %d B",
+			subject, response.ContentLength, wantLength)
+	}
+	data, err := io.ReadAll(io.LimitReader(body, wantLength+1))
+	if err != nil {
+		return nil, exit.Unavailablef("triage bundle %s ended while it was read: %s",
+			subject, guard.why(err))
+	}
+	if int64(len(data)) != wantLength {
+		return nil, exit.Named(exit.Failed, "media_length_mismatch",
+			"triage bundle %s delivered %d B; its terminal declares %d B",
+			subject, len(data), wantLength)
+	}
+	if got := digestOf(data); got != wantDigest {
+		return nil, exit.Named(exit.Failed, "media_digest_mismatch",
+			"triage bundle %s delivered %s; its terminal declares %s", subject, got, wantDigest)
+	}
+	return data, nil
+}
+
 func digestOf(data []byte) string {
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:])
