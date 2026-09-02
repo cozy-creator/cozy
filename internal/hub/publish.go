@@ -252,6 +252,20 @@ func (c *Client) UpdateModelRelease(ctx context.Context, ref Ref, release string
 	return out, e
 }
 
+// RetargetModelLane moves ONE existing release lane pointer to another
+// checkpoint the model already retains. The hub creates nothing on this route:
+// an unknown release, lane, or checkpoint and a yanked release refuse typed.
+func (c *Client) RetargetModelLane(ctx context.Context, ref Ref, release, lane,
+	checkpointID, reason string,
+) (ModelRelease, *exit.Error) {
+	var out ModelRelease
+	e := c.do(ctx, call{method: http.MethodPut,
+		path: modelReleasePath(ref, release) + "/lanes/" + url.PathEscape(lane),
+		auth: true, reason: reason, patient: true, strict: true,
+		body: map[string]any{"checkpoint_id": checkpointID}}, &out)
+	return out, e
+}
+
 func (c *Client) YankModelRelease(ctx context.Context, ref Ref, release, reason string) (ModelRelease, *exit.Error) {
 	var out ModelRelease
 	e := c.do(ctx, call{method: http.MethodDelete, path: modelReleasePath(ref, release),
