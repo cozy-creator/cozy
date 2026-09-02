@@ -630,6 +630,7 @@ func (c *Orchestrator) issuePrivatePackageSet(s *session, w *worker,
 	revision := c.nextRevision()
 	c.mu.Lock()
 	w.revision, w.desiredRefusal = revision, nil
+	w.delegationExpiry = time.Time{} // private wheels travel as minted capabilities, not a delegation
 	w.desiredPrivate = clonePrivatePackageSet(selected)
 	w.desiredPrivatePlacement = nil
 	w.desiredPackages, w.desiredModels = nil, nil
@@ -696,6 +697,7 @@ func (c *Orchestrator) issuePrivatePlacementSet(s *session, w *worker,
 	revision := c.nextRevision()
 	c.mu.Lock()
 	w.revision, w.desiredRefusal = revision, nil
+	w.delegationExpiry = delegationExpiryOf(selected.DownloadDelegation)
 	w.desiredPrivate, w.desiredPackages, w.desiredModels = nil, nil, nil
 	w.desiredPrivatePlacement = clonePrivatePlacementSet(selected)
 	c.mu.Unlock()

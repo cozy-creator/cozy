@@ -74,7 +74,9 @@ type owner struct {
 	closer func()
 }
 
-func hostOwner(t *testing.T, name string) *owner {
+// hostOwner builds the real orchestrator on a fresh root. `with` mutates the options
+// before Open, for the wiring a particular product path needs (the rental callbacks, say).
+func hostOwner(t *testing.T, name string, with ...func(*orchestrator.Options)) *owner {
 	t.Helper()
 	root := filepath.Join(os.TempDir(), "cozy-product-test", name)
 	must(t, os.RemoveAll(root))
@@ -90,10 +92,14 @@ func hostOwner(t *testing.T, name string) *owner {
 	fatal(t, e)
 	log, err := os.Create(filepath.Join(root, "orchestrator.log"))
 	must(t, err)
-	c, e := orchestrator.Open(orchestrator.Options{
+	options := orchestrator.Options{
 		Cfg: cfg, Layout: l, Store: st, Yield: "smart", Log: log,
 		ConfigDigest: "sha256:" + strings.Repeat("22", 32), MaxOutputMiB: 8,
-	})
+	}
+	for _, mutate := range with {
+		mutate(&options)
+	}
+	c, e := orchestrator.Open(options)
 	fatal(t, e)
 	go func() { _ = c.Serve() }()
 	o := &owner{root: root, cfg: cfg, l: l, store: st, c: c}

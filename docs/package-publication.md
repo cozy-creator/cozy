@@ -57,7 +57,8 @@ the parent requirement. It also derives the canonical descriptor with the projec
 `cozy-model-contract-proof` in the same locked venv over the hub-resolved
 (snapshot, config, hardware variants) per declared pair, producing the derive-evidence
 envelope that publishes beside the descriptor (cl-078; the hub validates it statically and
-never executes package code). A build that repeatedly emits no output is stopped as stalled.
+never executes package code). Each of these runs to its own completion: Cozy waits on the
+child process and reads its exit, and imposes no clock of its own on it.
 
 Publication is one small digest-declared transaction (the th-094 shape):
 

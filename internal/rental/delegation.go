@@ -110,9 +110,24 @@ func modelKey(row *pb.DownloadModelRef) string {
 		row.Release + "\x00" + row.Manifest
 }
 
+// DelegationLifetime is how long one signed download delegation is worth stealing — a
+// SECURITY bound, and never a bound on the transfer it authorizes. Tensorhub refuses any
+// delegation whose expiry is more than an hour out (`internal/workerdownloads/delegation.go`
+// maxDelegationLifetime), so an hour is the ceiling; this is the ceiling less one plan
+// lifetime (the hub mints presigned URLs for at most 10 minutes) so the last plan minted
+// under a delegation still gets a full-length capability, and a modest Creator/hub clock
+// difference cannot push the expiry past the ceiling and be refused for that alone.
+//
+// A materialization longer than this does NOT fail: the pod reports the lapse, and the
+// orchestrator answers it by signing a fresh delegation over the bytes already verified on
+// disk (xs-007 row 5). 100 GB at 50 MB/s took 33 minutes and used to fail as a credential
+// error, Structural and unrequeued, because the expiry was making the decision.
+const DelegationLifetime = time.Hour - 10*time.Minute
+
 func PackageSetSigner(l home.Layout) orchestrator.RentalPackageSetSource {
 	return func(connection *orchestrator.WorkerConnection, packages []*pb.DownloadPackageRef,
 		models []*pb.DownloadModelRef) ([]byte, []byte, *exit.Error) {
-		return SignDownloadDelegation(l, connection, packages, models, time.Now().Add(30*time.Minute))
+		return SignDownloadDelegation(l, connection, packages, models,
+			time.Now().Add(DelegationLifetime))
 	}
 }

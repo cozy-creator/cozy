@@ -383,6 +383,9 @@ type worker struct {
 	// owner issued. It is distinct from a claim refusal and from capacity: a config or
 	// placement-set refusal can never become dispatchable by waiting longer.
 	desiredRefusal *exit.Error
+	// delegationExpiry is when the download delegation carried by the current desired
+	// revision stops being honoured. It is read only to judge a lapse the pod reports.
+	delegationExpiry time.Time
 	// exitCode is the process's own disposition. RECYCLE is not a death (cr-009): a
 	// run-once job worker exits with it the moment its terminal is acknowledged, and
 	// reading that as "the worker died" turns a completed job into a failed request.
@@ -1233,7 +1236,14 @@ const ReportCadence = 2 * time.Second
 
 // mediaIOStallBudget bounds one socket operation that moves no bytes. It does not settle,
 // retire, or reclaim a worker and resets whenever bytes move.
-const mediaIOStallBudget = 16 * time.Second
+//
+// The figure is DERIVED, not chosen (xs-007 row 29): a live pod proves it is there every
+// ReportCadence on the control stream, so eight consecutive report periods with not one
+// byte moving on the byte plane is silence by the pod's own published cadence. Eight is the
+// fleet's still-factor — the same count `transfer.stillSamples` spends before calling a
+// transfer stalled — so one slow read, a GC pause, or a retry inside the transport can
+// never be mistaken for a stall.
+const mediaIOStallBudget = 8 * ReportCadence
 
 // EnsurePlacementReady blocks until the placement's SERVING AXIS says DISPATCHABLE for
 // this plan — a real activation completed, never merely "connected" and never merely

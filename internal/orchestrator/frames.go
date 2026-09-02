@@ -160,13 +160,16 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 		return exit.Named(exit.Validation, "rental.delegation_incomplete",
 			"package_set requires canonical delegation bytes and one Ed25519 signature")
 	}
-	if _, err := canonical.Read(delegation, &pb.DownloadDelegation{}); err != nil {
+	document, err := canonical.Read(delegation, &pb.DownloadDelegation{})
+	if err != nil {
 		return exit.Named(exit.Validation, "rental.delegation_invalid",
 			"package_set delegation is not canonical: %s", err)
 	}
+	expiry := time.Unix(document.Int("expires_at_unix"), 0)
 	revision := c.nextRevision()
 	c.mu.Lock()
 	w.revision, w.desiredRefusal = revision, nil
+	w.delegationExpiry = expiry
 	w.desiredPackages = clonePackageRefs(packages)
 	w.desiredModels = cloneModelRefs(models)
 	w.desiredDelegation = append([]byte(nil), delegation...)
@@ -189,6 +192,19 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 	c.logf("DesiredWorkerState revision=%d package_set delegation=%d B -> %s",
 		revision, len(delegation), s.bootID)
 	return nil
+}
+
+// delegationExpiryOf reads the lifetime out of the exact delegation bytes this owner is
+// about to send. It is kept on the worker so a pod reporting the credential lapsed can be
+// told apart from a pod reporting a lapse that could not have happened yet (owner.go's
+// refusePendingDesiredState). A desired state carrying no delegation clears it: a stale
+// expiry must never excuse a refusal of some other mode.
+func delegationExpiryOf(delegation []byte) time.Time {
+	document, err := canonical.Read(delegation, &pb.DownloadDelegation{})
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Unix(document.Int("expires_at_unix"), 0)
 }
 
 func clonePackageRefs(in []*pb.DownloadPackageRef) []*pb.DownloadPackageRef {
@@ -242,6 +258,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 	rev := c.nextRevision()
 	c.mu.Lock()
 	w.revision, w.setDigest, w.setBytes = rev, digest, setBytes
+	w.delegationExpiry = time.Time{}
 	w.desiredRefusal = nil
 	c.mu.Unlock()
 

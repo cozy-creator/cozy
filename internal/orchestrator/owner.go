@@ -129,23 +129,66 @@ func (c *Orchestrator) attach(w *worker) {
 // FailedPrecondition is the worker host's final answer when it could not apply the
 // desired revision. Redialing cannot make that exact revision acceptable, and hiding the
 // status behind reconnects leaves the request waiting for a state the worker rejected.
+//
+// WITH ONE EXCEPTION, and it is not a verdict about the revision at all: the download
+// delegation THIS OWNER signed can age out while the pod is still downloading against it.
+// A 100 GB materialization at 50 MB/s runs 33 minutes; the delegation used to last 30, so
+// every large rental download failed as a credential error — Structural, not requeued
+// (xs-007 row 5). Nothing about that refusal says the work stopped: the pod fails a
+// materialization for lack of PROGRESS on its own (`poddownloads` refuses a refreshed plan
+// that landed no new byte), and that verdict arrives here as a different refusal, which is
+// still permanent. So a lapsed credential is answered by minting another one — `attach`
+// redials and `onSnapshot` re-issues the package set under a freshly signed delegation,
+// over the bytes already verified on the pod's content-addressed disk.
+//
+// The excuse is spent only on a credential that HAS aged out by this owner's clock too. A
+// pod reporting a lapse against a delegation that is still live here means the two sides
+// disagree about the time, not that a download is running: re-signing would produce the
+// same answer forever, so that refusal stays permanent and names the skew.
 func (c *Orchestrator) refusePendingDesiredState(w *worker, err error) bool {
 	if status.Code(err) != codes.FailedPrecondition {
 		return false
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if w.revision == 0 || w.acceptedRevision >= w.revision {
+		c.mu.Unlock()
 		return false
 	}
 	detail := status.Convert(err).Message()
 	if len(detail) > 1024 {
 		detail = detail[:1024] + "…"
 	}
-	w.desiredRefusal = exit.Named(exit.Structural, "worker.desired_state_refused",
-		"worker rejected desired revision %d before applying it: %s",
-		w.revision, detail)
+	expiry := w.delegationExpiry
+	lapsed := lapsedDownloadDelegation(detail) && !expiry.IsZero() && !time.Now().Before(expiry)
+	if !lapsed {
+		w.desiredRefusal = exit.Named(exit.Structural, "worker.desired_state_refused",
+			"worker rejected desired revision %d before applying it: %s",
+			w.revision, detail)
+	}
+	revision := w.revision
+	c.mu.Unlock()
+	if lapsed {
+		c.logf("worker %s: the download delegation this owner signed expired at %s while the "+
+			"pod was still resolving; re-issuing the package set under a fresh one",
+			w.instanceID, expiry.UTC().Format(time.RFC3339))
+		return false
+	}
+	c.logf("worker %s: desired revision %d REFUSED before it was applied: %s",
+		w.instanceID, revision, detail)
 	return true
+}
+
+// lapsedDownloadDelegation reads the pod's refusal for the one cause that is a fact about
+// this owner's credential rather than about the desired revision. Tensorhub refuses a
+// resolve carrying an aged-out delegation with `worker_downloads.delegation_unauthorized`
+// and says `expired` in the message; pod-supervisor forwards that text verbatim as its
+// FailedPrecondition detail. That text is the whole channel — the worker wire is pinned
+// (protocol/cozy/worker/v1/SOURCE) and carries no field for a refusal code — so both
+// tokens must be present, and the same code for an invalid signature or a delegation bound
+// to another rental (neither of which says `expired`) stays permanent.
+func lapsedDownloadDelegation(detail string) bool {
+	return strings.Contains(detail, "worker_downloads.delegation_unauthorized") &&
+		strings.Contains(detail, "expired")
 }
 
 // workerAddr resolves the dialable address: the remote spec's own, or the file-handoff

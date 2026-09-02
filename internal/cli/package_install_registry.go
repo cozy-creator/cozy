@@ -19,7 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/tfs"
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
@@ -428,20 +427,19 @@ func publishedDefaultBindings(parent context.Context, cfg config.Config, root, r
 		return nil, exit.Internalf("cannot stage exact package descriptor: %s", err)
 	}
 
-	queryCtx, cancel := context.WithTimeout(parent, launch.DefaultRuntimeQueryTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(queryCtx, runtimeBin, "--json", "--dir", metadataRoot,
+	// The install waits on the CHILD, not on a clock (xs-007 row 10). This call used to run
+	// under a 5-second deadline that refused the install whenever a Python cold start took
+	// longer — which on a loaded host it does. `parent` is the caller's own cancellation and
+	// remains the only bound.
+	cmd := exec.CommandContext(parent, runtimeBin, "--json", "--dir", metadataRoot,
 		"--descriptor", descriptorPath, "bindings")
 	cmd.WaitDelay = 250 * time.Millisecond
 	cmd.Env = cfg.Tool("COZY_HOME=" + cfg.Home)
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
-	if queryCtx.Err() == context.DeadlineExceeded {
-		return nil, exit.Named(exit.Deadline, "runtime_query_stalled",
-			"`cozy-runtime bindings` did not answer its metadata query within %s",
-			launch.DefaultRuntimeQueryTimeout).
-			WithRemedy("bindings must resolve package.toml against the exact descriptor without importing package code")
+	if parent.Err() != nil {
+		return nil, exit.New(exit.Canceled, "`cozy-runtime bindings` was stopped: %s", parent.Err())
 	}
 	if cmd.ProcessState == nil {
 		return nil, exit.Named(exit.Structural, "runtime_missing",

@@ -146,7 +146,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	var said struct {
 		DescriptorID string `json:"job_descriptor_id"`
 	}
-	if e := f.RuntimeCLI.query(&said, "describe", function); e != nil {
+	if e := f.RuntimeCLI.call(&said, "describe", function); e != nil {
 		return nil, e
 	}
 	if said.DescriptorID == "" {
