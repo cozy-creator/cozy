@@ -423,7 +423,9 @@ func deriveDevelopmentPlacement(venvDir, sourceDir, artifactStore string, local 
 		return nil, empty, exit.Internalf("cannot run %s: %s", bin, err)
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return nil, empty, metadataRefusal(code, "development-placement", stderr.String())
+		return nil, empty, launch.RuntimeExit(code, "development-placement",
+			"runtime_preparation_failed", stdout.String(), stderr.String()).
+			WithNext("cozy help package install")
 	}
 	type exact struct {
 		Bytes  []byte `json:"canonical_bytes_base64"`
@@ -480,29 +482,6 @@ func deriveDevelopmentPlacement(venvDir, sourceDir, artifactStore string, local 
 	}
 	return descriptor, ExactDocument{Bytes: answer.PlacementSet.Bytes,
 		Digest: answer.PlacementSet.Digest, Length: answer.PlacementSet.Length}, nil
-}
-
-// metadataRefusal preserves Runtime's typed metadata refusal under the shared exit vocabulary.
-func metadataRefusal(code int, verb, stderr string) *exit.Error {
-	var doc struct {
-		Error struct{ Name, Message, Remedy string } `json:"error"`
-	}
-	c := exit.Code(code)
-	if !c.Valid() {
-		c = exit.Internal
-	}
-	if json.Unmarshal([]byte(stderr), &doc) != nil || doc.Error.Message == "" {
-		return exit.Named(c, "runtime_metadata_refused",
-			"`cozy-runtime %s` refused this install (exit %d)", verb, code).
-			WithRemedy("%s", condense(stderr))
-	}
-	name := doc.Error.Name
-	if name == "" {
-		name = "runtime_metadata_refused"
-	}
-	return exit.Named(c, name, "%s", doc.Error.Message).
-		WithRemedy("%s", doc.Error.Remedy).
-		WithNext("cozy help package install")
 }
 
 // verifySource settles source identity before any build backend or import can run.

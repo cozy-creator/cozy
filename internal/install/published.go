@@ -140,10 +140,7 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 				"cannot remove local materialization-wheel view: %s", err)
 		}
 	}
-	answer, refusal, problem := preparePackageSet(l, installDir, published)
-	if refusal != nil {
-		return nil, empty, "", nil, refusal
-	}
+	answer, problem := preparePackageSet(l, installDir, published)
 	if problem != nil {
 		return nil, empty, "", nil, problem
 	}
@@ -218,7 +215,8 @@ func describePublished(runtimeBin, sourceDir string, committed ExactDocument) (
 		return nil, exit.Internalf("cannot run %s: %s", runtimeBin, err)
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return nil, metadataRefusal(code, "describe", stderr.String())
+		return nil, launch.RuntimeExit(code, "describe", "runtime_query_failed",
+			stdout.String(), stderr.String())
 	}
 	raw := bytes.TrimSuffix([]byte(stdout.String()), []byte("\n"))
 	if !bytes.Equal(raw, committed.Bytes) {
@@ -319,13 +317,10 @@ func runPublishedSelection(l home.Layout, inst records.PackageInstall,
 	published *PublishedSource,
 ) (ExactDocument, *exit.Error) {
 	var empty ExactDocument
-	answer, refusal, problem := preparePackageSet(l, inst.Dir, published)
-	if refusal != nil {
-		return empty, exit.Named(refusal.Code, "model_selection_incompatible",
-			"selected model does not satisfy %s: %s", inst.Package, refusal.Message).
-			WithRemedy("choose a model matching the callable's slot class and stamps; %s", refusal.Remedy)
-	}
+	answer, problem := preparePackageSet(l, inst.Dir, published)
 	if problem != nil {
+		// The runtime's refusal is the run's error, unrelabelled: nothing on this path
+		// evaluates the checkpoint, so nothing here may call it a fit (model-code-fit §3).
 		return empty, problem
 	}
 	if answer.Package != inst.Package || answer.Release != inst.Version ||
@@ -362,14 +357,14 @@ type packagePreparation struct {
 // package at once instead of waiting for each release to re-lock a newer cozy-runtime. The
 // venv's own Runtime running this verb judged its own site-packages as "the base" and refused
 // every native dependency wheel it had just installed (hf_xet.abi3.so "already belongs to the
-// selected base"). A refusal is the Runtime's own typed verdict on the wheels or the selected
-// models; a problem is this machine's (no host Runtime, an unreadable answer).
+// selected base"). The Runtime's typed refusal is returned as itself (launch.RuntimeExit);
+// this machine's own problems (no host Runtime, an unreadable answer) carry their own names.
 func preparePackageSet(l home.Layout, installDir string, published *PublishedSource,
-) (answer packagePreparation, refusal, problem *exit.Error) {
+) (answer packagePreparation, problem *exit.Error) {
 	var empty packagePreparation
 	runtimeBin, problem := launch.HostRuntime(config.Frozen().Tool())
 	if problem != nil {
-		return empty, nil, problem
+		return empty, problem
 	}
 	args := []string{"--json", "prepare-package",
 		"--artifact-store", l.CAS,
@@ -388,7 +383,7 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 	for _, model := range published.Models {
 		raw, err := json.Marshal(model)
 		if err != nil {
-			return empty, nil, exit.Internalf("cannot encode selected package model: %s", err)
+			return empty, exit.Internalf("cannot encode selected package model: %s", err)
 		}
 		args = append(args, "--model", string(raw))
 	}
@@ -398,10 +393,11 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
 	if cmd.ProcessState == nil {
-		return empty, nil, exit.Internalf("cannot run %s: %s", runtimeBin, err)
+		return empty, exit.Internalf("cannot run %s: %s", runtimeBin, err)
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return empty, metadataRefusal(code, "prepare-package", stderr.String()), nil
+		return empty, launch.RuntimeExit(code, "prepare-package", "runtime_preparation_failed",
+			stdout.String(), stderr.String())
 	}
 	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
 	decoder.DisallowUnknownFields()
@@ -413,10 +409,10 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 	if decodeErr != io.EOF || answer.Package != published.Package ||
 		answer.Release != published.Release ||
 		!validRuntimeExact(answer.PackageDescriptor) || !validRuntimeExact(answer.PlacementSet) {
-		return empty, nil, exit.Named(exit.Structural, "package_prepare_invalid",
+		return empty, exit.Named(exit.Structural, "package_prepare_invalid",
 			"cozy-runtime returned an invalid package preparation result")
 	}
-	return answer, nil, nil
+	return answer, nil
 }
 
 // The package venv runs the exact cozy-runtime wheel selected by uv.lock. Older releases may
