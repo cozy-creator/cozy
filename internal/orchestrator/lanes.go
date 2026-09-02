@@ -68,6 +68,9 @@ type lane struct {
 	ordinals     []uint32
 	placementIDs []string
 	seats        seatLedger
+	// held is how many attempts the worker last reported on this lane, in every state
+	// from admission to ack — the queue ahead of a new offer (route.go).
+	held int
 	// outsideEnvelope latches a lane naming an ordinal past the granted envelope. It is a
 	// worker breach; the lane takes no offer and the report says why, once.
 	outsideEnvelope bool
@@ -171,6 +174,23 @@ func (t *laneTable) route(placementID, laneID string) {
 	t.byPlacement[placementID] = laneID
 }
 
+// observeHeld counts the worker's held attempts onto the lanes their placements are on,
+// after `observe` and `route` have placed every placement. It answers how many were on no
+// lane (a job-mode attempt names no placement).
+func (t *laneTable) observeHeld(placementIDs []string) (unrouted int) {
+	for _, l := range t.lanes {
+		l.held = 0
+	}
+	for _, placementID := range placementIDs {
+		if l := t.of(placementID); l != nil {
+			l.held++
+		} else {
+			unrouted++
+		}
+	}
+	return unrouted
+}
+
 func (t *laneTable) of(placementID string) *lane {
 	if id, ok := t.byPlacement[placementID]; ok {
 		return t.lanes[id]
@@ -216,6 +236,7 @@ type LaneFacts struct {
 	DeviceOrdinals []uint32 `json:"device_ordinals"`
 	Devices        []string `json:"devices"`
 	AvailableSlots int      `json:"available_attempt_slots"`
+	HeldAttempts   int      `json:"held_attempts"`
 	PlacementIDs   []string `json:"placement_ids"`
 }
 
@@ -229,42 +250,13 @@ func laneFactsOf(w *worker) []LaneFacts {
 		out = append(out, LaneFacts{
 			LaneID: l.id, DeviceOrdinals: append([]uint32(nil), l.ordinals...),
 			Devices: devicesOf(l, w.spec.Devices), AvailableSlots: l.seats.slots,
-			PlacementIDs: append([]string(nil), l.placementIDs...),
+			HeldAttempts: l.held, PlacementIDs: append([]string(nil), l.placementIDs...),
 		})
 	}
 	return out
 }
 
-// seatFor is the ADMISSION question for one placement (#486c generalized by proto-024):
-// the worker's fence is OPEN, a worker-level seat is free, and — when the worker reports
-// lanes — the placement's own lane has a free seat. It answers the lane id the reservation
-// draws from ("" for the worker-level window) and a reason when the answer is no.
-func (w *worker) seatFor(placementID string) (laneID string, ok bool, why string) {
-	if w.admission != pb.AdmissionState_ADMISSION_STATE_OPEN {
-		return "", false, "admission " +
-			trimEnum(pb.AdmissionState_name[int32(w.admission)], "ADMISSION_STATE_")
-	}
-	if w.seats.slots <= 0 {
-		return "", false, "no free attempt slot"
-	}
-	if !w.lanes.present() {
-		return "", true, ""
-	}
-	l := w.lanes.of(placementID)
-	if l == nil {
-		return "", false, fmt.Sprintf("placement %s is on none of the %d reported lane(s)",
-			placementID, len(w.lanes.lanes))
-	}
-	if l.outsideEnvelope {
-		return "", false, fmt.Sprintf("lane %s is outside the granted envelope", l.id)
-	}
-	if l.seats.slots <= 0 {
-		return "", false, fmt.Sprintf("lane %s has no free seat", l.id)
-	}
-	return l.id, true, ""
-}
-
-// reserveSeat takes the seat seatFor answered: the worker-level window and, when the offer
+// reserveSeat takes the seat roomFor answered: the worker-level window and, when the offer
 // draws from a lane, that lane's.
 func (w *worker) reserveSeat(laneID string) {
 	w.seats.reserve()
@@ -280,10 +272,19 @@ func (w *worker) releaseSeat(laneID string) {
 	}
 }
 
+// settleSeat answers a reservation. A consumed one is now an attempt the worker HOLDS, so
+// it moves from this owner's reservations to the held count until the worker's next report
+// says so itself — the two never both count it, and the lane never looks emptier than it is.
 func (w *worker) settleSeat(laneID string, consumed bool) {
 	w.seats.settle(consumed)
+	if consumed {
+		w.held++
+	}
 	if l := w.lanes.get(laneID); l != nil {
 		l.seats.settle(consumed)
+		if consumed {
+			l.held++
+		}
 	}
 }
 
