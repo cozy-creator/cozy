@@ -73,23 +73,48 @@ func TestRegistryLockRowsReplaceTheProxiedDownload(t *testing.T) {
 }
 
 func TestUnresolvableSourceProfilesRefuseBeforeAnyDerivation(t *testing.T) {
-	root := t.TempDir()
-	descriptor := filepath.Join(root, "descriptor.json")
-	body := `{"format":"cozy.package.descriptor/1","application":"a:b",` +
-		`"entrypoints":[{"name":"generate","request":{},"result":{},` +
-		`"models":[{"class":"Denoiser","path":"generate.models.denoiser",` +
-		`"stamps":{},"component_use":{},"source_profile":"just-a-token"}]}],"jobs":[]}`
-	if err := os.WriteFile(descriptor, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
+	profiled := func(t *testing.T, profile string) *packagepublish.Package {
+		root := t.TempDir()
+		descriptor := filepath.Join(root, "descriptor.json")
+		body := `{"format":"cozy.package.descriptor/1","application":"a:b",` +
+			`"entrypoints":[{"name":"generate","request":{},"result":{},` +
+			`"models":[{"class":"Denoiser","path":"generate.models.denoiser",` +
+			`"stamps":{},"component_use":{},"source_profile":"` + profile + `"}]}],"jobs":[]}`
+		if err := os.WriteFile(descriptor, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return &packagepublish.Package{Root: root, Descriptor: descriptor,
+			Wheel: descriptor /* never reached */, Tree: root, Name: "thing", Release: "1.0.0"}
 	}
-	pack := &packagepublish.Package{Root: root, Descriptor: descriptor,
-		Wheel: descriptor /* never reached */, Tree: root, Name: "thing", Release: "1.0.0"}
-	problem := pack.DeriveEvidence(t.Context(), "acme",
-		func(_ context.Context, model, release, lane string) (packagepublish.DeriveInput, *exit.Error) {
-			t.Fatalf("resolver reached for %s@%s/%s", model, release, lane)
-			return packagepublish.DeriveInput{}, nil
-		})
-	if problem == nil || problem.Name != "source_profile_unresolvable" {
-		t.Fatalf("one-segment profile answered %v", problem)
+	// Outside the four-or-five segment grammar the resolver is never reached.
+	for _, profile := range []string{"just-a-token", "a/b/c/d/e/f", "a/b/c/d/"} {
+		problem := profiled(t, profile).DeriveEvidence(t.Context(), "acme",
+			func(_ context.Context, model, release, lane, config string) (packagepublish.DeriveInput, *exit.Error) {
+				t.Fatalf("resolver reached for %s@%s/%s config %q", model, release, lane, config)
+				return packagepublish.DeriveInput{}, nil
+			})
+		if problem == nil || problem.Name != "source_profile_unresolvable" {
+			t.Fatalf("profile %q answered %v", profile, problem)
+		}
+	}
+	// The optional fifth segment is the config selector (th-114): the resolver
+	// receives it exactly, and empty for a four-segment profile.
+	for profile, config := range map[string]string{
+		"acme/sd-turbo/1.0.0/bf16":      "",
+		"acme/sd-turbo/1.0.0/bf16/unet": "unet",
+	} {
+		stop := exit.Named(exit.Unavailable, "resolver_stopped", "recorded the parse")
+		var got [4]string
+		problem := profiled(t, profile).DeriveEvidence(t.Context(), "acme",
+			func(_ context.Context, model, release, lane, config string) (packagepublish.DeriveInput, *exit.Error) {
+				got = [4]string{model, release, lane, config}
+				return packagepublish.DeriveInput{}, stop
+			})
+		if problem == nil || problem.Name != "resolver_stopped" {
+			t.Fatalf("profile %q answered %v", profile, problem)
+		}
+		if got != [4]string{"acme/sd-turbo", "1.0.0", "bf16", config} {
+			t.Fatalf("profile %q resolved as %v", profile, got)
+		}
 	}
 }

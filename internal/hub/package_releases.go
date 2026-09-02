@@ -192,6 +192,7 @@ type PackageDeriveInputs struct {
 	Model            string   `json:"model"`
 	Release          string   `json:"release"`
 	Lane             string   `json:"lane"`
+	Config           string   `json:"config"`
 	Snapshot         string   `json:"snapshot"`
 	ConfigBase64     string   `json:"config_base64"`
 	ConfigDigest     string   `json:"config_digest"`
@@ -199,9 +200,12 @@ type PackageDeriveInputs struct {
 	HardwareVariants []string `json:"hardware_variants"`
 }
 
-func (c *Client) ModelDeriveInputs(ctx context.Context, ref Ref, release, lane string) (PackageDeriveInputs, *exit.Error) {
+func (c *Client) ModelDeriveInputs(ctx context.Context, ref Ref, release, lane, config string) (PackageDeriveInputs, *exit.Error) {
 	var out PackageDeriveInputs
 	query := url.Values{"lane": []string{lane}, "release": []string{release}}
+	if config != "" {
+		query.Set("config", config)
+	}
 	e := c.do(ctx, call{method: http.MethodGet,
 		path:   resourcePath("models", ref) + "/derive-inputs?" + query.Encode(),
 		strict: true, responseBytes: 16 << 20}, &out)

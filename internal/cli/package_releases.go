@@ -159,31 +159,32 @@ func handlePackageYank(ctx *Context) *exit.Error {
 	}, "package", "release", "status"))
 }
 
-// deriveInputResolver turns a declared "org/model/lane" profile into the
-// evidence run's exact inputs through the hub's derive-inputs read.
+// deriveInputResolver turns a declared "org/model/release/lane[/config]"
+// profile into the evidence run's exact inputs through the hub's derive-inputs
+// read.
 func deriveInputResolver(c *hub.Client) packagepublish.ProfileResolver {
-	return func(ctx context.Context, model, release, lane string) (packagepublish.DeriveInput, *exit.Error) {
+	return func(ctx context.Context, model, release, lane, config string) (packagepublish.DeriveInput, *exit.Error) {
 		ref, problem := hub.ParseRef(model)
 		if problem != nil {
 			return packagepublish.DeriveInput{}, problem.
-				WithRemedy("declare the source profile as <org>/<model>/<release>/<lane>")
+				WithRemedy("declare the source profile as <org>/<model>/<release>/<lane>[/<config>]")
 		}
-		resolved, problem := c.ModelDeriveInputs(ctx, ref, release, lane)
+		resolved, problem := c.ModelDeriveInputs(ctx, ref, release, lane, config)
 		if problem != nil {
 			return packagepublish.DeriveInput{}, problem
 		}
-		config, err := base64.StdEncoding.DecodeString(resolved.ConfigBase64)
-		if err != nil || int64(len(config)) != resolved.ConfigLength {
+		configBytes, err := base64.StdEncoding.DecodeString(resolved.ConfigBase64)
+		if err != nil || int64(len(configBytes)) != resolved.ConfigLength {
 			return packagepublish.DeriveInput{}, exit.Named(exit.Structural,
 				"hub.derive_inputs_invalid", "Tensorhub returned invalid derive inputs for %s", model)
 		}
-		sum := sha256.Sum256(config)
+		sum := sha256.Sum256(configBytes)
 		if resolved.ConfigDigest != "sha256:"+hex.EncodeToString(sum[:]) {
 			return packagepublish.DeriveInput{}, exit.Named(exit.Conflict,
 				"hub.derive_inputs_invalid", "derive-input config bytes do not match their digest")
 		}
 		return packagepublish.DeriveInput{Snapshot: resolved.Snapshot,
-			ConfigDigest: resolved.ConfigDigest, ConfigBytes: config,
+			ConfigDigest: resolved.ConfigDigest, ConfigBytes: configBytes,
 			Variants: resolved.HardwareVariants}, nil
 	}
 }

@@ -34,8 +34,11 @@ type DeriveInput struct {
 	Variants     []string
 }
 
-// ProfileResolver answers one declared "org/model/release/lane" profile from the hub.
-type ProfileResolver func(ctx context.Context, model, release, lane string) (DeriveInput, *exit.Error)
+// ProfileResolver answers one declared "org/model/release/lane[/config]"
+// profile from the hub. config is the optional fifth segment (th-114): the
+// named construction config of a multi-config checkpoint, empty when the
+// profile declares none.
+type ProfileResolver func(ctx context.Context, model, release, lane, config string) (DeriveInput, *exit.Error)
 
 var evidenceDocName = regexp.MustCompile(`^[0-9a-f]{64}\.json$`)
 
@@ -112,17 +115,23 @@ func (p *Package) DeriveEvidence(ctx context.Context, org string, resolve Profil
 	for i, binding := range bindings {
 		// Model releases are mutable pointers with unordered labels (#689), so a
 		// model has no default release and the declared profile must name one:
-		// <org>/<model>/<release>/<lane>.
+		// <org>/<model>/<release>/<lane>. A fifth segment (th-114) names the
+		// construction config of a multi-config checkpoint.
 		segments := strings.Split(binding.profile, "/")
-		if len(segments) != 4 {
+		if len(segments) < 4 || len(segments) > 5 ||
+			(len(segments) == 5 && segments[4] == "") {
 			return exit.Named(exit.Validation, "source_profile_unresolvable",
-				"%s declares source profile %q; evidence resolution needs org/model/release/lane",
+				"%s declares source profile %q; evidence resolution needs org/model/release/lane with an optional /config",
 				binding.path, binding.profile).
-				WithRemedy("declare the profile as <org>/<model>/<release>/<lane>")
+				WithRemedy("declare the profile as <org>/<model>/<release>/<lane>[/<config>]")
+		}
+		config := ""
+		if len(segments) == 5 {
+			config = segments[4]
 		}
 		input, held := inputs[binding.profile]
 		if !held {
-			resolved, problem := resolve(ctx, segments[0]+"/"+segments[1], segments[2], segments[3])
+			resolved, problem := resolve(ctx, segments[0]+"/"+segments[1], segments[2], segments[3], config)
 			if problem != nil {
 				return problem
 			}
