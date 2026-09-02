@@ -11,7 +11,7 @@ use tensorfs_core::ids::{hex64, prefixed, Doc, ObjectRef};
 use tensorfs_core::manifest::{Entry, Manifest};
 use tensorfs_core::repository::{self, Mutation, Repository};
 use tensorfs_core::storage::{
-    self, Census, CheckpointFacts as CensusCheckpointFacts, InventoryEntry,
+    self, Census, CheckpointFacts as CensusCheckpointFacts, InventoryEntry, StagedCheckpoint,
 };
 use tensorfs_core::store::{ExpectedCheckpointContract, Fault, Store};
 
@@ -181,7 +181,9 @@ fn checkpoint_fact_rows(
         ("org", Value::str(repository.repo.org.clone())),
     ];
     if let (Some(header), Some(digests)) = (&facts.header, &facts.digests) {
-        fields.push(("config_digest", Value::str(digests.config_digest.clone())));
+        if let Some(config) = &digests.config_digest {
+            fields.push(("config_digest", Value::str(config.clone())));
+        }
         fields.push(("header_length", Value::uint(header.length)));
         fields.push(("header_sha256", Value::str(header.sha256.clone())));
         fields.push(("shape_digest", Value::str(digests.shape_digest.clone())));
@@ -361,17 +363,19 @@ pub fn cmd_repo_migrate(root: &Path, flags: &Flags) -> ExitCode {
                 Ok(value) => value,
                 Err(error) => return bail(error),
             };
-            let digests = header.digests();
+            let digests = match tensorfs_core::checkpoint::digests(&store, &header) {
+                Ok(value) => value,
+                Err(error) => return bail(error),
+            };
             evidence.retain(|(k, _)| {
                 !matches!(
                     k.as_str(),
                     "classification_digest" | "topology_digest" | "shape_digest" | "config_digest"
                 )
             });
-            evidence.push((
-                "config_digest".to_string(),
-                Value::str(digests.config_digest),
-            ));
+            if let Some(config) = digests.config_digest {
+                evidence.push(("config_digest".to_string(), Value::str(config)));
+            }
             evidence.push(("shape_digest".to_string(), Value::str(digests.shape_digest)));
             evidence.push((
                 "topology_digest".to_string(),
@@ -707,6 +711,39 @@ pub fn cmd_local_remove(root: &Path, name: &str, flags: &Flags) -> ExitCode {
     }
 }
 
+/// The exact bytes of every config the header names, from the `--config <path>` files the
+/// caller staged (any number, matched by content). `repo apply` has no store to read
+/// them from, and `config_digest` is derived from the construction document those bytes
+/// carry — a header naming a config the caller did not stage cannot be applied.
+fn staged_configs(
+    header: &Header,
+    flags: &Flags,
+) -> tensorfs_core::err::Result<Vec<(String, Vec<u8>)>> {
+    let mut staged: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for (key, path) in flags {
+        if key != "config" {
+            continue;
+        }
+        let bytes = read(Path::new(path))?;
+        staged.insert(tensorfs_core::sha256::hex_digest(&bytes), bytes);
+    }
+    header
+        .configs
+        .iter()
+        .map(|(name, config)| match staged.get(&config.sha256) {
+            Some(bytes) => Ok((name.clone(), bytes.clone())),
+            None => Err(Refusal {
+                code: Code::MISSING_FIELD,
+                detail: format!(
+                    "the header names config {name:?} (sha256:{}) but it was not staged: \
+                     pass --config <path> for every config the header names",
+                    config.sha256
+                ),
+            }),
+        })
+        .collect()
+}
+
 pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode {
     let (Some(output), Some(rows)) = (flag(flags, "out"), flag(flags, "rows")) else {
         eprintln!("--out <replacement> and --rows <jsonl> are required");
@@ -747,7 +784,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                 Ok(value) => value,
                 Err(error) => return bail(error),
             };
-            let (header_bytes, derived) = match (parsed.header(), flag(flags, "header")) {
+            let (header_bytes, configs, derived) = match (parsed.header(), flag(flags, "header")) {
                 (Some(header_ref), Some(header_path)) => {
                     let bytes = match read(Path::new(header_path)) {
                         Ok(value) => value,
@@ -763,13 +800,22 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                         Ok(value) => value,
                         Err(error) => return bail(error),
                     };
-                    let digests = header.digests();
+                    let configs = match staged_configs(&header, flags) {
+                        Ok(value) => value,
+                        Err(error) => return bail(error),
+                    };
+                    let digests = match header.digests(&configs) {
+                        Ok(value) => value,
+                        Err(error) => return bail(error),
+                    };
                     println!("topology_digest {}", digests.topology_digest);
                     println!("shape_digest    {}", digests.shape_digest);
-                    println!("config_digest   {}", digests.config_digest);
-                    (Some(bytes), Some(digests))
+                    if let Some(config) = &digests.config_digest {
+                        println!("config_digest   {config}");
+                    }
+                    (Some(bytes), configs, Some(digests))
                 }
-                (None, None) => (None, None),
+                (None, None) => (None, Vec::new(), None),
                 (Some(_), None) => {
                     eprintln!("a CozyTensors manifest also requires --header <cbor>");
                     return ExitCode::from(2);
@@ -783,7 +829,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                 Ok(value) => value,
                 Err(error) => return bail(error),
             };
-            Some((manifest_bytes, header_bytes, inventory, derived))
+            Some((manifest_bytes, header_bytes, configs, inventory, derived))
         }
         Mutation::RemoveCheckpoint { .. }
         | Mutation::UpdateRelease { .. }
@@ -791,7 +837,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
         | Mutation::DeleteRepository { .. } => None,
     };
 
-    let derived = inputs.as_ref().and_then(|inputs| inputs.3.as_ref());
+    let derived = inputs.as_ref().and_then(|inputs| inputs.4.as_ref());
     let replacement = match repository::apply(current_bytes.as_deref(), &mutation, derived) {
         Ok(value) => value,
         Err(error) => return bail(error),
@@ -802,12 +848,15 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
             let lines = match (&mutation, inputs) {
                 (
                     Mutation::PutCheckpoint { manifest, .. },
-                    Some((manifest_bytes, header, inventory, _)),
+                    Some((manifest_bytes, header, configs, inventory, _)),
                 ) => {
                     let facts = match Census::validate_checkpoint_inputs(
                         manifest,
-                        &manifest_bytes,
-                        header.as_deref(),
+                        StagedCheckpoint {
+                            manifest: &manifest_bytes,
+                            header: header.as_deref(),
+                            configs: &configs,
+                        },
                         &inventory,
                     ) {
                         Ok(facts) => facts,
@@ -819,12 +868,15 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                 }
                 (
                     Mutation::ReplaceLocal { manifest, .. },
-                    Some((manifest_bytes, header, inventory, _)),
+                    Some((manifest_bytes, header, configs, inventory, _)),
                 ) => {
                     let facts = match Census::validate_checkpoint_inputs(
                         manifest,
-                        &manifest_bytes,
-                        header.as_deref(),
+                        StagedCheckpoint {
+                            manifest: &manifest_bytes,
+                            header: header.as_deref(),
+                            configs: &configs,
+                        },
                         &inventory,
                     ) {
                         Ok(facts) => facts,

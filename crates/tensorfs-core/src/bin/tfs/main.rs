@@ -46,7 +46,8 @@
 //!   tfs repo migrate <store>                 re-derive every checkpoint row's digests from its header
 //!   tfs repo usage <store> --rows <jsonl>    blob bytes per repo: total, and unique to it
 //!   tfs repo apply <current.json|-> <mutation.json> --out <replacement> --rows <jsonl>
-//!                  put_checkpoint requires --manifest, --header and --inventory
+//!                  put_checkpoint requires --manifest, --header and --inventory, plus
+//!                  --config <path> for every config the header names
 //!   tfs repo commit <store> <current.json|-> <mutation.json>
 //!   tfs local resolve <store> <name>
 //!   tfs local replace <store> <name> <source-sha256> <manifest> <length>

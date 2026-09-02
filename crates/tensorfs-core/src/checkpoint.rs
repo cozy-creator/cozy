@@ -257,6 +257,26 @@ pub fn load_header(store: &Store, r: &ObjectRef) -> Result<Header> {
     Header::parse(&read_object(store, r, limits::DOC_MAX_BYTES)?)
 }
 
+/// The exact bytes of every config the header names, read from the store in header order.
+pub fn load_configs(store: &Store, h: &Header) -> Result<Vec<(String, Vec<u8>)>> {
+    h.configs
+        .iter()
+        .map(|(name, c)| {
+            let r = ObjectRef {
+                sha256: c.sha256.clone(),
+                length: c.length,
+            };
+            Ok((name.clone(), read_object(store, &r, limits::DOC_MAX_BYTES)?))
+        })
+        .collect()
+}
+
+/// The three catalog digests of a stored checkpoint (design §2): the header's projections
+/// and the construction document assembled from the config objects the header names.
+pub fn digests(store: &Store, h: &Header) -> Result<crate::header::Digests> {
+    h.digests(&load_configs(store, h)?)
+}
+
 /// The closure the header's `encodings` list names. An absent spec object is state (3) of
 /// cozytensors.md §4 — it cannot install as self-describing at all.
 pub fn load_closure(store: &Store, h: &Header) -> Result<Closure> {

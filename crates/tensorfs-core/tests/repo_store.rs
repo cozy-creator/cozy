@@ -80,7 +80,7 @@ fn model_fixture(store: &Store, value: [u8; 4]) -> (ObjectRef, CheckpointEvidenc
     };
     header.validate(&Closure::default()).unwrap();
     let evidence = CheckpointEvidence {
-        digests: header.digests(),
+        digests: header.digests(&[]).unwrap(),
         ingest: None,
         verification: None,
     };
@@ -125,12 +125,12 @@ fn apply_release(
                     .read_manifest(manifest)?
                     .header()
                     .map(|header| {
-                        tensorfs_core::checkpoint::load_header(store, header).map(|header| {
-                            Box::new(CheckpointEvidence {
-                                digests: header.digests(),
+                        tensorfs_core::checkpoint::load_header(store, header).and_then(|header| {
+                            Ok(Box::new(CheckpointEvidence {
+                                digests: tensorfs_core::checkpoint::digests(store, &header)?,
                                 ingest: None,
                                 verification: None,
-                            })
+                            }))
                         })
                     })
                     .transpose()?,
@@ -938,7 +938,8 @@ fn committed_repo_apply_fixture_is_the_cross_process_projection_seam() {
     let checkpoint_evidence = CheckpointEvidence {
         digests: Header::parse(&fs::read(fixture.join("header.cbor")).unwrap())
             .unwrap()
-            .digests(),
+            .digests(&[])
+            .unwrap(),
         ingest: None,
         verification: None,
     };

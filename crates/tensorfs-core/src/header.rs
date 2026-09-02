@@ -291,16 +291,15 @@ pub const TOPOLOGY_IDENTITY_DOMAIN: &str = "cozytensors.topology/1";
 /// mistaken for an exact one in a bucket key.
 pub const TOPOLOGY_SHAPE_DOMAIN: &str = "cozytensors.topology.shape/1";
 
-/// Domain separator for the construction-document projection (`config_digest`).
-pub const CONFIG_DOMAIN: &str = "cozytensors.configs/1";
-
 /// What `tfs ingest` derives from a header and stores on the checkpoint row: identity,
-/// the fit index, and the construction document's identity (design §2).
+/// the fit index, and the construction document's identity (design §2). `config_digest`
+/// is absent exactly when the header names no config: there is no construction document
+/// to digest, and the hub refuses to serve one (`checkpoint.config_absent`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Digests {
     pub topology_digest: String,
     pub shape_digest: String,
-    pub config_digest: String,
+    pub config_digest: Option<String>,
 }
 
 /// Which topology question a digest answers.
@@ -412,31 +411,80 @@ impl Header {
         topology_digest_of(&self.projected(Projection::ShapeOnly))
     }
 
-    /// The construction document's identity: the header's own `configs` map — name to the
-    /// exact config bytes it references — under its own domain separator. Every party
-    /// that holds the header can compute it, and no config content has to be parsed.
-    pub fn config_digest(&self) -> String {
-        topology_digest_of(&Value::obj(vec![
-            (
-                "configs",
-                Value::map(
-                    self.configs
-                        .iter()
-                        .map(|(name, c)| (name.clone(), c.to_value()))
-                        .collect(),
+    /// The construction document (design §2): what the factory consumes, assembled from
+    /// the exact bytes of every config the header names — one config is the document
+    /// itself; several become the name-keyed map — in the interoperable JCS profile
+    /// (`jcs.rs`). Byte-identical to the hub's `ConstructionDocument` and cozy-runtime's
+    /// `model_config.construction_document`, so its sha256 is the one `config_digest` a
+    /// derive is keyed by. `None` when the header names no config. The supplied bytes must
+    /// be exactly the objects the header references, by name, sha256 and length.
+    pub fn construction_document(&self, configs: &[(String, Vec<u8>)]) -> Result<Option<Vec<u8>>> {
+        if configs.len() != self.configs.len() {
+            return refuse(
+                Code::MISSING_FIELD,
+                format!(
+                    "header names {} configs, {} supplied",
+                    self.configs.len(),
+                    configs.len()
                 ),
-            ),
-            ("projection", Value::str(CONFIG_DOMAIN)),
-        ]))
+            );
+        }
+        let mut members = Vec::with_capacity(self.configs.len());
+        for (name, c) in &self.configs {
+            let Some((_, bytes)) = configs.iter().find(|(n, _)| n == name) else {
+                return refuse(Code::MISSING_FIELD, format!("config {name:?} not supplied"));
+            };
+            if bytes.len() as u64 != c.length {
+                return refuse(
+                    Code::LENGTH_MISMATCH,
+                    format!(
+                        "config {name:?}: {} bytes supplied, header says {}",
+                        bytes.len(),
+                        c.length
+                    ),
+                );
+            }
+            let got = crate::sha256::hex_digest(bytes);
+            if got != c.sha256 {
+                return refuse(
+                    Code::OBJECT_ID_MISMATCH,
+                    format!(
+                        "config {name:?}: sha256:{got} supplied, header says sha256:{}",
+                        c.sha256
+                    ),
+                );
+            }
+            let document =
+                crate::jcs::parse(bytes, limits::DOC_MAX_BYTES).map_err(|e| Refusal {
+                    code: e.code,
+                    detail: format!("config {name:?}: {}", e.detail),
+                })?;
+            if !matches!(document, crate::jcs::Json::Obj(_)) {
+                return refuse(
+                    Code::WRONG_TYPE,
+                    format!("config {name:?} is not an object"),
+                );
+            }
+            members.push((name.clone(), document));
+        }
+        let document = match members.len() {
+            0 => return Ok(None),
+            1 => members.pop().expect("one member").1,
+            _ => crate::jcs::Json::object(members)?,
+        };
+        Ok(Some(crate::jcs::write(&document)))
     }
 
-    /// The three catalog digests a checkpoint row carries (design §2).
-    pub fn digests(&self) -> Digests {
-        Digests {
+    /// The three catalog digests a checkpoint row carries (design §2), from the header and
+    /// the exact bytes of the configs it names.
+    pub fn digests(&self, configs: &[(String, Vec<u8>)]) -> Result<Digests> {
+        Ok(Digests {
             topology_digest: self.topology_digest(),
             shape_digest: self.shape_digest(),
-            config_digest: self.config_digest(),
-        }
+            config_digest: self
+                .construction_document(configs)?
+                .map(|document| crate::ids::object_id(&document)),
+        })
     }
 
     /// Closure-independent schema, geometry, ordering and aggregate-limit validation.

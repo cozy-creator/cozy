@@ -147,10 +147,15 @@ impl CheckpointEvidence {
     fn from_value(v: &Value) -> Result<Self> {
         let mut fields = Fields::new("Release.evidence", v)?;
         let digests = Digests {
-            config_digest: prefixed(
-                "Release.evidence.config_digest",
-                fields.req_str("config_digest")?,
-            )?,
+            config_digest: fields
+                .opt("config_digest")
+                .map(|value| {
+                    prefixed(
+                        "Release.evidence.config_digest",
+                        as_str("Release.evidence", "config_digest", value)?,
+                    )
+                })
+                .transpose()?,
             shape_digest: prefixed(
                 "Release.evidence.shape_digest",
                 fields.req_str("shape_digest")?,
@@ -292,10 +297,6 @@ impl CheckpointEvidence {
     pub fn to_value(&self) -> Value {
         let mut fields = vec![
             (
-                "config_digest",
-                Value::str(self.digests.config_digest.clone()),
-            ),
-            (
                 "shape_digest",
                 Value::str(self.digests.shape_digest.clone()),
             ),
@@ -304,6 +305,9 @@ impl CheckpointEvidence {
                 Value::str(self.digests.topology_digest.clone()),
             ),
         ];
+        if let Some(config) = &self.digests.config_digest {
+            fields.push(("config_digest", Value::str(config.clone())));
+        }
         if let Some(ingest) = &self.ingest {
             let mut ingest_fields = vec![
                 (
@@ -1067,9 +1071,11 @@ impl Mutation {
     }
 }
 
-/// The row's digests must be what the header derives, all three. A caller that transcribes
-/// a stale or foreign digest into evidence is refused here rather than indexed wrong.
+/// The row's digests must be what the checkpoint derives, all three. A caller that
+/// transcribes a stale or foreign digest into evidence is refused here rather than indexed
+/// wrong.
 pub fn require_digests(claimed: &Digests, derived: &Digests) -> Result<()> {
+    let absent = "absent".to_string();
     for (name, c, d) in [
         (
             "topology_digest",
@@ -1079,14 +1085,14 @@ pub fn require_digests(claimed: &Digests, derived: &Digests) -> Result<()> {
         ("shape_digest", &claimed.shape_digest, &derived.shape_digest),
         (
             "config_digest",
-            &claimed.config_digest,
-            &derived.config_digest,
+            claimed.config_digest.as_ref().unwrap_or(&absent),
+            derived.config_digest.as_ref().unwrap_or(&absent),
         ),
     ] {
         if c != d {
             return refuse(
                 Code::TOPOLOGY_MISMATCH,
-                format!("checkpoint evidence {name} {c} differs from the header's {d}"),
+                format!("checkpoint evidence {name} {c} differs from the checkpoint's {d}"),
             );
         }
     }
@@ -1252,7 +1258,7 @@ mod tests {
         Digests {
             topology_digest: d(0),
             shape_digest: d(1),
-            config_digest: d(2),
+            config_digest: Some(d(2)),
         }
     }
 

@@ -762,7 +762,7 @@ fn execute_prepared(
     sources.sort();
     sources.dedup();
     let evidence = CheckpointEvidence {
-        digests: outcome.header.digests(),
+        digests: crate::checkpoint::digests(store, &outcome.header)?,
         ingest: Some(IngestProvenance {
             source_dialect: prepared.conv.dialect.to_string(),
             converter_build: converter_build.clone(),
@@ -1035,7 +1035,10 @@ fn validate_prepared_result(store: &Store, source: &PreparedModelSource) -> Resu
         detail: "prepared model Manifest has no CozyTensors header".into(),
     })?;
     let header = crate::checkpoint::load_header(store, header_ref)?;
-    crate::repository::require_digests(&evidence.digests, &header.digests())?;
+    crate::repository::require_digests(
+        &evidence.digests,
+        &crate::checkpoint::digests(store, &header)?,
+    )?;
     for (path, required) in evidence.required_files()? {
         if !manifest
             .entries()

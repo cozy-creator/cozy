@@ -105,8 +105,12 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
         store, destination, snap, len(info["manifest"])
     )
     assert admitted_manifest["id"] == "sha256:" + snap
+    digests = tensorfs.digests(info["header"], {})
+    assert digests["config_digest"] is None  # the synthetic header names no config
     evidence = json.dumps(
-        tensorfs.digests(info["header"]), sort_keys=True, separators=(",", ":")
+        {key: value for key, value in digests.items() if value is not None},
+        sort_keys=True,
+        separators=(",", ":"),
     ).encode()
     expected = {
         "expected_topology": tensorfs.topology_digest(info["header"]),

@@ -311,17 +311,54 @@ pub fn shape_digest(py: Python<'_>, data: &[u8]) -> PyResult<String> {
     Ok(Header::parse(data).or_refuse(py)?.shape_digest())
 }
 
-/// The construction document's identity: the header's own `configs` map, digested.
+fn config_bytes(configs: &Bound<'_, PyDict>) -> PyResult<Vec<(String, Vec<u8>)>> {
+    configs
+        .iter()
+        .map(|(name, bytes)| Ok((name.extract::<String>()?, bytes.extract::<Vec<u8>>()?)))
+        .collect()
+}
+
+/// The construction document (model-code-fit §2) of a header, from the exact bytes of every
+/// config it names (`{name: bytes}`): the RFC 8785 bytes whose sha256 is `config_digest`,
+/// or `None` when the header names no config.
 #[pyfunction]
-pub fn config_digest(py: Python<'_>, data: &[u8]) -> PyResult<String> {
-    Ok(Header::parse(data).or_refuse(py)?.config_digest())
+pub fn construction_document<'p>(
+    py: Python<'p>,
+    data: &[u8],
+    configs: &Bound<'p, PyDict>,
+) -> PyResult<Option<Bound<'p, PyBytes>>> {
+    let header = Header::parse(data).or_refuse(py)?;
+    let document = header
+        .construction_document(&config_bytes(configs)?)
+        .or_refuse(py)?;
+    Ok(document.map(|bytes| PyBytes::new(py, &bytes)))
+}
+
+/// The construction document's identity, or `None` when the header names no config.
+#[pyfunction]
+pub fn config_digest(
+    py: Python<'_>,
+    data: &[u8],
+    configs: &Bound<'_, PyDict>,
+) -> PyResult<Option<String>> {
+    let header = Header::parse(data).or_refuse(py)?;
+    Ok(header
+        .digests(&config_bytes(configs)?)
+        .or_refuse(py)?
+        .config_digest)
 }
 
 /// All three catalog digests of a header: `{"topology_digest", "shape_digest",
-/// "config_digest"}` — what `tfs ingest` stores on the checkpoint row.
+/// "config_digest"}` — what `tfs ingest` stores on the checkpoint row. `configs` maps
+/// each config name the header declares to its exact bytes.
 #[pyfunction]
-pub fn digests<'p>(py: Python<'p>, data: &[u8]) -> PyResult<Bound<'p, PyDict>> {
-    let d = Header::parse(data).or_refuse(py)?.digests();
+pub fn digests<'p>(
+    py: Python<'p>,
+    data: &[u8],
+    configs: &Bound<'p, PyDict>,
+) -> PyResult<Bound<'p, PyDict>> {
+    let header = Header::parse(data).or_refuse(py)?;
+    let d = header.digests(&config_bytes(configs)?).or_refuse(py)?;
     let out = PyDict::new(py);
     out.set_item("topology_digest", d.topology_digest)?;
     out.set_item("shape_digest", d.shape_digest)?;
