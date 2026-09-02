@@ -1,0 +1,63 @@
+name: Publish to PyPI
+
+# Publication IS the tag push (cozy-eval's pattern). No local publish —
+# this workflow is the single release procedure.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    # Hang bound, not a work budget.
+    timeout-minutes: 30
+    permissions:
+      contents: read   # checkout on a private/org repo
+      id-token: write  # PyPI trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ci.yaml owns the Rust suite, the frozen vectors, and the wheel smoke on
+      # every push; the publish gate re-runs the version contract against the
+      # exact tagged tree rather than trusting that the tag points at a commit
+      # CI already saw.
+      - run: python3 scripts/version_contract.py source
+
+      - name: Version matches tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER="$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          if [ "$TAG" != "$VER" ]; then
+            echo "tag v$TAG != pyproject version $VER"; exit 1
+          fi
+
+      # The same pinned inputs as ci.yaml's `wheel` job: ONE manylinux x86_64
+      # abi3 wheel. cozy-runtime vendors exactly that wheel and no other
+      # tensorfs wheel exists in any consumer.
+      - name: Build wheel (manylinux x86_64 abi3)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          args: --release --out dist
+          manylinux: auto
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Wheel version contract
+        run: |
+          for wheel in dist/*.whl; do
+            python3 scripts/version_contract.py wheel "$wheel"
+          done
+
+      - name: Publish (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
