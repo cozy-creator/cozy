@@ -536,7 +536,8 @@ type JobState struct {
 	RetryBudget      int64             `json:"retry_budget"`
 	Progress         map[string]any    `json:"progress,omitempty"`
 	Stage            string            `json:"stage,omitempty"`
-	ElapsedMS        int64             `json:"elapsed_ms"`
+	QueuedMS         int64             `json:"queued_ms"`
+	ExecutionMS      int64             `json:"execution_ms"`
 	Metrics          map[string]any    `json:"metrics,omitempty"`
 	ErrorType        string            `json:"error_type,omitempty"`
 	Error            string            `json:"error,omitempty"`
@@ -712,7 +713,8 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	// THE ELAPSED CLOCK is the authority's own timestamps, and the LIVE progress is the
 	// lossy lane's latest tick — replayed on connect, never durable, never load-bearing.
 	terminalAt, _ := s.store.TerminalEventAt(row.ID)
-	state.ElapsedMS = elapsedMS(row, attempts, terminalAt)
+	state.QueuedMS = queuedMS(row, attempts, terminalAt)
+	state.ExecutionMS = executionMS(row, attempts, terminalAt)
 	if frame, ok := s.orchestrator.LatestFrame(row.ID); ok {
 		if value, ok := frame.Value.(map[string]any); ok {
 			state.Progress = value
@@ -726,7 +728,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	if rate := s.cfg.LocalRateMicroUSDPerHour; rate > 0 {
 		state.Bill = &JobBill{
 			RateMicroUSDPerHour: rate,
-			MicroUSD:            rate * state.ElapsedMS / 3_600_000,
+			MicroUSD:            rate * state.ExecutionMS / 3_600_000,
 			Source:              "COZY_LOCAL_RATE_MICRO_USD_PER_HOUR",
 		}
 	}
@@ -778,27 +780,49 @@ func parseStamp(s string) time.Time {
 	return t
 }
 
-func elapsedMS(row records.Request, attempts []records.Attempt, terminalAt string) int64 {
+// queuedMS is the time a request spent WAITING: from submission to its first dispatch,
+// or — for a request that never dispatched — to its terminal, or to now while it waits.
+func queuedMS(row records.Request, attempts []records.Attempt, terminalAt string) int64 {
 	began := parseStamp(row.CreatedAt)
 	if began.IsZero() {
 		return 0
 	}
 	end := time.Now().UTC()
 	if len(attempts) > 0 {
-		last := attempts[len(attempts)-1]
-		if last.ClosedAt != "" && (row.State == "succeeded" || row.State == "failed" ||
-			row.State == "canceled" || row.State == "refused" || row.State == "abandoned") {
-			if closed := parseStamp(last.ClosedAt); !closed.IsZero() {
-				end = closed
-			}
+		if dispatched := parseStamp(attempts[0].DispatchedAt); !dispatched.IsZero() {
+			end = dispatched
 		}
-	}
-	if settledRequestState(row.State) {
-		if terminal := parseStamp(terminalAt); !terminal.IsZero() && terminal.Before(end) {
+	} else if settledRequestState(row.State) {
+		if terminal := parseStamp(terminalAt); !terminal.IsZero() {
 			end = terminal
 		}
 	}
-	return end.Sub(began).Milliseconds()
+	return max(end.Sub(began).Milliseconds(), 0)
+}
+
+// executionMS is the time a request spent RUNNING: each attempt from its dispatch to its
+// close (or to the terminal, or to now while it runs), summed. Queue time is never in it.
+func executionMS(row records.Request, attempts []records.Attempt, terminalAt string) int64 {
+	var total int64
+	now := time.Now().UTC()
+	terminal := parseStamp(terminalAt)
+	for _, attempt := range attempts {
+		began := parseStamp(attempt.DispatchedAt)
+		if began.IsZero() {
+			continue
+		}
+		end := now
+		switch {
+		case attempt.ClosedAt != "":
+			if closed := parseStamp(attempt.ClosedAt); !closed.IsZero() {
+				end = closed
+			}
+		case settledRequestState(row.State) && !terminal.IsZero():
+			end = terminal
+		}
+		total += max(end.Sub(began).Milliseconds(), 0)
+	}
+	return total
 }
 
 func settledRequestState(state string) bool {

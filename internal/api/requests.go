@@ -644,7 +644,8 @@ type Lifecycle struct {
 	Function      string           `json:"function"`
 	Attempt       uint64           `json:"attempt"`
 	Attempts      int              `json:"attempts"`
-	ElapsedMS     int64            `json:"elapsed_ms"`
+	QueuedMS      int64            `json:"queued_ms"`
+	ExecutionMS   int64            `json:"execution_ms"`
 	ResponseURL   string           `json:"response_url"`
 	Metrics       map[string]any   `json:"metrics,omitempty"`
 	ErrorType     string           `json:"error_type,omitempty"`
@@ -738,7 +739,8 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	attempts, _ := s.store.Attempts(row.ID)
 	life.Attempts = len(attempts)
 	terminalAt, _ := s.store.TerminalEventAt(row.ID)
-	life.ElapsedMS = elapsedMS(row, attempts, terminalAt)
+	life.QueuedMS = queuedMS(row, attempts, terminalAt)
+	life.ExecutionMS = executionMS(row, attempts, terminalAt)
 	outs, _ := s.store.VisibleOutputs(row.ID)
 	for _, o := range outs {
 		life.Outputs = append(life.Outputs, MediaRef{

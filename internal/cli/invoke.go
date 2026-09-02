@@ -595,8 +595,8 @@ func handleRunList(ctx *Context) *exit.Error {
 	}
 	pkg := strings.TrimSpace(ctx.Inv.Value("--package"))
 	list := output.List{
-		Name: "invocations", Fields: []string{"number", "target", "status", "elapsed"},
-		AllFields: []string{"number", "id", "kind", "target", "status", "elapsed", "attempts", "created"},
+		Name: "invocations", Fields: []string{"number", "target", "status", "queued", "execution"},
+		AllFields: []string{"number", "id", "kind", "target", "status", "queued", "execution", "attempts", "created"},
 	}
 	states := map[string]int{}
 	for _, life := range rows {
@@ -610,7 +610,7 @@ func handleRunList(ctx *Context) *exit.Error {
 		list.Rows = append(list.Rows, map[string]string{
 			"number": strconv.FormatInt(life.Number, 10), "id": life.RequestID, "kind": kind,
 			"target": life.Package + "/" + life.Function, "status": life.Status,
-			"elapsed":  fmt.Sprintf("%.1fs", float64(life.ElapsedMS)/1000),
+			"queued": seconds(life.QueuedMS), "execution": seconds(life.ExecutionMS),
 			"attempts": strconv.Itoa(life.Attempts), "created": life.CreatedAt,
 		})
 		states[life.Status]++
@@ -1242,11 +1242,12 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	if life.Triage != nil {
 		fields = append(fields, output.Field{K: "attempt_key", V: life.Triage.AttemptKey})
 	}
-	elapsed := time.Since(began)
+	// Two facts, never one sum: how long the request waited, and how long it ran.
 	fields = append(fields,
-		output.Field{K: "elapsed", V: fmt.Sprintf("%.1fs", elapsed.Seconds())},
+		output.Field{K: "queued", V: seconds(life.QueuedMS)},
+		output.Field{K: "execution", V: seconds(life.ExecutionMS)},
 		output.Field{K: "submit_ms", V: submitted.Milliseconds()},
-		output.Field{K: "wall_ms", V: elapsed.Milliseconds()})
+		output.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
 
 	defaults := []string{"target", "status"}
 	if life.Result != nil {
@@ -1255,7 +1256,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	if len(saved) > 0 {
 		defaults = append(defaults, "saved")
 	}
-	defaults = append(defaults, "elapsed")
+	defaults = append(defaults, "queued", "execution")
 	rec := compactRecord(fields, defaults...)
 	if ctx.Mode().Human && !ctx.Mode().Full && len(saved) > 0 {
 		rec.Fields = expandSavedResult(rec.Fields)
@@ -1643,3 +1644,6 @@ func eventText(e *localapi.Event, key string) string {
 	s, _ := e.Payload[key].(string)
 	return s
 }
+
+// seconds spells a millisecond count as the CLI's duration cell.
+func seconds(ms int64) string { return fmt.Sprintf("%.1fs", float64(ms)/1000) }

@@ -136,8 +136,9 @@ func TestProductPath(t *testing.T) {
 		ID      string `json:"id"`
 		Kind    string `json:"kind"`
 		Target  string `json:"target"`
-		Status  string `json:"status"`
-		Elapsed string `json:"elapsed"`
+		Status    string `json:"status"`
+		Queued    string `json:"queued"`
+		Execution string `json:"execution"`
 	}
 	listRuns := func() []listedRun {
 		t.Helper()
@@ -160,7 +161,8 @@ func TestProductPath(t *testing.T) {
 	for index, row := range runs {
 		number, err := strconv.ParseInt(row.Number, 10, 64)
 		if err != nil || number < 1 || !strings.HasPrefix(row.ID, "req-") ||
-			row.Kind != "invocation" || !strings.HasSuffix(row.Elapsed, "s") {
+			row.Kind != "invocation" || !strings.HasSuffix(row.Queued, "s") ||
+			!strings.HasSuffix(row.Execution, "s") {
 			t.Fatalf("run list row %d is not useful: %+v (%v)", index, row, err)
 		}
 		if index > 0 {
@@ -180,7 +182,7 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("numeric run cancel was not idempotent [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", "list", "--limit", "2"); code != 0 ||
-		!strings.Contains(out, "NUMBER") || !strings.Contains(out, "ELAPSED") ||
+		!strings.Contains(out, "NUMBER") || !strings.Contains(out, "QUEUED") || !strings.Contains(out, "EXECUTION") ||
 		strings.Contains(out, "KIND") || strings.Index(out, runs[0].Number) > strings.Index(out, runs[1].Number) {
 		t.Fatalf("human run list columns/order are not useful [exit %d]\n%s", code, out)
 	}
@@ -194,10 +196,12 @@ func TestProductPath(t *testing.T) {
 	if len(runs) == 0 {
 		t.Fatal("failed job is absent from run list")
 	}
-	jobElapsed, err := strconv.ParseFloat(strings.TrimSuffix(runs[0].Elapsed, "s"), 64)
+	// A request refused before any attempt waited and never ran: its queue clock is
+	// closed at the terminal, and its execution time is exactly nothing.
+	jobQueued, err := strconv.ParseFloat(strings.TrimSuffix(runs[0].Queued, "s"), 64)
 	if runs[0].Kind != "job" || runs[0].Status != "failed" ||
-		err != nil || jobElapsed < 0 || jobElapsed > 10 {
-		t.Fatalf("pre-attempt job row lost its kind or terminal elapsed clock: %+v (%v)", runs, err)
+		err != nil || jobQueued < 0 || jobQueued > 10 || runs[0].Execution != "0.0s" {
+		t.Fatalf("pre-attempt job row lost its kind or its clocks: %+v (%v)", runs, err)
 	}
 	if code, out := runCozy(t, root, "run", "watch", runs[0].Number, "--json"); code == 0 ||
 		!strings.Contains(out, "editable_jobs_unsupported") {
