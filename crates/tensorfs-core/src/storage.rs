@@ -430,16 +430,8 @@ impl Census {
             }
         };
         let mut objects: BTreeMap<String, (&'static str, ObjectRef)> = BTreeMap::new();
-        for (_, entry) in manifest.entries() {
-            insert_ref(
-                &mut objects,
-                if matches!(entry, Entry::CozyTensors(_)) {
-                    "header"
-                } else {
-                    "file"
-                },
-                entry.blob(),
-            )?;
+        if let Some(header_ref) = manifest.header() {
+            insert_ref(&mut objects, "header", header_ref)?;
         }
         if let Some(header) = &header {
             for (_, config) in &header.configs {
@@ -465,6 +457,14 @@ impl Census {
                         }
                     }
                 }
+            }
+        }
+        // Runtime roles win when an ordinary snapshot path aliases the same bytes. Consumers
+        // may skip `file`, so inserting files first would make a required config, model asset,
+        // or tensor part disappear from their runtime closure.
+        for (_, entry) in manifest.entries() {
+            if let Entry::File(object) = entry {
+                insert_ref(&mut objects, "file", object)?;
             }
         }
         let mut object_bytes = 0u64;
@@ -1088,10 +1088,8 @@ impl Census {
         _reference: &ObjectRef,
     ) -> Result<Vec<ObjectRef>> {
         let mut objects = BTreeMap::new();
-        for (_, entry) in manifest.entries() {
-            insert_ref(&mut objects, "file", entry.blob())?;
-        }
         if let Some(header_ref) = manifest.header() {
+            insert_ref(&mut objects, "header", header_ref)?;
             let header = self.header(header_ref)?;
             for (_, config) in &header.configs {
                 insert_ref(
@@ -1116,6 +1114,11 @@ impl Census {
                         }
                     }
                 }
+            }
+        }
+        for (_, entry) in manifest.entries() {
+            if let Entry::File(object) = entry {
+                insert_ref(&mut objects, "file", object)?;
             }
         }
         for (kind, object) in objects.values() {
@@ -1450,7 +1453,8 @@ pub fn repository_release_lines(root: &Path) -> Result<Vec<Vec<u8>>> {
 mod tests {
     use super::*;
     use crate::dtype::Dtype;
-    use crate::header::{Closure, Header, Part, Tensor};
+    use crate::header::{Asset, Body, Closure, Header, Part, Tensor};
+    use crate::ids::ConfigRef;
     use crate::manifest::{Draft, Entry};
     use crate::repository::{
         Checkpoint, CheckpointEvidence, IngestProvenance, Mutation, Release, RepositoryName,
@@ -1506,6 +1510,110 @@ mod tests {
             RepositoryName::new("org", "model").unwrap(),
             manifest_ref,
         )
+    }
+
+    #[test]
+    fn checkpoint_projection_preserves_runtime_roles_over_aliased_files() {
+        let spec = crate::registry::seeds()
+            .into_iter()
+            .find(|seed| seed.alias == "plain/1")
+            .unwrap()
+            .spec;
+        let config_bytes = b"{}".to_vec();
+        let config = ObjectRef::of(&config_bytes);
+        let asset = ObjectRef::of(b"tokenizer vocabulary");
+        let part = ObjectRef::of(&[0u8; 260]);
+        let header = Header {
+            configs: vec![(
+                "model".into(),
+                ConfigRef {
+                    sha256: config.sha256.clone(),
+                    length: config.length,
+                    media_type: "application/json".into(),
+                },
+            )],
+            assets: vec![(
+                "tokenizer/vocab.txt".into(),
+                Asset {
+                    logical_sha256: asset.sha256.clone(),
+                    logical_length: asset.length,
+                    media_type: "text/plain".into(),
+                    segments: vec![asset.clone()],
+                },
+            )],
+            encodings: vec![spec.clone()],
+            components: vec![(
+                "model".into(),
+                vec![(
+                    "weight".into(),
+                    Tensor {
+                        dtype: Dtype::F32,
+                        shape: vec![65],
+                        encoding: spec.object_id(),
+                        parts: vec![(
+                            "value".into(),
+                            Part {
+                                dtype: Dtype::F32,
+                                shape: vec![65],
+                                body: Body::Segments(vec![part.clone()]),
+                            },
+                        )],
+                    },
+                )],
+            )],
+        };
+        header.validate(&Closure::default()).unwrap();
+        let header_bytes = header.canonical_bytes().unwrap();
+        let header_ref = ObjectRef::of(&header_bytes);
+        let readme = ObjectRef::of(b"sample model");
+        let manifest = Draft {
+            entries: vec![
+                ("README.txt".into(), Entry::File(readme.clone())),
+                ("config.json".into(), Entry::File(config.clone())),
+                (
+                    "model.cozytensors".into(),
+                    Entry::CozyTensors(header_ref.clone()),
+                ),
+                ("tokenizer.txt".into(), Entry::File(asset.clone())),
+                ("weights.bin".into(), Entry::File(part.clone())),
+            ],
+        }
+        .seal()
+        .unwrap();
+        let manifest_bytes = manifest.canonical_bytes();
+        let manifest_ref = ObjectRef::of(&manifest_bytes);
+        let mut inventory = BTreeMap::new();
+        for object in [&header_ref, &config, &asset, &part, &readme] {
+            inventory.insert(
+                object.sha256.clone(),
+                InventoryEntry {
+                    key: blob_key(&object.sha256).unwrap(),
+                    length: object.length,
+                    sha256: object.sha256.clone(),
+                },
+            );
+        }
+
+        let facts = Census::validate_checkpoint_inputs(
+            &manifest_ref,
+            StagedCheckpoint {
+                manifest: &manifest_bytes,
+                header: Some(&header_bytes),
+                configs: &[("model".into(), config_bytes)],
+            },
+            &inventory,
+        )
+        .unwrap();
+        let kinds: BTreeMap<_, _> = facts
+            .objects
+            .iter()
+            .map(|(kind, object)| (object.sha256.as_str(), kind.as_str()))
+            .collect();
+        assert_eq!(kinds[header_ref.sha256.as_str()], "header");
+        assert_eq!(kinds[config.sha256.as_str()], "config");
+        assert_eq!(kinds[asset.sha256.as_str()], "model_asset");
+        assert_eq!(kinds[part.sha256.as_str()], "part");
+        assert_eq!(kinds[readme.sha256.as_str()], "file");
     }
 
     fn evidence(store: &Store, manifest: &ObjectRef) -> CheckpointEvidence {

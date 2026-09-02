@@ -1067,11 +1067,6 @@ fn closure_refs(
             },
         )?;
     }
-    for (_, entry) in manifest.entries() {
-        if let Entry::File(object) = entry {
-            insert(&mut refs, "file", object)?;
-        }
-    }
     for (_, asset) in &header.assets {
         for object in &asset.segments {
             insert(&mut refs, "model_asset", object)?;
@@ -1084,6 +1079,13 @@ fn closure_refs(
                     insert(&mut refs, "part", object)?;
                 }
             }
+        }
+    }
+    // Runtime roles precede ordinary snapshot paths so an aliased README/sample path cannot
+    // relabel a required config, model asset, or tensor part as an ignorable file.
+    for (_, entry) in manifest.entries() {
+        if let Entry::File(object) = entry {
+            insert(&mut refs, "file", object)?;
         }
     }
     Ok(refs)
