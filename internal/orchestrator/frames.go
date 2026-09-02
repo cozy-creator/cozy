@@ -319,6 +319,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 		}
 		w.observeHeld(heldPlacements(r.HeldAttempts))
+		w.heldManifests = setOf(r.HeldManifests)
 		heldVerdicts = c.observeHeldOutcomes(w, r.HeldAttempts)
 		w.acceptedRevision = r.AcceptedDesiredStateRevision
 		w.convergedRevision = r.ConvergedRevision

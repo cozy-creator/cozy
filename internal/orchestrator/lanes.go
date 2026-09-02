@@ -71,6 +71,11 @@ type lane struct {
 	// held is how many attempts the worker last reported on this lane, in every state
 	// from admission to ack — the queue ahead of a new offer (route.go).
 	held int
+	// resident is the worker's last word on which placements hold device bytes on this
+	// lane (`resident_placement_ids`, proto-026): the fact `cost` prices a fill by. A set,
+	// never bytes; one report stale at most, and a wrong belief costs a fill, not
+	// correctness (residency-aware-routing.md §3.3).
+	resident map[string]bool
 	// outsideEnvelope latches a lane naming an ordinal past the granted envelope. It is a
 	// worker breach; the lane takes no offer and the report says why, once.
 	outsideEnvelope bool
@@ -83,6 +88,7 @@ type laneReport struct {
 	ordinals     []uint32
 	slots        int
 	placementIDs []string
+	resident     []string
 }
 
 func laneReportsOf(rows []*pb.DeviceLane) []laneReport {
@@ -95,6 +101,7 @@ func laneReportsOf(rows []*pb.DeviceLane) []laneReport {
 			id: row.LaneId, ordinals: append([]uint32(nil), row.DeviceOrdinals...),
 			slots:        int(row.AvailableAttemptSlots),
 			placementIDs: append([]string(nil), row.PlacementIds...),
+			resident:     append([]string(nil), row.ResidentPlacementIds...),
 		})
 	}
 	return out
@@ -108,6 +115,7 @@ func laneReportsOfDoc(rows []canonical.Doc) []laneReport {
 			id: row.Str("lane_id"), ordinals: make([]uint32, 0, len(ordinals)),
 			slots:        int(row.Int("available_attempt_slots")),
 			placementIDs: row.Strs("placement_ids"),
+			resident:     row.Strs("resident_placement_ids"),
 		}
 		for _, ordinal := range ordinals {
 			report.ordinals = append(report.ordinals, uint32(ordinal))
@@ -138,6 +146,7 @@ func (t *laneTable) observe(rows []laneReport, envelope []string) (breaches []st
 			l = &lane{id: row.id}
 		}
 		l.ordinals, l.placementIDs = row.ordinals, row.placementIDs
+		l.resident = setOf(row.resident)
 		l.seats.observe(row.slots)
 		outside := false
 		if len(envelope) > 0 {
@@ -191,6 +200,27 @@ func (t *laneTable) observeHeld(placementIDs []string) (unrouted int) {
 	return unrouted
 }
 
+// residentIDs is the lane's resident set, sorted, for the decision log.
+func (l *lane) residentIDs() []string {
+	out := make([]string, 0, len(l.resident))
+	for id := range l.resident {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func setOf(ids []string) map[string]bool {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out
+}
+
 func (t *laneTable) of(placementID string) *lane {
 	if id, ok := t.byPlacement[placementID]; ok {
 		return t.lanes[id]
@@ -232,12 +262,13 @@ func devicesOf(l *lane, envelope []string) []string {
 // LaneFacts is one lane as this owner reads it: the worker's ordinals and free seat, and
 // the granted device names those ordinals index.
 type LaneFacts struct {
-	LaneID         string   `json:"lane_id"`
-	DeviceOrdinals []uint32 `json:"device_ordinals"`
-	Devices        []string `json:"devices"`
-	AvailableSlots int      `json:"available_attempt_slots"`
-	HeldAttempts   int      `json:"held_attempts"`
-	PlacementIDs   []string `json:"placement_ids"`
+	LaneID               string   `json:"lane_id"`
+	DeviceOrdinals       []uint32 `json:"device_ordinals"`
+	Devices              []string `json:"devices"`
+	AvailableSlots       int      `json:"available_attempt_slots"`
+	HeldAttempts         int      `json:"held_attempts"`
+	PlacementIDs         []string `json:"placement_ids"`
+	ResidentPlacementIDs []string `json:"resident_placement_ids"`
 }
 
 func laneFactsOf(w *worker) []LaneFacts {
@@ -251,6 +282,7 @@ func laneFactsOf(w *worker) []LaneFacts {
 			LaneID: l.id, DeviceOrdinals: append([]uint32(nil), l.ordinals...),
 			Devices: devicesOf(l, w.spec.Devices), AvailableSlots: l.seats.slots,
 			HeldAttempts: l.held, PlacementIDs: append([]string(nil), l.placementIDs...),
+			ResidentPlacementIDs: l.residentIDs(),
 		})
 	}
 	return out

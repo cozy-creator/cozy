@@ -70,11 +70,16 @@ type Options struct {
 	// tombstone is idempotent.
 	ReportReleaseDefect ReleaseDefectReporter
 	// RentalFleet renders the one fleet burn line after reconciling every local
-	// rental with Tensorhub. AcquireManagedRental durably assigns one --rental
-	// request; ReleaseManagedRental observes a rental as a request pinned to it
-	// settles and tears it down once nothing is left on it.
+	// rental with Tensorhub. AcquireManagedRental is the capacity decision for a --rental
+	// request no rental holds a placement for (residency-aware-routing.md §3.2): it pins
+	// the request to the ready rental RankRentals puts first and says which it chose
+	// over what. With `download` it may choose a rental that must fetch the manifests, or
+	// buy one — only when no machine has them on disk; without it, a ready rental whose
+	// store already holds them, or nothing (an empty RentalID: the request waits).
+	// ReleaseManagedRental observes a rental as a request pinned to it settles and tears
+	// it down once nothing is left on it.
 	RentalFleet          func() (string, *exit.Error)
-	AcquireManagedRental func(records.Request) (string, string, *exit.Error)
+	AcquireManagedRental func(req records.Request, download bool) (RentalDecision, string, *exit.Error)
 	ReleaseManagedRental func(string) (string, *exit.Error)
 	ModelTransfers       ModelTransferOwner
 	// LocalWheels puts an unpublished revision's wheels in the object store and answers
@@ -174,6 +179,71 @@ type LogicalJob struct {
 }
 
 type ModelRef = records.ModelRef
+
+// RentalCoverage is one ready rental read against a placement's manifests (§3.2): whether
+// its worker's verified store reports every one of them, how many (and how many bytes)
+// it lacks, and the room its worker reports. A rental with no worker attached yet has
+// reported nothing, so it holds nothing.
+type RentalCoverage struct {
+	RentalID         string `json:"rental"`
+	Worker           string `json:"worker,omitempty"`
+	Holds            bool   `json:"holds"`
+	ManifestsMissing int    `json:"manifests_missing"`
+	BytesMissing     int64  `json:"bytes_missing"`
+	Room             int    `json:"room"`
+	Held             int    `json:"held"`
+}
+
+// RentalDecision is the capacity decision's answer: the rental the placement is staged
+// on, whether it was bought for this request, and every ready rental it was chosen over.
+type RentalDecision struct {
+	RentalID   string
+	Bought     bool
+	Candidates []RentalCoverage
+}
+
+// RankRentals orders ready rentals for a NEW placement by the no-holder rule (§3.2, D4):
+// a store holding every manifest first (nothing to fetch), then the fewest missing bytes,
+// then the most room, then the caller's order — cheapest first. Nothing here is a timer,
+// and the ranking never desires residency anywhere: it reads what each worker last said.
+func (c *Orchestrator) RankRentals(ids []string, models []ModelRef) []RentalCoverage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]RentalCoverage, 0, len(ids))
+	for _, id := range ids {
+		row := RentalCoverage{RentalID: id}
+		w := c.workers[rentalInstanceID(id)]
+		if w == nil || w.exited || w.stopping || c.sessions[w.bootID] == nil {
+			w = nil
+		}
+		if w != nil {
+			row.Worker, row.Room, row.Held = w.instanceID, w.seats.slots, w.held+w.seats.reserved
+		}
+		for _, model := range models {
+			if model.Manifest == "" || (w != nil && w.heldManifests[model.Manifest]) {
+				continue
+			}
+			row.ManifestsMissing++
+			row.BytesMissing += model.Bytes
+		}
+		row.Holds = row.ManifestsMissing == 0
+		out = append(out, row)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Holds != b.Holds {
+			return a.Holds
+		}
+		if a.BytesMissing != b.BytesMissing {
+			return a.BytesMissing < b.BytesMissing
+		}
+		if a.ManifestsMissing != b.ManifestsMissing {
+			return a.ManifestsMissing < b.ManifestsMissing
+		}
+		return a.Room > b.Room
+	})
+	return out
+}
 
 // Orchestrator is the Cozy daemon's scheduling role.
 type Orchestrator struct {
@@ -467,11 +537,6 @@ func (c *Orchestrator) drain() {
 		}
 		if settledState(req.State) {
 			c.forget(id)
-			continue
-		}
-		if req.RentalRequired && req.Worker == "" {
-			c.selectOrStart(*req)
-			c.park(*req, position, waitFacts{cause: WaitRental}, "waiting for a rental to be assigned")
 			continue
 		}
 		if req.ModelTransfer != nil {

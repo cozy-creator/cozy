@@ -328,18 +328,6 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 		go c.runModelPassThrough(req)
 		return 0, nil
 	}
-	if req.RentalRequired && req.Worker == "" {
-		if !c.enqueue(req.ID) {
-			return 0, nil
-		}
-		c.emit(req.ID, "request.queued", 0, waitFacts{cause: WaitRental}.decorate(map[string]any{
-			"reason":   "remote rental required; local capacity is intentionally skipped",
-			"position": c.QueuePosition(req.ID),
-		}, req))
-		c.selectOrStart(req)
-		go c.drain()
-		return 0, nil
-	}
 	// A SUBMISSION NEVER OVERTAKES WORK ALREADY WAITING. Dispatching straight from submit
 	// is what keeps a warm request fast, and it is exactly what breaks FIFO when a queue
 	// exists: a request arriving while six are parked would take the free slot the head of
@@ -484,27 +472,67 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 // longer wait. A request that queues forever behind a worker that died on boot is the
 // worst of both: no output and no answer.
 func (c *Orchestrator) selectOrStart(req records.Request) {
+	var guards []string
 	if req.Rental && req.Worker == "" {
+		// WHO HOLDS THE PLACEMENT decides whether this is a routing wait or a capacity
+		// decision (residency-aware-routing.md §3.2, D4). A worker that staged the plan —
+		// the local one, or any attached rental — is capacity `drain` routes onto the
+		// moment its lane has room, so the request WAITS unpinned and takes its pin from
+		// dispatch. Only when no worker holds it does the fleet choose the rental to
+		// stage it on, by what each store already holds; that rental keeps serving its
+		// other tenants while the manifests land, and this request routes to it once
+		// its placement reports DISPATCHABLE.
 		if c.opt.RentalFleet == nil || c.opt.AcquireManagedRental == nil {
 			c.failQueued(req.ID, exit.Named(exit.Unavailable, "rental.acquisition_unavailable",
 				"this Cozy daemon cannot acquire managed rentals"))
 			return
 		}
+		guard := "rental/" + requestSlot(req)
+		c.mu.Lock()
+		localHolds, rentalHolds := c.placementHeld(req)
+		staging := c.starting[guard]
+		if !rentalHolds && !staging {
+			c.starting[guard] = true
+		}
+		c.mu.Unlock()
+		if rentalHolds || staging {
+			return
+		}
+		guards = append(guards, guard)
+		unguard := func() {
+			c.mu.Lock()
+			delete(c.starting, guard)
+			c.mu.Unlock()
+		}
 		line, problem := c.opt.RentalFleet()
 		if problem != nil {
+			unguard()
 			c.failQueued(req.ID, problem)
 			return
 		}
 		c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
-		rentalID, after, problem := c.opt.AcquireManagedRental(req)
+		// A download is bought only when NO machine has the model on disk (owner ruling,
+		// residency-aware-routing.md): while the local worker holds it, the fleet may
+		// add the placement to a paid, ready rental whose store already holds the
+		// manifests — free at the margin — and otherwise the request waits for local.
+		decision, after, problem := c.opt.AcquireManagedRental(req, !localHolds)
 		if problem != nil {
+			unguard()
 			c.failQueued(req.ID, problem)
 			return
 		}
 		if after != "" {
 			c.emit(req.ID, "request.rentals", 0, map[string]any{"line": after})
 		}
-		req.Worker = rentalID
+		if decision.RentalID == "" {
+			unguard()
+			c.logf("%s waits for the local worker holding %s: no ready rental holds its "+
+				"manifests and a download is not bought while a machine has them on disk",
+				req.ID, req.PlanID)
+			return
+		}
+		req.Worker = decision.RentalID
+		c.logDownloadDecision(req, decision)
 	}
 	// A JOB names its own slot — one worker per (package, job function) — so the
 	// "already starting" and "already resident" questions are asked about that slot and
@@ -523,6 +551,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 	}
 	c.mu.Lock()
 	if c.starting[slot] {
+		for _, guard := range guards {
+			delete(c.starting, guard)
+		}
 		c.mu.Unlock()
 		return
 	}
@@ -565,6 +596,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			// Replace that process once; the new launch below either serves the request with
 			// the current Runtime or gives the request its own prompt terminal answer.
 			if stagedFor(w, req) && retirementGround(w) == "" {
+				for _, guard := range guards {
+					delete(c.starting, guard)
+				}
 				c.mu.Unlock()
 				return
 			}
@@ -577,6 +611,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		}
 	}
 	c.starting[slot] = true
+	guards = append(guards, slot)
 	c.mu.Unlock()
 	if stale != "" {
 		c.logf("worker %s staged no plan for %s and is STALE; replacing it", stale, req.PlanID)
@@ -592,7 +627,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		// launch bounced off it too.
 		done := func() {
 			c.mu.Lock()
-			delete(c.starting, slot)
+			for _, guard := range guards {
+				delete(c.starting, guard)
+			}
 			c.mu.Unlock()
 		}
 		spec, planID, e := c.resolveFor(req)
@@ -659,6 +696,77 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 }
 
 func autoRentalGate(_ records.Request, cause *exit.Error) *exit.Error { return cause }
+
+// requestSlot names what a request needs resident, before any pin: the package, an
+// install for an editable one, a job function for a job.
+func requestSlot(req records.Request) string {
+	slot := req.Package
+	if req.InstallID != "" {
+		slot += "/install/" + req.InstallID
+	}
+	if req.IsJob() {
+		slot += "/job/" + req.Entrypoint
+	}
+	return slot
+}
+
+// placementHeld answers which live workers this request may route to have its plan
+// staged: the local worker's slot (never for a rental-only request), and any attached
+// rental's placement under that rental's pinned package name. Callers hold c.mu.
+func (c *Orchestrator) placementHeld(req records.Request) (local, rental bool) {
+	for _, w := range c.workers {
+		if w.exited || w.stopping || w.spec.IsJob() != req.IsJob() || retirementGround(w) != "" {
+			continue
+		}
+		if w.spec.Connection == nil {
+			if req.RentalRequired || w.spec.Placement.Package != req.Package ||
+				(req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID) ||
+				(req.IsJob() && w.spec.Placement.Jobs[0].Function != req.Entrypoint) {
+				continue
+			}
+			local = local || staged(w, req.PlanID)
+			continue
+		}
+		slot := pinnedPackage(req.Package, w.spec.Connection.RentalID)
+		if req.IsJob() {
+			rental = rental || (w.spec.Placement.Package == slot &&
+				w.spec.Placement.Jobs[0].Function == req.Entrypoint && staged(w, req.PlanID))
+			continue
+		}
+		rental = rental || w.remoteStaged(slot, req.PlanID, remoteRevision(req))
+	}
+	return local, rental
+}
+
+// logDownloadDecision is the decision log for the capacity half (D8): no worker held the
+// placement, so the fleet chose a rental to stage it on — by what each ready rental's
+// store already held — and this request is pinned there until its placement reports.
+func (c *Orchestrator) logDownloadDecision(req records.Request, decision RentalDecision) {
+	rows := make([]any, 0, len(decision.Candidates))
+	var chosen RentalCoverage
+	for _, k := range decision.Candidates {
+		rows = append(rows, k)
+		if k.RentalID == decision.RentalID {
+			chosen = k
+		}
+	}
+	if decision.Bought {
+		chosen = RentalCoverage{RentalID: decision.RentalID, ManifestsMissing: len(req.Models)}
+		for _, model := range req.Models {
+			chosen.BytesMissing += model.Bytes
+		}
+	}
+	c.logf("%s: no worker holds %s for %s; rental %s stages it (bought=%t, holds=%t, "+
+		"manifests_missing=%d, bytes_missing=%d) over %d ready rental(s); the download "+
+		"delegation goes with its desired state", req.ID, req.PlanID, req.Package,
+		decision.RentalID, decision.Bought, chosen.Holds, chosen.ManifestsMissing,
+		chosen.BytesMissing, len(decision.Candidates))
+	c.emit(req.ID, "request.routed", 0, map[string]any{
+		"decision": "download", "candidates": rows, "bought": decision.Bought,
+		"manifests_missing": chosen.ManifestsMissing, "bytes_missing": chosen.BytesMissing,
+		"pick": map[string]any{"rental": decision.RentalID, "worker": chosen.Worker},
+	})
+}
 
 // staged answers whether this worker was launched with the given plan id staged for it.
 // It reads what the LAUNCHER wrote, not what the worker has got around to advertising: a
@@ -941,9 +1049,6 @@ func (c *Orchestrator) releaseManagedNow(req records.Request) *exit.Error {
 }
 
 func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
-	if req.RentalRequired && req.Worker == "" {
-		return 0, exit.Unavailablef("remote rental assignment is required before dispatch")
-	}
 	// PLACEMENT is the orchestrator's: the caller names the binding, and dispatch picks a
 	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence
 	// is open. `pick` also returns the admission epoch it OBSERVED, which is what
@@ -959,6 +1064,23 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			c.releaseDispatch(reservation)
 		}
 	}()
+	if w.spec.Connection != nil && req.Worker == "" {
+		// THE PIN IS ROUTING'S OUTPUT (cl-092 step 4): the argmin was a rental, so the
+		// request is pinned to it now — durably, before its identity is bound to that
+		// rental's placement — and everything below reads the pinned request. A request
+		// that settled first has no worker to pin; it is not dispatched.
+		rentalID := w.spec.Connection.RentalID
+		pinned, e := c.opt.Store.PinRental(req.ID, rentalID)
+		if e != nil {
+			return 0, e
+		}
+		if !pinned {
+			return 0, exit.New(exit.Conflict, "request %s settled before it could be pinned to rental %s",
+				req.ID, rentalID)
+		}
+		req.Worker = rentalID
+		target.routed.pinned = rentalID
+	}
 	if req.ModelTransfer != nil && req.Rental && w.spec.Connection == nil && req.Release != "" &&
 		(w.spec.Placement.Release != req.Release ||
 			w.spec.Placement.PackageRevisionDigest != req.PackageRevisionDigest) {
@@ -1344,7 +1466,7 @@ func (c *Orchestrator) pick(req records.Request) (offerTarget, *exit.Error) {
 	routed := c.route(req)
 	pick := routed.pick()
 	if pick == nil {
-		return offerTarget{}, routed.noCapacity(pinnedPackage(req.Package, req.Worker), req.PlanID)
+		return offerTarget{}, routed.noCapacity(req)
 	}
 	w := pick.worker
 	target := offerTarget{worker: w, sess: c.sessions[w.bootID], admissionEpoch: w.admissionEpoch,

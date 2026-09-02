@@ -16,40 +16,91 @@ import (
 //
 //	score(l) = held(l) + cost(l)
 //	pick     = argmin score over candidates with room(l) > 0;
-//	           ties → the local worker, then lowest (instance_id, lane_id)
+//	           ties → p ∈ resident(l), then the local worker, then lowest (instance_id, lane_id)
 //
 // held(l) is the attempt-equivalents already ahead on the lane: every attempt the worker
 // holds on it (QUEUED, RUNNING, outcome pending ack) plus this owner's own offers the worker
-// has not answered yet. cost(l) is the fill the attempt pays on arrival; until residency is
-// on the wire (proto-026 `resident_placement_ids`) every lane is priced one fill — unknown
-// is one fill. The constants are attempt-equivalents and live here, never in config or env
-// (#1312). Nothing here is a timer: `age_ms` rides the decision log for the audit and ranks
-// nothing.
+// has not answered yet. cost(l) is the fill the attempt pays on arrival, priced off the
+// lane's reported `resident_placement_ids`: 0 when the placement's weights are on the
+// device, 1 on an idle lane (one fill, nobody displaced), 2 when it displaces a resident
+// tenant (that tenant's refill is owed later). A lane whose residency is not on the wire
+// prices one fill — unknown is one fill. The constants are attempt-equivalents and live
+// here, never in config or env (#1312). Nothing here is a timer: `age_ms` rides the
+// decision log for the audit and ranks nothing.
+//
+// WHICH WORKERS ARE ASKED is the request's permission (D6): local lanes unless
+// `--rental-only`; every attached rental's lanes with `--rental`, local winning ties; a
+// request PINNED to a rental (`Worker`) sees that rental alone. The pin is routing's own
+// output — written by `dispatch` when the argmin is a rental, or by the capacity decision
+// when no worker holds the placement (`selectOrStart`) — never a submission's guess.
 
-const fillCost = 1
+const (
+	costResident = 0
+	costFill     = 1
+	costDisplace = 2
+)
 
 // candidate is one (worker, lane) with room for this request, scored.
 type candidate struct {
-	worker *worker
-	laneID string // "" for a worker reporting no lanes: the worker-level window
-	held   int
-	cost   int
-	score  int
-	ageMS  int64
+	worker      *worker
+	laneID      string // "" for a worker reporting no lanes: the worker-level window
+	placementID string
+	held        int
+	cost        int
+	score       int
+	ageMS       int64
+	// resident is the lane's reported resident set; manifestsMissing is how many of the
+	// request's model manifests the worker's store does not hold (a DISPATCHABLE
+	// placement holds all of them; the number is the audit's, §3.2).
+	resident         []string
+	manifestsMissing int
 }
 
 func (k candidate) local() bool { return k.worker.spec.Connection == nil }
 
 func (k candidate) String() string {
-	return fmt.Sprintf("%s/%s held=%d cost=%d score=%d age_ms=%d", k.worker.instanceID,
-		orNone(k.laneID), k.held, k.cost, k.score, k.ageMS)
+	return fmt.Sprintf("%s/%s held=%d cost=%d score=%d resident=%v missing=%d age_ms=%d",
+		k.worker.instanceID, orNone(k.laneID), k.held, k.cost, k.score, k.resident,
+		k.manifestsMissing, k.ageMS)
 }
 
 func (k candidate) event() map[string]any {
-	return map[string]any{
-		"worker": k.worker.instanceID, "lane": k.laneID, "held": k.held,
-		"cost": k.cost, "score": k.score, "age_ms": k.ageMS,
+	out := map[string]any{
+		"worker": k.worker.instanceID, "lane": k.laneID, "placement": k.placementID,
+		"held": k.held, "cost": k.cost, "score": k.score, "age_ms": k.ageMS,
+		"resident": k.resident, "manifests_missing": k.manifestsMissing,
 	}
+	if !k.local() {
+		out["rental"] = k.worker.spec.Connection.RentalID
+	}
+	return out
+}
+
+// costOn prices the fill an attempt for `placementID` pays on `laneID` (§3.1).
+func (w *worker) costOn(laneID, placementID string) (int, []string) {
+	l := w.lanes.get(laneID)
+	if l == nil {
+		return costFill, nil
+	}
+	switch {
+	case l.resident[placementID]:
+		return costResident, l.residentIDs()
+	case len(l.resident) == 0:
+		return costFill, nil
+	}
+	return costDisplace, l.residentIDs()
+}
+
+// missingManifests counts the request's model manifests the worker's verified store does
+// not report holding.
+func (w *worker) missingManifests(models []records.ModelRef) int {
+	missing := 0
+	for _, model := range models {
+		if model.Manifest != "" && !w.heldManifests[model.Manifest] {
+			missing++
+		}
+	}
+	return missing
 }
 
 // laneKey names one (worker, lane) two requests compete for; lane "" is the worker-level
@@ -97,6 +148,8 @@ type routing struct {
 	parked     []string
 	lanes      []laneKey
 	claimed    []string
+	// pinned is the rental this decision pinned the request to (dispatch), or "".
+	pinned string
 }
 
 func (r routing) pick() *candidate {
@@ -116,7 +169,14 @@ func (r routing) event() map[string]any {
 		out["claimed"] = r.claimed
 	}
 	if pick := r.pick(); pick != nil {
-		out["pick"] = map[string]any{"worker": pick.worker.instanceID, "lane": pick.laneID}
+		row := map[string]any{"worker": pick.worker.instanceID, "lane": pick.laneID}
+		if !pick.local() {
+			row["rental"] = pick.worker.spec.Connection.RentalID
+		}
+		if r.pinned != "" {
+			row["pinned"] = true
+		}
+		out["pick"] = row
 	}
 	return out
 }
@@ -130,20 +190,19 @@ func (r routing) String() string {
 }
 
 // route scores every claimed worker whose placement is DISPATCHABLE for the request and
-// whose lane has room. Eligibility is the request's pin: a request pinned to a rental sees
-// that rental's worker only, and an unpinned request sees local workers only (cl-016) —
-// someone is billed for a rented card and nobody asked for it here. Callers hold c.mu.
+// whose lane has room. Callers hold c.mu.
 func (c *Orchestrator) route(req records.Request) routing {
 	planID := req.PlanID
-	slot := pinnedPackage(req.Package, req.Worker)
 	now := time.Now()
 	claims := c.claimsAhead(req.ID)
 	var out routing
 	for _, w := range c.workers {
-		if !c.eligible(w, req, slot, planID) {
+		slot, ok := c.eligible(w, req, planID)
+		if !ok {
 			continue
 		}
-		laneID, room, held, why := w.roomFor(w.placementFor(slot, planID), planID)
+		placementID := w.placementFor(slot, planID)
+		laneID, room, held, why := w.roomFor(placementID, planID)
 		lane := laneKey{w.instanceID, laneID}
 		out.lanes = append(out.lanes, lane)
 		if room <= 0 {
@@ -154,7 +213,9 @@ func (c *Orchestrator) route(req records.Request) routing {
 			out.claimed = append(out.claimed, lane.String()+" by "+by)
 			continue
 		}
-		k := candidate{worker: w, laneID: laneID, held: held, cost: fillCost}
+		k := candidate{worker: w, laneID: laneID, placementID: placementID, held: held,
+			manifestsMissing: w.missingManifests(req.Models)}
+		k.cost, k.resident = w.costOn(laneID, placementID)
 		k.score = k.held + k.cost
 		if !w.lastReport.IsZero() {
 			k.ageMS = now.Sub(w.lastReport).Milliseconds()
@@ -165,6 +226,9 @@ func (c *Orchestrator) route(req records.Request) routing {
 		a, b := out.candidates[i], out.candidates[j]
 		if a.score != b.score {
 			return a.score < b.score
+		}
+		if (a.cost == costResident) != (b.cost == costResident) {
+			return a.cost == costResident
 		}
 		if a.local() != b.local() {
 			return a.local()
@@ -245,35 +309,44 @@ func (w *worker) laneKeys() []laneKey {
 	return out
 }
 
-// eligible is the placement half of the match: a live claimed worker in the request's
-// slot whose placement advertises the plan as DISPATCHABLE. THE SLOT IS PART OF THE MATCH,
-// not only the binding: matching on the plan id alone sent a request pinned to rental B
-// to rental A's worker — same package, same plan digest — which made the pin advisory and
-// let a request run on a pod whose credential it never presented.
-func (c *Orchestrator) eligible(w *worker, req records.Request, slot, planID string) bool {
+// eligible is the placement half of the match: a live claimed worker whose placement
+// advertises the plan as DISPATCHABLE for this request, and the slot that placement sits
+// under. THE SLOT IS PART OF THE MATCH, not only the binding: a rental's placements live
+// under the package name pinned to that rental, so the same plan digest on rental A and
+// rental B are two placements, each presented that rental's own credential — matching on
+// the plan id alone once sent a request to a pod whose credential it never presented.
+func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) (string, bool) {
 	if w.exited || w.stopping || c.sessions[w.bootID] == nil {
-		return false
+		return "", false
 	}
-	if req.RentalRequired && w.spec.Connection == nil {
-		return false
+	if w.spec.Connection == nil {
+		if req.RentalRequired || req.Worker != "" || w.spec.Placement.Package != req.Package {
+			return "", false
+		}
+		if req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {
+			return "", false
+		}
+		if w.spec.IsJob() {
+			// A JOB worker hosts no placement: its dispatchability IS its job capacity.
+			return req.Package, w.dispatchable[planID]
+		}
+		return req.Package, w.dispatchableFor(planID)
 	}
-	if req.Worker != "" && !req.IsJob() && w.spec.Connection != nil {
-		placement, ok := w.remotePlacements[remotePlanKey(slot, planID)]
-		return w.instanceID == rentalInstanceID(req.Worker) && ok &&
-			placement.Package == slot && placement.PackageRevisionDigest == remoteRevision(req) &&
-			w.remoteDispatchable(placement, planID)
+	if req.Worker != "" {
+		if w.instanceID != rentalInstanceID(req.Worker) {
+			return "", false
+		}
+	} else if !req.Rental {
+		return "", false
 	}
-	if w.spec.Placement.Package != slot {
-		return false
+	slot := pinnedPackage(req.Package, w.spec.Connection.RentalID)
+	if req.IsJob() {
+		return slot, w.spec.IsJob() && w.spec.Placement.Package == slot && w.dispatchable[planID]
 	}
-	if req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {
-		return false
-	}
-	if w.spec.IsJob() {
-		// A JOB worker hosts no placement: its dispatchability IS its job capacity.
-		return w.dispatchable[planID]
-	}
-	return w.dispatchableFor(planID)
+	placement, ok := w.remotePlacements[remotePlanKey(slot, planID)]
+	return slot, ok && !w.spec.IsJob() && placement.Package == slot &&
+		placement.PackageRevisionDigest == remoteRevision(req) &&
+		w.remoteDispatchable(placement, planID)
 }
 
 // roomFor is the capacity half, per worker kind (#486c generalized by proto-024): the
@@ -316,20 +389,31 @@ func (w *worker) roomFor(placementID, planID string) (laneID string, room, held 
 	return "", w.seats.slots, w.held + w.seats.reserved, ""
 }
 
-// noCapacity spells a routing with no pick as the request's queued reason.
-func (r routing) noCapacity(slot, planID string) *exit.Error {
+// noCapacity spells a routing with no pick as the request's queued reason, naming the
+// workers the request was allowed to ask.
+func (r routing) noCapacity(req records.Request) *exit.Error {
+	slot, planID := pinnedPackage(req.Package, req.Worker), req.PlanID
+	asked := "no claimed worker"
+	switch {
+	case req.Worker != "":
+		asked = "no worker of the pinned rental"
+	case req.RentalRequired:
+		asked = "no attached rental"
+	case req.Rental:
+		asked = "no local worker or attached rental"
+	}
 	if len(r.claimed) > 0 {
 		return exit.Unavailablef("every lane with room for %s in %s is claimed by a request "+
 			"queued ahead of it (%s)", planID, slot, strings.Join(r.claimed, "; "))
 	}
 	if len(r.parked) > 0 {
 		return exit.Unavailablef(
-			"no claimed worker in %s has a DISPATCHABLE placement for %s with a free attempt "+
-				"slot (%s)", slot, planID, strings.Join(r.parked, "; "))
+			"%s in %s has a DISPATCHABLE placement for %s with a free attempt "+
+				"slot (%s)", asked, slot, planID, strings.Join(r.parked, "; "))
 	}
 	return exit.Unavailablef(
-		"no claimed worker in %s has a DISPATCHABLE placement for %s with a free attempt slot",
-		slot, planID)
+		"%s in %s has a DISPATCHABLE placement for %s with a free attempt slot",
+		asked, slot, planID)
 }
 
 // logRouting is the decision log (D8): inputs, score per candidate and the pick, as a
@@ -339,7 +423,11 @@ func (c *Orchestrator) logRouting(requestID string, attempt uint64, r routing) {
 	if pick == nil {
 		return
 	}
-	c.logf("routed %s#%d to %s/%s over %d candidate(s): %s", requestID, attempt,
-		pick.worker.instanceID, orNone(pick.laneID), len(r.candidates), r)
+	pinned := ""
+	if r.pinned != "" {
+		pinned = " (pinned to rental " + r.pinned + ")"
+	}
+	c.logf("routed %s#%d to %s/%s%s over %d candidate(s): %s", requestID, attempt,
+		pick.worker.instanceID, orNone(pick.laneID), pinned, len(r.candidates), r)
 	c.emit(requestID, "request.routed", attempt, r.event())
 }
