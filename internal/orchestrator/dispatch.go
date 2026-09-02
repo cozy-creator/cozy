@@ -599,6 +599,15 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			c.failQueued(req.ID, autoRentalGate(req, e))
 			return
 		}
+		if planID != "" && planID != req.PlanID {
+			// The worker resolved the binding this request routes on. The row is what the
+			// drain routes from, so the plan is durable before the queue is re-asked.
+			if e := c.opt.Store.BindRequestPlan(req.ID, planID); e != nil {
+				done()
+				c.failQueued(req.ID, e)
+				return
+			}
+		}
 		if planID != "" {
 			req.PlanID = planID
 		}
