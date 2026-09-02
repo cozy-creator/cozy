@@ -12,6 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/scratch"
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
@@ -35,12 +36,6 @@ func tooling(ctx *Context) (*tfs.Tool, *hub.Client, home.Layout, *exit.Error) {
 	return tool, client(ctx), layout, nil
 }
 
-// scratch is this transfer's own staging directory, named by its subject so two
-// transfers never stage over each other.
-func scratch(layout home.Layout, subject string) string {
-	return filepath.Join(layout.Transfer, strings.TrimPrefix(subject, "sha256:")[:16])
-}
-
 func progress(ctx *Context) func(string) {
 	return func(line string) { _ = output.Progress(ctx.Err, line) }
 }
@@ -59,21 +54,18 @@ func handleModelList(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if err := os.MkdirAll(layout.Transfer, 0o700); err != nil {
-		return exit.Internalf("cannot create transfer scratch: %s", err)
+	work, problem := scratch.Temp(layout.Transfer, "repo-list-")
+	if problem != nil {
+		return problem
 	}
-	scratch, err := os.MkdirTemp(layout.Transfer, "repo-list-")
-	if err != nil {
-		return exit.Internalf("cannot create repository-list scratch: %s", err)
-	}
-	defer os.RemoveAll(scratch)
-	releases, problem := tool.Releases(filepath.Join(scratch, "rows.jsonl"))
+	defer work.Release()
+	releases, problem := tool.Releases(filepath.Join(work.Path, "rows.jsonl"))
 	if problem != nil {
 		return problem
 	}
 	// The list stands without its byte columns: a store the byte plane refuses to
 	// measure is still a store with names in it, and the refusal is said, not hidden.
-	usage, usageProblem := tool.Usage(filepath.Join(scratch, "usage.jsonl"))
+	usage, usageProblem := tool.Usage(filepath.Join(work.Path, "usage.jsonl"))
 	bytesOf := make(map[string]tfs.RepositoryUsage, len(usage.Repos))
 	for _, repo := range usage.Repos {
 		bytesOf[repo.Org+"/"+repo.Name] = repo
@@ -167,15 +159,12 @@ func handleModelRemove(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if err := os.MkdirAll(layout.Transfer, 0o700); err != nil {
-		return exit.Internalf("cannot create transfer scratch: %s", err)
+	work, problem := scratch.Temp(layout.Transfer, "repo-remove-")
+	if problem != nil {
+		return problem
 	}
-	scratchDir, err := os.MkdirTemp(layout.Transfer, "repo-remove-")
-	if err != nil {
-		return exit.Internalf("cannot create repository-remove scratch: %s", err)
-	}
-	defer os.RemoveAll(scratchDir)
-	releases, problem := tool.Releases(filepath.Join(scratchDir, "rows.jsonl"))
+	defer work.Release()
+	releases, problem := tool.Releases(filepath.Join(work.Path, "rows.jsonl"))
 	if problem != nil {
 		return problem
 	}
@@ -206,7 +195,7 @@ func handleModelRemove(ctx *Context) *exit.Error {
 				return problem
 			}
 		} else {
-			repoScratch := filepath.Join(scratchDir, strings.ReplaceAll(ref.String(), "/", "-"))
+			repoScratch := filepath.Join(work.Path, strings.ReplaceAll(ref.String(), "/", "-"))
 			if err := os.MkdirAll(repoScratch, 0o700); err != nil {
 				return exit.Internalf("cannot create repository-remove scratch: %s", err)
 			}

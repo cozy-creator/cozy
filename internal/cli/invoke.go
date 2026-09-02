@@ -28,7 +28,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/resultfiles"
+	"github.com/cozy-creator/cozy/internal/scratch"
 )
 
 // THE LIFECYCLE AND REQUEST VERBS (cl-010), every one of them a CLIENT of the local
@@ -152,7 +152,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	input, outputHash, e := finalizeInputPayload(ep, input, key)
+	input, e = finalizeInputPayload(ep, input, key)
 	if e != nil {
 		return e
 	}
@@ -169,14 +169,12 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		}
 	}
 	outputDirectory := ""
-	outputIntentHash := ""
 	if requested := ctx.Inv.Value("--out"); requested != "" {
 		absolute, err := filepath.Abs(requested)
 		if err != nil {
 			return exit.Usagef("cannot resolve --out %q: %s", requested, err)
 		}
 		outputDirectory = filepath.Clean(absolute)
-		outputIntentHash = outputHash
 	}
 
 	c, e := dial(ctx)
@@ -190,7 +188,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Release: target.Release, ReleaseDigest: target.ReleaseDigest, Rental: managedRental,
 		RentalRequired:  ctx.Inv.Bool("--rental-only"),
 		Models:          models,
-		OutputDirectory: outputDirectory, OutputPayloadHash: outputIntentHash,
+		OutputDirectory: outputDirectory,
 	}, key)
 	if e != nil {
 		return e
@@ -203,8 +201,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 				handle.RequestID, handle.Attempt, handle.Status)
 		} else {
 			fmt.Fprintf(ctx.Err, "Invoking %s/%s...\n", target.Package, target.Function)
-			if dir := ctx.Inv.Value("--out"); dir != "" {
-				fmt.Fprintf(ctx.Err, "Saving outputs as %s\n", outputPathHint(ep, dir, outputHash))
+			if len(launch.AssetPaths(ep.Result)) > 0 {
+				fmt.Fprintf(ctx.Err, "Saving outputs to %s\n", outputDirectoryHint(ctx, target, outputDirectory))
 			}
 		}
 		if handle.Replay {
@@ -287,14 +285,12 @@ func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
 	if problem != nil {
 		return nil, problem
 	}
-	if err := os.MkdirAll(layout.Transfer, 0o700); err != nil {
-		return nil, exit.Internalf("cannot create model selection scratch: %s", err)
+	work, problem := scratch.Temp(layout.Transfer, "invoke-models-")
+	if problem != nil {
+		return nil, problem
 	}
-	root, err := os.MkdirTemp(layout.Transfer, "invoke-models-")
-	if err != nil {
-		return nil, exit.Internalf("cannot create model selection scratch: %s", err)
-	}
-	defer os.RemoveAll(root)
+	defer work.Release()
+	root := work.Path
 	hctx, cancel := hub.LongContext()
 	defer cancel()
 	out := make([]orchestrator.ModelRef, 0, len(selected))
@@ -736,28 +732,51 @@ func outputExportHint(export *api.OutputExportRef) string {
 	if export == nil {
 		return ""
 	}
-	if len(export.Paths) == 1 {
-		return export.Paths[0]
-	}
-	if len(export.Paths) > 1 {
+	if len(export.Paths) > 0 {
 		return strings.Join(export.Paths, ", ")
 	}
-	return filepath.Join(export.Directory, export.PayloadHash+"*")
+	return export.Directory
 }
 
-func exportedOutputs(life api.Lifecycle) []map[string]string {
+// outputDirectoryHint is where this run's files will land: the caller's --out, else the
+// package's own store — the same directory the daemon derives, spelled by the one layout.
+func outputDirectoryHint(ctx *Context, target Target, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	layout, problem := home.Open(ctx.Cfg.Home)
+	if problem != nil {
+		return filepath.Join(ctx.Cfg.Home, "outputs")
+	}
+	return layout.PackageOutputs(target.Package)
+}
+
+// savedFile is one exported result file as `cozy run` reports it: the path a person
+// opens, and the facts a program wants beside it.
+type savedFile struct {
+	Output string `json:"output"`
+	Path   string `json:"path"`
+	Bytes  int64  `json:"bytes"`
+	Mime   string `json:"mime"`
+	Digest string `json:"digest"`
+}
+
+// exportedOutputs joins the published paths to the outputs they carry. A file is named
+// by its content digest, so the join is exact rather than positional.
+func exportedOutputs(life api.Lifecycle) []savedFile {
 	if life.OutputExport == nil || life.OutputExport.State != "published" {
 		return nil
 	}
-	paths := life.OutputExport.Paths
-	result := make([]map[string]string, 0, len(paths))
-	for index, path := range paths {
-		row := map[string]string{"path": path}
-		if index < len(life.Outputs) {
-			row["output"] = life.Outputs[index].OutputID
-			row["bytes"] = output.Bytes(life.Outputs[index].Length)
-			row["mime"] = life.Outputs[index].MimeType
-			row["digest"] = life.Outputs[index].Digest
+	byDigest := make(map[string]api.MediaRef, len(life.Outputs))
+	for _, o := range life.Outputs {
+		byDigest[strings.TrimPrefix(o.Digest, "sha256:")] = o
+	}
+	result := make([]savedFile, 0, len(life.OutputExport.Paths))
+	for _, path := range life.OutputExport.Paths {
+		stem := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		row := savedFile{Path: path}
+		if o, ok := byDigest[stem]; ok {
+			row.Output, row.Bytes, row.Mime, row.Digest = o.OutputID, o.Length, o.MimeType, o.Digest
 		}
 		result = append(result, row)
 	}
@@ -1154,29 +1173,13 @@ func compactValue(v map[string]any) string {
 	return strings.Join(parts, " ")
 }
 
-func outputPathHint(ep *launch.Entrypoint, dir, payloadHash string) string {
-	paths := launch.AssetPaths(ep.Result)
-	if len(paths) != 1 {
-		return filepath.Join(dir, payloadHash+"*")
-	}
-	spec, ok := launch.ResultAssetSpec(ep, paths[0])
-	if !ok || len(spec.MediaTypes) != 1 {
-		return filepath.Join(dir, payloadHash+"*")
-	}
-	extension := resultfiles.Extension(spec.MediaTypes[0])
-	if extension == "" {
-		return filepath.Join(dir, payloadHash+"*")
-	}
-	return filepath.Join(dir, payloadHash+extension)
-}
-
 // opaqueType is the type an output carries when nobody declared one.
 const opaqueType = "application/octet-stream"
 
 // renderRun prints the run's answer and maps the terminal onto the SHARED matrix:
 // succeeded 0 · failed 11 · canceled 12 · deadline 10, from `exit.JobTerminal`.
 func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopped string,
-	saved []map[string]string, submitted time.Duration, began time.Time) *exit.Error {
+	saved []savedFile, submitted time.Duration, began time.Time) *exit.Error {
 	status := localapi.StreamStatus(terminal)
 	if status == "" {
 		status = life.Status
@@ -1223,10 +1226,14 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		paths := make([]string, 0, len(saved))
 		opaque := false
 		for _, s := range saved {
-			paths = append(paths, s["path"]+" ("+s["bytes"]+")")
-			opaque = opaque || s["mime"] == opaqueType || s["mime"] == ""
+			paths = append(paths, s.Path+" ("+output.Bytes(s.Bytes)+")")
+			opaque = opaque || s.Mime == opaqueType || s.Mime == ""
 		}
-		fields = append(fields, output.Field{K: "saved", V: paths})
+		if ctx.Mode().JSON {
+			fields = append(fields, output.Field{K: "saved", V: saved})
+		} else {
+			fields = append(fields, output.Field{K: "saved", V: paths})
+		}
 		if opaque {
 			// DEGRADE LOUDLY. The file is exactly the bytes the manifest declared and its
 			// digest matched; what is missing is the TYPE, and the runtime is the only
@@ -1368,15 +1375,12 @@ func mintKey() string {
 // already-minted idempotency key, so a normal invocation gets fresh entropy while an
 // explicit-key retry reconstructs byte-identical input instead of conflicting with its
 // recorded request. An explicitly supplied seed is never changed.
-//
-// The returned hash is SHA-256 of the exact normalized JSON bytes submitted to the daemon.
-// It therefore exists before execution and names the output independently of result bytes.
 func finalizeInputPayload(ep *launch.Entrypoint, input json.RawMessage,
 	idempotencyKey string,
-) (json.RawMessage, string, *exit.Error) {
+) (json.RawMessage, *exit.Error) {
 	var document map[string]json.RawMessage
 	if err := json.Unmarshal(input, &document); err != nil || document == nil {
-		return nil, "", exit.Internalf("cannot finalize the invocation payload: %v", err)
+		return nil, exit.Internalf("cannot finalize the invocation payload: %v", err)
 	}
 	for _, field := range ep.Request.Fields {
 		if field.Name != "seed" || string(field.Type) != `"int"` {
@@ -1392,10 +1396,9 @@ func finalizeInputPayload(ep *launch.Entrypoint, input json.RawMessage,
 	}
 	rendered, err := json.Marshal(document)
 	if err != nil {
-		return nil, "", exit.Internalf("cannot render the finalized invocation payload: %s", err)
+		return nil, exit.Internalf("cannot render the finalized invocation payload: %s", err)
 	}
-	digest := sha256.Sum256(rendered)
-	return rendered, hex.EncodeToString(digest[:]), nil
+	return rendered, nil
 }
 
 // ------------------------------------------------------------------- target parsing

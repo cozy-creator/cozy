@@ -1,6 +1,6 @@
-// Package resultfiles publishes daemon-owned verified media into a caller's durable
-// --out destination. It owns filenames and the no-overwrite boundary; execution never
-// composes a path from a terminal document.
+// Package resultfiles publishes daemon-owned verified media into a durable directory:
+// the package's own store under outputs/ or a caller's --out. It owns filenames and the
+// no-overwrite boundary; execution never composes a path from a terminal document.
 package resultfiles
 
 import (
@@ -28,29 +28,16 @@ type Entry struct {
 	Length    int64
 }
 
-// Filename returns the pre-execution name for one exact output contract.
-func Filename(payloadHash, outputID, mediaType string, count int) (string, *exit.Error) {
-	if len(payloadHash) != sha256.Size*2 || strings.Trim(payloadHash, "0123456789abcdef") != "" {
-		return "", exit.Named(exit.Validation, "output_export_hash_malformed",
-			"output payload hash %q is not 64 lowercase hexadecimal characters", payloadHash)
+// Filename names one verified file by its own content digest and media type:
+// `<sha256 hex>.<ext>`. The same bytes always get the same name, so a regenerated file
+// lands on itself and two different files can never collide.
+func Filename(digest, mediaType string) (string, *exit.Error) {
+	hex, ok := strings.CutPrefix(digest, "sha256:")
+	if !ok || len(hex) != sha256.Size*2 || strings.Trim(hex, "0123456789abcdef") != "" {
+		return "", exit.Named(exit.Validation, "output_export_digest_malformed",
+			"output digest %q is not sha256 over 64 lowercase hexadecimal characters", digest)
 	}
-	if outputID == "" || filepath.Base(outputID) != outputID || strings.ContainsAny(outputID, `/\\`) {
-		return "", exit.Named(exit.Validation, "output_export_id_malformed",
-			"output id %q is not one safe field path", outputID)
-	}
-	if count < 1 {
-		return "", exit.Internalf("cannot name an empty output set")
-	}
-	extension := Extension(mediaType)
-	if extension == "" {
-		return "", exit.Named(exit.Validation, "output_export_media_type_ambiguous",
-			"output %s declares unsupported media type %q", outputID, mediaType)
-	}
-	stem := payloadHash
-	if count > 1 {
-		stem += "-" + outputID
-	}
-	return stem + extension, nil
+	return hex + Extension(mediaType), nil
 }
 
 // Extension is the closed media-to-filename projection. Unknown bytes get no guessed

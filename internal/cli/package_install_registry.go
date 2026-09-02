@@ -15,6 +15,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/scratch"
 	"github.com/cozy-creator/cozy/internal/tfs"
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
@@ -69,15 +70,12 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if existingInstall != nil && existingInstall.SourceDigest == releaseDigest {
 		defer existing.Close()
 		result := &install.Result{Install: *existingInstall, Idempotent: true}
-		if err := os.MkdirAll(existingLayout.Transfer, 0o700); err != nil {
-			return exit.Internalf("cannot create model prefetch scratch: %s", err)
+		modelScratch, problem := scratch.Temp(existingLayout.Transfer, "package-model-prefetch-")
+		if problem != nil {
+			return problem
 		}
-		modelScratch, err := os.MkdirTemp(existingLayout.Transfer, "package-model-prefetch-")
-		if err != nil {
-			return exit.Internalf("cannot create model prefetch scratch: %s", err)
-		}
-		defer os.RemoveAll(modelScratch)
-		bestEffortDefaultModels(hctx, ctx, modelScratch,
+		defer modelScratch.Release()
+		bestEffortDefaultModels(hctx, ctx, modelScratch.Path,
 			&install.PublishedSource{Package: ref.String(), Release: release,
 				SourceDigest: releaseDigest, PackageConfig: packageConfig,
 				Selection: install.Selection{PackageDescriptor: packageDescriptor}}, result)
@@ -88,15 +86,12 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if err := os.MkdirAll(layout.Transfer, 0o700); err != nil {
-		return exit.Internalf("cannot create package download scratch: %s", err)
+	work, problem := scratch.Temp(layout.Transfer, "package-install-")
+	if problem != nil {
+		return problem
 	}
-	scratch, err := os.MkdirTemp(layout.Transfer, "package-install-")
-	if err != nil {
-		return exit.Internalf("cannot create package download scratch: %s", err)
-	}
-	defer os.RemoveAll(scratch)
-	published, problem := downloadPackageInstallPlan(hctx, ctx, scratch, ref, release, releaseDigest,
+	defer work.Release()
+	published, problem := downloadPackageInstallPlan(hctx, ctx, work.Path, ref, release, releaseDigest,
 		plan, packageConfig, packageDescriptor, pyproject, uvLock)
 	if problem != nil {
 		return problem
@@ -120,7 +115,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	}
 	st.Close()
 	writer.Unlock()
-	bestEffortDefaultModels(hctx, ctx, scratch, published, result)
+	bestEffortDefaultModels(hctx, ctx, work.Path, published, result)
 	_, outputStore, outputWriter, problem := open(ctx.Cfg, true)
 	if problem != nil {
 		return problem
@@ -419,4 +414,3 @@ func exactLocalModel(tool *tfs.Tool, spec, lane, work string) (
 	// never guess between two lanes merely because both are on disk.
 	return empty, false, nil
 }
-

@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/reclaim"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	cozyweb "github.com/cozy-creator/cozy/web"
@@ -152,6 +153,11 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// would otherwise still reference an install, and before the API is served — and it
 	// is never fatal: what it removes is a venv `cozy package install` rebuilds.
 	swept, sweepNote := sweepInstalls(l, st)
+	// The three roots that used to grow without bound. Each sweep lets the records
+	// authority — or a live process's kernel lock — decide what still has a claim.
+	attempts, attemptsNote := reclaimNote(reclaim.Attempts(l, st))
+	workers, workersNote := reclaimNote(reclaim.Workers(l, st))
+	transfer, transferNote := reclaimNote(reclaim.Transfer(l))
 
 	// One per-launch CLI credential is handed over through a 0600 file. It is never
 	// printed, logged, or placed on argv, and dies with this process. The public web stub
@@ -182,6 +188,12 @@ func serveDaemon(ctx *Context) *exit.Error {
 		addr, strings.Join(bound, "+"), socket)
 	fmt.Fprintf(ctx.Out, "  install sweep: reclaimed %d of %d director(ies), freed %s exclusive%s\n",
 		swept.Removed, swept.Scanned, output.Bytes(swept.Bytes), sweepNote)
+	fmt.Fprintf(ctx.Out, "  attempt sweep: reclaimed %d of %d director(ies), freed %s%s\n",
+		attempts.Removed, attempts.Scanned, output.Bytes(attempts.Bytes), attemptsNote)
+	fmt.Fprintf(ctx.Out, "  worker sweep: reclaimed %d of %d director(ies), freed %s%s\n",
+		workers.Removed, workers.Scanned, output.Bytes(workers.Bytes), workersNote)
+	fmt.Fprintf(ctx.Out, "  transfer sweep: reclaimed %d of %d entr(y|ies), freed %s%s\n",
+		transfer.Removed, transfer.Scanned, output.Bytes(transfer.Bytes), transferNote)
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s · reconcile killed %d orphan(s), forgot %d stale row(s)\n",
 		l.DB, yield, killed, forgotten)
 	fmt.Fprintf(ctx.Out, "  client credential %s (%s, mode 0600)\n", creds.CLI.Digest(), l.Client)
@@ -221,6 +233,15 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fleet.close()
 	c.Close(orchestrator.StopGrace)
 	return nil
+}
+
+// reclaimNote turns a reclaim sweep's first refusal into a banner note; like the install
+// sweep, nothing here may keep the daemon down.
+func reclaimNote(swept reclaim.Swept, problem *exit.Error) (reclaim.Swept, string) {
+	if problem != nil {
+		return swept, " · incomplete: " + problem.Message
+	}
+	return swept, ""
 }
 
 // sweepInstalls takes the single-writer lock the install transaction takes, sweeps, and

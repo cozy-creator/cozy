@@ -208,15 +208,19 @@ detaches without canceling the durable run.
 If the package is missing, Cozy installs the newest compatible release from Tensorhub before
 starting; the download is visible progress, not an interactive prompt. Reusing an explicit
 `--idempotency-key` safely returns the same recorded work. Before submission, Cozy materializes an
-omitted integer `seed` and hashes the finalized input payload. Files saved under `--out` use that full
-lowercase hash as their filename, so unseeded runs can share one directory without replacing one
-another. The same explicit payload intentionally resolves to the same filename; multi-output results
-append each output field name. The daemon probes the destination writable at submit and refuses typed
-(`output_destination_unwritable`) before any execution; it records the destination with the request
-and publishes the verified media after terminal, so closing the command or restarting Cozy does not
-abandon `--out`. A destination that dies after submit never turns a completed run into a failure:
-the verdict reads `completed (export pending: <code>)` and the daemon keeps retrying the durable
-export.
+omitted integer `seed`, so an unseeded run draws fresh entropy.
+
+Every run says where its files are. Result files land in the package's own store,
+`~/.cozy/outputs/<org>-<package>/`, or under `--out DIR`; either way each file is named by its own
+content digest, `<sha256>.<ext>`, so regenerating the same bytes lands on the same file and two
+different results never collide. Nothing but result files is ever written there — the request
+payload and other inputs live in an internal attempt directory that is reclaimed once the run
+settles. `saved:` lists the absolute paths (`saved[].path` under `--json`). The daemon probes the
+destination writable at submit and refuses typed (`output_destination_unwritable`) before any
+execution; it records the destination with the request and publishes the verified media after
+terminal, so closing the command or restarting Cozy does not abandon the export. A destination that
+dies after submit never turns a completed run into a failure: the verdict reads `completed (export
+pending: <code>)` and the daemon keeps retrying the durable export.
 
 Local Runtime workers start on demand. Successful serving workers may remain resident for warm
 reuse; job workers are reclaimed at terminal.

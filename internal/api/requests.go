@@ -20,7 +20,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/resultfiles"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -45,13 +44,14 @@ type Submission struct {
 	// LocalAssets is the local API's out-of-band input set. Each source path is ingested into
 	// the daemon-owned immutable input store before the request row exists; it never
 	// crosses the worker protocol. The typed payload carries only its opaque reference.
-	LocalAssets       []records.AssetBinding  `json:"local_assets,omitempty"`
-	Rental            bool                    `json:"rental,omitempty"`
-	RentalRequired    bool                    `json:"rental_required,omitempty"`
-	Models            []orchestrator.ModelRef `json:"models,omitempty"`
-	OutputDirectory   string                  `json:"output_directory,omitempty"`
-	OutputPayloadHash string                  `json:"output_payload_hash,omitempty"`
-	AttemptKey        string                  `json:"-"`
+	LocalAssets    []records.AssetBinding  `json:"local_assets,omitempty"`
+	Rental         bool                    `json:"rental,omitempty"`
+	RentalRequired bool                    `json:"rental_required,omitempty"`
+	Models         []orchestrator.ModelRef `json:"models,omitempty"`
+	// OutputDirectory is the caller's --out. Empty means the package's own store under
+	// outputs/, which every run exports to.
+	OutputDirectory string `json:"output_directory,omitempty"`
+	AttemptKey      string `json:"-"`
 }
 
 // Handle is the 202 answer: the request's id and where to go next. Verbatim from the
@@ -247,7 +247,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Rental:               sub.Rental || sub.RentalRequired,
 		RentalRequired:       sub.RentalRequired,
 		Models:               models, NeedsAccelerator: recorded.NeedsAccelerator,
-		OutputExport: outputExportInput(sub),
+		OutputDirectory: sub.OutputDirectory,
 	}
 }
 
@@ -296,18 +296,10 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		}
 		doc["models"] = models
 	}
-	if export := spec.OutputExport; export != nil {
-		rows := make([]canonical.Value, 0, len(export.Outputs))
-		for _, output := range export.Outputs {
-			rows = append(rows, map[string]canonical.Value{
-				"output_id": output.OutputID, "media_type": output.MediaType,
-				"filename": output.Filename,
-			})
-		}
-		doc["output_export"] = map[string]canonical.Value{
-			"directory": export.Directory, "payload_hash": export.PayloadHash,
-			"outputs": rows,
-		}
+	// The caller's explicit --out is part of what the key names; the derived default and
+	// the descriptor-derived entries are facts of the package, not of the submission.
+	if spec.OutputDirectory != "" {
+		doc["output_directory"] = spec.OutputDirectory
 	}
 	// The pinned rental is NOT in it: a worker id says WHERE the same work runs, and two
 	// submissions of one key that differ only in placement are the same request. What the
@@ -370,8 +362,8 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
 		Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
 		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
-		Models:       append([]orchestrator.ModelRef(nil), sub.Models...),
-		OutputExport: outputExportInput(sub),
+		Models:          append([]orchestrator.ModelRef(nil), sub.Models...),
+		OutputDirectory: sub.OutputDirectory,
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
@@ -415,7 +407,7 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 		if e := validateInputs(entrypoint, &out); e != nil {
 			return out, e
 		}
-		if e := deriveOutputExport(entrypoint, &out); e != nil {
+		if e := s.deriveOutputExport(entrypoint, &out); e != nil {
 			return out, e
 		}
 		return out, nil
@@ -468,32 +460,29 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 		return out, e
 	}
 	out.NeedsAccelerator = needsAccelerator
-	if e := deriveOutputExport(entrypoint, &out); e != nil {
+	if e := s.deriveOutputExport(entrypoint, &out); e != nil {
 		return out, e
 	}
 	return out, nil
 }
 
-func outputExportInput(sub Submission) *records.OutputExportIntent {
-	if sub.OutputDirectory == "" && sub.OutputPayloadHash == "" {
+// deriveOutputExport records where this run's result files will be published: the
+// caller's --out, else the package's own store under outputs/. A callable with no result
+// files exports nothing and records no obligation.
+func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestrator.Submission) *exit.Error {
+	paths := launch.AssetPaths(entrypoint.Result)
+	if len(paths) == 0 && len(out.Outputs) == 0 {
 		return nil
 	}
-	return &records.OutputExportIntent{
-		Directory: sub.OutputDirectory, PayloadHash: sub.OutputPayloadHash,
-	}
-}
-
-func deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestrator.Submission) *exit.Error {
-	intent := out.OutputExport
-	if intent == nil {
-		return nil
+	intent := &records.OutputExportIntent{Directory: out.OutputDirectory}
+	if intent.Directory == "" {
+		intent.Directory = s.layout.PackageOutputs(out.Package)
 	}
 	if !filepath.IsAbs(intent.Directory) || filepath.Clean(intent.Directory) != intent.Directory ||
 		len(intent.Directory) > 4096 {
 		return exit.Named(exit.Validation, "output_export_directory_malformed",
 			"output directory must be one canonical absolute path")
 	}
-	paths := launch.AssetPaths(entrypoint.Result)
 	if len(paths) != len(out.Outputs) {
 		return exit.Named(exit.Validation, "output_export_set_mismatch",
 			"package result declares %d asset paths for %d granted outputs", len(paths), len(out.Outputs))
@@ -511,17 +500,13 @@ func deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestrator.Submiss
 		spec, ok := launch.ResultAssetSpec(entrypoint, outputID)
 		if !ok || len(spec.MediaTypes) != 1 {
 			return exit.Named(exit.Validation, "output_export_media_type_ambiguous",
-				"result asset %s must declare exactly one media type for --out", outputID)
-		}
-		filename, problem := resultfiles.Filename(
-			intent.PayloadHash, outputID, spec.MediaTypes[0], len(paths))
-		if problem != nil {
-			return problem
+				"result asset %s must declare exactly one media type", outputID)
 		}
 		intent.Outputs = append(intent.Outputs, records.OutputExportEntry{
-			OutputID: outputID, MediaType: spec.MediaTypes[0], Filename: filename,
+			OutputID: outputID, MediaType: spec.MediaTypes[0],
 		})
 	}
+	out.OutputExport = intent
 	return nil
 }
 
@@ -659,13 +644,15 @@ type Lifecycle struct {
 	OutputExport  *OutputExportRef `json:"output_export,omitempty"`
 }
 
+// OutputExportRef is where a run's result files go and whether they are there yet.
+// Paths is filled once published: a file is named by its own content digest, which
+// nothing knows before the terminal.
 type OutputExportRef struct {
-	Directory   string   `json:"directory"`
-	PayloadHash string   `json:"payload_hash"`
-	State       string   `json:"state"`
-	ErrorCode   string   `json:"error_code,omitempty"`
-	Error       string   `json:"error,omitempty"`
-	Paths       []string `json:"paths"`
+	Directory string   `json:"directory"`
+	State     string   `json:"state"`
+	ErrorCode string   `json:"error_code,omitempty"`
+	Error     string   `json:"error,omitempty"`
+	Paths     []string `json:"paths"`
 }
 
 // MediaRef is how bytes are named in EVERY document this API emits: an opaque id and its
@@ -723,16 +710,10 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		}
 	}
 	if export, problem := s.store.OutputExportOf(row.ID); problem == nil && export != nil {
-		paths := make([]string, 0, len(export.Outputs))
-		for _, output := range export.Outputs {
-			paths = append(paths, filepath.Join(export.Directory, output.Filename))
-		}
-		if len(export.PublishedPaths) > 0 {
-			paths = append(paths[:0], export.PublishedPaths...)
-		}
 		life.OutputExport = &OutputExportRef{
-			Directory: export.Directory, PayloadHash: export.PayloadHash, State: export.State,
-			ErrorCode: export.ErrorCode, Error: export.SafeError, Paths: paths,
+			Directory: export.Directory, State: export.State,
+			ErrorCode: export.ErrorCode, Error: export.SafeError,
+			Paths: append([]string{}, export.PublishedPaths...),
 		}
 	}
 	attempts, _ := s.store.Attempts(row.ID)
