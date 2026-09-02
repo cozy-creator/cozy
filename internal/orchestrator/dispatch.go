@@ -332,10 +332,10 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 		if !c.enqueue(req.ID) {
 			return 0, nil
 		}
-		c.emit(req.ID, "request.queued", 0, map[string]any{
+		c.emit(req.ID, "request.queued", 0, waitFacts{cause: WaitRental}.decorate(map[string]any{
 			"reason":   "remote rental required; local capacity is intentionally skipped",
 			"position": c.QueuePosition(req.ID),
-		})
+		}, req))
 		c.selectOrStart(req)
 		go c.drain()
 		return 0, nil
@@ -350,10 +350,10 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 		if !c.enqueue(req.ID) {
 			return 0, nil
 		}
-		c.emit(req.ID, "request.queued", 0, map[string]any{
+		c.emit(req.ID, "request.queued", 0, waitFacts{cause: WaitQueueAhead}.decorate(map[string]any{
 			"reason":   "the dispatch queue is not empty; this request joins it in submission order",
 			"position": c.QueuePosition(req.ID),
-		})
+		}, req))
 		c.logf("%s QUEUED behind %d waiting request(s)", req.ID, c.QueuePosition(req.ID)-1)
 		c.selectOrStart(req)
 		go c.drain()
@@ -373,7 +373,8 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 		if !c.enqueue(req.ID) {
 			return 0, nil
 		}
-		c.emit(req.ID, "request.queued", 0, map[string]any{"reason": e.Message})
+		c.emit(req.ID, "request.queued", 0,
+			c.waitOf(req).decorate(map[string]any{"reason": e.Message}, req))
 		c.logf("%s QUEUED for capacity: %s", req.ID, e.Message)
 		c.selectOrStart(req)
 		go c.drain()
@@ -459,7 +460,8 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 		// No capacity yet: the request WAITS. A requeue that cannot be placed is queued,
 		// never dropped — dispatch resumes the moment a worker reports the binding ready.
 		c.enqueue(requestID)
-		c.emit(requestID, "request.queued", 0, map[string]any{"reason": e.Message, "requeues": n})
+		c.emit(requestID, "request.queued", 0,
+			c.waitOf(*req).decorate(map[string]any{"reason": e.Message, "requeues": n}, *req))
 		c.logf("%s requeued %d/%d and QUEUED for capacity: %s", requestID, n, MaxRequeues, e.Message)
 		c.selectOrStart(*req)
 		return

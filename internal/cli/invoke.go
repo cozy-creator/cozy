@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -934,9 +935,14 @@ func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
 type runProgress struct {
 	ctx         *Context
 	stream      bool
+	mu          sync.Mutex
 	last        string
 	dirty       bool
+	closed      bool
 	began       time.Time
+	waitedSince time.Time
+	waitEvent   localapi.Event
+	patience    *time.Timer
 	stepStage   string
 	stepSeconds float64
 	stepSamples int
@@ -957,15 +963,23 @@ func (p *runProgress) on(e localapi.Event) bool {
 	if p.ctx.Mode().JSON {
 		return true // one JSON document on stdout: the run's own, at the end
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.observeWait(e)
 	// A redirected human command has no status line to rewrite. Its final result is the
 	// useful record; spraying every lossy tick into logs is neither progress nor a stable
 	// interface. --full deliberately restores the diagnostic stream.
 	if !p.ctx.Mode().Color && !p.ctx.Mode().Full {
 		return true
 	}
-	line := p.line(e, p.ctx.Mode().Full)
+	p.render(p.line(e, p.ctx.Mode().Full))
+	return true
+}
+
+// render rewrites the status line. Callers hold p.mu.
+func (p *runProgress) render(line string) {
 	if line == "" || line == p.last {
-		return true
+		return
 	}
 	p.last, p.dirty = line, true
 	// stderr, deliberately: stdout carries the RESULT, so a piped `cozy run` is not
@@ -975,12 +989,69 @@ func (p *runProgress) on(e localapi.Event) bool {
 	} else {
 		fmt.Fprintln(p.ctx.Err, line)
 	}
-	return true
+}
+
+// observeWait keeps the wait clock. It starts on a queued/parked event — at the event's
+// own recorded time, so a reattached watcher inherits the wait already served — and
+// stops on any event that says the queue let go of the request. Callers hold p.mu.
+func (p *runProgress) observeWait(e localapi.Event) {
+	switch strings.TrimPrefix(e.Type, "request.") {
+	case "queued", "parked":
+		p.waitEvent = e
+		if p.waitedSince.IsZero() {
+			p.waitedSince = eventTime(e)
+			p.armPatience()
+		}
+	case "rentals", "log", "metric":
+		// Still the same wait; these narrate it without ending it.
+	default:
+		p.waitedSince = time.Time{}
+		p.disarmPatience()
+	}
+}
+
+// armPatience schedules the one time-driven render: a wait that outlives waitPatience
+// re-renders with the diagnostic even when no new event arrives — the stuck case emits
+// exactly one parked event and then silence. Only the human status line needs it; the
+// diagnostic surfaces (--full, --stream, --json) carry the detail from the start.
+// Callers hold p.mu.
+func (p *runProgress) armPatience() {
+	if !p.ctx.Mode().Color || p.ctx.Mode().Full {
+		return
+	}
+	remaining := max(waitPatience-time.Since(p.waitedSince), 0)
+	p.patience = time.AfterFunc(remaining, func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.closed || p.waitedSince.IsZero() {
+			return
+		}
+		p.render(p.waitLine(p.waitEvent))
+	})
+}
+
+func (p *runProgress) disarmPatience() {
+	if p.patience != nil {
+		p.patience.Stop()
+		p.patience = nil
+	}
+}
+
+// eventTime is the event's own recorded time, this process's clock when it carries none.
+func eventTime(e localapi.Event) time.Time {
+	if at, err := time.Parse(time.RFC3339Nano, e.At); err == nil {
+		return at
+	}
+	return time.Now()
 }
 
 func (p *runProgress) line(e localapi.Event, full bool) string {
 	if full {
 		return diagnosticProgressLine(e)
+	}
+	switch strings.TrimPrefix(e.Type, "request.") {
+	case "queued", "parked":
+		return p.waitLine(e)
 	}
 	if strings.TrimPrefix(e.Type, "request.") != "progress" {
 		return progressLine(e, false)
@@ -1065,6 +1136,10 @@ func shortDuration(value time.Duration) string {
 }
 
 func (p *runProgress) done() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	p.disarmPatience()
 	if p.dirty && p.ctx.Mode().Color {
 		fmt.Fprintln(p.ctx.Err)
 	}
@@ -1085,13 +1160,8 @@ func progressLine(e localapi.Event, full bool) string {
 		return humanStage(e.Payload["value"])
 	case "metric":
 		return ""
-	case "queued":
-		return "  preparing a local worker"
-	case "parked":
-		if reason, ok := e.Payload["reason"].(string); ok {
-			return "  queued — " + reason
-		}
-		return "  queued"
+	case "queued", "parked":
+		return humanWaitLine(e.Payload)
 	case "rentals":
 		if line, ok := e.Payload["line"].(string); ok {
 			return line
@@ -1133,6 +1203,63 @@ func humanProgress(value any) string {
 	return fmt.Sprintf("  %s — %.0f%%", name, fraction*100)
 }
 
+// waitPatience is how long a wait stays a calm one-liner (cl-103). Past it, the
+// dispatcher's own diagnostic joins the line: a long wait is the abnormal case, and the
+// detail is how a person sees exactly what the queue is stuck on. The full diagnostic is
+// always in --full and --stream/--json regardless.
+const waitPatience = 90 * time.Second
+
+// humanWaitLine says what the queue is DOING, never how it thinks: the event's stable
+// `wait` cause becomes a calm stage line with no digests and no dispatcher vocabulary.
+// The verbatim diagnostic stays in the payload's `reason` for the machine surfaces.
+func humanWaitLine(payload map[string]any) string {
+	pkg, _ := payload["package"].(string)
+	on, _ := payload["waiting_on"].(string)
+	cause, _ := payload["wait"].(string)
+	switch cause {
+	case orchestrator.WaitWorkerStart:
+		if pkg != "" {
+			return "  starting a worker for " + pkg
+		}
+		return "  starting a worker"
+	case orchestrator.WaitWorkerWarming:
+		if on != "" {
+			return "  warming the model on " + on
+		}
+		return "  warming the model"
+	case orchestrator.WaitSlotBusy:
+		if on != "" {
+			return "  waiting for a free slot on " + on
+		}
+		return "  waiting for a free slot"
+	case orchestrator.WaitQueueAhead:
+		if position, ok := number(payload["position"]); ok && position > 1 {
+			return fmt.Sprintf("  waiting in line — position %.0f", position)
+		}
+		return "  waiting in line"
+	case orchestrator.WaitRental:
+		return "  waiting for a rental machine"
+	case orchestrator.WaitModelTransfer:
+		return "  downloading the model"
+	}
+	return "  waiting for capacity"
+}
+
+// waitLine is humanWaitLine plus patience: once the wait outlives waitPatience the raw
+// diagnostic earns its place on the human line too. Callers hold p.mu.
+func (p *runProgress) waitLine(e localapi.Event) string {
+	line := humanWaitLine(e.Payload)
+	if p.waitedSince.IsZero() || time.Since(p.waitedSince) < waitPatience {
+		return line
+	}
+	reason, _ := e.Payload["reason"].(string)
+	if reason == "" {
+		return line
+	}
+	return fmt.Sprintf("%s — %s so far: %s",
+		line, shortDuration(time.Since(p.waitedSince)), reason)
+}
+
 func humanStage(value any) string {
 	if name, ok := value.(string); ok && strings.TrimSpace(name) != "" {
 		return "  " + strings.TrimSpace(name)
@@ -1172,11 +1299,11 @@ func diagnosticProgressLine(e localapi.Event) string {
 		if v, ok := e.Payload["value"].(map[string]any); ok {
 			return "  " + strings.TrimSpace(fmt.Sprintf("%s %s", kind, compactValue(v)))
 		}
-	case "queued":
+	case "queued", "parked":
 		if reason, ok := e.Payload["reason"].(string); ok {
-			return "  queued — " + reason
+			return "  " + kind + " — " + reason
 		}
-		return "  queued"
+		return "  " + kind
 	case "rentals":
 		if line, ok := e.Payload["line"].(string); ok {
 			return line

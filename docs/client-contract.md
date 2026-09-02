@@ -171,7 +171,8 @@ after it arrives in order, across a host restart. `id:` carries the cursor on th
 | type | payload |
 |---|---|
 | `request.submitted` | `package`, `function`, `body_digest`, `plan_id`, `outputs` |
-| `request.queued` | `reason` |
+| `request.queued` | `reason` (verbatim diagnostic), `wait` (stable cause: `worker_start` · `worker_warming` · `slot_busy` · `queue_ahead` · `rental` · `model_transfer`), `waiting_on` (machine word, when known), `package`, `position` |
+| `request.parked` | the drain skipped a waiting request: the `request.queued` fields plus `lanes`, `overtaken`, `budget`, `claims` |
 | `request.dispatch_aborted` | pre-offer preparation failed; `cause`, `error`; no worker saw this ordinal |
 | `request.dispatched` | `instance_id`, `invocation_digest` |
 | `request.accepted` | `plan_digest`, `construction_digest`, `plan` |
