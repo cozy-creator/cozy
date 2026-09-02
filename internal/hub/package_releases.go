@@ -199,9 +199,9 @@ type PackageDeriveInputs struct {
 	HardwareVariants []string `json:"hardware_variants"`
 }
 
-func (c *Client) ModelDeriveInputs(ctx context.Context, ref Ref, lane string) (PackageDeriveInputs, *exit.Error) {
+func (c *Client) ModelDeriveInputs(ctx context.Context, ref Ref, release, lane string) (PackageDeriveInputs, *exit.Error) {
 	var out PackageDeriveInputs
-	query := url.Values{"lane": []string{lane}}
+	query := url.Values{"lane": []string{lane}, "release": []string{release}}
 	e := c.do(ctx, call{method: http.MethodGet,
 		path:   resourcePath("models", ref) + "/derive-inputs?" + query.Encode(),
 		strict: true, responseBytes: 16 << 20}, &out)

@@ -34,8 +34,8 @@ type DeriveInput struct {
 	Variants     []string
 }
 
-// ProfileResolver answers one declared "org/model/lane" profile from the hub.
-type ProfileResolver func(ctx context.Context, model, lane string) (DeriveInput, *exit.Error)
+// ProfileResolver answers one declared "org/model/release/lane" profile from the hub.
+type ProfileResolver func(ctx context.Context, model, release, lane string) (DeriveInput, *exit.Error)
 
 var evidenceDocName = regexp.MustCompile(`^[0-9a-f]{64}\.json$`)
 
@@ -110,16 +110,19 @@ func (p *Package) DeriveEvidence(ctx context.Context, org string, resolve Profil
 	}
 	requestBindings := make([]map[string]any, 0, len(bindings))
 	for i, binding := range bindings {
+		// Model releases are mutable pointers with unordered labels (#689), so a
+		// model has no default release and the declared profile must name one:
+		// <org>/<model>/<release>/<lane>.
 		segments := strings.Split(binding.profile, "/")
-		if len(segments) != 3 {
+		if len(segments) != 4 {
 			return exit.Named(exit.Validation, "source_profile_unresolvable",
-				"%s declares source profile %q; evidence resolution needs org/model/lane",
+				"%s declares source profile %q; evidence resolution needs org/model/release/lane",
 				binding.path, binding.profile).
-				WithRemedy("declare the profile as <org>/<model>/<lane>")
+				WithRemedy("declare the profile as <org>/<model>/<release>/<lane>")
 		}
 		input, held := inputs[binding.profile]
 		if !held {
-			resolved, problem := resolve(ctx, segments[0]+"/"+segments[1], segments[2])
+			resolved, problem := resolve(ctx, segments[0]+"/"+segments[1], segments[2], segments[3])
 			if problem != nil {
 				return problem
 			}
