@@ -79,7 +79,7 @@ plan = tensorfs.plan(info["header"], order, window=1 << 16)
 slots = [memoryview(bytearray(1 << 18)) for _ in range(3)]
 digest = hashlib.sha256()
 
-with store.acquire_manifest(snap) as lease:
+with store.acquire_cozytensors(snap) as lease:
     print(f"lease: {len(lease.objects)} objects, {lease.bytes} B verified")
     first_id, first_length = lease.objects[0]
 
@@ -97,7 +97,7 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
     destination = tensorfs.Store.init(transfer_root)
     operation = destination.begin_operation("wheel-acquire", "tensorhub", "smoke")
     operation.hold_manifest(snap, len(info["manifest"]))
-    closure = store.walk(snap)
+    closure = store.walk_cozytensors(snap)
     for reached in closure:
         operation.hold_blob(reached["id"], reached["length"])
         tensorfs.transfer_object(store, destination, reached["id"], reached["length"])
@@ -105,6 +105,18 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
         store, destination, snap, len(info["manifest"])
     )
     assert admitted_manifest["id"] == "sha256:" + snap
+    declared = sorted({(row["id"], row["length"]) for row in closure})
+    pull = tensorfs.fetch_plan(
+        destination,
+        "wheel-runtime-closure",
+        snap,
+        len(info["manifest"]),
+        declared,
+    )
+    assert not pull["wanted"]
+    assert tensorfs.fetch_complete_cozytensors(destination, pull["document"]) == (
+        len(info["manifest"]) + sum(length for _, length in declared)
+    )
     # The construction document is assembled from the config bytes the header names;
     # its digest is what the hub's header route and cozy-runtime compute from the same bytes.
     configs = {name: bytes(store.document(row["sha256"])) for name, row in header["configs"].items()}

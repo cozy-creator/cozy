@@ -16,7 +16,7 @@ element sizes come from `DTYPES`, which is the compiled dtype enum, exported onc
     slots = [torch.empty(SLOT, dtype=torch.uint8, pin_memory=True) for _ in range(4)]
     views = [memoryview(s.numpy()) for s in slots]
 
-    with store.acquire_manifest(manifest_id) as lease:
+    with store.acquire_cozytensors(manifest_id) as lease:
         def on_batch(b: tensorfs.Batch) -> None:
             copy_h2d(slots[b.slot][: b.nbytes])   # asynchronous
             b.release()                            # after the completion event

@@ -31,6 +31,12 @@ Three schemas are STORED — written to a path, digested, and identified by thei
 2. Manifest JSON, typed by `manifests/`.
 3. `cozytensors/1`, the portable CBOR tensor header, stored as a blob.
 
+A model Manifest selects at most one typed CozyTensors entry and may also carry ordinary files
+such as a README, license, or sample image. `Store.walk_cozytensors` and
+`Store.acquire_cozytensors` cover only the selected header and its transitive configs, model
+assets, and tensor parts. The existing `Store.walk` and `Store.acquire_manifest` retain their
+full-snapshot meaning, including every ordinary sibling.
+
 Those three are the durable format contract. They are not the whole document inventory, and
 this file used to claim they were. Nine further canonical grammars cross a process boundary
 without being stored under their own path — `corpus.rs` `DOC_KINDS` enumerates them and the
