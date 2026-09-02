@@ -761,9 +761,9 @@ fn execute_prepared(
         .collect();
     sources.sort();
     sources.dedup();
-    let evidence = CheckpointEvidence {
-        digests: crate::checkpoint::digests(store, &outcome.header)?,
-        ingest: Some(IngestProvenance {
+    let evidence = CheckpointEvidence::new(
+        Some(crate::checkpoint::digests(store, &outcome.header)?),
+        Some(IngestProvenance {
             source_dialect: prepared.conv.dialect.to_string(),
             converter_build: converter_build.clone(),
             converter_recipe: recipe_ref.clone(),
@@ -771,11 +771,11 @@ fn execute_prepared(
             source_uri: Some(source_uri.to_string()),
             declared_license: (!declared_license.is_empty()).then(|| declared_license.to_string()),
         }),
-        verification: Some(VerificationEvidence::ApprovedProducer {
+        Some(VerificationEvidence::ApprovedProducer {
             implementation: converter_build,
             recipe: recipe_ref,
         }),
-    };
+    );
     let evidence_bytes = evidence.canonical_bytes();
     CheckpointEvidence::parse(&evidence_bytes)?;
     Ok((manifest, evidence_bytes))
@@ -1036,7 +1036,7 @@ fn validate_prepared_result(store: &Store, source: &PreparedModelSource) -> Resu
     })?;
     let header = crate::checkpoint::load_header(store, header_ref)?;
     crate::repository::require_digests(
-        &evidence.digests,
+        evidence.digests()?.as_ref(),
         &crate::checkpoint::digests(store, &header)?,
     )?;
     for (path, required) in evidence.required_files()? {
@@ -1354,7 +1354,7 @@ mod tests {
             store.read_manifest(&reference).unwrap();
             let evidence =
                 CheckpointEvidence::parse(&source.checkpoint_evidence_canonical_bytes).unwrap();
-            let ingest = evidence.ingest.as_ref().unwrap();
+            let ingest = evidence.ingest().unwrap().unwrap();
             assert_eq!(
                 ingest.source_uri.as_deref(),
                 Some(request.source_uri.as_str())
@@ -1364,7 +1364,7 @@ mod tests {
                 Some(request.declared_license.as_str())
             );
             assert!(matches!(
-                evidence.verification,
+                evidence.verification().unwrap(),
                 Some(VerificationEvidence::ApprovedProducer { ref implementation, ref recipe })
                     if implementation == &ingest.converter_build
                         && recipe == &ingest.converter_recipe

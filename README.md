@@ -1,6 +1,6 @@
 # TensorFS
 
-The current release is `0.1.0`.
+The current release is `0.1.1`.
 
 TensorFS stores every domain repository as the same graph:
 
@@ -203,9 +203,15 @@ union (`bytes_total`), `bytes_unique_sum`, `bytes_unreferenced` (verified blobs 
 reaches) and `repos`. Manifests are not counted; a blob counts once per repository however many
 paths list it.
 
-Evidence is present only for a Manifest containing one typed CozyTensors header, and its three
-digests are re-derived from that header on every read. Ordinary files carry no digests. Rebuild always recovers the repository, Manifest, and complete
-reached blob set;
+A checkpoint row's `evidence` is ingest provenance — source dialect, converter build and recipe,
+source digests, the verification verdict, and the three header-derived digests (`topology_digest`,
+`shape_digest`, `config_digest`) — and it is informational: serving reads the manifest and the
+header, never evidence. Reading is total: every evidence key is optional, unknown keys are ignored,
+an absent digest answers "unknown". Only writers require more: `repo apply` refuses a CozyTensors
+checkpoint row whose evidence lacks the digests or whose digests differ from the header's (the row
+it authors is what the catalog serves `fit` from), and ingest provenance must name its verdict.
+`repo migrate` re-derives the three digests for every row and rewrites in the current shape.
+Rebuild always recovers the repository, Manifest, and complete reached blob set;
 model headers additionally recover the diagnostic projection emitted by `store rebuild --rows`.
 
 ## Reviewed source planning and ingest

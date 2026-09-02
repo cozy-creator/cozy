@@ -101,38 +101,214 @@ pub enum VerificationEvidence {
     },
 }
 
-/// What the checkpoint row carries beside its manifest: the three digests tfs derives from
-/// the header (design §2 — identity, the fit index, the construction document), and, when
-/// the checkpoint came through the ingest border, its bounded provenance and one receipt
-/// verdict. Rust always re-derives the digests from the exact header; a row that disagrees
-/// with its header is refused, never believed.
+/// A typed view a reader cannot form — a key it needs is absent, or a vocabulary it has never
+/// seen — is "unknown", never a refusal. A key that is present and malformed still refuses:
+/// leniency is about what is missing, never about believing garbage.
+fn understood<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(refusal) if matches!(refusal.code, Code::MISSING_FIELD | Code::UNKNOWN_FIELD) => {
+            Ok(None)
+        }
+        Err(refusal) => Err(refusal),
+    }
+}
+
+impl IngestProvenance {
+    fn from_value(value: &Value) -> Result<Self> {
+        let mut ingest = Fields::new("Release.evidence.ingest", value)?;
+        let converter_build = prefixed(
+            "Release.evidence.ingest.converter_build",
+            ingest.req_str("converter_build")?,
+        )?;
+        let converter_recipe = ObjectRef::from_value(
+            "Release.evidence.ingest.converter_recipe",
+            ingest.req("converter_recipe")?,
+        )?;
+        let source_dialect = ingest.req_str("source_dialect")?.to_string();
+        ascii_name(
+            "Release.evidence.ingest.source_dialect",
+            &source_dialect,
+            128,
+        )?;
+        let mut sources = Vec::new();
+        for value in as_arr("Release.evidence.ingest", "sources", ingest.req("sources")?)? {
+            let mut source = Fields::new("Release.evidence.ingest.source", value)?;
+            let generation = source.req_uint("generation")?;
+            let digest = prefixed(
+                "Release.evidence.ingest.source.digest",
+                source.req_str("digest")?,
+            )?;
+            sources.push((digest, generation));
+        }
+        let source_uri = ingest
+            .opt("source_uri")
+            .map(|value| as_str("Release.evidence.ingest", "source_uri", value).map(str::to_string))
+            .transpose()?;
+        if let Some(value) = &source_uri {
+            bounded_fact("Release.evidence.ingest.source_uri", value, 2048)?;
+            if value.contains('?') || value.contains('#') {
+                return refuse(
+                    Code::KEY_GRAMMAR,
+                    "ingest source_uri must be canonical and query/fragment-free",
+                );
+            }
+        }
+        let declared_license = ingest
+            .opt("declared_license")
+            .map(|value| {
+                as_str("Release.evidence.ingest", "declared_license", value).map(str::to_string)
+            })
+            .transpose()?;
+        if let Some(value) = &declared_license {
+            bounded_fact("Release.evidence.ingest.declared_license", value, 512)?;
+        }
+        if sources.is_empty() || sources.len() > 256 {
+            return refuse(
+                Code::COUNT_CAP,
+                "ingest provenance source count is outside 1..=256",
+            );
+        }
+        if sources.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return refuse(
+                Code::SORT_ORDER,
+                "ingest provenance sources must be sorted and unique",
+            );
+        }
+        Ok(Self {
+            source_dialect,
+            converter_build,
+            converter_recipe,
+            sources,
+            source_uri,
+            declared_license,
+        })
+    }
+
+    fn to_value(&self) -> Value {
+        let mut fields = vec![
+            ("converter_build", Value::str(self.converter_build.clone())),
+            ("converter_recipe", self.converter_recipe.to_value()),
+            ("source_dialect", Value::str(self.source_dialect.clone())),
+            (
+                "sources",
+                Value::arr(
+                    self.sources
+                        .iter()
+                        .map(|(digest, generation)| {
+                            Value::obj(vec![
+                                ("digest", Value::str(digest.clone())),
+                                ("generation", Value::uint(*generation)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+        ];
+        if let Some(value) = &self.source_uri {
+            fields.push(("source_uri", Value::str(value.clone())));
+        }
+        if let Some(value) = &self.declared_license {
+            fields.push(("declared_license", Value::str(value.clone())));
+        }
+        Value::obj(fields)
+    }
+}
+
+impl VerificationEvidence {
+    fn from_value(value: &Value) -> Result<Self> {
+        let mut verification = Fields::new("Release.evidence.verification", value)?;
+        match verification.req_str("kind")? {
+            "approved_producer" => Ok(Self::ApprovedProducer {
+                implementation: prefixed(
+                    "Release.evidence.verification.implementation",
+                    verification.req_str("implementation")?,
+                )?,
+                recipe: ObjectRef::from_value(
+                    "Release.evidence.verification.recipe",
+                    verification.req("recipe")?,
+                )?,
+            }),
+            "independent_numerical" => Ok(Self::IndependentNumerical {
+                verifier_build: prefixed(
+                    "Release.evidence.verification.verifier_build",
+                    verification.req_str("verifier_build")?,
+                )?,
+                report: ObjectRef::from_value(
+                    "Release.evidence.verification.report",
+                    verification.req("report")?,
+                )?,
+            }),
+            _ => refuse(Code::UNKNOWN_FIELD, "release verification kind is unknown"),
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        match self {
+            Self::ApprovedProducer {
+                implementation,
+                recipe,
+            } => Value::obj(vec![
+                ("implementation", Value::str(implementation.clone())),
+                ("kind", Value::str("approved_producer")),
+                ("recipe", recipe.to_value()),
+            ]),
+            Self::IndependentNumerical {
+                verifier_build,
+                report,
+            } => Value::obj(vec![
+                ("kind", Value::str("independent_numerical")),
+                ("report", report.to_value()),
+                ("verifier_build", Value::str(verifier_build.clone())),
+            ]),
+        }
+    }
+}
+
+/// Ingest provenance a checkpoint row carries beside its manifest. Informational: serving
+/// reads the manifest and the header, never this. It records where the checkpoint came from
+/// (`ingest`: source dialect, converter build and recipe, source digests, canonical origin,
+/// declared license), the receipt verdict the ingest border reached (`verification`), and the
+/// three digests tfs derived from the header at write time (`digests`: topology identity,
+/// the dtype-elided shape digest the fit index joins on, the construction document's digest).
+///
+/// The row carries the exact canonical object it was written with — stored bytes are the
+/// canonical bytes, so a reader re-emits what it read, including keys it does not know — and
+/// the typed views are formed on demand. Reading is total: an absent or unknown key answers
+/// "unknown", and only a key that is present and malformed refuses, at the view that needs
+/// it. Only writers require more: `apply` stores a CozyTensors checkpoint row with the digests
+/// tfs derives from the resident header and refuses a supplied digest that differs
+/// (`authored`); the admission seam requires the published row to carry them
+/// (`require_digests`); `required_files` refuses ingest provenance without its verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointEvidence {
-    pub digests: Digests,
-    pub ingest: Option<IngestProvenance>,
-    pub verification: Option<VerificationEvidence>,
+    value: Value,
 }
 
 impl CheckpointEvidence {
-    pub fn required_files(&self) -> Result<Vec<(&'static str, ObjectRef)>> {
-        let Some(ingest) = &self.ingest else {
-            return Ok(Vec::new());
-        };
-        let mut files = vec![("evidence/converter-recipe", ingest.converter_recipe.clone())];
-        match self.verification.as_ref().expect("validated evidence pair") {
-            VerificationEvidence::ApprovedProducer { recipe, .. } => {
-                if recipe != &ingest.converter_recipe {
-                    return refuse(
-                        Code::OBJECT_ID_MISMATCH,
-                        "approved-producer recipe differs from ingest converter recipe",
-                    );
-                }
+    /// What a writer records: the current shape, every part it holds.
+    pub fn new(
+        digests: Option<Digests>,
+        ingest: Option<IngestProvenance>,
+        verification: Option<VerificationEvidence>,
+    ) -> Self {
+        let mut fields = Vec::new();
+        if let Some(digests) = digests {
+            if let Some(config) = digests.config_digest {
+                fields.push(("config_digest", Value::str(config)));
             }
-            VerificationEvidence::IndependentNumerical { report, .. } => {
-                files.push(("evidence/verification-report", report.clone()));
-            }
+            fields.push(("shape_digest", Value::str(digests.shape_digest)));
+            fields.push(("topology_digest", Value::str(digests.topology_digest)));
         }
-        Ok(files)
+        if let Some(ingest) = ingest {
+            fields.push(("ingest", ingest.to_value()));
+        }
+        if let Some(verification) = verification {
+            fields.push(("verification", verification.to_value()));
+        }
+        Self {
+            value: Value::obj(fields),
+        }
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -140,230 +316,136 @@ impl CheckpointEvidence {
         Self::from_value(&value)
     }
 
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        crate::canon::write(&self.to_value())
-    }
-
     fn from_value(v: &Value) -> Result<Self> {
-        let mut fields = Fields::new("Release.evidence", v)?;
-        let digests = Digests {
-            config_digest: fields
-                .opt("config_digest")
-                .map(|value| {
-                    prefixed(
-                        "Release.evidence.config_digest",
-                        as_str("Release.evidence", "config_digest", value)?,
-                    )
-                })
-                .transpose()?,
-            shape_digest: prefixed(
-                "Release.evidence.shape_digest",
-                fields.req_str("shape_digest")?,
-            )?,
-            topology_digest: prefixed(
-                "Release.evidence.topology_digest",
-                fields.req_str("topology_digest")?,
-            )?,
-        };
-        let ingest = fields
-            .opt("ingest")
-            .map(|value| {
-                let mut ingest = Fields::new("Release.evidence.ingest", value)?;
-                let converter_build = prefixed(
-                    "Release.evidence.ingest.converter_build",
-                    ingest.req_str("converter_build")?,
-                )?;
-                let converter_recipe = ObjectRef::from_value(
-                    "Release.evidence.ingest.converter_recipe",
-                    ingest.req("converter_recipe")?,
-                )?;
-                let source_dialect = ingest.req_str("source_dialect")?.to_string();
-                ascii_name(
-                    "Release.evidence.ingest.source_dialect",
-                    &source_dialect,
-                    128,
-                )?;
-                let mut sources = Vec::new();
-                for value in as_arr("Release.evidence.ingest", "sources", ingest.req("sources")?)? {
-                    let mut source = Fields::new("Release.evidence.ingest.source", value)?;
-                    let generation = source.req_uint("generation")?;
-                    let digest = prefixed(
-                        "Release.evidence.ingest.source.digest",
-                        source.req_str("digest")?,
-                    )?;
-                    source.done()?;
-                    sources.push((digest, generation));
-                }
-                let source_uri = ingest
-                    .opt("source_uri")
-                    .map(|value| {
-                        as_str("Release.evidence.ingest", "source_uri", value).map(str::to_string)
-                    })
-                    .transpose()?;
-                if let Some(value) = &source_uri {
-                    bounded_fact("Release.evidence.ingest.source_uri", value, 2048)?;
-                    if value.contains('?') || value.contains('#') {
-                        return refuse(
-                            Code::KEY_GRAMMAR,
-                            "ingest source_uri must be canonical and query/fragment-free",
-                        );
-                    }
-                }
-                let declared_license = ingest
-                    .opt("declared_license")
-                    .map(|value| {
-                        as_str("Release.evidence.ingest", "declared_license", value)
-                            .map(str::to_string)
-                    })
-                    .transpose()?;
-                if let Some(value) = &declared_license {
-                    bounded_fact("Release.evidence.ingest.declared_license", value, 512)?;
-                }
-                ingest.done()?;
-                if sources.is_empty() || sources.len() > 256 {
-                    return refuse(
-                        Code::COUNT_CAP,
-                        "ingest provenance source count is outside 1..=256",
-                    );
-                }
-                if sources.windows(2).any(|pair| pair[0] >= pair[1]) {
-                    return refuse(
-                        Code::SORT_ORDER,
-                        "ingest provenance sources must be sorted and unique",
-                    );
-                }
-                Ok(IngestProvenance {
-                    source_dialect,
-                    converter_build,
-                    converter_recipe,
-                    sources,
-                    source_uri,
-                    declared_license,
-                })
-            })
-            .transpose()?;
-        let verification = fields
-            .opt("verification")
-            .map(|value| {
-                let mut verification = Fields::new("Release.evidence.verification", value)?;
-                let kind = verification.req_str("kind")?;
-                let result = match kind {
-                    "approved_producer" => VerificationEvidence::ApprovedProducer {
-                        implementation: prefixed(
-                            "Release.evidence.verification.implementation",
-                            verification.req_str("implementation")?,
-                        )?,
-                        recipe: ObjectRef::from_value(
-                            "Release.evidence.verification.recipe",
-                            verification.req("recipe")?,
-                        )?,
-                    },
-                    "independent_numerical" => VerificationEvidence::IndependentNumerical {
-                        verifier_build: prefixed(
-                            "Release.evidence.verification.verifier_build",
-                            verification.req_str("verifier_build")?,
-                        )?,
-                        report: ObjectRef::from_value(
-                            "Release.evidence.verification.report",
-                            verification.req("report")?,
-                        )?,
-                    },
-                    _ => {
-                        return refuse(Code::UNKNOWN_FIELD, "release verification kind is unknown")
-                    }
-                };
-                verification.done()?;
-                Ok(result)
-            })
-            .transpose()?;
-        if ingest.is_some() != verification.is_some() {
-            return refuse(
-                Code::MISSING_FIELD,
-                "ingest provenance and verification must be present together",
-            );
-        }
-        fields.done()?;
-        let evidence = Self {
-            digests,
-            ingest,
-            verification,
-        };
-        if crate::canon::write(&evidence.to_value()).len() > MAX_EVIDENCE_BYTES {
+        Fields::new("Release.evidence", v)?;
+        if crate::canon::write(v).len() > MAX_EVIDENCE_BYTES {
             return refuse(Code::SIZE_CAP, "release evidence exceeds 64 KiB");
         }
-        Ok(evidence)
+        Ok(Self { value: v.clone() })
     }
 
     pub fn to_value(&self) -> Value {
-        let mut fields = vec![
-            (
-                "shape_digest",
-                Value::str(self.digests.shape_digest.clone()),
-            ),
+        self.value.clone()
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::canon::write(&self.value)
+    }
+
+    fn field(&self, key: &str) -> Option<&Value> {
+        let Value::Obj(fields) = &self.value else {
+            return None;
+        };
+        fields
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value)
+    }
+
+    fn digest(&self, key: &str) -> Result<Option<String>> {
+        self.field(key)
+            .map(|value| prefixed("Release.evidence", as_str("Release.evidence", key, value)?))
+            .transpose()
+    }
+
+    /// The header-derived digests, when the row carries the topology/shape pair.
+    pub fn digests(&self) -> Result<Option<Digests>> {
+        Ok(
+            match (
+                self.digest("topology_digest")?,
+                self.digest("shape_digest")?,
+            ) {
+                (Some(topology_digest), Some(shape_digest)) => Some(Digests {
+                    topology_digest,
+                    shape_digest,
+                    config_digest: self.digest("config_digest")?,
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn ingest(&self) -> Result<Option<IngestProvenance>> {
+        self.field("ingest")
+            .map(|value| understood(IngestProvenance::from_value(value)))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn verification(&self) -> Result<Option<VerificationEvidence>> {
+        self.field("verification")
+            .map(|value| understood(VerificationEvidence::from_value(value)))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// The row a writer stores for a checkpoint whose header is at hand: the digests are
+    /// tfs's own derivation — a supplied digest that differs is refused, an absent one is
+    /// filled in — beside the provenance the caller supplied, in the current shape.
+    pub fn authored(&self, derived: &Digests) -> Result<Self> {
+        for (name, claimed, derived) in [
             (
                 "topology_digest",
-                Value::str(self.digests.topology_digest.clone()),
+                self.digest("topology_digest")?,
+                Some(&derived.topology_digest),
             ),
-        ];
-        if let Some(config) = &self.digests.config_digest {
-            fields.push(("config_digest", Value::str(config.clone())));
-        }
-        if let Some(ingest) = &self.ingest {
-            let mut ingest_fields = vec![
-                (
-                    "converter_build",
-                    Value::str(ingest.converter_build.clone()),
-                ),
-                ("converter_recipe", ingest.converter_recipe.to_value()),
-                ("source_dialect", Value::str(ingest.source_dialect.clone())),
-                (
-                    "sources",
-                    Value::arr(
-                        ingest
-                            .sources
-                            .iter()
-                            .map(|(digest, generation)| {
-                                Value::obj(vec![
-                                    ("digest", Value::str(digest.clone())),
-                                    ("generation", Value::uint(*generation)),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                ),
-            ];
-            if let Some(value) = &ingest.source_uri {
-                ingest_fields.push(("source_uri", Value::str(value.clone())));
+            (
+                "shape_digest",
+                self.digest("shape_digest")?,
+                Some(&derived.shape_digest),
+            ),
+            (
+                "config_digest",
+                self.digest("config_digest")?,
+                derived.config_digest.as_ref(),
+            ),
+        ] {
+            if let Some(claimed) = claimed {
+                if Some(&claimed) != derived {
+                    return refuse(
+                        Code::TOPOLOGY_MISMATCH,
+                        format!(
+                            "checkpoint evidence {name} {claimed} differs from the checkpoint's {}",
+                            derived.map_or("absent", String::as_str)
+                        ),
+                    );
+                }
             }
-            if let Some(value) = &ingest.declared_license {
-                ingest_fields.push(("declared_license", Value::str(value.clone())));
+        }
+        Ok(Self::new(
+            Some(derived.clone()),
+            self.ingest()?,
+            self.verification()?,
+        ))
+    }
+
+    /// The manifest files ingest provenance names. A writer's rule: provenance without its
+    /// verdict is refused here.
+    pub fn required_files(&self) -> Result<Vec<(&'static str, ObjectRef)>> {
+        let Some(ingest) = self.ingest()? else {
+            return Ok(Vec::new());
+        };
+        let mut files = vec![("evidence/converter-recipe", ingest.converter_recipe.clone())];
+        match self.verification()? {
+            Some(VerificationEvidence::ApprovedProducer { recipe, .. }) => {
+                if recipe != ingest.converter_recipe {
+                    return refuse(
+                        Code::OBJECT_ID_MISMATCH,
+                        "approved-producer recipe differs from ingest converter recipe",
+                    );
+                }
             }
-            fields.push(("ingest", Value::obj(ingest_fields)));
+            Some(VerificationEvidence::IndependentNumerical { report, .. }) => {
+                files.push(("evidence/verification-report", report));
+            }
+            None => {
+                return refuse(
+                    Code::MISSING_FIELD,
+                    "ingest provenance requires its verification verdict",
+                )
+            }
         }
-        if let Some(verification) = &self.verification {
-            fields.push((
-                "verification",
-                match verification {
-                    VerificationEvidence::ApprovedProducer {
-                        implementation,
-                        recipe,
-                    } => Value::obj(vec![
-                        ("implementation", Value::str(implementation.clone())),
-                        ("kind", Value::str("approved_producer")),
-                        ("recipe", recipe.to_value()),
-                    ]),
-                    VerificationEvidence::IndependentNumerical {
-                        verifier_build,
-                        report,
-                    } => Value::obj(vec![
-                        ("kind", Value::str("independent_numerical")),
-                        ("report", report.to_value()),
-                        ("verifier_build", Value::str(verifier_build.clone())),
-                    ]),
-                },
-            ));
-        }
-        Value::obj(fields)
+        Ok(files)
     }
 }
 
@@ -1071,10 +1153,16 @@ impl Mutation {
     }
 }
 
-/// The row's digests must be what the checkpoint derives, all three. A caller that
-/// transcribes a stale or foreign digest into evidence is refused here rather than indexed
-/// wrong.
-pub fn require_digests(claimed: &Digests, derived: &Digests) -> Result<()> {
+/// A published row must carry the digests, and they must be what the checkpoint derives, all
+/// three: the admission seam and the receipt writers check the row they are about to serve
+/// against the header, so a stale or foreign transcription is refused rather than indexed.
+pub fn require_digests(claimed: Option<&Digests>, derived: &Digests) -> Result<()> {
+    let Some(claimed) = claimed else {
+        return refuse(
+            Code::MISSING_FIELD,
+            "checkpoint evidence carries no topology_digest/shape_digest",
+        );
+    };
     let absent = "absent".to_string();
     for (name, c, d) in [
         (
@@ -1102,6 +1190,11 @@ pub fn require_digests(claimed: &Digests, derived: &Digests) -> Result<()> {
 /// Apply against the exact bytes the caller observed. The returned `None` means conditional
 /// repository deletion; `Some` is the exact replacement body. The backend supplies the
 /// observed bytes/ETag as its CAS precondition, never an embedded generation number.
+///
+/// `derived` is what the resident header digests to, and it is the writer's: a CozyTensors
+/// checkpoint row is stored with those digests whether or not the incoming evidence carried
+/// them (`CheckpointEvidence::authored`), so a document from a hub or a peer written under
+/// an older vocabulary commits, and a digest it does claim must agree.
 pub fn apply(
     current: Option<&[u8]>,
     mutation: &Mutation,
@@ -1129,28 +1222,25 @@ pub fn apply(
                     "local repositories require replace_local",
                 );
             }
-            match (evidence.as_deref(), derived) {
-                (Some(evidence), Some(derived)) => require_digests(&evidence.digests, derived)?,
-                (None, None) => {}
+            let evidence = match (evidence.as_deref(), derived) {
+                (Some(evidence), Some(derived)) => Some(evidence.authored(derived)?),
+                (None, Some(derived)) => {
+                    Some(CheckpointEvidence::new(Some(derived.clone()), None, None))
+                }
+                (None, None) => None,
                 (Some(_), None) => {
                     return refuse(
                         Code::ATTACHMENT_CARDINALITY,
                         "model evidence requires one CozyTensors manifest entry",
                     )
                 }
-                (None, Some(_)) => {
-                    return refuse(
-                        Code::MISSING_FIELD,
-                        "a CozyTensors checkpoint requires model evidence",
-                    )
-                }
-            }
+            };
             Ok(Some(
                 existing
                     .unwrap_or_else(|| Repository::empty(repo.clone()))
                     .put_checkpoint(Checkpoint {
                         manifest: manifest.clone(),
-                        evidence: evidence.as_deref().cloned(),
+                        evidence,
                         published: false,
                         source_selection: None,
                     })?,
@@ -1222,11 +1312,10 @@ pub fn apply(
                 code: Code::MISSING_FIELD,
                 detail: "a local CozyTensors alias requires the header-derived digests".into(),
             })?;
-            require_digests(&evidence.digests, derived)?;
             let repository = Repository {
                 checkpoints: vec![Checkpoint {
                     manifest: manifest.clone(),
-                    evidence: Some((**evidence).clone()),
+                    evidence: Some(evidence.authored(derived)?),
                     published: false,
                     source_selection: Some(version.clone()),
                 }],
@@ -1263,11 +1352,7 @@ mod tests {
     }
 
     fn evidence(seed: u8) -> CheckpointEvidence {
-        CheckpointEvidence {
-            digests: seeded(seed),
-            ingest: None,
-            verification: None,
-        }
+        CheckpointEvidence::new(Some(seeded(seed)), None, None)
     }
 
     fn lane(lane: &str, seed: u8) -> ReleaseLane {
@@ -1448,8 +1533,17 @@ mod tests {
         let bad = String::from_utf8(good)
             .unwrap()
             .replace("sha256:0101", "0101010101");
+        // The document reads (evidence is informational); the digest view refuses.
+        let read = Repository::parse(bad.as_bytes()).unwrap();
+        assert_eq!(read.canonical_bytes(), bad.as_bytes());
         assert_eq!(
-            Repository::parse(bad.as_bytes()).unwrap_err().code,
+            read.checkpoints[0]
+                .evidence
+                .as_ref()
+                .unwrap()
+                .digests()
+                .unwrap_err()
+                .code,
             Code::MALFORMED_DIGEST
         );
     }
@@ -1514,30 +1608,37 @@ mod tests {
             length: 12,
         };
         let source_uri = format!("hf://org/model@{}", "88".repeat(20));
-        let evidence = CheckpointEvidence {
-            digests: seeded(0x55),
-            ingest: Some(IngestProvenance {
-                source_dialect: "safetensors.diffusers".into(),
-                converter_build: format!("sha256:{}", "66".repeat(32)),
-                converter_recipe: recipe.clone(),
-                sources: vec![(format!("sha256:{}", "77".repeat(32)), 1)],
-                source_uri: Some(source_uri.clone()),
-                declared_license: Some("apache-2.0".into()),
-            }),
-            verification: Some(VerificationEvidence::ApprovedProducer {
-                implementation: format!("sha256:{}", "66".repeat(32)),
-                recipe,
-            }),
+        let ingest = IngestProvenance {
+            source_dialect: "safetensors.diffusers".into(),
+            converter_build: format!("sha256:{}", "66".repeat(32)),
+            converter_recipe: recipe.clone(),
+            sources: vec![(format!("sha256:{}", "77".repeat(32)), 1)],
+            source_uri: Some(source_uri.clone()),
+            declared_license: Some("apache-2.0".into()),
         };
+        let evidence = CheckpointEvidence::new(
+            Some(seeded(0x55)),
+            Some(ingest.clone()),
+            Some(VerificationEvidence::ApprovedProducer {
+                implementation: format!("sha256:{}", "66".repeat(32)),
+                recipe: recipe.clone(),
+            }),
+        );
+        let read = CheckpointEvidence::parse(&evidence.canonical_bytes()).unwrap();
+        assert_eq!(read, evidence);
+        assert_eq!(read.digests().unwrap(), Some(seeded(0x55)));
+        assert_eq!(read.ingest().unwrap(), Some(ingest));
         assert_eq!(
-            CheckpointEvidence::parse(&evidence.canonical_bytes()).unwrap(),
-            evidence
+            read.required_files().unwrap(),
+            vec![("evidence/converter-recipe", recipe)]
         );
         let with_query = String::from_utf8(evidence.canonical_bytes())
             .unwrap()
             .replace(&source_uri, &format!("{source_uri}?token=secret"));
         assert_eq!(
             CheckpointEvidence::parse(with_query.as_bytes())
+                .unwrap()
+                .ingest()
                 .unwrap_err()
                 .code,
             Code::KEY_GRAMMAR

@@ -675,6 +675,10 @@ impl Census {
         ));
     }
 
+    /// The admission seam's rule for the row a publisher authors: a CozyTensors checkpoint
+    /// carries evidence whose digests are the header's, and provenance names manifest files.
+    /// A rebuild (`project_checkpoint`) never asks this — the index is derived from the
+    /// header, and provenance is informational.
     fn require_checkpoint_evidence(
         manifest: &Manifest,
         checkpoint: &Checkpoint,
@@ -682,7 +686,7 @@ impl Census {
     ) -> Result<()> {
         match (&facts.digests, &checkpoint.evidence) {
             (Some(derived), Some(evidence)) => {
-                crate::repository::require_digests(&evidence.digests, derived)?;
+                crate::repository::require_digests(evidence.digests()?.as_ref(), derived)?;
                 for (path, required) in evidence.required_files()? {
                     match manifest.entries().iter().find(|(candidate, _)| candidate == path) {
                         Some((_, Entry::File(actual))) if actual == &required => {}
@@ -1054,7 +1058,6 @@ impl Census {
             },
             &self.inventory,
         )?;
-        Self::require_checkpoint_evidence(manifest, checkpoint, &facts)?;
         Self::append_checkpoint_facts(repository, checkpoint, facts, projection);
         Ok(())
     }
@@ -1508,11 +1511,11 @@ mod tests {
     fn evidence(store: &Store, manifest: &ObjectRef) -> CheckpointEvidence {
         let manifest = store.read_manifest(manifest).unwrap();
         let header = crate::checkpoint::load_header(store, manifest.header().unwrap()).unwrap();
-        CheckpointEvidence {
-            digests: crate::checkpoint::digests(store, &header).unwrap(),
-            ingest: None,
-            verification: None,
-        }
+        CheckpointEvidence::new(
+            Some(crate::checkpoint::digests(store, &header).unwrap()),
+            None,
+            None,
+        )
     }
 
     fn apply_release(
@@ -1660,11 +1663,11 @@ mod tests {
         let manifest = Manifest::parse(&manifest_bytes).unwrap();
         let header_ref = manifest.header().unwrap();
         let header_bytes = fs::read(store.blob_path(&header_ref.sha256)).unwrap();
-        let checkpoint_evidence = CheckpointEvidence {
-            digests: Header::parse(&header_bytes).unwrap().digests(&[]).unwrap(),
-            ingest: None,
-            verification: None,
-        };
+        let checkpoint_evidence = CheckpointEvidence::new(
+            Some(Header::parse(&header_bytes).unwrap().digests(&[]).unwrap()),
+            None,
+            None,
+        );
         let lane = ReleaseLane {
             lane: "cpu".into(),
             manifest: manifest_ref.clone(),
@@ -1716,9 +1719,9 @@ mod tests {
             .obj;
         let evidence_checkpoint = Checkpoint {
             manifest: lane.manifest.clone(),
-            evidence: Some(CheckpointEvidence {
-                digests: Header::parse(&header_bytes).unwrap().digests(&[]).unwrap(),
-                ingest: Some(IngestProvenance {
+            evidence: Some(CheckpointEvidence::new(
+                Some(Header::parse(&header_bytes).unwrap().digests(&[]).unwrap()),
+                Some(IngestProvenance {
                     source_dialect: "cozytensors".into(),
                     converter_build: format!("sha256:{}", "22".repeat(32)),
                     converter_recipe: recipe.clone(),
@@ -1726,11 +1729,11 @@ mod tests {
                     source_uri: None,
                     declared_license: None,
                 }),
-                verification: Some(VerificationEvidence::ApprovedProducer {
+                Some(VerificationEvidence::ApprovedProducer {
                     implementation: format!("sha256:{}", "22".repeat(32)),
                     recipe,
                 }),
-            }),
+            )),
             published: false,
             source_selection: None,
         };

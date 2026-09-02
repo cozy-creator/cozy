@@ -79,11 +79,7 @@ fn model_fixture(store: &Store, value: [u8; 4]) -> (ObjectRef, CheckpointEvidenc
         )],
     };
     header.validate(&Closure::default()).unwrap();
-    let evidence = CheckpointEvidence {
-        digests: header.digests(&[]).unwrap(),
-        ingest: None,
-        verification: None,
-    };
+    let evidence = CheckpointEvidence::new(Some(header.digests(&[]).unwrap()), None, None);
     let bytes = header.canonical_bytes().unwrap();
     let header = store
         .put_stream(
@@ -126,11 +122,11 @@ fn apply_release(
                     .header()
                     .map(|header| {
                         tensorfs_core::checkpoint::load_header(store, header).and_then(|header| {
-                            Ok(Box::new(CheckpointEvidence {
-                                digests: tensorfs_core::checkpoint::digests(store, &header)?,
-                                ingest: None,
-                                verification: None,
-                            }))
+                            Ok(Box::new(CheckpointEvidence::new(
+                                Some(tensorfs_core::checkpoint::digests(store, &header)?),
+                                None,
+                                None,
+                            )))
                         })
                     })
                     .transpose()?,
@@ -313,7 +309,12 @@ fn expected_local_contract_gates_positive_mismatch_replay_and_cas() {
     let repo = tensorfs_core::repository::RepositoryName::new("local", "contract").unwrap();
     let (manifest_a, evidence_a) = model_fixture(&store, [0, 0, 0, 0]);
     let (manifest_b, evidence_b) = model_fixture(&store, [0, 0, 128, 63]);
-    let topology = evidence_b.digests.topology_digest.clone();
+    let topology = evidence_b
+        .digests()
+        .unwrap()
+        .unwrap()
+        .topology_digest
+        .clone();
     let encoding = tensorfs_core::registry::seeds()
         .into_iter()
         .find(|seed| seed.alias == "plain/1")
@@ -935,14 +936,16 @@ fn committed_repo_apply_fixture_is_the_cross_process_projection_seam() {
     fs::create_dir_all(&root).unwrap();
     let manifest_bytes = fs::read(fixture.join("manifest.json")).unwrap();
     let manifest = ObjectRef::of(&manifest_bytes);
-    let checkpoint_evidence = CheckpointEvidence {
-        digests: Header::parse(&fs::read(fixture.join("header.cbor")).unwrap())
-            .unwrap()
-            .digests(&[])
-            .unwrap(),
-        ingest: None,
-        verification: None,
-    };
+    let checkpoint_evidence = CheckpointEvidence::new(
+        Some(
+            Header::parse(&fs::read(fixture.join("header.cbor")).unwrap())
+                .unwrap()
+                .digests(&[])
+                .unwrap(),
+        ),
+        None,
+        None,
+    );
     let checkpoint_mutation_path = root.join("checkpoint-mutation.json");
     fs::write(
         &checkpoint_mutation_path,
