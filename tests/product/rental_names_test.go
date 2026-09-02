@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -20,7 +21,7 @@ import (
 // records the paid operation, against every rental row and unsettled operation it holds.
 func TestRentalMachineNames(t *testing.T) {
 	words := rentalid.Words()
-	if len(words) < 300 || !sort.StringsAreSorted(words) {
+	if len(words) < 5000 || !sort.StringsAreSorted(words) {
 		t.Fatalf("the vocabulary holds %d words", len(words))
 	}
 	for i, word := range words {
@@ -31,6 +32,39 @@ func TestRentalMachineNames(t *testing.T) {
 			if other == word || oneLetterApart(word, other) {
 				t.Fatalf("%q and %q would be confused when typed from memory", word, other)
 			}
+		}
+	}
+
+	// cl-098's red arm: the vocabulary is anime given names MINUS the top-100
+	// most-popular tier. Every banned name in the generated drop list — and the
+	// Goku/Naruto/Luffy household names by name — must be unmintable forever.
+	raw, err := os.ReadFile(filepath.Join("testdata", "machine-words-dropped.txt"))
+	if err != nil {
+		t.Fatalf("the generated drop list is part of the product: %v", err)
+	}
+	dropped := map[string]bool{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line = strings.TrimSpace(line); line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		dropped[line] = true
+		if at := sort.SearchStrings(words, line); at < len(words) && words[at] == line {
+			t.Fatalf("%q is a dropped top-100 name, yet a rental could be named by it", line)
+		}
+	}
+	if len(dropped) < 50 {
+		t.Fatalf("the drop list holds %d names; the top-100 ban has gone missing", len(dropped))
+	}
+	for _, famous := range []string{"gokuu", "naruto", "luffy", "lelouch", "levi"} {
+		if !dropped[famous] {
+			t.Fatalf("%q is not on the drop list; the top-100 tier is wrong", famous)
+		}
+	}
+	// The household spellings too: "goku" is one letter from the banned "gokuu",
+	// and the generator refuses any word one letter from a banned name.
+	for _, famous := range []string{"goku", "gokuu", "naruto", "luffy", "lelouch", "levi", "zoro"} {
+		if at := sort.SearchStrings(words, famous); at < len(words) && words[at] == famous {
+			t.Fatalf("a rental could be named %q", famous)
 		}
 	}
 
