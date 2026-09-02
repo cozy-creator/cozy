@@ -211,8 +211,12 @@ starting; the download is visible progress, not an interactive prompt. Reusing a
 omitted integer `seed` and hashes the finalized input payload. Files saved under `--out` use that full
 lowercase hash as their filename, so unseeded runs can share one directory without replacing one
 another. The same explicit payload intentionally resolves to the same filename; multi-output results
-append each output field name. The daemon records the destination with the request and publishes the
-verified media after terminal, so closing the command or restarting Cozy does not abandon `--out`.
+append each output field name. The daemon probes the destination writable at submit and refuses typed
+(`output_destination_unwritable`) before any execution; it records the destination with the request
+and publishes the verified media after terminal, so closing the command or restarting Cozy does not
+abandon `--out`. A destination that dies after submit never turns a completed run into a failure:
+the verdict reads `completed (export pending: <code>)` and the daemon keeps retrying the durable
+export.
 
 Local Runtime workers start on demand. Successful serving workers may remain resident for warm
 reuse; job workers are reclaimed at terminal.

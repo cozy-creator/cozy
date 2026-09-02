@@ -7,8 +7,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -216,4 +218,58 @@ func randomSuffix() string {
 func exportIO(format string, args ...any) *exit.Error {
 	return exit.Named(exit.Unavailable, "output_export_io", format, args...).
 		WithRemedy("free space or restore access to the recorded output directory; Cozy retries the durable export")
+}
+
+// Preflight proves the destination can accept a published file BEFORE a request is
+// queued: create-if-absent, then a touch-and-unlink probe in the final directory. It
+// runs in the daemon — the process that later publishes — so it proves the writer's own
+// access, not a client's. A probe that passes is not a reservation; the durable export
+// still handles a destination that dies later.
+func Preflight(directory string) *exit.Error {
+	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
+		return exit.Named(exit.Validation, "output_export_directory_malformed",
+			"output directory %q is not one canonical absolute path", directory)
+	}
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return unwritable(directory, err)
+	}
+	info, err := os.Lstat(directory)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return exit.Named(exit.Conflict, "output_export_directory_substituted",
+			"output directory %s is not a real directory", directory)
+	}
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		return unwritable(directory, err)
+	}
+	defer root.Close()
+	name := ".cozy-probe-" + randomSuffix()
+	probe, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return unwritable(directory, err)
+	}
+	problem := probe.Close()
+	if err := root.Remove(name); problem == nil {
+		problem = err
+	}
+	if problem != nil {
+		return unwritable(directory, problem)
+	}
+	return nil
+}
+
+func unwritable(directory string, err error) *exit.Error {
+	return exit.Named(exit.Validation, "output_destination_unwritable",
+		"output destination %s is not writable: %s", directory, ioCause(err)).
+		WithRemedy("fix permissions on %s (or pick another --out) and resubmit; nothing was queued", directory)
+}
+
+// ioCause strips the probe's own random filename out of the refusal: the caller's
+// remediable fact is the directory and the errno, not a name that never existed.
+func ioCause(err error) error {
+	var pathError *fs.PathError
+	if errors.As(err, &pathError) {
+		return pathError.Err
+	}
+	return err
 }
