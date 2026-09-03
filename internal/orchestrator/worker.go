@@ -584,7 +584,6 @@ func (w *worker) placementFor(slot, planID string) string {
 func (w *worker) remoteDispatchable(placement DesiredPlacement, planID string) bool {
 	observed := w.observedRemote[placement.PlacementIDValue]
 	return placement.PlacementIDValue != "" &&
-		observed.placementSetDigest == placement.PlacementSetDigest &&
 		observed.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
 		observed.dispatchablePlanIDs[planID]
 }
@@ -596,8 +595,7 @@ func (w *worker) remoteStaged(packageName, planID, release, localRevision string
 		return false
 	}
 	observed, ok := w.observedRemote[placement.PlacementIDValue]
-	return ok && observed.placementSetDigest == placement.PlacementSetDigest &&
-		observed.knownPlanIDs[planID]
+	return ok && observed.knownPlanIDs[planID]
 }
 
 func preparedRemotePlacement(w *worker, pkg, release string) (DesiredPlacement, bool, *exit.Error) {
