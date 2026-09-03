@@ -40,6 +40,10 @@ import (
 type JobPlan struct {
 	Function     string
 	DescriptorID string
+	// BuildID is `build_id`: the BUILD this job plan record is written under, and the
+	// value `JobDirective.build_id` must name. See `JobBuildID` for why it is the
+	// preparing placement's own identity and never the PlacementSet digest.
+	BuildID string
 	// Outputs are the job's declared asset result field paths — the output ids the
 	// publication grant names, one destination each. Grants mint off the DECLARATION.
 	Outputs []string
@@ -54,6 +58,48 @@ type JobPlan struct {
 }
 
 const DefaultJobRSSCap int64 = 8 << 30
+
+// JobBuildID reads the BUILD a job plan record is staged under out of the prepared
+// PlacementSet document itself.
+//
+// IT IS NOT THE PlacementSet DIGEST. This owner UNITES the sets several packages
+// prepared into one document (`unitePreparedPlacementSets`), so the set digest a worker
+// would have to compare against is a value that worker cannot know while it is staging
+// its records — and a rented worker stages them itself, from
+// `package_prepare.py::_prepare_published`, before this owner has united anything. The
+// identity a preparation CAN name is its own placement's, and that is what the runtime
+// writes: `environment_digest` for a published preparation, the project wheel's digest
+// for a development one (`package_prepare.py::prepare_package`). This reads exactly
+// those two fields back off the document, so the local lane — which stages the record
+// here, in Go — writes the same value the remote lane's worker wrote for itself.
+func JobBuildID(setBytes []byte, pkg string) (string, *exit.Error) {
+	doc, err := canonical.Read(setBytes, &pb.PlacementSet{})
+	if err != nil {
+		return "", exit.Named(exit.Structural, "job_build_identity_unreadable",
+			"the prepared PlacementSet for %s is not its canonical document: %s", pkg, err)
+	}
+	for _, row := range doc.List("placements") {
+		if development := row.Sub("development"); development.Str("package") == pkg {
+			id := development.Sub("project_wheel").Sub("ref").Str("digest")
+			if id == "" {
+				return "", exit.Named(exit.Structural, "job_build_identity_missing",
+					"the development placement for %s names no project wheel", pkg)
+			}
+			return id, nil
+		}
+		if row.Sub("package").Str("package") != pkg {
+			continue
+		}
+		id := row.Str("environment_digest")
+		if id == "" {
+			return "", exit.Named(exit.Structural, "job_build_identity_missing",
+				"the prepared placement for %s names no environment identity", pkg)
+		}
+		return id, nil
+	}
+	return "", exit.Named(exit.Structural, "job_build_identity_missing",
+		"the prepared PlacementSet carries no placement for %s", pkg)
+}
 
 // stageJobPlans writes one job plan record per declared job into the worker's own home.
 // The file name is the descriptor id's hex, which is how the supervisor finds it.
@@ -83,6 +129,10 @@ func stageJobPlans(workerHome string, plans []*JobPlan) *exit.Error {
 // attempts.
 func (c *Orchestrator) sendJobDirective(s *session, w *worker) *exit.Error {
 	plan := w.spec.Placement.Jobs[0]
+	if plan.BuildID == "" {
+		return exit.Named(exit.Structural, "job_build_identity_missing",
+			"job %s carries no build identity to name in its directive", plan.Function)
+	}
 	rev := c.nextRevision()
 	c.mu.Lock()
 	w.revision = rev
@@ -91,7 +141,7 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker) *exit.Error {
 		Revision: rev, WireMinor: pb.WireMinor,
 		Posture: pb.Posture_POSTURE_ACCEPTING,
 		Mode: &pb.DesiredWorkerState_Job{Job: &pb.JobDirective{
-			BuildId:         w.spec.Placement.PlacementSetDigest,
+			BuildId:         plan.BuildID,
 			JobDescriptorId: plan.DescriptorID,
 			ResourceCaps: &pb.ResourceCaps{
 				DeviceRequired: gpuCountOf(plan) > 0,

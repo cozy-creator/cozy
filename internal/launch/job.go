@@ -82,6 +82,12 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}
+	// The build id comes off the SELECTED PlacementSet, exactly as a rented worker reads
+	// it off the set it prepared for itself. One derivation, one meaning, both lanes.
+	buildID, e := orchestrator.JobBuildID(placement.PlacementSetBytes, f.Install.Package)
+	if e != nil {
+		return orchestrator.WorkerLaunchSpec{}, nil, e
+	}
 	cache := filepath.Join(f.Install.Dir, "artifact-cache")
 	environmentPython := home.VenvPython(filepath.Join(f.Install.Dir, "venv"))
 	environmentContent := placement.EnvironmentDigest
@@ -91,13 +97,14 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	placement.Jobs = []*orchestrator.JobPlan{{
 		Function:       facts.Name,
 		DescriptorID:   facts.DescriptorID,
+		BuildID:        buildID,
 		Outputs:        facts.Outputs,
 		WeightsOutputs: facts.WeightsOutputs,
 		// The record's key set is CLOSED at both ends: `plan.py::JobBinding.read`
 		// refuses an unknown key, exactly as the binding record's reader does.
 		Record: map[string]any{
 			"job_descriptor_id":           facts.DescriptorID,
-			"build_id":                    placement.PlacementSetDigest,
+			"build_id":                    buildID,
 			"application":                 f.PackageInterface.Application,
 			"package_interface":           PackageInterfacePath(f.Install.Dir),
 			"python":                      environmentPython,
