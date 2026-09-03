@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os/signal"
 	"strconv"
@@ -545,51 +546,183 @@ func missingOf(r hub.Rental) string {
 	return "complete ready projection"
 }
 
-func handleRentLs(ctx *Context) *exit.Error {
+// handleRentalList is `cozy rental list` (cl-114) — and bare `cozy rental`, which
+// aliases to it. On a terminal it is the live board: the fleet redrawn in place every
+// second, the way `cozy run list` watches runs. Piped or --json it is one plain snapshot.
+func handleRentalList(ctx *Context) *exit.Error {
+	explicit, disabled := ctx.Inv.Bool("--watch"), ctx.Inv.Bool("--no-watch")
+	if explicit && disabled {
+		return exit.Usagef("--watch and --no-watch cannot be used together")
+	}
+	watching := explicit || ctx.Mode().TTY && !disabled
+	if watching && (ctx.Mode().JSON || !ctx.Mode().TTY) {
+		return exit.Usagef("--watch requires interactive terminal output").
+			WithRemedy("omit --watch for one snapshot, or use --json for automation")
+	}
 	l, st, e := rentalStores(ctx)
 	if e != nil {
 		return e
 	}
 	defer st.Close()
-	count, burn, e := (&managedRentals{ctx: ctx, layout: l, store: st}).totals()
+	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
+	if watching {
+		return watchRentalList(ctx, st, fleet)
+	}
+	list, e := rentalList(ctx, st, fleet, true)
 	if e != nil {
 		return e
+	}
+	return emit(ctx, list)
+}
+
+// watchRentalList is the board: redrawn every second so UPTIME and the IDLE countdown
+// move, reconciled with the hub only at pollCadence — a redraw is a local read, and the
+// hub is asked at the same rate every other rental wait asks it.
+func watchRentalList(ctx *Context, st *records.Store, fleet *managedRentals) *exit.Error {
+	var reconciled time.Time
+	return watchList(ctx, "machine", func(context.Context) (output.List, *exit.Error) {
+		reconcile := time.Since(reconciled) >= pollCadence
+		if reconcile {
+			reconciled = time.Now()
+		}
+		list, problem := rentalList(ctx, st, fleet, reconcile)
+		if problem != nil {
+			return output.List{}, problem
+		}
+		// The board's guidance line is its own trail; per-row verbs stay in the snapshot.
+		list.Next = nil
+		return list, nil
+	})
+}
+
+// rentalList is one snapshot of the fleet. reconcile says whether to converge local rows
+// with the hub first — every `cozy rental list` invocation does; the live board does at
+// pollCadence. The spend lead is th-120's reconciled BILLED burn, never the quote.
+func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
+	reconcile bool,
+) (output.List, *exit.Error) {
+	var count int
+	var burn int64
+	var e *exit.Error
+	if reconcile {
+		count, burn, e = fleet.totals()
+	} else {
+		count, burn, e = st.RentalFleetTotals()
+	}
+	if e != nil {
+		return output.List{}, e
 	}
 	rows, e := st.Rentals()
 	if e != nil {
-		return e
+		return output.List{}, e
 	}
 	grace := ctx.Cfg.RentalsIdleRelease
 	list := output.List{
-		Name:      "rentals",
-		Fields:    []string{"machine", "sku", "state", "uptime", "queued", "running", "idle", "release"},
-		AllFields: []string{"machine", "sku", "state", "uptime", "queued", "running", "idle", "release", "utilization", "rental", "accelerator", "address", "media", "hub", "rented", "ready"},
+		Name:   "rentals",
+		Fields: []string{"machine", "sku", "state", "uptime", "running", "queued", "idle"},
+		AllFields: []string{"machine", "sku", "state", "uptime", "running", "queued", "idle",
+			"rental", "accelerator", "address", "media", "hub", "rented", "ready",
+			"idle_since", "release_due"},
+		// The machine document carries the underlying facts, never the table's
+		// spellings: counts as numbers, moments as timestamps, absences omitted.
+		TypedFields: []string{"machine", "sku", "state", "rental_id", "rented_at",
+			"running", "queued", "idle_s", "release_due_at"},
+		TypedAllFields: []string{"machine", "sku", "state", "rental_id", "accelerator",
+			"address", "media_address", "hub", "rented_at", "ready_at", "running",
+			"queued", "idle_s", "idle_since_at", "release_due_at", "hourly_rate_usd_micros"},
+		TypedRows: make([]map[string]any, 0, len(rows)),
 		Lead: []string{fmt.Sprintf("Remote machines running: %d", count),
 			"Current spend per hour: " + usdPerHourBare(burn)},
+		Aggregates: []output.Field{{K: "machines_running", V: jsonFact{count}},
+			{K: "hourly_spend_usd_micros", V: jsonFact{burn}}},
 		Trail: []string{idleShutdownNote(grace)},
 		Next:  []string{"cozy help rental new"},
 	}
 	for _, r := range rows {
 		idle, problem := observeRentalIdle(st, r)
 		if problem != nil {
-			return problem
+			return output.List{}, problem
 		}
-		idleFor, release := rentalIdleColumns(r, idle, grace)
+		due, eligible := idle.releaseAt(grace)
+		idleSince, releaseDue := "", ""
+		if eligible {
+			idleSince, releaseDue = idle.Since.UTC().Format(time.RFC3339), due.UTC().Format(time.RFC3339)
+		}
 		list.Rows = append(list.Rows, map[string]string{
 			"machine": r.MachineName, "sku": orNone(r.SKU),
 			"state": r.State, "uptime": rentalUptime(r.RentedAt),
-			"queued": strconv.Itoa(idle.Queued), "running": strconv.Itoa(idle.Running),
-			"idle": idleFor, "release": release,
-			"utilization": "not reported", "rental": r.ID,
-			"accelerator": r.AcceleratorModel, "address": r.Address,
-			"media": r.MediaAddress, "hub": r.Hub,
+			"running": strconv.Itoa(idle.Running), "queued": strconv.Itoa(idle.Queued),
+			"idle":   idleCell(idle, grace),
+			"rental": r.ID, "accelerator": r.AcceleratorModel,
+			"address": r.Address, "media": r.MediaAddress, "hub": r.Hub,
 			"rented": stamp(r.RentedAt), "ready": orNone(stamp(r.ReadyAt)),
+			"idle_since": idleSince, "release_due": releaseDue,
 		})
+		typed := map[string]any{
+			"machine": r.MachineName, "state": r.State, "rental_id": r.ID,
+			"running": idle.Running, "queued": idle.Queued,
+			"hourly_rate_usd_micros": r.HourlyRateUSDMicros,
+		}
+		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
+			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub,
+			"rented_at": r.RentedAt, "ready_at": r.ReadyAt,
+			"idle_since_at": idleSince, "release_due_at": releaseDue} {
+			if value != "" {
+				typed[key] = value
+			}
+		}
+		if eligible {
+			typed["idle_s"] = int64(time.Since(idle.Since).Seconds())
+		}
+		list.TypedRows = append(list.TypedRows, typed)
 	}
 	if len(list.Rows) > 0 {
 		list.Next = []string{"cozy rental end " + list.Rows[0]["machine"]}
 	}
-	return emit(ctx, list)
+	return list, nil
+}
+
+// jsonFact is an aggregate only a program reads: the terminal already says it in the lead.
+type jsonFact struct{ V any }
+
+func (jsonFact) Human() string                  { return "" }
+func (f jsonFact) MarshalJSON() ([]byte, error) { return json.Marshal(f.V) }
+
+// idleCell is the IDLE column (cl-114): how long the machine has sat idle over the grace
+// that ends it — `41s / 30m` — from the actual rentals.idle_release_s policy. Blank when
+// no idle clock is running: the machine is busy, still booting, leaving, or the policy
+// is off.
+func idleCell(idle rentalIdleness, grace time.Duration) string {
+	due, eligible := idle.releaseAt(grace)
+	if !eligible {
+		return ""
+	}
+	return idleClock(time.Since(idle.Since)) + " / " + idleClock(due.Sub(idle.Since))
+}
+
+// idleClock spells a countdown duration the way a person reads a clock: `0s`, `41s`,
+// `1m30s`, `30m` — whole seconds, no zero units.
+func idleClock(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	d = d.Round(time.Second)
+	if d == 0 {
+		return "0s"
+	}
+	var b strings.Builder
+	if h := d / time.Hour; h > 0 {
+		fmt.Fprintf(&b, "%dh", h)
+		d -= h * time.Hour
+	}
+	if m := d / time.Minute; m > 0 {
+		fmt.Fprintf(&b, "%dm", m)
+		d -= m * time.Minute
+	}
+	if s := d / time.Second; s > 0 {
+		fmt.Fprintf(&b, "%ds", s)
+	}
+	return b.String()
 }
 
 func rentalUptime(started string) string {
@@ -608,29 +741,6 @@ func roughDuration(d time.Duration) string {
 		return "<1m"
 	}
 	return d.Round(time.Minute).String()
-}
-
-// rentalIdleColumns says how long a rental has been idle and when the daemon will end it,
-// so a listing shows why a pod is about to go.
-func rentalIdleColumns(r records.Rental, idle rentalIdleness, grace time.Duration) (string, string) {
-	idleFor := "booting"
-	switch {
-	case idle.busy():
-		idleFor = "busy"
-	case !idle.Since.IsZero():
-		idleFor = roughDuration(time.Since(idle.Since))
-	}
-	switch due, eligible := idle.releaseAt(grace); {
-	case r.State == hub.RentalReleaseRequested:
-		return idleFor, "requested"
-	case grace <= 0:
-		return idleFor, "cozy rental end"
-	case !eligible:
-		return idleFor, "when idle for " + grace.String()
-	case time.Now().Before(due):
-		return idleFor, "in " + roughDuration(time.Until(due))
-	}
-	return idleFor, "due"
 }
 
 // idleShutdownNote is the one sentence the rental list owes: what ends an idle machine.

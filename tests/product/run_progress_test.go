@@ -45,7 +45,9 @@ func ptyRunInput(t *testing.T, root string, rows uint16, input [][]byte, args ..
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave //cozy:stdin-value test pty navigation
 	must(t, cmd.Start())
 	must(t, slave.Close()) // the child holds the slave now; EOF/EIO on master ends the read
-	timedOut := time.AfterFunc(10*time.Second, func() { _ = cmd.Process.Kill() })
+	// The kill is a stuck-terminal stop for a child that never answers its inputs; the
+	// proofs' own bounds are their input cadences, so the stop stays far behind them.
+	timedOut := time.AfterFunc(20*time.Second, func() { _ = cmd.Process.Kill() })
 	defer timedOut.Stop()
 	go func() {
 		for _, keys := range input {
