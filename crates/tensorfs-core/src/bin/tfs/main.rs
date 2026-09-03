@@ -36,7 +36,10 @@
 //!   tfs fetch <root> <ref>       closure -> plan -> presign(wanted) -> N-way walk -> proof
 //!   tfs fetch plan-objects <root> <session> --refs <jsonl>   HELD/WANTED, no manifest
 //!   tfs fetch url <root> <sha256> <length> <url|->           one granted object
-//!   tfs push <root> <sha256> --url <presigned|-> [--manifest] [--content-type ct]
+//!   tfs push <root> <sha256> --grant-file <path> [--manifest] [--content-type ct]
+//!            the grant is the destination on line one, then one "name: value" per header
+//!            its signature covers; TFS_PUSH_GRANT carries the same text, and
+//!            --url <presigned|-> is a bare destination that signs no conditions
 //!   tfs source list <hf://org/repo@rev | civitai://id> [--api <base>]  provider listing
 //!   tfs source pull <root> <uri> [--api <base>] [--allow-local]        tfs-052 handlers
 //!   tfs bench-store <root>       put/read/range/rehash throughput + peak RSS

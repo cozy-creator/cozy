@@ -14,6 +14,16 @@
 //! silence bound is the ledger's floor — the same derived noise floor `egress.py` used —
 //! never an invented constant. Authority stays where it was: `podweights` (or whoever
 //! minted the grant) decided WHETHER these bytes may go; this module only moves them.
+//!
+//! **A grant is a URL AND the headers its signature covers, together.** tensorhub signs
+//! `if-none-match: *` and `x-amz-checksum-sha256: <base64 of the raw digest>` into every
+//! upload grant it mints (`podweights.validateGrant` demands exactly those two), and a
+//! SigV4 store answers 400 to a PUT that omits a signed header. A mover that carried the
+//! URL and dropped the conditions therefore could not spend ANY minted grant — which is
+//! what th-132 found. So the destination and its conditions are ONE value, `UploadGrant`,
+//! and no spelling reaches this function with one and not the other. The headers cross the
+//! wire verbatim, exactly once each, on every attempt, and they win over this module's own
+//! defaults and over the credential's: the grant's spelling is what the signature covers.
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::ids::{Doc, ObjectRef};
@@ -29,6 +39,88 @@ use std::sync::OnceLock;
 pub const PUT_ATTEMPTS: u32 = 4;
 
 const HTTP_PRECONDITION_FAILED: u16 = 412;
+
+/// One upload grant: the exact destination and the exact headers its signature covers.
+/// The pair is indivisible — a presigned PUT spent without its signed conditions is not a
+/// degraded push, it is a 400 — so this is the only way to name a push destination.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UploadGrant {
+    pub url: String,
+    /// Lowercase names in the grant's own order, each sent verbatim exactly once.
+    pub headers: Vec<(String, String)>,
+}
+
+/// A grant is a URL, a few signed headers and nothing else; anything larger is not one.
+pub const MAX_GRANT_BYTES: usize = 64 * 1024;
+
+impl UploadGrant {
+    /// A destination that signs no conditions — a plain PUT target, not a minted grant.
+    pub fn to(url: &str) -> UploadGrant {
+        UploadGrant {
+            url: url.to_string(),
+            headers: Vec::new(),
+        }
+    }
+
+    /// The grant as its minter writes it, in the line grammar the credential file already
+    /// uses: the destination on the first line, then one `name: value` per line for each
+    /// header the signature covers. No escaping, no canonical-bytes question — a presigned
+    /// URL is full of `&` and a base64 checksum of `+/=`, and a grammar that can mangle
+    /// either is a grammar that loses the signature.
+    ///
+    /// ```text
+    /// https://bucket.s3.amazonaws.com/o/<key>?X-Amz-Algorithm=...&X-Amz-Signature=...
+    /// if-none-match: *
+    /// x-amz-checksum-sha256: 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=
+    /// ```
+    pub fn parse(text: &str) -> Result<UploadGrant> {
+        if text.len() > MAX_GRANT_BYTES {
+            return refuse(
+                Code::SIZE_CAP,
+                format!(
+                    "{} bytes is not an upload grant — one is a URL and a few headers",
+                    text.len()
+                ),
+            );
+        }
+        let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+        let Some(url) = lines.next() else {
+            return refuse(
+                Code::SOURCE_NOT_ALLOWED,
+                "an upload grant is a destination on the first line, then one \
+                 `name: value` per signed header",
+            );
+        };
+        let mut grant = UploadGrant::to(url);
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                return refuse(
+                    Code::SOURCE_NOT_ALLOWED,
+                    format!("upload grant line {line:?} is not `name: value`"),
+                );
+            };
+            let (name, value) = (name.trim(), value.trim());
+            if name.is_empty() || name != name.to_ascii_lowercase() || value.is_empty() {
+                return refuse(
+                    Code::SOURCE_NOT_ALLOWED,
+                    format!(
+                        "upload grant header {name:?} is not one canonical lowercase name \
+                         with a value — send the grant's headers exactly as its signature \
+                         spells them"
+                    ),
+                );
+            }
+            if grant.headers.iter().any(|(held, _)| held == name) {
+                return refuse(
+                    Code::SOURCE_NOT_ALLOWED,
+                    format!("upload grant repeats the signed header {name:?}"),
+                );
+            }
+            grant.headers.push((name.to_string(), value.to_string()));
+        }
+        Ok(grant)
+    }
+}
 
 fn shared_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
@@ -88,13 +180,14 @@ fn verified_bytes(store: &Store, sha256: &str, manifest: bool) -> Result<(Vec<u8
     }
 }
 
-/// Stream one verified store object to one exact presigned URL.
+/// Stream one verified store object to the one destination a grant names, under the exact
+/// headers that grant's signature covers.
 #[allow(clippy::too_many_arguments)]
 pub fn push_object(
     store: &Store,
     sha256: &str,
     manifest: bool,
-    url: &str,
+    grant: &UploadGrant,
     policy: &SourcePolicy,
     credential: &dyn CredentialProvider,
     deadline: Deadline,
@@ -107,7 +200,7 @@ pub fn push_object(
     let mut last_refusal: Option<Refusal> = None;
     for attempt in 1..=PUT_ATTEMPTS {
         let last = attempt == PUT_ATTEMPTS;
-        let checked = policy.check(url)?;
+        let checked = policy.check(&grant.url)?;
         let mut headers = vec![
             (
                 "content-type".to_string(),
@@ -120,6 +213,14 @@ pub fn push_object(
             ("if-none-match".to_string(), "*".to_string()),
         ];
         headers.extend(credential.headers(&checked.host));
+        // The grant's own spelling is the one the signature covers, so it replaces a
+        // default or a credential header of the same name rather than joining it.
+        for (name, value) in &grant.headers {
+            match headers.iter_mut().find(|(held, _)| held == name) {
+                Some(slot) => slot.1 = value.clone(),
+                None => headers.push((name.clone(), value.clone())),
+            }
+        }
         let sent = http::request(
             client,
             &checked,

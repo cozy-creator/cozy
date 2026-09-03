@@ -7,7 +7,7 @@ use super::hub::{Anonymous, HostToken};
 use super::ledger::{Deadline, Ledger};
 use super::policy::{blocked, SourcePolicy};
 use super::pull::{fetch_url, pull, PullRequest};
-use super::push::push_object;
+use super::push::{push_object, UploadGrant};
 use crate::canon::Value;
 use crate::dtype::Dtype;
 use crate::err::Code;
@@ -933,7 +933,7 @@ fn push_streams_a_verified_object_and_412_is_the_object_being_durable() {
         &store,
         &object.sha256,
         false,
-        &format!("{}/put/{}", origin.base, object.sha256),
+        &UploadGrant::to(&format!("{}/put/{}", origin.base, object.sha256)),
         &local_policy(),
         &Anonymous,
         Deadline::none(),
@@ -967,7 +967,7 @@ fn push_streams_a_verified_object_and_412_is_the_object_being_durable() {
         &store,
         &object.sha256,
         false,
-        &format!("{}/put/x", origin.base),
+        &UploadGrant::to(&format!("{}/put/x", origin.base)),
         &local_policy(),
         &Anonymous,
         Deadline::none(),
@@ -985,7 +985,7 @@ fn push_streams_a_verified_object_and_412_is_the_object_being_durable() {
         &store,
         &object.sha256,
         false,
-        &format!("{}/put/x", origin.base),
+        &UploadGrant::to(&format!("{}/put/x", origin.base)),
         &local_policy(),
         &Anonymous,
         Deadline::none(),
@@ -1007,7 +1007,7 @@ fn push_streams_a_verified_object_and_412_is_the_object_being_durable() {
         &store,
         &object.sha256,
         false,
-        &format!("{}/put/x", origin.base),
+        &UploadGrant::to(&format!("{}/put/x", origin.base)),
         &local_policy(),
         &Anonymous,
         Deadline::none(),
@@ -1017,6 +1017,141 @@ fn push_streams_a_verified_object_and_412_is_the_object_being_durable() {
     .unwrap_err();
     assert_eq!(refusal.code, Code::REDIRECT_REFUSED);
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// th-132's other half, proven at the socket: a tensorhub upload grant is a presigned URL
+/// AND the exact headers its signature covers — `if-none-match: *` and
+/// `x-amz-checksum-sha256` (podweights.validateGrant refuses a grant without them, and a
+/// SigV4 store refuses a PUT without them) — so the mover sends them verbatim, once each,
+/// on every attempt. The origin here DEMANDS them: without the checksum header it answers
+/// 400 and the push fails, which is exactly what made an upload grant unspendable.
+#[test]
+fn push_spends_a_grant_the_origin_refuses_without_its_signed_headers() {
+    let root = temporary("push-grant-headers");
+    let store = Store::init(&root).unwrap();
+    let body = b"granted bytes".to_vec();
+    let object = ObjectRef::of(&body);
+    store
+        .put_stream(&mut body.as_slice(), Some(&object), &Default::default())
+        .unwrap();
+    let raw: Vec<u8> = object
+        .sha256
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    let checksum = crate::b64::encode(&raw);
+
+    type SeenHeaders = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+    let seen: SeenHeaders = Arc::default();
+    let seen_for = Arc::clone(&seen);
+    let checksum_for = checksum.clone();
+    let demanding: Dispatch = Arc::new(move |request: &Request| {
+        seen_for.lock().unwrap().push(request.headers.clone());
+        // The store's side of the contract, exactly as S3 enforces it: no signed
+        // checksum, no PUT.
+        if request.header("x-amz-checksum-sha256") != Some(checksum_for.as_str())
+            || request.header("if-none-match") != Some("*")
+        {
+            return status(400, b"InvalidRequest: the signed headers are required");
+        }
+        status(200, b"")
+    });
+    let origin = origin(demanding);
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+    let destination = format!("{}/put/{}", origin.base, object.sha256);
+
+    // Without the grant's headers this origin refuses — the gap th-132 recorded.
+    let refusal = push_object(
+        &store,
+        &object.sha256,
+        false,
+        &UploadGrant::to(&destination),
+        &local_policy(),
+        &Anonymous,
+        Deadline::none(),
+        &ledger,
+        "",
+    )
+    .unwrap_err();
+    assert_eq!(refusal.code, Code::TRANSFER_FAILED);
+    assert!(refusal.detail.contains("400"), "{refusal}");
+
+    // The grant as its minter writes it — url and headers in one document, so the URL
+    // cannot be spent without its conditions.
+    let document = format!("{destination}\nif-none-match: *\nx-amz-checksum-sha256: {checksum}\n");
+    let grant = UploadGrant::parse(&document).unwrap();
+    assert_eq!(grant.url, destination);
+    assert_eq!(grant.headers.len(), 2);
+    seen.lock().unwrap().clear();
+    let pushed = push_object(
+        &store,
+        &object.sha256,
+        false,
+        &grant,
+        &local_policy(),
+        &Anonymous,
+        Deadline::none(),
+        &ledger,
+        "",
+    )
+    .unwrap();
+    assert_eq!(pushed.http_status, 200);
+    assert_eq!(pushed.bytes_sent, object.length);
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let of = |name: &str| -> Vec<&str> {
+            seen[0]
+                .iter()
+                .filter(|(held, _)| held == name)
+                .map(|(_, value)| value.as_str())
+                .collect()
+        };
+        // The grant's own if-none-match replaced the built-in — sent exactly once.
+        assert_eq!(of("if-none-match"), vec!["*"]);
+        assert_eq!(of("x-amz-checksum-sha256"), vec![checksum.as_str()]);
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A grant document is refused for the first thing it gets wrong, before any byte moves —
+/// and the grammar survives what a real grant actually contains: a presigned URL full of
+/// `&` and `=`, and a base64 checksum ending in `=`.
+#[test]
+fn a_grant_document_is_refused_for_the_first_disagreeing_thing() {
+    let presigned = "https://bucket.s3.amazonaws.com/o/k?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+                     &X-Amz-Signature=deadbeef&X-Amz-SignedHeaders=host%3Bif-none-match";
+    let checksum = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+    let grant = UploadGrant::parse(&format!(
+        "{presigned}\n\nif-none-match: *\nx-amz-checksum-sha256: {checksum}\n"
+    ))
+    .unwrap();
+    assert_eq!(grant.url, presigned);
+    assert_eq!(
+        grant.headers,
+        vec![
+            ("if-none-match".to_string(), "*".to_string()),
+            ("x-amz-checksum-sha256".to_string(), checksum.to_string()),
+        ]
+    );
+
+    // A name that is not its own canonical lowercase self is not the name the signature
+    // covers; an empty value, a line that is not `name: value`, a repeat, and an empty
+    // document are each the grant saying something this mover will not guess at.
+    for bad in [
+        "https://s3.example/put\nX-Amz-Checksum-Sha256: abc",
+        "https://s3.example/put\nif-none-match:",
+        "https://s3.example/put\nif-none-match",
+        "https://s3.example/put\nif-none-match: *\nif-none-match: *",
+        "   \n\n",
+    ] {
+        let refusal = UploadGrant::parse(bad).unwrap_err();
+        assert_eq!(refusal.code, Code::SOURCE_NOT_ALLOWED, "{bad:?}");
+    }
+    // The cap is the parser's, so every door gets it — file, environment, and any caller.
+    let refusal = UploadGrant::parse(&"x".repeat(super::MAX_GRANT_BYTES + 1)).unwrap_err();
+    assert_eq!(refusal.code, Code::SIZE_CAP);
 }
 
 // ---------------------------------------------------------------- TLS
