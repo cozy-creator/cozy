@@ -33,24 +33,38 @@ import (
 )
 
 // Tool is one resolved tensorfs CLI plus the store it operates on.
+// BuiltFor is the tensorfs release this binary speaks. `tfs version` prints
+// `tfs <version> sha256:<digest of its own bytes>`; a resolved binary that says
+// anything else is a structural refusal at Open (tfs-051) — skew is a version
+// number that can be printed and refused on, never a file path that cannot.
+const BuiltFor = "0.3.1"
+
 type Tool struct {
 	Bin    string
 	Root   string // the local CAS
 	Source string // where the binary path came from, for the remedy text
-	env    []string
+	// Version and BuildDigest are what the binary said at the Open handshake.
+	Version     string
+	BuildDigest string
+	env         []string
 }
 
-// Open resolves the binary and the store. A missing `tfs` is a structural refusal
-// (exit 6) naming what to install: this binary cannot substitute for it, and a
-// cozy-creator-side reimplementation is exactly what boundaries.md forbids.
+// Open resolves the binary, handshakes its version, and opens the store. A
+// missing `tfs` is a structural refusal (exit 6) naming what to install: this
+// binary cannot substitute for it, and a cozy-creator-side reimplementation is
+// exactly what boundaries.md forbids. A tfs of another release is refused the
+// same way — every consumer of this store speaks exactly one tensorfs.
 func Open(cfg config.Config, layout home.Layout) (*Tool, *exit.Error) {
 	bin, err := exec.LookPath(cfg.Tfs)
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "tfs_missing",
 			"the tensorfs CLI %q is not on PATH: %s", cfg.Tfs, err).
-			WithRemedy("build it from the tensorfs repo (cargo build --release -p tensorfs-core --bin tfs) and set COZY_TFS to the binary")
+			WithRemedy("install tensorfs==%s (the wheel ships bin/tfs) or set COZY_TFS to a binary of that release", BuiltFor)
 	}
 	t := &Tool{Bin: bin, Root: layout.CAS, Source: cfg.TfsSource, env: cfg.Tool()}
+	if e := t.handshake(); e != nil {
+		return nil, e
+	}
 	if err := os.MkdirAll(t.Root, 0o755); err != nil {
 		return nil, exit.Internalf("cannot create the local store at %s: %s", t.Root, err)
 	}
@@ -58,6 +72,36 @@ func Open(cfg config.Config, layout home.Layout) (*Tool, *exit.Error) {
 		return nil, e
 	}
 	return t, nil
+}
+
+func (t *Tool) handshake() *exit.Error {
+	cmd := exec.Command(t.Bin, "version")
+	cmd.Env = t.env
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		said := strings.TrimSpace(errb.String())
+		if said == "" {
+			said = err.Error()
+		}
+		return exit.Named(exit.Structural, "tfs_version_unreadable",
+			"the tensorfs CLI at %s (from %s) does not answer `tfs version`: %s", t.Bin, t.Source, firstLine(said)).
+			WithRemedy("install tensorfs==%s (the wheel ships bin/tfs); a build without `tfs version` predates the version contract", BuiltFor)
+	}
+	fields := strings.Fields(out.String())
+	if len(fields) != 3 || fields[0] != "tfs" || !strings.HasPrefix(fields[2], "sha256:") {
+		return exit.Named(exit.Structural, "tfs_version_unreadable",
+			"the tensorfs CLI at %s printed %q, not `tfs <version> sha256:<hex>`", t.Bin, firstLine(out.String())).
+			WithRemedy("install tensorfs==%s (the wheel ships bin/tfs)", BuiltFor)
+	}
+	t.Version, t.BuildDigest = fields[1], fields[2]
+	if t.Version != BuiltFor {
+		return exit.Named(exit.Structural, "tfs_version_skew",
+			"the tensorfs CLI at %s (from %s) is tensorfs %s (%s); this binary is built for %s",
+			t.Bin, t.Source, t.Version, t.BuildDigest, BuiltFor).
+			WithRemedy("install tensorfs==%s, or rebuild cozy against %s", BuiltFor, t.Version)
+	}
+	return nil
 }
 
 func (t *Tool) run(args ...string) (string, *exit.Error) {
