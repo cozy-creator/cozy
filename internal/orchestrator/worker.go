@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -276,7 +277,7 @@ type WorkerLaunchSpec struct {
 	ArtifactCache     string       `json:"artifact_cache,omitempty"`
 	InstallRoot       string       `json:"install_root,omitempty"`
 	EnvironmentPython string       `json:"environment_python,omitempty"` // preinstalled package venv
-	ArtifactStore     string       `json:"artifact_store,omitempty"`
+	TensorFSRoot      string       `json:"tensorfs_root,omitempty"`
 	// Placement is what this worker is launched to host. LAUNCH CLAMPS THE SET TO ONE
 	// (worker-protocol header): a longer set is a typed refusal at the worker, so this
 	// side names one placement rather than pretending to a generality it cannot deliver.
@@ -1158,7 +1159,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		{"--artifact-cache", spec.ArtifactCache},
 		{"--install-root", spec.InstallRoot},
 		{"--environment-python", spec.EnvironmentPython},
-		{"--artifact-store", spec.ArtifactStore},
+		{"--tensorfs-root", spec.TensorFSRoot},
 	} {
 		if option.value != "" {
 			args = append(args, option.flag, option.value)
@@ -1538,7 +1539,12 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 				return exit.Named(exit.Unavailable, "worker_recycled",
 					"the job worker recycled (exit %d) after its bounded attempt", RecycleExit)
 			}
-			return exit.New(exit.Failed, "the package worker exited before reporting ready").
+			// The runtime's own typed refusal is already on stderr, which is this log.
+			// Saying only "read the log" turned a launch-grammar mismatch (cl-120's
+			// `--artifact-store`) into a mute death; the tool's last words are the answer.
+			return exit.New(exit.Failed,
+				"the package worker exited (%d) before reporting ready: %s",
+				code, lastWords(logPath)).
 				WithRemedy("its log is %s", logPath)
 		}
 		if workerFaulted {
@@ -1548,6 +1554,50 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// lastWords is the tail of a dead worker's log, condensed to one line. A worker that
+// refuses its own launch says why on stderr and then exits; this is that sentence, read
+// at the only moment anyone needs it.
+func lastWords(path string) string {
+	if path == "" {
+		return "it wrote no log"
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "its log is unreadable: " + err.Error()
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "its log is unreadable: " + err.Error()
+	}
+	const window = 4 << 10
+	at := info.Size() - window
+	if at < 0 {
+		at = 0
+	}
+	buf := make([]byte, info.Size()-at)
+	if _, err := f.ReadAt(buf, at); err != nil && err != io.EOF {
+		return "its log is unreadable: " + err.Error()
+	}
+	var said []string
+	for _, line := range strings.Split(string(buf), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			said = append(said, line)
+		}
+	}
+	if len(said) == 0 {
+		return "it said nothing"
+	}
+	if len(said) > 3 {
+		said = said[len(said)-3:]
+	}
+	tail := strings.Join(strings.Fields(strings.Join(said, " · ")), " ")
+	if len(tail) > 400 {
+		return "…" + tail[len(tail)-400:]
+	}
+	return tail
 }
 
 // RecycleExit is the run-once COMPLETION disposition (cr-009, v1 rc 75). A job worker
