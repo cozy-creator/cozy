@@ -406,7 +406,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 // deriveDevelopmentPlacement runs the install's own Runtime over its source. Runtime emits the
 // complete package interface without writing the source tree; Cozy validates the closed grammar
 // and stores the canonical bytes under the immutable install root.
-func deriveDevelopmentPlacement(venvDir, sourceDir, artifactStore string, local LocalSource) (
+func deriveDevelopmentPlacement(venvDir, sourceDir, tensorfsRoot string, local LocalSource) (
 	*launch.PackageInterface, ExactDocument, *exit.Error,
 ) {
 	var empty ExactDocument
@@ -419,7 +419,7 @@ func deriveDevelopmentPlacement(venvDir, sourceDir, artifactStore string, local 
 	}
 	cmd := exec.Command(bin, "--json", "--dir", sourceDir, "development-placement",
 		"--package", local.Package, "--release", local.Release,
-		"--source-digest", local.SourceDigest, "--artifact-store", artifactStore)
+		"--source-digest", local.SourceDigest, "--tensorfs-root", tensorfsRoot)
 	cmd.Env = config.Frozen().Tool("COZY_HOME=" + runtimeScratchHome())
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr

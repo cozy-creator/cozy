@@ -101,7 +101,7 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 				"--development-source-digest", placement.SourceDigest},
 			Dir: f.Source, Devices: devices, GraceSec: 3,
 			ArtifactCache: cache,
-			ArtifactStore: config.Frozen().TensorFSRoot,
+			TensorFSRoot:  config.Frozen().TensorFSRoot,
 		}, nil
 	}
 	runtimeBin, e := HostRuntime(f.RuntimeCLI.Env)
@@ -116,6 +116,6 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 		GraceSec:          3,
 		ArtifactCache:     cache,
 		EnvironmentPython: home.VenvPython(filepath.Join(f.Install.Dir, "venv")),
-		ArtifactStore:     config.Frozen().TensorFSRoot,
+		TensorFSRoot:      config.Frozen().TensorFSRoot,
 	}, nil
 }

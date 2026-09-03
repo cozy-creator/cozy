@@ -262,7 +262,7 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 		return empty, problem
 	}
 	args := []string{"--json", "prepare-package",
-		"--artifact-store", config.Frozen().TensorFSRoot,
+		"--tensorfs-root", config.Frozen().TensorFSRoot,
 		"--package", published.Package,
 		"--release", published.Release,
 		"--locked-requirements", filepath.Join(installDir, LockedRequirementsFile),
