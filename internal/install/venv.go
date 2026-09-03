@@ -46,7 +46,7 @@ type EnvironmentReceipt struct {
 // that, never writes uv.lock, and never falls back to a resolve; a matching lock
 // needs no network at all (verified with UV_OFFLINE=1). The two flags are mutually
 // exclusive in uv, so this is the stronger reading of one rule, not a second one.
-func MaterializeEnvironment(sourceDir, venvDir, companionStore string) (*EnvironmentReceipt, *exit.Error) {
+func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *exit.Error) {
 	lock := filepath.Join(sourceDir, "uv.lock")
 	lockDigest, err := fileDigest(lock)
 	if err != nil {
@@ -82,9 +82,6 @@ func MaterializeEnvironment(sourceDir, venvDir, companionStore string) (*Environ
 	}
 
 	env.Python = pythonVersion(venvDir)
-	if problem := joinCompanions(companionStore, venvDir, &env.Warnings); problem != nil {
-		return nil, problem
-	}
 	env.Packages, env.Closure = closure(venvDir)
 	return env, nil
 }
@@ -97,7 +94,7 @@ func MaterializeEnvironment(sourceDir, venvDir, companionStore string) (*Environ
 // — index directives plus sorted exact rows — is retained at
 // `<install>/locked-requirements.txt`: it is the exact document Runtime preparation
 // consumes and re-consumes at model selection.
-func MaterializePublishedEnvironment(sourceDir, venvDir, companionStore string,
+func MaterializePublishedEnvironment(sourceDir, venvDir string,
 	published *PublishedSource,
 ) (*EnvironmentReceipt, *exit.Error) {
 	lock := filepath.Join(sourceDir, "uv.lock")
@@ -158,9 +155,6 @@ func MaterializePublishedEnvironment(sourceDir, venvDir, companionStore string,
 		return nil, problem
 	}
 	env.Python = pythonVersion(venvDir)
-	if problem := joinCompanions(companionStore, venvDir, &env.Warnings); problem != nil {
-		return nil, problem
-	}
 	env.Packages, env.Closure = closure(venvDir)
 	return env, nil
 }

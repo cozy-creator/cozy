@@ -83,8 +83,7 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 		return nil, empty, "", nil, exit.Internalf("cannot create package artifact cache: %s", err)
 	}
 	venvDir := filepath.Join(installDir, "venv")
-	environment, problem := MaterializePublishedEnvironment(sourceDir, venvDir, l.Companions,
-		published)
+	environment, problem := MaterializePublishedEnvironment(sourceDir, venvDir, published)
 	if problem != nil {
 		return nil, empty, "", nil, problem
 	}

@@ -281,8 +281,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 	if prior != nil && priorInstall != nil && priorInstall.SourceKind == inst.SourceKind &&
 		priorInstall.Package == inst.Package && priorInstall.Version == inst.Version &&
-		(inst.SourceKind == "tensorhub" || priorInstall.SourceDigest == inst.SourceDigest) &&
-		!CompanionsStale(l.Companions, filepath.Join(priorInstall.Dir, "venv")) {
+		(inst.SourceKind == "tensorhub" || priorInstall.SourceDigest == inst.SourceDigest) {
 		res.Idempotent = true
 		res.Install = *priorInstall
 		_ = os.RemoveAll(installDir)
@@ -334,7 +333,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if req.Published != nil {
 		packageInterface, placement, inst.Runtime, env, err = preparePublished(l, installDir, req.Published)
 	} else {
-		env, err = MaterializeEnvironment(sourceDir, venvDir, l.Companions)
+		env, err = MaterializeEnvironment(sourceDir, venvDir)
 	}
 	if err != nil {
 		return guard(err)

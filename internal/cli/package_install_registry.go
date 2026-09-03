@@ -63,9 +63,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		return problem
 	}
 	if existingInstall != nil && existingInstall.SourceKind == "tensorhub" &&
-		existingInstall.Package == ref.String() && existingInstall.Version == release &&
-		!install.CompanionsStale(existingLayout.Companions,
-			filepath.Join(existingInstall.Dir, "venv")) {
+		existingInstall.Package == ref.String() && existingInstall.Version == release {
 		defer existing.Close()
 		result := &install.Result{Install: *existingInstall, Idempotent: true}
 		modelScratch, problem := scratch.Temp(existingLayout.Tmp, "package-model-prefetch-")
