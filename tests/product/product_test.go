@@ -336,7 +336,7 @@ func TestProductPath(t *testing.T) {
 
 	code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=7", "--full", "--await")
-	if code != 0 || !strings.Contains(stderr, "progress fraction=") {
+	if code != 0 || !strings.Contains(stderr, "progress stage=tile stage_fraction=") {
 		t.Fatalf("--full did not retain Runtime diagnostics [exit %d]\n%s", code, stderr)
 	}
 
