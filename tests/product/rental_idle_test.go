@@ -193,6 +193,7 @@ func reservePort(t *testing.T) int {
 type fakeRentalHub struct {
 	mu       sync.Mutex
 	rentals  map[string]map[string]any
+	skus     []map[string]any
 	released map[string]int
 	server   *httptest.Server
 }
@@ -212,6 +213,12 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(row)
 	})
+	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(h.skus)
+	})
 	mux.HandleFunc("DELETE /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -230,6 +237,14 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	h.server.Start()
 	t.Cleanup(h.close)
 	return h
+}
+
+// setSKUs is the fake hub's product catalog, the shape Tensorhub serves it:
+// GPU list price and the spec-derived storage adder, decomposed (th-126).
+func (h *fakeRentalHub) setSKUs(skus ...map[string]any) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.skus = append([]map[string]any(nil), skus...)
 }
 
 func (h *fakeRentalHub) add(id, machine string) {

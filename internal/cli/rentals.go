@@ -91,7 +91,7 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 	defer st.Close()
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
-	line, hourlyRate, e := fleet.admit(skuName)
+	line, sku, e := fleet.admit(skuName)
 	if e != nil {
 		return e
 	}
@@ -113,7 +113,8 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 
 	row, attachable, replay, e := acquireRental(ctx, l, st, skuName,
-		operationKey, reason, hourlyRate, ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "")
+		operationKey, reason, sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
+		ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "")
 	if e != nil {
 		return e
 	}
@@ -164,16 +165,21 @@ func handleRent(ctx *Context) *exit.Error {
 // `cozy run --rental`. It returns only after the immutable retail rate and the
 // worker's authenticated attach projection are durable locally.
 func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName,
-	operationKey, reason string, hourlyRateUSDMicros, fleetCapUSDMicros int64,
+	operationKey, reason string, hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros int64,
 	deadline time.Time, managedRequestID string,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
-	return acquireRentalContext(context.Background(), ctx, l, st, skuName,
-		operationKey, reason, hourlyRateUSDMicros, fleetCapUSDMicros, deadline, managedRequestID)
+	return acquireRentalContext(context.Background(), ctx, l, st, skuName, operationKey,
+		reason, hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros, deadline, managedRequestID)
 }
 
+// hourlyRateUSDMicros is the LOCKED accepted quote — the hub's GPU list rate,
+// the figure the fresh-acceptance guard compares. storageUSDMicros is the
+// SKU's estimated storage adder (th-126): admission money only, totaled with
+// the quote against the fleet cap and never persisted as the rate.
 func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout,
 	st *records.Store, skuName, operationKey, reason string,
-	hourlyRateUSDMicros, fleetCapUSDMicros int64, deadline time.Time, managedRequestID string,
+	hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros int64,
+	deadline time.Time, managedRequestID string,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
 	c := client(ctx)
 	existing, e := st.RentalOperation(operationKey)
@@ -218,7 +224,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	op, replay, e := st.BeginRentalOperation(records.RentalOperation{
 		Key: operationKey, Hub: c.Base(), Reason: reason, HourlyRateUSDMicros: hourlyRateUSDMicros,
 		ManagedRequestID: managedRequestID,
-	}, fleetCapUSDMicros, author)
+	}, fleetCapUSDMicros, storageUSDMicros, author)
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
@@ -359,15 +365,20 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
 	rows := make([]map[string]string, 0, len(skus))
 	for _, sku := range skus {
+		// The ladder speaks the whole pre-spend rate, decomposed (th-126):
+		// price is the estimated total the pod will bill, gpu and storage its
+		// components. gpu is the rate the accepted quote locks.
 		rows = append(rows, map[string]string{
 			"name": sku.Name, "model": sku.AcceleratorModel,
 			"compute": computeCapabilityText(sku.ComputeCapability),
 			"vram":    fmt.Sprintf("%d GB", sku.VRAMGB),
-			"price":   rentalPrice(sku.PriceUSDMicrosPerHour),
+			"gpu":     rentalPrice(sku.PriceUSDMicrosPerHour),
+			"storage": rentalPrice(sku.StorageUSDMicrosPerHour),
+			"price":   rentalPrice(sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour),
 		})
 	}
 	doc := output.List{
-		Name: "gpus", Fields: []string{"name", "model", "compute", "vram", "price"},
+		Name: "gpus", Fields: []string{"name", "model", "compute", "vram", "gpu", "storage", "price"},
 		Rows: rows, Total: len(rows),
 		Next: []string{"cozy rental new <gpu-name>"},
 	}

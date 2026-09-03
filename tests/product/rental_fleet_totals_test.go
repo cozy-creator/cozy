@@ -2,8 +2,10 @@ package producttest
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -33,5 +35,36 @@ func TestFailedRentalLeavesTheFleetTotals(t *testing.T) {
 	if count != 1 || burn != 720_000 {
 		t.Fatalf("fleet totals = %d machines at %d micros/hour, want the one ready "+
 			"machine at 720000; a proven-absent rental is still counted as spend", count, burn)
+	}
+}
+
+// th-126's fleet-cap red arm: burn is billed-truth money (th-120), so the
+// admission figure for a new rental is the estimated TOTAL it will bill. A SKU
+// whose GPU rate fits the headroom but whose total exceeds it is refused, and
+// the refusal decomposes the figure.
+func TestFleetCapAdmitsTheEstimatedTotalNotTheGPURate(t *testing.T) {
+	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
+	fatal(t, problem)
+	defer store.Close()
+	author := func(machineName string) ([]byte, string, *exit.Error) {
+		return []byte(`{"name":"` + machineName + `"}`), "sha256:" + strings.Repeat("cd", 32), nil
+	}
+	// Cap $0.70/h; the L4 quote is $0.49 GPU + $0.213504 storage = $0.703504.
+	_, _, problem = store.BeginRentalOperation(records.RentalOperation{
+		Key: "op-l4", Hub: "http://127.0.0.1:1", Reason: "cozy rental new l4",
+		HourlyRateUSDMicros: 490_000,
+	}, 700_000, 213_504, author)
+	if problem == nil || problem.ErrName() != "rental.fleet_spend_cap" ||
+		!strings.Contains(problem.Error(), "703504 (490000 gpu + 213504 storage)") {
+		t.Fatalf("a total above the cap was admitted on its GPU rate alone: %v", problem)
+	}
+	// The same SKU under a cap that covers the total is admitted.
+	_, replay, problem := store.BeginRentalOperation(records.RentalOperation{
+		Key: "op-l4-fits", Hub: "http://127.0.0.1:1", Reason: "cozy rental new l4",
+		HourlyRateUSDMicros: 490_000,
+	}, 710_000, 213_504, author)
+	fatal(t, problem)
+	if replay {
+		t.Fatal("a fresh operation replayed")
 	}
 }

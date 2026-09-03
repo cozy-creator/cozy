@@ -163,26 +163,26 @@ func (m *managedRentals) status() (string, *exit.Error) {
 	return m.lineLocked()
 }
 
-func (m *managedRentals) admit(skuName string) (string, int64, *exit.Error) {
+func (m *managedRentals) admit(skuName string) (string, hub.RentalSKU, *exit.Error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if problem := m.reconcileLocked(); problem != nil {
-		return "", 0, problem
+		return "", hub.RentalSKU{}, problem
 	}
 	line, problem := m.lineLocked()
 	if problem != nil {
-		return "", 0, problem
+		return "", hub.RentalSKU{}, problem
 	}
 	skus, problem := m.catalogLocked()
 	if problem != nil {
-		return "", 0, problem
+		return "", hub.RentalSKU{}, problem
 	}
 	for _, sku := range skus {
 		if sku.Name == skuName {
-			return line, sku.PriceUSDMicrosPerHour, m.admitLocked(sku)
+			return line, sku, m.admitLocked(sku)
 		}
 	}
-	return "", 0, exit.Named(exit.Validation, "rental.sku_unavailable",
+	return "", hub.RentalSKU{}, exit.Named(exit.Validation, "rental.sku_unavailable",
 		"Tensorhub currently offers no rental SKU %q", skuName)
 }
 
@@ -272,10 +272,11 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 	if current == nil || settledRequest(current.State) {
 		return none, "", exit.New(exit.Canceled, "request %s settled before rental acquisition", req.ID)
 	}
-	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s\n", sku.Name, usdPerHour(sku.PriceUSDMicrosPerHour))
+	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s\n", sku.Name, skuRate(sku))
 	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name,
 		"managed-rental-"+req.ID, "",
-		sku.PriceUSDMicrosPerHour, m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID)
+		sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
+		m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID)
 	if problem != nil {
 		return none, "", problem
 	}
@@ -311,10 +312,13 @@ func (m *managedRentals) admitLocked(sku hub.RentalSKU) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if burn > cap || sku.PriceUSDMicrosPerHour > cap-burn {
+	// The cap is a SPEND cap and burn is billed-truth money (th-120), so the
+	// figure admitted is the estimated TOTAL the pod will bill — the GPU rate
+	// plus the SKU's storage adder — never the GPU rate alone (th-126).
+	if burn > cap || sku.PriceUSDMicrosPerHour+sku.StorageUSDMicrosPerHour > cap-burn {
 		return exit.Named(exit.Capacity, "rental.fleet_spend_cap",
 			"rental %s at %s would exceed %s",
-			sku.Name, usdPerHour(sku.PriceUSDMicrosPerHour), usdPerHour(cap)).
+			sku.Name, skuRate(sku), usdPerHour(cap)).
 			WithRemedy("raise rentals.max_hourly_spend_usd or end another rental")
 	}
 	return nil
@@ -607,6 +611,19 @@ func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
 
 func usdPerHour(micros int64) string {
 	return usdPerHourBare(micros) + "/hour"
+}
+
+// skuRate is a SKU's pre-spend rate the way a human must read it (th-126):
+// the estimated total the pod will bill, decomposed into the GPU list rate and
+// the spec-derived storage adder. A SKU whose hub itemizes no storage renders
+// as the plain rate.
+func skuRate(sku hub.RentalSKU) string {
+	if sku.StorageUSDMicrosPerHour <= 0 {
+		return usdPerHour(sku.PriceUSDMicrosPerHour)
+	}
+	return usdPerHour(sku.PriceUSDMicrosPerHour+sku.StorageUSDMicrosPerHour) +
+		" (" + usdPerHourBare(sku.PriceUSDMicrosPerHour) + " gpu + " +
+		usdPerHourBare(sku.StorageUSDMicrosPerHour) + " storage)"
 }
 
 // usdPerHourBare is the dollar figure alone, for a line that already says "per hour".

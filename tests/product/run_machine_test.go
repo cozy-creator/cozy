@@ -178,7 +178,7 @@ func TestRunListMachineColumn(t *testing.T) {
 		Key: "op-machine-acquiring", Hub: "http://127.0.0.1:1",
 		Reason:              "managed-rental-req-machine-acquiring",
 		HourlyRateUSDMicros: 100_000, ManagedRequestID: "req-machine-acquiring",
-	}, 10_000_000, func(machineName string) ([]byte, string, *exit.Error) {
+	}, 10_000_000, 0, func(machineName string) ([]byte, string, *exit.Error) {
 		return []byte(`{"name":"` + machineName + `"}`), "sha256:" + strings.Repeat("cd", 32), nil
 	})
 	fatal(t, problem)

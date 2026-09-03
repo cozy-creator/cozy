@@ -151,3 +151,32 @@ func TestReleaseRefusedBeforeRentalSpend(t *testing.T) {
 		})
 	}
 }
+
+// th-126 — the ranking proof: the storage adder is the same for every SKU of a
+// class (one image spec per class), so the cheapest-by-total choice is the
+// cheapest-by-GPU-rate choice the routing always made. A class whose products
+// carried different disks would rank by what the renter actually pays.
+func TestSameSpecStorageAdderLeavesRankingUnchanged(t *testing.T) {
+	skus := offeredSKUs()
+	for i := range skus {
+		if skus[i].AcceleratorModel != "CPU" {
+			skus[i].StorageUSDMicrosPerHour = 213_504
+		}
+	}
+	skus = append(skus, hub.RentalSKU{Name: "l4", AcceleratorModel: "NVIDIA L4",
+		PriceUSDMicrosPerHour: 490_000, StorageUSDMicrosPerHour: 213_504,
+		BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"})
+	sku, mismatch, ok := rental.CheapestCompatibleSKU(skus, true, rental.Constraints{})
+	if !ok || sku.Name != "l4" {
+		t.Fatalf("selected %+v ok=%v mismatch=%q; the same-spec adder must not reorder the ladder", sku, ok, mismatch)
+	}
+	// Different adders DO reorder by true cost: a cheap card on a bloated spec
+	// loses to a dearer card whose pod bills less in total.
+	skus = append(skus, hub.RentalSKU{Name: "l4-bloated", AcceleratorModel: "NVIDIA L4",
+		PriceUSDMicrosPerHour: 480_000, StorageUSDMicrosPerHour: 300_000,
+		BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"})
+	sku, _, ok = rental.CheapestCompatibleSKU(skus, true, rental.Constraints{})
+	if !ok || sku.Name != "l4" {
+		t.Fatalf("selected %+v; want l4 by total (703504 < 780000)", sku)
+	}
+}
