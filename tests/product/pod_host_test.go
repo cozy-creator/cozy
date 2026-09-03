@@ -89,6 +89,12 @@ type fakePod struct {
 	preparedDig        []byte
 	reports            map[string]int // fault text -> reports that carried it
 	offers             []*pb.AttemptOffer
+	// stagedJobBuild is what THIS pod wrote into the job plan records it staged during
+	// preparation — `build_id`, its own placement's environment identity, exactly as
+	// `package_prepare.py::_stage_job_plans` writes it. A JobDirective naming anything
+	// else is what `session.py::apply_job_directive` refuses as `job_plan_mismatch`.
+	stagedJobBuild string
+	jobDirectives  []*pb.JobDirective
 }
 
 // served is the serve arm's ObservedWorkerState: the exact set accepted and converged,
@@ -256,6 +262,9 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			p.mu.Lock()
 			p.desired = append(p.desired, m.DesiredState)
 			p.lanes = append(p.lanes, "placement_set")
+			if job := m.DesiredState.GetJob(); job != nil {
+				p.jobDirectives = append(p.jobDirectives, job)
+			}
 			latched, serve := p.latch != nil, p.serve
 			p.mu.Unlock()
 			if serve && m.DesiredState.GetPlacementSet() != nil {
@@ -448,8 +457,16 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 	if err != nil {
 		return err
 	}
+	prepared, err := canonical.Read(setBytes, &pb.PlacementSet{})
+	if err != nil {
+		return err
+	}
 	p.mu.Lock()
 	p.preparedSet, p.preparedDig = setBytes, setDigest
+	// The Runtime stages this package's job plan records inside THIS call, before the
+	// owner has united anything, so the only build identity it can write is its own
+	// placement's.
+	p.stagedJobBuild = prepared.List("placements")[0].Str("environment_digest")
 	p.mu.Unlock()
 	for _, event := range []*pb.PrepareEvent{
 		{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED, TotalBytes: total},
@@ -935,5 +952,65 @@ func TestPodPlacementRefusedRepeats(t *testing.T) {
 	must(t, err)
 	if !strings.Contains(string(log), "repeated unchanged on "+strconv.Itoa(orchestrator.StillFactor)+" consecutive reports") {
 		t.Errorf("the owner log does not name the repetition verdict")
+	}
+}
+
+// submitPublishedRentalJob queues one published JOB bound to the rented pod, the way
+// `cozy model upload --producer ... --rental-only` does: a job-shaped callable, no
+// install, no model release of its own.
+func submitPublishedRentalJob(t *testing.T, o *owner, pkg, release, planID, idem string) string {
+	t.Helper()
+	requestID, _, e := o.c.Submit(orchestrator.Submission{
+		IdemKey: idem, Package: pkg, Entrypoint: "four-lane", PlanID: planID, Release: release,
+		Kind: "job", Org: "paul", Payload: []byte(`{"steps":4}`), Outputs: []string{"model"},
+		Worker: podRental, Rental: true, RentalRequired: true,
+	})
+	fatal(t, e)
+	return requestID
+}
+
+// TestPodHostJobDirectiveNamesTheStagedBuild: the JOB lane's directive names the BUILD the
+// rented worker staged its job plan records under — its own prepared placement's identity —
+// and not this owner's PlacementSet digest, which the worker never saw while it was
+// staging. Naming the set digest is what `session.py::apply_job_directive` refuses as
+// `job_plan_mismatch`, and it refuses BEFORE any offer, so no producer run can reach a
+// first attempt. The producer path (a job-shaped callable on a rented pod, zero model
+// releases) is the combination that had no test.
+func TestPodHostJobDirectiveNamesTheStagedBuild(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	pod := &fakePod{controlKey: public, serve: true}
+	root := t.TempDir()
+	connection, _ := startFakePod(t, root, pod)
+	o := hostOwner(t, "podhost-job-build", rentalWiring(connection, private))
+
+	planID := "sha256:" + strings.Repeat("35", 32)
+	submitPublishedRentalJob(t, o, "cozy/h3-package", "1.0.7", planID, "job-build-1")
+
+	waitUntil(t, "the JobDirective on WorkerControl", func() bool {
+		pod.mu.Lock()
+		defer pod.mu.Unlock()
+		return len(pod.jobDirectives) >= 1
+	})
+	pod.mu.Lock()
+	defer pod.mu.Unlock()
+	if pod.stagedJobBuild == "" {
+		t.Fatalf("the pod staged its job plans under no build identity")
+	}
+	directive := pod.jobDirectives[0]
+	if directive.BuildId != pod.stagedJobBuild {
+		t.Fatalf("the JobDirective names build %q; the pod staged its job plan under %q",
+			directive.BuildId, pod.stagedJobBuild)
+	}
+	if directive.JobDescriptorId != planID {
+		t.Fatalf("the JobDirective names descriptor %q, not the requested %q",
+			directive.JobDescriptorId, planID)
+	}
+	if !directive.ReclaimOnTerminal {
+		t.Fatalf("the JobDirective does not reclaim on terminal")
+	}
+	setDigest, _ := canonical.Spell(pod.preparedDig)
+	if directive.BuildId == setDigest {
+		t.Fatalf("the JobDirective names the PlacementSet digest, which the worker never staged under")
 	}
 }

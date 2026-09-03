@@ -954,14 +954,23 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		}
 		c.mu.Lock()
 		preparedSet := ""
+		var preparedBytes []byte
 		if worker := c.workers[instance]; worker != nil {
 			preparedSet = spellOf(worker.setDigest)
+			preparedBytes = append([]byte(nil), worker.setBytes...)
 		}
 		c.mu.Unlock()
 		if !validDigest(preparedSet) {
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
 				"rental.package_preparation_identity_missing",
 				"the rented worker staged %s without an exact PlacementSet", req.Package)
+		}
+		// The worker staged its own job plan records during that preparation, under its
+		// own placement's identity. The directive names THAT, read back off the same
+		// document — never this owner's set digest, which the worker never saw.
+		buildID, e := JobBuildID(preparedBytes, req.Package)
+		if e != nil {
+			return WorkerLaunchSpec{}, "", e
 		}
 		weights, e := decodeWeightsOutputs(req.WeightsOutputs)
 		if e != nil {
@@ -971,6 +980,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
 			PlacementSetDigest: preparedSet,
 			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,
+				BuildID:        buildID,
 				Outputs:        strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
 				WeightsOutputs: weights, RSSCap: DefaultJobRSSCap,
 				NeedsAccelerator: req.NeedsAccelerator}},
@@ -1169,11 +1179,15 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		}},
 	}
 	if req.IsJob() {
+		if !w.spec.IsJob() {
+			return 0, exit.Internalf(
+				"worker %s holds no job plan to dispatch job request %s against", w.instanceID, req.ID)
+		}
 		// ONE mode names ONE spec. The per-attempt publication contract names THIS
 		// request's scratch repo, which is why a queue-serving worker can hold one
 		// directive and still publish each attempt into its own place.
 		spec.Spec = &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{
-			BuildId:         w.spec.Placement.PlacementSetDigest,
+			BuildId:         w.spec.Placement.Jobs[0].BuildID,
 			JobDescriptorId: req.PlanID,
 			PublicationContract: &pb.PublicationContract{
 				GrantId: home.ScratchRepo(req.Org, req.ID),
