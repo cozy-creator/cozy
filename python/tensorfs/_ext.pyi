@@ -1,4 +1,34 @@
-from typing import Any
+from typing import Any, Literal
+
+class Store:
+    @staticmethod
+    def open(root: str) -> Store: ...
+    @staticmethod
+    def init(root: str) -> Store: ...
+    @property
+    def root(self) -> str: ...
+    def __getattr__(self, name: str) -> Any: ...
+
+class RepoObjectCache:
+    def __init__(self, root: str) -> None: ...
+    @property
+    def root(self) -> str: ...
+    def admit(
+        self,
+        store: Store,
+        object_id: str,
+        length: int,
+        *,
+        manifest: bool = ...,
+    ) -> Literal["hit", "missing", "corrupt", "unavailable"]: ...
+    def backfill(
+        self,
+        store: Store,
+        object_id: str,
+        length: int,
+        *,
+        manifest: bool = ...,
+    ) -> Literal["stored", "present", "unavailable"]: ...
 
 def parse_header(data: bytes, closure: object | None = ...) -> object: ...
 def _fit(*args: Any, **kwargs: Any) -> object: ...
