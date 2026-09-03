@@ -26,7 +26,11 @@ import (
 // settled attempt, or the moment the hub first said `ready`. rentals.idle_release_s is only
 // how long that must stay true. Its default, five minutes, is a few cold acquisitions: on
 // the fleet proof a cold `--rental` answer took 34–56 s against 0.6 s warm, so an idle pod
-// is worth keeping for a handful of those and no longer.
+// is worth keeping for a handful of those and no longer. "Owed" includes the buy itself
+// (cl-113): a rental bought for a request is that request's debt from the moment the paid
+// row exists — through the whole boot — until the request settles or durably routes to
+// another machine, and the observation reads that debt from the rental row, never from
+// the memory of the goroutine that bought it.
 //
 // managedRentals is deliberately small: one mutex serializes the local fleet ceiling, reuse
 // decision, paid POST, and paid DELETE. The durable rental operation and request rows remain
@@ -53,6 +57,11 @@ func idleReleaseRetry(grace time.Duration) time.Duration { return grace / 5 }
 // rentalIdleness is the one observation the idle release and `cozy rental` share.
 type rentalIdleness struct {
 	Queued, Running int
+	// Owed marks a rental bought for a request that has not settled and has not been
+	// durably routed to another machine (cl-113). The debt starts at the buy — before
+	// the pod is ready, before dispatch pins — so a booting pod whose buyer is still
+	// queued is busy, not idle.
+	Owed bool
 	// Since is the newest fact this host holds about the pod doing anything: the close of
 	// its last settled attempt, or, for a rental that has never run, the moment this host
 	// recorded the hub's `ready`. Zero while the pod is still booting — RentedAt is when it
@@ -65,7 +74,7 @@ type rentalIdleness struct {
 	Spent bool
 }
 
-func (i rentalIdleness) busy() bool { return i.Queued > 0 || i.Running > 0 }
+func (i rentalIdleness) busy() bool { return i.Queued > 0 || i.Running > 0 || i.Owed }
 
 func observeRentalIdle(st *records.Store, row records.Rental) (rentalIdleness, *exit.Error) {
 	var idle rentalIdleness
@@ -88,11 +97,43 @@ func observeRentalIdle(st *records.Store, row records.Rental) (rentalIdleness, *
 		idle.Since = last.ClosedAt
 	}
 	idle.Spent = row.ManagedRequestID != "" && (!found || last.Kind == "job" || last.ClosedAt.IsZero())
+	if idle.Owed, problem = rentalOwedBy(st, row); problem != nil {
+		return idle, problem
+	}
+	if idle.Owed {
+		// The buyer has not settled: the rental's reason is live, not spent.
+		idle.Spent = false
+	}
 	return idle, nil
 }
 
-// releaseAt is when the idle release is due, or false while the rental is busy, still
-// booting, or exempt because rentals.idle_release_s is zero.
+// rentalOwedBy answers whether the request this rental was bought for still owes it a
+// pin: not yet settled, and not durably routed to another machine. The debt is read from
+// the durable rows alone — `rentals.managed_request_id` is written with the paid create —
+// so it holds across a daemon restart and across the whole boot, when the request row
+// still says worker=” because the pin is routing's output (cl-092) and routing has not
+// run yet. Without this, a booting or freshly ready pod looks unowed to every observer
+// and an idle sweep — or any fleet hygiene reading the same records — reaps a pod whose
+// buyer is still queued for it (cl-113, observed live: rental pr-b192da1a released
+// mid-boot while req-ff3f79f4 waited on it).
+func rentalOwedBy(st *records.Store, row records.Rental) (bool, *exit.Error) {
+	if row.ManagedRequestID == "" {
+		return false, nil
+	}
+	owing, problem := st.RequestRow(row.ManagedRequestID)
+	if problem != nil {
+		return false, problem
+	}
+	return owing != nil && !settledRequest(owing.State) &&
+		(owing.Worker == "" || owing.Worker == row.ID), nil
+}
+
+// releaseAt is when the idle release is due, or false while the rental is busy (queued,
+// running, or owed by the request that bought it), still booting, or exempt because
+// rentals.idle_release_s is zero. A rental whose ready_at is unset and which has never
+// settled an attempt has a zero Since and is therefore never idle-released: a pod is
+// never reaped mid-boot (th-105/cl-078) — a terminally failed acquisition ends through
+// the hub's own `failed` state and reconciliation, not through this clock.
 func (i rentalIdleness) releaseAt(grace time.Duration) (time.Time, bool) {
 	if grace <= 0 || i.busy() || i.Since.IsZero() {
 		return time.Time{}, false
@@ -409,7 +450,10 @@ func (m *managedRentals) close() {
 }
 
 // releaseLocked is the paid DELETE, re-observing the row under the lock first: the sweep
-// and the settlement hook both arrive here, and only a pod with nothing pinned to it goes.
+// and the settlement hook both arrive here, and only a pod with nothing queued, running,
+// or owed on it goes. The owed re-check keeps the buy's rollback honest too: acquire
+// releases a rental it just bought only because the buyer settled or routed elsewhere,
+// which is exactly when the debt is gone.
 func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 	row, problem := m.store.RentalRow(id)
 	if problem != nil {
@@ -423,6 +467,13 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 		return "", problem
 	}
 	if queued != 0 || running != 0 {
+		return m.lineLocked()
+	}
+	owed, problem := rentalOwedBy(m.store, *row)
+	if problem != nil {
+		return "", problem
+	}
+	if owed {
 		return m.lineLocked()
 	}
 	operationKey, problem := m.store.RequestRentalRelease(id)
