@@ -121,6 +121,11 @@ held = store.complete_cozytensors_manifests()
 other = tensorfs.Store.open("/srv/tensorfs")
 ```
 
+`Store.init`/`tfs store init` accept only an absent or exactly empty real directory. Use
+`Store.ensure` for normal startup: it initializes that same narrow case, but requires a nonempty
+root to be a real current Store with a valid `tensorfs.sqlite`. Neither operation follows a root
+or namespace symlink, merges foreign files into a Store, or recognizes an older layout.
+
 Move a stopped Store into the new home once, on the same filesystem:
 
 ```bash

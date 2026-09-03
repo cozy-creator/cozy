@@ -288,6 +288,35 @@ impl Store {
     }
 
     pub fn init(root: &Path) -> Result<Store> {
+        match fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return refuse(
+                    Code::STORE_ERA,
+                    format!("{} is not a real Store directory", root.display()),
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(root)
+                    .map_err(|error| io(format!("create Store root {}", root.display()), error))?;
+            }
+            Err(error) => return Err(io(format!("stat Store root {}", root.display()), error)),
+        }
+        if fs::read_dir(root)
+            .map_err(|error| io(format!("read Store root {}", root.display()), error))?
+            .next()
+            .transpose()
+            .map_err(|error| io(format!("read Store root {}", root.display()), error))?
+            .is_some()
+        {
+            return refuse(
+                Code::STORE_ERA,
+                format!(
+                    "{} is not empty; use Store::ensure or Store::open for an existing Store",
+                    root.display()
+                ),
+            );
+        }
         for d in ["repos", "manifests", "blobs", "checkouts", "tmp"] {
             fs::create_dir_all(root.join(d)).map_err(|e| io(format!("mkdir {d}"), e))?;
         }
@@ -1254,7 +1283,7 @@ fn validate_store_root(root: &Path) -> Result<()> {
         let path = root.join(name);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) | Err(_) => {
+            Ok(_) => {
                 return refuse(
                     Code::STORE_ERA,
                     format!(
@@ -1262,6 +1291,21 @@ fn validate_store_root(root: &Path) -> Result<()> {
                         root.display()
                     ),
                 )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return refuse(
+                    Code::STORE_ERA,
+                    format!(
+                        "{} lacks a real {name}/ namespace; old or partial stores require an offline migration",
+                        root.display()
+                    ),
+                )
+            }
+            Err(error) => {
+                return Err(io(
+                    format!("stat Store namespace {}", path.display()),
+                    error,
+                ))
             }
         }
     }

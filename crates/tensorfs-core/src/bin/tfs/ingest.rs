@@ -1282,7 +1282,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     }
     let session = session_of(f, &p);
     let tenant = flag(f, "tenant").unwrap_or("dev").to_string();
-    let mut store = ok!(Store::init(root));
+    let mut store = ok!(Store::open(root));
     if flag_on(f, "progress") {
         store = store.observed(Arc::new(Reporter::default()));
     }

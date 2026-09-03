@@ -96,6 +96,7 @@ fn ensure_initializes_only_absent_or_empty_real_roots() {
         .unwrap()
         .contains(&format!("root:       {}", absent.display())));
     Store::ensure(&absent).unwrap();
+    assert_eq!(Store::init(&absent).unwrap_err().code, Code::STORE_ERA);
     Store::ensure(&absent).unwrap();
 
     let empty = root.join("empty");
@@ -106,6 +107,7 @@ fn ensure_initializes_only_absent_or_empty_real_roots() {
     fs::create_dir(&foreign).unwrap();
     fs::write(foreign.join("somebody-elses-state"), b"keep").unwrap();
     assert_eq!(Store::ensure(&foreign).unwrap_err().code, Code::STORE_ERA);
+    assert_eq!(Store::init(&foreign).unwrap_err().code, Code::STORE_ERA);
     assert!(!foreign.join("repos").exists());
 
     let partial = root.join("partial");
@@ -142,7 +144,14 @@ fn ensure_initializes_only_absent_or_empty_real_roots() {
     let link = root.join("link");
     symlink(&real, &link).unwrap();
     assert_eq!(Store::ensure(&link).unwrap_err().code, Code::STORE_ERA);
+    assert_eq!(Store::init(&link).unwrap_err().code, Code::STORE_ERA);
     assert_eq!(Store::open(&link).unwrap_err().code, Code::STORE_ERA);
+
+    let missing_target = root.join("must-not-be-created");
+    let dangling = root.join("dangling");
+    symlink(&missing_target, &dangling).unwrap();
+    assert_eq!(Store::init(&dangling).unwrap_err().code, Code::STORE_ERA);
+    assert!(!missing_target.exists());
 
     for namespace in ["repos", "manifests", "blobs"] {
         let store_root = root.join(format!("symlink-{namespace}"));
