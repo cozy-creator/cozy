@@ -19,8 +19,8 @@ import (
 // only to materialize Creator's independent local environment.
 const MaxPackageInstallDownloads = 131
 
-// PackageDeclaredFile is one ordinary file selected from the exact generic
-// TensorFS Manifest. The hub echoes these refs only to authorize missing uploads.
+// PackageDeclaredFile is one ordinary file in a publication session. Tensorhub journals
+// the declaration and echoes these refs only to authorize missing uploads.
 type PackageDeclaredFile struct {
 	Digest string `json:"digest"`
 	Length int64  `json:"length"`
