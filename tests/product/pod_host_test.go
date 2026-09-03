@@ -75,19 +75,20 @@ type fakePod struct {
 	// slots is the advertised seat count while serving; zero means one.
 	slots uint32
 
-	mu            sync.Mutex
-	acks          []*pb.SnapshotAck
-	desired       []*pb.DesiredWorkerState
-	prepares      []*pb.PreparePackageSetCall
-	localPrepares []*pb.PrepareLocalPackageCall
-	grants        []*pb.LocalPackageFileGrant
-	lanes         []string // the order lanes were used: fetch, prepare_private, placement_set
-	prepareCodes  []codes.Code
-	hostDigest    []byte
-	preparedSet   []byte
-	preparedDig   []byte
-	reports       map[string]int // fault text -> reports that carried it
-	offers        []*pb.AttemptOffer
+	mu                 sync.Mutex
+	acks               []*pb.SnapshotAck
+	desired            []*pb.DesiredWorkerState
+	prepares           []*pb.PreparePackageSetCall
+	localPrepares      []*pb.PrepareLocalPackageCall
+	grants             []*pb.LocalPackageFileGrant
+	lanes              []string // the order lanes were used: fetch, prepare_private, placement_set
+	prepareCodes       []codes.Code
+	prepareUnavailable int
+	hostDigest         []byte
+	preparedSet        []byte
+	preparedDig        []byte
+	reports            map[string]int // fault text -> reports that carried it
+	offers             []*pb.AttemptOffer
 }
 
 // served is the serve arm's ObservedWorkerState: the exact set accepted and converged,
@@ -389,7 +390,14 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 	}
 	p.mu.Lock()
 	p.prepares = append(p.prepares, call)
+	unavailable := p.prepareUnavailable > 0
+	if unavailable {
+		p.prepareUnavailable--
+	}
 	p.mu.Unlock()
+	if unavailable {
+		return status.Error(codes.Unavailable, "Tensorhub is restarting")
+	}
 	total := uint64(18_874_368)
 	selected := delegation.List("packages")
 	if len(selected) != 1 {
