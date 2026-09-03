@@ -500,21 +500,21 @@ impl PyStore {
     #[staticmethod]
     #[pyo3(signature = (root = None))]
     fn ensure(py: Python<'_>, root: Option<PathBuf>) -> PyResult<PyStore> {
-        let root = tensorfs_core::home::resolve(root.as_deref()).or_refuse(py)?;
+        let root = tensorfs_core::home::store_root(root.as_deref()).or_refuse(py)?;
         open_store(py, root, CoreStore::ensure)
     }
 
     #[staticmethod]
     #[pyo3(signature = (root = None))]
     fn open(py: Python<'_>, root: Option<PathBuf>) -> PyResult<PyStore> {
-        let root = tensorfs_core::home::resolve(root.as_deref()).or_refuse(py)?;
+        let root = tensorfs_core::home::store_root(root.as_deref()).or_refuse(py)?;
         open_store(py, root, CoreStore::open)
     }
 
     #[staticmethod]
     #[pyo3(signature = (root = None))]
     fn init(py: Python<'_>, root: Option<PathBuf>) -> PyResult<PyStore> {
-        let root = tensorfs_core::home::resolve(root.as_deref()).or_refuse(py)?;
+        let root = tensorfs_core::home::store_root(root.as_deref()).or_refuse(py)?;
         open_store(py, root, CoreStore::init)
     }
 

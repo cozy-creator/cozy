@@ -10,6 +10,10 @@
 //! --range <off>:<len> --rate <f> --pass <n> --slow-ms <n>
 //! --size <bytes> --small <n>, plus the dev-only kill points --fault <stage> --ready <path>.
 //!
+//! A Store is created only where someone said to: `tfs store init|ensure <root>`, or the same
+//! verbs over `TENSORFS_HOME`. Every other command REFUSES a root that does not exist, and the
+//! `~/.tensorfs` fallback is opened, never conjured (tfs-053).
+//!
 //!   tfs store init|info <root>
 //!   tfs store ensure [<root>]
 //!   tfs store prepare-readers [<root>]
@@ -558,8 +562,10 @@ fn cmd_home_migrate(source: &Path, flags: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The no-root spelling of a `store` verb. It uses `TENSORFS_HOME`, or an existing
+/// `$HOME/.tensorfs` — never a Store it would have to invent (tfs-053).
 fn cmd_store_default(verb: &str) -> ExitCode {
-    cmd_store(&ok!(tensorfs_core::home::resolve(None)), verb)
+    cmd_store(&ok!(tensorfs_core::home::store_root(None)), verb)
 }
 
 fn cmd_store(root: &Path, verb: &str) -> ExitCode {
@@ -574,7 +580,7 @@ fn cmd_store(root: &Path, verb: &str) -> ExitCode {
 }
 
 fn cmd_store_prepare_readers(explicit: Option<&Path>) -> ExitCode {
-    let root = ok!(tensorfs_core::home::resolve(explicit));
+    let root = ok!(tensorfs_core::home::store_root(explicit));
     let store = ok!(Store::open(&root));
     ok!(store.prepare_readers());
     println!("root:       {}", store.root().display());
@@ -583,7 +589,7 @@ fn cmd_store_prepare_readers(explicit: Option<&Path>) -> ExitCode {
 }
 
 fn cmd_store_complete_cozytensors(explicit: Option<&Path>) -> ExitCode {
-    let root = ok!(tensorfs_core::home::resolve(explicit));
+    let root = ok!(tensorfs_core::home::store_root(explicit));
     let store = ok!(Store::open(&root));
     for manifest in ok!(store.complete_cozytensors_manifests()) {
         println!("{manifest}");

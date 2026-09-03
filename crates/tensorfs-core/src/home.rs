@@ -2,6 +2,12 @@
 //!
 //! Core Store operations remain explicit-root. This resolver exists for user-facing entrypoints
 //! and never consults another product's home or configuration.
+//!
+//! A root the operator NAMED — a positional argument or `TENSORFS_HOME` — is a place they asked
+//! for. `$HOME/.tensorfs` is a guess, so it is only ever OPENED: no command conjures a Store
+//! there, and nothing creates a Store in whatever directory a process happens to be run from
+//! (tfs-053). Creation stays with the verbs that say so, `tfs store init` and `tfs store ensure`,
+//! over a root that was named.
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -19,10 +25,43 @@ pub struct MoveReport {
     pub destination: PathBuf,
 }
 
+/// Where a resolved root came from. `Named` roots were asked for; `Fallback` is a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Named,
+    Fallback,
+}
+
 /// Resolve an optional caller-supplied Store root.
 ///
-/// Precedence is explicit argument, `TENSORFS_HOME`, then `$HOME/.tensorfs`.
+/// Precedence is explicit argument, `TENSORFS_HOME`, then `$HOME/.tensorfs`. This answers WHERE
+/// a Store would live; it neither requires nor creates one. `tfs home` prints exactly this.
 pub fn resolve(explicit: Option<&Path>) -> Result<PathBuf> {
+    Ok(resolve_env(explicit)?.0)
+}
+
+/// The Store root of a command that needs a Store.
+///
+/// A named root — argument or `TENSORFS_HOME` — is used as given, and `tfs store init`/`ensure`
+/// may bring it into existence. The `$HOME/.tensorfs` fallback is accepted only for a Store that
+/// ALREADY exists: with nothing named and nothing there, every command refuses instead of
+/// materializing a database nobody asked for.
+pub fn store_root(explicit: Option<&Path>) -> Result<PathBuf> {
+    let (root, origin) = resolve_env(explicit)?;
+    if origin == Origin::Named || root.is_dir() {
+        return Ok(root);
+    }
+    refuse(
+        Code::STORE_ROOT_ABSENT,
+        format!(
+            "no Store root was given and the default {} does not exist: name a root, set {ENV}, \
+             or create one with `tfs store init <root>`",
+            root.display()
+        ),
+    )
+}
+
+fn resolve_env(explicit: Option<&Path>) -> Result<(PathBuf, Origin)> {
     resolve_values(
         explicit,
         std::env::var_os(ENV).map(PathBuf::from).as_deref(),
@@ -34,15 +73,17 @@ fn resolve_values(
     explicit: Option<&Path>,
     tensorfs_home: Option<&Path>,
     user_home: Option<&Path>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, Origin)> {
     if let Some(root) = explicit {
-        return nonempty("explicit TensorFS root", root);
+        return Ok((nonempty("explicit TensorFS root", root)?, Origin::Named));
     }
     if let Some(root) = tensorfs_home {
-        return nonempty(ENV, root);
+        return Ok((nonempty(ENV, root)?, Origin::Named));
     }
     match user_home {
-        Some(root) if !root.as_os_str().is_empty() => Ok(root.join(".tensorfs")),
+        Some(root) if !root.as_os_str().is_empty() => {
+            Ok((root.join(".tensorfs"), Origin::Fallback))
+        }
         _ => refuse(
             Code::IO_FAILED,
             "TensorFS root is absent: pass one explicitly, set TENSORFS_HOME, or set HOME",
@@ -162,7 +203,7 @@ mod tests {
                 Some(Path::new("/user")),
             )
             .unwrap(),
-            Path::new("/explicit"),
+            (PathBuf::from("/explicit"), Origin::Named),
         );
         assert_eq!(
             resolve_values(
@@ -171,11 +212,11 @@ mod tests {
                 Some(Path::new("/user"))
             )
             .unwrap(),
-            Path::new("/environment"),
+            (PathBuf::from("/environment"), Origin::Named),
         );
         assert_eq!(
             resolve_values(None, None, Some(Path::new("/user"))).unwrap(),
-            Path::new("/user/.tensorfs"),
+            (PathBuf::from("/user/.tensorfs"), Origin::Fallback),
         );
     }
 

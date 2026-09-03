@@ -83,6 +83,7 @@ codes![
     VECTOR_MISMATCH,
     // object store
     STORE_ERA,
+    STORE_ROOT_ABSENT,
     OBJECT_ABSENT,
     OBJECT_CORRUPT,
     RANGE_BOUNDS,

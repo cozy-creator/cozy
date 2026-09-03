@@ -861,10 +861,38 @@ pub struct WriterGuard {
     _recovery: File,
 }
 
+/// `tmp/writers` inside a root that already exists.
+///
+/// A writer marker is never the thing that brings a root into being: pointed at an absent path
+/// this used to lay down a directory tree wherever the caller happened to be (tfs-053).
+fn writer_markers(root: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return refuse(
+                Code::STORE_ERA,
+                format!("{} is not a real Store directory", root.display()),
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return refuse(
+                Code::STORE_ROOT_ABSENT,
+                format!(
+                    "{} does not exist; create the root before writing into it",
+                    root.display()
+                ),
+            )
+        }
+        Err(error) => return Err(io(format!("stat root {}", root.display()), error)),
+    }
+    let directory = root.join("tmp/writers");
+    fs::create_dir_all(&directory).map_err(|error| io("mkdir writer markers", error))?;
+    Ok(directory)
+}
+
 impl WriterGuard {
     pub fn acquire(root: &Path) -> Result<Self> {
-        let directory = root.join("tmp/writers");
-        fs::create_dir_all(&directory).map_err(|error| io("mkdir writer markers", error))?;
+        let directory = writer_markers(root)?;
         let recovery = File::options()
             .create(true)
             .truncate(false)
@@ -894,8 +922,7 @@ impl WriterGuard {
     }
 
     pub fn lock_rebuild(root: &Path) -> Result<RebuildGuard> {
-        let directory = root.join("tmp/writers");
-        fs::create_dir_all(&directory).map_err(|error| io("mkdir writer markers", error))?;
+        let directory = writer_markers(root)?;
         let recovery = File::options()
             .create(true)
             .truncate(false)
