@@ -12,7 +12,7 @@ type CLI struct {
 	Auth    AuthCmd    `cmd:"" group:"Authentication" help:"Authenticate this machine to Tensorhub."`
 	Run     RunCmd     `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
 	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud."`
-	Volume  VolumeCmd  `cmd:"" group:"Rentals" help:"Keep a persistent model store in a datacenter you rent in."`
+	Volume  VolumeCmd  `cmd:"" group:"Rentals" help:"Manage an optional repo-object cache in a datacenter you rent in."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
 	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
 	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
@@ -386,8 +386,8 @@ func (c *RentalListCmd) Run(r *Runtime) error {
 
 type VolumeCmd struct {
 	Current VolumeListCmd `cmd:"" default:"1" hidden:""`
-	Warm    VolumeWarmCmd `cmd:"" help:"Create the standing volume in a datacenter before renting there."`
-	Drop    VolumeDropCmd `cmd:"" help:"Permanently delete a standing volume and its bytes."`
+	Warm    VolumeWarmCmd `cmd:"" help:"Create an optional cache volume in a datacenter before renting there."`
+	Drop    VolumeDropCmd `cmd:"" help:"Delete a disposable cache volume and its cached copies."`
 }
 
 type VolumeListCmd struct{}
