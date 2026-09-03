@@ -9,7 +9,7 @@ element sizes come from `DTYPES`, which is the compiled dtype enum, exported onc
 
     import torch, tensorfs
 
-    store = tensorfs.Store.open("/var/lib/cozy/store")
+    store = tensorfs.Store.open("/var/lib/tensorfs")
     manifest = store.manifest(manifest_id)
     plan  = tensorfs.plan(manifest["header"], traversal, window=WINDOW)
 
@@ -54,6 +54,7 @@ from ._ext import (
     fetch_complete_cozytensors,
     fetch_plan,
     gc,
+    home,
     manifest_max_bytes,
     object_id,
     parse_header as _parse_header,
@@ -215,6 +216,7 @@ __all__ = [
     "fetch_complete_cozytensors",
     "fetch_plan",
     "gc",
+    "home",
     "manifest_max_bytes",
     "object_id",
     "parse_header",

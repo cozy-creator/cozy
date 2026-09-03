@@ -51,11 +51,24 @@ echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/facade-conform.py
 
 "$work/venv/bin/python" - "$fixture" "$SNAP" <<'PY'
-import hashlib, pathlib, sys, tempfile
+import hashlib, os, pathlib, sys, tempfile
 
 store_path, snap = pathlib.Path(sys.argv[1]), sys.argv[2]
 import tensorfs
 print("import tensorfs OK ->", tensorfs.__file__, tensorfs.__version__)
+
+with tempfile.TemporaryDirectory(prefix="tensorfs-default-home-") as default_root:
+    os.environ["TENSORFS_HOME"] = default_root
+    os.environ["COZY_HOME"] = str(pathlib.Path(default_root) / "must-not-be-read")
+    assert tensorfs.home() == default_root
+    assert tensorfs.home(pathlib.Path(default_root) / "explicit") == str(
+        pathlib.Path(default_root) / "explicit"
+    )
+    default_store = tensorfs.Store.init()
+    assert default_store.root == default_root
+    assert not pathlib.Path(os.environ["COZY_HOME"]).exists()
+    del os.environ["TENSORFS_HOME"]
+    del os.environ["COZY_HOME"]
 
 assert "torch" not in sys.modules, "torch leaked into sys.modules"
 print("torch in sys.modules:", "torch" in sys.modules, "| dtypes:", len(tensorfs.DTYPES))

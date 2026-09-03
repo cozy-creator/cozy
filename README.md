@@ -95,6 +95,41 @@ Plus one bounded operational DTO, `source-plan.json`, specified below. Naming th
 make them stored formats; refusing to name them only made the count look smaller than the
 system.
 
+## Store root
+
+TensorFS owns its Store location independently of Creator. User-facing entrypoints resolve one
+default in this order: an explicit argument, `TENSORFS_HOME`, then `$HOME/.tensorfs`. They never
+read `COZY_HOME`. Core Rust Store operations remain explicit-root.
+
+```bash
+tfs home
+tfs store init
+TENSORFS_HOME=/var/lib/tensorfs tfs store info
+```
+
+Python exposes the same resolver. Passing a root remains supported and always wins:
+
+```python
+import tensorfs
+
+root = tensorfs.home()
+store = tensorfs.Store.open()
+other = tensorfs.Store.open("/srv/tensorfs")
+```
+
+Move a stopped Store into the new home once, on the same filesystem:
+
+```bash
+tfs home migrate ~/.cozy/cas
+# or: tfs home migrate /old/store --to /var/lib/tensorfs
+```
+
+This is an offline operator command: stop every process that could open the Store first. The
+destination must not exist. TensorFS also refuses already-active holders, source symlinks, and
+cross-filesystem moves, performs one atomic rename, and leaves no redirect or fallback at the old
+path. A same-filesystem rename preserves device, inode, and mtime, so the existing verification
+catalog opens without rehashing payloads.
+
 ## Build and test
 
 The native wheel is `cp312-abi3`, so CPython 3.12 is the floor and every later CPython loads
@@ -131,9 +166,9 @@ TensorFS 0.3.0 intentionally has no pre-0.3.0 header reader. Existing 0.1.2 root
 directly, and intermediate 0.2.x roots use the same standalone tool:
 
 ```bash
-uv run tools/migrate-to-0.3.0.py /var/lib/cozy/store \
+uv run tools/migrate-to-0.3.0.py /var/lib/tensorfs \
   --tfs /path/to/tensorfs-0.3.0/tfs
-uv run tools/migrate-to-0.3.0.py /var/lib/cozy/store \
+uv run tools/migrate-to-0.3.0.py /var/lib/tensorfs \
   --tfs /path/to/tensorfs-0.3.0/tfs --apply
 ```
 

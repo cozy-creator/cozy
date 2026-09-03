@@ -53,6 +53,13 @@ fn py_platform_gate(py: Python<'_>, platform: &str) -> PyResult<()> {
     platform_gate(platform).map_err(|e| errors::to_py(py, &e))
 }
 
+#[pyfunction(name = "home", signature = (root = None))]
+fn py_home(py: Python<'_>, root: Option<std::path::PathBuf>) -> PyResult<String> {
+    tensorfs_core::home::resolve(root.as_deref())
+        .map(|path| path.display().to_string())
+        .map_err(|error| errors::to_py(py, &error))
+}
+
 #[pymodule]
 fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
@@ -72,6 +79,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add("__version__", python_distribution_version())?;
     m.add_function(wrap_pyfunction!(py_platform_gate, m)?)?;
+    m.add_function(wrap_pyfunction!(py_home, m)?)?;
 
     m.add_function(wrap_pyfunction!(docs::object_id, m)?)?;
     m.add_function(wrap_pyfunction!(docs::parse_header, m)?)?;

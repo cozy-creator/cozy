@@ -18,6 +18,7 @@ pub mod fill;
 pub mod fit;
 pub mod gc;
 pub mod header;
+pub mod home;
 pub mod ids;
 pub mod ingest;
 pub mod jcs;

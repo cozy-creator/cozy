@@ -498,12 +498,16 @@ fn open_store(py: Python<'_>, root: PathBuf, init: bool) -> PyResult<PyStore> {
 #[pymethods]
 impl PyStore {
     #[staticmethod]
-    fn open(py: Python<'_>, root: PathBuf) -> PyResult<PyStore> {
+    #[pyo3(signature = (root = None))]
+    fn open(py: Python<'_>, root: Option<PathBuf>) -> PyResult<PyStore> {
+        let root = tensorfs_core::home::resolve(root.as_deref()).or_refuse(py)?;
         open_store(py, root, false)
     }
 
     #[staticmethod]
-    fn init(py: Python<'_>, root: PathBuf) -> PyResult<PyStore> {
+    #[pyo3(signature = (root = None))]
+    fn init(py: Python<'_>, root: Option<PathBuf>) -> PyResult<PyStore> {
+        let root = tensorfs_core::home::resolve(root.as_deref()).or_refuse(py)?;
         open_store(py, root, true)
     }
 
