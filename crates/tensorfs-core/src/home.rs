@@ -60,8 +60,9 @@ fn nonempty(source: &str, root: &Path) -> Result<PathBuf> {
 /// Move one stopped Store into the resolved TensorFS home without copying or rehashing it.
 ///
 /// The destination must not exist and both parents must be on the same filesystem. The Store's
-/// recovery lock excludes readers and writers during the atomic rename. No redirect is left at
-/// the old path.
+/// recovery lock refuses already-active readers and writers. This is still an offline operator
+/// command: possible Store openers must be stopped so none can recreate the retired pathname
+/// after the rename. No redirect or reservation is left at the old path.
 pub fn move_store(source: &Path, explicit_destination: Option<&Path>) -> Result<MoveReport> {
     let source_metadata = fs::symlink_metadata(source).map_err(|error| io("stat source", error))?;
     if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {

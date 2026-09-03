@@ -1,9 +1,10 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tensorfs_core::catalog::WriterGuard;
 use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::store::{Fault, Store, Verdict};
 
@@ -39,6 +40,16 @@ fn run_home(tensorfs_home: Option<&Path>, user_home: &Path, args: &[&str]) -> St
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn migrate(root: &Path, source: &Path, destination: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["home", "migrate", source.to_str().unwrap()])
+        .env("TENSORFS_HOME", destination)
+        .env("HOME", root.join("poison-home"))
+        .env("COZY_HOME", root.join("poison-cozy"))
+        .output()
+        .unwrap()
 }
 
 #[test]
@@ -98,13 +109,7 @@ fn migration_is_one_atomic_move_and_keeps_verification_identity() {
         .unwrap();
     let before = fs::metadata(store.blob_path(&object.sha256)).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args(["home", "migrate", source.to_str().unwrap()])
-        .env("TENSORFS_HOME", &destination)
-        .env("HOME", root.join("poison-home"))
-        .env("COZY_HOME", root.join("poison-cozy"))
-        .output()
-        .unwrap();
+    let output = migrate(&root, &source, &destination);
     assert!(
         output.status.success(),
         "{}",
@@ -138,18 +143,53 @@ fn migration_refuses_any_destination_conflict_without_moving_source() {
     Store::init(&source).unwrap();
     Store::init(&destination).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args(["home", "migrate", source.to_str().unwrap()])
-        .env("TENSORFS_HOME", &destination)
-        .env("HOME", root.join("poison-home"))
-        .env("COZY_HOME", root.join("poison-cozy"))
-        .output()
-        .unwrap();
+    let output = migrate(&root, &source, &destination);
     assert!(!output.status.success());
     assert!(String::from_utf8(output.stderr)
         .unwrap()
         .contains("already exists"));
     assert!(source.is_dir());
     assert!(destination.is_dir());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn migration_refuses_a_live_holder_without_moving_the_store() {
+    let root = temporary("migration-live");
+    let source = root.join(".cozy/cas");
+    let destination = root.join(".tensorfs");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    Store::init(&source).unwrap();
+    let _active = WriterGuard::acquire(&source).unwrap();
+
+    let output = migrate(&root, &source, &destination);
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("STORE_BUSY"));
+    assert!(source.is_dir());
+    assert!(!destination.exists());
+    drop(_active);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn migration_refuses_a_source_symlink_without_following_it() {
+    let root = temporary("migration-symlink");
+    let real = root.join("real-store");
+    let source = root.join("legacy-link");
+    let destination = root.join(".tensorfs");
+    fs::create_dir_all(&root).unwrap();
+    Store::init(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &source).unwrap();
+
+    let output = migrate(&root, &source, &destination);
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("not a TensorFS Store directory"));
+    assert!(source.is_symlink());
+    assert!(real.is_dir());
+    assert!(!destination.exists());
     fs::remove_dir_all(root).unwrap();
 }
