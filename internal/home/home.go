@@ -53,9 +53,6 @@ type Layout struct {
 	// LocalPackages holds exact ephemeral wheel revisions for rented local-package
 	// commands. It is staging the daemon alone writes, never a catalog.
 	LocalPackages string
-	// Companions holds this host's CUDA-profile image-owned companion wheels (cr-086
-	// arm 0). Nothing creates it; a host that has none installs without it.
-	Companions string
 	// Log is the Cozy daemon's own log, bounded by rotation on an observed size
 	// (internal/daemon.OpenLog). Its one rotated predecessor is Log + ".1".
 	Log string
@@ -89,7 +86,6 @@ func Open(root string) (Layout, *exit.Error) {
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
 	l.LocalPackages = filepath.Join(root, "local-packages")
-	l.Companions = filepath.Join(root, "companions")
 	l.Log = filepath.Join(root, "daemon.log")
 	// A prior root's records.db is the same database under its retired name. The rename
 	// runs here — cheap, idempotent, and before any open — so no second code path ever
