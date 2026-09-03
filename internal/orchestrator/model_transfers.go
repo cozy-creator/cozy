@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -314,7 +315,11 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 	// stream rather than only for members this owner has not yet seen verified — otherwise
 	// a pod that restarted under a live rental is asked to prepare over a selection it was
 	// never told about, and the transfer dies naming files nobody named to it.
-	restated := uint64(0)
+	//
+	// The key carries the BOOT, not the epoch alone: the pod mints control-stream epochs
+	// from a counter that starts over with the process, so a restarted supervisor hands out
+	// epoch 1 again — and that is precisely the pod whose index is empty.
+	restated := ""
 	for {
 		transfer, problem := c.opt.Store.ModelTransferOf(req.ID)
 		if problem != nil {
@@ -353,7 +358,8 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		// The frames go out in ONE pass, in member order, and a preparation sent in the
 		// same pass is read after all of them: the pod registers every member off its
 		// control read loop before it considers a preparation for the same operation.
-		first := restated != session.epoch
+		stream := fmt.Sprintf("%s/%d", session.bootID, session.epoch)
+		first := restated != stream
 		for _, member := range members {
 			if !first && revisions[member] != 0 && statusOf(statuses, member) == "verified" {
 				continue
@@ -370,7 +376,7 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 					CapabilityRevision: uint64(revisions[member] + 1)}}})
 		}
 		if first {
-			restated = session.epoch
+			restated = stream
 			c.logf("model transfer %s: stating all %d selected source file(s) to %s on "+
 				"control stream %d; a member this pod already holds is answered from its "+
 				"TensorFS store and moves nothing",
