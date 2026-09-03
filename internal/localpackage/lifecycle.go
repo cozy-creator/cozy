@@ -117,6 +117,9 @@ func DropDigestUnowned(layout home.Layout, store *records.Store, digest string) 
 func Sweep(layout home.Layout, store *records.Store) *exit.Error {
 	entries, err := os.ReadDir(layout.LocalPackages)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return exit.Internalf("cannot scan local package revisions: %s", err)
 	}
 	for _, entry := range entries {

@@ -179,6 +179,28 @@ func (c *Client) Submit(sub api.Submission, key string) (api.Handle, *exit.Error
 }
 
 // Request reads one request's lifecycle document.
+// Triage fetches one attempt's kept triage bundle — raw bytes, already verified by the
+// daemon against the terminal's own reference before it was stored (cl-116).
+func (c *Client) Triage(attemptKey string) ([]byte, *exit.Error) {
+	req, e := c.request(http.MethodGet, "/v1/local/attempts/"+url.PathEscape(attemptKey)+"/triage", nil)
+	if e != nil {
+		return nil, e
+	}
+	res, err := c.http.Do(req)
+	if err != nil {
+		return nil, c.unreachable(err)
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(res.Body, 2<<20))
+	if err != nil {
+		return nil, exit.Internalf("the triage bundle could not be read: %s", err)
+	}
+	if res.StatusCode >= 300 {
+		return nil, Refusal(res.StatusCode, data)
+	}
+	return data, nil
+}
+
 func (c *Client) Request(id string) (api.Lifecycle, *exit.Error) {
 	var life api.Lifecycle
 	e := c.call("GET", "/v1/requests/"+id, nil, &life)

@@ -21,11 +21,18 @@ func freeBytes(dir string) (int64, bool) {
 	return int64(avail), true
 }
 
-// Windows' FileInfo carries no link count (the Win32 find data has none), so a
-// hardlinked file is indistinguishable from an exclusive one here and every byte is
-// charged to this install. It over-reports exclusive bytes; it never invents shared
-// ones, and `cozy package list` prints a number that is at worst pessimistic.
-func hardlinked(fs.FileInfo) bool { return false }
+// inodeKey mirrors the unix identity; unused on Windows, where the Win32 find data
+// carries no link count.
+type inodeKey struct {
+	dev uint64
+	ino uint64
+}
+
+// Windows' FileInfo carries no link count, so a hardlinked file is indistinguishable
+// from an exclusive one here and every byte is charged to this install by logical
+// length. It over-reports exclusive bytes; it never invents shared ones, and `cozy
+// package list` prints a number that is at worst pessimistic.
+func inode(fs.FileInfo) (inodeKey, uint64, int64, bool) { return inodeKey{}, 0, 0, false }
 
 // Windows requires the writable bit for a read-only file to be removed. Directories
 // also need traversal permission while the retired tree is walked.

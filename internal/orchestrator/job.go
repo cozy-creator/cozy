@@ -328,6 +328,43 @@ func (c *Orchestrator) promote(req records.Request, attempt uint64, outputs []re
 	return nil
 }
 
+// cleanupPublication settles the publication plane for one SETTLED job request: the
+// staging tree is over either way, and a root no committed publication row names holds
+// nothing a reader can reach — the audit's 51 empty directories were exactly these,
+// left by failed and canceled jobs (cl-116). Empty parents are pruned so the plane
+// itself disappears when no job holds it. Idempotent, like everything after a terminal.
+func (c *Orchestrator) cleanupPublication(req records.Request) {
+	if !req.IsJob() {
+		return
+	}
+	root := c.opt.Layout.PublicationRoot(req.Org, req.ID)
+	publication, problem := c.opt.Store.PublicationOf(req.ID)
+	if problem != nil {
+		c.logf("request %s publication cleanup deferred: %s", req.ID, problem.Message)
+		return
+	}
+	target := filepath.Join(root, ".staging")
+	if publication == nil {
+		target = root
+	}
+	if err := os.RemoveAll(target); err != nil {
+		c.logf("request %s publication cleanup deferred: %s", req.ID, err)
+		return
+	}
+	prunePublicationParents(c.opt.Layout, root)
+}
+
+// prunePublicationParents removes the empty directories a settled job leaves between
+// its root and the plane, the plane included. Each remove refuses on a non-empty
+// directory, so a committed sibling publication is structurally safe.
+func prunePublicationParents(l home.Layout, root string) {
+	for dir := root; strings.HasPrefix(dir, l.Publications); dir = filepath.Dir(dir) {
+		if os.Remove(dir) != nil {
+			return
+		}
+	}
+}
+
 // ------------------------------------------------------------------ the checkpoint lane
 
 // onCheckpoint answers the DURABLE checkpoint exchange. The worker blocked on this frame

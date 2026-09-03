@@ -353,7 +353,7 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("first editable invocation did not run source [exit %d]\n%s\n%s",
 			code, out, productWorkerLogs(root))
 	}
-	store, problem := records.Open(filepath.Join(root, "records.db"))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	requests, problem := store.RequestsOfKind("serving", "", "", 10)
 	fatal(t, problem)
@@ -487,7 +487,7 @@ func activePackageInstall(t *testing.T, root string) records.PackageInstall {
 
 func activeInstall(t *testing.T, root, packageRef string) records.PackageInstall {
 	t.Helper()
-	store, problem := records.Open(filepath.Join(root, "records.db"))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	_, install, problem := store.ActivePackage(packageRef)

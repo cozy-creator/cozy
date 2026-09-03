@@ -127,7 +127,9 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 	if problem != nil {
 		return daemon.State{}, false, problem
 	}
-	staleCredential, _ := os.ReadFile(layout.Client)
+	// The daemon record carries the per-launch token; a relaunch rewrites the whole
+	// body, so "the bytes changed" is exactly "a fresh daemon minted a fresh token".
+	staleCredential, _ := os.ReadFile(layout.Daemon)
 	var child *daemonChild
 	var childResult *daemonExit
 	started := false
@@ -141,7 +143,7 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 	defer tick.Stop()
 	for {
 		if state := daemon.Probe(ctx.Cfg); state.Up {
-			current, _ := os.ReadFile(layout.Client)
+			current, _ := os.ReadFile(layout.Daemon)
 			credentialReady := !started || !bytes.Equal(current, staleCredential)
 			if credentialReady {
 				if _, problem := api.ClientCredential(layout); problem == nil && uiReady(state.Addr) {

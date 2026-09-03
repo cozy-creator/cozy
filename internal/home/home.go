@@ -12,70 +12,52 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/flock"
 )
 
-// Layout is the resolved set of paths every cl-009 verb works against.
+// Layout is the resolved set of paths every cl-009 verb works against. Every
+// top-level entry is one of: durable Creator authority, user-owned input/output,
+// protected credential, immutable install, bounded log, runtime lock, or typed live
+// work (proto-030's home diet, carried by cl-116). Everything else was deleted or
+// nested under its owner; nothing here may reintroduce a retired root.
 type Layout struct {
 	Root     string
-	DB       string // the one local SQLite lifecycle database
+	DB       string // creator.sqlite — the one local SQLite lifecycle database
 	Installs string // one immutable directory per package install
-	Lock     string // the single-writer flock file
-	Daemon   string // the Cozy daemon's liveness lock (cl-001; held, never read)
-	Workers  string // per-worker roots: journal, logs, staged binding plans
+	Lock     string // installs/.lock — the install-filesystem single-writer flock
+	// Daemon is the Cozy daemon's lifetime ownership/address record (cl-001). The live
+	// owner holds its kernel lock and publishes the client address, worker socket and
+	// the per-launch CLI token under it, mode 0600. There is no separate client.cred.
+	Daemon  string
+	Workers string // per-worker roots: journal, logs, staged binding plans (live only)
 	// Outputs is the user-facing store: `<org>-<package>/<digest>.<ext>`, one file per
 	// result file, named by its own content digest so a regenerated file lands on itself.
-	// It is the directory a local serving grant names: the worker writes the result
-	// there under its digest name, and nothing is staged anywhere first.
+	// User-owned result files are never automatically removed.
 	Outputs string
-	// Inputs is the immutable, content-addressed staging area for caller-owned assets.
-	// Request rows point here so requeue never depends on the submitting CLI or its
-	// original path still existing.
+	// Inputs is the content-addressed request input store, created on demand. cl-116's
+	// end state narrows it to uploaded/streamed bodies only — bytes without a stable
+	// caller path; the zero-copy local-CLI-file arm is still open and Stage currently
+	// copies those too.
 	Inputs string
-	// Uploads is the private content-addressed store for bytes received through the
-	// localhost upload API. Browser/API callers name opaque ids, never paths.
-	Uploads string
-	// CAS is the shared local tensorfs store: the one place canonical bytes live on
-	// this host. cozy-creator names it and never writes into it — every byte crosses
-	// through the tfs binary (cl-012).
-	CAS string
-	// Tmp is THE ONE place for bytes in flight (owner ruling 2026-09-02): a model source
-	// downloaded for ingest lives in `tmp/<request-id>/` until its CozyTensors are in the
-	// CAS, a request's fetched remote input in `tmp/<request-id>/` until it settles, a
-	// verb's exchange files with the tfs binary in `tmp/<verb>-*/` for the verb's life.
-	// The process that writes an entry removes it the moment it is dead; every entry is
-	// claimed through internal/scratch and the daemon's start-time sweep is only the
-	// backstop for a crashed writer. `locks/` (model-acquisition flocks) is permanent.
+	// Tmp is typed in-flight work: a model transfer's request-named staging and the
+	// model-acquisition flocks under `tmp/locks`. Verb-lifetime exchange scratch uses OS
+	// temp; the whole root disappears when nothing is in flight.
 	Tmp string
-	// Triage holds WorkerTriageBundles copied out of worker roots (cl-006). A worker
-	// root does not outlive its worker — a one-shot run deletes it — so the bundle
-	// worth keeping is kept HERE, by the client that wanted it.
-	Triage string
-	// Publications is the DURABLE PUBLICATION PLANE (cl-004): one directory per job
-	// scratch repo, and the only place a job is ever granted to write. It is
-	// deliberately NOT under Outputs or Workers — a bounded job is reclaimed at its
-	// terminal, and a bundle that lived inside what reclaim removes would be destroyed
-	// by the very act that ends the job that produced it.
+	// Publications is the job publication plane (cl-004): one directory per job scratch
+	// repo, reclaimed when its request settles without a committed publication.
 	Publications string
-	// Client is the CLI's local credential file, mode 0600. A credential never rides
-	// argv (cl-011's rule), so the handoff is an OS-protected file the Cozy daemon
-	// writes and its own CLI reads.
-	Client string
-	// Rentals holds one rented pod's SECRET MATERIAL: its media bearer (0600)
-	// and the certificate this client pins when it dials (cl-015). The rental's facts —
-	// address, pod id, state — are rows in the one records authority; only what must not
-	// be readable by another user on this host lives out here as files.
+	// Rentals holds one rented pod's SECRET MATERIAL: its media bearer (0600) and the
+	// certificate this client pins when it dials (cl-015). Secrets whose rental is
+	// proven absent are erased by the boot sweep.
 	Rentals string
-	// LocalPackages holds exact ephemeral wheel revisions for rented local-package commands.
-	// It is staging the daemon alone writes, never a catalog or mutable checkout.
+	// LocalPackages holds exact ephemeral wheel revisions for rented local-package
+	// commands. It is staging the daemon alone writes, never a catalog.
 	LocalPackages string
-	// Companions holds this host's CUDA-profile image-owned companion wheels — the
-	// local twin of what the base worker image bakes onto its exact NVIDIA CUDA
-	// profile (cr-086 arm 0). Install materialization joins any wheel here whose
-	// declared profile the host and the fresh venv both match; nothing else reads it.
+	// Companions holds this host's CUDA-profile image-owned companion wheels (cr-086
+	// arm 0). Nothing creates it; a host that has none installs without it.
 	Companions string
-	// Log is the Cozy daemon's own log: the orchestrator's words and the process's
-	// banner, bounded by rotation on an observed size (internal/daemon.OpenLog). Its one
-	// rotated predecessor is Log + ".1". Read with `cozy daemon log`.
+	// Log is the Cozy daemon's own log, bounded by rotation on an observed size
+	// (internal/daemon.OpenLog). Its one rotated predecessor is Log + ".1".
 	Log string
 }
 
@@ -84,8 +66,9 @@ func Open(root string) (Layout, *exit.Error) {
 		return Layout{}, exit.Internalf("the local root is unset: internal/config.Load did not run")
 	}
 	// The records database retains request payloads and path-free creative prompts; the
-	// client credential and rental secrets already make this an OS-private user root.
-	// Protecting the directory also protects SQLite's lazily-created WAL/SHM siblings.
+	// daemon lock carries the CLI token and rental secrets live under rentals/, so this
+	// is an OS-private user root. Protecting the directory also protects SQLite's
+	// lazily-created WAL/SHM siblings.
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return Layout{}, exit.Internalf("cannot create the private local root %s: %s", root, err)
 	}
@@ -94,48 +77,74 @@ func Open(root string) (Layout, *exit.Error) {
 	}
 	l := Layout{
 		Root:     root,
-		DB:       filepath.Join(root, "records.db"),
+		DB:       filepath.Join(root, "creator.sqlite"),
 		Installs: filepath.Join(root, "installs"),
-		Lock:     filepath.Join(root, "writer.lock"),
 		Daemon:   filepath.Join(root, "daemon.lock"),
 		Workers:  filepath.Join(root, "workers"),
 		Outputs:  filepath.Join(root, "outputs"),
 		Inputs:   filepath.Join(root, "inputs"),
-		Uploads:  filepath.Join(root, "uploads", "sha256"),
-		CAS:      filepath.Join(root, "cas"),
 		Tmp:      filepath.Join(root, "tmp"),
-		Triage:   filepath.Join(root, "triage"),
-		Client:   filepath.Join(root, "client.cred"),
 	}
+	l.Lock = filepath.Join(l.Installs, ".lock")
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
 	l.LocalPackages = filepath.Join(root, "local-packages")
 	l.Companions = filepath.Join(root, "companions")
 	l.Log = filepath.Join(root, "daemon.log")
-	// The revision store was `private-packages/` before the vocabulary hard-cut (proto-027).
-	// A root written by that build keeps what it holds: the directory moves, once, and the
-	// local-package sweep retires any revision written under the old document format.
-	if prior := filepath.Join(root, "private-packages"); dirExists(prior) && !dirExists(l.LocalPackages) {
-		if err := os.Rename(prior, l.LocalPackages); err != nil {
-			return Layout{}, exit.Internalf("cannot move %s to %s: %s", prior, l.LocalPackages, err)
-		}
+	// A prior root's records.db is the same database under its retired name. The rename
+	// runs here — cheap, idempotent, and before any open — so no second code path ever
+	// reads the old spelling. WAL/SHM siblings move with it or not at all: a database
+	// whose main file moved without its WAL would silently lose committed pages.
+	if e := renameRecords(root, l.Daemon, l.DB); e != nil {
+		return Layout{}, e
 	}
-	for _, dir := range []string{l.Installs, l.Workers, l.Outputs, l.Triage, l.Publications} {
+	// Only the two roots every verb touches exist up front. Everything else is created
+	// by its writer at the moment work exists, and reclaimed when the work dies.
+	for _, dir := range []string{l.Installs, l.Outputs} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
-		}
-	}
-	for _, dir := range []string{l.Inputs, l.Uploads, l.LocalPackages, l.Companions} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}
 	}
 	return l, nil
 }
 
-func dirExists(path string) bool {
-	info, err := os.Lstat(path)
-	return err == nil && info.IsDir()
+// renameRecords moves a pre-cl-116 records.db (and its WAL/SHM siblings) onto the
+// creator.sqlite spelling. It refuses when both databases exist — two lifecycle
+// authorities in one root is a state no rename may silently pick a winner for — and it
+// refuses under a LIVE daemon: an old-build daemon still holds records.db open, and
+// renaming its WAL out from under it would split committed pages from their database.
+// The daemon liveness lock is held across the renames so no daemon can start mid-move.
+func renameRecords(root, daemonLock, db string) *exit.Error {
+	prior := filepath.Join(root, "records.db")
+	if _, err := os.Lstat(prior); err != nil {
+		return nil
+	}
+	if _, err := os.Lstat(db); err == nil {
+		return exit.Named(exit.Conflict, "records_ambiguous",
+			"%s holds both records.db and creator.sqlite; remove the one that is not the lifecycle authority", root)
+	}
+	f, err := os.OpenFile(daemonLock, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return exit.Internalf("cannot take the daemon lock to migrate %s: %s", root, err)
+	}
+	defer f.Close()
+	if err := flock.Exclusive(f); err != nil {
+		return exit.Named(exit.Conflict, "records_migration_blocked",
+			"a running Cozy daemon still owns %s under its old records.db name", root).
+			WithRemedy("stop it with `cozy down`, then retry; the new daemon migrates the database at start").
+			WithNext("cozy down")
+	}
+	defer flock.Release(f)
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		from, to := prior+suffix, db+suffix
+		if _, err := os.Lstat(from); err != nil {
+			continue
+		}
+		if err := os.Rename(from, to); err != nil {
+			return exit.Internalf("cannot move %s to %s: %s", from, to, err)
+		}
+	}
+	return nil
 }
 
 // InputAsset resolves one verified sha256 digest into its private immutable staging
@@ -175,6 +184,11 @@ func (l Layout) PendingRentalCreatorIdentity(operationKey string) string {
 // public — trusting exactly this PEM and no CA is what makes the pin a pin (#445).
 func (l Layout) RentalCert(id string) string { return filepath.Join(l.Rentals, id+".pem") }
 
+// AcquisitionLocks is the model-acquisition flock directory: one lock file per exact
+// Manifest, electing the one live mover across processes. Lock files are ephemeral
+// coordination, created on demand; the empty directory is pruned at boot.
+func (l Layout) AcquisitionLocks() string { return filepath.Join(l.Tmp, "locks") }
+
 // InstallDir is where one install's source tree and venv live. The directory is replaced
 // wholesale, never mutated. "generations" was the wrong name for the FOLDER -- in a product
 // that generates media, a top-level `generations/` reads as the output namespace, which is
@@ -184,12 +198,6 @@ func (l Layout) InstallDir(id string) string { return filepath.Join(l.Installs, 
 // WorkerDir is one worker session's own root: its journal, its log, and the binding
 // plan records the runtime resolves out of its COZY_HOME.
 func (l Layout) WorkerDir(session string) string { return filepath.Join(l.Workers, session) }
-
-// TriageFile is where one kept bundle lives, named by its OPAQUE subject and by
-// nothing a client can shape.
-func (l Layout) TriageFile(subject string) string {
-	return filepath.Join(l.Triage, subject+".json")
-}
 
 // ScratchRepo is the job SCRATCH repo one request publishes into:
 // `<org>/_job-<request-id>`. The underscore is deliberately outside the public repo

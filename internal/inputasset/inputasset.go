@@ -191,6 +191,10 @@ func stageSource(layout home.Layout, source string, max int64) (string, int64, s
 	if max > 0 && info.Size() > max {
 		return "", 0, "", "", overCap(source, info.Size(), max)
 	}
+	// Created on demand: the input store exists only once submission-delivered bytes do.
+	if err := os.MkdirAll(layout.Inputs, 0o700); err != nil {
+		return "", 0, "", "", exit.Internalf("cannot create the input store: %s", err)
+	}
 	staging, err := os.CreateTemp(layout.Inputs, ".asset-*")
 	if err != nil {
 		return "", 0, "", "", exit.Internalf("cannot stage input asset: %s", err)
@@ -298,6 +302,9 @@ func DropUnowned(layout home.Layout, store *records.Store, assets []records.Asse
 func Sweep(layout home.Layout, store *records.Store) *exit.Error {
 	entries, err := os.ReadDir(layout.Inputs)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return exit.Internalf("cannot scan the input asset store: %s", err)
 	}
 	for _, entry := range entries {

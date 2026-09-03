@@ -84,6 +84,37 @@ CREATE UNIQUE INDEX IF NOT EXISTS worker_session ON worker_processes(session_id)
 const workerProcessCols = `instance_id,package,install_id,worker_id,
 	devices,pid,birth,session_id,state,opened_at,closed_at`
 
+const attemptsDDL = `
+CREATE TABLE IF NOT EXISTS attempts (
+  request_id       TEXT    NOT NULL REFERENCES requests(id),
+  attempt          INTEGER NOT NULL,
+  attempt_key      TEXT    NOT NULL UNIQUE,
+  instance_id      TEXT    NOT NULL REFERENCES worker_processes(instance_id),
+  session_id       TEXT    NOT NULL,
+  invocation_digest TEXT    NOT NULL,
+  invocation        BLOB    NOT NULL,
+  weights_outputs  TEXT    NOT NULL DEFAULT '[]',
+  state            TEXT    NOT NULL,
+  plan_digest      TEXT    NOT NULL DEFAULT '',
+  construction     TEXT    NOT NULL DEFAULT '',
+  plan_summary     TEXT    NOT NULL DEFAULT '',
+  terminal_id      TEXT    NOT NULL DEFAULT '',
+  terminal_digest  TEXT    NOT NULL DEFAULT '',
+  terminal_status  TEXT    NOT NULL DEFAULT '',
+  terminal_cause   TEXT    NOT NULL DEFAULT '',
+  safe_message     TEXT    NOT NULL DEFAULT '',
+  triage_subject   TEXT    NOT NULL DEFAULT '',
+  triage_digest    TEXT    NOT NULL DEFAULT '',
+  triage_length    INTEGER NOT NULL DEFAULT 0,
+  triage_bundle    BLOB    NOT NULL DEFAULT x'',
+  terminal_body    BLOB,
+  dispatched_at    TEXT    NOT NULL,
+  accepted_at      TEXT    NOT NULL DEFAULT '',
+  closed_at        TEXT    NOT NULL DEFAULT '',
+  media_cleaned    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (request_id, attempt)
+)`
+
 var orchestratorSchema = []string{workerProcessesDDL, workerSessionIndex, requestsDDL, `
 -- The PUBLICATION (cl-004). One row per job request, written INSIDE the terminal
 -- transaction: a publication that a terminal did not commit does not exist, which is
@@ -124,36 +155,7 @@ CREATE TABLE IF NOT EXISTS job_checkpoints (
   recorded_at   TEXT    NOT NULL,
   PRIMARY KEY (request_id, attempt, operation_key, logical_key),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
-)`, `
-CREATE TABLE IF NOT EXISTS attempts (
-  request_id       TEXT    NOT NULL REFERENCES requests(id),
-  attempt          INTEGER NOT NULL,
-  attempt_key      TEXT    NOT NULL UNIQUE,
-  instance_id      TEXT    NOT NULL REFERENCES worker_processes(instance_id),
-  session_id       TEXT    NOT NULL,
-  invocation_digest TEXT    NOT NULL,
-  invocation        BLOB    NOT NULL,
-  weights_outputs  TEXT    NOT NULL DEFAULT '[]',
-  state            TEXT    NOT NULL,
-  plan_digest      TEXT    NOT NULL DEFAULT '',
-  construction     TEXT    NOT NULL DEFAULT '',
-  plan_summary     TEXT    NOT NULL DEFAULT '',
-  terminal_id      TEXT    NOT NULL DEFAULT '',
-  terminal_digest  TEXT    NOT NULL DEFAULT '',
-  terminal_status  TEXT    NOT NULL DEFAULT '',
-  terminal_cause   TEXT    NOT NULL DEFAULT '',
-  safe_message     TEXT    NOT NULL DEFAULT '',
-  triage_subject   TEXT    NOT NULL DEFAULT '',
-  triage_digest    TEXT    NOT NULL DEFAULT '',
-  triage_length    INTEGER NOT NULL DEFAULT 0,
-  triage_path      TEXT    NOT NULL DEFAULT '',
-  terminal_body    BLOB,
-  dispatched_at    TEXT    NOT NULL,
-  accepted_at      TEXT    NOT NULL DEFAULT '',
-  closed_at        TEXT    NOT NULL DEFAULT '',
-  media_cleaned    INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (request_id, attempt)
-)`, `
+)`, attemptsDDL, `
 CREATE TABLE IF NOT EXISTS outputs (
   request_id TEXT    NOT NULL,
   attempt    INTEGER NOT NULL,
@@ -1188,7 +1190,7 @@ type Attempt struct {
 	TriageSubject       string
 	TriageDigest        string
 	TriageLength        int64
-	TriagePath          string
+	TriageKept          bool // the verified bundle bytes are in this row
 	TerminalBody        []byte
 	DispatchedAt        string
 	AcceptedAt          string
@@ -1442,14 +1444,14 @@ type Terminal struct {
 	Cause            string
 	SafeMessage      string
 	TriageSubject    string
-	// TriageDigest/TriageLength/TriagePath are cl-006's PERSISTENCE of the worker's
-	// bundle: the bytes are copied out of the worker root and verified against the
-	// terminal's own TriageBundleRef before this transaction runs. A one-shot run
-	// deletes its worker root (cr-011 §8), so a bundle worth keeping is the client's
-	// to keep — and "the client" is this orchestrator.
+	// TriageDigest/TriageLength/TriageBundle are cl-006's PERSISTENCE of the worker's
+	// bundle: the bounded bytes are copied out of the worker/media plane and verified
+	// against the terminal's own TriageBundleRef before this transaction runs, then
+	// live IN the attempt row (cl-116). A bundle belongs to exactly one attempt, so an
+	// orphan bundle file is unrepresentable.
 	TriageDigest         string
 	TriageLength         int64
-	TriagePath           string
+	TriageBundle         []byte
 	Body                 []byte
 	Outputs              []Output
 	WeightsFinalizations []WeightsFinalization
@@ -1530,10 +1532,10 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 
 	res, err := tx.Exec(`UPDATE attempts SET state='terminal', terminal_id=?, terminal_digest=?,
 		terminal_status=?, terminal_cause=?, safe_message=?, triage_subject=?, triage_digest=?,
-		triage_length=?, triage_path=?, terminal_body=?, closed_at=?
+		triage_length=?, triage_bundle=?, terminal_body=?, closed_at=?
 		WHERE request_id=? AND attempt=? AND session_id=? AND state IN ('offered','accepted','recovered_open')`,
 		t.TerminalID, t.TerminalDigest, t.Status, t.Cause, t.SafeMessage, t.TriageSubject,
-		t.TriageDigest, t.TriageLength, t.TriagePath,
+		t.TriageDigest, t.TriageLength, blobOrEmpty(t.TriageBundle),
 		t.Body, now(), t.RequestID, t.Attempt, t.SessionID)
 	if err != nil {
 		return false, exit.Internalf("cannot apply the terminal of %s#%d: %s", t.RequestID, t.Attempt, err)
@@ -1727,7 +1729,7 @@ func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error
 	rows, err := s.db.Query(`SELECT request_id,attempt,attempt_key,instance_id,session_id,
 		invocation_digest,invocation,weights_outputs,state,plan_digest,construction,plan_summary,terminal_id,
 		terminal_digest,terminal_status,terminal_cause,safe_message,triage_subject,
-		triage_digest,triage_length,triage_path,
+		triage_digest,triage_length,length(triage_bundle)>0,
 		COALESCE(terminal_body,x''),dispatched_at,accepted_at,closed_at
 		FROM attempts WHERE `+where+` ORDER BY request_id, attempt`, args...)
 	if err != nil {
@@ -1740,13 +1742,34 @@ func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error
 		if err := rows.Scan(&a.RequestID, &a.Attempt, &a.AttemptKey, &a.InstanceID, &a.SessionID,
 			&a.InvocationDigest, &a.InvocationCanonical, &a.WeightsOutputs, &a.State, &a.PlanDigest, &a.Construction,
 			&a.PlanSummary, &a.TerminalID, &a.TerminalDigest, &a.TerminalStatus, &a.TerminalCause,
-			&a.SafeMessage, &a.TriageSubject, &a.TriageDigest, &a.TriageLength, &a.TriagePath,
+			&a.SafeMessage, &a.TriageSubject, &a.TriageDigest, &a.TriageLength, &a.TriageKept,
 			&a.TerminalBody, &a.DispatchedAt, &a.AcceptedAt, &a.ClosedAt); err != nil {
 			return nil, exit.Internalf("cannot read an attempt row: %s", err)
 		}
 		out = append(out, a)
 	}
 	return out, nil
+}
+
+// TriageBundle serves one kept bundle by the attempt's OPAQUE key. Empty bytes mean the
+// terminal named no bundle or verification refused it; the caller answers 404, not 500.
+func (s *Store) TriageBundle(attemptKey string) (subject string, bundle []byte, problem *exit.Error) {
+	row := s.db.QueryRow(`SELECT triage_subject, triage_bundle FROM attempts WHERE attempt_key=?`, attemptKey)
+	if err := row.Scan(&subject, &bundle); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil, nil
+		}
+		return "", nil, exit.Internalf("cannot read the triage bundle of attempt %s: %s", attemptKey, err)
+	}
+	return subject, bundle, nil
+}
+
+// blobOrEmpty keeps a NOT NULL blob column honest: an absent bundle is zero bytes.
+func blobOrEmpty(b []byte) []byte {
+	if b == nil {
+		return []byte{}
+	}
+	return b
 }
 
 const weightsFinalizationCols = `request_id,attempt,instance_id,owner_scope,invocation_digest,

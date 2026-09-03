@@ -44,6 +44,11 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
+	// The suite must never reach the user's ~/.tensorfs: config freezes on its first
+	// in-process Load, so the isolated TensorFS home is pinned before any test runs.
+	if err := os.Setenv("TENSORFS_HOME", filepath.Join(dir, "tensorfs")); err != nil {
+		panic(err)
+	}
 	cozyBin = filepath.Join(dir, "cozy")
 	fakeWorkerBin = filepath.Join(dir, "cozy-fakeworker")
 	for _, b := range [][2]string{{cozyBin, "."}, {fakeWorkerBin, "./tests/support/fakeworker"}} {
@@ -86,6 +91,7 @@ func hostOwner(t *testing.T, name string, with ...func(*orchestrator.Options)) *
 	cfg, e := config.Load()
 	fatal(t, e)
 	cfg.Home = root // Load freezes on first call; a suite that reuses the process re-derives
+	cfg.TensorFSRoot = filepath.Join(root, "tensorfs")
 	l, e := home.Open(cfg.Home)
 	fatal(t, e)
 	st, e := records.Open(l.DB)
@@ -247,15 +253,16 @@ func startDaemonProcess(t *testing.T, root string) *daemonProcess {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		lock, lockErr := os.ReadFile(filepath.Join(root, "daemon.lock"))
-		credential, credentialErr := os.ReadFile(filepath.Join(root, "client.cred"))
-		if lockErr == nil && credentialErr == nil {
+		if lockErr == nil {
 			for _, line := range strings.Split(string(lock), "\n") {
 				if value, ok := strings.CutPrefix(line, "addr="); ok {
 					s.addr = strings.TrimSpace(value)
 				}
+				if value, ok := strings.CutPrefix(line, "token="); ok {
+					s.token = strings.TrimSpace(value)
+				}
 			}
-			if s.addr != "" {
-				s.token = strings.TrimSpace(string(credential))
+			if s.addr != "" && s.token != "" {
 				return s
 			}
 		}
@@ -373,7 +380,9 @@ func childEnv(t *testing.T, root string, imposed ...string) []string {
 	must(t, os.Setenv("COZY_HOME", root))
 	cfg, e := config.Load()
 	fatal(t, e)
-	return cfg.Child(append([]string{"COZY_HOME=" + root}, imposed...)...)
+	// Both homes are isolated: a product test must never reach the user's ~/.tensorfs.
+	return cfg.Child(append([]string{"COZY_HOME=" + root,
+		"TENSORFS_HOME=" + filepath.Join(root, "tensorfs")}, imposed...)...)
 }
 
 // --------------------------------------------------------------------------- the small stuff

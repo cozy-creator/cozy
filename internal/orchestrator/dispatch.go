@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -1299,7 +1300,10 @@ func (c *Orchestrator) rollbackGrant(req records.Request, attempt uint64, w *wor
 	}
 	if err := os.RemoveAll(c.opt.Layout.PublicationStage(req.Org, req.ID, attempt)); err != nil {
 		c.logf("%s#%d local grant rollback failed: %s", req.ID, attempt, err)
+		return
 	}
+	_ = os.Remove(filepath.Join(c.opt.Layout.PublicationRoot(req.Org, req.ID), ".staging"))
+	prunePublicationParents(c.opt.Layout, c.opt.Layout.PublicationRoot(req.Org, req.ID))
 }
 
 // DefaultMaxOutputMiB is the per-output bound when Options.MaxOutputMiB is unset. It

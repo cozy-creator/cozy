@@ -29,7 +29,7 @@ func tooling(ctx *Context) (*tfs.Tool, *hub.Client, home.Layout, *exit.Error) {
 	if e != nil {
 		return nil, nil, layout, e
 	}
-	tool, e := tfs.Open(ctx.Cfg, layout)
+	tool, e := tfs.Open(ctx.Cfg)
 	if e != nil {
 		return nil, nil, layout, e
 	}
@@ -45,7 +45,7 @@ func localTensorFS(ctx *Context) (*tfs.Tool, home.Layout, *exit.Error) {
 	if problem != nil {
 		return nil, layout, problem
 	}
-	tool, problem := tfs.Open(ctx.Cfg, layout)
+	tool, problem := tfs.Open(ctx.Cfg)
 	return tool, layout, problem
 }
 

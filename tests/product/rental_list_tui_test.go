@@ -46,7 +46,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	hub := newFakeRentalHub(t, port)
 	hub.add("rental-tui", "sparrow")
 	hub.set("rental-tui", "state", "acquiring")
-	store, problem := records.Open(filepath.Join(root, "records.db"))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	fatal(t, store.RecordRental(records.Rental{

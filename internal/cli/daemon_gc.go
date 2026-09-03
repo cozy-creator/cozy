@@ -66,7 +66,7 @@ func (g gcCron) once() {
 		fmt.Fprintf(g.log, "gc: deferred: the daemon manages %s\n", strings.Join(held, ", "))
 		return
 	}
-	tool, problem := tfs.Open(g.cfg, g.layout)
+	tool, problem := tfs.Open(g.cfg)
 	if problem != nil {
 		fmt.Fprintf(g.log, "gc: deferred: %s\n", problem.Message)
 		return

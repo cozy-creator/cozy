@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -43,8 +44,12 @@ func prepareLocalTransferSources(runCtx context.Context, ctx *Context, root stri
 			manifestLength: alias.ManifestLength}), nil
 	}
 	if catalogModelSpelling(intent.Source) {
+		layout, problem := home.Open(ctx.Cfg.Home)
+		if problem != nil {
+			return nil, problem
+		}
 		fetch := &transfer.Fetch{Tool: tool, Hub: client(ctx), Spec: intent.Source,
-			Lane: intent.InputLane, Progress: progress(ctx)}
+			Lane: intent.InputLane, Progress: progress(ctx), Locks: layout.AcquisitionLocks()}
 		hctx, cancel := hub.LongContext()
 		defer cancel()
 		row, problem := fetch.Resolve(hctx)

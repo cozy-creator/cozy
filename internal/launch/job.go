@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -121,7 +122,7 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 		GraceSec:          3,
 		ArtifactCache:     cache,
 		EnvironmentPython: environmentPython,
-		ArtifactStore:     filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
+		ArtifactStore:     config.Frozen().TensorFSRoot,
 	}
 	return spec, facts, nil
 }

@@ -55,6 +55,12 @@ type Config struct {
 
 	Tfs       string
 	TfsSource string
+	// TensorFSRoot is the independent local TensorFS Store this Creator consumes
+	// (proto-030/tfs-047): explicit configuration first, then TENSORFS_HOME, then
+	// `~/.tensorfs`. It is never derived from COZY_HOME — TensorFS is not a
+	// subdirectory of Creator.
+	TensorFSRoot       string
+	TensorFSRootSource string
 	// TensorFSRegistry is an operator/test-only override. Ordinary imports use
 	// the reviewed registry embedded by the installed TensorFS binary.
 	TensorFSRegistry string
@@ -96,6 +102,7 @@ type values struct {
 	HuggingFaceToken         string `name:"huggingface_token"`
 	CivitaiToken             string `name:"civitai_token"`
 	Tfs                      string `name:"tfs" default:"tfs"`
+	TensorFSRoot             string `name:"tensorfs_root"`
 	TensorFSRegistry         string `name:"tensorfs_registry"`
 	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
 	RentalsMaxHourlySpendUSD string `name:"rentals_max_hourly_spend_usd" default:"0"`
@@ -143,6 +150,7 @@ var fileKeys = map[string]bool{
 	"huggingface_token":             true,
 	"civitai_token":                 true,
 	"tfs":                           true,
+	"tensorfs_root":                 true,
 	"local_rate_micro_usd_per_hour": true,
 	"port":                          true,
 	"yield":                         true,
@@ -166,6 +174,7 @@ var environmentNames = map[string]string{
 	"huggingface_token": "HF_TOKEN",
 	"civitai_token":     "CIVITAI_TOKEN",
 	"tfs":               "COZY_TFS",
+	"tensorfs_root":     "TENSORFS_HOME",
 	"tensorfs_registry": "COZY_TFS_REGISTRY",
 	"bootstrap":         "COZY_BOOTSTRAP_CREDENTIAL",
 }
@@ -210,6 +219,10 @@ func load() (Config, *exit.Error) {
 	hubToken := secret.New(input.HubToken)
 	huggingFaceToken := secret.New(input.HuggingFaceToken)
 	civitaiToken := secret.New(input.CivitaiToken)
+	tensorFSRoot, problem := resolveTensorFSRoot(input.TensorFSRoot)
+	if problem != nil {
+		return Config{}, problem
+	}
 	c := Config{
 		Home:                           home,
 		Port:                           input.Port,
@@ -225,6 +238,8 @@ func load() (Config, *exit.Error) {
 		CivitaiTokenSource:             sourceOf("civitai_token", file, environment, "unset"),
 		Tfs:                            strings.TrimSpace(input.Tfs),
 		TfsSource:                      sourceOf("tfs", file, environment, "default"),
+		TensorFSRoot:                   tensorFSRoot,
+		TensorFSRootSource:             sourceOf("tensorfs_root", file, environment, "default"),
 		TensorFSRegistry:               strings.TrimSpace(input.TensorFSRegistry),
 		LocalRateMicroUSDPerHour:       input.LocalRateMicroUSDPerHour,
 		LocalRateSource:                sourceOf("local_rate_micro_usd_per_hour", file, environment, "unset"),
@@ -277,6 +292,24 @@ func resolveHome() (string, *exit.Error) {
 		return "", exit.Internalf("no home directory and COZY_HOME is unset: %s", err)
 	}
 	return filepath.Join(home, ".cozy"), nil
+}
+
+// resolveTensorFSRoot turns the configured TensorFS root into an absolute path, or
+// derives the product default `~/.tensorfs`. There is deliberately no `~/.cozy/cas`
+// fallback and no compatibility lookup (proto-030).
+func resolveTensorFSRoot(value string) (string, *exit.Error) {
+	if value = strings.TrimSpace(value); value != "" {
+		root, err := filepath.Abs(value)
+		if err != nil {
+			return "", exit.Internalf("tensorfs_root %q is not resolvable: %s", value, err)
+		}
+		return root, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", exit.Internalf("no home directory and no tensorfs_root configured: %s", err)
+	}
+	return filepath.Join(home, ".tensorfs"), nil
 }
 
 // readEnvironment captures the complete admitted environment once. Only
@@ -467,6 +500,9 @@ func usdMicros(value string) (int64, error) {
 func (c Config) Child(imposed ...string) []string {
 	if c.TfsSource != "default" && c.Tfs != "" {
 		imposed = append([]string{"COZY_TFS=" + c.Tfs}, imposed...)
+	}
+	if c.TensorFSRootSource != "default" && c.TensorFSRoot != "" {
+		imposed = append([]string{"TENSORFS_HOME=" + c.TensorFSRoot}, imposed...)
 	}
 	seen := map[string]string{}
 	for _, pair := range c.inherited {

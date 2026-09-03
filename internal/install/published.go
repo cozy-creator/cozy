@@ -382,7 +382,7 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 		return empty, problem
 	}
 	args := []string{"--json", "prepare-package",
-		"--artifact-store", l.CAS,
+		"--artifact-store", config.Frozen().TensorFSRoot,
 		"--package", published.Package,
 		"--release", published.Release,
 		"--package-interface", launch.StagedPackageInterfacePath(installDir),
@@ -403,7 +403,7 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 		args = append(args, "--model", string(raw))
 	}
 	cmd := exec.Command(runtimeBin, args...)
-	cmd.Env = config.Frozen().Tool("COZY_HOME=" + l.Root)
+	cmd.Env = config.Frozen().Tool("COZY_HOME=" + runtimeScratchHome())
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -94,16 +95,16 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 	defer held.Release()
-	// The held daemon lock proves any prior handoff is stale. Only the winning
-	// daemon removes it, so concurrent auto-start callers cannot erase a live token.
-	_ = os.Remove(l.Client)
 
-	st, e := records.OpenForDaemon(l.DB)
+	// The schema-22 migration folds each kept triage file into its attempt row; the
+	// retired-shape sweep below removes the directory afterwards.
+	st, e := records.OpenForDaemon(l.DB, filepath.Join(l.Root, "triage"))
 	if e != nil {
 		closeListeners()
 		return e
 	}
 	defer st.Close()
+	retired, retiredNote := reclaimNote(reclaim.Retired(l))
 
 	// The resolver is built BEFORE the orchestrator, because the orchestrator holds it:
 	// select-or-start is the scheduler's act, and a request whose binding no live worker
@@ -154,16 +155,19 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// records authority — or a live process's kernel lock — decide what still has a claim.
 	workers, workersNote := reclaimNote(reclaim.Workers(l, st))
 	tmp, tmpNote := reclaimNote(reclaim.Tmp(l, st))
+	publications, publicationsNote := reclaimNote(reclaim.Publications(l, st))
+	rentalSecrets, rentalSecretsNote := reclaimNote(reclaim.RentalSecrets(l, st))
+	reclaim.EmptyRoots(l)
 
-	// One per-launch CLI credential is handed over through a 0600 file. It is never
-	// printed, logged, or placed on argv, and dies with this process. The public web stub
-	// exposes no state; full browser authorization is a later, separately reviewed door.
+	// One per-launch CLI credential rides the daemon's own held 0600 record. It is never
+	// printed, logged, or placed on argv, and rotates with every launch. The public web
+	// stub exposes no state; full browser authorization is a later, separately reviewed
+	// door.
 	creds, e := api.Mint(l)
 	if e != nil {
 		closeListeners()
 		return e
 	}
-	defer os.Remove(l.Client)
 
 	// The stop channel exists before the server so the shutdown route can feed it: the
 	// route is the ask a platform with no process signal still has (#449), and it takes
@@ -188,9 +192,14 @@ func serveDaemon(ctx *Context) *exit.Error {
 		workers.Removed, workers.Scanned, output.Bytes(workers.Bytes), workersNote)
 	fmt.Fprintf(ctx.Out, "  tmp sweep: reclaimed %d of %d entr(y|ies), freed %s%s\n",
 		tmp.Removed, tmp.Scanned, output.Bytes(tmp.Bytes), tmpNote)
+	if retired.Scanned+publications.Scanned+rentalSecrets.Scanned > 0 {
+		fmt.Fprintf(ctx.Out, "  lifecycle sweep: %d retired entr(y|ies)%s · %d publication root(s) settled%s · %d stale rental secret(s) erased%s\n",
+			retired.Removed, retiredNote, publications.Removed, publicationsNote,
+			rentalSecrets.Removed, rentalSecretsNote)
+	}
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s · reconcile killed %d orphan(s), forgot %d stale row(s)\n",
 		l.DB, yield, killed, forgotten)
-	fmt.Fprintf(ctx.Out, "  client credential %s (%s, mode 0600)\n", creds.CLI.Digest(), l.Client)
+	fmt.Fprintf(ctx.Out, "  client credential %s (carried in %s, mode 0600)\n", creds.CLI.Digest(), l.Daemon)
 	if ctx.Cfg.RentalsIdleRelease > 0 {
 		fmt.Fprintf(ctx.Out, "  rentals: released after %s with nothing queued, running, or owed (rentals.idle_release_s)\n",
 			ctx.Cfg.RentalsIdleRelease)

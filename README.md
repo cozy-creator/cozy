@@ -317,17 +317,19 @@ authentication, upload-to-invocation binding, and media-history UX come with the
 
 ## Configuration
 
-The default local root is `~/.cozy`. What lives there:
+The default local root is `~/.cozy`. The TensorFS store is its own independent home —
+`~/.tensorfs` by default, moved with `TENSORFS_HOME` or `tensorfs_root` — written only by
+`tfs`. What lives under `~/.cozy`:
 
 | path | what it is |
 |---|---|
-| `cas/` | the local TensorFS store: every model's canonical bytes, written only by `tfs` |
-| `installs/` | one immutable environment per installed package |
-| `outputs/<org>-<package>/` | result files, named by their own content digest |
-| `attempts/` | the daemon's per-attempt working area; removed once an attempt settles |
+| `installs/` | one immutable environment per installed package, plus the writer's `.lock` |
+| `outputs/<org>-<package>/` | result files, named by their own content digest; never removed automatically |
+| `inputs/` | uploaded/streamed request bodies only, created on demand; a local CLI file input stays at its caller path |
 | `workers/<instance>/` | a local worker's `run/` state and `worker.log`; removed when it exits, the log stays |
-| `tmp/<request-id>/` | bytes in flight: a model source downloaded for ingest, a fetched remote input; removed the moment the CozyTensors are in `cas/` or the request settles |
-| `records.db`, `daemon.log` | the one local lifecycle database and the daemon's own log |
+| `tmp/<request-id>/` | bytes in flight for a model transfer; removed when the request settles |
+| `creator.sqlite`, `daemon.log` | the one local lifecycle database (mode 0600) and the daemon's own log |
+| `daemon.lock` | the daemon's lifetime ownership record: address, pid, and the per-launch CLI token (mode 0600) |
 
 Nothing is kept on disk without a live reason; the daemon's start-time sweeps (`cozy up` prints
 them) are only the backstop for a process that crashed and report `reclaimed 0` on a healthy box.
