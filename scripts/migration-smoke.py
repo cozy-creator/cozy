@@ -165,6 +165,93 @@ def main() -> int:
         )
         intermediate_repo_path = root / "repos/org/intermediate.json"
         intermediate_repo_path.write_bytes(intermediate_repository)
+
+        def sortable_manifest(number: int) -> tuple[str, int]:
+            sortable_config = canonical({"n": number})
+            sortable_config_id, sortable_config_length = put(
+                root, "blobs", sortable_config
+            )
+            sortable_header = cbor2.loads(
+                (
+                    ROOT / "conformance/cbor/vectors/green/minimal-inline.cbor"
+                ).read_bytes()
+            )
+            for encoding in sortable_header[3]:
+                encoding.insert(3, ["retired documentation"])
+            sortable_header[1] = [
+                [
+                    "model",
+                    bytes.fromhex(sortable_config_id),
+                    sortable_config_length,
+                    "application/json",
+                ]
+            ]
+            sortable_header_bytes = cbor2.dumps(sortable_header, canonical=True)
+            sortable_header_id, sortable_header_length = put(
+                root, "blobs", sortable_header_bytes
+            )
+            return put(
+                root,
+                "manifests",
+                canonical(
+                    {
+                        "entries": [
+                            {
+                                "blob": {
+                                    "length": sortable_header_length,
+                                    "sha256": sortable_header_id,
+                                },
+                                "kind": "cozytensors",
+                                "path": "model.cozytensors",
+                            },
+                            {
+                                "blob": {
+                                    "length": sortable_config_length,
+                                    "sha256": sortable_config_id,
+                                },
+                                "kind": "file",
+                                "path": "model/config.json",
+                            },
+                        ]
+                    }
+                ),
+            )
+
+        sortable_refs = [sortable_manifest(0), sortable_manifest(2)]
+        assert sortable_refs[0][0] < sortable_refs[1][0]
+        sortable_repository = canonical(
+            {
+                "checkpoints": [
+                    {
+                        "manifest": {"length": length, "sha256": identity},
+                        "published": True,
+                    }
+                    for identity, length in sortable_refs
+                ],
+                "releases": [
+                    {
+                        "lanes": [
+                            {
+                                "lane": lane,
+                                "manifest": {
+                                    "length": reference[1],
+                                    "sha256": reference[0],
+                                },
+                            }
+                            for lane, reference in zip(
+                                ("a", "b"), sortable_refs, strict=True
+                            )
+                        ],
+                        "revision": 1,
+                        "version": "1.0.0",
+                        "yanked": False,
+                    }
+                ],
+                "repo": {"name": "sort-regression", "org": "org"},
+            }
+        )
+        sortable_repo_path = root / "repos/org/sort-regression.json"
+        sortable_repo_path.write_bytes(sortable_repository)
         connection = sqlite3.connect(root / "tensorfs.sqlite")
         connection.execute("PRAGMA user_version=1")
         connection.execute(
@@ -212,7 +299,13 @@ def main() -> int:
         assert "evidence" not in migrated["checkpoints"][0]
         new_manifest_id = migrated["checkpoints"][0]["manifest"]["sha256"]
         new_manifest = json.loads(
-            (root / "manifests" / new_manifest_id[:2] / new_manifest_id[2:4] / f"{new_manifest_id}.json").read_bytes()
+            (
+                root
+                / "manifests"
+                / new_manifest_id[:2]
+                / new_manifest_id[2:4]
+                / f"{new_manifest_id}.json"
+            ).read_bytes()
         )
         assert [entry["path"] for entry in new_manifest["entries"]] == [
             "README.txt",
@@ -237,7 +330,7 @@ def main() -> int:
                 / "manifests"
                 / intermediate_ref["sha256"][:2]
                 / intermediate_ref["sha256"][2:4]
-                / f'{intermediate_ref["sha256"]}.json'
+                / f"{intermediate_ref['sha256']}.json"
             ).read_bytes()
         )
         intermediate_header_ref = intermediate_document["entries"][0]["blob"]
@@ -249,6 +342,16 @@ def main() -> int:
         intermediate_final = cbor2.loads(intermediate_final_bytes)
         assert intermediate_final[1] == [["model", b'{"hidden_size":1}']]
         assert all(len(encoding) == 4 for encoding in intermediate_final[3])
+        sortable_migrated = json.loads(sortable_repo_path.read_bytes())
+        sortable_checkpoints = [
+            row["manifest"]["sha256"] for row in sortable_migrated["checkpoints"]
+        ]
+        sortable_lanes = {
+            row["lane"]: row["manifest"]["sha256"]
+            for row in sortable_migrated["releases"][0]["lanes"]
+        }
+        assert sortable_lanes["b"] < sortable_lanes["a"]
+        assert sortable_checkpoints == [sortable_lanes["b"], sortable_lanes["a"]]
         assert (
             root / "migration-backup-0.3.0/repos/org/model.json"
         ).read_bytes() == repository
@@ -256,12 +359,18 @@ def main() -> int:
         assert sqlite3.connect(root / "tensorfs.sqlite.pre-0.3.0.bak").execute(
             "SELECT count(*) FROM tensorfs_derived_transactions"
         ).fetchone()[0] == len(historical)
-        assert sqlite3.connect(root / "tensorfs.sqlite").execute(
-            "PRAGMA user_version"
-        ).fetchone()[0] == 2
-        assert sqlite3.connect(root / "tensorfs.sqlite").execute(
-            "SELECT count(*) FROM tensorfs_derived_transactions"
-        ).fetchone()[0] == 0
+        assert (
+            sqlite3.connect(root / "tensorfs.sqlite")
+            .execute("PRAGMA user_version")
+            .fetchone()[0]
+            == 2
+        )
+        assert (
+            sqlite3.connect(root / "tensorfs.sqlite")
+            .execute("SELECT count(*) FROM tensorfs_derived_transactions")
+            .fetchone()[0]
+            == 0
+        )
         assert len(list((root / "tmp").glob("migration-0.2.0-rows-*.jsonl"))) == 1
         rerun = subprocess.run(
             (*command, "--apply"), capture_output=True, text=True, check=True
