@@ -34,8 +34,10 @@ type localAbortStatus struct {
 type localTransferFile struct {
 	digest         []byte
 	filename, path string
-	kind           pb.LocalDownloadKind
-	length         uint64
+	// project marks the row whose wheel identity names the package itself. A Creator-side
+	// staging fact only: no kind row travels at wire 30.
+	project bool
+	length  uint64
 }
 
 // LocalWheel is one wheel of an unpublished revision as this daemon holds it on disk.
@@ -246,9 +248,7 @@ func localSelection(operationID string, revision localpackage.Revision) (
 	projects := 0
 	for _, file := range revision.Files {
 		digest, err := canonical.Raw(file.Digest)
-		kind := pb.LocalDownloadKind_LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL
 		if file.Kind == "project" {
-			kind = pb.LocalDownloadKind_LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL
 			projects++
 		} else if file.Kind != "dependency" {
 			return nil, nil, exit.Named(exit.Structural, "local_package_file_kind_invalid",
@@ -263,9 +263,9 @@ func localSelection(operationID string, revision localpackage.Revision) (
 		total += uint64(file.Length)
 		spelled := file.Digest
 		transfer.files[spelled] = localTransferFile{digest: digest, filename: file.Filename,
-			path: file.Path, kind: kind, length: uint64(file.Length)}
+			path: file.Path, project: file.Kind == "project", length: uint64(file.Length)}
 		selected.Files = append(selected.Files, &pb.LocalPackageFileRef{Digest: digest,
-			Filename: file.Filename, Kind: kind, Length: uint64(file.Length)})
+			Filename: file.Filename, Length: uint64(file.Length)})
 		prior = digest
 	}
 	if projects != 1 || len(transfer.files) != len(revision.Files) {
@@ -409,7 +409,7 @@ func (c *Orchestrator) grantLocalWheels(current *session, ordered []localTransfe
 			return nil, exit.Internalf("cannot spell a local package wheel digest: %s", err)
 		}
 		kind := "dependency_wheel"
-		if selected.kind == pb.LocalDownloadKind_LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL {
+		if selected.project {
 			kind = "project_wheel"
 		}
 		wheels = append(wheels, LocalWheel{Digest: spelled, Filename: selected.filename,
@@ -430,7 +430,7 @@ func (c *Orchestrator) grantLocalWheels(current *session, ordered []localTransfe
 				"the read capability for %s is empty or over its bound", selected.filename)
 		}
 		grants = append(grants, &pb.LocalPackageFileGrant{Digest: selected.digest,
-			Filename: selected.filename, Kind: selected.kind, Length: selected.length,
+			Filename: selected.filename, Length: selected.length,
 			Url: urls[i]})
 	}
 	return grants, nil
@@ -663,7 +663,7 @@ func (c *Orchestrator) onLocalPackageFileStatus(current *session,
 	}
 	expected, ok := transfer.files[spelled]
 	if !ok || !bytes.Equal(frame.Digest, expected.digest) || frame.Filename != expected.filename ||
-		frame.Kind != expected.kind || frame.Length != expected.length ||
+		frame.Length != expected.length ||
 		frame.ReceivedBytes > frame.Length {
 		return
 	}
@@ -879,7 +879,7 @@ func cloneLocalPackageSet(in *pb.DesiredLocalPackageSet) *pb.DesiredLocalPackage
 	for _, file := range in.Files {
 		if file != nil {
 			out.Files = append(out.Files, &pb.LocalPackageFileRef{Digest: append([]byte(nil), file.Digest...),
-				Filename: file.Filename, Kind: file.Kind, Length: file.Length})
+				Filename: file.Filename, Length: file.Length})
 		}
 	}
 	return out

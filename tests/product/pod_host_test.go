@@ -299,7 +299,7 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 						RecordOwnerEpoch: request.RecordOwnerEpoch, ControlStreamEpoch: request.ControlStreamEpoch,
 						WorkerBootId: request.WorkerBootId, OperationId: request.OperationId,
 						SourceDigest: request.SourceDigest, Digest: grant.Digest, Filename: grant.Filename,
-						Kind: grant.Kind, Length: grant.Length, ReceivedBytes: grant.Length,
+						Length: grant.Length, ReceivedBytes: grant.Length,
 						State: pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED,
 					}}}); err != nil {
 					return err
@@ -324,7 +324,9 @@ func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream g
 	var total uint64
 	for _, file := range selected.Files {
 		total += file.Length
-		if file.Kind == pb.LocalDownloadKind_LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL {
+		// Wire 30: no kind row travels; the project wheel is the row whose filename
+		// names the package's own distribution and release.
+		if strings.HasPrefix(file.Filename, "weightless-"+selected.Package.Release+"-") {
 			project = file
 		}
 	}
@@ -444,18 +446,17 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 // plan it will dispatch (podPlanID).
 func podPlacement(delegation []byte, name, release, distribution string) *pb.Placement {
 	seed := sha256.Sum256(delegation)
+	_ = distribution
 	return &pb.Placement{
 		PlacementId: "package-" + hex.EncodeToString(seed[:])[:24],
-		PackageMode: &pb.Placement_Package{Package: &pb.PackageSelection{Package: name, Release: release,
-			ProjectWheel: &pb.WheelFact{Ref: &pb.Ref{Digest: sha256Of([]byte("wheel:" + name)), Length: 4096},
-				Distribution: distribution, Version: release,
-				Filename:    strings.ReplaceAll(distribution, "-", "_") + "-" + release + "-py3-none-any.whl",
-				ImportRoots: []string{strings.ReplaceAll(distribution, "-", "_")}, Tags: []string{"py3-none-any"}}}},
+		PackageMode: &pb.Placement_Package{Package: &pb.PackageSelection{
+			Package: name, Release: release}},
 		EnvironmentDigest: sha256Of([]byte("environment:" + name)),
 		PackageInterface:  &pb.Ref{Digest: sha256Of([]byte("interface:" + name)), Length: 2048},
 		BindingsDigest:    sha256Of([]byte("bindings:" + name)),
 		Entrypoints:       []*pb.Entrypoint{{Name: "tile", EntrypointBindingDigest: sha256Of([]byte("entrypoint:" + name))}},
-		Environment:       &pb.Environment{},
+		Environment: &pb.Environment{LockedRequirements: &pb.Ref{
+			Digest: sha256Of([]byte("locked:" + name)), Length: 1024}},
 	}
 }
 
@@ -763,10 +764,10 @@ func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 	project := 0
 	for _, grant := range pod.grants {
 		spelled, _ := canonical.Spell(grant.Digest)
-		if grant.Kind == pb.LocalDownloadKind_LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL {
+		if strings.HasPrefix(grant.Filename, "weightless-1.0.0-") {
 			project++
 			if spelled != revision.Files[0].Digest && spelled != revision.Files[1].Digest ||
-				!strings.HasPrefix(grant.Filename, "weightless-") || grant.Url == "" {
+				grant.Url == "" {
 				t.Fatalf("the project wheel grant names %s %s, not the sealed revision's wheel", spelled, grant.Filename)
 			}
 		}

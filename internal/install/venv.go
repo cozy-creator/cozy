@@ -89,12 +89,16 @@ func MaterializeEnvironment(sourceDir, venvDir, companionStore string) (*Environ
 	return env, nil
 }
 
-// MaterializePublishedEnvironment recreates the frozen local environment from the exact
-// published project metadata, then installs the exact project and custom wheels. Registry
-// dependencies come from uv.lock; wheel paths replace only distributions whose published
-// bytes are authoritative. Nothing is inherited from Creator's own Python environment.
+// MaterializePublishedEnvironment recreates the frozen environment from the exact
+// published metadata alone (wire 30): registry dependencies from the committed lock's
+// export, the release's own wheels hash-pinned against the org's public index. No wheel
+// file is ever staged; every artifact must match a hash the export names
+// (`--require-hashes`), so the indexes have no authority over bytes. The export it writes
+// — index directives plus sorted exact rows — is retained at
+// `<install>/locked-requirements.txt`: it is the exact document Runtime preparation
+// consumes and re-consumes at model selection.
 func MaterializePublishedEnvironment(sourceDir, venvDir, companionStore string,
-	project PublishedWheel, dependencies, localWheels []PublishedWheel,
+	published *PublishedSource,
 ) (*EnvironmentReceipt, *exit.Error) {
 	lock := filepath.Join(sourceDir, "uv.lock")
 	lockDigest, err := fileDigest(lock)
@@ -102,6 +106,9 @@ func MaterializePublishedEnvironment(sourceDir, venvDir, companionStore string,
 		return nil, exit.Named(exit.Structural, "lock_missing",
 			"the published release carries no uv.lock").
 			WithRemedy("publish the exact uv.lock that freezes the package environment")
+	}
+	if published.IndexURL == "" {
+		return nil, exit.Internalf("published package source names no org index")
 	}
 	env := &EnvironmentReceipt{
 		LockDigest: "sha256:" + lockDigest,
@@ -113,22 +120,16 @@ func MaterializePublishedEnvironment(sourceDir, venvDir, companionStore string,
 		"venv", "--no-progress", venvDir); problem != nil {
 		return nil, problem
 	}
-	requirements := filepath.Join(filepath.Dir(venvDir), "locked-requirements.txt")
-	// Published local/workspace sources are represented by their exact wheels, not by the
-	// author's paths. Export the committed lock without reopening those unavailable paths;
-	// the final pip check joins the wheel requirements back to this frozen registry closure.
+	appended := append([]PublishedWheel{published.ProjectWheel}, published.Wheels...)
+	appended = append(appended, published.LocalWheels...)
+	exported := filepath.Join(filepath.Dir(venvDir), ".locked-requirements-export.txt")
+	defer os.Remove(exported)
+	// Export the committed registry closure without the rows the release's own wheels
+	// supply; those rows are re-added below as exact org-index pins.
 	args := []string{"export", "--frozen", "--no-dev", "--no-emit-project",
-		"--format", "requirements.txt", "--output-file", requirements, "--no-progress"}
+		"--format", "requirements.txt", "--output-file", exported, "--no-progress"}
 	seen := map[string]bool{}
-	for _, wheel := range dependencies {
-		name := strings.TrimSpace(wheel.Distribution)
-		if name == "" || seen[name] {
-			continue
-		}
-		seen[name] = true
-		args = append(args, "--no-emit-package", name)
-	}
-	for _, wheel := range localWheels {
+	for _, wheel := range appended {
 		name := strings.TrimSpace(wheel.Distribution)
 		if name == "" || seen[name] {
 			continue
@@ -140,21 +141,15 @@ func MaterializePublishedEnvironment(sourceDir, venvDir, companionStore string,
 		"the published lock cannot export its exact registry closure", args...); problem != nil {
 		return nil, problem
 	}
-	if problem := runUV(sourceDir, config.Frozen().Tool(), "locked_environment_refused",
-		"the exact registry closure is incompatible with the selected Python environment",
-		"pip", "install", "--no-deps", "--require-hashes", "--python",
-		home.VenvPython(venvDir), "--requirements", requirements); problem != nil {
+	requirements := filepath.Join(filepath.Dir(venvDir), "locked-requirements.txt")
+	if problem := writeLockedRequirements(exported, requirements,
+		published.IndexURL, appended); problem != nil {
 		return nil, problem
 	}
-	wheels := append([]PublishedWheel{project}, dependencies...)
-	wheels = append(wheels, localWheels...)
-	args = []string{"pip", "install", "--offline", "--no-index", "--no-deps", "--no-build",
-		"--python", home.VenvPython(venvDir)}
-	for _, wheel := range wheels {
-		args = append(args, wheel.Path)
-	}
-	if problem := runUV(sourceDir, config.Frozen().Tool(), "package_wheel_incompatible",
-		"an exact published wheel is incompatible with the selected Python environment", args...); problem != nil {
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "locked_environment_refused",
+		"the exact locked closure is incompatible with the selected Python environment",
+		"pip", "install", "--no-deps", "--require-hashes", "--python",
+		home.VenvPython(venvDir), "--requirements", requirements); problem != nil {
 		return nil, problem
 	}
 	if problem := runUV(sourceDir, config.Frozen().Tool(), "package_requirement_incompatible",
@@ -181,6 +176,70 @@ func runtimeScratchHome() string {
 		base = os.TempDir()
 	}
 	return filepath.Join(base, "cozy", "runtime-install")
+}
+
+// writeLockedRequirements merges the export's registry rows with the release's own exact
+// wheel pins into the ONE document Runtime's reader admits: two https index directives,
+// then hash-pinned rows sorted unique by normalized distribution.
+func writeLockedRequirements(exported, target, indexURL string,
+	wheels []PublishedWheel,
+) *exit.Error {
+	raw, err := os.ReadFile(exported)
+	if err != nil {
+		return exit.Internalf("cannot read the exported registry closure: %s", err)
+	}
+	rows := map[string]string{}
+	pending := ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasSuffix(line, "\\") {
+			pending += strings.TrimSuffix(line, "\\") + " "
+			continue
+		}
+		row := strings.TrimSpace(pending + line)
+		pending = ""
+		if row == "" || strings.HasPrefix(row, "#") || strings.HasPrefix(row, "-") {
+			continue
+		}
+		name := normalizedRequirementName(row)
+		if name == "" || rows[name] != "" {
+			return exit.Internalf("the exported registry closure row %q is not one exact pin", row)
+		}
+		rows[name] = strings.Join(strings.Fields(row), " ")
+	}
+	seen := map[string]bool{}
+	for _, wheel := range wheels {
+		name := normalizedRequirementName(wheel.Distribution)
+		if name == "" || wheel.Version == "" ||
+			!strings.HasPrefix(wheel.Digest, "sha256:") || rows[name] != "" || seen[name] {
+			return exit.Internalf("published wheel fact %q is incomplete or duplicated",
+				wheel.Distribution)
+		}
+		seen[name] = true
+		rows[name] = name + "==" + wheel.Version + " --hash=" + wheel.Digest
+	}
+	names := make([]string, 0, len(rows))
+	for name := range rows {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var out strings.Builder
+	out.WriteString("--index-url https://pypi.org/simple\n")
+	out.WriteString("--extra-index-url " + indexURL + "\n")
+	for _, name := range names {
+		out.WriteString(rows[name] + "\n")
+	}
+	if err := os.WriteFile(target, []byte(out.String()), 0o600); err != nil {
+		return exit.Internalf("cannot retain the locked-requirements export: %s", err)
+	}
+	return nil
+}
+
+var requirementName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*`)
+var requirementNormalize = regexp.MustCompile(`[-_.]+`)
+
+func normalizedRequirementName(row string) string {
+	name := requirementName.FindString(strings.TrimSpace(row))
+	return requirementNormalize.ReplaceAllString(strings.ToLower(name), "-")
 }
 
 func runUV(dir string, env []string, code, message string, args ...string) *exit.Error {

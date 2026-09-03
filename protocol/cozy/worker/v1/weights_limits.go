@@ -24,3 +24,6 @@ const MaxModelSourceURLBytes = 16 << 10
 const MaxLocalPackageFiles = 33
 const MaxLocalPackageFilenameBytes = 255
 const MaxLocalPackageGrantURLBytes = 16 << 10
+const MaxModelSlotPaths = 256
+const MaxImageInventoryDistributions = 4096
+const MaxLockedRequirementsBytes = 1 << 20

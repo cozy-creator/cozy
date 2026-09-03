@@ -60,8 +60,11 @@ type PublishedSource struct {
 	Release       string
 	UVLock        ExactDocument
 	Wheels        []PublishedWheel
-	Models        []PublishedModel
-	Selection     Selection
+	// IndexURL is the org's public PEP 503 index (th-113): the second index the
+	// locked-requirements export names, serving the release's own wheels.
+	IndexURL  string
+	Models    []PublishedModel
+	Selection Selection
 	// ReportDefect relays a package-interface falsification observed during LOCAL
 	// preparation (cl-078). Best-effort: the hub's sound authorization wants a
 	// rental chain, which a local install does not hold, so only an
@@ -103,13 +106,14 @@ func ModelPrefetchStatus(models []PublishedModel) string {
 	}
 }
 
+// PublishedWheel is one exact release wheel FACT (wire 30): identity only, never a
+// local file. The bytes come from the indexes under the release's own hashes.
 type PublishedWheel struct {
 	Digest       string
 	Distribution string
 	Filename     string
 	ImportRoots  []string
 	Length       int64
-	Path         string
 	Tags         []string
 	Version      string
 }
@@ -134,7 +138,7 @@ func validatePublished(inst records.PackageInstall, published *PublishedSource) 
 	}
 	if published.ProjectWheel.Distribution != inst.Package[strings.LastIndex(inst.Package, "/")+1:] ||
 		published.ProjectWheel.Version != inst.Version ||
-		published.ProjectWheel.Digest == "" || published.ProjectWheel.Path == "" {
+		published.ProjectWheel.Digest == "" || published.ProjectWheel.Filename == "" {
 		return exit.Named(exit.Conflict, "package_wheel_release_mismatch",
 			"published project wheel does not name %s@%s", inst.Package, inst.Version)
 	}
@@ -231,7 +235,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	switch {
 	case req.Published != nil:
 		if req.Published.Package == "" || req.Published.Release == "" ||
-			req.Published.ProjectWheel.Path == "" {
+			req.Published.ProjectWheel.Digest == "" {
 			return fail(exit.Internalf("published package source is incomplete"))
 		}
 		sourceDir = installDir

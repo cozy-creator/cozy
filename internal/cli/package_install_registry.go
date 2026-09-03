@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -90,7 +89,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		return problem
 	}
 	defer work.Release()
-	published, problem := downloadPackageInstallPlan(hctx, ctx, work.Path, ref, release,
+	published, problem := packageInstallPlanFacts(ctx, ref, release,
 		plan, packageConfig, packageInterface, pyproject, uvLock)
 	if problem != nil {
 		return problem
@@ -155,7 +154,7 @@ func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
 	return ref, release, problem
 }
 
-func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch string, ref hub.Ref,
+func packageInstallPlanFacts(cli *Context, ref hub.Ref,
 	release string, plan hub.PackageDownloadPlan, packageConfig,
 	packageInterface, pyproject, uvLock install.ExactDocument,
 ) (*install.PublishedSource, *exit.Error) {
@@ -168,91 +167,48 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 		Pyproject:     pyproject,
 		UVLock:        uvLock,
 		Selection:     install.Selection{PackageInterface: packageInterface},
-		ReportDefect:  localDefectReporter(cli, ref, release),
+		IndexURL: strings.TrimRight(cli.Cfg.HubURL, "/") +
+			"/v1/index/" + ref.Org + "/simple/",
+		ReportDefect: localDefectReporter(cli, ref, release),
 	}
+	// Wire 30: the plan's rows are release wheel FACTS only. No wheel byte is downloaded;
+	// the environment materializes from the locked-requirements export, whose hashes pin
+	// every artifact against PyPI plus the org index.
 	seen := map[string]bool{}
-	type job struct {
-		download hub.PackageInstallDownload
-		dst      string
-	}
-	jobs := make([]job, 0, len(plan.Downloads))
 	for _, download := range plan.Downloads {
-		var dst string
 		switch download.Kind {
 		case "project_wheel", "dependency_wheel", "local_materialization_wheel":
-			if filepath.Base(download.Path) != download.Path || !strings.HasSuffix(download.Path, ".whl") {
-				return nil, exit.Internalf("Tensorhub returned unsafe package wheel path %q", download.Path)
+			if filepath.Base(download.Path) != download.Path ||
+				!strings.HasSuffix(download.Path, ".whl") {
+				return nil, exit.Internalf("Tensorhub returned unsafe package wheel path %q",
+					download.Path)
 			}
-			dst = filepath.Join(scratch, "wheels", download.Path)
-			if download.Kind == "project_wheel" {
-				if published.ProjectWheel.Path != "" {
+			if seen[download.Path] {
+				return nil, exit.Internalf("Tensorhub returned a duplicate package wheel")
+			}
+			seen[download.Path] = true
+			wheel := install.PublishedWheel{Digest: download.Digest,
+				Distribution: download.Distribution, Filename: download.Path,
+				ImportRoots: append([]string(nil), download.ImportRoots...),
+				Length:      download.Length,
+				Tags:        append([]string(nil), download.Tags...), Version: download.Version}
+			switch download.Kind {
+			case "project_wheel":
+				if published.ProjectWheel.Digest != "" {
 					return nil, exit.Internalf("Tensorhub returned more than one project wheel")
 				}
-				published.ProjectWheel = install.PublishedWheel{Digest: download.Digest,
-					Distribution: download.Distribution, Filename: download.Path,
-					ImportRoots: append([]string(nil), download.ImportRoots...), Length: download.Length,
-					Path: dst, Tags: append([]string(nil), download.Tags...), Version: download.Version}
-			} else if download.Kind == "dependency_wheel" {
-				published.Wheels = append(published.Wheels, install.PublishedWheel{Digest: download.Digest,
-					Distribution: download.Distribution, Filename: download.Path,
-					ImportRoots: append([]string(nil), download.ImportRoots...), Length: download.Length,
-					Path: dst, Tags: append([]string(nil), download.Tags...), Version: download.Version})
-			} else {
-				published.LocalWheels = append(published.LocalWheels, install.PublishedWheel{Digest: download.Digest,
-					Distribution: download.Distribution, Filename: download.Path,
-					ImportRoots: append([]string(nil), download.ImportRoots...), Length: download.Length,
-					Path: dst, Tags: append([]string(nil), download.Tags...), Version: download.Version})
+				published.ProjectWheel = wheel
+			case "dependency_wheel":
+				published.Wheels = append(published.Wheels, wheel)
+			default:
+				published.LocalWheels = append(published.LocalWheels, wheel)
 			}
 		default:
 			return nil, exit.Internalf("Tensorhub returned unknown package file kind %q", download.Kind)
 		}
-		if seen[dst] || download.URL == "" {
-			return nil, exit.Internalf("Tensorhub returned a duplicate or unreadable package file")
-		}
-		seen[dst] = true
-		jobs = append(jobs, job{download: download, dst: dst})
 	}
-	if published.ProjectWheel.Path == "" {
+	if published.ProjectWheel.Digest == "" {
 		return nil, exit.Internalf("Tensorhub package install plan has no project wheel")
-	}
-	queue := make(chan job, len(jobs))
-	results := make(chan *exit.Error, len(jobs))
-	for _, item := range jobs {
-		queue <- item
-	}
-	close(queue)
-	var group sync.WaitGroup
-	for range min(16, len(jobs)) {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			for item := range queue {
-				results <- transfer.DownloadExact(ctx, item.download.Path, item.download.URL, item.dst,
-					item.download.Digest, item.download.Length)
-			}
-		}()
-	}
-	go func() {
-		group.Wait()
-		close(results)
-	}()
-	progress := packageFileCounter(cli, "Downloading files")
-	progress(0, len(jobs))
-	completed := 0
-	var firstProblem *exit.Error
-	for problem := range results {
-		completed++
-		progress(completed, len(jobs))
-		if firstProblem == nil && problem != nil {
-			firstProblem = problem
-		}
-	}
-	if firstProblem != nil {
-		return nil, firstProblem
-	}
-	for _, item := range jobs {
-		published.Files++
-		published.Bytes += item.download.Length
 	}
 	return published, nil
 }

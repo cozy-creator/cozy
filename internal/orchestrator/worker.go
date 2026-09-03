@@ -147,9 +147,14 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 	}
 	environment := row.Sub("environment")
 	if placement.SourceDigest == "" {
+		// Wire 30: a published Environment is its locked-requirements ref; supplied
+		// wheels belong to editable revisions only.
 		environmentIdentity := map[string]canonical.Value{
-			"format": "cozy.worker.v1.Environment/1",
-			"wheels": arrayOrEmpty(environment["wheels"]),
+			"format":       "cozy.worker.v1.Environment/1",
+			"local_wheels": arrayOrEmpty(environment["local_wheels"]),
+		}
+		if locked, ok := environment["locked_requirements"]; ok {
+			environmentIdentity["locked_requirements"] = locked
 		}
 		if !digestMatches(environmentIdentity, placement.EnvironmentDigest) {
 			return DesiredPlacement{}, exit.Named(exit.Conflict, "environment_identity_mismatch",

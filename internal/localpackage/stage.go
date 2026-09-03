@@ -307,15 +307,15 @@ func identity(packageName, release, sourceDigest, packageInterfaceDigest string,
 			return Revision{}, nil, exit.Named(exit.Structural, "local_package_file_invalid",
 				"local package file %s has an invalid or duplicate identity", file.Filename)
 		}
-		kind := pb.LocalDownloadKind_LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL
-		if file.Kind == "project" {
-			kind = pb.LocalDownloadKind_LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL
-		} else if file.Kind != "dependency" {
+		// Wire 30: no kind row travels. The project wheel is the row whose measured
+		// wheel identity names the package's own distribution and release; the local
+		// Kind stays a Creator-side staging fact only.
+		if file.Kind != "project" && file.Kind != "dependency" {
 			return Revision{}, nil, exit.Named(exit.Structural, "local_package_file_invalid",
 				"local package file %s has an invalid identity", file.Filename)
 		}
 		refs = append(refs, &pb.LocalPackageFileRef{Digest: digest, Filename: file.Filename,
-			Kind: kind, Length: uint64(file.Length)})
+			Length: uint64(file.Length)})
 	}
 	source, sourceErr := canonical.Raw(sourceDigest)
 	packageInterface, packageInterfaceErr := canonical.Raw(packageInterfaceDigest)
