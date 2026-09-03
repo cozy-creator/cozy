@@ -32,6 +32,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal, TypedDict, cast
+
 from . import errors
 from ._ext import (
     _fit,
@@ -53,7 +55,7 @@ from ._ext import (
     gc,
     manifest_max_bytes,
     object_id,
-    parse_header,
+    parse_header as _parse_header,
     parse_manifest,
     plan,
     platform_digests,
@@ -66,6 +68,73 @@ from ._ext import (
     transfer_object,
     transfer_manifest,
 )
+
+
+class ObjectRef(TypedDict):
+    """One content-addressed body segment."""
+
+    sha256: str
+    length: int
+
+
+class Asset(TypedDict):
+    """One logical non-tensor file carried by a CozyTensors artifact."""
+
+    logical_sha256: str
+    logical_length: int
+    media_type: str
+    segments: list[ObjectRef]
+
+
+class Encoding(TypedDict):
+    """One encoding definition and the digest tensor rows cite."""
+
+    id: str
+    definition: object
+
+
+class TensorLogical(TypedDict):
+    """The execution-visible tensor schema, independent of stored packing."""
+
+    logical_dtype: str
+    shape: list[int]
+
+
+class InlinePart(TypedDict):
+    dtype: str
+    shape: list[int]
+    inline: bytes
+
+
+class SegmentedPart(TypedDict):
+    dtype: str
+    shape: list[int]
+    segments: list[ObjectRef]
+
+
+type TensorPart = InlinePart | SegmentedPart
+
+
+class Tensor(TypedDict):
+    logical: TensorLogical
+    encoding: str
+    parts: dict[str, TensorPart]
+
+
+class Header(TypedDict):
+    """The exact Python projection returned by :func:`parse_header`."""
+
+    format: Literal["cozytensors/1"]
+    configs: dict[str, bytes]
+    assets: dict[str, Asset]
+    encodings: list[Encoding]
+    components: dict[str, dict[str, Tensor]]
+
+
+def parse_header(data: bytes, closure: Closure | None = None) -> Header:
+    """Parse a verified CozyTensors header into TensorFS's typed Python projection."""
+
+    return cast(Header, _parse_header(data, closure))
 
 
 @dataclass(frozen=True)
@@ -97,13 +166,16 @@ def fit(
         )
         for tensor in requirements
     ]
-    return _fit(
-        rows,
-        header,
-        custody=custody,
-        encoded_leaves=encoded_leaves,
-        device=device,
-        observations=observations,
+    return cast(
+        dict[str, object],
+        _fit(
+            rows,
+            header,
+            custody=custody,
+            encoded_leaves=encoded_leaves,
+            device=device,
+            observations=observations,
+        ),
     )
 
 #: The closed carrier/logical dtype enum and its element sizes. The ONE export of dtype
@@ -112,9 +184,18 @@ def fit(
 DTYPES: dict[str, int] = dtypes()
 
 __all__ = [
+    "Asset",
     "DTYPES",
     "Batch",
     "Closure",
+    "Encoding",
+    "Header",
+    "InlinePart",
+    "ObjectRef",
+    "SegmentedPart",
+    "Tensor",
+    "TensorLogical",
+    "TensorPart",
     "TensorRequirement",
     "DerivedWriter",
     "Operation",
