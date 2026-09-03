@@ -174,10 +174,22 @@ type standInPod struct {
 	holdFor time.Duration
 	// refusal, when set, is answered to every package_set.
 	refusal string
+	// unimplemented, once closed, makes this pod answer its control stream the way a pod
+	// that DELETED a lane answers one: codes.Unimplemented over the whole stream. A nil
+	// channel never fires, so an arm that does not set it is untouched.
+	unimplemented chan struct{}
 
 	mu    sync.Mutex
 	seen  []presentedDownloadSet
 	epoch uint64
+}
+
+// claims counts the control streams this pod has accepted a Claim on. It is the owner's
+// redial rate seen from the other end, and the only honest measure of a reconnect loop.
+func (p *standInPod) claims() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.epoch
 }
 
 func (p *standInPod) WatchProgress(_ *pb.ProgressOpen, stream pb.WorkerControl_WatchProgressServer) error {
@@ -228,10 +240,35 @@ func (p *standInPod) Control(stream pb.WorkerControl_ControlServer) error {
 		return nil
 	}
 
+	frames := make(chan *pb.RecordOwnerFrame)
+	go func() {
+		defer close(frames)
+		for {
+			received, err := stream.Recv()
+			if err != nil {
+				return
+			}
+			select {
+			case frames <- received:
+			case <-stream.Context().Done():
+				return
+			}
+		}
+	}()
+
 	for {
-		frame, err := stream.Recv()
-		if err != nil {
-			return nil
+		var frame *pb.RecordOwnerFrame
+		select {
+		case <-p.unimplemented:
+			// What a pod that deleted a lane actually answers. Returning a status from
+			// the bidi handler tears down the whole session, which is why a status the
+			// owner does not treat as terminal becomes a reconnect loop.
+			return status.Error(codes.Unimplemented, "this lane is deleted")
+		case received, open := <-frames:
+			if !open {
+				return nil
+			}
+			frame = received
 		}
 		desired := frame.GetDesiredState()
 		if desired == nil {

@@ -116,7 +116,7 @@ func (c *Orchestrator) attach(w *worker) {
 		err := c.converse(w, addr)
 		if err != nil {
 			c.logf("worker %s: control stream ended: %s", w.instanceID, err)
-			if c.refusePendingDesiredState(w, err) {
+			if c.refuseUnimplemented(w, err) || c.refusePendingDesiredState(w, err) {
 				return
 			}
 		}
@@ -130,6 +130,48 @@ func (c *Orchestrator) attach(w *worker) {
 		// resolution (the worker republishes nothing; its listener persists), not a bound.
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// refuseUnimplemented ends the conversation on codes.Unimplemented, which is the ONE
+// status a redial can never turn into a success: it does not say the callee failed, it
+// says the callee HAS NO SUCH CALL. Nothing about reconnecting installs one.
+//
+// This is deliberately NOT part of refusePendingDesiredState, and the difference is the
+// whole defect. That function answers a PENDING desired revision, so it returns false
+// whenever `acceptedRevision >= revision` — and the lane that produced this hazard, a
+// model-source frame refused by a pod that deleted the lane (tensorhub th-124), is sent
+// long AFTER the pod converged its desired state. Making Unimplemented terminal only
+// there would have left the loop running: 200 ms redial, forever, burning one control
+// epoch each time on a rented pod at roughly a dollar an hour. A sibling session measured
+// the shape at 2,434 revisions in 100 minutes from a different cause.
+//
+// The verdict is recorded as this owner's refusal of the worker (the same field a foreign
+// instance identity or an unpinned release lands in) rather than as a desired-state
+// refusal, because it is a fact about the thing at the other end and not about one
+// revision: a waiter must be answered whether or not a revision was in flight.
+//
+// It stops at Unimplemented on purpose. Unauthenticated and PermissionDenied look similar
+// but a reconnect legitimately re-presents a fresh Claim against a newer epoch, and
+// InvalidArgument depends on which frame was in flight; only "the callee does not
+// implement this at all" is unconditionally beyond retry.
+func (c *Orchestrator) refuseUnimplemented(w *worker, err error) bool {
+	if status.Code(err) != codes.Unimplemented {
+		return false
+	}
+	c.refuseClaim(w, exit.Named(exit.Structural, "worker.call_unimplemented",
+		"this worker does not implement a call this owner made: %s", refusalDetail(err)).
+		WithRemedy("the two sides disagree about the wire — the worker image is older or "+
+			"newer than this daemon; redialing cannot install the missing call"))
+	return true
+}
+
+// refusalDetail bounds what a worker's status message is quoted as.
+func refusalDetail(err error) string {
+	detail := status.Convert(err).Message()
+	if len(detail) > 1024 {
+		detail = detail[:1024] + "…"
+	}
+	return detail
 }
 
 // FailedPrecondition is the worker host's final answer when it could not apply the
@@ -153,10 +195,7 @@ func (c *Orchestrator) refusePendingDesiredState(w *worker, err error) bool {
 		c.mu.Unlock()
 		return false
 	}
-	detail := status.Convert(err).Message()
-	if len(detail) > 1024 {
-		detail = detail[:1024] + "…"
-	}
+	detail := refusalDetail(err)
 	w.desiredRefusal = exit.Named(exit.Structural, "worker.desired_state_refused",
 		"worker rejected desired revision %d before applying it: %s",
 		w.revision, detail)
