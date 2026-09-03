@@ -187,8 +187,8 @@ func (c *Orchestrator) runHostPrepare(s *session, seq uint64, label string, open
 // settleHostPrepare records a preparation's verdict, answering whether the caller holds a
 // prepared set to carry forward. A typed refusal or an inadmissible document is the
 // worker's word on the whole desire (a full-replace set missing one member must not be
-// sent); a transport end without a verdict is not — the control stream's reconnect
-// re-issues the journaled desire and the host answers from its ledger.
+// sent); a transport end without a verdict is not. It releases the waiting launch as
+// Unavailable, leaving the request queued; the fleet observer re-issues the journaled desire.
 func (c *Orchestrator) settleHostPrepare(s *session, w *worker, seq uint64, label string, result hostPrepareResult) bool {
 	switch {
 	case result.refusal != "":
@@ -196,7 +196,8 @@ func (c *Orchestrator) settleHostPrepare(s *session, w *worker, seq uint64, labe
 	case result.fault != nil:
 		c.setDesiredRefusal(w, seq, result.fault)
 	case result.err != nil:
-		c.logf("PodHost prepare %s#%d ended without a verdict: %v", label, seq, result.err)
+		c.setDesiredUnavailable(w, seq, exit.Unavailablef(
+			"PodHost prepare %s ended without a verdict: %v", label, result.err))
 	default:
 		return result.set != nil
 	}
@@ -270,13 +271,28 @@ func (c *Orchestrator) hostPrepareRefused(s *session, w *worker, seq uint64, lab
 
 func (c *Orchestrator) setDesiredRefusal(w *worker, seq uint64, e *exit.Error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if w.hostPrepareSeq != seq {
+		c.mu.Unlock()
 		return
 	}
 	w.desiredRefusal = e
+	instance, revision := w.instanceID, w.revision
+	c.mu.Unlock()
 	c.logf("worker %s: desired revision %d REFUSED before it was applied: %s",
-		w.instanceID, w.revision, e.Message)
+		instance, revision, e.Message)
+}
+
+func (c *Orchestrator) setDesiredUnavailable(w *worker, seq uint64, e *exit.Error) {
+	c.mu.Lock()
+	if w.hostPrepareSeq != seq {
+		c.mu.Unlock()
+		return
+	}
+	w.desiredRefusal = e
+	instance, revision := w.instanceID, w.revision
+	c.mu.Unlock()
+	c.logf("worker %s: desired revision %d DEFERRED without a verdict: %s",
+		instance, revision, e.Message)
 }
 
 // convergePrepared is step three: the exact bytes this owner has verified become the desired
