@@ -574,7 +574,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		if !req.IsJob() || w.spec.Placement.Jobs[0].Function == req.Entrypoint {
 			// A local package_set request learns its binding digest from the worker.
 			// Until that happens an empty plan is neither staged nor stale; resolveFor
-			// sends the signed logical set and binds the observed answer.
+			// sends the logical set and binds the observed answer.
 			if req.Worker != "" && req.PlanID == "" {
 				continue
 			}
@@ -845,7 +845,7 @@ func settledState(state string) bool {
 }
 
 // resolveFor keeps local package execution separate from generic rented capacity.
-// A rented worker receives only Creator's signed logical package refs; the worker
+// A rented worker receives only Creator's logical package refs; the worker
 // resolves and reports the exact binding it made dispatchable.
 func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string, *exit.Error) {
 	if req.Worker == "" {
