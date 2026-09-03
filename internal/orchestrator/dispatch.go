@@ -1372,7 +1372,7 @@ func downloadModelRefs(models []ModelRef) []*pb.DownloadModelRef {
 			continue
 		}
 		out = append(out, &pb.DownloadModelRef{Package: model.Package, Slot: model.Slot,
-			Model: model.Model, Release: model.Release, Manifest: model.Manifest})
+			Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest})
 	}
 	return out
 }
