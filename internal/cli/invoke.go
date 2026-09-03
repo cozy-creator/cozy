@@ -607,6 +607,14 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status",
 			"progress", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "queued", "execution", "attempts", "created"},
+		TypedFields: []string{"number", "target", "machine", "rental_id", "status",
+			"progress_stage", "stage_fraction", "overall_fraction", "position", "total",
+			"remaining_ms", "execution_ms"},
+		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id",
+			"status", "canceled_by", "progress_stage", "stage_fraction", "overall_fraction",
+			"position", "total", "remaining_ms", "queued_ms", "execution_ms", "attempts",
+			"created_at"},
+		TypedRows: make([]map[string]any, 0, len(rows)),
 		// The raw rental id is a machine fact: JSON always carries it, the compact
 		// human table never does — the human word is the MACHINE column (cl-107).
 		Machine: []string{"rental_id"},
@@ -636,6 +644,42 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 			"execution":        seconds(life.ExecutionMS),
 			"attempts":         strconv.Itoa(life.Attempts), "created": life.CreatedAt,
 		})
+		typed := map[string]any{
+			"number": life.Number, "id": life.RequestID, "kind": kind,
+			"target": life.Package + "/" + life.Function, "machine": life.Machine,
+			"status": life.Status, "queued_ms": life.QueuedMS, "execution_ms": life.ExecutionMS,
+			"attempts": life.Attempts, "created_at": life.CreatedAt,
+		}
+		if life.RentalID != "" {
+			typed["rental_id"] = life.RentalID
+		}
+		if life.CanceledBy != "" {
+			typed["canceled_by"] = life.CanceledBy
+		}
+		// Progress is an observation of the current attempt, not durable lifecycle
+		// state. A queued or terminal row therefore carries no progress facts even
+		// if an older frame is still present in an upstream response.
+		if life.Status == "in_progress" {
+			if life.ProgressStage != "" {
+				typed["progress_stage"] = life.ProgressStage
+			}
+			if life.StageFraction != nil {
+				typed["stage_fraction"] = *life.StageFraction
+			}
+			if life.OverallFraction != nil {
+				typed["overall_fraction"] = *life.OverallFraction
+			}
+			if life.Position != nil {
+				typed["position"] = *life.Position
+			}
+			if life.Total != nil {
+				typed["total"] = *life.Total
+			}
+			if life.RemainingMS != nil {
+				typed["remaining_ms"] = *life.RemainingMS
+			}
+		}
+		list.TypedRows = append(list.TypedRows, typed)
 		states[life.Status]++
 	}
 	keys := make([]string, 0, len(states))

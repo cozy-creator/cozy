@@ -164,36 +164,62 @@ func TestRunProgressSurfaces(t *testing.T) {
 		t.Fatalf("detached progress run failed [exit %d]\n%s", code, output)
 	}
 	type progressRow struct {
-		Number          string `json:"number"`
-		Status          string `json:"status"`
-		Progress        string `json:"progress"`
-		ProgressStage   string `json:"progress_stage"`
-		StageFraction   string `json:"stage_fraction"`
-		OverallFraction string `json:"overall_fraction"`
+		Number          int64    `json:"number"`
+		Status          string   `json:"status"`
+		ProgressStage   string   `json:"progress_stage"`
+		StageFraction   *float64 `json:"stage_fraction"`
+		OverallFraction *float64 `json:"overall_fraction"`
+		Position        *int64   `json:"position"`
+		Total           *int64   `json:"total"`
+		RemainingMS     *int64   `json:"remaining_ms"`
+		ExecutionMS     int64    `json:"execution_ms"`
 	}
-	list := func() progressRow {
+	list := func(full bool) progressRow {
 		t.Helper()
-		code, out := runCozy(t, root, "--json", "--full", "run", "list", "--limit", "1")
+		args := []string{"--json"}
+		if full {
+			args = append(args, "--full")
+		}
+		args = append(args, "run", "list", "--limit", "1")
+		code, out := runCozy(t, root, args...)
 		var document struct {
 			Invocations []progressRow `json:"invocations"`
 		}
 		if code != 0 || json.Unmarshal([]byte(out), &document) != nil || len(document.Invocations) != 1 {
 			t.Fatalf("could not read the live progress row [exit %d]\n%s", code, out)
 		}
+		for _, presentation := range []string{
+			`"progress":`, `"queued":"`, `"execution":"`,
+			`"stage_fraction":"`, `"overall_fraction":"`, `"position":"`, `"total":"`,
+		} {
+			if strings.Contains(out, presentation) {
+				t.Fatalf("machine run list retained presentation value %s\n%s", presentation, out)
+			}
+		}
 		return document.Invocations[0]
 	}
-	live := list()
-	progress := regexp.MustCompile(`^[1-9][0-9]?% overall \(~[0-9.]+[a-z]+\) · .+ [1-9][0-9]?% stage$`)
-	if live.Status != "in_progress" || !progress.MatchString(live.Progress) ||
-		live.ProgressStage == "" || live.StageFraction == "" || live.OverallFraction == "" {
+	live := list(true)
+	if live.Status != "in_progress" || live.ProgressStage == "" ||
+		live.StageFraction == nil || *live.StageFraction <= 0 ||
+		live.OverallFraction == nil || *live.OverallFraction <= 0 ||
+		live.Position == nil || live.Total == nil || *live.Position <= 0 ||
+		*live.Total <= 0 || *live.Position > *live.Total ||
+		live.RemainingMS == nil || *live.RemainingMS <= 0 || live.ExecutionMS <= 0 {
 		t.Fatalf("live run does not distinguish overall and stage progress: %+v", live)
 	}
-	if code, out := runCozy(t, root, "run", "watch", live.Number, "--json"); code != 0 ||
+	// Default JSON is the same typed machine projection with fewer diagnostic
+	// identity/timing fields; it never falls back to the human progress cell.
+	if compact := list(false); compact.StageFraction == nil || compact.OverallFraction == nil ||
+		compact.ExecutionMS <= 0 {
+		t.Fatalf("default JSON list lost its numeric progress projection: %+v", compact)
+	}
+	if code, out := runCozy(t, root, "run", "watch", strconv.FormatInt(live.Number, 10), "--json"); code != 0 ||
 		!strings.Contains(out, `"status":"completed"`) {
 		t.Fatalf("progress proof run did not settle [exit %d]\n%s", code, out)
 	}
-	if terminal := list(); terminal.Status != "completed" || terminal.Progress != "-" ||
-		terminal.StageFraction != "" || terminal.OverallFraction != "" {
+	if terminal := list(true); terminal.Status != "completed" || terminal.ProgressStage != "" ||
+		terminal.StageFraction != nil || terminal.OverallFraction != nil ||
+		terminal.Position != nil || terminal.Total != nil || terminal.RemainingMS != nil {
 		t.Fatalf("terminal run retained redundant progress: %+v", terminal)
 	}
 

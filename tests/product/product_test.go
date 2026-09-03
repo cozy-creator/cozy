@@ -2,11 +2,11 @@ package producttest
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -176,15 +176,15 @@ func TestProductPath(t *testing.T) {
 	assertNoAttemptRoot(t, root)
 
 	type listedRun struct {
-		Number    string `json:"number"`
-		ID        string `json:"id"`
-		Kind      string `json:"kind"`
-		Target    string `json:"target"`
-		Machine   string `json:"machine"`
-		Status    string `json:"status"`
-		Progress  string `json:"progress"`
-		Queued    string `json:"queued"`
-		Execution string `json:"execution"`
+		Number      int64  `json:"number"`
+		ID          string `json:"id"`
+		Kind        string `json:"kind"`
+		Target      string `json:"target"`
+		Machine     string `json:"machine"`
+		Status      string `json:"status"`
+		QueuedMS    int64  `json:"queued_ms"`
+		ExecutionMS int64  `json:"execution_ms"`
+		Attempts    int    `json:"attempts"`
 	}
 	listRuns := func() []listedRun {
 		t.Helper()
@@ -205,30 +205,28 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("run list omitted recorded invocations: %+v", runs)
 	}
 	for index, row := range runs {
-		number, err := strconv.ParseInt(row.Number, 10, 64)
-		if err != nil || number < 1 || !strings.HasPrefix(row.ID, "req-") ||
-			row.Kind != "invocation" || !strings.HasSuffix(row.Queued, "s") ||
-			!strings.HasSuffix(row.Execution, "s") || row.Progress != "-" {
-			t.Fatalf("run list row %d is not useful: %+v (%v)", index, row, err)
+		if row.Number < 1 || !strings.HasPrefix(row.ID, "req-") ||
+			row.Kind != "invocation" || row.QueuedMS < 0 || row.ExecutionMS < 0 ||
+			row.Attempts < 1 {
+			t.Fatalf("run list row %d is not useful: %+v", index, row)
 		}
 		if row.Machine != "local" {
 			t.Fatalf("a run attempted on this host's own worker is MACHINE %q, not local: %+v",
 				row.Machine, row)
 		}
 		if index > 0 {
-			prior, _ := strconv.ParseInt(runs[index-1].Number, 10, 64)
-			if prior <= number {
+			if runs[index-1].Number <= row.Number {
 				t.Fatalf("run list is not newest-first by local number: %+v", runs)
 			}
 		}
 	}
 	latest := runs[0]
-	if code, out := runCozy(t, root, "run", "watch", latest.Number, "--json"); code != 0 ||
+	if code, out := runCozy(t, root, "run", "watch", fmt.Sprint(latest.Number), "--json"); code != 0 ||
 		!strings.Contains(out, `"status":"completed"`) ||
 		!strings.Contains(out, `"machine":"local"`) {
 		t.Fatalf("numeric run watch failed or lost its machine [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "run", "cancel", latest.Number, "--json"); code != 0 ||
+	if code, out := runCozy(t, root, "run", "cancel", fmt.Sprint(latest.Number), "--json"); code != 0 ||
 		!strings.Contains(out, `"changed":false`) {
 		t.Fatalf("numeric run cancel was not idempotent [exit %d]\n%s", code, out)
 	}
@@ -237,7 +235,7 @@ func TestProductPath(t *testing.T) {
 		!strings.Contains(out, "PROGRESS") || !strings.Contains(out, "EXECUTION") ||
 		strings.Contains(out, "QUEUED") ||
 		!strings.Contains(out, "local") ||
-		strings.Contains(out, "KIND") || strings.Index(out, runs[0].Number) > strings.Index(out, runs[1].Number) {
+		strings.Contains(out, "KIND") || strings.Index(out, fmt.Sprint(runs[0].Number)) > strings.Index(out, fmt.Sprint(runs[1].Number)) {
 		t.Fatalf("human run list columns/order are not useful [exit %d]\n%s", code, out)
 	}
 
@@ -252,15 +250,15 @@ func TestProductPath(t *testing.T) {
 	}
 	// A request refused before any attempt waited and never ran: its queue clock is
 	// closed at the terminal, and its execution time is exactly nothing.
-	jobQueued, err := strconv.ParseFloat(strings.TrimSuffix(runs[0].Queued, "s"), 64)
 	if runs[0].Kind != "job" || runs[0].Status != "failed" ||
-		err != nil || jobQueued < 0 || jobQueued > 10 || runs[0].Execution != "0.0s" {
-		t.Fatalf("pre-attempt job row lost its kind or its clocks: %+v (%v)", runs, err)
+		runs[0].QueuedMS < 0 || runs[0].QueuedMS > 10_000 || runs[0].ExecutionMS != 0 ||
+		runs[0].Attempts != 0 {
+		t.Fatalf("pre-attempt job row lost its kind or its clocks: %+v", runs)
 	}
 	if runs[0].Machine != "" {
 		t.Fatalf("a request that never landed anywhere claims MACHINE %q: %+v", runs[0].Machine, runs[0])
 	}
-	if code, out := runCozy(t, root, "run", "watch", runs[0].Number, "--json"); code == 0 ||
+	if code, out := runCozy(t, root, "run", "watch", fmt.Sprint(runs[0].Number), "--json"); code == 0 ||
 		!strings.Contains(out, "editable_jobs_unsupported") {
 		t.Fatalf("numeric failed-job watch did not resolve the job [exit %d]\n%s", code, out)
 	}

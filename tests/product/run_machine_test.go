@@ -66,11 +66,17 @@ func TestRunListMachineColumn(t *testing.T) {
 	}
 
 	type listedRun struct {
-		Number   string `json:"number"`
-		ID       string `json:"id"`
-		Machine  string `json:"machine"`
-		RentalID string `json:"rental_id"`
-		Status   string `json:"status"`
+		Number          int64    `json:"number"`
+		ID              string   `json:"id"`
+		Machine         string   `json:"machine"`
+		RentalID        string   `json:"rental_id"`
+		Status          string   `json:"status"`
+		QueuedMS        int64    `json:"queued_ms"`
+		ExecutionMS     int64    `json:"execution_ms"`
+		Attempts        int      `json:"attempts"`
+		ProgressStage   string   `json:"progress_stage"`
+		StageFraction   *float64 `json:"stage_fraction"`
+		OverallFraction *float64 `json:"overall_fraction"`
 	}
 	listRuns := func() map[string]listedRun {
 		t.Helper()
@@ -94,8 +100,15 @@ func TestRunListMachineColumn(t *testing.T) {
 	if row := rows["req-machine-claimed"]; row.Status != "queued" || row.Machine != "otter" {
 		t.Fatalf("a rental-claimed run must carry the rental's machine word: %+v", row)
 	}
-	if rows["req-machine-unclaimed"].Number == "" || rows["req-machine-claimed"].Number == "" {
+	if rows["req-machine-unclaimed"].Number < 1 || rows["req-machine-claimed"].Number < 1 {
 		t.Fatalf("the venue must never replace the monotonic number: %+v", rows)
+	}
+	for _, id := range []string{"req-machine-unclaimed", "req-machine-claimed"} {
+		row := rows[id]
+		if row.QueuedMS < 0 || row.ExecutionMS != 0 || row.Attempts != 0 ||
+			row.ProgressStage != "" || row.StageFraction != nil || row.OverallFraction != nil {
+			t.Fatalf("queued run %s carries presentation text or live progress: %+v", id, row)
+		}
 	}
 	// The default JSON document carries the field too — machine is a first-class column,
 	// not a --full extra.
