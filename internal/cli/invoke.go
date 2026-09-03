@@ -268,10 +268,18 @@ func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
 	if problem != nil || len(selected) == 0 {
 		return nil, problem
 	}
+	slots := make(map[string]launch.Slot, len(ep.Models))
+	for _, slot := range ep.Models {
+		slots[slot.Path] = slot
+	}
 	if remote {
 		out := make([]orchestrator.ModelRef, 0, len(selected))
 		for _, spec := range selected {
-			row, problem := resolveRemoteModel(ctx, target.Package, spec.Slot, spec.Ref, spec.Lane)
+			slot, ok := slots[spec.Slot]
+			if !ok {
+				return nil, exit.Internalf("resolved model slot %s is absent from the package interface", spec.Slot)
+			}
+			row, problem := resolveRemoteModel(ctx, target.Package, slot, spec.Ref, spec.Lane)
 			if problem != nil {
 				return nil, problem
 			}
@@ -298,8 +306,12 @@ func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
 	out := make([]orchestrator.ModelRef, 0, len(selected))
 	for index, spec := range selected {
 		packagePublishStatus(ctx, "Resolving model for %s...", spec.Slot)
+		slot, ok := slots[spec.Slot]
+		if !ok {
+			return nil, exit.Internalf("resolved model slot %s is absent from the package interface", spec.Slot)
+		}
 		model, problem := acquirePublishedModel(hctx, ctx, tool, client(ctx), spec.Ref,
-			spec.Lane, target.Package, spec.Slot,
+			spec.Lane, target.Package, slot,
 			filepath.Join(root, fmt.Sprintf("%03d", index)))
 		if problem != nil {
 			return nil, problem
@@ -416,7 +428,7 @@ func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstal
 	return row, nil
 }
 
-func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane string) (
+func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw, wantedLane string) (
 	orchestrator.ModelRef, *exit.Error,
 ) {
 	// A caller may narrow by Manifest spelling, but cannot introduce one: the Hub-authored
@@ -474,11 +486,13 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane str
 	}
 	manifestLanes := map[string][]string{}
 	manifestBytes := map[string]int64{}
+	manifestComponents := map[string][]string{}
 	for _, lane := range selected.Lanes {
 		if (manifest == "" || lane.ManifestID == manifest) &&
 			(wantedLane == "" || lane.Lane == wantedLane) {
 			manifestLanes[lane.ManifestID] = append(manifestLanes[lane.ManifestID], lane.Lane)
 			manifestBytes[lane.ManifestID] = lane.Bytes
+			manifestComponents[lane.ManifestID] = lane.Components
 		}
 	}
 	if manifest != "" && len(manifestLanes[manifest]) == 0 {
@@ -504,7 +518,10 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane str
 	}
 	lanes := manifestLanes[manifest]
 	sort.Strings(lanes)
-	return orchestrator.ModelRef{Package: packageName, Slot: slotPath,
+	if problem := requireCheckpointComponents(raw, slot, manifestComponents[manifest]); problem != nil {
+		return empty, problem
+	}
+	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path,
 		Model: ref.String(), Release: release, Lane: lanes[0], Manifest: manifest,
 		Bytes: manifestBytes[manifest]}, nil
 }

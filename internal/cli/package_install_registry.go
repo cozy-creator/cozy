@@ -282,11 +282,11 @@ func downloadPublishedPackageModels(ctx context.Context, cli *Context, root stri
 	if problem != nil {
 		return problem
 	}
-	declared := map[string]bool{}
+	declared := map[string]launch.Slot{}
 	for _, callables := range [][]launch.Entrypoint{packageInterface.Entrypoints, packageInterface.Jobs} {
 		for i := range callables {
 			for _, slot := range callables[i].Models {
-				declared[slot.Path] = true
+				declared[slot.Path] = slot
 			}
 		}
 	}
@@ -300,7 +300,7 @@ func downloadPublishedPackageModels(ctx context.Context, cli *Context, root stri
 	}
 	bindings := make([]hub.PackageBindingRow, 0, len(rows))
 	for _, row := range rows {
-		if declared[row.Slot] {
+		if _, ok := declared[row.Slot]; ok {
 			bindings = append(bindings, row)
 		}
 	}
@@ -320,7 +320,7 @@ func downloadPublishedPackageModels(ctx context.Context, cli *Context, root stri
 	for index, binding := range bindings {
 		packagePublishStatus(cli, "Resolving model %s...", binding.Ref())
 		selected, problem := acquirePublishedModel(ctx, cli, tool, hubClient,
-			binding.Ref(), binding.Lane, published.Package, binding.Slot,
+			binding.Ref(), binding.Lane, published.Package, declared[binding.Slot],
 			filepath.Join(root, "models", fmt.Sprintf("%03d", index)))
 		if problem != nil {
 			return problem
@@ -334,13 +334,13 @@ func downloadPublishedPackageModels(ctx context.Context, cli *Context, root stri
 // authority to invoke an already-installed Manifest even if Tensorhub's catalog was
 // reset or is offline. Only a local miss asks Tensorhub to resolve/download.
 func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
-	hubClient *hub.Client, spec, lane, packageName, slot, work string,
+	hubClient *hub.Client, spec, lane, packageName string, slot launch.Slot, work string,
 ) (install.PublishedModel, *exit.Error) {
 	var empty install.PublishedModel
 	if local, ok, problem := exactLocalModel(tool, spec, lane, work); problem != nil {
 		return empty, problem
 	} else if ok {
-		return install.PublishedModel{Package: packageName, Slot: slot, Model: local.Model,
+		return install.PublishedModel{Package: packageName, Slot: slot.Path, Model: local.Model,
 			Release: local.Release, Lane: local.Lane, Manifest: local.Manifest,
 			ManifestLength: local.ManifestLength, Reused: true}, nil
 	}
@@ -349,8 +349,11 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 	resolved, problem := fetch.Resolve(ctx)
 	if problem != nil {
 		return empty, exit.Named(problem.Code, "model_resolution_unavailable",
-			"cannot resolve model %s for slot %s: %s", spec, slot, problem.Message).
-			WithRemedy("download another compatible model or override this slot with model.%s=org/model@release", slot[strings.LastIndex(slot, ".")+1:])
+			"cannot resolve model %s for slot %s: %s", spec, slot.Path, problem.Message).
+			WithRemedy("download another compatible model or override this slot with model.%s=org/model@release", slot.Path[strings.LastIndex(slot.Path, ".")+1:])
+	}
+	if problem := requireCheckpointComponents(spec, slot, resolved.Components); problem != nil {
+		return empty, problem
 	}
 	fetched, problem := fetch.Acquire(ctx, resolved)
 	if problem != nil {
@@ -360,11 +363,22 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 	if err != nil || len(manifest) != 32 || fetched.ManifestLength <= 0 ||
 		fetched.Release == "" || fetched.Lane == "" || fetch.Ref.String() == "/" {
 		return empty, exit.Named(exit.Structural, "model_download_result_invalid",
-			"model acquisition returned an incomplete exact selection for package slot %s", slot)
+			"model acquisition returned an incomplete exact selection for package slot %s", slot.Path)
 	}
-	return install.PublishedModel{Package: packageName, Slot: slot, Model: fetch.Ref.String(),
+	return install.PublishedModel{Package: packageName, Slot: slot.Path, Model: fetch.Ref.String(),
 		Release: fetched.Release, Lane: fetched.Lane, Manifest: fetched.ManifestID,
 		ManifestLength: fetched.ManifestLength, Reused: fetched.Moved == 0}, nil
+}
+
+func requireCheckpointComponents(model string, slot launch.Slot, available []string) *exit.Error {
+	missing := launch.MissingComponents(slot, available)
+	if len(missing) == 0 {
+		return nil
+	}
+	return exit.Named(exit.Validation, "checkpoint_component_missing",
+		"model %s cannot satisfy %s; checkpoint is missing component(s): %s",
+		model, slot.Path, strings.Join(missing, ", ")).
+		WithRemedy("select a checkpoint whose component set includes %s", strings.Join(missing, ", "))
 }
 
 type localModelSelection struct {

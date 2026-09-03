@@ -263,26 +263,28 @@ func publications(ref Ref) string {
 
 // ModelManifest is one resolved immutable model tree.
 type ModelManifest struct {
-	Org        string `json:"org"`
-	Name       string `json:"name"`
-	Release    string `json:"release"`
-	Lane       string `json:"lane"`
-	ManifestID string `json:"manifest_id"`
-	HeaderID   string `json:"header_digest"`
-	Objects    int    `json:"objects"`
-	Bytes      int64  `json:"bytes"`
+	Org        string   `json:"org"`
+	Name       string   `json:"name"`
+	Release    string   `json:"release"`
+	Lane       string   `json:"lane"`
+	ManifestID string   `json:"manifest_id"`
+	HeaderID   string   `json:"header_digest"`
+	Components []string `json:"components"`
+	Objects    int      `json:"objects"`
+	Bytes      int64    `json:"bytes"`
 }
 
 // ModelResolution is Tensorhub's exact answer to a human model ref. Download never
 // lists manifests and guesses: digest or release selection happens at this route.
 type ModelResolution struct {
-	Model      string `json:"model"`
-	Release    string `json:"release"`
-	Lane       string `json:"lane"`
-	ManifestID string `json:"manifest_id"`
-	HeaderID   string `json:"header_digest"`
-	Objects    int    `json:"objects"`
-	Bytes      int64  `json:"bytes"`
+	Model      string   `json:"model"`
+	Release    string   `json:"release"`
+	Lane       string   `json:"lane"`
+	ManifestID string   `json:"manifest_id"`
+	HeaderID   string   `json:"header_digest"`
+	Components []string `json:"components"`
+	Objects    int      `json:"objects"`
+	Bytes      int64    `json:"bytes"`
 }
 
 func (c *Client) ResolveModel(ctx context.Context, spec, lane string) (ModelResolution, *exit.Error) {

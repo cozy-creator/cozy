@@ -152,7 +152,7 @@ func (f *Fetch) Resolve(ctx context.Context) (hub.ModelManifest, *exit.Error) {
 	return hub.ModelManifest{
 		Org: ref.Org, Name: ref.Name, Release: resolved.Release, Lane: resolved.Lane,
 		ManifestID: resolved.ManifestID, HeaderID: resolved.HeaderID,
-		Objects: resolved.Objects, Bytes: resolved.Bytes,
+		Components: resolved.Components, Objects: resolved.Objects, Bytes: resolved.Bytes,
 	}, nil
 }
 
