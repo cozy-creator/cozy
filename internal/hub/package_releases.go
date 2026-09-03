@@ -54,7 +54,9 @@ type PackageReleaseDraft struct {
 }
 
 type PackageReleaseCommit struct {
-	State string `json:"state"`
+	PublicationID   string   `json:"publication_id"`
+	State           string   `json:"state"`
+	BindingWarnings []string `json:"binding_warnings,omitempty"`
 }
 
 type PackageReleaseYank struct {

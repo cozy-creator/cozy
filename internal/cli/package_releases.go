@@ -95,12 +95,17 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	if done.State != "committed" {
 		return exit.Internalf("package commit did not reach committed state")
 	}
+	if done.PublicationID != draft.PublicationID {
+		return exit.Internalf("package commit returned publication id %q, want %q",
+			done.PublicationID, draft.PublicationID)
+	}
 	fields := []output.Field{
 		{K: "package", V: ref.String()}, {K: "release", V: release},
 		{K: "status", V: "published"}, {K: "changed", V: true},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}
 	record := compactRecord(fields, "package", "release", "status")
+	record.Notes = append(record.Notes, done.BindingWarnings...)
 	for _, dependency := range pack.Vendored {
 		record.Notes = append(record.Notes, packagepublish.VendoredNote(account.Name, dependency))
 	}
