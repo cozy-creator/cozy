@@ -125,9 +125,9 @@ tfs home migrate ~/.cozy/cas
 ```
 
 The destination must not exist. TensorFS refuses live holders and cross-filesystem moves, performs
-one atomic rename, verifies that every filesystem entry retained its device, inode, and mtime, and
-leaves no redirect or fallback at the old path. The existing verification catalog therefore opens
-without rehashing payloads.
+one atomic rename, and leaves no redirect or fallback at the old path. A same-filesystem rename
+preserves device, inode, and mtime, so the existing verification catalog opens without rehashing
+payloads.
 
 ## Build and test
 

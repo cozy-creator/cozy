@@ -17,7 +17,6 @@ pub const ENV: &str = "TENSORFS_HOME";
 pub struct MoveReport {
     pub source: PathBuf,
     pub destination: PathBuf,
-    pub entries: usize,
 }
 
 /// Resolve an optional caller-supplied Store root.
@@ -130,69 +129,16 @@ pub fn move_store(source: &Path, explicit_destination: Option<&Path>) -> Result<
     }
 
     let _exclusive = WriterGuard::lock_rebuild(&source)?;
-    let before = identities(&source)?;
     fs::rename(&source, &destination).map_err(|error| io("rename Store", error))?;
     store::fsync_dir(&destination_parent)?;
     if source_parent != destination_parent {
         store::fsync_dir(source_parent)?;
     }
-    let after = identities(&destination)?;
-    if before != after {
-        return refuse(
-            Code::DURABILITY_UNPROVEN,
-            format!(
-                "Store moved to {}, but device/inode/mtime identity changed",
-                destination.display()
-            ),
-        );
-    }
     Store::open(&destination)?;
     Ok(MoveReport {
         source,
         destination,
-        entries: after.len(),
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Identity {
-    path: PathBuf,
-    device: u64,
-    inode: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-}
-
-fn identities(root: &Path) -> Result<Vec<Identity>> {
-    fn visit(root: &Path, path: &Path, out: &mut Vec<Identity>) -> Result<()> {
-        let metadata = fs::symlink_metadata(path).map_err(|error| io("stat Store entry", error))?;
-        out.push(Identity {
-            path: path
-                .strip_prefix(root)
-                .unwrap_or(Path::new(""))
-                .to_path_buf(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            modified_seconds: metadata.mtime(),
-            modified_nanoseconds: metadata.mtime_nsec(),
-        });
-        if metadata.is_dir() {
-            let mut children = fs::read_dir(path)
-                .map_err(|error| io("read Store directory", error))?
-                .map(|entry| entry.map(|entry| entry.path()))
-                .collect::<std::io::Result<Vec<_>>>()
-                .map_err(|error| io("read Store entry", error))?;
-            children.sort();
-            for child in children {
-                visit(root, &child, out)?;
-            }
-        }
-        Ok(())
-    }
-
-    let mut out = Vec::new();
-    visit(root, root, &mut out)?;
-    Ok(out)
 }
 
 fn io(what: &str, error: std::io::Error) -> crate::err::Refusal {

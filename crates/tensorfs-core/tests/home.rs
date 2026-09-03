@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -95,6 +96,7 @@ fn migration_is_one_atomic_move_and_keeps_verification_identity() {
     store
         .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
         .unwrap();
+    let before = fs::metadata(store.blob_path(&object.sha256)).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_tfs"))
         .args(["home", "migrate", source.to_str().unwrap()])
@@ -112,9 +114,14 @@ fn migration_is_one_atomic_move_and_keeps_verification_identity() {
     assert!(destination.is_dir());
     assert!(String::from_utf8(output.stdout)
         .unwrap()
-        .contains("device/inode/mtime preserved"));
+        .contains("device/inode/mtime preserved by same-filesystem rename"));
 
     let moved = Store::open(&destination).unwrap();
+    let after = fs::metadata(moved.blob_path(&object.sha256)).unwrap();
+    assert_eq!(before.dev(), after.dev());
+    assert_eq!(before.ino(), after.ino());
+    assert_eq!(before.mtime(), after.mtime());
+    assert_eq!(before.mtime_nsec(), after.mtime_nsec());
     assert_eq!(
         moved.verify(&object.sha256).unwrap(),
         Verdict::Verified { rehashed: false }

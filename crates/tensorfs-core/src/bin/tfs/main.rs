@@ -497,10 +497,9 @@ fn cmd_home_migrate(source: &Path, flags: &Flags) -> ExitCode {
     let destination = flag(flags, "to").map(Path::new);
     let report = ok!(tensorfs_core::home::move_store(source, destination));
     println!(
-        "moved {} -> {} ({} filesystem entries; device/inode/mtime preserved)",
+        "moved {} -> {} (device/inode/mtime preserved by same-filesystem rename)",
         report.source.display(),
         report.destination.display(),
-        report.entries,
     );
     ExitCode::SUCCESS
 }
