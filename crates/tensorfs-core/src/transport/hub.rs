@@ -20,9 +20,11 @@
 //! Responses are I-JSON, ASCII, no HTML escaping (Go: `SetEscapeHTML(false)`).
 //!
 //! **The credential arrives as a provider trait, never a credential type**, so one
-//! implementation serves a worker delegation on a pod and a user token on a laptop. It is
-//! asked per host, so a credential stays scoped to the hosts its provider names and
-//! cannot leak onto a presigned object host or a redirect target.
+//! implementation serves whatever a caller holds. It is asked per host, so a credential
+//! stays scoped to the hosts its provider names and cannot leak onto a presigned object
+//! host or a redirect target. A rented pod holds nothing at all: the hub's closure and
+//! presign routes are PUBLIC (tensorhub owner ruling 2026-09-03, which deleted the signed
+//! DownloadDelegation these calls used to present), so the pod fetches as `Anonymous`.
 
 use crate::canon::{self, as_arr, as_obj, as_str, as_uint, Value};
 use crate::err::{refuse, Code, Refusal, Result};
@@ -67,7 +69,7 @@ impl CredentialProvider for HostToken {
 }
 
 /// Arbitrary presentation headers, scoped to named hosts — the generic impl a caller
-/// builds when its credential is not a bearer (a worker delegation is two headers).
+/// builds when its credential is not a bearer.
 pub struct ScopedHeaders {
     pub hosts: Vec<String>,
     pub headers: Vec<(String, String)>,
@@ -86,9 +88,9 @@ impl CredentialProvider for ScopedHeaders {
 /// The ONE credential spelling every surface passes (tfs-050): exactly one scoped value,
 /// handed explicitly — a file, one deliberately-set variable — never inherited.
 ///
-/// - `bearer <token>`                       → `authorization: Bearer <token>`
-/// - `delegation <payload-b64url> <sig-b64url>` → the worker delegation pair
-/// - empty                                  → anonymous
+/// - `bearer <token>` → `authorization: Bearer <token>`
+/// - empty            → anonymous, which is what a rented pod uses: the hub's closure and
+///   presign routes take no credential.
 pub fn credential_from_spec(spec: &str, hosts: Vec<String>) -> Result<ScopedHeaders> {
     let spec = spec.trim();
     if spec.is_empty() {
@@ -98,22 +100,15 @@ pub fn credential_from_spec(spec: &str, hosts: Vec<String>) -> Result<ScopedHead
         });
     }
     let mut parts = spec.split_whitespace();
-    let headers = match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some("bearer"), Some(token), None, _) => {
+    let headers = match (parts.next(), parts.next()) {
+        (Some("bearer"), Some(token)) if parts.next().is_none() => {
             vec![("authorization".to_string(), format!("Bearer {token}"))]
         }
-        (Some("delegation"), Some(payload), Some(signature), None) => vec![
-            ("x-tensorfs-delegation".to_string(), payload.to_string()),
-            (
-                "x-tensorfs-delegation-signature".to_string(),
-                signature.to_string(),
-            ),
-        ],
         _ => {
             return refuse(
                 Code::CREDENTIAL_REQUIRED,
-                "a credential is `bearer <token>` or `delegation <payload> <signature>` — \
-                 one scoped value, passed explicitly",
+                "a credential is `bearer <token>` or empty — one scoped value, passed \
+                 explicitly",
             )
         }
     };

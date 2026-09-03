@@ -33,7 +33,7 @@
 //!   tfs fill <root> <plan>       resumable fill: skip only verified objects
 //!
 //! The ONE transport (tfs-048/tfs-049/tfs-050). The credential is `--credential-file` or
-//! TFS_CREDENTIAL (`bearer <token>` | `delegation <payload> <sig>`), never bare argv; a
+//! TFS_CREDENTIAL (`bearer <token>`, or empty for anonymous), never bare argv; a
 //! URL of `-` arrives on stdin. Flags: --hub <base> --lane --session --streams <n>
 //! --timeout <s> --allow-hosts a,b,.c --allow-local --max-redirects <n>.
 //!
