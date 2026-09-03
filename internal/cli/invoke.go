@@ -1762,14 +1762,13 @@ func triageRemedy(ctx *Context, ref *api.TriageRef, terminal *localapi.Event) st
 		}
 		return fmt.Sprintf("triage bundle %s was NOT kept: %s", ref.SubjectID, fault)
 	}
-	layout, problem := home.Open(ctx.Cfg.Home)
+	remedy := "triage bundle " + ref.SubjectID + " kept; read it with `GET " + ref.URL + "`"
+	c, problem := dial(ctx)
 	if problem != nil {
-		return "the retained triage bundle explains it"
+		return remedy
 	}
-	path := layout.TriageFile(ref.SubjectID)
-	remedy := "triage bundle kept at " + ctx.Mode().Hyperlink(path)
-	data, err := os.ReadFile(path)
-	if err != nil {
+	data, problem := c.Triage(ref.AttemptKey)
+	if problem != nil {
 		return remedy
 	}
 	var bundle struct {

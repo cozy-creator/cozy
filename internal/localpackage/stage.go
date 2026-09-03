@@ -88,6 +88,9 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 	for _, dependency := range pack.DependencyWheels {
 		paths = append(paths, dependency.Path)
 	}
+	if err := os.MkdirAll(layout.LocalPackages, 0o700); err != nil {
+		return Revision{}, exit.Internalf("cannot create the local package store: %s", err)
+	}
 	stage, err := os.MkdirTemp(layout.LocalPackages, ".stage-")
 	if err != nil {
 		return Revision{}, exit.Internalf("cannot create local package staging: %s", err)

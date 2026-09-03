@@ -203,15 +203,16 @@ func attachDaemon(t *testing.T, root string) *daemonProcess {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		lock, lockErr := os.ReadFile(filepath.Join(root, "daemon.lock"))
-		credential, credentialErr := os.ReadFile(filepath.Join(root, "client.cred"))
-		if lockErr == nil && credentialErr == nil {
+		if lockErr == nil {
 			for _, line := range strings.Split(string(lock), "\n") {
 				if value, ok := strings.CutPrefix(line, "addr="); ok {
 					s.addr = strings.TrimSpace(value)
 				}
+				if value, ok := strings.CutPrefix(line, "token="); ok {
+					s.token = strings.TrimSpace(value)
+				}
 			}
-			if s.addr != "" {
-				s.token = strings.TrimSpace(string(credential))
+			if s.addr != "" && s.token != "" {
 				return s
 			}
 		}

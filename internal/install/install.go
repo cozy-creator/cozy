@@ -345,7 +345,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	// resident placement. Editable source retains its existing development path.
 	if req.Local != nil {
 		packageInterface, placement, e = deriveDevelopmentPlacement(
-			venvDir, sourceDir, l.CAS, *req.Local)
+			venvDir, sourceDir, config.Frozen().TensorFSRoot, *req.Local)
 		if e != nil {
 			return guard(e)
 		}
@@ -417,7 +417,7 @@ func deriveDevelopmentPlacement(venvDir, sourceDir, artifactStore string, local 
 	cmd := exec.Command(bin, "--json", "--dir", sourceDir, "development-placement",
 		"--package", local.Package, "--release", local.Release,
 		"--source-digest", local.SourceDigest, "--artifact-store", artifactStore)
-	cmd.Env = config.Frozen().Tool()
+	cmd.Env = config.Frozen().Tool("COZY_HOME=" + runtimeScratchHome())
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()

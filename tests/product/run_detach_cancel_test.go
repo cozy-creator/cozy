@@ -96,7 +96,7 @@ func TestClientDeathNeverCancels(t *testing.T) {
 
 	// The QUEUED path: the incident's exact pre-attempt state — a request parked with no
 	// dispatchable worker — canceled explicitly and settled with its actor recorded.
-	store, problem := records.Open(filepath.Join(root, "records.db"))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	const parkedID = "req-cl108-parked"

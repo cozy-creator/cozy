@@ -68,7 +68,7 @@ func TestRentalMachineNames(t *testing.T) {
 		}
 	}
 
-	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
+	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	const hubURL, fleetCap = "https://hub.invalid", int64(1_000_000_000_000)

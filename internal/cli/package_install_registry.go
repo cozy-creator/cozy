@@ -344,8 +344,12 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 			Release: local.Release, Lane: local.Lane, Manifest: local.Manifest,
 			ManifestLength: local.ManifestLength, Reused: true}, nil
 	}
+	layout, problem := home.Open(cli.Cfg.Home)
+	if problem != nil {
+		return empty, problem
+	}
 	fetch := &transfer.Fetch{Tool: tool, Hub: hubClient, Spec: spec, Lane: lane,
-		Progress: progress(cli), Scratch: work}
+		Progress: progress(cli), Scratch: work, Locks: layout.AcquisitionLocks()}
 	resolved, problem := fetch.Resolve(ctx)
 	if problem != nil {
 		return empty, exit.Named(problem.Code, "model_resolution_unavailable",

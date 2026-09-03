@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -106,39 +105,16 @@ func TestLocalAPIDoor(t *testing.T) {
 		t.Errorf("the public web stub bypassed the Host guard: %s", hostile.brief())
 	}
 
-	// Browser-selected bytes cross one authenticated, bounded, content-addressed door.
-	// The response exposes an opaque id, never a caller filesystem path.
+	// The standalone upload plane is DELETED (cl-116): no second content-addressed blob
+	// store exists under the home, and a future browser upload becomes a request-owned
+	// input. The route refuses as unknown even to an authenticated caller.
 	uploadBody := []byte("\x89PNG\r\n\x1a\ncozy-upload-arm")
-	unauthenticatedUpload := svc.callBytes(t, "POST", "/v1/uploads", uploadBody, "image/png",
-		"Authorization", "")
-	if unauthenticatedUpload.Status != http.StatusUnauthorized {
-		t.Errorf("an unauthenticated upload was admitted: %s", unauthenticatedUpload.brief())
+	if r := svc.callBytes(t, "POST", "/v1/uploads", uploadBody, "image/png"); r.Status != http.StatusNotFound ||
+		r.code() != "unknown_route" {
+		t.Errorf("the retired upload plane answered: %s", r.brief())
 	}
-	first := svc.callBytes(t, "POST", "/v1/uploads", uploadBody, "image/png")
-	second := svc.callBytes(t, "POST", "/v1/uploads", uploadBody, "image/png")
-	if first.Status != http.StatusCreated || second.Status != http.StatusCreated {
-		t.Fatalf("content-addressed upload failed: first=%s second=%s", first.brief(), second.brief())
-	}
-	var stored, replayed struct {
-		ID     string `json:"upload_id"`
-		Digest string `json:"digest"`
-		Length int64  `json:"length"`
-		URL    string `json:"url"`
-	}
-	must(t, json.Unmarshal(first.Body, &stored))
-	must(t, json.Unmarshal(second.Body, &replayed))
-	if stored.ID == "" || stored.ID != replayed.ID || stored.Digest != replayed.Digest ||
-		stored.Length != int64(len(uploadBody)) || strings.Contains(string(first.Body), root) {
-		t.Errorf("upload identity is not pathless and idempotent: %s / %s", first.brief(), second.brief())
-	}
-	fetched := svc.call(t, "GET", stored.URL, nil)
-	if fetched.Status != http.StatusOK || string(fetched.Body) != string(uploadBody) ||
-		fetched.Header.Get("X-Cozy-Digest") != stored.Digest {
-		t.Errorf("opaque upload readback changed bytes or identity: %s", fetched.brief())
-	}
-	malformed := svc.call(t, "GET", "/v1/uploads/upl-../../../../etc/passwd", nil)
-	if malformed.Status != http.StatusNotFound {
-		t.Errorf("a path-shaped upload id reached the filesystem: %s", malformed.brief())
+	if r := svc.call(t, "GET", "/v1/uploads/upl-"+strings.Repeat("a", 64), nil); r.Status != http.StatusNotFound {
+		t.Errorf("the retired upload plane served: %s", r.brief())
 	}
 
 	// The media plane takes opaque ids and nothing that could be a path.
@@ -177,12 +153,12 @@ func TestLocalAPIDoor(t *testing.T) {
 		t.Errorf("deleted caller-selected worker reached the queue: %s", deletedWorker.brief())
 	}
 
-	// The credential is handed over through an OS-protected file, never argv, and never
-	// appears in anything the daemon writes.
-	info, err := os.Stat(filepath.Join(root, "client.cred"))
+	// The credential rides the daemon's own OS-protected record, never argv, and never
+	// appears in anything the daemon writes elsewhere.
+	info, err := os.Stat(filepath.Join(root, "daemon.lock"))
 	must(t, err)
 	if info.Mode().Perm() != 0o600 {
-		t.Errorf("the CLI credential file is %v, wanted 0600", info.Mode().Perm())
+		t.Errorf("the daemon record carrying the credential is %v, wanted 0600", info.Mode().Perm())
 	}
 	log, _ := os.ReadFile(filepath.Join(root, "daemon.log"))
 	if strings.Contains(string(log), svc.token) {
@@ -193,7 +169,7 @@ func TestLocalAPIDoor(t *testing.T) {
 	}
 
 	// Plain down is safe by default: one paid obligation refuses shutdown by exact id.
-	store, problem := records.Open(filepath.Join(root, "records.db"))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	fatal(t, store.RecordRental(records.Rental{
 		ID:               "rental-down-arm",

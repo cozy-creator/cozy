@@ -1,7 +1,9 @@
 package producttest
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -20,8 +22,27 @@ import (
 // new names" but "an existing database keeps its installs, pins, workers, requests and
 // rentals while the shape changes".
 func TestRecordsMigrationFromEleven(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "records.db")
+	root := t.TempDir()
+	path := filepath.Join(root, "records.db")
 	writeSchemaElevenDatabase(t, path)
+
+	// Two triage files beside the database: one an attempt row references — its bytes
+	// must land IN that row — and one orphan the audit found 259 of, which nothing may
+	// import and the daemon's retired-shape sweep later deletes with the directory.
+	triageDir := filepath.Join(root, "triage")
+	if err := os.MkdirAll(triageDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundle := []byte(`{"terminal":{"traceback":"boom"}}`)
+	digest := sha256.Sum256(bundle)
+	if err := os.WriteFile(filepath.Join(triageDir, "trb-kept.json"), bundle, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(triageDir, "trb-orphan.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeSchemaElevenAttempt(t, path, "sha256:"+hex.EncodeToString(digest[:]),
+		int64(len(bundle)), filepath.Join(triageDir, "trb-kept.json"))
 
 	if store, problem := records.Open(path); problem == nil || problem.ErrName() != "records_schema_upgrade_required" {
 		if store != nil {
@@ -38,11 +59,18 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 		t.Fatalf("ordinary Open changed user_version to %d: %v", priorVersion, err)
 	}
 	before.Close()
-	store, problem := records.OpenForDaemon(path)
+	store, problem := records.OpenForDaemon(path, triageDir)
 	if problem != nil {
 		t.Fatalf("schema-11 database did not migrate: %v", problem)
 	}
 	defer store.Close()
+
+	// Schema 22: the referenced bundle's exact bytes now live in the attempt row and are
+	// served by the attempt's opaque key; the orphan imported nowhere.
+	if subject, kept, problem := store.TriageBundle("att-triaged"); problem != nil ||
+		subject != "trb-kept" || string(kept) != string(bundle) {
+		t.Fatalf("triage bundle after migration = %q/%d bytes, %v", subject, len(kept), problem)
+	}
 
 	// The product's own readers answer, so the rows survived as ROWS and not merely as
 	// bytes in a table that happens to still exist.
@@ -67,8 +95,11 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 21 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 22 {
 		t.Fatalf("user_version = %d, %v", version, err)
+	}
+	if columns := columnNames(t, db, "attempts"); !columns["triage_bundle"] || columns["triage_path"] {
+		t.Fatalf("attempts columns after migration = %v", columns)
 	}
 	// The request keeps the schema-15 local_package spelling, schema 17 records
 	// the machine word, schema 19 deletes the duplicate config digest, and schema 20
@@ -134,6 +165,27 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	if problem != nil || rented == nil || rented.State != "ready" || rented.ReadyAt != "" ||
 		rented.MachineName != "quiet-heron-0000000000000011" {
 		t.Fatalf("rental after migration = %+v, %v", rented, problem)
+	}
+}
+
+// writeSchemaElevenAttempt plants one closed, triage-bearing attempt in the released
+// shape: the bundle bytes live in a FILE the row names, which is exactly what schema 22
+// retires.
+func writeSchemaElevenAttempt(t *testing.T, path, digest string, length int64, triagePath string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO attempts(request_id,attempt,attempt_key,instance_id,
+		session_id,invocation_digest,invocation,state,terminal_status,terminal_cause,
+		triage_subject,triage_digest,triage_length,triage_path,dispatched_at,closed_at)
+		VALUES('request-orphan',1,'att-triaged','worker-1','session-1','sha256:ff',x'00',
+		'closed','FAILED','handler_error','trb-kept',?,?,?,
+		'2026-01-01T00:00:01Z','2026-01-01T00:00:02Z')`,
+		digest, length, triagePath); err != nil {
+		t.Fatalf("cannot plant the schema-11 attempt: %v", err)
 	}
 }
 

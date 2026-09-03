@@ -9,7 +9,9 @@
 // its launcher and said COLD forever.
 //
 // The lock file's bytes are written by the holder and are meaningless without the lock:
-// the address is data the live owner publishes, never evidence that it lives.
+// the address is data the live owner publishes, never evidence that it lives. The same
+// record carries the per-launch CLI token (cl-116): the file is mode 0600, rewritten on
+// every launch, and there is no separate client.cred handoff file.
 package daemon
 
 import (
@@ -43,7 +45,7 @@ func Probe(cfg config.Config) State {
 		return st
 	}
 	st.Path = cfg.Home + "/daemon.lock"
-	f, err := os.OpenFile(st.Path, os.O_RDWR|os.O_CREATE, 0o644)
+	f, err := os.OpenFile(st.Path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		st.Details = "the daemon lock is unreadable: " + err.Error()
 		return st
@@ -84,10 +86,18 @@ type Held struct{ f *os.File }
 
 // Hold takes the root's exclusive claim and publishes the live addresses under it. A
 // second `cozy run list` on one root gets exit 13 here, before it can bind anything.
+// The body is rewritten on every launch; api.Mint appends the per-launch CLI token to
+// the same record, which is why the file is 0600 and why no client.cred exists.
 func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
-	f, err := os.OpenFile(l.Daemon, os.O_RDWR|os.O_CREATE, 0o644)
+	f, err := os.OpenFile(l.Daemon, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, exit.Internalf("cannot establish daemon ownership for %s: %s", l.Root, err)
+	}
+	// Chmod anyway: O_CREAT's mode is masked by umask, and a prior build's 0644 lock
+	// file would otherwise keep its old width under the new token-carrying body.
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return nil, exit.Internalf("cannot protect the daemon record: %s", err)
 	}
 	if err := flock.Exclusive(f); err != nil {
 		f.Close()
@@ -110,11 +120,15 @@ func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
 }
 
 // Release drops the claim. The kernel does this anyway, on any exit; this is only the
-// polite spelling of it.
+// polite spelling of it. The published body — the address and the CLI token api.Mint
+// appended — is truncated first: a credential must not outlive its daemon on disk, and
+// a client polling the record must never read a dead launch's token as a live one. A
+// SIGKILL skips this, which is why clients also compare the body across a relaunch.
 func (h *Held) Release() {
 	if h == nil || h.f == nil {
 		return
 	}
+	_ = h.f.Truncate(0)
 	_ = flock.Release(h.f)
 	_ = h.f.Close()
 	h.f = nil

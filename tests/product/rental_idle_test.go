@@ -38,7 +38,7 @@ func TestRentalIdleRelease(t *testing.T) {
 	logPath := filepath.Join(root, "daemon.log")
 
 	hub := newFakeRentalHub(t, port)
-	store, problem := records.Open(filepath.Join(root, "records.db"))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	plant := func(id, machine string) {

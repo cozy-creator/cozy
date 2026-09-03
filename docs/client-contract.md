@@ -32,8 +32,6 @@ daemon.
 | `POST /v1/requests/{id}/cancel` | core | yes | requests cancellation; `?grace_ms=` |
 | `GET /v1/requests/{id}/events` | core | yes | SSE, one request, terminal-stop; `?cursor=` |
 | `GET /v1/media/{media_id}` | core | yes | bytes by opaque id; `HEAD`; one `Range` |
-| `POST /v1/uploads` | local | yes | admit bounded content-addressed bytes; no caller path |
-| `GET /v1/uploads/{upload_id}` | local | yes | opaque upload bytes with digest and Range support |
 
 ### Submit
 
@@ -261,6 +259,7 @@ URLs but remain local-scope rows in the same guarded route table.
 
 | route | scope | auth | notes |
 |---|---|---|---|
+| `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | one attempt's kept triage bundle from its own row; 404 when none was kept |
 | `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the daemon to one generic empty private worker and directly claim WorkerControl |
 | `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | detach that worker and wait for its control loop before rental credentials are removed |
 | `POST /v1/local/daemon/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |

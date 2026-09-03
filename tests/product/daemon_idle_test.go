@@ -41,7 +41,7 @@ func TestDaemonIdleShutdown(t *testing.T) {
 	// (b) A rental row — including one the hub has not yet confirmed released — holds the
 	// daemon up past the debounce, and the daemon names it. Forgetting the row, which is
 	// what a confirmed release does, is what lets it go.
-	store, problem := records.Open(filepath.Join(root, "records.db"))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	fatal(t, store.RecordRental(records.Rental{

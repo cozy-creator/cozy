@@ -32,7 +32,7 @@ func TestRentalListingAdoptsTheHubBilledRate(t *testing.T) {
 	hub.add("pr-redarm", "twine")
 	hub.setRate("pr-redarm", 720_000)
 
-	store, problem := records.Open(filepath.Join(root, "records.db"))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	fatal(t, store.RecordRental(records.Rental{
@@ -120,7 +120,7 @@ func TestRentalListingShowsStructuredBootFailure(t *testing.T) {
 	}
 	hubServer.mu.Unlock()
 
-	store, problem := records.Open(filepath.Join(root, "records.db"))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	fatal(t, store.RecordRental(records.Rental{
 		ID: "pr-boot-failed", MachineName: "yuzuriha", SKU: "gpu-cu130",
@@ -157,7 +157,7 @@ func TestRentalListingShowsStructuredBootFailure(t *testing.T) {
 		row.ContainerState != "exited" {
 		t.Fatalf("typed rental failure lost facts: %+v", listed.Rentals[0])
 	}
-	persisted, problem := records.Open(filepath.Join(root, "records.db"))
+	persisted, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	stored, problem := persisted.RentalRow("pr-boot-failed")
 	fatal(t, problem)

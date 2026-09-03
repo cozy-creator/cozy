@@ -29,7 +29,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/home"
 )
 
 // Tool is one resolved tensorfs CLI plus the store it operates on.
@@ -40,17 +39,19 @@ type Tool struct {
 	env    []string
 }
 
-// Open resolves the binary and the store. A missing `tfs` is a structural refusal
-// (exit 6) naming what to install: this binary cannot substitute for it, and a
-// cozy-creator-side reimplementation is exactly what boundaries.md forbids.
-func Open(cfg config.Config, layout home.Layout) (*Tool, *exit.Error) {
+// Open resolves the binary and the independent TensorFS Store root (proto-030: the
+// root is supplied explicitly, never derived from the Creator home). A missing `tfs`
+// is a structural refusal (exit 6) naming what to install: this binary cannot
+// substitute for it, and a cozy-creator-side reimplementation is exactly what
+// boundaries.md forbids.
+func Open(cfg config.Config) (*Tool, *exit.Error) {
 	bin, err := exec.LookPath(cfg.Tfs)
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "tfs_missing",
 			"the tensorfs CLI %q is not on PATH: %s", cfg.Tfs, err).
 			WithRemedy("build it from the tensorfs repo (cargo build --release -p tensorfs-core --bin tfs) and set COZY_TFS to the binary")
 	}
-	t := &Tool{Bin: bin, Root: layout.CAS, Source: cfg.TfsSource, env: cfg.Tool()}
+	t := &Tool{Bin: bin, Root: cfg.TensorFSRoot, Source: cfg.TfsSource, env: cfg.Tool()}
 	if err := os.MkdirAll(t.Root, 0o755); err != nil {
 		return nil, exit.Internalf("cannot create the local store at %s: %s", t.Root, err)
 	}

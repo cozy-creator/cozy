@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -100,7 +101,7 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 				"--development-source-digest", placement.SourceDigest},
 			Dir: f.Source, Devices: devices, GraceSec: 3,
 			ArtifactCache: cache,
-			ArtifactStore: filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
+			ArtifactStore: config.Frozen().TensorFSRoot,
 		}, nil
 	}
 	runtimeBin, e := HostRuntime(f.RuntimeCLI.Env)
@@ -115,6 +116,6 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 		GraceSec:          3,
 		ArtifactCache:     cache,
 		EnvironmentPython: home.VenvPython(filepath.Join(f.Install.Dir, "venv")),
-		ArtifactStore:     filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
+		ArtifactStore:     config.Frozen().TensorFSRoot,
 	}, nil
 }

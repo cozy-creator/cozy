@@ -31,7 +31,7 @@ func TestRunListMachineColumn(t *testing.T) {
 			"tensorhub_token: machine-column-test\n"+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 
-	store, problem := records.Open(filepath.Join(root, "records.db"))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	fatal(t, store.RecordRental(records.Rental{

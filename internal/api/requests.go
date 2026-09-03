@@ -785,7 +785,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		life.Triage = &TriageRef{
 			AttemptKey: last.AttemptKey, SubjectID: last.TriageSubject,
 			URL:    "/v1/local/attempts/" + last.AttemptKey + "/triage",
-			Length: last.TriageLength, Kept: last.TriagePath != "",
+			Length: last.TriageLength, Kept: last.TriageKept,
 		}
 	}
 	if len(last.TerminalBody) == 0 {

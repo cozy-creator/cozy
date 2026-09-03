@@ -9,7 +9,7 @@ package api
 //	Core  — Cozy's implemented request-level API and the proposed common core for
 //	        future servers. Cross-host parity requires conformance proof; it is not
 //	        asserted by this registry.
-//	Local — the Cozy-only extension module: jobs, rentals, lifecycle, uploads, and
+//	Local — the Cozy-only extension module: jobs, rentals, lifecycle, and
 //	        localhost web assets. Its URL mount makes
 //	        that boundary visible in the URL.
 
@@ -61,14 +61,10 @@ var Routes = []Route{
 	{"GET", "/v1/media/{media_id}", Core, true, false, false, "",
 		"one output's bytes by OPAQUE id; bounded Range; never a path",
 		"`cozy run --out`"},
-	{"POST", "/v1/uploads", Local, true, true, false, "",
-		"admit one bounded content-addressed upload from bytes, never a caller path",
-		"localhost web UI foundation"},
-	{"GET", "/v1/uploads/{upload_id}", Local, true, false, false, "",
-		"serve one upload by opaque content id with digest and Range support",
-		"localhost web UI foundation"},
-
 	// ---- the LOCAL extension module ----
+	{"GET", "/v1/local/attempts/{attempt_key}/triage", Local, true, false, false, "",
+		"one attempt's kept triage bundle from its own attempt row; 404 when none was kept",
+		"run/job failure remedies"},
 	{"POST", "/v1/local/rentals/{rental_id}/claim", Local, true, true, false, "",
 		"attach the daemon directly to one generic empty private worker",
 		"`cozy rental new` attachment"},

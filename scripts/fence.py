@@ -589,8 +589,7 @@ def check_web_boundary():
     bounded by rotation on observed bytes (never a timer), and `cozy daemon log` reads it.
     stdout stays /dev/null — the log is the surface, not an attached stream."""
     bad = []
-    for required in ("web/index.html", "web/app.css", "web/app.js", "web/embed.go",
-                     "internal/api/uploads.go", "internal/upload/upload.go"):
+    for required in ("web/index.html", "web/app.css", "web/app.js", "web/embed.go"):
         if not pathlib.Path(required).is_file():
             bad.append(f"[web] missing {required}")
     daemon = pathlib.Path("internal/cli/daemon.go").read_text()
@@ -627,10 +626,10 @@ def check_web_boundary():
         for retired in retired_names:
             if retired in text:
                 bad.append(f"[web] {source} retains whole-process alias {retired!r}")
-    upload = pathlib.Path("internal/upload/upload.go").read_text()
-    for required in ("MaxBytes int64 = 64 << 20", "io.LimitReader", "sha256.New()", "os.Rename"):
-        if required not in upload:
-            bad.append(f"[web] upload boundary missing {required!r}")
+    # cl-116 deleted the standalone upload store: a second content-addressed blob plane
+    # under the home must not come back. Future upload admission becomes a request input.
+    if pathlib.Path("internal/upload").exists():
+        bad.append("[web] retired internal/upload package remains (cl-116)")
     return bad
 
 

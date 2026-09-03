@@ -50,11 +50,13 @@ func (f *Fetch) Acquire(ctx context.Context, row hub.ModelManifest) (Fetched, *e
 	if err := os.MkdirAll(f.Scratch, 0o700); err != nil {
 		return out, exit.Internalf("cannot create model acquisition scratch: %s", err)
 	}
-	locks := filepath.Join(filepath.Dir(f.Tool.Root), "tmp", "locks")
-	if err := os.MkdirAll(locks, 0o700); err != nil {
+	if f.Locks == "" {
+		return out, exit.Internalf("model acquisition lacks a lock directory")
+	}
+	if err := os.MkdirAll(f.Locks, 0o700); err != nil {
 		return out, exit.Internalf("cannot create model acquisition locks: %s", err)
 	}
-	lockPath := filepath.Join(locks, strings.TrimPrefix(f.ManifestID, "sha256:")+".lock")
+	lockPath := filepath.Join(f.Locks, strings.TrimPrefix(f.ManifestID, "sha256:")+".lock")
 	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return out, exit.Internalf("cannot open model acquisition lock: %s", err)
@@ -97,6 +99,10 @@ type Fetch struct {
 	DryRun     bool
 	Progress   func(string)
 	Scratch    string
+	// Locks is the caller-supplied model-acquisition flock directory (the Creator
+	// layout's `tmp/locks`). It is never derived from the TensorFS root: the Store is
+	// an independent home this process does not write beside (proto-030).
+	Locks string
 
 	// seen is what THIS run already handled. The rounds overlap by construction —
 	// the closure names the documents round 2 fetched — and counting an object twice

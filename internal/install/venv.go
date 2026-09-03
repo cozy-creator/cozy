@@ -170,6 +170,19 @@ func MaterializePublishedEnvironment(sourceDir, venvDir, companionStore string,
 	return env, nil
 }
 
+// runtimeScratchHome is the COZY_HOME every install-time cozy-runtime invocation gets:
+// a per-user OS cache directory, never the Creator home. What the runtime derives there
+// (its JIT-kernel proof cache) is reusable derived state, and the audited top-level
+// `~/.cozy/jit-cache` — 19 empty directories — was exactly this scratch landing in the
+// product home (cl-116).
+func runtimeScratchHome() string {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "cozy", "runtime-install")
+}
+
 func runUV(dir string, env []string, code, message string, args ...string) *exit.Error {
 	cmd := exec.Command("uv", args...)
 	cmd.Dir = dir
@@ -184,10 +197,22 @@ func runUV(dir string, env []string, code, message string, args ...string) *exit
 	return nil
 }
 
-// Disk measures one install exactly once, at install: the bytes only this tree
-// holds, and the bytes it shares with another venv through a hardlink. `cozy package list` reads
-// these numbers back out of the record — it never walks 122k files.
+// Disk measures one install exactly once, at install: the ALLOCATED bytes only this
+// tree holds, and the allocated bytes it shares with a name outside it. `cozy package
+// list` reads these numbers back out of the record — it never walks 122k files.
+//
+// Each inode is measured ONCE, however many names inside the tree reach it, and an
+// inode whose every link lives inside the tree is EXCLUSIVE — its digest file plus a
+// named view die together, so calling it shared double-counted ~26 GB on the audited
+// home (cl-116). Only an inode with a link outside the walk is shared. Exclusive is
+// therefore also the observed post-delete delta a removal reports.
 func Disk(dir string) (exclusive, shared int64) {
+	type counted struct {
+		links     uint64
+		seen      uint64
+		allocated int64
+	}
+	inodes := map[inodeKey]*counted{}
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
@@ -196,13 +221,25 @@ func Disk(dir string) (exclusive, shared int64) {
 		if err != nil {
 			return nil
 		}
-		if hardlinked(info) {
-			shared += info.Size()
+		key, links, allocated, ok := inode(info)
+		if !ok {
+			exclusive += info.Size()
 			return nil
 		}
-		exclusive += info.Size()
+		if row := inodes[key]; row != nil {
+			row.seen++
+			return nil
+		}
+		inodes[key] = &counted{links: links, seen: 1, allocated: allocated}
 		return nil
 	})
+	for _, row := range inodes {
+		if row.seen >= row.links {
+			exclusive += row.allocated
+			continue
+		}
+		shared += row.allocated
+	}
 	return
 }
 

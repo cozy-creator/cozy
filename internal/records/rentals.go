@@ -672,6 +672,26 @@ func (s *Store) Rentals() ([]Rental, *exit.Error) {
 // that is running or spending.
 const absentRentalStates = `'failed','released'`
 
+// HeldRentalIDs is every rental whose secret material this host must still hold:
+// absence has not been proven, so its media bearer, pinned certificate and Creator
+// identity stay on disk. The boot sweep erases the files of every other id (cl-116).
+func (s *Store) HeldRentalIDs() (map[string]bool, *exit.Error) {
+	rows, err := s.db.Query(`SELECT id FROM rentals WHERE state NOT IN (` + absentRentalStates + `)`)
+	if err != nil {
+		return nil, exit.Internalf("cannot list held rentals: %s", err)
+	}
+	defer rows.Close()
+	held := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, exit.Internalf("cannot read a held rental id: %s", err)
+		}
+		held[id] = true
+	}
+	return held, nil
+}
+
 // RentalFleetTotals counts each potentially billing obligation once. A rental
 // operation with no local rental row covers the response-loss window; once its
 // row exists, the immutable row rate replaces that reservation in the sum.

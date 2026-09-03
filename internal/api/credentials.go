@@ -5,34 +5,35 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
-// Credentials is the per-launch CLI credential. It is handed over through a
-// 0600 file, never argv or inherited environment, and dies with the daemon.
+// Credentials is the per-launch CLI credential. It rides the daemon's own lifetime
+// ownership record (`daemon.lock`, mode 0600) — never argv or inherited environment —
+// and rotates with every launch because daemon.Hold rewrites that record (cl-116).
 type Credentials struct {
 	CLI secret.Value
 }
 
-// Mint generates a fresh credential and writes it to its 0600 handoff file.
+// Mint generates a fresh credential and appends it to the daemon record the caller
+// already holds. Hold truncated the body this launch, so exactly one token line exists.
 func Mint(l home.Layout) (Credentials, *exit.Error) {
 	c := Credentials{CLI: secret.Mint()}
-	// O_EXCL is not used: a stale file from a dead daemon is a leftover, and the
-	// daemon lock already proved no live owner exists on this root. 0600 is the point.
-	f, err := os.OpenFile(l.Client, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	f, err := os.OpenFile(l.Daemon, os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return Credentials{}, exit.Internalf("cannot write the local client credential: %s", err)
 	}
 	defer f.Close()
-	// Chmod anyway: O_CREAT's mode is masked by umask, and a credential readable by the
-	// group because of an inherited umask would be exactly the bug this file prevents.
+	// Chmod anyway: a record created by an older build was 0644, and a credential
+	// readable by the group would be exactly the leak this file prevents.
 	if err := f.Chmod(0o600); err != nil {
-		return Credentials{}, exit.Internalf("cannot restrict the client credential file: %s", err)
+		return Credentials{}, exit.Internalf("cannot restrict the daemon record: %s", err)
 	}
-	if _, err := fmt.Fprintln(f, c.CLI.Reveal()); err != nil {
+	if _, err := fmt.Fprintf(f, "token=%s\n", c.CLI.Reveal()); err != nil {
 		return Credentials{}, exit.Internalf("cannot write the local client credential: %s", err)
 	}
 	return c, nil
@@ -48,45 +49,49 @@ func (c Credentials) Admits(presented string) bool {
 // never name host paths; a future browser asset surface has to upload selected bytes.
 func (c Credentials) AdmitsCLI(presented string) bool { return c.CLI.Equal(presented) }
 
-// ClientCredential is the CLI side of the 0600 handoff (cl-010, the file's first reader).
-// It is deliberately here and not in the client package: this file is the credential's
+// ClientCredential is the CLI side of the handoff: the token line of the daemon's own
+// 0600 record (cl-116; cl-010's separate client.cred file is deleted). It is
+// deliberately here and not in the client package: this file is the credential's
 // carrier site, so the raw value is read where it becomes a carrier and nowhere else —
 // the `secret` fence family holds that.
 //
-// A missing file means the Cozy daemon is not running or is running on another root.
-// That is exactly the exit-9 condition every server-backed verb already shares, so it
-// refuses with the same remedy rather than inventing a credential vocabulary.
+// A record without a token means the Cozy daemon is not running or has not finished
+// launching on this root. That is exactly the exit-9 condition every server-backed verb
+// already shares, so it refuses with the same remedy.
 func ClientCredential(l home.Layout) (secret.Value, *exit.Error) {
-	info, err := os.Stat(l.Client)
+	info, err := os.Stat(l.Daemon)
 	if err != nil {
 		return secret.Value{}, exit.Unavailablef(
-			"no local client credential at %s", l.Client).
+			"no daemon record at %s", l.Daemon).
 			WithRemedy("the daemon writes it at launch; retry the command to auto-start or reconnect").
 			WithNext("cozy run list")
 	}
-	// The mode is CHECKED, not assumed. A credential that became group- or
-	// world-readable (an inherited umask, a careless copy) is a refusal: reading it
-	// anyway would be the client agreeing to a leak the server tried to prevent.
-	// On Windows, Unix mode bits are a fiction (Go reports 0666 for every file) — the
-	// boundary there is the user profile's ACL, which already scopes COZY_HOME to the
-	// user, so the bits are not consulted.
+	// The mode is CHECKED, not assumed. A record that became group- or world-readable
+	// (an inherited umask, a careless copy) is a refusal: reading it anyway would be
+	// the client agreeing to a leak the server tried to prevent. On Windows, Unix mode
+	// bits are a fiction (Go reports 0666 for every file) — the boundary there is the
+	// user profile's ACL, which already scopes COZY_HOME to the user.
 	if perm := info.Mode().Perm(); perm&0o077 != 0 && runtime.GOOS != "windows" {
 		return secret.Value{}, exit.New(exit.Credential,
-			"%s is mode %#o; the local client credential is 0600 or it is not used", l.Client, perm).
+			"%s is mode %#o; the daemon record carrying the client credential is 0600 or it is not used", l.Daemon, perm).
 			WithRemedy("run `cozy down`, fix the file mode, then retry; every daemon launch mints a fresh credential")
 	}
-	data, err := os.ReadFile(l.Client)
+	data, err := os.ReadFile(l.Daemon)
 	if err != nil {
 		return secret.Value{}, exit.New(exit.Credential,
 			"the local client credential is unreadable: %s", err)
 	}
-	v := secret.New(string(data))
-	if !v.Present() {
-		return secret.Value{}, exit.New(exit.Credential,
-			"the local client credential at %s is empty", l.Client).
-			WithNext("cozy down")
+	for _, line := range strings.Split(string(data), "\n") {
+		if raw, ok := strings.CutPrefix(strings.TrimSpace(line), "token="); ok {
+			if v := secret.New(raw); v.Present() {
+				return v, nil
+			}
+		}
 	}
-	return v, nil
+	return secret.Value{}, exit.Unavailablef(
+		"the daemon record at %s carries no client credential yet", l.Daemon).
+		WithRemedy("the daemon appends it once its API is up; retry the command").
+		WithNext("cozy run list")
 }
 
 // Authorize puts a credential onto one outbound request. It is the ONLY place a local

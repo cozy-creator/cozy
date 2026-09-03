@@ -16,8 +16,12 @@
 package records
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -67,7 +71,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 21
+const schemaVersion = 22
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -121,17 +125,20 @@ var schema = append([]string{installsDDL, pinsDDL}, append(orchestratorSchema,
 const pragmas = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate"
 
 func Open(path string) (*Store, *exit.Error) {
-	return open(path, false)
+	return open(path, false, "")
 }
 
 // OpenForDaemon is the only schema-migrating entrance. The daemon holds
 // home.Layout.Daemon before calling it and keeps that lock for its lifetime, so
 // a newly installed CLI cannot rewrite the database under an older live daemon.
-func OpenForDaemon(path string) (*Store, *exit.Error) {
-	return open(path, true)
+// `triageDir` is the retired pre-cl-116 bundle directory: schema 22 folds each
+// referenced file into its attempt row, and the caller deletes the directory once
+// this open has returned.
+func OpenForDaemon(path, triageDir string) (*Store, *exit.Error) {
+	return open(path, true, triageDir)
 }
 
-func open(path string, migratePrior bool) (*Store, *exit.Error) {
+func open(path string, migratePrior bool, triageDir string) (*Store, *exit.Error) {
 	// No `file:` prefix: the driver hands an unprefixed name to SQLite verbatim, so a
 	// local root containing `%` or `#` stays a path instead of becoming a URI to decode.
 	db, err := sql.Open("sqlite", path+pragmas)
@@ -163,7 +170,7 @@ func open(path string, migratePrior bool) (*Store, *exit.Error) {
 				version, schemaVersion).
 				WithRemedy("stop the active Cozy daemon, then run `cozy up` so the new daemon can migrate it")
 		}
-		if e := migrate(db, path, version); e != nil {
+		if e := migrate(db, path, version, triageDir); e != nil {
 			db.Close()
 			return nil, e
 		}
@@ -176,6 +183,14 @@ func open(path string, migratePrior bool) (*Store, *exit.Error) {
 		db.Close()
 		return nil, e
 	}
+	// The database retains request payloads, rental facts and triage bundles; 0600 is
+	// the same boundary the daemon record carries, and the WAL/SHM siblings SQLite
+	// creates next inherit these bits (cl-116). Windows mode bits are a fiction; the
+	// user-profile ACL scopes the root there.
+	if err := os.Chmod(path, 0o600); err != nil {
+		db.Close()
+		return nil, exit.Internalf("cannot protect the records database %s: %s", path, err)
+	}
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
 		db.Close()
 		return nil, exit.Internalf("cannot enable WAL for %s: %s", path, err)
@@ -183,7 +198,7 @@ func open(path string, migratePrior bool) (*Store, *exit.Error) {
 	return &Store{db: db}, nil
 }
 
-// Schemas 6 through 21 migrate in place. Schema 11 replaces authored GPU counts with
+// Schemas 6 through 22 migrate in place. Schema 11 replaces authored GPU counts with
 // the one derived accelerator-class fact; schema 12 gives the install table and its two
 // foreign keys the one word the row actually names; schema 13 records when a rental was
 // first seen ready; schema 14 drops the output export's pre-execution payload hash — a
@@ -195,12 +210,14 @@ func open(path string, migratePrior bool) (*Store, *exit.Error) {
 // model-transfer outputs; schema 19 removes the duplicate request config digest now owned
 // by the CozyTensors header; schema 20 renames the installed package interface and removes
 // the obsolete aggregate package revision digest. Package, request, event, export, and rental rows survive;
-// schema 21 retains Tensorhub's sanitized terminal rental boot failure.
+// schema 21 retains Tensorhub's sanitized terminal rental boot failure; schema 22 moves
+// each attempt's verified triage bundle bytes INTO the attempt row (cl-116), retiring the
+// triage file directory and its orphan class.
 // only schema 9's superseded special
 // model-production subsystem is dropped.
 // Schema 10 creates empty request-attached transfer sidecars because older rows cannot be
 // translated into ordinary request identity safely.
-func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
+func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit.Error {
 	if e := verifyPriorSchema(db, path, sourceVersion); e != nil {
 		return e
 	}
@@ -280,7 +297,12 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			}
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=21`); err != nil {
+	if sourceVersion < 22 {
+		if e := migrateAttemptTriage(tx, path, triageDir); e != nil {
+			return e
+		}
+	}
+	if _, err := tx.Exec(`PRAGMA user_version=22`); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
 	if e := commitMigration(tx, path); e != nil {
@@ -397,6 +419,77 @@ func migrateOutputExports(tx *sql.Tx, path string) *exit.Error {
 	}
 	return nil
 }
+
+// migrateAttemptTriage rebuilds the attempts table with the bundle IN the row
+// (schema 22): `triage_path` becomes `triage_bundle`, and every referenced file that
+// still verifies against its recorded digest and length is folded in. A file that is
+// missing or no longer matches imports as an empty bundle — the row keeps the subject
+// and digest as the record of what was lost. The caller deletes the retired directory
+// after this open returns.
+func migrateAttemptTriage(tx *sql.Tx, path, triageDir string) *exit.Error {
+	const cols = `request_id,attempt,attempt_key,instance_id,session_id,invocation_digest,
+	  invocation,weights_outputs,state,plan_digest,construction,plan_summary,terminal_id,
+	  terminal_digest,terminal_status,terminal_cause,safe_message,triage_subject,
+	  triage_digest,triage_length,terminal_body,dispatched_at,accepted_at,closed_at,media_cleaned`
+	for _, statement := range []string{
+		`ALTER TABLE attempts RENAME TO attempts_prior`,
+		attemptsDDL,
+		`INSERT INTO attempts(` + cols + `) SELECT ` + cols + ` FROM attempts_prior`,
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return exit.Internalf("cannot rebuild the attempts table while migrating %s: %s", path, err)
+		}
+	}
+	type kept struct {
+		key     string
+		subject string
+		digest  string
+		length  int64
+	}
+	var rows []kept
+	if triageDir != "" {
+		read, err := tx.Query(`SELECT attempt_key, triage_subject, triage_digest, triage_length
+			FROM attempts_prior WHERE triage_path != ''`)
+		if err != nil {
+			return exit.Internalf("cannot read kept triage references while migrating %s: %s", path, err)
+		}
+		for read.Next() {
+			var r kept
+			if err := read.Scan(&r.key, &r.subject, &r.digest, &r.length); err != nil {
+				read.Close()
+				return exit.Internalf("cannot read a kept triage reference while migrating %s: %s", path, err)
+			}
+			rows = append(rows, r)
+		}
+		read.Close()
+	}
+	for _, r := range rows {
+		if r.subject == "" || filepath.Base(r.subject) != r.subject ||
+			r.length <= 0 || r.length > maxTriageBundle {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(triageDir, r.subject+".json"))
+		if err != nil || int64(len(data)) != r.length {
+			continue
+		}
+		sum := sha256.Sum256(data)
+		if "sha256:"+hex.EncodeToString(sum[:]) != r.digest {
+			continue
+		}
+		if _, err := tx.Exec(`UPDATE attempts SET triage_bundle=? WHERE attempt_key=?`,
+			data, r.key); err != nil {
+			return exit.Internalf("cannot import the triage bundle of %s while migrating %s: %s", r.key, path, err)
+		}
+	}
+	if _, err := tx.Exec(`DROP TABLE attempts_prior`); err != nil {
+		return exit.Internalf("cannot finish the attempts migration in %s: %s", path, err)
+	}
+	return nil
+}
+
+// maxTriageBundle mirrors the media plane's bound: the protocol caps one bundle at 1 MiB,
+// so anything larger on disk was never a bundle this product kept.
+const maxTriageBundle = 1 << 20
 
 // migrateModelTransferOutputs drops the checkpoint evidence payload. The Manifest/header is
 // the checkpoint authority; a transfer row keeps only the exact receipt and object inventory.
@@ -554,6 +647,10 @@ func priorStatements(version int) []string {
 			stmt = priorRentals
 		case stmt == rentalsDDL && version < 21:
 			stmt = priorRentalsTwenty
+		case stmt == attemptsDDL && version < 22:
+			stmt = strings.Replace(stmt,
+				"  triage_bundle    BLOB    NOT NULL DEFAULT x'',\n",
+				"  triage_path      TEXT    NOT NULL DEFAULT '',\n", 1)
 		case stmt == outputExportSchema && version < 14:
 			stmt = priorOutputExports
 		case stmt == modelTransferSchema[2] && version < 18:
@@ -674,7 +771,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=21`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=22`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {

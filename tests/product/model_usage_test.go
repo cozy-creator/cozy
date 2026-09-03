@@ -13,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/tfs"
 	"github.com/cozy-creator/cozy/internal/units"
 )
@@ -36,9 +35,9 @@ func TestModelListShowsEachModelsBytesAndWhatItShares(t *testing.T) {
 	must(t, os.Setenv("COZY_HOME", root))
 	cfg, e := config.Load()
 	fatal(t, e)
-	layout, e := home.Open(cfg.Home)
-	fatal(t, e)
-	tool, e := tfs.Open(cfg, layout)
+	cfg.Home = root
+	cfg.TensorFSRoot = filepath.Join(root, "tensorfs")
+	tool, e := tfs.Open(cfg)
 	if e != nil && e.Name == "tfs_missing" {
 		t.Skipf("no tensorfs CLI on this runner: %s", e.Message)
 	}

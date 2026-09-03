@@ -18,11 +18,21 @@ func freeBytes(dir string) (int64, bool) {
 	return int64(st.Bavail) * int64(st.Bsize), true
 }
 
-// hardlinked answers whether this file's bytes are shared with another name — what
-// makes uv's hardlink dedup visible as SHARED rather than exclusive bytes.
-func hardlinked(info fs.FileInfo) bool {
+// inodeKey identifies one file's storage across every name that reaches it.
+type inodeKey struct {
+	dev uint64
+	ino uint64
+}
+
+// inode answers the storage identity, link count and ALLOCATED bytes of one file —
+// what makes uv's hardlink dedup measurable as one inode instead of many names, and
+// what makes a sparse or tail-packed file report the blocks it really holds.
+func inode(info fs.FileInfo) (inodeKey, uint64, int64, bool) {
 	st, ok := info.Sys().(*syscall.Stat_t)
-	return ok && st.Nlink > 1
+	if !ok {
+		return inodeKey{}, 0, 0, false
+	}
+	return inodeKey{dev: uint64(st.Dev), ino: uint64(st.Ino)}, uint64(st.Nlink), st.Blocks * 512, true
 }
 
 // Unix unlinks files through their parent directory. Leave read-only regular files

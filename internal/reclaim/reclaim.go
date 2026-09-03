@@ -8,9 +8,12 @@
 package reclaim
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -54,6 +57,9 @@ func Request(l home.Layout, st *records.Store, requestID string) (Swept, *exit.E
 func Workers(l home.Layout, st *records.Store) (Swept, *exit.Error) {
 	entries, err := os.ReadDir(l.Workers)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return Swept{}, nil
+		}
 		return Swept{}, exit.Internalf("cannot scan the worker root %s: %s", l.Workers, err)
 	}
 	live, problem := st.LiveWorkers()
@@ -237,4 +243,194 @@ func makeRemovable(root string) error {
 		}
 		return nil
 	})
+}
+
+// ------------------------------------------------------------------ publications
+
+// Publications reclaims the job publication plane's DEBRIS while preserving every
+// committed publication: a root a publication row names survives untouched (minus its
+// settled `.staging`); a root whose request settled without ever committing one — or
+// whose request no longer exists — is removed whole. Live requests are left alone.
+// Empty org directories, and finally the empty plane itself, are pruned.
+func Publications(l home.Layout, st *records.Store) (Swept, *exit.Error) {
+	orgs, err := os.ReadDir(l.Publications)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Swept{}, nil
+		}
+		return Swept{}, exit.Internalf("cannot scan the publication plane %s: %s", l.Publications, err)
+	}
+	var swept Swept
+	var first *exit.Error
+	note := func(problem *exit.Error) {
+		if problem != nil && first == nil {
+			first = problem
+		}
+	}
+	for _, org := range orgs {
+		if !org.IsDir() {
+			continue
+		}
+		orgDir := filepath.Join(l.Publications, org.Name())
+		jobs, err := os.ReadDir(orgDir)
+		if err != nil {
+			note(exit.Internalf("cannot scan %s: %s", orgDir, err))
+			continue
+		}
+		for _, job := range jobs {
+			requestID, isJob := strings.CutPrefix(job.Name(), "_job-")
+			if !job.IsDir() || !isJob {
+				continue
+			}
+			swept.Scanned++
+			freed, removed, problem := publicationRoot(l, st, filepath.Join(orgDir, job.Name()), requestID)
+			note(problem)
+			swept.add(freed, removed)
+		}
+		_ = os.Remove(orgDir) // only when empty
+	}
+	_ = os.Remove(l.Publications)
+	return swept, first
+}
+
+// publicationRoot settles one `<org>/_job-<id>` directory against the records authority.
+func publicationRoot(l home.Layout, st *records.Store, root, requestID string) (int64, bool, *exit.Error) {
+	request, problem := st.RequestRow(requestID)
+	if problem != nil {
+		return 0, false, problem
+	}
+	if request != nil && !records.Settled(request.State) {
+		return 0, false, nil // an attempt may be writing its stage right now
+	}
+	publication, problem := st.PublicationOf(requestID)
+	if problem != nil {
+		return 0, false, problem
+	}
+	if publication == nil {
+		freed, problem := removeTree(root)
+		return freed, problem == nil, problem
+	}
+	// A committed publication keeps its root; only the settled staging is over.
+	freed, problem := removeTree(filepath.Join(root, ".staging"))
+	if problem != nil {
+		return 0, false, problem
+	}
+	return freed, freed > 0, nil
+}
+
+// ------------------------------------------------------------------ rental secrets
+
+// RentalSecrets erases the secret files of every rental the records authority no longer
+// holds: an id in a proven-absent terminal state, an id with no row at all, and every
+// pending-operation credential whose paid operation is over. Files this package cannot
+// attribute are left where they are. The empty directory is removed last.
+func RentalSecrets(l home.Layout, st *records.Store) (Swept, *exit.Error) {
+	entries, err := os.ReadDir(l.Rentals)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Swept{}, nil
+		}
+		return Swept{}, exit.Internalf("cannot scan the rental credential root %s: %s", l.Rentals, err)
+	}
+	held, problem := st.HeldRentalIDs()
+	if problem != nil {
+		return Swept{}, problem
+	}
+	operations, problem := st.ActiveRentalOperations()
+	if problem != nil {
+		return Swept{}, problem
+	}
+	pending := map[string]bool{}
+	for _, op := range operations {
+		sum := sha256.Sum256([]byte(op.Key))
+		pending["pending-"+hex.EncodeToString(sum[:])] = true
+	}
+	var swept Swept
+	var first *exit.Error
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		owner, known := secretOwner(entry.Name())
+		if !known {
+			continue
+		}
+		swept.Scanned++
+		if strings.HasPrefix(owner, "pending-") {
+			if pending[owner] {
+				continue
+			}
+		} else if held[owner] {
+			continue
+		}
+		path := filepath.Join(l.Rentals, entry.Name())
+		info, err := entry.Info()
+		var size int64
+		if err == nil {
+			size = info.Size()
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			if first == nil {
+				first = exit.Internalf("cannot erase the stale rental secret %s: %s", entry.Name(), err)
+			}
+			continue
+		}
+		swept.add(size, true)
+	}
+	_ = os.Remove(l.Rentals) // only when empty
+	return swept, first
+}
+
+// secretOwner maps one rental credential filename to the id (or pending key hash) that
+// owns it. Only this package's own spellings are recognized.
+func secretOwner(name string) (string, bool) {
+	for _, suffix := range []string{".media-token", ".creator.pem", ".pem"} {
+		if owner, ok := strings.CutSuffix(name, suffix); ok && owner != "" {
+			return owner, true
+		}
+	}
+	return "", false
+}
+
+// ------------------------------------------------------------------ retired shapes
+
+// Retired removes the top-level entries this Creator no longer writes (cl-116): the
+// triage file store (its bundles now live in their attempt rows), the upload store, the
+// job-plan and JIT-cache planes, the separate client credential and the old writer
+// lock. It runs after the records open — the schema-22 migration has already folded
+// kept triage files in — and repeats harmlessly.
+func Retired(l home.Layout) (Swept, *exit.Error) {
+	var swept Swept
+	var first *exit.Error
+	for _, name := range []string{
+		"triage", "uploads", "job-plans", "jit-cache", "client.cred", "writer.lock",
+		"private-packages",
+	} {
+		path := filepath.Join(l.Root, name)
+		if _, err := os.Lstat(path); err != nil {
+			continue
+		}
+		swept.Scanned++
+		freed, problem := removeTree(path)
+		if problem != nil {
+			if first == nil {
+				first = problem
+			}
+			continue
+		}
+		swept.add(freed, true)
+	}
+	return swept, first
+}
+
+// EmptyRoots prunes on-demand directories whose work is gone. Every one of these is
+// recreated by its writer at the moment work exists, so an empty one is debris, not
+// structure. Each remove refuses unless the directory is empty, which is the point.
+func EmptyRoots(l home.Layout) {
+	for _, dir := range []string{
+		l.Workers, filepath.Join(l.Tmp, "locks"), l.Tmp, l.Inputs,
+		l.LocalPackages, l.Companions,
+	} {
+		_ = os.Remove(dir)
+	}
 }

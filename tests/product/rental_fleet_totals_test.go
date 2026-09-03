@@ -15,7 +15,7 @@ import (
 // acquisitions held $5.04/hour of a $10 fleet cap while zero pods existed,
 // and the cap then refused real capacity.
 func TestFailedRentalLeavesTheFleetTotals(t *testing.T) {
-	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
+	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	record := func(id, state string, rate int64) {
@@ -43,7 +43,7 @@ func TestFailedRentalLeavesTheFleetTotals(t *testing.T) {
 // whose GPU rate fits the headroom but whose total exceeds it is refused, and
 // the refusal decomposes the figure.
 func TestFleetCapAdmitsTheEstimatedTotalNotTheGPURate(t *testing.T) {
-	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
+	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	author := func(machineName string) ([]byte, string, *exit.Error) {

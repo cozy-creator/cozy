@@ -991,7 +991,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		TerminalDigest: shortNone(t.OutcomeDigest), Status: status, Cause: cause,
 		SafeMessage:   doc.Str("safe_message"),
 		TriageSubject: triage.Subject, TriageDigest: triage.Digest,
-		TriageLength: triage.Length, TriagePath: triage.Path,
+		TriageLength: triage.Length, TriageBundle: triage.Bundle,
 		Body: t.OutcomeCanonicalBytes, Outputs: outputs,
 		WeightsFinalizations: weightsFinalizations,
 		EventType:            kept.Type, EventPayload: kept.Payload,
@@ -1230,6 +1230,7 @@ func (c *Orchestrator) cleanupAttempt(req records.Request, attempt uint64, holde
 	}
 	c.reclaimTmp(req.ID)
 	c.cleanupRequestAssets(req)
+	c.cleanupPublication(req)
 }
 
 func (c *Orchestrator) cleanupRequestAssets(req records.Request) {
@@ -1295,7 +1296,7 @@ type Triage struct {
 	Subject string
 	Digest  string
 	Length  int64
-	Path    string
+	Bundle  []byte // the verified bytes, kept in the attempt row (cl-116)
 	Fault   string // why the bytes were not kept, when a subject was named and they were not
 }
 
@@ -1412,16 +1413,7 @@ func (c *Orchestrator) captureTriage(s *session, requestID string, attempt uint6
 		c.logf("triage %s for %s#%d REFUSED: %s", tr.Subject, requestID, attempt, tr.Fault)
 		return tr
 	}
-	dest := c.opt.Layout.TriageFile(tr.Subject)
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		tr.Fault = "the local triage store is unwritable: " + err.Error()
-		return tr
-	}
-	if err := os.WriteFile(dest, data, 0o600); err != nil {
-		tr.Fault = "the bundle could not be kept: " + err.Error()
-		return tr
-	}
-	tr.Path = dest
+	tr.Bundle = data
 	c.logf("triage %s kept for %s#%d (%d B, %s)", tr.Subject, requestID, attempt,
 		tr.Length, shortDigest(tr.Digest))
 	return tr
