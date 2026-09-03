@@ -1,4 +1,4 @@
-doc: code_topology
+doc: tensor_requirements
 expect: refuse
 code: MISSING_COMPONENT
-note: constructed_components names exactly the components the topology carries
+note: constructed_components names exactly the components the requirements carry

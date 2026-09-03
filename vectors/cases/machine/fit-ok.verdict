@@ -1,4 +1,4 @@
 doc: machine_fit
 expect: ok
 id: sha256:c69f9ecd538dec9dd2955a5f57ff4815200b70a90f8487246ac39aba03fa38a3
-note: the code constructs exactly what the checkpoint carries: `ok`, routes counted, encoded leaves qualified on the device asked about
+note: the requirements describe exactly what the checkpoint carries: `ok`, routes counted, encoded leaves qualified on the device asked about

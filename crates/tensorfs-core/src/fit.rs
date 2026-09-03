@@ -1,18 +1,18 @@
 //! `fit` — the ONE code <-> checkpoint matching function (tfs-042, design
 //! `tracker/cross-cutting/model-code-fit.md` §3).
 //!
-//! Two inputs, one answer. The code side is a `CodeTopology`: what the package's factory
+//! Two inputs, one answer. `TensorRequirements` describes what the package's factory
 //! constructs from the checkpoint's own config document, censused on the meta device —
 //! `component -> key -> {dtype, shape, accepts, pinned}` plus the constructed component
 //! list. The checkpoint side is its `Header`. `fit` returns exactly one `Fit` code with the
 //! text a human reads; it plans nothing, grades nothing and names no remedy.
 //!
 //! Rules, in order (§3): (1) every constructed component exists; components the checkpoint
-//! carries that the code does not construct are ignored (D6); (2) every constructed key
+//! carries that the requirements do not construct are ignored (D6); (2) every constructed key
 //! exists at the same logical shape; (3) a key whose destination PINS a dtype must be
 //! supplied at that dtype or through a lossless widening — otherwise dtype is delivery's
 //! business (D4); (4) on `canonical` custody a stored key inside a constructed component
-//! that the code does not consume refuses, on `local` it is listed and ignored (D5); (5)
+//! that the requirements do not consume refuses, on `local` it is listed and ignored (D5); (5)
 //! every stored encoding must be admitted by the row's `accepts`; (6) with a device, every
 //! encoded leaf must have a qualification observation for that device class.
 //!
@@ -30,7 +30,7 @@ use crate::limits;
 
 // ---------------------------------------------------------------- the required side
 
-/// Which encodings a code destination will accept for one tensor. Closed and REQUIRED —
+/// Which encodings a destination will accept for one tensor. Closed and REQUIRED —
 /// an absent field defaulting to "anything" is how a lane silently widens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Accepts {
@@ -90,33 +90,33 @@ impl Accepts {
     }
 }
 
-/// One code destination: what `load()` actually constructs, as a byte contract.
+/// One tensor destination that `load()` constructs, as a byte contract.
 ///
 /// `pinned` says the destination fixes its dtype (an integer buffer, an fp32 island): the
 /// checkpoint must supply that dtype or one that widens into it losslessly. An unpinned
 /// dtype is the constructed default and is delivery's business, not fit's (D4).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Requirement {
+pub struct TensorRequirement {
     pub dtype: Dtype,
     pub shape: Vec<u64>,
     pub accepts: Accepts,
     pub pinned: bool,
 }
 
-/// The code side: the meta-device census of `factory(config)`, projected to TensorFS's
+/// The meta-device census of `factory(config)`, projected to TensorFS's
 /// vocabulary. `contract` is the digest of the census this was projected from — recorded,
 /// never parsed. `constructed_components` is the same set as `components`' keys, in the
 /// order the factory constructed them (D9); the map is canonical (sorted) and the list is
 /// where the order survives.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CodeTopology {
+pub struct TensorRequirements {
     pub contract: String,
-    pub components: Vec<(String, Vec<(String, Requirement)>)>,
+    pub components: Vec<(String, Vec<(String, TensorRequirement)>)>,
     pub constructed_components: Vec<String>,
 }
 
-impl CodeTopology {
-    pub fn tensors(&self) -> impl Iterator<Item = (&str, &str, &Requirement)> {
+impl TensorRequirements {
+    pub fn tensors(&self) -> impl Iterator<Item = (&str, &str, &TensorRequirement)> {
         self.components
             .iter()
             .flat_map(|(c, ks)| ks.iter().map(move |(k, r)| (c.as_str(), k.as_str(), r)))
@@ -126,7 +126,7 @@ impl CodeTopology {
         self.components.iter().map(|(_, k)| k.len()).sum()
     }
 
-    pub fn requirement(&self, component: &str, key: &str) -> Option<&Requirement> {
+    pub fn requirement(&self, component: &str, key: &str) -> Option<&TensorRequirement> {
         self.components
             .iter()
             .find(|(c, _)| c == component)
@@ -148,18 +148,18 @@ impl CodeTopology {
     }
 }
 
-impl Plain for CodeTopology {
+impl Plain for TensorRequirements {
     const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
 
     fn from_value(v: &Value) -> Result<Self> {
-        let mut f = Fields::new("CodeTopology", v)?;
-        let contract = prefixed("CodeTopology.contract", f.req_str("contract")?)?;
+        let mut f = Fields::new("TensorRequirements", v)?;
+        let contract = prefixed("TensorRequirements.contract", f.req_str("contract")?)?;
         let mut components = Vec::new();
         let mut total = 0usize;
-        for (name, cv) in as_obj("CodeTopology", "components", f.req("components")?)? {
-            ascii_name("CodeTopology.component", name, limits::MAX_NAME_BYTES)?;
+        for (name, cv) in as_obj("TensorRequirements", "components", f.req("components")?)? {
+            ascii_name("TensorRequirements.component", name, limits::MAX_NAME_BYTES)?;
             let mut keys = Vec::new();
-            for (key, rv) in as_obj("CodeTopology.components", name, cv)? {
+            for (key, rv) in as_obj("TensorRequirements.components", name, cv)? {
                 if key.is_empty() || key.len() > limits::MAX_KEY_BYTES {
                     return refuse(
                         Code::KEY_GRAMMAR,
@@ -168,11 +168,11 @@ impl Plain for CodeTopology {
                 }
                 total += 1;
                 if total > limits::MAX_TENSORS {
-                    return refuse(Code::COUNT_CAP, "code topology key count over cap");
+                    return refuse(Code::COUNT_CAP, "tensor requirements key count over cap");
                 }
-                let mut rf = Fields::new("Requirement", rv)?;
-                let accepts = Accepts::from_value("Requirement", rf.req("accepts")?)?;
-                let dtype = Dtype::parse(as_str("Requirement", "dtype", rf.req("dtype")?)?)?;
+                let mut rf = Fields::new("TensorRequirement", rv)?;
+                let accepts = Accepts::from_value("TensorRequirement", rf.req("accepts")?)?;
+                let dtype = Dtype::parse(as_str("TensorRequirement", "dtype", rf.req("dtype")?)?)?;
                 let pinned = match rf.opt("pinned") {
                     None => false,
                     Some(Value::Bool(true)) => true,
@@ -183,19 +183,19 @@ impl Plain for CodeTopology {
                         )
                     }
                 };
-                let sa = as_arr("Requirement", "shape", rf.req("shape")?)?;
+                let sa = as_arr("TensorRequirement", "shape", rf.req("shape")?)?;
                 if sa.len() > limits::MAX_RANK {
                     return refuse(Code::RANK_CAP, format!("{name}/{key}: rank over cap"));
                 }
                 let shape = sa
                     .iter()
-                    .map(|x| crate::canon::as_uint("Requirement", "shape", x))
+                    .map(|x| crate::canon::as_uint("TensorRequirement", "shape", x))
                     .collect::<Result<Vec<u64>>>()?;
                 rf.done()?;
                 crate::dtype::checked_elements(key, &shape)?;
                 keys.push((
                     key.clone(),
-                    Requirement {
+                    TensorRequirement {
                         dtype,
                         shape,
                         accepts,
@@ -213,12 +213,12 @@ impl Plain for CodeTopology {
         }
         let mut constructed_components = Vec::new();
         for x in as_arr(
-            "CodeTopology",
+            "TensorRequirements",
             "constructed_components",
             f.req("constructed_components")?,
         )? {
             constructed_components
-                .push(as_str("CodeTopology", "constructed_components", x)?.to_string());
+                .push(as_str("TensorRequirements", "constructed_components", x)?.to_string());
         }
         f.done()?;
         if components.is_empty() || components.len() > limits::MAX_COMPONENTS {
@@ -233,11 +233,11 @@ impl Plain for CodeTopology {
                 Code::MISSING_COMPONENT,
                 format!(
                     "constructed_components {constructed_components:?} must name exactly the \
-                     components the topology carries ({named:?}), once each"
+                     components the requirements carry ({named:?}), once each"
                 ),
             );
         }
-        Ok(CodeTopology {
+        Ok(TensorRequirements {
             contract,
             components,
             constructed_components,
@@ -302,7 +302,7 @@ impl Plain for CodeTopology {
 /// (D5). Missing keys refuse on both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Custody {
-    /// The border classified every key. A stored key the code does not consume is drift.
+    /// The border classified every key. A stored key the requirements do not consume is drift.
     Canonical,
     /// A local manifest that never crossed the border: extras are listed and ignored.
     Local,
@@ -469,7 +469,7 @@ pub struct ComponentFacts {
 
 /// Everything one walk produced: the fact set, the component-granular facts grading
 /// consumes, and the UNCONSUMED set — stored keys inside constructed components that the
-/// code does not consume, on local custody (listed, ignored).
+/// requirements do not consume, on local custody (listed, ignored).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     pub mismatches: Vec<Details>,
@@ -523,11 +523,11 @@ fn mismatch(code: Code, component: &str, key: &str, required: Side, present: Sid
     }
 }
 
-/// The one deterministic walk. Iteration is over the CODE side first, in canonical (sorted)
+/// The one deterministic walk. Iteration is over the requirements first, in canonical (sorted)
 /// order, so "first disagreeing tensor" means the same tensor on every machine. Components
-/// the checkpoint carries that the code does not construct are never visited (D6).
+/// the checkpoint carries that the requirements do not construct are never visited (D6).
 pub fn check_compatibility(
-    code: &CodeTopology,
+    requirements: &TensorRequirements,
     header: &Header,
     closure: &Closure,
     pin: &[String],
@@ -543,7 +543,7 @@ pub fn check_compatibility(
         };
     }
 
-    for (comp, reqs) in &code.components {
+    for (comp, reqs) in &requirements.components {
         let present = header.components.iter().find(|(c, _)| c == comp);
         let tensors: &[(String, crate::header::Tensor)] = match present {
             Some((_, t)) => t.as_slice(),
@@ -700,7 +700,7 @@ pub fn check_compatibility(
             }
         }
 
-        // The present side of THIS component: stored keys the code never asked for. On
+        // The present side of THIS component: stored keys the requirements never asked for. On
         // canonical custody a surplus is drift and refuses by name; on local custody it is
         // listed and ignored, at every depth.
         let known_index = index_of(reqs);
@@ -775,7 +775,7 @@ pub struct Routes {
     pub verbatim: u64,
     /// Stored encoded, admitted by an explicit accepts list: decoded to float on the way in.
     pub decoded_float: u64,
-    /// Stored encoded under `accepts: any`: an encoded linear op is swapped in under the code.
+    /// Stored encoded under `accepts: any`: an encoded linear op is swapped in at the destination.
     pub encoded_gemm: u64,
 }
 
@@ -786,7 +786,7 @@ pub struct Routes {
 pub enum Fit {
     Ok {
         routes: Routes,
-        /// `component/key` the checkpoint stores and the code does not consume, on local
+        /// `component/key` the checkpoint stores and the requirements do not consume, on local
         /// custody. Empty on canonical custody by construction.
         ignored: Vec<String>,
         /// The device class the encoded leaves were qualified on, when one was asked.
@@ -906,11 +906,11 @@ impl Fit {
                 s
             }
             Fit::ComponentMissing { component, present } => format!(
-                "the code constructs {component}; the checkpoint has {}",
+                "the requirements construct {component}; the checkpoint has {}",
                 present.join(", ")
             ),
             Fit::TensorMissing { component, key } => format!(
-                "{component}.{key}: the code constructs it; the checkpoint does not supply it"
+                "{component}.{key}: the requirements name it; the checkpoint does not supply it"
             ),
             Fit::ShapeMismatch {
                 component,
@@ -1005,14 +1005,14 @@ fn plain_digest() -> String {
         .object_id()
 }
 
-/// `fit(code, checkpoint, custody, device, observations) -> Fit` — design §3.
+/// `fit(requirements, checkpoint, custody, device, observations) -> Fit` — design §3.
 ///
 /// `observations` widens the compiled-in qualification records (the reference decoders on
 /// cpu) with what a component holding a card measured; `device` is the class the caller
 /// will execute on. Without a device rule (6) is not asked. Plain storage is verbatim and
 /// has nothing to qualify.
 pub fn fit(
-    code: &CodeTopology,
+    requirements: &TensorRequirements,
     header: &Header,
     custody: Custody,
     device: Option<&str>,
@@ -1029,7 +1029,7 @@ pub fn fit(
     let mut pin: Vec<String> = seeds.iter().map(|s| s.spec.object_id()).collect();
     pin.extend(header.encodings.iter().map(|s| s.object_id()));
     let out = check_compatibility(
-        code,
+        requirements,
         header,
         &Closure::default(),
         &pin,
@@ -1076,7 +1076,7 @@ pub fn fit(
         let (Some(pinned), Some(stored)) = (d.required.dtype, d.present.dtype) else {
             continue;
         };
-        let is_pinned = code
+        let is_pinned = requirements
             .requirement(&d.component, &d.key)
             .is_some_and(|r| r.pinned);
         if is_pinned && !lossless_widening(stored, pinned) {
@@ -1103,7 +1103,7 @@ pub fn fit(
             Code::ENCODING_MISMATCH | Code::UNKNOWN_TO_LOCAL_CAPABILITY
         )
     }) {
-        let accepts = code
+        let accepts = requirements
             .requirement(&d.component, &d.key)
             .map(|r| r.accepts.clone())
             .unwrap_or(Accepts::Any);
@@ -1127,10 +1127,10 @@ pub fn fit(
         );
     }
 
-    // Routes, and rule (6) over the encoded leaves the code actually consumes.
+    // Routes, and rule (6) over the encoded leaves the requirements actually consume.
     let mut routes = Routes::default();
     let mut encoded: Vec<String> = Vec::new();
-    for (comp, key, req) in code.tensors() {
+    for (comp, key, req) in requirements.tensors() {
         let stored = header
             .components
             .iter()
@@ -1198,13 +1198,13 @@ pub struct CompatibilityReport {
 
 impl CompatibilityReport {
     pub fn of(
-        code: &CodeTopology,
+        requirements: &TensorRequirements,
         header: &Header,
         custody: Custody,
         o: &Outcome,
     ) -> Result<CompatibilityReport> {
         Ok(CompatibilityReport {
-            contract: code.contract.clone(),
+            contract: requirements.contract.clone(),
             header: header.object_id()?,
             custody,
             depth: o.depth,
@@ -1509,7 +1509,7 @@ mod tests {
     use super::*;
     use crate::header::{Closure, Header, Part, Tensor};
 
-    fn pair() -> (CodeTopology, Header, String) {
+    fn pair() -> (TensorRequirements, Header, String) {
         let spec = crate::registry::seeds()
             .into_iter()
             .find(|seed| seed.alias == "plain/1")
@@ -1533,13 +1533,13 @@ mod tests {
                 )],
             )],
         };
-        let code = CodeTopology {
+        let code = TensorRequirements {
             contract: crate::ids::object_id(b"inline-spec-test"),
             components: vec![(
                 "core".into(),
                 vec![(
                     "weight".into(),
-                    Requirement {
+                    TensorRequirement {
                         dtype: Dtype::Bf16,
                         shape: vec![1],
                         accepts: Accepts::Any,

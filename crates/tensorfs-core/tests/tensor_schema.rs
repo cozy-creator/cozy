@@ -1,5 +1,5 @@
 use tensorfs_core::dtype::Dtype;
-use tensorfs_core::fit::{Accepts, CodeTopology, Requirement};
+use tensorfs_core::fit::{Accepts, TensorRequirement, TensorRequirements};
 use tensorfs_core::header::{tensor_schema_digest_of, tensor_schema_value, Header, Tensor};
 
 #[test]
@@ -47,13 +47,13 @@ fn checkpoint_and_code_requirements_share_one_tensor_schema() {
         encodings: Vec::new(),
         components: vec![("model".into(), vec![("weight".into(), tensor)])],
     };
-    let requirements = CodeTopology {
+    let requirements = TensorRequirements {
         contract: "sha256:".to_string() + &"11".repeat(32),
         components: vec![(
             "model".into(),
             vec![(
                 "weight".into(),
-                Requirement {
+                TensorRequirement {
                     dtype: Dtype::F32,
                     shape: vec![2],
                     accepts: Accepts::Any,

@@ -1,3 +1,0 @@
-doc: code_topology
-expect: mutant
-note: one byte flipped at offset 102 of sha256:567347c06e7eecb9e8eb5e6c89ead24c5a894362c3e92d836575f1d4bee3c940

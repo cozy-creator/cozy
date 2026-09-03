@@ -1662,12 +1662,12 @@ impl PyPlan {
 }
 
 /// Build a read plan from canonical header bytes and the CALLER's traversal. Order is the
-/// caller's code topology.
+/// caller's tensor requirements.
 ///
 /// `components` DECLARES the scope completeness is checked against (#570b): the traversal
 /// must name every tensor the header carries for those components and none outside them.
 /// Absent, it defaults to every component the header carries — the whole-artifact reading,
-/// which is what a caller with no code topology to narrow by means.
+/// which is what a caller with no tensor requirements to narrow by means.
 #[pyfunction]
 #[pyo3(signature = (header, traversal, components=None, window=1<<24))]
 pub fn plan(

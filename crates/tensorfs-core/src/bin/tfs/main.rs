@@ -24,7 +24,7 @@
 //! distinct code per refusal (10..16, see `Fit::exit_code`); `--json` prints the machine
 //! document.
 //!
-//!   tfs fit <code-topology.json> <root> <header> [--custody canonical|local]
+//!   tfs fit <tensor-requirements.json> <root> <header> [--custody canonical|local]
 //!       [--device <class> --observations <obs.json>] [--json]
 //!
 //! Qualification (tfs-008): what an (encoding, device) pair is QUALIFIED to execute.
@@ -95,7 +95,9 @@ use std::time::Instant;
 use tensorfs_core::canon;
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::err::Refusal;
-use tensorfs_core::fit::{self, Accepts, CodeTopology, CompatibilityReport, Custody, Requirement};
+use tensorfs_core::fit::{
+    self, Accepts, CompatibilityReport, Custody, TensorRequirement, TensorRequirements,
+};
 use tensorfs_core::grade::{self, ConversionRegistration, Mapping};
 use tensorfs_core::header::{Asset, Body, Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{Doc, ObjectRef, Plain};
@@ -248,7 +250,7 @@ fn main() -> ExitCode {
         ["fetch", "admit", r, p, i] => fetch::cmd_admit(Path::new(r), Path::new(p), i, &flags),
         ["fetch", "complete", r, p] => fetch::cmd_complete(Path::new(r), Path::new(p)),
         ["compat", "import", r] => layout::cmd_import(Path::new(r), &flags),
-        ["compat", "topology", r, h] => layout::cmd_topology(Path::new(r), h, &flags),
+        ["compat", "requirements", r, h] => layout::cmd_requirements(Path::new(r), h, &flags),
         ["compat", "check", c, h] => layout::cmd_check(Path::new(c), Path::new(h), &flags),
         ["compat", "release-cut", r] => layout::cmd_release_cut(Path::new(r)),
         ["grade", "decision", d] => layout::cmd_decision(Path::new(d)),
@@ -902,24 +904,24 @@ fn stamp_doc(
 }
 
 /// The layout plane's three frozen documents, all derived from the corpus header so the
-/// vector and the live path cannot describe different things. The code topology is the
-/// header's OWN topology (a contract that asks for exactly what is there is the Satisfied
+/// vector and the live path cannot describe different things. The requirements are the
+/// header's own tensor schema (a contract that asks for exactly what is there is the Satisfied
 /// case), and the registration is run, not asserted.
 #[allow(clippy::type_complexity)]
 /// The layout plane's frozen documents, produced together because every one of them is a
 /// projection of the SAME header and the same base contract — which is what makes the
 /// verdicts they earn comparable.
 struct LayoutPlane {
-    code: CodeTopology,
+    requirements: TensorRequirements,
     report: CompatibilityReport,
     registration: ConversionRegistration,
     worst_full: CompatibilityReport,
     worst_first: CompatibilityReport,
-    recast: CodeTopology,
+    recast: TensorRequirements,
     recast_report: CompatibilityReport,
     /// The planted contract behind `worst_*`: a dtype cast on the first key and a shape
     /// edit on the last, the `tfs fit` shape-mismatch arm.
-    worst: CodeTopology,
+    worst: TensorRequirements,
     /// The CONVERTIBLE arm: every required dtype widened to f32, which the registered
     /// lossless bf16 -> f32 mapping closes. CONVERTIBLE is the only grade that populates
     /// `remedy_registration` and `remedy_mapping`, and tensorhub reads both, so the machine
@@ -928,8 +930,8 @@ struct LayoutPlane {
 }
 
 fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
-    let code = CodeTopology {
-        contract: tensorfs_core::ids::object_id(b"CodeTopology:corpus"),
+    let requirements = TensorRequirements {
+        contract: tensorfs_core::ids::object_id(b"TensorRequirements:corpus"),
         components: h
             .components
             .iter()
@@ -940,7 +942,7 @@ fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
                         .map(|(k, t)| {
                             (
                                 k.clone(),
-                                Requirement {
+                                TensorRequirement {
                                     dtype: t.dtype,
                                     shape: t.shape.clone(),
                                     accepts: Accepts::Any,
@@ -956,14 +958,14 @@ fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
     };
     let pin: Vec<String> = h.encodings.iter().map(EncodingSpec::object_id).collect();
     let out = fit::check_compatibility(
-        &code,
+        &requirements,
         h,
         closure,
         &pin,
         Custody::Canonical,
         fit::Depth::Full,
     )?;
-    let report = CompatibilityReport::of(&code, h, Custody::Canonical, &out)?;
+    let report = CompatibilityReport::of(&requirements, h, Custody::Canonical, &out)?;
     let reg = ConversionRegistration::register(
         "bf16-to-f32",
         Mapping::Widen {
@@ -981,7 +983,7 @@ fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
     // Graded on the FIRST fact the pair reads PRODUCIBLE and a catalog would offer the
     // conversion; graded on the WHOLE set it is INCOMPATIBLE. Both reports are frozen with
     // their verdicts so the two answers cannot silently become one.
-    let mut worst = code.clone();
+    let mut worst = requirements.clone();
     let keys: usize = worst.components.iter().map(|(_, k)| k.len()).sum();
     if keys < 2 {
         return Err(tensorfs_core::err::Refusal {
@@ -1010,7 +1012,7 @@ fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
     // The same contract with every required dtype recast and NOTHING else touched. This
     // remains a compact regression for the dtype-remedy path after deleting the old
     // shape-only catalog index.
-    let mut recast = code.clone();
+    let mut recast = requirements.clone();
     for (_, keys) in recast.components.iter_mut() {
         for (_, r) in keys.iter_mut() {
             r.dtype = Dtype::F8E4M3FN;
@@ -1028,7 +1030,7 @@ fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
 
     // THE CONVERTIBLE ARM. Same shape as the recast above, widened the other way: every
     // required dtype becomes f32, so the gap is exactly the lossless cast `reg` registers.
-    let mut widen = code.clone();
+    let mut widen = requirements.clone();
     for (_, keys) in widen.components.iter_mut() {
         for (_, r) in keys.iter_mut() {
             r.dtype = Dtype::F32;
@@ -1044,7 +1046,7 @@ fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
     )?;
     let widen_report = CompatibilityReport::of(&widen, h, Custody::Canonical, &out)?;
     Ok(LayoutPlane {
-        code,
+        requirements,
         report,
         registration: reg,
         worst_full: whole_set,
@@ -1268,7 +1270,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "stamp",
         "stamp",
         stmp.canonical_bytes(),
-        "the verified ledger: topology, candidate set, converter, golden, accounting",
+        "the verified ledger: tensor schema, candidate set, converter, golden, accounting",
     ));
     cases.push(ok_case(
         "ingest",
@@ -1278,9 +1280,9 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "one evidence arm; signer in the envelope; binds its stamp",
     ));
 
-    // --- the layout plane (tfs-009): code topology, report, registration
+    // --- the layout plane (tfs-009): tensor requirements, report, registration
     let LayoutPlane {
-        code,
+        requirements,
         report,
         registration: reg,
         worst_full,
@@ -1292,9 +1294,9 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     } = layout_plane_docs(&ha, &closure)?;
     cases.push(ok_case(
         "layout",
-        "code-topology",
-        "code_topology",
-        code.canonical_bytes(),
+        "tensor-requirements",
+        "tensor_requirements",
+        requirements.canonical_bytes(),
         "the meta-device census of factory(config), projected: accepts, pinned dtypes, \
          constructed components",
     ));
@@ -1326,8 +1328,8 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     ));
     cases.push(ok_case(
         "layout",
-        "code-topology-recast",
-        "code_topology",
+        "tensor-requirements-recast",
+        "tensor_requirements",
         recast.canonical_bytes(),
         "the same contract with only the dtypes recast: a different tensor schema digest",
     ));
@@ -1375,21 +1377,21 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     cases.push(red_case(
         "layout-red",
         "unconstructed-component",
-        "code_topology",
+        "tensor_requirements",
         sub(
-            &code.canonical_bytes(),
+            &requirements.canonical_bytes(),
             "\"constructed_components\":[",
             "\"constructed_components\":[\"ghost\",",
         ),
         "MISSING_COMPONENT",
-        "constructed_components names exactly the components the topology carries",
+        "constructed_components names exactly the components the requirements carry",
     ));
     cases.push(red_case(
         "layout-red",
         "empty-accepts",
-        "code_topology",
+        "tensor_requirements",
         sub(
-            &code.canonical_bytes(),
+            &requirements.canonical_bytes(),
             "\"accepts\":\"any\"",
             "\"accepts\":[]",
         ),
@@ -1553,13 +1555,13 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     // `tfs fit --json` (tfs-042): the one code <-> checkpoint answer, frozen on the ok arm
     // and on a planted shape edit so the eight-code vocabulary and its §3 text are held.
     {
-        let ok = fit::fit(&code, &ha, Custody::Canonical, Some("cpu"), None)?;
+        let ok = fit::fit(&requirements, &ha, Custody::Canonical, Some("cpu"), None)?;
         cases.push(ok_case(
             "machine",
             "fit-ok",
             "machine_fit",
             tensorfs_core::machine::fit_json(&ok, Custody::Canonical),
-            "the code constructs exactly what the checkpoint carries: `ok`, routes counted, \
+            "the requirements describe exactly what the checkpoint carries: `ok`, routes counted, \
              encoded leaves qualified on the device asked about",
         ));
         let planted = fit::fit(&worst, &ha, Custody::Canonical, None, None)?;
@@ -2283,8 +2285,8 @@ fn cmd_gen(dir: &Path) -> ExitCode {
                 let h = Header::parse(&c.bytes).unwrap();
                 v += &format!("tensor_schema: {}\n", h.tensor_schema_digest());
             }
-            if c.doc == "code_topology" {
-                let code = tensorfs_core::fit::CodeTopology::parse(&c.bytes).unwrap();
+            if c.doc == "tensor_requirements" {
+                let code = tensorfs_core::fit::TensorRequirements::parse(&c.bytes).unwrap();
                 v += &format!("tensor_schema: {}\n", code.tensor_schema_digest());
             }
             if c.doc == "manifest" {

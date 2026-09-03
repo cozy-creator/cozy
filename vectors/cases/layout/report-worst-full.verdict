@@ -1,5 +1,5 @@
 doc: compat_report
 expect: ok
-id: sha256:c864f9bd6efc4a9c504d52287454b5f178da8ee8098224a6af2e6a438ea1d5de
+id: sha256:0c28b6eda508656be1f7437716dd090af38aca1ff7756db6dbfda2e8698121aa
 grade: INCOMPATIBLE
 note: a dtype cast FIRST and a shape mismatch SECOND: the whole set grades INCOMPATIBLE

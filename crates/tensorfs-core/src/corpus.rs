@@ -42,7 +42,7 @@ pub const DOC_KINDS: &[&str] = &[
     "session",
     "receipt",
     "stamp",
-    "code_topology",
+    "tensor_requirements",
     "compat_report",
     // proto-020: the CLI's `--json` machine surfaces, frozen like every other
     // cross-boundary document because they ARE one — tensorhub decodes them.
@@ -96,9 +96,9 @@ pub fn run_doc(
         "session" => IngestSession::parse(bytes).map(|_| (None, None))?,
         "receipt" => IngestVerificationReceipt::parse(bytes).map(|_| (None, None))?,
         "stamp" => crate::ingest::stamp::Stamp::parse(bytes).map(|_| (None, None))?,
-        // The layout plane's documents (tfs-009). A code topology projects to the SAME
+        // The layout plane's documents (tfs-009). A tensor requirements projects to the SAME
         // frozen projection a header does, so its digest is reported here too.
-        "code_topology" => crate::fit::CodeTopology::parse(bytes)
+        "tensor_requirements" => crate::fit::TensorRequirements::parse(bytes)
             .map(|c| (Some(c.tensor_schema_digest()), None))?,
         // The machine surfaces (proto-020). The document is a projection, not a stored
         // object, so there is no reader to round-trip it through: what a consumer needs

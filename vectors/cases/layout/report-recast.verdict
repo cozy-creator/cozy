@@ -1,5 +1,5 @@
 doc: compat_report
 expect: ok
-id: sha256:655a41e5c771be39d5e2994804ac8ffcbf8ef97c92651b7a4fd5d17a13fab13e
+id: sha256:be4d28564dabd06f43d5a2a59cba060dbb35431f20134194914239192f276822
 grade: PRODUCIBLE
 note: differs by dtype alone, so the registered cast determines the grade

@@ -1,1 +1,0 @@
-{"components":{"transformer":{"blocks.0.attn.to_q.weight":{"accepts":"any","dtype":"bf16","shape":[64,128]},"blocks.0.norm.weight":{"accepts":"any","dtype":"bf16","shape":[128]}}},"constructed_components":["transformer"],"contract":"sha256:58cfa2784dc3bc17fd2089598a2339d82b9467a225ea304b8c87a854463ab56e"}

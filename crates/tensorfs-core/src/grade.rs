@@ -734,8 +734,11 @@ pub fn grade_report(report: &CompatibilityReport, reg: &Registry) -> Result<Grad
 /// down to the form the mapping can widen FROM. A regroup changes key counts and shapes and
 /// is deliberately not auto-applied — it is a real conversion whose plan belongs to a job,
 /// and a grader that pretended otherwise would be planning.
-pub fn apply(m: &Mapping, code: &crate::fit::CodeTopology) -> Option<crate::fit::CodeTopology> {
-    let mut out = code.clone();
+pub fn apply(
+    m: &Mapping,
+    requirements: &crate::fit::TensorRequirements,
+) -> Option<crate::fit::TensorRequirements> {
+    let mut out = requirements.clone();
     match m {
         Mapping::Rename { pairs } => {
             for (_, keys) in out.components.iter_mut() {
@@ -770,7 +773,7 @@ pub fn apply(m: &Mapping, code: &crate::fit::CodeTopology) -> Option<crate::fit:
 /// Bounded by the registration count, and every pass is header-only, so the whole thing
 /// still decides pre-download.
 pub fn resolve(
-    code: &crate::fit::CodeTopology,
+    requirements: &crate::fit::TensorRequirements,
     header: &crate::header::Header,
     closure: &crate::header::Closure,
     pin: &[String],
@@ -781,19 +784,19 @@ pub fn resolve(
     // ranks. The re-checks below ask only "does the mapped topology satisfy outright", and
     // one fact answers that, so they take the cheap path.
     let out = crate::fit::check_compatibility(
-        code,
+        requirements,
         header,
         closure,
         pin,
         custody,
         crate::fit::Depth::Full,
     )?;
-    let report = CompatibilityReport::of(code, header, custody, &out)?;
+    let report = CompatibilityReport::of(requirements, header, custody, &out)?;
     if out.is_satisfied() {
         return Ok((report, Grade::Compatible));
     }
     for r in &reg.registrations {
-        let mapped = match apply(&r.mapping, code) {
+        let mapped = match apply(&r.mapping, requirements) {
             Some(m) => m,
             None => continue,
         };

@@ -17,7 +17,7 @@ use std::process::Command;
 
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::err::Code;
-use tensorfs_core::fit::{self, CodeTopology, CompatibilityReport, Custody, Depth};
+use tensorfs_core::fit::{self, CompatibilityReport, Custody, Depth, TensorRequirements};
 use tensorfs_core::grade::{
     self, complete_domain_16, ConversionRegistration, Grade, GradeDecision, Mapping, Registry,
 };
@@ -105,13 +105,14 @@ fn an_empty_corpus_case_is_not_a_proof() {
 
 // ------------------------------------------------------------------ the frozen pair
 
-/// The corpus pair the layout vectors were mined from: a code topology asking for exactly
+/// The corpus pair the layout vectors were mined from: requirements asking for exactly
 /// what the header carries. Editing one side is how every grading arm below is built.
-fn frozen_pair() -> (CodeTopology, Header, Closure, Vec<String>) {
-    let code = CodeTopology::parse(
-        &std::fs::read(vectors().join("cases/layout/code-topology.json")).expect("code topology"),
+fn frozen_pair() -> (TensorRequirements, Header, Closure, Vec<String>) {
+    let code = TensorRequirements::parse(
+        &std::fs::read(vectors().join("cases/layout/tensor-requirements.json"))
+            .expect("tensor requirements"),
     )
-    .expect("parse code topology");
+    .expect("parse tensor requirements");
     let header = Header::parse(
         &std::fs::read(vectors().join("cases/header/plain-fp8.cbor")).expect("header"),
     )
@@ -130,8 +131,8 @@ fn frozen_pair() -> (CodeTopology, Header, Closure, Vec<String>) {
 }
 
 fn report_at(
-    code: &CodeTopology,
-    pair: &(CodeTopology, Header, Closure, Vec<String>),
+    code: &TensorRequirements,
+    pair: &(TensorRequirements, Header, Closure, Vec<String>),
     depth: Depth,
 ) -> CompatibilityReport {
     let (_, header, closure, pin) = pair;
@@ -141,8 +142,8 @@ fn report_at(
 }
 
 fn report_for(
-    code: &CodeTopology,
-    pair: &(CodeTopology, Header, Closure, Vec<String>),
+    code: &TensorRequirements,
+    pair: &(TensorRequirements, Header, Closure, Vec<String>),
 ) -> CompatibilityReport {
     report_at(code, pair, Depth::FirstMismatch)
 }
@@ -151,7 +152,7 @@ fn report_for(
 /// converted down to (PRODUCIBLE on its own) and the LAST asks for a shape the checkpoint
 /// does not have (INCOMPATIBLE on its own). Keys are compared in canonical order, so the
 /// producible fact is genuinely the one a first-mismatch walk stops on.
-fn cast_first_then_shape(code: &CodeTopology) -> CodeTopology {
+fn cast_first_then_shape(code: &TensorRequirements) -> TensorRequirements {
     let mut out = code.clone();
     let keys: usize = out.components.iter().map(|(_, k)| k.len()).sum();
     assert!(keys >= 2, "the arm needs two keys to have a second fact");
@@ -162,7 +163,7 @@ fn cast_first_then_shape(code: &CodeTopology) -> CodeTopology {
     out
 }
 
-fn retype(code: &CodeTopology, to: Dtype) -> CodeTopology {
+fn retype(code: &TensorRequirements, to: Dtype) -> TensorRequirements {
     let mut out = code.clone();
     for (_, keys) in out.components.iter_mut() {
         for (_, requirement) in keys.iter_mut() {
@@ -476,7 +477,7 @@ fn the_guard_reads_the_whole_set_before_it_fires() {
 #[test]
 fn preflight_stops_and_the_full_walk_does_not() {
     use std::time::Instant;
-    use tensorfs_core::fit::{Accepts, Requirement};
+    use tensorfs_core::fit::{Accepts, TensorRequirement};
     use tensorfs_core::header::{Part, Tensor};
 
     const KEYS: usize = 4096;
@@ -506,7 +507,7 @@ fn preflight_stops_and_the_full_walk_does_not() {
         components: vec![("core".into(), tensors.clone())],
     };
     // EVERY key disagrees, so the full walk records KEYS facts and preflight records one.
-    let code = CodeTopology {
+    let code = TensorRequirements {
         contract: tensorfs_core::ids::object_id(b"depth-cost"),
         components: vec![(
             "core".into(),
@@ -515,7 +516,7 @@ fn preflight_stops_and_the_full_walk_does_not() {
                 .map(|(k, _)| {
                     (
                         k.clone(),
-                        Requirement {
+                        TensorRequirement {
                             dtype: Dtype::F8E4M3FN,
                             shape: vec![1],
                             accepts: Accepts::Any,
@@ -617,14 +618,19 @@ fn field(json: &str, key: &str) -> String {
     rest[..rest.find('"').expect("closing quote")].to_string()
 }
 
-fn graded_json(dir: &Path, name: &str, code: &CodeTopology, registry: Option<&Path>) -> String {
+fn graded_json(
+    dir: &Path,
+    name: &str,
+    code: &TensorRequirements,
+    registry: Option<&Path>,
+) -> String {
     graded_json_at(dir, name, code, registry, Depth::FirstMismatch)
 }
 
 fn graded_json_at(
     dir: &Path,
     name: &str,
-    code: &CodeTopology,
+    code: &TensorRequirements,
     registry: Option<&Path>,
     depth: Depth,
 ) -> String {
@@ -939,7 +945,7 @@ fn prove_with_is_refused_on_a_batch() {
             "serve",
             "--registry",
             "",
-            "--code",
+            "--requirements",
             "/nonexistent",
             "--header",
             "/nonexistent",

@@ -36,7 +36,7 @@ from typing import Literal
 
 from . import errors
 from ._ext import (
-    _code_topology,
+    _tensor_requirements,
     Batch,
     Closure,
     DerivedWriter,
@@ -72,7 +72,7 @@ from ._ext import (
 
 
 @dataclass(frozen=True)
-class CodeTensor:
+class TensorRequirement:
     """One destination the factory constructs: its shape, constructed dtype, which stored
     encodings it accepts (`"any"` under ``encoded_leaves="accept"``, a digest list
     otherwise), and whether the dtype is PINNED (an integer buffer, an fp32 island)."""
@@ -85,12 +85,12 @@ class CodeTensor:
     pinned: bool = False
 
 
-def code_topology(
+def tensor_requirements(
     contract_digest: str,
-    tensors: Sequence[CodeTensor],
+    tensors: Sequence[TensorRequirement],
     constructed_components: Sequence[str] | None = None,
 ) -> bytes:
-    """Author canonical CodeTopology bytes from the meta-device census rows.
+    """Author canonical TensorRequirements bytes from the meta-device census rows.
 
     `constructed_components` is the factory's construction order (D9); it defaults to the
     order the components first appear in `tensors`.
@@ -108,7 +108,7 @@ def code_topology(
     ]
     if constructed_components is None:
         constructed_components = list(dict.fromkeys(tensor.component for tensor in tensors))
-    return _code_topology(contract_digest, rows, list(constructed_components))
+    return _tensor_requirements(contract_digest, rows, list(constructed_components))
 
 #: The closed carrier/logical dtype enum and its element sizes. The ONE export of dtype
 #: knowledge: a consumer sizing a `torch.frombuffer` reads it from here, never from a
@@ -119,7 +119,7 @@ __all__ = [
     "DTYPES",
     "Batch",
     "Closure",
-    "CodeTensor",
+    "TensorRequirement",
     "DerivedWriter",
     "Operation",
     "ReadLease",
@@ -127,7 +127,7 @@ __all__ = [
     "Store",
     "__version__",
     "capability",
-    "code_topology",
+    "tensor_requirements",
     "dtypes",
     "doc_kinds",
     "fit",

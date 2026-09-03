@@ -45,7 +45,7 @@ rm -rf "$work/venv"
 "$work/venv/bin/pip" install --quiet "$wheel"
 echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/version_contract.py installed "$wheel"
-"$work/venv/bin/python" scripts/code-topology-runs.py
+"$work/venv/bin/python" scripts/tensor-requirements-runs.py
 # The frozen corpus, through the FACADE. `tfs vectors verify` runs the same 90 vectors
 # through Rust; this proves the marshal boundary agrees — same ids, same typed refusals.
 "$work/venv/bin/python" scripts/facade-conform.py

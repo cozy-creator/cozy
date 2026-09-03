@@ -10,7 +10,7 @@ use tensorfs_core::canon::Value;
 use tensorfs_core::capability::CapabilityRecords;
 use tensorfs_core::corpus;
 use tensorfs_core::dtype::Dtype;
-use tensorfs_core::fit::{Accepts, CodeTopology, Custody, Requirement};
+use tensorfs_core::fit::{Accepts, Custody, TensorRequirement, TensorRequirements};
 use tensorfs_core::header::{Closure as CoreClosure, Header};
 use tensorfs_core::ids::{self, Doc, Plain};
 use tensorfs_core::manifest::Manifest;
@@ -19,37 +19,37 @@ use tensorfs_core::spec::EncodingSpec;
 
 use crate::errors::IntoPy;
 
-type CodeTensorRow = (String, String, String, Vec<u64>, Option<Vec<String>>, bool);
+type TensorRequirementRow = (String, String, String, Vec<u64>, Option<Vec<String>>, bool);
 
-/// Author one canonical CodeTopology from the meta-device census rows. TensorFS receives
+/// Author one canonical TensorRequirements from the meta-device census rows. TensorFS receives
 /// exact component/key fields; it never runs package code or guesses prefixes.
-#[pyfunction(name = "_code_topology")]
-pub fn code_topology<'p>(
+#[pyfunction(name = "_tensor_requirements")]
+pub fn tensor_requirements<'p>(
     py: Python<'p>,
     contract_digest: &str,
-    tensors: Vec<CodeTensorRow>,
+    tensors: Vec<TensorRequirementRow>,
     constructed_components: Vec<String>,
 ) -> PyResult<Bound<'p, PyBytes>> {
     if tensors.is_empty() {
         return tensorfs_core::err::refuse(
             tensorfs_core::err::Code::EMPTY_COMPONENTS,
-            "CodeTopology requires at least one tensor",
+            "TensorRequirements requires at least one tensor",
         )
         .or_refuse(py);
     }
-    let mut components: Vec<(String, Vec<(String, Requirement)>)> = Vec::new();
+    let mut components: Vec<(String, Vec<(String, TensorRequirement)>)> = Vec::new();
     let mut prior: Option<(String, String)> = None;
     for (component, key, dtype, shape, accepts, pinned) in tensors {
         let identity = (component.clone(), key.clone());
         if prior.as_ref().is_some_and(|held| held >= &identity) {
             return tensorfs_core::err::refuse(
                 tensorfs_core::err::Code::SORT_ORDER,
-                "CodeTensor rows must be sorted and unique by (component,key)",
+                "TensorRequirement rows must be sorted and unique by (component,key)",
             )
             .or_refuse(py);
         }
         prior = Some(identity);
-        let requirement = Requirement {
+        let requirement = TensorRequirement {
             dtype: Dtype::parse(&dtype).or_refuse(py)?,
             shape,
             accepts: accepts.map(Accepts::OneOf).unwrap_or(Accepts::Any),
@@ -60,38 +60,39 @@ pub fn code_topology<'p>(
             _ => components.push((component, vec![(key, requirement)])),
         }
     }
-    let topology = CodeTopology {
+    let requirements = TensorRequirements {
         contract: contract_digest.to_string(),
         components,
         constructed_components,
     };
-    let raw = topology.canonical_bytes();
-    CodeTopology::parse(&raw).or_refuse(py)?;
+    let raw = requirements.canonical_bytes();
+    TensorRequirements::parse(&raw).or_refuse(py)?;
     Ok(PyBytes::new(py, &raw))
 }
 
-/// `tensorfs.fit(code_topology, header, *, custody, device=None, observations=None)`:
+/// `tensorfs.fit(tensor_requirements, header, *, custody, device=None, observations=None)`:
 /// the one code <-> checkpoint answer (design §3), as the same total document `tfs fit
 /// --json` prints, plus `ok`.
 #[pyfunction(name = "fit")]
-#[pyo3(signature = (code_topology, header, *, custody, device=None, observations=None))]
+#[pyo3(signature = (tensor_requirements, header, *, custody, device=None, observations=None))]
 pub fn py_fit<'p>(
     py: Python<'p>,
-    code_topology: &[u8],
+    tensor_requirements: &[u8],
     header: &[u8],
     custody: &str,
     device: Option<&str>,
     observations: Option<&[u8]>,
 ) -> PyResult<Bound<'p, PyDict>> {
-    let code = CodeTopology::parse(code_topology).or_refuse(py)?;
+    let requirements = TensorRequirements::parse(tensor_requirements).or_refuse(py)?;
     let header = Header::parse(header).or_refuse(py)?;
     let custody = Custody::parse(custody).or_refuse(py)?;
     let observed = match observations {
         Some(bytes) => Some(CapabilityRecords::parse_observed(bytes).or_refuse(py)?),
         None => None,
     };
-    let verdict = tensorfs_core::fit::fit(&code, &header, custody, device, observed.as_ref())
-        .or_refuse(py)?;
+    let verdict =
+        tensorfs_core::fit::fit(&requirements, &header, custody, device, observed.as_ref())
+            .or_refuse(py)?;
     let doc = tensorfs_core::machine::fit_json(&verdict, custody);
     let value = tensorfs_core::canon::parse_canonical(&doc, tensorfs_core::limits::DOC_MAX_BYTES)
         .or_refuse(py)?;

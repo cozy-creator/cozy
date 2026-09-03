@@ -1,5 +1,5 @@
 doc: compat_report
 expect: ok
-id: sha256:23b7c624712b9451e895fc70a5ea4c52b98696370f09eee56d1a3c1e9d6e76fe
+id: sha256:97a26469b2b1b24716f0c4b56fee243fa69766f79f5528b376b587f057b9a41a
 grade: INCOMPATIBLE
 note: every required dtype widened to f32. With no registry the gap is unclosable and the frozen grade is INCOMPATIBLE; load the registered lossless cast and the same report grades CONVERTIBLE, which is the whole point of the rung

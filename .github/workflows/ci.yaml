@@ -46,7 +46,7 @@ jobs:
           set -e
           m=vectors/cases/machine
           diff <(cat "$m/check-satisfied.json"; echo) <(./target/release/tfs compat check \
-            vectors/cases/layout/code-topology.json vectors/cases/header/plain-fp8.cbor \
+            vectors/cases/layout/tensor-requirements.json vectors/cases/header/plain-fp8.cbor \
             --depth full --json)
           diff <(cat "$m/grade-compatible.json"; echo) <(./target/release/tfs grade \
             vectors/cases/layout/report-satisfied.json --json)
@@ -68,11 +68,11 @@ jobs:
           set -e
           m=vectors/cases/machine
           diff <(cat "$m/fit-ok.json"; echo) <(./target/release/tfs fit \
-            vectors/cases/layout/code-topology.json . vectors/cases/header/plain-fp8.cbor \
+            vectors/cases/layout/tensor-requirements.json . vectors/cases/header/plain-fp8.cbor \
             --device cpu --json)
           python3 - <<'PY'
           import json
-          d = json.load(open("vectors/cases/layout/code-topology.json"))
+          d = json.load(open("vectors/cases/layout/tensor-requirements.json"))
           keys = d["components"]["transformer"]
           keys[sorted(keys)[-1]]["shape"] = [7]
           open("planted.json", "w").write(json.dumps(d, sort_keys=True, separators=(",", ":")))

@@ -45,7 +45,7 @@ fn load(root: &Path, hex: &str) -> Result<(Store, Manifest, Header), Refusal> {
 }
 
 /// Every component this header carries. The `tfs` CLI's own plans are whole-artifact by
-/// construction — it has no code topology to narrow by — so it declares the full set
+/// construction — it has no tensor requirements to narrow by — so it declares the full set
 /// (#570b). A caller that binds a subset declares the subset.
 fn all_components(h: &Header) -> Vec<String> {
     h.components.iter().map(|(c, _)| c.clone()).collect()

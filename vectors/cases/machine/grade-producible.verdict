@@ -1,4 +1,4 @@
 doc: machine_grade
 expect: ok
-id: sha256:90a711d8c91f3b6cdc90f547db937055e21ffbb68b88dfd96c680ee5f4079a41
+id: sha256:8970d073dff2e2233dfffd98eb469b9ad49f71cd86ad9de7ef53507d91952eee
 note: PRODUCIBLE names the CONTRACT's target in remedy_target, never the observed encoding

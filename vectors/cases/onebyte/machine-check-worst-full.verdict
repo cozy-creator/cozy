@@ -1,3 +1,3 @@
 doc: machine_check
 expect: mutant
-note: one byte flipped at offset 204 of sha256:a8984abb03874a64d3f828d92458e8e009db6000a0b6cc4c91fee077666e732d
+note: one byte flipped at offset 204 of sha256:c648164057d9d680ba65863ed4c471b2e1265b42d2ab4c365e2091bf9aeaa0a5

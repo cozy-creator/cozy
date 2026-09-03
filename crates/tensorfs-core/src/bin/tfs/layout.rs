@@ -14,7 +14,7 @@ use tensorfs_core::capability::CapabilityRecords;
 use tensorfs_core::checkpoint as ck;
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::fit::{
-    self, Accepts, CodeTopology, CompatibilityReport, Custody, Fit, Requirement,
+    self, Accepts, CompatibilityReport, Custody, Fit, TensorRequirement, TensorRequirements,
 };
 use tensorfs_core::grade::{self, ConversionRegistration, Grade, GradeDecision, Mapping, Registry};
 use tensorfs_core::header::Header;
@@ -51,10 +51,10 @@ macro_rules! rd {
     };
 }
 
-/// A header's own topology, projected into a code topology. This is the IDENTITY contract:
+/// A header projected into tensor requirements. This is the identity contract:
 /// what a `load()` that constructs exactly this checkpoint would require. It is the
 /// starting point for every real pair — you edit one side and grade the difference.
-pub fn cmd_topology(root: &Path, hex: &str, flags: &Flags) -> ExitCode {
+pub fn cmd_requirements(root: &Path, hex: &str, flags: &Flags) -> ExitCode {
     let store = ok!(Store::open(root));
     let length = match fs::metadata(store.object_path(hex)) {
         Ok(m) => m.len(),
@@ -73,16 +73,16 @@ pub fn cmd_topology(root: &Path, hex: &str, flags: &Flags) -> ExitCode {
     if let Some(p) = flag(flags, "emit-header") {
         let _ = fs::write(p, ok!(header.canonical_bytes()));
     }
-    let code = project(&header, flag(flags, "contract").unwrap_or("local"));
-    emit(&code, flags);
-    println!("contract     {}", code.contract);
-    println!("tensors      {}", code.count());
-    println!("tensor schema {}", code.tensor_schema_digest());
+    let requirements = project(&header, flag(flags, "contract").unwrap_or("local"));
+    emit(&requirements, flags);
+    println!("contract     {}", requirements.contract);
+    println!("tensors      {}", requirements.count());
+    println!("tensor schema {}", requirements.tensor_schema_digest());
     ExitCode::SUCCESS
 }
 
-pub fn project(h: &Header, contract_name: &str) -> CodeTopology {
-    CodeTopology {
+pub fn project(h: &Header, contract_name: &str) -> TensorRequirements {
+    TensorRequirements {
         contract: tensorfs_core::ids::object_id(contract_name.as_bytes()),
         components: h
             .components
@@ -94,7 +94,7 @@ pub fn project(h: &Header, contract_name: &str) -> CodeTopology {
                         .map(|(k, t)| {
                             (
                                 k.clone(),
-                                Requirement {
+                                TensorRequirement {
                                     dtype: t.dtype,
                                     shape: t.shape.clone(),
                                     accepts: Accepts::OneOf(vec![t.encoding.clone()]),
@@ -110,14 +110,14 @@ pub fn project(h: &Header, contract_name: &str) -> CodeTopology {
     }
 }
 
-/// `tfs fit <code-topology.json> <root> <header> [--custody local] [--device <class>
+/// `tfs fit <tensor-requirements.json> <root> <header> [--custody local] [--device <class>
 /// --observations <obs.json>] [--json]` — design §3, the only compatibility verdict.
 ///
 /// `<header>` is a header object id in `<root>` or a path to header bytes. Exit 0 on
 /// `ok`; every refusal has its own exit code so a caller can branch without parsing, and
 /// `--json` prints the total machine document (`machine::fit_json`).
-pub fn cmd_fit(code_p: &Path, root: &Path, header_arg: &str, flags: &Flags) -> ExitCode {
-    let code = ok!(CodeTopology::parse(&rd!(code_p)));
+pub fn cmd_fit(requirements_p: &Path, root: &Path, header_arg: &str, flags: &Flags) -> ExitCode {
+    let requirements = ok!(TensorRequirements::parse(&rd!(requirements_p)));
     let header = match tensorfs_core::ids::hex64("header", header_arg) {
         Ok(_) => {
             let store = ok!(Store::open(root));
@@ -152,7 +152,7 @@ pub fn cmd_fit(code_p: &Path, root: &Path, header_arg: &str, flags: &Flags) -> E
     }
     let t = Instant::now();
     let verdict = ok!(fit::fit(
-        &code,
+        &requirements,
         &header,
         custody,
         device,
@@ -178,7 +178,7 @@ pub fn cmd_fit(code_p: &Path, root: &Path, header_arg: &str, flags: &Flags) -> E
     ExitCode::from(verdict.exit_code())
 }
 
-/// Build a canonical header + code topology out of NEUTRAL measured rows.
+/// Build a canonical header + tensor requirements out of NEUTRAL measured rows.
 ///
 /// The rows carry component, key, logical dtype/shape and the measured role geometry, and
 /// nothing else — no format marks, no canonical bytes. That split is deliberate: the
@@ -219,7 +219,7 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
 
     let mut closure = tensorfs_core::header::Closure::default();
     let mut out: Vec<(String, tensorfs_core::header::Tensor)> = Vec::new();
-    let mut reqs: Vec<(String, Requirement)> = Vec::new();
+    let mut reqs: Vec<(String, TensorRequirement)> = Vec::new();
     for tv in tensors {
         let mut tf = match tensorfs_core::canon::Fields::new("row", tv) {
             Ok(x) => x,
@@ -327,7 +327,7 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
         ));
         reqs.push((
             key,
-            Requirement {
+            TensorRequirement {
                 dtype,
                 shape,
                 accepts: Accepts::OneOf(vec![sid]),
@@ -366,7 +366,7 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
         components: vec![(component.clone(), out)],
     };
     ok!(header.validate(&closure));
-    let code = CodeTopology {
+    let requirements = TensorRequirements {
         contract: tensorfs_core::ids::object_id(provenance.as_bytes()),
         components: vec![(component.clone(), reqs)],
         constructed_components: vec![component],
@@ -374,8 +374,8 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
     if let Some(p) = flag(flags, "out-header") {
         let _ = fs::write(p, ok!(header.canonical_bytes()));
     }
-    if let Some(p) = flag(flags, "out-code") {
-        let _ = fs::write(p, code.canonical_bytes());
+    if let Some(p) = flag(flags, "out-requirements") {
+        let _ = fs::write(p, requirements.canonical_bytes());
     }
     if let Some(d) = flag(flags, "out-closure") {
         let _ = fs::create_dir_all(d);
@@ -394,7 +394,7 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
     println!("  parts      PLACEHOLDER object ids: no weight bytes transit this machine");
     println!("header       {}", ok!(header.object_id()));
     println!("tensor schema {}", header.tensor_schema_digest());
-    println!("code         {}", code.object_id());
+    println!("requirements {}", requirements.object_id());
     for (id, s) in &closure.specs {
         println!(
             "  spec       {} roles {:?}",
@@ -497,7 +497,7 @@ fn emit_bytes(bytes: &[u8], flags: &Flags) {
 }
 
 /// `check_compatibility` over two documents on disk. Zero tensor bytes are read: the whole
-/// decision is a function of a code topology, a header and a closure, which is exactly why
+/// decision is a function of tensor requirements, a header and a closure, which is exactly why
 /// it is decidable before a download.
 ///
 /// `--depth` picks the question. The default is `first-mismatch` — PREFLIGHT, "can this
@@ -512,8 +512,8 @@ fn emit_bytes(bytes: &[u8], flags: &Flags) {
 /// be read" and "some card has a qualified implementation for them" are two independent
 /// questions; the second is `tfs capability`, and a caller cannot ask it without knowing
 /// which pairs to ask about.
-pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
-    let code = ok!(CodeTopology::parse(&rd!(code_p)));
+pub fn cmd_check(requirements_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
+    let requirements = ok!(TensorRequirements::parse(&rd!(requirements_p)));
     let header = ok!(Header::parse(&rd!(header_p)));
     let mut closure = tensorfs_core::header::Closure::default();
     for p in flag(flags, "closure").unwrap_or("").split(',') {
@@ -540,10 +540,20 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
     ));
     let t = Instant::now();
     let out = ok!(fit::check_compatibility(
-        &code, &header, &closure, &pin, custody, depth
+        &requirements,
+        &header,
+        &closure,
+        &pin,
+        custody,
+        depth
     ));
     let us = t.elapsed().as_secs_f64() * 1e6;
-    let report = ok!(CompatibilityReport::of(&code, &header, custody, &out));
+    let report = ok!(CompatibilityReport::of(
+        &requirements,
+        &header,
+        custody,
+        &out
+    ));
     emit(&report, flags);
 
     // The machine surface (proto-020). A caller that shells out to this command must not
@@ -780,11 +790,11 @@ pub fn cmd_grade(report_p: &Path, flags: &Flags) -> ExitCode {
         Err(c) => return c,
     };
     // Grading over a report ALONE cannot prove a registration closes the whole gap; holding
-    // both documents can. `--code`/`--header` supply them here.
+    // both documents can. `--requirements`/`--header` supply them here.
     let t = Instant::now();
-    let g = match (flag(flags, "code"), flag(flags, "header")) {
+    let g = match (flag(flags, "requirements"), flag(flags, "header")) {
         (Some(c), Some(h)) => {
-            let code = ok!(CodeTopology::parse(&rd!(Path::new(c))));
+            let requirements = ok!(TensorRequirements::parse(&rd!(Path::new(c))));
             let header = ok!(Header::parse(&rd!(Path::new(h))));
             let mut closure = tensorfs_core::header::Closure::default();
             for p in flag(flags, "closure").unwrap_or("").split(',') {
@@ -801,7 +811,7 @@ pub fn cmd_grade(report_p: &Path, flags: &Flags) -> ExitCode {
                     .collect(),
             };
             ok!(grade::resolve(
-                &code,
+                &requirements,
                 &header,
                 &closure,
                 &pin,
@@ -968,14 +978,14 @@ fn stream_in(path: Option<&Path>) -> Result<(Box<dyn BufRead>, bool), ExitCode> 
 /// same document — literally the same `grade_json` — so the single-pair form is not a
 /// different surface with a shared name, and a preflight caller is never made to batch.
 ///
-/// The registry is loaded ONCE for the whole stream. `--prove-with` (`--code`/`--header`)
+/// The registry is loaded ONCE for the whole stream. `--prove-with` (`--requirements`/`--header`)
 /// is single-pair only: proving a registration closes the whole gap needs both documents of
 /// THAT pair, and a batch has one registry and many pairs.
 pub fn cmd_grade_stream(path: Option<&Path>, flags: &Flags) -> ExitCode {
-    if flag(flags, "code").is_some() || flag(flags, "header").is_some() {
+    if flag(flags, "requirements").is_some() || flag(flags, "header").is_some() {
         eprintln!(
-            "REFUSED UNKNOWN_FIELD: --prove-with is single-pair only: it holds the code \
-             topology and header of ONE pair, and a batch carries many"
+            "REFUSED UNKNOWN_FIELD: --prove-with is single-pair only: it holds the tensor \
+             requirements and header of ONE pair, and a batch carries many"
         );
         return ExitCode::FAILURE;
     }
