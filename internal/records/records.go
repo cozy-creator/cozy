@@ -121,6 +121,17 @@ var schema = append([]string{installsDDL, pinsDDL}, append(orchestratorSchema,
 const pragmas = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate"
 
 func Open(path string) (*Store, *exit.Error) {
+	return open(path, false)
+}
+
+// OpenForDaemon is the only schema-migrating entrance. The daemon holds
+// home.Layout.Daemon before calling it and keeps that lock for its lifetime, so
+// a newly installed CLI cannot rewrite the database under an older live daemon.
+func OpenForDaemon(path string) (*Store, *exit.Error) {
+	return open(path, true)
+}
+
+func open(path string, migratePrior bool) (*Store, *exit.Error) {
 	// No `file:` prefix: the driver hands an unprefixed name to SQLite verbatim, so a
 	// local root containing `%` or `#` stays a path instead of becoming a URI to decode.
 	db, err := sql.Open("sqlite", path+pragmas)
@@ -145,6 +156,13 @@ func Open(path string) (*Store, *exit.Error) {
 			return nil, e
 		}
 	} else if version >= 6 && version < schemaVersion {
+		if !migratePrior {
+			db.Close()
+			return nil, exit.Named(exit.Conflict, "records_schema_upgrade_required",
+				"records database has schema %d; this Creator requires schema %d",
+				version, schemaVersion).
+				WithRemedy("stop the active Cozy daemon, then run `cozy up` so the new daemon can migrate it")
+		}
 		if e := migrate(db, path, version); e != nil {
 			db.Close()
 			return nil, e
