@@ -335,34 +335,17 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	if problem != nil {
 		return "", problem
 	}
-	const batch = 128
-	for start := 0; opened.Publication.State == "open" && start < len(objects); start += batch {
-		end := min(start+batch, len(objects))
-		ids := make([]string, 0, end-start)
-		for _, object := range objects[start:end] {
-			ids = append(ids, object.ID)
-		}
-		granted, problem := publicationClient.GrantKnownTransfers(ctx, ref, operation, ids,
-			"cozy model upload "+intent.Source+" "+intent.Destination)
-		if problem != nil {
-			return "", problem
-		}
-		decisions := make([]orchestrator.WeightsTransferDecision, 0, len(ids))
-		for _, grant := range granted.Grants {
-			expires, err := time.Parse(time.RFC3339, grant.Expires)
-			if err != nil {
-				return "", exit.Named(exit.Conflict, "model_transfer.grant_expiry_invalid",
-					"Tensorhub returned an invalid grant expiry")
-			}
-			decisions = append(decisions, orchestrator.WeightsTransferDecision{
-				ObjectID: grant.ObjectID, Length: grant.Length, URL: grant.URL,
-				Headers: grant.Headers, ExpiresAtUnix: uint64(expires.Unix())})
-		}
-		for _, held := range granted.Held {
-			decisions = append(decisions, orchestrator.WeightsTransferDecision{
-				ObjectID: held.ObjectID, Length: held.Length, Held: true})
-		}
-		if problem := mover(ctx, weights, operation, decisions); problem != nil {
+	// THE MOVER MINTS, THIS ONLY SIGNS. Grants used to be asked for here, 128 at a time,
+	// before the mover moved a single byte: one expiry stamped on the whole batch, the last
+	// object's URL signed beside the first and dead before its turn came. The mover now
+	// carries the cursor, so it asks for the objects whose bytes are about to move and asks
+	// again once the hub's own declared life is half spent. Nothing about the publication
+	// protocol changed -- the hub always re-minted for a still-claimed object.
+	if opened.Publication.State == "open" {
+		if problem := mover(ctx, weights, operation,
+			func(ctx context.Context, objectIDs []string) (orchestrator.WeightsGrantWindow, *exit.Error) {
+				return mintWeightsGrants(ctx, publicationClient, ref, operation, intent, objectIDs)
+			}); problem != nil {
 			return "", problem
 		}
 	}
@@ -378,6 +361,42 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 		return "", problem
 	}
 	return checkpoint.PublishID, nil
+}
+
+// mintWeightsGrants authorizes one window of objects and reports the hub's clock beside them.
+// The window is whatever the mover asked for; this neither batches nor caches, because the
+// only place that knows which object is about to move is the walk.
+func mintWeightsGrants(ctx context.Context, client *hub.Client, ref hub.Ref, operation string,
+	intent records.ModelTransferIntent, objectIDs []string,
+) (orchestrator.WeightsGrantWindow, *exit.Error) {
+	var window orchestrator.WeightsGrantWindow
+	granted, problem := client.GrantKnownTransfers(ctx, ref, operation, objectIDs,
+		"cozy model upload "+intent.Source+" "+intent.Destination)
+	if problem != nil {
+		return window, problem
+	}
+	if granted.ServerTimeUnix <= 0 {
+		return window, exit.Named(exit.Conflict, "model_transfer.grant_clock_absent",
+			"Tensorhub authorized these objects without stating its own clock, "+
+				"so no client can tell how much of the grant is left")
+	}
+	window.ServerTimeUnix = granted.ServerTimeUnix
+	window.Decisions = make([]orchestrator.WeightsTransferDecision, 0, len(objectIDs))
+	for _, grant := range granted.Grants {
+		if grant.ExpiresAtUnix <= granted.ServerTimeUnix {
+			return window, exit.Named(exit.Conflict, "model_transfer.grant_expiry_invalid",
+				"Tensorhub signed %s to expire at or before the moment it signed it",
+				grant.ObjectID)
+		}
+		window.Decisions = append(window.Decisions, orchestrator.WeightsTransferDecision{
+			ObjectID: grant.ObjectID, Length: grant.Length, URL: grant.URL,
+			Headers: grant.Headers, ExpiresAtUnix: uint64(grant.ExpiresAtUnix)})
+	}
+	for _, held := range granted.Held {
+		window.Decisions = append(window.Decisions, orchestrator.WeightsTransferDecision{
+			ObjectID: held.ObjectID, Length: held.Length, Held: true})
+	}
+	return window, nil
 }
 
 func transferOutputOperation(requestID, slot string) string {

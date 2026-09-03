@@ -71,8 +71,7 @@ func (c *Orchestrator) runModelPassThrough(req records.Request) {
 const weightsGrantExpired = "weights_grant_expired"
 
 func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
-	weights records.ModelTransferWeights, operationID string,
-	decisions []WeightsTransferDecision,
+	weights records.ModelTransferWeights, operationID string, mint WeightsGrantMinter,
 ) *exit.Error {
 	request, problem := c.opt.Store.RequestRow(weights.RequestID)
 	if problem != nil || request == nil {
@@ -82,55 +81,50 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 		return exit.Named(exit.Structural, "model_transfer.remote_mover_not_needed",
 			"local model transfer output is already in Creator TensorFS")
 	}
-	byObject := make(map[string]WeightsTransferDecision, len(decisions))
+	if mint == nil {
+		return exit.Internalf("remote weights transfer has no grant minter")
+	}
+	if len(weights.Objects) == 0 {
+		return exit.Named(exit.Conflict, "model_transfer.output_inventory_empty",
+			"weights output %s adopted no objects", weights.OutputSlot)
+	}
 	known := make(map[string]int64, len(weights.Objects))
 	for _, object := range weights.Objects {
 		known[object.ObjectID] = object.Length
 	}
-	for _, decision := range decisions {
-		if decision.ObjectID == "" || decision.Length <= 0 || known[decision.ObjectID] != decision.Length ||
-			byObject[decision.ObjectID].ObjectID != "" {
-			return exit.Named(exit.Validation, "model_transfer.transfer_decision_invalid",
-				"weights transfer decisions changed the adopted object inventory")
-		}
-		byObject[decision.ObjectID] = decision
-	}
+	// ONE window for the whole walk. It outlives the loop below on purpose: a grant minted
+	// on an earlier pass is reused while it is young and re-minted once it is not, which is
+	// what stops a re-send from carrying a signature that has gone cold.
+	window := &grantWindow{mint: mint}
 	for {
 		objects, problem := c.opt.Store.ModelTransferObjects(weights.RequestID,
 			weights.Attempt, weights.OutputSlot)
 		if problem != nil {
 			return problem
 		}
-		complete := len(byObject) > 0
+		outstanding := make([]records.ModelTransferObject, 0, len(objects))
 		for _, object := range objects {
-			if _, selected := byObject[object.ObjectID]; !selected {
+			if object.State == "uploaded" || object.State == "already_present" ||
+				object.State == "held" {
 				continue
 			}
 			if object.State == "failed" {
-				// A grant that would not spend is not a verdict about the object: this
-				// owner mints them per batch of <= 128 objects under a 900 s TTL, and a
-				// batch that outran that clock needs a NEW grant, not a dead transfer.
-				//
-				// The test used to be `strings.Contains(SafeCode, "expired")` against a
-				// pod that hardcoded the literal `weights_transfer_failed` for every
-				// cause, so this branch was unreachable code: one refused object PUT
-				// terminally failed all four checkpoints — about 1,280 objects of
-				// exposure — after hours of compute. The pod now names the class
-				// (tensorhub `weights_grant_expired`) and, for exactly this class, leaves
-				// no durable failure behind, so a re-issue can actually be spent.
-				if object.SafeCode == weightsGrantExpired {
-					return exit.Named(exit.Unavailable, object.SafeCode,
-						"worker weights transfer %s needs a refreshed grant: %s",
-						object.ObjectID, object.SafeDetail)
+				// AN EXPIRED GRANT IS NOT A VERDICT ABOUT THE OBJECT. The pod never spent
+				// the signature it was handed, so nothing about these bytes was decided and
+				// nothing about them has to change -- only the grant does. This used to
+				// unwind the whole finalize as exit.Unavailable and rebuild the publication
+				// from the top to get fresh URLs; the window is simply dropped instead, and
+				// the send below carries a signature minted just now.
+				if object.SafeCode != weightsGrantExpired {
+					return exit.Named(exit.Failed, "model_transfer.object_failed",
+						"worker weights transfer %s failed (%s): %s", object.ObjectID,
+						object.SafeCode, object.SafeDetail)
 				}
-				return exit.Named(exit.Failed, "model_transfer.object_failed",
-					"worker weights transfer %s failed: %s", object.ObjectID,
-					object.SafeDetail)
+				window.expire()
 			}
-			complete = complete && (object.State == "uploaded" ||
-				object.State == "already_present" || object.State == "held")
+			outstanding = append(outstanding, object)
 		}
-		if complete {
+		if len(outstanding) == 0 {
 			return nil
 		}
 		session, problem := c.rentalControl(request.Worker)
@@ -148,20 +142,30 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 		if err != nil {
 			return exit.Internalf("persisted weights receipt digest is malformed: %s", err)
 		}
-		for _, object := range objects {
-			decision, selected := byObject[object.ObjectID]
-			if !selected || object.State == "uploaded" || object.State == "already_present" ||
-				object.State == "held" {
-				continue
+		ids := make([]string, 0, len(outstanding))
+		for _, object := range outstanding {
+			ids = append(ids, object.ObjectID)
+		}
+		for index, object := range outstanding {
+			// The grant is obtained HERE, immediately before this object's bytes are asked
+			// for, rather than for the whole batch before any of them moved.
+			decision, problem := window.spendable(ctx, object.ObjectID, ids[index:], time.Now())
+			if problem != nil {
+				return problem
 			}
-			request := &pb.WeightsTransferRequest{RecordOwnerEpoch: recordOwnerEpoch,
+			if decision.Length <= 0 || known[object.ObjectID] != decision.Length {
+				return exit.Named(exit.Validation, "model_transfer.transfer_decision_invalid",
+					"the authorized grant for %s changed the adopted object inventory",
+					object.ObjectID)
+			}
+			transfer := &pb.WeightsTransferRequest{RecordOwnerEpoch: recordOwnerEpoch,
 				ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
 				RequestId: weights.RequestID, AttemptOrdinal: uint64(weights.Attempt),
 				InvocationSpecDigest: specDigest, OutputSlot: weights.OutputSlot,
 				WeightsTransactionId: weights.TransactionID, WeightsReceiptDigest: receiptDigest,
 				OperationId: operationID, GrantRevision: uint64(object.GrantRevision + 1)}
 			if decision.Held {
-				request.Decision = &pb.WeightsTransferRequest_Held{Held: &pb.WeightsObjectRef{
+				transfer.Decision = &pb.WeightsTransferRequest_Held{Held: &pb.WeightsObjectRef{
 					ObjectId: object.ObjectID, Length: uint64(decision.Length)}}
 			} else {
 				names := make([]string, 0, len(decision.Headers))
@@ -171,14 +175,17 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 				sort.Strings(names)
 				headers := make([]*pb.WeightsUploadHeader, 0, len(names))
 				for _, name := range names {
-					headers = append(headers, &pb.WeightsUploadHeader{Name: name, Value: decision.Headers[name]})
+					headers = append(headers, &pb.WeightsUploadHeader{Name: name,
+						Value: decision.Headers[name]})
 				}
-				request.Decision = &pb.WeightsTransferRequest_UploadGrant{UploadGrant: &pb.WeightsUploadGrant{
-					ObjectId: object.ObjectID, Length: uint64(decision.Length), Url: decision.URL,
-					RequiredHeaders: headers, ExpiresAtUnix: decision.ExpiresAtUnix}}
+				transfer.Decision = &pb.WeightsTransferRequest_UploadGrant{
+					UploadGrant: &pb.WeightsUploadGrant{
+						ObjectId: object.ObjectID, Length: uint64(decision.Length),
+						Url: decision.URL, RequiredHeaders: headers,
+						ExpiresAtUnix: decision.ExpiresAtUnix}}
 			}
 			session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_WeightsTransferRequest{
-				WeightsTransferRequest: request}})
+				WeightsTransferRequest: transfer}})
 		}
 		if wait := c.waitTransfer(ctx, weights.RequestID); wait != nil {
 			return wait
@@ -413,9 +420,9 @@ func (c *Orchestrator) finalizeModelTransfer(ctx context.Context, requestID stri
 	} else if problem = c.opt.Store.BeginModelTransferFinalization(requestID); problem == nil {
 		problem = c.opt.ModelTransfers.Finalize(ctx, requestID,
 			func(ctx context.Context, weights records.ModelTransferWeights, operationID string,
-				decisions []WeightsTransferDecision,
+				mint WeightsGrantMinter,
 			) *exit.Error {
-				return c.moveModelTransferWeights(ctx, weights, operationID, decisions)
+				return c.moveModelTransferWeights(ctx, weights, operationID, mint)
 			})
 	}
 	if problem != nil {
