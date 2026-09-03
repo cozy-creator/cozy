@@ -11,6 +11,9 @@
 //!
 //!   tfs store init|info <root>
 //!   tfs store rebuild <census> --rows <jsonl> [--sqlite <tensorfs.sqlite>]
+//!   tfs store admit-file <store> blob|manifest <id> <length> <source>
+//!   tfs repo-cache admit <cache> <store> blob|manifest <id> <length>
+//!   tfs repo-cache backfill <cache> <store> blob|manifest <id> <length>
 //!   tfs put <root> <file>        stream one object in (any shape)
 //!   tfs get <root> <hex>         verified read, whole or ranged
 //!   tfs contains <root> <hex>    the presence HINT, and what it is worth
@@ -94,6 +97,7 @@ use tensorfs_core::ingest::stamp::Stamp;
 use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerificationReceipt};
 use tensorfs_core::manifest::{Draft, Entry, Manifest};
 use tensorfs_core::registry;
+use tensorfs_core::repo_cache::{CacheKind, RepoObjectCache};
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::{Fault, Store, Verdict, FAULT_STAGES};
 
@@ -126,6 +130,15 @@ fn main() -> ExitCode {
         ["store", "init", r] => cmd_store(Path::new(r), "init"),
         ["store", "info", r] => cmd_store(Path::new(r), "info"),
         ["store", "rebuild", r] => repo::cmd_rebuild(Path::new(r), &flags),
+        ["store", "admit-file", store, kind, object, length, source] => {
+            cmd_store_admit_file(Path::new(store), kind, object, length, Path::new(source))
+        }
+        ["repo-cache", "admit", cache, store, kind, object, length] => {
+            cmd_repo_cache_admit(Path::new(cache), Path::new(store), kind, object, length)
+        }
+        ["repo-cache", "backfill", cache, store, kind, object, length] => {
+            cmd_repo_cache_backfill(Path::new(cache), Path::new(store), kind, object, length)
+        }
         ["put", r, f] => cmd_put(Path::new(r), Path::new(f), &flags),
         ["get", r, h] => cmd_get(Path::new(r), h, &flags),
         ["contains", r, h] => cmd_contains(Path::new(r), h),
@@ -253,6 +266,138 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn cache_args(kind: &str, object: &str, length: &str) -> TfsResult<(CacheKind, ObjectRef)> {
+    let kind = CacheKind::parse(kind).ok_or_else(|| Refusal {
+        code: tensorfs_core::err::Code::WRONG_TYPE,
+        detail: format!("repo cache kind {kind:?} is not blob or manifest"),
+    })?;
+    let sha256 = tensorfs_core::ids::hex64("repo cache object", object)?;
+    let length = length.parse::<u64>().map_err(|_| Refusal {
+        code: tensorfs_core::err::Code::NUMBER_RANGE,
+        detail: format!("repo cache length {length:?} is not an unsigned integer"),
+    })?;
+    Ok((kind, ObjectRef { sha256, length }))
+}
+
+fn cmd_repo_cache_admit(
+    cache: &Path,
+    store: &Path,
+    kind: &str,
+    object: &str,
+    length: &str,
+) -> ExitCode {
+    let (kind, object) = match cache_args(kind, object, length) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    let store = match Store::open(store) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    let status = match RepoObjectCache::new(cache).admit(&store, kind, &object) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    println!("{{\"status\":\"{}\"}}", status.as_str());
+    ExitCode::SUCCESS
+}
+
+fn cmd_repo_cache_backfill(
+    cache: &Path,
+    store: &Path,
+    kind: &str,
+    object: &str,
+    length: &str,
+) -> ExitCode {
+    let (kind, object) = match cache_args(kind, object, length) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    let store = match Store::open(store) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    let status = match RepoObjectCache::new(cache).backfill_store(&store, kind, &object) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    println!("{{\"status\":\"{}\"}}", status.as_str());
+    ExitCode::SUCCESS
+}
+
+fn cmd_store_admit_file(
+    store: &Path,
+    kind: &str,
+    object: &str,
+    length: &str,
+    source: &Path,
+) -> ExitCode {
+    let (kind, object) = match cache_args(kind, object, length) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    let store = match Store::open(store) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    let admitted = match kind {
+        CacheKind::Blob => match store.put_file(source, Some(&object), &Fault::default()) {
+            Ok(value) => value.admitted,
+            Err(error) => return bail(error),
+        },
+        CacheKind::Manifest => {
+            let metadata = match fs::metadata(source) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    return bail(Refusal {
+                        code: tensorfs_core::err::Code::IO_FAILED,
+                        detail: format!("stat {}: {error}", source.display()),
+                    })
+                }
+            };
+            if metadata.len() != object.length || object.length > Manifest::MAX_BYTES as u64 {
+                return bail(Refusal {
+                    code: tensorfs_core::err::Code::LENGTH_MISMATCH,
+                    detail: format!(
+                        "{} is {} bytes, expected {}",
+                        source.display(),
+                        metadata.len(),
+                        object.length
+                    ),
+                });
+            }
+            let bytes = match fs::read(source) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return bail(Refusal {
+                        code: tensorfs_core::err::Code::IO_FAILED,
+                        detail: format!("read {}: {error}", source.display()),
+                    })
+                }
+            };
+            let manifest = match Manifest::parse(&bytes) {
+                Ok(value) => value,
+                Err(error) => return bail(error),
+            };
+            if ObjectRef::of(&bytes) != object {
+                return bail(Refusal {
+                    code: tensorfs_core::err::Code::OBJECT_ID_MISMATCH,
+                    detail: format!("{} bytes disagree with {}", source.display(), object.id()),
+                });
+            }
+            match store.put_manifest(&manifest) {
+                Ok(value) => value.admitted,
+                Err(error) => return bail(error),
+            }
+        }
+    };
+    println!(
+        "{{\"status\":\"{}\"}}",
+        if admitted { "stored" } else { "present" }
+    );
+    ExitCode::SUCCESS
 }
 
 fn cmd_config_canonicalize(path: &Path, flags: &Flags) -> ExitCode {

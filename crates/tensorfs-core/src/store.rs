@@ -27,12 +27,12 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::ids::{hex64, Doc, ObjectRef};
 use crate::sha256::{self, Sha256};
 
-const BUF: usize = 1 << 20;
+pub(crate) const BUF: usize = 1 << 20;
 
 #[cfg(target_os = "linux")]
-const O_NOFOLLOW: i32 = 0o400_000;
+pub(crate) const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(target_os = "macos")]
-const O_NOFOLLOW: i32 = 0x0100;
+pub(crate) const O_NOFOLLOW: i32 = 0x0100;
 
 fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
     Refusal {
@@ -1175,13 +1175,13 @@ fn read_dir(p: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-fn fsync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
     File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| io(format!("fsync dir {}", dir.display()), e))
 }
 
-fn now_nanos_unique() -> u128 {
+pub(crate) fn now_nanos_unique() -> u128 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     SystemTime::now()

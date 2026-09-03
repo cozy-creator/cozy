@@ -30,6 +30,7 @@ pub mod read;
 pub mod receipt;
 pub mod registry;
 pub mod relation;
+pub mod repo_cache;
 pub mod repository;
 pub mod sha256;
 pub mod spec;

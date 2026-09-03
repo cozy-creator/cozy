@@ -25,6 +25,40 @@ A writable local TensorFS root has exactly one host owner. SQLite/advisory locks
 processes on that host; they are not a cross-host lock service and must not sit on NFS as shared
 mutation authority. Multi-host publication and GC use Tensorhub's R2/PostgreSQL control plane.
 
+Workers may additionally use a caller-selected root (for example,
+`/workspace/cozy/repo-cache`) as an optional datacenter cache. The example path is deployment
+policy, not part of the TensorFS format. The cache is not a TensorFS Store and contains only
+immutable repository objects:
+
+```text
+blobs/<first-2-hex>/<next-2-hex>/<64-lowercase-hex>
+manifests/<first-2-hex>/<next-2-hex>/<64-lowercase-hex>.json
+```
+
+There is no SQLite file, repository projection, lease, operation, verification authority, or GC
+in that cache. Every hit is checked against an exact SHA-256 and length while TensorFS copies it
+directly into the ordinary local Store. Missing, corrupt,
+read-only, full, and unavailable cache states are soft misses; the authenticated cloud source
+remains authoritative. Cloud-success backfill uses a hidden unique sibling, fsync, and an atomic
+no-clobber link, so concurrent writers converge and an interrupted write never has a final name.
+An existing corrupt final entry is never overwritten: it remains a soft miss until an operator
+deletes that exact cache object, after which the next successful backfill repairs it. This explicit
+drop is intentional; the cache has no independent repair authority or garbage collector.
+
+Cache calls perform synchronous filesystem I/O and must run on a worker data path or subprocess,
+never its control loop. A mounted filesystem which stops responding cannot provide a timely soft
+miss from inside the blocked syscall, so subprocess progress/termination and live hung-mount proof
+remain the supervisor's responsibility.
+
+The supervisor subprocess seam emits exactly one JSON record and exits successfully for cache
+weather:
+
+```bash
+tfs store admit-file <store> blob|manifest <sha256> <length> <source>
+tfs repo-cache admit <cache> <store> blob|manifest <sha256> <length>
+tfs repo-cache backfill <cache> <store> blob|manifest <sha256> <length>
+```
+
 Three schemas are STORED — written to a path, digested, and identified by their exact bytes:
 
 1. Repository JSON, typed by `repos/`.
