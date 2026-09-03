@@ -290,6 +290,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		AcceleratorModel: remote.AcceleratorModel, HourlyRateUSDMicros: remote.HourlyRateUSDMicros,
 		ManagedRequestID: managedRequestID, State: remote.State, Hub: c.Base(),
 	}
+	copyRentalFailure(&row, remote)
 	stored, problem := st.RentalRow(remote.ID)
 	if problem != nil {
 		return records.Rental{}, hub.Rental{}, false, problem
@@ -328,6 +329,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		row.Address, row.State = seen.Address, seen.State
 		row.MediaAddress = seen.MediaAddress
 		row.ExpectedWorkerID, row.ExpectedWorkerBootID = seen.WorkerID, seen.WorkerBootID
+		copyRentalFailure(&row, seen)
 		if e := st.RecordRental(row); e != nil {
 			return e
 		}
@@ -463,10 +465,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 		case done(r):
 			return r, nil
 		case r.State == hub.RentalFailed:
-			return hub.Rental{}, exit.New(exit.Failed,
-				"rental %s failed to provision: %s", id, detailOr(r.Detail)).
-				WithRemedy("the pod is the hub's to reclaim; `cozy rental end %s` closes it out", id).
-				WithNext("cozy rental end " + id)
+			return hub.Rental{}, rentalProvisionFailure(id, r)
 		case r.State == hub.RentalDegraded:
 			return hub.Rental{}, exit.New(exit.Failed,
 				"rental %s is degraded: %s", id, detailOr(r.Detail)).
@@ -520,6 +519,32 @@ func detailOr(detail string) string {
 		return "the hub gave no detail"
 	}
 	return detail
+}
+
+func rentalFailureCode(r hub.Rental) string {
+	if r.Failure != nil && r.Failure.Code != "" {
+		return r.Failure.Code
+	}
+	return "rental.provision_failed"
+}
+
+func rentalProvisionFailure(id string, r hub.Rental) *exit.Error {
+	return exit.Named(exit.Failed, rentalFailureCode(r),
+		"rental %s failed to provision: %s", id, detailOr(r.Detail)).
+		WithRemedy("the pod is the hub's to reclaim; `cozy rental end %s` closes it out", id).
+		WithNext("cozy rental end " + id)
+}
+
+func copyRentalFailure(row *records.Rental, remote hub.Rental) {
+	if remote.Failure == nil || remote.Failure.Code == "" {
+		return
+	}
+	row.Failure = records.RentalFailure{
+		Code: remote.Failure.Code, BaseWorkerImageDigest: remote.Failure.BaseWorkerImageDigest,
+		Provider: remote.Failure.Provider, ProviderResourceID: remote.Failure.ProviderResourceID,
+		ProviderHostID: remote.Failure.ProviderHostID, ProviderState: remote.Failure.ProviderState,
+		ContainerState: remote.Failure.ContainerState,
+	}
 }
 
 // missingOf names the first piece a `ready` rental did not carry. The hub never carries
@@ -620,16 +645,19 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 	list := output.List{
 		Name:   "rentals",
 		Fields: []string{"machine", "sku", "state", "uptime", "running", "queued", "idle"},
-		AllFields: []string{"machine", "sku", "state", "uptime", "running", "queued", "idle",
+		AllFields: []string{"machine", "sku", "state", "failure", "uptime", "running", "queued", "idle",
 			"rental", "accelerator", "address", "media", "hub", "rented", "ready",
-			"idle_since", "release_due"},
+			"idle_since", "release_due", "image", "provider", "provider resource",
+			"provider host", "provider state", "container state"},
 		// The machine document carries the underlying facts, never the table's
 		// spellings: counts as numbers, moments as timestamps, absences omitted.
 		TypedFields: []string{"machine", "sku", "state", "rental_id", "rented_at",
 			"running", "queued", "idle_s", "release_due_at"},
 		TypedAllFields: []string{"machine", "sku", "state", "rental_id", "accelerator",
 			"address", "media_address", "hub", "rented_at", "ready_at", "running",
-			"queued", "idle_s", "idle_since_at", "release_due_at", "hourly_rate_usd_micros"},
+			"queued", "idle_s", "idle_since_at", "release_due_at", "hourly_rate_usd_micros",
+			"failure_code", "base_worker_image_digest", "provider", "provider_resource_id",
+			"provider_host_id", "provider_state", "container_state"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		Lead: []string{fmt.Sprintf("Remote machines running: %d", count),
 			"Current spend per hour: " + usdPerHourBare(burn)},
@@ -638,6 +666,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		Trail: []string{idleShutdownNote(grace)},
 		Next:  []string{"cozy help rental new"},
 	}
+	haveFailure := false
 	for _, r := range rows {
 		idle, problem := observeRentalIdle(st, r)
 		if problem != nil {
@@ -650,13 +679,16 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		}
 		list.Rows = append(list.Rows, map[string]string{
 			"machine": r.MachineName, "sku": orNone(r.SKU),
-			"state": r.State, "uptime": rentalUptime(r.RentedAt),
+			"state": r.State, "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
 			"running": strconv.Itoa(idle.Running), "queued": strconv.Itoa(idle.Queued),
 			"idle":   idleCell(idle, grace),
 			"rental": r.ID, "accelerator": r.AcceleratorModel,
 			"address": r.Address, "media": r.MediaAddress, "hub": r.Hub,
 			"rented": stamp(r.RentedAt), "ready": orNone(stamp(r.ReadyAt)),
 			"idle_since": idleSince, "release_due": releaseDue,
+			"image": r.Failure.BaseWorkerImageDigest, "provider": r.Failure.Provider,
+			"provider resource": r.Failure.ProviderResourceID, "provider host": r.Failure.ProviderHostID,
+			"provider state": r.Failure.ProviderState, "container state": r.Failure.ContainerState,
 		})
 		typed := map[string]any{
 			"machine": r.MachineName, "state": r.State, "rental_id": r.ID,
@@ -674,7 +706,19 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		if eligible {
 			typed["idle_s"] = int64(time.Since(idle.Since).Seconds())
 		}
+		if r.Failure.Code != "" {
+			haveFailure = true
+			typed["failure_code"] = r.Failure.Code
+			typed["base_worker_image_digest"], typed["provider"] = r.Failure.BaseWorkerImageDigest, r.Failure.Provider
+			typed["provider_resource_id"], typed["provider_host_id"] = r.Failure.ProviderResourceID, r.Failure.ProviderHostID
+			typed["provider_state"], typed["container_state"] = r.Failure.ProviderState, r.Failure.ContainerState
+		}
 		list.TypedRows = append(list.TypedRows, typed)
+	}
+	if haveFailure {
+		list.Fields = []string{"machine", "sku", "state", "failure", "uptime", "running", "queued", "idle"}
+		list.TypedFields = []string{"machine", "sku", "state", "rental_id", "rented_at",
+			"running", "queued", "idle_s", "release_due_at", "failure_code"}
 	}
 	if len(list.Rows) > 0 {
 		list.Next = []string{"cozy rental end " + list.Rows[0]["machine"]}

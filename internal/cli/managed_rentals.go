@@ -511,6 +511,7 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 			problem = exit.New(exit.NotFound, "rental released")
 		case observed == nil:
 			row.State = remote.State
+			copyRentalFailure(row, remote)
 			if update := m.store.RecordRental(*row); update != nil {
 				return "", update
 			}
@@ -581,6 +582,7 @@ func (m *managedRentals) reconcileLocked() *exit.Error {
 			continue
 		}
 		row.State = remote.State
+		copyRentalFailure(&row, remote)
 		if problem := m.store.RecordRental(row); problem != nil {
 			return problem
 		}

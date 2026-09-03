@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -89,4 +90,114 @@ func TestRentalLadderRendersTheTotalDecomposed(t *testing.T) {
 		}
 	}
 	hub.close()
+}
+
+// A confirmed pre-readiness container exit is a terminal rental diagnosis, not
+// a hidden Hub detail. The human list names the code and JSON retains the
+// bounded structured facts the Hub supplied.
+func TestRentalListingShowsStructuredBootFailure(t *testing.T) {
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-boot-failure")
+	must(t, os.RemoveAll(root))
+	must(t, os.MkdirAll(root, 0o755))
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	port := reservePort(t)
+	hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
+		"tensorhub_url: "+hubURL+"\n"+
+			"tensorhub_token: rental-idle-test\n"+
+			"rentals:\n  max_hourly_spend_usd: 10.00\n"), 0o600))
+
+	hubServer := newFakeRentalHub(t, port)
+	hubServer.add("pr-boot-failed", "yuzuriha")
+	hubServer.mu.Lock()
+	hubServer.rentals["pr-boot-failed"]["state"] = "failed"
+	hubServer.rentals["pr-boot-failed"]["detail"] = "container_exited_before_readiness"
+	hubServer.rentals["pr-boot-failed"]["failure"] = map[string]any{
+		"code":                     "container_exited_before_readiness",
+		"base_worker_image_digest": "sha256:" + strings.Repeat("a", 64),
+		"provider":                 "runpod", "provider_resource_id": "nuowj42m20y65g",
+		"provider_host_id": "host-7", "provider_state": "running", "container_state": "exited",
+	}
+	hubServer.mu.Unlock()
+
+	store, problem := records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	fatal(t, store.RecordRental(records.Rental{
+		ID: "pr-boot-failed", MachineName: "yuzuriha", SKU: "gpu-cu130",
+		AcceleratorModel: "L4", HourlyRateUSDMicros: 100_000,
+		State: "booting", Hub: hubURL,
+	}))
+	store.Close()
+
+	code, human := runCozy(t, root, "rental")
+	if code != 0 || !strings.Contains(human, "container_exited_before_readiness") {
+		t.Fatalf("human rental list hid the boot failure [exit %d]:\n%s", code, human)
+	}
+	code, raw := runCozy(t, root, "rental", "--full", "--json")
+	var listed struct {
+		Rentals []struct {
+			State                 string `json:"state"`
+			Failure               string `json:"failure_code"`
+			BaseWorkerImageDigest string `json:"base_worker_image_digest"`
+			Provider              string `json:"provider"`
+			ProviderResourceID    string `json:"provider_resource_id"`
+			ProviderHostID        string `json:"provider_host_id"`
+			ProviderState         string `json:"provider_state"`
+			ContainerState        string `json:"container_state"`
+		} `json:"rentals"`
+	}
+	if code != 0 || json.Unmarshal([]byte(raw), &listed) != nil || len(listed.Rentals) != 1 {
+		t.Fatalf("typed rental list is unreadable [exit %d]:\n%s", code, raw)
+	}
+	row := listed.Rentals[0]
+	if row.State != "failed" || row.Failure != "container_exited_before_readiness" ||
+		row.BaseWorkerImageDigest != "sha256:"+strings.Repeat("a", 64) ||
+		row.Provider != "runpod" || row.ProviderResourceID != "nuowj42m20y65g" ||
+		row.ProviderHostID != "host-7" || row.ProviderState != "running" ||
+		row.ContainerState != "exited" {
+		t.Fatalf("typed rental failure lost facts: %+v", listed.Rentals[0])
+	}
+	persisted, problem := records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	stored, problem := persisted.RentalRow("pr-boot-failed")
+	fatal(t, problem)
+	if stored == nil || stored.Failure.ProviderResourceID != "nuowj42m20y65g" {
+		t.Fatalf("local records lost the terminal diagnosis: %+v", stored)
+	}
+	changed := *stored
+	changed.Failure.ProviderResourceID = "another-pod"
+	if problem := persisted.RecordRental(changed); problem == nil || problem.ErrName() != "rental.attach_projection_conflict" {
+		t.Fatalf("a changed terminal diagnosis was not refused: %v", problem)
+	}
+	persisted.Close()
+
+	// The same diagnosis also remains the machine-stable error of a rental
+	// acquisition, which is the error a managed run records when its buy fails.
+	hubServer.setSKUs(map[string]any{
+		"name": "l4", "accelerator_model": "NVIDIA L4", "accelerator_count": 1,
+		"base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86", "compute_capability": "8.9",
+		"vram_gb": 24, "minimum_ram_per_gpu_gb": 64, "price_usd_micros_per_hour": 100_000,
+	})
+	hubServer.mu.Lock()
+	hubServer.rent = func(request map[string]any) map[string]any {
+		return map[string]any{
+			"rental_id": "pr-new-boot-failed", "name": request["name"], "state": "failed",
+			"requested_accelerator_model": "NVIDIA L4", "hourly_rate_usd_micros": 100_000,
+			"detail": "container_exited_before_readiness",
+			"failure": map[string]any{"code": "container_exited_before_readiness",
+				"base_worker_image_digest": "sha256:" + strings.Repeat("a", 64),
+				"provider":                 "runpod", "provider_resource_id": "pod-new",
+				"provider_host_id": "host-new", "provider_state": "running", "container_state": "exited"},
+		}
+	}
+	hubServer.mu.Unlock()
+	code, raw, _ = runCozyStreams(t, root, "rental", "new", "l4", "--json")
+	var failed struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(raw), &failed) != nil || code == 0 || failed.Error.Code != "container_exited_before_readiness" {
+		t.Fatalf("rental acquisition lost the typed boot failure [exit %d]:\n%s", code, raw)
+	}
 }

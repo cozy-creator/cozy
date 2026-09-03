@@ -14,7 +14,7 @@ import (
 // DDL, dumped from that schema's own sqlite_master and checked in beside this test — and
 // proves the schema-12 rename, the schema-13 rental column, the schema-14 export table,
 // the schema-15 request column spelling, schema-17 machine-word backfill, and schema-20
-// package-interface/digest cleanup carried
+// package-interface/digest cleanup and schema-21 rental failure fields carried
 // their rows. The owner's
 // machine holds one of these, so the property under test is not "a fresh database has the
 // new names" but "an existing database keeps its installs, pins, workers, requests and
@@ -67,7 +67,7 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 20 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 21 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	// The request keeps the schema-15 local_package spelling, schema 17 records
@@ -97,6 +97,11 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	if columns := columnNames(t, db, "installs"); !columns["package_interface"] || columns["package_descriptor"] {
 		t.Fatalf("installs columns after migration = %v", columns)
+	}
+	if columns := columnNames(t, db, "rentals"); !columns["failure_code"] ||
+		!columns["failure_image_digest"] || !columns["failure_provider_resource_id"] ||
+		!columns["failure_provider_host_id"] || !columns["failure_container_state"] {
+		t.Fatalf("rental failure columns after migration = %v", columns)
 	}
 	var tables int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
