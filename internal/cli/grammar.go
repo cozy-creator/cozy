@@ -351,6 +351,7 @@ func (c *RunWatchCmd) Run(r *Runtime) error {
 
 type RentalCmd struct {
 	Current RentalListCmd `cmd:"" default:"1" hidden:""`
+	List    RentalListCmd `cmd:"" help:"List rented machines, live on a terminal."`
 	New     RentalNewCmd  `cmd:"" help:"Start a private rental."`
 	End     RentalEndCmd  `cmd:"" help:"End a private rental and stop billing."`
 }
@@ -374,10 +375,13 @@ func (c *RentalEndCmd) Run(r *Runtime) error {
 	return r.call(handleRentRelease, []string{c.ID}, nil, nil, true)
 }
 
-type RentalListCmd struct{}
+type RentalListCmd struct {
+	Watch   bool `help:"Refresh continuously (requires a terminal)."`
+	NoWatch bool `help:"Print one snapshot even in a terminal."`
+}
 
 func (c *RentalListCmd) Run(r *Runtime) error {
-	return r.call(handleRentLs, nil, nil, nil, false)
+	return r.call(handleRentalList, nil, bools("--watch", c.Watch, "--no-watch", c.NoWatch), nil, false)
 }
 
 type VolumeCmd struct {

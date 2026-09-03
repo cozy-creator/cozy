@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -84,8 +85,10 @@ func TestRentalIdleRelease(t *testing.T) {
 		t.Fatalf("the hub saw a release of a busy rental\n%s", tail(logPath))
 	}
 	code, out := runCozy(t, root, "rental")
-	if code != 0 || !strings.Contains(out, "busy") || !strings.Contains(out, "when idle for 2s") {
-		t.Fatalf("the listing does not show the busy rental's idle clock [exit %d]\n%s", code, out)
+	busyRow := regexp.MustCompile(`otter\s+cpu\s+ready\s+\S+\s+0\s+1\s+-`)
+	if code != 0 || !busyRow.MatchString(out) ||
+		!strings.Contains(out, "Idle machines shut down after 2 seconds.") {
+		t.Fatalf("the listing does not show the queued work holding the rental [exit %d]\n%s", code, out)
 	}
 	if r := daemon.call(t, "POST", "/v1/requests/req-rental-idle/cancel", nil); r.Status != http.StatusOK {
 		t.Fatalf("cancel of the queued request: %s", r.brief())
@@ -120,8 +123,9 @@ func TestRentalIdleRelease(t *testing.T) {
 		t.Fatalf("the hub saw a release of an owed rental\n%s", tail(logPath))
 	}
 	code, out = runCozy(t, root, "rental")
-	if code != 0 || !strings.Contains(out, "busy") {
-		t.Fatalf("the listing does not show the owed rental as busy [exit %d]\n%s", code, out)
+	owedRow := regexp.MustCompile(`curlew\s+cpu\s+ready\s+\S+\s+0\s+0\s+-`)
+	if code != 0 || !owedRow.MatchString(out) {
+		t.Fatalf("the listing shows an idle countdown on an owed rental [exit %d]\n%s", code, out)
 	}
 	if r := daemon.call(t, "POST", "/v1/requests/req-rental-owed/cancel", nil); r.Status != http.StatusOK {
 		t.Fatalf("cancel of the owing request: %s", r.brief())
