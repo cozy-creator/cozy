@@ -95,7 +95,7 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 	// ONE window for the whole walk. It outlives the loop below on purpose: a grant minted
 	// on an earlier pass is reused while it is young and re-minted once it is not, which is
 	// what stops a re-send from carrying a signature that has gone cold.
-	window := &grantWindow{mint: mint}
+	window := NewWeightsGrantWindow(mint)
 	for {
 		objects, problem := c.opt.Store.ModelTransferObjects(weights.RequestID,
 			weights.Attempt, weights.OutputSlot)
@@ -127,7 +127,7 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 						"worker weights transfer %s failed (%s): %s", object.ObjectID,
 						object.SafeCode, object.SafeDetail)
 				}
-				window.expire()
+				window.Expire()
 			}
 			outstanding = append(outstanding, object)
 		}
@@ -156,7 +156,7 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 		for index, object := range outstanding {
 			// The grant is obtained HERE, immediately before this object's bytes are asked
 			// for, rather than for the whole batch before any of them moved.
-			decision, problem := window.spendable(ctx, object.ObjectID, ids[index:], time.Now())
+			decision, problem := window.Spendable(ctx, object.ObjectID, ids[index:], time.Now())
 			if problem != nil {
 				return problem
 			}

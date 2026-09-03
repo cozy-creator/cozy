@@ -343,7 +343,7 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	// protocol changed -- the hub always re-minted for a still-claimed object.
 	if opened.Publication.State == "open" {
 		if problem := mover(ctx, weights, operation,
-			func(ctx context.Context, objectIDs []string) (orchestrator.WeightsGrantWindow, *exit.Error) {
+			func(ctx context.Context, objectIDs []string) (orchestrator.WeightsGrantMint, *exit.Error) {
 				return mintWeightsGrants(ctx, publicationClient, ref, operation, intent, objectIDs)
 			}); problem != nil {
 			return "", problem
@@ -368,8 +368,8 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 // only place that knows which object is about to move is the walk.
 func mintWeightsGrants(ctx context.Context, client *hub.Client, ref hub.Ref, operation string,
 	intent records.ModelTransferIntent, objectIDs []string,
-) (orchestrator.WeightsGrantWindow, *exit.Error) {
-	var window orchestrator.WeightsGrantWindow
+) (orchestrator.WeightsGrantMint, *exit.Error) {
+	var window orchestrator.WeightsGrantMint
 	granted, problem := client.GrantKnownTransfers(ctx, ref, operation, objectIDs,
 		"cozy model upload "+intent.Source+" "+intent.Destination)
 	if problem != nil {
