@@ -154,6 +154,7 @@ pub fn cmd_complete(root: &Path, plan_p: &Path) -> ExitCode {
 
 // ---------------------------------------------------------------- the one transport (tfs-050)
 
+use tensorfs_core::providers::{self, Endpoints, SourceUri};
 use tensorfs_core::transport::{
     self, credential_from_spec, Anonymous, Deadline, PullRequest, SourcePolicy,
 };
@@ -381,5 +382,115 @@ pub fn cmd_push(root: &Path, id: &str, flags: &Flags) -> ExitCode {
             ""
         }
     );
+    ExitCode::SUCCESS
+}
+
+fn source_setup(
+    uri: &str,
+    flags: &Flags,
+) -> Result<
+    (
+        SourceUri,
+        Endpoints,
+        tensorfs_core::transport::ScopedHeaders,
+    ),
+    ExitCode,
+> {
+    let uri = match SourceUri::parse(uri) {
+        Ok(parsed) => parsed,
+        Err(refusal) => {
+            eprintln!("REFUSED {refusal}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let mut endpoints = Endpoints {
+        allow_local: crate::flag_on(flags, "allow-local"),
+        ..Endpoints::default()
+    };
+    if let Some(base) = flag(flags, "api") {
+        match uri {
+            SourceUri::HuggingFace { .. } => endpoints.huggingface = base.to_string(),
+            SourceUri::Civitai { .. } => endpoints.civitai = base.to_string(),
+        }
+    }
+    // The credential is scoped to the provider's own API host: a resolve/download
+    // redirect onto a delivery host deliberately presents nothing.
+    let api_host = match tensorfs_core::transport::base_host(match uri {
+        SourceUri::HuggingFace { .. } => &endpoints.huggingface,
+        SourceUri::Civitai { .. } => &endpoints.civitai,
+    }) {
+        Ok(host) => host,
+        Err(refusal) => {
+            eprintln!("REFUSED {refusal}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let credential = credential_of(flags, vec![api_host])?;
+    Ok((uri, endpoints, credential))
+}
+
+/// `tfs source list <uri>` — what one pinned foreign source reaches, as the provider
+/// declares it (tfs-052). No store, no bytes moved.
+pub fn cmd_source_list(uri: &str, flags: &Flags) -> ExitCode {
+    let (uri, endpoints, credential) = match source_setup(uri, flags) {
+        Ok(setup) => setup,
+        Err(code) => return code,
+    };
+    let members = ok!(providers::list(
+        &uri,
+        &endpoints,
+        &credential,
+        deadline_of(flags)
+    ));
+    for member in &members {
+        println!(
+            "{}  {}  {}",
+            match &member.sha256 {
+                Some(sha256) => format!("sha256:{sha256}"),
+                None => format!("{:>71}", "(provider declares no digest)"),
+            },
+            match member.length {
+                Some(length) => format!("{length:>14} B"),
+                None => format!("{:>16}", "?"),
+            },
+            member.member
+        );
+    }
+    println!("members      {}", members.len());
+    ExitCode::SUCCESS
+}
+
+/// `tfs source pull <root> <uri>` — fetch and ingest one pinned foreign source through
+/// the plan/transport/put_stream path (tfs-052). Held members move nothing.
+pub fn cmd_source_pull(root: &Path, uri: &str, flags: &Flags) -> ExitCode {
+    let (uri, endpoints, credential) = match source_setup(uri, flags) {
+        Ok(setup) => setup,
+        Err(code) => return code,
+    };
+    let store = ok!(Store::open(root));
+    let pulled = ok!(providers::pull(
+        &store,
+        &uri,
+        &endpoints,
+        &credential,
+        deadline_of(flags),
+        &mut |_, _| {},
+    ));
+    let mut transferred = 0u64;
+    let mut held = 0usize;
+    for row in &pulled {
+        transferred += row.transferred;
+        held += usize::from(row.held);
+        println!(
+            "{}  {}  {} B {}",
+            if row.held { "held    " } else { "admitted" },
+            row.object.id(),
+            row.object.length,
+            row.member
+        );
+    }
+    println!("members      {}", pulled.len());
+    println!("held         {held} member(s) — NOT fetched");
+    println!("transferred  {transferred} B");
     ExitCode::SUCCESS
 }

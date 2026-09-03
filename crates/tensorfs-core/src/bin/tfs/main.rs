@@ -37,6 +37,8 @@
 //!   tfs fetch plan-objects <root> <session> --refs <jsonl>   HELD/WANTED, no manifest
 //!   tfs fetch url <root> <sha256> <length> <url|->           one granted object
 //!   tfs push <root> <sha256> --url <presigned|-> [--manifest] [--content-type ct]
+//!   tfs source list <hf://org/repo@rev | civitai://id> [--api <base>]  provider listing
+//!   tfs source pull <root> <uri> [--api <base>] [--allow-local]        tfs-052 handlers
 //!   tfs bench-store <root>       put/read/range/rehash throughput + peak RSS
 //!
 //! Qualification (tfs-008): what an (encoding, device) pair is QUALIFIED to execute.
@@ -280,6 +282,8 @@ fn main() -> ExitCode {
         ["fetch", "admit", r, p, i] => fetch::cmd_admit(Path::new(r), Path::new(p), i, &flags),
         ["fetch", "complete", r, p] => fetch::cmd_complete(Path::new(r), Path::new(p)),
         ["fetch", "url", r, i, l, u] => fetch::cmd_url(Path::new(r), i, l, u, &flags),
+        ["source", "list", u] => fetch::cmd_source_list(u, &flags),
+        ["source", "pull", r, u] => fetch::cmd_source_pull(Path::new(r), u, &flags),
         ["fetch", sub, _t]
             if ["plan", "plan-objects", "admit", "complete", "url"].contains(sub) =>
         {
