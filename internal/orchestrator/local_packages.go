@@ -798,7 +798,7 @@ func (c *Orchestrator) issueLocalPackageSet(s *session, w *worker,
 }
 
 // ConvergePrivatePlacement binds exact downloaded models to code already admitted under one
-// local revision. Creator signs logical refs only; Runtime authors the joined PlacementSet.
+// local revision. Creator names logical refs only; Runtime authors the joined PlacementSet.
 func (c *Orchestrator) ConvergePrivatePlacement(instanceID, operationID,
 	localRevisionDigest string, models []*pb.DownloadModelRef,
 ) *exit.Error {
@@ -887,7 +887,6 @@ func clonePrivatePlacementSet(in *pb.DesiredPrivatePlacementSet) *pb.DesiredPriv
 		return nil
 	}
 	return &pb.DesiredPrivatePlacementSet{OperationId: in.OperationId,
-		LocalRevisionDigest:         append([]byte(nil), in.LocalRevisionDigest...),
-		DownloadDelegation:          append([]byte(nil), in.DownloadDelegation...),
-		DownloadDelegationSignature: append([]byte(nil), in.DownloadDelegationSignature...)}
+		LocalRevisionDigest: append([]byte(nil), in.LocalRevisionDigest...),
+		DownloadDelegation:  append([]byte(nil), in.DownloadDelegation...)}
 }

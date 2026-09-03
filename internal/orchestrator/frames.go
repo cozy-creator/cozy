@@ -73,9 +73,10 @@ func (c *Orchestrator) ConvergePlacementSet(instanceID string, placements []Desi
 	return c.converge(s, w, placements)
 }
 
-// ConvergePackageSet sends Creator's signed logical package/model authority to a
-// private pod. The refs never pass through PlacementSet or local platform resolution;
-// pod-supervisor verifies the signature and resolves downloads.
+// ConvergePackageSet sends Creator's logical package/model selection to a private pod.
+// It is desired state and nothing else -- there is nothing to verify (owner ruling
+// 2026-09-03). The refs never pass through PlacementSet or local platform resolution;
+// pod-supervisor resolves the downloads.
 func (c *Orchestrator) ConvergePackageSet(instanceID string, packages []*pb.DownloadPackageRef,
 	models []*pb.DownloadModelRef) *exit.Error {
 	c.mu.Lock()
