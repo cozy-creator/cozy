@@ -2236,8 +2236,9 @@ pub fn fetch_complete_cozytensors(py: Python<'_>, store: &PyStore, plan: &[u8]) 
 /// plan against the real store, presign for exactly `wanted`, the 16-way walk, and the
 /// completion proof, all in the compiled core.
 ///
-/// `credential` is the one spelling (`bearer <token>` | `delegation <payload> <sig>` |
-/// empty), scoped to the hub's host. `timeout` is the caller's deadline or None for none —
+/// `credential` is the one spelling (`bearer <token>`, or empty for anonymous — which is
+/// what a rented pod uses, the hub's closure and presign routes taking no credential),
+/// scoped to the hub's host. `timeout` is the caller's deadline or None for none —
 /// nothing below invents a number of seconds. `sample_seconds` is the liveness ledger's
 /// RESOLUTION (configuration, never a verdict); leave it defaulted outside tests.
 #[pyfunction]
