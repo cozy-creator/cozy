@@ -462,6 +462,59 @@ fn cold_pull_lands_and_warm_pull_moves_nothing() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A pull leaves a Store that can ANSWER for what it holds, and whose contents are not
+/// garbage. The closure carries model/release/lane for the local index row; nothing wrote
+/// it, so a pod that had just fetched a checkpoint refused `REPOSITORY_ABSENT` when it
+/// resolved the release, and `gc_plan` — which seeds liveness from `repos/` alone — planned
+/// the whole freshly-admitted closure for deletion.
+#[test]
+fn pull_records_the_release_it_resolved() {
+    let root = temporary("pull-records");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(3, 8 * 1024));
+    let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = SourcePolicy::default();
+    let report = pull(&request_for(&store, &origin.base, &policy)).unwrap();
+
+    let repo = crate::repository::RepositoryName::new("acme", "model").unwrap();
+    let recorded = crate::repository::Repository::parse(
+        &std::fs::read(store.repository_path(&repo)).expect("the pull recorded no repository"),
+    )
+    .unwrap();
+    let release = recorded
+        .releases
+        .iter()
+        .find(|release| release.version == report.release)
+        .expect("the pull recorded no release");
+    let lane = release
+        .lanes
+        .iter()
+        .find(|lane| lane.lane == report.lane)
+        .expect("the pull recorded no lane");
+    assert_eq!(lane.manifest, checkpoint.manifest);
+    assert!(recorded
+        .checkpoints
+        .iter()
+        .any(|entry| entry.manifest == checkpoint.manifest));
+
+    // THE SILENT HALF: liveness is computed from `repos/`, so an unrecorded pull leaves
+    // every object it just admitted collectable.
+    let census = crate::storage::Census::open(&root).unwrap();
+    assert!(
+        census.gc_plan(&[]).unwrap().is_empty(),
+        "a recorded pull still planned its own closure for deletion"
+    );
+
+    // A warm re-pull records the same row again without conflicting on it.
+    pull(&request_for(&store, &origin.base, &policy)).unwrap();
+    let again =
+        crate::repository::Repository::parse(&std::fs::read(store.repository_path(&repo)).unwrap())
+            .unwrap();
+    assert_eq!(again.checkpoints.len(), 1);
+    assert_eq!(again.releases.len(), 1);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn corrupt_object_heals_into_wanted_and_refetches() {
     let root = temporary("heal");
