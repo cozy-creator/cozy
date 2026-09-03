@@ -152,7 +152,7 @@ type ModelTransferOwner interface {
 }
 
 type ModelTransferMover func(context.Context, records.ModelTransferWeights,
-	string, []WeightsTransferDecision) *exit.Error
+	string, WeightsGrantMinter) *exit.Error
 
 // Launcher resolves a package ref along the two boundaries #484 split: the
 // platform-neutral desired placement and the local target-environment launch. A connected

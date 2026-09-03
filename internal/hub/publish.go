@@ -73,8 +73,11 @@ type Grant struct {
 	ObjectID string            `json:"object_id"`
 	Length   int64             `json:"length"`
 	URL      string            `json:"url"`
-	Expires  string            `json:"expires_at"`
 	Headers  map[string]string `json:"required_headers"`
+	// ExpiresAtUnix is when the STORE stops honouring this signature, on the hub's clock.
+	// It is only meaningful beside GrantResponse.ServerTimeUnix: the difference is the life
+	// the hub signed for, and a client that has spent half of it asks for a new grant.
+	ExpiresAtUnix int64 `json:"expires_at_unix"`
 }
 
 // HeldTransfer is Tensorhub's current durable transfer-row projection. Grants
@@ -91,6 +94,10 @@ type HeldTransfer struct {
 type GrantResponse struct {
 	Grants []Grant        `json:"grants"`
 	Held   []HeldTransfer `json:"held"`
+	// ServerTimeUnix is the signer's own now. Staleness is measured against it and never
+	// against the local clock, so skew between this daemon and the hub cannot misjudge
+	// how much of a grant is left.
+	ServerTimeUnix int64 `json:"server_time_unix"`
 }
 
 // GrantKnownTransfers asks for one bounded transfer batch immediately before its
