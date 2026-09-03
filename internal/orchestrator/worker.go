@@ -274,7 +274,7 @@ type WorkerLaunchSpec struct {
 	GraceSec          float64      `json:"grace_sec"`
 	Warmup            WarmupPolicy `json:"warmup,omitempty"`
 	ArtifactCache     string       `json:"artifact_cache,omitempty"`
-	EnvironmentRoot   string       `json:"environment_root,omitempty"`
+	InstallRoot       string       `json:"install_root,omitempty"`
 	EnvironmentPython string       `json:"environment_python,omitempty"` // preinstalled package venv
 	ArtifactStore     string       `json:"artifact_store,omitempty"`
 	// Placement is what this worker is launched to host. LAUNCH CLAMPS THE SET TO ONE
@@ -1156,7 +1156,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	)
 	for _, option := range []struct{ flag, value string }{
 		{"--artifact-cache", spec.ArtifactCache},
-		{"--environment-root", spec.EnvironmentRoot},
+		{"--install-root", spec.InstallRoot},
 		{"--environment-python", spec.EnvironmentPython},
 		{"--artifact-store", spec.ArtifactStore},
 	} {
