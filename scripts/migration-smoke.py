@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import sqlite3
@@ -115,11 +116,46 @@ def main() -> int:
         repo_path.write_bytes(repository)
         connection = sqlite3.connect(root / "tensorfs.sqlite")
         connection.execute("PRAGMA user_version=1")
+        connection.execute(
+            "CREATE TABLE tensorfs_derived_transactions "
+            "(id TEXT PRIMARY KEY, bytes BLOB NOT NULL) STRICT"
+        )
+        historical = (
+            ("sha256:" + "11" * 32, canonical({"state": "committed"})),
+            ("sha256:" + "22" * 32, canonical({"state": "abandoned"})),
+            (
+                "sha256:" + "33" * 32,
+                canonical({"current_session": None, "state": "open"}),
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO tensorfs_derived_transactions(id,bytes) VALUES (?,?)",
+            historical,
+        )
+        connection.commit()
         connection.close()
 
         command = (sys.executable, str(MIGRATE), str(root), "--tfs", str(tfs))
+        for relative in (
+            "tmp/leases/read-123-456.lease",
+            "tmp/writers/123-456.writer",
+            "tmp/writers/recovery.lock",
+        ):
+            marker = root / relative
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            with marker.open("w+b") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                refused = subprocess.run(
+                    command, capture_output=True, text=True, check=False
+                )
+                assert refused.returncode != 0
+                assert "TensorFS has a live lease/writer" in refused.stderr
+            marker.unlink()
         subprocess.run(command, check=True)
         assert repo_path.read_bytes() == repository
+        assert sqlite3.connect(root / "tensorfs.sqlite").execute(
+            "SELECT count(*) FROM tensorfs_derived_transactions"
+        ).fetchone()[0] == len(historical)
         subprocess.run((*command, "--apply"), check=True)
         migrated = json.loads(repo_path.read_bytes())
         assert "evidence" not in migrated["checkpoints"][0]
@@ -145,10 +181,22 @@ def main() -> int:
             root / "migration-backup-0.1.2/repos/org/model.json"
         ).read_bytes() == repository
         assert (root / "tensorfs.sqlite.0.1.2.bak").is_file()
+        assert sqlite3.connect(root / "tensorfs.sqlite.0.1.2.bak").execute(
+            "SELECT count(*) FROM tensorfs_derived_transactions"
+        ).fetchone()[0] == len(historical)
         assert sqlite3.connect(root / "tensorfs.sqlite").execute(
             "PRAGMA user_version"
         ).fetchone()[0] == 2
-        subprocess.run((*command, "--apply"), check=True)
+        assert sqlite3.connect(root / "tensorfs.sqlite").execute(
+            "SELECT count(*) FROM tensorfs_derived_transactions"
+        ).fetchone()[0] == 0
+        rerun = subprocess.run(
+            (*command, "--apply"), capture_output=True, text=True, check=True
+        )
+        assert (
+            "preflight: 0 new CAS objects, 0 repository replacements, "
+            "0 historical derived rows to archive"
+        ) in rerun.stdout
     print("migration smoke green")
     return 0
 

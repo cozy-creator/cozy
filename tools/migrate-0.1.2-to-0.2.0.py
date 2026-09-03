@@ -79,7 +79,7 @@ def marker_is_live(path: Path) -> bool:
         os.close(descriptor)
 
 
-def require_quiescent(root: Path) -> None:
+def require_quiescent(root: Path) -> int:
     catalog = root / "tensorfs.sqlite"
     markers = [
         marker
@@ -91,7 +91,7 @@ def require_quiescent(root: Path) -> None:
     if (root / "tensorfs.sqlite-wal").exists() or (root / "tensorfs.sqlite-shm").exists():
         raise RuntimeError("SQLite WAL/SHM files exist; stop TensorFS cleanly before migration")
     if not catalog.exists():
-        return
+        return 0
     connection = sqlite3.connect(f"file:{catalog}?mode=ro", uri=True)
     try:
         tables = {
@@ -101,7 +101,6 @@ def require_quiescent(root: Path) -> None:
             )
         }
         for table in (
-            "tensorfs_derived_transactions",
             "tensorfs_holds",
             "tensorfs_operations",
             "tensorfs_source_preparations",
@@ -111,8 +110,14 @@ def require_quiescent(root: Path) -> None:
                 f"SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"
             ).fetchone()[0]:
                 raise RuntimeError(f"{table} is nonempty; finish or abandon active work first")
+        historical_derived = (
+            connection.execute("SELECT count(*) FROM tensorfs_derived_transactions").fetchone()[0]
+            if "tensorfs_derived_transactions" in tables
+            else 0
+        )
     finally:
         connection.close()
+    return historical_derived
 
 
 def ref(row: object) -> tuple[str, int]:
@@ -238,11 +243,12 @@ class Migration:
         document["entries"] = kept
         encoded = canonical_json(document)
         new_digest = sha256(encoded)
-        with tempfile.TemporaryDirectory(prefix="tfs-manifest-migrate-", dir=self.root / "tmp") as raw:
-            candidate, refs = Path(raw) / "manifest.json", Path(raw) / "refs.jsonl"
-            candidate.write_bytes(encoded)
-            self.run("manifest", "inspect", str(candidate), "--refs", str(refs))
-        self.objects[manifest_path(self.root, new_digest)] = encoded
+        if encoded != source:
+            with tempfile.TemporaryDirectory(prefix="tfs-manifest-migrate-", dir=self.root / "tmp") as raw:
+                candidate, refs = Path(raw) / "manifest.json", Path(raw) / "refs.jsonl"
+                candidate.write_bytes(encoded)
+                self.run("manifest", "inspect", str(candidate), "--refs", str(refs))
+            self.objects[manifest_path(self.root, new_digest)] = encoded
         self.manifests[digest] = (new_digest, len(encoded))
         return new_digest, len(encoded)
 
@@ -336,12 +342,13 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     root = args.root.resolve(strict=True)
-    require_quiescent(root)
+    historical_derived = require_quiescent(root)
     migration = Migration(root, args.tfs.resolve(strict=True))
     replacements = migration.repositories()
     print(
         f"preflight: {len(migration.objects)} new CAS objects, "
-        f"{len(replacements)} repository replacements"
+        f"{len(replacements)} repository replacements, "
+        f"{historical_derived} historical derived rows to archive"
     )
     if not args.apply:
         print("dry run; pass --apply after reviewing the counts")
