@@ -1,7 +1,9 @@
 target/
 __pycache__/
 *.pyc
+*.so
 .venv/
+/uv.lock
 dist/
 *.egg-info/
 vectors/store/meta/
