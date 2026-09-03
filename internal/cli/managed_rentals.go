@@ -192,6 +192,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 		}
 		ready = append(ready, row.ID)
 	}
+	ready = m.owner.ModeCompatibleRentals(ready, req.IsJob())
 	if len(ready) > 0 {
 		ranked := m.owner.RankRentals(ready, req.Models)
 		chosen := ranked[0].RentalID
