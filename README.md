@@ -38,6 +38,11 @@ tensor parts; configs are canonical JSON bytes inside the header. The existing
 `Store.walk` and `Store.acquire_manifest` retain their
 full-snapshot meaning, including every ordinary sibling.
 
+While that lease is live, `lease.read_asset(header_bytes, name, max_bytes=64<<20)` reads a
+header-declared tokenizer or other model asset through the same pinned verified descriptors,
+then checks its declared logical length and SHA-256. The supplied header must itself belong to
+the lease.
+
 Those three are the durable format contract. The frozen corpus also verifies the bounded
 ingest, encoding-vector, and device-capability grammars that cross process boundaries:
 
