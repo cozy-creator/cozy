@@ -110,12 +110,20 @@
 // pod-resident half of the HOST role the Cozy daemon performs in-process locally: it downloads
 // and verifies, asks the Runtime's loopback preparation for PlacementSet bytes, moves objects,
 // and keeps the pod ledger. Minor 21 gives that role its own lanes so the host never rewrites
-// a frame in flight: `PodHost` (owner <-> host, a second service on the pod listener),
-// `RuntimeWeights` (host <-> Runtime, loopback), and a host-authored SECOND snapshot document
-// beside the worker's, which passes through BYTE-IDENTICAL. The direction-annotated slots
-// still on RecordOwnerFrame / WorkerFrame / DesiredWorkerState.mode are the pre-21 shape of
-// the same lanes; they are RETIRING and are reserved at the first minor after every consumer
-// is off them. Nothing at 21 is removed or renumbered.
+// a frame in flight: `PodHost` (owner <-> host, a second service on the pod listener) and
+// `RuntimeWeights` (host <-> Runtime, loopback). The direction-annotated slots still on
+// RecordOwnerFrame / WorkerFrame / DesiredWorkerState.mode are the pre-21 shape of the same
+// lanes; they are RETIRING and are reserved at the first minor after every consumer is off
+// them. Nothing at 21 is removed or renumbered.
+//
+// ONE SNAPSHOT DOCUMENT AGAIN (th-142 child 2, minor 33). Minor 21 also gave the host a SECOND
+// snapshot document beside the worker's, because the pod's durable attempt record lived in the
+// supervisor's ledger and a canonical document under a digest cannot be appended to. That
+// record is the Runtime's now: it keeps its attempts and its weights transactions on disk under
+// a root the supervisor creates, recovers them at its own boot, and reports them in the one
+// document it already authors. `HostSnapshotBody`, `WorkerSnapshot` 9/10 and `SnapshotAck` 7
+// are deleted and reserved. Nothing observable was lost with them — no fact the host held was
+// unobservable to the Runtime that produced it.
 //
 // DEVICE LANES (proto-024, minor 22). The serialized resource inside one worker is a DEVICE
 // LANE — a set of envelope-local device ordinals, one attempt seat, one ledger — not the worker

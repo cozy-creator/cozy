@@ -110,12 +110,20 @@
 // pod-resident half of the HOST role the Cozy daemon performs in-process locally: it downloads
 // and verifies, asks the Runtime's loopback preparation for PlacementSet bytes, moves objects,
 // and keeps the pod ledger. Minor 21 gives that role its own lanes so the host never rewrites
-// a frame in flight: `PodHost` (owner <-> host, a second service on the pod listener),
-// `RuntimeWeights` (host <-> Runtime, loopback), and a host-authored SECOND snapshot document
-// beside the worker's, which passes through BYTE-IDENTICAL. The direction-annotated slots
-// still on RecordOwnerFrame / WorkerFrame / DesiredWorkerState.mode are the pre-21 shape of
-// the same lanes; they are RETIRING and are reserved at the first minor after every consumer
-// is off them. Nothing at 21 is removed or renumbered.
+// a frame in flight: `PodHost` (owner <-> host, a second service on the pod listener) and
+// `RuntimeWeights` (host <-> Runtime, loopback). The direction-annotated slots still on
+// RecordOwnerFrame / WorkerFrame / DesiredWorkerState.mode are the pre-21 shape of the same
+// lanes; they are RETIRING and are reserved at the first minor after every consumer is off
+// them. Nothing at 21 is removed or renumbered.
+//
+// ONE SNAPSHOT DOCUMENT AGAIN (th-142 child 2, minor 33). Minor 21 also gave the host a SECOND
+// snapshot document beside the worker's, because the pod's durable attempt record lived in the
+// supervisor's ledger and a canonical document under a digest cannot be appended to. That
+// record is the Runtime's now: it keeps its attempts and its weights transactions on disk under
+// a root the supervisor creates, recovers them at its own boot, and reports them in the one
+// document it already authors. `HostSnapshotBody`, `WorkerSnapshot` 9/10 and `SnapshotAck` 7
+// are deleted and reserved. Nothing observable was lost with them — no fact the host held was
+// unobservable to the Runtime that produced it.
 //
 // DEVICE LANES (proto-024, minor 22). The serialized resource inside one worker is a DEVICE
 // LANE — a set of envelope-local device ordinals, one attempt seat, one ledger — not the worker
@@ -4706,15 +4714,8 @@ type WorkerSnapshot struct {
 	SnapshotDigest                     []byte                 `protobuf:"bytes,6,opt,name=snapshot_digest,json=snapshotDigest,proto3" json:"snapshot_digest,omitempty"`                                                                   // class (a): sha256 over EXACTLY the bytes in 7
 	SnapshotCanonicalBytes             []byte                 `protobuf:"bytes,7,opt,name=snapshot_canonical_bytes,json=snapshotCanonicalBytes,proto3" json:"snapshot_canonical_bytes,omitempty"`                                         // the WorkerSnapshotBody DOCUMENT, canonical JSON bytes
 	AcceptedPlacementSetCanonicalBytes []byte                 `protobuf:"bytes,8,opt,name=accepted_placement_set_canonical_bytes,json=acceptedPlacementSetCanonicalBytes,proto3" json:"accepted_placement_set_canonical_bytes,omitempty"` // the EXACT accepted set bytes as journaled
-	// — never a re-serialization; its digest lives INSIDE 7
-	// THE HOST'S OWN DOCUMENT (proto-025). A canonical document under a digest cannot be appended
-	// to -- any addition re-authors it -- so a host standing between the RecordOwner and the
-	// worker gets a second document beside the worker's, and 6/7 pass through BYTE-IDENTICAL.
-	// Both empty when no host stands between them (local execution).
-	HostSnapshotDigest         []byte `protobuf:"bytes,9,opt,name=host_snapshot_digest,json=hostSnapshotDigest,proto3" json:"host_snapshot_digest,omitempty"`                            // class (a): sha256 over EXACTLY the bytes in 10
-	HostSnapshotCanonicalBytes []byte `protobuf:"bytes,10,opt,name=host_snapshot_canonical_bytes,json=hostSnapshotCanonicalBytes,proto3" json:"host_snapshot_canonical_bytes,omitempty"` // the HostSnapshotBody DOCUMENT, canonical JSON
-	unknownFields              protoimpl.UnknownFields
-	sizeCache                  protoimpl.SizeCache
+	unknownFields                      protoimpl.UnknownFields
+	sizeCache                          protoimpl.SizeCache
 }
 
 func (x *WorkerSnapshot) Reset() {
@@ -4796,20 +4797,6 @@ func (x *WorkerSnapshot) GetAcceptedPlacementSetCanonicalBytes() []byte {
 	return nil
 }
 
-func (x *WorkerSnapshot) GetHostSnapshotDigest() []byte {
-	if x != nil {
-		return x.HostSnapshotDigest
-	}
-	return nil
-}
-
-func (x *WorkerSnapshot) GetHostSnapshotCanonicalBytes() []byte {
-	if x != nil {
-		return x.HostSnapshotCanonicalBytes
-	}
-	return nil
-}
-
 // DOCUMENT SHAPE (not a wire message): canonical form `cozy.worker.v1.WorkerSnapshotBody/1`, the
 // subject of WorkerSnapshot.snapshot_digest.
 //
@@ -4839,12 +4826,23 @@ type WorkerSnapshotBody struct {
 	HeldAttempts []*HeldAttempt `protobuf:"bytes,10,rep,name=held_attempts,json=heldAttempts,proto3" json:"held_attempts,omitempty"` // every accepted attempt from admission to ack
 	// (QUEUED, RUNNING, DEVICE_RELEASED,
 	// OUTCOME_PENDING_ACK); sorted by
-	// (request_id, attempt_ordinal)
-	WeightsTransactions []*WeightsTransactionStatus `protobuf:"bytes,11,rep,name=weights_transactions,json=weightsTransactions,proto3" json:"weights_transactions,omitempty"` // RETIRING (proto-025): the
-	// host's rows live in HostSnapshotBody/1; no
-	// worker writes this. journal_highwater (3) has
-	// had no writer since the Runtime journal went.
-	// Both are reserved at the retirement minor.
+	// (request_id, attempt_ordinal). Since minor 33
+	// this includes the attempts RECOVERED from the
+	// worker's own durable record at boot — the
+	// survivors of a worker restart, authored an
+	// interrupted terminal and carried here as
+	// OUTCOME_PENDING_ACK. They used to be a second
+	// document's held_outcomes; a worker that owns
+	// its record names them itself.
+	WeightsTransactions []*WeightsTransactionStatus `protobuf:"bytes,11,rep,name=weights_transactions,json=weightsTransactions,proto3" json:"weights_transactions,omitempty"` // the weights transactions this
+	// worker holds open, sorted by
+	// weights_transaction_id: INTENT rows it has an
+	// ack for, RECEIPT rows whose frames it replays
+	// after the barrier. Worker-authored since minor
+	// 33 (th-142 child 2); before that the host's
+	// second document carried them and no worker
+	// wrote this. journal_highwater (3) still has no
+	// writer and is reserved at the retirement minor.
 	Lanes []*DeviceLane `protobuf:"bytes,12,rep,name=lanes,proto3" json:"lanes,omitempty"` // proto-024: the lanes as of this snapshot,
 	// sorted by lane_id — the per-lane room a
 	// reconnecting RecordOwner reconciles from,
@@ -4976,69 +4974,6 @@ func (x *WorkerSnapshotBody) GetHeldManifests() []string {
 	return nil
 }
 
-// DOCUMENT SHAPE (not a wire message): canonical form `cozy.worker.v1.HostSnapshotBody/1`, the
-// subject of WorkerSnapshot.host_snapshot_digest. Authored by the pod host from its ledger at
-// every worker snapshot; never by the worker.
-//
-// held_outcomes are the ledger's outcomes pending ack that the worker's own held_attempts does
-// NOT name -- the survivor set after a child replacement. Each replays as an AttemptOutcome
-// after the barrier, exactly like the worker's own. A live child's held_attempts always covers
-// the ledger's, so this list is empty until a child is replaced. weights_transactions announce
-// the receipt frames the host replays after the barrier. Lanes that moved to PodHost have no
-// post-barrier replay and therefore no row here: the owner asks the host.
-type HostSnapshotBody struct {
-	state        protoimpl.MessageState `protogen:"open.v1"`
-	HeldOutcomes []*HeldAttempt         `protobuf:"bytes,1,rep,name=held_outcomes,json=heldOutcomes,proto3" json:"held_outcomes,omitempty"` // sorted by (request_id, attempt_ordinal); state is
-	// always OUTCOME_PENDING_ACK
-	WeightsTransactions []*WeightsTransactionStatus `protobuf:"bytes,2,rep,name=weights_transactions,json=weightsTransactions,proto3" json:"weights_transactions,omitempty"` // sorted by weights_transaction_id
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
-}
-
-func (x *HostSnapshotBody) Reset() {
-	*x = HostSnapshotBody{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[31]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *HostSnapshotBody) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*HostSnapshotBody) ProtoMessage() {}
-
-func (x *HostSnapshotBody) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[31]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use HostSnapshotBody.ProtoReflect.Descriptor instead.
-func (*HostSnapshotBody) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{31}
-}
-
-func (x *HostSnapshotBody) GetHeldOutcomes() []*HeldAttempt {
-	if x != nil {
-		return x.HeldOutcomes
-	}
-	return nil
-}
-
-func (x *HostSnapshotBody) GetWeightsTransactions() []*WeightsTransactionStatus {
-	if x != nil {
-		return x.WeightsTransactions
-	}
-	return nil
-}
-
 type SnapshotAck struct {
 	state              protoimpl.MessageState `protogen:"open.v1"`
 	RecordOwnerEpoch   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
@@ -5046,16 +4981,13 @@ type SnapshotAck struct {
 	WorkerBootId       string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
 	SnapshotId         string                 `protobuf:"bytes,5,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`             // echo of the exact snapshot durably reconciled
 	SnapshotDigest     []byte                 `protobuf:"bytes,6,opt,name=snapshot_digest,json=snapshotDigest,proto3" json:"snapshot_digest,omitempty"` // echo; COMPARED, never recomputed by the worker. An ack
-	// naming a different id/digest is NOT an ack — the barrier
-	// stays closed and dispatch never opens.
-	HostSnapshotDigest []byte `protobuf:"bytes,7,opt,name=host_snapshot_digest,json=hostSnapshotDigest,proto3" json:"host_snapshot_digest,omitempty"` // echo of WorkerSnapshot 9; the host compares it before
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
 
 func (x *SnapshotAck) Reset() {
 	*x = SnapshotAck{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[32]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5067,7 +4999,7 @@ func (x *SnapshotAck) String() string {
 func (*SnapshotAck) ProtoMessage() {}
 
 func (x *SnapshotAck) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[32]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5080,7 +5012,7 @@ func (x *SnapshotAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotAck.ProtoReflect.Descriptor instead.
 func (*SnapshotAck) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{32}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *SnapshotAck) GetRecordOwnerEpoch() uint64 {
@@ -5118,13 +5050,6 @@ func (x *SnapshotAck) GetSnapshotDigest() []byte {
 	return nil
 }
 
-func (x *SnapshotAck) GetHostSnapshotDigest() []byte {
-	if x != nil {
-		return x.HostSnapshotDigest
-	}
-	return nil
-}
-
 type DesiredWorkerState struct {
 	state              protoimpl.MessageState `protogen:"open.v1"`
 	RecordOwnerEpoch   uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
@@ -5153,7 +5078,7 @@ type DesiredWorkerState struct {
 
 func (x *DesiredWorkerState) Reset() {
 	*x = DesiredWorkerState{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[33]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5165,7 +5090,7 @@ func (x *DesiredWorkerState) String() string {
 func (*DesiredWorkerState) ProtoMessage() {}
 
 func (x *DesiredWorkerState) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[33]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5178,7 +5103,7 @@ func (x *DesiredWorkerState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DesiredWorkerState.ProtoReflect.Descriptor instead.
 func (*DesiredWorkerState) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{33}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *DesiredWorkerState) GetRecordOwnerEpoch() uint64 {
@@ -5330,7 +5255,7 @@ type DesiredPackageSet struct {
 
 func (x *DesiredPackageSet) Reset() {
 	*x = DesiredPackageSet{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[34]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5342,7 +5267,7 @@ func (x *DesiredPackageSet) String() string {
 func (*DesiredPackageSet) ProtoMessage() {}
 
 func (x *DesiredPackageSet) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[34]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5355,7 +5280,7 @@ func (x *DesiredPackageSet) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DesiredPackageSet.ProtoReflect.Descriptor instead.
 func (*DesiredPackageSet) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{34}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *DesiredPackageSet) GetDownloadDelegation() []byte {
@@ -5386,7 +5311,7 @@ type DesiredLocalPackageSet struct {
 
 func (x *DesiredLocalPackageSet) Reset() {
 	*x = DesiredLocalPackageSet{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[35]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5398,7 +5323,7 @@ func (x *DesiredLocalPackageSet) String() string {
 func (*DesiredLocalPackageSet) ProtoMessage() {}
 
 func (x *DesiredLocalPackageSet) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[35]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5411,7 +5336,7 @@ func (x *DesiredLocalPackageSet) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DesiredLocalPackageSet.ProtoReflect.Descriptor instead.
 func (*DesiredLocalPackageSet) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{35}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *DesiredLocalPackageSet) GetOperationId() string {
@@ -5450,7 +5375,7 @@ type DesiredPrivatePlacementSet struct {
 
 func (x *DesiredPrivatePlacementSet) Reset() {
 	*x = DesiredPrivatePlacementSet{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[36]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5462,7 +5387,7 @@ func (x *DesiredPrivatePlacementSet) String() string {
 func (*DesiredPrivatePlacementSet) ProtoMessage() {}
 
 func (x *DesiredPrivatePlacementSet) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[36]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5475,7 +5400,7 @@ func (x *DesiredPrivatePlacementSet) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DesiredPrivatePlacementSet.ProtoReflect.Descriptor instead.
 func (*DesiredPrivatePlacementSet) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{36}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *DesiredPrivatePlacementSet) GetOperationId() string {
@@ -5517,7 +5442,7 @@ type LocalPackageFileRef struct {
 
 func (x *LocalPackageFileRef) Reset() {
 	*x = LocalPackageFileRef{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[37]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5529,7 +5454,7 @@ func (x *LocalPackageFileRef) String() string {
 func (*LocalPackageFileRef) ProtoMessage() {}
 
 func (x *LocalPackageFileRef) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[37]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5542,7 +5467,7 @@ func (x *LocalPackageFileRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LocalPackageFileRef.ProtoReflect.Descriptor instead.
 func (*LocalPackageFileRef) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{37}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *LocalPackageFileRef) GetDigest() []byte {
@@ -5583,7 +5508,7 @@ type LocalPackageRevision struct {
 
 func (x *LocalPackageRevision) Reset() {
 	*x = LocalPackageRevision{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[38]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5595,7 +5520,7 @@ func (x *LocalPackageRevision) String() string {
 func (*LocalPackageRevision) ProtoMessage() {}
 
 func (x *LocalPackageRevision) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[38]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5608,7 +5533,7 @@ func (x *LocalPackageRevision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LocalPackageRevision.ProtoReflect.Descriptor instead.
 func (*LocalPackageRevision) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{38}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *LocalPackageRevision) GetPackage() string {
@@ -5668,7 +5593,7 @@ type DesiredPlacementSet struct {
 
 func (x *DesiredPlacementSet) Reset() {
 	*x = DesiredPlacementSet{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[39]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5680,7 +5605,7 @@ func (x *DesiredPlacementSet) String() string {
 func (*DesiredPlacementSet) ProtoMessage() {}
 
 func (x *DesiredPlacementSet) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[39]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5693,7 +5618,7 @@ func (x *DesiredPlacementSet) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DesiredPlacementSet.ProtoReflect.Descriptor instead.
 func (*DesiredPlacementSet) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{39}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *DesiredPlacementSet) GetPlacementSetDigest() []byte {
@@ -5735,7 +5660,7 @@ type PlacementDevicePin struct {
 
 func (x *PlacementDevicePin) Reset() {
 	*x = PlacementDevicePin{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[40]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5747,7 +5672,7 @@ func (x *PlacementDevicePin) String() string {
 func (*PlacementDevicePin) ProtoMessage() {}
 
 func (x *PlacementDevicePin) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[40]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5760,7 +5685,7 @@ func (x *PlacementDevicePin) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlacementDevicePin.ProtoReflect.Descriptor instead.
 func (*PlacementDevicePin) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{40}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *PlacementDevicePin) GetPlacementId() string {
@@ -5789,7 +5714,7 @@ type PlacementSet struct {
 
 func (x *PlacementSet) Reset() {
 	*x = PlacementSet{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[41]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5801,7 +5726,7 @@ func (x *PlacementSet) String() string {
 func (*PlacementSet) ProtoMessage() {}
 
 func (x *PlacementSet) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[41]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5814,7 +5739,7 @@ func (x *PlacementSet) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlacementSet.ProtoReflect.Descriptor instead.
 func (*PlacementSet) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{41}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *PlacementSet) GetPlacements() []*Placement {
@@ -5842,7 +5767,7 @@ type DownloadDelegation struct {
 
 func (x *DownloadDelegation) Reset() {
 	*x = DownloadDelegation{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[42]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5854,7 +5779,7 @@ func (x *DownloadDelegation) String() string {
 func (*DownloadDelegation) ProtoMessage() {}
 
 func (x *DownloadDelegation) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[42]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5867,7 +5792,7 @@ func (x *DownloadDelegation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DownloadDelegation.ProtoReflect.Descriptor instead.
 func (*DownloadDelegation) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{42}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *DownloadDelegation) GetExpiresAtUnix() uint64 {
@@ -5933,7 +5858,7 @@ type DownloadModelRef struct {
 
 func (x *DownloadModelRef) Reset() {
 	*x = DownloadModelRef{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[43]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5945,7 +5870,7 @@ func (x *DownloadModelRef) String() string {
 func (*DownloadModelRef) ProtoMessage() {}
 
 func (x *DownloadModelRef) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[43]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5958,7 +5883,7 @@ func (x *DownloadModelRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DownloadModelRef.ProtoReflect.Descriptor instead.
 func (*DownloadModelRef) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{43}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *DownloadModelRef) GetManifest() string {
@@ -6013,7 +5938,7 @@ type DownloadPackageRef struct {
 
 func (x *DownloadPackageRef) Reset() {
 	*x = DownloadPackageRef{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[44]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6025,7 +5950,7 @@ func (x *DownloadPackageRef) String() string {
 func (*DownloadPackageRef) ProtoMessage() {}
 
 func (x *DownloadPackageRef) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[44]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6038,7 +5963,7 @@ func (x *DownloadPackageRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DownloadPackageRef.ProtoReflect.Descriptor instead.
 func (*DownloadPackageRef) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{44}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *DownloadPackageRef) GetPackage() string {
@@ -6078,7 +6003,7 @@ type Placement struct {
 
 func (x *Placement) Reset() {
 	*x = Placement{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[45]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6090,7 +6015,7 @@ func (x *Placement) String() string {
 func (*Placement) ProtoMessage() {}
 
 func (x *Placement) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[45]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6103,7 +6028,7 @@ func (x *Placement) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Placement.ProtoReflect.Descriptor instead.
 func (*Placement) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{45}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *Placement) GetPlacementId() string {
@@ -6208,7 +6133,7 @@ type Ref struct {
 
 func (x *Ref) Reset() {
 	*x = Ref{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[46]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6220,7 +6145,7 @@ func (x *Ref) String() string {
 func (*Ref) ProtoMessage() {}
 
 func (x *Ref) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[46]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6233,7 +6158,7 @@ func (x *Ref) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Ref.ProtoReflect.Descriptor instead.
 func (*Ref) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{46}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *Ref) GetDigest() []byte {
@@ -6267,7 +6192,7 @@ type WheelFact struct {
 
 func (x *WheelFact) Reset() {
 	*x = WheelFact{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[47]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6279,7 +6204,7 @@ func (x *WheelFact) String() string {
 func (*WheelFact) ProtoMessage() {}
 
 func (x *WheelFact) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[47]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6292,7 +6217,7 @@ func (x *WheelFact) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WheelFact.ProtoReflect.Descriptor instead.
 func (*WheelFact) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{47}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *WheelFact) GetRef() *Ref {
@@ -6353,7 +6278,7 @@ type PackageSelection struct {
 
 func (x *PackageSelection) Reset() {
 	*x = PackageSelection{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[48]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6365,7 +6290,7 @@ func (x *PackageSelection) String() string {
 func (*PackageSelection) ProtoMessage() {}
 
 func (x *PackageSelection) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[48]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6378,7 +6303,7 @@ func (x *PackageSelection) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PackageSelection.ProtoReflect.Descriptor instead.
 func (*PackageSelection) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{48}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *PackageSelection) GetPackage() string {
@@ -6412,7 +6337,7 @@ type DevelopmentPackage struct {
 
 func (x *DevelopmentPackage) Reset() {
 	*x = DevelopmentPackage{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[49]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6424,7 +6349,7 @@ func (x *DevelopmentPackage) String() string {
 func (*DevelopmentPackage) ProtoMessage() {}
 
 func (x *DevelopmentPackage) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[49]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6437,7 +6362,7 @@ func (x *DevelopmentPackage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DevelopmentPackage.ProtoReflect.Descriptor instead.
 func (*DevelopmentPackage) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{49}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *DevelopmentPackage) GetPackage() string {
@@ -6491,7 +6416,7 @@ type Environment struct {
 
 func (x *Environment) Reset() {
 	*x = Environment{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[50]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6503,7 +6428,7 @@ func (x *Environment) String() string {
 func (*Environment) ProtoMessage() {}
 
 func (x *Environment) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[50]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6516,7 +6441,7 @@ func (x *Environment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Environment.ProtoReflect.Descriptor instead.
 func (*Environment) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{50}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *Environment) GetLockedRequirements() *Ref {
@@ -6546,7 +6471,7 @@ type Model struct {
 
 func (x *Model) Reset() {
 	*x = Model{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[51]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6558,7 +6483,7 @@ func (x *Model) String() string {
 func (*Model) ProtoMessage() {}
 
 func (x *Model) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[51]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6571,7 +6496,7 @@ func (x *Model) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Model.ProtoReflect.Descriptor instead.
 func (*Model) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{51}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *Model) GetId() string {
@@ -6621,7 +6546,7 @@ type Entrypoint struct {
 
 func (x *Entrypoint) Reset() {
 	*x = Entrypoint{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[52]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6633,7 +6558,7 @@ func (x *Entrypoint) String() string {
 func (*Entrypoint) ProtoMessage() {}
 
 func (x *Entrypoint) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[52]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6646,7 +6571,7 @@ func (x *Entrypoint) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Entrypoint.ProtoReflect.Descriptor instead.
 func (*Entrypoint) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{52}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *Entrypoint) GetName() string {
@@ -6684,7 +6609,7 @@ type Slot struct {
 
 func (x *Slot) Reset() {
 	*x = Slot{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[53]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6696,7 +6621,7 @@ func (x *Slot) String() string {
 func (*Slot) ProtoMessage() {}
 
 func (x *Slot) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[53]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6709,7 +6634,7 @@ func (x *Slot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Slot.ProtoReflect.Descriptor instead.
 func (*Slot) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{53}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *Slot) GetSlot() string {
@@ -6757,7 +6682,7 @@ type Component struct {
 
 func (x *Component) Reset() {
 	*x = Component{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[54]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6769,7 +6694,7 @@ func (x *Component) String() string {
 func (*Component) ProtoMessage() {}
 
 func (x *Component) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[54]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6782,7 +6707,7 @@ func (x *Component) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Component.ProtoReflect.Descriptor instead.
 func (*Component) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{54}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *Component) GetComponent() string {
@@ -6810,7 +6735,7 @@ type Stamp struct {
 
 func (x *Stamp) Reset() {
 	*x = Stamp{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[55]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6822,7 +6747,7 @@ func (x *Stamp) String() string {
 func (*Stamp) ProtoMessage() {}
 
 func (x *Stamp) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[55]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6835,7 +6760,7 @@ func (x *Stamp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Stamp.ProtoReflect.Descriptor instead.
 func (*Stamp) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{55}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *Stamp) GetComponent() string {
@@ -6873,7 +6798,7 @@ type JobDirective struct {
 
 func (x *JobDirective) Reset() {
 	*x = JobDirective{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[56]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6885,7 +6810,7 @@ func (x *JobDirective) String() string {
 func (*JobDirective) ProtoMessage() {}
 
 func (x *JobDirective) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[56]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6898,7 +6823,7 @@ func (x *JobDirective) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JobDirective.ProtoReflect.Descriptor instead.
 func (*JobDirective) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{56}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{55}
 }
 
 func (x *JobDirective) GetBuildId() string {
@@ -6997,7 +6922,7 @@ type ObservedWorkerState struct {
 
 func (x *ObservedWorkerState) Reset() {
 	*x = ObservedWorkerState{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[57]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7009,7 +6934,7 @@ func (x *ObservedWorkerState) String() string {
 func (*ObservedWorkerState) ProtoMessage() {}
 
 func (x *ObservedWorkerState) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[57]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7022,7 +6947,7 @@ func (x *ObservedWorkerState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ObservedWorkerState.ProtoReflect.Descriptor instead.
 func (*ObservedWorkerState) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{57}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *ObservedWorkerState) GetRecordOwnerEpoch() uint64 {
@@ -7180,7 +7105,7 @@ type DeviceLane struct {
 
 func (x *DeviceLane) Reset() {
 	*x = DeviceLane{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[58]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7192,7 +7117,7 @@ func (x *DeviceLane) String() string {
 func (*DeviceLane) ProtoMessage() {}
 
 func (x *DeviceLane) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[58]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7205,7 +7130,7 @@ func (x *DeviceLane) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeviceLane.ProtoReflect.Descriptor instead.
 func (*DeviceLane) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{58}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *DeviceLane) GetLaneId() string {
@@ -7283,7 +7208,7 @@ type PlacementStatus struct {
 
 func (x *PlacementStatus) Reset() {
 	*x = PlacementStatus{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[59]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7295,7 +7220,7 @@ func (x *PlacementStatus) String() string {
 func (*PlacementStatus) ProtoMessage() {}
 
 func (x *PlacementStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[59]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7308,7 +7233,7 @@ func (x *PlacementStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlacementStatus.ProtoReflect.Descriptor instead.
 func (*PlacementStatus) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{59}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *PlacementStatus) GetPlacementId() string {
@@ -7425,7 +7350,7 @@ type PlacementAcquisitionObservation struct {
 
 func (x *PlacementAcquisitionObservation) Reset() {
 	*x = PlacementAcquisitionObservation{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[60]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7437,7 +7362,7 @@ func (x *PlacementAcquisitionObservation) String() string {
 func (*PlacementAcquisitionObservation) ProtoMessage() {}
 
 func (x *PlacementAcquisitionObservation) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[60]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7450,7 +7375,7 @@ func (x *PlacementAcquisitionObservation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlacementAcquisitionObservation.ProtoReflect.Descriptor instead.
 func (*PlacementAcquisitionObservation) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{60}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{59}
 }
 
 func (x *PlacementAcquisitionObservation) GetPackage() *AcquisitionLegObservation {
@@ -7479,7 +7404,7 @@ type AcquisitionLegObservation struct {
 
 func (x *AcquisitionLegObservation) Reset() {
 	*x = AcquisitionLegObservation{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[61]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7491,7 +7416,7 @@ func (x *AcquisitionLegObservation) String() string {
 func (*AcquisitionLegObservation) ProtoMessage() {}
 
 func (x *AcquisitionLegObservation) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[61]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7504,7 +7429,7 @@ func (x *AcquisitionLegObservation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcquisitionLegObservation.ProtoReflect.Descriptor instead.
 func (*AcquisitionLegObservation) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{61}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{60}
 }
 
 func (x *AcquisitionLegObservation) GetStartedMonotonicNs() uint64 {
@@ -7558,7 +7483,7 @@ type AcceleratorQualification struct {
 
 func (x *AcceleratorQualification) Reset() {
 	*x = AcceleratorQualification{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[62]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7570,7 +7495,7 @@ func (x *AcceleratorQualification) String() string {
 func (*AcceleratorQualification) ProtoMessage() {}
 
 func (x *AcceleratorQualification) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[62]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7583,7 +7508,7 @@ func (x *AcceleratorQualification) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcceleratorQualification.ProtoReflect.Descriptor instead.
 func (*AcceleratorQualification) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{62}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *AcceleratorQualification) GetQualified() bool {
@@ -7654,7 +7579,7 @@ type ActivityEvent struct {
 
 func (x *ActivityEvent) Reset() {
 	*x = ActivityEvent{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[63]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7666,7 +7591,7 @@ func (x *ActivityEvent) String() string {
 func (*ActivityEvent) ProtoMessage() {}
 
 func (x *ActivityEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[63]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7679,7 +7604,7 @@ func (x *ActivityEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActivityEvent.ProtoReflect.Descriptor instead.
 func (*ActivityEvent) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{63}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{62}
 }
 
 func (x *ActivityEvent) GetSeq() uint64 {
@@ -7740,7 +7665,7 @@ type AttemptOffer struct {
 
 func (x *AttemptOffer) Reset() {
 	*x = AttemptOffer{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[64]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7752,7 +7677,7 @@ func (x *AttemptOffer) String() string {
 func (*AttemptOffer) ProtoMessage() {}
 
 func (x *AttemptOffer) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[64]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7765,7 +7690,7 @@ func (x *AttemptOffer) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptOffer.ProtoReflect.Descriptor instead.
 func (*AttemptOffer) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{64}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *AttemptOffer) GetRecordOwnerEpoch() uint64 {
@@ -7858,7 +7783,7 @@ type AttemptAccepted struct {
 
 func (x *AttemptAccepted) Reset() {
 	*x = AttemptAccepted{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[65]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7870,7 +7795,7 @@ func (x *AttemptAccepted) String() string {
 func (*AttemptAccepted) ProtoMessage() {}
 
 func (x *AttemptAccepted) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[65]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7883,7 +7808,7 @@ func (x *AttemptAccepted) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptAccepted.ProtoReflect.Descriptor instead.
 func (*AttemptAccepted) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{65}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{64}
 }
 
 func (x *AttemptAccepted) GetRecordOwnerEpoch() uint64 {
@@ -7961,7 +7886,7 @@ type AttemptPlanSummary struct {
 
 func (x *AttemptPlanSummary) Reset() {
 	*x = AttemptPlanSummary{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[66]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[65]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7973,7 +7898,7 @@ func (x *AttemptPlanSummary) String() string {
 func (*AttemptPlanSummary) ProtoMessage() {}
 
 func (x *AttemptPlanSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[66]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[65]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7986,7 +7911,7 @@ func (x *AttemptPlanSummary) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptPlanSummary.ProtoReflect.Descriptor instead.
 func (*AttemptPlanSummary) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{66}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{65}
 }
 
 func (x *AttemptPlanSummary) GetDelivery() string {
@@ -8056,7 +7981,7 @@ type CancelAttempt struct {
 
 func (x *CancelAttempt) Reset() {
 	*x = CancelAttempt{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[67]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[66]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8068,7 +7993,7 @@ func (x *CancelAttempt) String() string {
 func (*CancelAttempt) ProtoMessage() {}
 
 func (x *CancelAttempt) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[67]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[66]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8081,7 +8006,7 @@ func (x *CancelAttempt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelAttempt.ProtoReflect.Descriptor instead.
 func (*CancelAttempt) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{67}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{66}
 }
 
 func (x *CancelAttempt) GetRecordOwnerEpoch() uint64 {
@@ -8164,7 +8089,7 @@ type AttemptOutcome struct {
 
 func (x *AttemptOutcome) Reset() {
 	*x = AttemptOutcome{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[68]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8176,7 +8101,7 @@ func (x *AttemptOutcome) String() string {
 func (*AttemptOutcome) ProtoMessage() {}
 
 func (x *AttemptOutcome) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[68]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8189,7 +8114,7 @@ func (x *AttemptOutcome) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptOutcome.ProtoReflect.Descriptor instead.
 func (*AttemptOutcome) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{68}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{67}
 }
 
 func (x *AttemptOutcome) GetRecordOwnerEpoch() uint64 {
@@ -8290,7 +8215,7 @@ type AttemptOutcomeBody struct {
 
 func (x *AttemptOutcomeBody) Reset() {
 	*x = AttemptOutcomeBody{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[69]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[68]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8302,7 +8227,7 @@ func (x *AttemptOutcomeBody) String() string {
 func (*AttemptOutcomeBody) ProtoMessage() {}
 
 func (x *AttemptOutcomeBody) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[69]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[68]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8315,7 +8240,7 @@ func (x *AttemptOutcomeBody) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptOutcomeBody.ProtoReflect.Descriptor instead.
 func (*AttemptOutcomeBody) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{69}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{68}
 }
 
 func (x *AttemptOutcomeBody) GetRequestId() string {
@@ -8415,7 +8340,7 @@ type WeightsReceiptRef struct {
 
 func (x *WeightsReceiptRef) Reset() {
 	*x = WeightsReceiptRef{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[70]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[69]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8427,7 +8352,7 @@ func (x *WeightsReceiptRef) String() string {
 func (*WeightsReceiptRef) ProtoMessage() {}
 
 func (x *WeightsReceiptRef) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[70]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[69]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8440,7 +8365,7 @@ func (x *WeightsReceiptRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsReceiptRef.ProtoReflect.Descriptor instead.
 func (*WeightsReceiptRef) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{70}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{69}
 }
 
 func (x *WeightsReceiptRef) GetWeightsReceiptDigest() []byte {
@@ -8474,7 +8399,7 @@ type WeightsReceipt struct {
 
 func (x *WeightsReceipt) Reset() {
 	*x = WeightsReceipt{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[71]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[70]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8486,7 +8411,7 @@ func (x *WeightsReceipt) String() string {
 func (*WeightsReceipt) ProtoMessage() {}
 
 func (x *WeightsReceipt) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[71]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[70]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8499,7 +8424,7 @@ func (x *WeightsReceipt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsReceipt.ProtoReflect.Descriptor instead.
 func (*WeightsReceipt) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{71}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{70}
 }
 
 func (x *WeightsReceipt) GetOwnerAuthorityScope() string {
@@ -8564,7 +8489,7 @@ type WeightsObjectSource struct {
 
 func (x *WeightsObjectSource) Reset() {
 	*x = WeightsObjectSource{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[72]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[71]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8576,7 +8501,7 @@ func (x *WeightsObjectSource) String() string {
 func (*WeightsObjectSource) ProtoMessage() {}
 
 func (x *WeightsObjectSource) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[72]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[71]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8589,7 +8514,7 @@ func (x *WeightsObjectSource) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsObjectSource.ProtoReflect.Descriptor instead.
 func (*WeightsObjectSource) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{72}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{71}
 }
 
 func (x *WeightsObjectSource) GetObjectId() string {
@@ -8637,7 +8562,7 @@ type WeightsIntentFrame struct {
 
 func (x *WeightsIntentFrame) Reset() {
 	*x = WeightsIntentFrame{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[73]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[72]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8649,7 +8574,7 @@ func (x *WeightsIntentFrame) String() string {
 func (*WeightsIntentFrame) ProtoMessage() {}
 
 func (x *WeightsIntentFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[73]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[72]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8662,7 +8587,7 @@ func (x *WeightsIntentFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsIntentFrame.ProtoReflect.Descriptor instead.
 func (*WeightsIntentFrame) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{73}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{72}
 }
 
 func (x *WeightsIntentFrame) GetRecordOwnerEpoch() uint64 {
@@ -8762,7 +8687,7 @@ type WeightsHostAck struct {
 
 func (x *WeightsHostAck) Reset() {
 	*x = WeightsHostAck{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[74]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[73]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8774,7 +8699,7 @@ func (x *WeightsHostAck) String() string {
 func (*WeightsHostAck) ProtoMessage() {}
 
 func (x *WeightsHostAck) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[74]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[73]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8787,7 +8712,7 @@ func (x *WeightsHostAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsHostAck.ProtoReflect.Descriptor instead.
 func (*WeightsHostAck) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{74}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{73}
 }
 
 func (x *WeightsHostAck) GetRecordOwnerEpoch() uint64 {
@@ -8920,7 +8845,7 @@ type WeightsReceiptFrame struct {
 
 func (x *WeightsReceiptFrame) Reset() {
 	*x = WeightsReceiptFrame{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[75]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[74]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8932,7 +8857,7 @@ func (x *WeightsReceiptFrame) String() string {
 func (*WeightsReceiptFrame) ProtoMessage() {}
 
 func (x *WeightsReceiptFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[75]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[74]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8945,7 +8870,7 @@ func (x *WeightsReceiptFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsReceiptFrame.ProtoReflect.Descriptor instead.
 func (*WeightsReceiptFrame) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{75}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{74}
 }
 
 func (x *WeightsReceiptFrame) GetRecordOwnerEpoch() uint64 {
@@ -9039,10 +8964,11 @@ func (x *WeightsReceiptFrame) GetManifest() *Ref {
 	return nil
 }
 
-// Compact supervisor-ledger state included in WorkerSnapshotBody/1. A stateless replacement
-// Runtime does not author these rows; pod-supervisor injects them before digesting the external
-// snapshot. It MUST NOT put declarations, receipt bytes, or object inventory here. After the
-// snapshot ACK, the supervisor replays each RECEIPT transaction's exact WeightsReceiptFrame.
+// Compact weights-transaction state included in WorkerSnapshotBody/1, authored by the worker
+// from its own durable record (th-142 child 2; before minor 33 the supervisor injected these
+// rows into a second document). A row MUST NOT carry declarations, receipt bytes, or object
+// inventory. After the snapshot ACK the author replays each RECEIPT row's exact
+// WeightsReceiptFrame — the row announces the replay, it is not the replay.
 type WeightsTransactionStatus struct {
 	state                     protoimpl.MessageState  `protogen:"open.v1"`
 	WeightsTransactionId      string                  `protobuf:"bytes,1,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
@@ -9060,7 +8986,7 @@ type WeightsTransactionStatus struct {
 
 func (x *WeightsTransactionStatus) Reset() {
 	*x = WeightsTransactionStatus{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[76]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[75]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9072,7 +8998,7 @@ func (x *WeightsTransactionStatus) String() string {
 func (*WeightsTransactionStatus) ProtoMessage() {}
 
 func (x *WeightsTransactionStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[76]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[75]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9085,7 +9011,7 @@ func (x *WeightsTransactionStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsTransactionStatus.ProtoReflect.Descriptor instead.
 func (*WeightsTransactionStatus) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{76}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{75}
 }
 
 func (x *WeightsTransactionStatus) GetWeightsTransactionId() string {
@@ -9173,7 +9099,7 @@ type WeightsReadRequest struct {
 
 func (x *WeightsReadRequest) Reset() {
 	*x = WeightsReadRequest{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[77]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[76]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9185,7 +9111,7 @@ func (x *WeightsReadRequest) String() string {
 func (*WeightsReadRequest) ProtoMessage() {}
 
 func (x *WeightsReadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[77]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[76]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9198,7 +9124,7 @@ func (x *WeightsReadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsReadRequest.ProtoReflect.Descriptor instead.
 func (*WeightsReadRequest) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{77}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{76}
 }
 
 func (x *WeightsReadRequest) GetRecordOwnerEpoch() uint64 {
@@ -9293,7 +9219,7 @@ type WeightsReadResult struct {
 
 func (x *WeightsReadResult) Reset() {
 	*x = WeightsReadResult{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[78]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[77]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9305,7 +9231,7 @@ func (x *WeightsReadResult) String() string {
 func (*WeightsReadResult) ProtoMessage() {}
 
 func (x *WeightsReadResult) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[78]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[77]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9318,7 +9244,7 @@ func (x *WeightsReadResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsReadResult.ProtoReflect.Descriptor instead.
 func (*WeightsReadResult) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{78}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{77}
 }
 
 func (x *WeightsReadResult) GetRecordOwnerEpoch() uint64 {
@@ -9429,7 +9355,7 @@ type WeightsObjectRef struct {
 
 func (x *WeightsObjectRef) Reset() {
 	*x = WeightsObjectRef{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[79]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[78]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9441,7 +9367,7 @@ func (x *WeightsObjectRef) String() string {
 func (*WeightsObjectRef) ProtoMessage() {}
 
 func (x *WeightsObjectRef) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[79]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[78]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9454,7 +9380,7 @@ func (x *WeightsObjectRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsObjectRef.ProtoReflect.Descriptor instead.
 func (*WeightsObjectRef) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{79}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{78}
 }
 
 func (x *WeightsObjectRef) GetObjectId() string {
@@ -9481,7 +9407,7 @@ type WeightsUploadHeader struct {
 
 func (x *WeightsUploadHeader) Reset() {
 	*x = WeightsUploadHeader{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[80]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[79]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9493,7 +9419,7 @@ func (x *WeightsUploadHeader) String() string {
 func (*WeightsUploadHeader) ProtoMessage() {}
 
 func (x *WeightsUploadHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[80]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[79]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9506,7 +9432,7 @@ func (x *WeightsUploadHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsUploadHeader.ProtoReflect.Descriptor instead.
 func (*WeightsUploadHeader) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{80}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{79}
 }
 
 func (x *WeightsUploadHeader) GetName() string {
@@ -9546,7 +9472,7 @@ type WeightsUploadGrant struct {
 
 func (x *WeightsUploadGrant) Reset() {
 	*x = WeightsUploadGrant{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[81]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[80]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9558,7 +9484,7 @@ func (x *WeightsUploadGrant) String() string {
 func (*WeightsUploadGrant) ProtoMessage() {}
 
 func (x *WeightsUploadGrant) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[81]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[80]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9571,7 +9497,7 @@ func (x *WeightsUploadGrant) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsUploadGrant.ProtoReflect.Descriptor instead.
 func (*WeightsUploadGrant) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{81}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{80}
 }
 
 func (x *WeightsUploadGrant) GetObjectId() string {
@@ -9637,7 +9563,7 @@ type WeightsTransferRequest struct {
 
 func (x *WeightsTransferRequest) Reset() {
 	*x = WeightsTransferRequest{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[82]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[81]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9649,7 +9575,7 @@ func (x *WeightsTransferRequest) String() string {
 func (*WeightsTransferRequest) ProtoMessage() {}
 
 func (x *WeightsTransferRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[82]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[81]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9662,7 +9588,7 @@ func (x *WeightsTransferRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsTransferRequest.ProtoReflect.Descriptor instead.
 func (*WeightsTransferRequest) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{82}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{81}
 }
 
 func (x *WeightsTransferRequest) GetRecordOwnerEpoch() uint64 {
@@ -9807,7 +9733,7 @@ type WeightsUploadRequest struct {
 
 func (x *WeightsUploadRequest) Reset() {
 	*x = WeightsUploadRequest{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[83]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[82]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9819,7 +9745,7 @@ func (x *WeightsUploadRequest) String() string {
 func (*WeightsUploadRequest) ProtoMessage() {}
 
 func (x *WeightsUploadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[83]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[82]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9832,7 +9758,7 @@ func (x *WeightsUploadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsUploadRequest.ProtoReflect.Descriptor instead.
 func (*WeightsUploadRequest) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{83}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{82}
 }
 
 func (x *WeightsUploadRequest) GetRecordOwnerEpoch() uint64 {
@@ -9939,7 +9865,7 @@ type WeightsUploadResult struct {
 
 func (x *WeightsUploadResult) Reset() {
 	*x = WeightsUploadResult{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[84]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[83]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9951,7 +9877,7 @@ func (x *WeightsUploadResult) String() string {
 func (*WeightsUploadResult) ProtoMessage() {}
 
 func (x *WeightsUploadResult) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[84]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[83]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9964,7 +9890,7 @@ func (x *WeightsUploadResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsUploadResult.ProtoReflect.Descriptor instead.
 func (*WeightsUploadResult) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{84}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{83}
 }
 
 func (x *WeightsUploadResult) GetRecordOwnerEpoch() uint64 {
@@ -10103,7 +10029,7 @@ type WeightsTransferStatus struct {
 
 func (x *WeightsTransferStatus) Reset() {
 	*x = WeightsTransferStatus{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[85]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[84]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10115,7 +10041,7 @@ func (x *WeightsTransferStatus) String() string {
 func (*WeightsTransferStatus) ProtoMessage() {}
 
 func (x *WeightsTransferStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[85]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[84]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10128,7 +10054,7 @@ func (x *WeightsTransferStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsTransferStatus.ProtoReflect.Descriptor instead.
 func (*WeightsTransferStatus) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{85}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{84}
 }
 
 func (x *WeightsTransferStatus) GetRecordOwnerEpoch() uint64 {
@@ -10304,7 +10230,7 @@ type ModelSourceFileRequest struct {
 
 func (x *ModelSourceFileRequest) Reset() {
 	*x = ModelSourceFileRequest{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[86]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[85]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10316,7 +10242,7 @@ func (x *ModelSourceFileRequest) String() string {
 func (*ModelSourceFileRequest) ProtoMessage() {}
 
 func (x *ModelSourceFileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[86]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[85]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10329,7 +10255,7 @@ func (x *ModelSourceFileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelSourceFileRequest.ProtoReflect.Descriptor instead.
 func (*ModelSourceFileRequest) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{86}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{85}
 }
 
 func (x *ModelSourceFileRequest) GetRecordOwnerEpoch() uint64 {
@@ -10438,7 +10364,7 @@ type ModelSourceFileStatus struct {
 
 func (x *ModelSourceFileStatus) Reset() {
 	*x = ModelSourceFileStatus{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[87]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[86]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10450,7 +10376,7 @@ func (x *ModelSourceFileStatus) String() string {
 func (*ModelSourceFileStatus) ProtoMessage() {}
 
 func (x *ModelSourceFileStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[87]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[86]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10463,7 +10389,7 @@ func (x *ModelSourceFileStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelSourceFileStatus.ProtoReflect.Descriptor instead.
 func (*ModelSourceFileStatus) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{87}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{86}
 }
 
 func (x *ModelSourceFileStatus) GetRecordOwnerEpoch() uint64 {
@@ -10583,7 +10509,7 @@ type ModelSourcePrepareRequest struct {
 
 func (x *ModelSourcePrepareRequest) Reset() {
 	*x = ModelSourcePrepareRequest{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[88]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[87]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10595,7 +10521,7 @@ func (x *ModelSourcePrepareRequest) String() string {
 func (*ModelSourcePrepareRequest) ProtoMessage() {}
 
 func (x *ModelSourcePrepareRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[88]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[87]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10608,7 +10534,7 @@ func (x *ModelSourcePrepareRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelSourcePrepareRequest.ProtoReflect.Descriptor instead.
 func (*ModelSourcePrepareRequest) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{88}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{87}
 }
 
 func (x *ModelSourcePrepareRequest) GetRecordOwnerEpoch() uint64 {
@@ -10684,7 +10610,7 @@ type ModelSourcePrepared struct {
 
 func (x *ModelSourcePrepared) Reset() {
 	*x = ModelSourcePrepared{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[89]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[88]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10696,7 +10622,7 @@ func (x *ModelSourcePrepared) String() string {
 func (*ModelSourcePrepared) ProtoMessage() {}
 
 func (x *ModelSourcePrepared) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[89]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[88]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10709,7 +10635,7 @@ func (x *ModelSourcePrepared) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelSourcePrepared.ProtoReflect.Descriptor instead.
 func (*ModelSourcePrepared) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{89}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{88}
 }
 
 func (x *ModelSourcePrepared) GetRecordOwnerEpoch() uint64 {
@@ -10791,7 +10717,7 @@ type LocalPackageFileGrant struct {
 
 func (x *LocalPackageFileGrant) Reset() {
 	*x = LocalPackageFileGrant{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[90]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[89]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10803,7 +10729,7 @@ func (x *LocalPackageFileGrant) String() string {
 func (*LocalPackageFileGrant) ProtoMessage() {}
 
 func (x *LocalPackageFileGrant) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[90]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[89]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10816,7 +10742,7 @@ func (x *LocalPackageFileGrant) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LocalPackageFileGrant.ProtoReflect.Descriptor instead.
 func (*LocalPackageFileGrant) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{90}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{89}
 }
 
 func (x *LocalPackageFileGrant) GetDigest() []byte {
@@ -10877,7 +10803,7 @@ type LocalPackageFetchRequest struct {
 
 func (x *LocalPackageFetchRequest) Reset() {
 	*x = LocalPackageFetchRequest{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[91]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[90]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10889,7 +10815,7 @@ func (x *LocalPackageFetchRequest) String() string {
 func (*LocalPackageFetchRequest) ProtoMessage() {}
 
 func (x *LocalPackageFetchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[91]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[90]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10902,7 +10828,7 @@ func (x *LocalPackageFetchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LocalPackageFetchRequest.ProtoReflect.Descriptor instead.
 func (*LocalPackageFetchRequest) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{91}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{90}
 }
 
 func (x *LocalPackageFetchRequest) GetRecordOwnerEpoch() uint64 {
@@ -10971,7 +10897,7 @@ type LocalPackageFileStatus struct {
 
 func (x *LocalPackageFileStatus) Reset() {
 	*x = LocalPackageFileStatus{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[92]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[91]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10983,7 +10909,7 @@ func (x *LocalPackageFileStatus) String() string {
 func (*LocalPackageFileStatus) ProtoMessage() {}
 
 func (x *LocalPackageFileStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[92]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[91]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10996,7 +10922,7 @@ func (x *LocalPackageFileStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LocalPackageFileStatus.ProtoReflect.Descriptor instead.
 func (*LocalPackageFileStatus) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{92}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{91}
 }
 
 func (x *LocalPackageFileStatus) GetRecordOwnerEpoch() uint64 {
@@ -11100,7 +11026,7 @@ type LocalPackageAbort struct {
 
 func (x *LocalPackageAbort) Reset() {
 	*x = LocalPackageAbort{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[93]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[92]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11112,7 +11038,7 @@ func (x *LocalPackageAbort) String() string {
 func (*LocalPackageAbort) ProtoMessage() {}
 
 func (x *LocalPackageAbort) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[93]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[92]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11125,7 +11051,7 @@ func (x *LocalPackageAbort) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LocalPackageAbort.ProtoReflect.Descriptor instead.
 func (*LocalPackageAbort) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{93}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{92}
 }
 
 func (x *LocalPackageAbort) GetRecordOwnerEpoch() uint64 {
@@ -11189,7 +11115,7 @@ type LocalPackageAbortStatus struct {
 
 func (x *LocalPackageAbortStatus) Reset() {
 	*x = LocalPackageAbortStatus{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[94]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[93]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11201,7 +11127,7 @@ func (x *LocalPackageAbortStatus) String() string {
 func (*LocalPackageAbortStatus) ProtoMessage() {}
 
 func (x *LocalPackageAbortStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[94]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[93]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11214,7 +11140,7 @@ func (x *LocalPackageAbortStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LocalPackageAbortStatus.ProtoReflect.Descriptor instead.
 func (*LocalPackageAbortStatus) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{94}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{93}
 }
 
 func (x *LocalPackageAbortStatus) GetRecordOwnerEpoch() uint64 {
@@ -11301,7 +11227,7 @@ type WeightsFinalizeRequest struct {
 
 func (x *WeightsFinalizeRequest) Reset() {
 	*x = WeightsFinalizeRequest{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[95]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[94]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11313,7 +11239,7 @@ func (x *WeightsFinalizeRequest) String() string {
 func (*WeightsFinalizeRequest) ProtoMessage() {}
 
 func (x *WeightsFinalizeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[95]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[94]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11326,7 +11252,7 @@ func (x *WeightsFinalizeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsFinalizeRequest.ProtoReflect.Descriptor instead.
 func (*WeightsFinalizeRequest) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{95}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{94}
 }
 
 func (x *WeightsFinalizeRequest) GetRecordOwnerEpoch() uint64 {
@@ -11418,7 +11344,7 @@ type WeightsFinalizeResult struct {
 
 func (x *WeightsFinalizeResult) Reset() {
 	*x = WeightsFinalizeResult{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[96]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[95]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11430,7 +11356,7 @@ func (x *WeightsFinalizeResult) String() string {
 func (*WeightsFinalizeResult) ProtoMessage() {}
 
 func (x *WeightsFinalizeResult) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[96]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[95]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11443,7 +11369,7 @@ func (x *WeightsFinalizeResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeightsFinalizeResult.ProtoReflect.Descriptor instead.
 func (*WeightsFinalizeResult) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{96}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{95}
 }
 
 func (x *WeightsFinalizeResult) GetRecordOwnerEpoch() uint64 {
@@ -11524,7 +11450,7 @@ type ResultEnvelope struct {
 
 func (x *ResultEnvelope) Reset() {
 	*x = ResultEnvelope{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[97]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[96]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11536,7 +11462,7 @@ func (x *ResultEnvelope) String() string {
 func (*ResultEnvelope) ProtoMessage() {}
 
 func (x *ResultEnvelope) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[97]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[96]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11549,7 +11475,7 @@ func (x *ResultEnvelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResultEnvelope.ProtoReflect.Descriptor instead.
 func (*ResultEnvelope) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{97}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{96}
 }
 
 func (x *ResultEnvelope) GetResultSchemaDigest() []byte {
@@ -11599,7 +11525,7 @@ type AdjustmentRow struct {
 
 func (x *AdjustmentRow) Reset() {
 	*x = AdjustmentRow{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[98]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[97]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11611,7 +11537,7 @@ func (x *AdjustmentRow) String() string {
 func (*AdjustmentRow) ProtoMessage() {}
 
 func (x *AdjustmentRow) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[98]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[97]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11624,7 +11550,7 @@ func (x *AdjustmentRow) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdjustmentRow.ProtoReflect.Descriptor instead.
 func (*AdjustmentRow) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{98}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{97}
 }
 
 func (x *AdjustmentRow) GetField() string {
@@ -11667,7 +11593,7 @@ type OutcomeCause struct {
 
 func (x *OutcomeCause) Reset() {
 	*x = OutcomeCause{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[99]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[98]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11679,7 +11605,7 @@ func (x *OutcomeCause) String() string {
 func (*OutcomeCause) ProtoMessage() {}
 
 func (x *OutcomeCause) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[99]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[98]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11692,7 +11618,7 @@ func (x *OutcomeCause) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OutcomeCause.ProtoReflect.Descriptor instead.
 func (*OutcomeCause) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{99}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{98}
 }
 
 func (x *OutcomeCause) GetCode() CauseCode {
@@ -11737,7 +11663,7 @@ type ResourceShortfall struct {
 
 func (x *ResourceShortfall) Reset() {
 	*x = ResourceShortfall{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[100]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[99]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11749,7 +11675,7 @@ func (x *ResourceShortfall) String() string {
 func (*ResourceShortfall) ProtoMessage() {}
 
 func (x *ResourceShortfall) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[100]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[99]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11762,7 +11688,7 @@ func (x *ResourceShortfall) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResourceShortfall.ProtoReflect.Descriptor instead.
 func (*ResourceShortfall) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{100}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{99}
 }
 
 func (x *ResourceShortfall) GetResource() string {
@@ -11823,7 +11749,7 @@ type AttemptOutcomeAck struct {
 
 func (x *AttemptOutcomeAck) Reset() {
 	*x = AttemptOutcomeAck{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[101]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[100]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11835,7 +11761,7 @@ func (x *AttemptOutcomeAck) String() string {
 func (*AttemptOutcomeAck) ProtoMessage() {}
 
 func (x *AttemptOutcomeAck) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[101]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[100]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11848,7 +11774,7 @@ func (x *AttemptOutcomeAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptOutcomeAck.ProtoReflect.Descriptor instead.
 func (*AttemptOutcomeAck) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{101}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{100}
 }
 
 func (x *AttemptOutcomeAck) GetRecordOwnerEpoch() uint64 {
@@ -11925,7 +11851,7 @@ type JobCheckpointRequest struct {
 
 func (x *JobCheckpointRequest) Reset() {
 	*x = JobCheckpointRequest{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[102]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[101]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11937,7 +11863,7 @@ func (x *JobCheckpointRequest) String() string {
 func (*JobCheckpointRequest) ProtoMessage() {}
 
 func (x *JobCheckpointRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[102]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[101]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11950,7 +11876,7 @@ func (x *JobCheckpointRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JobCheckpointRequest.ProtoReflect.Descriptor instead.
 func (*JobCheckpointRequest) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{102}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{101}
 }
 
 func (x *JobCheckpointRequest) GetRecordOwnerEpoch() uint64 {
@@ -12042,7 +11968,7 @@ type JobCheckpointReceipt struct {
 
 func (x *JobCheckpointReceipt) Reset() {
 	*x = JobCheckpointReceipt{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[103]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[102]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12054,7 +11980,7 @@ func (x *JobCheckpointReceipt) String() string {
 func (*JobCheckpointReceipt) ProtoMessage() {}
 
 func (x *JobCheckpointReceipt) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[103]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[102]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12067,7 +11993,7 @@ func (x *JobCheckpointReceipt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JobCheckpointReceipt.ProtoReflect.Descriptor instead.
 func (*JobCheckpointReceipt) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{103}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{102}
 }
 
 func (x *JobCheckpointReceipt) GetRecordOwnerEpoch() uint64 {
@@ -12158,7 +12084,7 @@ type CheckpointFault struct {
 
 func (x *CheckpointFault) Reset() {
 	*x = CheckpointFault{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[104]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[103]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12170,7 +12096,7 @@ func (x *CheckpointFault) String() string {
 func (*CheckpointFault) ProtoMessage() {}
 
 func (x *CheckpointFault) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[104]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[103]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12183,7 +12109,7 @@ func (x *CheckpointFault) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckpointFault.ProtoReflect.Descriptor instead.
 func (*CheckpointFault) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{104}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{103}
 }
 
 func (x *CheckpointFault) GetCode() CheckpointFaultCode {
@@ -12223,7 +12149,7 @@ type JobCheckpointAck struct {
 
 func (x *JobCheckpointAck) Reset() {
 	*x = JobCheckpointAck{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[105]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[104]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12235,7 +12161,7 @@ func (x *JobCheckpointAck) String() string {
 func (*JobCheckpointAck) ProtoMessage() {}
 
 func (x *JobCheckpointAck) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[105]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[104]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12248,7 +12174,7 @@ func (x *JobCheckpointAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JobCheckpointAck.ProtoReflect.Descriptor instead.
 func (*JobCheckpointAck) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{105}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{104}
 }
 
 func (x *JobCheckpointAck) GetRecordOwnerEpoch() uint64 {
@@ -12319,7 +12245,7 @@ type ProgressOpen struct {
 
 func (x *ProgressOpen) Reset() {
 	*x = ProgressOpen{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[106]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[105]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12331,7 +12257,7 @@ func (x *ProgressOpen) String() string {
 func (*ProgressOpen) ProtoMessage() {}
 
 func (x *ProgressOpen) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[106]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[105]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12344,7 +12270,7 @@ func (x *ProgressOpen) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProgressOpen.ProtoReflect.Descriptor instead.
 func (*ProgressOpen) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{106}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{105}
 }
 
 func (x *ProgressOpen) GetRecordOwnerEpoch() uint64 {
@@ -12394,7 +12320,7 @@ type AttemptProgress struct {
 
 func (x *AttemptProgress) Reset() {
 	*x = AttemptProgress{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[107]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[106]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12406,7 +12332,7 @@ func (x *AttemptProgress) String() string {
 func (*AttemptProgress) ProtoMessage() {}
 
 func (x *AttemptProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[107]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[106]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12419,7 +12345,7 @@ func (x *AttemptProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptProgress.ProtoReflect.Descriptor instead.
 func (*AttemptProgress) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{107}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{106}
 }
 
 func (x *AttemptProgress) GetRecordOwnerEpoch() uint64 {
@@ -12507,7 +12433,7 @@ type InvocationSpec struct {
 
 func (x *InvocationSpec) Reset() {
 	*x = InvocationSpec{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[108]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[107]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12519,7 +12445,7 @@ func (x *InvocationSpec) String() string {
 func (*InvocationSpec) ProtoMessage() {}
 
 func (x *InvocationSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[108]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[107]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12532,7 +12458,7 @@ func (x *InvocationSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InvocationSpec.ProtoReflect.Descriptor instead.
 func (*InvocationSpec) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{108}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{107}
 }
 
 func (x *InvocationSpec) GetEnvironmentDigest() string {
@@ -12624,7 +12550,7 @@ type InputBinding struct {
 
 func (x *InputBinding) Reset() {
 	*x = InputBinding{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[109]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[108]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12636,7 +12562,7 @@ func (x *InputBinding) String() string {
 func (*InputBinding) ProtoMessage() {}
 
 func (x *InputBinding) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[109]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[108]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12649,7 +12575,7 @@ func (x *InputBinding) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InputBinding.ProtoReflect.Descriptor instead.
 func (*InputBinding) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{109}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{108}
 }
 
 func (x *InputBinding) GetInputId() string {
@@ -12698,7 +12624,7 @@ type OutputBinding struct {
 
 func (x *OutputBinding) Reset() {
 	*x = OutputBinding{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[110]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[109]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12710,7 +12636,7 @@ func (x *OutputBinding) String() string {
 func (*OutputBinding) ProtoMessage() {}
 
 func (x *OutputBinding) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[110]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[109]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12723,7 +12649,7 @@ func (x *OutputBinding) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OutputBinding.ProtoReflect.Descriptor instead.
 func (*OutputBinding) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{110}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{109}
 }
 
 func (x *OutputBinding) GetOutputId() string {
@@ -12757,7 +12683,7 @@ type ServingInvocationSpec struct {
 
 func (x *ServingInvocationSpec) Reset() {
 	*x = ServingInvocationSpec{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[111]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[110]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12769,7 +12695,7 @@ func (x *ServingInvocationSpec) String() string {
 func (*ServingInvocationSpec) ProtoMessage() {}
 
 func (x *ServingInvocationSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[111]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[110]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12782,7 +12708,7 @@ func (x *ServingInvocationSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServingInvocationSpec.ProtoReflect.Descriptor instead.
 func (*ServingInvocationSpec) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{111}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{110}
 }
 
 func (x *ServingInvocationSpec) GetEntrypointBindingDigest() string {
@@ -12810,7 +12736,7 @@ type JobInvocationSpec struct {
 
 func (x *JobInvocationSpec) Reset() {
 	*x = JobInvocationSpec{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[112]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[111]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12822,7 +12748,7 @@ func (x *JobInvocationSpec) String() string {
 func (*JobInvocationSpec) ProtoMessage() {}
 
 func (x *JobInvocationSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[112]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[111]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12835,7 +12761,7 @@ func (x *JobInvocationSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JobInvocationSpec.ProtoReflect.Descriptor instead.
 func (*JobInvocationSpec) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{112}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{111}
 }
 
 func (x *JobInvocationSpec) GetBuildId() string {
@@ -12875,7 +12801,7 @@ type DeliveryGrant struct {
 
 func (x *DeliveryGrant) Reset() {
 	*x = DeliveryGrant{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[113]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[112]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12887,7 +12813,7 @@ func (x *DeliveryGrant) String() string {
 func (*DeliveryGrant) ProtoMessage() {}
 
 func (x *DeliveryGrant) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[113]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[112]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12900,7 +12826,7 @@ func (x *DeliveryGrant) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeliveryGrant.ProtoReflect.Descriptor instead.
 func (*DeliveryGrant) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{113}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{112}
 }
 
 func (x *DeliveryGrant) GetInvocationSpecDigest() []byte {
@@ -12955,7 +12881,7 @@ type InputAccess struct {
 
 func (x *InputAccess) Reset() {
 	*x = InputAccess{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[114]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[113]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12967,7 +12893,7 @@ func (x *InputAccess) String() string {
 func (*InputAccess) ProtoMessage() {}
 
 func (x *InputAccess) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[114]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[113]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12980,7 +12906,7 @@ func (x *InputAccess) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InputAccess.ProtoReflect.Descriptor instead.
 func (*InputAccess) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{114}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{113}
 }
 
 func (x *InputAccess) GetInputId() string {
@@ -13007,7 +12933,7 @@ type OutputAccess struct {
 
 func (x *OutputAccess) Reset() {
 	*x = OutputAccess{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[115]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[114]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13019,7 +12945,7 @@ func (x *OutputAccess) String() string {
 func (*OutputAccess) ProtoMessage() {}
 
 func (x *OutputAccess) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[115]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[114]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13032,7 +12958,7 @@ func (x *OutputAccess) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OutputAccess.ProtoReflect.Descriptor instead.
 func (*OutputAccess) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{115}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{114}
 }
 
 func (x *OutputAccess) GetOutputId() string {
@@ -13062,7 +12988,7 @@ type DeliveryAccessCredential struct {
 
 func (x *DeliveryAccessCredential) Reset() {
 	*x = DeliveryAccessCredential{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[116]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[115]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13074,7 +13000,7 @@ func (x *DeliveryAccessCredential) String() string {
 func (*DeliveryAccessCredential) ProtoMessage() {}
 
 func (x *DeliveryAccessCredential) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[116]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[115]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13087,7 +13013,7 @@ func (x *DeliveryAccessCredential) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeliveryAccessCredential.ProtoReflect.Descriptor instead.
 func (*DeliveryAccessCredential) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{116}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{115}
 }
 
 func (x *DeliveryAccessCredential) GetIssuer() string {
@@ -13137,7 +13063,7 @@ type ResourceCaps struct {
 
 func (x *ResourceCaps) Reset() {
 	*x = ResourceCaps{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[117]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[116]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13149,7 +13075,7 @@ func (x *ResourceCaps) String() string {
 func (*ResourceCaps) ProtoMessage() {}
 
 func (x *ResourceCaps) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[117]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[116]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13162,7 +13088,7 @@ func (x *ResourceCaps) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResourceCaps.ProtoReflect.Descriptor instead.
 func (*ResourceCaps) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{117}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{116}
 }
 
 func (x *ResourceCaps) GetDeviceRequired() bool {
@@ -13203,7 +13129,7 @@ type PublicationContract struct {
 
 func (x *PublicationContract) Reset() {
 	*x = PublicationContract{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[118]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[117]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13215,7 +13141,7 @@ func (x *PublicationContract) String() string {
 func (*PublicationContract) ProtoMessage() {}
 
 func (x *PublicationContract) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[118]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[117]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13228,7 +13154,7 @@ func (x *PublicationContract) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublicationContract.ProtoReflect.Descriptor instead.
 func (*PublicationContract) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{118}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{117}
 }
 
 func (x *PublicationContract) GetOutputs() []*OutputBinding {
@@ -13276,7 +13202,7 @@ type WorkerResources struct {
 
 func (x *WorkerResources) Reset() {
 	*x = WorkerResources{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[119]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[118]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13288,7 +13214,7 @@ func (x *WorkerResources) String() string {
 func (*WorkerResources) ProtoMessage() {}
 
 func (x *WorkerResources) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[119]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[118]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13301,7 +13227,7 @@ func (x *WorkerResources) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkerResources.ProtoReflect.Descriptor instead.
 func (*WorkerResources) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{119}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{118}
 }
 
 func (x *WorkerResources) GetPlatform() string {
@@ -13428,7 +13354,7 @@ type JobCapacity struct {
 
 func (x *JobCapacity) Reset() {
 	*x = JobCapacity{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[120]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[119]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13440,7 +13366,7 @@ func (x *JobCapacity) String() string {
 func (*JobCapacity) ProtoMessage() {}
 
 func (x *JobCapacity) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[120]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[119]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13453,7 +13379,7 @@ func (x *JobCapacity) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JobCapacity.ProtoReflect.Descriptor instead.
 func (*JobCapacity) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{120}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{119}
 }
 
 func (x *JobCapacity) GetJobsInFlight() uint32 {
@@ -13511,7 +13437,7 @@ type HeldAttempt struct {
 
 func (x *HeldAttempt) Reset() {
 	*x = HeldAttempt{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[121]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[120]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13523,7 +13449,7 @@ func (x *HeldAttempt) String() string {
 func (*HeldAttempt) ProtoMessage() {}
 
 func (x *HeldAttempt) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[121]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[120]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13536,7 +13462,7 @@ func (x *HeldAttempt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeldAttempt.ProtoReflect.Descriptor instead.
 func (*HeldAttempt) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{121}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{120}
 }
 
 func (x *HeldAttempt) GetRequestId() string {
@@ -13649,7 +13575,7 @@ type Fault struct {
 
 func (x *Fault) Reset() {
 	*x = Fault{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[122]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[121]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13661,7 +13587,7 @@ func (x *Fault) String() string {
 func (*Fault) ProtoMessage() {}
 
 func (x *Fault) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[122]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[121]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13674,7 +13600,7 @@ func (x *Fault) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Fault.ProtoReflect.Descriptor instead.
 func (*Fault) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{122}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{121}
 }
 
 func (x *Fault) GetKind() FaultKind {
@@ -13718,7 +13644,7 @@ type OutputManifest struct {
 
 func (x *OutputManifest) Reset() {
 	*x = OutputManifest{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[123]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[122]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13730,7 +13656,7 @@ func (x *OutputManifest) String() string {
 func (*OutputManifest) ProtoMessage() {}
 
 func (x *OutputManifest) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[123]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[122]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13743,7 +13669,7 @@ func (x *OutputManifest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OutputManifest.ProtoReflect.Descriptor instead.
 func (*OutputManifest) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{123}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{122}
 }
 
 func (x *OutputManifest) GetPublicationReceiptDigest() string {
@@ -13772,7 +13698,7 @@ type OutputEntry struct {
 
 func (x *OutputEntry) Reset() {
 	*x = OutputEntry{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[124]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[123]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13784,7 +13710,7 @@ func (x *OutputEntry) String() string {
 func (*OutputEntry) ProtoMessage() {}
 
 func (x *OutputEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[124]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[123]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13797,7 +13723,7 @@ func (x *OutputEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OutputEntry.ProtoReflect.Descriptor instead.
 func (*OutputEntry) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{124}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{123}
 }
 
 func (x *OutputEntry) GetOutputId() string {
@@ -13852,7 +13778,7 @@ type AttemptMetrics struct {
 
 func (x *AttemptMetrics) Reset() {
 	*x = AttemptMetrics{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[125]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[124]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13864,7 +13790,7 @@ func (x *AttemptMetrics) String() string {
 func (*AttemptMetrics) ProtoMessage() {}
 
 func (x *AttemptMetrics) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[125]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[124]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13877,7 +13803,7 @@ func (x *AttemptMetrics) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptMetrics.ProtoReflect.Descriptor instead.
 func (*AttemptMetrics) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{125}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{124}
 }
 
 func (x *AttemptMetrics) GetRuntimeMs() uint64 {
@@ -13982,7 +13908,7 @@ type TriageBundleRef struct {
 
 func (x *TriageBundleRef) Reset() {
 	*x = TriageBundleRef{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[126]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[125]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13994,7 +13920,7 @@ func (x *TriageBundleRef) String() string {
 func (*TriageBundleRef) ProtoMessage() {}
 
 func (x *TriageBundleRef) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[126]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[125]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14007,7 +13933,7 @@ func (x *TriageBundleRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TriageBundleRef.ProtoReflect.Descriptor instead.
 func (*TriageBundleRef) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{126}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{125}
 }
 
 func (x *TriageBundleRef) GetSubjectId() string {
@@ -14223,7 +14149,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\tresources\x18\t \x01(\v2\x1f.cozy.worker.v1.WorkerResourcesR\tresources\x124\n" +
 	"\x16control_runtime_digest\x18\n" +
 	" \x01(\tR\x14controlRuntimeDigest\x12*\n" +
-	"\x11worker_release_id\x18\v \x01(\tR\x0fworkerReleaseIdJ\x04\b\x04\x10\x05\"\xe9\x03\n" +
+	"\x11worker_release_id\x18\v \x01(\tR\x0fworkerReleaseIdJ\x04\b\x04\x10\x05\"\xb5\x03\n" +
 	"\x0eWorkerSnapshot\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
 	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
@@ -14232,10 +14158,9 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"snapshotId\x12'\n" +
 	"\x0fsnapshot_digest\x18\x06 \x01(\fR\x0esnapshotDigest\x128\n" +
 	"\x18snapshot_canonical_bytes\x18\a \x01(\fR\x16snapshotCanonicalBytes\x12R\n" +
-	"&accepted_placement_set_canonical_bytes\x18\b \x01(\fR\"acceptedPlacementSetCanonicalBytes\x120\n" +
-	"\x14host_snapshot_digest\x18\t \x01(\fR\x12hostSnapshotDigest\x12A\n" +
-	"\x1dhost_snapshot_canonical_bytes\x18\n" +
-	" \x01(\fR\x1ahostSnapshotCanonicalBytesJ\x04\b\x04\x10\x05\"\x9d\x06\n" +
+	"&accepted_placement_set_canonical_bytes\x18\b \x01(\fR\"acceptedPlacementSetCanonicalBytesJ\x04\b\x04\x10\x05J\x04\b\t\x10\n" +
+	"J\x04\b\n" +
+	"\x10\vR\x14host_snapshot_digestR\x1dhost_snapshot_canonical_bytes\"\x9d\x06\n" +
 	"\x12WorkerSnapshotBody\x12E\n" +
 	"\x1faccepted_desired_state_revision\x18\x01 \x01(\x04R\x1cacceptedDesiredStateRevision\x12A\n" +
 	"\x1daccepted_placement_set_digest\x18\x02 \x01(\fR\x1aacceptedPlacementSetDigest\x12+\n" +
@@ -14252,18 +14177,14 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	" \x03(\v2\x1b.cozy.worker.v1.HeldAttemptR\fheldAttempts\x12[\n" +
 	"\x14weights_transactions\x18\v \x03(\v2(.cozy.worker.v1.WeightsTransactionStatusR\x13weightsTransactions\x120\n" +
 	"\x05lanes\x18\f \x03(\v2\x1a.cozy.worker.v1.DeviceLaneR\x05lanes\x12%\n" +
-	"\x0eheld_manifests\x18\r \x03(\tR\rheldManifests\"\xb1\x01\n" +
-	"\x10HostSnapshotBody\x12@\n" +
-	"\rheld_outcomes\x18\x01 \x03(\v2\x1b.cozy.worker.v1.HeldAttemptR\fheldOutcomes\x12[\n" +
-	"\x14weights_transactions\x18\x02 \x03(\v2(.cozy.worker.v1.WeightsTransactionStatusR\x13weightsTransactions\"\x95\x02\n" +
+	"\x0eheld_manifests\x18\r \x03(\tR\rheldManifests\"\xff\x01\n" +
 	"\vSnapshotAck\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
 	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12\x1f\n" +
 	"\vsnapshot_id\x18\x05 \x01(\tR\n" +
 	"snapshotId\x12'\n" +
-	"\x0fsnapshot_digest\x18\x06 \x01(\fR\x0esnapshotDigest\x120\n" +
-	"\x14host_snapshot_digest\x18\a \x01(\fR\x12hostSnapshotDigestJ\x04\b\x04\x10\x05\"\xd0\x05\n" +
+	"\x0fsnapshot_digest\x18\x06 \x01(\fR\x0esnapshotDigestJ\x04\b\x04\x10\x05J\x04\b\a\x10\bR\x14host_snapshot_digest\"\xd0\x05\n" +
 	"\x12DesiredWorkerState\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
 	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
@@ -15365,7 +15286,7 @@ func file_cozy_worker_v1_worker_proto_rawDescGZIP() []byte {
 }
 
 var file_cozy_worker_v1_worker_proto_enumTypes = make([]protoimpl.EnumInfo, 33)
-var file_cozy_worker_v1_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 127)
+var file_cozy_worker_v1_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 126)
 var file_cozy_worker_v1_worker_proto_goTypes = []any{
 	(Posture)(0),                               // 0: cozy.worker.v1.Posture
 	(WorkerPhase)(0),                           // 1: cozy.worker.v1.WorkerPhase
@@ -15431,326 +15352,323 @@ var file_cozy_worker_v1_worker_proto_goTypes = []any{
 	(*BootFailure)(nil),                        // 61: cozy.worker.v1.BootFailure
 	(*WorkerSnapshot)(nil),                     // 62: cozy.worker.v1.WorkerSnapshot
 	(*WorkerSnapshotBody)(nil),                 // 63: cozy.worker.v1.WorkerSnapshotBody
-	(*HostSnapshotBody)(nil),                   // 64: cozy.worker.v1.HostSnapshotBody
-	(*SnapshotAck)(nil),                        // 65: cozy.worker.v1.SnapshotAck
-	(*DesiredWorkerState)(nil),                 // 66: cozy.worker.v1.DesiredWorkerState
-	(*DesiredPackageSet)(nil),                  // 67: cozy.worker.v1.DesiredPackageSet
-	(*DesiredLocalPackageSet)(nil),             // 68: cozy.worker.v1.DesiredLocalPackageSet
-	(*DesiredPrivatePlacementSet)(nil),         // 69: cozy.worker.v1.DesiredPrivatePlacementSet
-	(*LocalPackageFileRef)(nil),                // 70: cozy.worker.v1.LocalPackageFileRef
-	(*LocalPackageRevision)(nil),               // 71: cozy.worker.v1.LocalPackageRevision
-	(*DesiredPlacementSet)(nil),                // 72: cozy.worker.v1.DesiredPlacementSet
-	(*PlacementDevicePin)(nil),                 // 73: cozy.worker.v1.PlacementDevicePin
-	(*PlacementSet)(nil),                       // 74: cozy.worker.v1.PlacementSet
-	(*DownloadDelegation)(nil),                 // 75: cozy.worker.v1.DownloadDelegation
-	(*DownloadModelRef)(nil),                   // 76: cozy.worker.v1.DownloadModelRef
-	(*DownloadPackageRef)(nil),                 // 77: cozy.worker.v1.DownloadPackageRef
-	(*Placement)(nil),                          // 78: cozy.worker.v1.Placement
-	(*Ref)(nil),                                // 79: cozy.worker.v1.Ref
-	(*WheelFact)(nil),                          // 80: cozy.worker.v1.WheelFact
-	(*PackageSelection)(nil),                   // 81: cozy.worker.v1.PackageSelection
-	(*DevelopmentPackage)(nil),                 // 82: cozy.worker.v1.DevelopmentPackage
-	(*Environment)(nil),                        // 83: cozy.worker.v1.Environment
-	(*Model)(nil),                              // 84: cozy.worker.v1.Model
-	(*Entrypoint)(nil),                         // 85: cozy.worker.v1.Entrypoint
-	(*Slot)(nil),                               // 86: cozy.worker.v1.Slot
-	(*Component)(nil),                          // 87: cozy.worker.v1.Component
-	(*Stamp)(nil),                              // 88: cozy.worker.v1.Stamp
-	(*JobDirective)(nil),                       // 89: cozy.worker.v1.JobDirective
-	(*ObservedWorkerState)(nil),                // 90: cozy.worker.v1.ObservedWorkerState
-	(*DeviceLane)(nil),                         // 91: cozy.worker.v1.DeviceLane
-	(*PlacementStatus)(nil),                    // 92: cozy.worker.v1.PlacementStatus
-	(*PlacementAcquisitionObservation)(nil),    // 93: cozy.worker.v1.PlacementAcquisitionObservation
-	(*AcquisitionLegObservation)(nil),          // 94: cozy.worker.v1.AcquisitionLegObservation
-	(*AcceleratorQualification)(nil),           // 95: cozy.worker.v1.AcceleratorQualification
-	(*ActivityEvent)(nil),                      // 96: cozy.worker.v1.ActivityEvent
-	(*AttemptOffer)(nil),                       // 97: cozy.worker.v1.AttemptOffer
-	(*AttemptAccepted)(nil),                    // 98: cozy.worker.v1.AttemptAccepted
-	(*AttemptPlanSummary)(nil),                 // 99: cozy.worker.v1.AttemptPlanSummary
-	(*CancelAttempt)(nil),                      // 100: cozy.worker.v1.CancelAttempt
-	(*AttemptOutcome)(nil),                     // 101: cozy.worker.v1.AttemptOutcome
-	(*AttemptOutcomeBody)(nil),                 // 102: cozy.worker.v1.AttemptOutcomeBody
-	(*WeightsReceiptRef)(nil),                  // 103: cozy.worker.v1.WeightsReceiptRef
-	(*WeightsReceipt)(nil),                     // 104: cozy.worker.v1.WeightsReceipt
-	(*WeightsObjectSource)(nil),                // 105: cozy.worker.v1.WeightsObjectSource
-	(*WeightsIntentFrame)(nil),                 // 106: cozy.worker.v1.WeightsIntentFrame
-	(*WeightsHostAck)(nil),                     // 107: cozy.worker.v1.WeightsHostAck
-	(*WeightsReceiptFrame)(nil),                // 108: cozy.worker.v1.WeightsReceiptFrame
-	(*WeightsTransactionStatus)(nil),           // 109: cozy.worker.v1.WeightsTransactionStatus
-	(*WeightsReadRequest)(nil),                 // 110: cozy.worker.v1.WeightsReadRequest
-	(*WeightsReadResult)(nil),                  // 111: cozy.worker.v1.WeightsReadResult
-	(*WeightsObjectRef)(nil),                   // 112: cozy.worker.v1.WeightsObjectRef
-	(*WeightsUploadHeader)(nil),                // 113: cozy.worker.v1.WeightsUploadHeader
-	(*WeightsUploadGrant)(nil),                 // 114: cozy.worker.v1.WeightsUploadGrant
-	(*WeightsTransferRequest)(nil),             // 115: cozy.worker.v1.WeightsTransferRequest
-	(*WeightsUploadRequest)(nil),               // 116: cozy.worker.v1.WeightsUploadRequest
-	(*WeightsUploadResult)(nil),                // 117: cozy.worker.v1.WeightsUploadResult
-	(*WeightsTransferStatus)(nil),              // 118: cozy.worker.v1.WeightsTransferStatus
-	(*ModelSourceFileRequest)(nil),             // 119: cozy.worker.v1.ModelSourceFileRequest
-	(*ModelSourceFileStatus)(nil),              // 120: cozy.worker.v1.ModelSourceFileStatus
-	(*ModelSourcePrepareRequest)(nil),          // 121: cozy.worker.v1.ModelSourcePrepareRequest
-	(*ModelSourcePrepared)(nil),                // 122: cozy.worker.v1.ModelSourcePrepared
-	(*LocalPackageFileGrant)(nil),              // 123: cozy.worker.v1.LocalPackageFileGrant
-	(*LocalPackageFetchRequest)(nil),           // 124: cozy.worker.v1.LocalPackageFetchRequest
-	(*LocalPackageFileStatus)(nil),             // 125: cozy.worker.v1.LocalPackageFileStatus
-	(*LocalPackageAbort)(nil),                  // 126: cozy.worker.v1.LocalPackageAbort
-	(*LocalPackageAbortStatus)(nil),            // 127: cozy.worker.v1.LocalPackageAbortStatus
-	(*WeightsFinalizeRequest)(nil),             // 128: cozy.worker.v1.WeightsFinalizeRequest
-	(*WeightsFinalizeResult)(nil),              // 129: cozy.worker.v1.WeightsFinalizeResult
-	(*ResultEnvelope)(nil),                     // 130: cozy.worker.v1.ResultEnvelope
-	(*AdjustmentRow)(nil),                      // 131: cozy.worker.v1.AdjustmentRow
-	(*OutcomeCause)(nil),                       // 132: cozy.worker.v1.OutcomeCause
-	(*ResourceShortfall)(nil),                  // 133: cozy.worker.v1.ResourceShortfall
-	(*AttemptOutcomeAck)(nil),                  // 134: cozy.worker.v1.AttemptOutcomeAck
-	(*JobCheckpointRequest)(nil),               // 135: cozy.worker.v1.JobCheckpointRequest
-	(*JobCheckpointReceipt)(nil),               // 136: cozy.worker.v1.JobCheckpointReceipt
-	(*CheckpointFault)(nil),                    // 137: cozy.worker.v1.CheckpointFault
-	(*JobCheckpointAck)(nil),                   // 138: cozy.worker.v1.JobCheckpointAck
-	(*ProgressOpen)(nil),                       // 139: cozy.worker.v1.ProgressOpen
-	(*AttemptProgress)(nil),                    // 140: cozy.worker.v1.AttemptProgress
-	(*InvocationSpec)(nil),                     // 141: cozy.worker.v1.InvocationSpec
-	(*InputBinding)(nil),                       // 142: cozy.worker.v1.InputBinding
-	(*OutputBinding)(nil),                      // 143: cozy.worker.v1.OutputBinding
-	(*ServingInvocationSpec)(nil),              // 144: cozy.worker.v1.ServingInvocationSpec
-	(*JobInvocationSpec)(nil),                  // 145: cozy.worker.v1.JobInvocationSpec
-	(*DeliveryGrant)(nil),                      // 146: cozy.worker.v1.DeliveryGrant
-	(*InputAccess)(nil),                        // 147: cozy.worker.v1.InputAccess
-	(*OutputAccess)(nil),                       // 148: cozy.worker.v1.OutputAccess
-	(*DeliveryAccessCredential)(nil),           // 149: cozy.worker.v1.DeliveryAccessCredential
-	(*ResourceCaps)(nil),                       // 150: cozy.worker.v1.ResourceCaps
-	(*PublicationContract)(nil),                // 151: cozy.worker.v1.PublicationContract
-	(*WorkerResources)(nil),                    // 152: cozy.worker.v1.WorkerResources
-	(*JobCapacity)(nil),                        // 153: cozy.worker.v1.JobCapacity
-	(*HeldAttempt)(nil),                        // 154: cozy.worker.v1.HeldAttempt
-	(*Fault)(nil),                              // 155: cozy.worker.v1.Fault
-	(*OutputManifest)(nil),                     // 156: cozy.worker.v1.OutputManifest
-	(*OutputEntry)(nil),                        // 157: cozy.worker.v1.OutputEntry
-	(*AttemptMetrics)(nil),                     // 158: cozy.worker.v1.AttemptMetrics
-	(*TriageBundleRef)(nil),                    // 159: cozy.worker.v1.TriageBundleRef
+	(*SnapshotAck)(nil),                        // 64: cozy.worker.v1.SnapshotAck
+	(*DesiredWorkerState)(nil),                 // 65: cozy.worker.v1.DesiredWorkerState
+	(*DesiredPackageSet)(nil),                  // 66: cozy.worker.v1.DesiredPackageSet
+	(*DesiredLocalPackageSet)(nil),             // 67: cozy.worker.v1.DesiredLocalPackageSet
+	(*DesiredPrivatePlacementSet)(nil),         // 68: cozy.worker.v1.DesiredPrivatePlacementSet
+	(*LocalPackageFileRef)(nil),                // 69: cozy.worker.v1.LocalPackageFileRef
+	(*LocalPackageRevision)(nil),               // 70: cozy.worker.v1.LocalPackageRevision
+	(*DesiredPlacementSet)(nil),                // 71: cozy.worker.v1.DesiredPlacementSet
+	(*PlacementDevicePin)(nil),                 // 72: cozy.worker.v1.PlacementDevicePin
+	(*PlacementSet)(nil),                       // 73: cozy.worker.v1.PlacementSet
+	(*DownloadDelegation)(nil),                 // 74: cozy.worker.v1.DownloadDelegation
+	(*DownloadModelRef)(nil),                   // 75: cozy.worker.v1.DownloadModelRef
+	(*DownloadPackageRef)(nil),                 // 76: cozy.worker.v1.DownloadPackageRef
+	(*Placement)(nil),                          // 77: cozy.worker.v1.Placement
+	(*Ref)(nil),                                // 78: cozy.worker.v1.Ref
+	(*WheelFact)(nil),                          // 79: cozy.worker.v1.WheelFact
+	(*PackageSelection)(nil),                   // 80: cozy.worker.v1.PackageSelection
+	(*DevelopmentPackage)(nil),                 // 81: cozy.worker.v1.DevelopmentPackage
+	(*Environment)(nil),                        // 82: cozy.worker.v1.Environment
+	(*Model)(nil),                              // 83: cozy.worker.v1.Model
+	(*Entrypoint)(nil),                         // 84: cozy.worker.v1.Entrypoint
+	(*Slot)(nil),                               // 85: cozy.worker.v1.Slot
+	(*Component)(nil),                          // 86: cozy.worker.v1.Component
+	(*Stamp)(nil),                              // 87: cozy.worker.v1.Stamp
+	(*JobDirective)(nil),                       // 88: cozy.worker.v1.JobDirective
+	(*ObservedWorkerState)(nil),                // 89: cozy.worker.v1.ObservedWorkerState
+	(*DeviceLane)(nil),                         // 90: cozy.worker.v1.DeviceLane
+	(*PlacementStatus)(nil),                    // 91: cozy.worker.v1.PlacementStatus
+	(*PlacementAcquisitionObservation)(nil),    // 92: cozy.worker.v1.PlacementAcquisitionObservation
+	(*AcquisitionLegObservation)(nil),          // 93: cozy.worker.v1.AcquisitionLegObservation
+	(*AcceleratorQualification)(nil),           // 94: cozy.worker.v1.AcceleratorQualification
+	(*ActivityEvent)(nil),                      // 95: cozy.worker.v1.ActivityEvent
+	(*AttemptOffer)(nil),                       // 96: cozy.worker.v1.AttemptOffer
+	(*AttemptAccepted)(nil),                    // 97: cozy.worker.v1.AttemptAccepted
+	(*AttemptPlanSummary)(nil),                 // 98: cozy.worker.v1.AttemptPlanSummary
+	(*CancelAttempt)(nil),                      // 99: cozy.worker.v1.CancelAttempt
+	(*AttemptOutcome)(nil),                     // 100: cozy.worker.v1.AttemptOutcome
+	(*AttemptOutcomeBody)(nil),                 // 101: cozy.worker.v1.AttemptOutcomeBody
+	(*WeightsReceiptRef)(nil),                  // 102: cozy.worker.v1.WeightsReceiptRef
+	(*WeightsReceipt)(nil),                     // 103: cozy.worker.v1.WeightsReceipt
+	(*WeightsObjectSource)(nil),                // 104: cozy.worker.v1.WeightsObjectSource
+	(*WeightsIntentFrame)(nil),                 // 105: cozy.worker.v1.WeightsIntentFrame
+	(*WeightsHostAck)(nil),                     // 106: cozy.worker.v1.WeightsHostAck
+	(*WeightsReceiptFrame)(nil),                // 107: cozy.worker.v1.WeightsReceiptFrame
+	(*WeightsTransactionStatus)(nil),           // 108: cozy.worker.v1.WeightsTransactionStatus
+	(*WeightsReadRequest)(nil),                 // 109: cozy.worker.v1.WeightsReadRequest
+	(*WeightsReadResult)(nil),                  // 110: cozy.worker.v1.WeightsReadResult
+	(*WeightsObjectRef)(nil),                   // 111: cozy.worker.v1.WeightsObjectRef
+	(*WeightsUploadHeader)(nil),                // 112: cozy.worker.v1.WeightsUploadHeader
+	(*WeightsUploadGrant)(nil),                 // 113: cozy.worker.v1.WeightsUploadGrant
+	(*WeightsTransferRequest)(nil),             // 114: cozy.worker.v1.WeightsTransferRequest
+	(*WeightsUploadRequest)(nil),               // 115: cozy.worker.v1.WeightsUploadRequest
+	(*WeightsUploadResult)(nil),                // 116: cozy.worker.v1.WeightsUploadResult
+	(*WeightsTransferStatus)(nil),              // 117: cozy.worker.v1.WeightsTransferStatus
+	(*ModelSourceFileRequest)(nil),             // 118: cozy.worker.v1.ModelSourceFileRequest
+	(*ModelSourceFileStatus)(nil),              // 119: cozy.worker.v1.ModelSourceFileStatus
+	(*ModelSourcePrepareRequest)(nil),          // 120: cozy.worker.v1.ModelSourcePrepareRequest
+	(*ModelSourcePrepared)(nil),                // 121: cozy.worker.v1.ModelSourcePrepared
+	(*LocalPackageFileGrant)(nil),              // 122: cozy.worker.v1.LocalPackageFileGrant
+	(*LocalPackageFetchRequest)(nil),           // 123: cozy.worker.v1.LocalPackageFetchRequest
+	(*LocalPackageFileStatus)(nil),             // 124: cozy.worker.v1.LocalPackageFileStatus
+	(*LocalPackageAbort)(nil),                  // 125: cozy.worker.v1.LocalPackageAbort
+	(*LocalPackageAbortStatus)(nil),            // 126: cozy.worker.v1.LocalPackageAbortStatus
+	(*WeightsFinalizeRequest)(nil),             // 127: cozy.worker.v1.WeightsFinalizeRequest
+	(*WeightsFinalizeResult)(nil),              // 128: cozy.worker.v1.WeightsFinalizeResult
+	(*ResultEnvelope)(nil),                     // 129: cozy.worker.v1.ResultEnvelope
+	(*AdjustmentRow)(nil),                      // 130: cozy.worker.v1.AdjustmentRow
+	(*OutcomeCause)(nil),                       // 131: cozy.worker.v1.OutcomeCause
+	(*ResourceShortfall)(nil),                  // 132: cozy.worker.v1.ResourceShortfall
+	(*AttemptOutcomeAck)(nil),                  // 133: cozy.worker.v1.AttemptOutcomeAck
+	(*JobCheckpointRequest)(nil),               // 134: cozy.worker.v1.JobCheckpointRequest
+	(*JobCheckpointReceipt)(nil),               // 135: cozy.worker.v1.JobCheckpointReceipt
+	(*CheckpointFault)(nil),                    // 136: cozy.worker.v1.CheckpointFault
+	(*JobCheckpointAck)(nil),                   // 137: cozy.worker.v1.JobCheckpointAck
+	(*ProgressOpen)(nil),                       // 138: cozy.worker.v1.ProgressOpen
+	(*AttemptProgress)(nil),                    // 139: cozy.worker.v1.AttemptProgress
+	(*InvocationSpec)(nil),                     // 140: cozy.worker.v1.InvocationSpec
+	(*InputBinding)(nil),                       // 141: cozy.worker.v1.InputBinding
+	(*OutputBinding)(nil),                      // 142: cozy.worker.v1.OutputBinding
+	(*ServingInvocationSpec)(nil),              // 143: cozy.worker.v1.ServingInvocationSpec
+	(*JobInvocationSpec)(nil),                  // 144: cozy.worker.v1.JobInvocationSpec
+	(*DeliveryGrant)(nil),                      // 145: cozy.worker.v1.DeliveryGrant
+	(*InputAccess)(nil),                        // 146: cozy.worker.v1.InputAccess
+	(*OutputAccess)(nil),                       // 147: cozy.worker.v1.OutputAccess
+	(*DeliveryAccessCredential)(nil),           // 148: cozy.worker.v1.DeliveryAccessCredential
+	(*ResourceCaps)(nil),                       // 149: cozy.worker.v1.ResourceCaps
+	(*PublicationContract)(nil),                // 150: cozy.worker.v1.PublicationContract
+	(*WorkerResources)(nil),                    // 151: cozy.worker.v1.WorkerResources
+	(*JobCapacity)(nil),                        // 152: cozy.worker.v1.JobCapacity
+	(*HeldAttempt)(nil),                        // 153: cozy.worker.v1.HeldAttempt
+	(*Fault)(nil),                              // 154: cozy.worker.v1.Fault
+	(*OutputManifest)(nil),                     // 155: cozy.worker.v1.OutputManifest
+	(*OutputEntry)(nil),                        // 156: cozy.worker.v1.OutputEntry
+	(*AttemptMetrics)(nil),                     // 157: cozy.worker.v1.AttemptMetrics
+	(*TriageBundleRef)(nil),                    // 158: cozy.worker.v1.TriageBundleRef
 }
 var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
-	106, // 0: cozy.worker.v1.WeightsHostEvent.intent:type_name -> cozy.worker.v1.WeightsIntentFrame
-	108, // 1: cozy.worker.v1.WeightsHostEvent.receipt:type_name -> cozy.worker.v1.WeightsReceiptFrame
+	105, // 0: cozy.worker.v1.WeightsHostEvent.intent:type_name -> cozy.worker.v1.WeightsIntentFrame
+	107, // 1: cozy.worker.v1.WeightsHostEvent.receipt:type_name -> cozy.worker.v1.WeightsReceiptFrame
 	58,  // 2: cozy.worker.v1.PreparePackageSetCall.claim:type_name -> cozy.worker.v1.Claim
-	67,  // 3: cozy.worker.v1.PreparePackageSetCall.package_set:type_name -> cozy.worker.v1.DesiredPackageSet
+	66,  // 3: cozy.worker.v1.PreparePackageSetCall.package_set:type_name -> cozy.worker.v1.DesiredPackageSet
 	44,  // 4: cozy.worker.v1.PreparePackageSetCall.image_inventory:type_name -> cozy.worker.v1.ImageInventory
 	58,  // 5: cozy.worker.v1.PrepareLocalPackageCall.claim:type_name -> cozy.worker.v1.Claim
-	68,  // 6: cozy.worker.v1.PrepareLocalPackageCall.local_package_set:type_name -> cozy.worker.v1.DesiredLocalPackageSet
+	67,  // 6: cozy.worker.v1.PrepareLocalPackageCall.local_package_set:type_name -> cozy.worker.v1.DesiredLocalPackageSet
 	58,  // 7: cozy.worker.v1.PreparePrivatePlacementCall.claim:type_name -> cozy.worker.v1.Claim
-	69,  // 8: cozy.worker.v1.PreparePrivatePlacementCall.private_placement_set:type_name -> cozy.worker.v1.DesiredPrivatePlacementSet
+	68,  // 8: cozy.worker.v1.PreparePrivatePlacementCall.private_placement_set:type_name -> cozy.worker.v1.DesiredPrivatePlacementSet
 	16,  // 9: cozy.worker.v1.PrepareEvent.stage:type_name -> cozy.worker.v1.PrepareStage
-	72,  // 10: cozy.worker.v1.PrepareEvent.placement_set:type_name -> cozy.worker.v1.DesiredPlacementSet
+	71,  // 10: cozy.worker.v1.PrepareEvent.placement_set:type_name -> cozy.worker.v1.DesiredPlacementSet
 	58,  // 11: cozy.worker.v1.ModelSourceFileCall.claim:type_name -> cozy.worker.v1.Claim
-	119, // 12: cozy.worker.v1.ModelSourceFileCall.request:type_name -> cozy.worker.v1.ModelSourceFileRequest
+	118, // 12: cozy.worker.v1.ModelSourceFileCall.request:type_name -> cozy.worker.v1.ModelSourceFileRequest
 	58,  // 13: cozy.worker.v1.ModelSourcePrepareCall.claim:type_name -> cozy.worker.v1.Claim
-	121, // 14: cozy.worker.v1.ModelSourcePrepareCall.request:type_name -> cozy.worker.v1.ModelSourcePrepareRequest
+	120, // 14: cozy.worker.v1.ModelSourcePrepareCall.request:type_name -> cozy.worker.v1.ModelSourcePrepareRequest
 	58,  // 15: cozy.worker.v1.LocalPackageFetchCall.claim:type_name -> cozy.worker.v1.Claim
-	124, // 16: cozy.worker.v1.LocalPackageFetchCall.request:type_name -> cozy.worker.v1.LocalPackageFetchRequest
+	123, // 16: cozy.worker.v1.LocalPackageFetchCall.request:type_name -> cozy.worker.v1.LocalPackageFetchRequest
 	58,  // 17: cozy.worker.v1.LocalPackageAbortCall.claim:type_name -> cozy.worker.v1.Claim
-	126, // 18: cozy.worker.v1.LocalPackageAbortCall.request:type_name -> cozy.worker.v1.LocalPackageAbort
+	125, // 18: cozy.worker.v1.LocalPackageAbortCall.request:type_name -> cozy.worker.v1.LocalPackageAbort
 	58,  // 19: cozy.worker.v1.WeightsTransferCall.claim:type_name -> cozy.worker.v1.Claim
-	115, // 20: cozy.worker.v1.WeightsTransferCall.request:type_name -> cozy.worker.v1.WeightsTransferRequest
+	114, // 20: cozy.worker.v1.WeightsTransferCall.request:type_name -> cozy.worker.v1.WeightsTransferRequest
 	44,  // 21: cozy.worker.v1.PreparePackageSetRequest.image_inventory:type_name -> cozy.worker.v1.ImageInventory
 	45,  // 22: cozy.worker.v1.ImageInventory.distributions:type_name -> cozy.worker.v1.ImageDistribution
-	72,  // 23: cozy.worker.v1.PreparePackageSetResult.placement_set:type_name -> cozy.worker.v1.DesiredPlacementSet
-	82,  // 24: cozy.worker.v1.PrepareLocalPackageRequest.package:type_name -> cozy.worker.v1.DevelopmentPackage
+	71,  // 23: cozy.worker.v1.PreparePackageSetResult.placement_set:type_name -> cozy.worker.v1.DesiredPlacementSet
+	81,  // 24: cozy.worker.v1.PrepareLocalPackageRequest.package:type_name -> cozy.worker.v1.DevelopmentPackage
 	49,  // 25: cozy.worker.v1.PrepareLocalPackageRequest.wheels:type_name -> cozy.worker.v1.LocalPackageWheel
-	79,  // 26: cozy.worker.v1.PreparedModelSource.manifest:type_name -> cozy.worker.v1.Ref
+	78,  // 26: cozy.worker.v1.PreparedModelSource.manifest:type_name -> cozy.worker.v1.Ref
 	52,  // 27: cozy.worker.v1.PrepareModelSourceRequest.profiles:type_name -> cozy.worker.v1.ModelSourceProfile
 	51,  // 28: cozy.worker.v1.PrepareModelSourceRequest.files:type_name -> cozy.worker.v1.LocalModelSourceFile
 	28,  // 29: cozy.worker.v1.PrepareModelSourceResult.outcome:type_name -> cozy.worker.v1.ModelSourcePrepareOutcome
 	53,  // 30: cozy.worker.v1.PrepareModelSourceResult.sources:type_name -> cozy.worker.v1.PreparedModelSource
 	58,  // 31: cozy.worker.v1.RecordOwnerFrame.claim:type_name -> cozy.worker.v1.Claim
-	66,  // 32: cozy.worker.v1.RecordOwnerFrame.desired_state:type_name -> cozy.worker.v1.DesiredWorkerState
-	97,  // 33: cozy.worker.v1.RecordOwnerFrame.attempt_offer:type_name -> cozy.worker.v1.AttemptOffer
-	100, // 34: cozy.worker.v1.RecordOwnerFrame.cancel_attempt:type_name -> cozy.worker.v1.CancelAttempt
-	134, // 35: cozy.worker.v1.RecordOwnerFrame.outcome_ack:type_name -> cozy.worker.v1.AttemptOutcomeAck
-	136, // 36: cozy.worker.v1.RecordOwnerFrame.checkpoint_receipt:type_name -> cozy.worker.v1.JobCheckpointReceipt
-	65,  // 37: cozy.worker.v1.RecordOwnerFrame.snapshot_ack:type_name -> cozy.worker.v1.SnapshotAck
-	128, // 38: cozy.worker.v1.RecordOwnerFrame.weights_finalize_request:type_name -> cozy.worker.v1.WeightsFinalizeRequest
-	107, // 39: cozy.worker.v1.RecordOwnerFrame.weights_host_ack:type_name -> cozy.worker.v1.WeightsHostAck
-	115, // 40: cozy.worker.v1.RecordOwnerFrame.weights_transfer_request:type_name -> cozy.worker.v1.WeightsTransferRequest
-	110, // 41: cozy.worker.v1.RecordOwnerFrame.weights_read_request:type_name -> cozy.worker.v1.WeightsReadRequest
-	119, // 42: cozy.worker.v1.RecordOwnerFrame.model_source_file_request:type_name -> cozy.worker.v1.ModelSourceFileRequest
-	121, // 43: cozy.worker.v1.RecordOwnerFrame.model_source_prepare_request:type_name -> cozy.worker.v1.ModelSourcePrepareRequest
-	126, // 44: cozy.worker.v1.RecordOwnerFrame.local_package_abort:type_name -> cozy.worker.v1.LocalPackageAbort
-	116, // 45: cozy.worker.v1.RecordOwnerFrame.weights_upload_request:type_name -> cozy.worker.v1.WeightsUploadRequest
-	124, // 46: cozy.worker.v1.RecordOwnerFrame.local_package_fetch_request:type_name -> cozy.worker.v1.LocalPackageFetchRequest
+	65,  // 32: cozy.worker.v1.RecordOwnerFrame.desired_state:type_name -> cozy.worker.v1.DesiredWorkerState
+	96,  // 33: cozy.worker.v1.RecordOwnerFrame.attempt_offer:type_name -> cozy.worker.v1.AttemptOffer
+	99,  // 34: cozy.worker.v1.RecordOwnerFrame.cancel_attempt:type_name -> cozy.worker.v1.CancelAttempt
+	133, // 35: cozy.worker.v1.RecordOwnerFrame.outcome_ack:type_name -> cozy.worker.v1.AttemptOutcomeAck
+	135, // 36: cozy.worker.v1.RecordOwnerFrame.checkpoint_receipt:type_name -> cozy.worker.v1.JobCheckpointReceipt
+	64,  // 37: cozy.worker.v1.RecordOwnerFrame.snapshot_ack:type_name -> cozy.worker.v1.SnapshotAck
+	127, // 38: cozy.worker.v1.RecordOwnerFrame.weights_finalize_request:type_name -> cozy.worker.v1.WeightsFinalizeRequest
+	106, // 39: cozy.worker.v1.RecordOwnerFrame.weights_host_ack:type_name -> cozy.worker.v1.WeightsHostAck
+	114, // 40: cozy.worker.v1.RecordOwnerFrame.weights_transfer_request:type_name -> cozy.worker.v1.WeightsTransferRequest
+	109, // 41: cozy.worker.v1.RecordOwnerFrame.weights_read_request:type_name -> cozy.worker.v1.WeightsReadRequest
+	118, // 42: cozy.worker.v1.RecordOwnerFrame.model_source_file_request:type_name -> cozy.worker.v1.ModelSourceFileRequest
+	120, // 43: cozy.worker.v1.RecordOwnerFrame.model_source_prepare_request:type_name -> cozy.worker.v1.ModelSourcePrepareRequest
+	125, // 44: cozy.worker.v1.RecordOwnerFrame.local_package_abort:type_name -> cozy.worker.v1.LocalPackageAbort
+	115, // 45: cozy.worker.v1.RecordOwnerFrame.weights_upload_request:type_name -> cozy.worker.v1.WeightsUploadRequest
+	123, // 46: cozy.worker.v1.RecordOwnerFrame.local_package_fetch_request:type_name -> cozy.worker.v1.LocalPackageFetchRequest
 	60,  // 47: cozy.worker.v1.WorkerFrame.claim_ack:type_name -> cozy.worker.v1.ClaimAck
-	90,  // 48: cozy.worker.v1.WorkerFrame.observed_state:type_name -> cozy.worker.v1.ObservedWorkerState
-	98,  // 49: cozy.worker.v1.WorkerFrame.attempt_accepted:type_name -> cozy.worker.v1.AttemptAccepted
-	101, // 50: cozy.worker.v1.WorkerFrame.attempt_outcome:type_name -> cozy.worker.v1.AttemptOutcome
+	89,  // 48: cozy.worker.v1.WorkerFrame.observed_state:type_name -> cozy.worker.v1.ObservedWorkerState
+	97,  // 49: cozy.worker.v1.WorkerFrame.attempt_accepted:type_name -> cozy.worker.v1.AttemptAccepted
+	100, // 50: cozy.worker.v1.WorkerFrame.attempt_outcome:type_name -> cozy.worker.v1.AttemptOutcome
 	61,  // 51: cozy.worker.v1.WorkerFrame.boot_failure:type_name -> cozy.worker.v1.BootFailure
-	135, // 52: cozy.worker.v1.WorkerFrame.checkpoint_request:type_name -> cozy.worker.v1.JobCheckpointRequest
-	138, // 53: cozy.worker.v1.WorkerFrame.checkpoint_ack:type_name -> cozy.worker.v1.JobCheckpointAck
+	134, // 52: cozy.worker.v1.WorkerFrame.checkpoint_request:type_name -> cozy.worker.v1.JobCheckpointRequest
+	137, // 53: cozy.worker.v1.WorkerFrame.checkpoint_ack:type_name -> cozy.worker.v1.JobCheckpointAck
 	62,  // 54: cozy.worker.v1.WorkerFrame.snapshot:type_name -> cozy.worker.v1.WorkerSnapshot
-	129, // 55: cozy.worker.v1.WorkerFrame.weights_finalize_result:type_name -> cozy.worker.v1.WeightsFinalizeResult
-	106, // 56: cozy.worker.v1.WorkerFrame.weights_intent:type_name -> cozy.worker.v1.WeightsIntentFrame
-	108, // 57: cozy.worker.v1.WorkerFrame.weights_receipt:type_name -> cozy.worker.v1.WeightsReceiptFrame
-	111, // 58: cozy.worker.v1.WorkerFrame.weights_read_result:type_name -> cozy.worker.v1.WeightsReadResult
-	118, // 59: cozy.worker.v1.WorkerFrame.weights_transfer_status:type_name -> cozy.worker.v1.WeightsTransferStatus
-	120, // 60: cozy.worker.v1.WorkerFrame.model_source_file_status:type_name -> cozy.worker.v1.ModelSourceFileStatus
-	122, // 61: cozy.worker.v1.WorkerFrame.model_source_prepared:type_name -> cozy.worker.v1.ModelSourcePrepared
-	125, // 62: cozy.worker.v1.WorkerFrame.local_package_file_status:type_name -> cozy.worker.v1.LocalPackageFileStatus
-	127, // 63: cozy.worker.v1.WorkerFrame.local_package_abort_status:type_name -> cozy.worker.v1.LocalPackageAbortStatus
-	117, // 64: cozy.worker.v1.WorkerFrame.weights_upload_result:type_name -> cozy.worker.v1.WeightsUploadResult
+	128, // 55: cozy.worker.v1.WorkerFrame.weights_finalize_result:type_name -> cozy.worker.v1.WeightsFinalizeResult
+	105, // 56: cozy.worker.v1.WorkerFrame.weights_intent:type_name -> cozy.worker.v1.WeightsIntentFrame
+	107, // 57: cozy.worker.v1.WorkerFrame.weights_receipt:type_name -> cozy.worker.v1.WeightsReceiptFrame
+	110, // 58: cozy.worker.v1.WorkerFrame.weights_read_result:type_name -> cozy.worker.v1.WeightsReadResult
+	117, // 59: cozy.worker.v1.WorkerFrame.weights_transfer_status:type_name -> cozy.worker.v1.WeightsTransferStatus
+	119, // 60: cozy.worker.v1.WorkerFrame.model_source_file_status:type_name -> cozy.worker.v1.ModelSourceFileStatus
+	121, // 61: cozy.worker.v1.WorkerFrame.model_source_prepared:type_name -> cozy.worker.v1.ModelSourcePrepared
+	124, // 62: cozy.worker.v1.WorkerFrame.local_package_file_status:type_name -> cozy.worker.v1.LocalPackageFileStatus
+	126, // 63: cozy.worker.v1.WorkerFrame.local_package_abort_status:type_name -> cozy.worker.v1.LocalPackageAbortStatus
+	116, // 64: cozy.worker.v1.WorkerFrame.weights_upload_result:type_name -> cozy.worker.v1.WeightsUploadResult
 	11,  // 65: cozy.worker.v1.ClaimAck.rejection:type_name -> cozy.worker.v1.ClaimRejection
-	152, // 66: cozy.worker.v1.ClaimAck.resources:type_name -> cozy.worker.v1.WorkerResources
+	151, // 66: cozy.worker.v1.ClaimAck.resources:type_name -> cozy.worker.v1.WorkerResources
 	13,  // 67: cozy.worker.v1.BootFailure.reason:type_name -> cozy.worker.v1.BootFailureReason
-	152, // 68: cozy.worker.v1.BootFailure.resources:type_name -> cozy.worker.v1.WorkerResources
+	151, // 68: cozy.worker.v1.BootFailure.resources:type_name -> cozy.worker.v1.WorkerResources
 	1,   // 69: cozy.worker.v1.WorkerSnapshotBody.worker_phase:type_name -> cozy.worker.v1.WorkerPhase
-	92,  // 70: cozy.worker.v1.WorkerSnapshotBody.placements:type_name -> cozy.worker.v1.PlacementStatus
+	91,  // 70: cozy.worker.v1.WorkerSnapshotBody.placements:type_name -> cozy.worker.v1.PlacementStatus
 	4,   // 71: cozy.worker.v1.WorkerSnapshotBody.admission_state:type_name -> cozy.worker.v1.AdmissionState
-	154, // 72: cozy.worker.v1.WorkerSnapshotBody.held_attempts:type_name -> cozy.worker.v1.HeldAttempt
-	109, // 73: cozy.worker.v1.WorkerSnapshotBody.weights_transactions:type_name -> cozy.worker.v1.WeightsTransactionStatus
-	91,  // 74: cozy.worker.v1.WorkerSnapshotBody.lanes:type_name -> cozy.worker.v1.DeviceLane
-	154, // 75: cozy.worker.v1.HostSnapshotBody.held_outcomes:type_name -> cozy.worker.v1.HeldAttempt
-	109, // 76: cozy.worker.v1.HostSnapshotBody.weights_transactions:type_name -> cozy.worker.v1.WeightsTransactionStatus
-	0,   // 77: cozy.worker.v1.DesiredWorkerState.posture:type_name -> cozy.worker.v1.Posture
-	89,  // 78: cozy.worker.v1.DesiredWorkerState.job:type_name -> cozy.worker.v1.JobDirective
-	72,  // 79: cozy.worker.v1.DesiredWorkerState.placement_set:type_name -> cozy.worker.v1.DesiredPlacementSet
-	67,  // 80: cozy.worker.v1.DesiredWorkerState.package_set:type_name -> cozy.worker.v1.DesiredPackageSet
-	68,  // 81: cozy.worker.v1.DesiredWorkerState.local_package_set:type_name -> cozy.worker.v1.DesiredLocalPackageSet
-	69,  // 82: cozy.worker.v1.DesiredWorkerState.private_placement_set:type_name -> cozy.worker.v1.DesiredPrivatePlacementSet
-	82,  // 83: cozy.worker.v1.DesiredLocalPackageSet.package:type_name -> cozy.worker.v1.DevelopmentPackage
-	70,  // 84: cozy.worker.v1.DesiredLocalPackageSet.files:type_name -> cozy.worker.v1.LocalPackageFileRef
-	79,  // 85: cozy.worker.v1.LocalPackageRevision.package_interface:type_name -> cozy.worker.v1.Ref
-	70,  // 86: cozy.worker.v1.LocalPackageRevision.files:type_name -> cozy.worker.v1.LocalPackageFileRef
-	73,  // 87: cozy.worker.v1.DesiredPlacementSet.device_pins:type_name -> cozy.worker.v1.PlacementDevicePin
-	78,  // 88: cozy.worker.v1.PlacementSet.placements:type_name -> cozy.worker.v1.Placement
-	76,  // 89: cozy.worker.v1.DownloadDelegation.models:type_name -> cozy.worker.v1.DownloadModelRef
-	77,  // 90: cozy.worker.v1.DownloadDelegation.packages:type_name -> cozy.worker.v1.DownloadPackageRef
-	81,  // 91: cozy.worker.v1.Placement.package:type_name -> cozy.worker.v1.PackageSelection
-	82,  // 92: cozy.worker.v1.Placement.development:type_name -> cozy.worker.v1.DevelopmentPackage
-	79,  // 93: cozy.worker.v1.Placement.package_interface:type_name -> cozy.worker.v1.Ref
-	84,  // 94: cozy.worker.v1.Placement.models:type_name -> cozy.worker.v1.Model
-	85,  // 95: cozy.worker.v1.Placement.entrypoints:type_name -> cozy.worker.v1.Entrypoint
-	83,  // 96: cozy.worker.v1.Placement.environment:type_name -> cozy.worker.v1.Environment
-	79,  // 97: cozy.worker.v1.WheelFact.ref:type_name -> cozy.worker.v1.Ref
-	80,  // 98: cozy.worker.v1.DevelopmentPackage.project_wheel:type_name -> cozy.worker.v1.WheelFact
-	79,  // 99: cozy.worker.v1.Environment.locked_requirements:type_name -> cozy.worker.v1.Ref
-	80,  // 100: cozy.worker.v1.Environment.local_wheels:type_name -> cozy.worker.v1.WheelFact
-	79,  // 101: cozy.worker.v1.Model.manifest:type_name -> cozy.worker.v1.Ref
-	86,  // 102: cozy.worker.v1.Entrypoint.slots:type_name -> cozy.worker.v1.Slot
-	87,  // 103: cozy.worker.v1.Slot.components:type_name -> cozy.worker.v1.Component
-	79,  // 104: cozy.worker.v1.Slot.model_construction_contract:type_name -> cozy.worker.v1.Ref
-	88,  // 105: cozy.worker.v1.Slot.stamps:type_name -> cozy.worker.v1.Stamp
-	150, // 106: cozy.worker.v1.JobDirective.resource_caps:type_name -> cozy.worker.v1.ResourceCaps
-	151, // 107: cozy.worker.v1.JobDirective.publication_contract:type_name -> cozy.worker.v1.PublicationContract
-	154, // 108: cozy.worker.v1.ObservedWorkerState.held_attempts:type_name -> cozy.worker.v1.HeldAttempt
-	155, // 109: cozy.worker.v1.ObservedWorkerState.faults:type_name -> cozy.worker.v1.Fault
-	96,  // 110: cozy.worker.v1.ObservedWorkerState.activity:type_name -> cozy.worker.v1.ActivityEvent
-	153, // 111: cozy.worker.v1.ObservedWorkerState.job_capacity:type_name -> cozy.worker.v1.JobCapacity
-	92,  // 112: cozy.worker.v1.ObservedWorkerState.placements:type_name -> cozy.worker.v1.PlacementStatus
-	4,   // 113: cozy.worker.v1.ObservedWorkerState.admission_state:type_name -> cozy.worker.v1.AdmissionState
-	1,   // 114: cozy.worker.v1.ObservedWorkerState.worker_phase:type_name -> cozy.worker.v1.WorkerPhase
-	91,  // 115: cozy.worker.v1.ObservedWorkerState.lanes:type_name -> cozy.worker.v1.DeviceLane
-	155, // 116: cozy.worker.v1.PlacementStatus.faults:type_name -> cozy.worker.v1.Fault
-	95,  // 117: cozy.worker.v1.PlacementStatus.accelerator:type_name -> cozy.worker.v1.AcceleratorQualification
-	2,   // 118: cozy.worker.v1.PlacementStatus.materialization:type_name -> cozy.worker.v1.MaterializationState
-	3,   // 119: cozy.worker.v1.PlacementStatus.serving:type_name -> cozy.worker.v1.ServingState
-	93,  // 120: cozy.worker.v1.PlacementStatus.acquisition:type_name -> cozy.worker.v1.PlacementAcquisitionObservation
-	94,  // 121: cozy.worker.v1.PlacementAcquisitionObservation.package:type_name -> cozy.worker.v1.AcquisitionLegObservation
-	94,  // 122: cozy.worker.v1.PlacementAcquisitionObservation.model:type_name -> cozy.worker.v1.AcquisitionLegObservation
-	146, // 123: cozy.worker.v1.AttemptOffer.grant:type_name -> cozy.worker.v1.DeliveryGrant
-	10,  // 124: cozy.worker.v1.CancelAttempt.reason:type_name -> cozy.worker.v1.CancelReason
-	7,   // 125: cozy.worker.v1.AttemptOutcomeBody.status:type_name -> cozy.worker.v1.OutcomeStatus
-	156, // 126: cozy.worker.v1.AttemptOutcomeBody.output_manifest:type_name -> cozy.worker.v1.OutputManifest
-	158, // 127: cozy.worker.v1.AttemptOutcomeBody.metrics:type_name -> cozy.worker.v1.AttemptMetrics
-	159, // 128: cozy.worker.v1.AttemptOutcomeBody.triage_bundle:type_name -> cozy.worker.v1.TriageBundleRef
-	132, // 129: cozy.worker.v1.AttemptOutcomeBody.cause:type_name -> cozy.worker.v1.OutcomeCause
-	130, // 130: cozy.worker.v1.AttemptOutcomeBody.result:type_name -> cozy.worker.v1.ResultEnvelope
-	103, // 131: cozy.worker.v1.AttemptOutcomeBody.weights_receipts:type_name -> cozy.worker.v1.WeightsReceiptRef
-	17,  // 132: cozy.worker.v1.WeightsHostAck.stage:type_name -> cozy.worker.v1.WeightsHostStage
-	18,  // 133: cozy.worker.v1.WeightsHostAck.outcome:type_name -> cozy.worker.v1.WeightsHostOutcome
-	19,  // 134: cozy.worker.v1.WeightsHostAck.refusal:type_name -> cozy.worker.v1.WeightsHostRefusal
-	103, // 135: cozy.worker.v1.WeightsHostAck.weights_receipt:type_name -> cozy.worker.v1.WeightsReceiptRef
-	79,  // 136: cozy.worker.v1.WeightsHostAck.manifest:type_name -> cozy.worker.v1.Ref
-	103, // 137: cozy.worker.v1.WeightsReceiptFrame.weights_receipt:type_name -> cozy.worker.v1.WeightsReceiptRef
-	105, // 138: cozy.worker.v1.WeightsReceiptFrame.objects:type_name -> cozy.worker.v1.WeightsObjectSource
-	79,  // 139: cozy.worker.v1.WeightsReceiptFrame.manifest:type_name -> cozy.worker.v1.Ref
-	20,  // 140: cozy.worker.v1.WeightsTransactionStatus.state:type_name -> cozy.worker.v1.WeightsTransactionState
-	21,  // 141: cozy.worker.v1.WeightsReadResult.outcome:type_name -> cozy.worker.v1.WeightsReadOutcome
-	22,  // 142: cozy.worker.v1.WeightsReadResult.refusal:type_name -> cozy.worker.v1.WeightsReadRefusal
-	113, // 143: cozy.worker.v1.WeightsUploadGrant.required_headers:type_name -> cozy.worker.v1.WeightsUploadHeader
-	114, // 144: cozy.worker.v1.WeightsTransferRequest.upload_grant:type_name -> cozy.worker.v1.WeightsUploadGrant
-	112, // 145: cozy.worker.v1.WeightsTransferRequest.held:type_name -> cozy.worker.v1.WeightsObjectRef
-	114, // 146: cozy.worker.v1.WeightsUploadRequest.grant:type_name -> cozy.worker.v1.WeightsUploadGrant
-	23,  // 147: cozy.worker.v1.WeightsUploadResult.outcome:type_name -> cozy.worker.v1.WeightsUploadOutcome
-	24,  // 148: cozy.worker.v1.WeightsUploadResult.refusal:type_name -> cozy.worker.v1.WeightsUploadRefusal
-	25,  // 149: cozy.worker.v1.WeightsTransferStatus.state:type_name -> cozy.worker.v1.WeightsTransferState
-	26,  // 150: cozy.worker.v1.ModelSourceFileRequest.provider:type_name -> cozy.worker.v1.ModelSourceProvider
-	27,  // 151: cozy.worker.v1.ModelSourceFileStatus.state:type_name -> cozy.worker.v1.ModelSourceFileState
-	52,  // 152: cozy.worker.v1.ModelSourcePrepareRequest.profiles:type_name -> cozy.worker.v1.ModelSourceProfile
-	28,  // 153: cozy.worker.v1.ModelSourcePrepared.outcome:type_name -> cozy.worker.v1.ModelSourcePrepareOutcome
-	53,  // 154: cozy.worker.v1.ModelSourcePrepared.sources:type_name -> cozy.worker.v1.PreparedModelSource
-	123, // 155: cozy.worker.v1.LocalPackageFetchRequest.files:type_name -> cozy.worker.v1.LocalPackageFileGrant
-	29,  // 156: cozy.worker.v1.LocalPackageFileStatus.state:type_name -> cozy.worker.v1.LocalPackageFileState
-	30,  // 157: cozy.worker.v1.LocalPackageAbortStatus.outcome:type_name -> cozy.worker.v1.LocalPackageAbortOutcome
-	31,  // 158: cozy.worker.v1.WeightsFinalizeRequest.disposition:type_name -> cozy.worker.v1.WeightsFinalizeDisposition
-	32,  // 159: cozy.worker.v1.WeightsFinalizeResult.outcome:type_name -> cozy.worker.v1.WeightsFinalizeOutcome
-	103, // 160: cozy.worker.v1.WeightsFinalizeResult.weights_receipt:type_name -> cozy.worker.v1.WeightsReceiptRef
-	157, // 161: cozy.worker.v1.ResultEnvelope.result_blob:type_name -> cozy.worker.v1.OutputEntry
-	131, // 162: cozy.worker.v1.ResultEnvelope.adjustments:type_name -> cozy.worker.v1.AdjustmentRow
-	8,   // 163: cozy.worker.v1.OutcomeCause.code:type_name -> cozy.worker.v1.CauseCode
-	9,   // 164: cozy.worker.v1.OutcomeCause.origin:type_name -> cozy.worker.v1.CauseOrigin
-	133, // 165: cozy.worker.v1.OutcomeCause.shortfall:type_name -> cozy.worker.v1.ResourceShortfall
-	157, // 166: cozy.worker.v1.JobCheckpointRequest.artifact:type_name -> cozy.worker.v1.OutputEntry
-	14,  // 167: cozy.worker.v1.JobCheckpointReceipt.outcome:type_name -> cozy.worker.v1.CheckpointOutcome
-	137, // 168: cozy.worker.v1.JobCheckpointReceipt.fault:type_name -> cozy.worker.v1.CheckpointFault
-	15,  // 169: cozy.worker.v1.CheckpointFault.code:type_name -> cozy.worker.v1.CheckpointFaultCode
-	142, // 170: cozy.worker.v1.InvocationSpec.inputs:type_name -> cozy.worker.v1.InputBinding
-	143, // 171: cozy.worker.v1.InvocationSpec.outputs:type_name -> cozy.worker.v1.OutputBinding
-	144, // 172: cozy.worker.v1.InvocationSpec.serving:type_name -> cozy.worker.v1.ServingInvocationSpec
-	145, // 173: cozy.worker.v1.InvocationSpec.job:type_name -> cozy.worker.v1.JobInvocationSpec
-	151, // 174: cozy.worker.v1.JobInvocationSpec.publication_contract:type_name -> cozy.worker.v1.PublicationContract
-	149, // 175: cozy.worker.v1.DeliveryGrant.credential:type_name -> cozy.worker.v1.DeliveryAccessCredential
-	147, // 176: cozy.worker.v1.DeliveryGrant.inputs:type_name -> cozy.worker.v1.InputAccess
-	148, // 177: cozy.worker.v1.DeliveryGrant.outputs:type_name -> cozy.worker.v1.OutputAccess
-	143, // 178: cozy.worker.v1.PublicationContract.outputs:type_name -> cozy.worker.v1.OutputBinding
-	5,   // 179: cozy.worker.v1.HeldAttempt.kind:type_name -> cozy.worker.v1.AttemptKind
-	6,   // 180: cozy.worker.v1.HeldAttempt.state:type_name -> cozy.worker.v1.AttemptState
-	12,  // 181: cozy.worker.v1.Fault.kind:type_name -> cozy.worker.v1.FaultKind
-	157, // 182: cozy.worker.v1.OutputManifest.outputs:type_name -> cozy.worker.v1.OutputEntry
-	56,  // 183: cozy.worker.v1.WorkerControl.Control:input_type -> cozy.worker.v1.RecordOwnerFrame
-	139, // 184: cozy.worker.v1.WorkerControl.WatchProgress:input_type -> cozy.worker.v1.ProgressOpen
-	43,  // 185: cozy.worker.v1.RuntimePreparation.CheckPackageSetCompatibility:input_type -> cozy.worker.v1.PreparePackageSetRequest
-	43,  // 186: cozy.worker.v1.RuntimePreparation.PreparePackageSet:input_type -> cozy.worker.v1.PreparePackageSetRequest
-	54,  // 187: cozy.worker.v1.RuntimePreparation.PrepareModelSource:input_type -> cozy.worker.v1.PrepareModelSourceRequest
-	48,  // 188: cozy.worker.v1.RuntimePreparation.PrepareLocalPackage:input_type -> cozy.worker.v1.PrepareLocalPackageRequest
-	50,  // 189: cozy.worker.v1.RuntimePreparation.PreparePrivatePlacement:input_type -> cozy.worker.v1.PreparePrivatePlacementRequest
-	107, // 190: cozy.worker.v1.RuntimeWeights.Exchange:input_type -> cozy.worker.v1.WeightsHostAck
-	116, // 191: cozy.worker.v1.RuntimeWeights.Upload:input_type -> cozy.worker.v1.WeightsUploadRequest
-	34,  // 192: cozy.worker.v1.PodHost.PreparePackageSet:input_type -> cozy.worker.v1.PreparePackageSetCall
-	35,  // 193: cozy.worker.v1.PodHost.PrepareLocalPackage:input_type -> cozy.worker.v1.PrepareLocalPackageCall
-	36,  // 194: cozy.worker.v1.PodHost.PreparePrivatePlacement:input_type -> cozy.worker.v1.PreparePrivatePlacementCall
-	38,  // 195: cozy.worker.v1.PodHost.ModelSourceFile:input_type -> cozy.worker.v1.ModelSourceFileCall
-	39,  // 196: cozy.worker.v1.PodHost.ModelSourcePrepare:input_type -> cozy.worker.v1.ModelSourcePrepareCall
-	40,  // 197: cozy.worker.v1.PodHost.LocalPackageFetch:input_type -> cozy.worker.v1.LocalPackageFetchCall
-	41,  // 198: cozy.worker.v1.PodHost.LocalPackageAbort:input_type -> cozy.worker.v1.LocalPackageAbortCall
-	42,  // 199: cozy.worker.v1.PodHost.WeightsTransfer:input_type -> cozy.worker.v1.WeightsTransferCall
-	57,  // 200: cozy.worker.v1.WorkerControl.Control:output_type -> cozy.worker.v1.WorkerFrame
-	140, // 201: cozy.worker.v1.WorkerControl.WatchProgress:output_type -> cozy.worker.v1.AttemptProgress
-	47,  // 202: cozy.worker.v1.RuntimePreparation.CheckPackageSetCompatibility:output_type -> cozy.worker.v1.CheckPackageSetCompatibilityResult
-	46,  // 203: cozy.worker.v1.RuntimePreparation.PreparePackageSet:output_type -> cozy.worker.v1.PreparePackageSetResult
-	55,  // 204: cozy.worker.v1.RuntimePreparation.PrepareModelSource:output_type -> cozy.worker.v1.PrepareModelSourceResult
-	46,  // 205: cozy.worker.v1.RuntimePreparation.PrepareLocalPackage:output_type -> cozy.worker.v1.PreparePackageSetResult
-	46,  // 206: cozy.worker.v1.RuntimePreparation.PreparePrivatePlacement:output_type -> cozy.worker.v1.PreparePackageSetResult
-	33,  // 207: cozy.worker.v1.RuntimeWeights.Exchange:output_type -> cozy.worker.v1.WeightsHostEvent
-	117, // 208: cozy.worker.v1.RuntimeWeights.Upload:output_type -> cozy.worker.v1.WeightsUploadResult
-	37,  // 209: cozy.worker.v1.PodHost.PreparePackageSet:output_type -> cozy.worker.v1.PrepareEvent
-	37,  // 210: cozy.worker.v1.PodHost.PrepareLocalPackage:output_type -> cozy.worker.v1.PrepareEvent
-	37,  // 211: cozy.worker.v1.PodHost.PreparePrivatePlacement:output_type -> cozy.worker.v1.PrepareEvent
-	120, // 212: cozy.worker.v1.PodHost.ModelSourceFile:output_type -> cozy.worker.v1.ModelSourceFileStatus
-	122, // 213: cozy.worker.v1.PodHost.ModelSourcePrepare:output_type -> cozy.worker.v1.ModelSourcePrepared
-	125, // 214: cozy.worker.v1.PodHost.LocalPackageFetch:output_type -> cozy.worker.v1.LocalPackageFileStatus
-	127, // 215: cozy.worker.v1.PodHost.LocalPackageAbort:output_type -> cozy.worker.v1.LocalPackageAbortStatus
-	118, // 216: cozy.worker.v1.PodHost.WeightsTransfer:output_type -> cozy.worker.v1.WeightsTransferStatus
-	200, // [200:217] is the sub-list for method output_type
-	183, // [183:200] is the sub-list for method input_type
-	183, // [183:183] is the sub-list for extension type_name
-	183, // [183:183] is the sub-list for extension extendee
-	0,   // [0:183] is the sub-list for field type_name
+	153, // 72: cozy.worker.v1.WorkerSnapshotBody.held_attempts:type_name -> cozy.worker.v1.HeldAttempt
+	108, // 73: cozy.worker.v1.WorkerSnapshotBody.weights_transactions:type_name -> cozy.worker.v1.WeightsTransactionStatus
+	90,  // 74: cozy.worker.v1.WorkerSnapshotBody.lanes:type_name -> cozy.worker.v1.DeviceLane
+	0,   // 75: cozy.worker.v1.DesiredWorkerState.posture:type_name -> cozy.worker.v1.Posture
+	88,  // 76: cozy.worker.v1.DesiredWorkerState.job:type_name -> cozy.worker.v1.JobDirective
+	71,  // 77: cozy.worker.v1.DesiredWorkerState.placement_set:type_name -> cozy.worker.v1.DesiredPlacementSet
+	66,  // 78: cozy.worker.v1.DesiredWorkerState.package_set:type_name -> cozy.worker.v1.DesiredPackageSet
+	67,  // 79: cozy.worker.v1.DesiredWorkerState.local_package_set:type_name -> cozy.worker.v1.DesiredLocalPackageSet
+	68,  // 80: cozy.worker.v1.DesiredWorkerState.private_placement_set:type_name -> cozy.worker.v1.DesiredPrivatePlacementSet
+	81,  // 81: cozy.worker.v1.DesiredLocalPackageSet.package:type_name -> cozy.worker.v1.DevelopmentPackage
+	69,  // 82: cozy.worker.v1.DesiredLocalPackageSet.files:type_name -> cozy.worker.v1.LocalPackageFileRef
+	78,  // 83: cozy.worker.v1.LocalPackageRevision.package_interface:type_name -> cozy.worker.v1.Ref
+	69,  // 84: cozy.worker.v1.LocalPackageRevision.files:type_name -> cozy.worker.v1.LocalPackageFileRef
+	72,  // 85: cozy.worker.v1.DesiredPlacementSet.device_pins:type_name -> cozy.worker.v1.PlacementDevicePin
+	77,  // 86: cozy.worker.v1.PlacementSet.placements:type_name -> cozy.worker.v1.Placement
+	75,  // 87: cozy.worker.v1.DownloadDelegation.models:type_name -> cozy.worker.v1.DownloadModelRef
+	76,  // 88: cozy.worker.v1.DownloadDelegation.packages:type_name -> cozy.worker.v1.DownloadPackageRef
+	80,  // 89: cozy.worker.v1.Placement.package:type_name -> cozy.worker.v1.PackageSelection
+	81,  // 90: cozy.worker.v1.Placement.development:type_name -> cozy.worker.v1.DevelopmentPackage
+	78,  // 91: cozy.worker.v1.Placement.package_interface:type_name -> cozy.worker.v1.Ref
+	83,  // 92: cozy.worker.v1.Placement.models:type_name -> cozy.worker.v1.Model
+	84,  // 93: cozy.worker.v1.Placement.entrypoints:type_name -> cozy.worker.v1.Entrypoint
+	82,  // 94: cozy.worker.v1.Placement.environment:type_name -> cozy.worker.v1.Environment
+	78,  // 95: cozy.worker.v1.WheelFact.ref:type_name -> cozy.worker.v1.Ref
+	79,  // 96: cozy.worker.v1.DevelopmentPackage.project_wheel:type_name -> cozy.worker.v1.WheelFact
+	78,  // 97: cozy.worker.v1.Environment.locked_requirements:type_name -> cozy.worker.v1.Ref
+	79,  // 98: cozy.worker.v1.Environment.local_wheels:type_name -> cozy.worker.v1.WheelFact
+	78,  // 99: cozy.worker.v1.Model.manifest:type_name -> cozy.worker.v1.Ref
+	85,  // 100: cozy.worker.v1.Entrypoint.slots:type_name -> cozy.worker.v1.Slot
+	86,  // 101: cozy.worker.v1.Slot.components:type_name -> cozy.worker.v1.Component
+	78,  // 102: cozy.worker.v1.Slot.model_construction_contract:type_name -> cozy.worker.v1.Ref
+	87,  // 103: cozy.worker.v1.Slot.stamps:type_name -> cozy.worker.v1.Stamp
+	149, // 104: cozy.worker.v1.JobDirective.resource_caps:type_name -> cozy.worker.v1.ResourceCaps
+	150, // 105: cozy.worker.v1.JobDirective.publication_contract:type_name -> cozy.worker.v1.PublicationContract
+	153, // 106: cozy.worker.v1.ObservedWorkerState.held_attempts:type_name -> cozy.worker.v1.HeldAttempt
+	154, // 107: cozy.worker.v1.ObservedWorkerState.faults:type_name -> cozy.worker.v1.Fault
+	95,  // 108: cozy.worker.v1.ObservedWorkerState.activity:type_name -> cozy.worker.v1.ActivityEvent
+	152, // 109: cozy.worker.v1.ObservedWorkerState.job_capacity:type_name -> cozy.worker.v1.JobCapacity
+	91,  // 110: cozy.worker.v1.ObservedWorkerState.placements:type_name -> cozy.worker.v1.PlacementStatus
+	4,   // 111: cozy.worker.v1.ObservedWorkerState.admission_state:type_name -> cozy.worker.v1.AdmissionState
+	1,   // 112: cozy.worker.v1.ObservedWorkerState.worker_phase:type_name -> cozy.worker.v1.WorkerPhase
+	90,  // 113: cozy.worker.v1.ObservedWorkerState.lanes:type_name -> cozy.worker.v1.DeviceLane
+	154, // 114: cozy.worker.v1.PlacementStatus.faults:type_name -> cozy.worker.v1.Fault
+	94,  // 115: cozy.worker.v1.PlacementStatus.accelerator:type_name -> cozy.worker.v1.AcceleratorQualification
+	2,   // 116: cozy.worker.v1.PlacementStatus.materialization:type_name -> cozy.worker.v1.MaterializationState
+	3,   // 117: cozy.worker.v1.PlacementStatus.serving:type_name -> cozy.worker.v1.ServingState
+	92,  // 118: cozy.worker.v1.PlacementStatus.acquisition:type_name -> cozy.worker.v1.PlacementAcquisitionObservation
+	93,  // 119: cozy.worker.v1.PlacementAcquisitionObservation.package:type_name -> cozy.worker.v1.AcquisitionLegObservation
+	93,  // 120: cozy.worker.v1.PlacementAcquisitionObservation.model:type_name -> cozy.worker.v1.AcquisitionLegObservation
+	145, // 121: cozy.worker.v1.AttemptOffer.grant:type_name -> cozy.worker.v1.DeliveryGrant
+	10,  // 122: cozy.worker.v1.CancelAttempt.reason:type_name -> cozy.worker.v1.CancelReason
+	7,   // 123: cozy.worker.v1.AttemptOutcomeBody.status:type_name -> cozy.worker.v1.OutcomeStatus
+	155, // 124: cozy.worker.v1.AttemptOutcomeBody.output_manifest:type_name -> cozy.worker.v1.OutputManifest
+	157, // 125: cozy.worker.v1.AttemptOutcomeBody.metrics:type_name -> cozy.worker.v1.AttemptMetrics
+	158, // 126: cozy.worker.v1.AttemptOutcomeBody.triage_bundle:type_name -> cozy.worker.v1.TriageBundleRef
+	131, // 127: cozy.worker.v1.AttemptOutcomeBody.cause:type_name -> cozy.worker.v1.OutcomeCause
+	129, // 128: cozy.worker.v1.AttemptOutcomeBody.result:type_name -> cozy.worker.v1.ResultEnvelope
+	102, // 129: cozy.worker.v1.AttemptOutcomeBody.weights_receipts:type_name -> cozy.worker.v1.WeightsReceiptRef
+	17,  // 130: cozy.worker.v1.WeightsHostAck.stage:type_name -> cozy.worker.v1.WeightsHostStage
+	18,  // 131: cozy.worker.v1.WeightsHostAck.outcome:type_name -> cozy.worker.v1.WeightsHostOutcome
+	19,  // 132: cozy.worker.v1.WeightsHostAck.refusal:type_name -> cozy.worker.v1.WeightsHostRefusal
+	102, // 133: cozy.worker.v1.WeightsHostAck.weights_receipt:type_name -> cozy.worker.v1.WeightsReceiptRef
+	78,  // 134: cozy.worker.v1.WeightsHostAck.manifest:type_name -> cozy.worker.v1.Ref
+	102, // 135: cozy.worker.v1.WeightsReceiptFrame.weights_receipt:type_name -> cozy.worker.v1.WeightsReceiptRef
+	104, // 136: cozy.worker.v1.WeightsReceiptFrame.objects:type_name -> cozy.worker.v1.WeightsObjectSource
+	78,  // 137: cozy.worker.v1.WeightsReceiptFrame.manifest:type_name -> cozy.worker.v1.Ref
+	20,  // 138: cozy.worker.v1.WeightsTransactionStatus.state:type_name -> cozy.worker.v1.WeightsTransactionState
+	21,  // 139: cozy.worker.v1.WeightsReadResult.outcome:type_name -> cozy.worker.v1.WeightsReadOutcome
+	22,  // 140: cozy.worker.v1.WeightsReadResult.refusal:type_name -> cozy.worker.v1.WeightsReadRefusal
+	112, // 141: cozy.worker.v1.WeightsUploadGrant.required_headers:type_name -> cozy.worker.v1.WeightsUploadHeader
+	113, // 142: cozy.worker.v1.WeightsTransferRequest.upload_grant:type_name -> cozy.worker.v1.WeightsUploadGrant
+	111, // 143: cozy.worker.v1.WeightsTransferRequest.held:type_name -> cozy.worker.v1.WeightsObjectRef
+	113, // 144: cozy.worker.v1.WeightsUploadRequest.grant:type_name -> cozy.worker.v1.WeightsUploadGrant
+	23,  // 145: cozy.worker.v1.WeightsUploadResult.outcome:type_name -> cozy.worker.v1.WeightsUploadOutcome
+	24,  // 146: cozy.worker.v1.WeightsUploadResult.refusal:type_name -> cozy.worker.v1.WeightsUploadRefusal
+	25,  // 147: cozy.worker.v1.WeightsTransferStatus.state:type_name -> cozy.worker.v1.WeightsTransferState
+	26,  // 148: cozy.worker.v1.ModelSourceFileRequest.provider:type_name -> cozy.worker.v1.ModelSourceProvider
+	27,  // 149: cozy.worker.v1.ModelSourceFileStatus.state:type_name -> cozy.worker.v1.ModelSourceFileState
+	52,  // 150: cozy.worker.v1.ModelSourcePrepareRequest.profiles:type_name -> cozy.worker.v1.ModelSourceProfile
+	28,  // 151: cozy.worker.v1.ModelSourcePrepared.outcome:type_name -> cozy.worker.v1.ModelSourcePrepareOutcome
+	53,  // 152: cozy.worker.v1.ModelSourcePrepared.sources:type_name -> cozy.worker.v1.PreparedModelSource
+	122, // 153: cozy.worker.v1.LocalPackageFetchRequest.files:type_name -> cozy.worker.v1.LocalPackageFileGrant
+	29,  // 154: cozy.worker.v1.LocalPackageFileStatus.state:type_name -> cozy.worker.v1.LocalPackageFileState
+	30,  // 155: cozy.worker.v1.LocalPackageAbortStatus.outcome:type_name -> cozy.worker.v1.LocalPackageAbortOutcome
+	31,  // 156: cozy.worker.v1.WeightsFinalizeRequest.disposition:type_name -> cozy.worker.v1.WeightsFinalizeDisposition
+	32,  // 157: cozy.worker.v1.WeightsFinalizeResult.outcome:type_name -> cozy.worker.v1.WeightsFinalizeOutcome
+	102, // 158: cozy.worker.v1.WeightsFinalizeResult.weights_receipt:type_name -> cozy.worker.v1.WeightsReceiptRef
+	156, // 159: cozy.worker.v1.ResultEnvelope.result_blob:type_name -> cozy.worker.v1.OutputEntry
+	130, // 160: cozy.worker.v1.ResultEnvelope.adjustments:type_name -> cozy.worker.v1.AdjustmentRow
+	8,   // 161: cozy.worker.v1.OutcomeCause.code:type_name -> cozy.worker.v1.CauseCode
+	9,   // 162: cozy.worker.v1.OutcomeCause.origin:type_name -> cozy.worker.v1.CauseOrigin
+	132, // 163: cozy.worker.v1.OutcomeCause.shortfall:type_name -> cozy.worker.v1.ResourceShortfall
+	156, // 164: cozy.worker.v1.JobCheckpointRequest.artifact:type_name -> cozy.worker.v1.OutputEntry
+	14,  // 165: cozy.worker.v1.JobCheckpointReceipt.outcome:type_name -> cozy.worker.v1.CheckpointOutcome
+	136, // 166: cozy.worker.v1.JobCheckpointReceipt.fault:type_name -> cozy.worker.v1.CheckpointFault
+	15,  // 167: cozy.worker.v1.CheckpointFault.code:type_name -> cozy.worker.v1.CheckpointFaultCode
+	141, // 168: cozy.worker.v1.InvocationSpec.inputs:type_name -> cozy.worker.v1.InputBinding
+	142, // 169: cozy.worker.v1.InvocationSpec.outputs:type_name -> cozy.worker.v1.OutputBinding
+	143, // 170: cozy.worker.v1.InvocationSpec.serving:type_name -> cozy.worker.v1.ServingInvocationSpec
+	144, // 171: cozy.worker.v1.InvocationSpec.job:type_name -> cozy.worker.v1.JobInvocationSpec
+	150, // 172: cozy.worker.v1.JobInvocationSpec.publication_contract:type_name -> cozy.worker.v1.PublicationContract
+	148, // 173: cozy.worker.v1.DeliveryGrant.credential:type_name -> cozy.worker.v1.DeliveryAccessCredential
+	146, // 174: cozy.worker.v1.DeliveryGrant.inputs:type_name -> cozy.worker.v1.InputAccess
+	147, // 175: cozy.worker.v1.DeliveryGrant.outputs:type_name -> cozy.worker.v1.OutputAccess
+	142, // 176: cozy.worker.v1.PublicationContract.outputs:type_name -> cozy.worker.v1.OutputBinding
+	5,   // 177: cozy.worker.v1.HeldAttempt.kind:type_name -> cozy.worker.v1.AttemptKind
+	6,   // 178: cozy.worker.v1.HeldAttempt.state:type_name -> cozy.worker.v1.AttemptState
+	12,  // 179: cozy.worker.v1.Fault.kind:type_name -> cozy.worker.v1.FaultKind
+	156, // 180: cozy.worker.v1.OutputManifest.outputs:type_name -> cozy.worker.v1.OutputEntry
+	56,  // 181: cozy.worker.v1.WorkerControl.Control:input_type -> cozy.worker.v1.RecordOwnerFrame
+	138, // 182: cozy.worker.v1.WorkerControl.WatchProgress:input_type -> cozy.worker.v1.ProgressOpen
+	43,  // 183: cozy.worker.v1.RuntimePreparation.CheckPackageSetCompatibility:input_type -> cozy.worker.v1.PreparePackageSetRequest
+	43,  // 184: cozy.worker.v1.RuntimePreparation.PreparePackageSet:input_type -> cozy.worker.v1.PreparePackageSetRequest
+	54,  // 185: cozy.worker.v1.RuntimePreparation.PrepareModelSource:input_type -> cozy.worker.v1.PrepareModelSourceRequest
+	48,  // 186: cozy.worker.v1.RuntimePreparation.PrepareLocalPackage:input_type -> cozy.worker.v1.PrepareLocalPackageRequest
+	50,  // 187: cozy.worker.v1.RuntimePreparation.PreparePrivatePlacement:input_type -> cozy.worker.v1.PreparePrivatePlacementRequest
+	106, // 188: cozy.worker.v1.RuntimeWeights.Exchange:input_type -> cozy.worker.v1.WeightsHostAck
+	115, // 189: cozy.worker.v1.RuntimeWeights.Upload:input_type -> cozy.worker.v1.WeightsUploadRequest
+	34,  // 190: cozy.worker.v1.PodHost.PreparePackageSet:input_type -> cozy.worker.v1.PreparePackageSetCall
+	35,  // 191: cozy.worker.v1.PodHost.PrepareLocalPackage:input_type -> cozy.worker.v1.PrepareLocalPackageCall
+	36,  // 192: cozy.worker.v1.PodHost.PreparePrivatePlacement:input_type -> cozy.worker.v1.PreparePrivatePlacementCall
+	38,  // 193: cozy.worker.v1.PodHost.ModelSourceFile:input_type -> cozy.worker.v1.ModelSourceFileCall
+	39,  // 194: cozy.worker.v1.PodHost.ModelSourcePrepare:input_type -> cozy.worker.v1.ModelSourcePrepareCall
+	40,  // 195: cozy.worker.v1.PodHost.LocalPackageFetch:input_type -> cozy.worker.v1.LocalPackageFetchCall
+	41,  // 196: cozy.worker.v1.PodHost.LocalPackageAbort:input_type -> cozy.worker.v1.LocalPackageAbortCall
+	42,  // 197: cozy.worker.v1.PodHost.WeightsTransfer:input_type -> cozy.worker.v1.WeightsTransferCall
+	57,  // 198: cozy.worker.v1.WorkerControl.Control:output_type -> cozy.worker.v1.WorkerFrame
+	139, // 199: cozy.worker.v1.WorkerControl.WatchProgress:output_type -> cozy.worker.v1.AttemptProgress
+	47,  // 200: cozy.worker.v1.RuntimePreparation.CheckPackageSetCompatibility:output_type -> cozy.worker.v1.CheckPackageSetCompatibilityResult
+	46,  // 201: cozy.worker.v1.RuntimePreparation.PreparePackageSet:output_type -> cozy.worker.v1.PreparePackageSetResult
+	55,  // 202: cozy.worker.v1.RuntimePreparation.PrepareModelSource:output_type -> cozy.worker.v1.PrepareModelSourceResult
+	46,  // 203: cozy.worker.v1.RuntimePreparation.PrepareLocalPackage:output_type -> cozy.worker.v1.PreparePackageSetResult
+	46,  // 204: cozy.worker.v1.RuntimePreparation.PreparePrivatePlacement:output_type -> cozy.worker.v1.PreparePackageSetResult
+	33,  // 205: cozy.worker.v1.RuntimeWeights.Exchange:output_type -> cozy.worker.v1.WeightsHostEvent
+	116, // 206: cozy.worker.v1.RuntimeWeights.Upload:output_type -> cozy.worker.v1.WeightsUploadResult
+	37,  // 207: cozy.worker.v1.PodHost.PreparePackageSet:output_type -> cozy.worker.v1.PrepareEvent
+	37,  // 208: cozy.worker.v1.PodHost.PrepareLocalPackage:output_type -> cozy.worker.v1.PrepareEvent
+	37,  // 209: cozy.worker.v1.PodHost.PreparePrivatePlacement:output_type -> cozy.worker.v1.PrepareEvent
+	119, // 210: cozy.worker.v1.PodHost.ModelSourceFile:output_type -> cozy.worker.v1.ModelSourceFileStatus
+	121, // 211: cozy.worker.v1.PodHost.ModelSourcePrepare:output_type -> cozy.worker.v1.ModelSourcePrepared
+	124, // 212: cozy.worker.v1.PodHost.LocalPackageFetch:output_type -> cozy.worker.v1.LocalPackageFileStatus
+	126, // 213: cozy.worker.v1.PodHost.LocalPackageAbort:output_type -> cozy.worker.v1.LocalPackageAbortStatus
+	117, // 214: cozy.worker.v1.PodHost.WeightsTransfer:output_type -> cozy.worker.v1.WeightsTransferStatus
+	198, // [198:215] is the sub-list for method output_type
+	181, // [181:198] is the sub-list for method input_type
+	181, // [181:181] is the sub-list for extension type_name
+	181, // [181:181] is the sub-list for extension extendee
+	0,   // [0:181] is the sub-list for field type_name
 }
 
 func init() { file_cozy_worker_v1_worker_proto_init() }
@@ -15800,22 +15718,22 @@ func file_cozy_worker_v1_worker_proto_init() {
 		(*WorkerFrame_LocalPackageAbortStatus)(nil),
 		(*WorkerFrame_WeightsUploadResult)(nil),
 	}
-	file_cozy_worker_v1_worker_proto_msgTypes[33].OneofWrappers = []any{
+	file_cozy_worker_v1_worker_proto_msgTypes[32].OneofWrappers = []any{
 		(*DesiredWorkerState_Job)(nil),
 		(*DesiredWorkerState_PlacementSet)(nil),
 		(*DesiredWorkerState_PackageSet)(nil),
 		(*DesiredWorkerState_LocalPackageSet)(nil),
 		(*DesiredWorkerState_PrivatePlacementSet)(nil),
 	}
-	file_cozy_worker_v1_worker_proto_msgTypes[45].OneofWrappers = []any{
+	file_cozy_worker_v1_worker_proto_msgTypes[44].OneofWrappers = []any{
 		(*Placement_Package)(nil),
 		(*Placement_Development)(nil),
 	}
-	file_cozy_worker_v1_worker_proto_msgTypes[82].OneofWrappers = []any{
+	file_cozy_worker_v1_worker_proto_msgTypes[81].OneofWrappers = []any{
 		(*WeightsTransferRequest_UploadGrant)(nil),
 		(*WeightsTransferRequest_Held)(nil),
 	}
-	file_cozy_worker_v1_worker_proto_msgTypes[108].OneofWrappers = []any{
+	file_cozy_worker_v1_worker_proto_msgTypes[107].OneofWrappers = []any{
 		(*InvocationSpec_Serving)(nil),
 		(*InvocationSpec_Job)(nil),
 	}
@@ -15825,7 +15743,7 @@ func file_cozy_worker_v1_worker_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_cozy_worker_v1_worker_proto_rawDesc), len(file_cozy_worker_v1_worker_proto_rawDesc)),
 			NumEnums:      33,
-			NumMessages:   127,
+			NumMessages:   126,
 			NumExtensions: 0,
 			NumServices:   4,
 		},

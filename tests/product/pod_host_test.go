@@ -62,8 +62,9 @@ type fakePod struct {
 	pb.UnimplementedPodHostServer
 	controlKey ed25519.PublicKey
 	leafDigest []byte
-	// mutateHostDigest is the red arm: the host document's digest stops hashing its bytes.
-	mutateHostDigest bool
+	// mutateSnapshotDigest is the red arm: the snapshot document's digest stops hashing its
+	// bytes. At minor 33 there is one document to fence and this is it (th-142 child 2).
+	mutateSnapshotDigest bool
 
 	// latch is the materialization fault this pod keeps against every placement_set it
 	// accepts (the Runtime's own shape: accepted, never converged, the placement ABSENT
@@ -84,7 +85,7 @@ type fakePod struct {
 	lanes              []string // the order lanes were used: fetch, prepare_private, placement_set
 	prepareCodes       []codes.Code
 	prepareUnavailable int
-	hostDigest         []byte
+	snapshotDigest     []byte
 	preparedSet        []byte
 	preparedDig        []byte
 	reports            map[string]int // fault text -> reports that carried it
@@ -219,13 +220,12 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			}}}); err != nil {
 				return err
 			}
+			// ONE DOCUMENT (th-142 child 2, minor 33). The weights transactions the pod
+			// host used to inject into a second document are the Runtime's own rows now,
+			// on the one snapshot body it authors.
 			body, digest, err := canonical.Identity(&pb.WorkerSnapshotBody{
 				WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE, AdmissionEpoch: 1,
-				AdmissionState: pb.AdmissionState_ADMISSION_STATE_CLOSED, AvailableAttemptSlots: 2})
-			if err != nil {
-				return err
-			}
-			hostBody, hostDigest, err := canonical.Identity(&pb.HostSnapshotBody{
+				AdmissionState: pb.AdmissionState_ADMISSION_STATE_CLOSED, AvailableAttemptSlots: 2,
 				WeightsTransactions: []*pb.WeightsTransactionStatus{{
 					WeightsTransactionId: "sha256:" + strings.Repeat("ab", 32), RequestId: "job-prior",
 					AttemptOrdinal: 1, InvocationSpecDigest: "sha256:" + strings.Repeat("cd", 32),
@@ -235,16 +235,15 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			if err != nil {
 				return err
 			}
-			if p.mutateHostDigest {
-				hostDigest = bytes.Repeat([]byte{0x11}, 32)
+			if p.mutateSnapshotDigest {
+				digest = bytes.Repeat([]byte{0x11}, 32)
 			}
 			p.mu.Lock()
-			p.hostDigest = hostDigest
+			p.snapshotDigest = digest
 			p.mu.Unlock()
 			if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_Snapshot{Snapshot: &pb.WorkerSnapshot{
 				RecordOwnerEpoch: m.Claim.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: podBootID,
 				SnapshotId: "snp-pod-1", SnapshotDigest: digest, SnapshotCanonicalBytes: body,
-				HostSnapshotDigest: hostDigest, HostSnapshotCanonicalBytes: hostBody,
 			}}}); err != nil {
 				return err
 			}
@@ -627,7 +626,7 @@ func waitUntil(t *testing.T, what string, ok func() bool) {
 
 // TestPodHostThreeStepSequence: the owner prepares through PodHost, then sends the exact
 // prepared placement_set bytes itself on WorkerControl. No package_set ever crosses the
-// control stream, and the snapshot ack echoes the host document's digest.
+// control stream, and the snapshot ack echoes the exact snapshot digest.
 func TestPodHostThreeStepSequence(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
@@ -639,11 +638,11 @@ func TestPodHostThreeStepSequence(t *testing.T) {
 	instance, _, _, e := o.c.EnsureRental(podRental)
 	fatal(t, e)
 	pod.mu.Lock()
-	acks, hostDigest := append([]*pb.SnapshotAck(nil), pod.acks...), pod.hostDigest
+	acks, snapshotDigest := append([]*pb.SnapshotAck(nil), pod.acks...), pod.snapshotDigest
 	pod.mu.Unlock()
-	if len(acks) != 1 || !bytes.Equal(acks[0].HostSnapshotDigest, hostDigest) {
-		t.Fatalf("the snapshot ack did not echo the host document digest: %d ack(s) %x vs %x",
-			len(acks), acks[0].GetHostSnapshotDigest(), hostDigest)
+	if len(acks) != 1 || !bytes.Equal(acks[0].SnapshotDigest, snapshotDigest) {
+		t.Fatalf("the snapshot ack did not echo the exact snapshot digest: %d ack(s) %x vs %x",
+			len(acks), acks[0].GetSnapshotDigest(), snapshotDigest)
 	}
 
 	fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
@@ -689,29 +688,29 @@ func TestPodHostThreeStepSequence(t *testing.T) {
 	}
 }
 
-// TestPodHostRefusesUnverifiedHostDocument: a host document whose digest does not hash its
-// bytes is refused at the barrier exactly like a worker document would be. Dispatch never
-// opens, and the pod sees no ack.
-func TestPodHostRefusesUnverifiedHostDocument(t *testing.T) {
+// TestPodHostRefusesUnverifiedSnapshotDocument: a snapshot document whose digest does not
+// hash its bytes is refused at the barrier. Dispatch never opens, and the pod sees no ack.
+// At minor 33 there is ONE document to fence — the worker's — and this is that fence.
+func TestPodHostRefusesUnverifiedSnapshotDocument(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
-	pod := &fakePod{controlKey: public, mutateHostDigest: true}
+	pod := &fakePod{controlKey: public, mutateSnapshotDigest: true}
 	root := t.TempDir()
 	connection, _ := startFakePod(t, root, pod)
 	o := hostOwner(t, "podhost-red", rentalWiring(connection, private))
 
 	done := make(chan *exit.Error, 1)
 	go func() { _, _, _, e := o.c.EnsureRental(podRental); done <- e }()
-	waitUntil(t, "the owner's refusal of the host document", func() bool {
+	waitUntil(t, "the owner's refusal of the snapshot document", func() bool {
 		log, _ := os.ReadFile(filepath.Join(o.root, "orchestrator.log"))
-		return strings.Contains(string(log), "host_snapshot_digest") &&
+		return strings.Contains(string(log), "snapshot_digest") &&
 			strings.Contains(string(log), "NOT acknowledged")
 	})
 	pod.mu.Lock()
 	acks := len(pod.acks)
 	pod.mu.Unlock()
 	if acks != 0 {
-		t.Fatalf("the owner acknowledged a host document whose digest does not hash its bytes")
+		t.Fatalf("the owner acknowledged a document whose digest does not hash its bytes")
 	}
 	select {
 	case e := <-done:

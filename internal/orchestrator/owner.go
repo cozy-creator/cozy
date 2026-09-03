@@ -644,27 +644,12 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 				briefOf(blocked))
 		}
 	}
+	// ONE DOCUMENT (th-142 child 2, minor 33). A pod host used to author a SECOND snapshot
+	// document beside the worker's, carrying the outcomes its ledger held that the live child
+	// did not name. The worker owns that record now and recovers it at its own boot, so those
+	// outcomes arrive in `held_attempts` like every other one and are reconciled by the same
+	// pass. There is nothing left for a host to append here.
 	reconcileHeld(held, "held")
-	// THE HOST'S OWN DOCUMENT (proto-025). A pod host between this owner and the worker
-	// holds outcomes the live child may not name (a replaced child's survivors) and announces
-	// the receipts it replays after this ack. It is fenced exactly like the worker's document
-	// and reconciled before the same ack; the worker's bytes above are the worker's own.
-	var hostHeld []canonical.Doc
-	if len(snap.HostSnapshotCanonicalBytes) > 0 || len(snap.HostSnapshotDigest) > 0 {
-		computed := canonical.Digest(snap.HostSnapshotCanonicalBytes)
-		if !bytes.Equal(computed, snap.HostSnapshotDigest) {
-			refuse("host_snapshot_digest %x does not hash the %d resident host bytes (%x)",
-				snap.HostSnapshotDigest, len(snap.HostSnapshotCanonicalBytes), computed)
-			return false
-		}
-		hostDoc, err := canonical.Read(snap.HostSnapshotCanonicalBytes, &pb.HostSnapshotBody{})
-		if err != nil {
-			refuse("the host snapshot document is inadmissible (%s)", err)
-			return false
-		}
-		hostHeld = hostDoc.List("held_outcomes")
-		reconcileHeld(hostHeld, "host-held")
-	}
 	continuations := c.reconcileSnapshotAbsence(w, heldSet)
 	// The worker's own admission facts arrive with the snapshot, so the barrier's other
 	// side is readable before the first observed state: admission reports CLOSED until the
@@ -693,8 +678,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		c.logf("worker breach on %s: %s", w.instanceID, breach)
 	}
 
-	ackMsg := &pb.SnapshotAck{SnapshotId: snap.SnapshotId, SnapshotDigest: snap.SnapshotDigest,
-		HostSnapshotDigest: append([]byte(nil), snap.HostSnapshotDigest...)}
+	ackMsg := &pb.SnapshotAck{SnapshotId: snap.SnapshotId, SnapshotDigest: snap.SnapshotDigest}
 	ackMsg.RecordOwnerEpoch, ackMsg.ControlStreamEpoch, ackMsg.WorkerBootId =
 		recordOwnerEpoch, s.epoch, s.bootID
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_SnapshotAck{SnapshotAck: ackMsg}}) {
@@ -707,11 +691,11 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		c.afterAck(continuation.request, continuation.attempt, w)
 	}
 	c.retryMediaCleanup(w)
-	c.logf("snapshot %s (%s, %d B) acknowledged: %d held attempt(s), %d host-held outcome(s), "+
+	c.logf("snapshot %s (%s, %d B) acknowledged: %d held attempt(s), %d weights transaction(s), "+
 		"accepted revision %d, converged %d; dispatch is open", snap.SnapshotId,
 		shortDigest(shortNone(snap.SnapshotDigest)), len(snap.SnapshotCanonicalBytes),
-		len(held), len(hostHeld), doc.Int("accepted_desired_state_revision"),
-		doc.Int("converged_revision"))
+		len(held), len(doc.List("weights_transactions")),
+		doc.Int("accepted_desired_state_revision"), doc.Int("converged_revision"))
 	if w.spec.IsJob() {
 		c.signalAllTransfers()
 		_ = c.sendJobDirective(s, w)
