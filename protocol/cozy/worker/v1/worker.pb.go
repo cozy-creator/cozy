@@ -2750,8 +2750,14 @@ type PreparePackageSetRequest struct {
 	ImageInventory     *ImageInventory        `protobuf:"bytes,6,opt,name=image_inventory,json=imageInventory,proto3" json:"image_inventory,omitempty"`
 	LockedRequirements []byte                 `protobuf:"bytes,7,opt,name=locked_requirements,json=lockedRequirements,proto3" json:"locked_requirements,omitempty"`
 	InstallRoot        string                 `protobuf:"bytes,8,opt,name=install_root,json=installRoot,proto3" json:"install_root,omitempty"` // absolute immutable install destination
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// MINOR 32: the delegation's other half. The same 64-byte Ed25519 signature by the rental
+	// Creator key that DesiredPackageSet.download_delegation_signature carries, forwarded
+	// unchanged by the pod host. Runtime's TensorFS presents `delegation <payload> <signature>`
+	// as its hub credential on the tensorfs closure and presign routes; the payload alone does
+	// not authenticate.
+	DownloadDelegationSignature []byte `protobuf:"bytes,9,opt,name=download_delegation_signature,json=downloadDelegationSignature,proto3" json:"download_delegation_signature,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *PreparePackageSetRequest) Reset() {
@@ -2824,6 +2830,13 @@ func (x *PreparePackageSetRequest) GetInstallRoot() string {
 		return x.InstallRoot
 	}
 	return ""
+}
+
+func (x *PreparePackageSetRequest) GetDownloadDelegationSignature() []byte {
+	if x != nil {
+		return x.DownloadDelegationSignature
+	}
+	return nil
 }
 
 // The placed worker image's pinned inventory (`tensorhub.image_inventory/1` facts). The list
@@ -3194,8 +3207,13 @@ type PreparePrivatePlacementRequest struct {
 	OperationId         string                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
 	LocalRevisionDigest []byte                 `protobuf:"bytes,2,opt,name=local_revision_digest,json=localRevisionDigest,proto3" json:"local_revision_digest,omitempty"`
 	DownloadDelegation  []byte                 `protobuf:"bytes,3,opt,name=download_delegation,json=downloadDelegation,proto3" json:"download_delegation,omitempty"` // exact model-only canonical DownloadDelegation/1 bytes
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// MINOR 32: the same 64-byte Ed25519 signature by the rental Creator key that
+	// DesiredPrivatePlacementSet.download_delegation_signature carries, forwarded unchanged by the
+	// pod host so Runtime's TensorFS can present `delegation <payload> <signature>` to the hub's
+	// tensorfs routes.
+	DownloadDelegationSignature []byte `protobuf:"bytes,5,opt,name=download_delegation_signature,json=downloadDelegationSignature,proto3" json:"download_delegation_signature,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *PreparePrivatePlacementRequest) Reset() {
@@ -3245,6 +3263,13 @@ func (x *PreparePrivatePlacementRequest) GetLocalRevisionDigest() []byte {
 func (x *PreparePrivatePlacementRequest) GetDownloadDelegation() []byte {
 	if x != nil {
 		return x.DownloadDelegation
+	}
+	return nil
+}
+
+func (x *PreparePrivatePlacementRequest) GetDownloadDelegationSignature() []byte {
+	if x != nil {
+		return x.DownloadDelegationSignature
 	}
 	return nil
 }
@@ -14052,14 +14077,15 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\arequest\x18\x02 \x01(\v2!.cozy.worker.v1.LocalPackageAbortR\arequest\"\x84\x01\n" +
 	"\x13WeightsTransferCall\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12@\n" +
-	"\arequest\x18\x02 \x01(\v2&.cozy.worker.v1.WeightsTransferRequestR\arequest\"\xd9\x02\n" +
+	"\arequest\x18\x02 \x01(\v2&.cozy.worker.v1.WeightsTransferRequestR\arequest\"\x9d\x03\n" +
 	"\x18PreparePackageSetRequest\x12/\n" +
 	"\x13download_delegation\x18\x01 \x01(\fR\x12downloadDelegation\x12 \n" +
 	"\vapplication\x18\x04 \x01(\tR\vapplication\x12(\n" +
 	"\x10model_slot_paths\x18\x05 \x03(\tR\x0emodelSlotPaths\x12G\n" +
 	"\x0fimage_inventory\x18\x06 \x01(\v2\x1e.cozy.worker.v1.ImageInventoryR\x0eimageInventory\x12/\n" +
 	"\x13locked_requirements\x18\a \x01(\fR\x12lockedRequirements\x12!\n" +
-	"\finstall_root\x18\b \x01(\tR\vinstallRootJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04R\x05filesR\x10environment_root\"\x8b\x01\n" +
+	"\finstall_root\x18\b \x01(\tR\vinstallRoot\x12B\n" +
+	"\x1ddownload_delegation_signature\x18\t \x01(\fR\x1bdownloadDelegationSignatureJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04R\x05filesR\x10environment_root\"\x8b\x01\n" +
 	"\x0eImageInventory\x12\x18\n" +
 	"\aprofile\x18\x01 \x01(\tR\aprofile\x12\x16\n" +
 	"\x06python\x18\x02 \x01(\tR\x06python\x12G\n" +
@@ -14081,11 +14107,12 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x06digest\x18\x01 \x01(\fR\x06digest\x12\x1a\n" +
 	"\bfilename\x18\x02 \x01(\tR\bfilename\x12\x16\n" +
 	"\x06length\x18\x03 \x01(\x04R\x06length\x12\x12\n" +
-	"\x04path\x18\x04 \x01(\tR\x04path\"\xb5\x01\n" +
+	"\x04path\x18\x04 \x01(\tR\x04path\"\xf9\x01\n" +
 	"\x1ePreparePrivatePlacementRequest\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\tR\voperationId\x122\n" +
 	"\x15local_revision_digest\x18\x02 \x01(\fR\x13localRevisionDigest\x12/\n" +
-	"\x13download_delegation\x18\x03 \x01(\fR\x12downloadDelegationJ\x04\b\x04\x10\x05R\x05files\"w\n" +
+	"\x13download_delegation\x18\x03 \x01(\fR\x12downloadDelegation\x12B\n" +
+	"\x1ddownload_delegation_signature\x18\x05 \x01(\fR\x1bdownloadDelegationSignatureJ\x04\b\x04\x10\x05R\x05files\"w\n" +
 	"\x14LocalModelSourceFile\x12\x16\n" +
 	"\x06member\x18\x01 \x01(\tR\x06member\x12\x1b\n" +
 	"\tobject_id\x18\x02 \x01(\tR\bobjectId\x12\x16\n" +
