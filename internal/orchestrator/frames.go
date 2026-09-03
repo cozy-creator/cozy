@@ -150,11 +150,13 @@ func mergePackageSet(currentPackages []*pb.DownloadPackageRef, currentModels []*
 // issuePackageSet prepares the desired logical set ONE PACKAGE PER PREPARE — the
 // Runtime's contract (package_prepare: exactly one package and a model array) — and sends
 // every prepared placement as the ONE full-replace set a rental hosting several package
-// environments converges to. Each package's delegation is signed once and reused
-// byte-for-byte while it lives and the boot stands: the pod's preparation ledger answers
-// a known delegation without re-downloading, and the Runtime seeds the placement_id from
-// the exact delegation bytes, so re-signing package A when package B joins would retire
-// a serving placement that changed in nothing but its credential.
+// environments converges to. Each package's download set is a pure function of its
+// content, so an unchanged selection authors identical bytes: the pod's preparation
+// ledger answers a known set without re-downloading, and the Runtime seeds the
+// placement_id from those exact bytes, so adding package B cannot retire package A's
+// serving placement. Nothing is retained between issues because nothing about the
+// document can change while its content does not -- there is no signature and no expiry
+// to go stale (owner ruling 2026-09-03).
 func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.DownloadPackageRef,
 	models []*pb.DownloadModelRef) *exit.Error {
 	if c.opt.RentalPackageSet == nil {
@@ -169,65 +171,39 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 	if problem != nil {
 		return problem
 	}
-	c.mu.Lock()
-	retained := w.desiredDelegations
-	bootID := ""
-	if w.spec.Connection != nil {
-		bootID = w.spec.Connection.WorkerBootID
-	}
-	c.mu.Unlock()
-	now := time.Now()
-	signed := make(map[string]signedPackageDelegation, len(selections))
+	sets := make(map[string][]byte, len(selections))
 	prepares := make([]packagePrepare, 0, len(selections))
-	var earliest time.Time
 	for _, selection := range selections {
 		if len(selection.packages) != 1 {
 			return exit.Named(exit.Validation, "rental.package_set_release_ambiguous",
 				"package_set selects %d releases of %s; a package prepares as exactly one release",
 				len(selection.packages), selection.name)
 		}
-		key := selection.contentKey()
-		delegation, held := retained[selection.name]
-		if !held || delegation.contentKey != key || delegation.bootID != bootID ||
-			!now.Before(delegation.expiry) {
-			body, signature, problem := c.opt.RentalPackageSet(w.spec.Connection,
-				selection.packages, selection.models)
-			if problem != nil {
-				return problem
-			}
-			if len(body) == 0 || len(signature) != 64 {
-				return exit.Named(exit.Validation, "rental.delegation_incomplete",
-					"package_set requires canonical delegation bytes and one Ed25519 signature")
-			}
-			document, err := canonical.Read(body, &pb.DownloadDelegation{})
-			if err != nil {
-				return exit.Named(exit.Validation, "rental.delegation_invalid",
-					"package_set delegation is not canonical: %s", err)
-			}
-			delegation = signedPackageDelegation{
-				contentKey: key, bootID: bootID,
-				expiry:     time.Unix(document.Int("expires_at_unix"), 0),
-				delegation: body, signature: signature,
-			}
+		body, problem := c.opt.RentalPackageSet(selection.packages, selection.models)
+		if problem != nil {
+			return problem
 		}
-		signed[selection.name] = delegation
-		if earliest.IsZero() || delegation.expiry.Before(earliest) {
-			earliest = delegation.expiry
+		if len(body) == 0 {
+			return exit.Named(exit.Validation, "rental.download_set_incomplete",
+				"package_set requires canonical download-set bytes")
 		}
+		if _, err := canonical.Read(body, &pb.DownloadDelegation{}); err != nil {
+			return exit.Named(exit.Validation, "rental.download_set_invalid",
+				"package_set download set is not canonical: %s", err)
+		}
+		sets[selection.name] = body
 		prepares = append(prepares, packagePrepare{
 			label: hostLabel("package_set", selection.name),
 			pkg:   selection.name,
 			ref: &pb.DownloadPackageRef{Package: selection.packages[0].Package,
 				Release: selection.packages[0].Release},
-			delegation: append([]byte(nil), delegation.delegation...),
-			signature:  append([]byte(nil), delegation.signature...),
+			downloadSet: append([]byte(nil), body...),
 		})
 	}
 	c.mu.Lock()
-	w.delegationExpiry = earliest
 	w.desiredPackages = clonePackageRefs(packages)
 	w.desiredModels = cloneModelRefs(models)
-	w.desiredDelegations = signed
+	w.desiredDownloadSets = sets
 	w.desiredLocal = nil
 	w.desiredPrivatePlacement = nil
 	c.mu.Unlock()
@@ -237,14 +213,14 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 
 // packageSelection is one package's slice of the desired logical set: its ref and the
 // models bound to it. Prepare is a per-package operation, so this is exactly what one
-// delegation authorizes and one PreparePackageSet call presents.
+// download set names and one PreparePackageSet call presents.
 type packageSelection struct {
 	name     string
 	packages []*pb.DownloadPackageRef
 	models   []*pb.DownloadModelRef
 }
 
-// contentKey is the selection's logical content — what a signed delegation binds beside
+// contentKey is the selection's logical content — what a download set names beside
 // its expiry and worker identity. Equal keys authorize the same bytes.
 func (g packageSelection) contentKey() string {
 	var sb strings.Builder
@@ -344,30 +320,6 @@ func unitePreparedPlacementSets(sets []*pb.DesiredPlacementSet) (*pb.DesiredPlac
 	}, nil
 }
 
-// delegationExpiryOf reads the lifetime out of the exact delegation bytes this owner is
-// about to send. It is kept on the worker so a pod reporting the credential lapsed can be
-// told apart from a pod reporting a lapse that could not have happened yet (owner.go's
-// refusePendingDesiredState). A desired state carrying no delegation clears it: a stale
-// expiry must never excuse a refusal of some other mode.
-func delegationExpiryOf(delegation []byte) time.Time {
-	document, err := canonical.Read(delegation, &pb.DownloadDelegation{})
-	if err != nil {
-		return time.Time{}
-	}
-	return time.Unix(document.Int("expires_at_unix"), 0)
-}
-
-// signedPackageDelegation is one package's exact signed download authority: the
-// canonical DownloadDelegation bytes, their signature, and the facts that decide reuse —
-// the logical content signed, the worker boot it binds, and its expiry.
-type signedPackageDelegation struct {
-	contentKey string
-	bootID     string
-	expiry     time.Time
-	delegation []byte
-	signature  []byte
-}
-
 func clonePackageRefs(in []*pb.DownloadPackageRef) []*pb.DownloadPackageRef {
 	out := make([]*pb.DownloadPackageRef, 0, len(in))
 	for _, ref := range in {
@@ -419,7 +371,6 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 	rev := c.nextRevision()
 	c.mu.Lock()
 	w.revision, w.setDigest, w.setBytes = rev, digest, setBytes
-	w.delegationExpiry = time.Time{}
 	w.desiredRefusal = nil
 	c.mu.Unlock()
 
@@ -1755,8 +1706,9 @@ const descriptorDefectCode = "package_prepare_interface_disagrees"
 // relayDescriptorDefect files one defect report per desired revision when the
 // pod's typed refusal falsifies the published package interface. The orchestrator
 // holds no hub client, so the report goes through the same kind of entrypoint
-// callback the package-set signer uses; the callback carries the exact signed
-// delegation this download ran under — the report's whole chain of authority.
+// callback the package-set author uses. It carries no chain of authority: the signed
+// delegation that used to prove which download the refusal came from is deleted
+// (owner ruling 2026-09-03), so the hub authorizes by rental ownership alone.
 func (c *Orchestrator) relayDescriptorDefect(w *worker, revision uint64, f *pb.Fault) {
 	if c.opt.ReportReleaseDefect == nil || !strings.Contains(f.Detail, descriptorDefectCode) {
 		return
@@ -1766,19 +1718,16 @@ func (c *Orchestrator) relayDescriptorDefect(w *worker, revision uint64, f *pb.F
 		return
 	}
 	selected := w.desiredPackages[0]
-	signed, held := w.desiredDelegations[selected.Package]
-	if !held {
+	if _, prepared := w.desiredDownloadSets[selected.Package]; !prepared {
 		return
 	}
 	w.defectReportedRevision = revision
 	report := ReleaseDefect{
-		Package:    selected.Package,
-		Release:    selected.Release,
-		RentalID:   w.spec.Connection.RentalID,
-		Delegation: append([]byte(nil), signed.delegation...),
-		Signature:  append([]byte(nil), signed.signature...),
-		Code:       descriptorDefectCode,
-		Detail:     brief(f.Detail, 2048),
+		Package:  selected.Package,
+		Release:  selected.Release,
+		RentalID: w.spec.Connection.RentalID,
+		Code:     descriptorDefectCode,
+		Detail:   brief(f.Detail, 2048),
 	}
 	c.logf("relaying package-interface defect for %s@%s from rental %s",
 		report.Package, report.Release, report.RentalID)

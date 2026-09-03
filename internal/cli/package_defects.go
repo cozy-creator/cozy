@@ -2,13 +2,13 @@ package cli
 
 // cl-078/th-106: the defect relay's entrypoint half. The orchestrator holds no
 // Tensorhub client, so a package-interface-falsifying pod refusal reaches the hub
-// through this owner — carrying the exact creator-signed delegation the
-// download ran under, which is the report's whole chain of authority. The hub's
-// tombstone is idempotent, so this is fire-and-forget: a failure is logged and
-// the next rental of the same defective release files the same report.
+// through this owner. It carries no chain of authority: the creator-signed delegation
+// that proved the download ran under this rental is deleted (owner ruling 2026-09-03),
+// and the hub authorizes the report by rental OWNERSHIP alone. The hub's tombstone is
+// idempotent, so this is fire-and-forget: a failure is logged and the next rental of
+// the same defective release files the same report.
 
 import (
-	"encoding/base64"
 	"fmt"
 	"io"
 
@@ -43,11 +43,9 @@ func (o *defectReporter) report(defect orchestrator.ReleaseDefect) {
 	hctx, cancel := hub.LongContext()
 	defer cancel()
 	result, problem := c.ReportPackageDefect(hctx, ref, defect.Release, hub.PackageDefectReport{
-		Code:                defect.Code,
-		Detail:              defect.Detail,
-		RentalID:            defect.RentalID,
-		DelegationBase64URL: base64.RawURLEncoding.EncodeToString(defect.Delegation),
-		SignatureBase64URL:  base64.RawURLEncoding.EncodeToString(defect.Signature),
+		Code:     defect.Code,
+		Detail:   defect.Detail,
+		RentalID: defect.RentalID,
 	}, "package-interface-falsifying refusal on rental "+defect.RentalID)
 	if problem != nil {
 		fmt.Fprintf(o.log, "defect report for %s@%s refused: %s\n",

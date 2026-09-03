@@ -10,7 +10,8 @@ import (
 )
 
 // ClaimProof reconstructs worker-protocol ClaimProof/1 from the exact attach projection
-// and signs it with the same per-rental key used for artifact delegation.
+// and signs it with the per-rental Creator key. That key survives the delegation
+// deletion: it still signs ClaimProof, which is how a pod knows this owner.
 func ClaimProof(l home.Layout) orchestrator.RentalClaimProofSource {
 	return func(connection *orchestrator.WorkerConnection, epoch uint64) ([]byte, *exit.Error) {
 		if connection == nil || connection.RentalID == "" || epoch == 0 ||

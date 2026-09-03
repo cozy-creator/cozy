@@ -195,7 +195,7 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 
 // placementModels reads the exact model rows a PlacementSet binds and names each by the
 // descriptor slot path its entrypoint binds it to — the spelling every download
-// delegation, private placement, and request selection is addressed by.
+// download set, private placement, and request selection is addressed by.
 func placementModels(pkg string, row canonical.Doc) []ModelRef {
 	byID := map[string]canonical.Doc{}
 	for _, model := range row.List("models") {
@@ -399,15 +399,15 @@ type worker struct {
 	// locally reconstructed placement.
 	desiredPackages []*pb.DownloadPackageRef
 	desiredModels   []*pb.DownloadModelRef
-	// desiredDelegations retain, PER PACKAGE, the exact signed authority the current
-	// package_set is prepared under. Prepare is a per-package operation (the Runtime's
-	// package_prepare takes exactly one package), and the Runtime seeds the package's
-	// placement_id from the exact delegation bytes — so the bytes are REUSED while they
-	// live: re-signing package A because package B joined would retire a serving
-	// placement that changed in nothing but its credential. A package-interface-falsifying
-	// refusal is relayed to the hub with this chain (cl-078/th-106); defectReported
-	// latches per revision so one falsification files one report.
-	desiredDelegations     map[string]signedPackageDelegation
+	// desiredDownloadSets hold, PER PACKAGE, the exact canonical download-set bytes the
+	// current package_set is prepared under. Prepare is a per-package operation (the
+	// Runtime's package_prepare takes exactly one package), and the Runtime seeds the
+	// package's placement_id from these bytes. They are a pure function of content, so
+	// an unchanged selection re-authors identical bytes and adding package B cannot
+	// retire package A's serving placement. A package-interface-falsifying refusal is
+	// relayed to the hub (cl-078/th-106); defectReported latches per revision so one
+	// falsification files one report.
+	desiredDownloadSets    map[string][]byte
 	defectReportedRevision uint64
 	desiredMu              sync.Mutex
 	// A rental is one machine and may host several package environments. Keep the
@@ -418,7 +418,7 @@ type worker struct {
 	// desiredLocal is the exact command-scoped local wheel inventory. It survives
 	// control reconnect so a prepared pod can replay its ledgered PlacementSet directly.
 	desiredLocal *pb.DesiredLocalPackageSet
-	// desiredPrivatePlacement is the signed model-only join for the already-prepared private
+	// desiredPrivatePlacement is the model-only join for the already-prepared private
 	// revision. It survives a control reconnect so pod-supervisor can replay its exact journal.
 	desiredPrivatePlacement *pb.DesiredPrivatePlacementSet
 	// desiredEpoch is the control-stream epoch the local desire above was issued on. A
@@ -443,9 +443,6 @@ type worker struct {
 	// owner issued. It is distinct from a claim refusal and from capacity: a config or
 	// placement-set refusal can never become dispatchable by waiting longer.
 	desiredRefusal *exit.Error
-	// delegationExpiry is when the download delegation carried by the current desired
-	// revision stops being honoured. It is read only to judge a lapse the pod reports.
-	delegationExpiry time.Time
 	// exitCode is the process's own disposition. RECYCLE is not a death (cr-009): a
 	// run-once job worker exits with it the moment its terminal is acknowledged, and
 	// reading that as "the worker died" turns a completed job into a failed request.

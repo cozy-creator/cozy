@@ -182,11 +182,9 @@ func (c *Client) CommitPackageRelease(ctx context.Context, ref Ref, release stri
 }
 
 type PackageDefectReport struct {
-	Code                string `json:"code"`
-	Detail              string `json:"detail"`
-	RentalID            string `json:"rental_id"`
-	DelegationBase64URL string `json:"delegation_base64url"`
-	SignatureBase64URL  string `json:"signature_base64url"`
+	Code     string `json:"code"`
+	Detail   string `json:"detail"`
+	RentalID string `json:"rental_id"`
 }
 
 type PackageDefectResult struct {
@@ -198,8 +196,10 @@ type PackageDefectResult struct {
 }
 
 // ReportPackageDefect relays a package-interface-falsifying pod refusal (th-106). The
-// hub authorizes the report by its chain: this account owns the named rental
-// and the presented creator-signed delegation named this exact release.
+// hub authorizes the report by rental OWNERSHIP: this account owns the named rental
+// against a committed release. The signed-delegation chain that used to prove the
+// rental had downloaded these exact bytes is deleted (owner ruling 2026-09-03), so the
+// report's provenance is no longer proven.
 func (c *Client) ReportPackageDefect(ctx context.Context, ref Ref, release string,
 	report PackageDefectReport, reason string,
 ) (PackageDefectResult, *exit.Error) {

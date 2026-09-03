@@ -371,11 +371,10 @@ func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream g
 }
 
 // PreparePackageSet is the published package lane the way the pod actually runs it:
-// pod-supervisor downloads under the delegation and the Runtime prepares EXACTLY ONE
-// package per call — a delegation naming more than one is refused with the Runtime's own
+// pod-supervisor downloads what the desired set names and the Runtime prepares EXACTLY
+// ONE package per call — a set naming more than one is refused with the Runtime's own
 // verdict (run 146's failure text), and the prepared single placement is derived from
-// the delegation the way the Runtime derives it, placement_id seeded from the exact
-// delegation bytes.
+// the set the way the Runtime derives it, placement_id seeded from its exact bytes.
 func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
 	if err := p.verifyClaim(call.Claim, false); err != nil {
 		p.mu.Lock()
@@ -383,8 +382,12 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 		p.mu.Unlock()
 		return err
 	}
-	if call.PackageSet == nil || len(call.PackageSet.DownloadDelegationSignature) != ed25519.SignatureSize {
-		return status.Error(codes.InvalidArgument, "no signed delegation")
+	if call.PackageSet == nil || len(call.PackageSet.DownloadDelegation) == 0 {
+		return status.Error(codes.InvalidArgument, "no desired download set")
+	}
+	// RED ARM for the delegation deletion: the pod is handed no credential.
+	if len(call.PackageSet.DownloadDelegationSignature) != 0 {
+		return status.Error(codes.InvalidArgument, "the download set still carries a signature")
 	}
 	// MINOR 31 (xs-019): the release facts ride the call — the pod host's exact
 	// refusal (internal/workerhost/prepare.go), the one run 178 died on.
@@ -394,9 +397,9 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 		return status.Error(codes.InvalidArgument,
 			"PreparePackageSet requires the release facts: application, bounded model_slot_paths, and the locked requirements export")
 	}
-	delegation, err := canonical.Read(call.PackageSet.DownloadDelegation, &pb.DownloadDelegation{})
+	downloadSet, err := canonical.Read(call.PackageSet.DownloadDelegation, &pb.DownloadDelegation{})
 	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "delegation: %v", err)
+		return status.Errorf(codes.InvalidArgument, "download set: %v", err)
 	}
 	p.mu.Lock()
 	p.prepares = append(p.prepares, call)
@@ -423,7 +426,7 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 		}
 		return nil
 	}
-	selected := delegation.List("packages")
+	selected := downloadSet.List("packages")
 	if len(selected) != 1 {
 		for _, event := range []*pb.PrepareEvent{
 			{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED, TotalBytes: total},
@@ -462,12 +465,12 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 	return nil
 }
 
-// podPlacement is the one placement a prepared package delegation yields, on the
+// podPlacement is the one placement a prepared package download set yields, on the
 // Runtime's own derivations: `package-` + the first 24 hex of sha256 over the exact
-// delegation bytes, and one deterministic entrypoint per package so a test can name the
+// download-set bytes, and one deterministic entrypoint per package so a test can name the
 // plan it will dispatch (podPlanID).
-func podPlacement(delegation []byte, name, release, distribution string) *pb.Placement {
-	seed := sha256.Sum256(delegation)
+func podPlacement(downloadSet []byte, name, release, distribution string) *pb.Placement {
+	seed := sha256.Sum256(downloadSet)
 	_ = distribution
 	return &pb.Placement{
 		PlacementId: "package-" + hex.EncodeToString(seed[:])[:24],
@@ -548,7 +551,7 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 }
 
 // rentalWiring is the production entrypoint's rental hooks with a test key: the same
-// ClaimProof/1 and DownloadDelegation/1 documents, signed the same way.
+// ClaimProof/1 signature, and the same unsigned download-set document.
 func rentalWiring(connection *orchestrator.WorkerConnection, signer ed25519.PrivateKey) func(*orchestrator.Options) {
 	return func(o *orchestrator.Options) {
 		o.Rentals = func(id string) (*orchestrator.RemoteTarget, *exit.Error) {
@@ -577,19 +580,13 @@ func rentalWiring(connection *orchestrator.WorkerConnection, signer ed25519.Priv
 			}
 			return urls, nil
 		}
-		o.RentalPackageSet = func(c *orchestrator.WorkerConnection, packages []*pb.DownloadPackageRef,
-			models []*pb.DownloadModelRef) ([]byte, []byte, *exit.Error) {
-			pin, err := workertls.LoadPin(c.CACert)
+		o.RentalPackageSet = func(packages []*pb.DownloadPackageRef,
+			models []*pb.DownloadModelRef) ([]byte, *exit.Error) {
+			body, err := canonical.Bytes(&pb.DownloadDelegation{Models: models, Packages: packages})
 			if err != nil {
-				return nil, nil, exit.Internalf("%v", err)
+				return nil, exit.Internalf("%v", err)
 			}
-			body, err := canonical.Bytes(&pb.DownloadDelegation{ExpiresAtUnix: 2_000_000_000,
-				Models: models, Packages: packages, RentalId: c.RentalID, WorkerBootId: c.WorkerBootID,
-				WorkerId: c.WorkerID, WorkerTlsCertificateDigest: pin.Digest()})
-			if err != nil {
-				return nil, nil, exit.Internalf("%v", err)
-			}
-			return body, ed25519.Sign(signer, body), nil
+			return body, nil
 		}
 		o.RentalPrepareFacts = func(_ context.Context, _ *orchestrator.WorkerConnection,
 			ref *pb.DownloadPackageRef) (orchestrator.PrepareFacts, *exit.Error) {
