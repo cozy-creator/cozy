@@ -512,7 +512,7 @@ type AssetBinding struct {
 
 // ModelRef is one exact user-selected model binding. Creator resolves the human
 // spelling before it rents anything, records this row with the request, and sends it
-// only to the attached worker in a signed download delegation.
+// only to the attached worker in the desired download set.
 type ModelRef struct {
 	Package  string `json:"package"`
 	Slot     string `json:"slot"`

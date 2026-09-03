@@ -42,56 +42,60 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// TestRentalDownloadDelegationOutlivesItsExpiry is xs-007 row 5 as behaviour.
+// TestRentalDownloadSetCarriesNoCredential is xs-007 row 5, settled by deletion.
 //
-// Creator signs the download delegation a rented pod resolves its packages and models
-// with. That credential has a lifetime — the hub refuses one that outlives an hour — and it
-// used to be the thing that decided whether a materialization succeeded: 30 minutes, while
-// 100 GB at 50 MB/s takes 33, so a large download failed as `worker.desired_state_refused`,
-// Structural and never requeued. Nothing in that failure observed a stalled download.
+// Creator used to sign a DownloadDelegation the rented pod presented as its hub
+// credential. That credential had a lifetime — the hub refused one outliving an hour —
+// and it, not the transfer, decided whether a materialization succeeded: 100 GB at
+// 50 MB/s takes 33 minutes, so a large download failed as `worker.desired_state_refused`,
+// Structural and never requeued, with nothing in that failure having observed a stalled
+// download. The answer used to be re-signing mid-transfer. The owner deleted the whole
+// authorization plane instead (ruling 2026-09-03): packages and repos are public, the
+// hub's closure and presign routes take no credential, and the document Creator authors
+// is DESIRED STATE alone.
 //
-// The rule now: a lapsed credential is answered by minting another one, and only OBSERVED
-// lack of progress ends the work. The pod is the party that can see bytes, and it already
-// refuses a refreshed plan that landed none; that verdict is what fails the request.
+// So a download can no longer become unauthorized by running long, and only OBSERVED lack
+// of progress ends the work. The pod is the party that can see bytes, and it refuses a
+// refreshed plan that landed none; that verdict is what fails the request.
 //
 // Every arm below runs the real orchestrator against a real second implementation of the
-// worker protocol over pinned TLS, with the real Creator signer and the hub's real
-// delegation rule. Nothing is stubbed inside the code under test.
-func TestRentalDownloadDelegationOutlivesItsExpiry(t *testing.T) {
-	t.Run("re-signed while the pod is still working", func(t *testing.T) {
-		// The credential ages out mid-download: the pod holds the first delegation past
-		// its own expiry (a transfer in flight) and only then asks the hub for the next
-		// plan, which the hub refuses because the delegation is spent.
-		pod := &standInPod{holdFirstPastExpiry: true}
-		o, instance := attachStandInRental(t, "delegation-resigned", 2*time.Second, pod)
+// worker protocol over pinned TLS, with the real Creator claim signer and the real
+// download-set author. Nothing is stubbed inside the code under test.
+func TestRentalDownloadSetCarriesNoCredential(t *testing.T) {
+	t.Run("no credential to lapse", func(t *testing.T) {
+		// RED ARM for the deletion. The pod holds the set far longer than the old
+		// credential would have lived, then prepares. There is nothing to expire, so it
+		// succeeds on the FIRST presentation: no re-issue, no refusal — and the document
+		// it was handed carries no expiry, no rental/worker/boot binding, and no
+		// signature.
+		pod := &standInPod{holdFor: 2 * time.Second}
+		o, instance := attachStandInRental(t, "download-set-no-credential", pod)
 
 		fatal(t, o.c.ConvergePackageSet(instance, delegatedPackages(), nil))
 
-		if _, ok := waitEvent(o, "re-issuing the package set under a fresh one", 30*time.Second); !ok {
-			t.Fatalf("the lapsed delegation was not re-signed:\n%s", pod.report())
+		seen := pod.await(t, 1, 30*time.Second)
+		if !seen[0].accepted {
+			t.Fatalf("a credential-free download set was refused:\n%s", pod.report())
 		}
-		seen := pod.await(t, 2, 30*time.Second)
-		if !seen[1].accepted {
-			t.Fatalf("the re-signed delegation was refused as well:\n%s", pod.report())
+		if seen[0].credentialFields != "" {
+			t.Fatalf("the download set still carries credential field(s) %s:\n%s",
+				seen[0].credentialFields, pod.report())
 		}
-		if !seen[1].expiry.After(seen[0].expiry) {
-			t.Fatalf("the second delegation is not a fresh credential (%s then %s)",
-				seen[0].expiry.UTC(), seen[1].expiry.UTC())
-		}
-		if !seen[1].signed {
-			t.Fatalf("the re-issued delegation is not signed by this rental's Creator key")
+		if seen[0].signature {
+			t.Fatalf("the download set still carries an Ed25519 signature:\n%s", pod.report())
 		}
 		if n := countEvents(o, "REFUSED before it was applied"); n != 0 {
-			t.Fatalf("a still-working download was refused %d time(s):\n%s", n, pod.report())
+			t.Fatalf("a slow download was refused %d time(s):\n%s", n, pod.report())
 		}
+		pod.stayAt(t, 1, 2*time.Second)
 	})
 
 	t.Run("refused when the pod reports no bytes landed", func(t *testing.T) {
 		// The pod's own progress verdict: a refreshed plan expired having landed no new
-		// byte. That is the observation the delegation clock was standing in for, and it
+		// byte. That is the observation the credential clock was standing in for, and it
 		// is still permanent — nothing is re-signed for a store that is not serving.
 		pod := &standInPod{refusal: noBytesLandedRefusal}
-		o, instance := attachStandInRental(t, "delegation-no-bytes", time.Minute, pod)
+		o, instance := attachStandInRental(t, "download-set-no-bytes", pod)
 
 		fatal(t, o.c.ConvergePackageSet(instance, delegatedPackages(), nil))
 
@@ -105,27 +109,29 @@ func TestRentalDownloadDelegationOutlivesItsExpiry(t *testing.T) {
 		pod.stayAt(t, 1, 3*time.Second)
 	})
 
-	t.Run("refused when a live delegation is reported lapsed", func(t *testing.T) {
-		// The anti-spin fence. A pod reporting the credential expired while this owner's
-		// copy is still live means the two ends disagree about the time; re-signing would
-		// produce the same answer forever, so the refusal stands.
-		pod := &standInPod{refusal: hubDelegationLapsedRefusal}
-		o, instance := attachStandInRental(t, "delegation-skew", time.Minute, pod)
+	t.Run("a credential refusal is now an ordinary permanent one", func(t *testing.T) {
+		// The anti-spin fence, now unconditional. The owner used to answer this exact
+		// text by re-issuing under a fresh credential. No credential exists to refresh,
+		// so the refusal stands and the owner stops — one presentation, no loop.
+		pod := &standInPod{refusal: retiredCredentialRefusal}
+		o, instance := attachStandInRental(t, "download-set-credential-refusal", pod)
 
 		fatal(t, o.c.ConvergePackageSet(instance, delegatedPackages(), nil))
 
 		if _, ok := waitEvent(o, "REFUSED before it was applied", 30*time.Second); !ok {
-			t.Fatalf("a lapse this owner's own clock contradicts was not refused:\n%s", pod.report())
+			t.Fatalf("a credential-shaped refusal was not refused:\n%s", pod.report())
+		}
+		if n := countEvents(o, "re-issuing the package set under a fresh one"); n != 0 {
+			t.Fatalf("the deleted re-sign path ran %d time(s):\n%s", n, pod.report())
 		}
 		pod.stayAt(t, 1, 3*time.Second)
 	})
 }
 
-// hubDelegationLapsedRefusal is what a pod says when tensorhub refuses to mint a plan for
-// an aged-out delegation: `worker_downloads.delegation_unauthorized` from
-// `internal/workerdownloads/service.go`, rendered by `poddownloads.resolveRefusal` and
-// wrapped by `materialize`, then forwarded verbatim as pod-supervisor's FailedPrecondition.
-const hubDelegationLapsedRefusal = "refresh expired download plan: " +
+// retiredCredentialRefusal is the text a pod used to send when tensorhub refused to mint
+// a plan for an aged-out delegation. Nothing produces it any more; it is kept here as the
+// exact input that once bought a re-sign, to prove it now buys nothing.
+const retiredCredentialRefusal = "refresh expired download plan: " +
 	"worker_downloads.delegation_unauthorized: delegation is expired or exceeds the " +
 	"one-hour lifetime; send a fresh delegation signed by this rental's Creator key (HTTP 401)"
 
@@ -142,16 +148,18 @@ func delegatedPackages() []*pb.DownloadPackageRef {
 
 // ---------------------------------------------------------------- the stand-in pod
 
-type resolvedDelegation struct {
-	expiry   time.Time
-	accepted bool
-	signed   bool
+// presentedDownloadSet is what the pod was handed: whether it prepared, and the two
+// facts the deletion is about — any surviving credential field, and any signature.
+type presentedDownloadSet struct {
+	accepted         bool
+	credentialFields string
+	signature        bool
 }
 
 // standInPod is a second implementation of the pod side standing where a rented pod
 // stands: WorkerControl and PodHost on one pinned TLS listener (proto-025). It claims,
-// mints its own canonical snapshot, and answers PodHost.PreparePackageSet by resolving the
-// delegation exactly as tensorhub's resolve route would. A refusal is the prepare stream's
+// mints its own canonical snapshot, and answers PodHost.PreparePackageSet by reading the
+// desired download set the way pod-supervisor does. A refusal is the prepare stream's
 // terminal REFUSED event carrying the hub's code and words, which is what pod-supervisor
 // answers; the owner then sends the prepared placement_set itself on WorkerControl.
 type standInPod struct {
@@ -161,14 +169,14 @@ type standInPod struct {
 	creatorPublicKey           ed25519.PublicKey
 	leafDigest                 []byte // the pinned leaf the owner's ClaimProof names
 
-	// holdFirstPastExpiry keeps the first delegation in hand until it has aged out, the
-	// way a transfer that is still landing bytes does.
-	holdFirstPastExpiry bool
-	// refusal, when set, is answered to every package_set without consulting the clock.
+	// holdFor keeps the first download set in hand this long before preparing, the way a
+	// transfer that is still landing bytes does. Nothing expires while it waits.
+	holdFor time.Duration
+	// refusal, when set, is answered to every package_set.
 	refusal string
 
 	mu    sync.Mutex
-	seen  []resolvedDelegation
+	seen  []presentedDownloadSet
 	epoch uint64
 }
 
@@ -250,9 +258,8 @@ func (p *standInPod) Control(stream pb.WorkerControl_ControlServer) error {
 	}
 }
 
-// PreparePackageSet is the host lane: the same delegation resolve, answered as prepare
-// events. The hub's refusal code and words ride the terminal REFUSED event exactly as
-// pod-supervisor forwards them, so the owner's lapse rule reads one text either way.
+// PreparePackageSet is the host lane, answered as prepare events. A refusal's code and
+// words ride the terminal REFUSED event exactly as pod-supervisor forwards them.
 func (p *standInPod) PreparePackageSet(call *pb.PreparePackageSetCall,
 	stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
 	if call.GetClaim() == nil || call.Claim.ControlStreamEpoch != 0 ||
@@ -273,7 +280,7 @@ func (p *standInPod) PreparePackageSet(call *pb.PreparePackageSetCall,
 	if err := stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED}); err != nil {
 		return err
 	}
-	if err := p.applyPackageSet(set.DownloadDelegation, set.DownloadDelegationSignature); err != nil {
+	if err := p.applyPackageSet(set.DownloadDelegation, set.DownloadDelegationSignature); err != nil { //nolint:staticcheck // wire field renamed by proto-033
 		code, detail, _ := strings.Cut(err.Error(), ": ")
 		return stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_REFUSED,
 			SafeCode: code, SafeDetail: detail})
@@ -298,57 +305,53 @@ func (p *standInPod) claimProof(claim *pb.Claim) []byte {
 	return body
 }
 
-// applyPackageSet is the pod's download edge: read the delegation, take as long over it as
-// the arm says a transfer would, then present it to the hub's rule.
-func (p *standInPod) applyPackageSet(delegation, signature []byte) error {
-	document, err := canonical.Read(delegation, &pb.DownloadDelegation{})
+// applyPackageSet is the pod's download edge: read the desired download set, take as long
+// over it as the arm says a transfer would, and record what the document actually carried.
+// There is no credential to check — the hub's closure and presign routes take none — so
+// only an arm's own refusal can fail a preparation.
+func (p *standInPod) applyPackageSet(desired, signature []byte) error {
+	document, err := canonical.Read(desired, &pb.DownloadDelegation{})
 	if err != nil {
-		return fmt.Errorf("delegation is not canonical: %w", err)
+		return fmt.Errorf("download set is not canonical: %w", err)
 	}
-	expiry := time.Unix(document.Int("expires_at_unix"), 0)
-	signed := ed25519.Verify(p.creatorPublicKey, delegation, signature)
+	// The credential fields the deletion removed. A document carrying any of them means
+	// some part of the authorization plane grew back.
+	surviving := []string(nil)
+	for _, field := range []string{"expires_at_unix", "rental_id", "worker_boot_id",
+		"worker_id", "worker_tls_certificate_digest"} {
+		if _, present := document[field]; present {
+			surviving = append(surviving, field)
+		}
+	}
+	presented := presentedDownloadSet{credentialFields: strings.Join(surviving, ","),
+		signature: len(signature) != 0}
 
 	p.mu.Lock()
 	first := len(p.seen) == 0
 	p.mu.Unlock()
-
-	if p.holdFirstPastExpiry && first {
-		time.Sleep(time.Until(expiry) + 100*time.Millisecond)
+	if p.holdFor > 0 && first {
+		time.Sleep(p.holdFor)
 	}
-	resolveErr := errors.New(p.refusal)
-	if p.refusal == "" {
-		resolveErr = standInHubResolve(expiry, signed, time.Now())
+	var refusal error
+	if p.refusal != "" {
+		refusal = errors.New(p.refusal)
 	}
+	presented.accepted = refusal == nil
 
 	p.mu.Lock()
-	p.seen = append(p.seen, resolvedDelegation{expiry: expiry, accepted: resolveErr == nil, signed: signed})
+	p.seen = append(p.seen, presented)
 	p.mu.Unlock()
-	return resolveErr
+	return refusal
 }
 
-// standInHubResolve is tensorhub's admission rule for a delegation and nothing else
-// (`internal/workerdownloads/delegation.go` verifyDelegation): the Creator signature must
-// verify, the credential must not have aged out, and it must not outlive the hub's
-// one-hour ceiling. A refusal is rendered in the hub's own words.
-func standInHubResolve(expiry time.Time, signed bool, now time.Time) error {
-	if !signed {
-		return errors.New("worker_downloads.delegation_unauthorized: delegation signature is invalid " +
-			"(HTTP 401)")
-	}
-	if !expiry.After(now) || expiry.After(now.Add(time.Hour)) {
-		return errors.New(hubDelegationLapsedRefusal)
-	}
-	return nil
-}
-
-func (p *standInPod) resolved() []resolvedDelegation {
+func (p *standInPod) resolved() []presentedDownloadSet {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]resolvedDelegation(nil), p.seen...)
+	return append([]presentedDownloadSet(nil), p.seen...)
 }
 
-// await waits for the pod to have been presented `count` delegations.
-func (p *standInPod) await(t *testing.T, count int, timeout time.Duration) []resolvedDelegation {
+// await waits for the pod to have been presented `count` download sets.
+func (p *standInPod) await(t *testing.T, count int, timeout time.Duration) []presentedDownloadSet {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -357,17 +360,17 @@ func (p *standInPod) await(t *testing.T, count int, timeout time.Duration) []res
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatalf("the pod was presented %d delegation(s), wanted %d:\n%s",
+	t.Fatalf("the pod was presented %d download set(s), wanted %d:\n%s",
 		len(p.resolved()), count, p.report())
 	return nil
 }
 
-// stayAt proves the owner stopped: a permanent refusal must not become a re-sign loop.
+// stayAt proves the owner stopped: nothing re-issues a set the pod already answered.
 func (p *standInPod) stayAt(t *testing.T, count int, settle time.Duration) {
 	t.Helper()
 	time.Sleep(settle)
 	if seen := p.resolved(); len(seen) != count {
-		t.Fatalf("a refused package set was re-signed: %d delegation(s), wanted %d:\n%s",
+		t.Fatalf("the package set was re-issued: %d download set(s), wanted %d:\n%s",
 			len(seen), count, p.report())
 	}
 }
@@ -375,11 +378,15 @@ func (p *standInPod) stayAt(t *testing.T, count int, settle time.Duration) {
 func (p *standInPod) report() string {
 	out := ""
 	for i, row := range p.resolved() {
-		out += fmt.Sprintf("  delegation %d: expires %s accepted=%v signed=%v\n",
-			i+1, row.expiry.UTC().Format(time.RFC3339), row.accepted, row.signed)
+		fields := row.credentialFields
+		if fields == "" {
+			fields = "(none)"
+		}
+		out += fmt.Sprintf("  download set %d: accepted=%v credential fields=%s signature=%v\n",
+			i+1, row.accepted, fields, row.signature)
 	}
 	if out == "" {
-		return "  (the pod was presented no delegation)"
+		return "  (the pod was presented no download set)"
 	}
 	return out
 }
@@ -387,12 +394,10 @@ func (p *standInPod) report() string {
 // ---------------------------------------------------------------- the rented machine
 
 // attachStandInRental brings up one rental: a real Creator identity, a real pinned TLS
-// leaf, the real claim-proof and delegation signers, and this test's own delegation
-// lifetime. The lifetime is the security bound the product keeps — shortening it is what
-// lets a lapse be observed in seconds instead of fifty minutes. Everything else is the
-// product's own code, including the bytes that get signed.
-func attachStandInRental(t *testing.T, name string, lifetime time.Duration,
-	pod *standInPod) (*owner, string) {
+// leaf, the real claim-proof signer, and the real download-set author. There is no
+// lifetime to configure — the credential that had one is deleted. Everything is the
+// product's own code, including the exact bytes the pod is handed.
+func attachStandInRental(t *testing.T, name string, pod *standInPod) (*owner, string) {
 	t.Helper()
 	rentalID := "rental-" + name
 	pod.workerID = "wrk-" + name
@@ -413,11 +418,7 @@ func attachStandInRental(t *testing.T, name string, lifetime time.Duration,
 		options.RentalClaimProof = func(c *orchestrator.WorkerConnection, epoch uint64) ([]byte, *exit.Error) {
 			return rental.ClaimProof(layout)(c, epoch)
 		}
-		options.RentalPackageSet = func(c *orchestrator.WorkerConnection,
-			packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRef) ([]byte, []byte, *exit.Error) {
-			return rental.SignDownloadDelegation(layout, c, packages, models,
-				time.Now().Add(lifetime))
-		}
+		options.RentalPackageSet = rental.PackageSetSource()
 		options.RentalPrepareFacts = func(_ context.Context, _ *orchestrator.WorkerConnection,
 			ref *pb.DownloadPackageRef) (orchestrator.PrepareFacts, *exit.Error) {
 			return testPrepareFacts(ref.Package, ref.Release), nil

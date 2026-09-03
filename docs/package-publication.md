@@ -82,9 +82,11 @@ The declared digests are claims, never authority: Tensorhub's own hash of the st
 remains identity, and wrong bytes at any declared digest require a new release id. If a pod
 later derives a different PackageInterface than the committed one, its typed refusal
 (`package_prepare_interface_disagrees`) is relayed to
-`POST /v1/packages/{org}/{name}/releases/{release}/defects` with the rental's signed
-delegation as the chain of authority, and the release is tombstoned until a corrected one
-is published.
+`POST /v1/packages/{org}/{name}/releases/{release}/defects`, authorized by the caller's
+OWNERSHIP of the named rental, and the release is tombstoned until a corrected one is
+published. The signed-delegation chain that used to prove the rental had actually
+downloaded the bytes is deleted (owner ruling 2026-09-03), so the report's provenance is
+no longer proven.
 
 Finalize commits valid package custody even when no base image is active. Publication neither
 selects a base nor runs package code. A later paid request names only a rental SKU and the

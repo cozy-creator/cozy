@@ -125,7 +125,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
-		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSigner(l),
+		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSource(),
 		RentalPrepareFacts: rental.PrepareFactsSource(client(ctx)),
 		RentalFleet:        fleet.status, AcquireManagedRental: fleet.acquire,
 		ReleaseManagedRental: fleet.release,

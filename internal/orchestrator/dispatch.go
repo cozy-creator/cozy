@@ -781,7 +781,7 @@ func (c *Orchestrator) logDownloadDecision(req records.Request, decision RentalD
 	}
 	c.logf("%s: no worker holds %s for %s; rental %s stages it (bought=%t, holds=%t, "+
 		"manifests_missing=%d, bytes_missing=%d) over %d ready rental(s); the download "+
-		"delegation goes with its desired state", req.ID, req.PlanID, req.Package,
+		"the download set goes with its desired state", req.ID, req.PlanID, req.Package,
 		decision.RentalID, decision.Bought, chosen.Holds, chosen.ManifestsMissing,
 		chosen.BytesMissing, len(decision.Candidates))
 	c.emit(req.ID, "request.routed", 0, map[string]any{

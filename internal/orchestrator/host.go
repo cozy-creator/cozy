@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -53,21 +52,15 @@ func (c *Orchestrator) issueThroughHost(s *session, w *worker, label string, ope
 }
 
 // packagePrepare is one package's own PreparePackageSet call inside a package_set desire:
-// the exact signed delegation naming that one package and its models.
+// the exact download set naming that one package and its models.
 type packagePrepare struct {
 	label string
-	// pkg names the package this preparation carries. The pod host's ledger replays a
-	// terminal verdict for the exact delegation bytes, so a REFUSED preparation must
-	// drop the package's retained delegation — the next desire then signs fresh bytes
-	// and the pod prepares again instead of replaying the old refusal (a transient
-	// model-object fetch failure, HTTP 429 observed live on anima's 5.66 GB set, would
-	// otherwise be permanent for the delegation's lifetime on that pod).
+	// pkg names the package this preparation carries.
 	pkg string
 	// ref is the exact release this preparation carries — what the facts fetch
 	// names against the rental-scoped prepare-facts route.
-	ref        *pb.DownloadPackageRef
-	delegation []byte
-	signature  []byte
+	ref         *pb.DownloadPackageRef
+	downloadSet []byte
 }
 
 // issuePackagePrepares starts one package_set desire and returns. The desire holds ONE
@@ -127,8 +120,7 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 			return
 		}
 		call := &pb.PreparePackageSetCall{Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
-			DownloadDelegation:          append([]byte(nil), prep.delegation...),
-			DownloadDelegationSignature: append([]byte(nil), prep.signature...),
+			DownloadDelegation: append([]byte(nil), prep.downloadSet...),
 		},
 			Application:        facts.Application,
 			ModelSlotPaths:     append([]string(nil), facts.ModelSlotPaths...),
@@ -140,11 +132,6 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 				return s.host.PreparePackageSet(ctx, call)
 			})
 		if !c.settleHostPrepare(s, w, seq, prep.label, result) {
-			if result.refusal != "" {
-				c.mu.Lock()
-				delete(w.desiredDelegations, prep.pkg)
-				c.mu.Unlock()
-			}
 			return
 		}
 		sets = append(sets, result.set)
@@ -241,15 +228,15 @@ func classifyPrepareEnd(err error) hostPrepareResult {
 	}
 }
 
-// hostPrepareRefused is refusePendingDesiredState's rule for the host lane (xs-007 row 5):
-// a refusal that names THIS OWNER'S lapsed download delegation, when the credential has
-// aged out by this owner's clock too, is answered by re-issuing the same logical desire
-// under a freshly signed one -- over the bytes already verified on the pod's disk. Every
-// other refusal is the worker's final word on this desire. The pod's own progress verdict
-// (a refreshed plan that landed no byte) arrives here as a different text and stays
-// permanent; a lapse reported against a delegation still live here is clock skew, and
-// re-signing would answer it forever, so it stays permanent too.
-func (c *Orchestrator) hostPrepareRefused(s *session, w *worker, seq uint64, label, detail string) {
+// hostPrepareRefused records the host lane's refusal. It is the worker's final word on
+// this desire: redialing cannot make that exact revision acceptable.
+//
+// It used to carry ONE exception (xs-007 row 5): a refusal naming this owner's lapsed
+// download delegation was answered by re-issuing under a freshly signed one, because the
+// credential aged out mid-transfer. The credential is deleted (owner ruling 2026-09-03),
+// so a download can no longer become unauthorized by running long, and the exception has
+// nothing left to except.
+func (c *Orchestrator) hostPrepareRefused(_ *session, w *worker, seq uint64, _, detail string) {
 	if len(detail) > 1024 {
 		detail = detail[:1024] + "…"
 	}
@@ -258,39 +245,12 @@ func (c *Orchestrator) hostPrepareRefused(s *session, w *worker, seq uint64, lab
 		c.mu.Unlock()
 		return
 	}
-	expiry, revision := w.delegationExpiry, w.revision
-	lapsed := lapsedDownloadDelegation(detail) && !expiry.IsZero() && !time.Now().Before(expiry)
-	if !lapsed {
-		w.desiredRefusal = exit.Named(exit.Structural, "worker.desired_state_refused",
-			"worker rejected desired revision %d before applying it: %s", revision, detail)
-	}
-	private := cloneLocalPackageSet(w.desiredLocal)
-	privatePlacement := clonePrivatePlacementSet(w.desiredPrivatePlacement)
-	packages := clonePackageRefs(w.desiredPackages)
-	models := cloneModelRefs(w.desiredModels)
+	revision := w.revision
+	w.desiredRefusal = exit.Named(exit.Structural, "worker.desired_state_refused",
+		"worker rejected desired revision %d before applying it: %s", revision, detail)
 	c.mu.Unlock()
-	if !lapsed {
-		c.logf("worker %s: desired revision %d REFUSED before it was applied: %s",
-			w.instanceID, revision, detail)
-		return
-	}
-	c.logf("worker %s: the download delegation this owner signed expired at %s while the "+
-		"pod was still resolving; re-issuing the package set under a fresh one",
-		w.instanceID, expiry.UTC().Format(time.RFC3339))
-	var e *exit.Error
-	switch {
-	case private != nil:
-		e = c.issueLocalPackageSet(s, w, private)
-	case privatePlacement != nil:
-		e = c.issuePrivatePlacementSet(s, w, privatePlacement)
-	default:
-		w.desiredMu.Lock()
-		e = c.issuePackageSet(s, w, packages, models)
-		w.desiredMu.Unlock()
-	}
-	if e != nil {
-		c.logf("worker %s: %s could not be re-issued: %s", w.instanceID, label, e.Message)
-	}
+	c.logf("worker %s: desired revision %d REFUSED before it was applied: %s",
+		w.instanceID, revision, detail)
 }
 
 func (c *Orchestrator) setDesiredRefusal(w *worker, seq uint64, e *exit.Error) {

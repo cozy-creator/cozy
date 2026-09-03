@@ -95,22 +95,25 @@ type Options struct {
 
 type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)
 
-// ReleaseDefect is one chained defect report: the exact release the pod
-// refused, the rental it was refused on, and the signed delegation that
-// authorized the download — the hub verifies that chain before tombstoning.
+// ReleaseDefect is one defect report: the exact release the pod refused and the
+// rental it was refused on. The signed-delegation chain of authority that used to
+// travel with it is deleted (owner ruling 2026-09-03), so the hub authorizes the
+// report by rental OWNERSHIP — provenance is no longer proven.
 type ReleaseDefect struct {
-	Package, Release      string
-	RentalID              string
-	Delegation, Signature []byte
-	Code, Detail          string
+	Package, Release string
+	RentalID         string
+	Code, Detail     string
 }
 
 // ReleaseDefectReporter posts one defect report; failures are logged, never
 // retried here — a republished falsifying release will be refused again.
 type ReleaseDefectReporter func(report ReleaseDefect)
 
-type RentalPackageSetSource func(*WorkerConnection, []*pb.DownloadPackageRef,
-	[]*pb.DownloadModelRef) ([]byte, []byte, *exit.Error)
+// RentalPackageSetSource authors the desired download set for one selection. It takes
+// no worker connection: the document names content only and binds no rental, worker or
+// boot (owner ruling 2026-09-03).
+type RentalPackageSetSource func([]*pb.DownloadPackageRef,
+	[]*pb.DownloadModelRef) ([]byte, *exit.Error)
 
 // PrepareFacts is the hub-known half of one PreparePackageSetCall: the release
 // facts (fields 3-6) the record owner fetched for this exact package release on

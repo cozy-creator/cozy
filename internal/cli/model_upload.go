@@ -161,7 +161,7 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 	}
 	if effectiveRental && catalogModelSpelling(source.Canonical) {
 		return exit.Named(exit.Unavailable, "model_transfer.rented_catalog_source_unavailable",
-			"rented model transfer cannot yet bind a Tensorhub checkpoint through worker download delegation").
+			"rented model transfer cannot yet bind a Tensorhub checkpoint through the worker download set").
 			WithRemedy("run locally or use the original pinned provider source until the tracked catalog binding lands")
 	}
 	plan := modeltransfer.Plan{

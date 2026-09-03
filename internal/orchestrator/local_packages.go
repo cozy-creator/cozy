@@ -777,10 +777,9 @@ func (c *Orchestrator) issueLocalPackageSet(s *session, w *worker,
 		return exit.Internalf("cannot spell the local revision digest: %s", err)
 	}
 	c.mu.Lock()
-	w.delegationExpiry = time.Time{} // local wheels travel as minted capabilities, not a delegation
 	w.desiredLocal = cloneLocalPackageSet(selected)
 	w.desiredPrivatePlacement = nil
-	w.desiredPackages, w.desiredModels, w.desiredDelegations = nil, nil, nil
+	w.desiredPackages, w.desiredModels, w.desiredDownloadSets = nil, nil, nil
 	w.desiredEpoch = s.epoch
 	_, held := w.observedRemote[revision]
 	c.mu.Unlock()
@@ -831,19 +830,18 @@ func (c *Orchestrator) ConvergePrivatePlacement(instanceID, operationID,
 	if problem := c.awaitLocalRevision(instanceID, localRevisionDigest); problem != nil {
 		return problem
 	}
-	delegation, signature, problem := c.opt.RentalPackageSet(w.spec.Connection, nil, models)
+	downloadSet, problem := c.opt.RentalPackageSet(nil, models)
 	if problem != nil {
 		return problem
 	}
 	revision, err := canonical.Raw(localRevisionDigest)
-	if err != nil || len(delegation) == 0 || len(signature) != 64 {
-		return exit.Named(exit.Validation, "private_placement_delegation_incomplete",
-			"local package placement delegation is incomplete")
+	if err != nil || len(downloadSet) == 0 {
+		return exit.Named(exit.Validation, "private_placement_download_set_incomplete",
+			"local package placement download set is incomplete")
 	}
 	operationID = c.localOperation(w, revision, operationID)
 	selected := &pb.DesiredPrivatePlacementSet{OperationId: operationID,
-		LocalRevisionDigest: revision, DownloadDelegation: delegation,
-		DownloadDelegationSignature: signature}
+		LocalRevisionDigest: revision, DownloadDelegation: downloadSet}
 	return c.issuePrivatePlacementSet(s, w, selected)
 }
 
@@ -854,8 +852,7 @@ func (c *Orchestrator) issuePrivatePlacementSet(s *session, w *worker,
 		return exit.Internalf("cannot issue an empty private placement set")
 	}
 	c.mu.Lock()
-	w.delegationExpiry = delegationExpiryOf(selected.DownloadDelegation)
-	w.desiredLocal, w.desiredPackages, w.desiredModels, w.desiredDelegations = nil, nil, nil, nil
+	w.desiredLocal, w.desiredPackages, w.desiredModels, w.desiredDownloadSets = nil, nil, nil, nil
 	w.desiredPrivatePlacement = clonePrivatePlacementSet(selected)
 	w.desiredEpoch = s.epoch
 	c.mu.Unlock()
