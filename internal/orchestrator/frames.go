@@ -161,6 +161,10 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 		return exit.Named(exit.Unavailable, "rental.package_set_signer_missing",
 			"this Cozy daemon has no package_set signer")
 	}
+	if c.opt.RentalPrepareFacts == nil {
+		return exit.Named(exit.Unavailable, "rental.prepare_facts_source_missing",
+			"this Cozy daemon has no rental prepare-facts source")
+	}
 	selections, problem := splitPackageSet(packages, models)
 	if problem != nil {
 		return problem
@@ -177,6 +181,11 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 	prepares := make([]packagePrepare, 0, len(selections))
 	var earliest time.Time
 	for _, selection := range selections {
+		if len(selection.packages) != 1 {
+			return exit.Named(exit.Validation, "rental.package_set_release_ambiguous",
+				"package_set selects %d releases of %s; a package prepares as exactly one release",
+				len(selection.packages), selection.name)
+		}
 		key := selection.contentKey()
 		delegation, held := retained[selection.name]
 		if !held || delegation.contentKey != key || delegation.bootID != bootID ||
@@ -206,8 +215,10 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 			earliest = delegation.expiry
 		}
 		prepares = append(prepares, packagePrepare{
-			label:      hostLabel("package_set", selection.name),
-			pkg:        selection.name,
+			label: hostLabel("package_set", selection.name),
+			pkg:   selection.name,
+			ref: &pb.DownloadPackageRef{Package: selection.packages[0].Package,
+				Release: selection.packages[0].Release},
 			delegation: append([]byte(nil), delegation.delegation...),
 			signature:  append([]byte(nil), delegation.signature...),
 		})

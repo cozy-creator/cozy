@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -262,6 +263,13 @@ func (p *standInPod) PreparePackageSet(call *pb.PreparePackageSetCall,
 	if set == nil {
 		return status.Error(codes.InvalidArgument, "no package set")
 	}
+	// MINOR 31 (xs-019): the pod host's facts fence, exactly as workerhost spells it.
+	if call.Application == "" || len(call.LockedRequirements) == 0 ||
+		len(call.LockedRequirements) > pb.MaxLockedRequirementsBytes ||
+		len(call.ModelSlotPaths) > pb.MaxModelSlotPaths {
+		return status.Error(codes.InvalidArgument,
+			"PreparePackageSet requires the release facts: application, bounded model_slot_paths, and the locked requirements export")
+	}
 	if err := stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED}); err != nil {
 		return err
 	}
@@ -409,6 +417,10 @@ func attachStandInRental(t *testing.T, name string, lifetime time.Duration,
 			packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRef) ([]byte, []byte, *exit.Error) {
 			return rental.SignDownloadDelegation(layout, c, packages, models,
 				time.Now().Add(lifetime))
+		}
+		options.RentalPrepareFacts = func(_ context.Context, _ *orchestrator.WorkerConnection,
+			ref *pb.DownloadPackageRef) (orchestrator.PrepareFacts, *exit.Error) {
+			return testPrepareFacts(ref.Package, ref.Release), nil
 		}
 	})
 	layout = o.l
