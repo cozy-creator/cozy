@@ -27,6 +27,7 @@ pub mod machine;
 pub mod manifest;
 pub mod meta;
 pub mod project;
+pub mod providers;
 pub mod read;
 pub mod receipt;
 pub mod registry;
