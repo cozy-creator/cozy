@@ -9,7 +9,7 @@ element sizes come from `DTYPES`, which is the compiled dtype enum, exported onc
 
     import torch, tensorfs
 
-    store = tensorfs.Store.open("/var/lib/cozy/store")
+    store = tensorfs.Store.open("/var/lib/tensorfs")
     manifest = store.manifest(manifest_id)
     plan  = tensorfs.plan(manifest["header"], traversal, window=WINDOW)
 

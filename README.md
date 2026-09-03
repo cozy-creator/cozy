@@ -166,9 +166,9 @@ TensorFS 0.3.0 intentionally has no pre-0.3.0 header reader. Existing 0.1.2 root
 directly, and intermediate 0.2.x roots use the same standalone tool:
 
 ```bash
-uv run tools/migrate-to-0.3.0.py /var/lib/cozy/store \
+uv run tools/migrate-to-0.3.0.py /var/lib/tensorfs \
   --tfs /path/to/tensorfs-0.3.0/tfs
-uv run tools/migrate-to-0.3.0.py /var/lib/cozy/store \
+uv run tools/migrate-to-0.3.0.py /var/lib/tensorfs \
   --tfs /path/to/tensorfs-0.3.0/tfs --apply
 ```
 
