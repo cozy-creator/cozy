@@ -763,12 +763,12 @@ fn deadline_refuses_midpull_and_the_next_pull_resumes_per_object() {
 /// of ~2,400 retries because each retry re-ran closure and presign together.)
 #[test]
 fn a_walk_that_outlives_the_url_lifetime_completes() {
-    let checkpoint = Arc::new(checkpoint(38, 4 * 1024)); // 38 blobs + header + manifest
+    let checkpoint = Arc::new(checkpoint(62, 4 * 1024)); // 62 blobs + header + manifest
     let hub = expiring_hub_origin(
         Arc::clone(&checkpoint),
-        Duration::from_secs(1),
-        Duration::from_millis(100),
-        Duration::from_millis(40),
+        Duration::from_secs(2),
+        Duration::from_millis(80),
+        Duration::from_millis(30),
     );
 
     // Today's shape, spelled out: every URL stamped once, at T=0, with the hub's cap on it.
@@ -820,7 +820,7 @@ fn a_walk_that_outlives_the_url_lifetime_completes() {
     let report = pull(&request).unwrap();
     let walked = started.elapsed();
 
-    assert_eq!(report.fetched, 40);
+    assert_eq!(report.fetched, 64);
     assert_eq!(report.held, 0);
     assert!(
         walked > hub.lifetime,
@@ -851,8 +851,8 @@ fn a_resume_across_an_expiry_boundary_completes() {
     let hub = expiring_hub_origin(
         Arc::clone(&checkpoint),
         Duration::from_secs(1),
-        Duration::from_millis(80),
-        Duration::from_millis(20),
+        Duration::from_millis(50),
+        Duration::from_millis(15),
     );
     let root = temporary("expiry-resume");
     let store = Store::init(&root).unwrap();
@@ -862,7 +862,7 @@ fn a_resume_across_an_expiry_boundary_completes() {
     let mut rushed = request_for(&store, &hub.origin.base, &policy);
     rushed.streams = 2;
     rushed.sample_seconds = 0.2;
-    rushed.deadline = Deadline::after_seconds(Some(0.8));
+    rushed.deadline = Deadline::after_seconds(Some(0.6));
     let refusal = pull(&rushed).unwrap_err();
     assert_eq!(refusal.code, Code::DEADLINE_EXCEEDED);
 
