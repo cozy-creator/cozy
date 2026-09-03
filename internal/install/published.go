@@ -90,6 +90,15 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 	if err := os.MkdirAll(setDir, 0o700); err != nil {
 		return nil, empty, "", nil, exit.Internalf("cannot create package wheel cache: %s", err)
 	}
+	// The set-rooted interface copy: prepare-package admits the PACKAGE_INTERFACE row only
+	// at `<set>/metadata/package-interface.json`; the documents/ copy above serves launch.
+	staged := launch.StagedPackageInterfacePath(installDir)
+	if err := os.MkdirAll(filepath.Dir(staged), 0o700); err != nil {
+		return nil, empty, "", nil, exit.Internalf("cannot create the staged interface directory: %s", err)
+	}
+	if err := os.WriteFile(staged, published.Selection.PackageInterface.Bytes, 0o600); err != nil {
+		return nil, empty, "", nil, exit.Internalf("cannot stage the exact package interface: %s", err)
+	}
 	if problem := stagePublishedWheel(cache, setDir, &published.ProjectWheel); problem != nil {
 		return nil, empty, "", nil, problem
 	}
@@ -376,7 +385,7 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 		"--artifact-store", l.CAS,
 		"--package", published.Package,
 		"--release", published.Release,
-		"--package-interface", launch.PackageInterfacePath(installDir),
+		"--package-interface", launch.StagedPackageInterfacePath(installDir),
 		"--project-wheel", published.ProjectWheel.Path,
 		"--artifact-cache", filepath.Join(installDir, "artifact-cache"),
 		"--environment-python", home.VenvPython(filepath.Join(installDir, "venv")),
