@@ -52,11 +52,91 @@ func (c *Orchestrator) issueThroughHost(s *session, w *worker, label string, ope
 	return nil
 }
 
+// packagePrepare is one package's own PreparePackageSet call inside a package_set desire:
+// the exact signed delegation naming that one package and its models.
+type packagePrepare struct {
+	label      string
+	delegation []byte
+	signature  []byte
+}
+
+// issuePackagePrepares starts one package_set desire and returns. The desire holds ONE
+// prepare per package — the Runtime prepares exactly one package per call — issued
+// SEQUENTIALLY on one goroutine, and the united placement set is sent as one full-replace
+// desired state only after every package's preparation returned its exact bytes.
+// issueThroughHost's seq/revision law applies to the sequence as a whole: it is one
+// logical desire, superseded between prepares exactly as a single prepare is superseded.
+func (c *Orchestrator) issuePackagePrepares(s *session, w *worker, label string, prepares []packagePrepare) *exit.Error {
+	if s.host == nil {
+		return exit.Internalf("worker %s has no PodHost lane to prepare %s on", w.instanceID, label)
+	}
+	rev := c.nextRevision()
+	c.mu.Lock()
+	w.hostPrepareSeq++
+	seq := w.hostPrepareSeq
+	w.revision, w.desiredRefusal = rev, nil
+	c.mu.Unlock()
+	c.logf("PodHost prepare %s#%d for revision %d -> %s", label, seq, rev, s.bootID)
+	go c.preparePackagesThroughHost(s, w, seq, rev, label, prepares)
+	return nil
+}
+
 func (c *Orchestrator) prepareThroughHost(s *session, w *worker, seq, rev uint64, label string, open prepareOpener) {
+	result := c.runHostPrepare(s, seq, label, open)
+	if !c.settleHostPrepare(s, w, seq, label, result) {
+		return
+	}
+	c.convergePrepared(s, w, seq, rev, label, result.set)
+}
+
+func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, rev uint64,
+	label string, prepares []packagePrepare) {
+	sets := make([]*pb.DesiredPlacementSet, 0, len(prepares))
+	for _, prep := range prepares {
+		c.mu.Lock()
+		superseded := w.hostPrepareSeq
+		c.mu.Unlock()
+		if superseded != seq {
+			c.logf("PodHost prepare %s#%d superseded by #%d between packages", prep.label, seq, superseded)
+			return
+		}
+		call := &pb.PreparePackageSetCall{Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
+			DownloadDelegation:          append([]byte(nil), prep.delegation...),
+			DownloadDelegationSignature: append([]byte(nil), prep.signature...),
+		}}
+		result := c.runHostPrepare(s, seq, prep.label,
+			func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
+				return s.host.PreparePackageSet(ctx, call)
+			})
+		if !c.settleHostPrepare(s, w, seq, prep.label, result) {
+			return
+		}
+		sets = append(sets, result.set)
+	}
+	united, err := unitePreparedPlacementSets(sets)
+	if err != nil {
+		c.setDesiredRefusal(w, seq, exit.Named(exit.Structural, "worker.prepare_document_invalid",
+			"the pod host's prepared PlacementSets for %s cannot be united: %s", label, err))
+		return
+	}
+	c.convergePrepared(s, w, seq, rev, label, united)
+}
+
+// hostPrepareResult is one preparation's end: the exact prepared set, the host's typed
+// refusal text, an inadmissible-document fault, or a transport end without a verdict.
+type hostPrepareResult struct {
+	set     *pb.DesiredPlacementSet
+	refusal string
+	fault   *exit.Error
+	err     error
+}
+
+// runHostPrepare opens one prepare stream and consumes it to its end, returning the
+// verified prepared PlacementSet or the verdict that stopped it.
+func (c *Orchestrator) runHostPrepare(s *session, seq uint64, label string, open prepareOpener) hostPrepareResult {
 	stream, err := open(s.ctx)
 	if err != nil {
-		c.hostPrepareFailed(s, w, seq, label, err)
-		return
+		return classifyPrepareEnd(err)
 	}
 	var stage pb.PrepareStage
 	for {
@@ -65,8 +145,7 @@ func (c *Orchestrator) prepareThroughHost(s *session, w *worker, seq, rev uint64
 			if err == io.EOF {
 				err = status.Error(codes.FailedPrecondition, "the host closed the prepare stream without a terminal event")
 			}
-			c.hostPrepareFailed(s, w, seq, label, err)
-			return
+			return classifyPrepareEnd(err)
 		}
 		if event.Stage != stage {
 			stage = event.Stage
@@ -76,38 +155,52 @@ func (c *Orchestrator) prepareThroughHost(s *session, w *worker, seq, rev uint64
 		}
 		switch event.Stage {
 		case pb.PrepareStage_PREPARE_STAGE_REFUSED:
-			c.hostPrepareRefused(s, w, seq, label, event.SafeCode+": "+event.SafeDetail)
-			return
+			return hostPrepareResult{refusal: event.SafeCode + ": " + event.SafeDetail}
 		case pb.PrepareStage_PREPARE_STAGE_PREPARED:
 			prepared := event.PlacementSet
 			if prepared == nil || !bytes.Equal(canonical.Digest(prepared.PlacementSetCanonicalBytes),
 				prepared.PlacementSetDigest) {
-				c.setDesiredRefusal(w, seq, exit.Named(exit.Structural, "worker.prepare_identity_mismatch",
-					"the pod host's prepared PlacementSet for %s does not hash to its digest", label))
-				return
+				return hostPrepareResult{fault: exit.Named(exit.Structural, "worker.prepare_identity_mismatch",
+					"the pod host's prepared PlacementSet for %s does not hash to its digest", label)}
 			}
 			if _, err := canonical.Read(prepared.PlacementSetCanonicalBytes, &pb.PlacementSet{}); err != nil {
-				c.setDesiredRefusal(w, seq, exit.Named(exit.Structural, "worker.prepare_document_invalid",
-					"the pod host's prepared PlacementSet for %s is inadmissible: %s", label, err))
-				return
+				return hostPrepareResult{fault: exit.Named(exit.Structural, "worker.prepare_document_invalid",
+					"the pod host's prepared PlacementSet for %s is inadmissible: %s", label, err)}
 			}
-			c.convergePrepared(s, w, seq, rev, label, prepared)
-			return
+			return hostPrepareResult{set: prepared}
 		}
 	}
 }
 
-// hostPrepareFailed classifies a prepare stream's end. A transport failure is not a verdict:
-// the control stream's reconnect re-issues the journaled desire and the host answers from its
-// ledger. A typed refusal from the host is the worker's final word on this desire, with the
-// one exception hostPrepareRefused names.
-func (c *Orchestrator) hostPrepareFailed(s *session, w *worker, seq uint64, label string, err error) {
+// settleHostPrepare records a preparation's verdict, answering whether the caller holds a
+// prepared set to carry forward. A typed refusal or an inadmissible document is the
+// worker's word on the whole desire (a full-replace set missing one member must not be
+// sent); a transport end without a verdict is not — the control stream's reconnect
+// re-issues the journaled desire and the host answers from its ledger.
+func (c *Orchestrator) settleHostPrepare(s *session, w *worker, seq uint64, label string, result hostPrepareResult) bool {
+	switch {
+	case result.refusal != "":
+		c.hostPrepareRefused(s, w, seq, label, result.refusal)
+	case result.fault != nil:
+		c.setDesiredRefusal(w, seq, result.fault)
+	case result.err != nil:
+		c.logf("PodHost prepare %s#%d ended without a verdict: %v", label, seq, result.err)
+	default:
+		return result.set != nil
+	}
+	return false
+}
+
+// classifyPrepareEnd sorts a prepare stream's end into refusal-class codes (the host's
+// typed verdict on this desire, with the one exception hostPrepareRefused names) and
+// everything else (no verdict; the reconnect re-issues).
+func classifyPrepareEnd(err error) hostPrepareResult {
 	switch status.Code(err) {
 	case codes.FailedPrecondition, codes.InvalidArgument, codes.PermissionDenied,
 		codes.Unauthenticated, codes.Unimplemented:
-		c.hostPrepareRefused(s, w, seq, label, status.Convert(err).Message())
+		return hostPrepareResult{refusal: status.Convert(err).Message()}
 	default:
-		c.logf("PodHost prepare %s#%d ended without a verdict: %v", label, seq, err)
+		return hostPrepareResult{err: err}
 	}
 }
 
