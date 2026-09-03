@@ -207,6 +207,7 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 		}
 		prepares = append(prepares, packagePrepare{
 			label:      hostLabel("package_set", selection.name),
+			pkg:        selection.name,
 			delegation: append([]byte(nil), delegation.delegation...),
 			signature:  append([]byte(nil), delegation.signature...),
 		})

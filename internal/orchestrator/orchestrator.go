@@ -196,6 +196,35 @@ type RentalDecision struct {
 	Candidates []RentalCoverage
 }
 
+// ModeCompatibleRentals filters ready rentals by the one desired MODE a worker can hold.
+// DesiredWorkerState is a full-replace `oneof mode` — a JobDirective or a serving
+// placement set — so a pod worker cannot host both at once: converging a job onto a
+// worker with a serving desire (or a serving set onto a job worker) would unload the
+// other tenant mid-flight. Placements co-host per package (issuePackageSet); modes do
+// not, because the wire forbids it — a mode-conflicted rental is simply not a candidate,
+// and the capacity decision moves to the next rental or the buy (owner's --rental
+// ruling). An unattached rental has no mode yet and takes it from its first desire.
+func (c *Orchestrator) ModeCompatibleRentals(ids []string, job bool) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		w := c.workers[rentalInstanceID(id)]
+		if w != nil && !w.exited && !w.stopping {
+			serving := len(w.desiredPackages) > 0 || w.desiredLocal != nil ||
+				w.desiredPrivatePlacement != nil || len(w.observedRemote) > 0
+			if job && serving {
+				continue
+			}
+			if !job && w.spec.IsJob() {
+				continue
+			}
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
 // RankRentals orders ready rentals for a NEW placement by the no-holder rule (§3.2, D4):
 // a store holding every manifest first (nothing to fetch), then the fewest missing bytes,
 // then the most room, then the caller's order — cheapest first. Nothing here is a timer,

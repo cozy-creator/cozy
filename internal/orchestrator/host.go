@@ -55,7 +55,14 @@ func (c *Orchestrator) issueThroughHost(s *session, w *worker, label string, ope
 // packagePrepare is one package's own PreparePackageSet call inside a package_set desire:
 // the exact signed delegation naming that one package and its models.
 type packagePrepare struct {
-	label      string
+	label string
+	// pkg names the package this preparation carries. The pod host's ledger replays a
+	// terminal verdict for the exact delegation bytes, so a REFUSED preparation must
+	// drop the package's retained delegation — the next desire then signs fresh bytes
+	// and the pod prepares again instead of replaying the old refusal (a transient
+	// model-object fetch failure, HTTP 429 observed live on anima's 5.66 GB set, would
+	// otherwise be permanent for the delegation's lifetime on that pod).
+	pkg        string
 	delegation []byte
 	signature  []byte
 }
@@ -109,6 +116,11 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 				return s.host.PreparePackageSet(ctx, call)
 			})
 		if !c.settleHostPrepare(s, w, seq, prep.label, result) {
+			if result.refusal != "" {
+				c.mu.Lock()
+				delete(w.desiredDelegations, prep.pkg)
+				c.mu.Unlock()
+			}
 			return
 		}
 		sets = append(sets, result.set)
