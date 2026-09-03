@@ -198,6 +198,7 @@ type fakeRentalHub struct {
 	mu       sync.Mutex
 	rentals  map[string]map[string]any
 	skus     []map[string]any
+	rent     func(map[string]any) map[string]any
 	released map[string]int
 	server   *httptest.Server
 }
@@ -222,6 +223,25 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 		defer h.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(h.skus)
+	})
+	mux.HandleFunc("POST /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.rent == nil || r.Header.Get("Authorization") != "Bearer rental-idle-test" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var request map[string]any
+		if json.NewDecoder(r.Body).Decode(&request) != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		row := h.rent(request)
+		id, _ := row["rental_id"].(string)
+		h.rentals[id] = row
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(row)
 	})
 	mux.HandleFunc("DELETE /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()

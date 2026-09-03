@@ -63,6 +63,7 @@ type Rental struct {
 	Address          string
 	CertPEM          string
 	Detail           string
+	Failure          *RentalFailure
 	// MediaAddress is the pod's BYTE PLANE (cl-014, ruled #506b): the co-resident media
 	// server's own listener, which is where an owner uploads a payload and downloads an
 	// output. The hub observed it and names it.
@@ -75,6 +76,18 @@ type Rental struct {
 	// a comparison neither end can make by saying the token.
 	MediaTokenSHA256    []string
 	HourlyRateUSDMicros int64
+}
+
+// RentalFailure is Tensorhub's sanitized terminal boot diagnosis. It contains
+// only frozen image/resource identity and direct provider lifecycle facts.
+type RentalFailure struct {
+	Code                  string `json:"code"`
+	BaseWorkerImageDigest string `json:"base_worker_image_digest"`
+	Provider              string `json:"provider,omitempty"`
+	ProviderResourceID    string `json:"provider_resource_id,omitempty"`
+	ProviderHostID        string `json:"provider_host_id,omitempty"`
+	ProviderState         string `json:"provider_state,omitempty"`
+	ContainerState        string `json:"container_state,omitempty"`
 }
 
 // ExactDocument is the package interface returned with exact wheel downloads.
@@ -109,19 +122,20 @@ func (r Rental) HoldsMediaHash(hash string) bool {
 
 // wireRental is the answer's own shape.
 type wireRental struct {
-	ID                  string   `json:"rental_id"`
-	Name                string   `json:"name"`
-	State               string   `json:"state"`
-	AcceleratorModel    string   `json:"requested_accelerator_model"`
-	WorkerAddress       string   `json:"worker_address"`
-	CertPEM             string   `json:"cert_pem"`
-	Detail              string   `json:"detail"`
-	MediaAddress        string   `json:"media_address"`
-	WorkerID            string   `json:"worker_id"`
-	WorkerBootID        string   `json:"worker_boot_id"`
-	CreatorPublicKey    string   `json:"creator_public_key"`
-	MediaTokenSHA256    []string `json:"media_token_sha256"`
-	HourlyRateUSDMicros int64    `json:"hourly_rate_usd_micros"`
+	ID                  string         `json:"rental_id"`
+	Name                string         `json:"name"`
+	State               string         `json:"state"`
+	AcceleratorModel    string         `json:"requested_accelerator_model"`
+	WorkerAddress       string         `json:"worker_address"`
+	CertPEM             string         `json:"cert_pem"`
+	Detail              string         `json:"detail"`
+	Failure             *RentalFailure `json:"failure"`
+	MediaAddress        string         `json:"media_address"`
+	WorkerID            string         `json:"worker_id"`
+	WorkerBootID        string         `json:"worker_boot_id"`
+	CreatorPublicKey    string         `json:"creator_public_key"`
+	MediaTokenSHA256    []string       `json:"media_token_sha256"`
+	HourlyRateUSDMicros int64          `json:"hourly_rate_usd_micros"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -143,7 +157,7 @@ func (w wireRental) rental() Rental {
 		ID: w.ID, Name: w.Name, State: w.State,
 		AcceleratorModel: w.AcceleratorModel,
 		Address:          w.WorkerAddress, CertPEM: w.CertPEM,
-		Detail: w.Detail, MediaAddress: w.MediaAddress,
+		Detail: w.Detail, Failure: w.Failure, MediaAddress: w.MediaAddress,
 		WorkerID: w.WorkerID, WorkerBootID: w.WorkerBootID,
 		CreatorPublicKey:    w.CreatorPublicKey,
 		MediaTokenSHA256:    w.MediaTokenSHA256,

@@ -67,7 +67,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 20
+const schemaVersion = 21
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -183,7 +183,7 @@ func open(path string, migratePrior bool) (*Store, *exit.Error) {
 	return &Store{db: db}, nil
 }
 
-// Schemas 6 through 20 migrate in place. Schema 11 replaces authored GPU counts with
+// Schemas 6 through 21 migrate in place. Schema 11 replaces authored GPU counts with
 // the one derived accelerator-class fact; schema 12 gives the install table and its two
 // foreign keys the one word the row actually names; schema 13 records when a rental was
 // first seen ready; schema 14 drops the output export's pre-execution payload hash — a
@@ -195,6 +195,7 @@ func open(path string, migratePrior bool) (*Store, *exit.Error) {
 // model-transfer outputs; schema 19 removes the duplicate request config digest now owned
 // by the CozyTensors header; schema 20 renames the installed package interface and removes
 // the obsolete aggregate package revision digest. Package, request, event, export, and rental rows survive;
+// schema 21 retains Tensorhub's sanitized terminal rental boot failure.
 // only schema 9's superseded special
 // model-production subsystem is dropped.
 // Schema 10 creates empty request-attached transfer sidecars because older rows cannot be
@@ -238,8 +239,8 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			return e
 		}
 	}
-	if sourceVersion < 13 {
-		if e := migrateRentals(tx, path); e != nil {
+	if sourceVersion < 21 {
+		if e := migrateRentals(tx, path, sourceVersion); e != nil {
 			return e
 		}
 	}
@@ -279,7 +280,7 @@ func migrate(db *sql.DB, path string, sourceVersion int) *exit.Error {
 			}
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=20`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=21`); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
 	if e := commitMigration(tx, path); e != nil {
@@ -349,7 +350,7 @@ func migrateInstalls(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 // and every earlier shape carries the released column list without it. A rental that was
 // already ready when the schema moved gets no ready_at; its idle clock starts at its next
 // settlement, never at a guess.
-func migrateRentals(tx *sql.Tx, path string) *exit.Error {
+func migrateRentals(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	if _, err := tx.Exec(`DROP INDEX rentals_machine_name`); err != nil {
 		return exit.Internalf("cannot stage rental index while migrating %s: %s", path, err)
 	}
@@ -359,8 +360,12 @@ func migrateRentals(tx *sql.Tx, path string) *exit.Error {
 	if _, err := tx.Exec(rentalsDDL); err != nil {
 		return exit.Internalf("cannot create current rentals table while migrating %s: %s", path, err)
 	}
-	if _, err := tx.Exec(`INSERT INTO rentals(` + rentalColsPriorThirteen + `) SELECT ` +
-		rentalColsPriorThirteen + ` FROM rentals_prior`); err != nil {
+	columns := rentalColsPriorTwentyOne
+	if sourceVersion < 13 {
+		columns = rentalColsPriorThirteen
+	}
+	if _, err := tx.Exec(`INSERT INTO rentals(` + columns + `) SELECT ` +
+		columns + ` FROM rentals_prior`); err != nil {
 		return exit.Internalf("cannot preserve rental rows while migrating %s: %s", path, err)
 	}
 	if _, err := tx.Exec(`DROP TABLE rentals_prior`); err != nil {
@@ -497,7 +502,10 @@ func priorStatements(version int) []string {
 		"  job_gpu_count INTEGER NOT NULL DEFAULT 0,\n", 1)
 	priorRequestsSix := strings.Replace(priorRequests,
 		"  rental_required INTEGER NOT NULL DEFAULT 0,\n", "", 1)
-	priorRentals := strings.Replace(rentalsDDL,
+	priorRentalsTwenty := strings.Replace(rentalsDDL,
+		"  ready_at          TEXT NOT NULL DEFAULT '',\n  failure_code                 TEXT NOT NULL DEFAULT '',\n  failure_image_digest         TEXT NOT NULL DEFAULT '',\n  failure_provider             TEXT NOT NULL DEFAULT '',\n  failure_provider_resource_id TEXT NOT NULL DEFAULT '',\n  failure_provider_host_id     TEXT NOT NULL DEFAULT '',\n  failure_provider_state       TEXT NOT NULL DEFAULT '',\n  failure_container_state      TEXT NOT NULL DEFAULT ''\n",
+		"  ready_at          TEXT NOT NULL DEFAULT ''\n", 1)
+	priorRentals := strings.Replace(priorRentalsTwenty,
 		"  expected_worker_boot_id    TEXT NOT NULL DEFAULT '',\n  ready_at          TEXT NOT NULL DEFAULT ''\n",
 		"  expected_worker_boot_id    TEXT NOT NULL DEFAULT ''\n", 1)
 	priorOutputExports := strings.Replace(outputExportSchema,
@@ -544,6 +552,8 @@ func priorStatements(version int) []string {
 			stmt = rentalsDDLPrior
 		case stmt == rentalsDDL && version < 13:
 			stmt = priorRentals
+		case stmt == rentalsDDL && version < 21:
+			stmt = priorRentalsTwenty
 		case stmt == outputExportSchema && version < 14:
 			stmt = priorOutputExports
 		case stmt == modelTransferSchema[2] && version < 18:
@@ -664,7 +674,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=20`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=21`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {

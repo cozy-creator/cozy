@@ -223,11 +223,13 @@ func resolveRentalOperation(ctx *Context, key string) (string, *exit.Error) {
 	if problem := store.AdvanceRentalOperation(key, seen.ID, seen.State); problem != nil {
 		return "", problem
 	}
-	if problem := store.RecordRental(records.Rental{
+	row := records.Rental{
 		ID: seen.ID, SKU: request.SKU, AcceleratorModel: seen.AcceleratorModel,
 		HourlyRateUSDMicros: seen.HourlyRateUSDMicros, ManagedRequestID: operation.ManagedRequestID,
 		State: seen.State, Hub: operation.Hub,
-	}); problem != nil {
+	}
+	copyRentalFailure(&row, seen)
+	if problem := store.RecordRental(row); problem != nil {
 		return "", problem
 	}
 	return seen.ID, nil

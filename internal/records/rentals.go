@@ -52,7 +52,14 @@ CREATE TABLE IF NOT EXISTS rentals (
   media_address     TEXT NOT NULL DEFAULT '',
   expected_worker_id         TEXT NOT NULL DEFAULT '',
   expected_worker_boot_id    TEXT NOT NULL DEFAULT '',
-  ready_at          TEXT NOT NULL DEFAULT ''
+  ready_at          TEXT NOT NULL DEFAULT '',
+  failure_code                 TEXT NOT NULL DEFAULT '',
+  failure_image_digest         TEXT NOT NULL DEFAULT '',
+  failure_provider             TEXT NOT NULL DEFAULT '',
+  failure_provider_resource_id TEXT NOT NULL DEFAULT '',
+  failure_provider_host_id     TEXT NOT NULL DEFAULT '',
+  failure_provider_state       TEXT NOT NULL DEFAULT '',
+  failure_container_state      TEXT NOT NULL DEFAULT ''
 )`
 
 var rentalSchema = []string{rentalOperationsDDL, rentalsDDL, `
@@ -391,19 +398,37 @@ type Rental struct {
 	// observed billing moment as a usable machine, as opposed to RentedAt, which is only
 	// when it was asked for. It is the idle clock of a rental that has never run anything.
 	ReadyAt string
+	Failure RentalFailure
 }
 
-const rentalCols = `id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at`
+// RentalFailure is the local copy of Tensorhub's sanitized terminal boot
+// diagnosis. No provider payload, pod log, or credential is stored here.
+type RentalFailure struct {
+	Code                  string
+	BaseWorkerImageDigest string
+	Provider              string
+	ProviderResourceID    string
+	ProviderHostID        string
+	ProviderState         string
+	ContainerState        string
+}
+
+const rentalCols = `id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at,failure_code,failure_image_digest,failure_provider,failure_provider_resource_id,failure_provider_host_id,failure_provider_state,failure_container_state`
+
+const rentalColsPriorTwentyOne = `id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at`
 
 // rentalColsPriorThirteen is the released column list every schema before 13 carried.
-var rentalColsPriorThirteen = strings.TrimSuffix(rentalCols, ",ready_at")
+var rentalColsPriorThirteen = strings.TrimSuffix(rentalColsPriorTwentyOne, ",ready_at")
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
 	err := row.Scan(&r.ID, &r.MachineName, &r.SKU, &r.AcceleratorModel,
 		&r.HourlyRateUSDMicros, &r.ManagedRequestID, &r.Address, &r.CertPath,
 		&r.State, &r.Hub, &r.RentedAt, &r.MediaAddress,
-		&r.ExpectedWorkerID, &r.ExpectedWorkerBootID, &r.ReadyAt)
+		&r.ExpectedWorkerID, &r.ExpectedWorkerBootID, &r.ReadyAt,
+		&r.Failure.Code, &r.Failure.BaseWorkerImageDigest, &r.Failure.Provider,
+		&r.Failure.ProviderResourceID, &r.Failure.ProviderHostID,
+		&r.Failure.ProviderState, &r.Failure.ContainerState)
 	return r, err
 }
 
@@ -482,7 +507,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.ReadyAt = now()
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 		  machine_name=CASE WHEN rentals.machine_name<>'' THEN rentals.machine_name ELSE excluded.machine_name END,
 		  sku=CASE WHEN rentals.sku<>'' THEN rentals.sku ELSE excluded.sku END,
@@ -497,10 +522,20 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		    THEN rentals.expected_worker_id ELSE excluded.expected_worker_id END,
 		  expected_worker_boot_id=CASE WHEN rentals.expected_worker_boot_id<>''
 		    THEN rentals.expected_worker_boot_id ELSE excluded.expected_worker_boot_id END,
-		  ready_at=CASE WHEN rentals.ready_at<>'' THEN rentals.ready_at ELSE excluded.ready_at END`,
+		  ready_at=CASE WHEN rentals.ready_at<>'' THEN rentals.ready_at ELSE excluded.ready_at END,
+		  failure_code=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_code ELSE excluded.failure_code END,
+		  failure_image_digest=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_image_digest ELSE excluded.failure_image_digest END,
+		  failure_provider=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_provider ELSE excluded.failure_provider END,
+		  failure_provider_resource_id=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_provider_resource_id ELSE excluded.failure_provider_resource_id END,
+		  failure_provider_host_id=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_provider_host_id ELSE excluded.failure_provider_host_id END,
+		  failure_provider_state=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_provider_state ELSE excluded.failure_provider_state END,
+		  failure_container_state=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_container_state ELSE excluded.failure_container_state END`,
 		r.ID, r.MachineName, r.SKU, r.AcceleratorModel, r.HourlyRateUSDMicros, r.ManagedRequestID,
 		r.Address, r.CertPath, r.State, r.Hub,
-		r.RentedAt, r.MediaAddress, r.ExpectedWorkerID, r.ExpectedWorkerBootID, r.ReadyAt); err != nil {
+		r.RentedAt, r.MediaAddress, r.ExpectedWorkerID, r.ExpectedWorkerBootID, r.ReadyAt,
+		r.Failure.Code, r.Failure.BaseWorkerImageDigest, r.Failure.Provider,
+		r.Failure.ProviderResourceID, r.Failure.ProviderHostID,
+		r.Failure.ProviderState, r.Failure.ContainerState); err != nil {
 		return exit.Internalf("cannot record rental %s: %s", r.ID, err)
 	}
 	stored, err := scanRental(tx.QueryRow(`SELECT `+rentalCols+` FROM rentals WHERE id=?`, r.ID))
@@ -514,7 +549,8 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.MediaAddress != "" && stored.MediaAddress != r.MediaAddress ||
 		r.CertPath != "" && stored.CertPath != r.CertPath ||
 		r.ExpectedWorkerID != "" && stored.ExpectedWorkerID != r.ExpectedWorkerID ||
-		r.ExpectedWorkerBootID != "" && stored.ExpectedWorkerBootID != r.ExpectedWorkerBootID {
+		r.ExpectedWorkerBootID != "" && stored.ExpectedWorkerBootID != r.ExpectedWorkerBootID ||
+		r.Failure.Code != "" && stored.Failure != r.Failure {
 		return exit.Named(exit.Conflict, "rental.attach_projection_conflict",
 			"rental %s already carries another address, media address, certificate pin, or worker identity", r.ID)
 	}
