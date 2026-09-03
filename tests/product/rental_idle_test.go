@@ -19,8 +19,8 @@ import (
 
 // TestRentalIdleRelease is the owner's ruling as behaviour: a rental this daemon owns is
 // ended once it has had no work for rentals.idle_release_s, however it was acquired; work
-// pinned to it is what keeps it; and a release the hub did not confirm is asked again
-// until it is. Every arm is the real daemon process on a real root, deciding from its real
+// pinned to it — or the unsettled request it was bought for (cl-113) — is what keeps it;
+// and a release the hub did not confirm is asked again until it is. Every arm is the real daemon process on a real root, deciding from its real
 // records and releasing through the real hub client against a hub that answers the rental
 // routes; the grace is the one product knob.
 func TestRentalIdleRelease(t *testing.T) {
@@ -91,6 +91,42 @@ func TestRentalIdleRelease(t *testing.T) {
 		t.Fatalf("cancel of the queued request: %s", r.brief())
 	}
 	awaitRentalGone(t, store, "rental-idle-busy", 15*time.Second, logPath)
+
+	// (b2) The buy itself is a debt (cl-113): a rental bought for a request is owed by
+	// that request from the moment the paid row exists — before dispatch pins, so the
+	// request row still says worker='' — and the sweep must not release it while its
+	// buyer is queued. On the code this arm was written against, the pod went the moment
+	// it was ready: Spent saw a managed rental with no settled attempt and reaped a
+	// healthy pod its buyer was still waiting for (observed live, pr-b192da1a).
+	hub.add("rental-idle-owed", "curlew")
+	fatal(t, store.RecordRental(records.Rental{
+		ID: "rental-idle-owed", MachineName: "curlew", SKU: "cpu", AcceleratorModel: "CPU",
+		HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL,
+		Address: "127.0.0.1:1", CertPath: filepath.Join(root, "rental-idle-owed.pem"),
+		ManagedRequestID: "req-rental-owed",
+	}))
+	if _, _, problem := store.Submit(records.Request{
+		ID: "req-rental-owed", IdemKey: "idem-rental-owed", BodyDigest: "sha256:" + strings.Repeat("cd", 32),
+		Package: "fake/owed", Entrypoint: "generate", Payload: []byte("{}"),
+		Rental: true,
+	}); problem != nil {
+		t.Fatal(problem.Message)
+	}
+	time.Sleep(6 * time.Second)
+	if row, problem := store.RentalRow("rental-idle-owed"); problem != nil || row == nil || row.State != "ready" {
+		t.Fatalf("a rental owed by its still-queued buyer was released: %+v %v\n%s", row, problem, tail(logPath))
+	}
+	if hub.releases("rental-idle-owed") != 0 {
+		t.Fatalf("the hub saw a release of an owed rental\n%s", tail(logPath))
+	}
+	code, out = runCozy(t, root, "rental")
+	if code != 0 || !strings.Contains(out, "busy") {
+		t.Fatalf("the listing does not show the owed rental as busy [exit %d]\n%s", code, out)
+	}
+	if r := daemon.call(t, "POST", "/v1/requests/req-rental-owed/cancel", nil); r.Status != http.StatusOK {
+		t.Fatalf("cancel of the owing request: %s", r.brief())
+	}
+	awaitRentalGone(t, store, "rental-idle-owed", 15*time.Second, logPath)
 
 	// (c) A release the hub does not confirm is retried at the next observation, not left
 	// until a rental command or a restart: with the hub gone the daemon says so once, keeps
