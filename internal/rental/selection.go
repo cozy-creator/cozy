@@ -31,9 +31,16 @@ func CheapestCompatibleSKU(skus []hub.RentalSKU, needsAccelerator bool,
 		}
 		compatible = append(compatible, candidate)
 	}
+	// Cheapest is what the renter PAYS: the GPU rate plus the SKU's storage
+	// adder (th-126). Every GPU product shares one image spec, so the adder is
+	// a constant and the ordering equals the GPU-price ordering there; a class
+	// whose products carried different disks would still rank by true cost.
+	total := func(sku hub.RentalSKU) int64 {
+		return sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour
+	}
 	sort.Slice(compatible, func(i, j int) bool {
-		if compatible[i].PriceUSDMicrosPerHour != compatible[j].PriceUSDMicrosPerHour {
-			return compatible[i].PriceUSDMicrosPerHour < compatible[j].PriceUSDMicrosPerHour
+		if total(compatible[i]) != total(compatible[j]) {
+			return total(compatible[i]) < total(compatible[j])
 		}
 		return compatible[i].Name < compatible[j].Name
 	})

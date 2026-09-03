@@ -218,11 +218,19 @@ type RentalSKU struct {
 	// requirements the label already contradicts is refused before the paid ask. It is
 	// deliberately NOT validated: a spelling this client cannot read means one fewer
 	// pre-spend check, never an unrentable catalog.
-	BaseWorkerProfile     string `json:"base_worker_profile"`
-	ComputeCapability     string `json:"compute_capability"`
-	VRAMGB                int64  `json:"vram_gb"`
-	MinimumRAMPerGPUGB    int64  `json:"minimum_ram_per_gpu_gb"`
-	PriceUSDMicrosPerHour int64  `json:"price_usd_micros_per_hour"`
+	BaseWorkerProfile  string `json:"base_worker_profile"`
+	ComputeCapability  string `json:"compute_capability"`
+	VRAMGB             int64  `json:"vram_gb"`
+	MinimumRAMPerGPUGB int64  `json:"minimum_ram_per_gpu_gb"`
+	// PriceUSDMicrosPerHour is the GPU list rate — the unit the hub's offer
+	// matching and replan cap run on, and the accepted quote this client locks.
+	PriceUSDMicrosPerHour int64 `json:"price_usd_micros_per_hour"`
+	// StorageUSDMicrosPerHour is the hub's estimated per-running-hour storage
+	// adder for one pod of this product (th-126): deterministic from the SKU's
+	// image disk spec. The renter pays price + storage, so every pre-spend
+	// display and the fleet spend admission total the two; the locked quote
+	// stays the GPU rate alone. Zero from a hub that itemizes none.
+	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour"`
 }
 
 // RentalSKUs reads Tensorhub's public product catalog.
@@ -239,7 +247,7 @@ func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
 			sku.VRAMGB <= 0 || sku.MinimumRAMPerGPUGB <= 0)
 		if strings.TrimSpace(sku.Name) == "" || strings.TrimSpace(sku.AcceleratorModel) == "" ||
 			invalidCPU || invalidGPU ||
-			sku.PriceUSDMicrosPerHour <= 0 || seen[sku.Name] {
+			sku.PriceUSDMicrosPerHour <= 0 || sku.StorageUSDMicrosPerHour < 0 || seen[sku.Name] {
 			return nil, exit.Named(exit.Conflict, "hub.rental_catalog_invalid",
 				"the hub returned an invalid or duplicate rental SKU %q", sku.Name).
 				WithRemedy("Tensorhub must publish unique positive-price CPU SKUs without GPU fields, or GPU SKUs with compute capability and positive VRAM/RAM")

@@ -115,7 +115,11 @@ type RentalRequestAuthor func(machineName string) (body []byte, digest string, p
 // operation on this host holds and has the request authored under it, inside the one
 // transaction that records it — so two acquisitions can never share a word, and
 // `cozy rental end <word>` is never ambiguous.
-func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros int64,
+// storageUSDMicros is the SKU's estimated storage adder (th-126): the spend
+// admission totals it with the locked GPU rate — burn is billed-truth money
+// (th-120), so the figure admitted is what the pod will actually bill — while
+// the operation row keeps the GPU quote alone.
+func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros, storageUSDMicros int64,
 	author RentalRequestAuthor) (RentalOperation, bool, *exit.Error) {
 	stamp := now()
 	tx, err := s.db.Begin()
@@ -134,18 +138,19 @@ func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros int64
 	if !errors.Is(err, sql.ErrNoRows) {
 		return RentalOperation{}, false, exit.Internalf("cannot read rental operation: %s", err)
 	}
-	if op.HourlyRateUSDMicros <= 0 || fleetCapUSDMicros <= 0 {
+	if op.HourlyRateUSDMicros <= 0 || fleetCapUSDMicros <= 0 || storageUSDMicros < 0 {
 		return RentalOperation{}, false, exit.Named(exit.Usage, "rental.spend_cap_required",
-			"a positive locked hourly rate and rentals.max_hourly_spend_usd are required")
+			"a positive locked hourly rate, a non-negative storage adder, and rentals.max_hourly_spend_usd are required")
 	}
 	count, burn, problem := rentalFleetTotals(tx)
 	if problem != nil {
 		return RentalOperation{}, false, problem
 	}
-	if burn > fleetCapUSDMicros || op.HourlyRateUSDMicros > fleetCapUSDMicros-burn {
+	estimatedTotal := op.HourlyRateUSDMicros + storageUSDMicros
+	if burn > fleetCapUSDMicros || estimatedTotal > fleetCapUSDMicros-burn {
 		return RentalOperation{}, false, exit.Named(exit.Capacity, "rental.fleet_spend_cap",
-			"%d potentially billing rental(s) already reserve %d USD micros/hour; the next %d would exceed %d",
-			count, burn, op.HourlyRateUSDMicros, fleetCapUSDMicros)
+			"%d potentially billing rental(s) already reserve %d USD micros/hour; the next %d (%d gpu + %d storage) would exceed %d",
+			count, burn, estimatedTotal, op.HourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros)
 	}
 	taken, e := machineNamesInUse(tx)
 	if e != nil {
