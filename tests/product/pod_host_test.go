@@ -386,6 +386,14 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 	if call.PackageSet == nil || len(call.PackageSet.DownloadDelegationSignature) != ed25519.SignatureSize {
 		return status.Error(codes.InvalidArgument, "no signed delegation")
 	}
+	// MINOR 31 (xs-019): the release facts ride the call — the pod host's exact
+	// refusal (internal/workerhost/prepare.go), the one run 178 died on.
+	if call.Application == "" || len(call.LockedRequirements) == 0 ||
+		len(call.LockedRequirements) > pb.MaxLockedRequirementsBytes ||
+		len(call.ModelSlotPaths) > pb.MaxModelSlotPaths {
+		return status.Error(codes.InvalidArgument,
+			"PreparePackageSet requires the release facts: application, bounded model_slot_paths, and the locked requirements export")
+	}
 	delegation, err := canonical.Read(call.PackageSet.DownloadDelegation, &pb.DownloadDelegation{})
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "delegation: %v", err)
@@ -401,6 +409,20 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 		return status.Error(codes.Unavailable, "Tensorhub is restarting")
 	}
 	total := uint64(18_874_368)
+	if call.ImageInventory == nil {
+		// The Runtime's own verdict: preparation refuses a request without the
+		// placed image's inventory (package_prepare._request_facts).
+		for _, event := range []*pb.PrepareEvent{
+			{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED, TotalBytes: total},
+			{Stage: pb.PrepareStage_PREPARE_STAGE_REFUSED, TotalBytes: total,
+				SafeCode: "package_prepare_image_inventory_missing", SafeDetail: "image_inventory"},
+		} {
+			if err := stream.Send(event); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	selected := delegation.List("packages")
 	if len(selected) != 1 {
 		for _, event := range []*pb.PrepareEvent{
@@ -569,6 +591,25 @@ func rentalWiring(connection *orchestrator.WorkerConnection, signer ed25519.Priv
 			}
 			return body, ed25519.Sign(signer, body), nil
 		}
+		o.RentalPrepareFacts = func(_ context.Context, _ *orchestrator.WorkerConnection,
+			ref *pb.DownloadPackageRef) (orchestrator.PrepareFacts, *exit.Error) {
+			return testPrepareFacts(ref.Package, ref.Release), nil
+		}
+	}
+}
+
+// testPrepareFacts is the hub-known release half of a PreparePackageSetCall in this
+// suite: what the rental-scoped prepare-facts route would answer for one release.
+func testPrepareFacts(pkg, release string) orchestrator.PrepareFacts {
+	return orchestrator.PrepareFacts{
+		Application:    "comfyui",
+		ModelSlotPaths: []string{"unet"},
+		ImageInventory: &pb.ImageInventory{Profile: "python3.12-cpu-linux-x86", Python: "3.12.8",
+			Distributions: []*pb.ImageDistribution{{Distribution: "numpy", Version: "2.1.0"}}},
+		LockedRequirements: []byte("--index-url https://pypi.org/simple\n" +
+			"--extra-index-url https://hub.invalid/v1/index/acme/simple/\n\n" +
+			pkg[strings.IndexByte(pkg, '/')+1:] + "==" + release +
+			" --hash=sha256:" + strings.Repeat("11", 32) + "\n"),
 	}
 }
 
@@ -619,6 +660,11 @@ func TestPodHostThreeStepSequence(t *testing.T) {
 	}
 	if got := pod.prepares[0].Claim; got.ControlStreamEpoch != 0 || got.WorkerBootId != podBootID {
 		t.Fatalf("the host call's Claim is stream-scoped or misaddressed: %+v", got)
+	}
+	if first := pod.prepares[0]; first.Application == "" || len(first.ModelSlotPaths) == 0 ||
+		first.ImageInventory.GetPython() == "" || len(first.LockedRequirements) == 0 {
+		t.Fatalf("the host call does not carry the release facts (fields 3-6): app=%q slots=%v inventory=%v",
+			first.Application, first.ModelSlotPaths, first.ImageInventory)
 	}
 	for _, d := range pod.desired {
 		if d.GetPackageSet() != nil || d.GetLocalPackageSet() != nil || d.GetPrivatePlacementSet() != nil {

@@ -348,3 +348,35 @@ func (c *Client) Release(ctx context.Context, id, reason string) *exit.Error {
 		method: http.MethodDelete, path: "/v1/rentals/" + url.PathEscape(id), auth: true, reason: reason,
 	}, nil)
 }
+
+// PrepareFactsView is the rental-scoped prepare-facts answer verbatim (wire 31,
+// xs-019): the release facts a PreparePackageSetCall carries on fields 3-6.
+// The inventory is the placed image's registered tensorhub.image_inventory/1
+// document, untouched by this client.
+type PrepareFactsView struct {
+	Application        string          `json:"application"`
+	ModelSlotPaths     []string        `json:"model_slot_paths"`
+	ImageInventory     json.RawMessage `json:"image_inventory"`
+	LockedRequirements string          `json:"locked_requirements"`
+}
+
+// The locked requirements alone may reach the 1 MiB wire bound; the inventory
+// rides beside them.
+const maxPrepareFactsResponseBytes = 4 << 20
+
+// PrepareFacts reads the hub-known release facts for dispatching one committed
+// package release to this rental (GET /v1/rentals/{id}/prepare-facts).
+func (c *Client) PrepareFacts(ctx context.Context, id, pkg, release string) (PrepareFactsView, *exit.Error) {
+	if e := validateRentalID(id); e != nil {
+		return PrepareFactsView{}, e
+	}
+	query := url.Values{"package": {pkg}, "release": {release}}
+	var out PrepareFactsView
+	e := c.do(ctx, call{method: http.MethodGet,
+		path: "/v1/rentals/" + url.PathEscape(id) + "/prepare-facts?" + query.Encode(),
+		auth: true, responseBytes: maxPrepareFactsResponseBytes}, &out)
+	if e != nil {
+		return PrepareFactsView{}, e
+	}
+	return out, nil
+}

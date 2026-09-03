@@ -64,6 +64,11 @@ type Options struct {
 	RentalClaimProof RentalClaimProofSource
 	// RentalPackageSet signs Creator's logical package/model download authority.
 	RentalPackageSet RentalPackageSetSource
+	// RentalPrepareFacts fetches the hub-known release facts one
+	// PreparePackageSetCall carries on fields 3-6 (wire 31, xs-019) for
+	// dispatching one package release to this rental. Callback for the same
+	// reason RentalPackageSet is: the orchestrator holds no Tensorhub client.
+	RentalPrepareFacts RentalPrepareFactsSource
 	// ReportReleaseDefect relays a package-interface-falsifying pod refusal to the hub
 	// (th-106). Callback for the same reason RentalPackageSet is: the
 	// orchestrator holds no Tensorhub client. Fire-and-forget; the hub's defect
@@ -106,6 +111,22 @@ type ReleaseDefectReporter func(report ReleaseDefect)
 
 type RentalPackageSetSource func(*WorkerConnection, []*pb.DownloadPackageRef,
 	[]*pb.DownloadModelRef) ([]byte, []byte, *exit.Error)
+
+// PrepareFacts is the hub-known half of one PreparePackageSetCall: the release
+// facts (fields 3-6) the record owner fetched for this exact package release on
+// this rental. The pod host relays them verbatim to the Runtime's preparation,
+// which refuses a call without them.
+type PrepareFacts struct {
+	Application        string
+	ModelSlotPaths     []string
+	ImageInventory     *pb.ImageInventory
+	LockedRequirements []byte
+}
+
+// RentalPrepareFactsSource answers one package release's facts for one rental.
+// Every call returns a fresh value; the orchestrator sends it on the wire as is.
+type RentalPrepareFactsSource func(context.Context, *WorkerConnection,
+	*pb.DownloadPackageRef) (PrepareFacts, *exit.Error)
 
 type RentalObservation struct {
 	RentalID               string

@@ -62,7 +62,10 @@ type packagePrepare struct {
 	// and the pod prepares again instead of replaying the old refusal (a transient
 	// model-object fetch failure, HTTP 429 observed live on anima's 5.66 GB set, would
 	// otherwise be permanent for the delegation's lifetime on that pod).
-	pkg        string
+	pkg string
+	// ref is the exact release this preparation carries — what the facts fetch
+	// names against the rental-scoped prepare-facts route.
+	ref        *pb.DownloadPackageRef
 	delegation []byte
 	signature  []byte
 }
@@ -107,10 +110,31 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 			c.logf("PodHost prepare %s#%d superseded by #%d between packages", prep.label, seq, superseded)
 			return
 		}
+		// MINOR 31 (xs-019): the call carries the hub-known release facts on
+		// fields 3-6; the pod host refuses one without them. They are fetched
+		// here, on the prepare's own goroutine, because the source is a network
+		// call and issuePackageSet's callers include the control stream's
+		// receive loop.
+		facts, problem := c.opt.RentalPrepareFacts(s.ctx, w.spec.Connection, prep.ref)
+		if problem != nil {
+			if problem.Code == exit.Unavailable || problem.Code == exit.Deadline {
+				c.setDesiredUnavailable(w, seq, exit.Unavailablef(
+					"PodHost prepare %s has no release facts yet: %s", prep.label, problem.Message))
+			} else {
+				c.setDesiredRefusal(w, seq, exit.Named(exit.Structural, "worker.prepare_facts_refused",
+					"the hub refused the release facts for %s: %s", prep.label, problem.Message))
+			}
+			return
+		}
 		call := &pb.PreparePackageSetCall{Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
 			DownloadDelegation:          append([]byte(nil), prep.delegation...),
 			DownloadDelegationSignature: append([]byte(nil), prep.signature...),
-		}}
+		},
+			Application:        facts.Application,
+			ModelSlotPaths:     append([]string(nil), facts.ModelSlotPaths...),
+			ImageInventory:     facts.ImageInventory,
+			LockedRequirements: append([]byte(nil), facts.LockedRequirements...),
+		}
 		result := c.runHostPrepare(s, seq, prep.label,
 			func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
 				return s.host.PreparePackageSet(ctx, call)

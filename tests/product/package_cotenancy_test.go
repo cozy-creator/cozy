@@ -276,9 +276,14 @@ func TestPodRefusesMergedDelegation(t *testing.T) {
 	proof, err := canonical.Bytes(&pb.ClaimProof{RecordOwnerEpoch: 7, WorkerId: podWorkerID,
 		WorkerBootId: podBootID, WorkerTlsCertificateDigest: pod.leafDigest})
 	must(t, err)
+	facts := testPrepareFacts("acme/alpha", "1.0.0")
 	stream, err := pb.NewPodHostClient(client).PreparePackageSet(t.Context(), &pb.PreparePackageSetCall{
-		Claim:      &pb.Claim{RecordOwnerEpoch: 7, WorkerBootId: podBootID, Proof: ed25519.Sign(private, proof)},
-		PackageSet: &pb.DesiredPackageSet{DownloadDelegation: merged, DownloadDelegationSignature: signature},
+		Claim:              &pb.Claim{RecordOwnerEpoch: 7, WorkerBootId: podBootID, Proof: ed25519.Sign(private, proof)},
+		PackageSet:         &pb.DesiredPackageSet{DownloadDelegation: merged, DownloadDelegationSignature: signature},
+		Application:        facts.Application,
+		ModelSlotPaths:     facts.ModelSlotPaths,
+		ImageInventory:     facts.ImageInventory,
+		LockedRequirements: facts.LockedRequirements,
 	})
 	must(t, err)
 	deadline := time.Now().Add(10 * time.Second)
