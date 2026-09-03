@@ -101,9 +101,15 @@ TensorFS owns its Store location independently of Creator. User-facing entrypoin
 default in this order: an explicit argument, `TENSORFS_HOME`, then `$HOME/.tensorfs`. They never
 read `COZY_HOME`. Core Rust Store operations remain explicit-root.
 
+A Store is created only where someone NAMED it — a root argument, or `TENSORFS_HOME` — and only by
+`init`/`ensure`. `$HOME/.tensorfs` is a place to look, not a place to conjure: with no root named
+and nothing there, every store verb refuses `STORE_ROOT_ABSENT` and writes nothing. Nor does a
+writer marker create the root it locks, so no command lays down a skeleton Store in whatever
+directory it happened to be run from.
+
 ```bash
 tfs home
-tfs store ensure                 # open valid, or initialize only absent/empty
+tfs store ensure                 # over a NAMED root: open valid, or initialize only absent/empty
 TENSORFS_HOME=/var/lib/tensorfs tfs store info
 tfs store prepare-readers        # TensorFS owns cross-uid lease coordination modes
 tfs store complete-cozytensors   # sorted verified-complete runtime manifests
