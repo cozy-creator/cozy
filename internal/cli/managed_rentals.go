@@ -354,9 +354,6 @@ func (m *managedRentals) releaseOrphaned() {
 // say; the grace is the debounce, and a sample that finds nothing to do costs a few local
 // reads. It returns when quit closes, or at once when idle release is configured off.
 func (m *managedRentals) watch(quit <-chan struct{}) {
-	if m.ctx.Cfg.RentalsIdleRelease <= 0 {
-		return
-	}
 	tick := time.NewTicker(pollCadence)
 	defer tick.Stop()
 	for {
@@ -369,7 +366,13 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 		if !m.closed {
 			m.sweepLocked()
 		}
+		owner := m.owner
 		m.mu.Unlock()
+		if owner != nil {
+			// Hub recovery is an observed fleet change. Re-ask durable queued work outside
+			// the fleet lock; selection calls back into this object.
+			owner.WakeQueue()
+		}
 	}
 }
 

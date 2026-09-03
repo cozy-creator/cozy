@@ -743,6 +743,14 @@ func (c *Orchestrator) reviveQueue() {
 	}
 }
 
+// WakeQueue re-asks durable queued work after an external capacity observation changes. It is
+// intentionally edge-triggered by the fleet observer; the queue remains the authority and
+// duplicate wakes cannot mint duplicate attempts.
+func (c *Orchestrator) WakeQueue() {
+	c.reviveQueue()
+	go c.drain()
+}
+
 // recoverWorker settles the local process death from Creator's existing records
 // authority. Runtime is a disposable execution child: it owns neither a journal nor a
 // recovery decision. An unoffered assignment returns to the queue; an offer that may have
