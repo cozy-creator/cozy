@@ -178,6 +178,12 @@ type standInPod struct {
 	// that DELETED a lane answers one: codes.Unimplemented over the whole stream. A nil
 	// channel never fires, so an arm that does not set it is untouched.
 	unimplemented chan struct{}
+	// prepareStatus, when set, ends every prepare stream with that gRPC status instead of
+	// any prepare event — the way a host answers a desire it cannot serve at all.
+	prepareStatus *status.Status
+	// prepareCalls counts PreparePackageSet calls. It is the owner's re-issue rate seen
+	// from the other end, and the only honest measure of a desired-state retry loop.
+	prepareCalls uint64
 
 	mu    sync.Mutex
 	seen  []presentedDownloadSet
@@ -190,6 +196,13 @@ func (p *standInPod) claims() uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.epoch
+}
+
+// prepares counts the prepare streams this pod has been asked to open.
+func (p *standInPod) prepares() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.prepareCalls
 }
 
 func (p *standInPod) WatchProgress(_ *pb.ProgressOpen, stream pb.WorkerControl_WatchProgressServer) error {
@@ -302,6 +315,12 @@ func (p *standInPod) PreparePackageSet(call *pb.PreparePackageSetCall,
 	if call.GetClaim() == nil || call.Claim.ControlStreamEpoch != 0 ||
 		!ed25519.Verify(p.creatorPublicKey, p.claimProof(call.Claim), call.Claim.Proof) {
 		return status.Error(codes.Unauthenticated, "the host call carries no valid ClaimProof")
+	}
+	p.mu.Lock()
+	p.prepareCalls++
+	p.mu.Unlock()
+	if p.prepareStatus != nil {
+		return p.prepareStatus.Err()
 	}
 	set := call.GetPackageSet()
 	if set == nil {
