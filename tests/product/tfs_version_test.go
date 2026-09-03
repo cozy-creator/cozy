@@ -1,4 +1,4 @@
-package tfs
+package producttest
 
 import (
 	"fmt"
@@ -10,27 +10,28 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
 // presentBinary writes an executable that behaves like a tfs build and Opens against it,
 // so every assertion runs the real resolve -> handshake -> store-init path.
-func presentBinary(t *testing.T, script string) (*Tool, *exit.Error) {
+func presentBinary(t *testing.T, script string) (*tfs.Tool, *exit.Error) {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "tfs")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Config{Tfs: bin, TfsSource: "test"}
-	return Open(cfg, home.Layout{CAS: filepath.Join(t.TempDir(), "cas")})
+	return tfs.Open(cfg, home.Layout{CAS: filepath.Join(t.TempDir(), "cas")})
 }
 
 func TestOpenAcceptsTheBuiltForVersion(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("ab", 32)
-	tool, e := presentBinary(t, fmt.Sprintf(`if [ "$1" = version ]; then echo "tfs %s %s"; fi; exit 0`, BuiltFor, digest))
+	tool, e := presentBinary(t, fmt.Sprintf(`if [ "$1" = version ]; then echo "tfs %s %s"; fi; exit 0`, tfs.BuiltFor, digest))
 	if e != nil {
 		t.Fatalf("matching binary refused: %s", e.Message)
 	}
-	if tool.Version != BuiltFor || tool.BuildDigest != digest {
+	if tool.Version != tfs.BuiltFor || tool.BuildDigest != digest {
 		t.Fatalf("handshake recorded %q %q", tool.Version, tool.BuildDigest)
 	}
 }
@@ -43,7 +44,7 @@ func TestOpenRefusesAMismatchedBinary(t *testing.T) {
 	if e.Name != "tfs_version_skew" || e.Code != exit.Structural {
 		t.Fatalf("refusal %s (exit %d)", e.ErrName(), e.Code)
 	}
-	if !strings.Contains(e.Message, "9.9.9") || !strings.Contains(e.Message, BuiltFor) {
+	if !strings.Contains(e.Message, "9.9.9") || !strings.Contains(e.Message, tfs.BuiltFor) {
 		t.Fatalf("refusal names neither side: %s", e.Message)
 	}
 }
