@@ -166,13 +166,16 @@ def fit(
         )
         for tensor in requirements
     ]
-    return _fit(
-        rows,
-        header,
-        custody=custody,
-        encoded_leaves=encoded_leaves,
-        device=device,
-        observations=observations,
+    return cast(
+        dict[str, object],
+        _fit(
+            rows,
+            header,
+            custody=custody,
+            encoded_leaves=encoded_leaves,
+            device=device,
+            observations=observations,
+        ),
     )
 
 #: The closed carrier/logical dtype enum and its element sizes. The ONE export of dtype
