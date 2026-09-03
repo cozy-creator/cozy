@@ -82,6 +82,10 @@ digest = hashlib.sha256()
 with store.acquire_cozytensors(snap) as lease:
     print(f"lease: {len(lease.objects)} objects, {lease.bytes} B verified")
     first_id, first_length = lease.objects[0]
+    for asset_name, asset in header["assets"].items():
+        asset_bytes = lease.read_asset(info["header"], asset_name)
+        assert len(asset_bytes) == asset["logical_length"]
+        assert hashlib.sha256(asset_bytes).hexdigest() == asset["logical_sha256"]
 
     def on_batch(b):
         digest.update(slots[b.slot][: b.nbytes])

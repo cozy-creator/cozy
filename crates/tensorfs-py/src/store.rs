@@ -1811,6 +1811,7 @@ impl PyLease {
         name: &str,
         max_bytes: u64,
     ) -> PyResult<Bound<'p, PyBytes>> {
+        let header_ref = ObjectRef::of(header);
         let header = Header::parse(header).or_refuse(py)?;
         let asset = header
             .assets
@@ -1820,6 +1821,13 @@ impl PyLease {
             .ok_or_else(|| missing(py, "model asset", name))?;
         let guard = self.lease.lock().unwrap();
         let lease = guard.as_ref().ok_or_else(|| released(py))?;
+        lease
+            .covers(&ObjectRange {
+                obj: header_ref,
+                off: 0,
+                len: 0,
+            })
+            .or_refuse(py)?;
         let bytes = py
             .detach(|| read::read_asset(lease, name, asset, max_bytes))
             .or_refuse(py)?;
