@@ -23,7 +23,22 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.db")
 	writeSchemaElevenDatabase(t, path)
 
-	store, problem := records.Open(path)
+	if store, problem := records.Open(path); problem == nil || problem.ErrName() != "records_schema_upgrade_required" {
+		if store != nil {
+			store.Close()
+		}
+		t.Fatalf("ordinary Open = %v, want records_schema_upgrade_required", problem)
+	}
+	before, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var priorVersion int
+	if err := before.QueryRow(`PRAGMA user_version`).Scan(&priorVersion); err != nil || priorVersion != 11 {
+		t.Fatalf("ordinary Open changed user_version to %d: %v", priorVersion, err)
+	}
+	before.Close()
+	store, problem := records.OpenForDaemon(path)
 	if problem != nil {
 		t.Fatalf("schema-11 database did not migrate: %v", problem)
 	}

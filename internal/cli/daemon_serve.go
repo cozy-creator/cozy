@@ -98,7 +98,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// daemon removes it, so concurrent auto-start callers cannot erase a live token.
 	_ = os.Remove(l.Client)
 
-	st, e := records.Open(l.DB)
+	st, e := records.OpenForDaemon(l.DB)
 	if e != nil {
 		closeListeners()
 		return e
