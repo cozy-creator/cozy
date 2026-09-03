@@ -37,7 +37,7 @@
 //! URL of `-` arrives on stdin. Flags: --hub <base> --lane --session --streams <n>
 //! --timeout <s> --allow-hosts a,b,.c --allow-local --max-redirects <n>.
 //!
-//!   tfs fetch <root> <ref>       closure -> plan -> presign(wanted) -> N-way walk -> proof
+//!   tfs fetch <root> <ref>       closure -> plan -> N-way walk (presign at use) -> proof
 //!   tfs fetch plan-objects <root> <session> --refs <jsonl>   HELD/WANTED, no manifest
 //!   tfs fetch url <root> <sha256> <length> <url|->           one granted object
 //!   tfs push <root> <sha256> --grant-file <path> [--manifest] [--content-type ct]

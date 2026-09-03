@@ -11,9 +11,13 @@
 //!    unique by digest and EXCLUDES the manifest row, which travels in `manifest`.
 //!    `scope` names the walk the closure covers (`runtime` today); `stamps` is the
 //!    resolved lane's stamped-fact set (#567d) and may be absent.
-//! 2. `POST {base}/v1/tensorfs/presign`, body `{"digests":[hex,...]}` (sorted unique)
-//!    → `{"urls":{hex:"https://...",...}}` — credential again, URLs only for what was
-//!    asked, the manifest digest included when asked.
+//! 2. `POST {base}/v1/tensorfs/presign`, body `{"digests":[hex,...]}` (sorted unique, at
+//!    most `MAX_PRESIGN_DIGESTS`) → `{"expires_at_unix":N,"server_time_unix":N,
+//!    "urls":{hex:"https://...",...}}` — credential again, URLs only for what was asked,
+//!    the manifest digest included when asked. The two clock fields are the URL's declared
+//!    life stated in the HUB's own time, which is what lets a caller judge a URL's age
+//!    without trusting its own clock; the pull mints against them per object rather than
+//!    once for a whole closure.
 //!
 //! Errors travel in the hub's own envelope `{"error":{"code","message","remedy"}}` and
 //! cross verbatim — the hub knows why it refused better than anything restated here.
@@ -229,6 +233,22 @@ pub fn closure(
 /// URLs for exactly the asked digests. A digest the hub does not answer is a typed
 /// refusal here, not a KeyError three calls later.
 #[allow(clippy::too_many_arguments)]
+/// What one presign answered: the URLs, and the LIFETIME the hub declared for them.
+///
+/// The lifetime is read from the hub's OWN clock — `expires_at_unix - server_time_unix` —
+/// never from this machine's, so a skewed local clock cannot make a live URL look dead or a
+/// dead one look live. `None` when the hub declared neither field: there is then nothing to
+/// judge a URL's age against, and the caller's mint window is the only bound on it.
+#[derive(Debug, Clone, Default)]
+pub struct Presigned {
+    pub urls: Vec<(String, String)>,
+    pub lifetime: Option<std::time::Duration>,
+}
+
+/// Mint URLs for exactly `digests` — sorted unique bare hex, which is what the hub accepts
+/// and what `FetchPlan` already produces. The hub answers every digest it was asked or
+/// refuses; a silent subset is a refusal here, because a walk that discovers a missing URL
+/// halfway through has already spent the link.
 pub fn presign(
     client: &Client,
     base: &str,
@@ -237,7 +257,7 @@ pub fn presign(
     policy: &SourcePolicy,
     deadline: Deadline,
     ledger: &Ledger,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Presigned> {
     let body = canon::write(&Value::obj(vec![(
         "digests",
         Value::arr(digests.iter().map(Value::str).collect()),
@@ -262,6 +282,17 @@ pub fn presign(
             detail: "the presign response carries no \"urls\" field".into(),
         })?;
     let rows = as_obj("presign", "urls", urls)?;
+    let field = |name: &str| obj.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    let lifetime = match (field("expires_at_unix"), field("server_time_unix")) {
+        (Some(expires), Some(server_now)) => {
+            let expires = as_uint("presign", "expires_at_unix", expires)?;
+            let server_now = as_uint("presign", "server_time_unix", server_now)?;
+            Some(std::time::Duration::from_secs(
+                expires.saturating_sub(server_now),
+            ))
+        }
+        _ => None,
+    };
     let mut out = Vec::new();
     for digest in digests {
         match rows.iter().find(|(k, _)| k == digest) {
@@ -280,7 +311,10 @@ pub fn presign(
             }
         }
     }
-    Ok(out)
+    Ok(Presigned {
+        urls: out,
+        lifetime,
+    })
 }
 
 fn object_row(what: &'static str, value: &Value) -> Result<ObjectRef> {

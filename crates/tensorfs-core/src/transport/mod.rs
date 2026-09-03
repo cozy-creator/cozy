@@ -44,13 +44,14 @@ pub use api::{api_get, probe_length};
 pub use http::Client;
 pub use hub::{
     closure, credential_from_spec, presign, Anonymous, Closure, CredentialProvider, HostToken,
-    ScopedHeaders,
+    Presigned, ScopedHeaders,
 };
 pub use ledger::{
     Deadline, Ledger, FETCH_ATTEMPTS, SAMPLE_SECONDS, STALL_FACTOR, STILL_SAMPLES, STREAMS,
 };
 pub use policy::{base_host, blocked, is_loopback_origin, resolve, CheckedUrl, SourcePolicy};
 pub use pull::{
-    fetch_url, fetch_wanted, pull, Fetched, PullReport, PullRequest, WalkOutcome, RETRYABLE_STATUS,
+    fetch_authorized, fetch_url, fetch_wanted, pull, Fetched, ObjectUrls, PullReport, PullRequest,
+    WalkOutcome, MAX_PRESIGN_DIGESTS, RETRYABLE_STATUS,
 };
 pub use push::{push_object, Pushed, UploadGrant, MAX_GRANT_BYTES, PUT_ATTEMPTS};

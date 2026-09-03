@@ -38,6 +38,9 @@ fn temporary(name: &str) -> PathBuf {
 struct Request {
     method: String,
     path: String,
+    /// Everything after `?`. Hits are counted by PATH, so a URL that carries its own expiry
+    /// here is still the same object to every existing assertion.
+    query: String,
     headers: Vec<(String, String)>,
     #[allow(dead_code)]
     body: Vec<u8>,
@@ -217,7 +220,11 @@ fn read_request(socket: &mut TcpStream) -> Option<Request> {
     let request_line = lines.next()?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_string();
-    let path = parts.next()?.split('?').next()?.to_string();
+    let target = parts.next()?;
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path.to_string(), query.to_string()),
+        None => (target.to_string(), String::new()),
+    };
     let headers: Vec<(String, String)> = lines
         .filter_map(|line| line.split_once(':'))
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
@@ -237,6 +244,7 @@ fn read_request(socket: &mut TcpStream) -> Option<Request> {
     Some(Request {
         method,
         path,
+        query,
         headers,
         body,
     })
@@ -409,6 +417,108 @@ fn origin_with_hits(dispatch: Dispatch, hits: Arc<Mutex<HashMap<String, usize>>>
         }
     });
     Origin { base, hits }
+}
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+}
+
+/// A hub whose presigned URLs DIE, and an object store that enforces it.
+///
+/// Every URL carries the wall-clock instant it stops working, the presign answer declares
+/// the same life in the hub's own clock fields (`expires_at_unix`/`server_time_unix`), and a
+/// GET presented after that instant is refused the way an object store refuses a signature
+/// that has aged out. This is the only origin here that models the one fact the hub's cap
+/// exists to state, and it is what makes the walk-outlives-the-cap proof mean anything.
+struct Expiring {
+    origin: Origin,
+    lifetime: Duration,
+    /// How many times a URL was presented after it died — the proof that the origin is
+    /// actually enforcing, rather than a test that could not fail.
+    rejected: Arc<AtomicUsize>,
+}
+
+fn expiring_presign_value(request_body: &[u8], base: &str, lifetime: Duration) -> Value {
+    let asked = crate::canon::parse(request_body, 1 << 20).unwrap();
+    let Value::Obj(fields) = asked else { panic!() };
+    let Some((_, Value::Arr(digests))) = fields.into_iter().find(|(k, _)| k == "digests") else {
+        panic!()
+    };
+    let dies = now_millis() + lifetime.as_millis();
+    let server_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let urls: Vec<(String, Value)> = digests
+        .into_iter()
+        .map(|d| {
+            let Value::Str(hex) = d else { panic!() };
+            let url = format!("{base}/obj/{hex}?dies={dies}");
+            (hex, Value::str(url))
+        })
+        .collect();
+    Value::obj(vec![
+        (
+            "expires_at_unix",
+            Value::uint(server_now + lifetime.as_secs()),
+        ),
+        ("server_time_unix", Value::uint(server_now)),
+        ("urls", Value::map(urls)),
+    ])
+}
+
+fn expiring_hub_origin(
+    checkpoint: Arc<Checkpoint>,
+    lifetime: Duration,
+    ttfb: Duration,
+    gap: Duration,
+) -> Expiring {
+    let base_slot: Arc<Mutex<String>> = Arc::default();
+    let hits: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let dispatch_base = Arc::clone(&base_slot);
+    let dispatch_rejected = Arc::clone(&rejected);
+    let dispatch: Dispatch = Arc::new(move |request: &Request| {
+        let base = dispatch_base.lock().unwrap().clone();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/v1/tensorfs/closure") => ok_json(&closure_value(&checkpoint, &base)),
+            ("POST", "/v1/tensorfs/presign") => {
+                ok_json(&expiring_presign_value(&request.body, &base, lifetime))
+            }
+            ("GET", path) if path.starts_with("/obj/") => {
+                let hex = &path["/obj/".len()..];
+                let dies: u128 = request
+                    .query
+                    .strip_prefix("dies=")
+                    .and_then(|stamp| stamp.parse().ok())
+                    .expect("every URL this hub mints carries its own expiry");
+                if now_millis() > dies {
+                    dispatch_rejected.fetch_add(1, Ordering::Relaxed);
+                    return status(403, b"{\"error\":{\"code\":\"AccessDenied\"}}");
+                }
+                match checkpoint.bodies.get(hex) {
+                    Some(body) => Serve::Drip {
+                        body: body.clone(),
+                        chunk: (body.len() / 4).max(1),
+                        gap,
+                        ttfb,
+                    },
+                    None => status(404, b"no such object"),
+                }
+            }
+            _ => status(404, b"no such route"),
+        }
+    });
+    let origin = origin_with_hits(dispatch, hits);
+    *base_slot.lock().unwrap() = origin.base.clone();
+    Expiring {
+        origin,
+        lifetime,
+        rejected,
+    }
 }
 
 fn local_policy() -> SourcePolicy {
@@ -632,6 +742,152 @@ fn deadline_refuses_midpull_and_the_next_pull_resumes_per_object() {
         .presence
         .iter()
         .for_each(|(_, why)| assert_ne!(*why, "corrupt_removed"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// **The decisive one: a walk that outlives the URL lifetime and still completes.**
+///
+/// The hub caps how long a presigned URL lives. What that cap BOUNDS depends entirely on
+/// when the URL is minted — and minting the whole wanted set before the walk starts spends
+/// the cap on the closure rather than on an object, so the last object's URL is already dead
+/// when a stream reaches it. The cap was never wrong; the moment of minting was.
+///
+/// One origin proves both halves, because the only difference between them is that moment.
+/// Its URLs live one second and it refuses a URL presented later, exactly as an object store
+/// refuses a signature that has aged out. Minted up front, the walk is refused partway
+/// through. Minted where they are used, the same URLs — same cap, same closure, same origin
+/// — carry a walk several times longer than one URL's life to completion.
+///
+/// (No production run has yet been observed failing this way. SDXL run 192 is NOT evidence
+/// for it: that run died on `tensorfs.delegation_unauthorized`, its URLs fresh on every one
+/// of ~2,400 retries because each retry re-ran closure and presign together.)
+#[test]
+fn a_walk_that_outlives_the_url_lifetime_completes() {
+    let checkpoint = Arc::new(checkpoint(38, 4 * 1024)); // 38 blobs + header + manifest
+    let hub = expiring_hub_origin(
+        Arc::clone(&checkpoint),
+        Duration::from_secs(1),
+        Duration::from_millis(100),
+        Duration::from_millis(40),
+    );
+
+    // Today's shape, spelled out: every URL stamped once, at T=0, with the hub's cap on it.
+    let eager_root = temporary("expiry-eager");
+    let eager = Store::init(&eager_root).unwrap();
+    let (eager_plan, _) =
+        FetchPlan::of(&eager, "eager", &checkpoint.manifest, &checkpoint.objects).unwrap();
+    let dies = now_millis() + hub.lifetime.as_millis();
+    let up_front: std::collections::BTreeMap<String, String> = eager_plan
+        .wanted
+        .iter()
+        .map(|o| {
+            (
+                o.sha256.clone(),
+                format!("{}/obj/{}?dies={dies}", hub.origin.base, o.sha256),
+            )
+        })
+        .collect();
+    let refusal = super::pull::fetch_wanted(
+        &eager,
+        &eager_plan,
+        &up_front,
+        &local_policy(),
+        &Anonymous,
+        Deadline::none(),
+        &Ledger::with_resolution(Duration::from_millis(200)),
+        4,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(refusal.code, Code::TRANSFER_FAILED);
+    assert!(refusal.detail.contains("403"), "{}", refusal.detail);
+    let refused_up_front = hub.rejected.load(Ordering::Relaxed);
+    assert!(
+        refused_up_front > 0,
+        "the origin never actually refused an aged URL — the proof would be vacuous"
+    );
+    let _ = std::fs::remove_dir_all(eager_root);
+
+    // The same closure, the same origin, the same one-second URLs — minted where they are
+    // used. Nothing about the cap changed; only when the URL is asked for.
+    let root = temporary("expiry-lazy");
+    let store = Store::init(&root).unwrap();
+    let policy = SourcePolicy::default();
+    let mut request = request_for(&store, &hub.origin.base, &policy);
+    request.streams = 4;
+    request.sample_seconds = 0.2;
+    let started = std::time::Instant::now();
+    let report = pull(&request).unwrap();
+    let walked = started.elapsed();
+
+    assert_eq!(report.fetched, 40);
+    assert_eq!(report.held, 0);
+    assert!(
+        walked > hub.lifetime,
+        "the walk finished inside one URL's life ({walked:?}) — it never crossed the \
+         boundary this test is about"
+    );
+    assert!(
+        hub.origin.hits("/v1/tensorfs/presign") > 1,
+        "one presign covered the whole walk — the URLs were still minted up front"
+    );
+    assert_eq!(
+        hub.rejected.load(Ordering::Relaxed),
+        refused_up_front,
+        "a dead URL was presented during the lazy walk — every fetch must carry an \
+         authorization minted for it"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// **A resume across an expiry boundary.** The second reason to mint at the point of use: a
+/// single up-front mint stamps every unfetched object with the SAME expiry, so an
+/// interruption longer than what is left of it poisons all of them at once. A URL minted at
+/// use survives a resume by construction — the resumed walk mints its own, and never
+/// inherits one the interrupted walk was holding.
+#[test]
+fn a_resume_across_an_expiry_boundary_completes() {
+    let checkpoint = Arc::new(checkpoint(18, 4 * 1024)); // 18 blobs + header + manifest
+    let hub = expiring_hub_origin(
+        Arc::clone(&checkpoint),
+        Duration::from_secs(1),
+        Duration::from_millis(80),
+        Duration::from_millis(20),
+    );
+    let root = temporary("expiry-resume");
+    let store = Store::init(&root).unwrap();
+    let policy = SourcePolicy::default();
+
+    // Cut the first walk off with objects still to move.
+    let mut rushed = request_for(&store, &hub.origin.base, &policy);
+    rushed.streams = 2;
+    rushed.sample_seconds = 0.2;
+    rushed.deadline = Deadline::after_seconds(Some(0.8));
+    let refusal = pull(&rushed).unwrap_err();
+    assert_eq!(refusal.code, Code::DEADLINE_EXCEEDED);
+
+    // Wait out the life of every URL that walk was holding, then resume.
+    std::thread::sleep(hub.lifetime + Duration::from_millis(300));
+
+    let mut resumed_request = request_for(&store, &hub.origin.base, &policy);
+    resumed_request.streams = 2;
+    resumed_request.sample_seconds = 0.2;
+    let resumed = pull(&resumed_request).unwrap();
+
+    assert_eq!(resumed.held + resumed.fetched, 20);
+    assert!(
+        resumed.held > 0,
+        "per-object resume kept what the interrupted walk landed"
+    );
+    assert!(
+        resumed.fetched > 0,
+        "nothing was left to fetch — the walk never crossed the boundary"
+    );
+    assert_eq!(
+        hub.rejected.load(Ordering::Relaxed),
+        0,
+        "the resume presented a URL minted before the interruption"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 

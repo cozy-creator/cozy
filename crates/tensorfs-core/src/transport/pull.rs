@@ -16,11 +16,26 @@
 //! resume inside an object — the artifact is already cut on the object grid, so the
 //! recovery unit is an object.
 //!
+//! **A presigned URL is minted just before the object it authorizes is fetched.** The
+//! hub caps a URL's life, and the question that cap answers depends entirely on WHEN the
+//! URL is minted. Minting the whole wanted set before the walk starts makes the cap a
+//! bound on the WHOLE WALK — the last object's URL is minted at T=0 beside the first, and
+//! dies while the walk is still in its opening objects — so the cap silently becomes a cap
+//! on how large a closure may be pulled at all, which is not what it was written to be. A
+//! ~5 GiB checkpoint fits inside it and has never fired; a 92 GiB one at this transport's
+//! measured 117 MB/s needs about thirteen minutes and does not. (This defect has never yet
+//! been observed firing in production, and nothing here is evidence that it has.) Minting
+//! at the point of use makes the same cap a bound on ONE OBJECT'S transfer, which is what
+//! it was sized for and is generous for, and makes resume free: a walk that stops and
+//! starts again mints its own URLs and inherits none of the dying ones.
+//!
 //! **Which failures deserve a re-ask.** A stall the ledger NAMED, a connection that died,
 //! and the object store's own retryable answers do; an expired presign and an absent key
 //! do not — those are facts about authorization, and asking again about authorization is
-//! a lie about time. A refusal at the admission door propagates untouched: the bytes are
-//! wrong at the only authority there is.
+//! a lie about time. Re-AUTHORIZING is a different act and is honest, which is why every
+//! ask carries a URL minted for it rather than the one the first ask was given. A refusal
+//! at the admission door propagates untouched: the bytes are wrong at the only authority
+//! there is.
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{DeliveryGrant, FetchPlan};
@@ -33,6 +48,7 @@ use crate::transport::policy::{self, SourcePolicy};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// The object-store answers a re-ask is worth attempting for. Everything else is a fact
 /// about the request or the grant, and retrying it is a lie about time.
@@ -71,12 +87,46 @@ impl<F: FnMut(u64)> std::io::Read for Observed<'_, F> {
     }
 }
 
-/// Move ONE granted object across the door, re-asking while re-asking is honest.
+/// Move ONE granted object across the door from a URL the caller already holds. The
+/// caller then owns the question of whether that URL is still alive — which is why `pull`
+/// uses `fetch_authorized` instead.
 #[allow(clippy::too_many_arguments)]
 pub fn fetch_url(
     store: &Store,
     grant: &DeliveryGrant,
     url: &str,
+    policy: &SourcePolicy,
+    credential: &dyn CredentialProvider,
+    deadline: Deadline,
+    ledger: &Ledger,
+    progress: Option<&mut dyn FnMut(u64)>,
+) -> Result<Fetched> {
+    fetch_authorized(
+        store,
+        grant,
+        &|| Ok(url.to_string()),
+        policy,
+        credential,
+        deadline,
+        ledger,
+        progress,
+    )
+}
+
+/// Move ONE granted object across the door, re-asking while re-asking is honest, and
+/// re-AUTHORIZING on every ask.
+///
+/// `authorize` is consulted once per attempt rather than once per object, because the two
+/// are not the same thing when a URL has a life: four attempts against one aging URL can
+/// outlast it, and the fourth would then be refused for a reason the first three were not.
+/// Re-asking with the same expired URL is a lie about time — but re-minting is not asking
+/// again, it is being authorized again, which is honest and is exactly what the object
+/// store's refusal asked for.
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_authorized(
+    store: &Store,
+    grant: &DeliveryGrant,
+    authorize: &dyn Fn() -> Result<String>,
     policy: &SourcePolicy,
     credential: &dyn CredentialProvider,
     deadline: Deadline,
@@ -89,7 +139,8 @@ pub fn fetch_url(
     let mut stalled_attempts = 0u32;
     for attempt in 1..=FETCH_ATTEMPTS {
         let last = attempt == FETCH_ATTEMPTS;
-        let opened = match open_object(client, url, policy, credential, deadline, ledger) {
+        let url = authorize()?;
+        let opened = match open_object(client, &url, policy, credential, deadline, ledger) {
             Ok(response) => response,
             Err(refusal) => match refusal.code {
                 Code::TRANSFER_FAILED if !last => {
@@ -251,6 +302,180 @@ fn named(refusal: Refusal, id: &str) -> Refusal {
     }
 }
 
+/// Where the walk gets the URL for the object it is ABOUT to fetch — asked at the point of
+/// use, and asked again for every re-ask.
+///
+/// The walk does not know what a presign is, and does not need to: it names the object it
+/// has reached and is handed something it may GET. `at` is that object's index in
+/// `plan.wanted`, which is the whole reason this is not a bare `Fn(&ObjectRef)` — an
+/// implementation that mints has to know where the walk has got to in order to mint AHEAD
+/// of it rather than one call per object.
+pub trait ObjectUrls: Sync {
+    fn url_for(&self, at: usize, object: &ObjectRef) -> Result<String>;
+}
+
+/// URLs already in hand: the shape a caller that did its own authorizing passes. Nothing
+/// here re-mints, so the lifetime of these URLs bounds the whole walk — which is precisely
+/// why `pull` does not use this impl.
+impl ObjectUrls for BTreeMap<String, String> {
+    fn url_for(&self, _at: usize, object: &ObjectRef) -> Result<String> {
+        match self.get(&object.sha256) {
+            Some(url) => Ok(url.clone()),
+            None => refuse(
+                Code::TRANSFER_FAILED,
+                format!(
+                    "{}: wanted by the plan and no URL was minted for it — the grant set \
+                     covers the wanted set exactly",
+                    object.id()
+                ),
+            ),
+        }
+    }
+}
+
+/// The hub presigns at most this many digests in one call (`MaxGrantSubjects` on its side);
+/// asking for more is a refusal, not a truncation, so a mint window stops here.
+pub const MAX_PRESIGN_DIGESTS: usize = 4096;
+
+/// How far ahead of the walk one mint reaches, in DECLARED bytes.
+///
+/// This is GRANULARITY, not a verdict. Nothing fails because of it: a lease that goes stale
+/// before the walk reaches it is re-minted where it is used, so a badly chosen budget costs
+/// extra presign calls and never a transfer. It is a byte budget rather than an object count
+/// because that is what makes both ends safe at once — a window of very large objects stays
+/// short enough to be walked while its URLs are still young, and a window of very small ones
+/// stays long enough that refills do not beat against the hub's per-rental presign rate
+/// limit.
+const MINT_AHEAD_BYTES: u64 = 8 << 30;
+
+/// One minted URL and the life the hub declared for it.
+struct Lease {
+    url: String,
+    minted: Instant,
+    /// What the HUB said this URL is good for, or `None` when it said nothing.
+    lifetime: Option<Duration>,
+}
+
+impl Lease {
+    /// A lease is spent once less than half the life the hub granted it remains.
+    ///
+    /// Half of the hub's OWN number is not a magic duration: it carries no opinion about how
+    /// many seconds anything should take, it moves when the hub moves, and what it buys is a
+    /// stated guarantee — every object begins its transfer holding at least half a URL's
+    /// life, whatever that life happens to be. A hub that declares nothing leaves nothing to
+    /// judge, and then the mint window's own advance is the only bound on a URL's age.
+    fn spent(&self) -> bool {
+        self.lifetime
+            .is_some_and(|life| self.minted.elapsed() * 2 >= life)
+    }
+}
+
+/// The walk's URL supply: `hub::presign` called just ahead of the workers instead of once
+/// for the whole closure.
+///
+/// Two locks, and they are different questions. `held` is the map, taken for as long as a
+/// lookup; `minting` is the right to CALL, held across the network so that N streams
+/// arriving at the same exhausted window cost one presign rather than N — which is also
+/// what the hub wants, since it single-flights presign per rental.
+struct Leases<'a> {
+    client: &'a Client,
+    base: &'a str,
+    credential: &'a dyn CredentialProvider,
+    policy: &'a SourcePolicy,
+    deadline: Deadline,
+    ledger: &'a Ledger,
+    wanted: &'a [ObjectRef],
+    streams: usize,
+    held: Mutex<BTreeMap<String, Lease>>,
+    minting: Mutex<()>,
+}
+
+impl ObjectUrls for Leases<'_> {
+    fn url_for(&self, at: usize, object: &ObjectRef) -> Result<String> {
+        if let Some(url) = self.fresh(&object.sha256) {
+            return Ok(url);
+        }
+        let _minting = self.minting.lock().unwrap();
+        // Another stream may have minted this window while this one waited for the right
+        // to call. Asking again before calling is what makes one window cost one call.
+        if let Some(url) = self.fresh(&object.sha256) {
+            return Ok(url);
+        }
+        self.mint_from(at)?;
+        self.fresh(&object.sha256).ok_or_else(|| Refusal {
+            code: Code::HUB_REFUSED,
+            detail: format!(
+                "{}: the mint answered without leaving a usable URL for it — a URL whose \
+                 declared life is already spent when it is granted authorizes nothing",
+                object.id()
+            ),
+        })
+    }
+}
+
+impl Leases<'_> {
+    fn fresh(&self, digest: &str) -> Option<String> {
+        let held = self.held.lock().unwrap();
+        held.get(digest)
+            .filter(|lease| !lease.spent())
+            .map(|lease| lease.url.clone())
+    }
+
+    /// Mint from the walk's cursor forward: the object the caller has reached, and enough of
+    /// what follows that the streams behind it find their URLs already waiting.
+    ///
+    /// Objects still holding a fresh lease are skipped. `plan.wanted` is sorted unique by
+    /// digest, so any subsequence of it is still the sorted unique list presign requires —
+    /// no re-sorting, and no chance of asking for a digest twice.
+    ///
+    /// The call itself crosses the network to the hub, so it goes out on the pull's own
+    /// `Deadline` and teaches the same `Ledger` the object fetches teach: a mint that hangs
+    /// must be as visible to liveness as a stream that stops sending, and a cheap call that
+    /// hangs is still a hang.
+    fn mint_from(&self, at: usize) -> Result<()> {
+        let mut digests: Vec<String> = Vec::new();
+        let mut bytes = 0u64;
+        for object in &self.wanted[at..] {
+            let enough = digests.len() >= self.streams.max(1) && bytes >= MINT_AHEAD_BYTES;
+            if enough || digests.len() >= MAX_PRESIGN_DIGESTS {
+                break;
+            }
+            if self.fresh(&object.sha256).is_some() {
+                continue;
+            }
+            digests.push(object.sha256.clone());
+            bytes = bytes.saturating_add(object.length);
+        }
+        if digests.is_empty() {
+            return Ok(());
+        }
+        // Stamped BEFORE the call, so the call's own latency is spent out of the lease it
+        // is fetching rather than granted back to it.
+        let minted = Instant::now();
+        let answer = hub::presign(
+            self.client,
+            self.base,
+            &digests,
+            self.credential,
+            self.policy,
+            self.deadline,
+            self.ledger,
+        )?;
+        let mut held = self.held.lock().unwrap();
+        for (digest, url) in answer.urls {
+            held.insert(
+                digest,
+                Lease {
+                    url,
+                    minted,
+                    lifetime: answer.lifetime,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
 /// What the walk moved — counted, never estimated.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WalkOutcome {
@@ -265,7 +490,7 @@ pub struct WalkOutcome {
 pub fn fetch_wanted(
     store: &Store,
     plan: &FetchPlan,
-    urls: &BTreeMap<String, String>,
+    urls: &dyn ObjectUrls,
     policy: &SourcePolicy,
     credential: &dyn CredentialProvider,
     deadline: Deadline,
@@ -273,18 +498,10 @@ pub fn fetch_wanted(
     streams: usize,
     on_object: Option<ObjectObserver<'_>>,
 ) -> Result<WalkOutcome> {
-    for object in &plan.wanted {
-        if !urls.contains_key(&object.sha256) {
-            return refuse(
-                Code::TRANSFER_FAILED,
-                format!(
-                    "{}: wanted by the plan and no URL was minted for it — the grant set \
-                     covers the wanted set exactly",
-                    object.id()
-                ),
-            );
-        }
-    }
+    // Nothing is checked up front any more, because there is no up-front set to check. The
+    // invariant it proved — the grant set covers the wanted set exactly — is enforced per
+    // mint instead: presign authorizes every digest it was asked or refuses, never a silent
+    // subset, and a supplier with no URL for an object refuses in the same words.
     let streams = streams.clamp(1, 128).min(plan.wanted.len().max(1));
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
@@ -301,16 +518,10 @@ pub fn fetch_wanted(
                 let Some(object) = plan.wanted.get(at) else {
                     return;
                 };
+                let authorize = || urls.url_for(at, object);
                 let outcome = DeliveryGrant::mint(plan, object).and_then(|grant| {
-                    fetch_url(
-                        store,
-                        &grant,
-                        &urls[&object.sha256],
-                        policy,
-                        credential,
-                        deadline,
-                        ledger,
-                        None,
+                    fetch_authorized(
+                        store, &grant, &authorize, policy, credential, deadline, ledger, None,
                     )
                 });
                 match outcome {
@@ -403,11 +614,12 @@ pub struct PullReport {
 }
 
 /// Pull one hub checkpoint into a local store: closure, `FetchPlan::of` against the REAL
-/// store, presign for exactly `wanted`, the N-way walk, and the completion proof — a local
-/// walk over locally verified bytes, never the transfer's own success report.
+/// store, the N-way walk presigning `wanted` as it reaches it, and the completion proof — a
+/// local walk over locally verified bytes, never the transfer's own success report.
 ///
-/// A warm store asks the hub one question (`closure`) and moves nothing: no presign call
-/// is made when `wanted` is empty.
+/// A warm store asks the hub one question (`closure`) and moves nothing: no presign call is
+/// made when `wanted` is empty, and a URL is never minted for an object the walk does not
+/// go on to fetch.
 pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     let ledger = Ledger::with_resolution(std::time::Duration::from_secs_f64(
         request.sample_seconds.clamp(0.001, 3600.0),
@@ -460,22 +672,22 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         ..Default::default()
     };
     if !plan.wanted.is_empty() {
-        let digests: Vec<String> = plan.wanted.iter().map(|o| o.sha256.clone()).collect();
-        let urls: BTreeMap<String, String> = hub::presign(
+        let leases = Leases {
             client,
-            request.base,
-            &digests,
-            request.credential,
-            &policy,
-            request.deadline,
-            &ledger,
-        )?
-        .into_iter()
-        .collect();
+            base: request.base,
+            credential: request.credential,
+            policy: &policy,
+            deadline: request.deadline,
+            ledger: &ledger,
+            wanted: &plan.wanted,
+            streams: request.streams.clamp(1, 128),
+            held: Mutex::new(BTreeMap::new()),
+            minting: Mutex::new(()),
+        };
         let walked = fetch_wanted(
             request.store,
             &plan,
-            &urls,
+            &leases,
             &policy,
             request.credential,
             request.deadline,
