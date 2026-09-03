@@ -504,6 +504,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		line, problem := c.opt.RentalFleet()
 		if problem != nil {
 			unguard()
+			if c.deferUnavailable(req, problem) {
+				return
+			}
 			c.failQueued(req.ID, problem)
 			return
 		}
@@ -515,6 +518,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		decision, after, problem := c.opt.AcquireManagedRental(req)
 		if problem != nil {
 			unguard()
+			if c.deferUnavailable(req, problem) {
+				return
+			}
 			c.failQueued(req.ID, problem)
 			return
 		}
@@ -625,6 +631,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		spec, planID, e := c.resolveFor(req)
 		if e != nil {
 			done()
+			if c.deferUnavailable(req, e) {
+				return
+			}
 			c.failQueued(req.ID, autoRentalGate(req, e))
 			return
 		}
@@ -653,11 +662,18 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 				c.logf("%s remains QUEUED for the local device envelope: %s", req.ID, e.Message)
 				return
 			}
+			if c.deferUnavailable(req, e) {
+				return
+			}
 			c.failQueued(req.ID, autoRentalGate(req, e))
 			return
 		}
 		c.logf("%s: %s is %s for the queued request", req.Package, instance, change)
 		if e := c.EnsurePlacementReady(instance, req.PlanID); e != nil {
+			if c.deferUnavailable(req, e) {
+				done()
+				return
+			}
 			// AND THE WORKER GOES. A process that cannot make its binding resident still
 			// holds a device grant, and `selectOrStart` returns early whenever a worker
 			// for the package exists — so leaving it would hang the NEXT request behind a
@@ -683,6 +699,18 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		// for a plan the head does not need.
 		c.reviveQueue()
 	}()
+}
+
+func (c *Orchestrator) deferUnavailable(req records.Request, problem *exit.Error) bool {
+	if problem == nil || problem.Code != exit.Unavailable {
+		return false
+	}
+	position := c.QueuePosition(req.ID)
+	if position == 0 {
+		return false
+	}
+	c.park(req, position-1, waitFacts{}, problem.Message)
+	return true
 }
 
 func autoRentalGate(_ records.Request, cause *exit.Error) *exit.Error { return cause }
