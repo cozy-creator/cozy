@@ -131,11 +131,11 @@ func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec
 	}
 	spelled := func(raw []byte) string { value, _ := canonical.Spell(raw); return value }
 	environment := map[string]canonical.Value{
-		"wheels": []canonical.Value{},
+		"local_wheels": []canonical.Value{},
 	}
 	environmentIdentity := map[string]canonical.Value{
-		"format": "cozy.worker.v1.Environment/1",
-		"wheels": environment["wheels"],
+		"format":       "cozy.worker.v1.Environment/1",
+		"local_wheels": environment["local_wheels"],
 	}
 	environmentBytes, _ := canonical.Write(environmentIdentity)
 	entrypointIdentity := map[string]canonical.Value{
@@ -153,10 +153,7 @@ func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec
 	setBytes, setDigest, _ := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{{
 		PlacementId: "plc-fake-" + name,
 		PackageMode: &pb.Placement_Package{Package: &pb.PackageSelection{
-			Package: "fake/" + name, Release: "1.0.0",
-			ProjectWheel: &pb.WheelFact{Ref: ref("fake-project-wheel"), Distribution: "fake-" + name,
-				Version: "1.0.0", Filename: "fake_" + name + "-1.0.0-py3-none-any.whl",
-				ImportRoots: []string{"fake_" + name}, Tags: []string{"py3-none-any"}}}},
+			Package: "fake/" + name, Release: "1.0.0"}},
 		EnvironmentDigest: canonical.Digest(environmentBytes),
 		PackageInterface:  ref("fake-interface"), BindingsDigest: canonical.Digest(bindingsBytes),
 		Entrypoints: []*pb.Entrypoint{{Name: "fake", EntrypointBindingDigest: entrypointDigest}},

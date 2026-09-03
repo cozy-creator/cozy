@@ -433,15 +433,6 @@ func PackageInterfacePath(installDir string) string {
 	return filepath.Join(installDir, "documents", PackageInterfaceFile)
 }
 
-// StagedPackageInterfacePath is where prepare-package reads the interface: the runtime's
-// PACKAGE_INTERFACE row demands exactly `<artifact-cache>/sets/<set>/metadata/<file>`
-// (cozy-runtime package_interface.FILENAME = "metadata/package-interface.json"), the one
-// download row whose filename keeps a directory. `documents/` remains the launch-read copy.
-func StagedPackageInterfacePath(installDir string) string {
-	return filepath.Join(installDir, "artifact-cache", "sets", "package",
-		"metadata", PackageInterfaceFile)
-}
-
 // ReadPackageInterface reads the private package interface and joins it to the install record.
 func ReadPackageInterface(path, expectDigest string) (*PackageInterface, *exit.Error) {
 	data, err := os.ReadFile(path)

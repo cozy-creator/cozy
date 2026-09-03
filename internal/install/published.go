@@ -2,7 +2,6 @@ package install
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/json"
 	"io"
 	"os"
@@ -19,18 +18,12 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// PublishedPreparationFile retains the bounded exact wheel inventory already verified
-// during code installation. It is not an identity document or executable authority:
-// Runtime re-verifies every wheel and authors the exact PlacementSet only after an
-// invocation selects model Manifests. A fixed file avoids rediscovering install files.
-const PublishedPreparationFile = "package-preparation.json"
-
-type publishedPreparation struct {
-	Package      string           `json:"package"`
-	Release      string           `json:"release"`
-	ProjectWheel PublishedWheel   `json:"project_wheel"`
-	Wheels       []PublishedWheel `json:"wheels"`
-}
+// LockedRequirementsFile is the release's exact export — index directives plus
+// hash-pinned rows — written at environment materialization and re-consumed by Runtime
+// preparation, including a later model selection. It replaces the retired
+// package-preparation.json wheel inventory (wire 30: wheel facts stop being install
+// inputs; the export's hashes are the authority).
+const LockedRequirementsFile = "locked-requirements.txt"
 
 func hasServingModelSlots(packageInterface *launch.PackageInterface) bool {
 	for i := range packageInterface.Entrypoints {
@@ -86,35 +79,12 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 		return nil, empty, "", nil, exit.Internalf("cannot retain exact package interface: %s", err)
 	}
 	cache := filepath.Join(installDir, "artifact-cache")
-	setDir := filepath.Join(cache, "sets", "package")
-	if err := os.MkdirAll(setDir, 0o700); err != nil {
-		return nil, empty, "", nil, exit.Internalf("cannot create package wheel cache: %s", err)
-	}
-	// The set-rooted interface copy: prepare-package admits the PACKAGE_INTERFACE row only
-	// at `<set>/metadata/package-interface.json`; the documents/ copy above serves launch.
-	staged := launch.StagedPackageInterfacePath(installDir)
-	if err := os.MkdirAll(filepath.Dir(staged), 0o700); err != nil {
-		return nil, empty, "", nil, exit.Internalf("cannot create the staged interface directory: %s", err)
-	}
-	if err := os.WriteFile(staged, published.Selection.PackageInterface.Bytes, 0o600); err != nil {
-		return nil, empty, "", nil, exit.Internalf("cannot stage the exact package interface: %s", err)
-	}
-	if problem := stagePublishedWheel(cache, setDir, &published.ProjectWheel); problem != nil {
-		return nil, empty, "", nil, problem
-	}
-	for index := range published.Wheels {
-		if problem := stagePublishedWheel(cache, setDir, &published.Wheels[index]); problem != nil {
-			return nil, empty, "", nil, problem
-		}
-	}
-	for index := range published.LocalWheels {
-		if problem := stagePublishedWheel(cache, setDir, &published.LocalWheels[index]); problem != nil {
-			return nil, empty, "", nil, problem
-		}
+	if err := os.MkdirAll(cache, 0o700); err != nil {
+		return nil, empty, "", nil, exit.Internalf("cannot create package artifact cache: %s", err)
 	}
 	venvDir := filepath.Join(installDir, "venv")
 	environment, problem := MaterializePublishedEnvironment(sourceDir, venvDir, l.Companions,
-		published.ProjectWheel, published.Wheels, published.LocalWheels)
+		published)
 	if problem != nil {
 		return nil, empty, "", nil, problem
 	}
@@ -134,27 +104,10 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 		return nil, empty, "", nil, problem
 	}
 	deferredModels := len(published.Models) == 0 && hasServingModelSlots(packageInterface)
-	if deferredModels {
-		inventory, err := json.Marshal(publishedPreparation{Package: published.Package,
-			Release:      published.Release,
-			ProjectWheel: published.ProjectWheel, Wheels: published.Wheels})
-		if err != nil {
-			return nil, empty, "", nil, exit.Internalf("cannot encode package preparation: %s", err)
-		}
-		if err := os.WriteFile(filepath.Join(installDir, PublishedPreparationFile), inventory, 0o400); err != nil {
-			return nil, empty, "", nil, exit.Internalf(
-				"cannot retain code-only package preparation: %s", err)
-		}
-		if !hasWeightlessCallable(packageInterface) {
-			return packageInterface, empty, runtimeBin, environment, nil
-		}
-	}
-
-	for _, wheel := range published.LocalWheels {
-		if err := os.Remove(wheel.Path); err != nil {
-			return nil, empty, "", nil, exit.Internalf(
-				"cannot remove local materialization-wheel view: %s", err)
-		}
+	if deferredModels && !hasWeightlessCallable(packageInterface) {
+		// The retained locked-requirements export is the reusable code-only preparation;
+		// a later model selection re-runs preparation from it.
+		return packageInterface, empty, runtimeBin, environment, nil
 	}
 	answer, problem := preparePackageSet(l, installDir, published)
 	if problem != nil {
@@ -180,41 +133,16 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 	}
 	prepared := set.List("placements")[0]
 	fact := prepared.Sub("package")
-	if fact.Str("package") != published.Package || fact.Str("release") != published.Release ||
-		fact.Sub("project_wheel").Sub("ref").Str("digest") != published.ProjectWheel.Digest {
+	if fact.Str("package") != published.Package || fact.Str("release") != published.Release {
 		return nil, empty, "", nil, exit.Named(exit.Conflict, "package_placement_mismatch",
-			"cozy-runtime prepared different package bytes than Creator downloaded")
+			"cozy-runtime prepared a different package identity than Creator installed")
 	}
 	placementPath := filepath.Join(cache, strings.TrimPrefix(answer.PlacementSet.Digest, "sha256:"))
 	if err := os.WriteFile(placementPath, answer.PlacementSet.Bytes, 0o600); err != nil {
 		return nil, empty, "", nil, exit.Internalf("cannot store prepared package placement: %s", err)
 	}
-	if deferredModels {
-		// Keep the bounded wheel views for a modeled invocation. This package also has a
-		// weightless callable, so its code-only PlacementSet remains immediately runnable.
-		return packageInterface, answer.PlacementSet, runtimeBin, environment, nil
-	}
-	selectedDependencies := map[string]bool{}
-	for _, wheel := range prepared.Sub("environment").List("wheels") {
-		selectedDependencies[wheel.Sub("ref").Str("digest")] = true
-	}
-	if err := os.Remove(published.ProjectWheel.Path); err != nil {
-		return nil, empty, "", nil, exit.Internalf("cannot remove prepared project-wheel view: %s", err)
-	}
-	for _, wheel := range published.Wheels {
-		if runtimePreparationDependency(wheel) && !selectedDependencies[wheel.Digest] {
-			return nil, empty, "", nil, exit.Named(exit.Structural,
-				"package_placement_incomplete",
-				"cozy-runtime omitted published dependency %s from the local package placement",
-				wheel.Filename)
-		}
-		if err := os.Remove(wheel.Path); err != nil {
-			return nil, empty, "", nil, exit.Internalf(
-				"cannot remove prepared dependency-wheel view: %s", err)
-		}
-	}
-	// The placement records the exact wheel subset used by a rental base. The local
-	// environment receipt above records the complete frozen closure this machine runs.
+	// The placement binds the release's locked-requirements export; the local environment
+	// receipt above records the complete frozen closure this machine runs.
 	return packageInterface, answer.PlacementSet, runtimeBin, environment, nil
 }
 
@@ -259,56 +187,10 @@ func PreparePublishedSelection(l home.Layout, inst records.PackageInstall,
 			"install %s has no complete published model selection", inst.ID).
 			WithRemedy("select one exact model for every callable slot")
 	}
-	seedBytes, err := os.ReadFile(filepath.Join(inst.Dir, PublishedPreparationFile))
-	if err != nil {
+	if _, err := os.Stat(filepath.Join(inst.Dir, LockedRequirementsFile)); err != nil {
 		return empty, exit.Named(exit.Conflict, "package_code_preparation_missing",
-			"%s was installed without reusable code-only preparation: %s", inst.Package, err).
+			"%s was installed without its locked-requirements export: %s", inst.Package, err).
 			WithRemedy("reinstall the package; model weights are not required for reinstall")
-	}
-	var inventory publishedPreparation
-	decoder := json.NewDecoder(bytes.NewReader(seedBytes))
-	decoder.DisallowUnknownFields()
-	decodeErr := decoder.Decode(&inventory)
-	var trailing any
-	if decodeErr == nil {
-		decodeErr = decoder.Decode(&trailing)
-	}
-	if decodeErr != io.EOF || inventory.Package != inst.Package ||
-		inventory.Release != inst.Version ||
-		len(inventory.Wheels) > 128 {
-		return empty, exit.Named(exit.Conflict, "package_code_preparation_changed",
-			"%s code-only preparation does not match install %s", inst.Package, inst.ID)
-	}
-	cache := filepath.Join(inst.Dir, "artifact-cache")
-	setDir := filepath.Join(cache, "sets", "package")
-	wheelFrom := func(wheel PublishedWheel) (PublishedWheel, *exit.Error) {
-		digest, digestErr := canonical.Raw(wheel.Digest)
-		path := filepath.Join(setDir, wheel.Filename)
-		if digestErr != nil || len(digest) != 32 || wheel.Filename == "" ||
-			filepath.Base(wheel.Filename) != wheel.Filename || wheel.Length <= 0 ||
-			wheel.Path != path {
-			return PublishedWheel{}, exit.Named(exit.Conflict,
-				"package_code_preparation_invalid", "prepared package wheel is incomplete")
-		}
-		info, statErr := os.Stat(path)
-		if statErr != nil || !info.Mode().IsRegular() || info.Size() != wheel.Length {
-			return PublishedWheel{}, exit.Named(exit.Conflict,
-				"package_code_wheel_missing", "prepared wheel %s is absent or changed", wheel.Filename).
-				WithRemedy("reinstall the package code; no model download is required")
-		}
-		return wheel, nil
-	}
-	project, problem := wheelFrom(inventory.ProjectWheel)
-	if problem != nil {
-		return empty, problem
-	}
-	dependencies := make([]PublishedWheel, 0, len(inventory.Wheels))
-	for _, value := range inventory.Wheels {
-		wheel, problem := wheelFrom(value)
-		if problem != nil {
-			return empty, problem
-		}
-		dependencies = append(dependencies, wheel)
 	}
 	packageInterfaceBytes, err := os.ReadFile(launch.PackageInterfacePath(inst.Dir))
 	if err != nil {
@@ -320,7 +202,6 @@ func PreparePublishedSelection(l home.Layout, inst records.PackageInstall,
 			"installed package interface does not match %s", inst.PackageInterface)
 	}
 	published := &PublishedSource{Package: inst.Package, Release: inst.Version,
-		ProjectWheel: project, Wheels: dependencies,
 		Models: append([]PublishedModel(nil), models...), Selection: Selection{
 			PackageInterface: ExactDocument{Bytes: packageInterfaceBytes, Digest: packageInterfaceDigest,
 				Length: int64(len(packageInterfaceBytes))},
@@ -385,15 +266,9 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 		"--artifact-store", config.Frozen().TensorFSRoot,
 		"--package", published.Package,
 		"--release", published.Release,
-		"--package-interface", launch.StagedPackageInterfacePath(installDir),
-		"--project-wheel", published.ProjectWheel.Path,
+		"--locked-requirements", filepath.Join(installDir, LockedRequirementsFile),
 		"--artifact-cache", filepath.Join(installDir, "artifact-cache"),
 		"--environment-python", home.VenvPython(filepath.Join(installDir, "venv")),
-	}
-	for _, wheel := range published.Wheels {
-		if runtimePreparationDependency(wheel) {
-			args = append(args, "--dependency-wheel", wheel.Path)
-		}
 	}
 	for _, model := range published.Models {
 		raw, err := json.Marshal(model)
@@ -428,70 +303,6 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 			"cozy-runtime returned an invalid package preparation result")
 	}
 	return answer, nil
-}
-
-// The package venv runs the exact cozy-runtime wheel selected by uv.lock. Older releases may
-// still carry it as a dependency wheel; passing it back to its own prepare-package command as
-// package-owned would shadow the selected worker image. New releases carry it only in the local
-// materialization lane. All ordinary dependency wheels remain explicit package inputs.
-func runtimePreparationDependency(wheel PublishedWheel) bool {
-	return wheel.Distribution != "cozy-runtime"
-}
-
-func stagePublishedWheel(cache, setDir string, wheel *PublishedWheel) *exit.Error {
-	digest, err := canonical.Raw(wheel.Digest)
-	if err != nil || len(digest) != 32 || wheel.Length <= 0 ||
-		filepath.Base(wheel.Filename) != wheel.Filename || filepath.Base(wheel.Path) != wheel.Filename {
-		return exit.Named(exit.Structural, "package_wheel_invalid",
-			"downloaded package wheel metadata is invalid")
-	}
-	target := filepath.Join(cache, strings.TrimPrefix(wheel.Digest, "sha256:"))
-	if problem := copyPublishedWheel(wheel.Path, target, digest, wheel.Length); problem != nil {
-		return problem
-	}
-	view := filepath.Join(setDir, wheel.Filename)
-	if err := os.Link(target, view); err != nil {
-		if problem := copyPublishedWheel(target, view, digest, wheel.Length); problem != nil {
-			return problem
-		}
-	}
-	if err := os.Chmod(target, 0o400); err != nil {
-		return exit.Internalf("cannot protect downloaded package wheel %s: %s", wheel.Filename, err)
-	}
-	if err := os.Chmod(view, 0o400); err != nil {
-		return exit.Internalf("cannot protect staged package wheel %s: %s", wheel.Filename, err)
-	}
-	wheel.Path = view
-	return nil
-}
-
-func copyPublishedWheel(source, target string, digest []byte, length int64) *exit.Error {
-	input, err := os.Open(source)
-	if err != nil {
-		return exit.Named(exit.Conflict, "package_wheel_changed",
-			"downloaded package wheel changed before installation")
-	}
-	defer input.Close()
-	info, err := input.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() != length {
-		return exit.Named(exit.Conflict, "package_wheel_changed",
-			"downloaded package wheel changed before installation")
-	}
-	output, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return exit.Internalf("cannot retain downloaded package wheel: %s", err)
-	}
-	measured := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(output, measured), input)
-	syncErr := output.Sync()
-	closeErr := output.Close()
-	if copyErr != nil || syncErr != nil || closeErr != nil || written != length ||
-		!bytes.Equal(measured.Sum(nil), digest) {
-		_ = os.Remove(target)
-		return exit.Named(exit.Conflict, "package_wheel_changed",
-			"downloaded package wheel changed before installation")
-	}
-	return nil
 }
 
 func validRuntimeExact(value ExactDocument) bool {
