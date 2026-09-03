@@ -241,16 +241,6 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 	return req, nil
 }
 
-// statusOf is what this owner last recorded about one member.
-func statusOf(statuses []records.ModelTransferSourceStatus, member string) string {
-	for _, status := range statuses {
-		if status.Member == member {
-			return status.State
-		}
-	}
-	return ""
-}
-
 func transferSourceBytes(files []records.ModelTransferSourceFile) int64 {
 	var total int64
 	for _, file := range files {
@@ -351,8 +341,10 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		}
 		allVerified := len(statuses) == len(expected)
 		revisions := make(map[string]int64, len(statuses))
+		verified := make(map[string]bool, len(statuses))
 		for _, status := range statuses {
 			revisions[status.Member] = status.CapabilityRevision
+			verified[status.Member] = status.State == "verified"
 			allVerified = allVerified && status.State == "verified"
 		}
 		// The frames go out in ONE pass, in member order, and a preparation sent in the
@@ -361,7 +353,7 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		stream := fmt.Sprintf("%s/%d", session.bootID, session.epoch)
 		first := restated != stream
 		for _, member := range members {
-			if !first && revisions[member] != 0 && statusOf(statuses, member) == "verified" {
+			if !first && verified[member] {
 				continue
 			}
 			file := expected[member]
