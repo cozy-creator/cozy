@@ -237,7 +237,7 @@ type packageSelection struct {
 func (g packageSelection) contentKey() string {
 	var sb strings.Builder
 	for _, row := range g.packages {
-		sb.WriteString("p\x00" + row.Package + "\x00" + row.Release + "\x00" + row.ReleaseDigest + "\x01")
+		sb.WriteString("p\x00" + row.Package + "\x00" + row.Release + "\x01")
 	}
 	for _, row := range g.models {
 		sb.WriteString("m\x00" + row.Package + "\x00" + row.Slot + "\x00" + row.Model + "\x00" +
