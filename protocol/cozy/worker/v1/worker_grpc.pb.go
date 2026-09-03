@@ -363,10 +363,12 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
-// service on its external listener. Runtime receives logical refs, hub-known release facts, and
-// (local packages only) verified local wheel paths: no presigned URL, delegation signature,
-// worker TLS credential, or index bearer. The anonymous public index directives inside
-// locked_requirements are the one origin that crosses — an https URL, never a credential.
+// service on its external listener. Runtime receives logical refs, hub-known release facts,
+// (local packages only) verified local wheel paths, and — from minor 32 — BOTH halves of the
+// signed download delegation, because the party that resolves a model's closure against the hub
+// is now Runtime's own TensorFS: no presigned URL, worker TLS credential, or index bearer. The
+// anonymous public index directives inside locked_requirements are the other origin that
+// crosses — an https URL, never a credential.
 type RuntimePreparationClient interface {
 	CheckPackageSetCompatibility(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
@@ -438,10 +440,12 @@ func (c *runtimePreparationClient) PreparePrivatePlacement(ctx context.Context, 
 // for forward compatibility.
 //
 // Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
-// service on its external listener. Runtime receives logical refs, hub-known release facts, and
-// (local packages only) verified local wheel paths: no presigned URL, delegation signature,
-// worker TLS credential, or index bearer. The anonymous public index directives inside
-// locked_requirements are the one origin that crosses — an https URL, never a credential.
+// service on its external listener. Runtime receives logical refs, hub-known release facts,
+// (local packages only) verified local wheel paths, and — from minor 32 — BOTH halves of the
+// signed download delegation, because the party that resolves a model's closure against the hub
+// is now Runtime's own TensorFS: no presigned URL, worker TLS credential, or index bearer. The
+// anonymous public index directives inside locked_requirements are the other origin that
+// crosses — an https URL, never a credential.
 type RuntimePreparationServer interface {
 	CheckPackageSetCompatibility(context.Context, *PreparePackageSetRequest) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error)
