@@ -66,7 +66,7 @@ run down
 check "down stops the explicit daemon" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -Eq 'daemon: +stopped' && echo 1 || echo 0)" "$OUT"
 
 run run list --json
-check "run list can auto-start the same daemon" "$([ "$CODE" = 0 ] && [ -f "$COZY_HOME/daemon.lock" ] && [ -f "$COZY_HOME/client.cred" ] && echo 1 || echo 0)" "$OUT"
+check "run list can auto-start the same daemon" "$([ "$CODE" = 0 ] && grep -q '^token=' "$COZY_HOME/daemon.lock" && echo 1 || echo 0)" "$OUT"
 check "JSON success is domain-shaped without renderer scaffolding" "$(printf '%s' "$OUT" | grep -q '"invocations":\[\]' && ! printf '%s' "$OUT" | grep -Eq '"(ok|kind|data|fields|rows|count|aggregates)"' && echo 1 || echo 0)" "$OUT"
 
 run unload
