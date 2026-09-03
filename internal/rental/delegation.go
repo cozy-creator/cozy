@@ -77,9 +77,10 @@ func SignDownloadDelegation(l home.Layout, connection *orchestrator.WorkerConnec
 			strings.TrimSpace(row.Release) != row.Release || row.Release == "" ||
 			strings.TrimSpace(row.Package) != row.Package || !packageSelected ||
 			strings.TrimSpace(row.Slot) != row.Slot || row.Slot == "" ||
+			strings.TrimSpace(row.Lane) != row.Lane || row.Lane == "" ||
 			digestErr != nil || key <= prior {
 			return nil, nil, exit.Named(exit.Validation, "rental.delegation_model_invalid",
-				"download models must be complete, unique logical refs with exact manifests")
+				"download models must be complete, unique logical refs with exact lanes and manifests")
 		}
 		prior = key
 	}

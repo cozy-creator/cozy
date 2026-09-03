@@ -88,12 +88,20 @@ func TestCoTenantPackagesPreparePerPackage(t *testing.T) {
 	o := hostOwner(t, "podhost-cotenant", rentalWiring(connection, private))
 
 	submit := func(pkg, idem string) string {
-		requestID, _, e := o.c.Submit(orchestrator.Submission{
+		submission := orchestrator.Submission{
 			IdemKey: idem, Package: pkg, Entrypoint: "tile", PlanID: podPlanID(pkg),
 			Release: "1.0.0",
 			Payload: []byte(`{"size":16}`), Outputs: []string{"image"},
 			Worker: podRental, Rental: true, RentalRequired: true,
-		})
+		}
+		if pkg == "acme/beta" {
+			submission.Models = []orchestrator.ModelRef{{
+				Package: pkg, Slot: "tile.models.model", Model: "paul/anima",
+				Release: "1.0.0", Lane: "bf16", Manifest: "sha256:" + strings.Repeat("43", 32),
+				ManifestLength: 2048,
+			}}
+		}
+		requestID, _, e := o.c.Submit(submission)
 		fatal(t, e)
 		return requestID
 	}
@@ -136,6 +144,12 @@ func TestCoTenantPackagesPreparePerPackage(t *testing.T) {
 					"reused while they live, or the serving placement_id changes with the credential", pkg)
 			}
 		}
+	}
+	beta, err := canonical.Read(delegations["acme/beta"][0], &pb.DownloadDelegation{})
+	must(t, err)
+	models := beta.List("models")
+	if len(models) != 1 || models[0].Str("lane") != "bf16" {
+		t.Fatalf("beta's signed delegation lost the selected model lane: %v", models)
 	}
 	united := placementsOf(t, pod.desired[len(pod.desired)-1])
 	if len(united) != 2 {
@@ -190,7 +204,7 @@ func TestRun146ShapePreparesClean(t *testing.T) {
 	fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
 		Package: "paul/anima", Release: "1.2.0"}},
 		[]*pb.DownloadModelRef{{Package: "paul/anima", Slot: "unet", Model: "paul/anima-weights",
-			Release: "1.0.0", Manifest: "sha256:" + strings.Repeat("43", 32)}}))
+			Release: "1.0.0", Lane: "bf16", Manifest: "sha256:" + strings.Repeat("43", 32)}}))
 	waitUntil(t, "the united two-package placement_set", func() bool {
 		pod.mu.Lock()
 		defer pod.mu.Unlock()

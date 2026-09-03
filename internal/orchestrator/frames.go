@@ -242,7 +242,7 @@ func (g packageSelection) contentKey() string {
 	}
 	for _, row := range g.models {
 		sb.WriteString("m\x00" + row.Package + "\x00" + row.Slot + "\x00" + row.Model + "\x00" +
-			row.Release + "\x00" + row.Manifest + "\x01")
+			row.Release + "\x00" + row.Lane + "\x00" + row.Manifest + "\x01")
 	}
 	return sb.String()
 }
@@ -375,7 +375,7 @@ func cloneModelRefs(in []*pb.DownloadModelRef) []*pb.DownloadModelRef {
 		if ref != nil {
 			out = append(out, &pb.DownloadModelRef{
 				Manifest: ref.Manifest, Model: ref.Model, Release: ref.Release,
-				Package: ref.Package, Slot: ref.Slot,
+				Package: ref.Package, Slot: ref.Slot, Lane: ref.Lane,
 			})
 		}
 	}
