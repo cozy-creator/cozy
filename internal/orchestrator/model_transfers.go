@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"context"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -66,6 +65,10 @@ func (c *Orchestrator) runModelPassThrough(req records.Request) {
 	c.forgetTransferProgress(req.ID)
 }
 
+// weightsGrantExpired is the pod's name for the one weights-transfer refusal a freshly
+// signed grant answers (tensorhub internal/workerhost/weights.go).
+const weightsGrantExpired = "weights_grant_expired"
+
 func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 	weights records.ModelTransferWeights, operationID string,
 	decisions []WeightsTransferDecision,
@@ -103,7 +106,18 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 				continue
 			}
 			if object.State == "failed" {
-				if strings.Contains(strings.ToLower(object.SafeCode), "expired") {
+				// A grant that would not spend is not a verdict about the object: this
+				// owner mints them per batch of <= 128 objects under a 900 s TTL, and a
+				// batch that outran that clock needs a NEW grant, not a dead transfer.
+				//
+				// The test used to be `strings.Contains(SafeCode, "expired")` against a
+				// pod that hardcoded the literal `weights_transfer_failed` for every
+				// cause, so this branch was unreachable code: one refused object PUT
+				// terminally failed all four checkpoints — about 1,280 objects of
+				// exposure — after hours of compute. The pod now names the class
+				// (tensorhub `weights_grant_expired`) and, for exactly this class, leaves
+				// no durable failure behind, so a re-issue can actually be spent.
+				if object.SafeCode == weightsGrantExpired {
 					return exit.Named(exit.Unavailable, object.SafeCode,
 						"worker weights transfer %s needs a refreshed grant: %s",
 						object.ObjectID, object.SafeDetail)
@@ -226,6 +240,16 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 	return req, nil
 }
 
+// statusOf is what this owner last recorded about one member.
+func statusOf(statuses []records.ModelTransferSourceStatus, member string) string {
+	for _, status := range statuses {
+		if status.Member == member {
+			return status.State
+		}
+	}
+	return ""
+}
+
 func transferSourceBytes(files []records.ModelTransferSourceFile) int64 {
 	var total int64
 	for _, file := range files {
@@ -277,7 +301,20 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		return nil, exit.Named(exit.Conflict, "model_transfer.source_capability_incomplete",
 			"refreshed provider access returned %d of %d selected files", len(byMember), len(expected))
 	}
+	members := make([]string, 0, len(expected))
+	for member := range expected {
+		members = append(members, member)
+	}
+	sort.Strings(members)
 	asked := false
+	// restated names the control stream this owner has already stated its WHOLE selection
+	// to. The pod's memory of a transfer is its TensorFS Store, not a journal: it indexes
+	// what it proved by object, and a boot that lost that index answers a re-ask from the
+	// store itself, `held`, moving nothing. So the selection is restated once per control
+	// stream rather than only for members this owner has not yet seen verified — otherwise
+	// a pod that restarted under a live rental is asked to prepare over a selection it was
+	// never told about, and the transfer dies naming files nobody named to it.
+	restated := uint64(0)
 	for {
 		transfer, problem := c.opt.Store.ModelTransferOf(req.ID)
 		if problem != nil {
@@ -308,21 +345,36 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 			return nil, problem
 		}
 		allVerified := len(statuses) == len(expected)
+		revisions := make(map[string]int64, len(statuses))
 		for _, status := range statuses {
-			file := expected[status.Member]
+			revisions[status.Member] = status.CapabilityRevision
 			allVerified = allVerified && status.State == "verified"
-			if status.State == "verified" {
+		}
+		// The frames go out in ONE pass, in member order, and a preparation sent in the
+		// same pass is read after all of them: the pod registers every member off its
+		// control read loop before it considers a preparation for the same operation.
+		first := restated != session.epoch
+		for _, member := range members {
+			if !first && revisions[member] != 0 && statusOf(statuses, member) == "verified" {
 				continue
 			}
-			access := byMember[status.Member]
-			request := &pb.ModelSourceFileRequest{RecordOwnerEpoch: recordOwnerEpoch,
-				ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
-				OperationId: req.ID, SourceSelectionDigest: selection, Member: status.Member,
-				ObjectId: "sha256:" + file.SHA256, Length: uint64(file.Length),
-				Provider: access.Provider, Url: access.URL, ExpiresAtUnix: access.ExpiresAtUnix,
-				CapabilityRevision: uint64(status.CapabilityRevision + 1)}
+			file := expected[member]
+			access := byMember[member]
 			session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourceFileRequest{
-				ModelSourceFileRequest: request}})
+				ModelSourceFileRequest: &pb.ModelSourceFileRequest{
+					RecordOwnerEpoch: recordOwnerEpoch,
+					ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
+					OperationId: req.ID, SourceSelectionDigest: selection, Member: member,
+					ObjectId: "sha256:" + file.SHA256, Length: uint64(file.Length),
+					Provider: access.Provider, Url: access.URL, ExpiresAtUnix: access.ExpiresAtUnix,
+					CapabilityRevision: uint64(revisions[member] + 1)}}})
+		}
+		if first {
+			restated = session.epoch
+			c.logf("model transfer %s: stating all %d selected source file(s) to %s on "+
+				"control stream %d; a member this pod already holds is answered from its "+
+				"TensorFS store and moves nothing",
+				req.ID, len(members), session.instanceID, session.epoch)
 		}
 		if allVerified {
 			if !asked {
