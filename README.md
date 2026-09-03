@@ -117,6 +117,18 @@ store = tensorfs.Store.open()
 other = tensorfs.Store.open("/srv/tensorfs")
 ```
 
+Move a stopped Store into the new home once, on the same filesystem:
+
+```bash
+tfs home migrate ~/.cozy/cas
+# or: tfs home migrate /old/store --to /var/lib/tensorfs
+```
+
+The destination must not exist. TensorFS refuses live holders and cross-filesystem moves, performs
+one atomic rename, verifies that every filesystem entry retained its device, inode, and mtime, and
+leaves no redirect or fallback at the old path. The existing verification catalog therefore opens
+without rehashing payloads.
+
 ## Build and test
 
 The native wheel is `cp312-abi3`, so CPython 3.12 is the floor and every later CPython loads
