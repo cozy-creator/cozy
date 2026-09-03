@@ -692,7 +692,7 @@ fn execute_prepared(store: &Store, operation: &str, prepared: &Prepared) -> Resu
     )?;
     if outcome.header.tensor_schema_digest() != predicted {
         return refuse(
-            Code::TOPOLOGY_MISMATCH,
+            Code::TENSOR_SCHEMA_MISMATCH,
             "source plan and executed tensor schema differ",
         );
     }

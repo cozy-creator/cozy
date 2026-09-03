@@ -115,7 +115,7 @@ codes![
     UNREGISTERED_FINGERPRINT,
     AMBIGUOUS_CLASSIFICATION,
     PROFILE_REQUIRED,
-    TOPOLOGY_MISMATCH,
+    TENSOR_SCHEMA_MISMATCH,
     DIALECT_MISMATCH,
     // ingest border: conversion
     CONVERTS_NOTHING,
@@ -149,19 +149,15 @@ codes![
     PLATFORM_UNSUPPORTED,
     PROJECTION_WEIGHT_PATH,
     BLOB_NOT_RETAINED,
-    // the layout plane: check_compatibility (tfs-009)
+    // request-time fit
     MISSING_COMPONENT,
     EXTRA_COMPONENT,
     EXTRA_TENSOR,
     UNCLASSIFIED_EXTRAS,
-    // the layout plane: Stamp and the hermetic verifier (tfs-009)
+    // Stamp and the hermetic verifier
     STAMP_MISMATCH,
     EVIDENCE_NOT_RESIDENT,
     VERIFIER_OUTPUT_INCOMPLETE,
-    // the layout plane: hub grading (tfs-009)
-    ROUND_TRIP_LOSSY,
-    UNREGISTERED_CONVERSION,
-    PARTIAL_MISMATCH_SET,
     // roots, holds and GC (tfs-006)
     LOCK_CONTENDED,
     ROOT_GENERATION,

@@ -1,4 +1,4 @@
 doc: machine_capability
 expect: ok
-id: sha256:f752e85f962d1372b2eaaf5076769c40fd157e372290a9639d5206bed4e2f224
-note: ADMITTED: the implementation and the exact vector set it passed bit-for-bit
+id: sha256:8b2353557c2770edb3c728fa9293fcd3e630322e05c59040197f452171309beb
+note: qualified encoding/device pair

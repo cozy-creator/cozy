@@ -1340,7 +1340,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     let got = out.header.tensor_schema_digest();
     if got != predicted {
         eprintln!(
-            "REFUSED TOPOLOGY_MISMATCH: the plan predicted tensor schema {predicted} and \
+            "REFUSED TENSOR_SCHEMA_MISMATCH: the plan predicted tensor schema {predicted} and \
              the written header projects {got} — the preview and the run disagree"
         );
         return ExitCode::FAILURE;

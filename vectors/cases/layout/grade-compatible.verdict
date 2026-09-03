@@ -1,4 +1,0 @@
-doc: grade_decision
-expect: ok
-id: sha256:90da125d5a5e3705160da39fee11a71942b0f041b0f38d6a633c0379a3bf70f8
-note: the contract asks for exactly what is there

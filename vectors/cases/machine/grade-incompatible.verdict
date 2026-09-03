@@ -1,4 +1,0 @@
-doc: machine_grade
-expect: ok
-id: sha256:218a1d419253ebb30f7fb480f6e2dcb534e8495d4705bd798e184419f32fa012
-note: INCOMPATIBLE carries the reason and no remedy: a different model, not a different packaging

@@ -1,3 +1,0 @@
-doc: tensor_requirements
-expect: mutant
-note: one byte flipped at offset 105 of sha256:d89c920e3a3919f2314efba1e2c12b0a56be273c34e1ff0acd9fdab8ad2b542f

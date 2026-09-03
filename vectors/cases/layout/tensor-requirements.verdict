@@ -1,5 +1,0 @@
-doc: tensor_requirements
-expect: ok
-id: sha256:206f9047ec76dbf797028ac429269d4d3a02531058eec8274dacb7b26e2979fa
-tensor_schema: sha256:f46a7f4d483f3cb771cb5c2352fe79650b4a89cd788010bb4d7df5d1ccd5d1be
-note: the meta-device census of factory(config), projected: accepts, pinned dtypes, constructed components

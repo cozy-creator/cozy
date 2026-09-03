@@ -341,7 +341,7 @@ fn decode_relation(d: &mut Decoder<'_>, what: &str) -> Result<Relation> {
 }
 
 fn encode_encoding_into(e: &mut Encoder<Bounded>, spec: &EncodingSpec) -> Result<()> {
-    emit("encoding", e.array(5))?;
+    emit("encoding", e.array(4))?;
     emit(
         "encoding.logical_dtypes",
         e.array(spec.logical_dtypes.len() as u64),
@@ -360,16 +360,12 @@ fn encode_encoding_into(e: &mut Encoder<Bounded>, spec: &EncodingSpec) -> Result
         encode_carrier(e, &role.carrier)?;
         encode_relation(e, &role.shape)?;
     }
-    encode_optional(e, spec.doc.as_ref(), |e, doc| {
-        emit("encoding.doc", e.str(doc))?;
-        Ok(())
-    })?;
     encode_optional(e, spec.vectors.as_ref(), encode_ref)?;
     Ok(())
 }
 
 fn decode_encoding_from(d: &mut Decoder<'_>, what: &str) -> Result<EncodingSpec> {
-    exact_array(d, what, 5)?;
+    exact_array(d, what, 4)?;
     let count = list_len(d, &format!("{what}.logical_dtypes"), 32, true)?;
     let logical_dtypes = (0..count)
         .map(|_| Dtype::from_code(uint(d, &format!("{what}.logical_dtype"))?))
@@ -387,9 +383,6 @@ fn decode_encoding_from(d: &mut Decoder<'_>, what: &str) -> Result<EncodingSpec>
         let shape = decode_relation(d, &format!("{role_what}.shape"))?;
         roles.push((name, Role { carrier, shape }));
     }
-    let doc = decode_optional(d, &format!("{what}.doc"), |d| {
-        text(d, &format!("{what}.doc.value"), limits::MAX_DOC_TEXT_BYTES)
-    })?;
     let vectors = decode_optional(d, &format!("{what}.vectors"), |d| {
         decode_ref(d, &format!("{what}.vectors.value"))
     })?;
@@ -397,7 +390,6 @@ fn decode_encoding_from(d: &mut Decoder<'_>, what: &str) -> Result<EncodingSpec>
         logical_dtypes,
         logical_rank,
         roles,
-        doc,
         vectors,
     };
     EncodingSpec::from_value(&spec.to_value())

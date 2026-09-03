@@ -1,5 +1,0 @@
-doc: compat_report
-expect: ok
-id: sha256:b4150a0f17e641b8867e1e82d3badab5b476cdfae05ac2da46f1dbed61499c0f
-grade: PRODUCIBLE
-note: the same pair stopped at the first fact: PRODUCIBLE, which is why ranking may not stop there

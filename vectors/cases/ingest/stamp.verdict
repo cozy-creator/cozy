@@ -1,4 +1,4 @@
 doc: stamp
 expect: ok
-id: sha256:1618fa3d6fe7755070f3e5eb4e3b37070fbf6fd8ba77ac626570e3b925eb9b44
+id: sha256:f3cad72ec75358169122db88a08d9b02bfa6bb2e38476e48da8fe4f73be72ae1
 note: the verified ledger: tensor schema, candidate set, converter, golden, accounting

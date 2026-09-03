@@ -632,8 +632,7 @@ pub fn cmd_mine(rows: &std::path::Path, name: &str, f: &Flags) -> ExitCode {
 /// question, asked from outside the process.
 ///
 /// `--json` prints one `capability_json` object on stdout and nothing else, and exits
-/// SUCCESS on both verdicts: the answer is `admitted`, exactly as `compat check --json`
-/// answers in `satisfied` and `grade --json` answers in `grade`. The column-aligned print
+/// SUCCESS on both verdicts: the answer is `admitted`. The column-aligned print
 /// keeps its non-zero exit on a refusal and is for people; no program may match on it.
 pub fn cmd_capability(encoding: &str, device: &str, f: &Flags) -> ExitCode {
     // The compiled-in records speak only for the reference decoders in this harness, on

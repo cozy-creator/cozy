@@ -1,3 +1,0 @@
-doc: machine_check
-expect: mutant
-note: one byte flipped at offset 204 of sha256:c648164057d9d680ba65863ed4c471b2e1265b42d2ab4c365e2091bf9aeaa0a5

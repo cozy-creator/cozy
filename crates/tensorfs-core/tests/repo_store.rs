@@ -5,9 +5,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tensorfs_core::canon::Value;
 use tensorfs_core::dtype::Dtype;
-use tensorfs_core::header::{Closure, Header, Part, Tensor};
+use tensorfs_core::header::{Asset, Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::{Draft, Entry, Manifest};
+use tensorfs_core::meta::Meta;
+use tensorfs_core::read;
 use tensorfs_core::repository::{Mutation, ReleaseLane, Repository};
 use tensorfs_core::store::{Fault, Store, Verdict};
 
@@ -98,6 +100,84 @@ fn model_fixture(store: &Store, value: [u8; 4]) -> ObjectRef {
         )
         .unwrap()
         .obj
+}
+
+#[test]
+fn a_model_asset_reads_through_the_cozytensors_lease() {
+    let root = temporary("model-asset");
+    let store = Store::init(&root).unwrap();
+    let meta = Meta::open(&store).unwrap();
+    let parts: [&[u8]; 2] = [b"vocab\n", b"merges\n"];
+    let segments = parts
+        .iter()
+        .map(|bytes| {
+            let mut source = *bytes;
+            store
+                .put_stream(&mut source, Some(&ObjectRef::of(bytes)), &Fault::default())
+                .unwrap()
+                .obj
+        })
+        .collect::<Vec<_>>();
+    let bytes = parts.concat();
+    let spec = tensorfs_core::registry::seeds()
+        .into_iter()
+        .find(|seed| seed.alias == "plain/1")
+        .unwrap()
+        .spec;
+    let header = Header {
+        configs: Vec::new(),
+        assets: vec![(
+            "tokenizer/vocab.txt".into(),
+            Asset {
+                logical_sha256: tensorfs_core::sha256::hex_digest(&bytes),
+                logical_length: bytes.len() as u64,
+                media_type: "text/plain".into(),
+                segments,
+            },
+        )],
+        encodings: vec![spec.clone()],
+        components: vec![(
+            "model".into(),
+            vec![(
+                "weight".into(),
+                Tensor {
+                    dtype: Dtype::F32,
+                    shape: vec![1],
+                    encoding: spec.object_id(),
+                    parts: vec![("value".into(), Part::plan(Dtype::F32, vec![1], &[0; 4]))],
+                },
+            )],
+        )],
+    };
+    let header_bytes = header.canonical_bytes().unwrap();
+    let header_ref = store
+        .put_stream(
+            &mut header_bytes.as_slice(),
+            Some(&ObjectRef::of(&header_bytes)),
+            &Fault::default(),
+        )
+        .unwrap()
+        .obj;
+    let manifest = Draft {
+        entries: vec![("model.cozytensors".into(), Entry::CozyTensors(header_ref))],
+    }
+    .seal()
+    .unwrap();
+    store.put_manifest(&manifest).unwrap();
+    let (lease, _) = read::acquire_cozytensors(&store, &meta, &manifest).unwrap();
+    let asset = &header.assets[0].1;
+    assert_eq!(
+        read::read_asset(&lease, "tokenizer/vocab.txt", asset, bytes.len() as u64).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        read::read_asset(&lease, "tokenizer/vocab.txt", asset, 1)
+            .unwrap_err()
+            .code,
+        tensorfs_core::err::Code::SIZE_CAP
+    );
+    lease.release(&meta).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 fn apply_release(

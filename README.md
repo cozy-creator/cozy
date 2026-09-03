@@ -1,6 +1,6 @@
 # TensorFS
 
-The current release is `0.2.1`.
+The current release is `0.3.0`.
 
 TensorFS stores every domain repository as the same graph:
 
@@ -38,10 +38,13 @@ tensor parts; configs are canonical JSON bytes inside the header. The existing
 `Store.walk` and `Store.acquire_manifest` retain their
 full-snapshot meaning, including every ordinary sibling.
 
-Those three are the durable format contract. They are not the whole document inventory, and
-this file used to claim they were. Nine further canonical grammars cross a process boundary
-without being stored under their own path — `corpus.rs` `DOC_KINDS` enumerates them and the
-frozen corpus verifies every one:
+While that lease is live, `lease.read_asset(header_bytes, name, max_bytes=64<<20)` reads a
+header-declared tokenizer or other model asset through the same pinned verified descriptors,
+then checks its declared logical length and SHA-256. The supplied header must itself belong to
+the lease.
+
+Those three are the durable format contract. The frozen corpus also verifies the bounded
+ingest, encoding-vector, and device-capability grammars that cross process boundaries:
 
 | grammar | where it lives |
 | --- | --- |
@@ -49,13 +52,10 @@ frozen corpus verifies every one:
 | `EncodingVectors` | compiled-in registry fixture |
 | `IngestProfile`, `IngestSubject`, `IngestSession` | the ingest border's own documents |
 | `IngestVerificationReceipt`, `Stamp` | transient candidate-byte admission proof, never release metadata |
-| `TensorRequirements`, `CompatibilityReport` | `fit`'s required tensors, and the grade plane's walk record |
 
-Four more are neither stored nor exchanged as documents but are a cross-repository contract
-all the same: the `--json` output of `fit`, `compat check`, `grade` and `capability`, which
-consumers shell out for and decode. They are frozen in `vectors/cases/machine/` and RE-EMITTED by
-`tfs vectors verify`, so adding a key to any of them fails here, on the producer, naming the
-consumer — instead of breaking it silently at runtime, which it did twice.
+Tensor requirements are deliberately absent from that list. They are transient rows passed
+directly from Runtime to TensorFS for one cold request; they are never serialized, published,
+cached, hashed, or graded.
 
 Plus one bounded operational DTO, `source-plan.json`, specified below. Naming these does not
 make them stored formats; refusing to name them only made the count look smaller than the
@@ -66,56 +66,46 @@ system.
 The native wheel is `cp312-abi3`, so CPython 3.12 is the floor and every later CPython loads
 the same wheel.
 
-`tensorfs.TensorRequirement(component, key, dtype, shape, accepts, pinned=False)` and
-`tensorfs.tensor_requirements(contract_digest, tensors, constructed_components=None)` are the one
-Python author seam for canonical TensorRequirements bytes: the meta-device census of `factory(config)`,
-which TensorFS validates and writes but never computes.
+`tensorfs.TensorRequirement(component, key, shape, logical_dtype=None)` describes one row of
+Runtime's request-time `factory(config)` census.
 
 ## Fit
 
-`fit` is the ONE code <-> checkpoint matching function (tfs-042; design
-`tracker/cross-cutting/model-code-fit.md` §3). Two inputs — a `TensorRequirements` and a `cozytensors/1`
-header — and exactly one of eight answers with the text a human reads:
-
-```text
-tfs fit <tensor-requirements.json> <root> <header-id|header.cbor> [--custody canonical|local]
-    [--device <class> --observations <records.json>] [--json]
-```
+`tensorfs.fit(requirements, header, *, custody, encoded_leaves, device=None,
+observations=None)` compares those in-memory rows with one `cozytensors/1` header. There is
+no CLI or document form.
 
 | code | rule |
 | --- | --- |
 | `ok` | routes counted: `verbatim` (plain), `decoded_float`, `encoded_gemm` |
 | `component_missing` | (1) every required component exists; extra components are ignored |
 | `tensor_missing`, `shape_mismatch` | (2) every constructed key exists at the same logical shape |
-| `dtype_pinned_mismatch` | (3) a `pinned` destination takes its dtype or a lossless widening; otherwise dtype is delivery's business |
+| `dtype_mismatch` | (3) an optional logical dtype constraint disagrees |
 | `extra_tensor` | (4) a stored key inside a constructed component absent from the requirements — refused on `canonical` custody, listed and ignored on `local` |
-| `encoding_unsupported` | (5) every stored encoding is admitted by the row's `accepts` |
+| `encoding_unsupported` | (5) the package refuses encoded leaves |
 | `encoding_unqualified` | (6) with `--device`, every encoded leaf has a qualification record for that class (plain storage has nothing to qualify) |
 
-Exit 0 on `ok`, one distinct code per refusal (10..16). The same answer is
-`tensorfs.fit(tensor_requirements, header, *, custody, device=None, observations=None) -> dict`, and
-`tensorfs.capability(encoding, device, observations=None)` answers the device axis alone. There is
-no grade in a fit; `tfs compat check` / `tfs grade` are the search plane's ranking over the same
-walk.
+`tensorfs.capability(encoding, device, observations=None)` answers the device axis alone.
+TensorFS has no compatibility grade or search plane.
 
 Each named construction config is one bounded RFC 8785 JSON-object byte string stored directly in
 the CozyTensors header. Header parsing refuses duplicate keys, trailing bytes, non-finite numbers,
 non-object JSON, oversized values, and any noncanonical spelling. TensorFS stores no separate
 config objects or aggregate config digest.
 
-TensorFS 0.2.0 intentionally has no 0.1.2 header reader. Existing roots migrate once with the
-standalone tool, first as a dry run and then explicitly:
+TensorFS 0.3.0 intentionally has no pre-0.3.0 header reader. Existing 0.1.2 roots migrate
+directly, and intermediate 0.2.x roots use the same standalone tool:
 
 ```bash
-uv run tools/migrate-0.1.2-to-0.2.0.py /var/lib/cozy/store \
-  --tfs /path/to/tensorfs-0.2.0/tfs
-uv run tools/migrate-0.1.2-to-0.2.0.py /var/lib/cozy/store \
-  --tfs /path/to/tensorfs-0.2.0/tfs --apply
+uv run tools/migrate-to-0.3.0.py /var/lib/cozy/store \
+  --tfs /path/to/tensorfs-0.3.0/tfs
+uv run tools/migrate-to-0.3.0.py /var/lib/cozy/store \
+  --tfs /path/to/tensorfs-0.3.0/tfs --apply
 ```
 
 It stages and validates all new headers, Manifests, and repositories before changing a root;
-repository documents remain under `migration-backup-0.1.2/`, and the v1 SQLite catalog remains as
-`tensorfs.sqlite.0.1.2.bak`.
+repository documents remain under `migration-backup-0.3.0/`, and the prior SQLite catalog remains
+as `tensorfs.sqlite.pre-0.3.0.bak`.
 
 Everything below is what CI runs, in the same order.
 
@@ -222,7 +212,7 @@ the existing fingerprint entries; the profile supplies the exact required compon
 encodings, and canonical construction traversal for each reviewed key-set variant. The registry may
 bank several exact tensor-schema observations for one `(key set, component)`; the observed header still
 has to match one of them exactly. This lets one SDXL profile cover reviewed FP16, BF16, and mixed
-component topologies without 16 source-specific code paths. An optional canonical provider
+component tensor schemas without 16 source-specific code paths. An optional canonical provider
 member/slot binds a component only when bytes cannot distinguish it, such as byte-identical H3 DiT
 headers. A reviewed member prefix may admit interchangeable objects from one provider namespace;
 the generic SDXL profile uses `civitai/files/`. Omitting both bindings remains local-only, so a

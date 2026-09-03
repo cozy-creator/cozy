@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the standalone 0.1.2 -> 0.2.0 migration against real files."""
+"""Exercise the standalone 0.1.2/0.2.x -> 0.3.0 migration against real files."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from pathlib import Path
 import cbor2
 
 ROOT = Path(__file__).resolve().parent.parent
-MIGRATE = ROOT / "tools" / "migrate-0.1.2-to-0.2.0.py"
+MIGRATE = ROOT / "tools" / "migrate-to-0.3.0.py"
 
 
 def canonical(value: object) -> bytes:
@@ -24,6 +24,10 @@ def canonical(value: object) -> bytes:
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def object_path(root: Path, identity: str) -> Path:
+    return root / "blobs" / identity[:2] / identity[2:4] / identity
 
 
 def put(root: Path, kind: str, data: bytes) -> tuple[str, int]:
@@ -46,6 +50,8 @@ def main() -> int:
         current = cbor2.loads(
             (ROOT / "conformance/cbor/vectors/green/minimal-inline.cbor").read_bytes()
         )
+        for encoding in current[3]:
+            encoding.insert(3, ["retired documentation"])
         current[1] = [
             ["model", bytes.fromhex(config_id), config_length, "application/json"]
         ]
@@ -114,6 +120,51 @@ def main() -> int:
         )
         repo_path = root / "repos/org/model.json"
         repo_path.write_bytes(repository)
+
+        intermediate = cbor2.loads(
+            (ROOT / "conformance/cbor/vectors/green/minimal-inline.cbor").read_bytes()
+        )
+        intermediate[1] = [["model", b'{"hidden_size":1}']]
+        for encoding in intermediate[3]:
+            encoding.insert(3, ["retired documentation"])
+        intermediate_header = cbor2.dumps(intermediate, canonical=True)
+        intermediate_header_id, intermediate_header_length = put(
+            root, "blobs", intermediate_header
+        )
+        intermediate_manifest = canonical(
+            {
+                "entries": [
+                    {
+                        "blob": {
+                            "length": intermediate_header_length,
+                            "sha256": intermediate_header_id,
+                        },
+                        "kind": "cozytensors",
+                        "path": "model.cozytensors",
+                    }
+                ]
+            }
+        )
+        intermediate_manifest_id, intermediate_manifest_length = put(
+            root, "manifests", intermediate_manifest
+        )
+        intermediate_repository = canonical(
+            {
+                "checkpoints": [
+                    {
+                        "manifest": {
+                            "length": intermediate_manifest_length,
+                            "sha256": intermediate_manifest_id,
+                        },
+                        "published": True,
+                    }
+                ],
+                "releases": [],
+                "repo": {"name": "intermediate", "org": "org"},
+            }
+        )
+        intermediate_repo_path = root / "repos/org/intermediate.json"
+        intermediate_repo_path.write_bytes(intermediate_repository)
         connection = sqlite3.connect(root / "tensorfs.sqlite")
         connection.execute("PRAGMA user_version=1")
         connection.execute(
@@ -177,11 +228,32 @@ def main() -> int:
         )
         parsed = cbor2.loads(header_path.read_bytes())
         assert parsed[1] == [["model", b'{"a":0,"z":1}']]
+        assert all(len(encoding) == 4 for encoding in parsed[3])
+        intermediate_migrated = json.loads(intermediate_repo_path.read_bytes())
+        intermediate_ref = intermediate_migrated["checkpoints"][0]["manifest"]
+        intermediate_document = json.loads(
+            (
+                root
+                / "manifests"
+                / intermediate_ref["sha256"][:2]
+                / intermediate_ref["sha256"][2:4]
+                / f'{intermediate_ref["sha256"]}.json'
+            ).read_bytes()
+        )
+        intermediate_header_ref = intermediate_document["entries"][0]["blob"]
+        intermediate_final_bytes = object_path(
+            root, intermediate_header_ref["sha256"]
+        ).read_bytes()
+        assert len(intermediate_final_bytes) == intermediate_header_ref["length"]
+        assert digest(intermediate_final_bytes) == intermediate_header_ref["sha256"]
+        intermediate_final = cbor2.loads(intermediate_final_bytes)
+        assert intermediate_final[1] == [["model", b'{"hidden_size":1}']]
+        assert all(len(encoding) == 4 for encoding in intermediate_final[3])
         assert (
-            root / "migration-backup-0.1.2/repos/org/model.json"
+            root / "migration-backup-0.3.0/repos/org/model.json"
         ).read_bytes() == repository
-        assert (root / "tensorfs.sqlite.0.1.2.bak").is_file()
-        assert sqlite3.connect(root / "tensorfs.sqlite.0.1.2.bak").execute(
+        assert (root / "tensorfs.sqlite.pre-0.3.0.bak").is_file()
+        assert sqlite3.connect(root / "tensorfs.sqlite.pre-0.3.0.bak").execute(
             "SELECT count(*) FROM tensorfs_derived_transactions"
         ).fetchone()[0] == len(historical)
         assert sqlite3.connect(root / "tensorfs.sqlite").execute(
@@ -190,6 +262,7 @@ def main() -> int:
         assert sqlite3.connect(root / "tensorfs.sqlite").execute(
             "SELECT count(*) FROM tensorfs_derived_transactions"
         ).fetchone()[0] == 0
+        assert len(list((root / "tmp").glob("migration-0.2.0-rows-*.jsonl"))) == 1
         rerun = subprocess.run(
             (*command, "--apply"), capture_output=True, text=True, check=True
         )

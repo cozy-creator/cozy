@@ -1,6 +1,5 @@
 use tensorfs_core::dtype::Dtype;
-use tensorfs_core::fit::{Accepts, TensorRequirement, TensorRequirements};
-use tensorfs_core::header::{tensor_schema_digest_of, tensor_schema_value, Header, Tensor};
+use tensorfs_core::header::{tensor_schema_digest_of, tensor_schema_value};
 
 #[test]
 fn tensor_schema_is_exact_and_order_independent() {
@@ -34,37 +33,9 @@ fn tensor_schema_is_exact_and_order_independent() {
 }
 
 #[test]
-fn checkpoint_and_code_requirements_share_one_tensor_schema() {
-    let tensor = Tensor {
-        dtype: Dtype::F32,
-        shape: vec![2],
-        encoding: String::new(),
-        parts: Vec::new(),
-    };
-    let header = Header {
-        configs: Vec::new(),
-        assets: Vec::new(),
-        encodings: Vec::new(),
-        components: vec![("model".into(), vec![("weight".into(), tensor)])],
-    };
-    let requirements = TensorRequirements {
-        contract: "sha256:".to_string() + &"11".repeat(32),
-        components: vec![(
-            "model".into(),
-            vec![(
-                "weight".into(),
-                TensorRequirement {
-                    dtype: Dtype::F32,
-                    shape: vec![2],
-                    accepts: Accepts::Any,
-                    pinned: false,
-                },
-            )],
-        )],
-        constructed_components: vec!["model".into()],
-    };
-    assert_eq!(
-        header.tensor_schema_digest(),
-        requirements.tensor_schema_digest()
-    );
+fn tensor_schema_names_logical_dtype_explicitly() {
+    let schema = tensor_schema_value([("model", "weight", Dtype::F32, [2].as_slice())].into_iter());
+    let json = String::from_utf8(tensorfs_core::canon::write(&schema)).unwrap();
+    assert!(json.contains(r#""logical_dtype":"f32""#), "{json}");
+    assert!(!json.contains(r#""dtype":"#), "{json}");
 }

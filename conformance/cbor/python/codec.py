@@ -277,7 +277,7 @@ def _carrier(value: Any, where: str, *, diagnostic: bool) -> list[Any]:
 
 def encoding_spec(value: Any, where: str, *, diagnostic: bool) -> list[Any]:
     if diagnostic:
-        if type(value) is not dict or not {"logical_dtypes", "roles"}.issubset(value) or not set(value) <= {"logical_dtypes", "logical_rank", "roles", "doc", "vectors"}:
+        if type(value) is not dict or not {"logical_dtypes", "roles"}.issubset(value) or not set(value) <= {"logical_dtypes", "logical_rank", "roles", "vectors"}:
             refuse("WRONG_FIELDS", f"{where} has wrong encoding fields")
         dtypes = [dtype_code(v, f"{where}.logical_dtypes[{i}]", diagnostic=True) for i, v in enumerate(array(value["logical_dtypes"], None, f"{where}.logical_dtypes"))]
         rank = [] if "logical_rank" not in value else [uint(value["logical_rank"], f"{where}.logical_rank", positive=True)]
@@ -288,7 +288,6 @@ def encoding_spec(value: Any, where: str, *, diagnostic: bool) -> list[Any]:
             if type(role) is not dict or set(role) != {"carrier", "shape"}:
                 refuse("WRONG_FIELDS", f"{where}.roles.{role_name} has wrong fields")
             roles.append([name(role_name, f"{where}.role", MAX_NAME), _carrier(role["carrier"], f"{where}.{role_name}.carrier", diagnostic=True), _relation(role["shape"], f"{where}.{role_name}.shape", diagnostic=True)])
-        doc = [] if "doc" not in value else [text(value["doc"], f"{where}.doc", 4096)]
         if "vectors" not in value:
             vectors = []
         else:
@@ -297,19 +296,18 @@ def encoding_spec(value: Any, where: str, *, diagnostic: bool) -> list[Any]:
                 refuse("WRONG_FIELDS", f"{where}.vectors has wrong fields")
             vectors = [[diagnostic_digest(ref["sha256"], f"{where}.vectors.sha256"), uint(ref["length"], f"{where}.vectors.length", positive=True)]]
     else:
-        row = array(value, 5, where)
+        row = array(value, 4, where)
         dtypes = [dtype_code(v, f"{where}.logical_dtypes[{i}]", diagnostic=False) for i, v in enumerate(array(row[0], None, f"{where}.logical_dtypes"))]
         rank = _optional(row[1], f"{where}.logical_rank", lambda v: uint(v, f"{where}.logical_rank.value", positive=True))
         roles = []
         for i, role in enumerate(array(row[2], None, f"{where}.roles")):
             role = array(role, 3, f"{where}.roles[{i}]")
             roles.append([name(role[0], f"{where}.roles[{i}].name", MAX_NAME), _carrier(role[1], f"{where}.roles[{i}].carrier", diagnostic=False), _relation(role[2], f"{where}.roles[{i}].shape", diagnostic=False)])
-        doc = _optional(row[3], f"{where}.doc", lambda v: text(v, f"{where}.doc.value", 4096))
-        vectors = _optional(row[4], f"{where}.vectors", lambda v: object_ref(v, f"{where}.vectors.value", diagnostic=False))
+        vectors = _optional(row[3], f"{where}.vectors", lambda v: object_ref(v, f"{where}.vectors.value", diagnostic=False))
     if not dtypes or dtypes != sorted(set(dtypes)) or not roles or len(roles) > MAX_PARTS:
         refuse("SORT_ORDER", f"{where} dtypes/roles are empty, unsorted, duplicate, or over cap")
     sorted_unique(roles, 0, f"{where}.roles")
-    return [dtypes, rank, roles, doc, vectors]
+    return [dtypes, rank, roles, vectors]
 
 
 def project_encoding(value: list[Any]) -> dict[str, Any]:
@@ -331,8 +329,7 @@ def project_encoding(value: list[Any]) -> dict[str, Any]:
         "roles": {role[0]: {"carrier": carrier(role[1]), "shape": relation(role[2])} for role in value[2]},
     }
     if value[1]: out["logical_rank"] = value[1][0]
-    if value[3]: out["doc"] = value[3][0]
-    if value[4]: out["vectors"] = {"length": value[4][0][1], "sha256": "sha256:" + value[4][0][0].hex()}
+    if value[3]: out["vectors"] = {"length": value[3][0][1], "sha256": "sha256:" + value[3][0][0].hex()}
     return out
 
 

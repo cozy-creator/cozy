@@ -283,7 +283,8 @@ impl Part {
     }
 }
 
-/// Domain-separated exact logical tensor schema: component -> key -> {dtype, shape}.
+/// Domain-separated exact logical tensor schema:
+/// component -> key -> {logical_dtype, shape}.
 pub const TENSOR_SCHEMA_DOMAIN: &str = "cozytensors.tensor-schema/1";
 
 pub fn tensor_schema_value<'a>(
@@ -292,7 +293,7 @@ pub fn tensor_schema_value<'a>(
     let mut components: Vec<(String, Vec<(String, Value)>)> = Vec::new();
     for (component, key, dtype, shape) in items {
         let tensor = Value::obj(vec![
-            ("dtype", Value::str(dtype.name())),
+            ("logical_dtype", Value::str(dtype.name())),
             ("shape", shape_value(shape)),
         ]);
         match components.iter_mut().find(|(name, _)| name == component) {

@@ -1,5 +1,5 @@
 doc: manifest
 expect: ok
-id: sha256:e5e329db078e62714e3b84611ecfed35f7123285454c60920c1630ffcf68b0ea
-manifest: sha256:e5e329db078e62714e3b84611ecfed35f7123285454c60920c1630ffcf68b0ea
+id: sha256:9046060604f1e1e940efcb1131eca4ee494196696fdb771d9c65f455d47d977a
+manifest: sha256:9046060604f1e1e940efcb1131eca4ee494196696fdb771d9c65f455d47d977a
 note: manifest identity is its exact virtual-tree bytes

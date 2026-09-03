@@ -1,1 +1,0 @@
-{"decision":"sha256:947ae51604efb124aae6714826bc63c6a53675a68c739ea3f6e1fc6a98974d51","depth":"full","grade":"CONVDRTIBLE","mismatches":2,"reason":"","remedy_mapping":"widen bf16 -> f32","remedy_registration":"bf16-to-f32","remedy_source":"","remedy_target":"","report":"sha256:97a26469b2b1b24716f0c4b56fee243fa69766f79f5528b376b587f057b9a41a"}

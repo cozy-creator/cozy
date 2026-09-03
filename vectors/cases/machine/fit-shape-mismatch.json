@@ -1,1 +1,0 @@
-{"code":"shape_mismatch","component":"transformer","custody":"canonical","detail":"transformer.blocks.0.norm.weight: code [7], checkpoint [128]","device":"","encoding":"","ignored":[],"key":"blocks.0.norm.weight","routes":{"decoded_float":0,"encoded_gemm":0,"verbatim":0}}
