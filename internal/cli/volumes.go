@@ -1,10 +1,9 @@
 package cli
 
-// th-122 — the volume verbs. A volume is the standing per-datacenter model
-// store the hub mounts under the pods you rent there; warm it before the
-// first rental, list what it costs and holds, drop it when the standing cost
-// stops being worth it. The hub is the only state: nothing volume-shaped
-// lives in the local records store.
+// th-122 — the volume verbs. A volume is an optional per-datacenter cache of
+// immutable repo objects from model and dataset snapshots. It accelerates
+// downloads but is disposable and never authoritative. The hub is the only
+// state: nothing volume-shaped lives in the local records store.
 
 import (
 	"fmt"
@@ -28,19 +27,19 @@ func handleVolumeLs(ctx *Context) *exit.Error {
 	}
 	list := output.List{
 		Name:      "volumes",
-		Fields:    []string{"datacenter", "provider", "state", "size", "rate", "warm", "volume"},
-		AllFields: []string{"datacenter", "provider", "state", "size", "rate", "warm", "warm_objects", "volume", "created", "live", "last_bound"},
-		Lead:      []string{"Standing storage per hour: " + usdPerHourBare(burn)},
-		Trail:     []string{"A volume keeps its datacenter's model store warm between rentals; it bills until dropped."},
+		Fields:    []string{"datacenter", "provider", "state", "size", "rate", "cached", "volume"},
+		AllFields: []string{"datacenter", "provider", "state", "size", "rate", "cached", "cached_objects", "volume", "created", "live", "last_bound"},
+		Lead:      []string{"Optional cache storage per hour: " + usdPerHourBare(burn)},
+		Trail:     []string{"Cache volumes hold disposable copies of immutable model and dataset snapshot objects; they are never authoritative."},
 		Next:      []string{"cozy help volume warm"},
 	}
 	for _, v := range volumes {
 		list.Rows = append(list.Rows, map[string]string{
 			"datacenter": v.Datacenter, "provider": v.Provider, "state": v.State,
 			"size": fmt.Sprintf("%dGB", v.SizeGB), "rate": usdPerHourBare(v.USDMicrosPerHour),
-			"warm":         gigabytes(v.WarmBytes),
-			"warm_objects": fmt.Sprintf("%d", v.WarmObjects),
-			"volume":       v.ID, "created": stamp(v.CreatedAt), "live": orNone(stamp(v.LiveAt)),
+			"cached":         gigabytes(v.WarmBytes),
+			"cached_objects": fmt.Sprintf("%d", v.WarmObjects),
+			"volume":         v.ID, "created": stamp(v.CreatedAt), "live": orNone(stamp(v.LiveAt)),
 			"last_bound": orNone(stamp(v.LastBoundAt)),
 		})
 	}
@@ -71,7 +70,7 @@ func handleVolumeWarm(ctx *Context) *exit.Error {
 		{K: "state", V: volume.State},
 		{K: "size", V: fmt.Sprintf("%dGB", volume.SizeGB)},
 		{K: "rate", V: usdPerHourBare(volume.USDMicrosPerHour)},
-	}, Notes: []string{"Models warm onto it as rentals in " + volume.Datacenter + " download them."}})
+	}, Notes: []string{"Rentals in " + volume.Datacenter + " may cache immutable model and dataset snapshot objects here. The cache is optional and disposable."}})
 }
 
 func handleVolumeDrop(ctx *Context) *exit.Error {
@@ -109,7 +108,7 @@ func handleVolumeDrop(ctx *Context) *exit.Error {
 	return emit(ctx, output.Record{Fields: []output.Field{
 		{K: "volume", V: id},
 		{K: "state", V: "dropped"},
-	}, Notes: []string{"The store and its bytes are gone; the next rental there downloads cold."}})
+	}, Notes: []string{"The cached copies are gone; the next rental there fetches snapshots from another source."}})
 }
 
 func gigabytes(bytes int64) string {

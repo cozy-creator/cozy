@@ -1,6 +1,6 @@
 package hub
 
-// th-122 — the persistent-volume routes, verbatim from tensorhub:
+// th-122 — the provider-volume routes, verbatim from tensorhub:
 //
 //	GET    /v1/volumes                                   (auth) -> {"volumes":[…]}
 //	POST   /v1/volumes          {"provider"?, "datacenter"}  (auth) warm = ensure the standing volume exists
@@ -19,7 +19,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-// Volume is one owner-scoped standing store in one provider datacenter.
+// Volume is one owner-scoped, disposable repo-object cache in one provider datacenter.
 type Volume struct {
 	ID               string `json:"id"`
 	Provider         string `json:"provider"`
@@ -57,8 +57,8 @@ func (c *Client) Volumes(ctx context.Context) ([]Volume, *exit.Error) {
 	return out.Volumes, nil
 }
 
-// WarmVolume ensures the standing volume exists in one datacenter, creating it
-// lazily. Bytes warm through pods; this only opens the store they warm into.
+// WarmVolume ensures the optional cache volume exists in one datacenter. Pods
+// populate it with immutable repo objects while acquiring model and dataset snapshots.
 func (c *Client) WarmVolume(ctx context.Context, provider, datacenter, reason string) (Volume, *exit.Error) {
 	if strings.TrimSpace(datacenter) == "" {
 		return Volume{}, exit.Usagef("name the datacenter to warm")
@@ -81,7 +81,7 @@ func (c *Client) WarmVolume(ctx context.Context, provider, datacenter, reason st
 	return out, nil
 }
 
-// DropVolume permanently deletes one standing volume and its bytes.
+// DropVolume deletes one disposable cache volume and its cached copies.
 func (c *Client) DropVolume(ctx context.Context, id, reason string) *exit.Error {
 	if !strings.HasPrefix(id, "pvl-") {
 		return exit.Usagef("volume ids begin with pvl-; %q is not one", id)

@@ -8,6 +8,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -16,6 +19,72 @@ import (
 
 func volumeClient(url string) *hub.Client {
 	return hub.New(config.Config{HubURL: url}, "producttest").WithTokenSource(staleTokenSource{})
+}
+
+func TestVolumeUXDescribesAnOptionalDisposableCache(t *testing.T) {
+	server, _ := stubVolumeHub(t)
+	defer server.Close()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, config.FileName), []byte(
+		"tensorhub_url: "+server.URL+"\n"+
+			"tensorhub_token: volume-ux-test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code, help := runCozy(t, root, "help", "volume")
+	if code != 0 {
+		t.Fatalf("volume help [exit %d]:\n%s", code, help)
+	}
+	for _, want := range []string{
+		"optional repo-object cache",
+		"optional cache volume",
+		"disposable cache volume",
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("volume help omitted %q:\n%s", want, help)
+		}
+	}
+
+	code, listed := runCozy(t, root, "volume")
+	if code != 0 {
+		t.Fatalf("volume list [exit %d]:\n%s", code, listed)
+	}
+	for _, want := range []string{
+		"Optional cache storage per hour:",
+		"CACHED",
+		"model and dataset snapshot objects",
+		"disposable copies",
+		"never authoritative",
+	} {
+		if !strings.Contains(listed, want) {
+			t.Fatalf("volume list omitted %q:\n%s", want, listed)
+		}
+	}
+
+	code, machine := runCozy(t, root, "--json", "volume")
+	if code != 0 || !strings.Contains(machine, `"cached":"5.0GB"`) ||
+		strings.Contains(machine, `"warm":`) || strings.Contains(machine, `"warm_objects":`) {
+		t.Fatalf("machine volume list did not hardcut cached fields [exit %d]:\n%s", code, machine)
+	}
+
+	code, warmed := runCozy(t, root, "volume", "warm", "EU-RO-1")
+	if code != 0 || !strings.Contains(warmed, "immutable model and dataset snapshot objects") ||
+		!strings.Contains(warmed, "optional and disposable") {
+		t.Fatalf("volume warm lost cache semantics [exit %d]:\n%s", code, warmed)
+	}
+
+	code, dropped := runCozy(t, root, "volume", "drop", "pvl-a")
+	if code != 0 || !strings.Contains(dropped, "cached copies are gone") ||
+		!strings.Contains(dropped, "fetches snapshots from another source") {
+		t.Fatalf("volume drop lost cache semantics [exit %d]:\n%s", code, dropped)
+	}
+
+	all := strings.ToLower(help + listed + machine + warmed + dropped)
+	for _, legacy := range []string{"persistent model store", "standing model store", "models warm onto"} {
+		if strings.Contains(all, legacy) {
+			t.Fatalf("volume UX retained legacy claim %q:\n%s", legacy, all)
+		}
+	}
 }
 
 type staleTokenSource = staleSource
