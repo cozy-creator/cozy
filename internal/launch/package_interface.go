@@ -4,7 +4,7 @@
 //
 // Nothing here re-derives a fact its owner already produced:
 //
-//   - THE SURFACE is an install-private descriptor derived once by the release's own
+//   - THE SURFACE is an install-private package interface derived once by the release's own
 //     Runtime at install. Reading it back costs microseconds; re-running `describe` per
 //     invocation would import the package's module graph to learn a fact already frozen.
 //     The recorded semantic digest is checked on every read.
@@ -28,7 +28,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -37,14 +36,14 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
-// DescriptorFile is Runtime's derived document inside an immutable install. It is
+// PackageInterfaceFile is Runtime's derived document inside an immutable install. It is
 // never committed in package source.
-const DescriptorFile = "descriptor.json"
-const descriptorFormat = "cozy.package.descriptor/1"
+const PackageInterfaceFile = "package-interface.json"
+const packageInterfaceFormat = "cozy.package.interface/1"
 
-// PackageDescriptor is the closed PackageDescriptor/1 this host reads. Unknown fields refuse;
+// PackageInterface is the closed PackageInterface/1 this host reads. Unknown fields refuse;
 // Raw is normalized canonical JSON for control-plane transport and semantic identity.
-type PackageDescriptor struct {
+type PackageInterface struct {
 	Format      string          `json:"format"`
 	Application string          `json:"application"`
 	Entrypoints []Entrypoint    `json:"entrypoints"`
@@ -69,19 +68,13 @@ type Entrypoint struct {
 }
 
 type WeightsOutput struct {
-	OutputID         string                `json:"output_id"`
-	MimeType         string                `json:"mime_type"`
-	MaxBytes         uint64                `json:"max_bytes"`
-	RequiredContract *WeightsModelContract `json:"required_contract,omitempty"`
-}
-
-type WeightsModelContract struct {
-	TopologyDigest string   `json:"topology_digest"`
-	Encodings      []string `json:"encodings"`
+	OutputID string `json:"output_id"`
+	MimeType string `json:"mime_type"`
+	MaxBytes uint64 `json:"max_bytes"`
 }
 
 // Slot is one declared model binding path — capability, never selection. Its members
-// mirror cozy-runtime's `internal/descriptor.py` slot (cr-078a): `{class, component_use,
+// mirror cozy-runtime's `internal/package_interface.py` slot (cr-078a): `{class, component_use,
 // path}` plus the class's one keyword `encoded_leaves` and an optional `sequence_parallel`
 // document. `stamps` is a RETIRED member: every release published before the cut ships an
 // empty map, which reads as nothing declared, and a value in it refuses by name below.
@@ -206,7 +199,7 @@ func refuseRetiredSlotMembers(members map[string]json.RawMessage) error {
 	return nil
 }
 
-func validateClosedDescriptor(data []byte) error {
+func validateClosedPackageInterface(data []byte) error {
 	root, err := exactKeys(data,
 		[]string{"application", "entrypoints", "format", "jobs"}, nil)
 	if err != nil {
@@ -263,19 +256,8 @@ func validateClosedDescriptor(data []byte) error {
 				}
 				for _, output := range rows {
 					if _, err := exactKeys(output,
-						[]string{"max_bytes", "mime_type", "output_id"},
-						[]string{"required_contract"}); err != nil {
+						[]string{"max_bytes", "mime_type", "output_id"}, nil); err != nil {
 						return err
-					}
-					var fields map[string]json.RawMessage
-					if err := json.Unmarshal(output, &fields); err != nil {
-						return err
-					}
-					if contract := fields["required_contract"]; contract != nil {
-						if _, err := exactKeys(contract,
-							[]string{"encodings", "topology_digest"}, nil); err != nil {
-							return err
-						}
 					}
 				}
 			}
@@ -344,7 +326,7 @@ func validateTypeRaw(raw json.RawMessage) error {
 		case "bool", "float", "int", "null", "str":
 			return nil
 		}
-		return fmt.Errorf("unsupported descriptor scalar %q", scalar)
+		return fmt.Errorf("unsupported package-interface scalar %q", scalar)
 	}
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &object); err != nil {
@@ -372,7 +354,7 @@ func validateTypeRaw(raw json.RawMessage) error {
 		}
 		var branches []json.RawMessage
 		if err := json.Unmarshal(object["union"], &branches); err != nil || len(branches) == 0 {
-			return fmt.Errorf("empty descriptor union")
+			return fmt.Errorf("empty package-interface union")
 		}
 		for _, branch := range branches {
 			if union["tag_field"] != nil {
@@ -398,12 +380,12 @@ func validateTypeRaw(raw json.RawMessage) error {
 	case object["fields"] != nil:
 		return validateStructRaw(raw)
 	}
-	return fmt.Errorf("unsupported descriptor type")
+	return fmt.Errorf("unsupported package-interface type")
 }
 
 func validateEntrypoint(ep *Entrypoint) *exit.Error {
 	if ep.Name == "" {
-		return exit.New(exit.Validation, "descriptor carries an unnamed %s", ep.Kind)
+		return exit.New(exit.Validation, "package interface carries an unnamed %s", ep.Kind)
 	}
 	for i := range ep.Models {
 		slot := &ep.Models[i]
@@ -441,88 +423,67 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 				"%s has an invalid weights output %q: slots are unique snapshot MIME rows with a 1..2^53-1 byte cap",
 				ep.Name, output.OutputID)
 		}
-		if contract := output.RequiredContract; contract != nil &&
-			(!descriptorDigestPattern.MatchString(contract.TopologyDigest) ||
-				!validDescriptorDigestList(contract.Encodings, 32)) {
-			return exit.New(exit.Validation,
-				"%s weights output %s has an invalid required model contract",
-				ep.Name, output.OutputID)
-		}
 		seenWeights[output.OutputID] = true
 	}
 	return nil
 }
 
-var descriptorDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-
-func validDescriptorDigestList(values []string, cap int) bool {
-	if len(values) < 1 || len(values) > cap {
-		return false
-	}
-	for i, value := range values {
-		if !descriptorDigestPattern.MatchString(value) || i > 0 && values[i-1] >= value {
-			return false
-		}
-	}
-	return true
+// PackageInterfacePath is the one install-private location for Runtime-derived bytes.
+func PackageInterfacePath(installDir string) string {
+	return filepath.Join(installDir, "documents", PackageInterfaceFile)
 }
 
-// DescriptorPath is the one install-private location for Runtime-derived bytes.
-func DescriptorPath(installDir string) string {
-	return filepath.Join(installDir, "documents", DescriptorFile)
-}
-
-// ReadDescriptor reads the private descriptor and joins it to the install record.
-func ReadDescriptor(path, expectDigest string) (*PackageDescriptor, *exit.Error) {
+// ReadPackageInterface reads the private package interface and joins it to the install record.
+func ReadPackageInterface(path, expectDigest string) (*PackageInterface, *exit.Error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, exit.Named(exit.Structural, "descriptor_absent",
-			"this install carries no private %s", DescriptorFile).
-			WithRemedy("reinstall from the original source so its Runtime can derive the descriptor")
+		return nil, exit.Named(exit.Structural, "package_interface_absent",
+			"this install carries no private %s", PackageInterfaceFile).
+			WithRemedy("reinstall from the original source so its Runtime can derive the package interface")
 	}
-	d, problem := DecodeDescriptor(data)
+	d, problem := DecodePackageInterface(data)
 	if problem != nil {
 		return nil, problem
 	}
 	if expectDigest != "" && d.Digest != expectDigest {
-		return nil, exit.Named(exit.Conflict, "descriptor_stale",
-			"the private descriptor content digests to %s and this install recorded %s", d.Digest, expectDigest).
+		return nil, exit.Named(exit.Conflict, "package_interface_stale",
+			"the private package interface content digests to %s and this install recorded %s", d.Digest, expectDigest).
 			WithRemedy("the immutable install is corrupt; reinstall it from its original source")
 	}
 	return d, nil
 }
 
-// DecodeDescriptor reads the one closed descriptor/1 grammar and derives its canonical
+// DecodePackageInterface reads the one closed package-interface/1 grammar and derives its canonical
 // semantic identity. Collection membership supplies callable kind; the document does not
 // repeat it.
-func DecodeDescriptor(data []byte) (*PackageDescriptor, *exit.Error) {
+func DecodePackageInterface(data []byte) (*PackageInterface, *exit.Error) {
 	if len(data) > canonical.DocMax {
-		return nil, exit.New(exit.Validation, "%s exceeds the %d-byte cap", DescriptorFile, canonical.DocMax)
+		return nil, exit.New(exit.Validation, "%s exceeds the %d-byte cap", PackageInterfaceFile, canonical.DocMax)
 	}
 	normalized, err := canonical.NormalizeJCS(data)
 	if err != nil {
-		return nil, exit.New(exit.Validation, "%s violates descriptor/1: %s", DescriptorFile, err)
+		return nil, exit.New(exit.Validation, "%s violates package-interface/1: %s", PackageInterfaceFile, err)
 	}
-	if err := validateClosedDescriptor(normalized); err != nil {
-		return nil, exit.New(exit.Validation, "%s violates descriptor/1: %s", DescriptorFile, err)
+	if err := validateClosedPackageInterface(normalized); err != nil {
+		return nil, exit.New(exit.Validation, "%s violates package-interface/1: %s", PackageInterfaceFile, err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(normalized))
 	decoder.DisallowUnknownFields()
-	var d PackageDescriptor
+	var d PackageInterface
 	if err := decoder.Decode(&d); err != nil {
-		return nil, exit.New(exit.Validation, "%s is not a descriptor document: %s", DescriptorFile, err)
+		return nil, exit.New(exit.Validation, "%s is not a package interface document: %s", PackageInterfaceFile, err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return nil, exit.New(exit.Validation, "%s carries trailing JSON", DescriptorFile)
+		return nil, exit.New(exit.Validation, "%s carries trailing JSON", PackageInterfaceFile)
 	}
-	if d.Format != descriptorFormat || d.Application == "" {
-		return nil, exit.New(exit.Validation, "%s format/application is invalid", DescriptorFile)
+	if d.Format != packageInterfaceFormat || d.Application == "" {
+		return nil, exit.New(exit.Validation, "%s format/application is invalid", PackageInterfaceFile)
 	}
 	var raw struct {
 		Jobs []json.RawMessage `json:"jobs"`
 	}
 	if err := json.Unmarshal(normalized, &raw); err != nil || len(raw.Jobs) != len(d.Jobs) {
-		return nil, exit.New(exit.Validation, "%s carries invalid job rows", DescriptorFile)
+		return nil, exit.New(exit.Validation, "%s carries invalid job rows", PackageInterfaceFile)
 	}
 	for i := range d.Entrypoints {
 		d.Entrypoints[i].Kind = "entrypoint"
@@ -543,7 +504,7 @@ func DecodeDescriptor(data []byte) (*PackageDescriptor, *exit.Error) {
 	}
 	digest, err := canonical.Spell(canonical.Digest(normalized))
 	if err != nil {
-		return nil, exit.Internalf("cannot spell descriptor digest: %s", err)
+		return nil, exit.Internalf("cannot spell package interface digest: %s", err)
 	}
 	d.Digest = digest
 	d.Raw = normalized
@@ -551,7 +512,7 @@ func DecodeDescriptor(data []byte) (*PackageDescriptor, *exit.Error) {
 }
 
 // Function finds one entrypoint or job by name.
-func (d *PackageDescriptor) Function(name string) (*Entrypoint, *exit.Error) {
+func (d *PackageInterface) Function(name string) (*Entrypoint, *exit.Error) {
 	for i := range d.Entrypoints {
 		if d.Entrypoints[i].Name == name {
 			return &d.Entrypoints[i], nil
@@ -567,7 +528,7 @@ func (d *PackageDescriptor) Function(name string) (*Entrypoint, *exit.Error) {
 }
 
 // Names is every callable this release registers.
-func (d *PackageDescriptor) Names() []string {
+func (d *PackageInterface) Names() []string {
 	out := []string{}
 	for _, e := range d.Entrypoints {
 		out = append(out, e.Name)
@@ -650,7 +611,7 @@ func (e *Entrypoint) TypeOfField(name string) (json.RawMessage, bool) {
 	return nil, false
 }
 
-// InputKind returns the compact descriptor kind for one request field.
+// InputKind returns the compact package-interface kind for one request field.
 func (e *Entrypoint) InputKind(name string) (string, bool) {
 	for _, field := range e.Request.Fields {
 		if field.Name == name {

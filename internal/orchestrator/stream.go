@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"encoding/json"
+	"math"
 	"sync"
 
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -91,21 +92,30 @@ func (c *Orchestrator) LatestFrame(requestID string) (Frame, bool) {
 }
 
 // ProgressSnapshot is the latest real work coordinate Runtime reported and an optional
-// estimate from the mean measured step time. It is observational and live-only.
+// whole-job estimate from measured elapsed time per overall-fraction advance. It is
+// observational and live-only.
 type ProgressSnapshot struct {
-	Stage       string
-	Fraction    float64
-	RemainingMS int64
-	Estimated   bool
+	Stage           string
+	StageFraction   *float64
+	OverallFraction *float64
+	Position        *int64
+	Total           *int64
+	RemainingMS     int64
+	Estimated       bool
 }
 
 type progressAccumulator struct {
-	attempt   uint64
-	stage     string
-	fraction  float64
-	position  float64
-	stepMSSum float64
-	samples   int64
+	attempt          uint64
+	stage            string
+	stageFraction    float64
+	hasStageFraction bool
+	position         int64
+	total            int64
+	hasPosition      bool
+	overallFraction  float64
+	hasOverall       bool
+	overallDelta     float64
+	overallMSSum     float64
 }
 
 func (c *Orchestrator) LatestProgress(requestID string, attempt uint64) (ProgressSnapshot, bool) {
@@ -116,49 +126,131 @@ func (c *Orchestrator) LatestProgress(requestID string, attempt uint64) (Progres
 	if !ok || progress.attempt != attempt {
 		return ProgressSnapshot{}, false
 	}
-	snapshot := ProgressSnapshot{Stage: progress.stage, Fraction: progress.fraction}
-	if progress.samples > 0 && progress.position > 0 && progress.fraction > 0 {
-		total := progress.position / progress.fraction
-		remaining := max(0, total-progress.position)
-		snapshot.RemainingMS = int64(remaining * progress.stepMSSum / float64(progress.samples))
+	snapshot := ProgressSnapshot{Stage: progress.stage}
+	if progress.hasStageFraction {
+		value := progress.stageFraction
+		snapshot.StageFraction = &value
+	}
+	if progress.hasPosition {
+		position, total := progress.position, progress.total
+		snapshot.Position, snapshot.Total = &position, &total
+	}
+	if progress.hasOverall {
+		value := progress.overallFraction
+		snapshot.OverallFraction = &value
+	}
+	if progress.hasOverall && progress.overallDelta > 0 && progress.overallMSSum > 0 {
+		remaining := max(0.0, 1-progress.overallFraction)
+		snapshot.RemainingMS = int64(remaining * progress.overallMSSum / progress.overallDelta)
 		snapshot.Estimated = true
 	}
 	return snapshot, true
 }
 
-func progressCoordinates(value any) (stage string, fraction, position, stepMS float64, ok bool) {
-	if direct, isNumber := value.(float64); isNumber {
-		return "", direct, 0, 0, direct >= 0 && direct <= 1
-	}
+type progressCoordinate struct {
+	stage            string
+	stageFraction    float64
+	hasStageFraction bool
+	overallFraction  float64
+	hasOverall       bool
+	position         int64
+	total            int64
+	hasPosition      bool
+	stepMS           float64
+}
+
+func finiteFraction(value any) (float64, bool) {
+	number, ok := value.(float64)
+	return number, ok && !math.IsNaN(number) && !math.IsInf(number, 0) && number >= 0 && number <= 1
+}
+
+func progressCoordinates(value any) (progressCoordinate, bool) {
+	var out progressCoordinate
 	fields, isMap := value.(map[string]any)
 	if !isMap {
-		return "", 0, 0, 0, false
+		return out, false
 	}
-	stage, _ = fields["name"].(string)
-	fraction, ok = fields["fraction"].(float64)
-	if !ok {
-		fraction, ok = fields["value"].(float64)
+	for key := range fields {
+		switch key {
+		case "stage", "stage_fraction", "overall_fraction", "position", "total", "step_ms":
+		default:
+			return out, false
+		}
 	}
-	position, _ = fields["position"].(float64)
-	stepMS, _ = fields["step_ms"].(float64)
-	return stage, fraction, position, stepMS, ok && fraction >= 0 && fraction <= 1
+	out.stage, _ = fields["stage"].(string)
+	step, hasStep := fields["step_ms"]
+	var stepOK bool
+	out.stepMS, stepOK = step.(float64)
+	if out.stage == "" || len(out.stage) > 120 || !hasStep || !stepOK || math.IsNaN(out.stepMS) ||
+		math.IsInf(out.stepMS, 0) || out.stepMS < 0 {
+		return out, false
+	}
+	if value, present := fields["stage_fraction"]; present {
+		var ok bool
+		out.stageFraction, ok = finiteFraction(value)
+		if !ok {
+			return out, false
+		}
+		out.hasStageFraction = true
+	}
+	if value, present := fields["overall_fraction"]; present {
+		var ok bool
+		out.overallFraction, ok = finiteFraction(value)
+		if !ok {
+			return out, false
+		}
+		out.hasOverall = true
+	}
+	positionValue, hasPosition := fields["position"]
+	totalValue, hasTotal := fields["total"]
+	if hasPosition != hasTotal {
+		return out, false
+	}
+	if hasPosition {
+		position, positionOK := positionValue.(float64)
+		total, totalOK := totalValue.(float64)
+		if !positionOK || !totalOK || math.Trunc(position) != position || math.Trunc(total) != total ||
+			position < 0 || total <= 0 || position > total {
+			return out, false
+		}
+		out.position, out.total, out.hasPosition = int64(position), int64(total), true
+		derived := position / total
+		if out.hasStageFraction && math.Abs(out.stageFraction-derived) > 1e-9 {
+			return out, false
+		}
+		if !out.hasStageFraction {
+			out.stageFraction, out.hasStageFraction = derived, true
+		}
+	}
+	return out, true
 }
 
 func (f *fanout) observeProgress(frame Frame) {
-	stage, fraction, position, stepMS, ok := progressCoordinates(frame.Value)
+	coordinate, ok := progressCoordinates(frame.Value)
 	if !ok {
 		return
 	}
 	progress := f.progress[frame.RequestID]
-	if progress.attempt != frame.Attempt || progress.stage != stage ||
-		position > 0 && progress.position > 0 && position <= progress.position {
-		progress = progressAccumulator{attempt: frame.Attempt, stage: stage}
+	if progress.attempt != frame.Attempt {
+		progress = progressAccumulator{attempt: frame.Attempt}
 	}
-	progress.fraction, progress.position = fraction, position
-	if stepMS > 0 {
-		progress.stepMSSum += stepMS
-		progress.samples++
+	if coordinate.hasOverall && progress.hasOverall &&
+		coordinate.overallFraction < progress.overallFraction {
+		return
 	}
+	if coordinate.hasOverall && progress.hasOverall &&
+		coordinate.overallFraction > progress.overallFraction && coordinate.stepMS > 0 {
+		progress.overallDelta += coordinate.overallFraction - progress.overallFraction
+		progress.overallMSSum += coordinate.stepMS
+	}
+	if coordinate.hasOverall {
+		progress.overallFraction, progress.hasOverall = coordinate.overallFraction, true
+	}
+	progress.stage = coordinate.stage
+	progress.stageFraction, progress.hasStageFraction =
+		coordinate.stageFraction, coordinate.hasStageFraction
+	progress.position, progress.total, progress.hasPosition =
+		coordinate.position, coordinate.total, coordinate.hasPosition
 	f.progress[frame.RequestID] = progress
 }
 

@@ -28,28 +28,27 @@ const PublishedPreparationFile = "package-preparation.json"
 type publishedPreparation struct {
 	Package      string           `json:"package"`
 	Release      string           `json:"release"`
-	SourceDigest string           `json:"source_digest"`
 	ProjectWheel PublishedWheel   `json:"project_wheel"`
 	Wheels       []PublishedWheel `json:"wheels"`
 }
 
-func hasServingModelSlots(descriptor *launch.PackageDescriptor) bool {
-	for i := range descriptor.Entrypoints {
-		if len(descriptor.Entrypoints[i].Models) > 0 {
+func hasServingModelSlots(packageInterface *launch.PackageInterface) bool {
+	for i := range packageInterface.Entrypoints {
+		if len(packageInterface.Entrypoints[i].Models) > 0 {
 			return true
 		}
 	}
 	return false
 }
 
-func hasWeightlessCallable(descriptor *launch.PackageDescriptor) bool {
-	for i := range descriptor.Entrypoints {
-		if len(descriptor.Entrypoints[i].Models) == 0 {
+func hasWeightlessCallable(packageInterface *launch.PackageInterface) bool {
+	for i := range packageInterface.Entrypoints {
+		if len(packageInterface.Entrypoints[i].Models) == 0 {
 			return true
 		}
 	}
-	for i := range descriptor.Jobs {
-		if len(descriptor.Jobs[i].Models) == 0 {
+	for i := range packageInterface.Jobs {
+		if len(packageInterface.Jobs[i].Models) == 0 {
 			return true
 		}
 	}
@@ -59,9 +58,9 @@ func hasWeightlessCallable(descriptor *launch.PackageDescriptor) bool {
 // preparePublished materializes the release's complete frozen uv environment, asks that
 // environment's Runtime to describe the surface the release itself pinned, and asks THIS
 // host's Runtime to admit the environment and author its resident placement. Creator
-// compares the derived descriptor with the committed publication descriptor.
+// compares the derived package interface with the committed publication interface.
 func preparePublished(l home.Layout, installDir string, published *PublishedSource) (
-	*launch.PackageDescriptor, ExactDocument, string, *EnvironmentReceipt, *exit.Error,
+	*launch.PackageInterface, ExactDocument, string, *EnvironmentReceipt, *exit.Error,
 ) {
 	var empty ExactDocument
 	sourceDir := filepath.Join(installDir, "source")
@@ -77,6 +76,14 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 		if err := os.WriteFile(filepath.Join(sourceDir, name), document.Bytes, 0o400); err != nil {
 			return nil, empty, "", nil, exit.Internalf("cannot retain exact %s: %s", name, err)
 		}
+	}
+	packageInterfacePath := launch.PackageInterfacePath(installDir)
+	if err := os.MkdirAll(filepath.Dir(packageInterfacePath), 0o700); err != nil {
+		return nil, empty, "", nil, exit.Internalf("cannot create package interface directory: %s", err)
+	}
+	if err := os.WriteFile(packageInterfacePath,
+		published.Selection.PackageInterface.Bytes, 0o600); err != nil {
+		return nil, empty, "", nil, exit.Internalf("cannot retain exact package interface: %s", err)
 	}
 	cache := filepath.Join(installDir, "artifact-cache")
 	setDir := filepath.Join(cache, "sets", "package")
@@ -108,19 +115,19 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 			"the published package environment provides no cozy-runtime").
 			WithRemedy("declare cozy-runtime in pyproject.toml and refresh uv.lock")
 	}
-	descriptor, problem := describePublished(runtimeBin, sourceDir,
-		published.Selection.PackageDescriptor)
+	packageInterface, problem := describePublished(runtimeBin, sourceDir,
+		published.Selection.PackageInterface)
 	if problem != nil {
-		if published.ReportDefect != nil && problem.Name == "descriptor_mismatch" {
-			published.ReportDefect("package_prepare_descriptor_disagrees",
-				"local describe derived a different descriptor than the committed release")
+		if published.ReportDefect != nil && problem.Name == "package_interface_mismatch" {
+			published.ReportDefect("package_prepare_interface_disagrees",
+				"local describe derived a different package interface than the committed release")
 		}
 		return nil, empty, "", nil, problem
 	}
-	deferredModels := len(published.Models) == 0 && hasServingModelSlots(descriptor)
+	deferredModels := len(published.Models) == 0 && hasServingModelSlots(packageInterface)
 	if deferredModels {
 		inventory, err := json.Marshal(publishedPreparation{Package: published.Package,
-			Release: published.Release, SourceDigest: published.SourceDigest,
+			Release:      published.Release,
 			ProjectWheel: published.ProjectWheel, Wheels: published.Wheels})
 		if err != nil {
 			return nil, empty, "", nil, exit.Internalf("cannot encode package preparation: %s", err)
@@ -129,8 +136,8 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 			return nil, empty, "", nil, exit.Internalf(
 				"cannot retain code-only package preparation: %s", err)
 		}
-		if !hasWeightlessCallable(descriptor) {
-			return descriptor, empty, runtimeBin, environment, nil
+		if !hasWeightlessCallable(packageInterface) {
+			return packageInterface, empty, runtimeBin, environment, nil
 		}
 	}
 
@@ -144,18 +151,18 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 	if problem != nil {
 		return nil, empty, "", nil, problem
 	}
-	if !bytes.Equal(answer.PackageDescriptor.Bytes, published.Selection.PackageDescriptor.Bytes) {
+	if !bytes.Equal(answer.PackageInterface.Bytes, published.Selection.PackageInterface.Bytes) {
 		if published.ReportDefect != nil {
-			published.ReportDefect("package_prepare_descriptor_disagrees",
-				"local preparation derived a different descriptor than the committed release")
+			published.ReportDefect("package_prepare_interface_disagrees",
+				"local preparation derived a different package interface than the committed release")
 		}
-		return nil, empty, "", nil, exit.Named(exit.Conflict, "descriptor_mismatch",
+		return nil, empty, "", nil, exit.Named(exit.Conflict, "package_interface_mismatch",
 			"the installed package describes a different callable surface than its committed release")
 	}
-	descriptor, problem = launch.DecodeDescriptor(answer.PackageDescriptor.Bytes)
-	if problem != nil || descriptor.Digest != answer.PackageDescriptor.Digest {
-		return nil, empty, "", nil, exit.Named(exit.Structural, "package_descriptor_invalid",
-			"cozy-runtime returned an invalid package descriptor")
+	packageInterface, problem = launch.DecodePackageInterface(answer.PackageInterface.Bytes)
+	if problem != nil || packageInterface.Digest != answer.PackageInterface.Digest {
+		return nil, empty, "", nil, exit.Named(exit.Structural, "package_interface_invalid",
+			"cozy-runtime returned an invalid package interface")
 	}
 	set, readErr := canonical.Read(answer.PlacementSet.Bytes, &pb.PlacementSet{})
 	if readErr != nil || len(set.List("placements")) != 1 {
@@ -165,7 +172,6 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 	prepared := set.List("placements")[0]
 	fact := prepared.Sub("package")
 	if fact.Str("package") != published.Package || fact.Str("release") != published.Release ||
-		fact.Str("release_digest") != published.SourceDigest ||
 		fact.Sub("project_wheel").Sub("ref").Str("digest") != published.ProjectWheel.Digest {
 		return nil, empty, "", nil, exit.Named(exit.Conflict, "package_placement_mismatch",
 			"cozy-runtime prepared different package bytes than Creator downloaded")
@@ -177,7 +183,7 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 	if deferredModels {
 		// Keep the bounded wheel views for a modeled invocation. This package also has a
 		// weightless callable, so its code-only PlacementSet remains immediately runnable.
-		return descriptor, answer.PlacementSet, runtimeBin, environment, nil
+		return packageInterface, answer.PlacementSet, runtimeBin, environment, nil
 	}
 	selectedDependencies := map[string]bool{}
 	for _, wheel := range prepared.Sub("environment").List("wheels") {
@@ -200,11 +206,11 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 	}
 	// The placement records the exact wheel subset used by a rental base. The local
 	// environment receipt above records the complete frozen closure this machine runs.
-	return descriptor, answer.PlacementSet, runtimeBin, environment, nil
+	return packageInterface, answer.PlacementSet, runtimeBin, environment, nil
 }
 
 func describePublished(runtimeBin, sourceDir string, committed ExactDocument) (
-	*launch.PackageDescriptor, *exit.Error,
+	*launch.PackageInterface, *exit.Error,
 ) {
 	cmd := exec.Command(runtimeBin, "--json", "--dir", sourceDir, "describe")
 	cmd.Env = config.Frozen().Tool()
@@ -220,15 +226,15 @@ func describePublished(runtimeBin, sourceDir string, committed ExactDocument) (
 	}
 	raw := bytes.TrimSuffix([]byte(stdout.String()), []byte("\n"))
 	if !bytes.Equal(raw, committed.Bytes) {
-		return nil, exit.Named(exit.Conflict, "descriptor_mismatch",
+		return nil, exit.Named(exit.Conflict, "package_interface_mismatch",
 			"the installed package describes a different callable surface than its committed release")
 	}
-	descriptor, problem := launch.DecodeDescriptor(raw)
-	if problem != nil || descriptor.Digest != committed.Digest {
-		return nil, exit.Named(exit.Structural, "package_descriptor_invalid",
-			"cozy-runtime returned an invalid installed package descriptor")
+	packageInterface, problem := launch.DecodePackageInterface(raw)
+	if problem != nil || packageInterface.Digest != committed.Digest {
+		return nil, exit.Named(exit.Structural, "package_interface_invalid",
+			"cozy-runtime returned an invalid installed package interface")
 	}
-	return descriptor, nil
+	return packageInterface, nil
 }
 
 // PreparePublishedSelection turns one installed code/environment tree plus exact
@@ -259,7 +265,7 @@ func PreparePublishedSelection(l home.Layout, inst records.PackageInstall,
 		decodeErr = decoder.Decode(&trailing)
 	}
 	if decodeErr != io.EOF || inventory.Package != inst.Package ||
-		inventory.Release != inst.Version || inventory.SourceDigest != inst.SourceDigest ||
+		inventory.Release != inst.Version ||
 		len(inventory.Wheels) > 128 {
 		return empty, exit.Named(exit.Conflict, "package_code_preparation_changed",
 			"%s code-only preparation does not match install %s", inst.Package, inst.ID)
@@ -295,20 +301,20 @@ func PreparePublishedSelection(l home.Layout, inst records.PackageInstall,
 		}
 		dependencies = append(dependencies, wheel)
 	}
-	descriptorBytes, err := os.ReadFile(launch.DescriptorPath(inst.Dir))
+	packageInterfaceBytes, err := os.ReadFile(launch.PackageInterfacePath(inst.Dir))
 	if err != nil {
-		return empty, exit.New(exit.NotFound, "cannot read installed package descriptor: %s", err)
+		return empty, exit.New(exit.NotFound, "cannot read installed package interface: %s", err)
 	}
-	descriptorDigest, _ := canonical.Spell(canonical.Digest(descriptorBytes))
-	if descriptorDigest != inst.PackageDescriptor {
-		return empty, exit.Named(exit.Conflict, "package_descriptor_changed",
-			"installed package descriptor does not match %s", inst.PackageDescriptor)
+	packageInterfaceDigest, _ := canonical.Spell(canonical.Digest(packageInterfaceBytes))
+	if packageInterfaceDigest != inst.PackageInterface {
+		return empty, exit.Named(exit.Conflict, "package_interface_changed",
+			"installed package interface does not match %s", inst.PackageInterface)
 	}
 	published := &PublishedSource{Package: inst.Package, Release: inst.Version,
-		SourceDigest: inst.SourceDigest, ProjectWheel: project, Wheels: dependencies,
+		ProjectWheel: project, Wheels: dependencies,
 		Models: append([]PublishedModel(nil), models...), Selection: Selection{
-			PackageDescriptor: ExactDocument{Bytes: descriptorBytes, Digest: descriptorDigest,
-				Length: int64(len(descriptorBytes))},
+			PackageInterface: ExactDocument{Bytes: packageInterfaceBytes, Digest: packageInterfaceDigest,
+				Length: int64(len(packageInterfaceBytes))},
 		}}
 	return runPublishedSelection(l, inst, published)
 }
@@ -324,7 +330,7 @@ func runPublishedSelection(l home.Layout, inst records.PackageInstall,
 		return empty, problem
 	}
 	if answer.Package != inst.Package || answer.Release != inst.Version ||
-		!bytes.Equal(answer.PackageDescriptor.Bytes, published.Selection.PackageDescriptor.Bytes) {
+		!bytes.Equal(answer.PackageInterface.Bytes, published.Selection.PackageInterface.Bytes) {
 		return empty, exit.Named(exit.Structural, "package_prepare_invalid",
 			"cozy-runtime returned an invalid selected package preparation")
 	}
@@ -343,10 +349,10 @@ func runPublishedSelection(l home.Layout, inst records.PackageInstall,
 }
 
 type packagePreparation struct {
-	Package           string        `json:"package"`
-	Release           string        `json:"release"`
-	PackageDescriptor ExactDocument `json:"package_descriptor"`
-	PlacementSet      ExactDocument `json:"placement_set"`
+	Package          string        `json:"package"`
+	Release          string        `json:"release"`
+	PackageInterface ExactDocument `json:"package_interface"`
+	PlacementSet     ExactDocument `json:"placement_set"`
 }
 
 // preparePackageSet runs THIS host's Runtime over the install's venv: it admits every exact
@@ -370,7 +376,7 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 		"--artifact-store", l.CAS,
 		"--package", published.Package,
 		"--release", published.Release,
-		"--release-digest", published.SourceDigest,
+		"--package-interface", launch.PackageInterfacePath(installDir),
 		"--project-wheel", published.ProjectWheel.Path,
 		"--artifact-cache", filepath.Join(installDir, "artifact-cache"),
 		"--environment-python", home.VenvPython(filepath.Join(installDir, "venv")),
@@ -408,7 +414,7 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 	}
 	if decodeErr != io.EOF || answer.Package != published.Package ||
 		answer.Release != published.Release ||
-		!validRuntimeExact(answer.PackageDescriptor) || !validRuntimeExact(answer.PlacementSet) {
+		!validRuntimeExact(answer.PackageInterface) || !validRuntimeExact(answer.PlacementSet) {
 		return empty, exit.Named(exit.Structural, "package_prepare_invalid",
 			"cozy-runtime returned an invalid package preparation result")
 	}

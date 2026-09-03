@@ -39,7 +39,6 @@ type JobSubmission struct {
 	Input          json.RawMessage `json:"input"`
 	InstallID      string          `json:"install_id,omitempty"`
 	Release        string          `json:"release,omitempty"`
-	ReleaseDigest  string          `json:"release_digest,omitempty"`
 	Rental         bool            `json:"rental,omitempty"`
 	RentalRequired bool            `json:"rental_required,omitempty"`
 	// Worker pins an internal production step to the already-attached rental that
@@ -251,7 +250,6 @@ func replayJobSubmission(sub JobSubmission,
 	return orchestrator.Submission{Kind: "job", Package: packageName,
 		Entrypoint: function, Payload: payload, Org: org,
 		InstallID: recorded.InstallID, Release: recorded.Release,
-		ReleaseDigest:      recorded.PackageRevisionDigest,
 		LocalPackageDigest: recorded.LocalPackageDigest,
 		PlanID:             recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
 		NeedsAccelerator: recorded.NeedsAccelerator, Trees: trees, Worker: recorded.Worker,
@@ -260,7 +258,7 @@ func replayJobSubmission(sub JobSubmission,
 }
 
 // resolveJob turns package+function into the orchestrator's Submission. The
-// `job_descriptor_id` is resolved HERE, from the installed package's own descriptor —
+// `job_descriptor_id` is resolved HERE, from the installed package's own PackageInterface —
 // a client never names a digest, exactly as it never names a binding plan id.
 func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrator.Submission, *exit.Error) {
 	if sub.ModelTransfer != nil && sub.Package == "" && sub.Function == "" {
@@ -276,8 +274,8 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 	out := orchestrator.Submission{
 		Kind: "job", Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org),
-		Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
-		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
+		Release: sub.Release,
+		Rental:  sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
 		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
 		ModelTransfer: sub.ModelTransfer,
 	}
@@ -309,12 +307,12 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			}
 			return s.resolveLocalJob(ctx, sub, out, refreshed)
 		}
-		if sub.InstallID != "" || sub.Release == "" || sub.ReleaseDigest == "" || len(sub.Trees) > 0 {
+		if sub.InstallID != "" || sub.Release == "" || len(sub.Trees) > 0 {
 			return out, exit.Named(exit.Validation, "rental.job_release_incomplete",
 				"remote jobs require one exact published release and no local input trees")
 		}
 		logical, job, problem := s.packages.ResolveRemoteJob(
-			sub.Package, sub.Release, sub.ReleaseDigest, sub.Function, sub.Models,
+			sub.Package, sub.Release, sub.Function, sub.Models,
 			sub.ModelTransfer != nil)
 		if problem != nil {
 			return out, problem
@@ -427,7 +425,7 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 		return out, problem
 	}
 	out.InstallID = installID
-	out.Release, out.ReleaseDigest = revision.Release, revision.SourceDigest
+	out.Release = revision.Release
 	out.LocalPackageDigest = revision.Digest
 	return out, nil
 }
@@ -491,7 +489,6 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	if spec.Rental {
 		doc["rental"] = true
 		doc["release"] = spec.Release
-		doc["release_digest"] = spec.ReleaseDigest
 	}
 	if spec.RentalRequired {
 		doc["rental_required"] = true

@@ -40,8 +40,8 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	packageDescriptor, problem := exactPackageInstallDocument(
-		"package descriptor", plan.PackageDescriptor)
+	packageInterface, problem := exactPackageInstallDocument(
+		"package interface", plan.PackageInterface)
 	if problem != nil {
 		return problem
 	}
@@ -54,10 +54,6 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		return problem
 	}
 	release = plan.Release
-	if _, err := canonical.Raw(plan.ReleaseDigest); err != nil {
-		return exit.Internalf("Tensorhub returned an invalid release digest")
-	}
-	releaseDigest := plan.ReleaseDigest
 	existingLayout, existing, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return problem
@@ -67,7 +63,8 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		existing.Close()
 		return problem
 	}
-	if existingInstall != nil && existingInstall.SourceDigest == releaseDigest &&
+	if existingInstall != nil && existingInstall.SourceKind == "tensorhub" &&
+		existingInstall.Package == ref.String() && existingInstall.Version == release &&
 		!install.CompanionsStale(existingLayout.Companions,
 			filepath.Join(existingInstall.Dir, "venv")) {
 		defer existing.Close()
@@ -79,8 +76,8 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		defer modelScratch.Release()
 		bestEffortDefaultModels(hctx, ctx, modelScratch.Path,
 			&install.PublishedSource{Package: ref.String(), Release: release,
-				SourceDigest: releaseDigest, PackageConfig: packageConfig,
-				Selection: install.Selection{PackageDescriptor: packageDescriptor}}, result)
+				PackageConfig: packageConfig,
+				Selection:     install.Selection{PackageInterface: packageInterface}}, result)
 		return emitInstallResult(ctx, existingLayout, existing, result)
 	}
 	existing.Close()
@@ -93,8 +90,8 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		return problem
 	}
 	defer work.Release()
-	published, problem := downloadPackageInstallPlan(hctx, ctx, work.Path, ref, release, releaseDigest,
-		plan, packageConfig, packageDescriptor, pyproject, uvLock)
+	published, problem := downloadPackageInstallPlan(hctx, ctx, work.Path, ref, release,
+		plan, packageConfig, packageInterface, pyproject, uvLock)
 	if problem != nil {
 		return problem
 	}
@@ -159,18 +156,18 @@ func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
 }
 
 func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch string, ref hub.Ref,
-	release, releaseDigest string, plan hub.PackageDownloadPlan, packageConfig,
-	packageDescriptor, pyproject, uvLock install.ExactDocument,
+	release string, plan hub.PackageDownloadPlan, packageConfig,
+	packageInterface, pyproject, uvLock install.ExactDocument,
 ) (*install.PublishedSource, *exit.Error) {
 	if len(plan.Downloads) == 0 || len(plan.Downloads) > hub.MaxPackageInstallDownloads {
 		return nil, exit.Internalf("Tensorhub returned an invalid package install plan")
 	}
 	published := &install.PublishedSource{
-		Package: ref.String(), Release: release, SourceDigest: releaseDigest,
+		Package: ref.String(), Release: release,
 		PackageConfig: packageConfig,
 		Pyproject:     pyproject,
 		UVLock:        uvLock,
-		Selection:     install.Selection{PackageDescriptor: packageDescriptor},
+		Selection:     install.Selection{PackageInterface: packageInterface},
 		ReportDefect:  localDefectReporter(cli, ref, release),
 	}
 	seen := map[string]bool{}
@@ -277,16 +274,16 @@ func exactPackageInstallDocument(name string, document hub.ExactDocument) (insta
 // hub bindings select (th-116): the mutable rows seeded from the shipped
 // package.toml at release commit and owner-retargetable afterwards. The
 // installed toml is never consulted; only rows naming a slot this release's
-// descriptor declares are prefetched.
+// PackageInterface declares are prefetched.
 func downloadPublishedPackageModels(ctx context.Context, cli *Context, root string,
 	published *install.PublishedSource,
 ) *exit.Error {
-	descriptor, problem := launch.DecodeDescriptor(published.Selection.PackageDescriptor.Bytes)
+	packageInterface, problem := launch.DecodePackageInterface(published.Selection.PackageInterface.Bytes)
 	if problem != nil {
 		return problem
 	}
 	declared := map[string]bool{}
-	for _, callables := range [][]launch.Entrypoint{descriptor.Entrypoints, descriptor.Jobs} {
+	for _, callables := range [][]launch.Entrypoint{packageInterface.Entrypoints, packageInterface.Jobs} {
 		for i := range callables {
 			for _, slot := range callables[i].Models {
 				declared[slot.Path] = true

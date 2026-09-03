@@ -20,7 +20,6 @@ import (
 type localPreparedSource struct {
 	manifestID     string
 	manifestLength int64
-	evidence       []byte
 	plan           *tfs.SourcePlan
 }
 
@@ -40,13 +39,8 @@ func prepareLocalTransferSources(runCtx context.Context, ctx *Context, root stri
 		if problem != nil {
 			return nil, problem
 		}
-		evidence, problem := tool.CheckpointEvidence("local", name, alias.ManifestDigest,
-			filepath.Join(root, "local-evidence.jsonl"))
-		if problem != nil {
-			return nil, problem
-		}
 		return samePreparedSource(slots, localPreparedSource{manifestID: alias.ManifestDigest,
-			manifestLength: alias.ManifestLength, evidence: evidence}), nil
+			manifestLength: alias.ManifestLength}), nil
 	}
 	if catalogModelSpelling(intent.Source) {
 		fetch := &transfer.Fetch{Tool: tool, Hub: client(ctx), Spec: intent.Source,
@@ -67,7 +61,7 @@ func prepareLocalTransferSources(runCtx context.Context, ctx *Context, root stri
 			return nil, problem
 		}
 		return samePreparedSource(slots, localPreparedSource{manifestID: fetched.ManifestID,
-			manifestLength: fetched.ManifestLength, evidence: row.CheckpointEvidence}), nil
+			manifestLength: fetched.ManifestLength}), nil
 	}
 
 	cwd, err := os.Getwd()

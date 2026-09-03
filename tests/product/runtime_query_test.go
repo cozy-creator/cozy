@@ -31,9 +31,9 @@ func TestSlowRuntimeMetadataIsAnswered(t *testing.T) {
 		`printf '{"job_descriptor_id":"jd-slow"}\n'`+"\n"), 0o700))
 
 	facts := &launch.Facts{
-		Install:           records.PackageInstall{Package: "acme/slow"},
-		PackageDescriptor: &launch.PackageDescriptor{Jobs: []launch.Entrypoint{{Name: "render"}}},
-		RuntimeCLI:        launch.RuntimeCLI{Bin: slowRuntime, Dir: root, Home: root}, //cozy:allow drives the metadata verb directly
+		Install:          records.PackageInstall{Package: "acme/slow"},
+		PackageInterface: &launch.PackageInterface{Jobs: []launch.Entrypoint{{Name: "render"}}},
+		RuntimeCLI:       launch.RuntimeCLI{Bin: slowRuntime, Dir: root, Home: root}, //cozy:allow drives the metadata verb directly
 	}
 
 	started := time.Now()

@@ -91,7 +91,7 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker) *exit.Error {
 		Revision: rev, WireMinor: pb.WireMinor,
 		Posture: pb.Posture_POSTURE_ACCEPTING,
 		Mode: &pb.DesiredWorkerState_Job{Job: &pb.JobDirective{
-			BuildId:         w.spec.Placement.PackageRevisionDigest,
+			BuildId:         w.spec.Placement.PlacementSetDigest,
 			JobDescriptorId: plan.DescriptorID,
 			ResourceCaps: &pb.ResourceCaps{
 				DeviceRequired: gpuCountOf(plan) > 0,

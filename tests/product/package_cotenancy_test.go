@@ -87,10 +87,10 @@ func TestCoTenantPackagesPreparePerPackage(t *testing.T) {
 	connection, _ := startFakePod(t, root, pod)
 	o := hostOwner(t, "podhost-cotenant", rentalWiring(connection, private))
 
-	submit := func(pkg, idem, digest string) string {
+	submit := func(pkg, idem string) string {
 		requestID, _, e := o.c.Submit(orchestrator.Submission{
 			IdemKey: idem, Package: pkg, Entrypoint: "tile", PlanID: podPlanID(pkg),
-			Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat(digest, 32),
+			Release: "1.0.0",
 			Payload: []byte(`{"size":16}`), Outputs: []string{"image"},
 			Worker: podRental, Rental: true, RentalRequired: true,
 		})
@@ -99,7 +99,7 @@ func TestCoTenantPackagesPreparePerPackage(t *testing.T) {
 	}
 
 	// The first tenant prepares, converges, and is OFFERED before the second exists.
-	submit("acme/alpha", "cotenant-alpha", "31")
+	submit("acme/alpha", "cotenant-alpha")
 	waitUntil(t, "the first tenant's offer", func() bool {
 		pod.mu.Lock()
 		defer pod.mu.Unlock()
@@ -115,7 +115,7 @@ func TestCoTenantPackagesPreparePerPackage(t *testing.T) {
 
 	// The second tenant joins the SAME rental (run 146: routing co-tenants a second
 	// package onto the machine already serving the first).
-	submit("acme/beta", "cotenant-beta", "32")
+	submit("acme/beta", "cotenant-beta")
 	waitUntil(t, "the second tenant's offer", func() bool {
 		pod.mu.Lock()
 		defer pod.mu.Unlock()
@@ -181,16 +181,14 @@ func TestRun146ShapePreparesClean(t *testing.T) {
 	instance, _, _, e := o.c.EnsureRental(podRental)
 	fatal(t, e)
 	fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
-		Package: "paul/minimax-h3-tools", Release: "2.2.1",
-		ReleaseDigest: "sha256:" + strings.Repeat("41", 32)}}, nil))
+		Package: "paul/minimax-h3-tools", Release: "2.2.1"}}, nil))
 	waitUntil(t, "the producer's placement_set", func() bool {
 		pod.mu.Lock()
 		defer pod.mu.Unlock()
 		return len(pod.desired) >= 1
 	})
 	fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
-		Package: "paul/anima", Release: "1.2.0",
-		ReleaseDigest: "sha256:" + strings.Repeat("42", 32)}},
+		Package: "paul/anima", Release: "1.2.0"}},
 		[]*pb.DownloadModelRef{{Package: "paul/anima", Slot: "unet", Model: "paul/anima-weights",
 			Release: "1.0.0", Manifest: "sha256:" + strings.Repeat("43", 32)}}))
 	waitUntil(t, "the united two-package placement_set", func() bool {
@@ -245,8 +243,8 @@ func TestPodRefusesMergedDelegation(t *testing.T) {
 	connection, pemPath := startFakePod(t, root, pod)
 
 	merged, signature, problem := rentalWiringSigner(connection, private, []*pb.DownloadPackageRef{
-		{Package: "acme/alpha", Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("31", 32)},
-		{Package: "acme/beta", Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("31", 32)},
+		{Package: "acme/alpha", Release: "1.0.0"},
+		{Package: "acme/beta", Release: "1.0.0"},
 	}, nil)
 	if problem != nil {
 		t.Fatal(problem.Message)

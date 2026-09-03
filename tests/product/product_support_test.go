@@ -94,7 +94,7 @@ func hostOwner(t *testing.T, name string, with ...func(*orchestrator.Options)) *
 	must(t, err)
 	options := orchestrator.Options{
 		Cfg: cfg, Layout: l, Store: st, Yield: "smart", Log: log,
-		ConfigDigest: "sha256:" + strings.Repeat("22", 32), MaxOutputMiB: 8,
+		MaxOutputMiB: 8,
 	}
 	for _, mutate := range with {
 		mutate(&options)
@@ -147,12 +147,12 @@ func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec
 	setBytes, setDigest, _ := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{{
 		PlacementId: "plc-fake-" + name,
 		PackageMode: &pb.Placement_Package{Package: &pb.PackageSelection{
-			Package: "fake/" + name, Release: "1.0.0", ReleaseDigest: ref("fake-release").Digest,
+			Package: "fake/" + name, Release: "1.0.0",
 			ProjectWheel: &pb.WheelFact{Ref: ref("fake-project-wheel"), Distribution: "fake-" + name,
 				Version: "1.0.0", Filename: "fake_" + name + "-1.0.0-py3-none-any.whl",
 				ImportRoots: []string{"fake_" + name}, Tags: []string{"py3-none-any"}}}},
 		EnvironmentDigest: canonical.Digest(environmentBytes),
-		PackageDescriptor: ref("fake-descriptor"), BindingsDigest: canonical.Digest(bindingsBytes),
+		PackageInterface:  ref("fake-interface"), BindingsDigest: canonical.Digest(bindingsBytes),
 		Entrypoints: []*pb.Entrypoint{{Name: "fake", EntrypointBindingDigest: entrypointDigest}},
 		Environment: &pb.Environment{},
 	}}})

@@ -24,8 +24,8 @@ const plainEncoding = `{"doc":"Plain little-endian row-major storage: one ` + "`
 
 // TestModelListShowsEachModelsBytesAndWhatItShares retains two local models through the
 // product's own TensorFS path — blobs put, a CozyTensors header and manifest reproduced
-// over them, the alias replaced with exact evidence — that share one config blob and one
-// tensor segment. `cozy model list` then shows SIZE and SHARED to the byte, JSON carries
+// over them and the alias replaced with exact custody — that share one tensor segment while
+// each self-contained header carries its own inline config. `cozy model list` then shows SIZE and SHARED to the byte, JSON carries
 // integers plus `unique`, and the store footer appears only once a blob is unreferenced.
 // The expected numbers come from `tfs manifest walk`, a second TensorFS surface.
 func TestModelListShowsEachModelsBytesAndWhatItShares(t *testing.T) {
@@ -45,24 +45,20 @@ func TestModelListShowsEachModelsBytesAndWhatItShares(t *testing.T) {
 	fatal(t, e)
 	store := tfsStore{t: t, bin: tool.Bin, env: cfg.Tool(), root: tool.Root, work: t.TempDir()}
 
-	configBlob := store.put("config.json", []byte(`{"kind":"shared-config"}`))
 	shared := store.put("shared.bin", bytes.Repeat([]byte{7}, 300))
 	manifestBytes := map[string]int64{}
 	model := func(name string, own byte) map[string]int64 {
 		ownBlob := store.put(name+"-own.bin", bytes.Repeat([]byte{own}, 300))
-		header := fmt.Sprintf(`{"format":"cozytensors/1","configs":[],"assets":[],"encodings":[%s],`+
+		header := fmt.Sprintf(`{"format":"cozytensors/1","configs":[["model","{\"kind\":\"shared-config\"}"]],"assets":[],"encodings":[%s],`+
 			`"components":[["model",[`+
 			`["own","f32",[75],0,[["value","f32",[75],{"segments":[["sha256:%s",300]]}]]],`+
 			`["shared","f32",[75],0,[["value","f32",[75],{"segments":[["sha256:%s",300]]}]]]]]]}`,
 			plainEncoding, ownBlob.sha256, shared.sha256)
-		entries := fmt.Sprintf(`[["config.json","file",{"length":%d,"sha256":"%s"}],["model.cozytensors","cozytensors"]]`,
-			configBlob.length, configBlob.sha256)
+		entries := `[["model.cozytensors","cozytensors"]]`
 		manifest := store.reproduce(name, header, entries, `[["model","own"],["model","shared"]]`)
 		manifestBytes[name] = manifest.length
-		evidence := filepath.Join(store.work, name+"-evidence.json")
-		must(t, os.WriteFile(evidence, []byte(`{"classification_digest":"`+store.topology(manifest.header)+`"}`), 0o600))
 		if _, e := tool.ReplaceLocal(name, "sha256:"+shared.sha256, "absent", "sha256:"+manifest.sha256,
-			manifest.length, evidence, nil); e != nil {
+			manifest.length); e != nil {
 			t.Fatalf("local/%s: %s", name, briefly(e))
 		}
 		return store.walk(manifest.sha256)
@@ -80,8 +76,8 @@ func TestModelListShowsEachModelsBytesAndWhatItShares(t *testing.T) {
 			sharedBytes += length
 		}
 	}
-	if sharedBytes != configBlob.length+shared.length {
-		t.Fatalf("the fixture shares %d bytes, want the config and one segment (%d)", sharedBytes, configBlob.length+shared.length)
+	if sharedBytes != shared.length {
+		t.Fatalf("the fixture shares %d bytes, want one tensor segment (%d)", sharedBytes, shared.length)
 	}
 	union := sum(alpha) + sum(beta) - sharedBytes
 
@@ -135,7 +131,7 @@ func TestModelListShowsEachModelsBytesAndWhatItShares(t *testing.T) {
 	if usage = modelListJSON(t, root); usage.Store.Unreferenced != 0 || usage.Store.Size != union {
 		t.Errorf("store json after gc = %+v, want unreferenced 0 and size %d", usage.Store, union)
 	}
-	if !store.present(shared.sha256) || !store.present(configBlob.sha256) {
+	if !store.present(shared.sha256) {
 		t.Fatalf("gc removed a referenced blob")
 	}
 
@@ -152,7 +148,7 @@ func TestModelListShowsEachModelsBytesAndWhatItShares(t *testing.T) {
 		t.Errorf("store json after removing alpha = %+v (%d models), want beta alone at %d, unreferenced 0",
 			usage.Store, len(usage.Models), sum(beta))
 	}
-	if !store.present(shared.sha256) || !store.present(configBlob.sha256) {
+	if !store.present(shared.sha256) {
 		t.Fatalf("removing alpha took a blob beta still reaches")
 	}
 }
@@ -215,10 +211,9 @@ type reproduced struct {
 }
 
 var (
-	admittedLine   = regexp.MustCompile(`admitted sha256:([0-9a-f]{64}) length=(\d+)`)
-	headerLine     = regexp.MustCompile(`header\s+sha256:([0-9a-f]{64})`)
-	manifestLine   = regexp.MustCompile(`manifest\s+sha256:([0-9a-f]{64}) length=(\d+)`)
-	topologyDigest = regexp.MustCompile(`topology_digest (sha256:[0-9a-f]{64})`)
+	admittedLine = regexp.MustCompile(`admitted sha256:([0-9a-f]{64}) length=(\d+)`)
+	headerLine   = regexp.MustCompile(`header\s+sha256:([0-9a-f]{64})`)
+	manifestLine = regexp.MustCompile(`manifest\s+sha256:([0-9a-f]{64}) length=(\d+)`)
 )
 
 func (s tfsStore) run(args ...string) string {
@@ -262,15 +257,6 @@ func (s tfsStore) reproduce(name, header, entries, order string) reproduced {
 	}
 	length, _ := strconv.ParseInt(m[2], 10, 64)
 	return reproduced{blobRef: blobRef{sha256: m[1], length: length}, header: h[1]}
-}
-
-func (s tfsStore) topology(header string) string {
-	s.t.Helper()
-	m := topologyDigest.FindStringSubmatch(s.run("checkpoint", "info", s.root, header))
-	if m == nil {
-		s.t.Fatalf("tfs checkpoint info printed no topology digest")
-	}
-	return m[1]
 }
 
 // walk is the manifest's distinct blob closure by TensorFS's other surface.

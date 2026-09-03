@@ -106,13 +106,6 @@ func (p *fakePod) served(d *pb.DesiredWorkerState, epoch uint64) *pb.WorkerFrame
 			Serving:         pb.ServingState_SERVING_STATE_DISPATCHABLE, ExecutorEpoch: 1,
 			PlacementSetDigest: set.PlacementSetDigest,
 			EnvironmentDigest:  placement.Str("environment_digest"),
-			ConfigDigest:       "sha256:" + strings.Repeat("26", 32),
-		}
-		development := placement.Sub("development")
-		if development != nil {
-			row.PackageRevisionDigest = development.Str("local_revision_digest")
-		} else {
-			row.PackageRevisionDigest = placement.Sub("package").Str("release_digest")
 		}
 		for _, entrypoint := range placement.List("entrypoints") {
 			if digest, err := canonical.Raw(entrypoint.Str("entrypoint_binding_digest")); err == nil {
@@ -350,7 +343,7 @@ func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream g
 				Distribution: "weightless", Version: selected.Package.Release, Filename: project.Filename,
 				ImportRoots: []string{"weightless"}, Tags: []string{"py3-none-any"}}}},
 		EnvironmentDigest: bytes.Repeat([]byte{0x23}, 32),
-		PackageDescriptor: &pb.Ref{Digest: bytes.Repeat([]byte{0x24}, 32), Length: 2048},
+		PackageInterface:  &pb.Ref{Digest: bytes.Repeat([]byte{0x24}, 32), Length: 2048},
 		BindingsDigest:    bytes.Repeat([]byte{0x25}, 32),
 		Entrypoints:       []*pb.Entrypoint{{Name: "tile", EntrypointBindingDigest: bytes.Repeat([]byte{0x34}, 32)}},
 		Environment:       &pb.Environment{},
@@ -413,13 +406,9 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 		return nil
 	}
 	name, release := selected[0].Str("package"), selected[0].Str("release")
-	releaseDigest, err := canonical.Raw(selected[0].Str("release_digest"))
-	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "release digest: %v", err)
-	}
 	distribution := name[strings.IndexByte(name, '/')+1:]
 	setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{
-		podPlacement(call.PackageSet.DownloadDelegation, name, release, releaseDigest, distribution),
+		podPlacement(call.PackageSet.DownloadDelegation, name, release, distribution),
 	}})
 	if err != nil {
 		return err
@@ -445,18 +434,17 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 // Runtime's own derivations: `package-` + the first 24 hex of sha256 over the exact
 // delegation bytes, and one deterministic entrypoint per package so a test can name the
 // plan it will dispatch (podPlanID).
-func podPlacement(delegation []byte, name, release string, releaseDigest []byte, distribution string) *pb.Placement {
+func podPlacement(delegation []byte, name, release, distribution string) *pb.Placement {
 	seed := sha256.Sum256(delegation)
 	return &pb.Placement{
 		PlacementId: "package-" + hex.EncodeToString(seed[:])[:24],
 		PackageMode: &pb.Placement_Package{Package: &pb.PackageSelection{Package: name, Release: release,
-			ReleaseDigest: releaseDigest,
 			ProjectWheel: &pb.WheelFact{Ref: &pb.Ref{Digest: sha256Of([]byte("wheel:" + name)), Length: 4096},
 				Distribution: distribution, Version: release,
 				Filename:    strings.ReplaceAll(distribution, "-", "_") + "-" + release + "-py3-none-any.whl",
 				ImportRoots: []string{strings.ReplaceAll(distribution, "-", "_")}, Tags: []string{"py3-none-any"}}}},
 		EnvironmentDigest: sha256Of([]byte("environment:" + name)),
-		PackageDescriptor: &pb.Ref{Digest: sha256Of([]byte("descriptor:" + name)), Length: 2048},
+		PackageInterface:  &pb.Ref{Digest: sha256Of([]byte("interface:" + name)), Length: 2048},
 		BindingsDigest:    sha256Of([]byte("bindings:" + name)),
 		Entrypoints:       []*pb.Entrypoint{{Name: "tile", EntrypointBindingDigest: sha256Of([]byte("entrypoint:" + name))}},
 		Environment:       &pb.Environment{},
@@ -609,7 +597,7 @@ func TestPodHostThreeStepSequence(t *testing.T) {
 	}
 
 	fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
-		Package: "cozy/h3-package", Release: "1.0.7", ReleaseDigest: "sha256:" + strings.Repeat("21", 32)}}, nil))
+		Package: "cozy/h3-package", Release: "1.0.7"}}, nil))
 	waitUntil(t, "the prepared placement_set on WorkerControl", func() bool {
 		pod.mu.Lock()
 		defer pod.mu.Unlock()
@@ -714,7 +702,7 @@ func stageLocalRevision(t *testing.T, root string) localpackage.Revision {
 	}
 	return localpackage.Revision{Package: "local/weightless", Release: "1.0.0",
 		SourceDigest: "sha256:" + strings.Repeat("31", 32), Digest: "sha256:" + strings.Repeat("32", 32),
-		DescriptorDigest: "sha256:" + strings.Repeat("33", 32), DescriptorLength: 512, Files: files}
+		PackageInterfaceDigest: "sha256:" + strings.Repeat("33", 32), PackageInterfaceLength: 512, Files: files}
 }
 
 // submitPrivateRental records the editable install the request names and queues the
@@ -729,7 +717,7 @@ func submitPrivateRental(t *testing.T, o *owner, revision localpackage.Revision,
 	planID := "sha256:" + strings.Repeat("34", 32)
 	requestID, _, e := o.c.Submit(orchestrator.Submission{
 		IdemKey: idem, Package: revision.Package, Entrypoint: "tile", PlanID: planID,
-		Release: revision.Release, ReleaseDigest: revision.SourceDigest,
+		Release:            revision.Release,
 		LocalPackageDigest: revision.Digest, Payload: []byte(`{"size":48}`), Outputs: []string{"image"},
 		Worker: podRental, InstallID: install.ID, Rental: true, RentalRequired: true,
 	})
@@ -816,9 +804,9 @@ func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 	}
 	spec, err := canonical.Read(pod.offers[0].InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
 	must(t, err)
-	if spec.Str("package_revision_digest") != revision.Digest || spec.Str("environment_digest") != "" {
-		t.Fatalf("the InvocationSpec names revision %s and environment %q; want the local revision %s and no environment",
-			spec.Str("package_revision_digest"), spec.Str("environment_digest"), revision.Digest)
+	if spec.Str("environment_digest") != "" {
+		t.Fatalf("the local-package InvocationSpec names environment %q; want none",
+			spec.Str("environment_digest"))
 	}
 }
 

@@ -102,9 +102,9 @@ type Resolver interface {
 	LocalRevision(string, string) (localpackage.Revision, *exit.Error)
 	ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error)
 	ResolveInstall(installID string, models []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error)
-	ResolveRemoteRelease(pkg, release, digest, function string, models []orchestrator.ModelRef) (
+	ResolveRemoteRelease(pkg, release, function string, models []orchestrator.ModelRef) (
 		orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error)
-	ResolveRemoteJob(pkg, release, digest, function string, models []orchestrator.ModelRef,
+	ResolveRemoteJob(pkg, release, function string, models []orchestrator.ModelRef,
 		deferredModels bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error)
 	Entrypoint(installID, name string) (*launch.Entrypoint, bool, *exit.Error)
 	// Jobs names the `@job` functions one installed package registers, with the

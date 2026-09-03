@@ -1,18 +1,15 @@
 package modeltransfer
 
 import (
-	"strings"
-
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // ValidateProducer checks only the callable shape model download/upload needs.
-// A producer may leave its output contract open when the exact source determines
-// the topology; TensorFS still derives and verifies the produced checkpoint facts.
-// The descriptor declares no source selection (cr-077): every model input is bound
+// Output tensor schemas depend on the selected source and remain owned by the produced
+// CozyTensors header; publication declares only bounded output slots here.
+// The PackageInterface declares no source selection (cr-077): every model input is bound
 // by the caller's --source-profile at dispatch.
 func ValidateProducer(name string, job *launch.Entrypoint, supplied map[string]string) *exit.Error {
 	if len(job.Models) == 0 {
@@ -46,9 +43,8 @@ func ValidateProducer(name string, job *launch.Entrypoint, supplied map[string]s
 	return nil
 }
 
-// ValidateSubmission binds a model transfer intent to the already-resolved job
-// descriptor. An omitted contract matches only another omission; when a producer
-// declares one, exact topology and encoding equality remains mandatory.
+// ValidateSubmission binds a model-transfer intent to the already-resolved job
+// PackageInterface by model-input and output-slot names only.
 func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 	intent := spec.ModelTransfer
 	if intent == nil {
@@ -59,33 +55,31 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 		if !platformPassThrough {
 			return exit.New(exit.Validation, "platform pass-through requires exact package and function")
 		}
-		if len(intent.Outputs) != 1 || intent.Outputs[0].Name != "model" ||
-			intent.Outputs[0].RequiredContract != nil {
+		if len(intent.Outputs) != 1 || intent.Outputs[0].Name != "model" {
 			return exit.New(exit.Validation, "platform pass-through requires exactly output model")
 		}
 		return nil
 	}
 	if len(intent.SourceProfiles) == 0 || len(intent.Outputs) != len(spec.WeightsOutputs) ||
 		!profilesCoverParams(intent.SourceProfiles, spec.ProducerParams) {
-		return exit.New(exit.Validation, "producer transfer inputs/outputs do not match the job descriptor")
+		return exit.New(exit.Validation, "producer transfer inputs/outputs do not match the job PackageInterface")
 	}
-	declared := make(map[string]*orchestrator.WeightsOutput, len(spec.WeightsOutputs))
+	declared := make(map[string]bool, len(spec.WeightsOutputs))
 	for index := range spec.WeightsOutputs {
 		output := &spec.WeightsOutputs[index]
-		declared[output.OutputID] = output
+		declared[output.OutputID] = true
 	}
 	for _, output := range intent.Outputs {
-		declaredOutput := declared[output.Name]
-		if declaredOutput == nil || !sameContract(output.RequiredContract, declaredOutput.RequiredContract) {
+		if !declared[output.Name] {
 			return exit.New(exit.Validation,
-				"producer transfer output %s differs from its descriptor contract", output.Name)
+				"producer transfer output %s is absent from its PackageInterface", output.Name)
 		}
 	}
 	return nil
 }
 
 // profilesCoverParams requires the caller's intent (--source-profile) to bind
-// exactly the job's model inputs: the descriptor declares no source selection
+// exactly the job's model inputs: the PackageInterface declares no source selection
 // (cr-077), so dispatch is the one place a producer's sources are named.
 func profilesCoverParams(intent map[string]string, params []string) bool {
 	if len(intent) != len(params) {
@@ -97,12 +91,4 @@ func profilesCoverParams(intent map[string]string, params []string) bool {
 		}
 	}
 	return true
-}
-
-func sameContract(left, right *records.ModelTransferContract) bool {
-	if left == nil || right == nil {
-		return left == nil && right == nil
-	}
-	return left.TopologyDigest == right.TopologyDigest &&
-		strings.Join(left.Encodings, "\x00") == strings.Join(right.Encodings, "\x00")
 }

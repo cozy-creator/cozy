@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -20,7 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/scratch"
-	"github.com/cozy-creator/cozy/internal/tfs"
 	"github.com/cozy-creator/cozy/internal/transfer"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -181,25 +179,18 @@ func (o *modelTransferOwner) PassThrough(parent context.Context, requestID strin
 			return problem
 		}
 		if problem := tool.InstallLocal(source.plan.Session, temporary, intent.SourceSelection,
-			observed, intent.Source, intent.SourceLicense); problem != nil {
+			observed); problem != nil {
 			return problem
 		}
 		alias, problem := tool.ResolveLocal(temporary)
 		if problem != nil {
 			return problem
 		}
-		evidence, problem := tool.CheckpointEvidence("local", temporary, alias.ManifestDigest,
-			filepath.Join(work.Path, "temp-evidence.jsonl"))
-		if problem != nil {
-			return problem
-		}
-		source.manifestID, source.manifestLength, source.evidence = alias.ManifestDigest,
-			alias.ManifestLength, evidence
+		source.manifestID, source.manifestLength = alias.ManifestDigest, alias.ManifestLength
 		defer tool.RemoveLocal(temporary, alias.RepositoryDigest)
 	}
 	weights := records.ModelTransferWeights{RequestID: requestID, OutputSlot: "model",
-		ManifestID: source.manifestID, ManifestLength: source.manifestLength,
-		Evidence: source.evidence}
+		ManifestID: source.manifestID, ManifestLength: source.manifestLength}
 	if problem := o.store.RecordModelTransferWeights(weights); problem != nil {
 		return problem
 	}
@@ -243,21 +234,19 @@ func (o *modelTransferOwner) Finalize(ctx context.Context, requestID string,
 			"model transfer %s has %d of %d required outputs", requestID, len(rows),
 			len(intent.Outputs))
 	}
-	contracts := make(map[string]*records.ModelTransferContract, len(intent.Outputs))
+	declared := make(map[string]bool, len(intent.Outputs))
 	for _, output := range intent.Outputs {
-		contracts[output.Name] = output.RequiredContract
+		declared[output.Name] = true
 	}
 	checkpoints := make(map[string]string, len(rows))
 	for _, weights := range rows {
-		contract, declared := contracts[weights.OutputSlot]
-		if !declared {
+		if !declared[weights.OutputSlot] {
 			return exit.Named(exit.Conflict, "model_transfer.output_undeclared",
-				"weights output %s is absent from the accepted producer descriptor",
+				"weights output %s is absent from the accepted producer package interface",
 				weights.OutputSlot)
 		}
 		if weights.FinalID == "" {
-			finalID, problem := o.finalizeOutput(ctx, *intent, request.Worker, weights,
-				contract, mover)
+			finalID, problem := o.finalizeOutput(ctx, *intent, request.Worker, weights, mover)
 			if problem != nil {
 				return problem
 			}
@@ -273,7 +262,7 @@ func (o *modelTransferOwner) Finalize(ctx context.Context, requestID string,
 
 func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	intent records.ModelTransferIntent, worker string, weights records.ModelTransferWeights,
-	contract *records.ModelTransferContract, mover orchestrator.ModelTransferMover,
+	mover orchestrator.ModelTransferMover,
 ) (string, *exit.Error) {
 	cli := o.cliContext(intent, worker != "")
 	if intent.Kind == "model-download" {
@@ -292,13 +281,9 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 		if problem != nil {
 			return "", problem
 		}
-		evidencePath := filepath.Join(work.Path, "local-evidence-"+weights.OutputSlot+".json")
-		if err := os.WriteFile(evidencePath, weights.Evidence, 0o600); err != nil {
-			return "", exit.Internalf("cannot stage local checkpoint evidence: %s", err)
-		}
 		alias, problem := tool.ReplaceLocal(name,
 			localFinalizationSelection(weights.RequestID, weights.OutputSlot), observed,
-			weights.ManifestID, weights.ManifestLength, evidencePath, expectedTFSContract(contract))
+			weights.ManifestID, weights.ManifestLength)
 		if problem != nil {
 			return "", problem
 		}
@@ -323,20 +308,13 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 		}
 		defer work.Release()
 		upload := &transfer.Upload{Tool: tool, Hub: publicationClient, Ref: ref,
-			ManifestID: weights.ManifestID, CheckpointEvidence: weights.Evidence,
-			Session: transferOutputOperation(weights.RequestID, weights.OutputSlot),
-			Reason:  "cozy model upload " + intent.Source + " " + intent.Destination,
-			Scratch: work.Path, Progress: progress(cli),
-			ExpectedContract: expectedHubContract(contract)}
+			ManifestID: weights.ManifestID,
+			Session:    transferOutputOperation(weights.RequestID, weights.OutputSlot),
+			Reason:     "cozy model upload " + intent.Source + " " + intent.Destination,
+			Scratch:    work.Path, Progress: progress(cli)}
 		result, problem := upload.Run(ctx)
 		if problem != nil {
 			return "", problem
-		}
-		if contract != nil && (result.TopologyDigest != contract.TopologyDigest ||
-			!sameStrings(result.EncodingSet, contract.Encodings)) {
-			return "", exit.Named(exit.Conflict, "model_transfer.contract_mismatch",
-				"Tensorhub-derived contract for output %s differs from the producer descriptor",
-				weights.OutputSlot)
 		}
 		return result.PublishID, nil
 	}
@@ -390,50 +368,19 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	}
 	checkpoint, problem := publicationClient.FinalizePublication(ctx, ref, operation,
 		hub.FinalizePublicationRequest{ManifestID: weights.ManifestID,
-			ManifestLength:           weights.ManifestLength,
-			CheckpointEvidenceBase64: hub.B64(weights.Evidence),
-			ExpectedContract:         expectedHubContract(contract)},
+			ManifestLength: weights.ManifestLength},
 		"cozy model upload "+intent.Source+" "+intent.Destination)
 	if problem != nil {
 		return "", problem
 	}
 	if problem := transfer.ValidateFinalizedCheckpoint(checkpoint, operation,
-		weights.ManifestID, weights.ManifestLength, weights.Evidence, totals); problem != nil {
+		weights.ManifestID, weights.ManifestLength, totals); problem != nil {
 		return "", problem
 	}
-	if contract != nil && (checkpoint.TopologyDigest != contract.TopologyDigest ||
-		!sameStrings(checkpoint.Contract.Encoding.Set, contract.Encodings)) {
-		return "", exit.Named(exit.Conflict, "model_transfer.contract_mismatch",
-			"Tensorhub-derived contract for output %s differs from the producer descriptor",
-			weights.OutputSlot)
-	}
 	return checkpoint.PublishID, nil
-}
-
-func expectedHubContract(contract *records.ModelTransferContract) *hub.ExpectedModelContract {
-	if contract == nil {
-		return nil
-	}
-	return &hub.ExpectedModelContract{TopologyDigest: contract.TopologyDigest,
-		Encodings: append([]string(nil), contract.Encodings...)}
-}
-
-func expectedTFSContract(contract *records.ModelTransferContract) *tfs.ExpectedModelContract {
-	if contract == nil {
-		return nil
-	}
-	return &tfs.ExpectedModelContract{TopologyDigest: contract.TopologyDigest,
-		Encodings: append([]string(nil), contract.Encodings...)}
 }
 
 func transferOutputOperation(requestID, slot string) string {
 	sum := sha256.Sum256([]byte(requestID + "\x00" + slot))
 	return "model-artifact-" + hex.EncodeToString(sum[:])
-}
-
-func sameStrings(left, right []string) bool {
-	left, right = append([]string(nil), left...), append([]string(nil), right...)
-	sort.Strings(left)
-	sort.Strings(right)
-	return strings.Join(left, "\x00") == strings.Join(right, "\x00")
 }

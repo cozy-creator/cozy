@@ -50,6 +50,40 @@ func waitEnvelope(eventType string, at time.Time, payload map[string]any) locala
 		At: at.UTC().Format(time.RFC3339Nano), Payload: payload}
 }
 
+func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
+	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
+	frame := func(stageFraction, overallFraction float64, position int) localapi.Event {
+		return localapi.Event{Type: "request.progress", RequestID: "req-progress", Attempt: 1,
+			Payload: map[string]any{"value": map[string]any{
+				"stage": "tile_steps", "stage_fraction": stageFraction,
+				"overall_fraction": overallFraction, "position": float64(position),
+				"total": float64(100), "step_ms": float64(20),
+			}}}
+	}
+	p.On(frame(0.50, 0.10, 50))
+	if got := buf.String(); !strings.Contains(got, "overall") ||
+		!strings.Contains(got, "tile_steps 50/100") || !strings.Contains(got, "50% stage") ||
+		strings.Contains(got, "ETA") {
+		t.Fatalf("first progress sample conflated stage and overall facts: %q", got)
+	}
+	p.On(frame(0.60, 0.20, 60))
+	if got := buf.String(); !strings.Contains(got, "20%") || !strings.Contains(got, "ETA ~") {
+		t.Fatalf("forward overall progress did not produce a whole-job ETA: %q", got)
+	}
+	p.Done()
+
+	p, buf = progressSink(output.Mode{Human: true, Color: true}, false)
+	p.On(localapi.Event{Type: "request.progress", RequestID: "req-stage", Attempt: 1,
+		Payload: map[string]any{"value": map[string]any{
+			"stage": "encode", "stage_fraction": float64(0.7), "step_ms": float64(12),
+		}}})
+	if got := buf.String(); !strings.Contains(got, "70%") || !strings.Contains(got, "stage") ||
+		strings.Contains(got, "overall") || strings.Contains(got, "ETA") {
+		t.Fatalf("stage-only progress was presented as whole-job progress: %q", got)
+	}
+	p.Done()
+}
+
 func TestWaitLinesAreStageHonest(t *testing.T) {
 	cases := []struct {
 		name    string

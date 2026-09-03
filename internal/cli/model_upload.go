@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/api"
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	packageref "github.com/cozy-creator/cozy/internal/install"
@@ -44,8 +43,8 @@ type producerPlan struct {
 	Name             string
 	InstallID        string
 	Release          string
-	ReleaseDigest    string
-	Descriptor       *launch.PackageDescriptor
+	SourceDigest     string
+	PackageInterface *launch.PackageInterface
 	Job              *launch.Entrypoint
 	Pin              modeltransfer.JobPin
 	SourceProfiles   map[string]string
@@ -175,7 +174,8 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 	if producer != nil {
 		plan.Producer, plan.ProducerInstallID = producer.Name, producer.InstallID
 		plan.ProducerRelease = producer.Release
-		plan.ProducerDigest, plan.DescriptorDigest = producer.ReleaseDigest, producer.Descriptor.Digest
+		plan.ProducerSourceDigest = producer.SourceDigest
+		plan.PackageInterfaceDigest = producer.PackageInterface.Digest
 		pin := producer.Pin
 		plan.Job, plan.SourceProfiles, plan.Outputs = &pin, producer.SourceProfiles, producer.Outputs
 	} else {
@@ -240,7 +240,6 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 	if producer != nil {
 		submission.Package, submission.Function = producer.Pin.Package, producer.Pin.Function
 		submission.InstallID, submission.Release = producer.Pin.InstallID, producer.Pin.Release
-		submission.ReleaseDigest = producer.Pin.ReleaseDigest
 		if kind == "model-upload" {
 			submission.Org = strings.Split(destination, "/")[0]
 		}
@@ -284,13 +283,7 @@ func modelTransferIntent(plan modeltransfer.Plan) records.ModelTransferIntent {
 	}
 	outputs := make([]records.ModelTransferOutput, 0, len(plan.Outputs))
 	for _, output := range plan.Outputs {
-		var contract *records.ModelTransferContract
-		if output.RequiredContract != nil {
-			contract = &records.ModelTransferContract{TopologyDigest: output.RequiredContract.TopologyDigest,
-				Encodings: append([]string(nil), output.RequiredContract.Encodings...)}
-		}
-		outputs = append(outputs, records.ModelTransferOutput{Name: output.Name,
-			RequiredContract: contract})
+		outputs = append(outputs, records.ModelTransferOutput{Name: output.Name})
 	}
 	return records.ModelTransferIntent{Kind: plan.Instruction.Kind, Destination: plan.Destination,
 		Source: plan.Source, SourceSelection: plan.SourceSelection, SourceLicense: plan.SourceLicense,
@@ -498,8 +491,8 @@ func resolveProducerPlan(ctx *Context, raw string, supplied map[string]string) (
 	if problem != nil {
 		return nil, problem
 	}
-	descriptor := selected.Descriptor
-	job, problem := descriptor.Function(target.Function)
+	packageInterface := selected.PackageInterface
+	job, problem := packageInterface.Function(target.Function)
 	if problem != nil || job.Kind != "job" {
 		return nil, exit.Named(exit.Validation, "model_producer.not_job",
 			"--producer %s does not name one ordinary job callable", raw)
@@ -509,27 +502,26 @@ func resolveProducerPlan(ctx *Context, raw string, supplied map[string]string) (
 	}
 	plan := &producerPlan{Name: target.Selector + "/" + target.Function,
 		InstallID: selected.InstallID, Release: selected.Release,
-		ReleaseDigest: selected.ReleaseDigest,
-		Descriptor:    descriptor, Job: job,
+		SourceDigest:     selected.SourceDigest,
+		PackageInterface: packageInterface, Job: job,
 		NeedsAccelerator: launch.AcceleratorRequired(selected.Requirements),
 		SourceProfiles:   map[string]string{}}
 	plan.Pin = modeltransfer.JobPin{Callable: plan.Name, Package: target.Package,
 		Function: target.Function, InstallID: selected.InstallID, Release: selected.Release,
-		ReleaseDigest: selected.ReleaseDigest, DescriptorID: job.DescriptorID}
+		SourceDigest: selected.SourceDigest, DescriptorID: job.DescriptorID}
 	for _, slot := range job.Models {
 		plan.SourceProfiles[slot.Param] = supplied[slot.Param]
 	}
 	for _, output := range job.WeightsOutputs {
-		plan.Outputs = append(plan.Outputs, modeltransfer.OutputPin{Name: output.OutputID,
-			RequiredContract: output.RequiredContract})
+		plan.Outputs = append(plan.Outputs, modeltransfer.OutputPin{Name: output.OutputID})
 	}
 	return plan, nil
 }
 
 type productionPackage struct {
-	InstallID, Release, ReleaseDigest string
-	Descriptor                        *launch.PackageDescriptor
-	Requirements                      []string
+	InstallID, Release, SourceDigest string
+	PackageInterface                 *launch.PackageInterface
+	Requirements                     []string
 }
 
 func resolveProductionPackage(ctx *Context, packageName string, remote bool) (productionPackage, *exit.Error) {
@@ -549,7 +541,7 @@ func resolveProductionPackage(ctx *Context, packageName string, remote bool) (pr
 			return productionPackage{}, problem
 		}
 		selected := productionPackage{InstallID: install.ID, Release: install.Version,
-			ReleaseDigest: install.SourceDigest, Descriptor: facts.PackageDescriptor,
+			SourceDigest: install.SourceDigest, PackageInterface: facts.PackageInterface,
 			Requirements: strings.Split(install.Closure, "\n")}
 		return selected, nil
 	}
@@ -589,31 +581,25 @@ func resolveProductionPackage(ctx *Context, packageName string, remote bool) (pr
 		return productionPackage{}, problem
 	}
 	if detail.Release.Release != release || detail.Release.Yanked || detail.Release.YankedAt != "" ||
-		detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
+		detail.Release.PackageInterfaceLength != int64(len(detail.PackageInterface)) {
 		return productionPackage{}, exit.Named(exit.Conflict, "model_transfer.package_changed",
 			"Tensorhub package %s@%s returned inconsistent immutable release metadata",
-			selector.Package, release)
-	}
-	if _, err := canonical.Raw(detail.Release.ReleaseDigest); err != nil {
-		return productionPackage{}, exit.Named(exit.Conflict,
-			"model_transfer.package_release_digest_invalid",
-			"Tensorhub package %s@%s has no exact immutable release digest",
 			selector.Package, release)
 	}
 	requirements, problem := detail.Requirements()
 	if problem != nil {
 		return productionPackage{}, problem
 	}
-	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
+	packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
 	if problem != nil {
 		return productionPackage{}, problem
 	}
-	if descriptor.Digest != detail.Release.PackageDescriptorDigest {
-		return productionPackage{}, exit.Named(exit.Conflict, "model_transfer.descriptor_changed",
-			"Tensorhub package descriptor does not match its release fact")
+	if packageInterface.Digest != detail.Release.PackageInterfaceDigest {
+		return productionPackage{}, exit.Named(exit.Conflict, "model_transfer.package_interface_changed",
+			"Tensorhub package interface does not match its release fact")
 	}
-	selected := productionPackage{Release: release, ReleaseDigest: detail.Release.ReleaseDigest,
-		Descriptor: descriptor, Requirements: requirements}
+	selected := productionPackage{Release: release,
+		PackageInterface: packageInterface, Requirements: requirements}
 	return selected, nil
 }
 

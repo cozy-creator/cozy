@@ -237,7 +237,7 @@ type packageSelection struct {
 func (g packageSelection) contentKey() string {
 	var sb strings.Builder
 	for _, row := range g.packages {
-		sb.WriteString("p\x00" + row.Package + "\x00" + row.Release + "\x00" + row.ReleaseDigest + "\x01")
+		sb.WriteString("p\x00" + row.Package + "\x00" + row.Release + "\x01")
 	}
 	for _, row := range g.models {
 		sb.WriteString("m\x00" + row.Package + "\x00" + row.Slot + "\x00" + row.Model + "\x00" +
@@ -361,7 +361,7 @@ func clonePackageRefs(in []*pb.DownloadPackageRef) []*pb.DownloadPackageRef {
 	for _, ref := range in {
 		if ref != nil {
 			out = append(out, &pb.DownloadPackageRef{
-				Package: ref.Package, Release: ref.Release, ReleaseDigest: ref.ReleaseDigest,
+				Package: ref.Package, Release: ref.Release,
 			})
 		}
 	}
@@ -507,9 +507,9 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 					status = p
 				}
 				row := remotePlacementObservation{
-					placementID: p.PlacementId, packageRevision: p.PackageRevisionDigest,
-					environmentDigest: p.EnvironmentDigest, configDigest: p.ConfigDigest,
-					materialization: p.Materialization, serving: p.Serving,
+					placementID: p.PlacementId, placementSetDigest: spellOf(p.PlacementSetDigest),
+					environmentDigest: p.EnvironmentDigest,
+					materialization:   p.Materialization, serving: p.Serving,
 					dispatchablePlanIDs: map[string]bool{}, knownPlanIDs: map[string]bool{},
 				}
 				for _, digest := range p.DispatchableBindingDigests {
@@ -525,7 +525,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 					row.knownPlanIDs[planID] = true
 					materializable[planID] = true
 				}
-				observed[p.PackageRevisionDigest] = row
+				observed[p.PlacementId] = row
 				for _, f := range p.Faults {
 					w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
 				}
@@ -541,8 +541,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			if status != nil {
 				w.placementID = status.PlacementId
 				w.materialization, w.serving = status.Materialization, status.Serving
-				w.packageRevisionDigest = status.PackageRevisionDigest
-				w.environmentDigest, w.configDigest = status.EnvironmentDigest, status.ConfigDigest
+				w.environmentDigest = status.EnvironmentDigest
 				w.executorEpoch = status.ExecutorEpoch
 				w.heldSetDigest = status.PlacementSetDigest
 				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
@@ -550,7 +549,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			} else {
 				w.materialization = pb.MaterializationState_MATERIALIZATION_STATE_UNSPECIFIED
 				w.serving = pb.ServingState_SERVING_STATE_UNSPECIFIED
-				w.packageRevisionDigest, w.environmentDigest, w.configDigest = "", "", ""
+				w.environmentDigest = ""
 			}
 		} else {
 			for _, p := range r.Placements {
@@ -560,9 +559,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 			if status != nil {
 				w.materialization, w.serving = status.Materialization, status.Serving
-				w.packageRevisionDigest = status.PackageRevisionDigest
 				w.environmentDigest = status.EnvironmentDigest
-				w.configDigest = status.ConfigDigest
 				w.executorEpoch = status.ExecutorEpoch
 				w.heldSetDigest = status.PlacementSetDigest
 				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
@@ -582,7 +579,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				// dispatchable, which is exactly true.
 				w.materialization = pb.MaterializationState_MATERIALIZATION_STATE_UNSPECIFIED
 				w.serving = pb.ServingState_SERVING_STATE_UNSPECIFIED
-				w.packageRevisionDigest, w.environmentDigest, w.configDigest = "", "", ""
+				w.environmentDigest = ""
 			}
 		}
 		w.dispatchable, w.materializable = dispatchable, materializable
@@ -1749,10 +1746,10 @@ func shortNone(raw []byte) string {
 // descriptorDefectCode is the one pod refusal that falsifies a PUBLISHED
 // descriptor (cr-067): derivation on the pod disagreed with the committed
 // document. Every other preparation refusal is local to that worker.
-const descriptorDefectCode = "package_prepare_descriptor_disagrees"
+const descriptorDefectCode = "package_prepare_interface_disagrees"
 
 // relayDescriptorDefect files one defect report per desired revision when the
-// pod's typed refusal falsifies the published descriptor. The orchestrator
+// pod's typed refusal falsifies the published package interface. The orchestrator
 // holds no hub client, so the report goes through the same kind of entrypoint
 // callback the package-set signer uses; the callback carries the exact signed
 // delegation this download ran under — the report's whole chain of authority.
@@ -1771,16 +1768,15 @@ func (c *Orchestrator) relayDescriptorDefect(w *worker, revision uint64, f *pb.F
 	}
 	w.defectReportedRevision = revision
 	report := ReleaseDefect{
-		Package:       selected.Package,
-		Release:       selected.Release,
-		ReleaseDigest: selected.ReleaseDigest,
-		RentalID:      w.spec.Connection.RentalID,
-		Delegation:    append([]byte(nil), signed.delegation...),
-		Signature:     append([]byte(nil), signed.signature...),
-		Code:          descriptorDefectCode,
-		Detail:        brief(f.Detail, 2048),
+		Package:    selected.Package,
+		Release:    selected.Release,
+		RentalID:   w.spec.Connection.RentalID,
+		Delegation: append([]byte(nil), signed.delegation...),
+		Signature:  append([]byte(nil), signed.signature...),
+		Code:       descriptorDefectCode,
+		Detail:     brief(f.Detail, 2048),
 	}
-	c.logf("relaying descriptor defect for %s@%s from rental %s",
+	c.logf("relaying package-interface defect for %s@%s from rental %s",
 		report.Package, report.Release, report.RentalID)
 	go c.opt.ReportReleaseDefect(report)
 }

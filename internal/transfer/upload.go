@@ -17,7 +17,6 @@ package transfer
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -53,15 +52,6 @@ type Upload struct {
 	Tool *tfs.Tool
 	Hub  *hub.Client
 	Ref  hub.Ref
-	// EvidenceRef names the local TensorFS repository that roots ManifestID.
-	// Empty uses Ref. A local/name alias can therefore publish to an unrelated
-	// remote org/name without pretending the destination already owns its bytes.
-	EvidenceRef hub.Ref
-	// CheckpointEvidence is the exact WeightsSink evidence for an unretained local
-	// output. When present, it avoids inventing a temporary repository merely so
-	// the privileged transfer finalizer can read bytes it already owns.
-	CheckpointEvidence []byte
-	ExpectedContract   *hub.ExpectedModelContract
 	// ManifestID is the local canonical manifest being published.
 	ManifestID string
 	Session    string
@@ -86,13 +76,11 @@ type Result struct {
 	Verified  int
 	// Moved is bytes this invocation actually put on the wire; Deduped is what the
 	// hub already held. Their sum is the artifact.
-	Moved          int64
-	Deduped        int64
-	Manifest       hub.ManifestRef
-	TopologyDigest string
-	EncodingSet    []string
-	Dup            bool
-	MS             map[string]int64
+	Moved    int64
+	Deduped  int64
+	Manifest hub.ManifestRef
+	Dup      bool
+	MS       map[string]int64
 }
 
 func ValidateOpenedPublication(opened hub.OpenPublicationResponse, operation string,
@@ -125,12 +113,11 @@ func ValidateOpenedPublication(opened hub.OpenPublicationResponse, operation str
 }
 
 func ValidateFinalizedCheckpoint(checkpoint hub.CheckpointPublication, operation,
-	manifestID string, manifestLength int64, evidence []byte, totals hub.Totals,
+	manifestID string, manifestLength int64, totals hub.Totals,
 ) *exit.Error {
 	if checkpoint.PublishID != operation || checkpoint.CheckpointID != manifestID ||
 		checkpoint.Manifest.SHA256 != strings.TrimPrefix(manifestID, "sha256:") ||
 		checkpoint.Manifest.Length != manifestLength ||
-		checkpoint.CheckpointEvidenceBase64 != hub.B64(evidence) ||
 		checkpoint.State != "checkpointed" || checkpoint.Objects != totals.DeclaredObjects-1 ||
 		checkpoint.Bytes != totals.DeclaredBytes-manifestLength {
 		return exit.Internalf("Tensorhub retained a different checkpoint identity or inventory")
@@ -151,25 +138,12 @@ func (p *Upload) Run(ctx context.Context) (Result, *exit.Error) {
 	ms := map[string]int64{}
 	res.MS = ms
 
-	// 1. Prepare the exact evidence and known ObjectRefs. The Manifest is one of
+	// 1. Prepare the known ObjectRefs. The Manifest is one of
 	//    the transferred objects; finalize names its accepted digest/length and
 	//    Tensorhub reads those custody bytes itself.
 	t0 := time.Now()
 	if err := os.MkdirAll(p.Scratch, 0o700); err != nil {
 		return res, exit.Internalf("cannot create the transfer scratch at %s: %s", p.Scratch, err)
-	}
-	evidenceRef := p.EvidenceRef
-	if evidenceRef.Org == "" {
-		evidenceRef = p.Ref
-	}
-	evidence := append([]byte(nil), p.CheckpointEvidence...)
-	if len(evidence) == 0 {
-		var e *exit.Error
-		evidence, e = p.Tool.CheckpointEvidence(evidenceRef.Org, evidenceRef.Name, p.ManifestID,
-			filepath.Join(p.Scratch, "repo-releases.jsonl"))
-		if e != nil {
-			return res, e
-		}
 	}
 	objects, e := p.Tool.ManifestObjects(p.ManifestID, filepath.Join(p.Scratch, "objects.jsonl"))
 	if e != nil {
@@ -187,8 +161,6 @@ func (p *Upload) Run(ctx context.Context) (Result, *exit.Error) {
 		Length: manifestInfo.Size()}
 	finalize := hub.FinalizePublicationRequest{
 		ManifestID: p.ManifestID, ManifestLength: manifestInfo.Size(),
-		CheckpointEvidenceBase64: hub.B64(evidence),
-		ExpectedContract:         p.ExpectedContract,
 	}
 	declared := make([]hub.Object, 0, len(objects)+1)
 	for _, o := range objects {
@@ -280,21 +252,10 @@ func (p *Upload) finalize(ctx context.Context, request hub.FinalizePublicationRe
 	}
 	ms["finalize"] = since(t0)
 	if problem := ValidateFinalizedCheckpoint(checkpoint, res.PublishID, p.ManifestID,
-		res.Manifest.Length, p.CheckpointEvidence, res.Totals); problem != nil {
-		// Repository-rooted callers populate evidence through the local repository.
-		if len(p.CheckpointEvidence) == 0 {
-			evidence, e := base64.StdEncoding.DecodeString(request.CheckpointEvidenceBase64)
-			if e == nil {
-				problem = ValidateFinalizedCheckpoint(checkpoint, res.PublishID, p.ManifestID,
-					res.Manifest.Length, evidence, res.Totals)
-			}
-		}
-		if problem != nil {
-			return res, problem
-		}
+		res.Manifest.Length, res.Totals); problem != nil {
+		return res, problem
 	}
-	res.Manifest, res.TopologyDigest, res.Verified = checkpoint.Manifest, checkpoint.TopologyDigest, checkpoint.Objects
-	res.EncodingSet = append([]string(nil), checkpoint.Contract.Encoding.Set...)
+	res.Manifest, res.Verified = checkpoint.Manifest, checkpoint.Objects
 	res.Dup = checkpoint.Duplicate
 	if checkpoint.Duplicate {
 		p.say("this exact checkpoint was already retained")

@@ -37,11 +37,10 @@ type Submission struct {
 	Input    json.RawMessage `json:"input"`
 	// InstallID is the immutable local install selected by the CLI. It is opaque to users;
 	// omitting it asks the daemon to resolve the active package pointer.
-	InstallID     string   `json:"install_id,omitempty"`
-	Release       string   `json:"release,omitempty"`
-	ReleaseDigest string   `json:"release_digest,omitempty"`
-	Outputs       []string `json:"outputs,omitempty"`
-	PlanID        string   `json:"plan_id,omitempty"`
+	InstallID string   `json:"install_id,omitempty"`
+	Release   string   `json:"release,omitempty"`
+	Outputs   []string `json:"outputs,omitempty"`
+	PlanID    string   `json:"plan_id,omitempty"`
 	// LocalAssets is the local API's out-of-band input set. Each source path is ingested into
 	// the daemon-owned immutable input store before the request row exists; it never
 	// crosses the worker protocol. The typed payload carries only its opaque reference.
@@ -243,7 +242,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 	return orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: payload,
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
-		InstallID: sub.InstallID, Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
+		InstallID: sub.InstallID, Release: sub.Release,
 		LocalPackageDigest: recorded.LocalPackageDigest,
 		Rental:             sub.Rental || sub.RentalRequired,
 		RentalRequired:     sub.RentalRequired,
@@ -261,9 +260,9 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"package":    spec.Package,
 		"function":   spec.Entrypoint,
 		"install_id": spec.InstallID,
-		"release":    spec.Release, "release_digest": spec.ReleaseDigest,
-		"input":   base64.StdEncoding.EncodeToString(spec.Payload),
-		"outputs": strings.Join(spec.Outputs, ","),
+		"release":    spec.Release,
+		"input":      base64.StdEncoding.EncodeToString(spec.Payload),
+		"outputs":    strings.Join(spec.Outputs, ","),
 	}
 	assets := make([]canonical.Value, 0, len(spec.Assets))
 	for _, asset := range spec.Assets {
@@ -298,7 +297,7 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		doc["models"] = models
 	}
 	// The caller's explicit --out is part of what the key names; the derived default and
-	// the descriptor-derived entries are facts of the package, not of the submission.
+	// the PackageInterface-derived entries are facts of the package, not of the submission.
 	if spec.OutputDirectory != "" {
 		doc["output_directory"] = spec.OutputDirectory
 	}
@@ -361,8 +360,8 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 	out := orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
-		Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
-		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
+		Release: sub.Release,
+		Rental:  sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
 		Models:          append([]orchestrator.ModelRef(nil), sub.Models...),
 		OutputDirectory: sub.OutputDirectory,
 	}
@@ -386,16 +385,15 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 			}
 			return s.resolveLocalServing(ctx, sub, out, refreshed)
 		}
-		if sub.InstallID != "" || sub.Release == "" || sub.ReleaseDigest == "" {
+		if sub.InstallID != "" || sub.Release == "" {
 			return out, exit.Unavailablef("remote execution requires one exact Tensorhub package release")
 		}
 		logical, entrypoint, e := s.packages.ResolveRemoteRelease(
-			sub.Package, sub.Release, sub.ReleaseDigest, sub.Function, sub.Models)
+			sub.Package, sub.Release, sub.Function, sub.Models)
 		if e != nil {
 			return out, e
 		}
-		if logical.Package != sub.Package || logical.Release != sub.Release ||
-			logical.ReleaseDigest != sub.ReleaseDigest {
+		if logical.Package != sub.Package || logical.Release != sub.Release {
 			return out, exit.Named(exit.Conflict, "install_package_mismatch",
 				"queued remote release does not match the resolved Tensorhub release")
 		}
@@ -545,7 +543,7 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 		return out, problem
 	}
 	out.InstallID, out.PlanID = installID, planID
-	out.Release, out.ReleaseDigest = revision.Release, revision.SourceDigest
+	out.Release = revision.Release
 	out.LocalPackageDigest = revision.Digest
 	if len(out.Outputs) == 0 {
 		out.Outputs = outputs
@@ -557,7 +555,7 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 }
 
 // validateInputs checks the payload and every local asset against the entrypoint that
-// will run it — the same law for a local install and a rental's frozen descriptor.
+// will run it — the same law for a local install and a rental's frozen PackageInterface.
 func validateInputs(entrypoint *launch.Entrypoint, out *orchestrator.Submission) *exit.Error {
 	if e := launch.ValidatePayload(out.Package, entrypoint, out.Payload); e != nil {
 		return e
@@ -630,23 +628,26 @@ func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBind
 // fields a local client has and a cloud one does not need to presign: the typed result,
 // the visible media by OPAQUE id, and the triage handle.
 type Lifecycle struct {
-	Number        int64          `json:"number"`
-	Kind          string         `json:"kind"`
-	RequestID     string         `json:"request_id"`
-	Status        string         `json:"status"`
-	Package       string         `json:"package"`
-	Function      string         `json:"function"`
-	Attempt       uint64         `json:"attempt"`
-	Attempts      int            `json:"attempts"`
-	QueuedMS      int64          `json:"queued_ms"`
-	ExecutionMS   int64          `json:"execution_ms"`
-	Completion    *float64       `json:"completion,omitempty"`
-	RemainingMS   *int64         `json:"remaining_ms,omitempty"`
-	ProgressStage string         `json:"progress_stage,omitempty"`
-	ResponseURL   string         `json:"response_url"`
-	Metrics       map[string]any `json:"metrics,omitempty"`
-	ErrorType     string         `json:"error_type,omitempty"`
-	Error         string         `json:"error,omitempty"`
+	Number          int64          `json:"number"`
+	Kind            string         `json:"kind"`
+	RequestID       string         `json:"request_id"`
+	Status          string         `json:"status"`
+	Package         string         `json:"package"`
+	Function        string         `json:"function"`
+	Attempt         uint64         `json:"attempt"`
+	Attempts        int            `json:"attempts"`
+	QueuedMS        int64          `json:"queued_ms"`
+	ExecutionMS     int64          `json:"execution_ms"`
+	ProgressStage   string         `json:"progress_stage,omitempty"`
+	StageFraction   *float64       `json:"stage_fraction,omitempty"`
+	OverallFraction *float64       `json:"overall_fraction,omitempty"`
+	Position        *int64         `json:"position,omitempty"`
+	Total           *int64         `json:"total,omitempty"`
+	RemainingMS     *int64         `json:"remaining_ms,omitempty"`
+	ResponseURL     string         `json:"response_url"`
+	Metrics         map[string]any `json:"metrics,omitempty"`
+	ErrorType       string         `json:"error_type,omitempty"`
+	Error           string         `json:"error,omitempty"`
 	// CanceledBy is the recorded actor behind a canceled run (cl-108): the explicit
 	// `cozy run cancel`, a caller-authored --timeout, `cozy down --all` — never blank
 	// for a run this daemon canceled on request.
@@ -736,8 +737,11 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	}
 	if life.Status == "in_progress" {
 		if progress, ok := s.orchestrator.LatestProgress(row.ID, life.Attempt); ok {
-			life.Completion = &progress.Fraction
 			life.ProgressStage = progress.Stage
+			life.StageFraction = progress.StageFraction
+			life.OverallFraction = progress.OverallFraction
+			life.Position = progress.Position
+			life.Total = progress.Total
 			if progress.Estimated {
 				life.RemainingMS = &progress.RemainingMS
 			}

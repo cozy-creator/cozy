@@ -18,11 +18,11 @@ import (
 
 // TestSubmitSchemaValidation is cl-105/cl-106 as behaviour. The defect: `cozy run
 // paul/sdxl/generate` with no prompt queued run 98 instead of refusing — the installed
-// descriptor knew the whole request schema and submit never consulted it usefully for the
-// person typing. Now the daemon-submit seam refuses a payload the descriptor refutes in
+// PackageInterface knew the whole request schema and submit never consulted it usefully for the
+// person typing. Now the daemon-submit seam refuses a payload the PackageInterface refutes in
 // ONE typed `request_payload_invalid` naming every offending field, with the callable's
 // usage line as the remedy, BEFORE a request row exists or an idempotency key is burned —
-// and `--describe` renders the same contract from the same descriptor. The worker's own
+// and `--describe` renders the same contract from the same PackageInterface. The worker's own
 // author-surface check still stands behind it for a payload injected past this seam.
 func TestSubmitSchemaValidation(t *testing.T) {
 	root, err := os.MkdirTemp(os.TempDir(), "cozy-schema-")
@@ -39,7 +39,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 	video := localWeightlessRef + "/video_transport"
 	usage := "cozy run " + video + " prompt=<str> --asset first_frame=<file>"
 
-	// cl-106: --describe renders the callable's contract from the installed descriptor —
+	// cl-106: --describe renders the callable's contract from the installed PackageInterface —
 	// the exact facts submit validates against — without dialing anything.
 	code, out = runCozy(t, root, "run", video, "--describe")
 	for _, expected := range []string{video, "prompt: str", "first_frame: image asset", "usage: " + usage} {
@@ -53,7 +53,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 			t.Fatalf("a job's --describe omitted %q [exit %d]\n%s", expected, code, out)
 		}
 	}
-	// --json is the raw request struct, verbatim from the descriptor: field order is the
+	// --json is the raw request struct, verbatim from the PackageInterface: field order is the
 	// author's, and a required field carries NO wire member rather than a synthesized one.
 	code, out = runCozy(t, root, "--json", "run", video, "--describe")
 	var request struct {
@@ -83,7 +83,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 	}
 
 	// Field NAMES are case-insensitive at the CLI composition seam (Paul, 2026-09-02):
-	// a typed key folds onto the descriptor's spelling and the wire carries ONLY the
+	// a typed key folds onto the PackageInterface's spelling and the wire carries ONLY the
 	// canonical name — PROMPT= composes exactly what prompt= composes, so the daemon's
 	// strict validator misses first_frame alone.
 	for _, spelling := range []string{"PROMPT=fold", "Prompt=fold"} {
@@ -96,7 +96,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 		}
 	}
 	// The same fold reaches --asset field paths: PROMPT folds to prompt, and the walk's
-	// canonical refusal names the descriptor's spelling.
+	// canonical refusal names the PackageInterface's spelling.
 	code, out = runCozy(t, root, "run", video, "prompt=x", "--asset", "PROMPT=missing.png")
 	if code != 1 || !strings.Contains(out, "video_transport.prompt is not an asset field") {
 		t.Fatalf("--asset PROMPT did not fold onto prompt [exit %d]\n%s", code, out)
@@ -260,7 +260,7 @@ func ownerAtRoot(t *testing.T, root string) *owner {
 	must(t, err)
 	options := orchestrator.Options{
 		Cfg: cfg, Layout: l, Store: st, Yield: "smart", Log: log,
-		ConfigDigest: "sha256:" + strings.Repeat("22", 32), MaxOutputMiB: 8,
+		MaxOutputMiB: 8,
 	}
 	options.Packages = cli.NewResolver(st, cfg, orchestrator.LocalDeviceEnvelope())
 	c, e := orchestrator.Open(options)

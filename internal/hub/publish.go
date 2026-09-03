@@ -138,15 +138,8 @@ func (c *Client) GrantKnownTransfers(ctx context.Context, ref Ref, operation str
 }
 
 type FinalizePublicationRequest struct {
-	ManifestID               string                 `json:"manifest_id"`
-	ManifestLength           int64                  `json:"manifest_length"`
-	CheckpointEvidenceBase64 string                 `json:"checkpoint_evidence_base64"`
-	ExpectedContract         *ExpectedModelContract `json:"expected_contract,omitempty"`
-}
-
-type ExpectedModelContract struct {
-	TopologyDigest string   `json:"topology_digest"`
-	Encodings      []string `json:"encodings"`
+	ManifestID     string `json:"manifest_id"`
+	ManifestLength int64  `json:"manifest_length"`
 }
 
 type ManifestRef struct {
@@ -154,28 +147,15 @@ type ManifestRef struct {
 	Length int64  `json:"length"`
 }
 
-type Encoding struct {
-	Set []string `json:"set"`
-}
-
-type Contract struct {
-	Stamps    map[string][]string `json:"stamps"`
-	Structure string              `json:"structure"`
-	Encoding  Encoding            `json:"encoding"`
-}
-
 // CheckpointPublication is the durable owner-only checkpoint returned by finalize.
 type CheckpointPublication struct {
-	PublishID                string      `json:"publish_id"`
-	CheckpointID             string      `json:"checkpoint_id"`
-	Manifest                 ManifestRef `json:"manifest"`
-	Contract                 Contract    `json:"contract"`
-	TopologyDigest           string      `json:"topology_digest"`
-	Objects                  int         `json:"objects"`
-	Bytes                    int64       `json:"bytes"`
-	CheckpointEvidenceBase64 string      `json:"checkpoint_evidence_base64"`
-	State                    string      `json:"state"`
-	Duplicate                bool        `json:"duplicate"`
+	PublishID    string      `json:"publish_id"`
+	CheckpointID string      `json:"checkpoint_id"`
+	Manifest     ManifestRef `json:"manifest"`
+	Objects      int         `json:"objects"`
+	Bytes        int64       `json:"bytes"`
+	State        string      `json:"state"`
+	Duplicate    bool        `json:"duplicate"`
 }
 
 func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation string,
@@ -192,11 +172,10 @@ func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation str
 }
 
 type ModelReleaseLane struct {
-	Lane         string   `json:"lane"`
-	CheckpointID string   `json:"checkpoint_id"`
-	Contract     Contract `json:"contract"`
-	Objects      int      `json:"objects"`
-	Bytes        int64    `json:"bytes"`
+	Lane         string `json:"lane"`
+	CheckpointID string `json:"checkpoint_id"`
+	Objects      int    `json:"objects"`
+	Bytes        int64  `json:"bytes"`
 }
 
 // ModelRelease is one revision of a mutable human release label. Checkpoints
@@ -284,28 +263,26 @@ func publications(ref Ref) string {
 
 // ModelManifest is one resolved immutable model tree.
 type ModelManifest struct {
-	Org                string `json:"org"`
-	Name               string `json:"name"`
-	Release            string `json:"release"`
-	Lane               string `json:"lane"`
-	ManifestID         string `json:"manifest_id"`
-	HeaderID           string `json:"header_digest"`
-	Objects            int    `json:"objects"`
-	Bytes              int64  `json:"bytes"`
-	CheckpointEvidence []byte `json:"-"`
+	Org        string `json:"org"`
+	Name       string `json:"name"`
+	Release    string `json:"release"`
+	Lane       string `json:"lane"`
+	ManifestID string `json:"manifest_id"`
+	HeaderID   string `json:"header_digest"`
+	Objects    int    `json:"objects"`
+	Bytes      int64  `json:"bytes"`
 }
 
 // ModelResolution is Tensorhub's exact answer to a human model ref. Download never
 // lists manifests and guesses: digest or release selection happens at this route.
 type ModelResolution struct {
-	Model                    string `json:"model"`
-	Release                  string `json:"release"`
-	Lane                     string `json:"lane"`
-	ManifestID               string `json:"manifest_id"`
-	HeaderID                 string `json:"header_digest"`
-	Objects                  int    `json:"objects"`
-	Bytes                    int64  `json:"bytes"`
-	CheckpointEvidenceBase64 string `json:"checkpoint_evidence_base64"`
+	Model      string `json:"model"`
+	Release    string `json:"release"`
+	Lane       string `json:"lane"`
+	ManifestID string `json:"manifest_id"`
+	HeaderID   string `json:"header_digest"`
+	Objects    int    `json:"objects"`
+	Bytes      int64  `json:"bytes"`
 }
 
 func (c *Client) ResolveModel(ctx context.Context, spec, lane string) (ModelResolution, *exit.Error) {

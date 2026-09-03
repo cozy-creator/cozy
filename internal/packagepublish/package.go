@@ -37,14 +37,11 @@ var projectNameSeparator = regexp.MustCompile(`[-_.]+`)
 // computes identities and package facts after the bytes arrive.
 type Package struct {
 	Files            map[string]string // source-relative path -> local path
-	Descriptor       string
+	PackageInterface string
 	Wheel            string
 	DependencyWheels []DependencyWheel
 	Vendored         []VendoredDependency // auto-vendored local deps, for the publish nudge (th-113)
 	Registry         []RegistryRow        // locked registry rows; Tensorhub fetches (cl-078)
-	Evidence         map[string]string    // envelope-relative path -> local path
-	SlotFacts        []string             // slot classes with derived facts (cr-077)
-	SlotFactsSkipped []string             // slot classes with no complete default binding
 	Tree             string
 	Root             string // disposable wheel output, empty until Build
 	Name             string
@@ -160,13 +157,13 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 			return problem
 		}
 	}
-	descriptor, problem := describe(ctx, p.Tree, root)
+	packageInterface, problem := describe(ctx, p.Tree, root)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
 		return problem
 	}
-	p.Wheel, p.Descriptor, p.DependencyWheels, p.Registry = project, descriptor, dependencies, registry
+	p.Wheel, p.PackageInterface, p.DependencyWheels, p.Registry = project, packageInterface, dependencies, registry
 	p.Vendored = vendored
 	return nil
 }
@@ -312,17 +309,17 @@ func describe(ctx context.Context, tree, root string) (string, *exit.Error) {
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return "", exit.Named(exit.Validation, "package_descriptor_refused",
+		return "", exit.Named(exit.Validation, "package_interface_refused",
 			"cozy-runtime could not describe the package").WithRemedy("%s", strings.TrimSpace(stderr.String()))
 	}
 	raw := []byte(strings.TrimSpace(stdout.String()))
 	if len(raw) == 0 || len(raw) > 1<<20 || !json.Valid(raw) {
-		return "", exit.Named(exit.Structural, "package_descriptor_invalid",
-			"cozy-runtime returned an invalid package descriptor")
+		return "", exit.Named(exit.Structural, "package_interface_invalid",
+			"cozy-runtime returned an invalid package interface")
 	}
-	path := filepath.Join(root, "descriptor.json")
+	path := filepath.Join(root, "package-interface.json")
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return "", exit.Internalf("cannot stage package descriptor: %s", err)
+		return "", exit.Internalf("cannot stage package interface: %s", err)
 	}
 	return path, nil
 }
@@ -450,7 +447,7 @@ var ignoredRootDir = map[string]bool{
 
 var ignoredFile = map[string]bool{
 	".ds_store": true, "thumbs.db": true, ".gitignore": true, ".gitattributes": true,
-	"package.descriptor.json":       true,
+	"package-interface.json":        true,
 	"package.evaluated-config.json": true,
 }
 

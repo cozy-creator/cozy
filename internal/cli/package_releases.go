@@ -3,17 +3,16 @@ package cli
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -49,14 +48,10 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 			return exit.Internalf("package lookup returned release %q, want %q",
 				detail.Release.Release, release)
 		}
-		if _, err := canonical.Raw(detail.Release.ReleaseDigest); err != nil {
-			return exit.Internalf("published package has no exact release digest")
-		}
 		packagePublishStatus(ctx, "Release already published; no build or upload needed.")
 		return emit(ctx, compactRecord([]output.Field{
 			{K: "package", V: ref.String()}, {K: "release", V: release},
 			{K: "status", V: "already published"}, {K: "changed", V: false},
-			{K: "release_digest", V: detail.Release.ReleaseDigest},
 			{K: "uploaded", V: output.Bytes(0)}, {K: "hub", V: c.Base()},
 		}, "package", "release", "status"))
 	}
@@ -68,12 +63,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	}); problem != nil {
 		return problem
 	}
-	if problem := packagePublishStage(ctx, "Deriving evidence for declared model pairs", func() *exit.Error {
-		return pack.DeriveEvidence(hctx, account.Name, deriveInputResolver(c))
-	}); problem != nil {
-		return problem
-	}
-	declared, registry, locals, problem := packageDeclaration(pack)
+	declared, registry, locals, problem := packageFiles(pack)
 	if problem != nil {
 		return problem
 	}
@@ -83,23 +73,20 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if draft.State != "pending" && draft.State != "committed" {
-		return exit.Internalf("package declaration returned invalid state %q", draft.State)
+	if draft.PublicationID == "" {
+		return exit.Internalf("package declaration returned no publication id")
 	}
 	var moved int64
-	if draft.State == "pending" {
-		moved, problem = uploadPackageFiles(hctx, declared, locals, draft.Files,
-			packageUploadCounter(ctx))
-		if problem != nil {
-			return problem
-		}
-	} else {
-		packagePublishStatus(ctx, "Release already published; refreshing status...")
+	moved, problem = uploadPackageFiles(hctx, declared, locals, draft.Files,
+		packageUploadCounter(ctx))
+	if problem != nil {
+		return problem
 	}
 	var done hub.PackageReleaseCommit
 	problem = packagePublishStage(ctx, "Committing exact package release", func() *exit.Error {
 		var finalProblem *exit.Error
-		done, finalProblem = c.CommitPackageRelease(hctx, ref, release, declared, registry, reason)
+		done, finalProblem = c.CommitPackageRelease(hctx, ref, release,
+			draft.PublicationID, registry, reason)
 		return finalProblem
 	})
 	if problem != nil {
@@ -108,29 +95,17 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	if done.State != "committed" {
 		return exit.Internalf("package commit did not reach committed state")
 	}
-	if _, err := canonical.Raw(done.ReleaseDigest); err != nil {
-		return exit.Internalf("package commit returned no exact release digest")
-	}
-	replay := draft.State == "committed"
-	status := "published"
-	if replay {
-		status = "already published"
+	if done.PublicationID != draft.PublicationID {
+		return exit.Internalf("package commit returned publication id %q, want %q",
+			done.PublicationID, draft.PublicationID)
 	}
 	fields := []output.Field{
 		{K: "package", V: ref.String()}, {K: "release", V: release},
-		{K: "status", V: status}, {K: "changed", V: !replay},
-		{K: "release_digest", V: done.ReleaseDigest},
+		{K: "status", V: "published"}, {K: "changed", V: true},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}
-	if len(pack.SlotFacts) > 0 {
-		fields = append(fields, output.Field{K: "slot_facts", V: strings.Join(pack.SlotFacts, ",")})
-	}
 	record := compactRecord(fields, "package", "release", "status")
-	for _, class := range pack.SlotFactsSkipped {
-		record.Notes = append(record.Notes, fmt.Sprintf(
-			"slot class %s has no complete [bindings] default (model/release/lane); no slot facts derived — preflight cannot grade it",
-			class))
-	}
+	record.Notes = append(record.Notes, done.BindingWarnings...)
 	for _, dependency := range pack.Vendored {
 		record.Notes = append(record.Notes, packagepublish.VendoredNote(account.Name, dependency))
 	}
@@ -167,65 +142,35 @@ func handlePackageYank(ctx *Context) *exit.Error {
 	}, "package", "release", "status"))
 }
 
-// deriveInputResolver turns one fully named default binding — model, release,
-// lane — into the slot-facts run's exact construction seed through the hub's
-// derive-inputs read.
-func deriveInputResolver(c *hub.Client) packagepublish.SeedResolver {
-	return func(ctx context.Context, model, release, lane string) (packagepublish.DeriveInput, *exit.Error) {
-		ref, problem := hub.ParseRef(model)
-		if problem != nil {
-			return packagepublish.DeriveInput{}, problem.
-				WithRemedy("bind the slot as [bindings] model/release/lane in package.toml")
-		}
-		resolved, problem := c.ModelDeriveInputs(ctx, ref, release, lane)
-		if problem != nil {
-			return packagepublish.DeriveInput{}, problem
-		}
-		configBytes, err := base64.StdEncoding.DecodeString(resolved.ConfigBase64)
-		if err != nil || int64(len(configBytes)) != resolved.ConfigLength {
-			return packagepublish.DeriveInput{}, exit.Named(exit.Structural,
-				"hub.derive_inputs_invalid", "Tensorhub returned invalid derive inputs for %s", model)
-		}
-		sum := sha256.Sum256(configBytes)
-		if resolved.ConfigDigest != "sha256:"+hex.EncodeToString(sum[:]) {
-			return packagepublish.DeriveInput{}, exit.Named(exit.Conflict,
-				"hub.derive_inputs_invalid", "derive-input config bytes do not match their digest")
-		}
-		return packagepublish.DeriveInput{Snapshot: resolved.Snapshot,
-			ConfigDigest: resolved.ConfigDigest, ConfigBytes: configBytes,
-			Variants: resolved.HardwareVariants}, nil
-	}
-}
-
-// packageDeclaration renders the complete digest declaration: every local
-// subject hashed here, plus the registry rows the hub fetches itself.
-func packageDeclaration(pack *packagepublish.Package) (
+// packageFiles measures the ordinary package file tree used for upload grants.
+// Registry dependencies remain external environment facts and are never uploaded.
+func packageFiles(pack *packagepublish.Package) (
 	[]hub.PackageDeclaredFile, []hub.PackageRegistryRow, map[string]string, *exit.Error,
 ) {
 	locals := map[string]string{}
 	for path, local := range pack.Files {
 		locals[path] = local
 	}
-	locals["project.whl"] = pack.Wheel
-	locals["descriptor.json"] = pack.Descriptor
-	for _, dependency := range pack.DependencyWheels {
-		locals[dependency.Filename] = dependency.Path
-	}
-	for path, local := range pack.Evidence {
-		locals[path] = local
-	}
-	kindOf := func(path string) string {
-		switch {
-		case path == "project.whl":
-			return "project_wheel"
-		case path == "descriptor.json":
-			return "descriptor"
-		case strings.HasPrefix(path, "evidence/"):
-			return "derive_evidence"
-		case strings.HasSuffix(path, ".whl") && !strings.Contains(path, "/"):
-			return "dependency_wheel"
+	add := func(path, local string) *exit.Error {
+		if _, exists := locals[path]; exists {
+			return exit.Named(exit.Conflict, "package_file_path_conflict",
+				"more than one package file maps to %s", path)
 		}
-		return "source"
+		locals[path] = local
+		return nil
+	}
+	projectPath := "artifacts/project/" + filepath.Base(pack.Wheel)
+	if problem := add(projectPath, pack.Wheel); problem != nil {
+		return nil, nil, nil, problem
+	}
+	if problem := add("metadata/package-interface.json", pack.PackageInterface); problem != nil {
+		return nil, nil, nil, problem
+	}
+	for _, dependency := range pack.DependencyWheels {
+		path := "artifacts/dependencies/" + dependency.Filename
+		if problem := add(path, dependency.Path); problem != nil {
+			return nil, nil, nil, problem
+		}
 	}
 	declared := make([]hub.PackageDeclaredFile, 0, len(locals))
 	for path, local := range locals {
@@ -235,8 +180,9 @@ func packageDeclaration(pack *packagepublish.Package) (
 				"%s is unreadable: %v", path, err)
 		}
 		sum := sha256.Sum256(raw)
+		hexDigest := hex.EncodeToString(sum[:])
 		declared = append(declared, hub.PackageDeclaredFile{
-			Digest: "sha256:" + hex.EncodeToString(sum[:]), Kind: kindOf(path),
+			Digest: "sha256:" + hexDigest,
 			Length: int64(len(raw)), Path: path})
 	}
 	sort.Slice(declared, func(i, j int) bool { return declared[i].Path < declared[j].Path })

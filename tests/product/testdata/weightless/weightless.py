@@ -100,7 +100,11 @@ def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> Tile
     if remaining > 0:
         # cl-104: the delay is a MEASURED step loop — the fixture's stand-in for a
         # denoising loop, one `on_step` per iteration (cancellation included).
-        on_step = tel.step_callback((remaining + 24) // 25, stage="tile_steps")
+        on_step = tel.step_callback(
+            (remaining + 24) // 25,
+            stage="tile_steps",
+            overall_range=(0.0, 1.0),
+        )
         index = 0
         while remaining > 0:
             step = min(remaining, 25)

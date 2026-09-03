@@ -53,11 +53,6 @@ func (c *Orchestrator) onModelTransferWeightsReceipt(s *session, frame *pb.Weigh
 	if err != nil || receiptDoc.Str("weights_transaction_id") != frame.WeightsTransactionId {
 		return
 	}
-	evidence, err := base64.StdEncoding.Strict().DecodeString(
-		receiptDoc.Str("checkpoint_evidence_canonical_bytes"))
-	if err != nil || len(evidence) == 0 || len(evidence) > pb.MaxCheckpointEvidenceBytes {
-		return
-	}
 	objects := make([]records.ModelTransferObject, 0, len(frame.Objects))
 	previous := ""
 	manifestPresent := false
@@ -80,7 +75,7 @@ func (c *Orchestrator) onModelTransferWeightsReceipt(s *session, frame *pb.Weigh
 	}
 	problem = c.opt.Store.RecordModelTransferWeights(records.ModelTransferWeights{
 		RequestID: frame.RequestId, OutputSlot: frame.OutputSlot, ManifestID: manifestDigest,
-		ManifestLength: int64(frame.Manifest.Length), Evidence: evidence, Objects: objects,
+		ManifestLength: int64(frame.Manifest.Length), Objects: objects,
 		Attempt: int64(frame.AttemptOrdinal), InvocationDigest: invocationDigest,
 		TransactionID: frame.WeightsTransactionId, ReceiptDigest: receipt.ReceiptDigest,
 		Receipt: receipt.ReceiptBytes})

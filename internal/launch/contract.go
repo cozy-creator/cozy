@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// The ONE contract printer (cl-105/cl-106). The descriptor already carries every fact a
+// The ONE contract printer (cl-105/cl-106). The PackageInterface already carries every fact a
 // caller needs to spell a valid request; this file renders those facts three ways —
 // the AXI-style usage line (install's "what now?", the submit refusal's remedy), the
 // `cozy run <target> --describe` contract, and nothing else. No other module re-renders
@@ -43,7 +43,7 @@ func usageTerm(f *Field) string {
 	return term
 }
 
-// typePhrase is a rendered type in one compact word: the descriptor's own scalar names,
+// typePhrase is a rendered type in one compact word: the PackageInterface's own scalar names,
 // literal members spelled out, asset/tree/list/struct in the payload grammar's terms.
 func typePhrase(raw json.RawMessage) string {
 	kind, _ := typeOf(raw)
@@ -207,9 +207,9 @@ func constraintPhrase(c FieldConstraints) string {
 	return "(" + strings.Join(parts, ", ") + ")"
 }
 
-// RawRequest is the callable's request struct verbatim from the canonical descriptor
+// RawRequest is the callable's request struct verbatim from the canonical PackageInterface
 // document — what `--describe --json` emits.
-func (d *PackageDescriptor) RawRequest(name string) (json.RawMessage, bool) {
+func (d *PackageInterface) RawRequest(name string) (json.RawMessage, bool) {
 	var doc struct {
 		Entrypoints []struct {
 			Name    string          `json:"name"`

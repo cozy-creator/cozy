@@ -30,7 +30,7 @@ import (
 
 // Entrypoint is the small dispatch projection of one entrypoint already bound inside
 // the exact PlacementSet. Digest is the wire identity; Outputs comes from the exact
-// PackageDescriptor and is presentation metadata, never a second binding document.
+// PackageInterface and is presentation metadata, never a second binding document.
 type Entrypoint struct {
 	Name    string   `json:"name"`
 	Digest  string   `json:"digest"`
@@ -72,10 +72,10 @@ func (p WarmupPolicy) Or() WarmupPolicy {
 // rev-2's Placement nested directly in PlacementSet (#481). It carries the identity
 // facts, and nothing about how a process is started.
 type DesiredPlacement struct {
-	Package               string `json:"package"`                 // org/name — the slot this placement serves under
-	PackageRevisionDigest string `json:"package_revision_digest"` // exact selected release digest spelling
-	Release               string `json:"release"`
-	SourceDigest          string `json:"source_digest,omitempty"` // local-only DevelopmentPackage identity
+	Package             string `json:"package"` // org/name — the slot this placement serves under
+	Release             string `json:"release"`
+	SourceDigest        string `json:"source_digest,omitempty"` // local-only DevelopmentPackage identity
+	LocalRevisionDigest string `json:"local_revision_digest,omitempty"`
 	// InstallID is the install this placement was resolved from ("" = an uninstalled dev
 	// tree). Was `Generation`, which named a protocol word this side does not own (#484).
 	InstallID string `json:"install_id"`
@@ -86,7 +86,6 @@ type DesiredPlacement struct {
 	PlacementSetDigest string       `json:"placement_set_digest"`
 	PlacementSetBytes  []byte       `json:"placement_set_bytes"`
 	EnvironmentDigest  string       `json:"environment_digest"`
-	ConfigDigest       string       `json:"config_digest"`
 	Entrypoints        []Entrypoint `json:"entrypoints"`
 	PlacementIDValue   string       `json:"placement_id,omitempty"`
 	// Models is the exact selection this placement was resolved with (empty = the package's
@@ -127,22 +126,21 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 	packageFact, development := row.Sub("package"), row.Sub("development")
 	placement := DesiredPlacement{
 		Package: pkg, InstallID: installID, PlacementIDValue: row.Str("placement_id"),
-		PackageRevisionDigest: packageFact.Str("release_digest"),
-		Release:               packageFact.Str("release"),
-		EnvironmentDigest:     row.Str("environment_digest"),
-		PlacementSetDigest:    digest, PlacementSetBytes: append([]byte(nil), data...),
+		Release:            packageFact.Str("release"),
+		EnvironmentDigest:  row.Str("environment_digest"),
+		PlacementSetDigest: digest, PlacementSetBytes: append([]byte(nil), data...),
 	}
 	if development.Str("source_digest") != "" {
-		placement.PackageRevisionDigest = development.Str("source_digest")
 		placement.Release = development.Str("release")
 		placement.SourceDigest = development.Str("source_digest")
+		placement.LocalRevisionDigest = development.Str("local_revision_digest")
 		if development.Str("package") != pkg || placement.Release == "" ||
 			placement.PlacementIDValue == "" || placement.EnvironmentDigest != "" {
 			return DesiredPlacement{}, exit.Named(exit.Structural, "development_placement_incomplete",
 				"development PlacementSet mixes local source with published selection facts")
 		}
 	} else if packageFact.Str("package") != pkg || placement.Release == "" ||
-		placement.PackageRevisionDigest == "" || placement.EnvironmentDigest == "" ||
+		placement.EnvironmentDigest == "" ||
 		placement.PlacementIDValue == "" {
 		return DesiredPlacement{}, exit.Named(exit.Structural, "placement_set_incomplete",
 			"PlacementSet omits or mismatches its placement, package selection, or environment identity")
@@ -400,7 +398,7 @@ type worker struct {
 	// package_prepare takes exactly one package), and the Runtime seeds the package's
 	// placement_id from the exact delegation bytes — so the bytes are REUSED while they
 	// live: re-signing package A because package B joined would retire a serving
-	// placement that changed in nothing but its credential. A descriptor-falsifying
+	// placement that changed in nothing but its credential. A package-interface-falsifying
 	// refusal is relayed to the hub with this chain (cl-078/th-106); defectReported
 	// latches per revision so one falsification files one report.
 	desiredDelegations     map[string]signedPackageDelegation
@@ -497,13 +495,11 @@ type worker struct {
 	// retired as dishonest — it advanced on acceptance, so a reader learned only that its
 	// own message arrived. converged < accepted is the normal, readable state of a
 	// convergence in progress or a latched failure, never an error.
-	acceptedRevision      uint64
-	convergedRevision     uint64
-	acceptedSetDigest     []byte
-	snapshotAcknowledged  bool
-	packageRevisionDigest string
-	environmentDigest     string
-	configDigest          string
+	acceptedRevision     uint64
+	convergedRevision    uint64
+	acceptedSetDigest    []byte
+	snapshotAcknowledged bool
+	environmentDigest    string
 	// The job lane uses the same reported-versus-pre-offer split as serving. jobsAvail is
 	// the effective number dispatch reads.
 	reportedJobs int
@@ -547,9 +543,8 @@ type worker struct {
 
 type remotePlacementObservation struct {
 	placementID         string
-	packageRevision     string
+	placementSetDigest  string
 	environmentDigest   string
-	configDigest        string
 	materialization     pb.MaterializationState
 	serving             pb.ServingState
 	dispatchablePlanIDs map[string]bool
@@ -587,19 +582,57 @@ func (w *worker) placementFor(slot, planID string) string {
 }
 
 func (w *worker) remoteDispatchable(placement DesiredPlacement, planID string) bool {
-	observed := w.observedRemote[placement.PackageRevisionDigest]
+	observed := w.observedRemote[placement.PlacementIDValue]
 	return placement.PlacementIDValue != "" &&
 		observed.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
 		observed.dispatchablePlanIDs[planID]
 }
 
-func (w *worker) remoteStaged(packageName, planID, revision string) bool {
+func (w *worker) remoteStaged(packageName, planID, release, localRevision string) bool {
 	placement, ok := w.remotePlacements[remotePlanKey(packageName, planID)]
-	if !ok || placement.PackageRevisionDigest != revision {
+	if !ok || placement.Release != release ||
+		(localRevision != "" && placement.LocalRevisionDigest != localRevision) {
 		return false
 	}
-	observed, ok := w.observedRemote[placement.PackageRevisionDigest]
-	return ok && observed.placementID == placement.PlacementIDValue && observed.knownPlanIDs[planID]
+	observed, ok := w.observedRemote[placement.PlacementIDValue]
+	return ok && observed.knownPlanIDs[planID]
+}
+
+func preparedRemotePlacement(w *worker, pkg, release string) (DesiredPlacement, bool, *exit.Error) {
+	if len(w.setBytes) == 0 || len(w.setDigest) == 0 {
+		return DesiredPlacement{}, false, nil
+	}
+	doc, err := canonical.Read(w.setBytes, &pb.PlacementSet{})
+	if err != nil {
+		return DesiredPlacement{}, false, exit.Named(exit.Structural,
+			"rental.placement_set_invalid", "prepared PlacementSet is not canonical: %s", err)
+	}
+	digest := spellOf(w.setDigest)
+	for _, row := range doc.List("placements") {
+		selected := row.Sub("package")
+		development := row.Sub("development")
+		if development.Str("package") != "" {
+			selected = development
+		}
+		if selected.Str("package") != pkg || selected.Str("release") != release {
+			continue
+		}
+		placement := DesiredPlacement{Package: pkg, Release: release,
+			PlacementIDValue: row.Str("placement_id"), PlacementSetDigest: digest,
+			PlacementSetBytes: append([]byte(nil), w.setBytes...),
+			EnvironmentDigest: row.Str("environment_digest")}
+		if development.Str("package") != "" {
+			placement.SourceDigest = development.Str("source_digest")
+			placement.LocalRevisionDigest = development.Str("local_revision_digest")
+		}
+		if placement.PlacementIDValue == "" ||
+			(placement.SourceDigest == "" && placement.EnvironmentDigest == "") {
+			return DesiredPlacement{}, false, exit.Named(exit.Structural,
+				"rental.placement_incomplete", "prepared placement for %s@%s is incomplete", pkg, release)
+		}
+		return placement, true, nil
+	}
+	return DesiredPlacement{}, false, nil
 }
 
 // admissible answers the worker-level half. CLOSED is STRUCTURAL (pre-snapshot-barrier,
@@ -863,7 +896,12 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 		placementFailed := false
 		if w != nil {
 			refused, desiredRefusal = w.refusal, w.desiredRefusal
-			observed := w.observedRemote[logical.ReleaseDigest]
+			desired, found, placementProblem := preparedRemotePlacement(w, logical.Package, logical.Release)
+			if placementProblem != nil {
+				c.mu.Unlock()
+				return WorkerLaunchSpec{}, "", placementProblem
+			}
+			observed := w.observedRemote[desired.PlacementIDValue]
 			placementFailed = observed.materialization ==
 				pb.MaterializationState_MATERIALIZATION_STATE_FAILED
 			planID := logical.PlanID
@@ -878,34 +916,25 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 					}
 				}
 			}
-			ready := planID != "" && observed.dispatchablePlanIDs[planID] &&
+			ready := found && planID != "" && observed.dispatchablePlanIDs[planID] &&
 				observed.placementID != "" &&
+				observed.placementSetDigest == desired.PlacementSetDigest &&
 				observed.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
 				w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision
-			if ready && (!validDigest(observed.packageRevision) ||
-				!validDigest(observed.environmentDigest) || !validDigest(observed.configDigest)) {
+			if ready && desired.SourceDigest == "" &&
+				(!validDigest(observed.environmentDigest) ||
+					observed.environmentDigest != desired.EnvironmentDigest) {
 				c.mu.Unlock()
 				return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
 					"rental.invocation_identity_invalid",
 					"worker resolved package %s without complete invocation identity", logical.Package)
 			}
 			if ready {
-				if observed.packageRevision != logical.ReleaseDigest {
-					c.mu.Unlock()
-					return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict,
-						"rental.package_release_changed",
-						"worker resolved package release %s, not delegated %s",
-						observed.packageRevision, logical.ReleaseDigest)
-				}
-				placement := DesiredPlacement{
-					Package: pinnedPackage(logical.Package, rentalID), Release: logical.Release,
-					PackageRevisionDigest: observed.packageRevision,
-					EnvironmentDigest:     observed.environmentDigest, ConfigDigest: observed.configDigest,
-					PlacementIDValue: observed.placementID,
-					Entrypoints: []Entrypoint{{Name: logical.Function, Digest: planID,
-						Outputs: append([]string(nil), logical.Outputs...)}},
-					Models: append([]ModelRef(nil), logical.Models...),
-				}
+				placement := desired
+				placement.Package = pinnedPackage(logical.Package, rentalID)
+				placement.Entrypoints = []Entrypoint{{Name: logical.Function, Digest: planID,
+					Outputs: append([]string(nil), logical.Outputs...)}}
+				placement.Models = append([]ModelRef(nil), logical.Models...)
 				w.remotePlacements[remotePlanKey(placement.Package, planID)] = placement
 				spec := w.spec
 				spec.Placement = placement
@@ -1054,12 +1083,8 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	// The GRANT IS JOURNALED FIRST, before any process exists. An admission that
 	// refuses here means nothing was started, which is why the refusal has no cleanup.
 	if e := c.opt.Store.SpawnWorker(records.WorkerProcess{
-		InstanceID:            instanceID,
-		Package:               spec.Placement.Package,
-		InstallID:             spec.Placement.InstallID,
-		PackageRevisionDigest: spec.Placement.PackageRevisionDigest,
-		WorkerID:              "local",
-		Devices:               spec.Devices,
+		InstanceID: instanceID, Package: spec.Placement.Package,
+		InstallID: spec.Placement.InstallID, WorkerID: "local", Devices: spec.Devices,
 	}); e != nil {
 		logFile.Close()
 		return "", e
@@ -1087,7 +1112,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	args = append(args,
 		"--socket", listen,
 		"--out", filepath.Join(root, "run"),
-		"--release-id", spec.Placement.PackageRevisionDigest,
+		"--release-id", spec.Placement.Release,
 		"--devices", strings.Join(spec.Devices, ","),
 		"--grace", strconv.FormatFloat(graceOr(spec.GraceSec), 'f', -1, 64),
 	)
@@ -1301,11 +1326,8 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	// cards, and the pod's card is the pod's. There is no grant to journal and none to
 	// release, which is also why nothing here has a pid or a birth identity to record.
 	if e := c.opt.Store.AttachWorker(records.WorkerProcess{
-		InstanceID:            instanceID,
-		Package:               spec.Placement.Package,
-		InstallID:             spec.Placement.InstallID,
-		PackageRevisionDigest: spec.Placement.PackageRevisionDigest,
-		WorkerID:              "remote",
+		InstanceID: instanceID, Package: spec.Placement.Package,
+		InstallID: spec.Placement.InstallID, WorkerID: "remote",
 	}); e != nil {
 		return "", e
 	}
@@ -1533,7 +1555,7 @@ type WorkerFacts struct {
 	InstanceID                string   `json:"instance_id"`
 	RentalID                  string   `json:"rental_id,omitempty"`
 	Package                   string   `json:"package"`
-	PackageRevisionDigest     string   `json:"package_revision_digest"`
+	Release                   string   `json:"release"`
 	BootID                    string   `json:"worker_boot_id"`
 	PlacementID               string   `json:"placement_id"`
 	PlacementSetDigest        string   `json:"placement_set_digest"`
@@ -1600,7 +1622,7 @@ func (c *Orchestrator) Worker(instanceID string) *WorkerFacts {
 func factsOf(w *worker) WorkerFacts {
 	f := WorkerFacts{
 		InstanceID: w.instanceID, Package: w.spec.Placement.Package,
-		PackageRevisionDigest: w.spec.Placement.PackageRevisionDigest, BootID: w.bootID,
+		Release: w.spec.Placement.Release, BootID: w.bootID,
 		PlacementID: w.placementID, ExecutorEpoch: w.executorEpoch,
 		Exited: w.exited, Devices: w.spec.Devices,
 

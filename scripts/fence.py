@@ -170,7 +170,7 @@ TFS_SITES = {"internal/config/config.go", "internal/tfs/tfs.go"}
 TFS_FIELD = re.compile(r"\.Tfs\b")
 
 # (cl-010) The files that may reach a package's own cozy-runtime, and the CLOSED set
-# of verbs they may name. Publication and install derive the package descriptor once; launch
+# of verbs they may name. Publication and install derive the package interface once; launch
 # may ask for host facts and fit verdicts. Nothing executes a model
 # through these doors — that is what the orchestrator and worker protocol are for.
 RUNTIME_SITES = {

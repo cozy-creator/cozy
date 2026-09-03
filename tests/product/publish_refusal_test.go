@@ -212,7 +212,7 @@ func TestPublishRefusesImageOwnedPins(t *testing.T) {
 // TestPublishStagesInTreeDependencies proves the auto-vendor path is unchanged
 // for in-tree local deps: over a REAL `uv lock` of a tree with one in-tree path
 // dependency, publication staging passes both cl-084 gates, builds the project
-// and dependency wheels, and stops only at the descriptor step (this fixture
+// and dependency wheels, and stops only at the PackageInterface step (this fixture
 // deliberately has no cozy-runtime to describe it).
 func TestPublishStagesInTreeDependencies(t *testing.T) {
 	tree := fixtureTree(t, fixturePyproject("cozy-fixture-helper==0.0.1")+`
@@ -230,7 +230,7 @@ cozy-fixture-helper = { path = "libs/helper" }
 	fatal(t, problem)
 	defer pack.Close()
 	problem = pack.BuildForPublish(t.Context())
-	if problem == nil || problem.Name != "package_descriptor_refused" {
+	if problem == nil || problem.Name != "package_interface_refused" {
 		t.Fatalf("in-tree dependency tree stopped early: %v", problem)
 	}
 }
@@ -251,7 +251,7 @@ func writeHelperProject(t *testing.T, dir, distribution, module, version string)
 
 // TestPublishBuildAcceptsCompliantPackage is the green arm over the runtime
 // peer fixture: an image-owned RANGE plus one in-tree local dependency builds
-// the complete publication staging — descriptor included — vendors exactly the
+// the complete publication staging — PackageInterface included — vendors exactly the
 // in-tree dep, keeps the roster wheel in source custody, and reports the
 // th-113 publish nudge.
 func TestPublishBuildAcceptsCompliantPackage(t *testing.T) {
@@ -297,7 +297,7 @@ func TestPublishBuildAcceptsCompliantPackage(t *testing.T) {
 	if len(pack.Registry) != 0 {
 		t.Fatalf("registry rows = %+v", pack.Registry)
 	}
-	if pack.Descriptor == "" || pack.Wheel == "" {
-		t.Fatalf("staging incomplete: wheel %q descriptor %q", pack.Wheel, pack.Descriptor)
+	if pack.PackageInterface == "" || pack.Wheel == "" {
+		t.Fatalf("staging incomplete: wheel %q package interface %q", pack.Wheel, pack.PackageInterface)
 	}
 }

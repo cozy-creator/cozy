@@ -64,7 +64,7 @@ type Options struct {
 	RentalClaimProof RentalClaimProofSource
 	// RentalPackageSet signs Creator's logical package/model download authority.
 	RentalPackageSet RentalPackageSetSource
-	// ReportReleaseDefect relays a descriptor-falsifying pod refusal to the hub
+	// ReportReleaseDefect relays a package-interface-falsifying pod refusal to the hub
 	// (th-106). Callback for the same reason RentalPackageSet is: the
 	// orchestrator holds no Tensorhub client. Fire-and-forget; the hub's defect
 	// tombstone is idempotent.
@@ -84,10 +84,7 @@ type Options struct {
 	// LocalWheels puts an unpublished revision's wheels in the object store and answers
 	// with one read capability per wheel (th-094). Without it this daemon cannot transfer a
 	// local package: the control stream carries control, not content.
-	LocalWheels LocalWheelGrantSource
-	// ConfigDigest is the local evaluated-config identity. Environment identity
-	// comes only from the exact selected PlacementSet.
-	ConfigDigest string
+	LocalWheels  LocalWheelGrantSource
 	MaxOutputMiB int64
 }
 
@@ -97,10 +94,10 @@ type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error
 // refused, the rental it was refused on, and the signed delegation that
 // authorized the download — the hub verifies that chain before tombstoning.
 type ReleaseDefect struct {
-	Package, Release, ReleaseDigest string
-	RentalID                        string
-	Delegation, Signature           []byte
-	Code, Detail                    string
+	Package, Release      string
+	RentalID              string
+	Delegation, Signature []byte
+	Code, Detail          string
 }
 
 // ReleaseDefectReporter posts one defect report; failures are logged, never
@@ -156,7 +153,6 @@ type Launcher interface {
 type LogicalPackage struct {
 	Package          string
 	Release          string
-	ReleaseDigest    string
 	Function         string
 	Outputs          []string
 	PlanID           string
@@ -167,7 +163,6 @@ type LogicalPackage struct {
 type LogicalJob struct {
 	Package          string
 	Release          string
-	ReleaseDigest    string
 	Function         string
 	DescriptorID     string
 	Outputs          []string

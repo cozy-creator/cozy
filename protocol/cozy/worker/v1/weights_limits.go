@@ -21,7 +21,6 @@ const MaxModelSourceProfileBytes = 1024
 const MaxModelSourceURIBytes = 4096
 const MaxModelSourceLicenseBytes = 4096
 const MaxModelSourceURLBytes = 16 << 10
-const MaxCheckpointEvidenceBytes = 64 << 10
 const MaxLocalPackageFiles = 33
 const MaxLocalPackageFilenameBytes = 255
 const MaxLocalPackageGrantURLBytes = 16 << 10

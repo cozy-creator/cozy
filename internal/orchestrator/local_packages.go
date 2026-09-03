@@ -714,7 +714,12 @@ func (c *Orchestrator) replayLocalAborts(current *session, workerID string) {
 		return
 	}
 	for _, row := range rows {
-		source, sourceErr := canonical.Raw(row.PackageRevisionDigest)
+		install, installProblem := c.opt.Store.Install(row.InstallID)
+		if installProblem != nil || install == nil {
+			c.logf("canceled request %s has no source install for local package abort", row.ID)
+			continue
+		}
+		source, sourceErr := canonical.Raw(install.SourceDigest)
 		revision, revisionErr := canonical.Raw(row.LocalPackageDigest)
 		if sourceErr != nil || revisionErr != nil {
 			c.logf("canceled request %s has invalid local package abort identity", row.ID)

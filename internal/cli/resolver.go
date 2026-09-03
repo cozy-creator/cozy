@@ -26,7 +26,7 @@ import (
 // cl-006 shipped a second source, `--dev-package <file>`: a hand-written PackageSpec
 // document, because the install could not yet carry the launch facts a supervisor
 // needs and guessing an interpreter would have been worse than refusing. cl-010 DELETES
-// it — an install carries a venv, a proven descriptor and a binding table, which is
+// it — an install carries a venv, a proven PackageInterface and a binding table, which is
 // every fact that document supplied. Nothing coexists "temporarily": the flag, the
 // loader, and the driver's writer are all gone, and the live driver installs a package
 // exactly as a user does.
@@ -38,7 +38,7 @@ type Resolver struct {
 	selectionMu sync.Mutex
 	store       *records.Store
 	cfg         config.Config
-	// cache holds the specs already derived this launch. Deriving one reads a descriptor
+	// cache holds the specs already derived this launch. Deriving one reads a PackageInterface
 	// and asks the runtime for its artifact index; an install is IMMUTABLE, so doing it
 	// twice would answer the same thing twice.
 	cache    map[string]orchestrator.WorkerLaunchSpec
@@ -431,15 +431,15 @@ func selectedInstallKey(installID string, models []orchestrator.ModelRef) string
 	return key.String()
 }
 
-func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function string,
+func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 	models []orchestrator.ModelRef,
 ) (
 	orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error,
 ) {
 	var empty orchestrator.LogicalPackage
-	if _, err := canonical.Raw(releaseDigest); err != nil || release == "" {
-		return empty, nil, exit.Named(exit.Structural, "rental.package_release_digest_invalid",
-			"remote package release identity is incomplete")
+	if release == "" {
+		return empty, nil, exit.Named(exit.Structural, "rental.package_release_invalid",
+			"remote package release is absent")
 	}
 	ref, problem := hub.ParseRef(pkg)
 	if problem != nil {
@@ -451,8 +451,8 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function st
 	if problem != nil {
 		return empty, nil, problem
 	}
-	if detail.Release.Release != release || detail.Release.ReleaseDigest != releaseDigest ||
-		detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
+	if detail.Release.Release != release ||
+		detail.Release.PackageInterfaceLength != int64(len(detail.PackageInterface)) {
 		return empty, nil, exit.Named(exit.Conflict, "rental.package_release_changed",
 			"Tensorhub release %s@%s does not match the queued immutable release", pkg, release)
 	}
@@ -460,19 +460,19 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function st
 	if problem != nil {
 		return empty, nil, problem
 	}
-	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
+	packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
 	if problem != nil {
 		return empty, nil, problem
 	}
-	if descriptor.Digest != detail.Release.PackageDescriptorDigest {
-		return empty, nil, exit.Named(exit.Conflict, "rental.package_descriptor_digest_mismatch",
-			"Tensorhub descriptor bytes do not match their release fact")
+	if packageInterface.Digest != detail.Release.PackageInterfaceDigest {
+		return empty, nil, exit.Named(exit.Conflict, "rental.package_interface_digest_mismatch",
+			"Tensorhub package interface bytes do not match their release fact")
 	}
-	entrypoint, problem := descriptor.Function(function)
+	entrypoint, problem := packageInterface.Function(function)
 	if problem != nil {
 		return empty, nil, problem
 	}
-	if len(entrypoint.Models) > 0 && len(descriptor.Entrypoints) != 1 {
+	if len(entrypoint.Models) > 0 && len(packageInterface.Entrypoints) != 1 {
 		return empty, nil, exit.Named(exit.Unavailable, "rental.modeled_package_surface_unsupported",
 			"the first modeled rental lane requires one serving entrypoint so its worker-derived binding is unambiguous")
 	}
@@ -522,21 +522,21 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function st
 		}
 	}
 	return orchestrator.LogicalPackage{
-		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
+		Package: pkg, Release: release,
 		Function: function, Outputs: launch.AssetPaths(entrypoint.Result), PlanID: planID,
 		Models: models, NeedsAccelerator: launch.AcceleratorRequired(requirements),
 	}, entrypoint, nil
 }
 
-func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string,
+func (r *Resolver) ResolveRemoteJob(pkg, release, function string,
 	models []orchestrator.ModelRef, deferredModels bool,
 ) (
 	orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error,
 ) {
 	var empty orchestrator.LogicalJob
-	if _, err := canonical.Raw(releaseDigest); err != nil || release == "" {
-		return empty, nil, exit.Named(exit.Structural, "rental.package_release_digest_invalid",
-			"remote package release identity is incomplete")
+	if release == "" {
+		return empty, nil, exit.Named(exit.Structural, "rental.package_release_invalid",
+			"remote package release is absent")
 	}
 	ref, problem := hub.ParseRef(pkg)
 	if problem != nil {
@@ -548,8 +548,8 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 	if problem != nil {
 		return empty, nil, problem
 	}
-	if detail.Release.Release != release || detail.Release.ReleaseDigest != releaseDigest ||
-		detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
+	if detail.Release.Release != release ||
+		detail.Release.PackageInterfaceLength != int64(len(detail.PackageInterface)) {
 		return empty, nil, exit.Named(exit.Conflict, "rental.package_release_changed",
 			"Tensorhub release %s@%s does not match the queued immutable release", pkg, release)
 	}
@@ -557,12 +557,12 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 	if problem != nil {
 		return empty, nil, problem
 	}
-	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
-	if problem != nil || descriptor.Digest != detail.Release.PackageDescriptorDigest {
-		return empty, nil, exit.Named(exit.Conflict, "rental.package_descriptor_digest_mismatch",
-			"Tensorhub descriptor bytes do not match their release fact")
+	packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
+	if problem != nil || packageInterface.Digest != detail.Release.PackageInterfaceDigest {
+		return empty, nil, exit.Named(exit.Conflict, "rental.package_interface_digest_mismatch",
+			"Tensorhub package interface bytes do not match their release fact")
 	}
-	job, problem := descriptor.Function(function)
+	job, problem := packageInterface.Function(function)
 	if problem != nil {
 		return empty, nil, problem
 	}
@@ -609,19 +609,13 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 	}
 	outputs := launch.AssetPaths(job.Result)
 	for _, output := range job.WeightsOutputs {
-		var contract *records.ModelTransferContract
-		if output.RequiredContract != nil {
-			contract = &records.ModelTransferContract{TopologyDigest: output.RequiredContract.TopologyDigest,
-				Encodings: append([]string(nil), output.RequiredContract.Encodings...)}
-		}
 		weights = append(weights, orchestrator.WeightsOutput{
 			OutputID: output.OutputID, MimeType: output.MimeType, MaxBytes: output.MaxBytes,
-			RequiredContract: contract,
 		})
 		outputs = append(outputs, output.OutputID)
 	}
 	return orchestrator.LogicalJob{
-		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
+		Package: pkg, Release: release,
 		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
 		WeightsOutputs: weights, NeedsAccelerator: launch.AcceleratorRequired(requirements), Models: models,
 		ProducerParams: params,
@@ -629,11 +623,11 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 }
 
 func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, bool, *exit.Error) {
-	install, descriptor, problem := r.installDescriptor(installID)
+	install, packageInterface, problem := r.installPackageInterface(installID)
 	if problem != nil {
 		return nil, false, problem
 	}
-	entrypoint, problem := descriptor.Function(name)
+	entrypoint, problem := packageInterface.Function(name)
 	return entrypoint, launch.AcceleratorRequired(strings.Split(install.Closure, "\n")), problem
 }
 
@@ -650,17 +644,17 @@ func (r *Resolver) installRecord(installID string) (*records.PackageInstall, *ex
 	return install, nil
 }
 
-func (r *Resolver) installDescriptor(installID string) (*records.PackageInstall,
-	*launch.PackageDescriptor, *exit.Error) {
+func (r *Resolver) installPackageInterface(installID string) (*records.PackageInstall,
+	*launch.PackageInterface, *exit.Error) {
 	install, e := r.installRecord(installID)
 	if e != nil {
 		return nil, nil, e
 	}
-	descriptor, e := launch.ReadDescriptor(launch.DescriptorPath(install.Dir), install.PackageDescriptor)
+	packageInterface, e := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir), install.PackageInterface)
 	if e != nil {
 		return nil, nil, e
 	}
-	return install, descriptor, nil
+	return install, packageInterface, nil
 }
 
 func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
@@ -701,7 +695,7 @@ func (r *Resolver) ResolveJobInstall(installID, function string) (orchestrator.W
 	return spec, e
 }
 
-// Jobs names the `@job` functions one installed package registers, with the descriptor
+// Jobs names the `@job` functions one installed package registers, with the PackageInterface
 // id each resolves to. `cozy run list` and the API's job listing read it.
 func (r *Resolver) Jobs(pkg string) ([]launch.JobFacts, *exit.Error) {
 	inst, e := r.activeInstall(strings.TrimSpace(pkg))
@@ -726,7 +720,7 @@ func (r *Resolver) JobsInstall(installID string) ([]launch.JobFacts, *exit.Error
 
 func jobsOf(facts *launch.Facts) ([]launch.JobFacts, *exit.Error) {
 	out := []launch.JobFacts{}
-	for _, job := range facts.PackageDescriptor.Jobs {
+	for _, job := range facts.PackageInterface.Jobs {
 		one, e := facts.Job(job.Name)
 		if e != nil {
 			return nil, e
