@@ -298,6 +298,7 @@ class Migration:
                 migrated, migrated_length = self.manifest(digest, length)
                 checkpoint["manifest"] = {"length": migrated_length, "sha256": migrated}
                 checkpoint.pop("evidence", None)
+            document["checkpoints"].sort(key=lambda row: row["manifest"]["sha256"])
             for release in document.get("releases", []):
                 for lane in release.get("lanes", []):
                     digest, length = ref(lane["manifest"])
