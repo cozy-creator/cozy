@@ -24,7 +24,7 @@
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{DeliveryGrant, FetchPlan};
-use crate::ids::ObjectRef;
+use crate::ids::{Doc, ObjectRef};
 use crate::store::Store;
 use crate::transport::http::{self, Client};
 use crate::transport::hub::{self, CredentialProvider};
@@ -490,5 +490,102 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         "runtime" => plan.complete_cozytensors(request.store)?,
         _ => plan.complete(request.store)?,
     }
+    record_locally(request.store, &closure)?;
     Ok(report)
+}
+
+/// RECORD WHAT THE PULL RESOLVED. The closure carries `model`, `release` and `lane` for
+/// exactly this — "the resolved identity the local index row needs" — and until now nothing
+/// wrote that row, so a pull left a Store holding a checkpoint it could not answer for.
+///
+/// Two things broke on that, one loudly and one silently. `Store::resolve_release` reads
+/// `repos/<org>/<name>.json`, so a pod that had just fetched a whole checkpoint refused
+/// `REPOSITORY_ABSENT` when it asked which manifest a release lane names. And `gc_plan`
+/// seeds liveness from `repos/` alone — an owner ruling, "the filesystem itself is
+/// self-describing" — so every object the pull had just admitted was formally garbage: a
+/// measured 135 MB proof store planned its entire contents for deletion after a successful
+/// fetch.
+///
+/// Both mutations are idempotent, which is what a warm re-fetch needs: an identical
+/// checkpoint returns the repository unchanged, and re-setting a lane to the manifest it
+/// already names is a no-op the revision fence accepts because the revision is read fresh.
+fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
+    use crate::repository::{Mutation, ReleaseLane, Repository, RepositoryName};
+
+    let Some((org, name)) = closure.model.split_once('/') else {
+        return refuse(
+            Code::HUB_REFUSED,
+            format!("closure model {:?} is not org/name", closure.model),
+        );
+    };
+    let repo = RepositoryName::new(org, name)?;
+    let fault = crate::store::Fault::default();
+    let mut observed = std::fs::read(store.repository_path(&repo)).ok();
+    let mut latest = observed.as_deref().map(Repository::parse).transpose()?;
+
+    let holds_checkpoint = |repository: Option<&Repository>| {
+        repository.is_some_and(|repository| {
+            repository
+                .checkpoints
+                .iter()
+                .any(|entry| entry.manifest == closure.manifest)
+        })
+    };
+    let holds_lane = |repository: Option<&Repository>| {
+        closure.lane.is_empty()
+            || repository.is_some_and(|repository| {
+                repository.releases.iter().any(|release| {
+                    release.version == closure.release
+                        && !release.yanked
+                        && release.lanes.iter().any(|lane| {
+                            lane.lane == closure.lane && lane.manifest == closure.manifest
+                        })
+                })
+            })
+    };
+    // A warm pull records nothing, for the same reason it moves nothing: the row already
+    // says what this pull would say.
+    if holds_checkpoint(latest.as_ref()) && holds_lane(latest.as_ref()) {
+        return Ok(());
+    }
+    if !holds_checkpoint(latest.as_ref()) {
+        latest = store.apply_repository(
+            observed.as_deref(),
+            &Mutation::PutCheckpoint {
+                repo: repo.clone(),
+                manifest: closure.manifest.clone(),
+            },
+            &fault,
+        )?;
+        observed = latest.as_ref().map(Doc::canonical_bytes);
+    }
+    // A closure that named no lane still gets its checkpoint, which is what keeps the
+    // objects live; there is simply no release row to point at them.
+    if closure.lane.is_empty() {
+        return Ok(());
+    }
+    let expected_revision = latest
+        .as_ref()
+        .and_then(|repository| {
+            repository
+                .releases
+                .iter()
+                .find(|release| release.version == closure.release)
+        })
+        .map_or(0, |release| release.revision);
+    store.apply_repository(
+        observed.as_deref(),
+        &Mutation::UpdateRelease {
+            expected_revision,
+            repo,
+            remove: Vec::new(),
+            set: vec![ReleaseLane {
+                lane: closure.lane.clone(),
+                manifest: closure.manifest.clone(),
+            }],
+            version: closure.release.clone(),
+        },
+        &fault,
+    )?;
+    Ok(())
 }
