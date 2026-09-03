@@ -53,4 +53,4 @@ pub use policy::{base_host, blocked, is_loopback_origin, resolve, CheckedUrl, So
 pub use pull::{
     fetch_url, fetch_wanted, pull, Fetched, PullReport, PullRequest, WalkOutcome, RETRYABLE_STATUS,
 };
-pub use push::{push_object, Pushed, PUT_ATTEMPTS};
+pub use push::{push_object, Pushed, UploadGrant, MAX_GRANT_BYTES, PUT_ATTEMPTS};
