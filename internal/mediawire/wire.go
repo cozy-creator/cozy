@@ -27,7 +27,14 @@ const Service = "cozy-media"
 // terminal attempt, read by the opaque subject the terminal named and bounded to the
 // protocol's 1 MiB. Before it, a pod attempt's bundle stayed on the pod and the owner
 // recorded `bundle_absent` for every remote failure.
-const ContractRev = 3
+// Rev 4 added `PUT /v1/packages/{operation}/{digest}` and `DELETE /v1/packages/{operation}`
+// (th-142 child 4, decision 697: the pod never pulls from the owner's machine). Before it,
+// an editable revision's wheels went to an object store under owner-minted read
+// capabilities and the POD spent them through a download edge of its own. A wheel is a
+// file, the media plane is the file plane, and the object's own sha256 is the path segment
+// it is pushed under — so the pod proves each body against its own name and needs no
+// transfer ledger to believe it afterwards.
+const ContractRev = 4
 
 // Health is the exact document `GET /v1/health` answers, and it is ONLY the contract: who
 // is answering and at which revision. That is the whole question the route exists to

@@ -396,6 +396,86 @@ func (c *Client) PutInputFile(blob, path, wantDigest string, wantLength int64) (
 	return doc.Path, nil
 }
 
+// PushPackage streams one editable wheel to the pod and answers the POD-LOCAL PATH it
+// landed at. It is `PutInputFile` for a different subtree and for the same reason: a wheel
+// is a file, and this is the only byte channel there is between this host and a pod.
+//
+// THE NAME IS THE PROOF (th-142 child 4, decision 697). The path segment is the object's own
+// sha256, so the pod hashes what arrives and commits it only under a name its bytes prove.
+// The owner used to PUT these to an object store and hand the pod a read capability per
+// wheel, which the pod spent through a download edge of its own; nothing about that ever
+// needed the pod to reach the network. Re-pushing an object the pod already holds is
+// answered from its disk without a byte moving, so a retry costs one round trip.
+func (c *Client) PushPackage(operation, path, wantDigest string, wantLength int64) (
+	string, *exit.Error,
+) {
+	hex, ok := strings.CutPrefix(wantDigest, "sha256:")
+	if !ok || len(hex) != 64 {
+		return "", exit.Internalf("a pushed package object is named by its sha256, not %q", wantDigest)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", exit.New(exit.NotFound, "local package wheel %s: %s", filepath.Base(path), err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() != wantLength {
+		return "", exit.Named(exit.Conflict, "local_package_wheel_changed",
+			"local package wheel %s no longer has its recorded %d-byte length",
+			filepath.Base(path), wantLength)
+	}
+	hash := sha256.New()
+	request, err := http.NewRequest(http.MethodPut,
+		c.url("/v1/packages/"+operation+"/"+hex), io.TeeReader(file, hash))
+	if err != nil {
+		return "", exit.Internalf("cannot build the media package push: %s", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+c.spec.Token.Reveal()) //cozy:allow-reveal
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.ContentLength = wantLength
+	request, guard := c.stall(request)
+	defer guard.cancel()
+	response, err := c.http.Do(request)
+	if err != nil {
+		return "", exit.Named(exit.Unavailable, "media_unreachable",
+			"the pod's media server at %s did not accept %s: %s",
+			c.spec.Addr, filepath.Base(path), guard.why(err))
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(guard.reader(response.Body), 1<<20+1))
+	if err != nil || len(data) > 1<<20 {
+		return "", exit.Unavailablef("the pod's media package answer is unreadable or oversized")
+	}
+	if response.StatusCode >= 400 {
+		return "", mediaRefusal(response.StatusCode, data)
+	}
+	var doc answer
+	if err := json.Unmarshal(data, &doc); err != nil || doc.Path == "" {
+		return "", exit.Internalf("the pod accepted a wheel and returned no readable path")
+	}
+	// A re-push is answered from the pod's disk without reading the body, so the local
+	// hash is only a fact when this call actually streamed one.
+	if got := "sha256:" + hexEncode(hash.Sum(nil)); response.StatusCode == http.StatusCreated &&
+		got != wantDigest {
+		return "", exit.Named(exit.Conflict, "local_package_wheel_changed",
+			"local package wheel %s changed while it was being pushed", filepath.Base(path))
+	}
+	if doc.Length != wantLength || (doc.Digest != "" && doc.Digest != wantDigest) {
+		return "", exit.Named(exit.Conflict, "local_package_wheel_changed",
+			"the pod holds %s at %d B under a digest that is not the one this revision names",
+			filepath.Base(path), doc.Length)
+	}
+	return doc.Path, nil
+}
+
+// DropPackages removes exactly one operation's pushed wheels. It is the counterpart of the
+// push and the whole of what the abort frame used to be: the wheels live inside the pod's
+// quota-bounded media subtree, so nothing else reclaims them.
+func (c *Client) DropPackages(operation string) *exit.Error {
+	_, _, e := c.call(http.MethodDelete, "/v1/packages/"+operation, nil)
+	return e
+}
+
 func mediaRefusal(status int, data []byte) *exit.Error {
 	var doc answer
 	_ = json.Unmarshal(data, &doc)
@@ -558,6 +638,8 @@ func (c *Client) GetTriage(subject, wantDigest string, wantLength int64) ([]byte
 	}
 	return data, nil
 }
+
+func hexEncode(raw []byte) string { return hex.EncodeToString(raw) }
 
 func digestOf(data []byte) string {
 	sum := sha256.Sum256(data)

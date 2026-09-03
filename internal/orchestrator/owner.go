@@ -403,20 +403,6 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			c.onModelSourcePrepared(s, prepared)
-		case *pb.WorkerFrame_LocalPackageFileStatus:
-			status := m.LocalPackageFileStatus
-			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamEpoch,
-				status.WorkerBootId) {
-				continue
-			}
-			c.onLocalPackageFileStatus(s, status)
-		case *pb.WorkerFrame_LocalPackageAbortStatus:
-			status := m.LocalPackageAbortStatus
-			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamEpoch,
-				status.WorkerBootId) {
-				continue
-			}
-			c.onLocalPackageAbortStatus(s, status)
 		case *pb.WorkerFrame_WeightsReceipt:
 			receipt := m.WeightsReceipt
 			if c.fenced(s, receipt.RecordOwnerEpoch, receipt.ControlStreamEpoch,

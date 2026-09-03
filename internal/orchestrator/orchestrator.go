@@ -86,11 +86,7 @@ type Options struct {
 	AcquireManagedRental func(req records.Request) (RentalDecision, string, *exit.Error)
 	ReleaseManagedRental func(string) (string, *exit.Error)
 	ModelTransfers       ModelTransferOwner
-	// LocalWheels puts an unpublished revision's wheels in the object store and answers
-	// with one read capability per wheel (th-094). Without it this daemon cannot transfer a
-	// local package: the control stream carries control, not content.
-	LocalWheels  LocalWheelGrantSource
-	MaxOutputMiB int64
+	MaxOutputMiB         int64
 }
 
 type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)
@@ -348,9 +344,6 @@ type Orchestrator struct {
 	transferDispatching map[string]bool
 	transferCancels     map[string]context.CancelFunc
 	transferProgressSeq map[string]uint64
-	// localTransfers is command-scoped, lossy progress over Creator's durable request
-	// row and sealed revision. A restart simply replays exact chunks from those authorities.
-	localTransfers map[string]*localTransfer
 }
 
 type wait struct {
@@ -389,7 +382,6 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		transferDispatching: make(map[string]bool),
 		transferCancels:     make(map[string]context.CancelFunc),
 		transferProgressSeq: make(map[string]uint64),
-		localTransfers:      make(map[string]*localTransfer),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a
 	// SAMPLING resolution, never a verdict: every verdict it acts on is the worker's own
@@ -1057,7 +1049,7 @@ func (c *Orchestrator) CancelQueued(requestID, actor string) *exit.Error {
 		}
 		return exit.Internalf("canceled request %s cannot be read back", requestID)
 	}
-	abortProblem := c.cancelLocalTransfer(requestID)
+	abortProblem := c.dropLocalPackages(requestID)
 	c.forget(requestID)
 	if row.ModelTransfer != nil {
 		c.forgetTransferProgress(requestID)

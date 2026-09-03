@@ -80,8 +80,7 @@ type fakePod struct {
 	desired            []*pb.DesiredWorkerState
 	prepares           []*pb.PreparePackageSetCall
 	localPrepares      []*pb.PrepareLocalPackageCall
-	grants             []*pb.LocalPackageFileGrant
-	lanes              []string // the order lanes were used: fetch, prepare_private, placement_set
+	lanes              []string // the order lanes were used: prepare_private, placement_set
 	prepareCodes       []codes.Code
 	prepareUnavailable int
 	hostDigest         []byte
@@ -285,26 +284,6 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			p.mu.Lock()
 			p.offers = append(p.offers, m.AttemptOffer)
 			p.mu.Unlock()
-		case *pb.RecordOwnerFrame_LocalPackageFetchRequest:
-			// th-094's pod half, minimally: every named wheel is reported VERIFIED at its
-			// full length. The grants are recorded so the test can read what was named.
-			request := m.LocalPackageFetchRequest
-			p.mu.Lock()
-			p.grants = append(p.grants, request.Files...)
-			p.lanes = append(p.lanes, "fetch")
-			p.mu.Unlock()
-			for _, grant := range request.Files {
-				if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_LocalPackageFileStatus{
-					LocalPackageFileStatus: &pb.LocalPackageFileStatus{
-						RecordOwnerEpoch: request.RecordOwnerEpoch, ControlStreamEpoch: request.ControlStreamEpoch,
-						WorkerBootId: request.WorkerBootId, OperationId: request.OperationId,
-						SourceDigest: request.SourceDigest, Digest: grant.Digest, Filename: grant.Filename,
-						Length: grant.Length, ReceivedBytes: grant.Length,
-						State: pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED,
-					}}}); err != nil {
-					return err
-				}
-			}
 		}
 	}
 }
@@ -528,6 +507,34 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 			_ = os.WriteFile(path, body, 0o644)
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{"path": path, "length": len(body)})
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/packages/"):
+			// THE NAME IS THE PROOF (th-142 child 4). The last segment is the object's own
+			// sha256; the plane hashes what arrives and commits it only under a name its
+			// bytes prove. A re-push of a name already held reads the disk and moves nothing.
+			segments := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/packages/"), "/")
+			if len(segments) != 2 {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			path := filepath.Join(mediaRoot, "packages", segments[0], segments[1])
+			if info, err := os.Stat(path); err == nil {
+				_ = json.NewEncoder(w).Encode(map[string]any{"path": path,
+					"digest": "sha256:" + segments[1], "length": info.Size()})
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			sum := sha256.Sum256(body)
+			if hex.EncodeToString(sum[:]) != segments[1] {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{
+					"code": "media.digest_mismatch", "message": "the body is not the named object"}})
+				return
+			}
+			_ = os.MkdirAll(filepath.Dir(path), 0o755)
+			_ = os.WriteFile(path, body, 0o644)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"path": path,
+				"digest": "sha256:" + segments[1], "length": len(body)})
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/outputs/"):
 			dir := filepath.Join(mediaRoot, "outputs", strings.TrimPrefix(r.URL.Path, "/v1/outputs/"))
 			_ = os.MkdirAll(dir, 0o755)
@@ -569,13 +576,6 @@ func rentalWiring(connection *orchestrator.WorkerConnection, signer ed25519.Priv
 				return nil, exit.Internalf("%v", err)
 			}
 			return ed25519.Sign(signer, body), nil
-		}
-		o.LocalWheels = func(_ context.Context, wheels []orchestrator.LocalWheel) ([]string, *exit.Error) {
-			urls := make([]string, 0, len(wheels))
-			for _, wheel := range wheels {
-				urls = append(urls, "https://store.invalid/private/"+wheel.Digest)
-			}
-			return urls, nil
 		}
 		o.RentalPackageSet = func(c *orchestrator.WorkerConnection, packages []*pb.DownloadPackageRef,
 			models []*pb.DownloadModelRef) ([]byte, []byte, *exit.Error) {
@@ -780,11 +780,16 @@ func submitPrivateRental(t *testing.T, o *owner, revision localpackage.Revision,
 	return requestID
 }
 
-// TestPodHostLocalRevisionGrantsProjectWheel: a rental-bound editable request grants
-// every wheel of its sealed revision to the pod — the project wheel among them — BEFORE
-// the private set is prepared through PodHost, and the placement_set the owner then
+// TestPodHostLocalRevisionPushesEveryWheel: a rental-bound editable request PUSHES every
+// wheel of its sealed revision onto the pod's file plane — the project wheel among them —
+// BEFORE the private set is prepared through PodHost, and the placement_set the owner then
 // sends is the exact bytes the host prepared, carrying that wheel.
-func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
+//
+// It used to GRANT them: one short-lived read capability per wheel on the control stream,
+// which the POD spent against an object store. th-142 child 4 inverts that (decision 697),
+// so what this test reads is no longer a list of URLs the owner named — it is the pod's own
+// disk, under `packages/<operation>/<sha256>`, holding the exact bytes.
+func TestPodHostLocalRevisionPushesEveryWheel(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	pod := &fakePod{controlKey: public}
@@ -804,23 +809,28 @@ func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 	})
 	pod.mu.Lock()
 	defer pod.mu.Unlock()
-	if got := strings.Join(pod.lanes, ","); got != "fetch,prepare_private,placement_set" {
-		t.Fatalf("the pod saw the lanes in the order %q; want fetch, prepare_private, placement_set", got)
+	if got := strings.Join(pod.lanes, ","); got != "prepare_private,placement_set" {
+		t.Fatalf("the pod saw the lanes in the order %q; want prepare_private, placement_set", got)
 	}
-	project := 0
-	for _, grant := range pod.grants {
-		spelled, _ := canonical.Spell(grant.Digest)
-		if strings.HasPrefix(grant.Filename, "weightless-1.0.0-") {
-			project++
-			if spelled != revision.Files[0].Digest && spelled != revision.Files[1].Digest ||
-				grant.Url == "" {
-				t.Fatalf("the project wheel grant names %s %s, not the sealed revision's wheel", spelled, grant.Filename)
-			}
+	// THE POD'S OWN DISK is the assertion. Every wheel of the sealed revision stands under
+	// this operation, at a name that is its sha256, holding the exact staged bytes.
+	held := filepath.Join(root, "pod-media", "packages", requestID)
+	entries, err := os.ReadDir(held)
+	must(t, err)
+	if len(entries) != len(revision.Files) {
+		t.Fatalf("the pod holds %d pushed object(s) for %s; want %d",
+			len(entries), requestID, len(revision.Files))
+	}
+	for _, file := range revision.Files {
+		landed, err := os.ReadFile(filepath.Join(held, strings.TrimPrefix(file.Digest, "sha256:")))
+		if err != nil {
+			t.Fatalf("wheel %s was never pushed to the pod: %v", file.Filename, err)
 		}
-	}
-	if len(pod.grants) != len(revision.Files) || project != 1 {
-		t.Fatalf("%d grant(s) with %d project wheel(s); want %d grants naming exactly one project wheel",
-			len(pod.grants), project, len(revision.Files))
+		staged, err := os.ReadFile(file.Path)
+		must(t, err)
+		if !bytes.Equal(landed, staged) {
+			t.Fatalf("the pod holds different bytes for %s than this host staged", file.Filename)
+		}
 	}
 	if len(pod.localPrepares) != 1 || len(pod.localPrepares[0].LocalPackageSet.Files) != len(revision.Files) ||
 		pod.localPrepares[0].LocalPackageSet.OperationId != requestID {
