@@ -46,7 +46,7 @@ type EnvironmentReceipt struct {
 // that, never writes uv.lock, and never falls back to a resolve; a matching lock
 // needs no network at all (verified with UV_OFFLINE=1). The two flags are mutually
 // exclusive in uv, so this is the stronger reading of one rule, not a second one.
-func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *exit.Error) {
+func MaterializeEnvironment(sourceDir, venvDir, companionStore string) (*EnvironmentReceipt, *exit.Error) {
 	lock := filepath.Join(sourceDir, "uv.lock")
 	lockDigest, err := fileDigest(lock)
 	if err != nil {
@@ -82,6 +82,9 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 	}
 
 	env.Python = pythonVersion(venvDir)
+	if problem := joinCompanions(companionStore, venvDir, &env.Warnings); problem != nil {
+		return nil, problem
+	}
 	env.Packages, env.Closure = closure(venvDir)
 	return env, nil
 }
@@ -90,8 +93,8 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 // published project metadata, then installs the exact project and custom wheels. Registry
 // dependencies come from uv.lock; wheel paths replace only distributions whose published
 // bytes are authoritative. Nothing is inherited from Creator's own Python environment.
-func MaterializePublishedEnvironment(sourceDir, venvDir string, project PublishedWheel,
-	dependencies, localWheels []PublishedWheel,
+func MaterializePublishedEnvironment(sourceDir, venvDir, companionStore string,
+	project PublishedWheel, dependencies, localWheels []PublishedWheel,
 ) (*EnvironmentReceipt, *exit.Error) {
 	lock := filepath.Join(sourceDir, "uv.lock")
 	lockDigest, err := fileDigest(lock)
@@ -160,6 +163,9 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string, project Publishe
 		return nil, problem
 	}
 	env.Python = pythonVersion(venvDir)
+	if problem := joinCompanions(companionStore, venvDir, &env.Warnings); problem != nil {
+		return nil, problem
+	}
 	env.Packages, env.Closure = closure(venvDir)
 	return env, nil
 }

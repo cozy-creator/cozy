@@ -36,7 +36,7 @@ var boundaryVersionPattern = regexp.MustCompile(
 	`(?:===|==|!=|~=|<=|>=|<|>)\s*v?(?:([0-9]+)!)?([0-9]+(?:\.[0-9]+)*)`)
 
 func refuseImageOwnedPin(req requirement) *exit.Error {
-	if !imageOwnedDistribution(req.name) || !req.hasSpec {
+	if !ImageOwnedDistribution(req.name) || !req.hasSpec {
 		return nil
 	}
 	if admitsTwoMinorLines(req.specifier, req.spec) {

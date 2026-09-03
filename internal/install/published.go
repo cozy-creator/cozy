@@ -97,7 +97,7 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 		}
 	}
 	venvDir := filepath.Join(installDir, "venv")
-	environment, problem := MaterializePublishedEnvironment(sourceDir, venvDir,
+	environment, problem := MaterializePublishedEnvironment(sourceDir, venvDir, l.Companions,
 		published.ProjectWheel, published.Wheels, published.LocalWheels)
 	if problem != nil {
 		return nil, empty, "", nil, problem
