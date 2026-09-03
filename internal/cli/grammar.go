@@ -12,6 +12,7 @@ type CLI struct {
 	Auth    AuthCmd    `cmd:"" group:"Authentication" help:"Authenticate this machine to Tensorhub."`
 	Run     RunCmd     `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
 	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud."`
+	Volume  VolumeCmd  `cmd:"" group:"Rentals" help:"Keep a persistent model store in a datacenter you rent in."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
 	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
 	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
@@ -377,6 +378,35 @@ type RentalListCmd struct{}
 
 func (c *RentalListCmd) Run(r *Runtime) error {
 	return r.call(handleRentLs, nil, nil, nil, false)
+}
+
+type VolumeCmd struct {
+	Current VolumeListCmd `cmd:"" default:"1" hidden:""`
+	Warm    VolumeWarmCmd `cmd:"" help:"Create the standing volume in a datacenter before renting there."`
+	Drop    VolumeDropCmd `cmd:"" help:"Permanently delete a standing volume and its bytes."`
+}
+
+type VolumeListCmd struct{}
+
+func (c *VolumeListCmd) Run(r *Runtime) error {
+	return r.call(handleVolumeLs, nil, nil, nil, false)
+}
+
+type VolumeWarmCmd struct {
+	Datacenter string `arg:"" name:"datacenter" help:"Provider datacenter id, such as EU-RO-1."`
+	Provider   string `help:"Provider name; the hub's primary when omitted."`
+}
+
+func (c *VolumeWarmCmd) Run(r *Runtime) error {
+	return r.call(handleVolumeWarm, []string{c.Datacenter}, nil, values("--provider", c.Provider), false)
+}
+
+type VolumeDropCmd struct {
+	Target string `arg:"" name:"volume" help:"Volume id (pvl-…) or its datacenter."`
+}
+
+func (c *VolumeDropCmd) Run(r *Runtime) error {
+	return r.call(handleVolumeDrop, []string{c.Target}, nil, nil, false)
 }
 
 type UnloadCmd struct{}
