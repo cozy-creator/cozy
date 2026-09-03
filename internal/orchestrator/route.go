@@ -330,7 +330,11 @@ func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) (
 			// A JOB worker hosts no placement: its dispatchability IS its job capacity.
 			return req.Package, w.dispatchable[planID]
 		}
-		return req.Package, w.dispatchableFor(planID)
+		// The model selection is part of the match (cl-114): the plan id hashes the
+		// entrypoint's interface, not its weights, so a placement holding the same plan
+		// under a different selection is not this request's capacity.
+		return req.Package, w.dispatchableFor(planID) &&
+			selectionServes(req.Models, w.spec.Placement.Models)
 	}
 	if req.Worker != "" {
 		if w.instanceID != rentalInstanceID(req.Worker) {
@@ -347,6 +351,7 @@ func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) (
 	return slot, ok && !w.spec.IsJob() && placement.Package == slot &&
 		placement.Release == req.Release &&
 		(req.LocalPackageDigest == "" || placement.LocalRevisionDigest == req.LocalPackageDigest) &&
+		selectionServes(req.Models, placement.Models) &&
 		w.remoteDispatchable(placement, planID)
 }
 

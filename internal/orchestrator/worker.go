@@ -176,21 +176,21 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 		return DesiredPlacement{}, exit.Named(exit.Conflict, "bindings_identity_mismatch",
 			"bindings_digest does not hash the exact selected entrypoints and models")
 	}
-	if placement.SourceDigest != "" {
-		// A DEVELOPMENT placement froze its exact model selection at install, from the
-		// local store (cozy-runtime `_resolve_development_models`): repo, release, lane,
-		// manifest digest and length. Project it, so an editable request carries the same
-		// frozen intent to a rented worker that a local worker reads from the bytes (cl-101);
-		// a published placement's selection is resolved per request and stays empty here.
-		placement.Models = developmentModels(pkg, row)
-	}
+	// Every placement carries the exact model selection its set binds — a development
+	// placement's frozen at install from the local store (cozy-runtime
+	// `_resolve_development_models`, cl-101), a published placement's selected by
+	// install or per-request selection (cl-114). The projection is what the matching
+	// layer holds a request's own selection against: the plan id hashes the entrypoint's
+	// interface, not its weights, so without it two selections of one package are
+	// indistinguishable warm capacity.
+	placement.Models = placementModels(pkg, row)
 	return placement, nil
 }
 
-// developmentModels reads the exact model rows a development PlacementSet froze and names
-// each by the descriptor slot path its entrypoint binds it to — the spelling every
-// download delegation and private placement is addressed by.
-func developmentModels(pkg string, row canonical.Doc) []ModelRef {
+// placementModels reads the exact model rows a PlacementSet binds and names each by the
+// descriptor slot path its entrypoint binds it to — the spelling every download
+// delegation, private placement, and request selection is addressed by.
+func placementModels(pkg string, row canonical.Doc) []ModelRef {
 	byID := map[string]canonical.Doc{}
 	for _, model := range row.List("models") {
 		byID[model.Str("id")] = model
@@ -588,10 +588,12 @@ func (w *worker) remoteDispatchable(placement DesiredPlacement, planID string) b
 		observed.dispatchablePlanIDs[planID]
 }
 
-func (w *worker) remoteStaged(packageName, planID, release, localRevision string) bool {
+func (w *worker) remoteStaged(packageName, planID, release, localRevision string,
+	models []ModelRef) bool {
 	placement, ok := w.remotePlacements[remotePlanKey(packageName, planID)]
 	if !ok || placement.Release != release ||
-		(localRevision != "" && placement.LocalRevisionDigest != localRevision) {
+		(localRevision != "" && placement.LocalRevisionDigest != localRevision) ||
+		!selectionServes(models, placement.Models) {
 		return false
 	}
 	observed, ok := w.observedRemote[placement.PlacementIDValue]
@@ -720,6 +722,23 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 		if e := c.ConvergePlacementSet(instanceID, []DesiredPlacement{spec.Placement}); e != nil {
 			return instanceID, ChangeNone, e
 		}
+		// The launcher's record is what the matching layer reads. A local re-stage keeps
+		// the process but replaces its placement (cl-114: the same plans under a new
+		// model selection), so the spec must say what the worker was just asked to host —
+		// or the next request would be matched against the selection that was vacated.
+		c.mu.Lock()
+		if c.workers[instanceID] == live {
+			live.spec.Placement = spec.Placement
+			live.planIDs = live.planIDs[:0]
+			for _, entrypoint := range spec.Placement.Entrypoints {
+				live.planIDs = append(live.planIDs, entrypoint.Digest)
+			}
+			for _, job := range spec.Placement.Jobs {
+				live.planIDs = append(live.planIDs, job.DescriptorID)
+			}
+			sort.Strings(live.planIDs)
+		}
+		c.mu.Unlock()
 		return instanceID, ChangePlacementAdded, nil
 	}
 	defer func() {
@@ -1019,7 +1038,9 @@ func (c *Orchestrator) DetachRental(id string) bool {
 }
 
 // hostsPlans answers whether a live worker was launched for exactly the selected
-// entrypoint bindings. The exact PlacementSet remains the authority.
+// entrypoint bindings. The exact PlacementSet remains the authority: a local worker
+// holding the same plans under a DIFFERENT set — the same interface bound to a different
+// model selection (cl-114) — does not host this placement, and EnsureWorker re-stages it.
 func hostsPlans(w *worker, p DesiredPlacement) bool {
 	want := map[string]bool{}
 	for _, entrypoint := range p.Entrypoints {
@@ -1035,6 +1056,9 @@ func hostsPlans(w *worker, p DesiredPlacement) bool {
 			}
 		}
 		return len(want) > 0
+	}
+	if w.spec.Placement.PlacementSetDigest != p.PlacementSetDigest {
+		return false
 	}
 	if len(want) != len(w.planIDs) {
 		return false
