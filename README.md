@@ -103,8 +103,10 @@ read `COZY_HOME`. Core Rust Store operations remain explicit-root.
 
 ```bash
 tfs home
-tfs store init
+tfs store ensure                 # open valid, or initialize only absent/empty
 TENSORFS_HOME=/var/lib/tensorfs tfs store info
+tfs store prepare-readers        # TensorFS owns cross-uid lease coordination modes
+tfs store complete-cozytensors   # sorted verified-complete runtime manifests
 ```
 
 Python exposes the same resolver. Passing a root remains supported and always wins:
@@ -113,7 +115,9 @@ Python exposes the same resolver. Passing a root remains supported and always wi
 import tensorfs
 
 root = tensorfs.home()
-store = tensorfs.Store.open()
+store = tensorfs.Store.ensure()
+store.prepare_readers()
+held = store.complete_cozytensors_manifests()
 other = tensorfs.Store.open("/srv/tensorfs")
 ```
 

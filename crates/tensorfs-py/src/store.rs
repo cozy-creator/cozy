@@ -8,7 +8,7 @@
 //! 2. **The GIL is not held while bytes move.** Every read runs inside `Python::detach`, so a
 //!    reader pool of N genuinely reads N-wide from a Python caller.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use pyo3::buffer::PyBuffer;
@@ -482,12 +482,12 @@ pub struct PyStore {
     pub meta: Arc<Meta>,
 }
 
-fn open_store(py: Python<'_>, root: PathBuf, init: bool) -> PyResult<PyStore> {
-    let s = if init {
-        CoreStore::init(&root).or_refuse(py)?
-    } else {
-        CoreStore::open(&root).or_refuse(py)?
-    };
+fn open_store(
+    py: Python<'_>,
+    root: PathBuf,
+    open: fn(&Path) -> tensorfs_core::err::Result<CoreStore>,
+) -> PyResult<PyStore> {
+    let s = open(&root).or_refuse(py)?;
     let m = Meta::open(&s).or_refuse(py)?;
     Ok(PyStore {
         store: Arc::new(s),
@@ -499,21 +499,36 @@ fn open_store(py: Python<'_>, root: PathBuf, init: bool) -> PyResult<PyStore> {
 impl PyStore {
     #[staticmethod]
     #[pyo3(signature = (root = None))]
+    fn ensure(py: Python<'_>, root: Option<PathBuf>) -> PyResult<PyStore> {
+        let root = tensorfs_core::home::resolve(root.as_deref()).or_refuse(py)?;
+        open_store(py, root, CoreStore::ensure)
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (root = None))]
     fn open(py: Python<'_>, root: Option<PathBuf>) -> PyResult<PyStore> {
         let root = tensorfs_core::home::resolve(root.as_deref()).or_refuse(py)?;
-        open_store(py, root, false)
+        open_store(py, root, CoreStore::open)
     }
 
     #[staticmethod]
     #[pyo3(signature = (root = None))]
     fn init(py: Python<'_>, root: Option<PathBuf>) -> PyResult<PyStore> {
         let root = tensorfs_core::home::resolve(root.as_deref()).or_refuse(py)?;
-        open_store(py, root, true)
+        open_store(py, root, CoreStore::init)
     }
 
     #[getter]
     fn root(&self) -> String {
         self.store.root().display().to_string()
+    }
+
+    fn prepare_readers(&self, py: Python<'_>) -> PyResult<()> {
+        self.store.prepare_readers().or_refuse(py)
+    }
+
+    fn complete_cozytensors_manifests(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        self.store.complete_cozytensors_manifests().or_refuse(py)
     }
 
     fn contains(&self, hex: &str) -> bool {
