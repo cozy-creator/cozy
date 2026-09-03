@@ -565,7 +565,16 @@ func (w *worker) dispatchableFor(planID string) bool {
 		}
 		return false
 	}
-	return w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE && w.dispatchable[planID]
+	// THE ISSUED REVISION GATES DISPATCH (cl-114 follow-up). Between this owner issuing a
+	// new desired set and the worker converging to it, every observed fact — serving
+	// DISPATCHABLE, the plan advertised — describes the placement being REPLACED. Run 168
+	// proved the window live: the fp8 re-stage was accepted, the runtime kept the bf16
+	// placement serving through the handoff, and an offer dispatched on the pre-converge
+	// observation executed on the vacating selection. The remote ready path already
+	// requires accepted and converged to reach the issued revision; the local one now
+	// does too, so an offer is only made against the placement the owner last asked for.
+	return w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision &&
+		w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE && w.dispatchable[planID]
 }
 
 func remotePlanKey(packageName, planID string) string { return packageName + "\x00" + planID }
