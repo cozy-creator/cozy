@@ -103,8 +103,10 @@ read `COZY_HOME`. Core Rust Store operations remain explicit-root.
 
 ```bash
 tfs home
-tfs store init
+tfs store ensure                 # open valid, or initialize only absent/empty
 TENSORFS_HOME=/var/lib/tensorfs tfs store info
+tfs store prepare-readers        # TensorFS owns cross-uid lease coordination modes
+tfs store complete-cozytensors   # sorted verified-complete runtime manifests
 ```
 
 Python exposes the same resolver. Passing a root remains supported and always wins:
@@ -113,9 +115,16 @@ Python exposes the same resolver. Passing a root remains supported and always wi
 import tensorfs
 
 root = tensorfs.home()
-store = tensorfs.Store.open()
+store = tensorfs.Store.ensure()
+store.prepare_readers()
+held = store.complete_cozytensors_manifests()
 other = tensorfs.Store.open("/srv/tensorfs")
 ```
+
+`Store.init`/`tfs store init` accept only an absent or exactly empty real directory. Use
+`Store.ensure` for normal startup: it initializes that same narrow case, but requires a nonempty
+root to be a real current Store with a valid `tensorfs.sqlite`. Neither operation follows a root
+or namespace symlink, merges foreign files into a Store, or recognizes an older layout.
 
 Move a stopped Store into the new home once, on the same filesystem:
 

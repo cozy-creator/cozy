@@ -64,8 +64,11 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-default-home-") as default_roo
     assert tensorfs.home(pathlib.Path(default_root) / "explicit") == str(
         pathlib.Path(default_root) / "explicit"
     )
-    default_store = tensorfs.Store.init()
+    default_store = tensorfs.Store.ensure()
     assert default_store.root == default_root
+    default_store.prepare_readers()
+    assert default_store.complete_cozytensors_manifests() == []
+    assert tensorfs.Store.ensure().root == default_root
     assert not pathlib.Path(os.environ["COZY_HOME"]).exists()
     del os.environ["TENSORFS_HOME"]
     del os.environ["COZY_HOME"]

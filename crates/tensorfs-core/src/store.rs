@@ -244,7 +244,79 @@ pub struct Scrub {
 }
 
 impl Store {
+    /// Open a valid Store, or initialize an absent/empty real directory.
+    ///
+    /// A symlink, non-directory, partial Store, or directory containing foreign state refuses.
+    /// There is no old-layout lookup or fallback root.
+    pub fn ensure(root: &Path) -> Result<Store> {
+        match fs::symlink_metadata(root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Store::init(root),
+            Err(error) => return Err(io(format!("stat Store root {}", root.display()), error)),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return refuse(
+                    Code::STORE_ERA,
+                    format!("{} is not a real Store directory", root.display()),
+                )
+            }
+            Ok(_) => {}
+        }
+        let empty = fs::read_dir(root)
+            .map_err(|error| io(format!("read Store root {}", root.display()), error))?
+            .next()
+            .transpose()
+            .map_err(|error| io(format!("read Store root {}", root.display()), error))?
+            .is_none();
+        if empty {
+            Store::init(root)
+        } else {
+            validate_store_root(root)?;
+            let catalog_path = root.join("tensorfs.sqlite");
+            match fs::symlink_metadata(&catalog_path) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    return refuse(
+                        Code::DURABILITY_UNPROVEN,
+                        format!("{} is not a real catalog file", catalog_path.display()),
+                    )
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io("stat TensorFS catalog", error)),
+            }
+            crate::catalog::Catalog::open(root)?;
+            open_validated(root)
+        }
+    }
+
     pub fn init(root: &Path) -> Result<Store> {
+        match fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return refuse(
+                    Code::STORE_ERA,
+                    format!("{} is not a real Store directory", root.display()),
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(root)
+                    .map_err(|error| io(format!("create Store root {}", root.display()), error))?;
+            }
+            Err(error) => return Err(io(format!("stat Store root {}", root.display()), error)),
+        }
+        if fs::read_dir(root)
+            .map_err(|error| io(format!("read Store root {}", root.display()), error))?
+            .next()
+            .transpose()
+            .map_err(|error| io(format!("read Store root {}", root.display()), error))?
+            .is_some()
+        {
+            return refuse(
+                Code::STORE_ERA,
+                format!(
+                    "{} is not empty; use Store::ensure or Store::open for an existing Store",
+                    root.display()
+                ),
+            );
+        }
         for d in ["repos", "manifests", "blobs", "checkouts", "tmp"] {
             fs::create_dir_all(root.join(d)).map_err(|e| io(format!("mkdir {d}"), e))?;
         }
@@ -275,27 +347,111 @@ impl Store {
     /// The three authoritative namespaces identify a TensorFS store. Old mixed-object and
     /// state.json layouts are a prelaunch hardcut and never dual-read.
     pub fn open(root: &Path) -> Result<Store> {
-        if !["repos", "manifests", "blobs"]
-            .iter()
-            .all(|name| root.join(name).is_dir())
-        {
-            return refuse(
-                Code::STORE_ERA,
-                format!(
-                    "{} lacks the repos/manifests/blobs layout; old stores require an offline migration",
-                    root.display()
-                ),
-            );
-        }
-        fs::create_dir_all(root.join("tmp")).map_err(|error| io("mkdir tmp", error))?;
-        Ok(Store {
-            root: root.to_path_buf(),
-            progress: None,
-        })
+        validate_store_root(root)?;
+        open_validated(root)
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Prepare the Store for read leases created by a separate unprivileged uid.
+    ///
+    /// TensorFS owns these internal paths and exact modes. Callers request the policy; they do
+    /// not create or chmod Store internals themselves.
+    pub fn prepare_readers(&self) -> Result<()> {
+        for (path, mode) in [
+            (self.root.clone(), 0o755),
+            (self.root.join("repos"), 0o755),
+            (self.root.join("manifests"), 0o755),
+            (self.root.join("blobs"), 0o755),
+            (self.root.join("checkouts"), 0o755),
+            (self.root.join("tmp"), 0o755),
+            (self.root.join("tmp/leases"), 0o1733),
+            (self.root.join("tmp/writers"), 0o755),
+        ] {
+            prepare_reader_dir(&path, mode)?;
+        }
+        let lock_path = self.root.join("tmp/writers/recovery.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o666)
+            .custom_flags(O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|error| io(format!("open {}", lock_path.display()), error))?;
+        if !lock
+            .metadata()
+            .map_err(|error| io("stat recovery lock", error))?
+            .is_file()
+        {
+            return refuse(
+                Code::NOT_REGULAR_FILE,
+                format!("{} is not a regular file", lock_path.display()),
+            );
+        }
+        lock.set_permissions(fs::Permissions::from_mode(0o666))
+            .map_err(|error| io("chmod recovery lock", error))?;
+        lock.sync_all()
+            .map_err(|error| io("sync recovery lock", error))?;
+        fsync_dir(&self.root.join("tmp/writers"))
+    }
+
+    /// Sorted Manifest ids whose CozyTensors runtime closures are verifiably resident.
+    ///
+    /// Ordinary snapshots, incomplete models, malformed Manifests, and corrupt/missing reached
+    /// objects are conservatively absent from the answer.
+    pub fn complete_cozytensors_manifests(&self) -> Result<Vec<String>> {
+        let mut manifests = Vec::new();
+        for first in read_dir(&self.root.join("manifests"))? {
+            if !is_real_dir(&first)? {
+                continue;
+            }
+            for second in read_dir(&first)? {
+                if !is_real_dir(&second)? {
+                    continue;
+                }
+                for path in read_dir(&second)? {
+                    let metadata = match fs::symlink_metadata(&path) {
+                        Ok(metadata) if metadata.is_file() => metadata,
+                        Ok(_) => continue,
+                        Err(error) => return Err(io("stat Manifest candidate", error)),
+                    };
+                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    let Some(digest) = name.strip_suffix(".json") else {
+                        continue;
+                    };
+                    if hex64("Manifest candidate", digest).is_err()
+                        || self.manifest_path(digest) != path
+                    {
+                        continue;
+                    }
+                    let reference = ObjectRef {
+                        sha256: digest.to_string(),
+                        length: metadata.len(),
+                    };
+                    let Ok(manifest) = self.read_manifest(&reference) else {
+                        continue;
+                    };
+                    let Ok(walk) = crate::checkpoint::walk_cozytensors(self, &manifest) else {
+                        continue;
+                    };
+                    let complete = walk.distinct().into_iter().all(|object| {
+                        self.open_verified(&object.sha256)
+                            .is_ok_and(|file| file.len() == object.length)
+                    });
+                    if complete {
+                        manifests.push(reference.id());
+                    }
+                }
+            }
+        }
+        manifests.sort();
+        Ok(manifests)
     }
 
     /// A malformed id has NO path in this store. `hex[0..2]` panics on a short string, and a
@@ -1112,6 +1268,91 @@ impl Store {
         }
         Ok((gone, kept))
     }
+}
+
+fn validate_store_root(root: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| io(format!("stat Store root {}", root.display()), error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return refuse(
+            Code::STORE_ERA,
+            format!("{} is not a real Store directory", root.display()),
+        );
+    }
+    for name in ["repos", "manifests", "blobs"] {
+        let path = root.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return refuse(
+                    Code::STORE_ERA,
+                    format!(
+                        "{} lacks a real {name}/ namespace; old or partial stores require an offline migration",
+                        root.display()
+                    ),
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return refuse(
+                    Code::STORE_ERA,
+                    format!(
+                        "{} lacks a real {name}/ namespace; old or partial stores require an offline migration",
+                        root.display()
+                    ),
+                )
+            }
+            Err(error) => {
+                return Err(io(
+                    format!("stat Store namespace {}", path.display()),
+                    error,
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_validated(root: &Path) -> Result<Store> {
+    fs::create_dir_all(root.join("tmp")).map_err(|error| io("mkdir tmp", error))?;
+    Ok(Store {
+        root: root.to_path_buf(),
+        progress: None,
+    })
+}
+
+fn prepare_reader_dir(path: &Path, mode: u32) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(io(format!("mkdir {}", path.display()), error)),
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| io(format!("open directory {}", path.display()), error))?;
+    if !directory
+        .metadata()
+        .map_err(|error| io(format!("stat directory {}", path.display()), error))?
+        .is_dir()
+    {
+        return refuse(
+            Code::STORE_ERA,
+            format!("{} is not a real Store directory", path.display()),
+        );
+    }
+    directory
+        .set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(|error| io(format!("chmod directory {}", path.display()), error))?;
+    directory
+        .sync_all()
+        .map_err(|error| io(format!("sync directory {}", path.display()), error))
+}
+
+fn is_real_dir(path: &Path) -> Result<bool> {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .map_err(|error| io(format!("stat directory {}", path.display()), error))
 }
 
 // ---------------------------------------------------------------- helpers

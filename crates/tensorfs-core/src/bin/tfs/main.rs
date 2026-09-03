@@ -10,6 +10,9 @@
 //! --size <bytes> --small <n>, plus the dev-only kill points --fault <stage> --ready <path>.
 //!
 //!   tfs store init|info <root>
+//!   tfs store ensure [<root>]
+//!   tfs store prepare-readers [<root>]
+//!   tfs store complete-cozytensors [<root>]
 //!   tfs home                     print TENSORFS_HOME or ~/.tensorfs
 //!   tfs home migrate <old-root> [--to <new-root>]
 //!   tfs store rebuild <census> --rows <jsonl> [--sqlite <tensorfs.sqlite>]
@@ -134,8 +137,14 @@ fn main() -> ExitCode {
         ["home", r] => cmd_home(Some(Path::new(r))),
         ["store", "init"] => cmd_store_default("init"),
         ["store", "info"] => cmd_store_default("info"),
+        ["store", "ensure"] => cmd_store_default("ensure"),
+        ["store", "prepare-readers"] => cmd_store_prepare_readers(None),
+        ["store", "complete-cozytensors"] => cmd_store_complete_cozytensors(None),
         ["store", "init", r] => cmd_store(Path::new(r), "init"),
         ["store", "info", r] => cmd_store(Path::new(r), "info"),
+        ["store", "ensure", r] => cmd_store(Path::new(r), "ensure"),
+        ["store", "prepare-readers", r] => cmd_store_prepare_readers(Some(Path::new(r))),
+        ["store", "complete-cozytensors", r] => cmd_store_complete_cozytensors(Some(Path::new(r))),
         ["store", "rebuild", r] => repo::cmd_rebuild(Path::new(r), &flags),
         ["store", "admit-file", store, kind, object, length, source] => {
             cmd_store_admit_file(Path::new(store), kind, object, length, Path::new(source))
@@ -511,10 +520,29 @@ fn cmd_store_default(verb: &str) -> ExitCode {
 fn cmd_store(root: &Path, verb: &str) -> ExitCode {
     let s = match verb {
         "init" => ok!(Store::init(root)),
+        "ensure" => ok!(Store::ensure(root)),
         _ => ok!(Store::open(root)),
     };
     println!("root:       {}", s.root().display());
     println!("blobs:      {}", ok!(s.objects()).len());
+    ExitCode::SUCCESS
+}
+
+fn cmd_store_prepare_readers(explicit: Option<&Path>) -> ExitCode {
+    let root = ok!(tensorfs_core::home::resolve(explicit));
+    let store = ok!(Store::open(&root));
+    ok!(store.prepare_readers());
+    println!("root:       {}", store.root().display());
+    println!("readers:    prepared");
+    ExitCode::SUCCESS
+}
+
+fn cmd_store_complete_cozytensors(explicit: Option<&Path>) -> ExitCode {
+    let root = ok!(tensorfs_core::home::resolve(explicit));
+    let store = ok!(Store::open(&root));
+    for manifest in ok!(store.complete_cozytensors_manifests()) {
+        println!("{manifest}");
+    }
     ExitCode::SUCCESS
 }
 
