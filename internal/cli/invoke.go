@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -585,8 +586,10 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		return output.List{}, problem
 	}
 	list := output.List{
-		Name: "invocations", Fields: []string{"number", "target", "machine", "status", "completion", "execution"},
-		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status", "completion", "progress_stage", "queued", "execution", "attempts", "created"},
+		Name: "invocations", Fields: []string{"number", "target", "machine", "status", "progress", "execution"},
+		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status",
+			"progress", "progress_stage", "stage_fraction", "overall_fraction",
+			"position", "total", "queued", "execution", "attempts", "created"},
 		// The raw rental id is a machine fact: JSON always carries it, the compact
 		// human table never does — the human word is the MACHINE column (cl-107).
 		Machine: []string{"rental_id"},
@@ -606,12 +609,15 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		list.Rows = append(list.Rows, map[string]string{
 			"number": strconv.FormatInt(life.Number, 10), "id": life.RequestID, "kind": kind,
 			"target": life.Package + "/" + life.Function, "machine": life.Machine,
-			"rental_id":  life.RentalID,
-			"status":     status,
-			"completion": completion(life), "progress_stage": life.ProgressStage,
-			"queued":    seconds(life.QueuedMS),
-			"execution": seconds(life.ExecutionMS),
-			"attempts":  strconv.Itoa(life.Attempts), "created": life.CreatedAt,
+			"rental_id": life.RentalID,
+			"status":    status, "progress": progressValue(life), "progress_stage": life.ProgressStage,
+			"stage_fraction":   fractionValue(life.StageFraction),
+			"overall_fraction": fractionValue(life.OverallFraction),
+			"position":         integerValue(life.Position),
+			"total":            integerValue(life.Total),
+			"queued":           seconds(life.QueuedMS),
+			"execution":        seconds(life.ExecutionMS),
+			"attempts":         strconv.Itoa(life.Attempts), "created": life.CreatedAt,
 		})
 		states[life.Status]++
 	}
@@ -626,15 +632,46 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 	return list, nil
 }
 
-func completion(life api.Lifecycle) string {
-	if life.Status != "in_progress" || life.Completion == nil {
+func fractionValue(value *float64) string {
+	if value == nil {
 		return ""
 	}
-	value := fmt.Sprintf("%.0f%%", *life.Completion*100)
-	if life.RemainingMS != nil {
-		value += " · ~" + shortDuration(time.Duration(*life.RemainingMS)*time.Millisecond)
+	return strconv.FormatFloat(*value, 'f', -1, 64)
+}
+
+func integerValue(value *int64) string {
+	if value == nil {
+		return ""
 	}
-	return value
+	return strconv.FormatInt(*value, 10)
+}
+
+func progressValue(life api.Lifecycle) string {
+	if life.Status != "in_progress" {
+		return "-"
+	}
+	parts := []string{}
+	if life.OverallFraction != nil {
+		overall := fmt.Sprintf("%.0f%% overall", *life.OverallFraction*100)
+		if life.RemainingMS != nil {
+			overall += " (~" + shortDuration(time.Duration(*life.RemainingMS)*time.Millisecond) + ")"
+		}
+		parts = append(parts, overall)
+	}
+	if life.ProgressStage != "" {
+		stage := life.ProgressStage
+		switch {
+		case life.StageFraction != nil:
+			stage += fmt.Sprintf(" %.0f%% stage", *life.StageFraction*100)
+		case life.Position != nil && life.Total != nil:
+			stage += fmt.Sprintf(" %d/%d", *life.Position, *life.Total)
+		}
+		parts = append(parts, stage)
+	}
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, " · ")
 }
 
 func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error {
@@ -1205,19 +1242,24 @@ func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
 // with HumanWaitLine and WaitPatience — so the product suite (#661: verification's one
 // home) drives this exact render path.
 type RunProgress struct {
-	ctx         *Context
-	stream      bool
-	mu          sync.Mutex
-	last        string
-	dirty       bool
-	closed      bool
-	began       time.Time
-	waitedSince time.Time
-	waitEvent   localapi.Event
-	patience    *time.Timer
-	stepStage   string
-	stepSeconds float64
-	stepSamples int
+	ctx             *Context
+	stream          bool
+	mu              sync.Mutex
+	last            string
+	dirty           bool
+	closed          bool
+	began           time.Time
+	waitedSince     time.Time
+	waitEvent       localapi.Event
+	patience        *time.Timer
+	stepStage       string
+	stepSeconds     float64
+	stepSamples     int
+	progressAttempt uint64
+	overallSeen     bool
+	overallFraction float64
+	overallDelta    float64
+	overallSeconds  float64
 
 	// The sparse lane's memory: which tenth of which stage was last appended, and when.
 	sparseStage  string
@@ -1249,6 +1291,11 @@ func (p *RunProgress) On(e localapi.Event) bool {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if strings.TrimPrefix(e.Type, "request.") == "progress" && p.progressAttempt != e.Attempt {
+		p.progressAttempt = e.Attempt
+		p.stepStage, p.stepSeconds, p.stepSamples = "", 0, 0
+		p.overallSeen, p.overallFraction, p.overallDelta, p.overallSeconds = false, 0, 0, 0
+	}
 	p.observeWait(e)
 	// A redirected human command has no status line to rewrite: it gets the sparse
 	// append lane. --full deliberately restores the complete diagnostic stream.
@@ -1350,7 +1397,11 @@ func (p *RunProgress) sparse(e localapi.Event) {
 		p.appendOnce(humanStage(map[string]any{"name": stageLabel(facts.label)}))
 		return
 	}
-	decile := int(facts.fraction * 10)
+	fraction := facts.stageFraction
+	if facts.hasOverall {
+		fraction = facts.overallFraction
+	}
+	decile := int(fraction * 10)
 	stale := !p.sparseAt.IsZero() && p.now().Sub(p.sparseAt) >= 5*time.Second
 	if facts.label == p.sparseStage && decile == p.sparseDecile && !stale {
 		return
@@ -1360,7 +1411,13 @@ func (p *RunProgress) sparse(e localapi.Event) {
 	if facts.counted {
 		line += fmt.Sprintf(" %d/%d", facts.current, facts.total)
 	}
-	line += fmt.Sprintf(" · %.0f%% · elapsed %s", facts.fraction*100, shortDuration(p.now().Sub(p.began)))
+	if facts.hasStageFraction {
+		line += fmt.Sprintf(" · %.0f%% stage", facts.stageFraction*100)
+	}
+	if facts.hasOverall {
+		line += fmt.Sprintf(" · %.0f%% overall", facts.overallFraction*100)
+	}
+	line += " · elapsed " + shortDuration(p.now().Sub(p.began))
 	fmt.Fprintln(p.ctx.Err, line)
 }
 
@@ -1375,21 +1432,28 @@ func (p *RunProgress) appendOnce(line string) {
 // stepFacts is one progress frame read through the accumulator: a display label, the
 // fraction, and — when the frame counts steps — current/total plus mean seconds per step.
 type stepFacts struct {
-	label    string
-	fraction float64
-	counted  bool
-	current  int64
-	total    int64
-	perStep  float64
+	label            string
+	stageFraction    float64
+	hasStageFraction bool
+	overallFraction  float64
+	hasOverall       bool
+	counted          bool
+	current          int64
+	total            int64
+	perStep          float64
+	overallRemaining time.Duration
+	hasOverallETA    bool
 }
 
 // observe folds one progress payload into the per-stage step-time accumulator and
 // returns the frame's facts; ok is false when the frame carries no usable fraction.
 func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
-	name, _ := fields["name"].(string)
+	name, _ := fields["stage"].(string)
 	name = strings.TrimSpace(name)
-	fraction, fractionOK := number(fields["fraction"])
+	stageFraction, stageFractionOK := number(fields["stage_fraction"])
+	overallFraction, overallOK := number(fields["overall_fraction"])
 	position, positionOK := number(fields["position"])
+	total, totalOK := number(fields["total"])
 	stepMS, stepOK := number(fields["step_ms"])
 	if name != "" && name != p.stepStage {
 		p.stepStage, p.stepSeconds, p.stepSamples = name, 0, 0
@@ -1402,23 +1466,44 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 	if label == "" {
 		label = "running"
 	}
-	facts := stepFacts{label: label, fraction: fraction}
-	if !fractionOK || fraction < 0 || fraction > 1 {
-		facts.label = name
+	facts := stepFacts{label: label}
+	if positionOK != totalOK || positionOK &&
+		(position < 0 || total <= 0 || position > total || math.Trunc(position) != position || math.Trunc(total) != total) {
 		return facts, false
 	}
-	if positionOK && position > 0 && fraction > 0 {
+	if positionOK {
 		facts.counted = true
 		facts.current = int64(position)
-		facts.total = int64(position/fraction + 0.5)
-		if facts.total < facts.current {
-			facts.total = facts.current
+		facts.total = int64(total)
+		if !stageFractionOK {
+			stageFraction, stageFractionOK = position/total, true
+		}
+	}
+	if stageFractionOK && stageFraction >= 0 && stageFraction <= 1 {
+		facts.stageFraction, facts.hasStageFraction = stageFraction, true
+	}
+	if overallOK && overallFraction >= 0 && overallFraction <= 1 {
+		if p.overallSeen && overallFraction < p.overallFraction {
+			return facts, false
+		}
+		if p.overallSeen && overallFraction > p.overallFraction && stepOK && stepMS > 0 {
+			p.overallDelta += overallFraction - p.overallFraction
+			p.overallSeconds += stepMS / 1000
+		}
+		p.overallSeen, p.overallFraction = true, overallFraction
+	}
+	if p.overallSeen {
+		facts.overallFraction, facts.hasOverall = p.overallFraction, true
+		if p.overallDelta > 0 && p.overallSeconds > 0 {
+			facts.overallRemaining = time.Duration(
+				(1 - p.overallFraction) * p.overallSeconds / p.overallDelta * float64(time.Second))
+			facts.hasOverallETA = true
 		}
 	}
 	if p.stepSamples > 0 {
 		facts.perStep = p.stepSeconds / float64(p.stepSamples)
 	}
-	return facts, true
+	return facts, facts.hasStageFraction || facts.hasOverall
 }
 
 func (p *RunProgress) line(e localapi.Event, full bool) string {
@@ -1441,17 +1526,27 @@ func (p *RunProgress) line(e localapi.Event, full bool) string {
 		return humanStage(map[string]any{"name": stageLabel(facts.label)})
 	}
 	elapsed := p.now().Sub(p.began)
-	bar := progressBar(facts.fraction, 18)
-	if !facts.counted {
-		return fmt.Sprintf("  %s %s %.0f%% · %s", facts.label, bar, facts.fraction*100, shortDuration(elapsed))
+	fraction := facts.stageFraction
+	label := facts.label + " stage"
+	if facts.hasOverall {
+		fraction, label = facts.overallFraction, "overall"
 	}
-	line := fmt.Sprintf("  %s %s %d/%d · %.0f%%", facts.label, bar, facts.current, facts.total, facts.fraction*100)
+	bar := progressBar(fraction, 18)
+	line := fmt.Sprintf("  %s %s %.0f%%", label, bar, fraction*100)
+	if facts.counted {
+		line += fmt.Sprintf(" · %s %d/%d", facts.label, facts.current, facts.total)
+	}
+	if facts.hasOverall && facts.hasStageFraction {
+		line += fmt.Sprintf(" · %.0f%% stage", facts.stageFraction*100)
+	}
 	if facts.perStep > 0 {
 		line += fmt.Sprintf(" · %.2fs/step · %.2f steps/s", facts.perStep, 1/facts.perStep)
-		remaining := time.Duration(float64(facts.total-facts.current) * facts.perStep * float64(time.Second))
-		return line + fmt.Sprintf(" · elapsed %s · ETA ~%s", shortDuration(elapsed), shortDuration(remaining))
 	}
-	return line + " · elapsed " + shortDuration(elapsed)
+	line += " · elapsed " + shortDuration(elapsed)
+	if facts.hasOverallETA {
+		line += " · ETA ~" + shortDuration(facts.overallRemaining)
+	}
+	return line
 }
 
 // clampLine bounds one rewritten status line to the terminal: a wrapped line leaves
@@ -1511,8 +1606,8 @@ func (p *RunProgress) Done() {
 }
 
 // progressLine is the human projection of one event. Runtime's exact typed envelope stays
-// available through --stream and --full; the ordinary status line shows only a named stage
-// or completion percentage. Timing samples and metrics are diagnostics, not user progress.
+// available through --stream and --full; the ordinary status line shows only Runtime's named
+// stage and explicit progress coordinates. Timing samples and metrics are diagnostics.
 func progressLine(e localapi.Event, full bool) string {
 	if full {
 		return diagnosticProgressLine(e)
@@ -1548,24 +1643,35 @@ func progressLine(e localapi.Event, full bool) string {
 }
 
 func humanProgress(value any) string {
-	name := "running"
-	fraction, ok := number(value)
-	if fields, isMap := value.(map[string]any); isMap {
-		if named, exists := fields["name"].(string); exists && strings.TrimSpace(named) != "" {
-			name = strings.TrimSpace(named)
-		} else if named, exists := fields["stage"].(string); exists && strings.TrimSpace(named) != "" {
-			name = strings.TrimSpace(named)
-		}
-		for _, key := range []string{"fraction", "value"} {
-			if fraction, ok = number(fields[key]); ok {
-				break
-			}
-		}
-	}
-	if !ok || fraction < 0 || fraction > 1 {
+	fields, ok := value.(map[string]any)
+	if !ok {
 		return ""
 	}
-	return fmt.Sprintf("  %s — %.0f%%", name, fraction*100)
+	stage, _ := fields["stage"].(string)
+	stage = strings.TrimSpace(stage)
+	stageFraction, hasStage := number(fields["stage_fraction"])
+	if !hasStage {
+		position, hasPosition := number(fields["position"])
+		total, hasTotal := number(fields["total"])
+		if hasPosition && hasTotal && position >= 0 && total > 0 && position <= total {
+			stageFraction, hasStage = position/total, true
+		}
+	}
+	overall, hasOverall := number(fields["overall_fraction"])
+	if hasOverall && overall >= 0 && overall <= 1 {
+		line := fmt.Sprintf("  overall — %.0f%%", overall*100)
+		if stage != "" && hasStage && stageFraction >= 0 && stageFraction <= 1 {
+			line += fmt.Sprintf(" · %s %.0f%% stage", stage, stageFraction*100)
+		}
+		return line
+	}
+	if stage != "" && hasStage && stageFraction >= 0 && stageFraction <= 1 {
+		return fmt.Sprintf("  %s — %.0f%% stage", stage, stageFraction*100)
+	}
+	if stage != "" {
+		return "  " + stage
+	}
+	return ""
 }
 
 // WaitPatience is how long a wait stays a calm one-liner (cl-103). Past it, the

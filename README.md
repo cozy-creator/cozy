@@ -214,8 +214,9 @@ cozy run cancel <run-id>
 Every run is durable. Cozy observes its first three seconds so a warm, weightless function can still
 return its result directly; otherwise it prints the run id, live status, and authoritative queue
 position, then returns while the daemon continues. `--await` stays attached through the terminal and
-shows named pipeline stages, measured step speed, elapsed time, and an estimate while step telemetry
-is available. `--stream` is the corresponding typed event stream and requires `--await`.
+shows named pipeline stages, measured step speed, elapsed time, and a whole-run estimate only when
+the package reports `overall_fraction`; stage-local fractions are labeled as stage progress.
+`--stream` is the corresponding typed event stream and requires `--await`.
 `cozy run watch <run-id>` attaches to that same progress stream later; interrupting a watcher
 detaches without canceling the durable run.
 

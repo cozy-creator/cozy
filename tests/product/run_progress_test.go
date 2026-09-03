@@ -88,7 +88,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 	if strings.ContainsAny(stderr, "\r\033") {
 		t.Fatalf("piped progress carries terminal control bytes\n%q", stderr)
 	}
-	stepLine := regexp.MustCompile(`^  tile_steps (\d+)/100 · (\d+)% · elapsed [0-9ms.]+$`)
+	stepLine := regexp.MustCompile(`^  tile_steps (\d+)/100 · (\d+)% stage · (\d+)% overall · elapsed [0-9ms.]+$`)
 	previous, matched := -1, 0
 	for _, line := range strings.Split(stderr, "\n") {
 		if !strings.Contains(line, "tile_steps") {
@@ -124,7 +124,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 	}
 	// The 80-column pty clamps the tail (that IS the resize safety); the bar, steps
 	// and percentage must always survive the clamp.
-	barred := regexp.MustCompile(`tile_steps \[[=.]{18}\] \d+/100 · \d+%`)
+	barred := regexp.MustCompile(`overall \[[=.]{18}\] \d+% · tile_steps \d+/100 · \d+% stage`)
 	seen := 0
 	for _, chunk := range rewrites[1:] {
 		line := chunk
@@ -155,41 +155,46 @@ func TestRunProgressSurfaces(t *testing.T) {
 		t.Fatalf("--json stderr shows renderer output\n%q", stderr)
 	}
 
-	// The list reuses the same lossy Runtime progress lane. It reports actual completion
-	// only while the attempt is live; terminal rows go back to an empty machine value (a
-	// dash in the human table), because 100% beside "completed" would add no information.
+	// The list reuses the same lossy Runtime progress lane. Whole-job percentage and ETA
+	// come only from overall_fraction; the current stage remains explicitly stage-local.
+	// Terminal rows return to a dash because progress beside "completed" adds no information.
 	code, _ = runCozy(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=6", "delay_ms=6000")
 	if code != 0 {
 		t.Fatalf("detached progress run failed [exit %d]", code)
 	}
-	type completionRow struct {
-		Number     string `json:"number"`
-		Status     string `json:"status"`
-		Completion string `json:"completion"`
+	type progressRow struct {
+		Number          string `json:"number"`
+		Status          string `json:"status"`
+		Progress        string `json:"progress"`
+		ProgressStage   string `json:"progress_stage"`
+		StageFraction   string `json:"stage_fraction"`
+		OverallFraction string `json:"overall_fraction"`
 	}
-	list := func() completionRow {
+	list := func() progressRow {
 		t.Helper()
 		code, out := runCozy(t, root, "--json", "--full", "run", "list", "--limit", "1")
 		var document struct {
-			Invocations []completionRow `json:"invocations"`
+			Invocations []progressRow `json:"invocations"`
 		}
 		if code != 0 || json.Unmarshal([]byte(out), &document) != nil || len(document.Invocations) != 1 {
-			t.Fatalf("could not read the live completion row [exit %d]\n%s", code, out)
+			t.Fatalf("could not read the live progress row [exit %d]\n%s", code, out)
 		}
 		return document.Invocations[0]
 	}
 	live := list()
-	percent := regexp.MustCompile(`^[1-9][0-9]?% · ~[0-9.]+[a-z]+$`)
-	if live.Status != "in_progress" || !percent.MatchString(live.Completion) {
-		t.Fatalf("live run has no measured completion: %+v", live)
+	progress := regexp.MustCompile(`^[1-9][0-9]?% overall \(~[0-9.]+[a-z]+\) · .+ [1-9][0-9]?%$`)
+	if live.Status != "in_progress" || !progress.MatchString(live.Progress) ||
+		live.ProgressStage == "" || live.StageFraction == "" || live.OverallFraction == "" {
+		t.Fatalf("live run does not distinguish overall and stage progress: %+v", live)
 	}
 	if code, out := runCozy(t, root, "run", "watch", live.Number, "--json"); code != 0 ||
 		!strings.Contains(out, `"status":"completed"`) {
-		t.Fatalf("completion proof run did not settle [exit %d]\n%s", code, out)
+		t.Fatalf("progress proof run did not settle [exit %d]\n%s", code, out)
 	}
-	if terminal := list(); terminal.Status != "completed" || terminal.Completion != "" {
-		t.Fatalf("terminal run retained a redundant completion value: %+v", terminal)
+	if terminal := list(); terminal.Status != "completed" || terminal.Progress != "-" ||
+		terminal.StageFraction != "" || terminal.OverallFraction != "" {
+		t.Fatalf("terminal run retained redundant progress: %+v", terminal)
 	}
 
 	// The live inventory is a real terminal viewport: a wheel event moves the bounded page,
