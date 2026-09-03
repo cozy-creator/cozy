@@ -215,16 +215,36 @@ func (c *Orchestrator) settleHostPrepare(s *session, w *worker, seq uint64, labe
 	return false
 }
 
-// classifyPrepareEnd sorts a prepare stream's end into refusal-class codes (the host's
-// typed verdict on this desire, with the one exception hostPrepareRefused names) and
-// everything else (no verdict; the reconnect re-issues).
+// classifyPrepareEnd sorts a prepare stream's end into "no verdict, the reconnect re-issues"
+// and the host's typed verdict on this desire.
+//
+// THE POLARITY IS THE POINT. This listed the terminal codes and let everything else fall
+// through to a redial, which means every status nobody thought of became an unbounded retry
+// on a rented pod. codes.NotFound was one of them: the desire names an immutable identity,
+// so a host that cannot find it now cannot find it on the next dial either, and the owner
+// re-issued the same revision forever. That is proto-035's rule — a refusal is resumable
+// only if the refusing party could answer differently to the IDENTICAL request later — and
+// a deny-list cannot enforce it, because the codes that violate it are exactly the ones not
+// yet enumerated. It is also how the Unimplemented loop happened (cozy #298), eleven lines
+// from `RentalPrepareFacts`, which has had the right polarity all along.
+//
+// So: an allow-list of the codes that describe a condition of the MOMENT rather than of the
+// request. Anything else — NotFound, OutOfRange, DataLoss, AlreadyExists, and whatever is
+// added next — is the host's word on this desire, and redialing cannot change it.
 func classifyPrepareEnd(err error) hostPrepareResult {
 	switch status.Code(err) {
-	case codes.FailedPrecondition, codes.InvalidArgument, codes.PermissionDenied,
-		codes.Unauthenticated, codes.Unimplemented:
-		return hostPrepareResult{refusal: status.Convert(err).Message()}
-	default:
+	case codes.OK:
+		// Not reached: this is only called with a non-nil end. Never a refusal.
 		return hostPrepareResult{err: err}
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled,
+		codes.ResourceExhausted, codes.Aborted, codes.Internal, codes.Unknown:
+		// The pod is down, busy, restarting, contended, or the transport broke under a
+		// raw error. Internal and Unknown stay here on purpose: a connection reset mid
+		// stream surfaces as one of them, and calling that a permanent verdict would
+		// strand a paid pod on a network blip.
+		return hostPrepareResult{err: err}
+	default:
+		return hostPrepareResult{refusal: status.Convert(err).Message()}
 	}
 }
 
