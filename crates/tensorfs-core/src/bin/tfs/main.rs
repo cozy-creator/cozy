@@ -10,6 +10,7 @@
 //! --size <bytes> --small <n>, plus the dev-only kill points --fault <stage> --ready <path>.
 //!
 //!   tfs store init|info <root>
+//!   tfs home                     print TENSORFS_HOME or ~/.tensorfs
 //!   tfs store rebuild <census> --rows <jsonl> [--sqlite <tensorfs.sqlite>]
 //!   tfs store admit-file <store> blob|manifest <id> <length> <source>
 //!   tfs repo-cache admit <cache> <store> blob|manifest <id> <length>
@@ -127,6 +128,10 @@ fn main() -> ExitCode {
     let args = accept_printed_ids(args);
     let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match a.as_slice() {
+        ["home"] => cmd_home(None),
+        ["home", r] => cmd_home(Some(Path::new(r))),
+        ["store", "init"] => cmd_store_default("init"),
+        ["store", "info"] => cmd_store_default("info"),
         ["store", "init", r] => cmd_store(Path::new(r), "init"),
         ["store", "info", r] => cmd_store(Path::new(r), "info"),
         ["store", "rebuild", r] => repo::cmd_rebuild(Path::new(r), &flags),
@@ -480,6 +485,15 @@ mod rd;
 mod repo;
 mod snap;
 mod watch;
+
+fn cmd_home(explicit: Option<&Path>) -> ExitCode {
+    println!("{}", ok!(tensorfs_core::home::resolve(explicit)).display());
+    ExitCode::SUCCESS
+}
+
+fn cmd_store_default(verb: &str) -> ExitCode {
+    cmd_store(&ok!(tensorfs_core::home::resolve(None)), verb)
+}
 
 fn cmd_store(root: &Path, verb: &str) -> ExitCode {
     let s = match verb {

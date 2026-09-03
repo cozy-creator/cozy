@@ -95,6 +95,28 @@ Plus one bounded operational DTO, `source-plan.json`, specified below. Naming th
 make them stored formats; refusing to name them only made the count look smaller than the
 system.
 
+## Store root
+
+TensorFS owns its Store location independently of Creator. User-facing entrypoints resolve one
+default in this order: an explicit argument, `TENSORFS_HOME`, then `$HOME/.tensorfs`. They never
+read `COZY_HOME`. Core Rust Store operations remain explicit-root.
+
+```bash
+tfs home
+tfs store init
+TENSORFS_HOME=/var/lib/tensorfs tfs store info
+```
+
+Python exposes the same resolver. Passing a root remains supported and always wins:
+
+```python
+import tensorfs
+
+root = tensorfs.home()
+store = tensorfs.Store.open()
+other = tensorfs.Store.open("/srv/tensorfs")
+```
+
 ## Build and test
 
 The native wheel is `cp312-abi3`, so CPython 3.12 is the floor and every later CPython loads
