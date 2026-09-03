@@ -27,8 +27,7 @@ mkdir -p "$work"
 
 wheels="${wheels:-$work/wheels}"
 if [ -z "$skip_build" ]; then
-    export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
-    nice -n 19 maturin build --release --out "$wheels" >"$work/build.log" 2>&1 || {
+    scripts/build-wheel.sh --out "$wheels" >"$work/build.log" 2>&1 || {
         tail -20 "$work/build.log"; exit 1; }
 fi
 cargo build --quiet --release --bin tfs

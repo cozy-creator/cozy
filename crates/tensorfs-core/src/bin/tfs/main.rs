@@ -1,5 +1,6 @@
 //! tfs — TensorFS store and CozyTensors inspection tool.
 //!
+//!   tfs version                  release version + sha256 of this binary, the skew observable
 //!   tfs registry                 print the seeded platform namespace (alias -> digest)
 //!   tfs id <file>                object id (+ derived ids) of a stored document
 //!   tfs cbor encode|decode|check <file>  header conformance seam; JSON is diagnostic only
@@ -132,6 +133,7 @@ fn main() -> ExitCode {
     let args = accept_printed_ids(args);
     let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match a.as_slice() {
+        ["version"] => cmd_version(),
         ["home"] => cmd_home(None),
         ["home", "migrate", source] => cmd_home_migrate(Path::new(source), &flags),
         ["home", r] => cmd_home(Some(Path::new(r))),
@@ -282,6 +284,25 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// `tfs <version> sha256:<digest of this binary's own bytes>` — one line, machine-parsed by
+/// tensorhub and cozy-creator at startup (tfs-051). Byte-identical builds print the same
+/// digest; two builds stamped with one version cannot hide behind it.
+fn cmd_version() -> ExitCode {
+    let bytes = match std::env::current_exe().and_then(fs::read) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("REFUSED IO_FAILED: read own binary: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    println!(
+        "tfs {} sha256:{}",
+        env!("CARGO_PKG_VERSION"),
+        tensorfs_core::sha256::hex_digest(&bytes)
+    );
+    ExitCode::SUCCESS
 }
 
 fn cache_args(kind: &str, object: &str, length: &str) -> TfsResult<(CacheKind, ObjectRef)> {

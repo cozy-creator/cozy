@@ -68,11 +68,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # The binary rides the wheel (tfs-051). It is built INSIDE the manylinux
+      # container so its glibc floor matches the extension module it ships beside.
       - uses: PyO3/maturin-action@v1
         with:
           target: x86_64
-          args: --release --out dist
+          args: --release --locked --out dist
           manylinux: auto
+          before-script-linux: |
+            cargo build --release --locked -p tensorfs-core --bin tfs
+            install -D -m 755 target/release/tfs wheel-data/scripts/tfs
       - run: |
           for wheel in dist/*.whl; do
             python3 scripts/version_contract.py wheel "$wheel"
