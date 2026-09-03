@@ -115,12 +115,48 @@ fn ensure_initializes_only_absent_or_empty_real_roots() {
     assert_eq!(Store::ensure(&partial).unwrap_err().code, Code::STORE_ERA);
     assert!(!partial.join("blobs").exists());
 
+    let missing_catalog = root.join("missing-catalog");
+    for namespace in ["repos", "manifests", "blobs"] {
+        fs::create_dir_all(missing_catalog.join(namespace)).unwrap();
+    }
+    assert_eq!(
+        Store::ensure(&missing_catalog).unwrap_err().code,
+        Code::DURABILITY_UNPROVEN
+    );
+    assert!(!missing_catalog.join("tmp").exists());
+
+    let corrupt_catalog = root.join("corrupt-catalog");
+    Store::init(&corrupt_catalog).unwrap();
+    fs::remove_dir_all(corrupt_catalog.join("tmp")).unwrap();
+    let connection = rusqlite::Connection::open(corrupt_catalog.join("tensorfs.sqlite")).unwrap();
+    connection.pragma_update(None, "user_version", 999).unwrap();
+    drop(connection);
+    assert_eq!(
+        Store::ensure(&corrupt_catalog).unwrap_err().code,
+        Code::UNKNOWN_FORMAT
+    );
+    assert!(!corrupt_catalog.join("tmp").exists());
+
     let real = root.join("real");
     Store::init(&real).unwrap();
     let link = root.join("link");
     symlink(&real, &link).unwrap();
     assert_eq!(Store::ensure(&link).unwrap_err().code, Code::STORE_ERA);
     assert_eq!(Store::open(&link).unwrap_err().code, Code::STORE_ERA);
+
+    for namespace in ["repos", "manifests", "blobs"] {
+        let store_root = root.join(format!("symlink-{namespace}"));
+        Store::init(&store_root).unwrap();
+        let outside = root.join(format!("outside-{namespace}"));
+        fs::create_dir(&outside).unwrap();
+        fs::remove_dir(store_root.join(namespace)).unwrap();
+        symlink(&outside, store_root.join(namespace)).unwrap();
+        assert_eq!(
+            Store::ensure(&store_root).unwrap_err().code,
+            Code::STORE_ERA
+        );
+        assert_eq!(Store::open(&store_root).unwrap_err().code, Code::STORE_ERA);
+    }
     fs::remove_dir_all(root).unwrap();
 }
 

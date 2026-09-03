@@ -269,7 +269,21 @@ impl Store {
         if empty {
             Store::init(root)
         } else {
-            Store::open(root)
+            validate_store_root(root)?;
+            let catalog_path = root.join("tensorfs.sqlite");
+            match fs::symlink_metadata(&catalog_path) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    return refuse(
+                        Code::DURABILITY_UNPROVEN,
+                        format!("{} is not a real catalog file", catalog_path.display()),
+                    )
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io("stat TensorFS catalog", error)),
+            }
+            crate::catalog::Catalog::open(root)?;
+            open_validated(root)
         }
     }
 
@@ -304,31 +318,8 @@ impl Store {
     /// The three authoritative namespaces identify a TensorFS store. Old mixed-object and
     /// state.json layouts are a prelaunch hardcut and never dual-read.
     pub fn open(root: &Path) -> Result<Store> {
-        let metadata = fs::symlink_metadata(root)
-            .map_err(|error| io(format!("stat Store root {}", root.display()), error))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return refuse(
-                Code::STORE_ERA,
-                format!("{} is not a real Store directory", root.display()),
-            );
-        }
-        if !["repos", "manifests", "blobs"]
-            .iter()
-            .all(|name| root.join(name).is_dir())
-        {
-            return refuse(
-                Code::STORE_ERA,
-                format!(
-                    "{} lacks the repos/manifests/blobs layout; old stores require an offline migration",
-                    root.display()
-                ),
-            );
-        }
-        fs::create_dir_all(root.join("tmp")).map_err(|error| io("mkdir tmp", error))?;
-        Ok(Store {
-            root: root.to_path_buf(),
-            progress: None,
-        })
+        validate_store_root(root)?;
+        open_validated(root)
     }
 
     pub fn root(&self) -> &Path {
@@ -1248,6 +1239,41 @@ impl Store {
         }
         Ok((gone, kept))
     }
+}
+
+fn validate_store_root(root: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| io(format!("stat Store root {}", root.display()), error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return refuse(
+            Code::STORE_ERA,
+            format!("{} is not a real Store directory", root.display()),
+        );
+    }
+    for name in ["repos", "manifests", "blobs"] {
+        let path = root.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) | Err(_) => {
+                return refuse(
+                    Code::STORE_ERA,
+                    format!(
+                        "{} lacks a real {name}/ namespace; old or partial stores require an offline migration",
+                        root.display()
+                    ),
+                )
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_validated(root: &Path) -> Result<Store> {
+    fs::create_dir_all(root.join("tmp")).map_err(|error| io("mkdir tmp", error))?;
+    Ok(Store {
+        root: root.to_path_buf(),
+        progress: None,
+    })
 }
 
 fn prepare_reader_dir(path: &Path, mode: u32) -> Result<()> {
