@@ -1,5 +1,5 @@
 doc: header
 expect: ok
-id: sha256:d465ec53ab07782f55f98e851b8369aab6108d73bc73edc5398e578caf6225ee
-tensor_schema: sha256:f46a7f4d483f3cb771cb5c2352fe79650b4a89cd788010bb4d7df5d1ccd5d1be
+id: sha256:130d46a68260c1b5ccbddae43dd3b2f3f2183ab01e2ba9e5c23cdd99dfdfa1a1
+tensor_schema: sha256:782069e32121589acfc3ec8b191e98cf1ff93029da947100ec5b5536fa67e15b
 note: same tensors, no configs: same tensor schema, different header id

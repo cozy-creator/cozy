@@ -1,3 +1,3 @@
 doc: manifest
 expect: mutant
-note: one byte flipped at offset 98 of sha256:cb1281ec56b863dffe9f00759fc855e7a9cc9854f26eecaa5b3c3b90951f2beb
+note: one byte flipped at offset 98 of sha256:94798bba1a94f1cc7452e94aacbbe9680effd62f04ebe73d4b8b13c3d468209b

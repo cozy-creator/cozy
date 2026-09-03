@@ -1,1 +1,0 @@
-{"code":"ok","component":"","custody":"canonical","detail":"fits (routes: verbatim x1, decoded_float x0, encoded_gemm x1; 1 encoded leaf qualified on cpu)","device":"cpu","encoding":"","ignored":[],"key":"","routes":{"decoded_float":0,"encoded_gemm":1,"verbatim":1}}

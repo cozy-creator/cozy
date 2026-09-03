@@ -1,5 +1,0 @@
-doc: tensor_requirements
-expect: ok
-id: sha256:d89c920e3a3919f2314efba1e2c12b0a56be273c34e1ff0acd9fdab8ad2b542f
-tensor_schema: sha256:3c9af9e6769dc31e8e86ea1e5acbaeeb38780a7bb7e631bcec1e6271c59caa24
-note: the same contract with only the dtypes recast: a different tensor schema digest

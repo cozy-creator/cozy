@@ -19,7 +19,6 @@ pub struct EncodingSpec {
     pub logical_rank: Option<u64>,
     /// EXACT role set, sorted by name. No optional roles: one digest, one byte contract.
     pub roles: Vec<(String, Role)>,
-    pub doc: Option<String>,
     /// Raw-bit conformance vectors. Mandatory for executable qualification.
     pub vectors: Option<ObjectRef>,
 }
@@ -119,16 +118,6 @@ impl EncodingSpec {
             roles.push((name.clone(), Role { carrier, shape }));
         }
 
-        let doc = match f.opt("doc") {
-            Some(x) => {
-                let s = as_str("EncodingSpec", "doc", x)?;
-                if s.len() > limits::MAX_DOC_TEXT_BYTES {
-                    return refuse(Code::SIZE_CAP, "EncodingSpec.doc over the byte cap");
-                }
-                Some(s.to_string())
-            }
-            None => None,
-        };
         let vectors = match f.opt("vectors") {
             Some(x) => Some(ObjectRef::from_value("EncodingSpec.vectors", x)?),
             None => None,
@@ -155,7 +144,6 @@ impl EncodingSpec {
             logical_dtypes,
             logical_rank,
             roles,
-            doc,
             vectors,
         })
     }
@@ -191,9 +179,6 @@ impl EncodingSpec {
         ];
         if let Some(r) = self.logical_rank {
             fields.push(("logical_rank", Value::uint(r)));
-        }
-        if let Some(d) = &self.doc {
-            fields.push(("doc", Value::str(d.clone())));
         }
         if let Some(v) = &self.vectors {
             fields.push(("vectors", v.to_value()));

@@ -1,3 +1,0 @@
-doc: grade_decision
-expect: mutant
-note: one byte flipped at offset 57 of sha256:c54e7ab7183ccf718985a865871f0eaf8c877318df9c29959a8eb47d4ca493f7

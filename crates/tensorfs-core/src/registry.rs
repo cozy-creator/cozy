@@ -77,7 +77,6 @@ fn spec(
     logical_dtypes: Vec<Dtype>,
     logical_rank: Option<u64>,
     roles: Vec<(&str, Role)>,
-    doc: &str,
     vectors: Option<ObjectRef>,
 ) -> EncodingSpec {
     let mut r: Vec<(String, Role)> = roles.into_iter().map(|(n, x)| (n.to_string(), x)).collect();
@@ -86,7 +85,6 @@ fn spec(
         logical_dtypes,
         logical_rank,
         roles: r,
-        doc: Some(doc.to_string()),
         vectors,
     }
 }
@@ -98,13 +96,12 @@ fn seed(
     logical_dtypes: Vec<Dtype>,
     logical_rank: Option<u64>,
     roles: Vec<(&str, Role)>,
-    doc: &str,
     vectors: Option<EncodingVectors>,
 ) -> Seed {
     let vref = vectors.as_ref().map(|v| v.fixture_ref());
     Seed {
         alias,
-        spec: spec(logical_dtypes, logical_rank, roles, doc, vref),
+        spec: spec(logical_dtypes, logical_rank, roles, vref),
         vectors,
     }
 }
@@ -149,22 +146,23 @@ pub fn seeds() -> Vec<Seed> {
     let mut out = vec![
         seed(
             "plain/1",
-                all,
-                None,
-                vec![("value", role(Carrier::SameAsLogical, Relation::Same))],
-                "Plain little-endian row-major storage: one `value` role carrying the logical bytes verbatim. Entry zero of the registry; not a special absent form.",
-                Some(plain_vectors()),
+            all,
+            None,
+            vec![("value", role(Carrier::SameAsLogical, Relation::Same))],
+            Some(plain_vectors()),
         ),
         seed(
             "fp8-rowwise/1",
-                float.clone(),
-                Some(2),
-                vec![
-                    ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
-                    ("scale", role(set(&[Dtype::F32]), dims(vec![Dim::Axis { axis: 0 }]))),
-                ],
-                "value[i,j] = data[i,j] * scale[i]. Per-output-row fp8 e4m3 weights with one f32 scale per row; scale[i] = amax(|W[i,:]|)/448 floored at 1e-12, and the quantizer clamps to +/-448 BEFORE the e4m3 cast because that cast does not saturate. This is what v1 shipped as `fp8-w8a8` (convert/writer.py:546) -- the ecosystem's `w8a8` is fp8, not int8.",
-                Some(mined("fp8-rowwise")),
+            float.clone(),
+            Some(2),
+            vec![
+                ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
+                (
+                    "scale",
+                    role(set(&[Dtype::F32]), dims(vec![Dim::Axis { axis: 0 }])),
+                ),
+            ],
+            Some(mined("fp8-rowwise")),
         ),
         // The SAME alias, a DIFFERENT physical variant: rank-2 `[out, 1]` rather than
         // rank-1 `[out]`. Roles are EXACT, so this is its own spec digest rather than an
@@ -183,20 +181,19 @@ pub fn seeds() -> Vec<Seed> {
         // `nvfp4_awq` = rank-2 F8_E4M3 block scales. Scale rank is a per-producer fact.
         seed(
             "fp8-rowwise/1",
-                float.clone(),
-                Some(2),
-                vec![
-                    ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
-                    (
-                        "scale",
-                        role(
-                            set(&[Dtype::F32]),
-                            dims(vec![Dim::Axis { axis: 0 }, Dim::Lit { value: 1 }]),
-                        ),
+            float.clone(),
+            Some(2),
+            vec![
+                ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
+                (
+                    "scale",
+                    role(
+                        set(&[Dtype::F32]),
+                        dims(vec![Dim::Axis { axis: 0 }, Dim::Lit { value: 1 }]),
                     ),
-                ],
-                "value[i,j] = data[i,j] * scale[i,0]. Per-output-row fp8 e4m3 with a KEPT trailing unit axis on the scale -- v1's own quantizer output (decisions #187). Physically distinct from the rank-1 variant: a reader that assumes [out] mis-strides this and a reader that assumes [out,1] mis-strides that, which is precisely why they are two digests.",
-                Some(mined("fp8-rowwise-keepdim")),
+                ),
+            ],
+            Some(mined("fp8-rowwise-keepdim")),
         ),
         // A THIRD physical variant of the same alias, and the one the largest H3
         // distribution by download count actually ships. MEASURED, not inferred, from
@@ -217,15 +214,14 @@ pub fn seeds() -> Vec<Seed> {
         // the producer itself, on bytes that were never a model.
         seed(
             "fp8-scaled-scalar/1",
-                float.clone(),
-                Some(2),
-                vec![
-                    ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
-                    ("input_scale", role(set(&[Dtype::F32]), dims(vec![]))),
-                    ("weight_scale", role(set(&[Dtype::F32]), dims(vec![]))),
-                ],
-                "value[i,j] = data[i,j] * weight_scale, with a separate rank-0 activation `input_scale`. Both scales are SCALARS -- rank 0, one number for the whole tensor -- which is what ComfyUI's `scaled_fp8` comfy_quant marker convention emits for the H3 DiT. Not a degenerate spelling of the rank-2 variant: the byte layouts differ and so do the digests. The `input_scale` takes NO part in reconstructing the weight -- it is the activation quantizer's scale, and the vectors pin that by carrying a value a folded-in reader gets wrong. The scale is NARROWED TO THE LOGICAL DTYPE BEFORE the multiply, not multiplied in f32 and rounded once: the producer's dequant is `narrow(weight_scale) * e4m3(data)`, and the difference is a full ulp on 132 of 512 bf16 elements.",
-                Some(mined("fp8-scaled-scalar")),
+            float.clone(),
+            Some(2),
+            vec![
+                ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
+                ("input_scale", role(set(&[Dtype::F32]), dims(vec![]))),
+                ("weight_scale", role(set(&[Dtype::F32]), dims(vec![]))),
+            ],
+            Some(mined("fp8-scaled-scalar")),
         ),
         // A FOURTH variant, and the one that vindicates "no `optional: true`" on real bytes.
         // The SAME file carries both: measured on the pinned pruned fp8_scaled DiT, 200
@@ -236,14 +232,13 @@ pub fn seeds() -> Vec<Seed> {
         // into one digest that describes neither tensor exactly; two digests describe both.
         seed(
             "fp8-scaled-scalar/1",
-                float.clone(),
-                Some(2),
-                vec![
-                    ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
-                    ("weight_scale", role(set(&[Dtype::F32]), dims(vec![]))),
-                ],
-                "value[i,j] = data[i,j] * weight_scale, weight scale only -- no activation scale role at all. ComfyUI's scaled_fp8 emits this for the H3 DiT's `mlp.fc2` while emitting the input_scale variant for `out_proj`/`qkv_proj`/`mlp.fc1` in the same file. Same narrowing rule as the sibling variant: the scale lands in the logical dtype before the multiply.",
-                Some(mined("fp8-scaled-scalar-weight-only")),
+            float.clone(),
+            Some(2),
+            vec![
+                ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
+                ("weight_scale", role(set(&[Dtype::F32]), dims(vec![]))),
+            ],
+            Some(mined("fp8-scaled-scalar-weight-only")),
         ),
         // DELETED (tfs-008 deletion pass): the int8 `w8a8-perchannel/1` seed. It had no
         // producer, no consumer, and a NAME that actively misleads -- everything in this
@@ -254,17 +249,22 @@ pub fn seeds() -> Vec<Seed> {
         // belongs to `svdq-microscale/1`. Schema with no path is what the conventions forbid.
         seed(
             "mxfp8/1",
-                float.clone(),
-                Some(2),
-                vec![
-                    ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
-                    (
-                        "scale",
-                        role(set(&[Dtype::U8]), dims(vec![Dim::Axis { axis: 0 }, Dim::CeilDiv { axis: 1, by: 32 }])),
+            float.clone(),
+            Some(2),
+            vec![
+                ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
+                (
+                    "scale",
+                    role(
+                        set(&[Dtype::U8]),
+                        dims(vec![
+                            Dim::Axis { axis: 0 },
+                            Dim::CeilDiv { axis: 1, by: 32 },
+                        ]),
                     ),
-                ],
-                "OCP Microscaling MXFP8: E4M3 elements with one E8M0 power-of-two scale per 32-element block along the last axis; the E8M0 exponent byte rides a u8 carrier. Execution floors are capability records, never spec fields (native SM100; software-scaled sm89-class; decoded-float below). Scale byte b means 2^(b-127); v1 carries this convention in exactly one decode line (hf_fp8_blockwise.py:275) and NO producer, so these vectors come from an independent implementation written to the OCP spec, not from a shipped MX producer -- a weaker provenance than the fp8/nvfp4 sets and marked as such.",
-                Some(mined("mxfp8")),
+                ),
+            ],
+            Some(mined("mxfp8")),
         ),
         Seed {
             alias: "svdq-microscale/1",
@@ -273,7 +273,13 @@ pub fn seeds() -> Vec<Seed> {
                 float.clone(),
                 Some(2),
                 vec![
-                    ("weight", role(set(&[Dtype::U8]), dims(vec![Dim::Axis { axis: 0 }, Dim::Div { axis: 1, by: 2 }]))),
+                    (
+                        "weight",
+                        role(
+                            set(&[Dtype::U8]),
+                            dims(vec![Dim::Axis { axis: 0 }, Dim::Div { axis: 1, by: 2 }]),
+                        ),
+                    ),
                     (
                         "wscale",
                         role(
@@ -289,11 +295,25 @@ pub fn seeds() -> Vec<Seed> {
                             ]),
                         ),
                     ),
-                    ("proj_down", role(set(&[Dtype::Bf16]), dims(vec![Dim::Lit { value: 32 }, Dim::Axis { axis: 1 }]))),
-                    ("proj_up", role(set(&[Dtype::Bf16]), dims(vec![Dim::Axis { axis: 0 }, Dim::Lit { value: 32 }]))),
-                    ("smooth", role(set(&[Dtype::Bf16]), dims(vec![Dim::Axis { axis: 1 }]))),
+                    (
+                        "proj_down",
+                        role(
+                            set(&[Dtype::Bf16]),
+                            dims(vec![Dim::Lit { value: 32 }, Dim::Axis { axis: 1 }]),
+                        ),
+                    ),
+                    (
+                        "proj_up",
+                        role(
+                            set(&[Dtype::Bf16]),
+                            dims(vec![Dim::Axis { axis: 0 }, Dim::Lit { value: 32 }]),
+                        ),
+                    ),
+                    (
+                        "smooth",
+                        role(set(&[Dtype::Bf16]), dims(vec![Dim::Axis { axis: 1 }])),
+                    ),
                 ],
-                "svdq micro-scale. The `wscale` geometry is TRANSCRIBED from v1 nunchaku.micro-scale.v1.json: logical [out, in/16] e4m3 scales written under the warp-lane permutation (0,5,1,4,3,2,6) of extents (out/128, 1, 4, 4, 8, (in/16)/4, 4), so the stored grid is [out/128, in/64, 1, 8, 4, 4, 4]; exact division enforces out%128==0 and (in/16)%4==0. PROVISIONAL: the rank-32 low-rank branch and smoothing-factor geometry await producer-mined confirmation (tfs-008).",
                 None,
             ),
         },
@@ -318,7 +338,6 @@ pub fn seeds() -> Vec<Seed> {
         ),
         ("weight_scale_2", role(set(&[Dtype::F32]), dims(vec![]))),
     ];
-    let doc = "nvfp4 W4A4 (modelopt export shapes): weight u8 [out, in/2] packed e2m1 nibble pairs, element 2j in the LOW nibble; weight_scale e4m3 [out, in/16] per-16-block scales, flat row-major; weight_scale_2 f32 scalar. Dequant: W ~= e2m1(weight) * weight_scale.float() * weight_scale_2. Detection is the (u8 weight + e4m3 weight_scale + f32 weight_scale_2) triple, never a name list.";
     for (suffix, extra) in [
         ("", vec![]),
         (
@@ -345,7 +364,6 @@ pub fn seeds() -> Vec<Seed> {
     ] {
         let mut roles = base.clone();
         roles.extend(extra);
-        let full = format!("{doc} Variant roles: base{suffix}.");
         // Only the BASE variant has producer-mined vectors: v1's quantizer emits exactly
         // the (weight, weight_scale, weight_scale_2) triple. The three variants that add an
         // input_scale / pre_quant_scale are real physical contracts with no mined bytes yet,
@@ -356,7 +374,6 @@ pub fn seeds() -> Vec<Seed> {
             logical(&[Dtype::Bf16, Dtype::F16]),
             Some(2),
             roles,
-            &full,
             if suffix.is_empty() {
                 Some(mined("nvfp4-w4a4"))
             } else {

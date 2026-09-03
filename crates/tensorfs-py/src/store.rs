@@ -1802,6 +1802,30 @@ impl PyLease {
         py.detach(|| read::read_into(lease, &r, dest)).or_refuse(py)
     }
 
+    /// Read one self-contained model asset through the lease's pinned descriptors.
+    #[pyo3(signature = (header, name, max_bytes=67_108_864))]
+    fn read_asset<'p>(
+        &self,
+        py: Python<'p>,
+        header: &[u8],
+        name: &str,
+        max_bytes: u64,
+    ) -> PyResult<Bound<'p, PyBytes>> {
+        let header = Header::parse(header).or_refuse(py)?;
+        let asset = header
+            .assets
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, asset)| asset)
+            .ok_or_else(|| missing(py, "model asset", name))?;
+        let guard = self.lease.lock().unwrap();
+        let lease = guard.as_ref().ok_or_else(|| released(py))?;
+        let bytes = py
+            .detach(|| read::read_asset(lease, name, asset, max_bytes))
+            .or_refuse(py)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
     /// **The streaming shape.** One plan, a ring of CALLER-owned slots, and a reader pool
     /// that never stops at a batch boundary.
     ///

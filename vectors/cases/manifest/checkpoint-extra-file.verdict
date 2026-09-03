@@ -1,5 +1,5 @@
 doc: manifest
 expect: ok
-id: sha256:cb1281ec56b863dffe9f00759fc855e7a9cc9854f26eecaa5b3c3b90951f2beb
-manifest: sha256:cb1281ec56b863dffe9f00759fc855e7a9cc9854f26eecaa5b3c3b90951f2beb
+id: sha256:94798bba1a94f1cc7452e94aacbbe9680effd62f04ebe73d4b8b13c3d468209b
+manifest: sha256:94798bba1a94f1cc7452e94aacbbe9680effd62f04ebe73d4b8b13c3d468209b
 note: one more sibling file: new manifest_id, same header id

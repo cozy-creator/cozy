@@ -861,9 +861,9 @@ mod tests {
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
     const SCALED_SCHEMA: &str =
-        "sha256:b4cce0c745fe5bb0535827572791c37195c982e21b5d5fe9b30a9b2446bc8ea2";
+        "sha256:9a73b8829dcc6a29ce4b8bdd12672b788078e0f32d9e5fbd806a3cbb13f7646a";
     const FULL_SCHEMA: &str =
-        "sha256:61e69d1fcc565583e90560cf0282f42a18d3cc65462a6a17eee5f69c64b0a6ba";
+        "sha256:fd58d2dec532f72f8744f3369ebf6b35c489c58f42647c17f950f9aae23f0afc";
     const MIXED_BLOCK_ORDER: [&str; 5] = [
         "blocks.0.attn1.to_q.weight",
         "blocks.0.attn1.to_out.0.weight",

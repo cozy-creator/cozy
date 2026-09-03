@@ -45,7 +45,7 @@ rm -rf "$work/venv"
 "$work/venv/bin/pip" install --quiet "$wheel"
 echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/version_contract.py installed "$wheel"
-"$work/venv/bin/python" scripts/tensor-requirements-runs.py
+"$work/venv/bin/python" scripts/fit-runs.py
 # The frozen corpus, through the FACADE. `tfs vectors verify` runs the same 90 vectors
 # through Rust; this proves the marshal boundary agrees — same ids, same typed refusals.
 "$work/venv/bin/python" scripts/facade-conform.py
@@ -72,7 +72,7 @@ assert tensorfs.object_id(info["manifest"]) == "sha256:" + snap
 names = [(c, k) for c in header["components"] for k in header["components"][c]]
 comp, key = names[0]
 tensor = header["components"][comp][key]
-print(f"named tensor: {comp}/{key} {tensor['logical']['dtype']} {tensor['logical']['shape']}")
+print(f"named tensor: {comp}/{key} {tensor['logical']['logical_dtype']} {tensor['logical']['shape']}")
 
 order = names
 plan = tensorfs.plan(info["header"], order, window=1 << 16)

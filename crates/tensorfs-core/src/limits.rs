@@ -1,5 +1,5 @@
 //! PROVISIONAL constants (cozytensors.md §7). Ratification waits on proto-001's REAL
-//! selected-H3 topology corpus + SDXL; nothing here is frozen until that lands.
+//! selected-H3 tensor-schema corpus + SDXL; nothing here is frozen until that lands.
 
 pub const PROVISIONAL: &str = "provisional: awaiting proto-001 H3+SDXL corpus (tfs-013/tfs-015)";
 

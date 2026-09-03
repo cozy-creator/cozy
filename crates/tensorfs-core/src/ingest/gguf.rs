@@ -569,7 +569,7 @@ pub fn check_twin(plan: &GgufPlan, rows: &[u8]) -> Result<u64> {
                     Code::MISSING_TENSOR,
                     format!(
                         "{}: the carrier holds it and the named twin does not — the two \
-                         artifacts are not the same topology",
+                         artifacts do not have the same tensor schema",
                         t.name
                     ),
                 )

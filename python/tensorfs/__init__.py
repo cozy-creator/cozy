@@ -32,11 +32,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
-
 from . import errors
 from ._ext import (
-    _tensor_requirements,
+    _fit,
     Batch,
     Closure,
     DerivedWriter,
@@ -48,7 +46,6 @@ from ._ext import (
     capability,
     dtypes,
     doc_kinds,
-    fit,
     fetch_admit,
     fetch_complete,
     fetch_complete_cozytensors,
@@ -73,42 +70,41 @@ from ._ext import (
 
 @dataclass(frozen=True)
 class TensorRequirement:
-    """One destination the factory constructs: its shape, constructed dtype, which stored
-    encodings it accepts (`"any"` under ``encoded_leaves="accept"``, a digest list
-    otherwise), and whether the dtype is PINNED (an integer buffer, an fp32 island)."""
+    """One tensor constructed for this request."""
 
     component: str
     key: str
-    dtype: str
     shape: Sequence[int]
-    accepts: Literal["any"] | Sequence[str]
-    pinned: bool = False
+    logical_dtype: str | None = None
 
 
-def tensor_requirements(
-    contract_digest: str,
-    tensors: Sequence[TensorRequirement],
-    constructed_components: Sequence[str] | None = None,
-) -> bytes:
-    """Author canonical TensorRequirements bytes from the meta-device census rows.
-
-    `constructed_components` is the factory's construction order (D9); it defaults to the
-    order the components first appear in `tensors`.
-    """
+def fit(
+    requirements: Sequence[TensorRequirement],
+    header: bytes,
+    *,
+    custody: str,
+    encoded_leaves: bool,
+    device: str | None = None,
+    observations: bytes | None = None,
+) -> dict[str, object]:
+    """Compare a transient factory census with one CozyTensors header."""
     rows = [
         (
             tensor.component,
             tensor.key,
-            tensor.dtype,
             list(tensor.shape),
-            None if tensor.accepts == "any" else list(tensor.accepts),
-            bool(tensor.pinned),
+            tensor.logical_dtype,
         )
-        for tensor in tensors
+        for tensor in requirements
     ]
-    if constructed_components is None:
-        constructed_components = list(dict.fromkeys(tensor.component for tensor in tensors))
-    return _tensor_requirements(contract_digest, rows, list(constructed_components))
+    return _fit(
+        rows,
+        header,
+        custody=custody,
+        encoded_leaves=encoded_leaves,
+        device=device,
+        observations=observations,
+    )
 
 #: The closed carrier/logical dtype enum and its element sizes. The ONE export of dtype
 #: knowledge: a consumer sizing a `torch.frombuffer` reads it from here, never from a
@@ -127,7 +123,6 @@ __all__ = [
     "Store",
     "__version__",
     "capability",
-    "tensor_requirements",
     "dtypes",
     "doc_kinds",
     "fit",

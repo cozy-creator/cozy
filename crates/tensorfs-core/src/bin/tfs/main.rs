@@ -20,13 +20,6 @@
 //!   tfs fill <root> <plan>       resumable fill: skip only verified objects
 //!   tfs bench-store <root>       put/read/range/rehash throughput + peak RSS
 //!
-//! Fit (tfs-042): the ONE code <-> checkpoint matching function. Exit 0 on `ok`, one
-//! distinct code per refusal (10..16, see `Fit::exit_code`); `--json` prints the machine
-//! document.
-//!
-//!   tfs fit <tensor-requirements.json> <root> <header> [--custody canonical|local]
-//!       [--device <class> --observations <obs.json>] [--json]
-//!
 //! Qualification (tfs-008): what an (encoding, device) pair is QUALIFIED to execute.
 //! FAIL-CLOSED -- an absent pair refuses, because an unrecognised device is the absence of
 //! evidence and never permission. The compiled-in records speak only for the reference
@@ -95,10 +88,6 @@ use std::time::Instant;
 use tensorfs_core::canon;
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::err::Refusal;
-use tensorfs_core::fit::{
-    self, Accepts, CompatibilityReport, Custody, TensorRequirement, TensorRequirements,
-};
-use tensorfs_core::grade::{self, ConversionRegistration, Mapping};
 use tensorfs_core::header::{Asset, Body, Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{Doc, ObjectRef, Plain};
 use tensorfs_core::ingest::stamp::Stamp;
@@ -160,7 +149,6 @@ fn main() -> ExitCode {
         ["conform", w] => conform::cmd_conform(Some(w), &flags),
         ["capability", e, d] => conform::cmd_capability(e, d, &flags),
         ["vectors", "mine", rows, name] => conform::cmd_mine(Path::new(rows), name, &flags),
-        ["fit", c, r, h] => layout::cmd_fit(Path::new(c), Path::new(r), h, &flags),
         ["manifest", "show", r, h] => snap::cmd_show(Path::new(r), h),
         ["manifest", "get", r, h] => snap::cmd_get(Path::new(r), h, &flags),
         ["manifest", "admit", r, p] => snap::cmd_admit(Path::new(r), Path::new(p), &flags),
@@ -249,19 +237,6 @@ fn main() -> ExitCode {
         ["fetch", "plan", r, d, s] => fetch::cmd_plan(Path::new(r), Path::new(d), s, &flags),
         ["fetch", "admit", r, p, i] => fetch::cmd_admit(Path::new(r), Path::new(p), i, &flags),
         ["fetch", "complete", r, p] => fetch::cmd_complete(Path::new(r), Path::new(p)),
-        ["compat", "import", r] => layout::cmd_import(Path::new(r), &flags),
-        ["compat", "requirements", r, h] => layout::cmd_requirements(Path::new(r), h, &flags),
-        ["compat", "check", c, h] => layout::cmd_check(Path::new(c), Path::new(h), &flags),
-        ["compat", "release-cut", r] => layout::cmd_release_cut(Path::new(r)),
-        ["grade", "decision", d] => layout::cmd_decision(Path::new(d)),
-        // The BATCH surface (tfs-039). Grading is microseconds; the wall was the process
-        // around it. `batch` reads a file of canonical reports, `serve` reads them from
-        // stdin and flushes per line, and both emit exactly the bytes `grade --json` emits
-        // for the same document — so the single-pair form below is untouched.
-        ["grade", "batch", p] => layout::cmd_grade_stream(Some(Path::new(p)), &flags),
-        ["grade", "serve"] => layout::cmd_grade_stream(None, &flags),
-        ["grade", r] => layout::cmd_grade(Path::new(r), &flags),
-        ["grade", "register", n, k, s] => layout::cmd_register(n, k, s, &flags),
         ["registry"] => cmd_registry(),
         ["vectors", "gen"] => cmd_gen(&default_dir()),
         ["vectors", "gen", dir] => cmd_gen(Path::new(dir)),
@@ -356,7 +331,6 @@ mod ckpt;
 mod conform;
 mod fetch;
 mod ingest;
-mod layout;
 mod rd;
 mod repo;
 mod snap;
@@ -729,9 +703,6 @@ fn probe_spec() -> EncodingSpec {
                 ]),
             },
         )],
-        doc: Some(
-            "limit probe: legal geometry that overflows checked 64-bit arithmetic".to_string(),
-        ),
         vectors: None,
     }
 }
@@ -900,161 +871,6 @@ fn stamp_doc(
             ("bytes_written".to_string(), 1 << 20),
             ("tensors".to_string(), 2),
         ],
-    })
-}
-
-/// The layout plane's three frozen documents, all derived from the corpus header so the
-/// vector and the live path cannot describe different things. The requirements are the
-/// header's own tensor schema (a contract that asks for exactly what is there is the Satisfied
-/// case), and the registration is run, not asserted.
-#[allow(clippy::type_complexity)]
-/// The layout plane's frozen documents, produced together because every one of them is a
-/// projection of the SAME header and the same base contract — which is what makes the
-/// verdicts they earn comparable.
-struct LayoutPlane {
-    requirements: TensorRequirements,
-    report: CompatibilityReport,
-    registration: ConversionRegistration,
-    worst_full: CompatibilityReport,
-    worst_first: CompatibilityReport,
-    recast: TensorRequirements,
-    recast_report: CompatibilityReport,
-    /// The planted contract behind `worst_*`: a dtype cast on the first key and a shape
-    /// edit on the last, the `tfs fit` shape-mismatch arm.
-    worst: TensorRequirements,
-    /// The CONVERTIBLE arm: every required dtype widened to f32, which the registered
-    /// lossless bf16 -> f32 mapping closes. CONVERTIBLE is the only grade that populates
-    /// `remedy_registration` and `remedy_mapping`, and tensorhub reads both, so the machine
-    /// surface needs a real one rather than a hand-built decision.
-    widen_report: CompatibilityReport,
-}
-
-fn layout_plane_docs(h: &Header, closure: &Closure) -> TfsResult<LayoutPlane> {
-    let requirements = TensorRequirements {
-        contract: tensorfs_core::ids::object_id(b"TensorRequirements:corpus"),
-        components: h
-            .components
-            .iter()
-            .map(|(c, ts)| {
-                (
-                    c.clone(),
-                    ts.iter()
-                        .map(|(k, t)| {
-                            (
-                                k.clone(),
-                                TensorRequirement {
-                                    dtype: t.dtype,
-                                    shape: t.shape.clone(),
-                                    accepts: Accepts::Any,
-                                    pinned: false,
-                                },
-                            )
-                        })
-                        .collect(),
-                )
-            })
-            .collect(),
-        constructed_components: h.components.iter().map(|(c, _)| c.clone()).collect(),
-    };
-    let pin: Vec<String> = h.encodings.iter().map(EncodingSpec::object_id).collect();
-    let out = fit::check_compatibility(
-        &requirements,
-        h,
-        closure,
-        &pin,
-        Custody::Canonical,
-        fit::Depth::Full,
-    )?;
-    let report = CompatibilityReport::of(&requirements, h, Custody::Canonical, &out)?;
-    let reg = ConversionRegistration::register(
-        "bf16-to-f32",
-        Mapping::Widen {
-            from: Dtype::Bf16,
-            to: Dtype::F32,
-        },
-        &grade::complete_domain_16(),
-    )?;
-
-    // THE RED ARM (tfs-037), as a pair of frozen reports over ONE contract.
-    //
-    // The contract's first key asks for f8_e4m3fn where the checkpoint holds bf16 — a
-    // downward cast, PRODUCIBLE on its own — and its last key asks for a shape the
-    // checkpoint does not have, which is a different model and INCOMPATIBLE on its own.
-    // Graded on the FIRST fact the pair reads PRODUCIBLE and a catalog would offer the
-    // conversion; graded on the WHOLE set it is INCOMPATIBLE. Both reports are frozen with
-    // their verdicts so the two answers cannot silently become one.
-    let mut worst = requirements.clone();
-    let keys: usize = worst.components.iter().map(|(_, k)| k.len()).sum();
-    if keys < 2 {
-        return Err(tensorfs_core::err::Refusal {
-            code: tensorfs_core::err::Code::MISSING_FIELD,
-            detail: "the worst-grade arm needs a contract with at least two keys".into(),
-        });
-    }
-    let last = worst.components.len() - 1;
-    worst.components[0].1[0].1.dtype = Dtype::F8E4M3FN;
-    let tail = worst.components[last].1.len() - 1;
-    worst.components[last].1[tail].1.shape = vec![7];
-
-    let mut reports = Vec::new();
-    for depth in [fit::Depth::Full, fit::Depth::FirstMismatch] {
-        let out = fit::check_compatibility(&worst, h, closure, &pin, Custody::Canonical, depth)?;
-        reports.push(CompatibilityReport::of(
-            &worst,
-            h,
-            Custody::Canonical,
-            &out,
-        )?);
-    }
-    let first_fact = reports.pop().unwrap();
-    let whole_set = reports.pop().unwrap();
-
-    // The same contract with every required dtype recast and NOTHING else touched. This
-    // remains a compact regression for the dtype-remedy path after deleting the old
-    // shape-only catalog index.
-    let mut recast = requirements.clone();
-    for (_, keys) in recast.components.iter_mut() {
-        for (_, r) in keys.iter_mut() {
-            r.dtype = Dtype::F8E4M3FN;
-        }
-    }
-    let out = fit::check_compatibility(
-        &recast,
-        h,
-        closure,
-        &pin,
-        Custody::Canonical,
-        fit::Depth::Full,
-    )?;
-    let recast_report = CompatibilityReport::of(&recast, h, Custody::Canonical, &out)?;
-
-    // THE CONVERTIBLE ARM. Same shape as the recast above, widened the other way: every
-    // required dtype becomes f32, so the gap is exactly the lossless cast `reg` registers.
-    let mut widen = requirements.clone();
-    for (_, keys) in widen.components.iter_mut() {
-        for (_, r) in keys.iter_mut() {
-            r.dtype = Dtype::F32;
-        }
-    }
-    let out = fit::check_compatibility(
-        &widen,
-        h,
-        closure,
-        &pin,
-        Custody::Canonical,
-        fit::Depth::Full,
-    )?;
-    let widen_report = CompatibilityReport::of(&widen, h, Custody::Canonical, &out)?;
-    Ok(LayoutPlane {
-        requirements,
-        report,
-        registration: reg,
-        worst_full: whole_set,
-        worst_first: first_fact,
-        recast,
-        recast_report,
-        worst,
-        widen_report,
     })
 }
 
@@ -1280,316 +1096,23 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "one evidence arm; signer in the envelope; binds its stamp",
     ));
 
-    // --- the layout plane (tfs-009): tensor requirements, report, registration
-    let LayoutPlane {
-        requirements,
-        report,
-        registration: reg,
-        worst_full,
-        worst_first,
-        recast,
-        recast_report,
-        worst,
-        widen_report,
-    } = layout_plane_docs(&ha, &closure)?;
-    cases.push(ok_case(
-        "layout",
-        "tensor-requirements",
-        "tensor_requirements",
-        requirements.canonical_bytes(),
-        "the meta-device census of factory(config), projected: accepts, pinned dtypes, \
-         constructed components",
-    ));
-    cases.push(ok_case(
-        "layout",
-        "report-satisfied",
-        "compat_report",
-        report.canonical_bytes(),
-        "no fact recorded, with the component-granular encoding facts grading needs",
-    ));
-    // tfs-037. Two reports, ONE contract, one checkpoint: the only difference is how far
-    // the walk went, and it is the difference between offering a conversion and refusing
-    // one. Their frozen `grade:` lines are what notices if the ranking path ever regresses
-    // to reading the first fact.
-    cases.push(ok_case(
-        "layout",
-        "report-worst-full",
-        "compat_report",
-        worst_full.canonical_bytes(),
-        "a dtype cast FIRST and a shape mismatch SECOND: the whole set grades INCOMPATIBLE",
-    ));
-    cases.push(ok_case(
-        "layout",
-        "report-worst-first-fact",
-        "compat_report",
-        worst_first.canonical_bytes(),
-        "the same pair stopped at the first fact: PRODUCIBLE, which is why ranking may not \
-         stop there",
-    ));
-    cases.push(ok_case(
-        "layout",
-        "tensor-requirements-recast",
-        "tensor_requirements",
-        recast.canonical_bytes(),
-        "the same contract with only the dtypes recast: a different tensor schema digest",
-    ));
-    cases.push(ok_case(
-        "layout",
-        "report-widen",
-        "compat_report",
-        widen_report.canonical_bytes(),
-        "every required dtype widened to f32. With no registry the gap is unclosable and \
-         the frozen grade is INCOMPATIBLE; load the registered lossless cast and the same \
-         report grades CONVERTIBLE, which is the whole point of the rung",
-    ));
-    cases.push(ok_case(
-        "layout",
-        "report-recast",
-        "compat_report",
-        recast_report.canonical_bytes(),
-        "differs by dtype alone, so the registered cast determines the grade",
-    ));
-    cases.push(red_case(
-        "layout-red",
-        "worst-graded-partial",
-        "compat_report",
-        sub(
-            &worst_full.canonical_bytes(),
-            "\"depth\":\"full\"",
-            "\"depth\":\"first-mismatch\"",
-        ),
-        "PARTIAL_MISMATCH_SET",
-        "a full mismatch set relabelled as a stopped walk: ranking refuses rather than \
-         reading a truncated set",
-    ));
-    cases.push(red_case(
-        "layout-red",
-        "third-custody",
-        "compat_report",
-        sub(
-            &report.canonical_bytes(),
-            "\"custody\":\"canonical\"",
-            "\"custody\":\"borrowed\"",
-        ),
-        "UNKNOWN_FIELD",
-        "a third custody: canonical and local are the closed set (D5)",
-    ));
-    cases.push(red_case(
-        "layout-red",
-        "unconstructed-component",
-        "tensor_requirements",
-        sub(
-            &requirements.canonical_bytes(),
-            "\"constructed_components\":[",
-            "\"constructed_components\":[\"ghost\",",
-        ),
-        "MISSING_COMPONENT",
-        "constructed_components names exactly the components the requirements carry",
-    ));
-    cases.push(red_case(
-        "layout-red",
-        "empty-accepts",
-        "tensor_requirements",
-        sub(
-            &requirements.canonical_bytes(),
-            "\"accepts\":\"any\"",
-            "\"accepts\":[]",
-        ),
-        "MISSING_FIELD",
-        "an empty accepts list admits nothing and says nothing",
-    ));
-    // The grading plane's documents. The registration above was RUN, not asserted: these
-    // bytes exist only because bf16 -> f32 -> bf16 came back identical over all 65,536
-    // representable inputs, and freezing them puts that document's canonical form under
-    // `tfs vectors verify` and the cross-language facade diff.
-    cases.push(ok_case(
-        "layout",
-        "conversion-registration",
-        "conversion_registration",
-        reg.canonical_bytes(),
-        "a lossless widening, proved over the complete 16-bit domain",
-    ));
-    for (name, note, graded) in [
-        (
-            "grade-compatible",
-            "the contract asks for exactly what is there",
-            grade::Grade::Compatible,
-        ),
-        (
-            "grade-convertible",
-            "a registered lossless cast names the registration that closes it",
-            grade::Grade::Convertible {
-                registration: reg.name.clone(),
-                mapping: reg.mapping.describe(),
-            },
-        ),
-        (
-            "grade-producible",
-            "the remedy names the CONTRACT's target, never the observed encoding",
-            grade::Grade::Producible {
-                target: "f8_e4m3fn at transformer/blocks.0.attn.to_q.weight".to_string(),
-                source: "this checkpoint's bf16 tensors".to_string(),
-            },
-        ),
-        (
-            "grade-incompatible",
-            "a different model, not a different packaging",
-            grade::Grade::Incompatible {
-                reason: "transformer/blocks.0.attn.to_q.weight: logical shapes disagree"
-                    .to_string(),
-            },
-        ),
-    ] {
-        cases.push(ok_case(
-            "layout",
-            name,
-            "grade_decision",
-            grade::GradeDecision {
-                report: report.object_id(),
-                grade: graded,
-            }
-            .canonical_bytes(),
-            note,
-        ));
-    }
-    cases.push(red_case(
-        "layout-red",
-        "fifth-grade",
-        "grade_decision",
-        sub(
-            &grade::GradeDecision {
-                report: report.object_id(),
-                grade: grade::Grade::Compatible,
-            }
-            .canonical_bytes(),
-            "\"t\":\"COMPATIBLE\"",
-            "\"t\":\"PROBABLY\"",
-        ),
-        "UNKNOWN_FIELD",
-        "a fifth grade below the hub: the four levels are the closed set",
-    ));
-    // --- the machine surfaces (proto-020): the `--json` documents tensorhub decodes.
-    //
-    // These are the only documents in this corpus that nothing STORES — they are a CLI
-    // projection. They are frozen anyway, because they are a producer/consumer contract
-    // across two repositories and two languages and until now nothing held it: tensorfs
-    // changed shape more than once, and tensorhub's decoder refused every real answer while
-    // both repositories' CI stayed green. Freezing them
-    // here means `tfs vectors verify` re-emits each one from the frozen report beside it
-    // and requires byte identity, so a key added to any surface fails on the PRODUCER,
-    // naming the consumer, before it can ship.
-    let registry_with_widening = grade::Registry {
-        registrations: vec![reg.clone()],
-    };
-    for (name, source, note) in [
-        (
-            "check-satisfied",
-            &report,
-            "Satisfied: `details` empty, `encodings` carrying the pairs the DEVICE axis is \
-             then asked about one at a time",
-        ),
-        (
-            "check-worst-full",
-            &worst_full,
-            "a full walk: `details` is the WHOLE mismatch set and `depth` says so",
-        ),
-        (
-            "check-worst-first-fact",
-            &worst_first,
-            "the same pair stopped at the first fact: one detail, `depth` first-mismatch",
-        ),
-        (
-            "check-recast",
-            &recast_report,
-            "the same keys and shapes with a different required dtype",
-        ),
-    ] {
-        cases.push(ok_case(
-            "machine",
-            name,
-            "machine_check",
-            tensorfs_core::machine::check_json(source),
-            note,
-        ));
-    }
-    for (name, source, registry, note) in [
-        (
-            "grade-compatible",
-            &report,
-            &grade::Registry::default(),
-            "COMPATIBLE carries no remedy, and every remedy_* key is present and empty",
-        ),
-        (
-            "grade-producible",
-            &worst_first,
-            &grade::Registry::default(),
-            "PRODUCIBLE names the CONTRACT's target in remedy_target, never the observed \
-             encoding",
-        ),
-        (
-            "grade-incompatible",
-            &worst_full,
-            &grade::Registry::default(),
-            "INCOMPATIBLE carries the reason and no remedy: a different model, not a \
-             different packaging",
-        ),
-        (
-            "grade-convertible",
-            &widen_report,
-            &registry_with_widening,
-            "CONVERTIBLE names the registration that closes the gap",
-        ),
-    ] {
-        let decision = grade::GradeDecision {
-            report: source.object_id(),
-            grade: grade::grade_report(source, registry)?,
-        };
-        cases.push(ok_case(
-            "machine",
-            name,
-            "machine_grade",
-            tensorfs_core::machine::grade_json(&decision, source),
-            note,
-        ));
-    }
-    // `tfs fit --json` (tfs-042): the one code <-> checkpoint answer, frozen on the ok arm
-    // and on a planted shape edit so the eight-code vocabulary and its §3 text are held.
-    {
-        let ok = fit::fit(&requirements, &ha, Custody::Canonical, Some("cpu"), None)?;
-        cases.push(ok_case(
-            "machine",
-            "fit-ok",
-            "machine_fit",
-            tensorfs_core::machine::fit_json(&ok, Custody::Canonical),
-            "the requirements describe exactly what the checkpoint carries: `ok`, routes counted, \
-             encoded leaves qualified on the device asked about",
-        ));
-        let planted = fit::fit(&worst, &ha, Custody::Canonical, None, None)?;
-        cases.push(ok_case(
-            "machine",
-            "fit-shape-mismatch",
-            "machine_fit",
-            tensorfs_core::machine::fit_json(&planted, Custody::Canonical),
-            "rule (2) before rule (3): the planted shape edit answers even though a dtype \
-             cast comes first in walk order",
-        ));
-    }
+    // --- the two request-time machine results retained by TensorFS.
     {
         let records = registry::capability_records();
         let plain_id = seed_spec("plain/1", 0).object_id();
         let admitted = records
             .admit(&plain_id, "cpu")
-            .expect("plain/1 is qualified on the CPU the reference decoders run on");
+            .expect("plain/1 is qualified on the reference CPU");
         cases.push(ok_case(
             "machine",
             "capability-admitted",
             "machine_capability",
             tensorfs_core::machine::capability_json(Some(admitted), &plain_id, "cpu", "", &["cpu"]),
-            "ADMITTED: the implementation and the exact vector set it passed bit-for-bit",
+            "qualified encoding/device pair",
         ));
         let refusal = records
             .admit(&plain_id, "cuda.sm89")
-            .expect_err("no accelerator class is qualified in the compiled-in records");
+            .expect_err("no accelerator class is compiled in");
         cases.push(ok_case(
             "machine",
             "capability-unqualified",
@@ -1601,8 +1124,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
                 &refusal.detail,
                 &["cpu"],
             ),
-            "REFUSED with qualified_devices non-empty: routable elsewhere, which is a \
-             different answer from nothing anywhere runs this",
+            "unqualified encoding/device pair names where it is qualified",
         ));
     }
 
@@ -1999,8 +1521,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     // A spec object present in the closure that this runtime's pin does not alias: valid
     // DATA, unsupported EXECUTION. `header` accepts the same bytes; only serving refuses.
     let foreign = {
-        let mut s = seed_spec("plain/1", 0);
-        s.doc = Some("a spec object no platform alias names".to_string());
+        let s = seed_spec("plain/1", 0);
         s
     };
     let hf = Header {
@@ -2285,26 +1806,9 @@ fn cmd_gen(dir: &Path) -> ExitCode {
                 let h = Header::parse(&c.bytes).unwrap();
                 v += &format!("tensor_schema: {}\n", h.tensor_schema_digest());
             }
-            if c.doc == "tensor_requirements" {
-                let code = tensorfs_core::fit::TensorRequirements::parse(&c.bytes).unwrap();
-                v += &format!("tensor_schema: {}\n", code.tensor_schema_digest());
-            }
             if c.doc == "manifest" {
                 let m = Manifest::parse(&c.bytes).unwrap();
                 v += &format!("manifest: {}\n", m.manifest_id());
-            }
-            // The hub verdict a report earns, frozen alongside its bytes: the corpus holds
-            // the DECISION, not merely the canonical form the decision was read from.
-            if c.doc == "compat_report" {
-                let closure = Closure::default();
-                let outcome = tensorfs_core::corpus::run_doc(
-                    c.doc,
-                    &c.bytes,
-                    &closure,
-                    &registry::platform_digests(),
-                )
-                .unwrap();
-                v += &format!("grade: {}\n", outcome.grade.unwrap());
             }
         }
         v += &format!("note: {}\n", c.note);
@@ -2326,7 +1830,6 @@ enum Outcome {
         id: String,
         tensor_schema: Option<String>,
         manifest: Option<String>,
-        grade: Option<String>,
     },
     Refused(Refusal),
 }
@@ -2338,7 +1841,6 @@ fn run_doc(doc: &str, bytes: &[u8], closure: &Closure, platform: &[String]) -> O
             id: o.id,
             tensor_schema: o.tensor_schema,
             manifest: o.manifest,
-            grade: o.grade,
         },
         Err(e) => Outcome::Refused(e),
     }
@@ -2413,7 +1915,6 @@ fn cmd_verify(dir: &Path) -> ExitCode {
                         id,
                         tensor_schema,
                         manifest,
-                        grade,
                     },
                 ) => {
                     let mut bad = Vec::new();
@@ -2430,11 +1931,6 @@ fn cmd_verify(dir: &Path) -> ExitCode {
                     if let Some(expected) = field(&v, "manifest") {
                         if manifest.as_deref() != Some(expected.as_str()) {
                             bad.push(format!("manifest {manifest:?} != frozen {expected}"));
-                        }
-                    }
-                    if let Some(expected) = field(&v, "grade") {
-                        if grade.as_deref() != Some(expected.as_str()) {
-                            bad.push(format!("grade {grade:?} != frozen {expected}"));
                         }
                     }
                     if bad.is_empty() {
@@ -2574,167 +2070,39 @@ fn cmd_verify(dir: &Path) -> ExitCode {
         String::new(),
     ));
 
-    // proto-020: the MACHINE SURFACES, re-emitted live and required to be byte identical
-    // to the frozen documents. This is the arm the `tfs` JSON seam never had.
-    //
-    // Every other document here is frozen bytes re-read by its own reader. A `--json`
-    // projection has no reader, so freezing its bytes alone would be vacuous — the file
-    // would only ever be compared to itself, which is exactly how tensorhub's recorded
-    // samples went stale twice while staying green. So the emitter is run HERE, over the
-    // frozen `compat_report` beside it, and its output is diffed against the frozen
-    // document. Add a key to `compat check --json`, `grade --json` or `capability --json`
-    // and this FAILS, on the producer, before the consumer ever sees it.
     let case_bytes = |rel: &str| fs::read(dir.join("cases").join(rel)).unwrap_or_default();
-    let report_named = |name: &str| CompatibilityReport::parse(&case_bytes(name));
-    let widening = grade::Registry {
-        registrations: match ConversionRegistration::parse(&case_bytes(
-            "layout/conversion-registration.json",
-        )) {
-            Ok(r) => vec![r],
-            Err(_) => Vec::new(),
-        },
-    };
-    let mut reemitted: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
-    for (surface, source) in [
-        ("check-satisfied", "layout/report-satisfied.json"),
-        ("check-worst-full", "layout/report-worst-full.json"),
+    let records = registry::capability_records();
+    let plain_id = seed_spec("plain/1", 0).object_id();
+    let admitted = records
+        .admit(&plain_id, "cpu")
+        .expect("plain/1 is qualified on the reference CPU");
+    let refused = records
+        .admit(&plain_id, "cuda.sm89")
+        .expect_err("no accelerator class is compiled in");
+    for (name, live) in [
         (
-            "check-worst-first-fact",
-            "layout/report-worst-first-fact.json",
+            "capability-admitted",
+            tensorfs_core::machine::capability_json(Some(admitted), &plain_id, "cpu", "", &["cpu"]),
         ),
-        ("check-recast", "layout/report-recast.json"),
+        (
+            "capability-unqualified",
+            tensorfs_core::machine::capability_json(
+                None,
+                &plain_id,
+                "cuda.sm89",
+                &refused.detail,
+                &["cpu"],
+            ),
+        ),
     ] {
-        let live = match report_named(source) {
-            Ok(r) => tensorfs_core::machine::check_json(&r),
-            Err(e) => {
-                fail += 1;
-                println!("FAIL machine/{surface:<36} re-emit  {source} does not parse: {e}");
-                continue;
-            }
-        };
-        reemitted.push((
-            surface.to_string(),
-            live,
-            case_bytes(&format!("machine/{surface}.json")),
-        ));
-    }
-    for (surface, source, registry) in [
-        (
-            "grade-compatible",
-            "layout/report-satisfied.json",
-            &grade::Registry::default(),
-        ),
-        (
-            "grade-producible",
-            "layout/report-worst-first-fact.json",
-            &grade::Registry::default(),
-        ),
-        (
-            "grade-incompatible",
-            "layout/report-worst-full.json",
-            &grade::Registry::default(),
-        ),
-        ("grade-convertible", "layout/report-widen.json", &widening),
-    ] {
-        let live = match report_named(source)
-            .and_then(|r| Ok((grade::grade_report(&r, registry)?, r)))
-            .map(|(g, r)| {
-                let decision = grade::GradeDecision {
-                    report: r.object_id(),
-                    grade: g,
-                };
-                tensorfs_core::machine::grade_json(&decision, &r)
-            }) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                fail += 1;
-                println!("FAIL machine/{surface:<36} re-emit  {source} does not grade: {e}");
-                continue;
-            }
-        };
-        reemitted.push((
-            surface.to_string(),
-            live,
-            case_bytes(&format!("machine/{surface}.json")),
-        ));
-    }
-    {
-        let records = registry::capability_records();
-        let plain_id = seed_spec("plain/1", 0).object_id();
-        match records.admit(&plain_id, "cpu") {
-            Ok(record) => reemitted.push((
-                "capability-admitted".to_string(),
-                tensorfs_core::machine::capability_json(
-                    Some(record),
-                    &plain_id,
-                    "cpu",
-                    "",
-                    &["cpu"],
-                ),
-                case_bytes("machine/capability-admitted.json"),
-            )),
-            Err(e) => {
-                fail += 1;
-                println!("FAIL machine/capability-admitted          re-emit  plain/1 on cpu: {e}");
-            }
-        }
-        match records.admit(&plain_id, "cuda.sm89") {
-            Ok(_) => {
-                fail += 1;
-                println!(
-                    "FAIL machine/capability-unqualified       re-emit  an accelerator class \
-                     was admitted from the compiled-in records"
-                );
-            }
-            Err(e) => reemitted.push((
-                "capability-unqualified".to_string(),
-                tensorfs_core::machine::capability_json(
-                    None,
-                    &plain_id,
-                    "cuda.sm89",
-                    &e.detail,
-                    &["cpu"],
-                ),
-                case_bytes("machine/capability-unqualified.json"),
-            )),
-        }
-    }
-    for (surface, live, frozen) in &reemitted {
+        let frozen = case_bytes(&format!("machine/{name}.json"));
         if live == frozen {
             pass += 1;
-            println!(
-                "PASS machine/{surface:<36} contract id={}",
-                &tensorfs_core::ids::object_id(live)[7..19]
-            );
-            continue;
-        }
-        fail += 1;
-        let live_keys = tensorfs_core::machine::document_keys(live).unwrap_or_default();
-        let frozen_keys = tensorfs_core::machine::document_keys(frozen).unwrap_or_default();
-        let what = if live_keys == frozen_keys {
-            "the VALUES moved".to_string()
+            println!("PASS machine/{name:<36} exact result");
         } else {
-            format!("the KEYS moved: this build emits {live_keys:?}, frozen is {frozen_keys:?}")
-        };
-        println!(
-            "FAIL machine/{surface:<36} contract this build's `--json` output is not the \
-             frozen document — {what}. {}",
-            tensorfs_core::machine::CONSUMER_REMEDY
-        );
-    }
-    // The corpus must actually HOLD one document per surface. A machine vector that is
-    // deleted rather than regenerated would otherwise leave the surface silently unfrozen.
-    for (kind, _) in tensorfs_core::machine::SURFACES {
-        let held = reemitted.iter().filter(|(n, _, _)| match *kind {
-            "machine_check" => n.starts_with("check-"),
-            "machine_grade" => n.starts_with("grade-"),
-            _ => n.starts_with("capability-"),
-        });
-        cross.push((
-            format!("{kind} is frozen by at least one machine vector"),
-            held.count() > 0,
-            String::new(),
-        ));
+            fail += 1;
+            println!("FAIL machine/{name:<36} result moved");
+        }
     }
 
     for (what, ok, detail) in &cross {

@@ -1,4 +1,0 @@
-doc: conversion_registration
-expect: ok
-id: sha256:7dc4f9306ef81a17b19dad3a61171843db91cd84a43d922b34b6f3c445301549
-note: a lossless widening, proved over the complete 16-bit domain

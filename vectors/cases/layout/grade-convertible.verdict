@@ -1,4 +1,0 @@
-doc: grade_decision
-expect: ok
-id: sha256:c54e7ab7183ccf718985a865871f0eaf8c877318df9c29959a8eb47d4ca493f7
-note: a registered lossless cast names the registration that closes it

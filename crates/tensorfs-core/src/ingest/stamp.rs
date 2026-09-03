@@ -255,7 +255,7 @@ pub fn stamp(store: &Store, p: Presented) -> Result<Stamped> {
     let tensor_schema_digest = header.tensor_schema_digest();
     if tensor_schema_digest != p.profile.expected_tensor_schema_digest {
         return refuse(
-            Code::TOPOLOGY_MISMATCH,
+            Code::TENSOR_SCHEMA_MISMATCH,
             format!(
                 "computed tensor schema {tensor_schema_digest} != the profile's expected {}",
                 p.profile.expected_tensor_schema_digest

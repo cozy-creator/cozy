@@ -24,7 +24,7 @@ use std::time::Instant;
 
 use crate::checkpoint;
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::header::{Body, Header, Located, Part};
+use crate::header::{Asset, Body, Header, Located, Part};
 use crate::ids::ObjectRef;
 use crate::manifest::Manifest;
 use crate::meta::{Hold, Meta};
@@ -339,6 +339,63 @@ pub fn read_into(lease: &ReadLease, r: &ObjectRange, buf: &mut [u8]) -> Result<(
             detail: format!("pread {}: {e}", r.obj.id()),
         }),
     }
+}
+
+/// Reassemble one header-declared asset through this lease's already verified descriptors.
+/// `max_bytes` is the caller's allocation bound; assets above it refuse before allocation.
+pub fn read_asset(lease: &ReadLease, name: &str, asset: &Asset, max_bytes: u64) -> Result<Vec<u8>> {
+    if asset.logical_length > max_bytes {
+        return refuse(
+            Code::SIZE_CAP,
+            format!(
+                "asset {name:?} is {} B, above the caller's {max_bytes} B bound",
+                asset.logical_length
+            ),
+        );
+    }
+    let length = usize::try_from(asset.logical_length).map_err(|_| Refusal {
+        code: Code::SIZE_CAP,
+        detail: format!("asset {name:?} length does not fit this platform"),
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).map_err(|error| Refusal {
+        code: Code::SIZE_CAP,
+        detail: format!("asset {name:?}: cannot allocate {length} B: {error}"),
+    })?;
+    bytes.resize(length, 0);
+
+    let mut offset = 0usize;
+    for segment in &asset.segments {
+        let segment_length = usize::try_from(segment.length).map_err(|_| Refusal {
+            code: Code::SIZE_CAP,
+            detail: format!("asset {name:?}: segment length does not fit this platform"),
+        })?;
+        let end = offset.checked_add(segment_length).ok_or_else(|| Refusal {
+            code: Code::ARITH_OVERFLOW,
+            detail: format!("asset {name:?}: segment offsets overflow"),
+        })?;
+        read_into(
+            lease,
+            &ObjectRange {
+                obj: segment.clone(),
+                off: 0,
+                len: segment.length,
+            },
+            &mut bytes[offset..end],
+        )?;
+        offset = end;
+    }
+    let digest = crate::sha256::hex_digest(&bytes);
+    if offset as u64 != asset.logical_length || digest != asset.logical_sha256 {
+        return refuse(
+            Code::WHOLE_DIGEST_MISMATCH,
+            format!(
+                "asset {name:?}: reassembled {offset} B sha256:{digest}, header claims {} B sha256:{}",
+                asset.logical_length, asset.logical_sha256
+            ),
+        );
+    }
+    Ok(bytes)
 }
 
 /// A sequential helper over one storage-part run: the part's declared geometry locates the
