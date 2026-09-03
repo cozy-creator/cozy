@@ -111,12 +111,9 @@ fn a_model_asset_reads_through_the_cozytensors_lease() {
     let segments = parts
         .iter()
         .map(|bytes| {
+            let mut source = *bytes;
             store
-                .put_stream(
-                    &mut bytes.as_ref(),
-                    Some(&ObjectRef::of(bytes)),
-                    &Fault::default(),
-                )
+                .put_stream(&mut source, Some(&ObjectRef::of(bytes)), &Fault::default())
                 .unwrap()
                 .obj
         })

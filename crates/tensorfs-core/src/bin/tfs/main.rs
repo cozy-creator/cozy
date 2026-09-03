@@ -1520,10 +1520,8 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
 
     // A spec object present in the closure that this runtime's pin does not alias: valid
     // DATA, unsupported EXECUTION. `header` accepts the same bytes; only serving refuses.
-    let foreign = {
-        let s = seed_spec("plain/1", 0);
-        s
-    };
+    let mut foreign = seed_spec("plain/1", 0);
+    foreign.vectors = None;
     let hf = Header {
         configs: vec![],
         assets: vec![],
