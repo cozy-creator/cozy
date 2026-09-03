@@ -1,17 +1,18 @@
 //! The fetch/admit plane (tfs-003 row 220, cr-016's `pull`). Bytes are ARRIVING, and
-//! nothing about arriving bytes is known until the last one is hashed, so:
 //! nothing about arriving bytes is known until the last one is hashed, so the authorization
 //! is an EXPECTATION and the thing that enforces it is `Store::put_stream` — a streaming,
 //! bounded-buffer, no-clobber door that commits at the digest it computed or commits
 //! nothing. There is no second admission path and this module does not add one.
 //!
-//! **TensorFS never sees a presigned URL or a worker credential** (boundaries.md §2). A
-//! `DeliveryGrant` carries a digest and a length and nothing else. The caller's transport
-//! adapter — `HTTP/R2 fetch with attempt authority`, boundaries.md §9's placement row, owned
-//! by cozy-runtime — holds the URL, opens the connection, and hands the border a byte
-//! stream. So the same grant admits bytes from tensorhub, from a mirror, from a pod-local
-//! file or from a pipe, and the border cannot tell the difference, which is the point: the
-//! digest is the only authority.
+//! **The digest is the only authority and `put_stream` is the only door** (tfs-048). A
+//! `DeliveryGrant` carries a digest and a length and nothing else, so the same grant admits
+//! bytes from tensorhub, from a mirror, from a foreign provider, from a pod-local file or
+//! from a pipe, and the border cannot tell the difference: origin is indistinguishable and
+//! irrelevant. This header used to claim "TensorFS never sees a presigned URL or a worker
+//! credential" as the invariant; that conflated layering with security, and it bought three
+//! transport implementations in three consumers, not a security property. The one transport
+//! lives in `transport`, beside this plane, and what it moves still enters through exactly
+//! this door.
 //!
 //! **Idempotency is a computed fact, not a client's guess.** `FetchPlan::of` splits a
 //! declared object set into HELD and WANTED against a real store, and a caller that fetches
@@ -99,7 +100,9 @@ impl Presence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchPlan {
     pub session: String,
-    pub manifest: ObjectRef,
+    /// The Manifest anchoring a checkpoint pull, or None for a bare object set — raw
+    /// foreign-source members have no Manifest until preparation authors one (th-124).
+    pub manifest: Option<ObjectRef>,
     /// Sorted unique by digest. Present and trustworthy: NOT fetched.
     pub held: Vec<ObjectRef>,
     /// Sorted unique by digest. The only objects a grant may be minted for.
@@ -115,8 +118,29 @@ impl FetchPlan {
         manifest: &ObjectRef,
         declared: &[ObjectRef],
     ) -> Result<(FetchPlan, Vec<(ObjectRef, Presence)>)> {
+        Self::plan(store, session, Some(manifest), declared)
+    }
+
+    /// The same split over a bare object set: no Manifest anchors it and none is fetched.
+    /// `complete` then proves per-object residency instead of a closure walk.
+    pub fn of_objects(
+        store: &Store,
+        session: &str,
+        declared: &[ObjectRef],
+    ) -> Result<(FetchPlan, Vec<(ObjectRef, Presence)>)> {
+        Self::plan(store, session, None, declared)
+    }
+
+    fn plan(
+        store: &Store,
+        session: &str,
+        manifest: Option<&ObjectRef>,
+        declared: &[ObjectRef],
+    ) -> Result<(FetchPlan, Vec<(ObjectRef, Presence)>)> {
         ascii_name("FetchPlan.session", session, limits::MAX_NAME_BYTES)?;
-        validate_manifest_ref(manifest)?;
+        if let Some(manifest) = manifest {
+            validate_manifest_ref(manifest)?;
+        }
         if declared.is_empty() {
             return refuse(
                 Code::MISSING_FIELD,
@@ -134,16 +158,18 @@ impl FetchPlan {
                  bytes this pull moves",
             );
         }
-        if !sorted.iter().any(|object| object.sha256 == manifest.sha256) {
-            sorted.push(manifest.clone());
-            sorted.sort_by(|left, right| left.sha256.cmp(&right.sha256));
+        if let Some(manifest) = manifest {
+            if !sorted.iter().any(|object| object.sha256 == manifest.sha256) {
+                sorted.push(manifest.clone());
+                sorted.sort_by(|left, right| left.sha256.cmp(&right.sha256));
+            }
         }
         let mut held = Vec::new();
         let mut wanted = Vec::new();
         let mut why = Vec::new();
         for o in sorted {
             hex64("FetchPlan.object", &o.sha256)?;
-            let p = if o.sha256 == manifest.sha256 {
+            let p = if manifest.is_some_and(|m| m.sha256 == o.sha256) {
                 manifest_presence(store, &o)?
             } else {
                 presence(store, &o)?
@@ -158,7 +184,7 @@ impl FetchPlan {
         Ok((
             FetchPlan {
                 session: session.to_string(),
-                manifest: manifest.clone(),
+                manifest: manifest.cloned(),
                 held,
                 wanted,
             },
@@ -200,23 +226,28 @@ impl FetchPlan {
         store: &Store,
         walk: fn(&Store, &crate::manifest::Manifest) -> Result<crate::checkpoint::Walk>,
     ) -> Result<()> {
-        let manifest = store.read_manifest(&self.manifest)?;
-        let reached = walk(store, &manifest)?;
-        let mut declared: Vec<ObjectRef> = self.held.iter().chain(&self.wanted).cloned().collect();
-        declared
-            .sort_by(|left, right| (&left.sha256, left.length).cmp(&(&right.sha256, right.length)));
-        let mut actual: Vec<ObjectRef> = reached.distinct().into_iter().cloned().collect();
-        actual.push(self.manifest.clone());
-        actual
-            .sort_by(|left, right| (&left.sha256, left.length).cmp(&(&right.sha256, right.length)));
-        if declared != actual {
-            return refuse(
-                Code::NOT_CONTAINED,
-                "fetch plan blob set differs from the admitted manifest closure",
-            );
+        if let Some(manifest_ref) = &self.manifest {
+            let manifest = store.read_manifest(manifest_ref)?;
+            let reached = walk(store, &manifest)?;
+            let mut declared: Vec<ObjectRef> =
+                self.held.iter().chain(&self.wanted).cloned().collect();
+            declared.sort_by(|left, right| {
+                (&left.sha256, left.length).cmp(&(&right.sha256, right.length))
+            });
+            let mut actual: Vec<ObjectRef> = reached.distinct().into_iter().cloned().collect();
+            actual.push(manifest_ref.clone());
+            actual.sort_by(|left, right| {
+                (&left.sha256, left.length).cmp(&(&right.sha256, right.length))
+            });
+            if declared != actual {
+                return refuse(
+                    Code::NOT_CONTAINED,
+                    "fetch plan blob set differs from the admitted manifest closure",
+                );
+            }
         }
         for o in self.held.iter().chain(self.wanted.iter()) {
-            let resident = if o.sha256 == self.manifest.sha256 {
+            let resident = if self.manifest.as_ref().is_some_and(|m| m.sha256 == o.sha256) {
                 manifest_presence(store, o)?
             } else {
                 presence(store, o)?
@@ -279,8 +310,14 @@ impl FetchPlan {
             held.push(ObjectRef::from_value("FetchPlan.held", o)?);
         }
         let session = f.req_str("session")?.to_string();
-        let manifest = ObjectRef::from_value("FetchPlan.manifest", f.req("manifest")?)?;
-        validate_manifest_ref(&manifest)?;
+        let manifest = match f.opt("manifest") {
+            Some(value) => {
+                let parsed = ObjectRef::from_value("FetchPlan.manifest", value)?;
+                validate_manifest_ref(&parsed)?;
+                Some(parsed)
+            }
+            None => None,
+        };
         let mut wanted = Vec::new();
         for o in as_arr("FetchPlan", "wanted", f.req("wanted")?)? {
             wanted.push(ObjectRef::from_value("FetchPlan.wanted", o)?);
@@ -311,18 +348,21 @@ impl FetchPlan {
     }
 
     pub fn to_value(&self) -> Value {
-        Value::obj(vec![
+        let mut fields = vec![
             (
                 "held",
                 Value::arr(self.held.iter().map(|o| o.to_value()).collect()),
             ),
             ("session", Value::str(self.session.clone())),
-            ("manifest", self.manifest.to_value()),
             (
                 "wanted",
                 Value::arr(self.wanted.iter().map(|o| o.to_value()).collect()),
             ),
-        ])
+        ];
+        if let Some(manifest) = &self.manifest {
+            fields.push(("manifest", manifest.to_value()));
+        }
+        Value::obj(fields)
     }
 }
 
@@ -395,7 +435,7 @@ impl DeliveryGrant {
             Some(o) => Ok(DeliveryGrant {
                 session: plan.session.clone(),
                 object: o.clone(),
-                manifest: o.sha256 == plan.manifest.sha256,
+                manifest: plan.manifest.as_ref().is_some_and(|m| m.sha256 == o.sha256),
             }),
         }
     }
@@ -767,5 +807,96 @@ impl DeliveryGrant {
             ("object", self.object.to_value()),
             ("session", Value::str(self.session.clone())),
         ])
+    }
+}
+
+#[cfg(test)]
+mod object_set_tests {
+    use super::*;
+    use crate::store::Fault;
+    use std::fs;
+
+    fn temporary(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tensorfs-fetch-objects-{name}-{}-{}",
+            std::process::id(),
+            crate::meta::now_nanos_unique()
+        ))
+    }
+
+    #[test]
+    fn bare_object_set_splits_admits_and_completes() {
+        let root = temporary("split");
+        let store = Store::init(&root).unwrap();
+        let held_bytes = b"a member the store already holds".to_vec();
+        let held_ref = ObjectRef::of(&held_bytes);
+        store
+            .put_stream(
+                &mut held_bytes.as_slice(),
+                Some(&held_ref),
+                &Fault::default(),
+            )
+            .unwrap();
+        let wanted_bytes = b"a member the store does not hold".to_vec();
+        let wanted_ref = ObjectRef::of(&wanted_bytes);
+
+        let declared = vec![held_ref.clone(), wanted_ref.clone()];
+        let (plan, why) = FetchPlan::of_objects(&store, "members", &declared).unwrap();
+        assert_eq!(plan.manifest, None);
+        assert_eq!(plan.held, vec![held_ref.clone()]);
+        assert_eq!(plan.wanted, vec![wanted_ref.clone()]);
+        assert!(why
+            .iter()
+            .any(|(o, p)| o == &wanted_ref && *p == Presence::Absent));
+
+        // The document round-trips without a manifest field.
+        let parsed = FetchPlan::parse(&plan.canonical_bytes()).unwrap();
+        assert_eq!(parsed, plan);
+
+        // Incomplete until the wanted member lands; a held member cannot be re-granted.
+        assert_eq!(
+            plan.complete(&store).unwrap_err().code,
+            Code::DURABILITY_UNPROVEN
+        );
+        assert_eq!(
+            DeliveryGrant::mint(&plan, &held_ref).unwrap_err().code,
+            Code::NOT_CONTAINED
+        );
+        let grant = DeliveryGrant::mint(&plan, &wanted_ref).unwrap();
+        assert!(!grant.manifest);
+        grant.admit(&store, &mut wanted_bytes.as_slice()).unwrap();
+        plan.complete(&store).unwrap();
+
+        // The warm replay: the same declaration now wants NOTHING.
+        let (warm, _) = FetchPlan::of_objects(&store, "members", &declared).unwrap();
+        assert_eq!(warm.wanted, Vec::new());
+        assert_eq!(warm.held.len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corrupt_member_heals_into_wanted() {
+        let root = temporary("heal");
+        let store = Store::init(&root).unwrap();
+        let bytes = b"bytes that will rot on disk".to_vec();
+        let object = ObjectRef::of(&bytes);
+        store
+            .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
+            .unwrap();
+        let path = store.blob_path(&object.sha256);
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
+        fs::set_permissions(&path, permissions).unwrap();
+        fs::write(&path, vec![b'x'; bytes.len()]).unwrap();
+
+        let (plan, why) =
+            FetchPlan::of_objects(&store, "heal", std::slice::from_ref(&object)).unwrap();
+        assert!(matches!(why[0].1, Presence::CorruptRemoved { .. }));
+        assert_eq!(plan.wanted, vec![object.clone()]);
+        assert!(!path.exists());
+        let grant = DeliveryGrant::mint(&plan, &object).unwrap();
+        grant.admit(&store, &mut bytes.as_slice()).unwrap();
+        plan.complete(&store).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 }

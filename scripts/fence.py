@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """The two architecture fences boundaries.md actually mandates.
 
-1. forbidden dependencies — core is torch/CUDA/HTTP/TLS/server-DB/hub-free
+1. forbidden dependencies — core is torch/CUDA/server-DB/hub-free. The ONE transport
+   (tfs-048/tfs-049) is the one exception: `rustls`/`webpki` serve `src/transport/` alone,
+   and every other HTTP/TLS stack stays denied everywhere so a second byte mover cannot
+   grow beside it.
 2. no upward imports    — core < py; a crate may name only lower ranks
 
 Everything else that lived here was a word blacklist over source text: it could not tell
@@ -17,8 +20,13 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 DENY = ["torch", "cudarc", "cust", "tch", "reqwest", "hyper", "ureq", "curl", "openssl",
-        "rustls", "native-tls", "sqlx", "postgres", "tensorhub-v2",
+        "rustls", "native-tls", "webpki", "sqlx", "postgres", "tensorhub-v2",
         "cozy-creator-v2", "cozy-runtime-v2", "worker-protocol-v2"]
+#: The one transport's carve-out (tfs-049): these tokens are legal ONLY here.
+ALLOW = {
+    "rustls": ("crates/tensorfs-core/Cargo.toml", "crates/tensorfs-core/src/transport/"),
+    "webpki": ("crates/tensorfs-core/Cargo.toml", "crates/tensorfs-core/src/transport/"),
+}
 SCAN = ["crates/*/Cargo.toml", "crates/*/src/**/*.rs"]
 RANK = {"tensorfs-core": 0, "tensorfs-py": 1}
 
@@ -42,6 +50,8 @@ def fence_dependencies():
                 for i, s in lines(p):
                     for d in DENY:
                         if re.search(r"(?<![\w.-])" + re.escape(d) + r"(?![\w-])", s, re.I):
+                            if any(str(rel(p)).startswith(ok) for ok in ALLOW.get(d, ())):
+                                continue
                             bad.append(f"{rel(p)}:{i}: forbidden dependency '{d}': {s}")
     return bad, f"{len(DENY)} forbidden tokens over {len(SCAN)} globs"
 

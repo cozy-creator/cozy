@@ -2163,7 +2163,13 @@ pub fn fetch_plan<'p>(
     }
     let result = PyDict::new(py);
     result.set_item("session", &plan.session)?;
-    result.set_item("manifest", plan.manifest.id())?;
+    result.set_item(
+        "manifest",
+        plan.manifest
+            .as_ref()
+            .expect("fetch_plan is built with a manifest")
+            .id(),
+    )?;
     result.set_item("held", objects(&plan.held)?)?;
     result.set_item("wanted", objects(&plan.wanted)?)?;
     result.set_item("wanted_bytes", plan.wanted_bytes())?;
@@ -2223,4 +2229,82 @@ pub fn fetch_complete_cozytensors(py: Python<'_>, store: &PyStore, plan: &[u8]) 
     py.detach(|| plan.complete_cozytensors(&store.store))
         .or_refuse(py)?;
     Ok(plan.declared_bytes())
+}
+
+/// The ONE transport, from Python (tfs-050): ask for a repo, get a store that has it.
+/// cozy-runtime sheds its own downloader (cr-090); this call IS the mover — closure,
+/// plan against the real store, presign for exactly `wanted`, the 16-way walk, and the
+/// completion proof, all in the compiled core.
+///
+/// `credential` is the one spelling (`bearer <token>` | `delegation <payload> <sig>` |
+/// empty), scoped to the hub's host. `timeout` is the caller's deadline or None for none —
+/// nothing below invents a number of seconds. `sample_seconds` is the liveness ledger's
+/// RESOLUTION (configuration, never a verdict); leave it defaulted outside tests.
+#[pyfunction]
+#[pyo3(signature = (store, hub, refspec, *, lane=String::new(), credential=String::new(),
+       timeout=None, session=String::new(), streams=tensorfs_core::transport::STREAMS,
+       allowed_hosts=Vec::new(), allow_local=false, sample_seconds=None))]
+#[allow(clippy::too_many_arguments)]
+pub fn pull<'p>(
+    py: Python<'p>,
+    store: &PyStore,
+    hub: &str,
+    refspec: &str,
+    lane: String,
+    credential: String,
+    timeout: Option<f64>,
+    session: String,
+    streams: usize,
+    allowed_hosts: Vec<String>,
+    allow_local: bool,
+    sample_seconds: Option<f64>,
+) -> PyResult<Bound<'p, PyDict>> {
+    use tensorfs_core::transport;
+    let hub_host = transport::base_host(hub).or_refuse(py)?;
+    let scoped = transport::credential_from_spec(&credential, vec![hub_host]).or_refuse(py)?;
+    let policy = transport::SourcePolicy {
+        allowed_hosts,
+        allow_local,
+        max_redirects: 0,
+    };
+    let report = py
+        .detach(|| {
+            let mut request =
+                transport::PullRequest::new(&store.store, hub, refspec, &scoped, &policy);
+            request.lane = &lane;
+            request.session = &session;
+            request.streams = streams;
+            request.deadline = transport::Deadline::after_seconds(timeout);
+            if let Some(sample) = sample_seconds {
+                request.sample_seconds = sample;
+            }
+            transport::pull(&request)
+        })
+        .or_refuse(py)?;
+    let result = PyDict::new(py);
+    result.set_item("ref", &report.refspec)?;
+    result.set_item("model", &report.model)?;
+    result.set_item("release", &report.release)?;
+    result.set_item("lane", &report.lane)?;
+    result.set_item("manifest", &report.manifest)?;
+    result.set_item("session", &report.session)?;
+    result.set_item("store", store.store.root().display().to_string())?;
+    result.set_item("streams", report.streams)?;
+    result.set_item("declared", report.declared)?;
+    result.set_item("held", report.held)?;
+    result.set_item("fetched", report.fetched)?;
+    result.set_item("bytes_moved", report.bytes_moved)?;
+    result.set_item("bytes_held", report.bytes_held)?;
+    result.set_item("bytes_total", report.bytes_total)?;
+    let presence = PyDict::new(py);
+    for (id, why) in &report.presence {
+        presence.set_item(id, why)?;
+    }
+    result.set_item("presence", presence)?;
+    let stamps = PyDict::new(py);
+    for (key, values) in &report.stamps {
+        stamps.set_item(key, values.clone())?;
+    }
+    result.set_item("stamps", stamps)?;
+    Ok(result)
 }

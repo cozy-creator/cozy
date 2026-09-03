@@ -166,6 +166,15 @@ codes![
     SNAPSHOT_PINNED,
     STORE_BUSY,
     DURABILITY_UNPROVEN,
+    // transport (tfs-049): the one byte mover; every byte it moves still enters put_stream
+    SOURCE_NOT_ALLOWED,
+    REDIRECT_REFUSED,
+    HUB_UNREACHABLE,
+    HUB_REFUSED,
+    REF_NOT_FOUND,
+    CREDENTIAL_REQUIRED,
+    TRANSFER_FAILED,
+    DEADLINE_EXCEEDED,
     // repository graph
     REPOSITORY_FULL,
     REPOSITORY_CONFLICT,

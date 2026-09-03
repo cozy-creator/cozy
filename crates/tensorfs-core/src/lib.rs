@@ -37,4 +37,5 @@ pub mod sha256;
 pub mod spec;
 pub mod storage;
 pub mod store;
+pub mod transport;
 pub mod vectors;

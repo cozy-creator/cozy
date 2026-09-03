@@ -76,7 +76,7 @@ pub fn cmd_plan(root: &Path, manifest_p: &Path, session: &str, flags: &Flags) ->
         tensorfs_core::ids::object_id(&plan.canonical_bytes())
     );
     println!("session      {}", plan.session);
-    println!("manifest     {}", plan.manifest.id());
+    println!("manifest     {}", manifest.id());
     println!(
         "held         {} object(s), {} B — NOT fetched",
         plan.held.len(),
@@ -137,11 +137,249 @@ pub fn cmd_complete(root: &Path, plan_p: &Path) -> ExitCode {
     let store = ok!(Store::open(root));
     let plan = ok!(FetchPlan::parse(&read!(plan_p)));
     ok!(plan.complete(&store));
-    println!("complete     {}", plan.manifest.id());
+    match &plan.manifest {
+        Some(manifest) => println!("complete     {}", manifest.id()),
+        None => println!(
+            "complete     {} object(s), no manifest anchor",
+            plan.held.len() + plan.wanted.len()
+        ),
+    }
     println!(
         "resident     {} object(s), {} B, every one verifiably local",
         plan.held.len() + plan.wanted.len(),
         plan.declared_bytes()
+    );
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------- the one transport (tfs-050)
+
+use tensorfs_core::transport::{
+    self, credential_from_spec, Anonymous, Deadline, PullRequest, SourcePolicy,
+};
+
+fn policy_of(flags: &Flags) -> SourcePolicy {
+    SourcePolicy {
+        allowed_hosts: crate::flag(flags, "allow-hosts")
+            .map(|hosts| {
+                hosts
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        allow_local: crate::flag_on(flags, "allow-local"),
+        max_redirects: crate::flag_num(flags, "max-redirects", 0u32),
+    }
+}
+
+fn deadline_of(flags: &Flags) -> Deadline {
+    Deadline::after_seconds(crate::flag(flags, "timeout").and_then(|t| t.parse::<f64>().ok()))
+}
+
+/// The ONE credential spelling, reaching the child explicitly (tfs-050): `--credential-file
+/// <path>` or the deliberately-set `TFS_CREDENTIAL` — never argv (world-readable in /proc),
+/// never the inherited environment at large. The value is `bearer <token>` or
+/// `delegation <payload> <signature>`, scoped to exactly the named hosts.
+fn credential_of(
+    flags: &Flags,
+    hosts: Vec<String>,
+) -> Result<tensorfs_core::transport::ScopedHeaders, ExitCode> {
+    let spec = match flag(flags, "credential-file") {
+        Some(path) => match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("REFUSED IO_FAILED: read {path}: {error}");
+                return Err(ExitCode::FAILURE);
+            }
+        },
+        None => std::env::var("TFS_CREDENTIAL").unwrap_or_default(),
+    };
+    match credential_from_spec(spec.trim(), hosts) {
+        Ok(credential) => Ok(credential),
+        Err(refusal) => {
+            eprintln!("REFUSED {refusal}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// `tfs fetch <root> <ref>` — closure, plan against the REAL store, presign for exactly
+/// `wanted`, the N-way walk, the completion proof. A warm store asks one question and
+/// moves nothing.
+pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
+    let store = ok!(Store::open(root));
+    let Some(base) = flag(flags, "hub") else {
+        eprintln!("--hub <base-url> is required");
+        return ExitCode::from(2);
+    };
+    let hub_host = match transport::base_host(base) {
+        Ok(host) => host,
+        Err(refusal) => return bail(refusal),
+    };
+    let credential = match credential_of(flags, vec![hub_host]) {
+        Ok(credential) => credential,
+        Err(code) => return code,
+    };
+    let policy = policy_of(flags);
+    let mut request = PullRequest::new(&store, base, refspec, &credential, &policy);
+    request.lane = flag(flags, "lane").unwrap_or("");
+    request.session = flag(flags, "session").unwrap_or("");
+    request.streams = crate::flag_num(flags, "streams", transport::STREAMS);
+    request.deadline = deadline_of(flags);
+    let report = ok!(transport::pull(&request));
+    println!(
+        "model        {}@{} lane {}",
+        report.model, report.release, report.lane
+    );
+    println!("manifest     {}", report.manifest);
+    println!(
+        "held         {} object(s), {} B — NOT fetched",
+        report.held, report.bytes_held
+    );
+    println!(
+        "fetched      {} object(s), {} B, {} stream(s)",
+        report.fetched, report.bytes_moved, report.streams
+    );
+    println!("complete     every declared object verifiably local");
+    ExitCode::SUCCESS
+}
+
+/// `tfs fetch plan-objects <root> <session> --refs <jsonl>` — the HELD/WANTED split over a
+/// bare object set (th-124: raw foreign-source members have no Manifest until preparation
+/// authors one).
+pub fn cmd_plan_objects(root: &Path, session: &str, flags: &Flags) -> ExitCode {
+    let store = ok!(Store::open(root));
+    let Some(refs_path) = flag(flags, "refs") else {
+        eprintln!("--refs <jsonl> is required");
+        return ExitCode::from(2);
+    };
+    let refs = ok!(fetch::parse_refs_jsonl(&read!(Path::new(refs_path))));
+    let (plan, why) = ok!(FetchPlan::of_objects(&store, session, &refs));
+    emit_bytes(&plan.canonical_bytes(), flags);
+    println!(
+        "plan         {}",
+        tensorfs_core::ids::object_id(&plan.canonical_bytes())
+    );
+    println!("session      {}", plan.session);
+    println!(
+        "held         {} object(s), {} B — NOT fetched",
+        plan.held.len(),
+        plan.held_bytes()
+    );
+    println!(
+        "wanted       {} object(s), {} B",
+        plan.wanted.len(),
+        plan.wanted_bytes()
+    );
+    if crate::flag_on(flags, "why") {
+        for (o, p) in &why {
+            println!("             {} {}", p.as_str(), o.id());
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `tfs fetch url <root> <sha256> <length> <url|->` — plan-of-one, then the one transport
+/// into `put_stream`. A held object answers `held` and moves nothing. A url of `-` reads
+/// the real URL as one line on stdin: a capability URL can embed a signature, and argv is
+/// world-readable in /proc.
+pub fn cmd_url(root: &Path, id: &str, length: &str, url: &str, flags: &Flags) -> ExitCode {
+    use std::io::BufRead;
+    let store = ok!(Store::open(root));
+    let stdin_url;
+    let url = if url == "-" {
+        let mut line = String::new();
+        if io::stdin().lock().read_line(&mut line).is_err() {
+            eprintln!("REFUSED SOURCE_NOT_ALLOWED: could not read the URL from stdin");
+            return ExitCode::FAILURE;
+        }
+        stdin_url = line.trim().to_string();
+        stdin_url.as_str()
+    } else {
+        url
+    };
+    let sha256 = ok!(tensorfs_core::ids::hex64("fetch url object", id));
+    let Ok(length) = length.parse::<u64>() else {
+        eprintln!("length must be a byte count");
+        return ExitCode::from(2);
+    };
+    let object = ObjectRef { sha256, length };
+    let session = flag(flags, "session").unwrap_or("fetch-url");
+    let (plan, _) = ok!(FetchPlan::of_objects(
+        &store,
+        session,
+        std::slice::from_ref(&object)
+    ));
+    if plan.held.iter().any(|held| held.sha256 == object.sha256) {
+        println!("held         {}", object.id());
+        println!("transferred  0 B");
+        return ExitCode::SUCCESS;
+    }
+    let grant = ok!(fetch::DeliveryGrant::mint(&plan, &object));
+    let ledger = transport::Ledger::new();
+    let fetched = ok!(transport::fetch_url(
+        &store,
+        &grant,
+        url,
+        &policy_of(flags),
+        &Anonymous,
+        deadline_of(flags),
+        &ledger,
+        None,
+    ));
+    println!("admitted     {}", fetched.admitted.object.id());
+    println!("transferred  {} B", fetched.transferred);
+    ExitCode::SUCCESS
+}
+
+/// `tfs push <root> <sha256> --url <presigned|-> [--manifest]` — the upload half: one
+/// verified store object to one exact presigned destination, 412 a success under
+/// `If-None-Match: *`.
+pub fn cmd_push(root: &Path, id: &str, flags: &Flags) -> ExitCode {
+    use std::io::BufRead;
+    let store = ok!(Store::open(root));
+    let sha256 = ok!(tensorfs_core::ids::hex64("push object", id));
+    let Some(url_flag) = flag(flags, "url") else {
+        eprintln!("--url <presigned-put|-> is required");
+        return ExitCode::from(2);
+    };
+    let stdin_url;
+    let url = if url_flag == "-" {
+        let mut line = String::new();
+        if io::stdin().lock().read_line(&mut line).is_err() {
+            eprintln!("REFUSED SOURCE_NOT_ALLOWED: could not read the URL from stdin");
+            return ExitCode::FAILURE;
+        }
+        stdin_url = line.trim().to_string();
+        stdin_url.as_str()
+    } else {
+        url_flag
+    };
+    let ledger = transport::Ledger::new();
+    let pushed = ok!(transport::push_object(
+        &store,
+        &sha256,
+        crate::flag_on(flags, "manifest"),
+        url,
+        &policy_of(flags),
+        &Anonymous,
+        deadline_of(flags),
+        &ledger,
+        flag(flags, "content-type").unwrap_or(""),
+    ));
+    println!("pushed       {}", pushed.object.id());
+    println!("status       HTTP {}", pushed.http_status);
+    println!(
+        "sent         {} B{}",
+        pushed.bytes_sent,
+        if pushed.landed_precondition {
+            " (the immutable key already held these exact bytes)"
+        } else {
+            ""
+        }
     );
     ExitCode::SUCCESS
 }
