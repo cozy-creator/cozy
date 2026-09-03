@@ -775,7 +775,7 @@ func (c *Orchestrator) issueLocalPackageSet(s *session, w *worker,
 	w.delegationExpiry = time.Time{} // local wheels travel as minted capabilities, not a delegation
 	w.desiredLocal = cloneLocalPackageSet(selected)
 	w.desiredPrivatePlacement = nil
-	w.desiredPackages, w.desiredModels = nil, nil
+	w.desiredPackages, w.desiredModels, w.desiredDelegations = nil, nil, nil
 	w.desiredEpoch = s.epoch
 	_, held := w.observedRemote[revision]
 	c.mu.Unlock()
@@ -850,7 +850,7 @@ func (c *Orchestrator) issuePrivatePlacementSet(s *session, w *worker,
 	}
 	c.mu.Lock()
 	w.delegationExpiry = delegationExpiryOf(selected.DownloadDelegation)
-	w.desiredLocal, w.desiredPackages, w.desiredModels = nil, nil, nil
+	w.desiredLocal, w.desiredPackages, w.desiredModels, w.desiredDelegations = nil, nil, nil, nil
 	w.desiredPrivatePlacement = clonePrivatePlacementSet(selected)
 	w.desiredEpoch = s.epoch
 	c.mu.Unlock()

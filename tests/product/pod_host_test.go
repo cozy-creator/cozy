@@ -11,9 +11,11 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"io"
@@ -70,6 +72,8 @@ type fakePod struct {
 	// serve makes every accepted placement_set converge at once: STAGED, DISPATCHABLE,
 	// every entrypoint advertised, one free seat. Offers are recorded, never answered.
 	serve bool
+	// slots is the advertised seat count while serving; zero means one.
+	slots uint32
 
 	mu            sync.Mutex
 	acks          []*pb.SnapshotAck
@@ -117,12 +121,16 @@ func (p *fakePod) served(d *pb.DesiredWorkerState, epoch uint64) *pb.WorkerFrame
 		}
 		placements = append(placements, row)
 	}
+	seats := uint32(1)
+	if p.slots > 1 {
+		seats = p.slots
+	}
 	return &pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: &pb.ObservedWorkerState{
 		RecordOwnerEpoch: d.RecordOwnerEpoch, ControlStreamEpoch: epoch, WorkerBootId: podBootID,
 		AcceptedDesiredStateRevision: d.Revision, ConvergedRevision: d.Revision,
 		AcceptedPlacementSetDigest: set.PlacementSetDigest,
 		WorkerPhase:                pb.WorkerPhase_WORKER_PHASE_ONLINE, AppliedWireMinor: pb.WireMinor,
-		AdmissionState: pb.AdmissionState_ADMISSION_STATE_OPEN, AdmissionEpoch: 7, AvailableAttemptSlots: 1,
+		AdmissionState: pb.AdmissionState_ADMISSION_STATE_OPEN, AdmissionEpoch: 7, AvailableAttemptSlots: seats,
 		Placements: placements,
 	}}}
 }
@@ -366,6 +374,12 @@ func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream g
 	return nil
 }
 
+// PreparePackageSet is the published package lane the way the pod actually runs it:
+// pod-supervisor downloads under the delegation and the Runtime prepares EXACTLY ONE
+// package per call — a delegation naming more than one is refused with the Runtime's own
+// verdict (run 146's failure text), and the prepared single placement is derived from
+// the delegation the way the Runtime derives it, placement_id seeded from the exact
+// delegation bytes.
 func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
 	if err := p.verifyClaim(call.Claim, false); err != nil {
 		p.mu.Lock()
@@ -376,31 +390,43 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 	if call.PackageSet == nil || len(call.PackageSet.DownloadDelegationSignature) != ed25519.SignatureSize {
 		return status.Error(codes.InvalidArgument, "no signed delegation")
 	}
-	if _, err := canonical.Read(call.PackageSet.DownloadDelegation, &pb.DownloadDelegation{}); err != nil {
+	delegation, err := canonical.Read(call.PackageSet.DownloadDelegation, &pb.DownloadDelegation{})
+	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "delegation: %v", err)
 	}
 	p.mu.Lock()
 	p.prepares = append(p.prepares, call)
 	p.mu.Unlock()
-	setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{{
-		PlacementId: "plc-pod-1",
-		PackageMode: &pb.Placement_Package{Package: &pb.PackageSelection{Package: "cozy/h3-package", Release: "1.0.7",
-			ReleaseDigest: bytes.Repeat([]byte{0x21}, 32),
-			ProjectWheel: &pb.WheelFact{Ref: &pb.Ref{Digest: bytes.Repeat([]byte{0x22}, 32), Length: 4096},
-				Distribution: "h3-package", Version: "1.0.7", Filename: "h3_package-1.0.7-py3-none-any.whl",
-				ImportRoots: []string{"h3_package"}, Tags: []string{"py3-none-any"}}}},
-		EnvironmentDigest: bytes.Repeat([]byte{0x23}, 32),
-		PackageDescriptor: &pb.Ref{Digest: bytes.Repeat([]byte{0x24}, 32), Length: 2048},
-		BindingsDigest:    bytes.Repeat([]byte{0x25}, 32),
-		Environment:       &pb.Environment{},
-	}}})
+	total := uint64(18_874_368)
+	selected := delegation.List("packages")
+	if len(selected) != 1 {
+		for _, event := range []*pb.PrepareEvent{
+			{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED, TotalBytes: total},
+			{Stage: pb.PrepareStage_PREPARE_STAGE_REFUSED, TotalBytes: total,
+				SafeCode: "runtime_preparation_failed", SafeDetail: "package_prepare_selection_invalid: " +
+					"exactly one package and a model array are required"},
+		} {
+			if err := stream.Send(event); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	name, release := selected[0].Str("package"), selected[0].Str("release")
+	releaseDigest, err := canonical.Raw(selected[0].Str("release_digest"))
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "release digest: %v", err)
+	}
+	distribution := name[strings.IndexByte(name, '/')+1:]
+	setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{
+		podPlacement(call.PackageSet.DownloadDelegation, name, release, releaseDigest, distribution),
+	}})
 	if err != nil {
 		return err
 	}
 	p.mu.Lock()
 	p.preparedSet, p.preparedDig = setBytes, setDigest
 	p.mu.Unlock()
-	total := uint64(18_874_368)
 	for _, event := range []*pb.PrepareEvent{
 		{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED, TotalBytes: total},
 		{Stage: pb.PrepareStage_PREPARE_STAGE_DOWNLOADING, TotalBytes: total, TransferredBytes: total / 2},
@@ -413,6 +439,34 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 		}
 	}
 	return nil
+}
+
+// podPlacement is the one placement a prepared package delegation yields, on the
+// Runtime's own derivations: `package-` + the first 24 hex of sha256 over the exact
+// delegation bytes, and one deterministic entrypoint per package so a test can name the
+// plan it will dispatch (podPlanID).
+func podPlacement(delegation []byte, name, release string, releaseDigest []byte, distribution string) *pb.Placement {
+	seed := sha256.Sum256(delegation)
+	return &pb.Placement{
+		PlacementId: "package-" + hex.EncodeToString(seed[:])[:24],
+		PackageMode: &pb.Placement_Package{Package: &pb.PackageSelection{Package: name, Release: release,
+			ReleaseDigest: releaseDigest,
+			ProjectWheel: &pb.WheelFact{Ref: &pb.Ref{Digest: sha256Of([]byte("wheel:" + name)), Length: 4096},
+				Distribution: distribution, Version: release,
+				Filename:    strings.ReplaceAll(distribution, "-", "_") + "-" + release + "-py3-none-any.whl",
+				ImportRoots: []string{strings.ReplaceAll(distribution, "-", "_")}, Tags: []string{"py3-none-any"}}}},
+		EnvironmentDigest: sha256Of([]byte("environment:" + name)),
+		PackageDescriptor: &pb.Ref{Digest: sha256Of([]byte("descriptor:" + name)), Length: 2048},
+		BindingsDigest:    sha256Of([]byte("bindings:" + name)),
+		Entrypoints:       []*pb.Entrypoint{{Name: "tile", EntrypointBindingDigest: sha256Of([]byte("entrypoint:" + name))}},
+		Environment:       &pb.Environment{},
+	}
+}
+
+// podPlanID is the plan a request binds to reach podPlacement's entrypoint for `name`.
+func podPlanID(name string) string {
+	spelled, _ := canonical.Spell(sha256Of([]byte("entrypoint:" + name)))
+	return spelled
 }
 
 // startFakePod mints the pod leaf, binds the pinned listener, and serves the media health

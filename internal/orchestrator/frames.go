@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -11,8 +10,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"google.golang.org/grpc"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -150,42 +147,189 @@ func mergePackageSet(currentPackages []*pb.DownloadPackageRef, currentModels []*
 	return clonePackageRefs(packages), cloneModelRefs(models)
 }
 
+// issuePackageSet prepares the desired logical set ONE PACKAGE PER PREPARE — the
+// Runtime's contract (package_prepare: exactly one package and a model array) — and sends
+// every prepared placement as the ONE full-replace set a rental hosting several package
+// environments converges to. Each package's delegation is signed once and reused
+// byte-for-byte while it lives and the boot stands: the pod's preparation ledger answers
+// a known delegation without re-downloading, and the Runtime seeds the placement_id from
+// the exact delegation bytes, so re-signing package A when package B joins would retire
+// a serving placement that changed in nothing but its credential.
 func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.DownloadPackageRef,
 	models []*pb.DownloadModelRef) *exit.Error {
 	if c.opt.RentalPackageSet == nil {
 		return exit.Named(exit.Unavailable, "rental.package_set_signer_missing",
 			"this Cozy daemon has no package_set signer")
 	}
-	delegation, signature, problem := c.opt.RentalPackageSet(w.spec.Connection, packages, models)
+	selections, problem := splitPackageSet(packages, models)
 	if problem != nil {
 		return problem
 	}
-	if len(delegation) == 0 || len(signature) != 64 {
-		return exit.Named(exit.Validation, "rental.delegation_incomplete",
-			"package_set requires canonical delegation bytes and one Ed25519 signature")
+	c.mu.Lock()
+	retained := w.desiredDelegations
+	bootID := ""
+	if w.spec.Connection != nil {
+		bootID = w.spec.Connection.WorkerBootID
 	}
-	document, err := canonical.Read(delegation, &pb.DownloadDelegation{})
-	if err != nil {
-		return exit.Named(exit.Validation, "rental.delegation_invalid",
-			"package_set delegation is not canonical: %s", err)
+	c.mu.Unlock()
+	now := time.Now()
+	signed := make(map[string]signedPackageDelegation, len(selections))
+	prepares := make([]packagePrepare, 0, len(selections))
+	var earliest time.Time
+	for _, selection := range selections {
+		key := selection.contentKey()
+		delegation, held := retained[selection.name]
+		if !held || delegation.contentKey != key || delegation.bootID != bootID ||
+			!now.Before(delegation.expiry) {
+			body, signature, problem := c.opt.RentalPackageSet(w.spec.Connection,
+				selection.packages, selection.models)
+			if problem != nil {
+				return problem
+			}
+			if len(body) == 0 || len(signature) != 64 {
+				return exit.Named(exit.Validation, "rental.delegation_incomplete",
+					"package_set requires canonical delegation bytes and one Ed25519 signature")
+			}
+			document, err := canonical.Read(body, &pb.DownloadDelegation{})
+			if err != nil {
+				return exit.Named(exit.Validation, "rental.delegation_invalid",
+					"package_set delegation is not canonical: %s", err)
+			}
+			delegation = signedPackageDelegation{
+				contentKey: key, bootID: bootID,
+				expiry:     time.Unix(document.Int("expires_at_unix"), 0),
+				delegation: body, signature: signature,
+			}
+		}
+		signed[selection.name] = delegation
+		if earliest.IsZero() || delegation.expiry.Before(earliest) {
+			earliest = delegation.expiry
+		}
+		prepares = append(prepares, packagePrepare{
+			label:      hostLabel("package_set", selection.name),
+			delegation: append([]byte(nil), delegation.delegation...),
+			signature:  append([]byte(nil), delegation.signature...),
+		})
 	}
 	c.mu.Lock()
-	w.delegationExpiry = time.Unix(document.Int("expires_at_unix"), 0)
+	w.delegationExpiry = earliest
 	w.desiredPackages = clonePackageRefs(packages)
 	w.desiredModels = cloneModelRefs(models)
-	w.desiredDelegation = append([]byte(nil), delegation...)
-	w.desiredDelegationSignature = append([]byte(nil), signature...)
+	w.desiredDelegations = signed
 	w.desiredLocal = nil
 	w.desiredPrivatePlacement = nil
 	c.mu.Unlock()
-	call := &pb.PreparePackageSetCall{Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
-		DownloadDelegation:          append([]byte(nil), delegation...),
-		DownloadDelegationSignature: append([]byte(nil), signature...),
-	}}
-	return c.issueThroughHost(s, w, hostLabel("package_set", fmt.Sprintf("%d packages, %d models", len(packages), len(models))),
-		func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
-			return s.host.PreparePackageSet(ctx, call)
-		})
+	return c.issuePackagePrepares(s, w,
+		hostLabel("package_set", fmt.Sprintf("%d packages, %d models", len(packages), len(models))), prepares)
+}
+
+// packageSelection is one package's slice of the desired logical set: its ref and the
+// models bound to it. Prepare is a per-package operation, so this is exactly what one
+// delegation authorizes and one PreparePackageSet call presents.
+type packageSelection struct {
+	name     string
+	packages []*pb.DownloadPackageRef
+	models   []*pb.DownloadModelRef
+}
+
+// contentKey is the selection's logical content — what a signed delegation binds beside
+// its expiry and worker identity. Equal keys authorize the same bytes.
+func (g packageSelection) contentKey() string {
+	var sb strings.Builder
+	for _, row := range g.packages {
+		sb.WriteString("p\x00" + row.Package + "\x00" + row.Release + "\x00" + row.ReleaseDigest + "\x01")
+	}
+	for _, row := range g.models {
+		sb.WriteString("m\x00" + row.Package + "\x00" + row.Slot + "\x00" + row.Model + "\x00" +
+			row.Release + "\x00" + row.Manifest + "\x01")
+	}
+	return sb.String()
+}
+
+// splitPackageSet gives every package of the merged logical set its own selection,
+// ordered by package name. Every model rides with its named package; a model naming no
+// selected package has no prepare to ride and is refused here, where the defect is
+// legible, rather than as a pod refusal.
+func splitPackageSet(packages []*pb.DownloadPackageRef,
+	models []*pb.DownloadModelRef) ([]packageSelection, *exit.Error) {
+	byName := map[string]*packageSelection{}
+	names := []string(nil)
+	for _, row := range packages {
+		if row == nil {
+			continue
+		}
+		if _, ok := byName[row.Package]; !ok {
+			byName[row.Package] = &packageSelection{name: row.Package}
+			names = append(names, row.Package)
+		}
+		byName[row.Package].packages = append(byName[row.Package].packages, row)
+	}
+	for _, row := range models {
+		if row == nil {
+			continue
+		}
+		selection, ok := byName[row.Package]
+		if !ok {
+			return nil, exit.Named(exit.Validation, "rental.package_set_model_orphaned",
+				"model %s names package %s, which the package_set does not select",
+				row.Model, row.Package)
+		}
+		selection.models = append(selection.models, row)
+	}
+	if len(names) == 0 {
+		return nil, exit.Named(exit.Validation, "rental.package_set_empty",
+			"package_set selects no package")
+	}
+	sort.Strings(names)
+	out := make([]packageSelection, 0, len(names))
+	for _, name := range names {
+		out = append(out, *byName[name])
+	}
+	return out, nil
+}
+
+// unitePreparedPlacementSets joins the per-package prepared sets into the ONE
+// full-replace PlacementSet this owner sends. A single preparation passes through
+// byte-exact — the Runtime's own authored bytes. A joined set is re-authored canonically
+// over the exact placement entries each preparation returned, sorted by placement_id so
+// the united document's identity does not depend on prepare order; the worker recomputes
+// the digest over these bytes before parsing (§4).
+func unitePreparedPlacementSets(sets []*pb.DesiredPlacementSet) (*pb.DesiredPlacementSet, error) {
+	if len(sets) == 1 {
+		return sets[0], nil
+	}
+	placements := make([]canonical.Value, 0, len(sets))
+	seen := map[string]bool{}
+	for _, set := range sets {
+		doc, err := canonical.Read(set.PlacementSetCanonicalBytes, &pb.PlacementSet{})
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range doc.List("placements") {
+			id := row.Str("placement_id")
+			if id == "" || seen[id] {
+				return nil, fmt.Errorf("prepared placement id %q is empty or duplicated", id)
+			}
+			seen[id] = true
+			placements = append(placements, row)
+		}
+	}
+	if len(placements) == 0 {
+		return nil, fmt.Errorf("the prepared sets carry no placements")
+	}
+	sort.Slice(placements, func(i, j int) bool {
+		return placements[i].(canonical.Doc).Str("placement_id") <
+			placements[j].(canonical.Doc).Str("placement_id")
+	})
+	data, err := canonical.Write(map[string]canonical.Value{
+		"format": canonical.Format(&pb.PlacementSet{}), "placements": placements,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &pb.DesiredPlacementSet{
+		PlacementSetDigest: canonical.Digest(data), PlacementSetCanonicalBytes: data,
+	}, nil
 }
 
 // delegationExpiryOf reads the lifetime out of the exact delegation bytes this owner is
@@ -199,6 +343,17 @@ func delegationExpiryOf(delegation []byte) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(document.Int("expires_at_unix"), 0)
+}
+
+// signedPackageDelegation is one package's exact signed download authority: the
+// canonical DownloadDelegation bytes, their signature, and the facts that decide reuse —
+// the logical content signed, the worker boot it binds, and its expiry.
+type signedPackageDelegation struct {
+	contentKey string
+	bootID     string
+	expiry     time.Time
+	delegation []byte
+	signature  []byte
 }
 
 func clonePackageRefs(in []*pb.DownloadPackageRef) []*pb.DownloadPackageRef {
@@ -1606,19 +1761,22 @@ func (c *Orchestrator) relayDescriptorDefect(w *worker, revision uint64, f *pb.F
 		return
 	}
 	if w.spec.Connection == nil || w.spec.Connection.RentalID == "" ||
-		len(w.desiredDelegation) == 0 || len(w.desiredPackages) != 1 ||
-		w.defectReportedRevision == revision {
+		len(w.desiredPackages) != 1 || w.defectReportedRevision == revision {
+		return
+	}
+	selected := w.desiredPackages[0]
+	signed, held := w.desiredDelegations[selected.Package]
+	if !held {
 		return
 	}
 	w.defectReportedRevision = revision
-	selected := w.desiredPackages[0]
 	report := ReleaseDefect{
 		Package:       selected.Package,
 		Release:       selected.Release,
 		ReleaseDigest: selected.ReleaseDigest,
 		RentalID:      w.spec.Connection.RentalID,
-		Delegation:    append([]byte(nil), w.desiredDelegation...),
-		Signature:     append([]byte(nil), w.desiredDelegationSignature...),
+		Delegation:    append([]byte(nil), signed.delegation...),
+		Signature:     append([]byte(nil), signed.signature...),
 		Code:          descriptorDefectCode,
 		Detail:        brief(f.Detail, 2048),
 	}
