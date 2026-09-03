@@ -702,7 +702,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 }
 
 func (c *Orchestrator) deferUnavailable(req records.Request, problem *exit.Error) bool {
-	if problem == nil || problem.Code != exit.Unavailable {
+	if !req.Rental || problem == nil || problem.Code != exit.Unavailable {
 		return false
 	}
 	position := c.QueuePosition(req.ID)

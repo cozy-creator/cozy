@@ -3,6 +3,7 @@ package producttest
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -77,24 +78,23 @@ func TestRentalHubOutageKeepsTheRequestQueued(t *testing.T) {
 func TestQueuedRequestSurvivesDaemonRestartAndDispatchesOnce(t *testing.T) {
 	var ready atomic.Bool
 	launcher := &restartLauncher{ready: &ready}
-	o := hostOwner(t, "queued-daemon-restart", func(options *orchestrator.Options) {
-		options.Packages = launcher
-	})
+	o := hostOwner(t, "queued-daemon-restart")
 	launcher.spec = fakeSpec("queued-daemon-restart", "0", "--arm", "output", "--cozy-home", o.root)
-	requestID, _, problem := o.c.Submit(submission(planIDOf(t, launcher.spec),
-		"fake/queued-daemon-restart", "queued-daemon-restart-1", map[string]any{"restart": true}))
-	fatal(t, problem)
-	deadline := time.Now().Add(5 * time.Second)
-	for launcher.calls.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if launcher.calls.Load() == 0 {
-		t.Fatal("the first daemon never attempted the queued launch")
-	}
-	if attempts, problem := o.store.Attempts(requestID); problem != nil || len(attempts) != 0 {
-		t.Fatalf("the unavailable first daemon minted an attempt: %#v (%s)", attempts, briefly(problem))
-	}
 	o.close()
+
+	// This is the crash seam: the submission transaction committed, while no live daemon had
+	// yet projected it into its in-memory queue.
+	before, problem := records.Open(o.l.DB)
+	fatal(t, problem)
+	requestID := "req-queued-daemon-restart"
+	_, _, problem = before.Submit(records.Request{
+		ID: requestID, IdemKey: "queued-daemon-restart-1",
+		BodyDigest: "sha256:" + strings.Repeat("ab", 32),
+		Package:    "fake/queued-daemon-restart", Entrypoint: "fake",
+		PlanID: planIDOf(t, launcher.spec), Payload: []byte(`{"restart":true}`), Outputs: "image",
+	})
+	fatal(t, problem)
+	before.Close()
 	ready.Store(true)
 
 	store, problem := records.Open(o.l.DB)
