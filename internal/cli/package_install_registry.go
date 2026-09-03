@@ -67,7 +67,9 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		existing.Close()
 		return problem
 	}
-	if existingInstall != nil && existingInstall.SourceDigest == releaseDigest {
+	if existingInstall != nil && existingInstall.SourceDigest == releaseDigest &&
+		!install.CompanionsStale(existingLayout.Companions,
+			filepath.Join(existingInstall.Dir, "venv")) {
 		defer existing.Close()
 		result := &install.Result{Install: *existingInstall, Idempotent: true}
 		modelScratch, problem := scratch.Temp(existingLayout.Tmp, "package-model-prefetch-")

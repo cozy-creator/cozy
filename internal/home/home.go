@@ -68,6 +68,11 @@ type Layout struct {
 	// LocalPackages holds exact ephemeral wheel revisions for rented local-package commands.
 	// It is staging the daemon alone writes, never a catalog or mutable checkout.
 	LocalPackages string
+	// Companions holds this host's CUDA-profile image-owned companion wheels — the
+	// local twin of what the base worker image bakes onto its exact NVIDIA CUDA
+	// profile (cr-086 arm 0). Install materialization joins any wheel here whose
+	// declared profile the host and the fresh venv both match; nothing else reads it.
+	Companions string
 	// Log is the Cozy daemon's own log: the orchestrator's words and the process's
 	// banner, bounded by rotation on an observed size (internal/daemon.OpenLog). Its one
 	// rotated predecessor is Log + ".1". Read with `cozy daemon log`.
@@ -105,6 +110,7 @@ func Open(root string) (Layout, *exit.Error) {
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
 	l.LocalPackages = filepath.Join(root, "local-packages")
+	l.Companions = filepath.Join(root, "companions")
 	l.Log = filepath.Join(root, "daemon.log")
 	// The revision store was `private-packages/` before the vocabulary hard-cut (proto-027).
 	// A root written by that build keeps what it holds: the directory moves, once, and the
@@ -119,7 +125,7 @@ func Open(root string) (Layout, *exit.Error) {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}
 	}
-	for _, dir := range []string{l.Inputs, l.Uploads, l.LocalPackages} {
+	for _, dir := range []string{l.Inputs, l.Uploads, l.LocalPackages, l.Companions} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}

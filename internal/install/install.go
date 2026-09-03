@@ -276,7 +276,8 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if e != nil {
 		return fail(e)
 	}
-	if prior != nil && priorInstall != nil && priorInstall.SourceDigest == inst.SourceDigest {
+	if prior != nil && priorInstall != nil && priorInstall.SourceDigest == inst.SourceDigest &&
+		!CompanionsStale(l.Companions, filepath.Join(priorInstall.Dir, "venv")) {
 		res.Idempotent = true
 		res.Install = *priorInstall
 		_ = os.RemoveAll(installDir)
@@ -328,7 +329,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if req.Published != nil {
 		descriptor, placement, inst.Runtime, env, err = preparePublished(l, installDir, req.Published)
 	} else {
-		env, err = MaterializeEnvironment(sourceDir, venvDir)
+		env, err = MaterializeEnvironment(sourceDir, venvDir, l.Companions)
 	}
 	if err != nil {
 		return guard(err)

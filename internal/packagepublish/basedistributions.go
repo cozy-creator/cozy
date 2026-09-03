@@ -42,9 +42,9 @@ var remoteBaseRoots = derivedBaseRoots()
 // must recognize the whole family by name.
 var remoteBasePrefixes = derivedBasePrefixes()
 
-// imageOwnedDistribution says whether a normalized distribution name is owned
+// ImageOwnedDistribution says whether a normalized distribution name is owned
 // by the worker image: a roster name or a member of a roster prefix family.
-func imageOwnedDistribution(name string) bool {
+func ImageOwnedDistribution(name string) bool {
 	if remoteBaseRoots[name] {
 		return true
 	}
