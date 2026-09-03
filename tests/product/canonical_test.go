@@ -326,7 +326,7 @@ func TestPackageInterface(t *testing.T) {
 
 	// Model inputs are not hardware facts: this job could transform their TensorFS bytes on
 	// CPU. The immutable release dependency set selects the machine class instead.
-	gpuRaw := []byte(`{"application":"h3:tools","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"H3Dits","component_use":{},"path":"four_lane.models.dits","stamps":{}}],"name":"four_lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+	gpuRaw := []byte(`{"application":"h3:tools","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"H3Dits","component_use":{},"path":"four_lane.models.dits"}],"name":"four_lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	gpuDescriptor, problem := launch.DecodePackageInterface(gpuRaw)
 	fatal(t, problem)
 	_, problem = gpuDescriptor.Function("four_lane")
@@ -354,11 +354,25 @@ func TestPackageInterface(t *testing.T) {
 	}
 }
 
+func TestPackageInterfaceComponentLowerBound(t *testing.T) {
+	slot := launch.Slot{ComponentUse: map[string][]string{
+		"preview": {"text_encoder", "vae"},
+		"render":  {"transformer", "vae"},
+	}}
+	got := launch.MissingComponents(slot, []string{"transformer", "vae"})
+	if len(got) != 1 || got[0] != "text_encoder" {
+		t.Fatalf("MissingComponents = %v, want [text_encoder]", got)
+	}
+	if got := launch.MissingComponents(launch.Slot{}, nil); len(got) != 0 {
+		t.Fatalf("undeclared component lower bound = %v, want none", got)
+	}
+}
+
 // TestDynamicProducerOutputs is the model-upload dry-run boundary. The selected
 // source determines the exact header; the PackageInterface and intent agree only on
 // output slot names, never a duplicate topology contract.
 func TestDynamicProducerOutputs(t *testing.T) {
-	raw := []byte(`{"application":"quantize:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"QuantizationSource","component_use":{},"path":"produce.models.source","stamps":{}}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"mxfp8"}]}]}`)
+	raw := []byte(`{"application":"quantize:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"QuantizationSource","component_use":{},"path":"produce.models.source"}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"},{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"mxfp8"}]}]}`)
 	packageInterface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
 	job, problem := packageInterface.Function("produce")
@@ -395,7 +409,7 @@ func TestDynamicProducerOutputs(t *testing.T) {
 // (cr-077) — --source-profile binds every producer model input at dispatch,
 // refuses when one is missing, and never invents slots.
 func TestSuppliedSourceProfiles(t *testing.T) {
-	raw := []byte(`{"application":"h3:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"H3FullTransformer","component_use":{},"path":"four-lane.models.dits","stamps":{}},{"class":"H3FullTransformer","component_use":{},"path":"four-lane.models.shared","stamps":{}}],"name":"four-lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"full"}]}]}`)
+	raw := []byte(`{"application":"h3:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"H3FullTransformer","component_use":{},"path":"four-lane.models.dits"},{"class":"H3FullTransformer","component_use":{},"path":"four-lane.models.shared"}],"name":"four-lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":17179869184,"mime_type":"application/vnd.cozy.model-manifest","output_id":"full"}]}]}`)
 	packageInterface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
 	job, problem := packageInterface.Function("four-lane")
@@ -418,7 +432,7 @@ func TestSuppliedSourceProfiles(t *testing.T) {
 		t.Fatalf("unknown slot must refuse, got %v", problem)
 	}
 
-	stale := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"S","component_use":{},"path":"produce.models.source","source_profile":"civitai/sdxl/single-file/1","stamps":{}}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"}]}]}`)
+	stale := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"S","component_use":{},"path":"produce.models.source","source_profile":"civitai/sdxl/single-file/1"}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"}]}]}`)
 	if _, problem := launch.DecodePackageInterface(stale); problem == nil {
 		t.Fatal("a stale package interface still carrying source_profile must refuse (cr-077 hard cut)")
 	}

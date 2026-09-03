@@ -85,7 +85,6 @@ type Slot struct {
 	ComponentUse     map[string][]string `json:"component_use"`
 	EncodedLeaves    string              `json:"encoded_leaves,omitempty"`
 	SequenceParallel json.RawMessage     `json:"sequence_parallel,omitempty"`
-	Stamps           map[string]string   `json:"stamps,omitempty"`
 }
 
 // Struct is a rendered msgspec struct.
@@ -178,27 +177,6 @@ func exactKeys(raw json.RawMessage, required, optional []string) (map[string]jso
 	return object, nil
 }
 
-// refuseRetiredSlotMembers is the reader-side half of cr-078a's hard cut, the same rule
-// cozy-runtime's `_refuse_retired` keeps: an EMPTY `stamps` map is what every release
-// published before the cut carries and reads as nothing declared; a stamp in it, or any
-// `source_profile` (cr-077), is a member the grammar deleted and refuses by name.
-func refuseRetiredSlotMembers(members map[string]json.RawMessage) error {
-	if raw, ok := members["stamps"]; ok {
-		var stamps map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &stamps); err != nil {
-			return fmt.Errorf("stamps must be an object")
-		}
-		if len(stamps) != 0 {
-			return fmt.Errorf("stamps are retired (model-code-fit D1); a semantic twin is a " +
-				"component name or a config fact")
-		}
-	}
-	if _, ok := members["source_profile"]; ok {
-		return fmt.Errorf("source_profile is retired (cr-077); capability is the slot's class annotation")
-	}
-	return nil
-}
-
 func validateClosedPackageInterface(data []byte) error {
 	root, err := exactKeys(data,
 		[]string{"application", "entrypoints", "format", "jobs"}, nil)
@@ -234,11 +212,8 @@ func validateClosedPackageInterface(data []byte) error {
 				for _, slot := range slots {
 					members, err := exactKeys(slot,
 						[]string{"class", "component_use", "path"},
-						[]string{"encoded_leaves", "sequence_parallel", "stamps", "source_profile"})
+						[]string{"encoded_leaves", "sequence_parallel"})
 					if err != nil {
-						return err
-					}
-					if err := refuseRetiredSlotMembers(members); err != nil {
 						return err
 					}
 					if leaves, ok := members["encoded_leaves"]; ok {
@@ -264,6 +239,31 @@ func validateClosedPackageInterface(data []byte) error {
 		}
 	}
 	return nil
+}
+
+// MissingComponents returns the package-declared lower bound that a checkpoint
+// cannot supply. ComponentUse is intentionally conservative: it unions only
+// explicitly declared names, so an undeclared method can never cause a false
+// incompatibility verdict.
+func MissingComponents(slot Slot, available []string) []string {
+	have := make(map[string]struct{}, len(available))
+	for _, component := range available {
+		have[component] = struct{}{}
+	}
+	required := make(map[string]struct{})
+	for _, components := range slot.ComponentUse {
+		for _, component := range components {
+			required[component] = struct{}{}
+		}
+	}
+	missing := make([]string, 0, len(required))
+	for component := range required {
+		if _, ok := have[component]; !ok {
+			missing = append(missing, component)
+		}
+	}
+	sort.Strings(missing)
+	return missing
 }
 
 func validateStructRaw(raw json.RawMessage) error {

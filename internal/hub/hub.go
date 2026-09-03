@@ -179,9 +179,10 @@ type PackageCard struct {
 }
 
 type ModelLaneSummary struct {
-	Lane       string `json:"lane"`
-	ManifestID string `json:"manifest_id"`
-	Bytes      int64  `json:"bytes"`
+	Lane       string   `json:"lane"`
+	ManifestID string   `json:"manifest_id"`
+	Components []string `json:"components"`
+	Bytes      int64    `json:"bytes"`
 }
 
 type ModelReleaseSummary struct {
