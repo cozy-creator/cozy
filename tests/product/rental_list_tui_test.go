@@ -144,16 +144,17 @@ func TestRentalListLiveBoard(t *testing.T) {
 		t.Fatalf("JSON watch did not refuse clearly [exit %d]\n%s", code, out)
 	}
 
-	// JSON: field-complete — every human column, every machine fact, and the reconciled
-	// fleet totals in the document itself.
-	code, out := runCozy(t, root, "--json", "rental", "list")
+	// JSON: field-complete typed machine rows — the underlying facts (counts as numbers,
+	// moments as timestamps), never the table's spellings — plus the reconciled fleet
+	// totals in the document itself.
+	code, out := runCozy(t, root, "--json", "--full", "rental", "list")
 	if code != 0 {
 		t.Fatalf("JSON snapshot failed [exit %d]\n%s", code, out)
 	}
 	var document struct {
-		Rentals              []map[string]string `json:"rentals"`
-		MachinesRunning      int                 `json:"machines_running"`
-		HourlySpendUSDMicros int64               `json:"hourly_spend_usd_micros"`
+		Rentals              []map[string]any `json:"rentals"`
+		MachinesRunning      int              `json:"machines_running"`
+		HourlySpendUSDMicros int64            `json:"hourly_spend_usd_micros"`
 	}
 	must(t, json.Unmarshal([]byte(out), &document))
 	if len(document.Rentals) != 1 || document.MachinesRunning != 1 ||
@@ -161,17 +162,22 @@ func TestRentalListLiveBoard(t *testing.T) {
 		t.Fatalf("JSON lost the fleet totals: %s", out)
 	}
 	row := document.Rentals[0]
-	for _, field := range []string{"machine", "sku", "state", "uptime", "running", "queued",
-		"idle", "rental", "accelerator", "address", "media", "hub", "rented", "ready",
-		"idle_since", "release_due"} {
+	for _, field := range []string{"machine", "sku", "state", "rental_id", "accelerator",
+		"address", "hub", "rented_at", "ready_at", "running", "queued", "idle_s",
+		"idle_since_at", "release_due_at", "hourly_rate_usd_micros"} {
 		if _, ok := row[field]; !ok {
 			t.Fatalf("JSON row lost field %q: %s", field, out)
 		}
 	}
-	if row["machine"] != "sparrow" || row["state"] != "ready" || row["rental"] != "rental-tui" ||
-		!regexp.MustCompile(`^\d+s / 4m$`).MatchString(row["idle"]) ||
-		row["release_due"] == "" || row["idle_since"] == "" {
+	if row["machine"] != "sparrow" || row["state"] != "ready" || row["rental_id"] != "rental-tui" ||
+		row["queued"] != float64(0) || row["hourly_rate_usd_micros"] != float64(100_000) ||
+		row["idle_s"] == nil || row["release_due_at"] == "" {
 		t.Fatalf("JSON row is not the live idle truth: %s", out)
+	}
+	for _, spelling := range []string{`"idle":`, `"uptime":`, `"rented":`} {
+		if strings.Contains(out, spelling) {
+			t.Fatalf("JSON carries the table spelling %s: %s", spelling, out)
+		}
 	}
 
 	// The spend header stays on th-120's billed totals: when the hub's reconciled billed

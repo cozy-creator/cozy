@@ -612,8 +612,14 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		AllFields: []string{"machine", "sku", "state", "uptime", "running", "queued", "idle",
 			"rental", "accelerator", "address", "media", "hub", "rented", "ready",
 			"idle_since", "release_due"},
-		Machine: []string{"rental", "accelerator", "address", "media", "hub", "rented",
-			"ready", "idle_since", "release_due"},
+		// The machine document carries the underlying facts, never the table's
+		// spellings: counts as numbers, moments as timestamps, absences omitted.
+		TypedFields: []string{"machine", "sku", "state", "rental_id", "rented_at",
+			"running", "queued", "idle_s", "release_due_at"},
+		TypedAllFields: []string{"machine", "sku", "state", "rental_id", "accelerator",
+			"address", "media_address", "hub", "rented_at", "ready_at", "running",
+			"queued", "idle_s", "idle_since_at", "release_due_at", "hourly_rate_usd_micros"},
+		TypedRows: make([]map[string]any, 0, len(rows)),
 		Lead: []string{fmt.Sprintf("Remote machines running: %d", count),
 			"Current spend per hour: " + usdPerHourBare(burn)},
 		Aggregates: []output.Field{{K: "machines_running", V: jsonFact{count}},
@@ -641,6 +647,23 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			"rented": stamp(r.RentedAt), "ready": orNone(stamp(r.ReadyAt)),
 			"idle_since": idleSince, "release_due": releaseDue,
 		})
+		typed := map[string]any{
+			"machine": r.MachineName, "state": r.State, "rental_id": r.ID,
+			"running": idle.Running, "queued": idle.Queued,
+			"hourly_rate_usd_micros": r.HourlyRateUSDMicros,
+		}
+		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
+			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub,
+			"rented_at": r.RentedAt, "ready_at": r.ReadyAt,
+			"idle_since_at": idleSince, "release_due_at": releaseDue} {
+			if value != "" {
+				typed[key] = value
+			}
+		}
+		if eligible {
+			typed["idle_s"] = int64(time.Since(idle.Since).Seconds())
+		}
+		list.TypedRows = append(list.TypedRows, typed)
 	}
 	if len(list.Rows) > 0 {
 		list.Next = []string{"cozy rental end " + list.Rows[0]["machine"]}
