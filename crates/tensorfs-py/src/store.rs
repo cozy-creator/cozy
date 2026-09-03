@@ -2233,8 +2233,8 @@ pub fn fetch_complete_cozytensors(py: Python<'_>, store: &PyStore, plan: &[u8]) 
 
 /// The ONE transport, from Python (tfs-050): ask for a repo, get a store that has it.
 /// cozy-runtime sheds its own downloader (cr-090); this call IS the mover — closure,
-/// plan against the real store, presign for exactly `wanted`, the 16-way walk, and the
-/// completion proof, all in the compiled core.
+/// plan against the real store, the 16-way walk presigning `wanted` as it reaches it, and
+/// the completion proof, all in the compiled core.
 ///
 /// `credential` is the one spelling (`bearer <token>`, or empty for anonymous — which is
 /// what a rented pod uses, the hub's closure and presign routes taking no credential),

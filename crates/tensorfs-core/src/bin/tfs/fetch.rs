@@ -208,9 +208,9 @@ fn credential_of(
     }
 }
 
-/// `tfs fetch <root> <ref>` — closure, plan against the REAL store, presign for exactly
-/// `wanted`, the N-way walk, the completion proof. A warm store asks one question and
-/// moves nothing.
+/// `tfs fetch <root> <ref>` — closure, plan against the REAL store, the N-way walk
+/// presigning `wanted` as it reaches it, the completion proof. A warm store asks one
+/// question and moves nothing.
 pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
     let store = ok!(Store::open(root));
     let Some(base) = flag(flags, "hub") else {
