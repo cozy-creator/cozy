@@ -113,6 +113,73 @@ fn blobs_and_manifests_round_trip_through_normal_store_admission() {
 }
 
 #[test]
+fn a_complete_generic_snapshot_rehydrates_a_fresh_store_from_cache() {
+    let root = temporary("generic-snapshot");
+    let source_root = root.join("source");
+    let source = Store::init(&source_root).unwrap();
+    let cache = RepoObjectCache::new(root.join("cache"));
+    let files: [(&str, &[u8]); 3] = [
+        ("dataset/shard-000.jsonl", b"{\"sample\":0}\n"),
+        ("dataset/shard-001.jsonl", b"{\"sample\":1}\n"),
+        ("metadata/schema.json", b"{\"columns\":[\"sample\"]}"),
+    ];
+    let objects = files
+        .iter()
+        .map(|(_, bytes)| put_blob(&source, bytes))
+        .collect::<Vec<_>>();
+    let manifest = Manifest::from_files(
+        files
+            .iter()
+            .zip(&objects)
+            .map(|((path, _), object)| ((*path).to_string(), object.clone()))
+            .collect(),
+    )
+    .unwrap();
+    let manifest_ref = source.put_manifest(&manifest).unwrap().obj;
+
+    for object in &objects {
+        assert_eq!(
+            cache
+                .backfill_store(&source, CacheKind::Blob, object)
+                .unwrap(),
+            CacheWrite::Stored
+        );
+    }
+    assert_eq!(
+        cache
+            .backfill_store(&source, CacheKind::Manifest, &manifest_ref)
+            .unwrap(),
+        CacheWrite::Stored
+    );
+    drop(source);
+    fs::remove_dir_all(source_root).unwrap();
+
+    let destination = Store::init(&root.join("fresh-destination")).unwrap();
+    assert_eq!(
+        cache
+            .admit(&destination, CacheKind::Manifest, &manifest_ref)
+            .unwrap(),
+        CacheRead::Hit
+    );
+    for object in &objects {
+        assert_eq!(
+            cache.admit(&destination, CacheKind::Blob, object).unwrap(),
+            CacheRead::Hit
+        );
+    }
+    assert_eq!(destination.read_manifest(&manifest_ref).unwrap(), manifest);
+    for ((_, expected), object) in files.iter().zip(&objects) {
+        let mut admitted = destination.open_verified(&object.sha256).unwrap();
+        let mut actual = Vec::new();
+        std::io::Read::read_to_end(&mut admitted, &mut actual).unwrap();
+        assert_eq!(&actual, expected);
+    }
+    assert!(!cache.root().join("repos").exists());
+    assert!(!cache.root().join("tensorfs.sqlite").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn missing_and_corrupt_cache_objects_fall_through_without_local_admission() {
     let root = temporary("fall-through");
     let destination = Store::init(&root.join("destination")).unwrap();
