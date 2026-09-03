@@ -36,6 +36,14 @@ type List struct {
 	Fields    []string
 	AllFields []string
 	Rows      []map[string]string
+	// TypedFields, TypedAllFields, and TypedRows optionally provide the logical
+	// machine document separately from the terminal table. A table cell may be a
+	// formatted duration, percentage, or dash; JSON/TOON must instead carry the
+	// underlying number or omit an unavailable fact. When present, TypedRows has
+	// exactly one row for every Rows entry and is used for every non-human mode.
+	TypedFields    []string
+	TypedAllFields []string
+	TypedRows      []map[string]any
 	// Bytes names the columns whose cells are byte counts, written as decimal integers
 	// (`Int`): the terminal shows binary units, JSON carries the integer. An empty cell is
 	// an absent fact in both.
@@ -93,12 +101,23 @@ func (l List) Emit(w io.Writer, mode Mode) error {
 	if strings.TrimSpace(l.Name) == "" {
 		return fmt.Errorf("output list name is required")
 	}
-	columns, err := l.Columns(mode)
+	human := mode.Human && !mode.JSON
+	typed := !human && l.TypedRows != nil
+	if typed && len(l.TypedRows) != len(l.Rows) {
+		return fmt.Errorf("output list typed rows (%d) do not match display rows (%d)",
+			len(l.TypedRows), len(l.Rows))
+	}
+	var columns []string
+	var err error
+	if typed {
+		columns, err = l.typedColumns(mode)
+	} else {
+		columns, err = l.Columns(mode)
+	}
 	if err != nil {
 		return err
 	}
-	human := mode.Human && !mode.JSON
-	if !human && len(mode.Fields) == 0 {
+	if !human && !typed && len(mode.Fields) == 0 {
 		for _, column := range l.Machine {
 			if !contains(columns, column) {
 				columns = append(columns, column)
@@ -110,7 +129,28 @@ func (l List) Emit(w io.Writer, mode Mode) error {
 		shown = shown[:rowCap]
 	}
 	document := map[string]any{}
-	if len(columns) == 1 {
+	if typed {
+		shownTyped := l.TypedRows[:len(shown)]
+		if len(columns) == 1 {
+			values := make([]any, 0, len(shownTyped))
+			for _, source := range shownTyped {
+				values = append(values, source[columns[0]])
+			}
+			document[l.Name] = values
+		} else {
+			rows := make([]map[string]any, 0, len(shownTyped))
+			for _, source := range shownTyped {
+				row := make(map[string]any, len(columns))
+				for _, column := range columns {
+					if value, present := source[column]; present {
+						row[column] = value
+					}
+				}
+				rows = append(rows, row)
+			}
+			document[l.Name] = rows
+		}
+	} else if len(columns) == 1 {
 		values := make([]string, 0, len(shown))
 		for _, source := range shown {
 			values = append(values, Elide(source[columns[0]], cellCap, mode.Full))
@@ -425,6 +465,26 @@ func (l List) Columns(mode Mode) ([]string, error) {
 		if !contains(l.AllFields, field) {
 			return nil, NewError(Usage, "output.field_unknown", fmt.Sprintf("unknown output field %q", field)).
 				WithRemedy("available fields: " + strings.Join(l.AllFields, ", "))
+		}
+	}
+	return mode.Fields, nil
+}
+
+func (l List) typedColumns(mode Mode) ([]string, error) {
+	available := l.TypedAllFields
+	if len(available) == 0 {
+		available = l.TypedFields
+	}
+	if len(mode.Fields) == 0 {
+		if mode.Full {
+			return available, nil
+		}
+		return l.TypedFields, nil
+	}
+	for _, field := range mode.Fields {
+		if !contains(available, field) {
+			return nil, NewError(Usage, "output.field_unknown", fmt.Sprintf("unknown output field %q", field)).
+				WithRemedy("available fields: " + strings.Join(available, ", "))
 		}
 	}
 	return mode.Fields, nil

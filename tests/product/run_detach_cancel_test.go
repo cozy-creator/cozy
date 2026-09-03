@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -54,7 +55,7 @@ func TestClientDeathNeverCancels(t *testing.T) {
 		!strings.Contains(out, `"status":"completed"`) {
 		t.Fatalf("the resubmission after a client death did not complete [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "run", "watch", victim.Number, "--json"); code != 0 ||
+	if code, out := runCozy(t, root, "run", "watch", strconv.FormatInt(victim.Number, 10), "--json"); code != 0 ||
 		!strings.Contains(out, `"status":"completed"`) || !strings.Contains(out, `"saved":[{`) {
 		t.Fatalf("the killed client's run must complete and publish its export [exit %d]\n%s\n%s",
 			code, out, productWorkerLogs(root))
@@ -147,7 +148,7 @@ func TestClientDeathNeverCancels(t *testing.T) {
 }
 
 type listedInvocation struct {
-	Number string `json:"number"`
+	Number int64  `json:"number"`
 	ID     string `json:"id"`
 	Status string `json:"status"`
 }
@@ -223,7 +224,7 @@ func awaitRunReferenceStatus(t *testing.T, root, reference, wanted string) {
 	status := ""
 	for time.Now().Before(deadline) {
 		for _, row := range listInvocations(t, root) {
-			if row.Number != reference && row.ID != reference {
+			if strconv.FormatInt(row.Number, 10) != reference && row.ID != reference {
 				continue
 			}
 			status = row.Status
