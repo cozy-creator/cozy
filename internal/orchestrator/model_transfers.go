@@ -102,6 +102,13 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 		if problem != nil {
 			return problem
 		}
+		// The durable rows must cover the adopted inventory before an empty outstanding set
+		// can mean "done". A projection that has not caught up is not a completed transfer.
+		if len(objects) != len(known) {
+			return exit.Named(exit.Unavailable, "model_transfer.object_rows_incomplete",
+				"weights output %s has %d durable object rows for %d adopted objects",
+				weights.OutputSlot, len(objects), len(known))
+		}
 		outstanding := make([]records.ModelTransferObject, 0, len(objects))
 		for _, object := range objects {
 			if object.State == "uploaded" || object.State == "already_present" ||
