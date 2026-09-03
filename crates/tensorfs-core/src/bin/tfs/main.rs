@@ -23,6 +23,16 @@
 //!   tfs scrub <root>             one rate knob over the whole store
 //!   tfs reap <root>              reap admission temps whose writer is gone
 //!   tfs fill <root> <plan>       resumable fill: skip only verified objects
+//!
+//! The ONE transport (tfs-048/tfs-049/tfs-050). The credential is `--credential-file` or
+//! TFS_CREDENTIAL (`bearer <token>` | `delegation <payload> <sig>`), never bare argv; a
+//! URL of `-` arrives on stdin. Flags: --hub <base> --lane --session --streams <n>
+//! --timeout <s> --allow-hosts a,b,.c --allow-local --max-redirects <n>.
+//!
+//!   tfs fetch <root> <ref>       closure -> plan -> presign(wanted) -> N-way walk -> proof
+//!   tfs fetch plan-objects <root> <session> --refs <jsonl>   HELD/WANTED, no manifest
+//!   tfs fetch url <root> <sha256> <length> <url|->           one granted object
+//!   tfs push <root> <sha256> --url <presigned|-> [--manifest] [--content-type ct]
 //!   tfs bench-store <root>       put/read/range/rehash throughput + peak RSS
 //!
 //! Qualification (tfs-008): what an (encoding, device) pair is QUALIFIED to execute.
@@ -255,8 +265,18 @@ fn main() -> ExitCode {
         ["materialize", r, h, p, d] => rd::cmd_materialize(Path::new(r), h, p, Path::new(d)),
         ["render", r, h] => rd::cmd_render(Path::new(r), h),
         ["fetch", "plan", r, d, s] => fetch::cmd_plan(Path::new(r), Path::new(d), s, &flags),
+        ["fetch", "plan-objects", r, s] => fetch::cmd_plan_objects(Path::new(r), s, &flags),
         ["fetch", "admit", r, p, i] => fetch::cmd_admit(Path::new(r), Path::new(p), i, &flags),
         ["fetch", "complete", r, p] => fetch::cmd_complete(Path::new(r), Path::new(p)),
+        ["fetch", "url", r, i, l, u] => fetch::cmd_url(Path::new(r), i, l, u, &flags),
+        ["fetch", sub, _t]
+            if ["plan", "plan-objects", "admit", "complete", "url"].contains(sub) =>
+        {
+            eprintln!("usage: see the header of {}", file!());
+            ExitCode::from(2)
+        }
+        ["fetch", r, refspec] => fetch::cmd_pull(Path::new(r), refspec, &flags),
+        ["push", r, i] => fetch::cmd_push(Path::new(r), i, &flags),
         ["registry"] => cmd_registry(),
         ["vectors", "gen"] => cmd_gen(&default_dir()),
         ["vectors", "gen", dir] => cmd_gen(Path::new(dir)),
