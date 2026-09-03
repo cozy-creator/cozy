@@ -89,3 +89,20 @@ jobs:
       - run: |
           bash scripts/wheel-smoke.sh "${RUNNER_TEMP}/smoke" python3.12 \
             --skip-build --wheels "$PWD/dist"
+
+  # A RELEASED VERSION NUMBER NAMES ONE TREE, FOREVER (proto-036). `v*` is the whole
+  # release procedure — publish.yaml triggers on the tag push and there is no local
+  # publish — so the tags ARE the released set, and this refuses a tree that has drifted
+  # away from the number it still declares. Its own job, with the full history the
+  # comparison needs, so the heavy jobs keep their one-commit checkout.
+  released-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 scripts/released_version.py
