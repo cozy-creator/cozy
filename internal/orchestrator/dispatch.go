@@ -597,6 +597,14 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 				// machine, not evidence that its existing worker is stale.
 				continue
 			}
+			if staged(w, req.PlanID) && retirementGround(w) == "" {
+				// SAME PLAN, DIFFERENT MODEL SELECTION (cl-114). The process is fine;
+				// only its placement's selection differs from the request's. The launch
+				// below resolves the request's own selection and EnsureWorker re-stages
+				// this worker's placement under it — the desired set is authoritative and
+				// the worker's own residency arbitration vacates the old selection.
+				continue
+			}
 			stale = w.instanceID
 		}
 	}
@@ -717,7 +725,7 @@ func (c *Orchestrator) rentalHeld(req records.Request) bool {
 			}
 			continue
 		}
-		if w.remoteStaged(slot, req.PlanID, req.Release, req.LocalPackageDigest) {
+		if w.remoteStaged(slot, req.PlanID, req.Release, req.LocalPackageDigest, req.Models) {
 			return true
 		}
 	}
@@ -769,9 +777,33 @@ func staged(w *worker, planID string) bool {
 func stagedFor(w *worker, req records.Request) bool {
 	if req.Worker != "" && w.spec.Connection != nil && !req.IsJob() {
 		return w.remoteStaged(pinnedPackage(req.Package, req.Worker), req.PlanID,
-			req.Release, req.LocalPackageDigest)
+			req.Release, req.LocalPackageDigest, req.Models)
 	}
-	return staged(w, req.PlanID)
+	return staged(w, req.PlanID) && selectionServes(req.Models, w.spec.Placement.Models)
+}
+
+// selectionServes is the model half of the match (cl-114): a placement that holds a slot
+// the request binds must hold it under the request's exact manifest. The plan id hashes
+// the entrypoint's interface, not its weights, so two selections of one package share a
+// plan — matching on the plan alone dispatched an fp8 request onto the warm bf16
+// placement. A request that binds no models (an editable install's frozen selection, an
+// unmodeled package) accepts whatever the placement holds, and a placement whose set
+// binds no row for a slot has no selection to disagree with — the request's model rows
+// are then facts for the row, not residency evidence.
+func selectionServes(requested, held []ModelRef) bool {
+	if len(requested) == 0 || len(held) == 0 {
+		return true
+	}
+	holds := make(map[string]string, len(held))
+	for _, m := range held {
+		holds[m.Slot] = m.Manifest
+	}
+	for _, m := range requested {
+		if manifest, ok := holds[m.Slot]; ok && manifest != m.Manifest {
+			return false
+		}
+	}
+	return true
 }
 
 // settledState answers whether the authority has already recorded this request's outcome.
