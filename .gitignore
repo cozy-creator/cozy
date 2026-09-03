@@ -9,3 +9,4 @@ dist/
 vectors/store/meta/
 vectors/store/verified/
 vectors/store/tmp/
+wheel-data/

@@ -4,9 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
+import os
 import pathlib
+import subprocess
 import sys
+import sysconfig
+import tempfile
 import tomllib
 import zipfile
 from email.parser import BytesParser
@@ -17,8 +22,8 @@ PACKAGE = "tensorfs"
 # abi3 is forward compatible by construction: a cp312-abi3 wheel loads on 3.12 and every
 # later CPython. The floor is real; there is no ceiling to assert.
 PYTHON_SPEC = ">=3.12"
-CURRENT_CARGO_VERSION = "0.3.0"
-CURRENT_PYTHON_VERSION = "0.3.0"
+CURRENT_CARGO_VERSION = "0.3.1"
+CURRENT_PYTHON_VERSION = "0.3.1"
 
 
 def _toml(path: pathlib.Path) -> dict[str, object]:
@@ -76,8 +81,40 @@ def source_version() -> str:
     return source_versions()[1]
 
 
+def _binary_version(tfs: pathlib.Path, expected_cargo: str) -> None:
+    """One wheel carries one version (tfs-051): the shipped binary must SAY the version
+    the wheel claims, and the digest it prints must be the digest of its own bytes."""
+    said = subprocess.run([tfs, "version"], capture_output=True, text=True, check=False)
+    if said.returncode != 0:
+        raise ValueError(f"shipped tfs refused `version`: {said.stderr.strip()!r}")
+    fields = said.stdout.split()
+    if len(fields) != 3 or fields[0] != "tfs" or not fields[2].startswith("sha256:"):
+        raise ValueError(f"shipped tfs printed {said.stdout!r}, not `tfs <version> sha256:<hex>`")
+    if fields[1] != expected_cargo:
+        raise ValueError(f"shipped tfs is version {fields[1]!r}, wheel claims {expected_cargo!r}")
+    digest = hashlib.sha256(tfs.read_bytes()).hexdigest()
+    if fields[2] != f"sha256:{digest}":
+        raise ValueError(f"shipped tfs prints digest {fields[2]!r}, its bytes hash to {digest}")
+
+
+def wheel_binary(path: pathlib.Path, expected_cargo: str, expected_python: str) -> None:
+    member = f"tensorfs-{expected_python}.data/scripts/tfs"
+    with zipfile.ZipFile(path) as wheel:
+        try:
+            info = wheel.getinfo(member)
+        except KeyError:
+            raise ValueError(f"{path.name} ships no {member}: the wheel IS the tfs channel")
+        if not (info.external_attr >> 16) & 0o111:
+            raise ValueError(f"{member} is not executable in {path.name}")
+        with tempfile.TemporaryDirectory(prefix="tensorfs-wheel-tfs-") as scratch:
+            extracted = pathlib.Path(wheel.extract(member, scratch))
+            extracted.chmod(0o755)
+            _binary_version(extracted, expected_cargo)
+
+
 def wheel_version(path: pathlib.Path) -> str:
-    expected = source_version()
+    cargo_expected, expected = source_versions()
+    wheel_binary(path, cargo_expected, expected)
     with zipfile.ZipFile(path) as wheel:
         members = [name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")]
         if len(members) != 1:
@@ -111,6 +148,10 @@ def installed_version(path: pathlib.Path) -> str:
         raise ValueError(
             f"tensorfs.__version__ {tensorfs.__version__!r} != wheel version {expected!r}"
         )
+    installed_tfs = pathlib.Path(sysconfig.get_path("scripts")) / "tfs"
+    if not os.access(installed_tfs, os.X_OK):
+        raise ValueError(f"install put no executable tfs at {installed_tfs}")
+    _binary_version(installed_tfs, source_versions()[0])
     return expected
 
 

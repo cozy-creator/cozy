@@ -1,6 +1,6 @@
 # TensorFS
 
-The current release is `0.3.0`.
+The current release is `0.3.1`.
 
 TensorFS stores every domain repository as the same graph:
 
@@ -194,6 +194,13 @@ uv run --python 3.12 --project conformance/cbor/python \
 # the end-to-end test: wheel -> fresh venv -> real store -> lease/plan/ring/CAS
 bash scripts/wheel-smoke.sh
 ```
+
+One artifact, one version (tfs-051): the wheel ships the `tfs` binary beside the module, so
+`pip install tensorfs==<v>` yields both, and `tfs version` prints
+`tfs <version> sha256:<digest of its own bytes>` — the line tensorhub and cozy-creator check
+at startup and refuse on. `scripts/build-wheel.sh` is the one wheel build; a bare
+`maturin build` refuses until it has staged the binary. The sdist carries sources only —
+installs come from the wheel.
 
 The CBOR gate runs the production Rust codec and an independent Python codec over the same
 green and red vectors.

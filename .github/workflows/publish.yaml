@@ -44,9 +44,15 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: x86_64
-          args: --release --out dist
+          args: --release --locked --out dist
           manylinux: auto
+          before-script-linux: |
+            cargo build --release --locked -p tensorfs-core --bin tfs
+            install -D -m 755 target/release/tfs wheel-data/scripts/tfs
 
+      # The sdist carries sources only, never the staged binary; pyproject's `data`
+      # option needs the directory to exist even for an sdist.
+      - run: mkdir -p wheel-data/scripts
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
