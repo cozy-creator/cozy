@@ -158,10 +158,10 @@ func TestRunProgressSurfaces(t *testing.T) {
 	// The list reuses the same lossy Runtime progress lane. Whole-job percentage and ETA
 	// come only from overall_fraction; the current stage remains explicitly stage-local.
 	// Terminal rows return to a dash because progress beside "completed" adds no information.
-	code, _ = runCozy(t, root, "run", localWeightlessRef+"/tile",
-		"size=32", "seed=6", "delay_ms=6000")
+	code, output := runCozy(t, root, "run", localWeightlessRef+"/tile",
+		"size=32", "seed=6", "delay_ms=5000")
 	if code != 0 {
-		t.Fatalf("detached progress run failed [exit %d]", code)
+		t.Fatalf("detached progress run failed [exit %d]\n%s", code, output)
 	}
 	type progressRow struct {
 		Number          string `json:"number"`
@@ -183,7 +183,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 		return document.Invocations[0]
 	}
 	live := list()
-	progress := regexp.MustCompile(`^[1-9][0-9]?% overall \(~[0-9.]+[a-z]+\) · .+ [1-9][0-9]?%$`)
+	progress := regexp.MustCompile(`^[1-9][0-9]?% overall \(~[0-9.]+[a-z]+\) · .+ [1-9][0-9]?% stage$`)
 	if live.Status != "in_progress" || !progress.MatchString(live.Progress) ||
 		live.ProgressStage == "" || live.StageFraction == "" || live.OverallFraction == "" {
 		t.Fatalf("live run does not distinguish overall and stage progress: %+v", live)
