@@ -132,6 +132,50 @@ func TestRentalIdleRelease(t *testing.T) {
 	}
 	awaitRentalGone(t, store, "rental-idle-owed", 15*time.Second, logPath)
 
+	// (b3) QUEUED WORK THAT IS PINNED TO NOBODY still holds the fleet (cl-121). The pin is
+	// routing's own output, so a --rental request belongs to no machine between the moment
+	// some rental has its plan STAGED (`rentalHeld`, which makes `selectOrStart` return
+	// without pinning) and the moment that placement is DISPATCHABLE (which is when `route`
+	// pins it). On the code this arm was written against, that request counted toward NO
+	// rental — `RentalRunCounts` counts `worker=<rental>` and `Owed` covers only the one
+	// buyer — so a warm machine idled out from under work that was waiting for it, and the
+	// next request paid a full cold acquisition (178-271 s and a 6.93 GB re-download of
+	// bytes the released machine already held). This rental neither bought the request nor
+	// holds its pin: that is the point, because releasing ANY machine on this evidence is
+	// wrong in the expensive direction.
+	plant("rental-idle-unpinned", "kestrel")
+	if _, _, problem := store.Submit(records.Request{
+		ID: "req-rental-unpinned", IdemKey: "idem-rental-unpinned",
+		BodyDigest: "sha256:" + strings.Repeat("ef", 32),
+		Package:    "fake/unpinned", Entrypoint: "generate", Payload: []byte("{}"),
+		Rental: true,
+	}); problem != nil {
+		t.Fatal(problem.Message)
+	}
+	time.Sleep(6 * time.Second)
+	if row, problem := store.RentalRow("rental-idle-unpinned"); problem != nil || row == nil ||
+		row.State != "ready" {
+		t.Fatalf("a rental was released while unpinned --rental work was queued: %+v %v\n%s",
+			row, problem, tail(logPath))
+	}
+	if hub.releases("rental-idle-unpinned") != 0 {
+		t.Fatalf("the hub saw a release while unpinned work was queued\n%s", tail(logPath))
+	}
+	// The listing has to agree with the mechanism: no work of its OWN (0 queued, 0 running)
+	// and no countdown, because the fleet is not idle even though this machine is.
+	code, out = runCozy(t, root, "rental")
+	unpinnedRow := regexp.MustCompile(`kestrel\s+cpu\s+ready\s+\S+\s+0\s+0\s+-`)
+	if code != 0 || !unpinnedRow.MatchString(out) {
+		t.Fatalf("the listing shows an idle countdown while unpinned work is queued [exit %d]\n%s",
+			code, out)
+	}
+	// And settling the unpinned request is what lets it go: the hold is the WORK, never a
+	// permanent exemption.
+	if r := daemon.call(t, "POST", "/v1/requests/req-rental-unpinned/cancel", nil); r.Status != http.StatusOK {
+		t.Fatalf("cancel of the unpinned request: %s", r.brief())
+	}
+	awaitRentalGone(t, store, "rental-idle-unpinned", 15*time.Second, logPath)
+
 	// (c) A release the hub does not confirm is retried at the next observation, not left
 	// until a rental command or a restart: with the hub gone the daemon says so once, keeps
 	// asking, and the pod is released as soon as the hub answers again.

@@ -735,6 +735,34 @@ func (s *Store) RentalRunCounts(id string) (queued, running int, problem *exit.E
 	return queued, running, nil
 }
 
+// QueuedUnpinnedRentalRequests counts the --rental requests that are QUEUED and pinned to
+// no rental at all (cl-121). They are the work `RentalRunCounts` cannot see: it counts
+// `requests WHERE worker=<rental>`, and an unpinned request belongs to no rental yet
+// BY DESIGN — the pin is routing's own output, so an unpinned request stays free to take
+// whichever rental frees up first (routing D6). The consequence was that queued work
+// counted toward nothing while a warm machine idled out from under it: `selectOrStart`
+// returns without pinning whenever some rental has the plan STAGED (`rentalHeld`), while
+// `route` will only dispatch, and so only pin, once that placement is DISPATCHABLE. Between
+// those two states the request is neither, and observed windows were 21 s and ~24 s — but
+// the fix must not depend on the window's length, because a placement that never becomes
+// dispatchable never closes it.
+//
+// The fleet reads this as a reason not to release ANY rental. That is deliberately
+// conservative — this request might have gone to a different machine — and the asymmetry
+// says why: an extra minute of a warm pod is under a cent, while releasing one out from
+// under queued work costs a full cold acquisition, measured at 178-271 s and a 6.93 GB
+// re-download of bytes that machine already held.
+func (s *Store) QueuedUnpinnedRentalRequests() (int, *exit.Error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM requests
+		WHERE rental=1 AND worker='' AND state IN ('submitted','queued','requeue_pending')`).
+		Scan(&count)
+	if err != nil {
+		return 0, exit.Internalf("cannot count queued unpinned rental requests: %s", err)
+	}
+	return count, nil
+}
+
 // RentalLastSettlement returns the newest settled request assigned to one rental and
 // the time its final attempt became durable. A zero ClosedAt means the request settled
 // before an attempt crossed the terminal boundary.

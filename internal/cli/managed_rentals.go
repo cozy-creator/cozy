@@ -67,6 +67,15 @@ type rentalIdleness struct {
 	// recorded the hub's `ready`. Zero while the pod is still booting — RentedAt is when it
 	// was asked for, not when it began to exist — so a rental is never reaped mid-boot.
 	Since time.Time
+	// UnpinnedQueued is queued --rental work that is pinned to NO rental (cl-121). It is
+	// not this rental's work and may never be — that is exactly why it is counted here
+	// rather than against a machine: the pin is routing's output, so between a placement
+	// being STAGED and being DISPATCHABLE the request belongs to nobody, and the fleet
+	// used to read "belongs to nobody" as "nobody is busy" and release the warm machine
+	// it was waiting for. Releasing on this evidence is wrong in the expensive direction:
+	// a cold re-acquisition measured 178-271 s and re-downloaded 6.93 GB the released
+	// machine already held, against under a cent for the extra minute of keeping it.
+	UnpinnedQueued int
 	// Spent says the rental's reason is over without waiting: a managed rental exists for
 	// the request that bought it, and a job, or a request that never reached an attempt,
 	// leaves nothing warm worth keeping. A manual rental exists because the user asked;
@@ -74,7 +83,9 @@ type rentalIdleness struct {
 	Spent bool
 }
 
-func (i rentalIdleness) busy() bool { return i.Queued > 0 || i.Running > 0 || i.Owed }
+func (i rentalIdleness) busy() bool {
+	return i.Queued > 0 || i.Running > 0 || i.Owed || i.UnpinnedQueued > 0
+}
 
 func observeRentalIdle(st *records.Store, row records.Rental) (rentalIdleness, *exit.Error) {
 	var idle rentalIdleness
@@ -97,6 +108,9 @@ func observeRentalIdle(st *records.Store, row records.Rental) (rentalIdleness, *
 		idle.Since = last.ClosedAt
 	}
 	idle.Spent = row.ManagedRequestID != "" && (!found || last.Kind == "job" || last.ClosedAt.IsZero())
+	if idle.UnpinnedQueued, problem = st.QueuedUnpinnedRentalRequests(); problem != nil {
+		return idle, problem
+	}
 	if idle.Owed, problem = rentalOwedBy(st, row); problem != nil {
 		return idle, problem
 	}
