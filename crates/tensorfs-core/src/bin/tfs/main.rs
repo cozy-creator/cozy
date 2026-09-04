@@ -60,6 +60,16 @@
 //!            its signature covers; TFS_PUSH_GRANT carries the same text, and
 //!            --url <presigned|-> is a bare destination that signs no conditions
 //!   tfs source list <hf://org/repo@rev | civitai://id> [--api <base>]  provider listing
+//!   tfs source resolve <uri> [--source-profile <name>]... [--registry <r>] [--json]
+//!            the EXACT member list: every tensor
+//!            carrier with its object id, length and URL, sharded repos expanded through
+//!            their weight_map. No store and no tensor bytes — this is what an owner runs
+//!            to size a container disk before renting the machine that will hold it.
+//!            `members` and `objects` are printed as separate counts: two members can be
+//!            the same bytes, and a CAS store holds those once.
+//!            --source-profile NARROWS the repository to one reviewed model and is the
+//!            step that decides 210 GB instead of 498 GB; without it the answer is the
+//!            whole repository, which is a successful download of the wrong size
 //!   tfs source pull <root> <uri> [--api <base>] [--allow-local]        tfs-052 handlers
 //!   tfs bench-store <root>       put/read/range/rehash throughput + peak RSS
 //!
@@ -315,6 +325,7 @@ fn main() -> ExitCode {
         ["fetch", "complete", r, p] => fetch::cmd_complete(Path::new(r), Path::new(p)),
         ["fetch", "url", r, i, l, u] => fetch::cmd_url(Path::new(r), i, l, u, &flags),
         ["source", "list", u] => fetch::cmd_source_list(u, &flags),
+        ["source", "resolve", u] => fetch::cmd_source_resolve(u, &flags),
         ["source", "pull", r, u] => fetch::cmd_source_pull(Path::new(r), u, &flags),
         ["fetch", sub, _t]
             if ["plan", "plan-objects", "admit", "complete", "url"].contains(sub) =>
@@ -709,6 +720,13 @@ fn split_flags(argv: Vec<String>) -> (Vec<String>, Flags) {
 
 fn flag<'a>(f: &'a Flags, k: &str) -> Option<&'a str> {
     f.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str())
+}
+/// Every value given for a REPEATABLE flag, in the order they were typed.
+fn flag_all<'a>(f: &'a Flags, k: &str) -> Vec<&'a str> {
+    f.iter()
+        .filter(|(a, _)| a == k)
+        .map(|(_, v)| v.as_str())
+        .collect()
 }
 fn flag_on(f: &Flags, k: &str) -> bool {
     flag(f, k).is_some()

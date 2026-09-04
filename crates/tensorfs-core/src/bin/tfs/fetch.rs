@@ -14,6 +14,7 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use tensorfs_core::canon;
 use tensorfs_core::fetch::{self, DeliveryGrant, FetchPlan};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::Manifest;
@@ -694,6 +695,144 @@ pub fn cmd_source_list(uri: &str, flags: &Flags) -> ExitCode {
         );
     }
     println!("members      {}", members.len());
+    ExitCode::SUCCESS
+}
+
+/// `tfs source resolve <uri>` — what one pinned foreign source resolves to, EXACTLY:
+/// every tensor carrier, its object id, its length and its URL, with sharded repositories
+/// expanded through their `weight_map`. No store, no tensor bytes.
+///
+/// This is the verb an owner runs BEFORE renting anything: the container-disk floor is
+/// `objects` bytes, and it has to exist before the disk it sizes. Nothing here takes a
+/// `Store` for exactly that reason.
+///
+/// `--json` is the machine answer. It prints `members` and `objects` as separate counts
+/// and separate totals, because they differ whenever two members are the same bytes and a
+/// caller that conflates them will size a disk for weights it will only store once.
+pub fn cmd_source_resolve(uri: &str, flags: &Flags) -> ExitCode {
+    let (uri, endpoints, credential) = match source_setup(uri, flags) {
+        Ok(setup) => setup,
+        Err(code) => return code,
+    };
+    let resolution = ok!(providers::resolve(
+        &uri,
+        &endpoints,
+        &credential,
+        deadline_of(flags)
+    ));
+    // NARROWING. A repository is not a model. MiniMax-H3 resolves to 112 carriers /
+    // 498.3 GB; the reviewed profiles that name an actual model select 5 carriers, which
+    // expand through their indexes to 48 members / 47 objects / 210.3 GB. Skipping this
+    // step does not fail — it downloads 2.4x more, successfully — so the profile names and
+    // the member list they narrow to are both printed, and `resolved`/`selected` counts
+    // are reported separately whenever a narrowing actually happened.
+    let profiles: Vec<String> = crate::flag_all(flags, "source-profile")
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let full = resolution.members.len();
+    let resolution = if profiles.is_empty() {
+        resolution
+    } else {
+        let registry = match crate::ingest::load_registry(flags) {
+            Ok(registry) => registry,
+            Err(code) => return code,
+        };
+        let carriers = ok!(registry.exact_source_members(&profiles));
+        ok!(resolution.select(&carriers))
+    };
+    if crate::flag_on(flags, "json") {
+        let rows: Vec<canon::Value> = resolution
+            .members
+            .iter()
+            .map(|row| {
+                canon::Value::obj(vec![
+                    ("carrier", canon::Value::Bool(row.carrier)),
+                    ("length", canon::Value::uint(row.object.length)),
+                    ("member", canon::Value::str(row.member.clone())),
+                    ("object", canon::Value::str(row.object.id())),
+                    ("provenance", canon::Value::str(row.provenance.as_str())),
+                    (
+                        "requires",
+                        canon::Value::arr(
+                            row.requires
+                                .iter()
+                                .map(|need| canon::Value::str(need.clone()))
+                                .collect(),
+                        ),
+                    ),
+                    ("url", canon::Value::str(row.url.clone())),
+                ])
+            })
+            .collect();
+        let document = canon::Value::obj(vec![
+            ("canonical", canon::Value::str(resolution.canonical.clone())),
+            (
+                "source_profiles",
+                canon::Value::arr(
+                    profiles
+                        .iter()
+                        .map(|profile| canon::Value::str(profile.clone()))
+                        .collect(),
+                ),
+            ),
+            ("resolved_members", canon::Value::uint(full as u64)),
+            (
+                "member_bytes",
+                canon::Value::uint(resolution.member_bytes()),
+            ),
+            ("members", canon::Value::arr(rows)),
+            (
+                "object_bytes",
+                canon::Value::uint(resolution.object_bytes()),
+            ),
+            (
+                "objects",
+                canon::Value::uint(resolution.objects().len() as u64),
+            ),
+            (
+                "selection_sha256",
+                canon::Value::str(resolution.selection_sha256.clone()),
+            ),
+        ]);
+        println!("{}", String::from_utf8_lossy(&canon::write(&document)));
+        return ExitCode::SUCCESS;
+    }
+    for row in &resolution.members {
+        println!(
+            "{}  {:>14} B  {:9}  {}{}",
+            row.object.id(),
+            row.object.length,
+            row.provenance.as_str(),
+            if row.carrier { "" } else { "  " },
+            row.member
+        );
+    }
+    println!("canonical    {}", resolution.canonical);
+    if profiles.is_empty() {
+        println!(
+            "profiles     (none) — THE WHOLE REPOSITORY. A model is a narrowing of this; \n\
+             \x20            pass --source-profile <name> to select one."
+        );
+        println!("members      {}", resolution.members.len());
+    } else {
+        println!("profiles     {}", profiles.join(", "));
+        println!(
+            "members      {} of {} resolved carriers",
+            resolution.members.len(),
+            full
+        );
+    }
+    println!(
+        "objects      {} distinct — what a store admits",
+        resolution.objects().len()
+    );
+    println!("member bytes {}", resolution.member_bytes());
+    println!(
+        "object bytes {} — the container-disk floor",
+        resolution.object_bytes()
+    );
+    println!("selection    sha256:{}", resolution.selection_sha256);
     ExitCode::SUCCESS
 }
 

@@ -30,6 +30,11 @@ const API_PAGE_MAX: usize = 64;
 /// class is HuggingFace non-LFS files (configs, tokenizers), which git itself keeps small.
 const UNPINNED_MEMBER_MAX_BYTES: u64 = 64 << 20;
 const MEMBER_MAX: usize = 4096;
+/// A `*.safetensors.index.json` is a map from tensor name to shard file. It is JSON that
+/// git itself keeps small, and the Go resolver bounded it at the same 32 MiB.
+const INDEX_MAX_BYTES: u64 = 32 << 20;
+/// H3's largest index names 535 tensors. The bound is Go's, three orders above the fact.
+const WEIGHT_MAP_MAX: usize = 200_000;
 
 /// One pinned foreign source, in the URI grammar the rest of cozy already speaks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +192,11 @@ pub struct SourceMember {
     pub length: Option<u64>,
     pub sha256: Option<String>,
     pub url: String,
+    /// The provider's own designation of "this is the file to take", already narrowed to a
+    /// SafeTensors carrier — Civitai's `primary` flag together with `metadata.format`.
+    /// HuggingFace declares no such thing (a repository is a tree, and the selection rule
+    /// is the file suffix), so its rows leave this false.
+    pub primary: bool,
 }
 
 fn json_get<'j>(value: &'j Json, key: &str) -> Option<&'j Json> {
@@ -214,8 +224,11 @@ fn json_u64(value: &Json, key: &str) -> Option<u64> {
 }
 
 fn digest64(value: &str) -> Option<String> {
+    // A provider may spell its digest with the algorithm on the front; the Go resolver
+    // strips exactly this prefix and so does this one.
     let lower = value.to_ascii_lowercase();
-    (lower.len() == 64 && lower.bytes().all(|b| b.is_ascii_hexdigit())).then_some(lower)
+    let lower = lower.strip_prefix("sha256:").unwrap_or(&lower);
+    (lower.len() == 64 && lower.bytes().all(|b| b.is_ascii_hexdigit())).then(|| lower.to_string())
 }
 
 /// List what one pinned source reaches: every member with the identity the provider
@@ -274,18 +287,57 @@ fn list_observed(
                         return refuse(Code::MISSING_FIELD, "a tree row names no path");
                     };
                     if !member_path(path) {
-                        return refuse(
-                            Code::KEY_GRAMMAR,
-                            format!("member path {path:?} is outside the grammar"),
-                        );
+                        // Every HuggingFace repository carries `.gitattributes`, and a
+                        // leading dot is outside the member grammar. Refusing the whole
+                        // listing over a file nothing would ever select made `source list`
+                        // fail on every real repository; the Go resolver skips such rows
+                        // and always has.
+                        //
+                        // The skip is safe in exactly one direction: a member that is not
+                        // a tensor carrier cannot change a selection by being absent. One
+                        // that IS a carrier would silently shrink the model, so it refuses
+                        // instead — a smaller model that still downloads is the failure
+                        // shape worth refusing loudly.
+                        if is_safetensors(path) || is_index(path) {
+                            return refuse(
+                                Code::KEY_GRAMMAR,
+                                format!(
+                                    "tensor carrier {path:?} has a path outside the member \
+                                     grammar, so the selection cannot name it"
+                                ),
+                            );
+                        }
+                        continue;
                     }
                     // LFS rows carry an exact sha256 and length; plain git rows carry a
                     // git oid, which is not an object identity here.
                     let (sha256, length) = match json_get(row, "lfs") {
-                        Some(lfs) => (
-                            json_str(lfs, "oid").and_then(digest64),
-                            json_u64(lfs, "size").or_else(|| json_u64(row, "size")),
-                        ),
+                        Some(lfs) => {
+                            let oid = json_str(lfs, "oid");
+                            // A GATED repository answers an unauthenticated listing with
+                            // the oid MASKED — sixty-four asterisks where the digest goes.
+                            // Nothing downstream can recover from that, and without saying
+                            // so here the failure surfaces much later as "this member has
+                            // no digest", which reads as a size or format problem and sends
+                            // the reader looking in the wrong place entirely.
+                            if oid.is_some_and(|oid| {
+                                !oid.is_empty() && oid.bytes().all(|b| b == b'*')
+                            }) {
+                                return refuse(
+                                    Code::CREDENTIAL_REQUIRED,
+                                    format!(
+                                        "{path}: the provider masked this member's digest, \
+                                         which is what a gated repository returns to a \
+                                         caller it has not authorized — supply the owner's \
+                                         token with --credential-file"
+                                    ),
+                                );
+                            }
+                            (
+                                oid.and_then(digest64),
+                                json_u64(lfs, "size").or_else(|| json_u64(row, "size")),
+                            )
+                        }
                         None => (None, json_u64(row, "size")),
                     };
                     members.push(SourceMember {
@@ -293,6 +345,7 @@ fn list_observed(
                         length,
                         sha256,
                         url: format!("{base}/{org}/{repo}/resolve/{revision}/{path}"),
+                        primary: false,
                     });
                 }
                 match next {
@@ -345,6 +398,17 @@ fn list_observed(
                     Some(explicit) => explicit.to_string(),
                     None => format!("{base}/api/download/models/{version}"),
                 };
+                // A Civitai version is a bag of files (weights, a VAE, a config); the
+                // one to take is the `primary` SafeTensors file, exactly as the Go
+                // resolver selects it. `metadata.format` must agree or be silent.
+                let format_ok = match json_get(file, "metadata").and_then(|m| json_str(m, "format"))
+                {
+                    Some(format) => format.eq_ignore_ascii_case("SafeTensor"),
+                    None => true,
+                };
+                let primary = matches!(json_get(file, "primary"), Some(Json::Bool(true)))
+                    && format_ok
+                    && name.to_ascii_lowercase().ends_with(".safetensors");
                 // sizeKB is kilobytes as a float — an approximation, not a length.
                 // The exact length is probed from the origin at pull time.
                 members.push(SourceMember {
@@ -352,6 +416,7 @@ fn list_observed(
                     length: None,
                     sha256,
                     url,
+                    primary,
                 });
             }
             members
@@ -515,6 +580,458 @@ pub fn pull(
     }
     pulled.sort_by(|left, right| left.member.cmp(&right.member));
     Ok(pulled)
+}
+
+// ---------------------------------------------------------------------------- resolution
+
+/// Where a member's object identity came from.
+///
+/// This distinction is the whole reason resolution is not a pure metadata read. A
+/// HuggingFace LFS row carries a **content sha256** (`lfs.oid`), which IS the object id.
+/// A plain git row carries a **git sha1**, which identifies a blob under git's own
+/// `blob <len>\0` framing and is not a digest of these bytes at all. Treating the second
+/// as the first produces a member that can never verify, and a member that can never
+/// verify is one nobody notices until the 210 GB pull is already paid for. So the answer
+/// says, per member, which of the two it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// The provider stated a content sha256 and it was taken as given.
+    Declared,
+    /// Computed here, from bytes this resolution actually read.
+    Computed,
+}
+
+impl Provenance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provenance::Declared => "declared",
+            Provenance::Computed => "computed",
+        }
+    }
+}
+
+/// One member of a pinned source with an EXACT identity — the fact a caller can size a
+/// disk against, plan a fetch from, or refuse on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedMember {
+    pub member: String,
+    pub object: ObjectRef,
+    pub url: String,
+    pub provenance: Provenance,
+    /// True for a member the selection names in its own right — a standalone
+    /// `.safetensors`, or an index — as opposed to a shard reached only through an index's
+    /// `weight_map`. A caller selects carriers; the shards come along because the index
+    /// says they must.
+    pub carrier: bool,
+    /// For an index member, the shard members its `weight_map` names. Sorted and unique.
+    pub requires: Vec<String>,
+}
+
+/// What one pinned source resolves to.
+///
+/// **`members.len()` is not `objects().len()`.** Two members of one repository can be the
+/// same bytes — MiniMax-H3 ships `FL2VA/transformer/model.safetensors.index.json` and
+/// `Ref2VA/transformer/model.safetensors.index.json` as one 38,323-byte object — and a
+/// content-addressed store holds that object once. Any caller that assumes member→object
+/// is injective will double-count a disk budget and mis-plan a fetch, so the two counts
+/// are separate methods here rather than one number anyone can read the wrong way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    pub canonical: String,
+    pub members: Vec<ResolvedMember>,
+    /// sha256 over the canonical source name and every (member, digest, length) triple, in
+    /// member order — one value naming this exact selection (the Go resolver's
+    /// `SelectionSHA256`, byte-for-byte the same construction).
+    pub selection_sha256: String,
+}
+
+impl Resolution {
+    /// The DISTINCT objects this source reaches, sorted by digest. This is what a store
+    /// admits and what a disk must hold.
+    pub fn objects(&self) -> Vec<ObjectRef> {
+        let mut objects: Vec<ObjectRef> = self.members.iter().map(|m| m.object.clone()).collect();
+        objects.sort_by(|left, right| left.sha256.cmp(&right.sha256));
+        objects.dedup_by(|left, right| left.sha256 == right.sha256);
+        objects
+    }
+
+    /// Summed over MEMBERS — duplicates counted once per member. This is what a tree on an
+    /// ordinary filesystem costs.
+    pub fn member_bytes(&self) -> u64 {
+        self.members.iter().map(|m| m.object.length).sum()
+    }
+
+    /// Summed over DISTINCT OBJECTS. This is the container-disk floor: a CAS store holds
+    /// one copy of shared bytes however many members name them.
+    pub fn object_bytes(&self) -> u64 {
+        self.objects().iter().map(|o| o.length).sum()
+    }
+
+    /// NARROW this resolution to exactly the carriers named, plus the shards those
+    /// carriers' indexes require. The Go resolver's `Plan.Select`, same rules.
+    ///
+    /// **This step is not optional, and omitting it fails silently.** A repository is not
+    /// a model: `MiniMaxAI/MiniMax-H3@42ed227e` resolves to 112 tensor carriers totalling
+    /// **498.3 GB**, while the two reviewed profiles that actually name a model select 5
+    /// carriers which expand to **48 members / 47 objects / 210.3 GB**. A caller that
+    /// resolves without narrowing does not get an error — it gets a download 2.4x larger
+    /// that completes successfully, which is the worst shape a regression can take. So
+    /// `select` lives beside `resolve`, and the CLI's `--source-profile` is the only way
+    /// the narrowing can be forgotten by accident.
+    ///
+    /// A name that is not a carrier is refused rather than ignored: selecting a shard
+    /// directly would silently drop the index that gives it meaning.
+    pub fn select(&self, carriers: &[String]) -> Result<Resolution> {
+        if carriers.is_empty() {
+            return refuse(
+                Code::MISSING_FIELD,
+                "a selection names at least one carrier member",
+            );
+        }
+        let mut wanted: Vec<String> = Vec::new();
+        for name in carriers {
+            let Some(row) = self.members.iter().find(|row| &row.member == name) else {
+                return refuse(
+                    Code::MISSING_FIELD,
+                    format!("the source does not contain carrier member {name:?}"),
+                );
+            };
+            if !row.carrier {
+                return refuse(
+                    Code::AMBIGUOUS_CLASSIFICATION,
+                    format!(
+                        "{name:?} is a shard reached through an index, not a carrier to                          select on its own"
+                    ),
+                );
+            }
+            wanted.push(row.member.clone());
+            wanted.extend(row.requires.iter().cloned());
+        }
+        wanted.sort();
+        wanted.dedup();
+        let members: Vec<ResolvedMember> = self
+            .members
+            .iter()
+            .filter(|row| wanted.contains(&row.member))
+            .cloned()
+            .collect();
+        Ok(Resolution {
+            selection_sha256: selection_digest(&self.canonical, &members),
+            canonical: self.canonical.clone(),
+            members,
+        })
+    }
+}
+
+/// The Go resolver's `finishPlan` digest, same construction: the canonical source name and
+/// every (member, digest, length) triple, each field NUL-terminated, in member order. One
+/// value naming this exact selection.
+fn selection_digest(canonical: &str, members: &[ResolvedMember]) -> String {
+    let mut selection = Vec::new();
+    selection.extend_from_slice(canonical.as_bytes());
+    selection.push(0);
+    for row in members {
+        selection.extend_from_slice(row.member.as_bytes());
+        selection.push(0);
+        selection.extend_from_slice(row.object.sha256.as_bytes());
+        selection.push(0);
+        selection.extend_from_slice(row.object.length.to_string().as_bytes());
+        selection.push(0);
+    }
+    crate::sha256::hex_digest(&selection)
+}
+
+fn lower_ends_with(value: &str, suffix: &str) -> bool {
+    value.to_ascii_lowercase().ends_with(suffix)
+}
+
+fn is_index(member: &str) -> bool {
+    lower_ends_with(member, ".safetensors.index.json")
+}
+
+fn is_safetensors(member: &str) -> bool {
+    lower_ends_with(member, ".safetensors")
+}
+
+/// Resolve `relative` against the directory of `member`, the way the Go resolver's
+/// `path.Clean(path.Join(path.Dir(member), shard))` does. `None` when the reference walks
+/// above the repository root — an index may not name its way out of its own tree.
+fn join_member(member: &str, relative: &str) -> Option<String> {
+    let directory = member.rsplit_once('/').map_or("", |(head, _)| head);
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in directory.split('/').chain(relative.split('/')) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// Resolve one pinned source to its exact member list: what to fetch, at what identity,
+/// from where — WITHOUT moving a tensor byte.
+///
+/// This is the owner-side question. A container disk is sized from the total here before a
+/// rental is requested, so resolution must be answerable anywhere the credential lives and
+/// must not need a `Store`: it takes none, and returns facts rather than admitting any.
+///
+/// Three steps, all through the fenced transport:
+///
+/// 1. **List** what the pinned revision reaches (`list_observed`).
+/// 2. **Select** the tensor carriers — `*.safetensors` and `*.safetensors.index.json` for
+///    HuggingFace, the one primary SafeTensors file for Civitai.
+/// 3. **Expand and identify.** Every index is read (it is JSON, tens of kilobytes) and its
+///    `weight_map` expanded into the shards it names, which must be present in the
+///    listing. Reading it is also what gives it an identity: an index is a plain git blob,
+///    so its digest exists only once these bytes have been hashed.
+///
+/// The bytes read are bounded by construction and not by hope. After step 2 the ONLY
+/// members without a provider-declared content digest are the indexes — HuggingFace keeps
+/// every tensor file in LFS — so "hash what the provider did not identify" costs kilobytes
+/// on a repository whose weights are hundreds of gigabytes. Measured on
+/// `MiniMaxAI/MiniMax-H3@42ed227e`: 280 files, 112 selected, 104 LFS and 8 plain, and all
+/// 8 of the plain ones are indexes.
+pub fn resolve(
+    uri: &SourceUri,
+    endpoints: &Endpoints,
+    credentials: &dyn CredentialProvider,
+    deadline: Deadline,
+) -> Result<Resolution> {
+    let ledger = Ledger::new();
+    let policy = endpoints.policy(uri);
+    let listed = list_observed(uri, endpoints, credentials, deadline, &ledger)?;
+
+    let selected: Vec<SourceMember> = match uri {
+        SourceUri::HuggingFace { .. } => listed
+            .into_iter()
+            .filter(|member| is_safetensors(&member.member) || is_index(&member.member))
+            .collect(),
+        SourceUri::Civitai { .. } => {
+            let primary: Vec<SourceMember> =
+                listed.into_iter().filter(|member| member.primary).collect();
+            if primary.len() != 1 {
+                return refuse(
+                    Code::COUNT_CAP,
+                    format!(
+                        "the Civitai version declares {} primary SafeTensors files; exactly \
+                         one is required",
+                        primary.len()
+                    ),
+                );
+            }
+            primary
+        }
+    };
+    if selected.is_empty() {
+        return refuse(
+            Code::MISSING_FIELD,
+            "the source reaches no tensor carrier (.safetensors or .safetensors.index.json)",
+        );
+    }
+    if selected.len() > MEMBER_MAX {
+        return refuse(
+            Code::COUNT_CAP,
+            format!("the selection names more than {MEMBER_MAX} members"),
+        );
+    }
+
+    // Pass one: an exact identity for every selected member, and the indexes' bodies.
+    let mut resolved: Vec<ResolvedMember> = Vec::with_capacity(selected.len());
+    let mut indexes: Vec<(String, Vec<u8>)> = Vec::new();
+    for member in &selected {
+        let (object, provenance) = if is_index(&member.member) {
+            // An index must be READ regardless of what the provider declared: its
+            // `weight_map` is the expansion, and reading it is also the only way its
+            // identity exists at all when it is a plain git blob.
+            let (body, _) = api_get(
+                &member.url,
+                &policy,
+                credentials,
+                INDEX_MAX_BYTES,
+                deadline,
+                &ledger,
+            )?;
+            if body.is_empty() {
+                return refuse(
+                    Code::LENGTH_MISMATCH,
+                    format!("{}: the origin served an empty index", member.member),
+                );
+            }
+            let object = ObjectRef::of(&body);
+            // A declared digest is not needed here, but if one exists the two opinions
+            // about these bytes must agree.
+            if let Some(declared) = &member.sha256 {
+                if declared != &object.sha256 {
+                    return refuse(
+                        Code::OBJECT_ID_MISMATCH,
+                        format!(
+                            "{}: the provider declared sha256:{declared} but the bytes are {}",
+                            member.member,
+                            object.id()
+                        ),
+                    );
+                }
+            }
+            indexes.push((member.member.clone(), body));
+            (object, Provenance::Computed)
+        } else {
+            match &member.sha256 {
+                Some(sha256) => {
+                    // Declared identity. A Civitai listing states kilobytes as a float,
+                    // which is an approximation and never a length, so the exact one comes
+                    // from a one-byte ranged probe through the same fence.
+                    let length = match member.length {
+                        Some(length) if length > 0 => length,
+                        _ => probe_length(&member.url, &policy, credentials, deadline, &ledger)?,
+                    };
+                    if length == 0 {
+                        return refuse(
+                            Code::LENGTH_MISMATCH,
+                            format!("{}: the origin reports a zero-length member", member.member),
+                        );
+                    }
+                    (
+                        ObjectRef {
+                            sha256: sha256.clone(),
+                            length,
+                        },
+                        Provenance::Declared,
+                    )
+                }
+                None => {
+                    // A tensor carrier the provider does not identify. On HuggingFace this
+                    // means a `.safetensors` committed outside LFS, which git keeps small;
+                    // it is hashed here, under the same bound the pull path uses for the
+                    // class, and refused rather than guessed at if it is larger.
+                    if member
+                        .length
+                        .is_some_and(|length| length > UNPINNED_MEMBER_MAX_BYTES)
+                    {
+                        return refuse(
+                            Code::SIZE_CAP,
+                            format!(
+                                "{}: the provider identifies no digest for a carrier larger \
+                                 than {UNPINNED_MEMBER_MAX_BYTES} bytes, so resolving it \
+                                 would mean downloading it",
+                                member.member
+                            ),
+                        );
+                    }
+                    let (body, _) = api_get(
+                        &member.url,
+                        &policy,
+                        credentials,
+                        UNPINNED_MEMBER_MAX_BYTES,
+                        deadline,
+                        &ledger,
+                    )?;
+                    if body.is_empty() {
+                        return refuse(
+                            Code::LENGTH_MISMATCH,
+                            format!("{}: the origin served an empty member", member.member),
+                        );
+                    }
+                    (ObjectRef::of(&body), Provenance::Computed)
+                }
+            }
+        };
+        resolved.push(ResolvedMember {
+            member: member.member.clone(),
+            object,
+            url: member.url.clone(),
+            provenance,
+            carrier: true,
+            requires: Vec::new(),
+        });
+    }
+
+    // Pass two: expand every index into the shards it names. A shard the listing does not
+    // contain is a broken selection, not a member to invent.
+    let present: Vec<String> = resolved.iter().map(|row| row.member.clone()).collect();
+    let mut referenced: Vec<String> = Vec::new();
+    for (member, body) in &indexes {
+        let document = jcs::parse(body, INDEX_MAX_BYTES as usize)?;
+        let Some(Json::Obj(weight_map)) = json_get(&document, "weight_map") else {
+            return refuse(
+                Code::MISSING_FIELD,
+                format!("{member}: the tensor index declares no weight_map object"),
+            );
+        };
+        if weight_map.is_empty() || weight_map.len() > WEIGHT_MAP_MAX {
+            return refuse(
+                Code::COUNT_CAP,
+                format!(
+                    "{member}: the tensor index names {} tensors",
+                    weight_map.len()
+                ),
+            );
+        }
+        let mut requires: Vec<String> = Vec::new();
+        for (tensor, shard) in weight_map {
+            let Json::Str(shard) = shard else {
+                return refuse(
+                    Code::WRONG_TYPE,
+                    format!("{member}: weight_map entry {tensor:?} does not name a file"),
+                );
+            };
+            let Some(resolved_shard) = join_member(member, shard) else {
+                return refuse(
+                    Code::PATH_ILLEGAL,
+                    format!("{member}: weight_map names {shard:?}, which leaves the repository"),
+                );
+            };
+            if !member_path(&resolved_shard) || !present.contains(&resolved_shard) {
+                return refuse(
+                    Code::MISSING_FIELD,
+                    format!(
+                        "{member}: weight_map names shard {resolved_shard:?}, which the \
+                         revision does not contain"
+                    ),
+                );
+            }
+            requires.push(resolved_shard);
+        }
+        requires.sort();
+        requires.dedup();
+        referenced.extend(requires.iter().cloned());
+        for row in resolved.iter_mut() {
+            if &row.member == member {
+                row.requires = requires.clone();
+            }
+        }
+    }
+    // A shard reached only through an index is not itself a carrier: a caller selects the
+    // index, and the shards follow from what it says.
+    for row in resolved.iter_mut() {
+        if referenced.contains(&row.member) {
+            row.carrier = false;
+        }
+    }
+
+    resolved.sort_by(|left, right| left.member.cmp(&right.member));
+    if resolved
+        .windows(2)
+        .any(|pair| pair[0].member == pair[1].member)
+    {
+        return refuse(Code::DUPLICATE_KEY, "the selection names one member twice");
+    }
+
+    let canonical = match uri {
+        SourceUri::HuggingFace {
+            org,
+            repo,
+            revision,
+        } => format!("hf://{org}/{repo}@{revision}"),
+        SourceUri::Civitai { version } => format!("civitai://{version}"),
+    };
+    Ok(Resolution {
+        selection_sha256: selection_digest(&canonical, &resolved),
+        canonical,
+        members: resolved,
+    })
 }
 
 #[cfg(test)]
@@ -731,6 +1248,520 @@ mod tests {
         drop(log);
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ------------------------------------------------------------------ resolution (tfs-067)
+
+    /// One HTTP response with a redirect whose `Location` is RELATIVE, which is the form
+    /// HuggingFace answers for every plain git blob.
+    fn relative_redirect(location: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// MiniMax-H3's exact shape, small enough to serve from one thread.
+    ///
+    /// Two sibling directories each hold a sharded transformer, and their two
+    /// `model.safetensors.index.json` members are BYTE-IDENTICAL — the real repository
+    /// ships `FL2VA/transformer/…` and `Ref2VA/transformer/…` as one 38,323-byte object,
+    /// `sha256:fb457a26…`. Because each index names its shards RELATIVELY, the same bytes
+    /// expand to different shards in each directory. That is the case a resolver assuming
+    /// member→object is injective gets wrong, and it is why `members` and `objects` are
+    /// separate counts.
+    struct H3Shape {
+        tree: String,
+        index_body: Vec<u8>,
+        shards: Vec<(String, ObjectRef)>,
+        vae: (String, ObjectRef),
+    }
+
+    fn h3_shape() -> H3Shape {
+        let index_body = br#"{"weight_map":{"a.weight":"model-00001-of-00002.safetensors","b.weight":"model-00002-of-00002.safetensors"}}"#.to_vec();
+        let mut shards = Vec::new();
+        for directory in ["FL2VA", "Ref2VA"] {
+            for shard in 1..=2u32 {
+                let member =
+                    format!("{directory}/transformer/model-0000{shard}-of-00002.safetensors");
+                // Seeded from the member path so no two shards collide by accident: the
+                // duplicate object in this fixture must be the one the test is about.
+                let bytes: Vec<u8> = member
+                    .as_bytes()
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(8_000)
+                    .collect();
+                shards.push((member, ObjectRef::of(&bytes)));
+            }
+        }
+        let vae_bytes: Vec<u8> = (0u32..1_500).flat_map(|i| (i * 7).to_le_bytes()).collect();
+        let vae = (
+            "vae/diffusion_pytorch_model.safetensors".to_string(),
+            ObjectRef::of(&vae_bytes),
+        );
+        let mut rows: Vec<String> = Vec::new();
+        for (member, object) in shards.iter().chain(std::iter::once(&vae)) {
+            rows.push(format!(
+                r#"{{"type":"file","path":"{member}","size":{},"oid":"gitsha1","lfs":{{"oid":"{}","size":{}}}}}"#,
+                object.length, object.sha256, object.length
+            ));
+        }
+        for directory in ["FL2VA", "Ref2VA"] {
+            // Plain git blobs: a git sha1 and NO lfs object. Their content digest does not
+            // exist until these bytes are read.
+            rows.push(format!(
+                r#"{{"type":"file","path":"{directory}/transformer/model.safetensors.index.json","size":{},"oid":"89d6b0862f66080854b239ad7a0b50c31a6de986"}}"#,
+                index_body.len()
+            ));
+        }
+        // Not a tensor carrier: the selection must drop it.
+        rows.push(r#"{"type":"file","path":"config.json","size":604,"oid":"gitsha1"}"#.to_string());
+        rows.push(r#"{"type":"directory","path":"vae"}"#.to_string());
+        H3Shape {
+            tree: format!("[{}]", rows.join(",")),
+            index_body,
+            shards,
+            vae,
+        }
+    }
+
+    /// The whole of phase one, on the shape that cost a 210 GB run: the selection drops
+    /// non-carriers, the indexes are read and hashed, `weight_map` expands relatively, the
+    /// shards keep their LFS identity untouched, and 7 members resolve to 6 objects.
+    ///
+    /// One index is served behind a RELATIVE redirect, which is what HuggingFace really
+    /// answers for a plain git blob (tfs-060). Before the `api.rs` half of that fix this
+    /// test fails with `REDIRECT_REFUSED`.
+    #[test]
+    fn resolve_expands_shards_and_identifies_every_member_class() {
+        let shape = h3_shape();
+        let revision = "ab".repeat(20);
+        let tree = shape.tree.clone();
+        let index_body = shape.index_body.clone();
+        let index_object = ObjectRef::of(&shape.index_body);
+        let revision_for_routes = revision.clone();
+        // tree(1) + FL2VA index 307 + its 200 + Ref2VA index 200 = 4. No tensor byte moves:
+        // every shard is identified by the listing alone.
+        let (base, seen, handle) = origin(4, move |request| {
+            let r = &revision_for_routes;
+            if request.path == format!("/api/models/org/repo/tree/{r}?recursive=true") {
+                ok_body(tree.as_bytes(), "application/json")
+            } else if request.path
+                == format!("/org/repo/resolve/{r}/FL2VA/transformer/model.safetensors.index.json")
+            {
+                relative_redirect(&format!(
+                    "/api/resolve-cache/models/org/repo/{r}/FL2VA.json"
+                ))
+            } else if request.path == format!("/api/resolve-cache/models/org/repo/{r}/FL2VA.json")
+                || request.path
+                    == format!(
+                        "/org/repo/resolve/{r}/Ref2VA/transformer/model.safetensors.index.json"
+                    )
+            {
+                ok_body(&index_body, "application/json")
+            } else {
+                panic!(
+                    "unrouted path {} — resolution read something it should not",
+                    request.path
+                )
+            }
+        });
+        let uri = SourceUri::parse(&format!("hf://org/repo@{revision}")).unwrap();
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        let resolved = resolve(&uri, &endpoints, &Anonymous, Deadline::none()).unwrap();
+
+        // The selection is the tensor carriers and nothing else: config.json is gone.
+        assert_eq!(resolved.members.len(), 7);
+        assert!(!resolved
+            .members
+            .iter()
+            .any(|row| row.member == "config.json"));
+
+        // NON-INJECTIVE: 7 members, 6 distinct objects. The two indexes are one object.
+        assert_eq!(resolved.objects().len(), 6);
+        assert_eq!(
+            resolved.member_bytes() - resolved.object_bytes(),
+            index_object.length,
+            "the duplicated index must be counted once against a disk and twice against a tree"
+        );
+
+        // Digest provenance, per member class.
+        for (member, object) in shape.shards.iter().chain(std::iter::once(&shape.vae)) {
+            let row = resolved
+                .members
+                .iter()
+                .find(|row| &row.member == member)
+                .unwrap_or_else(|| panic!("{member} missing"));
+            assert_eq!(&row.object, object, "{member}: LFS identity must survive");
+            assert_eq!(
+                row.provenance,
+                Provenance::Declared,
+                "{member}: an LFS row states a content sha256"
+            );
+        }
+        for directory in ["FL2VA", "Ref2VA"] {
+            let member = format!("{directory}/transformer/model.safetensors.index.json");
+            let row = resolved
+                .members
+                .iter()
+                .find(|row| row.member == member)
+                .unwrap();
+            assert_eq!(
+                row.object, index_object,
+                "a plain git blob's identity is the digest of its bytes, never its git sha1"
+            );
+            assert_eq!(row.provenance, Provenance::Computed);
+            // The SAME index bytes expand to the shards of their OWN directory.
+            assert_eq!(
+                row.requires,
+                vec![
+                    format!("{directory}/transformer/model-00001-of-00002.safetensors"),
+                    format!("{directory}/transformer/model-00002-of-00002.safetensors"),
+                ]
+            );
+            assert!(row.carrier, "an index is a carrier");
+        }
+
+        // A shard reached through an index is not itself a carrier; a standalone one is.
+        for (member, _) in &shape.shards {
+            let row = resolved
+                .members
+                .iter()
+                .find(|row| &row.member == member)
+                .unwrap();
+            assert!(!row.carrier, "{member} is reached through its index");
+        }
+        assert!(
+            resolved
+                .members
+                .iter()
+                .find(|row| row.member == shape.vae.0)
+                .unwrap()
+                .carrier,
+            "an unsharded .safetensors is its own carrier"
+        );
+
+        assert_eq!(resolved.canonical, format!("hf://org/repo@{revision}"));
+        assert_eq!(resolved.selection_sha256.len(), 64);
+        assert_eq!(seen.lock().unwrap().len(), 4, "resolution is four reads");
+        handle.join().unwrap();
+    }
+
+    /// A gated repository answers an unauthenticated listing with the LFS oid replaced by
+    /// sixty-four asterisks. Verified live against `meta-llama/Llama-3.2-1B`, whose
+    /// `model.safetensors` lists `size: 2471645608` and `oid: "****…"`. Read naively that
+    /// member simply has no digest, and the failure surfaces as a size complaint about a
+    /// 2.4 GB file — pointing at the wrong problem entirely. The credential is the answer,
+    /// so the refusal says so.
+    #[test]
+    fn a_gated_repository_names_the_credential_and_not_the_size() {
+        let revision = "56".repeat(20);
+        let tree = format!(
+            r#"[{{"type":"file","path":"model.safetensors","size":2471645608,"oid":"gitsha1","lfs":{{"oid":"{}","size":2471645608}}}}]"#,
+            "*".repeat(64)
+        );
+        let revision_for_routes = revision.clone();
+        let (base, _, handle) = origin(1, move |request| {
+            let r = &revision_for_routes;
+            assert_eq!(
+                request.path,
+                format!("/api/models/org/gated/tree/{r}?recursive=true")
+            );
+            ok_body(tree.as_bytes(), "application/json")
+        });
+        let uri = SourceUri::parse(&format!("hf://org/gated@{revision}")).unwrap();
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        let refusal = resolve(&uri, &endpoints, &Anonymous, Deadline::none()).unwrap_err();
+        assert_eq!(refusal.code, Code::CREDENTIAL_REQUIRED);
+        assert!(refusal.detail.contains("--credential-file"));
+        handle.join().unwrap();
+    }
+
+    /// Every HuggingFace repository carries `.gitattributes`, whose leading dot is outside
+    /// the member grammar. Refusing the whole listing over it made `source list` fail on
+    /// every real repository; a non-carrier is skipped, a carrier is still refused.
+    #[test]
+    fn an_unnameable_non_carrier_is_skipped_and_an_unnameable_carrier_is_not() {
+        let revision = "78".repeat(20);
+        let shard: Vec<u8> = (0u32..1_000).flat_map(|i| i.to_le_bytes()).collect();
+        let object = ObjectRef::of(&shard);
+        let good = format!(
+            r#"[{{"type":"file","path":".gitattributes","size":1519,"oid":"gitsha1"}},
+                {{"type":"file","path":"model.safetensors","size":{},"oid":"gitsha1","lfs":{{"oid":"{}","size":{}}}}}]"#,
+            object.length, object.sha256, object.length
+        );
+        let revision_for_routes = revision.clone();
+        let (base, _, handle) = origin(1, move |_request| {
+            let _ = &revision_for_routes;
+            ok_body(good.as_bytes(), "application/json")
+        });
+        let uri = SourceUri::parse(&format!("hf://org/repo@{revision}")).unwrap();
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        let resolved = resolve(&uri, &endpoints, &Anonymous, Deadline::none()).unwrap();
+        assert_eq!(resolved.members.len(), 1);
+        assert_eq!(resolved.members[0].member, "model.safetensors");
+        handle.join().unwrap();
+
+        // The same path, but on a member the selection WOULD have taken: refused, because
+        // silently dropping it would shrink the model and still succeed.
+        let bad = r#"[{"type":"file","path":".hidden/model.safetensors","size":10,"oid":"g"}]"#;
+        let (base, _, handle) = origin(1, move |_| ok_body(bad.as_bytes(), "application/json"));
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        assert_eq!(
+            resolve(&uri, &endpoints, &Anonymous, Deadline::none())
+                .unwrap_err()
+                .code,
+            Code::KEY_GRAMMAR
+        );
+        handle.join().unwrap();
+    }
+
+    /// NARROWING is the difference between 210 GB and 498 GB, and its absence is a
+    /// SUCCESSFUL download of the wrong size. Selecting one carrier keeps that carrier and
+    /// exactly the shards its own index names — not its sibling's, though the two indexes
+    /// are the same object.
+    #[test]
+    fn select_narrows_to_one_carrier_and_the_shards_it_requires() {
+        let shape = h3_shape();
+        let revision = "34".repeat(20);
+        let tree = shape.tree.clone();
+        let index_body = shape.index_body.clone();
+        let revision_for_routes = revision.clone();
+        let (base, _, handle) = origin(3, move |request| {
+            let r = &revision_for_routes;
+            if request.path == format!("/api/models/org/repo/tree/{r}?recursive=true") {
+                ok_body(tree.as_bytes(), "application/json")
+            } else {
+                ok_body(&index_body, "application/json")
+            }
+        });
+        let uri = SourceUri::parse(&format!("hf://org/repo@{revision}")).unwrap();
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        let whole = resolve(&uri, &endpoints, &Anonymous, Deadline::none()).unwrap();
+        assert_eq!(whole.members.len(), 7);
+
+        let narrowed = whole
+            .select(&["FL2VA/transformer/model.safetensors.index.json".to_string()])
+            .unwrap();
+        assert_eq!(
+            narrowed
+                .members
+                .iter()
+                .map(|row| row.member.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "FL2VA/transformer/model-00001-of-00002.safetensors",
+                "FL2VA/transformer/model-00002-of-00002.safetensors",
+                "FL2VA/transformer/model.safetensors.index.json",
+            ],
+            "the sibling directory's shards are NOT reached, though its index is the same \
+             object"
+        );
+        assert!(narrowed.object_bytes() < whole.object_bytes());
+        // A narrowing is a different selection, and says so.
+        assert_ne!(narrowed.selection_sha256, whole.selection_sha256);
+        // Selecting the same carriers twice is the same answer.
+        assert_eq!(
+            narrowed.selection_sha256,
+            whole
+                .select(&["FL2VA/transformer/model.safetensors.index.json".to_string()])
+                .unwrap()
+                .selection_sha256
+        );
+
+        // A shard is not a carrier: selecting one directly would silently drop the index
+        // that gives it meaning, so it is refused rather than ignored.
+        assert_eq!(
+            whole
+                .select(&["FL2VA/transformer/model-00001-of-00002.safetensors".to_string()])
+                .unwrap_err()
+                .code,
+            Code::AMBIGUOUS_CLASSIFICATION
+        );
+        assert_eq!(
+            whole
+                .select(&["absent/model.safetensors".to_string()])
+                .unwrap_err()
+                .code,
+            Code::MISSING_FIELD
+        );
+        assert_eq!(whole.select(&[]).unwrap_err().code, Code::MISSING_FIELD);
+        handle.join().unwrap();
+    }
+
+    /// An index naming a shard the revision does not contain is a broken selection. The
+    /// Go resolver refuses it; so does this one, rather than inventing a member.
+    #[test]
+    fn resolve_refuses_an_index_naming_an_absent_shard() {
+        let revision = "cd".repeat(20);
+        let index_body =
+            br#"{"weight_map":{"a.weight":"model-00009-of-00009.safetensors"}}"#.to_vec();
+        let tree = format!(
+            r#"[{{"type":"file","path":"transformer/model.safetensors.index.json","size":{},"oid":"gitsha1"}}]"#,
+            index_body.len()
+        );
+        let revision_for_routes = revision.clone();
+        let (base, _, handle) = origin(2, move |request| {
+            let r = &revision_for_routes;
+            if request.path == format!("/api/models/org/repo/tree/{r}?recursive=true") {
+                ok_body(tree.as_bytes(), "application/json")
+            } else {
+                ok_body(&index_body, "application/json")
+            }
+        });
+        let uri = SourceUri::parse(&format!("hf://org/repo@{revision}")).unwrap();
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        let refusal = resolve(&uri, &endpoints, &Anonymous, Deadline::none()).unwrap_err();
+        assert_eq!(refusal.code, Code::MISSING_FIELD);
+        assert!(refusal.detail.contains("model-00009-of-00009.safetensors"));
+        handle.join().unwrap();
+    }
+
+    /// An index may not name its way out of the repository.
+    #[test]
+    fn resolve_refuses_an_index_escaping_the_repository() {
+        let revision = "ef".repeat(20);
+        let index_body = br#"{"weight_map":{"a.weight":"../../../etc/passwd"}}"#.to_vec();
+        let tree = format!(
+            r#"[{{"type":"file","path":"transformer/model.safetensors.index.json","size":{},"oid":"gitsha1"}}]"#,
+            index_body.len()
+        );
+        let revision_for_routes = revision.clone();
+        let (base, _, handle) = origin(2, move |request| {
+            let r = &revision_for_routes;
+            if request.path == format!("/api/models/org/repo/tree/{r}?recursive=true") {
+                ok_body(tree.as_bytes(), "application/json")
+            } else {
+                ok_body(&index_body, "application/json")
+            }
+        });
+        let uri = SourceUri::parse(&format!("hf://org/repo@{revision}")).unwrap();
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        let refusal = resolve(&uri, &endpoints, &Anonymous, Deadline::none()).unwrap_err();
+        assert_eq!(refusal.code, Code::PATH_ILLEGAL);
+        handle.join().unwrap();
+    }
+
+    /// Civitai: one version is a bag of files, and the one to take is the primary
+    /// SafeTensors. Its digest is declared but its length is only approximate kilobytes,
+    /// so the exact length comes from a ranged probe through the same fence.
+    #[test]
+    fn resolve_takes_the_one_primary_civitai_safetensors() {
+        let body: Vec<u8> = (0u32..9_000).flat_map(|i| i.to_le_bytes()).collect();
+        let object = ObjectRef::of(&body);
+        let listing = format!(
+            r#"{{"id":777,"files":[
+               {{"name":"model.safetensors","primary":true,"sizeKB":35.15,"hashes":{{"SHA256":"{}"}},"metadata":{{"format":"SafeTensor"}}}},
+               {{"name":"extra.safetensors","primary":false,"sizeKB":1.0,"hashes":{{"SHA256":"{}"}}}}
+            ]}}"#,
+            object.sha256.to_ascii_uppercase(),
+            "11".repeat(32)
+        );
+        let length = object.length;
+        let (base, _, handle) = origin(2, move |request| {
+            if request.path == "/api/v1/model-versions/777" {
+                ok_body(listing.as_bytes(), "application/json")
+            } else {
+                format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/{length}\r\nETag: \"tag\"\r\nConnection: close\r\n\r\n\0"
+                )
+                .into_bytes()
+            }
+        });
+        let uri = SourceUri::parse("civitai://777").unwrap();
+        let endpoints = Endpoints {
+            civitai: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        let resolved = resolve(&uri, &endpoints, &Anonymous, Deadline::none()).unwrap();
+        assert_eq!(resolved.members.len(), 1);
+        assert_eq!(resolved.members[0].member, "model.safetensors");
+        assert_eq!(resolved.members[0].object, object);
+        assert_eq!(resolved.members[0].provenance, Provenance::Declared);
+        assert!(resolved.members[0].carrier);
+        assert_eq!(resolved.canonical, "civitai://777");
+        handle.join().unwrap();
+    }
+
+    /// The credential is scoped to the host that holds it. A relative redirect stays on
+    /// that host and keeps the bearer; the fence re-checks it either way.
+    #[test]
+    fn resolve_presents_the_credential_only_to_the_scoped_host() {
+        let revision = "12".repeat(20);
+        let index_body =
+            br#"{"weight_map":{"a.weight":"model-00001-of-00001.safetensors"}}"#.to_vec();
+        let shard: Vec<u8> = (0u32..1_000).flat_map(|i| i.to_le_bytes()).collect();
+        let shard_object = ObjectRef::of(&shard);
+        let tree = format!(
+            r#"[{{"type":"file","path":"model.safetensors.index.json","size":{},"oid":"gitsha1"}},
+                {{"type":"file","path":"model-00001-of-00001.safetensors","size":{},"oid":"gitsha1","lfs":{{"oid":"{}","size":{}}}}}]"#,
+            index_body.len(),
+            shard_object.length,
+            shard_object.sha256,
+            shard_object.length
+        );
+        let revision_for_routes = revision.clone();
+        let (base, seen, handle) = origin(2, move |request| {
+            let r = &revision_for_routes;
+            if request.path == format!("/api/models/org/repo/tree/{r}?recursive=true") {
+                ok_body(tree.as_bytes(), "application/json")
+            } else {
+                ok_body(&index_body, "application/json")
+            }
+        });
+        let uri = SourceUri::parse(&format!("hf://org/repo@{revision}")).unwrap();
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        // Scoped to a host this resolution never speaks to: nothing may present it.
+        let elsewhere = HostToken {
+            hosts: vec!["cdn.example.invalid".into()],
+            token: "hf_secret".into(),
+        };
+        let resolved = resolve(&uri, &endpoints, &elsewhere, Deadline::none()).unwrap();
+        assert_eq!(resolved.members.len(), 2);
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|(_, authorization)| authorization.is_none()),
+            "a token scoped to another host must never be presented"
+        );
+        handle.join().unwrap();
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::transport::http::{self, Client};
 use crate::transport::hub::CredentialProvider;
 use crate::transport::ledger::{Deadline, Ledger};
 use crate::transport::policy::SourcePolicy;
+use crate::transport::pull::absolute_location;
 use std::sync::OnceLock;
 
 fn shared_client() -> &'static Client {
@@ -117,13 +118,19 @@ fn open_following_with<'l>(
             let Some(location) = response.header("location").map(str::to_string) else {
                 return refuse(Code::REDIRECT_REFUSED, "origin redirected with no Location");
             };
-            if !location.contains("://") {
+            // RFC 9110 §10.2.2 permits a relative reference here and HuggingFace uses
+            // one for every plain git blob — which is exactly the class resolution must
+            // read (`*.safetensors.index.json`). tfs-060 fixed this in the object path's
+            // opener and left the API path's own copy behind; this is that same fix.
+            // The fence is unchanged: the resolved reference goes back through
+            // `policy.check` on the next hop like any other.
+            let Some(absolute) = absolute_location(&checked, &location) else {
                 return refuse(
                     Code::REDIRECT_REFUSED,
-                    "origin redirected to a non-absolute URL",
+                    "origin redirected with an unusable Location",
                 );
-            }
-            target = location;
+            };
+            target = absolute;
             continue;
         }
         return Ok(response);
