@@ -18,6 +18,7 @@ use tensorfs_core::canon;
 use tensorfs_core::fetch::{self, DeliveryGrant, FetchPlan};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::Manifest;
+use tensorfs_core::staging;
 use tensorfs_core::store::Store;
 use tensorfs_core::transport::ObjectSource;
 
@@ -463,27 +464,54 @@ impl transport::FetchObserver for Reporter {
 /// supervisor cannot read: the H3 ingest moved 210 GB over 2h56m and its only signal was a
 /// cumulative byte total at each file's COMPLETION, so "slow" and "wedged" looked identical
 /// for the whole run and the run was lost.
-pub fn cmd_url(root: &Path, id: &str, length: &str, url: &str, flags: &Flags) -> ExitCode {
+/// A url of `-` reads the real URL as one line on stdin: a capability URL can embed a
+/// signature, and argv is world-readable in /proc.
+fn url_of(url: &str) -> Result<String, ExitCode> {
     use std::io::BufRead;
-    let store = ok!(Store::open(root));
-    let stdin_url;
-    let url = if url == "-" {
-        let mut line = String::new();
-        if io::stdin().lock().read_line(&mut line).is_err() {
-            eprintln!("REFUSED SOURCE_NOT_ALLOWED: could not read the URL from stdin");
-            return ExitCode::FAILURE;
+    if url != "-" {
+        return Ok(url.to_string());
+    }
+    let mut line = String::new();
+    if io::stdin().lock().read_line(&mut line).is_err() {
+        eprintln!("REFUSED SOURCE_NOT_ALLOWED: could not read the URL from stdin");
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(line.trim().to_string())
+}
+
+fn object_of(what: &str, id: &str, length: &str) -> Result<ObjectRef, ExitCode> {
+    let sha256 = match tensorfs_core::ids::hex64(what, id) {
+        Ok(sha256) => sha256,
+        Err(refusal) => {
+            eprintln!("REFUSED {refusal}");
+            return Err(ExitCode::FAILURE);
         }
-        stdin_url = line.trim().to_string();
-        stdin_url.as_str()
-    } else {
-        url
     };
-    let sha256 = ok!(tensorfs_core::ids::hex64("fetch url object", id));
     let Ok(length) = length.parse::<u64>() else {
         eprintln!("length must be a byte count");
-        return ExitCode::from(2);
+        return Err(ExitCode::from(2));
     };
-    let object = ObjectRef { sha256, length };
+    Ok(ObjectRef { sha256, length })
+}
+
+fn ranged_of(flags: &Flags) -> transport::Ranged {
+    transport::Ranged {
+        streams: crate::flag_num(flags, "streams", transport::SOURCE_STREAMS),
+        part: crate::flag_num::<u64>(flags, "part-mib", transport::PART_BYTES >> 20) << 20,
+    }
+}
+
+pub fn cmd_url(root: &Path, id: &str, length: &str, url: &str, flags: &Flags) -> ExitCode {
+    let store = ok!(Store::open(root));
+    let url = match url_of(url) {
+        Ok(url) => url,
+        Err(code) => return code,
+    };
+    let url = url.as_str();
+    let object = match object_of("fetch url object", id, length) {
+        Ok(object) => object,
+        Err(code) => return code,
+    };
     let session = flag(flags, "session").unwrap_or("fetch-url");
     let (plan, _) = ok!(FetchPlan::of_objects(
         &store,
@@ -499,10 +527,6 @@ pub fn cmd_url(root: &Path, id: &str, length: &str, url: &str, flags: &Flags) ->
     let ledger = transport::Ledger::new();
     let mut reporter = crate::flag_on(flags, "progress")
         .then(|| Reporter::new(crate::flag_num(flags, "progress-bytes", SAMPLE_BYTES)));
-    let ranged = transport::Ranged {
-        streams: crate::flag_num(flags, "streams", transport::SOURCE_STREAMS),
-        part: crate::flag_num::<u64>(flags, "part-mib", transport::PART_BYTES >> 20) << 20,
-    };
     let fetched = transport::fetch_ranged(
         &store,
         &grant,
@@ -511,7 +535,7 @@ pub fn cmd_url(root: &Path, id: &str, length: &str, url: &str, flags: &Flags) ->
         &Anonymous,
         deadline_of(flags),
         &ledger,
-        ranged,
+        ranged_of(flags),
         reporter
             .as_mut()
             .map(|r| r as &mut dyn transport::FetchObserver),
@@ -528,6 +552,130 @@ pub fn cmd_url(root: &Path, id: &str, length: &str, url: &str, flags: &Flags) ->
     }
     println!("admitted     {}", fetched.admitted.object.id());
     println!("transferred  {} B", fetched.transferred);
+    ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------------ the staging area
+
+/// `tfs staging fetch <root> <sha256> <length> <url|-> [--progress] [--streams N] …` — the
+/// SOURCE-CARRIER fetch, and the one verb the pod's source lane calls.
+///
+/// It is `fetch url`'s transport exactly: the same policy fence on the first URL and every
+/// redirect hop, the same ranged resume, the same event channel, and the same digest
+/// enforced by the same hashing core. What differs is where the bytes come to rest — a
+/// carrier lands at `<root>/staging/<hex>`, outside every namespace a census walks, with no
+/// catalog record and nothing to garbage-collect. `tfs fetch url` is UNCHANGED and still
+/// admits repo objects to the CAS; there is deliberately no flag that could put a 5 GB
+/// carrier in `blobs/` or a repo object in `staging/`.
+///
+/// Two dispositions, and the second is what makes a restart cheap:
+///
+///   present <id> — a staged file at the right length REHASHED to the id asked for. Zero
+///                  bytes moved, which is the behaviour `fetch url` has today for a HELD
+///                  object and which a port could silently have dropped.
+///   staged  <id> — this call moved the bytes.
+///
+/// `path` is on stdout in both cases, because the point of this issue is that the caller
+/// stops deriving TensorFS's internal layout by hand.
+pub fn cmd_staging_fetch(
+    root: &Path,
+    id: &str,
+    length: &str,
+    url: &str,
+    flags: &Flags,
+) -> ExitCode {
+    let store = ok!(Store::open(root));
+    let url = match url_of(url) {
+        Ok(url) => url,
+        Err(code) => return code,
+    };
+    let object = match object_of("staging fetch object", id, length) {
+        Ok(object) => object,
+        Err(code) => return code,
+    };
+    // Residency by REHASH, never by a record: a carrier is a file the store is about to
+    // throw away, and a durable claim about one would outlive it.
+    if let Some(path) = ok!(staging::staged(&store, &object)) {
+        println!("present      {}", object.id());
+        println!("path         {}", path.display());
+        println!("transferred  0 B");
+        return ExitCode::SUCCESS;
+    }
+    let session = flag(flags, "session").unwrap_or("staging");
+    let grant = ok!(fetch::DeliveryGrant::stage(session, &object));
+    let ledger = transport::Ledger::new();
+    let mut reporter = crate::flag_on(flags, "progress")
+        .then(|| Reporter::new(crate::flag_num(flags, "progress-bytes", SAMPLE_BYTES)));
+    let fetched = transport::fetch_ranged(
+        &store,
+        &grant,
+        &url,
+        &policy_of(flags),
+        &Anonymous,
+        deadline_of(flags),
+        &ledger,
+        ranged_of(flags),
+        reporter
+            .as_mut()
+            .map(|r| r as &mut dyn transport::FetchObserver),
+    );
+    let fetched = match fetched {
+        Ok(fetched) => fetched,
+        Err(refusal) => return bail(refusal),
+    };
+    if let Some(reporter) = reporter.as_mut() {
+        reporter.moved = fetched.transferred;
+        reporter.announce(1);
+    }
+    let path = ok!(staging::path(&store, &fetched.admitted.object.sha256));
+    println!("staged       {}", fetched.admitted.object.id());
+    println!("path         {}", path.display());
+    println!("transferred  {} B", fetched.transferred);
+    ExitCode::SUCCESS
+}
+
+/// `tfs staging drop <root> <sha256>` — retire one spent carrier. One unlink, IDEMPOTENT:
+/// an id that is not there is success, because the caller's intent is already true.
+///
+/// This is the consumer of `Progress.spent` — the carriers no remaining conversion op will
+/// read. It needs no hold check, no chain check and no catalog surgery, because there is
+/// nothing to be atomic about.
+pub fn cmd_staging_drop(root: &Path, id: &str) -> ExitCode {
+    let store = ok!(Store::open(root));
+    let sha256 = ok!(tensorfs_core::ids::hex64("staging drop object", id));
+    let removed = ok!(staging::remove(&store, &sha256));
+    println!(
+        "{}      sha256:{sha256}",
+        if removed { "dropped" } else { "absent " }
+    );
+    ExitCode::SUCCESS
+}
+
+/// `tfs staging clear <root>` — sweep the whole area, plus the orphan `stage-` temps of
+/// fetches that died before linking.
+///
+/// The end-of-operation call. `drop` retires what the converter says is spent; this retires
+/// everything the converter never got to say anything about, so a crash cannot leak 210 GB
+/// into the next run on the same pod. A live fetch's temp is kept, on the kernel lock.
+pub fn cmd_staging_clear(root: &Path) -> ExitCode {
+    let store = ok!(Store::open(root));
+    let cleared = ok!(staging::clear(&store));
+    println!("cleared      {} carrier(s)", cleared.carriers);
+    println!("reclaimed    {} B", cleared.bytes);
+    println!("temps        {} orphan(s)", cleared.temps);
+    ExitCode::SUCCESS
+}
+
+/// `tfs staging list <root>` — every carrier on disk, its length and its absolute path.
+pub fn cmd_staging_list(root: &Path) -> ExitCode {
+    let store = ok!(Store::open(root));
+    let carriers = ok!(staging::list(&store));
+    let mut bytes = 0u64;
+    for carrier in &carriers {
+        bytes = bytes.saturating_add(carrier.length);
+        println!("{}", ok!(staging::line(&store, carrier)));
+    }
+    println!("staged       {} carrier(s), {bytes} B", carriers.len());
     ExitCode::SUCCESS
 }
 
