@@ -271,6 +271,12 @@ struct Wire {
     moved: AtomicU64,
     next: AtomicUsize,
     stop: AtomicBool,
+    /// Workers that have not yet returned. The reader waits on `filled` for bytes that only
+    /// a worker can produce, so "every worker is gone and the object is not whole" has to be
+    /// a recorded FAILURE and not a silence — otherwise a worker that dies in a way this
+    /// module did not anticipate is an unkillable hang on a pod, hours into a transfer,
+    /// which is precisely the failure mode this whole lane exists to stop having.
+    live: AtomicUsize,
 }
 
 struct State {
@@ -310,6 +316,52 @@ impl Wire {
         }
         drop(state);
         self.filled.notify_all();
+    }
+
+    /// One worker has returned, however it returned. The LAST one out with the object still
+    /// incomplete and nothing recorded leaves a refusal behind, so the reader wakes and the
+    /// door refuses instead of blocking on bytes nobody is fetching any more. Poison-tolerant
+    /// because this runs in a `Drop` and panicking there would abort the process.
+    fn gone(&self) {
+        if self.live.fetch_sub(1, Ordering::AcqRel) > 1 {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.failure.is_none() && state.contiguous < state.done.len() && !self.stopped() {
+            state.failure = Some(Refusal {
+                code: Code::TRANSFER_FAILED,
+                detail: format!(
+                    "every stream stopped with {} of {} parts assembled",
+                    state.contiguous,
+                    state.done.len()
+                ),
+            });
+        }
+        drop(state);
+        self.filled.notify_all();
+    }
+}
+
+/// Decrements the live count however the worker leaves — return, refusal, or unwind.
+struct Worker<'a>(&'a Wire);
+
+impl Drop for Worker<'_> {
+    fn drop(&mut self) {
+        self.0.gone();
+    }
+}
+
+/// Sets `stop` however the door leaves, so a reader that unwinds does not leave eight
+/// streams pulling bytes into a scratch file nobody will read.
+struct Door<'a>(&'a Wire);
+
+impl Drop for Door<'_> {
+    fn drop(&mut self) {
+        self.0.stop.store(true, Ordering::Relaxed);
+        self.0.filled.notify_all();
     }
 }
 
@@ -387,12 +439,15 @@ fn assemble(
         moved: AtomicU64::new(0),
         next: AtomicUsize::new(0),
         stop: AtomicBool::new(false),
+        live: AtomicUsize::new(0),
     };
     let streams = ranged.streams.min(parts);
+    wire.live.store(streams, Ordering::Relaxed);
 
     let admitted = std::thread::scope(|scope| -> Result<Admitted> {
         for _ in 0..streams {
             scope.spawn(|| {
+                let _worker = Worker(&wire);
                 loop {
                     if wire.stopped() || wire.state.lock().unwrap().failure.is_some() {
                         return;
@@ -435,12 +490,12 @@ fn assemble(
             reported: 0,
             tick: ledger.sample(),
         };
-        let outcome = grant.admit(store, &mut reader);
-        // The door has read every byte it is going to read, whichever way it answered.
-        // Anything still on the wire is unwanted, and a worker blocked on the window must
-        // not hold the scope open waiting for a reader that has gone.
-        wire.stop.store(true, Ordering::Relaxed);
-        wire.filled.notify_all();
+        // The door has read every byte it is going to read, whichever way it answered —
+        // including by unwinding. Anything still on the wire is unwanted after that.
+        let outcome = {
+            let _door = Door(&wire);
+            grant.admit(store, &mut reader)
+        };
         reader.report();
         match outcome {
             Ok(admitted) => Ok(admitted),
