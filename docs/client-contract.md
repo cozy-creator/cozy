@@ -265,7 +265,7 @@ URLs but remain local-scope rows in the same guarded route table.
 | `POST /v1/local/daemon/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
 | `POST /v1/local/daemon/down` | local | yes | safe down fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
-| `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists |
+| `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
 | `POST /v1/local/jobs/{id}/cancel` | local | yes | request cancellation; a queued job leaves the queue, a running one gets its terminal |
 | `GET /{$}` | local | no | embedded localhost web UI entrypoint |
 | `GET /app.css` | local | no | embedded localhost web UI stylesheet |
