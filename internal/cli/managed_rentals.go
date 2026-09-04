@@ -287,10 +287,22 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 		return none, "", exit.New(exit.Canceled, "request %s settled before rental acquisition", req.ID)
 	}
 	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s\n", sku.Name, skuRate(sku))
+	// The buy and the boot are the request's own phase until a worker exists to carry
+	// one (cl-121). Every readiness poll reports what the hub currently says, so the
+	// wait between "renting" and "attachable" is named while it passes.
+	m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{Name: orchestrator.PhaseAcquiring})
+	defer m.owner.ForgetPhase(req.ID)
 	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name,
 		"managed-rental-"+req.ID, "",
 		sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
-		m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID)
+		m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID,
+		func(seen hub.Rental) {
+			if name := orchestrator.PhaseOfHubRental(seen.State, seen.ProviderState,
+				seen.ContainerState); name != "" {
+				m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{
+					Name: name, Machine: seen.Name, Detail: seen.Detail})
+			}
+		})
 	if problem != nil {
 		return none, "", problem
 	}

@@ -115,7 +115,7 @@ func handleRent(ctx *Context) *exit.Error {
 
 	row, attachable, replay, e := acquireRental(ctx, l, st, skuName,
 		operationKey, reason, sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
-		ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "")
+		ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "", nil)
 	if e != nil {
 		return e
 	}
@@ -167,11 +167,19 @@ func handleRent(ctx *Context) *exit.Error {
 // worker's authenticated attach projection are durable locally.
 func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName,
 	operationKey, reason string, hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros int64,
-	deadline time.Time, managedRequestID string,
+	deadline time.Time, managedRequestID string, phase acquisitionPhase,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
 	return acquireRentalContext(context.Background(), ctx, l, st, skuName, operationKey,
-		reason, hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros, deadline, managedRequestID)
+		reason, hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros, deadline,
+		managedRequestID, phase)
 }
+
+// acquisitionPhase reports one readiness observation to whoever is waiting on this
+// acquisition. It exists so the seconds between "renting" and "attachable" are named
+// while they pass instead of being one silent edge (cl-121): the hub is polled the whole
+// time and its answer already says which side of the boundary the pod is on. A caller
+// with nobody to tell passes nil.
+type acquisitionPhase func(hub.Rental)
 
 // hourlyRateUSDMicros is the LOCKED accepted quote — the hub's GPU list rate,
 // the figure the fresh-acceptance guard compares. storageUSDMicros is the
@@ -180,7 +188,7 @@ func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName,
 func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout,
 	st *records.Store, skuName, operationKey, reason string,
 	hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros int64,
-	deadline time.Time, managedRequestID string,
+	deadline time.Time, managedRequestID string, phase acquisitionPhase,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
 	c := client(ctx)
 	existing, e := st.RentalOperation(operationKey)
@@ -317,6 +325,9 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		return records.Rental{}, hub.Rental{}, false, e
 	}
 	observe := func(seen hub.Rental) *exit.Error {
+		if phase != nil {
+			phase(seen)
+		}
 		if seen.Name != row.MachineName {
 			return exit.Named(exit.Conflict, "rental.machine_name_changed",
 				"rental %s changed its name from %s to %s", seen.ID, row.MachineName, seen.Name)

@@ -345,6 +345,9 @@ type Orchestrator struct {
 	// frames is the LOSSY live lane's fanout (stream.go). The durable lane is rows in
 	// the records authority; these two are the whole event surface cl-006 serves.
 	frames *fanout
+	// phases is the preparation-phase lane (phase.go): what a request is doing before
+	// its first attempt exists. Live-only and observational, exactly like `frames`.
+	phases *phases
 	// transferWake is a lossy nudge over durable request-attached transfer rows.
 	transferWake        map[string]chan struct{}
 	transferRunning     map[string]bool
@@ -387,6 +390,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		parked:              map[string]*parking{},
 		ensuring:            map[string]chan struct{}{},
 		frames:              newFanout(),
+		phases:              newPhases(),
 		transferWake:        make(map[string]chan struct{}),
 		transferRunning:     make(map[string]bool),
 		transferDispatching: make(map[string]bool),
