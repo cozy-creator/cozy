@@ -177,7 +177,7 @@ func helpArgs(args []string) []string {
 	}
 	if len(args) == 1 {
 		switch args[0] {
-		case "package", "model":
+		case "package", "model", "rental":
 			return []string{args[0], "--help"}
 		case "run":
 			return []string{"run", "org/package/function", "--help"}

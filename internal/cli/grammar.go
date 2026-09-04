@@ -349,11 +349,12 @@ func (c *RunWatchCmd) Run(r *Runtime) error {
 	return r.call(handleRunWatch, []string{c.ID}, nil, nil, true)
 }
 
+// RentalCmd has no default subcommand: bare `cozy rental` prints its verbs, the way
+// bare `cozy package` and `cozy model` do.
 type RentalCmd struct {
-	Current RentalListCmd `cmd:"" default:"1" hidden:""`
-	List    RentalListCmd `cmd:"" help:"List rented machines, live on a terminal."`
-	New     RentalNewCmd  `cmd:"" help:"Start a private rental."`
-	End     RentalEndCmd  `cmd:"" help:"End a private rental and stop billing."`
+	List RentalListCmd `cmd:"" help:"List rented machines, live on a terminal."`
+	New  RentalNewCmd  `cmd:"" help:"Start a private rental."`
+	End  RentalEndCmd  `cmd:"" help:"End a private rental and stop billing."`
 }
 
 type RentalNewCmd struct {

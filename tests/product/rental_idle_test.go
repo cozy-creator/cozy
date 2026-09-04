@@ -84,7 +84,7 @@ func TestRentalIdleRelease(t *testing.T) {
 	if hub.releases("rental-idle-busy") != 0 {
 		t.Fatalf("the hub saw a release of a busy rental\n%s", tail(logPath))
 	}
-	code, out := runCozy(t, root, "rental")
+	code, out := runCozy(t, root, "rental", "list")
 	busyRow := regexp.MustCompile(`otter\s+cpu\s+ready\s+\S+\s+0\s+1\s+-`)
 	if code != 0 || !busyRow.MatchString(out) ||
 		!strings.Contains(out, "Idle machines shut down after 2 seconds.") {
@@ -122,7 +122,7 @@ func TestRentalIdleRelease(t *testing.T) {
 	if hub.releases("rental-idle-owed") != 0 {
 		t.Fatalf("the hub saw a release of an owed rental\n%s", tail(logPath))
 	}
-	code, out = runCozy(t, root, "rental")
+	code, out = runCozy(t, root, "rental", "list")
 	owedRow := regexp.MustCompile(`curlew\s+cpu\s+ready\s+\S+\s+0\s+0\s+-`)
 	if code != 0 || !owedRow.MatchString(out) {
 		t.Fatalf("the listing shows an idle countdown on an owed rental [exit %d]\n%s", code, out)
@@ -163,7 +163,7 @@ func TestRentalIdleRelease(t *testing.T) {
 	}
 	// The listing has to agree with the mechanism: no work of its OWN (0 queued, 0 running)
 	// and no countdown, because the fleet is not idle even though this machine is.
-	code, out = runCozy(t, root, "rental")
+	code, out = runCozy(t, root, "rental", "list")
 	unpinnedRow := regexp.MustCompile(`kestrel\s+cpu\s+ready\s+\S+\s+0\s+0\s+-`)
 	if code != 0 || !unpinnedRow.MatchString(out) {
 		t.Fatalf("the listing shows an idle countdown while unpinned work is queued [exit %d]\n%s",

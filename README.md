@@ -249,7 +249,7 @@ cozy rental new h200                # prints e.g. otter
 cozy rental new h200 \
   --idempotency-key <unique-key>
 
-cozy rental                        # current rented machines
+cozy rental list                   # current rented machines, live on a terminal
 cozy run org/package/generate --rental prompt="moonlit lake"
 cozy rental end otter
 ```
@@ -268,7 +268,7 @@ its own once nothing has been queued, running, or owed on it for `rentals.idle_r
 (default 300). Running work on it is what keeps it: the clock restarts at each settled attempt,
 and a rental that never ran anything counts from the moment Tensorhub first reported it `ready`,
 so a pod still booting is never ended. A managed rental whose job is done goes at once.
-`cozy rental` shows each machine's idle time and when it will be released; `cozy rental end`
+`cozy rental list` shows each machine's idle time and when it will be released; `cozy rental end`
 ends one now. A release Tensorhub does not confirm is retried until it does. Set
 `idle_release_s: 0` to leave every rental to `cozy rental end`.
 

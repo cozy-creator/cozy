@@ -128,10 +128,26 @@ func TestRentalListLiveBoard(t *testing.T) {
 		!strings.Contains(listed, "Idle machines shut down after 4 minutes.") {
 		t.Fatalf("piped snapshot lost the ruled surface\n%s", listed)
 	}
+	// Bare `cozy rental` names the group's VERBS; it is not one of them. The live table
+	// lives at `cozy rental list` and nowhere else — the same shape bare `cozy package`
+	// and `cozy model` already have.
 	code, bare := runCozy(t, root, "rental")
-	tick := regexp.MustCompile(`\d+s / 4m`)
-	if code != 0 || tick.ReplaceAllString(bare, "T / 4m") != tick.ReplaceAllString(listed, "T / 4m") {
-		t.Fatalf("bare `cozy rental` is not the list verb [exit %d]\nbare:\n%s\nlist:\n%s", code, bare, listed)
+	if code != 0 {
+		t.Fatalf("bare `cozy rental` did not print its verbs [exit %d]\n%s", code, bare)
+	}
+	for _, verb := range []string{"rental list", "rental new", "rental end"} {
+		if !strings.Contains(bare, verb) {
+			t.Fatalf("bare `cozy rental` does not offer `cozy %s`\n%s", verb, bare)
+		}
+	}
+	for _, ran := range []string{"MACHINE", "Remote machines running:"} {
+		if strings.Contains(bare, ran) {
+			t.Fatalf("bare `cozy rental` still RUNS the list verb instead of naming it\n%s", bare)
+		}
+	}
+	if code, helped := runCozy(t, root, "help", "rental"); code != 0 || helped != bare {
+		t.Fatalf("bare `cozy rental` is not `cozy help rental` [exit %d]\nbare:\n%s\nhelp:\n%s",
+			code, bare, helped)
 	}
 
 	// A watch that cannot be a terminal refuses instead of degrading.

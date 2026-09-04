@@ -41,7 +41,7 @@ func TestRentalListingAdoptsTheHubBilledRate(t *testing.T) {
 		State: "ready", Hub: hubURL,
 	}))
 
-	code, out := runCozy(t, root, "rental")
+	code, out := runCozy(t, root, "rental", "list")
 	if code != 0 || !strings.Contains(out, "Current spend per hour: $0.72") {
 		t.Fatalf("the burn line still says the quote [exit %d]:\n%s", code, out)
 	}
@@ -76,17 +76,36 @@ func TestRentalLadderRendersTheTotalDecomposed(t *testing.T) {
 	// Both widths of the card share the one pod-disk adder (1536 GB × 139).
 	hub.setSKUs(sku("l4", 1, 490_000, 213_504), sku("l4-x4", 4, 1_960_000, 213_504))
 
+	// The ladder itself states ONE price per rung and it is the whole one — the figure
+	// that surprised Paul is the figure on the table.
 	code, out := runCozy(t, root, "rental", "new")
 	if code != 0 {
 		t.Fatalf("cozy rental new [exit %d]:\n%s", code, out)
 	}
+	for _, want := range []string{"$0.703504/hr", "$2.173504/hr", "PRICE"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the ladder does not render the total %q:\n%s", want, out)
+		}
+	}
+	for _, component := range []string{"$0.49/hr", "$1.96/hr", "$0.213504/hr"} {
+		if strings.Contains(out, component) {
+			t.Fatalf("the ladder still quotes the component %s a renter does not pay alone:\n%s",
+				component, out)
+		}
+	}
+	// The decomposition is retained, one flag away: both widths of the card carry their
+	// own GPU rate beside the one pod-disk adder.
+	code, full := runCozy(t, root, "rental", "new", "--full")
+	if code != 0 {
+		t.Fatalf("cozy rental new --full [exit %d]:\n%s", code, full)
+	}
 	for _, want := range []string{
 		"$0.49/hr", "$0.213504/hr", "$0.703504/hr", // the L4 rung, decomposed
 		"$1.96/hr", "$2.173504/hr", // the x4 rung: its own price, the same adder
-		"GPU", "STORAGE", "PRICE",
+		"GPU PRICE", "STORAGE PRICE", "PRICE",
 	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("the ladder does not render %q:\n%s", want, out)
+		if !strings.Contains(full, want) {
+			t.Fatalf("--full does not render %q:\n%s", want, full)
 		}
 	}
 	hub.close()
@@ -129,11 +148,11 @@ func TestRentalListingShowsStructuredBootFailure(t *testing.T) {
 	}))
 	store.Close()
 
-	code, human := runCozy(t, root, "rental")
+	code, human := runCozy(t, root, "rental", "list")
 	if code != 0 || !strings.Contains(human, "container_exited_before_readiness") {
 		t.Fatalf("human rental list hid the boot failure [exit %d]:\n%s", code, human)
 	}
-	code, raw := runCozy(t, root, "rental", "--full", "--json")
+	code, raw := runCozy(t, root, "rental", "list", "--full", "--json")
 	var listed struct {
 		Rentals []struct {
 			State                 string `json:"state"`

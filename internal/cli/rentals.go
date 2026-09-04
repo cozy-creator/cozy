@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -377,31 +378,65 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 }
 
 func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
-	rows := make([]map[string]string, 0, len(skus))
-	for _, sku := range skus {
-		// The ladder speaks the whole pre-spend rate, decomposed (th-126):
-		// price is the estimated total the pod will bill, gpu and storage its
-		// components. gpu is the rate the accepted quote locks.
+	// Cheapest first, on the same key the scheduler ranks by (rental.CheapestCompatibleSKU):
+	// the combined micros a renter actually pays, tie-broken by name so equal-priced rows
+	// hold still between runs. The sort key is the column the table shows, never its
+	// formatted text.
+	ladder := append([]hub.RentalSKU(nil), skus...)
+	total := func(sku hub.RentalSKU) int64 {
+		return sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour
+	}
+	sort.Slice(ladder, func(i, j int) bool {
+		if total(ladder[i]) != total(ladder[j]) {
+			return total(ladder[i]) < total(ladder[j])
+		}
+		return ladder[i].Name < ladder[j].Name
+	})
+	rows := make([]map[string]string, 0, len(ladder))
+	for _, sku := range ladder {
+		// The ladder speaks ONE price and it is the whole pre-spend rate the pod will
+		// bill (th-126): GPU plus the SKU's storage adder, never the GPU rate alone,
+		// which is the figure that read $0.49/hr while RunPod billed ~$0.70. The
+		// components stay one --full away, where `gpu price` is the rate the accepted
+		// quote locks.
 		rows = append(rows, map[string]string{
-			"name": sku.Name, "model": sku.AcceleratorModel,
-			"compute": computeCapabilityText(sku.ComputeCapability),
-			"vram":    fmt.Sprintf("%d GB", sku.VRAMGB),
-			"gpu":     rentalPrice(sku.PriceUSDMicrosPerHour),
-			"storage": rentalPrice(sku.StorageUSDMicrosPerHour),
-			"price":   rentalPrice(sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour),
+			"name": sku.Name, "gpu": acceleratorName(sku.AcceleratorModel),
+			"accelerator model": sku.AcceleratorModel,
+			"compute":           computeCapabilityText(sku.ComputeCapability),
+			"vram":              fmt.Sprintf("%d GB", sku.VRAMGB),
+			"gpu price":         rentalPrice(sku.PriceUSDMicrosPerHour),
+			"storage price":     rentalPrice(sku.StorageUSDMicrosPerHour),
+			"price":             rentalPrice(total(sku)),
 		})
 	}
 	doc := output.List{
-		Name: "gpus", Fields: []string{"name", "model", "compute", "vram", "gpu", "storage", "price"},
+		Name:   "gpus",
+		Fields: []string{"name", "gpu", "compute", "vram", "price"},
+		AllFields: []string{"name", "gpu", "accelerator model", "compute", "vram",
+			"gpu price", "storage price", "price"},
 		Rows: rows, Total: len(rows),
 		Next: []string{"cozy rental new <gpu-name>"},
 	}
 	return emit(ctx, doc)
 }
 
+// acceleratorName is how a provider accelerator id READS in the GPU column. The id
+// itself is never rewritten — Tensorhub matches it byte-for-byte against the offers a
+// provider advertises (placement's rejectModel), so a respelling at the source stops
+// matching real stock. Only the workstation suffix comes off: NVIDIA names the
+// workstation card as the plain product and qualifies the variants ("Server Edition",
+// "Max-Q"), so dropping any other suffix would render two distinct cards identically.
+func acceleratorName(model string) string {
+	name := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(model), "Workstation Edition"))
+	return strings.ReplaceAll(name, "RTX PRO ", "RTX Pro ")
+}
+
+// computeCapabilityText leaves a card without a stated compute capability empty so the
+// table renders the house dash. A CPU SKU has none to state; "unknown" would claim a
+// lookup failed.
 func computeCapabilityText(value string) string {
 	if value == "" {
-		return "unknown"
+		return ""
 	}
 	return "sm_" + strings.ReplaceAll(value, ".", "")
 }
@@ -582,9 +617,9 @@ func missingOf(r hub.Rental) string {
 	return "complete ready projection"
 }
 
-// handleRentalList is `cozy rental list` (cl-114) — and bare `cozy rental`, which
-// aliases to it. On a terminal it is the live board: the fleet redrawn in place every
-// second, the way `cozy run list` watches runs. Piped or --json it is one plain snapshot.
+// handleRentalList is `cozy rental list` (cl-114). On a terminal it is the live board:
+// the fleet redrawn in place every second, the way `cozy run list` watches runs. Piped
+// or --json it is one plain snapshot. Bare `cozy rental` prints the verbs, not this.
 func handleRentalList(ctx *Context) *exit.Error {
 	explicit, disabled := ctx.Inv.Bool("--watch"), ctx.Inv.Bool("--no-watch")
 	if explicit && disabled {
