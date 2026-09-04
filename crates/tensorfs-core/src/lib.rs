@@ -31,6 +31,7 @@ pub mod project;
 pub mod providers;
 pub mod read;
 pub mod receipt;
+pub mod reclaim;
 pub mod registry;
 pub mod relation;
 pub mod repo_cache;
