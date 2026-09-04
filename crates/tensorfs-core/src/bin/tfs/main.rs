@@ -84,6 +84,15 @@
 //!            --source-profile NARROWS the repository to one reviewed model and is the
 //!            step that decides 210 GB instead of 498 GB; without it the answer is the
 //!            whole repository, which is a successful download of the wrong size
+//!   tfs source plan <uri> --source-profile <name>... [--registry <r>] [--json]
+//!            the CONVERSION plan, decided from HEADERS, before a byte of payload moves
+//!            and before a pod is rented (tfs-076). Resolve, narrow, fetch each member's
+//!            header by ranged GET, and run the pod's own planner over them. No store, no
+//!            tensor bytes. MiniMax-H3 is 275 KB of header standing in for 210.3 GB of
+//!            payload, and three separate H3 runs moved the 210.3 GB before refusing on
+//!            facts inside those 275 KB.
+//!            exit 0 PLAN OK / 1 REFUSED, this cannot convert / 2 UNDECIDED, a header
+//!            could not be read cheaply — proceed to the ordinary path, never refuse
 //!   tfs source pull <root> <uri> [--api <base>] [--allow-local]        tfs-052 handlers
 //!   tfs bench-store <root>       put/read/range/rehash throughput + peak RSS
 //!
@@ -347,6 +356,7 @@ fn main() -> ExitCode {
         ["staging", "list", r] => fetch::cmd_staging_list(Path::new(r)),
         ["source", "list", u] => fetch::cmd_source_list(u, &flags),
         ["source", "resolve", u] => fetch::cmd_source_resolve(u, &flags),
+        ["source", "plan", u] => fetch::cmd_source_plan(u, &flags),
         ["source", "pull", r, u] => fetch::cmd_source_pull(Path::new(r), u, &flags),
         ["fetch", sub, _t]
             if ["plan", "plan-objects", "admit", "complete", "url"].contains(sub) =>

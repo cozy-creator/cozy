@@ -79,6 +79,81 @@ pub fn probe_length(
     })
 }
 
+/// What one prefix read learned. `bytes` is `None` when the origin would not serve a
+/// range for an object larger than the ask — the only honest answer there is "not cheaply
+/// readable", because reading it whole is the transfer a prefix read exists to avoid.
+pub struct Prefix {
+    pub bytes: Option<Vec<u8>>,
+    /// The object's total length as the ORIGIN states it. A caller that already pinned a
+    /// length has two opinions here and must require that they agree.
+    pub total: Option<u64>,
+}
+
+/// The leading `want` bytes of one origin object, by ranged GET.
+///
+/// This is the read a conversion plan is actually made of. A safetensors header is
+/// `8 + <declared>` bytes at offset zero and a `*.safetensors.index.json` is a small whole
+/// document, so the facts that decide whether a 210 GB selection can convert at all live in
+/// the first few kilobytes of each member. `probe_length` beside it asks the same question
+/// with `want` of one byte and keeps only the total; this keeps the bytes.
+///
+/// The 200 arm reads nothing it was not promised. An origin that ignores the range and
+/// starts sending a 5 GiB shard is answered by dropping the body unread — a prefix read
+/// that silently became a whole-object download would be the exact cost it exists to
+/// remove. Only an object the origin itself declares to be no larger than the ask is read
+/// from a 200, which is how a small member on a range-less origin still arrives.
+pub fn fetch_prefix(
+    url: &str,
+    policy: &SourcePolicy,
+    credential: &dyn CredentialProvider,
+    want: u64,
+    deadline: Deadline,
+    ledger: &Ledger,
+) -> Result<Prefix> {
+    if want == 0 {
+        return refuse(Code::COUNT_CAP, "a prefix read asks for at least one byte");
+    }
+    let response = open_following_with(
+        url,
+        policy,
+        credential,
+        deadline,
+        ledger,
+        &[("range".to_string(), format!("bytes=0-{}", want - 1))],
+    )?;
+    let cap = usize::try_from(want).unwrap_or(usize::MAX);
+    match response.status {
+        206 => {
+            let total = response
+                .header("content-range")
+                .and_then(|value| value.trim().rsplit_once('/'))
+                .and_then(|(_, total)| total.trim().parse::<u64>().ok());
+            let bytes = response.read_capped(cap)?;
+            Ok(Prefix {
+                bytes: Some(bytes),
+                total,
+            })
+        }
+        200 => {
+            let total = response
+                .header("content-length")
+                .and_then(|value| value.trim().parse::<u64>().ok());
+            match total {
+                Some(total) if total <= want => Ok(Prefix {
+                    bytes: Some(response.read_capped(cap)?),
+                    total: Some(total),
+                }),
+                // The body is dropped here, unread, and that is the point.
+                _ => Ok(Prefix { bytes: None, total }),
+            }
+        }
+        other => refuse(
+            Code::TRANSFER_FAILED,
+            format!("origin answered HTTP {other} to a prefix read"),
+        ),
+    }
+}
+
 fn open_following<'l>(
     url: &str,
     policy: &SourcePolicy,

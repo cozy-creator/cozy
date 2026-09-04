@@ -22,6 +22,10 @@ use tensorfs_core::staging;
 use tensorfs_core::store::Store;
 use tensorfs_core::transport::ObjectSource;
 
+use tensorfs_core::err::{Code, Refusal};
+use tensorfs_core::ingest::fingerprint::FingerprintRegistry;
+use tensorfs_core::ingest::preflight;
+
 use crate::{bail, flag, Flags};
 
 macro_rules! ok {
@@ -981,6 +985,187 @@ pub fn cmd_source_resolve(uri: &str, flags: &Flags) -> ExitCode {
         resolution.object_bytes()
     );
     println!("selection    sha256:{}", resolution.selection_sha256);
+    ExitCode::SUCCESS
+}
+
+/// `tfs source plan <uri> --source-profile <name>...` — decide the conversion plan from
+/// HEADERS, before a byte of payload moves, before a pod is rented (tfs-076).
+///
+/// > *"why does conversion have to download all 200GBs of files and then refuse? shouldn't
+/// > it refuse right away?"*
+///
+/// It should, and this is where it does. Resolve, narrow, read each member's header by
+/// ranged GET, and run the pod's OWN planner over them. No Store, no tensor bytes, no
+/// rental. On MiniMax-H3 that is 275 KB of header standing in for 210.3 GB of payload.
+///
+/// Three exits, and they mean three different things:
+///
+/// - **0, `PLAN OK`.** Every requested profile plans. The session id printed for each is
+///   the conversion journal's key, and the pod will compute the same one.
+/// - **1, `REFUSED <code>`.** A guard refused on the headers. This selection cannot convert
+///   and no amount of transfer changes that — run 290, 294 and 309 all end here, for free.
+/// - **2, `UNDECIDED`.** One or more headers could not be read cheaply (an origin that will
+///   not serve a range). NOT a refusal: a caller that put this in front of a rental should
+///   proceed to the ordinary path, because "I could not look" is never "this is bad".
+pub fn cmd_source_plan(uri: &str, flags: &Flags) -> ExitCode {
+    let (uri, endpoints, credential) = match source_setup(uri, flags) {
+        Ok(setup) => setup,
+        Err(code) => return code,
+    };
+    // The narrowing is not optional and omitting it fails INTERESTINGLY: H3's repository
+    // resolves to 112 carriers that match no reviewed profile, so an unnarrowed preflight
+    // would refuse a model that converts perfectly well. A profile is what makes the
+    // question answerable at all.
+    let profiles: Vec<String> = crate::flag_all(flags, "source-profile")
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if profiles.is_empty() {
+        return bail(Refusal {
+            code: Code::MISSING_FIELD,
+            detail: "source plan requires --source-profile <name>: a repository is not a \
+                     model, and only a reviewed profile says which model this is"
+                .into(),
+        });
+    }
+    let (registry_locator, registry_bytes) = match crate::ingest::registry_bytes(flags) {
+        Ok(registry) => registry,
+        Err(code) => return code,
+    };
+    let registry = ok!(FingerprintRegistry::parse(&registry_bytes));
+    let wanted = ok!(registry.exact_source_members(&profiles));
+
+    let full = ok!(providers::resolve(
+        &uri,
+        &endpoints,
+        &credential,
+        deadline_of(flags)
+    ));
+    let resolved = full.members.len();
+    let selection = ok!(full.select(&wanted));
+    let heads = ok!(providers::read_heads(
+        &selection,
+        &uri,
+        &endpoints,
+        &credential,
+        deadline_of(flags)
+    ));
+
+    let json = crate::flag_on(flags, "json");
+    if !heads.unread.is_empty() {
+        if json {
+            let document = canon::Value::obj(vec![
+                (
+                    "unread",
+                    canon::Value::arr(
+                        heads
+                            .unread
+                            .iter()
+                            .map(|row| {
+                                canon::Value::obj(vec![
+                                    ("member", canon::Value::str(row.member.clone())),
+                                    ("why", canon::Value::str(row.why.clone())),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+                ("verdict", canon::Value::str("undecided".to_string())),
+            ]);
+            println!("{}", String::from_utf8_lossy(&canon::write(&document)));
+        } else {
+            for row in &heads.unread {
+                eprintln!("unread  {}  {}", row.member, row.why);
+            }
+            eprintln!(
+                "UNDECIDED — {} of {} member header(s) could not be read cheaply. This is \
+                 not a refusal: proceed to the ordinary path.",
+                heads.unread.len(),
+                selection.members.len()
+            );
+        }
+        return ExitCode::from(2);
+    }
+
+    let scratch = std::env::temp_dir().join(format!(
+        "tfs-source-plan-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0)
+    ));
+    let preflight = ok!(preflight::plan(
+        &registry_locator,
+        &registry_bytes,
+        &heads.heads,
+        &profiles,
+        &scratch,
+    ));
+
+    if json {
+        let mut fields = match preflight.value() {
+            canon::Value::Obj(fields) => fields,
+            _ => Vec::new(),
+        };
+        fields.push((
+            "requests".to_string(),
+            canon::Value::uint(heads.requests as u64),
+        ));
+        fields.push((
+            "resolved_members".to_string(),
+            canon::Value::uint(resolved as u64),
+        ));
+        fields.push((
+            "selection_sha256".to_string(),
+            canon::Value::str(selection.selection_sha256.clone()),
+        ));
+        fields.sort_by(|left, right| left.0.cmp(&right.0));
+        println!(
+            "{}",
+            String::from_utf8_lossy(&canon::write(&canon::Value::Obj(fields)))
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    for plan in &preflight.plans {
+        println!("profile      {}", plan.profile);
+        println!("converter    {}", plan.converter);
+        println!("target       {}", plan.target);
+        println!(
+            "session      {} — the conversion journal's key",
+            plan.session
+        );
+        println!("constructs   {} tensor(s)", plan.constructs);
+        for component in &plan.components {
+            println!(
+                "  {:<14} {}{}",
+                component.component,
+                component.member.as_deref().unwrap_or("(unnamed carrier)"),
+                if component.projected {
+                    "  [projected]"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    println!("canonical    {}", selection.canonical);
+    println!(
+        "members      {} of {} resolved carriers",
+        preflight.members, resolved
+    );
+    println!("registry     {}", preflight.registry_sha256);
+    println!("selection    sha256:{}", selection.selection_sha256);
+    println!(
+        "header bytes {} read in {} ranged GET(s)",
+        preflight.header_bytes, heads.requests
+    );
+    println!(
+        "member bytes {} NOT moved — this plan was decided without them",
+        preflight.member_bytes
+    );
+    println!("PLAN OK — this selection can convert.");
     ExitCode::SUCCESS
 }
 

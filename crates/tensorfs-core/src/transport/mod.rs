@@ -43,7 +43,7 @@ mod ranged;
 #[cfg(test)]
 mod tests;
 
-pub use api::{api_get, probe_length};
+pub use api::{api_get, fetch_prefix, probe_length, Prefix};
 pub use http::Client;
 pub use hub::{
     closure, closure_all, credential_from_spec, presign, Anonymous, Closure, CredentialProvider,

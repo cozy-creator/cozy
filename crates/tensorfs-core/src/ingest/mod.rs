@@ -11,12 +11,16 @@
 //!   fingerprint — classification into a reviewed registry verdict; ambiguity refuses
 //!   convert     — the PLAN (pure function of headers + target) and the reviewed converters
 //!   transaction — temporary candidate write through the real CAS, receipt, install/reap
+//!
+//! And one stage that runs BEFORE all of them:
+//!   preflight   — the plan, decided from headers over sparse holes, before a byte moves
 
 pub mod carrier;
 pub mod convert;
 pub mod fingerprint;
 pub mod gguf;
 pub mod journal;
+pub mod preflight;
 pub mod source;
 pub mod stamp;
 pub mod transaction;

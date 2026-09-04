@@ -20,7 +20,8 @@ use crate::ids::ObjectRef;
 use crate::jcs::{self, Json};
 use crate::store::{Fault, Store};
 use crate::transport::{
-    api_get, fetch_ranged, probe_length, CredentialProvider, Deadline, Ledger, Ranged, SourcePolicy,
+    api_get, fetch_prefix, fetch_ranged, probe_length, CredentialProvider, Deadline, Ledger,
+    Ranged, SourcePolicy,
 };
 
 /// Listing documents are bounded like any other untrusted input.
@@ -743,6 +744,177 @@ fn selection_digest(canonical: &str, members: &[ResolvedMember]) -> String {
 
 fn lower_ends_with(value: &str, suffix: &str) -> bool {
     value.to_ascii_lowercase().ends_with(suffix)
+}
+
+/// How much of a member is asked for on the first ask, when all that is wanted is its
+/// header.
+///
+/// MEASURED against the model this exists for: MiniMax-H3's 44 shard headers are 4-6 KB
+/// each and its four indexes are 12-38 KB, so 64 KiB covers every member of a 210.3 GB
+/// selection in ONE request. The size is a trade against latency and not against
+/// bandwidth: this crate's client sends `Connection: close`, so every ask pays a fresh
+/// connect plus TLS plus time-to-first-byte, measured at 0.41 s against HuggingFace's CDN.
+/// A two-step read — eight bytes for the declared length, then the header — would double
+/// that for every member and save kilobytes. So the first ask is speculative and generous,
+/// and a header that does not fit costs exactly one more.
+pub const HEAD_PROBE_BYTES: u64 = 64 << 10;
+
+/// One member's header, and the length of the object it was cut from.
+///
+/// **`length` is the FULL object length, never `head.len()`.** A carrier header declares
+/// tensor regions and every reader checks those regions against the file's real size, so a
+/// header divorced from its length can be geometrically checked against nothing. The two
+/// travel together for that reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberHead {
+    pub member: String,
+    pub length: u64,
+    pub head: Vec<u8>,
+}
+
+/// A member whose header could not be read cheaply, and why. NOT a refusal: an origin that
+/// will not serve a range is a real origin, and the honest verdict there is that the plan
+/// is undecided rather than that the model is bad.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadMember {
+    pub member: String,
+    pub why: String,
+}
+
+/// What one header read cost and reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadRead {
+    pub heads: Vec<MemberHead>,
+    pub unread: Vec<UnreadMember>,
+    /// Bytes actually pulled off the wire.
+    pub bytes: u64,
+    /// Ranged GETs actually issued. The rate-limit unit, and the number a caller sizes a
+    /// provider's budget against.
+    pub requests: usize,
+}
+
+/// Read every member's HEADER, and nothing else.
+///
+/// This is the whole of tfs-076: the facts that decide whether a selection can convert are
+/// in the members' headers, so they can be read for kilobytes before anything is rented and
+/// before a byte of payload moves. MiniMax-H3's 48 members total 210.3 GB and their headers
+/// total 275 KB; three separate H3 runs moved the 210.3 GB and then refused on facts inside
+/// the 275 KB.
+///
+/// The read is per-member and BEST EFFORT. Two answers are possible and they mean different
+/// things: a member whose header arrives is a member the plan can be decided from, and a
+/// member whose header will not arrive cheaply lands in `unread`, which makes the plan
+/// UNDECIDED rather than refused. Only a disagreement about identity — the origin's own
+/// length contradicting the length this selection is pinned to — refuses here, because that
+/// is a fault in the selection itself and no amount of transfer improves it.
+pub fn read_heads(
+    resolution: &Resolution,
+    uri: &SourceUri,
+    endpoints: &Endpoints,
+    credentials: &dyn CredentialProvider,
+    deadline: Deadline,
+) -> Result<HeadRead> {
+    let policy = endpoints.policy(uri);
+    let ledger = Ledger::new();
+    let mut out = HeadRead {
+        heads: Vec::with_capacity(resolution.members.len()),
+        unread: Vec::new(),
+        bytes: 0,
+        requests: 0,
+    };
+    for row in &resolution.members {
+        // An index is a whole small document — its `weight_map` IS the fact wanted — while
+        // a tensor carrier is a prefix of a file that can be 5 GiB. Both are bounded.
+        let whole = is_index(&row.member) || lower_ends_with(&row.member, ".json");
+        if whole && row.object.length > INDEX_MAX_BYTES {
+            out.unread.push(UnreadMember {
+                member: row.member.clone(),
+                why: format!(
+                    "index is {} B, over the {INDEX_MAX_BYTES} B bound",
+                    row.object.length
+                ),
+            });
+            continue;
+        }
+        let first = if whole {
+            row.object.length
+        } else {
+            row.object.length.min(HEAD_PROBE_BYTES)
+        };
+        let prefix = fetch_prefix(&row.url, &policy, credentials, first, deadline, &ledger)?;
+        out.requests += 1;
+        // The two halves of an identity may not disagree. A selection pinned to one length
+        // and an origin serving another is a fault in the SELECTION, decidable here for one
+        // request and never improved by transferring the object.
+        if let Some(total) = prefix.total {
+            if total != row.object.length {
+                return refuse(
+                    Code::LENGTH_MISMATCH,
+                    format!(
+                        "{}: the selection pins {} B and the origin says {total} B",
+                        row.member, row.object.length
+                    ),
+                );
+            }
+        }
+        let Some(mut head) = prefix.bytes else {
+            out.unread.push(UnreadMember {
+                member: row.member.clone(),
+                why: "origin would not serve a range for an object over the ask".into(),
+            });
+            continue;
+        };
+        out.bytes += head.len() as u64;
+        // What the first ask learned about how much was actually needed. A safetensors
+        // carrier says so in its own first eight bytes; anything the cap or the file
+        // refuses is NOT re-asked, because the short head already decides it — that is run
+        // 309's `carrier_header_cap`, reached for 64 KiB instead of 210.3 GB.
+        let need = if whole {
+            row.object.length
+        } else if head.len() >= 8 {
+            let declared = u64::from_le_bytes(head[0..8].try_into().expect("eight bytes"));
+            match declared.checked_add(8) {
+                Some(need)
+                    if declared <= crate::limits::CARRIER_HEADER_MAX_BYTES as u64
+                        && need <= row.object.length =>
+                {
+                    need
+                }
+                _ => head.len() as u64,
+            }
+        } else {
+            head.len() as u64
+        };
+        // The first ask is speculative, so it usually OVERSHOOTS. Trim to what the header
+        // actually is: `bytes` is what the wire cost and `head` is what the plan is built
+        // from, and reporting one as the other would misstate the guard in either direction.
+        if need < head.len() as u64 {
+            head.truncate(need as usize);
+        }
+        if need > head.len() as u64 {
+            let more = fetch_prefix(&row.url, &policy, credentials, need, deadline, &ledger)?;
+            out.requests += 1;
+            match more.bytes {
+                Some(bytes) => {
+                    out.bytes += bytes.len() as u64;
+                    head = bytes;
+                }
+                None => {
+                    out.unread.push(UnreadMember {
+                        member: row.member.clone(),
+                        why: format!("origin would not serve the {need} B header range"),
+                    });
+                    continue;
+                }
+            }
+        }
+        out.heads.push(MemberHead {
+            member: row.member.clone(),
+            length: row.object.length,
+            head,
+        });
+    }
+    Ok(out)
 }
 
 fn is_index(member: &str) -> bool {
