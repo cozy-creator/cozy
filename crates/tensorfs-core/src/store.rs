@@ -35,11 +35,36 @@ pub(crate) const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(target_os = "macos")]
 pub(crate) const O_NOFOLLOW: i32 = 0x0100;
 
-fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
+/// ENOSPC on Linux and macOS alike; EDQUOT differs.
+const ENOSPC: i32 = 28;
+#[cfg(target_os = "linux")]
+const EDQUOT: i32 = 122;
+#[cfg(target_os = "macos")]
+const EDQUOT: i32 = 69;
+
+/// An I/O failure, classified.
+///
+/// **Out of space is a VERDICT and everything else is weather**, and the difference is the
+/// whole of tfs-064. Before it, a full container disk raised `IO_FAILED` — the same code as
+/// a bad sector or a revoked permission — so `pod-supervisor` classified it `Resumable` and
+/// the owner re-issued the fetch, which re-planned, re-asked, and failed at the same byte.
+/// On rented hardware, forever. Naming the condition is what lets a caller stop.
+pub(crate) fn classify_io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
+    if matches!(e.raw_os_error(), Some(ENOSPC) | Some(EDQUOT)) {
+        return Refusal {
+            code: Code::CAPACITY_EXHAUSTED,
+            detail: format!("{}: the filesystem is full ({e})", what.as_ref()),
+        };
+    }
     Refusal {
         code: Code::IO_FAILED,
         detail: format!("{}: {e}", what.as_ref()),
     }
+}
+
+/// The short local spelling used by every call site in this module.
+fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
+    classify_io(what, e)
 }
 
 // ---------------------------------------------------- durable verification record
@@ -154,6 +179,10 @@ pub struct Store {
     /// [`REPO_CACHE_BINDING`] when the handle was made. See that constant for why the
     /// binding is a property of the Store and not an argument of every operation.
     cache: Option<crate::repo_cache::RepoObjectCache>,
+    /// The optional disk budget THIS Store is held to, read off [`DISK_BUDGET`] when the
+    /// handle was made. `None` is the default and means every operation behaves exactly as
+    /// it did before tfs-064. See that constant.
+    budget: Option<u64>,
 }
 
 impl std::fmt::Debug for Store {
@@ -331,6 +360,7 @@ impl Store {
             root: root.to_path_buf(),
             progress: None,
             cache: read_repo_cache_binding(root),
+            budget: read_disk_budget(root),
         })
     }
 
@@ -427,6 +457,140 @@ impl Store {
             cache: Some(crate::repo_cache::RepoObjectCache::new(cache)),
             ..self
         })
+    }
+
+    /// The disk budget this Store is held to, or `None`. See [`DISK_BUDGET`].
+    pub fn disk_budget(&self) -> Option<u64> {
+        self.budget
+    }
+
+    /// Record (`Some`) or clear (`None`) this Store's disk budget, and return the handle
+    /// that carries the result. DECLARATIVE, exactly like the cache binding: a setup that
+    /// says nothing about the budget is a setup that says the Store has none, so a pod
+    /// re-provisioned without one stops enforcing instead of quietly keeping a stale number.
+    pub fn bind_disk_budget(self, budget: Option<u64>) -> Result<Store> {
+        let path = self.root.join(DISK_BUDGET);
+        let Some(budget) = budget else {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io("clear disk budget", error)),
+            }
+            fsync_dir(&self.root)?;
+            return Ok(Store {
+                budget: None,
+                ..self
+            });
+        };
+        if budget == 0 {
+            return refuse(
+                Code::NUMBER_RANGE,
+                "a disk budget of zero admits nothing; clear it instead of setting it to 0",
+            );
+        }
+        let bytes = format!("{budget}\n").into_bytes();
+        let temp = self.root.join(format!(
+            "tmp/disk-budget.{}.{}",
+            std::process::id(),
+            now_nanos_unique()
+        ));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o644)
+            .custom_flags(O_NOFOLLOW)
+            .open(&temp)
+            .map_err(|error| io("open disk budget temp", error))?;
+        let written = file
+            .write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| io("write disk budget", error));
+        drop(file);
+        if let Err(refusal) = written {
+            let _ = fs::remove_file(&temp);
+            return Err(refusal);
+        }
+        if let Err(error) = fs::rename(&temp, &path) {
+            let _ = fs::remove_file(&temp);
+            return Err(io("install disk budget", error));
+        }
+        fsync_dir(&self.root)?;
+        Ok(Store {
+            budget: Some(budget),
+            ..self
+        })
+    }
+
+    /// What this Store is holding, in bytes: every installed blob and manifest.
+    ///
+    /// This is deliberately NOT the filesystem's used space. It counts what TensorFS put
+    /// there and nothing else, so the number means the same thing on a shared container
+    /// disk as on a dedicated one, and computing it needs no syscall about any other
+    /// tenant. Scratch under `tmp/` is excluded: an in-flight temp is charged to the
+    /// admission that is already being checked against the budget, and counting it twice
+    /// would refuse a pull that fits.
+    pub fn occupancy(&self) -> Result<u64> {
+        let mut total: u64 = 0;
+        for (namespace, suffix) in [("blobs", ""), ("manifests", ".json")] {
+            let base = self.root.join(namespace);
+            if !base.is_dir() {
+                continue;
+            }
+            for first in read_dir(&base)? {
+                for second in read_dir(&first)? {
+                    for object in read_dir(&second)? {
+                        let Some(name) = object.file_name().and_then(|value| value.to_str()) else {
+                            continue;
+                        };
+                        let stem = name.strip_suffix(suffix).unwrap_or(name);
+                        if suffix.is_empty() == name.ends_with(".json")
+                            || hex64("object", stem).is_err()
+                        {
+                            continue;
+                        }
+                        let metadata = match fs::symlink_metadata(&object) {
+                            Ok(metadata) => metadata,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(error) => return Err(io("stat store object", error)),
+                        };
+                        if !metadata.is_file() || metadata.file_type().is_symlink() {
+                            continue;
+                        }
+                        total = total.checked_add(metadata.len()).ok_or_else(|| Refusal {
+                            code: Code::ARITH_OVERFLOW,
+                            detail: "store occupancy overflow".into(),
+                        })?;
+                    }
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Refuse an admission that has not started yet, when the bytes it would ADD would put
+    /// this Store past its recorded budget.
+    ///
+    /// `adding` is what the caller has already established it must move -- for a pull that
+    /// is `FetchPlan::wanted_bytes()`, the bytes not already held, so dedup is credited
+    /// before anything is refused. A Store with no budget admits everything, which is the
+    /// default and the pre-tfs-064 behaviour.
+    pub fn admits(&self, adding: u64) -> Result<()> {
+        let Some(budget) = self.budget else {
+            return Ok(());
+        };
+        let occupancy = self.occupancy()?;
+        let after = occupancy.saturating_add(adding);
+        if after <= budget {
+            return Ok(());
+        }
+        refuse(
+            Code::CAPACITY_EXHAUSTED,
+            format!(
+                "this store holds {occupancy} B and this admission would add {adding} B, \
+                 which is {} B past its {budget} B disk budget",
+                after - budget
+            ),
+        )
     }
 
     /// Prepare the Store for read leases created by a separate unprivileged uid.
@@ -1439,6 +1603,45 @@ fn validate_repo_cache_root(cache: &Path, store: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Where a Store records the disk budget it is held to: one decimal byte count, one line,
+/// LOCAL, beside the cache binding and for the same reasons (see [`REPO_CACHE_BINDING`]).
+///
+/// **The presence of this record is the whole opt-in.** The owner's requirement was that
+/// reclamation must not be default-on -- *"users would be confused if files start
+/// disappearing"* -- and his own sentence for turning it on was *"tensorfs should be given
+/// some sort of disc budget, and when that's exceeded it starts ejecting"*. So the budget
+/// IS the switch: one record rather than a number plus a flag nobody sets. A Store without
+/// one behaves byte-for-byte as it did before tfs-064, and `$HOME/.tensorfs` never gets one.
+///
+/// **The budget is measured against the Store's OWN occupancy, never against the
+/// filesystem.** TensorFS does not stat a filesystem for policy (decisions.md 241/941):
+/// free space is a caller input, because only the caller can see the image layers, the
+/// install root, the media quota and the compile caches sharing the disk. What TensorFS
+/// owns is what it is holding, and that it can count without a syscall about anyone else.
+pub const DISK_BUDGET: &str = "disk-budget";
+
+/// The longest budget record this reads. A byte count needs 20 digits and a newline; a
+/// longer file is not a number.
+const DISK_BUDGET_MAX: u64 = 32;
+
+/// Read the budget, or nothing. Like the cache binding, reading can only cost, never
+/// refuse: an absent, unreadable or malformed record is no budget at all, because a Store
+/// that will not open is an availability failure and a policy record may not cause one. A
+/// number that is not a number refuses at BIND time, where it is a caller's mistake.
+fn read_disk_budget(root: &Path) -> Option<u64> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(root.join(DISK_BUDGET))
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(DISK_BUDGET_MAX).read_to_end(&mut bytes).ok()?;
+    std::str::from_utf8(&bytes).ok()?.trim().parse::<u64>().ok()
+}
+
 /// Read the binding, or nothing. Weather, never authority -- see [`REPO_CACHE_BINDING`].
 fn read_repo_cache_binding(root: &Path) -> Option<crate::repo_cache::RepoObjectCache> {
     let path = root.join(REPO_CACHE_BINDING);
@@ -1471,6 +1674,7 @@ fn open_validated(root: &Path) -> Result<Store> {
         root: root.to_path_buf(),
         progress: None,
         cache: read_repo_cache_binding(root),
+        budget: read_disk_budget(root),
     })
 }
 

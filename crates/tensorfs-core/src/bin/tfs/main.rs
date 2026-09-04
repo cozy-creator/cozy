@@ -786,6 +786,21 @@ fn cmd_store(root: &Path, verb: &str, flags: &Flags) -> ExitCode {
         (None, true) => Some(None),
         (None, false) => None,
     };
+    let budget = match (flag(flags, "disk-budget"), flag_on(flags, "no-disk-budget")) {
+        (Some(_), true) => {
+            eprintln!("--disk-budget and --no-disk-budget say opposite things; pass one");
+            return ExitCode::from(2);
+        }
+        (Some(value), false) => match value.parse::<u64>() {
+            Ok(bytes) => Some(Some(bytes)),
+            Err(_) => {
+                eprintln!("--disk-budget takes a byte count, not {value:?}");
+                return ExitCode::from(2);
+            }
+        },
+        (None, true) => Some(None),
+        (None, false) => None,
+    };
     let mut s = match verb {
         "init" => ok!(Store::init(root)),
         "ensure" => ok!(Store::ensure(root)),
@@ -794,12 +809,26 @@ fn cmd_store(root: &Path, verb: &str, flags: &Flags) -> ExitCode {
     if let Some(cache) = bind {
         s = ok!(s.bind_repo_cache(cache.as_deref()));
     }
+    if let Some(budget) = budget {
+        s = ok!(s.bind_disk_budget(budget));
+    }
     println!("root:       {}", s.root().display());
     println!("blobs:      {}", ok!(s.objects()).len());
     println!(
         "repo-cache: {}",
         match s.repo_cache() {
             Some(cache) => cache.root().display().to_string(),
+            None => "(none)".to_string(),
+        }
+    );
+    // Printed in the same readback shape as repo-cache, and for the same reason: a
+    // supervisor fences the line to prove the tfs it was baked with implements the flag it
+    // just passed, rather than trusting a zero exit (tensorhub pod-supervisor
+    // supervise.go:229-234).
+    println!(
+        "disk-budget: {}",
+        match s.disk_budget() {
+            Some(bytes) => format!("{bytes} B, holding {} B", ok!(s.occupancy())),
             None => "(none)".to_string(),
         }
     );

@@ -84,6 +84,12 @@ codes![
     // object store
     STORE_ERA,
     STORE_ROOT_ABSENT,
+    // There is no room: either the Store's recorded disk budget would be exceeded by an
+    // admission that has not started yet, or the filesystem itself answered ENOSPC. It is a
+    // VERDICT, never weather: a caller that retries it fails at the same byte forever, which
+    // is exactly what the generic IO_FAILED an out-of-space write used to raise bought on
+    // rented hardware (tfs-064).
+    CAPACITY_EXHAUSTED,
     OBJECT_ABSENT,
     OBJECT_CORRUPT,
     RANGE_BOUNDS,
