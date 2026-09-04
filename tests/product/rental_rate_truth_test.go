@@ -82,12 +82,12 @@ func TestRentalLadderRendersTheTotalDecomposed(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("cozy rental new [exit %d]:\n%s", code, out)
 	}
-	for _, want := range []string{"$0.703504/hr", "$2.173504/hr", "PRICE"} {
+	for _, want := range []string{"$0.70/hr", "$2.17/hr", "PRICE"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("the ladder does not render the total %q:\n%s", want, out)
 		}
 	}
-	for _, component := range []string{"$0.49/hr", "$1.96/hr", "$0.213504/hr"} {
+	for _, component := range []string{"$0.49/hr", "$1.96/hr", "$0.21/hr"} {
 		if strings.Contains(out, component) {
 			t.Fatalf("the ladder still quotes the component %s a renter does not pay alone:\n%s",
 				component, out)
@@ -100,8 +100,8 @@ func TestRentalLadderRendersTheTotalDecomposed(t *testing.T) {
 		t.Fatalf("cozy rental new --full [exit %d]:\n%s", code, full)
 	}
 	for _, want := range []string{
-		"$0.49/hr", "$0.213504/hr", "$0.703504/hr", // the L4 rung, decomposed
-		"$1.96/hr", "$2.173504/hr", // the x4 rung: its own price, the same adder
+		"$0.49/hr", "$0.21/hr", "$0.70/hr", // the L4 rung, decomposed
+		"$1.96/hr", "$2.17/hr", // the x4 rung: its own price, the same adder
 		"GPU PRICE", "STORAGE PRICE", "PRICE",
 	} {
 		if !strings.Contains(full, want) {

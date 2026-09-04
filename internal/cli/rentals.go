@@ -458,9 +458,12 @@ func computeCapabilityText(value string) string {
 	return "sm_" + strings.ReplaceAll(value, ".", "")
 }
 
+// rentalPrice is the catalog's per-hour figure. It DELEGATES rather than formatting
+// money a second way: this and usdPerHourBare rendered the same micros through two
+// independent implementations, so rounding one left `$0.46/hour` on the fleet line
+// beside `$0.463504/hr` in the ladder. One spelling of money, one place to change it.
 func rentalPrice(micros int64) string {
-	amount := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.6f", float64(micros)/1_000_000), "0"), ".")
-	return "$" + amount + "/hr"
+	return usdPerHourBare(micros) + "/hr"
 }
 
 func rentalRequestDigest(hubAuthority string, requestBody []byte) string {
