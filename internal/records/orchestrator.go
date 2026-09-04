@@ -1026,7 +1026,11 @@ func (s *Store) SettleRequest(id, state string) *exit.Error {
 // BeginRequeue crosses the post-ack boundary and charges the durable retry budget in one
 // transition. Replays after that transition are harmless: only `requeue_pending` can be
 // charged, so a duplicate terminal ack cannot spend twice or mint two ordinals.
-func (s *Store) BeginRequeue(id string, max int64) (count int64, started, canceled bool, e *exit.Error) {
+// `charge` is false for a requeue that is CAPACITY PRESSURE rather than a failed attempt.
+// The budget exists so a worker that dies on every attempt terminates the request; a
+// worker that had no room has not tried, and spending a life on being told "not now" is
+// how a request queued behind a busy machine dies having executed nothing.
+func (s *Store) BeginRequeue(id string, max int64, charge bool) (count int64, started, canceled bool, e *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, false, false, exit.Internalf("cannot begin the requeue transaction: %s", err)
@@ -1040,15 +1044,23 @@ func (s *Store) BeginRequeue(id string, max int64) (count int64, started, cancel
 	if state != "requeue_pending" {
 		return count, false, false, nil
 	}
-	if count >= max {
+	if charge && count >= max {
 		return count, false, false, exit.New(exit.Failed, "%s exhausted its requeue budget of %d", id, max)
 	}
-	if _, err := tx.Exec(`UPDATE requests SET state='queued',requeues=requeues+1
-		WHERE id=? AND state='requeue_pending'`, id); err != nil {
+	statement := `UPDATE requests SET state='queued',requeues=requeues+1
+		WHERE id=? AND state='requeue_pending'`
+	if !charge {
+		statement = `UPDATE requests SET state='queued'
+			WHERE id=? AND state='requeue_pending'`
+	}
+	if _, err := tx.Exec(statement, id); err != nil {
 		return 0, false, false, exit.Internalf("cannot charge a requeue for %s: %s", id, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, false, false, exit.Internalf("cannot commit requeue %s: %s", id, err)
+	}
+	if !charge {
+		return count, true, false, nil
 	}
 	return count + 1, true, false, nil
 }
