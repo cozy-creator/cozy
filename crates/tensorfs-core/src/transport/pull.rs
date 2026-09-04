@@ -21,21 +21,42 @@
 //! URL is minted. Minting the whole wanted set before the walk starts makes the cap a
 //! bound on the WHOLE WALK — the last object's URL is minted at T=0 beside the first, and
 //! dies while the walk is still in its opening objects — so the cap silently becomes a cap
-//! on how large a closure may be pulled at all, which is not what it was written to be. A
-//! ~5 GiB checkpoint fits inside it and has never fired; a 92 GiB one at this transport's
-//! measured 117 MB/s needs about thirteen minutes and does not. (This defect has never yet
-//! been observed firing in production, and nothing here is evidence that it has.) Minting
-//! at the point of use makes the same cap a bound on ONE OBJECT'S transfer, which is what
-//! it was sized for and is generous for, and makes resume free: a walk that stops and
-//! starts again mints its own URLs and inherits none of the dying ones.
+//! on how large a closure may be pulled at all, which is not what it was written to be.
+//! Minting at the point of use makes the same cap a bound on ONE OBJECT'S transfer, which
+//! is what it was sized for and is generous for, and makes resume free: a walk that stops
+//! and starts again mints its own URLs and inherits none of the dying ones.
+//!
+//! **The window is the bound the HUB declares and nothing else (proto-037).** It was two
+//! numbers this side chose — 4,096 digests copied from a hub constant that the hub's own
+//! body cap made unreachable, and an 8 GiB byte budget. Every model we own is smaller than
+//! 8 GiB, so that window never once closed: minting "at the point of use" minted the entire
+//! closure at T=0, exactly as the release before it did, and the protection this module was
+//! rewritten for was inert from the day it shipped. Meanwhile the count cap was twice the
+//! size the hub would read, so `paul/wai-illustrious@17.0.0` — 2,598 objects — passed both
+//! bounds and sent a 174,146 B body at a route that reads 131,072.
+//!
+//! A byte budget is gone rather than corrected. Window size is pure GRANULARITY: an
+//! over-large window costs a re-mint, an under-large one costs a round trip, and neither
+//! costs a transfer. The only bound with a correctness role is how many digests fit in one
+//! request, and that number belongs to the hub, which now says it on every closure.
 //!
 //! **Which failures deserve a re-ask.** A stall the ledger NAMED, a connection that died,
-//! and the object store's own retryable answers do; an expired presign and an absent key
-//! do not — those are facts about authorization, and asking again about authorization is
-//! a lie about time. Re-AUTHORIZING is a different act and is honest, which is why every
-//! ask carries a URL minted for it rather than the one the first ask was given. A refusal
-//! at the admission door propagates untouched: the bytes are wrong at the only authority
-//! there is.
+//! the object store's own retryable answers, and a LOCAL store that was merely busy do; an
+//! absent key does not. Asking the same question with the same expired URL is a lie about
+//! time — but re-AUTHORIZING is a different act, and it is the one the origin's 403 asked
+//! for. So a 403 is judged by the LEASE it refused: one the hub's own declared life says was
+//! already spent is re-minted, and one minted moments ago is terminal, because a refusal of
+//! a fresh capability is not about time. That gate is an observed fact and not a count — a
+//! count would call a genuinely slow object's second 403 terminal, and a slow origin is not
+//! a broken one.
+//!
+//! A refusal at the admission door propagates untouched: the bytes are wrong at the only
+//! authority there is. `IO_FAILED` is the one exception, and it is not an exception to the
+//! rule but an application of it: the catalog is a rollback-journal SQLite with a busy
+//! timeout, and sixteen concurrent writers make "database is locked" a fact about this
+//! second. A lock held five seconds ago is not held when we ask again, and it was killing
+//! whole multi-gigabyte walks after the bytes had landed. It re-asks with no wait at all,
+//! because the wait already happened inside SQLite'''s busy timeout.
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{DeliveryGrant, FetchPlan};
@@ -57,7 +78,7 @@ pub const RETRYABLE_STATUS: [u16; 7] = [408, 425, 429, 500, 502, 503, 504];
 /// A caller's per-object observer: the object that landed and the bytes this call moved.
 pub type ObjectObserver<'a> = &'a (dyn Fn(&ObjectRef, u64) + Sync);
 
-fn shared_client() -> &'static Client {
+pub(super) fn shared_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(Client::new)
 }
@@ -104,7 +125,16 @@ pub fn fetch_url(
     fetch_authorized(
         store,
         grant,
-        &|| Ok(url.to_string()),
+        &|stale: bool| {
+            if stale {
+                return refuse(
+                    Code::TRANSFER_FAILED,
+                    "the object store refused this URL and the caller supplied only one — \
+                     re-run with a freshly minted URL",
+                );
+            }
+            Ok(url.to_string())
+        },
         policy,
         credential,
         deadline,
@@ -126,7 +156,7 @@ pub fn fetch_url(
 pub fn fetch_authorized(
     store: &Store,
     grant: &DeliveryGrant,
-    authorize: &dyn Fn() -> Result<String>,
+    authorize: &dyn Fn(bool) -> Result<String>,
     policy: &SourcePolicy,
     credential: &dyn CredentialProvider,
     deadline: Deadline,
@@ -137,9 +167,32 @@ pub fn fetch_authorized(
     let id = grant.object.id();
     let mut last_refusal: Option<Refusal> = None;
     let mut stalled_attempts = 0u32;
+    // Set when the origin refused the URL this loop last held. The next ask says so, and
+    // the supplier decides whether re-authorizing is honest — it holds the lease and its
+    // declared life, which is the only place that question can be answered.
+    let mut stale: Option<u16> = None;
     for attempt in 1..=FETCH_ATTEMPTS {
         let last = attempt == FETCH_ATTEMPTS;
-        let url = authorize()?;
+        // A refused re-authorization must still name the origin's answer. It is the whole
+        // diagnosis: "403, and re-minting was not honest" and "403, and the hub would not
+        // mint" are different problems with different owners.
+        let url = match authorize(stale.is_some()) {
+            Ok(url) => url,
+            Err(refusal) => match stale {
+                Some(status) => {
+                    return refuse(
+                        Code::TRANSFER_FAILED,
+                        format!(
+                            "{id}: the object store answered {status} and re-authorizing \
+                             was refused — {}",
+                            refusal.detail
+                        ),
+                    )
+                }
+                None => return Err(refusal),
+            },
+        };
+        stale = None;
         let opened = match open_object(client, &url, policy, credential, deadline, ledger) {
             Ok(response) => response,
             Err(refusal) => match refusal.code {
@@ -161,6 +214,22 @@ pub fn fetch_authorized(
                         format!("{id}: the object store answered {status} on every attempt"),
                     );
                 }
+                continue;
+            }
+            Opened::Expired(status) => {
+                if last {
+                    return refuse(
+                        Code::TRANSFER_FAILED,
+                        format!(
+                            "{id}: the object store answered {status} on every attempt, \
+                             re-authorizing between them"
+                        ),
+                    );
+                }
+                // Ask to be authorized AGAIN — a different act from asking again, and the
+                // only one the origin's refusal can be answered with. The supplier refuses
+                // if the URL it just handed out was too young for time to be the cause.
+                stale = Some(status);
                 continue;
             }
             // An origin's own non-retryable answer is a fact, not weather: no re-ask.
@@ -189,7 +258,13 @@ pub fn fetch_authorized(
                     stalled_attempts += 1;
                 }
                 match refusal.code {
-                    Code::TRANSFER_FAILED if !last => {
+                    // IO_FAILED is the LOCAL store, and at sixteen concurrent writers
+                    // against a rollback-journal SQLite it is routinely "database is
+                    // locked" — a fact about this second, not about the object. It killed
+                    // whole multi-gigabyte walks after the bytes had landed. No wait is
+                    // added: the wait already happened inside SQLite's busy timeout, and
+                    // by the time this object is re-fetched the contention has moved.
+                    Code::TRANSFER_FAILED | Code::IO_FAILED if !last => {
                         last_refusal = Some(refusal);
                         continue;
                     }
@@ -222,6 +297,9 @@ pub fn fetch_authorized(
 enum Opened<'l> {
     Body(http::Response<'l>),
     Retryable(u16),
+    /// The origin refused the signature. Whether that is weather or a verdict depends on
+    /// the URL's age, which only the supplier knows.
+    Expired(u16),
     Refused(Refusal),
 }
 
@@ -278,12 +356,14 @@ fn open_object<'l>(
         if RETRYABLE_STATUS.contains(&status) {
             return Ok(Opened::Retryable(status));
         }
+        // 401/403 is the object store saying the SIGNATURE is no good — the one answer
+        // that a fresh URL can change, and the one that used to abort the walk outright.
+        if status == 401 || status == 403 {
+            return Ok(Opened::Expired(status));
+        }
         return Ok(Opened::Refused(Refusal {
             code: Code::TRANSFER_FAILED,
-            detail: format!(
-                "the object store answered {status} — a presigned read expires; re-run \
-                 the pull to be re-authorized"
-            ),
+            detail: format!("the object store answered {status}"),
         }));
     }
     refuse(
@@ -311,14 +391,28 @@ fn named(refusal: Refusal, id: &str) -> Refusal {
 /// implementation that mints has to know where the walk has got to in order to mint AHEAD
 /// of it rather than one call per object.
 pub trait ObjectUrls: Sync {
-    fn url_for(&self, at: usize, object: &ObjectRef) -> Result<String>;
+    /// `stale` is true when the caller is asking BECAUSE the URL it last held was refused
+    /// by the origin. A supplier that can re-mint must not answer with the same URL; one
+    /// that cannot must refuse, because handing back the dead URL would turn a re-ask into
+    /// an infinite one.
+    fn url_for(&self, at: usize, object: &ObjectRef, stale: bool) -> Result<String>;
 }
 
 /// URLs already in hand: the shape a caller that did its own authorizing passes. Nothing
 /// here re-mints, so the lifetime of these URLs bounds the whole walk — which is precisely
 /// why `pull` does not use this impl.
 impl ObjectUrls for BTreeMap<String, String> {
-    fn url_for(&self, _at: usize, object: &ObjectRef) -> Result<String> {
+    fn url_for(&self, _at: usize, object: &ObjectRef, stale: bool) -> Result<String> {
+        if stale {
+            return refuse(
+                Code::TRANSFER_FAILED,
+                format!(
+                    "{}: the object store refused the only URL this caller holds — these \
+                     URLs were minted elsewhere and nothing here can re-authorize them",
+                    object.id()
+                ),
+            );
+        }
         match self.get(&object.sha256) {
             Some(url) => Ok(url.clone()),
             None => refuse(
@@ -333,27 +427,29 @@ impl ObjectUrls for BTreeMap<String, String> {
     }
 }
 
-/// The hub presigns at most this many digests in one call (`MaxGrantSubjects` on its side);
-/// asking for more is a refusal, not a truncation, so a mint window stops here.
-pub const MAX_PRESIGN_DIGESTS: usize = 4096;
-
-/// How far ahead of the walk one mint reaches, in DECLARED bytes.
+/// How wide a mint window is when the hub declared no ceiling: exactly what the streams
+/// have in flight.
 ///
-/// This is GRANULARITY, not a verdict. Nothing fails because of it: a lease that goes stale
-/// before the walk reaches it is re-minted where it is used, so a badly chosen budget costs
-/// extra presign calls and never a transfer. It is a byte budget rather than an object count
-/// because that is what makes both ends safe at once — a window of very large objects stays
-/// short enough to be walked while its URLs are still young, and a window of very small ones
-/// stays long enough that refills do not beat against the hub's per-rental presign rate
-/// limit.
-const MINT_AHEAD_BYTES: u64 = 8 << 30;
+/// This is a DEGRADATION, derived from a fact this side owns, not a copy of a fact the hub
+/// owns. A window of `streams` digests is a few hundred bytes and is safe under any body cap
+/// a hub could plausibly have; it costs one presign call per wave of objects, which is a
+/// round trip and never a transfer. There is deliberately no constant here that guesses at
+/// the hub's cap — guessing at it is the defect this module is being repaired for.
+fn window_without_a_declared_ceiling(streams: usize) -> usize {
+    streams.max(1)
+}
 
 /// One minted URL and the life the hub declared for it.
-struct Lease {
-    url: String,
-    minted: Instant,
+///
+/// `pub(super)` for one reason: the rule that decides whether a 403 is re-mintable is the
+/// lease's AGE against that declared life, and reaching that decision from the wire means
+/// racing a clock. The rule is worth testing directly, with a lease whose age is stated
+/// rather than waited for.
+pub(super) struct Lease {
+    pub(super) url: String,
+    pub(super) minted: Instant,
     /// What the HUB said this URL is good for, or `None` when it said nothing.
-    lifetime: Option<Duration>,
+    pub(super) lifetime: Option<Duration>,
 }
 
 impl Lease {
@@ -377,21 +473,39 @@ impl Lease {
 /// lookup; `minting` is the right to CALL, held across the network so that N streams
 /// arriving at the same exhausted window cost one presign rather than N — which is also
 /// what the hub wants, since it single-flights presign per rental.
-struct Leases<'a> {
-    client: &'a Client,
-    base: &'a str,
-    credential: &'a dyn CredentialProvider,
-    policy: &'a SourcePolicy,
-    deadline: Deadline,
-    ledger: &'a Ledger,
-    wanted: &'a [ObjectRef],
-    streams: usize,
-    held: Mutex<BTreeMap<String, Lease>>,
-    minting: Mutex<()>,
+pub(super) struct Leases<'a> {
+    pub(super) client: &'a Client,
+    pub(super) base: &'a str,
+    pub(super) credential: &'a dyn CredentialProvider,
+    pub(super) policy: &'a SourcePolicy,
+    pub(super) deadline: Deadline,
+    pub(super) ledger: &'a Ledger,
+    pub(super) wanted: &'a [ObjectRef],
+    /// How many digests one mint asks for — the ceiling the hub declared on this pull's
+    /// own closure, or `window_without_a_declared_ceiling` when it declared none. Never a
+    /// constant compiled in here.
+    pub(super) window: usize,
+    pub(super) held: Mutex<BTreeMap<String, Lease>>,
+    pub(super) minting: Mutex<()>,
 }
 
 impl ObjectUrls for Leases<'_> {
-    fn url_for(&self, at: usize, object: &ObjectRef) -> Result<String> {
+    fn url_for(&self, at: usize, object: &ObjectRef, stale: bool) -> Result<String> {
+        if stale && !self.retire(&object.sha256)? {
+            // The refused lease was NOT spent: the hub's own declared life still had more
+            // than half of it left, so the origin's refusal is not about time and asking to
+            // be authorized again is asking the same question. Terminal, at the first 403,
+            // with no attempt spent guessing.
+            return refuse(
+                Code::TRANSFER_FAILED,
+                format!(
+                    "{}: the object store refused a URL minted moments ago, with most of \
+                     the life the hub declared for it still to run — that is a fact about \
+                     the object, not about time, and re-minting would ask the same question",
+                    object.id()
+                ),
+            );
+        }
         if let Some(url) = self.fresh(&object.sha256) {
             return Ok(url);
         }
@@ -421,6 +535,27 @@ impl Leases<'_> {
             .map(|lease| lease.url.clone())
     }
 
+    /// Drop the lease the origin just refused, and answer whether re-minting is honest.
+    ///
+    /// The gate is the LEASE'S AGE against the life the hub declared for it, which is an
+    /// observed fact about this URL and carries no opinion about seconds. It is not a count
+    /// of how many times this object has been re-authorized: a count and a freshness test
+    /// agree on a fast link and diverge exactly where a slow one lives. An object holding
+    /// half a URL's life that takes longer than that to move is slow, not broken, and its
+    /// second expiry is as honest as its first.
+    ///
+    /// A hub that declared no lifetime leaves nothing to judge, and then a refusal is taken
+    /// at face value: the window's own advance is the only bound on a URL's age, so a
+    /// re-mint could not be argued for.
+    fn retire(&self, digest: &str) -> Result<bool> {
+        let mut held = self.held.lock().unwrap();
+        let Some(lease) = held.remove(digest) else {
+            // Nothing held: another stream retired it, and whoever mints next is honest.
+            return Ok(true);
+        };
+        Ok(lease.spent())
+    }
+
     /// Mint from the walk's cursor forward: the object the caller has reached, and enough of
     /// what follows that the streams behind it find their URLs already waiting.
     ///
@@ -434,17 +569,14 @@ impl Leases<'_> {
     /// hangs is still a hang.
     fn mint_from(&self, at: usize) -> Result<()> {
         let mut digests: Vec<String> = Vec::new();
-        let mut bytes = 0u64;
         for object in &self.wanted[at..] {
-            let enough = digests.len() >= self.streams.max(1) && bytes >= MINT_AHEAD_BYTES;
-            if enough || digests.len() >= MAX_PRESIGN_DIGESTS {
+            if digests.len() >= self.window {
                 break;
             }
             if self.fresh(&object.sha256).is_some() {
                 continue;
             }
             digests.push(object.sha256.clone());
-            bytes = bytes.saturating_add(object.length);
         }
         if digests.is_empty() {
             return Ok(());
@@ -518,7 +650,7 @@ pub fn fetch_wanted(
                 let Some(object) = plan.wanted.get(at) else {
                     return;
                 };
-                let authorize = || urls.url_for(at, object);
+                let authorize = |stale: bool| urls.url_for(at, object, stale);
                 let outcome = DeliveryGrant::mint(plan, object).and_then(|grant| {
                     fetch_authorized(
                         store, &grant, &authorize, policy, credential, deadline, ledger, None,
@@ -636,7 +768,10 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         policy.allow_local = true;
     }
     let client = shared_client();
-    let closure = hub::closure(
+    // The WHOLE closure, however many pages the hub takes to say it. A closure that fits
+    // one page is one call, which is every model we own today; nothing about the walk
+    // changes when one day it is not.
+    let closure = hub::closure_all(
         client,
         request.base,
         request.refspec,
@@ -680,7 +815,9 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
             deadline: request.deadline,
             ledger: &ledger,
             wanted: &plan.wanted,
-            streams: request.streams.clamp(1, 128),
+            window: closure
+                .presign_max_digests
+                .unwrap_or_else(|| window_without_a_declared_ceiling(request.streams)),
             held: Mutex::new(BTreeMap::new()),
             minting: Mutex::new(()),
         };
@@ -698,12 +835,36 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         report.fetched = walked.fetched;
         report.bytes_moved = walked.bytes_moved;
     }
-    match closure.scope.as_str() {
-        "runtime" => plan.complete_cozytensors(request.store)?,
-        _ => plan.complete(request.store)?,
-    }
-    record_locally(request.store, &closure)?;
+    // The proof and the index row both read and write the catalog, and a walk that has just
+    // landed gigabytes must not be thrown away because the store was busy for a moment while
+    // its own streams were closing. Same rule as the walk's: a contended local store is a
+    // fact about this second.
+    while_store_busy(|| match closure.scope.as_str() {
+        "runtime" => plan.complete_cozytensors(request.store),
+        _ => plan.complete(request.store),
+    })?;
+    while_store_busy(|| record_locally(request.store, &closure))?;
     Ok(report)
+}
+
+/// Re-run while the LOCAL store answers `IO_FAILED`, which at this concurrency is dominated
+/// by SQLite's "database is locked". Bounded by the same `FETCH_ATTEMPTS` the walk uses, and
+/// with no wait of its own: the wait already happened inside the busy timeout, and a lock
+/// held a moment ago is not held now. Every other code is taken at face value on the first
+/// answer — proto-035's polarity, an allow-list of transient codes.
+fn while_store_busy<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut last = None;
+    for _ in 0..FETCH_ATTEMPTS {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(refusal) if refusal.code == Code::IO_FAILED => last = Some(refusal),
+            Err(refusal) => return Err(refusal),
+        }
+    }
+    Err(last.unwrap_or(Refusal {
+        code: Code::IO_FAILED,
+        detail: "the local store stayed busy".into(),
+    }))
 }
 
 /// RECORD WHAT THE PULL RESOLVED. The closure carries `model`, `release` and `lane` for

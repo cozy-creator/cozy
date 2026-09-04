@@ -4,20 +4,29 @@
 //! whether held or not, which is why the pod had to pre-emptively describe its own disk.
 //! Two calls replace it, and the store stops being the hub's business:
 //!
-//! 1. `POST {base}/v1/tensorfs/closure`, body `{"lane":"...","ref":"org/name[@release]"}`
-//!    → `{"lane":..,"manifest":{"length":N,"sha256":hex},"model":"org/name",
-//!       "objects":[{"length":N,"sha256":hex},...],"release":..,"scope":"runtime",
-//!       "stamps":{key:[values]}}` — permission-checked, NO URLs. `objects` is sorted
-//!    unique by digest and EXCLUDES the manifest row, which travels in `manifest`.
-//!    `scope` names the walk the closure covers (`runtime` today); `stamps` is the
-//!    resolved lane's stamped-fact set (#567d) and may be absent.
+//! 1. `POST {base}/v1/tensorfs/closure`, body
+//!    `{"lane":"..","ref":"org/name[@release]","after":hex?,"limit":N?}`
+//!    → `{"complete":bool,"lane":..,"manifest":{"length":N,"sha256":hex},"model":"org/name",
+//!       "objects":[{"length":N,"sha256":hex},...],"presign_max_digests":N,"release":..,
+//!       "scope":"runtime","stamps":{key:[values]}}` — NO URLs. `objects` is sorted
+//!    unique by digest and EXCLUDES the manifest row, which travels in `manifest` on
+//!    EVERY page. `scope` names the walk the closure covers (`runtime` today); `stamps`
+//!    is the resolved lane's stamped-fact set (#567d) and may be absent.
 //! 2. `POST {base}/v1/tensorfs/presign`, body `{"digests":[hex,...]}` (sorted unique, at
-//!    most `MAX_PRESIGN_DIGESTS`) → `{"expires_at_unix":N,"server_time_unix":N,
-//!    "urls":{hex:"https://...",...}}` — credential again, URLs only for what was asked,
-//!    the manifest digest included when asked. The two clock fields are the URL's declared
-//!    life stated in the HUB's own time, which is what lets a caller judge a URL's age
-//!    without trusting its own clock; the pull mints against them per object rather than
-//!    once for a whole closure.
+//!    most the `presign_max_digests` the closure declared) →
+//!    `{"expires_at_unix":N,"server_time_unix":N,"urls":{hex:"https://...",...}}` — URLs
+//!    only for what was asked, the manifest digest included when asked. The two clock
+//!    fields are the URL's declared life stated in the HUB's own time, which is what lets
+//!    a caller judge a URL's age without trusting its own clock; the pull mints against
+//!    them per object rather than once for a whole closure.
+//!
+//! **NO REQUEST OR RESPONSE HERE GROWS WITH THE MODEL (proto-037).** The closure is
+//! paginated on its own digests — the rows are sorted unique, so the cursor IS the last
+//! digest and needs no server session — and the presign ask is bounded by a ceiling the
+//! HUB derives from its own body cap and declares on every closure. This module holds no
+//! copy of that number. It held one once: 4,096, copied from the hub's grant-subject cap,
+//! which weighs 274,445 B against a route that reads 131,072. A 2,598-object closure
+//! passed every bound this side knew about and arrived as a 174,146 B body.
 //!
 //! Errors travel in the hub's own envelope `{"error":{"code","message","remedy"}}` and
 //! cross verbatim — the hub knows why it refused better than anything restated here.
@@ -134,23 +143,37 @@ pub struct Closure {
     /// Sorted unique by digest; EXCLUDES the manifest row.
     pub objects: Vec<ObjectRef>,
     pub stamps: Vec<(String, Vec<String>)>,
+    /// False when more object rows follow this page.
+    pub complete: bool,
+    /// The largest presign ask the HUB will read, as the hub itself stated it. `None` when
+    /// it declared nothing — there is then no bound this side may invent, so the caller
+    /// falls back to something derived from a fact it owns.
+    pub presign_max_digests: Option<usize>,
 }
 
+/// ONE PAGE of a closure. `after` is the last digest of the page before it, exclusive;
+/// the empty string asks for the first page. Callers that want the whole closure use
+/// [`closure_all`], which is what a pull does.
 #[allow(clippy::too_many_arguments)]
 pub fn closure(
     client: &Client,
     base: &str,
     refspec: &str,
     lane: &str,
+    after: &str,
     credential: &dyn CredentialProvider,
     policy: &SourcePolicy,
     deadline: Deadline,
     ledger: &Ledger,
 ) -> Result<Closure> {
-    let body = canon::write(&Value::obj(vec![
-        ("lane", Value::str(lane)),
-        ("ref", Value::str(refspec)),
-    ]));
+    // No `limit`: a page size is the hub's to choose, and a client that named one would be
+    // guessing at a bound it does not own. `after` is omitted entirely on the first page so
+    // the request is the one an unpaginated hub already understands.
+    let mut fields = vec![("lane", Value::str(lane)), ("ref", Value::str(refspec))];
+    if !after.is_empty() {
+        fields.insert(0, ("after", Value::str(after)));
+    }
+    let body = canon::write(&Value::obj(fields));
     let value = call(
         client,
         base,
@@ -214,6 +237,31 @@ pub fn closure(
             }
         }
     }
+    // An absent `complete` is a hub that does not paginate, and everything it sent IS the
+    // closure. A hub that paginates says so on every page.
+    let complete = match obj.iter().find(|(k, _)| k == "complete") {
+        Some((_, Value::Bool(done))) => *done,
+        Some((_, other)) => {
+            return refuse(
+                Code::HUB_REFUSED,
+                format!("closure.complete is {other:?}, not a boolean"),
+            )
+        }
+        None => true,
+    };
+    let presign_max_digests = match obj.iter().find(|(k, _)| k == "presign_max_digests") {
+        Some((_, raw)) => {
+            let declared = as_uint("closure", "presign_max_digests", raw)?;
+            if declared == 0 {
+                return refuse(
+                    Code::HUB_REFUSED,
+                    "the hub declared presign_max_digests = 0, which authorizes no ask at all",
+                );
+            }
+            Some(declared as usize)
+        }
+        None => None,
+    };
     Ok(Closure {
         model: as_str("closure", "model", field("model")?)?.to_string(),
         release: as_str("closure", "release", field("release")?)?.to_string(),
@@ -222,7 +270,100 @@ pub fn closure(
         manifest,
         objects,
         stamps,
+        complete,
+        presign_max_digests,
     })
+}
+
+/// THE WHOLE closure, however many pages it takes.
+///
+/// Page one resolves the ref; every page after it pins the manifest page one returned, so a
+/// release re-pointed mid-walk cannot stitch two trees into one closure — the hub answers
+/// about the identity that was asked for, not about whatever the lane names now. The pages
+/// are additionally checked against each other, because a hub that paginates correctly and
+/// a hub that has been restarted onto a different catalog look the same from one page.
+#[allow(clippy::too_many_arguments)]
+pub fn closure_all(
+    client: &Client,
+    base: &str,
+    refspec: &str,
+    lane: &str,
+    credential: &dyn CredentialProvider,
+    policy: &SourcePolicy,
+    deadline: Deadline,
+    ledger: &Ledger,
+) -> Result<Closure> {
+    let mut whole = closure(
+        client, base, refspec, lane, "", credential, policy, deadline, ledger,
+    )?;
+    if whole.complete {
+        return Ok(whole);
+    }
+    // The digest-pinned spelling of what page one resolved. `resolve` on the hub treats a
+    // digest as identity and settles on it alone.
+    let pinned = if whole.release.is_empty() {
+        format!("{}@sha256:{}", whole.model, whole.manifest.sha256)
+    } else {
+        format!(
+            "{}@{}@sha256:{}",
+            whole.model, whole.release, whole.manifest.sha256
+        )
+    };
+    // A closure may not exceed what this build will parse as one document's reference
+    // total. The bound is the artifact's, not the protocol's: a page count would be a
+    // number about the wire, and the wire is exactly what pagination made irrelevant.
+    while !whole.complete {
+        let Some(last) = whole.objects.last().map(|o| o.sha256.clone()) else {
+            return refuse(
+                Code::HUB_REFUSED,
+                "the closure is incomplete and its page is empty — paging cannot advance",
+            );
+        };
+        if whole.objects.len() >= limits::MAX_TOTAL_REFS {
+            return refuse(
+                Code::TOTAL_REFS_CAP,
+                format!(
+                    "the closure reached {} objects, this build's whole-document reference \
+                     total, and is still not complete",
+                    limits::MAX_TOTAL_REFS
+                ),
+            );
+        }
+        let next = closure(
+            client, base, &pinned, lane, &last, credential, policy, deadline, ledger,
+        )?;
+        if next.manifest != whole.manifest || next.model != whole.model || next.scope != whole.scope
+        {
+            return refuse(
+                Code::HUB_REFUSED,
+                format!(
+                    "the closure changed identity between pages: {} {} became {} {} — a \
+                     paged answer describes ONE tree",
+                    whole.model,
+                    whole.manifest.id(),
+                    next.model,
+                    next.manifest.id()
+                ),
+            );
+        }
+        if next
+            .objects
+            .first()
+            .is_some_and(|first| first.sha256 <= last)
+        {
+            return refuse(
+                Code::HUB_REFUSED,
+                format!(
+                    "the closure page after {last} starts at {} — the rows are sorted unique \
+                     by digest and a page must continue the one before it",
+                    next.objects[0].sha256
+                ),
+            );
+        }
+        whole.complete = next.complete;
+        whole.objects.extend(next.objects);
+    }
+    Ok(whole)
 }
 
 /// URLs for exactly the asked digests. A digest the hub does not answer is a typed
@@ -336,6 +477,16 @@ fn object_row(what: &'static str, value: &Value) -> Result<ObjectRef> {
     })
 }
 
+/// The hub answers a mint mid-walk, so a hub blip must not discard a transfer that has
+/// already moved gigabytes. `call` re-asks while re-asking is HONEST — proto-035's polarity:
+/// an allow-list of statuses that could genuinely answer differently later, everything else
+/// terminal on the first refusal.
+///
+/// What it waits is never a duration invented here. A 429 carries `retry_after_unix` beside
+/// the hub's own `server_time_unix`, so the wait is the hub's stated instant read off the
+/// hub's own clock; when nothing is stated the wait is the ledger's `patience()`, which is a
+/// multiple of the gap this pull has ACTUALLY shown. Both are debounces over an observed
+/// fact. The caller's deadline bounds either one.
 #[allow(clippy::too_many_arguments)]
 fn call(
     client: &Client,
@@ -347,8 +498,59 @@ fn call(
     deadline: Deadline,
     ledger: &Ledger,
 ) -> Result<Value> {
+    let mut last: Option<Refusal> = None;
+    for attempt in 1..=crate::transport::ledger::FETCH_ATTEMPTS {
+        let final_attempt = attempt == crate::transport::ledger::FETCH_ATTEMPTS;
+        match call_once(
+            client, base, path, body, credential, policy, deadline, ledger,
+        ) {
+            Ok(value) => return Ok(value),
+            Err(Retryable { wait, refusal }) if !final_attempt => {
+                // A wait is spent out of the caller's budget, never past it.
+                let wait = match deadline.remaining()? {
+                    Some(left) => wait.min(left),
+                    None => wait,
+                };
+                last = Some(refusal);
+                std::thread::sleep(wait);
+            }
+            Err(Retryable { refusal, .. }) => return Err(refusal),
+        }
+    }
+    Err(last.unwrap_or(Refusal {
+        code: Code::HUB_UNREACHABLE,
+        detail: format!("the hub at {base} did not answer {path}"),
+    }))
+}
+
+/// One refusal plus how long to wait before re-asking. A zero wait means "do not re-ask".
+struct Retryable {
+    wait: std::time::Duration,
+    refusal: Refusal,
+}
+
+impl From<Refusal> for Retryable {
+    fn from(refusal: Refusal) -> Retryable {
+        Retryable {
+            wait: std::time::Duration::ZERO,
+            refusal,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_once(
+    client: &Client,
+    base: &str,
+    path: &str,
+    body: &[u8],
+    credential: &dyn CredentialProvider,
+    policy: &SourcePolicy,
+    deadline: Deadline,
+    ledger: &Ledger,
+) -> std::result::Result<Value, Retryable> {
     let url = format!("{}{}", base.trim_end_matches('/'), path);
-    let checked = policy.check(&url)?;
+    let checked = policy.check(&url).map_err(Retryable::from)?;
     let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
     headers.extend(credential.headers(&checked.host));
     let response = crate::transport::http::request(
@@ -364,25 +566,62 @@ fn call(
         Code::HUB_UNREACHABLE,
     )
     .map_err(|refusal| match refusal.code {
-        Code::HUB_UNREACHABLE => Refusal {
-            code: Code::HUB_UNREACHABLE,
-            detail: format!(
-                "the hub at {base} did not answer {path} — {}; artifacts already in the \
-                 local store are usable offline",
-                refusal.detail
-            ),
+        // A hub that did not answer at all is weather, not a verdict: the same request may
+        // reach it on the next connection.
+        Code::HUB_UNREACHABLE => Retryable {
+            wait: ledger.patience(),
+            refusal: Refusal {
+                code: Code::HUB_UNREACHABLE,
+                detail: format!(
+                    "the hub at {base} did not answer {path} — {}; artifacts already in the \
+                     local store are usable offline",
+                    refusal.detail
+                ),
+            },
         },
-        _ => refusal,
+        _ => Retryable::from(refusal),
     })?;
     let status = response.status;
-    let raw = response.read_capped(limits::DOC_MAX_BYTES)?;
+    let raw = response
+        .read_capped(limits::DOC_MAX_BYTES)
+        .map_err(Retryable::from)?;
     if (200..300).contains(&status) {
-        return canon::parse(&raw, limits::DOC_MAX_BYTES).map_err(|refusal| Refusal {
-            code: Code::HUB_REFUSED,
-            detail: format!("the hub's {path} answer is not readable I-JSON: {refusal}"),
+        return canon::parse(&raw, limits::DOC_MAX_BYTES).map_err(|refusal| {
+            Retryable::from(Refusal {
+                code: Code::HUB_REFUSED,
+                detail: format!("the hub's {path} answer is not readable I-JSON: {refusal}"),
+            })
         });
     }
-    Err(envelope(status, &raw, path))
+    let refusal = envelope(status, &raw, path);
+    if !crate::transport::pull::RETRYABLE_STATUS.contains(&status) {
+        return Err(Retryable::from(refusal));
+    }
+    Err(Retryable {
+        wait: stated_wait(&raw).unwrap_or_else(|| ledger.patience()),
+        refusal,
+    })
+}
+
+/// How long the HUB says to wait, read off the pair of clocks it sent so a skewed local
+/// clock cannot shorten or lengthen it. `None` when the hub stated nothing.
+fn stated_wait(raw: &[u8]) -> Option<std::time::Duration> {
+    let Ok(Value::Obj(fields)) = canon::parse(raw, 64 * 1024) else {
+        return None;
+    };
+    let uint = |name: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| k == name)
+            .and_then(|(_, v)| match v {
+                Value::Int(n) if *n >= 0 => Some(*n as u64),
+                _ => None,
+            })
+    };
+    let (retry_after, server_now) = (uint("retry_after_unix")?, uint("server_time_unix")?);
+    Some(std::time::Duration::from_secs(
+        retry_after.saturating_sub(server_now),
+    ))
 }
 
 /// The hub's own typed envelope, crossed verbatim: its code and remedy are BETTER than
