@@ -16,7 +16,9 @@
 //! evidence, not reinvented (they were measured, and paid for on a rented pod):
 //!
 //! - **per-object resume** (`pull`): the recovery unit is an object; no byte-range resume
-//!   inside one — the artifact is already cut on the object grid;
+//!   inside one — the artifact is already cut on the object grid. That is a fact about
+//!   PUBLISHED artifacts, and `ranged` is where it stops being true: a foreign source
+//!   object is whatever the uploader pushed, so the grid is cut at fetch time instead;
 //! - **the liveness ledger, never a timeout** (`ledger`): a deadline arrives from the
 //!   caller or there is none; a stream is judged only against the longest gap this pull
 //!   has actually shown;
@@ -36,6 +38,7 @@ mod ledger;
 mod policy;
 mod pull;
 mod push;
+mod ranged;
 
 #[cfg(test)]
 mod tests;
@@ -55,3 +58,4 @@ pub use pull::{
     ObjectUrls, PullReport, PullRequest, WalkOutcome, RETRYABLE_STATUS,
 };
 pub use push::{push_object, Pushed, UploadGrant, MAX_GRANT_BYTES, PUT_ATTEMPTS};
+pub use ranged::{fetch_ranged, Ranged, PART_BYTES, RANGED_MIN_BYTES, SOURCE_STREAMS};
