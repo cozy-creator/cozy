@@ -86,6 +86,27 @@ fn sources(f: &Flags) -> Result<Vec<(String, PathBuf)>, ExitCode> {
 /// Physical carriers for source-plan. A reviewed canonical member may disambiguate
 /// equal headers; paths are locations only and never participate in classification.
 type CarrierInput = source_core::CarrierInput;
+type CarrierSet = source_core::CarrierSet;
+
+/// `--source component=path` names a LOCATION and nothing else, so these carriers have no
+/// member: the file name is the name and the directory is the shard scope. That is honest
+/// for a checkout on disk, and it is exactly why `--source` cannot reach a sharded index
+/// that lives in a store — there the name is a hex digest and there are no siblings. Use
+/// `source-plan --carrier <member>=<path>` for that, which names members.
+fn unnamed(sources: &[(String, PathBuf)]) -> Vec<(String, CarrierInput)> {
+    sources
+        .iter()
+        .map(|(component, path)| {
+            (
+                component.clone(),
+                CarrierInput {
+                    member: None,
+                    path: path.clone(),
+                },
+            )
+        })
+        .collect()
+}
 
 fn carriers(f: &Flags) -> Result<Vec<CarrierInput>, ExitCode> {
     let mut out = Vec::new();
@@ -317,7 +338,7 @@ pub fn cmd_inspect(f: &Flags) -> ExitCode {
 
     for (component, path) in &srcs {
         println!("{component}  {}", path.display());
-        let (h, raw) = ok!(source_core::read_carrier(path));
+        let (h, raw) = ok!(source_core::read_carrier_at(path));
         total_header += h.header_bytes;
         let fp = ok!(fingerprint::fingerprint(component, &h));
         let stamps = ok!(fingerprint::evidence_stamps(&h));
@@ -423,7 +444,7 @@ pub fn cmd_bank(dialect: &str, converter: &str, f: &Flags) -> ExitCode {
     };
     let mut reviewed = Vec::new();
     for (component, path) in &srcs {
-        let (full, raw) = ok!(source_core::read_carrier(path));
+        let (full, raw) = ok!(source_core::read_carrier_at(path));
         let h = if conv.name == "single_file.identity/1" {
             ok!(convert::single_file_component(component, &full))
         } else {
@@ -563,7 +584,13 @@ pub fn cmd_bank(dialect: &str, converter: &str, f: &Flags) -> ExitCode {
             .collect::<Vec<_>>()
             .join(",");
         let variant = flag(f, "spec-variant").and_then(|value| value.parse().ok());
-        let mut prepared = match source_core::prepare_with_registry(&target, &srcs, &reg, variant) {
+        let mut prepared = match source_core::prepare_with_registry(
+            &target,
+            &unnamed(&srcs),
+            &CarrierSet::default(),
+            &reg,
+            variant,
+        ) {
             Ok(prepared) => prepared,
             Err(error) => return bail(error),
         };
@@ -634,7 +661,12 @@ struct ClosedSourcePlan {
     order: Vec<(String, String)>,
     registry: String,
     session: String,
-    sources: Vec<(String, PathBuf)>,
+    /// The component's CARRIER, member included. A closed plan re-prepares from these, so
+    /// dropping the member here would read a store-resident sharded index as a safetensors
+    /// file at exactly the point the plan was supposed to be replayable.
+    sources: Vec<(String, CarrierInput)>,
+    /// The plan's whole carrier set — the directory a `weight_map` resolves against.
+    set: CarrierSet,
     target: String,
 }
 
@@ -732,10 +764,14 @@ fn read_closed_source_plan(path: &Path) -> Result<ClosedSourcePlan, ExitCode> {
                     let mut source = Fields::new("SourcePlanSource", row)?;
                     let component = source.req_str("component")?.to_string();
                     let path = PathBuf::from(source.req_str("path")?);
-                    if let Some(value) = source.opt("source_member") {
-                        let member = as_str("SourcePlanSource", "source_member", value)?;
-                        fingerprint::validate_source_member(member)?;
-                    }
+                    let member = match source.opt("source_member") {
+                        Some(value) => {
+                            let member = as_str("SourcePlanSource", "source_member", value)?;
+                            fingerprint::validate_source_member(member)?;
+                            Some(member.to_string())
+                        }
+                        None => None,
+                    };
                     match source.req("projected")? {
                         Value::Bool(_) => {}
                         other => {
@@ -749,7 +785,7 @@ fn read_closed_source_plan(path: &Path) -> Result<ClosedSourcePlan, ExitCode> {
                         }
                     }
                     source.done()?;
-                    Ok((component, path))
+                    Ok((component, CarrierInput { member, path }))
                 })
                 .collect()
         })
@@ -795,6 +831,7 @@ fn read_closed_source_plan(path: &Path) -> Result<ClosedSourcePlan, ExitCode> {
         registry,
         session,
         sources,
+        set: CarrierSet::of(&carriers),
         target,
     })
 }
@@ -815,12 +852,17 @@ fn prepare_closed_source_plan(
     for (component, source) in &closed.sources {
         flags.push((
             "source".to_string(),
-            format!("{component}={}", source.to_string_lossy()),
+            format!("{component}={}", source.path.to_string_lossy()),
         ));
     }
-    let mut prepared =
-        source_core::prepare_with_registry(&closed.target, &closed.sources, &registry, None)
-            .map_err(bail)?;
+    let mut prepared = source_core::prepare_with_registry(
+        &closed.target,
+        &closed.sources,
+        &closed.set,
+        &registry,
+        None,
+    )
+    .map_err(bail)?;
     if let Err(error) = prepared.plan.apply_order(&closed.order) {
         return Err(bail(error));
     }
@@ -951,7 +993,14 @@ fn prepare(f: &Flags, target: &str) -> Result<Prepared, ExitCode> {
     let sources = sources(f)?;
     let registry = load_registry(f)?;
     let variant = flag(f, "spec-variant").and_then(|value| value.parse().ok());
-    source_core::prepare_with_registry(target, &sources, &registry, variant).map_err(bail)
+    source_core::prepare_with_registry(
+        target,
+        &unnamed(&sources),
+        &CarrierSet::default(),
+        &registry,
+        variant,
+    )
+    .map_err(bail)
 }
 
 fn print_plan(p: &Prepared) {

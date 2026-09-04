@@ -756,7 +756,12 @@ fn is_safetensors(member: &str) -> bool {
 /// Resolve `relative` against the directory of `member`, the way the Go resolver's
 /// `path.Clean(path.Join(path.Dir(member), shard))` does. `None` when the reference walks
 /// above the repository root — an index may not name its way out of its own tree.
-fn join_member(member: &str, relative: &str) -> Option<String> {
+///
+/// **Shared with `ingest::carrier::read_sharded` on purpose.** The resolver uses this to
+/// decide which shards a selection must FETCH; the ingest uses it to decide which carrier
+/// a `weight_map` value NAMES. Two joins would be two answers to one question, and the
+/// disagreement would only ever be found by a run that downloaded everything first.
+pub(crate) fn join_member(member: &str, relative: &str) -> Option<String> {
     let directory = member.rsplit_once('/').map_or("", |(head, _)| head);
     let mut parts: Vec<&str> = Vec::new();
     for segment in directory.split('/').chain(relative.split('/')) {
