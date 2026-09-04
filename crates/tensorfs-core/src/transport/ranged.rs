@@ -1,59 +1,70 @@
-//! Byte-range parallel fetch of ONE source object (tfs-062).
+//! Resumable ranged fetch of ONE source object (tfs-062).
 //!
-//! **The recovery unit is an object only where the object grid is fine.** `pull`'s N-way
-//! walk parallelises ACROSS objects, which is the whole story for a repo pull: publish
-//! already cut the artifact at 64 MiB, so sixteen streams have sixteen things to carry and
-//! a dropped connection costs one segment. A foreign SOURCE has no such grid. A
-//! HuggingFace member is whatever the uploader pushed — MiniMax-H3's selection is 44
-//! safetensors shards totalling 210.3 GB, one of them 5.2 GB — and the walk that moves it
-//! has exactly ONE object to walk, so it runs on ONE stream and a connection that dies at
-//! 4.9 GB of 5.2 GB re-buys the whole shard.
+//! **The prize is resume, not parallelism.** `pull`'s N-way walk parallelises ACROSS
+//! objects, which is the whole story for a repo pull: publish already cut the artifact at
+//! 64 MiB, so a dropped connection costs one segment. A foreign SOURCE has no such grid — a
+//! HuggingFace member is whatever the uploader pushed, and MiniMax-H3's selection is 44
+//! shards totalling 210.3 GB, one of them 5.2 GB. There was no byte-range resume inside an
+//! object, so a connection that died at 4.9 GB of that shard re-bought the shard. On a
+//! 210 GB pull over a link that has been watched drop repeatedly, that is the recurring
+//! cost, and it is what this module removes.
 //!
-//! This module cuts the grid at fetch time instead of publish time. An object is split
-//! into PARTS, the parts are fetched in parallel with `Range`, and the object is assembled
-//! in offset order. Measured against HuggingFace's CDN from a developer box: 14.2 MB/s on
-//! one stream, 18.9 MB/s at eight — the same shape #566b measured pod-side at a different
-//! ceiling (49.8 MB/s serial, 117.6 MB/s at sixteen), and the reason the number here is
-//! smaller is that this box's own link saturates near 19 MB/s.
+//! **The throughput case was demoted by measurement, and is not claimed.** It was briefed
+//! as 49.8 MB/s on one stream against 117.6 MB/s at sixteen; those were transport-PROBE
+//! numbers. Production says otherwise: H3 run 290 sustained 70-129 MB/s per lane against a
+//! ~516 MB/s aggregate that looks bounded by the NIC or the origin, and a real 3.087 GB
+//! HuggingFace fetch through this code moved at **18.9 MB/s on one stream and 19.1 MB/s on
+//! eight 64 MiB parts** — the link was already saturated by one. On a link like that,
+//! cutting an object into parts moves bytes from one socket to another and changes no
+//! total. `SOURCE_STREAMS` is therefore 1, and parallelism is a parameter kept for the one
+//! case still argued for — the TAIL of a multi-object pull, where fewer objects remain than
+//! there are lanes — which nobody has measured yet.
+//!
+//! So there are three paths, and the default is the cheap one:
+//!
+//! - **one stream (`sequential`, the default).** Ascending ranges, one at a time. The bytes
+//!   arrive in the order the door wants them, so `put_stream` reads straight off the wire
+//!   and there is no scratch file, no second write, and nothing buffered anywhere. A
+//!   dropped connection re-asks `bytes=<reached>-<part end>`; the door has been hashing
+//!   that prefix all along and never learns the socket under it was replaced.
+//! - **N streams (`assemble`).** Parts in flight at once, landing out of order into a
+//!   scratch file, read back in offset order. Costs a second full write of every byte,
+//!   which is why it is not the default.
+//! - **no ranges (`whole`).** `pull::fetch_url`, byte for byte the path a member took
+//!   before this module. An origin that answers the probe with a 200, or with an unusable
+//!   `Content-Range`, or is merely busy, lands here. A source that cannot be ranged must
+//!   still work.
 //!
 //! **The admission door does not move.** Every byte still enters at
 //! `DeliveryGrant::admit` → `Store::put_stream`, hashed in one sequential pass over the
 //! object's own byte order, and the object is admitted only if it hashes to the id the
-//! record owner named. Parallelism changes WHICH SOCKET a byte arrives on and nothing
-//! about how it is judged: the parts land in a scratch file, and the door is fed a reader
-//! that hands out bytes strictly in offset order and blocks rather than skip a hole. A
-//! part that never completes is a read error at the door, and `put_stream` deletes its
-//! temp and refuses — a partially assembled object has no path to admission.
+//! record owner named. Ranges change WHICH SOCKET a byte arrives on and nothing about how
+//! it is judged: the door is always fed bytes in strictly ascending offset order, by
+//! construction on the sequential path and by a reader that blocks rather than skip a hole
+//! on the parallel one. A range that never completes is a read error at the door, and
+//! `put_stream` deletes its temp and refuses — a partially assembled object has no path to
+//! admission.
 //!
-//! **A part is `pull::open_object` called again, and nothing else.** Every ranged request
-//! goes through the single-stream path's own opener with one extra header, which is the
-//! only structure that makes the guarantee cheap to state and impossible to drift from:
-//! the fence runs on the part's URL and on every redirect hop of it, the credential is
+//! **A ranged ask is `pull::open_object` called again, and nothing else.** Every request
+//! here goes through the single-stream path's own opener with one extra header, which is
+//! the only structure that makes the guarantee cheap to state and impossible to drift
+//! from: the fence runs on the URL and on every redirect hop of it, the credential is
 //! re-asked per host, a relative `Location` resolves against the hop that sent it, the hop
-//! budget is the same budget, and the `Retryable`/`Expired` status arms are the same arms.
-//! Parallel ranges are not a way to reach a host the predicate never saw.
+//! budget is the same budget, and the `Retryable`/`Expired` arms are the same arms. Ranged
+//! requests are not a way to reach a host the predicate never saw.
 //!
 //! Nothing is resolved once and reused. It is tempting — the probe already walked the
-//! chain, and a part could start at the delivery URL and save a 302 — and that is exactly
+//! chain, and an ask could start at the delivery URL and save a 302 — and that is exactly
 //! the trade tfs-060 was filed about: a per-request behaviour quietly demoted to a
 //! per-object one, correct on the day it ships and wrong the first time an origin changes
-//! its mind mid-transfer. The redirect is re-walked per part, at the cost of one cheap hop
-//! per 64 MiB, and a delivery URL that ages out during a 5 GB shard simply never happens
-//! because no part is holding one.
+//! its mind mid-transfer. The chain is re-walked per ask, at the cost of one cheap hop per
+//! 64 MiB, and a delivery URL that ages out during a 5 GB shard simply never happens
+//! because nothing is holding one.
 //!
-//! **Resume is per part, and within a part it is per byte.** A part whose connection dies
-//! at byte k re-asks for `bytes=(start+k)-end` and moves nothing it already holds. The
-//! object is re-asked for only when the caller re-runs, and then `FetchPlan` already
-//! answers that it is not held.
-//!
-//! **A source that cannot be ranged still works.** The probe is one `bytes=0-0` GET: an
-//! origin that answers 200, or answers 206 without a usable `Content-Range`, or is merely
-//! busy, drops this object onto `pull::fetch_url`'s single-stream path with its full
-//! re-ask and re-authorize machinery. Ranged fetch is an accelerator, never a requirement.
-
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{Admitted, DeliveryGrant};
 use crate::store::Store;
+use crate::transport::http;
 use crate::transport::hub::CredentialProvider;
 use crate::transport::ledger::{Deadline, Ledger, FETCH_ATTEMPTS};
 use crate::transport::policy::SourcePolicy;
@@ -144,18 +155,18 @@ pub fn fetch_ranged(
     let ranged = ranged.normalized();
     let total = grant.object.length;
     // A manifest is bytes the door reads whole into memory and compares; it is never a
-    // gigabyte and cutting it would be all cost. Small objects are the same argument.
-    if grant.manifest || ranged.streams < 2 || total < ranged.part.saturating_mul(2) {
-        return single(
+    // gigabyte and ranging it would be all cost. Small objects are the same argument.
+    if grant.manifest || ranged.streams == 0 || total < ranged.part.saturating_mul(2) {
+        return whole(
             store, grant, url, policy, credential, deadline, ledger, observer,
         );
     }
     let probe = match probe(url, policy, credential, deadline, ledger)? {
         Some(probe) => probe,
         // The origin does not do ranges, or would not say so on this ask. Not an error:
-        // the single-stream path is the same path this object took before this module.
+        // this is the same whole-object GET the member took before this module.
         None => {
-            return single(
+            return whole(
                 store, grant, url, policy, credential, deadline, ledger, observer,
             )
         }
@@ -171,13 +182,31 @@ pub fn fetch_ranged(
             ),
         );
     }
+    // One stream is the DEFAULT and is not a degraded case: the parts arrive in order, so
+    // the door is fed straight off the wire and nothing is ever buffered anywhere. Resume
+    // is the whole point and is unaffected — a dropped connection re-asks from the byte it
+    // reached, and the door, which has been hashing that prefix all along, never notices.
+    if ranged.streams == 1 {
+        return sequential(
+            store,
+            grant,
+            url,
+            probe.total,
+            policy,
+            credential,
+            deadline,
+            ledger,
+            ranged,
+            observer,
+        );
+    }
     assemble(
         store, grant, url, &probe, policy, credential, deadline, ledger, ranged, observer,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn single(
+fn whole(
     store: &Store,
     grant: &DeliveryGrant,
     url: &str,
@@ -777,5 +806,222 @@ impl Read for Assembled<'_, '_> {
         self.scratch.read_at(&mut out[..n], self.at)?;
         self.at += n as u64;
         Ok(n)
+    }
+}
+
+// ---------------------------------------------------------------- one stream, resumable
+
+/// One stream, ranged — the DEFAULT, and the whole point of the module.
+///
+/// The object is asked for one part at a time in ascending order, so the bytes arrive in the
+/// order the door wants them and there is no scratch file, no second write, and nothing
+/// buffered anywhere: `put_stream` reads straight off the wire exactly as it does for a
+/// whole-object GET. The only thing that changed is what happens when the wire stops.
+///
+/// **A dropped connection costs the bytes that did not arrive, and nothing else.** The
+/// reader remembers the offset it has reached; the next ask is `bytes=<reached>-<part end>`.
+/// The door has been hashing that prefix all along and never learns that the socket under it
+/// was replaced. Before this, a connection that died at 4.9 GB of a 5.2 GB shard re-bought
+/// the shard.
+#[allow(clippy::too_many_arguments)]
+fn sequential(
+    store: &Store,
+    grant: &DeliveryGrant,
+    url: &str,
+    total: u64,
+    policy: &SourcePolicy,
+    credential: &dyn CredentialProvider,
+    deadline: Deadline,
+    ledger: &Ledger,
+    ranged: Ranged,
+    observer: Option<&mut dyn FetchObserver>,
+) -> Result<Fetched> {
+    let mut reader = Resumed {
+        at: 0,
+        total,
+        part: ranged.part,
+        open: None,
+        attempt: 0,
+        url,
+        policy,
+        credential,
+        deadline,
+        ledger,
+        observer,
+        failure: None,
+    };
+    let admitted = match grant.admit(store, &mut reader) {
+        Ok(admitted) => admitted,
+        // Same rule the parallel path follows: a range that could not be moved reaches the
+        // door as "read source: ...", which names the symptom. The cause is the refusal the
+        // reader recorded. A door that refused for its OWN reason — the bytes hashed wrong —
+        // recorded nothing here and propagates untouched.
+        Err(door) => return Err(reader.failure.take().unwrap_or(door)),
+    };
+    Ok(Fetched {
+        admitted,
+        transferred: reader.at,
+    })
+}
+
+/// The object as one resumable stream: ascending ranges, re-asked from the byte reached.
+struct Resumed<'a, 'l, 'o> {
+    at: u64,
+    total: u64,
+    part: u64,
+    /// The body currently being read and the byte its range runs to.
+    open: Option<(http::BodyReader<'l>, u64)>,
+    /// Asks spent since the last byte that landed. Reset by PROGRESS, not by a part
+    /// boundary: a link that delivers 60 MiB and then dies has not spent an attempt on the
+    /// next 60, and counting it as if it had would turn a long slow transfer into a failure.
+    attempt: u32,
+    url: &'a str,
+    policy: &'a SourcePolicy,
+    credential: &'a dyn CredentialProvider,
+    deadline: Deadline,
+    ledger: &'l Ledger,
+    observer: Option<&'o mut (dyn FetchObserver + 'o)>,
+    /// The typed refusal behind whatever `io::Error` the door will see.
+    failure: Option<Refusal>,
+}
+
+impl<'l> Resumed<'_, 'l, '_> {
+    /// Ask for `bytes=<at>-<end of the part containing at>`, through the single-stream
+    /// path's own opener so the fence, the credential and the redirect rules are the same
+    /// ones — not a copy of them.
+    fn ask(&mut self) -> Result<(http::BodyReader<'l>, u64)> {
+        let end = (self.at / self.part + 1)
+            .saturating_mul(self.part)
+            .min(self.total)
+            - 1;
+        let asked = format!("bytes={}-{end}", self.at);
+        let mut hops: Vec<(String, u16)> = Vec::new();
+        let opened = pull::open_object(
+            pull::shared_client(),
+            self.url,
+            self.policy,
+            self.credential,
+            self.deadline,
+            self.ledger,
+            &[("range".to_string(), asked.clone())],
+            &mut |checked, status| hops.push((checked.host.clone(), status)),
+        );
+        if let Some(observer) = self.observer.as_mut() {
+            for (host, status) in &hops {
+                observer.hop(self.attempt + 1, host, *status);
+            }
+        }
+        let response = match opened? {
+            Opened::Body(response) if response.status == 206 => response,
+            // 200 where 206 was asked for. At offset 0 that is simply an origin that does
+            // not range, and the whole body IS the object, so it is read as one — the same
+            // answer the probe's fall-back gives, arrived at later. Past offset 0 it would
+            // put the object's first bytes at this offset, and only the digest would notice.
+            Opened::Body(response) if self.at == 0 && end + 1 == self.total => response,
+            Opened::Body(_) => {
+                return refuse(
+                    Code::TRANSFER_FAILED,
+                    format!(
+                        "asked for {asked} and the origin answered 200 — it stopped \
+                         honouring ranges mid-object, which no re-ask can fix"
+                    ),
+                )
+            }
+            Opened::Retryable(status) | Opened::Expired(status) => {
+                return refuse(
+                    Code::TRANSFER_FAILED,
+                    format!("the origin answered {status} to {asked}"),
+                )
+            }
+            Opened::Refused(refusal) => return Err(refusal),
+        };
+        if response.status == 206 {
+            match content_range(response.header("content-range")) {
+                Some((first, _, said)) if first == self.at && said == self.total => {}
+                other => {
+                    return refuse(
+                        Code::TRANSFER_FAILED,
+                        format!(
+                            "asked for {asked} of {} B and the origin answered \
+                             Content-Range {other:?}",
+                            self.total
+                        ),
+                    )
+                }
+            }
+        }
+        Ok((response.into_body(), end))
+    }
+
+    /// Keep the typed refusal and hand the door the `io::Error` a `Read` can carry.
+    fn record(&mut self, refusal: Refusal) -> std::io::Error {
+        let text = refusal.to_string();
+        self.failure = Some(refusal);
+        std::io::Error::other(text)
+    }
+}
+
+impl Read for Resumed<'_, '_, '_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.at >= self.total || out.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            // A body is held only while it still owes bytes, so `end` is never behind `at`
+            // and the next ask is always the next thing to do.
+            let Some((mut body, end)) = self.open.take() else {
+                match self.ask() {
+                    Ok(open) => {
+                        self.open = Some(open);
+                        continue;
+                    }
+                    Err(refusal) => {
+                        self.attempt += 1;
+                        if self.attempt >= FETCH_ATTEMPTS {
+                            return Err(self.record(refusal));
+                        }
+                        continue;
+                    }
+                }
+            };
+            let want = out.len().min((end - self.at + 1) as usize);
+            match body.read_refusing(&mut out[..want]) {
+                Ok(0) => {
+                    // The origin closed inside the range it promised. The bytes already
+                    // handed to the door STAY handed to the door — `at` is where the next
+                    // ask begins, and that is the whole feature.
+                    self.attempt += 1;
+                    if self.attempt >= FETCH_ATTEMPTS {
+                        return Err(self.record(Refusal {
+                            code: Code::TRANSFER_FAILED,
+                            detail: format!(
+                                "the origin closed {} B short of the range it promised, on \
+                                 every one of {FETCH_ATTEMPTS} asks",
+                                end - self.at + 1
+                            ),
+                        }));
+                    }
+                }
+                Ok(read) => {
+                    self.at += read as u64;
+                    // Progress, so the budget is whole again: an object that keeps moving
+                    // never spends an attempt, however many sockets it took to move it.
+                    self.attempt = 0;
+                    if self.at <= end {
+                        self.open = Some((body, end));
+                    }
+                    if let Some(observer) = self.observer.as_mut() {
+                        observer.moved(self.at);
+                    }
+                    return Ok(read);
+                }
+                Err(refusal) => {
+                    self.attempt += 1;
+                    if self.attempt >= FETCH_ATTEMPTS {
+                        return Err(self.record(refusal));
+                    }
+                }
+            }
+        }
     }
 }
