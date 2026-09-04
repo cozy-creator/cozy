@@ -5,14 +5,18 @@ package home
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/flock"
+	_ "modernc.org/sqlite"
 )
 
 // Layout is the resolved set of paths every cl-009 verb works against. Every
@@ -116,8 +120,44 @@ func renameRecords(root, daemonLock, db string) *exit.Error {
 		return nil
 	}
 	if _, err := os.Lstat(db); err == nil {
+		// BOTH SPELLINGS EXIST, AND THAT IS USUALLY NOT AN AMBIGUITY (cl-134). An old
+		// build run once inside an already-migrated root recreates records.db, runs its
+		// own migrations into it, and writes no row. Every current binary then refused
+		// the whole root, and the refusal named a decision — "remove the one that is not
+		// the lifecycle authority" — that it gave the reader no evidence to make. The
+		// answer needed a sqlite shell to see. Observed twice on 2026-09-04.
+		//
+		// A database carrying no rows in any table carries no lifecycle, and that is
+		// decidable rather than a judgement: a real pre-cl-116 authority has installs,
+		// rentals or runs in it. So the empty one is sidelined and the root opens.
+		holds, why := priorStoreHoldsRecords(prior)
+		if !holds && why == "" {
+			stamp := time.Now().UTC().Format("20060102T150405Z")
+			for _, suffix := range []string{"", "-wal", "-shm"} {
+				from := prior + suffix
+				if _, err := os.Lstat(from); err != nil {
+					continue
+				}
+				if err := os.Rename(from, prior+".superseded-"+stamp+suffix); err != nil {
+					return exit.Internalf("cannot set aside %s: %s", from, err)
+				}
+			}
+			fmt.Fprintf(os.Stderr,
+				"cozy: %s held an empty records.db beside creator.sqlite — an older build "+
+					"recreated it and wrote nothing. Set aside as records.db.superseded-%s; "+
+					"creator.sqlite is the lifecycle authority and is untouched.\n", root, stamp)
+			return nil
+		}
+		detail := "it carries lifecycle rows"
+		if why != "" {
+			detail = why
+		}
 		return exit.Named(exit.Conflict, "records_ambiguous",
-			"%s holds both records.db and creator.sqlite; remove the one that is not the lifecycle authority", root)
+			"%s holds both records.db and creator.sqlite, and the records.db is not "+
+				"obviously stale (%s); this build only ever writes creator.sqlite, so move "+
+				"records.db aside if it predates the migration", root, detail).
+			WithRemedy("inspect both, then move the one you do not want aside: `mv %s %s.aside`",
+				prior, prior)
 	}
 	f, err := os.OpenFile(daemonLock, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
@@ -141,6 +181,57 @@ func renameRecords(root, daemonLock, db string) *exit.Error {
 		}
 	}
 	return nil
+}
+
+// priorStoreHoldsRecords answers whether a records.db beside creator.sqlite is a real
+// pre-cl-116 lifecycle authority or a scratch file a stale binary created after the
+// migration already ran. It returns (holds, why): `why` is non-empty when the question
+// could not be ANSWERED, which is treated exactly like "holds" — this decides whether to
+// move a database, so it is conservative in one direction only.
+//
+// The file is opened read-only and immutable, so a live old-build daemon still holding it
+// is never disturbed. `immutable=1` skips locking and therefore IGNORES the WAL, so a
+// non-empty WAL is checked first and answered as "holds": rows committed only there would
+// otherwise read as an empty database, which is the one wrong answer that loses data.
+func priorStoreHoldsRecords(path string) (holds bool, why string) {
+	if info, err := os.Lstat(path + "-wal"); err == nil && info.Size() > 0 {
+		return true, "it has an unmerged write-ahead log"
+	}
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&immutable=1")
+	if err != nil {
+		return true, "it could not be opened to answer"
+	}
+	defer db.Close()
+	rows, err := db.Query(
+		"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+	if err != nil {
+		return true, "its table list could not be read"
+	}
+	var tables []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return true, "its table list could not be read"
+		}
+		tables = append(tables, name)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return true, "its table list could not be read"
+	}
+	rows.Close()
+	for _, table := range tables {
+		var any int
+		q := fmt.Sprintf(`SELECT EXISTS(SELECT 1 FROM "%s")`, strings.ReplaceAll(table, `"`, `""`))
+		if err := db.QueryRow(q).Scan(&any); err != nil {
+			return true, "table " + table + " could not be counted"
+		}
+		if any == 1 {
+			return true, "table " + table + " carries rows"
+		}
+	}
+	return false, ""
 }
 
 // InputAsset resolves one verified sha256 digest into its private immutable staging

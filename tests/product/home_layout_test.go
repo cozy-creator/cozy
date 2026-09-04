@@ -312,3 +312,69 @@ func TestDiskCountsEachInodeOnce(t *testing.T) {
 		t.Fatalf("externally linked inode measured as %d shared bytes, want counted once (~4096)", shared)
 	}
 }
+
+// TestEmptyPriorRecordsIsSetAsideAndAPopulatedOneRefuses proves cl-134 on the real
+// migration path, both ways.
+//
+// The failure this ends: an OLD build run once inside an already-migrated root recreates
+// records.db, runs its own migrations into it, and writes nothing. Every current binary
+// then refused the whole root — the CLI went blind — and the refusal named a decision
+// ("remove the one that is not the lifecycle authority") it gave the reader no evidence
+// to make. Observed twice on 2026-09-04; the answer needed a sqlite shell to see.
+//
+// A database carrying no rows in any table carries no lifecycle, so it is set aside and
+// the root opens. One carrying rows is a real ambiguity and still refuses — that arm is
+// the red arm, and it must stay red.
+func TestEmptyPriorRecordsIsSetAsideAndAPopulatedOneRefuses(t *testing.T) {
+	// Both databases are made by the REAL store, so both carry the real schema; a
+	// hand-rolled file would prove the predicate against a fiction.
+	seedStore := func(path string) *records.Store {
+		store, problem := records.OpenForDaemon(path, filepath.Join(filepath.Dir(path), "triage"))
+		fatal(t, problem)
+		return store
+	}
+
+	t.Run("empty is set aside", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "home")
+		must(t, os.MkdirAll(root, 0o700))
+		authority := seedStore(filepath.Join(root, "creator.sqlite"))
+		submitSweepRequest(t, authority, "req-authority")
+		authority.Close()
+		// The stale binary's contribution: full schema, not one row.
+		seedStore(filepath.Join(root, "records.db")).Close()
+
+		l, problem := home.Open(root)
+		fatal(t, problem)
+		if _, err := os.Stat(filepath.Join(root, "records.db")); !os.IsNotExist(err) {
+			t.Fatal("an empty records.db survived beside creator.sqlite")
+		}
+		aside, err := filepath.Glob(filepath.Join(root, "records.db.superseded-*"))
+		must(t, err)
+		if len(aside) != 1 {
+			t.Fatalf("want exactly one superseded file, got %v", aside)
+		}
+		// AND THE AUTHORITY IS UNTOUCHED — the point of setting the other one aside.
+		store, problem := records.OpenForDaemon(l.DB, filepath.Join(root, "triage"))
+		fatal(t, problem)
+		defer store.Close()
+		fatal(t, store.SettleRequest("req-authority", "failed"))
+	})
+
+	t.Run("a populated one still refuses", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "home")
+		must(t, os.MkdirAll(root, 0o700))
+		seedStore(filepath.Join(root, "creator.sqlite")).Close()
+		prior := seedStore(filepath.Join(root, "records.db"))
+		submitSweepRequest(t, prior, "req-prior")
+		prior.Close()
+
+		if _, problem := home.Open(root); problem == nil {
+			t.Fatal("a records.db carrying rows was silently set aside")
+		} else if !strings.Contains(problem.Error(), "records.db") {
+			t.Fatalf("refusal does not name the file: %v", problem)
+		}
+		if _, err := os.Stat(filepath.Join(root, "records.db")); err != nil {
+			t.Fatalf("a refused migration moved the database anyway: %v", err)
+		}
+	})
+}
