@@ -649,7 +649,28 @@ pub fn run(store: &Store, drop: &[RepositoryName], options: RunOptions) -> Resul
     // record of what WAS true; the census is what is true now.
     let census = Census::open(store.root())?;
     let (holds, _) = crate::gc::session_holds(store)?;
-    let condemned = census.reclaim_plan(drop, &holds)?;
+
+    // WHAT THIS RUN IS EVICTING, which is not everything the sweep will take. Objects that
+    // are ALREADY unreferenced are what a plain `tfs gc` frees without anybody dropping a
+    // model, so they are neither demoted nor asked to prove themselves:
+    //
+    //  - demoting them would push bytes no model names onto a SHARED volume cache that has
+    //    no garbage collector by design, where they would stay forever;
+    //  - and asking them for a durable upstream would make one orphan blob refuse every
+    //    reclaim run on the store, which is a false refusal — those bytes are going whether
+    //    or not this run happens.
+    //
+    // They are still collected in phase 3, by the same sweep that would have taken them.
+    let already: BTreeSet<String> = census
+        .reclaim_plan(&[], &holds)?
+        .into_iter()
+        .map(|row| row.key)
+        .collect();
+    let condemned: Vec<_> = census
+        .reclaim_plan(drop, &holds)?
+        .into_iter()
+        .filter(|row| !already.contains(&row.key))
+        .collect();
 
     let mut unrecoverable = Vec::new();
     for row in &condemned {

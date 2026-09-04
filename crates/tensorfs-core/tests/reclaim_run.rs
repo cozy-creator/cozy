@@ -385,3 +385,52 @@ fn a_store_with_no_disk_budget_cannot_be_reclaimed_even_by_asking() {
     assert!(store.contains(&object.sha256));
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn one_orphan_blob_does_not_refuse_the_whole_run_and_is_never_pushed_to_the_cache() {
+    // FOUND BY REVIEW, NOT BY A FIXTURE. Bytes that are ALREADY unreferenced are what a
+    // plain `tfs gc` frees whether or not anybody evicts a model. Asking them to prove a
+    // durable upstream made a single orphan blob refuse every reclaim run on the store —
+    // a false refusal — and demoting them would push bytes no model names onto a SHARED
+    // volume cache that has no garbage collector by design.
+    let f = fixture("orphan", true);
+    let orphan = blob(&f.store, "nobody-names-me", 45_000);
+    assert!(
+        !Census::open(&f.root)
+            .unwrap()
+            .gc_plan(&[])
+            .unwrap()
+            .is_empty(),
+        "the fixture has no orphan; the arm would be vacuous"
+    );
+
+    let report = reclaim::run(
+        &f.store,
+        &victim(),
+        RunOptions {
+            demote: true,
+            assume_upstream: false,
+        },
+    )
+    .expect("an orphan blob must not refuse the run");
+
+    // The orphan is collected, because phase 3 is the ordinary sweep...
+    assert!(!f.store.contains(&orphan.sha256));
+    // ...but it never reached the shared cache, because nothing was evicting it.
+    let cached = RepoObjectCache::new(&f.cache)
+        .path(CacheKind::Blob, &orphan.sha256)
+        .unwrap();
+    assert!(
+        !cached.exists(),
+        "an object no model names was pushed onto the shared volume cache"
+    );
+    // The victim's own bytes DID get demoted, so the arm is not passing by demoting nothing.
+    let demoted = RepoObjectCache::new(&f.cache)
+        .path(CacheKind::Blob, &f.victim_only.sha256)
+        .unwrap();
+    assert!(demoted.exists(), "the eviction demoted nothing at all");
+    assert!(report.reclaimed_bytes > orphan.length);
+
+    let _ = std::fs::remove_dir_all(f.root);
+    let _ = std::fs::remove_dir_all(f.cache);
+}
