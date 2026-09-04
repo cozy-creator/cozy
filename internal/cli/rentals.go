@@ -223,9 +223,26 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
+	// A rental bought FOR a request declares that request's workload, so the hub
+	// can size the pod's container disk to the job (th-152). An ingest holds its
+	// source objects and the canonical CAS output built from them in one Store
+	// on the container disk, so a pod bought at the serving default would block
+	// on a full filesystem partway through a paid run. The selection is already
+	// resolved here — the request and its source inventory were committed in one
+	// transaction before any pod was asked for — so this costs no extra round
+	// trip. A rental with no managed request declares nothing and takes the
+	// serving default.
+	var plannedSourceBytes int64
+	if managedRequestID != "" {
+		plannedSourceBytes, e = st.PlannedSourceBytes(managedRequestID)
+		if e != nil {
+			return records.Rental{}, hub.Rental{}, false, e
+		}
+	}
 	// The machine word is the store's to reserve; the request is authored under it.
 	author := func(machineName string) ([]byte, string, *exit.Error) {
-		body, e := hub.RentalRequestBytes(machineName, skuName, secret.HashHex(token), creator.PublicKey())
+		body, e := hub.RentalRequestBytes(machineName, skuName, secret.HashHex(token),
+			creator.PublicKey(), plannedSourceBytes)
 		if e != nil {
 			return nil, "", e
 		}

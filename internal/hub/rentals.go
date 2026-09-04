@@ -186,17 +186,36 @@ type RentalRequest struct {
 	SKU              string `json:"sku"`
 	MediaTokenSHA256 string `json:"media_token_sha256"`
 	CreatorPublicKey string `json:"creator_public_key"`
+	// PlannedSourceBytes declares the workload this pod is being bought FOR, so
+	// the hub can size its container disk to the job instead of to one constant
+	// baked into the worker image (th-152). Omitted for a serving rental, whose
+	// models are not resolved yet; SET for an ingest, whose whole selection is
+	// resolved before the pod is asked for.
+	//
+	// It matters because an ingest holds its source objects and the canonical
+	// CAS output built from them in ONE Store on the container disk. A 210 GB
+	// source needs roughly twice that, and a pod bought at the serving default
+	// would not fail cleanly — a full filesystem blocks writes, which looks
+	// exactly like a stall, hours into a paid run.
+	PlannedSourceBytes int64 `json:"planned_source_bytes,omitempty"`
 }
 
 // RentalRequestBytes authors the exact bytes persisted before POST and replayed
 // unchanged after response loss. There is one encoder, not a digest struct plus
 // a separately marshaled transport map that can drift.
-func RentalRequestBytes(name, sku, mediaTokenSHA256, creatorPublicKey string) ([]byte, *exit.Error) {
+func RentalRequestBytes(name, sku, mediaTokenSHA256, creatorPublicKey string,
+	plannedSourceBytes int64,
+) ([]byte, *exit.Error) {
 	req := RentalRequest{
-		Name:             strings.TrimSpace(name),
-		SKU:              strings.TrimSpace(sku),
-		MediaTokenSHA256: strings.TrimPrefix(strings.TrimSpace(mediaTokenSHA256), "sha256:"),
-		CreatorPublicKey: strings.TrimSpace(creatorPublicKey),
+		Name:               strings.TrimSpace(name),
+		SKU:                strings.TrimSpace(sku),
+		MediaTokenSHA256:   strings.TrimPrefix(strings.TrimSpace(mediaTokenSHA256), "sha256:"),
+		CreatorPublicKey:   strings.TrimSpace(creatorPublicKey),
+		PlannedSourceBytes: plannedSourceBytes,
+	}
+	if plannedSourceBytes < 0 {
+		return nil, exit.Named(exit.Validation, "rental.planned_workload_invalid",
+			"a declared workload is the summed length of the source objects, or absent")
 	}
 	public, publicErr := base64.RawURLEncoding.DecodeString(req.CreatorPublicKey)
 	if !rentalid.ValidMachineName(req.Name) || req.SKU == "" || !bareSHA256Pattern.MatchString(req.MediaTokenSHA256) ||
@@ -227,7 +246,8 @@ func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
 		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
 			"persisted rental intent has trailing data")
 	}
-	canonical, problem := RentalRequestBytes(req.Name, req.SKU, req.MediaTokenSHA256, req.CreatorPublicKey)
+	canonical, problem := RentalRequestBytes(req.Name, req.SKU, req.MediaTokenSHA256,
+		req.CreatorPublicKey, req.PlannedSourceBytes)
 	if problem != nil || !bytes.Equal(canonical, raw) {
 		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
 			"persisted rental intent is not its exact canonical request")
