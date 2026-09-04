@@ -1116,6 +1116,13 @@ fn cmd_bench_store(root: &Path, f: &Flags) -> ExitCode {
     }
     println!("{:.2} s", t.elapsed().as_secs_f64());
 
+    // Which SHA-256 routine these numbers were produced by (tfs-068). Every row below
+    // except the range reads is hash-bound, so the rate means nothing without it.
+    println!(
+        "  sha256 backend: {}",
+        tensorfs_core::sha256::backend_name()
+    );
+
     let mib = |b: u64, s: f64| b as f64 / s / 1048576.0;
     let row = |what: &str, bytes: u64, secs: f64| {
         println!("  {what:<34} {secs:8.3} s   {:9.1} MiB/s", mib(bytes, secs));

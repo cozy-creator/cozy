@@ -1,7 +1,12 @@
 //! tensorfs-core — canonical documents, tensor rules, the fit function, and the encoding
 //! registry (tfs-013). See tracker-v2/cozytensors.md and tensorfs.md.
 
-#![forbid(unsafe_code)]
+// DENY, not forbid, for exactly one reason: `sha256.rs` reaches the CPU's SHA-256
+// instructions through intrinsics, and `forbid` cannot be relaxed even module-wide
+// (tfs-068). Two `#[allow(unsafe_code)]` sit in that file and nowhere else; anywhere
+// else in this crate an `unsafe` is still a hard error, and `git grep -n unsafe` over
+// crates/tensorfs-core/src is the check that it stays that way.
+#![deny(unsafe_code)]
 
 pub mod b64;
 pub mod canon;
