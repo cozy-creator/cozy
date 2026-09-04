@@ -826,3 +826,108 @@ func (s *Store) ForgetRental(id string) (bool, *exit.Error) {
 	}
 	return n > 0, nil
 }
+
+// PinnedRentalWork is every unsettled request pinned to one rental, oldest first. It is
+// what the daemon asks when that rental reaches a terminal failed state: the pin named a
+// machine, the machine is gone, and these rows are the work that went with it.
+//
+// It is deliberately the SAME predicate `RentalRunCounts` totals — `worker=<rental>` and an
+// active state — so the count an operator reads and the set recovery acts on can never
+// disagree. A rental shown as holding 1 running and 2 queued must be able to hand over
+// exactly those three rows.
+func (s *Store) PinnedRentalWork(rentalID string) ([]Request, *exit.Error) {
+	if rentalID == "" {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`SELECT `+requestCols+` FROM requests
+		WHERE worker=? AND state IN (`+activeRequestStates+`)
+		ORDER BY created_at,id`, rentalID)
+	if err != nil {
+		return nil, exit.Internalf("cannot list work pinned to rental %s: %s", rentalID, err)
+	}
+	defer rows.Close()
+	var out []Request
+	for rows.Next() {
+		r, err := scanRequest(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read work pinned to rental %s: %s", rentalID, err)
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// UnpinRentalWork releases a still-QUEUED request from a rental that can no longer serve
+// it, so routing may replan it onto another machine. It is the exact inverse of PinRental
+// and refuses the same rows PinRental would not have written: a request that has reached
+// an attempt is not unpinned here, because an attempt that may have run is a different
+// question from one that never started (StrandRentalAttempt answers that one).
+//
+// `machine` is NOT cleared. The machine word is history the run keeps (cl-107); a request
+// that waited on a pod which died should still be able to say which pod that was.
+func (s *Store) UnpinRentalWork(requestID, rentalID string) (bool, *exit.Error) {
+	result, err := s.db.Exec(`UPDATE requests SET worker=''
+		WHERE id=? AND worker=? AND rental=1
+		  AND state IN ('submitted','queued','requeue_pending')`, requestID, rentalID)
+	if err != nil {
+		return false, exit.Internalf("cannot release request %s from rental %s: %s",
+			requestID, rentalID, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, exit.Internalf("cannot read the release of request %s: %s", requestID, err)
+	}
+	return changed == 1, nil
+}
+
+// StrandRentalAttempt closes one open attempt whose pod is PROVABLY GONE, and puts its
+// request on the requeue path.
+//
+// This is the one exception to the recovered-attempts law, and it needs its reason stated.
+// `OpenAttemptsOf` says an unsettled attempt "can only be settled by the supervisor's own
+// journal, replayed by a worker in the SAME slot" — which is right for every case where
+// that worker may come back. A rental the hub has terminally failed has had its provider
+// resource reclaimed: there is no slot left to replay into, and the journal was destroyed
+// with the pod. Waiting for it is waiting for an event that cannot occur.
+//
+// The proof is an OBSERVATION — the rental's terminal state — never elapsed time. An
+// attempt sitting at 300 s is not evidence of anything; a reclaimed pod is.
+//
+// The request lands in `requeue_pending`, NOT back on the queue. That hands it to the
+// existing requeue budget rather than a second retry vocabulary: this attempt WAS accepted
+// by a worker and may have partially executed, so re-offering it costs a life, and a
+// request out of lives fails with that reason instead of retrying forever.
+func (s *Store) StrandRentalAttempt(requestID string, attempt int64, cause string) (bool, *exit.Error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, exit.Internalf("cannot begin stranding %s#%d: %s", requestID, attempt, err)
+	}
+	defer tx.Rollback()
+	// ONLY an attempt that crossed to the worker and recorded NO terminal. A `terminal`
+	// attempt already holds a real outcome the worker committed, and overwriting it with a
+	// synthetic failure would publish `request.failed` over a result that succeeded — the
+	// worst failure class this system has. `preparing`/`offered` never crossed at all and
+	// belong to the abort path, which charges nothing.
+	res, err := tx.Exec(`UPDATE attempts
+		SET state='closed',terminal_status='FAILED',terminal_cause='RENTAL_LOST',
+		    safe_message=?,closed_at=?
+		WHERE request_id=? AND attempt=? AND state IN ('accepted','recovered_open')`,
+		cause, now(), requestID, attempt)
+	if err != nil {
+		return false, exit.Internalf("cannot strand attempt %s#%d: %s", requestID, attempt, err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return false, nil
+	}
+	// Only the request's CURRENT ordinal moves it; a stale attempt of an already-advanced
+	// request settles alone.
+	if _, err := tx.Exec(`UPDATE requests SET state='requeue_pending'
+		WHERE id=? AND ordinal=? AND state IN ('dispatching','finalizing')`,
+		requestID, attempt); err != nil {
+		return false, exit.Internalf("cannot move %s to the requeue path: %s", requestID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, exit.Internalf("stranding %s#%d did not commit: %s", requestID, attempt, err)
+	}
+	return true, nil
+}

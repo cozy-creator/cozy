@@ -45,8 +45,18 @@ type managedRentals struct {
 	// the last line printed about each rental, so the sweep speaks once per change.
 	retryAt map[string]time.Time
 	said    map[string]string
-	closed  bool
+	// lost holds rentals observed in a terminal failed state whose pinned work has not
+	// been handed back yet. Recovery CANNOT run under this lock: it calls into the
+	// orchestrator, whose replan asks the fleet for capacity and re-enters here — the same
+	// re-entry `watch` already avoids by waking the queue after it unlocks. So reconcile
+	// only RECORDS the observation and the loop acts on it outside the lock.
+	lost   []lostRental
+	closed bool
 }
+
+// lostRental is one rental observed dead and the hub code that killed it, waiting to be
+// acted on outside the fleet lock.
+type lostRental struct{ id, code string }
 
 // idleReleaseRetry is how soon a release the hub did not confirm is asked again. A fifth
 // of the grace: shorter than the grace, or a transient fault would add another whole
@@ -383,21 +393,48 @@ func (m *managedRentals) release(id string) (string, *exit.Error) {
 // now and a warm one keeps only the unspent remainder of its grace.
 func (m *managedRentals) releaseOrphaned() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if problem := m.reconcileLocked(); problem != nil {
 		fmt.Fprintf(m.ctx.Out, "rental reconciliation deferred: %s\n", problem.Message)
+		m.mu.Unlock()
 		return
 	}
 	m.sweepLocked()
+	m.mu.Unlock()
+	m.recoverLostWork()
 }
+
+// hubReconcileCadence is how often the idle loop re-asks Tensorhub what each rental IS,
+// rather than what this host last recorded about it.
+//
+// It is a POLL INTERVAL and not a deadline. Nothing is killed, released, or reclaimed
+// because it elapsed; the only thing a tick does is ask a question, and every decision is
+// still made from the answer.
+//
+// The sweep needs it because the daemon cannot learn a rental died any other way. Tensorhub
+// owns provider reclaim, and a rental that fails AFTER it was serving reaches this host
+// through no other channel — the worker control stream dying looks the same as a network
+// blip, which is why it is not the signal. Every other reconcile is driven by a rental verb
+// or by an acquisition (`status`, `admit`), and those are exactly the events a rental
+// holding stranded work cannot cause: its requests are pinned, so they never reach
+// `selectOrStart` and never ask the fleet anything. Until this, the loop read local records
+// only, so a rental that failed while holding work was re-observed only if some UNRELATED
+// work happened to arrive and poll the hub for its own reasons.
+//
+// Ten seconds is chosen against the dispatch retry cadence, not picked round: a pinned
+// request re-asks its rental for a seat roughly every 20 s, so noticing at 10 s means the
+// daemon never spends a whole retry believing in a machine the hub has already reclaimed.
+// The cost is one GET per rental — a fleet is a handful of pods, not a datacenter.
+const hubReconcileCadence = 10 * time.Second
 
 // watch is the idle release's own loop. It re-reads the records at pollCadence — the
 // resolution every rental verb already samples a rental at — and acts only on what they
 // say; the grace is the debounce, and a sample that finds nothing to do costs a few local
 // reads. It returns when quit closes, or at once when idle release is configured off.
+
 func (m *managedRentals) watch(quit <-chan struct{}) {
 	tick := time.NewTicker(pollCadence)
 	defer tick.Stop()
+	reconciled := time.Now()
 	for {
 		select {
 		case <-quit:
@@ -406,10 +443,17 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 		}
 		m.mu.Lock()
 		if !m.closed {
+			if time.Since(reconciled) >= hubReconcileCadence {
+				reconciled = time.Now()
+				if problem := m.reconcileLocked(); problem != nil {
+					m.sayLocked("", "rental reconciliation deferred: "+problem.Message)
+				}
+			}
 			m.sweepLocked()
 		}
 		owner := m.owner
 		m.mu.Unlock()
+		m.recoverLostWork()
 		if owner != nil {
 			// Hub recovery is an observed fleet change. Re-ask durable queued work outside
 			// the fleet lock; selection calls back into this object.
@@ -624,8 +668,53 @@ func (m *managedRentals) reconcileLocked() *exit.Error {
 		if problem := m.store.RecordRental(row); problem != nil {
 			return problem
 		}
+		m.recoverLostWorkLocked(row, remote)
 	}
 	return nil
+}
+
+// recoverLostWorkLocked hands a terminally failed rental's pinned work back to routing.
+//
+// This sweep is where the daemon LEARNS a rental died — it is the only place that reads
+// the hub's verdict for a rental that was already serving — and until now it recorded that
+// verdict and did nothing else. The requests pinned to the pod stayed pinned to it: never
+// routed, because they named a machine no worker would ever answer for, and never
+// released, because `RentalRunCounts` counted them and fenced the idle release. Meanwhile
+// the fleet bought a second pod for a later request, served it, and released it while the
+// stranded three still waited (observed live 2026-09-04, rental pr-183abac284d1e16f5f0a).
+//
+// The worker record goes NOW, under the lock, so no replan can choose the corpse:
+// `rentalHeld` reads live worker records and a stale one would make `selectOrStart` decide
+// the dead rental still holds the placement. Detach never calls back into the fleet, so it
+// is safe here; handing the work back is not, and is queued for the loop instead.
+func (m *managedRentals) recoverLostWorkLocked(row records.Rental, remote hub.Rental) {
+	if row.State != hub.RentalFailed || m.owner == nil {
+		return
+	}
+	m.owner.DetachRental(row.ID)
+	for _, pending := range m.lost {
+		if pending.id == row.ID {
+			return
+		}
+	}
+	m.lost = append(m.lost, lostRental{id: row.ID, code: rentalFailureCode(remote)})
+}
+
+// recoverLostWork hands back the work of every rental reconcile has seen die, OUTSIDE the
+// fleet lock. Replanning a released request asks the fleet for capacity, so doing it under
+// the lock deadlocks the daemon — measured, not theorised, on the first cut of this change.
+func (m *managedRentals) recoverLostWork() {
+	m.mu.Lock()
+	lost := m.lost
+	m.lost = nil
+	owner := m.owner
+	m.mu.Unlock()
+	if owner == nil {
+		return
+	}
+	for _, entry := range lost {
+		owner.RecoverRentalWork(entry.id, entry.code)
+	}
 }
 
 func (m *managedRentals) lineLocked() (string, *exit.Error) {
