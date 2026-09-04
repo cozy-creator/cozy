@@ -192,6 +192,9 @@ pub fn append(
     segment: &Link,
     operation: Option<&str>,
 ) -> Result<ObjectRef> {
+    // The cache is still an argument HERE and only here: the journal thread already holds
+    // the one the mirror is publishing through, and taking a second handle off the Store
+    // would let a rebind mid-run split the chain across two mounts.
     let bytes = segment.canonical_bytes();
     let object = store
         .put_stream_held(
@@ -344,6 +347,20 @@ pub struct Restored {
     pub complete: bool,
 }
 
+/// The Store's binding, or a refusal. A RESTORE is the one place an absent cache is an
+/// error rather than weather: "bring these bytes back off the cache" with no cache is a
+/// caller mistake, not a cold mount, and answering it with an empty success would report a
+/// resume that restored nothing as a resume that had nothing to restore.
+fn bound_cache(store: &Store) -> Result<&RepoObjectCache> {
+    store.repo_cache().ok_or_else(|| crate::err::Refusal {
+        code: Code::MISSING_FIELD,
+        detail: format!(
+            "{} is bound to no repo cache; bind one with `tfs store ensure --repo-cache`",
+            store.root().display()
+        ),
+    })
+}
+
 /// Bring a declared object set back from the cache into a local Store.
 ///
 /// **This is literally a fetch, with the cache in the origin's place, and that is the
@@ -356,11 +373,11 @@ pub struct Restored {
 /// path here because there is no new admission door.
 pub fn restore_objects(
     store: &Store,
-    cache: &RepoObjectCache,
     session: &str,
     blobs: &[ObjectRef],
     manifests: &[ObjectRef],
 ) -> Result<Restored> {
+    let cache = bound_cache(store)?;
     let mut report = Restored::default();
     let mut wanted: Vec<(CacheKind, ObjectRef)> = Vec::new();
     if !blobs.is_empty() {
@@ -401,28 +418,23 @@ pub fn restore_objects(
 ///
 /// The completion proof at the end is the Store's own — a local walk over locally verified
 /// bytes — so "restored" means the same thing here it means after a pull.
-pub fn restore_checkpoint(
-    store: &Store,
-    cache: &RepoObjectCache,
-    session: &str,
-    manifest: &ObjectRef,
-) -> Result<Restored> {
+pub fn restore_checkpoint(store: &Store, session: &str, manifest: &ObjectRef) -> Result<Restored> {
     // Three rounds, and the order is forced by what names what. The Manifest names the
     // header; only the loaded header enumerates the tensor segments. Asking for the closure
     // before the header is local is asking the Store a question it cannot answer yet.
-    let mut report = restore_objects(store, cache, session, &[], std::slice::from_ref(manifest))?;
+    let mut report = restore_objects(store, session, &[], std::slice::from_ref(manifest))?;
     let document = store.read_manifest(manifest)?;
     if let Some(header) = document.header() {
         add(
             &mut report,
-            restore_objects(store, cache, session, std::slice::from_ref(header), &[])?,
+            restore_objects(store, session, std::slice::from_ref(header), &[])?,
         );
     }
     let walk = crate::checkpoint::walk(store, &document)?;
     let declared: Vec<ObjectRef> = walk.distinct().into_iter().cloned().collect();
     add(
         &mut report,
-        restore_objects(store, cache, session, &canonical_refs(declared), &[])?,
+        restore_objects(store, session, &canonical_refs(declared), &[])?,
     );
     report.complete = walk.require_resident(store).is_ok();
     Ok(report)
@@ -451,10 +463,21 @@ pub const INTERVAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// What a durable conversion is being run under.
 pub struct Policy<'a> {
-    /// The optional mounted cache. `None` is a conversion with no durability — every local
-    /// ingest, and any pod whose datacenter bound no volume.
-    pub cache: Option<&'a RepoObjectCache>,
-    /// The ingest operation. It names the chain, and two conversions never share one.
+    /// The chain's NAME, written into every link and checked across the whole chain on
+    /// resume. Two conversions never share one.
+    pub chain: &'a str,
+    /// The catalog operation the link objects are HELD under, which is a different fact from
+    /// the chain's name and is why it is a different field.
+    ///
+    /// A link is an ordinary object in the local Store, and an object with no hold is an
+    /// object the next `tfs gc` reclaims -- so it is admitted `_held`, and a hold row has a
+    /// foreign key onto `tensorfs_operations`. `prepare_model_source` runs ONE catalog
+    /// operation over SEVERAL slots and names a chain per slot (`<operation>/<slot>`),
+    /// because a slot's chain must be validatable against that slot's plan alone. Holding
+    /// under the chain name would insert a hold for an operation that does not exist: the
+    /// insert fails, `link` returns, and the run publishes every object while producing no
+    /// chain at all -- every byte durable and nothing able to find them. The hold belongs to
+    /// the operation that owns the output; the chain name is a label inside the document.
     pub operation: &'a str,
     /// The digest of the plan, re-derivable from source headers alone.
     pub plan: &'a str,
@@ -496,7 +519,15 @@ pub fn with<R>(
     policy: &Policy<'_>,
     body: impl FnOnce(Option<&crate::repo_cache::Mirror>) -> R,
 ) -> (R, Report) {
-    let Some(cache) = policy.cache else {
+    // THE ONLY PLACE A MIRROR IS EVER STARTED, and it is an operation that starts it rather
+    // than `Store::open`. A Store handle is made by `tfs get`, `tfs verify`, every transfer
+    // and every read lease; starting publisher threads for those would spend threads and a
+    // mounted-filesystem connection on runs that admit nothing. A `Mirror` also cannot exist
+    // without the identity a `Policy` carries -- the chain is per (operation, plan) and a
+    // link written under neither would name a durability nothing could adopt. So: the Store
+    // knows WHERE the cache is, from open; an operation with durable output decides WHEN to
+    // publish to it.
+    let Some(cache) = store.repo_cache() else {
         return (body(None), Report::default());
     };
     let mirror = crate::repo_cache::Mirror::start(cache.clone(), store.root(), policy.interval);
@@ -602,7 +633,7 @@ fn link(
     }
     let mut current = head.lock().unwrap_or_else(|e| e.into_inner());
     let segment = Link {
-        operation: policy.operation.to_string(),
+        operation: policy.chain.to_string(),
         plan: policy.plan.to_string(),
         prev: current.head.clone(),
         index: current.links,
@@ -658,12 +689,12 @@ pub fn snapshot_conversion(
 /// simply re-converts those ops.
 pub fn restore_conversion(
     store: &Store,
-    cache: &RepoObjectCache,
     session: &str,
     tenant: &str,
     plan_digest: &str,
     snapshot: &ObjectRef,
 ) -> Result<()> {
+    let cache = bound_cache(store)?;
     if cache.admit(store, CacheKind::Blob, snapshot)? != CacheRead::Hit {
         return refuse(
             Code::OBJECT_ABSENT,

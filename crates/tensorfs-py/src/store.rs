@@ -523,6 +523,19 @@ impl PyStore {
         self.store.root().display().to_string()
     }
 
+    /// The mounted immutable object cache this Store is bound to, or `None`.
+    ///
+    /// READ-ONLY on purpose, and there is no way to bind one from here. The binding is a
+    /// deployment fact recorded once by `tfs store ensure --repo-cache`; a Python caller
+    /// preparing a model source neither knows nor needs a mount point, and giving it one to
+    /// pass would put a filesystem path back into a protocol that has no use for it.
+    #[getter]
+    fn repo_cache(&self) -> Option<String> {
+        self.store
+            .repo_cache()
+            .map(|cache| cache.root().display().to_string())
+    }
+
     fn prepare_readers(&self, py: Python<'_>) -> PyResult<()> {
         self.store.prepare_readers().or_refuse(py)
     }
@@ -741,17 +754,14 @@ impl PyStore {
     /// Prepare one descriptor-reviewed foreign source entirely from verified supervisor
     /// paths. Access URLs and credentials are outside this facade and have no argument.
     ///
-    /// `repo_cache` names the pod's optional mounted immutable object cache. Passing it
-    /// makes the conversion write its output through to that cache AS IT RUNS, so a pod
-    /// reclaimed mid-conversion costs the re-conversion of one checkpoint interval rather
-    /// than the whole artifact. Each returned row carries `journal`, `journal_links` and
-    /// `durable_bytes`: the caller hands `journal` to the hub as this operation's resume
-    /// pointer, advanced by compare-and-set on `durable_bytes`, which only moves forward.
-    // KEYWORD-ONLY and defaulted, deliberately. A mount point is not part of the request's
-    // shape and must never be positionally confusable with one that is; a caller built
-    // against a build without it keeps working and simply publishes nothing.
-    #[pyo3(signature = (operation_id, source_selection_digest, profiles, files, *, repo_cache = None))]
-    #[allow(clippy::too_many_arguments)]
+    /// THE CALLER PASSES NO CACHE. If this Store is bound to one, the conversion writes its
+    /// output through to it AS IT RUNS, so a pod reclaimed mid-conversion costs the
+    /// re-conversion of one checkpoint interval rather than the whole artifact; if it is
+    /// bound to none, the same call produces the same bytes and publishes nothing. Each
+    /// returned row carries `journal`, `journal_links` and `durable_bytes`: the caller hands
+    /// `journal` to the hub as this operation's resume pointer, advanced by compare-and-set
+    /// on `durable_bytes`, which only moves forward.
+    #[pyo3(signature = (operation_id, source_selection_digest, profiles, files))]
     fn prepare_model_source<'p>(
         &self,
         py: Python<'p>,
@@ -759,7 +769,6 @@ impl PyStore {
         source_selection_digest: &str,
         profiles: Vec<(String, String)>,
         files: Vec<(String, String, u64, PathBuf)>,
-        repo_cache: Option<PathBuf>,
     ) -> PyResult<Bound<'p, PyDict>> {
         let request = PrepareModelSource {
             operation_id: operation_id.to_string(),
@@ -779,7 +788,6 @@ impl PyStore {
                     },
                 )
                 .collect(),
-            repo_cache,
         };
         let prepared = py
             .detach(|| model_source::prepare_model_source(&self.store, &request))
