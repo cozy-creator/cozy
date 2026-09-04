@@ -628,26 +628,38 @@ func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBind
 // fields a local client has and a cloud one does not need to presign: the typed result,
 // the visible media by OPAQUE id, and the triage handle.
 type Lifecycle struct {
-	Number          int64          `json:"number"`
-	Kind            string         `json:"kind"`
-	RequestID       string         `json:"request_id"`
-	Status          string         `json:"status"`
-	Package         string         `json:"package"`
-	Function        string         `json:"function"`
-	Attempt         uint64         `json:"attempt"`
-	Attempts        int            `json:"attempts"`
-	QueuedMS        int64          `json:"queued_ms"`
-	ExecutionMS     int64          `json:"execution_ms"`
-	ProgressStage   string         `json:"progress_stage,omitempty"`
-	StageFraction   *float64       `json:"stage_fraction,omitempty"`
-	OverallFraction *float64       `json:"overall_fraction,omitempty"`
-	Position        *int64         `json:"position,omitempty"`
-	Total           *int64         `json:"total,omitempty"`
-	RemainingMS     *int64         `json:"remaining_ms,omitempty"`
-	ResponseURL     string         `json:"response_url"`
-	Metrics         map[string]any `json:"metrics,omitempty"`
-	ErrorType       string         `json:"error_type,omitempty"`
-	Error           string         `json:"error,omitempty"`
+	Number          int64    `json:"number"`
+	Kind            string   `json:"kind"`
+	RequestID       string   `json:"request_id"`
+	Status          string   `json:"status"`
+	Package         string   `json:"package"`
+	Function        string   `json:"function"`
+	Attempt         uint64   `json:"attempt"`
+	Attempts        int      `json:"attempts"`
+	QueuedMS        int64    `json:"queued_ms"`
+	ExecutionMS     int64    `json:"execution_ms"`
+	ProgressStage   string   `json:"progress_stage,omitempty"`
+	StageFraction   *float64 `json:"stage_fraction,omitempty"`
+	OverallFraction *float64 `json:"overall_fraction,omitempty"`
+	Position        *int64   `json:"position,omitempty"`
+	Total           *int64   `json:"total,omitempty"`
+	RemainingMS     *int64   `json:"remaining_ms,omitempty"`
+	// The PREPARATION facts (cl-121). A queued request is not idle — it is acquiring a
+	// machine, booting one, or landing model bytes on it — and these say which, with
+	// whatever advancement that phase actually has. Absent for anything that has left
+	// the queue, and absent field by field for a phase whose producer measured nothing:
+	// a missing rate means "not measured", never zero.
+	Phase            string         `json:"phase,omitempty"`
+	PhaseMachine     string         `json:"phase_machine,omitempty"`
+	PhaseElapsedMS   *int64         `json:"phase_elapsed_ms,omitempty"`
+	PhaseMovedBytes  *int64         `json:"phase_moved_bytes,omitempty"`
+	PhaseTotalBytes  *int64         `json:"phase_total_bytes,omitempty"`
+	PhaseRate        *float64       `json:"phase_rate_bytes_per_second,omitempty"`
+	PhaseRemainingMS *int64         `json:"phase_remaining_ms,omitempty"`
+	ResponseURL      string         `json:"response_url"`
+	Metrics          map[string]any `json:"metrics,omitempty"`
+	ErrorType        string         `json:"error_type,omitempty"`
+	Error            string         `json:"error,omitempty"`
 	// CanceledBy is the recorded actor behind a canceled run (cl-108): the explicit
 	// `cozy run cancel`, a caller-authored --timeout, `cozy down --all` — never blank
 	// for a run this daemon canceled on request.
@@ -733,6 +745,29 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	if life.Status == "queued" {
 		if position, depth := s.orchestrator.QueueState(row.ID); position > 0 {
 			life.QueuePosition, life.QueueDepth = &position, &depth
+		}
+		if phase, ok := s.orchestrator.QueuePhase(row.ID); ok {
+			life.Phase, life.PhaseMachine = phase.Name, phase.Machine
+			if elapsed := phase.Elapsed(); elapsed > 0 {
+				ms := elapsed.Milliseconds()
+				life.PhaseElapsedMS = &ms
+			}
+			if phase.HasBytes {
+				moved := int64(phase.Moved)
+				life.PhaseMovedBytes = &moved
+				if phase.Total > 0 {
+					total := int64(phase.Total)
+					life.PhaseTotalBytes = &total
+				}
+				if phase.Rate > 0 {
+					rate := phase.Rate
+					life.PhaseRate = &rate
+				}
+				if remaining, ok := phase.Remaining(); ok {
+					ms := remaining.Milliseconds()
+					life.PhaseRemainingMS = &ms
+				}
+			}
 		}
 	}
 	if life.Status == "in_progress" {

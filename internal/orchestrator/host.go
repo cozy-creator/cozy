@@ -85,7 +85,7 @@ func (c *Orchestrator) issuePackagePrepares(s *session, w *worker, label string,
 }
 
 func (c *Orchestrator) prepareThroughHost(s *session, w *worker, seq, rev uint64, label string, open prepareOpener) {
-	result := c.runHostPrepare(s, seq, label, open)
+	result := c.runHostPrepare(s, w, seq, label, open)
 	if !c.settleHostPrepare(s, w, seq, label, result) {
 		return
 	}
@@ -127,7 +127,7 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 			ImageInventory:     facts.ImageInventory,
 			LockedRequirements: append([]byte(nil), facts.LockedRequirements...),
 		}
-		result := c.runHostPrepare(s, seq, prep.label,
+		result := c.runHostPrepare(s, w, seq, prep.label,
 			func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
 				return s.host.PreparePackageSet(ctx, call)
 			})
@@ -156,11 +156,20 @@ type hostPrepareResult struct {
 
 // runHostPrepare opens one prepare stream and consumes it to its end, returning the
 // verified prepared PlacementSet or the verdict that stopped it.
-func (c *Orchestrator) runHostPrepare(s *session, seq uint64, label string, open prepareOpener) hostPrepareResult {
+//
+// EVERY EVENT IS AN OBSERVATION, not only the ones that change the stage (cl-121). This
+// loop used to log on a stage change and discard the rest, so a multi-hour materialization
+// produced four lines in a daemon log and nothing anywhere a person looks. The pod's
+// counters are the only measurement of that work anyone has; they belong in the phase lane
+// the moment they arrive.
+func (c *Orchestrator) runHostPrepare(s *session, w *worker, seq uint64, label string, open prepareOpener) hostPrepareResult {
 	stream, err := open(s.ctx)
 	if err != nil {
 		return classifyPrepareEnd(err)
 	}
+	c.mu.Lock()
+	machine := c.machineWord(w.instanceID)
+	c.mu.Unlock()
 	var stage pb.PrepareStage
 	for {
 		event, err := stream.Recv()
@@ -170,6 +179,7 @@ func (c *Orchestrator) runHostPrepare(s *session, seq uint64, label string, open
 			}
 			return classifyPrepareEnd(err)
 		}
+		c.observePrepareEvent(w.instanceID, machine, label, event)
 		if event.Stage != stage {
 			stage = event.Stage
 			c.logf("PodHost prepare %s#%d %s (%d/%d B)", label, seq,
@@ -327,3 +337,37 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 }
 
 func hostLabel(kind, id string) string { return fmt.Sprintf("%s(%s)", kind, id) }
+
+// observePrepareEvent folds one PrepareEvent into the phase lane. The subject is the
+// WORKER, not a request: one preparation serves every request queued behind it, and
+// recording it per request would make the same bytes look like several transfers.
+//
+// The mapping is the pod's own stage vocabulary and nothing else. A stage this owner does
+// not recognise records no phase rather than a guessed one, and the terminal stages record
+// none because a request that has left preparation is no longer IN it.
+//
+// TotalBytes is 0 until the plan is bounded (worker.proto), so it is forwarded as declared:
+// zero means "no denominator yet", which the renderer shows as bytes and a rate rather
+// than as a fraction of nothing.
+func (c *Orchestrator) observePrepareEvent(instanceID, machine, label string, event *pb.PrepareEvent) {
+	name := ""
+	switch event.GetStage() {
+	case pb.PrepareStage_PREPARE_STAGE_RESOLVED:
+		name = PhaseResolving
+	case pb.PrepareStage_PREPARE_STAGE_DOWNLOADING:
+		name = PhaseDownloading
+	case pb.PrepareStage_PREPARE_STAGE_PREPARING:
+		name = PhasePreparing
+	case pb.PrepareStage_PREPARE_STAGE_PREPARED:
+		// The bytes are in and the placement is about to be sent: what remains is the
+		// worker making it resident, which is the phase the routing already names.
+		name = PhaseWarming
+	default:
+		return
+	}
+	c.ObservePhase(instanceID, PhaseSample{
+		Name: name, Machine: machine, Detail: label,
+		HasBytes: event.GetTotalBytes() > 0 || event.GetTransferredBytes() > 0,
+		Moved:    event.GetTransferredBytes(), Total: event.GetTotalBytes(),
+	})
+}

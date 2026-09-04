@@ -1034,7 +1034,12 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 	}
 	c.signalClosed(key(req.ID, uint64(attempt.Attempt)), verdict)
 	if requeue {
-		c.Requeue(req.ID, attempt.TerminalStatus+"/"+attempt.TerminalCause)
+		why := attempt.TerminalStatus + "/" + attempt.TerminalCause
+		if CapacityRefusal(attempt.TerminalStatus, attempt.TerminalCause) {
+			c.RequeueForCapacity(req.ID, why)
+			return
+		}
+		c.Requeue(req.ID, why)
 		return
 	}
 	if req.ModelTransfer != nil {
@@ -1417,6 +1422,26 @@ func requeueable(status, cause, origin string, executionStarted bool) bool {
 		return true
 	}
 	return false
+}
+
+// CapacityRefusal names the pre-execution refusals that mean THERE WAS NO ROOM RIGHT NOW,
+// as distinct from the ones that mean something about this request.
+//
+// It exists because the requeue budget was spending a life on both. The budget's job is to
+// terminate a request whose attempts keep faulting; a worker that answered NO_CAPACITY has
+// not attempted anything, so three of those in a row settled a run that had executed
+// nothing — measured live as four attempts on one request, every one refused before
+// execution reached the device.
+//
+// It is an ALLOW-LIST of one, and deliberately so. `NO_CAPACITY` is unambiguously "not
+// now" and matches a line the local path has always drawn (`device_envelope_held` keeps
+// the request queued and charges nothing). Its three siblings are not: a stale admission
+// epoch, an unknown placement and a placement that is not dispatchable can all be
+// permanent, and a request that waits forever on one of those is the failure mode the
+// budget exists to prevent. So they keep paying, and a cause added later pays until
+// someone shows it should not.
+func CapacityRefusal(status, cause string) bool {
+	return status == "REFUSED" && cause == "NO_CAPACITY"
 }
 
 // preExecution names the four causes rev-2 §6/§7 defines as worker pre-execution

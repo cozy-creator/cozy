@@ -603,13 +603,15 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 	list := output.List{
 		Name: "invocations", Fields: []string{"number", "target", "machine", "status", "progress", "execution"},
 		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status",
-			"progress", "progress_stage", "stage_fraction", "overall_fraction",
+			"progress", "phase", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "queued", "execution", "attempts", "created"},
 		TypedFields: []string{"number", "target", "machine", "rental_id", "status",
-			"progress_stage", "stage_fraction", "overall_fraction", "position", "total",
+			"phase", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
 			"remaining_ms", "execution_ms"},
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id",
-			"status", "canceled_by", "progress_stage", "stage_fraction", "overall_fraction",
+			"status", "canceled_by", "phase", "phase_machine", "phase_elapsed_ms",
+			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
+			"phase_remaining_ms", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "remaining_ms", "queued_ms", "execution_ms", "attempts",
 			"created_at"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
@@ -633,7 +635,8 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 			"number": strconv.FormatInt(life.Number, 10), "id": life.RequestID, "kind": kind,
 			"target": life.Package + "/" + life.Function, "machine": life.Machine,
 			"rental_id": life.RentalID,
-			"status":    status, "progress": progressValue(life), "progress_stage": life.ProgressStage,
+			"status":    status, "progress": progressValue(life), "phase": life.Phase,
+			"progress_stage":   life.ProgressStage,
 			"stage_fraction":   fractionValue(life.StageFraction),
 			"overall_fraction": fractionValue(life.OverallFraction),
 			"position":         integerValue(life.Position),
@@ -650,6 +653,30 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		}
 		if life.RentalID != "" {
 			typed["rental_id"] = life.RentalID
+		}
+		// The preparation facts are machine-readable as NUMBERS and absence, never as the
+		// human cell: a reader must be able to tell "no rate was measured" from "the rate
+		// was zero", and a rendered string cannot say that.
+		if life.Phase != "" {
+			typed["phase"] = life.Phase
+			if life.PhaseMachine != "" {
+				typed["phase_machine"] = life.PhaseMachine
+			}
+			if life.PhaseElapsedMS != nil {
+				typed["phase_elapsed_ms"] = *life.PhaseElapsedMS
+			}
+			if life.PhaseMovedBytes != nil {
+				typed["phase_moved_bytes"] = *life.PhaseMovedBytes
+			}
+			if life.PhaseTotalBytes != nil {
+				typed["phase_total_bytes"] = *life.PhaseTotalBytes
+			}
+			if life.PhaseRate != nil {
+				typed["phase_rate_bytes_per_second"] = *life.PhaseRate
+			}
+			if life.PhaseRemainingMS != nil {
+				typed["phase_remaining_ms"] = *life.PhaseRemainingMS
+			}
 		}
 		if life.CanceledBy != "" {
 			typed["canceled_by"] = life.CanceledBy
@@ -705,7 +732,55 @@ func integerValue(value *int64) string {
 	return strconv.FormatInt(*value, 10)
 }
 
+// phaseValue is the PROGRESS cell of a request that has not dispatched yet (cl-121).
+//
+// The order is deliberate and the owner's: RATE FIRST where there is one, then the bytes,
+// then a fraction only when the producer declared a real denominator. A percentage bar
+// reads identically at 70 MB/s and at 6 MB/s; a rate shows the second one degrading the
+// moment it degrades, which is the question an operator staring at a long download is
+// actually asking. A phase with nothing measured shows its name and how long it has been
+// that phase — which is still an answer, and is the answer that splits a silent wait into
+// named pieces.
+func phaseValue(life api.Lifecycle) string { return PhaseCell(life) }
+
+// PhaseCell is exported so the product suite drives this exact renderer rather than a
+// copy of it (#661: verification's one home).
+func PhaseCell(life api.Lifecycle) string {
+	if life.Phase == "" {
+		return ""
+	}
+	head := strings.ReplaceAll(life.Phase, "_", " ")
+	if life.PhaseMachine != "" {
+		head += " on " + life.PhaseMachine
+	}
+	parts := []string{head}
+	if life.PhaseMovedBytes != nil {
+		moved := output.Bytes(*life.PhaseMovedBytes)
+		if life.PhaseTotalBytes != nil && *life.PhaseTotalBytes > 0 {
+			moved += " of " + output.Bytes(*life.PhaseTotalBytes)
+		}
+		parts = append(parts, moved)
+	}
+	if life.PhaseRate != nil {
+		parts = append(parts, output.Bytes(int64(*life.PhaseRate))+"/s")
+	}
+	switch {
+	case life.PhaseRemainingMS != nil:
+		parts = append(parts, "~"+shortDuration(time.Duration(*life.PhaseRemainingMS)*time.Millisecond))
+	case life.PhaseMovedBytes == nil && life.PhaseElapsedMS != nil:
+		// No counters at all: the one measured fact is how long this phase has lasted.
+		parts = append(parts, shortDuration(time.Duration(*life.PhaseElapsedMS)*time.Millisecond))
+	}
+	return strings.Join(parts, " · ")
+}
+
 func progressValue(life api.Lifecycle) string {
+	if life.Status == "queued" {
+		if cell := phaseValue(life); cell != "" {
+			return cell
+		}
+		return "-"
+	}
 	if life.Status != "in_progress" {
 		return "-"
 	}
@@ -1428,6 +1503,8 @@ func progressLine(e localapi.Event, full bool) string {
 		return humanProgress(e.Payload["value"])
 	case "stage":
 		return humanStage(e.Payload["value"])
+	case "phase":
+		return HumanPhaseLine(e.Payload["value"])
 	case "metric":
 		return ""
 	case "queued", "parked":
@@ -1524,6 +1601,43 @@ func HumanWaitLine(payload map[string]any) string {
 		return "  downloading the model"
 	}
 	return "  waiting for capacity"
+}
+
+// HumanPhaseLine renders one preparation phase for the attached run (cl-121). It is the
+// same information `run list` shows in its PROGRESS cell, said as a sentence: what is
+// happening, on which machine, and — where the producer measured them — how much has moved
+// and how fast. Absent numbers are absent, never rendered as zero.
+func HumanPhaseLine(value any) string {
+	fields, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	name, _ := fields["phase"].(string)
+	if strings.TrimSpace(name) == "" {
+		return ""
+	}
+	line := "  " + strings.ReplaceAll(name, "_", " ")
+	if machine, _ := fields["machine"].(string); machine != "" {
+		line += " on " + machine
+	}
+	moved, hasMoved := number(fields["moved_bytes"])
+	if hasMoved {
+		line += " — " + output.Bytes(int64(moved))
+		if total, ok := number(fields["total_bytes"]); ok && total > 0 {
+			line += " of " + output.Bytes(int64(total))
+		}
+	}
+	if rate, ok := number(fields["rate_bytes_per_second"]); ok && rate > 0 {
+		line += " · " + output.Bytes(int64(rate)) + "/s"
+	}
+	if remaining, ok := number(fields["remaining_ms"]); ok && remaining > 0 {
+		line += " · ~" + shortDuration(time.Duration(remaining)*time.Millisecond)
+	} else if !hasMoved {
+		if elapsed, ok := number(fields["elapsed_ms"]); ok && elapsed > 0 {
+			line += " — " + shortDuration(time.Duration(elapsed)*time.Millisecond)
+		}
+	}
+	return line
 }
 
 // waitLine is HumanWaitLine plus patience: once the wait outlives WaitPatience the raw

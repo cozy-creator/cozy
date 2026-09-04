@@ -371,8 +371,30 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 // Requeue is the orchestrator's PROJECTION over a neutral terminal: an ABANDONED attempt
 // or an infra-class failure earns a NEW ordinal, a fresh grant and a fresh execution —
 // never a patch to the one that died. It is charged against the request's durable budget.
-func (c *Orchestrator) Requeue(requestID, why string) {
-	n, started, canceled, e := c.opt.Store.BeginRequeue(requestID, MaxRequeues)
+func (c *Orchestrator) Requeue(requestID, why string) { c.requeue(requestID, why, true) }
+
+// RequeueForCapacity returns a request to the queue WITHOUT spending a life.
+//
+// The two are not the same event and treating them as one killed healthy runs. The budget
+// exists so a worker that faults on every attempt terminates the request rather than
+// dispatching forever. A worker that answered NO_CAPACITY has not attempted anything: it
+// said "not now", which is a fact about the machine's moment and not about the request.
+// Charging it means three "not now"s in a row settle a run that executed nothing —
+// observed as four attempts on one request, every one of them refused before execution.
+//
+// The local path has always drawn this line: `device_envelope_held` in selectOrStart keeps
+// the durable request on the queue and charges nothing, because "a later idle-capacity
+// report re-enters select-or-start". This is the same rule reaching the remote path.
+//
+// It is not an unbounded retry. The request returns to the queue and PARKS; only a worker
+// reporting capacity re-dispatches it, so the loop is driven by an observation rather than
+// by a cadence — and while it waits, the phase lane says so instead of showing silence.
+func (c *Orchestrator) RequeueForCapacity(requestID, why string) {
+	c.requeue(requestID, why, false)
+}
+
+func (c *Orchestrator) requeue(requestID, why string, charge bool) {
+	n, started, canceled, e := c.opt.Store.BeginRequeue(requestID, MaxRequeues, charge)
 	if e != nil {
 		// THE REQUEST ENDS HERE, and it has to SAY so. Settling the row without emitting a
 		// terminal event left a client watching the durable stream with `attempt_failed

@@ -285,6 +285,23 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				outcome(t)
 				continue
 			}
+			// THE CROWDED-MACHINE ARM (cl-121). Every offer is refused NO_CAPACITY, which
+			// is a real worker saying "not now" — a co-tenant holds the card, the lane's
+			// seat is taken. It exists so an owner can be held to the rule that such a
+			// refusal is capacity pressure and not a failed attempt: nothing was executed,
+			// so nothing may be charged against the request's lives.
+			if f.arm == "no-capacity" {
+				f.say("ARM: no capacity for %s#%d — REFUSED NO_CAPACITY (journaled)",
+					offer.RequestId, offer.AttemptOrdinal)
+				t, _ := outcomeFor(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
+					pb.OutcomeStatus_OUTCOME_STATUS_REFUSED,
+					"every seat on this device is taken",
+					pb.CauseCode_CAUSE_CODE_NO_CAPACITY,
+					pb.CauseOrigin_CAUSE_ORIGIN_WORKER, false)
+				t.PlacementId = offer.PlacementId
+				outcome(t)
+				continue
+			}
 			if lanes {
 				// THE SEAT IS THE LANE'S. A second offer against a placement whose lane is
 				// full is refused exactly as a saturated window is: a journaled outcome,

@@ -287,10 +287,34 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 		return none, "", exit.New(exit.Canceled, "request %s settled before rental acquisition", req.ID)
 	}
 	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s\n", sku.Name, skuRate(sku))
+	// The buy and the boot are the request's own phase until a worker exists to carry
+	// one (cl-121). Every readiness poll reports what the hub currently says, so the
+	// wait between "renting" and "attachable" is named while it passes.
+	m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{Name: orchestrator.PhaseAcquiring})
+	defer m.owner.ForgetPhase(req.ID)
 	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name,
 		"managed-rental-"+req.ID, "",
 		sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
-		m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID)
+		m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID,
+		func(seen hub.Rental) {
+			// A failure carried by a rental that is BACK in pending_acquisition is the
+			// hub saying "that one did not work; I am buying again". The detail names
+			// what refused, so a replan is visible AND attributable rather than being
+			// 32 silent seconds inside a longer silence.
+			retrying := seen.Failure != nil
+			detail := seen.Detail
+			if retrying && seen.Failure.Code != "" {
+				detail = seen.Failure.Code
+				if seen.Failure.ProviderHostID != "" {
+					detail += " on " + seen.Failure.ProviderHostID
+				}
+			}
+			if name := orchestrator.PhaseOfHubRental(seen.State, seen.ProviderState,
+				seen.ContainerState, retrying); name != "" {
+				m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{
+					Name: name, Machine: seen.Name, Detail: detail})
+			}
+		})
 	if problem != nil {
 		return none, "", problem
 	}

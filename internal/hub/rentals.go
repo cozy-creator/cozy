@@ -76,6 +76,15 @@ type Rental struct {
 	// a comparison neither end can make by saying the token.
 	MediaTokenSHA256    []string
 	HourlyRateUSDMicros int64
+	// ProviderState and ContainerState are the provider's own lifecycle words for this
+	// pod, as the hub last observed them. They are here for one reason: without them the
+	// whole interval between "renting" and "attachable" is a single edge, and a person
+	// watching it cannot tell a provider queue from a multi-gigabyte image pull. They are
+	// the same class of fact the hub already publishes inside RentalFailure — a provider
+	// lifecycle fact the hub observed — and carry no acquisition identity of their own.
+	// Blank whenever the hub has not observed the pod yet, or is older than the field.
+	ProviderState  string
+	ContainerState string
 }
 
 // RentalFailure is Tensorhub's sanitized terminal boot diagnosis. It contains
@@ -136,6 +145,8 @@ type wireRental struct {
 	CreatorPublicKey    string         `json:"creator_public_key"`
 	MediaTokenSHA256    []string       `json:"media_token_sha256"`
 	HourlyRateUSDMicros int64          `json:"hourly_rate_usd_micros"`
+	ProviderState       string         `json:"provider_state,omitempty"`
+	ContainerState      string         `json:"container_state,omitempty"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -162,6 +173,8 @@ func (w wireRental) rental() Rental {
 		CreatorPublicKey:    w.CreatorPublicKey,
 		MediaTokenSHA256:    w.MediaTokenSHA256,
 		HourlyRateUSDMicros: w.HourlyRateUSDMicros,
+		ProviderState:       w.ProviderState,
+		ContainerState:      w.ContainerState,
 	}
 }
 

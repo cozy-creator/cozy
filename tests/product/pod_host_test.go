@@ -74,6 +74,11 @@ type fakePod struct {
 	serve bool
 	// slots is the advertised seat count while serving; zero means one.
 	slots uint32
+	// downloadSamples is how many DOWNLOADING events the prepare stream reports before
+	// it finishes. One is what a pod host that only reports the stage boundary sends;
+	// more is what one that reports while the bytes are moving sends. It exists so the
+	// phase lane is proven on a stream that ADVANCES, not only on one that is wired.
+	downloadSamples int
 
 	mu                 sync.Mutex
 	acks               []*pb.SnapshotAck
@@ -468,15 +473,25 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 	// placement's.
 	p.stagedJobBuild = prepared.List("placements")[0].Str("environment_digest")
 	p.mu.Unlock()
-	for _, event := range []*pb.PrepareEvent{
-		{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED, TotalBytes: total},
-		{Stage: pb.PrepareStage_PREPARE_STAGE_DOWNLOADING, TotalBytes: total, TransferredBytes: total / 2},
-		{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARING, TotalBytes: total, TransferredBytes: total},
-		{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED, TotalBytes: total, TransferredBytes: total,
-			PlacementSet: &pb.DesiredPlacementSet{PlacementSetDigest: setDigest, PlacementSetCanonicalBytes: setBytes}},
-	} {
+	samples := max(p.downloadSamples, 1)
+	events := []*pb.PrepareEvent{{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED, TotalBytes: total}}
+	for i := 1; i <= samples; i++ {
+		events = append(events, &pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_DOWNLOADING,
+			TotalBytes: total, TransferredBytes: total / 2 * uint64(i) / uint64(samples)})
+	}
+	events = append(events,
+		&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARING, TotalBytes: total, TransferredBytes: total},
+		&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED, TotalBytes: total, TransferredBytes: total,
+			PlacementSet: &pb.DesiredPlacementSet{PlacementSetDigest: setDigest, PlacementSetCanonicalBytes: setBytes}})
+	for i, event := range events {
 		if err := stream.Send(event); err != nil {
 			return err
+		}
+		if i < len(events)-1 && p.downloadSamples > 0 {
+			// A measurable interval between samples. The owner computes a rate from the
+			// gap between two reports and declines to compute one when there is no gap,
+			// so a pod that reports instantly proves nothing about a rate.
+			time.Sleep(2 * time.Millisecond)
 		}
 	}
 	return nil
