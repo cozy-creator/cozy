@@ -546,7 +546,14 @@ type JobState struct {
 	Checkpoints      []JobCheckpoint   `json:"checkpoints,omitempty"`
 	ModelOutputs     map[string]string `json:"model_outputs,omitempty"`
 	ModelDestination string            `json:"model_destination,omitempty"`
-	Publication      *PublicationRef   `json:"publication,omitempty"`
+	// ModelSources is the per-member source projection, and it exists because the
+	// aggregate beside it answers "how far" and nothing answers "why". Run 205 sat at
+	// 44 of 48 verified for 2h55m with four members permanently failed, and every read
+	// surface showed a percentage: `safe_code` and `safe_detail` reached the durable row
+	// and the live frame and then stopped. Only members that are NOT verified are listed —
+	// a verified member has nothing to say — so a healthy transfer carries none of this.
+	ModelSources []ModelSourceState `json:"model_sources,omitempty"`
+	Publication  *PublicationRef    `json:"publication,omitempty"`
 	// Bill is ABSENT unless this host was configured with an explicit local rate. There
 	// is no `$0.00`: a fabricated zero is a claim about money nobody made (cl-004).
 	Bill      *JobBill   `json:"bill,omitempty"`
@@ -554,6 +561,23 @@ type JobState struct {
 	CreatedAt string     `json:"created_at"`
 	EventsURL string     `json:"events_url"`
 }
+
+// ModelSourceState is one selected source file's transfer, as a client sees it. `safe_code`
+// and `safe_detail` are the POD's own words about these bytes, bounded and sanitized at the
+// border they came from; this host neither rewrites nor summarizes them.
+type ModelSourceState struct {
+	Member      string `json:"member"`
+	State       string `json:"state"`
+	Transferred int64  `json:"transferred_bytes"`
+	Length      int64  `json:"length"`
+	SafeCode    string `json:"safe_code,omitempty"`
+	SafeDetail  string `json:"safe_detail,omitempty"`
+}
+
+// maxJobModelSources bounds the projection. A selection may hold up to 20,000 members and
+// this document is re-read on every poll of `cozy run watch`, so the rows are truncated
+// rather than allowed to become the response. The counts beside them stay exact.
+const maxJobModelSources = 32
 
 // WeightsRef is Cozy's durable scratch adoption projection. It exposes no path or
 // TensorFS internals: the exact Runtime receipt digest and Cozy-derived private root id
@@ -651,16 +675,33 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 			if row.State == "failed" {
 				state.ErrorType, state.Error = transfer.ErrorCode, transfer.SafeError
 			}
-			if transfer.State == "materializing" {
-				state.Stage = "source materialization"
-				if statuses, statusProblem := s.store.ModelTransferSourceStatuses(row.ID); statusProblem == nil {
-					var transferred, total int64
-					for _, status := range statuses {
-						transferred += status.Transferred
-						total += status.Length
+			// READ ONCE, WHATEVER THE STATE. The rows used to be read only while
+			// `materializing`, which is to say only while there was nothing to explain: a
+			// transfer that has already failed is exactly when the reason is wanted.
+			if statuses, statusProblem := s.store.ModelTransferSourceStatuses(row.ID); statusProblem == nil {
+				var transferred, total int64
+				verified := 0
+				for _, status := range statuses {
+					transferred += status.Transferred
+					total += status.Length
+					if status.State == "verified" {
+						verified++
+						continue
 					}
+					if len(state.ModelSources) < maxJobModelSources {
+						state.ModelSources = append(state.ModelSources, ModelSourceState{
+							Member: status.Member, State: status.State,
+							Transferred: status.Transferred, Length: status.Length,
+							SafeCode: status.SafeCode, SafeDetail: status.SafeDetail})
+					}
+				}
+				if transfer.State == "materializing" {
+					state.Stage = "source materialization"
+					// members_verified/members_total is the "44 of 48" a human reads. It
+					// was in the daemon log and on no client surface at all.
 					state.Progress = map[string]any{"stage": state.Stage,
-						"transferred_bytes": transferred, "total_bytes": total}
+						"transferred_bytes": transferred, "total_bytes": total,
+						"members_verified": verified, "members_total": len(statuses)}
 					if total > 0 {
 						state.Progress["fraction"] = float64(transferred) / float64(total)
 					}

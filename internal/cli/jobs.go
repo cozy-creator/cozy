@@ -107,6 +107,12 @@ func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Er
 		fields = append(fields, output.Field{K: "queue_position", V: queue})
 		defaults = append(defaults, "queue_position")
 	}
+	// A job still in flight whose transfer has already refused a member says so HERE, on
+	// the reattachment surface, rather than only in a terminal nobody has reached yet.
+	if rows := modelSourceLines(state.ModelSources); modelSourceVerdict(state.ModelSources) {
+		fields = append(fields, output.Field{K: "model_sources", V: rows})
+		defaults = append(defaults, "model_sources")
+	}
 	fields = append(fields, output.Field{K: "changed", V: changed})
 	defaults = append(defaults, "run")
 	rec := compactRecord(fields, defaults...)
@@ -162,6 +168,12 @@ func jobFields(mode output.Mode, state api.JobState, full bool) []output.Field {
 	}
 	if state.Progress != nil {
 		fields = append(fields, output.Field{K: "progress", V: compactValue(state.Progress)})
+	}
+	// A MEMBER THAT DID NOT VERIFY IS SAID OUT LOUD, not folded into a percentage. This is
+	// the surface run 205 did not have: 44 of 48 verified for 2h55m, four members
+	// permanently failed, and every client read showed a fraction.
+	if rows := modelSourceLines(state.ModelSources); len(rows) > 0 {
+		fields = append(fields, output.Field{K: "model_sources", V: rows})
 	}
 	fields = append(fields, output.Field{
 		K: "retries", V: fmt.Sprintf("%d/%d", state.Requeues, state.RetryBudget)})
@@ -311,6 +323,11 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if len(state.ModelOutputs) > 0 {
 		defaults = append(defaults, "model_outputs")
 	}
+	// A verdict is not a --full detail. It is the answer to the question the operator is
+	// asking, so it stands in the default view.
+	if modelSourceVerdict(state.ModelSources) {
+		defaults = append(defaults, "model_sources")
+	}
 	defaults = append(defaults, "wall_ms")
 	rec := compactRecord(fields, defaults...)
 	code := exit.JobTerminal(mapTerminal(status))
@@ -345,6 +362,44 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		err.WithNext(hint)
 	}
 	return err
+}
+
+// modelSourceVerdict answers whether any listed member carries the pod's own reason. A
+// member merely still in flight is progress; a member with a code is an explanation.
+func modelSourceVerdict(sources []api.ModelSourceState) bool {
+	for _, source := range sources {
+		if source.SafeCode != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// modelSourceLines renders the unverified members, the ones that failed first: a stalled
+// transfer is read by its verdicts, and a member with no verdict is read after them.
+func modelSourceLines(sources []api.ModelSourceState) []string {
+	if len(sources) == 0 {
+		return nil
+	}
+	ordered := append([]api.ModelSourceState(nil), sources...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return (ordered[i].SafeCode != "") && (ordered[j].SafeCode == "")
+	})
+	rows := make([]string, 0, len(ordered))
+	for _, source := range ordered {
+		line := source.Member + " " + source.State
+		if source.Length > 0 {
+			line += " " + output.Bytes(source.Transferred) + "/" + output.Bytes(source.Length)
+		}
+		if source.SafeCode != "" {
+			line += " — " + source.SafeCode
+			if source.SafeDetail != "" {
+				line += ": " + source.SafeDetail
+			}
+		}
+		rows = append(rows, line)
+	}
+	return rows
 }
 
 func modelPublishHint(state api.JobState) string {
