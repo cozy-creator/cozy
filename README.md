@@ -131,6 +131,34 @@ tfs store prepare-readers        # TensorFS owns cross-uid lease coordination mo
 tfs store complete-cozytensors   # sorted verified-complete runtime manifests
 ```
 
+## Disk budget
+
+**A Store may be given a disk budget, and having one is the whole opt-in.** `tfs store
+ensure <root> --disk-budget <bytes>` writes the number into `<store-root>/disk-budget`;
+`--no-disk-budget` clears it. Every later handle reads it back, and `store info`/`store
+ensure` print `disk-budget: <n> B, holding <m> B` so a supervisor can fence the readback
+the way it fences `repo-cache:`.
+
+**A Store with no budget behaves exactly as it did before the budget existed.** Nothing is
+enforced, nothing is reclaimed, and nothing disappears — which is the point: a personal
+`$HOME/.tensorfs` never gets one, and models never vanish from under their owner.
+
+Where there IS one, `tfs fetch` refuses `CAPACITY_EXHAUSTED` **before it moves a byte**
+when the pull would put the Store past it. The charge is what the pull ADDS
+(`FetchPlan::wanted_bytes()`), not what its closure declares, so an object the Store
+already holds is never bought twice — on a content-addressed store a second model sharing
+an encoder with the first may add almost nothing.
+
+The budget is measured against the Store's own occupancy — the blobs and manifests
+TensorFS installed — and **never against the filesystem**. TensorFS does not stat a
+filesystem for policy: free space is a caller input, because only the caller can see the
+image layers, install roots, media quotas and compile caches sharing the disk. Choosing
+the number is the caller's job; refusing against it is TensorFS's.
+
+`CAPACITY_EXHAUSTED` is also what a genuinely full filesystem raises. It is a VERDICT and
+never weather: retrying it fails at the same byte forever, which is exactly what the
+generic `IO_FAILED` an out-of-space write used to raise bought on rented hardware.
+
 Python exposes the same resolver. Passing a root remains supported and always wins:
 
 ```python

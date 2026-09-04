@@ -999,6 +999,19 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         stamps: closure.stamps.clone(),
         ..Default::default()
     };
+    // THE ADMISSION GATE, and it stands here for two reasons (tfs-064).
+    //
+    // It is BEFORE the walk, so a pull that cannot fit costs a closure call and no bytes —
+    // a refusal at the door instead of a filesystem that blocks writes at 60% of a
+    // transfer, which is indistinguishable from a stall and has cost two nights.
+    //
+    // And it charges `wanted_bytes()`, never `declared_bytes()`: the plan has already
+    // split the closure against the real store, so an object this store already holds is
+    // not bought twice. On a content-addressed store that difference is the whole point —
+    // a second model sharing a text encoder and a VAE with the first may add almost
+    // nothing — and the two figures agree exactly when nothing is shared, which is exactly
+    // the fixture a careless proof would use.
+    request.store.admits(plan.wanted_bytes())?;
     if !plan.wanted.is_empty() {
         let leases = Leases {
             client,

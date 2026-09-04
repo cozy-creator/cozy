@@ -3235,3 +3235,178 @@ fn whole_asks_for_no_range_at_all() {
     );
     let _ = std::fs::remove_dir_all(root);
 }
+
+// ------------------------------------------------- the disk budget (tfs-064)
+//
+// Every expected byte figure below is a BANKED LITERAL measured from the fixture, never
+// the expression under test evaluated twice. th-152 shipped an arm that computed its
+// expected value from the constants it was checking — it asserted the code equalled itself
+// and passed review twice (proto-038, decisions.md 698). `the_fixture_is_the_size_it_was
+// _banked_at` is what keeps these literals honest: change the fixture and it says so.
+
+/// checkpoint(6, 32 * 1024): six 32,768-byte blobs, one header, one manifest.
+const SIX_BLOB_CLOSURE_BYTES: u64 = 197_312;
+/// checkpoint(3, 32 * 1024): the first three of those same six blobs, its own header and
+/// manifest. `checkpoint` derives each body from its index alone, so the blobs a smaller
+/// closure carries ARE the larger one's first blobs, byte for byte and digest for digest.
+const THREE_BLOB_CLOSURE_BYTES: u64 = 98_783;
+/// What a store already holding the three-blob closure must still buy for the six-blob one:
+/// three new blobs, a new header, a new manifest. NOT the difference of the two totals —
+/// the headers and manifests do not cancel — so this is measured too.
+const SIX_AFTER_THREE_WANTED_BYTES: u64 = 99_008;
+
+fn closure_bytes(checkpoint: &Checkpoint) -> u64 {
+    checkpoint.bodies.values().map(|b| b.len() as u64).sum()
+}
+
+#[test]
+fn the_fixture_is_the_size_it_was_banked_at() {
+    assert_eq!(
+        closure_bytes(&checkpoint(6, 32 * 1024)),
+        SIX_BLOB_CLOSURE_BYTES
+    );
+    assert_eq!(
+        closure_bytes(&checkpoint(3, 32 * 1024)),
+        THREE_BLOB_CLOSURE_BYTES
+    );
+    // The sharing this file's dedup arm depends on is asserted, not assumed: an arm over a
+    // fixture with no shared objects proves nothing about dedup at all.
+    let small = checkpoint(3, 32 * 1024);
+    let large = checkpoint(6, 32 * 1024);
+    let shared = small
+        .objects
+        .iter()
+        .filter(|object| {
+            large
+                .objects
+                .iter()
+                .any(|other| other.sha256 == object.sha256)
+        })
+        .count();
+    assert_eq!(
+        shared, 3,
+        "the two fixtures share no objects; the dedup arm would be vacuous"
+    );
+}
+
+#[test]
+fn a_budget_one_byte_short_refuses_before_a_byte_moves_and_the_same_byte_admits() {
+    let root = temporary("budget-two-sided");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(6, 32 * 1024));
+    let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = SourcePolicy::default();
+
+    // ONE BYTE SHORT.
+    let store = store
+        .bind_disk_budget(Some(SIX_BLOB_CLOSURE_BYTES - 1))
+        .unwrap();
+    let refusal = pull(&request_for(&store, &origin.base, &policy)).unwrap_err();
+    assert_eq!(refusal.code, Code::CAPACITY_EXHAUSTED, "{refusal}");
+    // "Before a byte moves" is proved by the store, not by the exit code: no object landed
+    // and no put- temp was even opened.
+    assert!(
+        store.objects().unwrap().is_empty(),
+        "the refusal still admitted objects"
+    );
+    let temps: Vec<_> = std::fs::read_dir(root.join("tmp"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("put-"))
+        .collect();
+    assert!(
+        temps.is_empty(),
+        "the refusal left scratch behind: {temps:?}"
+    );
+
+    // EXACTLY ENOUGH. A budget that refuses everything passes a one-sided test just as
+    // happily as one that refuses nothing, so both sides are pinned.
+    let store = store
+        .bind_disk_budget(Some(SIX_BLOB_CLOSURE_BYTES))
+        .unwrap();
+    let report = pull(&request_for(&store, &origin.base, &policy)).unwrap();
+    assert_eq!(report.fetched, 8);
+    assert_eq!(store.occupancy().unwrap(), SIX_BLOB_CLOSURE_BYTES);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn the_budget_charges_what_the_pull_adds_not_what_it_declares() {
+    // THE ARM THAT MATTERS ON A CONTENT-ADDRESSED STORE. A store already holding three of
+    // the six blobs must be admitted under a budget that could never hold the six-blob
+    // closure declared whole. Charging `declared_bytes()` instead of `wanted_bytes()`
+    // refuses this pull — and the two agree exactly when nothing is shared, which is
+    // precisely the fixture a careless proof would reach for.
+    let root = temporary("budget-dedup");
+    let store = Store::init(&root).unwrap();
+    let policy = SourcePolicy::default();
+
+    let small = Arc::new(checkpoint(3, 32 * 1024));
+    let small_origin = hub_origin(Arc::clone(&small), |_, _| None);
+    pull(&request_for(&store, &small_origin.base, &policy)).unwrap();
+    assert_eq!(store.occupancy().unwrap(), THREE_BLOB_CLOSURE_BYTES);
+
+    let budget = THREE_BLOB_CLOSURE_BYTES + SIX_AFTER_THREE_WANTED_BYTES;
+    assert!(
+        budget < THREE_BLOB_CLOSURE_BYTES + SIX_BLOB_CLOSURE_BYTES,
+        "the budget must be one no `declared_bytes()` gate could pass, or the arm is vacuous"
+    );
+    let store = store.bind_disk_budget(Some(budget)).unwrap();
+    let large = Arc::new(checkpoint(6, 32 * 1024));
+    let large_origin = hub_origin(Arc::clone(&large), |_, _| None);
+    let report = pull(&request_for(&store, &large_origin.base, &policy)).unwrap();
+    assert_eq!(report.held, 3, "the three shared blobs were not credited");
+    assert_eq!(store.occupancy().unwrap(), budget);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_store_with_no_budget_admits_everything() {
+    let root = temporary("budget-absent");
+    let store = Store::init(&root).unwrap();
+    assert_eq!(store.disk_budget(), None);
+    let checkpoint = Arc::new(checkpoint(6, 32 * 1024));
+    let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let report = pull(&request_for(&store, &origin.base, &SourcePolicy::default())).unwrap();
+    assert_eq!(report.fetched, 8);
+
+    // And clearing a budget really clears it, rather than leaving a stale number behind.
+    let store = store.bind_disk_budget(Some(1)).unwrap();
+    assert_eq!(store.disk_budget(), Some(1));
+    let store = store.bind_disk_budget(None).unwrap();
+    assert_eq!(store.disk_budget(), None);
+    assert!(!root.join(crate::store::DISK_BUDGET).exists());
+    assert_eq!(Store::open(&root).unwrap().disk_budget(), None);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_real_enospc_from_the_kernel_is_a_capacity_verdict_not_an_io_failure() {
+    // The error here is not constructed and not simulated: `/dev/full` is a real device
+    // whose write returns a real ENOSPC from the real kernel, which is the exact errno a
+    // full container disk delivers. That error is then carried through the ordinary Store
+    // write path's own failure handling.
+    let mut full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("/dev/full is required for this arm");
+    let error = full
+        .write_all(&[0u8; 4096])
+        .expect_err("/dev/full accepted a write");
+    assert_eq!(error.raw_os_error(), Some(28), "ENOSPC is errno 28");
+
+    let refusal = crate::store::classify_io("write blob", error);
+    assert_eq!(
+        refusal.code,
+        Code::CAPACITY_EXHAUSTED,
+        "a full filesystem must be a verdict, not weather: {refusal}"
+    );
+
+    // The other side: an ordinary I/O failure must NOT be a capacity verdict, or the
+    // classification would poison every retryable fault on the pod.
+    let ordinary = std::fs::File::open("/definitely/not/here").unwrap_err();
+    assert_eq!(
+        crate::store::classify_io("open blob", ordinary).code,
+        Code::IO_FAILED
+    );
+}
