@@ -447,10 +447,15 @@ impl transport::FetchObserver for Reporter {
     }
 }
 
-/// `tfs fetch url <root> <sha256> <length> <url|-> [--progress]` — plan-of-one, then the
-/// one transport into `put_stream`. A held object answers `held` and moves nothing. A url
-/// of `-` reads the real URL as one line on stdin: a capability URL can embed a signature,
-/// and argv is world-readable in /proc.
+/// `tfs fetch url <root> <sha256> <length> <url|-> [--progress] [--streams N] [--part-mib N]`
+/// — plan-of-one, then the one transport into `put_stream`. A held object answers `held`
+/// and moves nothing. A url of `-` reads the real URL as one line on stdin: a capability
+/// URL can embed a signature, and argv is world-readable in /proc.
+///
+/// `--streams` is how many byte ranges of THIS object are in flight; `--streams 1` is the
+/// single-stream fetch and stays reachable, because a link where concurrency does not help
+/// is a real link. An origin that will not answer a range takes the single-stream path
+/// whatever these say.
 ///
 /// `--progress` opens the observation channel above. Without it this command says nothing
 /// until it is finished, which for a 5 GiB shard is ten to fifteen minutes of silence a
@@ -493,7 +498,11 @@ pub fn cmd_url(root: &Path, id: &str, length: &str, url: &str, flags: &Flags) ->
     let ledger = transport::Ledger::new();
     let mut reporter = crate::flag_on(flags, "progress")
         .then(|| Reporter::new(crate::flag_num(flags, "progress-bytes", SAMPLE_BYTES)));
-    let fetched = transport::fetch_url(
+    let ranged = transport::Ranged {
+        streams: crate::flag_num(flags, "streams", transport::SOURCE_STREAMS),
+        part: crate::flag_num::<u64>(flags, "part-mib", transport::PART_BYTES >> 20) << 20,
+    };
+    let fetched = transport::fetch_ranged(
         &store,
         &grant,
         url,
@@ -501,6 +510,7 @@ pub fn cmd_url(root: &Path, id: &str, length: &str, url: &str, flags: &Flags) ->
         &Anonymous,
         deadline_of(flags),
         &ledger,
+        ranged,
         reporter
             .as_mut()
             .map(|r| r as &mut dyn transport::FetchObserver),

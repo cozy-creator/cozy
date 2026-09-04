@@ -20,7 +20,7 @@ use crate::ids::ObjectRef;
 use crate::jcs::{self, Json};
 use crate::store::{Fault, Store};
 use crate::transport::{
-    api_get, fetch_url, probe_length, CredentialProvider, Deadline, Ledger, SourcePolicy,
+    api_get, fetch_ranged, probe_length, CredentialProvider, Deadline, Ledger, Ranged, SourcePolicy,
 };
 
 /// Listing documents are bounded like any other untrusted input.
@@ -443,7 +443,11 @@ pub fn pull(
         for (member, object) in &pinned {
             if plan.wants(&object.sha256) {
                 let grant = DeliveryGrant::mint(&plan, object)?;
-                let fetched = fetch_url(
+                // Ranged: a source member is not cut on the object grid — one HuggingFace
+                // shard is whatever the uploader pushed, and on one stream it is one
+                // stream. `fetch_ranged` falls back to exactly the single-stream call this
+                // replaced whenever the origin will not answer a range.
+                let fetched = fetch_ranged(
                     store,
                     &grant,
                     &member.url,
@@ -451,6 +455,7 @@ pub fn pull(
                     credentials,
                     deadline,
                     &ledger,
+                    Ranged::default(),
                     Some(&mut |current| progress(&member.member, current)),
                 )?;
                 pulled.push(Pulled {

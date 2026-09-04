@@ -238,7 +238,8 @@ pub fn fetch_authorized(
             credential,
             deadline,
             ledger,
-            &mut |host, status| hops.push((host.to_string(), status)),
+            &[],
+            &mut |checked, status| hops.push((checked.host.clone(), status)),
         );
         if let Some(watcher) = observer.as_mut() {
             for (host, status) in &hops {
@@ -346,7 +347,7 @@ pub fn fetch_authorized(
     }))
 }
 
-enum Opened<'l> {
+pub(super) enum Opened<'l> {
     Body(http::Response<'l>),
     Retryable(u16),
     /// The origin refused the signature. Whether that is weather or a verdict depends on
@@ -357,19 +358,30 @@ enum Opened<'l> {
 
 /// One GET, redirect hops walked BY HAND so every hop faces the same predicate and the
 /// credential is re-asked per host (a scoped credential cannot leak onto a CDN).
-fn open_object<'l>(
+///
+/// `extra` is appended AFTER the credential, and is how a caller asks for one byte range
+/// of the object rather than all of it. It changes nothing else about the walk, and that
+/// is the point: a ranged fetch is THIS function called once per part, so the hop budget,
+/// the per-hop predicate, the per-host credential re-ask, the relative-`Location`
+/// resolution and the `Retryable`/`Expired` status arms are not re-implemented alongside
+/// it and cannot drift from it. The hop callback names the whole CHECKED url rather than
+/// its host so a caller can report the hop it just walked.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn open_object<'l>(
     client: &Client,
     url: &str,
     policy: &SourcePolicy,
     credential: &dyn CredentialProvider,
     deadline: Deadline,
     ledger: &'l Ledger,
-    hop: &mut dyn FnMut(&str, u16),
+    extra: &[(String, String)],
+    hop: &mut dyn FnMut(&policy::CheckedUrl, u16),
 ) -> Result<Opened<'l>> {
     let mut target = url.to_string();
     for _hop in 0..=policy.max_redirects {
         let checked = policy.check(&target)?;
-        let headers = credential.headers(&checked.host);
+        let mut headers = credential.headers(&checked.host);
+        headers.extend_from_slice(extra);
         let response = http::request(
             client,
             &checked,
@@ -383,7 +395,7 @@ fn open_object<'l>(
             Code::TRANSFER_FAILED,
         )?;
         let status = response.status;
-        hop(&checked.host, status);
+        hop(&checked, status);
         if (300..400).contains(&status) {
             let Some(location) = response.header("location").map(str::to_string) else {
                 return refuse(Code::REDIRECT_REFUSED, "origin redirected with no Location");
@@ -404,7 +416,11 @@ fn open_object<'l>(
             target = absolute;
             continue;
         }
-        if status == 200 {
+        // 206 joins 200 as "the origin answered with a body". A caller that asked for no
+        // range never sees one, and if a broken origin sent one anyway the admission door
+        // refuses the short body on length. A caller that DID ask for a range needs the
+        // partial answer to arrive as a body rather than as an unclassified status.
+        if status == 200 || status == 206 {
             return Ok(Opened::Body(response));
         }
         if RETRYABLE_STATUS.contains(&status) {

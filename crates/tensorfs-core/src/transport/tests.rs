@@ -8,6 +8,7 @@ use super::ledger::{Deadline, Ledger};
 use super::policy::{self, blocked, SourcePolicy};
 use super::pull::{absolute_location, fetch_url, pull, ObjectSource, PullRequest};
 use super::push::{push_object, UploadGrant};
+use super::ranged::{fetch_ranged, Ranged};
 use crate::canon::Value;
 use crate::dtype::Dtype;
 use crate::err::Code;
@@ -67,6 +68,14 @@ enum Serve {
     Stall { total: u64, prefix: Vec<u8> },
     /// Declare `total`, send only `prefix`, close — a connection that died mid-object.
     Truncate { total: u64, prefix: Vec<u8> },
+    /// A chosen status and headers, `declared` bytes promised, `prefix` actually sent, then
+    /// the socket closes — a ranged answer that died part way through its own range.
+    Short {
+        status: u16,
+        headers: Vec<(String, String)>,
+        declared: u64,
+        prefix: Vec<u8>,
+    },
     /// Sleep `ttfb`, then send the body in `chunk`-sized pieces with `gap` between them —
     /// a slow link that is honestly moving.
     Drip {
@@ -167,6 +176,22 @@ fn handle(mut socket: TcpStream, dispatch: Dispatch, hits: Arc<Mutex<HashMap<Str
         Serve::Truncate { total, prefix } => {
             let head =
                 format!("HTTP/1.1 200 OK\r\ncontent-length: {total}\r\nconnection: close\r\n\r\n");
+            let _ = socket.write_all(head.as_bytes());
+            let _ = socket.write_all(&prefix);
+        }
+        Serve::Short {
+            status,
+            headers,
+            declared,
+            prefix,
+        } => {
+            let mut head = format!(
+                "HTTP/1.1 {status} X\r\ncontent-length: {declared}\r\nconnection: close\r\n"
+            );
+            for (name, value) in headers {
+                head.push_str(&format!("{name}: {value}\r\n"));
+            }
+            head.push_str("\r\n");
             let _ = socket.write_all(head.as_bytes());
             let _ = socket.write_all(&prefix);
         }
@@ -2340,4 +2365,473 @@ fn a_hub_that_says_wait_is_waited_for_and_then_answers() {
         "the pull did not wait the instant the hub named: {waited:?}"
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+// ------------------------------------------------- ranged source fetch (tfs-061)
+//
+// Every origin here is the same loopback listener the rest of this file uses, one thread
+// per connection, so the parts really do arrive on concurrent sockets and really do land
+// out of order. Nothing is mocked: the client, the fence, the ledger and the admission
+// door are production's.
+
+/// A body whose every byte depends on its offset, so an object assembled at the wrong
+/// offsets cannot accidentally hash to the right id.
+fn ranged_body(bytes: usize) -> Vec<u8> {
+    let mut out = vec![0u8; bytes];
+    let mut state: u32 = 0x9E37_79B9;
+    for (at, slot) in out.iter_mut().enumerate() {
+        state = state
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223 ^ at as u32);
+        *slot = (state >> 24) as u8;
+    }
+    out
+}
+
+/// Temp files the store has not cleaned up. `tmp/writers` is a directory the catalog
+/// keeps, so counting entries would count it; the temps are the `put-` names, which the
+/// assembly scratch deliberately shares so the store's own reaper covers it.
+fn temps(root: &std::path::Path) -> usize {
+    std::fs::read_dir(root.join("tmp"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("put-"))
+        .count()
+}
+
+fn range_of(request: &Request) -> Option<(usize, usize)> {
+    let spec = request.header("range")?.trim().strip_prefix("bytes=")?;
+    let (first, last) = spec.split_once('-')?;
+    Some((first.trim().parse().ok()?, last.trim().parse().ok()?))
+}
+
+/// The 206 an origin that honours ranges answers with, or the whole body when nothing was
+/// asked for.
+fn partial(body: &[u8], request: &Request) -> Serve {
+    let Some((first, last)) = range_of(request) else {
+        return Serve::Whole {
+            status: 200,
+            body: body.to_vec(),
+            headers: Vec::new(),
+        };
+    };
+    let last = last.min(body.len() - 1);
+    Serve::Whole {
+        status: 206,
+        body: body[first..=last].to_vec(),
+        headers: vec![(
+            "content-range".into(),
+            format!("bytes {first}-{last}/{}", body.len()),
+        )],
+    }
+}
+
+struct RangedOrigin {
+    origin: Origin,
+    asked: Arc<Mutex<Vec<String>>>,
+}
+
+impl RangedOrigin {
+    fn ranges(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+/// One loopback origin that logs every `Range` it is asked for, so a test can assert on
+/// what the parts actually put on the wire rather than on how fast it went.
+fn ranged_origin(serve: impl Fn(&Request) -> Serve + Send + Sync + 'static) -> RangedOrigin {
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = Arc::clone(&asked);
+    let dispatch: Dispatch = Arc::new(move |request: &Request| {
+        log.lock()
+            .unwrap()
+            .push(request.header("range").unwrap_or("").to_string());
+        serve(request)
+    });
+    RangedOrigin {
+        origin: origin(dispatch),
+        asked,
+    }
+}
+
+fn ranged_grant(plan: &FetchPlan, object: &ObjectRef) -> DeliveryGrant {
+    DeliveryGrant::mint(plan, object).unwrap()
+}
+
+/// Four streams, six parts, one object: the parts arrive on concurrent sockets and in
+/// whatever order the origin answers them, and the object is admitted at the id its bytes
+/// compute — through the same `put_stream` a single stream would have crossed.
+#[test]
+fn a_source_object_crosses_in_parallel_byte_ranges() {
+    let root = temporary("ranged-parallel");
+    let store = Store::init(&root).unwrap();
+    let body = ranged_body(6 << 20);
+    let object = ObjectRef::of(&body);
+    let served = body.clone();
+    let listener = ranged_origin(move |request| partial(&served, request));
+    let (plan, _) = FetchPlan::of_objects(&store, "ranged", std::slice::from_ref(&object)).unwrap();
+    let grant = ranged_grant(&plan, &object);
+    let url = format!("{}/member.safetensors", listener.origin.base);
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+
+    let mut totals: Vec<u64> = Vec::new();
+    let fetched = fetch_ranged(
+        &store,
+        &grant,
+        &url,
+        &local_policy(),
+        &Anonymous,
+        Deadline::none(),
+        &ledger,
+        Ranged {
+            streams: 4,
+            part: 1 << 20,
+        },
+        Some(&mut |moved: u64| totals.push(moved)),
+    )
+    .unwrap();
+
+    assert_eq!(fetched.transferred, object.length);
+    // THE point of the whole module: the bytes are in the store at the id the caller
+    // named, verified by the store's own record and not by the transfer's say-so.
+    assert!(store.record_valid(&object.sha256).is_ok());
+
+    let asked = listener.ranges();
+    assert_eq!(asked[0], "bytes=0-0", "the probe asks for one byte first");
+    let mut parts = asked[1..].to_vec();
+    parts.sort();
+    assert_eq!(
+        parts,
+        vec![
+            "bytes=0-1048575",
+            "bytes=1048576-2097151",
+            "bytes=2097152-3145727",
+            "bytes=3145728-4194303",
+            "bytes=4194304-5242879",
+            "bytes=5242880-6291455",
+        ],
+        "one ask per part, covering the object exactly once"
+    );
+    // Progress stays a running total even though the parts land out of order: it counts
+    // bytes that are on this machine, never a part index or an estimate.
+    assert!(
+        totals.windows(2).all(|pair| pair[0] <= pair[1]),
+        "moved went backwards: {totals:?}"
+    );
+    assert_eq!(totals.last().copied(), Some(object.length));
+    // No litter: the assembly scratch is gone and `put_stream`'s temp with it.
+    assert_eq!(temps(&root), 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A source that will not range must still work. The probe asks for one byte, is answered
+/// with a 200, and the object crosses on the single stream it always did.
+#[test]
+fn an_origin_that_refuses_ranges_still_delivers_the_object() {
+    let root = temporary("ranged-refused");
+    let store = Store::init(&root).unwrap();
+    let body = ranged_body(6 << 20);
+    let object = ObjectRef::of(&body);
+    let served = body.clone();
+    // Range ignored entirely — the shape of an origin with `Accept-Ranges: none`.
+    let listener = ranged_origin(move |_request| Serve::Whole {
+        status: 200,
+        body: served.clone(),
+        headers: Vec::new(),
+    });
+    let (plan, _) =
+        FetchPlan::of_objects(&store, "refused", std::slice::from_ref(&object)).unwrap();
+    let grant = ranged_grant(&plan, &object);
+    let url = format!("{}/member.safetensors", listener.origin.base);
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+
+    let fetched = fetch_ranged(
+        &store,
+        &grant,
+        &url,
+        &local_policy(),
+        &Anonymous,
+        Deadline::none(),
+        &ledger,
+        Ranged {
+            streams: 4,
+            part: 1 << 20,
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(fetched.transferred, object.length);
+    assert!(store.record_valid(&object.sha256).is_ok());
+    // The probe, then ONE whole-object GET with no Range at all: the fall-back is the
+    // single-stream path itself, not a one-part version of the ranged one.
+    assert_eq!(
+        listener.ranges(),
+        vec!["bytes=0-0".to_string(), String::new()]
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The recovery unit inside a part is a BYTE. A connection that dies half way through a
+/// part re-asks for the half it is missing, and moves nothing it already holds.
+#[test]
+fn a_part_that_dies_mid_range_resumes_at_the_byte_it_reached() {
+    let root = temporary("ranged-resume");
+    let store = Store::init(&root).unwrap();
+    let body = ranged_body(4 << 20);
+    let object = ObjectRef::of(&body);
+    let served = body.clone();
+    let cut = Arc::new(AtomicUsize::new(0));
+    let cuts = Arc::clone(&cut);
+    let listener = ranged_origin(move |request| {
+        let Some((first, last)) = range_of(request) else {
+            return partial(&served, request);
+        };
+        // The FIRST full ask for the second part dies with half its bytes delivered.
+        if first == (1 << 20) && cuts.fetch_add(1, Ordering::Relaxed) == 0 {
+            let half = (last - first).div_ceil(2);
+            return Serve::Short {
+                status: 206,
+                headers: vec![(
+                    "content-range".into(),
+                    format!("bytes {first}-{last}/{}", served.len()),
+                )],
+                declared: (last - first + 1) as u64,
+                prefix: served[first..first + half].to_vec(),
+            };
+        }
+        partial(&served, request)
+    });
+    let (plan, _) = FetchPlan::of_objects(&store, "resume", std::slice::from_ref(&object)).unwrap();
+    let grant = ranged_grant(&plan, &object);
+    let url = format!("{}/member.safetensors", listener.origin.base);
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+
+    let fetched = fetch_ranged(
+        &store,
+        &grant,
+        &url,
+        &local_policy(),
+        &Anonymous,
+        Deadline::none(),
+        &ledger,
+        Ranged {
+            streams: 2,
+            part: 1 << 20,
+        },
+        None,
+    )
+    .unwrap();
+
+    assert!(store.record_valid(&object.sha256).is_ok());
+    let asked = listener.ranges();
+    // The re-ask starts at the byte the dead connection reached — 1.5 MiB — and not at the
+    // part's own start. That difference is the whole feature: at 5.2 GB it is the
+    // difference between re-buying 300 MB and re-buying the shard.
+    assert!(
+        asked.contains(&"bytes=1572864-2097151".to_string()),
+        "expected a resumed range, saw {asked:?}"
+    );
+    assert_eq!(
+        fetched.transferred, object.length,
+        "a resumed part counts each byte once"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The door does not soften because the bytes arrived in pieces. One part is served with a
+/// flipped byte and the object is refused at the digest, exactly as a corrupt single
+/// stream would be — and nothing partial is left behind.
+#[test]
+fn ranged_bytes_that_hash_wrong_are_refused_at_the_same_door() {
+    let root = temporary("ranged-corrupt");
+    let store = Store::init(&root).unwrap();
+    let body = ranged_body(6 << 20);
+    let object = ObjectRef::of(&body);
+    let mut corrupt = body.clone();
+    corrupt[3 << 20] ^= 0xFF;
+    let listener = ranged_origin(move |request| partial(&corrupt, request));
+    let (plan, _) =
+        FetchPlan::of_objects(&store, "corrupt", std::slice::from_ref(&object)).unwrap();
+    let grant = ranged_grant(&plan, &object);
+    let url = format!("{}/member.safetensors", listener.origin.base);
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+
+    let refusal = fetch_ranged(
+        &store,
+        &grant,
+        &url,
+        &local_policy(),
+        &Anonymous,
+        Deadline::none(),
+        &ledger,
+        Ranged {
+            streams: 4,
+            part: 1 << 20,
+        },
+        None,
+    )
+    .unwrap_err();
+
+    assert_eq!(refusal.code, Code::OBJECT_ID_MISMATCH);
+    assert!(store.record_valid(&object.sha256).is_err());
+    assert_eq!(temps(&root), 0, "a temp file was left behind");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A part that never lands means the object never lands. The bytes that DID arrive are not
+/// admitted at a shorter length, at a different id, or at all.
+#[test]
+fn a_partly_assembled_object_is_never_admitted() {
+    let root = temporary("ranged-partial");
+    let store = Store::init(&root).unwrap();
+    let body = ranged_body(6 << 20);
+    let object = ObjectRef::of(&body);
+    let served = body.clone();
+    let listener = ranged_origin(move |request| match range_of(request) {
+        // The fourth part is answered 503 forever; every other part lands normally.
+        Some((first, _)) if first == (3 << 20) => status(503, b"busy"),
+        _ => partial(&served, request),
+    });
+    let (plan, _) =
+        FetchPlan::of_objects(&store, "partial", std::slice::from_ref(&object)).unwrap();
+    let grant = ranged_grant(&plan, &object);
+    let url = format!("{}/member.safetensors", listener.origin.base);
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+
+    let refusal = fetch_ranged(
+        &store,
+        &grant,
+        &url,
+        &local_policy(),
+        &Anonymous,
+        Deadline::none(),
+        &ledger,
+        Ranged {
+            streams: 4,
+            part: 1 << 20,
+        },
+        None,
+    )
+    .unwrap_err();
+
+    assert_eq!(refusal.code, Code::TRANSFER_FAILED);
+    assert!(refusal.detail.contains("503"), "{}", refusal.detail);
+    assert!(store.record_valid(&object.sha256).is_err());
+    assert_eq!(temps(&root), 0, "a temp file was left behind");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The fence is per REQUEST, not per object. A part that is redirected off the declared
+/// hosts is refused by the same predicate that would have refused a whole-object GET —
+/// asking for a byte range is not a way to reach a host the predicate never saw.
+#[test]
+fn a_ranged_part_may_not_reach_a_host_the_predicate_never_saw() {
+    let root = temporary("ranged-fence");
+    let store = Store::init(&root).unwrap();
+    let body = ranged_body(6 << 20);
+    let object = ObjectRef::of(&body);
+    let served = body.clone();
+    let listener = ranged_origin(move |request| match range_of(request) {
+        // The probe is answered honestly; the PARTS are sent somewhere else. An origin
+        // that only diverts the big asks is exactly the shape a per-object check misses.
+        Some((0, 0)) => partial(&served, request),
+        _ => Serve::Whole {
+            status: 302,
+            body: Vec::new(),
+            headers: vec![("location".into(), "https://evil.example.org/steal".into())],
+        },
+    });
+    let (plan, _) = FetchPlan::of_objects(&store, "fence", std::slice::from_ref(&object)).unwrap();
+    let grant = ranged_grant(&plan, &object);
+    let url = format!("{}/member.safetensors", listener.origin.base);
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+    let mut policy = local_policy();
+    policy.max_redirects = 5;
+
+    let refusal = fetch_ranged(
+        &store,
+        &grant,
+        &url,
+        &policy,
+        &Anonymous,
+        Deadline::none(),
+        &ledger,
+        Ranged {
+            streams: 4,
+            part: 1 << 20,
+        },
+        None,
+    )
+    .unwrap_err();
+
+    assert_eq!(refusal.code, Code::SOURCE_NOT_ALLOWED);
+    assert!(
+        refusal.detail.contains("evil.example.org"),
+        "{}",
+        refusal.detail
+    );
+    assert!(store.record_valid(&object.sha256).is_err());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A scoped credential is consulted PER REQUEST against the host that request reaches —
+/// never presented once for the object and reused for its parts. Both arms, because only
+/// the pair proves consultation rather than coincidence: scoped to the host the parts
+/// reach, every part carries it; scoped to any other host, no part does.
+#[test]
+fn every_part_re_asks_the_credential_for_the_host_it_reaches() {
+    for (scoped_to, expected) in [
+        ("127.0.0.1", Some("Bearer hf_secret".to_string())),
+        ("cdn.elsewhere.example", None),
+    ] {
+        let root = temporary("ranged-credential");
+        let store = Store::init(&root).unwrap();
+        let body = ranged_body(4 << 20);
+        let object = ObjectRef::of(&body);
+        let served = body.clone();
+        let bearers: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let seen = Arc::clone(&bearers);
+        let dispatch: Dispatch = Arc::new(move |request: &Request| {
+            seen.lock()
+                .unwrap()
+                .push(request.header("authorization").map(str::to_string));
+            partial(&served, request)
+        });
+        let listener = origin(dispatch);
+        let (plan, _) =
+            FetchPlan::of_objects(&store, "credential", std::slice::from_ref(&object)).unwrap();
+        let grant = ranged_grant(&plan, &object);
+        let url = format!("{}/member.safetensors", listener.base);
+        let ledger = Ledger::with_resolution(Duration::from_millis(25));
+        let credential = HostToken {
+            hosts: vec![scoped_to.into()],
+            token: "hf_secret".into(),
+        };
+
+        fetch_ranged(
+            &store,
+            &grant,
+            &url,
+            &local_policy(),
+            &credential,
+            Deadline::none(),
+            &ledger,
+            Ranged {
+                streams: 2,
+                part: 1 << 20,
+            },
+            None,
+        )
+        .unwrap();
+
+        let bearers = bearers.lock().unwrap();
+        assert_eq!(bearers.len(), 5, "the probe and one ask per part");
+        assert!(
+            bearers.iter().all(|value| *value == expected),
+            "scoped to {scoped_to}, the parts carried {bearers:?}"
+        );
+        drop(bearers);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

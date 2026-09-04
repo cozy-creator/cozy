@@ -48,7 +48,8 @@
 //!
 //!   tfs fetch <root> <ref>       closure -> plan -> N-way walk (presign at use) -> proof
 //!   tfs fetch plan-objects <root> <session> --refs <jsonl>   HELD/WANTED, no manifest
-//!   tfs fetch url <root> <sha256> <length> <url|-> [--progress]   one granted object
+//!   tfs fetch url <root> <sha256> <length> <url|-> [--progress] [--streams N]
+//!                                                    one granted object, in parallel ranges
 //!            --progress opens the same STDERR event channel `tfs fetch` reports on, while
 //!            the bytes move: {"event":"fetch.progress","origin_bytes":N,...} per sample
 //!            and {"event":"fetch.delivery","host":..,"http_status":..} per redirect hop,
