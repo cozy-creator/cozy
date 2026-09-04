@@ -77,7 +77,18 @@ use std::time::{Duration, Instant};
 pub const RETRYABLE_STATUS: [u16; 7] = [408, 425, 429, 500, 502, 503, 504];
 
 /// A caller's per-object observer: the object that landed and the bytes this call moved.
-pub type ObjectObserver<'a> = &'a (dyn Fn(&ObjectRef, u64) + Sync);
+pub type ObjectObserver<'a> = &'a (dyn Fn(&ObjectRef, u64, ObjectSource) + Sync);
+
+/// Which door answered for one object, as told to an observer. It is on the callback and
+/// not only in the final report because the two doors cost different things and only one
+/// of them is an invoice: without the split, a datacenter whose cache has silently gone
+/// cold is indistinguishable, while the walk runs, from one that is working — the closure
+/// still completes and the totals still add up, and the bytes are quietly re-bought.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectSource {
+    Cache,
+    Origin,
+}
 
 pub(super) fn shared_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
@@ -706,7 +717,7 @@ pub fn fetch_wanted(
                 });
                 match outcome {
                     Ok(source) => {
-                        let moved = match source {
+                        let moved = match &source {
                             Source::Cache => {
                                 cached.fetch_add(1, Ordering::Relaxed);
                                 bytes_cached.fetch_add(object.length, Ordering::Relaxed);
@@ -719,7 +730,7 @@ pub fn fetch_wanted(
                             }
                         };
                         if let Some(observer) = on_object {
-                            observer(object, moved);
+                            observer(object, moved, source.door());
                         }
                     }
                     Err(refusal) => {
@@ -750,6 +761,15 @@ pub fn fetch_wanted(
 enum Source {
     Cache,
     Origin(Fetched),
+}
+
+impl Source {
+    fn door(&self) -> ObjectSource {
+        match self {
+            Source::Cache => ObjectSource::Cache,
+            Source::Origin(_) => ObjectSource::Origin,
+        }
+    }
 }
 
 /// One pull, described before it runs. `sample_seconds` is the ledger's RESOLUTION —

@@ -51,7 +51,7 @@ pub use ledger::{
 };
 pub use policy::{base_host, blocked, is_loopback_origin, resolve, CheckedUrl, SourcePolicy};
 pub use pull::{
-    fetch_authorized, fetch_url, fetch_wanted, pull, Fetched, ObjectUrls, PullReport, PullRequest,
-    WalkOutcome, RETRYABLE_STATUS,
+    fetch_authorized, fetch_url, fetch_wanted, pull, Fetched, ObjectSource, ObjectUrls, PullReport,
+    PullRequest, WalkOutcome, RETRYABLE_STATUS,
 };
 pub use push::{push_object, Pushed, UploadGrant, MAX_GRANT_BYTES, PUT_ATTEMPTS};

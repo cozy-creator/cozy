@@ -11,12 +11,15 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use tensorfs_core::fetch::{self, DeliveryGrant, FetchPlan};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::Manifest;
 use tensorfs_core::repo_cache::RepoObjectCache;
 use tensorfs_core::store::Store;
+use tensorfs_core::transport::ObjectSource;
 
 use crate::{bail, flag, Flags};
 
@@ -239,7 +242,31 @@ pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
     request.deadline = deadline_of(flags);
     let cache = flag(flags, "repo-cache").map(RepoObjectCache::new);
     request.cache = cache.as_ref();
+    // THE WALK REPORTS WHILE IT WALKS.
+    //
+    // Until now `tfs fetch` printed one report at the end, the pod's supervisor buffered
+    // that output to EOF, and the owner logged the resulting stage change once. So a
+    // 210 GB materialization was, to every layer above it, a single silent edge lasting
+    // hours: an operator could not tell a healthy pull from a wedged one without reading
+    // the daemon's raw log, and on 2026-09-03 a person had to.
+    //
+    // What is printed is what was MEASURED — bytes through each door and the instant they
+    // landed — and nothing derived. A rate is the consumer's division of two of these
+    // samples, which is the only place it can be computed honestly: this walk has sixteen
+    // streams and no opinion about what interval anyone wants to average over. There is no
+    // denominator here on purpose. `FetchPlan` knows it and `pull()` holds it, but a
+    // caller that must not invent a percentage would rather be given none than one this
+    // side guessed.
+    //
+    // The two doors are separate counters because they cost different things and only one
+    // of them is an invoice. A cache that has silently gone cold produces a complete
+    // closure, correct totals, and a bill — and looks exactly like a warm one unless the
+    // split is reported while it happens.
+    let progress = PullProgress::new(request.sample_seconds);
+    let observe = |_object: &ObjectRef, moved: u64, door: ObjectSource| progress.saw(moved, door);
+    request.on_object = Some(&observe);
     let report = ok!(transport::pull(&request));
+    progress.settle();
     println!(
         "model        {}@{} lane {}",
         report.model, report.release, report.lane
@@ -549,4 +576,105 @@ pub fn cmd_source_pull(root: &Path, uri: &str, flags: &Flags) -> ExitCode {
     println!("held         {held} member(s) — NOT fetched");
     println!("transferred  {transferred} B");
     ExitCode::SUCCESS
+}
+
+/// PullProgress is the walk's own reporting counter: totals through each door and the
+/// cadence they are printed at.
+///
+/// `resolution` is the ledger's sampling cadence, reused rather than reinvented. It is a
+/// REPORTING RESOLUTION and decides nothing: no refusal, no reclaim and no verdict depends
+/// on it, and a walk that never crosses it still prints its terminal sample. Sixteen
+/// streams complete objects concurrently, so without a resolution a closure of a hundred
+/// thousand small objects would print a hundred thousand lines to say what one line says.
+struct PullProgress {
+    state: Mutex<PullProgressState>,
+    resolution: Duration,
+}
+
+struct PullProgressState {
+    origin_bytes: u64,
+    cache_bytes: u64,
+    origin_objects: u64,
+    cache_objects: u64,
+    last: Option<Instant>,
+}
+
+impl PullProgress {
+    fn new(sample_seconds: f64) -> PullProgress {
+        PullProgress {
+            state: Mutex::new(PullProgressState {
+                origin_bytes: 0,
+                cache_bytes: 0,
+                origin_objects: 0,
+                cache_objects: 0,
+                last: None,
+            }),
+            resolution: Duration::from_secs_f64(sample_seconds.clamp(0.001, 3600.0)),
+        }
+    }
+
+    fn saw(&self, moved: u64, door: ObjectSource) {
+        let mut state = self.state.lock().unwrap();
+        match door {
+            ObjectSource::Origin => {
+                state.origin_bytes += moved;
+                state.origin_objects += 1;
+            }
+            ObjectSource::Cache => {
+                state.cache_bytes += moved;
+                state.cache_objects += 1;
+            }
+        }
+        let now = Instant::now();
+        let due = match state.last {
+            None => true,
+            Some(last) => now.duration_since(last) >= self.resolution,
+        };
+        if due {
+            state.last = Some(now);
+            print_progress(&state);
+        }
+    }
+
+    /// settle prints the final sample unconditionally, so the last bytes of a walk that
+    /// ended inside one resolution window are still reported. A consumer that computes a
+    /// rate from the gap between samples needs the last one to exist.
+    fn settle(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.last = Some(Instant::now());
+        print_progress(&state);
+    }
+}
+
+/// THE EVENT CHANNEL, and the one rule that governs everything on it.
+///
+/// Events are STDERR, one JSON object per line, `event` first. stdout carries the report a
+/// caller parses for its result and nothing else, so **no event can ever be parsed as a
+/// completion proof** — the guarantee is which stream it arrived on, not a convention about
+/// its contents. `parseFetchReport` reads stdout and requires the `cached` row, and nothing
+/// printed here can satisfy that.
+///
+/// Reserved on this channel, for the metadata-first ordering that lands beside it:
+///
+///   {"event":"pull.metadata","objects":N,"bytes":B}
+///
+/// emitted AT MOST ONCE, at the instant every metadata object of the closure — the
+/// manifest, its CozyTensors header, and the header-declared spec and asset objects — is
+/// verified local, and before the tensor bodies finish. It names no closure and proves no
+/// completion; it is a permission to start reading, which is what lets a consumer overlap
+/// the compatibility check with the rest of the walk instead of waiting for the whole
+/// materialization. The instant belongs to the ordering change that produces it; only the
+/// spelling is fixed here.
+///
+/// One sample, on STDERR as one JSON object per line. stdout carries the report a caller
+/// parses for its result; progress is a side channel and must never be mistaken for one.
+///
+/// Every counter is always present, including a zero. A consumer that reads an absent key
+/// as zero cannot tell a cache that answered nothing from a build that never reported the
+/// door at all, and those are the two states worth telling apart.
+fn print_progress(state: &PullProgressState) {
+    eprintln!(
+        "{{\"event\":\"pull.progress\",\"origin_bytes\":{},\"cache_bytes\":{},\"origin_objects\":{},\"cache_objects\":{}}}",
+        state.origin_bytes, state.cache_bytes, state.origin_objects, state.cache_objects
+    );
 }
