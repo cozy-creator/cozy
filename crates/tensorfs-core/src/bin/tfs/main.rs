@@ -14,8 +14,11 @@
 //! verbs over `TENSORFS_HOME`. Every other command REFUSES a root that does not exist, and the
 //! `~/.tensorfs` fallback is opened, never conjured (tfs-053).
 //!
-//!   tfs store init|info <root>
-//!   tfs store ensure [<root>]
+//!   tfs store init|info <root>       [--repo-cache <root> | --no-repo-cache]
+//!   tfs store ensure [<root>]         [--repo-cache <root> | --no-repo-cache]
+//!                                the Store RECORDS the mounted immutable object cache it
+//!                                mirrors through and reads back from, so no later command
+//!                                and no caller ever names one. `info` prints the binding
 //!   tfs store prepare-readers [<root>]
 //!   tfs store complete-cozytensors [<root>]
 //!   tfs home                     print TENSORFS_HOME or ~/.tensorfs
@@ -24,8 +27,8 @@
 //!   tfs store admit-file <store> blob|manifest <id> <length> <source>
 //!   tfs repo-cache admit <cache> <store> blob|manifest <id> <length>
 //!   tfs repo-cache backfill <cache> <store> blob|manifest <id> <length>
-//!   tfs repo-cache restore <cache> <store> <manifest-id> <length> [--session <s>]
-//!   tfs repo-cache resume <cache> <store> <chain-id> <length> --plan <sha256:...>
+//!   tfs repo-cache restore <store> <manifest-id> <length> [--session <s>]
+//!   tfs repo-cache resume <store> <chain-id> <length> --plan <sha256:...>
 //!                                   [--session <s>] [--tenant <t>] [--no-journal]
 //!   tfs repo-cache chain <cache> <chain-id> <length>       the links, root to head
 //!   tfs put <root> <file>        stream one object in (any shape)
@@ -40,8 +43,8 @@
 //! TFS_CREDENTIAL (`bearer <token>`, or empty for anonymous), never bare argv; a
 //! URL of `-` arrives on stdin. Flags: --hub <base> --lane --session --streams <n>
 //! --timeout <s> --allow-hosts a,b,.c --allow-local --max-redirects <n>.
-//! `tfs fetch` also takes --repo-cache <root>: an optional mounted immutable object
-//! cache read between the local Store and the origin, and backfilled from origin bytes.
+//! `tfs fetch` reads and backfills the Store's bound repo cache between the local Store
+//! and the origin. It is bound by `tfs store ensure --repo-cache` and never by a flag here.
 //!
 //!   tfs fetch <root> <ref>       closure -> plan -> N-way walk (presign at use) -> proof
 //!   tfs fetch plan-objects <root> <session> --refs <jsonl>   HELD/WANTED, no manifest
@@ -168,14 +171,14 @@ fn main() -> ExitCode {
         ["home"] => cmd_home(None),
         ["home", "migrate", source] => cmd_home_migrate(Path::new(source), &flags),
         ["home", r] => cmd_home(Some(Path::new(r))),
-        ["store", "init"] => cmd_store_default("init"),
-        ["store", "info"] => cmd_store_default("info"),
-        ["store", "ensure"] => cmd_store_default("ensure"),
+        ["store", "init"] => cmd_store_default("init", &flags),
+        ["store", "info"] => cmd_store_default("info", &flags),
+        ["store", "ensure"] => cmd_store_default("ensure", &flags),
         ["store", "prepare-readers"] => cmd_store_prepare_readers(None),
         ["store", "complete-cozytensors"] => cmd_store_complete_cozytensors(None),
-        ["store", "init", r] => cmd_store(Path::new(r), "init"),
-        ["store", "info", r] => cmd_store(Path::new(r), "info"),
-        ["store", "ensure", r] => cmd_store(Path::new(r), "ensure"),
+        ["store", "init", r] => cmd_store(Path::new(r), "init", &flags),
+        ["store", "info", r] => cmd_store(Path::new(r), "info", &flags),
+        ["store", "ensure", r] => cmd_store(Path::new(r), "ensure", &flags),
         ["store", "prepare-readers", r] => cmd_store_prepare_readers(Some(Path::new(r))),
         ["store", "complete-cozytensors", r] => cmd_store_complete_cozytensors(Some(Path::new(r))),
         ["store", "rebuild", r] => repo::cmd_rebuild(Path::new(r), &flags),
@@ -188,11 +191,11 @@ fn main() -> ExitCode {
         ["repo-cache", "backfill", cache, store, kind, object, length] => {
             cmd_repo_cache_backfill(Path::new(cache), Path::new(store), kind, object, length)
         }
-        ["repo-cache", "restore", cache, store, object, length] => {
-            cmd_repo_cache_restore(Path::new(cache), Path::new(store), object, length, &flags)
+        ["repo-cache", "restore", store, object, length] => {
+            cmd_repo_cache_restore(Path::new(store), object, length, &flags)
         }
-        ["repo-cache", "resume", cache, store, object, length] => {
-            cmd_repo_cache_resume(Path::new(cache), Path::new(store), object, length, &flags)
+        ["repo-cache", "resume", store, object, length] => {
+            cmd_repo_cache_resume(Path::new(store), object, length, &flags)
         }
         ["repo-cache", "chain", cache, object, length] => {
             cmd_repo_cache_chain(Path::new(cache), object, length)
@@ -423,13 +426,7 @@ fn cmd_repo_cache_backfill(
 /// admitted from the cache through the SAME door a pull uses. There is no adoption on trust
 /// and no second admission path: a cached object whose bytes disagree with its id is removed
 /// and reported, and the completion proof at the end is the Store's own local walk.
-fn cmd_repo_cache_restore(
-    cache: &Path,
-    store: &Path,
-    object: &str,
-    length: &str,
-    flags: &Flags,
-) -> ExitCode {
+fn cmd_repo_cache_restore(store: &Path, object: &str, length: &str, flags: &Flags) -> ExitCode {
     let (_, manifest) = match cache_args("manifest", object, length) {
         Ok(value) => value,
         Err(error) => return bail(error),
@@ -439,8 +436,7 @@ fn cmd_repo_cache_restore(
         Err(error) => return bail(error),
     };
     let session = flag(flags, "session").unwrap_or("restore");
-    let cache = RepoObjectCache::new(cache);
-    let report = match durability::restore_checkpoint(&store, &cache, session, &manifest) {
+    let report = match durability::restore_checkpoint(&store, session, &manifest) {
         Ok(report) => report,
         Err(error) => return bail(error),
     };
@@ -461,13 +457,7 @@ fn cmd_repo_cache_restore(
 /// `transaction::convert` re-checks every journalled part against the Store's own admission
 /// law, which is why a journal restored beside objects that did not survive costs a
 /// re-conversion and never a wrong artifact. `--no-journal` restores the bytes alone.
-fn cmd_repo_cache_resume(
-    cache: &Path,
-    store: &Path,
-    object: &str,
-    length: &str,
-    flags: &Flags,
-) -> ExitCode {
+fn cmd_repo_cache_resume(store: &Path, object: &str, length: &str, flags: &Flags) -> ExitCode {
     let Some(plan) = flag(flags, "plan") else {
         eprintln!(
             "REFUSED MISSING_FIELD: resume requires --plan <sha256:...>, the digest of the plan \
@@ -485,7 +475,17 @@ fn cmd_repo_cache_resume(
         Err(error) => return bail(error),
     };
     let session = flag(flags, "session").unwrap_or("resume");
-    let cache = RepoObjectCache::new(cache);
+    let cache = match store.repo_cache() {
+        Some(cache) => cache.clone(),
+        None => {
+            eprintln!(
+                "REFUSED MISSING_FIELD: {} is bound to no repo cache; bind one with \
+                 `tfs store ensure --repo-cache <root>`",
+                store.root().display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
     let chain = match durability::chain(&cache, &head) {
         Ok(chain) => chain,
         Err(error) => return bail(error),
@@ -498,19 +498,16 @@ fn cmd_repo_cache_resume(
         "chain        {} link(s) over operation {} — {} B declared durable",
         set.links, set.operation, set.bytes
     );
-    let report =
-        match durability::restore_objects(&store, &cache, session, &set.blobs, &set.manifests) {
-            Ok(report) => report,
-            Err(error) => return bail(error),
-        };
+    let report = match durability::restore_objects(&store, session, &set.blobs, &set.manifests) {
+        Ok(report) => report,
+        Err(error) => return bail(error),
+    };
     if !flag_on(flags, "no-journal") {
         match set.progress.last() {
             Some(snapshot) => {
                 let digest = plan.trim_start_matches("sha256:");
                 let tenant = flag(flags, "tenant").unwrap_or("dev");
-                match durability::restore_conversion(
-                    &store, &cache, session, tenant, digest, snapshot,
-                ) {
+                match durability::restore_conversion(&store, session, tenant, digest, snapshot) {
                     Ok(()) => println!(
                         "conversion   {} installed under session {session} — the ops it names \
                          are re-checked, never trusted",
@@ -760,18 +757,51 @@ fn cmd_home_migrate(source: &Path, flags: &Flags) -> ExitCode {
 
 /// The no-root spelling of a `store` verb. It uses `TENSORFS_HOME`, or an existing
 /// `$HOME/.tensorfs` — never a Store it would have to invent (tfs-053).
-fn cmd_store_default(verb: &str) -> ExitCode {
-    cmd_store(&ok!(tensorfs_core::home::store_root(None)), verb)
+fn cmd_store_default(verb: &str, flags: &Flags) -> ExitCode {
+    cmd_store(&ok!(tensorfs_core::home::store_root(None)), verb, flags)
 }
 
-fn cmd_store(root: &Path, verb: &str) -> ExitCode {
-    let s = match verb {
+/// `tfs store init|ensure|info <root>` — and, on the two SETUP verbs, the one place a
+/// deployment says where its repo cache is.
+///
+/// `--repo-cache <root>` records the mount ON THE STORE, so every later handle finds it and
+/// no operation is ever handed one. `--no-repo-cache` records that there is none. Neither
+/// flag leaves whatever the Store already carried; the pair exists so that a caller whose
+/// binding must track an environment — the pod supervisor, whose volume is bound per
+/// datacenter — passes exactly one on EVERY boot and can never inherit a mount that has
+/// gone away. A human running `tfs store init ~/.tensorfs` passes neither and gets what
+/// they had.
+///
+/// Neither flag touches the cache path. See `Store::bind_repo_cache`: a stat on a hard NFS
+/// mount that has stopped answering never returns, and boot is not allowed to hang on the
+/// thing that may only cost latency.
+fn cmd_store(root: &Path, verb: &str, flags: &Flags) -> ExitCode {
+    let bind = match (flag(flags, "repo-cache"), flag_on(flags, "no-repo-cache")) {
+        (Some(_), true) => {
+            eprintln!("--repo-cache and --no-repo-cache say opposite things; pass one");
+            return ExitCode::from(2);
+        }
+        (Some(path), false) => Some(Some(PathBuf::from(path))),
+        (None, true) => Some(None),
+        (None, false) => None,
+    };
+    let mut s = match verb {
         "init" => ok!(Store::init(root)),
         "ensure" => ok!(Store::ensure(root)),
         _ => ok!(Store::open(root)),
     };
+    if let Some(cache) = bind {
+        s = ok!(s.bind_repo_cache(cache.as_deref()));
+    }
     println!("root:       {}", s.root().display());
     println!("blobs:      {}", ok!(s.objects()).len());
+    println!(
+        "repo-cache: {}",
+        match s.repo_cache() {
+            Some(cache) => cache.root().display().to_string(),
+            None => "(none)".to_string(),
+        }
+    );
     ExitCode::SUCCESS
 }
 

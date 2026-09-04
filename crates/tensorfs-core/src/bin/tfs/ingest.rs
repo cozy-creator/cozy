@@ -44,7 +44,6 @@ use tensorfs_core::ingest::transaction::{self as tx};
 use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerificationReceipt};
 use tensorfs_core::limits;
 use tensorfs_core::registry;
-use tensorfs_core::repo_cache::RepoObjectCache;
 use tensorfs_core::store::{Progress, Store};
 
 use crate::watch::{self, Verdict, PROGRESS_PREFIX};
@@ -856,7 +855,7 @@ pub fn cmd_run_source(root: &Path, path: &Path, outer: &Flags) -> ExitCode {
         Err(code) => return code,
     };
     for (key, value) in outer.iter() {
-        if matches!(key.as_str(), "repo-cache" | "checkpoint-bytes") {
+        if matches!(key.as_str(), "checkpoint-bytes") {
             flags.push((key.clone(), value.clone()));
         }
     }
@@ -1157,7 +1156,6 @@ pub fn cmd_run(root: &Path, target: &str, f: &Flags) -> ExitCode {
                 | "order"
                 | "tenant"
                 | "isolation-tier"
-                | "repo-cache"
                 | "checkpoint-bytes"
         ) {
             argv.push(format!("--{k}"));
@@ -1343,13 +1341,14 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
             ok!(v.check(&seed.spec));
         }
     }
-    // THE DURABILITY HALF. `--repo-cache` names a mounted immutable object cache, and it is
-    // a PATH and never a mode: no flag is a conversion with no cache, and a cache that is
-    // missing, read-only, full or unmounted degrades to exactly that conversion. What it
-    // buys is that converted objects stop being pod-local while the conversion is still
-    // running — the reason a released pod used to cost the whole run, and the half the
-    // conversion journal beside it cannot supply because it dies with the pod.
-    let cache = flag(f, "repo-cache").map(RepoObjectCache::new);
+    // THE DURABILITY HALF. The cache is the STORE's — `tfs store ensure --repo-cache` bound
+    // it and this handle carries it — and it is a PATH and never a mode: an unbound Store is
+    // a conversion with no cache, and a cache that is missing, read-only, full or unmounted
+    // degrades to exactly that conversion. What it buys is that converted objects stop being
+    // pod-local while the conversion is still running — the reason a released pod used to
+    // cost the whole run, and the half the conversion journal beside it cannot supply
+    // because it dies with the pod.
+    let cache = store.repo_cache().is_some();
     let headers: Vec<(std::path::PathBuf, &SourceHeader)> = p
         .files
         .iter()
@@ -1363,7 +1362,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     );
     println!("plan         {plan_digest}");
     let policy = durability::Policy {
-        cache: cache.as_ref(),
+        chain: &session,
         operation: &session,
         plan: &plan_digest,
         interval: flag_num(f, "checkpoint-bytes", durability::INTERVAL_BYTES),
@@ -1379,7 +1378,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
             mirror,
         )
     });
-    if cache.is_some() {
+    if cache {
         let mirrored = durable.mirror;
         println!(
             "write-through {} object(s) stored, {} already present, {} refused — {} B durable \

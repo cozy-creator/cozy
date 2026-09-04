@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 use tensorfs_core::fetch::{self, DeliveryGrant, FetchPlan};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::Manifest;
-use tensorfs_core::repo_cache::RepoObjectCache;
 use tensorfs_core::store::Store;
 use tensorfs_core::transport::ObjectSource;
 
@@ -216,10 +215,12 @@ fn credential_of(
 /// presigning `wanted` as it reaches it, the completion proof. A warm store asks one
 /// question and moves nothing.
 ///
-/// `--repo-cache <root>` names an optional mounted immutable object cache to consult
-/// between the local Store and the origin, and to publish origin bytes onward into. It is
-/// a PATH and never a mode: an absent flag is a pull with no cache, and a cache that is
-/// missing, cold, corrupt, read-only or unmounted degrades to exactly that pull.
+/// The mounted immutable object cache — consulted between the local Store and the origin,
+/// and published onward into — is the STORE's, recorded by `tfs store ensure --repo-cache`
+/// and read off the handle this opens. There is no flag: a fetch does not get to name a
+/// cache, because the cache is a fact about the deployment and not about this pull. An
+/// unbound Store is a pull with no cache, and a cache that is missing, cold, corrupt,
+/// read-only or unmounted degrades to exactly that pull.
 pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
     let store = ok!(Store::open(root));
     let Some(base) = flag(flags, "hub") else {
@@ -240,8 +241,6 @@ pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
     request.session = flag(flags, "session").unwrap_or("");
     request.streams = crate::flag_num(flags, "streams", transport::STREAMS);
     request.deadline = deadline_of(flags);
-    let cache = flag(flags, "repo-cache").map(RepoObjectCache::new);
-    request.cache = cache.as_ref();
     // THE WALK REPORTS WHILE IT WALKS.
     //
     // Until now `tfs fetch` printed one report at the end, the pod's supervisor buffered

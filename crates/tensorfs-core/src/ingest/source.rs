@@ -16,7 +16,6 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{tensor_schema_digest_of, tensor_schema_value};
 use crate::ids::{ascii_name, object_id, prefixed, ObjectRef};
 use crate::registry;
-use crate::repo_cache::RepoObjectCache;
 use crate::spec::EncodingSpec;
 use crate::store::Store;
 
@@ -690,7 +689,6 @@ fn execute_prepared(
     operation: &str,
     chain: &str,
     prepared: &Prepared,
-    cache: Option<&RepoObjectCache>,
 ) -> Result<(ObjectRef, durability::Head)> {
     let _ = golden_suite(prepared.conv)?;
     for (_, seed) in &prepared.seeds {
@@ -706,8 +704,8 @@ fn execute_prepared(
         .collect();
     let plan_digest = super::journal::plan_digest(&prepared.plan, &headers);
     let policy = durability::Policy {
-        cache,
-        operation: chain,
+        chain,
+        operation,
         plan: &format!("sha256:{plan_digest}"),
         interval: durability::INTERVAL_BYTES,
     };
@@ -746,21 +744,22 @@ pub struct VerifiedModelSourceFile {
     pub path: PathBuf,
 }
 
+/// One preparation request. It names WHAT to convert and nothing about where the output is
+/// kept: the write-through cache is a property of the `Store` this runs against
+/// ([`crate::store::REPO_CACHE_BINDING`]), so no caller of this type ever spells a mount
+/// point.
+///
+/// That placement preserves the contract the field it replaced was documented with: a
+/// conversion is the same conversion whether or not a volume happened to be bound, so a pod
+/// with a cache and a pod without one replay each other's stored result rather than treating
+/// it as a different request. The cache changes what a run COSTS and what survives it; it can
+/// never change what it produces, which is why it is absent from [`request_digest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareModelSource {
     pub operation_id: String,
     pub source_selection_digest: String,
     pub profiles: Vec<ModelSourceProfile>,
     pub files: Vec<VerifiedModelSourceFile>,
-    /// The optional mounted immutable object cache converted objects are published onto as
-    /// they are admitted.
-    ///
-    /// **It is deliberately NOT part of [`request_digest`]**, and that omission is the
-    /// contract: a conversion is the same conversion whether or not a volume happened to be
-    /// bound, so a pod with a cache and a pod without one must replay each other's stored
-    /// result rather than treat it as a different request. The cache changes what a run
-    /// COSTS and what survives it; it can never change what it produces.
-    pub repo_cache: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -979,8 +978,6 @@ fn prepare_model_source_with_registry(
     let registry = FingerprintRegistry::parse(registry_bytes)?;
     let fences = validate_request(request, &registry)?;
     let digest = request_digest(request, registry_bytes);
-    let cache = request.repo_cache.as_deref().map(RepoObjectCache::new);
-    let cache = cache.as_ref();
     let catalog = crate::catalog::Catalog::open(store.root())?;
     let writer = match catalog.begin_source_preparation(&request.operation_id, &digest)? {
         crate::catalog::SourcePreparation::Prepared(rows) => {
@@ -1049,7 +1046,7 @@ fn prepare_model_source_with_registry(
         }
         let chain = format!("{}/{}", request.operation_id, requested.slot);
         let (manifest, durable) =
-            execute_prepared(store, &request.operation_id, &chain, &prepared, cache)?;
+            execute_prepared(store, &request.operation_id, &chain, &prepared)?;
         sources.push(PreparedModelSource {
             slot: requested.slot.clone(),
             profile: requested.profile.clone(),
@@ -1171,11 +1168,30 @@ mod tests {
     }
 
     fn fixture(root: &Path, bad_second_encoding: bool) -> (Store, Vec<u8>, PrepareModelSource) {
+        fixture_sized(root, bad_second_encoding, None)
+    }
+
+    /// `floats` present makes every tensor a REAL CAS object rather than an inline body.
+    /// The inline threshold is 256 B, so a request built from four-byte scalars publishes
+    /// nothing at all and any assertion about a cache over it would pass vacuously.
+    fn fixture_sized(
+        root: &Path,
+        bad_second_encoding: bool,
+        floats: Option<usize>,
+    ) -> (Store, Vec<u8>, PrepareModelSource) {
         fs::create_dir_all(root).unwrap();
         let first_path = root.join("first.safetensors");
         let second_path = root.join("second.safetensors");
-        let first = carrier(&first_path, "weight", [1, 2, 3, 4]);
-        let second = carrier(&second_path, "weight", [5, 6, 7, 8]);
+        let (first, second) = match floats {
+            None => (
+                carrier(&first_path, "weight", [1, 2, 3, 4]),
+                carrier(&second_path, "weight", [5, 6, 7, 8]),
+            ),
+            Some(floats) => (
+                wide_carrier(&first_path, "weight", floats, 0x11),
+                wide_carrier(&second_path, "weight", floats, 0x22),
+            ),
+        };
         let (first_entry, first_profile) = banked(
             "encoder",
             "provider/first.safetensors",
@@ -1227,7 +1243,6 @@ mod tests {
                     path: second_path,
                 },
             ],
-            repo_cache: None,
         };
         (store, registry.to_bytes(), request)
     }
@@ -1306,6 +1321,147 @@ mod tests {
                 .is_file());
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// THE DECISIVE ARM: a conversion driven through `prepare_model_source`, where NO
+    /// CALLER NAMED A CACHE, publishes its output onto one anyway — because the Store it ran
+    /// against is bound to it — and a second, entirely separate Store bound to the same
+    /// mount reads the whole checkpoint back, digest-verified, off that cache alone.
+    ///
+    /// This is the arm the write-through plane was missing. `repo_cache::Mirror` merged able
+    /// to publish and unreachable in production: the process that converts is the Runtime,
+    /// and the pod fences the Runtime child from the cache root by name, so the converter
+    /// could never be TOLD where the mount was. Nothing here tells it. Setup records the
+    /// mount on the Store once, and every later handle — this one, and the fresh one below
+    /// that has never met the first — finds it.
+    ///
+    /// The readback is not a file comparison. `restore_checkpoint` admits every object
+    /// through `put_stream` at the digest that names it and finishes with the Store's own
+    /// local closure walk, so "restored" here means exactly what it means after a pull.
+    #[test]
+    fn a_bound_store_mirrors_a_conversion_no_caller_named_a_cache_for() {
+        let root = temporary("bound-mirror");
+        let cache_root = root.join("repo-cache");
+        let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+        let store = store.bind_repo_cache(Some(&cache_root)).unwrap();
+
+        // The request carries no mount point, and there is no argument that could hold one.
+        let prepared =
+            prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
+                .unwrap();
+        assert!(!prepared.replayed);
+        assert!(
+            prepared
+                .sources
+                .iter()
+                .all(|source| source.durable.head.is_some() && source.durable.bytes > 0),
+            "a bound Store's conversion published no resumable chain: {:?}",
+            prepared.sources
+        );
+
+        // A SECOND POD. A brand new Store — no objects, no catalog rows, no shared handle —
+        // bound to the same mount by the same one-line setup act, and opened FRESH so the
+        // binding is proved to have come off disk rather than out of a variable.
+        let elsewhere = root.join("second-pod");
+        Store::init(&elsewhere)
+            .unwrap()
+            .bind_repo_cache(Some(&cache_root))
+            .unwrap();
+        let fresh = Store::open(&elsewhere).unwrap();
+        assert_eq!(fresh.repo_cache().map(|c| c.root()), Some(&*cache_root));
+        for source in &prepared.sources {
+            let manifest = ObjectRef {
+                sha256: source.manifest_digest.trim_start_matches("sha256:").into(),
+                length: source.manifest_length,
+            };
+            assert!(
+                fresh.read_manifest(&manifest).is_err(),
+                "the second Store must start out unable to answer for this checkpoint"
+            );
+            let report = durability::restore_checkpoint(&fresh, "second-pod", &manifest).unwrap();
+            assert!(
+                report.complete,
+                "the cache could not answer for {}: {report:?}",
+                source.slot
+            );
+            assert!(report.admitted > 0, "nothing actually moved: {report:?}");
+            validate_prepared_result(&fresh, source).unwrap();
+        }
+
+        // And an UNBOUND Store asking for a restore is a caller mistake, not weather: it is
+        // told so rather than handed an empty success that reads like a cold cache.
+        let unbound = Store::init(&root.join("unbound-pod")).unwrap();
+        let manifest = ObjectRef {
+            sha256: prepared.sources[0]
+                .manifest_digest
+                .trim_start_matches("sha256:")
+                .into(),
+            length: prepared.sources[0].manifest_length,
+        };
+        assert_eq!(
+            durability::restore_checkpoint(&unbound, "unbound", &manifest)
+                .unwrap_err()
+                .code,
+            Code::MISSING_FIELD
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The other half of the ruling: a binding that names a mount which is not there costs
+    /// the conversion its resumability and NOTHING ELSE. Same request, same registry, same
+    /// manifests — the run degrades to local-only in silence, exactly as an unbound Store
+    /// does, because cache failure is allowed to change cost and never authority.
+    #[test]
+    fn a_binding_to_an_absent_mount_degrades_to_a_local_only_conversion() {
+        let bound_root = temporary("absent-mount");
+        let (store, registry, request) = fixture_sized(&bound_root, false, Some(1024));
+        // A mount point that is NOT A DIRECTORY, which is what an unmounted volume looks
+        // like from inside the container: every path under it fails to open and fails to be
+        // created, for every object, in both directions.
+        let stub = bound_root.join("never");
+        fs::write(&stub, b"not a mount").unwrap();
+        let absent = stub.join("mounted");
+        let store = store.bind_repo_cache(Some(&absent)).unwrap();
+        let degraded =
+            prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
+                .unwrap();
+        assert!(
+            degraded
+                .sources
+                .iter()
+                .all(|source| source.durable.head.is_none() && source.durable.bytes == 0),
+            "an absent mount reported durability it cannot honour: {:?}",
+            degraded.sources
+        );
+        assert!(!absent.exists(), "a missing cache must not be conjured");
+
+        let plain_root = temporary("no-mount");
+        let (plain_store, plain_registry, plain_request) =
+            fixture_sized(&plain_root, false, Some(1024));
+        assert!(plain_store.repo_cache().is_none());
+        let plain = prepare_model_source_with_registry(
+            &plain_store,
+            &plain_request,
+            "fixture:registry",
+            &plain_registry,
+        )
+        .unwrap();
+        assert_eq!(
+            degraded
+                .sources
+                .iter()
+                .map(|s| (&s.slot, &s.manifest_digest, s.manifest_length))
+                .collect::<Vec<_>>(),
+            plain
+                .sources
+                .iter()
+                .map(|s| (&s.slot, &s.manifest_digest, s.manifest_length))
+                .collect::<Vec<_>>(),
+            "the cache changed what the conversion produced"
+        );
+        for root in [bound_root, plain_root] {
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

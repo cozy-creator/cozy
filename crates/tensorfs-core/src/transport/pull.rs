@@ -61,7 +61,7 @@
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{DeliveryGrant, FetchPlan};
 use crate::ids::{Doc, ObjectRef};
-use crate::repo_cache::{CacheKind, CacheRead, RepoObjectCache};
+use crate::repo_cache::{CacheKind, CacheRead};
 use crate::store::Store;
 use crate::transport::http::{self, Client};
 use crate::transport::hub::{self, CredentialProvider};
@@ -707,9 +707,9 @@ pub fn fetch_wanted(
     deadline: Deadline,
     ledger: &Ledger,
     streams: usize,
-    cache: Option<&RepoObjectCache>,
     on_object: Option<ObjectObserver<'_>>,
 ) -> Result<WalkOutcome> {
+    let cache = store.repo_cache();
     // Nothing is checked up front any more, because there is no up-front set to check. The
     // invariant it proved — the grant set covers the wanted set exactly — is enforced per
     // mint instead: presign authorizes every digest it was asked or refuses, never a silent
@@ -827,10 +827,6 @@ pub struct PullRequest<'a> {
     pub streams: usize,
     pub session: &'a str,
     pub sample_seconds: f64,
-    /// The optional mounted repo-object cache consulted between the local Store and the
-    /// origin. `None` is a pull with no cache, which is every local pull and any pod whose
-    /// datacenter has no volume — never a degraded mode, just a shorter source order.
-    pub cache: Option<&'a RepoObjectCache>,
     pub on_object: Option<ObjectObserver<'a>>,
 }
 
@@ -853,7 +849,6 @@ impl<'a> PullRequest<'a> {
             streams: STREAMS,
             session: "",
             sample_seconds: crate::transport::ledger::SAMPLE_SECONDS,
-            cache: None,
             on_object: None,
         }
     }
@@ -969,7 +964,6 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
             request.deadline,
             &ledger,
             request.streams,
-            request.cache,
             request.on_object,
         )?;
         report.fetched = walked.fetched;

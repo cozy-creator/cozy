@@ -182,21 +182,27 @@ fn convert(root: &Path, store: &Path, cache: &Path, interval: &str) -> Converted
         &order_path,
     );
     source_plan(&registry, &[&first, &second], &plan_path);
+    // THE CACHE IS NAMED ONCE, AT SETUP, AND NEVER AGAIN. Every command below — the
+    // conversion, the restore, the resume — finds it on the Store.
     ok(
-        "store init",
-        &tfs(&["store", "init", store.to_str().unwrap()]),
+        "store init --repo-cache",
+        &tfs(&[
+            "store",
+            "init",
+            store.to_str().unwrap(),
+            "--repo-cache",
+            cache.to_str().unwrap(),
+        ]),
     );
 
     let stdout = ok(
-        "ingest run --repo-cache",
+        "ingest run",
         &tfs(&[
             "ingest",
             "run",
             store.to_str().unwrap(),
             "--source-plan",
             plan_path.to_str().unwrap(),
-            "--repo-cache",
-            cache.to_str().unwrap(),
             "--checkpoint-bytes",
             interval,
         ]),
@@ -259,15 +265,20 @@ fn converted_objects_survive_the_loss_of_the_store_and_are_re_admitted_verified(
 
     let fresh = root.join("fresh");
     ok(
-        "store init",
-        &tfs(&["store", "init", fresh.to_str().unwrap()]),
+        "store init --repo-cache",
+        &tfs(&[
+            "store",
+            "init",
+            fresh.to_str().unwrap(),
+            "--repo-cache",
+            cache.to_str().unwrap(),
+        ]),
     );
     let restored = ok(
         "repo-cache restore",
         &tfs(&[
             "repo-cache",
             "restore",
-            cache.to_str().unwrap(),
             fresh.to_str().unwrap(),
             &converted.manifest,
             &converted.manifest_length.to_string(),
@@ -299,7 +310,6 @@ fn converted_objects_survive_the_loss_of_the_store_and_are_re_admitted_verified(
         &tfs(&[
             "repo-cache",
             "restore",
-            cache.to_str().unwrap(),
             fresh.to_str().unwrap(),
             &converted.manifest,
             &converted.manifest_length.to_string(),
@@ -327,8 +337,14 @@ fn the_journal_restores_what_was_durable_and_a_stale_one_is_discarded_whole() {
     fs::remove_dir_all(&store).unwrap();
     let fresh = root.join("fresh");
     ok(
-        "store init",
-        &tfs(&["store", "init", fresh.to_str().unwrap()]),
+        "store init --repo-cache",
+        &tfs(&[
+            "store",
+            "init",
+            fresh.to_str().unwrap(),
+            "--repo-cache",
+            cache.to_str().unwrap(),
+        ]),
     );
 
     // A journal written under a different plan is not partially adopted, migrated or
@@ -336,7 +352,6 @@ fn the_journal_restores_what_was_durable_and_a_stale_one_is_discarded_whole() {
     let stale = tfs(&[
         "repo-cache",
         "resume",
-        cache.to_str().unwrap(),
         fresh.to_str().unwrap(),
         &converted.chain,
         &converted.chain_length.to_string(),
@@ -380,7 +395,6 @@ fn the_journal_restores_what_was_durable_and_a_stale_one_is_discarded_whole() {
         &tfs(&[
             "repo-cache",
             "resume",
-            cache.to_str().unwrap(),
             fresh.to_str().unwrap(),
             &hex_of(root_link[1]),
             root_link.last().unwrap(),
@@ -399,7 +413,6 @@ fn the_journal_restores_what_was_durable_and_a_stale_one_is_discarded_whole() {
         &tfs(&[
             "repo-cache",
             "resume",
-            cache.to_str().unwrap(),
             fresh.to_str().unwrap(),
             &converted.chain,
             &converted.chain_length.to_string(),
@@ -455,8 +468,14 @@ fn a_cache_that_cannot_be_written_costs_the_conversion_nothing() {
     );
     source_plan(&registry, &[&first, &second], &plan_path);
     ok(
-        "store init",
-        &tfs(&["store", "init", store.to_str().unwrap()]),
+        "store init --repo-cache",
+        &tfs(&[
+            "store",
+            "init",
+            store.to_str().unwrap(),
+            "--repo-cache",
+            cache.to_str().unwrap(),
+        ]),
     );
 
     let stdout = ok(
@@ -467,8 +486,6 @@ fn a_cache_that_cannot_be_written_costs_the_conversion_nothing() {
             store.to_str().unwrap(),
             "--source-plan",
             plan_path.to_str().unwrap(),
-            "--repo-cache",
-            cache.to_str().unwrap(),
         ]),
     );
     assert!(
@@ -510,8 +527,14 @@ fn a_resumed_pod_reuses_the_restored_conversion_journal_instead_of_re_converting
     fs::remove_dir_all(&store).unwrap();
     let fresh = root.join("fresh");
     ok(
-        "store init",
-        &tfs(&["store", "init", fresh.to_str().unwrap()]),
+        "store init --repo-cache",
+        &tfs(&[
+            "store",
+            "init",
+            fresh.to_str().unwrap(),
+            "--repo-cache",
+            cache.to_str().unwrap(),
+        ]),
     );
 
     let resumed = ok(
@@ -519,7 +542,6 @@ fn a_resumed_pod_reuses_the_restored_conversion_journal_instead_of_re_converting
         &tfs(&[
             "repo-cache",
             "resume",
-            cache.to_str().unwrap(),
             fresh.to_str().unwrap(),
             &converted.chain,
             &converted.chain_length.to_string(),
@@ -544,8 +566,6 @@ fn a_resumed_pod_reuses_the_restored_conversion_journal_instead_of_re_converting
             fresh.to_str().unwrap(),
             "--source-plan",
             root.join("source-plan.json").to_str().unwrap(),
-            "--repo-cache",
-            cache.to_str().unwrap(),
         ]),
     );
     assert_eq!(

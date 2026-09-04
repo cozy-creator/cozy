@@ -25,10 +25,20 @@ A writable local TensorFS root has exactly one host owner. SQLite/advisory locks
 processes on that host; they are not a cross-host lock service and must not sit on NFS as shared
 mutation authority. Multi-host publication and GC use Tensorhub's R2/PostgreSQL control plane.
 
-Workers may additionally use a caller-selected root (for example,
-`/workspace/cozy/repo-cache`) as an optional datacenter cache. The example path is deployment
-policy, not part of the TensorFS format. The cache is not a TensorFS Store and contains only
-immutable repository objects:
+Workers may additionally use a root (for example, `/workspace/cozy/repo-cache`) as an optional
+datacenter cache. The example path is deployment policy, not part of the TensorFS format.
+
+**The cache is a property of the Store, recorded once at setup.** `tfs store ensure <root>
+--repo-cache <cache>` writes the mount into `<store-root>/repo-cache`; `--no-repo-cache` clears
+it. Every later handle — `Store::open`, `Store::ensure`, and so every fetch, conversion, restore
+and resume — reads it from there, so no request, protocol field, function argument or child
+environment ever carries a mount path. The record is LOCAL to the Store and never on the cache,
+which holds immutable objects only. Reading it can only change cost: an absent, unreadable or
+malformed record is simply no cache, because a Store that would not open is an availability
+failure and cache state may never cause one. Binding performs no I/O on the cache path, since a
+stat on a hung mount does not return.
+
+The cache is not a TensorFS Store and contains only immutable repository objects:
 
 ```text
 blobs/<first-2-hex>/<next-2-hex>/<64-lowercase-hex>
@@ -58,6 +68,12 @@ tfs store admit-file <store> blob|manifest <sha256> <length> <source>
 tfs repo-cache admit <cache> <store> blob|manifest <sha256> <length>
 tfs repo-cache backfill <cache> <store> blob|manifest <sha256> <length>
 ```
+
+Those three act on a cache directory as such and name one explicitly. The production paths never
+do: `tfs fetch`, `tfs ingest run`, `tfs repo-cache restore <store> ...` and
+`tfs repo-cache resume <store> ...` use whatever the Store is bound to, and an unbound Store is a
+run with no cache rather than a refusal — except a restore, where "bring these bytes back off the
+cache" with no cache is a caller mistake and says so.
 
 Three schemas are STORED — written to a path, digested, and identified by their exact bytes:
 

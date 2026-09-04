@@ -16,7 +16,6 @@ use crate::header::{Body, Closure, Header, Part, Tensor};
 use crate::ids::{Doc, ObjectRef};
 use crate::manifest::{Draft, Entry};
 use crate::registry;
-use crate::repo_cache::RepoObjectCache;
 use crate::store::Store;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -592,7 +591,6 @@ fn cold_pull_lands_and_warm_pull_moves_nothing() {
 #[test]
 fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
     let cache_root = temporary("repo-cache-volume");
-    let cache = RepoObjectCache::new(&cache_root);
     let checkpoint = Arc::new(checkpoint(6, 32 * 1024));
     let declared: u64 = checkpoint.bodies.values().map(|b| b.len() as u64).sum();
     let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
@@ -601,12 +599,14 @@ fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
     // POD A — cold Store, cold cache. Every object crosses the network once, and the walk
     // publishes each one onward as it lands.
     let a = temporary("repo-cache-pod-a");
-    let store_a = Store::init(&a).unwrap();
-    let cold = {
-        let mut request = request_for(&store_a, &origin.base, &policy);
-        request.cache = Some(&cache);
-        pull(&request).unwrap()
-    };
+    // THE CACHE IS BOUND TO THE STORE AND HANDED TO NOTHING. `pull` takes no cache
+    // argument: it reads the binding off the handle it was given, which is the same way
+    // `prepare_model_source` and every restore find it.
+    let store_a = Store::init(&a)
+        .unwrap()
+        .bind_repo_cache(Some(&cache_root))
+        .unwrap();
+    let cold = pull(&request_for(&store_a, &origin.base, &policy)).unwrap();
     assert_eq!(cold.fetched, 8);
     assert_eq!(cold.cached, 0, "a cold cache can answer for nothing");
     assert_eq!(cold.bytes_moved, declared);
@@ -619,12 +619,11 @@ fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
 
     // POD B — a DIFFERENT empty Store on the same mounted cache: the re-rental.
     let b = temporary("repo-cache-pod-b");
-    let store_b = Store::init(&b).unwrap();
-    let warm = {
-        let mut request = request_for(&store_b, &origin.base, &policy);
-        request.cache = Some(&cache);
-        pull(&request).unwrap()
-    };
+    let store_b = Store::init(&b)
+        .unwrap()
+        .bind_repo_cache(Some(&cache_root))
+        .unwrap();
+    let warm = pull(&request_for(&store_b, &origin.base, &policy)).unwrap();
     assert_eq!(
         warm.held, 0,
         "pod B's own Store starts empty — this is a fresh rental"
@@ -653,11 +652,11 @@ fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
 
     // And pod B is genuinely servable: `pull` refuses rather than returns if the closure is
     // incomplete, so a third pull that HOLDS everything is the readback.
-    let readback = {
-        let mut request = request_for(&store_b, &origin.base, &policy);
-        request.cache = Some(&cache);
-        pull(&request).unwrap()
-    };
+    // A FRESH HANDLE on the same root: the binding survived the process's own forgetting,
+    // because it is recorded in the Store and not in this variable.
+    let store_b = Store::open(&b).unwrap();
+    assert_eq!(store_b.repo_cache().map(|c| c.root()), Some(&*cache_root));
+    let readback = pull(&request_for(&store_b, &origin.base, &policy)).unwrap();
     assert_eq!(readback.held, 8);
     assert_eq!(
         readback.cached, 0,
@@ -683,27 +682,23 @@ fn an_absent_or_corrupt_cache_degrades_to_the_ordinary_pull() {
     // A root that does not exist, on a filesystem the pull may not even be able to write.
     let absent = temporary("repo-cache-absent").join("never").join("created");
     let a = temporary("repo-cache-degraded-a");
-    let store_a = Store::init(&a).unwrap();
-    let missing_cache = RepoObjectCache::new(&absent);
-    let report = {
-        let mut request = request_for(&store_a, &origin.base, &policy);
-        request.cache = Some(&missing_cache);
-        pull(&request).unwrap()
-    };
+    let store_a = Store::init(&a)
+        .unwrap()
+        .bind_repo_cache(Some(&absent))
+        .unwrap();
+    let report = pull(&request_for(&store_a, &origin.base, &policy)).unwrap();
     assert_eq!(report.cached, 0);
     assert_eq!(report.fetched, 6); // 4 blobs + header + manifest
     assert_eq!(report.bytes_moved, declared);
 
     // Now poison every cache final the successful pull just published, keeping the names.
     let poisoned = temporary("repo-cache-poisoned");
-    let cache = RepoObjectCache::new(&poisoned);
     let b = temporary("repo-cache-degraded-b");
-    let store_b = Store::init(&b).unwrap();
-    {
-        let mut request = request_for(&store_b, &origin.base, &policy);
-        request.cache = Some(&cache);
-        pull(&request).unwrap();
-    }
+    let store_b = Store::init(&b)
+        .unwrap()
+        .bind_repo_cache(Some(&poisoned))
+        .unwrap();
+    pull(&request_for(&store_b, &origin.base, &policy)).unwrap();
     let mut poisoned_files = 0;
     for entry in walk_files(&poisoned) {
         let length = std::fs::metadata(&entry).unwrap().len() as usize;
@@ -720,13 +715,12 @@ fn an_absent_or_corrupt_cache_degrades_to_the_ordinary_pull() {
     );
 
     let c = temporary("repo-cache-degraded-c");
-    let store_c = Store::init(&c).unwrap();
+    let store_c = Store::init(&c)
+        .unwrap()
+        .bind_repo_cache(Some(&poisoned))
+        .unwrap();
     let before = origin.total_hits();
-    let recovered = {
-        let mut request = request_for(&store_c, &origin.base, &policy);
-        request.cache = Some(&cache);
-        pull(&request).unwrap()
-    };
+    let recovered = pull(&request_for(&store_c, &origin.base, &policy)).unwrap();
     assert_eq!(recovered.cached, 0, "corrupt finals answer for nothing");
     assert_eq!(recovered.fetched, 6, "and the origin answered instead");
     assert_eq!(recovered.bytes_moved, declared);
@@ -980,7 +974,6 @@ fn a_walk_that_outlives_the_url_lifetime_completes() {
         Deadline::none(),
         &Ledger::with_resolution(Duration::from_millis(200)),
         4,
-        None,
         None,
     )
     .unwrap_err();
@@ -1819,7 +1812,6 @@ fn bench_walk_16way_parity() {
             Deadline::none(),
             &ledger,
             streams,
-            None,
             None,
         )
         .unwrap();
