@@ -332,6 +332,23 @@ func (h *fakeRentalHub) setRate(id string, usdMicros int64) {
 	h.rentals[id]["hourly_rate_usd_micros"] = usdMicros
 }
 
+// setState moves one rental to a hub lifecycle state, with the failure Tensorhub reports
+// alongside a terminal one. It is how a pod DYING reaches this daemon: the hub owns
+// provider reclaim, so a rental that fails after it was serving is served as `failed` with
+// the code that reclaimed it, and there is no other channel that carries the fact.
+func (h *fakeRentalHub) setState(id, state, failureCode string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	row, ok := h.rentals[id]
+	if !ok {
+		return
+	}
+	row["state"] = state
+	if failureCode != "" {
+		row["failure"] = map[string]any{"code": failureCode}
+	}
+}
+
 func (h *fakeRentalHub) releases(id string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
