@@ -1,4 +1,4 @@
-//! Byte-range parallel fetch of ONE source object (tfs-061).
+//! Byte-range parallel fetch of ONE source object (tfs-062).
 //!
 //! **The recovery unit is an object only where the object grid is fine.** `pull`'s N-way
 //! walk parallelises ACROSS objects, which is the whole story for a repo pull: publish
