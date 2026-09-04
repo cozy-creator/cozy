@@ -31,6 +31,13 @@ type publishSource struct {
 	Bytes     int64
 	Exact     []modeltransfer.SourceFile
 	Access    []sourceCapability
+	// The provider resolution this source came from, ALREADY NARROWED to the reviewed
+	// carriers, and the resolver that answered it. Carried so a header-first conversion
+	// preflight (tfs-076) can range-read those carriers' headers without re-asking the
+	// provider everything it has just answered. Nil for a local file, a `local/` alias,
+	// or a Tensorhub checkpoint — none of which has a provider header to read.
+	Resolver   *modelsource.Resolver
+	Resolution modelsource.Plan
 }
 
 type sourceCapability struct {
@@ -187,6 +194,28 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 			producerName, len(plan.Outputs)).WithRemedy(
 			"use a one-output producer or model upload until tracked multi-output local aliases land")
 	}
+	// THE GUARD (tfs-076). A conversion plan is a function of the source HEADERS, so it is
+	// decidable HERE — owner-side, before a rental is requested, before a byte of payload
+	// moves, and before this process submits anything. Runs 290, 294 and 309 each moved
+	// 210.3 GB and then refused on facts that were in the first few kilobytes of each
+	// member; a `--dry-run` in front of each of them reported `status: planned`, because
+	// it validated the dispatch plan and never the conversion plan.
+	//
+	// Placed on the two paths that pay for the omission: a DRY RUN, whose whole job is to
+	// answer this question, and a RENTED transfer, which is the one that spends money to
+	// find out. A local transfer already plans from headers itself, in
+	// prepareLocalTransferSources, and paying for a second header read here would be the
+	// same work twice.
+	conversion := conversionPreflight{Undecided: "not run on this path"}
+	if ctx.Inv.Bool("--dry-run") || effectiveRental {
+		pctx, cancel := hub.LongContext()
+		decided, problem := preflightConversionPlan(pctx, ctx, source, plan.SourceProfiles)
+		cancel()
+		if problem != nil {
+			return problem
+		}
+		conversion = decided
+	}
 	id := plan.ID()
 	if ctx.Inv.Bool("--dry-run") {
 		if kind == "model-upload" {
@@ -210,10 +239,21 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 				output.Field{K: "outputs", V: plan.OutputNames()},
 				output.Field{K: "needs_accelerator", V: producer.NeedsAccelerator},
 			)
+			// What the dispatch plan cannot say and this can: the reviewed headers admit a
+			// conversion, and these are the journal keys the pod will open.
+			if conversion.decided() {
+				fields = append(fields,
+					output.Field{K: "conversion", V: "planned"},
+					output.Field{K: "conversion_sessions", V: conversion.Sessions()})
+			} else {
+				fields = append(fields,
+					output.Field{K: "conversion", V: "undecided"},
+					output.Field{K: "conversion_undecided", V: conversion.Undecided})
+			}
 		}
 		defaults := []string{"id", "kind", "model", "source"}
 		if producer != nil {
-			defaults = append(defaults, "producer", "outputs")
+			defaults = append(defaults, "producer", "outputs", "conversion")
 		}
 		defaults = append(defaults, "status", "changed")
 		return emit(ctx, compactRecord(fields, defaults...))
@@ -423,7 +463,8 @@ func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (pu
 		return publishSource{Canonical: resolved.Canonical,
 			Selection: "sha256:" + resolved.SelectionSHA256,
 			License:   resolved.License, Files: len(resolved.Files), Bytes: resolved.Bytes,
-			Exact: exact, Access: access}, nil
+			Exact: exact, Access: access,
+			Resolver: resolver, Resolution: resolved}, nil
 	}
 	if !catalogModelSpelling(raw) {
 		return publishSource{}, parseProblem
