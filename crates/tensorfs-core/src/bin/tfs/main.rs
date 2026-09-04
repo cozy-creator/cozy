@@ -41,7 +41,12 @@
 //!
 //!   tfs fetch <root> <ref>       closure -> plan -> N-way walk (presign at use) -> proof
 //!   tfs fetch plan-objects <root> <session> --refs <jsonl>   HELD/WANTED, no manifest
-//!   tfs fetch url <root> <sha256> <length> <url|->           one granted object
+//!   tfs fetch url <root> <sha256> <length> <url|-> [--progress]   one granted object
+//!            --progress opens the same STDERR event channel `tfs fetch` reports on, while
+//!            the bytes move: {"event":"fetch.progress","origin_bytes":N,...} per sample
+//!            and {"event":"fetch.delivery","host":..,"http_status":..} per redirect hop,
+//!            so a supervisor can tell slow from wedged without a clock. stdout stays the
+//!            result. --progress-bytes <n> is that channel's resolution, never a verdict
 //!   tfs push <root> <sha256> --grant-file <path> [--manifest] [--content-type ct]
 //!            the grant is the destination on line one, then one "name: value" per header
 //!            its signature covers; TFS_PUSH_GRANT carries the same text, and

@@ -323,10 +323,141 @@ pub fn cmd_plan_objects(root: &Path, session: &str, flags: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `tfs fetch url <root> <sha256> <length> <url|->` — plan-of-one, then the one transport
-/// into `put_stream`. A held object answers `held` and moves nothing. A url of `-` reads
-/// the real URL as one line on stdin: a capability URL can embed a signature, and argv is
-/// world-readable in /proc.
+// ------------------------------------------------------------ the observation channel
+
+/// The RESOLUTION of `--progress`, never a verdict about it.
+///
+/// A record every `SAMPLE_BYTES` keeps the channel's cost proportional to the BYTES MOVED
+/// rather than to the number of fetches running: the pod runs several `fetch url` children
+/// at once over one link, and the link is what bounds their sum, so the whole transfer
+/// emits `moved / SAMPLE_BYTES` records however many children there are. At the 117.6 MB/s
+/// #566b measured for a saturated link that is about two records a second; at the 6 MB/s
+/// the H3 pod degraded to, one every ten seconds.
+///
+/// `SAMPLE_GAP` floors it so a crawling link still says so several times a minute, and it
+/// is the ledger's own `SAMPLE_SECONDS` rather than a second number invented here — the
+/// same cadence `cmd_pull`'s walk reports at. It is not a deadline and cannot fire on its
+/// own: a record is only ever emitted by a read that ACTUALLY MOVED BYTES, so silence on
+/// this channel means silence on the wire, which is the fact the parent is watching for.
+/// Judging that silence is the parent's job and it does it by observation. Nothing in this
+/// file can end a transfer.
+const SAMPLE_BYTES: u64 = 64 << 20;
+
+fn sample_gap() -> std::time::Duration {
+    std::time::Duration::from_secs_f64(transport::SAMPLE_SECONDS)
+}
+
+/// `--progress`: this command's half of the event channel `cmd_pull` opened.
+///
+/// EVENTS ARE STDERR, one JSON object per line, `event` first; stdout carries the report a
+/// caller parses for its result and nothing else. That is what makes "no event can be
+/// parsed as a completion proof" structural rather than conventional — the guarantee is
+/// which stream it arrived on. `fetch url`'s result is `held|admitted <id>` and
+/// `transferred <n> B`, and nothing printed here can be mistaken for either.
+///
+/// Two events, and the counter names are `pull.progress`'s so that one consumer reads both
+/// verbs. `fetch url` is a plan-of-one against the origin — a held object returns before a
+/// socket opens and no repo cache is consulted — so the cache counters would be
+/// structurally zero and are not printed; `origin_objects` goes to one only when the object
+/// is admitted:
+///
+///   {"event":"fetch.progress","origin_bytes":N,"origin_objects":0|1,"attempt":A}
+///   {"event":"fetch.delivery","attempt":A,"host":"h","http_status":S}
+///
+/// `attempt` is on the progress event because a re-ask RESTARTS `origin_bytes` at zero —
+/// `fetch url` has no mid-object resume, so those bytes are not in the store and a
+/// consumer must be able to see the count go back rather than believe a total this fetch
+/// cannot deliver.
+///
+/// `fetch.delivery` is one per redirect hop per ask, and it is the half that makes a
+/// degradation attributable at all. The URL is a bearer capability and never appears; the
+/// HOST is not, and neither is the status. Without them a 429 retry storm and a slow link
+/// produce the same byte curve afterwards, which is exactly why the H3 pod's 70 -> 6 MB/s
+/// could not be attributed to anything.
+struct Reporter {
+    moved: u64,
+    reported: u64,
+    attempt: u32,
+    /// The byte delta between records. `--progress-bytes` states it, because resolution is
+    /// configuration and nothing here is a verdict; production states nothing and gets
+    /// SAMPLE_BYTES.
+    every: u64,
+    gap: std::time::Duration,
+    last: std::time::Instant,
+}
+
+impl Reporter {
+    fn new(every: u64) -> Self {
+        Reporter {
+            moved: 0,
+            reported: 0,
+            attempt: 0,
+            every: every.max(1),
+            gap: sample_gap(),
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn say(&mut self, event: &str) {
+        use std::io::Write;
+        let mut out = io::stderr().lock();
+        // A closed channel is not this transfer's business. The bytes are wanted by
+        // whoever asked for them, not by whoever was watching.
+        let _ = writeln!(out, "{event}").and_then(|()| out.flush());
+        self.last = std::time::Instant::now();
+    }
+
+    fn announce(&mut self, admitted: u64) {
+        self.reported = self.moved;
+        let event = format!(
+            "{{\"event\":\"fetch.progress\",\"origin_bytes\":{},\"origin_objects\":{},\"attempt\":{}}}",
+            self.moved, admitted, self.attempt
+        );
+        self.say(&event);
+    }
+}
+
+impl transport::FetchObserver for Reporter {
+    fn hop(&mut self, attempt: u32, host: &str, status: u16) {
+        self.attempt = attempt;
+        // The host reaches the channel as JSON, so it reaches it quoted. It comes from the
+        // policy check that already refused anything but a hostname, and this is the belt
+        // that keeps a malformed one from being a malformed EVENT.
+        let host: String = host
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+            .take(253)
+            .collect();
+        let event = format!(
+            "{{\"event\":\"fetch.delivery\",\"attempt\":{attempt},\"host\":\"{host}\",\"http_status\":{status}}}"
+        );
+        self.say(&event);
+    }
+
+    fn moved(&mut self, total: u64) {
+        // A re-ask restarts the count at zero, and saying so is the honest report: those
+        // bytes are not in the store, and a reader that watched them climb must watch them
+        // go back rather than believe a total this fetch cannot deliver.
+        let due = total < self.moved
+            || total.saturating_sub(self.reported) >= self.every
+            || self.last.elapsed() >= self.gap;
+        self.moved = total;
+        if due {
+            self.announce(0);
+        }
+    }
+}
+
+/// `tfs fetch url <root> <sha256> <length> <url|-> [--progress]` — plan-of-one, then the
+/// one transport into `put_stream`. A held object answers `held` and moves nothing. A url
+/// of `-` reads the real URL as one line on stdin: a capability URL can embed a signature,
+/// and argv is world-readable in /proc.
+///
+/// `--progress` opens the observation channel above. Without it this command says nothing
+/// until it is finished, which for a 5 GiB shard is ten to fifteen minutes of silence a
+/// supervisor cannot read: the H3 ingest moved 210 GB over 2h56m and its only signal was a
+/// cumulative byte total at each file's COMPLETION, so "slow" and "wedged" looked identical
+/// for the whole run and the run was lost.
 pub fn cmd_url(root: &Path, id: &str, length: &str, url: &str, flags: &Flags) -> ExitCode {
     use std::io::BufRead;
     let store = ok!(Store::open(root));
@@ -361,7 +492,9 @@ pub fn cmd_url(root: &Path, id: &str, length: &str, url: &str, flags: &Flags) ->
     }
     let grant = ok!(fetch::DeliveryGrant::mint(&plan, &object));
     let ledger = transport::Ledger::new();
-    let fetched = ok!(transport::fetch_url(
+    let mut reporter = crate::flag_on(flags, "progress")
+        .then(|| Reporter::new(crate::flag_num(flags, "progress-bytes", SAMPLE_BYTES)));
+    let fetched = transport::fetch_url(
         &store,
         &grant,
         url,
@@ -369,8 +502,20 @@ pub fn cmd_url(root: &Path, id: &str, length: &str, url: &str, flags: &Flags) ->
         &Anonymous,
         deadline_of(flags),
         &ledger,
-        None,
-    ));
+        reporter
+            .as_mut()
+            .map(|r| r as &mut dyn transport::FetchObserver),
+    );
+    let fetched = match fetched {
+        Ok(fetched) => fetched,
+        Err(refusal) => return bail(refusal),
+    };
+    // The last record is the one that closes the channel: every byte moved, and the object
+    // admitted. A reader that saw nothing else still sees this.
+    if let Some(reporter) = reporter.as_mut() {
+        reporter.moved = fetched.transferred;
+        reporter.announce(1);
+    }
     println!("admitted     {}", fetched.admitted.object.id());
     println!("transferred  {} B", fetched.transferred);
     ExitCode::SUCCESS
