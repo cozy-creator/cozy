@@ -355,33 +355,35 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		}
 		allVerified := len(statuses) == len(expected)
 		revisions := make(map[string]int64, len(statuses))
-		verified := make(map[string]bool, len(statuses))
 		for _, status := range statuses {
 			revisions[status.Member] = status.CapabilityRevision
-			verified[status.Member] = status.State == "verified"
 			allVerified = allVerified && status.State == "verified"
 		}
 		// The frames go out in ONE pass, in member order, and a preparation sent in the
 		// same pass is read after all of them: the pod registers every member off its
 		// control read loop before it considers a preparation for the same operation.
+		//
+		// ONE PASS PER CONTROL STREAM, and only one. This used to re-state every
+		// non-verified member on every wake, and the pod's own ACCEPTED echo IS a wake --
+		// a closed loop with the pod as its amplifier. On run 205 it turned over ~3,000
+		// capability_revision bumps per member, each a fresh pod goroutine that took a
+		// fetch lane and re-bought a fetch that was already doomed, and each carrying the
+		// row further past the revision whose verdict was still in flight (cl-133). A
+		// member this pod has been told about on this stream is in the pod's hands.
 		stream := fmt.Sprintf("%s/%d", session.bootID, session.epoch)
-		first := restated != stream
-		for _, member := range members {
-			if !first && verified[member] {
-				continue
+		if restated != stream {
+			for _, member := range members {
+				file := expected[member]
+				access := byMember[member]
+				session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourceFileRequest{
+					ModelSourceFileRequest: &pb.ModelSourceFileRequest{
+						RecordOwnerEpoch:   recordOwnerEpoch,
+						ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
+						OperationId: req.ID, SourceSelectionDigest: selection, Member: member,
+						ObjectId: "sha256:" + file.SHA256, Length: uint64(file.Length),
+						Provider: access.Provider, Url: access.URL, ExpiresAtUnix: access.ExpiresAtUnix,
+						CapabilityRevision: uint64(revisions[member] + 1)}}})
 			}
-			file := expected[member]
-			access := byMember[member]
-			session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourceFileRequest{
-				ModelSourceFileRequest: &pb.ModelSourceFileRequest{
-					RecordOwnerEpoch: recordOwnerEpoch,
-					ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
-					OperationId: req.ID, SourceSelectionDigest: selection, Member: member,
-					ObjectId: "sha256:" + file.SHA256, Length: uint64(file.Length),
-					Provider: access.Provider, Url: access.URL, ExpiresAtUnix: access.ExpiresAtUnix,
-					CapabilityRevision: uint64(revisions[member] + 1)}}})
-		}
-		if first {
 			restated = stream
 			c.logf("model transfer %s: stating all %d selected source file(s) to %s on "+
 				"control stream %d; a member this pod already holds is answered from its "+
