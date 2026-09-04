@@ -209,6 +209,33 @@ func recordModelTransferTx(tx *sql.Tx, requestID string, intent *ModelTransferIn
 	return nil
 }
 
+// PlannedSourceBytes is the summed length of every source object this request
+// will pull, or 0 when the request moves no model bytes (th-152).
+//
+// It is read from request_model_transfer_files, which is written in the same
+// transaction as the request itself and is the table the length CHECK lives
+// on — never re-summed from the intent JSON, which would let two spellings of
+// the same plan disagree.
+//
+// This is what makes a plan-sized pod possible. An ingest holds its source
+// objects AND the canonical CAS output built from them in one TensorFS Store
+// on the pod's container disk, so a pod bought at the serving default would
+// block on a full filesystem partway through. The hub sizes the disk from this
+// figure; it is stated before the rental is bought because the selection is
+// resolved before any pod exists.
+func (s *Store) PlannedSourceBytes(requestID string) (int64, *exit.Error) {
+	var total sql.NullInt64
+	if err := s.db.QueryRow(`SELECT SUM(length) FROM request_model_transfer_files
+		WHERE request_id=?`, requestID).Scan(&total); err != nil {
+		return 0, exit.Internalf("cannot total model transfer source bytes for %s: %s",
+			requestID, err)
+	}
+	if !total.Valid || total.Int64 < 0 {
+		return 0, nil
+	}
+	return total.Int64, nil
+}
+
 func (s *Store) ModelTransferOf(requestID string) (*ModelTransfer, *exit.Error) {
 	var row ModelTransfer
 	var intent, models, checkpoints string
