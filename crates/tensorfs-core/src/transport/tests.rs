@@ -276,6 +276,13 @@ fn checkpoint(blobs: usize, size: usize) -> Checkpoint {
         for (at, byte) in body.iter_mut().enumerate() {
             *byte = ((at * 31 + index * 7 + 3) % 251) as u8;
         }
+        // The pattern above repeats every 251 indices, and a repeated body is the SAME
+        // object — a checkpoint of a few thousand blobs would silently collapse to 251 of
+        // them, which is why no test in this file has ever exercised a large closure.
+        // Stamping the index in keeps one blob one object at any count.
+        for (at, byte) in (index as u32).to_le_bytes().iter().enumerate() {
+            body[at] ^= byte;
+        }
         let object = ObjectRef::of(&body);
         tensors.push((
             format!("blocks.{index}.weight"),
@@ -956,7 +963,12 @@ fn retryable_status_buys_a_reask_and_authorization_answers_do_not() {
     assert_eq!(report.fetched, 4);
     assert_eq!(origin.hits(&format!("/obj/{flaky}")), 2);
 
-    // A 403 is an authorization fact: one ask, a typed refusal, no retry.
+    // A 403 against a URL minted moments ago: one ask, a typed refusal, no retry. The
+    // reason is the LEASE, not the status — this hub declares no lifetime, so there is
+    // nothing to argue that time was the cause, and re-minting would ask the same
+    // question. A 403 against a lease the hub's own declared life says is spent is
+    // re-minted instead; that half is
+    // `a_403_is_judged_by_the_leases_age_and_not_by_a_count`.
     let store2root = temporary("retry-expired");
     let store2 = Store::init(&store2root).unwrap();
     let expired_for = expired.clone();
@@ -1657,4 +1669,382 @@ fn bench_walk_16way_parity() {
         unthrottled >= 117.6,
         "the door itself moved {unthrottled:.1} MB/s — below the recorded WAN figure"
     );
+}
+
+// ------------------------------------------------- proto-037: the wire does not grow
+
+/// What one emulated hub was ASKED, so a test can assert about the requests and not only
+/// about the outcome.
+struct Wire {
+    origin: Origin,
+    /// The largest presign body this hub was asked to read.
+    largest_presign: Arc<AtomicUsize>,
+    /// How many presign calls it answered.
+    mints: Arc<AtomicUsize>,
+    /// How many closure pages it answered.
+    pages: Arc<AtomicUsize>,
+}
+
+/// A hub that behaves like tensorhub does: it PAGINATES its closure, DECLARES the presign
+/// ceiling it derived from its own body cap, and REFUSES an oversized body rather than
+/// truncating it.
+///
+/// `ceiling` of `None` is a hub that declares nothing, which is the skew a client must also
+/// survive.
+fn wire_hub_origin(
+    checkpoint: Arc<Checkpoint>,
+    request_cap: usize,
+    page: usize,
+    ceiling: Option<usize>,
+) -> Wire {
+    let base_slot: Arc<Mutex<String>> = Arc::default();
+    let hits: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+    let largest_presign = Arc::new(AtomicUsize::new(0));
+    let mints = Arc::new(AtomicUsize::new(0));
+    let pages = Arc::new(AtomicUsize::new(0));
+    let dispatch_base = Arc::clone(&base_slot);
+    let (seen, minted, paged) = (
+        Arc::clone(&largest_presign),
+        Arc::clone(&mints),
+        Arc::clone(&pages),
+    );
+    let dispatch: Dispatch = Arc::new(move |request: &Request| {
+        let base = dispatch_base.lock().unwrap().clone();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/v1/tensorfs/closure") => {
+                paged.fetch_add(1, Ordering::Relaxed);
+                let after = match crate::canon::parse(&request.body, 1 << 20) {
+                    Ok(Value::Obj(fields)) => fields
+                        .into_iter()
+                        .find(|(k, _)| k == "after")
+                        .and_then(|(_, v)| match v {
+                            Value::Str(hex) => Some(hex),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let rows: Vec<&ObjectRef> = checkpoint
+                    .objects
+                    .iter()
+                    .filter(|o| o.sha256 > after)
+                    .collect();
+                let complete = rows.len() <= page;
+                let taken = if complete { &rows[..] } else { &rows[..page] };
+                let row = |o: &ObjectRef| {
+                    Value::obj(vec![
+                        ("length", Value::uint(o.length)),
+                        ("sha256", Value::str(o.sha256.clone())),
+                    ])
+                };
+                let mut fields = vec![
+                    ("complete", Value::Bool(complete)),
+                    ("lane", Value::str("public")),
+                    ("manifest", row(&checkpoint.manifest)),
+                    ("model", Value::str("acme/model")),
+                    (
+                        "objects",
+                        Value::arr(taken.iter().map(|o| row(o)).collect()),
+                    ),
+                    ("release", Value::str("r1")),
+                    ("scope", Value::str("runtime")),
+                ];
+                if let Some(ceiling) = ceiling {
+                    fields.push(("presign_max_digests", Value::uint(ceiling as u64)));
+                }
+                ok_json(&Value::obj(fields))
+            }
+            ("POST", "/v1/tensorfs/presign") => {
+                minted.fetch_add(1, Ordering::Relaxed);
+                seen.fetch_max(request.body.len(), Ordering::Relaxed);
+                // Exactly what tensorhub does: the size check fires before the decoder, so
+                // an oversized body is a size refusal and never a shape one.
+                if request.body.len() > request_cap {
+                    return status(
+                        413,
+                        b"{\"error\":{\"code\":\"tensorfs.request_too_large\",\"message\":\"over the cap\"}}",
+                    );
+                }
+                ok_json(&presign_value(&request.body, &base))
+            }
+            ("GET", path) if path.starts_with("/obj/") => {
+                match checkpoint.bodies.get(&path["/obj/".len()..]) {
+                    Some(body) => status(200, body),
+                    None => status(404, b"no such object"),
+                }
+            }
+            _ => status(404, b"no such route"),
+        }
+    });
+    let origin = origin_with_hits(dispatch, hits);
+    *base_slot.lock().unwrap() = origin.base.clone();
+    Wire {
+        origin,
+        largest_presign,
+        mints,
+        pages,
+    }
+}
+
+/// **THE DECISIVE ONE: no presign body the walk sends can exceed what the hub will read.**
+///
+/// The mint window was bounded by bytes to TRANSFER (8 GiB declared) and by digest COUNT
+/// (4,096) and by nothing else, so a closure of several thousand small objects fell entirely
+/// inside one window and serialised into a body far larger than the hub accepts. Captured on
+/// the wire against the live hub, 2026-09-03: `paul/wai-illustrious@17.0.0`, 2,598 objects
+/// and ~6.9 GB — under the byte budget — asked for 2,599 digests in a 174,146-byte body at a
+/// route that reads 131,072, sixteen times, once per stream.
+///
+/// Neither existing bound could ever have caught it, which is the point. A digest weighs 67
+/// bytes on the wire, so 4,096 of them weigh 274,445: the count cap sat at more than twice
+/// the size the hub will read and was unreachable through this route. The missing bound was
+/// the request's own size — and it is not a bound this side may hold a copy of, because the
+/// number belongs to the hub. The hub declares it; the window is it.
+#[test]
+fn no_presign_body_exceeds_what_the_hub_will_read() {
+    // tensorhub `internal/workerdownloads/service.go`, verbatim.
+    const HUB_REQUEST_CAP: usize = 128 << 10;
+    // What that cap buys, by the hub's own derivation: (131072 - 13) / 67.
+    const HUB_CEILING: usize = 1956;
+    // Production's own object count. It MUST exceed the ceiling or the test proves nothing:
+    // a closure that fits in one window fits under any bound at all.
+    const OBJECTS: usize = 2598;
+    // Checked at COMPILE time, not at run time: shrinking the closure under the ceiling
+    // would make every assertion below pass vacuously, and that must fail the build rather
+    // than pass quietly. At 1,601 objects the old code passes this test.
+    const _: () = assert!(OBJECTS > HUB_CEILING);
+
+    let root = temporary("wire-window");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(OBJECTS - 2, 1024)); // blobs + header + manifest
+    assert!(
+        checkpoint.objects.len() > HUB_CEILING,
+        "the fixture collapsed to {} distinct objects",
+        checkpoint.objects.len()
+    );
+    let hub = wire_hub_origin(
+        Arc::clone(&checkpoint),
+        HUB_REQUEST_CAP,
+        usize::MAX,
+        Some(HUB_CEILING),
+    );
+    let policy = SourcePolicy::default();
+    let mut request = request_for(&store, &hub.origin.base, &policy);
+    request.streams = 4;
+    let report = pull(&request).unwrap();
+
+    assert_eq!(report.fetched, checkpoint.objects.len() as u64 + 1);
+    let largest = hub.largest_presign.load(Ordering::Relaxed);
+    assert!(
+        largest <= HUB_REQUEST_CAP,
+        "the walk sent a {largest} B presign body at a hub that reads {HUB_REQUEST_CAP} B"
+    );
+    // And the window is the hub's ceiling, not something smaller that happens to fit: a
+    // full window weighs 13 + 67 * 1956 = 131,065 B, seven bytes inside the cap.
+    assert_eq!(
+        largest,
+        13 + 67 * HUB_CEILING,
+        "the window is not the ceiling the hub declared"
+    );
+    // Several windows, which is what a closure larger than one window must cost.
+    assert!(hub.mints.load(Ordering::Relaxed) >= 2);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// **A closure larger than one page is walked page by page, and the pages name one tree.**
+#[test]
+fn a_closure_is_paginated_and_every_page_names_one_tree() {
+    let root = temporary("wire-pages");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(40, 1024));
+    let hub = wire_hub_origin(Arc::clone(&checkpoint), 128 << 10, 7, Some(1956));
+    let policy = SourcePolicy::default();
+    let report = pull(&request_for(&store, &hub.origin.base, &policy)).unwrap();
+    // Every object arrived, across the seams, with nothing repeated or skipped.
+    assert_eq!(report.fetched, checkpoint.objects.len() as u64 + 1);
+    assert_eq!(report.declared, checkpoint.objects.len() as u64 + 1);
+    let pages = hub.pages.load(Ordering::Relaxed);
+    assert!(
+        pages >= checkpoint.objects.len().div_ceil(7),
+        "{pages} pages for {} objects at 7 per page",
+        checkpoint.objects.len()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// **A hub that declares no ceiling gets a window derived from a fact this side owns.**
+///
+/// The fallback is `streams`: mint exactly what is in flight. It is a degradation and not a
+/// guess — a few hundred bytes per call, safe under any body cap a hub could have — and it
+/// is deliberately not a number picked to be "probably under" whatever the hub's cap is.
+#[test]
+fn a_hub_that_declares_no_ceiling_mints_one_wave_at_a_time() {
+    let root = temporary("wire-noceiling");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(30, 1024));
+    let hub = wire_hub_origin(Arc::clone(&checkpoint), 128 << 10, usize::MAX, None);
+    let policy = SourcePolicy::default();
+    let mut request = request_for(&store, &hub.origin.base, &policy);
+    request.streams = 4;
+    let report = pull(&request).unwrap();
+    assert_eq!(report.fetched, checkpoint.objects.len() as u64 + 1);
+    // A window of 4 over 32 objects is many calls, and each one is tiny.
+    let largest = hub.largest_presign.load(Ordering::Relaxed);
+    assert!(
+        largest <= 13 + 67 * 4,
+        "a fallback window sent a {largest} B body"
+    );
+    assert!(hub.mints.load(Ordering::Relaxed) >= 8);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// **A 403 is judged by the LEASE'S AGE against the life the hub declared, never by a count
+/// of how often this object has been re-authorized.**
+///
+/// The two agree on a fast link and diverge exactly where a slow one lives. An object that
+/// begins its transfer holding half a URL's life and takes longer than that to move is a
+/// 64 MiB object at ~107 KB/s: slow, and the transport exists to say slow is not broken. A
+/// count would call its second expiry terminal after gigabytes had landed. The age test
+/// re-mints for it, and still refuses at the FIRST 403 against a URL minted moments ago —
+/// because a refusal of a fresh capability is not about time, and asking to be authorized
+/// again would be asking the same question.
+///
+/// Reaching this decision from the wire means racing a clock, so the lease's age is stated
+/// here rather than waited for. Everything else is the production type.
+#[test]
+fn a_403_is_judged_by_the_leases_age_and_not_by_a_count() {
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    let checkpoint = Arc::new(checkpoint(3, 1024));
+    let hub = wire_hub_origin(Arc::clone(&checkpoint), 128 << 10, usize::MAX, Some(1956));
+    let policy = local_policy();
+    let ledger = Ledger::with_resolution(Duration::from_millis(50));
+    let wanted: Vec<ObjectRef> = checkpoint.objects.clone();
+    let object = wanted[0].clone();
+    let declared = Duration::from_secs(600);
+
+    let leases = super::pull::Leases {
+        client: super::pull::shared_client(),
+        base: &hub.origin.base,
+        credential: &Anonymous,
+        policy: &policy,
+        deadline: Deadline::none(),
+        ledger: &ledger,
+        wanted: &wanted,
+        window: 1956,
+        held: Mutex::new(BTreeMap::new()),
+        minting: Mutex::new(()),
+    };
+
+    // A lease whose declared life is more than half gone: the origin's refusal IS about
+    // time, and being authorized again is a different question with a different answer.
+    leases.held.lock().unwrap().insert(
+        object.sha256.clone(),
+        super::pull::Lease {
+            url: "http://127.0.0.1:1/stale".into(),
+            minted: Instant::now() - declared,
+            lifetime: Some(declared),
+        },
+    );
+    let minted = super::pull::ObjectUrls::url_for(&leases, 0, &object, true)
+        .expect("a spent lease refused by the origin must be re-minted");
+    assert!(
+        minted.starts_with(&hub.origin.base) && minted.contains(&object.sha256),
+        "re-authorizing did not produce a fresh URL: {minted}"
+    );
+    assert_eq!(hub.mints.load(Ordering::Relaxed), 1);
+
+    // A lease minted moments ago, refused by the origin: terminal at the first answer, with
+    // no attempt spent and no second mint.
+    leases.held.lock().unwrap().insert(
+        object.sha256.clone(),
+        super::pull::Lease {
+            url: "http://127.0.0.1:1/fresh".into(),
+            minted: Instant::now(),
+            lifetime: Some(declared),
+        },
+    );
+    let refusal = super::pull::ObjectUrls::url_for(&leases, 0, &object, true)
+        .expect_err("a URL minted moments ago is not refused because of time");
+    assert_eq!(refusal.code, Code::TRANSFER_FAILED);
+    assert!(refusal.detail.contains("minted moments ago"), "{refusal}");
+    assert_eq!(
+        hub.mints.load(Ordering::Relaxed),
+        1,
+        "a fresh lease's refusal bought a second mint"
+    );
+}
+
+/// **A hub that says "wait" is waited for, and the same request is then answered.**
+///
+/// A rate limit is the purest resumable refusal in the protocol — the identical request gets
+/// a different answer once the window slides — and it used to abort the whole pull through
+/// `HUB_REFUSED` after however many gigabytes had landed. The wait is the hub's own stated
+/// instant, read off the pair of clocks the hub sent, so a skewed local clock cannot shorten
+/// or lengthen it.
+#[test]
+fn a_hub_that_says_wait_is_waited_for_and_then_answers() {
+    let root = temporary("wire-429");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(4, 1024));
+    let base_slot: Arc<Mutex<String>> = Arc::default();
+    let refusals = Arc::new(AtomicUsize::new(0));
+    let dispatch_base = Arc::clone(&base_slot);
+    let refused = Arc::clone(&refusals);
+    let dispatch: Dispatch = Arc::new(move |request: &Request| {
+        let base = dispatch_base.lock().unwrap().clone();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/v1/tensorfs/closure") => ok_json(&closure_value(&checkpoint, &base)),
+            ("POST", "/v1/tensorfs/presign") => {
+                // The first ask is rate limited, and says WHEN — one second on the hub's
+                // own clock, stated beside that clock.
+                if refused.fetch_add(1, Ordering::Relaxed) == 0 {
+                    let now = 1_800_000_000u64;
+                    return Serve::Whole {
+                        status: 429,
+                        body: crate::canon::write(&Value::obj(vec![
+                            (
+                                "error",
+                                Value::obj(vec![
+                                    ("code", Value::str("tensorfs.rate_limited")),
+                                    ("message", Value::str("the budget is spent")),
+                                ]),
+                            ),
+                            ("retry_after_unix", Value::uint(now + 1)),
+                            ("server_time_unix", Value::uint(now)),
+                        ])),
+                        headers: vec![("Content-Type".into(), "application/json".into())],
+                    };
+                }
+                ok_json(&presign_value(&request.body, &base))
+            }
+            ("GET", path) if path.starts_with("/obj/") => {
+                match checkpoint.bodies.get(&path["/obj/".len()..]) {
+                    Some(body) => status(200, body),
+                    None => status(404, b"no such object"),
+                }
+            }
+            _ => status(404, b"no such route"),
+        }
+    });
+    let origin = origin_with_hits(dispatch, Arc::default());
+    *base_slot.lock().unwrap() = origin.base.clone();
+
+    let policy = SourcePolicy::default();
+    let started = std::time::Instant::now();
+    let report = pull(&request_for(&store, &origin.base, &policy)).unwrap();
+    let waited = started.elapsed();
+
+    assert_eq!(report.fetched, 6);
+    assert!(
+        refusals.load(Ordering::Relaxed) >= 2,
+        "the ask was not repeated"
+    );
+    // The hub asked for a second, and a second is what it got — not a number this side chose.
+    assert!(
+        waited >= Duration::from_secs(1),
+        "the pull did not wait the instant the hub named: {waited:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
