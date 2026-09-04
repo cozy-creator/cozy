@@ -59,7 +59,7 @@
 //! because the wait already happened inside SQLite'''s busy timeout.
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::fetch::{DeliveryGrant, FetchPlan};
+use crate::fetch::{DeliveryGrant, Destination, FetchPlan};
 use crate::ids::{Doc, ObjectRef};
 use crate::repo_cache::{CacheKind, CacheRead};
 use crate::store::Store;
@@ -795,12 +795,16 @@ pub fn fetch_wanted(
                 let outcome = DeliveryGrant::mint(plan, object).and_then(|grant| {
                     // The grant already knows which namespace this object lives in — it
                     // derives its own storage key from the same bit — so the cache is asked
-                    // the question the grant answers rather than one restated here.
-                    let kind = match grant.manifest {
-                        true => CacheKind::Manifest,
-                        false => CacheKind::Blob,
+                    // the question the grant answers rather than one restated here. A
+                    // carrier has no namespace and no place in an immutable repo cache; it
+                    // also cannot reach here, because this walk mints from a plan and a
+                    // plan never names one.
+                    let kind = match grant.destination {
+                        Destination::Manifest => Some(CacheKind::Manifest),
+                        Destination::Blob => Some(CacheKind::Blob),
+                        Destination::Staging => None,
                     };
-                    if let Some(cache) = cache {
+                    if let (Some(kind), Some(cache)) = (kind, cache) {
                         if cache.admit(store, kind, object)? == CacheRead::Hit {
                             return Ok(Source::Cache);
                         }
@@ -808,7 +812,7 @@ pub fn fetch_wanted(
                     let one = fetch_authorized(
                         store, &grant, &authorize, policy, credential, deadline, ledger, None,
                     )?;
-                    if let Some(cache) = cache {
+                    if let (Some(kind), Some(cache)) = (kind, cache) {
                         // Weather, and deliberately unread: a cache that cannot be written
                         // has cost this pull nothing, and the object it could not take is
                         // already local and already proved.

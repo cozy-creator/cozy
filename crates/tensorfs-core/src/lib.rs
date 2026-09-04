@@ -43,6 +43,7 @@ pub mod repo_cache;
 pub mod repository;
 pub mod sha256;
 pub mod spec;
+pub mod staging;
 pub mod storage;
 pub mod store;
 pub mod transport;

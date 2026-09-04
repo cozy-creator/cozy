@@ -402,7 +402,36 @@ fn validate_manifest_ref(manifest: &ObjectRef) -> Result<()> {
 pub struct DeliveryGrant {
     pub session: String,
     pub object: ObjectRef,
-    pub manifest: bool,
+    pub destination: Destination,
+}
+
+/// Where the bytes this grant authorizes come to rest.
+///
+/// The grant already carried this bit — it was `manifest: bool` — so a third destination is
+/// the existing shape rather than a new concept, and `admit` dispatching on it is what
+/// keeps `transport/` untouched: `ranged::sequential`'s single `grant.admit(store, &mut
+/// reader)` does not move, so byte-range resume works on the staging path for free and
+/// cannot drift from the CAS path.
+///
+/// `Blob` and `Manifest` are store objects. `Staging` is not: it is a foreign source
+/// carrier the store will read once and throw away, and it has no catalog record, no census
+/// membership and no `FetchPlan` that answers HELD or WANTED about it. See
+/// [`crate::staging`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    Blob,
+    Manifest,
+    Staging,
+}
+
+impl Destination {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Destination::Blob => "blob",
+            Destination::Manifest => "manifest",
+            Destination::Staging => "staging",
+        }
+    }
 }
 
 impl DeliveryGrant {
@@ -440,18 +469,47 @@ impl DeliveryGrant {
             Some(o) => Ok(DeliveryGrant {
                 session: plan.session.clone(),
                 object: o.clone(),
-                manifest: plan.manifest.as_ref().is_some_and(|m| m.sha256 == o.sha256),
+                destination: match plan.manifest.as_ref() {
+                    Some(m) if m.sha256 == o.sha256 => Destination::Manifest,
+                    _ => Destination::Blob,
+                },
             }),
         }
     }
 
-    /// DERIVED, not stored — the same key publish wrote to.
+    /// A grant to STAGE one carrier, with no `FetchPlan` behind it.
+    ///
+    /// There is no closure for this to be a subset of: a carrier is not declared by a
+    /// remote catalog and is not reached by any manifest. The binding it carries is the
+    /// object id itself, which [`DeliveryGrant::admit`] enforces by digest through the same
+    /// hashing core `put_stream` uses — so the authorization is exactly as strong as a
+    /// minted one, and narrower, because a staging grant can never land in `blobs/`.
+    pub fn stage(session: &str, object: &ObjectRef) -> Result<Self> {
+        ascii_name("DeliveryGrant.session", session, limits::MAX_NAME_BYTES)?;
+        hex64("DeliveryGrant.object", &object.sha256)?;
+        if object.length == 0 {
+            return refuse(
+                Code::LENGTH_MISMATCH,
+                "a staged carrier is a file the converter opens; zero bytes is not one",
+            );
+        }
+        Ok(DeliveryGrant {
+            session: session.to_string(),
+            object: object.clone(),
+            destination: Destination::Staging,
+        })
+    }
+
+    /// DERIVED, not stored — the same key publish wrote to. A staging grant's key is not a
+    /// store key at all, and saying so in the same shape is the point.
     pub fn key(&self) -> String {
-        if self.manifest {
-            crate::storage::manifest_key(&self.object.sha256)
-                .expect("DeliveryGrant carries a validated digest")
-        } else {
-            final_key(&self.object.sha256).expect("DeliveryGrant carries a validated digest")
+        match self.destination {
+            Destination::Manifest => crate::storage::manifest_key(&self.object.sha256)
+                .expect("DeliveryGrant carries a validated digest"),
+            Destination::Blob => {
+                final_key(&self.object.sha256).expect("DeliveryGrant carries a validated digest")
+            }
+            Destination::Staging => format!("staging/{}", self.object.sha256),
         }
     }
 
@@ -462,7 +520,17 @@ impl DeliveryGrant {
     ///
     /// `r` is whatever the transport adapter opened. This plane neither knows nor asks.
     pub fn admit<R: Read>(&self, store: &Store, r: &mut R) -> Result<Admitted> {
-        let put = if self.manifest {
+        if self.destination == Destination::Staging {
+            // Not an admission at all: the bytes cross the same hashing core and land
+            // OUTSIDE every namespace a census walks. Nothing is recorded about them,
+            // because there is nothing to be atomic about — see `crate::staging`.
+            let carrier = crate::staging::stage(store, r, &self.object)?;
+            return Ok(Admitted {
+                object: carrier.object,
+                first_writer: carrier.fetched,
+            });
+        }
+        let put = if self.destination == Destination::Manifest {
             validate_manifest_ref(&self.object)?;
             let capacity =
                 usize::try_from(self.object.length).map_err(|_| crate::err::Refusal {
@@ -785,10 +853,16 @@ impl DeliveryGrant {
     pub fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("DeliveryGrant", v)?;
         let kind = f.req_str("kind")?;
-        let manifest = match kind {
-            "blob" => false,
-            "manifest" => true,
-            _ => return refuse(Code::UNKNOWN_FIELD, "grant kind must be blob or manifest"),
+        let destination = match kind {
+            "blob" => Destination::Blob,
+            "manifest" => Destination::Manifest,
+            "staging" => Destination::Staging,
+            _ => {
+                return refuse(
+                    Code::UNKNOWN_FIELD,
+                    "grant kind must be blob, manifest or staging",
+                )
+            }
         };
         let object = ObjectRef::from_value("DeliveryGrant.object", f.req("object")?)?;
         let session = f.req_str("session")?.to_string();
@@ -797,7 +871,7 @@ impl DeliveryGrant {
         Ok(DeliveryGrant {
             session,
             object,
-            manifest,
+            destination,
         })
     }
 
@@ -805,10 +879,7 @@ impl DeliveryGrant {
         // `key` is deliberately ABSENT for the same reason `PublishGrant` omits it: a
         // derivable fact stored beside its source is a second authority waiting to disagree.
         Value::obj(vec![
-            (
-                "kind",
-                Value::str(if self.manifest { "manifest" } else { "blob" }),
-            ),
+            ("kind", Value::str(self.destination.as_str())),
             ("object", self.object.to_value()),
             ("session", Value::str(self.session.clone())),
         ])
@@ -868,7 +939,7 @@ mod object_set_tests {
             Code::NOT_CONTAINED
         );
         let grant = DeliveryGrant::mint(&plan, &wanted_ref).unwrap();
-        assert!(!grant.manifest);
+        assert_eq!(grant.destination, Destination::Blob);
         grant.admit(&store, &mut wanted_bytes.as_slice()).unwrap();
         plan.complete(&store).unwrap();
 

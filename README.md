@@ -10,8 +10,16 @@ manifests/<aa>/<bb>/<sha256>.json
 blobs/<aa>/<bb>/<sha256>
 tensorfs.sqlite                    # seven small local index/coordination/cache tables
 checkouts/<manifest-sha256>/...    # optional disposable local view
+staging/<sha256>                   # foreign source carriers: NOT store objects
 tmp/                               # all transient local state; delete when stopped
 ```
+
+`staging/` holds downloaded source carriers — a HuggingFace safetensors shard on its way to
+being converted. A carrier crosses the same hashing door a blob does and is refused at the
+same digest, but it is not content-addressed storage: it has no verification record, appears
+in no census, is never a `gc` candidate, and is deleted by `tfs staging drop` as soon as the
+conversion that reads it is done. A temporary input and a durable output do not share a
+lifetime. `tfs staging fetch|drop|clear|list` is the whole surface.
 
 Repository files are authoritative checkpoint roots plus revisioned model release pointers.
 Manifests are immutable virtual file trees. Blobs are immutable content bytes. TensorFS backs model

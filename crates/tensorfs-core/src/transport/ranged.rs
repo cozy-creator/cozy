@@ -62,7 +62,7 @@
 //! because nothing is holding one.
 //!
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::fetch::{Admitted, DeliveryGrant};
+use crate::fetch::{Admitted, DeliveryGrant, Destination};
 use crate::store::Store;
 use crate::transport::http;
 use crate::transport::hub::CredentialProvider;
@@ -173,8 +173,13 @@ pub fn fetch_ranged(
     let ranged = ranged.normalized();
     let total = grant.object.length;
     // A manifest is bytes the door reads whole into memory and compares; it is never a
-    // gigabyte and ranging it would be all cost. Small objects are the same argument.
-    if grant.manifest || ranged.streams == 0 || total < ranged.part.saturating_mul(2) {
+    // gigabyte and ranging it would be all cost. Small objects are the same argument. A
+    // STAGED carrier is the opposite case and ranges like a blob: it is the 5 GiB shard
+    // this module exists for.
+    if grant.destination == Destination::Manifest
+        || ranged.streams == 0
+        || total < ranged.part.saturating_mul(2)
+    {
         return whole(
             store, grant, url, policy, credential, deadline, ledger, observer,
         );

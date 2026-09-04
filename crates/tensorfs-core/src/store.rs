@@ -202,6 +202,24 @@ pub struct Put {
     pub admitted: bool,
 }
 
+/// The store's own scratch names under `tmp/`. [`Store::reap`] collects exactly these two
+/// prefixes and nothing else, so a crashed writer of EITHER destination cannot leak a
+/// partial multi-gigabyte temp forever, and a `tmp/` entry that is somebody else's stays
+/// somebody else's.
+pub(crate) const PUT_TEMP: &str = "put-";
+pub(crate) const STAGE_TEMP: &str = "stage-";
+
+/// A durable temp whose bytes are PROVEN and whose destination is not yet decided.
+///
+/// The lock is still held and the mode is still 0600, so nothing can read it and `reap`
+/// can tell it has a live writer. See [`Store::stream_verified`].
+pub(crate) struct Verified {
+    pub(crate) tmp: PathBuf,
+    pub(crate) file: File,
+    pub(crate) sha256: String,
+    pub(crate) length: u64,
+}
+
 /// Bytes proven to be `sha256` THROUGH THE DESCRIPTOR THIS HOLDS.
 ///
 /// The point of the type is the fd, not the fields: a `VerifiedFile` cannot be built from a
@@ -352,7 +370,7 @@ impl Store {
                 ),
             );
         }
-        for d in ["repos", "manifests", "blobs", "checkouts", "tmp"] {
+        for d in ["repos", "manifests", "blobs", "checkouts", "staging", "tmp"] {
             fs::create_dir_all(root.join(d)).map_err(|e| io(format!("mkdir {d}"), e))?;
         }
         crate::catalog::Catalog::initialize(root)?;
@@ -529,8 +547,16 @@ impl Store {
     /// tenant. Scratch under `tmp/` is excluded: an in-flight temp is charged to the
     /// admission that is already being checked against the budget, and counting it twice
     /// would refuse a pull that fits.
+    ///
+    /// **Staged carriers ARE counted, and that is a preservation rather than an addition.**
+    /// Before tfs-067 a fetched source shard was an ordinary blob and this number included
+    /// it; a carrier that left the CAS and left the arithmetic with it would quietly make
+    /// the budget mean something narrower than it did, and a store with 200 GB of carriers
+    /// on it would report headroom it does not have. They are not reclaimable by `gc` —
+    /// they are not in any census — which is exactly why the number that decides whether an
+    /// admission fits must see them.
     pub fn occupancy(&self) -> Result<u64> {
-        let mut total: u64 = 0;
+        let mut total: u64 = crate::staging::bytes(self)?;
         for (namespace, suffix) in [("blobs", ""), ("manifests", ".json")] {
             let base = self.root.join(namespace);
             if !base.is_dir() {
@@ -604,6 +630,7 @@ impl Store {
             (self.root.join("manifests"), 0o755),
             (self.root.join("blobs"), 0o755),
             (self.root.join("checkouts"), 0o755),
+            (crate::staging::area(self), 0o755),
             (self.root.join("tmp"), 0o755),
             (self.root.join("tmp/leases"), 0o1733),
             (self.root.join("tmp/writers"), 0o755),
@@ -960,24 +987,28 @@ impl Store {
 
     // ------------------------------------------------------------ admission
 
-    pub fn put_stream<R: Read>(
+    /// THE STREAMING-AND-VERIFY CORE, shared by every destination bytes can land in.
+    ///
+    /// Open a locked temp under `tmp/`, hash every chunk as it is written, fsync it, and
+    /// refuse anything that is not exactly the `ObjectRef` the caller expected. What comes
+    /// back is a durable, still-locked, still-0600 temp whose bytes are PROVEN — and
+    /// nothing about where it will end up. Destinations differ only in where they link
+    /// that temp and what they record about it (`put_stream_held` into `blobs/` with a
+    /// verification record; [`crate::staging`] into `staging/` with none).
+    ///
+    /// **The narrow door must not be the weak one.** A second hashing loop for carriers
+    /// would be a second opinion about identity, and the two would disagree exactly once,
+    /// silently, on the artifact that mattered. There is one loop and this is it.
+    ///
+    /// `prefix` names the temp so [`Store::reap`] can recognise it as the store's own
+    /// scratch; anything else under `tmp/` belongs to whoever put it there.
+    pub(crate) fn stream_verified<R: Read>(
         &self,
         r: &mut R,
         expect: Option<&ObjectRef>,
         fault: &Fault,
-    ) -> Result<Put> {
-        self.put_stream_held(r, expect, fault, None)
-    }
-
-    pub fn put_stream_held<R: Read>(
-        &self,
-        r: &mut R,
-        expect: Option<&ObjectRef>,
-        fault: &Fault,
-        operation: Option<&str>,
-    ) -> Result<Put> {
-        let catalog = crate::catalog::Catalog::open(&self.root)?;
-        let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
+        prefix: &str,
+    ) -> Result<Verified> {
         // The temp is LOCKED for as long as this process needs it — through the write,
         // the fsync and the link. `reap` takes the same lock to decide: a temp whose lock
         // the kernel still holds has a live writer behind it, whatever its mtime says, and
@@ -985,7 +1016,7 @@ impl Store {
         // link has landed; a writer that dies at any stage releases the lock with it.
         let (tmp, mut f) = loop {
             let tmp = self.root.join("tmp").join(format!(
-                "put-{}-{}",
+                "{prefix}{}-{}",
                 std::process::id(),
                 now_nanos_unique()
             ));
@@ -1054,6 +1085,38 @@ impl Store {
                 );
             }
         }
+        Ok(Verified {
+            tmp,
+            file: f,
+            sha256: hex,
+            length: len,
+        })
+    }
+
+    pub fn put_stream<R: Read>(
+        &self,
+        r: &mut R,
+        expect: Option<&ObjectRef>,
+        fault: &Fault,
+    ) -> Result<Put> {
+        self.put_stream_held(r, expect, fault, None)
+    }
+
+    pub fn put_stream_held<R: Read>(
+        &self,
+        r: &mut R,
+        expect: Option<&ObjectRef>,
+        fault: &Fault,
+        operation: Option<&str>,
+    ) -> Result<Put> {
+        let catalog = crate::catalog::Catalog::open(&self.root)?;
+        let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
+        let Verified {
+            tmp,
+            file: f,
+            sha256: hex,
+            length: len,
+        } = self.stream_verified(r, expect, fault, PUT_TEMP)?;
         if let Some(operation) = operation {
             catalog.hold(operation, &crate::storage::blob_key(&hex)?, len)?;
         }
@@ -1480,13 +1543,19 @@ impl Store {
     /// holds on the temp for its whole life: the kernel releases it only when the
     /// descriptor closes, which a dead process does and a slow one does not. Age plays no
     /// part — a writer streaming a large object is older than any clock a reaper could
-    /// pick. Only the store's own `put-` temps are considered; anything else under `tmp/`
-    /// belongs to whoever put it there.
+    /// pick. Only the store's own temps are considered — [`PUT_TEMP`] for an admission and
+    /// [`STAGE_TEMP`] for a carrier; anything else under `tmp/` belongs to whoever put it
+    /// there.
+    ///
+    /// A carrier's temp is collected here for exactly the reason an admission's is, and it
+    /// is the larger leak: a crashed source fetch would otherwise strand a partial 5 GB
+    /// shard under `tmp/` forever, with no name anywhere that would ever mention it.
     pub fn reap(&self) -> Result<(usize, usize)> {
         let (mut gone, mut kept) = (0, 0);
         for p in read_dir(&self.root.join("tmp"))? {
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.starts_with("put-") || !fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
+            let ours = name.starts_with(PUT_TEMP) || name.starts_with(STAGE_TEMP);
+            if !ours || !fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
                 continue;
             }
             let f = match File::options().read(true).open(&p) {

@@ -55,6 +55,20 @@
 //!            and {"event":"fetch.delivery","host":..,"http_status":..} per redirect hop,
 //!            so a supervisor can tell slow from wedged without a clock. stdout stays the
 //!            result. --progress-bytes <n> is that channel's resolution, never a verdict
+//!
+//! The STAGING area (tfs-067). A foreign source carrier is not a CAS object: it lands at
+//! `<root>/staging/<sha256>`, outside every namespace a census walks, with no catalog
+//! record and no `gc` candidacy — a temporary input that the store reads once and throws
+//! away. `tfs fetch url` is unchanged and still admits repo objects to the CAS.
+//!
+//!   tfs staging fetch <root> <sha256> <length> <url|->   same transport, same digest, same
+//!            [--progress] [--streams N] [--part-mib N]   fence; a different destination.
+//!            `present` answers a re-ask over a file that rehashes to the id, moving zero
+//!            bytes; `staged` answers one this call moved. `path` is printed in both cases
+//!   tfs staging drop <root> <sha256>    retire one spent carrier; one unlink, idempotent
+//!   tfs staging clear <root>            sweep the area plus orphan `stage-` temps
+//!   tfs staging list <root>             every carrier: id, length, absolute path
+//!
 //!   tfs push <root> <sha256> --grant-file <path> [--manifest] [--content-type ct]
 //!            the grant is the destination on line one, then one "name: value" per header
 //!            its signature covers; TFS_PUSH_GRANT carries the same text, and
@@ -327,6 +341,10 @@ fn main() -> ExitCode {
         ["fetch", "admit", r, p, i] => fetch::cmd_admit(Path::new(r), Path::new(p), i, &flags),
         ["fetch", "complete", r, p] => fetch::cmd_complete(Path::new(r), Path::new(p)),
         ["fetch", "url", r, i, l, u] => fetch::cmd_url(Path::new(r), i, l, u, &flags),
+        ["staging", "fetch", r, i, l, u] => fetch::cmd_staging_fetch(Path::new(r), i, l, u, &flags),
+        ["staging", "drop", r, i] => fetch::cmd_staging_drop(Path::new(r), i),
+        ["staging", "clear", r] => fetch::cmd_staging_clear(Path::new(r)),
+        ["staging", "list", r] => fetch::cmd_staging_list(Path::new(r)),
         ["source", "list", u] => fetch::cmd_source_list(u, &flags),
         ["source", "resolve", u] => fetch::cmd_source_resolve(u, &flags),
         ["source", "pull", r, u] => fetch::cmd_source_pull(Path::new(r), u, &flags),

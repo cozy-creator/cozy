@@ -190,6 +190,10 @@ fn prepare_readers_owns_exact_modes_and_refuses_internal_symlinks() {
         "manifests",
         "blobs",
         "checkouts",
+        // tfs-067: the staging area is TensorFS's to create at TensorFS's own mode, for
+        // run-185's reason — a directory born under whichever uid touched the Store first
+        // is one the pod's other identity cannot enter.
+        "staging",
         "tmp",
         "tmp/writers",
     ] {
