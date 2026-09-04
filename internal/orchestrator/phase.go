@@ -43,6 +43,13 @@ const (
 	// PhaseAcquiring: a machine is being chosen or bought, and the provider has not yet
 	// confirmed a container exists.
 	PhaseAcquiring = "acquiring"
+	// PhaseReplanning: an acquisition FAILED and the rental is buying again. It is its
+	// own phase because it is the one thing in this sequence that spends money and
+	// produces nothing, and because the request may quietly change datacenter doing it —
+	// which changes whether a repo cache is there at all. Measured on run 207: 32.1s of a
+	// 227.9s wait was one datacenter declining to create a pod, and an operator watching
+	// `queued` had no way to learn either that it happened or that the request moved.
+	PhaseReplanning = "replanning"
 	// PhaseProvisioning: the provider holds the request and has not reported the
 	// container running. This is the provider's queue, and it is not ours to shorten.
 	PhaseProvisioning = "provisioning"
@@ -378,11 +385,21 @@ func (c *Orchestrator) preparingFor(requestID string) string {
 // degraded rendering to apologize for: it is the honest one. Splitting it further would
 // mean deciding a phase from elapsed time, which is the thing this whole lane exists to
 // avoid.
-func PhaseOfHubRental(state, providerState, containerState string) string {
+func PhaseOfHubRental(state, providerState, containerState string, retrying bool) string {
 	if strings.TrimSpace(state) != "pending_acquisition" {
 		return ""
 	}
+	// A rental back in pending_acquisition CARRYING A FAILURE is on its second (or later)
+	// ordinal: the first one was bought, paid for, and refused. That is not the same
+	// wait as the first attempt and must not render as one.
+	if retrying {
+		return PhaseReplanning
+	}
 	if strings.TrimSpace(providerState) == "" {
+		// Nothing bought yet. This is the hub's own placement and selection, and it is
+		// NOT a rounding error: four consecutive runs on one SKU spent between 4.6s and
+		// 25.3s here, before the provider was asked at all. Naming it is the only way
+		// anyone learns it exists.
 		return PhaseAcquiring
 	}
 	if providerRunning(providerState, containerState) {

@@ -170,19 +170,27 @@ func TestAPhaseWithNoCountersStillNamesItself(t *testing.T) {
 // phase rather than a guess.
 func TestTheProviderDrawsTheProvisioningBoundary(t *testing.T) {
 	for _, c := range []struct {
-		state, provider, container, want string
+		state, provider, container string
+		retrying                   bool
+		want                       string
 	}{
-		{"pending_acquisition", "", "", orchestrator.PhaseAcquiring},
-		{"pending_acquisition", "CREATED", "", orchestrator.PhaseProvisioning},
-		{"pending_acquisition", "RUNNING", "PULLING", orchestrator.PhaseProvisioning},
-		{"pending_acquisition", "RUNNING", "RUNNING", orchestrator.PhaseBooting},
-		{"pending_acquisition", "RUNNING", "", orchestrator.PhaseBooting},
-		{"ready", "RUNNING", "RUNNING", ""},
-		{"failed", "EXITED", "EXITED", ""},
+		{"pending_acquisition", "", "", false, orchestrator.PhaseAcquiring},
+		{"pending_acquisition", "CREATED", "", false, orchestrator.PhaseProvisioning},
+		{"pending_acquisition", "RUNNING", "PULLING", false, orchestrator.PhaseProvisioning},
+		{"pending_acquisition", "RUNNING", "RUNNING", false, orchestrator.PhaseBooting},
+		{"pending_acquisition", "RUNNING", "", false, orchestrator.PhaseBooting},
+		// A rental back in pending_acquisition carrying a failure is buying AGAIN. It
+		// outranks every other reading: an operator must not be shown a first attempt's
+		// vocabulary for a second attempt's spend. Measured on run 207 — 32.1s of a
+		// 227.9s wait was one datacenter declining, and the request silently moved.
+		{"pending_acquisition", "", "", true, orchestrator.PhaseReplanning},
+		{"pending_acquisition", "RUNNING", "RUNNING", true, orchestrator.PhaseReplanning},
+		{"ready", "RUNNING", "RUNNING", false, ""},
+		{"failed", "EXITED", "EXITED", true, ""},
 	} {
-		if got := orchestrator.PhaseOfHubRental(c.state, c.provider, c.container); got != c.want {
-			t.Errorf("PhaseOfHubRental(%q,%q,%q) = %q, want %q",
-				c.state, c.provider, c.container, got, c.want)
+		if got := orchestrator.PhaseOfHubRental(c.state, c.provider, c.container, c.retrying); got != c.want {
+			t.Errorf("PhaseOfHubRental(%q,%q,%q,retrying=%t) = %q, want %q",
+				c.state, c.provider, c.container, c.retrying, got, c.want)
 		}
 	}
 }

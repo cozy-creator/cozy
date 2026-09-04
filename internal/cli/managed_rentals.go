@@ -297,10 +297,22 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 		sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
 		m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID,
 		func(seen hub.Rental) {
+			// A failure carried by a rental that is BACK in pending_acquisition is the
+			// hub saying "that one did not work; I am buying again". The detail names
+			// what refused, so a replan is visible AND attributable rather than being
+			// 32 silent seconds inside a longer silence.
+			retrying := seen.Failure != nil
+			detail := seen.Detail
+			if retrying && seen.Failure.Code != "" {
+				detail = seen.Failure.Code
+				if seen.Failure.ProviderHostID != "" {
+					detail += " on " + seen.Failure.ProviderHostID
+				}
+			}
 			if name := orchestrator.PhaseOfHubRental(seen.State, seen.ProviderState,
-				seen.ContainerState); name != "" {
+				seen.ContainerState, retrying); name != "" {
 				m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{
-					Name: name, Machine: seen.Name, Detail: seen.Detail})
+					Name: name, Machine: seen.Name, Detail: detail})
 			}
 		})
 	if problem != nil {
