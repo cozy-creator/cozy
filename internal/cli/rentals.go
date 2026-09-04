@@ -707,23 +707,32 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 	if e != nil {
 		return output.List{}, e
 	}
+	// Provenance: which command bought each pod (cl-132). Without it a `ready` machine
+	// beside another `ready` machine is two anonymous charges, and the reader supplies
+	// the attribution from memory — which is exactly how a refused explicit ask came to
+	// be credited with two pods that auto-placement had bought.
+	boughtFor, e := st.RentalProvenance()
+	if e != nil {
+		return output.List{}, e
+	}
 	grace := ctx.Cfg.RentalsIdleRelease
 	list := output.List{
 		Name:   "rentals",
 		Fields: []string{"machine", "sku", "state", "uptime", "running", "queued", "idle"},
 		AllFields: []string{"machine", "sku", "state", "failure", "uptime", "running", "queued", "idle",
-			"rental", "accelerator", "address", "media", "hub", "rented", "ready",
+			"rental", "bought for", "accelerator", "address", "media", "hub", "rented", "ready",
 			"idle_since", "release_due", "image", "provider", "provider resource",
 			"provider host", "provider state", "container state"},
 		// The machine document carries the underlying facts, never the table's
 		// spellings: counts as numbers, moments as timestamps, absences omitted.
 		TypedFields: []string{"machine", "sku", "state", "rental_id", "rented_at",
 			"running", "queued", "idle_s", "release_due_at"},
-		TypedAllFields: []string{"machine", "sku", "state", "rental_id", "accelerator",
-			"address", "media_address", "hub", "rented_at", "ready_at", "running",
-			"queued", "idle_s", "idle_since_at", "release_due_at", "hourly_rate_usd_micros",
-			"failure_code", "base_worker_image_digest", "provider", "provider_resource_id",
-			"provider_host_id", "provider_state", "container_state"},
+		TypedAllFields: []string{"machine", "sku", "state", "rental_id", "bought_for",
+			"accelerator", "address", "media_address", "hub", "rented_at", "ready_at",
+			"running", "queued", "idle_s", "idle_since_at", "release_due_at",
+			"hourly_rate_usd_micros", "failure_code", "base_worker_image_digest",
+			"provider", "provider_resource_id", "provider_host_id", "provider_state",
+			"container_state"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		Lead: []string{fmt.Sprintf("Remote machines running: %d", count),
 			"Current spend per hour: " + usdPerHourBare(burn)},
@@ -748,7 +757,8 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			"state": r.State, "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
 			"running": strconv.Itoa(idle.Running), "queued": strconv.Itoa(idle.Queued),
 			"idle":   idleCell(idle, grace),
-			"rental": r.ID, "accelerator": r.AcceleratorModel,
+			"rental": r.ID, "bought for": orNone(boughtFor[r.ID]),
+			"accelerator": r.AcceleratorModel,
 			"address": r.Address, "media": r.MediaAddress, "hub": r.Hub,
 			"rented": stamp(r.RentedAt), "ready": orNone(stamp(r.ReadyAt)),
 			"idle_since": idleSince, "release_due": releaseDue,
@@ -763,7 +773,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		}
 		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
 			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub,
-			"rented_at": r.RentedAt, "ready_at": r.ReadyAt,
+			"rented_at": r.RentedAt, "ready_at": r.ReadyAt, "bought_for": boughtFor[r.ID],
 			"idle_since_at": idleSince, "release_due_at": releaseDue} {
 			if value != "" {
 				typed[key] = value

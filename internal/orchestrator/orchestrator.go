@@ -214,11 +214,125 @@ type RentalCoverage struct {
 
 // RentalDecision is the capacity decision's answer: the rental the placement is staged
 // on, whether it was bought for this request, and every ready rental it was chosen over.
+//
+// Excluded and SKU carry the other half of the case (cl-132). A decision that records
+// only its winner cannot be audited: on 2026-09-04 a `--rental-only` run bought a second
+// $0.95/hr pod while a ready rental sat idle, and the durable record of that choice read
+// `{"bought":true,"candidates":[]}` — an empty candidate list that means "there were no
+// ready rentals" and "every ready rental was excluded" in the same six characters. The
+// first is the market; the second is a decision somebody should be able to check.
 type RentalDecision struct {
 	RentalID   string
 	Bought     bool
 	Candidates []RentalCoverage
+	// Excluded are the fleet's ready rentals that were NOT candidates, each with the
+	// reason. An empty Candidates beside a populated Excluded is the difference
+	// between an empty fleet and a fleet that could not take this work.
+	Excluded []RentalExclusion
+	// SKU is the catalog choice behind a buy: every product on offer at that instant,
+	// cheapest first. Nil when no pod was bought.
+	SKU *SKUDecision
 }
+
+// Verdicts a SKU candidate can carry. The chosen product carries none.
+const (
+	// VerdictDearer: a cheaper compatible product won. This is the ordinary
+	// runner-up, and it is what makes an overpay readable — a dearer pick with a
+	// `dearer` row above it is a defect; a dearer pick that IS the cheapest row is
+	// the market, not the code.
+	VerdictDearer = "dearer"
+	// VerdictBaseMismatch is spelled with the pod's own reason appended.
+	VerdictBaseMismatch = "base_mismatch"
+)
+
+// SKUCandidate is one offered product as the choice saw it.
+type SKUCandidate struct {
+	Name string `json:"sku"`
+	// TotalUSDMicrosPerHour is what the renter PAYS — the ordering key, not the
+	// GPU rate alone (th-126).
+	TotalUSDMicrosPerHour int64 `json:"total_usd_micros_per_hour"`
+	// Verdict is empty on the chosen product and otherwise names why not this one.
+	Verdict string `json:"verdict,omitempty"`
+}
+
+// SKUDecision is the recordable answer to "what did the fleet buy, and what did it buy
+// that over?" (cl-132).
+//
+// It exists because the choice used to be a bare return value. On 2026-09-04 an
+// auto-placement bought a $0.953504/hr rtx-4090 while an rtx-a4000 at $0.463504/hr was
+// believed to be on offer, and NOTHING in any log or row distinguished the two
+// explanations — a broken compatibility filter, or a card that was simply out of stock
+// in that minute. Both leave a byte-identical trace once the winner is the only thing
+// written down, and the question was settled only by reading provider inventory
+// generations out of the hub's Postgres hours later. Only the CANDIDATE SET separates
+// them, so the candidate set is what gets recorded.
+//
+// Offered is every product of the requested class the live catalog carried at the
+// instant of the choice, cheapest first. A stock-out is therefore an ABSENCE from this
+// list — a fact the reader can see, rather than one they must infer by running a second
+// command minutes later and hoping the market has not moved underneath them.
+type SKUDecision struct {
+	Offered []SKUCandidate `json:"offered"`
+	Chosen  string         `json:"chosen,omitempty"`
+	// Mismatch is the first accelerator-compatible product the release's own
+	// requirements excluded, when nothing could be chosen.
+	Mismatch string `json:"mismatch,omitempty"`
+}
+
+// Cheapest is the lowest-priced offered product of the requested class, chosen or not.
+func (d SKUDecision) Cheapest() (SKUCandidate, bool) {
+	if len(d.Offered) == 0 {
+		return SKUCandidate{}, false
+	}
+	return d.Offered[0], true
+}
+
+// UnexplainedPick names a cheaper product that was passed over WITHOUT a stated reason,
+// and is empty when the record is sound. It is the invariant th-151 was filed to check:
+// buying a dearer machine is allowed — the cheap card is often simply out of stock — but
+// buying one while a cheaper compatible product sits in Offered with no verdict on it is
+// a defect in the chooser, and this is the predicate that says so.
+//
+// Sound records make it empty two ways, and the difference is the whole point: the
+// cheapest row IS the chosen one, or the cheapest row carries the reason it lost.
+func (d SKUDecision) UnexplainedPick() string {
+	if d.Chosen == "" {
+		return ""
+	}
+	for _, candidate := range d.Offered {
+		if candidate.Name == d.Chosen {
+			return ""
+		}
+		if candidate.Verdict == "" {
+			return candidate.Name
+		}
+	}
+	return ""
+}
+
+// RentalExclusion is one ready rental the capacity decision could not use, and why.
+type RentalExclusion struct {
+	RentalID string `json:"rental"`
+	Machine  string `json:"machine,omitempty"`
+	Reason   string `json:"reason"`
+}
+
+// Exclusion reasons. They are properties of the FLEET at the moment of the decision,
+// not of the request, so a reader can tell "nothing was available" from "nothing was
+// eligible".
+const (
+	// ExcludedModeConflict: the rental's worker already holds the other half of the
+	// `oneof mode` — a job where a serving set is wanted, or the reverse. This is the
+	// one that read as waste live: a `ready` pod with no running work, which a
+	// serving request nonetheless may not touch.
+	ExcludedModeConflict = "mode_conflict"
+	// ExcludedWrongClass: CPU rental for accelerator work, or the reverse.
+	ExcludedWrongClass = "wrong_class"
+	// ExcludedNotReady: the rental is not in a state that can take a placement.
+	ExcludedNotReady = "not_ready"
+	// ExcludedUnattached: ready, but with no address or pinned certificate yet.
+	ExcludedUnattached = "unattached"
+)
 
 // ModeCompatibleRentals filters ready rentals by the one desired MODE a worker can hold.
 // DesiredWorkerState is a full-replace `oneof mode` — a JobDirective or a serving
@@ -228,25 +342,36 @@ type RentalDecision struct {
 // not, because the wire forbids it — a mode-conflicted rental is simply not a candidate,
 // and the capacity decision moves to the next rental or the buy (owner's --rental
 // ruling). An unattached rental has no mode yet and takes it from its first desire.
+// A silently shortened list is the whole defect, so the exclusion-reporting form below
+// is the one a caller that records a decision must use (cl-132).
 func (c *Orchestrator) ModeCompatibleRentals(ids []string, job bool) []string {
+	out, _ := c.ModeCompatibleRentalsWithExclusions(ids, job)
+	return out
+}
+
+// ModeCompatibleRentalsWithExclusions is ModeCompatibleRentals with the dropped rentals
+// named. Callers that record a decision use this one.
+func (c *Orchestrator) ModeCompatibleRentalsWithExclusions(ids []string, job bool) (
+	[]string, []RentalExclusion,
+) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := make([]string, 0, len(ids))
+	var excluded []RentalExclusion
 	for _, id := range ids {
 		w := c.workers[rentalInstanceID(id)]
 		if w != nil && !w.exited && !w.stopping {
 			serving := len(w.desiredPackages) > 0 || w.desiredLocal != nil ||
 				w.desiredPrivatePlacement != nil || len(w.observedRemote) > 0
-			if job && serving {
-				continue
-			}
-			if !job && w.spec.IsJob() {
+			if job && serving || !job && w.spec.IsJob() {
+				excluded = append(excluded, RentalExclusion{
+					RentalID: id, Reason: ExcludedModeConflict})
 				continue
 			}
 		}
 		out = append(out, id)
 	}
-	return out
+	return out, excluded
 }
 
 // RankRentals orders ready rentals for a NEW placement by the no-holder rule (§3.2, D4):
