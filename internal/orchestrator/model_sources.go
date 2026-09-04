@@ -139,6 +139,16 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 		}
 		value := map[string]any{"stage": "source download", "member": frame.Member,
 			"state": state, "transferred_bytes": transferred, "total_bytes": total}
+		// The delivery host, HTTP status and attempt reached the status row and the pod
+		// log but never the operator's live view, so a throttled origin and a slow link
+		// looked identical while a transfer was running. They ride every frame because
+		// the row keeps one record per member and a later byte frame would blank them.
+		if frame.SafeCode != "" {
+			value["safe_code"] = frame.SafeCode
+		}
+		if frame.SafeDetail != "" {
+			value["safe_detail"] = frame.SafeDetail
+		}
 		if total > 0 {
 			value["fraction"] = float64(transferred) / float64(total)
 		}
