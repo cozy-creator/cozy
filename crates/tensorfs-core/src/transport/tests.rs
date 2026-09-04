@@ -6,7 +6,7 @@
 use super::hub::{Anonymous, HostToken};
 use super::ledger::{Deadline, Ledger};
 use super::policy::{blocked, SourcePolicy};
-use super::pull::{fetch_url, pull, PullRequest};
+use super::pull::{fetch_url, pull, ObjectSource, PullRequest};
 use super::push::{push_object, UploadGrant};
 use crate::canon::Value;
 use crate::dtype::Dtype;
@@ -1172,8 +1172,12 @@ fn sixteen_way_walk_lands_everything_through_the_one_door() {
     let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
     let policy = SourcePolicy::default();
     let counted = AtomicUsize::new(0);
-    let observer = |_: &ObjectRef, _: u64| {
+    let from_origin = AtomicUsize::new(0);
+    let observer = |_: &ObjectRef, _: u64, door: ObjectSource| {
         counted.fetch_add(1, Ordering::Relaxed);
+        if door == ObjectSource::Origin {
+            from_origin.fetch_add(1, Ordering::Relaxed);
+        }
     };
     let mut request = request_for(&store, &origin.base, &policy);
     request.streams = 16;
@@ -1181,6 +1185,9 @@ fn sixteen_way_walk_lands_everything_through_the_one_door() {
     let report = pull(&request).unwrap();
     assert_eq!(report.fetched, 26);
     assert_eq!(counted.load(Ordering::Relaxed), 26);
+    // With no cache mounted every object came through the origin door, and the observer
+    // was told so per object rather than only in the final report.
+    assert_eq!(from_origin.load(Ordering::Relaxed), 26);
     let _ = std::fs::remove_dir_all(root);
 }
 
