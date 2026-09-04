@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -38,22 +39,35 @@ import (
 // --rental request runs `selectOrStart`, which acquires a rental or fails the request with
 // the acquisition's own reason. Recovery never leaves a request in a state where nothing
 // will speak about it again.
-func (c *Orchestrator) RecoverRentalWork(rentalID, cause string) {
-	if rentalID == "" {
-		return
-	}
-	pinned, problem := c.opt.Store.PinnedRentalWork(rentalID)
+// RecoverLostWork is the sweep, and it asks the question from the REQUEST side.
+//
+// The first cut of this keyed on OBSERVING a rental go `failed`, which has a hole: once the
+// rental RECORD is gone — `cozy rental end`, or any reconcile that forgets a released row —
+// there is no object left to observe, so nothing ever looked at the work again. That is
+// exactly how req-b2df33d17e663a8a1e047246 stayed `in_progress` for sixteen hours against a
+// container destroyed four minutes into its life. A request row always exists while the
+// request is active, so the request is what the sweep must enumerate.
+func (c *Orchestrator) RecoverLostWork() {
+	orphaned, problem := c.opt.Store.OrphanedRentalWork()
 	if problem != nil {
-		c.logf("cannot read the work pinned to rental %s: %s", rentalID, problem.Message)
+		c.logf("cannot read work pinned to lost rentals: %s", problem.Message)
 		return
 	}
-	if len(pinned) == 0 {
-		return
+	for _, req := range orphaned {
+		c.recoverPinned(req, req.Worker, c.lostRentalCause(req.Worker))
 	}
-	c.logf("rental %s is %s; recovering %d pinned request(s)", rentalID, cause, len(pinned))
-	for _, req := range pinned {
-		c.recoverPinned(req, rentalID, cause)
+}
+
+// lostRentalCause says WHY the rental cannot serve, in the words the operator will see.
+func (c *Orchestrator) lostRentalCause(rentalID string) string {
+	row, problem := c.opt.Store.RentalRow(rentalID)
+	if problem != nil || row == nil {
+		return "the rental record is gone"
 	}
+	if row.Failure.Code != "" {
+		return row.Failure.Code
+	}
+	return row.State
 }
 
 // recoverPinned answers for ONE request. The open attempt is looked up on the request
@@ -99,13 +113,14 @@ func (c *Orchestrator) recoverPinned(req records.Request, rentalID, cause string
 			// THE IN-FLIGHT CASE. Its worker accepted it and owes a terminal that can never
 			// arrive: the pod holding the journal was destroyed. Close it as lost and
 			// re-offer under the budget.
-			stranded, problem := c.opt.Store.StrandRentalAttempt(req.ID, attempt.Attempt,
-				"the rented machine was lost before this attempt reported a terminal ("+cause+")")
+			abandoned, problem := c.opt.Store.AbandonLostAttempt(req.ID, attempt.Attempt,
+				"the rented machine was lost before this attempt reported a terminal ("+cause+")",
+				records.RequeueAfterLoss)
 			if problem != nil {
-				c.logf("%s#%d could not be stranded: %s", req.ID, attempt.Attempt, problem.Message)
+				c.logf("%s#%d could not be abandoned: %s", req.ID, attempt.Attempt, problem.Message)
 				return
 			}
-			if !stranded {
+			if !abandoned {
 				return
 			}
 			c.settleDispatch(req.ID, uint64(attempt.Attempt), false)
@@ -156,4 +171,54 @@ func (c *Orchestrator) recoverPinned(req records.Request, rentalID, cause string
 	}
 	c.selectOrStart(req)
 	go c.drain()
+}
+
+// rentalCanServe answers whether the rental a request is pinned to could still take it.
+// A row that is absent, terminally failed, or released cannot, and that is a durable fact
+// this host can read without asking anything remote — which matters, because the thing it
+// would have to ask is the thing that is gone.
+func (c *Orchestrator) rentalCanServe(rentalID string) bool {
+	if rentalID == "" {
+		return false
+	}
+	row, problem := c.opt.Store.RentalRow(rentalID)
+	if problem != nil {
+		// An unreadable store is not an observation about the pod. Leave the attempt alone.
+		return true
+	}
+	return row != nil && row.State != "failed" && row.State != "released"
+}
+
+// CancelLostAttempt settles a request whose attempt can no longer be reached, as CANCELED,
+// from local durable state alone.
+//
+// Teardown reaches here when the control stream that held an attempt is gone. Recovery
+// wants a requeue in that situation; teardown wants the opposite, because the operator
+// asked for everything to stop and replanning the work into a daemon that is shutting down
+// answers a different question than the one they asked.
+//
+// The attempt's closure is what makes the cancellation reachable at all: both
+// `CancelQueuedRequest` and `FailQueuedRequest` refuse a request holding an open attempt,
+// which is precisely how one lost attempt made `cozy down` AND `cozy down --all` refuse and
+// left the daemon killable only by signal.
+func (c *Orchestrator) CancelLostAttempt(requestID string, attempt int64, reason string) *exit.Error {
+	canceled, problem := c.opt.Store.AbandonLostAttempt(requestID, attempt, reason,
+		records.CancelAfterLoss)
+	if problem != nil {
+		return problem
+	}
+	if !canceled {
+		// Not an open attempt this arm owns. The ordinary queued cancellation is then the
+		// right verb, and it is the caller's existing path.
+		return c.CancelQueued(requestID, "cozy down --all")
+	}
+	c.settleDispatch(requestID, uint64(attempt), false)
+	c.forget(requestID)
+	c.frames.forget(requestID)
+	c.logf("%s#%d was canceled with its execution context already gone: %s",
+		requestID, attempt, reason)
+	c.signalClosed(requestWaitKey(requestID),
+		exit.New(exit.Canceled, "%s was canceled; its execution context was gone", requestID))
+	c.RetryOutputExport(requestID)
+	return nil
 }

@@ -2101,6 +2101,18 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	}
 	for _, req := range unsettled {
 		if req.Worker != "" {
+			// RECONNECTING ONLY WORKS IF THERE IS SOMETHING TO RECONNECT TO. pod-supervisor's
+			// ledger is what replays a remote attempt, and it lives on the pod: once the
+			// rental is gone or terminally failed, that ledger was destroyed with it and no
+			// amount of reconnecting will ever produce the terminal this attempt owes.
+			// Before this check the daemon said "reconnecting to its supervisor ledger" at
+			// every boot for a pod that had not existed for hours, and the request behind it
+			// could never settle (observed live: req-b2df33d17e663a8a1e047246, 2590 s and
+			// climbing on a destroyed container).
+			if !c.rentalCanServe(req.Worker) {
+				c.recoverPinned(req, req.Worker, c.lostRentalCause(req.Worker))
+				continue
+			}
 			c.logf("%s holds a remote attempt with no terminal; reconnecting to its supervisor ledger",
 				req.ID)
 			c.selectOrStart(req)

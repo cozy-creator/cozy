@@ -1077,6 +1077,20 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 	}
 	applied, e := c.opt.Store.FailQueuedRequest(requestID, payload)
 	if e != nil {
+		// A CONFLICT HERE IS PERMANENT AND MUST NOT BE RETRIED. The store refuses a queued
+		// failure for a request that holds an open attempt, and no amount of asking again
+		// changes that: the attempt owns the request's fate, and the only thing that can
+		// settle it is the attempt's own terminal or the lost-attempt sweep. Retrying it
+		// every two seconds forever is the swallowed-refusal shape from the other
+		// direction — a permanent condition restated 1200 times an hour, filling the log
+		// and never surfacing. Observed live against req-b2df33d17e663a8a1e047246, whose
+		// pod had been destroyed: "could not be settled: … has an attempt and is not a
+		// queued failure", every 2 s, indefinitely.
+		if e.Code == exit.Conflict {
+			c.logf("%s cannot be failed as queued work: %s; leaving it to the attempt that holds it",
+				requestID, e.Message)
+			return
+		}
 		c.logf("%s could not be settled: %s", requestID, e.Message)
 		time.AfterFunc(2*time.Second, func() { c.failQueued(requestID, cause) })
 		return

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -36,6 +37,10 @@ type DownResult struct {
 	CancellationRequested []LifecycleIdentity `json:"cancellation_requested"`
 	Active                []LifecycleIdentity `json:"active"`
 	Rentals               []LifecycleIdentity `json:"rentals"`
+	// Refused names what `--all` could not close cleanly. It is reported rather than
+	// returned as an error: a teardown that stops at the first problem is the failure this
+	// field exists to make visible.
+	Refused []string `json:"refused,omitempty"`
 }
 
 func (s *Server) unload(w http.ResponseWriter, r *http.Request) {
@@ -85,32 +90,65 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 
 	requested := []LifecycleIdentity{}
 	if body.All {
+		// `--all` IS A GUARANTEED TEARDOWN, NOT A BEST-EFFORT ONE (owner ruling
+		// 2026-09-04): "you should be able to cozy down --all or force it to shut down
+		// (cancel all requests, shutdown all rentals and close)". It is the verb a person
+		// reaches for BECAUSE reconciliation is not working, so it may not refuse for the
+		// same reason plain `down` did — which is exactly what happened live: one request
+		// whose pod had been destroyed made both verbs fail with "the stream that holds
+		// req-b2df33d1…#1 is gone", and the daemon could not be stopped by any documented
+		// means. It had to be killed.
+		//
+		// So: one failure never aborts the rest. Every request is tried, what could not be
+		// closed cleanly is REPORTED rather than swallowed, and the pass still ends in a
+		// shutdown decision.
+		var refused []string
 		for _, identity := range active {
 			row, read := s.store.RequestRow(identity.ID)
-			if read != nil {
-				s.refuseTyped(w, r, read)
-				return
-			}
-			if row == nil {
+			if read != nil || row == nil {
+				if read != nil {
+					refused = append(refused, identity.ID+": "+read.Message)
+				}
 				continue
 			}
 			changed, cancelProblem := s.cancelForDown(*row)
 			if cancelProblem != nil {
-				s.refuseTyped(w, r, cancelProblem.WithRemedy(
-					"some cancellation requests may already be recorded; the daemon remains alive for reconciliation"))
-				return
+				refused = append(refused, identity.ID+": "+cancelProblem.Message)
+				continue
 			}
 			if changed {
 				requested = append(requested, identity)
 			}
 		}
-		if len(active) > 0 || len(rentals) > 0 {
-			// Rental destruction belongs to Tensorhub/provider ownership. Returning the exact
-			// identities while leaving this process alive lets the CLI confirm remote absence,
-			// forget the local rows, and retry this same idempotent request.
+		// Re-read rather than trusting the pre-pass sample: what a client is told is still
+		// holding the daemon has to be what IS.
+		remaining, remainingRentals, problem := s.downBlockers()
+		if problem != nil {
+			remaining, remainingRentals = active, rentals
+		}
+		// THE FIXPOINT, and it always terminates. If this pass CHANGED something, there is
+		// more to do and the caller gets another turn — rental destruction belongs to
+		// Tensorhub/provider ownership, so the CLI ends the named pods and calls back, and
+		// requests cancelled here settle through their own durable terminals.
+		if len(requested) > 0 || s.newDownRentals(remainingRentals) {
 			s.ok(w, r, http.StatusAccepted, DownResult{
-				CancellationRequested: requested, Active: active, Rentals: rentals,
+				CancellationRequested: requested, Active: remaining,
+				Rentals: remainingRentals, Refused: refused,
 			})
+			return
+		}
+		// NOTHING MOVED. Asking again would produce this same answer forever, and `--all`
+		// does not get to leave an operator with a daemon they cannot stop — that is the
+		// whole reason they typed it. Anything still here is reported, including a paid pod
+		// the CLI could not end: rental rows are durable and the next boot reconciles them,
+		// so a pod that outlives the daemon is a fact to state, not a reason to stay up.
+		if s.shutdown != nil && (len(remaining) > 0 || len(remainingRentals) > 0) {
+			s.shuttingDown = true
+			s.ok(w, r, http.StatusAccepted, DownResult{
+				ShuttingDown: true, Active: remaining,
+				Rentals: remainingRentals, Refused: refused,
+			})
+			go s.shutdown()
 			return
 		}
 	}
@@ -169,6 +207,29 @@ func (s *Server) downBlockers() ([]LifecycleIdentity, []LifecycleIdentity, *exit
 	return active, rentals, nil
 }
 
+// newDownRentals records the paid pods this pass is handing back and answers whether the
+// caller has not already been given this exact set. A set it has seen before, with nothing
+// else changing, means the caller tried and could not end them — so the teardown stops
+// asking and finishes instead of looping on an answer that will not move.
+func (s *Server) newDownRentals(rentals []LifecycleIdentity) bool {
+	ids := make([]string, 0, len(rentals))
+	for _, identity := range rentals {
+		ids = append(ids, identity.ID)
+	}
+	sort.Strings(ids)
+	same := len(ids) == len(s.reportedDownRentals)
+	if same {
+		for i, id := range ids {
+			if s.reportedDownRentals[i] != id {
+				same = false
+				break
+			}
+		}
+	}
+	s.reportedDownRentals = ids
+	return !same && len(ids) > 0
+}
+
 // cancelForDown reuses the request authority's existing queued/live cancellation
 // boundaries. A terminal awaiting acknowledgement is already on its way to settlement;
 // it remains in Active and makes the caller retry rather than receiving a second verdict.
@@ -187,8 +248,20 @@ func (s *Server) cancelForDown(row records.Request) (bool, *exit.Error) {
 	case "terminal":
 		return false, nil
 	default:
-		return true, s.orchestrator.CancelClient(
+		problem := s.orchestrator.CancelClient(
 			row.ID, uint64(last.Attempt), orchestrator.ClientCancelGraceMS, "cozy down --all")
+		if problem == nil || problem.Code != exit.Unavailable {
+			return true, problem
+		}
+		// THE STREAM IS GONE, so there is nobody to ask and there never will be. Cancelling
+		// an attempt normally means telling its worker to stop; when this process no longer
+		// holds a session or a worker for it, the execution context is already lost and the
+		// only honest thing left is to record that. Teardown must not depend on anything
+		// remote being reachable — a pod that is gone cannot answer, and waiting for it is
+		// exactly the failure this branch exists to end.
+		return true, s.orchestrator.CancelLostAttempt(row.ID, last.Attempt,
+			"the daemon was torn down with `cozy down --all` while this attempt's execution "+
+				"context was already gone: "+problem.Message)
 	}
 }
 

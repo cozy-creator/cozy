@@ -194,6 +194,9 @@ CREATE TABLE IF NOT EXISTS weights_finalizations (
 const (
 	activeRequestStates = `'submitted','queued','dispatching','requeue_pending','finalizing'`
 	openAttemptStates   = `'preparing','offered','accepted','recovered_open','terminal'`
+	// settledRequestStates is the SQL spelling of settledRequestState: a row here owes
+	// nothing and no later observation may contradict it.
+	settledRequestStates = `'succeeded','failed','canceled','refused','abandoned'`
 )
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }

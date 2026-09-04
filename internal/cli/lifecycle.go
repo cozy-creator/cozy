@@ -123,41 +123,92 @@ func handleDown(ctx *Context) *exit.Error {
 	return downAll(ctx, client)
 }
 
+// downAll is the GUARANTEED teardown (owner ruling 2026-09-04): cancel every request, end
+// every rental, and close. It is the verb a person reaches for because reconciliation is
+// not working, so no single failure inside it may stop the rest — the previous version
+// returned on the first problem with "the daemon remains alive for reconciliation", which
+// is plain `down`'s job and left an operator with one wedged request unable to stop their
+// daemon by any documented means.
+// downAll is the GUARANTEED teardown (owner ruling 2026-09-04): cancel every request, end
+// every rental, and close. It is the verb a person reaches for because reconciliation is
+// not working, so no single failure inside it may stop the rest — the previous version
+// returned on the first problem with "the daemon remains alive for reconciliation", which
+// is plain `down`'s job and left an operator with one wedged request unable to stop their
+// daemon by any documented means.
 func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 	canceled := map[string]bool{}
 	ended := map[string]bool{}
+	var refused []string
+	note := func(what, why string) {
+		line := what + ": " + why
+		for _, seen := range refused {
+			if seen == line {
+				return
+			}
+		}
+		refused = append(refused, line)
+	}
 	for {
 		result, problem := client.Down(true)
 		if problem != nil {
-			return problem.WithRemedy("partial teardown stopped; the daemon remains alive for reconciliation")
+			// The daemon itself refused or is unreachable. Nothing further can be asked of
+			// it here, so report honestly rather than pretending a teardown happened.
+			return problem.WithRemedy(
+				"the daemon did not accept the teardown; `cozy down --all` again, or stop the process")
 		}
 		for _, identity := range result.CancellationRequested {
 			canceled[identity.ID] = true
+		}
+		for _, line := range result.Refused {
+			note("request", line)
 		}
 		for _, identity := range result.Rentals {
 			switch identity.Kind {
 			case "rental":
 				if problem := endRentalSilently(ctx, identity.ID); problem != nil {
-					return problem.WithRemedy("rental termination was not confirmed; the daemon remains alive")
+					note("rental "+identity.ID, problem.Message)
+					continue
 				}
 				ended[identity.ID] = true
 			case "rental_operation":
 				id, problem := resolveRentalOperation(ctx, identity.ID)
 				if problem != nil {
-					return problem.WithRemedy("the paid operation remains recorded and the daemon remains alive")
+					note("rental operation "+identity.ID, problem.Message)
+					continue
 				}
-				if id != "" {
-					if problem := endRentalSilently(ctx, id); problem != nil {
-						return problem.WithRemedy("rental termination was not confirmed; the daemon remains alive")
-					}
-					ended[id] = true
+				if id == "" {
+					continue
 				}
+				if problem := endRentalSilently(ctx, id); problem != nil {
+					note("rental "+id, problem.Message)
+					continue
+				}
+				ended[id] = true
 			}
 		}
 		if result.ShuttingDown {
-			return finishDaemonDown(ctx, []output.Field{
+			fields := []output.Field{
 				{K: "canceled", V: len(canceled)}, {K: "rentals_ended", V: len(ended)},
-			})
+			}
+			// SAY WHAT WAS DESTROYED, and what survived. This cancels the owner's in-flight
+			// work by design, and a paid pod that could not be ended is still billing after
+			// this process exits — silence about either is the wrong kind of tidy.
+			for _, identity := range result.Active {
+				note("request "+identity.ID, "still "+identity.State+" at shutdown")
+			}
+			for _, identity := range result.Rentals {
+				if !ended[identity.ID] {
+					note(identity.Kind+" "+identity.ID,
+						"NOT ended; it is still running and still billing")
+				}
+			}
+			if len(refused) > 0 {
+				fields = append(fields, output.Field{K: "not_closed_cleanly", V: len(refused)})
+				for _, line := range refused {
+					fmt.Fprintf(ctx.Err, "  %s\n", line)
+				}
+			}
+			return finishDaemonDown(ctx, fields)
 		}
 		// Local cancellations settle through their durable worker terminals. Rental
 		// work above is synchronous through confirmed provider absence.
