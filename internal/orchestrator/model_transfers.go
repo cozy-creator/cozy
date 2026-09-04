@@ -353,17 +353,20 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		if problem != nil {
 			return nil, problem
 		}
-		allVerified := len(statuses) == len(expected)
 		revisions := make(map[string]int64, len(statuses))
 		verified := make(map[string]bool, len(statuses))
 		for _, status := range statuses {
 			revisions[status.Member] = status.CapabilityRevision
 			verified[status.Member] = status.State == "verified"
-			allVerified = allVerified && status.State == "verified"
 		}
-		// The frames go out in ONE pass, in member order, and a preparation sent in the
+		// The frames go out in ONE pass, in member order, and the preparation sent in the
 		// same pass is read after all of them: the pod registers every member off its
 		// control read loop before it considers a preparation for the same operation.
+		//
+		// That ordering used to be a nicety and is now load-bearing. The preparation is what
+		// tells the pod WHICH PROFILES to prepare, and the pod cannot plan a conversion
+		// without them; the roster it plans over is exactly the members registered by the
+		// frames above.
 		stream := fmt.Sprintf("%s/%d", session.bootID, session.epoch)
 		first := restated != stream
 		for _, member := range members {
@@ -374,7 +377,7 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 			access := byMember[member]
 			session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourceFileRequest{
 				ModelSourceFileRequest: &pb.ModelSourceFileRequest{
-					RecordOwnerEpoch: recordOwnerEpoch,
+					RecordOwnerEpoch:   recordOwnerEpoch,
 					ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
 					OperationId: req.ID, SourceSelectionDigest: selection, Member: member,
 					ObjectId: "sha256:" + file.SHA256, Length: uint64(file.Length),
@@ -388,25 +391,37 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 				"TensorFS store and moves nothing",
 				req.ID, len(members), session.instanceID, session.epoch)
 		}
-		if allVerified {
-			if !asked {
-				asked = true
-				c.logf("model transfer %s: all %d source file(s) verified on %s; asking it to "+
-					"prepare %d profile(s) — the request stays queued until the pod answers",
-					req.ID, len(expected), session.instanceID, len(intent.SourceProfiles))
-			}
-			profiles := make([]*pb.ModelSourceProfile, 0, len(intent.SourceProfiles))
-			for slot, profile := range intent.SourceProfiles {
-				profiles = append(profiles, &pb.ModelSourceProfile{Slot: slot, Profile: profile})
-			}
-			sort.Slice(profiles, func(i, j int) bool { return profiles[i].Slot < profiles[j].Slot })
-			session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourcePrepareRequest{
-				ModelSourcePrepareRequest: &pb.ModelSourcePrepareRequest{
-					RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: session.epoch,
-					WorkerBootId: session.bootID, OperationId: req.ID,
-					SourceSelectionDigest: selection, Profiles: profiles,
-					SourceUri: intent.Source, DeclaredLicense: intent.SourceLicense}}})
+		// THE PROFILES GO OUT NOW, NOT WHEN THE LAST MEMBER VERIFIES.
+		//
+		// This was the binding all-or-nothing gate. The pod is never told which profiles to
+		// prepare except in this frame, so while it was withheld until every member had
+		// verified the pod could not plan anything, whatever it held already. A
+		// MiniMax H3 selection reached 44 of 48 over 2h56m and 210 GB and the pod was lost
+		// with nothing converted, because this frame had not been sent.
+		//
+		// The owner does not know or care how far along the pod is: it states its whole
+		// desire — this selection, these profiles — and the pod converts each carrier as it
+		// lands. A duplicate on reconnect attaches to the run already in flight rather than
+		// starting a second one, which is the same property that made re-stating the file
+		// requests above free.
+		if !asked {
+			asked = true
+			c.logf("model transfer %s: asking %s to prepare %d profile(s) over %d selected "+
+				"source file(s) — conversion begins with the first file to land, not the "+
+				"last, and the request stays queued until the pod answers",
+				req.ID, session.instanceID, len(intent.SourceProfiles), len(expected))
 		}
+		profiles := make([]*pb.ModelSourceProfile, 0, len(intent.SourceProfiles))
+		for slot, profile := range intent.SourceProfiles {
+			profiles = append(profiles, &pb.ModelSourceProfile{Slot: slot, Profile: profile})
+		}
+		sort.Slice(profiles, func(i, j int) bool { return profiles[i].Slot < profiles[j].Slot })
+		session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourcePrepareRequest{
+			ModelSourcePrepareRequest: &pb.ModelSourcePrepareRequest{
+				RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: session.epoch,
+				WorkerBootId: session.bootID, OperationId: req.ID,
+				SourceSelectionDigest: selection, Profiles: profiles,
+				SourceUri: intent.Source, DeclaredLicense: intent.SourceLicense}}})
 		if wait := c.waitTransfer(ctx, req.ID); wait != nil {
 			return nil, wait
 		}
