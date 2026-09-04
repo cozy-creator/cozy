@@ -133,7 +133,7 @@ fn carriers(f: &Flags) -> Result<Vec<CarrierInput>, ExitCode> {
 const BUILTIN_REGISTRY: &str = source_core::BUILTIN_REGISTRY;
 const BUILTIN_REGISTRY_BYTES: &[u8] = source_core::BUILTIN_REGISTRY_BYTES;
 
-fn registry_bytes(f: &Flags) -> Result<(String, Vec<u8>), ExitCode> {
+pub(crate) fn registry_bytes(f: &Flags) -> Result<(String, Vec<u8>), ExitCode> {
     let Some(path) = flag(f, "registry") else {
         return Ok((
             BUILTIN_REGISTRY.to_string(),
@@ -172,7 +172,7 @@ fn registry_bytes_at(locator: &str) -> Result<Vec<u8>, ExitCode> {
     }
 }
 
-fn load_registry(f: &Flags) -> Result<FingerprintRegistry, ExitCode> {
+pub(crate) fn load_registry(f: &Flags) -> Result<FingerprintRegistry, ExitCode> {
     let (locator, bytes) = registry_bytes(f)?;
     match FingerprintRegistry::parse(&bytes) {
         Ok(registry) => Ok(registry),
