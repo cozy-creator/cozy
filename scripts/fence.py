@@ -541,7 +541,7 @@ def check_manifest():
         "Search ModelSearchCmd", "Download ModelDownloadCmd", "Remove ModelRemoveCmd",
         "List ModelListCmd", "Upload ModelUploadCmd", "Publish ModelPublishCmd", "Yank ModelYankCmd",
         "Execute RunExecuteCmd", "Cancel RunCancelCmd", "List RunListCmd", "Watch RunWatchCmd",
-        "Current RentalListCmd", "New RentalNewCmd", "End RentalEndCmd",
+        "List RentalListCmd", "New RentalNewCmd", "End RentalEndCmd",
     )
     bad = [f"[grammar] missing Kong command field {item!r}" for item in required if item not in fields]
     for retired in ("StackCmd", "ExitCmd", "WorkflowCmd", "VideoCmd", "JobCmd", "CommandsCmd", "StatusCmd"):
