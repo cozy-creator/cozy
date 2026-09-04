@@ -666,6 +666,33 @@ func (s *Store) Rentals() ([]Rental, *exit.Error) {
 	return out, nil
 }
 
+// RentalProvenance maps a held rental to the recorded reason it was bought (cl-132):
+// `cozy rental new rtx-a4000` for an explicit ask, `cozy run req-... (paul/sdxl)` for
+// one auto-placement bought. The reason has always been a column on the operation that
+// paid for the pod; nothing ever read it back, so a rental could not be attributed to
+// the command that caused it and two pods bought by a job and a run were read as the
+// product of a single explicit request that had actually been refused.
+//
+// An operation predating this, or one whose reason was never written, maps to "" — an
+// unknown provenance is reported as unknown, never guessed at from the shape of the id.
+func (s *Store) RentalProvenance() (map[string]string, *exit.Error) {
+	rows, err := s.db.Query(
+		`SELECT rental_id, reason FROM rental_operations WHERE rental_id <> ''`)
+	if err != nil {
+		return nil, exit.Internalf("cannot list rental provenance: %s", err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var id, reason string
+		if err := rows.Scan(&id, &reason); err != nil {
+			return nil, exit.Internalf("cannot read a rental operation row: %s", err)
+		}
+		out[id] = reason
+	}
+	return out, nil
+}
+
 // absentRentalStates is the one spelling of "the hub proved the provider holds
 // nothing for this rental": terminal states the hub commits only after
 // readback-agreed absence. A row in one is a record to close, never a machine

@@ -196,8 +196,38 @@ func (m *managedRentals) admit(skuName string) (string, hub.RentalSKU, *exit.Err
 			return line, sku, m.admitLocked(sku)
 		}
 	}
+	// An explicit ask is HONOURED OR REFUSED, never widened to a neighbouring card —
+	// and the refusal has to say so out loud (cl-132). The catalog is live provider
+	// inventory (th-150), so a name that was rentable ten minutes ago can be absent
+	// now; a reader who does not know that reads "no rental SKU" as "no such machine",
+	// retries something else, and later credits this refusal's pod-less minute to
+	// whatever pods auto-placement happened to buy around it. That is not hypothetical:
+	// it is what happened on 2026-09-04, and it cost an hour and two wrong issues.
 	return "", hub.RentalSKU{}, exit.Named(exit.Validation, "rental.sku_unavailable",
-		"Tensorhub currently offers no rental SKU %q", skuName)
+		"no rental SKU %q is on offer right now — NOTHING was rented and no other "+
+			"machine was substituted for it", skuName).
+		WithRemedy("the catalog is live provider inventory, so a name absent now may "+
+			"return within minutes; `cozy rental new` alone lists what is offered "+
+			"this minute (currently %s)", offeredNames(skus)).
+		WithNext("cozy rental new")
+}
+
+// offeredNames is the live catalog as a reader can scan it, so a refusal shows the shape
+// of the market it was refused against rather than asserting a bare absence.
+func offeredNames(skus []hub.RentalSKU) string {
+	if len(skus) == 0 {
+		return "none"
+	}
+	names := make([]string, 0, len(skus))
+	for _, sku := range skus {
+		names = append(names, sku.Name)
+	}
+	sort.Strings(names)
+	if len(names) > 12 {
+		return strings.Join(names[:12], ", ") +
+			fmt.Sprintf(" and %d more", len(names)-12)
+	}
+	return strings.Join(names, ", ")
 }
 
 // acquire is the capacity decision for a --rental request no rental holds a placement
@@ -234,20 +264,34 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 		}
 		return rows[i].ID < rows[j].ID
 	})
+	// Every rental the fleet holds but cannot use is recorded with its reason, not
+	// silently dropped (cl-132). A buy that reports "0 ready rentals" while the fleet
+	// holds two of them is the shape that read as waste live, and the reader could not
+	// tell an empty fleet from an ineligible one.
 	var ready []string
+	var excluded []orchestrator.RentalExclusion
+	machine := make(map[string]string, len(rows))
 	for _, row := range rows {
-		if (row.AcceleratorModel == "CPU") != needsCPU {
-			continue
+		machine[row.ID] = row.MachineName
+		switch {
+		case (row.AcceleratorModel == "CPU") != needsCPU:
+			excluded = append(excluded, orchestrator.RentalExclusion{
+				RentalID: row.ID, Reason: orchestrator.ExcludedWrongClass})
+		case row.State != hub.RentalReady && row.State != "attached":
+			excluded = append(excluded, orchestrator.RentalExclusion{
+				RentalID: row.ID, Reason: orchestrator.ExcludedNotReady})
+		case row.Address == "" || row.CertPath == "":
+			excluded = append(excluded, orchestrator.RentalExclusion{
+				RentalID: row.ID, Reason: orchestrator.ExcludedUnattached})
+		default:
+			ready = append(ready, row.ID)
 		}
-		if row.State != hub.RentalReady && row.State != "attached" {
-			continue
-		}
-		if row.Address == "" || row.CertPath == "" {
-			continue
-		}
-		ready = append(ready, row.ID)
 	}
-	ready = m.owner.ModeCompatibleRentals(ready, req.IsJob())
+	ready, modeExcluded := m.owner.ModeCompatibleRentalsWithExclusions(ready, req.IsJob())
+	excluded = append(excluded, modeExcluded...)
+	for i := range excluded {
+		excluded[i].Machine = machine[excluded[i].RentalID]
+	}
 	if len(ready) > 0 {
 		ranked := m.owner.RankRentals(ready, req.Models)
 		chosen := ranked[0].RentalID
@@ -260,11 +304,13 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 				"request %s settled before rental assignment", req.ID)
 		}
 		line, lineProblem := m.lineLocked()
-		return orchestrator.RentalDecision{RentalID: chosen, Candidates: ranked}, line, lineProblem
+		return orchestrator.RentalDecision{RentalID: chosen, Candidates: ranked,
+			Excluded: excluded}, line, lineProblem
 	}
 
-	sku, mismatch, found := rental.CheapestCompatibleSKU(skus, req.NeedsAccelerator,
+	sku, skuDecision, found := rental.Choose(skus, req.NeedsAccelerator,
 		releaseConstraints(m.ctx, req))
+	mismatch := skuDecision.Mismatch
 	if !found && mismatch != "" {
 		// Refused BEFORE the paid ask, in the pod's own vocabulary. Publication stays
 		// base-independent: the release is published and simply unqualified here.
@@ -286,14 +332,15 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 	if current == nil || settledRequest(current.State) {
 		return none, "", exit.New(exit.Canceled, "request %s settled before rental acquisition", req.ID)
 	}
-	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s\n", sku.Name, skuRate(sku))
+	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s%s\n", sku.Name, skuRate(sku),
+		cheaperNote(skuDecision))
 	// The buy and the boot are the request's own phase until a worker exists to carry
 	// one (cl-121). Every readiness poll reports what the hub currently says, so the
 	// wait between "renting" and "attachable" is named while it passes.
 	m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{Name: orchestrator.PhaseAcquiring})
 	defer m.owner.ForgetPhase(req.ID)
 	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name,
-		"managed-rental-"+req.ID, "",
+		"managed-rental-"+req.ID, rental.AcquisitionReason(req),
 		sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
 		m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID,
 		func(seen hub.Rental) {
@@ -331,7 +378,8 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 			"request %s settled while rental %s was starting; the rental was released", req.ID, row.ID)
 	}
 	line, problem := m.lineLocked()
-	return orchestrator.RentalDecision{RentalID: row.ID, Bought: true}, line, problem
+	return orchestrator.RentalDecision{RentalID: row.ID, Bought: true,
+		Excluded: excluded, SKU: &skuDecision}, line, problem
 }
 
 func (m *managedRentals) catalogLocked() ([]hub.RentalSKU, *exit.Error) {
@@ -719,6 +767,26 @@ func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
 
 func usdPerHour(micros int64) string {
 	return usdPerHourBare(micros) + "/hour"
+}
+
+// cheaperNote appends the one fact that makes a buy auditable AS IT HAPPENS: what the
+// cheapest offered machine was, when it is not the one being bought. An empty string is
+// the common and correct case — the fleet bought the cheapest thing on offer.
+//
+// This is deliberately not a warning. Buying dearer is usually right: the cheap card is
+// out of stock, or the release cannot run on it. What was missing is the SENTENCE, so
+// that "we overpaid" and "the cheap one was gone" stop looking identical in the log.
+func cheaperNote(decision orchestrator.SKUDecision) string {
+	cheapest, ok := decision.Cheapest()
+	if !ok || decision.Chosen == "" || cheapest.Name == decision.Chosen {
+		return ""
+	}
+	note := "; cheapest offered was " + cheapest.Name + " at " +
+		usdPerHour(cheapest.TotalUSDMicrosPerHour)
+	if cheapest.Verdict != "" {
+		note += " — " + cheapest.Verdict
+	}
+	return note
 }
 
 // skuRate is a SKU's pre-spend rate the way a human must read it (th-126):

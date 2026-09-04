@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -802,15 +803,64 @@ func (c *Orchestrator) logDownloadDecision(req records.Request, decision RentalD
 		}
 	}
 	c.logf("%s: no worker holds %s for %s; rental %s stages it (bought=%t, holds=%t, "+
-		"manifests_missing=%d, bytes_missing=%d) over %d ready rental(s); the download "+
+		"manifests_missing=%d, bytes_missing=%d) over %d ready rental(s)%s%s; the download "+
 		"the download set goes with its desired state", req.ID, req.PlanID, req.Package,
 		decision.RentalID, decision.Bought, chosen.Holds, chosen.ManifestsMissing,
-		chosen.BytesMissing, len(decision.Candidates))
-	c.emit(req.ID, "request.routed", 0, map[string]any{
+		chosen.BytesMissing, len(decision.Candidates), exclusionNote(decision.Excluded),
+		skuNote(decision.SKU))
+	payload := map[string]any{
 		"decision": "download", "candidates": rows, "bought": decision.Bought,
 		"manifests_missing": chosen.ManifestsMissing, "bytes_missing": chosen.BytesMissing,
 		"pick": map[string]any{"rental": decision.RentalID, "worker": chosen.Worker},
-	})
+	}
+	// The two facts that used to be absent from the durable record (cl-132): which
+	// ready rentals could not take this work, and what the catalog offered when a pod
+	// was bought. Written only when there is something to say, so an ordinary decision
+	// keeps the shape a reader already knows.
+	if len(decision.Excluded) > 0 {
+		payload["excluded"] = decision.Excluded
+	}
+	if decision.SKU != nil {
+		payload["sku"] = decision.SKU
+	}
+	c.emit(req.ID, "request.routed", 0, payload)
+}
+
+// exclusionNote renders the ready rentals the decision could not use. "over 0 ready
+// rental(s)" is true of an empty fleet and of a fleet whose every machine was
+// ineligible, and only this suffix separates them.
+func exclusionNote(excluded []RentalExclusion) string {
+	if len(excluded) == 0 {
+		return ""
+	}
+	note := fmt.Sprintf(" (%d excluded: ", len(excluded))
+	for i, row := range excluded {
+		if i > 0 {
+			note += ", "
+		}
+		name := row.Machine
+		if name == "" {
+			name = row.RentalID
+		}
+		note += name + " " + row.Reason
+	}
+	return note + ")"
+}
+
+// skuNote renders the catalog the buy chose from, so an overpay is readable in the log
+// line itself rather than only in the emitted payload.
+func skuNote(decision *SKUDecision) string {
+	if decision == nil || decision.Chosen == "" {
+		return ""
+	}
+	note := fmt.Sprintf("; bought %s of %d offered", decision.Chosen, len(decision.Offered))
+	if cheapest, ok := decision.Cheapest(); ok && cheapest.Name != decision.Chosen {
+		note += ", cheapest " + cheapest.Name
+		if cheapest.Verdict != "" {
+			note += " (" + cheapest.Verdict + ")"
+		}
+	}
+	return note
 }
 
 // staged answers whether this worker was launched with the given plan id staged for it.
