@@ -252,6 +252,7 @@ fn main() -> ExitCode {
         ["key", kind, rest @ ..] => repo::cmd_key(kind, rest),
         ["reclaim", "usage", store] => repo::cmd_reclaim_usage(Path::new(store), &flags),
         ["reclaim", "plan", store] => repo::cmd_reclaim_plan(Path::new(store), &flags),
+        ["reclaim", "run", store] => repo::cmd_reclaim_run(Path::new(store), &flags),
         ["gc", root] => repo::cmd_gc(Path::new(root), &flags),
         ["gc", "headers", census] => repo::cmd_gc_headers(Path::new(census), &flags),
         ["gc", "holds", store] => repo::cmd_gc_holds(Path::new(store), &flags),

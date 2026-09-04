@@ -63,6 +63,8 @@ use std::collections::BTreeSet;
 
 use crate::canon::Value;
 use crate::err::{refuse, Code, Result};
+use crate::ids::ObjectRef;
+use crate::repo_cache::{CacheKind, CacheWrite};
 use crate::repository::RepositoryName;
 use crate::storage::{Census, HeldKey};
 use crate::store::Store;
@@ -147,6 +149,25 @@ impl Plan {
             ),
         ]))
     }
+}
+
+/// The victims a plan document names, read back for `run`.
+///
+/// Only the NAMES are read. Every byte figure in the document is a record of what was true
+/// when the plan was made; `run` re-derives the delete set from the census, so a stale plan
+/// costs a re-plan and can never cost the wrong bytes.
+pub fn victims_of(document: &[u8]) -> Result<Vec<RepositoryName>> {
+    let value = crate::canon::parse_canonical(document, crate::limits::DOC_MAX_BYTES)?;
+    let mut fields = crate::canon::Fields::new("ReclaimPlan", &value)?;
+    let victims = crate::canon::as_arr("ReclaimPlan", "victims", fields.req("victims")?)?;
+    let mut names = Vec::with_capacity(victims.len());
+    for victim in victims {
+        let mut row = crate::canon::Fields::new("ReclaimPlan.victim", victim)?;
+        let name = row.req_str("name")?.to_string();
+        let org = row.req_str("org")?.to_string();
+        names.push(RepositoryName::new(org, name)?);
+    }
+    Ok(names)
 }
 
 /// Every reclaim verb refuses on a Store that was never given a disk budget.
@@ -463,4 +484,213 @@ pub fn plan(store: &Store, need: u64, keep: &[RepositoryName], holds: &[HeldKey]
         reclaimable_bytes: cumulative,
         victims,
     })
+}
+
+// ------------------------------------------------------------------ the act (tfs-066)
+
+/// How a plan's bytes are proven to be gettable again before they are let go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// The object is already on the bound repo cache at its exact length.
+    Cache,
+    /// This run put it there.
+    Demoted,
+    /// The caller declared the roots recoverable from the hub. Their word, like free space.
+    Declared,
+}
+
+/// What `run` was asked to do beyond the plan itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunOptions {
+    /// Publish each object to the bound repo cache before dropping it, so the refetch is a
+    /// volume read rather than an R2 pull.
+    pub demote: bool,
+    /// The caller declares these roots recoverable from the hub. Same class of caller-input
+    /// as free space (decisions.md 241): TensorFS cannot see the hub, the caller can.
+    pub assume_upstream: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunReport {
+    pub roots_dropped: Vec<String>,
+    /// Objects published to the cache by THIS run.
+    pub demoted_objects: u64,
+    pub demoted_bytes: u64,
+    /// Objects that were already on the cache, so demotion had nothing to do.
+    pub already_cached_objects: u64,
+    pub reclaimed_bytes: u64,
+    pub reclaimed_objects: u64,
+}
+
+impl RunReport {
+    pub fn line(&self) -> String {
+        format!(
+            "dropped {} root{}, reclaimed {} B in {} objects ({} demoted to the cache here, \
+             {} already there)",
+            self.roots_dropped.len(),
+            if self.roots_dropped.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            self.reclaimed_bytes,
+            self.reclaimed_objects,
+            self.demoted_objects,
+            self.already_cached_objects,
+        )
+    }
+
+    pub fn json(&self) -> Vec<u8> {
+        crate::canon::write(&Value::obj(vec![
+            (
+                "already_cached_objects",
+                Value::uint(self.already_cached_objects),
+            ),
+            ("demoted_bytes", Value::uint(self.demoted_bytes)),
+            ("demoted_objects", Value::uint(self.demoted_objects)),
+            ("reclaimed_bytes", Value::uint(self.reclaimed_bytes)),
+            ("reclaimed_objects", Value::uint(self.reclaimed_objects)),
+            (
+                "roots_dropped",
+                Value::arr(
+                    self.roots_dropped
+                        .iter()
+                        .map(|root| Value::str(root.as_str()))
+                        .collect(),
+                ),
+            ),
+        ]))
+    }
+}
+
+/// Is this object gettable again without the pod's own history?
+///
+/// decisions.md 842 set the DURABLE-UPSTREAM INVARIANT — *"pressure eviction may target
+/// only objects with a recorded durable upstream; local-only artifacts are never
+/// pressure-evicted"* — with the falsifier *"a pressure sweep evicting a local-only
+/// artifact"*. tfs-020 then deleted the `hub_published` boolean along with the pressure
+/// plane it gated, so the invariant has had no mechanism since.
+///
+/// It comes back CONSTRUCTIVELY rather than as a flag someone must remember to set: the
+/// cache is checked, or this run puts the bytes there, or the caller says so. Demotion is
+/// the interesting one, because it does not FIND the invariant true — it MAKES it true, and
+/// it makes it true against the `/workspace` volume, which measurably survives the
+/// container-disk reset that destroys the Store (th-152, 2026-09-04).
+fn recovery(
+    store: &Store,
+    row: &crate::storage::GcDelete,
+    options: RunOptions,
+    report: &mut RunReport,
+) -> Option<Recovery> {
+    if options.assume_upstream {
+        return Some(Recovery::Declared);
+    }
+    let cache = store.repo_cache()?;
+    let kind = match row.kind {
+        "manifest" => CacheKind::Manifest,
+        _ => CacheKind::Blob,
+    };
+    let want = ObjectRef {
+        sha256: row.sha256.clone(),
+        length: row.length,
+    };
+    // Present at the exact length is the cheap check and the honest one: the cache's own
+    // admission path re-verifies the digest on the way back in, so a byte-level check here
+    // would pay for a promise something else already keeps.
+    if let Ok(path) = cache.path(kind, &row.sha256) {
+        if std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() == row.length) {
+            report.already_cached_objects += 1;
+            return Some(Recovery::Cache);
+        }
+    }
+    if !options.demote {
+        return None;
+    }
+    match cache.backfill_store(store, kind, &want) {
+        Ok(CacheWrite::Stored) => {
+            report.demoted_objects += 1;
+            report.demoted_bytes = report.demoted_bytes.saturating_add(row.length);
+            Some(Recovery::Demoted)
+        }
+        Ok(CacheWrite::Present) => {
+            report.already_cached_objects += 1;
+            Some(Recovery::Cache)
+        }
+        // A cache that cannot take the bytes is weather everywhere else in this crate and
+        // stays weather here — but for an EVICTION the consequence is different. On a fetch
+        // the authority is still R2; on an eviction this pod may hold the last copy. So a
+        // failed demote does not become a silent delete, it becomes a refusal.
+        Ok(CacheWrite::Unavailable) | Err(_) => None,
+    }
+}
+
+/// Demote, tombstone, collect — in that order, and the order is the argument.
+///
+/// 1. **Demote** while the objects are still live and still reachable. Nothing is deleted.
+/// 2. **Tombstone** — `DeleteRepository` per victim, through `apply_repository`'s
+///    compare-and-set. This is the *explicit act* decisions.md 1135 requires: bytes become
+///    collectable because somebody removed the thing that named them, never because a sweep
+///    inferred they were garbage.
+/// 3. **Collect** — the existing `gc::collect`, unchanged. It recomputes reachability from
+///    `repos/`, `manifests/` and `blobs/` alone.
+///
+/// **Step 3 is why a wrong plan cannot corrupt the Store.** The plan chooses which ROOTS
+/// stop being named; the census decides which OBJECTS that actually frees. A caller that
+/// names every root still cannot delete an object a hold protects or a retained manifest
+/// needs.
+pub fn run(store: &Store, drop: &[RepositoryName], options: RunOptions) -> Result<RunReport> {
+    permitted(store)?;
+    let mut report = RunReport::default();
+    if drop.is_empty() {
+        return Ok(report);
+    }
+
+    // The plan is re-derived here and never read out of the caller's document. A plan is a
+    // record of what WAS true; the census is what is true now.
+    let census = Census::open(store.root())?;
+    let (holds, _) = crate::gc::session_holds(store)?;
+    let condemned = census.reclaim_plan(drop, &holds)?;
+
+    let mut unrecoverable = Vec::new();
+    for row in &condemned {
+        if recovery(store, row, options, &mut report).is_none() {
+            unrecoverable.push(format!("{}:{}", row.kind, row.sha256));
+        }
+    }
+    if !unrecoverable.is_empty() {
+        let shown: Vec<&str> = unrecoverable.iter().take(3).map(String::as_str).collect();
+        return refuse(
+            Code::DURABILITY_UNPROVEN,
+            format!(
+                "{} of {} objects cannot be got back if they go — {} — so nothing was \
+                 dropped; bind a repo cache and pass --demote, or declare the roots \
+                 recoverable with --assume-upstream",
+                unrecoverable.len(),
+                condemned.len(),
+                shown.join(", "),
+            ),
+        );
+    }
+
+    let fault = crate::store::Fault::default();
+    for repo in drop {
+        let path = store.repository_path(repo);
+        let observed = std::fs::read(&path).ok();
+        if observed.is_none() {
+            continue;
+        }
+        store.apply_repository(
+            observed.as_deref(),
+            &crate::repository::Mutation::DeleteRepository { repo: repo.clone() },
+            &fault,
+        )?;
+        report
+            .roots_dropped
+            .push(format!("{}/{}", repo.org, repo.name));
+    }
+
+    let collected = crate::gc::collect(store.root(), false)?;
+    report.reclaimed_bytes = collected.reclaimed_bytes;
+    report.reclaimed_objects = collected.reclaimed_blobs + collected.reclaimed_manifests;
+    Ok(report)
 }

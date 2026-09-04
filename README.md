@@ -159,6 +159,64 @@ the number is the caller's job; refusing against it is TensorFS's.
 never weather: retrying it fails at the same byte forever, which is exactly what the
 generic `IO_FAILED` an out-of-space write used to raise bought on rented hardware.
 
+## Reclamation
+
+`gc` collects what nothing names. **`reclaim` chooses what to stop naming.** Two acts, two
+verbs — and every one of them refuses on a Store with no recorded disk budget.
+
+```text
+tfs reclaim usage <root> --rows <rows.jsonl> [--keep <keep.jsonl>] [--candidates <cand.jsonl>]
+tfs reclaim plan  <root> --need <bytes> [--keep <org>/<name>]... [--out <plan.json>]
+tfs reclaim run   <root> --plan <plan.json> [--demote] [--assume-upstream]
+```
+
+**Reclaimable bytes are a property of the candidate SET, never of a model.** On a
+content-addressed store two models can be backed by one object, so *"deleting a model might
+reclaim almost no space because it was de-duped with one we want to keep"*. `reclaim usage`
+answers both halves and neither is derivable from the other:
+
+- per candidate, `bytes_marginal` — what dropping THAT ONE frees while the keep set and
+  every other candidate stand;
+- one `kind:"all"` row, `bytes_total` — what dropping every candidate frees.
+
+Two models sharing a 200 KB base each exclude it from their own marginal, so the set frees
+200 KB more than the sum. **A caller that adds the rows up under-estimates by the whole of
+the sharing.** The `all` row also carries `occupancy_bytes`, `budget_bytes` and
+`headroom_bytes`, so a caller asking how full the Store is has one answer rather than two
+that can disagree; it is deliberately not a filesystem statistic.
+
+Every number comes from the same walk the collection performs, with the deletions not yet
+applied, so the estimate and the act cannot drift.
+
+`reclaim plan` ranks by **marginal bytes per drop**, ties broken by the oldest-recorded
+root — not by model size, which picks the wrong victim exactly when dedup is working, and
+not by recency alone, which ranks access when the budget is about bytes. A root that would
+free nothing never survives into a plan. If the whole droppable set frees less than
+`--need` the plan refuses `RECLAIM_INSUFFICIENT` naming the shortfall, rather than emptying
+the Store and failing anyway.
+
+`reclaim run` is demote, tombstone, collect, in that order:
+
+1. **Demote** (`--demote`) publishes each condemned object to the bound repo cache while it
+   is still live. The cache is on a network volume, which survives the container-disk reset
+   that destroys the Store, so an eviction becomes a demotion and the refetch is a local
+   read. It comes back through `RepoObjectCache::admit`, the ordinary verified door the
+   fetch already uses — the promote half needed no new code.
+2. **Tombstone** removes the repository documents. This is the explicit act: bytes become
+   collectable because somebody removed the thing that named them, never because a sweep
+   inferred they were garbage.
+3. **Collect** is `tfs gc`, unchanged. **This is why a wrong plan cannot corrupt a Store**:
+   the plan chooses which ROOTS stop being named, the census decides which OBJECTS that
+   frees, so an object a retained manifest or a live hold still needs is never touched.
+
+An object that could not be got back if it went is **kept and the run refuses**, naming
+what it could not prove. A failed demote is weather for a fetch — R2 is still the authority
+— and is not weather for an eviction, where this pod may hold the last copy.
+
+`reclaim run` takes the same store-wide exclusivity `gc` does and refuses `STORE_BUSY`
+naming the live holder, so it cannot run beside a reader that holds a lease.
+
+
 Python exposes the same resolver. Passing a root remains supported and always wins:
 
 ```python

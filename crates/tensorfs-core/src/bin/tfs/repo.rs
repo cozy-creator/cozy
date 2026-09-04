@@ -1164,6 +1164,47 @@ pub fn cmd_reclaim_plan(root: &Path, flags: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+pub fn cmd_reclaim_run(root: &Path, flags: &Flags) -> ExitCode {
+    let Some(plan) = flag(flags, "plan") else {
+        eprintln!("--plan <plan.json> is required");
+        return ExitCode::from(2);
+    };
+    let document = match fs::read(Path::new(plan)) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return bail(Refusal {
+                code: Code::IO_FAILED,
+                detail: format!("read {plan}: {error}"),
+            })
+        }
+    };
+    let drop = match reclaim::victims_of(&document) {
+        Ok(names) => names,
+        Err(error) => return bail(error),
+    };
+    let options = reclaim::RunOptions {
+        demote: crate::flag_on(flags, "demote"),
+        assume_upstream: crate::flag_on(flags, "assume-upstream"),
+    };
+    let store = match Store::open(root) {
+        Ok(store) => store,
+        Err(error) => return bail(error),
+    };
+    let report = match reclaim::run(&store, &drop, options) {
+        Ok(report) => report,
+        Err(error) => return bail(error),
+    };
+    if crate::flag_on(flags, "json") {
+        println!("{}", String::from_utf8_lossy(&report.json()));
+    } else {
+        println!("{}", report.line());
+        for dropped in &report.roots_dropped {
+            println!("  dropped {dropped}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
