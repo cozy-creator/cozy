@@ -1,0 +1,242 @@
+[
+ {
+  "member": "FL2VA/transformer/model-00001-of-00013.safetensors",
+  "header_bytes": 5672,
+  "full_length": 5227812968
+ },
+ {
+  "member": "FL2VA/transformer/model-00002-of-00013.safetensors",
+  "header_bytes": 4136,
+  "full_length": 5164578856
+ },
+ {
+  "member": "FL2VA/transformer/model-00003-of-00013.safetensors",
+  "header_bytes": 4152,
+  "full_length": 5164578872
+ },
+ {
+  "member": "FL2VA/transformer/model-00004-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "FL2VA/transformer/model-00005-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "FL2VA/transformer/model-00006-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "FL2VA/transformer/model-00007-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "FL2VA/transformer/model-00008-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "FL2VA/transformer/model-00009-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "FL2VA/transformer/model-00010-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "FL2VA/transformer/model-00011-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "FL2VA/transformer/model-00012-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "FL2VA/transformer/model-00013-of-00013.safetensors",
+  "header_bytes": 4248,
+  "full_length": 4242305176
+ },
+ {
+  "member": "FL2VA/transformer/model.safetensors.index.json",
+  "header_bytes": 38323,
+  "full_length": 38323
+ },
+ {
+  "member": "Ref2VA/transformer/model-00001-of-00013.safetensors",
+  "header_bytes": 5672,
+  "full_length": 5227812968
+ },
+ {
+  "member": "Ref2VA/transformer/model-00002-of-00013.safetensors",
+  "header_bytes": 4136,
+  "full_length": 5164578856
+ },
+ {
+  "member": "Ref2VA/transformer/model-00003-of-00013.safetensors",
+  "header_bytes": 4152,
+  "full_length": 5164578872
+ },
+ {
+  "member": "Ref2VA/transformer/model-00004-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "Ref2VA/transformer/model-00005-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "Ref2VA/transformer/model-00006-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "Ref2VA/transformer/model-00007-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "Ref2VA/transformer/model-00008-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "Ref2VA/transformer/model-00009-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "Ref2VA/transformer/model-00010-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "Ref2VA/transformer/model-00011-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "Ref2VA/transformer/model-00012-of-00013.safetensors",
+  "header_bytes": 4176,
+  "full_length": 5164578896
+ },
+ {
+  "member": "Ref2VA/transformer/model-00013-of-00013.safetensors",
+  "header_bytes": 4248,
+  "full_length": 4242305176
+ },
+ {
+  "member": "Ref2VA/transformer/model.safetensors.index.json",
+  "header_bytes": 38323,
+  "full_length": 38323
+ },
+ {
+  "member": "audio_vae/diffusion_pytorch_model.safetensors",
+  "header_bytes": 123000,
+  "full_length": 605429340
+ },
+ {
+  "member": "text_encoder/model-00001-of-00014.safetensors",
+  "header_bytes": 5616,
+  "full_length": 4932328944
+ },
+ {
+  "member": "text_encoder/model-00002-of-00014.safetensors",
+  "header_bytes": 7168,
+  "full_length": 4875990528
+ },
+ {
+  "member": "text_encoder/model-00003-of-00014.safetensors",
+  "header_bytes": 7192,
+  "full_length": 4875990552
+ },
+ {
+  "member": "text_encoder/model-00004-of-00014.safetensors",
+  "header_bytes": 7224,
+  "full_length": 4875990584
+ },
+ {
+  "member": "text_encoder/model-00005-of-00014.safetensors",
+  "header_bytes": 7224,
+  "full_length": 4875990584
+ },
+ {
+  "member": "text_encoder/model-00006-of-00014.safetensors",
+  "header_bytes": 7224,
+  "full_length": 4875990584
+ },
+ {
+  "member": "text_encoder/model-00007-of-00014.safetensors",
+  "header_bytes": 7224,
+  "full_length": 4875990584
+ },
+ {
+  "member": "text_encoder/model-00008-of-00014.safetensors",
+  "header_bytes": 7224,
+  "full_length": 4875990584
+ },
+ {
+  "member": "text_encoder/model-00009-of-00014.safetensors",
+  "header_bytes": 7224,
+  "full_length": 4875990584
+ },
+ {
+  "member": "text_encoder/model-00010-of-00014.safetensors",
+  "header_bytes": 7224,
+  "full_length": 4875990584
+ },
+ {
+  "member": "text_encoder/model-00011-of-00014.safetensors",
+  "header_bytes": 7224,
+  "full_length": 4875990584
+ },
+ {
+  "member": "text_encoder/model-00012-of-00014.safetensors",
+  "header_bytes": 7224,
+  "full_length": 4875990584
+ },
+ {
+  "member": "text_encoder/model-00013-of-00014.safetensors",
+  "header_bytes": 7224,
+  "full_length": 4875990584
+ },
+ {
+  "member": "text_encoder/model-00014-of-00014.safetensors",
+  "header_bytes": 40528,
+  "full_length": 3270697008
+ },
+ {
+  "member": "text_encoder/model.safetensors.index.json",
+  "header_bytes": 97831,
+  "full_length": 97831
+ },
+ {
+  "member": "vae/diffusion_pytorch_model-00001-of-00003.safetensors",
+  "header_bytes": 35904,
+  "full_length": 5061033024
+ },
+ {
+  "member": "vae/diffusion_pytorch_model-00002-of-00003.safetensors",
+  "header_bytes": 43936,
+  "full_length": 4955986528
+ },
+ {
+  "member": "vae/diffusion_pytorch_model-00003-of-00003.safetensors",
+  "header_bytes": 3112,
+  "full_length": 398539336
+ },
+ {
+  "member": "vae/diffusion_pytorch_model.safetensors.index.json",
+  "header_bytes": 74228,
+  "full_length": 74228
+ }
+]

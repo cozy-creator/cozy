@@ -431,6 +431,17 @@ tfs ingest plan --source-plan <source-plan.json>
 tfs ingest run <store> --source-plan <source-plan.json>
 ```
 
+**A carrier is read by its NAME, and the name decides where its shards are.** The reviewed member is
+the name; the file name is the name only when no member is given. This is what lets a sharded
+`*.safetensors.index.json` be read at all from a content-addressed location — a staged carrier lives
+at `staging/<sha256>`, so its file name is a hex digest with no extension and its directory holds no
+siblings. The same key answers the second question: a carrier named by MEMBER resolves its
+`weight_map` through the carrier set, so every shard the index names must itself be a carrier, named
+by member; a carrier named by FILE NAME resolves them beside itself, as a checkout on disk. So
+`--carrier <path>` over a real tree needs only the index, while `--carrier <member>=<path>` must also
+name the shards. Carriers no index names are ignored: a selection spans a whole model, and one
+component's index has no business with another component's carriers.
+
 `source-plan.json` is a bounded operational DTO, not a stored document kind. Its exact canonical
 JSON fields are:
 

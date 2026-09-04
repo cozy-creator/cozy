@@ -37,6 +37,46 @@ pub struct CarrierInput {
     pub path: PathBuf,
 }
 
+/// The carriers one plan may read, and the ONLY map from a member to a file.
+///
+/// **A path is an OBJECT's identity, never a MEMBER's and never a layout.** A fetched
+/// source file lives at `<root>/staging/<sha256>`: the name is a hex digest, it carries no
+/// extension, and the area is flat, so it has no siblings that mean anything. A path cannot
+/// say what a carrier is, and a sharded index's `weight_map` cannot be resolved beside it.
+/// Here the selection is the directory.
+///
+/// Member -> path, not path -> member: the map is deliberately one-way because it is not
+/// injective. Two members carrying identical bytes are ONE object at ONE path (H3 ships
+/// `FL2VA/transformer/model.safetensors.index.json` and its `Ref2VA/` counterpart as one
+/// 38,323-byte object), so 48 members present 47 paths — and reading that shared object
+/// under its two member names must, and does, yield two different shard sets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CarrierSet {
+    by_member: BTreeMap<String, PathBuf>,
+}
+
+impl CarrierSet {
+    /// Every carrier that named itself. A carrier with no member contributes nothing: it
+    /// is a location with no name, and nothing can name it back.
+    pub fn of(carriers: &[CarrierInput]) -> Self {
+        let mut by_member = BTreeMap::new();
+        for carrier in carriers {
+            if let Some(member) = &carrier.member {
+                by_member.insert(member.clone(), carrier.path.clone());
+            }
+        }
+        Self { by_member }
+    }
+
+    pub fn path_of(&self, member: &str) -> Option<&Path> {
+        self.by_member.get(member).map(PathBuf::as_path)
+    }
+
+    pub fn members(&self) -> &BTreeMap<String, PathBuf> {
+        &self.by_member
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedSource {
     pub component: String,
@@ -273,18 +313,39 @@ pub fn read_header_only(path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
     Ok((header, raw))
 }
 
-pub fn read_carrier(path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
-    if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".index.json"))
-    {
-        return carrier::read_sharded(path);
+/// Read one carrier's header, by NAME.
+///
+/// The reviewed member is the name; the file name is the name only when no member was
+/// given. This is not a preference, it is the difference between working and not: a fetched
+/// carrier is staged at `<root>/staging/<sha256>`, so a
+/// `*.safetensors.index.json` arrives with a bare hex digest for a file name, falls
+/// through every extension test, and is read as a safetensors file — whereupon its first
+/// eight bytes, `{\n  "met`, are taken for a u64 header length of 8,387,229,874,382,703,227
+/// and refused against the 16 MiB cap. That is H3 run 309, after 48/48 members and 210.3 GB.
+///
+/// The same key then decides where the shards are: a carrier read by member resolves them
+/// through `set`, a carrier read by file name resolves them beside itself. One key, both
+/// questions.
+pub fn read_carrier(carrier: &CarrierInput, set: &CarrierSet) -> Result<(SourceHeader, Vec<u8>)> {
+    let path = carrier.path.as_path();
+    let name = match &carrier.member {
+        Some(member) => member.as_str(),
+        None => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(""),
+    };
+    if name.ends_with(".index.json") {
+        let shards = match &carrier.member {
+            Some(member) => carrier::Shards::Selection {
+                index: member,
+                set: set.members(),
+            },
+            None => carrier::Shards::Siblings,
+        };
+        return carrier::read_sharded(path, shards);
     }
-    if path
-        .extension()
-        .is_some_and(|extension| extension == "json")
-    {
+    if name.ends_with(".json") {
         return read_header_only(path);
     }
     let header = carrier::read_header(path)?;
@@ -298,6 +359,19 @@ pub fn read_carrier(path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
         detail: format!("reread header of {}: {error}", path.display()),
     })?;
     Ok((header, raw))
+}
+
+/// A carrier named only by where it is: `tfs ingest --source <component>=<path>` over a real
+/// directory tree. The file name is the name and the directory is the shard scope, which is
+/// honest ONLY where a directory exists — which a Store object path is not.
+pub fn read_carrier_at(path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
+    read_carrier(
+        &CarrierInput {
+            member: None,
+            path: path.to_path_buf(),
+        },
+        &CarrierSet::default(),
+    )
 }
 
 pub fn source_digest(header: &SourceHeader, raw_header: &[u8]) -> String {
@@ -367,9 +441,13 @@ pub fn plan_tensor_schema(plan: &Plan) -> Value {
     }))
 }
 
+/// `sources` carries each component's CARRIER, not its path: a path alone cannot say what
+/// the file is, and this is the second place — after the plan's own header pass — that
+/// would otherwise read a CAS-resident index as a safetensors file.
 pub fn prepare_with_registry(
     target: &str,
-    sources: &[(String, PathBuf)],
+    sources: &[(String, CarrierInput)],
+    set: &CarrierSet,
     registry: &FingerprintRegistry,
     spec_variant: Option<usize>,
 ) -> Result<Prepared> {
@@ -378,8 +456,9 @@ pub fn prepare_with_registry(
     let specs = plain_specs(&seeds);
     let (mut files, mut raws, mut verdicts, mut fingerprints) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for (component, path) in sources {
-        let (full, raw) = read_carrier(path)?;
+    for (component, carrier) in sources {
+        let path = &carrier.path;
+        let (full, raw) = read_carrier(carrier, set)?;
         let projected = convert::single_file_component(component, &full).ok();
         let mut selected = None;
         if let Some(view) = projected {
@@ -523,9 +602,13 @@ fn plan_source_prepared(
             );
         }
     }
+    // The selection is the directory. Built once, before a single header is read, so the
+    // plan's header pass and `prepare_with_registry`'s cannot disagree about which file a
+    // `weight_map` value names.
+    let set = CarrierSet::of(carriers);
     let mut headers = Vec::with_capacity(carriers.len());
     for carrier in carriers {
-        headers.push(read_carrier(&carrier.path)?.0);
+        headers.push(read_carrier(carrier, &set)?.0);
     }
     let mut matches = Vec::new();
     for profile in &registry.source_profiles {
@@ -563,12 +646,12 @@ fn plan_source_prepared(
     }
     let (profile, mut assignments) = matches.remove(0);
     assignments.sort_by(|left, right| left.component.cmp(&right.component));
-    let sources: Vec<(String, PathBuf)> = assignments
+    let sources: Vec<(String, CarrierInput)> = assignments
         .iter()
         .map(|assignment| {
             (
                 assignment.component.clone(),
-                carriers[assignment.carrier].path.clone(),
+                carriers[assignment.carrier].clone(),
             )
         })
         .collect();
@@ -592,7 +675,7 @@ fn plan_source_prepared(
                 .map(|key| (component.component.clone(), key.clone()))
         })
         .collect();
-    let mut prepared = prepare_with_registry(&target, &sources, &registry, spec_variant)?;
+    let mut prepared = prepare_with_registry(&target, &sources, &set, &registry, spec_variant)?;
     prepared.plan.apply_order(&order)?;
     prepared.plan.check_converts_something()?;
     let plan = SourcePlan {
@@ -1138,7 +1221,7 @@ mod tests {
         profile: &str,
         encoding: &str,
     ) -> (Banked, SourceProfile) {
-        let (header, raw) = read_carrier(path).unwrap();
+        let (header, raw) = read_carrier_at(path).unwrap();
         let observed = fingerprint::fingerprint(component, &header).unwrap();
         let entry = Banked {
             keyset_digest: observed.keyset_digest.clone(),
@@ -1527,7 +1610,7 @@ mod tests {
             ("encoder", "provider/first.safetensors", &first_path),
             ("decoder", "provider/second.safetensors", &second_path),
         ] {
-            let (header, raw) = read_carrier(path).unwrap();
+            let (header, raw) = read_carrier_at(path).unwrap();
             let observed = fingerprint::fingerprint(component, &header).unwrap();
             registry.merge(Banked {
                 keyset_digest: observed.keyset_digest.clone(),
@@ -1576,6 +1659,213 @@ mod tests {
         (store, registry.to_bytes(), carriers)
     }
 
+    /// A SHARDED model, prepared end to end out of a content-addressed staging area — the
+    /// production shape, with nothing about it mocked.
+    ///
+    /// Every carrier sits at `staging/<hex>`: flat, named by a digest, no extension, no
+    /// directory, no siblings. Two components each own a `*.safetensors.index.json` naming
+    /// two shards, and the two indexes are BYTE-IDENTICAL, so six members present five
+    /// paths — H3's 48-into-47 exactly. Nothing but the member says which component an
+    /// index belongs to or which shards its `weight_map` reaches.
+    ///
+    /// Before this, no sharded model could reach conversion by this route at all: the plan
+    /// read the index as a safetensors carrier and refused on its first eight bytes, and had
+    /// that been fixed alone, `read_sharded` would have looked for the shards beside a hex
+    /// digest and found nothing.
+    #[test]
+    fn a_sharded_model_prepares_from_content_addressed_carriers() {
+        let root = temporary("sharded-cas");
+        let area = root.join("staging");
+        fs::create_dir_all(&area).unwrap();
+
+        fn tensor_bytes(key: &str, floats: usize, fill: u8) -> Vec<u8> {
+            let bytes = floats * 4;
+            let header = format!(
+                "{{{key:?}:{{\"data_offsets\":[0,{bytes}],\"dtype\":\"F32\",\"shape\":[{floats}]}}}}"
+            );
+            let mut out = (header.len() as u64).to_le_bytes().to_vec();
+            out.extend_from_slice(header.as_bytes());
+            out.extend(std::iter::repeat_n(fill, bytes));
+            out
+        }
+
+        // The staging area IS content addressed: one file per distinct object, whatever the
+        // members call it.
+        let stage = |bytes: &[u8]| -> PathBuf {
+            let path = area.join(crate::sha256::hex_digest(bytes));
+            if !path.exists() {
+                fs::write(&path, bytes).unwrap();
+            }
+            path
+        };
+
+        // One index document, shared verbatim by both components.
+        let index_bytes = br#"{"weight_map":{"bias":"model-00002-of-00002.safetensors","weight":"model-00001-of-00002.safetensors"}}"#.to_vec();
+        let mut files: Vec<VerifiedModelSourceFile> = Vec::new();
+        let mut push = |member: &str, bytes: &[u8], path: PathBuf| {
+            files.push(VerifiedModelSourceFile {
+                member: member.to_string(),
+                object_id: ObjectRef::of(bytes).id(),
+                length: bytes.len() as u64,
+                path,
+            });
+        };
+        for (directory, fill) in [("enc", 0x11u8), ("dec", 0x22u8)] {
+            let weight = tensor_bytes("weight", 512, fill);
+            let bias = tensor_bytes("bias", 256, fill ^ 0xFF);
+            let index = stage(&index_bytes);
+            push(
+                &format!("{directory}/model.safetensors.index.json"),
+                &index_bytes,
+                index,
+            );
+            let staged = stage(&weight);
+            push(
+                &format!("{directory}/model-00001-of-00002.safetensors"),
+                &weight,
+                staged,
+            );
+            let staged = stage(&bias);
+            push(
+                &format!("{directory}/model-00002-of-00002.safetensors"),
+                &bias,
+                staged,
+            );
+        }
+        files.sort_by(|left, right| left.member.cmp(&right.member));
+
+        assert_eq!(files.len(), 6, "six verified members");
+        let paths: std::collections::BTreeSet<&PathBuf> =
+            files.iter().map(|file| &file.path).collect();
+        assert_eq!(
+            paths.len(),
+            5,
+            "the shared index collapses six members onto five files"
+        );
+
+        let carriers: Vec<CarrierInput> = files
+            .iter()
+            .map(|file| CarrierInput {
+                member: Some(file.member.clone()),
+                path: file.path.clone(),
+            })
+            .collect();
+        let set = CarrierSet::of(&carriers);
+
+        // Bank each component off the JOINED header its own member reaches.
+        let mut registry = FingerprintRegistry::default();
+        let mut components = Vec::new();
+        for (component, directory) in [("encoder", "enc"), ("decoder", "dec")] {
+            let member = format!("{directory}/model.safetensors.index.json");
+            let carrier = CarrierInput {
+                member: Some(member.clone()),
+                path: set.path_of(&member).unwrap().to_path_buf(),
+            };
+            let (header, raw) = read_carrier(&carrier, &set).expect("a sharded carrier reads");
+            assert_eq!(header.shards.len(), 2, "{member} joins two shards");
+            for shard in &header.shards {
+                assert_eq!(
+                    shard.path.parent().unwrap(),
+                    area,
+                    "shards resolve inside the staging area, not beside a digest"
+                );
+            }
+            let observed = fingerprint::fingerprint(component, &header).unwrap();
+            registry.merge(Banked {
+                keyset_digest: observed.keyset_digest.clone(),
+                dialect: "safetensors.diffusers".into(),
+                component: component.into(),
+                converter: "diffusers.identity/1".into(),
+                tensor_schema_digest: observed.tensor_schema_digest,
+                logical_keys: observed.logical_keys as u64,
+                provenance: Provenance {
+                    kind: REAL.into(),
+                    source: "synthetic full bytes".into(),
+                    source_sha256: Some(
+                        source_digest(&header, &raw)
+                            .trim_start_matches("sha256:")
+                            .to_string(),
+                    ),
+                    note: "sharded CAS fixture".into(),
+                },
+            });
+            components.push(SourceProfileComponent {
+                component: component.into(),
+                source_member: Some(member),
+                source_member_prefix: None,
+                target_encoding: "plain/1".into(),
+                variants: vec![super::fingerprint::SourceProfileVariant {
+                    keyset_digest: observed.keyset_digest,
+                    construction_order: header
+                        .tensors
+                        .iter()
+                        .map(|tensor| tensor.key.clone())
+                        .collect(),
+                }],
+            });
+        }
+        registry.merge_source_profile(SourceProfile {
+            name: "sharded/pair/1".into(),
+            components,
+        });
+        let registry_bytes = registry.to_bytes();
+
+        let store = Store::init(&root.join("store")).unwrap();
+        let request = PrepareModelSource {
+            operation_id: "sharded-cas".into(),
+            source_selection_digest: format!("sha256:{}", "44".repeat(32)),
+            profiles: vec![ModelSourceProfile {
+                slot: "pair".into(),
+                profile: "sharded/pair/1".into(),
+            }],
+            files: files.clone(),
+        };
+
+        let prepared = prepare_model_source_with_registry(
+            &store,
+            &request,
+            "fixture:registry",
+            &registry_bytes,
+        )
+        .expect("a sharded model prepares from staged carriers");
+        assert!(!prepared.replayed);
+        assert_eq!(prepared.sources.len(), 1);
+        let reference = ObjectRef {
+            sha256: prepared.sources[0]
+                .manifest_digest
+                .trim_start_matches("sha256:")
+                .into(),
+            length: prepared.sources[0].manifest_length,
+        };
+        let manifest = store.read_manifest(&reference).unwrap();
+        crate::checkpoint::walk_cozytensors(&store, &manifest)
+            .unwrap()
+            .require_resident(&store)
+            .expect("every converted tensor byte landed");
+
+        // A selection short of one shard is refused BY MEMBER, and the refusal comes out of
+        // the header pass — before a tensor byte moves.
+        let mut short = request.clone();
+        short.operation_id = "sharded-cas-short".into();
+        let dropped = short
+            .files
+            .iter()
+            .position(|file| file.member == "enc/model-00002-of-00002.safetensors")
+            .unwrap();
+        let dropped = short.files.remove(dropped);
+        let refusal =
+            prepare_model_source_with_registry(&store, &short, "fixture:registry", &registry_bytes)
+                .expect_err("an index whose shard is not carried must refuse");
+        assert_eq!(refusal.code, Code::MISSING_FIELD);
+        assert!(
+            refusal.detail.contains(&dropped.member),
+            "the refusal names the missing member: {}",
+            refusal.detail
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Two members carrying identical bytes resolve to ONE file, and the plan must accept
     /// that. A Store is content addressed, so a path is an OBJECT's identity and never a
     /// member's: MiniMax-H3's `FL2VA/transformer/model.safetensors.index.json` and its
@@ -1592,7 +1882,7 @@ mod tests {
         let mut components = Vec::new();
         // Two components, two member names, ONE file — the H3 shape exactly.
         for (component, member) in [("encoder", "FL2VA/index"), ("decoder", "Ref2VA/index")] {
-            let (header, raw) = read_carrier(&shared).unwrap();
+            let (header, raw) = read_carrier_at(&shared).unwrap();
             let observed = fingerprint::fingerprint(component, &header).unwrap();
             registry.merge(Banked {
                 keyset_digest: observed.keyset_digest.clone(),

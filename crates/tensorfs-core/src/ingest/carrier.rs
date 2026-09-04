@@ -17,9 +17,10 @@
 //!    `checked_prod(shape) x sizeof(dtype)`, must lie inside the file, and must not overlap
 //!    its neighbour. A lying header is refused by multiplication, never by a failed read.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::canon::{self, as_arr, as_str, Fields, Value};
 use crate::dtype::{checked_bytes, Dtype};
@@ -435,6 +436,69 @@ pub fn parse_header(bytes: &[u8], data_start: u64, file_len: Option<u64>) -> Res
 
 // ---------------------------------------------------------------- sharded carriers
 
+/// Where a sharded index's `weight_map` values live.
+///
+/// **A path is an OBJECT's identity, never a layout.** A fetched carrier sits at
+/// `<root>/staging/<sha256>`, and that area is FLAT by design (tfs-067): no extension, no
+/// directory of its own, and every other carrier of the run beside it under an equally
+/// meaningless name. A `weight_map` value resolved against that parent finds nothing, and
+/// every shard of every sharded model is unreachable. The shards of a store-resident index
+/// are other MEMBERS of the same selection, each at its own hashed path — the selection is
+/// the directory.
+///
+/// So the caller says which world it is in, and the same fact that named the carrier names
+/// its shards: a carrier read by MEMBER resolves shards by member, a carrier read by FILE
+/// NAME resolves them beside itself. One key, both questions, nothing to drift.
+#[derive(Debug, Clone, Copy)]
+pub enum Shards<'a> {
+    /// Beside the index, by bare filename — a real directory tree, `tfs ingest` over a
+    /// checkout. The value grammar is closed to bare sibling names: a traversal inside a
+    /// `weight_map` is an exfiltration primitive, not a layout.
+    Siblings,
+    /// Other members of this same carrier set. Values join onto the index's own member the
+    /// way the resolver joined them when it planned the fetch (`providers::join_member`),
+    /// and the set is the whole authority: a name that is not a member of it opens nothing,
+    /// so traversal is refused by absence rather than by grammar.
+    Selection {
+        /// The index's own member — the directory a relative value is joined onto.
+        index: &'a str,
+        /// member -> path over every carrier this plan may read.
+        set: &'a BTreeMap<String, PathBuf>,
+    },
+}
+
+/// The file one `weight_map` value names. The ONLY place a shard reference becomes a path.
+fn locate_shard(index_path: &Path, shards: Shards<'_>, name: &str) -> Result<PathBuf> {
+    match shards {
+        Shards::Siblings => Ok(index_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(name)),
+        Shards::Selection { index, set } => {
+            let Some(member) = crate::providers::join_member(index, name) else {
+                return refuse(
+                    Code::KEY_GRAMMAR,
+                    format!("{index}: weight_map names {name:?}, which leaves the source"),
+                );
+            };
+            match set.get(&member) {
+                Some(path) => Ok(path.clone()),
+                // The selection is short of what its own index requires. Either the record
+                // owner narrowed to carriers without expanding this index into the shards it
+                // names, or the index does not belong to the revision that was fetched. Name
+                // the MEMBER: the path it would have had does not exist to be named.
+                None => refuse(
+                    Code::MISSING_FIELD,
+                    format!(
+                        "{index}: weight_map names shard {member:?}, which this carrier set \
+                         does not contain"
+                    ),
+                ),
+            }
+        }
+    }
+}
+
 /// Decode a sharded safe carrier through its `*.index.json`: strict bounded index decode,
 /// every shard through `read_header` (so every single-file law — geometry, overlap,
 /// gaplessness, caps — holds per shard), then EXACT COVER both directions: every
@@ -443,8 +507,7 @@ pub fn parse_header(bytes: &[u8], data_start: u64, file_len: Option<u64>) -> Res
 /// (shards' data regions laid end to end in sorted-filename order); the returned identity
 /// bytes are the exact index bytes plus each shard's exact 8-byte prefix + header bytes in
 /// that same order, so the source digest is content-bound and deterministic.
-pub fn read_sharded(index_path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
-    let dir = index_path.parent().unwrap_or_else(|| Path::new("."));
+pub fn read_sharded(index_path: &Path, shards: Shards<'_>) -> Result<(SourceHeader, Vec<u8>)> {
     let index_bytes =
         std::fs::read(index_path).map_err(|e| io(format!("read {}", index_path.display()), e))?;
     let v = canon::parse(&index_bytes, limits::CARRIER_HEADER_MAX_BYTES)?;
@@ -498,16 +561,29 @@ pub fn read_sharded(index_path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
         }
     };
 
-    // key -> shard filename, with the filename grammar closed: a bare sibling file, never
-    // a path (a traversal inside a weight_map is an exfiltration primitive, not a layout).
-    // A MAP, not a scan-per-tensor: find/dedup/cover below are each per-tensor over
-    // MAX_TENSORS=100,000, and a linear probe there is O(n²) at design cardinality.
+    // key -> shard filename. A MAP, not a scan-per-tensor: find/dedup/cover below are each
+    // per-tensor over MAX_TENSORS=100,000, and a linear probe there is O(n²) at design
+    // cardinality.
     let mut by_key: std::collections::HashMap<&str, &str> =
         std::collections::HashMap::with_capacity(weight_map.len());
     let mut names: Vec<&str> = Vec::new();
     for (k, v) in weight_map {
         let name = as_str("shard index", "weight_map value", v)?;
-        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        if name.is_empty() {
+            return refuse(
+                Code::KEY_GRAMMAR,
+                format!("shard index: weight_map key {k:?} names no shard"),
+            );
+        }
+        // The grammar belongs to the layout, not to the file. Beside the index the value
+        // must be a bare sibling name, because there a traversal is an exfiltration
+        // primitive. Inside a selection the carrier set is the whole authority and a name
+        // that is not a member of it opens nothing, so the same reference is refused by
+        // absence instead -- and relative references stay legal, exactly as the resolver
+        // read them when it planned the fetch.
+        if matches!(shards, Shards::Siblings)
+            && (name.contains('/') || name.contains('\\') || name.contains(".."))
+        {
             return refuse(
                 Code::KEY_GRAMMAR,
                 format!("shard index: shard name {name:?} is not a bare sibling filename"),
@@ -520,15 +596,23 @@ pub fn read_sharded(index_path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
     }
     names.sort_unstable();
 
+    // Locate every shard BEFORE opening any of them. An incomplete selection is decided by
+    // metadata alone, and the whole point of reading headers first is that such a refusal
+    // costs bytes measured in kilobytes -- never a run that streamed 210 GB and then found
+    // out.
+    let mut located: Vec<(&str, PathBuf)> = Vec::with_capacity(names.len());
+    for name in &names {
+        located.push((name, locate_shard(index_path, shards, name)?));
+    }
+
     let mut out = SourceHeader::default();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut raw = (index_bytes.len() as u64).to_le_bytes().to_vec();
     raw.extend_from_slice(&index_bytes);
     let mut virtual_base = 0u64;
-    for name in &names {
-        let path = dir.join(name);
-        let h = read_header(&path)?;
-        let mut f = File::open(&path).map_err(|e| io(format!("reopen {}", path.display()), e))?;
+    for (name, path) in &located {
+        let h = read_header(path)?;
+        let mut f = File::open(path).map_err(|e| io(format!("reopen {}", path.display()), e))?;
         let mut hb = vec![0u8; h.header_bytes as usize + 8];
         f.read_exact(&mut hb)
             .map_err(|e| io(format!("reread header of {}", path.display()), e))?;
@@ -588,7 +672,7 @@ pub fn read_sharded(index_path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
         }
         out.header_bytes += h.header_bytes;
         out.shards.push(Shard {
-            path,
+            path: path.clone(),
             data_start: h.data_start,
             virtual_base,
             virtual_len: region,
