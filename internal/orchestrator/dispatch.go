@@ -833,7 +833,7 @@ func exclusionNote(excluded []RentalExclusion) string {
 	if len(excluded) == 0 {
 		return ""
 	}
-	note := " (" + fmt.Sprintf("%d excluded: ", len(excluded))
+	note := fmt.Sprintf(" (%d excluded: ", len(excluded))
 	for i, row := range excluded {
 		if i > 0 {
 			note += ", "
@@ -853,8 +853,7 @@ func skuNote(decision *SKUDecision) string {
 	if decision == nil || decision.Chosen == "" {
 		return ""
 	}
-	note := "; bought " + decision.Chosen + " of " +
-		fmt.Sprintf("%d offered", len(decision.Offered))
+	note := fmt.Sprintf("; bought %s of %d offered", decision.Chosen, len(decision.Offered))
 	if cheapest, ok := decision.Cheapest(); ok && cheapest.Name != decision.Chosen {
 		note += ", cheapest " + cheapest.Name
 		if cheapest.Verdict != "" {
