@@ -645,6 +645,22 @@ pub fn run(store: &Store, drop: &[RepositoryName], options: RunOptions) -> Resul
         return Ok(report);
     }
 
+    // EXCLUSIVITY IS PROVED BEFORE ANYTHING IS DONE, not discovered at the end.
+    //
+    // Phase 3 is `gc::collect`, which takes the store-wide recovery lock — and a read lease
+    // holds a SHARED lock on that same file for the life of a placement, while a repository
+    // mutation does not. So without this probe the order of events on a busy pod was:
+    // demote, tombstone, then refuse — leaving the model un-named, the space still
+    // occupied, and a retry that finds no root to drop and reports success over an empty
+    // plan. A half-evicted store is a worse outcome than a refusal.
+    //
+    // The lock is taken and released rather than held, because the tombstone in phase 2 is
+    // an ordinary writer and cannot run under it. That leaves a window in which a reader
+    // may arrive; if it does, phase 3 refuses as before and the roots are already gone, so
+    // that refusal says how to finish. The probe removes the case that actually happens —
+    // a placement that has been live all along.
+    std::mem::drop(crate::catalog::WriterGuard::lock_rebuild(store.root())?);
+
     // The plan is re-derived here and never read out of the caller's document. A plan is a
     // record of what WAS true; the census is what is true now.
     let census = Census::open(store.root())?;
@@ -710,7 +726,20 @@ pub fn run(store: &Store, drop: &[RepositoryName], options: RunOptions) -> Resul
             .push(format!("{}/{}", repo.org, repo.name));
     }
 
-    let collected = crate::gc::collect(store.root(), false)?;
+    let collected = crate::gc::collect(store.root(), false).map_err(|error| {
+        if error.code == Code::STORE_BUSY {
+            return crate::err::Refusal {
+                code: Code::STORE_BUSY,
+                detail: format!(
+                    "{error} — a reader arrived after the roots were dropped, so \
+                     {} root(s) are gone and their bytes are not yet collected; \
+                     `tfs gc` finishes this once the store is quiet",
+                    report.roots_dropped.len()
+                ),
+            };
+        }
+        error
+    })?;
     report.reclaimed_bytes = collected.reclaimed_bytes;
     report.reclaimed_objects = collected.reclaimed_blobs + collected.reclaimed_manifests;
     Ok(report)

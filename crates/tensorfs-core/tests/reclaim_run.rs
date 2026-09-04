@@ -348,8 +348,17 @@ fn a_live_reader_holds_the_store_and_releasing_it_lets_the_run_through() {
         refusal.detail.contains("held by"),
         "the refusal must name the holder: {refusal}"
     );
-    // Nothing was dropped, so a retry after the reader leaves is a clean retry.
+    // NOTHING WAS DROPPED, so a retry after the reader leaves is a CLEAN retry. The bytes
+    // surviving is not enough to prove that: if the tombstone had already run, the model
+    // would be un-named, the space still occupied, and the retry would find no root to drop
+    // and report success over an empty plan. So the repository document is checked too.
     assert!(f.store.contains(&f.victim_only.sha256));
+    assert!(
+        f.store
+            .repository_path(&RepositoryName::new("acme", "victim").unwrap())
+            .exists(),
+        "the run tombstoned the root and then refused, leaving a half-evicted store"
+    );
 
     hold.release(&meta).unwrap();
     reclaim::run(
