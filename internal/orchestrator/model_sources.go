@@ -122,6 +122,17 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 		Length: int64(frame.Length), CapabilityRevision: int64(frame.CapabilityRevision),
 		State: state, Transferred: int64(frame.TransferredBytes), SafeCode: frame.SafeCode,
 		SafeDetail: frame.SafeDetail}); problem != nil {
+		// The store keeps a terminal verdict that arrived under a superseded revision, so
+		// what reaches here is a status the row genuinely did not need. It is still not
+		// dropped in silence when it carried a verdict or an identity this owner did not
+		// expect: the pod said something about a member, and the log is where a human
+		// looks for it. An ordinary late byte frame is the one case worth staying quiet
+		// about — it repeats by the thousand and decides nothing.
+		if state == "failed" || problem.ErrName() != "model_transfer.source_status_superseded" {
+			c.logf("model transfer %s: source %s reported %s under capability revision %d "+
+				"(%s: %s) and the row did not take it: %s", frame.OperationId, frame.Member,
+				state, frame.CapabilityRevision, frame.SafeCode, frame.SafeDetail, problem.Message)
+		}
 		return
 	}
 	if state == "failed" && frame.SafeCode != "capability_expired" {
