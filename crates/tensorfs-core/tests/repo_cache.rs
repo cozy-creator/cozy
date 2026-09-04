@@ -371,3 +371,133 @@ fn cli_emits_one_json_status_and_admits_verified_bytes() {
     assert_eq!(actual, bytes);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn the_write_through_publishes_every_offer_and_the_watermark_is_the_offer_prefix() {
+    let root = temporary("mirror");
+    let store = Store::init(&root.join("store")).unwrap();
+    let cache = RepoObjectCache::new(root.join("cache"));
+    let objects: Vec<ObjectRef> = (0..64u32)
+        .map(|n| {
+            put_blob(
+                &store,
+                &format!("write-through object {n}").repeat(8).into_bytes(),
+            )
+        })
+        .collect();
+
+    let mirror = tensorfs_core::repo_cache::Mirror::start(cache.clone(), store.root(), u64::MAX);
+    for object in &objects {
+        mirror.offer(CacheKind::Blob, object);
+    }
+    let (offered, bytes_offered) = mirror.offered();
+    assert_eq!(offered, objects.len() as u64);
+    mirror.drain();
+    let report = mirror.report();
+
+    assert_eq!(report.stored, objects.len() as u64);
+    assert_eq!(report.unavailable, 0);
+    assert_eq!(report.bytes_stored, bytes_offered);
+    // The prefix reaches every offer, and it is a PREFIX: with four writers finishing out of
+    // order, a total would have been right for the wrong reason.
+    assert_eq!(report.durable.objects, objects.len() as u64);
+    assert_eq!(report.durable.bytes, bytes_offered);
+    assert!(!report.durable.stalled);
+
+    // Every published object comes back through the ordinary verified door.
+    let fresh = Store::init(&root.join("fresh")).unwrap();
+    for object in &objects {
+        assert_eq!(
+            cache.admit(&fresh, CacheKind::Blob, object).unwrap(),
+            CacheRead::Hit
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_mount_that_refuses_stalls_the_watermark_and_publishes_nothing() {
+    let root = temporary("mirror-refuses");
+    let store = Store::init(&root.join("store")).unwrap();
+    // A regular file where the cache root should be: every directory under it refuses.
+    let broken = root.join("not-a-mount");
+    fs::write(&broken, b"not a directory").unwrap();
+    let object = put_blob(&store, b"an object nobody can publish");
+
+    let mirror = tensorfs_core::repo_cache::Mirror::start(
+        RepoObjectCache::new(&broken),
+        store.root(),
+        u64::MAX,
+    );
+    mirror.offer(CacheKind::Blob, &object);
+    mirror.drain();
+    let report = mirror.report();
+
+    assert_eq!(report.offered, 1);
+    assert_eq!(report.stored, 0);
+    assert_eq!(report.unavailable, 1);
+    // The watermark does NOT advance over an object the mount would not take. A journal
+    // written past this point would name bytes that are not there.
+    assert_eq!(report.durable.objects, 0);
+    assert_eq!(report.durable.bytes, 0);
+    assert!(report.durable.stalled);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn concurrent_offers_keep_the_offer_list_and_the_sequence_in_step() {
+    let root = temporary("mirror-concurrent");
+    let store = Store::init(&root.join("store")).unwrap();
+    let cache = RepoObjectCache::new(root.join("cache"));
+    let objects: Vec<ObjectRef> = (0..128u32)
+        .map(|n| {
+            put_blob(
+                &store,
+                &format!("concurrent offer {n}").repeat(4).into_bytes(),
+            )
+        })
+        .collect();
+
+    let mirror = Arc::new(tensorfs_core::repo_cache::Mirror::start(
+        cache,
+        store.root(),
+        u64::MAX,
+    ));
+    // Several producers, because `Mirror` is a public type and nothing in it says one. The
+    // sequence a producer is handed IS the offer list's index, and a journal link built over
+    // a range of sequences must name exactly the objects at those positions.
+    let start = Arc::new(Barrier::new(4));
+    let mut threads = Vec::new();
+    for lane in 0..4usize {
+        let mirror = Arc::clone(&mirror);
+        let start = Arc::clone(&start);
+        let objects = objects.clone();
+        threads.push(thread::spawn(move || {
+            start.wait();
+            let mut seen = Vec::new();
+            for object in objects.iter().skip(lane).step_by(4) {
+                seen.push((mirror.offer(CacheKind::Blob, object), object.clone()));
+            }
+            seen
+        }));
+    }
+    let mut claimed: Vec<(u64, ObjectRef)> = threads
+        .into_iter()
+        .flat_map(|thread| thread.join().unwrap())
+        .collect();
+    claimed.sort_by_key(|(seq, _)| *seq);
+    mirror.drain();
+
+    assert_eq!(claimed.len(), objects.len());
+    for (position, (seq, object)) in claimed.iter().enumerate() {
+        assert_eq!(*seq, position as u64, "sequences are not dense");
+        let at = mirror.offers(*seq, seq + 1);
+        assert_eq!(
+            at,
+            vec![(CacheKind::Blob, object.clone())],
+            "offer {seq} is not the object its producer was numbered for"
+        );
+    }
+    assert_eq!(mirror.report().durable.objects, objects.len() as u64);
+    let _ = fs::remove_dir_all(root);
+}

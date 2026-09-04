@@ -167,6 +167,9 @@ codes![
     SNAPSHOT_PINNED,
     STORE_BUSY,
     DURABILITY_UNPROVEN,
+    // the ingest durability journal (tfs-057): a chain that is not this conversion's is
+    // discarded whole, never partially adopted
+    JOURNAL_STALE,
     // transport (tfs-049): the one byte mover; every byte it moves still enters put_stream
     SOURCE_NOT_ALLOWED,
     REDIRECT_REFUSED,

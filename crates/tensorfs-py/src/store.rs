@@ -740,6 +740,17 @@ impl PyStore {
 
     /// Prepare one descriptor-reviewed foreign source entirely from verified supervisor
     /// paths. Access URLs and credentials are outside this facade and have no argument.
+    ///
+    /// `repo_cache` names the pod's optional mounted immutable object cache. Passing it
+    /// makes the conversion write its output through to that cache AS IT RUNS, so a pod
+    /// reclaimed mid-conversion costs the re-conversion of one checkpoint interval rather
+    /// than the whole artifact. Each returned row carries `journal`, `journal_links` and
+    /// `durable_bytes`: the caller hands `journal` to the hub as this operation's resume
+    /// pointer, advanced by compare-and-set on `durable_bytes`, which only moves forward.
+    // KEYWORD-ONLY and defaulted, deliberately. A mount point is not part of the request's
+    // shape and must never be positionally confusable with one that is; a caller built
+    // against a build without it keeps working and simply publishes nothing.
+    #[pyo3(signature = (operation_id, source_selection_digest, profiles, files, *, repo_cache = None))]
     #[allow(clippy::too_many_arguments)]
     fn prepare_model_source<'p>(
         &self,
@@ -748,6 +759,7 @@ impl PyStore {
         source_selection_digest: &str,
         profiles: Vec<(String, String)>,
         files: Vec<(String, String, u64, PathBuf)>,
+        repo_cache: Option<PathBuf>,
     ) -> PyResult<Bound<'p, PyDict>> {
         let request = PrepareModelSource {
             operation_id: operation_id.to_string(),
@@ -767,6 +779,7 @@ impl PyStore {
                     },
                 )
                 .collect(),
+            repo_cache,
         };
         let prepared = py
             .detach(|| model_source::prepare_model_source(&self.store, &request))
@@ -780,6 +793,16 @@ impl PyStore {
             row.set_item("profile", source.profile)?;
             row.set_item("manifest_digest", source.manifest_digest)?;
             row.set_item("manifest_length", source.manifest_length)?;
+            row.set_item(
+                "journal",
+                source
+                    .durable
+                    .head
+                    .as_ref()
+                    .map(tensorfs_core::ids::ObjectRef::id),
+            )?;
+            row.set_item("journal_links", source.durable.links)?;
+            row.set_item("durable_bytes", source.durable.bytes)?;
             rows.append(row)?;
         }
         out.set_item("sources", rows)?;

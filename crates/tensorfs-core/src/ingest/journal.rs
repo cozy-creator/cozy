@@ -353,6 +353,14 @@ impl Journal {
         Ok(())
     }
 
+    /// This journal's exact bytes, for the plane that publishes it somewhere this pod is
+    /// not (`crate::durability`). It is read back off the file rather than re-serialized
+    /// from `parts`, so what is published is what a `Journal::open` would replay — one
+    /// authority for the on-disk form, not two that could drift.
+    pub fn snapshot(&self) -> Result<Vec<u8>> {
+        fs::read(&self.path).map_err(|error| io("read conversion journal for publication", error))
+    }
+
     /// Every object this journal names, for the filesystem hold protocol.
     pub fn objects(&self) -> Vec<ObjectRef> {
         let mut out: Vec<ObjectRef> = self
@@ -374,6 +382,36 @@ impl Journal {
             Err(error) => Err(io("remove conversion journal", error)),
         }
     }
+}
+
+/// Install a journal a previous pod published, where `Journal::open` will replay it.
+///
+/// Every line is parsed BEFORE anything is written: a snapshot arrives from a cache, and a
+/// cache is not an authority — the bytes were verified against the digest that named them,
+/// which says they are the snapshot, not that the snapshot is well formed. Installing it
+/// makes no part true either: `convert` re-checks each one against `segments_still_stand`
+/// before reusing it, so a journal restored beside objects that did not survive re-converts
+/// exactly those ops.
+pub fn install(dir: &Path, plan_digest: &str, bytes: &[u8]) -> Result<()> {
+    hex64("conversion journal plan", plan_digest)?;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        AddedPart::parse(line)?;
+    }
+    if bytes.last().is_some_and(|byte| *byte != b'\n') {
+        return refuse(
+            Code::TRAILING_BYTES,
+            "a published conversion journal ends mid-record",
+        );
+    }
+    fs::create_dir_all(dir).map_err(|error| io("mkdir conversion journal", error))?;
+    let path = journal_path(dir, plan_digest);
+    let temporary = path.with_extension("jsonl.incoming");
+    fs::write(&temporary, bytes)
+        .map_err(|error| io("write published conversion journal", error))?;
+    fs::rename(&temporary, &path).map_err(|error| io("install published conversion journal", error))
 }
 
 /// A journalled part may be reused only if its objects are still admissible. This is

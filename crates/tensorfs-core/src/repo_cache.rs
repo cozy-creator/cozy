@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::err::{Code, Result};
 use crate::ids::{hex64, Doc, ObjectRef};
+use crate::limits;
 use crate::manifest::Manifest;
 use crate::sha256::{self, Sha256};
 use crate::store::{self, Fault, Store};
@@ -153,6 +154,41 @@ impl RepoObjectCache {
                 }
             }
         }
+    }
+
+    /// Read one cached blob's exact bytes, verified against the digest and length that
+    /// named it. Bounded by the caller's own declared length, which is why this is only for
+    /// the small canonical documents the cache carries beside tensor bytes — a journal link
+    /// — and never for a tensor object, which streams through `admit`.
+    pub fn read_blob(&self, want: &ObjectRef) -> Result<Vec<u8>> {
+        let path = self.path(CacheKind::Blob, &want.sha256)?;
+        if want.length > limits::DOC_MAX_BYTES as u64 {
+            return crate::err::refuse(
+                Code::SIZE_CAP,
+                format!("{}: {} B is past the document cap", want.id(), want.length),
+            );
+        }
+        let mut file = open_exact(&path, want.length).map_err(|failure| crate::err::Refusal {
+            code: match failure {
+                SoftFailure::Missing => Code::OBJECT_ABSENT,
+                SoftFailure::Corrupt => Code::OBJECT_CORRUPT,
+                SoftFailure::Unavailable => Code::IO_FAILED,
+            },
+            detail: format!("{}: the cache cannot answer for it", want.id()),
+        })?;
+        let mut bytes = Vec::with_capacity(want.length as usize);
+        file.read_to_end(&mut bytes)
+            .map_err(|error| crate::err::Refusal {
+                code: Code::IO_FAILED,
+                detail: format!("read cached {}: {error}", want.id()),
+            })?;
+        if sha256::hex_digest(&bytes) != want.sha256 {
+            return crate::err::refuse(
+                Code::OBJECT_CORRUPT,
+                format!("{}: the cached bytes are not the object named", want.id()),
+            );
+        }
+        Ok(bytes)
     }
 
     /// Best-effort publication from an already admitted local Store object.
@@ -334,4 +370,433 @@ fn stream_exact(
         return Err(SoftFailure::Corrupt);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- write-through
+
+/// How many objects may be waiting for the cache at once.
+///
+/// It is `MAX_TOTAL_REFS` on purpose and not a tuned number. A legal checkpoint may not
+/// reference more objects than that — the header refuses above it — so one conversion
+/// cannot offer more than that, so an offer can never find this queue full and can never
+/// block the producer. The bound is the DOCUMENT'S OWN bound, which makes it a derived
+/// fact rather than a guess, and 65,536 `ObjectRef`s is a few megabytes against artifacts
+/// measured in hundreds of gigabytes.
+const QUEUE: usize = limits::MAX_TOTAL_REFS;
+
+/// How many objects the mirror publishes at once. A mounted network filesystem answers a
+/// single writer well below its own ceiling; more than one write in flight is what makes
+/// the publication overlap the work that produced the bytes instead of trailing it.
+const STREAMS: usize = 4;
+
+/// How many times ONE object's publication is retried before the mount is called
+/// unavailable. It is a COUNT OF ANSWERS and never a clock — nothing in this file asks how
+/// long anything took: each attempt is a complete publish that either produced the final
+/// path or did not, and a mount that refuses the same object this many times running is not
+/// slow, it is not working.
+const ATTEMPTS: usize = 3;
+
+/// What the write-through published, counted per object. `stored` is what this run put on
+/// the cache; `present` was already there — the ordinary answer when two pods run the same
+/// deterministic plan — and `unavailable` is what the mount would not take.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MirrorReport {
+    pub offered: u64,
+    pub stored: u64,
+    pub present: u64,
+    pub unavailable: u64,
+    pub bytes_offered: u64,
+    pub bytes_stored: u64,
+    pub bytes_present: u64,
+    pub durable: Durable,
+}
+
+/// The WATERMARK, and the reason it is a prefix rather than a total.
+///
+/// `objects` counts offers, IN OFFER ORDER, that are all now on the cache. A later object
+/// landing first does not advance it, because a journal naming an object whose predecessor
+/// never made it would claim a durability the cache cannot honour. It is a count and a byte
+/// total; it makes no statement about time, and every decision built on it — checkpoint
+/// here, this run is making progress, that one is not — is a decision about observed work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Durable {
+    pub objects: u64,
+    pub bytes: u64,
+    /// Set once a publication has exhausted [`ATTEMPTS`], or once an offer could not be
+    /// queued at all. The prefix stops here for the rest of the run and no later checkpoint
+    /// happens. The conversion is untouched: it simply stops being resumable past this
+    /// point, which is cost and latency, never authority or availability.
+    pub stalled: bool,
+}
+
+struct Work {
+    seq: u64,
+    kind: CacheKind,
+    object: ObjectRef,
+}
+
+#[derive(Default)]
+struct Prefix {
+    /// The next sequence that must land for the durable prefix to advance.
+    next: u64,
+    /// Sequences that landed AHEAD of `next`, and what each was worth. With several writers
+    /// in flight completion order is not offer order; this is the reorder buffer that turns
+    /// one into the other. It holds at most what is genuinely out of order.
+    ahead: std::collections::BTreeMap<u64, u64>,
+    bytes: u64,
+    stalled: bool,
+}
+
+/// What the producer has said about its own progress, and the door a journal waits at.
+/// There is no timeout here and no sampling cadence: the producer says "another unit of
+/// work is done", or it says "I am finished", and nothing else wakes a waiter.
+#[derive(Default)]
+struct Pulse {
+    units: u64,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct MirrorState {
+    offered: std::sync::atomic::AtomicU64,
+    bytes_offered: std::sync::atomic::AtomicU64,
+    stored: std::sync::atomic::AtomicU64,
+    present: std::sync::atomic::AtomicU64,
+    unavailable: std::sync::atomic::AtomicU64,
+    bytes_stored: std::sync::atomic::AtomicU64,
+    bytes_present: std::sync::atomic::AtomicU64,
+    prefix: std::sync::Mutex<Prefix>,
+    /// Every offer in offer order. A journal link names objects by their place in this
+    /// list, so the list is the mirror's and not a second copy kept by the producer. Bounded
+    /// by [`QUEUE`] for the same reason the queue is.
+    offers: std::sync::Mutex<Vec<(CacheKind, ObjectRef)>>,
+    pulse: std::sync::Mutex<Pulse>,
+    woken: std::sync::Condvar,
+    /// The newest snapshot of the producer's own progress document, and the offer sequence
+    /// it was handed over at. A link may name it only once that sequence is inside the
+    /// durable prefix — the document is subject to exactly the rule its objects are.
+    progress: std::sync::Mutex<Option<(u64, ObjectRef)>>,
+    /// Durable bytes when the last progress snapshot was offered.
+    progress_at: std::sync::atomic::AtomicU64,
+    /// Durable bytes between snapshots — the same interval the journal links at, held here
+    /// so the producer asks one question (`progress_due`) instead of carrying a policy.
+    interval: u64,
+}
+
+impl MirrorState {
+    fn prefix(&self) -> std::sync::MutexGuard<'_, Prefix> {
+        self.prefix.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn stall(&self) {
+        self.prefix().stalled = true;
+    }
+
+    fn record(&self, seq: u64, length: u64, outcome: CacheWrite) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match outcome {
+            CacheWrite::Stored => {
+                self.stored.fetch_add(1, Relaxed);
+                self.bytes_stored.fetch_add(length, Relaxed);
+            }
+            CacheWrite::Present => {
+                self.present.fetch_add(1, Relaxed);
+                self.bytes_present.fetch_add(length, Relaxed);
+            }
+            CacheWrite::Unavailable => {
+                self.unavailable.fetch_add(1, Relaxed);
+            }
+        }
+        let mut prefix = self.prefix();
+        if outcome == CacheWrite::Unavailable {
+            prefix.stalled = true;
+            return;
+        }
+        if prefix.stalled {
+            return;
+        }
+        prefix.ahead.insert(seq, length);
+        loop {
+            let next = prefix.next;
+            let Some(bytes) = prefix.ahead.remove(&next) else {
+                break;
+            };
+            prefix.bytes += bytes;
+            prefix.next = next + 1;
+        }
+    }
+
+    fn durable(&self) -> Durable {
+        let prefix = self.prefix();
+        Durable {
+            objects: prefix.next,
+            bytes: prefix.bytes,
+            stalled: prefix.stalled,
+        }
+    }
+}
+
+/// Write-through publication of already-admitted local objects, on threads of its own.
+///
+/// **The producer never waits for the cache, and that is the whole design.** Cache I/O
+/// blocking the worker is a named falsifier of the minimal-local-state decision, and a
+/// mounted network filesystem is precisely the thing that stops answering without saying
+/// so. An offer is therefore a push onto a queue that provably cannot fill (see [`QUEUE`]),
+/// and every byte the cache costs is paid on these threads.
+///
+/// **What the mirror publishes is already proved.** It goes through
+/// [`RepoObjectCache::backfill_store`], which reads the local Store's VERIFIED descriptor
+/// and re-hashes on the way to the final path, so the cache can only receive bytes this pod
+/// already admitted at the digest that names them. There is no second admission path and no
+/// way for an unproved byte to reach the mount.
+pub struct Mirror {
+    sender: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<Work>>>,
+    threads: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    state: std::sync::Arc<MirrorState>,
+}
+
+impl Mirror {
+    /// Start publishing onto `cache` from the Store at `store_root`.
+    ///
+    /// The mirror opens its OWN Store handle rather than sharing the caller's, for one
+    /// reason: the caller's handle usually carries a progress observer, and bytes this
+    /// publication reads are not bytes the conversion moved. A root that will not open is
+    /// weather like any other — every offer is counted, none is durable, and the producer
+    /// is unaffected.
+    pub fn start(cache: RepoObjectCache, store_root: &Path, interval: u64) -> Mirror {
+        let state = std::sync::Arc::new(MirrorState {
+            interval,
+            ..MirrorState::default()
+        });
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Work>(QUEUE);
+        let Ok(store) = Store::open(store_root) else {
+            state.stall();
+            return Mirror {
+                sender: std::sync::Mutex::new(None),
+                threads: std::sync::Mutex::new(Vec::new()),
+                state,
+            };
+        };
+        let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+        let mut threads = Vec::with_capacity(STREAMS);
+        for _ in 0..STREAMS {
+            let receiver = std::sync::Arc::clone(&receiver);
+            let state = std::sync::Arc::clone(&state);
+            let cache = cache.clone();
+            let store = store.clone();
+            threads.push(std::thread::spawn(move || loop {
+                let work = {
+                    let queue = receiver.lock().unwrap_or_else(|e| e.into_inner());
+                    match queue.recv() {
+                        Ok(work) => work,
+                        Err(_) => return,
+                    }
+                };
+                let mut outcome = CacheWrite::Unavailable;
+                for _ in 0..ATTEMPTS {
+                    outcome = cache
+                        .backfill_store(&store, work.kind, &work.object)
+                        .unwrap_or(CacheWrite::Unavailable);
+                    if outcome != CacheWrite::Unavailable {
+                        break;
+                    }
+                }
+                state.record(work.seq, work.object.length, outcome);
+                state.wake();
+            }));
+        }
+        Mirror {
+            sender: std::sync::Mutex::new(Some(sender)),
+            threads: std::sync::Mutex::new(threads),
+            state,
+        }
+    }
+
+    /// Hand one already-admitted object to the cache. Returns its sequence, which is the
+    /// number a watermark is read against. Never blocks, never fails, never refuses.
+    pub fn offer(&self, kind: CacheKind, object: &ObjectRef) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        // The sequence is the offer list's INDEX, taken under the same lock that appends to
+        // it. Numbering outside the lock is the version of this that reads correctly and is
+        // wrong: two producers could take 5 and 6 and then append in the other order, and a
+        // journal link would name the objects of a different slice than the one the durable
+        // prefix vouched for.
+        let seq = {
+            let mut offers = self.state.offers.lock().unwrap_or_else(|e| e.into_inner());
+            offers.push((kind, object.clone()));
+            (offers.len() - 1) as u64
+        };
+        self.state.offered.fetch_add(1, Relaxed);
+        self.state.bytes_offered.fetch_add(object.length, Relaxed);
+        let work = Work {
+            seq,
+            kind,
+            object: object.clone(),
+        };
+        let sender = self.sender.lock().unwrap_or_else(|e| e.into_inner());
+        match sender.as_ref() {
+            // The only ways here are a queue past the document's own reference cap and a
+            // writer set that is gone. The object stays local and proved either way; the
+            // durable prefix simply stops at this sequence.
+            Some(sender) if sender.try_send(work).is_err() => self.state.stall(),
+            Some(_) => {}
+            None => self.state.stall(),
+        }
+        seq
+    }
+
+    /// Offer every segment of one part. An inline body lives in the header and has no
+    /// object of its own, so a part with no segments offers nothing.
+    pub fn offer_part(&self, part: &crate::header::Part) {
+        for segment in part.segments() {
+            self.offer(CacheKind::Blob, segment);
+        }
+    }
+
+    /// Whether enough has become durable for the producer to snapshot its progress document
+    /// again. Reading it costs one lock and no I/O, so a converter may ask it every op.
+    pub fn progress_due(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let durable = self.state.durable();
+        durable
+            .bytes
+            .saturating_sub(self.state.progress_at.load(Relaxed))
+            >= self.state.interval
+    }
+
+    /// Hand over a snapshot of the producer's own progress document. It is an ordinary blob
+    /// and travels the ordinary way; what makes it special is only that a journal link may
+    /// point at it, and only once it is inside the durable prefix like everything else.
+    pub fn offer_progress(&self, object: &ObjectRef) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let seq = self.offer(CacheKind::Blob, object);
+        self.state
+            .progress_at
+            .store(self.state.durable().bytes, Relaxed);
+        *self
+            .state
+            .progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((seq, object.clone()));
+    }
+
+    /// The newest progress snapshot that is inside a durable prefix of `objects` offers, or
+    /// `None`. A link that named a snapshot the cache had not taken would send a resuming pod
+    /// to an object that is not there.
+    pub fn progress_within(&self, objects: u64) -> Option<ObjectRef> {
+        let progress = self
+            .state
+            .progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        progress
+            .as_ref()
+            .filter(|(seq, _)| *seq < objects)
+            .map(|(_, object)| object.clone())
+    }
+
+    /// The producer says one unit of its own work is finished. This is the ONLY thing that
+    /// wakes a journal, and it is an observation about work rather than about time. It
+    /// takes a lock and a notify and does no I/O, so calling it in a conversion's inner
+    /// loop costs the conversion nothing.
+    pub fn at_unit(&self) {
+        self.state.wake();
+    }
+
+    /// The durable prefix as it stands right now. One lock, no I/O.
+    pub fn durable(&self) -> Durable {
+        self.state.durable()
+    }
+
+    /// What has been handed over, durable or not — the other half of the watermark, and the
+    /// number that says whether the mirror is keeping up with the producer.
+    pub fn offered(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.state.offered.load(Relaxed),
+            self.state.bytes_offered.load(Relaxed),
+        )
+    }
+
+    /// The objects at offer positions `range`, in offer order. A journal link names exactly
+    /// a slice of this list, so the producer never keeps a second copy that could disagree.
+    pub fn offers(&self, from: u64, to: u64) -> Vec<(CacheKind, ObjectRef)> {
+        let offers = self.state.offers.lock().unwrap_or_else(|e| e.into_inner());
+        let from = (from as usize).min(offers.len());
+        let to = (to as usize).min(offers.len());
+        offers[from..to].to_vec()
+    }
+
+    /// Block until the producer reports more work than `seen`, or until it is finished.
+    /// Returns the new unit count, or `None` once the producer has closed. There is no
+    /// timeout: the only two things that end this wait are progress and completion.
+    pub fn awaited(&self, seen: u64) -> Option<u64> {
+        let mut pulse = self.state.pulse.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if pulse.units != seen {
+                return Some(pulse.units);
+            }
+            if pulse.closed {
+                return None;
+            }
+            pulse = self
+                .state
+                .woken
+                .wait(pulse)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Stop taking offers and wait for every one already taken to have its answer. After
+    /// this the durable prefix is final. Idempotent.
+    pub fn drain(&self) {
+        {
+            let mut sender = self.sender.lock().unwrap_or_else(|e| e.into_inner());
+            *sender = None;
+        }
+        let threads = std::mem::take(&mut *self.threads.lock().unwrap_or_else(|e| e.into_inner()));
+        for thread in threads {
+            let _ = thread.join();
+        }
+        self.state.wake();
+    }
+
+    /// Tell every waiter the producer is finished. A journal wakes one last time, takes its
+    /// final link over the drained prefix, and returns.
+    pub fn close(&self) {
+        let mut pulse = self.state.pulse.lock().unwrap_or_else(|e| e.into_inner());
+        pulse.closed = true;
+        drop(pulse);
+        self.state.woken.notify_all();
+    }
+
+    pub fn report(&self) -> MirrorReport {
+        use std::sync::atomic::Ordering::Relaxed;
+        MirrorReport {
+            offered: self.state.offered.load(Relaxed),
+            stored: self.state.stored.load(Relaxed),
+            present: self.state.present.load(Relaxed),
+            unavailable: self.state.unavailable.load(Relaxed),
+            bytes_offered: self.state.bytes_offered.load(Relaxed),
+            bytes_stored: self.state.bytes_stored.load(Relaxed),
+            bytes_present: self.state.bytes_present.load(Relaxed),
+            durable: self.state.durable(),
+        }
+    }
+}
+
+impl MirrorState {
+    fn wake(&self) {
+        let mut pulse = self.pulse.lock().unwrap_or_else(|e| e.into_inner());
+        pulse.units += 1;
+        drop(pulse);
+        self.woken.notify_all();
+    }
+}
+
+impl Drop for Mirror {
+    fn drop(&mut self) {
+        self.close();
+        self.drain();
+    }
 }
