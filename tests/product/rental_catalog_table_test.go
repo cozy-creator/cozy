@@ -134,6 +134,15 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 		}
 	}
 
+	// PRICES ARE READ IN PENNIES. Micro-dollar precision is how the provider quotes
+	// and how we bill; `$0.463504/hr` asks a reader to parse six decimals to learn
+	// "about forty-six cents". This asserts the rendered table, so it holds against
+	// whichever formatter produced a cell -- there were two, rendering the same
+	// micros independently, and rounding one left the other six decimals wide.
+	if over := subPenny.FindString(out); over != "" {
+		t.Fatalf("the ladder renders %q with sub-penny precision\n%s", over, out)
+	}
+
 	// Cheapest first, on the price the table shows — and equal rungs hold still.
 	climb := []string{"cpu", "cpu-torch", "rtx-a4000", "rtx-pro-6000-maxq",
 		"rtx-pro-6000-blackwell", "rtx-pro-6000", "b200"}
@@ -158,3 +167,6 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 	}
 	hub.close()
 }
+
+// subPenny matches a price carrying more than two decimal places.
+var subPenny = regexp.MustCompile(`\$[0-9]+\.[0-9]{3,}`)
