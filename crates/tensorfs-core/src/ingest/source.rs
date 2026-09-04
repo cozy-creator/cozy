@@ -5,6 +5,7 @@
 //! header/profile match, streams selected tensor bytes through the ordinary ingest/CAS pass, and
 //! retains only exact CAS holds and typed SQLite result rows.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -489,12 +490,11 @@ fn plan_source_prepared(
     if carriers.is_empty() {
         return refuse(Code::MISSING_FIELD, "source plan has no carriers");
     }
-    let mut paths: Vec<&Path> = carriers
-        .iter()
-        .map(|carrier| carrier.path.as_path())
-        .collect();
-    paths.sort();
-    paths.dedup();
+    // A MEMBER may not repeat; a PATH may. A Store is content addressed, so two members
+    // carrying identical bytes resolve to one file: H3's FL2VA and Ref2VA transformer
+    // indexes are byte-identical, so its 48 members present 47 paths. Assignment is by
+    // member and `read_carrier` is a read, so a repeated path costs one extra header read
+    // and decides nothing.
     let mut members: Vec<&str> = carriers
         .iter()
         .filter_map(|carrier| carrier.member.as_deref())
@@ -502,11 +502,8 @@ fn plan_source_prepared(
     let member_count = members.len();
     members.sort();
     members.dedup();
-    if paths.len() != carriers.len() || members.len() != member_count {
-        return refuse(
-            Code::DUPLICATE_KEY,
-            "carrier paths and reviewed members must be unique",
-        );
+    if members.len() != member_count {
+        return refuse(Code::DUPLICATE_KEY, "reviewed members must be unique");
     }
     for carrier in carriers {
         if let Some(member) = &carrier.member {
@@ -915,14 +912,24 @@ fn validate_request(
             "verified source files must be sorted uniquely by member",
         );
     }
-    let mut paths: Vec<&Path> = request.files.iter().map(|row| row.path.as_path()).collect();
-    paths.sort();
-    paths.dedup();
-    if paths.len() != request.files.len() {
-        return refuse(
-            Code::DUPLICATE_KEY,
-            "verified source file paths must be unique",
-        );
+    // Same rule as the plan above, stated where the object ids are still in hand: a path
+    // is an OBJECT's identity, so it may repeat across members, but only ever bearing one
+    // object. Two DIFFERENT objects on one path is a real fault and stays a refusal.
+    let mut owners: BTreeMap<&Path, &str> = BTreeMap::new();
+    for row in &request.files {
+        if *owners
+            .entry(row.path.as_path())
+            .or_insert(row.object_id.as_str())
+            != row.object_id
+        {
+            return refuse(
+                Code::DUPLICATE_KEY,
+                format!(
+                    "verified source path {} carries two different objects",
+                    row.path.display()
+                ),
+            );
+        }
     }
     request.files.iter().map(FileFence::capture).collect()
 }
@@ -1567,6 +1574,93 @@ mod tests {
             },
         ];
         (store, registry.to_bytes(), carriers)
+    }
+
+    /// Two members carrying identical bytes resolve to ONE file, and the plan must accept
+    /// that. A Store is content addressed, so a path is an OBJECT's identity and never a
+    /// member's: MiniMax-H3's `FL2VA/transformer/model.safetensors.index.json` and its
+    /// `Ref2VA/` counterpart are byte-identical, so its 48 verified members present 47
+    /// distinct paths. Run 294 downloaded all 210.3 GB and refused here on DUPLICATE_KEY.
+    #[test]
+    fn two_members_may_share_one_carrier_path() {
+        let root = temporary("shared-carrier-path");
+        fs::create_dir_all(&root).unwrap();
+        let shared = root.join("index.safetensors");
+        wide_carrier(&shared, "weight", 512, 0x33);
+
+        let mut registry = FingerprintRegistry::default();
+        let mut components = Vec::new();
+        // Two components, two member names, ONE file — the H3 shape exactly.
+        for (component, member) in [("encoder", "FL2VA/index"), ("decoder", "Ref2VA/index")] {
+            let (header, raw) = read_carrier(&shared).unwrap();
+            let observed = fingerprint::fingerprint(component, &header).unwrap();
+            registry.merge(Banked {
+                keyset_digest: observed.keyset_digest.clone(),
+                dialect: "safetensors.diffusers".into(),
+                component: component.into(),
+                converter: "diffusers.identity/1".into(),
+                tensor_schema_digest: observed.tensor_schema_digest,
+                logical_keys: observed.logical_keys as u64,
+                provenance: Provenance {
+                    kind: REAL.into(),
+                    source: "synthetic full bytes".into(),
+                    source_sha256: Some(
+                        source_digest(&header, &raw)
+                            .trim_start_matches("sha256:")
+                            .to_string(),
+                    ),
+                    note: "shared carrier fixture".into(),
+                },
+            });
+            components.push(SourceProfileComponent {
+                component: component.into(),
+                source_member: Some(member.into()),
+                source_member_prefix: None,
+                target_encoding: "plain/1".into(),
+                variants: vec![super::fingerprint::SourceProfileVariant {
+                    keyset_digest: observed.keyset_digest,
+                    construction_order: vec!["weight".into()],
+                }],
+            });
+        }
+        registry.merge_source_profile(SourceProfile {
+            name: "shared/pair/1".into(),
+            components,
+        });
+
+        let carriers = vec![
+            CarrierInput {
+                member: Some("FL2VA/index".into()),
+                path: shared.clone(),
+            },
+            CarrierInput {
+                member: Some("Ref2VA/index".into()),
+                path: shared.clone(),
+            },
+        ];
+        let (_, prepared) = plan_source_prepared(
+            "registry",
+            &registry.to_bytes(),
+            &carriers,
+            Some("shared/pair/1"),
+            None,
+        )
+        .expect("two members sharing one path must plan");
+        assert_eq!(prepared.files.len(), 2, "both members are planned");
+
+        // The member rule still holds: the SAME member twice is a real fault.
+        let repeated = vec![carriers[0].clone(), carriers[0].clone()];
+        match plan_source_prepared(
+            "registry",
+            &registry.to_bytes(),
+            &repeated,
+            Some("shared/pair/1"),
+            None,
+        ) {
+            Err(refusal) => assert_eq!(refusal.code, Code::DUPLICATE_KEY),
+            Ok(_) => panic!("one member twice must refuse"),
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     /// THE DECISIVE PROPERTY. A conversion interrupted partway resumes without re-hashing
