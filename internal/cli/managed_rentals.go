@@ -668,12 +668,21 @@ func skuRate(sku hub.RentalSKU) string {
 
 // usdPerHourBare is the dollar figure alone, for a line that already says "per hour".
 func usdPerHourBare(micros int64) string {
-	whole, fraction := micros/1_000_000, micros%1_000_000
-	decimal := fmt.Sprintf("%06d", fraction)
-	for len(decimal) > 2 && decimal[len(decimal)-1] == '0' {
-		decimal = decimal[:len(decimal)-1]
+	// PRICES ARE READ IN PENNIES. Micro-dollar precision is how the provider quotes
+	// and how we bill, but `$0.463504/hour` asks a reader to parse six decimals to
+	// learn "about forty-six cents" -- the extra digits carry no decision. Money is
+	// rounded here for DISPLAY only; every comparison, cap check and ledger entry
+	// upstream still works in whole micros.
+	if micros < 0 {
+		return "-" + usdPerHourBare(-micros)
 	}
-	return fmt.Sprintf("$%d.%s", whole, decimal)
+	cents := (micros + 5_000) / 10_000
+	// A rate that is real but smaller than a penny must not render as free: the CPU
+	// storage adder is $0.00278/hour, and `$0.00` would say the wrong thing.
+	if cents == 0 && micros > 0 {
+		return "<$0.01"
+	}
+	return fmt.Sprintf("$%d.%02d", cents/100, cents%100)
 }
 
 func settledRequest(state string) bool {

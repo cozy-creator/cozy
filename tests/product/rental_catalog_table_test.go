@@ -121,10 +121,14 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 	}
 
 	// ONE price, and it is the whole one: the components are not on this table.
-	if got := rows["rtx-a4000"][4]; got != "$0.463504/hr" {
-		t.Fatalf("the A4000's price reads %q, not the combined $0.463504/hr\n%s", got, out)
+	if got := rows["rtx-a4000"][4]; got != "$0.46/hr" {
+		t.Fatalf("the A4000's price reads %q, not the combined $0.46/hr\n%s", got, out)
 	}
-	for _, component := range []string{"$0.25/hr", "$0.213504/hr", "$0.07/hr", "$0.00278/hr"} {
+	// $0.07/hr is NOT checked here: rounded to the penny, the cpu SKU's COMBINED
+	// price ($0.07278) and its GPU component ($0.07) render identically, so the
+	// string cannot distinguish an itemised component from the total this table is
+	// supposed to show. The components that remain distinguishable still guard it.
+	for _, component := range []string{"$0.25/hr", "$0.21/hr", "<$0.01/hr"} {
 		if strings.Contains(out, component) {
 			t.Fatalf("the ladder still itemises %s beside the combined price\n%s", component, out)
 		}
@@ -146,7 +150,7 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 	for _, kept := range []string{
 		"ACCELERATOR MODEL", "GPU PRICE", "STORAGE PRICE",
 		"NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
-		"$1.69/hr", "$0.213504/hr", "$1.903504/hr",
+		"$1.69/hr", "$0.21/hr", "$1.90/hr",
 	} {
 		if !strings.Contains(full, kept) {
 			t.Fatalf("--full lost %q from the ladder\n%s", kept, full)
