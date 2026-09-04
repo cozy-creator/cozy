@@ -36,6 +36,8 @@
 //! TFS_CREDENTIAL (`bearer <token>`, or empty for anonymous), never bare argv; a
 //! URL of `-` arrives on stdin. Flags: --hub <base> --lane --session --streams <n>
 //! --timeout <s> --allow-hosts a,b,.c --allow-local --max-redirects <n>.
+//! `tfs fetch` also takes --repo-cache <root>: an optional mounted immutable object
+//! cache read between the local Store and the origin, and backfilled from origin bytes.
 //!
 //!   tfs fetch <root> <ref>       closure -> plan -> N-way walk (presign at use) -> proof
 //!   tfs fetch plan-objects <root> <session> --refs <jsonl>   HELD/WANTED, no manifest

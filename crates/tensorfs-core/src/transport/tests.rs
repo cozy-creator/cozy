@@ -16,6 +16,7 @@ use crate::header::{Body, Closure, Header, Part, Tensor};
 use crate::ids::{Doc, ObjectRef};
 use crate::manifest::{Draft, Entry};
 use crate::registry;
+use crate::repo_cache::RepoObjectCache;
 use crate::store::Store;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -579,6 +580,182 @@ fn cold_pull_lands_and_warm_pull_moves_nothing() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// THE SECOND POD IS THE WHOLE POINT, and this is the arm that proves the cache FIRES
+/// rather than merely that it is configured.
+///
+/// A rental ends and its container disk dies with it. The next rental in the same
+/// datacenter mounts the same volume onto an EMPTY Store — which is why pod B here gets a
+/// brand new `Store::init` and not a reused one. If the cache is inert, pod B re-buys the
+/// closure from the origin and this test still passes every completeness check while the
+/// invoice doubles; the only assertion that can tell the difference is the origin's own hit
+/// count, so that is the assertion this test is written around.
+#[test]
+fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
+    let cache_root = temporary("repo-cache-volume");
+    let cache = RepoObjectCache::new(&cache_root);
+    let checkpoint = Arc::new(checkpoint(6, 32 * 1024));
+    let declared: u64 = checkpoint.bodies.values().map(|b| b.len() as u64).sum();
+    let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = SourcePolicy::default();
+
+    // POD A — cold Store, cold cache. Every object crosses the network once, and the walk
+    // publishes each one onward as it lands.
+    let a = temporary("repo-cache-pod-a");
+    let store_a = Store::init(&a).unwrap();
+    let cold = {
+        let mut request = request_for(&store_a, &origin.base, &policy);
+        request.cache = Some(&cache);
+        pull(&request).unwrap()
+    };
+    assert_eq!(cold.fetched, 8);
+    assert_eq!(cold.cached, 0, "a cold cache can answer for nothing");
+    assert_eq!(cold.bytes_moved, declared);
+    let calls_after_a = origin.total_hits();
+    assert_eq!(
+        calls_after_a - 2,
+        8,
+        "closure + presign, then one GET per object"
+    );
+
+    // POD B — a DIFFERENT empty Store on the same mounted cache: the re-rental.
+    let b = temporary("repo-cache-pod-b");
+    let store_b = Store::init(&b).unwrap();
+    let warm = {
+        let mut request = request_for(&store_b, &origin.base, &policy);
+        request.cache = Some(&cache);
+        pull(&request).unwrap()
+    };
+    assert_eq!(
+        warm.held, 0,
+        "pod B's own Store starts empty — this is a fresh rental"
+    );
+    assert_eq!(
+        warm.cached, 8,
+        "every declared object came off the mounted cache"
+    );
+    assert_eq!(warm.fetched, 0);
+    assert_eq!(warm.bytes_cached, declared);
+    assert_eq!(warm.bytes_moved, 0);
+
+    // THE ASSERTION WITH THE INVOICE ON IT: pod B cost the origin no object bytes, and it
+    // never even asked to be authorized for any.
+    assert_eq!(
+        origin.total_hits() - calls_after_a,
+        1,
+        "pod B should have cost the origin exactly one call — the closure question"
+    );
+    assert_eq!(origin.hits("/v1/tensorfs/closure"), 2);
+    assert_eq!(
+        origin.hits("/v1/tensorfs/presign"),
+        1,
+        "an object that never crosses the network is never minted a URL"
+    );
+
+    // And pod B is genuinely servable: `pull` refuses rather than returns if the closure is
+    // incomplete, so a third pull that HOLDS everything is the readback.
+    let readback = {
+        let mut request = request_for(&store_b, &origin.base, &policy);
+        request.cache = Some(&cache);
+        pull(&request).unwrap()
+    };
+    assert_eq!(readback.held, 8);
+    assert_eq!(
+        readback.cached, 0,
+        "the local Store answers before the cache does"
+    );
+    assert_eq!(readback.fetched, 0);
+
+    for root in [cache_root, a, b] {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// Cache weather is never authority. A cache that is not there, cannot be read, or holds
+/// the wrong bytes under the right name costs the pull one fall-through and nothing else —
+/// which is the property that lets an operator delete a disposable volume at any moment.
+#[test]
+fn an_absent_or_corrupt_cache_degrades_to_the_ordinary_pull() {
+    let checkpoint = Arc::new(checkpoint(4, 16 * 1024));
+    let declared: u64 = checkpoint.bodies.values().map(|b| b.len() as u64).sum();
+    let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = SourcePolicy::default();
+
+    // A root that does not exist, on a filesystem the pull may not even be able to write.
+    let absent = temporary("repo-cache-absent").join("never").join("created");
+    let a = temporary("repo-cache-degraded-a");
+    let store_a = Store::init(&a).unwrap();
+    let missing_cache = RepoObjectCache::new(&absent);
+    let report = {
+        let mut request = request_for(&store_a, &origin.base, &policy);
+        request.cache = Some(&missing_cache);
+        pull(&request).unwrap()
+    };
+    assert_eq!(report.cached, 0);
+    assert_eq!(report.fetched, 6); // 4 blobs + header + manifest
+    assert_eq!(report.bytes_moved, declared);
+
+    // Now poison every cache final the successful pull just published, keeping the names.
+    let poisoned = temporary("repo-cache-poisoned");
+    let cache = RepoObjectCache::new(&poisoned);
+    let b = temporary("repo-cache-degraded-b");
+    let store_b = Store::init(&b).unwrap();
+    {
+        let mut request = request_for(&store_b, &origin.base, &policy);
+        request.cache = Some(&cache);
+        pull(&request).unwrap();
+    }
+    let mut poisoned_files = 0;
+    for entry in walk_files(&poisoned) {
+        let length = std::fs::metadata(&entry).unwrap().len() as usize;
+        let mut permissions = std::fs::metadata(&entry).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&entry, permissions).unwrap();
+        std::fs::write(&entry, vec![0xA5u8; length]).unwrap();
+        poisoned_files += 1;
+    }
+    assert!(
+        poisoned_files > 0,
+        "the cold pull published nothing to poison"
+    );
+
+    let c = temporary("repo-cache-degraded-c");
+    let store_c = Store::init(&c).unwrap();
+    let before = origin.total_hits();
+    let recovered = {
+        let mut request = request_for(&store_c, &origin.base, &policy);
+        request.cache = Some(&cache);
+        pull(&request).unwrap()
+    };
+    assert_eq!(recovered.cached, 0, "corrupt finals answer for nothing");
+    assert_eq!(recovered.fetched, 6, "and the origin answered instead");
+    assert_eq!(recovered.bytes_moved, declared);
+    assert!(
+        origin.total_hits() - before >= 6,
+        "the fall-through must have actually gone to the origin"
+    );
+
+    for root in [absent, poisoned, a, b, c] {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// Every regular file under a root, in no particular order.
+fn walk_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match path.is_dir() {
+            true => out.extend(walk_files(&path)),
+            false => out.push(path),
+        }
+    }
+    out
+}
+
 /// A pull leaves a Store that can ANSWER for what it holds, and whose contents are not
 /// garbage. The closure carries model/release/lane for the local index row; nothing wrote
 /// it, so a pod that had just fetched a checkpoint refused `REPOSITORY_ABSENT` when it
@@ -803,6 +980,7 @@ fn a_walk_that_outlives_the_url_lifetime_completes() {
         Deadline::none(),
         &Ledger::with_resolution(Duration::from_millis(200)),
         4,
+        None,
         None,
     )
     .unwrap_err();
@@ -1634,6 +1812,7 @@ fn bench_walk_16way_parity() {
             Deadline::none(),
             &ledger,
             streams,
+            None,
             None,
         )
         .unwrap();
