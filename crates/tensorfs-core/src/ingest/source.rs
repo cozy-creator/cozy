@@ -1439,8 +1439,28 @@ mod tests {
             );
         }
 
-        // ---- the resume: a different process, after the writer died.
+        // ---- a real reclamation pass runs between the crash and the resume.
+        //
+        // This is the red arm for the second hazard: `catalog.hold()` wrote a row per 64 MiB
+        // segment and `gc::collect` never reads that table. Before the journal, a pass here
+        // reclaimed every byte of the half-converted output and the resume had nothing left
+        // to reuse. GC takes the exclusive recovery lock, so the dead writer goes first —
+        // exactly the state a released pod leaves behind.
         drop(writer);
+        let objects: Vec<PathBuf> = super::super::journal::session_objects(&session_dir)
+            .unwrap()
+            .iter()
+            .map(|object| store.object_path(&object.sha256))
+            .collect();
+        assert!(!objects.is_empty());
+        let report = crate::gc::collect(store.root(), false).unwrap();
+        assert!(report.kept_objects > 0, "the journal held nothing");
+        assert_eq!(report.reclaimed_blobs, 0);
+        for path in &objects {
+            assert!(path.is_file(), "gc reclaimed in-flight conversion output");
+        }
+
+        // ---- the resume: a different process, after the writer died.
         let (_, writer) = transaction::open_root(&store, "journal-operation", "tenant").unwrap();
         let (resumed, outcome) = transaction::advance(
             &store,
