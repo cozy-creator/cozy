@@ -44,6 +44,11 @@ rm -rf "$work/venv"
 "$work/venv/bin/pip" install --quiet "$wheel"
 echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/version_contract.py installed "$wheel"
+# `py.typed` rides in this wheel, so the stub beside the extension is what every consumer's
+# type checker believes. Checked HERE, against the installed pair, because the wheel is what
+# a pod runs (tfs-077). A `__getattr__` back in the stub, a binding whose parameters moved,
+# a refusal class the facade forgot to re-export: all of them stop here.
+"$work/venv/bin/python" scripts/stub_conform.py
 "$work/venv/bin/python" scripts/fit-runs.py
 # The frozen corpus, through the FACADE. `tfs vectors verify` runs the same 90 vectors
 # through Rust; this proves the marshal boundary agrees — same ids, same typed refusals.
