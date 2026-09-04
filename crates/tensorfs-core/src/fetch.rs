@@ -267,7 +267,12 @@ impl FetchPlan {
     }
 }
 
-fn manifest_presence(store: &Store, object: &ObjectRef) -> Result<Presence> {
+/// The Manifest namespace's presence question — the same one [`FetchPlan`] asks about the
+/// Manifest it anchors on, asked about a Manifest that anchors nothing. `of_objects` cannot
+/// answer it, because a bare object set is a set of BLOBS and `presence` looks in the blob
+/// namespace; a caller restoring Manifests from a cache would get "absent" for every one it
+/// already holds. Public for that caller, and for no other reason.
+pub fn manifest_presence(store: &Store, object: &ObjectRef) -> Result<Presence> {
     match store.read_manifest(object) {
         Ok(_) => Ok(Presence::Recorded),
         Err(error) if error.code == Code::OBJECT_ABSENT => Ok(Presence::Absent),

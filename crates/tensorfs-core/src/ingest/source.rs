@@ -11,10 +11,12 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::canon::{self, Value};
+use crate::durability;
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{tensor_schema_digest_of, tensor_schema_value};
 use crate::ids::{ascii_name, object_id, prefixed, ObjectRef};
 use crate::registry;
+use crate::repo_cache::RepoObjectCache;
 use crate::spec::EncodingSpec;
 use crate::store::Store;
 
@@ -674,7 +676,22 @@ pub fn golden_suite(converter: &Converter) -> Result<usize> {
     Ok(count)
 }
 
-fn execute_prepared(store: &Store, operation: &str, prepared: &Prepared) -> Result<ObjectRef> {
+/// Convert one prepared profile, writing every object it admits through to `cache` as it
+/// lands.
+///
+/// **The durability chain is per (operation, slot) and named that way because that is the
+/// unit a resume replays.** `chain` carries the slot; two profiles of one request convert
+/// different plans, and a single chain over both could not be validated against either. The
+/// plan digest each link records is `ingest::journal::plan_digest` — the SAME identity the
+/// conversion journal keys its file on, so the two planes cannot disagree about which
+/// conversion this is.
+fn execute_prepared(
+    store: &Store,
+    operation: &str,
+    chain: &str,
+    prepared: &Prepared,
+    cache: Option<&RepoObjectCache>,
+) -> Result<(ObjectRef, durability::Head)> {
     let _ = golden_suite(prepared.conv)?;
     for (_, seed) in &prepared.seeds {
         if let Some(vectors) = &seed.vectors {
@@ -682,21 +699,37 @@ fn execute_prepared(store: &Store, operation: &str, prepared: &Prepared) -> Resu
         }
     }
     let predicted = tensor_schema_digest_of(&plan_tensor_schema(&prepared.plan));
-    let outcome = transaction::execute(
-        store,
-        &prepared.plan,
-        &prepared.files,
-        &plain_specs(&prepared.seeds),
-        &[],
-        operation,
-    )?;
+    let headers: Vec<(PathBuf, &carrier::SourceHeader)> = prepared
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), &file.header))
+        .collect();
+    let plan_digest = super::journal::plan_digest(&prepared.plan, &headers);
+    let policy = durability::Policy {
+        cache,
+        operation: chain,
+        plan: &format!("sha256:{plan_digest}"),
+        interval: durability::INTERVAL_BYTES,
+    };
+    let (converted, durable) = durability::with(store, &policy, |mirror| {
+        transaction::execute(
+            store,
+            &prepared.plan,
+            &prepared.files,
+            &plain_specs(&prepared.seeds),
+            &[],
+            operation,
+            mirror,
+        )
+    });
+    let outcome = converted?;
     if outcome.header.tensor_schema_digest() != predicted {
         return refuse(
             Code::TENSOR_SCHEMA_MISMATCH,
             "source plan and executed tensor schema differ",
         );
     }
-    Ok(outcome.manifest_ref)
+    Ok((outcome.manifest_ref, durable.journal))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -719,6 +752,15 @@ pub struct PrepareModelSource {
     pub source_selection_digest: String,
     pub profiles: Vec<ModelSourceProfile>,
     pub files: Vec<VerifiedModelSourceFile>,
+    /// The optional mounted immutable object cache converted objects are published onto as
+    /// they are admitted.
+    ///
+    /// **It is deliberately NOT part of [`request_digest`]**, and that omission is the
+    /// contract: a conversion is the same conversion whether or not a volume happened to be
+    /// bound, so a pod with a cache and a pod without one must replay each other's stored
+    /// result rather than treat it as a different request. The cache changes what a run
+    /// COSTS and what survives it; it can never change what it produces.
+    pub repo_cache: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -727,6 +769,10 @@ pub struct PreparedModelSource {
     pub profile: String,
     pub manifest_digest: String,
     pub manifest_length: u64,
+    /// Where this slot's durability chain ends. `head` is the digest the caller hands the
+    /// hub, and `bytes` the monotonic watermark it compare-and-sets on. Empty on a replayed
+    /// preparation and on a run with no cache: both are runs that published nothing.
+    pub durable: durability::Head,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -933,6 +979,8 @@ fn prepare_model_source_with_registry(
     let registry = FingerprintRegistry::parse(registry_bytes)?;
     let fences = validate_request(request, &registry)?;
     let digest = request_digest(request, registry_bytes);
+    let cache = request.repo_cache.as_deref().map(RepoObjectCache::new);
+    let cache = cache.as_ref();
     let catalog = crate::catalog::Catalog::open(store.root())?;
     let writer = match catalog.begin_source_preparation(&request.operation_id, &digest)? {
         crate::catalog::SourcePreparation::Prepared(rows) => {
@@ -958,6 +1006,7 @@ fn prepare_model_source_with_registry(
                         profile: row.profile,
                         manifest_digest: format!("sha256:{}", row.manifest_sha256),
                         manifest_length: row.manifest_length,
+                        durable: durability::Head::default(),
                     })
                     .collect(),
             };
@@ -998,12 +1047,15 @@ fn prepare_model_source_with_registry(
                 }
             }
         }
-        let manifest = execute_prepared(store, &request.operation_id, &prepared)?;
+        let chain = format!("{}/{}", request.operation_id, requested.slot);
+        let (manifest, durable) =
+            execute_prepared(store, &request.operation_id, &chain, &prepared, cache)?;
         sources.push(PreparedModelSource {
             slot: requested.slot.clone(),
             profile: requested.profile.clone(),
             manifest_digest: manifest.id(),
             manifest_length: manifest.length,
+            durable,
         });
         validate_prepared_result(store, sources.last().expect("just pushed source result"))?;
     }
@@ -1175,6 +1227,7 @@ mod tests {
                     path: second_path,
                 },
             ],
+            repo_cache: None,
         };
         (store, registry.to_bytes(), request)
     }
@@ -1407,6 +1460,7 @@ mod tests {
             &[],
             "journal-operation",
             transaction::Carriers::Landed(&[true, false]),
+            None,
         )
         .unwrap();
         assert!(incomplete.is_none(), "no header exists over part of a plan");
@@ -1470,6 +1524,7 @@ mod tests {
             &[],
             "journal-operation",
             transaction::Carriers::All,
+            None,
         )
         .unwrap();
         assert!(resumed.complete());
@@ -1503,6 +1558,7 @@ mod tests {
             &plain_specs(&prepared2.seeds),
             &[],
             "one-shot",
+            None,
         )
         .unwrap();
         assert_eq!(one_shot.manifest_ref, outcome.manifest_ref);
@@ -1549,6 +1605,7 @@ mod tests {
             &mut journal,
             "partial",
             transaction::Carriers::Landed(&[true, false]),
+            None,
         )
         .unwrap();
         let refusal = transaction::finalize(
@@ -1561,6 +1618,7 @@ mod tests {
                 operation: "partial",
                 pass: &transaction::Progress::default(),
                 elapsed_ms: 0,
+                mirror: None,
             },
         )
         .unwrap_err();

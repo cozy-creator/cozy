@@ -24,6 +24,10 @@
 //!   tfs store admit-file <store> blob|manifest <id> <length> <source>
 //!   tfs repo-cache admit <cache> <store> blob|manifest <id> <length>
 //!   tfs repo-cache backfill <cache> <store> blob|manifest <id> <length>
+//!   tfs repo-cache restore <cache> <store> <manifest-id> <length> [--session <s>]
+//!   tfs repo-cache resume <cache> <store> <chain-id> <length> --plan <sha256:...>
+//!                                   [--session <s>] [--tenant <t>] [--no-journal]
+//!   tfs repo-cache chain <cache> <chain-id> <length>       the links, root to head
 //!   tfs put <root> <file>        stream one object in (any shape)
 //!   tfs get <root> <hex>         verified read, whole or ranged
 //!   tfs contains <root> <hex>    the presence HINT, and what it is worth
@@ -122,6 +126,7 @@ use std::time::Instant;
 
 use tensorfs_core::canon;
 use tensorfs_core::dtype::Dtype;
+use tensorfs_core::durability;
 use tensorfs_core::err::Refusal;
 use tensorfs_core::header::{Asset, Body, Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{Doc, ObjectRef, Plain};
@@ -182,6 +187,15 @@ fn main() -> ExitCode {
         }
         ["repo-cache", "backfill", cache, store, kind, object, length] => {
             cmd_repo_cache_backfill(Path::new(cache), Path::new(store), kind, object, length)
+        }
+        ["repo-cache", "restore", cache, store, object, length] => {
+            cmd_repo_cache_restore(Path::new(cache), Path::new(store), object, length, &flags)
+        }
+        ["repo-cache", "resume", cache, store, object, length] => {
+            cmd_repo_cache_resume(Path::new(cache), Path::new(store), object, length, &flags)
+        }
+        ["repo-cache", "chain", cache, object, length] => {
+            cmd_repo_cache_chain(Path::new(cache), object, length)
         }
         ["put", r, f] => cmd_put(Path::new(r), Path::new(f), &flags),
         ["get", r, h] => cmd_get(Path::new(r), h, &flags),
@@ -253,7 +267,7 @@ fn main() -> ExitCode {
         },
         ["ingest", "plan", t] => ingest::cmd_plan(t, &flags),
         ["ingest", "run", r] => match flag(&flags, "source-plan") {
-            Some(path) => ingest::cmd_run_source(Path::new(r), Path::new(path)),
+            Some(path) => ingest::cmd_run_source(Path::new(r), Path::new(path), &flags),
             None => {
                 eprintln!("ingest run requires a target or --source-plan <json>");
                 ExitCode::from(2)
@@ -400,6 +414,178 @@ fn cmd_repo_cache_backfill(
     };
     println!("{{\"status\":\"{}\"}}", status.as_str());
     ExitCode::SUCCESS
+}
+
+/// `tfs repo-cache restore` — bring one whole checkpoint back off the cache.
+///
+/// This is the ordinary answer to "the pod that converted this is gone." The Manifest is
+/// admitted, its closure walked, and every object the local Store does not already hold is
+/// admitted from the cache through the SAME door a pull uses. There is no adoption on trust
+/// and no second admission path: a cached object whose bytes disagree with its id is removed
+/// and reported, and the completion proof at the end is the Store's own local walk.
+fn cmd_repo_cache_restore(
+    cache: &Path,
+    store: &Path,
+    object: &str,
+    length: &str,
+    flags: &Flags,
+) -> ExitCode {
+    let (_, manifest) = match cache_args("manifest", object, length) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    let store = match Store::open(store) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    let session = flag(flags, "session").unwrap_or("restore");
+    let cache = RepoObjectCache::new(cache);
+    let report = match durability::restore_checkpoint(&store, &cache, session, &manifest) {
+        Ok(report) => report,
+        Err(error) => return bail(error),
+    };
+    print_restore(&report)
+}
+
+/// `tfs repo-cache resume` — bring back everything a conversion had already made durable,
+/// and the map of what those bytes MEAN.
+///
+/// The chain head names links that live on the cache; each is read at its exact digest, and
+/// the chain is DISCARDED WHOLE unless every link was written under the plan `--plan` names
+/// — the plan a resuming run re-derives from the source headers alone, for zero tensor
+/// bytes. That is what makes a stale chain harmless rather than dangerous.
+///
+/// The objects come back exactly as a checkpoint's closure does. The conversion journal the
+/// newest link points at is installed beside them under `--session`, so the next
+/// `tfs ingest run` reuses the ops it describes instead of re-converting them — after
+/// `transaction::convert` re-checks every journalled part against the Store's own admission
+/// law, which is why a journal restored beside objects that did not survive costs a
+/// re-conversion and never a wrong artifact. `--no-journal` restores the bytes alone.
+fn cmd_repo_cache_resume(
+    cache: &Path,
+    store: &Path,
+    object: &str,
+    length: &str,
+    flags: &Flags,
+) -> ExitCode {
+    let Some(plan) = flag(flags, "plan") else {
+        eprintln!(
+            "REFUSED MISSING_FIELD: resume requires --plan <sha256:...>, the digest of the plan \
+             re-derived from these sources; without it a chain cannot be shown to be this \
+             conversion's"
+        );
+        return ExitCode::FAILURE;
+    };
+    let (_, head) = match cache_args("blob", object, length) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    let store = match Store::open(store) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    let session = flag(flags, "session").unwrap_or("resume");
+    let cache = RepoObjectCache::new(cache);
+    let chain = match durability::chain(&cache, &head) {
+        Ok(chain) => chain,
+        Err(error) => return bail(error),
+    };
+    let set = match durability::fold(&chain, plan) {
+        Ok(set) => set,
+        Err(error) => return bail(error),
+    };
+    println!(
+        "chain        {} link(s) over operation {} — {} B declared durable",
+        set.links, set.operation, set.bytes
+    );
+    let report =
+        match durability::restore_objects(&store, &cache, session, &set.blobs, &set.manifests) {
+            Ok(report) => report,
+            Err(error) => return bail(error),
+        };
+    if !flag_on(flags, "no-journal") {
+        match set.progress.last() {
+            Some(snapshot) => {
+                let digest = plan.trim_start_matches("sha256:");
+                let tenant = flag(flags, "tenant").unwrap_or("dev");
+                match durability::restore_conversion(
+                    &store, &cache, session, tenant, digest, snapshot,
+                ) {
+                    Ok(()) => println!(
+                        "conversion   {} installed under session {session} — the ops it names \
+                         are re-checked, never trusted",
+                        snapshot.id()
+                    ),
+                    // The bytes are back either way; without the map they are re-converted,
+                    // which costs CPU and never correctness.
+                    Err(error) => println!(
+                        "conversion   REFUSED {}: {} — the objects stand and the conversion \
+                         re-derives what they mean",
+                        error.code.as_str(),
+                        error.detail
+                    ),
+                }
+            }
+            None => println!("conversion   no journal snapshot is durable; every op re-converts"),
+        }
+    }
+    print_restore(&report)
+}
+
+/// `tfs repo-cache chain` — the links a head names, root first, reading nothing but the
+/// cache. It is how an operator sees whether a run's watermark is ADVANCING, which is the
+/// only honest question to ask about a long conversion: not how many minutes it has taken,
+/// but whether more of it is durable than the last time anyone looked.
+fn cmd_repo_cache_chain(cache: &Path, object: &str, length: &str) -> ExitCode {
+    let (_, head) = match cache_args("blob", object, length) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    let cache = RepoObjectCache::new(cache);
+    let chain = match durability::chain(&cache, &head) {
+        Ok(chain) => chain,
+        Err(error) => return bail(error),
+    };
+    for link in &chain {
+        let object = link.object_ref();
+        println!(
+            "{:<6} {} {} B durable, {} blob(s), {} manifest(s), plan {}, length {}",
+            link.index,
+            object.id(),
+            link.bytes,
+            link.blobs.len(),
+            link.manifests.len(),
+            link.plan,
+            object.length
+        );
+    }
+    println!("operation    {}", chain[0].operation);
+    ExitCode::SUCCESS
+}
+
+fn print_restore(report: &tensorfs_core::durability::Restored) -> ExitCode {
+    println!(
+        "held         {} object(s), {} B — NOT restored",
+        report.held, report.bytes_held
+    );
+    println!(
+        "restored     {} object(s), {} B — from the cache, verified into this Store",
+        report.admitted, report.bytes_admitted
+    );
+    println!(
+        "absent       {} object(s) the cache could not answer for, {} corrupt",
+        report.missing, report.corrupt
+    );
+    if report.complete {
+        println!("complete     every declared object is resident and verified");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "REFUSED OBJECT_ABSENT: the cache did not hold the whole declared set; what it \
+             held is now local and proved, and the rest has to be produced again"
+        );
+        ExitCode::FAILURE
+    }
 }
 
 fn cmd_store_admit_file(
