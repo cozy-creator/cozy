@@ -61,6 +61,7 @@
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{DeliveryGrant, FetchPlan};
 use crate::ids::{Doc, ObjectRef};
+use crate::repo_cache::{CacheKind, CacheRead, RepoObjectCache};
 use crate::store::Store;
 use crate::transport::http::{self, Client};
 use crate::transport::hub::{self, CredentialProvider};
@@ -608,16 +609,41 @@ impl Leases<'_> {
     }
 }
 
-/// What the walk moved — counted, never estimated.
+/// What the walk moved — counted, never estimated, and attributed to the source that
+/// actually answered. `cached` objects crossed the same admission door as `fetched` ones;
+/// they simply came off a mounted cache instead of the origin, and saying which is the
+/// only way an operator can tell a warm datacenter from a cold one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WalkOutcome {
     pub fetched: u64,
     pub bytes_moved: u64,
+    pub cached: u64,
+    pub bytes_cached: u64,
 }
 
 /// Walk `plan.wanted` with `streams` objects in flight. One is the serial walk and it
 /// stays reachable, because a link where concurrency does not help is a real link. The
 /// first refusal wins; streams already moving finish their object and stop.
+///
+/// **`cache` is the source order, and it is the whole reason a second pod is cheap.** The
+/// order is local Store, then the optional mounted cache, then the origin — the Store half
+/// is already spent by the time this is called, because `FetchPlan::of` planned against the
+/// real store and `wanted` is what it does not hold. So this walk owns the other two hops,
+/// and it owns them per object rather than per pull: a half-warm cache answers the half it
+/// holds and the origin answers the rest, in one walk, with no mode to choose between.
+///
+/// A hit skips the origin ENTIRELY — no presigned URL is minted for an object that never
+/// crosses the network, which is the same rule the walk already applies to a held object.
+/// A miss, a corrupt final, or an unreadable mount is weather: it falls through to the
+/// origin and the pull is unharmed, which is the property that lets a disposable cache be
+/// deleted at any moment without making a working grant fail.
+///
+/// **The backfill is inline, and that placement is derived rather than convenient.** The
+/// bytes are in the page cache at exactly the instant admission commits them, so publishing
+/// them onward is the cheapest read of that object that will ever be available; a later
+/// pass would re-read from disk what this moment already holds in memory. It costs the
+/// first pod in a datacenter a mounted-filesystem write that overlaps the still-running
+/// transfers on every other stream, and it is what makes every pod after it warm.
 #[allow(clippy::too_many_arguments)]
 pub fn fetch_wanted(
     store: &Store,
@@ -628,6 +654,7 @@ pub fn fetch_wanted(
     deadline: Deadline,
     ledger: &Ledger,
     streams: usize,
+    cache: Option<&RepoObjectCache>,
     on_object: Option<ObjectObserver<'_>>,
 ) -> Result<WalkOutcome> {
     // Nothing is checked up front any more, because there is no up-front set to check. The
@@ -639,6 +666,8 @@ pub fn fetch_wanted(
     let stop = AtomicBool::new(false);
     let fetched = AtomicU64::new(0);
     let bytes_moved = AtomicU64::new(0);
+    let cached = AtomicU64::new(0);
+    let bytes_cached = AtomicU64::new(0);
     let first: Mutex<Option<Refusal>> = Mutex::new(None);
     std::thread::scope(|scope| {
         for _ in 0..streams {
@@ -652,16 +681,45 @@ pub fn fetch_wanted(
                 };
                 let authorize = |stale: bool| urls.url_for(at, object, stale);
                 let outcome = DeliveryGrant::mint(plan, object).and_then(|grant| {
-                    fetch_authorized(
+                    // The grant already knows which namespace this object lives in — it
+                    // derives its own storage key from the same bit — so the cache is asked
+                    // the question the grant answers rather than one restated here.
+                    let kind = match grant.manifest {
+                        true => CacheKind::Manifest,
+                        false => CacheKind::Blob,
+                    };
+                    if let Some(cache) = cache {
+                        if cache.admit(store, kind, object)? == CacheRead::Hit {
+                            return Ok(Source::Cache);
+                        }
+                    }
+                    let one = fetch_authorized(
                         store, &grant, &authorize, policy, credential, deadline, ledger, None,
-                    )
+                    )?;
+                    if let Some(cache) = cache {
+                        // Weather, and deliberately unread: a cache that cannot be written
+                        // has cost this pull nothing, and the object it could not take is
+                        // already local and already proved.
+                        let _ = cache.backfill_store(store, kind, object);
+                    }
+                    Ok(Source::Origin(one))
                 });
                 match outcome {
-                    Ok(one) => {
-                        fetched.fetch_add(1, Ordering::Relaxed);
-                        bytes_moved.fetch_add(one.transferred, Ordering::Relaxed);
+                    Ok(source) => {
+                        let moved = match source {
+                            Source::Cache => {
+                                cached.fetch_add(1, Ordering::Relaxed);
+                                bytes_cached.fetch_add(object.length, Ordering::Relaxed);
+                                object.length
+                            }
+                            Source::Origin(one) => {
+                                fetched.fetch_add(1, Ordering::Relaxed);
+                                bytes_moved.fetch_add(one.transferred, Ordering::Relaxed);
+                                one.transferred
+                            }
+                        };
                         if let Some(observer) = on_object {
-                            observer(object, one.transferred);
+                            observer(object, moved);
                         }
                     }
                     Err(refusal) => {
@@ -682,7 +740,16 @@ pub fn fetch_wanted(
     Ok(WalkOutcome {
         fetched: fetched.load(Ordering::Relaxed),
         bytes_moved: bytes_moved.load(Ordering::Relaxed),
+        cached: cached.load(Ordering::Relaxed),
+        bytes_cached: bytes_cached.load(Ordering::Relaxed),
     })
+}
+
+/// Which door answered for one object. Both crossed `DeliveryGrant::admit`; only one
+/// crossed the network.
+enum Source {
+    Cache,
+    Origin(Fetched),
 }
 
 /// One pull, described before it runs. `sample_seconds` is the ledger's RESOLUTION —
@@ -698,6 +765,10 @@ pub struct PullRequest<'a> {
     pub streams: usize,
     pub session: &'a str,
     pub sample_seconds: f64,
+    /// The optional mounted repo-object cache consulted between the local Store and the
+    /// origin. `None` is a pull with no cache, which is every local pull and any pod whose
+    /// datacenter has no volume — never a degraded mode, just a shorter source order.
+    pub cache: Option<&'a RepoObjectCache>,
     pub on_object: Option<ObjectObserver<'a>>,
 }
 
@@ -720,6 +791,7 @@ impl<'a> PullRequest<'a> {
             streams: STREAMS,
             session: "",
             sample_seconds: crate::transport::ledger::SAMPLE_SECONDS,
+            cache: None,
             on_object: None,
         }
     }
@@ -739,6 +811,11 @@ pub struct PullReport {
     pub held: u64,
     pub fetched: u64,
     pub bytes_moved: u64,
+    /// What the mounted cache answered for, and what that spared the origin. Zero with no
+    /// cache and zero on a cold one; a warm datacenter is the case where these carry the
+    /// closure and `bytes_moved` is small.
+    pub cached: u64,
+    pub bytes_cached: u64,
     pub bytes_held: u64,
     pub bytes_total: u64,
     pub presence: Vec<(String, &'static str)>,
@@ -830,10 +907,13 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
             request.deadline,
             &ledger,
             request.streams,
+            request.cache,
             request.on_object,
         )?;
         report.fetched = walked.fetched;
         report.bytes_moved = walked.bytes_moved;
+        report.cached = walked.cached;
+        report.bytes_cached = walked.bytes_cached;
     }
     // The proof and the index row both read and write the catalog, and a walk that has just
     // landed gigabytes must not be thrown away because the store was busy for a moment while
