@@ -631,8 +631,22 @@ impl Census {
     }
 
     pub fn projection(&self) -> Result<Projection> {
+        self.projection_retaining(&[])
+    }
+
+    /// The projection of every repository EXCEPT the named ones.
+    ///
+    /// `drop` empty is the ordinary projection, which is why this is the only body: the
+    /// reclaim estimate and the collection it predicts are the same walk with the same
+    /// code, differing only in which repositories are still standing. A second, faster
+    /// estimator written beside this one is exactly where two expressions that agree on
+    /// every fixture anyone thought to write come to disagree on the store that matters.
+    fn projection_retaining(&self, drop: &[RepositoryName]) -> Result<Projection> {
         let mut projection = Projection::default();
         for (repository, bytes) in &self.repositories {
+            if drop.contains(&repository.repo) {
+                continue;
+            }
             projection.repos.push(RepoRow {
                 document_sha256: crate::sha256::hex_digest(bytes),
                 name: repository.repo.name.clone(),
@@ -704,13 +718,39 @@ impl Census {
     }
 
     pub fn gc_plan(&self, holds: &[HeldKey]) -> Result<Vec<GcDelete>> {
-        let projection = self.projection()?;
+        self.reclaim_plan(&[], holds)
+    }
+
+    /// What a collection would delete IF the named repositories were gone — the reclaim
+    /// estimate, answerable before anything is deleted.
+    ///
+    /// **This is `gc_plan` with the deletions not yet applied, and that is the point.** The
+    /// question the orchestrator has to answer is never "how big is this model" but "how
+    /// many bytes would I free by dropping THIS SET, given everything I am keeping", and on
+    /// a content-addressed store those differ arbitrarily: a 6.9 GB closure sharing its
+    /// text encoder and VAE with the model beside it may free almost nothing.
+    ///
+    /// Two errors are avoided by construction rather than by care. Summing each root's
+    /// drop-alone bytes UNDERSTATES without bound — an object held by exactly A and B is
+    /// unique to neither, so it is in no singleton's answer, yet dropping both frees it.
+    /// Counting each root's whole closure OVERSTATES, by counting bytes something retained
+    /// still needs. Removing the set from the census and asking the ordinary question gets
+    /// both right, and gets holds right for free.
+    pub fn reclaim_plan(
+        &self,
+        drop: &[RepositoryName],
+        holds: &[HeldKey],
+    ) -> Result<Vec<GcDelete>> {
+        let projection = self.projection_retaining(drop)?;
         let mut live_blobs = BTreeSet::new();
         for object in &projection.objects {
             live_blobs.insert(object.sha256.clone());
         }
         let mut live_manifests = BTreeSet::new();
         for repository in &self.repositories {
+            if drop.contains(&repository.0.repo) {
+                continue;
+            }
             for checkpoint in &repository.0.checkpoints {
                 live_manifests.insert(checkpoint.manifest.sha256.clone());
             }
@@ -783,6 +823,80 @@ impl Census {
         }
         plan.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(plan)
+    }
+
+    /// One walk over the whole graph, producing who-reaches-what.
+    ///
+    /// `reclaim_plan` is the oracle and this is the accelerator: the greedy chooser asks
+    /// "what would dropping this set free" once per candidate per step, and every such
+    /// question through `reclaim_plan` re-reads and re-parses every CozyTensors header from
+    /// disk (`Census::header`). Built once, the same question is a set operation.
+    ///
+    /// It is an accelerator and never the authority. The chosen plan is re-derived through
+    /// `reclaim_plan` before it is reported, and `the_index_and_the_oracle_agree` pins them
+    /// together on a store with deliberate three-way sharing.
+    pub fn holder_index(&self, holds: &[HeldKey]) -> Result<HolderIndex> {
+        let mut held = BTreeSet::new();
+        for hold in holds {
+            held.insert(hold.sha256.clone());
+        }
+        // A held manifest keeps its whole closure, exactly as the plan does.
+        for hold in holds {
+            if hold.kind == "manifest" {
+                if let Some((manifest, bytes)) = self.manifests.get(&hold.sha256) {
+                    let reference = ObjectRef {
+                        sha256: hold.sha256.clone(),
+                        length: bytes.len() as u64,
+                    };
+                    for object in self.manifest_blob_refs(manifest, &reference)? {
+                        held.insert(object.sha256);
+                    }
+                }
+            }
+        }
+        let mut index = HolderIndex {
+            roots: Vec::with_capacity(self.repositories.len()),
+            objects: BTreeMap::new(),
+            manifests: BTreeMap::new(),
+            held,
+        };
+        for (position, (repository, _)) in self.repositories.iter().enumerate() {
+            index.roots.push(repository.repo.clone());
+            for checkpoint in &repository.checkpoints {
+                let (manifest, bytes) = self.manifest(&checkpoint.manifest)?;
+                index
+                    .manifests
+                    .entry(checkpoint.manifest.sha256.clone())
+                    .or_insert((bytes.len() as u64, BTreeSet::new()))
+                    .1
+                    .insert(position);
+                for object in self.manifest_blob_refs(manifest, &checkpoint.manifest)? {
+                    index
+                        .objects
+                        .entry(object.sha256)
+                        .or_insert((object.length, BTreeSet::new()))
+                        .1
+                        .insert(position);
+                }
+            }
+        }
+        // Everything installed that no repository reaches. A plain `tfs gc` frees these
+        // without dropping anything, so they are reported apart from any eviction: telling
+        // an operator to evict a model for bytes a collection would have handed back for
+        // free is the same error as evicting one that frees nothing.
+        for entry in self.inventory.values() {
+            index
+                .objects
+                .entry(entry.sha256.clone())
+                .or_insert((entry.length, BTreeSet::new()));
+        }
+        for (sha256, (_, bytes)) in &self.manifests {
+            index
+                .manifests
+                .entry(sha256.clone())
+                .or_insert((bytes.len() as u64, BTreeSet::new()));
+        }
+        Ok(index)
     }
 
     /// The byte plane per repository: what each repository's retained checkpoints reach
@@ -998,6 +1112,60 @@ pub struct RepositoryUsage {
     pub name: String,
     pub bytes_total: u64,
     pub bytes_unique: u64,
+}
+
+/// Who reaches what, over one census. See [`Census::holder_index`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolderIndex {
+    /// Every repository in census order; a "root index" below is a position in this list.
+    pub roots: Vec<RepositoryName>,
+    objects: BTreeMap<String, (u64, BTreeSet<usize>)>,
+    manifests: BTreeMap<String, (u64, BTreeSet<usize>)>,
+    held: BTreeSet<String>,
+}
+
+impl HolderIndex {
+    pub fn position(&self, repo: &RepositoryName) -> Option<usize> {
+        self.roots.iter().position(|candidate| candidate == repo)
+    }
+
+    /// Bytes that dropping exactly `drop` would free: everything whose every holder is in
+    /// `drop`, minus anything a hold protects. An object one retained root still reaches is
+    /// not reclaimable, by definition and not by policy.
+    pub fn reclaimable(&self, drop: &BTreeSet<usize>) -> u64 {
+        let mut total = 0u64;
+        for map in [&self.objects, &self.manifests] {
+            for (sha256, (length, holders)) in map {
+                if self.held.contains(sha256) {
+                    continue;
+                }
+                if holders.iter().all(|holder| drop.contains(holder)) {
+                    total = total.saturating_add(*length);
+                }
+            }
+        }
+        total
+    }
+
+    /// Bytes no repository reaches at all — what a plain collection frees before any
+    /// eviction is considered.
+    pub fn unreferenced(&self) -> u64 {
+        self.reclaimable(&BTreeSet::new())
+    }
+
+    /// What one root's whole closure weighs, shared bytes included. Reported beside the
+    /// marginal precisely so the gap between them is visible: that gap IS the dedup.
+    pub fn closure_bytes(&self, root: usize) -> u64 {
+        let mut total = 0u64;
+        for map in [&self.objects, &self.manifests] {
+            for (length, holders) in map.values() {
+                if holders.contains(&root) {
+                    total = total.saturating_add(*length);
+                }
+            }
+        }
+        total
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

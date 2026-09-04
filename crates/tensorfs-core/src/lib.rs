@@ -30,6 +30,7 @@ pub mod meta;
 pub mod project;
 pub mod providers;
 pub mod read;
+pub mod reclaim;
 pub mod receipt;
 pub mod registry;
 pub mod relation;

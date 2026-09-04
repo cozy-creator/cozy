@@ -173,6 +173,13 @@ codes![
     SNAPSHOT_PINNED,
     STORE_BUSY,
     DURABILITY_UNPROVEN,
+    // reclamation (tfs-065): choosing what to stop naming, so a collection can free it
+    // This store was never given a disk budget, and having one is the whole opt-in.
+    RECLAIM_NOT_PERMITTED,
+    // Dropping everything droppable still would not free what was asked for. The honest
+    // answer to "this does not fit" is that it does not fit -- never a plan that empties
+    // the store and fails anyway.
+    RECLAIM_INSUFFICIENT,
     // the ingest durability journal (tfs-057): a chain that is not this conversion's is
     // discarded whole, never partially adopted
     JOURNAL_STALE,
