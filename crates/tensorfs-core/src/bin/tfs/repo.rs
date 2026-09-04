@@ -1023,81 +1023,6 @@ pub fn cmd_rebuild(census: &Path, flags: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashSet;
-    use tensorfs_core::manifest::Draft;
-
-    #[test]
-    fn inspect_closure_preserves_runtime_roles_over_aliased_files() {
-        let vectors = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors/cases");
-        let header = Header::parse(
-            &fs::read(vectors.join("header/plain-fp8.cbor")).expect("read frozen header"),
-        )
-        .unwrap();
-        let manifest = Manifest::parse(
-            &fs::read(vectors.join("manifest/checkpoint-extra-file.json"))
-                .expect("read frozen manifest"),
-        )
-        .unwrap();
-        let header_ref = manifest.header().unwrap().clone();
-        let part = header
-            .tensors()
-            .find_map(|(_, _, tensor)| {
-                tensor
-                    .parts
-                    .iter()
-                    .find_map(|(_, part)| part.segments().first().cloned())
-            })
-            .expect("frozen header has a segmented part");
-        let asset = header
-            .assets
-            .iter()
-            .find_map(|(_, asset)| asset.segments.first().cloned())
-            .expect("frozen header has a segmented asset");
-        let mut draft = Draft::of(&manifest);
-        draft.entries.extend([
-            ("assets/aliased-model.bin".into(), Entry::File(asset)),
-            ("weights/aliased-part.bin".into(), Entry::File(part.clone())),
-        ]);
-        draft.entries.sort_by(|left, right| left.0.cmp(&right.0));
-        let manifest = draft.seal().unwrap();
-        let refs = closure_refs(&manifest, &header, &header_ref).unwrap();
-        let file_ids: HashSet<&str> = manifest
-            .entries()
-            .iter()
-            .filter_map(|(_, entry)| match entry {
-                Entry::File(object) => Some(object.sha256.as_str()),
-                Entry::CozyTensors(_) => None,
-            })
-            .collect();
-
-        assert!(header.assets.iter().any(|(_, asset)| asset
-            .segments
-            .iter()
-            .any(|segment| file_ids.contains(segment.sha256.as_str()))));
-        for (_, asset) in &header.assets {
-            for segment in &asset.segments {
-                assert_eq!(refs[&segment.sha256].0, "model_asset");
-            }
-        }
-        assert_eq!(refs[&part.sha256].0, "part");
-
-        let runtime_ids: HashSet<&str> = refs
-            .values()
-            .filter(|(kind, _)| *kind != "file")
-            .map(|(_, object)| object.sha256.as_str())
-            .collect();
-        assert!(manifest.entries().iter().any(|(_, entry)| match entry {
-            Entry::File(object) => {
-                !runtime_ids.contains(object.sha256.as_str()) && refs[&object.sha256].0 == "file"
-            }
-            Entry::CozyTensors(_) => false,
-        }));
-    }
-}
-
 // ---------------------------------------------------------------- reclamation (tfs-065)
 //
 // `gc` collects what nothing names; `reclaim` chooses what to stop naming. Two acts, two
@@ -1237,4 +1162,79 @@ pub fn cmd_reclaim_plan(root: &Path, flags: &Flags) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use tensorfs_core::manifest::Draft;
+
+    #[test]
+    fn inspect_closure_preserves_runtime_roles_over_aliased_files() {
+        let vectors = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors/cases");
+        let header = Header::parse(
+            &fs::read(vectors.join("header/plain-fp8.cbor")).expect("read frozen header"),
+        )
+        .unwrap();
+        let manifest = Manifest::parse(
+            &fs::read(vectors.join("manifest/checkpoint-extra-file.json"))
+                .expect("read frozen manifest"),
+        )
+        .unwrap();
+        let header_ref = manifest.header().unwrap().clone();
+        let part = header
+            .tensors()
+            .find_map(|(_, _, tensor)| {
+                tensor
+                    .parts
+                    .iter()
+                    .find_map(|(_, part)| part.segments().first().cloned())
+            })
+            .expect("frozen header has a segmented part");
+        let asset = header
+            .assets
+            .iter()
+            .find_map(|(_, asset)| asset.segments.first().cloned())
+            .expect("frozen header has a segmented asset");
+        let mut draft = Draft::of(&manifest);
+        draft.entries.extend([
+            ("assets/aliased-model.bin".into(), Entry::File(asset)),
+            ("weights/aliased-part.bin".into(), Entry::File(part.clone())),
+        ]);
+        draft.entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let manifest = draft.seal().unwrap();
+        let refs = closure_refs(&manifest, &header, &header_ref).unwrap();
+        let file_ids: HashSet<&str> = manifest
+            .entries()
+            .iter()
+            .filter_map(|(_, entry)| match entry {
+                Entry::File(object) => Some(object.sha256.as_str()),
+                Entry::CozyTensors(_) => None,
+            })
+            .collect();
+
+        assert!(header.assets.iter().any(|(_, asset)| asset
+            .segments
+            .iter()
+            .any(|segment| file_ids.contains(segment.sha256.as_str()))));
+        for (_, asset) in &header.assets {
+            for segment in &asset.segments {
+                assert_eq!(refs[&segment.sha256].0, "model_asset");
+            }
+        }
+        assert_eq!(refs[&part.sha256].0, "part");
+
+        let runtime_ids: HashSet<&str> = refs
+            .values()
+            .filter(|(kind, _)| *kind != "file")
+            .map(|(_, object)| object.sha256.as_str())
+            .collect();
+        assert!(manifest.entries().iter().any(|(_, entry)| match entry {
+            Entry::File(object) => {
+                !runtime_ids.contains(object.sha256.as_str()) && refs[&object.sha256].0 == "file"
+            }
+            Entry::CozyTensors(_) => false,
+        }));
+    }
 }
