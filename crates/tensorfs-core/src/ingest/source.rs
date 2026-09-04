@@ -1038,7 +1038,12 @@ pub fn prepare_model_source(
 }
 
 pub fn release_model_source(store: &Store, operation_id: &str) -> Result<()> {
-    crate::catalog::Catalog::open(store.root())?.release_source_preparation(operation_id)
+    crate::catalog::Catalog::open(store.root())?.release_source_preparation(operation_id)?;
+    // The conversion journal and the session root that carried it are this operation's, and
+    // the caller has just said it is done with the result. Nothing may resume it afterwards,
+    // and nothing should keep holding its objects alive.
+    let _ = fs::remove_dir_all(transaction::candidate_dir(store.root(), operation_id));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1270,6 +1275,297 @@ mod tests {
         assert!(!catalog.held_keys().unwrap().is_empty());
         release_model_source(&store, &request.operation_id).unwrap();
         assert!(catalog.held_keys().unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ------------------------------------------------------------ the conversion journal
+    //
+    // Integration, not unit: a real Store, a real plan resolved off real carrier headers,
+    // real segmentation through the real CAS, and a real crash (the process's journal handle
+    // is dropped mid-plan, exactly as a released pod drops everything it held).
+
+    fn wide_carrier(path: &Path, key: &str, floats: usize, fill: u8) -> Vec<u8> {
+        let bytes = floats * 4;
+        let header = format!(
+            "{{{key:?}:{{\"data_offsets\":[0,{bytes}],\"dtype\":\"F32\",\"shape\":[{floats}]}}}}"
+        );
+        let mut out = (header.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(header.as_bytes());
+        out.extend(std::iter::repeat_n(fill, bytes));
+        fs::write(path, &out).unwrap();
+        out
+    }
+
+    /// One reviewed profile over TWO carriers, so a plan spans two files and a per-file pass
+    /// has something to defer.
+    fn two_carrier_fixture(root: &Path) -> (Store, Vec<u8>, Vec<CarrierInput>) {
+        fs::create_dir_all(root).unwrap();
+        let first_path = root.join("first.safetensors");
+        let second_path = root.join("second.safetensors");
+        wide_carrier(&first_path, "weight", 1024, 0x11);
+        wide_carrier(&second_path, "weight", 2048, 0x22);
+
+        let mut registry = FingerprintRegistry::default();
+        let mut components = Vec::new();
+        for (component, member, path) in [
+            ("encoder", "provider/first.safetensors", &first_path),
+            ("decoder", "provider/second.safetensors", &second_path),
+        ] {
+            let (header, raw) = read_carrier(path).unwrap();
+            let observed = fingerprint::fingerprint(component, &header).unwrap();
+            registry.merge(Banked {
+                keyset_digest: observed.keyset_digest.clone(),
+                dialect: "safetensors.diffusers".into(),
+                component: component.into(),
+                converter: "diffusers.identity/1".into(),
+                tensor_schema_digest: observed.tensor_schema_digest,
+                logical_keys: observed.logical_keys as u64,
+                provenance: Provenance {
+                    kind: REAL.into(),
+                    source: "synthetic full bytes".into(),
+                    source_sha256: Some(
+                        source_digest(&header, &raw)
+                            .trim_start_matches("sha256:")
+                            .to_string(),
+                    ),
+                    note: "conversion journal fixture".into(),
+                },
+            });
+            components.push(SourceProfileComponent {
+                component: component.into(),
+                source_member: Some(member.into()),
+                source_member_prefix: None,
+                target_encoding: "plain/1".into(),
+                variants: vec![super::fingerprint::SourceProfileVariant {
+                    keyset_digest: observed.keyset_digest,
+                    construction_order: vec!["weight".into()],
+                }],
+            });
+        }
+        registry.merge_source_profile(SourceProfile {
+            name: "journal/pair/1".into(),
+            components,
+        });
+        let store = Store::init(&root.join("store")).unwrap();
+        let carriers = vec![
+            CarrierInput {
+                member: Some("provider/first.safetensors".into()),
+                path: first_path,
+            },
+            CarrierInput {
+                member: Some("provider/second.safetensors".into()),
+                path: second_path,
+            },
+        ];
+        (store, registry.to_bytes(), carriers)
+    }
+
+    /// THE DECISIVE PROPERTY. A conversion interrupted partway resumes without re-hashing
+    /// what it already converted, and produces the same Manifest it would have produced in
+    /// one pass.
+    ///
+    /// Against the pre-journal `execute` this cannot pass: there was no record of a
+    /// completed op at all, so every resumed run re-read and re-hashed the whole plan and
+    /// only discovered the collision at the final link. It saved storage, never time.
+    #[test]
+    fn an_interrupted_conversion_resumes_without_rehashing_what_it_converted() {
+        let root = temporary("resume-journal");
+        let (store, registry, carriers) = two_carrier_fixture(&root);
+        let (_, prepared) = plan_source_prepared(
+            "fixture:registry",
+            &registry,
+            &carriers,
+            Some("journal/pair/1"),
+            None,
+        )
+        .unwrap();
+        let specs = plain_specs(&prepared.seeds);
+        // Which carrier a role reads is the PLAN's business (the profile's component order,
+        // not the caller's carrier order), so the expectation is read off the plan.
+        let bytes_from = |file_index: usize| -> u64 {
+            prepared
+                .plan
+                .ops
+                .iter()
+                .flat_map(|op| op.roles.iter())
+                .filter(|role| {
+                    matches!(&role.bytes, convert::Bytes::Stream { file, .. } if *file == file_index)
+                })
+                .map(|role| crate::dtype::checked_bytes("role", &role.shape, role.dtype).unwrap())
+                .sum()
+        };
+        let total = bytes_from(0) + bytes_from(1);
+        assert_eq!(total, (1024 + 2048) * 4);
+
+        // ---- the crash: only the first carrier has landed.
+        let (_, writer) = transaction::open_root(&store, "journal-operation", "tenant").unwrap();
+        let (partial, incomplete) = transaction::advance(
+            &store,
+            &prepared.plan,
+            &prepared.files,
+            &specs,
+            &[],
+            "journal-operation",
+            transaction::Carriers::Landed(&[true, false]),
+        )
+        .unwrap();
+        assert!(incomplete.is_none(), "no header exists over part of a plan");
+        assert!(!partial.complete());
+        assert_eq!(partial.deferred_ops, 1);
+        assert_eq!(partial.converted_roles, 1);
+        assert_eq!(partial.hashed, bytes_from(0));
+
+        // The half-converted output is named on the filesystem, so a GC pass keeps it. The
+        // session has no candidates at all yet — the header and Manifest are written last.
+        let session_dir = transaction::candidate_dir(store.root(), "journal-operation");
+        assert!(!super::super::journal::session_objects(&session_dir)
+            .unwrap()
+            .is_empty());
+        let (holds, sessions) = crate::gc::session_holds(&store).unwrap();
+        assert_eq!(sessions, ["journal-operation"]);
+        assert!(!holds.is_empty());
+        let survivors: Vec<String> = Census::open(store.root())
+            .unwrap()
+            .gc_plan(&holds)
+            .unwrap()
+            .iter()
+            .map(|row| row.key.clone())
+            .collect();
+        for hold in &holds {
+            assert!(
+                !survivors.contains(&hold.key),
+                "gc planned to reclaim in-flight conversion output {}",
+                hold.key
+            );
+        }
+
+        // ---- a real reclamation pass runs between the crash and the resume.
+        //
+        // This is the red arm for the second hazard: `catalog.hold()` wrote a row per 64 MiB
+        // segment and `gc::collect` never reads that table. Before the journal, a pass here
+        // reclaimed every byte of the half-converted output and the resume had nothing left
+        // to reuse. GC takes the exclusive recovery lock, so the dead writer goes first —
+        // exactly the state a released pod leaves behind.
+        drop(writer);
+        let objects: Vec<PathBuf> = super::super::journal::session_objects(&session_dir)
+            .unwrap()
+            .iter()
+            .map(|object| store.object_path(&object.sha256))
+            .collect();
+        assert!(!objects.is_empty());
+        let report = crate::gc::collect(store.root(), false).unwrap();
+        assert!(report.kept_objects > 0, "the journal held nothing");
+        assert_eq!(report.reclaimed_blobs, 0);
+        for path in &objects {
+            assert!(path.is_file(), "gc reclaimed in-flight conversion output");
+        }
+
+        // ---- the resume: a different process, after the writer died.
+        let (_, writer) = transaction::open_root(&store, "journal-operation", "tenant").unwrap();
+        let (resumed, outcome) = transaction::advance(
+            &store,
+            &prepared.plan,
+            &prepared.files,
+            &specs,
+            &[],
+            "journal-operation",
+            transaction::Carriers::All,
+        )
+        .unwrap();
+        assert!(resumed.complete());
+        assert_eq!(
+            resumed.resumed_roles, 1,
+            "the first carrier's op must come out of the journal"
+        );
+        assert_eq!(
+            resumed.hashed,
+            bytes_from(1),
+            "a resume hashes ONLY what it had not already converted"
+        );
+        let outcome = outcome.expect("a complete journal finalizes");
+
+        // ---- the same artifact a single uninterrupted pass would have produced.
+        let clean = temporary("resume-journal-oneshot");
+        let (fresh, registry2, carriers2) = two_carrier_fixture(&clean);
+        let (_, prepared2) = plan_source_prepared(
+            "fixture:registry",
+            &registry2,
+            &carriers2,
+            Some("journal/pair/1"),
+            None,
+        )
+        .unwrap();
+        let (_, fresh_writer) = transaction::open_root(&fresh, "one-shot", "tenant").unwrap();
+        let one_shot = transaction::execute(
+            &fresh,
+            &prepared2.plan,
+            &prepared2.files,
+            &plain_specs(&prepared2.seeds),
+            &[],
+            "one-shot",
+        )
+        .unwrap();
+        assert_eq!(one_shot.manifest_ref, outcome.manifest_ref);
+        assert_eq!(one_shot.header_ref, outcome.header_ref);
+        assert_eq!(one_shot.get("bytes_hashed"), total as i64);
+        assert_eq!(outcome.get("roles_resumed"), 1);
+
+        drop(writer);
+        drop(fresh_writer);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(clean);
+    }
+
+    /// A journal that is not complete may not become an artifact: a header over 44 of 48
+    /// shards is a structurally valid header for a smaller model.
+    #[test]
+    fn a_partial_journal_refuses_to_become_a_header() {
+        let root = temporary("partial-journal");
+        let (store, registry, carriers) = two_carrier_fixture(&root);
+        let (_, prepared) = plan_source_prepared(
+            "fixture:registry",
+            &registry,
+            &carriers,
+            Some("journal/pair/1"),
+            None,
+        )
+        .unwrap();
+        let specs = plain_specs(&prepared.seeds);
+        let headers: Vec<(PathBuf, &super::carrier::SourceHeader)> = prepared
+            .files
+            .iter()
+            .map(|file| (file.path.clone(), &file.header))
+            .collect();
+        let (_, writer) = transaction::open_root(&store, "partial", "tenant").unwrap();
+        let mut journal = super::super::journal::Journal::open(
+            &transaction::candidate_dir(store.root(), "partial"),
+            &super::super::journal::plan_digest(&prepared.plan, &headers),
+        )
+        .unwrap();
+        transaction::convert(
+            &store,
+            &prepared.plan,
+            &prepared.files,
+            &mut journal,
+            "partial",
+            transaction::Carriers::Landed(&[true, false]),
+        )
+        .unwrap();
+        let refusal = transaction::finalize(
+            &store,
+            transaction::Finalize {
+                plan: &prepared.plan,
+                journal: &journal,
+                specs: &specs,
+                configs: &[],
+                operation: "partial",
+                pass: &transaction::Progress::default(),
+                elapsed_ms: 0,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code, Code::VERIFIER_OUTPUT_INCOMPLETE);
+        drop(writer);
         let _ = fs::remove_dir_all(root);
     }
 

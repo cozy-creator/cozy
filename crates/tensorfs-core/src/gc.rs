@@ -95,19 +95,28 @@ impl Report {
     }
 }
 
-/// The filesystem's holds: every candidate an open ingest session root names. A candidate
-/// whose bytes sit in `manifests/` is a manifest hold (its closure stays live through the
-/// plan's held-manifest walk); anything else is a blob hold.
+/// The filesystem's holds: every candidate an open ingest session root names, PLUS every
+/// object its conversion journals name. A candidate whose bytes sit in `manifests/` is a
+/// manifest hold (its closure stays live through the plan's held-manifest walk); anything
+/// else is a blob hold.
+///
+/// The journal half is what makes an IN-FLIGHT conversion survive a pass. A session whose
+/// converter is still running has no candidates at all — the header and Manifest are written
+/// last — so before the journal existed the whole in-flight output was unreferenced bytes
+/// and the first pass reclaimed all of it. `catalog.hold()` looks like it prevented that and
+/// never did: `tensorfs.sqlite` is not consulted for liveness (see the head of this file).
 pub fn session_holds(store: &Store) -> Result<(Vec<HeldKey>, Vec<String>)> {
     let mut lines: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut sessions = Vec::new();
     for session in tx::sessions(store) {
         let root = tx::read_session(store.root(), &session)?;
-        if root.candidates.is_empty() {
+        let journalled =
+            crate::ingest::journal::session_objects(&tx::candidate_dir(store.root(), &session))?;
+        if root.candidates.is_empty() && journalled.is_empty() {
             continue;
         }
         sessions.push(session);
-        for candidate in &root.candidates {
+        for candidate in root.candidates.iter().chain(journalled.iter()) {
             let (kind, key) = if store.manifest_path(&candidate.sha256).is_file() {
                 ("manifest", storage::manifest_key(&candidate.sha256)?)
             } else {

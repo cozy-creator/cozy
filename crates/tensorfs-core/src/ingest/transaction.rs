@@ -25,6 +25,7 @@ use crate::store::{Store, Verdict};
 
 use super::carrier::{self, SourceHeader};
 use super::convert::{check_permute_size, Bytes, Plan};
+use super::journal::{self, Journal};
 
 fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
     Refusal {
@@ -384,57 +385,154 @@ pub struct SourceFile {
     pub header: SourceHeader,
 }
 
-/// Execute a plan through the real CAS. Streaming by construction: an identity-class role
-/// is copied through a fixed buffer and never resident, so peak RSS is a function of the
-/// buffer and the header, not of the artifact.
-pub fn execute(
+/// Which carriers this pass may read.
+///
+/// `Landed` is the per-file pipeline's argument: an op every one of whose roles reads a
+/// carrier that has arrived is converted and journalled NOW, and the rest are deferred to a
+/// later pass. It is what makes a source carrier transient by construction — converted, then
+/// droppable — instead of something the whole 210 GB selection has to be alive for at once.
+#[derive(Debug, Clone, Copy)]
+pub enum Carriers<'a> {
+    /// Every file in `files` is present. The whole-selection run.
+    All,
+    /// `landed[i]` says whether `files[i]` is readable right now.
+    Landed(&'a [bool]),
+}
+
+impl Carriers<'_> {
+    fn has(&self, file: usize) -> bool {
+        match self {
+            Carriers::All => true,
+            Carriers::Landed(landed) => landed.get(file).copied().unwrap_or(false),
+        }
+    }
+}
+
+/// What ONE conversion pass did. The byte counters are THIS PASS's work, never the
+/// artifact's totals: that is the whole measurement a resume exists to change.
+#[derive(Debug, Default, Clone)]
+pub struct Progress {
+    pub converted_roles: usize,
+    pub resumed_roles: usize,
+    pub deferred_ops: usize,
+    pub written: u64,
+    pub inherited: u64,
+    pub hashed: u64,
+    pub deduped: u64,
+}
+
+impl Progress {
+    /// Every op the plan names has a journalled part. Only then may a header exist.
+    pub fn complete(&self) -> bool {
+        self.deferred_ops == 0
+    }
+}
+
+/// Make sure the session root exists. The journal lives inside it, and `gc::session_holds`
+/// reads it — so this is also the act that puts in-flight conversion output under the
+/// filesystem's own hold protocol.
+///
+/// The model-source path never opened one: `prepare_model_source` went straight to `execute`
+/// with an operation id, so its output was named by nothing on disk and the first `tfs gc`
+/// pass would have reclaimed all of it (`catalog.hold()` writes rows `gc` never reads).
+pub fn ensure_session_root(store_root: &Path, session: &str, tenant: &str) -> Result<()> {
+    ascii_name("ingest session", session, limits::MAX_NAME_BYTES)?;
+    if session.contains('/') {
+        return refuse(
+            Code::KEY_GRAMMAR,
+            "an ingest session name is one path segment",
+        );
+    }
+    if read_session(store_root, session).is_err() {
+        write_session(
+            store_root,
+            &IngestSession {
+                session: session.to_string(),
+                tenant: tenant.to_string(),
+                candidates: Vec::new(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Name objects in the session root, where the filesystem hold protocol can see them.
+/// Additive and idempotent: a resumed run adds what it produced without unnaming what an
+/// earlier pass did.
+pub fn name_candidates(store_root: &Path, session: &str, refs: &[ObjectRef]) -> Result<()> {
+    let mut root = read_session(store_root, session)?;
+    for candidate in refs {
+        if !root
+            .candidates
+            .iter()
+            .any(|existing| existing.sha256 == candidate.sha256)
+        {
+            root.candidates.push(candidate.clone());
+        }
+    }
+    root.candidates.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    write_session(store_root, &root)
+}
+
+fn journal_of(store: &Store, plan: &Plan, files: &[SourceFile], session: &str) -> Result<Journal> {
+    ensure_session_root(store.root(), session, "_tensorfs")?;
+    let headers: Vec<(PathBuf, &SourceHeader)> = files
+        .iter()
+        .map(|file| (file.path.clone(), &file.header))
+        .collect();
+    Journal::open(
+        &candidate_dir(store.root(), session),
+        &journal::plan_digest(plan, &headers),
+    )
+}
+
+/// Convert every op whose carriers have landed, journalling each accepted op as it is
+/// produced, and REUSING every op a previous run already journalled without reading a byte.
+///
+/// Streaming by construction, unchanged: an identity-class role is copied through a fixed
+/// buffer and never resident, so peak RSS is a function of the buffer and the header, not of
+/// the artifact. What is new is that peak *lost work* is now also a function of neither.
+pub fn convert(
     store: &Store,
     plan: &Plan,
     files: &[SourceFile],
-    specs: &[(String, EncodingSpec)],
-    configs: &[(String, Vec<u8>)],
+    journal: &mut Journal,
     operation: &str,
-) -> Result<Outcome> {
+    carriers: Carriers<'_>,
+) -> Result<Progress> {
     plan.require_order()?;
-    let t0 = Instant::now();
-    let mut comps: Vec<(String, Vec<(String, Tensor)>)> = Vec::new();
-    let mut closure = Closure::default();
-    let mut encodings: Vec<EncodingSpec> = Vec::new();
+    let mut progress = Progress::default();
 
-    let (mut written, mut inherited, mut hashed, mut deduped) = (0u64, 0u64, 0u64, 0u64);
-    let (mut segments, mut inlines, mut parts) = (0usize, 0usize, 0usize);
-
-    // Resolved by DIGEST, never by alias: one alias groups several physical specs, and the
-    // plan already selected exactly one PER TENSOR. Computed once, not per op.
-    let by_id: Vec<(String, &EncodingSpec)> =
-        specs.iter().map(|(_, s)| (s.object_id(), s)).collect();
     // One key index per source file, computed once: `SourceHeader::get` is linear, and a
     // per-op linear probe is O(n²) at MAX_TENSORS.
     let indexes: Vec<std::collections::HashMap<&str, &super::carrier::SourceTensor>> =
         files.iter().map(|f| f.header.index()).collect();
 
     for op in &plan.ops {
-        let spec = match by_id.iter().find(|(id, _)| *id == op.encoding_id) {
-            Some((_, s)) => (*s).clone(),
-            None => {
-                return refuse(
-                    Code::UNKNOWN_ENCODING,
-                    format!(
-                        "{}: the plan selected spec {} ({}), which is not in the resolved set",
-                        op.out_key, op.encoding_id, op.encoding
-                    ),
-                )
+        let roles: Vec<String> = op.roles.iter().map(|r| r.role.clone()).collect();
+        if let Some(done) = journal.op(&op.component, &op.out_key, &roles) {
+            // A journalled part carries only if its objects still stand. This is
+            // `Bytes::Inherit`'s existing law: `contains` is a presence hint and nothing
+            // more, so admission takes a standing verification record or one rehash.
+            if done
+                .iter()
+                .all(|(_, part)| journal::segments_still_stand(store, part))
+            {
+                progress.resumed_roles += roles.len();
+                journal.resumed += roles.len();
+                continue;
             }
-        };
-        let sid = spec.object_id();
-        if closure.get(&sid).is_none() {
-            encodings.push(spec.clone());
-            closure.insert(spec.clone());
+        }
+        if !op.roles.iter().all(|role| match &role.bytes {
+            Bytes::Stream { file, .. } | Bytes::Permute { file, .. } => carriers.has(*file),
+            Bytes::Inherit { .. } => true,
+        }) {
+            progress.deferred_ops += 1;
+            continue;
         }
 
         let mut tparts: Vec<(String, Part)> = Vec::new();
         for r in &op.roles {
-            parts += 1;
             let what = format!("{}/{}#{}", op.component, op.out_key, r.role);
             let part = match &r.bytes {
                 Bytes::Stream { file, key } => {
@@ -458,13 +556,9 @@ pub fn execute(
                         &mut region,
                         Some(operation),
                     )?;
-                    written += w.bytes;
-                    hashed += w.bytes;
-                    deduped += w.deduped;
-                    segments += w.segments;
-                    if w.segments == 0 {
-                        inlines += 1;
-                    }
+                    progress.written += w.bytes;
+                    progress.hashed += w.bytes;
+                    progress.deduped += w.deduped;
                     w.part
                 }
                 Bytes::Permute { file, key, xform } => {
@@ -493,13 +587,9 @@ pub fn execute(
                         &mut region,
                         Some(operation),
                     )?;
-                    written += w.bytes;
-                    hashed += w.bytes;
-                    deduped += w.deduped;
-                    segments += w.segments;
-                    if w.segments == 0 {
-                        inlines += 1;
-                    }
+                    progress.written += w.bytes;
+                    progress.hashed += w.bytes;
+                    progress.deduped += w.deduped;
                     w.part
                 }
                 Bytes::Inherit { part } => {
@@ -550,13 +640,103 @@ pub fn execute(
                         }
                     }
                     let bytes = checked_bytes(&what, &r.shape, r.dtype)?;
-                    inherited += bytes;
+                    progress.inherited += bytes;
                     store.moved(bytes);
-                    segments += part.segments().len();
                     (**part).clone()
                 }
             };
             tparts.push((r.role.clone(), part));
+        }
+        // DURABLE BEFORE ADVERTISED: the op's meaning reaches the disk before the next op
+        // starts, so a kill here costs one op and never the pass.
+        journal.record(&op.component, &op.out_key, &tparts)?;
+        progress.converted_roles += tparts.len();
+    }
+    Ok(progress)
+}
+
+/// Build the candidate header and Manifest out of the journal.
+///
+/// THE FORMAT CANNOT EXPRESS *INCOMPLETE*. A header over 44 of 48 shards is a structurally
+/// valid header for a smaller model, and nothing downstream could tell it from a real one.
+/// So the refusal lives here: every op the plan names must have a journalled part before any
+/// header exists at all.
+pub struct Finalize<'a> {
+    pub plan: &'a Plan,
+    pub journal: &'a Journal,
+    pub specs: &'a [(String, EncodingSpec)],
+    pub configs: &'a [(String, Vec<u8>)],
+    pub operation: &'a str,
+    /// What the pass that just ran did. The byte counters ride into the observations, so a
+    /// resumed run reports the work IT did and not the artifact's totals.
+    pub pass: &'a Progress,
+    pub elapsed_ms: i64,
+}
+
+pub fn finalize(store: &Store, request: Finalize<'_>) -> Result<Outcome> {
+    let Finalize {
+        plan,
+        journal,
+        specs,
+        configs,
+        operation,
+        pass,
+        elapsed_ms,
+    } = request;
+    plan.require_order()?;
+    let mut comps: Vec<(String, Vec<(String, Tensor)>)> = Vec::new();
+    let mut closure = Closure::default();
+    let mut encodings: Vec<EncodingSpec> = Vec::new();
+    let (mut segments, mut inlines, mut parts) = (0usize, 0usize, 0usize);
+
+    // Resolved by DIGEST, never by alias: one alias groups several physical specs, and the
+    // plan already selected exactly one PER TENSOR. Computed once, not per op.
+    let by_id: Vec<(String, &EncodingSpec)> =
+        specs.iter().map(|(_, s)| (s.object_id(), s)).collect();
+
+    for op in &plan.ops {
+        let spec = match by_id.iter().find(|(id, _)| *id == op.encoding_id) {
+            Some((_, s)) => (*s).clone(),
+            None => {
+                return refuse(
+                    Code::UNKNOWN_ENCODING,
+                    format!(
+                        "{}: the plan selected spec {} ({}), which is not in the resolved set",
+                        op.out_key, op.encoding_id, op.encoding
+                    ),
+                )
+            }
+        };
+        let sid = spec.object_id();
+        if closure.get(&sid).is_none() {
+            encodings.push(spec.clone());
+            closure.insert(spec.clone());
+        }
+
+        let roles: Vec<String> = op.roles.iter().map(|r| r.role.clone()).collect();
+        let tparts = match journal.op(&op.component, &op.out_key, &roles) {
+            Some(tparts) => tparts,
+            None => {
+                return refuse(
+                    Code::VERIFIER_OUTPUT_INCOMPLETE,
+                    format!(
+                        "{}/{}: the conversion journal holds {} of {} ops; a CozyTensors \
+                         header over part of a plan is a valid header for a DIFFERENT model, \
+                         so none is written until every op has landed",
+                        op.component,
+                        op.out_key,
+                        journal.len(),
+                        plan.ops.len(),
+                    ),
+                )
+            }
+        };
+        for (_, part) in &tparts {
+            parts += 1;
+            match part.segments().len() {
+                0 => inlines += 1,
+                n => segments += n,
+            }
         }
 
         let t = Tensor {
@@ -593,26 +773,32 @@ pub fn execute(
         .obj;
     let manifest = build_manifest(&header, &header_ref, &closure)?;
     let manifest_ref = store.put_manifest_held(&manifest, Some(operation))?.obj;
+    // The two documents nothing else names yet. Written into the session root so the
+    // filesystem hold protocol keeps them until the coordinator installs or releases.
+    name_candidates(
+        store.root(),
+        operation,
+        &[header_ref.clone(), manifest_ref.clone()],
+    )?;
 
     let obs = vec![
-        ("bytes_written".to_string(), written as i64),
-        ("bytes_inherited".to_string(), inherited as i64),
-        ("bytes_hashed".to_string(), hashed as i64),
-        ("bytes_deduped".to_string(), deduped as i64),
+        ("bytes_written".to_string(), pass.written as i64),
+        ("bytes_inherited".to_string(), pass.inherited as i64),
+        ("bytes_hashed".to_string(), pass.hashed as i64),
+        ("bytes_deduped".to_string(), pass.deduped as i64),
         ("tensors".to_string(), plan.ops.len() as i64),
         ("parts".to_string(), parts as i64),
         ("segments".to_string(), segments as i64),
         ("inline_parts".to_string(), inlines as i64),
+        ("roles_converted".to_string(), pass.converted_roles as i64),
+        ("roles_resumed".to_string(), pass.resumed_roles as i64),
         (
             "markers_dropped".to_string(),
             plan.dropped_markers.len() as i64,
         ),
         ("roles_folded".to_string(), plan.folded_roles.len() as i64),
         ("carrier_header_bytes".to_string(), plan.header_bytes as i64),
-        (
-            "convert_elapsed_ms".to_string(),
-            t0.elapsed().as_millis() as i64,
-        ),
+        ("convert_elapsed_ms".to_string(), elapsed_ms),
     ];
 
     Ok(Outcome {
@@ -623,6 +809,89 @@ pub fn execute(
         manifest_ref,
         obs,
     })
+}
+
+/// Execute a plan through the real CAS, journalling every op as it lands.
+///
+/// The whole-selection entry point: convert what is not already journalled, then finalize.
+/// Interrupt it anywhere and the next call re-converts only what the journal does not hold.
+pub fn execute(
+    store: &Store,
+    plan: &Plan,
+    files: &[SourceFile],
+    specs: &[(String, EncodingSpec)],
+    configs: &[(String, Vec<u8>)],
+    operation: &str,
+) -> Result<Outcome> {
+    let t0 = Instant::now();
+    let mut journal = journal_of(store, plan, files, operation)?;
+    let progress = convert(store, plan, files, &mut journal, operation, Carriers::All)?;
+    finalize(
+        store,
+        Finalize {
+            plan,
+            journal: &journal,
+            specs,
+            configs,
+            operation,
+            pass: &progress,
+            elapsed_ms: t0.elapsed().as_millis() as i64,
+        },
+    )
+}
+
+/// Convert only what has landed, and finalize when the journal is complete.
+///
+/// This is the per-file pipeline's entry point: call it every time another carrier arrives.
+/// `Ok(None)` means real work was done and durably recorded, and the artifact is still
+/// waiting on carriers that have not landed.
+pub fn advance(
+    store: &Store,
+    plan: &Plan,
+    files: &[SourceFile],
+    specs: &[(String, EncodingSpec)],
+    configs: &[(String, Vec<u8>)],
+    operation: &str,
+    carriers: Carriers<'_>,
+) -> Result<(Progress, Option<Outcome>)> {
+    let t0 = Instant::now();
+    let mut journal = journal_of(store, plan, files, operation)?;
+    let progress = convert(store, plan, files, &mut journal, operation, carriers)?;
+    if !progress.complete() {
+        return Ok((progress, None));
+    }
+    let outcome = finalize(
+        store,
+        Finalize {
+            plan,
+            journal: &journal,
+            specs,
+            configs,
+            operation,
+            pass: &progress,
+            elapsed_ms: t0.elapsed().as_millis() as i64,
+        },
+    )?;
+    Ok((progress, Some(outcome)))
+}
+
+/// Drop the conversion journal for one plan. The coordinator's act, after its result is
+/// installed or released — a crash never reaches here, which is the point.
+pub fn forget_journal(
+    store: &Store,
+    plan: &Plan,
+    files: &[SourceFile],
+    operation: &str,
+) -> Result<()> {
+    let headers: Vec<(PathBuf, &SourceHeader)> = files
+        .iter()
+        .map(|file| (file.path.clone(), &file.header))
+        .collect();
+    Journal::open(
+        &candidate_dir(store.root(), operation),
+        &journal::plan_digest(plan, &headers),
+    )?
+    .remove()
 }
 
 #[cfg(test)]

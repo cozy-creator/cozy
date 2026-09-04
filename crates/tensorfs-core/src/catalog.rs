@@ -598,6 +598,21 @@ impl Catalog {
         result
     }
 
+    /// Register an exact key against an operation.
+    ///
+    /// **A HOLD IS NOT GC PROTECTION, and never was.** `gc::collect` computes liveness from
+    /// `repos/`, `manifests/` and `blobs/` plus the FILESYSTEM hold protocol — open ingest
+    /// session roots and the conversion journals inside them — and `tensorfs.sqlite` is
+    /// never consulted (gc.rs, owner ruling 2026-09-02). `held_keys()` below has no
+    /// production caller; it exists for tests and for `tfs gc plan --holds`, which is fed a
+    /// file, not this table. What these rows are FOR is the operation's own bookkeeping:
+    /// `complete_operation`/`abandon` cascade them away, so an operation can state exactly
+    /// which keys it put down without walking the store again.
+    ///
+    /// A writer that needs its in-flight output to survive a `tfs gc` pass must name those
+    /// objects on the filesystem — `transaction::name_candidates`, or the conversion journal
+    /// that `ingest::journal` appends to as each op lands. Writing a row here and expecting
+    /// the collector to honour it is the mistake this note exists to prevent.
     pub fn hold(&self, operation: &str, key: &str, length: u64) -> Result<()> {
         let kind = if key.starts_with("blobs/") {
             "blob"
