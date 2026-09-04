@@ -213,6 +213,15 @@ func (c *Orchestrator) onModelTransferWeightsStatus(s *session,
 	if state == "" || frame.TransferredBytes > frame.Length {
 		return
 	}
+	previous := ""
+	if objects, readProblem := c.opt.Store.ModelTransferObjects(frame.RequestId,
+		int64(frame.AttemptOrdinal), frame.OutputSlot); readProblem == nil {
+		for _, object := range objects {
+			if object.ObjectID == frame.ObjectId {
+				previous = object.State
+			}
+		}
+	}
 	problem = c.opt.Store.RecordModelTransferObjectStatus(records.ModelTransferObject{
 		RequestID: frame.RequestId, Attempt: int64(frame.AttemptOrdinal),
 		OutputSlot: frame.OutputSlot, ObjectID: frame.ObjectId, Length: int64(frame.Length),
@@ -229,7 +238,16 @@ func (c *Orchestrator) onModelTransferWeightsStatus(s *session,
 		}
 		return
 	}
-	c.signalTransfer(frame.RequestId)
+	// The same rule as the source lane: the wake is for facts the mover can act on, and
+	// `moveModelTransferWeights` decides on an object's STATE. Waking on byte progress made
+	// the pod's own echo re-send every non-adopted object at `grant_revision + 1` — the
+	// restatement loop of cl-134 on the outbound half, and the manufacturer of the stale
+	// grant revisions cl-133 was swallowing. The re-send itself stays: it is how an object
+	// whose grant went cold gets a signature minted just now (`WeightsGrantWindow.Expire`),
+	// and on a state change it is exactly what should happen.
+	if state != previous {
+		c.signalTransfer(frame.RequestId)
+	}
 }
 
 func canonicalSpell(raw []byte) string {
