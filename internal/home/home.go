@@ -156,8 +156,8 @@ func renameRecords(root, daemonLock, db string) *exit.Error {
 			"%s holds both records.db and creator.sqlite, and the records.db is not "+
 				"obviously stale (%s); this build only ever writes creator.sqlite, so move "+
 				"records.db aside if it predates the migration", root, detail).
-			WithRemedy("inspect both, then move the one you do not want aside: " +
-				"`mv " + prior + " " + prior + ".aside`")
+			WithRemedy("inspect both, then move the one you do not want aside: `mv %s %s.aside`",
+				prior, prior)
 	}
 	f, err := os.OpenFile(daemonLock, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
