@@ -286,9 +286,6 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		return records.Rental{}, hub.Rental{}, false, e
 	}
 	machineName := request.Name
-	if !replay {
-		fmt.Fprintf(ctx.Err, "  rental operation %s persisted; reuse this key to resume\n", operationKey)
-	}
 	// The create request is deliberately not canceled with the operation: a lost
 	// create answer can name a billing pod. Cancellation is sampled immediately
 	// after its durable verdict, when the rental id can be released exactly.
@@ -302,6 +299,18 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 				return records.Rental{}, hub.Rental{}, false, advanced
 			}
 			rental.ForgetPending(l, operationKey)
+			return records.Rental{}, hub.Rental{}, false, e
+		}
+		// THE KEY IS ONLY ACTIONABLE HERE (cl-135). It used to be printed on EVERY
+		// rental — a minted hex string the caller never chose, naming a resume they were
+		// not taking — and withheld on the one outcome where reusing it is the difference
+		// between resuming this rental and paying for a second pod. The ask that started
+		// this was "that doesn't mean anything for me", and it was right: a fact is noise
+		// where it cannot be acted on and help where it can.
+		if e.Remedy == "" {
+			e = e.WithRemedy("the operation is persisted, so this exact rental can be "+
+				"resumed rather than a second one paid for: cozy rental new %s "+
+				"--idempotency-key %s", skuName, operationKey)
 		}
 		return records.Rental{}, hub.Rental{}, false, e
 	}
