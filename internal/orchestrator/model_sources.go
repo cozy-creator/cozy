@@ -135,7 +135,17 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 		}
 		return
 	}
-	if state == "failed" && frame.SafeCode != "capability_expired" {
+	// EVERY FAILED IS THE POD'S LAST WORD. This used to except `capability_expired`, on
+	// the theory that a lapsed credential is answered by re-issuing under a fresh one.
+	// Nothing emits that code — it appears in this repository once, in the line that read
+	// it, and nowhere in tensorhub, cozy-runtime, tensorfs or the protocol. It is the same
+	// retired exception host.go:264 already documents removing: the download delegation was
+	// deleted (owner ruling 2026-09-03), so a fetch can no longer become unauthorized by
+	// running long. Left in place it is worse than dead — `prepareModelTransferRemote`
+	// holds a frozen capability set for its whole life, so the re-issue this excepted was
+	// never built, and a FAILED that does not fail the transfer is now a member nobody
+	// will ever state again.
+	if state == "failed" {
 		_ = c.opt.Store.FailModelTransfer(frame.OperationId, frame.SafeCode, frame.SafeDetail)
 	}
 	if statuses, problem := c.opt.Store.ModelTransferSourceStatuses(frame.OperationId); problem == nil {
@@ -176,7 +186,15 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 				len(transfer.SourceFiles), transferred, total)
 		}
 	}
-	c.signalTransfer(frame.OperationId)
+	// THE WAKE IS FOR FACTS THE PREPARER CAN ACT ON. It used to fire on every accepted
+	// frame, byte progress included, and `prepareModelTransferRemote` answered each one by
+	// re-stating the member — the pod's own echo driving the owner to talk again. Byte
+	// counts reach the live view above, which is where they were already going; the
+	// preparer decides on a member's STATE. Session attach, session drop and cancellation
+	// each signal on their own, so nothing it waits on is left without a wake.
+	if state != previous {
+		c.signalTransfer(frame.OperationId)
+	}
 }
 
 func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePrepared) {
