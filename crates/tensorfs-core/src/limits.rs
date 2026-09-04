@@ -54,8 +54,6 @@ pub const CARRIER_HEADER_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// a streaming transform). Above this a converter refuses rather than growing without bound;
 /// identity/inherit ops never buffer and are not subject to it.
 pub const CONVERT_TENSOR_MAX_BYTES: u64 = 512 * 1024 * 1024;
-/// Streaming copy buffer at the border — the peak-RSS floor of an identity-class ingest.
-pub const INGEST_STREAM_BUF: usize = 4 * 1024 * 1024;
 
 /// Interoperable integer range (I-JSON): numbers outside it refuse.
 pub const INT_MAX: i64 = (1i64 << 53) - 1;

@@ -24,6 +24,28 @@ jobs:
       - run: python3 scripts/fence.py
       - run: python3 scripts/version_contract.py source
       - run: cargo build --release --bin tfs
+      # A wheel is built once and runs on whatever the pod rents (tfs-068), so the SHA-256
+      # instructions must be reachable ONLY through the runtime-detected dispatch: an
+      # instruction emitted into an ordinary function is SIGILL on a host without them,
+      # which is a crash in `put` rather than a slow `put`. The check would fire the day
+      # someone adds `-C target-feature=+sha` to a build. `ring` carries its own detected
+      # implementation for TLS and is named because it is not ours.
+      - run: |
+          set -e
+          out=$(objdump -d --no-show-raw-insn target/release/tfs \
+            | awk '/^[0-9a-f]+ <.*>:$/ { s=$2 }
+                   /sha256rnds2|sha256msg1|sha256msg2/ { print s }' | sort -u)
+          [ -n "$out" ] || { echo "no sha extension instructions: the routine was dropped"; exit 1; }
+          bad=$(echo "$out" | grep -v 'sha2563x868compress' | grep -v 'ring_core' || true)
+          [ -z "$bad" ] || { echo "sha instructions outside the dispatch:"; echo "$bad"; exit 1; }
+          echo "sha extension instructions live only in the runtime-dispatched routine"
+      # Which SHA-256 routine the suite above ran through. On a runner without the
+      # extensions the differential test compares the scalar routine with itself, and the
+      # log should say so rather than leave it to be assumed.
+      - run: |
+          grep -qo sha_ni /proc/cpuinfo \
+            && echo "runner HAS the sha extensions: both routines were exercised" \
+            || echo "runner LACKS the sha extensions: only the scalar fallback was exercised"
       - run: ./target/release/tfs vectors verify
       - run: |
           set -e
