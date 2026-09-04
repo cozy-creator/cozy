@@ -5,8 +5,8 @@
 
 use super::hub::{Anonymous, HostToken};
 use super::ledger::{Deadline, Ledger};
-use super::policy::{blocked, SourcePolicy};
-use super::pull::{fetch_url, pull, ObjectSource, PullRequest};
+use super::policy::{self, blocked, SourcePolicy};
+use super::pull::{absolute_location, fetch_url, pull, ObjectSource, PullRequest};
 use super::push::{push_object, UploadGrant};
 use crate::canon::Value;
 use crate::dtype::Dtype;
@@ -1402,6 +1402,121 @@ fn redirects_are_refused_or_revalidated_never_followed_blind() {
     .unwrap_err();
     assert_eq!(refusal.code, Code::SOURCE_NOT_ALLOWED);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_relative_location_is_resolved_against_the_hop_that_sent_it() {
+    // HuggingFace answers `resolve/<commit>/<path>` for a member with NO LFS pointer -- a
+    // sharded repo's `model.safetensors.index.json` -- with a same-origin 307 whose
+    // Location is `/api/resolve-cache/...`, while every LFS member gets an ABSOLUTE
+    // redirect onto a delivery host. Refusing the relative form therefore refused exactly
+    // the index members of every sharded repo, on every pod, forever, while their shards
+    // succeeded: MiniMax-H3 moved all 210.3 GB of its 44 shards and then sat at 44 of 48
+    // for hours on four files totalling 249 KB.
+    let root = temporary("relative-redirect");
+    let store = Store::init(&root).unwrap();
+    let body = b"the member behind a relative redirect".to_vec();
+    let object = ObjectRef::of(&body);
+    let served = body.clone();
+    let dispatch: Dispatch = Arc::new(move |request: &Request| {
+        if request.path.starts_with("/api/resolve-cache/") {
+            return Serve::Whole {
+                status: 200,
+                body: served.clone(),
+                headers: Vec::new(),
+            };
+        }
+        // Relative, and carrying a query -- the shape HuggingFace actually sends.
+        Serve::Whole {
+            status: 307,
+            body: Vec::new(),
+            headers: vec![(
+                "location".into(),
+                "/api/resolve-cache/models/org/repo/deadbeef/member.json?etag=%22abc%22".into(),
+            )],
+        }
+    });
+    let origin = origin(dispatch);
+    let (plan, _) =
+        FetchPlan::of_objects(&store, "relative", std::slice::from_ref(&object)).unwrap();
+    let grant = DeliveryGrant::mint(&plan, &object).unwrap();
+    let url = format!("{}/org/repo/resolve/deadbeef/member.json", origin.base);
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+    let mut policy = local_policy();
+    policy.max_redirects = 5;
+
+    fetch_url(
+        &store,
+        &grant,
+        &url,
+        &policy,
+        &Anonymous,
+        Deadline::none(),
+        &ledger,
+        None,
+    )
+    .unwrap();
+
+    // The object is in the store, admitted through the same digest door as every other
+    // byte: the redirect changed which socket served it and nothing about what was accepted.
+    assert!(store.contains(&object.sha256));
+    assert_eq!(origin.hits("/org/repo/resolve/deadbeef/member.json"), 1);
+    assert_eq!(
+        origin.hits("/api/resolve-cache/models/org/repo/deadbeef/member.json"),
+        1
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn resolving_a_relative_location_cannot_leave_the_origin_the_predicate_admitted() {
+    // The safety argument for following a relative reference, asserted rather than
+    // reasoned: a relative Location resolves against the hop just walked, so it names the
+    // SAME origin the fence already admitted. Only an ABSOLUTE Location can name another
+    // host, and that one still faces the whole predicate on the next hop -- which is what
+    // `redirects_are_refused_or_revalidated_never_followed_blind` pins.
+    let base = policy::CheckedUrl {
+        https: true,
+        host: "huggingface.co".into(),
+        port: 443,
+        target: "/org/repo/resolve/deadbeef/dir/member.json?v=1".into(),
+        addrs: Vec::new(),
+    };
+    let cases = [
+        (
+            "/api/resolve-cache/x?e=1",
+            "https://huggingface.co/api/resolve-cache/x?e=1",
+        ),
+        (
+            "sibling.json",
+            "https://huggingface.co/org/repo/resolve/deadbeef/dir/sibling.json",
+        ),
+        (
+            "https://cdn.example.org/blob",
+            "https://cdn.example.org/blob",
+        ),
+        ("//cdn.example.org/blob", "https://cdn.example.org/blob"),
+    ];
+    for (location, want) in cases {
+        assert_eq!(
+            absolute_location(&base, location).as_deref(),
+            Some(want),
+            "resolving {location:?}"
+        );
+    }
+    // Nothing usable is not silently turned into the base URL: an empty Location is a
+    // refusal, not a re-fetch of the same target, which would be a hot loop.
+    assert_eq!(absolute_location(&base, "   "), None);
+
+    // A non-default port is carried, so a relative hop cannot be redirected to :443.
+    let odd = policy::CheckedUrl {
+        port: 8443,
+        ..base.clone()
+    };
+    assert_eq!(
+        absolute_location(&odd, "/x").as_deref(),
+        Some("https://huggingface.co:8443/x")
+    );
 }
 
 // ---------------------------------------------------------------- the push half

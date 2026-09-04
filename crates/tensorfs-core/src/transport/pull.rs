@@ -388,12 +388,12 @@ fn open_object<'l>(
             let Some(location) = response.header("location").map(str::to_string) else {
                 return refuse(Code::REDIRECT_REFUSED, "origin redirected with no Location");
             };
-            if !location.contains("://") {
+            let Some(absolute) = absolute_location(&checked, &location) else {
                 return refuse(
                     Code::REDIRECT_REFUSED,
-                    "origin redirected to a non-absolute URL",
+                    "origin redirected with an unusable Location",
                 );
-            }
+            };
             if policy.max_redirects == 0 {
                 return refuse(
                     Code::REDIRECT_REFUSED,
@@ -401,7 +401,7 @@ fn open_object<'l>(
                      open a URL the predicate never saw",
                 );
             }
-            target = location;
+            target = absolute;
             continue;
         }
         if status == 200 {
@@ -427,6 +427,49 @@ fn open_object<'l>(
             policy.max_redirects
         ),
     )
+}
+
+/// RFC 9110 §10.2.2: a `Location` MAY be a relative reference, and resolving one is the
+/// client's job. It is not an edge case here — HuggingFace answers a `resolve` URL for a
+/// member with NO LFS pointer (a sharded repo's `model.safetensors.index.json`) with a
+/// same-origin 307 to `/api/resolve-cache/...`, while every LFS member gets an absolute
+/// redirect onto a delivery host. Refusing the relative form therefore refused exactly the
+/// index members of every sharded repo, forever, on every pod, while their shards succeeded.
+///
+/// Resolution is against the hop just walked, so a relative reference cannot leave the
+/// origin the predicate already admitted — strictly narrower than the absolute redirects
+/// this walk has always followed. The caller re-checks the result regardless: the fence is
+/// applied per hop, and this function decides a URL's SHAPE, never its permission.
+pub(super) fn absolute_location(base: &policy::CheckedUrl, location: &str) -> Option<String> {
+    let location = location.trim();
+    if location.is_empty() {
+        return None;
+    }
+    if location.contains("://") {
+        return Some(location.to_string());
+    }
+    let scheme = if base.https { "https" } else { "http" };
+    // A protocol-relative reference carries its own authority; only the scheme is inherited.
+    if let Some(rest) = location.strip_prefix("//") {
+        return (!rest.is_empty()).then(|| format!("{scheme}://{rest}"));
+    }
+    let default_port = if base.https { 443 } else { 80 };
+    let origin = if base.port == default_port {
+        format!("{scheme}://{}", base.host)
+    } else {
+        format!("{scheme}://{}:{}", base.host, base.port)
+    };
+    if location.starts_with('/') {
+        return Some(format!("{origin}{location}"));
+    }
+    // A path-relative reference resolves against the base's directory. The base query is
+    // dropped, which is what RFC 3986 §5.3 does and what every browser does.
+    let path = base.target.split('?').next().unwrap_or("/");
+    let directory = match path.rfind('/') {
+        Some(cut) => &path[..=cut],
+        None => "/",
+    };
+    Some(format!("{origin}{directory}{location}"))
 }
 
 fn named(refusal: Refusal, id: &str) -> Refusal {
