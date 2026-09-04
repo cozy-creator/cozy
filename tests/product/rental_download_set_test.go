@@ -184,10 +184,15 @@ type standInPod struct {
 	// prepareCalls counts PreparePackageSet calls. It is the owner's re-issue rate seen
 	// from the other end, and the only honest measure of a desired-state retry loop.
 	prepareCalls uint64
+	// onSession, when set, is called once per accepted control stream with a sender bound
+	// to that stream and the stream's own envelope. It is how an arm drives a lane this
+	// pod does not otherwise speak, on the real wire and behind the real fence.
+	onSession func(send func(*pb.WorkerFrame) error, ownerEpoch, controlEpoch uint64, bootID string)
 
-	mu    sync.Mutex
-	seen  []presentedDownloadSet
-	epoch uint64
+	mu     sync.Mutex
+	sendMu sync.Mutex
+	seen   []presentedDownloadSet
+	epoch  uint64
 }
 
 // claims counts the control streams this pod has accepted a Claim on. It is the owner's
@@ -249,8 +254,16 @@ func (p *standInPod) Control(stream pb.WorkerControl_ControlServer) error {
 		SnapshotCanonicalBytes: bodyBytes, AcceptedPlacementSetCanonicalBytes: emptySet,
 		RecordOwnerEpoch: claim.RecordOwnerEpoch, ControlStreamEpoch: epoch, WorkerBootId: p.bootID,
 	}
-	if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_Snapshot{Snapshot: snapshot}}); err != nil {
+	send := func(m *pb.WorkerFrame) error {
+		p.sendMu.Lock()
+		defer p.sendMu.Unlock()
+		return stream.Send(m)
+	}
+	if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_Snapshot{Snapshot: snapshot}}); err != nil {
 		return nil
+	}
+	if p.onSession != nil {
+		go p.onSession(send, claim.RecordOwnerEpoch, epoch, p.bootID)
 	}
 
 	frames := make(chan *pb.RecordOwnerFrame)
@@ -301,7 +314,7 @@ func (p *standInPod) Control(stream pb.WorkerControl_ControlServer) error {
 			RecordOwnerEpoch: claim.RecordOwnerEpoch, ControlStreamEpoch: epoch,
 			WorkerBootId: p.bootID,
 		}
-		if err := stream.Send(&pb.WorkerFrame{
+		if err := send(&pb.WorkerFrame{
 			Msg: &pb.WorkerFrame_ObservedState{ObservedState: observed}}); err != nil {
 			return nil
 		}

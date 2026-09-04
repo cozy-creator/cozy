@@ -272,7 +272,10 @@ func (c *Orchestrator) hostPrepareRefused(_ *session, w *worker, seq uint64, _, 
 	}
 	c.mu.Lock()
 	if w.hostPrepareSeq != seq {
+		live := w.hostPrepareSeq
 		c.mu.Unlock()
+		c.logf("worker %s: PodHost prepare #%d was superseded by #%d before its refusal "+
+			"landed; the newer prepare carries its own verdict: %s", w.instanceID, seq, live, detail)
 		return
 	}
 	revision := w.revision
@@ -286,7 +289,10 @@ func (c *Orchestrator) hostPrepareRefused(_ *session, w *worker, seq uint64, _, 
 func (c *Orchestrator) setDesiredRefusal(w *worker, seq uint64, e *exit.Error) {
 	c.mu.Lock()
 	if w.hostPrepareSeq != seq {
+		live := w.hostPrepareSeq
 		c.mu.Unlock()
+		c.logf("worker %s: PodHost prepare #%d was superseded by #%d before its refusal "+
+			"landed; the newer prepare carries its own verdict: %s", w.instanceID, seq, live, e.Message)
 		return
 	}
 	w.desiredRefusal = e
@@ -299,7 +305,10 @@ func (c *Orchestrator) setDesiredRefusal(w *worker, seq uint64, e *exit.Error) {
 func (c *Orchestrator) setDesiredUnavailable(w *worker, seq uint64, e *exit.Error) {
 	c.mu.Lock()
 	if w.hostPrepareSeq != seq {
+		live := w.hostPrepareSeq
 		c.mu.Unlock()
+		c.logf("worker %s: PodHost prepare #%d was superseded by #%d before its deferral "+
+			"landed: %s", w.instanceID, seq, live, e.Message)
 		return
 	}
 	w.desiredRefusal = e

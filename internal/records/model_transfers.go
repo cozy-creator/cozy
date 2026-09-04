@@ -369,13 +369,29 @@ func (s *Store) RecordModelTransferSourceStatus(row ModelTransferSourceStatus) *
 	if replay {
 		return nil
 	}
+	if !exact {
+		return exit.Named(exit.Conflict, "model_transfer.source_status_changed",
+			"model transfer source %s changed identity", row.Member)
+	}
 	advancedRevision := row.CapabilityRevision > held.CapabilityRevision
 	advancedState := row.CapabilityRevision == held.CapabilityRevision &&
 		sourceStateRank(row.State) >= sourceStateRank(held.State)
 	absorbing := held.State == "verified" || (held.State == "failed" && !advancedRevision)
-	if !exact || row.Transferred < held.Transferred || (!advancedRevision && !advancedState) || absorbing {
-		return exit.Named(exit.Conflict, "model_transfer.source_status_changed",
-			"model transfer source %s changed identity or revision", row.Member)
+	if row.Transferred < held.Transferred || (!advancedRevision && !advancedState) || absorbing {
+		// A VERDICT IS ABOUT THE MEMBER, NOT ABOUT THE REVISION THAT CARRIED IT. A FAILED
+		// status that answers a superseded capability revision is still the pod's last word
+		// on these bytes, and the row is where every reader looks for it. Its counts are
+		// ignored — revision and transferred stay what the row holds — and only the one
+		// stronger proof, a verification of the same object, outranks the verdict.
+		//
+		// Dropping it whole is what made run 205 unreadable: four members failed in the
+		// first seconds under revision N, the row had already been carried past N, and
+		// `state=accepted, safe_code=''` was all a human could see for 2h55m.
+		if row.State != "failed" || held.State == "verified" || held.State == "failed" {
+			return exit.Named(exit.Conflict, "model_transfer.source_status_superseded",
+				"model transfer source %s status is behind the row it answers", row.Member)
+		}
+		row.CapabilityRevision, row.Transferred = held.CapabilityRevision, held.Transferred
 	}
 	result, err := tx.Exec(`UPDATE request_model_transfer_files SET capability_revision=?,
 		state=?,transferred=?,safe_code=?,safe_detail=? WHERE request_id=? AND member=?
@@ -565,16 +581,27 @@ func (s *Store) RecordModelTransferObjectStatus(row ModelTransferObject) *exit.E
 	if replay {
 		return nil
 	}
+	if row.Length != held.Length {
+		return exit.Named(exit.Conflict, "model_transfer.object_status_changed",
+			"model transfer object %s changed identity", row.ObjectID)
+	}
 	advanced := row.GrantRevision > held.GrantRevision ||
 		(row.GrantRevision == held.GrantRevision && row.UpdateSequence > held.UpdateSequence)
-	absorbing := held.State == "uploaded" || held.State == "already_present" || held.State == "held"
+	adopted := held.State == "uploaded" || held.State == "already_present" || held.State == "held"
+	absorbing := adopted || held.State == "failed" && row.GrantRevision == held.GrantRevision
 	stateRegressed := row.GrantRevision == held.GrantRevision &&
 		objectStateRank(row.State) < objectStateRank(held.State)
-	absorbing = absorbing || held.State == "failed" && row.GrantRevision == held.GrantRevision
-	if row.Length != held.Length || row.Transferred < held.Transferred || !advanced || absorbing ||
-		stateRegressed {
-		return exit.Named(exit.Conflict, "model_transfer.object_status_changed",
-			"model transfer object %s status moved backwards or changed identity", row.ObjectID)
+	if row.Transferred < held.Transferred || !advanced || absorbing || stateRegressed {
+		// The same rule as the source lane above, on the outbound half: a FAILED status
+		// under a superseded grant revision keeps its verdict and loses its counts. Only
+		// an object this owner already has proof of — uploaded, already present, or held
+		// by a concurrent publisher — outranks it.
+		if row.State != "failed" || adopted || held.State == "failed" {
+			return exit.Named(exit.Conflict, "model_transfer.object_status_superseded",
+				"model transfer object %s status is behind the row it answers", row.ObjectID)
+		}
+		row.GrantRevision, row.UpdateSequence = held.GrantRevision, held.UpdateSequence
+		row.Transferred = held.Transferred
 	}
 	result, err := tx.Exec(`UPDATE request_model_transfer_objects SET operation_id=?,
 		grant_revision=?,update_sequence=?,state=?,transferred=?,safe_code=?,safe_detail=?
