@@ -90,6 +90,29 @@ pub enum ObjectSource {
     Origin,
 }
 
+/// Where ONE object's fetch says what it is doing WHILE it does it, so a supervisor holding
+/// the other end can tell "still working" from "stopped" without a clock of its own — the
+/// same reason `store::Progress` exists, one layer up, where the bytes are still on the wire.
+///
+/// `hop` is announced per redirect hop per ask, BEFORE any byte of that hop moves. Which
+/// delivery host answered and what it answered are the two facts that separate "this link
+/// is slow" from "this origin is throttling us", and neither survives the call: the URL is
+/// a bearer capability that must not be logged, the host is not, and a 429 retry storm and
+/// a slow link are otherwise the same story. `moved` is the running total for THIS ask;
+/// a re-ask restarts it at zero, because a fetch has no mid-object resume and reporting
+/// bytes that are not in the store would be a lie about residency.
+pub trait FetchObserver {
+    fn hop(&mut self, attempt: u32, host: &str, status: u16);
+    fn moved(&mut self, total: u64);
+}
+
+impl<F: FnMut(u64)> FetchObserver for F {
+    fn hop(&mut self, _attempt: u32, _host: &str, _status: u16) {}
+    fn moved(&mut self, total: u64) {
+        self(total)
+    }
+}
+
 pub(super) fn shared_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(Client::new)
@@ -132,7 +155,7 @@ pub fn fetch_url(
     credential: &dyn CredentialProvider,
     deadline: Deadline,
     ledger: &Ledger,
-    progress: Option<&mut dyn FnMut(u64)>,
+    observer: Option<&mut dyn FetchObserver>,
 ) -> Result<Fetched> {
     fetch_authorized(
         store,
@@ -151,7 +174,7 @@ pub fn fetch_url(
         credential,
         deadline,
         ledger,
-        progress,
+        observer,
     )
 }
 
@@ -173,7 +196,7 @@ pub fn fetch_authorized(
     credential: &dyn CredentialProvider,
     deadline: Deadline,
     ledger: &Ledger,
-    mut progress: Option<&mut dyn FnMut(u64)>,
+    mut observer: Option<&mut dyn FetchObserver>,
 ) -> Result<Fetched> {
     let client = shared_client();
     let id = grant.object.id();
@@ -205,7 +228,24 @@ pub fn fetch_authorized(
             },
         };
         stale = None;
-        let opened = match open_object(client, &url, policy, credential, deadline, ledger) {
+        // Every hop of this ask, recorded as it is walked and announced before the body is
+        // read: an ask that dies in the middle still says which host answered it and how.
+        let mut hops: Vec<(String, u16)> = Vec::new();
+        let opened = open_object(
+            client,
+            &url,
+            policy,
+            credential,
+            deadline,
+            ledger,
+            &mut |host, status| hops.push((host.to_string(), status)),
+        );
+        if let Some(watcher) = observer.as_mut() {
+            for (host, status) in &hops {
+                watcher.hop(attempt, host, *status);
+            }
+        }
+        let opened = match opened {
             Ok(response) => response,
             Err(refusal) => match refusal.code {
                 Code::TRANSFER_FAILED if !last => {
@@ -251,8 +291,8 @@ pub fn fetch_authorized(
             inner: response.into_body(),
             seen: 0,
             notify: |total| {
-                if let Some(observer) = progress.as_mut() {
-                    observer(total);
+                if let Some(watcher) = observer.as_mut() {
+                    watcher.moved(total);
                 }
             },
         };
@@ -324,6 +364,7 @@ fn open_object<'l>(
     credential: &dyn CredentialProvider,
     deadline: Deadline,
     ledger: &'l Ledger,
+    hop: &mut dyn FnMut(&str, u16),
 ) -> Result<Opened<'l>> {
     let mut target = url.to_string();
     for _hop in 0..=policy.max_redirects {
@@ -342,6 +383,7 @@ fn open_object<'l>(
             Code::TRANSFER_FAILED,
         )?;
         let status = response.status;
+        hop(&checked.host, status);
         if (300..400).contains(&status) {
             let Some(location) = response.header("location").map(str::to_string) else {
                 return refuse(Code::REDIRECT_REFUSED, "origin redirected with no Location");
