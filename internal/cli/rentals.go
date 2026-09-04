@@ -232,17 +232,37 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	// transaction before any pod was asked for — so this costs no extra round
 	// trip. A rental with no managed request declares nothing and takes the
 	// serving default.
-	var plannedSourceBytes int64
+	//
+	// The SERVING half (th-155/cl-130) rides the same fact and the same trip.
+	// A serving pod's models are resolved into this store before the pod is
+	// asked for — and the very same rows become its desired download set — so
+	// the rental can state WHICH models it will hold and let the hub read what
+	// they weigh out of its own catalog. It declares identity rather than a
+	// byte total on purpose: two models sharing a component share those bytes
+	// on disk exactly once, and only the party holding the digests can take
+	// that union. Undeclared, the hub buys the image's serving default, which
+	// holds the H3 serve set with 35 GB to spare and no room for a second
+	// model.
+	var workload hub.DeclaredWorkload
 	if managedRequestID != "" {
-		plannedSourceBytes, e = st.PlannedSourceBytes(managedRequestID)
+		workload.SourceBytes, e = st.PlannedSourceBytes(managedRequestID)
 		if e != nil {
 			return records.Rental{}, hub.Rental{}, false, e
+		}
+		models, problem := st.DeclaredServingModels(managedRequestID)
+		if problem != nil {
+			return records.Rental{}, hub.Rental{}, false, problem
+		}
+		for _, model := range models {
+			workload.ServingModels = append(workload.ServingModels, hub.ServingModel{
+				Lane: model.Lane, Manifest: model.Manifest,
+				Model: model.Model, Release: model.Release})
 		}
 	}
 	// The machine word is the store's to reserve; the request is authored under it.
 	author := func(machineName string) ([]byte, string, *exit.Error) {
 		body, e := hub.RentalRequestBytes(machineName, skuName, secret.HashHex(token),
-			creator.PublicKey(), plannedSourceBytes)
+			creator.PublicKey(), workload)
 		if e != nil {
 			return nil, "", e
 		}

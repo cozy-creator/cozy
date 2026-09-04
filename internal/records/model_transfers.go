@@ -812,3 +812,32 @@ func (s *Store) FailModelTransferRequest(requestID, code, detail string,
 	}
 	return true, nil
 }
+
+// DeclaredServingModels is the set of published models this request will make
+// its pod hold, or empty when it names none (th-155/cl-130).
+//
+// It is the SERVING half of what PlannedSourceBytes does for an ingest, and it
+// exists for the same reason: the container disk is bought once and cannot grow
+// (any PATCH of a running RunPod pod destroys it), so the pod must be sized for
+// its whole workload up front. These rows are committed with the request, before
+// any pod is asked for, and the SAME rows become the pod's desired download set
+// — so declaring them costs no extra round trip and cannot disagree with what
+// the pod later fetches.
+//
+// A release-less ref is dropped, exactly as downloadModelRefs drops it: that is
+// an operation-local manifest already held in the worker's own store, not a
+// published model the hub can resolve or size.
+func (s *Store) DeclaredServingModels(requestID string) ([]ModelRef, *exit.Error) {
+	request, problem := s.RequestRow(requestID)
+	if problem != nil || request == nil {
+		return nil, problem
+	}
+	out := make([]ModelRef, 0, len(request.Models))
+	for _, model := range request.Models {
+		if model.Release == "" || model.Model == "" || model.Manifest == "" {
+			continue
+		}
+		out = append(out, model)
+	}
+	return out, nil
+}

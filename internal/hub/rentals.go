@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -198,24 +199,72 @@ type RentalRequest struct {
 	// would not fail cleanly — a full filesystem blocks writes, which looks
 	// exactly like a stall, hours into a paid run.
 	PlannedSourceBytes int64 `json:"planned_source_bytes,omitempty"`
+	// ServingModels declares the models this pod is being bought to SERVE
+	// (th-155), so the hub can size its container disk to that set. It carries
+	// model IDENTITY and never a byte total: a closure is a set of
+	// content-addressed objects, so two models sharing a component share those
+	// bytes on disk exactly once, and only the hub — which holds the digests —
+	// can take the union. A total computed here would over-count every shared
+	// byte or under-count the sharing, and under-counting is a full filesystem
+	// hours into a paid run.
+	//
+	// SET for a rental bought for a request whose models are already resolved,
+	// which is every managed request: the models are committed to this store
+	// before any pod is asked for, and the same rows become the pod's desired
+	// download set. Omitted when nothing is declared.
+	ServingModels []ServingModel `json:"serving_models,omitempty"`
 }
+
+// ServingModel is one declared model, in the exact grammar the pod's desired
+// download set already speaks (pb.DownloadModelRef's model/release/lane/manifest).
+// One vocabulary, so what a rental said it would serve and what its pod asks for
+// are comparable without a translation nobody maintains.
+type ServingModel struct {
+	Lane     string `json:"lane"`
+	Manifest string `json:"manifest"`
+	Model    string `json:"model"`
+	Release  string `json:"release"`
+}
+
+// DeclaredWorkload is everything a rental states about the work it is bought
+// for. The two halves are independent and additive: an ingest declares source
+// bytes, a serving pod declares models, and a pod that does both declares both.
+type DeclaredWorkload struct {
+	SourceBytes   int64
+	ServingModels []ServingModel
+}
+
+// maxServingModels is the hub's cap and the pod's download-set cap, not a new
+// number (DownloadSet enforces the same 32).
+const maxServingModels = 32
 
 // RentalRequestBytes authors the exact bytes persisted before POST and replayed
 // unchanged after response loss. There is one encoder, not a digest struct plus
 // a separately marshaled transport map that can drift.
 func RentalRequestBytes(name, sku, mediaTokenSHA256, creatorPublicKey string,
-	plannedSourceBytes int64,
+	workload DeclaredWorkload,
 ) ([]byte, *exit.Error) {
 	req := RentalRequest{
 		Name:               strings.TrimSpace(name),
 		SKU:                strings.TrimSpace(sku),
 		MediaTokenSHA256:   strings.TrimPrefix(strings.TrimSpace(mediaTokenSHA256), "sha256:"),
 		CreatorPublicKey:   strings.TrimSpace(creatorPublicKey),
-		PlannedSourceBytes: plannedSourceBytes,
+		PlannedSourceBytes: workload.SourceBytes,
+		ServingModels:      canonicalServingModels(workload.ServingModels),
 	}
-	if plannedSourceBytes < 0 {
+	if workload.SourceBytes < 0 {
 		return nil, exit.Named(exit.Validation, "rental.planned_workload_invalid",
 			"a declared workload is the summed length of the source objects, or absent")
+	}
+	if len(req.ServingModels) > maxServingModels {
+		return nil, exit.Named(exit.Validation, "rental.serving_set_too_large",
+			"a rental declares at most %d serving models", maxServingModels)
+	}
+	for _, model := range req.ServingModels {
+		if model.Model == "" || model.Release == "" || model.Manifest == "" {
+			return nil, exit.Named(exit.Validation, "rental.serving_model_incomplete",
+				"a declared serving model pins a model, a release and a manifest")
+		}
 	}
 	public, publicErr := base64.RawURLEncoding.DecodeString(req.CreatorPublicKey)
 	if !rentalid.ValidMachineName(req.Name) || req.SKU == "" || !bareSHA256Pattern.MatchString(req.MediaTokenSHA256) ||
@@ -247,7 +296,8 @@ func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
 			"persisted rental intent has trailing data")
 	}
 	canonical, problem := RentalRequestBytes(req.Name, req.SKU, req.MediaTokenSHA256,
-		req.CreatorPublicKey, req.PlannedSourceBytes)
+		req.CreatorPublicKey, DeclaredWorkload{SourceBytes: req.PlannedSourceBytes,
+			ServingModels: req.ServingModels})
 	if problem != nil || !bytes.Equal(canonical, raw) {
 		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
 			"persisted rental intent is not its exact canonical request")
@@ -412,4 +462,29 @@ func (c *Client) PrepareFacts(ctx context.Context, id, pkg, release string) (Pre
 		return PrepareFactsView{}, e
 	}
 	return out, nil
+}
+
+// canonicalServingModels sorts and de-duplicates the declared set so the authored
+// bytes are a pure function of the selection: the same models in any order
+// author the same request, and a replay re-authors byte-identically. An empty
+// set is nil so the key stays OFF the wire and an undeclared rental is
+// byte-identical to one authored before th-155.
+func canonicalServingModels(models []ServingModel) []ServingModel {
+	if len(models) == 0 {
+		return nil
+	}
+	key := func(m ServingModel) string {
+		return m.Model + "\x00" + m.Release + "\x00" + m.Manifest + "\x00" + m.Lane
+	}
+	sorted := append([]ServingModel(nil), models...)
+	sort.Slice(sorted, func(i, j int) bool { return key(sorted[i]) < key(sorted[j]) })
+	out := sorted[:0]
+	prior := ""
+	for _, model := range sorted {
+		if current := key(model); current != prior {
+			out = append(out, model)
+			prior = current
+		}
+	}
+	return out
 }
