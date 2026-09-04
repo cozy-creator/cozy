@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/rentalid"
@@ -487,4 +488,30 @@ func canonicalServingModels(models []ServingModel) []ServingModel {
 		}
 	}
 	return out
+}
+
+// RentalSKUStatus is one product name's standing (th-150), and it is asked ONLY
+// on the refusal path: the catalog is live provider inventory, so a name missing
+// from RentalSKUs may be a product this hub never sells OR a real one whose
+// inventory is momentarily empty. The two want opposite next actions from a
+// person, and the catalog spells both as absence.
+//
+// A hub too old to serve the route answers 404; that is not an error worth
+// failing a refusal over, so the caller gets an empty status and says the plain
+// thing instead.
+type RentalSKUStatus struct {
+	Name       string     `json:"name"`
+	Known      bool       `json:"known"`
+	Offered    bool       `json:"offered"`
+	SKU        *RentalSKU `json:"sku,omitempty"`
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+}
+
+func (c *Client) RentalSKUStatus(ctx context.Context, name string) (RentalSKUStatus, *exit.Error) {
+	var out RentalSKUStatus
+	if e := c.do(ctx, call{method: http.MethodGet,
+		path: "/v1/rental-skus/" + url.PathEscape(name)}, &out); e != nil {
+		return RentalSKUStatus{}, e
+	}
+	return out, nil
 }

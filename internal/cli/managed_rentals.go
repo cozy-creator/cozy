@@ -197,19 +197,72 @@ func (m *managedRentals) admit(skuName string) (string, hub.RentalSKU, *exit.Err
 		}
 	}
 	// An explicit ask is HONOURED OR REFUSED, never widened to a neighbouring card —
-	// and the refusal has to say so out loud (cl-132). The catalog is live provider
-	// inventory (th-150), so a name that was rentable ten minutes ago can be absent
-	// now; a reader who does not know that reads "no rental SKU" as "no such machine",
-	// retries something else, and later credits this refusal's pod-less minute to
-	// whatever pods auto-placement happened to buy around it. That is not hypothetical:
-	// it is what happened on 2026-09-04, and it cost an hour and two wrong issues.
-	return "", hub.RentalSKU{}, exit.Named(exit.Validation, "rental.sku_unavailable",
-		"no rental SKU %q is on offer right now — NOTHING was rented and no other "+
-			"machine was substituted for it", skuName).
-		WithRemedy("the catalog is live provider inventory, so a name absent now may "+
-			"return within minutes; `cozy rental new` alone lists what is offered "+
-			"this minute (currently %s)", offeredNames(skus)).
-		WithNext("cozy rental new")
+	// and the refusal has to say so out loud (cl-132), AND say which absence it hit
+	// (th-150).
+	return "", hub.RentalSKU{}, m.refuseSKULocked(skuName, skus)
+}
+
+// refuseSKULocked names the absence. The catalog is live provider inventory, so a
+// name missing from it means one of two completely different things:
+//
+//	"Tensorhub sells no such machine"      -> you typed something wrong; stop
+//	"that machine has no inventory now"    -> wait a couple of minutes; retry
+//
+// They used to share one sentence. On 2026-09-04 an explicit `cozy rental new
+// rtx-a4000` was refused during a 32-minute stock-out, the message read as the
+// first, and the conclusion drawn was that the rental code had substituted a
+// dearer card — it had not, and two issues were filed against a defect that does
+// not exist. The hub knows which absence it is; this asks, on the refusal path
+// only, and a hub that cannot answer just gets the plain refusal.
+func (m *managedRentals) refuseSKULocked(skuName string, skus []hub.RentalSKU) *exit.Error {
+	hctx, cancel := hub.Context()
+	status, problem := client(m.ctx).RentalSKUStatus(hctx, skuName)
+	cancel()
+	if problem != nil {
+		// The lookup is an EXPLANATION, never the refusal itself: a hub too old
+		// to answer, or one that fails the read, must still get a refusal about
+		// the SKU rather than an error about the lookup.
+		return SKURefusal(skuName, skus, nil, time.Now())
+	}
+	return SKURefusal(skuName, skus, &status, time.Now())
+}
+
+// SKURefusal composes the refusal for a name the live catalog does not carry.
+// `status` is the hub's answer about that name, or nil when it could not be
+// asked. It is a pure function of what was observed so that the words — which
+// are the entire deliverable of th-150 — can be asserted without a hub.
+func SKURefusal(skuName string, skus []hub.RentalSKU, status *hub.RentalSKUStatus,
+	now time.Time,
+) *exit.Error {
+	said := fmt.Sprintf("NOTHING was rented and no other machine was substituted for %q", skuName)
+	switch {
+	case status == nil:
+		return exit.Named(exit.Validation, "rental.sku_unavailable",
+			"no rental SKU %q is on offer right now — %s", skuName, said).
+			WithRemedy("the catalog is live provider inventory, so a name absent now may "+
+				"return within minutes; `cozy rental new` alone lists what is offered "+
+				"this minute (currently %s)", offeredNames(skus)).
+			WithNext("cozy rental new")
+	case !status.Known:
+		return exit.Named(exit.Validation, "rental.sku_unknown",
+			"Tensorhub sells no rental SKU named %q — %s", skuName, said).
+			WithRemedy("choose one of the names it does sell: %s", offeredNames(skus)).
+			WithNext("cozy rental new")
+	}
+	// Known but not buyable: a real product in a stock-out. The timestamp is the
+	// actionable half — it separates "gone for ten seconds" from "gone all night".
+	seen := "and no offer for it has been observed at all"
+	if status.LastSeenAt != nil {
+		seen = fmt.Sprintf("and it was last offered at %s (%s ago)",
+			status.LastSeenAt.UTC().Format(time.RFC3339),
+			roughDuration(now.Sub(*status.LastSeenAt)))
+	}
+	return exit.Named(exit.Capacity, "rental.sku_out_of_stock",
+		"%q is a Tensorhub product, but it has no provider inventory right now, %s — %s",
+		skuName, seen, said).
+		WithRemedy("this is a stock-out, not a bad name: retry in a minute or two, or "+
+			"see what is buyable this minute (currently %s)", offeredNames(skus)).
+		WithNext("cozy rental new "+skuName, "cozy rental new")
 }
 
 // offeredNames is the live catalog as a reader can scan it, so a refusal shows the shape
