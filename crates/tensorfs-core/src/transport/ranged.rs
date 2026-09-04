@@ -77,31 +77,44 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
-/// How many ranged asks are in flight for ONE object. Eight rather than `STREAMS`'s
-/// sixteen because these all belong to a single object: the walk's sixteen are sixteen
-/// different objects and cost sixteen sockets across a whole closure, while these sixteen
-/// would be sixteen sockets aimed at one file, which the measurement did not reward
-/// (14.2 MB/s at one stream, 18.9 MB/s at eight, 19.1 MB/s at sixteen on the same link).
-pub const SOURCE_STREAMS: usize = 8;
+/// How many ranged asks are in flight for ONE object, by default: **one**.
+///
+/// This started at eight and was demoted by measurement. The throughput case for splitting
+/// one object across N sockets rests on the aggregate being per-STREAM bound, and every
+/// number available says it is not: a real 3.087 GB HuggingFace fetch through this code
+/// moved at 18.9 MB/s on one stream and 19.1 MB/s on eight 64 MiB parts — the link was
+/// already saturated by one — and H3 run 290 has a single production lane sustaining
+/// 70-129 MB/s against an aggregate that looks bounded by the NIC or the origin. On a link
+/// like that, cutting an object into parts moves bytes from one socket to another and
+/// changes no total, while costing a second full write of every byte.
+///
+/// So the default buys the thing that is NOT in question — byte-exact resume inside an
+/// object — and buys it at zero extra disk, because one stream needs no scratch file.
+/// Parallelism stays one parameter away for the case still argued for: the TAIL of a
+/// multi-object pull, where fewer objects remain than there are lanes and per-object
+/// concurrency is the only thing that can fill them. That case is real and bounded, and
+/// nobody has measured it yet; when someone does, this constant is where the answer goes.
+pub const SOURCE_STREAMS: usize = 1;
 
 /// One ranged ask's slice, and the resume unit. MEASURED, not chosen: this crate's client
-/// sends `Connection: close`, so every part pays a fresh TCP connect plus TLS handshake
-/// plus time-to-first-byte, which against HuggingFace's CDN measured 0.41 s. A part must
-/// therefore be large enough that 0.41 s is noise against its own transfer — at the
-/// ~14 MB/s a single stream showed, 64 MiB transfers for 4.6 s and spends 8% of a stream's
-/// time handshaking. Smaller parts resume faster and waste more link; this is the trade,
-/// and it is a parameter because the right number is a property of the LINK.
+/// sends `Connection: close`, so every ask pays a fresh TCP connect plus TLS handshake plus
+/// time-to-first-byte, which against HuggingFace's CDN measured 0.41 s. A part must
+/// therefore be large enough that 0.41 s is noise against its own transfer — at ~19 MB/s
+/// on one stream, 64 MiB transfers for 3.4 s and spends about a tenth of its time
+/// handshaking. Smaller parts resume finer and waste more link; that is the trade, and it
+/// is a parameter because the right number is a property of the LINK.
 pub const PART_BYTES: u64 = 64 << 20;
 
-/// What `PART_BYTES` implies: an object smaller than two parts is one part, and one part
-/// is one stream. DERIVED and stated, never a second threshold — the size gate is
-/// `Ranged::part` alone, so a caller that cuts smaller parts gets a smaller floor with it
-/// rather than a constant here silently overriding the parameter it was handed.
+/// What `PART_BYTES` implies: an object smaller than two parts is one part, and one part is
+/// one ask, which is what the object would have been anyway. DERIVED and stated, never a
+/// second threshold — the size gate is `Ranged::part` alone, so a caller that cuts smaller
+/// parts gets a smaller floor with it rather than a constant here silently overriding the
+/// parameter it was handed.
 pub const RANGED_MIN_BYTES: u64 = 2 * PART_BYTES;
 
-/// How ONE object is cut. `streams` of 1 is the single-stream path and it stays reachable,
-/// for the same reason `fetch_wanted` keeps a serial walk: a link where concurrency does
-/// not help is a real link.
+/// How ONE object is asked for. `streams` of 1 — the default — is one resumable stream of
+/// ascending ranges; above 1 is that many ranges in flight at once, assembled through a
+/// scratch file; 0 is `Ranged::whole`, no ranges at all.
 #[derive(Debug, Clone, Copy)]
 pub struct Ranged {
     pub streams: usize,
@@ -118,24 +131,29 @@ impl Default for Ranged {
 }
 
 impl Ranged {
-    /// Do not cut: the object crosses on one stream, exactly as it did before this module.
-    pub fn single() -> Ranged {
+    /// Do not range at all: one whole-object GET, exactly the path a member took before
+    /// this module, with no resume inside it. This is what an origin that refuses ranges
+    /// gets, and it stays reachable by name because a link where none of this helps is a
+    /// real link.
+    pub fn whole() -> Ranged {
         Ranged {
-            streams: 1,
+            streams: 0,
             part: PART_BYTES,
         }
     }
 
     fn normalized(self) -> Ranged {
         Ranged {
-            streams: self.streams.clamp(1, 64),
+            // NOT clamped up to 1: zero means "do not range", and a floor here would
+            // silently turn the caller's opt-out into the default.
+            streams: self.streams.min(64),
             part: self.part.clamp(1 << 20, 1 << 30),
         }
     }
 }
 
-/// Move ONE granted object across the door, in parallel byte ranges when the origin
-/// supports them and on one stream when it does not.
+/// Move ONE granted object across the door as resumable byte ranges when the origin
+/// supports them, and as one whole-object GET when it does not.
 ///
 /// `url` is the caller's; nothing here re-authorizes it, which is why this is the SOURCE
 /// plane's entry point and not the hub walk's — a presigned hub URL has a lease and

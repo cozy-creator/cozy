@@ -8,7 +8,7 @@ use super::ledger::{Deadline, Ledger};
 use super::policy::{self, blocked, SourcePolicy};
 use super::pull::{absolute_location, fetch_url, pull, ObjectSource, PullRequest};
 use super::push::{push_object, UploadGrant};
-use super::ranged::{fetch_ranged, Ranged};
+use super::ranged::{fetch_ranged, Ranged, SOURCE_STREAMS};
 use crate::canon::Value;
 use crate::dtype::Dtype;
 use crate::err::Code;
@@ -2952,13 +2952,23 @@ fn one_stream_resumes_and_never_writes_the_object_twice() {
         Deadline::none(),
         &ledger,
         Ranged {
-            streams: 1,
+            // The DEFAULT stream count, not a hardcoded 1. `SOURCE_STREAMS` is what
+            // production runs and what every claim in this module's doc is about; a proof
+            // that pins its own number cannot notice the default moving under it, which is
+            // exactly how this shipped as 8 once already.
+            streams: SOURCE_STREAMS,
             part: 1 << 20,
         },
         Some(&mut |moved: u64| totals.push(moved)),
     )
     .unwrap();
 
+    assert_eq!(
+        SOURCE_STREAMS, 1,
+        "the default is one resumable stream: parallelism did not survive measurement \
+         (18.9 MB/s on one stream against 19.1 MB/s on eight, on a link one stream already \
+         saturated) and it costs a second full write of every byte"
+    );
     assert!(store.record_valid(&object.sha256).is_ok());
     assert_eq!(
         fetched.transferred, object.length,
@@ -2979,10 +2989,27 @@ fn one_stream_resumes_and_never_writes_the_object_twice() {
         asked.contains(&"bytes=2621440-3145727".to_string()),
         "expected a resumed range, saw {asked:?}"
     );
+    // Strictly ascending, which is what separates this path from the parallel one on the
+    // wire: one stream asks for the next range only once the previous is behind it.
+    let starts: Vec<u64> = asked[1..]
+        .iter()
+        .filter_map(|value| {
+            value
+                .strip_prefix("bytes=")?
+                .split_once('-')?
+                .0
+                .parse()
+                .ok()
+        })
+        .collect();
+    assert!(
+        starts.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the default path asked out of order, so it is not the sequential one: {asked:?}"
+    );
     assert_eq!(
         part_ends(&asked[1..]),
         vec![1048575, 2097151, 3145727, 4194303],
-        "four 1 MiB parts, asked in ascending order: {asked:?}"
+        "four 1 MiB parts: {asked:?}"
     );
     assert!(
         totals.windows(2).all(|pair| pair[0] <= pair[1]),
@@ -3168,5 +3195,43 @@ fn one_stream_never_admits_a_partial_object() {
     assert!(refusal.detail.contains("503"), "{}", refusal.detail);
     assert!(store.record_valid(&object.sha256).is_err());
     assert_eq!(temps(&root), 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// `Ranged::whole()` means what it says: not one range is asked for. The opt-out must not be
+/// quietly floored up into the default — a `clamp(1, 64)` in the wrong place did exactly
+/// that once, and nothing failed, because every proof passed its own stream count.
+#[test]
+fn whole_asks_for_no_range_at_all() {
+    let root = temporary("ranged-whole");
+    let store = Store::init(&root).unwrap();
+    let body = ranged_body(4 << 20);
+    let object = ObjectRef::of(&body);
+    let served = body.clone();
+    let listener = ranged_origin(move |request| partial(&served, request));
+    let (plan, _) = FetchPlan::of_objects(&store, "whole", std::slice::from_ref(&object)).unwrap();
+    let grant = ranged_grant(&plan, &object);
+    let url = format!("{}/member.safetensors", listener.origin.base);
+    let ledger = Ledger::with_resolution(Duration::from_secs(1));
+
+    fetch_ranged(
+        &store,
+        &grant,
+        &url,
+        &local_policy(),
+        &Anonymous,
+        Deadline::none(),
+        &ledger,
+        Ranged::whole(),
+        None,
+    )
+    .unwrap();
+
+    assert!(store.record_valid(&object.sha256).is_ok());
+    let asked = listener.ranges();
+    assert!(
+        asked.iter().all(String::is_empty),
+        "whole() asked for a range, including the probe: {asked:?}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
