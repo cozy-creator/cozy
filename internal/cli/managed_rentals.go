@@ -45,18 +45,8 @@ type managedRentals struct {
 	// the last line printed about each rental, so the sweep speaks once per change.
 	retryAt map[string]time.Time
 	said    map[string]string
-	// lost holds rentals observed in a terminal failed state whose pinned work has not
-	// been handed back yet. Recovery CANNOT run under this lock: it calls into the
-	// orchestrator, whose replan asks the fleet for capacity and re-enters here — the same
-	// re-entry `watch` already avoids by waking the queue after it unlocks. So reconcile
-	// only RECORDS the observation and the loop acts on it outside the lock.
-	lost   []lostRental
-	closed bool
+	closed  bool
 }
-
-// lostRental is one rental observed dead and the hub code that killed it, waiting to be
-// acted on outside the fleet lock.
-type lostRental struct{ id, code string }
 
 // idleReleaseRetry is how soon a release the hub did not confirm is asked again. A fifth
 // of the grace: shorter than the grace, or a transient fault would add another whole
@@ -399,8 +389,11 @@ func (m *managedRentals) releaseOrphaned() {
 		return
 	}
 	m.sweepLocked()
+	owner := m.owner
 	m.mu.Unlock()
-	m.recoverLostWork()
+	if owner != nil {
+		owner.RecoverLostWork()
+	}
 }
 
 // hubReconcileCadence is how often the idle loop re-asks Tensorhub what each rental IS,
@@ -453,8 +446,13 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 		}
 		owner := m.owner
 		m.mu.Unlock()
-		m.recoverLostWork()
 		if owner != nil {
+			// OUTSIDE the lock, always: replanning released work asks the fleet for
+			// capacity and re-enters this object. Under the lock it deadlocks the daemon,
+			// measured on the first cut of this change. It runs every tick rather than on
+			// a rental observation, because a rental whose record is GONE is observed by
+			// nobody — the sweep reads the request side, which still has rows.
+			owner.RecoverLostWork()
 			// Hub recovery is an observed fleet change. Re-ask durable queued work outside
 			// the fleet lock; selection calls back into this object.
 			owner.WakeQueue()
@@ -668,7 +666,7 @@ func (m *managedRentals) reconcileLocked() *exit.Error {
 		if problem := m.store.RecordRental(row); problem != nil {
 			return problem
 		}
-		m.recoverLostWorkLocked(row, remote)
+		m.detachLostRentalLocked(row)
 	}
 	return nil
 }
@@ -683,38 +681,19 @@ func (m *managedRentals) reconcileLocked() *exit.Error {
 // the fleet bought a second pod for a later request, served it, and released it while the
 // stranded three still waited (observed live 2026-09-04, rental pr-183abac284d1e16f5f0a).
 //
-// The worker record goes NOW, under the lock, so no replan can choose the corpse:
-// `rentalHeld` reads live worker records and a stale one would make `selectOrStart` decide
-// the dead rental still holds the placement. Detach never calls back into the fleet, so it
-// is safe here; handing the work back is not, and is queued for the loop instead.
-func (m *managedRentals) recoverLostWorkLocked(row records.Rental, remote hub.Rental) {
+// detachLostRentalLocked drops the worker record of a rental the hub has failed, so no
+// replan can choose the corpse: `rentalHeld` reads live worker records and a stale one
+// would make `selectOrStart` decide the dead rental still holds the placement.
+//
+// Detaching is ALL that happens under the fleet lock. Handing the work back re-enters this
+// object through the capacity question and deadlocks the daemon under it (measured), and it
+// is the loop's request-side sweep that does it — a rental whose record is gone is observed
+// by nobody, so the work has to be found from the side that still has rows.
+func (m *managedRentals) detachLostRentalLocked(row records.Rental) {
 	if row.State != hub.RentalFailed || m.owner == nil {
 		return
 	}
 	m.owner.DetachRental(row.ID)
-	for _, pending := range m.lost {
-		if pending.id == row.ID {
-			return
-		}
-	}
-	m.lost = append(m.lost, lostRental{id: row.ID, code: rentalFailureCode(remote)})
-}
-
-// recoverLostWork hands back the work of every rental reconcile has seen die, OUTSIDE the
-// fleet lock. Replanning a released request asks the fleet for capacity, so doing it under
-// the lock deadlocks the daemon — measured, not theorised, on the first cut of this change.
-func (m *managedRentals) recoverLostWork() {
-	m.mu.Lock()
-	lost := m.lost
-	m.lost = nil
-	owner := m.owner
-	m.mu.Unlock()
-	if owner == nil {
-		return
-	}
-	for _, entry := range lost {
-		owner.RecoverRentalWork(entry.id, entry.code)
-	}
 }
 
 func (m *managedRentals) lineLocked() (string, *exit.Error) {

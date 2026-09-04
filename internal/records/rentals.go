@@ -861,7 +861,7 @@ func (s *Store) PinnedRentalWork(rentalID string) ([]Request, *exit.Error) {
 // it, so routing may replan it onto another machine. It is the exact inverse of PinRental
 // and refuses the same rows PinRental would not have written: a request that has reached
 // an attempt is not unpinned here, because an attempt that may have run is a different
-// question from one that never started (StrandRentalAttempt answers that one).
+// question from one that never started (AbandonLostAttempt answers that one).
 //
 // `machine` is NOT cleared. The machine word is history the run keeps (cl-107); a request
 // that waited on a pod which died should still be able to say which pod that was.
@@ -880,54 +880,118 @@ func (s *Store) UnpinRentalWork(requestID, rentalID string) (bool, *exit.Error) 
 	return changed == 1, nil
 }
 
-// StrandRentalAttempt closes one open attempt whose pod is PROVABLY GONE, and puts its
-// request on the requeue path.
+// LostAttemptOutcome says what happens to the REQUEST once its lost attempt is closed.
+// The attempt's own fact is the same either way — its execution context is gone — but the
+// two callers want opposite things next, and neither may guess.
+type LostAttemptOutcome int
+
+const (
+	// RequeueAfterLoss hands the request to the ordinary requeue budget. Recovery uses it:
+	// the machine died under the work, and the work should run somewhere else.
+	RequeueAfterLoss LostAttemptOutcome = iota
+	// CancelAfterLoss settles the request as canceled. Teardown uses it: the operator asked
+	// for everything to stop, and requeueing into a daemon that is shutting down would be
+	// answering a different question than the one they asked.
+	CancelAfterLoss
+)
+
+// AbandonLostAttempt closes one open attempt whose EXECUTION CONTEXT IS PROVABLY GONE, and
+// settles its request the way the caller asked, in one transaction.
 //
-// This is the one exception to the recovered-attempts law, and it needs its reason stated.
+// This is the one exception to the recovered-attempts law and it needs its reason stated.
 // `OpenAttemptsOf` says an unsettled attempt "can only be settled by the supervisor's own
 // journal, replayed by a worker in the SAME slot" — which is right for every case where
-// that worker may come back. A rental the hub has terminally failed has had its provider
-// resource reclaimed: there is no slot left to replay into, and the journal was destroyed
-// with the pod. Waiting for it is waiting for an event that cannot occur.
+// that worker may come back. It is FALSE once the pod has been destroyed: there is no slot
+// left to replay into and the journal died with it, so waiting is waiting for an event that
+// cannot occur. The same is true of a control stream this process no longer holds for a
+// worker it no longer has.
 //
-// The proof is an OBSERVATION — the rental's terminal state — never elapsed time. An
-// attempt sitting at 300 s is not evidence of anything; a reclaimed pod is.
+// The proof is an OBSERVATION — the rental is gone or terminally failed, or the stream that
+// held the attempt is gone — never elapsed time. An attempt sitting at 2590 s is not
+// evidence of anything; a destroyed pod is.
 //
-// The request lands in `requeue_pending`, NOT back on the queue. That hands it to the
-// existing requeue budget rather than a second retry vocabulary: this attempt WAS accepted
-// by a worker and may have partially executed, so re-offering it costs a life, and a
-// request out of lives fails with that reason instead of retrying forever.
-func (s *Store) StrandRentalAttempt(requestID string, attempt int64, cause string) (bool, *exit.Error) {
+// ONLY an attempt that crossed to the worker and recorded NO terminal is touched. A
+// `terminal` attempt already holds a real outcome the worker committed, and overwriting it
+// would publish a synthetic failure over a result that may have succeeded — the worst
+// failure class this system has. `preparing`/`offered` never crossed at all and belong to
+// the abort path, which charges nothing.
+func (s *Store) AbandonLostAttempt(requestID string, attempt int64, reason string,
+	outcome LostAttemptOutcome,
+) (bool, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return false, exit.Internalf("cannot begin stranding %s#%d: %s", requestID, attempt, err)
+		return false, exit.Internalf("cannot begin abandoning %s#%d: %s", requestID, attempt, err)
 	}
 	defer tx.Rollback()
-	// ONLY an attempt that crossed to the worker and recorded NO terminal. A `terminal`
-	// attempt already holds a real outcome the worker committed, and overwriting it with a
-	// synthetic failure would publish `request.failed` over a result that succeeded — the
-	// worst failure class this system has. `preparing`/`offered` never crossed at all and
-	// belong to the abort path, which charges nothing.
 	res, err := tx.Exec(`UPDATE attempts
-		SET state='closed',terminal_status='FAILED',terminal_cause='RENTAL_LOST',
+		SET state='closed',terminal_status='ABANDONED',terminal_cause='EXECUTION_CONTEXT_LOST',
 		    safe_message=?,closed_at=?
 		WHERE request_id=? AND attempt=? AND state IN ('accepted','recovered_open')`,
-		cause, now(), requestID, attempt)
+		reason, now(), requestID, attempt)
 	if err != nil {
-		return false, exit.Internalf("cannot strand attempt %s#%d: %s", requestID, attempt, err)
+		return false, exit.Internalf("cannot abandon attempt %s#%d: %s", requestID, attempt, err)
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return false, nil
 	}
-	// Only the request's CURRENT ordinal moves it; a stale attempt of an already-advanced
-	// request settles alone.
-	if _, err := tx.Exec(`UPDATE requests SET state='requeue_pending'
-		WHERE id=? AND ordinal=? AND state IN ('dispatching','finalizing')`,
-		requestID, attempt); err != nil {
-		return false, exit.Internalf("cannot move %s to the requeue path: %s", requestID, err)
+	switch outcome {
+	case CancelAfterLoss:
+		// The operator asked for everything to stop. The attempt's closure above is what
+		// makes this reachable at all: `CancelQueuedRequest` refuses a request that holds
+		// an open attempt, which is exactly how one lost attempt made the whole daemon
+		// unstoppable.
+		if _, err := tx.Exec(`UPDATE requests SET state='canceled'
+			WHERE id=? AND state NOT IN (`+settledRequestStates+`)`, requestID); err != nil {
+			return false, exit.Internalf("cannot cancel %s after its attempt was lost: %s",
+				requestID, err)
+		}
+		if err := appendEventTx(tx, requestID, "request.canceled", attempt, map[string]any{
+			"status": "CANCELED", "cause": "EXECUTION_CONTEXT_LOST",
+			"error_type": "EXECUTION_CONTEXT_LOST", "error": reason,
+			"outputs": []any{}, "requeuing": false,
+		}); err != nil {
+			return false, exit.Internalf("cannot record the cancellation of %s: %s", requestID, err)
+		}
+	default:
+		// Only the request's CURRENT ordinal moves it; a stale attempt of an already-
+		// advanced request settles alone.
+		if _, err := tx.Exec(`UPDATE requests SET state='requeue_pending'
+			WHERE id=? AND ordinal=? AND state IN ('dispatching','finalizing')`,
+			requestID, attempt); err != nil {
+			return false, exit.Internalf("cannot move %s to the requeue path: %s", requestID, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
-		return false, exit.Internalf("stranding %s#%d did not commit: %s", requestID, attempt, err)
+		return false, exit.Internalf("abandoning %s#%d did not commit: %s", requestID, attempt, err)
 	}
 	return true, nil
+}
+
+// OrphanedRentalWork is every active request pinned to a rental this host can no longer
+// use: the row is GONE, or it is there and terminally failed.
+//
+// The gone case is the one that wedged req-b2df33d1 for sixteen hours. Recovery keyed on
+// OBSERVING a rental go `failed`, so `cozy rental end` — which destroys the record — left
+// the work pinned to a name nothing would ever look at again. There is no observer for an
+// object that does not exist, so the question has to be asked from the REQUEST side, which
+// is the side that still has a row.
+func (s *Store) OrphanedRentalWork() ([]Request, *exit.Error) {
+	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests
+		WHERE rental=1 AND worker<>'' AND state IN (` + activeRequestStates + `)
+		  AND NOT EXISTS (SELECT 1 FROM rentals WHERE rentals.id=requests.worker
+		                    AND rentals.state NOT IN ('failed','released'))
+		ORDER BY created_at,id`)
+	if err != nil {
+		return nil, exit.Internalf("cannot list work pinned to lost rentals: %s", err)
+	}
+	defer rows.Close()
+	var out []Request
+	for rows.Next() {
+		r, err := scanRequest(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read work pinned to a lost rental: %s", err)
+		}
+		out = append(out, r)
+	}
+	return out, nil
 }

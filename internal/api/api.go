@@ -91,6 +91,11 @@ type Server struct {
 	// bounded admission work; provider acquisition and execution start afterward.
 	shutdownAdmission sync.RWMutex
 	shuttingDown      bool
+	// reportedDownRentals is the paid-pod set the last `--all` pass handed back for the
+	// caller to end. Seeing the SAME set again with nothing else changed is how the
+	// teardown knows the caller could not end them, and that asking a third time would
+	// produce the same answer forever.
+	reportedDownRentals []string
 }
 
 // Resolver exposes control-plane placement facts separately from a local worker launch.

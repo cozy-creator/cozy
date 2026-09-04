@@ -174,7 +174,7 @@ func TestRentalFailureRecovery(t *testing.T) {
 		t.Fatalf("the in-flight attempt is still %q; it owes a terminal no destroyed pod "+
 			"can ever deliver\n%s", inFlight.State, tail(logPath))
 	}
-	if inFlight.TerminalStatus != "FAILED" || inFlight.TerminalCause != "RENTAL_LOST" {
+	if inFlight.TerminalStatus != "ABANDONED" || inFlight.TerminalCause != "EXECUTION_CONTEXT_LOST" {
 		t.Fatalf("the in-flight attempt did not say WHY it ended: status %q cause %q",
 			inFlight.TerminalStatus, inFlight.TerminalCause)
 	}
@@ -245,7 +245,8 @@ func TestRentalFailureKeepsARecordedTerminal(t *testing.T) {
 	}
 
 	// The store refuses to strand it, whatever the caller believes about the machine.
-	stranded, problem := store.StrandRentalAttempt("req-terminal", attempt, "the pod is gone")
+	stranded, problem := store.AbandonLostAttempt("req-terminal", attempt, "the pod is gone",
+		records.RequeueAfterLoss)
 	fatal(t, problem)
 	if stranded {
 		t.Fatal("a recorded terminal was overwritten with a synthetic failure")
