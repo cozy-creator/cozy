@@ -101,7 +101,12 @@ fn the_reclaim_of_a_set_is_more_than_the_sum_of_its_parts() {
     let a = blob(&store, "aaaa", A);
     let b = blob(&store, "bbbb", B);
     let c = blob(&store, "cccc", C);
-    model(&store, "acme", "alpha", &[("a.bin", a), ("b.bin", b.clone())]);
+    model(
+        &store,
+        "acme",
+        "alpha",
+        &[("a.bin", a), ("b.bin", b.clone())],
+    );
     model(&store, "acme", "beta", &[("b.bin", b), ("c.bin", c)]);
 
     let solo_alpha = reclaimable(&root, &[("acme", "alpha")]);
@@ -110,9 +115,12 @@ fn the_reclaim_of_a_set_is_more_than_the_sum_of_its_parts() {
 
     // Manifests are collected too, so each figure carries its own root's manifest bytes.
     // The SHAPE is what is pinned: B belongs to the pair and to neither singleton.
-    assert_eq!(both - solo_alpha - solo_beta, B as u64,
+    assert_eq!(
+        both - solo_alpha - solo_beta,
+        B as u64,
         "the shared object must be reclaimable by the pair and by neither alone \
-         (solo_alpha={solo_alpha} solo_beta={solo_beta} both={both})");
+         (solo_alpha={solo_alpha} solo_beta={solo_beta} both={both})"
+    );
     assert!(
         both > solo_alpha + solo_beta,
         "summing per-root figures understated the set"
@@ -166,8 +174,8 @@ fn the_chooser_takes_the_root_that_frees_the_most_not_the_one_that_is_biggest() 
         "lean freed {} B",
         lean.marginal_bytes
     );
-    let facts = reclaim::usage(&store, &[]).unwrap();
-    let hoard = facts.iter().find(|row| row.name == "hoard").unwrap();
+    let facts = reclaim::usage(&store, &keep, &[], &[]).unwrap();
+    let hoard = facts.roots.iter().find(|row| row.name == "hoard").unwrap();
     assert!(
         hoard.bytes_closure > 80_000 && hoard.bytes_solo < 2_000,
         "the fixture does not actually pit size against benefit: {hoard:?}"
@@ -198,7 +206,9 @@ fn a_root_that_frees_nothing_is_never_proposed_at_any_need() {
 
     // And it stays unreachable at the largest need the store can satisfy, which is the
     // half a "ranked last" implementation would fail.
-    let everything = reclaim::plan(&store, 30_000, &keep, &[]).unwrap().reclaimable_bytes;
+    let everything = reclaim::plan(&store, 30_000, &keep, &[])
+        .unwrap()
+        .reclaimable_bytes;
     let plan = reclaim::plan(&store, everything, &keep, &[]).unwrap();
     assert!(plan.victims.iter().all(|victim| victim.name != "ghost"));
     let _ = std::fs::remove_dir_all(root);
@@ -254,7 +264,9 @@ fn a_held_object_is_never_promised_and_releasing_the_hold_promises_it() {
     ]));
     let hold = HeldKey::parse_line(&line).unwrap();
 
-    let without = reclaim::plan(&store, 1, &[], &[]).unwrap().reclaimable_bytes;
+    let without = reclaim::plan(&store, 1, &[], &[])
+        .unwrap()
+        .reclaimable_bytes;
     let with = reclaim::plan(&store, 1, &[], std::slice::from_ref(&hold))
         .unwrap()
         .reclaimable_bytes;
@@ -328,7 +340,7 @@ fn a_store_with_no_disk_budget_refuses_every_reclaim_verb() {
     assert_eq!(store.disk_budget(), None);
 
     assert_eq!(
-        reclaim::usage(&store, &[]).unwrap_err().code,
+        reclaim::usage(&store, &[], &[], &[]).unwrap_err().code,
         Code::RECLAIM_NOT_PERMITTED
     );
     let refusal = reclaim::plan(&store, 1, &[], &[]).unwrap_err();
@@ -462,5 +474,94 @@ fn two_roots_that_free_nothing_apart_are_planned_together_and_the_useless_third_
             "victim {position} was not needed and should have been pruned"
         );
     }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn the_set_total_exceeds_the_sum_of_the_marginals_and_a_caller_must_not_add_them_up() {
+    // THE NUMBER THE ORCHESTRATOR REFUSES ON. Two models share a base that nothing else
+    // holds, so NEITHER counts it in its own marginal — it is not unique to either — and
+    // dropping both frees it. A caller that sums marginals under-estimates what eviction
+    // can achieve, evicts too little, and lands back on the full filesystem this whole
+    // line of work exists to prevent.
+    let root = temporary("set-total");
+    let store = budgeted(&root);
+    let base = blob(&store, "shared-base", 200_000);
+    let one = blob(&store, "one-own", 10_000);
+    let two = blob(&store, "two-own", 10_000);
+    model(
+        &store,
+        "acme",
+        "one",
+        &[("base.bin", base.clone()), ("own.bin", one)],
+    );
+    model(
+        &store,
+        "acme",
+        "two",
+        &[("base.bin", base.clone()), ("own.bin", two)],
+    );
+
+    let usage = reclaim::usage(&store, &[], &[], &[]).unwrap();
+    let summed: u64 = usage.roots.iter().map(|row| row.bytes_solo).sum();
+    assert_eq!(usage.roots.len(), 2);
+    assert!(
+        usage.roots.iter().all(|row| row.bytes_solo < base.length),
+        "a marginal counted the shared base: {:?}",
+        usage.roots
+    );
+    assert_eq!(
+        usage.bytes_total - summed,
+        base.length,
+        "the set total must exceed the summed marginals by exactly the shared base \
+         (total={} summed={summed})",
+        usage.bytes_total
+    );
+
+    // And the store's own fullness comes from here too, so a caller never holds a second
+    // number that can disagree with this one.
+    assert_eq!(usage.occupancy_bytes, store.occupancy().unwrap());
+    assert_eq!(usage.budget_bytes, store.disk_budget().unwrap());
+    assert_eq!(
+        usage.headroom_bytes,
+        usage.budget_bytes - usage.occupancy_bytes
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_candidate_list_narrows_the_rows_and_the_total_and_an_overlap_refuses() {
+    let root = temporary("candidate-list");
+    let store = budgeted(&root);
+    let a = blob(&store, "aaa", 10_000);
+    let b = blob(&store, "bbb", 20_000);
+    let c = blob(&store, "ccc", 40_000);
+    model(&store, "acme", "a", &[("o.bin", a)]);
+    model(&store, "acme", "b", &[("o.bin", b)]);
+    model(&store, "acme", "c", &[("o.bin", c)]);
+
+    let only_ab = [
+        RepositoryName::new("acme", "a").unwrap(),
+        RepositoryName::new("acme", "b").unwrap(),
+    ];
+    let narrowed = reclaim::usage(&store, &[], &only_ab, &[]).unwrap();
+    assert_eq!(narrowed.roots.len(), 2);
+    let everything = reclaim::usage(&store, &[], &[], &[]).unwrap();
+    assert_eq!(everything.roots.len(), 3);
+    assert!(
+        narrowed.bytes_total < everything.bytes_total,
+        "narrowing the candidates did not narrow the total"
+    );
+
+    // A root named on both lists is a caller mistake, and guessing which list meant it
+    // would be a guess about a deletion.
+    let refusal = reclaim::usage(
+        &store,
+        &[RepositoryName::new("acme", "a").unwrap()],
+        &only_ab,
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(refusal.code, Code::DISPOSITION_CONFLICT, "{refusal}");
     let _ = std::fs::remove_dir_all(root);
 }

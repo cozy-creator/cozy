@@ -136,10 +136,7 @@ impl Plan {
                             Value::obj(vec![
                                 ("bytes_closure", Value::uint(victim.bytes_closure)),
                                 ("cumulative_bytes", Value::uint(victim.cumulative_bytes)),
-                                (
-                                    "last_recorded_unix",
-                                    Value::uint(victim.last_recorded_unix),
-                                ),
+                                ("last_recorded_unix", Value::uint(victim.last_recorded_unix)),
                                 ("marginal_bytes", Value::uint(victim.marginal_bytes)),
                                 ("name", Value::str(victim.name.clone())),
                                 ("org", Value::str(victim.org.clone())),
@@ -179,22 +176,140 @@ fn recorded_unix(store: &Store, repo: &RepositoryName) -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// Every root, with what it reaches and what dropping it alone would free.
-pub fn usage(store: &Store, holds: &[HeldKey]) -> Result<Vec<RootFacts>> {
+/// What a whole store answers when asked what it could give back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Usage {
+    /// One row per candidate. With no candidate list, every root is a candidate.
+    pub roots: Vec<RootFacts>,
+    /// Bytes freed by dropping EVERY candidate at once.
+    ///
+    /// **This is not the sum of the per-root marginals, and that gap is the entire reason
+    /// the field exists.** Two models sharing a 2 GB base each exclude it from their own
+    /// figure — it is not unique to either — so dropping both frees 2 GB MORE than the sum.
+    /// A caller that adds up marginals systematically under-estimates what eviction can
+    /// achieve, evicts too little, and lands back on the full filesystem this work exists
+    /// to prevent. This is the number a refuse-early check must use.
+    pub bytes_total: u64,
+    /// Bytes no repository reaches, which a plain `tfs gc` frees without dropping anything.
+    pub bytes_unreferenced: u64,
+    /// What the Store is holding, and the budget it is held to. **This is deliberately not
+    /// a filesystem statistic**: TensorFS stats no filesystem for policy (decisions.md
+    /// 241/941), because only the caller can see the image layers, install roots and caches
+    /// sharing the disk. It is the one answer to "how full is this STORE", so a caller
+    /// consuming it never has a second number that can disagree.
+    pub occupancy_bytes: u64,
+    pub budget_bytes: u64,
+    /// `budget - occupancy`, floored at zero.
+    pub headroom_bytes: u64,
+}
+
+impl Usage {
+    /// `repo usage`-shaped JSONL: one `kind:"root"` row per candidate, then one
+    /// `kind:"all"` row for the whole set.
+    pub fn json_lines(&self) -> Vec<Vec<u8>> {
+        let mut lines: Vec<Vec<u8>> = self
+            .roots
+            .iter()
+            .map(|root| {
+                crate::canon::write(&Value::obj(vec![
+                    ("bytes_closure", Value::uint(root.bytes_closure)),
+                    ("bytes_marginal", Value::uint(root.bytes_solo)),
+                    ("kind", Value::str("root")),
+                    ("last_recorded_unix", Value::uint(root.last_recorded_unix)),
+                    ("name", Value::str(root.name.clone())),
+                    ("org", Value::str(root.org.clone())),
+                ]))
+            })
+            .collect();
+        lines.push(crate::canon::write(&Value::obj(vec![
+            ("budget_bytes", Value::uint(self.budget_bytes)),
+            ("bytes_total", Value::uint(self.bytes_total)),
+            ("bytes_unreferenced", Value::uint(self.bytes_unreferenced)),
+            ("candidates", Value::uint(self.roots.len() as u64)),
+            ("headroom_bytes", Value::uint(self.headroom_bytes)),
+            ("kind", Value::str("all")),
+            ("occupancy_bytes", Value::uint(self.occupancy_bytes)),
+        ])));
+        lines
+    }
+}
+
+/// What each candidate would free alone, and what all of them would free together.
+///
+/// `bytes_marginal` on a root is what dropping THAT ONE frees while everything else stands
+/// — the keep set and **every other candidate**. That is the greedy ranking key, and it is
+/// deliberately not `Census::usage()`'s `bytes_unique`, which answers the same question one
+/// repository at a time and therefore cannot be summed.
+///
+/// `keep` and `candidates` are CALLER INPUTS, exactly like free space. TensorFS does not
+/// know and must never decide which models a pod is serving; it knows what they reach and
+/// what they share.
+pub fn usage(
+    store: &Store,
+    keep: &[RepositoryName],
+    candidates: &[RepositoryName],
+    holds: &[HeldKey],
+) -> Result<Usage> {
     permitted(store)?;
     let census = Census::open(store.root())?;
     let index = census.holder_index(holds)?;
-    let mut rows = Vec::with_capacity(index.roots.len());
-    for (position, repo) in index.roots.iter().enumerate() {
-        rows.push(RootFacts {
-            org: repo.org.clone(),
-            name: repo.name.clone(),
-            bytes_closure: index.closure_bytes(position),
-            bytes_solo: index.reclaimable(&BTreeSet::from([position])),
-            last_recorded_unix: recorded_unix(store, repo),
-        });
+
+    for repo in keep {
+        if candidates.contains(repo) {
+            return refuse(
+                Code::DISPOSITION_CONFLICT,
+                format!(
+                    "{}/{} is named as both kept and a candidate; one of the two lists is \
+                     wrong and guessing which would be a deletion",
+                    repo.org, repo.name
+                ),
+            );
+        }
     }
-    Ok(rows)
+
+    // No candidate list means every root is one, which is what an operator asking "what
+    // could this store give back" means.
+    let chosen: Vec<usize> = if candidates.is_empty() {
+        (0..index.roots.len())
+            .filter(|position| !keep.contains(&index.roots[*position]))
+            .collect()
+    } else {
+        candidates
+            .iter()
+            .map(|repo| {
+                index.position(repo).ok_or_else(|| crate::err::Refusal {
+                    code: Code::REPOSITORY_ABSENT,
+                    detail: format!("{}/{} is not a root of this store", repo.org, repo.name),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    let roots = chosen
+        .iter()
+        .map(|position| {
+            let repo = &index.roots[*position];
+            RootFacts {
+                org: repo.org.clone(),
+                name: repo.name.clone(),
+                bytes_closure: index.closure_bytes(*position),
+                bytes_solo: index.reclaimable(&BTreeSet::from([*position])),
+                last_recorded_unix: recorded_unix(store, repo),
+            }
+        })
+        .collect();
+
+    let all: BTreeSet<usize> = chosen.into_iter().collect();
+    let occupancy = store.occupancy()?;
+    let budget = store.disk_budget().unwrap_or(0);
+    Ok(Usage {
+        roots,
+        bytes_total: index.reclaimable(&all),
+        bytes_unreferenced: index.unreferenced(),
+        occupancy_bytes: occupancy,
+        budget_bytes: budget,
+        headroom_bytes: budget.saturating_sub(occupancy),
+    })
 }
 
 /// Choose the roots to drop to free `need` bytes, keeping everything in `keep`.
@@ -206,7 +321,10 @@ pub fn plan(store: &Store, need: u64, keep: &[RepositoryName], holds: &[HeldKey]
     let census = Census::open(store.root())?;
     let index = census.holder_index(holds)?;
 
-    let kept: BTreeSet<usize> = keep.iter().filter_map(|repo| index.position(repo)).collect();
+    let kept: BTreeSet<usize> = keep
+        .iter()
+        .filter_map(|repo| index.position(repo))
+        .collect();
     let candidates: Vec<usize> = (0..index.roots.len())
         .filter(|position| !kept.contains(position))
         .collect();

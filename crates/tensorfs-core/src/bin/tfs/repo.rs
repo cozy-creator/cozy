@@ -1109,43 +1109,75 @@ fn reclaim_holds(store: &Store) -> Result<Vec<storage::HeldKey>, Refusal> {
     gc::session_holds(store).map(|(holds, _)| holds)
 }
 
+/// Read a `{"name":..,"org":..}` JSONL list of repositories. The same shape `tfs repo
+/// list --rows` emits, so a caller filters that output rather than inventing a format.
+fn read_repo_list(path: &str) -> Result<Vec<repository::RepositoryName>, Refusal> {
+    let bytes = fs::read(Path::new(path)).map_err(|error| Refusal {
+        code: Code::IO_FAILED,
+        detail: format!("read {path}: {error}"),
+    })?;
+    let mut names = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let value = tensorfs_core::canon::parse_canonical(line, 16 * 1024)?;
+        let mut fields = tensorfs_core::canon::Fields::new("RepositoryRow", &value)?;
+        let name = fields.req_str("name")?.to_string();
+        let org = fields.req_str("org")?.to_string();
+        names.push(repository::RepositoryName::new(org, name)?);
+    }
+    Ok(names)
+}
+
 pub fn cmd_reclaim_usage(root: &Path, flags: &Flags) -> ExitCode {
     let Some(rows) = flag(flags, "rows") else {
         eprintln!("--rows <jsonl> is required");
         return ExitCode::from(2);
     };
+    let mut keep = Vec::new();
+    let mut candidates = Vec::new();
+    for (list, into) in [("keep", &mut keep), ("candidates", &mut candidates)] {
+        if let Some(path) = flag(flags, list) {
+            match read_repo_list(path) {
+                Ok(names) => *into = names,
+                Err(error) => return bail(error),
+            }
+        }
+    }
     let store = match Store::open(root) {
         Ok(store) => store,
         Err(error) => return bail(error),
     };
-    let facts = match reclaim_holds(&store).and_then(|holds| reclaim::usage(&store, &holds)) {
-        Ok(facts) => facts,
+    let usage = match reclaim_holds(&store)
+        .and_then(|holds| reclaim::usage(&store, &keep, &candidates, &holds))
+    {
+        Ok(usage) => usage,
         Err(error) => return bail(error),
     };
-    let lines: Vec<Vec<u8>> = facts
-        .iter()
-        .map(|root| {
-            tensorfs_core::canon::write(&Value::obj(vec![
-                ("bytes_closure", Value::uint(root.bytes_closure)),
-                ("bytes_solo", Value::uint(root.bytes_solo)),
-                ("last_recorded_unix", Value::uint(root.last_recorded_unix)),
-                ("name", Value::str(root.name.clone())),
-                ("org", Value::str(root.org.clone())),
-            ]))
-        })
-        .collect();
-    if let Err(error) = storage::write_json_lines(Path::new(rows), &lines) {
+    if let Err(error) = storage::write_json_lines(Path::new(rows), &usage.json_lines()) {
         return bail(error);
     }
-    // Both numbers, always. `bytes_closure` alone reads as "what this model costs" and is
-    // the figure that picks the wrong victim; `bytes_solo` alone hides that dropping two
-    // roots together frees what neither frees apart.
-    for root in &facts {
+    // Both per-root numbers, always. `bytes_closure` alone reads as "what this model costs"
+    // and is the figure that picks the wrong victim; `bytes_marginal` alone hides that
+    // dropping two roots together frees what neither frees apart — which is why the set
+    // total is printed beside them rather than left to be summed.
+    for root in &usage.roots {
         println!(
-            "{}/{}  closure {} B  solo {} B",
+            "{}/{}  closure {} B  marginal {} B",
             root.org, root.name, root.bytes_closure, root.bytes_solo
         );
     }
+    println!(
+        "all {} candidate(s) together free {} B ({} B already unreferenced); holding {} B \
+         of a {} B budget, {} B of headroom",
+        usage.roots.len(),
+        usage.bytes_total,
+        usage.bytes_unreferenced,
+        usage.occupancy_bytes,
+        usage.budget_bytes,
+        usage.headroom_bytes,
+    );
     ExitCode::SUCCESS
 }
 
@@ -1176,12 +1208,11 @@ pub fn cmd_reclaim_plan(root: &Path, flags: &Flags) -> ExitCode {
         Ok(store) => store,
         Err(error) => return bail(error),
     };
-    let plan = match reclaim_holds(&store)
-        .and_then(|holds| reclaim::plan(&store, need, &keep, &holds))
-    {
-        Ok(plan) => plan,
-        Err(error) => return bail(error),
-    };
+    let plan =
+        match reclaim_holds(&store).and_then(|holds| reclaim::plan(&store, need, &keep, &holds)) {
+            Ok(plan) => plan,
+            Err(error) => return bail(error),
+        };
     if let Some(output) = flag(flags, "out") {
         if let Err(error) = fs::write(Path::new(output), plan.json()) {
             return bail(Refusal {
