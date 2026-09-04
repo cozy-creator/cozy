@@ -784,28 +784,25 @@ func progressValue(life api.Lifecycle) string {
 	if life.Status != "in_progress" {
 		return "-"
 	}
-	parts := []string{}
-	if life.OverallFraction != nil {
-		overall := fmt.Sprintf("%.0f%% overall", *life.OverallFraction*100)
-		if life.RemainingMS != nil {
-			overall += " (~" + shortDuration(time.Duration(*life.RemainingMS)*time.Millisecond) + ")"
+	// ONE NUMBER AND THE STAGE. This cell carried four facts at once -- an overall
+	// percent, a remaining estimate, the stage, and a SECOND percent scoped to that
+	// stage -- so `35% overall (~2s) · denoise 90% stage` asked a reader to hold two
+	// unrelated denominators in mind to learn one thing. The stage says what is
+	// happening; the overall percent says how far along it is. A stage-scoped percent
+	// answers a question nobody asked of a list, and the remaining estimate moves
+	// faster than the row it sits in.
+	stage := life.ProgressStage
+	if life.OverallFraction == nil {
+		if stage == "" {
+			return "-"
 		}
-		parts = append(parts, overall)
+		return stage
 	}
-	if life.ProgressStage != "" {
-		stage := life.ProgressStage
-		switch {
-		case life.StageFraction != nil:
-			stage += fmt.Sprintf(" %.0f%% stage", *life.StageFraction*100)
-		case life.Position != nil && life.Total != nil:
-			stage += fmt.Sprintf(" %d/%d", *life.Position, *life.Total)
-		}
-		parts = append(parts, stage)
+	overall := fmt.Sprintf("%.0f%%", *life.OverallFraction*100)
+	if stage == "" {
+		return overall
 	}
-	if len(parts) == 0 {
-		return "-"
-	}
-	return strings.Join(parts, " · ")
+	return stage + " " + overall
 }
 
 func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error {

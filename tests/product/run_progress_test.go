@@ -200,6 +200,24 @@ func TestRunProgressSurfaces(t *testing.T) {
 		}
 		return document.Invocations[0]
 	}
+	// THE HUMAN CELL IS ONE NUMBER AND THE STAGE. The machine projection above keeps
+	// stage and overall apart because a caller may want either; the LIST CELL is read
+	// by a person scanning rows, and it carried four facts at once --
+	// `35% overall (~2s) · denoise 90% stage` -- two percentages against different
+	// denominators plus an estimate that moves faster than the row holding it.
+	if code, human := runCozy(t, root, "run", "list", "--limit", "1"); code != 0 {
+		t.Fatalf("human run list [exit %d]:\n%s", code, human)
+	} else {
+		for _, gone := range []string{"% overall", "% stage"} {
+			if strings.Contains(human, gone) {
+				t.Fatalf("the progress cell still renders %q:\n%s", gone, human)
+			}
+		}
+		if !humanProgressCell.MatchString(human) {
+			t.Fatalf("the progress cell does not read as `<stage> <percent>`:\n%s", human)
+		}
+	}
+
 	live := list(true)
 	if live.Status != "in_progress" || live.ProgressStage == "" ||
 		live.StageFraction == nil || *live.StageFraction <= 0 ||
@@ -247,3 +265,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 		t.Fatalf("terminal input was echoed as output\n%q", tty)
 	}
 }
+
+// humanProgressCell is the shape a person reads off a row: the stage, then one
+// percent for the whole job.
+var humanProgressCell = regexp.MustCompile(`[a-z_]+ [0-9]+%`)
