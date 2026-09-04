@@ -221,6 +221,12 @@ func (c *Orchestrator) onModelTransferWeightsStatus(s *session,
 		Transferred: int64(frame.TransferredBytes), SafeCode: frame.SafeCode,
 		SafeDetail: frame.SafeDetail})
 	if problem != nil {
+		if state == "failed" || problem.ErrName() != "model_transfer.object_status_superseded" {
+			c.logf("model transfer %s: object %s reported %s under grant revision %d/%d "+
+				"(%s: %s) and the row did not take it: %s", frame.RequestId, frame.ObjectId,
+				state, frame.GrantRevision, frame.UpdateSequence, frame.SafeCode,
+				frame.SafeDetail, problem.Message)
+		}
 		return
 	}
 	c.signalTransfer(frame.RequestId)

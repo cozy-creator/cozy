@@ -673,13 +673,25 @@ func (c *Orchestrator) onLocalPackageFileStatus(current *session,
 		return
 	}
 	prior := transfer.status[spelled]
-	if frame.ReceivedBytes < prior.received ||
-		prior.state == pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED &&
-			frame.State != prior.state {
+	if prior.state == pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED &&
+		frame.State != prior.state {
 		return
 	}
+	received := frame.ReceivedBytes
+	if received < prior.received {
+		// A VERDICT IS ABOUT THE FILE, NOT ABOUT THE BYTE COUNT THAT CARRIED IT. The pod's
+		// whole-request refusal (`localPackageRefusal`) quotes the grant's identity and
+		// carries NO received bytes, so a refusal answering a file some earlier frame had
+		// already reported progress on was dropped entire — code, words and all — and the
+		// fetch then died on the generic `local_package_transfer_stuck` bound instead of
+		// the pod's own reason. The count is what goes backwards; the verdict does not.
+		if frame.State != pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_REFUSED {
+			return
+		}
+		received = prior.received
+	}
 	transfer.status[spelled] = localTransferStatus{state: frame.State,
-		received: frame.ReceivedBytes, safeCode: frame.SafeCode, safeDetail: frame.SafeDetail}
+		received: received, safeCode: frame.SafeCode, safeDetail: frame.SafeDetail}
 }
 
 func (c *Orchestrator) onLocalPackageAbortStatus(current *session,
