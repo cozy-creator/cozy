@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -30,6 +31,14 @@ func TestIncompleteSourceCheckpointIsDurableObservation(t *testing.T) {
 		for {
 			select {
 			case checkpoint := <-frames:
+				if checkpoint == nil {
+					_ = send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ModelSourcePrepared{ModelSourcePrepared: &pb.ModelSourcePrepared{
+						RecordOwnerEpoch: ownerEpoch, ControlStreamEpoch: controlEpoch, WorkerBootId: bootID,
+						OperationId: requestID, SourceSelectionDigest: bytes.Repeat([]byte{0x22}, 32),
+						Outcome:  pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_REFUSED,
+						SafeCode: "model_source_preparer_unavailable"}}})
+					continue
+				}
 				_ = send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ModelSourcePrepared{
 					ModelSourcePrepared: &pb.ModelSourcePrepared{
 						RecordOwnerEpoch: ownerEpoch, ControlStreamEpoch: controlEpoch,
@@ -61,6 +70,7 @@ func TestIncompleteSourceCheckpointIsDurableObservation(t *testing.T) {
 	if !created {
 		t.Fatal("the source operation was not created")
 	}
+	o.c.ObservePhase(requestID, orchestrator.PhaseSample{Name: orchestrator.PhaseWarming})
 	close(ready)
 	checkpoint := func(head, plan byte, index, size uint64) *pb.ModelSourceCheckpoint {
 		return &pb.ModelSourceCheckpoint{Slot: "shared", Head: &pb.Ref{Digest: bytes.Repeat([]byte{head}, 32), Length: 500},
@@ -71,6 +81,21 @@ func TestIncompleteSourceCheckpointIsDurableObservation(t *testing.T) {
 	frames <- checkpoint(0x22, 0x44, 3, 75) // an older replay must not regress progress
 	frames <- checkpoint(0x55, 0x44, 5, 125)
 	awaitSourceCheckpointIndex(t, o.store, requestID, 5)
+	phase, present := o.c.PhaseOf(requestID)
+	if !present || phase.Name != orchestrator.PhasePreparing || !phase.HasBytes || phase.Moved != 125 {
+		t.Fatalf("source conversion did not replace stale warming with measured bytes: %+v", phase)
+	}
+	frames <- nil
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		phase, _ := o.c.PhaseOf(requestID)
+		if strings.Contains(phase.Detail, "model_source_preparer_unavailable") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("preparer disconnect was not exposed in phase")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// Read through a newly opened database handle, after all temporary caller
 	// byte buffers could have disappeared. Neither header nor head lives only in memory.

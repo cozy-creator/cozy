@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS request_model_transfers (
   error_code       TEXT NOT NULL DEFAULT '',
   safe_error       TEXT NOT NULL DEFAULT '',
   updated_at       TEXT NOT NULL,
+  models_worker_boot_id TEXT NOT NULL DEFAULT '',
   CHECK (state IN ('pending','materializing','materialized','finalizing','completed','failed','canceled'))
 )`, `
 CREATE TABLE IF NOT EXISTS request_model_transfer_files (
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS request_model_transfer_files (
   transferred         INTEGER NOT NULL DEFAULT 0,
   safe_code           TEXT NOT NULL DEFAULT '',
   safe_detail         TEXT NOT NULL DEFAULT '',
+  worker_boot_id      TEXT NOT NULL DEFAULT '',
   PRIMARY KEY(request_id,member)
 )`, `
 CREATE TABLE IF NOT EXISTS request_model_transfer_outputs (
@@ -72,7 +74,7 @@ CREATE TABLE IF NOT EXISTS request_model_transfer_objects (
   PRIMARY KEY(request_id,attempt,output_slot,object_id),
   FOREIGN KEY(request_id,attempt,output_slot)
     REFERENCES request_model_transfer_outputs(request_id,attempt,output_slot)
-)`, modelSourceCheckpointSchema}
+)`, modelSourceCheckpointSchema, modelSourcePublicationSchema}
 
 type ModelTransferSourceFile struct {
 	Member string `json:"member"`
@@ -82,8 +84,8 @@ type ModelTransferSourceFile struct {
 }
 
 type ModelTransferSourceStatus struct {
-	RequestID, Member, ObjectID, State, SafeCode, SafeDetail string
-	Length, CapabilityRevision, Transferred                  int64
+	RequestID, Member, ObjectID, State, SafeCode, SafeDetail, WorkerBootID string
+	Length, CapabilityRevision, Transferred                                int64
 }
 
 type ModelTransferOutput struct {
@@ -108,12 +110,13 @@ type ModelTransferIntent struct {
 type ModelTransfer struct {
 	RequestID string
 	ModelTransferIntent
-	State       string
-	Models      []ModelRef
-	Checkpoints map[string]string
-	ErrorCode   string
-	SafeError   string
-	UpdatedAt   string
+	State              string
+	Models             []ModelRef
+	Checkpoints        map[string]string
+	ErrorCode          string
+	SafeError          string
+	UpdatedAt          string
+	ModelsWorkerBootID string
 }
 
 type ModelTransferObject struct {
@@ -242,9 +245,9 @@ func (s *Store) PlannedSourceBytes(requestID string) (int64, *exit.Error) {
 func (s *Store) ModelTransferOf(requestID string) (*ModelTransfer, *exit.Error) {
 	var row ModelTransfer
 	var intent, models, checkpoints string
-	err := s.db.QueryRow(`SELECT request_id,intent,state,models,checkpoints,error_code,safe_error,updated_at
+	err := s.db.QueryRow(`SELECT request_id,intent,state,models,checkpoints,error_code,safe_error,updated_at,models_worker_boot_id
 		FROM request_model_transfers WHERE request_id=?`, requestID).Scan(&row.RequestID,
-		&intent, &row.State, &models, &checkpoints, &row.ErrorCode, &row.SafeError, &row.UpdatedAt)
+		&intent, &row.State, &models, &checkpoints, &row.ErrorCode, &row.SafeError, &row.UpdatedAt, &row.ModelsWorkerBootID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -289,7 +292,7 @@ func (s *Store) ModelTransfersOwed() ([]ModelTransfer, *exit.Error) {
 
 func (s *Store) BeginModelTransferMaterialization(requestID string) *exit.Error {
 	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='materializing',updated_at=?
-		WHERE request_id=? AND state IN ('pending','materializing')`, now(), requestID)
+		WHERE request_id=? AND state IN ('pending','materializing','materialized')`, now(), requestID)
 	if err != nil {
 		return exit.Internalf("cannot begin model transfer materialization: %s", err)
 	}
@@ -307,15 +310,15 @@ func (s *Store) BeginModelTransferMaterialization(requestID string) *exit.Error 
 	return exit.New(exit.Conflict, "model transfer %s is not materializable", requestID)
 }
 
-func (s *Store) CompleteModelTransferMaterialization(requestID string, models []ModelRef) *exit.Error {
+func (s *Store) CompleteModelTransferMaterialization(requestID string, models []ModelRef, bootID string) *exit.Error {
 	rows := append([]ModelRef(nil), models...)
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Slot < rows[j].Slot })
 	data, err := json.Marshal(rows)
 	if err != nil {
 		return exit.Internalf("cannot encode model transfer inputs: %s", err)
 	}
-	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='materialized',models=?,updated_at=?
-		WHERE request_id=? AND state IN ('pending','materializing','materialized')`, string(data), now(), requestID)
+	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='materialized',models=?,updated_at=?,models_worker_boot_id=?
+		WHERE request_id=? AND state IN ('pending','materializing','materialized')`, string(data), now(), bootID, requestID)
 	if err != nil {
 		return exit.Internalf("cannot retain model transfer inputs: %s", err)
 	}
@@ -332,7 +335,7 @@ func (s *Store) CompleteModelTransferMaterialization(requestID string, models []
 
 func (s *Store) ModelTransferSourceStatuses(requestID string) ([]ModelTransferSourceStatus, *exit.Error) {
 	rows, err := s.db.Query(`SELECT request_id,member,object_id,length,capability_revision,state,
-		transferred,safe_code,safe_detail FROM request_model_transfer_files
+		transferred,safe_code,safe_detail,worker_boot_id FROM request_model_transfer_files
 		WHERE request_id=? ORDER BY member`, requestID)
 	if err != nil {
 		return nil, exit.Internalf("cannot list model transfer source files: %s", err)
@@ -343,7 +346,7 @@ func (s *Store) ModelTransferSourceStatuses(requestID string) ([]ModelTransferSo
 		var row ModelTransferSourceStatus
 		if err := rows.Scan(&row.RequestID, &row.Member, &row.ObjectID, &row.Length,
 			&row.CapabilityRevision, &row.State, &row.Transferred, &row.SafeCode,
-			&row.SafeDetail); err != nil {
+			&row.SafeDetail, &row.WorkerBootID); err != nil {
 			return nil, exit.Internalf("cannot decode model transfer source status: %s", err)
 		}
 		out = append(out, row)
@@ -359,16 +362,16 @@ func (s *Store) RecordModelTransferSourceStatus(row ModelTransferSourceStatus) *
 	defer tx.Rollback()
 	var held ModelTransferSourceStatus
 	err = tx.QueryRow(`SELECT request_id,member,object_id,length,capability_revision,state,
-		transferred,safe_code,safe_detail FROM request_model_transfer_files
+		transferred,safe_code,safe_detail,worker_boot_id FROM request_model_transfer_files
 		WHERE request_id=? AND member=?`, row.RequestID, row.Member).Scan(&held.RequestID,
 		&held.Member, &held.ObjectID, &held.Length, &held.CapabilityRevision, &held.State,
-		&held.Transferred, &held.SafeCode, &held.SafeDetail)
+		&held.Transferred, &held.SafeCode, &held.SafeDetail, &held.WorkerBootID)
 	if err != nil {
 		return exit.Internalf("cannot read model transfer source status: %s", err)
 	}
 	exact := held.ObjectID == row.ObjectID && held.Length == row.Length
 	replay := exact && held.CapabilityRevision == row.CapabilityRevision && held.State == row.State &&
-		held.Transferred == row.Transferred && held.SafeCode == row.SafeCode && held.SafeDetail == row.SafeDetail
+		held.Transferred == row.Transferred && held.WorkerBootID == row.WorkerBootID && held.SafeCode == row.SafeCode && held.SafeDetail == row.SafeDetail
 	if replay {
 		return nil
 	}
@@ -376,11 +379,18 @@ func (s *Store) RecordModelTransferSourceStatus(row ModelTransferSourceStatus) *
 		return exit.Named(exit.Conflict, "model_transfer.source_status_changed",
 			"model transfer source %s changed identity", row.Member)
 	}
+	newBoot := row.WorkerBootID != "" && row.WorkerBootID != held.WorkerBootID
+	if newBoot && row.CapabilityRevision < held.CapabilityRevision {
+		return exit.Named(exit.Conflict, "model_transfer.source_status_superseded", "new worker source status precedes its declaration")
+	}
+	if !newBoot && row.State == "converted" {
+		row.Transferred = held.Transferred
+	}
 	advancedRevision := row.CapabilityRevision > held.CapabilityRevision
 	advancedState := row.CapabilityRevision == held.CapabilityRevision &&
 		sourceStateRank(row.State) >= sourceStateRank(held.State)
-	absorbing := held.State == "verified" || (held.State == "failed" && !advancedRevision)
-	if row.Transferred < held.Transferred || (!advancedRevision && !advancedState) || absorbing {
+	absorbing := (held.State == "verified" || held.State == "converted" || held.State == "failed") && !advancedRevision
+	if !newBoot && (row.Transferred < held.Transferred || (!advancedRevision && !advancedState) || absorbing) {
 		// A VERDICT IS ABOUT THE MEMBER, NOT ABOUT THE REVISION THAT CARRIED IT. A FAILED
 		// status that answers a superseded capability revision is still the pod's last word
 		// on these bytes, and the row is where every reader looks for it. Its counts are
@@ -390,16 +400,16 @@ func (s *Store) RecordModelTransferSourceStatus(row ModelTransferSourceStatus) *
 		// Dropping it whole is what made run 205 unreadable: four members failed in the
 		// first seconds under revision N, the row had already been carried past N, and
 		// `state=accepted, safe_code=''` was all a human could see for 2h55m.
-		if row.State != "failed" || held.State == "verified" || held.State == "failed" {
+		if row.State != "failed" || held.State == "verified" || held.State == "converted" || held.State == "failed" {
 			return exit.Named(exit.Conflict, "model_transfer.source_status_superseded",
 				"model transfer source %s status is behind the row it answers", row.Member)
 		}
 		row.CapabilityRevision, row.Transferred = held.CapabilityRevision, held.Transferred
 	}
 	result, err := tx.Exec(`UPDATE request_model_transfer_files SET capability_revision=?,
-		state=?,transferred=?,safe_code=?,safe_detail=? WHERE request_id=? AND member=?
+		state=?,transferred=?,safe_code=?,safe_detail=?,worker_boot_id=? WHERE request_id=? AND member=?
 		AND capability_revision=? AND state=? AND transferred=?`, row.CapabilityRevision,
-		row.State, row.Transferred, row.SafeCode, row.SafeDetail, row.RequestID, row.Member,
+		row.State, row.Transferred, row.SafeCode, row.SafeDetail, row.WorkerBootID, row.RequestID, row.Member,
 		held.CapabilityRevision, held.State, held.Transferred)
 	if err != nil {
 		return exit.Internalf("cannot record model transfer source status: %s", err)
@@ -422,7 +432,7 @@ func sourceStateRank(state string) int {
 		return 1
 	case "downloading":
 		return 2
-	case "verified", "failed":
+	case "verified", "converted", "failed":
 		return 3
 	default:
 		return -1

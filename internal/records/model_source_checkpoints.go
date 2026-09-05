@@ -1,6 +1,7 @@
 package records
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -16,7 +17,18 @@ CREATE TABLE IF NOT EXISTS request_model_source_checkpoints (
   worker_boot_id TEXT NOT NULL,
   observed TEXT NOT NULL,
   acknowledged TEXT NOT NULL DEFAULT '',
+  grant_revision INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(request_id,slot)
+)`
+
+const modelSourcePublicationSchema = `
+CREATE TABLE IF NOT EXISTS request_model_source_publications (
+  request_id TEXT NOT NULL REFERENCES requests(id),
+  operation TEXT NOT NULL,
+  objects BLOB NOT NULL,
+  opened INTEGER NOT NULL DEFAULT 0,
+  released INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(request_id,operation)
 )`
 
 // ModelSourceCheckpoint is a TensorFS recovery head. Observing it says nothing
@@ -202,6 +214,13 @@ func (s *Store) AcknowledgeModelSourceCheckpoint(requestID, selection, bootID, p
 				"source checkpoint acknowledgment cannot move backwards")
 		}
 	}
+	var foreignBoot bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_model_transfer_files WHERE request_id=? AND worker_boot_id<>?)`, requestID, bootID).Scan(&foreignBoot); err != nil {
+		return exit.Internalf("cannot fence source checkpoint worker: %s", err)
+	}
+	if foreignBoot {
+		return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_superseded", "source checkpoint uploader no longer owns the declared worker")
+	}
 	if priorHead != previousHead || progress.WorkerBootID != bootID ||
 		progress.Observed.PlanDigest != checkpoint.PlanDigest || checkpoint.Index > progress.Observed.Index ||
 		(checkpoint.Index == progress.Observed.Index && checkpoint != progress.Observed) {
@@ -217,4 +236,97 @@ func (s *Store) AcknowledgeModelSourceCheckpoint(requestID, selection, bootID, p
 		return exit.Internalf("cannot commit source checkpoint acknowledgment: %s", err)
 	}
 	return nil
+}
+
+// NextModelSourceGrantRevision fences refreshed capabilities across daemon restarts.
+// The counter covers one source slot; individual transfer identities remain exact.
+func (s *Store) NextModelSourceGrantRevision(requestID, slot string) (uint64, *exit.Error) {
+	var revision int64
+	if err := s.db.QueryRow(`UPDATE request_model_source_checkpoints
+		SET grant_revision=grant_revision+1 WHERE request_id=? AND slot=? AND grant_revision<9223372036854775807
+		RETURNING grant_revision`, requestID, slot).Scan(&revision); err != nil {
+		return 0, exit.Internalf("cannot allocate a source checkpoint grant revision: %s", err)
+	}
+	return uint64(revision), nil
+}
+
+// RecordSourcePublication precedes the external open so cancellation can release
+// every hold even if the daemon dies before the checkpoint is acknowledged.
+func (s *Store) RecordSourcePublication(requestID, operation string, objects []byte) *exit.Error {
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO request_model_source_publications(request_id,operation,objects) VALUES(?,?,?)`,
+		requestID, operation, objects); err != nil {
+		return exit.Internalf("cannot record source publication intent: %s", err)
+	}
+	var stored []byte
+	if err := s.db.QueryRow(`SELECT objects FROM request_model_source_publications WHERE request_id=? AND operation=?`, requestID, operation).Scan(&stored); err != nil {
+		return exit.Internalf("cannot read source publication intent: %s", err)
+	}
+	if !bytes.Equal(stored, objects) {
+		return exit.Named(exit.Conflict, "model_transfer.source_publication_changed", "source publication changed its fixed object set")
+	}
+	return nil
+}
+
+type SourcePublication struct {
+	Operation string
+	Objects   json.RawMessage
+	Opened    bool
+}
+
+func (s *Store) OpenedSourcePublication(requestID, operation string) *exit.Error {
+	if _, err := s.db.Exec(`UPDATE request_model_source_publications SET opened=1 WHERE request_id=? AND operation=?`, requestID, operation); err != nil {
+		return exit.Internalf("cannot confirm source publication open: %s", err)
+	}
+	return nil
+}
+
+func (s *Store) SourcePublications(requestID string) ([]SourcePublication, *exit.Error) {
+	rows, err := s.db.Query(`SELECT operation,objects,opened FROM request_model_source_publications
+		WHERE request_id=? AND released=0 ORDER BY operation LIMIT 128`, requestID)
+	if err != nil {
+		return nil, exit.Internalf("cannot read source publication holds: %s", err)
+	}
+	defer rows.Close()
+	var out []SourcePublication
+	for rows.Next() {
+		var operation SourcePublication
+		if err := rows.Scan(&operation.Operation, &operation.Objects, &operation.Opened); err != nil {
+			return nil, exit.Internalf("cannot read source publication operation: %s", err)
+		}
+		out = append(out, operation)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot finish source publication holds: %s", err)
+	}
+	return out, nil
+}
+
+func (s *Store) ReleaseSourcePublication(requestID, operation string) *exit.Error {
+	if _, err := s.db.Exec(`UPDATE request_model_source_publications SET released=1 WHERE request_id=? AND operation=?`,
+		requestID, operation); err != nil {
+		return exit.Internalf("cannot record source publication release: %s", err)
+	}
+	return nil
+}
+
+func (s *Store) SourceCheckpointRequests() ([]string, *exit.Error) {
+	rows, err := s.db.Query(`SELECT request_id FROM request_model_source_publications WHERE released=0
+		UNION SELECT c.request_id FROM request_model_source_checkpoints c JOIN request_model_transfers t ON t.request_id=c.request_id
+		WHERE c.acknowledged<>c.observed AND t.state IN ('materializing','materialized','finalizing')`)
+	if err != nil {
+		return nil, exit.Internalf("cannot read owed source checkpoint work: %s", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var requestID string
+		if err := rows.Scan(&requestID); err != nil {
+			return nil, exit.Internalf("cannot read source checkpoint request: %s", err)
+		}
+		out = append(out, requestID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot finish source checkpoint requests: %s", err)
+	}
+	return out, nil
 }

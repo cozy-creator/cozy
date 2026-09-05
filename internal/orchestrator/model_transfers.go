@@ -66,6 +66,7 @@ func (c *Orchestrator) runModelPassThrough(req records.Request) {
 		c.logf("pass-through model transfer %s settlement failed: %s", req.ID, problem.Message)
 	}
 	c.forgetTransferProgress(req.ID)
+	c.kickSourceCheckpointUpload(req.ID)
 }
 
 // weightsGrantExpired is the pod's name for the one weights-transfer refusal a freshly
@@ -207,7 +208,10 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 	if problem != nil || transfer == nil {
 		return req, problem
 	}
-	if len(transfer.Models) > 0 {
+	c.mu.Lock()
+	bootID := w.bootID
+	c.mu.Unlock()
+	if len(transfer.Models) > 0 && (w.spec.Connection == nil || transfer.ModelsWorkerBootID == bootID) {
 		req.Models = append([]ModelRef(nil), transfer.Models...)
 		return req, nil
 	}
@@ -242,8 +246,10 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 		}
 		return req, problem
 	}
-	if problem := c.opt.Store.CompleteModelTransferMaterialization(req.ID, models); problem != nil {
-		return req, problem
+	if w.spec.Connection == nil {
+		if problem := c.opt.Store.CompleteModelTransferMaterialization(req.ID, models, ""); problem != nil {
+			return req, problem
+		}
 	}
 	current, problem := c.opt.Store.RequestRow(req.ID)
 	if problem != nil || current == nil {
@@ -278,8 +284,10 @@ func (c *Orchestrator) forgetTransferProgress(requestID string) {
 	c.mu.Lock()
 	delete(c.transferProgressSeq, requestID)
 	delete(c.sourcePrepareReplies, requestID)
+	delete(c.sourcePrepareBlocked, requestID)
 	c.mu.Unlock()
 	c.frames.forget(requestID)
+	c.ForgetPhase(requestID)
 }
 
 func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req records.Request,
@@ -292,6 +300,9 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 	}
 	expected := make(map[string]records.ModelTransferSourceFile, len(intent.SourceFiles))
 	for _, file := range intent.SourceFiles {
+		if len(file.Header) == 0 {
+			return nil, exit.Named(exit.Validation, "model_transfer.source_header_missing", "source header for %s was not retained before rental", file.Member)
+		}
 		expected[file.Member] = file
 	}
 	byMember := make(map[string]ModelSourceCapability, len(capabilities))
@@ -314,29 +325,16 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		members = append(members, member)
 	}
 	sort.Strings(members)
-	preparedStream, preparedRecovery := "", ""
+	stream, phase := "", ""
+	declarations := map[string]int64{}
 	preparedCount := -1
+	preparedRecovery := ""
 	preparing := false
 	var replyRevision uint64
-	// restated names the control stream this owner has already stated its WHOLE selection
-	// to. The pod's memory of a transfer is its TensorFS Store, not a journal: it indexes
-	// what it proved by object, and a boot that lost that index answers a re-ask from the
-	// store itself, `held`, moving nothing. So the selection is restated once per control
-	// stream rather than only for members this owner has not yet seen verified — otherwise
-	// a pod that restarted under a live rental is asked to prepare over a selection it was
-	// never told about, and the transfer dies naming files nobody named to it.
-	//
-	// The key carries the BOOT, not the epoch alone: the pod mints control-stream epochs
-	// from a counter that starts over with the process, so a restarted supervisor hands out
-	// epoch 1 again — and that is precisely the pod whose index is empty.
-	restated := ""
 	for {
 		transfer, problem := c.opt.Store.ModelTransferOf(req.ID)
 		if problem != nil {
 			return nil, problem
-		}
-		if transfer != nil && len(transfer.Models) == len(intent.SourceProfiles) {
-			return append([]ModelRef(nil), transfer.Models...), nil
 		}
 		if transfer != nil && transfer.State == "failed" {
 			return nil, exit.Named(exit.Failed, transfer.ErrorCode, "%s", transfer.SafeError)
@@ -348,90 +346,141 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		if request.State == "canceled" {
 			return nil, exit.New(exit.Canceled, "model transfer %s was canceled", req.ID)
 		}
-		session, problem := c.rentalControl(req.Worker)
+		session, problem := c.rentalControl(request.Worker)
 		if problem != nil {
 			if wait := c.waitTransfer(ctx, req.ID); wait != nil {
 				return nil, wait
 			}
 			continue
 		}
+		if transfer != nil && len(transfer.Models) == len(intent.SourceProfiles) && transfer.ModelsWorkerBootID == session.bootID {
+			return append([]ModelRef(nil), transfer.Models...), nil
+		}
 		statuses, problem := c.opt.Store.ModelTransferSourceStatuses(req.ID)
 		if problem != nil {
 			return nil, problem
 		}
-		verified := 0
-		revisions := make(map[string]int64, len(statuses))
+		byStatus := make(map[string]records.ModelTransferSourceStatus, len(statuses))
+		fulfilled := 0
 		for _, status := range statuses {
-			revisions[status.Member] = status.CapabilityRevision
-			if status.State == "verified" {
-				verified++
+			byStatus[status.Member] = status
+			if status.WorkerBootID == session.bootID && (status.State == "verified" || status.State == "converted") {
+				fulfilled++
 			}
 		}
-		// The frames go out in ONE pass, in member order, and a preparation sent in the
-		// same pass is read after all of them: the pod registers every member off its
-		// control read loop before it considers a preparation for the same operation.
-		//
-		// ONE PASS PER CONTROL STREAM, and only one. This used to re-state every
-		// non-verified member on every wake, and the pod's own ACCEPTED echo IS a wake --
-		// a closed loop with the pod as its amplifier. On run 205 it turned over ~3,000
-		// capability_revision bumps per member, each a fresh pod goroutine that took a
-		// fetch lane and re-bought a fetch that was already doomed, and each carrying the
-		// row further past the revision whose verdict was still in flight (cl-133). A
-		// member this pod has been told about on this stream is in the pod's hands.
-		stream := fmt.Sprintf("%s/%d", session.bootID, session.epoch)
-		if restated != stream {
+		send := func(member, url string, revision int64) *exit.Error {
+			file, access := expected[member], byMember[member]
+			frame := &pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourceFileRequest{
+				ModelSourceFileRequest: &pb.ModelSourceFileRequest{
+					RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
+					OperationId: req.ID, SourceSelectionDigest: selection, Member: member,
+					ObjectId: "sha256:" + file.SHA256, Length: uint64(file.Length), Header: file.Header,
+					Provider: access.Provider, Url: url, ExpiresAtUnix: access.ExpiresAtUnix,
+					CapabilityRevision: uint64(revision)}}}
+			if proto.Size(frame) > pb.MaxInlineControlBytes {
+				return exit.Named(exit.Validation, "model_transfer.source_header_too_large", "source header and capability for %s exceed the worker control bound", member)
+			}
+			if !session.send(frame) {
+				return exit.Unavailablef("source declaration control stream closed")
+			}
+			return nil
+		}
+		declare := func() *exit.Error {
 			for _, member := range members {
-				file := expected[member]
-				access := byMember[member]
-				frame := &pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourceFileRequest{
-					ModelSourceFileRequest: &pb.ModelSourceFileRequest{
-						RecordOwnerEpoch:   recordOwnerEpoch,
-						ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
-						OperationId: req.ID, SourceSelectionDigest: selection, Member: member,
-						ObjectId: "sha256:" + file.SHA256, Length: uint64(file.Length),
-						Provider: access.Provider, Url: access.URL, ExpiresAtUnix: access.ExpiresAtUnix,
-						CapabilityRevision: uint64(revisions[member] + 1), Header: file.Header}}}
-				if proto.Size(frame) > pb.MaxInlineControlBytes {
-					return nil, exit.Named(exit.Validation, "model_transfer.source_header_too_large",
-						"source header and capability for %s exceed the worker control bound", member)
+				revision := byStatus[member].CapabilityRevision + 1
+				if problem := send(member, "", revision); problem != nil {
+					return problem
 				}
-				session.send(frame)
+				declarations[member] = revision
 			}
-			restated = stream
-			c.logf("model transfer %s: stating all %d selected source file(s) to %s on "+
-				"control stream %d; a member this pod already holds is answered from its "+
-				"TensorFS store and moves nothing",
-				req.ID, len(members), session.instanceID, session.epoch)
+			return nil
 		}
-		// One call in flight. Its INCOMPLETE answer only opens the next call when
-		// more source members have verified, so progress cannot echo into a loop.
+		currentStream := fmt.Sprintf("%s/%d", session.bootID, session.epoch)
 		c.mu.Lock()
 		replies := c.sourcePrepareReplies[req.ID]
+		backoff := c.sourcePrepareBlocked[req.ID]
+		now := time.Now()
+		blocked := backoff.stream == currentStream && now.Before(backoff.until) && fulfilled == preparedCount
+		retryDue := backoff.stream == currentStream && !now.Before(backoff.until)
 		c.mu.Unlock()
-		if preparedStream != stream || replies != replyRevision {
-			preparing = false
-			replyRevision = replies
+		if currentStream != stream {
+			stream, phase = currentStream, "declaring"
+			c.ForgetPhase(req.ID)
+			preparedCount, preparing, replyRevision = -1, false, replies
+			if problem := declare(); problem != nil {
+				return nil, problem
+			}
+		} else if replies != replyRevision {
+			preparing, replyRevision = false, replies
+		}
+		allDeclared := len(byStatus) == len(expected)
+		for _, member := range members {
+			status := byStatus[member]
+			allDeclared = allDeclared && status.WorkerBootID == session.bootID && status.CapabilityRevision >= declarations[member]
 		}
 		checkpoints, recovery, problem := c.acknowledgedSourceCheckpoints(req.ID)
 		if problem != nil {
 			return nil, problem
 		}
-		if !preparing && (preparedStream != stream || preparedCount != verified || preparedRecovery != recovery) {
+		if phase == "declaring" && allDeclared {
+			phase = "probe"
+			if len(checkpoints) > 0 {
+				host, problem := c.sourceCheckpointHost(*request)
+				if problem != nil {
+					return nil, problem
+				}
+				if problem := c.opt.ModelTransfers.RestoreSourceCheckpoints(ctx, req.ID, host); problem != nil {
+					return nil, problem
+				}
+			}
+		}
+		// The restore probe lets TensorFS prove spent carriers. A metadata-only
+		// query then observes CONVERTED for those members before any source grant.
+		if phase == "probing" && !preparing && backoff.stream != currentStream {
+			if problem := declare(); problem != nil {
+				return nil, problem
+			}
+			phase, allDeclared = "sweeping", false
+		}
+		if phase == "sweeping" && allDeclared {
+			phase = "download"
+		}
+		if phase == "download" {
+			for _, member := range members {
+				status := byStatus[member]
+				if status.State == "verified" || status.State == "converted" {
+					continue
+				}
+				if problem := send(member, byMember[member].URL, status.CapabilityRevision+1); problem != nil {
+					return nil, problem
+				}
+			}
+			phase = "running"
+		}
+		if retryDue && !preparing {
+			preparedCount = -1
+			if phase == "probing" {
+				phase = "probe"
+			}
+		}
+		if !blocked && !preparing && (phase == "probe" || (phase == "running" && (preparedCount != fulfilled || preparedRecovery != recovery))) {
 			profiles := make([]*pb.ModelSourceProfile, 0, len(intent.SourceProfiles))
 			for slot, profile := range intent.SourceProfiles {
 				profiles = append(profiles, &pb.ModelSourceProfile{Slot: slot, Profile: profile})
 			}
 			sort.Slice(profiles, func(i, j int) bool { return profiles[i].Slot < profiles[j].Slot })
-			c.logf("model transfer %s: preparing %d profile(s) on %s with %d/%d source files verified",
-				req.ID, len(profiles), session.instanceID, verified, len(expected))
-			session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourcePrepareRequest{
-				ModelSourcePrepareRequest: &pb.ModelSourcePrepareRequest{
-					RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: session.epoch,
-					WorkerBootId: session.bootID, OperationId: req.ID,
+			c.logf("model transfer %s: preparing %d profile(s) on %s with %d/%d source members fulfilled", req.ID, len(profiles), session.instanceID, fulfilled, len(expected))
+			if !session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourcePrepareRequest{
+				ModelSourcePrepareRequest: &pb.ModelSourcePrepareRequest{RecordOwnerEpoch: recordOwnerEpoch,
+					ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID, OperationId: req.ID,
 					SourceSelectionDigest: selection, Profiles: profiles, Checkpoints: checkpoints,
-					SourceUri: intent.Source, DeclaredLicense: intent.SourceLicense}}})
-			preparing = true
-			preparedStream, preparedCount, preparedRecovery = stream, verified, recovery
+					SourceUri: intent.Source, DeclaredLicense: intent.SourceLicense}}}) {
+				return nil, exit.Unavailablef("source preparation control stream closed")
+			}
+			preparing, preparedCount, preparedRecovery = true, fulfilled, recovery
+			if phase == "probe" {
+				phase = "probing"
+			}
 		}
 		if wait := c.waitTransfer(ctx, req.ID); wait != nil {
 			return nil, wait
@@ -530,10 +579,12 @@ func (c *Orchestrator) CancelModelTransferFinalization(requestID, actor string) 
 		cancel()
 	}
 	c.signalTransfer(requestID)
+	c.kickSourceCheckpointUpload(requestID)
 	return nil
 }
 
 func (c *Orchestrator) finishModelTransferRequest(requestID string, attempt int64) {
+	c.kickSourceCheckpointUpload(requestID)
 	request, problem := c.opt.Store.RequestRow(requestID)
 	if problem != nil || request == nil || request.State == "canceled" {
 		return
@@ -557,6 +608,13 @@ func (c *Orchestrator) finishModelTransferRequest(requestID string, attempt int6
 }
 
 func (c *Orchestrator) ResumeModelTransfers() *exit.Error {
+	checkpointRequests, problem := c.opt.Store.SourceCheckpointRequests()
+	if problem != nil {
+		return problem
+	}
+	for _, requestID := range checkpointRequests {
+		c.kickSourceCheckpointUpload(requestID)
+	}
 	owed, problem := c.opt.Store.ModelTransfersOwed()
 	if problem != nil {
 		return problem

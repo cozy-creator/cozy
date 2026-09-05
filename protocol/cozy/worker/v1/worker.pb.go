@@ -1809,6 +1809,9 @@ const (
 	ModelSourceFileState_MODEL_SOURCE_FILE_STATE_DOWNLOADING ModelSourceFileState = 2
 	ModelSourceFileState_MODEL_SOURCE_FILE_STATE_VERIFIED    ModelSourceFileState = 3
 	ModelSourceFileState_MODEL_SOURCE_FILE_STATE_FAILED      ModelSourceFileState = 4
+	// All conversion consumers are complete/recoverable. The physical carrier may have
+	// been released, so this MUST NOT be used as LocalModelSourceFile.verified.
+	ModelSourceFileState_MODEL_SOURCE_FILE_STATE_CONVERTED ModelSourceFileState = 5
 )
 
 // Enum value maps for ModelSourceFileState.
@@ -1819,6 +1822,7 @@ var (
 		2: "MODEL_SOURCE_FILE_STATE_DOWNLOADING",
 		3: "MODEL_SOURCE_FILE_STATE_VERIFIED",
 		4: "MODEL_SOURCE_FILE_STATE_FAILED",
+		5: "MODEL_SOURCE_FILE_STATE_CONVERTED",
 	}
 	ModelSourceFileState_value = map[string]int32{
 		"MODEL_SOURCE_FILE_STATE_UNSPECIFIED": 0,
@@ -1826,6 +1830,7 @@ var (
 		"MODEL_SOURCE_FILE_STATE_DOWNLOADING": 2,
 		"MODEL_SOURCE_FILE_STATE_VERIFIED":    3,
 		"MODEL_SOURCE_FILE_STATE_FAILED":      4,
+		"MODEL_SOURCE_FILE_STATE_CONVERTED":   5,
 	}
 )
 
@@ -11211,9 +11216,12 @@ type ModelSourceFileRequest struct {
 	ObjectId              string                 `protobuf:"bytes,8,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"` // lowercase sha256:<64 hex>
 	Length                uint64                 `protobuf:"varint,9,opt,name=length,proto3" json:"length,omitempty"`
 	Provider              ModelSourceProvider    `protobuf:"varint,10,opt,name=provider,proto3,enum=cozy.worker.v1.ModelSourceProvider" json:"provider,omitempty"`
-	Url                   string                 `protobuf:"bytes,11,opt,name=url,proto3" json:"url,omitempty"`                                             // memory-only access; never echoed in status/snapshot/loopback
-	ExpiresAtUnix         uint64                 `protobuf:"varint,12,opt,name=expires_at_unix,json=expiresAtUnix,proto3" json:"expires_at_unix,omitempty"` // zero only for an immutable public URL
-	CapabilityRevision    uint64                 `protobuf:"varint,13,opt,name=capability_revision,json=capabilityRevision,proto3" json:"capability_revision,omitempty"`
+	// Empty declares header metadata only and returns ACCEPTED without downloading. The
+	// owner declares every roster header first, restores an acknowledged checkpoint, then
+	// grants nonempty URLs only for the physical carriers TensorFS still needs.
+	Url                string `protobuf:"bytes,11,opt,name=url,proto3" json:"url,omitempty"`                                             // memory-only access; never echoed in status/snapshot/loopback
+	ExpiresAtUnix      uint64 `protobuf:"varint,12,opt,name=expires_at_unix,json=expiresAtUnix,proto3" json:"expires_at_unix,omitempty"` // zero only for an immutable public URL
+	CapabilityRevision uint64 `protobuf:"varint,13,opt,name=capability_revision,json=capabilityRevision,proto3" json:"capability_revision,omitempty"`
 	// Exact safetensors 8-byte LE length + header JSON, or full JSON for an index carrier.
 	// One bounded header per file frame; never the model's entire header corpus in one frame.
 	// <= MaxModelSourceHeaderBytes AND the complete frame <= MaxInlineControlBytes.
@@ -16346,13 +16354,14 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x13ModelSourceProvider\x12%\n" +
 	"!MODEL_SOURCE_PROVIDER_UNSPECIFIED\x10\x00\x12&\n" +
 	"\"MODEL_SOURCE_PROVIDER_HUGGING_FACE\x10\x01\x12!\n" +
-	"\x1dMODEL_SOURCE_PROVIDER_CIVITAI\x10\x02*\xd8\x01\n" +
+	"\x1dMODEL_SOURCE_PROVIDER_CIVITAI\x10\x02*\xff\x01\n" +
 	"\x14ModelSourceFileState\x12'\n" +
 	"#MODEL_SOURCE_FILE_STATE_UNSPECIFIED\x10\x00\x12$\n" +
 	" MODEL_SOURCE_FILE_STATE_ACCEPTED\x10\x01\x12'\n" +
 	"#MODEL_SOURCE_FILE_STATE_DOWNLOADING\x10\x02\x12$\n" +
 	" MODEL_SOURCE_FILE_STATE_VERIFIED\x10\x03\x12\"\n" +
-	"\x1eMODEL_SOURCE_FILE_STATE_FAILED\x10\x04*\xf6\x01\n" +
+	"\x1eMODEL_SOURCE_FILE_STATE_FAILED\x10\x04\x12%\n" +
+	"!MODEL_SOURCE_FILE_STATE_CONVERTED\x10\x05*\xf6\x01\n" +
 	"\x19ModelSourcePrepareOutcome\x12,\n" +
 	"(MODEL_SOURCE_PREPARE_OUTCOME_UNSPECIFIED\x10\x00\x12)\n" +
 	"%MODEL_SOURCE_PREPARE_OUTCOME_PREPARED\x10\x01\x12)\n" +

@@ -3,8 +3,10 @@ package orchestrator
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -106,20 +108,21 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 	}
 	state := trimEnum(pb.ModelSourceFileState_name[int32(frame.State)], "MODEL_SOURCE_FILE_STATE_")
 	state = map[string]string{"ACCEPTED": "accepted", "DOWNLOADING": "downloading",
-		"VERIFIED": "verified", "FAILED": "failed"}[state]
+		"VERIFIED": "verified", "CONVERTED": "converted", "FAILED": "failed"}[state]
 	if state == "" {
 		return
 	}
 	previous := ""
+	var previousRevision int64
 	if statuses, problem := c.opt.Store.ModelTransferSourceStatuses(frame.OperationId); problem == nil {
 		for _, status := range statuses {
 			if status.Member == frame.Member {
-				previous = status.State
+				previous, previousRevision = status.State, status.CapabilityRevision
 			}
 		}
 	}
 	if problem := c.opt.Store.RecordModelTransferSourceStatus(records.ModelTransferSourceStatus{
-		RequestID: frame.OperationId, Member: frame.Member, ObjectID: frame.ObjectId,
+		RequestID: frame.OperationId, Member: frame.Member, ObjectID: frame.ObjectId, WorkerBootID: s.bootID,
 		Length: int64(frame.Length), CapabilityRevision: int64(frame.CapabilityRevision),
 		State: state, Transferred: int64(frame.TransferredBytes), SafeCode: frame.SafeCode,
 		SafeDetail: frame.SafeDetail}); problem != nil {
@@ -151,12 +154,19 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 	}
 	if statuses, problem := c.opt.Store.ModelTransferSourceStatuses(frame.OperationId); problem == nil {
 		var transferred, total int64
-		verified := 0
+		fulfilled := 0
 		for _, status := range statuses {
+			if status.State == "converted" && status.WorkerBootID == s.bootID {
+				total += status.Transferred
+			} else {
+				total += status.Length
+			}
+			if status.WorkerBootID != s.bootID {
+				continue
+			}
 			transferred += status.Transferred
-			total += status.Length
-			if status.State == "verified" {
-				verified++
+			if status.State == "verified" || status.State == "converted" {
+				fulfilled++
 			}
 		}
 		value := map[string]any{"stage": "source download", "member": frame.Member,
@@ -175,6 +185,7 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 			value["fraction"] = float64(transferred) / float64(total)
 		}
 		c.publishTransferProgress(frame.OperationId, value)
+		c.ObservePhase(frame.OperationId, PhaseSample{Name: PhaseDownloading, Detail: "source transfer", HasBytes: true, Moved: uint64(transferred), Total: uint64(total)})
 		// A member's state change is one line in the daemon log; byte progress is the
 		// live frame's alone. A queued transfer must be legible from the log (cl-099).
 		if state != previous {
@@ -182,8 +193,8 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 			if state == "failed" {
 				detail = " (" + frame.SafeCode + ": " + frame.SafeDetail + ")"
 			}
-			c.logf("model transfer %s: source %s %s on %s%s; %d of %d verified, %d/%d B",
-				frame.OperationId, frame.Member, state, s.instanceID, detail, verified,
+			c.logf("model transfer %s: source %s %s on %s%s; %d of %d fulfilled, %d/%d B",
+				frame.OperationId, frame.Member, state, s.instanceID, detail, fulfilled,
 				len(transfer.SourceFiles), transferred, total)
 		}
 	}
@@ -193,9 +204,15 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 	// counts reach the live view above, which is where they were already going; the
 	// preparer decides on a member's STATE. Session attach, session drop and cancellation
 	// each signal on their own, so nothing it waits on is left without a wake.
-	if state != previous {
+	if state != previous || int64(frame.CapabilityRevision) != previousRevision {
 		c.signalTransfer(frame.OperationId)
 	}
+}
+
+type sourcePreparationBackoff struct {
+	stream string
+	until  time.Time
+	delay  time.Duration
 }
 
 func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePrepared) {
@@ -221,6 +238,33 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 		c.mu.Unlock()
 		c.signalTransfer(frame.OperationId)
 	}()
+	if frame.Outcome == pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_REFUSED && frame.SafeCode == "model_source_preparer_unavailable" {
+		stream := fmt.Sprintf("%s/%d", s.bootID, s.epoch)
+		c.mu.Lock()
+		prior := c.sourcePrepareBlocked[frame.OperationId]
+		delay := time.Second
+		if prior.stream == stream {
+			delay = min(30*time.Second, max(time.Second, prior.delay*2))
+		}
+		retry := sourcePreparationBackoff{stream: stream, delay: delay, until: time.Now().Add(delay)}
+		c.sourcePrepareBlocked[frame.OperationId] = retry
+		c.mu.Unlock()
+		time.AfterFunc(delay, func() {
+			c.mu.Lock()
+			current := c.sourcePrepareBlocked[frame.OperationId]
+			wake := !c.closing && current.until == retry.until
+			c.mu.Unlock()
+			if wake {
+				c.signalTransfer(frame.OperationId)
+			}
+		})
+		c.ObservePhase(frame.OperationId, PhaseSample{Name: PhasePreparing, Detail: "model_source_preparer_unavailable; retrying"})
+		c.logf("model transfer %s: Runtime preparer unavailable; retrying in %s or on new source/worker progress", frame.OperationId, delay)
+		return
+	}
+	c.mu.Lock()
+	delete(c.sourcePrepareBlocked, frame.OperationId)
+	c.mu.Unlock()
 	checkpoints := make([]records.ModelSourceCheckpoint, 0, len(frame.Checkpoints))
 	for _, checkpoint := range frame.Checkpoints {
 		if checkpoint == nil || checkpoint.Head == nil || len(checkpoint.Head.Digest) != 32 ||
@@ -241,6 +285,12 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 			_ = c.opt.Store.FailModelTransfer(frame.OperationId, problem.ErrName(), problem.Message)
 			return
 		}
+		var converted uint64
+		for _, checkpoint := range checkpoints {
+			converted += uint64(checkpoint.Bytes)
+		}
+		c.ObservePhase(frame.OperationId, PhaseSample{Name: PhasePreparing, Detail: "source conversion", HasBytes: true, Moved: converted})
+		c.kickSourceCheckpointUpload(frame.OperationId)
 	}
 	c.logf("model transfer %s: source prepare %s on %s (%d source(s)) %s %s", frame.OperationId,
 		trimEnum(pb.ModelSourcePrepareOutcome_name[int32(frame.Outcome)], "MODEL_SOURCE_PREPARE_OUTCOME_"),
@@ -274,7 +324,7 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 			return
 		}
 	}
-	if problem := c.opt.Store.CompleteModelTransferMaterialization(frame.OperationId, rows); problem != nil {
+	if problem := c.opt.Store.CompleteModelTransferMaterialization(frame.OperationId, rows, s.bootID); problem != nil {
 		return
 	}
 }
