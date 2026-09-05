@@ -74,6 +74,8 @@ type fakePod struct {
 	serve bool
 	// jobReady advertises the independent job seat after accepting a JobDirective.
 	jobReady bool
+	// answerOffer supplies a protocol outcome when a test exercises settlement.
+	answerOffer func(*pb.AttemptOffer) (*pb.AttemptOutcome, error)
 	// slots is the advertised seat count while serving; zero means one.
 	slots uint32
 	// downloadSamples is how many DOWNLOADING events the prepare stream reports before
@@ -96,6 +98,7 @@ type fakePod struct {
 	preparedDig        []byte
 	reports            map[string]int // fault text -> reports that carried it
 	offers             []*pb.AttemptOffer
+	finalizations      []*pb.WeightsFinalizeRequest
 	// stagedJobBuild is what THIS pod wrote into the job plan records it staged during
 	// preparation — `build_id`, its own placement's environment identity, exactly as
 	// `package_prepare.py::_stage_job_plans` writes it. A JobDirective naming anything
@@ -312,6 +315,19 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 		case *pb.RecordOwnerFrame_AttemptOffer:
 			p.mu.Lock()
 			p.offers = append(p.offers, m.AttemptOffer)
+			p.mu.Unlock()
+			if p.answerOffer != nil {
+				outcome, err := p.answerOffer(m.AttemptOffer)
+				if err != nil {
+					return err
+				}
+				if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptOutcome{AttemptOutcome: outcome}}); err != nil {
+					return err
+				}
+			}
+		case *pb.RecordOwnerFrame_WeightsFinalizeRequest:
+			p.mu.Lock()
+			p.finalizations = append(p.finalizations, m.WeightsFinalizeRequest)
 			p.mu.Unlock()
 		case *pb.RecordOwnerFrame_LocalPackageFetchRequest:
 			// th-094's pod half, minimally: every named wheel is reported VERIFIED at its
