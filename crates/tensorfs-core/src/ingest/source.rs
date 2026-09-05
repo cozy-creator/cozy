@@ -1109,6 +1109,22 @@ fn prepare_model_source_with_registry(
     registry_locator: &str,
     registry_bytes: &[u8],
 ) -> Result<PreparedModelSources> {
+    prepare_model_source_with_budget(
+        store,
+        request,
+        registry_locator,
+        registry_bytes,
+        &mut transaction::Budget::new(durability::INTERVAL_BYTES),
+    )
+}
+
+fn prepare_model_source_with_budget(
+    store: &Store,
+    request: &PrepareModelSource,
+    registry_locator: &str,
+    registry_bytes: &[u8],
+    budget: &mut transaction::Budget,
+) -> Result<PreparedModelSources> {
     let registry = FingerprintRegistry::parse(registry_bytes)?;
     let (ready, fences) = validate_request(request, &registry)?;
     let digest = request_digest(request, registry_bytes);
@@ -1209,11 +1225,51 @@ fn prepare_model_source_with_registry(
             for source in &sources {
                 validate_prepared_result(store, source)?;
             }
+            // The final response can be lost after its catalog commit. Its existing local
+            // cursors must remain discoverable without converting or reading source bodies.
+            let mut checkpoints = Vec::new();
+            let dir = transaction::candidate_dir(store.root(), &request.operation_id);
+            for (requested, (plan_hex, _)) in request.profiles.iter().zip(&plans) {
+                let plan_digest = format!("sha256:{plan_hex}");
+                let chain = format!("{}/{}", request.operation_id, requested.slot);
+                let journal = super::journal::Journal::open(&dir, plan_hex)?;
+                let local = journal.local_head()?.ok_or_else(|| Refusal {
+                    code: Code::DURABILITY_UNPROVEN,
+                    detail: "completed source has no local checkpoint cursor".into(),
+                })?;
+                let supplied = request
+                    .checkpoints
+                    .iter()
+                    .find(|(slot, _)| slot == &requested.slot)
+                    .map(|(_, head)| head);
+                let head = durability::checkpoint_predecessor(
+                    store,
+                    &durability::Policy {
+                        chain: &chain,
+                        operation: &request.operation_id,
+                        plan: &plan_digest,
+                        interval: durability::INTERVAL_BYTES,
+                    },
+                    Some(&local),
+                    supplied,
+                )?
+                .expect("a local cursor was supplied");
+                let held = durability::local_chain(store, &head, &plan_digest)?;
+                checkpoints.push(SourceCheckpoint {
+                    slot: requested.slot.clone(),
+                    plan_digest,
+                    head: durability::Head {
+                        head: Some(head),
+                        links: held.links,
+                        bytes: held.bytes,
+                    },
+                });
+            }
             return Ok(PreparedModelSources {
                 replayed: true,
                 complete: true,
                 sources,
-                checkpoints: Vec::new(),
+                checkpoints,
                 spent: request
                     .roster
                     .iter()
@@ -1242,7 +1298,6 @@ fn prepare_model_source_with_registry(
         largest_op_bytes: 0,
     };
     let mut needed = std::collections::BTreeSet::new();
-    let mut budget = transaction::Budget::new(durability::INTERVAL_BYTES);
     for (requested, (plan_hex, prepared)) in request.profiles.iter().zip(plans) {
         let plan_digest = format!("sha256:{plan_hex}");
         let chain = format!("{}/{}", request.operation_id, requested.slot);
@@ -1297,7 +1352,7 @@ fn prepare_model_source_with_registry(
             transaction::Carriers::Ready(&ready),
             None,
             &mut journal,
-            Some(&mut budget),
+            Some(budget),
         )?;
         let checkpoint = durability::checkpoint(
             store,
@@ -1557,6 +1612,58 @@ mod tests {
     }
 
     #[test]
+    fn one_pass_budget_is_shared_by_profiles_and_allows_one_oversized_op() {
+        for limit in [1024, 4096] {
+            let root = temporary("bounded-profiles");
+            let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+            let first = prepare_model_source_with_budget(
+                &store,
+                &request,
+                "fixture:registry",
+                &registry,
+                &mut transaction::Budget::new(limit),
+            )
+            .unwrap();
+            assert!(!first.complete);
+            assert_eq!(first.converted_roles, 1);
+            assert_eq!(first.converted_bytes, 4096);
+            assert_eq!(first.largest_op_bytes, 4096);
+            assert_eq!(first.deferred_ops, 1, "one budget covers both profiles");
+            let mut stalled = request.clone();
+            stalled.landed.clear();
+            let no_work = prepare_model_source_with_budget(
+                &store,
+                &stalled,
+                "fixture:registry",
+                &registry,
+                &mut transaction::Budget::new(limit),
+            )
+            .unwrap();
+            assert_eq!(no_work.converted_bytes, 0);
+            assert_eq!(no_work.largest_op_bytes, 0);
+            assert_eq!(no_work.checkpoints, first.checkpoints);
+            let second = prepare_model_source_with_budget(
+                &store,
+                &request,
+                "fixture:registry",
+                &registry,
+                &mut transaction::Budget::new(limit),
+            )
+            .unwrap();
+            assert!(second.complete);
+            assert_eq!(second.converted_roles, 1);
+            assert_eq!(second.resumed_roles, 1);
+            assert_eq!(second.converted_bytes, 4096);
+            let clean = Store::init(&root.join("clean")).unwrap();
+            let expected =
+                prepare_model_source_with_registry(&clean, &request, "fixture:registry", &registry)
+                    .unwrap();
+            assert_eq!(second.sources, expected.sources);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn full_byte_multi_profile_transaction_replays_conflicts_rebuilds_and_releases_holds() {
         let root = temporary("transaction");
         let (store, registry, request) = fixture(&root, false);
@@ -1593,6 +1700,20 @@ mod tests {
                 .unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.sources, first.sources);
+        assert_eq!(replay.checkpoints, first.checkpoints);
+        let mut bodies_gone = request.clone();
+        bodies_gone.landed.clear();
+        for row in &bodies_gone.roster {
+            fs::remove_file(&row.path).unwrap();
+        }
+        let recovered_heads =
+            prepare_model_source_with_registry(&store, &bodies_gone, "fixture:registry", &registry)
+                .unwrap();
+        assert_eq!(recovered_heads.checkpoints, first.checkpoints);
+        assert_eq!(recovered_heads.converted_bytes, 0);
+        // Remaining arms need their original carriers again.
+        carrier(&request.roster[0].path, "weight", [1, 2, 3, 4]);
+        carrier(&request.roster[1].path, "weight", [5, 6, 7, 8]);
 
         let mut changed = request.clone();
         changed.roster[0].object_id = format!("sha256:{}", "33".repeat(32));
@@ -2249,6 +2370,11 @@ mod tests {
         )
         .unwrap();
         assert!(replay.replayed && replay.complete);
+        assert_eq!(
+            replay.checkpoints, resumed.checkpoints,
+            "a lost final response is replayed even with an old ACK"
+        );
+        assert_eq!(replay.converted_bytes, 0);
         let mut unrelated = registry.clone();
         unrelated.entries[0]
             .provenance

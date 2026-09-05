@@ -846,7 +846,7 @@ impl PyStore {
     /// One bounded link window, usable as soon as that link alone is resident.
     #[pyo3(signature = (head_id, head_length, *, operation_id, slot, plan_digest, offset=0, limit=128))]
     #[allow(clippy::too_many_arguments)]
-    fn source_checkpoint_page<'p>(
+    fn checkpoint_page<'p>(
         &self,
         py: Python<'p>,
         head_id: &str,
@@ -911,7 +911,7 @@ impl PyStore {
     /// length is checked before a socket opens, and the grant never leaves process memory.
     #[pyo3(signature = (object_id, length, manifest, grant, *, allow_local=false))]
     #[allow(clippy::too_many_arguments)]
-    fn source_checkpoint_push<'p>(
+    fn checkpoint_push<'p>(
         &self,
         py: Python<'p>,
         object_id: &str,
@@ -972,7 +972,7 @@ impl PyStore {
     /// Fetch one exact recovery object through ordinary digest/length admission.
     #[pyo3(signature = (object_id, length, manifest, url, *, allow_local=false))]
     #[allow(clippy::too_many_arguments)]
-    fn source_checkpoint_fetch<'p>(
+    fn checkpoint_fetch<'p>(
         &self,
         py: Python<'p>,
         object_id: &str,
@@ -1438,6 +1438,55 @@ impl PyStore {
         }
         out.set_item("configs", config_rows)?;
         Ok(out)
+    }
+
+    /// Canonical TensorFS declaration bytes for the current producer intent.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (sources, targets, configs, order, max_new_bytes, *, work_fingerprint))]
+    fn derived_declaration<'p>(
+        &self,
+        py: Python<'p>,
+        sources: &Bound<'_, PyDict>,
+        targets: &Bound<'_, PyDict>,
+        configs: &Bound<'_, PyDict>,
+        order: Vec<(String, String)>,
+        max_new_bytes: u64,
+        work_fingerprint: &str,
+    ) -> PyResult<Bound<'p, PyBytes>> {
+        let mut declaration =
+            parse_declaration(py, sources, targets, configs, order, max_new_bytes)?;
+        declaration.work_fingerprint = Some(work_fingerprint.to_string());
+        let bytes = declaration.canonical_work_bytes().or_refuse(py)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (transaction_id, declaration, head_id, head_length, *, operation_id, slot, plan_digest))]
+    fn validate_derived_checkpoint(
+        &self,
+        py: Python<'_>,
+        transaction_id: &str,
+        declaration: &[u8],
+        head_id: &str,
+        head_length: u64,
+        operation_id: &str,
+        slot: &str,
+        plan_digest: &str,
+    ) -> PyResult<()> {
+        let head = obj_ref(py, head_id, head_length)?;
+        py.detach(|| {
+            derived::validate_checkpoint(
+                &self.store,
+                &self.meta,
+                transaction_id,
+                declaration,
+                &head,
+                operation_id,
+                slot,
+                plan_digest,
+            )
+        })
+        .or_refuse(py)
     }
 
     /// Open one exact tfs-019 transaction. Python supplies typed plain values; canonical

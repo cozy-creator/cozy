@@ -145,6 +145,26 @@ pub struct Declaration {
 }
 
 impl Declaration {
+    /// One native encoder for the intent, writer and recovery validator.
+    pub fn canonical_work_bytes(&mut self) -> Result<Vec<u8>> {
+        self.normalize_and_validate()?;
+        if self.work_fingerprint.is_none() {
+            return refuse(
+                Code::MISSING_FIELD,
+                "derived work requires an explicit producer fingerprint",
+            );
+        }
+        self.require_order()?;
+        let bytes = crate::canon::write(&self.to_value());
+        if bytes.len() > limits::DOC_MAX_BYTES / 2 {
+            return refuse(
+                Code::SIZE_CAP,
+                "derived declaration is over its metadata budget",
+            );
+        }
+        Ok(bytes)
+    }
+
     fn require_order(&self) -> Result<()> {
         if self.order.is_empty() {
             return refuse(
@@ -864,7 +884,6 @@ pub(crate) struct TransactionRow {
     pub(crate) current_session: Option<u64>,
     pub(crate) added_parts: Vec<AddedPart>,
     pub(crate) added_configs: Vec<AddedConfig>,
-    pub(crate) recovery_objects: Vec<ObjectRef>,
     pub(crate) source_facts: Vec<SourceFact>,
     pub(crate) inherited_payload_objects: u64,
     pub(crate) inherited_payload_bytes: u64,
@@ -923,9 +942,6 @@ impl TransactionRow {
         self.added_parts
             .sort_by(|a, b| (&a.component, &a.key, &a.role).cmp(&(&b.component, &b.key, &b.role)));
         self.added_configs.sort_by(|a, b| a.name.cmp(&b.name));
-        self.recovery_objects
-            .sort_by(|a, b| a.sha256.cmp(&b.sha256));
-        self.recovery_objects.dedup();
         self.source_facts.sort_by(|a, b| a.alias.cmp(&b.alias));
     }
 
@@ -943,16 +959,6 @@ impl TransactionRow {
             .map(|v| as_str("DerivedTransaction", "declaration", v).map(str::to_string))
             .transpose()?;
 
-        let recovery_objects = f
-            .opt("recovery_objects")
-            .map(|value| {
-                as_arr("DerivedTransaction", "recovery_objects", value)?
-                    .iter()
-                    .map(|value| ObjectRef::from_value("recovery object", value))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .transpose()?
-            .unwrap_or_default();
         let mut added_parts = Vec::new();
         for value in as_arr("DerivedTransaction", "added_parts", f.req("added_parts")?)? {
             let mut af = Fields::new("DerivedTransaction.added_part", value)?;
@@ -1129,7 +1135,6 @@ impl TransactionRow {
             current_session,
             added_parts,
             added_configs,
-            recovery_objects,
             source_facts,
             inherited_payload_objects,
             inherited_payload_bytes,
@@ -1138,12 +1143,10 @@ impl TransactionRow {
         };
         let before_parts = row.added_parts.clone();
         let before_configs = row.added_configs.clone();
-        let before_recovery = row.recovery_objects.clone();
         let before_sources = row.source_facts.clone();
         row.normalize();
         if row.added_parts != before_parts
             || row.added_configs != before_configs
-            || row.recovery_objects != before_recovery
             || row.source_facts != before_sources
         {
             return refuse(
@@ -1290,17 +1293,6 @@ impl TransactionRow {
             ),
             ("state".to_string(), Value::str(self.state.name())),
         ];
-        if !self.recovery_objects.is_empty() {
-            fields.push((
-                "recovery_objects".into(),
-                Value::arr(
-                    self.recovery_objects
-                        .iter()
-                        .map(ObjectRef::to_value)
-                        .collect(),
-                ),
-            ));
-        }
         if let Some(session) = self.current_session {
             fields.push(("current_session".to_string(), Value::uint(session)));
         }
@@ -1907,21 +1899,8 @@ pub fn begin(
             "WriterSessionId must be positive and inside the canonical integer range",
         );
     }
-    declaration.normalize_and_validate()?;
-    if declaration.work_fingerprint.is_none() {
-        return refuse(
-            Code::MISSING_FIELD,
-            "derived work requires an explicit producer fingerprint",
-        );
-    }
-    declaration.require_order()?;
-    let declaration_text = declaration.canonical_text();
-    if declaration_text.len() > limits::DOC_MAX_BYTES / 2 {
-        return refuse(
-            Code::SIZE_CAP,
-            "derived declaration is over its metadata budget",
-        );
-    }
+    let declaration_text =
+        String::from_utf8(declaration.canonical_work_bytes()?).expect("canonical JSON is UTF-8");
 
     // The writer hold is registered before source metadata is touched. It is the live
     // process proof that keeps exclusive GC out even for a source-free create.
@@ -1981,8 +1960,14 @@ pub fn begin(
             return Err(error);
         }
     };
-    let mut txn = meta.txn()?;
-    let result = match txn.rows.iter_mut().find(|row| row.id == transaction) {
+    // Byte verification can update the verification catalog. Keep it outside the SQL
+    // writer transaction, then compare the observed row before assigning this epoch.
+    let initial = meta
+        .derived_rows()?
+        .into_iter()
+        .find(|row| row.id == transaction);
+    let mut rows: Vec<_> = initial.clone().into_iter().collect();
+    let result = match rows.iter_mut().find(|row| row.id == transaction) {
         Some(row) => match row.state {
             TransactionState::Committed(_) => refuse(
                 Code::TRANSACTION_CLOSED,
@@ -2021,7 +2006,7 @@ pub fn begin(
             }
         },
         None => {
-            txn.rows.push(TransactionRow {
+            rows.push(TransactionRow {
                 id: transaction.clone(),
                 declaration: Some(declaration_text),
                 state: TransactionState::Open,
@@ -2029,7 +2014,6 @@ pub fn begin(
                 current_session: Some(writer_session),
                 added_parts: Vec::new(),
                 added_configs: Vec::new(),
-                recovery_objects: Vec::new(),
                 source_facts: source_facts.clone(),
                 inherited_payload_objects: 0,
                 inherited_payload_bytes: 0,
@@ -2040,18 +2024,41 @@ pub fn begin(
         }
     };
     if let Err(error) = result {
-        drop(txn);
         release_guards(meta, Some(writer_hold), source_leases);
         return Err(error);
     }
-    let row = open_row(&mut txn.rows, &transaction, writer_session)?;
-    let merged = merge_progress(store, row, incoming.as_ref());
+    let row = open_row(&mut rows, &transaction, writer_session)?;
+    let merged = merge_progress(store, row, incoming.as_ref()).and_then(|()| {
+        build_header(
+            &declaration,
+            &sources,
+            &row.added_parts,
+            &row.added_configs,
+            true,
+        )?;
+        Ok(())
+    });
     if let Err(error) = merged {
-        drop(txn);
         release_guards(meta, Some(writer_hold), source_leases);
         return Err(error);
     }
-    if let Err(error) = txn.commit() {
+    let committed = (|| {
+        let mut txn = meta.txn()?;
+        let current = txn.rows.iter_mut().find(|row| row.id == transaction);
+        if current.as_deref() != initial.as_ref() {
+            return refuse(
+                Code::TRANSACTION_CONFLICT,
+                "derived work changed while beginning; retry with current writer epoch",
+            );
+        }
+        retain_progress(store, row, checkpoint)?;
+        match current {
+            Some(current) => *current = row.clone(),
+            None => txn.rows.push(row.clone()),
+        }
+        txn.commit()
+    })();
+    if let Err(error) = committed {
         release_guards(meta, Some(writer_hold), source_leases);
         return Err(error);
     }
@@ -2066,7 +2073,6 @@ fn progress_row(row: &TransactionRow) -> TransactionRow {
     let mut progress = row.clone();
     progress.highest_session = 0;
     progress.current_session = None;
-    progress.recovery_objects.clear();
     progress
 }
 
@@ -2146,8 +2152,6 @@ fn merge_progress(
                 None => row.added_configs.push(added.clone()),
             }
         }
-        row.recovery_objects
-            .extend(incoming.recovery_objects.iter().cloned());
     }
     row.normalize();
     Ok(())
@@ -2177,7 +2181,7 @@ fn read_progress(
             "derived progress differs from its ObjectRef",
         );
     }
-    let mut row = TransactionRow::from_value(&crate::canon::parse_canonical(
+    let row = TransactionRow::from_value(&crate::canon::parse_canonical(
         &bytes,
         limits::DOC_MAX_BYTES,
     )?)?;
@@ -2199,10 +2203,65 @@ fn read_progress(
             "derived checkpoint plan differs from its current work",
         );
     }
-    row.recovery_objects = crate::durability::local_documents(store, head)?;
     Ok(row)
 }
 
+/// Verify a restored checkpoint against the current native declaration without creating,
+/// importing or fencing writer authority. Payload admission must already have completed.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_checkpoint(
+    store: &Store,
+    meta: &Meta,
+    transaction: &str,
+    declaration_bytes: &[u8],
+    head: &ObjectRef,
+    operation: &str,
+    slot: &str,
+    plan: &str,
+) -> Result<()> {
+    let transaction = transaction_id(transaction)?;
+    let mut declaration = Declaration::from_value(&crate::canon::parse_canonical(
+        declaration_bytes,
+        limits::DOC_MAX_BYTES / 2,
+    )?)?;
+    let canonical = declaration.canonical_work_bytes()?;
+    if canonical != declaration_bytes {
+        return refuse(
+            Code::NONCANONICAL_ENCODING,
+            "derived declaration differs from its canonical bytes",
+        );
+    }
+    let link = crate::durability::local_link(store, head)?;
+    if link.operation != format!("{operation}/{slot}") || link.plan != plan {
+        return refuse(
+            Code::CROSS_SUBJECT_REPLAY,
+            "derived checkpoint differs from current operation, slot or plan",
+        );
+    }
+    let sources = resolve_sources(store, meta, &declaration)?;
+    let facts = sources
+        .iter()
+        .map(|source| source.fact.clone())
+        .collect::<Vec<_>>();
+    let text = std::str::from_utf8(&canonical).expect("canonical JSON is UTF-8");
+    let row = read_progress(store, head, &transaction, text, &facts)?;
+    validate_additions(&row)?;
+    build_header(
+        &declaration,
+        &sources,
+        &row.added_parts,
+        &row.added_configs,
+        true,
+    )?;
+    let chain = crate::durability::local_chain(store, head, plan)?;
+    for object in chain.blobs.iter().chain(added_objects(&row).iter()) {
+        require_payload_record(store, object, "restored derived checkpoint")?;
+    }
+    Ok(())
+}
+
+// Closed facade result: part keys and config names, with no mutable journal access.
+#[allow(clippy::type_complexity)]
 pub fn completed(
     meta: &Meta,
     transaction: &str,
@@ -2228,59 +2287,96 @@ pub fn checkpoint_progress(
     slot: &str,
     previous: Option<&ObjectRef>,
 ) -> Result<(String, crate::durability::Head)> {
-    let row = {
+    let progress = {
         let mut txn = meta.txn()?;
         progress_row(open_row(&mut txn.rows, transaction, writer_session)?)
     };
-    let plan = progress_plan(&row);
-    let bytes = crate::canon::write(&row.to_value());
+    let plan = progress_plan(&progress);
+    let bytes = crate::canon::write(&progress.to_value());
     let chain = format!("{operation}/{slot}");
     ascii_name("checkpoint operation", &chain, limits::MAX_NAME_BYTES)?;
+    let policy = crate::durability::Policy {
+        chain: &chain,
+        operation: transaction,
+        plan: &plan,
+        interval: crate::durability::INTERVAL_BYTES,
+    };
+    let root = roots::read(store, transaction)?;
+    let previous = crate::durability::checkpoint_predecessor(
+        store,
+        &policy,
+        root.as_ref().and_then(|root| root.checkpoint.as_ref()),
+        previous,
+    )?;
     let exported = crate::durability::checkpoint_bytes(
         store,
-        &crate::durability::Policy {
-            chain: &chain,
-            operation: transaction,
-            plan: &plan,
-            interval: crate::durability::INTERVAL_BYTES,
-        },
-        previous,
+        &policy,
+        previous.as_ref(),
         &bytes,
-        added_objects(&row),
+        added_objects(&progress),
         None,
     )?;
     let mut txn = meta.txn()?;
-    let current = open_row(&mut txn.rows, transaction, writer_session)?;
-    current.recovery_objects.extend(exported.roots);
-    current.normalize();
-    txn.commit()?;
+    let row = open_row(&mut txn.rows, transaction, writer_session)?;
+    retain_progress(store, row, exported.head.head.as_ref())?;
     Ok((plan, exported.head))
 }
 
-/// Persistent accepted work remains a GC root after its writer process disappears.
-pub(crate) fn gc_holds(store: &Store) -> Result<(Vec<crate::storage::HeldKey>, Vec<String>)> {
-    let mut roots = Vec::new();
-    let mut transactions = Vec::new();
-    for row in Meta::open(store)?.derived_rows()? {
-        let mut blobs = Vec::new();
-        let mut manifests = Vec::new();
-        match row.state {
-            TransactionState::Open => {
-                blobs.extend(added_objects(&row));
-                blobs.extend(row.recovery_objects);
-                manifests.extend(
-                    row.source_facts
-                        .iter()
-                        .map(|source| source.manifest.clone()),
-                );
-            }
-            TransactionState::Committed(Disposition::Pending) => {
-                blobs.extend(row.recovery_objects);
-                manifests.extend(row.manifest);
-            }
-            _ => continue,
+/// Private filesystem roots are the only GC liveness authority for accepted work.
+fn retain_progress(
+    store: &Store,
+    row: &TransactionRow,
+    checkpoint: Option<&ObjectRef>,
+) -> Result<()> {
+    let previous = roots::read(store, &row.id)?;
+    let local = previous.as_ref().and_then(|root| root.checkpoint.as_ref());
+    let head = if let Some(supplied) = checkpoint {
+        let link = crate::durability::local_link(store, supplied)?;
+        let plan = progress_plan(row);
+        crate::durability::checkpoint_predecessor(
+            store,
+            &crate::durability::Policy {
+                chain: &link.operation,
+                operation: &row.id,
+                plan: &plan,
+                interval: crate::durability::INTERVAL_BYTES,
+            },
+            local,
+            Some(supplied),
+        )?
+    } else {
+        local.cloned()
+    };
+    roots::write(
+        store,
+        &roots::Root {
+            transaction: row.id.clone(),
+            manifest: None,
+            name: None,
+            blobs: added_objects(row),
+            sources: row
+                .source_facts
+                .iter()
+                .map(|source| source.manifest.clone())
+                .collect(),
+            checkpoint: head,
+        },
+    )
+}
+
+pub(crate) fn retained_objects(store: &Store) -> Result<Vec<crate::storage::HeldKey>> {
+    let mut holds = Vec::new();
+    for root in roots::all(store)? {
+        let mut blobs = root.blobs;
+        let mut manifests = root.sources;
+        manifests.extend(root.manifest);
+        if let Some(head) = root.checkpoint {
+            let link = crate::durability::local_link(store, &head)?;
+            let chain = crate::durability::local_chain(store, &head, &link.plan)?;
+            blobs.extend(chain.blobs);
+            blobs.extend(crate::durability::local_documents(store, &head)?);
+            manifests.extend(chain.manifests);
         }
-        transactions.push(row.id);
         for (kind, objects) in [("blob", blobs), ("manifest", manifests)] {
             for object in objects {
                 let key = if kind == "blob" {
@@ -2288,7 +2384,7 @@ pub(crate) fn gc_holds(store: &Store) -> Result<(Vec<crate::storage::HeldKey>, V
                 } else {
                     crate::storage::manifest_key(&object.sha256)?
                 };
-                roots.push(crate::storage::HeldKey {
+                holds.push(crate::storage::HeldKey {
                     key,
                     kind: kind.into(),
                     length: object.length,
@@ -2297,7 +2393,7 @@ pub(crate) fn gc_holds(store: &Store) -> Result<(Vec<crate::storage::HeldKey>, V
             }
         }
     }
-    Ok((roots, transactions))
+    Ok(holds)
 }
 
 fn open_row<'a>(
@@ -2435,6 +2531,7 @@ pub fn add_part<R: Read>(
         part: written.part.clone(),
     });
     row.normalize();
+    retain_progress(store, row, None)?;
     txn.commit()?;
     Ok(written)
 }
@@ -2727,7 +2824,6 @@ pub fn abandon(store: &Store, meta: &Meta, transaction: &str) -> Result<Option<R
                 current_session: None,
                 added_parts: Vec::new(),
                 added_configs: Vec::new(),
-                recovery_objects: Vec::new(),
                 source_facts: Vec::new(),
                 inherited_payload_objects: 0,
                 inherited_payload_bytes: 0,
@@ -2752,7 +2848,6 @@ pub fn abandon(store: &Store, meta: &Meta, transaction: &str) -> Result<Option<R
                 row.state = TransactionState::Abandoned;
                 row.added_parts.clear();
                 row.added_configs.clear();
-                row.recovery_objects.clear();
                 None
             }
         },
@@ -2865,15 +2960,6 @@ pub fn adopt(
     })
 }
 
-/// Committed output is retained while awaiting the owner and after private adoption.
-/// Once disposed, ordinary repository roots alone decide whether its bytes remain live.
-pub(crate) fn retained_manifests(store: &Store) -> Result<Vec<ObjectRef>> {
-    Ok(roots::all(store)?
-        .into_iter()
-        .map(|root| root.manifest)
-        .collect())
-}
-
 fn effective_disposition(
     store: &Store,
     row: &TransactionRow,
@@ -2884,7 +2970,7 @@ fn effective_disposition(
     }
     match roots::read(store, &row.id)? {
         Some(root) => {
-            if row.manifest.as_ref() != Some(&root.manifest) {
+            if row.manifest != root.manifest {
                 return refuse(
                     Code::DISPOSITION_CONFLICT,
                     "private root differs from its committed receipt",
@@ -2939,7 +3025,6 @@ pub fn dispose(store: &Store, meta: &Meta, transaction: &str) -> Result<Disposit
     }
 
     txn.rows[index].state = TransactionState::Committed(desired.clone());
-    txn.rows[index].recovery_objects.clear();
     let row = txn.rows[index].clone();
     txn.commit()?;
     roots::remove(store, &transaction)?;
@@ -2955,7 +3040,7 @@ mod tests {
     use crate::header::{Closure, Part, Tensor};
     use crate::ids::Doc;
 
-    fn created_declaration() -> Declaration {
+    pub(super) fn created_declaration() -> Declaration {
         let encoding = registry::seeds()
             .into_iter()
             .find(|seed| seed.alias == "plain/1")
@@ -2963,6 +3048,7 @@ mod tests {
             .spec
             .object_id();
         Declaration {
+            work_fingerprint: Some(format!("sha256:{}", "44".repeat(32))),
             sources: Vec::new(),
             components: vec![ComponentDeclaration {
                 target: "model".into(),
@@ -2996,7 +3082,7 @@ mod tests {
         let store = Store::init(&root).unwrap();
         let meta = Meta::open(&store).unwrap();
         let id = format!("sha256:{}", "55".repeat(32));
-        let writer = begin(&store, &meta, &id, 1, created_declaration()).unwrap();
+        let writer = begin(&store, &meta, &id, 1, created_declaration(), None).unwrap();
         let bytes = vec![0x11; 2048];
         let written = add_part(
             &store,
@@ -3130,7 +3216,7 @@ mod tests {
             Lookup::Abandoned
         ));
         assert_eq!(
-            begin(&store, &reopened, &id, 1, created_declaration())
+            begin(&store, &reopened, &id, 1, created_declaration(), None)
                 .err()
                 .unwrap()
                 .code,
@@ -3297,3 +3383,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 }
+
+#[cfg(test)]
+mod resume_tests;

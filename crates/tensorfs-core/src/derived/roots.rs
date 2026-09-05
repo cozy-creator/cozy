@@ -13,16 +13,40 @@ use crate::store::Store;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Root {
     pub transaction: String,
-    pub manifest: ObjectRef,
+    pub manifest: Option<ObjectRef>,
+    pub blobs: Vec<ObjectRef>,
+    pub sources: Vec<ObjectRef>,
+    pub checkpoint: Option<ObjectRef>,
     pub name: Option<String>,
 }
 
 impl Plain for Root {
-    const MAX_BYTES: usize = 16 * 1024;
+    const MAX_BYTES: usize = crate::limits::DOC_MAX_BYTES;
     fn from_value(value: &Value) -> Result<Self> {
         let mut fields = Fields::new("PrivateDerivedRoot", value)?;
         let transaction = super::transaction_id(fields.req_str("transaction_id")?)?;
-        let manifest = ObjectRef::from_value("private root manifest", fields.req("manifest")?)?;
+        let manifest = fields
+            .opt("manifest")
+            .map(|value| ObjectRef::from_value("private root manifest", value))
+            .transpose()?;
+        let checkpoint = fields
+            .opt("checkpoint")
+            .map(|value| ObjectRef::from_value("private root checkpoint", value))
+            .transpose()?;
+        let mut refs = |key| -> Result<Vec<ObjectRef>> {
+            fields
+                .opt(key)
+                .map(|value| {
+                    crate::canon::as_arr("PrivateDerivedRoot", key, value)?
+                        .iter()
+                        .map(|value| ObjectRef::from_value(key, value))
+                        .collect()
+                })
+                .transpose()
+                .map(Option::unwrap_or_default)
+        };
+        let blobs = refs("blobs")?;
+        let sources = refs("sources")?;
         let name = fields
             .opt("scratch_root_id")
             .map(|value| {
@@ -35,14 +59,28 @@ impl Plain for Root {
         Ok(Self {
             transaction,
             manifest,
+            blobs,
+            sources,
+            checkpoint,
             name,
         })
     }
     fn to_value(&self) -> Value {
-        let mut fields = vec![
-            ("transaction_id", Value::str(self.transaction.clone())),
-            ("manifest", self.manifest.to_value()),
-        ];
+        let mut fields = vec![("transaction_id", Value::str(self.transaction.clone()))];
+        if let Some(manifest) = &self.manifest {
+            fields.push(("manifest", manifest.to_value()));
+        }
+        if let Some(checkpoint) = &self.checkpoint {
+            fields.push(("checkpoint", checkpoint.to_value()));
+        }
+        for (name, objects) in [("blobs", &self.blobs), ("sources", &self.sources)] {
+            if !objects.is_empty() {
+                fields.push((
+                    name,
+                    Value::arr(objects.iter().map(ObjectRef::to_value).collect()),
+                ));
+            }
+        }
         if let Some(name) = &self.name {
             fields.push(("scratch_root_id", Value::str(name.clone())));
         }
@@ -111,6 +149,10 @@ pub(super) fn all(store: &Store) -> Result<Vec<Root>> {
 }
 
 pub(super) fn write(store: &Store, root: &Root) -> Result<()> {
+    let bytes = root.canonical_bytes();
+    if bytes.len() > Root::MAX_BYTES {
+        return refuse(Code::COUNT_CAP, "private derived root exceeds its byte cap");
+    }
     let path = path(store, &root.transaction)?;
     fs::create_dir_all(directory(store)).map_err(io)?;
     let temporary = path.with_extension(format!("tmp-{}", crate::meta::now_nanos_unique()));
@@ -119,7 +161,7 @@ pub(super) fn write(store: &Store, root: &Root) -> Result<()> {
         .create_new(true)
         .open(&temporary)
         .map_err(io)?;
-    file.write_all(&root.canonical_bytes())
+    file.write_all(&bytes)
         .and_then(|()| file.sync_all())
         .map_err(io)?;
     fs::rename(&temporary, &path).map_err(io)?;
@@ -146,8 +188,11 @@ pub(super) fn pending(store: &Store, transaction: &str, manifest: &ObjectRef) ->
         store,
         &Root {
             transaction: transaction.into(),
-            manifest: manifest.clone(),
+            manifest: Some(manifest.clone()),
             name: None,
+            blobs: Vec::new(),
+            sources: Vec::new(),
+            checkpoint: read(store, transaction)?.and_then(|root| root.checkpoint),
         },
     )
 }
@@ -159,7 +204,9 @@ pub(super) fn adopt(
     name: &str,
 ) -> Result<()> {
     if let Some(root) = read(store, transaction)? {
-        if root.manifest != *manifest || root.name.as_ref().is_some_and(|old| old != name) {
+        if root.manifest.as_ref() != Some(manifest)
+            || root.name.as_ref().is_some_and(|old| old != name)
+        {
             return refuse(
                 Code::DISPOSITION_CONFLICT,
                 "private root already binds different output or name",
@@ -179,8 +226,11 @@ pub(super) fn adopt(
         store,
         &Root {
             transaction: transaction.into(),
-            manifest: manifest.clone(),
+            manifest: Some(manifest.clone()),
             name: Some(name.into()),
+            blobs: Vec::new(),
+            sources: Vec::new(),
+            checkpoint: None,
         },
     )
 }

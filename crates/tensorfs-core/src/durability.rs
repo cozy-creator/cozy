@@ -407,7 +407,7 @@ pub(crate) fn checkpoint_bytes(
     let progress = store
         .put_stream_held(
             &mut &*bytes,
-            Some(&ObjectRef::of(&bytes)),
+            Some(&ObjectRef::of(bytes)),
             &Default::default(),
             hold,
         )?

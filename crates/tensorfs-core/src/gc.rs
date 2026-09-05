@@ -132,14 +132,7 @@ pub fn session_holds(store: &Store) -> Result<(Vec<HeldKey>, Vec<String>)> {
         .values()
         .map(|line| HeldKey::parse_line(line))
         .collect::<Result<Vec<_>>>()?;
-    for manifest in crate::derived::retained_manifests(store)? {
-        holds.push(HeldKey {
-            key: storage::manifest_key(&manifest.sha256)?,
-            kind: "manifest".into(),
-            length: manifest.length,
-            sha256: manifest.sha256,
-        });
-    }
+    holds.extend(crate::derived::retained_objects(store)?);
     holds.sort_by(|left, right| left.key.cmp(&right.key));
     if holds
         .windows(2)

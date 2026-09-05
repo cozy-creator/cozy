@@ -50,6 +50,7 @@ echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 # a refusal class the facade forgot to re-export: all of them stop here.
 "$work/venv/bin/python" scripts/stub_conform.py
 "$work/venv/bin/python" scripts/fit-runs.py
+"$work/venv/bin/python" scripts/derived-resume.py
 # The frozen corpus, through the FACADE. `tfs vectors verify` runs the same 90 vectors
 # through Rust; this proves the marshal boundary agrees — same ids, same typed refusals.
 "$work/venv/bin/python" scripts/facade-conform.py

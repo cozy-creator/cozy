@@ -466,14 +466,14 @@ class Store:
         *,
         checkpoints: Sequence[tuple[str, str, int]] = ...,
     ) -> PreparedModelSource: ...
-    def source_checkpoint_page(
+    def checkpoint_page(
         self, head_id: str, head_length: int, *, operation_id: str, slot: str,
         plan_digest: str, offset: int = 0, limit: int = 128,
     ) -> SourceCheckpointPage: ...
-    def source_checkpoint_push(
+    def checkpoint_push(
         self, object_id: str, length: int, manifest: bool, grant: str, *, allow_local: bool = False,
     ) -> dict[str, int | bool]: ...
-    def source_checkpoint_fetch(
+    def checkpoint_fetch(
         self, object_id: str, length: int, manifest: bool, url: str, *, allow_local: bool = False,
     ) -> dict[str, int | bool]: ...
     def release_model_source(self, operation_id: str) -> None: ...
@@ -486,6 +486,14 @@ class Store:
         components: Sequence[str],
         configs: Sequence[str],
     ) -> dict[str, Any]: ...
+    def derived_declaration(
+        self, sources: dict[str, Any], targets: dict[str, Any], configs: dict[str, Any],
+        order: Sequence[tuple[str, str]], max_new_bytes: int, *, work_fingerprint: str,
+    ) -> bytes: ...
+    def validate_derived_checkpoint(
+        self, transaction_id: str, declaration: bytes, head_id: str, head_length: int, *,
+        operation_id: str, slot: str, plan_digest: str,
+    ) -> None: ...
     def begin_derived(
         self,
         transaction_id: str,
