@@ -92,7 +92,11 @@ func shortModelLanes(lanes []string) string {
 	if short != "" {
 		return short
 	}
-	return output.Elide(full, width, false)
+	suffix := "]"
+	if len(lanes) > 1 {
+		suffix = fmt.Sprintf(", … +%d]", len(lanes)-1)
+	}
+	return "[" + output.Elide(lanes[0], width-1-utf8.RuneCountInString(suffix), false) + suffix
 }
 
 func handleModelInfo(ctx *Context) *exit.Error {
