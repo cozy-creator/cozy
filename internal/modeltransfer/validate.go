@@ -50,6 +50,14 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 	if intent == nil {
 		return nil
 	}
+	if spec.Rental || spec.RentalRequired {
+		for _, file := range intent.SourceFiles {
+			if len(file.Header) == 0 {
+				return exit.Named(exit.Validation, "model_transfer.source_header_missing",
+					"source header for %s must be inspected before renting", file.Member)
+			}
+		}
+	}
 	platformPassThrough := spec.Package == "cozy/platform" && spec.Entrypoint == "model-pass-through"
 	if spec.Package == "cozy/platform" || spec.Entrypoint == "model-pass-through" {
 		if !platformPassThrough {

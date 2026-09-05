@@ -215,6 +215,11 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 			return problem
 		}
 		conversion = decided
+		if effectiveRental && !conversion.decided() {
+			return exit.Named(exit.Unavailable, "model_source.preflight_unavailable",
+				"source headers must be inspected before renting: %s", conversion.Undecided).
+				WithRemedy("retry after the provider can serve every selected source header")
+		}
 	}
 	id := plan.ID()
 	if ctx.Inv.Bool("--dry-run") {
@@ -265,6 +270,9 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 		}
 	}
 	intent := modelTransferIntent(plan)
+	for i := range intent.SourceFiles {
+		intent.SourceFiles[i].Header = conversion.Headers[intent.SourceFiles[i].Member]
+	}
 	intent.LocalOnly = localOnly
 	daemonState, _, problem := ensureDaemon(ctx)
 	if problem != nil {

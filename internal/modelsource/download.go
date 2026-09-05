@@ -21,6 +21,7 @@ const maxCarrierHeader = int64(64 << 20)
 type StagedFile struct {
 	Member string
 	Path   string
+	Header []byte
 }
 
 func (r *Resolver) Stage(ctx context.Context, plan Plan, root string, headersOnly bool,
@@ -64,6 +65,7 @@ func (r *Resolver) Stage(ctx context.Context, plan Plan, root string, headersOnl
 	staged := make([]StagedFile, 0, len(plan.Files))
 	for _, file := range plan.Files {
 		target := filepath.Join(root, filepath.FromSlash(file.Member))
+		var header []byte
 		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 			return nil, exit.Internalf("cannot create model member directory: %s", err)
 		}
@@ -71,14 +73,19 @@ func (r *Resolver) Stage(ctx context.Context, plan Plan, root string, headersOnl
 			if problem := writeInline(target, file); problem != nil {
 				return nil, problem
 			}
+			if headersOnly {
+				header = file.Inline
+			}
 		} else if headersOnly {
-			if problem := r.stageHeader(ctx, file, target); problem != nil {
+			var problem *exit.Error
+			header, problem = r.stageHeader(ctx, file, target)
+			if problem != nil {
 				return nil, problem
 			}
 		} else if problem := r.download(ctx, file, target, progress); problem != nil {
 			return nil, problem
 		}
-		staged = append(staged, StagedFile{Member: file.Member, Path: target})
+		staged = append(staged, StagedFile{Member: file.Member, Path: target, Header: header})
 	}
 	return staged, nil
 }
@@ -93,30 +100,30 @@ func writeInline(target string, file File) *exit.Error {
 	return nil
 }
 
-func (r *Resolver) stageHeader(ctx context.Context, file File, target string) *exit.Error {
+func (r *Resolver) stageHeader(ctx context.Context, file File, target string) ([]byte, *exit.Error) {
 	first, problem := r.rangeBytes(ctx, file, 0, 7)
 	if problem != nil {
-		return problem
+		return nil, problem
 	}
 	if len(first) != 8 {
-		return exit.Named(exit.Validation, "model_source_header_short", "%s returned a short header prefix", file.Member)
+		return nil, exit.Named(exit.Validation, "model_source_header_short", "%s returned a short header prefix", file.Member)
 	}
 	length := int64(binary.LittleEndian.Uint64(first))
 	if length <= 1 || length > maxCarrierHeader || 8+length > file.Length {
-		return exit.Named(exit.Validation, "model_source_header_invalid",
+		return nil, exit.Named(exit.Validation, "model_source_header_invalid",
 			"%s declares invalid header length %d", file.Member, length)
 	}
 	header, problem := r.rangeBytes(ctx, file, 8, 7+length)
 	if problem != nil {
-		return problem
+		return nil, problem
 	}
 	if int64(len(header)) != length {
-		return exit.Named(exit.Validation, "model_source_header_short", "%s returned a short header", file.Member)
+		return nil, exit.Named(exit.Validation, "model_source_header_short", "%s returned a short header", file.Member)
 	}
 	temporary := target + ".header-part"
 	f, err := os.OpenFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
-		return exit.Internalf("cannot stage model header: %s", err)
+		return nil, exit.Internalf("cannot stage model header: %s", err)
 	}
 	_, writeErr := f.Write(first)
 	if writeErr == nil {
@@ -131,13 +138,13 @@ func (r *Resolver) stageHeader(ctx context.Context, file File, target string) *e
 	closeErr := f.Close()
 	if writeErr != nil || closeErr != nil {
 		_ = os.Remove(temporary)
-		return exit.Internalf("cannot finish sparse model header: %v %v", writeErr, closeErr)
+		return nil, exit.Internalf("cannot finish sparse model header: %v %v", writeErr, closeErr)
 	}
 	if err := os.Rename(temporary, target); err != nil {
 		_ = os.Remove(temporary)
-		return exit.Internalf("cannot commit sparse model header: %s", err)
+		return nil, exit.Internalf("cannot commit sparse model header: %s", err)
 	}
-	return nil
+	return append(first, header...), nil
 }
 
 func (r *Resolver) rangeBytes(ctx context.Context, file File, first, last int64) ([]byte, *exit.Error) {

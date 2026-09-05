@@ -71,7 +71,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 22
+const schemaVersion = 23
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -302,7 +302,32 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=22`); err != nil {
+	if sourceVersion < 23 {
+		if sourceVersion >= 10 {
+			for _, statement := range []string{
+				`ALTER TABLE request_model_transfers RENAME TO request_model_transfers_prior`,
+				modelTransferSchema[0],
+				`INSERT INTO request_model_transfers(request_id,intent,state,models,checkpoints,error_code,safe_error,updated_at)
+				 SELECT request_id,intent,state,models,checkpoints,error_code,safe_error,updated_at FROM request_model_transfers_prior`,
+				`DROP TABLE request_model_transfers_prior`,
+				`ALTER TABLE request_model_transfer_files RENAME TO request_model_transfer_files_prior`,
+				modelTransferSchema[1],
+				`INSERT INTO request_model_transfer_files(request_id,member,object_id,length,capability_revision,state,transferred,safe_code,safe_detail)
+				 SELECT request_id,member,object_id,length,capability_revision,state,transferred,safe_code,safe_detail FROM request_model_transfer_files_prior`,
+				`DROP TABLE request_model_transfer_files_prior`,
+			} {
+				if _, err := tx.Exec(statement); err != nil {
+					return exit.Internalf("cannot bind source status to worker boot while migrating %s: %s", path, err)
+				}
+			}
+		}
+		for _, statement := range []string{modelSourceCheckpointSchema, modelSourcePublicationSchema} {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot create source checkpoint progress while migrating %s: %s", path, err)
+			}
+		}
+	}
+	if _, err := tx.Exec(`PRAGMA user_version=23`); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
 	if e := commitMigration(tx, path); e != nil {
@@ -615,7 +640,8 @@ func priorStatements(version int) []string {
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
 		if version < 10 && containsStatement(modelTransferSchema, statement) ||
-			version < 16 && containsStatement(packageEventSchema, statement) {
+			version < 16 && containsStatement(packageEventSchema, statement) ||
+			version < 23 && (statement == modelSourceCheckpointSchema || statement == modelSourcePublicationSchema) {
 			continue
 		}
 		statements = append(statements, statement)
@@ -653,6 +679,10 @@ func priorStatements(version int) []string {
 				"  triage_path      TEXT    NOT NULL DEFAULT '',\n", 1)
 		case stmt == outputExportSchema && version < 14:
 			stmt = priorOutputExports
+		case stmt == modelTransferSchema[0] && version < 23:
+			stmt = strings.Replace(stmt, "  models_worker_boot_id TEXT NOT NULL DEFAULT '',\n", "", 1)
+		case stmt == modelTransferSchema[1] && version < 23:
+			stmt = strings.Replace(stmt, "  worker_boot_id      TEXT NOT NULL DEFAULT '',\n", "", 1)
 		case stmt == modelTransferSchema[2] && version < 18:
 			stmt = strings.Replace(stmt,
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n",
@@ -771,7 +801,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=22`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=23`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {

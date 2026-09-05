@@ -680,12 +680,20 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 			// transfer that has already failed is exactly when the reason is wanted.
 			if statuses, statusProblem := s.store.ModelTransferSourceStatuses(row.ID); statusProblem == nil {
 				var transferred, total int64
-				verified := 0
+				verified, converted := 0, 0
 				for _, status := range statuses {
 					transferred += status.Transferred
-					total += status.Length
+					if status.State == "converted" {
+						total += status.Transferred
+					} else {
+						total += status.Length
+					}
 					if status.State == "verified" {
 						verified++
+						continue
+					}
+					if status.State == "converted" {
+						converted++
 						continue
 					}
 					if len(state.ModelSources) < maxJobModelSources {
@@ -701,7 +709,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 					// was in the daemon log and on no client surface at all.
 					state.Progress = map[string]any{"stage": state.Stage,
 						"transferred_bytes": transferred, "total_bytes": total,
-						"members_verified": verified, "members_total": len(statuses)}
+						"members_verified": verified, "members_converted": converted, "members_total": len(statuses)}
 					if total > 0 {
 						state.Progress["fraction"] = float64(transferred) / float64(total)
 					}

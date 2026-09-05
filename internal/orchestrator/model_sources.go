@@ -3,7 +3,10 @@ package orchestrator
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -105,20 +108,21 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 	}
 	state := trimEnum(pb.ModelSourceFileState_name[int32(frame.State)], "MODEL_SOURCE_FILE_STATE_")
 	state = map[string]string{"ACCEPTED": "accepted", "DOWNLOADING": "downloading",
-		"VERIFIED": "verified", "FAILED": "failed"}[state]
+		"VERIFIED": "verified", "CONVERTED": "converted", "FAILED": "failed"}[state]
 	if state == "" {
 		return
 	}
-	previous := ""
+	previous, previousCode := "", ""
+	var previousRevision int64
 	if statuses, problem := c.opt.Store.ModelTransferSourceStatuses(frame.OperationId); problem == nil {
 		for _, status := range statuses {
 			if status.Member == frame.Member {
-				previous = status.State
+				previous, previousCode, previousRevision = status.State, status.SafeCode, status.CapabilityRevision
 			}
 		}
 	}
 	if problem := c.opt.Store.RecordModelTransferSourceStatus(records.ModelTransferSourceStatus{
-		RequestID: frame.OperationId, Member: frame.Member, ObjectID: frame.ObjectId,
+		RequestID: frame.OperationId, Member: frame.Member, ObjectID: frame.ObjectId, WorkerBootID: s.bootID,
 		Length: int64(frame.Length), CapabilityRevision: int64(frame.CapabilityRevision),
 		State: state, Transferred: int64(frame.TransferredBytes), SafeCode: frame.SafeCode,
 		SafeDetail: frame.SafeDetail}); problem != nil {
@@ -150,12 +154,19 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 	}
 	if statuses, problem := c.opt.Store.ModelTransferSourceStatuses(frame.OperationId); problem == nil {
 		var transferred, total int64
-		verified := 0
+		fulfilled := 0
 		for _, status := range statuses {
+			if status.State == "converted" && status.WorkerBootID == s.bootID {
+				total += status.Transferred
+			} else {
+				total += status.Length
+			}
+			if status.WorkerBootID != s.bootID {
+				continue
+			}
 			transferred += status.Transferred
-			total += status.Length
-			if status.State == "verified" {
-				verified++
+			if status.State == "verified" || status.State == "converted" {
+				fulfilled++
 			}
 		}
 		value := map[string]any{"stage": "source download", "member": frame.Member,
@@ -174,6 +185,7 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 			value["fraction"] = float64(transferred) / float64(total)
 		}
 		c.publishTransferProgress(frame.OperationId, value)
+		c.ObservePhase(frame.OperationId, PhaseSample{Name: PhaseDownloading, Detail: "source transfer", HasBytes: true, Moved: uint64(transferred), Total: uint64(total)})
 		// A member's state change is one line in the daemon log; byte progress is the
 		// live frame's alone. A queued transfer must be legible from the log (cl-099).
 		if state != previous {
@@ -181,8 +193,8 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 			if state == "failed" {
 				detail = " (" + frame.SafeCode + ": " + frame.SafeDetail + ")"
 			}
-			c.logf("model transfer %s: source %s %s on %s%s; %d of %d verified, %d/%d B",
-				frame.OperationId, frame.Member, state, s.instanceID, detail, verified,
+			c.logf("model transfer %s: source %s %s on %s%s; %d of %d fulfilled, %d/%d B",
+				frame.OperationId, frame.Member, state, s.instanceID, detail, fulfilled,
 				len(transfer.SourceFiles), transferred, total)
 		}
 	}
@@ -192,9 +204,15 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 	// counts reach the live view above, which is where they were already going; the
 	// preparer decides on a member's STATE. Session attach, session drop and cancellation
 	// each signal on their own, so nothing it waits on is left without a wake.
-	if state != previous {
+	if state != previous || int64(frame.CapabilityRevision) != previousRevision || frame.SafeCode != previousCode {
 		c.signalTransfer(frame.OperationId)
 	}
+}
+
+type sourcePreparationBackoff struct {
+	stream string
+	until  time.Time
+	delay  time.Duration
 }
 
 func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePrepared) {
@@ -203,21 +221,86 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 	if err != nil || problem != nil || transfer == nil || selection != transfer.SourceSelection {
 		return
 	}
+	request, problem := c.opt.Store.RequestRow(frame.OperationId)
+	if problem != nil || request == nil || request.Worker == "" ||
+		rentalInstanceID(request.Worker) != s.instanceID {
+		return
+	}
+	if frame.Outcome != pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_REFUSED &&
+		frame.Outcome != pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_INCOMPLETE &&
+		frame.Outcome != pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_PREPARED &&
+		frame.Outcome != pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED {
+		return
+	}
+	defer func() {
+		c.mu.Lock()
+		c.sourcePrepareReplies[frame.OperationId]++
+		c.mu.Unlock()
+		c.signalTransfer(frame.OperationId)
+	}()
+	if frame.Outcome == pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_REFUSED && frame.SafeCode == "model_source_preparer_unavailable" {
+		stream := fmt.Sprintf("%s/%d", s.bootID, s.epoch)
+		c.mu.Lock()
+		prior := c.sourcePrepareBlocked[frame.OperationId]
+		delay := time.Second
+		if prior.stream == stream {
+			delay = min(30*time.Second, max(time.Second, prior.delay*2))
+		}
+		retry := sourcePreparationBackoff{stream: stream, delay: delay, until: time.Now().Add(delay)}
+		c.sourcePrepareBlocked[frame.OperationId] = retry
+		c.mu.Unlock()
+		time.AfterFunc(delay, func() {
+			c.mu.Lock()
+			current := c.sourcePrepareBlocked[frame.OperationId]
+			wake := !c.closing && current.until == retry.until
+			c.mu.Unlock()
+			if wake {
+				c.signalTransfer(frame.OperationId)
+			}
+		})
+		c.ObservePhase(frame.OperationId, PhaseSample{Name: PhasePreparing, Detail: "model_source_preparer_unavailable; retrying"})
+		c.logf("model transfer %s: Runtime preparer unavailable; retrying in %s or on new source/worker progress", frame.OperationId, delay)
+		return
+	}
+	c.mu.Lock()
+	delete(c.sourcePrepareBlocked, frame.OperationId)
+	c.mu.Unlock()
+	checkpoints := make([]records.ModelSourceCheckpoint, 0, len(frame.Checkpoints))
+	for _, checkpoint := range frame.Checkpoints {
+		if checkpoint == nil || checkpoint.Head == nil || len(checkpoint.Head.Digest) != 32 ||
+			len(checkpoint.PlanDigest) != 32 || checkpoint.Head.Length == 0 ||
+			checkpoint.Head.Length > uint64(^uint64(0)>>1) || checkpoint.Index > uint64(^uint64(0)>>1) ||
+			checkpoint.Bytes > uint64(^uint64(0)>>1) {
+			_ = c.opt.Store.FailModelTransfer(frame.OperationId, "model_transfer.source_checkpoint_invalid",
+				"worker returned malformed source checkpoint progress")
+			return
+		}
+		checkpoints = append(checkpoints, records.ModelSourceCheckpoint{
+			Slot: checkpoint.Slot, HeadID: "sha256:" + hex.EncodeToString(checkpoint.Head.Digest),
+			HeadLength: int64(checkpoint.Head.Length), PlanDigest: "sha256:" + hex.EncodeToString(checkpoint.PlanDigest),
+			Index: int64(checkpoint.Index), Bytes: int64(checkpoint.Bytes)})
+	}
+	if len(checkpoints) > 0 {
+		if problem := c.opt.Store.ObserveModelSourceCheckpoints(frame.OperationId, selection, s.bootID, checkpoints); problem != nil {
+			_ = c.opt.Store.FailModelTransfer(frame.OperationId, problem.ErrName(), problem.Message)
+			return
+		}
+		var converted uint64
+		for _, checkpoint := range checkpoints {
+			converted += uint64(checkpoint.Bytes)
+		}
+		c.ObservePhase(frame.OperationId, PhaseSample{Name: PhasePreparing, Detail: "source conversion", HasBytes: true, Moved: converted})
+		c.kickSourceCheckpointUpload(frame.OperationId)
+	}
 	c.logf("model transfer %s: source prepare %s on %s (%d source(s)) %s %s", frame.OperationId,
 		trimEnum(pb.ModelSourcePrepareOutcome_name[int32(frame.Outcome)], "MODEL_SOURCE_PREPARE_OUTCOME_"),
 		s.instanceID, len(frame.Sources), frame.SafeCode, frame.SafeDetail)
 	if frame.Outcome == pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_REFUSED {
 		_ = c.opt.Store.FailModelTransfer(frame.OperationId, frame.SafeCode, frame.SafeDetail)
-		c.signalTransfer(frame.OperationId)
 		return
 	}
 	if frame.Outcome != pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_PREPARED &&
 		frame.Outcome != pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED {
-		return
-	}
-	request, problem := c.opt.Store.RequestRow(frame.OperationId)
-	if problem != nil || request == nil || request.Worker == "" ||
-		rentalInstanceID(request.Worker) != s.instanceID {
 		return
 	}
 	rows := make([]records.ModelRef, 0, len(frame.Sources))
@@ -241,8 +324,37 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 			return
 		}
 	}
-	if problem := c.opt.Store.CompleteModelTransferMaterialization(frame.OperationId, rows); problem != nil {
+	if problem := c.opt.Store.CompleteModelTransferMaterialization(frame.OperationId, rows, s.bootID); problem != nil {
 		return
 	}
-	c.signalTransfer(frame.OperationId)
+}
+
+// Only remotely acknowledged heads travel back to a worker. Local observations
+// may refer to bytes that vanished with the previous pod.
+func (c *Orchestrator) sourceCheckpointHeads(requestID, bootID string) ([]*pb.ModelSourceCheckpoint, string, string, *exit.Error) {
+	progress, problem := c.opt.Store.ModelSourceProgress(requestID)
+	if problem != nil {
+		return nil, "", "", problem
+	}
+	var out []*pb.ModelSourceCheckpoint
+	var heads, observed []string
+	for _, slot := range progress {
+		if slot.WorkerBootID == bootID {
+			observed = append(observed, slot.Observed.Slot+"="+slot.Observed.HeadID)
+		}
+		checkpoint := slot.Acknowledged
+		if checkpoint == nil {
+			continue
+		}
+		head, headErr := canonical.Raw(checkpoint.HeadID)
+		plan, planErr := canonical.Raw(checkpoint.PlanDigest)
+		if headErr != nil || planErr != nil {
+			return nil, "", "", exit.Internalf("stored source checkpoint has malformed identity")
+		}
+		out = append(out, &pb.ModelSourceCheckpoint{Slot: checkpoint.Slot,
+			Head: &pb.Ref{Digest: head, Length: uint64(checkpoint.HeadLength)}, PlanDigest: plan,
+			Index: uint64(checkpoint.Index), Bytes: uint64(checkpoint.Bytes)})
+		heads = append(heads, checkpoint.Slot+"="+checkpoint.HeadID)
+	}
+	return out, strings.Join(heads, ","), strings.Join(observed, ","), nil
 }
