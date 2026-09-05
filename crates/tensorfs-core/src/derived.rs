@@ -143,6 +143,20 @@ pub struct Declaration {
 }
 
 impl Declaration {
+    /// The native declaration encoder shared by Runtime intents and writers.
+    pub fn canonical_bytes(&mut self) -> Result<Vec<u8>> {
+        self.normalize_and_validate()?;
+        self.require_order()?;
+        let bytes = crate::canon::write(&self.to_value());
+        if bytes.len() > limits::DOC_MAX_BYTES / 2 {
+            return refuse(
+                Code::SIZE_CAP,
+                "derived declaration is over its metadata budget",
+            );
+        }
+        Ok(bytes)
+    }
+
     fn require_order(&self) -> Result<()> {
         if self.order.is_empty() {
             return refuse(
@@ -1862,15 +1876,8 @@ pub fn begin(
             "WriterSessionId must be positive and inside the canonical integer range",
         );
     }
-    declaration.normalize_and_validate()?;
-    declaration.require_order()?;
-    let declaration_text = declaration.canonical_text();
-    if declaration_text.len() > limits::DOC_MAX_BYTES / 2 {
-        return refuse(
-            Code::SIZE_CAP,
-            "derived declaration is over its metadata budget",
-        );
-    }
+    let declaration_text =
+        String::from_utf8(declaration.canonical_bytes()?).expect("canonical JSON is UTF-8");
 
     // The writer hold is registered before source metadata is touched. It is the live
     // process proof that keeps exclusive GC out even for a source-free create.

@@ -481,6 +481,10 @@ class Store:
         components: Sequence[str],
         configs: Sequence[str],
     ) -> dict[str, Any]: ...
+    def derived_declaration(
+        self, sources: dict[str, Any], targets: dict[str, Any], configs: dict[str, Any],
+        order: Sequence[tuple[str, str]], max_new_bytes: int,
+    ) -> bytes: ...
     def begin_derived(
         self,
         transaction_id: str,

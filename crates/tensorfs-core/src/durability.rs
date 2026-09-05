@@ -185,21 +185,34 @@ pub fn canonical_refs(mut refs: Vec<ObjectRef>) -> Vec<ObjectRef> {
 /// Read an admitted link from the local Store. Unlike `chain`, this does not require an
 /// NFS binding: the ordinary transfer plane may have obtained it from the hub.
 pub fn local_link(store: &Store, object: &ObjectRef) -> Result<Link> {
-    if object.length > Link::MAX_BYTES as u64 {
+    Link::parse(&read_document(store, object, Link::MAX_BYTES)?)
+}
+
+/// Bound the actual pinned file before allocation, not only the untrusted claimed length.
+/// Source and derived progress use the same exact ObjectRef admission contract as links.
+pub(crate) fn read_document(store: &Store, object: &ObjectRef, cap: usize) -> Result<Vec<u8>> {
+    if object.length > cap as u64 {
+        return refuse(Code::COUNT_CAP, "checkpoint document exceeds its byte cap");
+    }
+    let mut file = store.open_verified(&object.sha256)?;
+    if file.len() != object.length {
         return refuse(
-            Code::COUNT_CAP,
-            "checkpoint link exceeds the document byte cap",
+            Code::LENGTH_MISMATCH,
+            "checkpoint document differs from its ObjectRef length",
         );
     }
-    let mut bytes = Vec::with_capacity(object.length as usize);
-    store.read_into(&object.sha256, &mut bytes)?;
+    let mut bytes = vec![0; object.length as usize];
+    std::io::Read::read_exact(&mut file, &mut bytes).map_err(|error| crate::err::Refusal {
+        code: Code::IO_FAILED,
+        detail: format!("read checkpoint document: {error}"),
+    })?;
     if ObjectRef::of(&bytes) != *object {
         return refuse(
             Code::OBJECT_ID_MISMATCH,
-            "checkpoint link differs from its ObjectRef",
+            "checkpoint document differs from its ObjectRef",
         );
     }
-    Link::parse(&bytes)
+    Ok(bytes)
 }
 
 /// Each call reads one link and returns a bounded window, so a caller can fetch links and
@@ -1029,6 +1042,40 @@ pub fn restore_conversion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_documents_refuse_wrong_lengths_before_reading_into_memory() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-document-bound-{}",
+            crate::meta::now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let bytes = b"a verified resident object";
+        let object = store
+            .put_stream(
+                &mut bytes.as_slice(),
+                Some(&ObjectRef::of(bytes)),
+                &Default::default(),
+            )
+            .unwrap()
+            .obj;
+        let mut short = object.clone();
+        short.length = 1;
+        assert_eq!(
+            local_link(&store, &short).unwrap_err().code,
+            Code::LENGTH_MISMATCH
+        );
+        assert_eq!(
+            read_document(&store, &short, 1).unwrap_err().code,
+            Code::LENGTH_MISMATCH
+        );
+        assert_eq!(
+            read_document(&store, &object, 1).unwrap_err().code,
+            Code::COUNT_CAP
+        );
+        assert_eq!(read_document(&store, &object, bytes.len()).unwrap(), bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn object(byte: &str, length: u64) -> ObjectRef {
         ObjectRef {

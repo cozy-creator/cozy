@@ -1437,6 +1437,24 @@ impl PyStore {
         Ok(out)
     }
 
+    /// Canonical TensorFS declaration bytes for the current producer intent.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (sources, targets, configs, order, max_new_bytes))]
+    fn derived_declaration<'p>(
+        &self,
+        py: Python<'p>,
+        sources: &Bound<'_, PyDict>,
+        targets: &Bound<'_, PyDict>,
+        configs: &Bound<'_, PyDict>,
+        order: Vec<(String, String)>,
+        max_new_bytes: u64,
+    ) -> PyResult<Bound<'p, PyBytes>> {
+        let mut declaration =
+            parse_declaration(py, sources, targets, configs, order, max_new_bytes)?;
+        let bytes = declaration.canonical_bytes().or_refuse(py)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
     /// Open one exact tfs-019 transaction. Python supplies typed plain values; canonical
     /// declaration bytes are constructed and locked only by the compiled core.
     // PyO3 exposes these as six named boundary fields. Packing them into an opaque dict

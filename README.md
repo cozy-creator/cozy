@@ -519,7 +519,9 @@ The RecordOwner uploads each Link and its objects and retains an acknowledged he
 Canonical output remains held until upload or an explicit terminal action. A replacement pod fetches the chain
 through ordinary verified admission and passes its head back in `checkpoints`; TensorFS re-derives
 the plan and verifies journalled parts before skipping work. No NFS mount is required or accessed
-by source preparation. Explicit release removes the operation's holds and recovery journal.
+by source preparation. A completed preparation replays its persisted final heads after a lost
+response, including when source bodies are gone or the caller still supplies an older ACK.
+Explicit release removes the operation's holds and recovery journal.
 
 `repo apply` validates the exact manifest, header, and complete blob inventory before the caller may
 perform its repository CAS, then records only `(org,name,manifest_sha256)` in SQLite. Missing or
@@ -571,6 +573,11 @@ its row is dropped). A live writer or read lease refuses `STORE_BUSY` naming the
 whose writer is gone is abandoned only by the explicit `tfs ingest reap`. `--dry-run` plans without
 deleting; `gc holds` + `gc plan` are the same plan as separate documents, which is how a cloud
 caller (tensorhub) supplies its own holds against a staged census.
+
+`Store.derived_declaration(sources, targets, configs, order, max_new_bytes)` returns the
+canonical declaration bytes for a Runtime producer intent. It uses the same native encoder and
+validation as `begin_derived`, so the resulting receipt carries exactly that declaration.
+Building the declaration does not open or fence a writer.
 
 A derived commit creates a pending private root before releasing its writer. The owner's
 `Store.derived_adopt(transaction_id, scratch_root_id)` names that root without creating a model

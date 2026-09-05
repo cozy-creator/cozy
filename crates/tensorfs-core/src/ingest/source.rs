@@ -1207,11 +1207,51 @@ fn prepare_model_source_with_registry(
             for source in &sources {
                 validate_prepared_result(store, source)?;
             }
+            // The final response can be lost after its catalog commit. Its existing local
+            // cursors must remain discoverable without converting or reading source bodies.
+            let mut checkpoints = Vec::new();
+            let dir = transaction::candidate_dir(store.root(), &request.operation_id);
+            for (requested, (plan_hex, _)) in request.profiles.iter().zip(&plans) {
+                let plan_digest = format!("sha256:{plan_hex}");
+                let chain = format!("{}/{}", request.operation_id, requested.slot);
+                let journal = super::journal::Journal::open(&dir, plan_hex)?;
+                let local = journal.local_head()?.ok_or_else(|| Refusal {
+                    code: Code::DURABILITY_UNPROVEN,
+                    detail: "completed source has no local checkpoint cursor".into(),
+                })?;
+                let supplied = request
+                    .checkpoints
+                    .iter()
+                    .find(|(slot, _)| slot == &requested.slot)
+                    .map(|(_, head)| head);
+                let head = durability::checkpoint_predecessor(
+                    store,
+                    &durability::Policy {
+                        chain: &chain,
+                        operation: &request.operation_id,
+                        plan: &plan_digest,
+                        interval: durability::INTERVAL_BYTES,
+                    },
+                    Some(&local),
+                    supplied,
+                )?
+                .expect("a local cursor was supplied");
+                let held = durability::local_chain(store, &head, &plan_digest)?;
+                checkpoints.push(SourceCheckpoint {
+                    slot: requested.slot.clone(),
+                    plan_digest,
+                    head: durability::Head {
+                        head: Some(head),
+                        links: held.links,
+                        bytes: held.bytes,
+                    },
+                });
+            }
             return Ok(PreparedModelSources {
                 replayed: true,
                 complete: true,
                 sources,
-                checkpoints: Vec::new(),
+                checkpoints,
                 spent: request
                     .roster
                     .iter()
@@ -1257,20 +1297,8 @@ fn prepare_model_source_with_registry(
             durability::retain_local_chain(store, head, &request.operation_id)?;
             if journal.is_empty() {
                 if let Some(progress) = held.progress.last() {
-                    if progress.length > crate::limits::DOC_MAX_BYTES as u64 {
-                        return refuse(
-                            Code::COUNT_CAP,
-                            "checkpoint progress exceeds the document byte cap",
-                        );
-                    }
-                    let mut bytes = Vec::with_capacity(progress.length as usize);
-                    store.read_into(&progress.sha256, &mut bytes)?;
-                    if ObjectRef::of(&bytes) != *progress {
-                        return refuse(
-                            Code::OBJECT_ID_MISMATCH,
-                            "checkpoint progress differs from its ObjectRef",
-                        );
-                    }
+                    let bytes =
+                        durability::read_document(store, progress, crate::limits::DOC_MAX_BYTES)?;
                     drop(journal);
                     super::journal::install(&dir, &plan_hex, &bytes)?;
                     journal = super::journal::Journal::open(&dir, &plan_hex)?;
@@ -1583,6 +1611,19 @@ mod tests {
                 .unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.sources, first.sources);
+        assert_eq!(replay.checkpoints, first.checkpoints);
+        let mut bodies_gone = request.clone();
+        bodies_gone.landed.clear();
+        for row in &bodies_gone.roster {
+            fs::remove_file(&row.path).unwrap();
+        }
+        let recovered_heads =
+            prepare_model_source_with_registry(&store, &bodies_gone, "fixture:registry", &registry)
+                .unwrap();
+        assert_eq!(recovered_heads.checkpoints, first.checkpoints);
+        // Remaining arms need their original carriers again.
+        carrier(&request.roster[0].path, "weight", [1, 2, 3, 4]);
+        carrier(&request.roster[1].path, "weight", [5, 6, 7, 8]);
 
         let mut changed = request.clone();
         changed.roster[0].object_id = format!("sha256:{}", "33".repeat(32));
@@ -2239,6 +2280,10 @@ mod tests {
         )
         .unwrap();
         assert!(replay.replayed && replay.complete);
+        assert_eq!(
+            replay.checkpoints, resumed.checkpoints,
+            "a lost final response replays even with an old ACK"
+        );
         let mut unrelated = registry.clone();
         unrelated.entries[0]
             .provenance
