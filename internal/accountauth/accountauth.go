@@ -105,6 +105,7 @@ func (m *Manager) FinishEmailProof(ctx context.Context, enrollment *Enrollment, 
 		return Session{}, exit.Usagef("the email verification code is empty")
 	}
 	var answer tokenAnswer
+	started := m.now()
 	if problem := m.post(ctx, "/v1/auth/device-keys/enroll/finish", map[string]string{
 		"enrollment_id": enrollment.id,
 		"code":          code,
@@ -112,7 +113,7 @@ func (m *Manager) FinishEmailProof(ctx context.Context, enrollment *Enrollment, 
 	}, &answer); problem != nil {
 		return Session{}, problem
 	}
-	session, problem := answer.session(enrollment.email)
+	session, problem := answer.session(enrollment.email, started)
 	if problem != nil {
 		return Session{}, problem
 	}
@@ -210,13 +211,14 @@ func (m *Manager) Authenticate(ctx context.Context) (Session, *exit.Error) {
 	}
 	signature := sign(private, loginDomain, challenge)
 	var answer tokenAnswer
+	started := m.now()
 	if problem := m.post(ctx, "/v1/auth/device-keys/login/finish", map[string]string{
 		"challenge_id": begun.ChallengeID,
 		"signature":    rawBase64.EncodeToString(signature),
 	}, &answer); problem != nil {
 		return Session{}, problem
 	}
-	m.session, problem = answer.session(stored.Email)
+	m.session, problem = answer.session(stored.Email, started)
 	return m.session, problem
 }
 
@@ -263,6 +265,7 @@ func (m *Manager) FinishEnrollment(ctx context.Context, enrollment *Enrollment, 
 		return Session{}, exit.Usagef("the email verification code is empty")
 	}
 	var answer tokenAnswer
+	started := m.now()
 	if problem := m.post(ctx, "/v1/auth/device-keys/enroll/finish", map[string]string{
 		"enrollment_id": enrollment.id,
 		"code":          code,
@@ -270,7 +273,7 @@ func (m *Manager) FinishEnrollment(ctx context.Context, enrollment *Enrollment, 
 	}, &answer); problem != nil {
 		return Session{}, problem
 	}
-	session, problem := answer.session(enrollment.email)
+	session, problem := answer.session(enrollment.email, started)
 	if problem != nil {
 		return Session{}, problem
 	}
@@ -289,26 +292,30 @@ func (m *Manager) FinishEnrollment(ctx context.Context, enrollment *Enrollment, 
 }
 
 type tokenAnswer struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	ExpiresAt   string `json:"expires_at"`
-	DeviceKey   struct {
+	TokenSet struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+		ExpiresIn   int64  `json:"expires_in"`
+	} `json:"token_set"`
+	DeviceKey struct {
 		ID        string `json:"id"`
 		Label     string `json:"label"`
 		CreatedAt string `json:"created_at"`
 	} `json:"device_key"`
 }
 
-func (a tokenAnswer) session(email string) (Session, *exit.Error) {
-	expires, problem := parseExpiry(a.ExpiresAt)
-	if problem != nil {
-		return Session{}, problem
+func (a tokenAnswer) session(email string, started time.Time) (Session, *exit.Error) {
+	if a.TokenSet.ExpiresIn <= 0 || a.TokenSet.ExpiresIn > int64((1<<63-1)/time.Second) {
+		return Session{}, exit.Named(exit.Internal, "auth.unreadable_expiry",
+			"Tensorhub returned an invalid authentication expiry")
 	}
-	if a.TokenType != "Bearer" || strings.TrimSpace(a.AccessToken) == "" || a.DeviceKey.ID == "" {
+	if a.TokenSet.TokenType != "Bearer" || strings.TrimSpace(a.TokenSet.AccessToken) == "" || strings.TrimSpace(a.DeviceKey.ID) == "" {
 		return Session{}, exit.Named(exit.Internal, "auth.unreadable_token",
 			"Tensorhub returned an invalid machine access token")
 	}
-	return Session{AccessToken: secret.New(a.AccessToken), ExpiresAt: expires,
+	// Start before the exchange so network latency cannot extend the server's TTL.
+	return Session{AccessToken: secret.New(a.TokenSet.AccessToken),
+		ExpiresAt:   started.Add(time.Duration(a.TokenSet.ExpiresIn) * time.Second),
 		DeviceKeyID: a.DeviceKey.ID, Email: email}, nil
 }
 
