@@ -135,6 +135,8 @@ impl ConfigDeclaration {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declaration {
+    /// Required to begin work. Historical declarations remain readable for committed lookup.
+    pub work_fingerprint: Option<String>,
     pub sources: Vec<Source>,
     pub components: Vec<ComponentDeclaration>,
     pub configs: Vec<ConfigDeclaration>,
@@ -165,6 +167,9 @@ impl Declaration {
     }
 
     pub fn normalize_and_validate(&mut self) -> Result<()> {
+        if let Some(fingerprint) = &self.work_fingerprint {
+            prefixed("producer work fingerprint", fingerprint)?;
+        }
         if self.components.is_empty() || self.components.len() > limits::MAX_COMPONENTS {
             return refuse(
                 Code::EMPTY_COMPONENTS,
@@ -454,6 +459,12 @@ impl Declaration {
     fn from_value(v: &Value) -> Result<Declaration> {
         let mut f = Fields::new("DerivedDeclaration", v)?;
         let max_new_bytes = f.req_uint("max_new_bytes")?;
+        let work_fingerprint = f
+            .opt("work_fingerprint")
+            .map(|value| {
+                as_str("DerivedDeclaration", "work_fingerprint", value).map(str::to_string)
+            })
+            .transpose()?;
 
         let mut sources = Vec::new();
         for (alias, source_value) in as_obj("DerivedDeclaration", "sources", f.req("sources")?)? {
@@ -575,6 +586,7 @@ impl Declaration {
         }
         f.done()?;
         Ok(Declaration {
+            work_fingerprint,
             sources,
             components,
             configs,
@@ -584,7 +596,7 @@ impl Declaration {
     }
 
     fn to_value(&self) -> Value {
-        Value::obj(vec![
+        let mut fields = vec![
             (
                 "components",
                 Value::map(
@@ -743,7 +755,11 @@ impl Declaration {
                         .collect(),
                 ),
             ),
-        ])
+        ];
+        if let Some(fingerprint) = &self.work_fingerprint {
+            fields.push(("work_fingerprint", Value::str(fingerprint.clone())));
+        }
+        Value::obj(fields)
     }
 }
 
@@ -848,6 +864,7 @@ pub(crate) struct TransactionRow {
     pub(crate) current_session: Option<u64>,
     pub(crate) added_parts: Vec<AddedPart>,
     pub(crate) added_configs: Vec<AddedConfig>,
+    pub(crate) recovery_objects: Vec<ObjectRef>,
     pub(crate) source_facts: Vec<SourceFact>,
     pub(crate) inherited_payload_objects: u64,
     pub(crate) inherited_payload_bytes: u64,
@@ -906,6 +923,9 @@ impl TransactionRow {
         self.added_parts
             .sort_by(|a, b| (&a.component, &a.key, &a.role).cmp(&(&b.component, &b.key, &b.role)));
         self.added_configs.sort_by(|a, b| a.name.cmp(&b.name));
+        self.recovery_objects
+            .sort_by(|a, b| a.sha256.cmp(&b.sha256));
+        self.recovery_objects.dedup();
         self.source_facts.sort_by(|a, b| a.alias.cmp(&b.alias));
     }
 
@@ -923,6 +943,16 @@ impl TransactionRow {
             .map(|v| as_str("DerivedTransaction", "declaration", v).map(str::to_string))
             .transpose()?;
 
+        let recovery_objects = f
+            .opt("recovery_objects")
+            .map(|value| {
+                as_arr("DerivedTransaction", "recovery_objects", value)?
+                    .iter()
+                    .map(|value| ObjectRef::from_value("recovery object", value))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         let mut added_parts = Vec::new();
         for value in as_arr("DerivedTransaction", "added_parts", f.req("added_parts")?)? {
             let mut af = Fields::new("DerivedTransaction.added_part", value)?;
@@ -1099,6 +1129,7 @@ impl TransactionRow {
             current_session,
             added_parts,
             added_configs,
+            recovery_objects,
             source_facts,
             inherited_payload_objects,
             inherited_payload_bytes,
@@ -1107,10 +1138,12 @@ impl TransactionRow {
         };
         let before_parts = row.added_parts.clone();
         let before_configs = row.added_configs.clone();
+        let before_recovery = row.recovery_objects.clone();
         let before_sources = row.source_facts.clone();
         row.normalize();
         if row.added_parts != before_parts
             || row.added_configs != before_configs
+            || row.recovery_objects != before_recovery
             || row.source_facts != before_sources
         {
             return refuse(
@@ -1257,6 +1290,17 @@ impl TransactionRow {
             ),
             ("state".to_string(), Value::str(self.state.name())),
         ];
+        if !self.recovery_objects.is_empty() {
+            fields.push((
+                "recovery_objects".into(),
+                Value::arr(
+                    self.recovery_objects
+                        .iter()
+                        .map(ObjectRef::to_value)
+                        .collect(),
+                ),
+            ));
+        }
         if let Some(session) = self.current_session {
             fields.push(("current_session".to_string(), Value::uint(session)));
         }
@@ -1530,24 +1574,23 @@ fn build_header(
             }
             let mut parts = Vec::new();
             for part_declaration in &tensor.parts {
-                let part = if planned {
-                    planned_part(part_declaration)?
-                } else {
-                    added_parts
-                        .iter()
-                        .find(|added| {
-                            added.component == component.target
-                                && added.key == tensor.key
-                                && added.role == part_declaration.role
-                        })
-                        .map(|added| added.part.clone())
-                        .ok_or_else(|| Refusal {
-                            code: Code::ARTIFACT_INCOMPLETE,
-                            detail: format!(
+                let supplied = added_parts.iter().find(|added| {
+                    added.component == component.target
+                        && added.key == tensor.key
+                        && added.role == part_declaration.role
+                });
+                let part = match supplied {
+                    Some(added) => added.part.clone(),
+                    None if planned => planned_part(part_declaration)?,
+                    None => {
+                        return refuse(
+                            Code::ARTIFACT_INCOMPLETE,
+                            format!(
                                 "missing added value {}/{}#{}",
                                 component.target, tensor.key, part_declaration.role
                             ),
-                        })?
+                        )
+                    }
                 };
                 if part.dtype != part_declaration.dtype || part.shape != part_declaration.shape {
                     return refuse(
@@ -1780,6 +1823,7 @@ pub fn inspect_source(
 ) -> Result<SourceInspection> {
     let alias = "source".to_string();
     let mut declaration = Declaration {
+        work_fingerprint: None,
         sources: vec![Source {
             alias: alias.clone(),
             manifest,
@@ -1854,6 +1898,7 @@ pub fn begin(
     transaction: &str,
     writer_session: u64,
     mut declaration: Declaration,
+    checkpoint: Option<&ObjectRef>,
 ) -> Result<Begin> {
     let transaction = transaction_id(transaction)?;
     if writer_session == 0 || writer_session > limits::INT_MAX as u64 {
@@ -1863,6 +1908,12 @@ pub fn begin(
         );
     }
     declaration.normalize_and_validate()?;
+    if declaration.work_fingerprint.is_none() {
+        return refuse(
+            Code::MISSING_FIELD,
+            "derived work requires an explicit producer fingerprint",
+        );
+    }
     declaration.require_order()?;
     let declaration_text = declaration.canonical_text();
     if declaration_text.len() > limits::DOC_MAX_BYTES / 2 {
@@ -1920,6 +1971,16 @@ pub fn begin(
         })
         .collect();
 
+    let incoming = match checkpoint
+        .map(|head| read_progress(store, head, &transaction, &declaration_text, &source_facts))
+        .transpose()
+    {
+        Ok(incoming) => incoming,
+        Err(error) => {
+            release_guards(meta, Some(writer_hold), source_leases);
+            return Err(error);
+        }
+    };
     let mut txn = meta.txn()?;
     let result = match txn.rows.iter_mut().find(|row| row.id == transaction) {
         Some(row) => match row.state {
@@ -1953,8 +2014,6 @@ pub fn begin(
                 } else {
                     if writer_session > row.highest_session {
                         row.highest_session = writer_session;
-                        row.added_parts.clear();
-                        row.added_configs.clear();
                     }
                     row.current_session = Some(writer_session);
                     Ok(())
@@ -1970,6 +2029,7 @@ pub fn begin(
                 current_session: Some(writer_session),
                 added_parts: Vec::new(),
                 added_configs: Vec::new(),
+                recovery_objects: Vec::new(),
                 source_facts: source_facts.clone(),
                 inherited_payload_objects: 0,
                 inherited_payload_bytes: 0,
@@ -1984,6 +2044,13 @@ pub fn begin(
         release_guards(meta, Some(writer_hold), source_leases);
         return Err(error);
     }
+    let row = open_row(&mut txn.rows, &transaction, writer_session)?;
+    let merged = merge_progress(store, row, incoming.as_ref());
+    if let Err(error) = merged {
+        drop(txn);
+        release_guards(meta, Some(writer_hold), source_leases);
+        return Err(error);
+    }
     if let Err(error) = txn.commit() {
         release_guards(meta, Some(writer_hold), source_leases);
         return Err(error);
@@ -1993,6 +2060,244 @@ pub fn begin(
         source_leases,
         source_views,
     })
+}
+
+fn progress_row(row: &TransactionRow) -> TransactionRow {
+    let mut progress = row.clone();
+    progress.highest_session = 0;
+    progress.current_session = None;
+    progress.recovery_objects.clear();
+    progress
+}
+
+fn progress_plan(row: &TransactionRow) -> String {
+    let mut identity = progress_row(row);
+    identity.added_parts.clear();
+    identity.added_configs.clear();
+    let mut hash = crate::sha256::Sha256::new();
+    hash.update(b"tensorfs.derived.work/1\0");
+    hash.update(&crate::canon::write(&identity.to_value()));
+    format!("sha256:{}", crate::sha256::hex(&hash.finish()))
+}
+
+fn validate_additions(row: &TransactionRow) -> Result<()> {
+    let declaration = declaration(row)?;
+    for added in &row.added_parts {
+        let expected = declaration
+            .components
+            .iter()
+            .find(|c| c.target == added.component)
+            .and_then(|c| c.add.iter().find(|t| t.key == added.key))
+            .and_then(|t| t.parts.iter().find(|p| p.role == added.role));
+        if !expected.is_some_and(|expected| {
+            expected.dtype == added.part.dtype && expected.shape == added.part.shape
+        }) {
+            return refuse(
+                Code::TRANSACTION_CONFLICT,
+                "progress contains an undeclared or changed tensor part",
+            );
+        }
+    }
+    for added in &row.added_configs {
+        if !declaration.configs.iter().any(|config| matches!(config,
+            ConfigDeclaration::Add { target } | ConfigDeclaration::Derive { target, .. } if target == &added.name)) {
+            return refuse(Code::TRANSACTION_CONFLICT, "progress contains an undeclared config");
+        }
+    }
+    Ok(())
+}
+
+fn merge_progress(
+    store: &Store,
+    row: &mut TransactionRow,
+    incoming: Option<&TransactionRow>,
+) -> Result<()> {
+    validate_additions(row)?;
+    row.added_parts
+        .retain(|added| crate::ingest::journal::segments_still_stand(store, &added.part));
+    if let Some(incoming) = incoming {
+        validate_additions(incoming)?;
+        for added in &incoming.added_parts {
+            if !crate::ingest::journal::segments_still_stand(store, &added.part) {
+                continue;
+            }
+            match row.added_parts.iter().find(|old| {
+                old.component == added.component && old.key == added.key && old.role == added.role
+            }) {
+                Some(old) if old != added => {
+                    return refuse(
+                        Code::TRANSACTION_CONFLICT,
+                        "accepted tensor part conflicts with restored progress",
+                    )
+                }
+                Some(_) => {}
+                None => row.added_parts.push(added.clone()),
+            }
+        }
+        for added in &incoming.added_configs {
+            match row.added_configs.iter().find(|old| old.name == added.name) {
+                Some(old) if old != added => {
+                    return refuse(
+                        Code::TRANSACTION_CONFLICT,
+                        "accepted config conflicts with restored progress",
+                    )
+                }
+                Some(_) => {}
+                None => row.added_configs.push(added.clone()),
+            }
+        }
+        row.recovery_objects
+            .extend(incoming.recovery_objects.iter().cloned());
+    }
+    row.normalize();
+    Ok(())
+}
+
+fn read_progress(
+    store: &Store,
+    head: &ObjectRef,
+    transaction: &str,
+    declaration: &str,
+    sources: &[SourceFact],
+) -> Result<TransactionRow> {
+    let link = crate::durability::local_link(store, head)?;
+    let chain = crate::durability::local_chain(store, head, &link.plan)?;
+    let progress = chain.progress.last().ok_or_else(|| Refusal {
+        code: Code::MISSING_FIELD,
+        detail: "derived checkpoint has no progress document".into(),
+    })?;
+    if progress.length > limits::DOC_MAX_BYTES as u64 {
+        return refuse(Code::COUNT_CAP, "derived progress exceeds its byte cap");
+    }
+    let mut bytes = Vec::with_capacity(progress.length as usize);
+    store.read_into(&progress.sha256, &mut bytes)?;
+    if ObjectRef::of(&bytes) != *progress {
+        return refuse(
+            Code::OBJECT_ID_MISMATCH,
+            "derived progress differs from its ObjectRef",
+        );
+    }
+    let mut row = TransactionRow::from_value(&crate::canon::parse_canonical(
+        &bytes,
+        limits::DOC_MAX_BYTES,
+    )?)?;
+    if row.id != transaction
+        || row.declaration.as_deref() != Some(declaration)
+        || row.source_facts != sources
+        || row.state != TransactionState::Open
+        || row.current_session.is_some()
+        || row.highest_session != 0
+    {
+        return refuse(
+            Code::TRANSACTION_CONFLICT,
+            "derived checkpoint differs from current work or imports writer authority",
+        );
+    }
+    if progress_plan(&row) != link.plan {
+        return refuse(
+            Code::JOURNAL_STALE,
+            "derived checkpoint plan differs from its current work",
+        );
+    }
+    row.recovery_objects = crate::durability::local_documents(store, head)?;
+    Ok(row)
+}
+
+pub fn completed(
+    meta: &Meta,
+    transaction: &str,
+    writer_session: u64,
+) -> Result<(Vec<(String, String, String)>, Vec<String>)> {
+    let mut txn = meta.txn()?;
+    let row = open_row(&mut txn.rows, transaction, writer_session)?;
+    Ok((
+        row.added_parts
+            .iter()
+            .map(|p| (p.component.clone(), p.key.clone(), p.role.clone()))
+            .collect(),
+        row.added_configs.iter().map(|c| c.name.clone()).collect(),
+    ))
+}
+
+pub fn checkpoint_progress(
+    store: &Store,
+    meta: &Meta,
+    transaction: &str,
+    writer_session: u64,
+    operation: &str,
+    slot: &str,
+    previous: Option<&ObjectRef>,
+) -> Result<(String, crate::durability::Head)> {
+    let row = {
+        let mut txn = meta.txn()?;
+        progress_row(open_row(&mut txn.rows, transaction, writer_session)?)
+    };
+    let plan = progress_plan(&row);
+    let bytes = crate::canon::write(&row.to_value());
+    let chain = format!("{operation}/{slot}");
+    ascii_name("checkpoint operation", &chain, limits::MAX_NAME_BYTES)?;
+    let exported = crate::durability::checkpoint_bytes(
+        store,
+        &crate::durability::Policy {
+            chain: &chain,
+            operation: transaction,
+            plan: &plan,
+            interval: crate::durability::INTERVAL_BYTES,
+        },
+        previous,
+        &bytes,
+        added_objects(&row),
+        None,
+    )?;
+    let mut txn = meta.txn()?;
+    let current = open_row(&mut txn.rows, transaction, writer_session)?;
+    current.recovery_objects.extend(exported.roots);
+    current.normalize();
+    txn.commit()?;
+    Ok((plan, exported.head))
+}
+
+/// Persistent accepted work remains a GC root after its writer process disappears.
+pub(crate) fn gc_holds(store: &Store) -> Result<(Vec<crate::storage::HeldKey>, Vec<String>)> {
+    let mut roots = Vec::new();
+    let mut transactions = Vec::new();
+    for row in Meta::open(store)?.derived_rows()? {
+        let mut blobs = Vec::new();
+        let mut manifests = Vec::new();
+        match row.state {
+            TransactionState::Open => {
+                blobs.extend(added_objects(&row));
+                blobs.extend(row.recovery_objects);
+                manifests.extend(
+                    row.source_facts
+                        .iter()
+                        .map(|source| source.manifest.clone()),
+                );
+            }
+            TransactionState::Committed(Disposition::Pending) => {
+                blobs.extend(row.recovery_objects);
+                manifests.extend(row.manifest);
+            }
+            _ => continue,
+        }
+        transactions.push(row.id);
+        for (kind, objects) in [("blob", blobs), ("manifest", manifests)] {
+            for object in objects {
+                let key = if kind == "blob" {
+                    crate::storage::blob_key(&object.sha256)?
+                } else {
+                    crate::storage::manifest_key(&object.sha256)?
+                };
+                roots.push(crate::storage::HeldKey {
+                    key,
+                    kind: kind.into(),
+                    length: object.length,
+                    sha256: object.sha256,
+                });
+            }
+        }
+    }
+    Ok((roots, transactions))
 }
 
 fn open_row<'a>(
@@ -2052,14 +2357,6 @@ pub fn add_part<R: Read>(
     let (declaration, expected) = {
         let mut txn = meta.txn()?;
         let row = open_row(&mut txn.rows, &transaction, writer_session)?;
-        if row.added_parts.iter().any(|added| {
-            added.component == component && added.key == tensor_key && added.role == role
-        }) {
-            return refuse(
-                Code::TRANSACTION_CONFLICT,
-                format!("added value {component}/{tensor_key}#{role} was already written"),
-            );
-        }
         let declaration = declaration(row)?;
         let expected = declaration
             .components
@@ -2118,14 +2415,17 @@ pub fn add_part<R: Read>(
 
     let mut txn = meta.txn()?;
     let row = open_row(&mut txn.rows, &transaction, writer_session)?;
-    if row
+    if let Some(existing) = row
         .added_parts
         .iter()
-        .any(|added| added.component == component && added.key == tensor_key && added.role == role)
+        .find(|added| added.component == component && added.key == tensor_key && added.role == role)
     {
+        if existing.part == written.part {
+            return Ok(written);
+        }
         return refuse(
             Code::TRANSACTION_CONFLICT,
-            format!("added value {component}/{tensor_key}#{role} raced another writer"),
+            format!("added value {component}/{tensor_key}#{role} differs from accepted bytes"),
         );
     }
     row.added_parts.push(AddedPart {
@@ -2149,16 +2449,6 @@ pub fn add_config<R: Read>(
     {
         let mut txn = meta.txn()?;
         let row = open_row(&mut txn.rows, &transaction, writer_session)?;
-        if row
-            .added_configs
-            .iter()
-            .any(|added| added.name == config_name)
-        {
-            return refuse(
-                Code::TRANSACTION_CONFLICT,
-                format!("added config {config_name:?} was already written"),
-            );
-        }
         let declaration = declaration(row)?;
         if !declaration.configs.iter().any(|config| {
             matches!(
@@ -2190,14 +2480,17 @@ pub fn add_config<R: Read>(
 
     let mut txn = meta.txn()?;
     let row = open_row(&mut txn.rows, &transaction, writer_session)?;
-    if row
+    if let Some(existing) = row
         .added_configs
         .iter()
-        .any(|added| added.name == config_name)
+        .find(|added| added.name == config_name)
     {
+        if existing.config == config {
+            return Ok(());
+        }
         return refuse(
             Code::TRANSACTION_CONFLICT,
-            format!("added config {config_name:?} raced another writer"),
+            format!("added config {config_name:?} differs from accepted bytes"),
         );
     }
     row.added_configs.push(AddedConfig {
@@ -2417,8 +2710,6 @@ pub fn fence(meta: &Meta, transaction: &str, writer_session: u64) -> Result<bool
         return Ok(false);
     }
     row.current_session = None;
-    row.added_parts.clear();
-    row.added_configs.clear();
     txn.commit()?;
     Ok(true)
 }
@@ -2436,6 +2727,7 @@ pub fn abandon(store: &Store, meta: &Meta, transaction: &str) -> Result<Option<R
                 current_session: None,
                 added_parts: Vec::new(),
                 added_configs: Vec::new(),
+                recovery_objects: Vec::new(),
                 source_facts: Vec::new(),
                 inherited_payload_objects: 0,
                 inherited_payload_bytes: 0,
@@ -2460,6 +2752,7 @@ pub fn abandon(store: &Store, meta: &Meta, transaction: &str) -> Result<Option<R
                 row.state = TransactionState::Abandoned;
                 row.added_parts.clear();
                 row.added_configs.clear();
+                row.recovery_objects.clear();
                 None
             }
         },
@@ -2646,6 +2939,7 @@ pub fn dispose(store: &Store, meta: &Meta, transaction: &str) -> Result<Disposit
     }
 
     txn.rows[index].state = TransactionState::Committed(desired.clone());
+    txn.rows[index].recovery_objects.clear();
     let row = txn.rows[index].clone();
     txn.commit()?;
     roots::remove(store, &transaction)?;
@@ -2974,6 +3268,7 @@ mod tests {
             &transaction,
             1,
             Declaration {
+                work_fingerprint: Some(format!("sha256:{}", "44".repeat(32))),
                 sources: vec![Source {
                     alias: "source".into(),
                     manifest: manifest_ref,
@@ -2989,6 +3284,7 @@ mod tests {
                 order: vec![("model".into(), "weight".into())],
                 max_new_bytes: 0,
             },
+            None,
         )
         .unwrap();
         assert_eq!(begun.source_views.len(), 1);

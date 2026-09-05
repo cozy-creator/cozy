@@ -83,6 +83,8 @@ class PreparedModelSource(TypedDict):
     converted_roles: int
     resumed_roles: int
     deferred_ops: int
+    converted_bytes: int
+    largest_op_bytes: int
 
 class ManifestRow(TypedDict):
     manifest_id: str
@@ -358,6 +360,9 @@ class Operation:
 
 class DerivedWriter:
     def sources(self) -> list[Any]: ...
+    def completed_parts(self) -> list[tuple[str, str, str]]: ...
+    def completed_configs(self) -> list[str]: ...
+    def checkpoint(self, operation_id: str, slot: str, *, previous: tuple[str, int] | None = None) -> dict[str, str | int | None]: ...
     def source_read_into(
         self, source: str, component: str, key: str, role: str, off: int, into: object
     ) -> None: ...
@@ -490,6 +495,9 @@ class Store:
         configs: dict[str, Any],
         order: Sequence[tuple[str, str]],
         max_new_bytes: int,
+        *,
+        work_fingerprint: str,
+        checkpoint: tuple[str, int] | None = None,
     ) -> DerivedWriter: ...
     def derived_lookup(self, transaction_id: str) -> dict[str, Any]: ...
     def derived_fence(self, transaction_id: str, writer_session_id: int) -> bool: ...

@@ -285,123 +285,20 @@ pub fn checkpoint(
     previous: Option<&ObjectRef>,
     journal: &crate::ingest::journal::Journal,
 ) -> Result<Head> {
-    let selected = checkpoint_predecessor(store, policy, journal.local_head()?.as_ref(), previous)?;
-    let previous = selected.as_ref();
-    let prior = previous
-        .map(|head| local_chain(store, head, policy.plan))
-        .transpose()?;
-    if prior
-        .as_ref()
-        .is_some_and(|set| set.operation != policy.chain)
-    {
-        return refuse(
-            Code::CROSS_SUBJECT_REPLAY,
-            "checkpoint belongs to another operation slot",
-        );
-    }
-    let bytes = journal.snapshot()?;
-    if bytes.len() > limits::DOC_MAX_BYTES {
-        return refuse(
-            Code::COUNT_CAP,
-            "checkpoint progress exceeds the document byte cap",
-        );
-    }
-    if bytes.is_empty() {
-        return Ok(Head::default());
-    }
-    let progress = store
-        .put_stream_held(
-            &mut bytes.as_slice(),
-            Some(&ObjectRef::of(&bytes)),
-            &Default::default(),
-            Some(policy.operation),
-        )?
-        .obj;
-    let mut objects = journal.objects();
-    for object in &objects {
-        let record = match store.record_valid(&object.sha256) {
-            Ok(record) => record,
-            Err(_) => {
-                store.verify(&object.sha256)?;
-                store
-                    .record_valid(&object.sha256)
-                    .map_err(|detail| crate::err::Refusal {
-                        code: Code::OBJECT_ABSENT,
-                        detail,
-                    })?
-            }
-        };
-        if record.length != object.length {
-            return refuse(
-                Code::LENGTH_MISMATCH,
-                "checkpoint journal names the wrong object length",
-            );
-        }
-    }
-    objects.push(progress.clone());
-    objects = canonical_refs(objects);
-    let held: std::collections::BTreeSet<&str> = prior
-        .iter()
-        .flat_map(|set| set.blobs.iter().map(|object| object.sha256.as_str()))
-        .collect();
-    objects.retain(|object| !held.contains(object.sha256.as_str()));
-    let mut head = Head {
-        head: previous.cloned(),
-        links: prior.as_ref().map_or(0, |set| set.links),
-        bytes: prior.as_ref().map_or(0, |set| set.bytes),
-    };
-    if objects.is_empty() {
-        if let Some(head) = &head.head {
-            journal.save_head(head)?;
-        }
-        return Ok(head);
-    }
-    let pages = objects.chunks(CHECKPOINT_REFS);
-    let page_count = pages.len();
-    let mut candidates = vec![progress.clone()];
-    for (index, page) in pages.enumerate() {
-        if head.links >= MAX_SEGMENTS as u64 {
-            return refuse(Code::COUNT_CAP, "checkpoint chain exceeds its link cap");
-        }
-        head.bytes = page.iter().try_fold(head.bytes, |sum, object| {
-            sum.checked_add(object.length)
-                .ok_or_else(|| crate::err::Refusal {
-                    code: Code::COUNT_CAP,
-                    detail: "checkpoint byte watermark overflow".into(),
-                })
-        })?;
-        let link = Link {
-            operation: policy.chain.to_string(),
-            plan: policy.plan.to_string(),
-            prev: head.head.clone(),
-            index: head.links,
-            blobs: page.to_vec(),
-            manifests: Vec::new(),
-            bytes: head.bytes,
-            progress: if index + 1 == page_count {
-                Some(progress.clone())
-            } else {
-                None
-            },
-        };
-        let bytes = link.canonical_bytes();
-        let object = store
-            .put_stream_held(
-                &mut bytes.as_slice(),
-                Some(&ObjectRef::of(&bytes)),
-                &Default::default(),
-                Some(policy.operation),
-            )?
-            .obj;
-        candidates.push(object.clone());
-        head.head = Some(object);
-        head.links += 1;
-    }
-    crate::ingest::transaction::name_candidates(store.root(), policy.operation, &candidates)?;
-    if let Some(head) = &head.head {
+    let previous = checkpoint_predecessor(store, policy, journal.local_head()?.as_ref(), previous)?;
+    let exported = checkpoint_bytes(
+        store,
+        policy,
+        previous.as_ref(),
+        &journal.snapshot()?,
+        journal.objects(),
+        Some(policy.operation),
+    )?;
+    crate::ingest::transaction::name_candidates(store.root(), policy.operation, &exported.roots)?;
+    if let Some(head) = &exported.head.head {
         journal.save_head(head)?;
     }
-    Ok(head)
+    Ok(exported.head)
 }
 
 /// Extend the newest locally known chain while accepting delayed acknowledgments of its
@@ -467,9 +364,148 @@ pub(crate) fn checkpoint_predecessor(
     Ok(Some(newest.clone()))
 }
 
+pub(crate) struct CheckpointExport {
+    pub head: Head,
+    /// Checkpoint documents to retain under the producing transaction's own GC root.
+    pub roots: Vec<ObjectRef>,
+}
+
+/// The shared byte-plane export. Its opaque progress is interpreted only by its producer;
+/// source ingest and derived writers keep their existing journals and retention authorities.
+pub(crate) fn checkpoint_bytes(
+    store: &Store,
+    policy: &Policy<'_>,
+    previous: Option<&ObjectRef>,
+    bytes: &[u8],
+    mut objects: Vec<ObjectRef>,
+    hold: Option<&str>,
+) -> Result<CheckpointExport> {
+    let prior = previous
+        .map(|head| local_chain(store, head, policy.plan))
+        .transpose()?;
+    if prior
+        .as_ref()
+        .is_some_and(|set| set.operation != policy.chain)
+    {
+        return refuse(
+            Code::CROSS_SUBJECT_REPLAY,
+            "checkpoint belongs to another operation slot",
+        );
+    }
+    if bytes.len() > limits::DOC_MAX_BYTES {
+        return refuse(
+            Code::COUNT_CAP,
+            "checkpoint progress exceeds the document byte cap",
+        );
+    }
+    if bytes.is_empty() {
+        return Ok(CheckpointExport {
+            head: Head::default(),
+            roots: Vec::new(),
+        });
+    }
+    let progress = store
+        .put_stream_held(
+            &mut &*bytes,
+            Some(&ObjectRef::of(&bytes)),
+            &Default::default(),
+            hold,
+        )?
+        .obj;
+    for object in &objects {
+        let record = match store.record_valid(&object.sha256) {
+            Ok(record) => record,
+            Err(_) => {
+                store.verify(&object.sha256)?;
+                store
+                    .record_valid(&object.sha256)
+                    .map_err(|detail| crate::err::Refusal {
+                        code: Code::OBJECT_ABSENT,
+                        detail,
+                    })?
+            }
+        };
+        if record.length != object.length {
+            return refuse(
+                Code::LENGTH_MISMATCH,
+                "checkpoint journal names the wrong object length",
+            );
+        }
+    }
+    objects.push(progress.clone());
+    objects = canonical_refs(objects);
+    let held: std::collections::BTreeSet<&str> = prior
+        .iter()
+        .flat_map(|set| set.blobs.iter().map(|object| object.sha256.as_str()))
+        .collect();
+    objects.retain(|object| !held.contains(object.sha256.as_str()));
+    let mut head = Head {
+        head: previous.cloned(),
+        links: prior.as_ref().map_or(0, |set| set.links),
+        bytes: prior.as_ref().map_or(0, |set| set.bytes),
+    };
+    let mut roots = previous
+        .map(|head| local_documents(store, head))
+        .transpose()?
+        .unwrap_or_default();
+    roots.push(progress.clone());
+    if objects.is_empty() {
+        return Ok(CheckpointExport { head, roots });
+    }
+    let pages = objects.chunks(CHECKPOINT_REFS);
+    let page_count = pages.len();
+    for (index, page) in pages.enumerate() {
+        if head.links >= MAX_SEGMENTS as u64 {
+            return refuse(Code::COUNT_CAP, "checkpoint chain exceeds its link cap");
+        }
+        head.bytes = page.iter().try_fold(head.bytes, |sum, object| {
+            sum.checked_add(object.length)
+                .ok_or_else(|| crate::err::Refusal {
+                    code: Code::COUNT_CAP,
+                    detail: "checkpoint byte watermark overflow".into(),
+                })
+        })?;
+        let link = Link {
+            operation: policy.chain.to_string(),
+            plan: policy.plan.to_string(),
+            prev: head.head.clone(),
+            index: head.links,
+            blobs: page.to_vec(),
+            manifests: Vec::new(),
+            bytes: head.bytes,
+            progress: if index + 1 == page_count {
+                Some(progress.clone())
+            } else {
+                None
+            },
+        };
+        let bytes = link.canonical_bytes();
+        let object = store
+            .put_stream_held(
+                &mut bytes.as_slice(),
+                Some(&ObjectRef::of(&bytes)),
+                &Default::default(),
+                hold,
+            )?
+            .obj;
+        roots.push(object.clone());
+        head.head = Some(object);
+        head.links += 1;
+    }
+    Ok(CheckpointExport { head, roots })
+}
+
 /// Pin restored chain documents before their journal is installed. Tensor segments are
 /// subsequently held by that journal; every immutable link/progress document is retained here.
 pub fn retain_local_chain(store: &Store, head: &ObjectRef, operation: &str) -> Result<()> {
+    crate::ingest::transaction::name_candidates(
+        store.root(),
+        operation,
+        &local_documents(store, head)?,
+    )
+}
+
+pub(crate) fn local_documents(store: &Store, head: &ObjectRef) -> Result<Vec<ObjectRef>> {
     let mut cursor = Some(head.clone());
     let mut documents = Vec::new();
     while let Some(object) = cursor {
@@ -481,7 +517,7 @@ pub fn retain_local_chain(store: &Store, head: &ObjectRef, operation: &str) -> R
         documents.extend(link.progress);
         cursor = link.prev;
     }
-    crate::ingest::transaction::name_candidates(store.root(), operation, &documents)
+    Ok(documents)
 }
 
 /// Append one link and publish it. The segment goes into the local Store like any other

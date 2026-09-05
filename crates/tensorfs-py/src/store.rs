@@ -351,6 +351,7 @@ fn parse_declaration(
         }
     }
     let mut declaration = Declaration {
+        work_fingerprint: None,
         sources: source_rows,
         components,
         configs: config_rows,
@@ -812,6 +813,8 @@ impl PyStore {
         out.set_item("converted_roles", prepared.converted_roles)?;
         out.set_item("resumed_roles", prepared.resumed_roles)?;
         out.set_item("deferred_ops", prepared.deferred_ops)?;
+        out.set_item("converted_bytes", prepared.converted_bytes)?;
+        out.set_item("largest_op_bytes", prepared.largest_op_bytes)?;
         let rows = PyList::empty(py);
         for source in prepared.sources {
             let row = PyDict::new(py);
@@ -1442,7 +1445,7 @@ impl PyStore {
     // PyO3 exposes these as six named boundary fields. Packing them into an opaque dict
     // would only move the arity into hand parsing and weaken the typed facade.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (transaction_id, writer_session_id, sources, targets, configs, order, max_new_bytes))]
+    #[pyo3(signature = (transaction_id, writer_session_id, sources, targets, configs, order, max_new_bytes, *, work_fingerprint, checkpoint=None))]
     fn begin_derived(
         &self,
         py: Python<'_>,
@@ -1453,8 +1456,15 @@ impl PyStore {
         configs: &Bound<'_, PyDict>,
         order: Vec<(String, String)>,
         max_new_bytes: u64,
+        work_fingerprint: &str,
+        checkpoint: Option<(String, u64)>,
     ) -> PyResult<PyDerivedWriter> {
-        let declaration = parse_declaration(py, sources, targets, configs, order, max_new_bytes)?;
+        let mut declaration =
+            parse_declaration(py, sources, targets, configs, order, max_new_bytes)?;
+        declaration.work_fingerprint = Some(work_fingerprint.to_string());
+        let checkpoint = checkpoint
+            .map(|(id, length)| obj_ref(py, &id, length))
+            .transpose()?;
         let begin = py
             .detach(|| {
                 derived::begin(
@@ -1463,6 +1473,7 @@ impl PyStore {
                     transaction_id,
                     writer_session_id,
                     declaration,
+                    checkpoint.as_ref(),
                 )
             })
             .or_refuse(py)?;
@@ -1713,6 +1724,56 @@ impl PyDerivedWriter {
     /// Effective exact sources after TensorFS has checked installed identity and closure.
     fn sources<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyList>> {
         source_facts(py, &self.source_views)
+    }
+
+    /// Accepted part keys only; object identities stay behind the Runtime capability.
+    fn completed_parts(&self, py: Python<'_>) -> PyResult<Vec<(String, String, String)>> {
+        py.detach(|| {
+            derived::completed(&self.meta, &self.transaction_id, self.writer_session_id)
+                .map(|(parts, _)| parts)
+        })
+        .or_refuse(py)
+    }
+
+    fn completed_configs(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        py.detach(|| {
+            derived::completed(&self.meta, &self.transaction_id, self.writer_session_id)
+                .map(|(_, configs)| configs)
+        })
+        .or_refuse(py)
+    }
+
+    #[pyo3(signature = (operation_id, slot, *, previous=None))]
+    fn checkpoint<'p>(
+        &self,
+        py: Python<'p>,
+        operation_id: &str,
+        slot: &str,
+        previous: Option<(String, u64)>,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let previous = previous
+            .map(|(id, length)| obj_ref(py, &id, length))
+            .transpose()?;
+        let (plan, head) = py
+            .detach(|| {
+                derived::checkpoint_progress(
+                    &self.store,
+                    &self.meta,
+                    &self.transaction_id,
+                    self.writer_session_id,
+                    operation_id,
+                    slot,
+                    previous.as_ref(),
+                )
+            })
+            .or_refuse(py)?;
+        let out = PyDict::new(py);
+        out.set_item("plan_digest", plan)?;
+        out.set_item("head", head.head.as_ref().map(ObjectRef::id))?;
+        out.set_item("head_length", head.head.as_ref().map_or(0, |r| r.length))?;
+        out.set_item("index", head.links.saturating_sub(1))?;
+        out.set_item("bytes", head.bytes)?;
+        Ok(out)
     }
 
     /// Read one semantic source-part range through its pinned verified descriptor set.

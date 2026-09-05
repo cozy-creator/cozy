@@ -803,6 +803,8 @@ pub struct PreparedModelSources {
     pub converted_roles: usize,
     pub resumed_roles: usize,
     pub deferred_ops: usize,
+    pub converted_bytes: u64,
+    pub largest_op_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1220,6 +1222,8 @@ fn prepare_model_source_with_registry(
                 converted_roles: 0,
                 resumed_roles: 0,
                 deferred_ops: 0,
+                converted_bytes: 0,
+                largest_op_bytes: 0,
             });
         }
         crate::catalog::SourcePreparation::Open(writer) => writer,
@@ -1234,8 +1238,11 @@ fn prepare_model_source_with_registry(
         converted_roles: 0,
         resumed_roles: 0,
         deferred_ops: 0,
+        converted_bytes: 0,
+        largest_op_bytes: 0,
     };
     let mut needed = std::collections::BTreeSet::new();
+    let mut budget = transaction::Budget::new(durability::INTERVAL_BYTES);
     for (requested, (plan_hex, prepared)) in request.profiles.iter().zip(plans) {
         let plan_digest = format!("sha256:{plan_hex}");
         let chain = format!("{}/{}", request.operation_id, requested.slot);
@@ -1290,6 +1297,7 @@ fn prepare_model_source_with_registry(
             transaction::Carriers::Ready(&ready),
             None,
             &mut journal,
+            Some(&mut budget),
         )?;
         let checkpoint = durability::checkpoint(
             store,
@@ -1311,6 +1319,8 @@ fn prepare_model_source_with_registry(
         }
         needed.extend(progress.needed);
         result.converted_roles += progress.converted_roles;
+        result.converted_bytes += progress.written;
+        result.largest_op_bytes = budget.largest_op;
         result.resumed_roles += progress.resumed_roles;
         result.deferred_ops += progress.deferred_ops;
         if let Some(outcome) = outcome {
