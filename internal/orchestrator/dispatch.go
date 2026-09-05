@@ -1510,7 +1510,7 @@ func inputBindings(req records.Request, payloadDigest string) []*pb.InputBinding
 			InputId: "model:" + model.Slot, Digest: model.Manifest,
 			Length:   uint64(model.ManifestLength),
 			KindMime: "application/vnd.cozy.model-manifest",
-			Order:    uint32(len(rows)),
+			Order:    0, // each Model is a scalar parameter, not an element of one shared list
 		})
 	}
 	order := uint32(len(rows))

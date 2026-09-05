@@ -2,7 +2,6 @@ package cli
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/accountauth"
@@ -46,7 +45,7 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	if len(ctx.Inv.Args) == 1 && family == "" {
 		if ref, problem := hub.ParseRef(ctx.Inv.Args[0]); problem == nil {
 			if kind == "model" {
-				return handleModelShow(ctx, ref)
+				return handleModelSearchRef(ctx, ref)
 			}
 			return handlePackageShow(ctx, ref)
 		}
@@ -78,25 +77,26 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 		resources = resources[:limit]
 	}
 
-	l := output.List{Name: kind + "s", Fields: []string{"ref", "latest"},
-		AllFields: []string{"ref", "latest", "created", "org", "name"}, Total: search.Total}
 	if kind == "model" {
-		l.Fields = []string{"model", "family", "lanes"}
-		l.AllFields = []string{"model", "family", "lanes", "created", "org", "name"}
-	}
-	for _, r := range resources {
-		row := map[string]string{
-			"ref": r.Ref(), "latest": r.LatestRelease,
-			"created": stamp(r.CreatedAt), "org": r.Org, "name": r.Name,
-		}
-		if kind == "model" {
-			card, problem := c.ModelCard(hctx, hub.Ref{Org: r.Org, Name: r.Name})
+		cards := make([]hub.ModelCard, 0, len(resources))
+		for _, resource := range resources {
+			card, problem := c.ModelCard(hctx, hub.Ref{Org: resource.Org, Name: resource.Name})
 			if problem != nil {
 				return problem
 			}
-			row = modelSearchRow(card)
+			cards = append(cards, card)
 		}
-		l.Rows = append(l.Rows, row)
+		var notes []string
+		if search.Capped || search.Total > len(resources) {
+			notes = append(notes, fmt.Sprintf("Showing releases for %d of %d matching models", len(resources), search.Total))
+		}
+		return emit(ctx, modelSearchView{Cards: cards, Notes: notes})
+	}
+	l := output.List{Name: kind + "s", Fields: []string{"ref", "latest"},
+		AllFields: []string{"ref", "latest", "created", "org", "name"}, Total: search.Total}
+	for _, r := range resources {
+		l.Rows = append(l.Rows, map[string]string{"ref": r.Ref(), "latest": r.LatestRelease,
+			"created": stamp(r.CreatedAt), "org": r.Org, "name": r.Name})
 	}
 
 	// The public listing is a whole-catalog read filtered here. That is honest at a
@@ -115,47 +115,14 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	return emit(ctx, l)
 }
 
-func handleModelShow(ctx *Context, ref hub.Ref) *exit.Error {
-	c := client(ctx)
+func handleModelSearchRef(ctx *Context, ref hub.Ref) *exit.Error {
 	hctx, cancel := hub.Context()
 	defer cancel()
-	card, problem := c.ModelCard(hctx, ref)
+	card, problem := client(ctx).ModelCard(hctx, ref)
 	if problem != nil {
 		return problem
 	}
-	return emit(ctx, output.List{
-		Name: "models", Fields: []string{"model", "family", "lanes"},
-		AllFields: []string{"model", "family", "lanes", "created", "org", "name"},
-		Rows:      []map[string]string{modelSearchRow(card)}, Total: 1,
-	})
-}
-
-func modelSearchRow(card hub.ModelCard) map[string]string {
-	seen := map[string]bool{}
-	for _, release := range card.Releases {
-		if release.Yanked {
-			continue
-		}
-		releaseName := strings.TrimSpace(release.Release)
-		if releaseName == "" {
-			continue
-		}
-		for _, lane := range release.Lanes {
-			if name := strings.TrimSpace(lane.Lane); name != "" {
-				seen[releaseName+"/"+name] = true
-			}
-		}
-	}
-	coordinates := make([]string, 0, len(seen))
-	for coordinate := range seen {
-		coordinates = append(coordinates, coordinate)
-	}
-	sort.Strings(coordinates)
-	return map[string]string{
-		"model": card.Model.Ref(), "family": card.Model.Family,
-		"lanes":   strings.Join(coordinates, ", "),
-		"created": stamp(card.Model.CreatedAt), "org": card.Model.Org, "name": card.Model.Name,
-	}
+	return emit(ctx, modelSearchView{Cards: []hub.ModelCard{card}})
 }
 
 func handleModelFamily(ctx *Context) *exit.Error {

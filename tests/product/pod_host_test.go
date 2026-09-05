@@ -72,6 +72,8 @@ type fakePod struct {
 	// serve makes every accepted placement_set converge at once: STAGED, DISPATCHABLE,
 	// every entrypoint advertised, one free seat. Offers are recorded, never answered.
 	serve bool
+	// jobReady advertises the independent job seat after accepting a JobDirective.
+	jobReady bool
 	// slots is the advertised seat count while serving; zero means one.
 	slots uint32
 	// downloadSamples is how many DOWNLOADING events the prepare stream reports before
@@ -272,6 +274,18 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			}
 			latched, serve := p.latch != nil, p.serve
 			p.mu.Unlock()
+			if p.jobReady && m.DesiredState.GetJob() != nil {
+				d := m.DesiredState
+				if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: &pb.ObservedWorkerState{
+					RecordOwnerEpoch: d.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: podBootID,
+					AcceptedDesiredStateRevision: d.Revision, ConvergedRevision: d.Revision,
+					WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE, AppliedWireMinor: pb.WireMinor,
+					AdmissionState: pb.AdmissionState_ADMISSION_STATE_OPEN, AdmissionEpoch: 7,
+					AvailableAttemptSlots: 1, JobCapacity: &pb.JobCapacity{JobsAvailable: 1},
+				}}}); err != nil {
+					return err
+				}
+			}
 			if serve && m.DesiredState.GetPlacementSet() != nil {
 				if frame := p.served(m.DesiredState, 1); frame != nil {
 					if err := stream.Send(frame); err != nil {
