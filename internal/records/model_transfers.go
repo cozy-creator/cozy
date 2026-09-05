@@ -383,12 +383,13 @@ func (s *Store) RecordModelTransferSourceStatus(row ModelTransferSourceStatus) *
 	if newBoot && row.CapabilityRevision < held.CapabilityRevision {
 		return exit.Named(exit.Conflict, "model_transfer.source_status_superseded", "new worker source status precedes its declaration")
 	}
-	if !newBoot && row.State == "converted" {
-		row.Transferred = held.Transferred
+	if !newBoot {
+		row.Transferred = max(row.Transferred, held.Transferred)
 	}
 	advancedRevision := row.CapabilityRevision > held.CapabilityRevision
+	retryVerdict := row.State == "accepted" && row.SafeCode != "" && row.CapabilityRevision == held.CapabilityRevision
 	advancedState := row.CapabilityRevision == held.CapabilityRevision &&
-		sourceStateRank(row.State) >= sourceStateRank(held.State)
+		(sourceStateRank(row.State) >= sourceStateRank(held.State) || retryVerdict)
 	absorbing := (held.State == "verified" || held.State == "converted" || held.State == "failed") && !advancedRevision
 	if !newBoot && (row.Transferred < held.Transferred || (!advancedRevision && !advancedState) || absorbing) {
 		// A VERDICT IS ABOUT THE MEMBER, NOT ABOUT THE REVISION THAT CARRIED IT. A FAILED

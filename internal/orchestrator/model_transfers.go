@@ -290,6 +290,14 @@ func (c *Orchestrator) forgetTransferProgress(requestID string) {
 	c.ForgetPhase(requestID)
 }
 
+type sourceCapabilityRetry struct {
+	revision int64
+	bytes    int64
+	delay    time.Duration
+	after    time.Time
+	sent     bool
+}
+
 func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req records.Request,
 	intent records.ModelTransferIntent, capabilities []ModelSourceCapability,
 ) ([]ModelRef, *exit.Error) {
@@ -327,8 +335,10 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 	sort.Strings(members)
 	stream, phase := "", ""
 	declarations := map[string]int64{}
+	retries := map[string]sourceCapabilityRetry{}
+	retryWake := func(delay time.Duration) { time.AfterFunc(delay, func() { c.signalTransfer(req.ID) }) }
 	preparedCount := -1
-	preparedRecovery := ""
+	preparedRecovery, preparedObservation := "", ""
 	preparing := false
 	var replyRevision uint64
 	for {
@@ -405,6 +415,7 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		c.mu.Unlock()
 		if currentStream != stream {
 			stream, phase = currentStream, "declaring"
+			retries = map[string]sourceCapabilityRetry{}
 			c.ForgetPhase(req.ID)
 			preparedCount, preparing, replyRevision = -1, false, replies
 			if problem := declare(); problem != nil {
@@ -418,7 +429,7 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 			status := byStatus[member]
 			allDeclared = allDeclared && status.WorkerBootID == session.bootID && status.CapabilityRevision >= declarations[member]
 		}
-		checkpoints, recovery, problem := c.acknowledgedSourceCheckpoints(req.ID)
+		checkpoints, recovery, observation, problem := c.sourceCheckpointHeads(req.ID, session.bootID)
 		if problem != nil {
 			return nil, problem
 		}
@@ -457,13 +468,64 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 			}
 			phase = "running"
 		}
+		if phase == "running" {
+			for _, member := range members {
+				status := byStatus[member]
+				if status.State != "accepted" || status.SafeCode == "" {
+					continue
+				}
+				retry, known := retries[member]
+				if !known || retry.revision != status.CapabilityRevision {
+					delay := time.Second
+					if known && status.Transferred <= retry.bytes {
+						delay = min(30*time.Second, retry.delay*2)
+					}
+					retry = sourceCapabilityRetry{revision: status.CapabilityRevision, bytes: status.Transferred, delay: delay, after: time.Now().Add(delay)}
+					retries[member] = retry
+					retryWake(delay)
+					continue
+				}
+				if retry.sent || time.Now().Before(retry.after) {
+					continue
+				}
+				refreshed, problem := c.opt.ModelTransfers.RefreshRemoteSource(ctx, intent)
+				if problem != nil {
+					if permanentTransferFailure(problem) {
+						return nil, problem
+					}
+					retry.delay = min(30*time.Second, retry.delay*2)
+					retry.after = time.Now().Add(retry.delay)
+					retries[member] = retry
+					retryWake(retry.delay)
+					continue
+				}
+				found := false
+				for _, access := range refreshed {
+					if access.Member == member {
+						if access.ObjectID != "sha256:"+expected[member].SHA256 || access.Length != expected[member].Length || access.URL == "" {
+							return nil, exit.Named(exit.Conflict, "model_transfer.source_capability_changed", "refreshed source retry changed the selected member")
+						}
+						byMember[member], found = access, true
+					}
+				}
+				if !found {
+					return nil, exit.Internalf("source retry lost its selected member")
+				}
+				if problem := send(member, byMember[member].URL, status.CapabilityRevision+1); problem != nil {
+					return nil, problem
+				}
+				retry.sent = true
+				retries[member] = retry
+				c.logf("model transfer %s: refreshed source access for %s after %s", req.ID, member, status.SafeCode)
+			}
+		}
 		if retryDue && !preparing {
 			preparedCount = -1
 			if phase == "probing" {
 				phase = "probe"
 			}
 		}
-		if !blocked && !preparing && (phase == "probe" || (phase == "running" && (preparedCount != fulfilled || preparedRecovery != recovery))) {
+		if !blocked && !preparing && (phase == "probe" || (phase == "running" && (preparedCount != fulfilled || preparedRecovery != recovery || preparedObservation != observation))) {
 			profiles := make([]*pb.ModelSourceProfile, 0, len(intent.SourceProfiles))
 			for slot, profile := range intent.SourceProfiles {
 				profiles = append(profiles, &pb.ModelSourceProfile{Slot: slot, Profile: profile})
@@ -477,7 +539,7 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 					SourceUri: intent.Source, DeclaredLicense: intent.SourceLicense}}}) {
 				return nil, exit.Unavailablef("source preparation control stream closed")
 			}
-			preparing, preparedCount, preparedRecovery = true, fulfilled, recovery
+			preparing, preparedCount, preparedRecovery, preparedObservation = true, fulfilled, recovery, observation
 			if phase == "probe" {
 				phase = "probing"
 			}

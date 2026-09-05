@@ -112,12 +112,12 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 	if state == "" {
 		return
 	}
-	previous := ""
+	previous, previousCode := "", ""
 	var previousRevision int64
 	if statuses, problem := c.opt.Store.ModelTransferSourceStatuses(frame.OperationId); problem == nil {
 		for _, status := range statuses {
 			if status.Member == frame.Member {
-				previous, previousRevision = status.State, status.CapabilityRevision
+				previous, previousCode, previousRevision = status.State, status.SafeCode, status.CapabilityRevision
 			}
 		}
 	}
@@ -204,7 +204,7 @@ func (c *Orchestrator) onModelSourceFileStatus(s *session, frame *pb.ModelSource
 	// counts reach the live view above, which is where they were already going; the
 	// preparer decides on a member's STATE. Session attach, session drop and cancellation
 	// each signal on their own, so nothing it waits on is left without a wake.
-	if state != previous || int64(frame.CapabilityRevision) != previousRevision {
+	if state != previous || int64(frame.CapabilityRevision) != previousRevision || frame.SafeCode != previousCode {
 		c.signalTransfer(frame.OperationId)
 	}
 }
@@ -331,14 +331,17 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 
 // Only remotely acknowledged heads travel back to a worker. Local observations
 // may refer to bytes that vanished with the previous pod.
-func (c *Orchestrator) acknowledgedSourceCheckpoints(requestID string) ([]*pb.ModelSourceCheckpoint, string, *exit.Error) {
+func (c *Orchestrator) sourceCheckpointHeads(requestID, bootID string) ([]*pb.ModelSourceCheckpoint, string, string, *exit.Error) {
 	progress, problem := c.opt.Store.ModelSourceProgress(requestID)
 	if problem != nil {
-		return nil, "", problem
+		return nil, "", "", problem
 	}
 	var out []*pb.ModelSourceCheckpoint
-	var heads []string
+	var heads, observed []string
 	for _, slot := range progress {
+		if slot.WorkerBootID == bootID {
+			observed = append(observed, slot.Observed.Slot+"="+slot.Observed.HeadID)
+		}
 		checkpoint := slot.Acknowledged
 		if checkpoint == nil {
 			continue
@@ -346,12 +349,12 @@ func (c *Orchestrator) acknowledgedSourceCheckpoints(requestID string) ([]*pb.Mo
 		head, headErr := canonical.Raw(checkpoint.HeadID)
 		plan, planErr := canonical.Raw(checkpoint.PlanDigest)
 		if headErr != nil || planErr != nil {
-			return nil, "", exit.Internalf("stored source checkpoint has malformed identity")
+			return nil, "", "", exit.Internalf("stored source checkpoint has malformed identity")
 		}
 		out = append(out, &pb.ModelSourceCheckpoint{Slot: checkpoint.Slot,
 			Head: &pb.Ref{Digest: head, Length: uint64(checkpoint.HeadLength)}, PlanDigest: plan,
 			Index: uint64(checkpoint.Index), Bytes: uint64(checkpoint.Bytes)})
 		heads = append(heads, checkpoint.Slot+"="+checkpoint.HeadID)
 	}
-	return out, strings.Join(heads, ","), nil
+	return out, strings.Join(heads, ","), strings.Join(observed, ","), nil
 }
