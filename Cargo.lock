@@ -392,7 +392,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tensorfs-core"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "fs2",
  "minicbor",
@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-py"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "pyo3",
  "tensorfs-core",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "winapi"
-version = "0.3.9"
+version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
 dependencies = [
