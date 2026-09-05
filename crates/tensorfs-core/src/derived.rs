@@ -6,6 +6,8 @@
 //! additions through the ordinary object writer. There is no filename inference, model
 //! vocabulary, Torch, schedule, publication, or serving decision here.
 
+mod roots;
+
 use std::collections::HashSet;
 use std::io::Read;
 
@@ -820,7 +822,21 @@ impl TransactionState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Disposition {
     Pending,
+    Adopted(String),
     Released,
+}
+
+impl Disposition {
+    fn to_value(&self) -> Value {
+        match self {
+            Self::Pending => Value::obj(vec![("kind", Value::str("pending"))]),
+            Self::Released => Value::obj(vec![("kind", Value::str("released"))]),
+            Self::Adopted(root) => Value::obj(vec![
+                ("kind", Value::str("adopted")),
+                ("scratch_root_id", Value::str(root.clone())),
+            ]),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -998,13 +1014,18 @@ impl TransactionRow {
             None => None,
             Some(value) => {
                 let mut df = Fields::new("DerivedTransaction.disposition", value)?;
-                let kind = df.req_str("kind")?;
-                df.done()?;
-                Some(match kind {
+                let disposition = match df.req_str("kind")? {
                     "pending" => Disposition::Pending,
                     "released" => Disposition::Released,
+                    "adopted" => {
+                        let root = df.req_str("scratch_root_id")?;
+                        name("private scratch root", root)?;
+                        Disposition::Adopted(root.into())
+                    }
                     _ => return refuse(Code::UNKNOWN_FIELD, "invalid derived root disposition"),
-                })
+                };
+                df.done()?;
+                Some(disposition)
             }
         };
         f.done()?;
@@ -1249,10 +1270,7 @@ impl TransactionRow {
             fields.push(("manifest".to_string(), manifest.to_value()));
         }
         if let TransactionState::Committed(disposition) = &self.state {
-            let value = match disposition {
-                Disposition::Pending => Value::obj(vec![("kind", Value::str("pending"))]),
-                Disposition::Released => Value::obj(vec![("kind", Value::str("released"))]),
-            };
+            let value = disposition.to_value();
             fields.push(("disposition".to_string(), value));
         }
         Value::map(fields)
@@ -2343,6 +2361,7 @@ pub fn commit(
             "the addition set changed while commit constructed the target; retry commit",
         );
     }
+    roots::pending(store, &transaction, &manifest_ref)?;
     row.state = TransactionState::Committed(Disposition::Pending);
     row.current_session = None;
     row.header = Some(header_ref);
@@ -2358,7 +2377,7 @@ pub fn commit(
 pub enum Lookup {
     Absent,
     Open { writer_session: Option<u64> },
-    Committed(Box<ReceiptFacts>),
+    Committed(Box<DispositionResult>),
     Abandoned,
 }
 
@@ -2372,8 +2391,12 @@ pub fn lookup(store: &Store, meta: &Meta, transaction: &str) -> Result<Lookup> {
         TransactionState::Open => Ok(Lookup::Open {
             writer_session: row.current_session,
         }),
-        TransactionState::Committed(_) => {
-            Ok(Lookup::Committed(Box::new(receipt_from(store, row)?)))
+        TransactionState::Committed(ref recorded) => {
+            let disposition = effective_disposition(store, row, recorded)?;
+            Ok(Lookup::Committed(Box::new(DispositionResult {
+                receipt: receipt_from(store, row)?,
+                disposition,
+            })))
         }
         TransactionState::Abandoned => Ok(Lookup::Abandoned),
     }
@@ -2406,7 +2429,7 @@ pub fn abandon(store: &Store, meta: &Meta, transaction: &str) -> Result<Option<R
     let result = match txn.rows.iter_mut().find(|row| row.id == transaction) {
         None => {
             txn.rows.push(TransactionRow {
-                id: transaction,
+                id: transaction.clone(),
                 declaration: None,
                 state: TransactionState::Abandoned,
                 highest_session: 0,
@@ -2446,6 +2469,7 @@ pub fn abandon(store: &Store, meta: &Meta, transaction: &str) -> Result<Option<R
         return Ok(Some(receipt_from(store, &row)?));
     }
     txn.commit()?;
+    roots::remove(store, &transaction)?;
     Ok(None)
 }
 
@@ -2457,18 +2481,126 @@ pub struct DispositionResult {
 
 impl DispositionResult {
     pub fn to_value(&self) -> Value {
-        let disposition = match &self.disposition {
-            Disposition::Pending => Value::obj(vec![("kind", Value::str("pending"))]),
-            Disposition::Released => Value::obj(vec![("kind", Value::str("released"))]),
-        };
+        let disposition = self.disposition.to_value();
         Value::obj(vec![
             ("disposition", disposition),
             ("receipt", self.receipt.to_value()),
         ])
     }
 
+    pub fn disposition_value(&self) -> Value {
+        self.disposition.to_value()
+    }
+
     pub fn receipt(&self) -> &ReceiptFacts {
         &self.receipt
+    }
+}
+
+/// Retain a committed result under an opaque private root. The name is supplied by the
+/// RecordOwner; TensorFS neither derives that name nor fabricates a model repository.
+pub fn adopt(
+    store: &Store,
+    meta: &Meta,
+    transaction: &str,
+    scratch_root_id: &str,
+) -> Result<DispositionResult> {
+    let transaction = transaction_id(transaction)?;
+    name("private scratch root", scratch_root_id)?;
+    let mut txn = meta.txn()?;
+    let index = txn
+        .rows
+        .iter()
+        .position(|row| row.id == transaction)
+        .ok_or_else(|| Refusal {
+            code: Code::ROOT_ABSENT,
+            detail: format!("no derived transaction {transaction}"),
+        })?;
+    let desired = Disposition::Adopted(scratch_root_id.into());
+    match &txn.rows[index].state {
+        TransactionState::Committed(Disposition::Pending) => {}
+        TransactionState::Committed(existing) if existing == &desired => {
+            let row = txn.rows[index].clone();
+            roots::adopt(
+                store,
+                &transaction,
+                row.manifest.as_ref().expect("committed manifest"),
+                scratch_root_id,
+            )?;
+            drop(txn);
+            return Ok(DispositionResult {
+                receipt: receipt_from(store, &row)?,
+                disposition: desired,
+            });
+        }
+        TransactionState::Committed(_) => {
+            return refuse(
+                Code::DISPOSITION_CONFLICT,
+                "derived result was adopted under another name or already released",
+            )
+        }
+        _ => {
+            return refuse(
+                Code::TRANSACTION_CLOSED,
+                "only a committed result can be adopted",
+            )
+        }
+    }
+    if txn.rows.iter().any(|row| {
+        row.id != transaction && row.state == TransactionState::Committed(desired.clone())
+    }) {
+        return refuse(
+            Code::DISPOSITION_CONFLICT,
+            "private scratch root already names another transaction",
+        );
+    }
+    roots::adopt(
+        store,
+        &transaction,
+        txn.rows[index].manifest.as_ref().ok_or_else(|| Refusal {
+            code: Code::ARTIFACT_INCOMPLETE,
+            detail: "committed transaction has no manifest".into(),
+        })?,
+        scratch_root_id,
+    )?;
+    txn.rows[index].state = TransactionState::Committed(desired.clone());
+    let row = txn.rows[index].clone();
+    txn.commit()?;
+    Ok(DispositionResult {
+        receipt: receipt_from(store, &row)?,
+        disposition: desired,
+    })
+}
+
+/// Committed output is retained while awaiting the owner and after private adoption.
+/// Once disposed, ordinary repository roots alone decide whether its bytes remain live.
+pub(crate) fn retained_manifests(store: &Store) -> Result<Vec<ObjectRef>> {
+    Ok(roots::all(store)?
+        .into_iter()
+        .map(|root| root.manifest)
+        .collect())
+}
+
+fn effective_disposition(
+    store: &Store,
+    row: &TransactionRow,
+    recorded: &Disposition,
+) -> Result<Disposition> {
+    if recorded == &Disposition::Released {
+        return Ok(Disposition::Released);
+    }
+    match roots::read(store, &row.id)? {
+        Some(root) => {
+            if row.manifest.as_ref() != Some(&root.manifest) {
+                return refuse(
+                    Code::DISPOSITION_CONFLICT,
+                    "private root differs from its committed receipt",
+                );
+            }
+            Ok(root.name.map_or(Disposition::Pending, Disposition::Adopted))
+        }
+        None if recorded == &Disposition::Pending => Ok(Disposition::Pending),
+        None => refuse(Code::DURABILITY_UNPROVEN, "adopted private root is absent"),
     }
 }
 
@@ -2489,10 +2621,11 @@ pub fn dispose(store: &Store, meta: &Meta, transaction: &str) -> Result<Disposit
     })?;
     let desired = Disposition::Released;
     match &txn.rows[index].state {
-        TransactionState::Committed(Disposition::Pending) => {}
+        TransactionState::Committed(Disposition::Pending | Disposition::Adopted(_)) => {}
         TransactionState::Committed(existing) if existing == &desired => {
             let row = txn.rows[index].clone();
             drop(txn);
+            roots::remove(store, &transaction)?;
             return Ok(DispositionResult {
                 receipt: receipt_from(store, &row)?,
                 disposition: desired,
@@ -2515,6 +2648,7 @@ pub fn dispose(store: &Store, meta: &Meta, transaction: &str) -> Result<Disposit
     txn.rows[index].state = TransactionState::Committed(desired.clone());
     let row = txn.rows[index].clone();
     txn.commit()?;
+    roots::remove(store, &transaction)?;
     Ok(DispositionResult {
         receipt: receipt_from(store, &row)?,
         disposition: desired,
@@ -2526,6 +2660,196 @@ mod tests {
     use super::*;
     use crate::header::{Closure, Part, Tensor};
     use crate::ids::Doc;
+
+    fn created_declaration() -> Declaration {
+        let encoding = registry::seeds()
+            .into_iter()
+            .find(|seed| seed.alias == "plain/1")
+            .unwrap()
+            .spec
+            .object_id();
+        Declaration {
+            sources: Vec::new(),
+            components: vec![ComponentDeclaration {
+                target: "model".into(),
+                source: None,
+                source_component: None,
+                drop: Vec::new(),
+                add: vec![TensorDeclaration {
+                    key: "weight".into(),
+                    dtype: Dtype::F32,
+                    shape: vec![512],
+                    encoding,
+                    parts: vec![PartDeclaration {
+                        role: "value".into(),
+                        dtype: Dtype::F32,
+                        shape: vec![512],
+                    }],
+                }],
+            }],
+            configs: Vec::new(),
+            order: vec![("model".into(), "weight".into())],
+            max_new_bytes: 2048,
+        }
+    }
+
+    #[test]
+    fn private_adoption_retains_real_payload_until_dispose_without_a_repository() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-private-adopt-{}",
+            crate::meta::now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let meta = Meta::open(&store).unwrap();
+        let id = format!("sha256:{}", "55".repeat(32));
+        let writer = begin(&store, &meta, &id, 1, created_declaration()).unwrap();
+        let bytes = vec![0x11; 2048];
+        let written = add_part(
+            &store,
+            &meta,
+            &id,
+            1,
+            ("model", "weight", "value"),
+            &mut bytes.as_slice(),
+        )
+        .unwrap();
+        let receipt = commit(&store, &meta, &id, 1).unwrap();
+        writer.writer_hold.release(&meta).unwrap();
+        let payload = &written.part.segments()[0];
+
+        // The owner has not answered yet: even this pending result is rooted after its
+        // writer is gone, closing the commit-to-finalize GC window.
+        crate::gc::collect(&root, false).unwrap();
+        assert!(store.contains(&payload.sha256));
+        store.read_manifest(&receipt.manifest).unwrap();
+        // Crash after the private name reached disk but before its SQL lifecycle update.
+        roots::adopt(&store, &id, &receipt.manifest, "private-root").unwrap();
+        let Lookup::Committed(observed) = lookup(&store, &meta, &id).unwrap() else {
+            panic!("committed output missing")
+        };
+        assert_eq!(
+            observed.disposition_value(),
+            Disposition::Adopted("private-root".into()).to_value()
+        );
+        assert_eq!(
+            adopt(&store, &meta, &id, "different-root")
+                .unwrap_err()
+                .code,
+            Code::DISPOSITION_CONFLICT
+        );
+        let adopted = adopt(&store, &meta, &id, "private-root").unwrap();
+        assert_eq!(adopted.receipt().to_value(), receipt.to_value());
+        let reopened = Meta::open(&store).unwrap();
+        assert_eq!(
+            adopt(&store, &reopened, &id, "private-root")
+                .unwrap()
+                .to_value(),
+            adopted.to_value()
+        );
+        assert_eq!(
+            adopt(&store, &reopened, &id, "different-root")
+                .unwrap_err()
+                .code,
+            Code::DISPOSITION_CONFLICT
+        );
+        crate::gc::collect(&root, false).unwrap();
+        assert!(store.contains(&payload.sha256));
+        store.read_manifest(&receipt.manifest).unwrap();
+        // Liveness is discoverable even when the transaction journal cannot be decoded.
+        // A GC hook that consults SQLite rather than private root files fails this arm.
+        let database = crate::catalog::Catalog::path(&root);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let saved: Vec<u8> = connection
+            .query_row(
+                "SELECT bytes FROM tensorfs_derived_transactions WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE tensorfs_derived_transactions SET bytes=?1 WHERE id=?2",
+                rusqlite::params![b"not a transaction".as_slice(), &id],
+            )
+            .unwrap();
+        drop(connection);
+        crate::gc::collect(&root, false).unwrap();
+        assert!(store.contains(&payload.sha256));
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE tensorfs_derived_transactions SET bytes=?1 WHERE id=?2",
+                rusqlite::params![saved, &id],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(std::fs::read_dir(root.join("repos"))
+            .map(|rows| rows.count() == 0)
+            .unwrap_or(true));
+
+        let saved_root = roots::read(&store, &id).unwrap().unwrap();
+        let released = dispose(&store, &reopened, &id).unwrap();
+        assert_eq!(released.receipt().to_value(), receipt.to_value());
+        // Crash after the terminal journal update but before the root was removed.
+        roots::write(&store, &saved_root).unwrap();
+        let Lookup::Committed(observed) = lookup(&store, &reopened, &id).unwrap() else {
+            panic!("committed receipt missing")
+        };
+        assert_eq!(
+            observed.disposition_value(),
+            Disposition::Released.to_value()
+        );
+        assert_eq!(
+            dispose(&store, &reopened, &id).unwrap().to_value(),
+            released.to_value()
+        );
+        assert!(roots::read(&store, &id).unwrap().is_none());
+        assert_eq!(
+            adopt(&store, &reopened, &id, "private-root")
+                .unwrap_err()
+                .code,
+            Code::DISPOSITION_CONFLICT
+        );
+        crate::gc::collect(&root, false).unwrap();
+        assert!(!store.contains(&payload.sha256));
+        assert!(!store.manifest_path(&receipt.manifest.sha256).exists());
+        assert_eq!(
+            dispose(&store, &reopened, &id).unwrap().to_value(),
+            released.to_value()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn absent_abandonment_is_a_durable_fence_against_a_late_begin() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-absent-abandon-{}",
+            crate::meta::now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let meta = Meta::open(&store).unwrap();
+        let id = format!("sha256:{}", "66".repeat(32));
+        assert!(abandon(&store, &meta, &id).unwrap().is_none());
+        let reopened = Meta::open(&store).unwrap();
+        assert!(matches!(
+            lookup(&store, &reopened, &id).unwrap(),
+            Lookup::Abandoned
+        ));
+        assert_eq!(
+            begin(&store, &reopened, &id, 1, created_declaration())
+                .err()
+                .unwrap()
+                .code,
+            Code::TRANSACTION_CLOSED
+        );
+        assert_eq!(
+            adopt(&store, &reopened, &id, "private-root")
+                .unwrap_err()
+                .code,
+            Code::TRANSACTION_CLOSED
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
     use crate::manifest::{Draft, Entry};
     use crate::repository::{Mutation, ReleaseLane, RepositoryName};
     use crate::store::Fault;

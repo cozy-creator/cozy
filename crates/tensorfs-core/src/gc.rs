@@ -62,13 +62,11 @@ impl Report {
             "reclaimed"
         };
         format!(
-            "{verb} {} B in {} objects, kept {} B in {} held by {} ingest session{}",
+            "{verb} {} B in {} objects, kept {} B in {} objects under retained roots",
             self.reclaimed_bytes,
             self.reclaimed_blobs + self.reclaimed_manifests,
             self.kept_bytes,
             self.kept_objects,
-            self.sessions.len(),
-            if self.sessions.len() == 1 { "" } else { "s" },
         )
     }
 
@@ -130,10 +128,29 @@ pub fn session_holds(store: &Store) -> Result<(Vec<HeldKey>, Vec<String>)> {
             lines.insert(key, line);
         }
     }
-    let holds = lines
+    let mut holds = lines
         .values()
         .map(|line| HeldKey::parse_line(line))
         .collect::<Result<Vec<_>>>()?;
+    for manifest in crate::derived::retained_manifests(store)? {
+        holds.push(HeldKey {
+            key: storage::manifest_key(&manifest.sha256)?,
+            kind: "manifest".into(),
+            length: manifest.length,
+            sha256: manifest.sha256,
+        });
+    }
+    holds.sort_by(|left, right| left.key.cmp(&right.key));
+    if holds
+        .windows(2)
+        .any(|pair| pair[0].key == pair[1].key && pair[0].length != pair[1].length)
+    {
+        return Err(Refusal {
+            code: crate::err::Code::LENGTH_MISMATCH,
+            detail: "retained roots disagree about an object's length".into(),
+        });
+    }
+    holds.dedup_by(|left, right| left.key == right.key);
     Ok((holds, sessions))
 }
 

@@ -2044,6 +2044,44 @@ mod tests {
         assert!(link.manifests.is_empty());
         assert!(link.progress.is_some());
         assert!(link.blobs.len() <= durability::CHECKPOINT_REFS);
+
+        // Upload acknowledgment can lag multiple local advances. The next pass must extend
+        // the locally exported chain, even when the owner still supplies no head or an old one.
+        let bias_member = "enc/model-00002-of-00002.safetensors";
+        let bias_source = files.iter().find(|row| row.member == bias_member).unwrap();
+        let bias_path = partial_request
+            .roster
+            .iter()
+            .find(|row| row.member == bias_member)
+            .unwrap()
+            .path
+            .clone();
+        fs::copy(&bias_source.path, &bias_path).unwrap();
+        let mut unacknowledged = partial_request.clone();
+        unacknowledged.landed.push(bias_member.into());
+        let advanced = prepare_model_source_with_registry(
+            &incremental,
+            &unacknowledged,
+            "fixture:registry",
+            &registry_bytes,
+        )
+        .unwrap();
+        assert!(advanced.checkpoints[0].head.links > progress.head.links);
+        assert_ne!(advanced.checkpoints[0].head.head, progress.head.head);
+        unacknowledged.landed.clear();
+        unacknowledged.checkpoints = vec![(progress.slot.clone(), head.clone())];
+        let no_work = prepare_model_source_with_registry(
+            &incremental,
+            &unacknowledged,
+            "fixture:registry",
+            &registry_bytes,
+        )
+        .unwrap();
+        assert_eq!(no_work.converted_roles, 0);
+        assert_eq!(
+            no_work.checkpoints[0].head, advanced.checkpoints[0].head,
+            "a delayed ACK cannot rewind the local cursor or append empty progress"
+        );
         fs::remove_file(&first_path).unwrap();
 
         // Transfer the acknowledged chain through the ordinary admission door into a
@@ -2087,6 +2125,17 @@ mod tests {
             }
         }
         let next_bodies = root.join("replacement-bodies");
+        let mut bootstrap = partial_request.clone();
+        bootstrap.landed.clear();
+        bootstrap.checkpoints = vec![(progress.slot.clone(), head.clone())];
+        let bootstrapped = prepare_model_source_with_registry(
+            &replacement,
+            &bootstrap,
+            "fixture:registry",
+            &registry_bytes,
+        )
+        .unwrap();
+        assert_eq!(bootstrapped.checkpoints[0].head.head.as_ref(), Some(head));
         fs::create_dir_all(&next_bodies).unwrap();
         let mut next_request = partial_request.clone();
         next_request.landed.clear();
@@ -2155,9 +2204,11 @@ mod tests {
             corrupt.code,
             Code::OBJECT_ABSENT | Code::OBJECT_CORRUPT
         ));
+        let mut no_ack = next_request.clone();
+        no_ack.checkpoints.clear();
         let resumed = prepare_model_source_with_registry(
             &replacement,
-            &next_request,
+            &no_ack,
             "fixture:registry",
             &registry_bytes,
         )

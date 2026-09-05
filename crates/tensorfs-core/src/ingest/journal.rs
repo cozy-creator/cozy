@@ -361,6 +361,39 @@ impl Journal {
         fs::read(&self.path).map_err(|error| io("read conversion journal for publication", error))
     }
 
+    /// The latest locally exported cursor is distinct from the owner's acknowledged head.
+    /// Persisting it prevents upload ACK lag from forking this journal's immutable chain.
+    pub fn local_head(&self) -> Result<Option<ObjectRef>> {
+        let bytes = match fs::read(self.path.with_extension("head.json")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io("read local checkpoint cursor", error)),
+        };
+        let value = canon::parse_canonical(&bytes, limits::SPEC_MAX_BYTES)?;
+        ObjectRef::from_value("local checkpoint cursor", &value).map(Some)
+    }
+
+    pub fn save_head(&self, head: &ObjectRef) -> Result<()> {
+        if self.local_head()?.as_ref() == Some(head) {
+            return Ok(());
+        }
+        let path = self.path.with_extension("head.json");
+        let temporary = path.with_extension(format!("tmp-{}", crate::meta::now_nanos_unique()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| io("create local checkpoint cursor", error))?;
+        file.write_all(&canon::write(&head.to_value()))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| io("sync local checkpoint cursor", error))?;
+        fs::rename(&temporary, &path)
+            .map_err(|error| io("replace local checkpoint cursor", error))?;
+        File::open(path.parent().expect("journal has a parent"))
+            .and_then(|file| file.sync_all())
+            .map_err(|error| io("sync local checkpoint cursor directory", error))
+    }
+
     /// Every object this journal names, for the filesystem hold protocol.
     pub fn objects(&self) -> Vec<ObjectRef> {
         let mut out: Vec<ObjectRef> = self

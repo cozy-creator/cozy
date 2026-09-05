@@ -1499,7 +1499,8 @@ impl PyStore {
             }
             derived::Lookup::Committed(value) => {
                 out.set_item("state", "committed")?;
-                out.set_item("receipt", receipt(py, &value)?)?;
+                out.set_item("receipt", receipt(py, value.receipt())?)?;
+                out.set_item("disposition", marshal(py, &value.disposition_value())?)?;
             }
             derived::Lookup::Abandoned => out.set_item("state", "abandoned")?,
         }
@@ -1535,6 +1536,22 @@ impl PyStore {
                 out.set_item("receipt", receipt(py, &value)?)?;
             }
         }
+        Ok(out)
+    }
+
+    /// Name a private retained root without creating a model repository or changing receipt bytes.
+    fn derived_adopt<'p>(
+        &self,
+        py: Python<'p>,
+        transaction_id: &str,
+        scratch_root_id: &str,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let value = py
+            .detach(|| derived::adopt(&self.store, &self.meta, transaction_id, scratch_root_id))
+            .or_refuse(py)?;
+        let out = marshal(py, &value.to_value())?;
+        out.cast::<PyDict>()?
+            .set_item("receipt", receipt(py, value.receipt())?)?;
         Ok(out)
     }
 

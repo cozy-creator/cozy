@@ -285,6 +285,8 @@ pub fn checkpoint(
     previous: Option<&ObjectRef>,
     journal: &crate::ingest::journal::Journal,
 ) -> Result<Head> {
+    let selected = checkpoint_predecessor(store, policy, journal.local_head()?.as_ref(), previous)?;
+    let previous = selected.as_ref();
     let prior = previous
         .map(|head| local_chain(store, head, policy.plan))
         .transpose()?;
@@ -349,6 +351,9 @@ pub fn checkpoint(
         bytes: prior.as_ref().map_or(0, |set| set.bytes),
     };
     if objects.is_empty() {
+        if let Some(head) = &head.head {
+            journal.save_head(head)?;
+        }
         return Ok(head);
     }
     let pages = objects.chunks(CHECKPOINT_REFS);
@@ -393,7 +398,73 @@ pub fn checkpoint(
         head.links += 1;
     }
     crate::ingest::transaction::name_candidates(store.root(), policy.operation, &candidates)?;
+    if let Some(head) = &head.head {
+        journal.save_head(head)?;
+    }
     Ok(head)
+}
+
+/// Extend the newest locally known chain while accepting delayed acknowledgments of its
+/// ancestors. Two independently forked heads are a conflict, never a reason to rewind.
+pub(crate) fn checkpoint_predecessor(
+    store: &Store,
+    policy: &Policy<'_>,
+    local: Option<&ObjectRef>,
+    supplied: Option<&ObjectRef>,
+) -> Result<Option<ObjectRef>> {
+    for head in [local, supplied].into_iter().flatten() {
+        let link = local_link(store, head)?;
+        if link.operation != policy.chain || link.plan != policy.plan {
+            return refuse(
+                Code::CROSS_SUBJECT_REPLAY,
+                "checkpoint cursor differs from its operation or plan",
+            );
+        }
+    }
+    let (Some(local), Some(supplied)) = (local, supplied) else {
+        return Ok(local.or(supplied).cloned());
+    };
+    if local == supplied {
+        return Ok(Some(local.clone()));
+    }
+    let left = local_link(store, local)?;
+    let right = local_link(store, supplied)?;
+    let (newest, oldest, mut link, old_index) = if left.index >= right.index {
+        (local, supplied, left, right.index)
+    } else {
+        (supplied, local, right, left.index)
+    };
+    let mut cursor = newest.clone();
+    let mut walked = 0;
+    while link.index > old_index {
+        if walked >= MAX_SEGMENTS {
+            return refuse(Code::COUNT_CAP, "checkpoint ancestry exceeds its link cap");
+        }
+        let previous = link.prev.ok_or_else(|| crate::err::Refusal {
+            code: Code::CROSS_SUBJECT_REPLAY,
+            detail: "checkpoint cursor has no expected ancestor".into(),
+        })?;
+        let parent = local_link(store, &previous)?;
+        if parent.index.checked_add(1) != Some(link.index)
+            || parent.plan != policy.plan
+            || parent.operation != policy.chain
+        {
+            return refuse(
+                Code::CROSS_SUBJECT_REPLAY,
+                "checkpoint ancestry is inconsistent",
+            );
+        }
+        cursor = previous;
+        link = parent;
+        walked += 1;
+    }
+    if &cursor != oldest {
+        return refuse(
+            Code::TRANSACTION_CONFLICT,
+            "local and acknowledged checkpoint chains forked",
+        );
+    }
+    Ok(Some(newest.clone()))
 }
 
 /// Pin restored chain documents before their journal is installed. Tensor segments are

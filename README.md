@@ -561,15 +561,25 @@ tfs gc plan <census> --holds <holds.jsonl> --out <plan.jsonl>
 
 `tfs gc <store>` is the local reclamation act: under the store's exclusive lock it marks
 `repositories -> manifests -> blobs` from the filesystem alone, keeps what an open ingest session
-root (`tmp/ingest/<session>/session.json`) names, deletes every other blob and manifest, and
+root (`tmp/ingest/<session>/session.json`) or private derived root (`roots/derived/<transaction>.json`)
+names, deletes every other blob and manifest, and
 repairs the verified-blob rows so no row outlives its object. `tensorfs.sqlite` is never consulted
 for liveness — the database is not the source of truth; the filesystem is self-describing. It
-prints `reclaimed <bytes> B in <n> objects, kept <bytes> B in <m> held by <k> ingest sessions`
+prints `reclaimed <bytes> B in <n> objects, kept <bytes> B in <m> objects under retained roots`
 (`--json` for a program), is idempotent, and converges after a crash (an object is unlinked before
 its row is dropped). A live writer or read lease refuses `STORE_BUSY` naming the holder; a session
 whose writer is gone is abandoned only by the explicit `tfs ingest reap`. `--dry-run` plans without
 deleting; `gc holds` + `gc plan` are the same plan as separate documents, which is how a cloud
 caller (tensorhub) supplies its own holds against a staged census.
+
+A derived commit creates a pending private root before releasing its writer. The owner's
+`Store.derived_adopt(transaction_id, scratch_root_id)` names that root without creating a model
+repository; the name is opaque to TensorFS. Same-name adoption replays, changing the name or
+adopting released output refuses. `derived_lookup` reports disposition alongside its unchanged
+receipt. `derived_dispose` durably releases the transaction before removing its filesystem root;
+replay completes interrupted removal. An absent `derived_abandon` creates a tombstone that prevents
+a late writer from opening that transaction. GC reads private roots directly, independent of the
+transaction journal's readability.
 
 Inventory and hold JSONL rows contain only `{key,length}` and `{kind,key,length}`; the digest is
 derived from the canonical domain-local key. Any malformed metadata, missing referenced byte,
