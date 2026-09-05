@@ -133,10 +133,18 @@ See [package publication](docs/package-publication.md) for the release contract.
 
 ## Models
 
+Search lists `MODEL`, `FAMILY`, `RELEASE`, and `LANES`, with one row per available
+release. Lane names belong to that release; `--full` and JSON retain complete lists.
+`cozy model info org/name` shows all available releases, while `@release` selects
+one exact tag. Info shows full lanes and immutable checkpoint refs. Unavailable
+Hub timestamps remain unavailable; model creation is distinct from release creation.
+
 Model releases live in the local TensorFS store:
 
 ```sh
 cozy model search flux
+cozy model info org/model
+cozy model info org/model@release
 cozy model download org/model@release local/flux --lane task=text-to-image
 cozy model list
 cozy model remove local/flux
