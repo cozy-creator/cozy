@@ -336,40 +336,26 @@ fn the_whole_h3_selection_reaches_its_verdict_from_headers_over_a_real_origin() 
     );
 
     let scratch = temporary("h3-plan");
-    let verdict = preflight::plan(
+    let preflight = preflight::plan(
         BUILTIN_REGISTRY,
         BUILTIN_REGISTRY_BYTES,
         &read.heads,
         &profiles(),
         &scratch,
-    );
-
-    // WHICH verdict is the registry's business and changes when it is re-banked (see
-    // `the_product_registry_is_stale_against_the_real_h3_carriers_it_names`). WHEN it is
-    // reached is this issue's business, and the answer is: before the transfer, for
-    // kilobytes, off a header read, with no pod rented and no store opened.
-    match &verdict {
-        Ok(preflight) => {
-            assert_eq!(preflight.plans.len(), 2, "two reviewed profiles");
-            assert_eq!(preflight.member_bytes, H3_MEMBER_BYTES);
-            assert_eq!(preflight.header_bytes, H3_HEADER_BYTES);
-            let dual = &preflight.plans[0];
-            assert_eq!(dual.profile, DUAL);
-            assert_eq!(dual.session.len(), 16, "the conversion journal's key");
-            let members: Vec<&str> = dual
-                .components
-                .iter()
-                .map(|component| component.member.as_deref().unwrap())
-                .collect();
-            assert_eq!(members, vec![FL2VA, REF2VA], "one object, two members");
-        }
-        Err(refusal) => assert_eq!(
-            refusal.code,
-            Code::UNREGISTERED_FINGERPRINT,
-            "an unexpected refusal: {}",
-            refusal.detail
-        ),
-    }
+    )
+    .expect("the reviewed H3 headers plan without payload transfer");
+    assert_eq!(preflight.plans.len(), 2, "two reviewed profiles");
+    assert_eq!(preflight.member_bytes, H3_MEMBER_BYTES);
+    assert_eq!(preflight.header_bytes, H3_HEADER_BYTES);
+    let dual = &preflight.plans[0];
+    assert_eq!(dual.profile, DUAL);
+    assert_eq!(dual.session.len(), 16, "the conversion journal's key");
+    let members: Vec<&str> = dual
+        .components
+        .iter()
+        .map(|component| component.member.as_deref().unwrap())
+        .collect();
+    assert_eq!(members, vec![FL2VA, REF2VA], "one object, two members");
 
     // The origin never sent a payload byte. Not "few" — none.
     assert_eq!(
@@ -385,28 +371,13 @@ fn the_whole_h3_selection_reaches_its_verdict_from_headers_over_a_real_origin() 
     assert!(!scratch.exists(), "the header staging is removed");
 }
 
-/// THE FOURTH INSTANCE OF TONIGHT'S PATTERN, and the one this verb found. The product
-/// registry says, per entry, exactly which carrier it was banked from: `provenance.note`
-/// carries the carrier's header length and `provenance.source_sha256` carries
-/// `source_digest` — the carrier IDENTITY. Both agree with `vectors/h3-headers` down to
-/// the byte, so these ARE the banked carriers.
-///
-/// And yet `tensor_schema_digest` does not agree, for all five H3 components. The digest's
-/// own preimage moved under the registry: `tensor_schema_value` renamed its `dtype` field
-/// to `logical_dtype` (84142fd, 2026-09-02) two hours after the field was first banked
-/// (03c9713), and `TENSOR_SCHEMA_DOMAIN` stayed `cozytensors.tensor-schema/1` — so nothing
-/// in the type system, the tests, or the domain string noticed. `registry.authorize`
-/// compares that digest exactly.
-///
-/// **So H3 run 310 was going to move 210.3 GB and refuse `UNREGISTERED_FINGERPRINT`**, the
-/// next guard in the 290/294/309 sequence, for the same reason each of those cost a run:
-/// nothing made it reachable until the guard before it was fixed. This test makes it
-/// reachable for free instead, and FLIPS when the registry is re-banked — at which point
-/// its assertions are the ones to invert, deliberately.
+/// The banked H3 fingerprints must match the exact reviewed carrier headers. Changing
+/// the tensor-schema projection without re-banking used to defer this refusal until
+/// after 210 GB of transfer; the corpus now checks both identity and authorization.
 #[test]
-fn the_product_registry_is_stale_against_the_real_h3_carriers_it_names() {
+fn the_product_registry_matches_the_real_h3_carriers_it_names() {
     use tensorfs_core::ingest::fingerprint::{self, FingerprintRegistry};
-    let root = temporary("stale-registry");
+    let root = temporary("reviewed-registry");
     let staged = preflight::stage(&root, &h3_heads()).unwrap();
     let set = source::CarrierSet::of(staged.carriers());
     let registry = FingerprintRegistry::parse(BUILTIN_REGISTRY_BYTES).unwrap();
@@ -455,12 +426,9 @@ fn the_product_registry_is_stale_against_the_real_h3_carriers_it_names() {
         assert_eq!(banked.keyset_digest, observed.keyset_digest);
         assert_eq!(banked.logical_keys, observed.logical_keys as u64);
 
-        // ...and a tensor schema digest that no longer agrees. One field rename, five
-        // components, two profiles, and a 210.3 GB refusal waiting behind a transfer.
-        assert_ne!(
+        assert_eq!(
             banked.tensor_schema_digest, observed.tensor_schema_digest,
-            "{component}: the registry now agrees — re-banked? then flip this test and the \
-             verdict arm of the H3 preflight above"
+            "{component}: the reviewed tensor-schema digest must match its carrier"
         );
     }
     drop(staged);
