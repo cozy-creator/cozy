@@ -474,11 +474,12 @@ type Orchestrator struct {
 	// its first attempt exists. Live-only and observational, exactly like `frames`.
 	phases *phases
 	// transferWake is a lossy nudge over durable request-attached transfer rows.
-	transferWake        map[string]chan struct{}
-	transferRunning     map[string]bool
-	transferDispatching map[string]bool
-	transferCancels     map[string]context.CancelFunc
-	transferProgressSeq map[string]uint64
+	transferWake         map[string]chan struct{}
+	transferRunning      map[string]bool
+	transferDispatching  map[string]bool
+	transferCancels      map[string]context.CancelFunc
+	transferProgressSeq  map[string]uint64
+	sourcePrepareReplies map[string]uint64
 	// localTransfers is command-scoped, lossy progress over Creator's durable request
 	// row and sealed revision. A restart simply replays exact chunks from those authorities.
 	localTransfers map[string]*localTransfer
@@ -503,25 +504,26 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		opt.Yield = "smart"
 	}
 	c := &Orchestrator{
-		opt:                 opt,
-		done:                make(chan struct{}),
-		sessions:            map[string]*session{},
-		workers:             map[string]*worker{},
-		waits:               map[string]*wait{},
-		offers:              map[string]*dispatchReservation{},
-		mediaCleaning:       map[string]bool{},
-		outputExporting:     map[string]bool{},
-		starting:            map[string]bool{},
-		parked:              map[string]*parking{},
-		ensuring:            map[string]chan struct{}{},
-		frames:              newFanout(),
-		phases:              newPhases(),
-		transferWake:        make(map[string]chan struct{}),
-		transferRunning:     make(map[string]bool),
-		transferDispatching: make(map[string]bool),
-		transferCancels:     make(map[string]context.CancelFunc),
-		transferProgressSeq: make(map[string]uint64),
-		localTransfers:      make(map[string]*localTransfer),
+		opt:                  opt,
+		done:                 make(chan struct{}),
+		sessions:             map[string]*session{},
+		workers:              map[string]*worker{},
+		waits:                map[string]*wait{},
+		offers:               map[string]*dispatchReservation{},
+		mediaCleaning:        map[string]bool{},
+		outputExporting:      map[string]bool{},
+		starting:             map[string]bool{},
+		parked:               map[string]*parking{},
+		ensuring:             map[string]chan struct{}{},
+		frames:               newFanout(),
+		phases:               newPhases(),
+		transferWake:         make(map[string]chan struct{}),
+		transferRunning:      make(map[string]bool),
+		transferDispatching:  make(map[string]bool),
+		transferCancels:      make(map[string]context.CancelFunc),
+		transferProgressSeq:  make(map[string]uint64),
+		sourcePrepareReplies: make(map[string]uint64),
+		localTransfers:       make(map[string]*localTransfer),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a
 	// SAMPLING resolution, never a verdict: every verdict it acts on is the worker's own

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"sort"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -203,21 +204,53 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 	if err != nil || problem != nil || transfer == nil || selection != transfer.SourceSelection {
 		return
 	}
+	request, problem := c.opt.Store.RequestRow(frame.OperationId)
+	if problem != nil || request == nil || request.Worker == "" ||
+		rentalInstanceID(request.Worker) != s.instanceID {
+		return
+	}
+	if frame.Outcome != pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_REFUSED &&
+		frame.Outcome != pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_INCOMPLETE &&
+		frame.Outcome != pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_PREPARED &&
+		frame.Outcome != pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED {
+		return
+	}
+	defer func() {
+		c.mu.Lock()
+		c.sourcePrepareReplies[frame.OperationId]++
+		c.mu.Unlock()
+		c.signalTransfer(frame.OperationId)
+	}()
+	checkpoints := make([]records.ModelSourceCheckpoint, 0, len(frame.Checkpoints))
+	for _, checkpoint := range frame.Checkpoints {
+		if checkpoint == nil || checkpoint.Head == nil || len(checkpoint.Head.Digest) != 32 ||
+			len(checkpoint.PlanDigest) != 32 || checkpoint.Head.Length == 0 ||
+			checkpoint.Head.Length > uint64(^uint64(0)>>1) || checkpoint.Index > uint64(^uint64(0)>>1) ||
+			checkpoint.Bytes > uint64(^uint64(0)>>1) {
+			_ = c.opt.Store.FailModelTransfer(frame.OperationId, "model_transfer.source_checkpoint_invalid",
+				"worker returned malformed source checkpoint progress")
+			return
+		}
+		checkpoints = append(checkpoints, records.ModelSourceCheckpoint{
+			Slot: checkpoint.Slot, HeadID: "sha256:" + hex.EncodeToString(checkpoint.Head.Digest),
+			HeadLength: int64(checkpoint.Head.Length), PlanDigest: "sha256:" + hex.EncodeToString(checkpoint.PlanDigest),
+			Index: int64(checkpoint.Index), Bytes: int64(checkpoint.Bytes)})
+	}
+	if len(checkpoints) > 0 {
+		if problem := c.opt.Store.ObserveModelSourceCheckpoints(frame.OperationId, selection, s.bootID, checkpoints); problem != nil {
+			_ = c.opt.Store.FailModelTransfer(frame.OperationId, problem.ErrName(), problem.Message)
+			return
+		}
+	}
 	c.logf("model transfer %s: source prepare %s on %s (%d source(s)) %s %s", frame.OperationId,
 		trimEnum(pb.ModelSourcePrepareOutcome_name[int32(frame.Outcome)], "MODEL_SOURCE_PREPARE_OUTCOME_"),
 		s.instanceID, len(frame.Sources), frame.SafeCode, frame.SafeDetail)
 	if frame.Outcome == pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_REFUSED {
 		_ = c.opt.Store.FailModelTransfer(frame.OperationId, frame.SafeCode, frame.SafeDetail)
-		c.signalTransfer(frame.OperationId)
 		return
 	}
 	if frame.Outcome != pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_PREPARED &&
 		frame.Outcome != pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_REPLAYED {
-		return
-	}
-	request, problem := c.opt.Store.RequestRow(frame.OperationId)
-	if problem != nil || request == nil || request.Worker == "" ||
-		rentalInstanceID(request.Worker) != s.instanceID {
 		return
 	}
 	rows := make([]records.ModelRef, 0, len(frame.Sources))
@@ -244,5 +277,31 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 	if problem := c.opt.Store.CompleteModelTransferMaterialization(frame.OperationId, rows); problem != nil {
 		return
 	}
-	c.signalTransfer(frame.OperationId)
+}
+
+// Only remotely acknowledged heads travel back to a worker. Local observations
+// may refer to bytes that vanished with the previous pod.
+func (c *Orchestrator) acknowledgedSourceCheckpoints(requestID string) ([]*pb.ModelSourceCheckpoint, string, *exit.Error) {
+	progress, problem := c.opt.Store.ModelSourceProgress(requestID)
+	if problem != nil {
+		return nil, "", problem
+	}
+	var out []*pb.ModelSourceCheckpoint
+	var heads []string
+	for _, slot := range progress {
+		checkpoint := slot.Acknowledged
+		if checkpoint == nil {
+			continue
+		}
+		head, headErr := canonical.Raw(checkpoint.HeadID)
+		plan, planErr := canonical.Raw(checkpoint.PlanDigest)
+		if headErr != nil || planErr != nil {
+			return nil, "", exit.Internalf("stored source checkpoint has malformed identity")
+		}
+		out = append(out, &pb.ModelSourceCheckpoint{Slot: checkpoint.Slot,
+			Head: &pb.Ref{Digest: head, Length: uint64(checkpoint.HeadLength)}, PlanDigest: plan,
+			Index: uint64(checkpoint.Index), Bytes: uint64(checkpoint.Bytes)})
+		heads = append(heads, checkpoint.Slot+"="+checkpoint.HeadID)
+	}
+	return out, strings.Join(heads, ","), nil
 }

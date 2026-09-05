@@ -354,6 +354,8 @@ const (
 	RuntimePreparation_CheckPackageSetCompatibility_FullMethodName = "/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility"
 	RuntimePreparation_PreparePackageSet_FullMethodName            = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
 	RuntimePreparation_PrepareModelSource_FullMethodName           = "/cozy.worker.v1.RuntimePreparation/PrepareModelSource"
+	RuntimePreparation_SourceCheckpointPage_FullMethodName         = "/cozy.worker.v1.RuntimePreparation/SourceCheckpointPage"
+	RuntimePreparation_SourceCheckpointTransfer_FullMethodName     = "/cozy.worker.v1.RuntimePreparation/SourceCheckpointTransfer"
 	RuntimePreparation_PrepareLocalPackage_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/PrepareLocalPackage"
 	RuntimePreparation_PreparePrivatePlacement_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/PreparePrivatePlacement"
 )
@@ -373,6 +375,8 @@ type RuntimePreparationClient interface {
 	CheckPackageSetCompatibility(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
 	PrepareModelSource(ctx context.Context, in *PrepareModelSourceRequest, opts ...grpc.CallOption) (*PrepareModelSourceResult, error)
+	SourceCheckpointPage(ctx context.Context, in *SourceCheckpointPageRequest, opts ...grpc.CallOption) (*SourceCheckpointPageResult, error)
+	SourceCheckpointTransfer(ctx context.Context, in *SourceCheckpointTransferRequest, opts ...grpc.CallOption) (*SourceCheckpointTransferStatus, error)
 	PrepareLocalPackage(ctx context.Context, in *PrepareLocalPackageRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
 	PreparePrivatePlacement(ctx context.Context, in *PreparePrivatePlacementRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
 }
@@ -415,6 +419,26 @@ func (c *runtimePreparationClient) PrepareModelSource(ctx context.Context, in *P
 	return out, nil
 }
 
+func (c *runtimePreparationClient) SourceCheckpointPage(ctx context.Context, in *SourceCheckpointPageRequest, opts ...grpc.CallOption) (*SourceCheckpointPageResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SourceCheckpointPageResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_SourceCheckpointPage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) SourceCheckpointTransfer(ctx context.Context, in *SourceCheckpointTransferRequest, opts ...grpc.CallOption) (*SourceCheckpointTransferStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SourceCheckpointTransferStatus)
+	err := c.cc.Invoke(ctx, RuntimePreparation_SourceCheckpointTransfer_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *runtimePreparationClient) PrepareLocalPackage(ctx context.Context, in *PrepareLocalPackageRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PreparePackageSetResult)
@@ -450,6 +474,8 @@ type RuntimePreparationServer interface {
 	CheckPackageSetCompatibility(context.Context, *PreparePackageSetRequest) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error)
 	PrepareModelSource(context.Context, *PrepareModelSourceRequest) (*PrepareModelSourceResult, error)
+	SourceCheckpointPage(context.Context, *SourceCheckpointPageRequest) (*SourceCheckpointPageResult, error)
+	SourceCheckpointTransfer(context.Context, *SourceCheckpointTransferRequest) (*SourceCheckpointTransferStatus, error)
 	PrepareLocalPackage(context.Context, *PrepareLocalPackageRequest) (*PreparePackageSetResult, error)
 	PreparePrivatePlacement(context.Context, *PreparePrivatePlacementRequest) (*PreparePackageSetResult, error)
 	mustEmbedUnimplementedRuntimePreparationServer()
@@ -470,6 +496,12 @@ func (UnimplementedRuntimePreparationServer) PreparePackageSet(context.Context, 
 }
 func (UnimplementedRuntimePreparationServer) PrepareModelSource(context.Context, *PrepareModelSourceRequest) (*PrepareModelSourceResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method PrepareModelSource not implemented")
+}
+func (UnimplementedRuntimePreparationServer) SourceCheckpointPage(context.Context, *SourceCheckpointPageRequest) (*SourceCheckpointPageResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method SourceCheckpointPage not implemented")
+}
+func (UnimplementedRuntimePreparationServer) SourceCheckpointTransfer(context.Context, *SourceCheckpointTransferRequest) (*SourceCheckpointTransferStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method SourceCheckpointTransfer not implemented")
 }
 func (UnimplementedRuntimePreparationServer) PrepareLocalPackage(context.Context, *PrepareLocalPackageRequest) (*PreparePackageSetResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method PrepareLocalPackage not implemented")
@@ -552,6 +584,42 @@ func _RuntimePreparation_PrepareModelSource_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RuntimePreparation_SourceCheckpointPage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SourceCheckpointPageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).SourceCheckpointPage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_SourceCheckpointPage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).SourceCheckpointPage(ctx, req.(*SourceCheckpointPageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_SourceCheckpointTransfer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SourceCheckpointTransferRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).SourceCheckpointTransfer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_SourceCheckpointTransfer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).SourceCheckpointTransfer(ctx, req.(*SourceCheckpointTransferRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _RuntimePreparation_PrepareLocalPackage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PrepareLocalPackageRequest)
 	if err := dec(in); err != nil {
@@ -606,6 +674,14 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PrepareModelSource",
 			Handler:    _RuntimePreparation_PrepareModelSource_Handler,
+		},
+		{
+			MethodName: "SourceCheckpointPage",
+			Handler:    _RuntimePreparation_SourceCheckpointPage_Handler,
+		},
+		{
+			MethodName: "SourceCheckpointTransfer",
+			Handler:    _RuntimePreparation_SourceCheckpointTransfer_Handler,
 		},
 		{
 			MethodName: "PrepareLocalPackage",
@@ -776,14 +852,16 @@ var RuntimeWeights_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	PodHost_PreparePackageSet_FullMethodName       = "/cozy.worker.v1.PodHost/PreparePackageSet"
-	PodHost_PrepareLocalPackage_FullMethodName     = "/cozy.worker.v1.PodHost/PrepareLocalPackage"
-	PodHost_PreparePrivatePlacement_FullMethodName = "/cozy.worker.v1.PodHost/PreparePrivatePlacement"
-	PodHost_ModelSourceFile_FullMethodName         = "/cozy.worker.v1.PodHost/ModelSourceFile"
-	PodHost_ModelSourcePrepare_FullMethodName      = "/cozy.worker.v1.PodHost/ModelSourcePrepare"
-	PodHost_LocalPackageFetch_FullMethodName       = "/cozy.worker.v1.PodHost/LocalPackageFetch"
-	PodHost_LocalPackageAbort_FullMethodName       = "/cozy.worker.v1.PodHost/LocalPackageAbort"
-	PodHost_WeightsTransfer_FullMethodName         = "/cozy.worker.v1.PodHost/WeightsTransfer"
+	PodHost_PreparePackageSet_FullMethodName        = "/cozy.worker.v1.PodHost/PreparePackageSet"
+	PodHost_PrepareLocalPackage_FullMethodName      = "/cozy.worker.v1.PodHost/PrepareLocalPackage"
+	PodHost_PreparePrivatePlacement_FullMethodName  = "/cozy.worker.v1.PodHost/PreparePrivatePlacement"
+	PodHost_ModelSourceFile_FullMethodName          = "/cozy.worker.v1.PodHost/ModelSourceFile"
+	PodHost_ModelSourcePrepare_FullMethodName       = "/cozy.worker.v1.PodHost/ModelSourcePrepare"
+	PodHost_SourceCheckpointPage_FullMethodName     = "/cozy.worker.v1.PodHost/SourceCheckpointPage"
+	PodHost_SourceCheckpointTransfer_FullMethodName = "/cozy.worker.v1.PodHost/SourceCheckpointTransfer"
+	PodHost_LocalPackageFetch_FullMethodName        = "/cozy.worker.v1.PodHost/LocalPackageFetch"
+	PodHost_LocalPackageAbort_FullMethodName        = "/cozy.worker.v1.PodHost/LocalPackageAbort"
+	PodHost_WeightsTransfer_FullMethodName          = "/cozy.worker.v1.PodHost/WeightsTransfer"
 )
 
 // PodHostClient is the client API for PodHost service.
@@ -821,6 +899,8 @@ type PodHostClient interface {
 	PreparePrivatePlacement(ctx context.Context, in *PreparePrivatePlacementCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
 	ModelSourceFile(ctx context.Context, in *ModelSourceFileCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ModelSourceFileStatus], error)
 	ModelSourcePrepare(ctx context.Context, in *ModelSourcePrepareCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error)
+	SourceCheckpointPage(ctx context.Context, in *SourceCheckpointPageCall, opts ...grpc.CallOption) (*SourceCheckpointPageResult, error)
+	SourceCheckpointTransfer(ctx context.Context, in *SourceCheckpointTransferCall, opts ...grpc.CallOption) (*SourceCheckpointTransferStatus, error)
 	LocalPackageFetch(ctx context.Context, in *LocalPackageFetchCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LocalPackageFileStatus], error)
 	LocalPackageAbort(ctx context.Context, in *LocalPackageAbortCall, opts ...grpc.CallOption) (*LocalPackageAbortStatus, error)
 	WeightsTransfer(ctx context.Context, in *WeightsTransferCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WeightsTransferStatus], error)
@@ -920,6 +1000,26 @@ func (c *podHostClient) ModelSourcePrepare(ctx context.Context, in *ModelSourceP
 	return out, nil
 }
 
+func (c *podHostClient) SourceCheckpointPage(ctx context.Context, in *SourceCheckpointPageCall, opts ...grpc.CallOption) (*SourceCheckpointPageResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SourceCheckpointPageResult)
+	err := c.cc.Invoke(ctx, PodHost_SourceCheckpointPage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) SourceCheckpointTransfer(ctx context.Context, in *SourceCheckpointTransferCall, opts ...grpc.CallOption) (*SourceCheckpointTransferStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SourceCheckpointTransferStatus)
+	err := c.cc.Invoke(ctx, PodHost_SourceCheckpointTransfer_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *podHostClient) LocalPackageFetch(ctx context.Context, in *LocalPackageFetchCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LocalPackageFileStatus], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[4], PodHost_LocalPackageFetch_FullMethodName, cOpts...)
@@ -1003,6 +1103,8 @@ type PodHostServer interface {
 	PreparePrivatePlacement(*PreparePrivatePlacementCall, grpc.ServerStreamingServer[PrepareEvent]) error
 	ModelSourceFile(*ModelSourceFileCall, grpc.ServerStreamingServer[ModelSourceFileStatus]) error
 	ModelSourcePrepare(context.Context, *ModelSourcePrepareCall) (*ModelSourcePrepared, error)
+	SourceCheckpointPage(context.Context, *SourceCheckpointPageCall) (*SourceCheckpointPageResult, error)
+	SourceCheckpointTransfer(context.Context, *SourceCheckpointTransferCall) (*SourceCheckpointTransferStatus, error)
 	LocalPackageFetch(*LocalPackageFetchCall, grpc.ServerStreamingServer[LocalPackageFileStatus]) error
 	LocalPackageAbort(context.Context, *LocalPackageAbortCall) (*LocalPackageAbortStatus, error)
 	WeightsTransfer(*WeightsTransferCall, grpc.ServerStreamingServer[WeightsTransferStatus]) error
@@ -1030,6 +1132,12 @@ func (UnimplementedPodHostServer) ModelSourceFile(*ModelSourceFileCall, grpc.Ser
 }
 func (UnimplementedPodHostServer) ModelSourcePrepare(context.Context, *ModelSourcePrepareCall) (*ModelSourcePrepared, error) {
 	return nil, status.Error(codes.Unimplemented, "method ModelSourcePrepare not implemented")
+}
+func (UnimplementedPodHostServer) SourceCheckpointPage(context.Context, *SourceCheckpointPageCall) (*SourceCheckpointPageResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method SourceCheckpointPage not implemented")
+}
+func (UnimplementedPodHostServer) SourceCheckpointTransfer(context.Context, *SourceCheckpointTransferCall) (*SourceCheckpointTransferStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method SourceCheckpointTransfer not implemented")
 }
 func (UnimplementedPodHostServer) LocalPackageFetch(*LocalPackageFetchCall, grpc.ServerStreamingServer[LocalPackageFileStatus]) error {
 	return status.Error(codes.Unimplemented, "method LocalPackageFetch not implemented")
@@ -1123,6 +1231,42 @@ func _PodHost_ModelSourcePrepare_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PodHost_SourceCheckpointPage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SourceCheckpointPageCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).SourceCheckpointPage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_SourceCheckpointPage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).SourceCheckpointPage(ctx, req.(*SourceCheckpointPageCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_SourceCheckpointTransfer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SourceCheckpointTransferCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).SourceCheckpointTransfer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_SourceCheckpointTransfer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).SourceCheckpointTransfer(ctx, req.(*SourceCheckpointTransferCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _PodHost_LocalPackageFetch_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(LocalPackageFetchCall)
 	if err := stream.RecvMsg(m); err != nil {
@@ -1173,6 +1317,14 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ModelSourcePrepare",
 			Handler:    _PodHost_ModelSourcePrepare_Handler,
+		},
+		{
+			MethodName: "SourceCheckpointPage",
+			Handler:    _PodHost_SourceCheckpointPage_Handler,
+		},
+		{
+			MethodName: "SourceCheckpointTransfer",
+			Handler:    _PodHost_SourceCheckpointTransfer_Handler,
 		},
 		{
 			MethodName: "LocalPackageAbort",

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"sort"
+
+	"google.golang.org/protobuf/proto"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -275,6 +277,7 @@ func (c *Orchestrator) publishTransferProgress(requestID string, value map[strin
 func (c *Orchestrator) forgetTransferProgress(requestID string) {
 	c.mu.Lock()
 	delete(c.transferProgressSeq, requestID)
+	delete(c.sourcePrepareReplies, requestID)
 	c.mu.Unlock()
 	c.frames.forget(requestID)
 }
@@ -311,7 +314,10 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		members = append(members, member)
 	}
 	sort.Strings(members)
-	asked := false
+	preparedStream, preparedRecovery := "", ""
+	preparedCount := -1
+	preparing := false
+	var replyRevision uint64
 	// restated names the control stream this owner has already stated its WHOLE selection
 	// to. The pod's memory of a transfer is its TensorFS Store, not a journal: it indexes
 	// what it proved by object, and a boot that lost that index answers a re-ask from the
@@ -353,11 +359,13 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		if problem != nil {
 			return nil, problem
 		}
-		allVerified := len(statuses) == len(expected)
+		verified := 0
 		revisions := make(map[string]int64, len(statuses))
 		for _, status := range statuses {
 			revisions[status.Member] = status.CapabilityRevision
-			allVerified = allVerified && status.State == "verified"
+			if status.State == "verified" {
+				verified++
+			}
 		}
 		// The frames go out in ONE pass, in member order, and a preparation sent in the
 		// same pass is read after all of them: the pod registers every member off its
@@ -375,14 +383,19 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 			for _, member := range members {
 				file := expected[member]
 				access := byMember[member]
-				session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourceFileRequest{
+				frame := &pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourceFileRequest{
 					ModelSourceFileRequest: &pb.ModelSourceFileRequest{
 						RecordOwnerEpoch:   recordOwnerEpoch,
 						ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
 						OperationId: req.ID, SourceSelectionDigest: selection, Member: member,
 						ObjectId: "sha256:" + file.SHA256, Length: uint64(file.Length),
 						Provider: access.Provider, Url: access.URL, ExpiresAtUnix: access.ExpiresAtUnix,
-						CapabilityRevision: uint64(revisions[member] + 1)}}})
+						CapabilityRevision: uint64(revisions[member] + 1), Header: file.Header}}}
+				if proto.Size(frame) > pb.MaxInlineControlBytes {
+					return nil, exit.Named(exit.Validation, "model_transfer.source_header_too_large",
+						"source header and capability for %s exceed the worker control bound", member)
+				}
+				session.send(frame)
 			}
 			restated = stream
 			c.logf("model transfer %s: stating all %d selected source file(s) to %s on "+
@@ -390,24 +403,35 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 				"TensorFS store and moves nothing",
 				req.ID, len(members), session.instanceID, session.epoch)
 		}
-		if allVerified {
-			if !asked {
-				asked = true
-				c.logf("model transfer %s: all %d source file(s) verified on %s; asking it to "+
-					"prepare %d profile(s) — the request stays queued until the pod answers",
-					req.ID, len(expected), session.instanceID, len(intent.SourceProfiles))
-			}
+		// One call in flight. Its INCOMPLETE answer only opens the next call when
+		// more source members have verified, so progress cannot echo into a loop.
+		c.mu.Lock()
+		replies := c.sourcePrepareReplies[req.ID]
+		c.mu.Unlock()
+		if preparedStream != stream || replies != replyRevision {
+			preparing = false
+			replyRevision = replies
+		}
+		checkpoints, recovery, problem := c.acknowledgedSourceCheckpoints(req.ID)
+		if problem != nil {
+			return nil, problem
+		}
+		if !preparing && (preparedStream != stream || preparedCount != verified || preparedRecovery != recovery) {
 			profiles := make([]*pb.ModelSourceProfile, 0, len(intent.SourceProfiles))
 			for slot, profile := range intent.SourceProfiles {
 				profiles = append(profiles, &pb.ModelSourceProfile{Slot: slot, Profile: profile})
 			}
 			sort.Slice(profiles, func(i, j int) bool { return profiles[i].Slot < profiles[j].Slot })
+			c.logf("model transfer %s: preparing %d profile(s) on %s with %d/%d source files verified",
+				req.ID, len(profiles), session.instanceID, verified, len(expected))
 			session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourcePrepareRequest{
 				ModelSourcePrepareRequest: &pb.ModelSourcePrepareRequest{
 					RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: session.epoch,
 					WorkerBootId: session.bootID, OperationId: req.ID,
-					SourceSelectionDigest: selection, Profiles: profiles,
+					SourceSelectionDigest: selection, Profiles: profiles, Checkpoints: checkpoints,
 					SourceUri: intent.Source, DeclaredLicense: intent.SourceLicense}}})
+			preparing = true
+			preparedStream, preparedCount, preparedRecovery = stream, verified, recovery
 		}
 		if wait := c.waitTransfer(ctx, req.ID); wait != nil {
 			return nil, wait
