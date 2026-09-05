@@ -484,3 +484,57 @@ fn source_identity_is_locked_and_source_closure_stays_rooted_after_writer_death(
     assert!(!store.contains(&payload.sha256));
     std::fs::remove_dir_all(store.root()).unwrap();
 }
+
+#[test]
+fn wrong_document_lengths_refuse_before_parsing_or_importing_work() {
+    let (store, meta, id, declaration) = fixture("lengths");
+    let writer = begin(&store, &meta, &id, 1, declaration.clone(), None).unwrap();
+    data(&store, &meta, &id, 1, 0x31);
+    let (plan, checkpoint) =
+        checkpoint_progress(&store, &meta, &id, 1, "request", "output", None).unwrap();
+    let head = checkpoint.head.unwrap();
+    let mut short_head = head.clone();
+    short_head.length = 1;
+    assert_eq!(
+        crate::durability::local_link(&store, &short_head)
+            .unwrap_err()
+            .code,
+        Code::LENGTH_MISMATCH
+    );
+    let mut link = crate::durability::local_link(&store, &head).unwrap();
+    let progress = link.progress.as_mut().unwrap();
+    progress.length = 1;
+    for object in &mut link.blobs {
+        if object.sha256 == progress.sha256 {
+            object.length = 1;
+        }
+    }
+    let bytes = link.canonical_bytes();
+    let forged = store
+        .put_stream(
+            &mut bytes.as_slice(),
+            Some(&ObjectRef::of(&bytes)),
+            &Default::default(),
+        )
+        .unwrap()
+        .obj;
+    let canonical = declaration.clone().canonical_work_bytes().unwrap();
+    assert_eq!(
+        validate_checkpoint(&store, &meta, &id, &canonical, &forged, "request", "output", &plan)
+            .unwrap_err()
+            .code,
+        Code::LENGTH_MISMATCH
+    );
+    assert_eq!(
+        begin(&store, &meta, &id, 2, declaration, Some(&forged))
+            .err()
+            .unwrap()
+            .code,
+        Code::LENGTH_MISMATCH
+    );
+    check_writer(&meta, &id, 1).unwrap();
+    fence(&meta, &id, 1).unwrap();
+    release(&meta, writer);
+    abandon(&store, &meta, &id).unwrap();
+    std::fs::remove_dir_all(store.root()).unwrap();
+}

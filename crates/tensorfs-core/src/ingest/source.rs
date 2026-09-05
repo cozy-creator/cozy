@@ -1319,20 +1319,8 @@ fn prepare_model_source_with_budget(
             durability::retain_local_chain(store, head, &request.operation_id)?;
             if journal.is_empty() {
                 if let Some(progress) = held.progress.last() {
-                    if progress.length > crate::limits::DOC_MAX_BYTES as u64 {
-                        return refuse(
-                            Code::COUNT_CAP,
-                            "checkpoint progress exceeds the document byte cap",
-                        );
-                    }
-                    let mut bytes = Vec::with_capacity(progress.length as usize);
-                    store.read_into(&progress.sha256, &mut bytes)?;
-                    if ObjectRef::of(&bytes) != *progress {
-                        return refuse(
-                            Code::OBJECT_ID_MISMATCH,
-                            "checkpoint progress differs from its ObjectRef",
-                        );
-                    }
+                    let bytes =
+                        durability::read_document(store, progress, crate::limits::DOC_MAX_BYTES)?;
                     drop(journal);
                     super::journal::install(&dir, &plan_hex, &bytes)?;
                     journal = super::journal::Journal::open(&dir, &plan_hex)?;

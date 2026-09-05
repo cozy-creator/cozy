@@ -2170,17 +2170,7 @@ fn read_progress(
         code: Code::MISSING_FIELD,
         detail: "derived checkpoint has no progress document".into(),
     })?;
-    if progress.length > limits::DOC_MAX_BYTES as u64 {
-        return refuse(Code::COUNT_CAP, "derived progress exceeds its byte cap");
-    }
-    let mut bytes = Vec::with_capacity(progress.length as usize);
-    store.read_into(&progress.sha256, &mut bytes)?;
-    if ObjectRef::of(&bytes) != *progress {
-        return refuse(
-            Code::OBJECT_ID_MISMATCH,
-            "derived progress differs from its ObjectRef",
-        );
-    }
+    let bytes = crate::durability::read_document(store, progress, limits::DOC_MAX_BYTES)?;
     let row = TransactionRow::from_value(&crate::canon::parse_canonical(
         &bytes,
         limits::DOC_MAX_BYTES,
