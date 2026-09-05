@@ -204,7 +204,7 @@ except tensorfs.errors.MalformedCbor as e:
 
 try:
     store.prepare_model_source(
-        "wheel-source-proof", "sha256:" + "44" * 32, [], [],
+        "wheel-source-proof", "sha256:" + "44" * 32, [], [], [],
     )
     raise AssertionError("empty model source preparation succeeded")
 except tensorfs.errors.CountCap as e:

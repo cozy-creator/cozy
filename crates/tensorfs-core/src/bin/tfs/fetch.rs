@@ -505,6 +505,70 @@ fn ranged_of(flags: &Flags) -> transport::Ranged {
     }
 }
 
+/// Enumerate one locally admitted recovery link; no tensor bytes or NFS access are needed.
+pub fn cmd_checkpoint_page(root: &Path, id: &str, length: &str, flags: &Flags) -> ExitCode {
+    use tensorfs_core::canon::Value;
+    use tensorfs_core::repo_cache::CacheKind;
+    let store = ok!(Store::open(root));
+    let object = match object_of("checkpoint head", id.trim_start_matches("sha256:"), length) {
+        Ok(object) => object,
+        Err(code) => return code,
+    };
+    let tensorfs_core::durability::Window {
+        link,
+        objects,
+        next,
+    } = ok!(tensorfs_core::durability::local_window(
+        &store,
+        &object,
+        crate::flag_num(flags, "offset", 0),
+        crate::flag_num(flags, "limit", tensorfs_core::durability::CHECKPOINT_REFS),
+    ));
+    let reference = |r: &ObjectRef| Value::arr(vec![Value::str(r.id()), Value::uint(r.length)]);
+    let mut fields = vec![
+        ("operation", Value::str(link.operation)),
+        ("plan_digest", Value::str(link.plan)),
+        ("index", Value::uint(link.index)),
+        ("bytes", Value::uint(link.bytes)),
+        (
+            "objects",
+            Value::arr(
+                objects
+                    .into_iter()
+                    .map(|(kind, object)| {
+                        Value::obj(vec![
+                            (
+                                "kind",
+                                Value::str(match kind {
+                                    CacheKind::Blob => "blob",
+                                    CacheKind::Manifest => "manifest",
+                                }),
+                            ),
+                            ("object_id", Value::str(object.id())),
+                            ("length", Value::uint(object.length)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ];
+    if let Some(previous) = &link.prev {
+        fields.push(("previous", reference(previous)));
+    }
+    if let Some(progress) = &link.progress {
+        fields.push(("progress", reference(progress)));
+    }
+    if let Some(next) = next {
+        fields.push(("next_offset", Value::uint(next as u64)));
+    }
+    let value = Value::obj(fields);
+    println!(
+        "{}",
+        String::from_utf8(tensorfs_core::canon::write(&value)).expect("canonical JSON")
+    );
+    ExitCode::SUCCESS
+}
+
 pub fn cmd_url(root: &Path, id: &str, length: &str, url: &str, flags: &Flags) -> ExitCode {
     let store = ok!(Store::open(root));
     let url = match url_of(url) {

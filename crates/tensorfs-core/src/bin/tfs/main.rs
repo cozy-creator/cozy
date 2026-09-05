@@ -132,6 +132,7 @@
 //!   tfs checkpoint write <root> [--plain]    objectize a synthetic tree, emit the header
 //!   tfs checkpoint read <root> <hex>         reconstruct every part, byte-identity checked
 //!   tfs checkpoint info <root> <hex>         component/scope query, zero tensor-byte reads
+//!   tfs checkpoint page <root> <hex> <len>   bounded source recovery link, --offset/--limit
 //!   tfs checkpoint locate <root> <hex> <component> <key> <role> <off> <len>
 //!   tfs checkpoint reproduce <root> <header.json> <entries.json>
 //!                                            verified refs -> canonical header + manifest
@@ -245,6 +246,7 @@ fn main() -> ExitCode {
         ["checkpoint", "write", r] => ckpt::cmd_write(Path::new(r), &flags),
         ["checkpoint", "read", r, h] => ckpt::cmd_read(Path::new(r), h, &flags),
         ["checkpoint", "info", r, h] => ckpt::cmd_info(Path::new(r), h),
+        ["checkpoint", "page", r, h, n] => fetch::cmd_checkpoint_page(Path::new(r), h, n, &flags),
         ["checkpoint", "locate", r, h, c, k, role, off, len] => ckpt::cmd_locate(
             Path::new(r),
             h,

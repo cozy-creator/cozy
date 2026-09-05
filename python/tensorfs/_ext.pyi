@@ -51,15 +51,38 @@ class PreparedSource(TypedDict):
     profile: str
     manifest_digest: str
     manifest_length: int
-    #: The resume pointer handed to the hub, advanced by compare-and-set on `durable_bytes`.
-    #: `None` until the conversion has banked anything.
-    journal: str | None
-    journal_links: int
-    durable_bytes: int
+class SourceCheckpoint(TypedDict):
+    slot: str
+    plan_digest: str
+    head: str
+    head_length: int
+    index: int
+    bytes: int
+
+class CheckpointObject(TypedDict):
+    kind: str
+    object_id: str
+    length: int
+
+class SourceCheckpointPage(TypedDict):
+    operation: str
+    plan_digest: str
+    index: int
+    bytes: int
+    previous: tuple[str, int] | None
+    progress: tuple[str, int] | None
+    next_offset: int | None
+    objects: list[CheckpointObject]
 
 class PreparedModelSource(TypedDict):
     replayed: bool
+    complete: bool
     sources: list[PreparedSource]
+    checkpoints: list[SourceCheckpoint]
+    spent: list[str]
+    converted_roles: int
+    resumed_roles: int
+    deferred_ops: int
 
 class ManifestRow(TypedDict):
     manifest_id: str
@@ -427,18 +450,27 @@ class Store:
         self, current: bytes, org: str, name: str, version: str, expected_revision: int
     ) -> bytes: ...
 
-    # -- foreign model sources. THE SEAM THAT BROKE, TWICE. Four arguments after `self`, and
-    # no address among them: URLs and credentials end in the supervisor and have no argument
-    # here. `files` rows are (member, object_id, length, path) — the path is the supervisor's
-    # verified local file, and two members may legitimately share one path when their bytes
-    # are identical (tfs-073).
+    # Headers fix the plan before bodies arrive. Only landed physical carriers are read.
     def prepare_model_source(
         self,
         operation_id: str,
         source_selection_digest: str,
         profiles: Sequence[tuple[str, str]],
-        files: Sequence[tuple[str, str, int, StrPath]],
+        roster: Sequence[tuple[str, str, int, StrPath, bytes]],
+        landed: Sequence[str],
+        *,
+        checkpoints: Sequence[tuple[str, str, int]] = ...,
     ) -> PreparedModelSource: ...
+    def source_checkpoint_page(
+        self, head_id: str, head_length: int, *, operation_id: str, slot: str,
+        plan_digest: str, offset: int = 0, limit: int = 128,
+    ) -> SourceCheckpointPage: ...
+    def source_checkpoint_push(
+        self, object_id: str, length: int, manifest: bool, grant: str, *, allow_local: bool = False,
+    ) -> dict[str, int | bool]: ...
+    def source_checkpoint_fetch(
+        self, object_id: str, length: int, manifest: bool, url: str, *, allow_local: bool = False,
+    ) -> dict[str, int | bool]: ...
     def release_model_source(self, operation_id: str) -> None: ...
 
     # -- derived

@@ -7,6 +7,7 @@
 //! `install` is the coordinator's act, performed against a receipt that binds the exact
 //! subject/manifest/header triple, and it is the only repository-release writer.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -398,13 +399,16 @@ pub enum Carriers<'a> {
     All,
     /// `landed[i]` says whether `files[i]` is readable right now.
     Landed(&'a [bool]),
+    /// Physical bodies, after an index has resolved each tensor onto its shard.
+    Ready(&'a BTreeSet<PathBuf>),
 }
 
 impl Carriers<'_> {
-    fn has(&self, file: usize) -> bool {
+    fn has(&self, file: usize, physical: &Path) -> bool {
         match self {
             Carriers::All => true,
             Carriers::Landed(landed) => landed.get(file).copied().unwrap_or(false),
+            Carriers::Ready(paths) => paths.contains(physical),
         }
     }
 }
@@ -420,6 +424,9 @@ pub struct Progress {
     pub inherited: u64,
     pub hashed: u64,
     pub deduped: u64,
+    /// Every physical carrier a not-yet-journalled op still needs, including a landed
+    /// sibling of an absent carrier. The caller may retire only the complement.
+    pub needed: BTreeSet<PathBuf>,
 }
 
 impl Progress {
@@ -533,10 +540,30 @@ pub fn convert(
                 continue;
             }
         }
-        if !op.roles.iter().all(|role| match &role.bytes {
-            Bytes::Stream { file, .. } | Bytes::Permute { file, .. } => carriers.has(*file),
-            Bytes::Inherit { .. } => true,
-        }) {
+        let mut dependencies = Vec::new();
+        for role in &op.roles {
+            let (file, key) = match &role.bytes {
+                Bytes::Stream { file, key } | Bytes::Permute { file, key, .. } => (*file, key),
+                Bytes::Inherit { .. } => continue,
+            };
+            let source = &files[file];
+            let tensor = indexes[file].get(key.as_str()).ok_or_else(|| Refusal {
+                code: Code::MISSING_TENSOR,
+                detail: format!(
+                    "{}/{}: source key {key:?} is absent",
+                    op.component, op.out_key
+                ),
+            })?;
+            let (path, _) = carrier::resolve(&source.path, &source.header, tensor)?;
+            dependencies.push((file, path.to_path_buf()));
+        }
+        if !dependencies
+            .iter()
+            .all(|(file, path)| carriers.has(*file, path))
+        {
+            progress
+                .needed
+                .extend(dependencies.into_iter().map(|(_, path)| path));
             progress.deferred_ops += 1;
             continue;
         }
@@ -916,17 +943,36 @@ pub fn advance(
     carriers: Carriers<'_>,
     mirror: Option<&Mirror>,
 ) -> Result<(Progress, Option<Outcome>)> {
-    let t0 = Instant::now();
     let mut journal = journal_of(store, plan, files, operation)?;
-    let progress = convert(
+    advance_journal(
         store,
         plan,
         files,
-        &mut journal,
+        specs,
+        configs,
         operation,
         carriers,
         mirror,
-    )?;
+        &mut journal,
+    )
+}
+
+/// The source coordinator supplies a journal keyed by immutable source identities rather
+/// than local paths. Conversion and final completeness still have exactly one executor.
+#[allow(clippy::too_many_arguments)]
+pub fn advance_journal(
+    store: &Store,
+    plan: &Plan,
+    files: &[SourceFile],
+    specs: &[(String, EncodingSpec)],
+    configs: &[(String, Vec<u8>)],
+    operation: &str,
+    carriers: Carriers<'_>,
+    mirror: Option<&Mirror>,
+    journal: &mut Journal,
+) -> Result<(Progress, Option<Outcome>)> {
+    let t0 = Instant::now();
+    let progress = convert(store, plan, files, journal, operation, carriers, mirror)?;
     if !progress.complete() {
         return Ok((progress, None));
     }
@@ -934,7 +980,7 @@ pub fn advance(
         store,
         Finalize {
             plan,
-            journal: &journal,
+            journal,
             specs,
             configs,
             operation,

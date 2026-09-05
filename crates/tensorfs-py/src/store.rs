@@ -751,25 +751,35 @@ impl PyStore {
         })
     }
 
-    /// Prepare one descriptor-reviewed foreign source entirely from verified supervisor
-    /// paths. Access URLs and credentials are outside this facade and have no argument.
-    ///
-    /// THE CALLER PASSES NO CACHE. If this Store is bound to one, the conversion writes its
-    /// output through to it AS IT RUNS, so a pod reclaimed mid-conversion costs the
-    /// re-conversion of one checkpoint interval rather than the whole artifact; if it is
-    /// bound to none, the same call produces the same bytes and publishes nothing. Each
-    /// returned row carries `journal`, `journal_links` and `durable_bytes`: the caller hands
-    /// `journal` to the hub as this operation's resume pointer, advanced by compare-and-set
-    /// on `durable_bytes`, which only moves forward.
-    #[pyo3(signature = (operation_id, source_selection_digest, profiles, files))]
+    /// Advance the exact source plan over verified physical carriers. Checkpoint heads are
+    /// local progress until the RecordOwner acknowledges their complete upload.
+    #[pyo3(signature = (operation_id, source_selection_digest, profiles, roster, landed, *, checkpoints=Vec::new()))]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn prepare_model_source<'p>(
         &self,
         py: Python<'p>,
         operation_id: &str,
         source_selection_digest: &str,
         profiles: Vec<(String, String)>,
-        files: Vec<(String, String, u64, PathBuf)>,
+        roster: Vec<(String, String, u64, PathBuf, Vec<u8>)>,
+        landed: Vec<String>,
+        checkpoints: Vec<(String, String, u64)>,
     ) -> PyResult<Bound<'p, PyDict>> {
+        let checkpoints = checkpoints
+            .into_iter()
+            .map(|(slot, id, length)| {
+                prefixed("source checkpoint", &id).map(|id| {
+                    (
+                        slot,
+                        ObjectRef {
+                            sha256: id.trim_start_matches("sha256:").into(),
+                            length,
+                        },
+                    )
+                })
+            })
+            .collect::<TResult<Vec<_>>>()
+            .or_refuse(py)?;
         let request = PrepareModelSource {
             operation_id: operation_id.to_string(),
             source_selection_digest: source_selection_digest.to_string(),
@@ -777,23 +787,31 @@ impl PyStore {
                 .into_iter()
                 .map(|(slot, profile)| ModelSourceProfile { slot, profile })
                 .collect(),
-            files: files
+            roster: roster
                 .into_iter()
                 .map(
-                    |(member, object_id, length, path)| VerifiedModelSourceFile {
+                    |(member, object_id, length, path, header)| VerifiedModelSourceFile {
                         member,
                         object_id,
                         length,
                         path,
+                        header,
                     },
                 )
                 .collect(),
+            landed,
+            checkpoints,
         };
         let prepared = py
             .detach(|| model_source::prepare_model_source(&self.store, &request))
             .or_refuse(py)?;
         let out = PyDict::new(py);
         out.set_item("replayed", prepared.replayed)?;
+        out.set_item("complete", prepared.complete)?;
+        out.set_item("spent", prepared.spent)?;
+        out.set_item("converted_roles", prepared.converted_roles)?;
+        out.set_item("resumed_roles", prepared.resumed_roles)?;
+        out.set_item("deferred_ops", prepared.deferred_ops)?;
         let rows = PyList::empty(py);
         for source in prepared.sources {
             let row = PyDict::new(py);
@@ -801,19 +819,208 @@ impl PyStore {
             row.set_item("profile", source.profile)?;
             row.set_item("manifest_digest", source.manifest_digest)?;
             row.set_item("manifest_length", source.manifest_length)?;
-            row.set_item(
-                "journal",
-                source
-                    .durable
-                    .head
-                    .as_ref()
-                    .map(tensorfs_core::ids::ObjectRef::id),
-            )?;
-            row.set_item("journal_links", source.durable.links)?;
-            row.set_item("durable_bytes", source.durable.bytes)?;
             rows.append(row)?;
         }
         out.set_item("sources", rows)?;
+        let checkpoints = PyList::empty(py);
+        for checkpoint in prepared.checkpoints {
+            let Some(head) = checkpoint.head.head else {
+                continue;
+            };
+            let row = PyDict::new(py);
+            row.set_item("slot", checkpoint.slot)?;
+            row.set_item("plan_digest", checkpoint.plan_digest)?;
+            row.set_item("head", head.id())?;
+            row.set_item("head_length", head.length)?;
+            row.set_item("index", checkpoint.head.links - 1)?;
+            row.set_item("bytes", checkpoint.head.bytes)?;
+            checkpoints.append(row)?;
+        }
+        out.set_item("checkpoints", checkpoints)?;
+        Ok(out)
+    }
+
+    /// One bounded link window, usable as soon as that link alone is resident.
+    #[pyo3(signature = (head_id, head_length, *, operation_id, slot, plan_digest, offset=0, limit=128))]
+    #[allow(clippy::too_many_arguments)]
+    fn source_checkpoint_page<'p>(
+        &self,
+        py: Python<'p>,
+        head_id: &str,
+        head_length: u64,
+        operation_id: &str,
+        slot: &str,
+        plan_digest: &str,
+        offset: usize,
+        limit: usize,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let id = prefixed("source checkpoint", head_id).or_refuse(py)?;
+        let object = ObjectRef {
+            sha256: id.trim_start_matches("sha256:").into(),
+            length: head_length,
+        };
+        let tensorfs_core::durability::Window {
+            link,
+            objects,
+            next,
+        } = py
+            .detach(|| tensorfs_core::durability::local_window(&self.store, &object, offset, limit))
+            .or_refuse(py)?;
+        if link.operation != format!("{operation_id}/{slot}") || link.plan != plan_digest {
+            return Err(to_py(
+                py,
+                &Refusal {
+                    code: Code::CROSS_SUBJECT_REPLAY,
+                    detail: "checkpoint link differs from its operation, slot or plan".into(),
+                },
+            ));
+        }
+        let out = PyDict::new(py);
+        out.set_item("operation", link.operation)?;
+        out.set_item("plan_digest", link.plan)?;
+        out.set_item("index", link.index)?;
+        out.set_item("bytes", link.bytes)?;
+        out.set_item("previous", link.prev.as_ref().map(|r| (r.id(), r.length)))?;
+        out.set_item(
+            "progress",
+            link.progress.as_ref().map(|r| (r.id(), r.length)),
+        )?;
+        out.set_item("next_offset", next)?;
+        let rows = PyList::empty(py);
+        for (kind, object) in objects {
+            let row = PyDict::new(py);
+            row.set_item(
+                "kind",
+                match kind {
+                    tensorfs_core::repo_cache::CacheKind::Blob => "blob",
+                    tensorfs_core::repo_cache::CacheKind::Manifest => "manifest",
+                },
+            )?;
+            row.set_item("object_id", object.id())?;
+            row.set_item("length", object.length)?;
+            rows.append(row)?;
+        }
+        out.set_item("objects", rows)?;
+        Ok(out)
+    }
+
+    /// Spend one scoped PUT through the existing TensorFS transport. The caller's expected
+    /// length is checked before a socket opens, and the grant never leaves process memory.
+    #[pyo3(signature = (object_id, length, manifest, grant, *, allow_local=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn source_checkpoint_push<'p>(
+        &self,
+        py: Python<'p>,
+        object_id: &str,
+        length: u64,
+        manifest: bool,
+        grant: &str,
+        allow_local: bool,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        use tensorfs_core::{fetch, transport};
+        let id = prefixed("checkpoint object", object_id).or_refuse(py)?;
+        let object = ObjectRef {
+            sha256: id.trim_start_matches("sha256:").into(),
+            length,
+        };
+        let grant = transport::UploadGrant::parse(grant).or_refuse(py)?;
+        let policy = transport::SourcePolicy {
+            allowed_hosts: vec![transport::base_host(&grant.url).or_refuse(py)?],
+            allow_local,
+            max_redirects: 0,
+        };
+        let pushed = py
+            .detach(|| {
+                let (plan, _) = if manifest {
+                    fetch::FetchPlan::of(&self.store, "checkpoint-upload", &object, &[])?
+                } else {
+                    fetch::FetchPlan::of_objects(
+                        &self.store,
+                        "checkpoint-upload",
+                        std::slice::from_ref(&object),
+                    )?
+                };
+                if !plan.wanted.is_empty() {
+                    return refuse(
+                        Code::OBJECT_ABSENT,
+                        "checkpoint upload object is not verified locally",
+                    );
+                }
+                transport::push_object(
+                    &self.store,
+                    &object.sha256,
+                    manifest,
+                    &grant,
+                    &policy,
+                    &transport::Anonymous,
+                    transport::Deadline::after_seconds(None),
+                    &transport::Ledger::new(),
+                    "application/octet-stream",
+                )
+            })
+            .or_refuse(py)?;
+        let out = PyDict::new(py);
+        out.set_item("http_status", pushed.http_status)?;
+        out.set_item("transferred", pushed.bytes_sent)?;
+        out.set_item("held", pushed.landed_precondition)?;
+        Ok(out)
+    }
+
+    /// Fetch one exact recovery object through ordinary digest/length admission.
+    #[pyo3(signature = (object_id, length, manifest, url, *, allow_local=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn source_checkpoint_fetch<'p>(
+        &self,
+        py: Python<'p>,
+        object_id: &str,
+        length: u64,
+        manifest: bool,
+        url: &str,
+        allow_local: bool,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        use tensorfs_core::{fetch, transport};
+        let id = prefixed("checkpoint object", object_id).or_refuse(py)?;
+        let object = ObjectRef {
+            sha256: id.trim_start_matches("sha256:").into(),
+            length,
+        };
+        let policy = transport::SourcePolicy {
+            allowed_hosts: vec![transport::base_host(url).or_refuse(py)?],
+            allow_local,
+            max_redirects: 0,
+        };
+        let (transferred, held) = py
+            .detach(|| {
+                let (plan, _) = if manifest {
+                    fetch::FetchPlan::of(&self.store, "checkpoint-download", &object, &[])?
+                } else {
+                    fetch::FetchPlan::of_objects(
+                        &self.store,
+                        "checkpoint-download",
+                        std::slice::from_ref(&object),
+                    )?
+                };
+                if plan.wanted.is_empty() {
+                    return Ok((0, true));
+                }
+                let grant = fetch::DeliveryGrant::mint(&plan, &object)?;
+                let fetched = transport::fetch_ranged(
+                    &self.store,
+                    &grant,
+                    url,
+                    &policy,
+                    &transport::Anonymous,
+                    transport::Deadline::after_seconds(None),
+                    &transport::Ledger::new(),
+                    transport::Ranged::default(),
+                    None,
+                )?;
+                Ok((fetched.transferred, false))
+            })
+            .or_refuse(py)?;
+        let out = PyDict::new(py);
+        out.set_item("transferred", transferred)?;
+        out.set_item("held", held)?;
         Ok(out)
     }
 

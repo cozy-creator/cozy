@@ -47,6 +47,10 @@ use crate::store::Store;
 /// only so a walk over untrusted digests terminates.
 pub const MAX_SEGMENTS: usize = 65_536;
 
+/// A control exchange names at most this many objects. The chain, rather than a frame,
+/// carries the rest of the operation's inventory.
+pub const CHECKPOINT_REFS: usize = 128;
+
 /// One link: the objects this conversion had published onto the cache when it was written.
 ///
 /// Sizing follows the header's: `objects` is bounded by `MAX_TOTAL_REFS` because a segment
@@ -176,6 +180,237 @@ pub fn canonical_refs(mut refs: Vec<ObjectRef>) -> Vec<ObjectRef> {
     refs.sort_by(|a, b| a.sha256.cmp(&b.sha256));
     refs.dedup_by(|a, b| a.sha256 == b.sha256);
     refs
+}
+
+/// Read an admitted link from the local Store. Unlike `chain`, this does not require an
+/// NFS binding: the ordinary transfer plane may have obtained it from the hub.
+pub fn local_link(store: &Store, object: &ObjectRef) -> Result<Link> {
+    if object.length > Link::MAX_BYTES as u64 {
+        return refuse(
+            Code::COUNT_CAP,
+            "checkpoint link exceeds the document byte cap",
+        );
+    }
+    let mut bytes = Vec::with_capacity(object.length as usize);
+    store.read_into(&object.sha256, &mut bytes)?;
+    if ObjectRef::of(&bytes) != *object {
+        return refuse(
+            Code::OBJECT_ID_MISMATCH,
+            "checkpoint link differs from its ObjectRef",
+        );
+    }
+    Link::parse(&bytes)
+}
+
+/// Each call reads one link and returns a bounded window, so a caller can fetch links and
+/// their objects without first downloading the entire chain or building a model-sized frame.
+pub struct Window {
+    pub link: Link,
+    pub objects: Vec<(CacheKind, ObjectRef)>,
+    pub next: Option<usize>,
+}
+
+pub fn local_window(
+    store: &Store,
+    object: &ObjectRef,
+    offset: usize,
+    limit: usize,
+) -> Result<Window> {
+    if limit == 0 || limit > CHECKPOINT_REFS {
+        return refuse(Code::COUNT_CAP, "checkpoint page limit is outside 1..=128");
+    }
+    let mut link = local_link(store, object)?;
+    let count = link.blobs.len() + link.manifests.len();
+    if offset > count {
+        return refuse(
+            Code::COUNT_CAP,
+            "checkpoint page offset exceeds its object count",
+        );
+    }
+    let objects = link
+        .blobs
+        .iter()
+        .map(|r| (CacheKind::Blob, r.clone()))
+        .chain(
+            link.manifests
+                .iter()
+                .map(|r| (CacheKind::Manifest, r.clone())),
+        )
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let end = offset + objects.len();
+    link.blobs.clear();
+    link.manifests.clear();
+    Ok(Window {
+        link,
+        objects,
+        next: (end < count).then_some(end),
+    })
+}
+
+pub fn local_chain(store: &Store, head: &ObjectRef, plan: &str) -> Result<Set> {
+    let mut links = Vec::new();
+    let mut cursor = Some(head.clone());
+    while let Some(object) = cursor {
+        if links.len() >= MAX_SEGMENTS {
+            return refuse(Code::COUNT_CAP, "checkpoint chain exceeds its link cap");
+        }
+        let link = local_link(store, &object)?;
+        if let Some(newer) = links.last() {
+            let newer: &Link = newer;
+            if link.index.checked_add(1) != Some(newer.index) {
+                return refuse(
+                    Code::SORT_ORDER,
+                    "checkpoint predecessor index does not decrease by one",
+                );
+            }
+        }
+        cursor = link.prev.clone();
+        links.push(link);
+    }
+    links.reverse();
+    if links.first().is_some_and(|link| link.index != 0) {
+        return refuse(Code::SORT_ORDER, "checkpoint chain has no root");
+    }
+    fold(&links, plan)
+}
+
+/// Export locally complete progress. This does not assert remote durability: the RecordOwner
+/// publishes the bounded chain and advances its durable pointer only after upload acceptance.
+/// NFS is not consulted and cannot delay this checkpoint.
+pub fn checkpoint(
+    store: &Store,
+    policy: &Policy<'_>,
+    previous: Option<&ObjectRef>,
+    journal: &crate::ingest::journal::Journal,
+) -> Result<Head> {
+    let prior = previous
+        .map(|head| local_chain(store, head, policy.plan))
+        .transpose()?;
+    if prior
+        .as_ref()
+        .is_some_and(|set| set.operation != policy.chain)
+    {
+        return refuse(
+            Code::CROSS_SUBJECT_REPLAY,
+            "checkpoint belongs to another operation slot",
+        );
+    }
+    let bytes = journal.snapshot()?;
+    if bytes.len() > limits::DOC_MAX_BYTES {
+        return refuse(
+            Code::COUNT_CAP,
+            "checkpoint progress exceeds the document byte cap",
+        );
+    }
+    if bytes.is_empty() {
+        return Ok(Head::default());
+    }
+    let progress = store
+        .put_stream_held(
+            &mut bytes.as_slice(),
+            Some(&ObjectRef::of(&bytes)),
+            &Default::default(),
+            Some(policy.operation),
+        )?
+        .obj;
+    let mut objects = journal.objects();
+    for object in &objects {
+        let record = match store.record_valid(&object.sha256) {
+            Ok(record) => record,
+            Err(_) => {
+                store.verify(&object.sha256)?;
+                store
+                    .record_valid(&object.sha256)
+                    .map_err(|detail| crate::err::Refusal {
+                        code: Code::OBJECT_ABSENT,
+                        detail,
+                    })?
+            }
+        };
+        if record.length != object.length {
+            return refuse(
+                Code::LENGTH_MISMATCH,
+                "checkpoint journal names the wrong object length",
+            );
+        }
+    }
+    objects.push(progress.clone());
+    objects = canonical_refs(objects);
+    let held: std::collections::BTreeSet<&str> = prior
+        .iter()
+        .flat_map(|set| set.blobs.iter().map(|object| object.sha256.as_str()))
+        .collect();
+    objects.retain(|object| !held.contains(object.sha256.as_str()));
+    let mut head = Head {
+        head: previous.cloned(),
+        links: prior.as_ref().map_or(0, |set| set.links),
+        bytes: prior.as_ref().map_or(0, |set| set.bytes),
+    };
+    if objects.is_empty() {
+        return Ok(head);
+    }
+    let pages = objects.chunks(CHECKPOINT_REFS);
+    let page_count = pages.len();
+    let mut candidates = vec![progress.clone()];
+    for (index, page) in pages.enumerate() {
+        if head.links >= MAX_SEGMENTS as u64 {
+            return refuse(Code::COUNT_CAP, "checkpoint chain exceeds its link cap");
+        }
+        head.bytes = page.iter().try_fold(head.bytes, |sum, object| {
+            sum.checked_add(object.length)
+                .ok_or_else(|| crate::err::Refusal {
+                    code: Code::COUNT_CAP,
+                    detail: "checkpoint byte watermark overflow".into(),
+                })
+        })?;
+        let link = Link {
+            operation: policy.chain.to_string(),
+            plan: policy.plan.to_string(),
+            prev: head.head.clone(),
+            index: head.links,
+            blobs: page.to_vec(),
+            manifests: Vec::new(),
+            bytes: head.bytes,
+            progress: if index + 1 == page_count {
+                Some(progress.clone())
+            } else {
+                None
+            },
+        };
+        let bytes = link.canonical_bytes();
+        let object = store
+            .put_stream_held(
+                &mut bytes.as_slice(),
+                Some(&ObjectRef::of(&bytes)),
+                &Default::default(),
+                Some(policy.operation),
+            )?
+            .obj;
+        candidates.push(object.clone());
+        head.head = Some(object);
+        head.links += 1;
+    }
+    crate::ingest::transaction::name_candidates(store.root(), policy.operation, &candidates)?;
+    Ok(head)
+}
+
+/// Pin restored chain documents before their journal is installed. Tensor segments are
+/// subsequently held by that journal; every immutable link/progress document is retained here.
+pub fn retain_local_chain(store: &Store, head: &ObjectRef, operation: &str) -> Result<()> {
+    let mut cursor = Some(head.clone());
+    let mut documents = Vec::new();
+    while let Some(object) = cursor {
+        if documents.len() >= MAX_SEGMENTS * 2 {
+            return refuse(Code::COUNT_CAP, "checkpoint chain exceeds its link cap");
+        }
+        let link = local_link(store, &object)?;
+        documents.push(object);
+        documents.extend(link.progress);
+        cursor = link.prev;
+    }
+    crate::ingest::transaction::name_candidates(store.root(), operation, &documents)
 }
 
 /// Append one link and publish it. The segment goes into the local Store like any other

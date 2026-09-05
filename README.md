@@ -489,20 +489,37 @@ prepared = store.prepare_model_source(
     source_selection_digest,
     [("dits", "hf/minimax-h3/native-dual-bf16/1"),
      ("shared", "hf/minimax-h3/shared-bf16/1")],
-    [(member, object_id, length, verified_path), ...],
+    [(member, object_id, length, local_path, exact_header_bytes), ...],
+    landed_members,
+    checkpoints=[(slot, previous_head_id, previous_head_length), ...],
 )
-# prepared = {replayed, sources:[{slot, profile, manifest_digest, manifest_length}]}
+# prepared = {complete, replayed, sources, checkpoints, spent,
+#             converted_roles, resumed_roles, deferred_ops}
+# Only after the operation is adopted or explicitly abandoned:
 store.release_model_source(operation_id)
 ```
 
-Inputs are sorted exact profile and verified-file rows. TensorFS binds the supervisor-verified
-ObjectRefs into operation identity and re-fences each regular non-symlink path by device, inode,
-length, and change token before and after conversion. It deliberately does not perform a second
-whole-file SHA pass: the existing streaming ingest pass hashes every admitted tensor byte into the
-CAS. All profiles prepare under one operation; only a complete sorted result set becomes replayable.
-Exact replay returns the same Manifest bytes; changed profile or file facts conflict, and explicit
-release removes only operation holds. Access URLs, credentials, provenance, repository names, and
-catalog release identity have no argument or durable field.
+The sorted roster contains all members from the outset. Headers are exact JSON index bytes or
+the safetensors eight-byte length plus header JSON. Every body length is pinned; only members in
+`landed_members` need exist. TensorFS plans from all headers, resolves each tensor to its physical
+shard, converts available ops, and journals them before returning. A shared index object can still
+name different shard sets through its two member names. Local paths and unrelated registry entries
+do not change work identity; source ObjectRefs and the actual ordered tensor plan do.
+
+`sources` contains final `{slot, profile, manifest_digest, manifest_length}` rows only when every
+profile is complete. Partial work returns separate `checkpoints` rows:
+`{slot, head, head_length, plan_digest, index, bytes}`. These are **local** progress, not a claim of
+remote durability. The existing immutable Link format carries at most 128 new refs per link and
+an opaque journal snapshot. `Store.source_checkpoint_page` validates operation/slot/plan and
+returns bounded refs, predecessor and progress references; `tfs checkpoint page ROOT HEAD LENGTH`
+is its diagnostic CLI. Fetch/PUT use `Store.source_checkpoint_fetch/push` over the existing transport.
+
+The caller may delete `spent` raw carriers once canonical output and its journal are held locally.
+The RecordOwner uploads each Link and its objects and retains an acknowledged head outside the pod.
+Canonical output remains held until upload or an explicit terminal action. A replacement pod fetches the chain
+through ordinary verified admission and passes its head back in `checkpoints`; TensorFS re-derives
+the plan and verifies journalled parts before skipping work. No NFS mount is required or accessed
+by source preparation. Explicit release removes the operation's holds and recovery journal.
 
 `repo apply` validates the exact manifest, header, and complete blob inventory before the caller may
 perform its repository CAS, then records only `(org,name,manifest_sha256)` in SQLite. Missing or

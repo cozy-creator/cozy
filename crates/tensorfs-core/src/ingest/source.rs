@@ -755,61 +755,6 @@ pub fn golden_suite(converter: &Converter) -> Result<usize> {
     Ok(count)
 }
 
-/// Convert one prepared profile, writing every object it admits through to `cache` as it
-/// lands.
-///
-/// **The durability chain is per (operation, slot) and named that way because that is the
-/// unit a resume replays.** `chain` carries the slot; two profiles of one request convert
-/// different plans, and a single chain over both could not be validated against either. The
-/// plan digest each link records is `ingest::journal::plan_digest` — the SAME identity the
-/// conversion journal keys its file on, so the two planes cannot disagree about which
-/// conversion this is.
-fn execute_prepared(
-    store: &Store,
-    operation: &str,
-    chain: &str,
-    prepared: &Prepared,
-) -> Result<(ObjectRef, durability::Head)> {
-    let _ = golden_suite(prepared.conv)?;
-    for (_, seed) in &prepared.seeds {
-        if let Some(vectors) = &seed.vectors {
-            vectors.check(&seed.spec)?;
-        }
-    }
-    let predicted = tensor_schema_digest_of(&plan_tensor_schema(&prepared.plan));
-    let headers: Vec<(PathBuf, &carrier::SourceHeader)> = prepared
-        .files
-        .iter()
-        .map(|file| (file.path.clone(), &file.header))
-        .collect();
-    let plan_digest = super::journal::plan_digest(&prepared.plan, &headers);
-    let policy = durability::Policy {
-        chain,
-        operation,
-        plan: &format!("sha256:{plan_digest}"),
-        interval: durability::INTERVAL_BYTES,
-    };
-    let (converted, durable) = durability::with(store, &policy, |mirror| {
-        transaction::execute(
-            store,
-            &prepared.plan,
-            &prepared.files,
-            &plain_specs(&prepared.seeds),
-            &[],
-            operation,
-            mirror,
-        )
-    });
-    let outcome = converted?;
-    if outcome.header.tensor_schema_digest() != predicted {
-        return refuse(
-            Code::TENSOR_SCHEMA_MISMATCH,
-            "source plan and executed tensor schema differ",
-        );
-    }
-    Ok((outcome.manifest_ref, durable.journal))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSourceProfile {
     pub slot: String,
@@ -822,24 +767,22 @@ pub struct VerifiedModelSourceFile {
     pub object_id: String,
     pub length: u64,
     pub path: PathBuf,
+    /// Exact index JSON or safetensors length-plus-header prefix, never payload.
+    pub header: Vec<u8>,
 }
 
-/// One preparation request. It names WHAT to convert and nothing about where the output is
-/// kept: the write-through cache is a property of the `Store` this runs against
-/// ([`crate::store::REPO_CACHE_BINDING`]), so no caller of this type ever spells a mount
-/// point.
-///
-/// That placement preserves the contract the field it replaced was documented with: a
-/// conversion is the same conversion whether or not a volume happened to be bound, so a pod
-/// with a cache and a pod without one replay each other's stored result rather than treating
-/// it as a different request. The cache changes what a run COSTS and what survives it; it can
-/// never change what it produces, which is why it is absent from [`request_digest`].
+/// The full immutable source roster and the bodies currently available. Arrival and local
+/// paths do not identify the work. Output stays in the local Store until the RecordOwner
+/// uploads and acknowledges its checkpoint chain; this call never waits for a cache mount.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareModelSource {
     pub operation_id: String,
     pub source_selection_digest: String,
     pub profiles: Vec<ModelSourceProfile>,
-    pub files: Vec<VerifiedModelSourceFile>,
+    pub roster: Vec<VerifiedModelSourceFile>,
+    pub landed: Vec<String>,
+    /// Latest observed local heads. Only the caller knows which were remotely acknowledged.
+    pub checkpoints: Vec<(String, ObjectRef)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -848,16 +791,26 @@ pub struct PreparedModelSource {
     pub profile: String,
     pub manifest_digest: String,
     pub manifest_length: u64,
-    /// Where this slot's durability chain ends. `head` is the digest the caller hands the
-    /// hub, and `bytes` the monotonic watermark it compare-and-sets on. Empty on a replayed
-    /// preparation and on a run with no cache: both are runs that published nothing.
-    pub durable: durability::Head,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedModelSources {
     pub replayed: bool,
+    pub complete: bool,
     pub sources: Vec<PreparedModelSource>,
+    pub checkpoints: Vec<SourceCheckpoint>,
+    pub spent: Vec<String>,
+    pub converted_roles: usize,
+    pub resumed_roles: usize,
+    pub deferred_ops: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCheckpoint {
+    pub slot: String,
+    pub plan_digest: String,
+    /// Locally checkpointed bytes. Remote durability requires the caller's upload acknowledgment.
+    pub head: durability::Head,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -944,12 +897,18 @@ impl FileFence {
 fn validate_request(
     request: &PrepareModelSource,
     registry: &FingerprintRegistry,
-) -> Result<Vec<FileFence>> {
+) -> Result<(std::collections::BTreeSet<PathBuf>, Vec<FileFence>)> {
     ascii_name(
         "model-source operation",
         &request.operation_id,
         crate::limits::MAX_NAME_BYTES,
     )?;
+    if request.operation_id.contains('/') {
+        return refuse(
+            Code::KEY_GRAMMAR,
+            "model-source operation is one path segment",
+        );
+    }
     prefixed("source selection digest", &request.source_selection_digest)?;
     if request.profiles.is_empty() || request.profiles.len() > 16 {
         return refuse(Code::COUNT_CAP, "source profile count is outside 1..=16");
@@ -978,14 +937,14 @@ fn validate_request(
             );
         }
     }
-    if request.files.is_empty() || request.files.len() > 4096 {
+    if request.roster.is_empty() || request.roster.len() > 4096 {
         return refuse(
             Code::COUNT_CAP,
             "verified source file count is outside 1..=4096",
         );
     }
     let members: Vec<&str> = request
-        .files
+        .roster
         .iter()
         .map(|row| row.member.as_str())
         .collect();
@@ -999,7 +958,7 @@ fn validate_request(
     // is an OBJECT's identity, so it may repeat across members, but only ever bearing one
     // object. Two DIFFERENT objects on one path is a real fault and stays a refusal.
     let mut owners: BTreeMap<&Path, &str> = BTreeMap::new();
-    for row in &request.files {
+    for row in &request.roster {
         if *owners
             .entry(row.path.as_path())
             .or_insert(row.object_id.as_str())
@@ -1014,7 +973,91 @@ fn validate_request(
             );
         }
     }
-    request.files.iter().map(FileFence::capture).collect()
+    let mut ready = std::collections::BTreeSet::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut fences = Vec::new();
+    for row in &request.roster {
+        fingerprint::validate_source_member(&row.member)?;
+        prefixed("source ObjectRef", &row.object_id)?;
+        if !row.path.is_absolute()
+            || row.length == 0
+            || row.header.is_empty()
+            || row.header.len() > crate::limits::CARRIER_HEADER_MAX_BYTES + 8
+            || row.header.len() as u64 > row.length
+        {
+            return refuse(
+                Code::CARRIER_GEOMETRY,
+                "source roster has invalid path, length or bounded header",
+            );
+        }
+        if row.member.ends_with(".index.json") {
+            if row.header.len() as u64 != row.length
+                || ObjectRef::of(&row.header).id() != row.object_id
+            {
+                return refuse(
+                    Code::OBJECT_ID_MISMATCH,
+                    "index metadata differs from its pinned ObjectRef",
+                );
+            }
+        } else {
+            if row.header.len() < 8 {
+                return refuse(
+                    Code::CARRIER_TRUNCATED,
+                    "source header has no length prefix",
+                );
+            }
+            let n = u64::from_le_bytes(row.header[..8].try_into().expect("eight bytes"));
+            if n != row.header.len() as u64 - 8 {
+                return refuse(
+                    Code::LENGTH_MISMATCH,
+                    "source header length differs from its exact prefix",
+                );
+            }
+            carrier::parse_header(&row.header[8..], n + 8, Some(row.length))?;
+        }
+    }
+    for member in &request.landed {
+        if !seen.insert(member) {
+            return refuse(Code::DUPLICATE_KEY, "landed source member repeats");
+        }
+        let row = request
+            .roster
+            .iter()
+            .find(|row| &row.member == member)
+            .ok_or_else(|| Refusal {
+                code: Code::MISSING_FIELD,
+                detail: "landed source is outside the pinned roster".into(),
+            })?;
+        fences.push(FileFence::capture(row)?);
+        // The header used to plan must be the prefix of the admitted body, not a second
+        // unauthenticated description of it. This reads only metadata, never the payload.
+        let mut file = fs::File::open(&row.path).map_err(|error| Refusal {
+            code: Code::IO_FAILED,
+            detail: format!("open source header: {error}"),
+        })?;
+        let mut prefix = vec![0; row.header.len()];
+        file.read_exact(&mut prefix).map_err(|error| Refusal {
+            code: Code::IO_FAILED,
+            detail: format!("read source header: {error}"),
+        })?;
+        if prefix != row.header {
+            return refuse(
+                Code::OBJECT_ID_MISMATCH,
+                "landed carrier header changed from its pinned metadata",
+            );
+        }
+        ready.insert(row.path.clone());
+    }
+    let mut checkpoint_slots = std::collections::BTreeSet::new();
+    for (slot, _) in &request.checkpoints {
+        if !checkpoint_slots.insert(slot) || !request.profiles.iter().any(|row| &row.slot == slot) {
+            return refuse(
+                Code::DUPLICATE_KEY,
+                "checkpoint slot repeats or is outside the profile set",
+            );
+        }
+    }
+    Ok((ready, fences))
 }
 
 fn digest_field(hash: &mut crate::sha256::Sha256, value: &[u8]) {
@@ -1022,20 +1065,19 @@ fn digest_field(hash: &mut crate::sha256::Sha256, value: &[u8]) {
     hash.update(value);
 }
 
-fn request_digest(request: &PrepareModelSource, registry_bytes: &[u8]) -> String {
+fn request_digest(request: &PrepareModelSource, _registry_bytes: &[u8]) -> String {
     let mut hash = crate::sha256::Sha256::new();
     digest_field(&mut hash, b"tensorfs.model-source-preparation");
-    digest_field(&mut hash, &crate::sha256::digest(registry_bytes));
     digest_field(&mut hash, request.source_selection_digest.as_bytes());
     for row in &request.profiles {
         digest_field(&mut hash, row.slot.as_bytes());
         digest_field(&mut hash, row.profile.as_bytes());
     }
-    for row in &request.files {
+    for row in &request.roster {
         digest_field(&mut hash, row.member.as_bytes());
         digest_field(&mut hash, row.object_id.as_bytes());
         digest_field(&mut hash, &row.length.to_le_bytes());
-        digest_field(&mut hash, row.path.as_os_str().as_encoded_bytes());
+        digest_field(&mut hash, &row.header);
     }
     format!("sha256:{}", crate::sha256::hex(&hash.finish()))
 }
@@ -1066,15 +1108,84 @@ fn prepare_model_source_with_registry(
     registry_bytes: &[u8],
 ) -> Result<PreparedModelSources> {
     let registry = FingerprintRegistry::parse(registry_bytes)?;
-    let fences = validate_request(request, &registry)?;
+    let (ready, fences) = validate_request(request, &registry)?;
     let digest = request_digest(request, registry_bytes);
+    let heads: Vec<_> = request
+        .roster
+        .iter()
+        .map(|row| crate::providers::MemberHead {
+            member: row.member.clone(),
+            length: row.length,
+            head: row.header.clone(),
+        })
+        .collect();
+    let staged = super::preflight::stage(
+        &store
+            .root()
+            .join("tmp")
+            .join(format!("source-heads-{}", crate::meta::now_nanos_unique())),
+        &heads,
+    )?;
+    let locations: BTreeMap<&Path, &VerifiedModelSourceFile> = staged
+        .carriers()
+        .iter()
+        .zip(&request.roster)
+        .map(|(carrier, row)| (carrier.path.as_path(), row))
+        .collect();
+    let mut plans = Vec::new();
+    for requested in &request.profiles {
+        let (_, mut prepared) = plan_source_prepared(
+            registry_locator,
+            registry_bytes,
+            staged.carriers(),
+            Some(&requested.profile),
+            None,
+        )?;
+        let _ = golden_suite(prepared.conv)?;
+        for (_, seed) in &prepared.seeds {
+            if let Some(vectors) = &seed.vectors {
+                vectors.check(&seed.spec)?;
+            }
+        }
+        // The tensor plan binds transforms/geometry/order; the pinned request binds all
+        // carrier object identities. Locations participate in neither identity.
+        let stable_headers: Vec<_> = prepared
+            .files
+            .iter()
+            .map(|file| {
+                let row = locations[&file.path.as_path()];
+                (PathBuf::from(&row.member), &file.header)
+            })
+            .collect();
+        let tensor_plan = super::journal::plan_digest(&prepared.plan, &stable_headers);
+        let mut hash = crate::sha256::Sha256::new();
+        digest_field(&mut hash, digest.as_bytes());
+        digest_field(&mut hash, requested.slot.as_bytes());
+        digest_field(&mut hash, tensor_plan.as_bytes());
+        let plan_hex = crate::sha256::hex(&hash.finish());
+        for file in &mut prepared.files {
+            file.path = locations[&file.path.as_path()].path.clone();
+            for shard in &mut file.header.shards {
+                shard.path = locations[&shard.path.as_path()].path.clone();
+            }
+        }
+        plans.push((plan_hex, prepared));
+    }
+    // A completed result replays only after its actual tensor plans were re-derived.
+    // Unrelated registry edits do not change these plans or invalidate completed work.
+    let mut request_hash = crate::sha256::Sha256::new();
+    digest_field(&mut request_hash, digest.as_bytes());
+    for (plan, _) in &plans {
+        digest_field(&mut request_hash, plan.as_bytes());
+    }
+    let digest = format!("sha256:{}", crate::sha256::hex(&request_hash.finish()));
     let catalog = crate::catalog::Catalog::open(store.root())?;
     let writer = match catalog.begin_source_preparation(&request.operation_id, &digest)? {
         crate::catalog::SourcePreparation::Prepared(rows) => {
             if rows.len() != request.profiles.len()
                 || rows
                     .iter()
-                    .zip(request.profiles.iter())
+                    .zip(&request.profiles)
                     .any(|(stored, requested)| {
                         stored.slot != requested.slot || stored.profile != requested.profile
                     })
@@ -1084,89 +1195,175 @@ fn prepare_model_source_with_registry(
                     "stored source results differ from their exact request",
                 );
             }
-            let prepared = PreparedModelSources {
-                replayed: true,
-                sources: rows
-                    .into_iter()
-                    .map(|row| PreparedModelSource {
-                        slot: row.slot,
-                        profile: row.profile,
-                        manifest_digest: format!("sha256:{}", row.manifest_sha256),
-                        manifest_length: row.manifest_length,
-                        durable: durability::Head::default(),
-                    })
-                    .collect(),
-            };
-            for source in &prepared.sources {
+            let sources: Vec<_> = rows
+                .into_iter()
+                .map(|row| PreparedModelSource {
+                    slot: row.slot,
+                    profile: row.profile,
+                    manifest_digest: format!("sha256:{}", row.manifest_sha256),
+                    manifest_length: row.manifest_length,
+                })
+                .collect();
+            for source in &sources {
                 validate_prepared_result(store, source)?;
             }
-            return Ok(prepared);
+            return Ok(PreparedModelSources {
+                replayed: true,
+                complete: true,
+                sources,
+                checkpoints: Vec::new(),
+                spent: request
+                    .roster
+                    .iter()
+                    .map(|row| row.member.clone())
+                    .collect(),
+                converted_roles: 0,
+                resumed_roles: 0,
+                deferred_ops: 0,
+            });
         }
         crate::catalog::SourcePreparation::Open(writer) => writer,
     };
-    let carriers: Vec<CarrierInput> = request
-        .files
-        .iter()
-        .map(|file| CarrierInput {
-            member: Some(file.member.clone()),
-            path: file.path.clone(),
-        })
-        .collect();
-    let mut sources = Vec::with_capacity(request.profiles.len());
-    for requested in &request.profiles {
-        for fence in &fences {
-            fence.check()?;
-        }
-        let (_, prepared) = plan_source_prepared(
-            registry_locator,
-            registry_bytes,
-            &carriers,
-            Some(&requested.profile),
-            None,
-        )?;
-        for source in &prepared.files {
-            for shard in &source.header.shards {
-                if !fences.iter().any(|fence| fence.path == shard.path) {
-                    return refuse(
-                        Code::OBJECT_ID_MISMATCH,
-                        format!("profile opened unverified shard {}", shard.path.display()),
-                    );
+    transaction::ensure_session_root(store.root(), &request.operation_id, "_tensorfs")?;
+    let mut result = PreparedModelSources {
+        replayed: false,
+        complete: true,
+        sources: Vec::new(),
+        checkpoints: Vec::new(),
+        spent: Vec::new(),
+        converted_roles: 0,
+        resumed_roles: 0,
+        deferred_ops: 0,
+    };
+    let mut needed = std::collections::BTreeSet::new();
+    for (requested, (plan_hex, prepared)) in request.profiles.iter().zip(plans) {
+        let plan_digest = format!("sha256:{plan_hex}");
+        let chain = format!("{}/{}", request.operation_id, requested.slot);
+        let previous = request
+            .checkpoints
+            .iter()
+            .find(|(slot, _)| slot == &requested.slot)
+            .map(|(_, head)| head);
+        let dir = transaction::candidate_dir(store.root(), &request.operation_id);
+        let mut journal = super::journal::Journal::open(&dir, &plan_hex)?;
+        if let Some(head) = previous {
+            let held = durability::local_chain(store, head, &plan_digest)?;
+            if held.operation != chain {
+                return refuse(
+                    Code::CROSS_SUBJECT_REPLAY,
+                    "checkpoint belongs to another operation slot",
+                );
+            }
+            durability::retain_local_chain(store, head, &request.operation_id)?;
+            if journal.is_empty() {
+                if let Some(progress) = held.progress.last() {
+                    if progress.length > crate::limits::DOC_MAX_BYTES as u64 {
+                        return refuse(
+                            Code::COUNT_CAP,
+                            "checkpoint progress exceeds the document byte cap",
+                        );
+                    }
+                    let mut bytes = Vec::with_capacity(progress.length as usize);
+                    store.read_into(&progress.sha256, &mut bytes)?;
+                    if ObjectRef::of(&bytes) != *progress {
+                        return refuse(
+                            Code::OBJECT_ID_MISMATCH,
+                            "checkpoint progress differs from its ObjectRef",
+                        );
+                    }
+                    drop(journal);
+                    super::journal::install(&dir, &plan_hex, &bytes)?;
+                    journal = super::journal::Journal::open(&dir, &plan_hex)?;
                 }
             }
         }
-        let chain = format!("{}/{}", request.operation_id, requested.slot);
-        let (manifest, durable) =
-            execute_prepared(store, &request.operation_id, &chain, &prepared)?;
-        sources.push(PreparedModelSource {
-            slot: requested.slot.clone(),
-            profile: requested.profile.clone(),
-            manifest_digest: manifest.id(),
-            manifest_length: manifest.length,
-            durable,
-        });
-        validate_prepared_result(store, sources.last().expect("just pushed source result"))?;
+        for fence in &fences {
+            fence.check()?;
+        }
+        let (progress, outcome) = transaction::advance_journal(
+            store,
+            &prepared.plan,
+            &prepared.files,
+            &plain_specs(&prepared.seeds),
+            &[],
+            &request.operation_id,
+            transaction::Carriers::Ready(&ready),
+            None,
+            &mut journal,
+        )?;
+        let checkpoint = durability::checkpoint(
+            store,
+            &durability::Policy {
+                chain: &chain,
+                operation: &request.operation_id,
+                plan: &plan_digest,
+                interval: durability::INTERVAL_BYTES,
+            },
+            previous,
+            &journal,
+        )?;
+        if checkpoint.head.is_some() {
+            result.checkpoints.push(SourceCheckpoint {
+                slot: requested.slot.clone(),
+                plan_digest,
+                head: checkpoint,
+            });
+        }
+        needed.extend(progress.needed);
+        result.converted_roles += progress.converted_roles;
+        result.resumed_roles += progress.resumed_roles;
+        result.deferred_ops += progress.deferred_ops;
+        if let Some(outcome) = outcome {
+            if outcome.header.tensor_schema_digest()
+                != tensor_schema_digest_of(&plan_tensor_schema(&prepared.plan))
+            {
+                return refuse(
+                    Code::TENSOR_SCHEMA_MISMATCH,
+                    "source plan and executed tensor schema differ",
+                );
+            }
+            result.sources.push(PreparedModelSource {
+                slot: requested.slot.clone(),
+                profile: requested.profile.clone(),
+                manifest_digest: outcome.manifest_ref.id(),
+                manifest_length: outcome.manifest_ref.length,
+            });
+        } else {
+            result.complete = false;
+        }
     }
     for fence in &fences {
         fence.check()?;
     }
-    let rows: Vec<crate::catalog::SourcePreparationResult> = sources
+    result.spent = request
+        .roster
         .iter()
-        .map(|source| crate::catalog::SourcePreparationResult {
-            slot: source.slot.clone(),
-            profile: source.profile.clone(),
-            manifest_sha256: source
-                .manifest_digest
-                .trim_start_matches("sha256:")
-                .to_string(),
-            manifest_length: source.manifest_length,
-        })
+        .filter(|row| !needed.contains(&row.path))
+        .map(|row| row.member.clone())
         .collect();
-    catalog.commit_source_preparation(&request.operation_id, &digest, &rows)?;
+    if result.complete {
+        for source in &result.sources {
+            validate_prepared_result(store, source)?;
+        }
+        let rows: Vec<_> = result
+            .sources
+            .iter()
+            .map(|source| crate::catalog::SourcePreparationResult {
+                slot: source.slot.clone(),
+                profile: source.profile.clone(),
+                manifest_sha256: source
+                    .manifest_digest
+                    .trim_start_matches("sha256:")
+                    .to_string(),
+                manifest_length: source.manifest_length,
+            })
+            .collect();
+        catalog.commit_source_preparation(&request.operation_id, &digest, &rows)?;
+    } else {
+        result.sources.clear();
+    }
     drop(writer);
-    Ok(PreparedModelSources {
-        replayed: false,
-        sources,
-    })
+    Ok(result)
 }
 
 pub fn prepare_model_source(
@@ -1202,6 +1399,11 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn header_prefix(bytes: &[u8]) -> Vec<u8> {
+        let length = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        bytes[..length + 8].to_vec()
     }
 
     fn carrier(path: &Path, key: &str, value: [u8; 4]) -> Vec<u8> {
@@ -1319,20 +1521,27 @@ mod tests {
                     profile: "fixture/second/1".into(),
                 },
             ],
-            files: vec![
+            roster: vec![
                 VerifiedModelSourceFile {
                     member: "provider/first.safetensors".into(),
                     object_id: ObjectRef::of(&first).id(),
                     length: first.len() as u64,
                     path: first_path,
+                    header: header_prefix(&first),
                 },
                 VerifiedModelSourceFile {
                     member: "provider/second.safetensors".into(),
                     object_id: ObjectRef::of(&second).id(),
                     length: second.len() as u64,
                     path: second_path,
+                    header: header_prefix(&second),
                 },
             ],
+            landed: vec![
+                "provider/first.safetensors".into(),
+                "provider/second.safetensors".into(),
+            ],
+            checkpoints: Vec::new(),
         };
         (store, registry.to_bytes(), request)
     }
@@ -1376,7 +1585,7 @@ mod tests {
         assert_eq!(replay.sources, first.sources);
 
         let mut changed = request.clone();
-        changed.files[0].object_id = format!("sha256:{}", "33".repeat(32));
+        changed.roster[0].object_id = format!("sha256:{}", "33".repeat(32));
         assert_eq!(
             prepare_model_source_with_registry(&store, &changed, "fixture:registry", &registry,)
                 .unwrap_err()
@@ -1413,87 +1622,33 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// THE DECISIVE ARM: a conversion driven through `prepare_model_source`, where NO
-    /// CALLER NAMED A CACHE, publishes its output onto one anyway — because the Store it ran
-    /// against is bound to it — and a second, entirely separate Store bound to the same
-    /// mount reads the whole checkpoint back, digest-verified, off that cache alone.
-    ///
-    /// This is the arm the write-through plane was missing. `repo_cache::Mirror` merged able
-    /// to publish and unreachable in production: the process that converts is the Runtime,
-    /// and the pod fences the Runtime child from the cache root by name, so the converter
-    /// could never be TOLD where the mount was. Nothing here tells it. Setup records the
-    /// mount on the Store once, and every later handle — this one, and the fresh one below
-    /// that has never met the first — finds it.
-    ///
-    /// The readback is not a file comparison. `restore_checkpoint` admits every object
-    /// through `put_stream` at the digest that names it and finishes with the Store's own
-    /// local closure walk, so "restored" here means exactly what it means after a pull.
     #[test]
-    fn a_bound_store_mirrors_a_conversion_no_caller_named_a_cache_for() {
-        let root = temporary("bound-mirror");
-        let cache_root = root.join("repo-cache");
+    fn a_bound_cache_does_not_block_or_claim_source_checkpoint_durability() {
+        let root = temporary("bound-local-checkpoint");
         let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+        let cache_root = root.join("repo-cache");
         let store = store.bind_repo_cache(Some(&cache_root)).unwrap();
-
-        // The request carries no mount point, and there is no argument that could hold one.
+        let existed = cache_root.exists();
         let prepared =
             prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
                 .unwrap();
-        assert!(!prepared.replayed);
-        assert!(
-            prepared
-                .sources
-                .iter()
-                .all(|source| source.durable.head.is_some() && source.durable.bytes > 0),
-            "a bound Store's conversion published no resumable chain: {:?}",
-            prepared.sources
-        );
-
-        // A SECOND POD. A brand new Store — no objects, no catalog rows, no shared handle —
-        // bound to the same mount by the same one-line setup act, and opened FRESH so the
-        // binding is proved to have come off disk rather than out of a variable.
-        let elsewhere = root.join("second-pod");
-        Store::init(&elsewhere)
-            .unwrap()
-            .bind_repo_cache(Some(&cache_root))
-            .unwrap();
-        let fresh = Store::open(&elsewhere).unwrap();
-        assert_eq!(fresh.repo_cache().map(|c| c.root()), Some(&*cache_root));
-        for source in &prepared.sources {
-            let manifest = ObjectRef {
-                sha256: source.manifest_digest.trim_start_matches("sha256:").into(),
-                length: source.manifest_length,
-            };
-            assert!(
-                fresh.read_manifest(&manifest).is_err(),
-                "the second Store must start out unable to answer for this checkpoint"
-            );
-            let report = durability::restore_checkpoint(&fresh, "second-pod", &manifest).unwrap();
-            assert!(
-                report.complete,
-                "the cache could not answer for {}: {report:?}",
-                source.slot
-            );
-            assert!(report.admitted > 0, "nothing actually moved: {report:?}");
-            validate_prepared_result(&fresh, source).unwrap();
-        }
-
-        // And an UNBOUND Store asking for a restore is a caller mistake, not weather: it is
-        // told so rather than handed an empty success that reads like a cold cache.
-        let unbound = Store::init(&root.join("unbound-pod")).unwrap();
-        let manifest = ObjectRef {
-            sha256: prepared.sources[0]
-                .manifest_digest
-                .trim_start_matches("sha256:")
-                .into(),
-            length: prepared.sources[0].manifest_length,
-        };
+        assert!(prepared.complete);
+        assert_eq!(prepared.checkpoints.len(), 2);
+        assert!(prepared
+            .checkpoints
+            .iter()
+            .all(|row| row.head.head.is_some() && row.head.bytes > 0));
         assert_eq!(
-            durability::restore_checkpoint(&unbound, "unbound", &manifest)
-                .unwrap_err()
-                .code,
-            Code::MISSING_FIELD
+            cache_root.exists(),
+            existed,
+            "local checkpoint export must not touch NFS"
         );
+        for checkpoint in &prepared.checkpoints {
+            let link =
+                durability::local_link(&store, checkpoint.head.head.as_ref().unwrap()).unwrap();
+            assert_eq!(link.plan, checkpoint.plan_digest);
+            assert!(link.progress.is_some());
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1517,11 +1672,10 @@ mod tests {
                 .unwrap();
         assert!(
             degraded
-                .sources
+                .checkpoints
                 .iter()
-                .all(|source| source.durable.head.is_none() && source.durable.bytes == 0),
-            "an absent mount reported durability it cannot honour: {:?}",
-            degraded.sources
+                .all(|row| row.head.head.is_some()),
+            "local progress must remain exportable when the cache is absent"
         );
         assert!(!absent.exists(), "a missing cache must not be conjured");
 
@@ -1555,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_profile_failure_exposes_no_result_and_explicit_release_drops_its_holds() {
+    fn metadata_failure_exposes_no_result_or_output_holds() {
         let root = temporary("partial");
         let (store, registry, request) = fixture(&root, true);
         assert_eq!(
@@ -1571,7 +1725,7 @@ mod tests {
             .unwrap();
         assert!(matches!(open, crate::catalog::SourcePreparation::Open(_)));
         drop(open);
-        assert!(!catalog.held_keys().unwrap().is_empty());
+        assert!(catalog.held_keys().unwrap().is_empty());
         release_model_source(&store, &request.operation_id).unwrap();
         assert!(catalog.held_keys().unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
@@ -1708,6 +1862,11 @@ mod tests {
                 object_id: ObjectRef::of(bytes).id(),
                 length: bytes.len() as u64,
                 path,
+                header: if member.ends_with(".index.json") {
+                    bytes.to_vec()
+                } else {
+                    header_prefix(bytes)
+                },
             });
         };
         for (directory, fill) in [("enc", 0x11u8), ("dec", 0x22u8)] {
@@ -1818,7 +1977,9 @@ mod tests {
                 slot: "pair".into(),
                 profile: "sharded/pair/1".into(),
             }],
-            files: files.clone(),
+            roster: files.clone(),
+            landed: files.iter().map(|row| row.member.clone()).collect(),
+            checkpoints: Vec::new(),
         };
 
         let prepared = prepare_model_source_with_registry(
@@ -1843,16 +2004,218 @@ mod tests {
             .require_resident(&store)
             .expect("every converted tensor byte landed");
 
+        // Only ONE physical shard exists on the next pod. Both index members still share
+        // one object, and every other body is absent: metadata alone must plan all of them.
+        let incremental = Store::init(&root.join("incremental")).unwrap();
+        let body_root = root.join("incremental-bodies");
+        fs::create_dir_all(&body_root).unwrap();
+        let mut partial_request = request.clone();
+        for row in &mut partial_request.roster {
+            row.path = body_root.join(row.object_id.trim_start_matches("sha256:"));
+        }
+        let first_member = "enc/model-00001-of-00002.safetensors";
+        let first_source = files.iter().find(|row| row.member == first_member).unwrap();
+        let first_path = partial_request
+            .roster
+            .iter()
+            .find(|row| row.member == first_member)
+            .unwrap()
+            .path
+            .clone();
+        fs::copy(&first_source.path, &first_path).unwrap();
+        partial_request.landed = vec![first_member.into()];
+        let partial = prepare_model_source_with_registry(
+            &incremental,
+            &partial_request,
+            "fixture:registry",
+            &registry_bytes,
+        )
+        .unwrap();
+        assert!(!partial.complete && partial.sources.is_empty());
+        assert_eq!(
+            partial.converted_roles, 1,
+            "the arrived shard converts before its siblings"
+        );
+        assert_eq!(partial.deferred_ops, 3);
+        assert!(partial.spent.contains(&first_member.to_string()));
+        let progress = &partial.checkpoints[0];
+        let head = progress.head.head.as_ref().unwrap();
+        let link = durability::local_link(&incremental, head).unwrap();
+        assert!(link.manifests.is_empty());
+        assert!(link.progress.is_some());
+        assert!(link.blobs.len() <= durability::CHECKPOINT_REFS);
+        fs::remove_file(&first_path).unwrap();
+
+        // Transfer the acknowledged chain through the ordinary admission door into a
+        // different Store. No journal file, catalog row or source body is copied with it.
+        let replacement = Store::init(&root.join("replacement")).unwrap();
+        let mut delivered = Vec::new();
+        let mut cursor = Some(head.clone());
+        while let Some(object) = cursor {
+            let mut bytes = Vec::new();
+            incremental.read_into(&object.sha256, &mut bytes).unwrap();
+            replacement
+                .put_stream(&mut bytes.as_slice(), Some(&object), &Default::default())
+                .unwrap();
+            delivered.push(object.clone());
+            let mut offset = 0;
+            loop {
+                let durability::Window {
+                    link: page,
+                    objects: refs,
+                    next,
+                } = durability::local_window(&incremental, &object, offset, 1).unwrap();
+                assert!(
+                    refs.len() <= 1,
+                    "the caller can impose a smaller bounded page"
+                );
+                for (kind, object) in refs {
+                    assert_eq!(kind, crate::repo_cache::CacheKind::Blob);
+                    let mut bytes = Vec::new();
+                    incremental.read_into(&object.sha256, &mut bytes).unwrap();
+                    replacement
+                        .put_stream(&mut bytes.as_slice(), Some(&object), &Default::default())
+                        .unwrap();
+                    delivered.push(object);
+                }
+                cursor = page.prev;
+                if let Some(next) = next {
+                    offset = next;
+                } else {
+                    break;
+                }
+            }
+        }
+        let next_bodies = root.join("replacement-bodies");
+        fs::create_dir_all(&next_bodies).unwrap();
+        let mut next_request = partial_request.clone();
+        next_request.landed.clear();
+        next_request.checkpoints = vec![(progress.slot.clone(), head.clone())];
+        for row in &mut next_request.roster {
+            row.path = next_bodies.join(row.object_id.trim_start_matches("sha256:"));
+            if row.member != first_member && row.member.ends_with(".safetensors") {
+                let original = files
+                    .iter()
+                    .find(|original| original.member == row.member)
+                    .unwrap();
+                fs::copy(&original.path, &row.path).unwrap();
+                next_request.landed.push(row.member.clone());
+            }
+        }
+        // A changed immutable source cannot reuse the old journal even with equal headers.
+        let mut changed = next_request.clone();
+        changed.operation_id = "changed-plan".into();
+        changed
+            .roster
+            .iter_mut()
+            .find(|row| row.member == first_member)
+            .unwrap()
+            .object_id = format!("sha256:{}", "55".repeat(32));
+        assert_eq!(
+            prepare_model_source_with_registry(
+                &replacement,
+                &changed,
+                "fixture:registry",
+                &registry_bytes,
+            )
+            .unwrap_err()
+            .code,
+            Code::JOURNAL_STALE
+        );
+        release_model_source(&replacement, &changed.operation_id).unwrap();
+        let corrupt_store = Store::init(&root.join("corrupt-replacement")).unwrap();
+        for object in &delivered {
+            let mut bytes = Vec::new();
+            replacement.read_into(&object.sha256, &mut bytes).unwrap();
+            corrupt_store
+                .put_stream(&mut bytes.as_slice(), Some(object), &Default::default())
+                .unwrap();
+        }
+        let payload = link
+            .blobs
+            .iter()
+            .find(|object| Some(*object) != link.progress.as_ref())
+            .unwrap();
+        fs::remove_file(corrupt_store.object_path(&payload.sha256)).unwrap();
+        fs::write(
+            corrupt_store.object_path(&payload.sha256),
+            vec![0; payload.length as usize],
+        )
+        .unwrap();
+        let corrupt = prepare_model_source_with_registry(
+            &corrupt_store,
+            &next_request,
+            "fixture:registry",
+            &registry_bytes,
+        )
+        .expect_err(
+            "a checkpoint containing corrupt payload cannot certify locally complete progress",
+        );
+        assert!(matches!(
+            corrupt.code,
+            Code::OBJECT_ABSENT | Code::OBJECT_CORRUPT
+        ));
+        let resumed = prepare_model_source_with_registry(
+            &replacement,
+            &next_request,
+            "fixture:registry",
+            &registry_bytes,
+        )
+        .unwrap();
+        assert!(resumed.complete);
+        assert_eq!(
+            resumed.resumed_roles, 1,
+            "the spent shard is never opened again"
+        );
+        assert_eq!(resumed.converted_roles, 3);
+        assert_eq!(
+            resumed.sources, prepared.sources,
+            "interrupted and uninterrupted manifests are identical"
+        );
+        assert_eq!(resumed.checkpoints[0].plan_digest, progress.plan_digest);
+        assert!(resumed.checkpoints[0].head.links > progress.head.links);
+        let (holds, _) = crate::gc::session_holds(&replacement).unwrap();
+        assert!(
+            holds.iter().any(|held| held.sha256 == head.sha256),
+            "the restored predecessor link stays held"
+        );
+        next_request.landed.clear();
+        let replay = prepare_model_source_with_registry(
+            &replacement,
+            &next_request,
+            "fixture:registry",
+            &registry_bytes,
+        )
+        .unwrap();
+        assert!(replay.replayed && replay.complete);
+        let mut unrelated = registry.clone();
+        unrelated.entries[0]
+            .provenance
+            .note
+            .push_str("; provenance correction only");
+        assert!(
+            prepare_model_source_with_registry(
+                &replacement,
+                &next_request,
+                "fixture:registry",
+                &unrelated.to_bytes(),
+            )
+            .unwrap()
+            .replayed,
+            "unrelated registry bytes do not change the actual plan"
+        );
+
         // A selection short of one shard is refused BY MEMBER, and the refusal comes out of
         // the header pass — before a tensor byte moves.
         let mut short = request.clone();
         short.operation_id = "sharded-cas-short".into();
         let dropped = short
-            .files
+            .roster
             .iter()
             .position(|file| file.member == "enc/model-00002-of-00002.safetensors")
             .unwrap();
-        let dropped = short.files.remove(dropped);
+        let dropped = short.roster.remove(dropped);
+        short.landed.retain(|member| member != &dropped.member);
         let refusal =
             prepare_model_source_with_registry(&store, &short, "fixture:registry", &registry_bytes)
                 .expect_err("an index whose shard is not carried must refuse");
@@ -2180,6 +2543,7 @@ mod tests {
             object_id: ObjectRef::of(&bytes).id(),
             length: bytes.len() as u64,
             path: path.clone(),
+            header: header_prefix(&bytes),
         };
         let fence = FileFence::capture(&verified).unwrap();
 
