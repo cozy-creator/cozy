@@ -14,6 +14,7 @@ const MaxWeightsGrantURLBytes = 16 << 10
 // control stream carries control, not content. It has no carve-out: the tensorhub fence in
 // scripts/fence.py convicts any content-bearing bound declared above it.
 const MaxInlineControlBytes = 4 << 20
+const MaxModelSourceHeaderBytes = MaxInlineControlBytes
 const MaxModelSourceFiles = 4096
 const MaxModelSourceProfiles = 16
 const MaxModelSourceMemberBytes = 1024

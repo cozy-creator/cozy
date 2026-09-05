@@ -41,6 +41,8 @@ import (
 type conversionPreflight struct {
 	// Plans by producer slot, when the headers decided.
 	Plans map[string]tfs.SourcePlan
+	// Exact inspected prefixes survive the temporary sparse files and enter the durable request.
+	Headers map[string][]byte
 	// Why the headers could not be read, when they could not. Non-empty means UNDECIDED,
 	// and Plans is then empty.
 	Undecided string
@@ -108,5 +110,9 @@ func preflightConversionPlan(runCtx context.Context, ctx *Context, source publis
 	if problem != nil {
 		return conversionPreflight{}, problem
 	}
-	return conversionPreflight{Plans: plans}, nil
+	headers := make(map[string][]byte, len(staged))
+	for _, file := range staged {
+		headers[file.Member] = file.Header
+	}
+	return conversionPreflight{Plans: plans, Headers: headers}, nil
 }

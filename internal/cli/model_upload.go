@@ -265,6 +265,9 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 		}
 	}
 	intent := modelTransferIntent(plan)
+	for i := range intent.SourceFiles {
+		intent.SourceFiles[i].Header = conversion.Headers[intent.SourceFiles[i].Member]
+	}
 	intent.LocalOnly = localOnly
 	daemonState, _, problem := ensureDaemon(ctx)
 	if problem != nil {
