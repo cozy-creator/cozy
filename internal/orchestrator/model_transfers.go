@@ -212,6 +212,11 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 	bootID := w.bootID
 	c.mu.Unlock()
 	if len(transfer.Models) > 0 && (w.spec.Connection == nil || transfer.ModelsWorkerBootID == bootID) {
+		if w.spec.Connection != nil {
+			if problem := c.awaitSourceInputCustody(req, bootID); problem != nil {
+				return req, problem
+			}
+		}
 		req.Models = append([]ModelRef(nil), transfer.Models...)
 		return req, nil
 	}
@@ -250,6 +255,8 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 		if problem := c.opt.Store.CompleteModelTransferMaterialization(req.ID, models, ""); problem != nil {
 			return req, problem
 		}
+	} else if problem := c.awaitSourceInputCustody(req, bootID); problem != nil {
+		return req, problem
 	}
 	current, problem := c.opt.Store.RequestRow(req.ID)
 	if problem != nil || current == nil {

@@ -5,9 +5,74 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 type sourceCheckpointUpload struct{ again bool }
+
+// Conversion overlaps upload, but producer dispatch consumes only recoverable
+// inputs. A refused producer therefore cannot interrupt unfinished source custody.
+func (c *Orchestrator) awaitSourceInputCustody(req records.Request, bootID string) *exit.Error {
+	for {
+		transfer, problem := c.opt.Store.ModelTransferOf(req.ID)
+		if problem != nil {
+			return problem
+		}
+		if transfer == nil {
+			return exit.Internalf("source input custody has no model transfer owner")
+		}
+		current, problem := c.opt.Store.RequestRow(req.ID)
+		if problem != nil {
+			return problem
+		}
+		if current == nil || current.Worker != req.Worker {
+			return exit.Unavailablef("source input placement changed before checkpoint custody was confirmed")
+		}
+		if transfer.State == "failed" {
+			return exit.Named(exit.Failed, transfer.ErrorCode, "%s", transfer.SafeError)
+		}
+		if transfer.State == "canceled" || current.State == "canceled" {
+			return exit.New(exit.Canceled, "model transfer %s was canceled", req.ID)
+		}
+		session, problem := c.rentalControl(req.Worker)
+		if problem != nil {
+			return problem
+		}
+		if session.bootID != bootID {
+			return exit.Unavailablef("source input worker changed before checkpoint custody was confirmed")
+		}
+		progress, problem := c.opt.Store.ModelSourceProgress(req.ID)
+		if problem != nil {
+			return problem
+		}
+		if len(progress) != len(transfer.SourceProfiles) {
+			return exit.Named(exit.Structural, "model_transfer.source_checkpoint_missing",
+				"prepared source inputs did not report a recoverable checkpoint for every slot")
+		}
+		ready := true
+		var held, total uint64
+		for _, slot := range progress {
+			if slot.WorkerBootID != bootID {
+				return exit.Named(exit.Structural, "model_transfer.source_checkpoint_missing",
+					"prepared source slot %s has no checkpoint observation from its current worker", slot.Observed.Slot)
+			}
+			total += uint64(slot.Observed.Bytes)
+			if slot.Acknowledged != nil {
+				held += uint64(slot.Acknowledged.Bytes)
+			}
+			ready = ready && slot.Acknowledged != nil && *slot.Acknowledged == slot.Observed
+		}
+		if ready {
+			return nil
+		}
+		c.ObservePhase(req.ID, PhaseSample{Name: PhasePreparing, Detail: "retaining converted source checkpoints in Tensorhub",
+			HasBytes: true, Moved: held, Total: total})
+		c.kickSourceCheckpointUpload(req.ID)
+		if problem := c.waitTransfer(context.Background(), req.ID); problem != nil {
+			return problem
+		}
+	}
+}
 
 // A single uploader follows the durable observed heads while conversion and
 // source downloads continue. Coalescing wakeups never coalesces custody facts.

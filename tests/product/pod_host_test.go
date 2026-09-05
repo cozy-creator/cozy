@@ -74,6 +74,8 @@ type fakePod struct {
 	serve bool
 	// jobReady advertises the independent job seat after accepting a JobDirective.
 	jobReady bool
+	// onJobReady can delay and sequence the independent peer's readiness facts.
+	onJobReady func(*pb.WorkerFrame, func(*pb.WorkerFrame) error) error
 	// slots is the advertised seat count while serving; zero means one.
 	slots uint32
 	// downloadSamples is how many DOWNLOADING events the prepare stream reports before
@@ -211,6 +213,12 @@ func (p *fakePod) verifyClaim(claim *pb.Claim, stream bool) error {
 }
 
 func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, pb.WorkerFrame]) error {
+	var sendMu sync.Mutex
+	send := func(frame *pb.WorkerFrame) error {
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		return stream.Send(frame)
+	}
 	for {
 		frame, err := stream.Recv()
 		if err != nil {
@@ -224,7 +232,7 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			if err := p.verifyClaim(m.Claim, true); err != nil {
 				return err
 			}
-			if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: &pb.ClaimAck{
+			if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: &pb.ClaimAck{
 				RecordOwnerEpoch: m.Claim.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: podBootID,
 				Accepted: true, WireMinor: pb.WireMinor, WorkerId: podWorkerID, WorkerInstanceId: "inst-pod-1",
 				Resources: &pb.WorkerResources{Backend: "cuda", DeviceName: "fake-4090", DeviceCount: 1,
@@ -254,7 +262,7 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			p.mu.Lock()
 			p.hostDigest = hostDigest
 			p.mu.Unlock()
-			if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_Snapshot{Snapshot: &pb.WorkerSnapshot{
+			if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_Snapshot{Snapshot: &pb.WorkerSnapshot{
 				RecordOwnerEpoch: m.Claim.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: podBootID,
 				SnapshotId: "snp-pod-1", SnapshotDigest: digest, SnapshotCanonicalBytes: body,
 				HostSnapshotDigest: hostDigest, HostSnapshotCanonicalBytes: hostBody,
@@ -276,19 +284,26 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			p.mu.Unlock()
 			if p.jobReady && m.DesiredState.GetJob() != nil {
 				d := m.DesiredState
-				if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: &pb.ObservedWorkerState{
+				ready := &pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: &pb.ObservedWorkerState{
 					RecordOwnerEpoch: d.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: podBootID,
 					AcceptedDesiredStateRevision: d.Revision, ConvergedRevision: d.Revision,
 					WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE, AppliedWireMinor: pb.WireMinor,
 					AdmissionState: pb.AdmissionState_ADMISSION_STATE_OPEN, AdmissionEpoch: 7,
 					AvailableAttemptSlots: 1, JobCapacity: &pb.JobCapacity{JobsAvailable: 1},
-				}}}); err != nil {
+				}}}
+				var err error
+				if p.onJobReady != nil {
+					err = p.onJobReady(ready, send)
+				} else {
+					err = send(ready)
+				}
+				if err != nil {
 					return err
 				}
 			}
 			if serve && m.DesiredState.GetPlacementSet() != nil {
 				if frame := p.served(m.DesiredState, 1); frame != nil {
-					if err := stream.Send(frame); err != nil {
+					if err := send(frame); err != nil {
 						return err
 					}
 				}
@@ -302,7 +317,7 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 						case <-time.After(25 * time.Millisecond):
 						}
 						if frame := p.report(d, 1); frame != nil {
-							if err := stream.Send(frame); err != nil {
+							if err := send(frame); err != nil {
 								return
 							}
 						}
@@ -322,7 +337,7 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			p.lanes = append(p.lanes, "fetch")
 			p.mu.Unlock()
 			for _, grant := range request.Files {
-				if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_LocalPackageFileStatus{
+				if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_LocalPackageFileStatus{
 					LocalPackageFileStatus: &pb.LocalPackageFileStatus{
 						RecordOwnerEpoch: request.RecordOwnerEpoch, ControlStreamEpoch: request.ControlStreamEpoch,
 						WorkerBootId: request.WorkerBootId, OperationId: request.OperationId,
