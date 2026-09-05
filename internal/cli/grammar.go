@@ -159,6 +159,7 @@ func (c *PackagePublishCmd) Run(r *Runtime) error {
 }
 
 type ModelCmd struct {
+	Info     ModelInfoCmd     `cmd:"" help:"Show model metadata, release lanes, and exact checkpoint refs."`
 	Search   ModelSearchCmd   `cmd:"" help:"Search the model catalog."`
 	Family   ModelFamilyCmd   `cmd:"" help:"Set a model repository's discovery family."`
 	Download ModelDownloadCmd `cmd:"" help:"Acquire a source, optionally run one producer job, and retain it locally."`
@@ -171,9 +172,17 @@ type ModelCmd struct {
 	Yank     ModelYankCmd     `cmd:"" help:"Yank a model release."`
 }
 
+type ModelInfoCmd struct {
+	Model string `arg:"" name:"model" help:"Model repository as org/name, optionally followed by @release."`
+}
+
+func (c *ModelInfoCmd) Run(r *Runtime) error {
+	return r.call(handleModelInfo, []string{c.Model}, nil, nil, false)
+}
+
 type ModelSearchCmd struct {
 	Query  []string `arg:"" optional:"" name:"query" help:"Search text or an exact org/name."`
-	Limit  int      `help:"Maximum results." default:"20"`
+	Limit  int      `help:"Maximum matching models; each release has its own row." default:"20"`
 	Family string   `help:"Only show one recognized model family."`
 }
 
