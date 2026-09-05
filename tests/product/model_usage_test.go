@@ -19,7 +19,7 @@ import (
 
 // The plain/1 encoding, as `tfs cbor decode` prints it: the one seeded spec a synthetic
 // header can name without a registry of its own.
-const plainEncoding = `{"doc":"Plain little-endian row-major storage: one ` + "`value`" + ` role carrying the logical bytes verbatim. Entry zero of the registry; not a special absent form.","logical_dtypes":["bf16","bool","f16","f32","f64","f8_e4m3fn","f8_e5m2","i16","i32","i64","i8","u8"],"roles":{"value":{"carrier":{"t":"same_as_logical"},"shape":{"t":"same"}}},"vectors":{"length":516,"sha256":"4766f931bbb70ed431e34b34e4f9fc5dda8174e96f43a8acd79d8799efcd43d2"}}`
+const plainEncoding = `{"logical_dtypes":["bf16","bool","f16","f32","f64","f8_e4m3fn","f8_e5m2","i16","i32","i64","i8","u8"],"roles":{"value":{"carrier":{"t":"same_as_logical"},"shape":{"t":"same"}}},"vectors":{"length":516,"sha256":"4766f931bbb70ed431e34b34e4f9fc5dda8174e96f43a8acd79d8799efcd43d2"}}`
 
 // TestModelListShowsEachModelsBytesAndWhatItShares retains two local models through the
 // product's own TensorFS path — blobs put, a CozyTensors header and manifest reproduced
