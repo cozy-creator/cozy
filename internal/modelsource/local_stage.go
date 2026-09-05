@@ -68,7 +68,7 @@ func StageLocal(ctx context.Context, source Source, root string) (Plan, StagedFi
 	plan := Plan{Source: resolved, Canonical: resolved.Canonical, SelectionSHA256: sha,
 		Files: []File{{Member: "source.safetensors", SHA256: sha, Length: written, Carrier: true}},
 		Bytes: written}
-	return plan, StagedFile{Path: target, Carrier: true}, nil
+	return plan, StagedFile{Path: target}, nil
 }
 
 // StageLocalHeader creates only the sparse header view required by TensorFS
@@ -143,7 +143,7 @@ func StageLocalHeader(ctx context.Context, source Source, root string) (Plan, St
 	plan := Plan{Source: source, Canonical: source.Canonical,
 		Files: []File{{Member: "source.safetensors", Length: before.Size(), Carrier: true}},
 		Bytes: before.Size(), InspectedBytes: 8 + headerLength}
-	return plan, StagedFile{Path: target, Carrier: true}, nil
+	return plan, StagedFile{Path: target}, nil
 }
 
 func importReadProblem(ctx context.Context, what string, err error) *exit.Error {

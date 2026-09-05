@@ -19,9 +19,8 @@ import (
 const maxCarrierHeader = int64(64 << 20)
 
 type StagedFile struct {
-	Member  string
-	Path    string
-	Carrier bool
+	Member string
+	Path   string
 }
 
 func (r *Resolver) Stage(ctx context.Context, plan Plan, root string, headersOnly bool,
@@ -79,7 +78,7 @@ func (r *Resolver) Stage(ctx context.Context, plan Plan, root string, headersOnl
 		} else if problem := r.download(ctx, file, target, progress); problem != nil {
 			return nil, problem
 		}
-		staged = append(staged, StagedFile{Member: file.Member, Path: target, Carrier: file.Carrier})
+		staged = append(staged, StagedFile{Member: file.Member, Path: target})
 	}
 	return staged, nil
 }
