@@ -146,6 +146,9 @@ func (s *Store) ObserveModelSourceCheckpoints(requestID, selection, bootID strin
 			return exit.Internalf("cannot read prior source checkpoint: %s", err)
 		}
 		if err == nil {
+			if prior.Observed.HeadID == checkpoint.HeadID && prior.Observed != checkpoint {
+				return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_changed", "immutable source head changed its recorded metadata")
+			}
 			if prior.Observed.PlanDigest != checkpoint.PlanDigest {
 				return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_plan_changed",
 					"source checkpoint changed the slot's frozen TensorFS plan")

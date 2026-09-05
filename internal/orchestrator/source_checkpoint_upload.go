@@ -47,7 +47,7 @@ func (c *Orchestrator) kickSourceCheckpointUpload(requestID string) {
 				c.signalTransfer(requestID)
 			}
 			c.mu.Lock()
-			again := running.again && problem == nil && !c.closing
+			again := running.again && !c.closing
 			if !again {
 				delete(c.sourceUploads, requestID)
 			}
