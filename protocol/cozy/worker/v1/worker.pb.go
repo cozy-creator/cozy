@@ -9552,8 +9552,12 @@ type WeightsIntentFrame struct {
 	TensorfsDeclarationDigest         []byte                 `protobuf:"bytes,9,opt,name=tensorfs_declaration_digest,json=tensorfsDeclarationDigest,proto3" json:"tensorfs_declaration_digest,omitempty"`
 	RequestedWriterEpoch              uint64                 `protobuf:"varint,10,opt,name=requested_writer_epoch,json=requestedWriterEpoch,proto3" json:"requested_writer_epoch,omitempty"`
 	TensorfsDeclarationCanonicalBytes []byte                 `protobuf:"bytes,11,opt,name=tensorfs_declaration_canonical_bytes,json=tensorfsDeclarationCanonicalBytes,proto3" json:"tensorfs_declaration_canonical_bytes,omitempty"`
-	unknownFields                     protoimpl.UnknownFields
-	sizeCache                         protoimpl.SizeCache
+	// Created only by Runtime. The host validates and durably binds this supplied ID to
+	// owner/request/spec/slot, refuses conflicting bindings, and echoes it; it never hashes
+	// a second transaction ID. Required lowercase sha256:<64 hex>.
+	WeightsTransactionId string `protobuf:"bytes,12,opt,name=weights_transaction_id,json=weightsTransactionId,proto3" json:"weights_transaction_id,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *WeightsIntentFrame) Reset() {
@@ -9654,6 +9658,13 @@ func (x *WeightsIntentFrame) GetTensorfsDeclarationCanonicalBytes() []byte {
 		return x.TensorfsDeclarationCanonicalBytes
 	}
 	return nil
+}
+
+func (x *WeightsIntentFrame) GetWeightsTransactionId() string {
+	if x != nil {
+		return x.WeightsTransactionId
+	}
+	return ""
 }
 
 // One ACK type covers intent and receipt durability. The supervisor injects it into Runtime only
@@ -12248,8 +12259,13 @@ type WeightsFinalizeRequest struct {
 	WeightsReceiptDigest []byte                     `protobuf:"bytes,9,opt,name=weights_receipt_digest,json=weightsReceiptDigest,proto3" json:"weights_receipt_digest,omitempty"`
 	ScratchRootId        string                     `protobuf:"bytes,10,opt,name=scratch_root_id,json=scratchRootId,proto3" json:"scratch_root_id,omitempty"`
 	OwnerAuthorityScope  string                     `protobuf:"bytes,11,opt,name=owner_authority_scope,json=ownerAuthorityScope,proto3" json:"owner_authority_scope,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Exact already-owned InvocationSpec/1 bytes, required and SHA-bound to field6.
+	// Runtime re-validates canonical form and the declared model output even after its
+	// ephemeral attempt history is gone. This is existing authority, never a new identity.
+	// The complete request must remain within MaxInlineControlBytes.
+	InvocationSpecCanonicalBytes []byte `protobuf:"bytes,12,opt,name=invocation_spec_canonical_bytes,json=invocationSpecCanonicalBytes,proto3" json:"invocation_spec_canonical_bytes,omitempty"`
+	unknownFields                protoimpl.UnknownFields
+	sizeCache                    protoimpl.SizeCache
 }
 
 func (x *WeightsFinalizeRequest) Reset() {
@@ -12350,6 +12366,13 @@ func (x *WeightsFinalizeRequest) GetOwnerAuthorityScope() string {
 		return x.OwnerAuthorityScope
 	}
 	return ""
+}
+
+func (x *WeightsFinalizeRequest) GetInvocationSpecCanonicalBytes() []byte {
+	if x != nil {
+		return x.InvocationSpecCanonicalBytes
+	}
+	return nil
 }
 
 // Durable worker->owner result. A commit-first ABANDON_UNCOMMITTED race carries the released
@@ -15611,7 +15634,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\tobject_id\x18\x01 \x01(\tR\bobjectId\x12\x16\n" +
 	"\x06length\x18\x02 \x01(\x04R\x06length\x12\x1d\n" +
 	"\n" +
-	"source_ref\x18\x03 \x01(\tR\tsourceRef\"\x86\x04\n" +
+	"source_ref\x18\x03 \x01(\tR\tsourceRef\"\xbc\x04\n" +
 	"\x12WeightsIntentFrame\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
 	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
@@ -15625,7 +15648,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x1btensorfs_declaration_digest\x18\t \x01(\fR\x19tensorfsDeclarationDigest\x124\n" +
 	"\x16requested_writer_epoch\x18\n" +
 	" \x01(\x04R\x14requestedWriterEpoch\x12O\n" +
-	"$tensorfs_declaration_canonical_bytes\x18\v \x01(\fR!tensorfsDeclarationCanonicalBytesJ\x04\b\x04\x10\x05\"\x85\x06\n" +
+	"$tensorfs_declaration_canonical_bytes\x18\v \x01(\fR!tensorfsDeclarationCanonicalBytes\x124\n" +
+	"\x16weights_transaction_id\x18\f \x01(\tR\x14weightsTransactionIdJ\x04\b\x04\x10\x05\"\x85\x06\n" +
 	"\x0eWeightsHostAck\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
 	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
@@ -15900,7 +15924,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\tsafe_code\x18\t \x01(\tR\bsafeCode\x12\x1f\n" +
 	"\vsafe_detail\x18\n" +
 	" \x01(\tR\n" +
-	"safeDetailJ\x04\b\x04\x10\x05\"\xfa\x03\n" +
+	"safeDetailJ\x04\b\x04\x10\x05\"\xc1\x04\n" +
 	"\x16WeightsFinalizeRequest\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
 	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
@@ -15914,7 +15938,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x16weights_receipt_digest\x18\t \x01(\fR\x14weightsReceiptDigest\x12&\n" +
 	"\x0fscratch_root_id\x18\n" +
 	" \x01(\tR\rscratchRootId\x122\n" +
-	"\x15owner_authority_scope\x18\v \x01(\tR\x13ownerAuthorityScopeJ\x04\b\x04\x10\x05\"\xdb\x03\n" +
+	"\x15owner_authority_scope\x18\v \x01(\tR\x13ownerAuthorityScope\x12E\n" +
+	"\x1finvocation_spec_canonical_bytes\x18\f \x01(\fR\x1cinvocationSpecCanonicalBytesJ\x04\b\x04\x10\x05\"\xdb\x03\n" +
 	"\x15WeightsFinalizeResult\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
 	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +

@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"fmt"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -163,11 +165,26 @@ func (c *Orchestrator) sendPendingWeightsFinalizations(s *session, requestID str
 	if e != nil {
 		return 0, e
 	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	owned, e := c.opt.Store.AttemptRow(requestID, attempt)
+	if e != nil {
+		return len(rows), e
+	}
+	if owned == nil || len(owned.InvocationCanonical) == 0 {
+		return len(rows), exit.Internalf("weights finalization has no stored invocation for %s#%d",
+			requestID, attempt)
+	}
 	for _, row := range rows {
 		if row.InstanceID != s.instanceID {
 			return len(rows), exit.New(exit.Conflict,
 				"weights finalization %s/%s belongs to worker %s, not %s",
 				row.RequestID, row.OutputSlot, row.InstanceID, s.instanceID)
+		}
+		if row.InvocationDigest != owned.InvocationDigest {
+			return len(rows), exit.Internalf("weights finalization does not match the stored invocation for %s#%d",
+				requestID, attempt)
 		}
 		specDigest, err := canonical.Raw(row.InvocationDigest)
 		if err != nil {
@@ -192,10 +209,18 @@ func (c *Orchestrator) sendPendingWeightsFinalizations(s *session, requestID str
 			Disposition:          pb.WeightsFinalizeDisposition(disposition),
 			WeightsReceiptDigest: receiptDigest, ScratchRootId: row.ScratchRootID,
 			OwnerAuthorityScope: row.OwnerScope,
+			// Replay the dispatched declaration, including after Runtime loses its
+			// attempt history. Current request state cannot reconstruct these bytes.
+			InvocationSpecCanonicalBytes: owned.InvocationCanonical,
 		}
-		if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_WeightsFinalizeRequest{
+		frame := &pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_WeightsFinalizeRequest{
 			WeightsFinalizeRequest: request,
-		}}) {
+		}}
+		if proto.Size(frame) > pb.MaxInlineControlBytes {
+			return len(rows), exit.Internalf("weights finalization %s/%s exceeds the control frame limit",
+				row.RequestID, row.OutputSlot)
+		}
+		if !s.send(frame) {
 			return len(rows), exit.Unavailablef("the stream closed before weights finalization %s/%s was sent",
 				row.RequestID, row.OutputSlot)
 		}
