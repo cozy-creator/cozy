@@ -213,9 +213,7 @@ func sortedMapKeys(values map[string]string) []string {
 func sourceCarriers(files []modelsource.StagedFile, labelled bool) []tfs.SourceCarrier {
 	carriers := make([]tfs.SourceCarrier, 0, len(files))
 	for _, file := range files {
-		if !file.Carrier {
-			continue
-		}
+		// TensorFS needs the complete physical set, including each index's shards.
 		carrier := tfs.SourceCarrier{Path: file.Path}
 		if labelled {
 			carrier.Member = file.Member
