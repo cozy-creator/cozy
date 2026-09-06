@@ -61,6 +61,7 @@ type fakePod struct {
 	pb.UnimplementedWorkerControlServer
 	pb.UnimplementedPodHostServer
 	controlKey ed25519.PublicKey
+	wireMinor  uint32 // zero uses the current protocol; tests can negotiate an older peer
 	leafDigest []byte
 	// mutateHostDigest is the red arm: the host document's digest stops hashing its bytes.
 	mutateHostDigest bool
@@ -235,9 +236,13 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			if err := p.verifyClaim(m.Claim, true); err != nil {
 				return err
 			}
+			minor := p.wireMinor
+			if minor == 0 {
+				minor = pb.WireMinor
+			}
 			if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: &pb.ClaimAck{
 				RecordOwnerEpoch: m.Claim.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: podBootID,
-				Accepted: true, WireMinor: pb.WireMinor, WorkerId: podWorkerID, WorkerInstanceId: "inst-pod-1",
+				Accepted: true, WireMinor: minor, WorkerId: podWorkerID, WorkerInstanceId: "inst-pod-1",
 				Resources: &pb.WorkerResources{Backend: "cuda", DeviceName: "fake-4090", DeviceCount: 1,
 					DeviceMemoryTotalBytes: 24 << 30},
 			}}}); err != nil {
@@ -712,6 +717,11 @@ func TestPodHostThreeStepSequence(t *testing.T) {
 
 	instance, _, _, e := o.c.EnsureRental(podRental)
 	fatal(t, e)
+	waitUntil(t, "the peer receiving the snapshot acknowledgement", func() bool {
+		pod.mu.Lock()
+		defer pod.mu.Unlock()
+		return len(pod.acks) > 0
+	})
 	pod.mu.Lock()
 	acks, hostDigest := append([]*pb.SnapshotAck(nil), pod.acks...), pod.hostDigest
 	pod.mu.Unlock()

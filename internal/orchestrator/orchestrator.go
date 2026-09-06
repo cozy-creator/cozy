@@ -324,6 +324,8 @@ type RentalExclusion struct {
 // not of the request, so a reader can tell "nothing was available" from "nothing was
 // eligible".
 const (
+	// ExcludedProtocol: new directives use the current generated wire contract.
+	ExcludedProtocol = "protocol_unsupported"
 	// ExcludedModeConflict: the rental's worker already holds the other half of the
 	// `oneof mode` — a job where a serving set is wanted, or the reverse. This is the
 	// one that read as waste live: a `ready` pod with no running work, which a
@@ -363,6 +365,10 @@ func (c *Orchestrator) ModeCompatibleRentalsWithExclusions(ids []string, job boo
 	var excluded []RentalExclusion
 	for _, id := range ids {
 		w := c.workers[rentalInstanceID(id)]
+		if w != nil && w.declaredInstance != "" && w.wireMinor < pb.WireMinor {
+			excluded = append(excluded, RentalExclusion{RentalID: id, Reason: ExcludedProtocol})
+			continue
+		}
 		if w != nil && !w.exited && !w.stopping {
 			serving := len(w.desiredPackages) > 0 || w.desiredLocal != nil ||
 				w.desiredPrivatePlacement != nil || len(w.observedRemote) > 0

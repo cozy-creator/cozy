@@ -527,6 +527,7 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 	}
 	c.mu.Lock()
 	w.declaredInstance = ack.WorkerInstanceId
+	w.wireMinor = ack.WireMinor
 	if w.spec.Connection != nil {
 		w.remoteWorkerID = ack.WorkerId
 	}

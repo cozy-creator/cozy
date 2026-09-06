@@ -392,6 +392,7 @@ type worker struct {
 	// names the stable slot; every local or attached worker names its own incarnation and
 	// must keep that identity stable across a control-stream reconnect.
 	declaredInstance string
+	wireMinor        uint32 // negotiated in ClaimAck, not inferred from the image profile
 	remoteWorkerID   string
 	// desiredPackages/models are Creator's logical private-rental intent. They survive a
 	// control-stream reconnect so the new authenticated stream does not reset a loaded
