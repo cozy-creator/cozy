@@ -173,6 +173,10 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 			if err != nil {
 				return exit.New(exit.Validation, "persisted weights object digest is malformed")
 			}
+			operationID := object.OperationID
+			if operationID == "" {
+				operationID = "weights-" + hex.EncodeToString(objectDigest)
+			}
 			// The Host binds one operation to one object within this transaction.
 			// The Hub publication is a separate scope shared by all of its objects.
 			transfer := &pb.WeightsTransferRequest{RecordOwnerEpoch: recordOwnerEpoch,
@@ -180,7 +184,7 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 				RequestId: weights.RequestID, AttemptOrdinal: uint64(weights.Attempt),
 				InvocationSpecDigest: specDigest, OutputSlot: weights.OutputSlot,
 				WeightsTransactionId: weights.TransactionID, WeightsReceiptDigest: receiptDigest,
-				OperationId: "weights-" + hex.EncodeToString(objectDigest), GrantRevision: uint64(object.GrantRevision + 1)}
+				OperationId: operationID, GrantRevision: uint64(object.GrantRevision + 1)}
 			if decision.Held {
 				transfer.Decision = &pb.WeightsTransferRequest_Held{Held: &pb.WeightsObjectRef{
 					ObjectId: object.ObjectID, Length: uint64(decision.Length)}}
