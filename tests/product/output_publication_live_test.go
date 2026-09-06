@@ -32,7 +32,7 @@ import (
 
 var publicationHub = flag.String("publication-hub", "", "live Tensorhub for the explicit tiny publication proof")
 var publicationHome = flag.String("publication-home", "", "existing enrolled home used only for the live proof's account credential")
-var publicationPython = flag.String("publication-python", "", "public Runtime 0.2.23/TensorFS 0.3.9 interpreter for the live proof")
+var publicationPython = flag.String("publication-python", "", "public Runtime 0.2.24/TensorFS 0.3.10 interpreter for the live proof")
 var publicationModel = flag.String("publication-model", "", "existing task-owned fixture model reused by the live proof; no new repository is created")
 
 // This explicitly armed test runs Creator's real publication owner and mover,
@@ -95,6 +95,16 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 			*pb.RecordOwnerFrame_WeightsFinalizeRequest, *pb.RecordOwnerFrame_OutcomeAck:
 		default:
 			return false, nil
+		}
+		if transfer := frame.GetWeightsTransferRequest(); transfer != nil {
+			objectID := transfer.GetUploadGrant().GetObjectId()
+			if transfer.GetHeld() != nil {
+				objectID = transfer.GetHeld().ObjectId
+			}
+			if transfer.OperationId != "weights-"+strings.TrimPrefix(objectID, "sha256:") {
+				errors <- fmt.Errorf("weights operation did not name its exact object")
+				return true, nil
+			}
 		}
 		if offer := frame.GetAttemptOffer(); offer != nil {
 			pod.mu.Lock()
@@ -182,7 +192,7 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 	pod.mu.Lock()
 	root, moved, acquired := manifest, transfers, sourceRequests
 	pod.mu.Unlock()
-	if root == nil || moved == 0 || acquired != 0 {
+	if root == nil || moved < 2 || acquired != 0 {
 		t.Fatalf("incomplete publication path: manifest=%v transfers=%d source requests=%d", root, moved, acquired)
 	}
 	ref, problem := hub.ParseRef(destination)
@@ -207,14 +217,11 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 	// Output publication retains an owner-only checkpoint; it does not create
 	// a public release. Read back the exact existing publication operation.
 	objects := make([]hub.Object, 0, len(rows[0].Objects))
-	operation := ""
+	operation := rows[0].FinalID
 	for _, object := range rows[0].Objects {
 		objects = append(objects, hub.Object{ID: object.ObjectID, Length: object.Length})
-		if operation == "" {
-			operation = object.OperationID
-		}
-		if object.OperationID != operation {
-			t.Fatal("output objects belong to different publication operations")
+		if object.OperationID != "weights-"+strings.TrimPrefix(object.ObjectID, "sha256:") || object.OperationID == operation {
+			t.Fatal("per-object transfer correlation was conflated with the Hub publication")
 		}
 	}
 	opened, problem := client.OpenPublication(ctx, ref, operation, objects, "read back the tiny product proof")

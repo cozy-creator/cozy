@@ -21,8 +21,8 @@ from cozy_runtime.internal.worker.weights import WeightsExchange
 from cozy_runtime.internal.worker.weights_finalize import finalize
 from cozy_runtime.protocol import documents, worker_pb2 as pb
 
-assert importlib.metadata.version("cozy-runtime") == "0.2.23"
-assert importlib.metadata.version("tensorfs") == "0.3.9"
+assert importlib.metadata.version("cozy-runtime") == "0.2.24"
+assert importlib.metadata.version("tensorfs") == "0.3.10"
 root = Path(sys.argv[1])
 store = tensorfs.Store.ensure(str(root / "store"))
 owner = None
@@ -63,11 +63,11 @@ try:
             config = json.dumps({"proof": offer.request_id}).encode()
             transaction = host.open(WeightsCommit(output_slot="model", sources={},
                 targets={"transformer": WeightsTarget(add={"weight": WeightsTensor(
-                    logical_dtype="f32", shape=(4,), encoding=SPEC_PLAIN,
-                    parts={"value": WeightsPart(dtype="f32", shape=(4,))})})},
+                    logical_dtype="f32", shape=(1024,), encoding=SPEC_PLAIN,
+                    parts={"value": WeightsPart(dtype="f32", shape=(1024,))})})},
                 configs={"model": WeightsConfig(data=config)}, order=(("transformer", "weight"),),
                 max_new_bytes=1 << 20))
-            transaction.add_part("transformer", "weight", "value", struct.pack("<4f", 1, 2, 3, 4))
+            transaction.add_part("transformer", "weight", "value", struct.pack("<1024f", *range(1024)))
             transaction.add_config("model", config, len(config))
             receipt = transaction.commit()
             reference, _, _ = protocol_receipt(receipt, owner_scope=owner,

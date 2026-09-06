@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"sort"
 
@@ -74,7 +75,7 @@ func (c *Orchestrator) runModelPassThrough(req records.Request) {
 const weightsGrantExpired = "weights_grant_expired"
 
 func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
-	weights records.ModelTransferWeights, operationID string, mint WeightsGrantMinter,
+	weights records.ModelTransferWeights, mint WeightsGrantMinter,
 ) *exit.Error {
 	request, problem := c.opt.Store.RequestRow(weights.RequestID)
 	if problem != nil || request == nil {
@@ -168,12 +169,18 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 					"the authorized grant for %s changed the adopted object inventory",
 					object.ObjectID)
 			}
+			objectDigest, err := canonical.Raw(object.ObjectID)
+			if err != nil {
+				return exit.New(exit.Validation, "persisted weights object digest is malformed")
+			}
+			// The Host binds one operation to one object within this transaction.
+			// The Hub publication is a separate scope shared by all of its objects.
 			transfer := &pb.WeightsTransferRequest{RecordOwnerEpoch: recordOwnerEpoch,
 				ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
 				RequestId: weights.RequestID, AttemptOrdinal: uint64(weights.Attempt),
 				InvocationSpecDigest: specDigest, OutputSlot: weights.OutputSlot,
 				WeightsTransactionId: weights.TransactionID, WeightsReceiptDigest: receiptDigest,
-				OperationId: operationID, GrantRevision: uint64(object.GrantRevision + 1)}
+				OperationId: "weights-" + hex.EncodeToString(objectDigest), GrantRevision: uint64(object.GrantRevision + 1)}
 			if decision.Held {
 				transfer.Decision = &pb.WeightsTransferRequest_Held{Held: &pb.WeightsObjectRef{
 					ObjectId: object.ObjectID, Length: uint64(decision.Length)}}
@@ -573,10 +580,10 @@ func (c *Orchestrator) finalizeModelTransfer(ctx context.Context, requestID stri
 			"this daemon has no model transfer finalizer")
 	} else if problem = c.opt.Store.BeginModelTransferFinalization(requestID); problem == nil {
 		problem = c.opt.ModelTransfers.Finalize(ctx, requestID,
-			func(ctx context.Context, weights records.ModelTransferWeights, operationID string,
+			func(ctx context.Context, weights records.ModelTransferWeights,
 				mint WeightsGrantMinter,
 			) *exit.Error {
-				return c.moveModelTransferWeights(ctx, weights, operationID, mint)
+				return c.moveModelTransferWeights(ctx, weights, mint)
 			})
 	}
 	if problem != nil {
