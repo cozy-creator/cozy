@@ -48,6 +48,10 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if len(overrides) > 0 {
 		return exit.Usagef("model.<param>= applies to serving callables; remote modeled jobs are not supported yet")
 	}
+	input, assets, e := launch.ParseAssets(job, input, ctx.Inv.Values["--asset"])
+	if e != nil {
+		return e
+	}
 	trees, e := parseTrees(ctx.Inv.Values["--input"])
 	if e != nil {
 		return e
@@ -60,7 +64,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	key := requestKey(ctx.Inv.Value("--idempotency-key"))
 	began := time.Now()
 	handle, e := c.SubmitJob(api.JobSubmission{
-		Package: target.Package, Function: target.Function, Input: input,
+		Package: target.Package, Function: target.Function, Input: input, LocalAssets: assets,
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
 		RentalRequired: ctx.Inv.Bool("--rental-only"),

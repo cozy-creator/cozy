@@ -29,6 +29,7 @@ from cozy_runtime.author import (
     App,
     AssetBound,
     Context,
+    FileAsset,
     ImageAsset,
     ImageFrame,
     InvalidRequest,
@@ -186,3 +187,19 @@ def video_transport(payload: VideoTransportInput) -> VideoTransportOutput:
     """
     del payload
     raise InvalidRequest("video_transport is a transport-contract fixture, not inference")
+
+
+class FileInput(msgspec.Struct, forbid_unknown_fields=True):
+    document: Annotated[FileAsset, AssetBound(max_bytes=1 << 20, media_types=("application/json", "text/plain"))]
+
+
+class FileDigest(msgspec.Struct):
+    sha256: str
+    length: int
+
+
+@app.job
+def digest_file(payload: FileInput) -> FileDigest:
+    """Read the real granted file; report its bytes, not the caller's claim."""
+    raw = payload.document.read_bytes()
+    return FileDigest(sha256=hashlib.sha256(raw).hexdigest(), length=len(raw))

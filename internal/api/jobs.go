@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
@@ -54,7 +56,8 @@ type JobSubmission struct {
 	Org string `json:"org,omitempty"`
 	// Trees are the typed input trees as `ref=<directory>`. The grant is the read
 	// capability: a `Tree` field naming a ref that is not here never hydrates.
-	Trees []string `json:"trees,omitempty"`
+	Trees       []string               `json:"trees,omitempty"`
+	LocalAssets []records.AssetBinding `json:"local_assets,omitempty"`
 }
 
 // JobHandle is the 202 answer.
@@ -114,13 +117,17 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// A job's trees name HOST DIRECTORIES that become read/write worker grants — the same
 	// authority local_assets carry on /v1/requests (requests.go) — so they take the same
 	// gate: a browser bearer must never name host paths (credentials.go).
-	if (len(sub.Trees) > 0 || sub.Worker != "" || len(sub.Models) > 0 ||
+	if (len(sub.LocalAssets) > 0 || len(sub.Trees) > 0 || sub.Worker != "" || len(sub.Models) > 0 ||
 		sub.ModelTransfer != nil) &&
 		!s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"trees name host filesystem directories and require the OS-protected CLI credential",
 			"use `cozy run --input-tree <ref>=<dir>`; this build exposes no browser tree-upload route")
 		return
+	}
+	if len(sub.LocalAssets) > 0 {
+		unlock := inputasset.Guard()
+		defer unlock()
 	}
 	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	existing, e := s.store.RequestByIdempotencyKey(key)
@@ -159,6 +166,20 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	if e = records.NormalizeModelTransferIntent(spec.ModelTransfer); e != nil {
 		s.refuseTyped(w, r, e)
 		return
+	}
+	if existing == nil {
+		spec.Assets, e = s.stageAssets(spec.Assets)
+		if e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		if len(spec.Assets) > 0 {
+			defer func() {
+				if problem := inputasset.DropUnowned(s.layout, s.store, spec.Assets); problem != nil {
+					fmt.Fprintf(s.log, "job input cleanup deferred: %s\n", problem.Message)
+				}
+			}()
+		}
 	}
 	spec.IdemKey = key
 	digest, e := jobSubmissionDigest(spec)
@@ -254,7 +275,7 @@ func replayJobSubmission(sub JobSubmission,
 		PlanID:             recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
 		NeedsAccelerator: recorded.NeedsAccelerator, Trees: trees, Worker: recorded.Worker,
 		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
-		Models: models, ModelTransfer: transfer, ProducerParams: params}, nil
+		Models: models, Assets: sub.LocalAssets, ModelTransfer: transfer, ProducerParams: params}, nil
 }
 
 // resolveJob turns package+function into the orchestrator's Submission. The
@@ -273,7 +294,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 	}
 	out := orchestrator.Submission{
 		Kind: "job", Package: sub.Package, Entrypoint: sub.Function,
-		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org),
+		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org), Assets: sub.LocalAssets,
 		Release: sub.Release,
 		Rental:  sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
 		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
@@ -317,7 +338,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		if problem != nil {
 			return out, problem
 		}
-		if problem := launch.ValidatePayload(sub.Package, job, out.Payload); problem != nil {
+		if problem := validateInputs(job, &out); problem != nil {
 			return out, problem
 		}
 		out.PlanID, out.Outputs = logical.DescriptorID, logical.Outputs
@@ -363,7 +384,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.WeightsOutputs = job.WeightsOutputs
 		out.NeedsAccelerator = job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
-		if problem := validateJobPayload(sub.Package, job, out.Payload); problem != nil {
+		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request}, &out); problem != nil {
 			return out, problem
 		}
 	}
@@ -412,7 +433,7 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 		out.PlanID, out.Outputs = job.DescriptorID, job.Outputs
 		out.WeightsOutputs, out.NeedsAccelerator = job.WeightsOutputs, job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
-		if problem := validateJobPayload(sub.Package, job, out.Payload); problem != nil {
+		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request}, &out); problem != nil {
 			return out, problem
 		}
 	}
@@ -428,11 +449,6 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 	out.Release = revision.Release
 	out.LocalPackageDigest = revision.Digest
 	return out, nil
-}
-
-func validateJobPayload(pkg string, job launch.JobFacts, payload json.RawMessage) *exit.Error {
-	return launch.ValidatePayload(pkg,
-		&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request}, payload)
 }
 
 // validOrg keeps the SCRATCH REPO's name spellable. The org is one path segment of
@@ -485,6 +501,9 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"weights_outputs": weightsOutputs,
 		"trees":           strings.Join(spec.Trees, ","),
 		"models":          models,
+	}
+	if assets := assetIdentities(spec.Assets); len(assets) > 0 {
+		doc["assets"] = assets
 	}
 	if spec.Rental {
 		doc["rental"] = true

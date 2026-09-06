@@ -264,16 +264,7 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"input":      base64.StdEncoding.EncodeToString(spec.Payload),
 		"outputs":    strings.Join(spec.Outputs, ","),
 	}
-	assets := make([]canonical.Value, 0, len(spec.Assets))
-	for _, asset := range spec.Assets {
-		assets = append(assets, map[string]canonical.Value{
-			"field_path": asset.FieldPath,
-			"digest":     asset.Digest,
-			"length":     asset.Length,
-			"media_type": asset.MediaType,
-			"order":      int64(asset.Order),
-		})
-	}
+	assets := assetIdentities(spec.Assets)
 	if len(assets) > 0 {
 		doc["assets"] = assets
 	}
@@ -999,4 +990,20 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 		"request_id": id, "attempt": last.Attempt, "status": "cancel_requested",
 		"note": "the attempt's own journaled terminal settles it; watch the event stream",
 	})
+}
+
+// assetIdentities is shared by serving and job idempotency. Mutable local paths
+// do not enter meaning; the existing digest/length/order/field/type facts do.
+func assetIdentities(bindings []records.AssetBinding) []canonical.Value {
+	assets := make([]canonical.Value, 0, len(bindings))
+	for _, asset := range bindings {
+		assets = append(assets, map[string]canonical.Value{
+			"field_path": asset.FieldPath,
+			"digest":     asset.Digest,
+			"length":     asset.Length,
+			"media_type": asset.MediaType,
+			"order":      int64(asset.Order),
+		})
+	}
+	return assets
 }

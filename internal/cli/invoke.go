@@ -93,10 +93,10 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		}
 		return handleRun(ctx, target, callable)
 	}
-	if ctx.Inv.Bool("--stream") || len(ctx.Inv.Values["--asset"]) > 0 ||
+	if ctx.Inv.Bool("--stream") ||
 		ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
-			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --await, and --rental")
+			WithRemedy("jobs accept payload values, --in, --asset, --input-tree, --org, --await, and --rental")
 	}
 	if rentalRequested(ctx) && len(callable.Models) > 0 {
 		return exit.Named(exit.Unavailable, "rental.modeled_job_unsupported",
