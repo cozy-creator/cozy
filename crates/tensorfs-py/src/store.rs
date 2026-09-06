@@ -1892,6 +1892,12 @@ impl PyDerivedWriter {
     fn commit<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let value = py
             .detach(|| {
+                let guards = self.guards.lock().expect("writer hold mutex poisoned");
+                let guards = guards.as_ref().ok_or_else(|| Refusal {
+                    code: Code::LEASE_REVOKED,
+                    detail: "derived writer holds were released".into(),
+                })?;
+                guards.writer_hold.still_registered(&self.meta)?;
                 derived::commit(
                     &self.store,
                     &self.meta,

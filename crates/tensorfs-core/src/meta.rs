@@ -11,7 +11,7 @@ use fs2::FileExt;
 use rusqlite::{params, Connection};
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::ids::{ascii_name, hex64};
+use crate::ids::ascii_name;
 use crate::limits;
 use crate::store::Store;
 
@@ -80,19 +80,6 @@ impl Meta {
 
     fn lease_path(&self, id: &str) -> PathBuf {
         self.lease_dir.join(format!("{id}.lease"))
-    }
-
-    pub fn manifest_is_released(&self, digest: &str) -> Result<bool> {
-        hex64("manifest", digest)?;
-        let count: u64 = self
-            .connection()?
-            .query_row(
-                "SELECT count(*) FROM tensorfs_released_manifests WHERE manifest_sha256=?1",
-                [digest],
-                |row| row.get(0),
-            )
-            .map_err(|error| sql("query released manifest", error))?;
-        Ok(count != 0)
     }
 
     pub(crate) fn txn(&self) -> Result<Txn> {

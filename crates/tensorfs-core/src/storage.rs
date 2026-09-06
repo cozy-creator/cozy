@@ -1223,7 +1223,7 @@ impl GcDelete {
     }
 }
 
-fn read_repositories(root: &Path) -> Result<Vec<(Repository, Vec<u8>)>> {
+pub(crate) fn read_repositories(root: &Path) -> Result<Vec<(Repository, Vec<u8>)>> {
     let mut result = Vec::new();
     for org_path in read_dir(&root.join("repos"))? {
         if !org_path.is_dir() {
