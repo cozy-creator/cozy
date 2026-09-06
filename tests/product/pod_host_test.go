@@ -81,6 +81,9 @@ type fakePod struct {
 	answerOffer func(*pb.AttemptOffer) (*pb.AttemptOutcome, error)
 	// onFrame lets a product test delegate selected frames to a real Runtime peer.
 	onFrame func(*pb.RecordOwnerFrame, func(*pb.WorkerFrame) error) (bool, error)
+	// preparedPlacement supplies a complete second-implementation placement for
+	// tests of modeled callable routing. The normal package preparation path still runs.
+	preparedPlacement func([]byte, string, string) *pb.Placement
 	// slots is the advertised seat count while serving; zero means one.
 	slots uint32
 	// downloadSamples is how many DOWNLOADING events the prepare stream reports before
@@ -517,8 +520,12 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 	}
 	name, release := selected[0].Str("package"), selected[0].Str("release")
 	distribution := name[strings.IndexByte(name, '/')+1:]
+	placement := podPlacement(call.PackageSet.DownloadDelegation, name, release, distribution)
+	if p.preparedPlacement != nil {
+		placement = p.preparedPlacement(call.PackageSet.DownloadDelegation, name, release)
+	}
 	setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{
-		podPlacement(call.PackageSet.DownloadDelegation, name, release, distribution),
+		placement,
 	}})
 	if err != nil {
 		return err

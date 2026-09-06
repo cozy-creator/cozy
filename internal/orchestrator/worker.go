@@ -651,6 +651,16 @@ func preparedRemotePlacement(w *worker, pkg, release string) (DesiredPlacement, 
 			return DesiredPlacement{}, false, exit.Named(exit.Structural,
 				"rental.placement_incomplete", "prepared placement for %s@%s is incomplete", pkg, release)
 		}
+		seen := make(map[string]bool)
+		for _, entrypoint := range row.List("entrypoints") {
+			name, binding := entrypoint.Str("name"), entrypoint.Str("entrypoint_binding_digest")
+			if name == "" || seen[name] || !validDigest(binding) {
+				return DesiredPlacement{}, false, exit.Named(exit.Structural,
+					"rental.entrypoint_binding_invalid", "prepared placement has an invalid or repeated callable binding")
+			}
+			seen[name] = true
+			placement.Entrypoints = append(placement.Entrypoints, Entrypoint{Name: name, Digest: binding})
+		}
 		return placement, true, nil
 	}
 	return DesiredPlacement{}, false, nil
@@ -944,13 +954,12 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 				pb.MaterializationState_MATERIALIZATION_STATE_FAILED
 			planID := logical.PlanID
 			if planID == "" && len(logical.Models) > 0 {
-				for candidate, dispatchable := range observed.dispatchablePlanIDs {
-					if dispatchable {
-						if planID != "" {
-							planID = ""
-							break
-						}
-						planID = candidate
+				// Runtime authored each binding beside its callable name. Other
+				// dispatchable entrypoints cannot identify this request's function.
+				for _, entrypoint := range desired.Entrypoints {
+					if entrypoint.Name == logical.Function {
+						planID = entrypoint.Digest
+						break
 					}
 				}
 			}
