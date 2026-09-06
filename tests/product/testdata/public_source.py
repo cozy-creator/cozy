@@ -81,8 +81,11 @@ def serve(selected_store):
     return server, f'127.0.0.1:{port}'
 server, address = serve(store)
 restore, restore_address = serve(root / 'restored')
+loop_restore, loop_address = serve(root / 'loop-restored')
 print(json.dumps({'address': address, 'restore_address': restore_address,
-    'prepared': base64.b64encode(prepared.SerializeToString()).decode()}), flush=True)
+    'loop_restore_address': loop_address, 'prepared': base64.b64encode(prepared.SerializeToString()).decode()}), flush=True)
 sys.stdin.readline()
 server.stop(0).wait()
 restore.stop(0).wait()
+
+loop_restore.stop(0).wait()
