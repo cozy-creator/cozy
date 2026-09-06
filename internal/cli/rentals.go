@@ -108,11 +108,7 @@ func handleRent(ctx *Context) *exit.Error {
 	if len(operationKey) > 200 {
 		return exit.Usagef("--idempotency-key is %d bytes; the hub admits at most 200", len(operationKey))
 	}
-	if operationKey == "" {
-		// Identical intent is not identity: a user may deliberately rent two
-		// identical pods. Only an explicit key may coalesce two invocations.
-		operationKey = mintKey()
-	}
+	operationKey = requestKey(operationKey)
 
 	row, attachable, replay, e := acquireRental(ctx, l, st, skuName,
 		operationKey, reason, sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
