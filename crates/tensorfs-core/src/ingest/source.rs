@@ -898,17 +898,7 @@ fn validate_request(
     request: &PrepareModelSource,
     registry: &FingerprintRegistry,
 ) -> Result<(std::collections::BTreeSet<PathBuf>, Vec<FileFence>)> {
-    ascii_name(
-        "model-source operation",
-        &request.operation_id,
-        crate::limits::MAX_NAME_BYTES,
-    )?;
-    if request.operation_id.contains('/') {
-        return refuse(
-            Code::KEY_GRAMMAR,
-            "model-source operation is one path segment",
-        );
-    }
+    crate::catalog::source_operation_id(&request.operation_id)?;
     prefixed("source selection digest", &request.source_selection_digest)?;
     if request.profiles.is_empty() || request.profiles.len() > 16 {
         return refuse(Code::COUNT_CAP, "source profile count is outside 1..=16");
@@ -1402,12 +1392,16 @@ pub fn prepare_model_source(
 }
 
 pub fn release_model_source(store: &Store, operation_id: &str) -> Result<()> {
-    crate::catalog::Catalog::open(store.root())?.release_source_preparation(operation_id)?;
-    // The conversion journal and the session root that carried it are this operation's, and
-    // the caller has just said it is done with the result. Nothing may resume it afterwards,
-    // and nothing should keep holding its objects alive.
-    let _ = fs::remove_dir_all(transaction::candidate_dir(store.root(), operation_id));
-    Ok(())
+    crate::catalog::Catalog::open(store.root())?.release_source_preparation(operation_id, || {
+        match fs::remove_dir_all(transaction::candidate_dir(store.root(), operation_id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Refusal {
+                code: Code::IO_FAILED,
+                detail: format!("remove model-source journal: {error}"),
+            }),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1598,6 +1592,10 @@ mod tests {
             store.read_manifest(&reference).unwrap();
         }
         let catalog = Catalog::open(store.root()).unwrap();
+        assert_eq!(
+            catalog.model_source_operations().unwrap(),
+            std::slice::from_ref(&request.operation_id)
+        );
         let holds = catalog.held_keys().unwrap();
         assert!(!holds.is_empty());
         assert!(Census::open(store.root())
@@ -1638,13 +1636,50 @@ mod tests {
         let rebuilt = Catalog::initialize(store.root()).unwrap();
         let projection = Census::open(store.root()).unwrap().projection().unwrap();
         rebuilt.replace_all(&projection).unwrap();
+        // Catalog destruction loses operation coordination, not retained journal bytes.
+        // Enumeration does not guess a source type from generic filesystem sessions.
+        assert!(rebuilt.model_source_operations().unwrap().is_empty());
         let recovered =
             prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
                 .unwrap();
         assert!(!recovered.replayed);
         assert_eq!(recovered.sources, first.sources);
 
+        assert_eq!(
+            Catalog::open(store.root())
+                .unwrap()
+                .model_source_operations()
+                .unwrap(),
+            std::slice::from_ref(&request.operation_id)
+        );
+
+        let session = transaction::candidate_dir(store.root(), &request.operation_id);
+        let saved_session = root.join("saved-session");
+        fs::rename(&session, &saved_session).unwrap();
+        fs::write(&session, b"not a directory").unwrap();
+        assert_eq!(
+            release_model_source(&store, &request.operation_id)
+                .unwrap_err()
+                .code,
+            Code::IO_FAILED
+        );
+        assert_eq!(
+            Catalog::open(store.root())
+                .unwrap()
+                .model_source_operations()
+                .unwrap(),
+            std::slice::from_ref(&request.operation_id)
+        );
+        fs::remove_file(&session).unwrap();
+        fs::rename(saved_session, &session).unwrap();
+
         release_model_source(&store, &request.operation_id).unwrap();
+        release_model_source(&store, &request.operation_id).unwrap();
+        assert!(Catalog::open(store.root())
+            .unwrap()
+            .model_source_operations()
+            .unwrap()
+            .is_empty());
         assert!(Catalog::open(store.root())
             .unwrap()
             .held_keys()
@@ -1661,6 +1696,60 @@ mod tests {
                 .is_file());
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    // The replacement-Runtime consumer needs a real native prepared source and head,
+    // not hand-authored SQL. Explicitly opt in; the caller owns the retained fixture.
+    #[test]
+    #[ignore = "exports an owned source fixture for cross-process Runtime restart proof"]
+    fn export_source_operation_restart_fixture() {
+        let root = PathBuf::from(
+            std::env::var_os("TFS_SOURCE_RESTART_FIXTURE").expect("fixture path required"),
+        );
+        assert!(!root.exists(), "fixture export requires a fresh owned path");
+        let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+        let prepared =
+            prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
+                .unwrap();
+        assert!(prepared.complete);
+        let heads = prepared
+            .checkpoints
+            .iter()
+            .map(|checkpoint| {
+                let head = checkpoint
+                    .head
+                    .head
+                    .as_ref()
+                    .expect("non-inline source exports a head");
+                Value::obj(vec![
+                    ("slot", Value::str(checkpoint.slot.clone())),
+                    ("plan_digest", Value::str(checkpoint.plan_digest.clone())),
+                    ("head_id", Value::str(head.id())),
+                    ("head_length", Value::uint(head.length)),
+                ])
+            })
+            .collect();
+        let mut incomplete = request.clone();
+        incomplete.operation_id = "open-source-operation".into();
+        incomplete.landed.clear();
+        let open =
+            prepare_model_source_with_registry(&store, &incomplete, "fixture:registry", &registry)
+                .unwrap();
+        assert!(!open.complete);
+        let document = Value::obj(vec![
+            ("operation", Value::str(request.operation_id)),
+            ("open_operation", Value::str(incomplete.operation_id)),
+            (
+                "store",
+                Value::str(store.root().to_string_lossy().to_string()),
+            ),
+            ("heads", Value::arr(heads)),
+        ]);
+        fs::write(
+            root.join("restart-fixture.json"),
+            crate::canon::write(&document),
+        )
+        .unwrap();
     }
 
     #[test]

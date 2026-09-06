@@ -6,6 +6,10 @@
 # script is what stages, and it re-stages unconditionally so a stale binary cannot ride.
 #
 #   scripts/build-wheel.sh [--out <dir>] [maturin build args...]
+#
+# Portable builds use the existing CI/release manylinux environment for BOTH
+# cargo and maturin. A host build can explicitly pass --compatibility linux;
+# the final whole-wheel audit refuses a manylinux tag inferred only from the extension.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

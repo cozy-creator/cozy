@@ -22,8 +22,8 @@ PACKAGE = "tensorfs"
 # abi3 is forward compatible by construction: a cp312-abi3 wheel loads on 3.12 and every
 # later CPython. The floor is real; there is no ceiling to assert.
 PYTHON_SPEC = ">=3.12"
-CURRENT_CARGO_VERSION = "0.3.10"
-CURRENT_PYTHON_VERSION = "0.3.10"
+CURRENT_CARGO_VERSION = "0.3.11"
+CURRENT_PYTHON_VERSION = "0.3.11"
 
 
 def _toml(path: pathlib.Path) -> dict[str, object]:
@@ -114,6 +114,12 @@ def wheel_binary(path: pathlib.Path, expected_cargo: str, expected_python: str) 
 
 def wheel_version(path: pathlib.Path) -> str:
     cargo_expected, expected = source_versions()
+    platform = subprocess.run(
+        ["uv", "run", "--script", str(ROOT / "scripts/wheel-platform.py"), str(path)],
+        capture_output=True, text=True, check=False,
+    )
+    if platform.returncode != 0:
+        raise ValueError(platform.stderr.strip() or platform.stdout.strip())
     wheel_binary(path, cargo_expected, expected)
     with zipfile.ZipFile(path) as wheel:
         members = [name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")]

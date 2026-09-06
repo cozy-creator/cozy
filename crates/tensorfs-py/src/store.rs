@@ -1024,6 +1024,15 @@ impl PyStore {
         Ok(out)
     }
 
+    /// Source-operation cleanup roster; the caller quiesces the owned Store lifecycle.
+    /// Does not scan roots or recover coordination lost with a deleted catalog.
+    fn model_source_operations(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        py.detach(|| {
+            tensorfs_core::catalog::Catalog::open(self.store.root())?.model_source_operations()
+        })
+        .or_refuse(py)
+    }
+
     /// Drop this operation's exact CAS holds after its prepared refs were adopted or rejected.
     fn release_model_source(&self, py: Python<'_>, operation_id: &str) -> PyResult<()> {
         py.detach(|| model_source::release_model_source(&self.store, operation_id))
