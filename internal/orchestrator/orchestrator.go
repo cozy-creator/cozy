@@ -327,6 +327,8 @@ type RentalExclusion struct {
 const (
 	// ExcludedProtocol: new directives use the current generated wire contract.
 	ExcludedProtocol = "protocol_unsupported"
+	// ExcludedSpent: a completed managed job rental is retained custody, not capacity.
+	ExcludedSpent = "managed_job_spent"
 	// ExcludedModeConflict: the rental's worker already holds the other half of the
 	// `oneof mode` — a job where a serving set is wanted, or the reverse. This is the
 	// one that read as waste live: a `ready` pod with no running work, which a
