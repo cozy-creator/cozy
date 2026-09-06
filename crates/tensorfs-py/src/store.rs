@@ -935,7 +935,12 @@ impl PyStore {
         let pushed = py
             .detach(|| {
                 let (plan, _) = if manifest {
-                    fetch::FetchPlan::of(&self.store, "checkpoint-upload", &object, &[])?
+                    fetch::FetchPlan::of(
+                        &self.store,
+                        "checkpoint-upload",
+                        &object,
+                        std::slice::from_ref(&object),
+                    )?
                 } else {
                     fetch::FetchPlan::of_objects(
                         &self.store,
@@ -995,7 +1000,12 @@ impl PyStore {
         let (transferred, held) = py
             .detach(|| {
                 let (plan, _) = if manifest {
-                    fetch::FetchPlan::of(&self.store, "checkpoint-download", &object, &[])?
+                    fetch::FetchPlan::of(
+                        &self.store,
+                        "checkpoint-download",
+                        &object,
+                        std::slice::from_ref(&object),
+                    )?
                 } else {
                     fetch::FetchPlan::of_objects(
                         &self.store,

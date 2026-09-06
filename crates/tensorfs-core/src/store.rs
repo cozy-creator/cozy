@@ -748,16 +748,33 @@ impl Store {
 
     pub fn read_manifest(&self, reference: &ObjectRef) -> Result<crate::manifest::Manifest> {
         let path = self.manifest_path(&reference.sha256);
-        let bytes = fs::read(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                Refusal {
-                    code: Code::OBJECT_ABSENT,
-                    detail: format!("manifest {} is absent", reference.id()),
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Refusal {
+                        code: Code::OBJECT_ABSENT,
+                        detail: format!("manifest {} is absent", reference.id()),
+                    }
+                } else {
+                    io(format!("read {}", path.display()), error)
                 }
-            } else {
-                io(format!("read {}", path.display()), error)
-            }
-        })?;
+            })?;
+        let mut bytes = Vec::new();
+        file.take(crate::manifest::Manifest::MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| io("read bounded manifest", error))?;
+        if bytes.len() > crate::manifest::Manifest::MAX_BYTES {
+            return refuse(Code::SIZE_CAP, "manifest exceeds its document byte cap");
+        }
+        if crate::sha256::hex_digest(&bytes) != reference.sha256 {
+            return refuse(
+                Code::OBJECT_ID_MISMATCH,
+                format!("manifest {} bytes disagree with its key", reference.id()),
+            );
+        }
         if bytes.len() as u64 != reference.length {
             return refuse(
                 Code::LENGTH_MISMATCH,
@@ -767,12 +784,6 @@ impl Store {
                     bytes.len(),
                     reference.length
                 ),
-            );
-        }
-        if crate::sha256::hex_digest(&bytes) != reference.sha256 {
-            return refuse(
-                Code::OBJECT_ID_MISMATCH,
-                format!("manifest {} bytes disagree with its key", reference.id()),
             );
         }
         crate::manifest::Manifest::parse(&bytes)

@@ -73,12 +73,14 @@ def child(root):
 
 def main():
     bodies = {}
+    requests = []
 
     class Objects(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass
 
         def do_PUT(self):
+            requests.append(("PUT", self.path))
             body = self.rfile.read(int(self.headers["Content-Length"]))
             assert hashlib.sha256(body).hexdigest() == self.path[1:]
             present = self.path in bodies
@@ -91,6 +93,7 @@ def main():
             self.end_headers()
 
         def do_GET(self):
+            requests.append(("GET", self.path))
             body = bodies[self.path]
             selected = self.headers.get("Range")
             self.send_response(206 if selected else 200)
@@ -192,11 +195,38 @@ def main():
         expected = finish(clean)
         assert recovered == local == expected
         assert recovered["declaration"] == json.loads(declaration)
+        document = expected["manifest"]
+        identity, length = "sha256:" + document["sha256"], document["length"]
+        document_store = tensorfs.Store.init(area / "manifest-only")
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Objects)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_port}/{document['sha256']}"
+        try:
+            before = len(requests)
+            refused("LENGTH_MISMATCH", lambda: store.checkpoint_push(
+                identity, length + 1, True, url, allow_local=True))
+            refused("LENGTH_MISMATCH", lambda: store.checkpoint_push(
+                tensorfs.object_id(DATA), len(DATA) + 1, False, url, allow_local=True))
+            assert len(requests) == before
+            store.checkpoint_push(identity, length, True, url, allow_local=True)
+            fetched = document_store.checkpoint_fetch(identity, length, True, url, allow_local=True)
+            assert fetched["transferred"] == length and not fetched["held"]
+            before = len(requests)
+            refused("LENGTH_MISMATCH", lambda: document_store.checkpoint_fetch(
+                identity, length + 1, True, url, allow_local=True))
+            warm = document_store.checkpoint_fetch(identity, length, True, url, allow_local=True)
+            assert warm["held"] and warm["transferred"] == 0 and len(requests) == before
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
         for current in [store, replacement, clean_store]:
             current.derived_dispose(TRANSACTION)
         print(f"derived resume: process death inside scale, retained {len(DATA)} B data role, "
               f"{len(delivered)} HTTP objects / {transferred} B, warm fetch 0 B, "
-              "next checkpoint excludes prior data, higher epoch and empty Store match clean receipt")
+              "next checkpoint excludes prior data, higher epoch and empty Store match clean receipt; "
+              "manifest PUT/GET/warm reuse and wrong-length no-network/no-deletion arms pass")
 
 
 if __name__ == "__main__":
