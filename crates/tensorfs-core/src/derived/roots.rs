@@ -18,6 +18,7 @@ pub(super) struct Root {
     pub sources: Vec<ObjectRef>,
     pub checkpoint: Option<ObjectRef>,
     pub name: Option<String>,
+    pub restore_epoch: Option<u64>,
 }
 
 impl Plain for Root {
@@ -33,6 +34,16 @@ impl Plain for Root {
             .opt("checkpoint")
             .map(|value| ObjectRef::from_value("private root checkpoint", value))
             .transpose()?;
+        let restore_epoch = fields
+            .opt("restore_epoch")
+            .map(|value| crate::canon::as_uint("PrivateDerivedRoot", "restore_epoch", value))
+            .transpose()?;
+        if restore_epoch.is_some_and(|epoch| epoch == 0 || epoch > crate::limits::INT_MAX as u64) {
+            return refuse(
+                Code::NUMBER_RANGE,
+                "restore epoch is outside the canonical range",
+            );
+        }
         let mut refs = |key| -> Result<Vec<ObjectRef>> {
             fields
                 .opt(key)
@@ -63,6 +74,7 @@ impl Plain for Root {
             sources,
             checkpoint,
             name,
+            restore_epoch,
         })
     }
     fn to_value(&self) -> Value {
@@ -83,6 +95,9 @@ impl Plain for Root {
         }
         if let Some(name) = &self.name {
             fields.push(("scratch_root_id", Value::str(name.clone())));
+        }
+        if let Some(epoch) = self.restore_epoch {
+            fields.push(("restore_epoch", Value::uint(epoch)));
         }
         Value::obj(fields)
     }
@@ -178,23 +193,27 @@ pub(super) fn write(store: &Store, root: &Root) -> Result<()> {
 }
 
 pub(super) fn pending(store: &Store, transaction: &str, manifest: &ObjectRef) -> Result<()> {
-    if read(store, transaction)?.is_some_and(|root| root.name.is_some()) {
+    let previous = read(store, transaction)?;
+    if previous.as_ref().is_some_and(|root| root.name.is_some()) {
         return refuse(
             Code::DISPOSITION_CONFLICT,
             "a named private root cannot become a pending candidate",
         );
     }
-    write(
-        store,
-        &Root {
-            transaction: transaction.into(),
-            manifest: Some(manifest.clone()),
-            name: None,
-            blobs: Vec::new(),
-            sources: Vec::new(),
-            checkpoint: read(store, transaction)?.and_then(|root| root.checkpoint),
-        },
-    )
+    let mut root = previous.unwrap_or_else(|| Root {
+        transaction: transaction.into(),
+        manifest: None,
+        name: None,
+        blobs: Vec::new(),
+        sources: Vec::new(),
+        checkpoint: None,
+        restore_epoch: None,
+    });
+    // The filesystem write precedes SQL commit. Until that succeeds, retry still
+    // needs the exact input manifests and accepted work, even if their original
+    // owners released them. ADOPT/dispose replaces this conservative retention.
+    root.manifest = Some(manifest.clone());
+    write(store, &root)
 }
 
 pub(super) fn adopt(
@@ -231,6 +250,7 @@ pub(super) fn adopt(
             blobs: Vec::new(),
             sources: Vec::new(),
             checkpoint: None,
+            restore_epoch: None,
         },
     )
 }

@@ -383,6 +383,28 @@ pub(crate) struct CheckpointExport {
     pub roots: Vec<ObjectRef>,
 }
 
+/// Keep a verified derived recovery object across fetch/page/Ready/process-death gaps.
+/// The live guard covers admission; the transaction's existing private root then owns
+/// the bytes until begin installs complete writer custody or explicit abandonment wins.
+pub fn restore_derived<T>(
+    store: &Store,
+    meta: &crate::meta::Meta,
+    transaction: &str,
+    epoch: u64,
+    object: &ObjectRef,
+    fetch: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let hold = meta.acquire_hold("derived-checkpoint-restore")?;
+    let result = (|| {
+        crate::derived::retain_restore(store, meta, transaction, epoch, None)?;
+        let value = fetch()?;
+        crate::derived::retain_restore(store, meta, transaction, epoch, Some(object))?;
+        Ok(value)
+    })();
+    let released = hold.release(meta);
+    result.and_then(|value| released.map(|()| value))
+}
+
 /// The shared byte-plane export. Its opaque progress is interpreted only by its producer;
 /// source ingest and derived writers keep their existing journals and retention authorities.
 pub(crate) fn checkpoint_bytes(

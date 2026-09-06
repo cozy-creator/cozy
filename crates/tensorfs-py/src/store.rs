@@ -975,7 +975,7 @@ impl PyStore {
     }
 
     /// Fetch one exact recovery object through ordinary digest/length admission.
-    #[pyo3(signature = (object_id, length, manifest, url, *, allow_local=false))]
+    #[pyo3(signature = (object_id, length, manifest, url, *, allow_local=false, derived_restore=None))]
     #[allow(clippy::too_many_arguments)]
     fn checkpoint_fetch<'p>(
         &self,
@@ -985,6 +985,7 @@ impl PyStore {
         manifest: bool,
         url: &str,
         allow_local: bool,
+        derived_restore: Option<(String, u64)>,
     ) -> PyResult<Bound<'p, PyDict>> {
         use tensorfs_core::{fetch, transport};
         let id = prefixed("checkpoint object", object_id).or_refuse(py)?;
@@ -999,36 +1000,56 @@ impl PyStore {
         };
         let (transferred, held) = py
             .detach(|| {
-                let (plan, _) = if manifest {
-                    fetch::FetchPlan::of(
+                let fetch_object = || {
+                    let (plan, _) = if manifest {
+                        fetch::FetchPlan::of(
+                            &self.store,
+                            "checkpoint-download",
+                            &object,
+                            std::slice::from_ref(&object),
+                        )?
+                    } else {
+                        fetch::FetchPlan::of_objects(
+                            &self.store,
+                            "checkpoint-download",
+                            std::slice::from_ref(&object),
+                        )?
+                    };
+                    if plan.wanted.is_empty() {
+                        return Ok((0, true));
+                    }
+                    let grant = fetch::DeliveryGrant::mint(&plan, &object)?;
+                    let fetched = transport::fetch_ranged(
                         &self.store,
-                        "checkpoint-download",
-                        &object,
-                        std::slice::from_ref(&object),
-                    )?
-                } else {
-                    fetch::FetchPlan::of_objects(
-                        &self.store,
-                        "checkpoint-download",
-                        std::slice::from_ref(&object),
-                    )?
+                        &grant,
+                        url,
+                        &policy,
+                        &transport::Anonymous,
+                        transport::Deadline::after_seconds(None),
+                        &transport::Ledger::new(),
+                        transport::Ranged::default(),
+                        None,
+                    )?;
+                    Ok((fetched.transferred, false))
                 };
-                if plan.wanted.is_empty() {
-                    return Ok((0, true));
+                if let Some((transaction, epoch)) = &derived_restore {
+                    if manifest {
+                        return refuse(
+                            Code::KEY_GRAMMAR,
+                            "derived progress restores blob objects, not manifests",
+                        );
+                    }
+                    tensorfs_core::durability::restore_derived(
+                        &self.store,
+                        &self.meta,
+                        transaction,
+                        *epoch,
+                        &object,
+                        fetch_object,
+                    )
+                } else {
+                    fetch_object()
                 }
-                let grant = fetch::DeliveryGrant::mint(&plan, &object)?;
-                let fetched = transport::fetch_ranged(
-                    &self.store,
-                    &grant,
-                    url,
-                    &policy,
-                    &transport::Anonymous,
-                    transport::Deadline::after_seconds(None),
-                    &transport::Ledger::new(),
-                    transport::Ranged::default(),
-                    None,
-                )?;
-                Ok((fetched.transferred, false))
             })
             .or_refuse(py)?;
         let out = PyDict::new(py);

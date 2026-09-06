@@ -6,7 +6,9 @@
 //! additions through the ordinary object writer. There is no filename inference, model
 //! vocabulary, Torch, schedule, publication, or serving decision here.
 
+mod progress;
 mod roots;
+use progress::read as read_progress;
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -937,6 +939,73 @@ fn part_from_value(value: &Value) -> Result<Part> {
     Ok(part)
 }
 
+impl AddedPart {
+    fn from_value(value: &Value) -> Result<Self> {
+        let mut fields = Fields::new("DerivedTransaction.added_part", value)?;
+        let component = fields.req_str("component")?.to_string();
+        let tensor_key = fields.req_str("key")?.to_string();
+        let part_value = crate::canon::parse_canonical(
+            fields.req_str("part")?.as_bytes(),
+            limits::DOC_MAX_BYTES,
+        )?;
+        let part = part_from_value(&part_value)?;
+        let role = fields.req_str("role")?.to_string();
+        fields.done()?;
+        name("added part component", &component)?;
+        key("added part tensor", &tensor_key)?;
+        name("added part role", &role)?;
+        Ok(Self {
+            component,
+            key: tensor_key,
+            role,
+            part,
+        })
+    }
+    fn to_value(&self) -> Value {
+        Value::obj(vec![
+            ("component", Value::str(self.component.clone())),
+            ("key", Value::str(self.key.clone())),
+            (
+                "part",
+                Value::str(
+                    String::from_utf8(crate::canon::write(&part_value(&self.part)))
+                        .expect("canonical JSON is UTF-8"),
+                ),
+            ),
+            ("role", Value::str(self.role.clone())),
+        ])
+    }
+}
+
+impl AddedConfig {
+    fn from_value(value: &Value) -> Result<Self> {
+        let mut fields = Fields::new("DerivedTransaction.added_config", value)?;
+        let config = fields.req_str("canonical_json")?.as_bytes().to_vec();
+        if crate::header::canonical_config("added config", &config)? != config {
+            return refuse(
+                Code::NONCANONICAL_ENCODING,
+                "added config is not canonical RFC 8785 JSON",
+            );
+        }
+        let config_name = fields.req_str("name")?.to_string();
+        fields.done()?;
+        name("added config", &config_name)?;
+        Ok(Self {
+            name: config_name,
+            config,
+        })
+    }
+    fn to_value(&self) -> Value {
+        Value::obj(vec![
+            (
+                "canonical_json",
+                Value::str(std::str::from_utf8(&self.config).expect("validated config is UTF-8")),
+            ),
+            ("name", Value::str(self.name.clone())),
+        ])
+    }
+}
+
 impl TransactionRow {
     pub(crate) fn normalize(&mut self) {
         self.added_parts
@@ -959,55 +1028,18 @@ impl TransactionRow {
             .map(|v| as_str("DerivedTransaction", "declaration", v).map(str::to_string))
             .transpose()?;
 
-        let mut added_parts = Vec::new();
-        for value in as_arr("DerivedTransaction", "added_parts", f.req("added_parts")?)? {
-            let mut af = Fields::new("DerivedTransaction.added_part", value)?;
-            let component = af.req_str("component")?.to_string();
-            let tensor_key = af.req_str("key")?.to_string();
-            let part_text = af.req_str("part")?;
-            let part_value =
-                crate::canon::parse_canonical(part_text.as_bytes(), limits::DOC_MAX_BYTES)?;
-            let part = part_from_value(&part_value)?;
-            let role = af.req_str("role")?.to_string();
-            af.done()?;
-            name("added part component", &component)?;
-            key("added part tensor", &tensor_key)?;
-            name("added part role", &role)?;
-            added_parts.push(AddedPart {
-                component,
-                key: tensor_key,
-                role,
-                part,
-            });
-        }
-        let mut added_configs = Vec::new();
-        for value in as_arr(
+        let added_parts = as_arr("DerivedTransaction", "added_parts", f.req("added_parts")?)?
+            .iter()
+            .map(AddedPart::from_value)
+            .collect::<Result<Vec<_>>>()?;
+        let added_configs = as_arr(
             "DerivedTransaction",
             "added_configs",
             f.req("added_configs")?,
-        )? {
-            let mut af = Fields::new("DerivedTransaction.added_config", value)?;
-            let config = as_str(
-                "DerivedTransaction.added_config",
-                "canonical_json",
-                af.req("canonical_json")?,
-            )?
-            .as_bytes()
-            .to_vec();
-            if crate::header::canonical_config("added config", &config)? != config {
-                return refuse(
-                    Code::NONCANONICAL_ENCODING,
-                    "added config is not canonical RFC 8785 JSON",
-                );
-            }
-            let config_name = af.req_str("name")?.to_string();
-            af.done()?;
-            name("added config", &config_name)?;
-            added_configs.push(AddedConfig {
-                name: config_name,
-                config,
-            });
-        }
+        )?
+        .iter()
+        .map(AddedConfig::from_value)
+        .collect::<Result<Vec<_>>>()?;
         let inherited_payload_bytes = f.req_uint("inherited_payload_bytes")?;
         let inherited_payload_objects = f.req_uint("inherited_payload_objects")?;
         let mut source_facts = Vec::new();
@@ -1214,44 +1246,13 @@ impl TransactionRow {
                 Value::arr(
                     self.added_configs
                         .iter()
-                        .map(|added| {
-                            Value::obj(vec![
-                                (
-                                    "canonical_json",
-                                    Value::str(
-                                        std::str::from_utf8(&added.config)
-                                            .expect("validated config is UTF-8"),
-                                    ),
-                                ),
-                                ("name", Value::str(added.name.clone())),
-                            ])
-                        })
+                        .map(AddedConfig::to_value)
                         .collect(),
                 ),
             ),
             (
                 "added_parts".to_string(),
-                Value::arr(
-                    self.added_parts
-                        .iter()
-                        .map(|added| {
-                            Value::obj(vec![
-                                ("component", Value::str(added.component.clone())),
-                                ("key", Value::str(added.key.clone())),
-                                (
-                                    "part",
-                                    Value::str(
-                                        String::from_utf8(crate::canon::write(&part_value(
-                                            &added.part,
-                                        )))
-                                        .expect("canonical JSON is UTF-8"),
-                                    ),
-                                ),
-                                ("role", Value::str(added.role.clone())),
-                            ])
-                        })
-                        .collect(),
-                ),
+                Value::arr(self.added_parts.iter().map(AddedPart::to_value).collect()),
             ),
             (
                 "highest_session".to_string(),
@@ -2072,6 +2073,15 @@ pub fn begin(
                 "derived work changed while beginning; retry with current writer epoch",
             );
         }
+        if roots::read(store, &transaction)?
+            .and_then(|root| root.restore_epoch)
+            .is_some_and(|epoch| epoch > writer_session)
+        {
+            return refuse(
+                Code::WRITER_FENCED,
+                "writer is behind the retained restore epoch",
+            );
+        }
         retain_progress(store, row, checkpoint)?;
         match current {
             Some(current) => *current = row.clone(),
@@ -2176,45 +2186,6 @@ fn merge_progress(
     }
     row.normalize();
     Ok(())
-}
-
-fn read_progress(
-    store: &Store,
-    head: &ObjectRef,
-    transaction: &str,
-    declaration: &str,
-    sources: &[SourceFact],
-) -> Result<TransactionRow> {
-    let link = crate::durability::local_link(store, head)?;
-    let chain = crate::durability::local_chain(store, head, &link.plan)?;
-    let progress = chain.progress.last().ok_or_else(|| Refusal {
-        code: Code::MISSING_FIELD,
-        detail: "derived checkpoint has no progress document".into(),
-    })?;
-    let bytes = crate::durability::read_document(store, progress, limits::DOC_MAX_BYTES)?;
-    let row = TransactionRow::from_value(&crate::canon::parse_canonical(
-        &bytes,
-        limits::DOC_MAX_BYTES,
-    )?)?;
-    if row.id != transaction
-        || row.declaration.as_deref() != Some(declaration)
-        || row.source_facts != sources
-        || row.state != TransactionState::Open
-        || row.current_session.is_some()
-        || row.highest_session != 0
-    {
-        return refuse(
-            Code::TRANSACTION_CONFLICT,
-            "derived checkpoint differs from current work or imports writer authority",
-        );
-    }
-    if progress_plan(&row) != link.plan {
-        return refuse(
-            Code::JOURNAL_STALE,
-            "derived checkpoint plan differs from its current work",
-        );
-    }
-    Ok(row)
 }
 
 /// Verify a restored checkpoint against the current native declaration without creating,
@@ -2327,7 +2298,6 @@ pub fn checkpoint_progress(
         progress_row(open_row(&mut txn.rows, transaction, writer_session)?)
     };
     let plan = progress_plan(&progress);
-    let bytes = crate::canon::write(&progress.to_value());
     let chain = format!("{operation}/{slot}");
     ascii_name("checkpoint operation", &chain, limits::MAX_NAME_BYTES)?;
     let policy = crate::durability::Policy {
@@ -2343,12 +2313,47 @@ pub fn checkpoint_progress(
         root.as_ref().and_then(|root| root.checkpoint.as_ref()),
         previous,
     )?;
+    let work = progress::context(&progress);
+    let work_bytes = crate::canon::write(&work.to_value());
+    let work_ref = ObjectRef::of(&work_bytes);
+    let prior = previous
+        .as_ref()
+        .map(|head| {
+            read_progress(
+                store,
+                head,
+                transaction,
+                progress.declaration.as_deref().expect("open declaration"),
+                &progress.source_facts,
+            )
+        })
+        .transpose()?;
+    let delta = progress::Delta::between(&progress, prior.as_ref(), work_ref.clone())?;
+    if delta.is_empty() && previous.is_some() {
+        let prior = crate::durability::local_chain(store, previous.as_ref().unwrap(), &plan)?;
+        return Ok((
+            plan,
+            crate::durability::Head {
+                head: previous,
+                links: prior.links,
+                bytes: prior.bytes,
+            },
+        ));
+    }
+    store.put_stream(
+        &mut work_bytes.as_slice(),
+        Some(&work_ref),
+        &Default::default(),
+    )?;
+    let bytes = crate::canon::write(&delta.to_value());
+    let mut objects = added_objects(&progress);
+    objects.push(work_ref);
     let exported = crate::durability::checkpoint_bytes(
         store,
         &policy,
         previous.as_ref(),
         &bytes,
-        added_objects(&progress),
+        objects,
         None,
     )?;
     let mut txn = meta.txn()?;
@@ -2395,8 +2400,87 @@ fn retain_progress(
                 .map(|source| source.manifest.clone())
                 .collect(),
             checkpoint: head,
+            restore_epoch: None,
         },
     )
+}
+
+/// Durability calls this under a live GC guard, before fetch and after verified admission.
+/// The same SQL lock as abandonment prevents a late download recreating a disposed root.
+pub(crate) fn retain_restore(
+    store: &Store,
+    meta: &Meta,
+    transaction: &str,
+    epoch: u64,
+    object: Option<&ObjectRef>,
+) -> Result<()> {
+    let transaction = transaction_id(transaction)?;
+    if epoch == 0 || epoch > limits::INT_MAX as u64 {
+        return refuse(
+            Code::NUMBER_RANGE,
+            "restore writer epoch is outside the canonical range",
+        );
+    }
+    if let Some(object) = object {
+        require_payload_record(store, object, "restored checkpoint object")?;
+    }
+    let txn = meta.txn()?;
+    let row = txn.rows.iter().find(|row| row.id == transaction);
+    let active = if let Some(row) = row {
+        if row.state != TransactionState::Open {
+            return refuse(
+                Code::TRANSACTION_CLOSED,
+                "restored transaction is already closed",
+            );
+        }
+        if epoch < row.highest_session
+            || epoch == row.highest_session && row.current_session != Some(epoch)
+        {
+            return refuse(
+                Code::WRITER_FENCED,
+                "restored object is behind the writer fence",
+            );
+        }
+        if row.current_session.is_some_and(|writer| writer != epoch) {
+            return refuse(
+                Code::STORE_BUSY,
+                "prior writer must be fenced before restoration",
+            );
+        }
+        row.current_session == Some(epoch)
+    } else {
+        false
+    };
+    let mut root = roots::read(store, &transaction)?.unwrap_or_else(|| roots::Root {
+        transaction: transaction.clone(),
+        manifest: None,
+        blobs: Vec::new(),
+        sources: Vec::new(),
+        checkpoint: None,
+        name: None,
+        restore_epoch: None,
+    });
+    if root.restore_epoch.is_some_and(|held| held > epoch) {
+        return refuse(
+            Code::WRITER_FENCED,
+            "restored object is behind the retained restore epoch",
+        );
+    }
+    if !active {
+        root.restore_epoch = Some(epoch);
+    }
+    if let Some(object) = object {
+        if let Some(held) = root.blobs.iter().find(|held| held.sha256 == object.sha256) {
+            if held != object {
+                return refuse(Code::LENGTH_MISMATCH, "restore hold changed object length");
+            }
+        } else {
+            root.blobs.push(object.clone());
+        }
+        root.blobs
+            .sort_by(|left, right| left.sha256.cmp(&right.sha256));
+    }
+    roots::write(store, &root)
 }
 
 pub(crate) fn retained_objects(store: &Store) -> Result<Vec<crate::storage::HeldKey>> {
@@ -3129,6 +3213,92 @@ mod tests {
             order: vec![("inherited".into(), "weight".into())],
             max_new_bytes: 0,
         }
+    }
+
+    #[test]
+    fn failed_commit_retains_input_custody_until_retry_and_adoption() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-derived-commit-window-{}",
+            crate::meta::now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let meta = Meta::open(&store).unwrap();
+        let source_id = format!("sha256:{}", "91".repeat(32));
+        let source_writer =
+            begin(&store, &meta, &source_id, 1, created_declaration(), None).unwrap();
+        let source_bytes = vec![0x21; 2048];
+        let source_part = add_part(
+            &store,
+            &meta,
+            &source_id,
+            1,
+            ("model", "weight", "value"),
+            &mut source_bytes.as_slice(),
+        )
+        .unwrap();
+        let source = commit(&store, &meta, &source_id, 1).unwrap();
+        release_guards(
+            &meta,
+            Some(source_writer.writer_hold),
+            source_writer.source_leases,
+        );
+
+        let id = format!("sha256:{}", "92".repeat(32));
+        let mut declaration = inherited_declaration(source.manifest.clone());
+        declaration.components[0].drop = vec!["weight".into()];
+        declaration.components[0].add = created_declaration().components.remove(0).add;
+        declaration.max_new_bytes = 2048;
+        let writer = begin(&store, &meta, &id, 1, declaration.clone(), None).unwrap();
+        dispose(&store, &meta, &source_id).unwrap();
+        let target_bytes = vec![0x31; 2048];
+        add_part(
+            &store,
+            &meta,
+            &id,
+            1,
+            ("inherited", "weight", "value"),
+            &mut target_bytes.as_slice(),
+        )
+        .unwrap();
+        let before = roots::read(&store, &id).unwrap().unwrap();
+
+        let connection = rusqlite::Connection::open(crate::catalog::Catalog::path(&root)).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_derived_commit BEFORE DELETE ON tensorfs_derived_transactions BEGIN SELECT RAISE(ABORT,'derived commit window'); END").unwrap();
+        let error = commit(&store, &meta, &id, 1).unwrap_err();
+        assert_eq!(error.code, Code::IO_FAILED);
+        assert!(error.detail.contains("derived commit window"));
+        connection
+            .execute_batch("DROP TRIGGER fail_derived_commit")
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            lookup(&store, &meta, &id).unwrap(),
+            Lookup::Open { .. }
+        ));
+        let pending = roots::read(&store, &id).unwrap().unwrap();
+        assert_eq!(pending.sources, before.sources);
+        assert_eq!(pending.blobs, before.blobs);
+        assert!(pending.manifest.is_some());
+
+        fence(&meta, &id, 1).unwrap();
+        release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
+        crate::gc::collect(&root, false).unwrap();
+        store.read_manifest(&source.manifest).unwrap();
+        assert!(store.contains(&source_part.part.segments()[0].sha256));
+        let replacement = begin(&store, &meta, &id, 2, declaration, None).unwrap();
+        assert_eq!(completed(&meta, &id, 2).unwrap().0.len(), 1);
+        let receipt = commit(&store, &meta, &id, 2).unwrap();
+        assert_eq!(Some(receipt.manifest.clone()), pending.manifest);
+        release_guards(
+            &meta,
+            Some(replacement.writer_hold),
+            replacement.source_leases,
+        );
+        adopt(&store, &meta, &id, "commit-window-output").unwrap();
+        crate::gc::collect(&root, false).unwrap();
+        store.read_manifest(&receipt.manifest).unwrap();
+        assert!(!store.contains(&source_part.part.segments()[0].sha256));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

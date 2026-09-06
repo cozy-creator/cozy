@@ -732,3 +732,187 @@ fn restored_inherited_source_custody_survives_origin_release_and_writer_restart(
     std::fs::remove_dir_all(store.root()).unwrap();
     std::fs::remove_dir_all(restored.root()).unwrap();
 }
+
+#[test]
+fn per_tensor_checkpoints_retain_linear_metadata() {
+    let (store, meta, id, mut declaration) = fixture("linear-progress");
+    let prototype = declaration.components[0].add[0].clone();
+    const COUNT: usize = 128;
+    declaration.components[0].add = (0..COUNT)
+        .map(|index| {
+            let mut tensor = prototype.clone();
+            tensor.key = format!("weight_{index:04}");
+            tensor
+        })
+        .collect();
+    declaration.order = declaration.components[0]
+        .add
+        .iter()
+        .map(|tensor| ("model".into(), tensor.key.clone()))
+        .collect();
+    declaration.max_new_bytes = (COUNT * 576) as u64;
+    let writer = begin(&store, &meta, &id, 1, declaration.clone(), None).unwrap();
+    let context_bytes =
+        crate::canon::write(&progress::context(&meta.derived_rows().unwrap()[0]).to_value()).len()
+            as u64;
+    let mut samples = Vec::new();
+    let mut last = None;
+    for index in 0..COUNT {
+        let key = format!("weight_{index:04}");
+        add_part(
+            &store,
+            &meta,
+            &id,
+            1,
+            ("model", &key, "data"),
+            &mut vec![0x31; 512].as_slice(),
+        )
+        .unwrap();
+        add_part(
+            &store,
+            &meta,
+            &id,
+            1,
+            ("model", &key, "scale"),
+            &mut vec![0; 64].as_slice(),
+        )
+        .unwrap();
+        let (plan, head) =
+            checkpoint_progress(&store, &meta, &id, 1, "request", "model", None).unwrap();
+        if [32, 64, 128].contains(&(index + 1)) {
+            let root = head.head.as_ref().unwrap();
+            let chain = crate::durability::local_chain(&store, root, &plan).unwrap();
+            assert_eq!(chain.progress.len(), index + 1);
+            let mut refs = std::collections::BTreeMap::new();
+            for object in chain.blobs.iter().chain(
+                crate::durability::local_documents(&store, root)
+                    .unwrap()
+                    .iter(),
+            ) {
+                refs.insert(object.sha256.clone(), object.length);
+            }
+            refs.remove(&ObjectRef::of(&vec![0x31; 512]).sha256);
+            let metadata: u64 = refs.values().sum();
+            assert!(
+                metadata < context_bytes + ((index + 1) * 2048) as u64,
+                "cumulative snapshots returned: tensors={} metadata={metadata}",
+                index + 1
+            );
+            samples.push(metadata);
+            let restored = read_progress(
+                &store,
+                root,
+                &id,
+                &String::from_utf8(declaration.clone().canonical_work_bytes().unwrap()).unwrap(),
+                &[],
+            )
+            .unwrap();
+            assert_eq!(restored.added_parts.len(), (index + 1) * 2);
+            eprintln!("derived metadata: tensors={} retained_bytes={metadata} context_bytes={context_bytes}",index+1);
+        }
+        last = Some((plan, head));
+    }
+    assert!(samples[2] - samples[1] <= 21 * (samples[1] - samples[0]) / 10);
+    assert_eq!(
+        checkpoint_progress(&store, &meta, &id, 1, "request", "model", None).unwrap(),
+        last.unwrap()
+    );
+    fence(&meta, &id, 1).unwrap();
+    release(&meta, writer);
+    abandon(&store, &meta, &id).unwrap();
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
+
+#[test]
+fn source_free_restore_holds_survive_gc_until_begin_or_explicit_abandon() {
+    let (source, source_meta, id, declaration) = fixture("restore-hold");
+    let writer = begin(&source, &source_meta, &id, 1, declaration.clone(), None).unwrap();
+    data(&source, &source_meta, &id, 1, 0x31);
+    let (plan, head) =
+        checkpoint_progress(&source, &source_meta, &id, 1, "request", "output", None).unwrap();
+    let head = head.head.unwrap();
+    let target = Store::init(&source.root().join("restore-target")).unwrap();
+    let meta = Meta::open(&target).unwrap();
+    let admit = |object: &ObjectRef| {
+        crate::durability::restore_derived(&target, &meta, &id, 3, object, || {
+            let mut body = Vec::new();
+            source.read_into(&object.sha256, &mut body)?;
+            target.put_stream(&mut body.as_slice(), Some(object), &Default::default())?;
+            Ok(())
+        })
+        .unwrap();
+        crate::gc::collect(target.root(), false).unwrap();
+        assert!(target.contains(&object.sha256));
+    };
+    admit(&head);
+    let page = crate::durability::local_window(&target, &head, 0, 128).unwrap();
+    for (kind, object) in page.objects {
+        assert_eq!(kind, crate::repo_cache::CacheKind::Blob);
+        admit(&object);
+    }
+    assert!(matches!(
+        lookup(&target, &meta, &id).unwrap(),
+        Lookup::Absent
+    ));
+    let canonical = declaration.clone().canonical_work_bytes().unwrap();
+    validate_checkpoint(
+        &target, &meta, &id, &canonical, &head, "request", "output", &plan,
+    )
+    .unwrap();
+    // Ready is read-only: persistent retention remains after its transient guard ends.
+    crate::gc::collect(target.root(), false).unwrap();
+    assert_eq!(
+        roots::read(&target, &id).unwrap().unwrap().restore_epoch,
+        Some(3)
+    );
+    assert_eq!(
+        begin(&target, &meta, &id, 2, declaration.clone(), Some(&head))
+            .err()
+            .unwrap()
+            .code,
+        Code::WRITER_FENCED
+    );
+    let restored = begin(&target, &meta, &id, 3, declaration, Some(&head)).unwrap();
+    assert!(roots::read(&target, &id)
+        .unwrap()
+        .unwrap()
+        .restore_epoch
+        .is_none());
+    assert_eq!(completed(&meta, &id, 3).unwrap().0.len(), 1);
+    fence(&meta, &id, 3).unwrap();
+    release(&meta, restored);
+    abandon(&target, &meta, &id).unwrap();
+    assert_eq!(
+        crate::durability::restore_derived(&target, &meta, &id, 4, &head, || -> Result<()> {
+            panic!("abandoned restore performed IO")
+        })
+        .unwrap_err()
+        .code,
+        Code::TRANSACTION_CLOSED
+    );
+    crate::gc::collect(target.root(), false).unwrap();
+    assert!(!target.contains(&head.sha256));
+
+    let late_id = format!("sha256:{}", "79".repeat(32));
+    let late = ObjectRef::of(b"late immutable object");
+    assert_eq!(
+        crate::durability::restore_derived(&target, &meta, &late_id, 1, &late, || {
+            target.put_stream(
+                &mut b"late immutable object".as_slice(),
+                Some(&late),
+                &Default::default(),
+            )?;
+            abandon(&target, &meta, &late_id)?;
+            Ok(())
+        })
+        .unwrap_err()
+        .code,
+        Code::TRANSACTION_CLOSED
+    );
+    assert!(roots::read(&target, &late_id).unwrap().is_none());
+    crate::gc::collect(target.root(), false).unwrap();
+    assert!(!target.contains(&late.sha256));
+    fence(&source_meta, &id, 1).unwrap();
+    release(&source_meta, writer);
+    std::fs::remove_dir_all(source.root()).unwrap();
+}
