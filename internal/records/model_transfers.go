@@ -783,7 +783,8 @@ func (s *Store) FailModelTransfer(requestID, code, detail string) *exit.Error {
 func (s *Store) RequestModelTransferCancellation(requestID string) *exit.Error {
 	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='canceled',
 		error_code='CLIENT_CANCELED',safe_error='model transfer finalization canceled by client',
-		updated_at=? WHERE request_id=? AND state='finalizing'`, now(), requestID)
+		updated_at=? WHERE request_id=? AND state IN ('finalizing','failed')
+		AND EXISTS (SELECT 1 FROM requests r WHERE r.id=request_id AND r.state='finalizing')`, now(), requestID)
 	if err != nil {
 		return exit.Internalf("cannot request model transfer cancellation: %s", err)
 	}

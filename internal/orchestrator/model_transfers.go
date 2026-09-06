@@ -652,13 +652,17 @@ func (c *Orchestrator) CancelModelTransferFinalization(requestID, actor string) 
 	}
 	c.signalTransfer(requestID)
 	c.kickSourceCheckpointUpload(requestID)
-	return nil
+	return c.resumeModelTransferPublication(requestID)
 }
 
 func (c *Orchestrator) finishModelTransferRequest(requestID string, attempt int64) {
 	c.kickSourceCheckpointUpload(requestID)
 	request, problem := c.opt.Store.RequestRow(requestID)
 	if problem != nil || request == nil || request.State == "canceled" {
+		return
+	}
+	retainedAttempt, readProblem := c.opt.Store.AttemptRow(requestID, attempt)
+	if readProblem != nil || retainedAttempt == nil || c.retainedPublication(*request, *retainedAttempt) {
 		return
 	}
 	if problem := c.releaseManagedNow(*request); problem != nil {
@@ -707,6 +711,16 @@ func (c *Orchestrator) ResumeModelTransfers() *exit.Error {
 		if readProblem != nil || attempt == nil {
 			continue
 		}
+		if c.retainedPublication(*request, *attempt) {
+			if transfer.State == "failed" {
+				if request.Worker != "" {
+					c.selectOrStart(*request)
+				}
+			} else {
+				_ = c.resumeModelTransferPublication(request.ID)
+			}
+			continue
+		}
 		if attempt.State == "closed" {
 			go c.finishModelTransferRequest(request.ID, attempt.Attempt)
 		} else if request.Worker == "" && attempt.State == "terminal" {
@@ -749,6 +763,12 @@ func (c *Orchestrator) kickRecoveredLocalTransfer(requestID string, attempt int6
 					return
 				}
 			}
+		}
+		request, readProblem := c.opt.Store.RequestRow(requestID)
+		retainedAttempt, attemptProblem := c.opt.Store.AttemptRow(requestID, attempt)
+		if readProblem != nil || attemptProblem != nil || request == nil || retainedAttempt == nil ||
+			c.retainedPublication(*request, *retainedAttempt) {
+			return
 		}
 		if problem := c.opt.Store.Closed(requestID, attempt); problem != nil {
 			return

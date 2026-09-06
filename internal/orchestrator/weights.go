@@ -339,8 +339,11 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 			c.logf("OutcomeAck %s#%d not sent: model transfer cannot be read", requestID, ordinal)
 			return
 		}
-		if transfer != nil && transfer.State != "completed" && transfer.State != "failed" &&
-			transfer.State != "canceled" {
+		if transfer != nil && transfer.State == "failed" {
+			c.logf("OutcomeAck %s#%d withheld: publication is blocked; retry publication or explicitly cancel", requestID, ordinal)
+			return
+		}
+		if transfer == nil || (transfer.State != "completed" && transfer.State != "canceled") {
 			c.kickModelTransferFinalizer(s, requestID, int64(ordinal))
 			return
 		}

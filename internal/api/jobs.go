@@ -897,7 +897,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	actor := cancelActor(r)
+	actor := requestActor(r)
 	if status := contractStatus(row.State); status == "completed" || status == "failed" || status == "canceled" {
 		s.ok(w, r, http.StatusOK, s.jobStateOf(row))
 		return

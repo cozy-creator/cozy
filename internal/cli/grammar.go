@@ -298,10 +298,11 @@ func (c *ModelYankCmd) Run(r *Runtime) error {
 }
 
 type RunCmd struct {
-	Execute RunExecuteCmd `cmd:"" default:"withargs" hidden:""`
-	Cancel  RunCancelCmd  `cmd:"" help:"Cancel a queued or running run."`
-	List    RunListCmd    `cmd:"" help:"List current and past runs."`
-	Watch   RunWatchCmd   `cmd:"" help:"Watch one recorded run until it settles."`
+	RetryPublication RunRetryPublicationCmd `cmd:"" help:"Retry a blocked model publication without rerunning its producer."`
+	Execute          RunExecuteCmd          `cmd:"" default:"withargs" hidden:""`
+	Cancel           RunCancelCmd           `cmd:"" help:"Cancel a queued or running run."`
+	List             RunListCmd             `cmd:"" help:"List current and past runs."`
+	Watch            RunWatchCmd            `cmd:"" help:"Watch one recorded run until it settles."`
 }
 
 type RunExecuteCmd struct {
@@ -329,6 +330,14 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets,
 		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org), true)
+}
+
+type RunRetryPublicationCmd struct {
+	ID string `arg:"" name:"run" help:"Run id with a retained failed model publication."`
+}
+
+func (c *RunRetryPublicationCmd) Run(r *Runtime) error {
+	return r.call(handleRunRetryPublication, []string{c.ID}, nil, nil, true)
 }
 
 type RunCancelCmd struct {
