@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,7 +17,9 @@ import (
 )
 
 const localWeightlessRef = "local/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "c0d98b55ab69b158a5a70b7d3c75e002bef35244"
+const editableRuntimeFixtureSHA = "3381ae1373725117c8e702c52f6ad25ab162ace4"
+
+var tensorfsFixtureWheel = flag.String("tensorfs-fixture-wheel", "", "exact native candidate wheel for an unpublished paired Runtime proof; omitted uses public resolution")
 
 // TestProductPath is the one end-to-end product path: a local package installed from
 // source, invoked as a user types it, answered with a typed result and real bytes on
@@ -511,6 +514,9 @@ func weightlessProject(t *testing.T) string {
 	build := exec.Command("/usr/bin/nice", "-n", "19", "python3",
 		"tests/product/testdata/build-weightless.py", "--out", dir, "--source-out", project,
 		"--runtime-sha", editableRuntimeFixtureSHA)
+	if *tensorfsFixtureWheel != "" {
+		build.Args = append(build.Args, "--tensorfs-wheel", *tensorfsFixtureWheel)
+	}
 	build.Dir = "../.."
 	build.Env = childEnv(t, repo, "RUNTIME_REPO="+repo)
 	if out, err := build.CombinedOutput(); err != nil {

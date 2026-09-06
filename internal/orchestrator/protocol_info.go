@@ -6,6 +6,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Probe the pinned peer before any Claim or preparation can change ownership.
@@ -20,6 +22,9 @@ func probeWorkerProtocol(ctx context.Context, connection grpc.ClientConnInterfac
 		info, err = pb.NewRuntimePreparationClient(connection).ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
 	}
 	if err != nil {
+		if status.Code(err) != codes.Unimplemented && status.Code(err) != codes.FailedPrecondition {
+			return exit.Unavailablef("worker protocol probe is temporarily unavailable")
+		}
 		return exit.Named(exit.Conflict, "worker.protocol_incompatible", "worker has no compatible read-only protocol probe")
 	}
 	if info == nil || info.MinimumWireMinor == 0 || info.MinimumWireMinor > info.WireMinor ||
