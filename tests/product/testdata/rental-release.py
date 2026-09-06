@@ -2,8 +2,8 @@ from pathlib import Path
 import base64,hashlib,http.server,json,os,subprocess,tempfile,threading,sys
 binary=sys.argv[1]
 results=[]
-for arm in ['readonly','release','wrong-boot','initial-absent','released-absent','changed-worker','unexpected-state']:
-    events=[]
+for arm in ['readonly','release','wrong-boot','initial-absent','released-absent','changed-worker','unexpected-state','pending-empty-released','pending-empty-absent']:
+    events=[]; polls=[]
     class Hub(http.server.BaseHTTPRequestHandler):
         def answer(self,status,value):
             raw=json.dumps(value).encode();self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
@@ -13,8 +13,11 @@ for arm in ['readonly','release','wrong-boot','initial-absent','released-absent'
             else:self.answer(404,{})
         def do_GET(self):
             assert self.headers.get('Authorization')=='Bearer fixture-token'
-            if arm=='initial-absent' or arm=='released-absent' and events:self.answer(404,{'error':{'code':'rental.not_found','message':'fixture absent'}});return
+            if events:polls.append(self.path)
+            if arm=='initial-absent' or arm=='released-absent' and events or arm=='pending-empty-absent' and len(polls)>1:self.answer(404,{'error':{'code':'rental.not_found','message':'fixture absent'}});return
             value={'rental_id':'pr-22222222222222222222','name':'proof','state':'released' if events else 'ready','hourly_rate_usd_micros':1,'worker_id':'fixture-worker','worker_boot_id':'fixture-boot','provider_state':'gone' if events else 'running','container_state':'gone' if events else 'running'}
+            if arm.startswith('pending-empty') and events:
+                value['worker_id']='';value['worker_boot_id']='';value['state']='release_requested' if len(polls)==1 else 'released'
             if arm=='wrong-boot':value['worker_boot_id']='foreign-boot'
             if arm=='changed-worker' and events:value['worker_id']='foreign-worker'
             if arm=='unexpected-state':value['state']='unknown-new-state'
@@ -32,9 +35,9 @@ for arm in ['readonly','release','wrong-boot','initial-absent','released-absent'
         env=dict(os.environ,COZY_HOME=tmp,TENSORHUB_URL=hub)
         args=[binary,'--rental','pr-22222222222222222222','--boot','fixture-boot']+([] if arm=='readonly' else ['--release'])
         result=subprocess.run(args,env=env,capture_output=True,text=True,timeout=15)
-        expected=arm in ('readonly','release','released-absent')
+        expected=arm in ('readonly','release','released-absent','pending-empty-released','pending-empty-absent')
         assert (result.returncode==0)==expected,(arm,result.stderr,result.stdout)
-        assert len(events)==(1 if arm in ('release','released-absent','changed-worker') else 0),(arm,events)
+        assert len(events)==(1 if arm in ('release','released-absent','changed-worker','pending-empty-released','pending-empty-absent') else 0),(arm,events)
         assert not (home/'daemon.lock').exists(),arm
         results.append({'arm':arm,'exit':result.returncode,'deletes':len(events),'output':result.stdout.strip(),'refusal':result.stderr.strip()})
     server.shutdown();server.server_close()

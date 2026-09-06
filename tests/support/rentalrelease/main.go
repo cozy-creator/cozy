@@ -58,10 +58,12 @@ func main() {
 		default:
 			fail("rental_release.unexpected_state")
 		}
-		if result.WorkerBootID != *boot || result.WorkerID == "" || (boundWorker != "" && result.WorkerID != boundWorker) {
+		if !afterRelease && (result.WorkerBootID != *boot || result.WorkerID == "" || (boundWorker != "" && result.WorkerID != boundWorker)) {
 			fail("rental_release.worker_boot_changed")
 		}
-		boundWorker = result.WorkerID
+		if !afterRelease {
+			boundWorker = result.WorkerID
+		}
 		return result, result.State == hub.RentalReleased
 	}
 	emit := func(result hub.Rental) {
