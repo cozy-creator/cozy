@@ -63,7 +63,7 @@ func handleRent(ctx *Context) *exit.Error {
 	skuName := strings.TrimSpace(ctx.Inv.Args[0])
 	if skuName == "" {
 		if ctx.Inv.Value("--idempotency-key") != "" ||
-			ctx.Inv.Value("--timeout") != "" || len(ctx.Inv.Values["--model"]) != 0 {
+			ctx.Inv.Value("--timeout") != "" || len(ctx.Inv.Values["--model"]) != 0 || ctx.Inv.Bool("--development") || ctx.Inv.Value("--ssh-public-key") != "" {
 			return exit.Usagef("rental options require a GPU SKU").
 				WithRemedy("use `cozy rental new` alone to list available machines")
 		}
@@ -150,6 +150,9 @@ func handleRent(ctx *Context) *exit.Error {
 		{K: "accelerator", V: ready.AcceleratorModel},
 		{K: "changed", V: !replay}, {K: "operation", V: operationKey}, {K: "replayed", V: replay},
 	}
+	if ready.Development {
+		fields = append(fields, output.Field{K: "ssh_address", V: ready.SSHAddress})
+	}
 	rec := compactRecord(fields, "machine", "state", "gpu", "changed")
 	rec.Notes = notes
 	rec.Next = []string{
@@ -208,7 +211,12 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 			WithNext("cozy rental end " + existing.RentalID)
 	}
 	var workload hub.DeclaredWorkload
+	var development *hub.RentalDevelopment
 	if managedRequestID == "" {
+		development, e = manualRentalDevelopment(ctx, existing)
+		if e != nil {
+			return records.Rental{}, hub.Rental{}, false, e
+		}
 		workload.ServingModels, e = manualRentalModels(ctx, existing)
 		if e != nil {
 			return records.Rental{}, hub.Rental{}, false, e
@@ -268,7 +276,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	// The machine word is the store's to reserve; the request is authored under it.
 	author := func(machineName string) ([]byte, string, *exit.Error) {
 		body, e := hub.RentalRequestBytes(machineName, skuName, secret.HashHex(token),
-			creator.PublicKey(), workload)
+			creator.PublicKey(), workload, development)
 		if e != nil {
 			return nil, "", e
 		}
@@ -651,6 +659,9 @@ func copyRentalFailure(row *records.Rental, remote hub.Rental) {
 // missingOf names the first piece a `ready` rental did not carry. The hub never carries
 // the credential, but it must carry the pod's observed HASH set so this host can compare.
 func missingOf(r hub.Rental) string {
+	if r.Development && r.SSHAddress == "" {
+		return "development SSH address"
+	}
 	if r.Address == "" {
 		return "worker address"
 	}
