@@ -7,10 +7,12 @@ native receipt/inventory, object upload and finalization. No host ledger is copi
 import base64
 import importlib.metadata
 import json
+import queue
 from pathlib import Path
 import struct
 import sys
 import threading
+from types import SimpleNamespace
 
 import tensorfs
 from cozy_runtime.author import WeightsConfig, WeightsPart, WeightsTarget, WeightsTensor
@@ -21,18 +23,21 @@ from cozy_runtime.internal.worker.weights import WeightsExchange
 from cozy_runtime.internal.worker.weights_finalize import finalize
 from cozy_runtime.protocol import documents, worker_pb2 as pb
 
-assert importlib.metadata.version("cozy-runtime") == "0.2.23"
-assert importlib.metadata.version("tensorfs") == "0.3.9"
+assert importlib.metadata.version("cozy-runtime") == "0.2.24"
+assert importlib.metadata.version("tensorfs") == "0.3.10"
 root = Path(sys.argv[1])
 store = tensorfs.Store.ensure(str(root / "store"))
 owner = None
-exchange = WeightsExchange(store_root=root / "store", send=lambda _: None,
-    stop=threading.Event(), owner_scope=lambda: owner, allow_private_egress=True)
+bridge = "--host-bridge" in sys.argv[2:]
 held = None
+output_lock = threading.Lock()
+incoming = queue.Queue()
+stop = threading.Event()
 
 
 def emit(frame):
-    print(json.dumps({"frame": base64.b64encode(frame.SerializeToString()).decode()}), flush=True)
+    with output_lock:
+        print(json.dumps({"frame": base64.b64encode(frame.SerializeToString()).decode()}), flush=True)
 
 
 def envelope(request):
@@ -40,9 +45,40 @@ def envelope(request):
         control_stream_epoch=request.control_stream_epoch, worker_boot_id=request.worker_boot_id)
 
 
+def send_host(frame):
+    inner = getattr(frame, frame.WhichOneof("msg"))
+    for key, value in envelope(offer).items():
+        setattr(inner, key, value)
+    emit(frame)
+
+
+exchange = WeightsExchange(store_root=root / "store", send=send_host,
+    stop=stop, owner_scope=lambda: owner, allow_private_egress=True)
+
+
+def read_input():
+    try:
+        for line in sys.stdin:
+            if line.startswith("{"):
+                message = json.loads(line)
+                if "ack" in message:
+                    ack = pb.WeightsHostAck.FromString(base64.b64decode(message["ack"], validate=True))
+                    exchange.absorb_ack(ack, lane=("control", ack.control_stream_epoch))
+                elif "upload" in message:
+                    request = pb.WeightsUploadRequest.FromString(base64.b64decode(message["upload"], validate=True))
+                    emit(exchange.upload(request))
+                else:
+                    raise RuntimeError("unexpected Host bridge message")
+            else:
+                incoming.put(pb.RecordOwnerFrame.FromString(base64.b64decode(line.strip(), validate=True)))
+    finally:
+        stop.set()
+        incoming.put(None)
+
+
+threading.Thread(target=read_input, daemon=True).start()
 try:
-    for line in sys.stdin:
-        frame = pb.RecordOwnerFrame.FromString(base64.b64decode(line.strip(), validate=True))
+    while (frame := incoming.get()) is not None:
         kind = frame.WhichOneof("msg")
         if kind == "claim":
             owner = frame.claim.record_owner_id
@@ -52,34 +88,48 @@ try:
             digest = documents.spell(offer.invocation_spec_digest)
             declaration_digest = None
 
+            attempt = SimpleNamespace(request_id=offer.request_id, attempt=offer.attempt_ordinal,
+                digest=offer.invocation_spec_digest, canceling=False, weights_receipts={})
+
             def bind(slot, transaction_id, native_digest, declaration):
                 global declaration_digest
                 declaration_digest = native_digest
+                if bridge:
+                    result = exchange.intent(attempt, output_slot=slot, transaction_id=transaction_id,
+                        declaration_digest=native_digest, declaration=declaration, requested_writer_epoch=0)
+                    return WeightsHostBinding(result["weights_transaction_id"], result["writer_epoch"])
                 return WeightsHostBinding(transaction_id, 1)
+
+            def record(receipt):
+                reference, canonical, digest = protocol_receipt(receipt, owner_scope=owner,
+                    request_id=offer.request_id, invocation_spec_digest=documents.spell(offer.invocation_spec_digest))
+                exchange.receipt(attempt, output_slot="model", transaction_id=receipt.weights_transaction_id,
+                    receipt_digest=digest, canonical_receipt=canonical)
 
             host = WeightsTransactionHost(store=store, owner_scope=owner, request_id=offer.request_id,
                 invocation_spec_digest=digest, writer_session_id=1, allowed_sources={},
-                output_bounds={"model": 1 << 20}, bind_intent=bind)
+                output_bounds={"model": 1 << 20}, bind_intent=bind, record_receipt=record if bridge else None)
             config = json.dumps({"proof": offer.request_id}).encode()
             transaction = host.open(WeightsCommit(output_slot="model", sources={},
                 targets={"transformer": WeightsTarget(add={"weight": WeightsTensor(
-                    logical_dtype="f32", shape=(4,), encoding=SPEC_PLAIN,
-                    parts={"value": WeightsPart(dtype="f32", shape=(4,))})})},
+                    logical_dtype="f32", shape=(1024,), encoding=SPEC_PLAIN,
+                    parts={"value": WeightsPart(dtype="f32", shape=(1024,))})})},
                 configs={"model": WeightsConfig(data=config)}, order=(("transformer", "weight"),),
                 max_new_bytes=1 << 20))
-            transaction.add_part("transformer", "weight", "value", struct.pack("<4f", 1, 2, 3, 4))
+            transaction.add_part("transformer", "weight", "value", struct.pack("<1024f", *range(1024)))
             transaction.add_config("model", config, len(config))
             receipt = transaction.commit()
             reference, _, _ = protocol_receipt(receipt, owner_scope=owner,
                 request_id=offer.request_id, invocation_spec_digest=digest)
             held = exchange._hold(receipt.weights_transaction_id, 1, reference)
-            emit(pb.WorkerFrame(weights_receipt=pb.WeightsReceiptFrame(**envelope(offer),
-                request_id=offer.request_id, attempt_ordinal=offer.attempt_ordinal,
-                invocation_spec_digest=offer.invocation_spec_digest, output_slot="model",
-                weights_transaction_id=receipt.weights_transaction_id, writer_epoch=1,
-                tensorfs_declaration_digest=declaration_digest,
-                weights_receipt=reference, manifest=held.manifest,
-                objects=[held.objects[key] for key in sorted(held.objects)])))
+            if not bridge:
+                emit(pb.WorkerFrame(weights_receipt=pb.WeightsReceiptFrame(**envelope(offer),
+                    request_id=offer.request_id, attempt_ordinal=offer.attempt_ordinal,
+                    invocation_spec_digest=offer.invocation_spec_digest, output_slot="model",
+                    weights_transaction_id=receipt.weights_transaction_id, writer_epoch=1,
+                    tensorfs_declaration_digest=declaration_digest,
+                    weights_receipt=reference, manifest=held.manifest,
+                    objects=[held.objects[key] for key in sorted(held.objects)])))
             body, outcome_digest = documents.identity(pb.AttemptOutcomeBody(
                 request_id=offer.request_id, attempt_ordinal=offer.attempt_ordinal,
                 invocation_spec_digest=digest, status=pb.OUTCOME_STATUS_SUCCEEDED,
@@ -97,6 +147,8 @@ try:
             result.worker_boot_id = request.worker_boot_id
             emit(pb.WorkerFrame(weights_finalize_result=result))
         elif kind == "weights_transfer_request":
+            if bridge:
+                raise RuntimeError("Host bridge did not consume the transfer request")
             request = frame.weights_transfer_request
             assert held is not None
             grant = request.upload_grant if request.WhichOneof("decision") == "upload_grant" else request.held
