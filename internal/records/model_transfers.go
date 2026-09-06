@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS request_model_transfers (
   safe_error       TEXT NOT NULL DEFAULT '',
   updated_at       TEXT NOT NULL,
   models_worker_boot_id TEXT NOT NULL DEFAULT '',
-  CHECK (state IN ('pending','materializing','materialized','finalizing','completed','failed','canceled'))
+  CHECK (state IN ('pending','materializing','materialized','finalizing','completed','failed','canceling','canceled'))
 )`, `
 CREATE TABLE IF NOT EXISTS request_model_transfer_files (
   request_id          TEXT NOT NULL REFERENCES requests(id),
@@ -765,7 +765,7 @@ func (s *Store) CompleteModelTransfer(requestID string, checkpoints map[string]s
 
 func (s *Store) FailModelTransfer(requestID, code, detail string) *exit.Error {
 	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='failed',error_code=?,safe_error=?,updated_at=?
-		WHERE request_id=? AND state NOT IN ('completed','canceled')`, code, detail, now(), requestID)
+		WHERE request_id=? AND state NOT IN ('completed','canceling','canceled')`, code, detail, now(), requestID)
 	if err != nil {
 		return exit.Internalf("cannot fail model transfer: %s", err)
 	}
@@ -781,7 +781,7 @@ func (s *Store) FailModelTransfer(requestID, code, detail string) *exit.Error {
 }
 
 func (s *Store) RequestModelTransferCancellation(requestID string) *exit.Error {
-	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='canceled',
+	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='canceling',
 		error_code='CLIENT_CANCELED',safe_error='model transfer finalization canceled by client',
 		updated_at=? WHERE request_id=? AND state IN ('finalizing','failed')
 		AND EXISTS (SELECT 1 FROM requests r WHERE r.id=request_id AND r.state='finalizing')`, now(), requestID)
@@ -792,7 +792,7 @@ func (s *Store) RequestModelTransferCancellation(requestID string) *exit.Error {
 		return nil
 	}
 	transfer, problem := s.ModelTransferOf(requestID)
-	if problem == nil && transfer != nil && transfer.State == "canceled" {
+	if problem == nil && transfer != nil && (transfer.State == "canceling" || transfer.State == "canceled") {
 		return nil
 	}
 	return exit.New(exit.Conflict, "model transfer %s is not finalizing", requestID)
@@ -869,7 +869,7 @@ func (s *Store) FailModelTransferRequest(requestID, code, detail string,
 		return false, nil
 	}
 	if _, err := tx.Exec(`UPDATE request_model_transfers SET state='failed',error_code=?,
-		safe_error=?,updated_at=? WHERE request_id=? AND state NOT IN ('completed','canceled')`,
+		safe_error=?,updated_at=? WHERE request_id=? AND state NOT IN ('completed','canceling','canceled')`,
 		code, detail, now(), requestID); err != nil {
 		return false, exit.Internalf("cannot fail model transfer sidecar: %s", err)
 	}

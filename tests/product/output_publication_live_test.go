@@ -10,11 +10,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,15 +26,19 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 var publicationHub = flag.String("publication-hub", "", "live Tensorhub for the explicit tiny publication proof")
 var publicationHome = flag.String("publication-home", "", "existing enrolled home used only for the live proof's account credential")
 var publicationPython = flag.String("publication-python", "", "public Runtime 0.2.24/TensorFS 0.3.10 interpreter for the live proof")
+var publicationCancel = flag.Bool("publication-cancel", false, "prove explicit cancellation of a retained publication after owner restart")
+var publicationRetry = flag.Bool("publication-retry", false, "prove failed bound upload, owner restart and explicit same-receipt retry")
 var publicationHostBridge = flag.String("publication-host-bridge", "", "compiled real Go Host bridge for the full native publication proof")
 var publicationModel = flag.String("publication-model", "", "existing task-owned fixture model reused by the live proof; no new repository is created")
 
@@ -42,6 +48,13 @@ var publicationModel = flag.String("publication-model", "", "existing task-owned
 func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 	if *publicationHub == "" || *publicationHome == "" || *publicationPython == "" || *publicationModel == "" {
 		t.Skip("requires -publication-hub, -publication-home, -publication-python and -publication-model; creates and removes one tiny checkpoint")
+	}
+	if *publicationRetry && *publicationCancel {
+		t.Fatal("select retry or cancel")
+	}
+	lifecycle := *publicationRetry || *publicationCancel
+	if lifecycle && *publicationHostBridge == "" {
+		t.Fatal("publication retry proof requires the actual Host bridge")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -69,6 +82,9 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 		command = exec.CommandContext(ctx, *publicationHostBridge,
 			"-test.run=^TestWeightsOwnerBridge$", "-weights-owner-python="+*publicationPython,
 			"-weights-owner-helper="+helper)
+		if lifecycle {
+			command.Args = append(command.Args, "-weights-owner-fail-upload-once")
+		}
 	}
 	input, err := command.StdinPipe()
 	must(t, err)
@@ -92,6 +108,13 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 	var readOnce sync.Once
 	var manifest *pb.Ref
 	var transfers, sourceRequests int
+	var acknowledgments, releases atomic.Int64
+	var restarting, historyComplete atomic.Bool
+	var nativeWrite sync.Mutex
+	var sendMu sync.Mutex
+	var currentSend func(*pb.WorkerFrame) error
+	legacyObject := ""
+	legacySent := false
 	pod.onFrame = func(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) error) (bool, error) {
 		switch frame.Msg.(type) {
 		case *pb.RecordOwnerFrame_ModelSourceFileRequest, *pb.RecordOwnerFrame_ModelSourcePrepareRequest:
@@ -104,16 +127,32 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 		default:
 			return false, nil
 		}
-		if transfer := frame.GetWeightsTransferRequest(); transfer != nil {
-			objectID := transfer.GetUploadGrant().GetObjectId()
-			if transfer.GetHeld() != nil {
-				objectID = transfer.GetHeld().ObjectId
+		nativeWrite.Lock()
+		defer nativeWrite.Unlock()
+		sendMu.Lock()
+		currentSend = send
+		sendMu.Unlock()
+		if frame.GetClaim() != nil {
+			restarting.Store(false)
+		}
+		if frame.GetOutcomeAck() != nil {
+			acknowledgments.Add(1)
+		}
+		if transfer := frame.GetWeightsTransferRequest(); transfer != nil && lifecycle &&
+			transfer.GetUploadGrant() != nil && !historyComplete.Load() {
+			if legacyObject == "" {
+				legacyObject = transfer.GetUploadGrant().ObjectId
 			}
-			if transfer.OperationId != "weights-"+strings.TrimPrefix(objectID, "sha256:") {
-				errors <- fmt.Errorf("weights operation did not name its exact object")
-				return true, nil
+			if transfer.GetUploadGrant().ObjectId == legacyObject {
+				if legacySent {
+					return true, nil
+				}
+				legacySent = true
+				// Establish a real historical correlation before its controlled failure.
+				transfer.OperationId = "prior-bound-object-transfer"
 			}
 		}
+
 		if offer := frame.GetAttemptOffer(); offer != nil {
 			pod.mu.Lock()
 			pod.offers = append(pod.offers, offer)
@@ -148,7 +187,13 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 						transfers++
 					}
 					pod.mu.Unlock()
-					if err := send(answer); err != nil {
+					sendMu.Lock()
+					target := currentSend
+					sendMu.Unlock()
+					if err := target(answer); err != nil {
+						if lifecycle && restarting.Load() {
+							continue
+						}
 						errors <- fmt.Errorf("native peer's claimed stream closed")
 						return
 					}
@@ -165,16 +210,19 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 		return frame.GetClaim() == nil, err
 	}
 	connection, _ := startFakePod(t, t.TempDir(), pod)
-	o := hostOwner(t, fmt.Sprintf("output-publication-live-%x", nonce), rentalWiring(connection, private),
-		func(options *orchestrator.Options) {
-			options.Cfg.HubURL = *publicationHub
-			options.ModelTransfers = cli.NewModelTransferOwner(options.Cfg, options.Store, options.Log, auth)
-		})
+	configure := func(options *orchestrator.Options) {
+		rentalWiring(connection, private)(options)
+		options.Cfg.HubURL = *publicationHub
+		options.ModelTransfers = cli.NewModelTransferOwner(options.Cfg, options.Store, options.Log, auth)
+		options.ReleaseManagedRental = func(string) (string, *exit.Error) { releases.Add(1); return "", nil }
+	}
+	o := hostOwner(t, fmt.Sprintf("output-publication-live-%x", nonce), configure)
 	sub := outputPublicationSubmission()
 	sub.Org, sub.ModelTransfer.Destination = account.Name, destination
 	fatal(t, modeltransfer.ValidateSubmission(sub))
 	requestID, _, problem := o.c.Submit(sub)
 	fatal(t, problem)
+	retried := false
 	for deadline := time.Now().Add(90 * time.Second); ; {
 		select {
 		case err := <-errors:
@@ -183,7 +231,60 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 		}
 		request, problem := o.store.RequestRow(requestID)
 		fatal(t, problem)
-		if request.State == "succeeded" {
+		if lifecycle && !retried {
+			transfer, problem := o.store.ModelTransferOf(requestID)
+			fatal(t, problem)
+			if transfer.State == "failed" {
+				if request.State != "finalizing" || acknowledgments.Load() != 0 || releases.Load() != 0 {
+					t.Fatal("failed publication acknowledged or recycled successful computation")
+				}
+				prior, problem := o.store.AllModelTransferWeights(requestID, 1)
+				fatal(t, problem)
+				complete := true
+				for _, object := range prior[0].Objects {
+					if object.State == "pending" || object.State == "accepted" || object.State == "uploading" {
+						complete = false
+					}
+				}
+				if !complete {
+					time.Sleep(20 * time.Millisecond)
+					continue
+				}
+				historyComplete.Store(true)
+				restarting.Store(true)
+				o.close()
+				store, problem := records.Open(o.l.DB)
+				fatal(t, problem)
+				log, err := os.OpenFile(filepath.Join(o.root, "restarted.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+				must(t, err)
+				options := orchestrator.Options{Cfg: o.cfg, Layout: o.l, Store: store, Yield: "smart", Log: log, MaxOutputMiB: 8}
+				configure(&options)
+				controller, problem := orchestrator.Open(options)
+				fatal(t, problem)
+				o = &owner{root: o.root, cfg: o.cfg, l: o.l, store: store, c: controller}
+				o.closer = func() { controller.Close(20 * time.Second); store.Close(); log.Close() }
+				t.Cleanup(o.close)
+				go func() { _ = controller.Serve() }()
+				fatal(t, controller.ResumeModelTransfers())
+				current, problem := store.RequestRow(requestID)
+				fatal(t, problem)
+				if current.State != "finalizing" || releases.Load() != 0 {
+					t.Fatal("restart discarded blocked output custody")
+				}
+				if *publicationCancel {
+					fatal(t, controller.CancelModelTransferFinalization(requestID, "actual native cancel proof"))
+				} else {
+					fatal(t, controller.RetryModelTransferPublication(requestID, "actual native retry proof"))
+				}
+				after, problem := store.AllModelTransferWeights(requestID, 1)
+				fatal(t, problem)
+				if len(prior) != len(after) || !bytes.Equal(prior[0].Receipt, after[0].Receipt) {
+					t.Fatal("retry changed native receipt")
+				}
+				retried = true
+			}
+		}
+		if request.State == "succeeded" || (*publicationCancel && request.State == "canceled") {
 			break
 		}
 		if request.State == "failed" || time.Now().After(deadline) {
@@ -201,10 +302,25 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	pod.mu.Lock()
-	root, moved, acquired := manifest, transfers, sourceRequests
+	root, moved, acquired, offers := manifest, transfers, sourceRequests, len(pod.offers)
 	pod.mu.Unlock()
-	if root == nil || moved < 2 || acquired != 0 {
+	if lifecycle && (!retried || acknowledgments.Load() != 1 || releases.Load() != 1) {
+		t.Fatal("retry did not settle exactly one original attempt")
+	}
+	if root == nil || moved < 2 || acquired != 0 || offers != 1 {
 		t.Fatalf("incomplete publication path: manifest=%v transfers=%d source requests=%d", root, moved, acquired)
+	}
+	if *publicationCancel {
+		transfer, problem := o.store.ModelTransferOf(requestID)
+		fatal(t, problem)
+		if transfer.State != "canceled" {
+			t.Fatal("cancellation cleanup did not finish")
+		}
+		cleanupCfg := o.cfg
+		cleanupCfg.HubURL = *publicationHub
+		fatal(t, cli.NewModelTransferOwner(cleanupCfg, o.store, nil, auth).AbandonModelTransferPublications(ctx, requestID))
+		t.Log("real failed publication retained through owner restart, then explicitly canceled and cleaned")
+		return
 	}
 	ref, problem := hub.ParseRef(destination)
 	fatal(t, problem)
@@ -231,7 +347,14 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 	operation := rows[0].FinalID
 	for _, object := range rows[0].Objects {
 		objects = append(objects, hub.Object{ID: object.ObjectID, Length: object.Length})
-		if object.OperationID != "weights-"+strings.TrimPrefix(object.ObjectID, "sha256:") || object.OperationID == operation {
+		expectedOperation := "weights-" + strings.TrimPrefix(object.ObjectID, "sha256:")
+		if *publicationRetry && object.ObjectID == legacyObject {
+			expectedOperation = "prior-bound-object-transfer"
+			if object.GrantRevision < 2 {
+				t.Fatal("bound object was not regranted")
+			}
+		}
+		if object.OperationID != expectedOperation || object.OperationID == operation {
 			t.Fatal("per-object transfer correlation was conflated with the Hub publication")
 		}
 	}

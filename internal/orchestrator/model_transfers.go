@@ -577,7 +577,16 @@ func (c *Orchestrator) finalizeModelTransfer(ctx context.Context, requestID stri
 		return problem
 	}
 	if transfer.State == "canceled" {
-		return exit.New(exit.Canceled, "model transfer %s finalization was canceled", requestID)
+		return nil
+	}
+	if transfer.State == "canceling" {
+		if c.opt.ModelTransfers == nil {
+			return exit.Unavailablef("publication cleanup owner is absent")
+		}
+		if problem := c.opt.ModelTransfers.AbandonModelTransferPublications(ctx, requestID); problem != nil {
+			return problem
+		}
+		return c.opt.Store.CompleteModelTransferCancellation(requestID)
 	}
 	if c.opt.ModelTransfers == nil {
 		problem = exit.Named(exit.Unavailable, "model_transfer.owner_absent",
@@ -611,9 +620,9 @@ func permanentTransferFailure(problem *exit.Error) bool {
 	}
 }
 
-func (c *Orchestrator) kickModelTransferFinalizer(s *session, requestID string, attempt int64) {
+func (c *Orchestrator) kickModelTransferFinalizer(requestID string, attempt int64) {
 	c.mu.Lock()
-	if c.transferRunning[requestID] {
+	if c.closing || c.transferRunning[requestID] {
 		c.mu.Unlock()
 		return
 	}
@@ -633,14 +642,35 @@ func (c *Orchestrator) kickModelTransferFinalizer(s *session, requestID string, 
 		if problem != nil {
 			c.logf("model transfer %s finalization failed: %s", requestID, problem.Message)
 			transfer, _ := c.opt.Store.ModelTransferOf(requestID)
+			if transfer != nil && transfer.State == "failed" {
+				return
+			}
 			if transfer == nil || (transfer.State != "failed" && transfer.State != "canceled") {
 				time.AfterFunc(2*time.Second, func() {
-					c.kickModelTransferFinalizer(s, requestID, attempt)
+					c.kickModelTransferFinalizer(requestID, attempt)
 				})
 				return
 			}
 		}
-		c.ackSettledOutcome(s, requestID, uint64(attempt))
+		request, readProblem := c.opt.Store.RequestRow(requestID)
+		if readProblem != nil || request == nil {
+			return
+		}
+		retainedAttempt, readProblem := c.opt.Store.AttemptRow(requestID, attempt)
+		if readProblem != nil || retainedAttempt == nil {
+			return
+		}
+		c.mu.Lock()
+		var session *session
+		if worker := c.workers[retainedAttempt.InstanceID]; worker != nil && worker.snapshotAcknowledged {
+			session = c.sessions[worker.bootID]
+		}
+		c.mu.Unlock()
+		if session == nil {
+			time.AfterFunc(2*time.Second, func() { c.kickModelTransferFinalizer(requestID, attempt) })
+			return
+		}
+		c.ackSettledOutcome(session, requestID, uint64(attempt))
 	}()
 }
 

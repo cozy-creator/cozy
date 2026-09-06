@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 23
+const schemaVersion = 24
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -327,7 +328,20 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			}
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=23`); err != nil {
+	if sourceVersion == 23 {
+		for _, statement := range []string{
+			`ALTER TABLE request_model_transfers RENAME TO request_model_transfers_prior`,
+			modelTransferSchema[0],
+			`INSERT INTO request_model_transfers(request_id,intent,state,models,checkpoints,error_code,safe_error,updated_at,models_worker_boot_id)
+			 SELECT request_id,intent,state,models,checkpoints,error_code,safe_error,updated_at,models_worker_boot_id FROM request_model_transfers_prior`,
+			`DROP TABLE request_model_transfers_prior`,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot add publication cancellation intent while migrating %s: %s", path, err)
+			}
+		}
+	}
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
 	if e := commitMigration(tx, path); e != nil {
@@ -650,6 +664,7 @@ func priorStatements(version int) []string {
 		statements = append(statements, schemaNineModelProduction...)
 	}
 	for index, stmt := range statements {
+		transferStatement := stmt == modelTransferSchema[0]
 		switch {
 		case stmt == requestsDDL && version == 6:
 			stmt = priorRequestsSix
@@ -687,6 +702,9 @@ func priorStatements(version int) []string {
 			stmt = strings.Replace(stmt,
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n",
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n  evidence         BLOB NOT NULL,\n", 1)
+		}
+		if transferStatement && version < 24 {
+			stmt = strings.Replace(stmt, ",'canceling'", "", 1)
 		}
 		if version < 12 {
 			stmt = priorInstallNames(stmt)
@@ -801,7 +819,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=23`); err != nil {
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {

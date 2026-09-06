@@ -29,10 +29,11 @@ func (c *Orchestrator) resumeModelTransferPublication(requestID string) *exit.Er
 	}
 	if request.Worker == "" {
 		c.kickRecoveredLocalTransfer(requestID, attempt.Attempt)
-	} else if session, problem := c.rentalControl(request.Worker); problem == nil {
-		c.kickModelTransferFinalizer(session, requestID, attempt.Attempt)
 	} else {
-		c.selectOrStart(*request)
+		c.kickModelTransferFinalizer(requestID, attempt.Attempt)
+		if _, problem := c.rentalControl(request.Worker); problem != nil {
+			c.selectOrStart(*request)
+		}
 	}
 	return nil
 }

@@ -344,7 +344,7 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 			return
 		}
 		if transfer == nil || (transfer.State != "completed" && transfer.State != "canceled") {
-			c.kickModelTransferFinalizer(s, requestID, int64(ordinal))
+			c.kickModelTransferFinalizer(requestID, int64(ordinal))
 			return
 		}
 	}

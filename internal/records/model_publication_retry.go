@@ -50,3 +50,18 @@ func (s *Store) RetryModelTransferPublication(requestID, actor string) (bool, *e
 	}
 	return true, nil
 }
+
+func (s *Store) CompleteModelTransferCancellation(requestID string) *exit.Error {
+	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='canceled',updated_at=? WHERE request_id=? AND state='canceling'`, now(), requestID)
+	if err != nil {
+		return exit.Internalf("cannot complete publication cancellation: %s", err)
+	}
+	if changed, _ := result.RowsAffected(); changed == 1 {
+		return nil
+	}
+	transfer, problem := s.ModelTransferOf(requestID)
+	if problem == nil && transfer != nil && transfer.State == "canceled" {
+		return nil
+	}
+	return exit.New(exit.Conflict, "publication cancellation changed before completion")
+}
