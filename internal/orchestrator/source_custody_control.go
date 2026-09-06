@@ -16,14 +16,14 @@ import (
 // state or attempt offer can originate from this connection.
 type SourceCustodyControl struct {
 	Context    context.Context
-	Host       SourceCheckpointHost
+	Host       CheckpointHost
 	connection *grpc.ClientConn
 	cancel     context.CancelFunc
 }
 
 func (s *SourceCustodyControl) Close() error { s.cancel(); return s.connection.Close() }
 
-func DialSourceCheckpointHost(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource) (*SourceCustodyControl, *exit.Error) {
+func DialCheckpointHost(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource) (*SourceCustodyControl, *exit.Error) {
 	if remote == nil || remote.CACert == "" || remote.WorkerBootID == "" || sign == nil {
 		return nil, exit.New(exit.Credential, "source custody requires a pinned rental and Claim signer")
 	}
@@ -75,7 +75,7 @@ func DialSourceCheckpointHost(parent context.Context, remote *WorkerConnection, 
 			if problem := validateCustodySnapshot(snap); problem != nil {
 				return nil, problem
 			}
-			control.Host = sourceCheckpointAdapter(pb.NewPodHostClient(conn), claim)
+			control.Host = checkpointAdapter(pb.NewPodHostClient(conn), claim)
 			// A lost control stream cancels the mover too: unary byte progress is not an
 			// owner-presence hold and may not outlive this accepted control connection.
 			go func() {

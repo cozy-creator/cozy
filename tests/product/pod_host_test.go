@@ -1105,21 +1105,21 @@ func TestPodHostJobDirectiveNamesTheStagedBuild(t *testing.T) {
 	}
 }
 
-func (p *fakePod) SourceCheckpointPage(ctx context.Context, call *pb.SourceCheckpointPageCall) (*pb.SourceCheckpointPageResult, error) {
+func (p *fakePod) CheckpointPage(ctx context.Context, call *pb.CheckpointPageCall) (*pb.CheckpointPageResult, error) {
 	if err := p.verifyClaim(call.GetClaim(), false); err != nil {
 		return nil, err
 	}
 	if p.sourceRuntime == nil {
 		return nil, status.Error(codes.Unimplemented, "no source Runtime")
 	}
-	return p.sourceRuntime.SourceCheckpointPage(ctx, call.GetRequest())
+	return p.sourceRuntime.CheckpointPage(ctx, call.GetRequest())
 }
-func (p *fakePod) SourceCheckpointTransfer(ctx context.Context, call *pb.SourceCheckpointTransferCall) (*pb.SourceCheckpointTransferStatus, error) {
+func (p *fakePod) CheckpointTransfer(ctx context.Context, call *pb.CheckpointTransferCall) (*pb.CheckpointTransferStatus, error) {
 	if err := p.verifyClaim(call.GetClaim(), false); err != nil {
 		return nil, err
 	}
 	if p.sourceRuntime == nil {
 		return nil, status.Error(codes.Unimplemented, "no source Runtime")
 	}
-	return p.sourceRuntime.SourceCheckpointTransfer(ctx, call.GetRequest())
+	return p.sourceRuntime.CheckpointTransfer(ctx, call.GetRequest())
 }

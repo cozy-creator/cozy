@@ -150,8 +150,8 @@ type ModelTransferOwner interface {
 	Finalize(context.Context, string, ModelTransferMover) *exit.Error
 	AbandonModelTransferPublications(context.Context, string) *exit.Error
 	PassThrough(context.Context, string, records.ModelTransferIntent) *exit.Error
-	SyncSourceCheckpoints(context.Context, string, SourceCheckpointHost) *exit.Error
-	RestoreSourceCheckpoints(context.Context, string, SourceCheckpointHost) *exit.Error
+	SyncSourceCheckpoints(context.Context, string, CheckpointHost) *exit.Error
+	RestoreSourceCheckpoints(context.Context, string, CheckpointHost) *exit.Error
 	ReleaseSourceCheckpoints(context.Context, string) *exit.Error
 }
 

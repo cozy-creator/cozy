@@ -182,10 +182,10 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 			cancelTransfer()
 		})
 	}
-	host := orchestrator.SourceCheckpointHost{BootID: boot,
-		Page: func(ctx context.Context, request *pb.SourceCheckpointPageRequest) (*pb.SourceCheckpointPageResult, *exit.Error) {
+	host := orchestrator.CheckpointHost{BootID: boot,
+		Page: func(ctx context.Context, request *pb.CheckpointPageRequest) (*pb.CheckpointPageResult, *exit.Error) {
 			request.RecordOwnerEpoch, request.WorkerBootId = 1, activeBoot
-			answer, err := runtime.SourceCheckpointPage(ctx, request)
+			answer, err := runtime.CheckpointPage(ctx, request)
 			if err != nil {
 				return nil, exit.Unavailablef("native checkpoint page RPC failed")
 			}
@@ -195,17 +195,17 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 			pages.Add(1)
 			return answer, nil
 		},
-		Transfer: func(ctx context.Context, request *pb.SourceCheckpointTransferRequest) (*pb.SourceCheckpointTransferStatus, *exit.Error) {
+		Transfer: func(ctx context.Context, request *pb.CheckpointTransferRequest) (*pb.CheckpointTransferStatus, *exit.Error) {
 			request.RecordOwnerEpoch, request.WorkerBootId = 1, activeBoot
 			if gate != nil {
 				if grant := request.GetUploadGrant(); grant != nil {
 					grant.Url = gate.route(http.MethodPut, grant.ObjectId, grant.Url)
 				} else {
 					id, _ := canonical.Spell(request.Object.Ref.Digest)
-					request.Decision = &pb.SourceCheckpointTransferRequest_DownloadUrl{DownloadUrl: gate.route(http.MethodGet, id, request.GetDownloadUrl())}
+					request.Decision = &pb.CheckpointTransferRequest_DownloadUrl{DownloadUrl: gate.route(http.MethodGet, id, request.GetDownloadUrl())}
 				}
 			}
-			answer, err := runtime.SourceCheckpointTransfer(ctx, request)
+			answer, err := runtime.CheckpointTransfer(ctx, request)
 			if err != nil {
 				return nil, exit.Unavailablef("native checkpoint transfer RPC failed")
 			}

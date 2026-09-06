@@ -53,7 +53,7 @@ func (o *modelTransferOwner) sourcePublicationClient(requestID string) (*hub.Cli
 
 // sourceCheckpointLink reads only one bounded immutable Link. The worker's
 // TensorFS decoder owns its format; Creator compares the returned typed subjects.
-func readSourceCheckpointLink(ctx context.Context, host orchestrator.SourceCheckpointHost,
+func readSourceCheckpointLink(ctx context.Context, host orchestrator.CheckpointHost,
 	requestID, selection string, checkpoint records.ModelSourceCheckpoint,
 ) (sourceCheckpointLink, *exit.Error) {
 	head, plan, problem := checkpointRef(checkpoint)
@@ -78,9 +78,9 @@ func readSourceCheckpointLink(ctx context.Context, host orchestrator.SourceCheck
 		return nil
 	}
 	for offset := uint32(0); ; {
-		page, problem := host.Page(ctx, &pb.SourceCheckpointPageRequest{OperationId: requestID,
-			SourceSelectionDigest: selected, Slot: checkpoint.Slot, PlanDigest: plan, Head: head,
-			Offset: offset, Limit: pb.MaxSourceCheckpointObjects})
+		page, problem := host.Page(ctx, &pb.CheckpointPageRequest{Subject: &pb.CheckpointSubject{Kind: &pb.CheckpointSubject_Source{
+			Source: &pb.SourceCheckpointSubject{OperationId: requestID, SourceSelectionDigest: selected, Slot: checkpoint.Slot}}}, PlanDigest: plan, Head: head,
+			Offset: offset, Limit: pb.MaxCheckpointObjects})
 		if problem != nil {
 			return link, problem
 		}
@@ -106,13 +106,13 @@ func readSourceCheckpointLink(ctx context.Context, host orchestrator.SourceCheck
 				return link, problem
 			}
 		}
-		if len(objects) > pb.MaxSourceCheckpointObjects+2 {
+		if len(objects) > pb.MaxCheckpointObjects+2 {
 			return link, exit.Named(exit.Structural, "model_transfer.source_checkpoint_too_large", "source checkpoint Link exceeds its fixed object bound")
 		}
 		if !page.HasMore {
 			break
 		}
-		if page.NextOffset <= offset || page.NextOffset > pb.MaxSourceCheckpointObjects {
+		if page.NextOffset <= offset || page.NextOffset > pb.MaxCheckpointObjects {
 			return link, exit.Named(exit.Structural, "model_transfer.source_checkpoint_cursor_invalid", "source checkpoint page did not advance within its bound")
 		}
 		offset = page.NextOffset
@@ -136,7 +136,7 @@ func previousSourceCheckpoint(link sourceCheckpointLink) (records.ModelSourceChe
 }
 
 func (o *modelTransferOwner) checkpointTransfer(requestID, selection, direction string, checkpoint records.ModelSourceCheckpoint, object hub.Object,
-) (*pb.SourceCheckpointTransferRequest, *exit.Error) {
+) (*pb.CheckpointTransferRequest, *exit.Error) {
 	head, plan, problem := checkpointRef(checkpoint)
 	if problem != nil {
 		return nil, problem
@@ -154,14 +154,14 @@ func (o *modelTransferOwner) checkpointTransfer(requestID, selection, direction 
 		return nil, problem
 	}
 	sum := sha256.Sum256([]byte(requestID + "\x00" + checkpoint.Slot + "\x00" + checkpoint.HeadID + "\x00" + object.ID + "\x00" + direction))
-	return &pb.SourceCheckpointTransferRequest{OperationId: requestID, SourceSelectionDigest: selected,
-		Slot: checkpoint.Slot, PlanDigest: plan, Head: head,
-		Object:     &pb.SourceCheckpointObject{Ref: &pb.Ref{Digest: objectDigest, Length: uint64(object.Length)}},
+	return &pb.CheckpointTransferRequest{Subject: &pb.CheckpointSubject{Kind: &pb.CheckpointSubject_Source{
+		Source: &pb.SourceCheckpointSubject{OperationId: requestID, SourceSelectionDigest: selected, Slot: checkpoint.Slot}}}, PlanDigest: plan, Head: head,
+		Object:     &pb.CheckpointObject{Ref: &pb.Ref{Digest: objectDigest, Length: uint64(object.Length)}},
 		TransferId: "source-" + hex.EncodeToString(sum[:]), GrantRevision: revision}, nil
 }
 
 func (o *modelTransferOwner) uploadSourceCheckpointLink(ctx context.Context, client *hub.Client, ref hub.Ref,
-	requestID string, intent records.ModelTransferIntent, host orchestrator.SourceCheckpointHost, link sourceCheckpointLink,
+	requestID string, intent records.ModelTransferIntent, host orchestrator.CheckpointHost, link sourceCheckpointLink,
 ) *exit.Error {
 	operation := sourceCheckpointOperation(requestID, link.checkpoint.Slot, link.checkpoint.HeadID)
 	body, _ := json.Marshal(link.objects)
@@ -219,7 +219,7 @@ func (o *modelTransferOwner) uploadSourceCheckpointLink(ctx context.Context, cli
 // SyncSourceCheckpoints walks backwards one bounded Link at a time. Only after
 // every new predecessor and object is accepted does the owner advance its head.
 func (o *modelTransferOwner) SyncSourceCheckpoints(parent context.Context, requestID string,
-	host orchestrator.SourceCheckpointHost,
+	host orchestrator.CheckpointHost,
 ) *exit.Error {
 	ctx, cancel := o.requestContext(parent, requestID)
 	defer cancel()
@@ -277,7 +277,7 @@ func (o *modelTransferOwner) SyncSourceCheckpoints(parent context.Context, reque
 }
 
 func (o *modelTransferOwner) downloadSourceCheckpointObjects(ctx context.Context, client *hub.Client, ref hub.Ref,
-	requestID, selection string, checkpoint records.ModelSourceCheckpoint, host orchestrator.SourceCheckpointHost, objects []hub.Object,
+	requestID, selection string, checkpoint records.ModelSourceCheckpoint, host orchestrator.CheckpointHost, objects []hub.Object,
 ) *exit.Error {
 	operation := sourceCheckpointOperation(requestID, checkpoint.Slot, checkpoint.HeadID)
 	window := orchestrator.NewWeightsGrantWindow(func(ctx context.Context, selected []string) (orchestrator.WeightsGrantMint, *exit.Error) {
@@ -314,7 +314,7 @@ const sourceCheckpointParallelism = 4
 
 func (o *modelTransferOwner) transferSourceCheckpointObjects(parent context.Context,
 	requestID, selection, direction string, checkpoint records.ModelSourceCheckpoint,
-	host orchestrator.SourceCheckpointHost, objects []hub.Object, window *orchestrator.WeightsGrantWindow,
+	host orchestrator.CheckpointHost, objects []hub.Object, window *orchestrator.WeightsGrantWindow,
 ) *exit.Error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
@@ -368,9 +368,9 @@ walk:
 				grant.RequiredHeaders = append(grant.RequiredHeaders, &pb.WeightsUploadHeader{Name: name, Value: value})
 			}
 			sort.Slice(grant.RequiredHeaders, func(i, j int) bool { return grant.RequiredHeaders[i].Name < grant.RequiredHeaders[j].Name })
-			request.Decision = &pb.SourceCheckpointTransferRequest_UploadGrant{UploadGrant: grant}
+			request.Decision = &pb.CheckpointTransferRequest_UploadGrant{UploadGrant: grant}
 		} else {
-			request.Decision = &pb.SourceCheckpointTransferRequest_DownloadUrl{DownloadUrl: decision.URL}
+			request.Decision = &pb.CheckpointTransferRequest_DownloadUrl{DownloadUrl: decision.URL}
 		}
 		workers.Add(1)
 		go func() {
@@ -397,7 +397,7 @@ walk:
 }
 
 func (o *modelTransferOwner) RestoreSourceCheckpoints(parent context.Context, requestID string,
-	host orchestrator.SourceCheckpointHost,
+	host orchestrator.CheckpointHost,
 ) *exit.Error {
 	ctx, cancel := o.requestContext(parent, requestID)
 	defer cancel()

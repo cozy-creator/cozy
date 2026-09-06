@@ -158,7 +158,7 @@ func (c *Orchestrator) syncSourceCheckpoint(ctx context.Context, requestID strin
 	if problem != nil || request == nil {
 		return problem
 	}
-	host, problem := c.sourceCheckpointHost(*request)
+	host, problem := c.checkpointHost(*request)
 	if problem != nil {
 		return problem
 	}
