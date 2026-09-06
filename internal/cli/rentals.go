@@ -63,7 +63,7 @@ func handleRent(ctx *Context) *exit.Error {
 	skuName := strings.TrimSpace(ctx.Inv.Args[0])
 	if skuName == "" {
 		if ctx.Inv.Value("--idempotency-key") != "" ||
-			ctx.Inv.Value("--timeout") != "" {
+			ctx.Inv.Value("--timeout") != "" || len(ctx.Inv.Values["--model"]) != 0 {
 			return exit.Usagef("rental options require a GPU SKU").
 				WithRemedy("use `cozy rental new` alone to list available machines")
 		}
@@ -203,6 +203,13 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 			WithRemedy("release the existing rental before starting another operation").
 			WithNext("cozy rental end " + existing.RentalID)
 	}
+	var workload hub.DeclaredWorkload
+	if managedRequestID == "" {
+		workload.ServingModels, e = manualRentalModels(ctx, existing)
+		if e != nil {
+			return records.Rental{}, hub.Rental{}, false, e
+		}
+	}
 	var token secret.Value
 	var creator rental.CreatorIdentity
 	if existing != nil && existing.State == "attached" && existing.RentalID != "" {
@@ -226,8 +233,8 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	// on a full filesystem partway through a paid run. The selection is already
 	// resolved here — the request and its source inventory were committed in one
 	// transaction before any pod was asked for — so this costs no extra round
-	// trip. A rental with no managed request declares nothing and takes the
-	// serving default.
+	// trip. A manual rental can declare exact models through --model; without
+	// that declaration it takes the serving default.
 	//
 	// The SERVING half (th-155/cl-130) rides the same fact and the same trip.
 	// A serving pod's models are resolved into this store before the pod is
@@ -239,7 +246,6 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	// that union. Undeclared, the hub buys the image's serving default, which
 	// holds the H3 serve set with 35 GB to spare and no room for a second
 	// model.
-	var workload hub.DeclaredWorkload
 	if managedRequestID != "" {
 		workload.SourceBytes, e = st.PlannedSourceBytes(managedRequestID)
 		if e != nil {
