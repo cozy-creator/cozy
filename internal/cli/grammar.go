@@ -369,14 +369,15 @@ type RentalCmd struct {
 }
 
 type RentalNewCmd struct {
-	SKU            string `arg:"" optional:"" name:"gpu" help:"Cozy GPU SKU, such as h200."`
-	IdempotencyKey string `help:"Stable paid-operation identity."`
-	Timeout        string `help:"Caller wait deadline; does not release the rental."`
+	SKU            string   `arg:"" optional:"" name:"gpu" help:"Cozy GPU SKU, such as h200."`
+	Models         []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
+	IdempotencyKey string   `help:"Stable paid-operation identity."`
+	Timeout        string   `help:"Caller wait deadline; does not release the rental."`
 }
 
 func (c *RentalNewCmd) Run(r *Runtime) error {
 	return r.call(handleRent, []string{c.SKU}, nil, values(
-		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout), false)
+		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models), false)
 }
 
 type RentalEndCmd struct {
