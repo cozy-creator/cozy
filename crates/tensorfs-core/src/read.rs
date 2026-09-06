@@ -494,6 +494,46 @@ pub struct ReadPlan {
 }
 
 impl ReadPlan {
+    /// Select whole physical parts from this already planned scope. Source ranges and
+    /// their order/windows are unchanged; destination offsets become contiguous again.
+    pub fn select(&self, whats: &[String]) -> Result<ReadPlan> {
+        let mut requested = HashSet::new();
+        for what in whats {
+            if !requested.insert(what.as_str()) {
+                return refuse(
+                    Code::DUPLICATE_KEY,
+                    format!("read selection repeats {what:?}"),
+                );
+            }
+        }
+        let mut missing = requested.clone();
+        let mut items = Vec::new();
+        let mut dest = 0;
+        for item in &self.items {
+            if requested.contains(item.what.as_str()) {
+                missing.remove(item.what.as_str());
+                let mut selected = item.clone();
+                selected.dest_off = dest;
+                dest += selected.len;
+                items.push(selected);
+            }
+        }
+        if let Some(what) = missing.into_iter().min() {
+            return refuse(
+                Code::MISSING_FIELD,
+                format!("read plan has no part {what:?}"),
+            );
+        }
+        let (bytes, io_bytes, inline_parts) = tally(&items);
+        Ok(ReadPlan {
+            items,
+            bytes,
+            io_bytes,
+            inline_parts,
+            order: self.order,
+        })
+    }
+
     /// Cut the plan into sub-plans that each fit a BOUNDED destination, destination offsets
     /// rebased from zero. This is what makes the caller's buffer a ring rather than a
     /// materialization: peak resident bytes become a function of the ring, not of the

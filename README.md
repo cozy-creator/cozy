@@ -1,7 +1,5 @@
 # TensorFS
 
-The current release is `0.3.1`.
-
 TensorFS stores every domain repository as the same graph:
 
 ```text
@@ -621,3 +619,12 @@ releases. Time never releases a hold.
 Cloud storage uses the same Repository, Manifest, ObjectRef, projection, and reachability code.
 Tensorhub supplies R2 conditional writes/listing and PostgreSQL coordination; TensorFS does not add
 cloud-specific catalog-root, grant, or verification documents.
+
+
+`tensorfs.plan(header, traversal, components=...)` checks the complete declared component
+census and its construction order. For bounded paging, cache that complete plan and call
+`plan.select(["text_encoder/model.language_model.layers.0.self_attn.q_proj.weight#value", ...])`.
+Selection uses exact existing part `what` identifiers, keeps every native window and source
+ObjectRef for those parts in native order, and compacts destination offsets. Duplicate or
+unknown identifiers refuse before I/O; an empty selection returns an empty plan. The original
+plan is unchanged, and selected plans use the same lease, stream and caller-owned ring.
