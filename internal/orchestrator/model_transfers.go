@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"sort"
 
@@ -74,7 +75,7 @@ func (c *Orchestrator) runModelPassThrough(req records.Request) {
 const weightsGrantExpired = "weights_grant_expired"
 
 func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
-	weights records.ModelTransferWeights, operationID string, mint WeightsGrantMinter,
+	weights records.ModelTransferWeights, mint WeightsGrantMinter,
 ) *exit.Error {
 	request, problem := c.opt.Store.RequestRow(weights.RequestID)
 	if problem != nil || request == nil {
@@ -168,6 +169,16 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 					"the authorized grant for %s changed the adopted object inventory",
 					object.ObjectID)
 			}
+			objectDigest, err := canonical.Raw(object.ObjectID)
+			if err != nil {
+				return exit.New(exit.Validation, "persisted weights object digest is malformed")
+			}
+			operationID := object.OperationID
+			if operationID == "" {
+				operationID = "weights-" + hex.EncodeToString(objectDigest)
+			}
+			// The Host binds one operation to one object within this transaction.
+			// The Hub publication is a separate scope shared by all of its objects.
 			transfer := &pb.WeightsTransferRequest{RecordOwnerEpoch: recordOwnerEpoch,
 				ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
 				RequestId: weights.RequestID, AttemptOrdinal: uint64(weights.Attempt),
@@ -566,17 +577,26 @@ func (c *Orchestrator) finalizeModelTransfer(ctx context.Context, requestID stri
 		return problem
 	}
 	if transfer.State == "canceled" {
-		return exit.New(exit.Canceled, "model transfer %s finalization was canceled", requestID)
+		return nil
+	}
+	if transfer.State == "canceling" {
+		if c.opt.ModelTransfers == nil {
+			return exit.Unavailablef("publication cleanup owner is absent")
+		}
+		if problem := c.opt.ModelTransfers.AbandonModelTransferPublications(ctx, requestID); problem != nil {
+			return problem
+		}
+		return c.opt.Store.CompleteModelTransferCancellation(requestID)
 	}
 	if c.opt.ModelTransfers == nil {
 		problem = exit.Named(exit.Unavailable, "model_transfer.owner_absent",
 			"this daemon has no model transfer finalizer")
 	} else if problem = c.opt.Store.BeginModelTransferFinalization(requestID); problem == nil {
 		problem = c.opt.ModelTransfers.Finalize(ctx, requestID,
-			func(ctx context.Context, weights records.ModelTransferWeights, operationID string,
+			func(ctx context.Context, weights records.ModelTransferWeights,
 				mint WeightsGrantMinter,
 			) *exit.Error {
-				return c.moveModelTransferWeights(ctx, weights, operationID, mint)
+				return c.moveModelTransferWeights(ctx, weights, mint)
 			})
 	}
 	if problem != nil {
@@ -600,9 +620,9 @@ func permanentTransferFailure(problem *exit.Error) bool {
 	}
 }
 
-func (c *Orchestrator) kickModelTransferFinalizer(s *session, requestID string, attempt int64) {
+func (c *Orchestrator) kickModelTransferFinalizer(requestID string, attempt int64) {
 	c.mu.Lock()
-	if c.transferRunning[requestID] {
+	if c.closing || c.transferRunning[requestID] {
 		c.mu.Unlock()
 		return
 	}
@@ -622,14 +642,35 @@ func (c *Orchestrator) kickModelTransferFinalizer(s *session, requestID string, 
 		if problem != nil {
 			c.logf("model transfer %s finalization failed: %s", requestID, problem.Message)
 			transfer, _ := c.opt.Store.ModelTransferOf(requestID)
+			if transfer != nil && transfer.State == "failed" {
+				return
+			}
 			if transfer == nil || (transfer.State != "failed" && transfer.State != "canceled") {
 				time.AfterFunc(2*time.Second, func() {
-					c.kickModelTransferFinalizer(s, requestID, attempt)
+					c.kickModelTransferFinalizer(requestID, attempt)
 				})
 				return
 			}
 		}
-		c.ackSettledOutcome(s, requestID, uint64(attempt))
+		request, readProblem := c.opt.Store.RequestRow(requestID)
+		if readProblem != nil || request == nil {
+			return
+		}
+		retainedAttempt, readProblem := c.opt.Store.AttemptRow(requestID, attempt)
+		if readProblem != nil || retainedAttempt == nil {
+			return
+		}
+		c.mu.Lock()
+		var session *session
+		if worker := c.workers[retainedAttempt.InstanceID]; worker != nil && worker.snapshotAcknowledged {
+			session = c.sessions[worker.bootID]
+		}
+		c.mu.Unlock()
+		if session == nil {
+			time.AfterFunc(2*time.Second, func() { c.kickModelTransferFinalizer(requestID, attempt) })
+			return
+		}
+		c.ackSettledOutcome(session, requestID, uint64(attempt))
 	}()
 }
 
@@ -652,13 +693,17 @@ func (c *Orchestrator) CancelModelTransferFinalization(requestID, actor string) 
 	}
 	c.signalTransfer(requestID)
 	c.kickSourceCheckpointUpload(requestID)
-	return nil
+	return c.resumeModelTransferPublication(requestID)
 }
 
 func (c *Orchestrator) finishModelTransferRequest(requestID string, attempt int64) {
 	c.kickSourceCheckpointUpload(requestID)
 	request, problem := c.opt.Store.RequestRow(requestID)
 	if problem != nil || request == nil || request.State == "canceled" {
+		return
+	}
+	retainedAttempt, readProblem := c.opt.Store.AttemptRow(requestID, attempt)
+	if readProblem != nil || retainedAttempt == nil || c.retainedPublication(*request, *retainedAttempt) {
 		return
 	}
 	if problem := c.releaseManagedNow(*request); problem != nil {
@@ -707,6 +752,16 @@ func (c *Orchestrator) ResumeModelTransfers() *exit.Error {
 		if readProblem != nil || attempt == nil {
 			continue
 		}
+		if c.retainedPublication(*request, *attempt) {
+			if transfer.State == "failed" {
+				if request.Worker != "" {
+					c.selectOrStart(*request)
+				}
+			} else {
+				_ = c.resumeModelTransferPublication(request.ID)
+			}
+			continue
+		}
 		if attempt.State == "closed" {
 			go c.finishModelTransferRequest(request.ID, attempt.Attempt)
 		} else if request.Worker == "" && attempt.State == "terminal" {
@@ -749,6 +804,12 @@ func (c *Orchestrator) kickRecoveredLocalTransfer(requestID string, attempt int6
 					return
 				}
 			}
+		}
+		request, readProblem := c.opt.Store.RequestRow(requestID)
+		retainedAttempt, attemptProblem := c.opt.Store.AttemptRow(requestID, attempt)
+		if readProblem != nil || attemptProblem != nil || request == nil || retainedAttempt == nil ||
+			c.retainedPublication(*request, *retainedAttempt) {
+			return
 		}
 		if problem := c.opt.Store.Closed(requestID, attempt); problem != nil {
 			return
