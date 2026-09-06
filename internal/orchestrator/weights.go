@@ -372,7 +372,7 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 		c.logf("OutcomeAck %s#%d was queued but closure is still owed: %s", requestID, ordinal, e.Message)
 		return
 	}
-	if req.ModelTransfer != nil {
+	if req.ModelTransfer != nil && req.State != "requeue_pending" {
 		go c.finishModelTransferRequest(requestID, int64(ordinal))
 		return
 	}

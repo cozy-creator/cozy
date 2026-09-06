@@ -261,7 +261,9 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if problem := probeWorkerProtocol(ctx, conn, w.spec.Connection != nil); problem != nil {
-		c.refuseClaim(w, problem)
+		if problem.Code != exit.Unavailable && problem.Code != exit.Deadline {
+			c.refuseClaim(w, problem)
+		}
 		return fmt.Errorf("%s", problem.Message)
 	}
 	c.mu.Lock()
