@@ -76,7 +76,7 @@ func (c *Orchestrator) rentalControl(rentalID string) (*session, *exit.Error) {
 	}
 	c.mu.Unlock()
 	if w == nil || w.spec.Connection == nil || w.spec.Connection.RentalID != rentalID {
-		return nil, exit.New(exit.NotFound, "rental %s has no attached worker", rentalID)
+		return nil, exit.Unavailablef("rental %s has no attached worker", rentalID)
 	}
 	if s == nil {
 		return nil, exit.Unavailablef("rental %s has no reconciled WorkerControl session", rentalID)
