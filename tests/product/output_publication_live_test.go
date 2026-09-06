@@ -32,14 +32,15 @@ import (
 
 var publicationHub = flag.String("publication-hub", "", "live Tensorhub for the explicit tiny publication proof")
 var publicationHome = flag.String("publication-home", "", "existing enrolled home used only for the live proof's account credential")
-var publicationPython = flag.String("publication-python", "", "public Runtime 0.2.22/TensorFS 0.3.9 interpreter for the live proof")
+var publicationPython = flag.String("publication-python", "", "public Runtime 0.2.23/TensorFS 0.3.9 interpreter for the live proof")
+var publicationModel = flag.String("publication-model", "", "existing task-owned fixture model reused by the live proof; no new repository is created")
 
 // This explicitly armed test runs Creator's real publication owner and mover,
 // Runtime's native receipt/upload/finalization, and a real Tensorhub. The small
 // claimed TLS peer supplies transport; Tensorhub's own suite covers its Go host ledger.
 func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
-	if *publicationHub == "" || *publicationHome == "" || *publicationPython == "" {
-		t.Skip("requires -publication-hub, -publication-home and -publication-python; creates one tiny model checkpoint")
+	if *publicationHub == "" || *publicationHome == "" || *publicationPython == "" || *publicationModel == "" {
+		t.Skip("requires -publication-hub, -publication-home, -publication-python and -publication-model; creates and removes one tiny checkpoint")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -51,7 +52,14 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 	var nonce [8]byte
 	_, err := rand.Read(nonce[:])
 	must(t, err)
-	destination := fmt.Sprintf("%s/creator-output-%x", account.Name, nonce)
+	destination := *publicationModel
+	fixture, problem := hub.ParseRef(destination)
+	fatal(t, problem)
+	if fixture.Org != account.Name {
+		t.Fatal("the fixture model must belong to the selected account")
+	}
+	_, problem = client.ModelCard(ctx, fixture)
+	fatal(t, problem)
 
 	command := exec.CommandContext(ctx, *publicationPython, "testdata/output-publication.py", t.TempDir())
 	input, err := command.StdinPipe()

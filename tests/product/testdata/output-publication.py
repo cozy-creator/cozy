@@ -21,7 +21,7 @@ from cozy_runtime.internal.worker.weights import WeightsExchange
 from cozy_runtime.internal.worker.weights_finalize import finalize
 from cozy_runtime.protocol import documents, worker_pb2 as pb
 
-assert importlib.metadata.version("cozy-runtime") == "0.2.22"
+assert importlib.metadata.version("cozy-runtime") == "0.2.23"
 assert importlib.metadata.version("tensorfs") == "0.3.9"
 root = Path(sys.argv[1])
 store = tensorfs.Store.ensure(str(root / "store"))
