@@ -312,3 +312,43 @@ func TestDevelopmentHoldRefusesChangedOwnerDuringReplacement(t *testing.T) {
 		t.Fatal("changed owner reached another remote Claim")
 	}
 }
+
+func TestDevelopmentHoldRefusesChangedPeerOrResetStream(t *testing.T) {
+	for _, kind := range []string{"boot", "stream"} {
+		t.Run(kind, func(t *testing.T) {
+			f := developmentFixtureAt(t)
+			address, stop := serveIdleHoldPeer(t, f.peer, f.cert, "127.0.0.1:0")
+			defer stop()
+			f.attach(t, address)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			updates := make(chan cli.DevelopmentHoldResult, 16)
+			finished := make(chan *exit.Error, 1)
+			go func() {
+				finished <- cli.HoldStoredDevelopmentWorker(ctx, f.cfg, f.rentalID, f.peer.bootID, io.Discard, func(value cli.DevelopmentHoldResult) { updates <- value })
+			}()
+			awaitDevelopmentState(t, updates, "holding")
+			stop()
+			awaitDevelopmentState(t, updates, "reconnecting")
+			second := &idleHoldPeer{key: f.peer.key, pin: f.peer.pin, epoch: 8, workerID: f.peer.workerID, bootID: f.peer.bootID}
+			if kind == "boot" {
+				second.bootID = "different-boot"
+			} else {
+				second.epoch = f.peer.epoch
+			}
+			_, stopSecond := serveIdleHoldPeer(t, second, f.cert, address)
+			defer stopSecond()
+			select {
+			case problem := <-finished:
+				if problem == nil || problem.Code != exit.Conflict {
+					t.Fatalf("changed %s was not refused: %v", kind, problem)
+				}
+			case <-ctx.Done():
+				t.Fatalf("changed %s was not refused", kind)
+			}
+			if second.otherFrames.Load() != 0 {
+				t.Fatal("refused replacement received a directive")
+			}
+		})
+	}
+}
