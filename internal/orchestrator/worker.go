@@ -950,8 +950,9 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 				return WorkerLaunchSpec{}, "", placementProblem
 			}
 			observed := w.observedRemote[desired.PlacementIDValue]
-			placementFailed = observed.materialization ==
-				pb.MaterializationState_MATERIALIZATION_STATE_FAILED
+			placementFailed = found && w.acceptedRevision == w.revision &&
+				observed.placementSetDigest == desired.PlacementSetDigest &&
+				observed.materialization == pb.MaterializationState_MATERIALIZATION_STATE_FAILED
 			planID := logical.PlanID
 			if planID == "" && len(logical.Models) > 0 {
 				// Runtime authored each binding beside its callable name. Other
@@ -1442,39 +1443,79 @@ func (w *worker) observeLatchedFault(r *pb.ObservedWorkerState) *exit.Error {
 		w.latchedFault, w.latchedFaultRevision, w.latchedFaultReports = "", 0, 0
 		return nil
 	}
-	if w.revision == 0 || r.AcceptedDesiredStateRevision < w.revision ||
-		r.ConvergedRevision >= w.revision {
+	if w.revision == 0 || r.AcceptedDesiredStateRevision != w.revision ||
+		r.ConvergedRevision >= w.revision || len(w.setDigest) == 0 ||
+		!bytes.Equal(r.AcceptedPlacementSetDigest, w.setDigest) {
 		return reset()
 	}
+	// Only the exact desired set can identify the placement this request is
+	// waiting for. The worker may still report its outgoing fallback beside it.
+	desired, err := canonical.Read(w.setBytes, &pb.PlacementSet{})
+	if err != nil {
+		return reset()
+	}
+	current := make(map[string]bool)
+	for _, p := range desired.List("placements") {
+		current[p.Str("placement_id")] = true
+	}
 	reported := make(map[string]*pb.PlacementStatus, len(r.Placements))
+	seen := make(map[string]bool, len(r.Placements))
 	for _, p := range r.Placements {
-		if p == nil {
+		if p != nil {
+			seen[p.PlacementId] = true
+		}
+		if p == nil || !current[p.PlacementId] || !bytes.Equal(p.PlacementSetDigest, w.setDigest) {
 			continue
 		}
-		if p.Materialization == pb.MaterializationState_MATERIALIZATION_STATE_MATERIALIZING {
+		// Historical diagnostics can survive a cutover. Downloading, activating
+		// or draining is a current transition, never proof of a latched failure.
+		if p.Materialization == pb.MaterializationState_MATERIALIZATION_STATE_MATERIALIZING ||
+			p.Serving == pb.ServingState_SERVING_STATE_ACTIVATING ||
+			p.Serving == pb.ServingState_SERVING_STATE_DRAINING {
 			return reset()
 		}
 		reported[p.PlacementId] = p
 	}
-	stalled := func(p *pb.PlacementStatus) bool {
-		return p == nil || p.Serving != pb.ServingState_SERVING_STATE_DISPATCHABLE
+	offline := func(p *pb.PlacementStatus) bool {
+		return p != nil && p.Serving == pb.ServingState_SERVING_STATE_OFFLINE
 	}
 	var fault *pb.Fault
+	var placement *pb.PlacementStatus
 	for _, p := range r.Placements {
-		if p != nil && stalled(p) && len(p.Faults) > 0 {
-			fault = p.Faults[0]
+		if p != nil && reported[p.PlacementId] == p && offline(p) {
+			for _, f := range p.Faults {
+				if f != nil {
+					fault, placement = f, p
+					break
+				}
+			}
+		}
+		if fault != nil {
 			break
 		}
 	}
 	for _, f := range r.Faults {
-		if fault == nil && f != nil && stalled(reported[f.Subject]) {
-			fault = f
+		if fault != nil || f == nil || !current[f.Subject] {
+			continue
+		}
+		p := reported[f.Subject]
+		// A pending replacement can fail before it has a PlacementStatus row,
+		// while the predecessor still serves. Only its exact incoming ID from
+		// the owned set can associate that global failure. A present row from a
+		// different set cannot use this absence case.
+		if offline(p) || p == nil && !seen[f.Subject] {
+			fault, placement = f, p
 		}
 	}
 	if fault == nil {
 		return reset()
 	}
-	key := fmt.Sprintf("%d\x00%s\x00%s\x00%s", fault.Kind, fault.Subject, fault.Reason, fault.Detail)
+	placementID, executorEpoch := fault.Subject, uint64(0)
+	if placement != nil {
+		placementID, executorEpoch = placement.PlacementId, placement.ExecutorEpoch
+	}
+	key := fmt.Sprintf("%x\x00%s\x00%d\x00%d\x00%s\x00%s\x00%s",
+		w.setDigest, placementID, executorEpoch, fault.Kind, fault.Subject, fault.Reason, fault.Detail)
 	if key != w.latchedFault || w.latchedFaultRevision != w.revision {
 		w.latchedFault, w.latchedFaultRevision, w.latchedFaultReports = key, w.revision, 0
 	}
