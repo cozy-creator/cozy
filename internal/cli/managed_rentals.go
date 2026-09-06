@@ -107,11 +107,13 @@ func observeRentalIdle(st *records.Store, row records.Rental) (rentalIdleness, *
 	if found && last.ClosedAt.After(idle.Since) {
 		idle.Since = last.ClosedAt
 	}
-	idle.Spent = row.ManagedRequestID != "" && (!found || last.Kind == "job" || last.ClosedAt.IsZero())
+	if idle.Spent, problem = orchestrator.RentalSpent(st, row); problem != nil {
+		return idle, problem
+	}
 	if idle.UnpinnedQueued, problem = st.QueuedUnpinnedRentalRequests(); problem != nil {
 		return idle, problem
 	}
-	if idle.Owed, problem = rentalOwedBy(st, row); problem != nil {
+	if idle.Owed, problem = orchestrator.RentalOwedBy(st, row); problem != nil {
 		return idle, problem
 	}
 	if idle.Owed {
@@ -119,27 +121,6 @@ func observeRentalIdle(st *records.Store, row records.Rental) (rentalIdleness, *
 		idle.Spent = false
 	}
 	return idle, nil
-}
-
-// rentalOwedBy answers whether the request this rental was bought for still owes it a
-// pin: not yet settled, and not durably routed to another machine. The debt is read from
-// the durable rows alone — `rentals.managed_request_id` is written with the paid create —
-// so it holds across a daemon restart and across the whole boot, when the request row
-// still says worker=” because the pin is routing's output (cl-092) and routing has not
-// run yet. Without this, a booting or freshly ready pod looks unowed to every observer
-// and an idle sweep — or any fleet hygiene reading the same records — reaps a pod whose
-// buyer is still queued for it (cl-113, observed live: rental pr-b192da1a released
-// mid-boot while req-ff3f79f4 waited on it).
-func rentalOwedBy(st *records.Store, row records.Rental) (bool, *exit.Error) {
-	if row.ManagedRequestID == "" {
-		return false, nil
-	}
-	owing, problem := st.RequestRow(row.ManagedRequestID)
-	if problem != nil {
-		return false, problem
-	}
-	return owing != nil && !settledRequest(owing.State) &&
-		(owing.Worker == "" || owing.Worker == row.ID), nil
 }
 
 // releaseAt is when the idle release is due, or false while the rental is busy (queued,
@@ -337,6 +318,15 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 			excluded = append(excluded, orchestrator.RentalExclusion{
 				RentalID: row.ID, Reason: orchestrator.ExcludedUnattached})
 		default:
+			spent, problem := orchestrator.RentalSpent(m.store, row)
+			if problem != nil {
+				return none, "", problem
+			}
+			if spent {
+				excluded = append(excluded, orchestrator.RentalExclusion{
+					RentalID: row.ID, Reason: orchestrator.ExcludedSpent})
+				continue
+			}
 			ready = append(ready, row.ID)
 		}
 	}
@@ -661,7 +651,7 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 	if queued != 0 || running != 0 {
 		return m.lineLocked()
 	}
-	owed, problem := rentalOwedBy(m.store, *row)
+	owed, problem := orchestrator.RentalOwedBy(m.store, *row)
 	if problem != nil {
 		return "", problem
 	}
