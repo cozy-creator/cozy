@@ -27,15 +27,19 @@ func (c *Orchestrator) sourceCheckpointHost(request records.Request) (SourceChec
 	if s.host == nil {
 		return SourceCheckpointHost{}, exit.Unavailablef("source checkpoint has no claimed PodHost lane")
 	}
-	return SourceCheckpointHost{BootID: s.bootID,
+	return sourceCheckpointAdapter(s.host, s.claim), nil
+}
+
+func sourceCheckpointAdapter(host pb.PodHostClient, claim *pb.Claim) SourceCheckpointHost {
+	return SourceCheckpointHost{BootID: claim.WorkerBootId,
 		Page: func(ctx context.Context, request *pb.SourceCheckpointPageRequest) (*pb.SourceCheckpointPageResult, *exit.Error) {
-			request.RecordOwnerEpoch, request.ControlStreamEpoch, request.WorkerBootId = recordOwnerEpoch, 0, s.bootID
-			answer, err := s.host.SourceCheckpointPage(ctx, &pb.SourceCheckpointPageCall{Claim: s.claim, Request: request})
+			request.RecordOwnerEpoch, request.ControlStreamEpoch, request.WorkerBootId = recordOwnerEpoch, 0, claim.WorkerBootId
+			answer, err := host.SourceCheckpointPage(ctx, &pb.SourceCheckpointPageCall{Claim: claim, Request: request})
 			if err != nil {
 				return nil, exit.Unavailablef("worker source checkpoint page is unavailable")
 			}
 			if answer == nil || answer.RecordOwnerEpoch != request.RecordOwnerEpoch || answer.ControlStreamEpoch != 0 ||
-				answer.WorkerBootId != s.bootID || answer.OperationId != request.OperationId || answer.Slot != request.Slot ||
+				answer.WorkerBootId != claim.WorkerBootId || answer.OperationId != request.OperationId || answer.Slot != request.Slot ||
 				!bytes.Equal(answer.SourceSelectionDigest, request.SourceSelectionDigest) ||
 				!bytes.Equal(answer.PlanDigest, request.PlanDigest) || !proto.Equal(answer.Head, request.Head) ||
 				len(answer.Objects) > pb.MaxSourceCheckpointObjects || proto.Size(answer) > pb.MaxInlineControlBytes {
@@ -48,13 +52,13 @@ func (c *Orchestrator) sourceCheckpointHost(request records.Request) (SourceChec
 			return answer, nil
 		},
 		Transfer: func(ctx context.Context, request *pb.SourceCheckpointTransferRequest) (*pb.SourceCheckpointTransferStatus, *exit.Error) {
-			request.RecordOwnerEpoch, request.ControlStreamEpoch, request.WorkerBootId = recordOwnerEpoch, 0, s.bootID
-			answer, err := s.host.SourceCheckpointTransfer(ctx, &pb.SourceCheckpointTransferCall{Claim: s.claim, Request: request})
+			request.RecordOwnerEpoch, request.ControlStreamEpoch, request.WorkerBootId = recordOwnerEpoch, 0, claim.WorkerBootId
+			answer, err := host.SourceCheckpointTransfer(ctx, &pb.SourceCheckpointTransferCall{Claim: claim, Request: request})
 			if err != nil {
 				return nil, exit.Unavailablef("worker source checkpoint transfer is unavailable")
 			}
 			if answer == nil || answer.RecordOwnerEpoch != request.RecordOwnerEpoch || answer.ControlStreamEpoch != 0 ||
-				answer.WorkerBootId != s.bootID || answer.OperationId != request.OperationId || answer.Slot != request.Slot ||
+				answer.WorkerBootId != claim.WorkerBootId || answer.OperationId != request.OperationId || answer.Slot != request.Slot ||
 				!bytes.Equal(answer.SourceSelectionDigest, request.SourceSelectionDigest) ||
 				!bytes.Equal(answer.PlanDigest, request.PlanDigest) || !proto.Equal(answer.Head, request.Head) ||
 				!proto.Equal(answer.Object, request.Object) || answer.TransferId != request.TransferId ||
@@ -69,5 +73,5 @@ func (c *Orchestrator) sourceCheckpointHost(request records.Request) (SourceChec
 					"worker source checkpoint transfer failed (%s): %s", answer.SafeCode, answer.SafeDetail)
 			}
 			return answer, nil
-		}}, nil
+		}}
 }
