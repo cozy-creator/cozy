@@ -33,6 +33,7 @@ import (
 var publicationHub = flag.String("publication-hub", "", "live Tensorhub for the explicit tiny publication proof")
 var publicationHome = flag.String("publication-home", "", "existing enrolled home used only for the live proof's account credential")
 var publicationPython = flag.String("publication-python", "", "public Runtime 0.2.24/TensorFS 0.3.10 interpreter for the live proof")
+var publicationHostBridge = flag.String("publication-host-bridge", "", "compiled real Go Host bridge for the full native publication proof")
 var publicationModel = flag.String("publication-model", "", "existing task-owned fixture model reused by the live proof; no new repository is created")
 
 // This explicitly armed test runs Creator's real publication owner and mover,
@@ -62,6 +63,13 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 	fatal(t, problem)
 
 	command := exec.CommandContext(ctx, *publicationPython, "testdata/output-publication.py", t.TempDir())
+	if *publicationHostBridge != "" {
+		helper, err := filepath.Abs("testdata/output-publication.py")
+		must(t, err)
+		command = exec.CommandContext(ctx, *publicationHostBridge,
+			"-test.run=^TestWeightsOwnerBridge$", "-weights-owner-python="+*publicationPython,
+			"-weights-owner-helper="+helper)
+	}
 	input, err := command.StdinPipe()
 	must(t, err)
 	output, err := command.StdoutPipe()
@@ -118,6 +126,9 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 				scanner := bufio.NewScanner(output)
 				scanner.Buffer(make([]byte, 4096), 2*pb.MaxInlineControlBytes)
 				for scanner.Scan() {
+					if *publicationHostBridge != "" && scanner.Text() == "PASS" {
+						continue
+					}
 					var line struct{ Frame string }
 					if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
 						errors <- fmt.Errorf("native peer emitted malformed JSON")
