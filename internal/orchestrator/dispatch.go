@@ -492,6 +492,26 @@ func (c *Orchestrator) requeue(requestID, why string, charge bool) {
 // longer wait. A request that queues forever behind a worker that died on boot is the
 // worst of both: no output and no answer.
 func (c *Orchestrator) selectOrStart(req records.Request) {
+	// A queued pin can predate a client upgrade or the peer's first ClaimAck.
+	// Replan only work which has never been offered; keep old attempts/data intact.
+	if req.Rental && req.Worker != "" {
+		c.mu.Lock()
+		w := c.workers[rentalInstanceID(req.Worker)]
+		older := w != nil && !w.supportsCurrentProtocol()
+		c.mu.Unlock()
+		if older {
+			attempts, problem := c.opt.Store.Attempts(req.ID)
+			if problem != nil || len(attempts) != 0 {
+				return
+			}
+			unpinned, problem := c.opt.Store.UnpinRentalWork(req.ID, req.Worker)
+			if problem != nil || !unpinned {
+				return
+			}
+			c.logf("%s replans queued work from rental %s: %s", req.ID, req.Worker, ExcludedProtocol)
+			req.Worker = ""
+		}
+	}
 	var guards []string
 	if req.Rental && req.Worker == "" {
 		// This request is QUEUED — no lane, local or rental, could take it at routing
@@ -765,7 +785,7 @@ func requestSlot(req records.Request) string {
 // has room, so the request waits unpinned. Callers hold c.mu.
 func (c *Orchestrator) rentalHeld(req records.Request) bool {
 	for _, w := range c.workers {
-		if w.exited || w.stopping || w.spec.IsJob() != req.IsJob() ||
+		if w.exited || w.stopping || !w.supportsCurrentProtocol() || w.spec.IsJob() != req.IsJob() ||
 			retirementGround(w) != "" || w.spec.Connection == nil {
 			continue
 		}

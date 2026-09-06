@@ -292,12 +292,7 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 			submission.Org = strings.Split(destination, "/")[0]
 		}
 	}
-	planDigest, err := plan.Digest()
-	if err != nil {
-		return exit.Internalf("cannot digest model transfer submission: %s", err)
-	}
-	handle, problem := local.SubmitJob(submission,
-		"model-transfer-"+strings.TrimPrefix(planDigest, "sha256:"))
+	handle, problem := local.SubmitJob(submission, requestKey(ctx.Inv.Value("--idempotency-key")))
 	if problem != nil {
 		return problem
 	}

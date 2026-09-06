@@ -365,6 +365,12 @@ func (p DesiredPlacement) PlacementID() string {
 	return "plc-" + strings.TrimPrefix(p.InstanceID(), "ins-")
 }
 
+// supportsCurrentProtocol is shared by placement reuse and dispatch. A peer that
+// has negotiated an older wire can settle prior work but cannot take new directives.
+func (w *worker) supportsCurrentProtocol() bool {
+	return w.declaredInstance == "" || w.wireMinor >= pb.WireMinor
+}
+
 type worker struct {
 	instanceID string
 	spec       WorkerLaunchSpec
@@ -392,6 +398,7 @@ type worker struct {
 	// names the stable slot; every local or attached worker names its own incarnation and
 	// must keep that identity stable across a control-stream reconnect.
 	declaredInstance string
+	wireMinor        uint32 // negotiated in ClaimAck, not inferred from the image profile
 	remoteWorkerID   string
 	// desiredPackages/models are Creator's logical private-rental intent. They survive a
 	// control-stream reconnect so the new authenticated stream does not reset a loaded

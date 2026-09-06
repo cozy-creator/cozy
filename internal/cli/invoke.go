@@ -134,10 +134,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	key := ctx.Inv.Value("--idempotency-key")
-	if key == "" {
-		key = mintKey()
-	}
+	key := requestKey(ctx.Inv.Value("--idempotency-key"))
 
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA — the surface the release's own
 	// runtime vouched for at install — so a typo costs a millisecond instead of a model
@@ -1964,10 +1961,13 @@ func mapTerminal(status string) string {
 	return status
 }
 
-// mintKey mints this invocation's idempotency key. One key names one request forever, so
+// requestKey preserves an explicit key or mints this invocation's key. One key names one request forever, so
 // a fresh invocation gets a fresh one and a caller that wants retry safety across process
 // restarts passes its own.
-func mintKey() string {
+func requestKey(supplied string) string {
+	if supplied != "" {
+		return supplied
+	}
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "idem-" + fmt.Sprint(time.Now().UnixNano())
