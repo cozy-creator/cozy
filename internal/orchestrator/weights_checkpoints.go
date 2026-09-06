@@ -27,6 +27,12 @@ func (c *Orchestrator) onWeightsCheckpoint(s *session, frame *pb.WeightsCheckpoi
 
 // The event and the canonical Host snapshot feed the same current-attempt join.
 func (c *Orchestrator) onWeightsTransaction(s *session, row *pb.WeightsTransactionStatus) {
+	c.mu.Lock()
+	current := !c.closing && s.bootID != "" && c.sessions[s.bootID] == s
+	c.mu.Unlock()
+	if !current {
+		return
+	}
 	if row == nil || row.AttemptOrdinal == 0 || row.AttemptOrdinal > math.MaxInt64 || row.WriterEpoch == 0 || len(row.TensorfsDeclarationDigest) != 32 {
 		return
 	}
