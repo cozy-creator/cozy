@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +32,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
+
+var sourceCheckpointConcurrent = flag.Bool("source-checkpoint-concurrency", false, "exercise four actual native PUT/GET bodies through a controlled R2 proxy")
 
 var sourceCheckpointHelper = flag.String("source-checkpoint-helper", "testdata/public_source.py", "native partial-H3 source fixture and actual RuntimePreparation gRPC service")
 
@@ -58,6 +62,9 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	fatal(t, problem)
 
 	command := exec.CommandContext(ctx, *publicationPython, *sourceCheckpointHelper, filepath.Join(root, "native"))
+	if *sourceCheckpointConcurrent {
+		command.Args = append(command.Args, "--transfer-proof")
+	}
 	command.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE=1"}
 	input, err := command.StdinPipe()
 	must(t, err)
@@ -115,7 +122,10 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	}
 	_, err = fmt.Fprintf(input, "{\"operation_id\":%q}\n", requestID)
 	must(t, err)
-	var started struct{ Address, Prepared string }
+	var started struct {
+		Address, Prepared string
+		RestoreAddress    string `json:"restore_address"`
+	}
 	must(t, decoder.Decode(&started))
 	hostname, _, err := net.SplitHostPort(started.Address)
 	must(t, err)
@@ -141,7 +151,16 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	must(t, err)
 	defer connection.Close()
 	runtime := pb.NewRuntimePreparationClient(connection)
-	pages, uploads := 0, 0
+	var pages, transfers atomic.Int64
+	var gate *checkpointHTTPGate
+	if *sourceCheckpointConcurrent {
+		gate = newCheckpointHTTPGate(t, func() {
+			progress, problem := store.ModelSourceProgress(requestID)
+			if problem != nil || len(progress) != 1 || progress[0].Acknowledged != nil {
+				t.Error("source custody was acknowledged before native HTTP bodies completed")
+			}
+		})
+	}
 	host := orchestrator.SourceCheckpointHost{BootID: boot,
 		Page: func(ctx context.Context, request *pb.SourceCheckpointPageRequest) (*pb.SourceCheckpointPageResult, *exit.Error) {
 			request.RecordOwnerEpoch, request.WorkerBootId = 1, boot
@@ -152,23 +171,31 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 			if answer.SafeCode != "" {
 				return nil, exit.Named(exit.Failed, answer.SafeCode, "native checkpoint page refused")
 			}
-			pages++
+			pages.Add(1)
 			return answer, nil
 		},
 		Transfer: func(ctx context.Context, request *pb.SourceCheckpointTransferRequest) (*pb.SourceCheckpointTransferStatus, *exit.Error) {
 			request.RecordOwnerEpoch, request.WorkerBootId = 1, boot
+			if gate != nil {
+				if grant := request.GetUploadGrant(); grant != nil {
+					grant.Url = gate.route(http.MethodPut, grant.ObjectId, grant.Url)
+				} else {
+					id, _ := canonical.Spell(request.Object.Ref.Digest)
+					request.Decision = &pb.SourceCheckpointTransferRequest_DownloadUrl{DownloadUrl: gate.route(http.MethodGet, id, request.GetDownloadUrl())}
+				}
+			}
 			answer, err := runtime.SourceCheckpointTransfer(ctx, request)
 			if err != nil {
 				return nil, exit.Unavailablef("native checkpoint transfer RPC failed")
 			}
 			if answer.State != pb.WeightsTransferState_WEIGHTS_TRANSFER_STATE_UPLOADED &&
-				answer.State != pb.WeightsTransferState_WEIGHTS_TRANSFER_STATE_ALREADY_PRESENT {
+				answer.State != pb.WeightsTransferState_WEIGHTS_TRANSFER_STATE_ALREADY_PRESENT && answer.State != pb.WeightsTransferState_WEIGHTS_TRANSFER_STATE_HELD {
 				return nil, exit.Named(exit.Unavailable, answer.SafeCode, "native checkpoint upload refused (%s)", answer.SafeCode)
 			}
 			if answer.TransferId != request.TransferId || !bytes.Equal(answer.Head.Digest, request.Head.Digest) {
 				return nil, exit.New(exit.Conflict, "native checkpoint transfer identity changed")
 			}
-			uploads++
+			transfers.Add(1)
 			return answer, nil
 		}}
 	owner := cli.NewModelTransferOwner(config.Config{HubURL: *publicationHub, Home: root}, store, io.Discard, auth)
@@ -179,18 +206,58 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 			t.Errorf("exact source publication cleanup failed: %s", problem.ErrName())
 		}
 	}()
+	if gate != nil {
+		denied := owner.SyncSourceCheckpoints(ctx, requestID, host)
+		if denied == nil || denied.Code != exit.Unavailable {
+			t.Fatalf("native denied PUT lost its typed failure: %v", denied)
+		}
+		failed, problem := store.ModelSourceProgress(requestID)
+		fatal(t, problem)
+		if len(failed) != 1 || failed[0].Acknowledged != nil {
+			t.Fatal("failed Link advanced its custody acknowledgment")
+		}
+		held, problem := store.SourcePublications(requestID)
+		fatal(t, problem)
+		if len(held) == 0 {
+			t.Fatal("failed Link dropped its recovery holds")
+		}
+		gate.mu.Lock()
+		gate.refuse = false
+		gate.mu.Unlock()
+	}
 	fatal(t, owner.SyncSourceCheckpoints(ctx, requestID, host))
 	progress, problem := store.ModelSourceProgress(requestID)
 	fatal(t, problem)
-	if pages == 0 || uploads == 0 || len(progress) != 1 || progress[0].Acknowledged == nil ||
+	if pages.Load() == 0 || transfers.Load() == 0 || len(progress) != 1 || progress[0].Acknowledged == nil ||
 		*progress[0].Acknowledged != observed {
 		t.Fatal("native source upload did not reach exact durable owner acknowledgment")
 	}
+	if gate != nil {
+		gate.mu.Lock()
+		peak, moved := gate.peak, gate.moved
+		gate.mu.Unlock()
+		if peak != 4 || moved == 0 {
+			t.Fatalf("native PUT concurrency/bytes: peak=%d moved=%d", peak, moved)
+		}
+		restored, err := grpc.NewClient(started.RestoreAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		must(t, err)
+		defer restored.Close()
+		runtime = pb.NewRuntimePreparationClient(restored)
+		fatal(t, owner.RestoreSourceCheckpoints(ctx, requestID, host))
+		gate.mu.Lock()
+		getPeak := gate.getPeak
+		gate.mu.Unlock()
+		if getPeak != 4 {
+			t.Fatalf("native GET concurrency: peak=%d", getPeak)
+		}
+		t.Logf("actual native network overlap: PUT peak=%d, GET peak=%d, uploaded body bytes=%d; empty-Store head-first restore passed", peak, getPeak, moved)
+	}
+
 	held, problem := store.SourcePublications(requestID)
 	fatal(t, problem)
 	if len(held) == 0 {
 		t.Fatal("source acknowledgment has no retained Hub publication")
 	}
-	t.Logf("public Runtime %s/TensorFS %s source checkpoint: %d native pages, %d actual uploads, %d verified Hub holds, exact head %s acknowledged",
-		initial.Software.Runtime, initial.Software.Tensorfs, pages, uploads, len(held), head)
+	t.Logf("public Runtime %s/TensorFS %s source checkpoint: %d native pages, %d successful native transfers, %d verified Hub holds, exact head %s acknowledged",
+		initial.Software.Runtime, initial.Software.Tensorfs, pages.Load(), transfers.Load(), len(held), head)
 }
