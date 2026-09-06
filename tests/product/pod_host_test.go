@@ -79,6 +79,8 @@ type fakePod struct {
 	onJobReady func(*pb.WorkerFrame, func(*pb.WorkerFrame) error) error
 	// answerOffer supplies a protocol outcome when a test exercises settlement.
 	answerOffer func(*pb.AttemptOffer) (*pb.AttemptOutcome, error)
+	// onFrame lets a product test delegate selected frames to a real Runtime peer.
+	onFrame func(*pb.RecordOwnerFrame, func(*pb.WorkerFrame) error) (bool, error)
 	// slots is the advertised seat count while serving; zero means one.
 	slots uint32
 	// downloadSamples is how many DOWNLOADING events the prepare stream reports before
@@ -230,6 +232,15 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 				return nil
 			}
 			return err
+		}
+		if p.onFrame != nil {
+			handled, err := p.onFrame(frame, send)
+			if err != nil {
+				return err
+			}
+			if handled {
+				continue
+			}
 		}
 		switch m := frame.Msg.(type) {
 		case *pb.RecordOwnerFrame_Claim:

@@ -145,6 +145,9 @@ func (c *Orchestrator) syncSourceCheckpoint(ctx context.Context, requestID strin
 	if problem != nil || transfer == nil {
 		return problem
 	}
+	if !transfer.HasAcquisition() {
+		return nil
+	}
 	if transfer.State == "completed" || transfer.State == "canceled" {
 		return c.opt.ModelTransfers.ReleaseSourceCheckpoints(ctx, requestID)
 	}

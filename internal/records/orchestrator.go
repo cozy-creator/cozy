@@ -593,7 +593,9 @@ func (s *Store) RequestRow(id string) (*Request, *exit.Error) {
 	}
 	if transfer != nil {
 		r.ModelTransfer = &transfer.ModelTransferIntent
-		r.Models = append([]ModelRef(nil), transfer.Models...)
+		if transfer.HasAcquisition() {
+			r.Models = append([]ModelRef(nil), transfer.Models...)
+		}
 	}
 	return &r, nil
 }
@@ -806,7 +808,9 @@ func (s *Store) RequestByIdempotencyKey(key string) (*Request, *exit.Error) {
 	}
 	if transfer != nil {
 		r.ModelTransfer = &transfer.ModelTransferIntent
-		r.Models = append([]ModelRef(nil), transfer.Models...)
+		if transfer.HasAcquisition() {
+			r.Models = append([]ModelRef(nil), transfer.Models...)
+		}
 	}
 	return &r, nil
 }

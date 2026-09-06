@@ -50,6 +50,11 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 	if intent == nil {
 		return nil
 	}
+	if !intent.HasAcquisition() && (spec.Rental || spec.RentalRequired) && spec.Worker == "" {
+		return exit.Named(exit.Validation, "model_transfer.prepared_rental_required",
+			"output-only publication requires an explicitly selected existing rental").
+			WithRemedy("select a prepared rental with sufficient disk and host memory; manifest byte lengths do not size their model closures")
+	}
 	if spec.Rental || spec.RentalRequired {
 		for _, file := range intent.SourceFiles {
 			if len(file.Header) == 0 {
@@ -63,13 +68,17 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 		if !platformPassThrough {
 			return exit.New(exit.Validation, "platform pass-through requires exact package and function")
 		}
+		if !intent.HasAcquisition() {
+			return exit.New(exit.Validation, "platform pass-through requires a source acquisition")
+		}
 		if len(intent.Outputs) != 1 || intent.Outputs[0].Name != "model" {
 			return exit.New(exit.Validation, "platform pass-through requires exactly output model")
 		}
 		return nil
 	}
-	if len(intent.SourceProfiles) == 0 || len(intent.Outputs) != len(spec.WeightsOutputs) ||
-		!profilesCoverParams(intent.SourceProfiles, spec.ProducerParams) {
+	if len(intent.Outputs) != len(spec.WeightsOutputs) ||
+		(intent.HasAcquisition() && (len(intent.SourceProfiles) == 0 ||
+			!profilesCoverParams(intent.SourceProfiles, spec.ProducerParams))) {
 		return exit.New(exit.Validation, "producer transfer inputs/outputs do not match the job PackageInterface")
 	}
 	declared := make(map[string]bool, len(spec.WeightsOutputs))

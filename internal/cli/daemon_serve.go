@@ -119,7 +119,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	knownRentals := rental.Known(st)
 
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
-	transfers := newModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
+	transfers := NewModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
 	localWheels := newLocalWheelOwner(ctx.Cfg, ctx.Out, ctx.AccountAuth)
 	defects := newDefectReporter(ctx.Cfg, ctx.Out, ctx.AccountAuth)
 	c, e := orchestrator.Open(orchestrator.Options{
