@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
@@ -178,8 +179,8 @@ func (c *Client) RemoveCheckpoint(ctx context.Context, ref Ref, checkpointID, re
 		strict: true}, &out); problem != nil {
 		return problem
 	}
-	if out.CheckpointID != checkpointID || !out.Removed {
-		return exit.Internalf("Tensorhub did not remove the requested checkpoint")
+	if _, err := canonical.Raw(out.RepositorySHA256); err != nil || out.CheckpointID != checkpointID {
+		return exit.Internalf("Tensorhub did not confirm the requested checkpoint removal")
 	}
 	return nil
 }
