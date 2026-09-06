@@ -97,6 +97,16 @@ func proveCurrentPlacementFault(t *testing.T, pending bool) {
 	report(func(r *pb.ObservedWorkerState) { r.Placements[0].PlacementSetDigest = bytes.Repeat([]byte{0x72}, 32) }, orchestrator.StillFactor+2)
 	queued("old placement set")
 	report(func(r *pb.ObservedWorkerState) {
+		r.Placements[0].PlacementSetDigest = bytes.Repeat([]byte{0x72}, 32)
+		r.Placements[0].Materialization = pb.MaterializationState_MATERIALIZATION_STATE_FAILED
+	}, orchestrator.StillFactor+2)
+	queued("failed axis from old placement set")
+	report(func(r *pb.ObservedWorkerState) {
+		r.AcceptedDesiredStateRevision--
+		r.Placements[0].Materialization = pb.MaterializationState_MATERIALIZATION_STATE_FAILED
+	}, orchestrator.StillFactor+2)
+	queued("failed axis from old desired revision")
+	report(func(r *pb.ObservedWorkerState) {
 		r.Placements[0].PlacementId = "old-placement"
 		r.Faults[0].Subject = "old-placement"
 	}, orchestrator.StillFactor+2)
