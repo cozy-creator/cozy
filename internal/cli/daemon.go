@@ -143,6 +143,11 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 	defer tick.Stop()
 	for {
 		if state := daemon.Probe(ctx.Cfg); state.Up {
+			if state.Addr == "" {
+				return daemon.State{}, false, exit.Named(exit.Conflict, "daemon.operator_owned",
+					"an operator process holds this Cozy root without starting a daemon").
+					WithRemedy("finish or stop the operator handoff before starting Cozy")
+			}
 			current, _ := os.ReadFile(layout.Daemon)
 			credentialReady := !started || !bytes.Equal(current, staleCredential)
 			if credentialReady {

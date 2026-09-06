@@ -33,6 +33,8 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
+var sourceCustodyBridge = flag.String("source-custody-host-bridge", "", "actual Go Host fixture bridge for the custody-only operator proof")
+
 var sourceCheckpointConcurrent = flag.Bool("source-checkpoint-concurrency", false, "exercise four actual native PUT/GET bodies through a controlled R2 proxy")
 
 var sourceCheckpointHelper = flag.String("source-checkpoint-helper", "testdata/public_source.py", "native partial-H3 source fixture and actual RuntimePreparation gRPC service")
@@ -107,7 +109,12 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	requestID := records.NewID("job")
 	_, fresh, problem := store.Submit(records.Request{ID: requestID, IdemKey: requestID,
 		BodyDigest: "sha256:" + strings.Repeat("c", 64), Package: "cozy/h3-package", Release: "1.0.7", PlanID: "sha256:" + strings.Repeat("35", 32),
-		Worker: podRental, Rental: true, RentalRequired: true,
+		Worker: func() string {
+			if *sourceCustodyBridge != "" {
+				return "pr-11111111111111111111"
+			}
+			return podRental
+		}(), Rental: true, RentalRequired: true,
 		Entrypoint: "four-lane", State: "queued", Kind: "job", Payload: []byte("{}"),
 		Outputs: "[]", WeightsOutputs: "[]", ModelTransfer: intent})
 	fatal(t, problem)
@@ -115,7 +122,10 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 		t.Fatal("source proof request was not newly recorded")
 	}
 	fatal(t, store.BeginModelTransferMaterialization(requestID))
-	const boot = "source-proof-boot"
+	boot := "source-proof-boot"
+	if *sourceCustodyBridge != "" {
+		boot = "boot-1"
+	}
 	activeBoot := boot
 	for _, file := range preparedRequest.Files {
 		fatal(t, store.RecordModelTransferSourceStatus(records.ModelTransferSourceStatus{
@@ -150,6 +160,11 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	observed := records.ModelSourceCheckpoint{Slot: checkpoint.Slot, HeadID: head,
 		HeadLength: int64(checkpoint.Head.Length), PlanDigest: plan, Index: int64(checkpoint.Index), Bytes: int64(checkpoint.Bytes)}
 	fatal(t, store.ObserveModelSourceCheckpoints(requestID, selection, boot, []records.ModelSourceCheckpoint{observed}))
+	if *sourceCustodyBridge != "" {
+		preparedRequest.OperationId = requestID
+		proveOperatorSourceCustody(t, ctx, root, store, auth, preparedRequest, started.Address, observed)
+		return
+	}
 	connection, err := grpc.NewClient(started.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	must(t, err)
 	defer connection.Close()

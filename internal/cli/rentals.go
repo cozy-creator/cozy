@@ -193,6 +193,10 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		return records.Rental{}, hub.Rental{}, false, e
 	}
 	if existing != nil && (existing.State == "rejected" || existing.State == "released") {
+		if managedRequestID != "" && existing.State == "released" {
+			return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Unavailable, "rental.operation_superseded",
+				"the prior managed rental was released before acquisition; retry its current selection")
+		}
 		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.operation_settled",
 			"rental operation %s is already %s", operationKey, existing.State).
 			WithRemedy("use a fresh operation key for a new paid rental")
