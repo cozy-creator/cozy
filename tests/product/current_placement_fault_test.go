@@ -1,0 +1,106 @@
+package producttest
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/cozy-creator/cozy/internal/orchestrator"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+)
+
+// H3's corrected placement was ACTIVATING while Runtime repeated a historical
+// binding fault. Reports are independent wire messages, not successful model
+// byte verdicts; the real owner must preserve the queued request while preparing.
+func TestHistoricalFaultCannotRefuseCurrentPlacementActivation(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	type observedPeer struct {
+		desired *pb.DesiredWorkerState
+		send    func(*pb.WorkerFrame) error
+	}
+	desires := make(chan observedPeer, 1)
+	pod := &fakePod{controlKey: public, latch: &pb.Fault{
+		Kind:   pb.FaultKind_FAULT_KIND_BINDING_UNAVAILABLE,
+		Reason: "unhandled_exception", Detail: "TraversalOrderMismatch: old header audio_proj_in.bias",
+	}}
+	pod.onFrame = func(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) error) (bool, error) {
+		if desired := frame.GetDesiredState(); desired != nil && desired.GetPlacementSet() != nil {
+			desires <- observedPeer{desired, send}
+			return true, nil
+		}
+		return false, nil
+	}
+	root := t.TempDir()
+	connection, _ := startFakePod(t, root, pod)
+	revision := stageLocalRevision(t, root)
+	o := hostOwner(t, "current-placement-fault", rentalWiring(connection, private), func(opt *orchestrator.Options) { opt.Packages = localLauncher{revision: revision} })
+	id := submitPrivateRental(t, o, revision, "current-placement-fault")
+	var peer observedPeer
+	select {
+	case peer = <-desires:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no desired placement")
+	}
+	instance, _, _, problem := o.c.EnsureRental(podRental)
+	fatal(t, problem)
+	sequence := uint64(100)
+	report := func(change func(*pb.ObservedWorkerState), count int) {
+		t.Helper()
+		for i := 0; i < count; i++ {
+			frame := pod.report(peer.desired, 1)
+			r := frame.GetObservedState()
+			r.Placements[0].Materialization = pb.MaterializationState_MATERIALIZATION_STATE_STAGED
+			r.Placements[0].ExecutorEpoch = 2
+			change(r)
+			sequence++
+			r.AdmissionEpoch = sequence
+			must(t, peer.send(frame))
+			waitUntil(t, "owner consumed exact fault report", func() bool { w := o.c.Worker(instance); return w != nil && w.AdmissionEpoch == sequence })
+		}
+	}
+	queued := func(label string) {
+		t.Helper()
+		time.Sleep(40 * time.Millisecond) // let the actual readiness waiter consume its verdict
+		row, problem := o.store.RequestRow(id)
+		fatal(t, problem)
+		if row.State != "submitted" {
+			t.Fatalf("%s failed current preparation: %s", label, row.State)
+		}
+		attempts, problem := o.store.Attempts(id)
+		fatal(t, problem)
+		if len(attempts) != 0 {
+			t.Fatal("preparation fault invented an attempt")
+		}
+	}
+	for _, state := range []pb.ServingState{pb.ServingState_SERVING_STATE_ACTIVATING, pb.ServingState_SERVING_STATE_DRAINING} {
+		report(func(r *pb.ObservedWorkerState) { r.Placements[0].Serving = state }, orchestrator.StillFactor+2)
+		queued(fmt.Sprint(state))
+	}
+	report(func(r *pb.ObservedWorkerState) {
+		r.Placements[0].Materialization = pb.MaterializationState_MATERIALIZATION_STATE_MATERIALIZING
+	}, orchestrator.StillFactor+2)
+	queued("materializing")
+	report(func(r *pb.ObservedWorkerState) { r.AcceptedPlacementSetDigest = bytes.Repeat([]byte{0x71}, 32) }, orchestrator.StillFactor+2)
+	queued("old accepted set")
+	report(func(r *pb.ObservedWorkerState) { r.Placements[0].PlacementSetDigest = bytes.Repeat([]byte{0x72}, 32) }, orchestrator.StillFactor+2)
+	queued("old placement set")
+	report(func(r *pb.ObservedWorkerState) {
+		r.Placements[0].PlacementId = "old-placement"
+		r.Faults[0].Subject = "old-placement"
+	}, orchestrator.StillFactor+2)
+	queued("old placement")
+	report(func(r *pb.ObservedWorkerState) { r.Placements = nil }, orchestrator.StillFactor+2)
+	queued("unassociated global fault")
+	// A real current OFFLINE failure still settles, but a replacement executor
+	// cannot inherit the predecessor's partially accumulated report count.
+	report(func(*pb.ObservedWorkerState) {}, orchestrator.StillFactor-2)
+	queued("six current executor reports")
+	report(func(r *pb.ObservedWorkerState) { r.Placements[0].ExecutorEpoch = 3 }, orchestrator.StillFactor-2)
+	queued("new executor restarted the count")
+	report(func(r *pb.ObservedWorkerState) { r.Placements[0].ExecutorEpoch = 3 }, 2)
+	waitUntil(t, "current offline failure settles", func() bool { row, _ := o.store.RequestRow(id); return row != nil && row.State == "failed" })
+}
