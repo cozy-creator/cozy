@@ -472,10 +472,6 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 	if problem != nil {
 		return empty, nil, problem
 	}
-	if len(entrypoint.Models) > 0 && len(packageInterface.Entrypoints) != 1 {
-		return empty, nil, exit.Named(exit.Unavailable, "rental.modeled_package_surface_unsupported",
-			"the first modeled rental lane requires one serving entrypoint so its worker-derived binding is unambiguous")
-	}
 	models = append([]orchestrator.ModelRef(nil), models...)
 	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
 	if len(models) != len(entrypoint.Models) {
