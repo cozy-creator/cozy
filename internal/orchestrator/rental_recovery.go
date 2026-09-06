@@ -222,3 +222,27 @@ func (c *Orchestrator) CancelLostAttempt(requestID string, attempt int64, reason
 	c.RetryOutputExport(requestID)
 	return nil
 }
+
+// An explicitly rented pod is still owned when no request needs it. Restore its
+// existing signed control claim on restart so owner absence cannot reclaim it.
+// Each attachment uses the normal resolver and runs outside fleet acquisition.
+func (c *Orchestrator) resumeManualRentals() *exit.Error {
+	if c.opt.Rentals == nil {
+		return nil
+	}
+	rows, problem := c.opt.Store.Rentals()
+	if problem != nil {
+		return problem
+	}
+	for _, row := range rows {
+		if row.ManagedRequestID != "" || !records.RentalReadyState(row.State) {
+			continue
+		}
+		go func(id string) {
+			if _, _, _, problem := c.EnsureRental(id); problem != nil {
+				c.logf("rental %s control reattachment deferred: %s", id, problem.Message)
+			}
+		}(row.ID)
+	}
+	return nil
+}
