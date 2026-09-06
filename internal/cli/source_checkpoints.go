@@ -156,7 +156,7 @@ func (o *modelTransferOwner) checkpointTransfer(requestID, selection, direction 
 	return &pb.SourceCheckpointTransferRequest{OperationId: requestID, SourceSelectionDigest: selected,
 		Slot: checkpoint.Slot, PlanDigest: plan, Head: head,
 		Object:     &pb.SourceCheckpointObject{Ref: &pb.Ref{Digest: objectDigest, Length: uint64(object.Length)}},
-		TransferId: "sha256:" + hex.EncodeToString(sum[:]), GrantRevision: revision}, nil
+		TransferId: "source-" + hex.EncodeToString(sum[:]), GrantRevision: revision}, nil
 }
 
 func (o *modelTransferOwner) uploadSourceCheckpointLink(ctx context.Context, client *hub.Client, ref hub.Ref,
