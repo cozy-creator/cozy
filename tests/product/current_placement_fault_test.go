@@ -16,6 +16,14 @@ import (
 // binding fault. Reports are independent wire messages, not successful model
 // byte verdicts; the real owner must preserve the queued request while preparing.
 func TestHistoricalFaultCannotRefuseCurrentPlacementActivation(t *testing.T) {
+	proveCurrentPlacementFault(t, false)
+}
+
+func TestPendingReplacementFaultNamesExactIncomingPlacement(t *testing.T) {
+	proveCurrentPlacementFault(t, true)
+}
+
+func proveCurrentPlacementFault(t *testing.T, pending bool) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	type observedPeer struct {
@@ -93,14 +101,23 @@ func TestHistoricalFaultCannotRefuseCurrentPlacementActivation(t *testing.T) {
 		r.Faults[0].Subject = "old-placement"
 	}, orchestrator.StillFactor+2)
 	queued("old placement")
-	report(func(r *pb.ObservedWorkerState) { r.Placements = nil }, orchestrator.StillFactor+2)
+	report(func(r *pb.ObservedWorkerState) { r.Placements = nil; r.Faults[0].Subject = "historical-binding" }, orchestrator.StillFactor+2)
 	queued("unassociated global fault")
-	// A real current OFFLINE failure still settles, but a replacement executor
-	// cannot inherit the predecessor's partially accumulated report count.
-	report(func(*pb.ObservedWorkerState) {}, orchestrator.StillFactor-2)
-	queued("six current executor reports")
-	report(func(r *pb.ObservedWorkerState) { r.Placements[0].ExecutorEpoch = 3 }, orchestrator.StillFactor-2)
-	queued("new executor restarted the count")
-	report(func(r *pb.ObservedWorkerState) { r.Placements[0].ExecutorEpoch = 3 }, 2)
+	if pending {
+		report(func(r *pb.ObservedWorkerState) {
+			r.Placements[0].PlacementId = "outgoing-fallback"
+			r.Placements[0].PlacementSetDigest = bytes.Repeat([]byte{0x73}, 32)
+			r.Placements[0].Serving = pb.ServingState_SERVING_STATE_DISPATCHABLE
+			// The global fault still names the exact current incoming ID.
+		}, orchestrator.StillFactor)
+	} else {
+		// A real current OFFLINE failure still settles, but a replacement executor
+		// cannot inherit the predecessor's partially accumulated report count.
+		report(func(*pb.ObservedWorkerState) {}, orchestrator.StillFactor-2)
+		queued("six current executor reports")
+		report(func(r *pb.ObservedWorkerState) { r.Placements[0].ExecutorEpoch = 3 }, orchestrator.StillFactor-2)
+		queued("new executor restarted the count")
+		report(func(r *pb.ObservedWorkerState) { r.Placements[0].ExecutorEpoch = 3 }, 2)
+	}
 	waitUntil(t, "current offline failure settles", func() bool { row, _ := o.store.RequestRow(id); return row != nil && row.State == "failed" })
 }

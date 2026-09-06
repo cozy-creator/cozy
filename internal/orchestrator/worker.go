@@ -1459,7 +1459,11 @@ func (w *worker) observeLatchedFault(r *pb.ObservedWorkerState) *exit.Error {
 		current[p.Str("placement_id")] = true
 	}
 	reported := make(map[string]*pb.PlacementStatus, len(r.Placements))
+	seen := make(map[string]bool, len(r.Placements))
 	for _, p := range r.Placements {
+		if p != nil {
+			seen[p.PlacementId] = true
+		}
 		if p == nil || !current[p.PlacementId] || !bytes.Equal(p.PlacementSetDigest, w.setDigest) {
 			continue
 		}
@@ -1491,10 +1495,16 @@ func (w *worker) observeLatchedFault(r *pb.ObservedWorkerState) *exit.Error {
 		}
 	}
 	for _, f := range r.Faults {
-		// A global fault with an unknown/old subject cannot speak for the new
-		// revision, even when the worker's fault history repeats it unchanged.
-		if fault == nil && f != nil && current[f.Subject] && offline(reported[f.Subject]) {
-			fault, placement = f, reported[f.Subject]
+		if fault != nil || f == nil || !current[f.Subject] {
+			continue
+		}
+		p := reported[f.Subject]
+		// A pending replacement can fail before it has a PlacementStatus row,
+		// while the predecessor still serves. Only its exact incoming ID from
+		// the owned set can associate that global failure. A present row from a
+		// different set cannot use this absence case.
+		if offline(p) || p == nil && !seen[f.Subject] {
+			fault, placement = f, p
 		}
 	}
 	if fault == nil {
