@@ -6224,9 +6224,10 @@ type HostSnapshotBody struct {
 	state        protoimpl.MessageState `protogen:"open.v1"`
 	HeldOutcomes []*HeldAttempt         `protobuf:"bytes,1,rep,name=held_outcomes,json=heldOutcomes,proto3" json:"held_outcomes,omitempty"` // sorted by (request_id, attempt_ordinal); state is
 	// always OUTCOME_PENDING_ACK
-	WeightsTransactions []*WeightsTransactionStatus `protobuf:"bytes,2,rep,name=weights_transactions,json=weightsTransactions,proto3" json:"weights_transactions,omitempty"` // sorted by weights_transaction_id
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	WeightsTransactions     []*WeightsTransactionStatus `protobuf:"bytes,2,rep,name=weights_transactions,json=weightsTransactions,proto3" json:"weights_transactions,omitempty"`                // sorted by weights_transaction_id
+	RetainedDesiredRevision uint64                      `protobuf:"varint,3,opt,name=retained_desired_revision,json=retainedDesiredRevision,proto3" json:"retained_desired_revision,omitempty"` // Host ledger high-water, not Runtime acceptance or convergence.
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *HostSnapshotBody) Reset() {
@@ -6271,6 +6272,13 @@ func (x *HostSnapshotBody) GetWeightsTransactions() []*WeightsTransactionStatus 
 		return x.WeightsTransactions
 	}
 	return nil
+}
+
+func (x *HostSnapshotBody) GetRetainedDesiredRevision() uint64 {
+	if x != nil {
+		return x.RetainedDesiredRevision
+	}
+	return 0
 }
 
 type SnapshotAck struct {
@@ -16152,10 +16160,11 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	" \x03(\v2\x1b.cozy.worker.v1.HeldAttemptR\fheldAttempts\x12[\n" +
 	"\x14weights_transactions\x18\v \x03(\v2(.cozy.worker.v1.WeightsTransactionStatusR\x13weightsTransactions\x120\n" +
 	"\x05lanes\x18\f \x03(\v2\x1a.cozy.worker.v1.DeviceLaneR\x05lanes\x12%\n" +
-	"\x0eheld_manifests\x18\r \x03(\tR\rheldManifests\"\xb1\x01\n" +
+	"\x0eheld_manifests\x18\r \x03(\tR\rheldManifests\"\xed\x01\n" +
 	"\x10HostSnapshotBody\x12@\n" +
 	"\rheld_outcomes\x18\x01 \x03(\v2\x1b.cozy.worker.v1.HeldAttemptR\fheldOutcomes\x12[\n" +
-	"\x14weights_transactions\x18\x02 \x03(\v2(.cozy.worker.v1.WeightsTransactionStatusR\x13weightsTransactions\"\x95\x02\n" +
+	"\x14weights_transactions\x18\x02 \x03(\v2(.cozy.worker.v1.WeightsTransactionStatusR\x13weightsTransactions\x12:\n" +
+	"\x19retained_desired_revision\x18\x03 \x01(\x04R\x17retainedDesiredRevision\"\x95\x02\n" +
 	"\vSnapshotAck\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
 	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +

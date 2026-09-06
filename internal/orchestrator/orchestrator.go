@@ -494,7 +494,7 @@ type Orchestrator struct {
 	transferProgressSeq  map[string]uint64
 	sourcePrepareReplies map[string]uint64
 	sourcePrepareBlocked map[string]sourcePreparationBackoff
-	checkpointUploads        map[string]*checkpointUpload
+	checkpointUploads    map[string]*checkpointUpload
 	// localTransfers is command-scoped, lossy progress over Creator's durable request
 	// row and sealed revision. A restart simply replays exact chunks from those authorities.
 	localTransfers map[string]*localTransfer
@@ -539,7 +539,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		transferProgressSeq:  make(map[string]uint64),
 		sourcePrepareReplies: make(map[string]uint64),
 		sourcePrepareBlocked: make(map[string]sourcePreparationBackoff),
-		checkpointUploads:        make(map[string]*checkpointUpload),
+		checkpointUploads:    make(map[string]*checkpointUpload),
 		localTransfers:       make(map[string]*localTransfer),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a
@@ -624,7 +624,7 @@ func (c *Orchestrator) emit(requestID, eventType string, attempt uint64, payload
 	}
 }
 
-// nextRevision mints the Directive revision. The hub owns it; it is monotonic, and a
+// nextRevision mints the Directive revision. The record owner owns it; it is monotonic, and a
 // changed body always carries a new one.
 func (c *Orchestrator) nextRevision() uint64 {
 	c.mu.Lock()

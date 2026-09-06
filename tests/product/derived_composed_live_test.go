@@ -292,13 +292,41 @@ func composedScheduledDerivedCheckpointCustody(t *testing.T, fault string) {
 	select {
 	case raw := <-results:
 		var verified struct {
-			Verified     bool
-			PayloadBytes int64 `json:"payload_bytes"`
+			Verified         bool
+			PayloadBytes     int64          `json:"payload_bytes"`
+			Uploads          map[string]int `json:"uploads"`
+			PriorRevision    uint64         `json:"prior_desired_revision"`
+			RetainedRevision uint64         `json:"retained_desired_revision"`
 		}
 		must(t, json.Unmarshal([]byte(raw), &verified))
 		if !verified.Verified || verified.PayloadBytes != (4<<20)+4096+2048 {
 			t.Fatalf("native post-GC exact payload verification failed: %s", raw)
 		}
+		for id, count := range verified.Uploads {
+			if count != 1 {
+				t.Fatalf("final output mover issued %d PUTs for %s", count, id)
+			}
+			found := false
+			for _, object := range outputs[0].Objects {
+				if object.ObjectID == id {
+					found = true
+					if object.Length >= 4<<20 {
+						t.Fatal("final mover reuploaded the retained data role")
+					}
+				}
+			}
+			if !found {
+				t.Fatal("final mover uploaded outside its exact adopted inventory")
+			}
+		}
+		if len(verified.Uploads) < 2 {
+			t.Fatal("fresh header/Manifest PUT path was not exercised")
+		}
+		if verified.PriorRevision == 0 || verified.RetainedRevision <= verified.PriorRevision {
+			t.Fatal("replacement did not advance the Host's existing revision")
+		}
+		t.Logf("existing Host desired revision advanced %d -> %d", verified.PriorRevision, verified.RetainedRevision)
+		t.Logf("existing final-output mover issued one PUT for each of %d fresh objects", len(verified.Uploads))
 		t.Logf("native ADOPT + GC + current Store lease verified all %d payload bytes", verified.PayloadBytes)
 	case <-time.After(15 * time.Second):
 		t.Fatal("native post-GC verification did not return")

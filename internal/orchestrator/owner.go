@@ -674,6 +674,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	// and reconciled before the same ack; the worker's bytes above are the worker's own.
 	var hostHeld []canonical.Doc
 	var hostWeights []*pb.WeightsTransactionStatus
+	var hostRetainedRevision uint64
 	if len(snap.HostSnapshotCanonicalBytes) > 0 || len(snap.HostSnapshotDigest) > 0 {
 		computed := canonical.Digest(snap.HostSnapshotCanonicalBytes)
 		if !bytes.Equal(computed, snap.HostSnapshotDigest) {
@@ -693,6 +694,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 			return false
 		}
 		hostWeights = typed.WeightsTransactions
+		hostRetainedRevision = typed.RetainedDesiredRevision
 		reconcileHeld(hostHeld, "host-held")
 	}
 	continuations := c.reconcileSnapshotAbsence(w, heldSet)
@@ -701,6 +703,10 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	// ack lands, which is exactly what "dispatch stays closed" looks like on the wire.
 	c.mu.Lock()
 	w.acceptedRevision = uint64(doc.Int("accepted_desired_state_revision"))
+	// The surviving Host may have received a revision the replacement Runtime
+	// has never accepted. Seed only the owner's existing outgoing sequence;
+	// acceptance and convergence remain the Runtime's independent observations.
+	c.revision = max(c.revision, w.acceptedRevision, hostRetainedRevision)
 	w.convergedRevision = uint64(doc.Int("converged_revision"))
 	w.admissionEpoch = uint64(doc.Int("admission_epoch"))
 	w.admission = pb.AdmissionState(doc.Int("admission_state"))
