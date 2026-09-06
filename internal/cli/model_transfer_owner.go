@@ -344,7 +344,7 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	// again once the hub's own declared life is half spent. Nothing about the publication
 	// protocol changed -- the hub always re-minted for a still-claimed object.
 	if opened.Publication.State == "open" {
-		if problem := mover(ctx, weights, operation,
+		if problem := mover(ctx, weights,
 			func(ctx context.Context, objectIDs []string) (orchestrator.WeightsGrantMint, *exit.Error) {
 				return mintWeightsGrants(ctx, publicationClient, ref, operation, intent, objectIDs)
 			}); problem != nil {
