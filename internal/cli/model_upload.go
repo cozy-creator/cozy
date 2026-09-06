@@ -249,6 +249,7 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 		}
 		defaults := []string{"id", "kind", "model", "source"}
 		if invocation != nil {
+			defaults = defaults[1:]
 			defaults = append(defaults, "target", "release", "outputs", "conversion")
 		}
 		defaults = append(defaults, "status", "changed")

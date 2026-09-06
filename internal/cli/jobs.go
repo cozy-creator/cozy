@@ -45,6 +45,9 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
+	if e := launch.ValidatePayload(target.Package, job, input); e != nil {
+		return e
+	}
 	trees, e := parseTrees(ctx.Inv.Values["--input"])
 	if e != nil {
 		return e

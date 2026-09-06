@@ -27,7 +27,7 @@ func runModelCatalog(t *testing.T) (string, *sync.Mutex, *[][]byte, string, []by
 	manifest := []byte(`{"fixture":"small root, not model closure bytes"}`)
 	digest, err := canonical.Spell(canonical.Digest(manifest))
 	must(t, err)
-	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"Source","component_use":{},"path":"quantize.models.dits"},{"class":"Source","component_use":{},"path":"quantize.models.shared"}],"name":"quantize","publishes":false,"request":{"fields":[{"name":"steps","type":{"kind":"int"}}]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"}]}]}`)
+	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"Source","component_use":{},"path":"quantize.models.dits"},{"class":"Source","component_use":{},"path":"quantize.models.shared"}],"name":"quantize","publishes":false,"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"}]}]}`)
 	contract, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
 	var detail hub.PackageReleaseDetail
@@ -83,7 +83,7 @@ func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {
 		{"duplicate profile", append(append([]string{}, base...), "--source-profile", "dits=x/1", "--source-profile", "dits=y/1"), "names slot dits twice"},
 		{"two sources", append(append([]string{}, base[:4]...), append([]string{"model.shared=civitai://123"}, base[5:]...)...), "model_source.multiple_sources_unsupported"},
 		{"mixed inputs", append(append([]string{}, base[:4]...), append([]string{"model.shared=proof/source@1.0.0/bf16"}, base[5:]...)...), "model_source.mixed_inputs_unsupported"},
-		{"unknown model slot", append(append([]string{}, base...), "model.other="+source), "unknown"},
+		{"unknown model slot", append(append(append([]string{}, base[:5]...), "model.other="+source), base[5:]...), "model_slot_unknown"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			code, out := runCozy(t, root, test.args...)
