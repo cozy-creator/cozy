@@ -18,6 +18,14 @@ import (
 // Root-authorized real source release for the composed restart test. It is complete
 // native data, not a placeholder; no H3 release or other fixture pointer is changed.
 func TestPublishRecoverySourceFixture(t *testing.T) {
+	publishRecoverySourceFixture(t, false)
+}
+
+func TestPublishConfiguredRecoverySourceFixture(t *testing.T) {
+	publishRecoverySourceFixture(t, true)
+}
+
+func publishRecoverySourceFixture(t *testing.T, configured bool) {
 	if *publicationHub == "" || *publicationHome == "" || *publicationPython == "" || *publicationModel == "" {
 		t.Skip("requires explicit existing task source fixture destination")
 	}
@@ -33,7 +41,11 @@ func TestPublishRecoverySourceFixture(t *testing.T) {
 	if ref.Org != account.Name {
 		t.Fatal("source fixture must belong to current account")
 	}
-	command := exec.CommandContext(ctx, *publicationPython, "testdata/recovery-source.py", filepath.Join(t.TempDir(), "native"))
+	arguments := []string{"testdata/recovery-source.py", filepath.Join(t.TempDir(), "native")}
+	if configured {
+		arguments = append(arguments, "--configured")
+	}
+	command := exec.CommandContext(ctx, *publicationPython, arguments...)
 	command.Stderr = io.Discard
 	input, err := command.StdinPipe()
 	must(t, err)
@@ -54,7 +66,10 @@ func TestPublishRecoverySourceFixture(t *testing.T) {
 		Objects  []hub.Object `json:"objects"`
 	}
 	must(t, decoder.Decode(&source))
-	const release, lane, operation = "0.0.0-recovery-source.20260906", "native-source", "recovery-source-fixture-20260906"
+	release, lane, operation := "0.0.0-recovery-source.20260906", "native-source", "recovery-source-fixture-20260906"
+	if configured {
+		release, operation = "0.0.0-recovery-source-config.20260906", "recovery-source-config-fixture-20260906"
+	}
 	prior, problem := client.ModelRelease(ctx, ref, release)
 	if problem == nil {
 		if len(prior.Lanes) != 1 || prior.Lanes[0].Lane != lane || prior.Lanes[0].CheckpointID != source.Manifest {

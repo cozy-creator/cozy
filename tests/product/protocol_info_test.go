@@ -1,59 +1,64 @@
-package orchestrator
+package producttest
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"sync/atomic"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-type protocolProbeConnection struct {
-	minor, floor uint32
-	absent       bool
-	calls        []string
-}
-
-func (c *protocolProbeConnection) Invoke(_ context.Context, method string, _ any, reply any, _ ...grpc.CallOption) error {
-	c.calls = append(c.calls, method)
-	if c.absent {
-		return status.Error(codes.Unimplemented, "old peer")
-	}
-	response := reply.(*pb.ProtocolInfoResult)
-	response.WireMinor, response.MinimumWireMinor = c.minor, c.floor
-	return nil
-}
-func (c *protocolProbeConnection) NewStream(context.Context, *grpc.StreamDesc, string, ...grpc.CallOption) (grpc.ClientStream, error) {
-	panic("probe opened an ownership stream")
-}
-
+// Exercise the real owner on pinned TLS: incompatible peers must receive no Claim.
 func TestProtocolRangeProbeHasNoOwnershipSideEffect(t *testing.T) {
-	for _, remote := range []bool{false, true} {
-		for _, row := range []struct {
-			name             string
-			minor, floor     uint32
-			absent, accepted bool
-		}{
-			{"current", pb.WireMinor, pb.MinCompatibleWireMinor, false, true},
-			{"additive", pb.WireMinor + 1, pb.MinCompatibleWireMinor, false, true},
-			{"old", pb.MinCompatibleWireMinor - 1, 1, false, false},
-			{"new hardcut", pb.WireMinor + 1, pb.WireMinor + 1, false, false},
-			{"invalid", 1, 2, false, false}, {"missing", 0, 0, true, false},
-		} {
-			c := &protocolProbeConnection{minor: row.minor, floor: row.floor, absent: row.absent}
-			problem := probeWorkerProtocol(t.Context(), c, remote)
+	for _, row := range []struct {
+		name             string
+		minor, floor     uint32
+		absent, accepted bool
+	}{
+		{"current", pb.WireMinor, pb.MinCompatibleWireMinor, false, true},
+		{"additive", pb.WireMinor + 1, pb.MinCompatibleWireMinor, false, true},
+		{"old", pb.MinCompatibleWireMinor - 1, 1, false, false},
+		{"new hardcut", pb.WireMinor + 1, pb.WireMinor + 1, false, false},
+		{"invalid", 1, 2, false, false}, {"missing", 0, 0, true, false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			public, private, err := ed25519.GenerateKey(rand.Reader)
+			must(t, err)
+			var probes, claims atomic.Int64
+			pod := &fakePod{controlKey: public}
+			pod.protocolInfo = func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+				probes.Add(1)
+				if row.absent {
+					return nil, status.Error(codes.Unimplemented, "old peer")
+				}
+				return &pb.ProtocolInfoResult{WireMinor: row.minor, MinimumWireMinor: row.floor}, nil
+			}
+			pod.onFrame = func(frame *pb.RecordOwnerFrame, _ func(*pb.WorkerFrame) error) (bool, error) {
+				if frame.GetClaim() != nil {
+					claims.Add(1)
+				}
+				return false, nil
+			}
+			connection, _ := startFakePod(t, t.TempDir(), pod)
+			o := hostOwner(t, "protocol-range-"+records.NewID("proof"), rentalWiring(connection, private))
+			_, _, _, problem := o.c.EnsureRental(podRental)
 			if (problem == nil) != row.accepted {
-				t.Fatalf("%s remote=%v: %v", row.name, remote, problem)
+				t.Fatalf("wrong range result: %v", problem)
 			}
-			path := pb.RuntimePreparation_ProtocolInfo_FullMethodName
-			if remote {
-				path = pb.PodHost_ProtocolInfo_FullMethodName
+			if probes.Load() == 0 {
+				t.Fatal("owner skipped read-only probe")
 			}
-			if len(c.calls) != 1 || c.calls[0] != path {
-				t.Fatalf("probe mutated or reached wrong service: %v", c.calls)
+			if row.accepted && claims.Load() != 1 {
+				t.Fatalf("compatible peer received %d claims", claims.Load())
 			}
-		}
+			if !row.accepted && claims.Load() != 0 {
+				t.Fatal("incompatible peer received ownership mutation")
+			}
+		})
 	}
 }

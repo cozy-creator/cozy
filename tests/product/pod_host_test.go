@@ -61,6 +61,7 @@ type fakePod struct {
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
 	sourceRuntime pb.RuntimePreparationClient
 	weightsReady  func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
+	protocolInfo  func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
 	pb.UnimplementedWorkerControlServer
 	pb.UnimplementedPodHostServer
 	controlKey ed25519.PublicKey
@@ -118,7 +119,10 @@ type fakePod struct {
 	jobDirectives  []*pb.JobDirective
 }
 
-func (p *fakePod) ProtocolInfo(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+func (p *fakePod) ProtocolInfo(ctx context.Context, request *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+	if p.protocolInfo != nil {
+		return p.protocolInfo(ctx, request)
+	}
 	version := p.wireMinor
 	if version == 0 {
 		version = pb.WireMinor
