@@ -15,7 +15,7 @@ const MaxWeightsGrantURLBytes = 16 << 10
 // scripts/fence.py convicts any content-bearing bound declared above it.
 const MaxInlineControlBytes = 4 << 20
 const MaxModelSourceHeaderBytes = MaxInlineControlBytes
-const MaxSourceCheckpointObjects = 128
+const MaxCheckpointObjects = 128
 const MaxModelSourceFiles = 4096
 const MaxModelSourceProfiles = 16
 const MaxModelSourceMemberBytes = 1024
