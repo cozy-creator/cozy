@@ -254,6 +254,7 @@ With Tensorhub configured, rent generic private capacity:
 ```sh
 cozy rental new                    # Cozy GPUs, VRAM, and retail hourly prices
 cozy rental new h200                # prints e.g. otter
+cozy rental new h200 --model paul/minimax-h3@1.0.0/bf16
 cozy rental new h200 \
   --idempotency-key <unique-key>
 
@@ -270,6 +271,12 @@ rental. Both modes remain under the configured fleet ceiling. Creator names ever
 with one memorable word, unique among this host's live rentals (a released word is drawn again);
 Tensorhub's identity for it is its `pr-…` id, which is what the provider-side pod is named after.
 The name carries no workload facts.
+
+Use `--model org/model@release/lane` to size a manual rental for known checkpoints; repeat
+`--model` for several models. Creator resolves and pins each manifest, and Tensorhub measures
+their shared object closure and required disk headroom. This declares capacity needs; packages
+and models are prepared when requests run. Retrying the same idempotency key reuses the pinned
+set, including when `--model` is omitted on the retry.
 
 Every rental the daemon owns — bought for a request or started with `cozy rental new` — ends on
 its own once nothing has been queued, running, or owed on it for `rentals.idle_release_s`
