@@ -499,7 +499,27 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		w := c.workers[rentalInstanceID(req.Worker)]
 		older := w != nil && !w.supportsCurrentProtocol()
 		c.mu.Unlock()
+		reason := ""
 		if older {
+			reason = ExcludedProtocol
+		} else {
+			row, problem := c.opt.Store.RentalRow(req.Worker)
+			if problem != nil {
+				c.logf("%s cannot assess pinned rental: %s", req.ID, problem.Message)
+				return
+			}
+			if row != nil {
+				spent, problem := RentalSpent(c.opt.Store, *row)
+				if problem != nil {
+					c.logf("%s cannot assess pinned rental purpose: %s", req.ID, problem.Message)
+					return
+				}
+				if spent {
+					reason = ExcludedSpent
+				}
+			}
+		}
+		if reason != "" {
 			attempts, problem := c.opt.Store.Attempts(req.ID)
 			if problem != nil || len(attempts) != 0 {
 				return
@@ -508,7 +528,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			if problem != nil || !unpinned {
 				return
 			}
-			c.logf("%s replans queued work from rental %s: %s", req.ID, req.Worker, ExcludedProtocol)
+			c.logf("%s replans queued work from rental %s: %s", req.ID, req.Worker, reason)
 			req.Worker = ""
 		}
 	}

@@ -148,6 +148,7 @@ type ModelTransferOwner interface {
 	MaterializeLocal(context.Context, string, records.ModelTransferIntent) ([]ModelRef, *exit.Error)
 	RefreshRemoteSource(context.Context, records.ModelTransferIntent) ([]ModelSourceCapability, *exit.Error)
 	Finalize(context.Context, string, ModelTransferMover) *exit.Error
+	AbandonModelTransferPublications(context.Context, string) *exit.Error
 	PassThrough(context.Context, string, records.ModelTransferIntent) *exit.Error
 	SyncSourceCheckpoints(context.Context, string, SourceCheckpointHost) *exit.Error
 	RestoreSourceCheckpoints(context.Context, string, SourceCheckpointHost) *exit.Error
@@ -155,7 +156,7 @@ type ModelTransferOwner interface {
 }
 
 type ModelTransferMover func(context.Context, records.ModelTransferWeights,
-	string, WeightsGrantMinter) *exit.Error
+	WeightsGrantMinter) *exit.Error
 
 // Launcher resolves a package ref along the two boundaries #484 split: the
 // platform-neutral desired placement and the local target-environment launch. A connected
@@ -326,6 +327,8 @@ type RentalExclusion struct {
 const (
 	// ExcludedProtocol: new directives use the current generated wire contract.
 	ExcludedProtocol = "protocol_unsupported"
+	// ExcludedSpent: a completed managed job rental is retained custody, not capacity.
+	ExcludedSpent = "managed_job_spent"
 	// ExcludedModeConflict: the rental's worker already holds the other half of the
 	// `oneof mode` — a job where a serving set is wanted, or the reverse. This is the
 	// one that read as waste live: a `ready` pod with no running work, which a

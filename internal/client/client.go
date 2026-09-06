@@ -296,6 +296,13 @@ func (c *Client) Job(id string) (api.JobState, *exit.Error) {
 	return state, e
 }
 
+// RetryJobPublication retries only destination retention of an already successful producer.
+func (c *Client) RetryJobPublication(id, actor string) (api.JobState, *exit.Error) {
+	var state api.JobState
+	problem := c.call("POST", "/v1/local/jobs/"+id+"/retry-publication", map[string]string{"actor": actor}, &state)
+	return state, problem
+}
+
 // CancelJob REQUESTS cancellation. A running job's own journaled terminal settles it; a
 // queued one leaves the queue and settles here. The actor names who is canceling.
 func (c *Client) CancelJob(id, actor string) *exit.Error {

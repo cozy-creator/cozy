@@ -31,7 +31,7 @@ func (c *Orchestrator) awaitSourceInputCustody(req records.Request, bootID strin
 		if transfer.State == "failed" {
 			return exit.Named(exit.Failed, transfer.ErrorCode, "%s", transfer.SafeError)
 		}
-		if transfer.State == "canceled" || current.State == "canceled" {
+		if transfer.State == "canceling" || transfer.State == "canceled" || current.State == "canceled" {
 			return exit.New(exit.Canceled, "model transfer %s was canceled", req.ID)
 		}
 		session, problem := c.rentalControl(req.Worker)
@@ -124,7 +124,7 @@ func (c *Orchestrator) kickSourceCheckpointUpload(requestID string) {
 			if problem != nil && !closing {
 				if permanentTransferFailure(problem) && problem.ErrName() != "model_transfer.source_checkpoint_superseded" {
 					transfer, _ := c.opt.Store.ModelTransferOf(requestID)
-					if transfer != nil && transfer.State != "completed" && transfer.State != "canceled" {
+					if transfer != nil && transfer.State != "completed" && transfer.State != "canceling" && transfer.State != "canceled" {
 						_ = c.opt.Store.FailModelTransfer(requestID, problem.ErrName(), problem.Message)
 						c.signalTransfer(requestID)
 					}
@@ -148,7 +148,7 @@ func (c *Orchestrator) syncSourceCheckpoint(ctx context.Context, requestID strin
 	if !transfer.HasAcquisition() {
 		return nil
 	}
-	if transfer.State == "completed" || transfer.State == "canceled" {
+	if transfer.State == "completed" || transfer.State == "canceled" || transfer.State == "canceling" {
 		return c.opt.ModelTransfers.ReleaseSourceCheckpoints(ctx, requestID)
 	}
 	if transfer.State == "failed" {
