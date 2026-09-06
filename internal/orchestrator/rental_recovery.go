@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"time"
+
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -238,11 +240,47 @@ func (c *Orchestrator) resumeManualRentals() *exit.Error {
 		if row.ManagedRequestID != "" || !records.RentalReadyState(row.State) {
 			continue
 		}
-		go func(id string) {
-			if _, _, _, problem := c.EnsureRental(id); problem != nil {
-				c.logf("rental %s control reattachment deferred: %s", id, problem.Message)
-			}
-		}(row.ID)
+		go c.resumeManualRental(row.ID)
 	}
 	return nil
+}
+
+func (c *Orchestrator) resumeManualRental(id string) {
+	for {
+		c.mu.Lock()
+		closing := c.closing
+		c.mu.Unlock()
+		if closing {
+			return
+		}
+		row, problem := c.opt.Store.RentalRow(id)
+		if problem != nil {
+			c.logf("rental %s control reattachment cannot read ownership: %s", id, problem.Message)
+			return
+		}
+		if row == nil || row.ManagedRequestID != "" || !records.RentalReadyState(row.State) {
+			return
+		}
+		if _, _, _, problem = c.EnsureRental(id); problem == nil {
+			return
+		}
+		c.logf("rental %s control reattachment refused: %s", id, problem.Message)
+		if problem.Code != exit.Unavailable {
+			return
+		}
+		c.mu.Lock()
+		worker := c.workers[rentalInstanceID(id)]
+		connecting := worker != nil && !worker.exited && !worker.stopping
+		c.mu.Unlock()
+		if connecting {
+			return // the existing connection loop owns transport recovery
+		}
+		timer := time.NewTimer(ReportCadence)
+		select {
+		case <-c.done:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/mediawire"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
@@ -34,6 +35,12 @@ import (
 // empty canonical snapshot. The actual daemon must claim it again after process
 // replacement without any request, package, or explicit second claim call.
 func TestIdleManualRentalReclaimsAfterDaemonRestart(t *testing.T) {
+	for _, mode := range []string{"healthy", "attached", "weather", "released", "closed", "permanent"} {
+		t.Run(mode, func(t *testing.T) { proveIdleManualRentalRestart(t, mode) })
+	}
+}
+
+func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	root := t.TempDir()
 	layout, problem := home.Open(root)
 	fatal(t, problem)
@@ -104,10 +111,22 @@ func TestIdleManualRentalReclaimsAfterDaemonRestart(t *testing.T) {
 	pb.RegisterWorkerControlServer(control, pod)
 	go func() { _ = control.Serve(listener) }()
 	defer control.Stop()
+	var mediaUnavailable atomic.Bool
+	var healthCalls atomic.Int64
 	media := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/health" {
 			t.Errorf("unexpected media request %s", r.URL.Path)
 			w.WriteHeader(404)
+			return
+		}
+		healthCalls.Add(1)
+		if mediaUnavailable.Load() {
+			if mode == "permanent" {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"error":{"code":"proof.owner_refused","message":"fixed credential refusal"}}`))
+			} else {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}
 			return
 		}
 		revision := mediawire.ContractRev
@@ -134,6 +153,9 @@ func TestIdleManualRentalReclaimsAfterDaemonRestart(t *testing.T) {
 	row := records.Rental{ID: podRental, State: "ready", Hub: hub.URL, MachineName: "manual-empty",
 		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, Address: listener.Addr().String(), MediaAddress: strings.TrimPrefix(media.URL, "https://"),
 		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}
+	if mode == "attached" {
+		row.State = "attached"
+	}
 	fatal(t, rental.Attach(layout, store, row, string(cert), token, identity))
 	before, problem := store.RentalRow(podRental)
 	fatal(t, problem)
@@ -170,11 +192,43 @@ func TestIdleManualRentalReclaimsAfterDaemonRestart(t *testing.T) {
 		fatal(t, rental.Attach(layout, store, excluded, string(cert), token, identity))
 	}
 	stop(first)
+	priorHealth := healthCalls.Load()
+	mediaUnavailable.Store(mode != "healthy" && mode != "attached")
 	second := startDaemonProcess(t, root)
-	waitUntil(t, "restarted daemon claims idle manual rental without a request", func() bool { mu.Lock(); defer mu.Unlock(); return len(acknowledged) == 2 })
+	waitUntil(t, "startup attempts the retained media endpoint", func() bool { return healthCalls.Load() > priorHealth })
+	expectedClaims := 2
+	if mode == "permanent" {
+		expectedClaims = 1
+	}
+	if mode == "released" {
+		released, problem := store.RentalRow(podRental)
+		fatal(t, problem)
+		released.State = "release_requested"
+		fatal(t, store.RecordRental(*released))
+		expectedClaims = 1
+	}
+	if mode == "closed" {
+		stop(second)
+		expectedClaims = 1
+	}
+	mediaUnavailable.Store(false)
+	if expectedClaims == 2 {
+		waitUntil(t, "restarted daemon claims idle manual rental without a request", func() bool { mu.Lock(); defer mu.Unlock(); return len(acknowledged) == 2 })
+	} else {
+		// Cross the actual startup retry cadence after its authority was removed.
+		time.Sleep(orchestrator.ReportCadence + 200*time.Millisecond)
+	}
+	if expectedClaims == 1 && healthCalls.Load() != priorHealth+1 {
+		t.Fatal("startup retried after its ownership, process, or credential authority ended")
+	}
 	mu.Lock()
-	if len(claims) != 2 || claims[1] != claims[0] || sequence != 2 || acknowledged[0] != claims[0] || acknowledged[1] != claims[1] {
+	if len(claims) != expectedClaims || len(acknowledged) != expectedClaims || sequence != uint64(expectedClaims) {
 		t.Fatalf("owner/stream restart identities: claims=%v acknowledgements=%v", claims, acknowledged)
+	}
+	for i := range claims {
+		if claims[i] != claims[0] || acknowledged[i] != claims[i] {
+			t.Fatal("the retained owner identity changed")
+		}
 	}
 	mu.Unlock()
 	pod.mu.Lock()
@@ -193,5 +247,7 @@ func TestIdleManualRentalReclaimsAfterDaemonRestart(t *testing.T) {
 	if !bytes.Equal(keyBefore, keyAfter) || mutations.Load() != 0 {
 		t.Fatal("restart changed the key or submitted a paid mutation")
 	}
-	stop(second)
+	if mode != "closed" {
+		stop(second)
+	}
 }
