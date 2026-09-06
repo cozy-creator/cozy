@@ -165,6 +165,25 @@ type CheckpointPublication struct {
 	Duplicate    bool        `json:"duplicate"`
 }
 
+// RemoveCheckpoint removes one retained, unreleased checkpoint through the
+// model's existing custody API. Referencing releases must be withdrawn first.
+func (c *Client) RemoveCheckpoint(ctx context.Context, ref Ref, checkpointID, reason string) *exit.Error {
+	var out struct {
+		CheckpointID     string `json:"checkpoint_id"`
+		RepositorySHA256 string `json:"repository_sha256"`
+		Removed          bool   `json:"removed"`
+	}
+	if problem := c.do(ctx, call{method: http.MethodDelete, auth: true, reason: reason,
+		path:   "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + url.PathEscape(checkpointID),
+		strict: true}, &out); problem != nil {
+		return problem
+	}
+	if out.CheckpointID != checkpointID || !out.Removed {
+		return exit.Internalf("Tensorhub did not remove the requested checkpoint")
+	}
+	return nil
+}
+
 func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation string,
 	request FinalizePublicationRequest, reason string,
 ) (CheckpointPublication, *exit.Error) {

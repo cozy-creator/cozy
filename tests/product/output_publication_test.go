@@ -61,6 +61,12 @@ func TestOutputPublicationKeepsSelectedInputs(t *testing.T) {
 		request.Models[1].Manifest != sub.Models[1].Manifest {
 		t.Fatalf("publication changed the selected generic inputs: %+v", request.Models)
 	}
+	replay, problem := o.store.RequestByIdempotencyKey(sub.IdemKey)
+	fatal(t, problem)
+	if replay == nil || len(replay.Models) != 2 || replay.Models[0].Manifest != sub.Models[0].Manifest ||
+		replay.Models[1].Manifest != sub.Models[1].Manifest {
+		t.Fatal("the idempotent replay path lost the original generic model selection")
+	}
 	transfer, problem := o.store.ModelTransferOf(requestID)
 	fatal(t, problem)
 	if transfer.State != "pending" || len(transfer.Models) != 0 || transfer.HasAcquisition() {
