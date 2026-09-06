@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,15 +24,18 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/cozy-creator/cozy/internal/accountauth"
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	cozyweb "github.com/cozy-creator/cozy/web"
 )
 
 var publicationHub = flag.String("publication-hub", "", "live Tensorhub for the explicit tiny publication proof")
@@ -271,10 +275,28 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 				if current.State != "finalizing" || releases.Load() != 0 {
 					t.Fatal("restart discarded blocked output custody")
 				}
+				// The replacement peer's canonical empty snapshot compacts this old
+				// attempt. Its unbanked successful publication must remain actionable.
+				for until := time.Now().Add(5 * time.Second); ; {
+					attempt, problem := store.AttemptRow(requestID, 1)
+					fatal(t, problem)
+					if attempt.State == "closed" {
+						break
+					}
+					if time.Now().After(until) {
+						t.Fatal("replacement snapshot did not close the retained attempt")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				stopAPI := publicationControlAPI(t, o)
+				defer stopAPI()
+				verb := "retry-publication"
 				if *publicationCancel {
-					fatal(t, controller.CancelModelTransferFinalization(requestID, "actual native cancel proof"))
-				} else {
-					fatal(t, controller.RetryModelTransferPublication(requestID, "actual native retry proof"))
+					verb = "cancel"
+				}
+				code, output := runCozy(t, o.root, "run", verb, requestID, "--json")
+				if code != 0 {
+					t.Fatalf("public CLI %s failed [%d]: %s", verb, code, output)
 				}
 				after, problem := store.AllModelTransferWeights(requestID, 1)
 				fatal(t, problem)
@@ -385,4 +407,24 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 	}
 	t.Logf("native receipt, upload, Hub readback and finalization passed: %s %s; owner records %s",
 		destination, digest, filepath.Join(o.root, "creator.sqlite"))
+}
+
+// Expose the existing owner through the ordinary authenticated API/daemon record so
+// the built CLI exercises the actual public recovery control, including closed attempts.
+func publicationControlAPI(t *testing.T, o *owner) func() {
+	t.Helper()
+	v4, v6, addr, problem := api.Listeners(0)
+	fatal(t, problem)
+	if v6 != nil {
+		_ = v6.Close()
+	}
+	held, problem := daemon.Hold(o.l, addr, "")
+	fatal(t, problem)
+	creds, problem := api.Mint(o.l)
+	fatal(t, problem)
+	handler, problem := api.New(api.Options{Orchestrator: o.c, Cfg: o.cfg, Creds: creds, Addr: addr, Web: cozyweb.Handler()}).Handler()
+	fatal(t, problem)
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = server.Serve(v4) }()
+	return func() { _ = server.Close(); held.Release() }
 }

@@ -924,6 +924,17 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	last := attempts[len(attempts)-1]
+	if row.ModelTransfer != nil && row.State == "finalizing" {
+		if e := s.orchestrator.CancelModelTransferFinalization(row.ID, actor); e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		s.ok(w, r, http.StatusAccepted, map[string]any{
+			"job_id": row.ID, "attempt": last.Attempt, "status": "cancel_requested",
+			"note": "destination finalization is stopping; provider teardown precedes the canceled terminal",
+		})
+		return
+	}
 	if last.State == "closed" || last.State == "dispatch_aborted" {
 		if e := s.orchestrator.CancelQueued(row.ID, actor); e != nil {
 			s.refuseTyped(w, r, e)
@@ -939,17 +950,6 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if last.State == "terminal" {
-		if row.ModelTransfer != nil && row.State == "finalizing" {
-			if e := s.orchestrator.CancelModelTransferFinalization(row.ID, actor); e != nil {
-				s.refuseTyped(w, r, e)
-				return
-			}
-			s.ok(w, r, http.StatusAccepted, map[string]any{
-				"job_id": row.ID, "attempt": last.Attempt, "status": "cancel_requested",
-				"note": "destination finalization is stopping; provider teardown precedes the canceled terminal",
-			})
-			return
-		}
 		s.refuse(w, r, http.StatusConflict, "terminal_ack_pending",
 			"the current job attempt has a terminal whose retry/settlement projection is not acknowledged yet",
 			"retry cancellation after the terminal ack")

@@ -266,6 +266,7 @@ URLs but remain local-scope rows in the same guarded route table.
 | `POST /v1/local/daemon/down` | local | yes | safe down fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
+| `POST /v1/local/jobs/{id}/retry-publication` | local | yes | retry failed output publication using the retained successful attempt and receipts; never rerun the producer |
 | `POST /v1/local/jobs/{id}/cancel` | local | yes | request cancellation; a queued job leaves the queue, a running one gets its terminal |
 | `GET /{$}` | local | no | embedded localhost web UI entrypoint |
 | `GET /app.css` | local | no | embedded localhost web UI stylesheet |
@@ -312,6 +313,16 @@ rental. Exact manifest lengths are metadata sizes and cannot size the input clos
 the producer's output working set, so this form does not purchase a new rental. A normal
 source-transfer intent still declares its source and selection, profile bindings and
 inspected headers, and uses the existing source preparation and checkpoint-custody path.
+
+A successful model producer remains `finalizing` while output publication is incomplete,
+including after an upload failure. Its receipts, worker custody and rental remain held;
+no outcome acknowledgement or automatic rental release occurs before publication succeeds
+or explicit cancellation finishes cleanup. `cozy run retry-publication <job>` (or the
+retry-publication route with an optional `actor`) retries the failed publication with the
+same request, attempt, receipts and per-object transfer identities. It does not rerun the
+producer. `cozy run cancel <job>` abandons unfinished destination holds and then settles
+cancellation; already completed checkpoints remain published. Both decisions survive a
+daemon restart. A failed request from an older build is not silently resurrected.
 
 `queue_position` and `queue_depth` are one atomic orchestrator scheduling snapshot;
 `requeues`/`retry_budget` are the record owner's durable-attempt facts. Several jobs submitted at once queue against one

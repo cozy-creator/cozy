@@ -11,5 +11,5 @@ func handleRunRetryPublication(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	return emit(ctx, compactRecord(jobFields(ctx.Mode(), state, true), "job", "status", "model_transfer"))
+	return emit(ctx, compactRecord(jobFields(ctx.Mode(), state, true), "job", "status"))
 }
