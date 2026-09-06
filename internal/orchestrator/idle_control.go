@@ -46,20 +46,20 @@ func DialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 	}()
 	stream, err := pb.NewWorkerControlClient(conn).Control(ctx)
 	if err != nil {
-		return nil, exit.Unavailablef("operator control control stream is unavailable")
+		return nil, idleControlEnd(err)
 	}
 	claim := &pb.Claim{RecordOwnerEpoch: recordOwnerEpoch, RecordOwnerId: recordOwnerID, WorkerId: remote.WorkerID, WorkerBootId: remote.WorkerBootID, WireMinor: pb.WireMinor, Proof: proof}
 	if err = stream.Send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_Claim{Claim: claim}}); err != nil {
-		return nil, exit.Unavailablef("operator control claim could not be sent")
+		return nil, idleControlEnd(err)
 	}
 	var epoch uint64
 	for {
 		frame, err := stream.Recv()
 		if err != nil {
-			return nil, exit.Unavailablef("operator control control ended before its snapshot")
+			return nil, idleControlEnd(err)
 		}
 		if proto.Size(frame) > pb.MaxInlineControlBytes {
-			return nil, exit.New(exit.Structural, "operator control control frame exceeds its bound")
+			return nil, exit.New(exit.Structural, "operator control frame exceeds its bound")
 		}
 		switch message := frame.Msg.(type) {
 		case *pb.WorkerFrame_ClaimAck:
@@ -97,6 +97,13 @@ func DialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 			return nil, exit.New(exit.Structural, "operator control expected ClaimAck and WorkerSnapshot")
 		}
 	}
+}
+
+func idleControlEnd(err error) *exit.Error {
+	if classifyPrepareEnd(err).err != nil {
+		return exit.Unavailablef("operator control is unavailable before its idle snapshot")
+	}
+	return exit.New(exit.Conflict, "operator control refused the fixed rental Claim")
 }
 
 func validateIdleSnapshot(snap *pb.WorkerSnapshot) *exit.Error {

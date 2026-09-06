@@ -40,6 +40,7 @@ type idleHoldPeer struct {
 	epoch                uint64
 	workerID, bootID     string
 	workerBusy, hostBusy bool
+	deny                 codes.Code
 	claims               atomic.Int64
 	otherFrames          atomic.Int64
 }
@@ -59,6 +60,9 @@ func (p *idleHoldPeer) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFra
 		return status.Error(codes.Unauthenticated, "Claim identity mismatch")
 	}
 	p.claims.Add(1)
+	if p.deny != codes.OK {
+		return status.Error(p.deny, "controlled fixed Claim refusal")
+	}
 	if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: &pb.ClaimAck{
 		Accepted: true, RecordOwnerEpoch: claim.RecordOwnerEpoch, ControlStreamEpoch: p.epoch,
 		WorkerId: p.workerID, WorkerBootId: p.bootID, WireMinor: pb.WireMinor,
@@ -272,6 +276,27 @@ func TestDevelopmentHoldRefusesOpenWorkAndHeldOutcomes(t *testing.T) {
 			if kind == "local-open" && f.peer.claims.Load() != 0 {
 				t.Fatal("local open attempt reached remote Claim")
 			}
+		})
+	}
+}
+
+func TestDevelopmentHoldDoesNotRetryPermanentClaimRefusal(t *testing.T) {
+	for _, code := range []codes.Code{codes.Unauthenticated, codes.PermissionDenied, codes.FailedPrecondition} {
+		t.Run(code.String(), func(t *testing.T) {
+			f := developmentFixtureAt(t)
+			f.peer.deny = code
+			address, stop := serveIdleHoldPeer(t, f.peer, f.cert, "127.0.0.1:0")
+			defer stop()
+			f.attach(t, address)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			problem := cli.HoldStoredDevelopmentWorker(ctx, f.cfg, f.rentalID, f.peer.bootID, io.Discard, nil)
+			if problem == nil || problem.Code != exit.Conflict || f.peer.claims.Load() != 1 {
+				t.Fatalf("fixed Claim denial was retried or ignored: problem=%v claims=%d", problem, f.peer.claims.Load())
+			}
+			lock, problem := daemon.Hold(f.layout, "", "")
+			fatal(t, problem)
+			lock.Release()
 		})
 	}
 }
