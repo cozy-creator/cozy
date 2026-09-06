@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 	"unicode"
@@ -112,6 +113,36 @@ func scanRentalOperation(row interface{ Scan(...any) error }) (RentalOperation, 
 	return op, err
 }
 
+// ManagedRentalOperationKey reuses a paid acquisition until the Hub has proved
+// it released. Replacement work keeps its original request identity while the
+// next paid operation gets its own key. History remains in rental_operations.
+func (s *Store) ManagedRentalOperationKey(requestID string) (string, *exit.Error) {
+	key, _, problem := managedRentalOperationKey(s.db, requestID)
+	return key, problem
+}
+
+func managedRentalOperationKey(q interface {
+	QueryRow(string, ...any) *sql.Row
+}, requestID string) (string, bool, *exit.Error) {
+	if requestID == "" {
+		return "", false, exit.New(exit.Validation, "managed rental requires its original request")
+	}
+	var key, state string
+	var count int64
+	err := q.QueryRow(`SELECT operation_key,state,COUNT(*) OVER () FROM rental_operations
+		WHERE managed_request_id=? ORDER BY rowid DESC LIMIT 1`, requestID).Scan(&key, &state, &count)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "managed-rental-" + requestID, false, nil
+	}
+	if err != nil {
+		return "", false, exit.Internalf("cannot read managed rental history: %s", err)
+	}
+	if state != "released" {
+		return key, true, nil
+	}
+	return fmt.Sprintf("managed-rental-%s-%d", requestID, count+1), true, nil
+}
+
 // RentalRequestAuthor renders the exact request bytes, and their digest, under the machine
 // name the store reserved for a new operation.
 type RentalRequestAuthor func(machineName string) (body []byte, digest string, problem *exit.Error)
@@ -134,6 +165,16 @@ func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros, stor
 		return RentalOperation{}, false, exit.Internalf("cannot begin rental operation: %s", err)
 	}
 	defer tx.Rollback()
+	if op.ManagedRequestID != "" {
+		key, prior, problem := managedRentalOperationKey(tx, op.ManagedRequestID)
+		if problem != nil {
+			return RentalOperation{}, false, problem
+		}
+		if prior && key != op.Key {
+			return RentalOperation{}, false, exit.Named(exit.Unavailable, "rental.operation_superseded",
+				"managed rental selection changed before its paid operation was recorded; retry")
+		}
+	}
 	stored, err := scanRentalOperation(tx.QueryRow(
 		`SELECT `+rentalOperationCols+` FROM rental_operations WHERE operation_key=?`, op.Key))
 	if err == nil {
