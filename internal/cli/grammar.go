@@ -212,6 +212,7 @@ type ModelDownloadCmd struct {
 	RentalOnly     bool     `help:"Require a remote rental instead of local capacity."`
 	DryRun         bool     `help:"Resolve the exact transfer plan without moving bodies or spending."`
 	Await          bool     `help:"Watch the accepted run until it settles."`
+	IdempotencyKey string   `help:"Stable request identity for exact replay; otherwise start a new run."`
 }
 
 func (c *ModelDownloadCmd) Run(r *Runtime) error {
@@ -219,7 +220,7 @@ func (c *ModelDownloadCmd) Run(r *Runtime) error {
 		"--rental", c.Rental, "--rental-only", c.RentalOnly,
 		"--dry-run", c.DryRun, "--await", c.Await),
 		values("--producer", c.Producer, "--lane", c.Lane,
-			"--source-profile", c.SourceProfiles), false)
+			"--source-profile", c.SourceProfiles, "--idempotency-key", c.IdempotencyKey), false)
 }
 
 type ModelRemoveCmd struct {
@@ -252,6 +253,7 @@ type ModelUploadCmd struct {
 	RentalOnly     bool     `help:"Require a remote rental instead of local capacity."`
 	DryRun         bool     `help:"Resolve the exact transfer plan without moving bodies or spending."`
 	Await          bool     `help:"Watch the accepted run until it settles."`
+	IdempotencyKey string   `help:"Stable request identity for exact replay; otherwise start a new run."`
 }
 
 func (c *ModelUploadCmd) Run(r *Runtime) error {
@@ -259,7 +261,7 @@ func (c *ModelUploadCmd) Run(r *Runtime) error {
 		"--rental", c.Rental, "--rental-only", c.RentalOnly,
 		"--dry-run", c.DryRun, "--await", c.Await),
 		values("--producer", c.Producer, "--lane", c.Lane,
-			"--source-profile", c.SourceProfiles), false)
+			"--source-profile", c.SourceProfiles, "--idempotency-key", c.IdempotencyKey), false)
 }
 
 type ModelPublishCmd struct {

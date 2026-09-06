@@ -57,10 +57,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
-	key := ctx.Inv.Value("--idempotency-key")
-	if key == "" {
-		key = mintKey()
-	}
+	key := requestKey(ctx.Inv.Value("--idempotency-key"))
 	began := time.Now()
 	handle, e := c.SubmitJob(api.JobSubmission{
 		Package: target.Package, Function: target.Function, Input: input,
