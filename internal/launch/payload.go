@@ -416,6 +416,18 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 				"request field %s has an unreadable union", path)
 		}
 		for _, branch := range branches {
+			// Tagged unions carry the discriminator name once on the union and
+			// its value on each struct branch. Pass both to the existing struct
+			// validator instead of treating the tag as an undeclared payload field.
+			if tagField := schema["tag_field"]; tagField != nil {
+				var tagged map[string]json.RawMessage
+				if json.Unmarshal(branch, &tagged) != nil || tagged == nil {
+					return exit.Named(exit.Structural, "package_interface_type_unknown",
+						"request field %s has an unreadable tagged branch", path)
+				}
+				tagged["tag_field"] = tagField
+				branch, _ = json.Marshal(tagged)
+			}
 			var found []string
 			if validateRenderedInto(branch, value, path, &found) == nil {
 				if assets != nil {
@@ -449,6 +461,14 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 		if !ok {
 			return exit.New(exit.Validation, "request field %s is not an object", path)
 		}
+		if nested.TagField != "" {
+			value, present := object[nested.TagField]
+			// Reuse literal validation for string and integer discriminator values.
+			tagType, _ := json.Marshal(map[string][]json.RawMessage{"literal": {nested.Tag}})
+			if !present || validateRenderedInto(tagType, value, path+"."+nested.TagField, nil) != nil {
+				return exit.New(exit.Validation, "request field %s has an absent or incorrect %s tag", path, nested.TagField)
+			}
+		}
 		declared := map[string]Field{}
 		for _, field := range nested.Fields {
 			declared[field.Name] = field
@@ -459,6 +479,9 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 			}
 		}
 		for name, element := range object {
+			if name == nested.TagField {
+				continue
+			}
 			field, ok := declared[name]
 			if !ok {
 				return exit.New(exit.Validation, "request field %s declares no nested field %q", path, name)
