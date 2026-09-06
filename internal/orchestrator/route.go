@@ -316,7 +316,7 @@ func (w *worker) laneKeys() []laneKey {
 // rental B are two placements, each presented that rental's own credential — matching on
 // the plan id alone once sent a request to a pod whose credential it never presented.
 func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) (string, bool) {
-	if w.exited || w.stopping || c.sessions[w.bootID] == nil {
+	if w.exited || w.stopping || !w.supportsCurrentProtocol() || c.sessions[w.bootID] == nil {
 		return "", false
 	}
 	if w.spec.Connection == nil {

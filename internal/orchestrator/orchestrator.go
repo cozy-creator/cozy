@@ -365,7 +365,7 @@ func (c *Orchestrator) ModeCompatibleRentalsWithExclusions(ids []string, job boo
 	var excluded []RentalExclusion
 	for _, id := range ids {
 		w := c.workers[rentalInstanceID(id)]
-		if w != nil && w.declaredInstance != "" && w.wireMinor < pb.WireMinor {
+		if w != nil && !w.supportsCurrentProtocol() {
 			excluded = append(excluded, RentalExclusion{RentalID: id, Reason: ExcludedProtocol})
 			continue
 		}

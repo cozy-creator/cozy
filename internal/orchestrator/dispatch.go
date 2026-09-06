@@ -765,7 +765,7 @@ func requestSlot(req records.Request) string {
 // has room, so the request waits unpinned. Callers hold c.mu.
 func (c *Orchestrator) rentalHeld(req records.Request) bool {
 	for _, w := range c.workers {
-		if w.exited || w.stopping || w.spec.IsJob() != req.IsJob() ||
+		if w.exited || w.stopping || !w.supportsCurrentProtocol() || w.spec.IsJob() != req.IsJob() ||
 			retirementGround(w) != "" || w.spec.Connection == nil {
 			continue
 		}

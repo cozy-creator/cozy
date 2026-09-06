@@ -365,6 +365,12 @@ func (p DesiredPlacement) PlacementID() string {
 	return "plc-" + strings.TrimPrefix(p.InstanceID(), "ins-")
 }
 
+// supportsCurrentProtocol is shared by placement reuse and dispatch. A peer that
+// has negotiated an older wire can settle prior work but cannot take new directives.
+func (w *worker) supportsCurrentProtocol() bool {
+	return w.declaredInstance == "" || w.wireMinor >= pb.WireMinor
+}
+
 type worker struct {
 	instanceID string
 	spec       WorkerLaunchSpec
