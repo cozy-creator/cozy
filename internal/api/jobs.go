@@ -210,7 +210,7 @@ func replayJobSubmission(sub JobSubmission,
 		payload = []byte("{}")
 	}
 	models := append([]orchestrator.ModelRef(nil), sub.Models...)
-	if len(models) == 0 && recorded.ModelTransfer == nil {
+	if len(models) == 0 && !recorded.ModelTransfer.HasAcquisition() {
 		models = append(models, recorded.Models...)
 	}
 	var weightsOutputs []orchestrator.WeightsOutput
@@ -313,7 +313,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		}
 		logical, job, problem := s.packages.ResolveRemoteJob(
 			sub.Package, sub.Release, sub.Function, sub.Models,
-			sub.ModelTransfer != nil)
+			sub.ModelTransfer.HasAcquisition())
 		if problem != nil {
 			return out, problem
 		}

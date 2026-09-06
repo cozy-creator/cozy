@@ -97,14 +97,23 @@ type ModelTransferOutput struct {
 type ModelTransferIntent struct {
 	Kind            string                    `json:"kind"`
 	Destination     string                    `json:"destination"`
-	Source          string                    `json:"source"`
-	SourceSelection string                    `json:"source_selection"`
+	Source          string                    `json:"source,omitempty"`
+	SourceSelection string                    `json:"source_selection,omitempty"`
 	SourceLicense   string                    `json:"source_license,omitempty"`
 	SourceFiles     []ModelTransferSourceFile `json:"source_files,omitempty"`
 	InputLane       string                    `json:"input_lane,omitempty"`
 	SourceProfiles  map[string]string         `json:"source_profiles,omitempty"`
 	Outputs         []ModelTransferOutput     `json:"outputs"`
 	LocalOnly       bool                      `json:"local_only,omitempty"`
+}
+
+// HasAcquisition distinguishes source ingestion from output publication for a
+// job whose inputs are already selected. Partial acquisition fields still count,
+// so validation cannot mistake an incomplete source declaration for their absence.
+func (intent *ModelTransferIntent) HasAcquisition() bool {
+	return intent != nil && (intent.Source != "" || intent.SourceSelection != "" ||
+		intent.SourceLicense != "" || len(intent.SourceFiles) > 0 || intent.InputLane != "" ||
+		len(intent.SourceProfiles) > 0 || intent.LocalOnly)
 }
 
 type ModelTransfer struct {
@@ -139,9 +148,15 @@ func NormalizeModelTransferIntent(intent *ModelTransferIntent) *exit.Error {
 		return nil
 	}
 	if (intent.Kind != "model-upload" && intent.Kind != "model-download") ||
-		intent.Destination == "" || intent.Source == "" || intent.SourceSelection == "" ||
-		len(intent.Outputs) == 0 {
+		intent.Destination == "" || len(intent.Outputs) == 0 {
 		return exit.New(exit.Validation, "model transfer intent is incomplete")
+	}
+	if intent.HasAcquisition() {
+		if intent.Source == "" || intent.SourceSelection == "" {
+			return exit.New(exit.Validation, "model source acquisition requires both source and source_selection")
+		}
+	} else if intent.Kind != "model-upload" {
+		return exit.New(exit.Validation, "output-only publication requires a model-upload destination")
 	}
 	localSource := strings.HasPrefix(intent.Source, "file:") || strings.HasPrefix(intent.Source, "local/")
 	if intent.LocalOnly != localSource {
@@ -177,8 +192,10 @@ func NormalizeModelTransferIntent(intent *ModelTransferIntent) *exit.Error {
 		sourceBytes += file.Length
 		previousFile = file.Member
 	}
-	if _, err := canonical.Raw(intent.SourceSelection); err != nil {
-		return exit.New(exit.Validation, "model transfer source selection is not an exact digest")
+	if intent.HasAcquisition() {
+		if _, err := canonical.Raw(intent.SourceSelection); err != nil {
+			return exit.New(exit.Validation, "model transfer source selection is not an exact digest")
+		}
 	}
 	intent.Outputs = append([]ModelTransferOutput(nil), intent.Outputs...)
 	sort.Slice(intent.Outputs, func(i, j int) bool { return intent.Outputs[i].Name < intent.Outputs[j].Name })
@@ -653,15 +670,28 @@ func objectStateRank(state string) int {
 }
 
 func (s *Store) BeginModelTransferFinalization(requestID string) *exit.Error {
+	transfer, problem := s.ModelTransferOf(requestID)
+	if problem != nil || transfer == nil {
+		if problem != nil {
+			return problem
+		}
+		return exit.New(exit.Conflict, "model transfer %s does not exist", requestID)
+	}
+	// A publication-only job never materialized a source. Its output receipt
+	// advances the existing pending intent, without inventing input custody.
+	prior := "materialized"
+	if !transfer.HasAcquisition() {
+		prior = "pending"
+	}
 	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='finalizing',updated_at=?
-		WHERE request_id=? AND state IN ('materialized','finalizing')`, now(), requestID)
+		WHERE request_id=? AND state IN (?,'finalizing')`, now(), requestID, prior)
 	if err != nil {
 		return exit.Internalf("cannot begin model transfer finalization: %s", err)
 	}
 	if changed, _ := result.RowsAffected(); changed == 1 {
 		return nil
 	}
-	transfer, problem := s.ModelTransferOf(requestID)
+	transfer, problem = s.ModelTransferOf(requestID)
 	if problem != nil {
 		return problem
 	}

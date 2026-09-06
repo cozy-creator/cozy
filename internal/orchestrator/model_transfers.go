@@ -208,6 +208,9 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 	if problem != nil || transfer == nil {
 		return req, problem
 	}
+	if !transfer.HasAcquisition() {
+		return req, nil
+	}
 	c.mu.Lock()
 	bootID := w.bootID
 	c.mu.Unlock()

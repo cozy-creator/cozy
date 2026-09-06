@@ -295,11 +295,23 @@ Two answers a job carries that a request does not:
   promotes it into the addressable root after the terminal is verified; the row is written
   INSIDE the terminal transaction, so a publication a terminal did not commit does not
   exist. `status` is the terminal's verdict STAMPED as metadata; a failed run's landed
-  writes still land. Published CHECKPOINTS are absent by design: the publication
-  transaction for canonical bytes is the runtime's, and this host will root and project
-  ONE typed receipt from that border when it exists.
+  writes still land. Model-producing jobs instead expose `checkpoints` after their
+  typed receipts and destination publication are verified.
 - **`bill`** — ABSENT unless the host was configured with an explicit local rate. There is
   no `$0.00`: a fabricated zero is a claim about money nobody measured.
+
+A CLI-authenticated job may attach output publication independently of input acquisition:
+`"model_transfer":{"kind":"model-upload","destination":"org/model","outputs":[{"name":"model"}]}`.
+Its `models` remain the exact ModelRefs validated against the job's declared parameters.
+The source, source_selection, source_license, source_files, input_lane, source_profiles
+and local_only fields are absent in this form; partial acquisition declarations refuse.
+The existing receipt, upload, finalization and cancellation paths handle its outputs.
+
+Remote output-only publication requires `worker` to pin an existing, suitably prepared
+rental. Exact manifest lengths are metadata sizes and cannot size the input closure or
+the producer's output working set, so this form does not purchase a new rental. A normal
+source-transfer intent still declares its source and selection, profile bindings and
+inspected headers, and uses the existing source preparation and checkpoint-custody path.
 
 `queue_position` and `queue_depth` are one atomic orchestrator scheduling snapshot;
 `requeues`/`retry_budget` are the record owner's durable-attempt facts. Several jobs submitted at once queue against one

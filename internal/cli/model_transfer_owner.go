@@ -30,7 +30,9 @@ type modelTransferOwner struct {
 	auth  *accountauth.Manager
 }
 
-func newModelTransferOwner(cfg config.Config, store *records.Store, log io.Writer,
+// NewModelTransferOwner wires the daemon's source and output I/O into its
+// orchestrator. The same owner handles publication with or without acquisition.
+func NewModelTransferOwner(cfg config.Config, store *records.Store, log io.Writer,
 	auth *accountauth.Manager,
 ) *modelTransferOwner {
 	if log == nil {
@@ -310,7 +312,7 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 		upload := &transfer.Upload{Tool: tool, Hub: publicationClient, Ref: ref,
 			ManifestID: weights.ManifestID,
 			Session:    transferOutputOperation(weights.RequestID, weights.OutputSlot),
-			Reason:     "cozy model upload " + intent.Source + " " + intent.Destination,
+			Reason:     modelPublicationReason(intent),
 			Scratch:    work.Path, Progress: progress(cli)}
 		result, problem := upload.Run(ctx)
 		if problem != nil {
@@ -327,7 +329,7 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	}
 	operation := transferOutputOperation(weights.RequestID, weights.OutputSlot)
 	opened, problem := publicationClient.OpenPublication(ctx, ref, operation, objects,
-		"cozy model upload "+intent.Source+" "+intent.Destination)
+		modelPublicationReason(intent))
 	if problem != nil {
 		return "", problem
 	}
@@ -352,7 +354,7 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	checkpoint, problem := publicationClient.FinalizePublication(ctx, ref, operation,
 		hub.FinalizePublicationRequest{ManifestID: weights.ManifestID,
 			ManifestLength: weights.ManifestLength},
-		"cozy model upload "+intent.Source+" "+intent.Destination)
+		modelPublicationReason(intent))
 	if problem != nil {
 		return "", problem
 	}
@@ -371,7 +373,7 @@ func mintWeightsGrants(ctx context.Context, client *hub.Client, ref hub.Ref, ope
 ) (orchestrator.WeightsGrantMint, *exit.Error) {
 	var window orchestrator.WeightsGrantMint
 	granted, problem := client.GrantKnownTransfers(ctx, ref, operation, objectIDs,
-		"cozy model upload "+intent.Source+" "+intent.Destination)
+		modelPublicationReason(intent))
 	if problem != nil {
 		return window, problem
 	}
@@ -402,4 +404,11 @@ func mintWeightsGrants(ctx context.Context, client *hub.Client, ref hub.Ref, ope
 func transferOutputOperation(requestID, slot string) string {
 	sum := sha256.Sum256([]byte(requestID + "\x00" + slot))
 	return "model-artifact-" + hex.EncodeToString(sum[:])
+}
+
+func modelPublicationReason(intent records.ModelTransferIntent) string {
+	if intent.HasAcquisition() {
+		return "cozy model upload " + intent.Source + " " + intent.Destination
+	}
+	return "publish job model outputs to " + intent.Destination
 }
