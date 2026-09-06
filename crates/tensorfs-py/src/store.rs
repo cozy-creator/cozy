@@ -1976,6 +1976,13 @@ pub struct PyPlan {
 
 #[pymethods]
 impl PyPlan {
+    /// Select exact existing part `what` identifiers, retaining all their native windows.
+    fn select(&self, py: Python<'_>, whats: Vec<String>) -> PyResult<PyPlan> {
+        Ok(PyPlan {
+            plan: self.plan.select(&whats).or_refuse(py)?,
+        })
+    }
+
     #[getter]
     fn bytes(&self) -> u64 {
         self.plan.bytes

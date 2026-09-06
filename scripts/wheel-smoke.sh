@@ -51,6 +51,7 @@ echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/stub_conform.py
 "$work/venv/bin/python" scripts/fit-runs.py
 "$work/venv/bin/python" scripts/derived-declaration.py
+"$work/venv/bin/python" scripts/read-plan-selection.py
 # The frozen corpus, through the FACADE. `tfs vectors verify` runs the same 90 vectors
 # through Rust; this proves the marshal boundary agrees — same ids, same typed refusals.
 "$work/venv/bin/python" scripts/facade-conform.py
