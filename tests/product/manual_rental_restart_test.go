@@ -35,7 +35,7 @@ import (
 // empty canonical snapshot. The actual daemon must claim it again after process
 // replacement without any request, package, or explicit second claim call.
 func TestIdleManualRentalReclaimsAfterDaemonRestart(t *testing.T) {
-	for _, mode := range []string{"healthy", "attached", "weather", "released", "closed", "permanent"} {
+	for _, mode := range []string{"healthy", "attached", "weather", "released", "closed", "permanent", "released_health", "closing_health", "concurrent"} {
 		t.Run(mode, func(t *testing.T) { proveIdleManualRentalRestart(t, mode) })
 	}
 }
@@ -113,6 +113,11 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	defer control.Stop()
 	var mediaUnavailable atomic.Bool
 	var healthCalls atomic.Int64
+	var blockedHealth atomic.Bool
+	healthReply := make(chan struct{})
+	var replyOnce sync.Once
+	releaseHealth := func() { replyOnce.Do(func() { close(healthReply) }) }
+	defer releaseHealth()
 	media := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/health" {
 			t.Errorf("unexpected media request %s", r.URL.Path)
@@ -120,6 +125,9 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 			return
 		}
 		healthCalls.Add(1)
+		if blockedHealth.Load() {
+			<-healthReply
+		}
 		if mediaUnavailable.Load() {
 			if mode == "permanent" {
 				w.WriteHeader(http.StatusForbidden)
@@ -161,8 +169,25 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	fatal(t, problem)
 	keyBefore, err := os.ReadFile(layout.RentalCreatorIdentity(podRental))
 	must(t, err)
+	blockedHealth.Store(mode == "concurrent")
 	first := startDaemonProcess(t, root)
-	if reply := first.call(t, "POST", "/v1/local/rentals/"+podRental+"/claim", map[string]any{}); reply.Status != http.StatusOK && reply.Status != http.StatusAccepted {
+	claim := func() reply { return first.call(t, "POST", "/v1/local/rentals/"+podRental+"/claim", map[string]any{}) }
+	if mode == "concurrent" {
+		waitUntil(t, "startup connection waits on media", func() bool { return healthCalls.Load() == 1 })
+		replies := make(chan reply, 4)
+		for i := 0; i < 4; i++ {
+			go func() { replies <- claim() }()
+		}
+		// Hold the real health request while the explicit claim calls enter the API.
+		time.Sleep(100 * time.Millisecond)
+		releaseHealth()
+		for i := 0; i < 4; i++ {
+			reply := <-replies
+			if reply.Status != http.StatusOK && reply.Status != http.StatusAccepted {
+				t.Fatalf("concurrent rental claim: %s", reply.brief())
+			}
+		}
+	} else if reply := claim(); reply.Status != http.StatusOK && reply.Status != http.StatusAccepted {
 		t.Fatalf("initial explicit rental claim: %s", reply.brief())
 	}
 	waitUntil(t, "first empty rental snapshot acknowledged", func() bool { mu.Lock(); defer mu.Unlock(); return len(acknowledged) == 1 })
@@ -193,14 +218,28 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	}
 	stop(first)
 	priorHealth := healthCalls.Load()
-	mediaUnavailable.Store(mode != "healthy" && mode != "attached")
-	second := startDaemonProcess(t, root)
+	mediaUnavailable.Store(mode == "weather" || mode == "released" || mode == "closed" || mode == "permanent")
+	blockedHealth.Store(mode == "released_health" || mode == "closing_health")
+	var second *daemonProcess
+	var owner *orchestrator.Orchestrator
+	if mode == "closing_health" {
+		owner, problem = orchestrator.Open(orchestrator.Options{
+			Cfg: config.Config{Home: root}, Layout: layout, Store: store,
+			Rentals: rental.Resolver(layout, store), ObserveRental: rental.ObserveWorker(store),
+			RentalClaimProof: rental.ClaimProof(layout)})
+		fatal(t, problem)
+		defer owner.Close(0)
+		_, _, problem = owner.Reconcile()
+		fatal(t, problem)
+	} else {
+		second = startDaemonProcess(t, root)
+	}
 	waitUntil(t, "startup attempts the retained media endpoint", func() bool { return healthCalls.Load() > priorHealth })
 	expectedClaims := 2
 	if mode == "permanent" {
 		expectedClaims = 1
 	}
-	if mode == "released" {
+	if mode == "released" || mode == "released_health" {
 		released, problem := store.RentalRow(podRental)
 		fatal(t, problem)
 		released.State = "release_requested"
@@ -211,12 +250,24 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		stop(second)
 		expectedClaims = 1
 	}
+	if mode == "closing_health" {
+		owner.Close(0)
+		expectedClaims = 1
+	}
 	mediaUnavailable.Store(false)
+	releaseHealth()
 	if expectedClaims == 2 {
 		waitUntil(t, "restarted daemon claims idle manual rental without a request", func() bool { mu.Lock(); defer mu.Unlock(); return len(acknowledged) == 2 })
 	} else {
 		// Cross the actual startup retry cadence after its authority was removed.
 		time.Sleep(orchestrator.ReportCadence + 200*time.Millisecond)
+	}
+	if mode == "closing_health" || mode == "released_health" {
+		rows, problem := store.LiveWorkers()
+		fatal(t, problem)
+		if len(rows) != 0 {
+			t.Fatal("health completion registered a worker after owner close")
+		}
 	}
 	if expectedClaims == 1 && healthCalls.Load() != priorHealth+1 {
 		t.Fatal("startup retried after its ownership, process, or credential authority ended")
@@ -247,7 +298,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	if !bytes.Equal(keyBefore, keyAfter) || mutations.Load() != 0 {
 		t.Fatal("restart changed the key or submitted a paid mutation")
 	}
-	if mode != "closed" {
+	if mode != "closed" && second != nil {
 		stop(second)
 	}
 }

@@ -726,6 +726,11 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 		break
 	}
 	if live != nil {
+		// A concurrent empty-rental attach may have waited for this connection.
+		// It requests the existing claim, never an empty replacement placement.
+		if spec.Connection != nil && spec.Placement.Package == "" {
+			return instanceID, ChangeNone, nil
+		}
 		// The worker is here. Does it already host what is wanted? The placement's
 		// identity for this purpose is its plan set, which is what the desired set names.
 		c.mu.Lock()
@@ -1370,6 +1375,13 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	if e := byteplane.Health(); e != nil {
 		return "", e
 	}
+	// Health can block while the retained rental is released. Revalidate its
+	// existing authority without replacing this connection's pinned target.
+	if c.opt.Rentals != nil {
+		if _, problem := c.opt.Rentals(spec.Connection.RentalID); problem != nil {
+			return "", problem
+		}
+	}
 	planIDs := make([]string, 0, len(spec.Placement.Entrypoints))
 	for _, entrypoint := range spec.Placement.Entrypoints {
 		planIDs = append(planIDs, entrypoint.Digest)
@@ -1378,16 +1390,21 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	// AttachWorker, not SpawnWorker: the device-envelope admission arbitrates THIS host's
 	// cards, and the pod's card is the pod's. There is no grant to journal and none to
 	// release, which is also why nothing here has a pid or a birth identity to record.
+	c.mu.Lock()
+	if c.closing {
+		c.mu.Unlock()
+		return "", exit.Unavailablef("the daemon is closing; no rental worker was registered")
+	}
 	if e := c.opt.Store.AttachWorker(records.WorkerProcess{
 		InstanceID: instanceID, Package: spec.Placement.Package,
 		InstallID: spec.Placement.InstallID, WorkerID: "remote",
 	}); e != nil {
+		c.mu.Unlock()
 		return "", e
 	}
 	w := newWorker(instanceID, spec)
 	w.logPath = "(connected worker: its log lives on the pod)"
 	w.planIDs, w.media = planIDs, byteplane
-	c.mu.Lock()
 	c.workers[instanceID] = w
 	c.mu.Unlock()
 	c.logf("worker %s CONNECTED at %s (media %s) plans=%d",
