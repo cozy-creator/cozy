@@ -290,7 +290,7 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 			converted += uint64(checkpoint.Bytes)
 		}
 		c.ObservePhase(frame.OperationId, PhaseSample{Name: PhasePreparing, Detail: "source conversion", HasBytes: true, Moved: converted})
-		c.kickSourceCheckpointUpload(frame.OperationId)
+		c.kickCheckpointUpload(frame.OperationId)
 	}
 	c.logf("model transfer %s: source prepare %s on %s (%d source(s)) %s %s", frame.OperationId,
 		trimEnum(pb.ModelSourcePrepareOutcome_name[int32(frame.Outcome)], "MODEL_SOURCE_PREPARE_OUTCOME_"),

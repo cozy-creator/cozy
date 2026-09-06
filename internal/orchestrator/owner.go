@@ -430,6 +430,10 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			c.onLocalPackageAbortStatus(s, status)
+		case *pb.WorkerFrame_WeightsTransaction:
+			c.onWeightsTransaction(s, m.WeightsTransaction)
+		case *pb.WorkerFrame_WeightsCheckpoint:
+			c.onWeightsCheckpoint(s, m.WeightsCheckpoint)
 		case *pb.WorkerFrame_WeightsReceipt:
 			receipt := m.WeightsReceipt
 			if c.fenced(s, receipt.RecordOwnerEpoch, receipt.ControlStreamEpoch,
@@ -664,6 +668,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	// the receipts it replays after this ack. It is fenced exactly like the worker's document
 	// and reconciled before the same ack; the worker's bytes above are the worker's own.
 	var hostHeld []canonical.Doc
+	var hostWeights []*pb.WeightsTransactionStatus
 	if len(snap.HostSnapshotCanonicalBytes) > 0 || len(snap.HostSnapshotDigest) > 0 {
 		computed := canonical.Digest(snap.HostSnapshotCanonicalBytes)
 		if !bytes.Equal(computed, snap.HostSnapshotDigest) {
@@ -677,6 +682,12 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 			return false
 		}
 		hostHeld = hostDoc.List("held_outcomes")
+		typed := new(pb.HostSnapshotBody)
+		if err := canonical.Unmarshal(snap.HostSnapshotCanonicalBytes, typed); err != nil {
+			refuse("host snapshot typed conversion failed: %s", err)
+			return false
+		}
+		hostWeights = typed.WeightsTransactions
 		reconcileHeld(hostHeld, "host-held")
 	}
 	continuations := c.reconcileSnapshotAbsence(w, heldSet)
@@ -721,6 +732,9 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		c.afterAck(continuation.request, continuation.attempt, w)
 	}
 	c.retryMediaCleanup(w)
+	for _, row := range hostWeights {
+		c.onWeightsTransaction(s, row)
+	}
 	c.logf("snapshot %s (%s, %d B) acknowledged: %d held attempt(s), %d host-held outcome(s), "+
 		"accepted revision %d, converged %d; dispatch is open", snap.SnapshotId,
 		shortDigest(shortNone(snap.SnapshotDigest)), len(snap.SnapshotCanonicalBytes),

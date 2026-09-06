@@ -54,7 +54,7 @@ func SyncStoredSourceCustody(ctx context.Context, cfg config.Config, requestID, 
 	defer connection.Close()
 	fmt.Fprintln(log, "source custody control claimed; snapshot dispatch barrier remains closed")
 	owner := NewModelTransferOwner(cfg, store, log, auth)
-	if problem := owner.SyncSourceCheckpoints(connection.Context, requestID, connection.Host); problem != nil {
+	if problem := owner.SyncCheckpoints(connection.Context, requestID, connection.Host); problem != nil {
 		return nil, problem
 	}
 	result, problem := inspectSourceCustody(store, cfg, requestID, rentalID, bootID)

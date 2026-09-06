@@ -149,29 +149,12 @@ func (s *Store) ObserveModelSourceCheckpoints(requestID, selection, bootID strin
 			return exit.Internalf("cannot read prior source checkpoint: %s", err)
 		}
 		if err == nil {
-			if prior.Observed.HeadID == checkpoint.HeadID && prior.Observed != checkpoint {
-				return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_changed", "immutable source head changed its recorded metadata")
-			}
-			if prior.Observed.PlanDigest != checkpoint.PlanDigest {
-				return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_plan_changed",
-					"source checkpoint changed the slot's frozen TensorFS plan")
-			}
-			if prior.Acknowledged != nil && (checkpoint.Index < prior.Acknowledged.Index ||
-				(checkpoint.Index == prior.Acknowledged.Index && checkpoint != *prior.Acknowledged)) {
-				return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_restore_required",
-					"source checkpoint precedes or changes acknowledged recovery progress")
-			}
-			if prior.WorkerBootID == bootID {
-				if checkpoint.Index < prior.Observed.Index {
-					continue // replayed older observation; it cannot move the watermark back
-				}
-				if (checkpoint.Index == prior.Observed.Index && checkpoint != prior.Observed) ||
-					checkpoint.Bytes < prior.Observed.Bytes {
-					return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_changed",
-						"source checkpoint changed an existing index or reduced its cumulative bytes")
-				}
+			checkpoint, problem = advanceCheckpoint(prior, bootID, checkpoint)
+			if problem != nil {
+				return problem
 			}
 		}
+
 		data, _ := json.Marshal(checkpoint)
 		if _, err := tx.Exec(`INSERT INTO request_model_checkpoints
 			(request_id,slot,worker_boot_id,observed) VALUES(?,?,?,?)
@@ -209,17 +192,6 @@ func (s *Store) AcknowledgeModelSourceCheckpoint(requestID, selection, bootID, p
 	if err != nil {
 		return exit.Internalf("cannot read checkpoint acknowledgment target: %s", err)
 	}
-	if progress.Acknowledged != nil && *progress.Acknowledged == checkpoint {
-		return nil
-	}
-	priorHead := ""
-	if progress.Acknowledged != nil {
-		priorHead = progress.Acknowledged.HeadID
-		if checkpoint.Index <= progress.Acknowledged.Index || checkpoint.Bytes < progress.Acknowledged.Bytes {
-			return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_superseded",
-				"source checkpoint acknowledgment cannot move backwards")
-		}
-	}
 	var foreignBoot bool
 	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_model_transfer_files WHERE request_id=? AND worker_boot_id<>?)`, requestID, bootID).Scan(&foreignBoot); err != nil {
 		return exit.Internalf("cannot fence source checkpoint worker: %s", err)
@@ -227,12 +199,13 @@ func (s *Store) AcknowledgeModelSourceCheckpoint(requestID, selection, bootID, p
 	if foreignBoot {
 		return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_superseded", "source checkpoint uploader no longer owns the declared worker")
 	}
-	if priorHead != previousHead || progress.WorkerBootID != bootID ||
-		progress.Observed.PlanDigest != checkpoint.PlanDigest || checkpoint.Index > progress.Observed.Index ||
-		(checkpoint.Index == progress.Observed.Index && checkpoint != progress.Observed) {
-		return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_superseded",
-			"source checkpoint acknowledgment no longer matches the observed operation")
+	if progress.WorkerBootID != bootID {
+		return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_superseded", "checkpoint uploader no longer owns the observed worker")
 	}
+	if problem := checkCheckpointAcknowledgment(progress, previousHead, checkpoint); problem != nil {
+		return problem
+	}
+
 	data, _ := json.Marshal(checkpoint)
 	if _, err := tx.Exec(`UPDATE request_model_checkpoints SET acknowledged=? WHERE request_id=? AND kind='source' AND slot=?`,
 		string(data), requestID, checkpoint.Slot); err != nil {
@@ -244,13 +217,13 @@ func (s *Store) AcknowledgeModelSourceCheckpoint(requestID, selection, bootID, p
 	return nil
 }
 
-// NextModelSourceGrantRevision fences refreshed capabilities across daemon restarts.
-// The counter covers one source slot; individual transfer identities remain exact.
-func (s *Store) NextModelSourceGrantRevision(requestID, slot string) (uint64, *exit.Error) {
+// NextCheckpointGrantRevision fences refreshed capabilities across daemon restarts.
+// The counter covers one typed checkpoint slot; individual transfer identities remain exact.
+func (s *Store) NextCheckpointGrantRevision(requestID, kind, slot string) (uint64, *exit.Error) {
 	var revision int64
 	if err := s.db.QueryRow(`UPDATE request_model_checkpoints
-		SET grant_revision=grant_revision+1 WHERE request_id=? AND kind='source' AND slot=? AND grant_revision<9223372036854775807
-		RETURNING grant_revision`, requestID, slot).Scan(&revision); err != nil {
+		SET grant_revision=grant_revision+1 WHERE request_id=? AND kind=? AND slot=? AND grant_revision<9223372036854775807
+		RETURNING grant_revision`, requestID, kind, slot).Scan(&revision); err != nil {
 		return 0, exit.Internalf("cannot allocate a source checkpoint grant revision: %s", err)
 	}
 	return uint64(revision), nil
@@ -315,10 +288,10 @@ func (s *Store) ReleaseCheckpointPublication(requestID, operation string) *exit.
 	return nil
 }
 
-func (s *Store) SourceCheckpointRequests() ([]string, *exit.Error) {
+func (s *Store) CheckpointRequests() ([]string, *exit.Error) {
 	rows, err := s.db.Query(`SELECT request_id FROM request_model_checkpoint_publications WHERE released=0
 		UNION SELECT c.request_id FROM request_model_checkpoints c JOIN request_model_transfers t ON t.request_id=c.request_id
-		WHERE c.kind='source' AND c.acknowledged<>c.observed AND t.state IN ('materializing','materialized','finalizing')`)
+		WHERE c.acknowledged<>c.observed AND t.state IN ('materializing','materialized','finalizing')`)
 	if err != nil {
 		return nil, exit.Internalf("cannot read owed source checkpoint work: %s", err)
 	}
@@ -335,4 +308,44 @@ func (s *Store) SourceCheckpointRequests() ([]string, *exit.Error) {
 		return nil, exit.Internalf("cannot finish source checkpoint requests: %s", err)
 	}
 	return out, nil
+}
+
+func advanceCheckpoint(prior ModelCheckpointProgress, boot string, next ModelCheckpoint) (ModelCheckpoint, *exit.Error) {
+	if prior.Observed.HeadID != "" {
+		if prior.Observed.HeadID == next.HeadID && prior.Observed != next {
+			return next, exit.Named(exit.Conflict, "model_transfer.source_checkpoint_changed", "immutable checkpoint changed its metadata")
+		}
+		if prior.Observed.PlanDigest != next.PlanDigest {
+			return next, exit.Named(exit.Conflict, "model_transfer.source_checkpoint_plan_changed", "checkpoint changed the frozen native plan")
+		}
+	}
+	if prior.Acknowledged != nil && (next.Index < prior.Acknowledged.Index || next.Index == prior.Acknowledged.Index && next != *prior.Acknowledged) {
+		return next, exit.Named(exit.Conflict, "model_transfer.source_checkpoint_restore_required", "checkpoint precedes acknowledged custody")
+	}
+	if prior.WorkerBootID == boot && prior.Observed.HeadID != "" {
+		if next.Index < prior.Observed.Index {
+			return prior.Observed, nil
+		}
+		if next.Index == prior.Observed.Index && next != prior.Observed || next.Bytes < prior.Observed.Bytes {
+			return next, exit.Named(exit.Conflict, "model_transfer.source_checkpoint_changed", "checkpoint changed its index or reduced cumulative bytes")
+		}
+	}
+	return next, nil
+}
+
+func checkCheckpointAcknowledgment(progress ModelCheckpointProgress, previous string, checkpoint ModelCheckpoint) *exit.Error {
+	if progress.Acknowledged != nil && *progress.Acknowledged == checkpoint {
+		return nil
+	}
+	priorHead := ""
+	if progress.Acknowledged != nil {
+		priorHead = progress.Acknowledged.HeadID
+		if checkpoint.Index <= progress.Acknowledged.Index || checkpoint.Bytes < progress.Acknowledged.Bytes {
+			return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_superseded", "checkpoint acknowledgment cannot move backwards")
+		}
+	}
+	if checkpoint.HeadID == "" || previous != priorHead || checkpoint.Slot != progress.Observed.Slot || progress.Observed.PlanDigest != checkpoint.PlanDigest || checkpoint.Index > progress.Observed.Index || checkpoint.Index == progress.Observed.Index && checkpoint != progress.Observed {
+		return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_superseded", "checkpoint acknowledgment no longer matches observed progress")
+	}
+	return nil
 }

@@ -223,12 +223,12 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	defer func() {
 		cleanup, stop := context.WithTimeout(context.Background(), 30*time.Second)
 		defer stop()
-		if problem := owner.ReleaseSourceCheckpoints(cleanup, requestID); problem != nil {
+		if problem := owner.ReleaseCheckpoints(cleanup, requestID); problem != nil {
 			t.Errorf("exact source publication cleanup failed: %s", problem.ErrName())
 		}
 	}()
 	if gate != nil {
-		ended := owner.SyncSourceCheckpoints(canceled, requestID, host)
+		ended := owner.SyncCheckpoints(canceled, requestID, host)
 		if ended == nil || ended.Code != exit.Canceled {
 			t.Fatalf("native transfer cancellation lost its type: %v", ended)
 		}
@@ -239,7 +239,7 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 		}
 	}
 	if gate != nil {
-		denied := owner.SyncSourceCheckpoints(ctx, requestID, host)
+		denied := owner.SyncCheckpoints(ctx, requestID, host)
 		if denied == nil || denied.Code != exit.Unavailable {
 			t.Fatalf("native denied PUT lost its typed failure: %v", denied)
 		}
@@ -257,7 +257,7 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 		gate.refuse = false
 		gate.mu.Unlock()
 	}
-	fatal(t, owner.SyncSourceCheckpoints(ctx, requestID, host))
+	fatal(t, owner.SyncCheckpoints(ctx, requestID, host))
 	progress, problem := store.ModelSourceProgress(requestID)
 	fatal(t, problem)
 	if pages.Load() == 0 || transfers.Load() == 0 || len(progress) != 1 || progress[0].Acknowledged == nil ||

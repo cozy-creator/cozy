@@ -99,7 +99,7 @@ func proveOperatorSourceCustody(t *testing.T, ctx context.Context, root string, 
 	held.Release()
 	owner := cli.NewModelTransferOwner(cfg, store, io.Discard, auth)
 	defer func() {
-		if problem := owner.ReleaseSourceCheckpoints(context.Background(), request.OperationId); problem != nil {
+		if problem := owner.ReleaseCheckpoints(context.Background(), request.OperationId); problem != nil {
 			t.Errorf("exact fixture hold cleanup: %s", problem.ErrName())
 		}
 	}()

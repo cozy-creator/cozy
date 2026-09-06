@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"google.golang.org/protobuf/proto"
 	"sort"
 	"sync"
 	"time"
@@ -18,15 +19,15 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-type sourceCheckpointLink struct {
+type checkpointLink struct {
 	checkpoint records.ModelCheckpoint
 	previous   *pb.Ref
 	objects    []hub.Object
 }
 
-func sourceCheckpointOperation(requestID, slot, head string) string {
+func checkpointOperation(kind, requestID, slot, head string) string {
 	sum := sha256.Sum256([]byte(requestID + "\x00" + slot + "\x00" + head))
-	return "source-progress-" + hex.EncodeToString(sum[:])
+	return kind + "-progress-" + hex.EncodeToString(sum[:])
 }
 
 func checkpointRef(checkpoint records.ModelCheckpoint) (*pb.Ref, []byte, *exit.Error) {
@@ -38,7 +39,7 @@ func checkpointRef(checkpoint records.ModelCheckpoint) (*pb.Ref, []byte, *exit.E
 	return &pb.Ref{Digest: head, Length: uint64(checkpoint.HeadLength)}, plan, nil
 }
 
-func (o *modelTransferOwner) sourcePublicationClient(requestID string) (*hub.Client, hub.Ref, *records.ModelTransfer, *exit.Error) {
+func (o *modelTransferOwner) checkpointPublicationClient(requestID string) (*hub.Client, hub.Ref, *records.ModelTransfer, *exit.Error) {
 	intent, problem := o.store.ModelTransferOf(requestID)
 	if problem != nil || intent == nil {
 		return nil, hub.Ref{}, nil, problem
@@ -51,20 +52,16 @@ func (o *modelTransferOwner) sourcePublicationClient(requestID string) (*hub.Cli
 	return client, ref, intent, problem
 }
 
-// sourceCheckpointLink reads only one bounded immutable Link. The worker's
+// checkpointLink reads only one bounded immutable Link. The worker's
 // TensorFS decoder owns its format; Creator compares the returned typed subjects.
-func readSourceCheckpointLink(ctx context.Context, host orchestrator.CheckpointHost,
-	requestID, selection string, checkpoint records.ModelCheckpoint,
-) (sourceCheckpointLink, *exit.Error) {
+func readCheckpointLink(ctx context.Context, host orchestrator.CheckpointHost,
+	subject *pb.CheckpointSubject, checkpoint records.ModelCheckpoint,
+) (checkpointLink, *exit.Error) {
 	head, plan, problem := checkpointRef(checkpoint)
 	if problem != nil {
-		return sourceCheckpointLink{}, problem
+		return checkpointLink{}, problem
 	}
-	selected, err := canonical.Raw(selection)
-	if err != nil {
-		return sourceCheckpointLink{}, exit.Internalf("stored source selection is malformed")
-	}
-	link := sourceCheckpointLink{checkpoint: checkpoint}
+	link := checkpointLink{checkpoint: checkpoint}
 	objects := map[string]int64{checkpoint.HeadID: checkpoint.HeadLength}
 	add := func(ref *pb.Ref) *exit.Error {
 		if ref == nil || len(ref.Digest) != 32 || ref.Length == 0 || ref.Length > uint64(^uint64(0)>>1) {
@@ -78,8 +75,7 @@ func readSourceCheckpointLink(ctx context.Context, host orchestrator.CheckpointH
 		return nil
 	}
 	for offset := uint32(0); ; {
-		page, problem := host.Page(ctx, &pb.CheckpointPageRequest{Subject: &pb.CheckpointSubject{Kind: &pb.CheckpointSubject_Source{
-			Source: &pb.SourceCheckpointSubject{OperationId: requestID, SourceSelectionDigest: selected, Slot: checkpoint.Slot}}}, PlanDigest: plan, Head: head,
+		page, problem := host.Page(ctx, &pb.CheckpointPageRequest{Subject: subject, PlanDigest: plan, Head: head,
 			Offset: offset, Limit: pb.MaxCheckpointObjects})
 		if problem != nil {
 			return link, problem
@@ -124,7 +120,7 @@ func readSourceCheckpointLink(ctx context.Context, host orchestrator.CheckpointH
 	return link, nil
 }
 
-func previousSourceCheckpoint(link sourceCheckpointLink) (records.ModelCheckpoint, *exit.Error) {
+func previousCheckpoint(link checkpointLink) (records.ModelCheckpoint, *exit.Error) {
 	previous := link.previous
 	if previous == nil || len(previous.Digest) != 32 || previous.Length == 0 ||
 		previous.Length > uint64(^uint64(0)>>1) || link.checkpoint.Index == 0 {
@@ -135,35 +131,30 @@ func previousSourceCheckpoint(link sourceCheckpointLink) (records.ModelCheckpoin
 		PlanDigest: link.checkpoint.PlanDigest, Index: link.checkpoint.Index - 1, Bytes: link.checkpoint.Bytes}, nil
 }
 
-func (o *modelTransferOwner) checkpointTransfer(requestID, selection, direction string, checkpoint records.ModelCheckpoint, object hub.Object,
+func (o *modelTransferOwner) checkpointTransfer(requestID string, subject *pb.CheckpointSubject, direction string, checkpoint records.ModelCheckpoint, object hub.Object,
 ) (*pb.CheckpointTransferRequest, *exit.Error) {
 	head, plan, problem := checkpointRef(checkpoint)
 	if problem != nil {
 		return nil, problem
 	}
-	selected, err := canonical.Raw(selection)
-	if err != nil {
-		return nil, exit.Internalf("stored source selection is malformed")
-	}
 	objectDigest, err := canonical.Raw(object.ID)
 	if err != nil || object.Length <= 0 {
 		return nil, exit.Internalf("checkpoint transfer has invalid object identity")
 	}
-	revision, problem := o.store.NextModelSourceGrantRevision(requestID, checkpoint.Slot)
+	revision, problem := o.store.NextCheckpointGrantRevision(requestID, checkpointKind(subject), checkpoint.Slot)
 	if problem != nil {
 		return nil, problem
 	}
 	sum := sha256.Sum256([]byte(requestID + "\x00" + checkpoint.Slot + "\x00" + checkpoint.HeadID + "\x00" + object.ID + "\x00" + direction))
-	return &pb.CheckpointTransferRequest{Subject: &pb.CheckpointSubject{Kind: &pb.CheckpointSubject_Source{
-		Source: &pb.SourceCheckpointSubject{OperationId: requestID, SourceSelectionDigest: selected, Slot: checkpoint.Slot}}}, PlanDigest: plan, Head: head,
+	return &pb.CheckpointTransferRequest{Subject: subject, PlanDigest: plan, Head: head,
 		Object:     &pb.CheckpointObject{Ref: &pb.Ref{Digest: objectDigest, Length: uint64(object.Length)}},
-		TransferId: "source-" + hex.EncodeToString(sum[:]), GrantRevision: revision}, nil
+		TransferId: checkpointKind(subject) + "-" + hex.EncodeToString(sum[:]), GrantRevision: revision}, nil
 }
 
-func (o *modelTransferOwner) uploadSourceCheckpointLink(ctx context.Context, client *hub.Client, ref hub.Ref,
-	requestID string, intent records.ModelTransferIntent, host orchestrator.CheckpointHost, link sourceCheckpointLink,
+func (o *modelTransferOwner) uploadCheckpointLink(ctx context.Context, client *hub.Client, ref hub.Ref,
+	requestID string, intent records.ModelTransferIntent, host orchestrator.CheckpointHost, subject *pb.CheckpointSubject, link checkpointLink,
 ) *exit.Error {
-	operation := sourceCheckpointOperation(requestID, link.checkpoint.Slot, link.checkpoint.HeadID)
+	operation := checkpointOperation(checkpointKind(subject), requestID, link.checkpoint.Slot, link.checkpoint.HeadID)
 	body, _ := json.Marshal(link.objects)
 	if problem := o.store.RecordCheckpointPublication(requestID, operation, body); problem != nil {
 		return problem
@@ -195,7 +186,7 @@ func (o *modelTransferOwner) uploadSourceCheckpointLink(ctx context.Context, cli
 			pending = append(pending, object)
 		}
 	}
-	if problem := o.transferSourceCheckpointObjects(ctx, requestID, intent.SourceSelection, "upload", link.checkpoint, host, pending, window); problem != nil {
+	if problem := o.transferCheckpointObjects(ctx, requestID, subject, "upload", link.checkpoint, host, pending, window); problem != nil {
 		return problem
 	}
 	for offset := 0; offset < len(link.objects); offset += 128 {
@@ -218,68 +209,104 @@ func (o *modelTransferOwner) uploadSourceCheckpointLink(ctx context.Context, cli
 
 // SyncSourceCheckpoints walks backwards one bounded Link at a time. Only after
 // every new predecessor and object is accepted does the owner advance its head.
-func (o *modelTransferOwner) SyncSourceCheckpoints(parent context.Context, requestID string,
-	host orchestrator.CheckpointHost,
-) *exit.Error {
+func checkpointKind(subject *pb.CheckpointSubject) string {
+	if subject.GetWeights() != nil {
+		return "weights"
+	}
+	return "source"
+}
+
+func sourceCheckpointSubject(requestID, selection, slot string) (*pb.CheckpointSubject, *exit.Error) {
+	selected, err := canonical.Raw(selection)
+	if err != nil {
+		return nil, exit.Internalf("source selection is malformed")
+	}
+	return &pb.CheckpointSubject{Kind: &pb.CheckpointSubject_Source{Source: &pb.SourceCheckpointSubject{OperationId: requestID, SourceSelectionDigest: selected, Slot: slot}}}, nil
+}
+
+func (o *modelTransferOwner) SyncCheckpoints(parent context.Context, requestID string, host orchestrator.CheckpointHost) *exit.Error {
 	ctx, cancel := o.requestContext(parent, requestID)
 	defer cancel()
-	client, ref, transfer, problem := o.sourcePublicationClient(requestID)
+	client, ref, transfer, problem := o.checkpointPublicationClient(requestID)
 	if problem != nil || transfer == nil {
 		return problem
 	}
-	progress, problem := o.store.ModelSourceProgress(requestID)
+	sources, problem := o.store.ModelSourceProgress(requestID)
 	if problem != nil {
 		return problem
 	}
-	for _, slot := range progress {
-		if slot.WorkerBootID != host.BootID || (slot.Acknowledged != nil && *slot.Acknowledged == slot.Observed) {
-			continue
+	for _, slot := range sources {
+		subject, problem := sourceCheckpointSubject(requestID, transfer.SourceSelection, slot.Observed.Slot)
+		if problem != nil {
+			return problem
 		}
-		stop := ""
-		if slot.Acknowledged != nil {
-			stop = slot.Acknowledged.HeadID
+		if problem := o.syncCheckpoint(ctx, client, ref, requestID, transfer.ModelTransferIntent, host, subject, slot,
+			func(previous string) *exit.Error {
+				return o.store.AcknowledgeModelSourceCheckpoint(requestID, transfer.SourceSelection, host.BootID, previous, slot.Observed)
+			}); problem != nil {
+			return problem
 		}
-		current := slot.Observed
-		first := true
-		for current.HeadID != stop {
-			link, problem := readSourceCheckpointLink(ctx, host, requestID, transfer.SourceSelection, current)
-			if problem != nil {
-				return problem
-			}
-			if link.checkpoint.Index != current.Index || link.checkpoint.Bytes > current.Bytes ||
-				(first && link.checkpoint.Bytes != current.Bytes) ||
-				(slot.Acknowledged != nil && link.checkpoint.Index <= slot.Acknowledged.Index) {
-				return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_chain_changed", "checkpoint chain does not extend acknowledged progress")
-			}
-			if problem := o.uploadSourceCheckpointLink(ctx, client, ref, requestID, transfer.ModelTransferIntent, host, link); problem != nil {
-				return problem
-			}
-			if link.previous == nil {
-				if stop != "" || link.checkpoint.Index != 0 {
-					return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_chain_changed", "checkpoint chain ended before acknowledged progress")
-				}
-				break
-			}
-			current, problem = previousSourceCheckpoint(link)
-			if problem != nil {
-				return problem
-			}
-			first = false
-		}
-		if slot.Acknowledged != nil && (current.HeadLength != slot.Acknowledged.HeadLength || current.Index != slot.Acknowledged.Index || current.PlanDigest != slot.Acknowledged.PlanDigest || current.Bytes < slot.Acknowledged.Bytes) {
-			return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_chain_changed", "checkpoint predecessor changed the acknowledged ObjectRef")
-		}
-		if problem := o.store.AcknowledgeModelSourceCheckpoint(requestID, transfer.SourceSelection, host.BootID, stop, slot.Observed); problem != nil {
+	}
+	weights, problem := o.store.ModelWeightsProgress(requestID)
+	if problem != nil {
+		return problem
+	}
+	for _, slot := range weights {
+		subject := &pb.CheckpointSubject{Kind: &pb.CheckpointSubject_Weights{Weights: slot.Subject}}
+		if problem := o.syncCheckpoint(ctx, client, ref, requestID, transfer.ModelTransferIntent, host, subject, slot.ModelCheckpointProgress,
+			func(previous string) *exit.Error {
+				return o.store.AcknowledgeModelWeightsCheckpoint(slot.Subject, slot.Attempt, host.BootID, previous, slot.Observed)
+			}); problem != nil {
 			return problem
 		}
 	}
 	return nil
 }
 
-func (o *modelTransferOwner) downloadSourceCheckpointObjects(ctx context.Context, client *hub.Client, ref hub.Ref,
-	requestID, selection string, checkpoint records.ModelCheckpoint, host orchestrator.CheckpointHost, objects []hub.Object,
+// Both subject kinds use this one backwards native-Link walk and custody barrier.
+func (o *modelTransferOwner) syncCheckpoint(ctx context.Context, client *hub.Client, ref hub.Ref, requestID string, intent records.ModelTransferIntent,
+	host orchestrator.CheckpointHost, subject *pb.CheckpointSubject, slot records.ModelCheckpointProgress, acknowledge func(string) *exit.Error) *exit.Error {
+	if slot.WorkerBootID != host.BootID || slot.Observed.HeadID == "" || slot.Acknowledged != nil && *slot.Acknowledged == slot.Observed {
+		return nil
+	}
+	stop := ""
+	if slot.Acknowledged != nil {
+		stop = slot.Acknowledged.HeadID
+	}
+	current, first := slot.Observed, true
+	for current.HeadID != stop {
+		link, problem := readCheckpointLink(ctx, host, subject, current)
+		if problem != nil {
+			return problem
+		}
+		if link.checkpoint.Index != current.Index || link.checkpoint.Bytes > current.Bytes || first && link.checkpoint.Bytes != current.Bytes || slot.Acknowledged != nil && link.checkpoint.Index <= slot.Acknowledged.Index {
+			return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_chain_changed", "checkpoint chain does not extend acknowledged progress")
+		}
+		if problem := o.uploadCheckpointLink(ctx, client, ref, requestID, intent, host, subject, link); problem != nil {
+			return problem
+		}
+		if link.previous == nil {
+			if stop != "" || link.checkpoint.Index != 0 {
+				return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_chain_changed", "checkpoint chain ended before acknowledged progress")
+			}
+			break
+		}
+		current, problem = previousCheckpoint(link)
+		if problem != nil {
+			return problem
+		}
+		first = false
+	}
+	if slot.Acknowledged != nil && (current.HeadLength != slot.Acknowledged.HeadLength || current.Index != slot.Acknowledged.Index || current.PlanDigest != slot.Acknowledged.PlanDigest || current.Bytes < slot.Acknowledged.Bytes) {
+		return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_chain_changed", "checkpoint predecessor changed acknowledged identity")
+	}
+	return acknowledge(stop)
+}
+
+func (o *modelTransferOwner) downloadCheckpointObjects(ctx context.Context, client *hub.Client, ref hub.Ref,
+	requestID string, subject *pb.CheckpointSubject, checkpoint records.ModelCheckpoint, host orchestrator.CheckpointHost, objects []hub.Object,
 ) *exit.Error {
-	operation := sourceCheckpointOperation(requestID, checkpoint.Slot, checkpoint.HeadID)
+	operation := checkpointOperation(checkpointKind(subject), requestID, checkpoint.Slot, checkpoint.HeadID)
 	window := orchestrator.NewWeightsGrantWindow(func(ctx context.Context, selected []string) (orchestrator.WeightsGrantMint, *exit.Error) {
 		var mint orchestrator.WeightsGrantMint
 		reads, problem := client.ReadPublicationObjects(ctx, ref, operation, selected)
@@ -305,20 +332,20 @@ func (o *modelTransferOwner) downloadSourceCheckpointObjects(ctx context.Context
 		}
 		return mint, nil
 	})
-	return o.transferSourceCheckpointObjects(ctx, requestID, selection, "download", checkpoint, host, objects, window)
+	return o.transferCheckpointObjects(ctx, requestID, subject, "download", checkpoint, host, objects, window)
 }
 
 // Each transfer owns a permit before its grant is selected. The calling goroutine alone
 // advances the existing grant window; only the byte-moving RPC runs concurrently.
-const sourceCheckpointParallelism = 4
+const checkpointParallelism = 4
 
-func (o *modelTransferOwner) transferSourceCheckpointObjects(parent context.Context,
-	requestID, selection, direction string, checkpoint records.ModelCheckpoint,
+func (o *modelTransferOwner) transferCheckpointObjects(parent context.Context,
+	requestID string, subject *pb.CheckpointSubject, direction string, checkpoint records.ModelCheckpoint,
 	host orchestrator.CheckpointHost, objects []hub.Object, window *orchestrator.WeightsGrantWindow,
 ) *exit.Error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	permits := make(chan struct{}, sourceCheckpointParallelism)
+	permits := make(chan struct{}, checkpointParallelism)
 	var workers sync.WaitGroup
 	var failed sync.Once
 	var first *exit.Error
@@ -355,7 +382,7 @@ walk:
 			<-permits
 			continue
 		}
-		request, problem := o.checkpointTransfer(requestID, selection, direction, checkpoint, object)
+		request, problem := o.checkpointTransfer(requestID, subject, direction, checkpoint, object)
 		if problem != nil {
 			<-permits
 			fail(problem)
@@ -396,19 +423,14 @@ walk:
 	return nil
 }
 
-func (o *modelTransferOwner) RestoreSourceCheckpoints(parent context.Context, requestID string,
-	host orchestrator.CheckpointHost,
-) *exit.Error {
+func (o *modelTransferOwner) RestoreSourceCheckpoints(parent context.Context, requestID string, host orchestrator.CheckpointHost) *exit.Error {
 	ctx, cancel := o.requestContext(parent, requestID)
 	defer cancel()
 	progress, problem := o.store.ModelSourceProgress(requestID)
-	if problem != nil {
+	if problem != nil || len(progress) == 0 {
 		return problem
 	}
-	if len(progress) == 0 {
-		return nil
-	}
-	client, ref, transfer, problem := o.sourcePublicationClient(requestID)
+	client, ref, transfer, problem := o.checkpointPublicationClient(requestID)
 	if problem != nil || transfer == nil {
 		return problem
 	}
@@ -416,47 +438,85 @@ func (o *modelTransferOwner) RestoreSourceCheckpoints(parent context.Context, re
 		if slot.Acknowledged == nil {
 			continue
 		}
-		current := *slot.Acknowledged
-		first := true
-		for {
-			if problem := o.downloadSourceCheckpointObjects(ctx, client, ref, requestID, transfer.SourceSelection,
-				current, host, []hub.Object{{ID: current.HeadID, Length: current.HeadLength}}); problem != nil {
-				return problem
-			}
-			link, problem := readSourceCheckpointLink(ctx, host, requestID, transfer.SourceSelection, current)
-			if problem != nil {
-				return problem
-			}
-			if link.checkpoint.Index != current.Index || link.checkpoint.Bytes > current.Bytes ||
-				(first && link.checkpoint.Bytes != current.Bytes) {
-				return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_restore_changed", "restored checkpoint chain changed its recorded progress")
-			}
-			if problem := o.downloadSourceCheckpointObjects(ctx, client, ref, requestID, transfer.SourceSelection,
-				link.checkpoint, host, link.objects); problem != nil {
-				return problem
-			}
-			if link.previous == nil {
-				if link.checkpoint.Index != 0 {
-					return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_restore_changed", "restored checkpoint chain has no root")
-				}
-				break
-			}
-			current, problem = previousSourceCheckpoint(link)
-			if problem != nil {
-				return problem
-			}
-			first = false
+		subject, problem := sourceCheckpointSubject(requestID, transfer.SourceSelection, slot.Acknowledged.Slot)
+		if problem != nil {
+			return problem
+		}
+		if problem := o.restoreCheckpoint(ctx, client, ref, requestID, host, subject, *slot.Acknowledged); problem != nil {
+			return problem
 		}
 	}
 	return nil
 }
 
-func (o *modelTransferOwner) ReleaseSourceCheckpoints(ctx context.Context, requestID string) *exit.Error {
+func (o *modelTransferOwner) RestoreWeightsCheckpoint(parent context.Context, requestID string, host orchestrator.CheckpointHost, subject *pb.WeightsCheckpointSubject) (*pb.CheckpointRef, *exit.Error) {
+	ctx, cancel := o.requestContext(parent, requestID)
+	defer cancel()
+	rows, problem := o.store.ModelWeightsProgress(requestID)
+	if problem != nil {
+		return nil, problem
+	}
+	for _, row := range rows {
+		if !proto.Equal(row.Subject, subject) || row.WorkerBootID != host.BootID {
+			continue
+		}
+		if row.Acknowledged == nil {
+			return nil, nil
+		}
+		client, ref, transfer, problem := o.checkpointPublicationClient(requestID)
+		if problem != nil || transfer == nil {
+			return nil, problem
+		}
+		scope := &pb.CheckpointSubject{Kind: &pb.CheckpointSubject_Weights{Weights: subject}}
+		if problem := o.restoreCheckpoint(ctx, client, ref, requestID, host, scope, *row.Acknowledged); problem != nil {
+			return nil, problem
+		}
+		head, plan, problem := checkpointRef(*row.Acknowledged)
+		if problem != nil {
+			return nil, problem
+		}
+		return &pb.CheckpointRef{Head: head, PlanDigest: plan, Index: uint64(row.Acknowledged.Index), Bytes: uint64(row.Acknowledged.Bytes)}, nil
+	}
+	return nil, exit.Named(exit.Conflict, "model_transfer.checkpoint_superseded", "weights restore no longer matches current owner cursor")
+}
+
+func (o *modelTransferOwner) restoreCheckpoint(ctx context.Context, client *hub.Client, ref hub.Ref, requestID string, host orchestrator.CheckpointHost, subject *pb.CheckpointSubject, current records.ModelCheckpoint) *exit.Error {
+	first := true
+	for {
+		if problem := o.downloadCheckpointObjects(ctx, client, ref, requestID, subject, current, host, []hub.Object{{ID: current.HeadID, Length: current.HeadLength}}); problem != nil {
+			return problem
+		}
+		link, problem := readCheckpointLink(ctx, host, subject, current)
+		if problem != nil {
+			return problem
+		}
+		if link.checkpoint.Index != current.Index || link.checkpoint.Bytes > current.Bytes || first && link.checkpoint.Bytes != current.Bytes {
+			return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_restore_changed", "restored checkpoint changed recorded progress")
+		}
+		if problem := o.downloadCheckpointObjects(ctx, client, ref, requestID, subject, link.checkpoint, host, link.objects); problem != nil {
+			return problem
+		}
+		if link.previous == nil {
+			if link.checkpoint.Index != 0 {
+				return exit.Named(exit.Conflict, "model_transfer.source_checkpoint_restore_changed", "restored chain has no root")
+			}
+			break
+		}
+		current, problem = previousCheckpoint(link)
+		if problem != nil {
+			return problem
+		}
+		first = false
+	}
+	return nil
+}
+
+func (o *modelTransferOwner) ReleaseCheckpoints(ctx context.Context, requestID string) *exit.Error {
 	pending, problem := o.store.CheckpointPublications(requestID)
 	if problem != nil || len(pending) == 0 {
 		return problem
 	}
-	client, ref, intent, problem := o.sourcePublicationClient(requestID)
+	client, ref, intent, problem := o.checkpointPublicationClient(requestID)
 	if problem != nil || intent == nil {
 		return problem
 	}
