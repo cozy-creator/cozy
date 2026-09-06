@@ -44,13 +44,13 @@ func (c *Client) AbandonPublication(ctx context.Context, ref Ref, operation stri
 	}
 	problem := c.do(ctx, call{method: http.MethodDelete,
 		path: publications(ref) + "/" + url.PathEscape(operation), auth: true,
-		reason: "release finished source preparation holds", byBytes: true, patient: true, strict: true}, &out)
+		reason: "release canceled or finished publication holds", byBytes: true, patient: true, strict: true}, &out)
 	if problem != nil {
 		return problem
 	}
 	if out.Publication.Operation != operation || out.Publication.State != "abandoned" {
-		return exit.Named(exit.Conflict, "model_transfer.source_publication_not_abandoned",
-			"Tensorhub did not acknowledge release of source preparation custody")
+		return exit.Named(exit.Conflict, "model_transfer.publication_not_abandoned",
+			"Tensorhub did not acknowledge release of publication custody")
 	}
 	return nil
 }

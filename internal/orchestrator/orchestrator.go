@@ -148,6 +148,7 @@ type ModelTransferOwner interface {
 	MaterializeLocal(context.Context, string, records.ModelTransferIntent) ([]ModelRef, *exit.Error)
 	RefreshRemoteSource(context.Context, records.ModelTransferIntent) ([]ModelSourceCapability, *exit.Error)
 	Finalize(context.Context, string, ModelTransferMover) *exit.Error
+	AbandonModelTransferPublications(context.Context, string) *exit.Error
 	PassThrough(context.Context, string, records.ModelTransferIntent) *exit.Error
 	SyncSourceCheckpoints(context.Context, string, SourceCheckpointHost) *exit.Error
 	RestoreSourceCheckpoints(context.Context, string, SourceCheckpointHost) *exit.Error

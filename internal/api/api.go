@@ -198,6 +198,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/local/daemon/down":                  s.downDaemon,
 		"POST /v1/local/jobs":                         s.submitJob,
 		"GET /v1/local/jobs/{id}":                     s.getJob,
+		"POST /v1/local/jobs/{id}/retry-publication":  s.retryJobPublication,
 		"POST /v1/local/jobs/{id}/cancel":             s.cancelJob,
 		"GET /{$}":                                    s.webUI,
 		"GET /app.css":                                s.webUI,

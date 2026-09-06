@@ -95,7 +95,7 @@ func sourceCheckpointOwner(tx *sql.Tx, requestID, selection string) (ModelTransf
 	if err != nil || json.Unmarshal([]byte(raw), &intent) != nil {
 		return intent, exit.Internalf("cannot read source checkpoint owner")
 	}
-	if intent.SourceSelection != selection || state == "failed" || state == "canceled" || state == "completed" {
+	if intent.SourceSelection != selection || state == "failed" || state == "canceling" || state == "canceled" || state == "completed" {
 		return intent, exit.Named(exit.Conflict, "model_transfer.source_checkpoint_stale",
 			"source checkpoint does not belong to the active selected operation")
 	}

@@ -911,7 +911,7 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 // cancelActor reads WHO is canceling from the request body. Cancellation is an
 // attributed act (cl-108): a canceled run must always be able to say who ended it, so
 // an unnamed caller is recorded as exactly that rather than as nothing.
-func cancelActor(r *http.Request) string {
+func requestActor(r *http.Request) string {
 	var body struct {
 		Actor string `json:"actor"`
 	}
@@ -937,7 +937,7 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := row.ID
-	actor := cancelActor(r)
+	actor := requestActor(r)
 	if status := contractStatus(row.State); status == "completed" || status == "failed" || status == "canceled" {
 		s.ok(w, r, http.StatusOK, s.lifecycleOf(*row))
 		return
