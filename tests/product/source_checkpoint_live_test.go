@@ -157,9 +157,9 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	must(t, err)
 	plan, err := canonical.Spell(checkpoint.PlanDigest)
 	must(t, err)
-	observed := records.ModelSourceCheckpoint{Slot: checkpoint.Slot, HeadID: head,
+	observed := records.ModelCheckpoint{Slot: checkpoint.Slot, HeadID: head,
 		HeadLength: int64(checkpoint.Head.Length), PlanDigest: plan, Index: int64(checkpoint.Index), Bytes: int64(checkpoint.Bytes)}
-	fatal(t, store.ObserveModelSourceCheckpoints(requestID, selection, boot, []records.ModelSourceCheckpoint{observed}))
+	fatal(t, store.ObserveModelSourceCheckpoints(requestID, selection, boot, []records.ModelCheckpoint{observed}))
 	if *sourceCustodyBridge != "" {
 		preparedRequest.OperationId = requestID
 		proveOperatorSourceCustody(t, ctx, root, store, auth, preparedRequest, started.Address, observed)
@@ -248,7 +248,7 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 		if len(failed) != 1 || failed[0].Acknowledged != nil {
 			t.Fatal("failed Link advanced its custody acknowledgment")
 		}
-		held, problem := store.SourcePublications(requestID)
+		held, problem := store.CheckpointPublications(requestID)
 		fatal(t, problem)
 		if len(held) == 0 {
 			t.Fatal("failed Link dropped its recovery holds")
@@ -327,7 +327,7 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	}
 	t.Logf("new boot resumed same operation %s: %d checkpointed bytes, %d spent members, zero source bodies present; partial profile remains incomplete", requestID, recovered.Checkpoints[0].Bytes, len(spent))
 
-	held, problem := store.SourcePublications(requestID)
+	held, problem := store.CheckpointPublications(requestID)
 	fatal(t, problem)
 	if len(held) == 0 {
 		t.Fatal("source acknowledgment has no retained Hub publication")

@@ -152,5 +152,5 @@ type SourceCustodyResult struct {
 	ObservedBytes        int64                         `json:"observed_bytes"`
 	AcknowledgedBytes    int64                         `json:"acknowledged_bytes"`
 	Models               []records.ModelRef            `json:"models"`
-	Checkpoints          []records.ModelSourceProgress `json:"source_checkpoints"`
+	Checkpoints          []records.ModelCheckpointProgress `json:"source_checkpoints"`
 }

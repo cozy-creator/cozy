@@ -19,7 +19,7 @@ import (
 )
 
 type sourceCheckpointLink struct {
-	checkpoint records.ModelSourceCheckpoint
+	checkpoint records.ModelCheckpoint
 	previous   *pb.Ref
 	objects    []hub.Object
 }
@@ -29,7 +29,7 @@ func sourceCheckpointOperation(requestID, slot, head string) string {
 	return "source-progress-" + hex.EncodeToString(sum[:])
 }
 
-func checkpointRef(checkpoint records.ModelSourceCheckpoint) (*pb.Ref, []byte, *exit.Error) {
+func checkpointRef(checkpoint records.ModelCheckpoint) (*pb.Ref, []byte, *exit.Error) {
 	head, headErr := canonical.Raw(checkpoint.HeadID)
 	plan, planErr := canonical.Raw(checkpoint.PlanDigest)
 	if headErr != nil || planErr != nil || checkpoint.HeadLength <= 0 {
@@ -54,7 +54,7 @@ func (o *modelTransferOwner) sourcePublicationClient(requestID string) (*hub.Cli
 // sourceCheckpointLink reads only one bounded immutable Link. The worker's
 // TensorFS decoder owns its format; Creator compares the returned typed subjects.
 func readSourceCheckpointLink(ctx context.Context, host orchestrator.CheckpointHost,
-	requestID, selection string, checkpoint records.ModelSourceCheckpoint,
+	requestID, selection string, checkpoint records.ModelCheckpoint,
 ) (sourceCheckpointLink, *exit.Error) {
 	head, plan, problem := checkpointRef(checkpoint)
 	if problem != nil {
@@ -124,18 +124,18 @@ func readSourceCheckpointLink(ctx context.Context, host orchestrator.CheckpointH
 	return link, nil
 }
 
-func previousSourceCheckpoint(link sourceCheckpointLink) (records.ModelSourceCheckpoint, *exit.Error) {
+func previousSourceCheckpoint(link sourceCheckpointLink) (records.ModelCheckpoint, *exit.Error) {
 	previous := link.previous
 	if previous == nil || len(previous.Digest) != 32 || previous.Length == 0 ||
 		previous.Length > uint64(^uint64(0)>>1) || link.checkpoint.Index == 0 {
-		return records.ModelSourceCheckpoint{}, exit.Named(exit.Structural, "model_transfer.source_checkpoint_chain_invalid", "source checkpoint predecessor is invalid")
+		return records.ModelCheckpoint{}, exit.Named(exit.Structural, "model_transfer.source_checkpoint_chain_invalid", "source checkpoint predecessor is invalid")
 	}
-	return records.ModelSourceCheckpoint{Slot: link.checkpoint.Slot,
+	return records.ModelCheckpoint{Slot: link.checkpoint.Slot,
 		HeadID: "sha256:" + hex.EncodeToString(previous.Digest), HeadLength: int64(previous.Length),
 		PlanDigest: link.checkpoint.PlanDigest, Index: link.checkpoint.Index - 1, Bytes: link.checkpoint.Bytes}, nil
 }
 
-func (o *modelTransferOwner) checkpointTransfer(requestID, selection, direction string, checkpoint records.ModelSourceCheckpoint, object hub.Object,
+func (o *modelTransferOwner) checkpointTransfer(requestID, selection, direction string, checkpoint records.ModelCheckpoint, object hub.Object,
 ) (*pb.CheckpointTransferRequest, *exit.Error) {
 	head, plan, problem := checkpointRef(checkpoint)
 	if problem != nil {
@@ -165,7 +165,7 @@ func (o *modelTransferOwner) uploadSourceCheckpointLink(ctx context.Context, cli
 ) *exit.Error {
 	operation := sourceCheckpointOperation(requestID, link.checkpoint.Slot, link.checkpoint.HeadID)
 	body, _ := json.Marshal(link.objects)
-	if problem := o.store.RecordSourcePublication(requestID, operation, body); problem != nil {
+	if problem := o.store.RecordCheckpointPublication(requestID, operation, body); problem != nil {
 		return problem
 	}
 	opened, problem := client.OpenPublication(ctx, ref, operation, link.objects, "retain source preparation progress")
@@ -175,7 +175,7 @@ func (o *modelTransferOwner) uploadSourceCheckpointLink(ctx context.Context, cli
 	if _, problem := transfer.ValidateOpenedPublication(opened, operation, link.objects); problem != nil {
 		return problem
 	}
-	if problem := o.store.OpenedSourcePublication(requestID, operation); problem != nil {
+	if problem := o.store.OpenedCheckpointPublication(requestID, operation); problem != nil {
 		return problem
 	}
 	window := orchestrator.NewWeightsGrantWindow(func(ctx context.Context, ids []string) (orchestrator.WeightsGrantMint, *exit.Error) {
@@ -277,7 +277,7 @@ func (o *modelTransferOwner) SyncSourceCheckpoints(parent context.Context, reque
 }
 
 func (o *modelTransferOwner) downloadSourceCheckpointObjects(ctx context.Context, client *hub.Client, ref hub.Ref,
-	requestID, selection string, checkpoint records.ModelSourceCheckpoint, host orchestrator.CheckpointHost, objects []hub.Object,
+	requestID, selection string, checkpoint records.ModelCheckpoint, host orchestrator.CheckpointHost, objects []hub.Object,
 ) *exit.Error {
 	operation := sourceCheckpointOperation(requestID, checkpoint.Slot, checkpoint.HeadID)
 	window := orchestrator.NewWeightsGrantWindow(func(ctx context.Context, selected []string) (orchestrator.WeightsGrantMint, *exit.Error) {
@@ -313,7 +313,7 @@ func (o *modelTransferOwner) downloadSourceCheckpointObjects(ctx context.Context
 const sourceCheckpointParallelism = 4
 
 func (o *modelTransferOwner) transferSourceCheckpointObjects(parent context.Context,
-	requestID, selection, direction string, checkpoint records.ModelSourceCheckpoint,
+	requestID, selection, direction string, checkpoint records.ModelCheckpoint,
 	host orchestrator.CheckpointHost, objects []hub.Object, window *orchestrator.WeightsGrantWindow,
 ) *exit.Error {
 	ctx, cancel := context.WithCancel(parent)
@@ -452,7 +452,7 @@ func (o *modelTransferOwner) RestoreSourceCheckpoints(parent context.Context, re
 }
 
 func (o *modelTransferOwner) ReleaseSourceCheckpoints(ctx context.Context, requestID string) *exit.Error {
-	pending, problem := o.store.SourcePublications(requestID)
+	pending, problem := o.store.CheckpointPublications(requestID)
 	if problem != nil || len(pending) == 0 {
 		return problem
 	}
@@ -461,7 +461,7 @@ func (o *modelTransferOwner) ReleaseSourceCheckpoints(ctx context.Context, reque
 		return problem
 	}
 	for {
-		operations, problem := o.store.SourcePublications(requestID)
+		operations, problem := o.store.CheckpointPublications(requestID)
 		if problem != nil || len(operations) == 0 {
 			return problem
 		}
@@ -478,7 +478,7 @@ func (o *modelTransferOwner) ReleaseSourceCheckpoints(ctx context.Context, reque
 			if problem := client.AbandonPublication(ctx, ref, publication.Operation); problem != nil && problem.ErrName() != "publication.not_found" {
 				return problem
 			}
-			if problem := o.store.ReleaseSourcePublication(requestID, publication.Operation); problem != nil {
+			if problem := o.store.ReleaseCheckpointPublication(requestID, publication.Operation); problem != nil {
 				return problem
 			}
 		}

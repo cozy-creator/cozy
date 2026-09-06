@@ -27,7 +27,7 @@ import (
 )
 
 func proveOperatorSourceCustody(t *testing.T, ctx context.Context, root string, store *records.Store, auth *accountauth.Manager,
-	request *pb.PrepareModelSourceRequest, address string, observed records.ModelSourceCheckpoint) {
+	request *pb.PrepareModelSourceRequest, address string, observed records.ModelCheckpoint) {
 	t.Helper()
 	raw, err := proto.Marshal(request)
 	must(t, err)

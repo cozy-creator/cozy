@@ -10,19 +10,22 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-const modelSourceCheckpointSchema = `
-CREATE TABLE IF NOT EXISTS request_model_source_checkpoints (
+const modelCheckpointSchema = `
+CREATE TABLE IF NOT EXISTS request_model_checkpoints (
   request_id TEXT NOT NULL REFERENCES requests(id),
+  kind TEXT NOT NULL DEFAULT 'source' CHECK(kind IN ('source','weights')),
   slot TEXT NOT NULL,
+  subject BLOB NOT NULL DEFAULT x'',
+  attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt>=0),
   worker_boot_id TEXT NOT NULL,
-  observed TEXT NOT NULL,
+  observed TEXT NOT NULL DEFAULT '',
   acknowledged TEXT NOT NULL DEFAULT '',
   grant_revision INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY(request_id,slot)
+  PRIMARY KEY(request_id,kind,slot)
 )`
 
-const modelSourcePublicationSchema = `
-CREATE TABLE IF NOT EXISTS request_model_source_publications (
+const modelCheckpointPublicationSchema = `
+CREATE TABLE IF NOT EXISTS request_model_checkpoint_publications (
   request_id TEXT NOT NULL REFERENCES requests(id),
   operation TEXT NOT NULL,
   objects BLOB NOT NULL,
@@ -31,9 +34,9 @@ CREATE TABLE IF NOT EXISTS request_model_source_publications (
   PRIMARY KEY(request_id,operation)
 )`
 
-// ModelSourceCheckpoint is a TensorFS recovery head. Observing it says nothing
+// ModelCheckpoint is a TensorFS recovery head. Observing it says nothing
 // about remote custody; only the separately acknowledged head may restore a pod.
-type ModelSourceCheckpoint struct {
+type ModelCheckpoint struct {
 	Slot       string `json:"slot"`
 	HeadID     string `json:"head_id"`
 	HeadLength int64  `json:"head_length"`
@@ -42,14 +45,14 @@ type ModelSourceCheckpoint struct {
 	Bytes      int64  `json:"bytes"`
 }
 
-type ModelSourceProgress struct {
+type ModelCheckpointProgress struct {
 	WorkerBootID string
-	Observed     ModelSourceCheckpoint
-	Acknowledged *ModelSourceCheckpoint
+	Observed     ModelCheckpoint
+	Acknowledged *ModelCheckpoint
 }
 
-func scanModelSourceProgress(row interface{ Scan(...any) error }) (ModelSourceProgress, error) {
-	var progress ModelSourceProgress
+func scanModelCheckpointProgress(row interface{ Scan(...any) error }) (ModelCheckpointProgress, error) {
+	var progress ModelCheckpointProgress
 	var observed, acknowledged string
 	if err := row.Scan(&progress.WorkerBootID, &observed, &acknowledged); err != nil {
 		return progress, err
@@ -58,7 +61,7 @@ func scanModelSourceProgress(row interface{ Scan(...any) error }) (ModelSourcePr
 		return progress, err
 	}
 	if acknowledged != "" {
-		progress.Acknowledged = &ModelSourceCheckpoint{}
+		progress.Acknowledged = &ModelCheckpoint{}
 		if err := json.Unmarshal([]byte(acknowledged), progress.Acknowledged); err != nil {
 			return progress, err
 		}
@@ -66,16 +69,16 @@ func scanModelSourceProgress(row interface{ Scan(...any) error }) (ModelSourcePr
 	return progress, nil
 }
 
-func (s *Store) ModelSourceProgress(requestID string) ([]ModelSourceProgress, *exit.Error) {
+func (s *Store) ModelSourceProgress(requestID string) ([]ModelCheckpointProgress, *exit.Error) {
 	rows, err := s.db.Query(`SELECT worker_boot_id,observed,acknowledged
-		FROM request_model_source_checkpoints WHERE request_id=? ORDER BY slot`, requestID)
+		FROM request_model_checkpoints WHERE request_id=? AND kind='source' ORDER BY slot`, requestID)
 	if err != nil {
 		return nil, exit.Internalf("cannot read source checkpoint progress: %s", err)
 	}
 	defer rows.Close()
-	var out []ModelSourceProgress
+	var out []ModelCheckpointProgress
 	for rows.Next() {
-		progress, err := scanModelSourceProgress(rows)
+		progress, err := scanModelCheckpointProgress(rows)
 		if err != nil {
 			return nil, exit.Internalf("cannot decode source checkpoint progress: %s", err)
 		}
@@ -102,7 +105,7 @@ func sourceCheckpointOwner(tx *sql.Tx, requestID, selection string) (ModelTransf
 	return intent, nil
 }
 
-func validateSourceCheckpoint(intent ModelTransferIntent, checkpoint ModelSourceCheckpoint) *exit.Error {
+func validateSourceCheckpoint(intent ModelTransferIntent, checkpoint ModelCheckpoint) *exit.Error {
 	_, headErr := canonical.Raw(checkpoint.HeadID)
 	_, planErr := canonical.Raw(checkpoint.PlanDigest)
 	if intent.SourceProfiles[checkpoint.Slot] == "" || headErr != nil || planErr != nil ||
@@ -113,11 +116,11 @@ func validateSourceCheckpoint(intent ModelTransferIntent, checkpoint ModelSource
 	return nil
 }
 
-// ObserveModelSourceCheckpoints freezes each slot's plan and advances only its
+// ObserveModelCheckpoints freezes each slot's plan and advances only its
 // current worker's local watermark. A replacement boot may start from the last
 // acknowledged head, never from unacknowledged progress left by the old pod.
 func (s *Store) ObserveModelSourceCheckpoints(requestID, selection, bootID string,
-	checkpoints []ModelSourceCheckpoint,
+	checkpoints []ModelCheckpoint,
 ) *exit.Error {
 	if bootID == "" {
 		return exit.New(exit.Validation, "source checkpoint observer has no worker boot")
@@ -140,8 +143,8 @@ func (s *Store) ObserveModelSourceCheckpoints(requestID, selection, bootID strin
 			return exit.New(exit.Validation, "source checkpoint repeats a slot")
 		}
 		seen[checkpoint.Slot] = true
-		prior, err := scanModelSourceProgress(tx.QueryRow(`SELECT worker_boot_id,observed,acknowledged
-			FROM request_model_source_checkpoints WHERE request_id=? AND slot=?`, requestID, checkpoint.Slot))
+		prior, err := scanModelCheckpointProgress(tx.QueryRow(`SELECT worker_boot_id,observed,acknowledged
+			FROM request_model_checkpoints WHERE request_id=? AND kind='source' AND slot=?`, requestID, checkpoint.Slot))
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return exit.Internalf("cannot read prior source checkpoint: %s", err)
 		}
@@ -170,9 +173,9 @@ func (s *Store) ObserveModelSourceCheckpoints(requestID, selection, bootID strin
 			}
 		}
 		data, _ := json.Marshal(checkpoint)
-		if _, err := tx.Exec(`INSERT INTO request_model_source_checkpoints
+		if _, err := tx.Exec(`INSERT INTO request_model_checkpoints
 			(request_id,slot,worker_boot_id,observed) VALUES(?,?,?,?)
-			ON CONFLICT(request_id,slot) DO UPDATE SET worker_boot_id=excluded.worker_boot_id,observed=excluded.observed`,
+			ON CONFLICT(request_id,kind,slot) DO UPDATE SET worker_boot_id=excluded.worker_boot_id,observed=excluded.observed`,
 			requestID, checkpoint.Slot, bootID, string(data)); err != nil {
 			return exit.Internalf("cannot record source checkpoint observation: %s", err)
 		}
@@ -183,11 +186,11 @@ func (s *Store) ObserveModelSourceCheckpoints(requestID, selection, bootID strin
 	return nil
 }
 
-// AcknowledgeModelSourceCheckpoint follows verified custody of every link object.
+// AcknowledgeModelCheckpoint follows verified custody of every link object.
 // The caller supplies its previous acknowledged head so a stale uploader cannot
 // overwrite a newer acknowledgment; a replaced worker also loses this authority.
 func (s *Store) AcknowledgeModelSourceCheckpoint(requestID, selection, bootID, previousHead string,
-	checkpoint ModelSourceCheckpoint,
+	checkpoint ModelCheckpoint,
 ) *exit.Error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -201,8 +204,8 @@ func (s *Store) AcknowledgeModelSourceCheckpoint(requestID, selection, bootID, p
 	if problem := validateSourceCheckpoint(intent, checkpoint); problem != nil {
 		return problem
 	}
-	progress, err := scanModelSourceProgress(tx.QueryRow(`SELECT worker_boot_id,observed,acknowledged
-		FROM request_model_source_checkpoints WHERE request_id=? AND slot=?`, requestID, checkpoint.Slot))
+	progress, err := scanModelCheckpointProgress(tx.QueryRow(`SELECT worker_boot_id,observed,acknowledged
+		FROM request_model_checkpoints WHERE request_id=? AND kind='source' AND slot=?`, requestID, checkpoint.Slot))
 	if err != nil {
 		return exit.Internalf("cannot read checkpoint acknowledgment target: %s", err)
 	}
@@ -231,7 +234,7 @@ func (s *Store) AcknowledgeModelSourceCheckpoint(requestID, selection, bootID, p
 			"source checkpoint acknowledgment no longer matches the observed operation")
 	}
 	data, _ := json.Marshal(checkpoint)
-	if _, err := tx.Exec(`UPDATE request_model_source_checkpoints SET acknowledged=? WHERE request_id=? AND slot=?`,
+	if _, err := tx.Exec(`UPDATE request_model_checkpoints SET acknowledged=? WHERE request_id=? AND kind='source' AND slot=?`,
 		string(data), requestID, checkpoint.Slot); err != nil {
 		return exit.Internalf("cannot record source checkpoint acknowledgment: %s", err)
 	}
@@ -245,23 +248,23 @@ func (s *Store) AcknowledgeModelSourceCheckpoint(requestID, selection, bootID, p
 // The counter covers one source slot; individual transfer identities remain exact.
 func (s *Store) NextModelSourceGrantRevision(requestID, slot string) (uint64, *exit.Error) {
 	var revision int64
-	if err := s.db.QueryRow(`UPDATE request_model_source_checkpoints
-		SET grant_revision=grant_revision+1 WHERE request_id=? AND slot=? AND grant_revision<9223372036854775807
+	if err := s.db.QueryRow(`UPDATE request_model_checkpoints
+		SET grant_revision=grant_revision+1 WHERE request_id=? AND kind='source' AND slot=? AND grant_revision<9223372036854775807
 		RETURNING grant_revision`, requestID, slot).Scan(&revision); err != nil {
 		return 0, exit.Internalf("cannot allocate a source checkpoint grant revision: %s", err)
 	}
 	return uint64(revision), nil
 }
 
-// RecordSourcePublication precedes the external open so cancellation can release
+// RecordCheckpointPublication precedes the external open so cancellation can release
 // every hold even if the daemon dies before the checkpoint is acknowledged.
-func (s *Store) RecordSourcePublication(requestID, operation string, objects []byte) *exit.Error {
-	if _, err := s.db.Exec(`INSERT OR IGNORE INTO request_model_source_publications(request_id,operation,objects) VALUES(?,?,?)`,
+func (s *Store) RecordCheckpointPublication(requestID, operation string, objects []byte) *exit.Error {
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO request_model_checkpoint_publications(request_id,operation,objects) VALUES(?,?,?)`,
 		requestID, operation, objects); err != nil {
 		return exit.Internalf("cannot record source publication intent: %s", err)
 	}
 	var stored []byte
-	if err := s.db.QueryRow(`SELECT objects FROM request_model_source_publications WHERE request_id=? AND operation=?`, requestID, operation).Scan(&stored); err != nil {
+	if err := s.db.QueryRow(`SELECT objects FROM request_model_checkpoint_publications WHERE request_id=? AND operation=?`, requestID, operation).Scan(&stored); err != nil {
 		return exit.Internalf("cannot read source publication intent: %s", err)
 	}
 	if !bytes.Equal(stored, objects) {
@@ -270,29 +273,29 @@ func (s *Store) RecordSourcePublication(requestID, operation string, objects []b
 	return nil
 }
 
-type SourcePublication struct {
+type CheckpointPublication struct {
 	Operation string
 	Objects   json.RawMessage
 	Opened    bool
 }
 
-func (s *Store) OpenedSourcePublication(requestID, operation string) *exit.Error {
-	if _, err := s.db.Exec(`UPDATE request_model_source_publications SET opened=1 WHERE request_id=? AND operation=?`, requestID, operation); err != nil {
+func (s *Store) OpenedCheckpointPublication(requestID, operation string) *exit.Error {
+	if _, err := s.db.Exec(`UPDATE request_model_checkpoint_publications SET opened=1 WHERE request_id=? AND operation=?`, requestID, operation); err != nil {
 		return exit.Internalf("cannot confirm source publication open: %s", err)
 	}
 	return nil
 }
 
-func (s *Store) SourcePublications(requestID string) ([]SourcePublication, *exit.Error) {
-	rows, err := s.db.Query(`SELECT operation,objects,opened FROM request_model_source_publications
+func (s *Store) CheckpointPublications(requestID string) ([]CheckpointPublication, *exit.Error) {
+	rows, err := s.db.Query(`SELECT operation,objects,opened FROM request_model_checkpoint_publications
 		WHERE request_id=? AND released=0 ORDER BY operation LIMIT 128`, requestID)
 	if err != nil {
 		return nil, exit.Internalf("cannot read source publication holds: %s", err)
 	}
 	defer rows.Close()
-	var out []SourcePublication
+	var out []CheckpointPublication
 	for rows.Next() {
-		var operation SourcePublication
+		var operation CheckpointPublication
 		if err := rows.Scan(&operation.Operation, &operation.Objects, &operation.Opened); err != nil {
 			return nil, exit.Internalf("cannot read source publication operation: %s", err)
 		}
@@ -304,8 +307,8 @@ func (s *Store) SourcePublications(requestID string) ([]SourcePublication, *exit
 	return out, nil
 }
 
-func (s *Store) ReleaseSourcePublication(requestID, operation string) *exit.Error {
-	if _, err := s.db.Exec(`UPDATE request_model_source_publications SET released=1 WHERE request_id=? AND operation=?`,
+func (s *Store) ReleaseCheckpointPublication(requestID, operation string) *exit.Error {
+	if _, err := s.db.Exec(`UPDATE request_model_checkpoint_publications SET released=1 WHERE request_id=? AND operation=?`,
 		requestID, operation); err != nil {
 		return exit.Internalf("cannot record source publication release: %s", err)
 	}
@@ -313,9 +316,9 @@ func (s *Store) ReleaseSourcePublication(requestID, operation string) *exit.Erro
 }
 
 func (s *Store) SourceCheckpointRequests() ([]string, *exit.Error) {
-	rows, err := s.db.Query(`SELECT request_id FROM request_model_source_publications WHERE released=0
-		UNION SELECT c.request_id FROM request_model_source_checkpoints c JOIN request_model_transfers t ON t.request_id=c.request_id
-		WHERE c.acknowledged<>c.observed AND t.state IN ('materializing','materialized','finalizing')`)
+	rows, err := s.db.Query(`SELECT request_id FROM request_model_checkpoint_publications WHERE released=0
+		UNION SELECT c.request_id FROM request_model_checkpoints c JOIN request_model_transfers t ON t.request_id=c.request_id
+		WHERE c.kind='source' AND c.acknowledged<>c.observed AND t.state IN ('materializing','materialized','finalizing')`)
 	if err != nil {
 		return nil, exit.Internalf("cannot read owed source checkpoint work: %s", err)
 	}
