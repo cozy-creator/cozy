@@ -277,6 +277,12 @@ func composedScheduledDerivedCheckpointCustody(t *testing.T, fault string) {
 	}
 	outputs, problem := o.store.AllModelTransferWeights(request, 2)
 	fatal(t, problem)
+	attempts, problem := o.store.Attempts(request)
+	fatal(t, problem)
+	if len(attempts) != 2 || attempts[0].State != "closed" || attempts[1].State != "closed" ||
+		attempts[0].InvocationDigest != attempts[1].InvocationDigest {
+		t.Fatal("recovery changed immutable work or failed to close exactly two attempts")
+	}
 	if len(outputs) != 1 || outputs[0].FinalID == "" {
 		t.Fatal("normal finalizer did not retain one exact checkpoint")
 	}
