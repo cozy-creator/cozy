@@ -60,7 +60,11 @@ func TestDevelopmentHoldBridge(t *testing.T) {
 		string(certificate), token, identity))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { scanner := bufio.NewScanner(os.Stdin); scanner.Scan(); cancel() }()
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin) //cozy:stdin-value isolated proof cancellation, not a user prompt
+		scanner.Scan()
+		cancel()
+	}()
 	problem = cli.HoldStoredDevelopmentWorker(ctx, cfg, rentalID, fixture.WorkerBootID, os.Stderr, func(state cli.DevelopmentHoldResult) {
 		body, err := json.Marshal(state)
 		if err != nil {
