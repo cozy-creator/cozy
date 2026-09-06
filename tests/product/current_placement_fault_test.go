@@ -2,15 +2,46 @@ package producttest
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
+
+func TestInitialPackageRefusalNeedsNoOwnedPlacementSet(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	pod := &fakePod{controlKey: public}
+	connection, _ := startFakePod(t, t.TempDir(), pod)
+	o := hostOwner(t, "initial-package-refusal", rentalWiring(connection, private), func(opt *orchestrator.Options) {
+		opt.RentalPrepareFacts = func(_ context.Context, _ *orchestrator.WorkerConnection, ref *pb.DownloadPackageRef) (orchestrator.PrepareFacts, *exit.Error) {
+			facts := testPrepareFacts(ref.Package, ref.Release)
+			facts.ImageInventory = nil // actual host REFUSED event before any set exists
+			return facts, nil
+		}
+	})
+	id, _, problem := o.c.Submit(orchestrator.Submission{
+		IdemKey: "initial-package-refusal", Package: "acme/weightless", Entrypoint: "tile",
+		PlanID: podPlanID("acme/weightless"), Release: "1.0.0", Payload: []byte(`{"size":16}`),
+		Outputs: []string{"image"}, Worker: podRental, Rental: true, RentalRequired: true,
+	})
+	fatal(t, problem)
+	waitUntil(t, "initial preparation refusal settles request", func() bool { row, _ := o.store.RequestRow(id); return row != nil && row.State == "failed" })
+	if _, ok := waitEvent(o, "package_prepare_image_inventory_missing", time.Second); !ok {
+		t.Fatal("initial host refusal lost its typed diagnosis")
+	}
+	pod.mu.Lock()
+	defer pod.mu.Unlock()
+	if len(pod.desired) != 0 || len(pod.preparedSet) != 0 || len(pod.offers) != 0 {
+		t.Fatal("the failed initial package unexpectedly owned a set or attempt")
+	}
+}
 
 // H3's corrected placement was ACTIVATING while Runtime repeated a historical
 // binding fault. Reports are independent wire messages, not successful model
