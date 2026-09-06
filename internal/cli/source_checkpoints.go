@@ -376,16 +376,22 @@ walk:
 		go func() {
 			defer workers.Done()
 			defer func() { <-permits }()
-			_, problem := host.Transfer(ctx, request)
+			// Native transfers can outlive a canceled RPC. Stop dispatch on a sibling
+			// failure, but drain already-granted calls before an automatic retry.
+			_, problem := host.Transfer(parent, request)
 			fail(problem)
 		}()
 	}
 	workers.Wait()
+	if parent.Err() != nil {
+		code := exit.Canceled
+		if parent.Err() == context.DeadlineExceeded {
+			code = exit.Deadline
+		}
+		return exit.New(code, "source checkpoint transfer ended before completion")
+	}
 	if first != nil {
 		return first
-	}
-	if parent.Err() != nil {
-		return exit.New(exit.Canceled, "source checkpoint transfer canceled")
 	}
 	return nil
 }

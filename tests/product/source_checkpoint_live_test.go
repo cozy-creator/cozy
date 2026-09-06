@@ -153,12 +153,15 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	runtime := pb.NewRuntimePreparationClient(connection)
 	var pages, transfers atomic.Int64
 	var gate *checkpointHTTPGate
+	canceled, cancelTransfer := context.WithCancel(ctx)
+	defer cancelTransfer()
 	if *sourceCheckpointConcurrent {
 		gate = newCheckpointHTTPGate(t, func() {
 			progress, problem := store.ModelSourceProgress(requestID)
 			if problem != nil || len(progress) != 1 || progress[0].Acknowledged != nil {
 				t.Error("source custody was acknowledged before native HTTP bodies completed")
 			}
+			cancelTransfer()
 		})
 	}
 	host := orchestrator.SourceCheckpointHost{BootID: boot,
@@ -206,6 +209,17 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 			t.Errorf("exact source publication cleanup failed: %s", problem.ErrName())
 		}
 	}()
+	if gate != nil {
+		ended := owner.SyncSourceCheckpoints(canceled, requestID, host)
+		if ended == nil || ended.Code != exit.Canceled {
+			t.Fatalf("native transfer cancellation lost its type: %v", ended)
+		}
+		progress, problem := store.ModelSourceProgress(requestID)
+		fatal(t, problem)
+		if len(progress) != 1 || progress[0].Acknowledged != nil {
+			t.Fatal("canceled Link advanced custody")
+		}
+	}
 	if gate != nil {
 		denied := owner.SyncSourceCheckpoints(ctx, requestID, host)
 		if denied == nil || denied.Code != exit.Unavailable {
