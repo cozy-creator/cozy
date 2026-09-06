@@ -58,6 +58,8 @@ const (
 // does. It verifies the owner's Ed25519 ClaimProof on both services against the control key
 // the rental's auth document would carry, records what crossed, and answers minimally.
 type fakePod struct {
+	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
+	sourceRuntime pb.RuntimePreparationClient
 	pb.UnimplementedWorkerControlServer
 	pb.UnimplementedPodHostServer
 	controlKey ed25519.PublicKey
@@ -1101,4 +1103,23 @@ func TestPodHostJobDirectiveNamesTheStagedBuild(t *testing.T) {
 	if directive.BuildId == setDigest {
 		t.Fatalf("the JobDirective names the PlacementSet digest, which the worker never staged under")
 	}
+}
+
+func (p *fakePod) SourceCheckpointPage(ctx context.Context, call *pb.SourceCheckpointPageCall) (*pb.SourceCheckpointPageResult, error) {
+	if err := p.verifyClaim(call.GetClaim(), false); err != nil {
+		return nil, err
+	}
+	if p.sourceRuntime == nil {
+		return nil, status.Error(codes.Unimplemented, "no source Runtime")
+	}
+	return p.sourceRuntime.SourceCheckpointPage(ctx, call.GetRequest())
+}
+func (p *fakePod) SourceCheckpointTransfer(ctx context.Context, call *pb.SourceCheckpointTransferCall) (*pb.SourceCheckpointTransferStatus, error) {
+	if err := p.verifyClaim(call.GetClaim(), false); err != nil {
+		return nil, err
+	}
+	if p.sourceRuntime == nil {
+		return nil, status.Error(codes.Unimplemented, "no source Runtime")
+	}
+	return p.sourceRuntime.SourceCheckpointTransfer(ctx, call.GetRequest())
 }

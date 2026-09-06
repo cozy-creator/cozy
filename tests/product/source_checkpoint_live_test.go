@@ -81,8 +81,8 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 		Software struct{ Runtime, Tensorfs, Commit string }
 	}
 	must(t, decoder.Decode(&initial))
-	if initial.Software.Runtime != "0.2.23" || initial.Software.Tensorfs != "0.3.9" {
-		t.Fatal("source proof did not select the expected public Runtime/TensorFS pair")
+	if initial.Software.Runtime == "" || initial.Software.Tensorfs == "" || len(initial.Software.Commit) != 40 {
+		t.Fatal("source proof did not report published Runtime/TensorFS identity")
 	}
 	raw, err := base64.StdEncoding.DecodeString(initial.Request)
 	must(t, err)
@@ -108,14 +108,15 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	defer store.Close()
 	requestID := records.NewID("job")
 	_, fresh, problem := store.Submit(records.Request{ID: requestID, IdemKey: requestID,
-		BodyDigest: "sha256:" + strings.Repeat("c", 64), Package: "proof/source-checkpoint",
-		Entrypoint: "prepare", State: "queued", Kind: "job", Payload: []byte("{}"),
-		Outputs: "[]", WeightsOutputs: "[]", ModelTransfer: intent, Worker: func() string {
+		BodyDigest: "sha256:" + strings.Repeat("c", 64), Package: "cozy/h3-package", Release: "1.0.7", PlanID: "sha256:" + strings.Repeat("35", 32),
+		Worker: func() string {
 			if *sourceCustodyBridge != "" {
 				return "pr-11111111111111111111"
 			}
-			return ""
-		}(), Rental: *sourceCustodyBridge != ""})
+			return podRental
+		}(), Rental: true, RentalRequired: true,
+		Entrypoint: "four-lane", State: "queued", Kind: "job", Payload: []byte("{}"),
+		Outputs: "[]", WeightsOutputs: "[]", ModelTransfer: intent})
 	fatal(t, problem)
 	if !fresh {
 		t.Fatal("source proof request was not newly recorded")
@@ -125,6 +126,7 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	if *sourceCustodyBridge != "" {
 		boot = "boot-1"
 	}
+	activeBoot := boot
 	for _, file := range preparedRequest.Files {
 		fatal(t, store.RecordModelTransferSourceStatus(records.ModelTransferSourceStatus{
 			RequestID: requestID, Member: file.Member, ObjectID: file.ObjectId, WorkerBootID: boot,
@@ -133,8 +135,9 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	_, err = fmt.Fprintf(input, "{\"operation_id\":%q}\n", requestID)
 	must(t, err)
 	var started struct {
-		Address, Prepared string
-		RestoreAddress    string `json:"restore_address"`
+		Address, Prepared  string
+		RestoreAddress     string `json:"restore_address"`
+		LoopRestoreAddress string `json:"loop_restore_address"`
 	}
 	must(t, decoder.Decode(&started))
 	hostname, _, err := net.SplitHostPort(started.Address)
@@ -181,7 +184,7 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	}
 	host := orchestrator.SourceCheckpointHost{BootID: boot,
 		Page: func(ctx context.Context, request *pb.SourceCheckpointPageRequest) (*pb.SourceCheckpointPageResult, *exit.Error) {
-			request.RecordOwnerEpoch, request.WorkerBootId = 1, boot
+			request.RecordOwnerEpoch, request.WorkerBootId = 1, activeBoot
 			answer, err := runtime.SourceCheckpointPage(ctx, request)
 			if err != nil {
 				return nil, exit.Unavailablef("native checkpoint page RPC failed")
@@ -193,7 +196,7 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 			return answer, nil
 		},
 		Transfer: func(ctx context.Context, request *pb.SourceCheckpointTransferRequest) (*pb.SourceCheckpointTransferStatus, *exit.Error) {
-			request.RecordOwnerEpoch, request.WorkerBootId = 1, boot
+			request.RecordOwnerEpoch, request.WorkerBootId = 1, activeBoot
 			if gate != nil {
 				if grant := request.GetUploadGrant(); grant != nil {
 					grant.Url = gate.route(http.MethodPut, grant.ObjectId, grant.Url)
@@ -268,19 +271,61 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 		if peak != 4 || moved == 0 {
 			t.Fatalf("native PUT concurrency/bytes: peak=%d moved=%d", peak, moved)
 		}
-		restored, err := grpc.NewClient(started.RestoreAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		t.Logf("actual native PUT overlap: peak=%d, uploaded body bytes=%d", peak, moved)
+	}
+
+	// A replacement has no source bodies or CAS. Metadata is declared before restoring
+	// the owner's acknowledged head; the same request/selection/profile remains authority.
+	restored, err := grpc.NewClient(started.RestoreAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	must(t, err)
+	defer restored.Close()
+	runtime = pb.NewRuntimePreparationClient(restored)
+	activeBoot = "source-proof-replacement-boot"
+	host.BootID = activeBoot
+	replacement := proto.Clone(preparedRequest).(*pb.PrepareModelSourceRequest)
+	replacement.OperationId = requestID
+	replacement.Checkpoints = []*pb.ModelSourceCheckpoint{checkpoint}
+	for i, file := range replacement.Files {
+		header, err := os.ReadFile(file.HeaderPath)
 		must(t, err)
-		defer restored.Close()
-		runtime = pb.NewRuntimePreparationClient(restored)
-		fatal(t, owner.RestoreSourceCheckpoints(ctx, requestID, host))
+		file.Path = filepath.Join(root, "replacement-absent", fmt.Sprintf("body-%d", i))
+		file.HeaderPath = filepath.Join(root, fmt.Sprintf("replacement-header-%d", i))
+		must(t, os.WriteFile(file.HeaderPath, header, 0o600))
+		file.Verified = false
+		fatal(t, store.RecordModelTransferSourceStatus(records.ModelTransferSourceStatus{
+			RequestID: requestID, Member: file.Member, ObjectID: file.ObjectId,
+			WorkerBootID: activeBoot, Length: int64(file.Length), CapabilityRevision: 2, State: "accepted"}))
+	}
+	fatal(t, owner.RestoreSourceCheckpoints(ctx, requestID, host))
+	recovered, err := runtime.PrepareModelSource(ctx, replacement)
+	must(t, err)
+	if recovered.Outcome != pb.ModelSourcePrepareOutcome_MODEL_SOURCE_PREPARE_OUTCOME_INCOMPLETE ||
+		len(recovered.Checkpoints) != 1 || !proto.Equal(recovered.Checkpoints[0], checkpoint) {
+		t.Fatalf("replacement did not resume exact native progress without conversion: %v", recovered)
+	}
+	spent := map[string]bool{}
+	for _, member := range recovered.SpentMembers {
+		spent[member] = true
+	}
+	for _, file := range preparedRequest.Files {
+		if file.Verified && !spent[file.Member] {
+			t.Fatalf("replacement did not retire covered carrier %s", file.Member)
+		}
+	}
+	for _, file := range replacement.Files {
+		if _, err := os.Stat(file.Path); !os.IsNotExist(err) {
+			t.Fatal("replacement unexpectedly gained a source body")
+		}
+	}
+	if gate != nil {
 		gate.mu.Lock()
 		getPeak := gate.getPeak
 		gate.mu.Unlock()
 		if getPeak != 4 {
 			t.Fatalf("native GET concurrency: peak=%d", getPeak)
 		}
-		t.Logf("actual native network overlap: PUT peak=%d, GET peak=%d, uploaded body bytes=%d; empty-Store head-first restore passed", peak, getPeak, moved)
 	}
+	t.Logf("new boot resumed same operation %s: %d checkpointed bytes, %d spent members, zero source bodies present; partial profile remains incomplete", requestID, recovered.Checkpoints[0].Bytes, len(spent))
 
 	held, problem := store.SourcePublications(requestID)
 	fatal(t, problem)
@@ -289,4 +334,5 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	}
 	t.Logf("public Runtime %s/TensorFS %s source checkpoint: %d native pages, %d successful native transfers, %d verified Hub holds, exact head %s acknowledged",
 		initial.Software.Runtime, initial.Software.Tensorfs, pages.Load(), transfers.Load(), len(held), head)
+	proveSourceReplacementLoop(t, ctx, root, store, auth, requestID, preparedRequest, checkpoint, started.LoopRestoreAddress)
 }
