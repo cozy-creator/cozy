@@ -82,3 +82,15 @@ func TestTaggedUnionKeepsLiteralAndOrdinaryUnionValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestUntaggedStructRefusesAnEmptyFieldName(t *testing.T) {
+	raw := []byte(`{"application":"proof:app","entrypoints":[{"name":"run","request":{"fields":[{"name":"item","type":{"fields":[{"name":"value","type":"int"}]}}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`)
+	iface, problem := launch.DecodePackageInterface(raw)
+	fatal(t, problem)
+	ep, problem := iface.Function("run")
+	fatal(t, problem)
+	fatal(t, launch.ValidatePayload("proof", ep, []byte(`{"item":{"value":7}}`)))
+	if launch.ValidatePayload("proof", ep, []byte(`{"item":{"value":7,"":"undeclared"}}`)) == nil {
+		t.Fatal("an untagged struct treated the empty field name as a discriminator")
+	}
+}

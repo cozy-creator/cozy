@@ -479,7 +479,7 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 			}
 		}
 		for name, element := range object {
-			if name == nested.TagField {
+			if nested.TagField != "" && name == nested.TagField {
 				continue
 			}
 			field, ok := declared[name]
