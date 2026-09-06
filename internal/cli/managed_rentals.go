@@ -392,8 +392,12 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 	// wait between "renting" and "attachable" is named while it passes.
 	m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{Name: orchestrator.PhaseAcquiring})
 	defer m.owner.ForgetPhase(req.ID)
+	operationKey, problem := m.store.ManagedRentalOperationKey(req.ID)
+	if problem != nil {
+		return none, "", problem
+	}
 	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name,
-		"managed-rental-"+req.ID, rental.AcquisitionReason(req),
+		operationKey, rental.AcquisitionReason(req),
 		sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
 		m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID,
 		func(seen hub.Rental) {
