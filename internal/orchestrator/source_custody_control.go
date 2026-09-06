@@ -43,6 +43,9 @@ func DialCheckpointHost(parent context.Context, remote *WorkerConnection, sign R
 			_ = control.Close()
 		}
 	}()
+	if problem := probeWorkerProtocol(ctx, conn, true); problem != nil {
+		return nil, problem
+	}
 	stream, err := pb.NewWorkerControlClient(conn).Control(ctx)
 	if err != nil {
 		return nil, exit.Unavailablef("source custody control stream is unavailable")

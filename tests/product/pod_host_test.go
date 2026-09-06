@@ -117,6 +117,14 @@ type fakePod struct {
 	jobDirectives  []*pb.JobDirective
 }
 
+func (p *fakePod) ProtocolInfo(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+	version := p.wireMinor
+	if version == 0 {
+		version = pb.WireMinor
+	}
+	return &pb.ProtocolInfoResult{WireMinor: version, MinimumWireMinor: min(version, pb.MinCompatibleWireMinor)}, nil
+}
+
 // served is the serve arm's ObservedWorkerState: the exact set accepted and converged,
 // the one placement staged and dispatchable under every binding it names.
 func (p *fakePod) served(d *pb.DesiredWorkerState, epoch uint64) *pb.WorkerFrame {
