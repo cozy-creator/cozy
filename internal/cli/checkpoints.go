@@ -227,12 +227,29 @@ func sourceCheckpointSubject(requestID, selection, slot string) (*pb.CheckpointS
 func (o *modelTransferOwner) SyncCheckpoints(parent context.Context, requestID string, host orchestrator.CheckpointHost) *exit.Error {
 	ctx, cancel := o.requestContext(parent, requestID)
 	defer cancel()
-	client, ref, transfer, problem := o.checkpointPublicationClient(requestID)
-	if problem != nil || transfer == nil {
-		return problem
-	}
 	sources, problem := o.store.ModelSourceProgress(requestID)
 	if problem != nil {
+		return problem
+	}
+	weights, problem := o.store.ModelWeightsProgress(requestID)
+	if problem != nil {
+		return problem
+	}
+	pending := false
+	needs := func(row records.ModelCheckpointProgress) bool {
+		return row.WorkerBootID == host.BootID && row.Observed.HeadID != "" && (row.Acknowledged == nil || *row.Acknowledged != row.Observed)
+	}
+	for _, row := range sources {
+		pending = pending || needs(row)
+	}
+	for _, row := range weights {
+		pending = pending || needs(row.ModelCheckpointProgress)
+	}
+	if !pending {
+		return nil
+	}
+	client, ref, transfer, problem := o.checkpointPublicationClient(requestID)
+	if problem != nil || transfer == nil {
 		return problem
 	}
 	for _, slot := range sources {
@@ -246,10 +263,6 @@ func (o *modelTransferOwner) SyncCheckpoints(parent context.Context, requestID s
 			}); problem != nil {
 			return problem
 		}
-	}
-	weights, problem := o.store.ModelWeightsProgress(requestID)
-	if problem != nil {
-		return problem
 	}
 	for _, slot := range weights {
 		subject := &pb.CheckpointSubject{Kind: &pb.CheckpointSubject_Weights{Weights: slot.Subject}}

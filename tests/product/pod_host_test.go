@@ -60,6 +60,7 @@ const (
 type fakePod struct {
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
 	sourceRuntime pb.RuntimePreparationClient
+	weightsReady  func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
 	pb.UnimplementedWorkerControlServer
 	pb.UnimplementedPodHostServer
 	controlKey ed25519.PublicKey
@@ -1121,6 +1122,16 @@ func (p *fakePod) CheckpointPage(ctx context.Context, call *pb.CheckpointPageCal
 		return nil, status.Error(codes.Unimplemented, "no source Runtime")
 	}
 	return p.sourceRuntime.CheckpointPage(ctx, call.GetRequest())
+}
+
+func (p *fakePod) WeightsIntentReady(_ context.Context, call *pb.WeightsIntentReadyCall) (*pb.WeightsHostAck, error) {
+	if err := p.verifyClaim(call.GetClaim(), false); err != nil {
+		return nil, err
+	}
+	if p.weightsReady == nil {
+		return nil, status.Error(codes.Unimplemented, "no weights Ready peer")
+	}
+	return p.weightsReady(call.GetRequest())
 }
 func (p *fakePod) CheckpointTransfer(ctx context.Context, call *pb.CheckpointTransferCall) (*pb.CheckpointTransferStatus, error) {
 	if err := p.verifyClaim(call.GetClaim(), false); err != nil {
