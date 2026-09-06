@@ -1079,6 +1079,40 @@ pub fn restore_conversion(
 mod tests {
     use super::*;
 
+    #[test]
+    fn checkpoint_documents_refuse_wrong_lengths_before_reading_into_memory() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-document-bound-{}",
+            crate::meta::now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let bytes = b"a verified resident object";
+        let object = store
+            .put_stream(
+                &mut bytes.as_slice(),
+                Some(&ObjectRef::of(bytes)),
+                &Default::default(),
+            )
+            .unwrap()
+            .obj;
+        let mut short = object.clone();
+        short.length = 1;
+        assert_eq!(
+            local_link(&store, &short).unwrap_err().code,
+            Code::LENGTH_MISMATCH
+        );
+        assert_eq!(
+            read_document(&store, &short, 1).unwrap_err().code,
+            Code::LENGTH_MISMATCH
+        );
+        assert_eq!(
+            read_document(&store, &object, 1).unwrap_err().code,
+            Code::COUNT_CAP
+        );
+        assert_eq!(read_document(&store, &object, bytes.len()).unwrap(), bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn object(byte: &str, length: u64) -> ObjectRef {
         ObjectRef {
             sha256: byte.repeat(32),

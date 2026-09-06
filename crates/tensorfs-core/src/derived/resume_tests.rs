@@ -538,3 +538,197 @@ fn wrong_document_lengths_refuse_before_parsing_or_importing_work() {
     abandon(&store, &meta, &id).unwrap();
     std::fs::remove_dir_all(store.root()).unwrap();
 }
+
+#[test]
+fn restored_inherited_source_custody_survives_origin_release_and_writer_restart() {
+    let (store, meta, id, mut declaration) = fixture("inherited-restart");
+    let source_id = format!("sha256:{}", "75".repeat(32));
+    let source_writer = begin(
+        &store,
+        &meta,
+        &source_id,
+        1,
+        super::tests::created_declaration(),
+        None,
+    )
+    .unwrap();
+    let source_part = add_part(
+        &store,
+        &meta,
+        &source_id,
+        1,
+        ("model", "weight", "value"),
+        &mut vec![0x61; 2048].as_slice(),
+    )
+    .unwrap();
+    let source = commit(&store, &meta, &source_id, 1).unwrap();
+    release(&meta, source_writer);
+    declaration.sources.push(Source {
+        alias: "base".into(),
+        manifest: source.manifest.clone(),
+    });
+    declaration.components.push(ComponentDeclaration {
+        target: "retained".into(),
+        source: Some("base".into()),
+        source_component: Some("model".into()),
+        drop: Vec::new(),
+        add: Vec::new(),
+    });
+    declaration.order.push(("retained".into(), "weight".into()));
+    let writer = begin(&store, &meta, &id, 11, declaration.clone(), None).unwrap();
+    let added = data(&store, &meta, &id, 11, 0x31).part.segments()[0].clone();
+    add_config(&meta, &id, 11, "model.json", &mut b"{\"a\":1}".as_slice()).unwrap();
+    let (plan, exported) =
+        checkpoint_progress(&store, &meta, &id, 11, "request", "output", None).unwrap();
+    let head = exported.head.unwrap();
+    let chain = crate::durability::local_chain(&store, &head, &plan).unwrap();
+    // Inputs stay under source custody; a role checkpoint exports only its added payload
+    // and native progress. It does not force another upload of the source closure.
+    assert!(chain.blobs.contains(&added));
+    for object in source_part.part.segments() {
+        assert!(!chain.blobs.contains(object));
+    }
+    assert!(chain.manifests.is_empty());
+    fence(&meta, &id, 11).unwrap();
+    release(&meta, writer);
+    dispose(&store, &meta, &source_id).unwrap();
+    crate::gc::collect(store.root(), false).unwrap();
+
+    let (restored, restored_meta, _, _) = fixture("inherited-empty");
+    transfer(&store, &restored, &head);
+    let canonical = declaration.canonical_work_bytes().unwrap();
+    let validate = || {
+        validate_checkpoint(
+            &restored,
+            &restored_meta,
+            &id,
+            &canonical,
+            &head,
+            "request",
+            "output",
+            &plan,
+        )
+    };
+    assert_eq!(validate().unwrap_err().code, Code::ROOT_ABSENT);
+    assert!(matches!(
+        lookup(&restored, &restored_meta, &id).unwrap(),
+        Lookup::Absent
+    ));
+
+    // Ordinary exact source acquisition into the new Store, without copying SQLite,
+    // private derived roots, a receipt, or the original writer's authority.
+    let manifest = checkpoint::load_manifest(&store, &source.manifest).unwrap();
+    let walk = checkpoint::walk(&store, &manifest).unwrap();
+    for reached in &walk.objects {
+        let mut bytes = Vec::new();
+        store.read_into(&reached.obj.sha256, &mut bytes).unwrap();
+        restored
+            .put_stream(
+                &mut bytes.as_slice(),
+                Some(&reached.obj),
+                &Default::default(),
+            )
+            .unwrap();
+    }
+    restored.put_manifest(&manifest).unwrap();
+    // Resident bytes alone never self-authorize begin or read-only validation.
+    assert_eq!(validate().unwrap_err().code, Code::ROOT_ABSENT);
+    assert_eq!(
+        begin(
+            &restored,
+            &restored_meta,
+            &id,
+            1,
+            declaration.clone(),
+            Some(&head)
+        )
+        .err()
+        .unwrap()
+        .code,
+        Code::ROOT_ABSENT
+    );
+    assert!(roots::read(&restored, &id).unwrap().is_none());
+
+    let operation = "restored-source";
+    let request = format!("sha256:{}", "76".repeat(32));
+    let catalog = crate::catalog::Catalog::open(restored.root()).unwrap();
+    let crate::catalog::SourcePreparation::Open(source_guard) = catalog
+        .begin_source_preparation(operation, &request)
+        .unwrap()
+    else {
+        panic!("already prepared")
+    };
+    crate::ingest::transaction::ensure_session_root(restored.root(), operation, "_tensorfs")
+        .unwrap();
+    crate::ingest::transaction::name_candidates(
+        restored.root(),
+        operation,
+        std::slice::from_ref(&source.manifest),
+    )
+    .unwrap();
+    catalog
+        .commit_source_preparation(
+            operation,
+            &request,
+            &[crate::catalog::SourcePreparationResult {
+                slot: "source".into(),
+                profile: "proof".into(),
+                manifest_sha256: source.manifest.sha256.clone(),
+                manifest_length: source.manifest.length,
+            }],
+        )
+        .unwrap();
+    drop(source_guard);
+    validate().unwrap();
+    assert!(matches!(
+        lookup(&restored, &restored_meta, &id).unwrap(),
+        Lookup::Absent
+    ));
+    let first = begin(
+        &restored,
+        &restored_meta,
+        &id,
+        1,
+        declaration.clone(),
+        Some(&head),
+    )
+    .unwrap();
+    assert_eq!(
+        completed(&restored_meta, &id, 1).unwrap(),
+        (
+            vec![("model".into(), "weight".into(), "data".into())],
+            vec!["model.json".into()]
+        )
+    );
+    crate::ingest::source::release_model_source(&restored, operation).unwrap();
+    assert!(catalog.model_source_operations().unwrap().is_empty());
+    fence(&restored_meta, &id, 1).unwrap();
+    release(&restored_meta, first);
+    crate::gc::collect(restored.root(), false).unwrap();
+    validate().unwrap();
+    let next = begin(&restored, &restored_meta, &id, 2, declaration, None).unwrap();
+    let (_, replay) =
+        checkpoint_progress(&restored, &restored_meta, &id, 2, "request", "output", None).unwrap();
+    assert_eq!(replay.head.as_ref(), Some(&head));
+    let receipt = finish(&restored, &restored_meta, &id, 2);
+    assert_eq!(receipt.inherited_payload_objects, 1);
+    assert_eq!(receipt.inherited_payload_bytes, 2048);
+    assert_eq!(receipt.added_objects, vec![added.clone()]);
+    release(&restored_meta, next);
+    adopt(&restored, &restored_meta, &id, "restored-output").unwrap();
+    crate::gc::collect(restored.root(), false).unwrap();
+    checkpoint::walk(
+        &restored,
+        &checkpoint::load_manifest(&restored, &receipt.manifest).unwrap(),
+    )
+    .unwrap()
+    .require_resident(&restored)
+    .unwrap();
+    dispose(&restored, &restored_meta, &id).unwrap();
+    crate::gc::collect(restored.root(), false).unwrap();
+    assert!(!restored.contains(&added.sha256));
+    assert!(!restored.contains(&source_part.part.segments()[0].sha256));
+    abandon(&store, &meta, &id).unwrap();
+    std::fs::remove_dir_all(store.root()).unwrap();
+    std::fs::remove_dir_all(restored.root()).unwrap();
+}

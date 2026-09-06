@@ -132,6 +132,60 @@ pub enum SourcePreparation {
     Prepared(Vec<SourcePreparationResult>),
 }
 
+pub(crate) fn source_operation_id(operation: &str) -> Result<()> {
+    crate::ids::ascii_name(
+        "model-source operation",
+        operation,
+        crate::limits::MAX_NAME_BYTES,
+    )?;
+    if operation.contains('/') || matches!(operation, "." | "..") {
+        return refuse(
+            Code::KEY_GRAMMAR,
+            "model-source operation is one ordinary path segment",
+        );
+    }
+    Ok(())
+}
+
+const SOURCE_OPERATION_SELECT: &str = "SELECT p.operation_id,p.request_digest,p.state,o.org,o.name
+     FROM tensorfs_source_preparations p
+     LEFT JOIN tensorfs_operations o ON o.id=p.operation_id";
+
+struct SourceOperationRow {
+    operation: String,
+    digest: String,
+    state: String,
+    org: Option<String>,
+    name: Option<String>,
+}
+
+impl SourceOperationRow {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            operation: row.get(0)?,
+            digest: row.get(1)?,
+            state: row.get(2)?,
+            org: row.get(3)?,
+            name: row.get(4)?,
+        })
+    }
+
+    fn validated(self) -> Result<String> {
+        source_operation_id(&self.operation)?;
+        crate::ids::prefixed("source preparation request", &self.digest)?;
+        if !matches!(self.state.as_str(), "open" | "prepared")
+            || self.org.as_deref() != Some("_tensorfs")
+            || self.name.as_deref() != Some("model-source-preparation")
+        {
+            return refuse(
+                Code::DURABILITY_UNPROVEN,
+                "source preparation has missing or conflicting operation identity/state",
+            );
+        }
+        Ok(self.operation)
+    }
+}
+
 impl Catalog {
     pub fn path(root: &Path) -> PathBuf {
         root.join("tensorfs.sqlite")
@@ -397,11 +451,7 @@ impl Catalog {
         operation: &str,
         request_digest: &str,
     ) -> Result<SourcePreparation> {
-        crate::ids::ascii_name(
-            "source preparation operation",
-            operation,
-            crate::limits::MAX_NAME_BYTES,
-        )?;
+        source_operation_id(operation)?;
         let request_digest = crate::ids::prefixed("source preparation request", request_digest)?;
         let guard = self.resume_operation(operation, "_tensorfs", "model-source-preparation")?;
         let connection = self.connection()?;
@@ -463,6 +513,30 @@ impl Catalog {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| sql("collect source results", error))?;
         Ok(rows)
+    }
+
+    /// Registered source operations needing explicit lifecycle release. This is the
+    /// existing operation journal, not GC liveness or a filesystem census. Ordinary
+    /// process replacement and projection rebuild preserve it; after catalog loss,
+    /// replaying the exact source request recreates this coordination as before.
+    pub fn model_source_operations(&self) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{SOURCE_OPERATION_SELECT} ORDER BY p.operation_id"
+            ))
+            .map_err(|error| sql("prepare source operation roster", error))?;
+        let rows = statement
+            .query_map([], SourceOperationRow::read)
+            .map_err(|error| sql("read source operation roster", error))?;
+        let mut operations = Vec::new();
+        for row in rows {
+            operations.push(
+                row.map_err(|error| sql("read source operation", error))?
+                    .validated()?,
+            );
+        }
+        Ok(operations)
     }
 
     /// Publish all prepared refs to replay readers in one SQLite commit. CAS bytes and exact
@@ -549,21 +623,34 @@ impl Catalog {
             .map_err(|error| sql("commit source preparation", error))
     }
 
-    /// Explicit lifecycle release. Acquiring the operation writer lock first prevents a
-    /// caller from dropping holds under an in-flight preparation.
-    pub fn release_source_preparation(&self, operation: &str) -> Result<()> {
-        let count: u64 = self
+    /// The caller quiesces source lifecycle changes before enumerating/releasing.
+    /// Remove its filesystem journal while the existing writer guard excludes GC and
+    /// preparation, then delete the roster row. Failed cleanup remains discoverable.
+    /// An absent source entry is a no-op and never authorizes filesystem cleanup.
+    pub fn release_source_preparation<F>(&self, operation: &str, cleanup: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        use rusqlite::OptionalExtension;
+        source_operation_id(operation)?;
+        let found = self
             .connection()?
             .query_row(
-                "SELECT count(*) FROM tensorfs_source_preparations WHERE operation_id=?1",
+                &format!("{SOURCE_OPERATION_SELECT} WHERE p.operation_id=?1"),
                 [operation],
-                |row| row.get(0),
+                SourceOperationRow::read,
             )
-            .map_err(|error| sql("find source preparation for release", error))?;
-        if count != 1 {
-            return refuse(Code::ROOT_ABSENT, "model-source preparation is absent");
+            .optional()
+            .map_err(|error| sql("find source operation for release", error))?;
+        if found
+            .map(SourceOperationRow::validated)
+            .transpose()?
+            .is_none()
+        {
+            return Ok(());
         }
         let _guard = self.resume_operation(operation, "_tensorfs", "model-source-preparation")?;
+        cleanup()?;
         self.complete_operation(operation)
     }
 
@@ -1266,6 +1353,185 @@ mod tests {
             .unwrap();
         assert_eq!(rebuilt.held_keys().unwrap().len(), 1);
         drop(recovered);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_operation_roster_is_typed_read_only_and_survives_process_reopen() {
+        let root = temporary("source-roster");
+        fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::initialize(&root).unwrap();
+        let digest = format!("sha256:{}", "31".repeat(32));
+        let source = catalog
+            .begin_source_preparation("z-prepared", &digest)
+            .unwrap();
+        catalog
+            .commit_source_preparation(
+                "z-prepared",
+                &digest,
+                &[SourcePreparationResult {
+                    slot: "model".into(),
+                    profile: "proof".into(),
+                    manifest_sha256: "32".repeat(32),
+                    manifest_length: 161,
+                }],
+            )
+            .unwrap();
+        drop(source);
+        let incomplete = catalog
+            .begin_source_preparation("a-incomplete", &digest)
+            .unwrap();
+        // Open work is discoverable even before any filesystem session root exists.
+        assert!(!root.join("tmp/ingest").exists());
+        let generic = catalog
+            .begin_operation("generic-ingest", "_tensorfs", "ingest")
+            .unwrap();
+        let derived = catalog
+            .begin_operation("derived-operation", "_tensorfs", "derived")
+            .unwrap();
+        let lookalike = catalog
+            .begin_operation(
+                "unregistered-source",
+                "_tensorfs",
+                "model-source-preparation",
+            )
+            .unwrap();
+        let before = fs::read(Catalog::path(&root)).unwrap();
+        let reopened = Catalog::open(&root).unwrap();
+        assert_eq!(
+            reopened.model_source_operations().unwrap(),
+            ["a-incomplete", "z-prepared"]
+        );
+        assert_eq!(fs::read(Catalog::path(&root)).unwrap(), before);
+        reopened.replace_all(&Projection::default()).unwrap();
+        assert_eq!(
+            reopened.model_source_operations().unwrap(),
+            ["a-incomplete", "z-prepared"]
+        );
+        assert_eq!(
+            reopened
+                .release_source_preparation("a-incomplete", || panic!("live writer cleaned"))
+                .unwrap_err()
+                .code,
+            Code::STORE_BUSY
+        );
+        drop(incomplete);
+        drop(generic);
+        drop(derived);
+        drop(lookalike);
+        for name in [
+            "generic-ingest",
+            "derived-operation",
+            "unregistered-source",
+            "absent",
+        ] {
+            reopened
+                .release_source_preparation(name, || panic!("non-source cleanup invoked"))
+                .unwrap();
+        }
+        let failed = reopened.release_source_preparation("a-incomplete", || {
+            refuse(Code::IO_FAILED, "injected cleanup refusal")
+        });
+        assert_eq!(failed.unwrap_err().code, Code::IO_FAILED);
+        assert_eq!(
+            reopened.model_source_operations().unwrap(),
+            ["a-incomplete", "z-prepared"]
+        );
+        reopened
+            .release_source_preparation("a-incomplete", || Ok(()))
+            .unwrap();
+        reopened
+            .release_source_preparation("a-incomplete", || panic!("repeated cleanup invoked"))
+            .unwrap();
+        assert_eq!(reopened.model_source_operations().unwrap(), ["z-prepared"]);
+        reopened
+            .release_source_preparation("z-prepared", || Ok(()))
+            .unwrap();
+        assert!(reopened.model_source_operations().unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corrupt_source_operation_rows_refuse_before_any_cleanup() {
+        for mutation in [
+            "UPDATE tensorfs_source_preparations SET request_digest='bad-digest'",
+            "UPDATE tensorfs_operations SET name='derived'",
+            "UPDATE tensorfs_operations SET org='another-owner'",
+            "PRAGMA foreign_keys=OFF; DELETE FROM tensorfs_operations",
+            "PRAGMA ignore_check_constraints=ON; UPDATE tensorfs_source_preparations SET state='closed'",
+            "PRAGMA foreign_keys=OFF; UPDATE tensorfs_operations SET id='../outside'; UPDATE tensorfs_source_preparations SET operation_id='../outside'",
+        ] {
+            let root = temporary("bad-source-roster");
+        fs::create_dir_all(&root).unwrap();
+            let catalog = Catalog::initialize(&root).unwrap();
+            let source = catalog.begin_source_preparation("source", &format!("sha256:{}", "42".repeat(32))).unwrap();
+            drop(source);
+            catalog.connection().unwrap().execute_batch(mutation).unwrap();
+            let before = fs::read(Catalog::path(&root)).unwrap();
+            assert!(catalog.model_source_operations().is_err(), "admitted {mutation}");
+            let requested = if mutation.contains("../outside") { "../outside" } else { "source" };
+            assert!(catalog.release_source_preparation(requested, || panic!("corrupt operation cleaned")).is_err());
+            assert_eq!(fs::read(Catalog::path(&root)).unwrap(), before);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn source_operation_identifiers_cannot_address_parent_or_current_directory() {
+        let root = temporary("source-roster-paths");
+        fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::initialize(&root).unwrap();
+        for operation in ["", ".", "..", "a/b", "../outside", "bad name"] {
+            assert_eq!(
+                catalog
+                    .begin_source_preparation(operation, &format!("sha256:{}", "42".repeat(32)))
+                    .err()
+                    .unwrap()
+                    .code,
+                Code::KEY_GRAMMAR
+            );
+            assert_eq!(
+                catalog
+                    .release_source_preparation(operation, || panic!("invalid path cleaned"))
+                    .unwrap_err()
+                    .code,
+                Code::KEY_GRAMMAR
+            );
+        }
+        assert!(catalog.model_source_operations().unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn releasing_one_source_does_not_read_unrelated_corrupt_roster_entries() {
+        let root = temporary("targeted-source-release");
+        fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::initialize(&root).unwrap();
+        let digest = format!("sha256:{}", "42".repeat(32));
+        drop(catalog.begin_source_preparation("good", &digest).unwrap());
+        drop(
+            catalog
+                .begin_source_preparation("unrelated", &digest)
+                .unwrap(),
+        );
+        catalog.connection().unwrap().execute(
+            "UPDATE tensorfs_source_preparations SET request_digest='corrupt' WHERE operation_id='unrelated'", [],
+        ).unwrap();
+        assert!(catalog.model_source_operations().is_err());
+        let cleaned = std::cell::Cell::new(false);
+        catalog
+            .release_source_preparation("good", || {
+                cleaned.set(true);
+                Ok(())
+            })
+            .unwrap();
+        assert!(cleaned.get());
+        catalog
+            .release_source_preparation("good", || panic!("repeated cleanup"))
+            .unwrap();
+        assert!(catalog
+            .release_source_preparation("unrelated", || panic!("corrupt cleanup"))
+            .is_err());
         let _ = fs::remove_dir_all(root);
     }
 }

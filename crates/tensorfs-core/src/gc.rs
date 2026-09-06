@@ -147,6 +147,32 @@ pub fn session_holds(store: &Store) -> Result<(Vec<HeldKey>, Vec<String>)> {
     Ok((holds, sessions))
 }
 
+/// The same exact manifest roots used by reclamation, without a payload census.
+/// Membership is retention, not caller authorization. A consumer must acquire its
+/// live hold before checking roots so GC cannot remove bytes during admission.
+pub(crate) fn retained_manifests(store: &Store) -> Result<Vec<crate::ids::ObjectRef>> {
+    let mut roots = Vec::new();
+    for (repository, _) in storage::read_repositories(store.root())? {
+        roots.extend(
+            repository
+                .checkpoints
+                .into_iter()
+                .map(|checkpoint| checkpoint.manifest),
+        );
+    }
+    let (holds, _) = session_holds(store)?;
+    roots.extend(
+        holds
+            .into_iter()
+            .filter(|hold| hold.kind == "manifest")
+            .map(|hold| crate::ids::ObjectRef {
+                sha256: hold.sha256,
+                length: hold.length,
+            }),
+    );
+    Ok(roots)
+}
+
 /// One complete pass: exclusivity, orphan temps, census, plan, delete, catalog repair.
 pub fn collect(root: &Path, dry_run: bool) -> Result<Report> {
     let store = Store::open(root)?;

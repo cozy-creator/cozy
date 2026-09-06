@@ -1027,6 +1027,15 @@ impl PyStore {
         Ok(out)
     }
 
+    /// Source-operation cleanup roster; the caller quiesces the owned Store lifecycle.
+    /// Does not scan roots or recover coordination lost with a deleted catalog.
+    fn model_source_operations(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        py.detach(|| {
+            tensorfs_core::catalog::Catalog::open(self.store.root())?.model_source_operations()
+        })
+        .or_refuse(py)
+    }
+
     /// Drop this operation's exact CAS holds after its prepared refs were adopted or rejected.
     fn release_model_source(&self, py: Python<'_>, operation_id: &str) -> PyResult<()> {
         py.detach(|| model_source::release_model_source(&self.store, operation_id))
@@ -1984,6 +1993,12 @@ impl PyDerivedWriter {
     fn commit<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let value = py
             .detach(|| {
+                let guards = self.guards.lock().expect("writer hold mutex poisoned");
+                let guards = guards.as_ref().ok_or_else(|| Refusal {
+                    code: Code::LEASE_REVOKED,
+                    detail: "derived writer holds were released".into(),
+                })?;
+                guards.writer_hold.still_registered(&self.meta)?;
                 derived::commit(
                     &self.store,
                     &self.meta,

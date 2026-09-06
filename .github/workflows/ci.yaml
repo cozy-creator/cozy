@@ -97,6 +97,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
       # The binary rides the wheel (tfs-051). It is built INSIDE the manylinux
       # container so its glibc floor matches the extension module it ships beside.
       - uses: PyO3/maturin-action@v1
@@ -118,6 +119,12 @@ jobs:
       - run: |
           bash scripts/wheel-smoke.sh "${RUNNER_TEMP}/smoke" python3.12 \
             --skip-build --wheels "$PWD/dist"
+      # wheel-smoke builds a host CLI to create its fixture. Replacing only the
+      # portable wheel's CLI with that newer-host ELF must falsify its platform tag.
+      - run: |
+          for wheel in dist/*.whl; do
+            uv run --script scripts/wheel-platform.py "$wheel" --prove target/release/tfs
+          done
 
   # A RELEASED VERSION NUMBER NAMES ONE TREE, FOREVER (proto-036). `v*` is the whole
   # release procedure — publish.yaml triggers on the tag push and there is no local

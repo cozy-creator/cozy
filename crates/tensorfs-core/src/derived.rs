@@ -1360,22 +1360,28 @@ fn require_payload_record(store: &Store, object: &ObjectRef, what: &str) -> Resu
     }
 }
 
-fn resolve_sources(
-    store: &Store,
-    meta: &Meta,
-    declaration: &Declaration,
-) -> Result<Vec<SourceData>> {
-    let mut out = Vec::new();
+fn require_source_roots(store: &Store, declaration: &Declaration) -> Result<()> {
+    if declaration.sources.is_empty() {
+        return Ok(());
+    }
+    let retained = crate::gc::retained_manifests(store)?;
     for declared in &declaration.sources {
-        if !meta.manifest_is_released(&declared.manifest.sha256)? {
+        if !retained.contains(&declared.manifest) {
             return refuse(
                 Code::ROOT_ABSENT,
                 format!(
-                    "source {} is not referenced by a repository release",
+                    "source {} has no exact retained filesystem root",
                     declared.manifest.id()
                 ),
             );
         }
+    }
+    Ok(())
+}
+
+fn load_sources(store: &Store, declaration: &Declaration) -> Result<Vec<SourceData>> {
+    let mut out = Vec::new();
+    for declared in &declaration.sources {
         let manifest = checkpoint::load_manifest(store, &declared.manifest)?;
         if manifest.manifest_id() != declared.manifest.id() {
             return refuse(
@@ -1813,6 +1819,18 @@ pub fn inspect_source(
     component_names: Vec<String>,
     config_names: Vec<String>,
 ) -> Result<SourceInspection> {
+    let hold = meta.acquire_hold("derived-source-inspect")?;
+    let result = inspect_retained_source(store, manifest, component_names, config_names);
+    let released = hold.release(meta);
+    result.and_then(|inspection| released.map(|()| inspection))
+}
+
+fn inspect_retained_source(
+    store: &Store,
+    manifest: ObjectRef,
+    component_names: Vec<String>,
+    config_names: Vec<String>,
+) -> Result<SourceInspection> {
     let alias = "source".to_string();
     let mut declaration = Declaration {
         work_fingerprint: None,
@@ -1842,7 +1860,8 @@ pub fn inspect_source(
         max_new_bytes: 0,
     };
     declaration.normalize_and_validate()?;
-    let mut sources = resolve_sources(store, meta, &declaration)?;
+    require_source_roots(store, &declaration)?;
+    let mut sources = load_sources(store, &declaration)?;
     let source = sources.pop().ok_or_else(|| Refusal {
         code: Code::ROOT_ABSENT,
         detail: "source inspection resolved no source".into(),
@@ -1905,7 +1924,9 @@ pub fn begin(
     // The writer hold is registered before source metadata is touched. It is the live
     // process proof that keeps exclusive GC out even for a source-free create.
     let writer_hold = meta.acquire_hold("derived-writer")?;
-    let sources = match resolve_sources(store, meta, &declaration) {
+    let sources = match require_source_roots(store, &declaration)
+        .and_then(|()| load_sources(store, &declaration))
+    {
         Ok(sources) => sources,
         Err(error) => {
             release_guards(meta, Some(writer_hold), Vec::new());
@@ -2209,6 +2230,29 @@ pub fn validate_checkpoint(
     slot: &str,
     plan: &str,
 ) -> Result<()> {
+    let hold = meta.acquire_hold("derived-checkpoint-inspect")?;
+    let result = validate_retained_checkpoint(
+        store,
+        transaction,
+        declaration_bytes,
+        head,
+        operation,
+        slot,
+        plan,
+    );
+    let released = hold.release(meta);
+    result.and(released)
+}
+
+fn validate_retained_checkpoint(
+    store: &Store,
+    transaction: &str,
+    declaration_bytes: &[u8],
+    head: &ObjectRef,
+    operation: &str,
+    slot: &str,
+    plan: &str,
+) -> Result<()> {
     let transaction = transaction_id(transaction)?;
     let mut declaration = Declaration::from_value(&crate::canon::parse_canonical(
         declaration_bytes,
@@ -2228,7 +2272,8 @@ pub fn validate_checkpoint(
             "derived checkpoint differs from current operation, slot or plan",
         );
     }
-    let sources = resolve_sources(store, meta, &declaration)?;
+    require_source_roots(store, &declaration)?;
+    let sources = load_sources(store, &declaration)?;
     let facts = sources
         .iter()
         .map(|source| source.fact.clone())
@@ -2703,6 +2748,9 @@ fn receipt_from(_store: &Store, row: &TransactionRow) -> Result<ReceiptFacts> {
     })
 }
 
+/// The caller retains Begin's writer hold and source leases through this call.
+/// Root membership was admitted at begin; the live hold now protects those exact
+/// bytes even if their original repository/session/private root is released.
 pub fn commit(
     store: &Store,
     meta: &Meta,
@@ -2715,7 +2763,7 @@ pub fn commit(
         open_row(&mut txn.rows, &transaction, writer_session)?.clone()
     };
     let declaration = declaration(&row_before)?;
-    let sources = resolve_sources(store, meta, &declaration)?;
+    let sources = load_sources(store, &declaration)?;
     let (header, closure, registry_adoptions) = build_header(
         &declaration,
         &sources,
@@ -3063,6 +3111,243 @@ mod tests {
         }
     }
 
+    fn inherited_declaration(manifest: ObjectRef) -> Declaration {
+        Declaration {
+            work_fingerprint: Some(format!("sha256:{}", "44".repeat(32))),
+            sources: vec![Source {
+                alias: "source".into(),
+                manifest,
+            }],
+            components: vec![ComponentDeclaration {
+                target: "inherited".into(),
+                source: Some("source".into()),
+                source_component: Some("model".into()),
+                drop: Vec::new(),
+                add: Vec::new(),
+            }],
+            configs: Vec::new(),
+            order: vec![("inherited".into(), "weight".into())],
+            max_new_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn retained_source_admission_and_writer_hold_share_the_gc_roots() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-retained-source-{}",
+            crate::meta::now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let meta = Meta::open(&store).unwrap();
+        let source_id = format!("sha256:{}", "81".repeat(32));
+        let source_writer =
+            begin(&store, &meta, &source_id, 1, created_declaration(), None).unwrap();
+        let bytes = vec![0x21; 2048];
+        add_part(
+            &store,
+            &meta,
+            &source_id,
+            1,
+            ("model", "weight", "value"),
+            &mut bytes.as_slice(),
+        )
+        .unwrap();
+        let source = commit(&store, &meta, &source_id, 1).unwrap();
+        release_guards(
+            &meta,
+            Some(source_writer.writer_hold),
+            source_writer.source_leases,
+        );
+        let preview = || {
+            inspect_source(
+                &store,
+                &meta,
+                source.manifest.clone(),
+                vec!["model".into()],
+                Vec::new(),
+            )
+        };
+
+        // Committed pending output and owner-adopted output have real filesystem roots.
+        preview().unwrap();
+        adopt(&store, &meta, &source_id, "source-private").unwrap();
+        preview().unwrap();
+        dispose(&store, &meta, &source_id).unwrap();
+        assert_eq!(preview().unwrap_err().code, Code::ROOT_ABSENT);
+        let target_id = format!("sha256:{}", "82".repeat(32));
+        assert_eq!(
+            begin(
+                &store,
+                &meta,
+                &target_id,
+                1,
+                inherited_declaration(source.manifest.clone()),
+                None,
+            )
+            .err()
+            .unwrap()
+            .code,
+            Code::ROOT_ABSENT
+        );
+        assert!(matches!(
+            lookup(&store, &meta, &target_id).unwrap(),
+            Lookup::Absent
+        ));
+
+        // The coordinator's actual prepared-source lifecycle names a private candidate.
+        let operation = "prepared-source";
+        let request_digest = format!("sha256:{}", "83".repeat(32));
+        let catalog = crate::catalog::Catalog::open(&root).unwrap();
+        let crate::catalog::SourcePreparation::Open(source_guard) = catalog
+            .begin_source_preparation(operation, &request_digest)
+            .unwrap()
+        else {
+            panic!("source operation already prepared")
+        };
+        crate::ingest::transaction::ensure_session_root(&root, operation, "_tensorfs").unwrap();
+        crate::ingest::transaction::name_candidates(
+            &root,
+            operation,
+            std::slice::from_ref(&source.manifest),
+        )
+        .unwrap();
+        // An actual candidate is retained even before the rebuildable result row is written.
+        preview().unwrap();
+        catalog
+            .commit_source_preparation(
+                operation,
+                &request_digest,
+                &[crate::catalog::SourcePreparationResult {
+                    slot: "source".into(),
+                    profile: "proof".into(),
+                    manifest_sha256: source.manifest.sha256.clone(),
+                    manifest_length: source.manifest.length,
+                }],
+            )
+            .unwrap();
+        drop(source_guard);
+        crate::gc::collect(&root, false).unwrap();
+        preview().unwrap();
+        let mut wrong = inherited_declaration(source.manifest.clone());
+        wrong.sources[0].manifest.length += 1;
+        assert_eq!(
+            begin(&store, &meta, &target_id, 1, wrong, None)
+                .err()
+                .unwrap()
+                .code,
+            Code::ROOT_ABSENT
+        );
+
+        let writer = begin(
+            &store,
+            &meta,
+            &target_id,
+            1,
+            inherited_declaration(source.manifest.clone()),
+            None,
+        )
+        .unwrap();
+        crate::ingest::source::release_model_source(&store, operation).unwrap();
+        // The resumable writer now retains its admitted sources independently of
+        // their original source operation, including after the live writer exits.
+        preview().unwrap();
+        writer.writer_hold.still_registered(&meta).unwrap();
+        assert_eq!(
+            crate::gc::collect(&root, false).unwrap_err().code,
+            Code::STORE_BUSY
+        );
+        let inherited = commit(&store, &meta, &target_id, 1).unwrap();
+        assert_eq!(inherited.inherited_payload_bytes, 2048);
+        assert!(inherited.added_objects.is_empty());
+        release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
+        crate::gc::collect(&root, false).unwrap();
+        store.read_manifest(&inherited.manifest).unwrap();
+        inspect_source(
+            &store,
+            &meta,
+            inherited.manifest.clone(),
+            vec!["inherited".into()],
+            Vec::new(),
+        )
+        .unwrap();
+        dispose(&store, &meta, &target_id).unwrap();
+        assert_eq!(
+            inspect_source(
+                &store,
+                &meta,
+                inherited.manifest,
+                vec!["inherited".into()],
+                Vec::new()
+            )
+            .unwrap_err()
+            .code,
+            Code::ROOT_ABSENT
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retained_source_still_refuses_corrupt_payload_and_abandoned_writer() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-retained-source-refusal-{}",
+            crate::meta::now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let meta = Meta::open(&store).unwrap();
+        let source_id = format!("sha256:{}", "84".repeat(32));
+        let source_writer =
+            begin(&store, &meta, &source_id, 1, created_declaration(), None).unwrap();
+        let bytes = vec![0x31; 2048];
+        let part = add_part(
+            &store,
+            &meta,
+            &source_id,
+            1,
+            ("model", "weight", "value"),
+            &mut bytes.as_slice(),
+        )
+        .unwrap();
+        let source = commit(&store, &meta, &source_id, 1).unwrap();
+        release_guards(
+            &meta,
+            Some(source_writer.writer_hold),
+            source_writer.source_leases,
+        );
+        let target_id = format!("sha256:{}", "85".repeat(32));
+        let writer = begin(
+            &store,
+            &meta,
+            &target_id,
+            1,
+            inherited_declaration(source.manifest.clone()),
+            None,
+        )
+        .unwrap();
+        assert!(fence(&meta, &target_id, 1).unwrap());
+        abandon(&store, &meta, &target_id).unwrap();
+        assert_eq!(
+            commit(&store, &meta, &target_id, 1).unwrap_err().code,
+            Code::TRANSACTION_CLOSED
+        );
+        release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
+        let path = store.blob_path(&part.part.segments()[0].sha256);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(path, vec![0x32; 2048]).unwrap();
+        assert_eq!(
+            inspect_source(
+                &store,
+                &meta,
+                source.manifest,
+                vec!["model".into()],
+                Vec::new()
+            )
+            .unwrap_err()
+            .code,
+            Code::OBJECT_CORRUPT
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn private_adoption_retains_real_payload_until_dispose_without_a_repository() {
         let root = std::env::temp_dir().join(format!(
@@ -3309,6 +3594,15 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        // An owner-retained checkpoint is a GC root before any public release exists.
+        inspect_source(
+            &store,
+            &meta,
+            manifest_ref.clone(),
+            vec!["model".into()],
+            Vec::new(),
+        )
+        .unwrap();
         store
             .apply_repository(
                 Some(&checkpointed.canonical_bytes()),

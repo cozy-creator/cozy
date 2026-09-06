@@ -16,24 +16,27 @@ import tensorfs
 
 TRANSACTION = "sha256:" + "71" * 32
 FINGERPRINT = tensorfs.object_id(b"tensorfs derived resume fixture producer/1")
-DATA = bytes([0x31]) * 512
+SHAPE = [512, 8192]
+DATA = bytes([0x31]) * (SHAPE[0] * SHAPE[1])
+SCALE = bytes(SHAPE[0] * 4)
+MAX_NEW_BYTES = len(DATA) + len(SCALE) + 1024
 ENCODING = next(digest for alias, digest in tensorfs.seed_digests() if alias == "fp8-rowwise/1")
 TARGETS = {"model": {"drop": [], "add": {"weight": {
-    "logical_dtype": "bf16", "shape": [16, 32], "encoding": ENCODING,
-    "parts": {"data": {"dtype": "f8_e4m3fn", "shape": [16, 32]},
-              "scale": {"dtype": "f32", "shape": [16]}},
+    "logical_dtype": "bf16", "shape": SHAPE, "encoding": ENCODING,
+    "parts": {"data": {"dtype": "f8_e4m3fn", "shape": SHAPE},
+              "scale": {"dtype": "f32", "shape": [SHAPE[0]]}},
 }}}}
 
 
 def begin(store, epoch, checkpoint=None):
     return store.begin_derived(TRANSACTION, epoch, {}, TARGETS,
                                {"model.json": {"kind": "add"}},
-                               [("model", "weight")], 2048,
+                               [("model", "weight")], MAX_NEW_BYTES,
                                work_fingerprint=FINGERPRINT, checkpoint=checkpoint)
 
 
 def finish(writer):
-    writer.add_part("model", "weight", "scale", io.BytesIO(bytes(64)))
+    writer.add_part("model", "weight", "scale", io.BytesIO(SCALE))
     writer.add_config("model.json", io.BytesIO(b'{"a":1}'))
     return writer.commit()
 
@@ -54,8 +57,18 @@ def child(root):
     writer.add_config("model.json", io.BytesIO(b'{"a":1}'))
     head = writer.checkpoint("request", "output")
     print(json.dumps(head), flush=True)
-    # No commit, fence, Drop, or cleanup: the next process observes an abandoned writer.
-    os._exit(23)
+    class InterruptedScale:
+        started = False
+
+        def read(self, size):
+            if self.started:
+                # Die inside an unfinished physical role, without commit/fence/Drop.
+                os._exit(23)
+            self.started = True
+            return SCALE[:min(size, len(SCALE) // 2)]
+
+    writer.add_part("model", "weight", "scale", InterruptedScale())
+    raise AssertionError("partial scale unexpectedly completed")
 
 
 def main():
@@ -149,9 +162,9 @@ def main():
         refused("WRITER_FENCED", lambda: begin(store, 7))
         refused("ARTIFACT_INCOMPLETE", writer.commit)
         writer.add_part("model", "weight", "data", io.BytesIO(DATA))
-        refused("TRANSACTION_CONFLICT", lambda: writer.add_part("model", "weight", "data", io.BytesIO(bytes(512))))
+        refused("TRANSACTION_CONFLICT", lambda: writer.add_part("model", "weight", "data", io.BytesIO(bytes(len(DATA)))))
         declaration = replacement.derived_declaration({}, TARGETS,
-            {"model.json": {"kind": "add"}}, [("model", "weight")], 2048,
+            {"model.json": {"kind": "add"}}, [("model", "weight")], MAX_NEW_BYTES,
             work_fingerprint=FINGERPRINT)
         assert replacement.derived_lookup(TRANSACTION)["state"] == "absent"
         replacement.validate_derived_checkpoint(TRANSACTION, declaration, *head,
@@ -164,6 +177,13 @@ def main():
         assert restored.completed_parts() == writer.completed_parts()
         assert restored.completed_configs() == writer.completed_configs()
         assert restored.checkpoint("request", "output") == checkpoint
+        restored.add_part("model", "weight", "scale", io.BytesIO(SCALE))
+        advanced = restored.checkpoint("request", "output", previous=head)
+        page = replacement.checkpoint_page(advanced["head"], advanced["head_length"],
+            operation_id="request", slot="output", plan_digest=checkpoint["plan_digest"])
+        assert page["previous"] == head
+        assert tensorfs.object_id(DATA) not in {obj["object_id"] for obj in page["objects"]}
+        assert tensorfs.object_id(SCALE) in {obj["object_id"] for obj in page["objects"]}
         recovered = finish(restored)
         local = finish(writer)
         clean_store = tensorfs.Store.init(area / "clean")
@@ -174,8 +194,9 @@ def main():
         assert recovered["declaration"] == json.loads(declaration)
         for current in [store, replacement, clean_store]:
             current.derived_dispose(TRANSACTION)
-        print(f"derived resume: process exit 23, {len(delivered)} HTTP objects / {transferred} B, "
-              "warm fetch 0 B, higher epoch and empty Store match clean receipt")
+        print(f"derived resume: process death inside scale, retained {len(DATA)} B data role, "
+              f"{len(delivered)} HTTP objects / {transferred} B, warm fetch 0 B, "
+              "next checkpoint excludes prior data, higher epoch and empty Store match clean receipt")
 
 
 if __name__ == "__main__":

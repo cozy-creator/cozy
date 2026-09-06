@@ -535,13 +535,19 @@ After fetching the chain into an empty Store, pass `checkpoint=(head_id, length)
 or corrupt part is no longer completed and must be supplied again. Runtime decides which complete
 role groups can be skipped and owns their numerical quality checks. Fencing revokes authority;
 explicit abandonment or terminal disposition releases the private filesystem retention root.
+Inherited source closures must also be restored through their existing acquisition path before
+validating or opening the writer. A derived checkpoint carries added work, not a second copy of
+its inputs. The writer's private root retains its admitted sources across process death and
+release of their original source operation, until commit or abandonment.
 
 The caller may delete `spent` raw carriers once canonical output and its journal are held locally.
 The RecordOwner uploads each Link and its objects and retains an acknowledged head outside the pod.
 Canonical output remains held until upload or an explicit terminal action. A replacement pod fetches the chain
 through ordinary verified admission and passes its head back in `checkpoints`; TensorFS re-derives
 the plan and verifies journalled parts before skipping work. No NFS mount is required or accessed
-by source preparation. Explicit release removes the operation's holds and recovery journal.
+by source preparation. A completed preparation replays its persisted final heads after a lost
+response, including when source bodies are gone or the caller still supplies an older ACK.
+Explicit release removes the operation's holds and recovery journal.
 
 `repo apply` validates the exact manifest, header, and complete blob inventory before the caller may
 perform its repository CAS, then records only `(org,name,manifest_sha256)` in SQLite. Missing or

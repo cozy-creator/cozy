@@ -114,6 +114,12 @@ def wheel_binary(path: pathlib.Path, expected_cargo: str, expected_python: str) 
 
 def wheel_version(path: pathlib.Path) -> str:
     cargo_expected, expected = source_versions()
+    platform = subprocess.run(
+        ["uv", "run", "--script", str(ROOT / "scripts/wheel-platform.py"), str(path)],
+        capture_output=True, text=True, check=False,
+    )
+    if platform.returncode != 0:
+        raise ValueError(platform.stderr.strip() or platform.stdout.strip())
     wheel_binary(path, cargo_expected, expected)
     with zipfile.ZipFile(path) as wheel:
         members = [name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")]

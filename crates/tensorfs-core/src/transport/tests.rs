@@ -620,6 +620,8 @@ fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
     let declared: u64 = checkpoint.bodies.values().map(|b| b.len() as u64).sum();
     let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
     let policy = SourcePolicy::default();
+    // Cache correctness has no artificial stall: retain the production sampling
+    // resolution so CI scheduling noise cannot add retries to exact GET counts.
 
     // POD A — cold Store, cold cache. Every object crosses the network once, and the walk
     // publishes each one onward as it lands.
@@ -631,7 +633,14 @@ fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
         .unwrap()
         .bind_repo_cache(Some(&cache_root))
         .unwrap();
-    let cold = pull(&request_for(&store_a, &origin.base, &policy)).unwrap();
+    let cold = pull(&PullRequest::new(
+        &store_a,
+        &origin.base,
+        "acme/model",
+        &Anonymous,
+        &policy,
+    ))
+    .unwrap();
     assert_eq!(cold.fetched, 8);
     assert_eq!(cold.cached, 0, "a cold cache can answer for nothing");
     assert_eq!(cold.bytes_moved, declared);
@@ -639,7 +648,8 @@ fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
     assert_eq!(
         calls_after_a - 2,
         8,
-        "closure + presign, then one GET per object"
+        "closure + presign, then one GET per object: {:?}",
+        origin.hits.lock().unwrap()
     );
 
     // POD B — a DIFFERENT empty Store on the same mounted cache: the re-rental.
@@ -648,7 +658,14 @@ fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
         .unwrap()
         .bind_repo_cache(Some(&cache_root))
         .unwrap();
-    let warm = pull(&request_for(&store_b, &origin.base, &policy)).unwrap();
+    let warm = pull(&PullRequest::new(
+        &store_b,
+        &origin.base,
+        "acme/model",
+        &Anonymous,
+        &policy,
+    ))
+    .unwrap();
     assert_eq!(
         warm.held, 0,
         "pod B's own Store starts empty — this is a fresh rental"
@@ -681,7 +698,14 @@ fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
     // because it is recorded in the Store and not in this variable.
     let store_b = Store::open(&b).unwrap();
     assert_eq!(store_b.repo_cache().map(|c| c.root()), Some(&*cache_root));
-    let readback = pull(&request_for(&store_b, &origin.base, &policy)).unwrap();
+    let readback = pull(&PullRequest::new(
+        &store_b,
+        &origin.base,
+        "acme/model",
+        &Anonymous,
+        &policy,
+    ))
+    .unwrap();
     assert_eq!(readback.held, 8);
     assert_eq!(
         readback.cached, 0,
