@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -188,34 +189,14 @@ func (o *modelTransferOwner) uploadSourceCheckpointLink(ctx context.Context, cli
 	for i, object := range link.objects {
 		ids[i] = object.ID
 	}
-	for i, object := range link.objects {
-		if acceptedBefore[object.ID] {
-			continue
+	pending := make([]hub.Object, 0, len(link.objects))
+	for _, object := range link.objects {
+		if !acceptedBefore[object.ID] {
+			pending = append(pending, object)
 		}
-		decision, problem := window.Spendable(ctx, object.ID, ids[i:min(i+128, len(ids))], time.Now())
-		if problem != nil {
-			return problem
-		}
-		if decision.Length != object.Length {
-			return exit.Named(exit.Structural, "model_transfer.source_checkpoint_grant_changed", "checkpoint grant changed the selected object length")
-		}
-		if decision.Held {
-			continue
-		}
-		request, problem := o.checkpointTransfer(requestID, intent.SourceSelection, "upload", link.checkpoint, object)
-		if problem != nil {
-			return problem
-		}
-		grant := &pb.WeightsUploadGrant{ObjectId: object.ID, Length: uint64(object.Length), Url: decision.URL,
-			ExpiresAtUnix: decision.ExpiresAtUnix}
-		for name, value := range decision.Headers {
-			grant.RequiredHeaders = append(grant.RequiredHeaders, &pb.WeightsUploadHeader{Name: name, Value: value})
-		}
-		sort.Slice(grant.RequiredHeaders, func(i, j int) bool { return grant.RequiredHeaders[i].Name < grant.RequiredHeaders[j].Name })
-		request.Decision = &pb.SourceCheckpointTransferRequest_UploadGrant{UploadGrant: grant}
-		if _, problem := host.Transfer(ctx, request); problem != nil {
-			return problem
-		}
+	}
+	if problem := o.transferSourceCheckpointObjects(ctx, requestID, intent.SourceSelection, "upload", link.checkpoint, host, pending, window); problem != nil {
+		return problem
 	}
 	for offset := 0; offset < len(link.objects); offset += 128 {
 		batch := link.objects[offset:min(offset+128, len(link.objects))]
@@ -299,10 +280,6 @@ func (o *modelTransferOwner) downloadSourceCheckpointObjects(ctx context.Context
 	requestID, selection string, checkpoint records.ModelSourceCheckpoint, host orchestrator.SourceCheckpointHost, objects []hub.Object,
 ) *exit.Error {
 	operation := sourceCheckpointOperation(requestID, checkpoint.Slot, checkpoint.HeadID)
-	ids := make([]string, len(objects))
-	for i, object := range objects {
-		ids[i] = object.ID
-	}
 	window := orchestrator.NewWeightsGrantWindow(func(ctx context.Context, selected []string) (orchestrator.WeightsGrantMint, *exit.Error) {
 		var mint orchestrator.WeightsGrantMint
 		reads, problem := client.ReadPublicationObjects(ctx, ref, operation, selected)
@@ -328,22 +305,93 @@ func (o *modelTransferOwner) downloadSourceCheckpointObjects(ctx context.Context
 		}
 		return mint, nil
 	})
+	return o.transferSourceCheckpointObjects(ctx, requestID, selection, "download", checkpoint, host, objects, window)
+}
+
+// Each transfer owns a permit before its grant is selected. The calling goroutine alone
+// advances the existing grant window; only the byte-moving RPC runs concurrently.
+const sourceCheckpointParallelism = 4
+
+func (o *modelTransferOwner) transferSourceCheckpointObjects(parent context.Context,
+	requestID, selection, direction string, checkpoint records.ModelSourceCheckpoint,
+	host orchestrator.SourceCheckpointHost, objects []hub.Object, window *orchestrator.WeightsGrantWindow,
+) *exit.Error {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	permits := make(chan struct{}, sourceCheckpointParallelism)
+	var workers sync.WaitGroup
+	var failed sync.Once
+	var first *exit.Error
+	fail := func(problem *exit.Error) {
+		if problem != nil {
+			failed.Do(func() { first = problem; cancel() })
+		}
+	}
+	ids := make([]string, len(objects))
 	for i, object := range objects {
-		read, problem := window.Spendable(ctx, object.ID, ids[i:], time.Now())
+		ids[i] = object.ID
+	}
+walk:
+	for i, object := range objects {
+		select {
+		case permits <- struct{}{}:
+		case <-ctx.Done():
+			break walk
+		}
+		if ctx.Err() != nil {
+			<-permits
+			break
+		}
+		decision, problem := window.Spendable(ctx, object.ID, ids[i:], time.Now())
+		if problem == nil && decision.Length != object.Length {
+			problem = exit.Named(exit.Structural, "model_transfer.source_checkpoint_grant_changed", "checkpoint grant changed the selected object length")
+		}
 		if problem != nil {
-			return problem
+			<-permits
+			fail(problem)
+			break
 		}
-		if read.Length != object.Length {
-			return exit.Named(exit.Structural, "model_transfer.source_checkpoint_reads_invalid", "Tensorhub changed a checkpoint read length")
+		if decision.Held {
+			<-permits
+			continue
 		}
-		request, problem := o.checkpointTransfer(requestID, selection, "download", checkpoint, object)
+		request, problem := o.checkpointTransfer(requestID, selection, direction, checkpoint, object)
 		if problem != nil {
-			return problem
+			<-permits
+			fail(problem)
+			break
 		}
-		request.Decision = &pb.SourceCheckpointTransferRequest_DownloadUrl{DownloadUrl: read.URL}
-		if _, problem := host.Transfer(ctx, request); problem != nil {
-			return problem
+		if direction == "upload" {
+			grant := &pb.WeightsUploadGrant{ObjectId: object.ID, Length: uint64(object.Length), Url: decision.URL,
+				ExpiresAtUnix: decision.ExpiresAtUnix}
+			for name, value := range decision.Headers {
+				grant.RequiredHeaders = append(grant.RequiredHeaders, &pb.WeightsUploadHeader{Name: name, Value: value})
+			}
+			sort.Slice(grant.RequiredHeaders, func(i, j int) bool { return grant.RequiredHeaders[i].Name < grant.RequiredHeaders[j].Name })
+			request.Decision = &pb.SourceCheckpointTransferRequest_UploadGrant{UploadGrant: grant}
+		} else {
+			request.Decision = &pb.SourceCheckpointTransferRequest_DownloadUrl{DownloadUrl: decision.URL}
 		}
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			defer func() { <-permits }()
+			// Native transfers can outlive a canceled RPC. Stop dispatch on a sibling
+			// failure, but drain already-granted calls before an automatic retry.
+			_, problem := host.Transfer(parent, request)
+			fail(problem)
+		}()
+	}
+	workers.Wait()
+	if parent.Err() != nil {
+		code := exit.Canceled
+		if parent.Err() == context.DeadlineExceeded {
+			code = exit.Deadline
+		}
+		return exit.New(code, "source checkpoint transfer ended before completion")
+	}
+	if first != nil {
+		return first
 	}
 	return nil
 }
