@@ -22,13 +22,16 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/transfer"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	grpcstatus "google.golang.org/grpc/status"
 )
 
 func main() {
@@ -51,6 +54,7 @@ func run() {
 	reader := flag.String("reader", "", "explicit serial reader executable; remaining arguments go to it")
 	proofObject := flag.String("proof-object", "", "bank only one exact object through the complete native/Hub/Host custody path")
 	execute := flag.Bool("execute", false, "publish retained bytes through existing Hub and PodHost APIs")
+	verifyCustody := flag.Bool("verify-custody", false, "verify every previously finalized exact closure against Hub")
 	flag.Parse()
 	if *requestID == "" || *rentalID == "" || *bootID == "" {
 		fail("exact request, rental and boot are required")
@@ -69,9 +73,9 @@ func run() {
 	if req == nil || !req.IsJob() || req.ModelTransfer == nil || req.ModelTransfer.Kind != "model-upload" || req.Worker != *rentalID {
 		fail("request does not bind this retained upload")
 	}
-	transfer, problem := st.ModelTransferOf(req.ID)
+	transferState, problem := st.ModelTransferOf(req.ID)
 	check(problem)
-	if transfer == nil || transfer.State != "failed" {
+	if transferState == nil || transferState.State != "failed" {
 		fail("operator recovery requires a blocked publication")
 	}
 	attempt, problem := st.AttemptRow(req.ID, req.Ordinal)
@@ -106,6 +110,32 @@ func run() {
 		fail("rental boot changed")
 	}
 	emit(map[string]any{"preflight": true, "request": req.ID, "rental": *rentalID, "boot": *bootID, "receipts": len(rows), "execute": *execute})
+	if *verifyCustody {
+		client := hub.New(cfg, "cozy-retained-custody").WithTokenSource(accountauth.New(cfg))
+		ref, problem := hub.ParseRef(req.ModelTransfer.Destination)
+		check(problem)
+		for _, row := range rows {
+			if row.FinalID == "" {
+				fail("checkpoint is not finalized")
+			}
+			declared := make([]hub.Object, len(row.Objects))
+			for i, object := range row.Objects {
+				declared[i] = hub.Object{ID: object.ObjectID, Length: object.Length}
+			}
+			opened, problem := client.OpenPublication(ctx, ref, row.FinalID, declared, "verify retained checkpoint custody")
+			check(problem)
+			totals, problem := transfer.ValidateOpenedPublication(opened, row.FinalID, declared)
+			check(problem)
+			if opened.Publication.State != "checkpointed" || totals.MissingObjects != 0 {
+				fail("checkpoint closure is not verified")
+			}
+			checkpoint, problem := client.FinalizePublication(ctx, ref, row.FinalID, hub.FinalizePublicationRequest{ManifestID: row.ManifestID, ManifestLength: row.ManifestLength}, "verify retained checkpoint custody")
+			check(problem)
+			check(transfer.ValidateFinalizedCheckpoint(checkpoint, row.FinalID, row.ManifestID, row.ManifestLength, totals))
+			emit(map[string]any{"output": row.OutputSlot, "hub_custody": checkpoint})
+		}
+		return
+	}
 	if !*execute {
 		return
 	}
@@ -165,6 +195,9 @@ func run() {
 	if all {
 		emit(map[string]any{"custody_complete": true, "request_lifecycle_recovery_pending": problem != nil})
 		return
+	}
+	if problem != nil {
+		emit(map[string]any{"recovery_failure": problem.ErrName(), "error_code": problem.Code})
 	}
 	check(problem)
 	fail("not all output checkpoints have verified custody")
@@ -277,7 +310,7 @@ func (m *custodyMover) pushBatch(ctx context.Context, weights records.ModelTrans
 	// behind a metadata walk. The Hub may have verified a concurrent upload meanwhile.
 	fresh, problem := mint(ctx, ids)
 	if problem != nil {
-		return 0, problem
+		return 0, exit.Named(problem.Code, "operator.batch_grant", "Hub batch mint failed (%s)", problem.ErrName())
 	}
 	if len(fresh.Decisions) != len(items) {
 		return 0, exit.New(exit.Conflict, "incomplete batch grant")
@@ -307,7 +340,7 @@ func (m *custodyMover) pushBatch(ctx context.Context, weights records.ModelTrans
 		return 0, nil
 	}
 	if m.input.Encode(docs) != nil || !m.answers.Scan() {
-		return 0, exit.Unavailablef("native batch reader ended")
+		return 0, exit.Named(exit.Unavailable, "operator.reader_ended", "native batch reader ended")
 	}
 	var results []readerResult
 	if json.Unmarshal(m.answers.Bytes(), &results) != nil || len(results) != len(uploads) {
@@ -323,7 +356,7 @@ func (m *custodyMover) pushBatch(ctx context.Context, weights records.ModelTrans
 		sent += result.Transferred
 		verified, problem := mint(ctx, []string{object.ObjectID})
 		if problem != nil {
-			return sent, problem
+			return sent, exit.Named(problem.Code, "operator.verify_grant", "Hub verification failed (%s)", problem.ErrName())
 		}
 		if len(verified.Decisions) != 1 || !verified.Decisions[0].Held || verified.Decisions[0].ObjectID != object.ObjectID || verified.Decisions[0].Length != object.Length {
 			return sent, exit.Unavailablef("Hub has not verified exact uploaded object")
@@ -357,12 +390,12 @@ func (m *custodyMover) hold(ctx context.Context, weights records.ModelTransferWe
 	defer cancel()
 	stream, err := m.host.WeightsTransfer(callCtx, &pb.WeightsTransferCall{Claim: m.claim, Request: request})
 	if err != nil {
-		return exit.Unavailablef("pinned PodHost custody call failed")
+		return exit.Named(exit.Unavailable, "operator.host_open", "pinned PodHost custody call failed (%s)", grpcstatus.Code(err))
 	}
 	for {
 		status, err := stream.Recv()
 		if err != nil {
-			return exit.Unavailablef("pinned PodHost returned no held custody")
+			return exit.Named(exit.Unavailable, "operator.host_status", "pinned PodHost returned no held custody (%s)", grpcstatus.Code(err))
 		}
 		if status.RecordOwnerEpoch != request.RecordOwnerEpoch || status.ControlStreamEpoch != 0 || status.WorkerBootId != request.WorkerBootId || status.RequestId != request.RequestId || status.AttemptOrdinal != request.AttemptOrdinal || !bytes.Equal(status.InvocationSpecDigest, invocation) || status.OutputSlot != weights.OutputSlot || status.WeightsTransactionId != weights.TransactionID || status.ObjectId != object.ObjectID || status.OperationId != operation || status.GrantRevision != request.GrantRevision || status.Length != uint64(object.Length) {
 			return exit.Named(exit.Conflict, "operator.host_binding_changed", "PodHost custody response changed its request binding")
