@@ -1791,6 +1791,7 @@ func (c *Orchestrator) relayDescriptorDefect(w *worker, revision uint64, f *pb.F
 		return
 	}
 	if w.spec.Connection == nil || w.spec.Connection.RentalID == "" ||
+		w.spec.Placement.LocalRevisionDigest != "" ||
 		len(w.desiredPackages) != 1 || w.defectReportedRevision == revision {
 		return
 	}
