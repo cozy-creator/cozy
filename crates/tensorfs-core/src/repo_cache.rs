@@ -861,6 +861,101 @@ impl MirrorState {
     }
 }
 
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+
+    fn temporary(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tensorfs-backfill-{name}-{}-{}",
+            std::process::id(),
+            store::now_nanos_unique()
+        ))
+    }
+
+    #[test]
+    fn active_cache_copy_allows_gc_and_keeps_its_open_verified_bytes() {
+        let root = temporary("gc");
+        let source = Store::init(&root.join("source")).unwrap();
+        let bytes = vec![37; store::BUF * 2 + 17];
+        let object = source
+            .put_stream(&mut bytes.as_slice(), None, &Fault::default())
+            .unwrap()
+            .obj;
+        let mut file = source.open_verified(&object.sha256).unwrap();
+        let cache = RepoObjectCache::new(root.join("cache"));
+        let destination = cache.path(CacheKind::Blob, &object.sha256).unwrap();
+        struct Reclaim<F> {
+            file: F,
+            root: PathBuf,
+            first: bool,
+            length: u64,
+        }
+        impl<F: Read> Read for Reclaim<F> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.file.read(output)?;
+                if self.first {
+                    self.first = false;
+                    // The actual copy has already opened its temporary and read its
+                    // first buffer. No global hold may defer GC until cache I/O ends.
+                    let report = crate::gc::collect(&self.root, false).unwrap();
+                    assert_eq!(report.reclaimed_blobs, 1);
+                    assert_eq!(report.reclaimed_bytes, self.length);
+                }
+                Ok(read)
+            }
+        }
+        let mut input = Reclaim {
+            file: &mut file,
+            root: source.root().to_path_buf(),
+            first: true,
+            length: object.length,
+        };
+        assert_eq!(publish_stream(&mut input, &destination, &object), Ok(true));
+        assert!(!source.contains(&object.sha256));
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert_eq!(verify_path(&destination, CacheKind::Blob, &object), Ok(()));
+        assert_eq!(
+            fs::read_dir(destination.parent().unwrap()).unwrap().count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_cache_copy_removes_only_its_temporary_and_never_publishes() {
+        let root = temporary("failure");
+        let cache = RepoObjectCache::new(&root);
+        let object = ObjectRef::of(&[19; 1024]);
+        let destination = cache.path(CacheKind::Blob, &object.sha256).unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let other = destination.parent().unwrap().join(".other-process.tmp");
+        fs::write(&other, b"owned elsewhere").unwrap();
+        struct Fails(bool);
+        impl Read for Fails {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("injected source read failure"));
+                }
+                self.0 = true;
+                output[..17].fill(19);
+                Ok(17)
+            }
+        }
+        assert_eq!(
+            publish_stream(&mut Fails(false), &destination, &object),
+            Err(SoftFailure::Unavailable)
+        );
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&other).unwrap(), b"owned elsewhere");
+        assert_eq!(
+            fs::read_dir(destination.parent().unwrap()).unwrap().count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 impl Drop for Mirror {
     fn drop(&mut self) {
         self.close();

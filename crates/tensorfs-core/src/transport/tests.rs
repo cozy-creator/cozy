@@ -3478,7 +3478,11 @@ fn blocked_optional_backfill_does_not_hold_origin_slots_completion_or_gc() {
     let _serial = OPTIONAL_CACHE_PROOFS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let cache_root = temporary("blocked-backfill-cache");
+    let exit_root = std::env::var_os("TFS_TEST_BACKFILL_EXIT_ROOT").map(PathBuf::from);
+    let cache_root = exit_root.as_ref().map_or_else(
+        || temporary("blocked-backfill-cache"),
+        |root| root.join("cache"),
+    );
     let cache = RepoObjectCache::new(&cache_root);
     let checkpoint = Arc::new(checkpoint(24, 32 * 1024));
     let blocked = checkpoint
@@ -3526,7 +3530,10 @@ fn blocked_optional_backfill_does_not_hold_origin_slots_completion_or_gc() {
         }
     }
     let release = Release(fifo_paths.clone());
-    let a = temporary("blocked-backfill-a");
+    let a = exit_root.as_ref().map_or_else(
+        || temporary("blocked-backfill-a"),
+        |root| root.join("store"),
+    );
     let store = Store::init(&a)
         .unwrap()
         .bind_repo_cache(Some(&cache_root))
@@ -3585,6 +3592,12 @@ fn blocked_optional_backfill_does_not_hold_origin_slots_completion_or_gc() {
         })
         .count();
     assert_eq!(pool_threads, 4);
+    if exit_root.is_some() {
+        // The subprocess proof returns normally with all four workers still waiting
+        // on their FIFO opens. It must not depend on the test's unblock cleanup.
+        std::mem::forget(release);
+        return;
+    }
 
     // Another Store/cache pair still acquires its exact objects while the process
     // pool is full. Repeated reference offers fill/drop the bounded queue, never
@@ -3639,4 +3652,47 @@ fn blocked_optional_backfill_does_not_hold_origin_slots_completion_or_gc() {
     for root in [a, b, cache_root, second_cache] {
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+#[test]
+fn blocked_optional_backfill_does_not_delay_process_exit() {
+    let root = temporary("backfill-process-exit");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "transport::tests::blocked_optional_backfill_does_not_hold_origin_slots_completion_or_gc",
+            "--nocapture",
+        ])
+        .env("TFS_TEST_BACKFILL_EXIT_ROOT", &root)
+        .spawn()
+        .unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= until {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            std::fs::remove_dir_all(&root).unwrap();
+            panic!("process exit waited for optional backfill");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success());
+    // A new process sees the completed local checkpoint. The unfinished cache offers
+    // conferred no custody and their loss did not remove or corrupt local bytes.
+    let store = Store::open(&root.join("store")).unwrap();
+    let checkpoint = checkpoint(24, 32 * 1024);
+    for object in &checkpoint.objects {
+        assert!(store.record_valid(&object.sha256).is_ok());
+    }
+    assert_eq!(
+        store
+            .read_manifest(&checkpoint.manifest)
+            .unwrap()
+            .canonical_bytes(),
+        checkpoint.bodies[&checkpoint.manifest.sha256]
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
