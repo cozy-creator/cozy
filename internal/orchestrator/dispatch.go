@@ -510,6 +510,11 @@ func (c *Orchestrator) requeue(requestID, why string, charge bool) {
 // longer wait. A request that queues forever behind a worker that died on boot is the
 // worst of both: no output and no answer.
 func (c *Orchestrator) selectOrStart(req records.Request) {
+	current, problem := c.opt.Store.RequestRow(req.ID)
+	if problem != nil || current == nil || (current.State != "submitted" && current.State != "queued") {
+		return
+	}
+	req = *current
 	// A queued pin can predate a client upgrade or the peer's first ClaimAck.
 	// Replan only work which has never been offered; keep old attempts/data intact.
 	if req.Rental && req.Worker != "" {
@@ -538,6 +543,10 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			}
 		}
 		if reason != "" {
+			if req.RetainWork {
+				c.failQueued(req.ID, exit.Named(exit.Conflict, "request.retained_rental_unavailable", "the retained rental cannot execute this transaction (%s)", reason))
+				return
+			}
 			attempts, problem := c.opt.Store.Attempts(req.ID)
 			if problem != nil || len(attempts) != 0 {
 				return

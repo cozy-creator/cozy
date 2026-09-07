@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS request_model_transfer_objects (
   PRIMARY KEY(request_id,attempt,output_slot,object_id),
   FOREIGN KEY(request_id,attempt,output_slot)
     REFERENCES request_model_transfer_outputs(request_id,attempt,output_slot)
-)`, modelSourceCheckpointSchema, modelSourcePublicationSchema}
+)`, modelCheckpointSchema, modelCheckpointPublicationSchema}
 
 type ModelTransferSourceFile struct {
 	Member string `json:"member"`
@@ -309,7 +309,8 @@ func (s *Store) ModelTransfersOwed() ([]ModelTransfer, *exit.Error) {
 
 func (s *Store) BeginModelTransferMaterialization(requestID string) *exit.Error {
 	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='materializing',updated_at=?
-		WHERE request_id=? AND state IN ('pending','materializing','materialized')`, now(), requestID)
+		WHERE request_id=? AND state IN ('pending','materializing','materialized')
+		AND EXISTS(SELECT 1 FROM requests WHERE id=? AND state IN ('submitted','queued'))`, now(), requestID, requestID)
 	if err != nil {
 		return exit.Internalf("cannot begin model transfer materialization: %s", err)
 	}

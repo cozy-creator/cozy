@@ -363,6 +363,7 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 		OutcomeId: attempt.TerminalID, OutcomeDigest: outcomeDigest,
 		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch,
 		WorkerBootId: s.bootID,
+		RetainWork:   req.RetainWork && (records.RetainedState(req.State) || req.State == "requeue_pending"),
 	}
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_OutcomeAck{OutcomeAck: ack}}) {
 		c.logf("OutcomeAck %s#%d was not queued: the closed stream owes a replay", requestID, ordinal)
@@ -372,7 +373,7 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 		c.logf("OutcomeAck %s#%d was queued but closure is still owed: %s", requestID, ordinal, e.Message)
 		return
 	}
-	if req.ModelTransfer != nil && !records.RetainedState(req.State) && req.State != "canceling" {
+	if req.ModelTransfer != nil && !records.RetainedState(req.State) && req.State != "canceling" && req.State != "requeue_pending" {
 		go c.finishModelTransferRequest(requestID, int64(ordinal))
 		return
 	}

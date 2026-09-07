@@ -195,6 +195,10 @@ type standInPod struct {
 	epoch  uint64
 }
 
+func (p *standInPod) ProtocolInfo(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+	return &pb.ProtocolInfoResult{WireMinor: pb.WireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor}, nil
+}
+
 // claims counts the control streams this pod has accepted a Claim on. It is the owner's
 // redial rate seen from the other end, and the only honest measure of a reconnect loop.
 func (p *standInPod) claims() uint64 {

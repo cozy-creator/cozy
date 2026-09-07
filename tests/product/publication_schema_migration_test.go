@@ -32,7 +32,21 @@ func databaseRows(t *testing.T, path string) map[string]string {
 	must(t, names.Close())
 	out := map[string]string{}
 	for _, name := range tables {
-		rows, err := db.Query(`SELECT * FROM "` + name + `"`)
+		query := `SELECT * FROM "` + name + `"`
+		identity := name
+		if name == "request_model_checkpoints" {
+			var changed int
+			must(t, db.QueryRow(`SELECT count(*) FROM request_model_checkpoints WHERE kind<>'source' OR length(subject)<>0 OR attempt<>0`).Scan(&changed))
+			if changed != 0 {
+				t.Fatal("migration invented weights authority")
+			}
+			query = `SELECT request_id,slot,worker_boot_id,observed,acknowledged,grant_revision FROM request_model_checkpoints`
+			identity = "request_model_source_checkpoints"
+		}
+		if name == "request_model_checkpoint_publications" {
+			identity = "request_model_source_publications"
+		}
+		rows, err := db.Query(query)
 		must(t, err)
 		columns, err := rows.Columns()
 		must(t, err)
@@ -76,7 +90,7 @@ func databaseRows(t *testing.T, path string) map[string]string {
 		sort.Strings(encoded)
 		raw, err := json.Marshal(encoded)
 		must(t, err)
-		out[name] = fmt.Sprintf("%d:%x", len(encoded), sha256.Sum256(raw))
+		out[identity] = fmt.Sprintf("%d:%x", len(encoded), sha256.Sum256(raw))
 	}
 	return out
 }
@@ -125,5 +139,5 @@ func TestPublicationCancellationMigratesPrivateCopyWithoutChangingRows(t *testin
 	if sha256.Sum256(still) != sha256.Sum256(original) {
 		t.Fatal("source snapshot changed")
 	}
-	t.Logf("schema23→24 private copy preserves all rows in %d tables; foreign keys valid; original snapshot unchanged", len(before))
+	t.Logf("schema23→25 private copy preserves all rows in %d tables, including source heads/ACKs/revisions; foreign keys valid; original snapshot unchanged", len(before))
 }

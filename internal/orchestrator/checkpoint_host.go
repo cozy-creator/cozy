@@ -11,38 +11,37 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// SourceCheckpointHost supplies the claimed pod's bounded byte-transfer lane.
+// CheckpointHost supplies the claimed pod's bounded byte-transfer lane.
 // The publication owner supplies exact subjects and short-lived grants only.
-type SourceCheckpointHost struct {
+type CheckpointHost struct {
 	BootID   string
-	Page     func(context.Context, *pb.SourceCheckpointPageRequest) (*pb.SourceCheckpointPageResult, *exit.Error)
-	Transfer func(context.Context, *pb.SourceCheckpointTransferRequest) (*pb.SourceCheckpointTransferStatus, *exit.Error)
+	Page     func(context.Context, *pb.CheckpointPageRequest) (*pb.CheckpointPageResult, *exit.Error)
+	Transfer func(context.Context, *pb.CheckpointTransferRequest) (*pb.CheckpointTransferStatus, *exit.Error)
 }
 
-func (c *Orchestrator) sourceCheckpointHost(request records.Request) (SourceCheckpointHost, *exit.Error) {
+func (c *Orchestrator) checkpointHost(request records.Request) (CheckpointHost, *exit.Error) {
 	s, problem := c.rentalControl(request.Worker)
 	if problem != nil {
-		return SourceCheckpointHost{}, problem
+		return CheckpointHost{}, problem
 	}
 	if s.host == nil {
-		return SourceCheckpointHost{}, exit.Unavailablef("source checkpoint has no claimed PodHost lane")
+		return CheckpointHost{}, exit.Unavailablef("source checkpoint has no claimed PodHost lane")
 	}
-	return sourceCheckpointAdapter(s.host, s.claim), nil
+	return checkpointAdapter(s.host, s.claim), nil
 }
 
-func sourceCheckpointAdapter(host pb.PodHostClient, claim *pb.Claim) SourceCheckpointHost {
-	return SourceCheckpointHost{BootID: claim.WorkerBootId,
-		Page: func(ctx context.Context, request *pb.SourceCheckpointPageRequest) (*pb.SourceCheckpointPageResult, *exit.Error) {
-			request.RecordOwnerEpoch, request.ControlStreamEpoch, request.WorkerBootId = recordOwnerEpoch, 0, claim.WorkerBootId
-			answer, err := host.SourceCheckpointPage(ctx, &pb.SourceCheckpointPageCall{Claim: claim, Request: request})
+func checkpointAdapter(host pb.PodHostClient, claim *pb.Claim) CheckpointHost {
+	return CheckpointHost{BootID: claim.WorkerBootId,
+		Page: func(ctx context.Context, request *pb.CheckpointPageRequest) (*pb.CheckpointPageResult, *exit.Error) {
+			request.RecordOwnerEpoch, request.ControlStreamEpoch, request.WorkerBootId = claim.RecordOwnerEpoch, 0, claim.WorkerBootId
+			answer, err := host.CheckpointPage(ctx, &pb.CheckpointPageCall{Claim: claim, Request: request})
 			if err != nil {
 				return nil, exit.Unavailablef("worker source checkpoint page is unavailable")
 			}
 			if answer == nil || answer.RecordOwnerEpoch != request.RecordOwnerEpoch || answer.ControlStreamEpoch != 0 ||
-				answer.WorkerBootId != claim.WorkerBootId || answer.OperationId != request.OperationId || answer.Slot != request.Slot ||
-				!bytes.Equal(answer.SourceSelectionDigest, request.SourceSelectionDigest) ||
+				answer.WorkerBootId != claim.WorkerBootId || !proto.Equal(answer.Subject, request.Subject) ||
 				!bytes.Equal(answer.PlanDigest, request.PlanDigest) || !proto.Equal(answer.Head, request.Head) ||
-				len(answer.Objects) > pb.MaxSourceCheckpointObjects || proto.Size(answer) > pb.MaxInlineControlBytes {
+				len(answer.Objects) > pb.MaxCheckpointObjects || proto.Size(answer) > pb.MaxInlineControlBytes {
 				return nil, exit.Named(exit.Structural, "model_transfer.source_checkpoint_page_invalid",
 					"worker source checkpoint page changed its claimed subject or exceeded its bound")
 			}
@@ -51,15 +50,14 @@ func sourceCheckpointAdapter(host pb.PodHostClient, claim *pb.Claim) SourceCheck
 			}
 			return answer, nil
 		},
-		Transfer: func(ctx context.Context, request *pb.SourceCheckpointTransferRequest) (*pb.SourceCheckpointTransferStatus, *exit.Error) {
-			request.RecordOwnerEpoch, request.ControlStreamEpoch, request.WorkerBootId = recordOwnerEpoch, 0, claim.WorkerBootId
-			answer, err := host.SourceCheckpointTransfer(ctx, &pb.SourceCheckpointTransferCall{Claim: claim, Request: request})
+		Transfer: func(ctx context.Context, request *pb.CheckpointTransferRequest) (*pb.CheckpointTransferStatus, *exit.Error) {
+			request.RecordOwnerEpoch, request.ControlStreamEpoch, request.WorkerBootId = claim.RecordOwnerEpoch, 0, claim.WorkerBootId
+			answer, err := host.CheckpointTransfer(ctx, &pb.CheckpointTransferCall{Claim: claim, Request: request})
 			if err != nil {
 				return nil, exit.Unavailablef("worker source checkpoint transfer is unavailable")
 			}
 			if answer == nil || answer.RecordOwnerEpoch != request.RecordOwnerEpoch || answer.ControlStreamEpoch != 0 ||
-				answer.WorkerBootId != claim.WorkerBootId || answer.OperationId != request.OperationId || answer.Slot != request.Slot ||
-				!bytes.Equal(answer.SourceSelectionDigest, request.SourceSelectionDigest) ||
+				answer.WorkerBootId != claim.WorkerBootId || !proto.Equal(answer.Subject, request.Subject) ||
 				!bytes.Equal(answer.PlanDigest, request.PlanDigest) || !proto.Equal(answer.Head, request.Head) ||
 				!proto.Equal(answer.Object, request.Object) || answer.TransferId != request.TransferId ||
 				answer.GrantRevision != request.GrantRevision || answer.TransferredBytes > request.Object.Ref.Length {

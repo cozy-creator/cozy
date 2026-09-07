@@ -103,6 +103,7 @@ func run() int {
 	}
 
 	server := grpc.NewServer()
+	pb.RegisterRuntimePreparationServer(server, &fakePreparation{})
 	pb.RegisterWorkerControlServer(server, &fakeControl{
 		say: say, arm: *arm, bootID: boot, instance: instance, releaseID: release,
 		root: *cozyHome, verify: verify,

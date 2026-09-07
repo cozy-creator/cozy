@@ -56,8 +56,40 @@ func (c *Orchestrator) RecoverLostWork() {
 		return
 	}
 	for _, req := range orphaned {
+		if req.RetainWork {
+			c.retainLostWork(req)
+			continue
+		}
 		c.recoverPinned(req, req.Worker, c.lostRentalCause(req.Worker))
 	}
+}
+
+// A private transaction's rental owns its local-only intermediate bytes. A new
+// machine cannot honestly resume those bytes, so loss blocks the retained
+// transaction rather than silently purchasing a replacement and recomputing it.
+func (c *Orchestrator) retainLostWork(req records.Request) {
+	attempts, problem := c.opt.Store.Attempts(req.ID)
+	if problem != nil {
+		return
+	}
+	for _, attempt := range attempts {
+		switch attempt.State {
+		case "terminal":
+			return // preserve a real recorded outcome for explicit reconciliation
+		case "preparing", "offered":
+			if problem := c.opt.Store.AbortDispatch(req.ID, attempt.Attempt, attempt.SessionID, "the retained rental was lost"); problem != nil {
+				return
+			}
+			c.settleDispatch(req.ID, uint64(attempt.Attempt), false)
+		case "accepted", "recovered_open":
+			if _, problem := c.opt.Store.AbandonLostAttempt(req.ID, attempt.Attempt, "the retained rental was lost", records.RequeueAfterLoss); problem != nil {
+				return
+			}
+			c.settleDispatch(req.ID, uint64(attempt.Attempt), false)
+		}
+	}
+	_, _ = c.opt.Store.BlockRetainedWork(req.ID, "request.state_lost", "the retained rental and its local intermediate bytes are no longer available")
+	c.forget(req.ID)
 }
 
 // lostRentalCause says WHY the rental cannot serve, in the words the operator will see.

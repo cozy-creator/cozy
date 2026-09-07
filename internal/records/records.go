@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 25
+const schemaVersion = 26
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -267,7 +267,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 25 {
+	if sourceVersion < 26 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
 		}
@@ -322,7 +322,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 				}
 			}
 		}
-		for _, statement := range []string{modelSourceCheckpointSchema, modelSourcePublicationSchema} {
+		for _, statement := range []string{modelCheckpointSchema, modelCheckpointPublicationSchema} {
 			if _, err := tx.Exec(statement); err != nil {
 				return exit.Internalf("cannot create source checkpoint progress while migrating %s: %s", path, err)
 			}
@@ -339,6 +339,11 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			if _, err := tx.Exec(statement); err != nil {
 				return exit.Internalf("cannot add publication cancellation intent while migrating %s: %s", path, err)
 			}
+		}
+	}
+	if sourceVersion >= 23 && sourceVersion < 25 {
+		if e := migrateCheckpoints(tx, path); e != nil {
+			return e
 		}
 	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
@@ -655,7 +660,7 @@ func priorStatements(version int) []string {
 	for _, statement := range schema {
 		if version < 10 && containsStatement(modelTransferSchema, statement) ||
 			version < 16 && containsStatement(packageEventSchema, statement) ||
-			version < 23 && (statement == modelSourceCheckpointSchema || statement == modelSourcePublicationSchema) {
+			version < 23 && (statement == modelCheckpointSchema || statement == modelCheckpointPublicationSchema) {
 			continue
 		}
 		statements = append(statements, statement)
@@ -704,11 +709,19 @@ func priorStatements(version int) []string {
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n",
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n  evidence         BLOB NOT NULL,\n", 1)
 		}
-		if requestStatement && version < 25 {
+		if requestStatement && version < 26 {
 			stmt = strings.Replace(stmt, ",\n  retain_work INTEGER NOT NULL DEFAULT 0 CHECK(retain_work IN (0,1)),\n  retry_of TEXT NOT NULL DEFAULT '',\n  reuse_scope TEXT NOT NULL DEFAULT '',\n  control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision>=0)", "", 1)
 		}
 		if transferStatement && version < 24 {
 			stmt = strings.Replace(stmt, ",'canceling'", "", 1)
+		}
+		if version < 25 {
+			if stmt == modelCheckpointSchema {
+				stmt = priorCheckpointSchema()
+			}
+			if stmt == modelCheckpointPublicationSchema {
+				stmt = strings.Replace(stmt, "request_model_checkpoint_publications", "request_model_source_publications", 1)
+			}
 		}
 		if version < 12 {
 			stmt = priorInstallNames(stmt)
