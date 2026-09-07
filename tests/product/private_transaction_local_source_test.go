@@ -66,6 +66,22 @@ func TestPrivateTransactionRetryRecordsIndependentLocalSource(t *testing.T) {
 	if !reflect.DeepEqual(before, after) {
 		t.Fatal("descendant adoption changed predecessor checkpoint history")
 	}
+	// Reconnection resumes the descendant's native head, including after its
+	// predecessor's cancellation and after further progress in the new chain.
+	fatal(t, store.RequestRetainedCancellation(prior.ID, "new request owns its source"))
+	_, problem = store.ReleaseRetainedWork(prior.ID)
+	fatal(t, problem)
+	_, problem = store.CompleteRetainedCancellation(prior.ID)
+	fatal(t, problem)
+	fresh.HeadID = "sha256:" + strings.Repeat("7", 64)
+	fresh.Index++
+	fresh.Bytes += 100
+	fatal(t, store.ObserveModelSourceCheckpoints(retry.ID, retry.ModelTransfer.SourceSelection, "retained-boot", []records.ModelCheckpoint{fresh}))
+	_, offered, problem := store.RetriedSourceCheckpoints(retry.ID)
+	fatal(t, problem)
+	if len(offered) != 0 {
+		t.Fatal("retry tried to re-adopt released predecessor instead of resuming its own head")
+	}
 }
 
 func TestPrivateTransactionRetryDoesNotOfferChangedSource(t *testing.T) {

@@ -1,9 +1,12 @@
 package records
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"reflect"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
@@ -90,6 +93,19 @@ func (s *Store) RetriedSourceCheckpoints(id string) (string, []ModelCheckpointPr
 		return "", nil, problem
 	}
 	if request.RetainWork {
+		complete := true
+		for _, item := range progress {
+			adopted, problem := s.sourceAlreadyAdopted(id, prior.ID, item)
+			if problem != nil {
+				return "", nil, problem
+			}
+			if !adopted {
+				complete = false
+			}
+		}
+		if complete {
+			return prior.ID, nil, nil
+		}
 		return prior.ID, progress, nil
 	}
 	retained := progress[:0]
@@ -99,6 +115,30 @@ func (s *Store) RetriedSourceCheckpoints(id string) (string, []ModelCheckpointPr
 		}
 	}
 	return prior.ID, retained, nil
+}
+
+// Once a retry owns an independent native head it resumes that head, even after
+// the predecessor is canceled. Later checkpoints keep the recorded provenance.
+func (s *Store) sourceAlreadyAdopted(id, priorID string, prior ModelCheckpointProgress) (bool, *exit.Error) {
+	var raw, observed []byte
+	var boot string
+	err := s.db.QueryRow(`SELECT subject,observed,worker_boot_id FROM request_model_checkpoints
+		WHERE request_id=? AND kind='source' AND slot=?`, id, prior.Observed.Slot).Scan(&raw, &observed, &boot)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, exit.Internalf("cannot read adopted source custody: %s", err)
+	}
+	var provenance sourceAdoption
+	var current ModelCheckpoint
+	if json.Unmarshal(raw, &provenance) != nil || json.Unmarshal(observed, &current) != nil {
+		return false, nil
+	}
+	_, err = canonical.Raw(provenance.AdoptedHead)
+	return err == nil && provenance.PriorID == priorID && provenance.PriorHead == prior.Observed.HeadID &&
+		provenance.AdoptedHead != prior.Observed.HeadID && boot == prior.WorkerBootID &&
+		current.Slot == prior.Observed.Slot && current.PlanDigest == prior.Observed.PlanDigest && current.HeadID != prior.Observed.HeadID, nil
 }
 
 // RetriedSourceCustodyPending keeps predecessor holds alive until each dependent
@@ -117,21 +157,18 @@ func (s *Store) RetriedSourceCustodyPending(priorID string) (bool, *exit.Error) 
 		}
 		ids = append(ids, id)
 	}
+	err = rows.Err()
 	rows.Close()
+	if err != nil {
+		return false, exit.Internalf("cannot finish dependent source custody census: %s", err)
+	}
 	for _, id := range ids {
 		_, prior, problem := s.RetriedSourceCheckpoints(id)
 		if problem != nil {
 			return false, problem
 		}
-		for _, progress := range prior {
-			var raw []byte
-			if err := s.db.QueryRow(`SELECT subject FROM request_model_checkpoints WHERE request_id=? AND kind='source' AND slot=?`, id, progress.Observed.Slot).Scan(&raw); err != nil {
-				return true, nil
-			}
-			var adopted sourceAdoption
-			if json.Unmarshal(raw, &adopted) != nil || adopted.PriorID != priorID || adopted.PriorHead != progress.Observed.HeadID || adopted.AdoptedHead == "" {
-				return true, nil
-			}
+		if len(prior) > 0 {
+			return true, nil
 		}
 	}
 	return false, nil
