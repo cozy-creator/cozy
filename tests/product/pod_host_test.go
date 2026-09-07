@@ -60,6 +60,7 @@ const (
 type fakePod struct {
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
 	sourceRuntime pb.RuntimePreparationClient
+	sourceRelease func(*pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error)
 	weightsReady  func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
 	protocolInfo  func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
 	pb.UnimplementedWorkerControlServer

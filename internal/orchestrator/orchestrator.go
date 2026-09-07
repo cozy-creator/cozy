@@ -335,7 +335,7 @@ const (
 	// one that read as waste live: a `ready` pod with no running work, which a
 	// serving request nonetheless may not touch.
 	ExcludedModeConflict = "mode_conflict"
-	// ExcludedWrongClass: CPU rental for accelerator work, or the reverse.
+	// ExcludedWrongClass: CPU rental for work that requires an accelerator.
 	ExcludedWrongClass = "wrong_class"
 	// ExcludedNotReady: the rental is not in a state that can take a placement.
 	ExcludedNotReady = "not_ready"

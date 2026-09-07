@@ -77,11 +77,15 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 		"tensorhub_url: "+server.URL+"\ntensorhub_token: rental-models-test\n"+
 			"rentals:\n  max_hourly_spend_usd: 20.00\n  idle_release_s: 0\n"+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	const sshKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea fixture"
+	keyPath := filepath.Join(root, "operator.pub")
+	must(t, os.WriteFile(keyPath, []byte(sshKey+"\n"), 0600))
 	startDaemonProcess(t, root)
 	runRental := func(args ...string) (int, string) {
 		return runCozy(t, root, append(args, "--json")...)
 	}
 	args := []string{"rental", "new", "h200", "--idempotency-key", "manual-models-proof",
+		"--development", "--ssh-public-key", keyPath,
 		"--model", "proof/shared@1.0.0/bf16", "--model", "proof/h3@1.2.0/full",
 		"--model", "proof/shared@1.0.0/bf16"}
 	code, output := runRental(args...)
@@ -97,6 +101,9 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 	mu.Unlock()
 	request, problem := hub.ParseRentalRequestBytes(body)
 	fatal(t, problem)
+	if request.Development == nil || request.Development.SSHPublicKey != sshKey {
+		t.Fatalf("explicit development key not retained: %+v", request.Development)
+	}
 	if request.SKU != "h200" || request.PlannedSourceBytes != 0 || len(request.ServingModels) != 2 {
 		t.Fatalf("manual workload lost its exact models: %+v", request)
 	}
@@ -146,6 +153,16 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 		t.Fatalf("changed/invalid model reached paid create: %d requests", len(posts))
 	}
 	mu.Unlock()
+	must(t, os.WriteFile(keyPath, []byte(sshKey+" changed-comment\n"), 0600))
+	code, output = runRental(args...)
+	if code == 0 || !strings.Contains(output, "rental.idempotency_conflict") {
+		t.Fatalf("changed development access was not refused: %s", output)
+	}
+	mu.Lock()
+	if len(posts) != 3 {
+		t.Fatalf("changed key reached paid create: %d", len(posts))
+	}
+	mu.Unlock()
 	code, output = runRental("rental", "new", "--model", "proof/h3@1.2.0/full")
 	if code == 0 || !strings.Contains(output, "require a GPU SKU") {
 		t.Fatalf("--model without GPU was not refused [exit %d]: %s", code, output)
@@ -156,7 +173,7 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(posts) != 4 || bytes.Contains(posts[3], []byte("serving_models")) {
+	if len(posts) != 4 || bytes.Contains(posts[3], []byte("serving_models")) || bytes.Contains(posts[3], []byte("development")) {
 		t.Fatalf("undeclared manual rental changed its request shape: %q", posts)
 	}
 }

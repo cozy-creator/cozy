@@ -283,7 +283,6 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 	if problem := m.reconcileLocked(); problem != nil {
 		return none, "", problem
 	}
-	needsCPU := !req.NeedsAccelerator
 	skus, problem := m.catalogLocked()
 	if problem != nil {
 		return none, "", problem
@@ -308,7 +307,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 	for _, row := range rows {
 		machine[row.ID] = row.MachineName
 		switch {
-		case (row.AcceleratorModel == "CPU") != needsCPU:
+		case req.NeedsAccelerator && row.AcceleratorModel == "CPU":
 			excluded = append(excluded, orchestrator.RentalExclusion{
 				RentalID: row.ID, Reason: orchestrator.ExcludedWrongClass})
 		case row.State != hub.RentalReady && row.State != "attached":
