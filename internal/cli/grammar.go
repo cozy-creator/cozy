@@ -295,12 +295,14 @@ type RunCmd struct {
 	RetryPublication RunRetryPublicationCmd `cmd:"" help:"Retry a blocked model publication without rerunning its producer."`
 	Execute          RunExecuteCmd          `cmd:"" default:"withargs" hidden:""`
 	Cancel           RunCancelCmd           `cmd:"" help:"Cancel a queued or running run."`
+	Pause            RunPauseCmd            `cmd:"" help:"Stop a private transaction while retaining its work and rental."`
+	Resume           RunResumeCmd           `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
 	List             RunListCmd             `cmd:"" help:"List current and past runs."`
 	Watch            RunWatchCmd            `cmd:"" help:"Watch one recorded run until it settles."`
 }
 
 type RunExecuteCmd struct {
-	Target         string   `arg:"" name:"target" help:"Package or callable as org/package[/function]."`
+	Target         string   `arg:"" name:"target" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
 	Input          []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, and model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
 	Out            string   `help:"Output directory." type:"path"`
 	Timeout        string   `help:"Request deadline."`
@@ -340,6 +342,22 @@ func (c *RunRetryPublicationCmd) Run(r *Runtime) error {
 
 type RunCancelCmd struct {
 	ID string `arg:"" name:"run" help:"Run id."`
+}
+
+type RunPauseCmd struct {
+	ID string `arg:"" name:"run" help:"Run id."`
+}
+
+func (c *RunPauseCmd) Run(r *Runtime) error {
+	return r.call(handleRunPause, []string{c.ID}, nil, nil, true)
+}
+
+type RunResumeCmd struct {
+	ID string `arg:"" name:"run" help:"Run id."`
+}
+
+func (c *RunResumeCmd) Run(r *Runtime) error {
+	return r.call(handleRunResume, []string{c.ID}, nil, nil, true)
 }
 
 func (c *RunCancelCmd) Run(r *Runtime) error {

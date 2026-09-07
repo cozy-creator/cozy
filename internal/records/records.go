@@ -935,6 +935,17 @@ func scanInstall(rows interface{ Scan(...any) error }) (PackageInstall, error) {
 // together or not at all. A crash before Commit leaves the previous pin — and the
 // previous install's venv — exactly as it was.
 func (s *Store) Activate(inst PackageInstall) (superseded string, e *exit.Error) {
+	return s.recordInstall(inst, true)
+}
+
+// RecordInstall retains an immutable invocation snapshot without replacing the
+// user's editable package pin. The accepting request owns its lifetime.
+func (s *Store) RecordInstall(inst PackageInstall) *exit.Error {
+	_, problem := s.recordInstall(inst, false)
+	return problem
+}
+
+func (s *Store) recordInstall(inst PackageInstall, activate bool) (string, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", exit.Internalf("cannot begin the activation transaction: %s", err)
@@ -961,13 +972,17 @@ func (s *Store) Activate(inst PackageInstall) (superseded string, e *exit.Error)
 		inst.BytesExcl, inst.BytesShared, inst.CreatedAt); err != nil {
 		return "", exit.Internalf("cannot insert install %s: %s", inst.ID, err)
 	}
-	if _, err := tx.Exec(`DELETE FROM pins WHERE package=?`, inst.Package); err != nil {
-		return "", exit.Internalf("cannot replace the active pin for %s: %s", inst.Package, err)
-	}
-	if _, err := tx.Exec(`INSERT INTO pins(package,major,install_id,activated_at)
-		VALUES(?,?,?,?)`,
-		inst.Package, inst.Major, inst.ID, inst.CreatedAt); err != nil {
-		return "", exit.Internalf("cannot activate the pin for %s@v%d: %s", inst.Package, inst.Major, err)
+	if activate {
+		if _, err := tx.Exec(`DELETE FROM pins WHERE package=?`, inst.Package); err != nil {
+			return "", exit.Internalf("cannot replace the active pin for %s: %s", inst.Package, err)
+		}
+		if _, err := tx.Exec(`INSERT INTO pins(package,major,install_id,activated_at)
+			VALUES(?,?,?,?)`,
+			inst.Package, inst.Major, inst.ID, inst.CreatedAt); err != nil {
+			return "", exit.Internalf("cannot activate the pin for %s@v%d: %s", inst.Package, inst.Major, err)
+		}
+	} else {
+		prior = ""
 	}
 	if err := tx.Commit(); err != nil {
 		return "", exit.New(exit.Conflict,

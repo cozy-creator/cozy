@@ -317,6 +317,9 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 	}
 	if out.Rental {
 		if strings.HasPrefix(sub.Package, "local/") {
+			if sub.InstallID != "" {
+				return s.resolveLocalJob(ctx, sub, out, sub.InstallID)
+			}
 			refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
 			if refreshProblem != nil {
 				return out, refreshProblem
@@ -346,12 +349,14 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
 		return out, nil
 	}
-	refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
-	if refreshProblem != nil {
-		return out, refreshProblem
-	}
-	if editable {
-		sub.InstallID = refreshed
+	if sub.InstallID == "" {
+		refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
+		if refreshProblem != nil {
+			return out, refreshProblem
+		}
+		if editable {
+			sub.InstallID = refreshed
+		}
 	}
 	var jobs []launch.JobFacts
 	var e *exit.Error
