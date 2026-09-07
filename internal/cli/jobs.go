@@ -389,7 +389,7 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	}
 	err := exit.Named(code, status, "job %s ended %s", state.JobID, status)
 	if status == "blocked" {
-		err.WithNext("cozy run <updated-script-or-package> --retry %s", runReference(state.Number, state.JobID))
+		err.WithNext("cozy run <updated-script-or-package> --retry " + runReference(state.Number, state.JobID))
 	}
 	if state.Error != "" {
 		err.Message = fmt.Sprintf("job %s ended %s: %s — %s",
@@ -484,7 +484,7 @@ func handleJobCancel(ctx *Context) *exit.Error {
 	}
 	// ALREADY TERMINAL = IDEMPOTENT 0 printing the terminal. A cancel that arrives after
 	// the terminal is late, not wrong.
-	if settled(state.Status) {
+	if settled(state.Status) && !state.Retaining {
 		fields := append(jobFields(ctx.Mode(), state, true), output.Field{K: "changed", V: false})
 		return emit(ctx, compactRecord(fields, "job", "status", "changed"))
 	}

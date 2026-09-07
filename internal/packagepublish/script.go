@@ -54,12 +54,12 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 		name := strings.FieldsFunc(requirement, func(r rune) bool {
 			return strings.ContainsRune("[<>=!~; @", r)
 		})
-		if len(name) > 0 && normalizedProjectName(name[0]) == "cozy-runtime" {
+		if len(name) > 0 && normalizedProjectName(name[0]) == "cozy-runtime" { //cozy:allow distribution metadata, not an executable invocation
 			hasRuntime = true
 		}
 	}
 	if !hasRuntime {
-		metadata.Dependencies = append(metadata.Dependencies, "cozy-runtime")
+		metadata.Dependencies = append(metadata.Dependencies, "cozy-runtime") //cozy:allow distribution metadata, not an executable invocation
 	}
 	if metadata.Tool != nil {
 		// A script's dependency metadata has the same explicit source rules as a

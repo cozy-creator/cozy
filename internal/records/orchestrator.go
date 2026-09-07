@@ -252,10 +252,6 @@ func deviceList(devices []string) string {
 // any device in this envelope. Two concurrent starts race one statement, and exactly one
 // row appears.
 func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
-	if len(w.Devices) == 0 {
-		return exit.New(exit.Validation, "a worker process needs a device envelope, even an empty-named one").
-			WithRemedy("name the devices this package process may see")
-	}
 	clauses := make([]string, 0, len(w.Devices))
 	args := []any{
 		w.InstanceID, w.Package, nullable(w.InstallID), w.WorkerID,
@@ -264,6 +260,11 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 	for _, d := range w.Devices {
 		clauses = append(clauses, "w.devices LIKE ?")
 		args = append(args, "%"+deviceMark(d)+"%")
+	}
+	if len(clauses) == 0 {
+		// A CPU-only process owns no accelerator. Keeping a failed CPU job's
+		// state must not block another revision on a fabricated device grant.
+		clauses = append(clauses, "0")
 	}
 	// THE ADMISSION ASKS ABOUT ANOTHER PROCESS, which is why the slot's own row is
 	// excluded. A slot restarting itself — the recovered-attempts path, where a dead
@@ -331,6 +332,9 @@ func nullable(s string) any {
 
 // DeviceHolders names the live processes holding any of these devices.
 func (s *Store) DeviceHolders(devices []string) ([]string, *exit.Error) {
+	if len(devices) == 0 {
+		return nil, nil
+	}
 	clauses := make([]string, 0, len(devices))
 	args := make([]any, 0, len(devices))
 	for _, d := range devices {
