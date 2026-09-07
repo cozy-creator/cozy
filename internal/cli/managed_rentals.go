@@ -280,6 +280,10 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 	if !req.Rental || req.Worker != "" {
 		return none, "", exit.Internalf("request %s is not an unassigned --rental request", req.ID)
 	}
+	needsAccelerator, problem := NewResolver(m.store, m.ctx.Cfg, nil).PrivateRentalNeedsAccelerator(req)
+	if problem != nil {
+		return none, "", problem
+	}
 	if problem := m.reconcileLocked(); problem != nil {
 		return none, "", problem
 	}
@@ -307,7 +311,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 	for _, row := range rows {
 		machine[row.ID] = row.MachineName
 		switch {
-		case req.NeedsAccelerator && row.AcceleratorModel == "CPU":
+		case needsAccelerator && row.AcceleratorModel == "CPU":
 			excluded = append(excluded, orchestrator.RentalExclusion{
 				RentalID: row.ID, Reason: orchestrator.ExcludedWrongClass})
 		case row.State != hub.RentalReady && row.State != "attached":
@@ -350,7 +354,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 			Excluded: excluded}, line, lineProblem
 	}
 
-	sku, skuDecision, found := rental.Choose(skus, req.NeedsAccelerator,
+	sku, skuDecision, found := rental.Choose(skus, needsAccelerator,
 		releaseConstraints(m.ctx, req))
 	mismatch := skuDecision.Mismatch
 	if !found && mismatch != "" {
