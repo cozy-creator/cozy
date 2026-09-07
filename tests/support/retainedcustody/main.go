@@ -190,6 +190,10 @@ type readerResult struct {
 	ErrorType   string `json:"error_type"`
 }
 
+type custodyUpload struct {
+	object records.ModelTransferObject
+}
+
 func (m *custodyMover) move(ctx context.Context, weights records.ModelTransferWeights, mint orchestrator.WeightsGrantMinter) *exit.Error {
 	objects, problem := m.store.ModelTransferObjects(weights.RequestID, weights.Attempt, weights.OutputSlot)
 	if problem != nil {
@@ -200,12 +204,23 @@ func (m *custodyMover) move(ctx context.Context, weights records.ModelTransferWe
 		ids[i] = o.ObjectID
 	}
 	window := orchestrator.NewWeightsGrantWindow(mint)
+	pending := make([]custodyUpload, 0, 4)
 	sent := int64(0)
+	flush := func() *exit.Error {
+		if len(pending) == 0 {
+			return nil
+		}
+		moved, problem := m.pushBatch(ctx, weights, pending, mint)
+		sent += moved
+		if problem != nil {
+			return problem
+		}
+		emit(map[string]any{"output": weights.OutputSlot, "native_batch_objects": len(pending), "reader_bytes_sent": sent})
+		pending = pending[:0]
+		return nil
+	}
 	for i, object := range objects {
 		if m.proofObject != "" && object.ObjectID != m.proofObject {
-			continue
-		}
-		if object.State == "held" || object.State == "uploaded" || object.State == "already_present" {
 			continue
 		}
 		decision, problem := window.Spendable(ctx, object.ObjectID, ids[i:], time.Now())
@@ -213,39 +228,111 @@ func (m *custodyMover) move(ctx context.Context, weights records.ModelTransferWe
 			return problem
 		}
 		if decision.ObjectID != object.ObjectID || decision.Length != object.Length {
-			return exit.New(exit.Conflict, "Hub grant changed retained object identity")
+			return exit.New(exit.Conflict, "Hub custody changed the declared object")
 		}
-		if !decision.Held {
-			doc := map[string]any{"manifest": map[string]any{"digest": weights.ManifestID, "length": weights.ManifestLength}, "object": map[string]any{"digest": object.ObjectID, "length": object.Length}, "grant": map[string]any{"url": decision.URL, "required_headers": decision.Headers}}
-			if m.input.Encode(doc) != nil {
-				return exit.Unavailablef("serial native reader input closed")
+		if decision.Held {
+			if m.proofObject != "" {
+				if problem := m.hold(ctx, weights, object); problem != nil {
+					return problem
+				}
+				return exit.Named(exit.Canceled, "operator.proof_complete", "one exact object has verified Hub and Host custody")
 			}
-			if !m.answers.Scan() {
-				return exit.Unavailablef("serial native reader returned no bounded result")
-			}
-			var result readerResult
-			if json.Unmarshal(m.answers.Bytes(), &result) != nil || !result.OK || result.Manifest != weights.ManifestID || result.ObjectID != object.ObjectID || result.Length != object.Length || result.Transferred < 0 || result.Transferred > object.Length || !(result.HTTPStatus >= 200 && result.HTTPStatus < 300 || result.HTTPStatus == 412) {
-				emit(map[string]any{"reader_ok": result.OK, "reader_code": result.Code, "reader_error_type": result.ErrorType})
-				return exit.Named(exit.Conflict, "operator.reader_refused", "serial native reader refused or changed the exact object result")
-			}
-			sent += result.Transferred
-			verified, problem := mint(ctx, []string{object.ObjectID})
-			if problem != nil {
+			continue
+		}
+		pending = append(pending, custodyUpload{object: object})
+		if len(pending) == 4 || m.proofObject != "" {
+			if problem := flush(); problem != nil {
 				return problem
 			}
-			if len(verified.Decisions) != 1 || !verified.Decisions[0].Held || verified.Decisions[0].ObjectID != object.ObjectID || verified.Decisions[0].Length != object.Length {
-				return exit.Unavailablef("Hub has not verified the uploaded exact object")
+			if m.proofObject != "" {
+				return exit.Named(exit.Canceled, "operator.proof_complete", "one exact object has verified Hub and Host custody")
 			}
 		}
-		if problem = m.hold(ctx, weights, object); problem != nil {
+	}
+	if problem := flush(); problem != nil {
+		return problem
+	}
+	// Re-read the complete closure through the same Hub authority. A known object
+	// needs no invented Host status; every missing object above required real bytes.
+	window = orchestrator.NewWeightsGrantWindow(mint)
+	for i, object := range objects {
+		held, problem := window.Spendable(ctx, object.ObjectID, ids[i:], time.Now())
+		if problem != nil {
 			return problem
 		}
-		emit(map[string]any{"output": weights.OutputSlot, "object": object.ObjectID, "held": true, "objects_done": i + 1, "objects": len(objects), "reader_bytes_sent": sent})
-		if m.proofObject != "" {
-			return exit.Named(exit.Canceled, "operator.proof_complete", "one exact object has verified Hub and Host custody")
+		if !held.Held || held.ObjectID != object.ObjectID || held.Length != object.Length {
+			return exit.Unavailablef("complete checkpoint custody is not verified by Hub")
 		}
 	}
+	emit(map[string]any{"output": weights.OutputSlot, "whole_closure_verified_by_hub": true, "objects": len(objects), "reader_bytes_sent": sent})
 	return nil
+}
+
+func (m *custodyMover) pushBatch(ctx context.Context, weights records.ModelTransferWeights, items []custodyUpload, mint orchestrator.WeightsGrantMinter) (int64, *exit.Error) {
+	ids := make([]string, len(items))
+	for i, row := range items {
+		ids[i] = row.object.ObjectID
+	}
+	// Refresh immediately before the bounded batch starts, never age capabilities
+	// behind a metadata walk. The Hub may have verified a concurrent upload meanwhile.
+	fresh, problem := mint(ctx, ids)
+	if problem != nil {
+		return 0, problem
+	}
+	if len(fresh.Decisions) != len(items) {
+		return 0, exit.New(exit.Conflict, "incomplete batch grant")
+	}
+	grants := make(map[string]orchestrator.WeightsTransferDecision, len(items))
+	for _, d := range fresh.Decisions {
+		grants[d.ObjectID] = d
+	}
+	var docs []map[string]any
+	var uploads []records.ModelTransferObject
+	for _, item := range items {
+		object := item.object
+		grant, ok := grants[object.ObjectID]
+		if !ok || grant.Length != object.Length {
+			return 0, exit.New(exit.Conflict, "batch grant changed exact object")
+		}
+		if grant.Held {
+			if problem := m.hold(ctx, weights, object); problem != nil {
+				return 0, problem
+			}
+			continue
+		}
+		docs = append(docs, map[string]any{"manifest": map[string]any{"digest": weights.ManifestID, "length": weights.ManifestLength}, "object": map[string]any{"digest": object.ObjectID, "length": object.Length}, "grant": map[string]any{"url": grant.URL, "required_headers": grant.Headers}})
+		uploads = append(uploads, object)
+	}
+	if len(docs) == 0 {
+		return 0, nil
+	}
+	if m.input.Encode(docs) != nil || !m.answers.Scan() {
+		return 0, exit.Unavailablef("native batch reader ended")
+	}
+	var results []readerResult
+	if json.Unmarshal(m.answers.Bytes(), &results) != nil || len(results) != len(uploads) {
+		return 0, exit.New(exit.Conflict, "native batch result shape changed")
+	}
+	var sent int64
+	for i, result := range results {
+		object := uploads[i]
+		if !result.OK || result.Manifest != weights.ManifestID || result.ObjectID != object.ObjectID || result.Length != object.Length || result.Transferred < 0 || result.Transferred > object.Length || !(result.HTTPStatus >= 200 && result.HTTPStatus < 300 || result.HTTPStatus == 412) {
+			emit(map[string]any{"reader_ok": result.OK, "reader_code": result.Code, "reader_error_type": result.ErrorType})
+			return sent, exit.Named(exit.Unavailable, "operator.reader_refused", "native batch refused or changed exact object result")
+		}
+		sent += result.Transferred
+		verified, problem := mint(ctx, []string{object.ObjectID})
+		if problem != nil {
+			return sent, problem
+		}
+		if len(verified.Decisions) != 1 || !verified.Decisions[0].Held || verified.Decisions[0].ObjectID != object.ObjectID || verified.Decisions[0].Length != object.Length {
+			return sent, exit.Unavailablef("Hub has not verified exact uploaded object")
+		}
+		if problem := m.hold(ctx, weights, object); problem != nil {
+			return sent, problem
+		}
+	}
+	return sent, nil
 }
 
 func (m *custodyMover) hold(ctx context.Context, weights records.ModelTransferWeights, object records.ModelTransferObject) *exit.Error {
@@ -282,6 +369,15 @@ func (m *custodyMover) hold(ctx context.Context, weights records.ModelTransferWe
 		}
 		if status.State == pb.WeightsTransferState_WEIGHTS_TRANSFER_STATE_ACCEPTED {
 			continue
+		}
+		if status.State == pb.WeightsTransferState_WEIGHTS_TRANSFER_STATE_FAILED {
+			if status.TransferredBytes > uint64(object.Length) || status.UpdateSequence == 0 {
+				return exit.New(exit.Conflict, "invalid Host failure observation")
+			}
+			if problem := m.store.RecordModelTransferObjectStatus(records.ModelTransferObject{RequestID: weights.RequestID, Attempt: weights.Attempt, OutputSlot: weights.OutputSlot, ObjectID: object.ObjectID, Length: object.Length, OperationID: operation, GrantRevision: int64(status.GrantRevision), UpdateSequence: int64(status.UpdateSequence), State: "failed", Transferred: int64(status.TransferredBytes), SafeCode: status.SafeCode, SafeDetail: status.SafeDetail}); problem != nil {
+				return problem
+			}
+			return exit.Named(exit.Unavailable, "operator.host_custody_failed", "the Host refused this exact revision; its observed high-water is retained for retry")
 		}
 		if status.State != pb.WeightsTransferState_WEIGHTS_TRANSFER_STATE_HELD || status.TransferredBytes > uint64(object.Length) || status.ChecksumSha256 != object.ObjectID || status.UpdateSequence == 0 {
 			return exit.Named(exit.Conflict, "operator.host_custody_refused", "PodHost did not confirm exact held custody")
