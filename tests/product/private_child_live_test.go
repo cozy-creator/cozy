@@ -48,6 +48,7 @@ func TestPrivateChildCompositionRunsEditsWithoutALocalCache(t *testing.T) {
 	run("pip", "install", "--python", filepath.Join(control, "bin", "python"), runtimeInstall)
 	root, err := os.MkdirTemp("", "cozy-calls-")
 	must(t, err)
+	defer tracePrivateChildWait(t, root)()
 	path := filepath.Join(control, "bin")
 	for _, item := range childEnv(t, root) {
 		if strings.HasPrefix(item, "PATH=") {

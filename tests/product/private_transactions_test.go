@@ -190,6 +190,46 @@ func TestPrivateTransactionsShareRentalRetention(t *testing.T) {
 	}
 }
 
+// Disabling automatic idle cleanup must not suppress an explicit transaction
+// abandonment. This failed against the real idle_release_s=0 development home.
+func TestPrivateCancellationReleasesManagedRentalWithIdleCleanupDisabled(t *testing.T) {
+	root := t.TempDir()
+	hub := newFakeRentalHub(t, 0)
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
+		"tensorhub_url: "+hub.server.URL+"\ntensorhub_token: retained-cancel-proof\n"+
+			"rentals:\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	daemon := startDaemonProcess(t, root)
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	const managed, manual = "pr-explicit-cancel-managed", "pr-explicit-cancel-manual"
+	request := recordPrivateTransaction(t, store, "explicit-cancel", managed)
+	for id, buyer := range map[string]string{managed: request.ID, manual: ""} {
+		machine := "otter"
+		if id == manual {
+			machine = "heron"
+		}
+		hub.add(id, machine)
+		fatal(t, store.RecordRental(records.Rental{ID: id, MachineName: machine,
+			State: "ready", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,
+			Hub: hub.server.URL, Address: "127.0.0.1:1", CertPath: filepath.Join(root, id+".pem"),
+			ManagedRequestID: buyer}))
+	}
+	response := daemon.call(t, http.MethodPost, "/v1/local/jobs/"+request.ID+"/cancel", nil)
+	if response.Status != http.StatusOK && response.Status != http.StatusAccepted {
+		t.Fatalf("explicit abandonment failed: %s", response.brief())
+	}
+	awaitRentalGone(t, store, managed, 10*time.Second, filepath.Join(root, "daemon.log"))
+	if hub.releases(managed) != 1 {
+		t.Fatal("explicit final-owner abandonment did not release exactly one managed rental")
+	}
+	row, problem := store.RentalRow(manual)
+	fatal(t, problem)
+	if row == nil || row.State != "ready" || hub.releases(manual) != 0 {
+		t.Fatal("explicit transaction abandonment released the independent manual reservation")
+	}
+}
+
 func recordPrivateTransaction(t *testing.T, store *records.Store, label, rentalID string) records.Request {
 	t.Helper()
 	request := records.Request{
