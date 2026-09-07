@@ -87,8 +87,10 @@ type Options struct {
 	RentalFleet          func() (string, *exit.Error)
 	AcquireManagedRental func(req records.Request) (RentalDecision, string, *exit.Error)
 	ReleaseManagedRental func(string) (string, *exit.Error)
-	ModelTransfers       ModelTransferOwner
-	MaxOutputMiB         int64
+	// ReleaseRetainedRental is explicit owner abandonment, independent of idle policy.
+	ReleaseRetainedRental func(string) (string, *exit.Error)
+	ModelTransfers        ModelTransferOwner
+	MaxOutputMiB          int64
 }
 
 type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)

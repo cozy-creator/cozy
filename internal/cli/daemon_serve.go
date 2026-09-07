@@ -127,8 +127,9 @@ func serveDaemon(ctx *Context) *exit.Error {
 		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSource(),
 		RentalPrepareFacts: rental.PrepareFactsSource(client(ctx)),
 		RentalFleet:        fleet.status, AcquireManagedRental: fleet.acquire,
-		ReleaseManagedRental: fleet.release,
-		ModelTransfers:       transfers,
+		ReleaseManagedRental:  fleet.release,
+		ReleaseRetainedRental: fleet.releaseRetained,
+		ModelTransfers:        transfers,
 		ReclaimInstall: func(id string) *exit.Error {
 			writer, problem := install.Lock(l)
 			if problem != nil {

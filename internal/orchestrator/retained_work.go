@@ -139,7 +139,16 @@ func (c *Orchestrator) finishRetainedRelease(request records.Request) {
 				return
 			}
 			if queued == 0 && running == 0 && !retained {
-				if problem := c.releaseManagedNow(request); problem != nil {
+				release := c.opt.ReleaseRetainedRental
+				if release == nil {
+					release = c.opt.ReleaseManagedRental
+				}
+				if release == nil {
+					c.retryRetainedCancellation(id)
+					return
+				}
+				if _, problem := release(row.ID); problem != nil {
+					c.logf("request %s retained rental release remains pending: %s", id, problem.Message)
 					c.retryRetainedCancellation(id)
 					return
 				}
