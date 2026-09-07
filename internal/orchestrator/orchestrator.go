@@ -847,7 +847,7 @@ func (c *Orchestrator) kickQueuedTransferDispatch(req records.Request) {
 			go c.drain()
 			return
 		}
-		if problem.Code != exit.Unavailable && problem.Code != exit.Conflict {
+		if problem.Code != exit.Unavailable && (problem.Code != exit.Conflict || req.RetainWork) {
 			c.failQueued(req.ID, problem)
 			go c.drain()
 			return
