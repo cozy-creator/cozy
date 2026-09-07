@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -18,6 +19,70 @@ func offerChildParent(t *testing.T, store *records.Store, parent records.Request
 	current, problem := store.RequestRow(parent.ID)
 	fatal(t, problem)
 	return *current
+}
+
+func TestPrivateChildBindingsAreImmutableAndOwnTheirImplementation(t *testing.T) {
+	layout, problem := home.Open(t.TempDir())
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	parent := cleanupTestInstall(layout, "1111111111111111", "1.0.0")
+	child := cleanupTestInstall(layout, "2222222222222222", "1.0.0")
+	replacement := cleanupTestInstall(layout, "3333333333333333", "1.0.0")
+	for _, inst := range []records.PackageInstall{parent, child, replacement} {
+		fatal(t, store.RecordInstall(inst))
+	}
+	binding := records.ChildBinding{ParentInstallID: parent.ID, InterfaceDigest: childDigest("a"), Module: "private_ops", Export: "compute", ChildInstallID: child.ID, LocalRevisionDigest: childDigest("b"), Entrypoint: "compute"}
+	fatal(t, store.RecordChildBindings([]records.ChildBinding{binding}))
+	fatal(t, store.RecordChildBindings([]records.ChildBinding{binding}))
+	binding.ChildInstallID = replacement.ID
+	if problem := store.RecordChildBindings([]records.ChildBinding{binding}); problem == nil {
+		t.Fatal("captured dependency accepted a replacement implementation")
+	}
+	forgotten, problem := store.ForgetIfUnreferenced(child.ID)
+	fatal(t, problem)
+	if forgotten {
+		t.Fatal("GC discarded an implementation still owned by a parent interface")
+	}
+	held, problem := store.LocalPackageInUse(binding.LocalRevisionDigest, "local/ignored", "1.0.0", childDigest("c"))
+	fatal(t, problem)
+	if !held {
+		t.Fatal("GC discarded the frozen implementation wheel revision")
+	}
+	forgotten, problem = store.ForgetIfUnreferenced(parent.ID)
+	fatal(t, problem)
+	if !forgotten {
+		t.Fatal("unowned parent could not release its dependency references")
+	}
+	forgotten, problem = store.ForgetIfUnreferenced(child.ID)
+	fatal(t, problem)
+	if !forgotten {
+		t.Fatal("implementation was not reclaimable after its final parent left")
+	}
+}
+
+func TestPrivateChildrenDoNotReuseEffectsByDefault(t *testing.T) {
+	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
+	parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "effects-original", ""))
+	call := records.Request{ID: "req-effect-original", IdemKey: "effect-original", BodyDigest: childDigest("3"), Package: "local/effect", Entrypoint: "perform", Kind: "job", Payload: []byte(`{}`), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("4"), ChildTargetDigest: childDigest("5")}
+	child, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot")
+	fatal(t, problem)
+	closeChild(t, store, child, "SUCCEEDED", "succeeded")
+	closeChild(t, store, parent, "FAILED", "blocked")
+	parent.ID, parent.IdemKey, parent.RetryOf = "req-effects-edited", "effects-edited", parent.ID
+	parent, _, problem = store.Submit(parent)
+	fatal(t, problem)
+	parent = offerChildParent(t, store, parent)
+	call.ID, call.IdemKey, call.ParentRequestID = "req-effect-new", "effect-new", parent.ID
+	child, _, problem = store.SubmitChild(call, 1, childDigest("1"), "private-boot")
+	fatal(t, problem)
+	if child.State != "submitted" || child.ReusedFrom != "" {
+		t.Fatal("an undeclared reusable effect was cached across parent revisions")
+	}
 }
 
 func closeChild(t *testing.T, store *records.Store, request records.Request, status, state string) {
@@ -36,7 +101,7 @@ func TestPrivateChildrenReuseExactSuccessfulOperationAfterParentEdit(t *testing.
 	defer store.Close()
 	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
 	parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "parent-original", ""))
-	call := records.Request{ID: "req-child-original-a", IdemKey: "child-original-a", BodyDigest: childDigest("3"), Package: "local/operation-a", Entrypoint: "compute", Kind: "job", Payload: []byte(`{"size":100}`), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("4"), ChildTargetDigest: childDigest("5")}
+	call := records.Request{ID: "req-child-original-a", IdemKey: "child-original-a", BodyDigest: childDigest("3"), Package: "local/operation-a", Entrypoint: "compute", Kind: "job", Payload: []byte(`{"size":100}`), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("4"), ChildTargetDigest: childDigest("5"), ChildReusable: true}
 	child, fresh, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot")
 	fatal(t, problem)
 	if !fresh || child.ParentRequestID != parent.ID || child.ReuseScope != parent.ReuseScope {

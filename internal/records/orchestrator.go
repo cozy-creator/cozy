@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS requests (
   parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<32),
   child_intent_digest TEXT NOT NULL DEFAULT '',
   child_target_digest TEXT NOT NULL DEFAULT '',
+  child_reusable INTEGER NOT NULL DEFAULT 0 CHECK(child_reusable IN (0,1)),
   reused_from TEXT NOT NULL DEFAULT ''
 )`
 
@@ -475,6 +476,7 @@ type Request struct {
 	ParentCallIndex   int64
 	ChildIntentDigest string
 	ChildTargetDigest string
+	ChildReusable     bool
 	ReusedFrom        string
 	// NeedsAccelerator is derived once from the selected package's immutable
 	// dependency facts. It is not an author-supplied resource request.
@@ -563,7 +565,7 @@ const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_
 	environment_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
 	COALESCE(install_id,''),assets,models,weights_outputs,retain_work,retry_of,reuse_scope,control_revision,
-	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,reused_from`
+	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
@@ -572,7 +574,7 @@ func requestScanTargets(r *Request, assets, models *string) []any {
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
 		&r.InstallID, assets, models, &r.WeightsOutputs, &r.RetainWork, &r.RetryOf, &r.ReuseScope, &r.ControlRevision,
-		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ReusedFrom}
+		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom}
 }
 
 func finishRequestScan(r Request, assets, models string, err error) (Request, error) {
@@ -1204,9 +1206,9 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		plan_id,package_release,local_package_digest,
 		local_package_uploaded_boot_id,environment_digest,
 		payload,outputs,state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,models,
-		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,reused_from)
+		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
-		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.LocalPackageDigest,
 		r.LocalPackageUploadedBootID, r.EnvironmentDigest, r.Payload,
@@ -1215,7 +1217,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		r.RentalRequired,
 		nullable(r.InstallID),
 		assets, models, r.WeightsOutputs, r.RetainWork, r.RetryOf, r.ReuseScope, r.ControlRevision,
-		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ReusedFrom); err != nil {
+		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	if problem := recordOutputExportTx(tx, r.ID, r.OutputExport, exportOutputs); problem != nil {

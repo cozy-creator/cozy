@@ -98,6 +98,7 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 	request.ParentRequestID, request.ParentCallIndex = parent.ID, int64(call.CallIndex)
 	request.ChildIntentDigest, _ = canonical.Spell(call.IntentDigest)
 	request.ChildTargetDigest = target
+	request.ChildReusable = spec.ChildReusable
 	parentDigest, _ := canonical.Spell(call.ParentInvocationSpecDigest)
 	child, fresh, problem := c.opt.Store.SubmitChild(request, int64(call.ParentAttemptOrdinal), parentDigest, s.bootID)
 	if problem != nil {
@@ -226,7 +227,8 @@ func (c *Orchestrator) onChildCancel(s *session, call *pb.ChildCallCancel) {
 	if call == nil || c.fenced(s, call.RecordOwnerEpoch, call.ControlStreamEpoch, call.WorkerBootId) {
 		return
 	}
-	if _, problem := c.childParent(s, call.ParentRequestId, call.ParentAttemptOrdinal, call.ParentInvocationSpecDigest); problem != nil {
+	parent, problem := c.childParent(s, call.ParentRequestId, call.ParentAttemptOrdinal, call.ParentInvocationSpecDigest)
+	if problem != nil {
 		return
 	}
 	children, problem := c.opt.Store.Children(call.ParentRequestId)
@@ -239,7 +241,11 @@ func (c *Orchestrator) onChildCancel(s *session, call *pb.ChildCallCancel) {
 	}
 	for _, child := range children {
 		if child.ParentCallIndex == int64(call.CallIndex) && child.ChildIntentDigest == intent && !records.Settled(child.State) {
-			_ = c.CancelRetainedRequest(child.ID, "parent canceled its child call")
+			if parent.State == "pausing" || parent.State == "paused" || parent.State == "blocked" {
+				_ = c.PauseRequest(child.ID, "parent retained its child call")
+			} else {
+				_ = c.CancelRetainedRequest(child.ID, "parent canceled its child call")
+			}
 			return
 		}
 	}

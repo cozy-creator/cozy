@@ -63,9 +63,10 @@ type Submission struct {
 
 	// Kind is the ATTEMPT CLASS: "" or `serving`, or `job`. A job carries two more facts
 	// a serving request has no version of.
-	Kind       string
-	RetainWork bool
-	RetryOf    string
+	Kind          string
+	RetainWork    bool
+	RetryOf       string
+	ChildReusable bool
 	// Org is the publishing org whose scratch repo this job publishes into.
 	Org string
 	// Trees are the job's typed input TREES as `ref=dir`, one grant input each.

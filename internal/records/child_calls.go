@@ -43,7 +43,7 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	}
 	existing, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE parent_request_id=? AND parent_call_index=?`, parent.ID, r.ParentCallIndex))
 	if err == nil {
-		if existing.ChildIntentDigest != r.ChildIntentDigest || existing.ChildTargetDigest != r.ChildTargetDigest {
+		if existing.ChildIntentDigest != r.ChildIntentDigest || existing.ChildTargetDigest != r.ChildTargetDigest || existing.ChildReusable != r.ChildReusable {
 			return Request{}, false, exit.Named(exit.Conflict, "child.intent_changed", "a parent call index already names a different target or input")
 		}
 		existing.Number, err = requestNumber(tx, existing)
@@ -63,10 +63,10 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	// Scalar result reuse has no native byte ownership to transfer. Artifact and
 	// weights children continue through ordinary execution until their native
 	// adoption contract supplies independent new-request ownership.
-	if r.Outputs == "" && (r.WeightsOutputs == "" || r.WeightsOutputs == "[]") && parent.RetryOf != "" {
+	if r.ChildReusable && r.Outputs == "" && (r.WeightsOutputs == "" || r.WeightsOutputs == "[]") && parent.RetryOf != "" {
 		var previous string
 		err = tx.QueryRow(`SELECT COALESCE(NULLIF(reused_from,''),id) FROM requests WHERE parent_request_id=? AND parent_call_index=?
-			AND state='succeeded' AND child_intent_digest=? AND child_target_digest=? AND reuse_scope=?
+			AND state='succeeded' AND child_reusable=1 AND child_intent_digest=? AND child_target_digest=? AND reuse_scope=?
 			AND EXISTS(SELECT 1 FROM attempts WHERE request_id=COALESCE(NULLIF(requests.reused_from,''),requests.id) AND state='closed' AND terminal_status='SUCCEEDED')
 			ORDER BY created_at DESC,id DESC LIMIT 1`, parent.RetryOf, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ReuseScope).Scan(&previous)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
