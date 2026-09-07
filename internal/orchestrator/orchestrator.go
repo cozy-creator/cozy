@@ -39,9 +39,11 @@ import (
 // Options is the frozen input to one Cozy daemon. Every field is decided by the
 // entrypoint; nothing in this package reads the environment.
 type Options struct {
-	Cfg    config.Config
-	Layout home.Layout
-	Store  *records.Store
+	// ReclaimInstall delegates unpinned snapshot cleanup to the existing package owner.
+	ReclaimInstall func(string) *exit.Error
+	Cfg            config.Config
+	Layout         home.Layout
+	Store          *records.Store
 	// Yield is the GPU yield policy: smart | always | never.
 	Yield string
 	Log   io.Writer
@@ -85,12 +87,10 @@ type Options struct {
 	RentalFleet          func() (string, *exit.Error)
 	AcquireManagedRental func(req records.Request) (RentalDecision, string, *exit.Error)
 	ReleaseManagedRental func(string) (string, *exit.Error)
-	ModelTransfers       ModelTransferOwner
-	// LocalWheels puts an unpublished revision's wheels in the object store and answers
-	// with one read capability per wheel (th-094). Without it this daemon cannot transfer a
-	// local package: the control stream carries control, not content.
-	LocalWheels  LocalWheelGrantSource
-	MaxOutputMiB int64
+	// ReleaseRetainedRental is explicit owner abandonment, independent of idle policy.
+	ReleaseRetainedRental func(string) (string, *exit.Error)
+	ModelTransfers        ModelTransferOwner
+	MaxOutputMiB          int64
 }
 
 type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)
@@ -489,6 +489,7 @@ type Orchestrator struct {
 	// transferWake is a lossy nudge over durable request-attached transfer rows.
 	transferWake         map[string]chan struct{}
 	transferRunning      map[string]bool
+	sourcePauseRunning   map[string]bool
 	transferDispatching  map[string]bool
 	transferCancels      map[string]context.CancelFunc
 	transferProgressSeq  map[string]uint64
@@ -497,7 +498,9 @@ type Orchestrator struct {
 	checkpointUploads    map[string]*checkpointUpload
 	// localTransfers is command-scoped, lossy progress over Creator's durable request
 	// row and sealed revision. A restart simply replays exact chunks from those authorities.
-	localTransfers map[string]*localTransfer
+	localTransfers   map[string]*localTransfer
+	childWatches     map[string]*session
+	operationLookups map[string]bool // one native lookup in flight per request; not a result cache
 }
 
 type wait struct {
@@ -534,6 +537,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		phases:               newPhases(),
 		transferWake:         make(map[string]chan struct{}),
 		transferRunning:      make(map[string]bool),
+		sourcePauseRunning:   make(map[string]bool),
 		transferDispatching:  make(map[string]bool),
 		transferCancels:      make(map[string]context.CancelFunc),
 		transferProgressSeq:  make(map[string]uint64),
@@ -541,6 +545,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		sourcePrepareBlocked: make(map[string]sourcePreparationBackoff),
 		checkpointUploads:    make(map[string]*checkpointUpload),
 		localTransfers:       make(map[string]*localTransfer),
+		childWatches:         make(map[string]*session),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a
 	// SAMPLING resolution, never a verdict: every verdict it acts on is the worker's own
@@ -689,7 +694,7 @@ func (c *Orchestrator) enqueue(requestID string) bool {
 	// either activation appends first and cancel removes it, or activation observes
 	// the absorbing terminal and appends nothing.
 	row, problem := c.opt.Store.RequestRow(requestID)
-	if problem != nil || row == nil || settledState(row.State) {
+	if problem != nil || row == nil || (row.State != "submitted" && row.State != "queued") {
 		return false
 	}
 	for _, id := range c.pending {
@@ -734,7 +739,7 @@ func (c *Orchestrator) drain() {
 			c.forget(id)
 			continue
 		}
-		if settledState(req.State) {
+		if req.State != "submitted" && req.State != "queued" {
 			c.forget(id)
 			continue
 		}
@@ -826,6 +831,11 @@ func (c *Orchestrator) queued(requestID string) bool {
 }
 
 func (c *Orchestrator) kickQueuedTransferDispatch(req records.Request) {
+	current, problem := c.opt.Store.RequestRow(req.ID)
+	if problem != nil || current == nil || (current.State != "submitted" && current.State != "queued") {
+		return
+	}
+	req = *current
 	c.mu.Lock()
 	if c.transferDispatching[req.ID] {
 		c.mu.Unlock()
@@ -846,13 +856,13 @@ func (c *Orchestrator) kickQueuedTransferDispatch(req records.Request) {
 			go c.drain()
 			return
 		}
-		if problem.Code != exit.Unavailable && problem.Code != exit.Conflict {
+		if problem.Code != exit.Unavailable && (problem.Code != exit.Conflict || req.RetainWork) {
 			c.failQueued(req.ID, problem, "")
 			go c.drain()
 			return
 		}
 		current, readProblem := c.opt.Store.RequestRow(req.ID)
-		if readProblem == nil && current != nil && !settledState(current.State) {
+		if readProblem == nil && current != nil && (current.State == "submitted" || current.State == "queued") {
 			c.selectOrStart(*current)
 			time.AfterFunc(2*time.Second, func() { c.kickQueuedTransferDispatch(*current) })
 		}

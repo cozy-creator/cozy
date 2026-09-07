@@ -41,6 +41,8 @@ type JobSubmission struct {
 	Release        string          `json:"release,omitempty"`
 	Rental         bool            `json:"rental,omitempty"`
 	RentalRequired bool            `json:"rental_required,omitempty"`
+	RetainWork     bool            `json:"retain_work,omitempty"`
+	RetryOf        string          `json:"retry_of,omitempty"`
 	// Worker pins an internal production step to the already-attached rental that
 	// prepared its source Manifests. It is admitted only with the CLI credential.
 	Worker string `json:"worker,omitempty"`
@@ -115,12 +117,30 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// authority local_assets carry on /v1/requests (requests.go) — so they take the same
 	// gate: a browser bearer must never name host paths (credentials.go).
 	if (len(sub.Trees) > 0 || sub.Worker != "" || len(sub.Models) > 0 ||
-		sub.ModelTransfer != nil) &&
+		sub.ModelTransfer != nil || sub.RetryOf != "") &&
 		!s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"trees name host filesystem directories and require the OS-protected CLI credential",
 			"use `cozy run --input-tree <ref>=<dir>`; this build exposes no browser tree-upload route")
 		return
+	}
+	if sub.RetryOf != "" {
+		prior, problem := s.store.RequestByReference(sub.RetryOf)
+		if problem != nil {
+			s.refuseTyped(w, r, problem)
+			return
+		}
+		if prior == nil || !prior.IsJob() {
+			s.refuse(w, r, http.StatusNotFound, "not_found", "no prior job "+sub.RetryOf+" on this host", "")
+			return
+		}
+		if sub.Worker != "" && sub.Worker != prior.Worker {
+			s.refuse(w, r, http.StatusConflict, "request.retry_worker_changed", "retry must retain the predecessor's machine", "")
+			return
+		}
+		sub.RetryOf, sub.Worker = prior.ID, prior.Worker
+		sub.RetainWork = true
+		sub.Rental, sub.RentalRequired = prior.Rental, prior.RentalRequired
 	}
 	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	existing, e := s.store.RequestByIdempotencyKey(key)
@@ -128,7 +148,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	if existing != nil && (existing.State == "canceled" || existing.State == "failed" || existing.State == "refused") {
+	if existing != nil && !existing.RetainWork && (existing.State == "canceled" || existing.State == "failed" || existing.State == "refused") {
 		released, e := s.store.ReleaseCanceledIdempotencyKey(key)
 		if e != nil {
 			s.refuseTyped(w, r, e)
@@ -140,6 +160,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 	var spec orchestrator.Submission
 	if existing != nil {
+		if e = s.verifyJobReplayInstall(sub, *existing); e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
 		spec, e = replayJobSubmission(sub, *existing)
 	} else {
 		if sub.Rental || sub.RentalRequired {
@@ -247,8 +271,9 @@ func replayJobSubmission(sub JobSubmission,
 		}
 		sort.Strings(params)
 	}
-	return orchestrator.Submission{Kind: "job", Package: packageName,
-		Entrypoint: function, Payload: payload, Org: org,
+	return orchestrator.Submission{Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: packageName,
+		ChildArtifacts: recorded.ChildArtifacts,
+		Entrypoint:     function, Payload: payload, Org: org,
 		InstallID: recorded.InstallID, Release: recorded.Release,
 		LocalPackageDigest: recorded.LocalPackageDigest,
 		PlanID:             recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
@@ -272,7 +297,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			PlanID: "sha256:" + strings.Repeat("0", 64), ModelTransfer: sub.ModelTransfer}, nil
 	}
 	out := orchestrator.Submission{
-		Kind: "job", Package: sub.Package, Entrypoint: sub.Function,
+		Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org),
 		Release: sub.Release,
 		Rental:  sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
@@ -297,6 +322,9 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 	}
 	if out.Rental {
 		if strings.HasPrefix(sub.Package, "local/") {
+			if sub.InstallID != "" {
+				return s.resolveLocalJob(ctx, sub, out, sub.InstallID)
+			}
 			refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
 			if refreshProblem != nil {
 				return out, refreshProblem
@@ -326,12 +354,14 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
 		return out, nil
 	}
-	refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
-	if refreshProblem != nil {
-		return out, refreshProblem
-	}
-	if editable {
-		sub.InstallID = refreshed
+	if sub.InstallID == "" {
+		refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
+		if refreshProblem != nil {
+			return out, refreshProblem
+		}
+		if editable {
+			sub.InstallID = refreshed
+		}
 	}
 	var jobs []launch.JobFacts
 	var e *exit.Error
@@ -359,6 +389,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			continue
 		}
 		out.PlanID = job.DescriptorID
+		out.ChildArtifacts = job.RetainsArtifacts
 		out.Outputs = job.Outputs
 		out.WeightsOutputs = job.WeightsOutputs
 		out.NeedsAccelerator = job.NeedsAccelerator
@@ -410,6 +441,7 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 			continue
 		}
 		out.PlanID, out.Outputs = job.DescriptorID, job.Outputs
+		out.ChildArtifacts = job.RetainsArtifacts
 		out.WeightsOutputs, out.NeedsAccelerator = job.WeightsOutputs, job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
 		if problem := validateJobPayload(sub.Package, job, out.Payload); problem != nil {
@@ -486,6 +518,12 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"trees":           strings.Join(spec.Trees, ","),
 		"models":          models,
 	}
+	if spec.RetainWork {
+		doc["retain_work"] = true
+	}
+	if spec.RetryOf != "" {
+		doc["retry_of"] = spec.RetryOf
+	}
 	if spec.Rental {
 		doc["rental"] = true
 		doc["release"] = spec.Release
@@ -516,13 +554,20 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 // JobState is one job's document: the lifecycle a request has, plus the two facts only a
 // job has — its publication and its running bill.
 type JobState struct {
-	Number   int64  `json:"number"`
-	JobID    string `json:"job_id"`
-	Status   string `json:"status"`
-	Package  string `json:"package"`
-	Function string `json:"function"`
-	Attempt  uint64 `json:"attempt"`
-	Attempts int    `json:"attempts"`
+	ParentRequestID string `json:"parent_request_id,omitempty"`
+	ParentCallIndex *int64 `json:"parent_call_index,omitempty"`
+	ReusedFrom      string `json:"reused_from,omitempty"`
+	RetainWork      bool   `json:"retain_work,omitempty"`
+	Retaining       bool   `json:"retaining,omitempty"`
+	RetryOf         string `json:"retry_of,omitempty"`
+	ReuseScope      string `json:"reuse_scope,omitempty"`
+	Number          int64  `json:"number"`
+	JobID           string `json:"job_id"`
+	Status          string `json:"status"`
+	Package         string `json:"package"`
+	Function        string `json:"function"`
+	Attempt         uint64 `json:"attempt"`
+	Attempts        int    `json:"attempts"`
 	// Queued is the job's position in the dispatch queue while it waits for a worker,
 	// counted from 1. Absent once it has an attempt — a running job is not queued.
 	QueuePosition *int `json:"queue_position,omitempty"`
@@ -651,12 +696,28 @@ func (s *Server) jobRow(w http.ResponseWriter, r *http.Request) (records.Request
 }
 
 func (s *Server) jobStateOf(row records.Request) JobState {
+	retaining, retentionProblem := s.store.RequestRetaining(row)
+	if retentionProblem != nil {
+		retaining = row.RetainWork
+	}
 	state := JobState{
+		RetainWork: row.RetainWork,
+		Retaining:  retaining,
+		RetryOf:    row.RetryOf, ReuseScope: row.ReuseScope,
 		Number: row.Number, JobID: row.ID, Status: contractStatus(row.State), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		Requeues: row.Requeues, RetryBudget: orchestrator.MaxRequeues,
 		Outputs: []MediaRef{}, CreatedAt: row.CreatedAt,
 		EventsURL: "/v1/requests/" + row.ID + "/events",
+	}
+	if row.State == "blocked" {
+		state.ErrorType, state.Error, _ = s.store.RetainedFailure(row.ID)
+	}
+	if row.ParentRequestID != "" {
+		state.ParentRequestID = row.ParentRequestID
+		index := row.ParentCallIndex
+		state.ParentCallIndex = &index
+		state.ReusedFrom = row.ReusedFrom
 	}
 	if row.ModelTransfer != nil {
 		if transfer, problem := s.store.ModelTransferOf(row.ID); problem == nil && transfer != nil {
@@ -789,6 +850,16 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		}
 	}
 	if len(attempts) == 0 {
+		if row.ReusedFrom != "" {
+			if prior, problem := s.store.Attempts(row.ReusedFrom); problem == nil && len(prior) > 0 {
+				last := prior[len(prior)-1]
+				if last.State == "closed" && last.TerminalStatus == "SUCCEEDED" {
+					if doc, err := canonical.Read(last.TerminalBody, &pb.AttemptOutcomeBody{}); err == nil {
+						state.Result = inlineJobResult(doc)
+					}
+				}
+			}
+		}
 		return state
 	}
 	last := attempts[len(attempts)-1]
@@ -814,15 +885,20 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	if last.TerminalStatus != "SUCCEEDED" && state.ErrorType == "" {
 		state.ErrorType, state.Error = last.TerminalCause, last.SafeMessage
 	}
+	state.Result = inlineJobResult(doc)
+	return state
+}
+
+func inlineJobResult(doc canonical.Doc) any {
 	if inline := doc.Sub("result").Str("inline_result"); inline != "" {
 		if decoded, err := base64.StdEncoding.DecodeString(inline); err == nil {
 			var typed any
 			if json.Unmarshal(decoded, &typed) == nil {
-				state.Result = typed
+				return typed
 			}
 		}
 	}
-	return state
+	return nil
 }
 
 // parseStamp reads the authority's own RFC3339Nano timestamps. An unreadable one answers
@@ -898,6 +974,24 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	actor := requestActor(r)
+	retaining, problem := s.store.RequestRetaining(row)
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	if retaining && row.State != "finalizing" {
+		if e := s.orchestrator.CancelRetainedRequest(row.ID, actor); e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		updated, e := s.store.RequestRow(row.ID)
+		if e != nil || updated == nil {
+			s.refuse(w, r, http.StatusInternalServerError, "internal", "canceled request cannot be read", "")
+			return
+		}
+		s.ok(w, r, http.StatusAccepted, s.jobStateOf(*updated))
+		return
+	}
 	if status := contractStatus(row.State); status == "completed" || status == "failed" || status == "canceled" {
 		s.ok(w, r, http.StatusOK, s.jobStateOf(row))
 		return

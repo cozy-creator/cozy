@@ -984,6 +984,9 @@ func handleRentRelease(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
+	if problem := st.RequestRetainedRentalAbandonment(id, "cozy rental end"); problem != nil {
+		return problem
+	}
 	if gone {
 		operationKey, releaseProblem := st.RequestRentalRelease(id)
 		if releaseProblem != nil {
@@ -1094,6 +1097,9 @@ func (w *releaseWatch) interrupted() *exit.Error {
 }
 
 func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey string, had bool, note string) *exit.Error {
+	if problem := st.CompleteRetainedRentalAbandonment(w.id, "cozy rental end"); problem != nil {
+		return problem
+	}
 	forgotten := false
 	if had {
 		local, problem := dial(w.ctx)

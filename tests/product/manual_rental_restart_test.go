@@ -35,7 +35,7 @@ import (
 // empty canonical snapshot. The actual daemon must claim it again after process
 // replacement without any request, package, or explicit second claim call.
 func TestIdleManualRentalReclaimsAfterDaemonRestart(t *testing.T) {
-	for _, mode := range []string{"healthy", "attached", "weather", "released", "closed", "permanent", "released_health", "closing_health", "concurrent"} {
+	for _, mode := range []string{"healthy", "attached", "weather", "released", "closed", "permanent", "released_health", "closing_health", "concurrent", "retained"} {
 		t.Run(mode, func(t *testing.T) { proveIdleManualRentalRestart(t, mode) })
 	}
 }
@@ -195,6 +195,9 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	if mode == "attached" {
 		row.State = "attached"
 	}
+	if mode == "retained" {
+		row.ManagedRequestID = "req-private-control-restart"
+	}
 	if mode == "cpu_job_on_gpu" {
 		row.SKU, row.AcceleratorModel = "rtx-4090", "RTX 4090"
 	}
@@ -233,6 +236,18 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		t.Fatalf("initial explicit rental claim: %s", reply.brief())
 	}
 	waitUntil(t, "first empty rental snapshot acknowledged", func() bool { mu.Lock(); defer mu.Unlock(); return len(acknowledged) == 1 })
+	if mode == "retained" {
+		request := recordPrivateTransaction(t, store, "control-restart", podRental)
+		response := first.call(t, http.MethodPost, "/v1/local/jobs/"+request.ID+"/pause",
+			map[string]any{"actor": "product proof"})
+		if response.Status != http.StatusOK || !bytes.Contains(response.Body, []byte(`"status":"paused"`)) {
+			t.Fatalf("pause retained rental owner: %s", response.brief())
+		}
+		// The machine now belongs to a retained transaction. Recovery must not
+		// rely on the manual-rental exception or an open Python attempt.
+		before, problem = store.RentalRow(podRental)
+		fatal(t, problem)
+	}
 	if classProof {
 		const request = "job-idle-accelerator-requirement"
 		waitUntil(t, "existing-rental selection or paid ask", func() bool {
@@ -350,7 +365,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	after, problem := store.RentalRow(podRental)
 	fatal(t, problem)
 	if after == nil || after.ID != before.ID || after.ExpectedWorkerID != before.ExpectedWorkerID ||
-		after.ExpectedWorkerBootID != before.ExpectedWorkerBootID || after.RentedAt != before.RentedAt || after.ReadyAt != before.ReadyAt || after.ManagedRequestID != "" {
+		after.ExpectedWorkerBootID != before.ExpectedWorkerBootID || after.RentedAt != before.RentedAt || after.ReadyAt != before.ReadyAt || after.ManagedRequestID != before.ManagedRequestID {
 		t.Fatalf("reattachment changed rental ownership/lifecycle: before=%+v after=%+v", before, after)
 	}
 	keyAfter, err := os.ReadFile(layout.RentalCreatorIdentity(podRental))

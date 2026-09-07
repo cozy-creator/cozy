@@ -65,6 +65,19 @@ type Entrypoint struct {
 	// WeightsOutputs is the job's explicit WeightsSink slot set. It is separate from
 	// result asset fields because worker-protocol rev5 OutputBinding has no kind.
 	WeightsOutputs []WeightsOutput `json:"weights_outputs"`
+	Invocable      *Invocable      `json:"invocable,omitempty"`
+}
+
+type Invocable struct {
+	Reusable     bool                       `json:"reusable"`
+	Capabilities []string                   `json:"capabilities"`
+	Context      string                     `json:"context"`
+	Module       string                     `json:"module"`
+	Export       string                     `json:"export"`
+	Parameters   []string                   `json:"parameters"`
+	Defaults     map[string]json.RawMessage `json:"defaults"`
+	TypeNames    map[string]string          `json:"type_names"`
+	EnumMembers  map[string]json.RawMessage `json:"enum_members"`
 }
 
 type WeightsOutput struct {
@@ -89,6 +102,7 @@ type Slot struct {
 
 // Struct is a rendered msgspec struct.
 type Struct struct {
+	Input    string          `json:"input,omitempty"`
 	Fields   []Field         `json:"fields"`
 	TagField string          `json:"tag_field"`
 	Tag      json.RawMessage `json:"tag"`
@@ -190,7 +204,7 @@ func validateClosedPackageInterface(data []byte) error {
 		}
 		for _, row := range rows {
 			required := []string{"name", "request", "result"}
-			optional := []string{"models"}
+			optional := []string{"models", "invocable"}
 			if kind == "job" {
 				required = append(required, "publishes")
 				optional = append(optional, "weights_outputs")
@@ -198,6 +212,11 @@ func validateClosedPackageInterface(data []byte) error {
 			callable, err := exactKeys(row, required, optional)
 			if err != nil {
 				return err
+			}
+			if metadata := callable["invocable"]; metadata != nil {
+				if _, err := exactKeys(metadata, []string{"context", "module", "export", "parameters", "defaults", "type_names", "enum_members"}, []string{"reusable", "capabilities"}); err != nil {
+					return err
+				}
 			}
 			for _, name := range []string{"request", "result"} {
 				if err := validateStructRaw(callable[name]); err != nil {
@@ -267,6 +286,10 @@ func MissingComponents(slot Slot, available []string) []string {
 }
 
 func validateStructRaw(raw json.RawMessage) error {
+	var native map[string]json.RawMessage
+	if json.Unmarshal(raw, &native) == nil && len(native) == 1 && string(native["input"]) == `"model"` {
+		return nil
+	}
 	object, err := exactKeys(raw, []string{"fields"}, []string{"tag", "tag_field"})
 	if err != nil {
 		return err
@@ -588,6 +611,9 @@ func typeOf(raw json.RawMessage) (kind string, nested Struct) {
 	// wire value is a REF, and the grant is what turns that ref into a readable path.
 	if kind, ok := object["input"]; ok && string(kind) == `"tree"` {
 		return "tree", Struct{}
+	}
+	if kind, ok := object["input"]; ok && string(kind) == `"model"` {
+		return "model", Struct{Input: "model"}
 	}
 	if _, ok := object["fields"]; ok {
 		var s Struct

@@ -60,6 +60,8 @@ const (
 type fakePod struct {
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
 	sourceRuntime pb.RuntimePreparationClient
+	sourceRelease func(*pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error)
+	sourceControl func(*pb.ModelSourceControlCall) (*pb.ModelSourceControlResult, error)
 	weightsReady  func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
 	protocolInfo  func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
 	pb.UnimplementedWorkerControlServer
@@ -81,6 +83,9 @@ type fakePod struct {
 	jobReady bool
 	// snapshotHeld replays actual retained attempt identities during reconnect tests.
 	snapshotHeld []*pb.HeldAttempt
+	hostHeld     func() []*pb.HeldAttempt
+	// localJobOnly supplies a prepared interface without any serving entrypoints.
+	localJobOnly bool
 	// onJobReady can delay and sequence the independent peer's readiness facts.
 	onJobReady func(*pb.WorkerFrame, func(*pb.WorkerFrame) error) error
 	// answerOffer supplies a protocol outcome when a test exercises settlement.
@@ -103,7 +108,7 @@ type fakePod struct {
 	desired            []*pb.DesiredWorkerState
 	prepares           []*pb.PreparePackageSetCall
 	localPrepares      []*pb.PrepareLocalPackageCall
-	grants             []*pb.LocalPackageFileGrant
+	uploads            []*pb.LocalPackageFileRef
 	lanes              []string // the order lanes were used: fetch, prepare_private, placement_set
 	prepareCodes       []codes.Code
 	prepareUnavailable int
@@ -286,7 +291,11 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			if err != nil {
 				return err
 			}
-			hostBody, hostDigest, err := canonical.Identity(&pb.HostSnapshotBody{
+			var retained []*pb.HeldAttempt
+			if p.hostHeld != nil {
+				retained = p.hostHeld()
+			}
+			hostBody, hostDigest, err := canonical.Identity(&pb.HostSnapshotBody{HeldOutcomes: retained,
 				WeightsTransactions: []*pb.WeightsTransactionStatus{{
 					WeightsTransactionId: "sha256:" + strings.Repeat("ab", 32), RequestId: "job-prior",
 					AttemptOrdinal: 1, InvocationSpecDigest: "sha256:" + strings.Repeat("cd", 32),
@@ -382,25 +391,7 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			p.finalizations = append(p.finalizations, m.WeightsFinalizeRequest)
 			p.mu.Unlock()
 		case *pb.RecordOwnerFrame_LocalPackageFetchRequest:
-			// th-094's pod half, minimally: every named wheel is reported VERIFIED at its
-			// full length. The grants are recorded so the test can read what was named.
-			request := m.LocalPackageFetchRequest
-			p.mu.Lock()
-			p.grants = append(p.grants, request.Files...)
-			p.lanes = append(p.lanes, "fetch")
-			p.mu.Unlock()
-			for _, grant := range request.Files {
-				if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_LocalPackageFileStatus{
-					LocalPackageFileStatus: &pb.LocalPackageFileStatus{
-						RecordOwnerEpoch: request.RecordOwnerEpoch, ControlStreamEpoch: request.ControlStreamEpoch,
-						WorkerBootId: request.WorkerBootId, OperationId: request.OperationId,
-						SourceDigest: request.SourceDigest, Digest: grant.Digest, Filename: grant.Filename,
-						Length: grant.Length, ReceivedBytes: grant.Length,
-						State: pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED,
-					}}}); err != nil {
-					return err
-				}
-			}
+			return status.Error(codes.PermissionDenied, "private wheels must use direct upload")
 		}
 	}
 }
@@ -408,6 +399,60 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 // PrepareLocalPackage is the pod host's private lane: the set names wheels the pod
 // already holds verified, and the prepared placement is a development one carrying the
 // exact project wheel and the local revision digest, as Runtime authors it.
+func (p *fakePod) LocalPackageUpload(stream grpc.BidiStreamingServer[pb.LocalPackageUploadFrame, pb.LocalPackageFileStatus]) error {
+	frame, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	header := frame.GetHeader()
+	if header == nil || header.File == nil {
+		return status.Error(codes.InvalidArgument, "header required")
+	}
+	if err := p.verifyClaim(header.Claim, false); err != nil {
+		return err
+	}
+	file := header.File
+	if file.Length == 0 || file.Length > 512<<20 {
+		return status.Error(codes.InvalidArgument, "file size")
+	}
+	state := &pb.LocalPackageFileStatus{OperationId: header.OperationId, SourceDigest: header.SourceDigest,
+		Digest: file.Digest, Filename: file.Filename, Length: file.Length,
+		State: pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_RECEIVING}
+	if err := stream.Send(state); err != nil {
+		return err
+	}
+	hash := sha256.New()
+	for state.ReceivedBytes < file.Length {
+		frame, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		chunk := frame.GetChunk()
+		if chunk == nil || chunk.Offset != state.ReceivedBytes || len(chunk.Data) == 0 ||
+			len(chunk.Data) > 1<<20 || uint64(len(chunk.Data)) > file.Length-state.ReceivedBytes {
+			return status.Error(codes.InvalidArgument, "chunk offset or size")
+		}
+		_, _ = hash.Write(chunk.Data)
+		state.ReceivedBytes += uint64(len(chunk.Data))
+		if state.ReceivedBytes == file.Length {
+			if !bytes.Equal(hash.Sum(nil), file.Digest) {
+				return status.Error(codes.DataLoss, "wheel digest")
+			}
+			state.State = pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED
+		}
+		if err := stream.Send(state); err != nil {
+			return err
+		}
+	}
+	p.mu.Lock()
+	if len(p.uploads) == 0 {
+		p.lanes = append(p.lanes, "upload")
+	}
+	p.uploads = append(p.uploads, file)
+	p.mu.Unlock()
+	return nil
+}
+
 func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
 	if err := p.verifyClaim(call.Claim, false); err != nil {
 		return err
@@ -433,6 +478,10 @@ func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream g
 	p.localPrepares = append(p.localPrepares, call)
 	p.lanes = append(p.lanes, "prepare_private")
 	p.mu.Unlock()
+	entrypoints := []*pb.Entrypoint{{Name: "tile", EntrypointBindingDigest: bytes.Repeat([]byte{0x34}, 32)}}
+	if p.localJobOnly {
+		entrypoints = nil
+	}
 	setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{{
 		PlacementId: "package-" + selected.OperationId,
 		PackageMode: &pb.Placement_Development{Development: &pb.DevelopmentPackage{
@@ -444,7 +493,7 @@ func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream g
 		EnvironmentDigest: bytes.Repeat([]byte{0x23}, 32),
 		PackageInterface:  &pb.Ref{Digest: bytes.Repeat([]byte{0x24}, 32), Length: 2048},
 		BindingsDigest:    bytes.Repeat([]byte{0x25}, 32),
-		Entrypoints:       []*pb.Entrypoint{{Name: "tile", EntrypointBindingDigest: bytes.Repeat([]byte{0x34}, 32)}},
+		Entrypoints:       entrypoints,
 		Environment:       &pb.Environment{},
 	}}})
 	if err != nil {
@@ -691,13 +740,6 @@ func rentalWiring(connection *orchestrator.WorkerConnection, signer ed25519.Priv
 			}
 			return ed25519.Sign(signer, body), nil
 		}
-		o.LocalWheels = func(_ context.Context, wheels []orchestrator.LocalWheel) ([]string, *exit.Error) {
-			urls := make([]string, 0, len(wheels))
-			for _, wheel := range wheels {
-				urls = append(urls, "https://store.invalid/private/"+wheel.Digest)
-			}
-			return urls, nil
-		}
 		o.RentalPackageSet = func(packages []*pb.DownloadPackageRef,
 			models []*pb.DownloadModelRef) ([]byte, *exit.Error) {
 			body, err := canonical.Bytes(&pb.DownloadDelegation{Models: models, Packages: packages})
@@ -924,23 +966,23 @@ func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 	})
 	pod.mu.Lock()
 	defer pod.mu.Unlock()
-	if got := strings.Join(pod.lanes, ","); got != "fetch,prepare_private,placement_set" {
-		t.Fatalf("the pod saw the lanes in the order %q; want fetch, prepare_private, placement_set", got)
+	if got := strings.Join(pod.lanes, ","); got != "upload,prepare_private,placement_set" {
+		t.Fatalf("the pod saw the lanes in the order %q; want upload, prepare_private, placement_set", got)
 	}
 	project := 0
-	for _, grant := range pod.grants {
+	for _, grant := range pod.uploads {
 		spelled, _ := canonical.Spell(grant.Digest)
 		if strings.HasPrefix(grant.Filename, "weightless-1.0.0-") {
 			project++
 			if spelled != revision.Files[0].Digest && spelled != revision.Files[1].Digest ||
-				grant.Url == "" {
+				grant.Length == 0 {
 				t.Fatalf("the project wheel grant names %s %s, not the sealed revision's wheel", spelled, grant.Filename)
 			}
 		}
 	}
-	if len(pod.grants) != len(revision.Files) || project != 1 {
+	if len(pod.uploads) != len(revision.Files) || project != 1 {
 		t.Fatalf("%d grant(s) with %d project wheel(s); want %d grants naming exactly one project wheel",
-			len(pod.grants), project, len(revision.Files))
+			len(pod.uploads), project, len(revision.Files))
 	}
 	if len(pod.localPrepares) != 1 || len(pod.localPrepares[0].LocalPackageSet.Files) != len(revision.Files) ||
 		pod.localPrepares[0].LocalPackageSet.OperationId != requestID {

@@ -353,9 +353,15 @@ var WorkerControl_ServiceDesc = grpc.ServiceDesc{
 
 const (
 	RuntimePreparation_ProtocolInfo_FullMethodName                 = "/cozy.worker.v1.RuntimePreparation/ProtocolInfo"
+	RuntimePreparation_NumericalEnvironment_FullMethodName         = "/cozy.worker.v1.RuntimePreparation/NumericalEnvironment"
 	RuntimePreparation_CheckPackageSetCompatibility_FullMethodName = "/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility"
 	RuntimePreparation_PreparePackageSet_FullMethodName            = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
 	RuntimePreparation_PrepareModelSource_FullMethodName           = "/cozy.worker.v1.RuntimePreparation/PrepareModelSource"
+	RuntimePreparation_ReleaseModelSource_FullMethodName           = "/cozy.worker.v1.RuntimePreparation/ReleaseModelSource"
+	RuntimePreparation_RetainDerivedResult_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/RetainDerivedResult"
+	RuntimePreparation_ReleaseDerivedRetention_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/ReleaseDerivedRetention"
+	RuntimePreparation_ReleaseDerivedResult_FullMethodName         = "/cozy.worker.v1.RuntimePreparation/ReleaseDerivedResult"
+	RuntimePreparation_CollectStoreGarbage_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/CollectStoreGarbage"
 	RuntimePreparation_ValidateWeightsCheckpoint_FullMethodName    = "/cozy.worker.v1.RuntimePreparation/ValidateWeightsCheckpoint"
 	RuntimePreparation_CheckpointPage_FullMethodName               = "/cozy.worker.v1.RuntimePreparation/CheckpointPage"
 	RuntimePreparation_CheckpointTransfer_FullMethodName           = "/cozy.worker.v1.RuntimePreparation/CheckpointTransfer"
@@ -376,9 +382,15 @@ const (
 // crosses — an https URL, never a credential.
 type RuntimePreparationClient interface {
 	ProtocolInfo(ctx context.Context, in *ProtocolInfoRequest, opts ...grpc.CallOption) (*ProtocolInfoResult, error)
+	NumericalEnvironment(ctx context.Context, in *NumericalEnvironmentRequest, opts ...grpc.CallOption) (*NumericalEnvironmentResult, error)
 	CheckPackageSetCompatibility(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
 	PrepareModelSource(ctx context.Context, in *PrepareModelSourceRequest, opts ...grpc.CallOption) (*PrepareModelSourceResult, error)
+	ReleaseModelSource(ctx context.Context, in *ReleaseModelSourceRequest, opts ...grpc.CallOption) (*ReleaseModelSourceResult, error)
+	RetainDerivedResult(ctx context.Context, in *DerivedRetentionRequest, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
+	ReleaseDerivedRetention(ctx context.Context, in *DerivedRetentionRequest, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
+	ReleaseDerivedResult(ctx context.Context, in *DerivedResultReleaseRequest, opts ...grpc.CallOption) (*DerivedResultReleaseResult, error)
+	CollectStoreGarbage(ctx context.Context, in *CollectStoreGarbageRequest, opts ...grpc.CallOption) (*CollectStoreGarbageResult, error)
 	ValidateWeightsCheckpoint(ctx context.Context, in *ValidateWeightsCheckpointRequest, opts ...grpc.CallOption) (*ValidateWeightsCheckpointResult, error)
 	CheckpointPage(ctx context.Context, in *CheckpointPageRequest, opts ...grpc.CallOption) (*CheckpointPageResult, error)
 	CheckpointTransfer(ctx context.Context, in *CheckpointTransferRequest, opts ...grpc.CallOption) (*CheckpointTransferStatus, error)
@@ -398,6 +410,16 @@ func (c *runtimePreparationClient) ProtocolInfo(ctx context.Context, in *Protoco
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ProtocolInfoResult)
 	err := c.cc.Invoke(ctx, RuntimePreparation_ProtocolInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) NumericalEnvironment(ctx context.Context, in *NumericalEnvironmentRequest, opts ...grpc.CallOption) (*NumericalEnvironmentResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NumericalEnvironmentResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_NumericalEnvironment_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -428,6 +450,56 @@ func (c *runtimePreparationClient) PrepareModelSource(ctx context.Context, in *P
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PrepareModelSourceResult)
 	err := c.cc.Invoke(ctx, RuntimePreparation_PrepareModelSource_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) ReleaseModelSource(ctx context.Context, in *ReleaseModelSourceRequest, opts ...grpc.CallOption) (*ReleaseModelSourceResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseModelSourceResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_ReleaseModelSource_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) RetainDerivedResult(ctx context.Context, in *DerivedRetentionRequest, opts ...grpc.CallOption) (*DerivedRetentionResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DerivedRetentionResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_RetainDerivedResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) ReleaseDerivedRetention(ctx context.Context, in *DerivedRetentionRequest, opts ...grpc.CallOption) (*DerivedRetentionResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DerivedRetentionResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_ReleaseDerivedRetention_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) ReleaseDerivedResult(ctx context.Context, in *DerivedResultReleaseRequest, opts ...grpc.CallOption) (*DerivedResultReleaseResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DerivedResultReleaseResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_ReleaseDerivedResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) CollectStoreGarbage(ctx context.Context, in *CollectStoreGarbageRequest, opts ...grpc.CallOption) (*CollectStoreGarbageResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CollectStoreGarbageResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_CollectStoreGarbage_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -497,9 +569,15 @@ func (c *runtimePreparationClient) PreparePrivatePlacement(ctx context.Context, 
 // crosses — an https URL, never a credential.
 type RuntimePreparationServer interface {
 	ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error)
+	NumericalEnvironment(context.Context, *NumericalEnvironmentRequest) (*NumericalEnvironmentResult, error)
 	CheckPackageSetCompatibility(context.Context, *PreparePackageSetRequest) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error)
 	PrepareModelSource(context.Context, *PrepareModelSourceRequest) (*PrepareModelSourceResult, error)
+	ReleaseModelSource(context.Context, *ReleaseModelSourceRequest) (*ReleaseModelSourceResult, error)
+	RetainDerivedResult(context.Context, *DerivedRetentionRequest) (*DerivedRetentionResult, error)
+	ReleaseDerivedRetention(context.Context, *DerivedRetentionRequest) (*DerivedRetentionResult, error)
+	ReleaseDerivedResult(context.Context, *DerivedResultReleaseRequest) (*DerivedResultReleaseResult, error)
+	CollectStoreGarbage(context.Context, *CollectStoreGarbageRequest) (*CollectStoreGarbageResult, error)
 	ValidateWeightsCheckpoint(context.Context, *ValidateWeightsCheckpointRequest) (*ValidateWeightsCheckpointResult, error)
 	CheckpointPage(context.Context, *CheckpointPageRequest) (*CheckpointPageResult, error)
 	CheckpointTransfer(context.Context, *CheckpointTransferRequest) (*CheckpointTransferStatus, error)
@@ -518,6 +596,9 @@ type UnimplementedRuntimePreparationServer struct{}
 func (UnimplementedRuntimePreparationServer) ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ProtocolInfo not implemented")
 }
+func (UnimplementedRuntimePreparationServer) NumericalEnvironment(context.Context, *NumericalEnvironmentRequest) (*NumericalEnvironmentResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method NumericalEnvironment not implemented")
+}
 func (UnimplementedRuntimePreparationServer) CheckPackageSetCompatibility(context.Context, *PreparePackageSetRequest) (*CheckPackageSetCompatibilityResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckPackageSetCompatibility not implemented")
 }
@@ -526,6 +607,21 @@ func (UnimplementedRuntimePreparationServer) PreparePackageSet(context.Context, 
 }
 func (UnimplementedRuntimePreparationServer) PrepareModelSource(context.Context, *PrepareModelSourceRequest) (*PrepareModelSourceResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method PrepareModelSource not implemented")
+}
+func (UnimplementedRuntimePreparationServer) ReleaseModelSource(context.Context, *ReleaseModelSourceRequest) (*ReleaseModelSourceResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseModelSource not implemented")
+}
+func (UnimplementedRuntimePreparationServer) RetainDerivedResult(context.Context, *DerivedRetentionRequest) (*DerivedRetentionResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method RetainDerivedResult not implemented")
+}
+func (UnimplementedRuntimePreparationServer) ReleaseDerivedRetention(context.Context, *DerivedRetentionRequest) (*DerivedRetentionResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseDerivedRetention not implemented")
+}
+func (UnimplementedRuntimePreparationServer) ReleaseDerivedResult(context.Context, *DerivedResultReleaseRequest) (*DerivedResultReleaseResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseDerivedResult not implemented")
+}
+func (UnimplementedRuntimePreparationServer) CollectStoreGarbage(context.Context, *CollectStoreGarbageRequest) (*CollectStoreGarbageResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method CollectStoreGarbage not implemented")
 }
 func (UnimplementedRuntimePreparationServer) ValidateWeightsCheckpoint(context.Context, *ValidateWeightsCheckpointRequest) (*ValidateWeightsCheckpointResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ValidateWeightsCheckpoint not implemented")
@@ -581,6 +677,24 @@ func _RuntimePreparation_ProtocolInfo_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RuntimePreparation_NumericalEnvironment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NumericalEnvironmentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).NumericalEnvironment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_NumericalEnvironment_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).NumericalEnvironment(ctx, req.(*NumericalEnvironmentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _RuntimePreparation_CheckPackageSetCompatibility_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PreparePackageSetRequest)
 	if err := dec(in); err != nil {
@@ -631,6 +745,96 @@ func _RuntimePreparation_PrepareModelSource_Handler(srv interface{}, ctx context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(RuntimePreparationServer).PrepareModelSource(ctx, req.(*PrepareModelSourceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_ReleaseModelSource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseModelSourceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).ReleaseModelSource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_ReleaseModelSource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).ReleaseModelSource(ctx, req.(*ReleaseModelSourceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_RetainDerivedResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DerivedRetentionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).RetainDerivedResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_RetainDerivedResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).RetainDerivedResult(ctx, req.(*DerivedRetentionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_ReleaseDerivedRetention_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DerivedRetentionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).ReleaseDerivedRetention(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_ReleaseDerivedRetention_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).ReleaseDerivedRetention(ctx, req.(*DerivedRetentionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_ReleaseDerivedResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DerivedResultReleaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).ReleaseDerivedResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_ReleaseDerivedResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).ReleaseDerivedResult(ctx, req.(*DerivedResultReleaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_CollectStoreGarbage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CollectStoreGarbageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).CollectStoreGarbage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_CollectStoreGarbage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).CollectStoreGarbage(ctx, req.(*CollectStoreGarbageRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -737,6 +941,10 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RuntimePreparation_ProtocolInfo_Handler,
 		},
 		{
+			MethodName: "NumericalEnvironment",
+			Handler:    _RuntimePreparation_NumericalEnvironment_Handler,
+		},
+		{
 			MethodName: "CheckPackageSetCompatibility",
 			Handler:    _RuntimePreparation_CheckPackageSetCompatibility_Handler,
 		},
@@ -747,6 +955,26 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PrepareModelSource",
 			Handler:    _RuntimePreparation_PrepareModelSource_Handler,
+		},
+		{
+			MethodName: "ReleaseModelSource",
+			Handler:    _RuntimePreparation_ReleaseModelSource_Handler,
+		},
+		{
+			MethodName: "RetainDerivedResult",
+			Handler:    _RuntimePreparation_RetainDerivedResult_Handler,
+		},
+		{
+			MethodName: "ReleaseDerivedRetention",
+			Handler:    _RuntimePreparation_ReleaseDerivedRetention_Handler,
+		},
+		{
+			MethodName: "ReleaseDerivedResult",
+			Handler:    _RuntimePreparation_ReleaseDerivedResult_Handler,
+		},
+		{
+			MethodName: "CollectStoreGarbage",
+			Handler:    _RuntimePreparation_CollectStoreGarbage_Handler,
 		},
 		{
 			MethodName: "ValidateWeightsCheckpoint",
@@ -930,14 +1158,25 @@ var RuntimeWeights_ServiceDesc = grpc.ServiceDesc{
 
 const (
 	PodHost_ProtocolInfo_FullMethodName            = "/cozy.worker.v1.PodHost/ProtocolInfo"
+	PodHost_NumericalEnvironment_FullMethodName    = "/cozy.worker.v1.PodHost/NumericalEnvironment"
 	PodHost_PreparePackageSet_FullMethodName       = "/cozy.worker.v1.PodHost/PreparePackageSet"
 	PodHost_PrepareLocalPackage_FullMethodName     = "/cozy.worker.v1.PodHost/PrepareLocalPackage"
 	PodHost_PreparePrivatePlacement_FullMethodName = "/cozy.worker.v1.PodHost/PreparePrivatePlacement"
 	PodHost_ModelSourceFile_FullMethodName         = "/cozy.worker.v1.PodHost/ModelSourceFile"
 	PodHost_ModelSourcePrepare_FullMethodName      = "/cozy.worker.v1.PodHost/ModelSourcePrepare"
+	PodHost_ModelSourceRelease_FullMethodName      = "/cozy.worker.v1.PodHost/ModelSourceRelease"
+	PodHost_ModelSourceControl_FullMethodName      = "/cozy.worker.v1.PodHost/ModelSourceControl"
+	PodHost_RetainDerivedResult_FullMethodName     = "/cozy.worker.v1.PodHost/RetainDerivedResult"
+	PodHost_ReleaseDerivedRetention_FullMethodName = "/cozy.worker.v1.PodHost/ReleaseDerivedRetention"
+	PodHost_ReleaseDerivedResult_FullMethodName    = "/cozy.worker.v1.PodHost/ReleaseDerivedResult"
+	PodHost_RecordOperationResult_FullMethodName   = "/cozy.worker.v1.PodHost/RecordOperationResult"
+	PodHost_LookupOperation_FullMethodName         = "/cozy.worker.v1.PodHost/LookupOperation"
+	PodHost_PruneOperationCache_FullMethodName     = "/cozy.worker.v1.PodHost/PruneOperationCache"
+	PodHost_ModelSourceAdopt_FullMethodName        = "/cozy.worker.v1.PodHost/ModelSourceAdopt"
 	PodHost_CheckpointPage_FullMethodName          = "/cozy.worker.v1.PodHost/CheckpointPage"
 	PodHost_CheckpointTransfer_FullMethodName      = "/cozy.worker.v1.PodHost/CheckpointTransfer"
 	PodHost_LocalPackageFetch_FullMethodName       = "/cozy.worker.v1.PodHost/LocalPackageFetch"
+	PodHost_LocalPackageUpload_FullMethodName      = "/cozy.worker.v1.PodHost/LocalPackageUpload"
 	PodHost_LocalPackageAbort_FullMethodName       = "/cozy.worker.v1.PodHost/LocalPackageAbort"
 	PodHost_WeightsTransfer_FullMethodName         = "/cozy.worker.v1.PodHost/WeightsTransfer"
 	PodHost_WeightsIntentReady_FullMethodName      = "/cozy.worker.v1.PodHost/WeightsIntentReady"
@@ -976,14 +1215,25 @@ type PodHostClient interface {
 	// Static, read-only compatibility probe over the existing pinned TLS connection.
 	// The Host forwards its actual Runtime's loopback result; it does not guess a version.
 	ProtocolInfo(ctx context.Context, in *ProtocolInfoRequest, opts ...grpc.CallOption) (*ProtocolInfoResult, error)
+	NumericalEnvironment(ctx context.Context, in *NumericalEnvironmentCall, opts ...grpc.CallOption) (*NumericalEnvironmentResult, error)
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
 	PrepareLocalPackage(ctx context.Context, in *PrepareLocalPackageCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
 	PreparePrivatePlacement(ctx context.Context, in *PreparePrivatePlacementCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
 	ModelSourceFile(ctx context.Context, in *ModelSourceFileCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ModelSourceFileStatus], error)
 	ModelSourcePrepare(ctx context.Context, in *ModelSourcePrepareCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error)
+	ModelSourceRelease(ctx context.Context, in *ModelSourceReleaseCall, opts ...grpc.CallOption) (*ReleaseModelSourceResult, error)
+	ModelSourceControl(ctx context.Context, in *ModelSourceControlCall, opts ...grpc.CallOption) (*ModelSourceControlResult, error)
+	RetainDerivedResult(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
+	ReleaseDerivedRetention(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
+	ReleaseDerivedResult(ctx context.Context, in *DerivedResultReleaseCall, opts ...grpc.CallOption) (*DerivedResultReleaseResult, error)
+	RecordOperationResult(ctx context.Context, in *RecordOperationResultCall, opts ...grpc.CallOption) (*RecordOperationResultResult, error)
+	LookupOperation(ctx context.Context, in *LookupOperationCall, opts ...grpc.CallOption) (*LookupOperationResult, error)
+	PruneOperationCache(ctx context.Context, in *PruneOperationCacheCall, opts ...grpc.CallOption) (*PruneOperationCacheResult, error)
+	ModelSourceAdopt(ctx context.Context, in *ModelSourceAdoptCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error)
 	CheckpointPage(ctx context.Context, in *CheckpointPageCall, opts ...grpc.CallOption) (*CheckpointPageResult, error)
 	CheckpointTransfer(ctx context.Context, in *CheckpointTransferCall, opts ...grpc.CallOption) (*CheckpointTransferStatus, error)
 	LocalPackageFetch(ctx context.Context, in *LocalPackageFetchCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LocalPackageFileStatus], error)
+	LocalPackageUpload(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LocalPackageUploadFrame, LocalPackageFileStatus], error)
 	LocalPackageAbort(ctx context.Context, in *LocalPackageAbortCall, opts ...grpc.CallOption) (*LocalPackageAbortStatus, error)
 	WeightsTransfer(ctx context.Context, in *WeightsTransferCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WeightsTransferStatus], error)
 	WeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error)
@@ -1001,6 +1251,16 @@ func (c *podHostClient) ProtocolInfo(ctx context.Context, in *ProtocolInfoReques
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ProtocolInfoResult)
 	err := c.cc.Invoke(ctx, PodHost_ProtocolInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) NumericalEnvironment(ctx context.Context, in *NumericalEnvironmentCall, opts ...grpc.CallOption) (*NumericalEnvironmentResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NumericalEnvironmentResult)
+	err := c.cc.Invoke(ctx, PodHost_NumericalEnvironment_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1093,6 +1353,96 @@ func (c *podHostClient) ModelSourcePrepare(ctx context.Context, in *ModelSourceP
 	return out, nil
 }
 
+func (c *podHostClient) ModelSourceRelease(ctx context.Context, in *ModelSourceReleaseCall, opts ...grpc.CallOption) (*ReleaseModelSourceResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseModelSourceResult)
+	err := c.cc.Invoke(ctx, PodHost_ModelSourceRelease_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) ModelSourceControl(ctx context.Context, in *ModelSourceControlCall, opts ...grpc.CallOption) (*ModelSourceControlResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ModelSourceControlResult)
+	err := c.cc.Invoke(ctx, PodHost_ModelSourceControl_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) RetainDerivedResult(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DerivedRetentionResult)
+	err := c.cc.Invoke(ctx, PodHost_RetainDerivedResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) ReleaseDerivedRetention(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DerivedRetentionResult)
+	err := c.cc.Invoke(ctx, PodHost_ReleaseDerivedRetention_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) ReleaseDerivedResult(ctx context.Context, in *DerivedResultReleaseCall, opts ...grpc.CallOption) (*DerivedResultReleaseResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DerivedResultReleaseResult)
+	err := c.cc.Invoke(ctx, PodHost_ReleaseDerivedResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) RecordOperationResult(ctx context.Context, in *RecordOperationResultCall, opts ...grpc.CallOption) (*RecordOperationResultResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RecordOperationResultResult)
+	err := c.cc.Invoke(ctx, PodHost_RecordOperationResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) LookupOperation(ctx context.Context, in *LookupOperationCall, opts ...grpc.CallOption) (*LookupOperationResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LookupOperationResult)
+	err := c.cc.Invoke(ctx, PodHost_LookupOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) PruneOperationCache(ctx context.Context, in *PruneOperationCacheCall, opts ...grpc.CallOption) (*PruneOperationCacheResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PruneOperationCacheResult)
+	err := c.cc.Invoke(ctx, PodHost_PruneOperationCache_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) ModelSourceAdopt(ctx context.Context, in *ModelSourceAdoptCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ModelSourcePrepared)
+	err := c.cc.Invoke(ctx, PodHost_ModelSourceAdopt_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *podHostClient) CheckpointPage(ctx context.Context, in *CheckpointPageCall, opts ...grpc.CallOption) (*CheckpointPageResult, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckpointPageResult)
@@ -1132,6 +1482,19 @@ func (c *podHostClient) LocalPackageFetch(ctx context.Context, in *LocalPackageF
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PodHost_LocalPackageFetchClient = grpc.ServerStreamingClient[LocalPackageFileStatus]
 
+func (c *podHostClient) LocalPackageUpload(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LocalPackageUploadFrame, LocalPackageFileStatus], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[5], PodHost_LocalPackageUpload_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[LocalPackageUploadFrame, LocalPackageFileStatus]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PodHost_LocalPackageUploadClient = grpc.BidiStreamingClient[LocalPackageUploadFrame, LocalPackageFileStatus]
+
 func (c *podHostClient) LocalPackageAbort(ctx context.Context, in *LocalPackageAbortCall, opts ...grpc.CallOption) (*LocalPackageAbortStatus, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(LocalPackageAbortStatus)
@@ -1144,7 +1507,7 @@ func (c *podHostClient) LocalPackageAbort(ctx context.Context, in *LocalPackageA
 
 func (c *podHostClient) WeightsTransfer(ctx context.Context, in *WeightsTransferCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WeightsTransferStatus], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[5], PodHost_WeightsTransfer_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[6], PodHost_WeightsTransfer_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1204,14 +1567,25 @@ type PodHostServer interface {
 	// Static, read-only compatibility probe over the existing pinned TLS connection.
 	// The Host forwards its actual Runtime's loopback result; it does not guess a version.
 	ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error)
+	NumericalEnvironment(context.Context, *NumericalEnvironmentCall) (*NumericalEnvironmentResult, error)
 	PreparePackageSet(*PreparePackageSetCall, grpc.ServerStreamingServer[PrepareEvent]) error
 	PrepareLocalPackage(*PrepareLocalPackageCall, grpc.ServerStreamingServer[PrepareEvent]) error
 	PreparePrivatePlacement(*PreparePrivatePlacementCall, grpc.ServerStreamingServer[PrepareEvent]) error
 	ModelSourceFile(*ModelSourceFileCall, grpc.ServerStreamingServer[ModelSourceFileStatus]) error
 	ModelSourcePrepare(context.Context, *ModelSourcePrepareCall) (*ModelSourcePrepared, error)
+	ModelSourceRelease(context.Context, *ModelSourceReleaseCall) (*ReleaseModelSourceResult, error)
+	ModelSourceControl(context.Context, *ModelSourceControlCall) (*ModelSourceControlResult, error)
+	RetainDerivedResult(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
+	ReleaseDerivedRetention(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
+	ReleaseDerivedResult(context.Context, *DerivedResultReleaseCall) (*DerivedResultReleaseResult, error)
+	RecordOperationResult(context.Context, *RecordOperationResultCall) (*RecordOperationResultResult, error)
+	LookupOperation(context.Context, *LookupOperationCall) (*LookupOperationResult, error)
+	PruneOperationCache(context.Context, *PruneOperationCacheCall) (*PruneOperationCacheResult, error)
+	ModelSourceAdopt(context.Context, *ModelSourceAdoptCall) (*ModelSourcePrepared, error)
 	CheckpointPage(context.Context, *CheckpointPageCall) (*CheckpointPageResult, error)
 	CheckpointTransfer(context.Context, *CheckpointTransferCall) (*CheckpointTransferStatus, error)
 	LocalPackageFetch(*LocalPackageFetchCall, grpc.ServerStreamingServer[LocalPackageFileStatus]) error
+	LocalPackageUpload(grpc.BidiStreamingServer[LocalPackageUploadFrame, LocalPackageFileStatus]) error
 	LocalPackageAbort(context.Context, *LocalPackageAbortCall) (*LocalPackageAbortStatus, error)
 	WeightsTransfer(*WeightsTransferCall, grpc.ServerStreamingServer[WeightsTransferStatus]) error
 	WeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error)
@@ -1228,6 +1602,9 @@ type UnimplementedPodHostServer struct{}
 func (UnimplementedPodHostServer) ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ProtocolInfo not implemented")
 }
+func (UnimplementedPodHostServer) NumericalEnvironment(context.Context, *NumericalEnvironmentCall) (*NumericalEnvironmentResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method NumericalEnvironment not implemented")
+}
 func (UnimplementedPodHostServer) PreparePackageSet(*PreparePackageSetCall, grpc.ServerStreamingServer[PrepareEvent]) error {
 	return status.Error(codes.Unimplemented, "method PreparePackageSet not implemented")
 }
@@ -1243,6 +1620,33 @@ func (UnimplementedPodHostServer) ModelSourceFile(*ModelSourceFileCall, grpc.Ser
 func (UnimplementedPodHostServer) ModelSourcePrepare(context.Context, *ModelSourcePrepareCall) (*ModelSourcePrepared, error) {
 	return nil, status.Error(codes.Unimplemented, "method ModelSourcePrepare not implemented")
 }
+func (UnimplementedPodHostServer) ModelSourceRelease(context.Context, *ModelSourceReleaseCall) (*ReleaseModelSourceResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method ModelSourceRelease not implemented")
+}
+func (UnimplementedPodHostServer) ModelSourceControl(context.Context, *ModelSourceControlCall) (*ModelSourceControlResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method ModelSourceControl not implemented")
+}
+func (UnimplementedPodHostServer) RetainDerivedResult(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method RetainDerivedResult not implemented")
+}
+func (UnimplementedPodHostServer) ReleaseDerivedRetention(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseDerivedRetention not implemented")
+}
+func (UnimplementedPodHostServer) ReleaseDerivedResult(context.Context, *DerivedResultReleaseCall) (*DerivedResultReleaseResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseDerivedResult not implemented")
+}
+func (UnimplementedPodHostServer) RecordOperationResult(context.Context, *RecordOperationResultCall) (*RecordOperationResultResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method RecordOperationResult not implemented")
+}
+func (UnimplementedPodHostServer) LookupOperation(context.Context, *LookupOperationCall) (*LookupOperationResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method LookupOperation not implemented")
+}
+func (UnimplementedPodHostServer) PruneOperationCache(context.Context, *PruneOperationCacheCall) (*PruneOperationCacheResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method PruneOperationCache not implemented")
+}
+func (UnimplementedPodHostServer) ModelSourceAdopt(context.Context, *ModelSourceAdoptCall) (*ModelSourcePrepared, error) {
+	return nil, status.Error(codes.Unimplemented, "method ModelSourceAdopt not implemented")
+}
 func (UnimplementedPodHostServer) CheckpointPage(context.Context, *CheckpointPageCall) (*CheckpointPageResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckpointPage not implemented")
 }
@@ -1251,6 +1655,9 @@ func (UnimplementedPodHostServer) CheckpointTransfer(context.Context, *Checkpoin
 }
 func (UnimplementedPodHostServer) LocalPackageFetch(*LocalPackageFetchCall, grpc.ServerStreamingServer[LocalPackageFileStatus]) error {
 	return status.Error(codes.Unimplemented, "method LocalPackageFetch not implemented")
+}
+func (UnimplementedPodHostServer) LocalPackageUpload(grpc.BidiStreamingServer[LocalPackageUploadFrame, LocalPackageFileStatus]) error {
+	return status.Error(codes.Unimplemented, "method LocalPackageUpload not implemented")
 }
 func (UnimplementedPodHostServer) LocalPackageAbort(context.Context, *LocalPackageAbortCall) (*LocalPackageAbortStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method LocalPackageAbort not implemented")
@@ -1296,6 +1703,24 @@ func _PodHost_ProtocolInfo_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(PodHostServer).ProtocolInfo(ctx, req.(*ProtocolInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_NumericalEnvironment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NumericalEnvironmentCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).NumericalEnvironment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_NumericalEnvironment_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).NumericalEnvironment(ctx, req.(*NumericalEnvironmentCall))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1362,6 +1787,168 @@ func _PodHost_ModelSourcePrepare_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PodHost_ModelSourceRelease_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ModelSourceReleaseCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).ModelSourceRelease(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_ModelSourceRelease_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).ModelSourceRelease(ctx, req.(*ModelSourceReleaseCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_ModelSourceControl_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ModelSourceControlCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).ModelSourceControl(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_ModelSourceControl_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).ModelSourceControl(ctx, req.(*ModelSourceControlCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_RetainDerivedResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DerivedRetentionCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).RetainDerivedResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_RetainDerivedResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).RetainDerivedResult(ctx, req.(*DerivedRetentionCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_ReleaseDerivedRetention_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DerivedRetentionCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).ReleaseDerivedRetention(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_ReleaseDerivedRetention_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).ReleaseDerivedRetention(ctx, req.(*DerivedRetentionCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_ReleaseDerivedResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DerivedResultReleaseCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).ReleaseDerivedResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_ReleaseDerivedResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).ReleaseDerivedResult(ctx, req.(*DerivedResultReleaseCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_RecordOperationResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RecordOperationResultCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).RecordOperationResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_RecordOperationResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).RecordOperationResult(ctx, req.(*RecordOperationResultCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_LookupOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LookupOperationCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).LookupOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_LookupOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).LookupOperation(ctx, req.(*LookupOperationCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_PruneOperationCache_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PruneOperationCacheCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).PruneOperationCache(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_PruneOperationCache_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).PruneOperationCache(ctx, req.(*PruneOperationCacheCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_ModelSourceAdopt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ModelSourceAdoptCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).ModelSourceAdopt(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_ModelSourceAdopt_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).ModelSourceAdopt(ctx, req.(*ModelSourceAdoptCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _PodHost_CheckpointPage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CheckpointPageCall)
 	if err := dec(in); err != nil {
@@ -1408,6 +1995,13 @@ func _PodHost_LocalPackageFetch_Handler(srv interface{}, stream grpc.ServerStrea
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PodHost_LocalPackageFetchServer = grpc.ServerStreamingServer[LocalPackageFileStatus]
+
+func _PodHost_LocalPackageUpload_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(PodHostServer).LocalPackageUpload(&grpc.GenericServerStream[LocalPackageUploadFrame, LocalPackageFileStatus]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PodHost_LocalPackageUploadServer = grpc.BidiStreamingServer[LocalPackageUploadFrame, LocalPackageFileStatus]
 
 func _PodHost_LocalPackageAbort_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(LocalPackageAbortCall)
@@ -1468,8 +2062,48 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _PodHost_ProtocolInfo_Handler,
 		},
 		{
+			MethodName: "NumericalEnvironment",
+			Handler:    _PodHost_NumericalEnvironment_Handler,
+		},
+		{
 			MethodName: "ModelSourcePrepare",
 			Handler:    _PodHost_ModelSourcePrepare_Handler,
+		},
+		{
+			MethodName: "ModelSourceRelease",
+			Handler:    _PodHost_ModelSourceRelease_Handler,
+		},
+		{
+			MethodName: "ModelSourceControl",
+			Handler:    _PodHost_ModelSourceControl_Handler,
+		},
+		{
+			MethodName: "RetainDerivedResult",
+			Handler:    _PodHost_RetainDerivedResult_Handler,
+		},
+		{
+			MethodName: "ReleaseDerivedRetention",
+			Handler:    _PodHost_ReleaseDerivedRetention_Handler,
+		},
+		{
+			MethodName: "ReleaseDerivedResult",
+			Handler:    _PodHost_ReleaseDerivedResult_Handler,
+		},
+		{
+			MethodName: "RecordOperationResult",
+			Handler:    _PodHost_RecordOperationResult_Handler,
+		},
+		{
+			MethodName: "LookupOperation",
+			Handler:    _PodHost_LookupOperation_Handler,
+		},
+		{
+			MethodName: "PruneOperationCache",
+			Handler:    _PodHost_PruneOperationCache_Handler,
+		},
+		{
+			MethodName: "ModelSourceAdopt",
+			Handler:    _PodHost_ModelSourceAdopt_Handler,
 		},
 		{
 			MethodName: "CheckpointPage",
@@ -1513,6 +2147,12 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "LocalPackageFetch",
 			Handler:       _PodHost_LocalPackageFetch_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "LocalPackageUpload",
+			Handler:       _PodHost_LocalPackageUpload_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
 		},
 		{
 			StreamName:    "WeightsTransfer",

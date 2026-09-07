@@ -333,7 +333,7 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 	c.mu.Lock()
 	holder := c.workers[s.instanceID]
 	c.mu.Unlock()
-	if req.ModelTransfer != nil && attempt.TerminalStatus == "SUCCEEDED" {
+	if req.ModelTransfer != nil && attempt.TerminalStatus == "SUCCEEDED" && req.State != "canceling" {
 		transfer, problem := c.opt.Store.ModelTransferOf(requestID)
 		if problem != nil {
 			c.logf("OutcomeAck %s#%d not sent: model transfer cannot be read", requestID, ordinal)
@@ -358,11 +358,18 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 		c.logf("OutcomeAck %s#%d not sent: malformed persisted outcome digest", requestID, ordinal)
 		return
 	}
+	if problem := c.recordOperationResult(s, *req, *attempt); problem != nil {
+		c.logf("OutcomeAck %s#%d awaits operation cache: %s", requestID, ordinal, problem.Message)
+		c.retryOperationAck(s, requestID, ordinal)
+		return
+	}
 	ack := &pb.AttemptOutcomeAck{
 		RequestId: requestID, AttemptOrdinal: ordinal, InvocationSpecDigest: specDigest,
 		OutcomeId: attempt.TerminalID, OutcomeDigest: outcomeDigest,
 		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch,
 		WorkerBootId: s.bootID,
+		RetainWork: req.RetainWork && (records.RetainedState(req.State) || req.State == "requeue_pending" ||
+			(req.RetainsLocalOutputs() && req.State != "canceling" && req.State != "releasing" && req.State != "canceled")),
 	}
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_OutcomeAck{OutcomeAck: ack}}) {
 		c.logf("OutcomeAck %s#%d was not queued: the closed stream owes a replay", requestID, ordinal)
@@ -372,7 +379,7 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 		c.logf("OutcomeAck %s#%d was queued but closure is still owed: %s", requestID, ordinal, e.Message)
 		return
 	}
-	if req.ModelTransfer != nil && req.State != "requeue_pending" {
+	if req.ModelTransfer != nil && !records.RetainedState(req.State) && req.State != "canceling" && req.State != "requeue_pending" {
 		go c.finishModelTransferRequest(requestID, int64(ordinal))
 		return
 	}

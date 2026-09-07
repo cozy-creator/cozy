@@ -64,7 +64,9 @@ func (c *Orchestrator) awaitSourceInputCustody(req records.Request, bootID strin
 			if slot.Acknowledged != nil {
 				held += uint64(slot.Acknowledged.Bytes)
 			}
-			ready = ready && slot.Acknowledged != nil && *slot.Acknowledged == slot.Observed
+			if !current.RetainWork {
+				ready = ready && slot.Acknowledged != nil && *slot.Acknowledged == slot.Observed
+			}
 		}
 		if ready {
 			return nil
@@ -173,6 +175,16 @@ func (c *Orchestrator) kickCheckpointUpload(requestID string, statuses ...*pb.We
 }
 
 func (c *Orchestrator) syncCheckpointUploads(ctx context.Context, requestID string) *exit.Error {
+	request, problem := c.opt.Store.RequestRow(requestID)
+	if problem != nil || request == nil {
+		return problem
+	}
+	// Private retained work owns bytes on its selected machine. Publication of
+	// final outputs is a separate explicit operation; progress never implies an
+	// upload to Tensorhub, including source and weights checkpoints.
+	if request.RetainWork {
+		return nil
+	}
 	transfer, problem := c.opt.Store.ModelTransferOf(requestID)
 	if problem != nil || transfer == nil {
 		return problem
@@ -185,10 +197,6 @@ func (c *Orchestrator) syncCheckpointUploads(ctx context.Context, requestID stri
 	}
 	if transfer.State == "failed" {
 		return nil // failed work retains its recovery holds until explicit cancellation
-	}
-	request, problem := c.opt.Store.RequestRow(requestID)
-	if problem != nil || request == nil {
-		return problem
 	}
 	host, problem := c.checkpointHost(*request)
 	if problem != nil {

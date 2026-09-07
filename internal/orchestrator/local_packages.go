@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"time"
 
@@ -40,22 +41,7 @@ type localTransferFile struct {
 	length  uint64
 }
 
-// LocalWheel is one wheel of an unpublished revision as this daemon holds it on disk.
-type LocalWheel struct {
-	Digest, Filename, Kind, Path string
-	Length                       int64
-}
-
-// LocalWheelGrantSource is th-094's replacement for the byte relay. It PUTs every wheel the
-// store does not already hold and answers with one short-lived read capability per wheel, in
-// the order asked. It is a callback for the same reason RentalPackageSet is: the orchestrator
-// holds no Tensorhub client, and the account, the token, and the byte plane belong to the
-// entrypoint. Calling it again after a stall re-mints the capabilities without re-uploading.
-type LocalWheelGrantSource func(context.Context, []LocalWheel) ([]string, *exit.Error)
-
-// Object bounds, not control-stream bounds. They are what one revision may cost the store and
-// the pod's disk, and they match the pod ledger's own quota. Nothing on the wire carries them:
-// the frame that names these wheels carries 33 URLs at most.
+// Bounds match the host ledger. Private wheel bytes travel only over PodHost.
 const (
 	maxLocalWheelBytes    = int64(512 << 20)
 	maxLocalWheelSetBytes = int64(1 << 30)
@@ -275,109 +261,116 @@ func localSelection(operationID string, revision localpackage.Revision) (
 	return selected, transfer, nil
 }
 
-// transferLocalPackage is th-094's whole owner half. It no longer sends a byte: the wheels go
-// to the store under capabilities scoped to their own digests, and the pod is handed one read
-// capability per wheel to spend against its own download edge.
-//
-// The loop exists because a capability is short-lived by design. A stall -- the pod saying it
-// has a partial prefix and needs a fresh URL -- is answered by minting new grants over the same
-// objects, which costs one HTTP round and re-uploads nothing, and the pod resumes from the
-// prefix it already holds.
+// transferLocalPackage sends private source wheels directly to the claimed host.
+// The host owns durable offsets; reconnect resumes verified prefixes without a
+// package repository, publication or intermediate object-storage grant.
 func (c *Orchestrator) transferLocalPackage(instanceID, operationID string,
 	transfer *localTransfer,
 ) *exit.Error {
-	if c.opt.LocalWheels == nil {
-		return exit.Named(exit.Structural, "local_package_grants_unwired",
-			"this daemon cannot upload a local package revision")
+	_, current, problem := c.localControl(instanceID)
+	if problem != nil {
+		return problem
 	}
-	stale := 0
+	held, problem := c.bindLocalTransfer(instanceID, operationID, transfer, current)
+	if problem != nil {
+		return problem
+	}
+	ordered := transferFilesInOrder(held)
+	if problem := c.proveLocalWheelsUnchanged(ordered); problem != nil {
+		return problem
+	}
+	for _, selected := range ordered {
+		if problem := c.uploadLocalWheel(current, operationID, held, selected); problem != nil {
+			return problem
+		}
+	}
+	return nil
+}
+
+func (c *Orchestrator) uploadLocalWheel(current *session, operationID string,
+	transfer *localTransfer, selected localTransferFile,
+) *exit.Error {
+	if current.host == nil {
+		return exit.Named(exit.Unavailable, "local_package_direct_transfer_unavailable",
+			"worker has no authenticated private package upload service")
+	}
+	ctx, cancel := context.WithCancel(current.ctx)
+	defer cancel()
+	stream, err := current.host.LocalPackageUpload(ctx)
+	if err != nil {
+		return exit.Named(exit.Unavailable, "local_package_upload_unavailable", "private package upload could not connect: %s", err)
+	}
+	defer stream.CloseSend()
+	if err := stream.Send(&pb.LocalPackageUploadFrame{Body: &pb.LocalPackageUploadFrame_Header{
+		Header: &pb.LocalPackageUploadHeader{Claim: current.claim, OperationId: operationID,
+			SourceDigest: transfer.source, File: &pb.LocalPackageFileRef{Digest: selected.digest,
+				Filename: selected.filename, Length: selected.length}},
+	}}); err != nil {
+		return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "private upload header was not accepted: %s", err)
+	}
+	file, err := os.Open(selected.path)
+	if err != nil {
+		return exit.Named(exit.Structural, "local_package_wheel_unreadable", "cannot read private wheel: %s", err)
+	}
+	defer file.Close()
+	buffer := make([]byte, 1<<20)
+	sent := uint64(0)
+	first := true
 	for {
-		_, selectedSession, problem := c.localControl(instanceID)
-		if problem != nil {
-			return problem
+		status, err := stream.Recv()
+		if err != nil {
+			return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "private upload interrupted; the worker retains its verified prefix: %s", err)
 		}
-		held, problem := c.bindLocalTransfer(instanceID, operationID, transfer, selectedSession)
-		if problem != nil {
-			return problem
+		if status.OperationId != operationID || !bytes.Equal(status.SourceDigest, transfer.source) ||
+			!bytes.Equal(status.Digest, selected.digest) || status.Filename != selected.filename ||
+			status.Length != selected.length || status.ReceivedBytes > selected.length ||
+			(!first && status.ReceivedBytes != sent) {
+			return exit.Named(exit.Conflict, "local_package_upload_identity_changed", "worker returned another private file or unexpected upload offset")
 		}
-		ordered := transferFilesInOrder(held)
-		if problem := c.proveLocalWheelsUnchanged(ordered); problem != nil {
-			return problem
+		c.onLocalPackageFileStatus(current, status)
+		if status.State == pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_REFUSED {
+			return exit.Named(exit.Failed, status.SafeCode, "worker refused private wheel %s: %s", selected.filename, status.SafeDetail)
 		}
-		granted, problem := c.grantLocalWheels(selectedSession, ordered)
-		if problem != nil {
-			return problem
-		}
-		// Clear the previous attempt's unverified statuses. A stall left behind by the round
-		// these grants were minted to answer would be read as this round's stall, and the loop
-		// would re-grant forever without ever waiting for an answer.
-		before := c.clearLocalStalls(operationID)
-		frame := &pb.LocalPackageFetchRequest{RecordOwnerEpoch: recordOwnerEpoch,
-			ControlStreamEpoch: selectedSession.epoch,
-			WorkerBootId:       selectedSession.bootID, OperationId: operationID,
-			SourceDigest: held.source, Files: granted}
-		if !selectedSession.send(&pb.RecordOwnerFrame{
-			Msg: &pb.RecordOwnerFrame_LocalPackageFetchRequest{
-				LocalPackageFetchRequest: frame}}) {
-			continue
-		}
-		done, problem := c.awaitLocalTransfer(instanceID, operationID, ordered, selectedSession)
-		if problem != nil {
-			return problem
-		}
-		if done {
+		if status.State == pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED {
+			if status.ReceivedBytes != selected.length {
+				return exit.Named(exit.Conflict, "local_package_upload_incomplete", "worker verified an incomplete private wheel")
+			}
 			return nil
 		}
-		// A stall is only worth answering while it is buying ground. A pod that keeps landing
-		// bytes gets as many capabilities as it needs; one that lands none twice running is not
-		// stalling, it is failing, and saying so beats an unbounded loop.
-		if after := c.localProgress(operationID); after > before {
-			stale = 0
-		} else if stale++; stale > maxLocalStalls {
-			return exit.Named(exit.Failed, "local_package_transfer_stuck",
-				"the worker landed no local package bytes across %d re-granted attempts",
-				stale)
+		if status.State != pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_RECEIVING || status.SafeCode != "" {
+			return exit.Named(exit.Unavailable, "local_package_upload_stopped", "worker stopped private wheel upload: %s", status.SafeDetail)
 		}
-	}
-}
-
-// maxLocalStalls is how many consecutive no-progress rounds a transfer may spend. Each one
-// costs a grant round trip and nothing else, so the bound is about ending, not about cost.
-const maxLocalStalls = 3
-
-// clearLocalStalls drops every unverified status and reports the durable byte total the pod
-// has acknowledged. A verified file is never cleared: it is settled.
-func (c *Orchestrator) clearLocalStalls(operationID string) uint64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	transfer := c.localTransfers[operationID]
-	if transfer == nil {
-		return 0
-	}
-	var total uint64
-	for digest, status := range transfer.status {
-		if status.state == pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED {
-			total += status.received
-			continue
+		if first {
+			if _, err := file.Seek(int64(status.ReceivedBytes), io.SeekStart); err != nil {
+				return exit.Internalf("cannot resume private wheel: %s", err)
+			}
+			sent, first = status.ReceivedBytes, false
 		}
-		total += status.received
-		delete(transfer.status, digest)
+		c.mu.Lock()
+		canceled := transfer.canceled
+		c.mu.Unlock()
+		if canceled {
+			return exit.New(exit.Canceled, "private package upload was canceled")
+		}
+		remaining := selected.length - sent
+		if remaining == 0 {
+			return exit.Named(exit.Conflict, "local_package_upload_unverified", "worker has all bytes but did not verify the private wheel")
+		}
+		chunk := buffer
+		if remaining < uint64(len(chunk)) {
+			chunk = chunk[:int(remaining)]
+		}
+		n, err := io.ReadFull(file, chunk)
+		if err != nil {
+			return exit.Named(exit.Conflict, "local_package_wheel_changed", "private wheel changed during upload: %s", err)
+		}
+		if err := stream.Send(&pb.LocalPackageUploadFrame{Body: &pb.LocalPackageUploadFrame_Chunk{
+			Chunk: &pb.LocalPackageUploadChunk{Offset: sent, Data: chunk[:n]},
+		}}); err != nil {
+			return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "private upload interrupted; retained bytes can be resumed: %s", err)
+		}
+		sent += uint64(n)
 	}
-	return total
-}
-
-func (c *Orchestrator) localProgress(operationID string) uint64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	transfer := c.localTransfers[operationID]
-	if transfer == nil {
-		return 0
-	}
-	var total uint64
-	for _, status := range transfer.status {
-		total += status.received
-	}
-	return total
 }
 
 // proveLocalWheelsUnchanged reads the local files the revision named. The digest is the
@@ -395,45 +388,6 @@ func (c *Orchestrator) proveLocalWheelsUnchanged(ordered []localTransferFile) *e
 		}
 	}
 	return nil
-}
-
-// grantLocalWheels turns one ordered wheel set into the frame's grants. The URLs are
-// memory-only: they are never journaled, never logged, and never survive this frame.
-func (c *Orchestrator) grantLocalWheels(current *session, ordered []localTransferFile) (
-	[]*pb.LocalPackageFileGrant, *exit.Error,
-) {
-	wheels := make([]LocalWheel, 0, len(ordered))
-	for _, selected := range ordered {
-		spelled, err := canonical.Spell(selected.digest)
-		if err != nil {
-			return nil, exit.Internalf("cannot spell a local package wheel digest: %s", err)
-		}
-		kind := "dependency_wheel"
-		if selected.project {
-			kind = "project_wheel"
-		}
-		wheels = append(wheels, LocalWheel{Digest: spelled, Filename: selected.filename,
-			Kind: kind, Path: selected.path, Length: int64(selected.length)})
-	}
-	urls, problem := c.opt.LocalWheels(current.ctx, wheels)
-	if problem != nil {
-		return nil, problem
-	}
-	if len(urls) != len(ordered) {
-		return nil, exit.Internalf("local package grants answered for %d of %d wheels",
-			len(urls), len(ordered))
-	}
-	grants := make([]*pb.LocalPackageFileGrant, 0, len(ordered))
-	for i, selected := range ordered {
-		if urls[i] == "" || len(urls[i]) > pb.MaxLocalPackageGrantURLBytes {
-			return nil, exit.Named(exit.Internal, "local_package_grant_url_invalid",
-				"the read capability for %s is empty or over its bound", selected.filename)
-		}
-		grants = append(grants, &pb.LocalPackageFileGrant{Digest: selected.digest,
-			Filename: selected.filename, Length: selected.length,
-			Url: urls[i]})
-	}
-	return grants, nil
 }
 
 func (c *Orchestrator) bindLocalTransfer(instanceID, operationID string,
@@ -568,72 +522,6 @@ func (c *Orchestrator) localControl(instanceID string) (*worker, *session, *exit
 		select {
 		case <-c.done:
 			return nil, nil, exit.Unavailablef("the daemon stopped during local package transfer")
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
-}
-
-// awaitLocalTransfer resolves ONE fetch request. It answers true when every wheel the pod
-// reported is verified, false when the set stalled and the caller should re-grant, and a
-// problem when the pod refused a wheel outright -- which the schema reserves for bytes that are
-// not the named object, and which a fresh URL would never fix.
-func (c *Orchestrator) awaitLocalTransfer(instanceID, operationID string,
-	ordered []localTransferFile, sent *session,
-) (bool, *exit.Error) {
-	for {
-		verified, stalled := 0, false
-		for _, selected := range ordered {
-			spelled, err := canonical.Spell(selected.digest)
-			if err != nil {
-				return false, exit.Internalf("cannot spell a local package wheel digest: %s", err)
-			}
-			status := c.localStatus(operationID, spelled)
-			switch status.state {
-			case pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED:
-				if status.received != selected.length {
-					return false, exit.Named(exit.Structural, "local_package_status_invalid",
-						"worker verified %s at %d of %d bytes", selected.filename,
-						status.received, selected.length)
-				}
-				verified++
-			case pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_REFUSED:
-				return false, exit.Named(exit.Failed, status.safeCode,
-					"worker refused local package file %s: %s",
-					selected.filename, status.safeDetail)
-			case pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_RECEIVING:
-				// A RECEIVING status carrying a safe code is the schema's resumable stall.
-				if status.safeCode != "" {
-					stalled = true
-				}
-			}
-		}
-		if verified == len(ordered) {
-			return true, nil
-		}
-		if stalled {
-			return false, nil
-		}
-		c.mu.Lock()
-		w := c.workers[instanceID]
-		current := w != nil && c.sessions[w.bootID] == sent
-		gone := w == nil || w.exited
-		var refused *exit.Error
-		if w != nil {
-			refused = w.refusal
-		}
-		c.mu.Unlock()
-		switch {
-		case !current:
-			return false, nil // the caller re-grants against the replacement session
-		case refused != nil:
-			return false, refused
-		case gone:
-			return false, exit.New(exit.Failed,
-				"the rented worker exited during local package transfer")
-		}
-		select {
-		case <-c.done:
-			return false, exit.Unavailablef("the daemon stopped during local package transfer")
 		case <-time.After(20 * time.Millisecond):
 		}
 	}

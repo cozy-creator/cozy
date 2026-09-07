@@ -49,8 +49,9 @@ type session struct {
 	// host is the pod's PodHost lane (proto-025), on the same pinned connection as the
 	// control stream; nil for a local worker, whose host is this daemon in-process. claim is
 	// the exact Claim this session presented, re-presented on every host call.
-	host  pb.PodHostClient
-	claim *pb.Claim
+	host        pb.PodHostClient
+	preparation pb.RuntimePreparationClient
+	claim       *pb.Claim
 }
 
 func (s *session) send(m *pb.RecordOwnerFrame) (sent bool) {
@@ -285,6 +286,7 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		return err
 	}
 	s := &session{ctx: ctx, instanceID: w.instanceID, out: make(chan *pb.RecordOwnerFrame, 32)}
+	s.preparation = pb.NewRuntimePreparationClient(conn)
 	go func() {
 		for m := range s.out {
 			if err := stream.Send(m); err != nil {
@@ -355,6 +357,10 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			if e := c.onClaimAck(w, s, ack); e != nil {
 				return fmt.Errorf("%s", e.Message)
 			}
+		case *pb.WorkerFrame_ChildCallRequest:
+			c.onChildCall(s, m.ChildCallRequest)
+		case *pb.WorkerFrame_ChildCallCancel:
+			c.onChildCancel(s, m.ChildCallCancel)
 		case *pb.WorkerFrame_BootFailure:
 			c.logf("BOOT FAILURE from %s: %s (%s)", m.BootFailure.WorkerInstanceId,
 				pb.BootFailureReason_name[int32(m.BootFailure.Reason)], m.BootFailure.Detail)
@@ -746,6 +752,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	for _, row := range hostWeights {
 		c.onWeightsTransaction(s, row)
 	}
+	_ = c.restoreRetainedWork()
 	c.logf("snapshot %s (%s, %d B) acknowledged: %d held attempt(s), %d host-held outcome(s), "+
 		"accepted revision %d, converged %d; dispatch is open", snap.SnapshotId,
 		shortDigest(shortNone(snap.SnapshotDigest)), len(snap.SnapshotCanonicalBytes),

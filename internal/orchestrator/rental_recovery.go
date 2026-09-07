@@ -56,8 +56,40 @@ func (c *Orchestrator) RecoverLostWork() {
 		return
 	}
 	for _, req := range orphaned {
+		if req.RetainWork {
+			c.retainLostWork(req)
+			continue
+		}
 		c.recoverPinned(req, req.Worker, c.lostRentalCause(req.Worker))
 	}
+}
+
+// A private transaction's rental owns its local-only intermediate bytes. A new
+// machine cannot honestly resume those bytes, so loss blocks the retained
+// transaction rather than silently purchasing a replacement and recomputing it.
+func (c *Orchestrator) retainLostWork(req records.Request) {
+	attempts, problem := c.opt.Store.Attempts(req.ID)
+	if problem != nil {
+		return
+	}
+	for _, attempt := range attempts {
+		switch attempt.State {
+		case "terminal":
+			return // preserve a real recorded outcome for explicit reconciliation
+		case "preparing", "offered":
+			if problem := c.opt.Store.AbortDispatch(req.ID, attempt.Attempt, attempt.SessionID, "the retained rental was lost"); problem != nil {
+				return
+			}
+			c.settleDispatch(req.ID, uint64(attempt.Attempt), false)
+		case "accepted", "recovered_open":
+			if _, problem := c.opt.Store.AbandonLostAttempt(req.ID, attempt.Attempt, "the retained rental was lost", records.RequeueAfterLoss); problem != nil {
+				return
+			}
+			c.settleDispatch(req.ID, uint64(attempt.Attempt), false)
+		}
+	}
+	_, _ = c.opt.Store.BlockLostRetainedWork(req.ID, "the retained rental and its local intermediate bytes are no longer available")
+	c.forget(req.ID)
 }
 
 // lostRentalCause says WHY the rental cannot serve, in the words the operator will see.
@@ -188,7 +220,7 @@ func (c *Orchestrator) rentalCanServe(rentalID string) bool {
 		// An unreadable store is not an observation about the pod. Leave the attempt alone.
 		return true
 	}
-	return row != nil && row.State != "failed" && row.State != "released"
+	return row != nil && row.State != "failed" && row.State != "released" && row.State != "release_requested"
 }
 
 // CancelLostAttempt settles a request whose attempt can no longer be reached, as CANCELED,
@@ -237,7 +269,11 @@ func (c *Orchestrator) resumeManualRentals() *exit.Error {
 		return problem
 	}
 	for _, row := range rows {
-		if row.ManagedRequestID != "" || !records.RentalReadyState(row.State) {
+		retained, problem := c.opt.Store.RentalRetainsWork(row.ID)
+		if problem != nil {
+			return problem
+		}
+		if (row.ManagedRequestID != "" && !retained) || !records.RentalReadyState(row.State) {
 			continue
 		}
 		go c.resumeManualRental(row.ID)
@@ -258,7 +294,11 @@ func (c *Orchestrator) resumeManualRental(id string) {
 			c.logf("rental %s control reattachment cannot read ownership: %s", id, problem.Message)
 			return
 		}
-		if row == nil || row.ManagedRequestID != "" || !records.RentalReadyState(row.State) {
+		retained, retainedProblem := c.opt.Store.RentalRetainsWork(id)
+		if retainedProblem != nil {
+			return
+		}
+		if row == nil || (row.ManagedRequestID != "" && !retained) || !records.RentalReadyState(row.State) {
 			return
 		}
 		if _, _, _, problem = c.EnsureRental(id); problem == nil {

@@ -132,6 +132,11 @@ func TestRemoteJobRefreshesCheckpointBeforeUsingNewCredit(t *testing.T) {
 		return len(attempts) == 1 && attempts[0].State == "closed"
 	})
 	firstAttempt := attemptRow(t, o.store, first, 1)
+	// Initial snapshot reconciliation can restate A's preparation. The input
+	// cutover must add exactly one preparation after that completed startup.
+	pod.mu.Lock()
+	preparesAfterA := len(pod.prepares)
+	pod.mu.Unlock()
 	second := submit("checkpoint-b", b, "")
 	waitUntil(t, "B starts preparing instead of borrowing A", func() bool {
 		mu.Lock()
@@ -187,8 +192,8 @@ func TestRemoteJobRefreshesCheckpointBeforeUsingNewCredit(t *testing.T) {
 	pod.mu.Lock()
 	prepares, offers := len(pod.prepares), append([]*pb.AttemptOffer(nil), pod.offers...)
 	pod.mu.Unlock()
-	if prepares != 2 || acquisitions.Load() != 1 {
-		t.Fatalf("prepares=%d fleet selections=%d", prepares, acquisitions.Load())
+	if prepares != preparesAfterA+1 || acquisitions.Load() != 1 {
+		t.Fatalf("prepares=%d after startup=%d fleet selections=%d", prepares, preparesAfterA, acquisitions.Load())
 	}
 	if len(offers) != 3 {
 		t.Fatalf("offers=%d", len(offers))

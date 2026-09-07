@@ -104,7 +104,7 @@ func (c *Orchestrator) readyWeightsCheckpoint(ctx context.Context, requestID str
 		return problem
 	}
 	var checkpoint *pb.CheckpointRef
-	if transfer != nil {
+	if transfer != nil && !req.RetainWork {
 		if transfer.State == "failed" || transfer.State == "canceling" || transfer.State == "canceled" || transfer.State == "completed" {
 			return nil
 		}

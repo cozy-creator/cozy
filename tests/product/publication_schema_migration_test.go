@@ -32,6 +32,14 @@ func databaseRows(t *testing.T, path string) map[string]string {
 	must(t, names.Close())
 	out := map[string]string{}
 	for _, name := range tables {
+		if name == "private_child_bindings" || name == "request_weights_retentions" {
+			var rows int
+			must(t, db.QueryRow(`SELECT count(*) FROM "`+name+`"`).Scan(&rows))
+			if rows != 0 {
+				t.Fatal("migration invented child bindings")
+			}
+			continue
+		}
 		query := `SELECT * FROM "` + name + `"`
 		identity := name
 		if name == "request_model_checkpoints" {
@@ -58,7 +66,43 @@ func databaseRows(t *testing.T, path string) map[string]string {
 				ptrs[i] = &values[i]
 			}
 			must(t, rows.Scan(ptrs...))
-			raw, err := json.Marshal(values)
+			// Schema 25 appends opt-in retention and retry lineage. Compare every
+			// pre-existing cell and require safe defaults for ordinary requests.
+			preserved := make([]any, 0, len(values))
+			for i, column := range columns {
+				if name == "requests" && (column == "retain_work" || column == "child_reusable" || column == "child_artifacts") {
+					if values[i] != int64(0) {
+						t.Fatal("migration changed a legacy request's retention policy")
+					}
+					continue
+				}
+				if name == "requests" && (column == "retry_of" || column == "reuse_scope" || column == "parent_request_id" || column == "child_intent_digest" || column == "child_target_digest" || column == "reused_from") {
+					if values[i] != "" {
+						t.Fatal("migration invented retry lineage for a legacy request")
+					}
+					continue
+				}
+				if name == "requests" && column == "control_revision" {
+					if values[i] != int64(0) {
+						t.Fatal("migration invented lifecycle changes for a legacy request")
+					}
+					continue
+				}
+				if name == "requests" && column == "parent_call_index" {
+					if values[i] != int64(-1) {
+						t.Fatal("migration invented child calls")
+					}
+					continue
+				}
+				if name == "requests" && column == "orchestration_directive" {
+					if raw, ok := values[i].([]byte); !ok || len(raw) != 0 {
+						t.Fatal("migration invented parent capacity")
+					}
+					continue
+				}
+				preserved = append(preserved, values[i])
+			}
+			raw, err := json.Marshal(preserved)
 			must(t, err)
 			encoded = append(encoded, string(raw))
 		}
@@ -101,8 +145,8 @@ func TestPublicationCancellationMigratesPrivateCopyWithoutChangingRows(t *testin
 	defer db.Close()
 	var version int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	if version != 25 {
-		t.Fatal("migration did not stamp schema25")
+	if version != 28 {
+		t.Fatal("migration did not stamp schema28")
 	}
 	fk, err := db.Query(`PRAGMA foreign_key_check`)
 	must(t, err)
@@ -115,5 +159,5 @@ func TestPublicationCancellationMigratesPrivateCopyWithoutChangingRows(t *testin
 	if sha256.Sum256(still) != sha256.Sum256(original) {
 		t.Fatal("source snapshot changed")
 	}
-	t.Logf("schema23→25 private copy preserves all rows in %d tables, including source heads/ACKs/revisions; foreign keys valid; original snapshot unchanged", len(before))
+	t.Logf("schema23→28 private copy preserves all rows in %d tables, including source heads/ACKs/revisions; foreign keys valid; original snapshot unchanged", len(before))
 }

@@ -46,6 +46,7 @@ type Package struct {
 	Root             string // disposable wheel output, empty until Build
 	Name             string
 	Release          string
+	temporarySource  string // generated single-file project, copied into a retained install
 }
 
 type sourceIdentityFile struct {
@@ -58,7 +59,10 @@ type sourceIdentityDocument struct {
 	Sources []sourceIdentityFile `json:"sources"`
 }
 
-func (p *Package) Close() { _ = os.RemoveAll(p.Root) }
+func (p *Package) Close() {
+	_ = os.RemoveAll(p.Root)
+	_ = os.RemoveAll(p.temporarySource)
+}
 
 // Prepare reads publication identity and source paths without executing the
 // project's build backend. The caller can therefore ask Tensorhub whether the
@@ -340,13 +344,41 @@ func Paths(files map[string]string) []string {
 func (p *Package) SourceIdentity() (string, int, int64, *exit.Error) {
 	document := sourceIdentityDocument{}
 	var sourceBytes int64
-	for _, path := range Paths(p.Files) {
-		row, problem := sourceIdentityFileAt(path, p.Files[path])
+	files := make(map[string]string, len(p.Files))
+	for name, path := range p.Files {
+		files[name] = path
+	}
+	dependencies, problem := LocalDependencyPaths(p.Tree)
+	if problem != nil {
+		return "", 0, 0, problem
+	}
+	for name, source := range dependencies {
+		info, err := os.Stat(source)
+		if err != nil {
+			return "", 0, 0, exit.Internalf("cannot inspect local dependency: %s", err)
+		}
+		if !info.IsDir() {
+			files["dependencies/"+name+"/"+filepath.Base(source)] = source
+			continue
+		}
+		_, members, problem := LibrarySourceTree(source)
+		if problem != nil {
+			return "", 0, 0, problem
+		}
+		for member, path := range members {
+			files["dependencies/"+name+"/"+member] = path
+		}
+	}
+	for _, path := range Paths(files) {
+		row, problem := sourceIdentityFileAt(path, files[path])
 		if problem != nil {
 			return "", 0, 0, problem
 		}
 		document.Sources = append(document.Sources, row)
 		sourceBytes += row.Length
+		if len(document.Sources) > MaxSourceFiles || sourceBytes > MaxSourceBytes {
+			return "", 0, 0, exit.Named(exit.Validation, "local_source_closure_too_large", "local project and dependency sources exceed package bounds")
+		}
 	}
 	raw, err := json.Marshal(document)
 	if err != nil {
@@ -475,6 +507,16 @@ func IgnoredSourcePath(rel string) bool {
 }
 
 func sourceTree(tree string) (string, map[string]string, *exit.Error) {
+	return boundedSourceTree(tree, []string{"package.toml", "pyproject.toml", "uv.lock"})
+}
+
+// LibrarySourceTree applies package source bounds to a normal Python library.
+// A library needs no Cozy App or package.toml and may use its parent's uv.lock.
+func LibrarySourceTree(tree string) (string, map[string]string, *exit.Error) {
+	return boundedSourceTree(tree, []string{"pyproject.toml"})
+}
+
+func boundedSourceTree(tree string, requiredFiles []string) (string, map[string]string, *exit.Error) {
 	root, err := filepath.Abs(tree)
 	if err != nil {
 		return "", nil, exit.Usagef("package directory %q is not resolvable: %s", tree, err)
@@ -556,7 +598,7 @@ func sourceTree(tree string) (string, map[string]string, *exit.Error) {
 		}
 		return "", nil, exit.Named(exit.Structural, "package_tree_unreadable", "%s: %v", root, err)
 	}
-	for _, required := range []string{"package.toml", "pyproject.toml", "uv.lock"} {
+	for _, required := range requiredFiles {
 		if files[required] == "" {
 			return "", nil, exit.Named(exit.Validation, "package_source_required_file_missing",
 				"package source has no %s", required)

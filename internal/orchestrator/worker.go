@@ -371,7 +371,7 @@ func (w *worker) supportsCurrentProtocol() bool {
 	if w.refusal != nil && w.refusal.ErrName() == "worker.protocol_incompatible" {
 		return false
 	}
-	return w.declaredInstance == "" || w.wireMinor >= pb.WireMinor
+	return w.declaredInstance == "" || w.wireMinor >= pb.MinCompatibleWireMinor
 }
 
 type worker struct {
@@ -476,6 +476,7 @@ type worker struct {
 	serving           pb.ServingState         // axis 2: what it will take
 	executorEpoch     uint64                  // THIS placement's executor epoch
 	dispatchable      map[string]bool         // dispatchable_plan_ids
+	jobReady          map[string]bool         // prepared job executors, including occupied slots
 	materializable    map[string]bool         // DISJOINT from dispatchable
 	heldSetDigest     []byte                  // parent set the placement actually holds
 	fallbackSetDigest []byte                  // predecessor set kept for restore; empty = replacement PAUSED
@@ -1090,6 +1091,9 @@ func hostsPlans(w *worker, p DesiredPlacement) bool {
 	}
 	for _, j := range p.Jobs {
 		want[j.DescriptorID] = true
+		if j.OrchestrationParent != nil {
+			want[j.OrchestrationParent.DescriptorID] = true
+		}
 	}
 	if w.spec.Connection != nil && !w.spec.IsJob() {
 		for id := range want {
@@ -1552,6 +1556,25 @@ func (w *worker) observeLatchedFault(r *pb.ObservedWorkerState) *exit.Error {
 		fault.Reason, brief(fault.Detail, 1024))
 }
 
+// Jobs have no placement set, so placement-fault reconciliation cannot settle
+// their preparation. This explicit safety refusal means no executor was created.
+// A stale revision or any usable/live job slot is never preparation-failure proof.
+func (w *worker) jobExecutorRefusal(r *pb.ObservedWorkerState) *exit.Error {
+	capacity := r.GetJobCapacity()
+	if !w.spec.IsJob() || w.revision == 0 || r.AcceptedDesiredStateRevision != w.revision ||
+		capacity.GetJobsAvailable() != 0 || capacity.GetJobsInFlight() != 0 ||
+		capacity.GetOrchestrationAvailable() != 0 || capacity.GetOrchestrationInFlight() != 0 {
+		return nil
+	}
+	for _, fault := range r.Faults {
+		if fault != nil && fault.Kind == pb.FaultKind_FAULT_KIND_LOCAL_SAFETY_REFUSAL && fault.Reason == "job_executor_absent" {
+			return exit.Named(exit.Structural, "job_executor_absent",
+				"the worker cannot create its contained job executor; run it within a delegated cgroup or use a configured private rental")
+		}
+	}
+	return nil
+}
+
 // EnsurePlacementReady blocks until the placement's SERVING AXIS says DISPATCHABLE for
 // this plan — a real activation completed, never merely "connected" and never merely
 // "materialized". The two axes are why this can now be said precisely: a placement that is
@@ -1569,6 +1592,12 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 		c.mu.Lock()
 		w := c.workers[instanceID]
 		ok := w != nil && !w.exited && w.dispatchableFor(planID)
+		if w != nil && w.spec.IsJob() {
+			// Jobs have no serving axis or placement convergence. An occupied
+			// executor is ready too: its accepted attempt must not be killed by
+			// the preparation waiter racing with dispatch.
+			ok = !w.exited && w.acceptedRevision >= w.revision && w.jobReady[planID]
+		}
 		gone := w == nil || w.exited
 		logPath, fault, code := "", "", 0
 		workerFaulted := false
@@ -2229,6 +2258,9 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 		return killed, forgotten, problem
 	}
 	if problem := c.resumeManualRentals(); problem != nil {
+		return killed, forgotten, problem
+	}
+	if problem := c.restoreRetainedWork(); problem != nil {
 		return killed, forgotten, problem
 	}
 	return killed, forgotten, nil

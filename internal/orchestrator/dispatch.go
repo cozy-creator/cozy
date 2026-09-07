@@ -63,7 +63,11 @@ type Submission struct {
 
 	// Kind is the ATTEMPT CLASS: "" or `serving`, or `job`. A job carries two more facts
 	// a serving request has no version of.
-	Kind string
+	Kind           string
+	RetainWork     bool
+	RetryOf        string
+	ChildReusable  bool
+	ChildArtifacts bool
 	// Org is the publishing org whose scratch repo this job publishes into.
 	Org string
 	// Trees are the job's typed input TREES as `ref=dir`, one grant input each.
@@ -174,6 +178,10 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	if s.RentalRequired {
 		s.Rental = true
 	}
+	if s.RetainWork && s.Kind != "job" {
+		return records.Request{}, nil, exit.Named(exit.Validation, "retain_work_not_job",
+			"retained work is an ordinary private job capability")
+	}
 	weightsOutputs, weightsBytes, e := normalizeWeightsOutputs(s)
 	if e != nil {
 		return records.Request{}, nil, e
@@ -230,7 +238,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		LocalPackageDigest: s.LocalPackageDigest,
 		Outputs:            strings.Join(s.Outputs, ","),
 		Assets:             s.Assets, WeightsOutputs: string(weightsBytes),
-		Kind: s.Kind, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
+		Kind: s.Kind, RetainWork: s.RetainWork, RetryOf: s.RetryOf, ChildArtifacts: s.ChildArtifacts, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, Models: s.Models,
 		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer,
@@ -318,6 +326,14 @@ func (c *Orchestrator) logRecordedReplay(req records.Request, idempotencyKey str
 }
 
 func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Error) {
+	current, problem := c.opt.Store.RequestRow(req.ID)
+	if problem != nil || current == nil {
+		return 0, problem
+	}
+	if current.State != "submitted" && current.State != "queued" {
+		return uint64(current.Ordinal), nil
+	}
+	req = *current
 	if req.ModelTransfer != nil && req.Package == "cozy/platform" &&
 		req.Entrypoint == "model-pass-through" {
 		// Narrow attempt-zero exception: an unchanged verified Manifest has no code
@@ -410,6 +426,10 @@ func (c *Orchestrator) requeue(requestID, why string, charge bool) {
 			"outputs": []any{}, "requeuing": false,
 		}
 		row, read := c.opt.Store.RequestRow(requestID)
+		if read == nil && row != nil && row.RetainWork {
+			_, _ = c.opt.Store.BlockRetainedWork(requestID, "REQUEUE_BUDGET_EXHAUSTED", e.Message)
+			return
+		}
 		if read == nil && row != nil && row.ModelTransfer != nil {
 			if problem := c.releaseManagedNow(*row); problem != nil {
 				c.logf("%s model transfer provider cleanup remains pending: %s", requestID, problem.Message)
@@ -492,6 +512,11 @@ func (c *Orchestrator) requeue(requestID, why string, charge bool) {
 // longer wait. A request that queues forever behind a worker that died on boot is the
 // worst of both: no output and no answer.
 func (c *Orchestrator) selectOrStart(req records.Request) {
+	current, problem := c.opt.Store.RequestRow(req.ID)
+	if problem != nil || current == nil || (current.State != "submitted" && current.State != "queued") {
+		return
+	}
+	req = *current
 	// A queued pin can predate a client upgrade or the peer's first ClaimAck.
 	// Replan only work which has never been offered; keep old attempts/data intact.
 	if req.Rental && req.Worker != "" {
@@ -528,6 +553,10 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			}
 		}
 		if reason != "" {
+			if req.RetainWork {
+				c.failQueued(req.ID, exit.Named(exit.Conflict, "request.retained_rental_unavailable", "the retained rental cannot execute this transaction (%s)", reason), "")
+				return
+			}
 			attempts, problem := c.opt.Store.Attempts(req.ID)
 			if problem != nil || len(attempts) != 0 {
 				return
@@ -923,16 +952,37 @@ func staged(w *worker, planID string) bool {
 }
 
 func stagedFor(w *worker, req records.Request) bool {
-	if req.IsJob() && w.spec.Connection != nil && len(req.Models) > 0 && len(w.spec.Placement.Models) == 0 {
-		// An older job spec may not retain its input selection. Unknown inputs
-		// require ordinary preparation, never the serving selection wildcard.
-		return false
+	if req.IsJob() && w.spec.Connection != nil {
+		// Exact job inputs include their count; an unknown older selection
+		// cannot satisfy a requested model through the serving wildcard.
+		return staged(w, req.PlanID) && exactJobSelection(w.spec.Placement, req)
 	}
 	if req.Worker != "" && w.spec.Connection != nil && !req.IsJob() {
 		return w.remoteStaged(pinnedPackage(req.Package, req.Worker), req.PlanID,
 			req.Release, req.LocalPackageDigest, req.Models)
 	}
 	return staged(w, req.PlanID) && selectionServes(req.Models, w.spec.Placement.Models)
+}
+
+func exactJobSelection(placement DesiredPlacement, req records.Request) bool {
+	if req.InstallID != "" && placement.InstallID != req.InstallID ||
+		req.LocalPackageDigest != "" && placement.LocalRevisionDigest != req.LocalPackageDigest ||
+		req.Release != "" && placement.Release != req.Release || len(placement.Models) != len(req.Models) {
+		return false
+	}
+	for _, requested := range req.Models {
+		found := false
+		for _, held := range placement.Models {
+			if held.Slot == requested.Slot && held.Manifest == requested.Manifest && held.ManifestLength == requested.ManifestLength {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // selectionServes is the model half of the match (cl-114): a placement that holds a slot
@@ -971,7 +1021,12 @@ func settledState(state string) bool {
 // resolveFor keeps local package execution separate from generic rented capacity.
 // A rented worker receives only Creator's logical package refs; the worker
 // resolves and reports the exact binding it made dispatchable.
-func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string, *exit.Error) {
+func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpec, planID string, problem *exit.Error) {
+	defer func() {
+		if problem == nil && resolved.IsJob() {
+			resolved, problem = c.jobExecutionRole(req, resolved)
+		}
+	}()
 	if req.Worker == "" {
 		if c.opt.Packages == nil {
 			return WorkerLaunchSpec{}, "", exit.Unavailablef("this host resolves no local packages")
@@ -1027,6 +1082,25 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
+	if req.RetainWork {
+		if _, problem := c.rentalControl(req.Worker); problem != nil {
+			return WorkerLaunchSpec{}, "", problem
+		}
+		c.mu.Lock()
+		var minor uint32
+		if worker := c.workers[instance]; worker != nil {
+			minor = worker.wireMinor
+		}
+		c.mu.Unlock()
+		required, problem := c.requiredPrivateWire(req)
+		if problem != nil {
+			return WorkerLaunchSpec{}, "", problem
+		}
+		if minor < required {
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "request.retention_unsupported", "this private work requires worker wire %d; selected worker speaks %d", required, minor)
+		}
+	}
+	var jobPrepared *pb.DesiredPlacementSet
 	if req.InstallID != "" {
 		if c.opt.Packages == nil || !validDigest(req.LocalPackageDigest) {
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
@@ -1043,7 +1117,18 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 				"local_package_revision_changed",
 				"request %s no longer matches its sealed local package revision", req.ID)
 		}
-		if e := c.ConvergeLocalPackage(instance, req.ID, revision,
+		if req.ParentRequestID != "" {
+			_, e = c.retainedOrchestrationParent(req)
+			if e != nil {
+				return WorkerLaunchSpec{}, "", e
+			}
+		}
+		if req.IsJob() {
+			jobPrepared, problem = c.prepareLocalJob(instance, req, revision)
+			if problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+		} else if e := c.ConvergeLocalPackage(instance, req.ID, revision,
 			req.LocalPackageUploadedBootID, func(bootID string) *exit.Error {
 				return c.opt.Store.MarkLocalPackageUploaded(req.ID, revision.Digest, bootID)
 			}); e != nil {
@@ -1073,17 +1158,22 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		}
 	}
 	if req.IsJob() {
-		if e := c.waitPackageStaged(instance); e != nil {
-			return WorkerLaunchSpec{}, "", e
-		}
-		c.mu.Lock()
 		preparedSet := ""
 		var preparedBytes []byte
-		if worker := c.workers[instance]; worker != nil {
-			preparedSet = spellOf(worker.setDigest)
-			preparedBytes = append([]byte(nil), worker.setBytes...)
+		if jobPrepared != nil {
+			preparedSet = spellOf(jobPrepared.PlacementSetDigest)
+			preparedBytes = jobPrepared.PlacementSetCanonicalBytes
+		} else {
+			if e := c.waitPackageStaged(instance); e != nil {
+				return WorkerLaunchSpec{}, "", e
+			}
+			c.mu.Lock()
+			if worker := c.workers[instance]; worker != nil {
+				preparedSet = spellOf(worker.setDigest)
+				preparedBytes = append([]byte(nil), worker.setBytes...)
+			}
+			c.mu.Unlock()
 		}
-		c.mu.Unlock()
 		if !validDigest(preparedSet) {
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
 				"rental.package_preparation_identity_missing",
@@ -1102,14 +1192,26 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		}
 		spec := WorkerLaunchSpec{Connection: remote.Connection, Placement: DesiredPlacement{
 			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
-			PlacementSetDigest: preparedSet,
-			Models:             logical.Models,
+			InstallID: req.InstallID, Models: append([]ModelRef(nil), logical.Models...),
+			LocalRevisionDigest: req.LocalPackageDigest,
+			PlacementSetDigest:  preparedSet,
 			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,
 				BuildID:        buildID,
 				Outputs:        strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
 				WeightsOutputs: weights, RSSCap: DefaultJobRSSCap,
 				NeedsAccelerator: req.NeedsAccelerator}},
 		}}
+		spec, e = c.jobExecutionRole(req, spec)
+		if e != nil {
+			return WorkerLaunchSpec{}, "", e
+		}
+		current, problem := c.opt.Store.RequestRow(req.ID)
+		if problem != nil {
+			return WorkerLaunchSpec{}, "", problem
+		}
+		if current == nil || (current.State != "submitted" && current.State != "queued") {
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "request.execution_stopped", "request stopped while its private job was being prepared")
+		}
 		if e := c.ConvergeRemoteJob(instance, spec); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
@@ -1160,6 +1262,11 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error, workerToS
 		return
 	}
 	c.forget(requestID)
+	if row, problem := c.opt.Store.RequestRow(requestID); problem == nil && row != nil && row.RetainWork {
+		c.logf("%s BLOCKED (%s): %s", requestID, cause.ErrName(), cause.Message)
+		c.signalClosed(requestWaitKey(requestID), cause)
+		return
+	}
 	if workerToStop != "" {
 		c.ShutdownWorker(workerToStop, StopGrace)
 	}
@@ -1204,10 +1311,28 @@ func (c *Orchestrator) releaseManagedNow(req records.Request) *exit.Error {
 }
 
 func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
+	current, problem := c.opt.Store.RequestRow(req.ID)
+	if problem != nil {
+		return 0, problem
+	}
+	if current == nil || (current.State != "submitted" && current.State != "queued") {
+		return 0, exit.Named(exit.Conflict, "request.execution_stopped", "request %s is not queued for execution", req.ID)
+	}
+	req = *current
 	// PLACEMENT is the orchestrator's: the caller names the binding, and dispatch picks a
 	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence
 	// is open. `pick` also returns the admission epoch it OBSERVED, which is what
 	// makes a stale offer refuse deterministically rather than race.
+	if hit, problem := c.lookupOperation(req); hit || problem != nil {
+		return 0, problem
+	}
+	current, problem = c.opt.Store.RequestRow(req.ID)
+	if problem != nil {
+		return 0, problem
+	}
+	if current == nil || (current.State != "submitted" && current.State != "queued") {
+		return 0, exit.Named(exit.Conflict, "request.execution_stopped", "request stopped while its operation lookup was in progress")
+	}
 	target, e := c.pick(req)
 	if e != nil {
 		return 0, e
@@ -1219,6 +1344,21 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			c.releaseDispatch(reservation)
 		}
 	}()
+	if req.RetainWork {
+		required, problem := c.requiredPrivateWire(req)
+		if problem != nil {
+			return 0, problem
+		}
+		if w.wireMinor < required {
+			return 0, exit.Named(exit.Structural, "request.retention_unsupported",
+				"this private work requires worker wire %d; selected worker speaks %d", required, w.wireMinor)
+		}
+	}
+	if req.ParentRequestID != "" {
+		if problem := c.retainChildInputs(req); problem != nil {
+			return 0, problem
+		}
+	}
 	if w.spec.Connection != nil && req.Worker == "" {
 		// THE PIN IS ROUTING'S OUTPUT (cl-092 step 4): the argmin was a rental, so the
 		// request is pinned to it now — durably, before its identity is bound to that

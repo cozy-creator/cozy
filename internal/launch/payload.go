@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // The `run` payload grammar (cozy-runtime-cli.md), the same one cr-016 implements for a
@@ -391,6 +392,17 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 			return nil
 		}
 		return exit.New(exit.Validation, "request tree field %s is not a reference", path)
+	}
+	if input, ok := schema["input"]; ok && string(input) == `"model"` {
+		raw, _ := json.Marshal(value)
+		artifact, problem := records.DecodeModelArtifact(raw)
+		if problem != nil {
+			return problem
+		}
+		if artifact == nil {
+			return exit.New(exit.Validation, "request model field %s requires an artifact reference", path)
+		}
+		return nil
 	}
 	if literal, ok := schema["literal"]; ok {
 		var members []json.RawMessage

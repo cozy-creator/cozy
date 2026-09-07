@@ -235,6 +235,11 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 	if !transfer.HasAcquisition() {
 		return req, nil
 	}
+	if w.spec.Connection != nil {
+		if problem := c.controlRetainedSource(context.Background(), req, false); problem != nil {
+			return req, problem
+		}
+	}
 	c.mu.Lock()
 	bootID := w.bootID
 	c.mu.Unlock()
@@ -270,6 +275,10 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 		}
 	}
 	if problem != nil {
+		current, readProblem := c.opt.Store.RequestRow(req.ID)
+		if readProblem == nil && current != nil && current.RetainWork && current.State == "pausing" {
+			return req, exit.Unavailablef("source preparation paused with retained work")
+		}
 		if permanentTransferFailure(problem) {
 			_ = c.opt.Store.FailModelTransfer(req.ID, problem.ErrName(), problem.Message)
 		}
@@ -387,8 +396,11 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		if problem != nil || request == nil {
 			return nil, problem
 		}
-		if request.State == "canceled" {
+		if request.State == "canceled" || request.State == "canceling" || request.State == "releasing" {
 			return nil, exit.New(exit.Canceled, "model transfer %s was canceled", req.ID)
+		}
+		if request.State == "pausing" || request.State == "paused" {
+			return nil, exit.New(exit.Canceled, "source preparation is paused")
 		}
 		session, problem := c.rentalControl(request.Worker)
 		if problem != nil {
@@ -468,6 +480,9 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 			return nil, problem
 		}
 		if phase == "declaring" && allDeclared {
+			if problem := c.adoptRetriedSource(ctx, *request, session); problem != nil {
+				return nil, problem
+			}
 			phase = "probe"
 			if len(checkpoints) > 0 {
 				host, problem := c.checkpointHost(*request)
@@ -730,10 +745,12 @@ func (c *Orchestrator) finishModelTransferRequest(requestID string, attempt int6
 	if readProblem != nil || retainedAttempt == nil || c.retainedPublication(*request, *retainedAttempt) {
 		return
 	}
-	if problem := c.releaseManagedNow(*request); problem != nil {
-		c.logf("model transfer %s provider cleanup remains pending: %s", requestID, problem.Message)
-		time.AfterFunc(2*time.Second, func() { c.finishModelTransferRequest(requestID, attempt) })
-		return
+	if !request.RetainsLocalOutputs() {
+		if problem := c.releaseManagedNow(*request); problem != nil {
+			c.logf("model transfer %s provider cleanup remains pending: %s", requestID, problem.Message)
+			time.AfterFunc(2*time.Second, func() { c.finishModelTransferRequest(requestID, attempt) })
+			return
+		}
 	}
 	if _, problem := c.opt.Store.SettleModelTransferRequest(requestID, attempt); problem != nil {
 		c.logf("model transfer %s terminal settlement remains pending: %s", requestID, problem.Message)

@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 25
+const schemaVersion = 29
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -111,8 +111,10 @@ CREATE TABLE IF NOT EXISTS pins (
 )`
 
 // schema is the only records shape this pre-launch build accepts.
-var schema = append([]string{installsDDL, pinsDDL}, append(orchestratorSchema,
+var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orchestratorSchema,
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
+
+func init() { schema = append(schema, weightsRetentionsDDL, operationLookupsDDL) }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
@@ -267,9 +269,17 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 20 {
+	if sourceVersion < 28 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
+		}
+	}
+	if sourceVersion < 28 {
+		if _, err := tx.Exec(childRequestIndex); err != nil {
+			return exit.Internalf("cannot restore child call admission index in %s: %s", path, err)
+		}
+		if _, err := tx.Exec(weightsRetentionsDDL); err != nil {
+			return exit.Internalf("cannot create artifact retention ownership in %s: %s", path, err)
 		}
 	}
 	if sourceVersion < 16 {
@@ -344,6 +354,18 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 	if sourceVersion >= 23 && sourceVersion < 25 {
 		if e := migrateCheckpoints(tx, path); e != nil {
 			return e
+		}
+	}
+	if sourceVersion < 27 {
+		for _, statement := range []string{childBindingsDDL, childRequestIndex} {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot create private child ownership in %s: %s", path, err)
+			}
+		}
+	}
+	if sourceVersion < 29 {
+		if _, err := tx.Exec(operationLookupsDDL); err != nil {
+			return exit.Internalf("cannot create pending operation lookups in %s: %s", path, err)
 		}
 	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
@@ -594,6 +616,16 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		needsAccelerator + `,
 		org,trees,worker,` + machine + `,rental,` + rentalRequired +
 		`,install_id,assets,models,weights_outputs`
+	if sourceVersion >= 26 {
+		retained := ",retain_work,retry_of,reuse_scope,control_revision"
+		destinationColumns += retained
+		selectColumns += retained
+	}
+	if sourceVersion >= 27 {
+		child := ",parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive"
+		destinationColumns += child
+		selectColumns += child
+	}
 	if _, err := tx.Exec(`INSERT INTO requests(` + destinationColumns + `) SELECT ` + selectColumns +
 		` FROM requests_prior`); err != nil {
 		return exit.Internalf("cannot preserve request rows while migrating %s: %s", path, err)
@@ -658,6 +690,15 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
+		if version < 29 && statement == operationLookupsDDL {
+			continue
+		}
+		if version < 28 && statement == weightsRetentionsDDL {
+			continue
+		}
+		if version < 27 && (statement == childBindingsDDL || statement == childRequestIndex) {
+			continue
+		}
 		if version < 10 && containsStatement(modelTransferSchema, statement) ||
 			version < 16 && containsStatement(packageEventSchema, statement) ||
 			version < 23 && (statement == modelCheckpointSchema || statement == modelCheckpointPublicationSchema) {
@@ -670,6 +711,7 @@ func priorStatements(version int) []string {
 	}
 	for index, stmt := range statements {
 		transferStatement := stmt == modelTransferSchema[0]
+		requestStatement := stmt == requestsDDL
 		switch {
 		case stmt == requestsDDL && version == 6:
 			stmt = priorRequestsSix
@@ -707,6 +749,15 @@ func priorStatements(version int) []string {
 			stmt = strings.Replace(stmt,
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n",
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n  evidence         BLOB NOT NULL,\n", 1)
+		}
+		if requestStatement && version < 27 {
+			stmt = strings.Replace(stmt, ",\n  parent_request_id TEXT NOT NULL DEFAULT '',\n  parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<32),\n  child_intent_digest TEXT NOT NULL DEFAULT '',\n  child_target_digest TEXT NOT NULL DEFAULT '',\n  child_reusable INTEGER NOT NULL DEFAULT 0 CHECK(child_reusable IN (0,1)),\n  reused_from TEXT NOT NULL DEFAULT '',\n  orchestration_directive BLOB NOT NULL DEFAULT x''", "", 1)
+		}
+		if requestStatement && version < 28 {
+			stmt = strings.Replace(stmt, ",\n  child_artifacts INTEGER NOT NULL DEFAULT 0 CHECK(child_artifacts IN (0,1))", "", 1)
+		}
+		if requestStatement && version < 26 {
+			stmt = strings.Replace(stmt, ",\n  retain_work INTEGER NOT NULL DEFAULT 0 CHECK(retain_work IN (0,1)),\n  retry_of TEXT NOT NULL DEFAULT '',\n  reuse_scope TEXT NOT NULL DEFAULT '',\n  control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision>=0)", "", 1)
 		}
 		if transferStatement && version < 24 {
 			stmt = strings.Replace(stmt, ",'canceling'", "", 1)
@@ -944,6 +995,17 @@ func scanInstall(rows interface{ Scan(...any) error }) (PackageInstall, error) {
 // together or not at all. A crash before Commit leaves the previous pin — and the
 // previous install's venv — exactly as it was.
 func (s *Store) Activate(inst PackageInstall) (superseded string, e *exit.Error) {
+	return s.recordInstall(inst, true)
+}
+
+// RecordInstall retains an immutable invocation snapshot without replacing the
+// user's editable package pin. The accepting request owns its lifetime.
+func (s *Store) RecordInstall(inst PackageInstall) *exit.Error {
+	_, problem := s.recordInstall(inst, false)
+	return problem
+}
+
+func (s *Store) recordInstall(inst PackageInstall, activate bool) (string, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", exit.Internalf("cannot begin the activation transaction: %s", err)
@@ -970,13 +1032,17 @@ func (s *Store) Activate(inst PackageInstall) (superseded string, e *exit.Error)
 		inst.BytesExcl, inst.BytesShared, inst.CreatedAt); err != nil {
 		return "", exit.Internalf("cannot insert install %s: %s", inst.ID, err)
 	}
-	if _, err := tx.Exec(`DELETE FROM pins WHERE package=?`, inst.Package); err != nil {
-		return "", exit.Internalf("cannot replace the active pin for %s: %s", inst.Package, err)
-	}
-	if _, err := tx.Exec(`INSERT INTO pins(package,major,install_id,activated_at)
-		VALUES(?,?,?,?)`,
-		inst.Package, inst.Major, inst.ID, inst.CreatedAt); err != nil {
-		return "", exit.Internalf("cannot activate the pin for %s@v%d: %s", inst.Package, inst.Major, err)
+	if activate {
+		if _, err := tx.Exec(`DELETE FROM pins WHERE package=?`, inst.Package); err != nil {
+			return "", exit.Internalf("cannot replace the active pin for %s: %s", inst.Package, err)
+		}
+		if _, err := tx.Exec(`INSERT INTO pins(package,major,install_id,activated_at)
+			VALUES(?,?,?,?)`,
+			inst.Package, inst.Major, inst.ID, inst.CreatedAt); err != nil {
+			return "", exit.Internalf("cannot activate the pin for %s@v%d: %s", inst.Package, inst.Major, err)
+		}
+	} else {
+		prior = ""
 	}
 	if err := tx.Commit(); err != nil {
 		return "", exit.New(exit.Conflict,
@@ -1055,6 +1121,8 @@ func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
 func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + installCols("i.") + `
 		FROM installs i WHERE i.id NOT IN (SELECT install_id FROM pins)
+		AND NOT EXISTS(SELECT 1 FROM requests WHERE install_id=i.id AND (state IN (` + activeRequestStates + `) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
+		AND NOT EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=i.id)
 		ORDER BY i.created_at`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list unreferenced installs: %s", err)
@@ -1108,8 +1176,20 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 		return false, exit.New(exit.Conflict, "cannot begin install %s gc: %s", id, err)
 	}
 	defer tx.Rollback()
+	// Check ownership before clearing historical references. A rejected GC must
+	// not sever the result schema from a completed child still owned by its parent.
+	var held bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM pins WHERE install_id=?)
+		OR EXISTS(SELECT 1 FROM requests WHERE install_id=? AND (state IN (`+activeRequestStates+`) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
+		OR EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=?)
+		OR EXISTS(SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')`, id, id, id, id).Scan(&held); err != nil {
+		return false, exit.New(exit.Conflict, "cannot inspect install %s gc ownership: %s", id, err)
+	}
+	if held {
+		return false, nil
+	}
 	if _, err := tx.Exec(`UPDATE requests SET install_id=NULL WHERE install_id=?
-		AND state NOT IN ('submitted','queued','dispatching','requeue_pending')`, id); err != nil {
+		AND state NOT IN (`+activeRequestStates+`)`, id); err != nil {
 		return false, exit.New(exit.Conflict,
 			"cannot release terminal requests from install %s: %s", id, err)
 	}
@@ -1120,9 +1200,10 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 	result, err := tx.Exec(`DELETE FROM installs WHERE id=?
 		AND NOT EXISTS (SELECT 1 FROM pins WHERE install_id=?)
 		AND NOT EXISTS (SELECT 1 FROM requests WHERE install_id=?
-		  AND state IN ('submitted','queued','dispatching','requeue_pending'))
+		  AND state IN (`+activeRequestStates+`))
+		AND NOT EXISTS (SELECT 1 FROM private_child_bindings WHERE child_install_id=?)
 		AND NOT EXISTS (SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')`,
-		id, id, id, id)
+		id, id, id, id, id)
 	if err != nil {
 		return false, exit.New(exit.Conflict, "cannot claim install %s for gc: %s", id, err)
 	}
