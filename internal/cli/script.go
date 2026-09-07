@@ -26,8 +26,8 @@ func scriptTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) 
 	if len(callables) != 1 {
 		reclaimSnapshot(ctx, target)
 		return Target{}, nil, exit.Named(exit.Validation, "script_entrypoint_count",
-			"script app must expose exactly one runnable entrypoint; found %d", len(callables)).
-			WithRemedy("keep one registered callable in app; ordinary helper functions are allowed")
+			"script must expose exactly one main function; found %d", len(callables)).
+			WithRemedy("define main() or main(ctx); ordinary helper functions are allowed")
 	}
 	target.Function = callables[0].Name
 	return target, surface, nil
