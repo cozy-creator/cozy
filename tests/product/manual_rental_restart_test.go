@@ -40,8 +40,18 @@ func TestIdleManualRentalReclaimsAfterDaemonRestart(t *testing.T) {
 	}
 }
 
+// CPU work has no accelerator requirement; an already-paid idle GPU is usable.
+// Accelerator work still cannot use a CPU worker. Both arms cross real daemon
+// acquisition, retained rental records, signed Claim and independent TLS peer.
+func TestIdleRentalAcceleratorRequirement(t *testing.T) {
+	for _, mode := range []string{"cpu_job_on_gpu", "gpu_job_on_cpu"} {
+		t.Run(mode, func(t *testing.T) { proveIdleManualRentalRestart(t, mode) })
+	}
+}
+
 func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	root := t.TempDir()
+	classProof := mode == "cpu_job_on_gpu" || mode == "gpu_job_on_cpu"
 	layout, problem := home.Open(root)
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
@@ -80,10 +90,14 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 				ControlStreamEpoch: sequence, WorkerBootId: podBootID,
 				SnapshotId: fmt.Sprintf("empty-%d", sequence), SnapshotDigest: digest,
 				SnapshotCanonicalBytes: body, HostSnapshotDigest: hostDigest, HostSnapshotCanonicalBytes: hostBody}
+			resources := &pb.WorkerResources{Backend: "none"}
+			if mode == "cpu_job_on_gpu" {
+				resources = &pb.WorkerResources{Backend: "cuda", DeviceName: "RTX 4090", DeviceCount: 1, DeviceMemoryTotalBytes: 24 << 30}
+			}
 			if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: &pb.ClaimAck{
 				RecordOwnerEpoch: claim.RecordOwnerEpoch, ControlStreamEpoch: sequence, WorkerBootId: podBootID,
 				Accepted: true, WireMinor: pb.WireMinor, WorkerId: podWorkerID, WorkerInstanceId: "manual-empty-pod",
-				Resources: &pb.WorkerResources{Backend: "none"}}}}); err != nil {
+				Resources: resources}}}); err != nil {
 				return true, err
 			}
 			return true, send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_Snapshot{Snapshot: expected}})
@@ -150,11 +164,27 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		if r.Method != http.MethodGet {
 			mutations.Add(1)
 		}
+		if classProof && r.Method == http.MethodGet {
+			switch r.URL.Path {
+			case "/v1/rental-skus":
+				skus := offeredSKUs()
+				for i := range skus {
+					if skus[i].AcceleratorModel != "CPU" {
+						skus[i].ComputeCapability, skus[i].VRAMGB, skus[i].MinimumRAMPerGPUGB = "8.9", 24, 64
+					}
+				}
+				_ = json.NewEncoder(w).Encode(skus)
+				return
+			case "/v1/rentals/" + podRental:
+				_ = json.NewEncoder(w).Encode(map[string]any{"rental_id": podRental, "name": "manual-empty", "state": "ready", "hourly_rate_usd_micros": 1})
+				return
+			}
+		}
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte(`{"error":{"code":"proof.hub_unavailable","message":"controlled cloud outage"}}`))
 	}))
 	defer hub.Close()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\ntensorhub_token: manual-restart-proof\nrentals:\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\ntensorhub_token: manual-restart-proof\nrentals:\n  max_hourly_spend_usd: 2\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	cert, err := os.ReadFile(certPath)
 	must(t, err)
 	token, problem := rental.PendingMediaToken(layout, "manual-restart")
@@ -168,12 +198,23 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	if mode == "retained" {
 		row.ManagedRequestID = "req-private-control-restart"
 	}
+	if mode == "cpu_job_on_gpu" {
+		row.SKU, row.AcceleratorModel = "rtx-4090", "RTX 4090"
+	}
 	fatal(t, rental.Attach(layout, store, row, string(cert), token, identity))
 	before, problem := store.RentalRow(podRental)
 	fatal(t, problem)
 	keyBefore, err := os.ReadFile(layout.RentalCreatorIdentity(podRental))
 	must(t, err)
 	blockedHealth.Store(mode == "concurrent")
+	if classProof {
+		const request = "job-idle-accelerator-requirement"
+		_, _, problem := store.Submit(records.Request{ID: request, IdemKey: request,
+			BodyDigest: "sha256:" + strings.Repeat("a", 64), Package: "proof/idle-job", Entrypoint: "produce",
+			Kind: "job", NeedsAccelerator: mode == "gpu_job_on_cpu", Rental: true, RentalRequired: true,
+			Payload: []byte("{}"), Outputs: "[]", WeightsOutputs: "[]"})
+		fatal(t, problem)
+	}
 	first := startDaemonProcess(t, root)
 	claim := func() reply { return first.call(t, "POST", "/v1/local/rentals/"+podRental+"/claim", map[string]any{}) }
 	if mode == "concurrent" {
@@ -206,6 +247,24 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		// rely on the manual-rental exception or an open Python attempt.
 		before, problem = store.RentalRow(podRental)
 		fatal(t, problem)
+	}
+	if classProof {
+		const request = "job-idle-accelerator-requirement"
+		waitUntil(t, "existing-rental selection or paid ask", func() bool {
+			request, problem := store.RequestRow(request)
+			fatal(t, problem)
+			return mutations.Load() > 0 || request.Worker != "" || request.State == "failed"
+		})
+		selected, problem := store.RequestRow(request)
+		fatal(t, problem)
+		if mode == "cpu_job_on_gpu" {
+			if selected.Worker != podRental || mutations.Load() != 0 {
+				t.Fatalf("CPU job did not reuse the ready GPU: worker=%q paid asks=%d; %s", selected.Worker, mutations.Load(), tail(filepath.Join(root, "daemon.log")))
+			}
+		} else if selected.Worker == podRental || mutations.Load() == 0 {
+			t.Fatalf("GPU job reused a CPU instead of asking for accelerator capacity: worker=%q paid asks=%d", selected.Worker, mutations.Load())
+		}
+		return
 	}
 	stop := func(d *daemonProcess) {
 		t.Helper()

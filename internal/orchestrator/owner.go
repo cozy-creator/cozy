@@ -261,12 +261,6 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 	client := pb.NewWorkerControlClient(conn)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if problem := probeWorkerProtocol(ctx, conn, w.spec.Connection != nil); problem != nil {
-		if problem.Code != exit.Unavailable && problem.Code != exit.Deadline {
-			c.refuseClaim(w, problem)
-		}
-		return fmt.Errorf("%s", problem.Message)
-	}
 	c.mu.Lock()
 	if current := c.workers[w.instanceID]; current != w || w.exited || w.stopping || c.closing {
 		c.mu.Unlock()
@@ -281,6 +275,12 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		}
 		c.mu.Unlock()
 	}()
+	if problem := probeWorkerProtocol(ctx, conn, w.spec.Connection != nil); problem != nil {
+		if problem.Code != exit.Unavailable && problem.Code != exit.Deadline {
+			c.refuseClaim(w, problem)
+		}
+		return fmt.Errorf("%s", problem.Message)
+	}
 	stream, err := client.Control(ctx)
 	if err != nil {
 		return err
