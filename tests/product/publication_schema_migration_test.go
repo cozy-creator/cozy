@@ -87,7 +87,7 @@ func TestPublicationCancellationMigratesPrivateCopyWithoutChangingRows(t *testin
 	defer db.Close()
 	var version int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	if version != 24 {
+	if version != 25 {
 		t.Fatal("migration did not stamp schema24")
 	}
 	fk, err := db.Query(`PRAGMA foreign_key_check`)
