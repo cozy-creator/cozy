@@ -251,6 +251,10 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 		if row == nil {
 			return nil, unknown(id)
 		}
+		if !records.RentalReadyState(row.State) {
+			return nil, exit.Named(exit.Unavailable, "rental.not_ready",
+				"rental %s is %s; its retained worker is not attachable", id, row.State)
+		}
 		if row.Address == "" {
 			return nil, noAddress(id, row.State)
 		}

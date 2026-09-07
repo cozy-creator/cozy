@@ -726,6 +726,11 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 		break
 	}
 	if live != nil {
+		// A concurrent empty-rental attach may have waited for this connection.
+		// It requests the existing claim, never an empty replacement placement.
+		if spec.Connection != nil && spec.Placement.Package == "" {
+			return instanceID, ChangeNone, nil
+		}
 		// The worker is here. Does it already host what is wanted? The placement's
 		// identity for this purpose is its plan set, which is what the desired set names.
 		c.mu.Lock()
@@ -950,8 +955,9 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 				return WorkerLaunchSpec{}, "", placementProblem
 			}
 			observed := w.observedRemote[desired.PlacementIDValue]
-			placementFailed = observed.materialization ==
-				pb.MaterializationState_MATERIALIZATION_STATE_FAILED
+			placementFailed = found && w.acceptedRevision == w.revision &&
+				observed.placementSetDigest == desired.PlacementSetDigest &&
+				observed.materialization == pb.MaterializationState_MATERIALIZATION_STATE_FAILED
 			planID := logical.PlanID
 			if planID == "" && len(logical.Models) > 0 {
 				// Runtime authored each binding beside its callable name. Other
@@ -1369,6 +1375,13 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	if e := byteplane.Health(); e != nil {
 		return "", e
 	}
+	// Health can block while the retained rental is released. Revalidate its
+	// existing authority without replacing this connection's pinned target.
+	if c.opt.Rentals != nil {
+		if _, problem := c.opt.Rentals(spec.Connection.RentalID); problem != nil {
+			return "", problem
+		}
+	}
 	planIDs := make([]string, 0, len(spec.Placement.Entrypoints))
 	for _, entrypoint := range spec.Placement.Entrypoints {
 		planIDs = append(planIDs, entrypoint.Digest)
@@ -1377,16 +1390,21 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	// AttachWorker, not SpawnWorker: the device-envelope admission arbitrates THIS host's
 	// cards, and the pod's card is the pod's. There is no grant to journal and none to
 	// release, which is also why nothing here has a pid or a birth identity to record.
+	c.mu.Lock()
+	if c.closing {
+		c.mu.Unlock()
+		return "", exit.Unavailablef("the daemon is closing; no rental worker was registered")
+	}
 	if e := c.opt.Store.AttachWorker(records.WorkerProcess{
 		InstanceID: instanceID, Package: spec.Placement.Package,
 		InstallID: spec.Placement.InstallID, WorkerID: "remote",
 	}); e != nil {
+		c.mu.Unlock()
 		return "", e
 	}
 	w := newWorker(instanceID, spec)
 	w.logPath = "(connected worker: its log lives on the pod)"
 	w.planIDs, w.media = planIDs, byteplane
-	c.mu.Lock()
 	c.workers[instanceID] = w
 	c.mu.Unlock()
 	c.logf("worker %s CONNECTED at %s (media %s) plans=%d",
@@ -1442,39 +1460,79 @@ func (w *worker) observeLatchedFault(r *pb.ObservedWorkerState) *exit.Error {
 		w.latchedFault, w.latchedFaultRevision, w.latchedFaultReports = "", 0, 0
 		return nil
 	}
-	if w.revision == 0 || r.AcceptedDesiredStateRevision < w.revision ||
-		r.ConvergedRevision >= w.revision {
+	if w.revision == 0 || r.AcceptedDesiredStateRevision != w.revision ||
+		r.ConvergedRevision >= w.revision || len(w.setDigest) == 0 ||
+		!bytes.Equal(r.AcceptedPlacementSetDigest, w.setDigest) {
 		return reset()
 	}
+	// Only the exact desired set can identify the placement this request is
+	// waiting for. The worker may still report its outgoing fallback beside it.
+	desired, err := canonical.Read(w.setBytes, &pb.PlacementSet{})
+	if err != nil {
+		return reset()
+	}
+	current := make(map[string]bool)
+	for _, p := range desired.List("placements") {
+		current[p.Str("placement_id")] = true
+	}
 	reported := make(map[string]*pb.PlacementStatus, len(r.Placements))
+	seen := make(map[string]bool, len(r.Placements))
 	for _, p := range r.Placements {
-		if p == nil {
+		if p != nil {
+			seen[p.PlacementId] = true
+		}
+		if p == nil || !current[p.PlacementId] || !bytes.Equal(p.PlacementSetDigest, w.setDigest) {
 			continue
 		}
-		if p.Materialization == pb.MaterializationState_MATERIALIZATION_STATE_MATERIALIZING {
+		// Historical diagnostics can survive a cutover. Downloading, activating
+		// or draining is a current transition, never proof of a latched failure.
+		if p.Materialization == pb.MaterializationState_MATERIALIZATION_STATE_MATERIALIZING ||
+			p.Serving == pb.ServingState_SERVING_STATE_ACTIVATING ||
+			p.Serving == pb.ServingState_SERVING_STATE_DRAINING {
 			return reset()
 		}
 		reported[p.PlacementId] = p
 	}
-	stalled := func(p *pb.PlacementStatus) bool {
-		return p == nil || p.Serving != pb.ServingState_SERVING_STATE_DISPATCHABLE
+	offline := func(p *pb.PlacementStatus) bool {
+		return p != nil && p.Serving == pb.ServingState_SERVING_STATE_OFFLINE
 	}
 	var fault *pb.Fault
+	var placement *pb.PlacementStatus
 	for _, p := range r.Placements {
-		if p != nil && stalled(p) && len(p.Faults) > 0 {
-			fault = p.Faults[0]
+		if p != nil && reported[p.PlacementId] == p && offline(p) {
+			for _, f := range p.Faults {
+				if f != nil {
+					fault, placement = f, p
+					break
+				}
+			}
+		}
+		if fault != nil {
 			break
 		}
 	}
 	for _, f := range r.Faults {
-		if fault == nil && f != nil && stalled(reported[f.Subject]) {
-			fault = f
+		if fault != nil || f == nil || !current[f.Subject] {
+			continue
+		}
+		p := reported[f.Subject]
+		// A pending replacement can fail before it has a PlacementStatus row,
+		// while the predecessor still serves. Only its exact incoming ID from
+		// the owned set can associate that global failure. A present row from a
+		// different set cannot use this absence case.
+		if offline(p) || p == nil && !seen[f.Subject] {
+			fault, placement = f, p
 		}
 	}
 	if fault == nil {
 		return reset()
 	}
-	key := fmt.Sprintf("%d\x00%s\x00%s\x00%s", fault.Kind, fault.Subject, fault.Reason, fault.Detail)
+	placementID, executorEpoch := fault.Subject, uint64(0)
+	if placement != nil {
+		placementID, executorEpoch = placement.PlacementId, placement.ExecutorEpoch
+	}
+	key := fmt.Sprintf("%x\x00%s\x00%d\x00%d\x00%s\x00%s\x00%s",
+		w.setDigest, placementID, executorEpoch, fault.Kind, fault.Subject, fault.Reason, fault.Detail)
 	if key != w.latchedFault || w.latchedFaultRevision != w.revision {
 		w.latchedFault, w.latchedFaultRevision, w.latchedFaultReports = key, w.revision, 0
 	}
@@ -2160,6 +2218,9 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 		return killed, forgotten, problem
 	}
 	if problem := c.ResumeQueuedRequests(); problem != nil {
+		return killed, forgotten, problem
+	}
+	if problem := c.resumeManualRentals(); problem != nil {
 		return killed, forgotten, problem
 	}
 	return killed, forgotten, nil
