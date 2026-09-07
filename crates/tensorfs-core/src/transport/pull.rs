@@ -754,8 +754,8 @@ pub struct WalkOutcome {
 /// bytes are in the page cache at exactly the instant admission commits them, so publishing
 /// them onward is the cheapest read of that object that will ever be available; a later
 /// pass would re-read from disk what this moment already holds in memory. It costs the
-/// first pod in a datacenter a mounted-filesystem write that overlaps the still-running
-/// transfers on every other stream, and it is what makes every pod after it warm.
+/// first pod in a datacenter a bounded, optional mounted-filesystem backfill. Local
+/// completion does not wait for it or promise that a later pod will find a complete cache.
 #[allow(clippy::too_many_arguments)]
 pub fn fetch_wanted(
     store: &Store,
@@ -813,10 +813,9 @@ pub fn fetch_wanted(
                         store, &grant, &authorize, policy, credential, deadline, ledger, None,
                     )?;
                     if let (Some(kind), Some(cache)) = (kind, cache) {
-                        // Weather, and deliberately unread: a cache that cannot be written
-                        // has cost this pull nothing, and the object it could not take is
-                        // already local and already proved.
-                        let _ = cache.backfill_store(store, kind, object);
+                        // Local admission is complete. Optional replication must never
+                        // occupy an origin slot or delay this object's completion report.
+                        cache.offer_backfill(store, kind, object);
                     }
                     Ok(Source::Origin(one))
                 });

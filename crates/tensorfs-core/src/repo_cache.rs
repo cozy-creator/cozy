@@ -92,6 +92,27 @@ impl RepoObjectCache {
         &self.root
     }
 
+    /// Offer optional replication after local acquisition. This reports no durability
+    /// and never waits for filesystem I/O or queue space. Ingest's explicit Mirror
+    /// retains its separate completion/watermark contract.
+    pub(crate) fn offer_backfill(
+        &self,
+        source: &Store,
+        kind: CacheKind,
+        object: &ObjectRef,
+    ) -> bool {
+        static BACKFILLS: std::sync::OnceLock<Backfills> = std::sync::OnceLock::new();
+        let pool = BACKFILLS.get_or_init(Backfills::start);
+        pool.sender
+            .try_send(Backfill {
+                cache: self.clone(),
+                source: source.root().to_path_buf(),
+                kind,
+                object: object.clone(),
+            })
+            .is_ok()
+    }
+
     /// The one cross-language layout contract. `digest` is bare lowercase SHA-256.
     pub fn path(&self, kind: CacheKind, digest: &str) -> Result<PathBuf> {
         let digest = hex64("repo cache object", digest)?;
@@ -225,6 +246,52 @@ impl RepoObjectCache {
             },
             Err(_) => CacheWrite::Unavailable,
         })
+    }
+}
+
+// Reference-only memory policy for optional acquisition backfill, not a protocol bound.
+// Typical jobs are a few hundred bytes; even two 4 KiB paths per job stay near 1 MiB.
+const BACKFILL_QUEUE: usize = 128;
+
+struct Backfill {
+    cache: RepoObjectCache,
+    source: PathBuf,
+    kind: CacheKind,
+    object: ObjectRef,
+}
+
+struct Backfills {
+    sender: std::sync::mpsc::SyncSender<Backfill>,
+}
+
+impl Backfills {
+    fn start() -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Backfill>(BACKFILL_QUEUE);
+        let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+        // One pool for the process, never a new blocked thread set for every pull.
+        // Workers are detached: process exit may leave cache temps, never canonical
+        // partial objects. Dropping a pull must not join a stalled FUSE syscall.
+        for _ in 0..STREAMS {
+            let receiver = receiver.clone();
+            let _ = std::thread::Builder::new()
+                .name("tfs-cache-write".into())
+                .spawn(move || loop {
+                    let work = {
+                        let queue = receiver.lock().unwrap_or_else(|error| error.into_inner());
+                        match queue.recv() {
+                            Ok(work) => work,
+                            Err(_) => return,
+                        }
+                    };
+                    // Reopen without a caller's progress observer. Queued work owns no GC
+                    // hold: a source reclaimed before it opens is simply a missed cache fill.
+                    // Once opened, the verified descriptor pins that inode through the copy.
+                    if let Ok(store) = Store::open(&work.source) {
+                        let _ = work.cache.backfill_store(&store, work.kind, &work.object);
+                    }
+                });
+        }
+        Self { sender }
     }
 }
 
@@ -798,5 +865,100 @@ impl Drop for Mirror {
     fn drop(&mut self) {
         self.close();
         self.drain();
+    }
+}
+
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+
+    fn temporary(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tensorfs-backfill-{name}-{}-{}",
+            std::process::id(),
+            store::now_nanos_unique()
+        ))
+    }
+
+    #[test]
+    fn active_cache_copy_allows_gc_and_keeps_its_open_verified_bytes() {
+        let root = temporary("gc");
+        let source = Store::init(&root.join("source")).unwrap();
+        let bytes = vec![37; store::BUF * 2 + 17];
+        let object = source
+            .put_stream(&mut bytes.as_slice(), None, &Fault::default())
+            .unwrap()
+            .obj;
+        let mut file = source.open_verified(&object.sha256).unwrap();
+        let cache = RepoObjectCache::new(root.join("cache"));
+        let destination = cache.path(CacheKind::Blob, &object.sha256).unwrap();
+        struct Reclaim<F> {
+            file: F,
+            root: PathBuf,
+            first: bool,
+            length: u64,
+        }
+        impl<F: Read> Read for Reclaim<F> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.file.read(output)?;
+                if self.first {
+                    self.first = false;
+                    // The actual copy has already opened its temporary and read its
+                    // first buffer. No global hold may defer GC until cache I/O ends.
+                    let report = crate::gc::collect(&self.root, false).unwrap();
+                    assert_eq!(report.reclaimed_blobs, 1);
+                    assert_eq!(report.reclaimed_bytes, self.length);
+                }
+                Ok(read)
+            }
+        }
+        let mut input = Reclaim {
+            file: &mut file,
+            root: source.root().to_path_buf(),
+            first: true,
+            length: object.length,
+        };
+        assert_eq!(publish_stream(&mut input, &destination, &object), Ok(true));
+        assert!(!source.contains(&object.sha256));
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert_eq!(verify_path(&destination, CacheKind::Blob, &object), Ok(()));
+        assert_eq!(
+            fs::read_dir(destination.parent().unwrap()).unwrap().count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_cache_copy_removes_only_its_temporary_and_never_publishes() {
+        let root = temporary("failure");
+        let cache = RepoObjectCache::new(&root);
+        let object = ObjectRef::of(&[19; 1024]);
+        let destination = cache.path(CacheKind::Blob, &object.sha256).unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let other = destination.parent().unwrap().join(".other-process.tmp");
+        fs::write(&other, b"owned elsewhere").unwrap();
+        struct Fails(bool);
+        impl Read for Fails {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("injected source read failure"));
+                }
+                self.0 = true;
+                output[..17].fill(19);
+                Ok(17)
+            }
+        }
+        assert_eq!(
+            publish_stream(&mut Fails(false), &destination, &object),
+            Err(SoftFailure::Unavailable)
+        );
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&other).unwrap(), b"owned elsewhere");
+        assert_eq!(
+            fs::read_dir(destination.parent().unwrap()).unwrap().count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
