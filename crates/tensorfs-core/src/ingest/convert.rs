@@ -80,12 +80,13 @@ pub const CONVERTERS: [Converter; 4] = [
         validated_on_real_bytes: true,
     },
     Converter {
-        name: "h3.native/1",
+        name: "h3.native/2",
         dialect: "safetensors.h3_native",
         class: Class::Permutation,
         doc: "H3 native spelling: every head-interleaved fused `attn.qkv_proj` split into the \
               canonical per-head contiguous to_q|to_k|to_v, and the ratified rekey rows moved \
-              with it. Reordering only — never arithmetic. A fused attention key this \
+              with it. Fused MLP [gate; value] rows become [value; gate] for Diffusers \
+              SwiGLU. Reordering only — never arithmetic. A fused attention key this \
               converter has NO banked seam for refuses rather than carrying through.",
         // FLIPPED 2026-08-25 (tfs-003 convergence run, MiniMaxAI/MiniMax-H3@42ed227e): the
         // full 66.28 GB native tree ingested through this converter (639 ops, exit 0), and
@@ -94,6 +95,9 @@ pub const CONVERTERS: [Converter; 4] = [
         // (transformer_blocks.0 and token_refiner.blocks.0; groups=56, head_dim=128 read
         // from q_norm). The 17 edge rewrites are byte-digest-proven bijections; the sole
         // native-only key is rope.inv_freq, carried.
+        // 2026-09-07: h3.native/2 also swaps all main/refiner fc1 row halves, as the
+        // pinned official converter requires. The complete trained Ref2VA block0
+        // fc1 (308281344 B) converted to e7cf97ae...3b19; fc2 stayed byte-identical.
         validated_on_real_bytes: true,
     },
 ];
@@ -179,7 +183,8 @@ pub enum Bytes {
     Stream { file: usize, key: String },
     /// Carry the already-admitted objects by reference: zero re-hash, zero re-upload.
     Inherit { part: Box<Part> },
-    /// Reorder a resident buffer. Bounded by `CONVERT_TENSOR_MAX_BYTES` and never arithmetic.
+    /// Reorder source runs through the ordinary bounded streaming writer; never arithmetic.
+    /// Input role size is bounded by `CONVERT_TENSOR_MAX_BYTES`.
     Permute {
         file: usize,
         key: String,
@@ -1152,7 +1157,26 @@ fn plan_carrier(
         });
 
         let out_key = rekey(conv, &t.key);
-        let effect = if out_key == t.key {
+        let effect = if conv.name == "h3.native/2"
+            && (t.key.ends_with(".mlp.fc1.weight") || t.key.ends_with(".mlp.fc1.bias"))
+        {
+            if chosen.alias != "plain/1" {
+                return refuse(
+                    Code::SEAM_UNBANKED,
+                    format!(
+                        "{}: H3 fused MLP companion roles require a reviewed encoded permutation",
+                        t.key
+                    ),
+                );
+            }
+            let xform = h3_swiglu(h, t)?;
+            roles[0].bytes = Bytes::Permute {
+                file,
+                key: t.key.clone(),
+                xform,
+            };
+            Effect::Permute
+        } else if out_key == t.key {
             Effect::Recontain
         } else {
             Effect::Rekey
@@ -1185,6 +1209,53 @@ fn plan_carrier(
         );
     }
     Ok(())
+}
+
+/// The original H3 MLP consumes [gate; value], while Diffusers SwiGLU consumes
+/// [value; gate]. The sibling fc2 projection proves the gate width, for main and
+/// token-refiner blocks alike. Only source runs move; no tensor value changes.
+fn h3_swiglu(h: &SourceHeader, t: &super::carrier::SourceTensor) -> Result<Xform> {
+    let (base, bias) = if let Some(base) = t.key.strip_suffix(".fc1.weight") {
+        (base, false)
+    } else {
+        (
+            t.key.strip_suffix(".fc1.bias").expect("selected fc1 role"),
+            true,
+        )
+    };
+    let first = h
+        .get(&format!("{base}.fc1.weight"))
+        .ok_or_else(|| crate::err::Refusal {
+            code: Code::MISSING_COMPANION_ROLE,
+            detail: format!("{}: fused MLP weight is absent", t.key),
+        })?;
+    let second = h
+        .get(&format!("{base}.fc2.weight"))
+        .ok_or_else(|| crate::err::Refusal {
+            code: Code::MISSING_COMPANION_ROLE,
+            detail: format!("{}: output MLP projection is absent", t.key),
+        })?;
+    if first.shape.len() != 2
+        || second.shape.len() != 2
+        || first.shape[0] == 0
+        || first.shape[1] == 0
+        || first.shape[0] % 2 != 0
+        || first.shape[0] / 2 != second.shape[1]
+        || first.shape[1] != second.shape[0]
+        || (bias && (t.shape.len() != 1 || t.shape[0] != first.shape[0]))
+    {
+        return refuse(
+            Code::SHAPE_MISMATCH,
+            format!(
+                "{}: fused MLP must contain equal gate/value row halves matching fc2",
+                t.key
+            ),
+        );
+    }
+    check_permute_size(&t.key, t.nbytes())?;
+    Ok(Xform::SwapHalves {
+        half_bytes: t.nbytes() / 2,
+    })
 }
 
 /// Plan ONE fused key into its members. Nothing is read: the cut comes from the declared
@@ -1391,7 +1462,7 @@ fn rekey(conv: &Converter, key: &str) -> String {
             .unwrap_or_else(|| key.to_string()),
         // Leaf first, then the block prefix — the two halves of the ratified map's own
         // `rekey` block, applied in the order it lists them.
-        "h3.native/1" => {
+        "h3.native/2" => {
             if let Some((_, to)) = H3_NATIVE_EXACT.iter().find(|(from, _)| *from == key) {
                 return to.to_string();
             }
@@ -1454,11 +1525,12 @@ const H3_NATIVE_EXACT: [(&str, &str); 17] = [
     ("video_patch_proj.weight", "proj_in.weight"),
 ];
 
-const H3_NATIVE_LEAVES: [(&str, &str); 5] = [
+const H3_NATIVE_LEAVES: [(&str, &str); 6] = [
     (".attn.out_proj.weight", ".attn.to_out.0.weight"),
     (".attn.q_norm.weight", ".attn.norm_q.weight"),
     (".attn.k_norm.weight", ".attn.norm_k.weight"),
     (".mlp.fc1.weight", ".ff.net.0.proj.weight"),
+    (".mlp.fc1.bias", ".ff.net.0.proj.bias"),
     (".mlp.fc2.weight", ".ff.net.2.weight"),
 ];
 
@@ -1496,7 +1568,7 @@ pub const H3_ATTENTION_SEAM: [Seam; 1] = [Seam {
 
 pub fn seams(c: &Converter) -> &'static [Seam] {
     match c.name {
-        "h3.native/1" => &H3_ATTENTION_SEAM,
+        "h3.native/2" => &H3_ATTENTION_SEAM,
         _ => &[],
     }
 }
@@ -1570,14 +1642,14 @@ pub fn single_file_component(component: &str, source: &SourceHeader) -> Result<S
     })
 }
 
-/// The bounded-buffer guard for a permutation op.
+/// The declared input-size guard for a permutation op; execution streams its source runs.
 pub fn check_permute_size(what: &str, nbytes: u64) -> Result<()> {
     if nbytes > limits::CONVERT_TENSOR_MAX_BYTES {
         return refuse(
             Code::CONVERT_SIZE_CAP,
             format!(
-                "{what}: a permutation needs {nbytes} B resident, over the declared \
-                 {} B converter bound",
+                "{what}: permutation source is {nbytes} B, over the declared \
+                 {} B converter input bound",
                 limits::CONVERT_TENSOR_MAX_BYTES
             ),
         );
@@ -1666,7 +1738,11 @@ pub fn h3_geometry(
 /// error at ~90% numerically while nothing raised.
 pub fn golden_cases(c: &Converter) -> Vec<(&'static str, Xform)> {
     match c.name {
-        "h3.native/1" => vec![
+        "h3.native/2" => vec![
+            (
+                "h3-swiglu gate/value rows",
+                Xform::SwapHalves { half_bytes: 64 * 2 },
+            ),
             (
                 "h3-dit-qkv 56 groups x 128 x bf16",
                 Xform::QkvSplit {

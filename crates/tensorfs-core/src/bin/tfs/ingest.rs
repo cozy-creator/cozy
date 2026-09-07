@@ -1861,7 +1861,7 @@ pub fn cmd_sessions(root: &Path) -> ExitCode {
 /// 6.78e+01, roughly 90% error, and nothing raised. Here the two outputs are the same length
 /// and a different digest, which is the same fact stated in bytes.
 pub fn cmd_golden() -> ExitCode {
-    let (mut pass, mut red) = (0usize, 0usize);
+    let (mut pass, mut red, mut failed) = (0usize, 0usize, 0usize);
     for c in convert::CONVERTERS.iter() {
         for (name, x) in convert::golden_cases(c) {
             let src = source_core::golden_bytes(name, x.in_bytes());
@@ -1875,8 +1875,29 @@ pub fn cmd_golden() -> ExitCode {
                         x.out_bytes()
                     );
                 }
-                Ok(false) => println!("  FAIL {name}: does not reassemble its own input"),
-                Err(e) => println!("  FAIL {name}: {}", e.code.as_str()),
+                Ok(false) => {
+                    failed += 1;
+                    println!("  FAIL {name}: does not reassemble its own input");
+                }
+                Err(e) => {
+                    failed += 1;
+                    println!("  FAIL {name}: {}", e.code.as_str());
+                }
+            }
+
+            if let convert::Xform::SwapHalves { .. } = &x {
+                let mut swapped = Vec::new();
+                ok!(x.apply(&src, &mut swapped));
+                if swapped.len() == src.len() && swapped != src {
+                    red += 1;
+                    println!(
+                        "  RED  {name}: unchanged gate/value order differs from converted bytes"
+                    );
+                } else {
+                    failed += 1;
+                    println!("  MISS {name}: unchanged fused halves were accepted");
+                }
+                continue;
             }
 
             // The planted wrong geometry: the SAME source read as one contiguous group.
@@ -1886,7 +1907,10 @@ pub fn cmd_golden() -> ExitCode {
                     shares,
                     take,
                     unit_bytes,
-                } = &x;
+                } = &x
+                else {
+                    unreachable!("half-swap handled above")
+                };
                 if *groups == 1 {
                     continue;
                 }
@@ -1909,13 +1933,14 @@ pub fn cmd_golden() -> ExitCode {
                         &tensorfs_core::sha256::hex_digest(&b)[..12]
                     );
                 } else {
+                    failed += 1;
                     println!("  MISS {name}: the wrong split produced the same bytes");
                 }
             }
         }
     }
     println!("  {pass} golden cases reassembled, {red} wrong-order arms fired");
-    if red > 0 && pass > 0 {
+    if failed == 0 && red > 0 && pass > 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

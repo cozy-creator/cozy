@@ -99,6 +99,8 @@ impl Decomposition {
 /// is 1:1:2 (q 2048, k 2048, v 4096), which equal thirds does not even divide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Xform {
+    /// Fused [gate; value] rows become [value; gate]. Both runs stream unchanged.
+    SwapHalves { half_bytes: u64 },
     QkvSplit {
         groups: u64,
         shares: [u64; 3],
@@ -113,6 +115,7 @@ impl Xform {
     /// Total source bytes this transform consumes.
     pub fn in_bytes(&self) -> u64 {
         match self {
+            Xform::SwapHalves { half_bytes } => 2 * half_bytes,
             Xform::QkvSplit {
                 groups,
                 shares,
@@ -125,6 +128,7 @@ impl Xform {
     /// Output byte length, derived from the transform alone.
     pub fn out_bytes(&self) -> u64 {
         match self {
+            Xform::SwapHalves { half_bytes } => 2 * half_bytes,
             Xform::QkvSplit {
                 groups,
                 shares,
@@ -139,6 +143,18 @@ impl Xform {
     /// `apply` executes exactly these runs and nothing else.
     pub fn runs(&self) -> Decomposition {
         match self {
+            Xform::SwapHalves { half_bytes } => Decomposition::of(vec![
+                Run {
+                    src_off: *half_bytes,
+                    dest_off: 0,
+                    len: *half_bytes,
+                },
+                Run {
+                    src_off: 0,
+                    dest_off: *half_bytes,
+                    len: *half_bytes,
+                },
+            ]),
             Xform::QkvSplit {
                 groups,
                 shares,
@@ -213,6 +229,13 @@ impl Xform {
     /// indexing and the three members must reassemble the source bit-for-bit.
     pub fn reassembles(&self, src: &[u8]) -> Result<bool> {
         match self {
+            Xform::SwapHalves { .. } => {
+                let mut swapped = Vec::new();
+                self.apply(src, &mut swapped)?;
+                let mut restored = Vec::new();
+                self.apply(&swapped, &mut restored)?;
+                Ok(restored == src)
+            }
             Xform::QkvSplit {
                 groups,
                 shares,

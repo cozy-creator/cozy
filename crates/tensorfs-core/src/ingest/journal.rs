@@ -216,18 +216,26 @@ pub fn plan_digest(plan: &Plan, headers: &[(PathBuf, &SourceHeader)]) -> String 
                     field(&mut hash, b"permute");
                     field(&mut hash, &(*file as u64).to_le_bytes());
                     field(&mut hash, key.as_bytes());
-                    let Xform::QkvSplit {
-                        groups,
-                        shares,
-                        take,
-                        unit_bytes,
-                    } = xform;
-                    field(&mut hash, &groups.to_le_bytes());
-                    for share in shares {
-                        field(&mut hash, &share.to_le_bytes());
+                    match xform {
+                        Xform::QkvSplit {
+                            groups,
+                            shares,
+                            take,
+                            unit_bytes,
+                        } => {
+                            // Preserve the identity of every existing QKV conversion.
+                            field(&mut hash, &groups.to_le_bytes());
+                            for share in shares {
+                                field(&mut hash, &share.to_le_bytes());
+                            }
+                            field(&mut hash, &[*take]);
+                            field(&mut hash, &unit_bytes.to_le_bytes());
+                        }
+                        Xform::SwapHalves { half_bytes } => {
+                            field(&mut hash, b"swap-halves");
+                            field(&mut hash, &half_bytes.to_le_bytes());
+                        }
                     }
-                    field(&mut hash, &[*take]);
-                    field(&mut hash, &unit_bytes.to_le_bytes());
                 }
             }
         }
