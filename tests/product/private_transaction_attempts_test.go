@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -133,6 +134,38 @@ func TestPrivateTransactionPauseFencesAttemptBeforeResume(t *testing.T) {
 		!bytes.Equal(peer.offers[0].InvocationSpecDigest, peer.offers[1].InvocationSpecDigest) ||
 		!bytes.Equal(peer.offers[0].InvocationSpecCanonicalBytes, peer.offers[1].InvocationSpecCanonicalBytes) {
 		t.Fatal("resumption did not offer exactly the original executable intent as attempt two")
+	}
+}
+
+// An older peer ignores an unknown protobuf bool and disposes state at outcome
+// acknowledgment. Refuse retained work before preparing packages or offering an
+// attempt, instead of discovering that incompatibility after expensive work.
+func TestPrivateTransactionRefusesPeerWithoutRetention(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	pod := &fakePod{controlKey: public, serve: true, jobReady: true, wireMinor: 38}
+	connection, _ := startFakePod(t, t.TempDir(), pod)
+	o := hostOwner(t, "private-transaction-old-peer", rentalWiring(connection, private))
+	sub := orchestrator.Submission{
+		IdemKey: "private-old-peer", Package: "cozy/h3-package", Entrypoint: "prepare",
+		PlanID: "sha256:" + fmt.Sprintf("%064x", 17), Release: "1.0.7", Kind: "job", Org: "local",
+		Payload: []byte(`{}`), Worker: podRental, Rental: true, RentalRequired: true, RetainWork: true,
+	}
+	requestID, _, problem := o.c.Submit(sub)
+	fatal(t, problem)
+	waitUntil(t, "typed refusal of retention-incompatible worker", func() bool {
+		return strings.Contains(strings.Join(o.c.Events(), "\n"), "request.retention_unsupported")
+	})
+	attempts, problem := o.store.Attempts(requestID)
+	fatal(t, problem)
+	if len(attempts) != 0 {
+		t.Fatalf("retention-incompatible peer was granted attempts: %+v", attempts)
+	}
+	pod.mu.Lock()
+	defer pod.mu.Unlock()
+	if len(pod.offers) != 0 || len(pod.prepares) != 0 || len(pod.localPrepares) != 0 {
+		t.Fatalf("retention refusal happened after worker preparation/dispatch: offers=%d published-prepares=%d private-prepares=%d",
+			len(pod.offers), len(pod.prepares), len(pod.localPrepares))
 	}
 }
 
