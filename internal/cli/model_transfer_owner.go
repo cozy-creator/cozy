@@ -343,7 +343,13 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	// carries the cursor, so it asks for the objects whose bytes are about to move and asks
 	// again once the hub's own declared life is half spent. Nothing about the publication
 	// protocol changed -- the hub always re-minted for a still-claimed object.
-	if opened.Publication.State == "open" {
+	verified := true
+	for _, object := range opened.Publication.Objects {
+		verified = verified && object.State == "accepted"
+	}
+	// Hub custody of the complete exact closure needs no worker byte transfer.
+	// Finalize below still verifies and retains the checkpoint normally.
+	if opened.Publication.State == "open" && !verified {
 		if problem := mover(ctx, weights,
 			func(ctx context.Context, objectIDs []string) (orchestrator.WeightsGrantMint, *exit.Error) {
 				return mintWeightsGrants(ctx, publicationClient, ref, operation, intent, objectIDs)
