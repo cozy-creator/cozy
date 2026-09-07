@@ -472,6 +472,25 @@ func (m *managedRentals) release(id string) (string, *exit.Error) {
 	return m.observeLocked(*row)
 }
 
+// Explicit transaction abandonment is not an idle observation. A manually held
+// rental stays reserved; the existing releaseLocked guard checks every other
+// owner before any managed rental reaches the provider DELETE.
+func (m *managedRentals) releaseRetained(id string) (string, *exit.Error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, problem := m.store.RentalRow(id)
+	if problem != nil {
+		return "", problem
+	}
+	if row == nil || row.ManagedRequestID == "" {
+		return m.lineLocked()
+	}
+	if strings.TrimRight(row.Hub, "/") != client(m.ctx).Base() {
+		return "", exit.Named(exit.Conflict, "rental.hub_mismatch", "retained rental belongs to a different Tensorhub authority")
+	}
+	return m.releaseLocked(id)
+}
+
 // releaseOrphaned resumes the policy after a daemon restart: every rental is reconciled
 // with the hub and then observed as the sweep observes it, so a job's rental releases
 // now and a warm one keeps only the unspent remainder of its grace.
