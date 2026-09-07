@@ -46,19 +46,7 @@ func handleRunWatch(ctx *Context) *exit.Error {
 }
 
 func watchJob(ctx *Context, client *localclient.Client, state api.JobState) *exit.Error {
-	began := recordedRunStart(state.CreatedAt)
-	terminal, detached, problem := watchRunStream(ctx, client, state.JobID, began)
-	if problem != nil {
-		return problem
-	}
-	state, problem = client.Job(state.JobID)
-	if problem != nil {
-		return problem
-	}
-	if detached && !settled(state.Status) {
-		return renderSubmittedJob(ctx, state, false)
-	}
-	return renderJobTerminal(ctx, state, terminal, began)
+	return followJob(ctx, client, state.JobID, recordedRunStart(state.CreatedAt))
 }
 
 func watchInvocation(ctx *Context, client *localclient.Client, id string) *exit.Error {
