@@ -226,6 +226,9 @@ func (c *Orchestrator) ConvergeRemoteJob(instanceID string, spec WorkerLaunchSpe
 		s = c.sessions[w.bootID]
 		w.spec = spec
 		w.planIDs = []string{spec.Placement.Jobs[0].DescriptorID}
+		if parent := spec.Placement.Jobs[0].OrchestrationParent; parent != nil {
+			w.planIDs = append(w.planIDs, parent.DescriptorID)
+		}
 		w.desiredRefusal = nil
 	}
 	c.mu.Unlock()

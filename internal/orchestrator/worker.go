@@ -476,6 +476,7 @@ type worker struct {
 	serving           pb.ServingState         // axis 2: what it will take
 	executorEpoch     uint64                  // THIS placement's executor epoch
 	dispatchable      map[string]bool         // dispatchable_plan_ids
+	jobReady          map[string]bool         // prepared job executors, including occupied slots
 	materializable    map[string]bool         // DISJOINT from dispatchable
 	heldSetDigest     []byte                  // parent set the placement actually holds
 	fallbackSetDigest []byte                  // predecessor set kept for restore; empty = replacement PAUSED
@@ -1085,6 +1086,9 @@ func hostsPlans(w *worker, p DesiredPlacement) bool {
 	}
 	for _, j := range p.Jobs {
 		want[j.DescriptorID] = true
+		if j.OrchestrationParent != nil {
+			want[j.OrchestrationParent.DescriptorID] = true
+		}
 	}
 	if w.spec.Connection != nil && !w.spec.IsJob() {
 		for id := range want {
@@ -1564,6 +1568,12 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 		c.mu.Lock()
 		w := c.workers[instanceID]
 		ok := w != nil && !w.exited && w.dispatchableFor(planID)
+		if w != nil && w.spec.IsJob() {
+			// Jobs have no serving axis or placement convergence. An occupied
+			// executor is ready too: its accepted attempt must not be killed by
+			// the preparation waiter racing with dispatch.
+			ok = !w.exited && w.acceptedRevision >= w.revision && w.jobReady[planID]
+		}
 		gone := w == nil || w.exited
 		logPath, fault, code := "", "", 0
 		workerFaulted := false
