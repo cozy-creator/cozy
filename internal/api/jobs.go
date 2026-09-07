@@ -547,6 +547,7 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 // job has — its publication and its running bill.
 type JobState struct {
 	RetainWork bool   `json:"retain_work,omitempty"`
+	Retaining  bool   `json:"retaining,omitempty"`
 	RetryOf    string `json:"retry_of,omitempty"`
 	ReuseScope string `json:"reuse_scope,omitempty"`
 	Number     int64  `json:"number"`
@@ -686,6 +687,7 @@ func (s *Server) jobRow(w http.ResponseWriter, r *http.Request) (records.Request
 func (s *Server) jobStateOf(row records.Request) JobState {
 	state := JobState{
 		RetainWork: row.RetainWork,
+		Retaining:  row.RetainWork && (!records.Settled(row.State) || (row.State == "succeeded" && row.RetainsLocalOutputs())),
 		RetryOf:    row.RetryOf, ReuseScope: row.ReuseScope,
 		Number: row.Number, JobID: row.ID, Status: contractStatus(row.State), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
@@ -936,7 +938,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	actor := requestActor(r)
-	if row.RetainWork && row.State != "finalizing" && !records.Settled(row.State) {
+	if row.RetainWork && row.State != "finalizing" && (!records.Settled(row.State) || (row.State == "succeeded" && row.RetainsLocalOutputs())) {
 		if e := s.orchestrator.CancelRetainedRequest(row.ID, actor); e != nil {
 			s.refuseTyped(w, r, e)
 			return

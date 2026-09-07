@@ -50,16 +50,6 @@ func resolveJobModelInputs(ctx *Context, target Target, job *launch.Entrypoint,
 		}
 		return "", nil, models, problem
 	}
-	if target.InstallID != "" {
-		row, problem := exactInvocationInstall(ctx, target)
-		if problem != nil {
-			return "", nil, nil, problem
-		}
-		if row.SourceKind == "local" {
-			return "", nil, nil, exit.Named(exit.Unavailable, "editable_model_override_unsupported",
-				"publish the package before overriding its model inputs")
-		}
-	}
 	selected, problem := invocationModelSpecs(ctx, target, job, overrides)
 	if problem != nil {
 		return "", nil, nil, problem
@@ -95,9 +85,6 @@ func resolveJobModelInputs(ctx *Context, target Target, job *launch.Entrypoint,
 	}
 	if problem := modeltransfer.ValidateProducer(target.Package+"/"+target.Function, job, profiles); problem != nil {
 		return "", nil, nil, problem
-	}
-	if ctx.Inv.Value("--publish-to") == "" {
-		return "", nil, nil, exit.Usagef("a source-backed weight job requires --publish-to org/model")
 	}
 	return source, profiles, nil, nil
 }

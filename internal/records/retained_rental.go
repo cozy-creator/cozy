@@ -7,7 +7,8 @@ import (
 )
 
 func retainedRentalIDs(tx *sql.Tx, rental string) ([]string, *exit.Error) {
-	rows, err := tx.Query(`SELECT id FROM requests WHERE worker=? AND retain_work=1 AND state IN (`+activeRequestStates+`) ORDER BY id`, rental)
+	rows, err := tx.Query(`SELECT r.id FROM requests r LEFT JOIN request_model_transfers t ON t.request_id=r.id WHERE r.worker=? AND r.retain_work=1
+		AND (r.state IN (`+activeRequestStates+`) OR (r.state='succeeded' AND r.weights_outputs!='[]' AND COALESCE(json_extract(t.intent,'$.destination'),'')='')) ORDER BY r.id`, rental)
 	if err != nil {
 		return nil, exit.Internalf("cannot read retained rental work: %s", err)
 	}

@@ -18,6 +18,9 @@ func (o *modelTransferOwner) AbandonModelTransferPublications(ctx context.Contex
 	if problem != nil {
 		return problem
 	}
+	if transfer != nil && transfer.Destination == "" {
+		return nil
+	}
 	if request == nil || transfer == nil || (transfer.State != "canceling" && transfer.State != "canceled") {
 		return exit.New(exit.Conflict, "publication cleanup requires explicit cancellation")
 	}

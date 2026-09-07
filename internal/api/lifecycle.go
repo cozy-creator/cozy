@@ -234,7 +234,7 @@ func (s *Server) newDownRentals(rentals []LifecycleIdentity) bool {
 // boundaries. A terminal awaiting acknowledgement is already on its way to settlement;
 // it remains in Active and makes the caller retry rather than receiving a second verdict.
 func (s *Server) cancelForDown(row records.Request) (bool, *exit.Error) {
-	if row.RetainWork && row.IsJob() && !records.Settled(row.State) && row.State != "finalizing" {
+	if row.RetainWork && row.IsJob() && (!records.Settled(row.State) || (row.State == "succeeded" && row.RetainsLocalOutputs())) && row.State != "finalizing" {
 		return row.State != "canceling" && row.State != "releasing", s.orchestrator.CancelRetainedRequest(row.ID, "cozy down --all")
 	}
 	attempts, problem := s.store.Attempts(row.ID)
