@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -78,12 +79,19 @@ func (r RuntimeCLI) call(out any, verb ...string) *exit.Error {
 }
 
 func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *exit.Error {
+	return r.callInputContext(ctx, nil, out, verb...)
+}
+
+func (r RuntimeCLI) callInputContext(ctx context.Context, input []byte, out any, verb ...string) *exit.Error {
 	args := []string{"--json", "--dir", r.Dir}
 	if r.PackageInterface != "" {
 		args = append(args, "--package-interface", r.PackageInterface)
 	}
 	args = append(args, verb...)
 	cmd := exec.CommandContext(ctx, r.Bin, args...)
+	if input != nil {
+		cmd.Stdin = bytes.NewReader(input)
+	}
 	if ctx.Done() != nil {
 		// CommandContext kills the direct child when the CALLER's context ends. WaitDelay
 		// also closes a pipe a misbehaving descendant retained, so the cancellation the
