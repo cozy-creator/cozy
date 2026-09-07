@@ -370,12 +370,15 @@ func (c *RunWatchCmd) Run(r *Runtime) error {
 // RentalCmd has no default subcommand: bare `cozy rental` prints its verbs, the way
 // bare `cozy package` and `cozy model` do.
 type RentalCmd struct {
-	List RentalListCmd `cmd:"" help:"List rented machines, live on a terminal."`
-	New  RentalNewCmd  `cmd:"" help:"Start a private rental."`
-	End  RentalEndCmd  `cmd:"" help:"End a private rental and stop billing."`
+	SSHInfo RentalSSHInfoCmd `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
+	List    RentalListCmd    `cmd:"" help:"List rented machines, live on a terminal."`
+	New     RentalNewCmd     `cmd:"" help:"Start a private rental."`
+	End     RentalEndCmd     `cmd:"" help:"End a private rental and stop billing."`
 }
 
 type RentalNewCmd struct {
+	Development    bool     `help:"Rent an explicit developer worker for SSH/SFTP wheel updates."`
+	SSHPublicKey   string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
 	SKU            string   `arg:"" optional:"" name:"gpu" help:"Cozy GPU SKU, such as h200."`
 	Models         []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
 	IdempotencyKey string   `help:"Stable paid-operation identity."`
@@ -383,8 +386,8 @@ type RentalNewCmd struct {
 }
 
 func (c *RentalNewCmd) Run(r *Runtime) error {
-	return r.call(handleRent, []string{c.SKU}, nil, values(
-		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models), false)
+	return r.call(handleRent, []string{c.SKU}, bools("--development", c.Development), values(
+		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey), false)
 }
 
 type RentalEndCmd struct {
@@ -451,4 +454,13 @@ type DownCmd struct {
 
 func (c *DownCmd) Run(r *Runtime) error {
 	return r.call(handleDown, nil, bools("--all", c.All), nil, false)
+}
+
+// SSHInfo reads current provider mapping from Hub; it stores no endpoint locally.
+type RentalSSHInfoCmd struct {
+	Rental string `arg:"" name:"rental" help:"Attached machine name or rental id."`
+}
+
+func (c *RentalSSHInfoCmd) Run(r *Runtime) error {
+	return r.call(handleRentalSSHInfo, []string{c.Rental}, nil, nil, false)
 }
