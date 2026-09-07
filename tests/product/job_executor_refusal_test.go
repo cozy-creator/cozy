@@ -74,8 +74,19 @@ func TestJobExecutorRefusalSettlesBeforeAttempt(t *testing.T) {
 			if row.Ordinal != wantOffers || row.RetainWork != arm.retained || offers.Load() != wantOffers {
 				t.Fatal("executor refusal invented an attempt or lost retained ownership")
 			}
-			if !arm.ready && !strings.Contains(tail(o.root+"/orchestrator.log"), "delegated cgroup") {
-				t.Fatal("executor refusal did not explain the required host setup")
+			if !arm.ready {
+				events, problem := o.store.EventsAfter(id, 0, 100)
+				fatal(t, problem)
+				found := false
+				for _, event := range events {
+					message, _ := event.Payload["error"].(string)
+					if event.Payload["error_type"] == "job_executor_absent" && strings.Contains(message, "delegated cgroup") {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatal("executor refusal did not persist the required host setup in its lifecycle event")
+				}
 			}
 		})
 	}
