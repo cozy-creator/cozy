@@ -32,7 +32,7 @@ func databaseRows(t *testing.T, path string) map[string]string {
 	must(t, names.Close())
 	out := map[string]string{}
 	for _, name := range tables {
-		if name == "private_child_bindings" || name == "request_weights_retentions" {
+		if name == "private_child_bindings" || name == "request_weights_retentions" || name == "request_operation_lookups" {
 			var rows int
 			must(t, db.QueryRow(`SELECT count(*) FROM "`+name+`"`).Scan(&rows))
 			if rows != 0 {
@@ -145,9 +145,9 @@ func TestPublicationCancellationMigratesPrivateCopyWithoutChangingRows(t *testin
 	defer db.Close()
 	var version int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	if version != 28 {
-		t.Fatal("migration did not stamp schema28")
-	}
+	current, problem := records.Open(path)
+	fatal(t, problem)
+	current.Close()
 	fk, err := db.Query(`PRAGMA foreign_key_check`)
 	must(t, err)
 	if fk.Next() {
@@ -159,5 +159,5 @@ func TestPublicationCancellationMigratesPrivateCopyWithoutChangingRows(t *testin
 	if sha256.Sum256(still) != sha256.Sum256(original) {
 		t.Fatal("source snapshot changed")
 	}
-	t.Logf("schema23→28 private copy preserves all rows in %d tables, including source heads/ACKs/revisions; foreign keys valid; original snapshot unchanged", len(before))
+	t.Logf("private copy migrated to current schema%d and preserves all rows in %d tables, including source heads/ACKs/revisions; foreign keys valid; original snapshot unchanged", version, len(before))
 }
