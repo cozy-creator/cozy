@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"database/sql"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,6 +22,63 @@ func offerChildParent(t *testing.T, store *records.Store, parent records.Request
 	current, problem := store.RequestRow(parent.ID)
 	fatal(t, problem)
 	return *current
+}
+
+func TestPrivateChildSchemaUpgradePreservesPriorOwnership(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "creator.sqlite")
+	store, problem := records.Open(path)
+	fatal(t, problem)
+	prior := recordPrivateTransaction(t, store, "schema27", "")
+	_, problem = store.RequestPause(prior.ID, "before upgrade")
+	fatal(t, problem)
+	_, problem = store.CompleteRequestPause(prior.ID)
+	fatal(t, problem)
+	before, problem := store.RequestRow(prior.ID)
+	fatal(t, problem)
+	store.Close()
+	db, err := sql.Open("sqlite", path)
+	must(t, err)
+	var ddl string
+	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='requests'`).Scan(&ddl))
+	_, err = db.Exec(`PRAGMA foreign_keys=OFF`)
+	must(t, err)
+	_, err = db.Exec(`PRAGMA legacy_alter_table=ON`)
+	must(t, err)
+	_, err = db.Exec(`ALTER TABLE requests RENAME TO prior28`)
+	must(t, err)
+	_, err = db.Exec(strings.Replace(ddl, ",\n  child_artifacts INTEGER NOT NULL DEFAULT 0 CHECK(child_artifacts IN (0,1))", "", 1))
+	must(t, err)
+	rows, err := db.Query(`PRAGMA table_info(requests)`)
+	must(t, err)
+	var columns []string
+	for rows.Next() {
+		var index, notnull, pk int
+		var name, kind string
+		var fallback any
+		must(t, rows.Scan(&index, &name, &kind, &notnull, &fallback, &pk))
+		columns = append(columns, name)
+	}
+	must(t, rows.Close())
+	joined := strings.Join(columns, ",")
+	_, err = db.Exec(`INSERT INTO requests(` + joined + `) SELECT ` + joined + ` FROM prior28`)
+	must(t, err)
+	_, err = db.Exec(`DROP TABLE prior28`)
+	must(t, err)
+	_, err = db.Exec(`CREATE UNIQUE INDEX requests_parent_call ON requests(parent_request_id,parent_call_index) WHERE parent_request_id!=''`)
+	must(t, err)
+	_, err = db.Exec(`DROP TABLE request_weights_retentions`)
+	must(t, err)
+	_, err = db.Exec(`PRAGMA user_version=27`)
+	must(t, err)
+	db.Close()
+	store, problem = records.OpenForDaemon(path, "")
+	fatal(t, problem)
+	defer store.Close()
+	after, problem := store.RequestRow(prior.ID)
+	fatal(t, problem)
+	if after.State != "paused" || !after.RetainWork || after.ReuseScope != before.ReuseScope || after.ControlRevision != before.ControlRevision || after.ParentCallIndex != -1 {
+		t.Fatalf("migration changed retained ownership: before=%+v after=%+v", before, after)
+	}
 }
 
 func TestPrivateParentRetainsExactOrchestrationContract(t *testing.T) {

@@ -205,6 +205,16 @@ func (c *Orchestrator) watchChildCall(s *session, call *pb.ChildCallRequest, id 
 						problem = c.opt.Store.CompleteReusedChild(row.ID)
 					}
 				}
+				if problem != nil && problem.Code == exit.Unavailable {
+					select {
+					case <-s.ctx.Done():
+						return
+					case <-c.done:
+						return
+					case <-ticker.C:
+					}
+					continue
+				}
 				state := pb.ChildCallState_CHILD_CALL_STATE_SUCCEEDED
 				if problem != nil {
 					state = pb.ChildCallState_CHILD_CALL_STATE_FAILED

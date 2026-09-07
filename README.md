@@ -245,9 +245,30 @@ work, releasing only resources with no other owner. Retained rentals continue bi
 An unchanged deterministic failure is not automatically retried. `--await` returns when a
 transaction blocks or pauses, and the ordinary run view explains the stopped state.
 
-Source/weight recovery does not make every Python function automatically resumable. A
-computation must commit supported output/checkpoint boundaries; managed package-call
-composition is tracked separately while its broker is being integrated.
+An invocable dependency exposes an ordinary typed Python call. Its implementation is
+captured separately; the parent imports a generated interface containing signatures and
+result types. Calling it creates an ordinary managed child job. A reusable computation
+opts in with `@invocable(reusable=True)` and registers through `app.job(function)`.
+Arbitrary helper functions and external effects do not become cached operations.
+
+On an edited retry, a reusable child can acquire an earlier successful result when its
+exact implementation closure, entrypoint, canonical inputs, resolved model checkpoints,
+and measured numerical environment match. This works independently of the parent's
+script digest or the call's position. Native model results travel as `ModelArtifact`
+references; reuse acquires independent native custody before the new result is visible.
+The reference names its original producer and receipt without copying tensor bytes.
+
+The implementation boundary is a package and its dependencies, not an individual Python
+function body. Editing B inside a package that also implements A invalidates that package's
+reusable calls. Keep expensive independent operations in independently captured packages.
+Source ingestion already has its own exact source/profile identity, so changing an H3
+producer does not invalidate its retained source conversion. No system can infer that
+arbitrary Python side effects are reversible or safe to repeat.
+
+Scalar compositions can run locally. Weight-producing child jobs require `--rental-only`
+and the private worker's native Host custody. A completed result stored only on that
+machine continues holding the rental until its owner releases it; completion alone does
+not make those bytes remotely durable. Parent and child attempts retain separate history.
 
 Serving entrypoints and bounded jobs use the same command. Cozy reads the installed package interface
 to determine the callable lifecycle:

@@ -275,6 +275,9 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 		}
 	}
 	if sourceVersion < 28 {
+		if _, err := tx.Exec(childRequestIndex); err != nil {
+			return exit.Internalf("cannot restore child call admission index in %s: %s", path, err)
+		}
 		if _, err := tx.Exec(weightsRetentionsDDL); err != nil {
 			return exit.Internalf("cannot create artifact retention ownership in %s: %s", path, err)
 		}

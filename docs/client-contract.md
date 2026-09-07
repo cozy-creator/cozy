@@ -331,6 +331,49 @@ daemon restart. A failed request from an older build is not silently resurrected
 worker and drain in submission order, while the retry projection over neutral outcomes
 spends a durable budget that the settlement names when it is exhausted.
 
+### Private transactions and child calls
+
+`retain_work:true` makes an ordinary private job retain its exact inputs, implementation
+and native intermediate work across failed or paused attempts. `pause` durably fences
+admission and reaches `paused` only after its writers and child writers stop. `resume`
+continues the same captured request. A deterministic `blocked` failure requires a
+corrected new request with `retry_of`, which accepts the prior public run number or ID.
+The new request retains the same physical store and a bounded reuse scope; the old code,
+payload, and attempt outcomes stay immutable. Cancellation releases only the caller's
+ownership. Explicit rental release also abandons its dependent transactions.
+
+Private source/weights checkpoints stay on that worker; they are not implicitly uploaded
+to Tensorhub. `--publish-to` remains an explicit final-output publication choice. A job
+document's `retaining` boolean reports continuing resource custody, including successful
+private model outputs. Such a completed job can be explicitly canceled to release custody
+without rewriting its successful execution outcome.
+
+Child calls use the current parent attempt's authenticated worker stream. The owner joins
+the requested interface/module/export to an immutable dependency captured in that parent's
+install, then creates an ordinary job. The child status includes `parent_request_id`,
+`parent_call_index`, and, for an acquired previous result, `reused_from`. A reused child has
+no invented execution attempt. Scalar results can complete immediately; model results stay
+`finalizing` until native independent retention is confirmed.
+
+Cross-request reuse requires an explicit `reusable:true` callable declaration, identical
+target implementation/dependencies, typed inputs/model references, and the current
+privileged numerical environment measurement. An unavailable measurement disables reuse
+while allowing execution. Exact same-parent call replay continues the original recorded
+child. Known egress/secret capabilities and non-reusable child effects cannot enter a
+reusable operation. This is an author contract, not a proof of arbitrary Python purity.
+
+Model artifacts are closed typed references with `producer_request_id`, `output_slot`,
+`manifest:{digest,length}`, and `tensorfs_receipt_digest`. The last field hashes the native
+TensorFS receipt, not its protocol envelope. Creator verifies provenance and scope, then
+binds the same manifest through the existing ModelRef input contract. Owner-selected native
+retention IDs remain outside package payloads. Only schema-declared model artifact result
+fields acquire custody; matching JSON field spellings grant nothing.
+
+Reuse granularity is the exact child package closure and entrypoint. Changing a helper
+within that closure invalidates its reusable operations; the owner never guesses a
+function-only dependency hash. Native source acquisition remains independently keyed by
+the selected source and profile, so a producer implementation edit can reuse that work.
+
 ## 8. Local host security posture
 
 A loopback bind is not a boundary — Ollama's DNS-rebinding CVE is the standing proof.

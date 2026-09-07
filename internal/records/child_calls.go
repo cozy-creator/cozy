@@ -147,7 +147,17 @@ func (s *Store) CompleteReusedChild(id string) *exit.Error {
 		return exit.Internalf("cannot complete reused child result: %s", err)
 	}
 	if n, _ := result.RowsAffected(); n == 0 {
-		return nil
+		var state string
+		if err := tx.QueryRow(`SELECT state FROM requests WHERE id=?`, id).Scan(&state); err != nil {
+			return exit.Internalf("cannot read reused result completion: %s", err)
+		}
+		if state == "succeeded" {
+			return nil
+		}
+		if state == "finalizing" {
+			return exit.Named(exit.Unavailable, "child.result_custody_pending", "the reused result still awaits independent artifact custody")
+		}
+		return exit.Named(exit.Canceled, "child.result_stopped", "the reused result was stopped before publication")
 	}
 	if err := appendEventTx(tx, id, "request.completed", 0, map[string]any{"status": "SUCCEEDED", "reused": true}); err != nil {
 		return exit.Internalf("cannot journal reused child result: %s", err)
