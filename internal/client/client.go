@@ -250,6 +250,12 @@ func (c *Client) EnsureRental(rentalID string) (StartResult, *exit.Error) {
 	return res, e
 }
 
+func (c *Client) PruneRental(rentalID string) (api.RentalPruneResult, *exit.Error) {
+	var result api.RentalPruneResult
+	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/prune", map[string]any{}, &result)
+	return result, problem
+}
+
 // DetachRental waits until the daemon no longer holds this rental's worker-control slot.
 // The result is false when the slot was already absent.
 func (c *Client) DetachRental(rentalID string) (bool, *exit.Error) {

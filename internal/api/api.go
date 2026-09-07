@@ -194,6 +194,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"GET /v1/local/attempts/{attempt_key}/triage": s.attemptTriage,
 		"POST /v1/local/rentals/{rental_id}/claim":    s.claimRental,
 		"DELETE /v1/local/rentals/{rental_id}/claim":  s.detachRental,
+		"POST /v1/local/rentals/{rental_id}/prune":    s.pruneRental,
 		"POST /v1/local/daemon/unload":                s.unload,
 		"POST /v1/local/daemon/down":                  s.downDaemon,
 		"POST /v1/local/jobs":                         s.submitJob,

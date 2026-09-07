@@ -262,6 +262,7 @@ URLs but remain local-scope rows in the same guarded route table.
 | `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | one attempt's kept triage bundle from its own row; 404 when none was kept |
 | `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the daemon to one generic empty private worker and directly claim WorkerControl |
 | `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | detach that worker and wait for its control loop before rental credentials are removed |
+| `POST /v1/local/rentals/{rental_id}/prune` | local | yes | prune unused operation cache roots on the claimed Host; report `removed_entries`, `reclaimed_bytes`, and whether native GC is still `store_busy` |
 | `POST /v1/local/daemon/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
 | `POST /v1/local/daemon/down` | local | yes | safe down fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
@@ -338,8 +339,10 @@ and native intermediate work across failed or paused attempts. `pause` durably f
 admission and reaches `paused` only after its writers and child writers stop. `resume`
 continues the same captured request. A deterministic `blocked` failure requires a
 corrected new request with `retry_of`, which accepts the prior public run number or ID.
-The new request retains the same physical store and a bounded reuse scope; the old code,
-payload, and attempt outcomes stay immutable. Cancellation releases only the caller's
+The new request selects the same physical store; run lineage scopes artifact grants and
+history, while completed computation is cached by the Host independently of run IDs.
+Fresh unrelated runs on that workspace can reuse compatible completed operations. The old
+payload and attempt outcomes stay immutable. Cancellation releases only the caller's
 ownership. Explicit rental release also abandons its dependent transactions.
 
 Private source/weights checkpoints stay on that worker; they are not implicitly uploaded
@@ -361,6 +364,20 @@ privileged numerical environment measurement. An unavailable measurement disable
 while allowing execution. Exact same-parent call replay continues the original recorded
 child. Known egress/secret capabilities and non-reusable child effects cannot enter a
 reusable operation. This is an author contract, not a proof of arbitrary Python purity.
+
+The Host records cache results from verified successful terminals before outcome ACKs.
+Lookup uses the computation key and an already-recorded consumer request; a HIT acquires
+independent native holds before returning. Creator persists a pending lookup obligation
+before the RPC, so pause/cancel and owner restart reconcile even a lost response. Once the
+request owns a result, resuming it does not depend on the cache entry still existing.
+Local scalar execution currently computes normally; no second local cache authority is
+inferred from request history.
+
+`cozy rental prune <rental>` removes unused cache roots and attempts native garbage
+collection on that same Host. Request-owned results and unresolved lookup recipients are
+preserved. A busy Store reports deferred byte collection; repeating prune can collect
+those bytes even when no further cache entries are removed. Cache roots do not count as
+unfinished rental work, and pruning neither ends the rental nor deletes run history.
 
 Model artifacts are closed typed references with `producer_request_id`, `output_slot`,
 `manifest:{digest,length}`, and `tensorfs_receipt_digest`. The last field hashes the native

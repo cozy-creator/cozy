@@ -257,4 +257,33 @@ func TestPrivateChildActualHostArtifacts(t *testing.T) {
 	restartHost()
 	checkTensor(children[0], 7)
 	checkTensor(thirdChildren[1], 15)
+	var removed uint32
+	var reclaimed uint64
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		status, out = runCozyPath(t, layout.Root, path, "rental", "prune", "child-host", "--json")
+		if status != 0 {
+			t.Fatalf("private cache pruning failed [%d]: %s", status, out)
+		}
+		var result struct {
+			Removed   uint32 `json:"removed_entries"`
+			Reclaimed uint64 `json:"reclaimed_bytes"`
+			Busy      bool   `json:"store_busy"`
+		}
+		must(t, json.Unmarshal([]byte(out), &result))
+		removed += result.Removed
+		reclaimed += result.Reclaimed
+		if !result.Busy {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cache roots pruned but native byte collection remained busy")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if removed == 0 || reclaimed == 0 {
+		t.Fatalf("unused B candidate was not reclaimed: entries=%d bytes=%d", removed, reclaimed)
+	}
+	checkTensor(children[0], 7)
+	checkTensor(thirdChildren[1], 15)
+	t.Logf("pruned obsolete cache results: entries=%d reclaimed_bytes=%d; fresh run tensors remain readable", removed, reclaimed)
 }

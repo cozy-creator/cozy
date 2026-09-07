@@ -393,6 +393,7 @@ type RentalCmd struct {
 	List    RentalListCmd    `cmd:"" help:"List rented machines, live on a terminal."`
 	New     RentalNewCmd     `cmd:"" help:"Start a private rental."`
 	End     RentalEndCmd     `cmd:"" help:"End a private rental and stop billing."`
+	Prune   RentalPruneCmd   `cmd:"" help:"Free unused cached operation results on a private rental."`
 }
 
 type RentalNewCmd struct {
@@ -402,6 +403,14 @@ type RentalNewCmd struct {
 	Models         []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
 	IdempotencyKey string   `help:"Stable paid-operation identity."`
 	Timeout        string   `help:"Caller wait deadline; does not release the rental."`
+}
+
+type RentalPruneCmd struct {
+	ID string `arg:"" name:"rental" help:"Rental machine name or id."`
+}
+
+func (c *RentalPruneCmd) Run(r *Runtime) error {
+	return r.call(handleRentalPrune, []string{c.ID}, nil, nil, true)
 }
 
 func (c *RentalNewCmd) Run(r *Runtime) error {
