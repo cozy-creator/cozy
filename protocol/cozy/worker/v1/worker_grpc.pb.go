@@ -361,6 +361,7 @@ const (
 	RuntimePreparation_RetainDerivedResult_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/RetainDerivedResult"
 	RuntimePreparation_ReleaseDerivedRetention_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/ReleaseDerivedRetention"
 	RuntimePreparation_ReleaseDerivedResult_FullMethodName         = "/cozy.worker.v1.RuntimePreparation/ReleaseDerivedResult"
+	RuntimePreparation_CollectStoreGarbage_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/CollectStoreGarbage"
 	RuntimePreparation_ValidateWeightsCheckpoint_FullMethodName    = "/cozy.worker.v1.RuntimePreparation/ValidateWeightsCheckpoint"
 	RuntimePreparation_CheckpointPage_FullMethodName               = "/cozy.worker.v1.RuntimePreparation/CheckpointPage"
 	RuntimePreparation_CheckpointTransfer_FullMethodName           = "/cozy.worker.v1.RuntimePreparation/CheckpointTransfer"
@@ -389,6 +390,7 @@ type RuntimePreparationClient interface {
 	RetainDerivedResult(ctx context.Context, in *DerivedRetentionRequest, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
 	ReleaseDerivedRetention(ctx context.Context, in *DerivedRetentionRequest, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
 	ReleaseDerivedResult(ctx context.Context, in *DerivedResultReleaseRequest, opts ...grpc.CallOption) (*DerivedResultReleaseResult, error)
+	CollectStoreGarbage(ctx context.Context, in *CollectStoreGarbageRequest, opts ...grpc.CallOption) (*CollectStoreGarbageResult, error)
 	ValidateWeightsCheckpoint(ctx context.Context, in *ValidateWeightsCheckpointRequest, opts ...grpc.CallOption) (*ValidateWeightsCheckpointResult, error)
 	CheckpointPage(ctx context.Context, in *CheckpointPageRequest, opts ...grpc.CallOption) (*CheckpointPageResult, error)
 	CheckpointTransfer(ctx context.Context, in *CheckpointTransferRequest, opts ...grpc.CallOption) (*CheckpointTransferStatus, error)
@@ -494,6 +496,16 @@ func (c *runtimePreparationClient) ReleaseDerivedResult(ctx context.Context, in 
 	return out, nil
 }
 
+func (c *runtimePreparationClient) CollectStoreGarbage(ctx context.Context, in *CollectStoreGarbageRequest, opts ...grpc.CallOption) (*CollectStoreGarbageResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CollectStoreGarbageResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_CollectStoreGarbage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *runtimePreparationClient) ValidateWeightsCheckpoint(ctx context.Context, in *ValidateWeightsCheckpointRequest, opts ...grpc.CallOption) (*ValidateWeightsCheckpointResult, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ValidateWeightsCheckpointResult)
@@ -565,6 +577,7 @@ type RuntimePreparationServer interface {
 	RetainDerivedResult(context.Context, *DerivedRetentionRequest) (*DerivedRetentionResult, error)
 	ReleaseDerivedRetention(context.Context, *DerivedRetentionRequest) (*DerivedRetentionResult, error)
 	ReleaseDerivedResult(context.Context, *DerivedResultReleaseRequest) (*DerivedResultReleaseResult, error)
+	CollectStoreGarbage(context.Context, *CollectStoreGarbageRequest) (*CollectStoreGarbageResult, error)
 	ValidateWeightsCheckpoint(context.Context, *ValidateWeightsCheckpointRequest) (*ValidateWeightsCheckpointResult, error)
 	CheckpointPage(context.Context, *CheckpointPageRequest) (*CheckpointPageResult, error)
 	CheckpointTransfer(context.Context, *CheckpointTransferRequest) (*CheckpointTransferStatus, error)
@@ -606,6 +619,9 @@ func (UnimplementedRuntimePreparationServer) ReleaseDerivedRetention(context.Con
 }
 func (UnimplementedRuntimePreparationServer) ReleaseDerivedResult(context.Context, *DerivedResultReleaseRequest) (*DerivedResultReleaseResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReleaseDerivedResult not implemented")
+}
+func (UnimplementedRuntimePreparationServer) CollectStoreGarbage(context.Context, *CollectStoreGarbageRequest) (*CollectStoreGarbageResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method CollectStoreGarbage not implemented")
 }
 func (UnimplementedRuntimePreparationServer) ValidateWeightsCheckpoint(context.Context, *ValidateWeightsCheckpointRequest) (*ValidateWeightsCheckpointResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ValidateWeightsCheckpoint not implemented")
@@ -805,6 +821,24 @@ func _RuntimePreparation_ReleaseDerivedResult_Handler(srv interface{}, ctx conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RuntimePreparation_CollectStoreGarbage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CollectStoreGarbageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).CollectStoreGarbage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_CollectStoreGarbage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).CollectStoreGarbage(ctx, req.(*CollectStoreGarbageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _RuntimePreparation_ValidateWeightsCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ValidateWeightsCheckpointRequest)
 	if err := dec(in); err != nil {
@@ -937,6 +971,10 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReleaseDerivedResult",
 			Handler:    _RuntimePreparation_ReleaseDerivedResult_Handler,
+		},
+		{
+			MethodName: "CollectStoreGarbage",
+			Handler:    _RuntimePreparation_CollectStoreGarbage_Handler,
 		},
 		{
 			MethodName: "ValidateWeightsCheckpoint",
@@ -1133,6 +1171,7 @@ const (
 	PodHost_ReleaseDerivedResult_FullMethodName    = "/cozy.worker.v1.PodHost/ReleaseDerivedResult"
 	PodHost_RecordOperationResult_FullMethodName   = "/cozy.worker.v1.PodHost/RecordOperationResult"
 	PodHost_LookupOperation_FullMethodName         = "/cozy.worker.v1.PodHost/LookupOperation"
+	PodHost_PruneOperationCache_FullMethodName     = "/cozy.worker.v1.PodHost/PruneOperationCache"
 	PodHost_ModelSourceAdopt_FullMethodName        = "/cozy.worker.v1.PodHost/ModelSourceAdopt"
 	PodHost_CheckpointPage_FullMethodName          = "/cozy.worker.v1.PodHost/CheckpointPage"
 	PodHost_CheckpointTransfer_FullMethodName      = "/cozy.worker.v1.PodHost/CheckpointTransfer"
@@ -1189,6 +1228,7 @@ type PodHostClient interface {
 	ReleaseDerivedResult(ctx context.Context, in *DerivedResultReleaseCall, opts ...grpc.CallOption) (*DerivedResultReleaseResult, error)
 	RecordOperationResult(ctx context.Context, in *RecordOperationResultCall, opts ...grpc.CallOption) (*RecordOperationResultResult, error)
 	LookupOperation(ctx context.Context, in *LookupOperationCall, opts ...grpc.CallOption) (*LookupOperationResult, error)
+	PruneOperationCache(ctx context.Context, in *PruneOperationCacheCall, opts ...grpc.CallOption) (*PruneOperationCacheResult, error)
 	ModelSourceAdopt(ctx context.Context, in *ModelSourceAdoptCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error)
 	CheckpointPage(ctx context.Context, in *CheckpointPageCall, opts ...grpc.CallOption) (*CheckpointPageResult, error)
 	CheckpointTransfer(ctx context.Context, in *CheckpointTransferCall, opts ...grpc.CallOption) (*CheckpointTransferStatus, error)
@@ -1383,6 +1423,16 @@ func (c *podHostClient) LookupOperation(ctx context.Context, in *LookupOperation
 	return out, nil
 }
 
+func (c *podHostClient) PruneOperationCache(ctx context.Context, in *PruneOperationCacheCall, opts ...grpc.CallOption) (*PruneOperationCacheResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PruneOperationCacheResult)
+	err := c.cc.Invoke(ctx, PodHost_PruneOperationCache_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *podHostClient) ModelSourceAdopt(ctx context.Context, in *ModelSourceAdoptCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ModelSourcePrepared)
@@ -1530,6 +1580,7 @@ type PodHostServer interface {
 	ReleaseDerivedResult(context.Context, *DerivedResultReleaseCall) (*DerivedResultReleaseResult, error)
 	RecordOperationResult(context.Context, *RecordOperationResultCall) (*RecordOperationResultResult, error)
 	LookupOperation(context.Context, *LookupOperationCall) (*LookupOperationResult, error)
+	PruneOperationCache(context.Context, *PruneOperationCacheCall) (*PruneOperationCacheResult, error)
 	ModelSourceAdopt(context.Context, *ModelSourceAdoptCall) (*ModelSourcePrepared, error)
 	CheckpointPage(context.Context, *CheckpointPageCall) (*CheckpointPageResult, error)
 	CheckpointTransfer(context.Context, *CheckpointTransferCall) (*CheckpointTransferStatus, error)
@@ -1589,6 +1640,9 @@ func (UnimplementedPodHostServer) RecordOperationResult(context.Context, *Record
 }
 func (UnimplementedPodHostServer) LookupOperation(context.Context, *LookupOperationCall) (*LookupOperationResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method LookupOperation not implemented")
+}
+func (UnimplementedPodHostServer) PruneOperationCache(context.Context, *PruneOperationCacheCall) (*PruneOperationCacheResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method PruneOperationCache not implemented")
 }
 func (UnimplementedPodHostServer) ModelSourceAdopt(context.Context, *ModelSourceAdoptCall) (*ModelSourcePrepared, error) {
 	return nil, status.Error(codes.Unimplemented, "method ModelSourceAdopt not implemented")
@@ -1859,6 +1913,24 @@ func _PodHost_LookupOperation_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PodHost_PruneOperationCache_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PruneOperationCacheCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).PruneOperationCache(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_PruneOperationCache_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).PruneOperationCache(ctx, req.(*PruneOperationCacheCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _PodHost_ModelSourceAdopt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ModelSourceAdoptCall)
 	if err := dec(in); err != nil {
@@ -2024,6 +2096,10 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "LookupOperation",
 			Handler:    _PodHost_LookupOperation_Handler,
+		},
+		{
+			MethodName: "PruneOperationCache",
+			Handler:    _PodHost_PruneOperationCache_Handler,
 		},
 		{
 			MethodName: "ModelSourceAdopt",
