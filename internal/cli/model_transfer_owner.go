@@ -2,8 +2,6 @@ package cli
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"io"
 	"path/filepath"
 	"sort"
@@ -311,7 +309,7 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 		defer work.Release()
 		upload := &transfer.Upload{Tool: tool, Hub: publicationClient, Ref: ref,
 			ManifestID: weights.ManifestID,
-			Session:    transferOutputOperation(weights.RequestID, weights.OutputSlot),
+			Session:    records.ModelTransferOutputOperation(weights.RequestID, weights.OutputSlot),
 			Reason:     modelPublicationReason(intent),
 			Scratch:    work.Path, Progress: progress(cli)}
 		result, problem := upload.Run(ctx)
@@ -327,7 +325,7 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	for _, object := range weights.Objects {
 		objects = append(objects, hub.Object{ID: object.ObjectID, Length: object.Length})
 	}
-	operation := transferOutputOperation(weights.RequestID, weights.OutputSlot)
+	operation := records.ModelTransferOutputOperation(weights.RequestID, weights.OutputSlot)
 	opened, problem := publicationClient.OpenPublication(ctx, ref, operation, objects,
 		modelPublicationReason(intent))
 	if problem != nil {
@@ -399,11 +397,6 @@ func mintWeightsGrants(ctx context.Context, client *hub.Client, ref hub.Ref, ope
 			ObjectID: held.ObjectID, Length: held.Length, Held: true})
 	}
 	return window, nil
-}
-
-func transferOutputOperation(requestID, slot string) string {
-	sum := sha256.Sum256([]byte(requestID + "\x00" + slot))
-	return "model-artifact-" + hex.EncodeToString(sum[:])
 }
 
 func modelPublicationReason(intent records.ModelTransferIntent) string {

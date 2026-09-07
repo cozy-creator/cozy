@@ -76,6 +76,9 @@ func (s *Store) RetryModelTransferPublication(requestID, actor string) (bool, *e
 // A pre-attempt waiter can outlive successful execution. Explicit recovery of
 // that request failure is permitted only after the normal publication owner has
 // banked every declared checkpoint; this never retries the producer itself.
+// The native TensorFS receipt is opaque here. RecordModelTransferWeights retains
+// the verified worker frame's immutable root and object roster; the publication
+// owner verifies that exact closure with Hub before recording its operation ID.
 func verifiedProducerPublication(tx *sql.Tx, requestID string, ordinal int64) *exit.Error {
 	refuse := func() *exit.Error {
 		return exit.Named(exit.Conflict, "model_transfer.publication_not_verified", "failed request recovery requires every exact successful producer checkpoint to be retained")
@@ -131,7 +134,9 @@ func verifiedProducerPublication(tx *sql.Tx, requestID string, ordinal int64) *e
 		}
 		declared[output.Name] = true
 	}
-	rows, err := tx.Query(`SELECT output_slot,manifest_id,manifest_length,invocation_digest,transaction_id,receipt_digest,receipt,final_id FROM request_model_transfer_outputs WHERE request_id=? AND attempt=?`, requestID, ordinal)
+	rows, err := tx.Query(`SELECT o.output_slot,o.manifest_id,o.manifest_length,o.invocation_digest,o.transaction_id,o.receipt_digest,o.receipt,o.final_id,
+ EXISTS(SELECT 1 FROM request_model_transfer_objects b WHERE b.request_id=o.request_id AND b.attempt=o.attempt AND b.output_slot=o.output_slot AND b.object_id=o.manifest_id AND b.length=o.manifest_length)
+ FROM request_model_transfer_outputs o WHERE o.request_id=? AND o.attempt=?`, requestID, ordinal)
 	if err != nil {
 		return exit.Internalf("cannot read verified output roster: %s", err)
 	}
@@ -140,18 +145,15 @@ func verifiedProducerPublication(tx *sql.Tx, requestID string, ordinal int64) *e
 	for rows.Next() {
 		var slot, manifest, invocation, transaction, digest, finalID string
 		var length int64
+		var rootPresent bool
 		var raw []byte
-		if err := rows.Scan(&slot, &manifest, &length, &invocation, &transaction, &digest, &raw, &finalID); err != nil {
+		if err := rows.Scan(&slot, &manifest, &length, &invocation, &transaction, &digest, &raw, &finalID, &rootPresent); err != nil {
 			return exit.Internalf("cannot read verified output: %s", err)
 		}
-		if !declared[slot] || finalID == "" || length <= 0 || invocation != invocationDigest || !bytes.Equal(receiptRefs[digest], raw) {
+		if !declared[slot] || finalID != ModelTransferOutputOperation(requestID, slot) || !rootPresent || length <= 0 || invocation != invocationDigest || !bytes.Equal(receiptRefs[digest], raw) {
 			return refuse()
 		}
 		if _, err := canonical.Raw(manifest); err != nil {
-			return refuse()
-		}
-		hash, err := canonical.Raw(digest)
-		if err != nil || !bytes.Equal(hash, canonical.Digest(raw)) {
 			return refuse()
 		}
 		receipt, err := canonical.Read(raw, &pb.WeightsReceipt{})

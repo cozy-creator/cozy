@@ -51,7 +51,8 @@ func publicationRetryFixture(t *testing.T) (*records.Store, *sql.DB, string) {
 	intent, err := json.Marshal(records.ModelTransferIntent{Kind: "model-upload", Destination: "owner/model", Outputs: []records.ModelTransferOutput{{Name: "model"}}})
 	must(t, err)
 	run(`INSERT INTO request_model_transfers(request_id,intent,state,error_code,safe_error,updated_at) VALUES(?,?,'failed','stale_preparation','old preparation failed','fixture')`, id, string(intent))
-	run(`INSERT INTO request_model_transfer_outputs(request_id,output_slot,manifest_id,manifest_length,attempt,invocation_digest,transaction_id,receipt_digest,receipt,final_id) VALUES(?,?,?,?,?,?,?,?,?,?)`, id, "model", "sha256:bde1922331c714cc7a2cef772423b099169c5f41d11c7c4547d61c19aee65f2d", 16384, terminal.Int("attempt_ordinal"), digest(invocation), rec.Str("weights_transaction_id"), digest(receipt), receipt, "verified-owner-publication")
+	run(`INSERT INTO request_model_transfer_outputs(request_id,output_slot,manifest_id,manifest_length,attempt,invocation_digest,transaction_id,receipt_digest,receipt,final_id) VALUES(?,?,?,?,?,?,?,?,?,?)`, id, "model", "sha256:bde1922331c714cc7a2cef772423b099169c5f41d11c7c4547d61c19aee65f2d", 16384, terminal.Int("attempt_ordinal"), digest(invocation), rec.Str("weights_transaction_id"), digest(receipt), receipt, records.ModelTransferOutputOperation(id, "model"))
+	run(`INSERT INTO request_model_transfer_objects(request_id,attempt,output_slot,object_id,length,source_ref) SELECT request_id,attempt,output_slot,manifest_id,manifest_length,'fixture' FROM request_model_transfer_outputs`)
 	return st, db, id
 }
 
@@ -111,19 +112,23 @@ func dbPathForRetry(t *testing.T, db *sql.DB) string {
 
 func TestVerifiedPublicationRetryRefusesUnprovenOrCanceledWork(t *testing.T) {
 	for name, query := range map[string]string{
-		"request canceled":         `UPDATE requests SET state='canceled'`,
-		"transfer canceled":        `UPDATE request_model_transfers SET state='canceled'`,
-		"producer failed":          `UPDATE attempts SET terminal_status='FAILED'`,
-		"producer still open":      `UPDATE attempts SET state='accepted'`,
-		"no exact attempt":         `UPDATE requests SET ordinal=99`,
-		"one checkpoint absent":    `UPDATE request_model_transfer_outputs SET final_id=''`,
-		"receipt absent":           `DELETE FROM request_model_transfer_outputs`,
-		"receipt digest changed":   `UPDATE request_model_transfer_outputs SET receipt_digest='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'`,
-		"receipt bytes changed":    `UPDATE request_model_transfer_outputs SET receipt=x'7b7d'`,
-		"transaction changed":      `UPDATE request_model_transfer_outputs SET transaction_id='different'`,
-		"invocation bytes changed": `UPDATE attempts SET invocation=x'7b7d'`,
-		"outcome bytes changed":    `UPDATE attempts SET terminal_body=x'7b7d'`,
-		"declaration changed":      `UPDATE request_model_transfers SET intent='{"kind":"model-upload","destination":"owner/model","outputs":[{"name":"other"}]}'`,
+		"request canceled":            `UPDATE requests SET state='canceled'`,
+		"transfer canceled":           `UPDATE request_model_transfers SET state='canceled'`,
+		"producer failed":             `UPDATE attempts SET terminal_status='FAILED'`,
+		"producer still open":         `UPDATE attempts SET state='accepted'`,
+		"no exact attempt":            `UPDATE requests SET ordinal=99`,
+		"one checkpoint absent":       `UPDATE request_model_transfer_outputs SET final_id=''`,
+		"manifest substituted":        `UPDATE request_model_transfer_outputs SET manifest_id='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'`,
+		"manifest length substituted": `UPDATE request_model_transfer_outputs SET manifest_length=42`,
+		"publication substituted":     `UPDATE request_model_transfer_outputs SET final_id='another-operation'`,
+		"root object absent":          `DELETE FROM request_model_transfer_objects`,
+		"receipt absent":              `DELETE FROM request_model_transfer_outputs`,
+		"receipt digest changed":      `UPDATE request_model_transfer_outputs SET receipt_digest='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'`,
+		"receipt bytes changed":       `UPDATE request_model_transfer_outputs SET receipt=x'7b7d'`,
+		"transaction changed":         `UPDATE request_model_transfer_outputs SET transaction_id='different'`,
+		"invocation bytes changed":    `UPDATE attempts SET invocation=x'7b7d'`,
+		"outcome bytes changed":       `UPDATE attempts SET terminal_body=x'7b7d'`,
+		"declaration changed":         `UPDATE request_model_transfers SET intent='{"kind":"model-upload","destination":"owner/model","outputs":[{"name":"other"}]}'`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			st, db, id := publicationRetryFixture(t)
