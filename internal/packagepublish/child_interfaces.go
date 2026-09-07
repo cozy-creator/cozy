@@ -21,6 +21,12 @@ func WithChildInterfaces(ctx context.Context, parent *Package, replacements map[
 	if len(replacements) == 0 {
 		return parent, nil
 	}
+	return preparePrivateCopy(ctx, parent, replacements)
+}
+
+// Both ordinary private dependency resolution and interface substitution use
+// the same bounded source capture, path rebasing and uv resolver.
+func preparePrivateCopy(ctx context.Context, parent *Package, replacements map[string]string) (*Package, *exit.Error) {
 	dependencies, problem := LocalDependencyPaths(parent.Tree)
 	if problem != nil {
 		return nil, problem
@@ -34,6 +40,7 @@ func WithChildInterfaces(ctx context.Context, parent *Package, replacements map[
 		return nil, exit.Internalf("cannot stage private interfaces: %s", err)
 	}
 	fail := func(problem *exit.Error) (*Package, *exit.Error) { _ = os.RemoveAll(root); return nil, problem }
+	captured := &Package{Tree: parent.Tree, Files: map[string]string{}}
 	for name, source := range parent.Files {
 		to := filepath.Join(root, filepath.FromSlash(name))
 		if err := os.MkdirAll(filepath.Dir(to), 0o700); err != nil {
@@ -54,9 +61,12 @@ func WithChildInterfaces(ctx context.Context, parent *Package, replacements map[
 		if copyErr != nil || closeErr != nil || n > MaxSourceFileBytes {
 			return fail(exit.New(exit.Conflict, "parent source changed while capturing child interfaces"))
 		}
+		captured.Files[name] = to
 	}
-	after, _, _, problem := parent.SourceIdentity()
-	if problem != nil || after != before {
+	// Read the copied bytes with the original dependency base before rebasing.
+	// An edit that is reverted during copying still cannot produce a mixed copy.
+	copied, _, _, problem := captured.SourceIdentity()
+	if problem != nil || copied != before {
 		return fail(exit.New(exit.Conflict, "parent source or dependency changed during interface capture"))
 	}
 	path := filepath.Join(root, "pyproject.toml")
@@ -103,6 +113,15 @@ func WithChildInterfaces(ctx context.Context, parent *Package, replacements map[
 			detail = detail[len(detail)-2000:]
 		}
 		return fail(exit.Named(exit.Structural, "child.interface_lock_refused", "cannot lock the captured interface dependencies: %s", detail))
+	}
+	// Rewalk as well as rehash: added and removed authored files matter too.
+	tree, files, problem := boundedSourceTree(parent.Tree, []string{"package.toml", "pyproject.toml"})
+	if problem != nil {
+		return fail(problem)
+	}
+	after, _, _, problem := (&Package{Tree: tree, Files: files}).SourceIdentity()
+	if problem != nil || after != before {
+		return fail(exit.New(exit.Conflict, "private source or dependency changed while resolving dependencies"))
 	}
 	prepared, problem := PrepareLocalFrom(root)
 	if problem != nil {
