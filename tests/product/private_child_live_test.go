@@ -18,11 +18,20 @@ var privateChildRuntimeWheel = flag.String("child-runtime-wheel", "", "exact Run
 // This uses the actual Creator binary, installed interface wheels, independent
 // package executors and typed broker. No control peer or executor is simulated.
 func TestPrivateChildCompositionReusesAAfterParentAndLibraryEdits(t *testing.T) {
-	if *privateChildRuntimeWheel == "" {
-		t.Skip("requires the paired Runtime40 wheel")
+	runtimeVersion := "0.2.33"
+	runtimeInstall := "cozy-runtime==" + runtimeVersion
+	runtimeSource := ""
+	if *privateChildRuntimeWheel != "" {
+		wheel, err := filepath.Abs(*privateChildRuntimeWheel)
+		must(t, err)
+		parts := strings.Split(filepath.Base(wheel), "-")
+		if len(parts) < 3 || parts[0] != "cozy_runtime" {
+			t.Fatal("child fixture requires a named Runtime wheel")
+		}
+		runtimeVersion = parts[1]
+		runtimeInstall = wheel
+		runtimeSource = "cozy-runtime = {path = " + strconv.Quote(wheel) + "}\n"
 	}
-	wheel, err := filepath.Abs(*privateChildRuntimeWheel)
-	must(t, err)
 	control := filepath.Join(t.TempDir(), "control")
 	run := func(args ...string) {
 		t.Helper()
@@ -32,7 +41,7 @@ func TestPrivateChildCompositionReusesAAfterParentAndLibraryEdits(t *testing.T) 
 		}
 	}
 	run("venv", control, "--python", "3.12")
-	run("pip", "install", "--python", filepath.Join(control, "bin", "python"), wheel)
+	run("pip", "install", "--python", filepath.Join(control, "bin", "python"), runtimeInstall)
 	root, err := os.MkdirTemp("", "cozy-calls-")
 	must(t, err)
 	path := filepath.Join(control, "bin")
@@ -51,9 +60,9 @@ func TestPrivateChildCompositionReusesAAfterParentAndLibraryEdits(t *testing.T) 
 name = "private-%s"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime==0.2.31"]
+dependencies = ["cozy-runtime==%s"]
 [tool.uv.sources]
-cozy-runtime = {path = %s}
+%s
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -61,7 +70,7 @@ build-backend = "hatchling.build"
 only-include = [%q]
 [project.entry-points."cozy.application"]
 default = %q
-`, name, strconv.Quote(wheel), module+".py", module+":app")
+`, name, runtimeVersion, runtimeSource, module+".py", module+":app")
 		must(t, os.WriteFile(filepath.Join(lib, "pyproject.toml"), []byte(metadata), 0o600))
 		must(t, os.WriteFile(filepath.Join(lib, "package.toml"), []byte(fmt.Sprintf("[application]\nobject=%q\n", module+":app")), 0o600))
 		body := `from importlib.metadata import distributions
@@ -83,12 +92,15 @@ class Result(msgspec.Struct, frozen=True):
 		run("lock", "--project", lib)
 	}
 	script := filepath.Join(project, "recipe.py")
+	runtimeScriptSource := ""
+	if runtimeSource != "" {
+		runtimeScriptSource = "# " + runtimeSource
+	}
 	code := `# /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime==0.2.31", "private-source==0.1.0", "private-candidate==0.1.0"]
+# dependencies = ["cozy-runtime==` + runtimeVersion + `", "private-source==0.1.0", "private-candidate==0.1.0"]
 # [tool.uv.sources]
-# cozy-runtime = {path = ` + strconv.Quote(wheel) + `}
-# private-source = {path = "./source"}
+` + runtimeScriptSource + `# private-source = {path = "./source"}
 # private-candidate = {path = "./candidate"}
 # ///
 import msgspec
