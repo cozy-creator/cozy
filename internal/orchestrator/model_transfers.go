@@ -468,6 +468,9 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 			return nil, problem
 		}
 		if phase == "declaring" && allDeclared {
+			if problem := c.adoptRetriedSource(ctx, *request, session); problem != nil {
+				return nil, problem
+			}
 			phase = "probe"
 			if len(checkpoints) > 0 {
 				host, problem := c.checkpointHost(*request)

@@ -160,6 +160,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 	var spec orchestrator.Submission
 	if existing != nil {
+		if e = s.verifyJobReplayInstall(sub, *existing); e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
 		spec, e = replayJobSubmission(sub, *existing)
 	} else {
 		if sub.Rental || sub.RentalRequired {

@@ -935,6 +935,7 @@ const (
 	PodHost_PreparePrivatePlacement_FullMethodName = "/cozy.worker.v1.PodHost/PreparePrivatePlacement"
 	PodHost_ModelSourceFile_FullMethodName         = "/cozy.worker.v1.PodHost/ModelSourceFile"
 	PodHost_ModelSourcePrepare_FullMethodName      = "/cozy.worker.v1.PodHost/ModelSourcePrepare"
+	PodHost_ModelSourceAdopt_FullMethodName        = "/cozy.worker.v1.PodHost/ModelSourceAdopt"
 	PodHost_CheckpointPage_FullMethodName          = "/cozy.worker.v1.PodHost/CheckpointPage"
 	PodHost_CheckpointTransfer_FullMethodName      = "/cozy.worker.v1.PodHost/CheckpointTransfer"
 	PodHost_LocalPackageFetch_FullMethodName       = "/cozy.worker.v1.PodHost/LocalPackageFetch"
@@ -982,6 +983,7 @@ type PodHostClient interface {
 	PreparePrivatePlacement(ctx context.Context, in *PreparePrivatePlacementCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
 	ModelSourceFile(ctx context.Context, in *ModelSourceFileCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ModelSourceFileStatus], error)
 	ModelSourcePrepare(ctx context.Context, in *ModelSourcePrepareCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error)
+	ModelSourceAdopt(ctx context.Context, in *ModelSourceAdoptCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error)
 	CheckpointPage(ctx context.Context, in *CheckpointPageCall, opts ...grpc.CallOption) (*CheckpointPageResult, error)
 	CheckpointTransfer(ctx context.Context, in *CheckpointTransferCall, opts ...grpc.CallOption) (*CheckpointTransferStatus, error)
 	LocalPackageFetch(ctx context.Context, in *LocalPackageFetchCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LocalPackageFileStatus], error)
@@ -1089,6 +1091,16 @@ func (c *podHostClient) ModelSourcePrepare(ctx context.Context, in *ModelSourceP
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ModelSourcePrepared)
 	err := c.cc.Invoke(ctx, PodHost_ModelSourcePrepare_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) ModelSourceAdopt(ctx context.Context, in *ModelSourceAdoptCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ModelSourcePrepared)
+	err := c.cc.Invoke(ctx, PodHost_ModelSourceAdopt_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1224,6 +1236,7 @@ type PodHostServer interface {
 	PreparePrivatePlacement(*PreparePrivatePlacementCall, grpc.ServerStreamingServer[PrepareEvent]) error
 	ModelSourceFile(*ModelSourceFileCall, grpc.ServerStreamingServer[ModelSourceFileStatus]) error
 	ModelSourcePrepare(context.Context, *ModelSourcePrepareCall) (*ModelSourcePrepared, error)
+	ModelSourceAdopt(context.Context, *ModelSourceAdoptCall) (*ModelSourcePrepared, error)
 	CheckpointPage(context.Context, *CheckpointPageCall) (*CheckpointPageResult, error)
 	CheckpointTransfer(context.Context, *CheckpointTransferCall) (*CheckpointTransferStatus, error)
 	LocalPackageFetch(*LocalPackageFetchCall, grpc.ServerStreamingServer[LocalPackageFileStatus]) error
@@ -1258,6 +1271,9 @@ func (UnimplementedPodHostServer) ModelSourceFile(*ModelSourceFileCall, grpc.Ser
 }
 func (UnimplementedPodHostServer) ModelSourcePrepare(context.Context, *ModelSourcePrepareCall) (*ModelSourcePrepared, error) {
 	return nil, status.Error(codes.Unimplemented, "method ModelSourcePrepare not implemented")
+}
+func (UnimplementedPodHostServer) ModelSourceAdopt(context.Context, *ModelSourceAdoptCall) (*ModelSourcePrepared, error) {
+	return nil, status.Error(codes.Unimplemented, "method ModelSourceAdopt not implemented")
 }
 func (UnimplementedPodHostServer) CheckpointPage(context.Context, *CheckpointPageCall) (*CheckpointPageResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckpointPage not implemented")
@@ -1381,6 +1397,24 @@ func _PodHost_ModelSourcePrepare_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PodHost_ModelSourceAdopt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ModelSourceAdoptCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).ModelSourceAdopt(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_ModelSourceAdopt_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).ModelSourceAdopt(ctx, req.(*ModelSourceAdoptCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _PodHost_CheckpointPage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CheckpointPageCall)
 	if err := dec(in); err != nil {
@@ -1496,6 +1530,10 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ModelSourcePrepare",
 			Handler:    _PodHost_ModelSourcePrepare_Handler,
+		},
+		{
+			MethodName: "ModelSourceAdopt",
+			Handler:    _PodHost_ModelSourceAdopt_Handler,
 		},
 		{
 			MethodName: "CheckpointPage",
