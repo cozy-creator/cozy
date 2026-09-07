@@ -204,7 +204,7 @@ func (c *Orchestrator) onModelTransferWeightsReceipt(s *session, frame *pb.Weigh
 func (c *Orchestrator) onModelTransferWeightsStatus(s *session,
 	frame *pb.WeightsTransferStatus,
 ) {
-	weights, problem := c.opt.Store.ModelTransferWeights(frame.RequestId,
+	weights, problem := c.opt.Store.ModelTransferWeightsMetadata(frame.RequestId,
 		int64(frame.AttemptOrdinal), frame.OutputSlot)
 	if problem != nil || weights == nil || frame.Length == 0 || frame.Length > uint64(^uint64(0)>>1) {
 		return
@@ -228,16 +228,7 @@ func (c *Orchestrator) onModelTransferWeightsStatus(s *session,
 	if state == "" || frame.TransferredBytes > frame.Length {
 		return
 	}
-	previous := ""
-	if objects, readProblem := c.opt.Store.ModelTransferObjects(frame.RequestId,
-		int64(frame.AttemptOrdinal), frame.OutputSlot); readProblem == nil {
-		for _, object := range objects {
-			if object.ObjectID == frame.ObjectId {
-				previous = object.State
-			}
-		}
-	}
-	problem = c.opt.Store.RecordModelTransferObjectStatus(records.ModelTransferObject{
+	stateChanged, problem := c.opt.Store.RecordModelTransferObjectStatus(records.ModelTransferObject{
 		RequestID: frame.RequestId, Attempt: int64(frame.AttemptOrdinal),
 		OutputSlot: frame.OutputSlot, ObjectID: frame.ObjectId, Length: int64(frame.Length),
 		OperationID: frame.OperationId, GrantRevision: int64(frame.GrantRevision),
@@ -260,7 +251,7 @@ func (c *Orchestrator) onModelTransferWeightsStatus(s *session,
 	// grant revisions cl-133 was swallowing. The re-send itself stays: it is how an object
 	// whose grant went cold gets a signature minted just now (`WeightsGrantWindow.Expire`),
 	// and on a state change it is exactly what should happen.
-	if state != previous {
+	if stateChanged {
 		c.signalTransfer(frame.RequestId)
 	}
 }

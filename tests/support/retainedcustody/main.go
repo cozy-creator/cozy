@@ -407,7 +407,7 @@ func (m *custodyMover) hold(ctx context.Context, weights records.ModelTransferWe
 			if status.TransferredBytes > uint64(object.Length) || status.UpdateSequence == 0 {
 				return exit.New(exit.Conflict, "invalid Host failure observation")
 			}
-			if problem := m.store.RecordModelTransferObjectStatus(records.ModelTransferObject{RequestID: weights.RequestID, Attempt: weights.Attempt, OutputSlot: weights.OutputSlot, ObjectID: object.ObjectID, Length: object.Length, OperationID: operation, GrantRevision: int64(status.GrantRevision), UpdateSequence: int64(status.UpdateSequence), State: "failed", Transferred: int64(status.TransferredBytes), SafeCode: status.SafeCode, SafeDetail: status.SafeDetail}); problem != nil {
+			if _, problem := m.store.RecordModelTransferObjectStatus(records.ModelTransferObject{RequestID: weights.RequestID, Attempt: weights.Attempt, OutputSlot: weights.OutputSlot, ObjectID: object.ObjectID, Length: object.Length, OperationID: operation, GrantRevision: int64(status.GrantRevision), UpdateSequence: int64(status.UpdateSequence), State: "failed", Transferred: int64(status.TransferredBytes), SafeCode: status.SafeCode, SafeDetail: status.SafeDetail}); problem != nil {
 				return problem
 			}
 			return exit.Named(exit.Unavailable, "operator.host_custody_failed", "the Host refused this exact revision; its observed high-water is retained for retry")
@@ -415,7 +415,8 @@ func (m *custodyMover) hold(ctx context.Context, weights records.ModelTransferWe
 		if status.State != pb.WeightsTransferState_WEIGHTS_TRANSFER_STATE_HELD || status.TransferredBytes > uint64(object.Length) || status.ChecksumSha256 != object.ObjectID || status.UpdateSequence == 0 {
 			return exit.Named(exit.Conflict, "operator.host_custody_refused", "PodHost did not confirm exact held custody")
 		}
-		return m.store.RecordModelTransferObjectStatus(records.ModelTransferObject{RequestID: weights.RequestID, Attempt: weights.Attempt, OutputSlot: weights.OutputSlot, ObjectID: object.ObjectID, Length: object.Length, OperationID: operation, GrantRevision: int64(status.GrantRevision), UpdateSequence: int64(status.UpdateSequence), State: "held", Transferred: int64(status.TransferredBytes)})
+		_, problem := m.store.RecordModelTransferObjectStatus(records.ModelTransferObject{RequestID: weights.RequestID, Attempt: weights.Attempt, OutputSlot: weights.OutputSlot, ObjectID: object.ObjectID, Length: object.Length, OperationID: operation, GrantRevision: int64(status.GrantRevision), UpdateSequence: int64(status.UpdateSequence), State: "held", Transferred: int64(status.TransferredBytes)})
+		return problem
 	}
 }
 func emit(value any) { _ = json.NewEncoder(os.Stdout).Encode(value) }
