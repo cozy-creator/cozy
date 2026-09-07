@@ -94,10 +94,14 @@ func TestPrivateTransactionQueuedPauseSurvivesDaemonCrash(t *testing.T) {
 
 	// Cancel means permanent abandonment, distinct from pause. Resuming the same
 	// number or global ID must refuse and leave the original identity in history.
-	if code, out := runCozy(t, root, "run", "cancel", reference, "--json"); code != 0 ||
-		!strings.Contains(out, `"status":"canceled"`) {
+	if code, out := runCozy(t, root, "run", "cancel", reference, "--json"); code != 0 {
 		t.Fatalf("cancel paused transaction [exit %d]: %s", code, out)
 	}
+	waitUntil(t, "paused cancellation settles", func() bool {
+		row, problem := store.RequestRow(before.ID)
+		fatal(t, problem)
+		return row.State == "canceled"
+	})
 	for _, ref := range []string{reference, before.ID} {
 		response := daemon.call(t, http.MethodPost, "/v1/local/jobs/"+ref+"/resume",
 			map[string]any{"actor": "product proof"})
@@ -166,13 +170,13 @@ func TestPrivateTransactionsShareRentalRetention(t *testing.T) {
 	// Cancel the original buyer. The second request is now the only reason to
 	// retain the machine; consulting ManagedRequestID alone would delete it.
 	response := daemon.call(t, http.MethodPost, "/v1/local/jobs/"+first.ID+"/cancel", nil)
-	if response.Status != http.StatusOK {
+	if response.Status != http.StatusOK && response.Status != http.StatusAccepted {
 		t.Fatalf("cancel original buyer: %s", response.brief())
 	}
 	assertHeldAfterSweep("pr-transaction-witness-three", "kestrel")
 	assertPrivateTransactionIdentity(t, store, second, "paused")
 	response = daemon.call(t, http.MethodPost, "/v1/local/jobs/"+second.ID+"/cancel", nil)
-	if response.Status != http.StatusOK {
+	if response.Status != http.StatusOK && response.Status != http.StatusAccepted {
 		t.Fatalf("cancel final owner: %s", response.brief())
 	}
 	awaitRentalGone(t, store, retained, 15*time.Second, filepath.Join(root, "daemon.log"))

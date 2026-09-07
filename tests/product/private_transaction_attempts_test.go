@@ -11,6 +11,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -33,6 +34,10 @@ func TestPrivateTransactionPauseFencesAttemptBeforeResume(t *testing.T) {
 	}
 	connection, _ := startFakePod(t, t.TempDir(), pod)
 	o := hostOwner(t, "private-transaction-attempts", rentalWiring(connection, private))
+	fatal(t, o.store.RecordRental(records.Rental{ID: podRental, MachineName: "otter", State: "ready",
+		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,
+		Address: connection.Addr, CertPath: connection.CACert,
+		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
 	sub := orchestrator.Submission{
 		IdemKey: "private-attempt-proof", Package: "cozy/h3-package", Entrypoint: "prepare",
 		PlanID: "sha256:" + fmt.Sprintf("%064x", 17), Release: "1.0.7", Kind: "job", Org: "local",
