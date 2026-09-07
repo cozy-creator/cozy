@@ -46,7 +46,7 @@ const (
 
 func newLadderHub(t *testing.T) *ladderHub {
 	t.Helper()
-	iface := []byte(`{"application":"h3:app","entrypoints":[{"name":"generate","models":[{"class":"H3","component_use":{},"path":"generate.models.model"}],"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`)
+	iface := []byte(`{"application":"h3:app","entrypoints":[{"name":"generate","models":[{"class":"H3","component_use":{"condition_fl2va_media":["video_vae"],"condition_ref2va_media":["audio_vae","video_vae"],"condition_text":["text_encoder"],"decode_audio":["audio_vae"],"decode_video":["video_vae"],"sample_fl2va":["fl2va_dit"],"sample_ref2va":["ref2va_dit"]},"path":"generate.models.model"}],"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`)
 	contract, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
 	var detail hub.PackageReleaseDetail
@@ -98,8 +98,14 @@ func newLadderHub(t *testing.T) *ladderHub {
 				{ReleaseSummary: hub.ReleaseSummary{Release: "0.9.0", Yanked: true}, Lanes: []hub.ModelLaneSummary{
 					{Lane: "bf16-full", ManifestID: bf16Manifest, Bytes: 130 * gib}}},
 				{ReleaseSummary: hub.ReleaseSummary{Release: "1.0.0-rc.1"}, Lanes: []hub.ModelLaneSummary{
-					{Lane: "fp8-adaln-pruned", ManifestID: fp8Manifest, Bytes: 60 * gib},
-					{Lane: "bf16-full", ManifestID: bf16Manifest, Bytes: 130 * gib}}},
+					{Lane: "fp8-adaln-pruned", ManifestID: fp8Manifest, Bytes: 103 * gib,
+						Components:     []string{"audio_vae", "fl2va_dit", "ref2va_dit", "text_encoder", "video_vae"},
+						ComponentBytes: h3Components()},
+					{Lane: "mxfp8-adaln-pruned", ManifestID: mxfpManifest, Bytes: 55 * gib,
+						Components: []string{"audio_vae", "fl2va_dit", "ref2va_dit", "text_encoder", "video_vae"}},
+					{Lane: "bf16-full", ManifestID: bf16Manifest, Bytes: 130 * gib,
+						Components:     []string{"audio_vae", "fl2va_dit", "ref2va_dit", "text_encoder", "video_vae"},
+						ComponentBytes: h3BF16Components()}}},
 			}})
 	})
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
@@ -203,7 +209,7 @@ func TestBindVerifiesTheLadderAgainstTheCardBeforeWriting(t *testing.T) {
 		{"yanked release", []string{ladderSlot, "proof/minimax@0.9.0", "--gpu", "*=bf16-full"},
 			[]string{"model.release_not_found", "releases: 1.0.0-rc.1"}},
 		{"lane absent from the release", []string{ladderSlot, "proof/minimax@1.0.0-rc.1", "--gpu", "H100=profile=fp8-adaln-pruned"},
-			[]string{"model.lane_not_found", "lanes: bf16-full, fp8-adaln-pruned"}},
+			[]string{"model.lane_not_found", "lanes: bf16-full, fp8-adaln-pruned, mxfp8-adaln-pruned"}},
 		{"catch-all not last", []string{ladderSlot, "proof/minimax@1.0.0-rc.1", "--gpu", "*=bf16-full", "--gpu", "H100=fp8-adaln-pruned"},
 			[]string{"catch-all rung '*' must be the last rung"}},
 		{"no rung", []string{ladderSlot, "proof/minimax@1.0.0-rc.1"}, []string{"at least one --gpu"}},
@@ -273,7 +279,7 @@ func TestRunRefusesEarlyWithWhatTheCardOffers(t *testing.T) {
 	h.bind(hub.PackageBindingRow{Slot: ladderSlot, Model: ladderModel, Release: "1.0.0-rc.1",
 		Ladder: []hub.BindingRung{{GPU: "H100", Lane: "profile=fp8-adaln-pruned"}}, Revision: 2})
 	code, out = run()
-	if code == 0 || !strings.Contains(out, "model.lane_not_found") || !strings.Contains(out, "lanes: bf16-full, fp8-adaln-pruned") {
+	if code == 0 || !strings.Contains(out, "model.lane_not_found") || !strings.Contains(out, "lanes: bf16-full, fp8-adaln-pruned, mxfp8-adaln-pruned") {
 		t.Fatalf("a stale lane did not refuse with the release's lanes [exit %d]: %s", code, out)
 	}
 	// Early means before submission: no request row exists on this root, so no daemon
@@ -291,9 +297,12 @@ func TestRunRefusesEarlyWithWhatTheCardOffers(t *testing.T) {
 	}
 }
 
+// goodLadder is the owner's fit map: fp8 on H100-class cards, mxfp8 (a lane the card
+// sizes no components for) on B200, bf16 anywhere else that can hold it.
 func goodLadder() hub.PackageBindingRow {
 	return hub.PackageBindingRow{Slot: ladderSlot, Model: ladderModel, Release: "1.0.0-rc.1",
-		Ladder: []hub.BindingRung{{GPU: "H100", Lane: "fp8-adaln-pruned"}, {GPU: "*", Lane: "bf16-full"}}, Revision: 3}
+		Ladder: []hub.BindingRung{{GPU: "H100", Lane: "fp8-adaln-pruned"}, {GPU: "B200", Lane: "mxfp8-adaln-pruned"},
+			{GPU: "*", Lane: "bf16-full"}}, Revision: 3}
 }
 
 func waitFor(t *testing.T, root, what string, ok func() bool) {
@@ -310,7 +319,7 @@ func waitFor(t *testing.T, root, what string, ok func() bool) {
 func TestAutoRentWalksTheLadderAndNeverBuysAShortCard(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
-	h.soldOut["h100-80"], h.soldOut["h100-nvl"] = true, true
+	h.soldOut["h100-80"], h.soldOut["h100-nvl"], h.soldOut["b200"] = true, true, true
 	root := ladderRoot(t, h)
 	startDaemonProcess(t, root)
 	// The fixture pod fails to provision after the walk, so the short observation the
@@ -325,10 +334,13 @@ func TestAutoRentWalksTheLadderAndNeverBuysAShortCard(t *testing.T) {
 	if queued == nil {
 		t.Fatalf("the laddered run was not submitted: %s", out)
 	}
-	waitFor(t, root, "the walk reaching the H200", func() bool { return len(h.postedSKUs()) >= 3 })
+	waitFor(t, root, "the walk reaching the H200", func() bool { return len(h.postedSKUs()) >= 4 })
 	posted := h.postedSKUs()
-	if strings.Join(posted[:3], " ") != "h100-80/fp8-adaln-pruned h100-nvl/fp8-adaln-pruned h200/bf16-full" {
-		t.Fatalf("paid asks %v; want the H100 rung cheapest first, both refused, then the catch-all on the H200", posted)
+	// The 103 GB fp8 lane is asked of the 80 GB H100 first: its largest resident group
+	// is the 51.5 GiB text encoder (cl-168). The unsized mxfp8 lane rides the owner's
+	// B200 rung by assertion. The 24 GB and 32 GB cards never hold that text encoder.
+	if strings.Join(posted[:4], " ") != "h100-80/fp8-adaln-pruned h100-nvl/fp8-adaln-pruned b200/mxfp8-adaln-pruned h200/bf16-full" {
+		t.Fatalf("paid asks %v; want the H100 rung cheapest first, the B200 rung, then the catch-all on the H200", posted)
 	}
 	for _, ask := range posted {
 		if strings.HasPrefix(ask, "rtx-") {
@@ -345,8 +357,10 @@ func TestAutoRentWalksTheLadderAndNeverBuysAShortCard(t *testing.T) {
 		t.Fatalf("the buy did not pin the H200's rung exactly: %+v", row.Models[0])
 	}
 	log := tail(filepath.Join(root, "daemon.log"))
-	for _, want := range []string{"renting h100-80", "(rung 1, lane fp8-adaln-pruned)",
-		"h100-80 has no inventory; walking to the next fitting machine", "renting h200", "(rung 2, lane bf16-full)"} {
+	for _, want := range []string{"renting h100-80", "(rung 1, lane fp8-adaln-pruned, fit components 51.5 GiB of 80 GB)",
+		"h100-80 has no inventory; walking to the next fitting machine",
+		"renting b200", "(rung 2, lane mxfp8-adaln-pruned, fit rung_asserted)",
+		"renting h200", "(rung 3, lane bf16-full, fit components 51.5 GiB of 141 GB)"} {
 		if !strings.Contains(log, want) {
 			t.Fatalf("daemon.log does not say %q:\n%s", want, log)
 		}
@@ -361,15 +375,18 @@ func TestAutoRentReusesTheFittingRentalBeforeBuying(t *testing.T) {
 	must(t, os.WriteFile(cert, []byte("fixture"), 0600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
-	// A live H200 the user already has up. It sits on the LAST rung and is dearer than
-	// the H100 rung's cards; it still wins, because rung order ranks no machine that is
-	// already paid for, and its rung's lane fits its memory. A live 5090 beside it fits a
-	// rung too, but not its lane's 130 GiB, so it is passed over with the reason recorded.
+	// Three live rentals the user already has up. Rung order ranks no machine that is
+	// already paid for. The 80 GB H100 holds the 103 GB fp8 lane — no method holds more
+	// than its 51.5 GiB text encoder — and wins on the fewest bytes to download; the H200
+	// on the bf16 rung fits too; the 5090 fits a rung but not that text encoder, so it is
+	// passed over with the need recorded (the 2026-09-07 production case, cl-168).
 	for _, seed := range []records.Rental{
 		{ID: "pr-zack", MachineName: "zack", SKU: "h200", AcceleratorModel: "NVIDIA H200",
 			HourlyRateUSDMicros: 3_590_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
 		{ID: "pr-cheap", MachineName: "cheap", SKU: "rtx-5090", AcceleratorModel: "NVIDIA GeForce RTX 5090",
 			HourlyRateUSDMicros: 990_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
+		{ID: "pr-morgiana", MachineName: "morgiana", SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3",
+			HourlyRateUSDMicros: 2_490_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
 	} {
 		fatal(t, store.RecordRental(seed))
 		h.addReady(seed.ID, seed.MachineName, seed.AcceleratorModel, seed.HourlyRateUSDMicros)
@@ -383,7 +400,7 @@ func TestAutoRentReusesTheFittingRentalBeforeBuying(t *testing.T) {
 	store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	waitFor(t, root, "the request pinned to the live H200", func() bool {
+	waitFor(t, root, "the request pinned to the live H100", func() bool {
 		row, problem := store.RequestByIdempotencyKey("ladder-reuse")
 		return problem == nil && row != nil && row.Worker != ""
 	})
@@ -392,14 +409,16 @@ func TestAutoRentReusesTheFittingRentalBeforeBuying(t *testing.T) {
 	if row == nil {
 		t.Fatalf("the laddered run was not submitted: %s", out)
 	}
-	if row.Worker != "pr-zack" || row.Models[0].Lane != "bf16-full" || row.Models[0].Manifest != bf16Manifest {
-		t.Fatalf("pinned to %q with %+v; want pr-zack on bf16-full", row.Worker, row.Models[0])
+	if row.Worker != "pr-morgiana" || row.Models[0].Lane != "fp8-adaln-pruned" || row.Models[0].Manifest != fp8Manifest ||
+		row.Models[0].ComponentBytes["text_encoder"] != textEncoderNeed {
+		t.Fatalf("pinned to %q with %+v; want pr-morgiana on fp8-adaln-pruned with its component bytes", row.Worker, row.Models[0])
 	}
 	if asks := h.postedSKUs(); len(asks) != 0 {
 		t.Fatalf("a fitting live rental was passed over for a buy: %v", asks)
 	}
 	log := tail(filepath.Join(root, "daemon.log"))
-	if !strings.Contains(log, "cheap vram_short") || !strings.Contains(log, "lane=bf16-full") {
-		t.Fatalf("daemon.log does not record the passed-over 5090 and the pinned lane:\n%s", log)
+	if !strings.Contains(log, "cheap vram_short: needs 51.5 GiB resident (condition_text: text_encoder), rtx-5090 has 32 GB") ||
+		!strings.Contains(log, "rental pr-morgiana stages it (bought=false, lane=fp8-adaln-pruned, fit=components 51.5 GiB of 80 GB,") {
+		t.Fatalf("daemon.log does not record the passed-over 5090's need, the pinned lane and the sizing:\n%s", log)
 	}
 }

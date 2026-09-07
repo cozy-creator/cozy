@@ -150,10 +150,10 @@ func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
 				"Tensorhub returned an invalid manifest for %s@%s/%s", ref.String(), selected.Release, rung.Lane)
 		}
 		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, Lane: rung.Lane,
-			Manifest: lane.ManifestID, Bytes: lane.Bytes})
+			Manifest: lane.ManifestID, Bytes: lane.Bytes, ComponentBytes: lane.ComponentBytes})
 	}
 	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path, Model: ref.String(),
-		Release: selected.Release, Ladder: rungs}, nil
+		Release: selected.Release, ComponentUse: slot.ComponentUse, Ladder: rungs}, nil
 }
 
 // rebind turns a card miss into the early refusal that names its fix: the binding points

@@ -511,12 +511,14 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 	manifestLanes := map[string][]string{}
 	manifestBytes := map[string]int64{}
 	manifestComponents := map[string][]string{}
+	manifestComponentBytes := map[string]map[string]int64{}
 	for _, lane := range selected.Lanes {
 		if (manifest == "" || lane.ManifestID == manifest) &&
 			(wantedLane == "" || lane.Lane == wantedLane) {
 			manifestLanes[lane.ManifestID] = append(manifestLanes[lane.ManifestID], lane.Lane)
 			manifestBytes[lane.ManifestID] = lane.Bytes
 			manifestComponents[lane.ManifestID] = lane.Components
+			manifestComponentBytes[lane.ManifestID] = lane.ComponentBytes
 		}
 	}
 	if manifest != "" && len(manifestLanes[manifest]) == 0 {
@@ -543,7 +545,8 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 	}
 	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path,
 		Model: ref.String(), Release: release, Lane: lanes[0], Manifest: manifest,
-		Bytes: manifestBytes[manifest]}, nil
+		Bytes: manifestBytes[manifest], ComponentBytes: manifestComponentBytes[manifest],
+		ComponentUse: slot.ComponentUse}, nil
 }
 
 func handleRunCancel(ctx *Context) *exit.Error {

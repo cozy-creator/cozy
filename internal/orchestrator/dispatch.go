@@ -880,11 +880,18 @@ func (c *Orchestrator) logDownloadDecision(req records.Request, decision RentalD
 		for _, model := range req.Models {
 			chosen.BytesMissing += model.Bytes
 		}
+		if decision.SKU != nil {
+			for _, offered := range decision.SKU.Offered {
+				if offered.Name == decision.SKU.Chosen {
+					chosen.Fit, chosen.ResidentBytes, chosen.VRAMBytes = offered.Fit, offered.ResidentBytes, offered.VRAMBytes
+				}
+			}
+		}
 	}
-	c.logf("%s: no worker holds %s for %s; rental %s stages it (bought=%t, lane=%s, holds=%t, "+
+	c.logf("%s: no worker holds %s for %s; rental %s stages it (bought=%t, lane=%s, fit=%s, holds=%t, "+
 		"manifests_missing=%d, bytes_missing=%d) over %d ready rental(s)%s%s; the download "+
 		"the download set goes with its desired state", req.ID, req.PlanID, req.Package,
-		decision.RentalID, decision.Bought, orNone(records.Lanes(req.Models)), chosen.Holds,
+		decision.RentalID, decision.Bought, orNone(records.Lanes(req.Models)), fitNote(chosen), chosen.Holds,
 		chosen.ManifestsMissing, chosen.BytesMissing, len(decision.Candidates),
 		exclusionNote(decision.Excluded), skuNote(decision.SKU))
 	payload := map[string]any{
@@ -904,6 +911,19 @@ func (c *Orchestrator) logDownloadDecision(req records.Request, decision RentalD
 		payload["sku"] = decision.SKU
 	}
 	c.emit(req.ID, "request.routed", 0, payload)
+}
+
+// fitNote renders how the chosen machine was sized (cl-168), so the line itself says
+// whether a figure was compared or the owner's rung stood alone.
+func fitNote(chosen RentalCoverage) string {
+	switch chosen.Fit {
+	case records.FitComponents:
+		return fmt.Sprintf("%s %.1f GiB of %.0f GB", chosen.Fit,
+			float64(chosen.ResidentBytes)/(1<<30), float64(chosen.VRAMBytes)/(1<<30))
+	case "":
+		return "unsized"
+	}
+	return chosen.Fit
 }
 
 // exclusionNote renders the ready rentals the decision could not use. "over 0 ready

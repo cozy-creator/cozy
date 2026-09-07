@@ -220,6 +220,13 @@ type RentalCoverage struct {
 	// queued ahead of a new request on this rental.
 	Lane   string `json:"lane,omitempty"`
 	Queued int    `json:"queued"`
+	// Fit says how the device was sized (cl-168): `components` with the bytes compared, or
+	// `rung_asserted` when the card published no per-component bytes and the owner's rung
+	// stood alone. ResidentBytes is the entrypoint's largest resident group, VRAMBytes the
+	// device's memory, both as compared.
+	Fit           string `json:"fit,omitempty"`
+	ResidentBytes int64  `json:"resident_bytes,omitempty"`
+	VRAMBytes     int64  `json:"vram_bytes,omitempty"`
 	// Models is the request's selection pinned to this rental's rung.
 	Models []ModelRef `json:"-"`
 }
@@ -232,6 +239,10 @@ type RentalCandidate struct {
 	RentalID string
 	Queued   int
 	Models   []ModelRef
+	// Fit, ResidentBytes and VRAMBytes are the device sizing as compared (cl-168).
+	Fit           string
+	ResidentBytes int64
+	VRAMBytes     int64
 }
 
 // RentalDecision is the capacity decision's answer: the rental the placement is staged
@@ -274,8 +285,8 @@ const (
 	// VerdictGPUMismatch: no rung of the ladder names this accelerator class.
 	VerdictGPUMismatch = "gpu_mismatch"
 	// VerdictVRAMShort is spelled with the need and the card's memory appended: the
-	// rung's lane does not fit on the device (the 2026-09-07 defect — a 24 GB card
-	// bought for a 103 GB lane).
+	// entrypoint's largest resident component group does not fit on the device (the
+	// 2026-09-07 defect — a 24 GB card bought for a lane whose text encoder is 51.5 GB).
 	VerdictVRAMShort = "vram_short"
 	// VerdictNoInventory: the hub refused the buy for want of stock, and the walk
 	// moved on to the next machine.
@@ -294,6 +305,12 @@ type SKUCandidate struct {
 	Lane string `json:"lane,omitempty"`
 	// Verdict is empty on the chosen product and otherwise names why not this one.
 	Verdict string `json:"verdict,omitempty"`
+	// Fit, ResidentBytes and VRAMBytes are the device sizing as compared (cl-168):
+	// `components` with the entrypoint's largest resident group against the device, or
+	// `rung_asserted` when the card published no per-component bytes for the rung's lane.
+	Fit           string `json:"fit,omitempty"`
+	ResidentBytes int64  `json:"resident_bytes,omitempty"`
+	VRAMBytes     int64  `json:"vram_bytes,omitempty"`
 }
 
 // SKUDecision is the recordable answer to "what did the fleet buy, and what did it buy
@@ -382,7 +399,7 @@ const (
 	ExcludedUnattached = "unattached"
 	// ExcludedGPUMismatch: no rung of the binding ladder names the rental's accelerator.
 	ExcludedGPUMismatch = "gpu_mismatch"
-	// ExcludedVRAMShort: the rental's rung lane does not fit its device memory.
+	// ExcludedVRAMShort: the rung lane's resident components do not fit the device memory.
 	ExcludedVRAMShort = "vram_short"
 	// ExcludedSaturated is spelled with the measured comparison appended: the work
 	// queued ahead on this rental is expected to outlast a fresh pod's observed cold
@@ -448,7 +465,8 @@ func (c *Orchestrator) RankRentals(candidates []RentalCandidate) []RentalCoverag
 	out := make([]RentalCoverage, 0, len(candidates))
 	for _, candidate := range candidates {
 		row := RentalCoverage{RentalID: candidate.RentalID, Queued: candidate.Queued,
-			Lane: records.Lanes(candidate.Models), Models: candidate.Models}
+			Lane: records.Lanes(candidate.Models), Models: candidate.Models, Fit: candidate.Fit,
+			ResidentBytes: candidate.ResidentBytes, VRAMBytes: candidate.VRAMBytes}
 		w := c.workers[rentalInstanceID(candidate.RentalID)]
 		if w == nil || w.exited || w.stopping || c.sessions[w.bootID] == nil {
 			w = nil

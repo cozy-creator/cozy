@@ -25,6 +25,7 @@ type Step struct {
 	SKU    hub.RentalSKU
 	Rung   int // 1-based ladder rung
 	Models []records.ModelRef
+	Fit    records.Residency
 	Index  int // this product's row in the decision's Offered
 }
 
@@ -35,12 +36,9 @@ type Step struct {
 // no rung names is not a candidate, and a product whose rung lane outweighs its device is
 // not one either.
 //
-// The resident need is the pinned lanes' manifest bytes summed over slots: the model card
-// publishes one byte total per lane and no per-component sizes, so the whole lane is what
-// this reads, and it is the conservative fact — a lane's largest component is never larger
-// than the lane. VRAMGB is read as GiB, the unit GPU memory is actually built in (an
-// "80 GB" H100 carries 81920 MiB). A CPU-class request skips the device check: there is
-// no device, and the hub sizes the pod's RAM from the SKU.
+// The device is held to Fit below — the entrypoint's resident components, never the whole
+// lane. A CPU-class request skips the device check: there is no device, and the hub sizes
+// the pod's RAM from the SKU.
 func Plan(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator bool,
 	constraints Constraints) ([]Step, orchestrator.SKUDecision) {
 	total := func(sku hub.RentalSKU) int64 {
@@ -57,7 +55,7 @@ func Plan(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator bool
 			continue
 		}
 		r := row{step: Step{SKU: sku}}
-		r.step.Rung, r.step.Models, r.verdict = fit(sku, models, needsAccelerator)
+		r.step.Rung, r.step.Models, r.step.Fit, r.verdict = fit(sku, models, needsAccelerator)
 		if r.verdict == "" {
 			if profile, readable := launch.ParseBaseProfile(sku.BaseWorkerProfile); readable {
 				if reason := launch.BaseMismatch(profile, constraints.Requirements,
@@ -93,6 +91,10 @@ func Plan(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator bool
 		if r.step.Rung != 0 {
 			candidate.Lane = records.Lanes(r.step.Models)
 		}
+		if r.step.Fit.Fit != "" {
+			candidate.Fit, candidate.ResidentBytes = r.step.Fit.Fit, r.step.Fit.Bytes
+			candidate.VRAMBytes = r.step.SKU.VRAMGB << 30
+		}
 		decision.Offered = append(decision.Offered, candidate)
 		if r.verdict == "" {
 			r.step.Index = i
@@ -106,26 +108,39 @@ func Plan(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator bool
 }
 
 // fit pins the request's selection to the product's rung and says whether it holds.
-func fit(sku hub.RentalSKU, models []records.ModelRef, needsAccelerator bool) (int, []records.ModelRef, string) {
+func fit(sku hub.RentalSKU, models []records.ModelRef, needsAccelerator bool) (
+	int, []records.ModelRef, records.Residency, string,
+) {
 	rung := 1
 	pinned := make([]records.ModelRef, 0, len(models))
 	for i, model := range models {
 		fitted, index, ok := model.RungFor(sku.AcceleratorModel)
 		if !ok {
-			return 0, nil, orchestrator.VerdictGPUMismatch
+			return 0, nil, records.Residency{}, orchestrator.VerdictGPUMismatch
 		}
 		if i == 0 {
 			rung = index + 1
 		}
 		pinned = append(pinned, model.Pin(fitted))
 	}
-	if needsAccelerator {
-		if need, have := records.ResidentBytes(pinned), sku.VRAMGB<<30; need > have {
-			return rung, pinned, fmt.Sprintf("%s: needs %.1f GiB, %s has %d GB",
-				orchestrator.VerdictVRAMShort, float64(need)/(1<<30), sku.Name, sku.VRAMGB)
-		}
+	if !needsAccelerator {
+		return rung, pinned, records.Residency{}, ""
 	}
-	return rung, pinned, ""
+	need := records.Resident(pinned)
+	return rung, pinned, need, Fit(need, sku.VRAMGB, sku.Name)
+}
+
+// Fit is the one VRAM sanity floor the buy walk, the reuse check and an explicit override
+// are held to (cl-168): a device is short only when the entrypoint's resident components
+// measurably outweigh it. It is never a second opinion on the owner's rung — a selection
+// the card publishes no component bytes for fits by that assertion. VRAMGB is read as
+// GiB, the unit GPU memory is built in (an "80 GB" H100 carries 81920 MiB).
+func Fit(need records.Residency, vramGB int64, name string) string {
+	if need.Fit != records.FitComponents || need.Bytes <= vramGB<<30 {
+		return ""
+	}
+	return fmt.Sprintf("%s: needs %.1f GiB resident (%s), %s has %d GB",
+		orchestrator.VerdictVRAMShort, float64(need.Bytes)/(1<<30), need.Need, name, vramGB)
 }
 
 // ladderText renders the fit map the walk follows: the lone slot's ladder, or one
