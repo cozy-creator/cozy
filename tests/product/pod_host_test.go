@@ -83,6 +83,7 @@ type fakePod struct {
 	jobReady bool
 	// snapshotHeld replays actual retained attempt identities during reconnect tests.
 	snapshotHeld []*pb.HeldAttempt
+	hostHeld     func() []*pb.HeldAttempt
 	// localJobOnly supplies a prepared interface without any serving entrypoints.
 	localJobOnly bool
 	// onJobReady can delay and sequence the independent peer's readiness facts.
@@ -290,7 +291,11 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			if err != nil {
 				return err
 			}
-			hostBody, hostDigest, err := canonical.Identity(&pb.HostSnapshotBody{
+			var retained []*pb.HeldAttempt
+			if p.hostHeld != nil {
+				retained = p.hostHeld()
+			}
+			hostBody, hostDigest, err := canonical.Identity(&pb.HostSnapshotBody{HeldOutcomes: retained,
 				WeightsTransactions: []*pb.WeightsTransactionStatus{{
 					WeightsTransactionId: "sha256:" + strings.Repeat("ab", 32), RequestId: "job-prior",
 					AttemptOrdinal: 1, InvocationSpecDigest: "sha256:" + strings.Repeat("cd", 32),
