@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -566,6 +568,11 @@ type ModelRef struct {
 	// hub fact the capacity decision ranks a rental's missing download by (§3.2). Zero
 	// when the resolver did not carry it.
 	Bytes int64 `json:"bytes,omitempty"`
+	// ComponentBytes is the pinned lane's per-component stored bytes as the card publishes
+	// them (th-181), and ComponentUse the slot's method → components map from the package
+	// interface. Together they size what one entrypoint holds resident (cl-168).
+	ComponentBytes map[string]int64    `json:"component_bytes,omitempty"`
+	ComponentUse   map[string][]string `json:"component_use,omitempty"`
 	// Ladder is the hub binding's FIT MAP (cl-166): which lane belongs on which GPU
 	// class, in the owner's order, each rung resolved to the exact manifest the model
 	// card publishes for that lane. A ref carrying a Ladder and no Manifest is UNPINNED:
@@ -576,10 +583,11 @@ type ModelRef struct {
 
 // ModelRung is one (gpu, lane) fit resolved against the model card.
 type ModelRung struct {
-	GPU      string `json:"gpu"`
-	Lane     string `json:"lane"`
-	Manifest string `json:"manifest"`
-	Bytes    int64  `json:"bytes"`
+	GPU            string           `json:"gpu"`
+	Lane           string           `json:"lane"`
+	Manifest       string           `json:"manifest"`
+	Bytes          int64            `json:"bytes"`
+	ComponentBytes map[string]int64 `json:"component_bytes,omitempty"`
 }
 
 func (r ModelRung) String() string { return r.GPU + "=" + r.Lane }
@@ -592,7 +600,8 @@ func (m ModelRef) Pinned() bool { return m.Manifest != "" }
 // NVIDIA device — fits only the "*" rung.
 func (m ModelRef) RungFor(accelerator string) (ModelRung, int, bool) {
 	if m.Pinned() {
-		return ModelRung{GPU: "*", Lane: m.Lane, Manifest: m.Manifest, Bytes: m.Bytes}, 0, true
+		return ModelRung{GPU: "*", Lane: m.Lane, Manifest: m.Manifest, Bytes: m.Bytes,
+			ComponentBytes: m.ComponentBytes}, 0, true
 	}
 	for i, rung := range m.Ladder {
 		if RungMatches(rung.GPU, accelerator) {
@@ -605,7 +614,8 @@ func (m ModelRef) RungFor(accelerator string) (ModelRung, int, bool) {
 // Pin returns the ref bound to one rung. The ladder is dropped: a pinned ref is the same
 // object an explicit `model.<param>=org/model@release/lane` produces.
 func (m ModelRef) Pin(rung ModelRung) ModelRef {
-	m.Lane, m.Manifest, m.Bytes, m.Ladder = rung.Lane, rung.Manifest, rung.Bytes, nil
+	m.Lane, m.Manifest, m.Bytes, m.ComponentBytes, m.Ladder =
+		rung.Lane, rung.Manifest, rung.Bytes, rung.ComponentBytes, nil
 	return m
 }
 
@@ -623,14 +633,73 @@ func PinModels(models []ModelRef, accelerator string) ([]ModelRef, string) {
 	return out, ""
 }
 
-// ResidentBytes is what the pinned selection weighs on one device: the lanes' total
-// manifest bytes summed over slots, because a placement holds every slot at once.
-func ResidentBytes(models []ModelRef) int64 {
-	var total int64
-	for _, model := range models {
-		total += model.Bytes
+// How a machine-class decision sized the device (cl-168).
+const (
+	// FitComponents: the card published every component's bytes, so the need is the
+	// entrypoint's largest resident group and the device is held to it.
+	FitComponents = "components"
+	// FitRungAsserted: the card carries no per-component bytes for a pinned lane. The
+	// owner's rung is the assertion that the lane fits this class; no figure overrides it.
+	FitRungAsserted = "rung_asserted"
+)
+
+// Residency is what a pinned selection must hold on one device at once.
+type Residency struct {
+	Bytes int64
+	Fit   string
+	// Need names each slot's largest group — `condition_text: text_encoder`, or the largest
+	// single component when the slot declares no component_use.
+	Need string
+}
+
+// Resident sizes the selection the way cozy-runtime loads it: per slot, the largest sum
+// over the slot's component_use groups (a method stages only the components it names), or
+// the largest single component when the slot declares none; summed over slots, because a
+// placement holds every slot at once. A pinned lane with no component bytes makes the
+// whole selection rung-asserted — there is no figure to hold a device to.
+func Resident(models []ModelRef) Residency {
+	if len(models) == 0 {
+		return Residency{}
 	}
-	return total
+	out := Residency{Fit: FitComponents}
+	needs := make([]string, 0, len(models))
+	for _, model := range models {
+		if len(model.ComponentBytes) == 0 {
+			return Residency{Fit: FitRungAsserted}
+		}
+		bytes, need := model.resident()
+		out.Bytes += bytes
+		needs = append(needs, need)
+	}
+	out.Need = strings.Join(needs, "; ")
+	return out
+}
+
+func (m ModelRef) resident() (int64, string) {
+	var best int64
+	need := ""
+	for _, method := range slices.Sorted(maps.Keys(m.ComponentUse)) {
+		components := m.ComponentUse[method]
+		if len(components) == 0 {
+			continue
+		}
+		var sum int64
+		for _, component := range components {
+			sum += m.ComponentBytes[component]
+		}
+		if need == "" || sum > best {
+			best, need = sum, method+": "+strings.Join(components, "+")
+		}
+	}
+	if need != "" {
+		return best, need
+	}
+	for _, component := range slices.Sorted(maps.Keys(m.ComponentBytes)) {
+		if bytes := m.ComponentBytes[component]; need == "" || bytes > best {
+			best, need = bytes, component
+		}
+	}
+	return best, need
 }
 
 // Lanes renders the pinned selection for a log line or audit row: the lane alone for one

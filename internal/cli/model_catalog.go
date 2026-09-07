@@ -141,8 +141,12 @@ func (view modelInfoView) Emit(w io.Writer, mode output.Mode) error {
 	for _, release := range card.Releases {
 		lanes := make([]map[string]any, 0, len(release.Lanes))
 		for _, lane := range release.Lanes {
-			lanes = append(lanes, map[string]any{"lane": lane.Lane, "bytes": lane.Bytes, "components": lane.Components,
-				"checkpoint_id": lane.ManifestID, "checkpoint_ref": card.Model.Ref() + "@" + lane.ManifestID})
+			row := map[string]any{"lane": lane.Lane, "bytes": lane.Bytes, "components": lane.Components,
+				"checkpoint_id": lane.ManifestID, "checkpoint_ref": card.Model.Ref() + "@" + lane.ManifestID}
+			if lane.ComponentBytes != nil {
+				row["component_bytes"] = lane.ComponentBytes
+			}
+			lanes = append(lanes, row)
 		}
 		var created any
 		if release.CutAt != "" {

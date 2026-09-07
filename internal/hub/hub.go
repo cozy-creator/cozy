@@ -182,7 +182,10 @@ type ModelLaneSummary struct {
 	Lane       string   `json:"lane"`
 	ManifestID string   `json:"manifest_id"`
 	Components []string `json:"components"`
-	Bytes      int64    `json:"bytes"`
+	// ComponentBytes is each component's stored bytes (th-181); absent when the hub has
+	// not derived them for this checkpoint.
+	ComponentBytes map[string]int64 `json:"component_bytes,omitempty"`
+	Bytes          int64            `json:"bytes"`
 }
 
 type ModelReleaseSummary struct {

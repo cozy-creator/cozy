@@ -348,21 +348,24 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 				exclude(orchestrator.ExcludedGPUMismatch + ": " + slot)
 				continue
 			}
-			// A machine the user already has up is never pinned a lane it cannot hold
-			// either; the catalog's memory figure for its product is the fact (a
-			// product gone from the catalog this minute decides nothing).
-			if need, have := records.ResidentBytes(pinned), vram[row.SKU]<<30; needsAccelerator &&
-				have > 0 && need > have {
-				exclude(fmt.Sprintf("%s: needs %.1f GiB, %s has %d GB", orchestrator.ExcludedVRAMShort,
-					float64(need)/(1<<30), row.SKU, vram[row.SKU]))
-				continue
+			candidate := orchestrator.RentalCandidate{RentalID: row.ID, Models: pinned}
+			if needsAccelerator {
+				// A machine the user already has up is held to the same floor as a buy;
+				// the catalog's memory figure for its product is the fact (a product gone
+				// from the catalog this minute decides nothing).
+				need := records.Resident(pinned)
+				candidate.Fit, candidate.ResidentBytes, candidate.VRAMBytes = need.Fit, need.Bytes, vram[row.SKU]<<30
+				if verdict := rental.Fit(need, vram[row.SKU], row.SKU); vram[row.SKU] > 0 && verdict != "" {
+					exclude(verdict)
+					continue
+				}
 			}
 			queued, _, problem := m.store.RentalRunCounts(row.ID)
 			if problem != nil {
 				return none, "", problem
 			}
-			candidates = append(candidates, orchestrator.RentalCandidate{
-				RentalID: row.ID, Queued: queued, Models: pinned})
+			candidate.Queued = queued
+			candidates = append(candidates, candidate)
 		}
 	}
 	ids := make([]string, 0, len(candidates))
@@ -483,8 +486,7 @@ func (m *managedRentals) buyLocked(req records.Request, skus []hub.RentalSKU, ne
 		if problem := m.store.PinRequestModels(req.ID, step.Models); problem != nil {
 			return none, "", problem
 		}
-		fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s (rung %d, lane %s)\n",
-			step.SKU.Name, skuRate(step.SKU), step.Rung, orNone(records.Lanes(step.Models)))
+		fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s (%s)\n", step.SKU.Name, skuRate(step.SKU), stepNote(step))
 		row, problem := m.rentLocked(req, step)
 		if problem != nil {
 			if problem.ErrName() != "rental.sku_out_of_stock" && problem.ErrName() != "rental.sku_unavailable" {
@@ -554,6 +556,19 @@ func (m *managedRentals) rentLocked(req records.Request, step rental.Step) (reco
 			}
 		})
 	return row, problem
+}
+
+// stepNote renders one walk step for the log: its rung, lane and how the device was sized.
+func stepNote(step rental.Step) string {
+	note := fmt.Sprintf("rung %d, lane %s", step.Rung, orNone(records.Lanes(step.Models)))
+	switch step.Fit.Fit {
+	case records.FitComponents:
+		note += fmt.Sprintf(", fit %s %.1f GiB of %d GB", records.FitComponents,
+			float64(step.Fit.Bytes)/(1<<30), step.SKU.VRAMGB)
+	case records.FitRungAsserted:
+		note += ", fit " + records.FitRungAsserted
+	}
+	return note
 }
 
 // verdicts renders why every offered product was excluded, for a refusal with no step.
