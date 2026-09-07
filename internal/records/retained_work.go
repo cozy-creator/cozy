@@ -88,13 +88,25 @@ func (r Request) RetainsLocalOutputs() bool {
 }
 
 func (s *Store) BlockRetainedWork(id, code, detail string) (bool, *exit.Error) {
+	return s.blockRetainedWork(id, code, detail, false)
+}
+
+func (s *Store) BlockLostRetainedWork(id, detail string) (bool, *exit.Error) {
+	return s.blockRetainedWork(id, "request.state_lost", detail, true)
+}
+
+func (s *Store) blockRetainedWork(id, code, detail string, includeStopped bool) (bool, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, exit.Internalf("cannot begin retained failure: %s", err)
 	}
 	defer tx.Rollback()
+	states := `'submitted','queued','dispatching','requeue_pending','finalizing'`
+	if includeStopped {
+		states += `,'pausing','paused'`
+	}
 	result, err := tx.Exec(`UPDATE requests SET state='blocked' WHERE id=? AND retain_work=1
-		AND state IN ('submitted','queued','dispatching','requeue_pending','finalizing','pausing','paused')`, id)
+		AND state IN (`+states+`)`, id)
 	if err != nil {
 		return false, exit.Internalf("cannot retain failed work: %s", err)
 	}
