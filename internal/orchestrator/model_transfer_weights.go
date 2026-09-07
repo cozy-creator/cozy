@@ -64,7 +64,8 @@ func NewWeightsGrantWindow(mint WeightsGrantMinter) *WeightsGrantWindow {
 func (w *WeightsGrantWindow) Spendable(ctx context.Context, objectID string, ahead []string,
 	now time.Time,
 ) (WeightsTransferDecision, *exit.Error) {
-	if decision, held := w.held[objectID]; held && !w.Stale(now) {
+	// Held custody has no signed URL to expire; it lasts for this publication.
+	if decision, held := w.held[objectID]; held && (decision.Held || !w.Stale(now)) {
 		return decision, nil
 	}
 	window := ahead
