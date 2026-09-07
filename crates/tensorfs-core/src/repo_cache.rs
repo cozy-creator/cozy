@@ -861,6 +861,13 @@ impl MirrorState {
     }
 }
 
+impl Drop for Mirror {
+    fn drop(&mut self) {
+        self.close();
+        self.drain();
+    }
+}
+
 #[cfg(test)]
 mod backfill_tests {
     use super::*;
@@ -953,12 +960,5 @@ mod backfill_tests {
             1
         );
         fs::remove_dir_all(root).unwrap();
-    }
-}
-
-impl Drop for Mirror {
-    fn drop(&mut self) {
-        self.close();
-        self.drain();
     }
 }
