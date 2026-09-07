@@ -436,6 +436,38 @@ impl Progress {
     }
 }
 
+/// Shared across every profile in one source-preparation call. A journal op stays atomic;
+/// an oversized first op is permitted, and its measured size is reported to the caller.
+#[derive(Debug)]
+pub struct Budget {
+    limit: u64,
+    used: u64,
+    stopped: bool,
+    pub largest_op: u64,
+}
+
+impl Budget {
+    pub fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            used: 0,
+            stopped: false,
+            largest_op: 0,
+        }
+    }
+    fn take(&mut self, bytes: u64) -> bool {
+        if self.stopped {
+            return false;
+        }
+        if self.used > 0 && bytes > self.limit.saturating_sub(self.used) {
+            self.stopped = true;
+            return false;
+        }
+        self.used = self.used.saturating_add(bytes);
+        true
+    }
+}
+
 /// Make sure the session root exists. The journal lives inside it, and `gc::session_holds`
 /// reads it — so this is also the act that puts in-flight conversion output under the
 /// filesystem's own hold protocol.
@@ -517,6 +549,22 @@ pub fn convert(
     carriers: Carriers<'_>,
     mirror: Option<&Mirror>,
 ) -> Result<Progress> {
+    convert_bounded(
+        store, plan, files, journal, operation, carriers, mirror, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn convert_bounded(
+    store: &Store,
+    plan: &Plan,
+    files: &[SourceFile],
+    journal: &mut Journal,
+    operation: &str,
+    carriers: Carriers<'_>,
+    mirror: Option<&Mirror>,
+    mut budget: Option<&mut Budget>,
+) -> Result<Progress> {
     plan.require_order()?;
     let mut progress = Progress::default();
 
@@ -557,9 +605,24 @@ pub fn convert(
             let (path, _) = carrier::resolve(&source.path, &source.header, tensor)?;
             dependencies.push((file, path.to_path_buf()));
         }
-        if !dependencies
+        let ready = dependencies
             .iter()
-            .all(|(file, path)| carriers.has(*file, path))
+            .all(|(file, path)| carriers.has(*file, path));
+        let bytes = op.roles.iter().try_fold(0u64, |sum, role| {
+            let next = if matches!(role.bytes, Bytes::Inherit { .. }) {
+                0
+            } else {
+                checked_bytes("conversion op", &role.shape, role.dtype)?
+            };
+            sum.checked_add(next).ok_or_else(|| Refusal {
+                code: Code::COUNT_CAP,
+                detail: "conversion op byte count overflows".into(),
+            })
+        })?;
+        if !ready
+            || budget
+                .as_deref_mut()
+                .is_some_and(|budget| !budget.take(bytes))
         {
             progress
                 .needed
@@ -567,6 +630,7 @@ pub fn convert(
             progress.deferred_ops += 1;
             continue;
         }
+        let written_before = progress.written;
 
         let mut tparts: Vec<(String, Part)> = Vec::new();
         for r in &op.roles {
@@ -688,6 +752,9 @@ pub fn convert(
         // starts, so a kill here costs one op and never the pass.
         journal.record(&op.component, &op.out_key, &tparts)?;
         progress.converted_roles += tparts.len();
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.largest_op = budget.largest_op.max(progress.written - written_before);
+        }
         // THE MEANING IS ON THIS DISK; NOW THE BYTES LEAVE IT. The order is the guarantee:
         // the journal names the part before anything publishes it, so a crash between the
         // two leaves a journalled op whose objects are only local — which the next run
@@ -954,6 +1021,7 @@ pub fn advance(
         carriers,
         mirror,
         &mut journal,
+        None,
     )
 }
 
@@ -970,9 +1038,12 @@ pub fn advance_journal(
     carriers: Carriers<'_>,
     mirror: Option<&Mirror>,
     journal: &mut Journal,
+    budget: Option<&mut Budget>,
 ) -> Result<(Progress, Option<Outcome>)> {
     let t0 = Instant::now();
-    let progress = convert(store, plan, files, journal, operation, carriers, mirror)?;
+    let progress = convert_bounded(
+        store, plan, files, journal, operation, carriers, mirror, budget,
+    )?;
     if !progress.complete() {
         return Ok((progress, None));
     }

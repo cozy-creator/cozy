@@ -31,7 +31,8 @@ def main():
                        "parts": {"value": {"dtype": "f32", "shape": [512]}}},
             "bias": {"logical_dtype": "f32", "shape": [1], "encoding": seeds["plain/1"],
                      "parts": {"value": {"dtype": "f32", "shape": [1]}}},
-        }}}, {}, [("model", "weight"), ("model", "unused"), ("model", "bias")], 8192)
+        }}}, {}, [("model", "weight"), ("model", "unused"), ("model", "bias")], 8192,
+            work_fingerprint="sha256:" + "86" * 32)
         for key, role, raw in (("weight", "data", data), ("weight", "scale", scale),
                                ("unused", "value", unused), ("bias", "value", bias)):
             writer.add_part("model", key, role, io.BytesIO(raw))

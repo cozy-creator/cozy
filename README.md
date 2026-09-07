@@ -492,7 +492,7 @@ prepared = store.prepare_model_source(
     checkpoints=[(slot, previous_head_id, previous_head_length), ...],
 )
 # prepared = {complete, replayed, sources, checkpoints, spent,
-#             converted_roles, resumed_roles, deferred_ops}
+#             converted_roles, resumed_roles, deferred_ops, converted_bytes, largest_op_bytes}
 # Only after the operation is adopted or explicitly abandoned:
 store.release_model_source(operation_id)
 ```
@@ -500,7 +500,10 @@ store.release_model_source(operation_id)
 The sorted roster contains all members from the outset. Headers are exact JSON index bytes or
 the safetensors eight-byte length plus header JSON. Every body length is pinned; only members in
 `landed_members` need exist. TensorFS plans from all headers, resolves each tensor to its physical
-shard, converts available ops, and journals them before returning. A shared index object can still
+shard, converts available ops, and journals them before returning. One pass shares a 4 GiB
+conversion budget across all profiles, stopping between complete ops. One oversized first op
+may progress; `converted_bytes` and `largest_op_bytes` report the measured work. A pass with no
+new work keeps its latest local head, including when the owner acknowledgment is delayed. A shared index object can still
 name different shard sets through its two member names. Local paths and unrelated registry entries
 do not change work identity; source ObjectRefs and the actual ordered tensor plan do.
 
@@ -508,9 +511,32 @@ do not change work identity; source ObjectRefs and the actual ordered tensor pla
 profile is complete. Partial work returns separate `checkpoints` rows:
 `{slot, head, head_length, plan_digest, index, bytes}`. These are **local** progress, not a claim of
 remote durability. The existing immutable Link format carries at most 128 new refs per link and
-an opaque journal snapshot. `Store.source_checkpoint_page` validates operation/slot/plan and
+an opaque journal snapshot. `Store.checkpoint_page` validates operation/slot/plan and
 returns bounded refs, predecessor and progress references; `tfs checkpoint page ROOT HEAD LENGTH`
-is its diagnostic CLI. Fetch/PUT use `Store.source_checkpoint_fetch/push` over the existing transport.
+is its diagnostic CLI. Fetch/PUT use `Store.checkpoint_fetch/push` over the existing transport.
+
+Derived writers use the same checkpoint transport. `Store.begin_derived` requires
+`work_fingerprint=` in addition to its existing transaction, epoch and declaration arguments.
+Before opening a writer, `Store.derived_declaration(sources, targets, configs, order,
+max_new_bytes, work_fingerprint=...)` produces the exact canonical bytes for its intent.
+`Store.validate_derived_checkpoint(transaction_id, declaration, head_id, head_length,
+operation_id=..., slot=..., plan_digest=...)` verifies restored work without opening a writer.
+The caller owns that producer fingerprint and transaction ID; TensorFS locks them into one
+canonical declaration. Higher writer epochs retain verified accepted work. `completed_parts()`
+returns `(component, key, role)` keys and `completed_configs()` returns names, as detached views.
+Re-adding identical bytes is idempotent; changing an accepted part or config refuses.
+
+`writer.checkpoint(operation_id, slot, previous=...)` returns the same head/length/plan/index/bytes
+facts as source preparation. It extends the newest local cursor even before acknowledgment.
+After fetching the chain into an empty Store, pass `checkpoint=(head_id, length)` to
+`begin_derived`; only accepted work is imported, never the previous writer's authority. An absent
+or corrupt part is no longer completed and must be supplied again. Runtime decides which complete
+role groups can be skipped and owns their numerical quality checks. Fencing revokes authority;
+explicit abandonment or terminal disposition releases the private filesystem retention root.
+Inherited source closures must also be restored through their existing acquisition path before
+validating or opening the writer. A derived checkpoint carries added work, not a second copy of
+its inputs. The writer's private root retains its admitted sources across process death and
+release of their original source operation, until commit or abandonment.
 
 The caller may delete `spent` raw carriers once canonical output and its journal are held locally.
 The RecordOwner uploads each Link and its objects and retains an acknowledged head outside the pod.
@@ -572,11 +598,6 @@ whose writer is gone is abandoned only by the explicit `tfs ingest reap`. `--dry
 deleting; `gc holds` + `gc plan` are the same plan as separate documents, which is how a cloud
 caller (tensorhub) supplies its own holds against a staged census.
 
-`Store.derived_declaration(sources, targets, configs, order, max_new_bytes)` returns the
-canonical declaration bytes for a Runtime producer intent. It uses the same native encoder and
-validation as `begin_derived`, so the resulting receipt carries exactly that declaration.
-Building the declaration does not open or fence a writer.
-
 A derived commit creates a pending private root before releasing its writer. The owner's
 `Store.derived_adopt(transaction_id, scratch_root_id)` names that root without creating a model
 repository; the name is opaque to TensorFS. Same-name adoption replays, changing the name or
@@ -607,3 +628,16 @@ Selection uses exact existing part `what` identifiers, keeps every native window
 ObjectRef for those parts in native order, and compacts destination offsets. Duplicate or
 unknown identifiers refuse before I/O; an empty selection returns an empty plan. The original
 plan is unchanged, and selected plans use the same lease, stream and caller-owned ring.
+
+A committed derived result can acquire independent private retention without changing its
+execution receipt: `Store.retain_derived_result(transaction_id, expected_receipt_digest,
+retention_id)`. The caller supplies an exact SHA-256 retention identity; the result names
+the original transaction, receipt, and manifest. It verifies native retained custody and
+resident verification records without copying tensor payloads.
+
+`Store.release_derived_retention` takes the same three arguments and releases only that
+retention owner. Its durable tombstone rejects delayed reacquisition, including release
+before acquire. The original transaction can be disposed independently. Native GC finds
+these manifest roots directly from the filesystem, without relying on request or transaction
+metadata. Eligibility and authorization belong to the caller; this API provides storage
+retention and never schedules computation or publishes a model repository.

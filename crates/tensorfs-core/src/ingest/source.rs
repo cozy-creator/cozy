@@ -783,6 +783,9 @@ pub struct PrepareModelSource {
     pub landed: Vec<String>,
     /// Latest observed local heads. Only the caller knows which were remotely acknowledged.
     pub checkpoints: Vec<(String, ObjectRef)>,
+    /// Explicit same-Store reuse. The supplied heads remain owned by this predecessor;
+    /// preparation creates new operation-bound heads and independent retention roots.
+    pub adopt_from_operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -803,6 +806,8 @@ pub struct PreparedModelSources {
     pub converted_roles: usize,
     pub resumed_roles: usize,
     pub deferred_ops: usize,
+    pub converted_bytes: u64,
+    pub largest_op_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -899,6 +904,15 @@ fn validate_request(
     registry: &FingerprintRegistry,
 ) -> Result<(std::collections::BTreeSet<PathBuf>, Vec<FileFence>)> {
     crate::catalog::source_operation_id(&request.operation_id)?;
+    if let Some(prior) = &request.adopt_from_operation_id {
+        crate::catalog::source_operation_id(prior)?;
+        if prior == &request.operation_id || request.checkpoints.is_empty() {
+            return refuse(
+                Code::CROSS_SUBJECT_REPLAY,
+                "source adoption requires another operation and its checkpoint heads",
+            );
+        }
+    }
     prefixed("source selection digest", &request.source_selection_digest)?;
     if request.profiles.is_empty() || request.profiles.len() > 16 {
         return refuse(Code::COUNT_CAP, "source profile count is outside 1..=16");
@@ -1097,6 +1111,22 @@ fn prepare_model_source_with_registry(
     registry_locator: &str,
     registry_bytes: &[u8],
 ) -> Result<PreparedModelSources> {
+    prepare_model_source_with_budget(
+        store,
+        request,
+        registry_locator,
+        registry_bytes,
+        &mut transaction::Budget::new(durability::INTERVAL_BYTES),
+    )
+}
+
+fn prepare_model_source_with_budget(
+    store: &Store,
+    request: &PrepareModelSource,
+    registry_locator: &str,
+    registry_bytes: &[u8],
+    budget: &mut transaction::Budget,
+) -> Result<PreparedModelSources> {
     let registry = FingerprintRegistry::parse(registry_bytes)?;
     let (ready, fences) = validate_request(request, &registry)?;
     let digest = request_digest(request, registry_bytes);
@@ -1212,6 +1242,7 @@ fn prepare_model_source_with_registry(
                 let supplied = request
                     .checkpoints
                     .iter()
+                    .filter(|_| request.adopt_from_operation_id.is_none())
                     .find(|(slot, _)| slot == &requested.slot)
                     .map(|(_, head)| head);
                 let head = durability::checkpoint_predecessor(
@@ -1250,6 +1281,8 @@ fn prepare_model_source_with_registry(
                 converted_roles: 0,
                 resumed_roles: 0,
                 deferred_ops: 0,
+                converted_bytes: 0,
+                largest_op_bytes: 0,
             });
         }
         crate::catalog::SourcePreparation::Open(writer) => writer,
@@ -1264,19 +1297,42 @@ fn prepare_model_source_with_registry(
         converted_roles: 0,
         resumed_roles: 0,
         deferred_ops: 0,
+        converted_bytes: 0,
+        largest_op_bytes: 0,
     };
     let mut needed = std::collections::BTreeSet::new();
     for (requested, (plan_hex, prepared)) in request.profiles.iter().zip(plans) {
         let plan_digest = format!("sha256:{plan_hex}");
         let chain = format!("{}/{}", request.operation_id, requested.slot);
-        let previous = request
+        let mut previous = request
             .checkpoints
             .iter()
             .find(|(slot, _)| slot == &requested.slot)
-            .map(|(_, head)| head);
+            .map(|(_, head)| head.clone());
         let dir = transaction::candidate_dir(store.root(), &request.operation_id);
         let mut journal = super::journal::Journal::open(&dir, &plan_hex)?;
-        if let Some(head) = previous {
+        if let Some(prior) = &request.adopt_from_operation_id {
+            previous = if let Some(local) = journal.local_head()? {
+                // A repeated adoption call must continue its own newer progress even
+                // after the original operation has released its independent root.
+                Some(local)
+            } else if let Some(head) = &previous {
+                adopt_source_checkpoint(
+                    store,
+                    prior,
+                    &chain,
+                    &request.operation_id,
+                    &plan_hex,
+                    head,
+                    &dir,
+                    &mut journal,
+                )?
+                .head
+            } else {
+                None
+            };
+        }
+        if let Some(head) = &previous {
             let held = durability::local_chain(store, head, &plan_digest)?;
             if held.operation != chain {
                 return refuse(
@@ -1308,6 +1364,7 @@ fn prepare_model_source_with_registry(
             transaction::Carriers::Ready(&ready),
             None,
             &mut journal,
+            Some(budget),
         )?;
         let checkpoint = durability::checkpoint(
             store,
@@ -1317,7 +1374,7 @@ fn prepare_model_source_with_registry(
                 plan: &plan_digest,
                 interval: durability::INTERVAL_BYTES,
             },
-            previous,
+            previous.as_ref(),
             &journal,
         )?;
         if checkpoint.head.is_some() {
@@ -1329,6 +1386,8 @@ fn prepare_model_source_with_registry(
         }
         needed.extend(progress.needed);
         result.converted_roles += progress.converted_roles;
+        result.converted_bytes += progress.written;
+        result.largest_op_bytes = budget.largest_op;
         result.resumed_roles += progress.resumed_roles;
         result.deferred_ops += progress.deferred_ops;
         if let Some(outcome) = outcome {
@@ -1389,6 +1448,63 @@ pub fn prepare_model_source(
     request: &PrepareModelSource,
 ) -> Result<PreparedModelSources> {
     prepare_model_source_with_registry(store, request, BUILTIN_REGISTRY, BUILTIN_REGISTRY_BYTES)
+}
+
+/// Reuse verified journal parts without relabeling the old chain or its ownership.
+/// The destination writer fence is held by preparation. A temporary read hold spans
+/// validation through installation of the new persistent root, including a concurrent
+/// predecessor release. No tensor payload is copied and no source carrier is read.
+#[allow(clippy::too_many_arguments)]
+fn adopt_source_checkpoint(
+    store: &Store,
+    prior: &str,
+    chain: &str,
+    operation: &str,
+    plan_hex: &str,
+    head: &ObjectRef,
+    dir: &Path,
+    journal: &mut super::journal::Journal,
+) -> Result<durability::Head> {
+    let meta = crate::meta::Meta::open(store)?;
+    let hold = meta.acquire_hold("source-adoption")?;
+    let result = (|| {
+        let plan = format!("sha256:{plan_hex}");
+        let held = durability::local_chain(store, head, &plan)?;
+        let slot = chain
+            .strip_prefix(&format!("{operation}/"))
+            .expect("source slot chain");
+        if held.operation != format!("{prior}/{slot}") {
+            return refuse(
+                Code::CROSS_SUBJECT_REPLAY,
+                "adopted checkpoint belongs to another operation slot",
+            );
+        }
+        if journal.is_empty() {
+            let progress = held.progress.last().ok_or_else(|| Refusal {
+                code: Code::DURABILITY_UNPROVEN,
+                detail: "source checkpoint has no conversion progress".into(),
+            })?;
+            let bytes = durability::read_document(store, progress, crate::limits::DOC_MAX_BYTES)?;
+            super::journal::install(dir, plan_hex, &bytes)?;
+            *journal = super::journal::Journal::open(dir, plan_hex)?;
+        }
+        // checkpoint verifies every referenced object before returning its new head.
+        // The root owns those parts independently of the predecessor's chain.
+        transaction::name_candidates(store.root(), operation, &journal.objects())?;
+        durability::checkpoint(
+            store,
+            &durability::Policy {
+                chain,
+                operation,
+                plan: &plan,
+                interval: durability::INTERVAL_BYTES,
+            },
+            None,
+            journal,
+        )
+    })();
+    let released = hold.release(&meta);
+    result.and_then(|head| released.map(|()| head))
 }
 
 pub fn release_model_source(store: &Store, operation_id: &str) -> Result<()> {
@@ -1564,8 +1680,245 @@ mod tests {
                 "provider/second.safetensors".into(),
             ],
             checkpoints: Vec::new(),
+            adopt_from_operation_id: None,
         };
         (store, registry.to_bytes(), request)
+    }
+
+    #[test]
+    fn edited_source_request_adopts_parts_with_independent_heads_and_roots() {
+        let root = temporary("source-adoption");
+        let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+        let first =
+            prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
+                .unwrap();
+        assert!(first.complete);
+        let old_heads: Vec<_> = first
+            .checkpoints
+            .iter()
+            .map(|item| (item.slot.clone(), item.head.head.clone().unwrap()))
+            .collect();
+        let old_links: Vec<_> = old_heads
+            .iter()
+            .map(|(_, head)| durability::local_link(&store, head).unwrap())
+            .collect();
+        let mut retry = request.clone();
+        retry.operation_id = "edited-source-request".into();
+        retry.checkpoints = old_heads.clone();
+        retry.landed.clear();
+        for row in &request.roster {
+            fs::remove_file(&row.path).unwrap();
+        }
+        assert_eq!(
+            prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
+                .unwrap_err()
+                .code,
+            Code::CROSS_SUBJECT_REPLAY,
+            "ordinary resume cannot silently adopt another request"
+        );
+        retry.adopt_from_operation_id = Some(request.operation_id.clone());
+        let adopted =
+            prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
+                .unwrap();
+        assert!(adopted.complete);
+        assert_eq!(adopted.converted_bytes, 0);
+        assert_eq!(adopted.converted_roles, 0);
+        assert_eq!(adopted.sources, first.sources);
+        for ((item, (_, old_head)), old_link) in
+            adopted.checkpoints.iter().zip(&old_heads).zip(&old_links)
+        {
+            let head = item.head.head.as_ref().unwrap();
+            assert_ne!(
+                head, old_head,
+                "new request must own a new checkpoint chain"
+            );
+            let new_link = durability::local_link(&store, head).unwrap();
+            assert_eq!(
+                new_link.operation,
+                format!("{}/{}", retry.operation_id, item.slot)
+            );
+            assert_eq!(
+                durability::local_link(&store, old_head).unwrap(),
+                *old_link,
+                "old chain changed"
+            );
+        }
+        release_model_source(&store, &request.operation_id).unwrap();
+        crate::gc::collect(store.root(), false).unwrap();
+        let replay =
+            prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
+                .unwrap();
+        assert!(replay.replayed && replay.complete);
+        assert_eq!(replay.sources, adopted.sources);
+        assert_eq!(replay.checkpoints, adopted.checkpoints);
+        assert_eq!(replay.converted_bytes, 0);
+        for source in &replay.sources {
+            validate_prepared_result(&store, source).unwrap();
+        }
+        release_model_source(&store, &retry.operation_id).unwrap();
+        crate::gc::collect(store.root(), false).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_source_adoption_resumes_remaining_work_after_predecessor_release() {
+        let root = temporary("source-partial-adoption");
+        let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+        let first = prepare_model_source_with_budget(
+            &store,
+            &request,
+            "fixture:registry",
+            &registry,
+            &mut transaction::Budget::new(1024),
+        )
+        .unwrap();
+        assert!(!first.complete);
+        assert_eq!(first.converted_roles, 1);
+        let mut retry = request.clone();
+        retry.operation_id = "edited-partial-source".into();
+        retry.adopt_from_operation_id = Some(request.operation_id.clone());
+        retry.checkpoints = first
+            .checkpoints
+            .iter()
+            .map(|item| (item.slot.clone(), item.head.head.clone().unwrap()))
+            .collect();
+        retry.landed.clear();
+        fs::remove_file(&retry.roster[0].path).unwrap();
+        let adopted =
+            prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
+                .unwrap();
+        assert!(!adopted.complete);
+        assert_eq!(adopted.converted_bytes, 0);
+        assert_eq!(adopted.resumed_roles, 1);
+        release_model_source(&store, &request.operation_id).unwrap();
+        crate::gc::collect(store.root(), false).unwrap();
+        retry.landed.push(retry.roster[1].member.clone());
+        let completed =
+            prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
+                .unwrap();
+        assert!(completed.complete);
+        assert_eq!(completed.converted_roles, 1);
+        assert_eq!(completed.converted_bytes, 4096);
+        assert_eq!(completed.resumed_roles, 1);
+        assert_eq!(completed.checkpoints[0], adopted.checkpoints[0]);
+        release_model_source(&store, &retry.operation_id).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_adoption_refuses_changed_identity_and_missing_payload() {
+        for arm in ["selection", "carrier", "operation", "slot", "missing"] {
+            let root = temporary(&format!("source-adoption-{arm}"));
+            let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+            let first =
+                prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
+                    .unwrap();
+            let mut retry = request.clone();
+            retry.operation_id = "edited-source-request".into();
+            retry.adopt_from_operation_id = Some(request.operation_id.clone());
+            retry.checkpoints = first
+                .checkpoints
+                .iter()
+                .map(|item| (item.slot.clone(), item.head.head.clone().unwrap()))
+                .collect();
+            retry.landed.clear();
+            match arm {
+                "selection" => {
+                    retry.source_selection_digest = format!("sha256:{}", "55".repeat(32))
+                }
+                "carrier" => retry.roster[0].object_id = format!("sha256:{}", "55".repeat(32)),
+                "operation" => retry.adopt_from_operation_id = Some("unrelated-operation".into()),
+                "slot" => {
+                    let left = retry.checkpoints[0].1.clone();
+                    retry.checkpoints[0].1 = retry.checkpoints[1].1.clone();
+                    retry.checkpoints[1].1 = left;
+                }
+                "missing" => {
+                    let head = first.checkpoints[0].head.head.as_ref().unwrap();
+                    let chain =
+                        durability::local_chain(&store, head, &first.checkpoints[0].plan_digest)
+                            .unwrap();
+                    let part = chain
+                        .blobs
+                        .iter()
+                        .find(|object| object.length == 4096)
+                        .unwrap();
+                    fs::remove_file(store.object_path(&part.sha256)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error =
+                prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    error.code,
+                    Code::CROSS_SUBJECT_REPLAY
+                        | Code::OBJECT_ABSENT
+                        | Code::IO_FAILED
+                        | Code::JOURNAL_STALE
+                ),
+                "{arm}: {error:?}"
+            );
+            assert!(Catalog::open(store.root())
+                .unwrap()
+                .model_source_operations()
+                .unwrap()
+                .contains(&request.operation_id));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn one_pass_budget_is_shared_by_profiles_and_allows_one_oversized_op() {
+        for limit in [1024, 4096] {
+            let root = temporary("bounded-profiles");
+            let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+            let first = prepare_model_source_with_budget(
+                &store,
+                &request,
+                "fixture:registry",
+                &registry,
+                &mut transaction::Budget::new(limit),
+            )
+            .unwrap();
+            assert!(!first.complete);
+            assert_eq!(first.converted_roles, 1);
+            assert_eq!(first.converted_bytes, 4096);
+            assert_eq!(first.largest_op_bytes, 4096);
+            assert_eq!(first.deferred_ops, 1, "one budget covers both profiles");
+            let mut stalled = request.clone();
+            stalled.landed.clear();
+            let no_work = prepare_model_source_with_budget(
+                &store,
+                &stalled,
+                "fixture:registry",
+                &registry,
+                &mut transaction::Budget::new(limit),
+            )
+            .unwrap();
+            assert_eq!(no_work.converted_bytes, 0);
+            assert_eq!(no_work.largest_op_bytes, 0);
+            assert_eq!(no_work.checkpoints, first.checkpoints);
+            let second = prepare_model_source_with_budget(
+                &store,
+                &request,
+                "fixture:registry",
+                &registry,
+                &mut transaction::Budget::new(limit),
+            )
+            .unwrap();
+            assert!(second.complete);
+            assert_eq!(second.converted_roles, 1);
+            assert_eq!(second.resumed_roles, 1);
+            assert_eq!(second.converted_bytes, 4096);
+            let clean = Store::init(&root.join("clean")).unwrap();
+            let expected =
+                prepare_model_source_with_registry(&clean, &request, "fixture:registry", &registry)
+                    .unwrap();
+            assert_eq!(second.sources, expected.sources);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -1619,6 +1972,7 @@ mod tests {
             prepare_model_source_with_registry(&store, &bodies_gone, "fixture:registry", &registry)
                 .unwrap();
         assert_eq!(recovered_heads.checkpoints, first.checkpoints);
+        assert_eq!(recovered_heads.converted_bytes, 0);
         // Remaining arms need their original carriers again.
         carrier(&request.roster[0].path, "weight", [1, 2, 3, 4]);
         carrier(&request.roster[1].path, "weight", [5, 6, 7, 8]);
@@ -2110,6 +2464,7 @@ mod tests {
             roster: files.clone(),
             landed: files.iter().map(|row| row.member.clone()).collect(),
             checkpoints: Vec::new(),
+            adopt_from_operation_id: None,
         };
 
         let prepared = prepare_model_source_with_registry(
@@ -2371,8 +2726,9 @@ mod tests {
         assert!(replay.replayed && replay.complete);
         assert_eq!(
             replay.checkpoints, resumed.checkpoints,
-            "a lost final response replays even with an old ACK"
+            "a lost final response is replayed even with an old ACK"
         );
+        assert_eq!(replay.converted_bytes, 0);
         let mut unrelated = registry.clone();
         unrelated.entries[0]
             .provenance

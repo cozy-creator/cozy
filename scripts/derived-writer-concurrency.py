@@ -25,14 +25,14 @@ def exercise(arm):
                        "parts": {"value": {"dtype": "u8", "shape": shape}}},
         }}}
         source = store.begin_derived("sha256:"+"01"*32, 1, {}, target, {},
-                                     [("model", "weight")], len(body))
+                                     [("model", "weight")], len(body), work_fingerprint="sha256:"+"11"*32)
         source.add_part("model", "weight", "value", io.BytesIO(body))
         source_ref = source.commit()["manifest"]
         writer = store.begin_derived("sha256:"+"02"*32, 1,
                                     {"source": ("sha256:"+source_ref["sha256"], source_ref["length"])},
                                     {"model": {"source": "source", "source_component": "model",
                                                "drop": [], "add": {}}},
-                                    {}, [("model", "weight")], len(body))
+                                    {}, [("model", "weight")], len(body), work_fingerprint="sha256:"+"12"*32)
         barrier = threading.Barrier(4)
         first_read, closing = threading.Event(), threading.Event()
 

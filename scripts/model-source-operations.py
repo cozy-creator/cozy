@@ -24,7 +24,7 @@ def observe(fixture: Path) -> dict[str, object]:
     operations = store.model_source_operations()
     heads = []
     for head in metadata["heads"]:
-        page = store.source_checkpoint_page(
+        page = store.checkpoint_page(
             head["head_id"], head["head_length"], operation_id=metadata["operation"],
             slot=head["slot"], plan_digest=head["plan_digest"],
         )
@@ -46,7 +46,7 @@ def main() -> None:
     writer = store.begin_derived(transaction, 1, {}, {"new": {"drop": [], "add": {
         "weight": {"logical_dtype": "f32", "shape": [512], "encoding": plain,
                    "parts": {"value": {"dtype": "f32", "shape": [512]}}},
-    }}}, {}, [("new", "weight")], 2048)
+    }}}, {}, [("new", "weight")], 2048, work_fingerprint="sha256:" + "84" * 32)
     assert store.model_source_operations() == before["operations"]
     writer.add_part("new", "weight", "value", io.BytesIO(bytes(2048)))
     writer.commit()

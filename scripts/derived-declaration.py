@@ -21,17 +21,18 @@ def main():
     }}}
     configs = {"model.json": {"kind": "add"}}
     order = [("model", "table"), ("model", "weight")]
+    fingerprint = "sha256:" + "42" * 32
     transaction = "sha256:" + "82" * 32
     with tempfile.TemporaryDirectory(prefix="tensorfs-native-declaration-") as root:
         store = tensorfs.Store.init(root)
-        declaration = store.derived_declaration({}, targets, configs, order, 4096)
+        declaration = store.derived_declaration({}, targets, configs, order, 4096, work_fingerprint=fingerprint)
         assert isinstance(declaration, bytes)
         assert store.derived_lookup(transaction)["state"] == "absent"
         expected = json.loads(declaration)
         assert expected["components"]["model"]["add"]["weight"]["logical"]["dtype"] == "bf16"
-        assert "work_fingerprint" not in expected
+        assert expected["work_fingerprint"] == fingerprint
         def filled_writer(transaction):
-            writer = store.begin_derived(transaction, 1, {}, targets, configs, order, 4096)
+            writer = store.begin_derived(transaction, 1, {}, targets, configs, order, 4096, work_fingerprint=fingerprint)
             writer.add_part("model", "table", "value", io.BytesIO(bytes(2048)))
             writer.add_part("model", "weight", "data", io.BytesIO(bytes([0x31]) * 512))
             writer.add_part("model", "weight", "scale", io.BytesIO(bytes(64)))
@@ -43,7 +44,7 @@ def main():
         assert receipt["declaration"] == expected
         assert store.derived_lookup(transaction)["receipt"] == receipt
         store.derived_dispose(transaction)
-        print("native declaration green: source-free table + FP8 data/scale + config; exact receipt equality; existing writer ABI")
+        print("native declaration green: source-free table + FP8 data/scale + config; exact receipt equality; required work fingerprint")
 
         for arm, suffix in (("revoked", "83"), ("fenced", "84")):
             transaction = "sha256:" + suffix * 32

@@ -352,6 +352,7 @@ fn parse_declaration(
         }
     }
     let mut declaration = Declaration {
+        work_fingerprint: None,
         sources: source_rows,
         components,
         configs: config_rows,
@@ -754,7 +755,7 @@ impl PyStore {
 
     /// Advance the exact source plan over verified physical carriers. Checkpoint heads are
     /// local progress until the RecordOwner acknowledges their complete upload.
-    #[pyo3(signature = (operation_id, source_selection_digest, profiles, roster, landed, *, checkpoints=Vec::new()))]
+    #[pyo3(signature = (operation_id, source_selection_digest, profiles, roster, landed, *, checkpoints=Vec::new(), adopt_from_operation_id=None))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn prepare_model_source<'p>(
         &self,
@@ -765,6 +766,7 @@ impl PyStore {
         roster: Vec<(String, String, u64, PathBuf, Vec<u8>)>,
         landed: Vec<String>,
         checkpoints: Vec<(String, String, u64)>,
+        adopt_from_operation_id: Option<String>,
     ) -> PyResult<Bound<'p, PyDict>> {
         let checkpoints = checkpoints
             .into_iter()
@@ -802,6 +804,7 @@ impl PyStore {
                 .collect(),
             landed,
             checkpoints,
+            adopt_from_operation_id,
         };
         let prepared = py
             .detach(|| model_source::prepare_model_source(&self.store, &request))
@@ -813,6 +816,8 @@ impl PyStore {
         out.set_item("converted_roles", prepared.converted_roles)?;
         out.set_item("resumed_roles", prepared.resumed_roles)?;
         out.set_item("deferred_ops", prepared.deferred_ops)?;
+        out.set_item("converted_bytes", prepared.converted_bytes)?;
+        out.set_item("largest_op_bytes", prepared.largest_op_bytes)?;
         let rows = PyList::empty(py);
         for source in prepared.sources {
             let row = PyDict::new(py);
@@ -844,7 +849,7 @@ impl PyStore {
     /// One bounded link window, usable as soon as that link alone is resident.
     #[pyo3(signature = (head_id, head_length, *, operation_id, slot, plan_digest, offset=0, limit=128))]
     #[allow(clippy::too_many_arguments)]
-    fn source_checkpoint_page<'p>(
+    fn checkpoint_page<'p>(
         &self,
         py: Python<'p>,
         head_id: &str,
@@ -909,7 +914,7 @@ impl PyStore {
     /// length is checked before a socket opens, and the grant never leaves process memory.
     #[pyo3(signature = (object_id, length, manifest, grant, *, allow_local=false))]
     #[allow(clippy::too_many_arguments)]
-    fn source_checkpoint_push<'p>(
+    fn checkpoint_push<'p>(
         &self,
         py: Python<'p>,
         object_id: &str,
@@ -933,7 +938,12 @@ impl PyStore {
         let pushed = py
             .detach(|| {
                 let (plan, _) = if manifest {
-                    fetch::FetchPlan::of(&self.store, "checkpoint-upload", &object, &[])?
+                    fetch::FetchPlan::of(
+                        &self.store,
+                        "checkpoint-upload",
+                        &object,
+                        std::slice::from_ref(&object),
+                    )?
                 } else {
                     fetch::FetchPlan::of_objects(
                         &self.store,
@@ -968,9 +978,9 @@ impl PyStore {
     }
 
     /// Fetch one exact recovery object through ordinary digest/length admission.
-    #[pyo3(signature = (object_id, length, manifest, url, *, allow_local=false))]
+    #[pyo3(signature = (object_id, length, manifest, url, *, allow_local=false, derived_restore=None))]
     #[allow(clippy::too_many_arguments)]
-    fn source_checkpoint_fetch<'p>(
+    fn checkpoint_fetch<'p>(
         &self,
         py: Python<'p>,
         object_id: &str,
@@ -978,6 +988,7 @@ impl PyStore {
         manifest: bool,
         url: &str,
         allow_local: bool,
+        derived_restore: Option<(String, u64)>,
     ) -> PyResult<Bound<'p, PyDict>> {
         use tensorfs_core::{fetch, transport};
         let id = prefixed("checkpoint object", object_id).or_refuse(py)?;
@@ -992,31 +1003,56 @@ impl PyStore {
         };
         let (transferred, held) = py
             .detach(|| {
-                let (plan, _) = if manifest {
-                    fetch::FetchPlan::of(&self.store, "checkpoint-download", &object, &[])?
-                } else {
-                    fetch::FetchPlan::of_objects(
+                let fetch_object = || {
+                    let (plan, _) = if manifest {
+                        fetch::FetchPlan::of(
+                            &self.store,
+                            "checkpoint-download",
+                            &object,
+                            std::slice::from_ref(&object),
+                        )?
+                    } else {
+                        fetch::FetchPlan::of_objects(
+                            &self.store,
+                            "checkpoint-download",
+                            std::slice::from_ref(&object),
+                        )?
+                    };
+                    if plan.wanted.is_empty() {
+                        return Ok((0, true));
+                    }
+                    let grant = fetch::DeliveryGrant::mint(&plan, &object)?;
+                    let fetched = transport::fetch_ranged(
                         &self.store,
-                        "checkpoint-download",
-                        std::slice::from_ref(&object),
-                    )?
+                        &grant,
+                        url,
+                        &policy,
+                        &transport::Anonymous,
+                        transport::Deadline::after_seconds(None),
+                        &transport::Ledger::new(),
+                        transport::Ranged::default(),
+                        None,
+                    )?;
+                    Ok((fetched.transferred, false))
                 };
-                if plan.wanted.is_empty() {
-                    return Ok((0, true));
+                if let Some((transaction, epoch)) = &derived_restore {
+                    if manifest {
+                        return refuse(
+                            Code::KEY_GRAMMAR,
+                            "derived progress restores blob objects, not manifests",
+                        );
+                    }
+                    tensorfs_core::durability::restore_derived(
+                        &self.store,
+                        &self.meta,
+                        transaction,
+                        *epoch,
+                        &object,
+                        fetch_object,
+                    )
+                } else {
+                    fetch_object()
                 }
-                let grant = fetch::DeliveryGrant::mint(&plan, &object)?;
-                let fetched = transport::fetch_ranged(
-                    &self.store,
-                    &grant,
-                    url,
-                    &policy,
-                    &transport::Anonymous,
-                    transport::Deadline::after_seconds(None),
-                    &transport::Ledger::new(),
-                    transport::Ranged::default(),
-                    None,
-                )?;
-                Ok((fetched.transferred, false))
             })
             .or_refuse(py)?;
         let out = PyDict::new(py);
@@ -1449,7 +1485,7 @@ impl PyStore {
 
     /// Canonical TensorFS declaration bytes for the current producer intent.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (sources, targets, configs, order, max_new_bytes))]
+    #[pyo3(signature = (sources, targets, configs, order, max_new_bytes, *, work_fingerprint))]
     fn derived_declaration<'p>(
         &self,
         py: Python<'p>,
@@ -1458,11 +1494,42 @@ impl PyStore {
         configs: &Bound<'_, PyDict>,
         order: Vec<(String, String)>,
         max_new_bytes: u64,
+        work_fingerprint: &str,
     ) -> PyResult<Bound<'p, PyBytes>> {
         let mut declaration =
             parse_declaration(py, sources, targets, configs, order, max_new_bytes)?;
-        let bytes = declaration.canonical_bytes().or_refuse(py)?;
+        declaration.work_fingerprint = Some(work_fingerprint.to_string());
+        let bytes = declaration.canonical_work_bytes().or_refuse(py)?;
         Ok(PyBytes::new(py, &bytes))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (transaction_id, declaration, head_id, head_length, *, operation_id, slot, plan_digest))]
+    fn validate_derived_checkpoint(
+        &self,
+        py: Python<'_>,
+        transaction_id: &str,
+        declaration: &[u8],
+        head_id: &str,
+        head_length: u64,
+        operation_id: &str,
+        slot: &str,
+        plan_digest: &str,
+    ) -> PyResult<()> {
+        let head = obj_ref(py, head_id, head_length)?;
+        py.detach(|| {
+            derived::validate_checkpoint(
+                &self.store,
+                &self.meta,
+                transaction_id,
+                declaration,
+                &head,
+                operation_id,
+                slot,
+                plan_digest,
+            )
+        })
+        .or_refuse(py)
     }
 
     /// Open one exact tfs-019 transaction. Python supplies typed plain values; canonical
@@ -1470,7 +1537,7 @@ impl PyStore {
     // PyO3 exposes these as six named boundary fields. Packing them into an opaque dict
     // would only move the arity into hand parsing and weaken the typed facade.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (transaction_id, writer_session_id, sources, targets, configs, order, max_new_bytes))]
+    #[pyo3(signature = (transaction_id, writer_session_id, sources, targets, configs, order, max_new_bytes, *, work_fingerprint, checkpoint=None))]
     fn begin_derived(
         &self,
         py: Python<'_>,
@@ -1481,8 +1548,15 @@ impl PyStore {
         configs: &Bound<'_, PyDict>,
         order: Vec<(String, String)>,
         max_new_bytes: u64,
+        work_fingerprint: &str,
+        checkpoint: Option<(String, u64)>,
     ) -> PyResult<PyDerivedWriter> {
-        let declaration = parse_declaration(py, sources, targets, configs, order, max_new_bytes)?;
+        let mut declaration =
+            parse_declaration(py, sources, targets, configs, order, max_new_bytes)?;
+        declaration.work_fingerprint = Some(work_fingerprint.to_string());
+        let checkpoint = checkpoint
+            .map(|(id, length)| obj_ref(py, &id, length))
+            .transpose()?;
         let begin = py
             .detach(|| {
                 derived::begin(
@@ -1491,6 +1565,7 @@ impl PyStore {
                     transaction_id,
                     writer_session_id,
                     declaration,
+                    checkpoint.as_ref(),
                 )
             })
             .or_refuse(py)?;
@@ -1581,6 +1656,50 @@ impl PyStore {
         out.cast::<PyDict>()?
             .set_item("receipt", receipt(py, value.receipt())?)?;
         Ok(out)
+    }
+
+    /// Retain an immutable committed result for another owner without changing its receipt.
+    fn retain_derived_result<'p>(
+        &self,
+        py: Python<'p>,
+        transaction_id: &str,
+        expected_receipt_digest: &str,
+        retention_id: &str,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let value = py
+            .detach(|| {
+                derived::retain_result(
+                    &self.store,
+                    &self.meta,
+                    transaction_id,
+                    expected_receipt_digest,
+                    retention_id,
+                )
+            })
+            .or_refuse(py)?;
+        marshal(py, &tensorfs_core::ids::Plain::to_value(&value))
+    }
+
+    /// Permanently release only the named retention owner, including before acquisition.
+    fn release_derived_retention<'p>(
+        &self,
+        py: Python<'p>,
+        transaction_id: &str,
+        expected_receipt_digest: &str,
+        retention_id: &str,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let value = py
+            .detach(|| {
+                derived::release_retention(
+                    &self.store,
+                    &self.meta,
+                    transaction_id,
+                    expected_receipt_digest,
+                    retention_id,
+                )
+            })
+            .or_refuse(py)?;
+        marshal(py, &tensorfs_core::ids::Plain::to_value(&value))
     }
 
     /// Release the committed transaction after its manifest has been published or rejected.
@@ -1741,6 +1860,56 @@ impl PyDerivedWriter {
     /// Effective exact sources after TensorFS has checked installed identity and closure.
     fn sources<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyList>> {
         source_facts(py, &self.source_views)
+    }
+
+    /// Accepted part keys only; object identities stay behind the Runtime capability.
+    fn completed_parts(&self, py: Python<'_>) -> PyResult<Vec<(String, String, String)>> {
+        py.detach(|| {
+            derived::completed(&self.meta, &self.transaction_id, self.writer_session_id)
+                .map(|(parts, _)| parts)
+        })
+        .or_refuse(py)
+    }
+
+    fn completed_configs(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        py.detach(|| {
+            derived::completed(&self.meta, &self.transaction_id, self.writer_session_id)
+                .map(|(_, configs)| configs)
+        })
+        .or_refuse(py)
+    }
+
+    #[pyo3(signature = (operation_id, slot, *, previous=None))]
+    fn checkpoint<'p>(
+        &self,
+        py: Python<'p>,
+        operation_id: &str,
+        slot: &str,
+        previous: Option<(String, u64)>,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let previous = previous
+            .map(|(id, length)| obj_ref(py, &id, length))
+            .transpose()?;
+        let (plan, head) = py
+            .detach(|| {
+                derived::checkpoint_progress(
+                    &self.store,
+                    &self.meta,
+                    &self.transaction_id,
+                    self.writer_session_id,
+                    operation_id,
+                    slot,
+                    previous.as_ref(),
+                )
+            })
+            .or_refuse(py)?;
+        let out = PyDict::new(py);
+        out.set_item("plan_digest", plan)?;
+        out.set_item("head", head.head.as_ref().map(ObjectRef::id))?;
+        out.set_item("head_length", head.head.as_ref().map_or(0, |r| r.length))?;
+        out.set_item("index", head.links.saturating_sub(1))?;
+        out.set_item("bytes", head.bytes)?;
+        Ok(out)
     }
 
     /// Read one semantic source-part range through its pinned verified descriptor set.

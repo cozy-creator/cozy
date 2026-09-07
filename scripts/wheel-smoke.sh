@@ -50,7 +50,9 @@ echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 # a refusal class the facade forgot to re-export: all of them stop here.
 "$work/venv/bin/python" scripts/stub_conform.py
 "$work/venv/bin/python" scripts/fit-runs.py
+"$work/venv/bin/python" scripts/derived-resume.py
 "$work/venv/bin/python" scripts/derived-declaration.py
+"$work/venv/bin/python" scripts/derived-retention.py
 "$work/venv/bin/python" scripts/derived-writer-concurrency.py
 "$work/venv/bin/python" scripts/read-plan-selection.py
 "$work/venv/bin/python" scripts/read-lease-concurrency.py "$fixture" "$SNAP"
