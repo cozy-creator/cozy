@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,10 +16,13 @@ import (
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
+var retainedCheckpointFixture = flag.String("retained-checkpoint-fixture", "", "isolated Hub checkpoint proof coordinates")
+var retainedCheckpointTFS = flag.String("retained-checkpoint-tfs", "", "native tfs binary for checkpoint input proof")
+
 // Shares the real isolated Hub fixture with its native/Runtime proof. No release
 // row, named local alias, fake byte resolver or paid provider is created here.
 func TestRetainedCheckpointLocalFetchKeepsNativeRoots(t *testing.T) {
-	fixture, binary := os.Getenv("COZY_CHECKPOINT_FIXTURE"), os.Getenv("COZY_TEST_TFS")
+	fixture, binary := *retainedCheckpointFixture, *retainedCheckpointTFS
 	if fixture == "" || binary == "" {
 		t.Skip("requires the isolated retained-checkpoint Hub fixture and native tfs")
 	}
