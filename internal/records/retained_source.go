@@ -1,12 +1,64 @@
 package records
 
 import (
-	"database/sql"
 	"encoding/json"
 	"reflect"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
+
+type sourceAdoption struct {
+	PriorID     string `json:"retry_of"`
+	PriorHead   string `json:"prior_head"`
+	AdoptedHead string `json:"adopted_head"`
+}
+
+// RecordRetriedSourceAdoption records the native owner's independent new roots.
+// Checkpoint byte counters include journal history and are not a progress measure
+// across different chains; explicit provenance is the release barrier instead.
+func (s *Store) RecordRetriedSourceAdoption(id, priorID, bootID string, previous, adopted []ModelCheckpoint) *exit.Error {
+	if len(previous) == 0 || len(previous) != len(adopted) {
+		return exit.Named(exit.Conflict, "request.source_adoption_incomplete", "source adoption must retain each selected old head")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin source adoption: %s", err)
+	}
+	defer tx.Rollback()
+	var valid bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests child JOIN requests parent ON child.retry_of=parent.id
+		WHERE child.id=? AND parent.id=? AND child.retain_work=1 AND child.worker=parent.worker)`, id, priorID).Scan(&valid); err != nil || !valid {
+		return exit.Named(exit.Conflict, "request.source_adoption_refused", "source adoption has no admitted same-machine lineage")
+	}
+	for i, old := range previous {
+		fresh := adopted[i]
+		if old.Slot != fresh.Slot || old.PlanDigest != fresh.PlanDigest || old.HeadID == fresh.HeadID {
+			return exit.Named(exit.Conflict, "request.source_adoption_changed", "source adoption must produce an independent head of the same slot and plan")
+		}
+		var oldRaw, newRaw, oldBoot, newBoot string
+		if err := tx.QueryRow(`SELECT p.observed,c.observed,p.worker_boot_id,c.worker_boot_id
+			FROM request_model_checkpoints p JOIN request_model_checkpoints c ON c.slot=p.slot AND c.kind=p.kind
+			WHERE p.request_id=? AND c.request_id=? AND p.kind='source' AND p.slot=?`, priorID, id, old.Slot).
+			Scan(&oldRaw, &newRaw, &oldBoot, &newBoot); err != nil {
+			return exit.Internalf("cannot verify observed source adoption: %s", err)
+		}
+		var heldOld, heldNew ModelCheckpoint
+		if json.Unmarshal([]byte(oldRaw), &heldOld) != nil || json.Unmarshal([]byte(newRaw), &heldNew) != nil || heldOld != old || heldNew != fresh || oldBoot != bootID || newBoot != bootID {
+			return exit.Named(exit.Conflict, "request.source_adoption_changed", "source adoption observations changed before ownership transfer")
+		}
+		provenance, _ := json.Marshal(sourceAdoption{priorID, old.HeadID, fresh.HeadID})
+		if _, err := tx.Exec(`UPDATE request_model_checkpoints SET subject=? WHERE request_id=? AND kind='source' AND slot=?`, provenance, id, old.Slot); err != nil {
+			return exit.Internalf("cannot record source adoption ownership: %s", err)
+		}
+	}
+	if err := appendEventTx(tx, id, "request.source_reused", 0, map[string]any{"retry_of": priorID, "slots": len(adopted)}); err != nil {
+		return exit.Internalf("cannot journal source adoption: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit source adoption: %s", err)
+	}
+	return nil
+}
 
 // SameSourceAcquisition compares source computation only. Producer code, output
 // declarations and destination publication are independently allowed to change.
@@ -49,62 +101,6 @@ func (s *Store) RetriedSourceCheckpoints(id string) (string, []ModelCheckpointPr
 	return prior.ID, retained, nil
 }
 
-// AdoptRetriedSourceCheckpoint follows independently verified custody under the
-// new request's publication holds. Native restore still checks the full source
-// plan and content before dispatch; this copies no worker status or model handle.
-func (s *Store) AdoptRetriedSourceCheckpoint(id, priorID string, checkpoint ModelCheckpoint) *exit.Error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return exit.Internalf("cannot begin source checkpoint adoption: %s", err)
-	}
-	defer tx.Rollback()
-	var parent string
-	if err := tx.QueryRow(`SELECT retry_of FROM requests WHERE id=? AND retain_work=1 AND state IN (`+activeRequestStates+`)`, id).Scan(&parent); err != nil || parent != priorID {
-		return exit.Named(exit.Conflict, "request.source_adoption_refused", "source adoption must name the admitted retained predecessor")
-	}
-	var priorRaw, currentRaw string
-	if err := tx.QueryRow(`SELECT p.intent,c.intent FROM request_model_transfers p,request_model_transfers c
-		WHERE p.request_id=? AND c.request_id=?`, priorID, id).Scan(&priorRaw, &currentRaw); err != nil {
-		return exit.Internalf("cannot read source adoption identities: %s", err)
-	}
-	var prior, current ModelTransferIntent
-	if json.Unmarshal([]byte(priorRaw), &prior) != nil || json.Unmarshal([]byte(currentRaw), &current) != nil || !SameSourceAcquisition(&prior, &current) {
-		return exit.Named(exit.Conflict, "request.source_adoption_changed", "source adoption changed the selected source or conversion profile")
-	}
-	if problem := validateSourceCheckpoint(current, checkpoint); problem != nil {
-		return problem
-	}
-	data, _ := json.Marshal(checkpoint)
-	var held string
-	if err := tx.QueryRow(`SELECT acknowledged FROM request_model_checkpoints WHERE request_id=? AND kind='source' AND slot=?`, priorID, checkpoint.Slot).Scan(&held); err != nil || held != string(data) {
-		return exit.Named(exit.Conflict, "request.source_adoption_changed", "source adoption must preserve the predecessor's exact acknowledged checkpoint")
-	}
-	var observed, acknowledged string
-	err = tx.QueryRow(`SELECT observed,acknowledged FROM request_model_checkpoints WHERE request_id=? AND kind='source' AND slot=?`, id, checkpoint.Slot).Scan(&observed, &acknowledged)
-	if err == nil {
-		// A restart after this commit, or later progress, already owns its result.
-		var existing ModelCheckpoint
-		if json.Unmarshal([]byte(acknowledged), &existing) == nil && existing.PlanDigest == checkpoint.PlanDigest && existing.Index >= checkpoint.Index {
-			return nil
-		}
-		return exit.Named(exit.Conflict, "request.source_adoption_changed", "source adoption cannot replace independently started progress")
-	}
-	if err != sql.ErrNoRows {
-		return exit.Internalf("cannot read source adoption progress: %s", err)
-	}
-	if _, err := tx.Exec(`INSERT INTO request_model_checkpoints(request_id,slot,worker_boot_id,observed,acknowledged)
-		VALUES(?,?,'',?,?)`, id, checkpoint.Slot, string(data), string(data)); err != nil {
-		return exit.Internalf("cannot adopt source checkpoint: %s", err)
-	}
-	if err := appendEventTx(tx, id, "request.source_reused", 0, map[string]any{"retry_of": priorID, "slot": checkpoint.Slot, "head": checkpoint.HeadID, "bytes": checkpoint.Bytes}); err != nil {
-		return exit.Internalf("cannot journal source reuse: %s", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit source checkpoint adoption: %s", err)
-	}
-	return nil
-}
-
 // RetriedSourceCustodyPending keeps predecessor holds alive until each dependent
 // revision acquires its own verified checkpoint custody or is abandoned.
 func (s *Store) RetriedSourceCustodyPending(priorID string) (bool, *exit.Error) {
@@ -123,32 +119,17 @@ func (s *Store) RetriedSourceCustodyPending(priorID string) (bool, *exit.Error) 
 	}
 	rows.Close()
 	for _, id := range ids {
-		request, problem := s.RequestRow(id)
-		if problem != nil || request == nil {
-			return false, problem
-		}
 		_, prior, problem := s.RetriedSourceCheckpoints(id)
 		if problem != nil {
 			return false, problem
 		}
-		current, problem := s.ModelSourceProgress(id)
-		if problem != nil {
-			return false, problem
-		}
-		bySlot := map[string]*ModelCheckpoint{}
-		for _, progress := range current {
-			bySlot[progress.Observed.Slot] = progress.Acknowledged
-			if request.RetainWork {
-				bySlot[progress.Observed.Slot] = &progress.Observed
-			}
-		}
 		for _, progress := range prior {
-			owned := bySlot[progress.Observed.Slot]
-			needed := progress.Acknowledged
-			if request.RetainWork {
-				needed = &progress.Observed
+			var raw []byte
+			if err := s.db.QueryRow(`SELECT subject FROM request_model_checkpoints WHERE request_id=? AND kind='source' AND slot=?`, id, progress.Observed.Slot).Scan(&raw); err != nil {
+				return true, nil
 			}
-			if owned == nil || owned.PlanDigest != needed.PlanDigest || owned.Bytes < needed.Bytes {
+			var adopted sourceAdoption
+			if json.Unmarshal(raw, &adopted) != nil || adopted.PriorID != priorID || adopted.PriorHead != progress.Observed.HeadID || adopted.AdoptedHead == "" {
 				return true, nil
 			}
 		}

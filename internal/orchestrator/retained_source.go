@@ -23,13 +23,6 @@ func (c *Orchestrator) adoptRetriedSource(ctx context.Context, request records.R
 	if problem != nil || priorID == "" || len(progress) == 0 {
 		return problem
 	}
-	current, problem := c.opt.Store.ModelSourceProgress(request.ID)
-	if problem != nil {
-		return problem
-	}
-	if len(current) != 0 {
-		return nil // the new native operation already owns independently observed work
-	}
 	if s == nil || s.host == nil || s.claim == nil {
 		return exit.Unavailablef("retained source adoption requires the claimed original pod")
 	}
@@ -86,7 +79,7 @@ func (c *Orchestrator) adoptRetriedSource(ctx context.Context, request records.R
 		}
 		prior := wanted[checkpoint.Slot]
 		if prior == nil || checkpoint.Head == nil || bytes.Equal(checkpoint.Head.Digest, prior.Head.Digest) ||
-			!bytes.Equal(checkpoint.PlanDigest, prior.PlanDigest) || checkpoint.Bytes != prior.Bytes {
+			!bytes.Equal(checkpoint.PlanDigest, prior.PlanDigest) {
 			return exit.Named(exit.Structural, "request.source_adoption_changed", "source adoption must retain the same source progress under a new operation-bound head")
 		}
 		delete(wanted, checkpoint.Slot)
@@ -99,6 +92,13 @@ func (c *Orchestrator) adoptRetriedSource(ctx context.Context, request records.R
 	if len(observed) != len(progress) {
 		return exit.Named(exit.Structural, "request.source_adoption_unrecorded", "source adoption was not accepted into the request's own progress")
 	}
-	c.emit(request.ID, "request.source_reused", 0, map[string]any{"retry_of": priorID, "slots": len(observed)})
-	return nil
+	previous := make([]records.ModelCheckpoint, len(progress))
+	adopted := make([]records.ModelCheckpoint, len(observed))
+	for i := range progress {
+		previous[i] = progress[i].Observed
+	}
+	for i := range observed {
+		adopted[i] = observed[i].Observed
+	}
+	return c.opt.Store.RecordRetriedSourceAdoption(request.ID, priorID, s.bootID, previous, adopted)
 }
