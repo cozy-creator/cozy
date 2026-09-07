@@ -58,7 +58,31 @@ func databaseRows(t *testing.T, path string) map[string]string {
 				ptrs[i] = &values[i]
 			}
 			must(t, rows.Scan(ptrs...))
-			raw, err := json.Marshal(values)
+			// Schema 25 appends opt-in retention and retry lineage. Compare every
+			// pre-existing cell and require safe defaults for ordinary requests.
+			preserved := make([]any, 0, len(values))
+			for i, column := range columns {
+				if name == "requests" && column == "retain_work" {
+					if values[i] != int64(0) {
+						t.Fatal("migration changed a legacy request's retention policy")
+					}
+					continue
+				}
+				if name == "requests" && (column == "retry_of" || column == "reuse_scope") {
+					if values[i] != "" {
+						t.Fatal("migration invented retry lineage for a legacy request")
+					}
+					continue
+				}
+				if name == "requests" && column == "control_revision" {
+					if values[i] != int64(0) {
+						t.Fatal("migration invented lifecycle changes for a legacy request")
+					}
+					continue
+				}
+				preserved = append(preserved, values[i])
+			}
+			raw, err := json.Marshal(preserved)
 			must(t, err)
 			encoded = append(encoded, string(raw))
 		}
