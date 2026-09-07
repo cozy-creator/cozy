@@ -30,3 +30,15 @@ func handleRentalPrune(ctx *Context) *exit.Error {
 	}
 	return emit(ctx, compactRecord([]output.Field{{K: "rental", V: result.Rental}, {K: "removed_entries", V: result.RemovedEntries}, {K: "reclaimed_bytes", V: result.ReclaimedBytes}, {K: "store_busy", V: result.StoreBusy}}, "rental", "removed_entries", "reclaimed_bytes", "store_busy"))
 }
+
+func handleCachePrune(ctx *Context) *exit.Error {
+	client, problem := dial(ctx)
+	if problem != nil {
+		return problem
+	}
+	result, problem := client.PruneLocalCache()
+	if problem != nil {
+		return problem
+	}
+	return emit(ctx, compactRecord([]output.Field{{K: "removed_entries", V: result.RemovedEntries}, {K: "reclaimed_bytes", V: result.ReclaimedBytes}, {K: "store_busy", V: result.StoreBusy}}, "removed_entries", "reclaimed_bytes", "store_busy"))
+}

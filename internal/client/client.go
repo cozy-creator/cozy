@@ -256,6 +256,12 @@ func (c *Client) PruneRental(rentalID string) (api.RentalPruneResult, *exit.Erro
 	return result, problem
 }
 
+func (c *Client) PruneLocalCache() (api.CachePruneResult, *exit.Error) {
+	var result api.CachePruneResult
+	problem := c.call(http.MethodPost, "/v1/local/cache/prune", map[string]any{}, &result)
+	return result, problem
+}
+
 // DetachRental waits until the daemon no longer holds this rental's worker-control slot.
 // The result is false when the slot was already absent.
 func (c *Client) DetachRental(rentalID string) (bool, *exit.Error) {

@@ -173,21 +173,7 @@ func (c *Orchestrator) changeDerivedRetention(ctx context.Context, retention rec
 	if problem != nil || producer == nil {
 		return exit.Unavailablef("native artifact producer is unavailable")
 	}
-	var session *session
-	if producer.Worker != "" {
-		session, problem = c.rentalControl(producer.Worker)
-	} else {
-		// All local package workers share the same authoritative TensorFS home.
-		// Any current claimed preparation service can acquire the native root.
-		c.mu.Lock()
-		for _, candidate := range c.sessions {
-			if candidate.host == nil && candidate.preparation != nil {
-				session = candidate
-				break
-			}
-		}
-		c.mu.Unlock()
-	}
+	session, problem := c.workspaceControl(producer.Worker)
 	if problem != nil {
 		return problem
 	}
@@ -195,18 +181,18 @@ func (c *Orchestrator) changeDerivedRetention(ctx context.Context, retention rec
 		return exit.Unavailablef("native artifact retention awaits a live preparation service")
 	}
 	request := &pb.DerivedRetentionRequest{WeightsTransactionId: weights.TransactionID, TensorfsReceiptDigest: digest, RetentionId: retention.RetentionID}
+	call := &pb.DerivedRetentionCall{Claim: session.claim, Request: request}
 	var result *pb.DerivedRetentionResult
 	if session.host != nil {
-		call := &pb.DerivedRetentionCall{Claim: session.claim, Request: request}
 		if release {
 			result, err = session.host.ReleaseDerivedRetention(ctx, call)
 		} else {
 			result, err = session.host.RetainDerivedResult(ctx, call)
 		}
 	} else if release {
-		result, err = session.preparation.ReleaseDerivedRetention(ctx, request)
+		result, err = session.preparation.WorkspaceReleaseDerivedRetention(ctx, call)
 	} else {
-		result, err = session.preparation.RetainDerivedResult(ctx, request)
+		result, err = session.preparation.WorkspaceRetainDerivedResult(ctx, call)
 	}
 	if err != nil {
 		switch status.Code(err) {
@@ -247,19 +233,7 @@ func (c *Orchestrator) releaseOriginalDerivedResults(id string) *exit.Error {
 	if len(outputs) == 0 {
 		return nil
 	}
-	var session *session
-	if request.Worker != "" {
-		session, problem = c.rentalControl(request.Worker)
-	} else {
-		c.mu.Lock()
-		for _, candidate := range c.sessions {
-			if candidate.host == nil && candidate.preparation != nil {
-				session = candidate
-				break
-			}
-		}
-		c.mu.Unlock()
-	}
+	session, problem := c.workspaceControl(request.Worker)
 	if problem != nil {
 		return problem
 	}
@@ -275,12 +249,12 @@ func (c *Orchestrator) releaseOriginalDerivedResults(id string) *exit.Error {
 		if err != nil {
 			return exit.Internalf("original artifact native receipt digest is malformed")
 		}
-		call := &pb.DerivedResultReleaseRequest{WeightsTransactionId: output.TransactionID, TensorfsReceiptDigest: digest}
+		call := &pb.DerivedResultReleaseCall{Claim: session.claim, Request: &pb.DerivedResultReleaseRequest{WeightsTransactionId: output.TransactionID, TensorfsReceiptDigest: digest}}
 		var result *pb.DerivedResultReleaseResult
 		if session.host != nil {
-			result, err = session.host.ReleaseDerivedResult(context.Background(), &pb.DerivedResultReleaseCall{Claim: session.claim, Request: call})
+			result, err = session.host.ReleaseDerivedResult(context.Background(), call)
 		} else {
-			result, err = session.preparation.ReleaseDerivedResult(context.Background(), call)
+			result, err = session.preparation.WorkspaceReleaseDerivedResult(context.Background(), call)
 		}
 		if err != nil {
 			return exit.Unavailablef("original artifact release awaits native disposal")

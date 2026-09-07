@@ -152,19 +152,20 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 // Release that same terminal only after its native/source ownership is settled.
 // Reconnect replays this ordinary ACK if the connection dies before delivery.
 func (c *Orchestrator) ackReleasedRetainedAttempts(request records.Request, attempts []records.Attempt) *exit.Error {
-	if request.Worker == "" || len(attempts) == 0 {
+	if len(attempts) == 0 {
 		return nil
 	}
-	rental, problem := c.opt.Store.RentalRow(request.Worker)
-	if problem != nil {
-		return problem
+	if request.Worker != "" {
+		rental, problem := c.opt.Store.RentalRow(request.Worker)
+		if problem != nil {
+			return problem
+		}
+		if rental != nil && (rental.State == "released" || rental.State == "failed") {
+			return nil
+		}
 	}
-	if rental != nil && (rental.State == "released" || rental.State == "failed") {
-		return nil
-	}
-	s, problem := c.rentalControl(request.Worker)
+	s, problem := c.workspaceControl(request.Worker)
 	if problem != nil {
-		_, _, _, _ = c.EnsureRental(request.Worker)
 		return problem
 	}
 	for _, attempt := range attempts {
@@ -181,7 +182,7 @@ func (c *Orchestrator) ackReleasedRetainedAttempts(request records.Request, atte
 		}
 		ack := &pb.AttemptOutcomeAck{RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, RequestId: request.ID, AttemptOrdinal: uint64(attempt.Attempt), InvocationSpecDigest: invocation, OutcomeId: attempt.TerminalID, OutcomeDigest: outcome, RetainWork: false}
 		if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_OutcomeAck{OutcomeAck: ack}}) {
-			return exit.Unavailablef("released terminal acknowledgement awaits its Host connection")
+			return exit.Unavailablef("released terminal acknowledgement awaits its workspace connection")
 		}
 	}
 	return nil

@@ -86,12 +86,19 @@ func (c *Orchestrator) readyWeightsCheckpoint(ctx context.Context, requestID str
 	if attempt.State != "offered" && attempt.State != "accepted" && attempt.State != "recovered_open" {
 		return nil
 	}
-	session, problem := c.rentalControl(req.Worker)
+	var session *session
+	if req.Worker != "" {
+		session, problem = c.rentalControl(req.Worker)
+	} else {
+		c.mu.Lock()
+		session = c.sessions[attempt.SessionID]
+		c.mu.Unlock()
+	}
 	if problem != nil {
 		return problem
 	}
-	if session.instanceID != attempt.InstanceID || session.host == nil {
-		return exit.Unavailablef("weights Ready has no current claimed Host")
+	if session == nil || session.claim == nil || session.instanceID != attempt.InstanceID || session.bootID != attempt.SessionID {
+		return exit.Unavailablef("weights Ready has no current claimed producer workspace")
 	}
 	invocation, err := canonical.Raw(row.InvocationSpecDigest)
 	if err != nil {
@@ -104,7 +111,7 @@ func (c *Orchestrator) readyWeightsCheckpoint(ctx context.Context, requestID str
 		return problem
 	}
 	var checkpoint *pb.CheckpointRef
-	if transfer != nil && !req.RetainWork {
+	if transfer != nil && !req.RetainWork && session.host != nil {
 		if transfer.State == "failed" || transfer.State == "canceling" || transfer.State == "canceled" || transfer.State == "completed" {
 			return nil
 		}
@@ -140,8 +147,14 @@ func (c *Orchestrator) readyWeightsCheckpoint(ctx context.Context, requestID str
 	if current == nil || current.State == "canceled" || current.Ordinal != req.Ordinal || current.Worker != req.Worker {
 		return nil
 	}
-	answer, err := session.host.WeightsIntentReady(ctx, &pb.WeightsIntentReadyCall{Claim: session.claim, Request: &pb.WeightsIntentReadyRequest{
-		RecordOwnerEpoch: session.claim.RecordOwnerEpoch, WorkerBootId: session.bootID, Weights: subject, AttemptOrdinal: row.AttemptOrdinal, Checkpoint: checkpoint}})
+	call := &pb.WeightsIntentReadyCall{Claim: session.claim, Request: &pb.WeightsIntentReadyRequest{
+		RecordOwnerEpoch: session.claim.RecordOwnerEpoch, WorkerBootId: session.bootID, Weights: subject, AttemptOrdinal: row.AttemptOrdinal, Checkpoint: checkpoint}}
+	var answer *pb.WeightsHostAck
+	if session.host != nil {
+		answer, err = session.host.WeightsIntentReady(ctx, call)
+	} else {
+		answer, err = session.preparation.WorkspaceWeightsIntentReady(ctx, call)
+	}
 	if err != nil {
 		return exit.Unavailablef("weights Ready awaits native checkpoint admission")
 	}

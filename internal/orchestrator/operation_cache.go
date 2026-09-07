@@ -62,7 +62,11 @@ func (c *Orchestrator) recordOperationResult(s *session, request records.Request
 	keyBytes, _ := canonical.Raw(key)
 	invocation, _ := canonical.Raw(attempt.InvocationDigest)
 	outcome, _ := canonical.Raw(attempt.TerminalDigest)
-	answer, err := s.host.RecordOperationResult(s.ctx, &pb.RecordOperationResultCall{Claim: s.claim, ComputationDigest: keyBytes, RequestId: request.ID, AttemptOrdinal: uint64(attempt.Attempt), InvocationSpecDigest: invocation, OutcomeId: attempt.TerminalID, OutcomeDigest: outcome})
+	workspace, problem := s.operationWorkspace()
+	if problem != nil {
+		return problem
+	}
+	answer, err := workspace.RecordOperationResult(s.ctx, &pb.RecordOperationResultCall{Claim: s.claim, ComputationDigest: keyBytes, RequestId: request.ID, AttemptOrdinal: uint64(attempt.Attempt), InvocationSpecDigest: invocation, OutcomeId: attempt.TerminalID, OutcomeDigest: outcome})
 	if status.Code(err) == codes.Unimplemented {
 		return nil
 	}
@@ -145,7 +149,11 @@ func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOn
 		return false, c.opt.Store.CompleteOperationMiss(request.ID, key)
 	}
 	keyBytes, _ := canonical.Raw(key)
-	answer, err := s.host.LookupOperation(s.ctx, &pb.LookupOperationCall{Claim: s.claim, ComputationDigest: keyBytes, ConsumerRequestId: request.ID})
+	workspace, problem := s.operationWorkspace()
+	if problem != nil {
+		return false, problem
+	}
+	answer, err := workspace.LookupOperation(s.ctx, &pb.LookupOperationCall{Claim: s.claim, ComputationDigest: keyBytes, ConsumerRequestId: request.ID})
 	if status.Code(err) == codes.Unimplemented {
 		return false, c.opt.Store.CompleteOperationMiss(request.ID, key)
 	}

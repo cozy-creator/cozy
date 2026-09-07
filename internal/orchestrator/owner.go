@@ -798,6 +798,9 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		return true
 	}
 	placements := []DesiredPlacement(nil)
+	if w.spec.Placement.Package == "" && w.spec.Placement.PlacementSetDigest == "" {
+		return true // empty local Runtime serves workspace RPCs without an executor
+	}
 	if w.spec.Placement.PlacementSetDigest != "" {
 		placements = []DesiredPlacement{w.spec.Placement}
 	}
