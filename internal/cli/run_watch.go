@@ -95,7 +95,7 @@ func watchRunStream(ctx *Context, client *localclient.Client, id string,
 		case <-done:
 		}
 	}()
-	lines := NewProgress(ctx, false, began)
+	lines := NewProgress(ctx, ctx.Mode().JSON, began)
 	terminal, problem := client.WatchContext(watchCtx, id, 0, lines.On)
 	lines.Done()
 	wasDetached := false

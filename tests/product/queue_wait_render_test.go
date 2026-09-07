@@ -14,7 +14,7 @@ import (
 )
 
 // cl-103's render half: the default human wait line says what the queue is DOING — no
-// digests, no dispatcher vocabulary. The raw diagnostic lives in --stream/--json/--full
+// digests, no dispatcher vocabulary. The raw diagnostic lives in --json/--full
 // and joins the human line only after WaitPatience. The events fed here are exactly the
 // payloads TestQueueWaitCauses proves the orchestrator emits.
 
@@ -175,8 +175,8 @@ func TestDiagnosticSurfacesKeepTheRawCause(t *testing.T) {
 		t.Errorf("--full must keep the verbatim diagnostic for queued and parked: %q", got)
 	}
 
-	// --stream: the typed envelope, unchanged.
-	p, buf = progressSink(output.Mode{Human: true}, true)
+	// Awaited --json: the typed envelope, unchanged.
+	p, buf = progressSink(output.Mode{JSON: true}, true)
 	p.On(waitEnvelope("request.parked", time.Now(), payload))
 	var envelope localapi.Event
 	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &envelope); err != nil {

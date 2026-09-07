@@ -282,6 +282,9 @@ func uploadPackageFiles(ctx context.Context, declared []hub.PackageDeclaredFile,
 const packagePublishHeartbeat = 15 * time.Second
 
 func packagePublishStatus(ctx *Context, format string, args ...any) {
+	if ctx.Mode().JSON {
+		return
+	}
 	_ = output.Progress(ctx.Err, fmt.Sprintf(format, args...))
 }
 

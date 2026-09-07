@@ -117,6 +117,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return output.ShellCode(problem)
 	}
 
+	args = runModelFlagArgs(args, parser.Model.Node)
 	parsed, err := parser.Parse(args)
 	mode = presentationMode(stdout, wantsJSON || grammar.JSON)
 	mode.Full, mode.Fields = grammar.Full, grammar.Fields
@@ -169,6 +170,77 @@ func jsonRequested(args []string) bool {
 		}
 	}
 	return false
+}
+
+// runModelFlagArgs gives dashed model overrides the existing payload spelling.
+// Kong's own flag metadata protects option values; the resolver still owns slots/refs.
+func runModelFlagArgs(args []string, application *kong.Node) []string {
+	var execute *kong.Node
+	for _, command := range application.Children {
+		if command.Name == "run" {
+			execute = command.DefaultCmd
+			break
+		}
+	}
+	if execute == nil {
+		return args
+	}
+	valueFlags := map[string]bool{}
+	for node := execute; node != nil; node = node.Parent {
+		for _, flag := range node.Flags {
+			valueFlags["--"+flag.Name] = !flag.IsBool() && !flag.IsCounter()
+			if flag.Short != 0 {
+				valueFlags["-"+string(flag.Short)] = !flag.IsBool() && !flag.IsCounter()
+			}
+		}
+	}
+	var overrides []string
+	remove := map[int]bool{}
+	inRun, target := false, -1
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		name, _, inline := strings.Cut(arg, "=")
+		if inRun && inline && strings.HasPrefix(name, "--model.") {
+			overrides = append(overrides, strings.TrimPrefix(arg, "--"))
+			remove[i] = true
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			if !inline && valueFlags[name] {
+				i++
+			}
+			continue
+		}
+		if !inRun {
+			if arg != "run" {
+				return args
+			}
+			inRun = true
+		} else if target < 0 {
+			for _, command := range execute.Parent.Children {
+				if command != execute && command.Name == arg {
+					return args
+				}
+			}
+			target = i
+		}
+	}
+	if target < 0 || len(overrides) == 0 {
+		return args
+	}
+	out := make([]string, 0, len(args))
+	for i, arg := range args {
+		if !remove[i] {
+			out = append(out, arg)
+		}
+		if i == target {
+			out = append(out, overrides...)
+		}
+	}
+	return out
 }
 
 func helpArgs(args []string) []string {
