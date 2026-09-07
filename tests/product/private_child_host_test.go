@@ -24,13 +24,13 @@ import (
 
 var childHostLauncher = flag.String("child-host-launcher", "", "actual isolated PodHost container launcher")
 var childHostHome = flag.String("child-host-home", "", "new retained proof home; kept for native custody inspection")
-var childHostProject = flag.String("child-host-project", "", "private source/candidate artifact fixture")
+var childHostProject = flag.String("child-host-project", "", "optional replacement for the shared private source/candidate artifact fixture")
 var childHostRuntimeBin = flag.String("child-host-runtime-bin", "", "installed matching Runtime bin directory")
 
 // Only the provider catalog/readback is a test peer. Both control planes, package
 // preparation, signed native effects and executors run in the actual Host image.
 func TestPrivateChildActualHostArtifacts(t *testing.T) {
-	if *childHostLauncher == "" || *childHostHome == "" || *childHostProject == "" || *childHostRuntimeBin == "" {
+	if *childHostLauncher == "" || *childHostHome == "" || *childHostRuntimeBin == "" {
 		t.Skip("requires an explicit task-owned actual Host image and artifact fixture")
 	}
 	layout, problem := home.Open(*childHostHome)
@@ -135,20 +135,7 @@ func TestPrivateChildActualHostArtifacts(t *testing.T) {
 			path += string(os.PathListSeparator) + strings.TrimPrefix(item, "PATH=")
 		}
 	}
-	project := filepath.Join(layout.Root, "client-project")
-	for _, relative := range []string{"recipe.py", "source/pyproject.toml", "source/package.toml", "source/uv.lock", "source/tensor_source.py", "candidate/pyproject.toml", "candidate/package.toml", "candidate/uv.lock", "candidate/tensor_candidate.py"} {
-		body, err := os.ReadFile(filepath.Join(*childHostProject, relative))
-		must(t, err)
-		if relative == "recipe.py" {
-			body = []byte(strings.Replace(string(body), "factor=2", "factor=0", 1))
-		}
-		if relative == "candidate/tensor_candidate.py" {
-			body = []byte(strings.Replace(string(body), "value * factor + 1 for value", "value * factor for value", 1))
-		}
-		target := filepath.Join(project, relative)
-		must(t, os.MkdirAll(filepath.Dir(target), 0o700))
-		must(t, os.WriteFile(target, body, 0o600))
-	}
+	project := copyPrivateTensorProject(t, layout.Root, *childHostProject)
 	script := filepath.Join(project, "recipe.py")
 	status, out := runCozyPath(t, layout.Root, path, "run", script, "--rental-only", "--await", "--json")
 	if status == 0 || !strings.Contains(out, "candidate quality gate failed") {
