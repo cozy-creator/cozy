@@ -165,6 +165,9 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	if mode == "attached" {
 		row.State = "attached"
 	}
+	if mode == "retained" {
+		row.ManagedRequestID = "req-private-control-restart"
+	}
 	fatal(t, rental.Attach(layout, store, row, string(cert), token, identity))
 	before, problem := store.RentalRow(podRental)
 	fatal(t, problem)
@@ -201,11 +204,6 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		}
 		// The machine now belongs to a retained transaction. Recovery must not
 		// rely on the manual-rental exception or an open Python attempt.
-		observed, problem := store.RentalRow(podRental)
-		fatal(t, problem)
-		row = *observed
-		row.ManagedRequestID = request.ID
-		fatal(t, store.RecordRental(row))
 		before, problem = store.RentalRow(podRental)
 		fatal(t, problem)
 	}

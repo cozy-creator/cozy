@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/records"
 )
+
+var privateScriptRuntimeWheel = flag.String("script-runtime-wheel", "", "Exact Runtime wheel used for private script product proofs")
 
 // A real Python library is captured with a script, even when its version and
 // pyproject stay unchanged. The corrected run must use the edited library while
@@ -36,12 +39,12 @@ only-include = ["algorithm.py"]
 	must(t, os.WriteFile(module, []byte("def compute(value):\n    raise ValueError('candidate failed quality gate')\n"), 0o600))
 	script := filepath.Join(project, "experiment.py")
 	runtimeSource := ""
-	if wheel := os.Getenv("COZY_TEST_RUNTIME_WHEEL"); wheel != "" {
+	if wheel := *privateScriptRuntimeWheel; wheel != "" {
 		runtimeSource = "# cozy-runtime = {path = " + strconv.Quote(wheel) + "}\n"
 	}
 	code := `# /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime", "private-script-algorithm"]
+# dependencies = ["cozy-runtime", "private-script-algorithm"] # //cozy:allow script dependency metadata, not a runtime invocation
 # [tool.uv.sources]
 # private-script-algorithm = {path = "./algorithm", editable = true}
 ` + runtimeSource + `# ///
@@ -116,7 +119,7 @@ func TestPrivateScriptRejectsMultipleEntrypoints(t *testing.T) {
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all"); _ = os.RemoveAll(root) })
 	p := filepath.Join(t.TempDir(), "two.py")
 	metadata := "# /// script\n# requires-python = \">=3.12,<3.13\"\n# dependencies = [\"cozy-runtime\"]\n"
-	if wheel := os.Getenv("COZY_TEST_RUNTIME_WHEEL"); wheel != "" {
+	if wheel := *privateScriptRuntimeWheel; wheel != "" {
 		metadata += fmt.Sprintf("# [tool.uv.sources]\n# cozy-runtime = {path = %q}\n", wheel)
 	}
 	metadata += "# ///\n"

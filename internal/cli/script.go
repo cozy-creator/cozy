@@ -104,5 +104,6 @@ func reclaimSnapshot(ctx *Context, target Target) {
 }
 
 func isScriptTarget(value string) bool {
-	return strings.EqualFold(filepath.Ext(value), ".py")
+	return strings.EqualFold(filepath.Ext(value), ".py") &&
+		(explicitPackageDirectory(value) || !strings.ContainsAny(value, `/\`))
 }

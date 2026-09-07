@@ -222,6 +222,33 @@ weights-read return plane; local-only sources under `--rental` remain local.
 
 ## Run packages and jobs
 
+Private scripts expose one registered App callable and declare dependencies with PEP 723
+inline metadata. They use the same package preparation and execution path:
+
+```sh
+cozy run ./experiment.py --rental-only --await
+# After failure, edit the script or one of its declared local libraries:
+cozy run ./experiment.py --retry <prior-run-id> --rental-only --await
+```
+
+Each execution captures its source and dependency closure. A corrected retry creates a new
+record linked to the previous run; it never rewrites the old attempt's code or result.
+Retained source preparation can be adopted when its exact source/profile still matches.
+Code and unpublished wheels go directly to the authenticated private worker, without a
+Tensorhub package publication or intermediate upload. Published dependencies can still come
+from their package repositories. Ordinary Python edits do not rebuild the worker image.
+
+Failed private jobs keep their resumable work and rental. `cozy run pause <id>` stops execution
+while retaining that state; `cozy run resume <id>` runs the exact captured revision again.
+Use `--retry` when changing code or parameters. `cozy run cancel <id>` abandons the retained
+work, releasing only resources with no other owner. Retained rentals continue billing.
+An unchanged deterministic failure is not automatically retried. `--await` returns when a
+transaction blocks or pauses, and the ordinary run view explains the stopped state.
+
+Source/weight recovery does not make every Python function automatically resumable. A
+computation must commit supported output/checkpoint boundaries; managed package-call
+composition is tracked separately while its broker is being integrated.
+
 Serving entrypoints and bounded jobs use the same command. Cozy reads the installed package interface
 to determine the callable lifecycle:
 
