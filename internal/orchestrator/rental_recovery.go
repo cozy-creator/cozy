@@ -220,7 +220,7 @@ func (c *Orchestrator) rentalCanServe(rentalID string) bool {
 		// An unreadable store is not an observation about the pod. Leave the attempt alone.
 		return true
 	}
-	return row != nil && row.State != "failed" && row.State != "released"
+	return row != nil && row.State != "failed" && row.State != "released" && row.State != "release_requested"
 }
 
 // CancelLostAttempt settles a request whose attempt can no longer be reached, as CANCELED,

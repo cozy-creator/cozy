@@ -2,10 +2,30 @@ package records
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
+
+func (s *Store) RetainedFailure(id string) (string, string, *exit.Error) {
+	var raw string
+	err := s.db.QueryRow(`SELECT payload FROM request_events WHERE request_id=? AND type='request.blocked' ORDER BY seq DESC LIMIT 1`, id).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", exit.Internalf("cannot read retained failure: %s", err)
+	}
+	var detail struct {
+		ErrorType string `json:"error_type"`
+		Error     string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(raw), &detail); err != nil {
+		return "", "", exit.Internalf("cannot decode retained failure: %s", err)
+	}
+	return detail.ErrorType, detail.Error, nil
+}
 
 // retainRetryTx acquires lineage and the same retained machine in the admission
 // transaction. A concurrent cancellation wins before or after this commit, never
@@ -40,7 +60,7 @@ func retainRetryTx(tx *sql.Tx, request *Request) *exit.Error {
 			}
 			return exit.Internalf("cannot inspect retained rental: %s", err)
 		}
-		if state == "released" || state == "failed" {
+		if state == "released" || state == "failed" || state == "release_requested" {
 			return exit.Named(exit.Conflict, "request.state_lost", "retry predecessor %s's retained rental is %s", prior.ID, state)
 		}
 	}

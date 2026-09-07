@@ -693,6 +693,9 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		Outputs: []MediaRef{}, CreatedAt: row.CreatedAt,
 		EventsURL: "/v1/requests/" + row.ID + "/events",
 	}
+	if row.State == "blocked" {
+		state.ErrorType, state.Error, _ = s.store.RetainedFailure(row.ID)
+	}
 	if row.ModelTransfer != nil {
 		if transfer, problem := s.store.ModelTransferOf(row.ID); problem == nil && transfer != nil {
 			state.ModelDestination = transfer.Destination
