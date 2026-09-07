@@ -63,6 +63,10 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	out = orchestrator.Submission{Kind: "job", RetainWork: true, Package: install.Package, Entrypoint: binding.Entrypoint, Release: install.Version, InstallID: install.ID,
 		PlanID: facts.DescriptorID, Payload: append([]byte(nil), payload...), Outputs: facts.Outputs, WeightsOutputs: facts.WeightsOutputs, NeedsAccelerator: facts.NeedsAccelerator, Org: parent.Org}
 	out.ChildReusable = job.Invocable.Reusable
+	if parent.Worker != "" {
+		out.Worker, out.Rental, out.RentalRequired = parent.Worker, true, true
+		out.LocalPackageDigest = binding.LocalRevisionDigest
+	}
 	identity, _ := json.Marshal(map[string]any{"local_revision_digest": binding.LocalRevisionDigest, "interface_digest": iface, "entrypoint": binding.Entrypoint, "module": module, "export": export})
 	identity, err := canonical.NormalizeJCS(identity)
 	if err != nil {

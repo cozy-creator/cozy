@@ -35,6 +35,14 @@ type ChildBinding struct {
 	Entrypoint          string
 }
 
+func (s *Store) HasChildBindings(parentInstall string) (bool, *exit.Error) {
+	var held bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM private_child_bindings WHERE parent_install_id=?)`, parentInstall).Scan(&held); err != nil {
+		return false, exit.Internalf("cannot read parent execution role: %s", err)
+	}
+	return held, nil
+}
+
 const childBindingCols = `parent_install_id,interface_digest,module,export,child_install_id,local_revision_digest,entrypoint`
 
 func scanChildBinding(row interface{ Scan(...any) error }) (ChildBinding, error) {

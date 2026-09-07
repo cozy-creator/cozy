@@ -987,7 +987,12 @@ func settledState(state string) bool {
 // resolveFor keeps local package execution separate from generic rented capacity.
 // A rented worker receives only Creator's logical package refs; the worker
 // resolves and reports the exact binding it made dispatchable.
-func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string, *exit.Error) {
+func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpec, planID string, problem *exit.Error) {
+	defer func() {
+		if problem == nil && resolved.IsJob() {
+			resolved, problem = c.jobExecutionRole(req, resolved)
+		}
+	}()
 	if req.Worker == "" {
 		if c.opt.Packages == nil {
 			return WorkerLaunchSpec{}, "", exit.Unavailablef("this host resolves no local packages")
@@ -1073,10 +1078,17 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 				"local_package_revision_changed",
 				"request %s no longer matches its sealed local package revision", req.ID)
 		}
+		var preserveParent *JobPlan
+		if req.ParentRequestID != "" {
+			preserveParent, e = c.retainedOrchestrationParent(req)
+			if e != nil {
+				return WorkerLaunchSpec{}, "", e
+			}
+		}
 		if e := c.ConvergeLocalPackage(instance, req.ID, revision,
 			req.LocalPackageUploadedBootID, func(bootID string) *exit.Error {
 				return c.opt.Store.MarkLocalPackageUploaded(req.ID, revision.Digest, bootID)
-			}); e != nil {
+			}, preserveParent); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
 		if !req.IsJob() && len(logical.Models) > 0 {
@@ -1139,6 +1151,10 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 				WeightsOutputs: weights, RSSCap: DefaultJobRSSCap,
 				NeedsAccelerator: req.NeedsAccelerator}},
 		}}
+		spec, e = c.jobExecutionRole(req, spec)
+		if e != nil {
+			return WorkerLaunchSpec{}, "", e
+		}
 		if e := c.ConvergeRemoteJob(instance, spec); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}

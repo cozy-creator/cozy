@@ -78,12 +78,6 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		refuse(exit.Unavailablef("this package owner cannot resolve frozen child interfaces"))
 		return
 	}
-	// The first lane uses the ordinary independent local worker slots. A rented
-	// parent needs explicit second-slot credit before it can host child work.
-	if parent.Worker != "" {
-		refuse(exit.Named(exit.Unavailable, "child.rental_capacity_unavailable", "the rented parent has no independent child execution slot"))
-		return
-	}
 	spec, target, problem := resolver.ResolvePrivateChild(*parent, iface, call.Module, call.Export, payload)
 	if problem != nil {
 		refuse(problem)

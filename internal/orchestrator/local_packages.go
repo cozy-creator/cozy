@@ -61,6 +61,7 @@ type localTransferStatus struct {
 // with no request and no durable marker: its next run proves the bytes again if it must.
 func (c *Orchestrator) ConvergeLocalPackage(instanceID, operationID string,
 	revision localpackage.Revision, uploadedBootID string, uploaded func(bootID string) *exit.Error,
+	parent ...*JobPlan,
 ) *exit.Error {
 	selected, transfer, problem := localSelection(operationID, revision)
 	if problem != nil {
@@ -104,8 +105,10 @@ func (c *Orchestrator) ConvergeLocalPackage(instanceID, operationID string,
 			uploadedBootID = s.bootID
 		}
 	}
-	if problem := c.hostNothing(instanceID, revision.Digest); problem != nil {
-		return problem
+	if len(parent) == 0 || parent[0] == nil {
+		if problem := c.hostNothing(instanceID, revision.Digest); problem != nil {
+			return problem
+		}
 	}
 	for {
 		if problem := c.issueLocalPackageSet(s, w, selected); problem == nil {

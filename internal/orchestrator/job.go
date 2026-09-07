@@ -52,9 +52,11 @@ type JobPlan struct {
 	WeightsOutputs []WeightsOutput
 	// Record is the closed key set `plan.py::JobBinding.read` accepts. An unknown key is
 	// a refusal at the worker, which is what makes "closed at both ends" a fact.
-	Record           map[string]any
-	RSSCap           int64
-	NeedsAccelerator bool
+	Record              map[string]any
+	RSSCap              int64
+	NeedsAccelerator    bool
+	Orchestration       bool
+	OrchestrationParent *JobPlan
 }
 
 const DefaultJobRSSCap int64 = 8 << 30
@@ -146,26 +148,7 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker) *exit.Error {
 	d := &pb.DesiredWorkerState{
 		Revision: rev, WireMinor: pb.WireMinor,
 		Posture: pb.Posture_POSTURE_ACCEPTING,
-		Mode: &pb.DesiredWorkerState_Job{Job: &pb.JobDirective{
-			BuildId:         plan.BuildID,
-			JobDescriptorId: plan.DescriptorID,
-			ResourceCaps: &pb.ResourceCaps{
-				DeviceRequired: gpuCountOf(plan) > 0,
-				MaxRssBytes:    uint64(plan.RSSCap),
-			},
-			// The DIRECTIVE's publication contract is the worker-level authorization;
-			// the per-attempt one rides the InvocationSpec, because a worker that
-			// drains a queue publishes into a different scratch repo per request.
-			PublicationContract: &pb.PublicationContract{
-				GrantId: home.ScratchRepo("local", "queue"),
-				Outputs: invocationOutputBindings(plan.Outputs, plan.WeightsOutputs, c.maxOutputBytes()),
-			},
-			// TERMINAL AND RECLAIM, everywhere. A job worker is one immutable build
-			// running one bounded attempt; deep queueing is the orchestrator's dispatch
-			// queue, not a warm worker (audit-adopted, 2026-08-26).
-			ReclaimOnTerminal: true,
-			DeviceCount:       uint32(gpuCountOf(plan)),
-		}},
+		Mode:    &pb.DesiredWorkerState_Job{Job: c.jobDirective(plan)},
 	}
 	d.RecordOwnerEpoch, d.ControlStreamEpoch, d.WorkerBootId = recordOwnerEpoch, s.epoch, s.bootID
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}}) {
@@ -174,6 +157,34 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker) *exit.Error {
 	c.logf("DesiredWorkerState revision=%d posture=accepting JOB %s (%s) -> %s",
 		rev, plan.Function, shortDigest(plan.DescriptorID), s.bootID)
 	return nil
+}
+
+func (c *Orchestrator) jobDirective(plan *JobPlan) *pb.JobDirective {
+	directive := &pb.JobDirective{
+		BuildId:         plan.BuildID,
+		JobDescriptorId: plan.DescriptorID,
+		ResourceCaps: &pb.ResourceCaps{
+			DeviceRequired: gpuCountOf(plan) > 0,
+			MaxRssBytes:    uint64(plan.RSSCap),
+		},
+		// The DIRECTIVE's publication contract is the worker-level authorization;
+		// the per-attempt one rides the InvocationSpec, because a worker that
+		// drains a queue publishes into a different scratch repo per request.
+		PublicationContract: &pb.PublicationContract{
+			GrantId: home.ScratchRepo("local", "queue"),
+			Outputs: invocationOutputBindings(plan.Outputs, plan.WeightsOutputs, c.maxOutputBytes()),
+		},
+		// TERMINAL AND RECLAIM, everywhere. A job worker is one immutable build
+		// running one bounded attempt; deep queueing is the orchestrator's dispatch
+		// queue, not a warm worker (audit-adopted, 2026-08-26).
+		ReclaimOnTerminal: true,
+		DeviceCount:       uint32(gpuCountOf(plan)),
+		Orchestration:     plan.Orchestration,
+	}
+	if plan.OrchestrationParent != nil {
+		directive.OrchestrationParent = c.jobDirective(plan.OrchestrationParent)
+	}
+	return directive
 }
 
 func (c *Orchestrator) ConvergeRemoteJob(instanceID string, spec WorkerLaunchSpec) *exit.Error {

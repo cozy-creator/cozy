@@ -449,6 +449,9 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			// hosts no placement at all, so it has no serving axis. `jobs_available` IS
 			// the job credit, and this lane's dispatchability is that number.
 			avail := r.GetJobCapacity().GetJobsAvailable()
+			if w.spec.Placement.Jobs[0].Orchestration {
+				avail = r.GetJobCapacity().GetOrchestrationAvailable()
+			}
 			w.observeJobs(int(avail))
 			for _, p := range w.spec.Placement.Jobs {
 				dispatchable[p.DescriptorID] = avail > 0
@@ -647,7 +650,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		if r.AvailableAttemptSlots > 0 {
 			go c.reviveQueue()
 		}
-	} else if w != nil && w.spec.IsJob() && r.GetJobCapacity().GetJobsAvailable() > 0 {
+	} else if w != nil && w.spec.IsJob() && (r.GetJobCapacity().GetJobsAvailable() > 0 || r.GetJobCapacity().GetOrchestrationAvailable() > 0) {
 		go c.drain()
 	} else if workerTerminal {
 		// A FAILED axis or permanent desired-state refusal is the worker's answer, not a
