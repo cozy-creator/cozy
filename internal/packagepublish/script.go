@@ -116,6 +116,9 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 		"cozy_script.py": raw,
 		"pyproject.toml": project,
 		"package.toml":   []byte("[application]\nobject = \"cozy_script:app\"\n"),
+		// The current Runtime contract requires standard CPython 3.12. Keep
+		// uv's choice with the snapshot; incompatible script metadata refuses.
+		".python-version": []byte("3.12\n"),
 	} {
 		if err := os.WriteFile(filepath.Join(root, filename), contents, 0o600); err != nil {
 			return nil, exit.Internalf("cannot stage script project: %s", err)
