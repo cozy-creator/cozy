@@ -21,7 +21,7 @@ var privateChildRuntimeWheel = flag.String("child-runtime-wheel", "", "exact Run
 
 // This uses the actual Creator binary, installed interface wheels, independent
 // package executors and typed broker. No control peer or executor is simulated.
-func TestPrivateChildCompositionReusesAAfterParentAndLibraryEdits(t *testing.T) {
+func TestPrivateChildCompositionRunsEditsWithoutALocalCache(t *testing.T) {
 	runtimeVersion := "0.2.33"
 	runtimeInstall := "cozy-runtime==" + runtimeVersion
 	runtimeSource := ""
@@ -93,7 +93,6 @@ class Result(msgspec.Struct, frozen=True):
 		}
 		body += "app = App()\napp.job(compute)\n"
 		must(t, os.WriteFile(filepath.Join(lib, module+".py"), []byte(body), 0o600))
-		run("lock", "--project", lib)
 	}
 	script := filepath.Join(project, "recipe.py")
 	runtimeScriptSource := ""
@@ -141,8 +140,8 @@ async def main():
 	fatal(t, problem)
 	children, problem = store.Children(second.ID)
 	fatal(t, problem)
-	if len(children) != 2 || children[0].ReusedFrom != originalA.ID || children[0].Ordinal != 0 || children[1].Ordinal != 1 || children[1].ChildTargetDigest != originalB.ChildTargetDigest || children[1].ChildIntentDigest == originalB.ChildIntentDigest {
-		t.Fatalf("parent edit did not reuse only A: %+v", children)
+	if len(children) != 2 || children[0].ReusedFrom != "" || children[0].Ordinal != 1 || children[0].ChildTargetDigest != originalA.ChildTargetDigest || children[1].Ordinal != 1 || children[1].ChildTargetDigest != originalB.ChildTargetDigest || children[1].ChildIntentDigest == originalB.ChildIntentDigest {
+		t.Fatalf("local composition did not execute unchanged A and changed B: %+v", children)
 	}
 	secondB := children[1]
 	assertChildScalar(t, store, secondB.ID, 214)
@@ -158,7 +157,7 @@ async def main():
 	fatal(t, problem)
 	children, problem = store.Children(third.ID)
 	fatal(t, problem)
-	if len(children) != 2 || children[0].ReusedFrom != originalA.ID || children[0].Ordinal != 0 || children[1].Ordinal != 1 || children[1].ChildTargetDigest == secondB.ChildTargetDigest || children[1].ChildIntentDigest != secondB.ChildIntentDigest {
+	if len(children) != 2 || children[0].ReusedFrom != "" || children[0].Ordinal != 1 || children[0].ChildTargetDigest != originalA.ChildTargetDigest || children[1].Ordinal != 1 || children[1].ChildTargetDigest == secondB.ChildTargetDigest || children[1].ChildIntentDigest != secondB.ChildIntentDigest {
 		t.Fatalf("library edit did not invalidate exactly B: %+v", children)
 	}
 	assertChildScalar(t, store, children[1].ID, 215)
@@ -171,6 +170,11 @@ async def main():
 	must(t, err)
 	if strings.Contains(string(retained), "value * factor + 1") {
 		t.Fatal("library edit modified the original captured implementation")
+	}
+	for _, name := range []string{"source", "candidate"} {
+		if _, err := os.Stat(filepath.Join(project, name, "uv.lock")); !os.IsNotExist(err) {
+			t.Fatal("private child intake modified the author's lock files")
+		}
 	}
 }
 

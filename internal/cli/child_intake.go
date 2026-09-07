@@ -71,17 +71,22 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 	replacements := map[string]string{}
 	for _, name := range names {
 		path := dependencies[name]
+		if stack[path] {
+			return fail(exit.New(exit.Validation, "private invocable dependency graph is cyclic"))
+		}
 		if info, err := os.Stat(filepath.Join(path, "package.toml")); err != nil || !info.Mode().IsRegular() {
 			continue
 		}
 		if len(intake.Bindings) >= 32 {
 			return fail(exit.New(exit.Validation, "private parent exceeds 32 invocable dependency exports"))
 		}
-		dependency, problem := packagepublish.PrepareLocalFrom(path)
+		dependency, problem := packagepublish.PreparePrivateFrom(context.Background(), path)
 		if problem != nil {
 			return fail(problem)
 		}
+		stack[path] = true
 		nested, problem := prepareChildIntakeDepth(ctx, dependency, layout, store, stack, depth+1)
+		delete(stack, path)
 		if problem != nil {
 			dependency.Close()
 			return fail(problem)
