@@ -102,7 +102,7 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 			c.retryRetainedCancellation(id)
 			return
 		}
-		if problem := c.opt.ModelTransfers.ReleaseSourceCheckpoints(context.Background(), id); problem != nil {
+		if problem := c.opt.ModelTransfers.ReleaseCheckpoints(context.Background(), id); problem != nil {
 			c.retryRetainedCancellation(id)
 			return
 		}

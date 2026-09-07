@@ -366,8 +366,11 @@ func (p DesiredPlacement) PlacementID() string {
 }
 
 // supportsCurrentProtocol is shared by placement reuse and dispatch. A peer that
-// has negotiated an older wire can settle prior work but cannot take new directives.
+// lacks a compatible protocol range cannot be claimed or take new directives.
 func (w *worker) supportsCurrentProtocol() bool {
+	if w.refusal != nil && w.refusal.ErrName() == "worker.protocol_incompatible" {
+		return false
+	}
 	return w.declaredInstance == "" || w.wireMinor >= pb.WireMinor
 }
 

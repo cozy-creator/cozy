@@ -54,7 +54,7 @@ func SyncStoredSourceCustody(ctx context.Context, cfg config.Config, requestID, 
 	defer connection.Close()
 	fmt.Fprintln(log, "source custody control claimed; snapshot dispatch barrier remains closed")
 	owner := NewModelTransferOwner(cfg, store, log, auth)
-	if problem := owner.SyncSourceCheckpoints(connection.Context, requestID, connection.Host); problem != nil {
+	if problem := owner.SyncCheckpoints(connection.Context, requestID, connection.Host); problem != nil {
 		return nil, problem
 	}
 	result, problem := inspectSourceCustody(store, cfg, requestID, rentalID, bootID)
@@ -144,13 +144,13 @@ func inspectSourceCustody(store *records.Store, cfg config.Config, requestID, re
 
 // SourcePrepared distinguishes final source inputs from an acknowledged partial prefix.
 type SourceCustodyResult struct {
-	ControlClaimed       bool                          `json:"control_claimed"`
-	SnapshotAcknowledged bool                          `json:"snapshot_acknowledged"`
-	SourcePrepared       bool                          `json:"source_prepared"`
-	SourceSelection      string                        `json:"source_selection"`
-	SourceBytes          int64                         `json:"source_bytes"`
-	ObservedBytes        int64                         `json:"observed_bytes"`
-	AcknowledgedBytes    int64                         `json:"acknowledged_bytes"`
-	Models               []records.ModelRef            `json:"models"`
-	Checkpoints          []records.ModelSourceProgress `json:"source_checkpoints"`
+	ControlClaimed       bool                              `json:"control_claimed"`
+	SnapshotAcknowledged bool                              `json:"snapshot_acknowledged"`
+	SourcePrepared       bool                              `json:"source_prepared"`
+	SourceSelection      string                            `json:"source_selection"`
+	SourceBytes          int64                             `json:"source_bytes"`
+	ObservedBytes        int64                             `json:"observed_bytes"`
+	AcknowledgedBytes    int64                             `json:"acknowledged_bytes"`
+	Models               []records.ModelRef                `json:"models"`
+	Checkpoints          []records.ModelCheckpointProgress `json:"source_checkpoints"`
 }

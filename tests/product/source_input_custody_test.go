@@ -68,9 +68,9 @@ func TestProducerWaitsForAcknowledgedSourceInputs(t *testing.T) {
 	})
 	fatal(t, problem)
 	fatal(t, o.store.BeginModelTransferMaterialization(requestID))
-	checkpoint := records.ModelSourceCheckpoint{Slot: "shared", HeadID: "sha256:" + strings.Repeat("3", 64),
+	checkpoint := records.ModelCheckpoint{Slot: "shared", HeadID: "sha256:" + strings.Repeat("3", 64),
 		HeadLength: 500, PlanDigest: "sha256:" + strings.Repeat("4", 64), Index: 0, Bytes: 256}
-	fatal(t, o.store.ObserveModelSourceCheckpoints(requestID, verdictSelection, podBootID, []records.ModelSourceCheckpoint{checkpoint}))
+	fatal(t, o.store.ObserveModelSourceCheckpoints(requestID, verdictSelection, podBootID, []records.ModelCheckpoint{checkpoint}))
 	fatal(t, o.store.CompleteModelTransferMaterialization(requestID, []records.ModelRef{{Package: "cozy/h3-package",
 		Slot: "shared", Model: "source/shared", Manifest: "sha256:" + strings.Repeat("5", 64), ManifestLength: 164}}, podBootID))
 	close(configured)

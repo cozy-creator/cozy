@@ -17,7 +17,7 @@ import (
 type IdleControl struct {
 	Context            context.Context
 	ControlStreamEpoch uint64
-	Host               SourceCheckpointHost
+	Host               CheckpointHost
 	connection         *grpc.ClientConn
 	cancel             context.CancelFunc
 }
@@ -44,6 +44,9 @@ func DialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 			_ = control.Close()
 		}
 	}()
+	if problem := probeWorkerProtocol(ctx, conn, true); problem != nil {
+		return nil, problem
+	}
 	stream, err := pb.NewWorkerControlClient(conn).Control(ctx)
 	if err != nil {
 		return nil, idleControlEnd(err)
@@ -77,7 +80,7 @@ func DialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 				return nil, problem
 			}
 			control.ControlStreamEpoch = epoch
-			control.Host = sourceCheckpointAdapter(pb.NewPodHostClient(conn), claim)
+			control.Host = checkpointAdapter(pb.NewPodHostClient(conn), claim)
 			// A lost control stream cancels the mover too: unary byte progress is not an
 			// owner-presence hold and may not outlive this accepted control connection.
 			go func() {

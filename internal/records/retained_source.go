@@ -23,7 +23,7 @@ func SameSourceAcquisition(a, b *ModelTransferIntent) bool {
 
 // RetriedSourceCheckpoints returns only acknowledged checkpoints from the exact
 // predecessor acquisition. Merely observed bytes are never promoted to custody.
-func (s *Store) RetriedSourceCheckpoints(id string) (string, []ModelSourceProgress, *exit.Error) {
+func (s *Store) RetriedSourceCheckpoints(id string) (string, []ModelCheckpointProgress, *exit.Error) {
 	request, problem := s.RequestRow(id)
 	if problem != nil || request == nil || request.RetryOf == "" {
 		return "", nil, problem
@@ -48,7 +48,7 @@ func (s *Store) RetriedSourceCheckpoints(id string) (string, []ModelSourceProgre
 // AdoptRetriedSourceCheckpoint follows independently verified custody under the
 // new request's publication holds. Native restore still checks the full source
 // plan and content before dispatch; this copies no worker status or model handle.
-func (s *Store) AdoptRetriedSourceCheckpoint(id, priorID string, checkpoint ModelSourceCheckpoint) *exit.Error {
+func (s *Store) AdoptRetriedSourceCheckpoint(id, priorID string, checkpoint ModelCheckpoint) *exit.Error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return exit.Internalf("cannot begin source checkpoint adoption: %s", err)
@@ -72,14 +72,14 @@ func (s *Store) AdoptRetriedSourceCheckpoint(id, priorID string, checkpoint Mode
 	}
 	data, _ := json.Marshal(checkpoint)
 	var held string
-	if err := tx.QueryRow(`SELECT acknowledged FROM request_model_source_checkpoints WHERE request_id=? AND slot=?`, priorID, checkpoint.Slot).Scan(&held); err != nil || held != string(data) {
+	if err := tx.QueryRow(`SELECT acknowledged FROM request_model_checkpoints WHERE request_id=? AND kind='source' AND slot=?`, priorID, checkpoint.Slot).Scan(&held); err != nil || held != string(data) {
 		return exit.Named(exit.Conflict, "request.source_adoption_changed", "source adoption must preserve the predecessor's exact acknowledged checkpoint")
 	}
 	var observed, acknowledged string
-	err = tx.QueryRow(`SELECT observed,acknowledged FROM request_model_source_checkpoints WHERE request_id=? AND slot=?`, id, checkpoint.Slot).Scan(&observed, &acknowledged)
+	err = tx.QueryRow(`SELECT observed,acknowledged FROM request_model_checkpoints WHERE request_id=? AND kind='source' AND slot=?`, id, checkpoint.Slot).Scan(&observed, &acknowledged)
 	if err == nil {
 		// A restart after this commit, or later progress, already owns its result.
-		var existing ModelSourceCheckpoint
+		var existing ModelCheckpoint
 		if json.Unmarshal([]byte(acknowledged), &existing) == nil && existing.PlanDigest == checkpoint.PlanDigest && existing.Index >= checkpoint.Index {
 			return nil
 		}
@@ -88,7 +88,7 @@ func (s *Store) AdoptRetriedSourceCheckpoint(id, priorID string, checkpoint Mode
 	if err != sql.ErrNoRows {
 		return exit.Internalf("cannot read source adoption progress: %s", err)
 	}
-	if _, err := tx.Exec(`INSERT INTO request_model_source_checkpoints(request_id,slot,worker_boot_id,observed,acknowledged)
+	if _, err := tx.Exec(`INSERT INTO request_model_checkpoints(request_id,slot,worker_boot_id,observed,acknowledged)
 		VALUES(?,?,'',?,?)`, id, checkpoint.Slot, string(data), string(data)); err != nil {
 		return exit.Internalf("cannot adopt source checkpoint: %s", err)
 	}
@@ -127,7 +127,7 @@ func (s *Store) RetriedSourceCustodyPending(priorID string) (bool, *exit.Error) 
 		if problem != nil {
 			return false, problem
 		}
-		bySlot := map[string]*ModelSourceCheckpoint{}
+		bySlot := map[string]*ModelCheckpoint{}
 		for _, progress := range current {
 			bySlot[progress.Observed.Slot] = progress.Acknowledged
 		}
