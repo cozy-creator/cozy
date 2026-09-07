@@ -2,8 +2,11 @@ package producttest
 
 import (
 	"net/http"
+	"runtime"
 	"strings"
 	"testing"
+
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func TestRentalPruneRequiresAuthenticatedKnownWorkspace(t *testing.T) {
@@ -28,5 +31,21 @@ func TestRentalPruneRequiresAuthenticatedKnownWorkspace(t *testing.T) {
 	}
 	if rows := listInvocations(t, root); len(rows) != 0 {
 		t.Fatal("pruning created an execution request")
+	}
+}
+
+func TestLocalCachePruneRequiresItsWorkspaceWithoutCreatingAJob(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the startup-refusing Runtime fixture is a POSIX shell script")
+	}
+	// This tool passes version admission but exits before publishing a worker
+	// address. A service failure must not become an all-zero successful prune.
+	root, path := hostRuntimeRoot(t, "cache-prune-refused", stubRuntime(t, "0.4.0", pb.WireMinor))
+	code, out := runCozyPath(t, root, path, "cache", "prune", "--json")
+	if code == 0 || !strings.Contains(out, `"code":"workspace.control_unavailable"`) || strings.Contains(out, `"removed_entries"`) {
+		t.Fatalf("workspace startup failure became cache-prune success [%d]: %s", code, out)
+	}
+	if rows := listInvocations(t, root); len(rows) != 0 {
+		t.Fatal("local cache pruning created an execution request")
 	}
 }
