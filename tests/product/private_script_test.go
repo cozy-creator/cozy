@@ -48,19 +48,17 @@ only-include = ["algorithm.py"]
 # [tool.uv.sources]
 # private-script-algorithm = {path = "./algorithm", editable = true}
 ` + runtimeSource + `# ///
-import msgspec
-from cozy_runtime.author import App
+from pathlib import Path
 from algorithm import compute
-app = App()
-class Request(msgspec.Struct):
-    value: int = 7
-class Result(msgspec.Struct):
-    value: int
-def helper(value: int) -> int:
+
+OUTPUT = ` + strconv.Quote(filepath.Join(root, "result.txt")) + `
+
+def helper(value):
     return compute(value)
-@app.job
-def main(payload: Request) -> Result:
-    return Result(helper(payload.value))
+
+def main(ctx):
+    ctx.raise_if_cancelled()
+    Path(OUTPUT).write_text(str(helper(7)))
 `
 	must(t, os.WriteFile(script, []byte(code), 0o600))
 	if status, out := runCozy(t, root, "run", script, "--describe", "--json"); status != 0 {
@@ -85,8 +83,13 @@ def main(payload: Request) -> Result:
 	}
 	must(t, os.WriteFile(module, []byte("def compute(value):\n    return value + 100\n"), 0o600))
 	status, out = runCozy(t, root, "run", script, "--retry", "1", "--await", "--json")
-	if status != 0 || !strings.Contains(out, `"value":107`) {
+	if status != 0 {
 		t.Fatalf("edited dependency was not used on retry [%d]: %s", status, out)
+	}
+	written, err := os.ReadFile(filepath.Join(root, "result.txt"))
+	must(t, err)
+	if string(written) != "107" {
+		t.Fatalf("edited script did not write its actual result: %q", written)
 	}
 	second, problem := store.RequestByReference("2")
 	fatal(t, problem)
@@ -113,7 +116,7 @@ def main(payload: Request) -> Result:
 	t.Logf("%s failed; %s uses edited library; original source/environment preserved", first.ID, second.ID)
 }
 
-func TestPrivateScriptRejectsMultipleEntrypoints(t *testing.T) {
+func TestPrivateScriptRequiresMainWithoutExecutingSource(t *testing.T) {
 	root, err := os.MkdirTemp("", "cozy-script-count-")
 	must(t, err)
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all"); _ = os.RemoveAll(root) })
@@ -123,25 +126,17 @@ func TestPrivateScriptRejectsMultipleEntrypoints(t *testing.T) {
 		metadata += fmt.Sprintf("# [tool.uv.sources]\n# cozy-runtime = {path = %q}\n", wheel)
 	}
 	metadata += "# ///\n"
-	must(t, os.WriteFile(p, []byte(metadata+`import msgspec
-from cozy_runtime.author import App
-app = App()
-class Request(msgspec.Struct):
-    value: int = 1
-class Result(msgspec.Struct):
-    value: int
-@app.job
-def first(payload: Request) -> Result:
-    return Result(payload.value)
-@app.job
-def second(payload: Request) -> Result:
-    return Result(payload.value)
+	must(t, os.WriteFile(p, []byte(metadata+`raise RuntimeError("client must never execute this module")
+def first():
+    pass
+def second():
+    pass
 `), 0o600))
 	status, out := runCozy(t, root, "run", p, "--json")
-	if status == 0 || !strings.Contains(out, "script_entrypoint_count") {
-		t.Fatalf("ambiguous script accepted [%d]: %s", status, out)
+	if status == 0 || !strings.Contains(out, "script_main_missing") {
+		t.Fatalf("script without main was accepted [%d]: %s", status, out)
 	}
 	if rows := listInvocations(t, root); len(rows) != 0 {
-		t.Fatalf("ambiguous script created work: %+v", rows)
+		t.Fatalf("script without main created work: %+v", rows)
 	}
 }
