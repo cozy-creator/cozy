@@ -341,20 +341,20 @@ func (r *Resolver) ResolveInstall(installID string, models []orchestrator.ModelR
 		return facts.Spec(r.Devices)
 	}
 	if facts.Install.SourceKind == "local" {
-		// An editable install's PlacementSet froze its selection at install; the rows a
-		// rental request carries are that projection handed back (cl-101), never a
-		// second selection to prepare. Anything else is an override this lane has no
-		// home for.
+		// An editable install serves the selection its PlacementSet was derived under;
+		// the rows a rental request carries are that projection handed back (cl-101). A
+		// per-run selection the set does not hold needs cozy-runtime's development
+		// placement re-derived for it, which the runtime does not yet take as input.
 		spec, e := facts.Spec(r.Devices)
 		if e != nil {
 			return orchestrator.WorkerLaunchSpec{}, e
 		}
 		if selectedInstallKey(installID, models) != selectedInstallKey(installID, spec.Placement.Models) {
 			return orchestrator.WorkerLaunchSpec{}, exit.Named(exit.Unavailable,
-				"editable_model_override_unsupported",
-				"%s is an editable install whose model selection was frozen at install",
+				"editable_model_selection_unprepared",
+				"%s is an editable install whose placement does not hold this run's model selection",
 				facts.Install.Package).
-				WithRemedy("change package.toml and let the editable refresh re-derive it, or publish the package and override with model.<param>=")
+				WithRemedy("publish the package and run it with model.<param>=org/model@release/lane, or run the selection its placement holds")
 		}
 		return spec, nil
 	}
@@ -499,9 +499,24 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 		if _, problem := hub.ParseRef(model.Model); problem != nil {
 			return empty, nil, problem
 		}
-		if _, err := canonical.Raw(model.Manifest); err != nil {
+		// Exact, or a ladder every rung of which is exact: the machine decision pins one
+		// rung once the machine exists (cl-166).
+		exact := []string{model.Manifest}
+		if !model.Pinned() {
+			exact = exact[:0]
+			for _, rung := range model.Ladder {
+				exact = append(exact, rung.Manifest)
+			}
+		}
+		if len(exact) == 0 {
 			return empty, nil, exit.Named(exit.Validation, "rental.model_manifest_invalid",
-				"model selection for %s has no exact manifest", slot.Path)
+				"model selection for %s has neither an exact manifest nor a ladder", slot.Path)
+		}
+		for _, manifest := range exact {
+			if _, err := canonical.Raw(manifest); err != nil {
+				return empty, nil, exit.Named(exit.Validation, "rental.model_manifest_invalid",
+					"model selection for %s has no exact manifest", slot.Path)
+			}
 		}
 	}
 	planID := ""

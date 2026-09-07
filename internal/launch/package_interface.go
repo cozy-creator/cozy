@@ -10,8 +10,8 @@
 //     The recorded semantic digest is checked on every read.
 //   - THE PLACEMENT FACTS come from the exact PlacementSet retained at install. Runtime owns
 //     no local model-ref index, and cozy-creator never composes a TensorFS store path.
-//   - THE SELECTION is `package.toml`'s `[bindings]` table — the author's declared
-//     default, in the runtime's own grammar and vocabulary.
+//   - THE SELECTION is the request's own: the hub binding's rung for the machine, or a
+//     `model.<param>=` run key. Nothing in the package source is a binding (cl-166).
 //
 // For a wholly weightless package the installed runtime is the sole canonical plan writer:
 // `bindings --json` reports exact WeightsSubjects before spawn and

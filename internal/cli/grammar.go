@@ -78,13 +78,14 @@ type PackageCmd struct {
 }
 
 type PackageBindCmd struct {
-	Ref  string `arg:"" name:"package" help:"Published package name (org/name)."`
-	Slot string `arg:"" name:"slot-path" help:"Declared slot path, e.g. generate.models.model."`
-	To   string `arg:"" name:"model" help:"org/model[@release[/lane]] — any repo; compatibility is preflight's flag, never a write gate."`
+	Ref  string   `arg:"" name:"package" help:"Published package name (org/name)."`
+	Slot string   `arg:"" name:"slot-path" help:"Declared slot path, e.g. generate.models.model."`
+	To   string   `arg:"" name:"model" help:"org/model@release — the model release the slot loads."`
+	GPU  []string `name:"gpu" help:"<GPU>=<lane>: the lane that fits that GPU class; repeat in order of preference, '*'=<lane> last as the catch-all."`
 }
 
 func (c *PackageBindCmd) Run(r *Runtime) error {
-	return r.call(handlePackageBind, []string{c.Ref, c.Slot, c.To}, nil, nil, false)
+	return r.call(handlePackageBind, []string{c.Ref, c.Slot, c.To}, nil, values("--gpu", c.GPU), false)
 }
 
 type PackageBindingsCmd struct {

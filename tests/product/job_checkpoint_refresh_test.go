@@ -112,7 +112,7 @@ func TestRemoteJobRefreshesCheckpointBeforeUsingNewCredit(t *testing.T) {
 		options.RentalFleet = func() (string, *exit.Error) { return "one existing rental", nil }
 		options.AcquireManagedRental = func(req records.Request) (orchestrator.RentalDecision, string, *exit.Error) {
 			acquisitions.Add(1)
-			_, problem := options.Store.PinRental(req.ID, podRental)
+			_, problem := options.Store.PinRental(req.ID, podRental, nil)
 			return orchestrator.RentalDecision{RentalID: podRental}, "", problem
 		}
 	})

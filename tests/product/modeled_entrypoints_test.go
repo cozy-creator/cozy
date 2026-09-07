@@ -38,7 +38,8 @@ func TestPublishedH3ModeledEntrypointSelection(t *testing.T) {
 		logical, entrypoint, problem := resolver.ResolveRemoteRelease("paul/minimax-h3", "1.1.2", function, models)
 		fatal(t, problem)
 		if entrypoint.Name != function || logical.Function != function || logical.PlanID != "" ||
-			len(logical.Models) != 1 || logical.Models[0] != models[0] {
+			len(logical.Models) != 1 || logical.Models[0].Slot != models[0].Slot ||
+			logical.Models[0].Manifest != models[0].Manifest {
 			t.Fatal("remote metadata resolution changed the callable or its selected model")
 		}
 		models[0].Slot = "unselected.models.model"

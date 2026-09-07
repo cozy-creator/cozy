@@ -1,7 +1,9 @@
 package rental
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -9,93 +11,164 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// CheapestCompatibleSKU applies Creator's complete automatic machine-class
-// decision to the live catalog. Price and stable product name are the only
-// ordering facts after CPU versus accelerator compatibility is established.
-//
-// `constraints` is the published release's own Requirements/RequiresPython, and it
-// narrows the choice ADVISORILY: a product whose base profile the release already
-// contradicts is not worth an hour's rent, because the pod would refuse it typed on
-// arrival. The SKU still chooses the machine. When every accelerator-compatible product
-// is excluded this way, `mismatch` names why, so the caller refuses before the paid ask
-// instead of reporting an empty catalog.
+// Constraints is the published release's own Requirements/RequiresPython. It narrows the
+// catalog ADVISORILY: a product whose base profile the release already contradicts is not
+// worth an hour's rent, because the pod would refuse it typed on arrival.
 type Constraints struct {
 	Requirements   []string
 	RequiresPython string
 }
 
-// CheapestCompatibleSKU is Choose's answer without the record, for callers that only
-// need the winner.
-func CheapestCompatibleSKU(skus []hub.RentalSKU, needsAccelerator bool,
-	constraints Constraints) (sku hub.RentalSKU, mismatch string, found bool) {
-	sku, decision, found := Choose(skus, needsAccelerator, constraints)
-	return sku, decision.Mismatch, found
+// Step is one buyable machine in walk order, with the request's selection pinned to the
+// rung that fits it.
+type Step struct {
+	SKU    hub.RentalSKU
+	Rung   int // 1-based ladder rung
+	Models []records.ModelRef
+	Index  int // this product's row in the decision's Offered
 }
 
-// Choose picks the machine AND states the case for it (cl-132). The pick is identical to
-// what CheapestCompatibleSKU always returned; the second return is the evidence that
-// makes the pick auditable — see orchestrator.SKUDecision for why it has to exist.
-func Choose(skus []hub.RentalSKU, needsAccelerator bool,
-	constraints Constraints) (hub.RentalSKU, orchestrator.SKUDecision, bool) {
-	compatible := make([]hub.RentalSKU, 0, len(skus))
-	for _, candidate := range skus {
-		if (candidate.AcceleratorModel != "CPU") != needsAccelerator {
-			continue
-		}
-		compatible = append(compatible, candidate)
-	}
-	// Cheapest is what the renter PAYS: the GPU rate plus the SKU's storage
-	// adder (th-126). Every GPU product shares one image spec, so the adder is
-	// a constant and the ordering equals the GPU-price ordering there; a class
-	// whose products carried different disks would still rank by true cost.
+// Plan is Creator's complete automatic machine-class decision for a buy (cl-166): the
+// catalog walked rung by rung in the owner's ladder order, cheapest first within a rung,
+// keeping only the products the request FITS, and the record that makes every exclusion
+// readable. The ladder is a fit map — which lane belongs on which GPU class — so a product
+// no rung names is not a candidate, and a product whose rung lane outweighs its device is
+// not one either.
+//
+// The resident need is the pinned lanes' manifest bytes summed over slots: the model card
+// publishes one byte total per lane and no per-component sizes, so the whole lane is what
+// this reads, and it is the conservative fact — a lane's largest component is never larger
+// than the lane. VRAMGB is read as GiB, the unit GPU memory is actually built in (an
+// "80 GB" H100 carries 81920 MiB). A CPU-class request skips the device check: there is
+// no device, and the hub sizes the pod's RAM from the SKU.
+func Plan(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator bool,
+	constraints Constraints) ([]Step, orchestrator.SKUDecision) {
 	total := func(sku hub.RentalSKU) int64 {
 		return sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour
 	}
-	sort.Slice(compatible, func(i, j int) bool {
-		if total(compatible[i]) != total(compatible[j]) {
-			return total(compatible[i]) < total(compatible[j])
-		}
-		return compatible[i].Name < compatible[j].Name
-	})
-	decision := orchestrator.SKUDecision{
-		Offered: make([]orchestrator.SKUCandidate, 0, len(compatible)),
+	decision := orchestrator.SKUDecision{Ladder: ladderText(models)}
+	type row struct {
+		step    Step
+		verdict string
 	}
-	var winner hub.RentalSKU
-	found := false
-	for _, candidate := range compatible {
-		row := orchestrator.SKUCandidate{
-			Name: candidate.Name, TotalUSDMicrosPerHour: total(candidate)}
-		if found {
-			// Everything after the winner is simply dearer (or an equal-priced
-			// later name): the sort already ordered it, and re-deciding it here
-			// would answer a question the choice never asked.
-			row.Verdict = orchestrator.VerdictDearer
-			decision.Offered = append(decision.Offered, row)
+	rows := make([]row, 0, len(skus))
+	for _, sku := range skus {
+		if (sku.AcceleratorModel != "CPU") != needsAccelerator {
 			continue
 		}
-		profile, readable := launch.ParseBaseProfile(candidate.BaseWorkerProfile)
-		reason := ""
-		if readable {
-			reason = launch.BaseMismatch(profile, constraints.Requirements,
-				constraints.RequiresPython)
-		}
-		if reason == "" {
-			winner, found = candidate, true
-			decision.Chosen = candidate.Name
-		} else {
-			row.Verdict = orchestrator.VerdictBaseMismatch + ": " + reason
-			if decision.Mismatch == "" {
-				decision.Mismatch = candidate.Name + ": " + reason
+		r := row{step: Step{SKU: sku}}
+		r.step.Rung, r.step.Models, r.verdict = fit(sku, models, needsAccelerator)
+		if r.verdict == "" {
+			if profile, readable := launch.ParseBaseProfile(sku.BaseWorkerProfile); readable {
+				if reason := launch.BaseMismatch(profile, constraints.Requirements,
+					constraints.RequiresPython); reason != "" {
+					r.verdict = orchestrator.VerdictBaseMismatch + ": " + reason
+					if decision.Mismatch == "" {
+						decision.Mismatch = sku.Name + ": " + reason
+					}
+				}
 			}
 		}
-		decision.Offered = append(decision.Offered, row)
+		rows = append(rows, r)
 	}
-	if found {
-		// A refusal reports the exclusion that caused it; a successful choice has
-		// nothing to explain away.
+	// Walk order: the owner's rung first, price within it, name for a stable tie; the
+	// products no rung names come last, so the record still shows them.
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
+		if (a.step.Rung == 0) != (b.step.Rung == 0) {
+			return a.step.Rung != 0
+		}
+		if a.step.Rung != b.step.Rung {
+			return a.step.Rung < b.step.Rung
+		}
+		if total(a.step.SKU) != total(b.step.SKU) {
+			return total(a.step.SKU) < total(b.step.SKU)
+		}
+		return a.step.SKU.Name < b.step.SKU.Name
+	})
+	var steps []Step
+	for i, r := range rows {
+		candidate := orchestrator.SKUCandidate{Name: r.step.SKU.Name,
+			TotalUSDMicrosPerHour: total(r.step.SKU), Rung: r.step.Rung, Verdict: r.verdict}
+		if r.step.Rung != 0 {
+			candidate.Lane = records.Lanes(r.step.Models)
+		}
+		decision.Offered = append(decision.Offered, candidate)
+		if r.verdict == "" {
+			r.step.Index = i
+			steps = append(steps, r.step)
+		}
+	}
+	if len(steps) > 0 {
 		decision.Mismatch = ""
 	}
-	return winner, decision, found
+	return steps, decision
+}
+
+// fit pins the request's selection to the product's rung and says whether it holds.
+func fit(sku hub.RentalSKU, models []records.ModelRef, needsAccelerator bool) (int, []records.ModelRef, string) {
+	rung := 1
+	pinned := make([]records.ModelRef, 0, len(models))
+	for i, model := range models {
+		fitted, index, ok := model.RungFor(sku.AcceleratorModel)
+		if !ok {
+			return 0, nil, orchestrator.VerdictGPUMismatch
+		}
+		if i == 0 {
+			rung = index + 1
+		}
+		pinned = append(pinned, model.Pin(fitted))
+	}
+	if needsAccelerator {
+		if need, have := records.ResidentBytes(pinned), sku.VRAMGB<<30; need > have {
+			return rung, pinned, fmt.Sprintf("%s: needs %.1f GiB, %s has %d GB",
+				orchestrator.VerdictVRAMShort, float64(need)/(1<<30), sku.Name, sku.VRAMGB)
+		}
+	}
+	return rung, pinned, ""
+}
+
+// ladderText renders the fit map the walk follows: the lone slot's ladder, or one
+// `slot: …` line per slot when the request binds several.
+func ladderText(models []records.ModelRef) []string {
+	var out []string
+	for _, model := range models {
+		rungs := model.Lane
+		if !model.Pinned() {
+			parts := make([]string, 0, len(model.Ladder))
+			for _, rung := range model.Ladder {
+				parts = append(parts, rung.String())
+			}
+			rungs = strings.Join(parts, " > ")
+		}
+		if len(models) == 1 {
+			return []string{rungs}
+		}
+		out = append(out, model.Slot+": "+rungs)
+	}
+	return out
+}
+
+// Conclude writes the walk's outcome onto the record: the winner, `no_inventory` on every
+// step the hub refused before it, and `dearer` / `later_rung` on every fitting product the
+// walk never reached. A record with a chosen product and a verdict-less row is the defect
+// SKUDecision.UnexplainedPick exists to catch.
+func Conclude(decision *orchestrator.SKUDecision, steps []Step, refused []int, winner int) {
+	for _, index := range refused {
+		decision.Offered[steps[index].Index].Verdict = orchestrator.VerdictNoInventory
+	}
+	if winner < 0 || winner >= len(steps) {
+		return
+	}
+	chosen := steps[winner]
+	decision.Chosen = chosen.SKU.Name
+	for i := winner + 1; i < len(steps); i++ {
+		verdict := orchestrator.VerdictDearer
+		if steps[i].Rung != chosen.Rung {
+			verdict = fmt.Sprintf("%s: rung %d", orchestrator.VerdictLaterRung, steps[i].Rung)
+		}
+		decision.Offered[steps[i].Index].Verdict = verdict
+	}
 }
 
 // AcquisitionReason is the rental's PROVENANCE: which command caused this pod to be

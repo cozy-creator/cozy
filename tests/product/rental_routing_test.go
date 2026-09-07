@@ -37,7 +37,7 @@ func TestPublishedJobRentalClass(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			sku, mismatch, ok := rental.CheapestCompatibleSKU(skus,
+			sku, _, mismatch, ok := choose(skus,
 				launch.AcceleratorRequired(test.requirements),
 				rental.Constraints{Requirements: test.requirements})
 			if !ok || sku.Name != test.wantSKU {
@@ -132,7 +132,7 @@ func TestReleaseRefusedBeforeRentalSpend(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			sku, mismatch, ok := rental.CheapestCompatibleSKU(test.skus,
+			sku, _, mismatch, ok := choose(test.skus,
 				launch.AcceleratorRequired(test.requirements),
 				rental.Constraints{Requirements: test.requirements, RequiresPython: test.requiresPython})
 			if test.wantSKU != "" {
@@ -166,7 +166,7 @@ func TestSameSpecStorageAdderLeavesRankingUnchanged(t *testing.T) {
 	skus = append(skus, hub.RentalSKU{Name: "l4", AcceleratorModel: "NVIDIA L4",
 		PriceUSDMicrosPerHour: 490_000, StorageUSDMicrosPerHour: 213_504,
 		BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"})
-	sku, mismatch, ok := rental.CheapestCompatibleSKU(skus, true, rental.Constraints{})
+	sku, _, mismatch, ok := choose(skus, true, rental.Constraints{})
 	if !ok || sku.Name != "l4" {
 		t.Fatalf("selected %+v ok=%v mismatch=%q; the same-spec adder must not reorder the ladder", sku, ok, mismatch)
 	}
@@ -175,7 +175,7 @@ func TestSameSpecStorageAdderLeavesRankingUnchanged(t *testing.T) {
 	skus = append(skus, hub.RentalSKU{Name: "l4-bloated", AcceleratorModel: "NVIDIA L4",
 		PriceUSDMicrosPerHour: 480_000, StorageUSDMicrosPerHour: 300_000,
 		BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"})
-	sku, _, ok = rental.CheapestCompatibleSKU(skus, true, rental.Constraints{})
+	sku, _, _, ok = choose(skus, true, rental.Constraints{})
 	if !ok || sku.Name != "l4" {
 		t.Fatalf("selected %+v; want l4 by total (703504 < 780000)", sku)
 	}

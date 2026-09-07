@@ -52,6 +52,19 @@ func marketWithoutA4000() []hub.RentalSKU {
 	}
 }
 
+// choose is the modelless buy: Plan walked to its first fitting product, the way an
+// unmodeled request buys. It keeps the pre-ladder proofs below on the real chooser.
+func choose(skus []hub.RentalSKU, needsAccelerator bool, constraints rental.Constraints) (
+	hub.RentalSKU, orchestrator.SKUDecision, string, bool,
+) {
+	steps, decision := rental.Plan(skus, nil, needsAccelerator, constraints)
+	if len(steps) == 0 {
+		return hub.RentalSKU{}, decision, decision.Mismatch, false
+	}
+	rental.Conclude(&decision, steps, nil, 0)
+	return steps[0].SKU, decision, "", true
+}
+
 func find(t *testing.T, decision orchestrator.SKUDecision, name string) orchestrator.SKUCandidate {
 	t.Helper()
 	for _, candidate := range decision.Offered {
@@ -77,7 +90,7 @@ func absent(t *testing.T, decision orchestrator.SKUDecision, name string) {
 // must produce DIFFERENT records, so a reader can tell an out-of-stock cheap card from a
 // wrongly-excluded one without a database.
 func TestTheChoiceRecordsWhatItChoseOver(t *testing.T) {
-	stocked, withA4000, ok := rental.Choose(marketWithA4000(), true, rental.Constraints{})
+	stocked, withA4000, _, ok := choose(marketWithA4000(), true, rental.Constraints{})
 	if !ok || stocked.Name != "rtx-a4000" {
 		t.Fatalf("with the A4000 in stock the cheapest compatible pick must be rtx-a4000; got %q (ok=%v)",
 			stocked.Name, ok)
@@ -93,7 +106,7 @@ func TestTheChoiceRecordsWhatItChoseOver(t *testing.T) {
 			verdict, orchestrator.VerdictDearer)
 	}
 
-	short, withoutA4000, ok := rental.Choose(marketWithoutA4000(), true, rental.Constraints{})
+	short, withoutA4000, _, ok := choose(marketWithoutA4000(), true, rental.Constraints{})
 	if !ok || short.Name != "rtx-4090" {
 		t.Fatalf("with no A4000 offered the pick must be rtx-4090; got %q (ok=%v)", short.Name, ok)
 	}
@@ -117,7 +130,7 @@ func TestTheChoiceRecordsWhatItChoseOver(t *testing.T) {
 // but a cheaper compatible product passed over with NO stated reason is a chooser defect.
 func TestCheapestOfferedIsAlwaysExplained(t *testing.T) {
 	for _, market := range [][]hub.RentalSKU{marketWithA4000(), marketWithoutA4000()} {
-		_, decision, ok := rental.Choose(market, true, rental.Constraints{})
+		_, decision, _, ok := choose(market, true, rental.Constraints{})
 		if !ok {
 			t.Fatalf("a GPU market with compatible products chose nothing: %+v", decision)
 		}

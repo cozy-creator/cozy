@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -137,10 +138,89 @@ func managedRentalOperationKey(q interface {
 	if err != nil {
 		return "", false, exit.Internalf("cannot read managed rental history: %s", err)
 	}
-	if state != "released" {
+	// A rejected operation never named a pod (the hub refused the SKU before any paid
+	// obligation), so the next rung of the ladder is a fresh operation, not a replay.
+	if state != "released" && state != "rejected" {
 		return key, true, nil
 	}
 	return fmt.Sprintf("managed-rental-%s-%d", requestID, count+1), true, nil
+}
+
+// ObservedColdPath is what this host has MEASURED a fresh pod to cost for a selection:
+// from the paid ask (rented_at) of a rental bought for a request to that request's first
+// dispatch on it, which spans provider boot, image pull, and the lane's download. The
+// newest observation whose selection held every manifest in `manifests` counts, so the
+// saturation comparison speaks from this host's own history for the lane, never from a
+// constant (no-magic-timeouts). False until one such buy has reached dispatch.
+func (s *Store) ObservedColdPath(manifests []string) (time.Duration, bool, *exit.Error) {
+	rows, err := s.db.Query(`SELECT r.rented_at, q.models, MIN(a.dispatched_at)
+		FROM rentals r JOIN requests q ON q.id=r.managed_request_id
+		JOIN attempts a ON a.request_id=q.id
+		WHERE r.managed_request_id<>'' GROUP BY r.id ORDER BY r.rented_at DESC`)
+	if err != nil {
+		return 0, false, exit.Internalf("cannot read cold-path observations: %s", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rentedAt, encoded, dispatchedAt string
+		if err := rows.Scan(&rentedAt, &encoded, &dispatchedAt); err != nil {
+			return 0, false, exit.Internalf("cannot read a cold-path observation: %s", err)
+		}
+		var models []ModelRef
+		if json.Unmarshal([]byte(encoded), &models) != nil || !holdsAll(models, manifests) {
+			continue
+		}
+		rented, errRented := time.Parse(time.RFC3339Nano, rentedAt)
+		dispatched, errDispatched := time.Parse(time.RFC3339Nano, dispatchedAt)
+		if errRented != nil || errDispatched != nil || !dispatched.After(rented) {
+			continue
+		}
+		return dispatched.Sub(rented), true, nil
+	}
+	return 0, false, nil
+}
+
+func holdsAll(models []ModelRef, manifests []string) bool {
+	held := make(map[string]bool, len(models))
+	for _, model := range models {
+		held[model.Manifest] = true
+	}
+	for _, manifest := range manifests {
+		if !held[manifest] {
+			return false
+		}
+	}
+	return true
+}
+
+// ObservedAttemptDuration is the median dispatch-to-close of the attempts one rental has
+// settled: the measured pace the work queued ahead of a new request drains at. False
+// until the rental has closed an attempt.
+func (s *Store) ObservedAttemptDuration(rentalID string) (time.Duration, bool, *exit.Error) {
+	rows, err := s.db.Query(`SELECT a.dispatched_at, a.closed_at FROM attempts a
+		JOIN requests q ON q.id=a.request_id
+		WHERE q.worker=? AND a.state IN ('terminal','closed') AND a.closed_at<>''`, rentalID)
+	if err != nil {
+		return 0, false, exit.Internalf("cannot read attempt durations for rental %s: %s", rentalID, err)
+	}
+	defer rows.Close()
+	var durations []time.Duration
+	for rows.Next() {
+		var dispatchedAt, closedAt string
+		if err := rows.Scan(&dispatchedAt, &closedAt); err != nil {
+			return 0, false, exit.Internalf("cannot read an attempt duration: %s", err)
+		}
+		dispatched, errDispatched := time.Parse(time.RFC3339Nano, dispatchedAt)
+		closed, errClosed := time.Parse(time.RFC3339Nano, closedAt)
+		if errDispatched == nil && errClosed == nil && closed.After(dispatched) {
+			durations = append(durations, closed.Sub(dispatched))
+		}
+	}
+	if len(durations) == 0 {
+		return 0, false, nil
+	}
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	return durations[len(durations)/2], true, nil
 }
 
 // RentalRequestAuthor renders the exact request bytes, and their digest, under the machine
@@ -645,7 +725,7 @@ func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
 			"rental %s ClaimAck worker/boot identity differs from Tensorhub readiness", id).
 			WithRemedy("release it; Creator signs only the worker and boot Tensorhub authenticated")
 	}
-	if !cpu && !acceleratorMatches(row.AcceleratorModel, accelerator) {
+	if !cpu && !AcceleratorMatches(row.AcceleratorModel, accelerator) {
 		return exit.Named(exit.Conflict, "rental.accelerator_readback_mismatch",
 			"rental %s worker reports %q but the paid request selected %q",
 			id, accelerator, row.AcceleratorModel).
@@ -654,10 +734,18 @@ func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
 	return nil
 }
 
-// acceleratorMatches accepts an observed device name that carries the requested SKU as an
-// in-order token subsequence, case-insensitively: "H200" and "NVIDIA H200" both name an
-// observed "NVIDIA H200"; "H100" does not.
-func acceleratorMatches(requested, observed string) bool {
+// RungMatches is a binding rung's gpu pattern against a machine's accelerator: the
+// literal "*" fits every machine, a host without an NVIDIA device included; anything
+// else is AcceleratorMatches.
+func RungMatches(gpu, accelerator string) bool {
+	return gpu == "*" || AcceleratorMatches(gpu, accelerator)
+}
+
+// AcceleratorMatches accepts an observed device name that carries the requested pattern
+// as an in-order token subsequence, case-insensitively: "H200" and "NVIDIA H200" both name
+// an observed "NVIDIA H200"; "H100" names "NVIDIA H100 80GB HBM3" and "NVIDIA H100 NVL"
+// alike, and never an H200.
+func AcceleratorMatches(requested, observed string) bool {
 	split := func(s string) []string {
 		return strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
 			return !unicode.IsLetter(r) && !unicode.IsDigit(r)

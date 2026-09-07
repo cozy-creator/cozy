@@ -1,0 +1,405 @@
+package producttest
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/records"
+)
+
+// cl-166, the run that filed it: the hub binding said release "1.0.0" lane
+// "profile=fp8-adaln-pruned" while the card carried "1.0.0-rc.1" / "fp8-adaln-pruned",
+// and the mismatch surfaced only at run time as a bare "no lane". These arms drive the
+// REAL binary and the REAL daemon against a stand-in hub that answers the catalog routes
+// the way Tensorhub does and refuses every paid create typed, so no pod is ever bought.
+
+// ladderHub is the stand-in: one package with one modeled entrypoint, one model with one
+// unyanked release of two lanes, the 2026-09-07 GPU market, and a mutable binding row.
+type ladderHub struct {
+	mu       sync.Mutex
+	server   *httptest.Server
+	bindings []hub.PackageBindingRow
+	puts     [][]byte
+	posts    [][]byte
+	// soldOut names the SKUs whose paid ask the hub refuses for inventory; rentals holds
+	// what a GET on a rental answers.
+	soldOut map[string]bool
+	rentals map[string]map[string]any
+}
+
+const (
+	ladderPackage = "proof/h3"
+	ladderSlot    = "generate.models.model"
+	ladderModel   = "proof/minimax"
+)
+
+func newLadderHub(t *testing.T) *ladderHub {
+	t.Helper()
+	iface := []byte(`{"application":"h3:app","entrypoints":[{"name":"generate","models":[{"class":"H3","component_use":{},"path":"generate.models.model"}],"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`)
+	contract, problem := launch.DecodePackageInterface(iface)
+	fatal(t, problem)
+	var detail hub.PackageReleaseDetail
+	detail.PackageInterface = iface
+	detail.Release.Release = "1.0.0"
+	detail.Release.PackageInterfaceDigest = contract.Digest
+	detail.Release.PackageInterfaceLength = int64(len(iface))
+	detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25", "torch<3,>=2.13"}
+	h := &ladderHub{soldOut: map[string]bool{}, rentals: map[string]map[string]any{}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/packages/proof/h3", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "h3"},
+			Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
+	})
+	mux.HandleFunc("GET /v1/packages/proof/h3/releases/1.0.0", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(detail)
+	})
+	mux.HandleFunc("GET /v1/packages/proof/h3/bindings", func(w http.ResponseWriter, _ *http.Request) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"bindings": append([]hub.PackageBindingRow{}, h.bindings...)})
+	})
+	mux.HandleFunc("PUT /v1/packages/proof/h3/bindings/{slot}", func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		must(t, err)
+		if r.Header.Get("Authorization") != "Bearer ladder-test" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":"auth.required","message":"owner token required"}}`))
+			return
+		}
+		var body struct {
+			Model            string            `json:"model"`
+			Release          string            `json:"release"`
+			Ladder           []hub.BindingRung `json:"ladder"`
+			ExpectedRevision int64             `json:"expected_revision"`
+		}
+		must(t, json.Unmarshal(raw, &body))
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.puts = append(h.puts, raw)
+		row := hub.PackageBindingRow{Slot: r.PathValue("slot"), Model: body.Model, Release: body.Release,
+			Ladder: body.Ladder, Revision: body.ExpectedRevision + 1, UpdatedAt: "2026-09-07T00:00:00Z"}
+		h.bindings = []hub.PackageBindingRow{row}
+		_ = json.NewEncoder(w).Encode(hub.PackageBindingWrite{Binding: row, Changed: true})
+	})
+	mux.HandleFunc("GET /v1/models/proof/minimax", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Org: "proof", Name: "minimax"},
+			Releases: []hub.ModelReleaseSummary{
+				{ReleaseSummary: hub.ReleaseSummary{Release: "0.9.0", Yanked: true}, Lanes: []hub.ModelLaneSummary{
+					{Lane: "bf16-full", ManifestID: bf16Manifest, Bytes: 130 * gib}}},
+				{ReleaseSummary: hub.ReleaseSummary{Release: "1.0.0-rc.1"}, Lanes: []hub.ModelLaneSummary{
+					{Lane: "fp8-adaln-pruned", ManifestID: fp8Manifest, Bytes: 60 * gib},
+					{Lane: "bf16-full", ManifestID: bf16Manifest, Bytes: 130 * gib}}},
+			}})
+	})
+	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(market20260907())
+	})
+	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`[]`)) })
+	mux.HandleFunc("GET /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		row, ok := h.rentals[r.PathValue("id")]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":"rental.not_found","message":"absent"}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(row)
+	})
+	mux.HandleFunc("POST /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		must(t, err)
+		request, problem := hub.ParseRentalRequestBytes(raw)
+		fatal(t, problem)
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.posts = append(h.posts, raw)
+		if h.soldOut[request.SKU] {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"rental.sku_out_of_stock","message":"` + request.SKU + ` has no provider inventory right now"}}`))
+			return
+		}
+		id := "pr-ladder-" + request.SKU
+		row := map[string]any{"rental_id": id, "name": request.Name, "state": "failed",
+			"requested_accelerator_model": "NVIDIA H200", "hourly_rate_usd_micros": 3_590_000,
+			"failure": map[string]any{"code": "fixture_finished"}}
+		h.rentals[id] = row
+		accepted := map[string]any{}
+		for k, v := range row {
+			accepted[k] = v
+		}
+		accepted["state"] = "acquiring"
+		delete(accepted, "failure")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(accepted)
+	})
+	h.server = httptest.NewServer(mux)
+	t.Cleanup(h.server.Close)
+	return h
+}
+
+func (h *ladderHub) bind(row hub.PackageBindingRow) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.bindings = []hub.PackageBindingRow{row}
+}
+
+func (h *ladderHub) postedSKUs() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]string, 0, len(h.posts))
+	for _, raw := range h.posts {
+		request, _ := hub.ParseRentalRequestBytes(raw)
+		lane := ""
+		if len(request.ServingModels) == 1 {
+			lane = request.ServingModels[0].Lane
+		}
+		out = append(out, request.SKU+"/"+lane)
+	}
+	return out
+}
+
+func (h *ladderHub) addReady(id, machine, accelerator string, rate int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.rentals[id] = map[string]any{"rental_id": id, "name": machine, "state": "ready",
+		"requested_accelerator_model": accelerator, "hourly_rate_usd_micros": rate,
+		"worker_address": "127.0.0.1:1", "media_address": "127.0.0.1:2"}
+}
+
+func ladderRoot(t *testing.T, h *ladderHub) string {
+	t.Helper()
+	root := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
+		"\ntensorhub_token: ladder-test\nrentals:\n  max_hourly_spend_usd: 20\n  idle_release_s: 0\n"+
+		"daemon:\n  idle_shutdown_s: 0\n"), 0600))
+	return root
+}
+
+func TestBindVerifiesTheLadderAgainstTheCardBeforeWriting(t *testing.T) {
+	h := newLadderHub(t)
+	root := ladderRoot(t, h)
+	bind := func(args ...string) (int, string) {
+		return runCozy(t, root, append([]string{"package", "bind", ladderPackage}, append(args, "--json")...)...)
+	}
+	for _, test := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"release absent from the card", []string{ladderSlot, "proof/minimax@1.0.0", "--gpu", "H100=fp8-adaln-pruned"},
+			[]string{"model.release_not_found", "releases: 1.0.0-rc.1"}},
+		{"yanked release", []string{ladderSlot, "proof/minimax@0.9.0", "--gpu", "*=bf16-full"},
+			[]string{"model.release_not_found", "releases: 1.0.0-rc.1"}},
+		{"lane absent from the release", []string{ladderSlot, "proof/minimax@1.0.0-rc.1", "--gpu", "H100=profile=fp8-adaln-pruned"},
+			[]string{"model.lane_not_found", "lanes: bf16-full, fp8-adaln-pruned"}},
+		{"catch-all not last", []string{ladderSlot, "proof/minimax@1.0.0-rc.1", "--gpu", "*=bf16-full", "--gpu", "H100=fp8-adaln-pruned"},
+			[]string{"catch-all rung '*' must be the last rung"}},
+		{"no rung", []string{ladderSlot, "proof/minimax@1.0.0-rc.1"}, []string{"at least one --gpu"}},
+		{"lane on the target", []string{ladderSlot, "proof/minimax@1.0.0-rc.1/fp8-adaln-pruned", "--gpu", "H100=fp8-adaln-pruned"},
+			[]string{"ride its ladder"}},
+		{"no release on the target", []string{ladderSlot, "proof/minimax", "--gpu", "H100=fp8-adaln-pruned"},
+			[]string{"names no release"}},
+		{"slot the interface does not declare", []string{"generate.models.other", "proof/minimax@1.0.0-rc.1", "--gpu", "H100=fp8-adaln-pruned"},
+			[]string{"binding.slot_not_found", "slots: generate.models.model"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			code, out := bind(test.args...)
+			if code == 0 {
+				t.Fatalf("bind was accepted: %s", out)
+			}
+			for _, want := range test.want {
+				if !strings.Contains(out, want) {
+					t.Fatalf("refusal does not say %q: %s", want, out)
+				}
+			}
+		})
+	}
+	h.mu.Lock()
+	writes := len(h.puts)
+	h.mu.Unlock()
+	if writes != 0 {
+		t.Fatalf("%d refused bind(s) still reached the hub", writes)
+	}
+
+	code, out := bind(ladderSlot, "proof/minimax@1.0.0-rc.1", "--gpu", "H100=fp8-adaln-pruned", "--gpu", "*=bf16-full")
+	if code != 0 || !strings.Contains(out, "H100=fp8-adaln-pruned, *=bf16-full") || !strings.Contains(out, `"bound"`) {
+		t.Fatalf("a verified bind was refused [exit %d]: %s", code, out)
+	}
+	h.mu.Lock()
+	written := append([]byte(nil), h.puts[0]...)
+	h.mu.Unlock()
+	if string(written) != `{"expected_revision":0,"ladder":[{"gpu":"H100","lane":"fp8-adaln-pruned"},{"gpu":"*","lane":"bf16-full"}],"model":"proof/minimax","release":"1.0.0-rc.1"}` {
+		t.Fatalf("the wire body is not the agreed contract: %s", written)
+	}
+	code, out = runCozy(t, root, "package", "bindings", ladderPackage)
+	if code != 0 || !strings.Contains(out, "H100=fp8-adaln-pruned, *=bf16-full") || !strings.Contains(out, "1.0.0-rc.1") {
+		t.Fatalf("bindings does not print the ladder [exit %d]: %s", code, out)
+	}
+}
+
+func TestRunRefusesEarlyWithWhatTheCardOffers(t *testing.T) {
+	h := newLadderHub(t)
+	root := ladderRoot(t, h)
+	run := func() (int, string) {
+		return runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--json",
+			"--idempotency-key", "ladder-refusal")
+	}
+	// No binding at all: the remedy is the exact bind command, never a repo fallback.
+	code, out := run()
+	if code == 0 || !strings.Contains(out, "package_default_model_unavailable") ||
+		!strings.Contains(out, "cozy package bind proof/h3 generate.models.model org/model@release --gpu") {
+		t.Fatalf("an unbound slot did not refuse with the bind command [exit %d]: %s", code, out)
+	}
+	// The binding as it stood on 2026-09-07: a release the card does not carry.
+	h.bind(hub.PackageBindingRow{Slot: ladderSlot, Model: ladderModel, Release: "1.0.0",
+		Ladder: []hub.BindingRung{{GPU: "H100", Lane: "fp8-adaln-pruned"}}, Revision: 1})
+	code, out = run()
+	if code == 0 || !strings.Contains(out, "model.release_not_found") ||
+		!strings.Contains(out, "releases: 1.0.0-rc.1") || !strings.Contains(out, "rebind: cozy package bind proof/h3 generate.models.model") {
+		t.Fatalf("a stale binding did not refuse with the card's releases [exit %d]: %s", code, out)
+	}
+	h.bind(hub.PackageBindingRow{Slot: ladderSlot, Model: ladderModel, Release: "1.0.0-rc.1",
+		Ladder: []hub.BindingRung{{GPU: "H100", Lane: "profile=fp8-adaln-pruned"}}, Revision: 2})
+	code, out = run()
+	if code == 0 || !strings.Contains(out, "model.lane_not_found") || !strings.Contains(out, "lanes: bf16-full, fp8-adaln-pruned") {
+		t.Fatalf("a stale lane did not refuse with the release's lanes [exit %d]: %s", code, out)
+	}
+	// Early means before submission: no request row exists on this root, so no daemon
+	// ever had work, and nothing reached a paid ask.
+	if store, problem := records.Open(filepath.Join(root, "creator.sqlite")); problem == nil {
+		defer store.Close()
+		if row, problem := store.RequestByIdempotencyKey("ladder-refusal"); problem != nil || row != nil {
+			t.Fatalf("a refused run was submitted: %+v (%v)", row, problem)
+		}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.posts) != 0 {
+		t.Fatal("a refused run reached a paid ask")
+	}
+}
+
+func goodLadder() hub.PackageBindingRow {
+	return hub.PackageBindingRow{Slot: ladderSlot, Model: ladderModel, Release: "1.0.0-rc.1",
+		Ladder: []hub.BindingRung{{GPU: "H100", Lane: "fp8-adaln-pruned"}, {GPU: "*", Lane: "bf16-full"}}, Revision: 3}
+}
+
+func waitFor(t *testing.T, root, what string, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for !ok() {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not happen: %s", what, tail(filepath.Join(root, "daemon.log")))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestAutoRentWalksTheLadderAndNeverBuysAShortCard(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	h.soldOut["h100-80"], h.soldOut["h100-nvl"] = true, true
+	root := ladderRoot(t, h)
+	startDaemonProcess(t, root)
+	// The fixture pod fails to provision after the walk, so the short observation the
+	// client keeps may already see that terminal; what is asserted is the walk itself.
+	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--json",
+		"--idempotency-key", "ladder-walk")
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	queued, problem := store.RequestByIdempotencyKey("ladder-walk")
+	fatal(t, problem)
+	if queued == nil {
+		t.Fatalf("the laddered run was not submitted: %s", out)
+	}
+	waitFor(t, root, "the walk reaching the H200", func() bool { return len(h.postedSKUs()) >= 3 })
+	posted := h.postedSKUs()
+	if strings.Join(posted[:3], " ") != "h100-80/fp8-adaln-pruned h100-nvl/fp8-adaln-pruned h200/bf16-full" {
+		t.Fatalf("paid asks %v; want the H100 rung cheapest first, both refused, then the catch-all on the H200", posted)
+	}
+	for _, ask := range posted {
+		if strings.HasPrefix(ask, "rtx-") {
+			t.Fatalf("a card the lane cannot fit was asked for: %v", posted)
+		}
+	}
+	waitFor(t, root, "the lane pinned with the buy", func() bool {
+		row, problem := store.RequestByIdempotencyKey("ladder-walk")
+		return problem == nil && row.Models[0].Lane == "bf16-full"
+	})
+	row, problem := store.RequestByIdempotencyKey("ladder-walk")
+	fatal(t, problem)
+	if row.Models[0].Manifest != bf16Manifest || row.Models[0].Ladder != nil {
+		t.Fatalf("the buy did not pin the H200's rung exactly: %+v", row.Models[0])
+	}
+	log := tail(filepath.Join(root, "daemon.log"))
+	for _, want := range []string{"renting h100-80", "(rung 1, lane fp8-adaln-pruned)",
+		"h100-80 has no inventory; walking to the next fitting machine", "renting h200", "(rung 2, lane bf16-full)"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("daemon.log does not say %q:\n%s", want, log)
+		}
+	}
+}
+
+func TestAutoRentReusesTheFittingRentalBeforeBuying(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	root := ladderRoot(t, h)
+	cert := filepath.Join(root, "zack.pem")
+	must(t, os.WriteFile(cert, []byte("fixture"), 0600))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	// A live H200 the user already has up. It sits on the LAST rung and is dearer than
+	// the H100 rung's cards; it still wins, because rung order ranks no machine that is
+	// already paid for, and its rung's lane fits its memory. A live 5090 beside it fits a
+	// rung too, but not its lane's 130 GiB, so it is passed over with the reason recorded.
+	for _, seed := range []records.Rental{
+		{ID: "pr-zack", MachineName: "zack", SKU: "h200", AcceleratorModel: "NVIDIA H200",
+			HourlyRateUSDMicros: 3_590_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
+		{ID: "pr-cheap", MachineName: "cheap", SKU: "rtx-5090", AcceleratorModel: "NVIDIA GeForce RTX 5090",
+			HourlyRateUSDMicros: 990_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
+	} {
+		fatal(t, store.RecordRental(seed))
+		h.addReady(seed.ID, seed.MachineName, seed.AcceleratorModel, seed.HourlyRateUSDMicros)
+	}
+	store.Close()
+	startDaemonProcess(t, root)
+	// The seeded rental has no media bearer on this host, so the request fails after the
+	// pin; the pin and the lane it carries are what this proves.
+	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--json",
+		"--idempotency-key", "ladder-reuse")
+	store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	waitFor(t, root, "the request pinned to the live H200", func() bool {
+		row, problem := store.RequestByIdempotencyKey("ladder-reuse")
+		return problem == nil && row != nil && row.Worker != ""
+	})
+	row, problem := store.RequestByIdempotencyKey("ladder-reuse")
+	fatal(t, problem)
+	if row == nil {
+		t.Fatalf("the laddered run was not submitted: %s", out)
+	}
+	if row.Worker != "pr-zack" || row.Models[0].Lane != "bf16-full" || row.Models[0].Manifest != bf16Manifest {
+		t.Fatalf("pinned to %q with %+v; want pr-zack on bf16-full", row.Worker, row.Models[0])
+	}
+	if asks := h.postedSKUs(); len(asks) != 0 {
+		t.Fatalf("a fitting live rental was passed over for a buy: %v", asks)
+	}
+	log := tail(filepath.Join(root, "daemon.log"))
+	if !strings.Contains(log, "cheap vram_short") || !strings.Contains(log, "lane=bf16-full") {
+		t.Fatalf("daemon.log does not record the passed-over 5090 and the pinned lane:\n%s", log)
+	}
+}

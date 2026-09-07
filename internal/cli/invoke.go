@@ -252,36 +252,25 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	return renderRun(ctx, life, terminal, stopped, saved, submitted, began)
 }
 
+// invocationModelSpec is one slot's selection before the card is read: an explicit
+// `model.<param>=` run key pins Ref (and possibly Lane); a hub binding carries its Ladder
+// and the machine decides the lane (cl-166).
 type invocationModelSpec struct {
-	Slot string
-	Ref  string
-	Lane string
+	Slot   string
+	Ref    string
+	Lane   string
+	Ladder []hub.BindingRung
 }
 
-// resolveInvocationModels applies the one binding ladder for both local and rented
+// resolveInvocationModels applies the one selection order for both local and rented
 // execution: an explicit `model.<param>=` run key, then the hub default binding. Local
-// acquisition freezes the exact Manifest and length before submission; remote
-// acquisition freezes the same Manifest in the signed worker download request.
+// acquisition freezes the exact Manifest and length before submission — the lane is the
+// host GPU's rung; remote acquisition carries the whole ladder and the winning machine
+// pins its rung. An editable `local/` package has no hub binding and takes its model per
+// run only.
 func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
 	overrides map[string]string, remote bool,
 ) ([]orchestrator.ModelRef, *exit.Error) {
-	if target.InstallID != "" {
-		row, problem := exactInvocationInstall(ctx, target)
-		if problem != nil {
-			return nil, problem
-		}
-		if row.SourceKind == "local" {
-			// An editable install froze its exact model selection from package.toml at
-			// install; a local worker reads it from the PlacementSet and a rental is handed
-			// the same rows (cl-101). There is no hub default to ask for a `local/` package.
-			if len(overrides) > 0 {
-				return nil, exit.Named(exit.Unavailable, "editable_model_override_unsupported",
-					"editable package model overrides are not available on the published-package BYOM lane").
-					WithRemedy("publish the package code, then invoke it with model.<param>=org/model@release")
-			}
-			return nil, nil
-		}
-	}
 	selected, problem := invocationModelSpecs(ctx, target, ep, overrides)
 	if problem != nil || len(selected) == 0 {
 		return nil, problem
@@ -303,7 +292,13 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 			if !ok {
 				return nil, exit.Internalf("resolved model slot %s is absent from the package interface", spec.Slot)
 			}
-			row, problem := resolveRemoteModel(ctx, target.Package, slot, spec.Ref, spec.Lane)
+			var row orchestrator.ModelRef
+			var problem *exit.Error
+			if len(spec.Ladder) > 0 {
+				row, problem = resolveRemoteLadder(ctx, target.Package, slot, spec)
+			} else {
+				row, problem = resolveRemoteModel(ctx, target.Package, slot, spec.Ref, spec.Lane)
+			}
 			if problem != nil {
 				return nil, problem
 			}
@@ -334,8 +329,17 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 		if !ok {
 			return nil, exit.Internalf("resolved model slot %s is absent from the package interface", spec.Slot)
 		}
+		lane := spec.Lane
+		if len(spec.Ladder) > 0 {
+			// Local execution: the lane is the rung this host's own accelerator fits.
+			rung, problem := localRung(ctx, spec.Ladder)
+			if problem != nil {
+				return nil, problem
+			}
+			lane = rung.Lane
+		}
 		model, problem := acquirePublishedModel(hctx, ctx, tool, client(ctx), spec.Ref,
-			spec.Lane, target.Package, slot,
+			lane, target.Package, slot,
 			filepath.Join(root, fmt.Sprintf("%03d", index)))
 		if problem != nil {
 			return nil, problem
@@ -386,8 +390,11 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 		}
 		selected[slotPath] = invocationModelSpec{Slot: slotPath, Ref: ref, Lane: lane}
 	}
+	// An editable `local/` package has no hub row to ask and nothing in its repo is a
+	// binding: every slot takes its model per run, or the run refuses here.
+	editable := strings.HasPrefix(target.Package, "local/")
 	defaults := map[string]hub.PackageBindingRow{}
-	if len(selected) < len(ep.Models) {
+	if len(selected) < len(ep.Models) && !editable {
 		var problem *exit.Error
 		defaults, problem = invocationDefaultBindings(ctx, target)
 		if problem != nil {
@@ -400,24 +407,28 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 			out = append(out, spec)
 			continue
 		}
+		if editable {
+			return nil, exit.Named(exit.Usage, "package_model_override_required",
+				"%s is an editable package and model slot %s takes its model per run", target.Package, slot.Path).
+				WithRemedy("model.%s=org/model@release[/lane]", slot.Param)
+		}
 		binding, ok := defaults[slot.Path]
 		if !ok {
 			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable",
-				"%s has no usable configured default for model slot %s", target.Package, slot.Path).
-				WithRemedy("override it explicitly: model.%s=org/model@release, or bind a default: cozy package bind %s %s org/model@release", slot.Param, target.Package, slot.Path)
+				"%s has no hub binding for model slot %s", target.Package, slot.Path).
+				WithRemedy("bind it: %s — or override this run: model.%s=org/model@release[/lane]",
+					bindRemedy(target.Package, slot.Path), slot.Param)
 		}
-		out = append(out, invocationModelSpec{Slot: slot.Path, Ref: binding.Ref(), Lane: binding.Lane})
+		out = append(out, invocationModelSpec{Slot: slot.Path, Ref: binding.Ref(), Ladder: binding.Ladder})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Slot < out[j].Slot })
 	return out, nil
 }
 
-// invocationDefaultBindings reads the package's CURRENT default bindings from
-// the hub (th-116). The rows are mutable pointers seeded from the shipped
-// package.toml at release commit and owner-retargetable afterwards; no
-// invocation re-reads the in-release toml, so an owner's retarget takes effect
-// on the very next bare run. A `model.<param>=` run key still overrides per
-// invocation.
+// invocationDefaultBindings reads the package's CURRENT default bindings from the hub
+// (th-116, cl-166): mutable owner-written rows, each a model release and its ladder.
+// Nothing in the release itself is consulted, so an owner's rebind takes effect on the
+// very next bare run. A `model.<param>=` run key still overrides per invocation.
 func invocationDefaultBindings(ctx *Context, target Target) (
 	map[string]hub.PackageBindingRow, *exit.Error,
 ) {
@@ -483,38 +494,19 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 		return empty, problem
 	}
 	if ref.Org == "local" {
-		return empty, exit.Named(exit.Unavailable, "rental_local_model_sync_required",
-			"%s is a private local model and cannot be granted to a rented worker by path", ref.String()).
-			WithRemedy("upload it under a non-local org, or explicitly sync it through the model upload workflow")
+		return empty, localModelOnRental(ref)
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
-	card, problem := client(ctx).ModelCard(hctx, ref)
+	_, selected, problem := modelReleaseCard(hctx, client(ctx), ref, release)
 	if problem != nil {
 		return empty, problem
 	}
-	if card.Model.Ref() != ref.String() {
-		return empty, exit.Named(exit.Conflict, "rental.model_catalog_changed",
-			"Tensorhub returned model %s while resolving %s", card.Model.Ref(), ref.String())
-	}
-	if release == "" {
-		for _, candidate := range card.Releases {
-			if !candidate.Yanked && candidate.YankedAt == "" &&
-				(release == "" || candidate.Release > release) {
-				release = candidate.Release
-			}
+	release = selected.Release
+	if wantedLane != "" {
+		if _, problem := laneOf(ref, selected, wantedLane); problem != nil {
+			return empty, problem
 		}
-	}
-	var selected *hub.ModelReleaseSummary
-	for i := range card.Releases {
-		candidate := &card.Releases[i]
-		if candidate.Release == release && !candidate.Yanked && candidate.YankedAt == "" {
-			selected = candidate
-			break
-		}
-	}
-	if selected == nil {
-		return empty, exit.New(exit.NotFound, "model %s has no available release %q", ref.String(), release)
 	}
 	manifestLanes := map[string][]string{}
 	manifestBytes := map[string]int64{}
@@ -530,10 +522,6 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 	if manifest != "" && len(manifestLanes[manifest]) == 0 {
 		return empty, exit.New(exit.NotFound, "model %s@%s does not contain manifest %s",
 			ref.String(), release, manifest)
-	}
-	if manifest == "" && wantedLane != "" && len(manifestLanes) == 0 {
-		return empty, exit.New(exit.NotFound, "model %s@%s has no lane %q",
-			ref.String(), release, wantedLane)
 	}
 	if manifest == "" {
 		if len(manifestLanes) != 1 {

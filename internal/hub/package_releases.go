@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -54,9 +55,8 @@ type PackageReleaseDraft struct {
 }
 
 type PackageReleaseCommit struct {
-	PublicationID   string   `json:"publication_id"`
-	State           string   `json:"state"`
-	BindingWarnings []string `json:"binding_warnings,omitempty"`
+	PublicationID string `json:"publication_id"`
+	State         string `json:"state"`
 }
 
 type PackageReleaseYank struct {
@@ -249,25 +249,59 @@ func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string) 
 
 // ---------------------------------------------------------------- bindings (th-116)
 
-// PackageBindingRow is one mutable hub default: which model a package slot
-// loads when no `model.<param>=` run key speaks. Seeded from the shipped
-// package.toml at release commit and owner-mutable afterwards; the hub row is
-// the ONE source and the in-release toml is never consulted post-seed.
+// PackageBindingRow is one mutable hub default: which model release a package slot loads
+// when no `model.<param>=` run key speaks, and — as a FIT MAP, not a ranking of machines
+// (cl-166) — which of that release's lanes belongs on which GPU class. The hub row is
+// the ONE source: `cozy package bind` is its only writer and nothing reads a package.toml
+// binding at install or run time.
 type PackageBindingRow struct {
-	Slot      string `json:"slot"`
-	Model     string `json:"model"`
-	Release   string `json:"release,omitempty"`
-	Lane      string `json:"lane,omitempty"`
-	Revision  int64  `json:"revision"`
-	UpdatedAt string `json:"updated_at"`
+	Slot      string        `json:"slot"`
+	Model     string        `json:"model"`
+	Release   string        `json:"release"`
+	Ladder    []BindingRung `json:"ladder"`
+	Revision  int64         `json:"revision"`
+	UpdatedAt string        `json:"updated_at"`
 }
 
-// Ref renders the row as the ladder's org/model[@release] spelling.
-func (b PackageBindingRow) Ref() string {
-	if b.Release == "" {
-		return b.Model
+// BindingRung pairs an accelerator pattern with the lane that fits it. GPU is matched as
+// a case-insensitive in-order token subsequence of a machine's accelerator_model ("H100"
+// fits "NVIDIA H100 80GB HBM3" and "NVIDIA H100 NVL"); the literal "*" is the catch-all
+// and is allowed only as the last rung.
+type BindingRung struct {
+	GPU  string `json:"gpu"`
+	Lane string `json:"lane"`
+}
+
+func (r BindingRung) String() string { return r.GPU + "=" + r.Lane }
+
+// Ref renders the row as its org/model@release spelling.
+func (b PackageBindingRow) Ref() string { return b.Model + "@" + b.Release }
+
+// LadderText is the ladder as one readable line: `H100=fp8, *=bf16`.
+func LadderText(ladder []BindingRung) string {
+	parts := make([]string, 0, len(ladder))
+	for _, rung := range ladder {
+		parts = append(parts, rung.String())
 	}
-	return b.Model + "@" + b.Release
+	return strings.Join(parts, ", ")
+}
+
+// ValidateLadder is the shape every ladder must have before it is written or trusted:
+// at least one rung, every rung a gpu pattern and a lane, "*" nowhere but last.
+func ValidateLadder(ladder []BindingRung) *exit.Error {
+	if len(ladder) == 0 {
+		return exit.Usagef("a binding needs at least one --gpu <GPU>=<lane> rung")
+	}
+	for i, rung := range ladder {
+		if strings.TrimSpace(rung.GPU) == "" || strings.TrimSpace(rung.Lane) == "" ||
+			strings.ContainsAny(rung.GPU+rung.Lane, " \t") {
+			return exit.Usagef("rung %d is not <GPU>=<lane>: %q", i+1, rung.String())
+		}
+		if rung.GPU == "*" && i != len(ladder)-1 {
+			return exit.Usagef("the catch-all rung '*' must be the last rung, not rung %d of %d", i+1, len(ladder))
+		}
+	}
+	return nil
 }
 
 // PackageBindings is the anonymous read of a package's current default bindings.
@@ -282,9 +316,10 @@ func (c *Client) PackageBindings(ctx context.Context, ref Ref) ([]PackageBinding
 	}
 	seen := make(map[string]bool, len(out.Bindings))
 	for _, row := range out.Bindings {
-		if row.Slot == "" || row.Model == "" || row.Revision < 1 || seen[row.Slot] {
+		if row.Slot == "" || row.Model == "" || row.Release == "" || row.Revision < 1 ||
+			seen[row.Slot] || ValidateLadder(row.Ladder) != nil {
 			return nil, exit.Named(exit.Structural, "hub.package_bindings_invalid",
-				"Tensorhub returned an incomplete or duplicate package binding row")
+				"Tensorhub returned an incomplete or duplicate package binding row for slot %q", row.Slot)
 		}
 		seen[row.Slot] = true
 	}
@@ -296,16 +331,16 @@ type PackageBindingWrite struct {
 	Changed bool              `json:"changed"`
 }
 
-// BindPackageSlot moves one package slot's default to an arbitrary
-// model/release/lane under CAS on expectedRevision (0 creates an unseeded row).
-func (c *Client) BindPackageSlot(ctx context.Context, ref Ref, slot, model, release, lane string,
-	expectedRevision int64, reason string,
+// BindPackageSlot moves one package slot's default to a model release and its ladder
+// under CAS on expectedRevision (0 creates an unbound row).
+func (c *Client) BindPackageSlot(ctx context.Context, ref Ref, slot, model, release string,
+	ladder []BindingRung, expectedRevision int64, reason string,
 ) (PackageBindingWrite, *exit.Error) {
 	var out PackageBindingWrite
 	e := c.do(ctx, call{method: http.MethodPut,
 		path: resourcePath("packages", ref) + "/bindings/" + url.PathEscape(slot),
 		auth: true, reason: reason, strict: true,
-		body: map[string]any{"model": model, "release": release, "lane": lane,
+		body: map[string]any{"model": model, "release": release, "ladder": ladder,
 			"expected_revision": expectedRevision}}, &out)
 	return out, e
 }
