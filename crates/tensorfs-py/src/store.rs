@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
+use pyo3::sync::MutexExt;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tensorfs_core::catalog::{Catalog, WriterGuard};
 use tensorfs_core::checkpoint;
@@ -2062,6 +2063,8 @@ pub fn plan(
 
 #[pyclass(name = "ReadLease")]
 pub struct PyLease {
+    // Every attached caller must detach before waiting: a reader holding this lock
+    // may need the GIL again to finish I/O or invoke a stream callback.
     lease: Mutex<Option<CoreLease>>,
     meta: Arc<Meta>,
     receipts: Receipts,
@@ -2081,7 +2084,7 @@ fn released(py: Python<'_>) -> PyErr {
 impl PyLease {
     #[getter]
     fn hold_id(&self, py: Python<'_>) -> PyResult<String> {
-        let g = self.lease.lock().unwrap();
+        let g = self.lease.lock_py_attached(py).unwrap();
         Ok(g.as_ref()
             .ok_or_else(|| released(py))?
             .hold_id()
@@ -2090,19 +2093,19 @@ impl PyLease {
 
     #[getter]
     fn manifest(&self, py: Python<'_>) -> PyResult<String> {
-        let g = self.lease.lock().unwrap();
+        let g = self.lease.lock_py_attached(py).unwrap();
         Ok(g.as_ref().ok_or_else(|| released(py))?.manifest.clone())
     }
 
     #[getter]
     fn bytes(&self, py: Python<'_>) -> PyResult<u64> {
-        let g = self.lease.lock().unwrap();
+        let g = self.lease.lock_py_attached(py).unwrap();
         Ok(g.as_ref().ok_or_else(|| released(py))?.bytes())
     }
 
     #[getter]
     fn objects(&self, py: Python<'_>) -> PyResult<Vec<(String, u64)>> {
-        let g = self.lease.lock().unwrap();
+        let g = self.lease.lock_py_attached(py).unwrap();
         Ok(g.as_ref()
             .ok_or_else(|| released(py))?
             .objects()
@@ -2120,7 +2123,7 @@ impl PyLease {
     /// Re-check against the authority: one document read, and the arm that makes a revoked
     /// lease refuse instead of serving stale bytes.
     fn recheck(&self, py: Python<'_>) -> PyResult<()> {
-        let g = self.lease.lock().unwrap();
+        let g = self.lease.lock_py_attached(py).unwrap();
         g.as_ref()
             .ok_or_else(|| released(py))?
             .recheck(&self.meta)
@@ -2130,7 +2133,7 @@ impl PyLease {
     /// THE explicit end. Nothing else releases the lease — dropping it keeps the row for
     /// the reaper and announces itself.
     fn release(&self, py: Python<'_>) -> PyResult<()> {
-        let l = self.lease.lock().unwrap().take();
+        let l = self.lease.lock_py_attached(py).unwrap().take();
         match l {
             Some(l) => py.detach(|| l.release(&self.meta)).or_refuse(py),
             None => Err(released(py)),
@@ -2138,8 +2141,8 @@ impl PyLease {
     }
 
     #[getter]
-    fn live(&self) -> bool {
-        self.lease.lock().unwrap().is_some()
+    fn live(&self, py: Python<'_>) -> bool {
+        self.lease.lock_py_attached(py).unwrap().is_some()
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -2148,7 +2151,7 @@ impl PyLease {
 
     #[pyo3(signature = (*_args))]
     fn __exit__(&self, py: Python<'_>, _args: &Bound<'_, PyAny>) -> PyResult<bool> {
-        if self.live() {
+        if self.live(py) {
             self.release(py)?;
         }
         Ok(false)
@@ -2167,7 +2170,7 @@ impl PyLease {
     ) -> PyResult<()> {
         let mut buf = Writable::new(py, into)?;
         let dest = buf.slice();
-        let g = self.lease.lock().unwrap();
+        let g = self.lease.lock_py_attached(py).unwrap();
         let lease = g.as_ref().ok_or_else(|| released(py))?;
         let r = ObjectRange {
             obj: obj_ref(py, object, object_length)?,
@@ -2194,7 +2197,7 @@ impl PyLease {
             .find(|(candidate, _)| candidate == name)
             .map(|(_, asset)| asset)
             .ok_or_else(|| missing(py, "model asset", name))?;
-        let guard = self.lease.lock().unwrap();
+        let guard = self.lease.lock_py_attached(py).unwrap();
         let lease = guard.as_ref().ok_or_else(|| released(py))?;
         lease
             .covers(&ObjectRange {
@@ -2231,7 +2234,7 @@ impl PyLease {
             .collect::<PyResult<_>>()?;
         let nslots = bufs.len();
         let views: Vec<&mut [u8]> = bufs.iter_mut().map(|w| w.slice()).collect();
-        let g = self.lease.lock().unwrap();
+        let g = self.lease.lock_py_attached(py).unwrap();
         let lease = g.as_ref().ok_or_else(|| released(py))?;
 
         let raised: Mutex<Option<PyErr>> = Mutex::new(None);
