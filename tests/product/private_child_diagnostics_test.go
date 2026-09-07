@@ -3,6 +3,7 @@ package producttest
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 
 // Keep the real fixture observable on a cold CI worker. This only reads the
 // fixture's records and bounded logs; it never cancels work or changes a deadline.
+// Direct stdout survives the suite timeout panic, which can bypass t.Log buffers.
 func tracePrivateChildWait(t *testing.T, root string) func() {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -23,19 +25,19 @@ func tracePrivateChildWait(t *testing.T, root string) func() {
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				tracePrivateChildState(t, ctx, root)
+				tracePrivateChildState(ctx, root)
 			}
 		}
 	}()
 	return func() { cancel(); <-done }
 }
 
-func tracePrivateChildState(t *testing.T, parent context.Context, root string) {
+func tracePrivateChildState(parent context.Context, root string) {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "creator.sqlite")+"?mode=ro")
 	if err != nil {
-		t.Logf("private composition diagnostic: %v", err)
+		fmt.Printf("private composition diagnostic: %v\n", err)
 		return
 	}
 	defer db.Close()
@@ -46,15 +48,18 @@ func tracePrivateChildState(t *testing.T, parent context.Context, root string) {
 	} {
 		var value string
 		if err := db.QueryRowContext(ctx, query.sql).Scan(&value); err != nil {
-			t.Logf("private composition %s: %v", query.name, err)
+			fmt.Printf("private composition %s: %v\n", query.name, err)
 		} else {
-			t.Logf("private composition %s: %s", query.name, value)
+			fmt.Printf("private composition %s: %s\n", query.name, value)
 		}
 	}
-	t.Logf("private composition daemon: %s", privateChildLogTail(filepath.Join(root, "daemon.log")))
+	fmt.Printf("private composition daemon: %s\n", privateChildLogTail(filepath.Join(root, "daemon.log")))
 	logs, _ := filepath.Glob(filepath.Join(root, "workers", "*", "*.log"))
-	for _, path := range logs {
-		t.Logf("private composition worker %s: %s", filepath.Base(filepath.Dir(path)), privateChildLogTail(path))
+	for i, path := range logs {
+		if i == 20 {
+			break
+		}
+		fmt.Printf("private composition worker %s: %s\n", filepath.Base(filepath.Dir(path)), privateChildLogTail(path))
 	}
 }
 
