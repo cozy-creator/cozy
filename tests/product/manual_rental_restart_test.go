@@ -109,6 +109,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	must(t, err)
 	control := grpc.NewServer(grpc.Creds(credentials.NewServerTLSFromCert(&pair)))
 	pb.RegisterWorkerControlServer(control, pod)
+	pb.RegisterPodHostServer(control, pod)
 	go func() { _ = control.Serve(listener) }()
 	defer control.Stop()
 	var mediaUnavailable atomic.Bool
