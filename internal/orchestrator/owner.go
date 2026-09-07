@@ -753,7 +753,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		doc.Int("converged_revision"))
 	if w.spec.IsJob() {
 		c.signalAllTransfers()
-		_ = c.sendJobDirective(s, w)
+		_ = c.sendJobDirective(s, w, nil)
 		return true
 	}
 	if w.spec.Connection != nil {
