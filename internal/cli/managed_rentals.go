@@ -318,6 +318,15 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 			excluded = append(excluded, orchestrator.RentalExclusion{
 				RentalID: row.ID, Reason: orchestrator.ExcludedUnattached})
 		default:
+			retained, problem := m.store.RentalHasRetainedJob(row.ID)
+			if problem != nil {
+				return none, "", problem
+			}
+			if retained {
+				excluded = append(excluded, orchestrator.RentalExclusion{
+					RentalID: row.ID, Reason: orchestrator.ExcludedModeConflict})
+				continue
+			}
 			spent, problem := orchestrator.RentalSpent(m.store, row)
 			if problem != nil {
 				return none, "", problem

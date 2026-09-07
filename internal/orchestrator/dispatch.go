@@ -503,6 +503,14 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		if older {
 			reason = ExcludedProtocol
 		} else {
+			retained, problem := c.opt.Store.RentalHasRetainedJob(req.Worker)
+			if problem != nil {
+				c.logf("%s cannot assess retained rental job: %s", req.ID, problem.Message)
+				return
+			}
+			if retained {
+				reason = ExcludedModeConflict
+			}
 			row, problem := c.opt.Store.RentalRow(req.Worker)
 			if problem != nil {
 				c.logf("%s cannot assess pinned rental: %s", req.ID, problem.Message)
