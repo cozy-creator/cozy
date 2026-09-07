@@ -82,7 +82,10 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 ) *exit.Error {
 	destinationArg = strings.TrimSpace(destinationArg)
 	destination := destinationArg
-	if kind == "model-upload" {
+	privateOutputs := invocation != nil && destinationArg == ""
+	if privateOutputs {
+		submission.RetainWork = true
+	} else if kind == "model-upload" {
 		ref, problem := hub.ParseRef(destinationArg)
 		if problem != nil {
 			return problem
@@ -212,7 +215,7 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 	}
 	id := plan.ID()
 	if ctx.Inv.Bool("--dry-run") {
-		if kind == "model-upload" {
+		if kind == "model-upload" && !privateOutputs {
 			ref, _ := hub.ParseRef(destination)
 			if _, problem := ownedPublication(ctx, ref); problem != nil {
 				return problem
@@ -255,7 +258,7 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 		defaults = append(defaults, "status", "changed")
 		return emit(ctx, compactRecord(fields, defaults...))
 	}
-	if kind == "model-upload" {
+	if kind == "model-upload" && !privateOutputs {
 		ref, _ := hub.ParseRef(destination)
 		if _, problem := ownedPublication(ctx, ref); problem != nil {
 			return problem
@@ -277,7 +280,7 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 	}
 	submission.ModelTransfer = &intent
 	submission.Rental, submission.RentalRequired = effectiveRental, placement == "rental-only"
-	if invocation != nil && kind == "model-upload" {
+	if invocation != nil && kind == "model-upload" && !privateOutputs {
 		org := strings.Split(destination, "/")[0]
 		if submission.Org != "" && submission.Org != org {
 			return exit.Usagef("--org must match the --publish-to organization")

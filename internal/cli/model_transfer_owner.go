@@ -266,6 +266,11 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	intent records.ModelTransferIntent, worker string, weights records.ModelTransferWeights,
 	mover orchestrator.ModelTransferMover,
 ) (string, *exit.Error) {
+	if intent.Destination == "" {
+		// The finalized native receipt already owns these immutable bytes. There
+		// is no external publication unless the caller selected a destination.
+		return weights.ManifestID, nil
+	}
 	cli := o.cliContext(intent, worker != "")
 	if intent.Kind == "model-download" {
 		tool, _, problem := localTensorFS(cli)

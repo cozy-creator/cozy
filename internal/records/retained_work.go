@@ -2,10 +2,30 @@ package records
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
+
+func (s *Store) RetainedFailure(id string) (string, string, *exit.Error) {
+	var raw string
+	err := s.db.QueryRow(`SELECT payload FROM request_events WHERE request_id=? AND type='request.blocked' ORDER BY seq DESC LIMIT 1`, id).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", exit.Internalf("cannot read retained failure: %s", err)
+	}
+	var detail struct {
+		ErrorType string `json:"error_type"`
+		Error     string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(raw), &detail); err != nil {
+		return "", "", exit.Internalf("cannot decode retained failure: %s", err)
+	}
+	return detail.ErrorType, detail.Error, nil
+}
 
 // retainRetryTx acquires lineage and the same retained machine in the admission
 // transaction. A concurrent cancellation wins before or after this commit, never
@@ -19,7 +39,7 @@ func retainRetryTx(tx *sql.Tx, request *Request) *exit.Error {
 		return exit.Internalf("cannot read retry predecessor: %s", err)
 	}
 	if !request.RetainWork || request.Kind != "job" || !prior.RetainWork || !prior.IsJob() ||
-		(prior.State != "paused" && prior.State != "blocked") {
+		(prior.State != "paused" && prior.State != "blocked" && !(prior.State == "succeeded" && prior.RetainsLocalOutputs())) {
 		return exit.Named(exit.Conflict, "request.retry_refused", "retry predecessor %s must retain stopped work; current state %s", prior.ID, prior.State)
 	}
 	var open int
@@ -40,7 +60,7 @@ func retainRetryTx(tx *sql.Tx, request *Request) *exit.Error {
 			}
 			return exit.Internalf("cannot inspect retained rental: %s", err)
 		}
-		if state == "released" || state == "failed" {
+		if state == "released" || state == "failed" || state == "release_requested" {
 			return exit.Named(exit.Conflict, "request.state_lost", "retry predecessor %s's retained rental is %s", prior.ID, state)
 		}
 	}
@@ -60,6 +80,11 @@ func RetainedState(state string) bool {
 		return true
 	}
 	return false
+}
+
+func (r Request) RetainsLocalOutputs() bool {
+	return r.RetainWork && r.WeightsOutputs != "" && r.WeightsOutputs != "[]" &&
+		(r.ModelTransfer == nil || r.ModelTransfer.Destination == "")
 }
 
 func (s *Store) BlockRetainedWork(id, code, detail string) (bool, *exit.Error) {
@@ -188,8 +213,9 @@ func (s *Store) ResumeRequest(id, actor string) (bool, *exit.Error) {
 // originally paid for a shared rental.
 func (s *Store) RentalRetainsWork(id string) (bool, *exit.Error) {
 	var found bool
-	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests WHERE worker=? AND retain_work=1
-		AND state IN (`+activeRequestStates+`) AND state!='releasing')`, id).Scan(&found)
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests r LEFT JOIN request_model_transfers t ON t.request_id=r.id WHERE r.worker=? AND r.retain_work=1
+		AND ((r.state IN (`+activeRequestStates+`) AND r.state!='releasing') OR
+		(r.state='succeeded' AND r.weights_outputs!='[]' AND COALESCE(json_extract(t.intent,'$.destination'),'')='')))`, id).Scan(&found)
 	if err != nil {
 		return false, exit.Internalf("cannot read retained rental ownership: %s", err)
 	}
@@ -203,7 +229,7 @@ func (s *Store) RequestRetainedCancellation(id, actor string) *exit.Error {
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(`UPDATE requests SET state='canceling',control_revision=control_revision+1 WHERE id=? AND retain_work=1
-		AND state NOT IN (`+settledRequestStates+`,'canceling','releasing')`, id)
+		AND state NOT IN ('failed','canceled','refused','abandoned','canceling','releasing')`, id)
 	if err != nil {
 		return exit.Internalf("cannot record retained cancellation: %s", err)
 	}

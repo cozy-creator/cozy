@@ -1043,6 +1043,13 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 // recovery. It is intentionally idempotent: cleanup and BeginRequeue both have durable
 // guards, so a replay cannot spend twice or delete a still-owned asset.
 func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, holder *worker) {
+	if req.State == "succeeded" && req.RetainsLocalOutputs() {
+		c.cleanupAttempt(req, uint64(attempt.Attempt), holder, false)
+		c.signalClosed(key(req.ID, uint64(attempt.Attempt)), nil)
+		c.signalClosed(requestWaitKey(req.ID), nil)
+		c.forget(req.ID)
+		return
+	}
 	if records.RetainedState(req.State) {
 		c.cleanupAttempt(req, uint64(attempt.Attempt), holder, false)
 		c.signalClosed(key(req.ID, uint64(attempt.Attempt)), outcomeError(attempt.TerminalStatus, attempt.TerminalCause, attempt.SafeMessage))

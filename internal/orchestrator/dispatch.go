@@ -1042,6 +1042,20 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
+	if req.RetainWork {
+		if _, problem := c.rentalControl(req.Worker); problem != nil {
+			return WorkerLaunchSpec{}, "", problem
+		}
+		c.mu.Lock()
+		var minor uint32
+		if worker := c.workers[instance]; worker != nil {
+			minor = worker.wireMinor
+		}
+		c.mu.Unlock()
+		if minor < RetainedWorkWireMinor {
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "request.retention_unsupported", "retained work requires worker wire %d; selected worker speaks %d", RetainedWorkWireMinor, minor)
+		}
+	}
 	if req.InstallID != "" {
 		if c.opt.Packages == nil || !validDigest(req.LocalPackageDigest) {
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
@@ -1167,7 +1181,12 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 	// contradict it.
 	row, readProblem := c.opt.Store.RequestRow(requestID)
 	if readProblem == nil && row != nil && row.RetainWork {
-		_, _ = c.opt.Store.BlockRetainedWork(requestID, cause.ErrName(), cause.Message)
+		changed, problem := c.opt.Store.BlockRetainedWork(requestID, cause.ErrName(), cause.Message)
+		if problem == nil && changed {
+			c.logf("%s BLOCKED (%s): %s", requestID, cause.ErrName(), cause.Message)
+			c.signalClosed(requestWaitKey(requestID), cause)
+			c.forget(requestID)
+		}
 		return
 	}
 	if readProblem == nil && row != nil && settledState(row.State) {
