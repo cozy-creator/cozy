@@ -1829,10 +1829,10 @@ struct DerivedGuards {
 }
 
 impl PyDerivedWriter {
-    fn release_holds(&self) {
+    fn release_holds(&self, py: Python<'_>) {
         let Some(guards) = self
             .guards
-            .lock()
+            .lock_py_attached(py)
             .expect("writer hold mutex poisoned")
             .take()
         else {
@@ -1928,7 +1928,10 @@ impl PyDerivedWriter {
     ) -> PyResult<()> {
         let mut buffer = Writable::new(py, into)?;
         let destination = buffer.slice();
-        let guards = self.guards.lock().expect("writer hold mutex poisoned");
+        let guards = self
+            .guards
+            .lock_py_attached(py)
+            .expect("writer hold mutex poisoned");
         let guards = guards.as_ref().ok_or_else(|| released(py))?;
         let lease = guards
             .source_leases
@@ -2085,7 +2088,7 @@ impl PyDerivedWriter {
                 )
             })
             .or_refuse(py)?;
-        self.release_holds();
+        self.release_holds(py);
         receipt(py, &value)
     }
 
@@ -2093,7 +2096,7 @@ impl PyDerivedWriter {
         let fenced = py
             .detach(|| derived::fence(&self.meta, &self.transaction_id, self.writer_session_id))
             .or_refuse(py)?;
-        self.release_holds();
+        self.release_holds(py);
         Ok(fenced)
     }
 

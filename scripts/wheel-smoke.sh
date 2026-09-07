@@ -53,6 +53,7 @@ echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/derived-resume.py
 "$work/venv/bin/python" scripts/derived-declaration.py
 "$work/venv/bin/python" scripts/derived-retention.py
+"$work/venv/bin/python" scripts/derived-writer-concurrency.py
 "$work/venv/bin/python" scripts/read-plan-selection.py
 "$work/venv/bin/python" scripts/read-lease-concurrency.py "$fixture" "$SNAP"
 # The frozen corpus, through the FACADE. `tfs vectors verify` runs the same 90 vectors
