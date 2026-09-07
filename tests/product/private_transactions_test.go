@@ -131,12 +131,15 @@ func TestPrivateTransactionsShareRentalRetention(t *testing.T) {
 	const retained = "pr-transaction-retained"
 	first := recordPrivateTransaction(t, store, "first", retained)
 	second := recordPrivateTransaction(t, store, "second", retained)
-	for _, request := range []records.Request{first, second} {
-		response := daemon.call(t, http.MethodPost, "/v1/local/jobs/"+request.ID+"/pause",
-			map[string]any{"actor": "product proof"})
-		if response.Status != http.StatusOK || !bytes.Contains(response.Body, []byte(`"status":"paused"`)) {
-			t.Fatalf("pause retained request: %s", response.brief())
-		}
+	response := daemon.call(t, http.MethodPost, "/v1/local/jobs/"+first.ID+"/pause",
+		map[string]any{"actor": "product proof"})
+	if response.Status != http.StatusOK || !bytes.Contains(response.Body, []byte(`"status":"paused"`)) {
+		t.Fatalf("pause retained request: %s", response.brief())
+	}
+	blocked, problem := store.BlockRetainedWork(second.ID, "author_exception", "step B failed")
+	fatal(t, problem)
+	if !blocked {
+		t.Fatal("failed transaction did not retain its state")
 	}
 	plant := func(id, machine, buyer string) {
 		t.Helper()
@@ -163,18 +166,17 @@ func TestPrivateTransactionsShareRentalRetention(t *testing.T) {
 	assertHeldAfterSweep("pr-transaction-witness-one", "heron")
 	daemon = crashAndRestartTransactionDaemon(t, daemon)
 	assertHeldAfterSweep("pr-transaction-witness-two", "curlew")
-	for _, request := range []records.Request{first, second} {
-		assertPrivateTransactionIdentity(t, store, request, "paused")
-	}
+	assertPrivateTransactionIdentity(t, store, first, "paused")
+	assertPrivateTransactionIdentity(t, store, second, "blocked")
 
 	// Cancel the original buyer. The second request is now the only reason to
 	// retain the machine; consulting ManagedRequestID alone would delete it.
-	response := daemon.call(t, http.MethodPost, "/v1/local/jobs/"+first.ID+"/cancel", nil)
+	response = daemon.call(t, http.MethodPost, "/v1/local/jobs/"+first.ID+"/cancel", nil)
 	if response.Status != http.StatusOK && response.Status != http.StatusAccepted {
 		t.Fatalf("cancel original buyer: %s", response.brief())
 	}
 	assertHeldAfterSweep("pr-transaction-witness-three", "kestrel")
-	assertPrivateTransactionIdentity(t, store, second, "paused")
+	assertPrivateTransactionIdentity(t, store, second, "blocked")
 	response = daemon.call(t, http.MethodPost, "/v1/local/jobs/"+second.ID+"/cancel", nil)
 	if response.Status != http.StatusOK && response.Status != http.StatusAccepted {
 		t.Fatalf("cancel final owner: %s", response.brief())
