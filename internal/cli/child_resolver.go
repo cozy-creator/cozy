@@ -81,6 +81,9 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if facts == nil {
 		return out, "", exit.Named(exit.Conflict, "child.export_changed", "the captured child has no matching job facts")
 	}
+	if parent.Worker == "" && len(facts.WeightsOutputs) > 0 {
+		return out, "", exit.Named(exit.Unavailable, "child.weights_rental_required", "weight-producing child operations require a private rental with native Host custody").WithRemedy("run the parent script with --rental-only")
+	}
 	if parent.Worker == "" && (len(facts.WeightsOutputs) > 0 || len(facts.ModelParams) > 0) {
 		if _, problem := tfs.Open(r.cfg); problem != nil {
 			return out, "", problem

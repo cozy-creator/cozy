@@ -90,7 +90,7 @@ func (r RuntimeCLI) callInputContext(ctx context.Context, input []byte, out any,
 	args = append(args, verb...)
 	cmd := exec.CommandContext(ctx, r.Bin, args...)
 	if input != nil {
-		cmd.Stdin = bytes.NewReader(input)
+		cmd.Stdin = bytes.NewReader(input) //cozy:stdin-value exact owner-supplied metadata for a noninteractive Runtime capability
 	}
 	if ctx.Done() != nil {
 		// CommandContext kills the direct child when the CALLER's context ends. WaitDelay

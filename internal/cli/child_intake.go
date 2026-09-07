@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -143,8 +142,7 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 				return fail(exit.Internalf("cannot stage child interfaces: %s", err))
 			}
 		}
-		runtime := launch.RuntimeCLI{Bin: launch.Binary(result.Install), Dir: result.Install.ProjectDir, Home: layout.Root, Env: config.Frozen().Tool()}
-		wheel, problem := runtime.InterfaceWheel(context.Background(), launch.PackageInterfacePath(result.Install.Dir), strings.TrimPrefix(result.Install.Package, "local/"), result.Install.Version, revision.Digest, intake.staging)
+		wheel, problem := launch.GenerateInterfaceWheel(context.Background(), result.Install, layout.Root, config.Frozen().Tool(), revision.Digest, intake.staging)
 		if problem != nil {
 			nested.Close()
 			dependency.Close()

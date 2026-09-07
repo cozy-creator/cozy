@@ -5,10 +5,19 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/records"
 )
+
+const interfaceGeneratorABI = "cozy.interface-generator/1"
+
+func GenerateInterfaceWheel(ctx context.Context, install records.PackageInstall, home string, env []string, implementation, output string) (InterfaceWheel, *exit.Error) {
+	runtime := RuntimeCLI{Bin: Binary(install), Dir: install.ProjectDir, Home: home, Env: env}
+	return runtime.InterfaceWheel(ctx, PackageInterfacePath(install.Dir), strings.TrimPrefix(install.Package, "local/"), install.Version, implementation, output)
+}
 
 type InterfaceWheel struct {
 	Filename     string `json:"filename"`
@@ -28,7 +37,7 @@ func (r RuntimeCLI) InterfaceWheel(ctx context.Context, interfacePath, distribut
 	if problem := r.callInputContext(ctx, raw, &wheel, "interface-wheel"); problem != nil {
 		return wheel, problem
 	}
-	if filepath.Base(wheel.Filename) != wheel.Filename || filepath.Clean(wheel.Path) != filepath.Join(output, wheel.Filename) || wheel.Length <= 0 || wheel.Length > 8<<20 || wheel.GeneratorABI != "cozy.interface-generator/1" {
+	if filepath.Base(wheel.Filename) != wheel.Filename || filepath.Clean(wheel.Path) != filepath.Join(output, wheel.Filename) || wheel.Length <= 0 || wheel.Length > 8<<20 || wheel.GeneratorABI != interfaceGeneratorABI {
 		return wheel, exit.New(exit.Validation, "interface generator returned an invalid bounded artifact")
 	}
 	info, err := os.Lstat(wheel.Path)

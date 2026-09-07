@@ -33,9 +33,14 @@ func TestPrivateChildCompositionReusesAAfterParentAndLibraryEdits(t *testing.T) 
 	}
 	run("venv", control, "--python", "3.12")
 	run("pip", "install", "--python", filepath.Join(control, "bin", "python"), wheel)
-	path := filepath.Join(control, "bin") + string(os.PathListSeparator) + os.Getenv("PATH")
 	root, err := os.MkdirTemp("", "cozy-calls-")
 	must(t, err)
+	path := filepath.Join(control, "bin")
+	for _, item := range childEnv(t, root) {
+		if strings.HasPrefix(item, "PATH=") {
+			path += string(os.PathListSeparator) + strings.TrimPrefix(item, "PATH=")
+		}
+	}
 	t.Cleanup(func() { _, _ = runCozyPath(t, root, path, "down", "--all"); _ = os.RemoveAll(root) })
 	project := t.TempDir()
 	for _, name := range []string{"source", "candidate"} {
