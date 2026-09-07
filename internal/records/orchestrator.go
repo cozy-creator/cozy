@@ -517,12 +517,15 @@ type AssetBinding struct {
 // spelling before it rents anything, records this row with the request, and sends it
 // only to the attached worker in the desired download set.
 type ModelRef struct {
-	Package  string `json:"package"`
-	Slot     string `json:"slot"`
-	Model    string `json:"model"`
-	Release  string `json:"release"`
-	Lane     string `json:"lane,omitempty"`
-	Manifest string `json:"manifest"`
+	Package string `json:"package"`
+	Slot    string `json:"slot"`
+	// BindingPath is the exact interface Model path used for package preparation.
+	// Jobs keep Slot as the bare invocation parameter; serving already uses a path.
+	BindingPath string `json:"binding_path,omitempty"`
+	Model       string `json:"model"`
+	Release     string `json:"release"`
+	Lane        string `json:"lane,omitempty"`
+	Manifest    string `json:"manifest"`
 	// ManifestLength is the manifest's exact byte length. Only a JOB declares its models
 	// as invocation inputs (orchestrator.jobModels); a serving request's models reach
 	// the worker through the placement's package-set lane, never as inputs.

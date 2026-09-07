@@ -8,13 +8,11 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
-	packageref "github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
@@ -46,17 +44,12 @@ type sourceCapability struct {
 	ExpiresAtUnix                   uint64
 }
 
-type producerPlan struct {
-	Name             string
-	InstallID        string
-	Release          string
-	SourceDigest     string
-	PackageInterface *launch.PackageInterface
-	Job              *launch.Entrypoint
-	Pin              modeltransfer.JobPin
-	SourceProfiles   map[string]string
-	Outputs          []modeltransfer.OutputPin
-	NeedsAccelerator bool
+// sourceInvocation is the already resolved ordinary job. Source acquisition does
+// not select another package or construct another payload.
+type sourceInvocation struct {
+	Target   Target
+	Job      *launch.Entrypoint
+	Profiles map[string]string
 }
 
 func sourceProfileNames(profiles map[string]string) []string {
@@ -77,7 +70,17 @@ func handleModelDownload(ctx *Context) *exit.Error {
 }
 
 func handleModelTransfer(ctx *Context, kind string) *exit.Error {
-	sourceArg, destinationArg := ctx.Inv.Args[0], strings.TrimSpace(ctx.Inv.Args[1])
+	return submitSourceTransfer(ctx, kind, ctx.Inv.Args[0], ctx.Inv.Args[1], nil,
+		api.JobSubmission{Input: []byte("{}")})
+}
+
+// submitSourceTransfer is shared by ordinary modeled jobs and standalone ingest.
+// It freezes the existing source inventory and headers before submitting the same
+// JobSubmission and ModelTransferIntent consumed by the resumable transfer owner.
+func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
+	invocation *sourceInvocation, submission api.JobSubmission,
+) *exit.Error {
+	destinationArg = strings.TrimSpace(destinationArg)
 	destination := destinationArg
 	if kind == "model-upload" {
 		ref, problem := hub.ParseRef(destinationArg)
@@ -111,15 +114,11 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 			return problem
 		}
 	}
-	producerName := strings.TrimSpace(ctx.Inv.Value("--producer"))
-	if producerName != "" {
-		if _, problem := parseProductionCallable(producerName); problem != nil {
-			return problem
-		}
-	}
-	suppliedProfiles, problem := parseSourceProfileFlags(ctx, producerName)
-	if problem != nil {
-		return problem
+	callable := ""
+	var suppliedProfiles map[string]string
+	if invocation != nil {
+		callable = invocation.Target.Package + "/" + invocation.Target.Function
+		suppliedProfiles = invocation.Profiles
 	}
 	instructionSource, problem := canonicalProductionSource(ctx, sourceArg)
 	if problem != nil {
@@ -133,7 +132,7 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 	}
 	instruction := modeltransfer.Instruction{Kind: kind, Destination: destination,
 		Source: instructionSource, InputLane: strings.TrimSpace(ctx.Inv.Value("--lane")),
-		Producer: producerName, Placement: placement, SourceProfiles: suppliedProfiles}
+		Producer: callable, Placement: placement, SourceProfiles: suppliedProfiles}
 	localOnly := localOnlyModelSource(instructionSource)
 	if localOnly && ctx.Inv.Bool("--rental-only") {
 		return exit.Usagef("a local model source cannot run under --rental-only").
@@ -145,23 +144,16 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 			"rented model download cannot yet return an output to local TensorFS").
 			WithRemedy("run locally until the negotiated weights-read return plane is active")
 	}
-	if producerName == "" && effectiveRental {
+	if invocation == nil && effectiveRental {
 		return exit.Named(exit.Unavailable, "model_transfer.rented_pass_through_unavailable",
-			"rented pass-through cannot choose a TensorFS source profile without a producer job").
-			WithRemedy("omit the rental flag for local pass-through, or select a typed --producer")
+			"rented standalone ingest does not yet select a TensorFS source profile").
+			WithRemedy("ingest locally, or invoke a typed job with cozy run and explicit model inputs")
 	}
 	if localOnly {
 		ctx.Inv.Bools["--rental"] = false
 		ctx.Inv.Bools["--rental-only"] = false
 	}
-	producer, problem := resolveProducerPlan(ctx, producerName, suppliedProfiles)
-	if problem != nil {
-		return problem
-	}
-	var sourceProfiles []string
-	if producer != nil {
-		sourceProfiles = sourceProfileNames(producer.SourceProfiles)
-	}
+	sourceProfiles := sourceProfileNames(suppliedProfiles)
 	source, problem := resolvePublishSource(ctx, sourceArg, sourceProfiles)
 	if problem != nil {
 		return problem
@@ -178,21 +170,18 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 		SourceLicense: source.License, InputLane: source.Lane,
 		SourceFiles: source.Exact,
 	}
-	if producer != nil {
-		plan.Producer, plan.ProducerInstallID = producer.Name, producer.InstallID
-		plan.ProducerRelease = producer.Release
-		plan.ProducerSourceDigest = producer.SourceDigest
-		plan.PackageInterfaceDigest = producer.PackageInterface.Digest
-		pin := producer.Pin
-		plan.Job, plan.SourceProfiles, plan.Outputs = &pin, producer.SourceProfiles, producer.Outputs
+	if invocation != nil {
+		target := invocation.Target
+		plan.Producer, plan.ProducerInstallID, plan.ProducerRelease = callable, target.InstallID, target.Release
+		plan.Job = &modeltransfer.JobPin{Callable: callable, Package: target.Package,
+			Function: target.Function, InstallID: target.InstallID, Release: target.Release,
+			DescriptorID: invocation.Job.DescriptorID}
+		plan.SourceProfiles = suppliedProfiles
+		for _, output := range invocation.Job.WeightsOutputs {
+			plan.Outputs = append(plan.Outputs, modeltransfer.OutputPin{Name: output.OutputID})
+		}
 	} else {
 		plan.Outputs = []modeltransfer.OutputPin{{Name: "model"}}
-	}
-	if kind == "model-download" && len(plan.Outputs) != 1 {
-		return exit.Named(exit.Unavailable, "model_download.multiple_outputs_unavailable",
-			"model download producer %s emits %d outputs; one local alias currently retains exactly one",
-			producerName, len(plan.Outputs)).WithRemedy(
-			"use a one-output producer or model upload until tracked multi-output local aliases land")
 	}
 	// THE GUARD (tfs-076). A conversion plan is a function of the source HEADERS, so it is
 	// decidable HERE — owner-side, before a rental is requested, before a byte of payload
@@ -236,13 +225,15 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 			{K: "source_files", V: source.Files}, {K: "source_bytes", V: output.Bytes(source.Bytes)},
 			{K: "status", V: "planned"}, {K: "changed", V: false},
 		}
-		if producer != nil {
+		if invocation != nil {
+			fields = fields[1:] // ordinary jobs have no transfer-instruction identity
 			fields = append(fields,
-				output.Field{K: "producer", V: producer.Name + "@" + producer.Release},
+				output.Field{K: "target", V: callable},
+				output.Field{K: "release", V: invocation.Target.Release},
+				output.Field{K: "input", V: submission.Input},
 				output.Field{K: "source_profiles", V: plan.ProfileNames()},
 				output.Field{K: "steps", V: 1},
 				output.Field{K: "outputs", V: plan.OutputNames()},
-				output.Field{K: "needs_accelerator", V: producer.NeedsAccelerator},
 			)
 			// What the dispatch plan cannot say and this can: the reviewed headers admit a
 			// conversion, and these are the journal keys the pod will open.
@@ -257,8 +248,9 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 			}
 		}
 		defaults := []string{"id", "kind", "model", "source"}
-		if producer != nil {
-			defaults = append(defaults, "producer", "outputs", "conversion")
+		if invocation != nil {
+			defaults = defaults[1:]
+			defaults = append(defaults, "target", "release", "outputs", "conversion")
 		}
 		defaults = append(defaults, "status", "changed")
 		return emit(ctx, compactRecord(fields, defaults...))
@@ -283,14 +275,14 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	submission := api.JobSubmission{Input: []byte("{}"), ModelTransfer: &intent,
-		Rental: effectiveRental, RentalRequired: placement == "rental-only"}
-	if producer != nil {
-		submission.Package, submission.Function = producer.Pin.Package, producer.Pin.Function
-		submission.InstallID, submission.Release = producer.Pin.InstallID, producer.Pin.Release
-		if kind == "model-upload" {
-			submission.Org = strings.Split(destination, "/")[0]
+	submission.ModelTransfer = &intent
+	submission.Rental, submission.RentalRequired = effectiveRental, placement == "rental-only"
+	if invocation != nil && kind == "model-upload" {
+		org := strings.Split(destination, "/")[0]
+		if submission.Org != "" && submission.Org != org {
+			return exit.Usagef("--org must match the --publish-to organization")
 		}
+		submission.Org = org
 	}
 	handle, problem := local.SubmitJob(submission, requestKey(ctx.Inv.Value("--idempotency-key")))
 	if problem != nil {
@@ -496,18 +488,9 @@ func catalogModelSpelling(value string) bool {
 	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
 }
 
-// parseSourceProfileFlags reads repeatable --source-profile slot=profile pairs.
-// They bind a producer's model inputs to reviewed TensorFS source profiles when
-// the job declares none; pass-through has no slots and takes no profiles.
-func parseSourceProfileFlags(ctx *Context, producerName string) (map[string]string, *exit.Error) {
+// parseSourceProfileFlags reads exact caller-owned slot=profile narrowing.
+func parseSourceProfileFlags(ctx *Context) (map[string]string, *exit.Error) {
 	values := ctx.Inv.Values["--source-profile"]
-	if len(values) == 0 {
-		return nil, nil
-	}
-	if producerName == "" {
-		return nil, exit.Usagef("--source-profile binds a producer job's model inputs; pass-through takes no source profiles").
-			WithRemedy("select the producer job whose inputs these profiles narrow, e.g. --producer org/package@vN/function")
-	}
 	supplied := make(map[string]string, len(values))
 	for _, value := range values {
 		slot, profile, ok := strings.Cut(value, "=")
@@ -521,145 +504,4 @@ func parseSourceProfileFlags(ctx *Context, producerName string) (map[string]stri
 		supplied[slot] = profile
 	}
 	return supplied, nil
-}
-
-func resolveProducerPlan(ctx *Context, raw string, supplied map[string]string) (*producerPlan, *exit.Error) {
-	if raw == "" {
-		return nil, nil
-	}
-	target, problem := parseProductionCallable(raw)
-	if problem != nil {
-		return nil, problem
-	}
-	selected, problem := resolveProductionPackage(ctx, target.Selector, rentalRequested(ctx))
-	if problem != nil {
-		return nil, problem
-	}
-	packageInterface := selected.PackageInterface
-	job, problem := packageInterface.Function(target.Function)
-	if problem != nil || job.Kind != "job" {
-		return nil, exit.Named(exit.Validation, "model_producer.not_job",
-			"--producer %s does not name one ordinary job callable", raw)
-	}
-	if problem := modeltransfer.ValidateProducer(raw, job, supplied); problem != nil {
-		return nil, problem
-	}
-	plan := &producerPlan{Name: target.Selector + "/" + target.Function,
-		InstallID: selected.InstallID, Release: selected.Release,
-		SourceDigest:     selected.SourceDigest,
-		PackageInterface: packageInterface, Job: job,
-		NeedsAccelerator: launch.AcceleratorRequired(selected.Requirements),
-		SourceProfiles:   map[string]string{}}
-	plan.Pin = modeltransfer.JobPin{Callable: plan.Name, Package: target.Package,
-		Function: target.Function, InstallID: selected.InstallID, Release: selected.Release,
-		SourceDigest: selected.SourceDigest, DescriptorID: job.DescriptorID}
-	for _, slot := range job.Models {
-		plan.SourceProfiles[slot.Param] = supplied[slot.Param]
-	}
-	for _, output := range job.WeightsOutputs {
-		plan.Outputs = append(plan.Outputs, modeltransfer.OutputPin{Name: output.OutputID})
-	}
-	return plan, nil
-}
-
-type productionPackage struct {
-	InstallID, Release, SourceDigest string
-	PackageInterface                 *launch.PackageInterface
-	Requirements                     []string
-}
-
-func resolveProductionPackage(ctx *Context, packageName string, remote bool) (productionPackage, *exit.Error) {
-	selector, problem := packageref.ParseRef(packageName)
-	if problem != nil {
-		return productionPackage{}, problem
-	}
-	key := selector.String()
-	if !remote {
-		install, problem := installedPackage(ctx, key)
-		if problem != nil {
-			return productionPackage{}, problem.WithRemedy(
-				"install the exact producer package before running it locally")
-		}
-		facts, problem := launch.Read(*install, ctx.Cfg.Home, ctx.Cfg.Tool())
-		if problem != nil {
-			return productionPackage{}, problem
-		}
-		selected := productionPackage{InstallID: install.ID, Release: install.Version,
-			SourceDigest: install.SourceDigest, PackageInterface: facts.PackageInterface,
-			Requirements: strings.Split(install.Closure, "\n")}
-		return selected, nil
-	}
-
-	ref, problem := hub.ParseRef(selector.Package)
-	if problem != nil {
-		return productionPackage{}, problem
-	}
-	hctx, cancel := hub.Context()
-	defer cancel()
-	card, problem := client(ctx).PackageCard(hctx, ref)
-	if problem != nil {
-		return productionPackage{}, problem
-	}
-	if card.Package.Ref() != selector.Package {
-		return productionPackage{}, exit.Named(exit.Conflict,
-			"model_transfer.package_catalog_changed",
-			"Tensorhub returned package %s while resolving %s", card.Package.Ref(), key)
-	}
-	var release string
-	if selector.HasMajor {
-		release, problem = newestPackageRelease(card.Releases, selector.Major)
-	} else {
-		release, problem = newestPackageRelease(card.Releases)
-	}
-	if problem != nil {
-		detail := ""
-		if selector.HasMajor {
-			detail = " in v" + strconv.Itoa(selector.Major)
-		}
-		return productionPackage{}, exit.Named(exit.NotFound,
-			"model_transfer.package_release_absent",
-			"Tensorhub package %s has no active immutable release%s", selector.Package, detail)
-	}
-	detail, problem := client(ctx).PackageRelease(hctx, ref, release)
-	if problem != nil {
-		return productionPackage{}, problem
-	}
-	if detail.Release.Release != release || detail.Release.Yanked || detail.Release.YankedAt != "" ||
-		detail.Release.PackageInterfaceLength != int64(len(detail.PackageInterface)) {
-		return productionPackage{}, exit.Named(exit.Conflict, "model_transfer.package_changed",
-			"Tensorhub package %s@%s returned inconsistent immutable release metadata",
-			selector.Package, release)
-	}
-	requirements, problem := detail.Requirements()
-	if problem != nil {
-		return productionPackage{}, problem
-	}
-	packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
-	if problem != nil {
-		return productionPackage{}, problem
-	}
-	if packageInterface.Digest != detail.Release.PackageInterfaceDigest {
-		return productionPackage{}, exit.Named(exit.Conflict, "model_transfer.package_interface_changed",
-			"Tensorhub package interface does not match its release fact")
-	}
-	selected := productionPackage{Release: release,
-		PackageInterface: packageInterface, Requirements: requirements}
-	return selected, nil
-}
-
-type productionCallable struct {
-	Package, Selector, Function string
-}
-
-func parseProductionCallable(value string) (productionCallable, *exit.Error) {
-	parts := strings.Split(value, "/")
-	if len(parts) != 3 || parts[2] == "" {
-		return productionCallable{}, exit.Usagef("%q is not org/package@vN/function", value)
-	}
-	selector, problem := packageref.ParseRef(parts[0] + "/" + parts[1])
-	if problem != nil {
-		return productionCallable{}, problem
-	}
-	return productionCallable{Package: selector.Package, Selector: selector.String(),
-		Function: parts[2]}, nil
 }

@@ -203,24 +203,21 @@ func (c *ModelFamilyCmd) Run(r *Runtime) error {
 }
 
 type ModelDownloadCmd struct {
-	Source         string   `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
-	Ref            string   `arg:"" name:"model" help:"Local destination (local/name)."`
-	Producer       string   `help:"Ordinary producer job as org/package@vN/function."`
-	SourceProfiles []string `name:"source-profile" help:"Bind a producer model input to a reviewed TensorFS source profile as slot=profile (repeatable; only for inputs the job leaves undeclared)."`
-	Lane           string   `help:"Select an input lane when source is a Tensorhub model release."`
-	Rental         bool     `help:"Permit a managed rental when compatible local capacity is unavailable."`
-	RentalOnly     bool     `help:"Require a remote rental instead of local capacity."`
-	DryRun         bool     `help:"Resolve the exact transfer plan without moving bodies or spending."`
-	Await          bool     `help:"Watch the accepted run until it settles."`
-	IdempotencyKey string   `help:"Stable request identity for exact replay; otherwise start a new run."`
+	Source         string `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
+	Ref            string `arg:"" name:"model" help:"Local destination (local/name)."`
+	Lane           string `help:"Select an input lane when source is a Tensorhub model release."`
+	Rental         bool   `help:"Permit a managed rental when compatible local capacity is unavailable."`
+	RentalOnly     bool   `help:"Require a remote rental instead of local capacity."`
+	DryRun         bool   `help:"Resolve the exact transfer plan without moving bodies or spending."`
+	Await          bool   `help:"Watch the accepted run until it settles."`
+	IdempotencyKey string `help:"Stable request identity for exact replay; otherwise start a new run."`
 }
 
 func (c *ModelDownloadCmd) Run(r *Runtime) error {
 	return r.call(handleModelDownload, []string{c.Source, c.Ref}, bools(
 		"--rental", c.Rental, "--rental-only", c.RentalOnly,
 		"--dry-run", c.DryRun, "--await", c.Await),
-		values("--producer", c.Producer, "--lane", c.Lane,
-			"--source-profile", c.SourceProfiles, "--idempotency-key", c.IdempotencyKey), false)
+		values("--lane", c.Lane, "--idempotency-key", c.IdempotencyKey), false)
 }
 
 type ModelRemoveCmd struct {
@@ -244,24 +241,21 @@ func (c *ModelListCmd) Run(r *Runtime) error {
 }
 
 type ModelUploadCmd struct {
-	Source         string   `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
-	Ref            string   `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
-	Producer       string   `help:"Ordinary producer job as org/package@vN/function."`
-	SourceProfiles []string `name:"source-profile" help:"Bind a producer model input to a reviewed TensorFS source profile as slot=profile (repeatable; only for inputs the job leaves undeclared)."`
-	Lane           string   `help:"Select an input lane when source is a Tensorhub model release."`
-	Rental         bool     `help:"Permit a managed rental when compatible local capacity is unavailable."`
-	RentalOnly     bool     `help:"Require a remote rental instead of local capacity."`
-	DryRun         bool     `help:"Resolve the exact transfer plan without moving bodies or spending."`
-	Await          bool     `help:"Watch the accepted run until it settles."`
-	IdempotencyKey string   `help:"Stable request identity for exact replay; otherwise start a new run."`
+	Source         string `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
+	Ref            string `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
+	Lane           string `help:"Select an input lane when source is a Tensorhub model release."`
+	Rental         bool   `help:"Permit a managed rental when compatible local capacity is unavailable."`
+	RentalOnly     bool   `help:"Require a remote rental instead of local capacity."`
+	DryRun         bool   `help:"Resolve the exact transfer plan without moving bodies or spending."`
+	Await          bool   `help:"Watch the accepted run until it settles."`
+	IdempotencyKey string `help:"Stable request identity for exact replay; otherwise start a new run."`
 }
 
 func (c *ModelUploadCmd) Run(r *Runtime) error {
 	return r.call(handleModelUpload, []string{c.Source, c.Ref}, bools(
 		"--rental", c.Rental, "--rental-only", c.RentalOnly,
 		"--dry-run", c.DryRun, "--await", c.Await),
-		values("--producer", c.Producer, "--lane", c.Lane,
-			"--source-profile", c.SourceProfiles, "--idempotency-key", c.IdempotencyKey), false)
+		values("--lane", c.Lane, "--idempotency-key", c.IdempotencyKey), false)
 }
 
 type ModelPublishCmd struct {
@@ -309,7 +303,7 @@ type RunCmd struct {
 
 type RunExecuteCmd struct {
 	Target         string   `arg:"" name:"target" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
-	Input          []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, and model.<param>=org/model[@release[/lane]][#sha256:<hex>] overrides."`
+	Input          []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, and model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
 	Out            string   `help:"Output directory." type:"path"`
 	Timeout        string   `help:"Request deadline."`
 	Stream         bool     `help:"Emit typed progress deltas."`
@@ -320,6 +314,9 @@ type RunExecuteCmd struct {
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`
 	Trees          []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
 	Org            string   `help:"Job publication organization (defaults to local)."`
+	PublishTo      string   `help:"Store the job's declared weight outputs as checkpoints in org/model; no release is created."`
+	SourceProfiles []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
+	DryRun         bool     `help:"Resolve exact job inputs and conversion headers without queueing or renting."`
 	Await          bool     `help:"Wait for the terminal result instead of returning after the short optimistic observation."`
 	Describe       bool     `help:"Print the callable's request contract instead of running it."`
 }
@@ -328,10 +325,11 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 	args := append([]string{c.Target}, c.Input...)
 	return r.call(handleRunExecute, args, bools(
 		"--stream", c.Stream, "--await", c.Await, "--rental", c.Rental,
-		"--rental-only", c.RentalOnly, "--describe", c.Describe), values(
+		"--rental-only", c.RentalOnly, "--describe", c.Describe, "--dry-run", c.DryRun), values(
 		"--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets,
-		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org), true)
+		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org,
+		"--publish-to", c.PublishTo, "--source-profile", c.SourceProfiles), !c.DryRun && !c.Describe)
 }
 
 type RunRetryPublicationCmd struct {
