@@ -1,10 +1,12 @@
 package producttest
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -86,21 +88,23 @@ func TestPrivateChildActualHostArtifacts(t *testing.T) {
 	var envelope struct {
 		Payload []byte `json:"payload"`
 	}
-	for deadline := time.Now().Add(time.Minute); ; {
-		response, callError := client.Get(host.Readiness)
-		if callError == nil {
-			raw, readError := io.ReadAll(io.LimitReader(response.Body, 32<<10))
-			response.Body.Close()
-			if readError == nil && response.StatusCode == http.StatusOK && json.Unmarshal(raw, &envelope) == nil && len(envelope.Payload) > 0 {
-				break
+	readReady := func() []byte {
+		for deadline := time.Now().Add(time.Minute); ; {
+			response, callError := client.Get(host.Readiness)
+			if callError == nil {
+				raw, readError := io.ReadAll(io.LimitReader(response.Body, 32<<10))
+				response.Body.Close()
+				if readError == nil && response.StatusCode == http.StatusOK && json.Unmarshal(raw, &envelope) == nil && len(envelope.Payload) > 0 {
+					return append([]byte(nil), envelope.Payload...)
+				}
 			}
+			if time.Now().After(deadline) {
+				t.Fatal("public Host readiness did not finish its probes")
+			}
+			time.Sleep(200 * time.Millisecond)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("public Host readiness did not finish its probes")
-		}
-		time.Sleep(200 * time.Millisecond)
 	}
-	readiness := envelope.Payload
+	readiness := readReady()
 	must(t, os.WriteFile(readinessPath, readiness, 0o600))
 	var ready struct {
 		WorkerBootID string `json:"pod_boot_id"`
@@ -108,6 +112,16 @@ func TestPrivateChildActualHostArtifacts(t *testing.T) {
 	must(t, json.Unmarshal(readiness, &ready))
 	if ready.WorkerBootID == "" {
 		t.Fatalf("actual Host readiness has no worker boot: %s", readiness)
+	}
+	restartHost := func() {
+		t.Helper()
+		out, err := exec.Command("docker", "restart", host.Container).CombinedOutput()
+		if err != nil {
+			t.Fatalf("restart actual Host: %v %s", err, out)
+		}
+		if !bytes.Equal(readiness, readReady()) {
+			t.Fatal("Host restart replaced the retained public readiness identity")
+		}
 	}
 	hub := newFakeRentalHub(t, 0)
 	hub.skus = []map[string]any{{"name": "cpu", "accelerator_model": "CPU", "price_usd_micros_per_hour": 1, "base_worker_profile": "python3.12-cpu-linux-x86"}}
@@ -121,7 +135,21 @@ func TestPrivateChildActualHostArtifacts(t *testing.T) {
 			path += string(os.PathListSeparator) + strings.TrimPrefix(item, "PATH=")
 		}
 	}
-	script := filepath.Join(*childHostProject, "recipe.py")
+	project := filepath.Join(layout.Root, "client-project")
+	for _, relative := range []string{"recipe.py", "source/pyproject.toml", "source/package.toml", "source/uv.lock", "source/tensor_source.py", "candidate/pyproject.toml", "candidate/package.toml", "candidate/uv.lock", "candidate/tensor_candidate.py"} {
+		body, err := os.ReadFile(filepath.Join(*childHostProject, relative))
+		must(t, err)
+		if relative == "recipe.py" {
+			body = []byte(strings.Replace(string(body), "factor=2", "factor=0", 1))
+		}
+		if relative == "candidate/tensor_candidate.py" {
+			body = []byte(strings.Replace(string(body), "value * factor + 1 for value", "value * factor for value", 1))
+		}
+		target := filepath.Join(project, relative)
+		must(t, os.MkdirAll(filepath.Dir(target), 0o700))
+		must(t, os.WriteFile(target, body, 0o600))
+	}
+	script := filepath.Join(project, "recipe.py")
 	status, out := runCozyPath(t, layout.Root, path, "run", script, "--rental-only", "--await", "--json")
 	if status == 0 || !strings.Contains(out, "candidate quality gate failed") {
 		t.Fatalf("actual artifact source/candidate failed [%d]: %s", status, out)
@@ -158,4 +186,57 @@ func TestPrivateChildActualHostArtifacts(t *testing.T) {
 			t.Fatalf("reused A changed original receipt custody: %+v", hold)
 		}
 	}
+	checkTensor := func(producer records.Request, expected int) {
+		t.Helper()
+		outputs, problem := store.AllModelTransferWeights(producer.ID, producer.Ordinal)
+		fatal(t, problem)
+		if len(outputs) != 1 {
+			t.Fatalf("native producer receipts: %+v", outputs)
+		}
+		program, err := os.Open(filepath.Join("testdata", "private_child_read.py"))
+		must(t, err)
+		defer program.Close()
+		command := exec.Command("docker", "exec", "-i", host.Container, "python3", "-", outputs[0].ManifestID, fmt.Sprint(expected))
+		command.Stdin = program //cozy:stdin-value actual native Store test inspector; no credentials
+		answer, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("actual tensor read after native GC: %v %s", err, answer)
+		}
+		t.Logf("actual native tensor after GC: %s", answer)
+	}
+	restartHost()
+	checkTensor(nextChildren[1], 14)
+	status, out = runCozyPath(t, layout.Root, path, "run", "cancel", "1", "--json")
+	if status != 0 {
+		t.Fatalf("old transaction cancellation: [%d] %s", status, out)
+	}
+	checkTensor(children[0], 7)
+	checkTensor(nextChildren[1], 14)
+	implementation := filepath.Join(project, "candidate", "tensor_candidate.py")
+	before, err := os.ReadFile(implementation)
+	must(t, err)
+	changed := strings.Replace(string(before), "value * factor for value", "value * factor + 1 for value", 1)
+	if changed == string(before) {
+		t.Fatal("expected private candidate fixture body")
+	}
+	must(t, os.WriteFile(implementation, []byte(changed), 0o600))
+	status, out = runCozyPath(t, layout.Root, path, "run", script, "--retry", "4", "--rental-only", "--await", "--json")
+	if status != 0 {
+		t.Fatalf("same-version candidate edit: [%d] %s", status, out)
+	}
+	third, problem := store.RequestByReference("7")
+	fatal(t, problem)
+	thirdChildren, problem := store.Children(third.ID)
+	fatal(t, problem)
+	if len(thirdChildren) != 2 || thirdChildren[0].Ordinal != 0 || thirdChildren[0].ReusedFrom != children[0].ID || thirdChildren[1].Ordinal != 1 || thirdChildren[1].ChildTargetDigest == nextChildren[1].ChildTargetDigest {
+		t.Fatalf("same-version B edit reused the wrong operation: %+v", thirdChildren)
+	}
+	restartHost()
+	checkTensor(thirdChildren[1], 15)
+	status, out = runCozyPath(t, layout.Root, path, "run", "cancel", "4", "--json")
+	if status != 0 {
+		t.Fatalf("prior corrected transaction cancellation: [%d] %s", status, out)
+	}
+	checkTensor(children[0], 7)
+	checkTensor(thirdChildren[1], 15)
 }
