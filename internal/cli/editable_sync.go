@@ -210,6 +210,13 @@ func (s *editableSync) reconcile() {
 		dependencies, problem := packagepublish.LocalDependencyPaths(row.SourceRef)
 		if problem != nil {
 			fmt.Fprintf(s.log, "editable %s: dependency watch scan refused: %s\n", row.Package, problem.Message)
+			// A temporarily missing file or half-written pyproject must not remove
+			// the watches that can observe its repair.
+			s.mu.Lock()
+			if previous := s.trees[row.SourceRef]; previous != nil {
+				roots[row.SourceRef] = append([]string(nil), previous.watchRoots...)
+			}
+			s.mu.Unlock()
 			continue
 		}
 		for _, path := range dependencies {
@@ -226,7 +233,15 @@ func (s *editableSync) reconcile() {
 		delete(s.trees, root)
 		close(tree.stop)
 		for _, watched := range s.watcher.WatchList() {
-			if watched == root || strings.HasPrefix(watched, root+string(filepath.Separator)) {
+			owned := sourceWatchNeeded(watched, tree.watchRoots)
+			needed := watched == filepath.Dir(s.layout.DB)
+			for _, sources := range roots {
+				if sourceWatchNeeded(watched, sources) {
+					needed = true
+					break
+				}
+			}
+			if owned && !needed {
 				_ = s.watcher.Remove(watched)
 			}
 		}
@@ -251,6 +266,15 @@ func (s *editableSync) reconcile() {
 		// found by reading it once now.
 		wake(tree.kick)
 	}
+}
+
+func sourceWatchNeeded(directory string, roots []string) bool {
+	for _, root := range roots {
+		if directory == root || directory == filepath.Dir(root) || strings.HasPrefix(directory, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *editableSync) syncTree(tree *editableTree) {
