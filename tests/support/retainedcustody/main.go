@@ -186,6 +186,8 @@ type readerResult struct {
 	Length      int64  `json:"length"`
 	Transferred int64  `json:"transferred_bytes"`
 	HTTPStatus  int    `json:"http_status"`
+	Code        string `json:"code"`
+	ErrorType   string `json:"error_type"`
 }
 
 func (m *custodyMover) move(ctx context.Context, weights records.ModelTransferWeights, mint orchestrator.WeightsGrantMinter) *exit.Error {
@@ -223,7 +225,8 @@ func (m *custodyMover) move(ctx context.Context, weights records.ModelTransferWe
 			}
 			var result readerResult
 			if json.Unmarshal(m.answers.Bytes(), &result) != nil || !result.OK || result.Manifest != weights.ManifestID || result.ObjectID != object.ObjectID || result.Length != object.Length || result.Transferred < 0 || result.Transferred > object.Length || !(result.HTTPStatus >= 200 && result.HTTPStatus < 300 || result.HTTPStatus == 412) {
-				return exit.New(exit.Conflict, "serial native reader refused or changed the exact object result")
+				emit(map[string]any{"reader_ok": result.OK, "reader_code": result.Code, "reader_error_type": result.ErrorType})
+				return exit.Named(exit.Conflict, "operator.reader_refused", "serial native reader refused or changed the exact object result")
 			}
 			sent += result.Transferred
 			verified, problem := mint(ctx, []string{object.ObjectID})
@@ -275,13 +278,13 @@ func (m *custodyMover) hold(ctx context.Context, weights records.ModelTransferWe
 			return exit.Unavailablef("pinned PodHost returned no held custody")
 		}
 		if status.RecordOwnerEpoch != request.RecordOwnerEpoch || status.ControlStreamEpoch != 0 || status.WorkerBootId != request.WorkerBootId || status.RequestId != request.RequestId || status.AttemptOrdinal != request.AttemptOrdinal || !bytes.Equal(status.InvocationSpecDigest, invocation) || status.OutputSlot != weights.OutputSlot || status.WeightsTransactionId != weights.TransactionID || status.ObjectId != object.ObjectID || status.OperationId != operation || status.GrantRevision != request.GrantRevision || status.Length != uint64(object.Length) {
-			return exit.New(exit.Conflict, "PodHost custody response changed its request binding")
+			return exit.Named(exit.Conflict, "operator.host_binding_changed", "PodHost custody response changed its request binding")
 		}
 		if status.State == pb.WeightsTransferState_WEIGHTS_TRANSFER_STATE_ACCEPTED {
 			continue
 		}
-		if status.State != pb.WeightsTransferState_WEIGHTS_TRANSFER_STATE_HELD || status.TransferredBytes != uint64(object.Length) || status.UpdateSequence == 0 {
-			return exit.New(exit.Conflict, "PodHost did not confirm exact held custody")
+		if status.State != pb.WeightsTransferState_WEIGHTS_TRANSFER_STATE_HELD || status.TransferredBytes > uint64(object.Length) || status.ChecksumSha256 != object.ObjectID || status.UpdateSequence == 0 {
+			return exit.Named(exit.Conflict, "operator.host_custody_refused", "PodHost did not confirm exact held custody")
 		}
 		return m.store.RecordModelTransferObjectStatus(records.ModelTransferObject{RequestID: weights.RequestID, Attempt: weights.Attempt, OutputSlot: weights.OutputSlot, ObjectID: object.ObjectID, Length: object.Length, OperationID: operation, GrantRevision: int64(status.GrantRevision), UpdateSequence: int64(status.UpdateSequence), State: "held", Transferred: int64(status.TransferredBytes)})
 	}
