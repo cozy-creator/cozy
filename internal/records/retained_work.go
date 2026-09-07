@@ -2,9 +2,55 @@ package records
 
 import (
 	"database/sql"
+	"errors"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
+
+// retainRetryTx acquires lineage and the same retained machine in the admission
+// transaction. A concurrent cancellation wins before or after this commit, never
+// between validating the predecessor and acquiring the descendant's rental hold.
+func retainRetryTx(tx *sql.Tx, request *Request) *exit.Error {
+	prior, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE id=?`, request.RetryOf))
+	if errors.Is(err, sql.ErrNoRows) {
+		return exit.New(exit.NotFound, "retry predecessor %s is absent", request.RetryOf)
+	}
+	if err != nil {
+		return exit.Internalf("cannot read retry predecessor: %s", err)
+	}
+	if !request.RetainWork || request.Kind != "job" || !prior.RetainWork || !prior.IsJob() ||
+		(prior.State != "paused" && prior.State != "blocked") {
+		return exit.Named(exit.Conflict, "request.retry_refused", "retry predecessor %s must retain stopped work; current state %s", prior.ID, prior.State)
+	}
+	var open int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM attempts WHERE request_id=? AND state IN (`+openAttemptStates+`)`, prior.ID).Scan(&open); err != nil {
+		return exit.Internalf("cannot inspect retry predecessor attempts: %s", err)
+	}
+	if open != 0 {
+		return exit.Named(exit.Conflict, "request.retry_refused", "retry predecessor %s still has an open attempt", prior.ID)
+	}
+	if request.Worker != "" && request.Worker != prior.Worker {
+		return exit.Named(exit.Conflict, "request.retry_worker_changed", "retry must retain predecessor %s's machine", prior.ID)
+	}
+	if prior.Worker != "" {
+		var state string
+		if err := tx.QueryRow(`SELECT state FROM rentals WHERE id=?`, prior.Worker).Scan(&state); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return exit.Named(exit.Conflict, "request.state_lost", "retry predecessor %s's retained rental is absent", prior.ID)
+			}
+			return exit.Internalf("cannot inspect retained rental: %s", err)
+		}
+		if state == "released" || state == "failed" {
+			return exit.Named(exit.Conflict, "request.state_lost", "retry predecessor %s's retained rental is %s", prior.ID, state)
+		}
+	}
+	request.Worker, request.Rental, request.RentalRequired = prior.Worker, prior.Rental, prior.RentalRequired
+	request.ReuseScope = prior.ReuseScope
+	if request.ReuseScope == "" {
+		request.ReuseScope = prior.ID
+	}
+	return nil
+}
 
 // RetainedState is an execution stop that still owns the request's exact inputs,
 // intermediate outputs and machine. It is never a terminal attempt outcome.
@@ -74,7 +120,7 @@ func (s *Store) RequestPause(id, actor string) (string, *exit.Error) {
 	if open == 0 {
 		next = "paused"
 	}
-	if _, err := tx.Exec(`UPDATE requests SET state=? WHERE id=?`, next, id); err != nil {
+	if _, err := tx.Exec(`UPDATE requests SET state=?,control_revision=control_revision+1 WHERE id=?`, next, id); err != nil {
 		return "", exit.Internalf("cannot record pause: %s", err)
 	}
 	if err := appendEventTx(tx, id, "request."+next, 0, map[string]any{"actor": actor, "status": next}); err != nil {
@@ -130,7 +176,7 @@ func (s *Store) ResumeRequest(id, actor string) (bool, *exit.Error) {
 		return false, exit.Named(exit.Conflict, "request.resume_refused",
 			"request %s must be paused with all attempts closed; current state %s", id, state)
 	}
-	if _, err := tx.Exec(`UPDATE requests SET state='queued' WHERE id=? AND state='paused'`, id); err != nil {
+	if _, err := tx.Exec(`UPDATE requests SET state='queued',control_revision=control_revision+1 WHERE id=? AND state='paused'`, id); err != nil {
 		return false, exit.Internalf("cannot queue resumed request: %s", err)
 	}
 	if err := appendEventTx(tx, id, "request.resumed", 0, map[string]any{"actor": actor, "status": "queued"}); err != nil {
@@ -160,7 +206,7 @@ func (s *Store) RequestRetainedCancellation(id, actor string) *exit.Error {
 		return exit.Internalf("cannot begin retained cancellation: %s", err)
 	}
 	defer tx.Rollback()
-	result, err := tx.Exec(`UPDATE requests SET state='canceling' WHERE id=? AND retain_work=1
+	result, err := tx.Exec(`UPDATE requests SET state='canceling',control_revision=control_revision+1 WHERE id=? AND retain_work=1
 		AND state NOT IN (`+settledRequestStates+`,'canceling','releasing')`, id)
 	if err != nil {
 		return exit.Internalf("cannot record retained cancellation: %s", err)

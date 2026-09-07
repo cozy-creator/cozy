@@ -705,7 +705,7 @@ func priorStatements(version int) []string {
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n  evidence         BLOB NOT NULL,\n", 1)
 		}
 		if requestStatement && version < 25 {
-			stmt = strings.Replace(stmt, ",\n  retain_work INTEGER NOT NULL DEFAULT 0 CHECK(retain_work IN (0,1))", "", 1)
+			stmt = strings.Replace(stmt, ",\n  retain_work INTEGER NOT NULL DEFAULT 0 CHECK(retain_work IN (0,1)),\n  retry_of TEXT NOT NULL DEFAULT '',\n  reuse_scope TEXT NOT NULL DEFAULT '',\n  control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision>=0)", "", 1)
 		}
 		if transferStatement && version < 24 {
 			stmt = strings.Replace(stmt, ",'canceling'", "", 1)

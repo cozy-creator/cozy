@@ -58,7 +58,10 @@ CREATE TABLE IF NOT EXISTS requests (
   assets       TEXT    NOT NULL DEFAULT '[]',
   models       TEXT    NOT NULL DEFAULT '[]',
   weights_outputs TEXT NOT NULL DEFAULT '[]',
-  retain_work INTEGER NOT NULL DEFAULT 0 CHECK(retain_work IN (0,1))
+  retain_work INTEGER NOT NULL DEFAULT 0 CHECK(retain_work IN (0,1)),
+  retry_of TEXT NOT NULL DEFAULT '',
+  reuse_scope TEXT NOT NULL DEFAULT '',
+  control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision>=0)
 )`
 
 const workerProcessesDDL = `
@@ -458,6 +461,11 @@ type Request struct {
 	// RetainWork preserves a private job's artifacts and capacity until the owner
 	// resumes or permanently cancels it, including after an attempt fails.
 	RetainWork bool
+	// RetryOf names immutable predecessor history; ReuseScope identifies the
+	// retained operation namespace shared by explicitly related revisions.
+	RetryOf         string
+	ReuseScope      string
+	ControlRevision uint64
 	// NeedsAccelerator is derived once from the selected package's immutable
 	// dependency facts. It is not an author-supplied resource request.
 	NeedsAccelerator bool
@@ -544,7 +552,7 @@ const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_
 	local_package_digest,local_package_uploaded_boot_id,
 	environment_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
-	COALESCE(install_id,''),assets,models,weights_outputs,retain_work`
+	COALESCE(install_id,''),assets,models,weights_outputs,retain_work,retry_of,reuse_scope,control_revision`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
@@ -552,7 +560,7 @@ func requestScanTargets(r *Request, assets, models *string) []any {
 		&r.LocalPackageUploadedBootID, &r.EnvironmentDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
-		&r.InstallID, assets, models, &r.WeightsOutputs, &r.RetainWork}
+		&r.InstallID, assets, models, &r.WeightsOutputs, &r.RetainWork, &r.RetryOf, &r.ReuseScope, &r.ControlRevision}
 }
 
 func finishRequestScan(r Request, assets, models string, err error) (Request, error) {
@@ -1111,6 +1119,9 @@ func prepareRequest(r Request) (Request, string, string, string, *exit.Error) {
 	if r.Kind == "" {
 		r.Kind = "serving"
 	}
+	if r.RetainWork {
+		r.ReuseScope = r.ID
+	}
 	assets := []byte("[]")
 	if len(r.Assets) > 0 {
 		var err error
@@ -1139,7 +1150,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	existing, err := scanRequest(tx.QueryRow(
 		`SELECT `+requestCols+` FROM requests WHERE idem_key=?`, r.IdemKey))
 	if err == nil {
-		if existing.BodyDigest != r.BodyDigest || existing.RetainWork != r.RetainWork {
+		if existing.BodyDigest != r.BodyDigest || existing.RetainWork != r.RetainWork || existing.RetryOf != r.RetryOf {
 			return Request{}, false, exit.New(exit.Conflict,
 				"idempotency key %s already names a request with a different body", r.IdemKey).
 				WithRemedy("one key, one body: %s was recorded, %s was submitted",
@@ -1154,13 +1165,18 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
+	if r.RetryOf != "" {
+		if problem := retainRetryTx(tx, &r); problem != nil {
+			return Request{}, false, problem
+		}
+	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
 		plan_id,package_release,local_package_digest,
 		local_package_uploaded_boot_id,environment_digest,
 		payload,outputs,state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,models,
-		weights_outputs,retain_work)
+		weights_outputs,retain_work,retry_of,reuse_scope,control_revision)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
-		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?)`,
+		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.LocalPackageDigest,
 		r.LocalPackageUploadedBootID, r.EnvironmentDigest, r.Payload,
@@ -1168,7 +1184,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		r.Worker, r.Rental,
 		r.RentalRequired,
 		nullable(r.InstallID),
-		assets, models, r.WeightsOutputs, r.RetainWork); err != nil {
+		assets, models, r.WeightsOutputs, r.RetainWork, r.RetryOf, r.ReuseScope, r.ControlRevision); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	if problem := recordOutputExportTx(tx, r.ID, r.OutputExport, exportOutputs); problem != nil {
