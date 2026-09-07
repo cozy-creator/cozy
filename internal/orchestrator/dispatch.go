@@ -63,10 +63,11 @@ type Submission struct {
 
 	// Kind is the ATTEMPT CLASS: "" or `serving`, or `job`. A job carries two more facts
 	// a serving request has no version of.
-	Kind          string
-	RetainWork    bool
-	RetryOf       string
-	ChildReusable bool
+	Kind           string
+	RetainWork     bool
+	RetryOf        string
+	ChildReusable  bool
+	ChildArtifacts bool
 	// Org is the publishing org whose scratch repo this job publishes into.
 	Org string
 	// Trees are the job's typed input TREES as `ref=dir`, one grant input each.
@@ -1333,6 +1334,11 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		if w.wireMinor < required {
 			return 0, exit.Named(exit.Structural, "request.retention_unsupported",
 				"this private work requires worker wire %d; selected worker speaks %d", required, w.wireMinor)
+		}
+	}
+	if req.ParentRequestID != "" {
+		if problem := c.retainChildInputs(req); problem != nil {
+			return 0, problem
 		}
 	}
 	if w.spec.Connection != nil && req.Worker == "" {

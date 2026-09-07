@@ -84,7 +84,7 @@ func RetainedState(state string) bool {
 }
 
 func (r Request) RetainsLocalOutputs() bool {
-	return r.RetainWork && r.WeightsOutputs != "" && r.WeightsOutputs != "[]" &&
+	return r.RetainWork && (r.ChildArtifacts || (r.WeightsOutputs != "" && r.WeightsOutputs != "[]")) &&
 		(r.ModelTransfer == nil || r.ModelTransfer.Destination == "")
 }
 
@@ -231,7 +231,7 @@ func (s *Store) RentalRetainsWork(id string) (bool, *exit.Error) {
 	var found bool
 	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests r LEFT JOIN request_model_transfers t ON t.request_id=r.id WHERE r.worker=? AND r.retain_work=1
 		AND ((r.state IN (`+activeRequestStates+`) AND r.state!='releasing') OR
-		(r.state='succeeded' AND r.weights_outputs!='[]' AND COALESCE(json_extract(t.intent,'$.destination'),'')='')))`, id).Scan(&found)
+		(r.state='succeeded' AND (r.child_artifacts=1 OR r.weights_outputs!='[]') AND COALESCE(json_extract(t.intent,'$.destination'),'')='')))`, id).Scan(&found)
 	if err != nil {
 		return false, exit.Internalf("cannot read retained rental ownership: %s", err)
 	}

@@ -93,6 +93,7 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 	request.ChildIntentDigest, _ = canonical.Spell(call.IntentDigest)
 	request.ChildTargetDigest = target
 	request.ChildReusable = spec.ChildReusable
+	request.ChildArtifacts = spec.ChildArtifacts
 	parentDigest, _ := canonical.Spell(call.ParentInvocationSpecDigest)
 	child, fresh, problem := c.opt.Store.SubmitChild(request, int64(call.ParentAttemptOrdinal), parentDigest, s.bootID)
 	if problem != nil {
@@ -102,6 +103,9 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 	c.sendChildResult(s, call, child.ID, pb.ChildCallState_CHILD_CALL_STATE_PENDING, nil, nil)
 	if fresh && child.State == "submitted" {
 		go func() { _, _ = c.activateRecorded(child) }()
+	}
+	if !fresh && child.State == "paused" {
+		go func() { _ = c.ResumeRequest(child.ID, "parent resumed its child call") }()
 	}
 	c.watchChildCall(s, proto.Clone(call).(*pb.ChildCallRequest), child.ID)
 }
@@ -145,11 +149,37 @@ func (c *Orchestrator) watchChildCall(s *session, call *pb.ChildCallRequest, id 
 				c.sendChildResult(s, call, id, pb.ChildCallState_CHILD_CALL_STATE_FAILED, nil, exit.Internalf("recorded child request cannot be read"))
 				return
 			}
-			switch row.State {
-			case "succeeded":
+			if row.State == "succeeded" || (row.State == "finalizing" && row.ReusedFrom != "") {
 				result, problem := c.childInlineResult(*row)
 				if problem != nil && problem.Code == exit.Unavailable {
-					break
+					select {
+					case <-s.ctx.Done():
+						return
+					case <-c.done:
+						return
+					case <-ticker.C:
+					}
+					continue
+				}
+				if problem == nil {
+					artifacts, inspectProblem := childArtifacts(result)
+					problem = inspectProblem
+					if problem == nil {
+						problem = c.retainChildArtifacts(s.ctx, *row, "result", artifacts)
+					}
+					if problem != nil && problem.Code == exit.Unavailable {
+						select {
+						case <-s.ctx.Done():
+							return
+						case <-c.done:
+							return
+						case <-ticker.C:
+						}
+						continue
+					}
+					if problem == nil && row.State == "finalizing" {
+						problem = c.opt.Store.CompleteReusedChild(row.ID)
+					}
 				}
 				state := pb.ChildCallState_CHILD_CALL_STATE_SUCCEEDED
 				if problem != nil {
@@ -157,6 +187,8 @@ func (c *Orchestrator) watchChildCall(s *session, call *pb.ChildCallRequest, id 
 				}
 				c.sendChildResult(s, call, id, state, result, problem)
 				return
+			}
+			switch row.State {
 			case "blocked", "failed", "refused", "abandoned":
 				code, detail, _ := c.opt.Store.RetainedFailure(id)
 				if code == "" {

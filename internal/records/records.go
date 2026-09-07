@@ -269,7 +269,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 27 {
+	if sourceVersion < 28 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
 		}
@@ -613,6 +613,11 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		destinationColumns += retained
 		selectColumns += retained
 	}
+	if sourceVersion >= 27 {
+		child := ",parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive"
+		destinationColumns += child
+		selectColumns += child
+	}
 	if _, err := tx.Exec(`INSERT INTO requests(` + destinationColumns + `) SELECT ` + selectColumns +
 		` FROM requests_prior`); err != nil {
 		return exit.Internalf("cannot preserve request rows while migrating %s: %s", path, err)
@@ -736,6 +741,9 @@ func priorStatements(version int) []string {
 		}
 		if requestStatement && version < 27 {
 			stmt = strings.Replace(stmt, ",\n  parent_request_id TEXT NOT NULL DEFAULT '',\n  parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<32),\n  child_intent_digest TEXT NOT NULL DEFAULT '',\n  child_target_digest TEXT NOT NULL DEFAULT '',\n  child_reusable INTEGER NOT NULL DEFAULT 0 CHECK(child_reusable IN (0,1)),\n  reused_from TEXT NOT NULL DEFAULT '',\n  orchestration_directive BLOB NOT NULL DEFAULT x''", "", 1)
+		}
+		if requestStatement && version < 28 {
+			stmt = strings.Replace(stmt, ",\n  child_artifacts INTEGER NOT NULL DEFAULT 0 CHECK(child_artifacts IN (0,1))", "", 1)
 		}
 		if requestStatement && version < 26 {
 			stmt = strings.Replace(stmt, ",\n  retain_work INTEGER NOT NULL DEFAULT 0 CHECK(retain_work IN (0,1)),\n  retry_of TEXT NOT NULL DEFAULT '',\n  reuse_scope TEXT NOT NULL DEFAULT '',\n  control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision>=0)", "", 1)

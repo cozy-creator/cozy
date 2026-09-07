@@ -40,11 +40,20 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 	if problem != nil {
 		return
 	}
+	borrowed, problem := c.opt.Store.PendingArtifactBorrowers(id)
+	if problem != nil || borrowed {
+		c.retryRetainedCancellation(id)
+		return
+	}
 	for _, attempt := range attempts {
 		if openAttempt(attempt.State) || attempt.State == "preparing" {
 			_ = c.stopRetainedAttempt(id, pb.CancelReason_CANCEL_REASON_CLIENT)
 			return
 		}
+	}
+	if problem := c.releaseChildRetentions(id, false); problem != nil {
+		c.retryRetainedCancellation(id)
+		return
 	}
 	// Walk newest first: a repeated invocation has one transaction per slot and its
 	// latest recorded worker is the current holder after an ordinary recovery.

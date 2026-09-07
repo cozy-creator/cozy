@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -79,17 +80,50 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if facts == nil {
 		return out, "", exit.Named(exit.Conflict, "child.export_changed", "the captured child has no matching job facts")
 	}
-	if len(facts.ModelParams) > 0 || len(facts.WeightsOutputs) > 0 || len(facts.Outputs) > 0 {
+	if len(facts.Outputs) > len(facts.WeightsOutputs) {
 		return out, "", exit.Named(exit.Unavailable, "child.artifact_binding_required", "artifact and model child calls require explicit native reference adoption")
+	}
+	var arguments map[string]json.RawMessage
+	if json.Unmarshal(payload, &arguments) != nil {
+		return out, "", exit.New(exit.Validation, "child input is not an object")
+	}
+	models := make([]orchestrator.ModelRef, 0, len(job.Models))
+	for _, slot := range job.Models {
+		artifact, problem := records.DecodeModelArtifact(arguments[slot.Param])
+		if problem != nil {
+			return out, "", problem
+		}
+		if artifact == nil {
+			return out, "", exit.Named(exit.Conflict, "child.model_unbound", "child model %s needs an exact retained ModelArtifact", slot.Param)
+		}
+		weights, problem := r.store.ArtifactOutput(*artifact)
+		if problem != nil {
+			return out, "", problem
+		}
+		producer, problem := r.store.RequestRow(artifact.ProducerRequestID)
+		if problem != nil || producer == nil || producer.ReuseScope != parent.ReuseScope || producer.Worker != parent.Worker {
+			return out, "", exit.Named(exit.Conflict, "child.artifact_scope", "model artifact does not belong to the parent's retained scope and store")
+		}
+		held, problem := r.store.ArtifactHasCustody(producer.ID, weights.Attempt, weights.OutputSlot, parent.ReuseScope)
+		if problem != nil {
+			return out, "", problem
+		}
+		if !held {
+			return out, "", exit.Named(exit.Conflict, "child.artifact_released", "model artifact no longer has retained native custody")
+		}
+		models = append(models, orchestrator.ModelRef{Package: install.Package, Slot: slot.Param, BindingPath: slot.Path, Model: producer.ID + "/" + artifact.OutputSlot, Manifest: artifact.Manifest.Digest, ManifestLength: artifact.Manifest.Length})
 	}
 	out = orchestrator.Submission{Kind: "job", RetainWork: true, Package: install.Package, Entrypoint: binding.Entrypoint, Release: install.Version, InstallID: install.ID,
 		PlanID: facts.DescriptorID, Payload: append([]byte(nil), payload...), Outputs: facts.Outputs, WeightsOutputs: facts.WeightsOutputs, NeedsAccelerator: facts.NeedsAccelerator, Org: parent.Org}
+	out.Models = models
 	out.ChildReusable = job.Invocable.Reusable
+	resultSchema, _ := json.Marshal(job.Result)
+	out.ChildArtifacts = bytes.Contains(resultSchema, []byte(`"input":"model"`))
 	if parent.Worker != "" {
 		out.Worker, out.Rental, out.RentalRequired = parent.Worker, true, true
 		out.LocalPackageDigest = binding.LocalRevisionDigest
 	}
-	identity, _ := json.Marshal(map[string]any{"local_revision_digest": binding.LocalRevisionDigest, "interface_digest": iface, "entrypoint": binding.Entrypoint, "module": module, "export": export})
+	identity, _ := json.Marshal(map[string]any{"local_revision_digest": binding.LocalRevisionDigest, "interface_digest": iface, "entrypoint": binding.Entrypoint, "module": module, "export": export, "models": models})
 	identity, err := canonical.NormalizeJCS(identity)
 	if err != nil {
 		return out, "", exit.Internalf("cannot encode frozen child identity: %s", err)

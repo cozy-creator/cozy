@@ -32,9 +32,9 @@ func databaseRows(t *testing.T, path string) map[string]string {
 	must(t, names.Close())
 	out := map[string]string{}
 	for _, name := range tables {
-		if name == "private_child_bindings" {
+		if name == "private_child_bindings" || name == "request_weights_retentions" {
 			var rows int
-			must(t, db.QueryRow(`SELECT count(*) FROM private_child_bindings`).Scan(&rows))
+			must(t, db.QueryRow(`SELECT count(*) FROM "`+name+`"`).Scan(&rows))
 			if rows != 0 {
 				t.Fatal("migration invented child bindings")
 			}
@@ -70,7 +70,7 @@ func databaseRows(t *testing.T, path string) map[string]string {
 			// pre-existing cell and require safe defaults for ordinary requests.
 			preserved := make([]any, 0, len(values))
 			for i, column := range columns {
-				if name == "requests" && (column == "retain_work" || column == "child_reusable") {
+				if name == "requests" && (column == "retain_work" || column == "child_reusable" || column == "child_artifacts") {
 					if values[i] != int64(0) {
 						t.Fatal("migration changed a legacy request's retention policy")
 					}
@@ -145,8 +145,8 @@ func TestPublicationCancellationMigratesPrivateCopyWithoutChangingRows(t *testin
 	defer db.Close()
 	var version int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	if version != 27 {
-		t.Fatal("migration did not stamp schema27")
+	if version != 28 {
+		t.Fatal("migration did not stamp schema28")
 	}
 	fk, err := db.Query(`PRAGMA foreign_key_check`)
 	must(t, err)
@@ -159,5 +159,5 @@ func TestPublicationCancellationMigratesPrivateCopyWithoutChangingRows(t *testin
 	if sha256.Sum256(still) != sha256.Sum256(original) {
 		t.Fatal("source snapshot changed")
 	}
-	t.Logf("schema23→27 private copy preserves all rows in %d tables, including source heads/ACKs/revisions; foreign keys valid; original snapshot unchanged", len(before))
+	t.Logf("schema23→28 private copy preserves all rows in %d tables, including source heads/ACKs/revisions; foreign keys valid; original snapshot unchanged", len(before))
 }

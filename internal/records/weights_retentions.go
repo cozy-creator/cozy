@@ -2,11 +2,19 @@ package records
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 )
+
+func ArtifactRetentionID(request, kind, slot string, artifact ModelArtifact) string {
+	raw, _ := json.Marshal(map[string]any{"request_id": request, "kind": kind, "slot": slot, "producer_request_id": artifact.ProducerRequestID, "output_slot": artifact.OutputSlot, "tensorfs_receipt_digest": artifact.TensorFSReceiptDigest})
+	raw, _ = canonical.NormalizeJCS(raw)
+	id, _ := canonical.Spell(canonical.Digest(raw))
+	return id
+}
 
 const weightsRetentionsDDL = `
 CREATE TABLE IF NOT EXISTS request_weights_retentions (
@@ -57,10 +65,25 @@ func (s *Store) RecordWeightsRetention(r WeightsRetention) (WeightsRetention, *e
 		return r, exit.Internalf("cannot begin weights retention: %s", err)
 	}
 	defer tx.Rollback()
+	held, problem := recordWeightsRetentionTx(tx, r)
+	if problem != nil {
+		return r, problem
+	}
+	if err := tx.Commit(); err != nil {
+		return r, exit.Internalf("cannot commit artifact retention: %s", err)
+	}
+	return held, nil
+}
+
+func recordWeightsRetentionTx(tx *sql.Tx, r WeightsRetention) (WeightsRetention, *exit.Error) {
 	var allowed bool
 	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests consumer JOIN requests producer ON consumer.reuse_scope=producer.reuse_scope
 		WHERE consumer.id=? AND producer.id=? AND consumer.retain_work=1 AND consumer.reuse_scope<>'' AND consumer.worker=producer.worker
-		AND consumer.state IN ('submitted','queued','dispatching','finalizing','succeeded'))`, r.RequestID, r.ProducerRequestID).Scan(&allowed); err != nil {
+		AND consumer.state IN ('submitted','queued','dispatching','finalizing','succeeded')
+		AND (producer.state NOT IN ('canceling','canceled','releasing') OR (consumer.reused_from=producer.id AND consumer.state='finalizing' AND producer.state='canceling')
+		OR EXISTS(SELECT 1 FROM request_weights_retentions reserved WHERE reserved.request_id=consumer.id AND reserved.producer_request_id=producer.id AND reserved.state='pending' AND producer.state='canceling')
+		OR EXISTS(SELECT 1 FROM request_weights_retentions live JOIN requests keeper ON keeper.id=live.request_id
+		WHERE live.producer_request_id=producer.id AND live.producer_attempt=? AND live.producer_output_slot=? AND live.state='held' AND keeper.reuse_scope=consumer.reuse_scope AND keeper.state NOT IN ('canceling','canceled','releasing'))))`, r.RequestID, r.ProducerRequestID, r.ProducerAttempt, r.ProducerOutputSlot).Scan(&allowed); err != nil {
 		return r, exit.Internalf("cannot validate artifact retention scope: %s", err)
 	}
 	if !allowed {
@@ -76,9 +99,6 @@ func (s *Store) RecordWeightsRetention(r WeightsRetention) (WeightsRetention, *e
 	}
 	if held.ProducerRequestID != r.ProducerRequestID || held.ProducerAttempt != r.ProducerAttempt || held.ProducerOutputSlot != r.ProducerOutputSlot || held.RetentionID != r.RetentionID || held.State == "releasing" || held.State == "released" {
 		return r, exit.Named(exit.Conflict, "child.artifact_retention_changed", "this retention already names different or released ownership")
-	}
-	if err := tx.Commit(); err != nil {
-		return r, exit.Internalf("cannot commit artifact retention intent: %s", err)
 	}
 	return held, nil
 }
@@ -146,7 +166,8 @@ func (s *Store) ArtifactHasCustody(producer string, attempt int64, slot, scope s
 
 func (s *Store) PendingArtifactBorrowers(producer string) (bool, *exit.Error) {
 	var found bool
-	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_weights_retentions h JOIN requests r ON r.id=h.request_id WHERE h.producer_request_id=? AND h.state='pending' AND r.state NOT IN ('canceling','releasing','canceled'))`, producer).Scan(&found); err != nil {
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_weights_retentions h JOIN requests r ON r.id=h.request_id WHERE h.producer_request_id=? AND h.state='pending' AND r.state NOT IN ('canceling','releasing','canceled'))
+		OR EXISTS(SELECT 1 FROM requests WHERE reused_from=? AND state='finalizing')`, producer, producer).Scan(&found); err != nil {
 		return false, exit.Internalf("cannot read pending artifact borrowers: %s", err)
 	}
 	return found, nil

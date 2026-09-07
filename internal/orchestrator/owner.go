@@ -49,8 +49,9 @@ type session struct {
 	// host is the pod's PodHost lane (proto-025), on the same pinned connection as the
 	// control stream; nil for a local worker, whose host is this daemon in-process. claim is
 	// the exact Claim this session presented, re-presented on every host call.
-	host  pb.PodHostClient
-	claim *pb.Claim
+	host        pb.PodHostClient
+	preparation pb.RuntimePreparationClient
+	claim       *pb.Claim
 }
 
 func (s *session) send(m *pb.RecordOwnerFrame) (sent bool) {
@@ -285,6 +286,7 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		return err
 	}
 	s := &session{ctx: ctx, instanceID: w.instanceID, out: make(chan *pb.RecordOwnerFrame, 32)}
+	s.preparation = pb.NewRuntimePreparationClient(conn)
 	go func() {
 		for m := range s.out {
 			if err := stream.Send(m); err != nil {
