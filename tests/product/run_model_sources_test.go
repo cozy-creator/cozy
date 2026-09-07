@@ -120,10 +120,14 @@ func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {
 
 func TestRunRetainedCheckpointPinsFactsWithoutRelease(t *testing.T) {
 	root, mu, posts, digest, manifest := runModelCatalog(t)
+	code, out := runCozy(t, root, "model", "download", "proof/source#"+digest, "local/checkpoint-proof", "--dry-run", "--json")
+	if code != 0 {
+		t.Fatalf("checkpoint download preflight refused: %d %s", code, out)
+	}
 	args := []string{"run", "proof/quantize/quantize", "steps=7",
 		"model.dits=proof/source#" + digest, "model.shared=proof/source#" + digest,
 		"--publish-to", "proof/output", "--rental-only", "--json", "--idempotency-key", "retained-model-job"}
-	code, out := runCozy(t, root, append(append([]string{}, args...), "--dry-run")...)
+	code, out = runCozy(t, root, append(append([]string{}, args...), "--dry-run")...)
 	if code != 0 {
 		t.Fatalf("digest-only preflight refused: %d %s", code, out)
 	}
