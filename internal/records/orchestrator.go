@@ -61,7 +61,12 @@ CREATE TABLE IF NOT EXISTS requests (
   retain_work INTEGER NOT NULL DEFAULT 0 CHECK(retain_work IN (0,1)),
   retry_of TEXT NOT NULL DEFAULT '',
   reuse_scope TEXT NOT NULL DEFAULT '',
-  control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision>=0)
+  control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision>=0),
+  parent_request_id TEXT NOT NULL DEFAULT '',
+  parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<32),
+  child_intent_digest TEXT NOT NULL DEFAULT '',
+  child_target_digest TEXT NOT NULL DEFAULT '',
+  reused_from TEXT NOT NULL DEFAULT ''
 )`
 
 const workerProcessesDDL = `
@@ -119,7 +124,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   PRIMARY KEY (request_id, attempt)
 )`
 
-var orchestratorSchema = []string{workerProcessesDDL, workerSessionIndex, requestsDDL, `
+var orchestratorSchema = []string{workerProcessesDDL, workerSessionIndex, requestsDDL, childRequestIndex, `
 -- The PUBLICATION (cl-004). One row per job request, written INSIDE the terminal
 -- transaction: a publication that a terminal did not commit does not exist, which is
 -- what "killing before commit exposes no partial bundle" means as a schema property
@@ -463,9 +468,14 @@ type Request struct {
 	RetainWork bool
 	// RetryOf names immutable predecessor history; ReuseScope identifies the
 	// retained operation namespace shared by explicitly related revisions.
-	RetryOf         string
-	ReuseScope      string
-	ControlRevision uint64
+	RetryOf           string
+	ReuseScope        string
+	ControlRevision   uint64
+	ParentRequestID   string
+	ParentCallIndex   int64
+	ChildIntentDigest string
+	ChildTargetDigest string
+	ReusedFrom        string
 	// NeedsAccelerator is derived once from the selected package's immutable
 	// dependency facts. It is not an author-supplied resource request.
 	NeedsAccelerator bool
@@ -552,7 +562,8 @@ const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_
 	local_package_digest,local_package_uploaded_boot_id,
 	environment_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
-	COALESCE(install_id,''),assets,models,weights_outputs,retain_work,retry_of,reuse_scope,control_revision`
+	COALESCE(install_id,''),assets,models,weights_outputs,retain_work,retry_of,reuse_scope,control_revision,
+	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,reused_from`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
@@ -560,7 +571,8 @@ func requestScanTargets(r *Request, assets, models *string) []any {
 		&r.LocalPackageUploadedBootID, &r.EnvironmentDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
-		&r.InstallID, assets, models, &r.WeightsOutputs, &r.RetainWork, &r.RetryOf, &r.ReuseScope, &r.ControlRevision}
+		&r.InstallID, assets, models, &r.WeightsOutputs, &r.RetainWork, &r.RetryOf, &r.ReuseScope, &r.ControlRevision,
+		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ReusedFrom}
 }
 
 func finishRequestScan(r Request, assets, models string, err error) (Request, error) {
@@ -985,6 +997,12 @@ func (s *Store) LocalPackageInUse(digest, packageName, release,
 	sourceDigest string,
 ) (bool, *exit.Error) {
 	var used int
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM private_child_bindings WHERE local_revision_digest=?)`, digest).Scan(&used); err != nil {
+		return false, exit.Internalf("cannot read child dependency revision ownership: %s", err)
+	}
+	if used != 0 {
+		return true, nil
+	}
 	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests
 		WHERE local_package_digest=?
 		  AND state IN (`+activeRequestStates+`))`, digest).
@@ -1119,6 +1137,9 @@ func prepareRequest(r Request) (Request, string, string, string, *exit.Error) {
 	if r.Kind == "" {
 		r.Kind = "serving"
 	}
+	if r.ParentRequestID == "" {
+		r.ParentCallIndex = -1
+	}
 	if r.RetainWork {
 		r.ReuseScope = r.ID
 	}
@@ -1183,9 +1204,9 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		plan_id,package_release,local_package_digest,
 		local_package_uploaded_boot_id,environment_digest,
 		payload,outputs,state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,models,
-		weights_outputs,retain_work,retry_of,reuse_scope,control_revision)
+		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,reused_from)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
-		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?)`,
+		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.LocalPackageDigest,
 		r.LocalPackageUploadedBootID, r.EnvironmentDigest, r.Payload,
@@ -1193,7 +1214,8 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		r.Worker, r.Rental,
 		r.RentalRequired,
 		nullable(r.InstallID),
-		assets, models, r.WeightsOutputs, r.RetainWork, r.RetryOf, r.ReuseScope, r.ControlRevision); err != nil {
+		assets, models, r.WeightsOutputs, r.RetainWork, r.RetryOf, r.ReuseScope, r.ControlRevision,
+		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ReusedFrom); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	if problem := recordOutputExportTx(tx, r.ID, r.OutputExport, exportOutputs); problem != nil {

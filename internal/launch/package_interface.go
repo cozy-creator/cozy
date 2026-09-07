@@ -65,6 +65,17 @@ type Entrypoint struct {
 	// WeightsOutputs is the job's explicit WeightsSink slot set. It is separate from
 	// result asset fields because worker-protocol rev5 OutputBinding has no kind.
 	WeightsOutputs []WeightsOutput `json:"weights_outputs"`
+	Invocable      *Invocable      `json:"invocable,omitempty"`
+}
+
+type Invocable struct {
+	Context     string                     `json:"context"`
+	Module      string                     `json:"module"`
+	Export      string                     `json:"export"`
+	Parameters  []string                   `json:"parameters"`
+	Defaults    map[string]json.RawMessage `json:"defaults"`
+	TypeNames   map[string]string          `json:"type_names"`
+	EnumMembers map[string]json.RawMessage `json:"enum_members"`
 }
 
 type WeightsOutput struct {
@@ -190,7 +201,7 @@ func validateClosedPackageInterface(data []byte) error {
 		}
 		for _, row := range rows {
 			required := []string{"name", "request", "result"}
-			optional := []string{"models"}
+			optional := []string{"models", "invocable"}
 			if kind == "job" {
 				required = append(required, "publishes")
 				optional = append(optional, "weights_outputs")
@@ -198,6 +209,11 @@ func validateClosedPackageInterface(data []byte) error {
 			callable, err := exactKeys(row, required, optional)
 			if err != nil {
 				return err
+			}
+			if metadata := callable["invocable"]; metadata != nil {
+				if _, err := exactKeys(metadata, []string{"context", "module", "export", "parameters", "defaults", "type_names", "enum_members"}, nil); err != nil {
+					return err
+				}
 			}
 			for _, name := range []string{"request", "result"} {
 				if err := validateStructRaw(callable[name]); err != nil {

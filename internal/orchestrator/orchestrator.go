@@ -496,6 +496,7 @@ type Orchestrator struct {
 	// localTransfers is command-scoped, lossy progress over Creator's durable request
 	// row and sealed revision. A restart simply replays exact chunks from those authorities.
 	localTransfers map[string]*localTransfer
+	childWatches   map[string]*session
 }
 
 type wait struct {
@@ -539,6 +540,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		sourcePrepareBlocked: make(map[string]sourcePreparationBackoff),
 		checkpointUploads:    make(map[string]*checkpointUpload),
 		localTransfers:       make(map[string]*localTransfer),
+		childWatches:         make(map[string]*session),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a
 	// SAMPLING resolution, never a verdict: every verdict it acts on is the worker's own

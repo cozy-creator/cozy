@@ -355,6 +355,10 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			if e := c.onClaimAck(w, s, ack); e != nil {
 				return fmt.Errorf("%s", e.Message)
 			}
+		case *pb.WorkerFrame_ChildCallRequest:
+			c.onChildCall(s, m.ChildCallRequest)
+		case *pb.WorkerFrame_ChildCallCancel:
+			c.onChildCancel(s, m.ChildCallCancel)
 		case *pb.WorkerFrame_BootFailure:
 			c.logf("BOOT FAILURE from %s: %s (%s)", m.BootFailure.WorkerInstanceId,
 				pb.BootFailureReason_name[int32(m.BootFailure.Reason)], m.BootFailure.Detail)
