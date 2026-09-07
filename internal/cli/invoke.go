@@ -253,13 +253,15 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 }
 
 // invocationModelSpec is one slot's selection before the card is read: an explicit
-// `model.<param>=` run key pins Ref (and possibly Lane); a hub binding carries its Ladder
-// and the machine decides the lane (cl-166).
+// `model.<param>=` run key pins Ref (and possibly Lane); a bare run takes Ref from the
+// hub binding and its ladder decides the lane (cl-166). Beside a run key the binding is
+// only the owner's word on where that lane fits (cl-170): evidence, never a choice.
 type invocationModelSpec struct {
-	Slot   string
-	Ref    string
-	Lane   string
-	Ladder []hub.BindingRung
+	Slot     string
+	Ref      string
+	Lane     string
+	Explicit bool
+	Binding  *hub.PackageBindingRow
 }
 
 // resolveInvocationModels applies the one selection order for both local and rented
@@ -294,10 +296,10 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 			}
 			var row orchestrator.ModelRef
 			var problem *exit.Error
-			if len(spec.Ladder) > 0 {
-				row, problem = resolveRemoteLadder(ctx, target.Package, slot, spec)
+			if spec.Explicit {
+				row, problem = resolveRemoteModel(ctx, target.Package, slot, spec.Ref, spec.Lane, spec.Binding)
 			} else {
-				row, problem = resolveRemoteModel(ctx, target.Package, slot, spec.Ref, spec.Lane)
+				row, problem = resolveRemoteLadder(ctx, target.Package, slot, spec)
 			}
 			if problem != nil {
 				return nil, problem
@@ -330,9 +332,9 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 			return nil, exit.Internalf("resolved model slot %s is absent from the package interface", spec.Slot)
 		}
 		lane := spec.Lane
-		if len(spec.Ladder) > 0 {
+		if !spec.Explicit {
 			// Local execution: the lane is the rung this host's own accelerator fits.
-			rung, problem := localRung(ctx, spec.Ladder)
+			rung, problem := localRung(ctx, spec.Binding.Ladder)
 			if problem != nil {
 				return nil, problem
 			}
@@ -374,7 +376,7 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 			return nil, problem
 		}
 		if provider {
-			selected[slotPath] = invocationModelSpec{Slot: slotPath, Ref: source}
+			selected[slotPath] = invocationModelSpec{Slot: slotPath, Ref: source, Explicit: true}
 			continue
 		}
 		model, release, lane, manifest, problem := parseModelRef(raw)
@@ -388,22 +390,30 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 		if manifest != "" {
 			ref += "#" + manifest
 		}
-		selected[slotPath] = invocationModelSpec{Slot: slotPath, Ref: ref, Lane: lane}
+		selected[slotPath] = invocationModelSpec{Slot: slotPath, Ref: ref, Lane: lane, Explicit: true}
 	}
 	// An editable `local/` package has no hub row to ask and nothing in its repo is a
 	// binding: every slot takes its model per run, or the run refuses here.
 	editable := strings.HasPrefix(target.Package, "local/")
 	defaults := map[string]hub.PackageBindingRow{}
-	if len(selected) < len(ep.Models) && !editable {
+	if !editable {
 		var problem *exit.Error
-		defaults, problem = invocationDefaultBindings(ctx, target)
-		if problem != nil {
-			return nil, problem
+		if defaults, problem = invocationDefaultBindings(ctx, target); problem != nil {
+			// A slot a run key covers needs no binding: beside it the read is only the
+			// owner's word on the lane's fit (cl-170), and a hub that cannot give it
+			// leaves the lane held to its own bytes rather than refusing the run.
+			if len(selected) < len(ep.Models) {
+				return nil, problem
+			}
+			defaults = map[string]hub.PackageBindingRow{}
 		}
 	}
 	out := make([]invocationModelSpec, 0, len(ep.Models))
 	for _, slot := range ep.Models {
 		if spec, ok := selected[slot.Path]; ok {
+			if binding, bound := defaults[slot.Path]; bound {
+				spec.Binding = &binding
+			}
 			out = append(out, spec)
 			continue
 		}
@@ -419,7 +429,7 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 				WithRemedy("bind it: %s — or override this run: model.%s=org/model@release[/lane]",
 					bindRemedy(target.Package, slot.Path), slot.Param)
 		}
-		out = append(out, invocationModelSpec{Slot: slot.Path, Ref: binding.Ref(), Ladder: binding.Ladder})
+		out = append(out, invocationModelSpec{Slot: slot.Path, Ref: binding.Ref(), Binding: &binding})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Slot < out[j].Slot })
 	return out, nil
@@ -471,9 +481,8 @@ func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstal
 	return row, nil
 }
 
-func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw, wantedLane string) (
-	orchestrator.ModelRef, *exit.Error,
-) {
+func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw, wantedLane string,
+	binding *hub.PackageBindingRow) (orchestrator.ModelRef, *exit.Error) {
 	// A caller may narrow by Manifest spelling, but cannot introduce one: the Hub-authored
 	// release card below must contain it in an exact lane before it enters request identity
 	// or a signed worker download delegation. No caller bytes or local path are trusted.
@@ -546,7 +555,28 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path,
 		Model: ref.String(), Release: release, Lane: lanes[0], Manifest: manifest,
 		Bytes: manifestBytes[manifest], ComponentBytes: manifestComponentBytes[manifest],
-		ComponentUse: slot.ComponentUse}, nil
+		ComponentUse: slot.ComponentUse, Ladder: assertedRungs(binding, ref, selected)}, nil
+}
+
+// assertedRungs is the owner's ladder carried beside an explicit lane (cl-170): each rung
+// bound to the card's lane, saying where the owner puts each lane of THIS release — the
+// evidence a machine decision reads for the fit of the lane the run key chose, never a
+// choice. A binding for another model or release, or a rung naming a lane the card
+// lacks, says nothing here.
+func assertedRungs(binding *hub.PackageBindingRow, ref hub.Ref, selected *hub.ModelReleaseSummary) []records.ModelRung {
+	if binding == nil || binding.Model != ref.String() || binding.Release != selected.Release {
+		return nil
+	}
+	var rungs []records.ModelRung
+	for _, rung := range binding.Ladder {
+		lane, problem := laneOf(ref, selected, rung.Lane)
+		if problem != nil {
+			continue
+		}
+		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, Lane: rung.Lane,
+			Manifest: lane.ManifestID, Bytes: lane.Bytes, ComponentBytes: lane.ComponentBytes})
+	}
+	return rungs
 }
 
 func handleRunCancel(ctx *Context) *exit.Error {

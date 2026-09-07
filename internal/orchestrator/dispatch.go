@@ -627,6 +627,16 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		if after != "" {
 			c.emit(req.ID, "request.rentals", 0, map[string]any{"line": after})
 		}
+		if decision.RentalID == "" {
+			// The fleet waits on a fitting rental whose worker has not attached (cl-170):
+			// the record is written once per distinct wait, and the fleet's next
+			// observation re-asks.
+			unguard()
+			if c.parkFor(req, decision.Line()) {
+				c.logPlacement(req, decision)
+			}
+			return
+		}
 		req.Worker = decision.RentalID
 		if decision.Models != nil {
 			req.Models = decision.Models
@@ -815,12 +825,21 @@ func (c *Orchestrator) deferUnavailable(req records.Request, problem *exit.Error
 	if !req.Rental || problem == nil || problem.Code != exit.Unavailable {
 		return false
 	}
+	if c.QueuePosition(req.ID) == 0 {
+		return false
+	}
+	c.parkFor(req, problem.Message)
+	return true
+}
+
+// parkFor parks a queued --rental request with the reason it waits, and says whether that
+// reason is news.
+func (c *Orchestrator) parkFor(req records.Request, reason string) bool {
 	position := c.QueuePosition(req.ID)
 	if position == 0 {
 		return false
 	}
-	c.park(req, position-1, waitFacts{}, problem.Message)
-	return true
+	return c.park(req, position-1, waitFacts{}, reason)
 }
 
 func autoRentalGate(_ records.Request, cause *exit.Error) *exit.Error { return cause }

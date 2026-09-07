@@ -136,8 +136,8 @@ func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
 	if problem != nil {
 		return empty, rebind(problem, packageName, slot.Path)
 	}
-	rungs := make([]records.ModelRung, 0, len(spec.Ladder))
-	for _, rung := range spec.Ladder {
+	rungs := make([]records.ModelRung, 0, len(spec.Binding.Ladder))
+	for _, rung := range spec.Binding.Ladder {
 		lane, problem := laneOf(ref, selected, rung.Lane)
 		if problem != nil {
 			return empty, rebind(problem, packageName, slot.Path)

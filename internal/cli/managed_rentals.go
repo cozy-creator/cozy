@@ -265,14 +265,16 @@ func offeredNames(skus []hub.RentalSKU) string {
 }
 
 // acquire is the placement decision for a --rental request no rental holds a placement
-// for (placement-economics.md, cl-165). The candidates are the fleet's attached ready
-// rentals — the cl-132 exclusions still apply — and the catalog's purchasable products,
-// each pinned to the lane its rung of the binding ladder selects and priced from the
-// live catalog; the model's published throughput rows give each its expected time and
-// cost, and placement.prefer picks. --rental is permission AND intent to spend (owner
-// ruling 2026-09-03). The chosen machine is pinned to THIS request alone, with the lane
-// its rung names, in one write; a buy the hub refuses for stock drops that product and
-// the choice repeats.
+// for (placement-economics.md, cl-165). The candidates are the fleet's ready rentals —
+// the cl-132 exclusions still apply — and the catalog's purchasable products, each
+// pinned to the lane its rung of the binding ladder selects (or the lane the request
+// pinned itself) and priced from the live catalog; the model's published throughput rows
+// give each its expected time and cost, and placement.prefer picks. --rental is
+// permission AND intent to spend (owner ruling 2026-09-03). The chosen machine is pinned
+// to THIS request alone, with the lane its rung names, in one write; a buy the hub
+// refuses for stock drops that product and the choice repeats. A fitting rental whose
+// worker has not attached yet is waited for, never bought around (cl-170): the decision
+// returns with no rental and the fleet's next observation re-asks.
 func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 	var none orchestrator.PlacementDecision
 	m.mu.Lock()
@@ -296,7 +298,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		bySKU[sku.Name] = sku
 	}
 	decision := orchestrator.PlacementDecision{Tier: m.ctx.Cfg.PlacementPrefer,
-		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models)}
+		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models), Override: rental.Override(req.Models)}
 	attached, problem := m.attachedLocked(req, bySKU, needsAccelerator)
 	if problem != nil {
 		return none, "", problem
@@ -320,6 +322,11 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	decision.Throughput = rental.Measure(decision.Candidates, rows, req.Models)
 	for {
 		i := rental.Place(decision.Tier, decision.Candidates)
+		if w := rental.Attaching(decision.Candidates); w >= 0 && (i < 0 || !decision.Candidates[i].Attached()) {
+			rental.Wait(decision.Candidates, w)
+			line, problem := m.lineLocked()
+			return decision, line, problem
+		}
 		if i < 0 {
 			return none, "", refusal(req, decision, capped)
 		}
@@ -386,24 +393,21 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hu
 		if problem != nil {
 			return nil, problem
 		}
-		var ok bool
 		switch {
 		case reason != "":
 			c.Verdict = orchestrator.VerdictExcluded + reason
 		default:
-			if c.Models, c.Rung, ok = rental.Pin(req.Models, row.AcceleratorModel); !ok {
-				c.Verdict = orchestrator.VerdictNoRung
+			// A machine the user already has up is held to the same floor as a buy; the
+			// catalog's memory figure for its product is the fact (a product gone from
+			// the catalog this minute decides nothing).
+			rental.Size(&c, req.Models, row.AcceleratorModel, sku.VRAMGB, needsAccelerator && offered)
+			if c.Verdict != "" {
 				break
 			}
-			c.Lane = records.Lanes(c.Models)
-			if needsAccelerator && offered {
-				// A machine the user already has up is held to the same floor as a buy;
-				// the catalog's memory figure for its product is the fact (a product gone
-				// from the catalog this minute decides nothing).
-				need := records.Resident(c.Models)
-				c.Fit, c.Verdict = rental.FitNote(need, sku.VRAMGB), rental.Fit(need, sku.VRAMGB, row.SKU)
-			}
-			if c.Verdict != "" {
+			if row.Address == "" || row.CertPath == "" {
+				// Ready, its worker not attached yet: a fitting machine the request waits
+				// for (cl-170), never one it buys around.
+				c.Verdict = orchestrator.VerdictAttaching
 				break
 			}
 			mode, held := m.owner.RentalStanding(row.ID, req.IsJob())
@@ -428,8 +432,6 @@ func (m *managedRentals) standingLocked(row records.Rental, needsAccelerator boo
 		return orchestrator.ExcludedWrongClass, nil
 	case row.State != hub.RentalReady && row.State != "attached":
 		return orchestrator.ExcludedNotReady, nil
-	case row.Address == "" || row.CertPath == "":
-		return orchestrator.ExcludedUnattached, nil
 	}
 	retained, problem := m.store.RentalHasRetainedJob(row.ID)
 	if problem != nil {
@@ -478,8 +480,7 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 	if problem := m.store.PinRequestModels(req.ID, c.Models); problem != nil {
 		return records.Rental{}, problem
 	}
-	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s (rung %d, lane %s, fit %s)\n",
-		sku.Name, skuRate(sku), c.Rung, orNone(c.Lane), orNone(c.Fit))
+	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s (%s)\n", sku.Name, skuRate(sku), pinText(c))
 	m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{Name: orchestrator.PhaseAcquiring})
 	defer m.owner.ForgetPhase(req.ID)
 	operationKey, problem := m.store.ManagedRentalOperationKey(req.ID)
@@ -510,6 +511,15 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 			}
 		})
 	return row, problem
+}
+
+// pinText is a candidate's pin for a log line; the rung is named when the ladder chose.
+func pinText(c orchestrator.PlacementCandidate) string {
+	text := fmt.Sprintf("lane %s, fit %s", orNone(c.Lane), orNone(c.Fit))
+	if c.Rung > 0 {
+		return fmt.Sprintf("rung %d, %s", c.Rung, text)
+	}
+	return text
 }
 
 // refusal names why nothing could be placed, in the order a reader can act on: a

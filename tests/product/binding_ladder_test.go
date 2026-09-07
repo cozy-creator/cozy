@@ -41,6 +41,9 @@ type ladderHub struct {
 	// provisions makes a bought pod come up READY with the triple the ask pinned, so the
 	// buy completes and the placement is recorded; otherwise the fixture pod fails.
 	provisions bool
+	// unsized makes the card publish no component bytes for any lane (the card as it
+	// stood on 2026-09-07 22:27Z, cl-170).
+	unsized bool
 }
 
 const (
@@ -98,7 +101,10 @@ func newLadderHub(t *testing.T) *ladderHub {
 		_ = json.NewEncoder(w).Encode(hub.PackageBindingWrite{Binding: row, Changed: true})
 	})
 	mux.HandleFunc("GET /v1/models/proof/minimax", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Org: "proof", Name: "minimax"},
+		h.mu.Lock()
+		unsized := h.unsized
+		h.mu.Unlock()
+		card := hub.ModelCard{Model: hub.Resource{Org: "proof", Name: "minimax"},
 			Releases: []hub.ModelReleaseSummary{
 				{ReleaseSummary: hub.ReleaseSummary{Release: "0.9.0", Yanked: true}, Lanes: []hub.ModelLaneSummary{
 					{Lane: "bf16-full", ManifestID: bf16Manifest, Bytes: 130 * gib}}},
@@ -111,7 +117,15 @@ func newLadderHub(t *testing.T) *ladderHub {
 					{Lane: "bf16-full", ManifestID: bf16Manifest, Bytes: 130 * gib,
 						Components:     []string{"audio_vae", "fl2va_dit", "ref2va_dit", "text_encoder", "video_vae"},
 						ComponentBytes: h3BF16Components()}}},
-			}})
+			}}
+		if unsized {
+			for _, release := range card.Releases {
+				for i := range release.Lanes {
+					release.Lanes[i].ComponentBytes = nil
+				}
+			}
+		}
+		_ = json.NewEncoder(w).Encode(card)
 	})
 	mux.HandleFunc("GET /v1/models/proof/minimax/throughput", func(w http.ResponseWriter, _ *http.Request) {
 		h.mu.Lock()
@@ -374,8 +388,8 @@ func TestAutoRentWalksTheLadderAndNeverBuysAShortCard(t *testing.T) {
 	})
 	row, problem := store.RequestByIdempotencyKey("ladder-walk")
 	fatal(t, problem)
-	if row.Models[0].Manifest != bf16Manifest || row.Models[0].Ladder != nil {
-		t.Fatalf("the buy did not pin the H200's rung exactly: %+v", row.Models[0])
+	if row.Models[0].Manifest != bf16Manifest || len(row.Models[0].Ladder) != 3 {
+		t.Fatalf("the buy did not pin the H200's rung exactly, ladder kept: %+v", row.Models[0])
 	}
 	log := tail(filepath.Join(root, "daemon.log"))
 	for _, want := range []string{"renting h100-80", "(rung 1, lane fp8-adaln-pruned, fit components 51.5 GiB of 80 GB)",
