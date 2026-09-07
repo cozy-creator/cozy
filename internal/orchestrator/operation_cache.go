@@ -161,7 +161,7 @@ func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOn
 	}
 	doc, err := canonical.Read(source.OutcomeCanonicalBytes, &pb.AttemptOutcomeBody{})
 	invocation, _ := canonical.Spell(source.InvocationSpecDigest)
-	if err != nil || doc.Str("request_id") != source.RequestId || doc.Int("attempt_ordinal") != int64(source.AttemptOrdinal) || doc.Str("invocation_spec_digest") != invocation || doc.Str("status") != "SUCCEEDED" {
+	if err != nil || doc.Str("request_id") != source.RequestId || doc.Int("attempt_ordinal") != int64(source.AttemptOrdinal) || doc.Str("invocation_spec_digest") != invocation || doc.Int("status") != int64(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED) {
 		return false, exit.Named(exit.Structural, "operation.source_changed", "cached operation differs from its original successful terminal")
 	}
 	outputs, problem := c.opt.Store.AllModelTransferWeights(source.RequestId, int64(source.AttemptOrdinal))

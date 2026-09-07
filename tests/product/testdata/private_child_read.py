@@ -1,6 +1,15 @@
-import tensorfs,struct,json,sys
+import tensorfs,struct,json,sys,time
+from tensorfs.errors import StoreBusy
 root='/var/lib/tensorfs'
-tensorfs.gc(root)
+deadline=time.monotonic()+10
+while True:
+    try:
+        tensorfs.gc(root)
+        break
+    except StoreBusy:
+        if time.monotonic()>=deadline:
+            raise
+        time.sleep(0.02)
 store=tensorfs.Store.open(root)
 manifest=sys.argv[1]
 with store.acquire_cozytensors(manifest) as lease:
