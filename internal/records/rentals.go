@@ -803,6 +803,23 @@ func (s *Store) RentalRunCounts(id string) (queued, running int, problem *exit.E
 	return queued, running, nil
 }
 
+// RentalHasRetainedJob keeps unacknowledged job outcomes and unfinished successful
+// publications out of new capacity, even after a connection or request has failed.
+// This does not retire or release a manually rented machine.
+func (s *Store) RentalHasRetainedJob(id string) (bool, *exit.Error) {
+	var retained bool
+	err := s.db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM requests r JOIN attempts a ON a.request_id=r.id
+		WHERE r.worker=? AND r.rental=1 AND r.kind='job' AND (
+		  a.state='terminal' OR (a.state='closed' AND a.terminal_status='SUCCEEDED'
+		    AND EXISTS (SELECT 1 FROM request_model_transfers t WHERE t.request_id=r.id
+		      AND t.state NOT IN ('completed','canceled')))))`, id).Scan(&retained)
+	if err != nil {
+		return false, exit.Internalf("cannot read retained jobs for rented machine %s: %s", id, err)
+	}
+	return retained, nil
+}
+
 // QueuedUnpinnedRentalRequests counts the --rental requests that are QUEUED and pinned to
 // no rental at all (cl-121). They are the work `RentalRunCounts` cannot see: it counts
 // `requests WHERE worker=<rental>`, and an unpinned request belongs to no rental yet

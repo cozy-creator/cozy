@@ -2,8 +2,6 @@ package cli
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"io"
 	"path/filepath"
 	"sort"
@@ -316,7 +314,7 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 		defer work.Release()
 		upload := &transfer.Upload{Tool: tool, Hub: publicationClient, Ref: ref,
 			ManifestID: weights.ManifestID,
-			Session:    transferOutputOperation(weights.RequestID, weights.OutputSlot),
+			Session:    records.ModelTransferOutputOperation(weights.RequestID, weights.OutputSlot),
 			Reason:     modelPublicationReason(intent),
 			Scratch:    work.Path, Progress: progress(cli)}
 		result, problem := upload.Run(ctx)
@@ -332,7 +330,7 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	for _, object := range weights.Objects {
 		objects = append(objects, hub.Object{ID: object.ObjectID, Length: object.Length})
 	}
-	operation := transferOutputOperation(weights.RequestID, weights.OutputSlot)
+	operation := records.ModelTransferOutputOperation(weights.RequestID, weights.OutputSlot)
 	opened, problem := publicationClient.OpenPublication(ctx, ref, operation, objects,
 		modelPublicationReason(intent))
 	if problem != nil {
@@ -348,7 +346,13 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 	// carries the cursor, so it asks for the objects whose bytes are about to move and asks
 	// again once the hub's own declared life is half spent. Nothing about the publication
 	// protocol changed -- the hub always re-minted for a still-claimed object.
-	if opened.Publication.State == "open" {
+	verified := true
+	for _, object := range opened.Publication.Objects {
+		verified = verified && object.State == "accepted"
+	}
+	// Hub custody of the complete exact closure needs no worker byte transfer.
+	// Finalize below still verifies and retains the checkpoint normally.
+	if opened.Publication.State == "open" && !verified {
 		if problem := mover(ctx, weights,
 			func(ctx context.Context, objectIDs []string) (orchestrator.WeightsGrantMint, *exit.Error) {
 				return mintWeightsGrants(ctx, publicationClient, ref, operation, intent, objectIDs)
@@ -404,11 +408,6 @@ func mintWeightsGrants(ctx context.Context, client *hub.Client, ref hub.Ref, ope
 			ObjectID: held.ObjectID, Length: held.Length, Held: true})
 	}
 	return window, nil
-}
-
-func transferOutputOperation(requestID, slot string) string {
-	sum := sha256.Sum256([]byte(requestID + "\x00" + slot))
-	return "model-artifact-" + hex.EncodeToString(sum[:])
 }
 
 func modelPublicationReason(intent records.ModelTransferIntent) string {

@@ -238,6 +238,14 @@ func (c *Orchestrator) stopRetainedAttempt(id string, reason pb.CancelReason) *e
 			}
 		}
 	}
+	request, problem := c.opt.Store.RequestRow(id)
+	if problem != nil {
+		return problem
+	}
+	if request != nil && request.State == "pausing" && request.Worker != "" && request.ModelTransfer != nil && request.ModelTransfer.HasAcquisition() {
+		c.pauseRetainedSource(*request)
+		return nil
+	}
 	c.mu.Lock()
 	preparing := c.transferDispatching[id] || c.transferRunning[id] || c.localTransfers[id] != nil || c.checkpointUploads[id] != nil
 	c.mu.Unlock()

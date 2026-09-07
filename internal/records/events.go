@@ -143,25 +143,49 @@ func (s *Store) FailQueuedRequest(requestID string, payload map[string]any) (boo
 	}
 	defer tx.Rollback()
 	var state string
+	var retain bool
 	var openAttempts int
-	if err := tx.QueryRow(`SELECT state,(SELECT COUNT(*) FROM attempts WHERE request_id=r.id
+	if err := tx.QueryRow(`SELECT state,retain_work,(SELECT COUNT(*) FROM attempts WHERE request_id=r.id
 		AND state IN ('preparing','offered','accepted','recovered_open','terminal'))
-		FROM requests r WHERE id=?`, requestID).Scan(&state, &openAttempts); err != nil {
+		FROM requests r WHERE id=?`, requestID).Scan(&state, &retain, &openAttempts); err != nil {
 		if err == sql.ErrNoRows {
 			return false, nil
 		}
 		return false, exit.Internalf("cannot read queued request %s: %s", requestID, err)
 	}
-	if state == "canceled" || state == "succeeded" || state == "failed" ||
-		state == "refused" || state == "abandoned" {
+	if state != "submitted" && state != "queued" {
 		return false, nil
 	}
 	if openAttempts != 0 {
 		return false, exit.New(exit.Conflict,
 			"request %s has an attempt and is not a queued failure", requestID)
 	}
+	if retain {
+		if _, err := tx.Exec(`UPDATE requests SET state='blocked' WHERE id=?`, requestID); err != nil {
+			return false, exit.Internalf("cannot retain queued failure: %s", err)
+		}
+		blocked := make(map[string]any, len(payload))
+		for key, value := range payload {
+			blocked[key] = value
+		}
+		blocked["status"] = "blocked"
+		if err := appendEventTx(tx, requestID, "request.blocked", 0, blocked); err != nil {
+			return false, exit.Internalf("cannot journal retained queued failure: %s", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return false, exit.Internalf("cannot commit retained queued failure: %s", err)
+		}
+		return true, nil
+	}
 	if _, err := tx.Exec(`UPDATE requests SET state='failed' WHERE id=?`, requestID); err != nil {
 		return false, exit.Internalf("cannot settle queued request %s: %s", requestID, err)
+	}
+	code, _ := payload["error_type"].(string)
+	detail, _ := payload["error"].(string)
+	if _, err := tx.Exec(`UPDATE request_model_transfers SET state='failed',error_code=?,
+		safe_error=?,updated_at=? WHERE request_id=? AND state NOT IN ('completed','canceling','canceled')`,
+		code, detail, now(), requestID); err != nil {
+		return false, exit.Internalf("cannot fail queued model transfer %s: %s", requestID, err)
 	}
 	if err := appendEventTx(tx, requestID, "request.failed", 0, payload); err != nil {
 		return false, exit.Internalf("cannot append queued failure for %s: %s", requestID, err)

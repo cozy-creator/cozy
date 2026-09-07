@@ -803,7 +803,8 @@ func (s *Store) RequestModelTransferCancellation(requestID string) *exit.Error {
 }
 
 // SettleModelTransferRequest atomically projects destination retention into the
-// ordinary request terminal and its absorbing event. Provider teardown happens first.
+// ordinary request terminal and its absorbing event. Attempt ACK and provider cleanup
+// are separate obligations and do not delay successful publication.
 func (s *Store) SettleModelTransferRequest(requestID string, attempt int64) (string, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -855,8 +856,8 @@ func (s *Store) SettleModelTransferRequest(requestID string, attempt int64) (str
 	return state, nil
 }
 
-// FailModelTransferRequest atomically settles a pre-attempt hook failure and its
-// ordinary absorbing event. It never overwrites cancellation or a completed request.
+// FailModelTransferRequest settles exhausted attempt retries and their absorbing
+// event. Pre-attempt preparation failures must use FailQueuedRequest instead.
 func (s *Store) FailModelTransferRequest(requestID, code, detail string,
 	payload map[string]any,
 ) (bool, *exit.Error) {

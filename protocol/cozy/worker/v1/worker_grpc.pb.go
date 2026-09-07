@@ -1127,6 +1127,7 @@ const (
 	PodHost_ModelSourceFile_FullMethodName         = "/cozy.worker.v1.PodHost/ModelSourceFile"
 	PodHost_ModelSourcePrepare_FullMethodName      = "/cozy.worker.v1.PodHost/ModelSourcePrepare"
 	PodHost_ModelSourceRelease_FullMethodName      = "/cozy.worker.v1.PodHost/ModelSourceRelease"
+	PodHost_ModelSourceControl_FullMethodName      = "/cozy.worker.v1.PodHost/ModelSourceControl"
 	PodHost_RetainDerivedResult_FullMethodName     = "/cozy.worker.v1.PodHost/RetainDerivedResult"
 	PodHost_ReleaseDerivedRetention_FullMethodName = "/cozy.worker.v1.PodHost/ReleaseDerivedRetention"
 	PodHost_ReleaseDerivedResult_FullMethodName    = "/cozy.worker.v1.PodHost/ReleaseDerivedResult"
@@ -1180,6 +1181,7 @@ type PodHostClient interface {
 	ModelSourceFile(ctx context.Context, in *ModelSourceFileCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ModelSourceFileStatus], error)
 	ModelSourcePrepare(ctx context.Context, in *ModelSourcePrepareCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error)
 	ModelSourceRelease(ctx context.Context, in *ModelSourceReleaseCall, opts ...grpc.CallOption) (*ReleaseModelSourceResult, error)
+	ModelSourceControl(ctx context.Context, in *ModelSourceControlCall, opts ...grpc.CallOption) (*ModelSourceControlResult, error)
 	RetainDerivedResult(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
 	ReleaseDerivedRetention(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
 	ReleaseDerivedResult(ctx context.Context, in *DerivedResultReleaseCall, opts ...grpc.CallOption) (*DerivedResultReleaseResult, error)
@@ -1311,6 +1313,16 @@ func (c *podHostClient) ModelSourceRelease(ctx context.Context, in *ModelSourceR
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReleaseModelSourceResult)
 	err := c.cc.Invoke(ctx, PodHost_ModelSourceRelease_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) ModelSourceControl(ctx context.Context, in *ModelSourceControlCall, opts ...grpc.CallOption) (*ModelSourceControlResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ModelSourceControlResult)
+	err := c.cc.Invoke(ctx, PodHost_ModelSourceControl_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1488,6 +1500,7 @@ type PodHostServer interface {
 	ModelSourceFile(*ModelSourceFileCall, grpc.ServerStreamingServer[ModelSourceFileStatus]) error
 	ModelSourcePrepare(context.Context, *ModelSourcePrepareCall) (*ModelSourcePrepared, error)
 	ModelSourceRelease(context.Context, *ModelSourceReleaseCall) (*ReleaseModelSourceResult, error)
+	ModelSourceControl(context.Context, *ModelSourceControlCall) (*ModelSourceControlResult, error)
 	RetainDerivedResult(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
 	ReleaseDerivedRetention(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
 	ReleaseDerivedResult(context.Context, *DerivedResultReleaseCall) (*DerivedResultReleaseResult, error)
@@ -1532,6 +1545,9 @@ func (UnimplementedPodHostServer) ModelSourcePrepare(context.Context, *ModelSour
 }
 func (UnimplementedPodHostServer) ModelSourceRelease(context.Context, *ModelSourceReleaseCall) (*ReleaseModelSourceResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ModelSourceRelease not implemented")
+}
+func (UnimplementedPodHostServer) ModelSourceControl(context.Context, *ModelSourceControlCall) (*ModelSourceControlResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method ModelSourceControl not implemented")
 }
 func (UnimplementedPodHostServer) RetainDerivedResult(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method RetainDerivedResult not implemented")
@@ -1699,6 +1715,24 @@ func _PodHost_ModelSourceRelease_Handler(srv interface{}, ctx context.Context, d
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(PodHostServer).ModelSourceRelease(ctx, req.(*ModelSourceReleaseCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_ModelSourceControl_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ModelSourceControlCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).ModelSourceControl(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_ModelSourceControl_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).ModelSourceControl(ctx, req.(*ModelSourceControlCall))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1898,6 +1932,10 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ModelSourceRelease",
 			Handler:    _PodHost_ModelSourceRelease_Handler,
+		},
+		{
+			MethodName: "ModelSourceControl",
+			Handler:    _PodHost_ModelSourceControl_Handler,
 		},
 		{
 			MethodName: "RetainDerivedResult",

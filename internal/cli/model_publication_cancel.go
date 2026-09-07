@@ -5,6 +5,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // AbandonModelTransferPublications reconciles only this request's unfinished
@@ -43,7 +44,7 @@ func (o *modelTransferOwner) AbandonModelTransferPublications(ctx context.Contex
 		if output.FinalID != "" {
 			continue
 		}
-		operation := transferOutputOperation(requestID, output.OutputSlot)
+		operation := records.ModelTransferOutputOperation(requestID, output.OutputSlot)
 		problem := client.AbandonPublication(ctx, ref, operation)
 		if problem == nil || problem.ErrName() == "publication.not_found" {
 			continue

@@ -489,6 +489,7 @@ type Orchestrator struct {
 	// transferWake is a lossy nudge over durable request-attached transfer rows.
 	transferWake         map[string]chan struct{}
 	transferRunning      map[string]bool
+	sourcePauseRunning   map[string]bool
 	transferDispatching  map[string]bool
 	transferCancels      map[string]context.CancelFunc
 	transferProgressSeq  map[string]uint64
@@ -535,6 +536,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		phases:               newPhases(),
 		transferWake:         make(map[string]chan struct{}),
 		transferRunning:      make(map[string]bool),
+		sourcePauseRunning:   make(map[string]bool),
 		transferDispatching:  make(map[string]bool),
 		transferCancels:      make(map[string]context.CancelFunc),
 		transferProgressSeq:  make(map[string]uint64),
@@ -761,7 +763,7 @@ func (c *Orchestrator) drain() {
 				c.park(*req, position, waitFacts{}, e.Message)
 				continue
 			}
-			c.failQueued(id, e)
+			c.failQueued(id, e, "")
 			continue
 		}
 		c.forget(id)
@@ -850,7 +852,7 @@ func (c *Orchestrator) kickQueuedTransferDispatch(req records.Request) {
 			return
 		}
 		if problem.Code != exit.Unavailable && (problem.Code != exit.Conflict || req.RetainWork) {
-			c.failQueued(req.ID, problem)
+			c.failQueued(req.ID, problem, "")
 			go c.drain()
 			return
 		}

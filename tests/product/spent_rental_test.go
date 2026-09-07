@@ -19,8 +19,16 @@ import (
 // A retained completed job pod is still billable but cannot become fresh capacity
 // merely because its last Hub readiness row survived the job's container exit.
 func TestSpentJobRentalIsPreservedWhileUnstartedWorkReplans(t *testing.T) {
-	for _, pinned := range []bool{false, true} {
-		t.Run(fmt.Sprintf("pinned_before_restart_%t", pinned), func(t *testing.T) {
+	for _, mode := range []struct {
+		custody string
+		pinned  bool
+	}{
+		{"managed", false}, {"managed", true},
+		{"manual-terminal", false}, {"manual-terminal", true},
+		{"manual-unpublished", false}, {"manual-unpublished", true},
+	} {
+		custody, pinned := mode.custody, mode.pinned
+		t.Run(fmt.Sprintf("%s/pinned_before_restart_%t", custody, pinned), func(t *testing.T) {
 			root := t.TempDir()
 			port := reservePort(t)
 			origin := fmt.Sprintf("http://127.0.0.1:%d", port)
@@ -33,7 +41,12 @@ func TestSpentJobRentalIsPreservedWhileUnstartedWorkReplans(t *testing.T) {
 			const old = "job-spent-producer"
 			const retained = "rental-spent"
 			const next = "job-unstarted-source"
-			_, _, problem = store.Submit(records.Request{ID: old, IdemKey: old, Kind: "job", Package: "proof/producer", Entrypoint: "convert", Payload: []byte("{}"), BodyDigest: "sha256:" + strings.Repeat("a", 64), Rental: true, Worker: retained})
+			var publication *records.ModelTransferIntent
+			if custody == "manual-unpublished" {
+				publication = &records.ModelTransferIntent{Kind: "model-upload", Destination: "proof/model",
+					Outputs: []records.ModelTransferOutput{{Name: "model"}}}
+			}
+			_, _, problem = store.Submit(records.Request{ID: old, IdemKey: old, Kind: "job", Package: "proof/producer", Entrypoint: "convert", Payload: []byte("{}"), BodyDigest: "sha256:" + strings.Repeat("a", 64), Rental: true, Worker: retained, ModelTransfer: publication})
 			fatal(t, problem)
 			fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "ins-spent", Package: "proof/producer", WorkerID: "remote", Devices: []string{"cpu"}}))
 			digest := "sha256:" + strings.Repeat("b", 64)
@@ -43,10 +56,21 @@ func TestSpentJobRentalIsPreservedWhileUnstartedWorkReplans(t *testing.T) {
 			fatal(t, store.Accepted(old, ordinal, "boot-spent"))
 			_, problem = store.AcceptTerminal(records.Terminal{RequestID: old, Attempt: ordinal, SessionID: "boot-spent", InvocationDigest: digest, TerminalID: "out-spent", TerminalDigest: "sha256:" + strings.Repeat("c", 64), Status: "SUCCEEDED", Cause: "COMPLETED"})
 			fatal(t, problem)
-			fatal(t, store.Closed(old, ordinal))
+			attemptState := "terminal"
+			if custody != "manual-terminal" {
+				fatal(t, store.Closed(old, ordinal))
+				attemptState = "closed"
+			}
+			if publication != nil {
+				fatal(t, store.FailModelTransfer(old, "proof.upload_failed", "retained output"))
+			}
 			fatal(t, store.SettleRequest(old, "failed")) // old publication failure, successful native execution
 			peer.add(retained, "bus")
-			fatal(t, store.RecordRental(records.Rental{ID: retained, MachineName: "bus", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100000, ManagedRequestID: old, State: "ready", Hub: origin, Address: "127.0.0.1:1", CertPath: filepath.Join(root, "retained.pem")}))
+			managedRequest := ""
+			if custody == "managed" {
+				managedRequest = old
+			}
+			fatal(t, store.RecordRental(records.Rental{ID: retained, MachineName: "bus", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100000, ManagedRequestID: managedRequest, State: "ready", Hub: origin, Address: "127.0.0.1:1", CertPath: filepath.Join(root, "retained.pem")}))
 			kept := filepath.Join(root, "retained-output-evidence")
 			raw := []byte("unbanked output custody is not disposable capacity")
 			must(t, os.WriteFile(kept, raw, 0600))
@@ -86,12 +110,12 @@ func TestSpentJobRentalIsPreservedWhileUnstartedWorkReplans(t *testing.T) {
 			oldAttempt := attemptRow(t, store, old, ordinal)
 			oldRequest, problem := store.RequestRow(old)
 			fatal(t, problem)
-			if oldAttempt.State != "closed" || oldAttempt.TerminalStatus != "SUCCEEDED" || oldRequest.State != "failed" {
+			if oldAttempt.State != attemptState || oldAttempt.TerminalStatus != "SUCCEEDED" || oldRequest.State != "failed" {
 				t.Fatal("old producer history changed")
 			}
 			row, problem := store.RentalRow(retained)
 			fatal(t, problem)
-			if row == nil || row.State != "ready" || row.ManagedRequestID != old || row.HourlyRateUSDMicros != 100000 || peer.releases(retained) != 0 {
+			if row == nil || row.State != "ready" || row.ManagedRequestID != managedRequest || row.HourlyRateUSDMicros != 100000 || peer.releases(retained) != 0 {
 				t.Fatal("retained rental was released or removed from billing")
 			}
 			contents, err := os.ReadFile(kept)
@@ -102,6 +126,14 @@ func TestSpentJobRentalIsPreservedWhileUnstartedWorkReplans(t *testing.T) {
 			time.Sleep(200 * time.Millisecond)
 			if creates.Load() != 1 {
 				t.Fatalf("one queued request caused %d creates", creates.Load())
+			}
+			if custody == "manual-terminal" {
+				fatal(t, store.Closed(old, ordinal))
+				blocked, problem := store.RentalHasRetainedJob(retained)
+				fatal(t, problem)
+				if blocked {
+					t.Fatal("acknowledging the old outcome permanently retired a manual rental")
+				}
 			}
 		})
 	}

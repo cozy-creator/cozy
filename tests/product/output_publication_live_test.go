@@ -44,6 +44,7 @@ var publicationPython = flag.String("publication-python", "", "public Runtime 0.
 var publicationCancel = flag.Bool("publication-cancel", false, "prove explicit cancellation of a retained publication after owner restart")
 var publicationRetry = flag.Bool("publication-retry", false, "prove failed bound upload, owner restart and explicit same-receipt retry")
 var publicationHostBridge = flag.String("publication-host-bridge", "", "compiled real Go Host bridge for the full native publication proof")
+var publicationPreheld = flag.Bool("publication-preheld", false, "prove an actually uploaded and verified open closure finalizes without another mover call")
 var publicationModel = flag.String("publication-model", "", "existing task-owned fixture model reused by the live proof; no new repository is created")
 
 // This explicitly armed test runs Creator's real publication owner and mover,
@@ -113,6 +114,7 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 	var manifest *pb.Ref
 	var transfers, sourceRequests int
 	var acknowledgments, releases atomic.Int64
+	var preheld *verifiedOpenPublication
 	var restarting, historyComplete atomic.Bool
 	var nativeWrite sync.Mutex
 	var sendMu sync.Mutex
@@ -218,6 +220,10 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 		rentalWiring(connection, private)(options)
 		options.Cfg.HubURL = *publicationHub
 		options.ModelTransfers = cli.NewModelTransferOwner(options.Cfg, options.Store, options.Log, auth)
+		if *publicationPreheld {
+			preheld = &verifiedOpenPublication{ModelTransferOwner: options.ModelTransfers}
+			options.ModelTransfers = preheld
+		}
 		options.ReleaseManagedRental = func(string) (string, *exit.Error) { releases.Add(1); return "", nil }
 	}
 	o := hostOwner(t, fmt.Sprintf("output-publication-live-%x", nonce), configure)
@@ -329,6 +335,9 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 	if lifecycle && (!retried || acknowledgments.Load() != 1 || releases.Load() != 1) {
 		t.Fatal("retry did not settle exactly one original attempt")
 	}
+	if preheld != nil && (preheld.moves.Load() != 1 || !preheld.verified.Load()) {
+		t.Fatalf("verified open closure reentered the mover: calls=%d verified=%v", preheld.moves.Load(), preheld.verified.Load())
+	}
 	if root == nil || moved < 2 || acquired != 0 || offers != 1 {
 		t.Fatalf("incomplete publication path: manifest=%v transfers=%d source requests=%d", root, moved, acquired)
 	}
@@ -431,4 +440,42 @@ func publicationControlAPI(t *testing.T, o *owner, configure ...func(*api.Option
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = server.Serve(v4) }()
 	return func() { _ = server.Close(); held.Release() }
+}
+
+// Fail only after real native uploads and Hub verification. The next Finalize
+// must use the verified closure without asking the worker to move it again.
+type verifiedOpenPublication struct {
+	orchestrator.ModelTransferOwner
+	moves    atomic.Int64
+	verified atomic.Bool
+}
+
+func (o *verifiedOpenPublication) Finalize(ctx context.Context, request string, mover orchestrator.ModelTransferMover) *exit.Error {
+	return o.ModelTransferOwner.Finalize(ctx, request, func(ctx context.Context, weights records.ModelTransferWeights, mint orchestrator.WeightsGrantMinter) *exit.Error {
+		call := o.moves.Add(1)
+		if problem := mover(ctx, weights, mint); problem != nil {
+			return problem
+		}
+		ids := make([]string, len(weights.Objects))
+		for i, row := range weights.Objects {
+			ids[i] = row.ObjectID
+		}
+		held, problem := mint(ctx, ids)
+		if problem != nil {
+			return problem
+		}
+		if len(held.Decisions) != len(ids) {
+			return exit.New(exit.Conflict, "incomplete real Hub custody proof")
+		}
+		for _, row := range held.Decisions {
+			if !row.Held {
+				return exit.New(exit.Conflict, "native uploads were not verified by Hub")
+			}
+		}
+		o.verified.Store(true)
+		if call == 1 {
+			return exit.Unavailablef("controlled interruption after actual Hub verification before checkpoint finalize")
+		}
+		return nil
+	})
 }

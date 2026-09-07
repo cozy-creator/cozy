@@ -71,7 +71,11 @@ func newExpiringOrigin() *expiringOrigin {
 // standInGrantHub serves the one publication route this walk uses, in the exact wire shape
 // Tensorhub answers with: every grant carries expires_at_unix, and the response carries the
 // hub's own server_time_unix beside them.
-func standInGrantHub(origin *expiringOrigin, mints *atomic.Int64) *httptest.Server {
+func standInGrantHub(origin *expiringOrigin, mints *atomic.Int64, heldIDs ...string) *httptest.Server {
+	heldSet := make(map[string]bool, len(heldIDs))
+	for _, id := range heldIDs {
+		heldSet[id] = true
+	}
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			ObjectIDs []string `json:"object_ids"`
@@ -84,7 +88,12 @@ func standInGrantHub(origin *expiringOrigin, mints *atomic.Int64) *httptest.Serv
 		now := time.Now()
 		expires := now.Add(grantLife).Unix()
 		grants := make([]map[string]any, 0, len(body.ObjectIDs))
+		held := make([]map[string]any, 0, len(body.ObjectIDs))
 		for _, id := range body.ObjectIDs {
+			if heldSet[id] {
+				held = append(held, map[string]any{"object_id": id, "length": int64(1)})
+				continue
+			}
 			grants = append(grants, map[string]any{
 				"object_id": id, "length": int64(1),
 				"url": fmt.Sprintf("%s/o/%s?expires_at=%d&signature=%d",
@@ -95,7 +104,7 @@ func standInGrantHub(origin *expiringOrigin, mints *atomic.Int64) *httptest.Serv
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"server_time_unix": now.Unix(), "held": []any{}, "grants": grants})
+			"server_time_unix": now.Unix(), "held": held, "grants": grants})
 	}))
 }
 
@@ -137,7 +146,66 @@ func hubGrantMinter(hubURL string) orchestrator.WeightsGrantMinter {
 				ObjectID: grant.ObjectID, Length: grant.Length, URL: grant.URL,
 				Headers: grant.Headers, ExpiresAtUnix: uint64(grant.ExpiresAtUnix)})
 		}
+		for _, held := range granted.Held {
+			mint.Decisions = append(mint.Decisions, orchestrator.WeightsTransferDecision{
+				ObjectID: held.ObjectID, Length: held.Length, Held: true})
+		}
 		return mint, nil
+	}
+}
+
+func TestHeldObjectsReuseOneGrantWindowWithoutAnExpiry(t *testing.T) {
+	origin := newExpiringOrigin()
+	defer origin.server.Close()
+	ids := walkObjects()
+	var mints atomic.Int64
+	hubServer := standInGrantHub(origin, &mints, ids...)
+	defer hubServer.Close()
+	window := orchestrator.NewWeightsGrantWindow(hubGrantMinter(hubServer.URL))
+	start := time.Now()
+	for index, id := range ids {
+		decision, problem := window.Spendable(context.Background(), id, ids[index:],
+			start.Add(time.Duration(index)*time.Hour))
+		if problem != nil || !decision.Held || decision.URL != "" || decision.ObjectID != id {
+			t.Fatalf("object %d: decision=%+v problem=%v", index, decision, problem)
+		}
+	}
+	if got := mints.Load(); got != 1 {
+		t.Fatalf("%d already-held objects needed %d grant requests, want one cached window", len(ids), got)
+	}
+	window.Expire()
+	if _, problem := window.Spendable(context.Background(), ids[0], ids, start); problem != nil {
+		t.Fatal(problem)
+	}
+	if got := mints.Load(); got != 2 {
+		t.Fatalf("explicit invalidation made %d grant requests, want 2", got)
+	}
+}
+
+func TestHeldDecisionSurvivesExpiredURLInSameWindow(t *testing.T) {
+	origin := newExpiringOrigin()
+	defer origin.server.Close()
+	ids := walkObjects()[:3]
+	var mints atomic.Int64
+	hubServer := standInGrantHub(origin, &mints, ids[0], ids[1])
+	defer hubServer.Close()
+	window := orchestrator.NewWeightsGrantWindow(hubGrantMinter(hubServer.URL))
+	start := time.Now()
+	if _, problem := window.Spendable(context.Background(), ids[0], ids, start); problem != nil {
+		t.Fatal(problem)
+	}
+	later := start.Add(grantLife)
+	if decision, problem := window.Spendable(context.Background(), ids[1], ids[1:], later); problem != nil || !decision.Held || mints.Load() != 1 {
+		t.Fatalf("URL expiry invalidated held custody: decision=%+v problem=%v mints=%d",
+			decision, problem, mints.Load())
+	}
+	decision, problem := window.Spendable(context.Background(), ids[2], ids[2:], later)
+	if problem != nil || decision.Held || mints.Load() != 2 {
+		t.Fatalf("expired URL was not refreshed: decision=%+v problem=%v mints=%d",
+			decision, problem, mints.Load())
+	}
+	if code := spendGrant(t, decision); code != http.StatusOK {
+		t.Fatalf("fresh upload grant was refused: %d", code)
 	}
 }
 

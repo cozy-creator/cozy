@@ -235,6 +235,11 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 	if !transfer.HasAcquisition() {
 		return req, nil
 	}
+	if w.spec.Connection != nil {
+		if problem := c.controlRetainedSource(context.Background(), req, false); problem != nil {
+			return req, problem
+		}
+	}
 	c.mu.Lock()
 	bootID := w.bootID
 	c.mu.Unlock()
@@ -270,6 +275,10 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 		}
 	}
 	if problem != nil {
+		current, readProblem := c.opt.Store.RequestRow(req.ID)
+		if readProblem == nil && current != nil && current.RetainWork && current.State == "pausing" {
+			return req, exit.Unavailablef("source preparation paused with retained work")
+		}
 		if permanentTransferFailure(problem) {
 			_ = c.opt.Store.FailModelTransfer(req.ID, problem.ErrName(), problem.Message)
 		}
@@ -389,6 +398,9 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		}
 		if request.State == "canceled" || request.State == "canceling" || request.State == "releasing" {
 			return nil, exit.New(exit.Canceled, "model transfer %s was canceled", req.ID)
+		}
+		if request.State == "pausing" || request.State == "paused" {
+			return nil, exit.New(exit.Canceled, "source preparation is paused")
 		}
 		session, problem := c.rentalControl(request.Worker)
 		if problem != nil {
@@ -676,6 +688,17 @@ func (c *Orchestrator) kickModelTransferFinalizer(requestID string, attempt int6
 		if readProblem != nil || retainedAttempt == nil {
 			return
 		}
+		// Publication success belongs to the request; worker ACK and cleanup remain
+		// durable attempt obligations even when its control session cannot respond.
+		transfer, transferProblem := c.opt.Store.ModelTransferOf(requestID)
+		if transferProblem == nil && transfer != nil && transfer.State == "completed" &&
+			retainedAttempt.TerminalStatus == "SUCCEEDED" {
+			if state, problem := c.opt.Store.SettleModelTransferRequest(requestID, attempt); problem != nil {
+				c.logf("model transfer %s publication settlement remains pending: %s", requestID, problem.Message)
+			} else if state == "succeeded" {
+				c.signalClosed(requestWaitKey(requestID), nil)
+			}
+		}
 		c.mu.Lock()
 		var session *session
 		if worker := c.workers[retainedAttempt.InstanceID]; worker != nil && worker.snapshotAcknowledged {
@@ -770,7 +793,8 @@ func (c *Orchestrator) ResumeModelTransfers() *exit.Error {
 		if readProblem != nil || attempt == nil {
 			continue
 		}
-		if c.retainedPublication(*request, *attempt) {
+		if c.retainedPublication(*request, *attempt) ||
+			(attempt.State == "terminal" && attempt.TerminalStatus == "SUCCEEDED" && transfer.State == "completed") {
 			if transfer.State == "failed" {
 				if request.Worker != "" {
 					c.selectOrStart(*request)

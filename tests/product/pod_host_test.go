@@ -61,6 +61,7 @@ type fakePod struct {
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
 	sourceRuntime pb.RuntimePreparationClient
 	sourceRelease func(*pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error)
+	sourceControl func(*pb.ModelSourceControlCall) (*pb.ModelSourceControlResult, error)
 	weightsReady  func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
 	protocolInfo  func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
 	pb.UnimplementedWorkerControlServer
@@ -80,6 +81,8 @@ type fakePod struct {
 	serve bool
 	// jobReady advertises the independent job seat after accepting a JobDirective.
 	jobReady bool
+	// snapshotHeld replays actual retained attempt identities during reconnect tests.
+	snapshotHeld []*pb.HeldAttempt
 	// localJobOnly supplies a prepared interface without any serving entrypoints.
 	localJobOnly bool
 	// onJobReady can delay and sequence the independent peer's readiness facts.
@@ -282,7 +285,8 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			}
 			body, digest, err := canonical.Identity(&pb.WorkerSnapshotBody{
 				WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE, AdmissionEpoch: 1,
-				AdmissionState: pb.AdmissionState_ADMISSION_STATE_CLOSED, AvailableAttemptSlots: 2})
+				AdmissionState: pb.AdmissionState_ADMISSION_STATE_CLOSED, AvailableAttemptSlots: 2,
+				HeldAttempts: p.snapshotHeld})
 			if err != nil {
 				return err
 			}
