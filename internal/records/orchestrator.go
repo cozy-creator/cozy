@@ -1170,6 +1170,15 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 			return Request{}, false, problem
 		}
 	}
+	if r.RetainWork && r.Worker != "" {
+		var releasing bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM rentals WHERE id=? AND state IN ('release_requested','released','failed'))`, r.Worker).Scan(&releasing); err != nil {
+			return Request{}, false, exit.Internalf("cannot inspect request rental admission: %s", err)
+		}
+		if releasing {
+			return Request{}, false, exit.Named(exit.Conflict, "request.rental_unavailable", "the selected rental is being released or has ended")
+		}
+	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
 		plan_id,package_release,local_package_digest,
 		local_package_uploaded_boot_id,environment_digest,

@@ -722,10 +722,12 @@ func (c *Orchestrator) finishModelTransferRequest(requestID string, attempt int6
 	if readProblem != nil || retainedAttempt == nil || c.retainedPublication(*request, *retainedAttempt) {
 		return
 	}
-	if problem := c.releaseManagedNow(*request); problem != nil {
-		c.logf("model transfer %s provider cleanup remains pending: %s", requestID, problem.Message)
-		time.AfterFunc(2*time.Second, func() { c.finishModelTransferRequest(requestID, attempt) })
-		return
+	if !request.RetainsLocalOutputs() {
+		if problem := c.releaseManagedNow(*request); problem != nil {
+			c.logf("model transfer %s provider cleanup remains pending: %s", requestID, problem.Message)
+			time.AfterFunc(2*time.Second, func() { c.finishModelTransferRequest(requestID, attempt) })
+			return
+		}
 	}
 	if _, problem := c.opt.Store.SettleModelTransferRequest(requestID, attempt); problem != nil {
 		c.logf("model transfer %s terminal settlement remains pending: %s", requestID, problem.Message)

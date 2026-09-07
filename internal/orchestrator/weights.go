@@ -363,7 +363,8 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 		OutcomeId: attempt.TerminalID, OutcomeDigest: outcomeDigest,
 		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch,
 		WorkerBootId: s.bootID,
-		RetainWork:   req.RetainWork && (records.RetainedState(req.State) || req.State == "requeue_pending"),
+		RetainWork: req.RetainWork && (records.RetainedState(req.State) || req.State == "requeue_pending" ||
+			(req.RetainsLocalOutputs() && req.State != "canceling" && req.State != "releasing" && req.State != "canceled")),
 	}
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_OutcomeAck{OutcomeAck: ack}}) {
 		c.logf("OutcomeAck %s#%d was not queued: the closed stream owes a replay", requestID, ordinal)

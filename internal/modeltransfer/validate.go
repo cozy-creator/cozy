@@ -45,6 +45,9 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 	if intent == nil {
 		return nil
 	}
+	if intent.Destination == "" && (!spec.RetainWork || spec.Kind != "job" || spec.Package == "cozy/platform") {
+		return exit.New(exit.Validation, "unpublished source results require a retained ordinary job")
+	}
 	if !intent.HasAcquisition() && (spec.Rental || spec.RentalRequired) && spec.Worker == "" {
 		// The existing rental workload declaration carries these exact model
 		// identities to the Hub's closure union measurement, for jobs as well

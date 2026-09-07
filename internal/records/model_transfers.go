@@ -147,8 +147,7 @@ func NormalizeModelTransferIntent(intent *ModelTransferIntent) *exit.Error {
 	if intent == nil {
 		return nil
 	}
-	if (intent.Kind != "model-upload" && intent.Kind != "model-download") ||
-		intent.Destination == "" || len(intent.Outputs) == 0 {
+	if (intent.Kind != "model-upload" && intent.Kind != "model-download") || len(intent.Outputs) == 0 {
 		return exit.New(exit.Validation, "model transfer intent is incomplete")
 	}
 	if intent.HasAcquisition() {
@@ -163,7 +162,11 @@ func NormalizeModelTransferIntent(intent *ModelTransferIntent) *exit.Error {
 		return exit.New(exit.Validation, "model transfer local_only does not match its source")
 	}
 	parts := strings.Split(intent.Destination, "/")
-	if intent.Kind == "model-upload" {
+	if intent.Destination == "" {
+		if intent.Kind != "model-upload" || !intent.HasAcquisition() {
+			return exit.New(exit.Validation, "an unpublished model result requires a source acquisition")
+		}
+	} else if intent.Kind == "model-upload" {
 		if len(parts) != 2 || parts[0] == "local" || !modelTransferSlug.MatchString(parts[0]) ||
 			!modelTransferSlug.MatchString(parts[1]) {
 			return exit.New(exit.Validation, "model upload destination is not one org/model")

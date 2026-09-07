@@ -22,6 +22,9 @@ func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 		SELECT CASE WHEN kind='job' THEN 'job' ELSE 'invocation' END,id,state FROM requests
 		 WHERE state IN (` + activeRequestStates + `)
 		UNION ALL
+		SELECT 'job',r.id,r.state FROM requests r LEFT JOIN request_model_transfers t ON t.request_id=r.id
+		 WHERE r.state='succeeded' AND r.retain_work=1 AND r.weights_outputs!='[]' AND COALESCE(json_extract(t.intent,'$.destination'),'')=''
+		UNION ALL
 		SELECT 'attempt',request_id||'#'||attempt,state FROM attempts
 		 WHERE state IN (` + openAttemptStates + `)
 		UNION ALL
