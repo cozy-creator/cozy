@@ -2325,6 +2325,7 @@ type WorkspaceImportBegin struct {
 	Claim         *Claim                 `protobuf:"bytes,1,opt,name=claim,proto3" json:"claim,omitempty"`
 	MigrationId   string                 `protobuf:"bytes,2,opt,name=migration_id,json=migrationId,proto3" json:"migration_id,omitempty"` // sha256 of kind NUL canonical-record LF, in record order
 	RecordCount   uint64                 `protobuf:"varint,3,opt,name=record_count,json=recordCount,proto3" json:"record_count,omitempty"`
+	SourceSchema  uint32                 `protobuf:"varint,5,opt,name=source_schema,json=sourceSchema,proto3" json:"source_schema,omitempty"` // 19: the retired Host custody schema, not a caller-selected format
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2376,6 +2377,13 @@ func (x *WorkspaceImportBegin) GetMigrationId() string {
 func (x *WorkspaceImportBegin) GetRecordCount() uint64 {
 	if x != nil {
 		return x.RecordCount
+	}
+	return 0
+}
+
+func (x *WorkspaceImportBegin) GetSourceSchema() uint32 {
+	if x != nil {
+		return x.SourceSchema
 	}
 	return 0
 }
@@ -7575,8 +7583,8 @@ type WorkerFrame_WeightsCheckpoint struct {
 }
 
 type WorkerFrame_WeightsTransaction struct {
-	// Host -> authenticated current RecordOwner stream. The same row as its snapshot:
-	// exposes the assigned writer epoch before Ready, without forwarding declaration bytes.
+	// Runtime -> Host -> authenticated current RecordOwner. Runtime's committed
+	// writer epoch/readiness/checkpoint, also projected into the Host snapshot.
 	// Observation only; every subsequent operation still validates the current Claim/fence.
 	WeightsTransaction *WeightsTransactionStatus `protobuf:"bytes,27,opt,name=weights_transaction,json=weightsTransaction,proto3,oneof"`
 }
@@ -12385,10 +12393,10 @@ func (x *WeightsObjectSource) GetSourceRef() string {
 	return ""
 }
 
-// Runtime asks its authenticated host to commit semantic intent before the first TensorFS write.
-// requested_writer_epoch == 0 means first open or replacement-child rejoin. Once ACKed, an
-// identical retry from the same child echoes the epoch and receives the same ACK without
-// fencing itself. The attempt ordinal is routing only and does not enter transaction identity.
+// At minor 41 Runtime commits semantic intent in its per-Store workspace before
+// native writes, then sends this observation. requested_writer_epoch is the positive
+// Runtime-assigned epoch; Host must project it exactly and never allocate another.
+// The attempt ordinal is routing only and does not enter transaction identity.
 // The TensorFS declaration is carried directly: it is not wrapped in a second Worker Protocol
 // document. Its digest and exact bytes are the durable conflict/replay fence.
 type WeightsIntentFrame struct {
@@ -12518,10 +12526,9 @@ func (x *WeightsIntentFrame) GetWeightsTransactionId() string {
 	return ""
 }
 
-// One ACK type covers intent and receipt durability. The supervisor injects it into Runtime only
-// after its one SQLite transaction commits. A replacement child receives the same transaction id
-// and a newly fenced writer epoch; if a receipt already exists it is replayed here and no
-// TensorFS write occurs. REFUSED carries no usable epoch or transaction authority.
+// Runtime's workspace readiness reply and internal intent/receipt observation result.
+// At minor 41 the Host only forwards Runtime-authored readiness replies; it never
+// injects this message to authorize native writes. REFUSED grants no writer authority.
 type WeightsHostAck struct {
 	state                     protoimpl.MessageState `protogen:"open.v1"`
 	RecordOwnerEpoch          uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
@@ -18392,11 +18399,12 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"checkpoint\x18\x03 \x01(\v2&.cozy.worker.v1.WeightsCheckpointFrameH\x00R\n" +
 	"checkpointB\a\n" +
 	"\x05event\"\x15\n" +
-	"\x13ProtocolInfoRequest\"\x89\x01\n" +
+	"\x13ProtocolInfoRequest\"\xae\x01\n" +
 	"\x14WorkspaceImportBegin\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12!\n" +
 	"\fmigration_id\x18\x02 \x01(\tR\vmigrationId\x12!\n" +
-	"\frecord_count\x18\x03 \x01(\x04R\vrecordCount\"q\n" +
+	"\frecord_count\x18\x03 \x01(\x04R\vrecordCount\x12#\n" +
+	"\rsource_schema\x18\x05 \x01(\rR\fsourceSchema\"q\n" +
 	"\x15WorkspaceImportRecord\x12\x14\n" +
 	"\x05index\x18\x01 \x01(\x04R\x05index\x12\x12\n" +
 	"\x04kind\x18\x02 \x01(\tR\x04kind\x12\x16\n" +

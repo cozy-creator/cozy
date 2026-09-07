@@ -64,6 +64,25 @@ func TestPrivateChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		}
 		return out
 	}
+	restartDaemon := func() {
+		t.Helper()
+		lock, err := os.ReadFile(filepath.Join(root, "daemon.lock"))
+		must(t, err)
+		pid := 0
+		for _, line := range strings.Split(string(lock), "\n") {
+			if value, ok := strings.CutPrefix(line, "pid="); ok {
+				pid, err = strconv.Atoi(value)
+				must(t, err)
+			}
+		}
+		if pid <= 0 {
+			t.Fatal("the test daemon has no process identity")
+		}
+		process, err := os.FindProcess(pid)
+		must(t, err)
+		must(t, process.Kill())
+		run("up") // normal startup reaps prior worker processes and reopens the journal
+	}
 	var store *records.Store
 	var originalA, originalB, latestB records.Request
 	checkTensor := func(producer records.Request, value int) {
@@ -140,7 +159,7 @@ func TestPrivateChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 			t.Fatalf("unchanged B did not use the shared workspace result: %+v", children[1])
 		}
 		run("run", "cancel", strconv.Itoa(1+3*(cycle-1)))
-		run("down") // the next fresh run must reopen the same workspace journal
+		restartDaemon()
 		checkTensor(originalA, 7)
 		value := 15
 		if cycle == 1 {

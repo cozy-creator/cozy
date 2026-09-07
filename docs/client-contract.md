@@ -366,16 +366,19 @@ while allowing execution. Exact same-parent call replay continues the original r
 child. Known egress/secret capabilities and non-reusable child effects cannot enter a
 reusable operation. This is an author contract, not a proof of arbitrary Python purity.
 
-The Host records cache results from verified successful terminals before outcome ACKs.
+The Runtime workspace records cache results from verified successful terminals before outcome ACKs.
 Lookup uses the computation key and an already-recorded consumer request; a HIT acquires
 independent native holds before returning. Creator persists a pending lookup obligation
 before the RPC, so pause/cancel and owner restart reconcile even a lost response. Once the
 request owns a result, resuming it does not depend on the cache entry still existing.
-Local scalar execution currently computes normally; no second local cache authority is
-inferred from request history.
+Local and rented execution address this same journal through RuntimePreparation or the
+authenticated Host. Request history never becomes a second cache authority. Declined
+optional cache admission leaves the successful result unchanged; an unresolved journal
+RPC remains an obligation until it can be reconciled.
 
-`cozy rental prune <rental>` removes unused cache roots and attempts native garbage
-collection on that same Host. Request-owned results and unresolved lookup recipients are
+`cozy cache prune` or `cozy rental prune <rental>` removes unused cache roots and attempts
+native garbage collection in the selected workspace. Local pruning can start an empty
+control Runtime when no package worker remains. Request-owned results and unresolved lookup recipients are
 preserved. A busy Store reports deferred byte collection; repeating prune can collect
 those bytes even when no further cache entries are removed. Cache roots do not count as
 unfinished rental work, and pruning neither ends the rental nor deletes run history.

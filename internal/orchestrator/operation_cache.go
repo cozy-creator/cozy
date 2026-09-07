@@ -24,10 +24,10 @@ func operationCacheProblem(err error) *exit.Error {
 	}
 }
 
-// Cache completion precedes OutcomeAck: the Host still has the actual terminal
+// Cache completion precedes OutcomeAck: the workspace still has the actual terminal
 // to verify, including scalar results whose ordinary ACK releases that journal.
 func (c *Orchestrator) recordOperationResult(s *session, request records.Request, attempt records.Attempt) *exit.Error {
-	if s.host == nil || !request.ChildReusable || request.ParentRequestID == "" || request.ReusedFrom != "" || attempt.TerminalStatus != "SUCCEEDED" || request.State == "canceling" || request.State == "canceled" || request.State == "releasing" {
+	if !request.ChildReusable || request.ParentRequestID == "" || request.ReusedFrom != "" || attempt.TerminalStatus != "SUCCEEDED" || request.State == "canceling" || request.State == "canceled" || request.State == "releasing" {
 		return nil
 	}
 	key, problem := records.OperationKey(request)
@@ -50,7 +50,7 @@ func (c *Orchestrator) recordOperationResult(s *session, request records.Request
 		return problem
 	}
 	for _, artifact := range artifacts {
-		// The initial Host index adopts outputs this operation actually wrote.
+		// The workspace index adopts outputs this operation actually wrote.
 		// Returning a borrowed handle still executes and retains normally.
 		if artifact.ProducerRequestID != request.ID {
 			return nil
@@ -84,7 +84,7 @@ func (c *Orchestrator) lookupOperation(request records.Request) (bool, *exit.Err
 }
 
 func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOnly bool) (bool, *exit.Error) {
-	if !request.ChildReusable || request.ParentRequestID == "" || request.Worker == "" || request.Ordinal != 0 {
+	if !request.ChildReusable || request.ParentRequestID == "" || request.Ordinal != 0 {
 		return false, nil
 	}
 	c.mu.Lock()
@@ -128,7 +128,7 @@ func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOn
 			return false, problem
 		}
 	}
-	if pendingOnly {
+	if pendingOnly && request.Worker != "" {
 		rental, problem := c.opt.Store.RentalRow(request.Worker)
 		if problem != nil {
 			return false, problem
@@ -137,13 +137,9 @@ func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOn
 			return false, c.opt.Store.CompleteOperationMiss(request.ID, key)
 		}
 	}
-	s, problem := c.rentalControl(request.Worker)
+	s, problem := c.workspaceControl(request.Worker)
 	if problem != nil {
-		_, _, _, _ = c.EnsureRental(request.Worker)
 		return false, problem
-	}
-	if s.host == nil {
-		return false, c.opt.Store.CompleteOperationMiss(request.ID, key)
 	}
 	keyBytes, _ := canonical.Raw(key)
 	workspace, problem := s.operationWorkspace()

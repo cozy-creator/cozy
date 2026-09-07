@@ -8,7 +8,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-// This is an RPC obligation, not a computation cache. The Host alone owns hits.
+// This is an RPC obligation, not a computation cache. Runtime's workspace owns hits.
 const operationLookupsDDL = `CREATE TABLE IF NOT EXISTS request_operation_lookups (
  request_id TEXT PRIMARY KEY REFERENCES requests(id),
  computation_digest TEXT NOT NULL,

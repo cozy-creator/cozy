@@ -7,7 +7,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-// CachedOperation is an authenticated Host lookup observation. Its original
+// CachedOperation is an authenticated Runtime workspace lookup observation. Its original
 // terminal stays historical; only the new request's result ownership is added.
 type CachedOperation struct {
 	Key, SourceRequestID, InvocationDigest, OutcomeID, OutcomeDigest string
@@ -30,7 +30,7 @@ func (s *Store) AdoptCachedOperation(id string, cached CachedOperation) *exit.Er
 	if problem != nil {
 		return problem
 	}
-	if key != cached.Key || !request.ChildReusable || request.ParentRequestID == "" || request.Worker == "" || request.Ordinal != 0 {
+	if key != cached.Key || !request.ChildReusable || request.ParentRequestID == "" || request.Ordinal != 0 {
 		return exit.Named(exit.Conflict, "operation.consumer_changed", "cached computation does not match this unoffered private child")
 	}
 	if request.State == "succeeded" && request.ReusedFrom == cached.SourceRequestID {

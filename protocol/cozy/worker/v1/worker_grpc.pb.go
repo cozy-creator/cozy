@@ -1359,10 +1359,9 @@ const (
 // on the external listener. It carries the supervisor<->Runtime privates that were
 // direction-annotated WorkerControl frames before minor 21.
 type RuntimeWeightsClient interface {
-	// Runtime -> host intents and receipts, host -> Runtime acks, on ONE stream the supervisor
-	// opens per accepted control session. The host commits its ledger before each ack, and
-	// forwards a recorded receipt to the RecordOwner on WorkerControl BEFORE acking it, so the
-	// owner sees the receipt ahead of the attempt outcome the Runtime can only send after.
+	// Retired at minor 41; implementations refuse this legacy custody stream. Runtime
+	// commits its common workspace journal and sends custody observations and outcomes
+	// on the same ordered WorkerControl stream. The Host never grants native authority.
 	Exchange(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[WeightsHostAck, WeightsHostEvent], error)
 	// One validated upload grant in, one terminal answer out. Runtime streams the bytes it holds.
 	Upload(ctx context.Context, in *WeightsUploadRequest, opts ...grpc.CallOption) (*WeightsUploadResult, error)
@@ -1408,10 +1407,9 @@ func (c *runtimeWeightsClient) Upload(ctx context.Context, in *WeightsUploadRequ
 // on the external listener. It carries the supervisor<->Runtime privates that were
 // direction-annotated WorkerControl frames before minor 21.
 type RuntimeWeightsServer interface {
-	// Runtime -> host intents and receipts, host -> Runtime acks, on ONE stream the supervisor
-	// opens per accepted control session. The host commits its ledger before each ack, and
-	// forwards a recorded receipt to the RecordOwner on WorkerControl BEFORE acking it, so the
-	// owner sees the receipt ahead of the attempt outcome the Runtime can only send after.
+	// Retired at minor 41; implementations refuse this legacy custody stream. Runtime
+	// commits its common workspace journal and sends custody observations and outcomes
+	// on the same ordered WorkerControl stream. The Host never grants native authority.
 	Exchange(grpc.BidiStreamingServer[WeightsHostAck, WeightsHostEvent]) error
 	// One validated upload grant in, one terminal answer out. Runtime streams the bytes it holds.
 	Upload(context.Context, *WeightsUploadRequest) (*WeightsUploadResult, error)
