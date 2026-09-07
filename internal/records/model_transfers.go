@@ -518,10 +518,27 @@ func (s *Store) RecordModelTransferWeights(row ModelTransferWeights) *exit.Error
 func mustJSON(value any) []byte { data, _ := json.Marshal(value); return data }
 
 func (s *Store) ModelTransferWeights(requestID string, attempt int64, slot string) (*ModelTransferWeights, *exit.Error) {
+	row, problem := s.modelTransferWeightsMetadata(requestID, attempt, slot, true)
+	if problem != nil || row == nil {
+		return row, problem
+	}
+	row.Objects, problem = s.ModelTransferObjects(requestID, attempt, slot)
+	if problem != nil {
+		return nil, problem
+	}
+	return row, nil
+}
+
+// ModelTransferWeightsMetadata omits the receipt and object roster from output identity reads.
+func (s *Store) ModelTransferWeightsMetadata(requestID string, attempt int64, slot string) (*ModelTransferWeights, *exit.Error) {
+	return s.modelTransferWeightsMetadata(requestID, attempt, slot, false)
+}
+
+func (s *Store) modelTransferWeightsMetadata(requestID string, attempt int64, slot string, includeReceipt bool) (*ModelTransferWeights, *exit.Error) {
 	var row ModelTransferWeights
 	err := s.db.QueryRow(`SELECT request_id,output_slot,manifest_id,manifest_length,
-		attempt,invocation_digest,transaction_id,receipt_digest,receipt,final_id
-		FROM request_model_transfer_outputs WHERE request_id=? AND attempt=? AND output_slot=?`, requestID, attempt, slot).
+		attempt,invocation_digest,transaction_id,receipt_digest,CASE WHEN ? THEN receipt ELSE NULL END,final_id
+		FROM request_model_transfer_outputs WHERE request_id=? AND attempt=? AND output_slot=?`, includeReceipt, requestID, attempt, slot).
 		Scan(&row.RequestID, &row.OutputSlot, &row.ManifestID, &row.ManifestLength,
 			&row.Attempt, &row.InvocationDigest, &row.TransactionID,
 			&row.ReceiptDigest, &row.Receipt, &row.FinalID)
@@ -531,11 +548,6 @@ func (s *Store) ModelTransferWeights(requestID string, attempt int64, slot strin
 	if err != nil {
 		return nil, exit.Internalf("cannot decode model transfer output %s/%s", requestID, slot)
 	}
-	objects, problem := s.ModelTransferObjects(requestID, attempt, slot)
-	if problem != nil {
-		return nil, problem
-	}
-	row.Objects = objects
 	return &row, nil
 }
 
@@ -592,10 +604,11 @@ func (s *Store) ModelTransferObjects(requestID string, attempt int64,
 	return out, nil
 }
 
-func (s *Store) RecordModelTransferObjectStatus(row ModelTransferObject) *exit.Error {
+// RecordModelTransferObjectStatus reports a state change only after it commits.
+func (s *Store) RecordModelTransferObjectStatus(row ModelTransferObject) (bool, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return exit.Internalf("cannot begin model transfer object status: %s", err)
+		return false, exit.Internalf("cannot begin model transfer object status: %s", err)
 	}
 	defer tx.Rollback()
 	var held ModelTransferObject
@@ -607,17 +620,17 @@ func (s *Store) RecordModelTransferObjectStatus(row ModelTransferObject) *exit.E
 		&held.SourceRef, &held.OperationID, &held.GrantRevision, &held.UpdateSequence,
 		&held.State, &held.Transferred, &held.SafeCode, &held.SafeDetail)
 	if err != nil {
-		return exit.Internalf("cannot read model transfer object status: %s", err)
+		return false, exit.Internalf("cannot read model transfer object status: %s", err)
 	}
 	replay := held.Length == row.Length && held.OperationID == row.OperationID &&
 		held.GrantRevision == row.GrantRevision && held.UpdateSequence == row.UpdateSequence &&
 		held.State == row.State && held.Transferred == row.Transferred && held.SafeCode == row.SafeCode &&
 		held.SafeDetail == row.SafeDetail
 	if replay {
-		return nil
+		return false, nil
 	}
 	if row.Length != held.Length {
-		return exit.Named(exit.Conflict, "model_transfer.object_status_changed",
+		return false, exit.Named(exit.Conflict, "model_transfer.object_status_changed",
 			"model transfer object %s changed identity", row.ObjectID)
 	}
 	advanced := row.GrantRevision > held.GrantRevision ||
@@ -632,7 +645,7 @@ func (s *Store) RecordModelTransferObjectStatus(row ModelTransferObject) *exit.E
 		// an object this owner already has proof of — uploaded, already present, or held
 		// by a concurrent publisher — outranks it.
 		if row.State != "failed" || adopted || held.State == "failed" {
-			return exit.Named(exit.Conflict, "model_transfer.object_status_superseded",
+			return false, exit.Named(exit.Conflict, "model_transfer.object_status_superseded",
 				"model transfer object %s status is behind the row it answers", row.ObjectID)
 		}
 		row.GrantRevision, row.UpdateSequence = held.GrantRevision, held.UpdateSequence
@@ -646,16 +659,16 @@ func (s *Store) RecordModelTransferObjectStatus(row ModelTransferObject) *exit.E
 		row.RequestID, row.Attempt, row.OutputSlot, row.ObjectID, held.GrantRevision,
 		held.UpdateSequence)
 	if err != nil {
-		return exit.Internalf("cannot record model transfer object status: %s", err)
+		return false, exit.Internalf("cannot record model transfer object status: %s", err)
 	}
 	if changed, _ := result.RowsAffected(); changed != 1 {
-		return exit.Named(exit.Conflict, "model_transfer.object_status_changed",
+		return false, exit.Named(exit.Conflict, "model_transfer.object_status_changed",
 			"model transfer object %s changed concurrently", row.ObjectID)
 	}
 	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit model transfer object status: %s", err)
+		return false, exit.Internalf("cannot commit model transfer object status: %s", err)
 	}
-	return nil
+	return row.State != held.State, nil
 }
 
 func objectStateRank(state string) int {
