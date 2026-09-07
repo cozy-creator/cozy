@@ -67,6 +67,16 @@ class RefuseInput(msgspec.Struct, forbid_unknown_fields=True):
     why: str = "cl-013 asked for it"
 
 
+class EchoOutput(msgspec.Struct):
+    text: str
+
+
+@app.entrypoint
+def echo(payload: RefuseInput) -> EchoOutput:
+    """Scalar-only result: no file output or output directory."""
+    return EchoOutput(payload.why)
+
+
 class VideoTransportInput(msgspec.Struct, forbid_unknown_fields=True):
     prompt: str
     first_frame: Annotated[ImageAsset, AssetBound(max_bytes=8 << 20, max_decoded_bytes=16 << 20)]
