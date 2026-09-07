@@ -35,6 +35,7 @@ import (
 // It issues no byte verdicts; actual Runtime restart joins the separate wrapper proof.
 type idleHoldPeer struct {
 	pb.UnimplementedWorkerControlServer
+	pb.UnimplementedPodHostServer
 	key                  ed25519.PublicKey
 	pin                  []byte
 	epoch                uint64
@@ -43,6 +44,10 @@ type idleHoldPeer struct {
 	deny                 codes.Code
 	claims               atomic.Int64
 	otherFrames          atomic.Int64
+}
+
+func (*idleHoldPeer) ProtocolInfo(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+	return &pb.ProtocolInfoResult{WireMinor: pb.WireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor}, nil
 }
 
 func (p *idleHoldPeer) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, pb.WorkerFrame]) error {
@@ -115,6 +120,7 @@ func serveIdleHoldPeer(t *testing.T, peer *idleHoldPeer, cert, address string) (
 	must(t, err)
 	server := grpc.NewServer(grpc.Creds(credentials.NewServerTLSFromCert(&pair)))
 	pb.RegisterWorkerControlServer(server, peer)
+	pb.RegisterPodHostServer(server, peer)
 	go func() { _ = server.Serve(listener) }()
 	return listener.Addr().String(), server.Stop
 }

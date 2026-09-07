@@ -150,9 +150,10 @@ type ModelTransferOwner interface {
 	Finalize(context.Context, string, ModelTransferMover) *exit.Error
 	AbandonModelTransferPublications(context.Context, string) *exit.Error
 	PassThrough(context.Context, string, records.ModelTransferIntent) *exit.Error
-	SyncSourceCheckpoints(context.Context, string, SourceCheckpointHost) *exit.Error
-	RestoreSourceCheckpoints(context.Context, string, SourceCheckpointHost) *exit.Error
-	ReleaseSourceCheckpoints(context.Context, string) *exit.Error
+	SyncCheckpoints(context.Context, string, CheckpointHost) *exit.Error
+	RestoreWeightsCheckpoint(context.Context, string, CheckpointHost, *pb.WeightsCheckpointSubject) (*pb.CheckpointRef, *exit.Error)
+	RestoreSourceCheckpoints(context.Context, string, CheckpointHost) *exit.Error
+	ReleaseCheckpoints(context.Context, string) *exit.Error
 }
 
 type ModelTransferMover func(context.Context, records.ModelTransferWeights,
@@ -493,7 +494,7 @@ type Orchestrator struct {
 	transferProgressSeq  map[string]uint64
 	sourcePrepareReplies map[string]uint64
 	sourcePrepareBlocked map[string]sourcePreparationBackoff
-	sourceUploads        map[string]*sourceCheckpointUpload
+	checkpointUploads    map[string]*checkpointUpload
 	// localTransfers is command-scoped, lossy progress over Creator's durable request
 	// row and sealed revision. A restart simply replays exact chunks from those authorities.
 	localTransfers map[string]*localTransfer
@@ -538,7 +539,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		transferProgressSeq:  make(map[string]uint64),
 		sourcePrepareReplies: make(map[string]uint64),
 		sourcePrepareBlocked: make(map[string]sourcePreparationBackoff),
-		sourceUploads:        make(map[string]*sourceCheckpointUpload),
+		checkpointUploads:    make(map[string]*checkpointUpload),
 		localTransfers:       make(map[string]*localTransfer),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a
@@ -623,7 +624,7 @@ func (c *Orchestrator) emit(requestID, eventType string, attempt uint64, payload
 	}
 }
 
-// nextRevision mints the Directive revision. The hub owns it; it is monotonic, and a
+// nextRevision mints the Directive revision. The record owner owns it; it is monotonic, and a
 // changed body always carries a new one.
 func (c *Orchestrator) nextRevision() uint64 {
 	c.mu.Lock()
@@ -1212,7 +1213,7 @@ func (c *Orchestrator) CancelQueued(requestID, actor string) *exit.Error {
 	if row.ModelTransfer != nil {
 		c.forgetTransferProgress(requestID)
 		c.signalTransfer(requestID)
-		c.kickSourceCheckpointUpload(requestID)
+		c.kickCheckpointUpload(requestID)
 	} else {
 		c.frames.forget(requestID)
 	}

@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS request_model_transfer_objects (
   PRIMARY KEY(request_id,attempt,output_slot,object_id),
   FOREIGN KEY(request_id,attempt,output_slot)
     REFERENCES request_model_transfer_outputs(request_id,attempt,output_slot)
-)`, modelSourceCheckpointSchema, modelSourcePublicationSchema}
+)`, modelCheckpointSchema, modelCheckpointPublicationSchema}
 
 type ModelTransferSourceFile struct {
 	Member string `json:"member"`

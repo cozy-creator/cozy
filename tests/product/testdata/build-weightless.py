@@ -30,6 +30,7 @@ def main() -> int:
     parser.add_argument("--runtime-sha", default=os.getenv("RUNTIME_SHA", "HEAD"))
     parser.add_argument("--out", required=True)
     parser.add_argument("--source-out")
+    parser.add_argument("--tensorfs-wheel", default="")
     parser.add_argument("--version", default="1.0.0")
     args = parser.parse_args()
 
@@ -69,6 +70,9 @@ def main() -> int:
         wheels = list(vendor.glob("cozy_runtime-*.whl"))
         if len(wheels) != 1:
             raise RuntimeError(f"expected one cozy-runtime wheel, found {len(wheels)}")
+        native = pathlib.Path(args.tensorfs_wheel).resolve() if args.tensorfs_wheel else None
+        if native is not None:
+            shutil.copy2(native, vendor / native.name)
 
         shutil.copy2(FIXTURE / "weightless.py", tree / "weightless.py")
         shutil.copy2(FIXTURE / "package.toml", tree / "package.toml")
@@ -92,6 +96,7 @@ def main() -> int:
             'only-include = ["weightless.py"]\n\n'
             "[tool.uv.sources]\n"
             f'cozy-runtime = {{ path = "vendor/{wheels[0].name}" }}\n'
+            + (f'tensorfs = {{ path = "vendor/{native.name}" }}\n' if native is not None else "")
         )
         run("uv", "lock", "--quiet", cwd=tree)
         run("uv", "sync", "--locked", "--quiet", cwd=tree)
