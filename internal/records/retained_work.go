@@ -43,7 +43,8 @@ func retainRetryTx(tx *sql.Tx, request *Request) *exit.Error {
 		return exit.Named(exit.Conflict, "request.retry_refused", "retry predecessor %s must retain stopped work; current state %s", prior.ID, prior.State)
 	}
 	var open int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM attempts WHERE request_id=? AND state IN (`+openAttemptStates+`)`, prior.ID).Scan(&open); err != nil {
+	if err := tx.QueryRow(`WITH RECURSIVE family(id) AS (SELECT ? UNION ALL SELECT r.id FROM requests r JOIN family f ON r.parent_request_id=f.id)
+		SELECT COUNT(*) FROM attempts WHERE request_id IN (SELECT id FROM family) AND state IN (`+openAttemptStates+`)`, prior.ID).Scan(&open); err != nil {
 		return exit.Internalf("cannot inspect retry predecessor attempts: %s", err)
 	}
 	if open != 0 {
@@ -172,7 +173,10 @@ func (s *Store) CompleteRequestPause(id string) (bool, *exit.Error) {
 	defer tx.Rollback()
 	result, err := tx.Exec(`UPDATE requests SET state='paused' WHERE id=? AND state='pausing'
 		AND NOT EXISTS(SELECT 1 FROM attempts WHERE request_id=? AND state IN (`+openAttemptStates+`))
-		AND NOT EXISTS(SELECT 1 FROM request_model_transfers WHERE request_id=? AND state='materializing')`, id, id, id)
+		AND NOT EXISTS(SELECT 1 FROM request_model_transfers WHERE request_id=? AND state='materializing')
+		AND NOT EXISTS(WITH RECURSIVE family(id) AS (SELECT id FROM requests WHERE parent_request_id=? UNION ALL SELECT r.id FROM requests r JOIN family f ON r.parent_request_id=f.id)
+		SELECT 1 FROM requests r JOIN family f ON r.id=f.id WHERE r.state NOT IN ('paused','blocked',`+settledRequestStates+`)
+		OR EXISTS(SELECT 1 FROM attempts a WHERE a.request_id=r.id AND a.state IN (`+openAttemptStates+`)))`, id, id, id, id)
 	if err != nil {
 		return false, exit.Internalf("cannot finish pause: %s", err)
 	}
@@ -286,7 +290,8 @@ func (s *Store) ReleaseRetainedWork(id string) (bool, *exit.Error) {
 	defer tx.Rollback()
 	result, err := tx.Exec(`UPDATE requests SET state='releasing' WHERE id=? AND state='canceling'
 		AND NOT EXISTS(SELECT 1 FROM attempts WHERE request_id=? AND state IN (`+openAttemptStates+`))
-		AND NOT EXISTS(SELECT 1 FROM weights_finalizations WHERE request_id=? AND completed_at='')`, id, id, id)
+		AND NOT EXISTS(SELECT 1 FROM weights_finalizations WHERE request_id=? AND completed_at='')
+		AND NOT EXISTS(SELECT 1 FROM requests WHERE parent_request_id=? AND state IN (`+activeRequestStates+`))`, id, id, id, id)
 	if err != nil {
 		return false, exit.Internalf("cannot complete retained cancellation: %s", err)
 	}

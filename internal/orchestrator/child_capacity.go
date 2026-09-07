@@ -7,6 +7,17 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
+func (c *Orchestrator) requiredPrivateWire(req records.Request) (uint32, *exit.Error) {
+	bound, problem := c.opt.Store.HasChildBindings(req.InstallID)
+	if problem != nil {
+		return 0, problem
+	}
+	if bound || req.ParentRequestID != "" {
+		return 40, nil
+	}
+	return RetainedWorkWireMinor, nil
+}
+
 // jobExecutionRole assigns the separate CPU orchestration slot from captured
 // dependency facts. A package never chooses this role in its invocation payload.
 func (c *Orchestrator) jobExecutionRole(req records.Request, spec WorkerLaunchSpec) (WorkerLaunchSpec, *exit.Error) {
@@ -28,6 +39,15 @@ func (c *Orchestrator) jobExecutionRole(req records.Request, spec WorkerLaunchSp
 			return spec, exit.Named(exit.Structural, "child.orchestration_resources", "an invocable composition must keep its parent CPU-only and delegate model work to children")
 		}
 		plan.Orchestration = req.Worker != ""
+		if plan.Orchestration {
+			raw, _, err := canonical.Identity(c.jobDirective(&plan))
+			if err != nil {
+				return spec, exit.Internalf("cannot encode CPU parent contract: %s", err)
+			}
+			if problem := c.opt.Store.CaptureOrchestrationDirective(req.ID, raw); problem != nil {
+				return spec, problem
+			}
+		}
 	}
 	if req.Worker != "" && req.ParentRequestID != "" {
 		if plan.Orchestration {
@@ -55,22 +75,9 @@ func (c *Orchestrator) retainedOrchestrationParent(child records.Request) (*JobP
 	if err != nil {
 		return nil, exit.Internalf("the parent invocation is not canonical")
 	}
-	c.mu.Lock()
-	worker := c.workers[rentalInstanceID(child.Worker)]
-	var plan *JobPlan
-	if worker != nil && worker.spec.IsJob() {
-		plan = worker.spec.Placement.Jobs[0]
-		if !plan.Orchestration {
-			plan = plan.OrchestrationParent
-		}
-		if plan != nil {
-			copy := *plan
-			plan = &copy
-		}
-	}
-	c.mu.Unlock()
-	if plan == nil || !plan.Orchestration || plan.OrchestrationParent != nil || plan.NeedsAccelerator || plan.DescriptorID != parent.PlanID || plan.BuildID != doc.Sub("job").Str("build_id") {
+	var directive pb.JobDirective
+	if canonical.Unmarshal(parent.OrchestrationDirective, &directive) != nil || !directive.Orchestration || directive.OrchestrationParent != nil || directive.ResourceCaps.GetDeviceRequired() || directive.DeviceCount != 0 || directive.JobDescriptorId != parent.PlanID || directive.BuildId != doc.Sub("job").Str("build_id") {
 		return nil, exit.Named(exit.Conflict, "child.parent_slot_unavailable", "the rental has no exact retained CPU orchestration parent")
 	}
-	return plan, nil
+	return &JobPlan{Function: parent.Entrypoint, DescriptorID: directive.JobDescriptorId, BuildID: directive.BuildId, Orchestration: true, FrozenDirective: &directive}, nil
 }

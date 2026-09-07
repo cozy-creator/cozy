@@ -36,16 +36,22 @@ func scriptTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) 
 // snapshotTarget uses the ordinary installer while keeping the user's editable
 // pin unchanged. Both the program and its environment are owned by the run.
 func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch.PackageInterface, *exit.Error) {
-	digest, files, bytes, problem := pack.SourceIdentity()
-	if problem != nil {
-		return Target{}, nil, problem
-	}
 	layout, store, writer, problem := open(ctx.Cfg, true)
 	if problem != nil {
 		return Target{}, nil, problem
 	}
 	defer store.Close()
 	defer writer.Unlock()
+	intake, problem := prepareChildIntake(ctx, pack, layout, store)
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	defer intake.Close()
+	pack = intake.Package
+	digest, files, bytes, problem := pack.SourceIdentity()
+	if problem != nil {
+		return Target{}, nil, problem
+	}
 	var result *install.Result
 	problem = packagePublishStage(ctx, "Preparing private script environment", func() *exit.Error {
 		var problem *exit.Error
@@ -57,6 +63,10 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 		return problem
 	})
 	if problem != nil {
+		return Target{}, nil, problem
+	}
+	if problem := intake.Finish(result.Install.ID); problem != nil {
+		_, _ = install.Reclaim(layout, store, result.Install.ID)
 		return Target{}, nil, problem
 	}
 	raw, err := os.ReadFile(launch.PackageInterfacePath(result.Install.Dir))

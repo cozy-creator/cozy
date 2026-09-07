@@ -37,6 +37,28 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if job.Kind != "job" || job.Invocable == nil || job.Invocable.Module != module || job.Invocable.Export != export {
 		return out, "", exit.Named(exit.Conflict, "child.export_changed", "the captured implementation does not expose the exact invocable job")
 	}
+	if job.Invocable.Reusable {
+		for _, capability := range job.Invocable.Capabilities {
+			if capability == "egress" || capability == "secrets" {
+				return out, "", exit.Named(exit.Conflict, "child.reusable_effect", "a reusable operation cannot carry external egress or secret capabilities")
+			}
+		}
+	}
+	parentInstall, problem := r.store.Install(parent.InstallID)
+	if problem != nil || parentInstall == nil {
+		return out, "", exit.Named(exit.Conflict, "child.parent_install_absent", "the parent snapshot is unavailable")
+	}
+	parentSurface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(parentInstall.Dir), parentInstall.PackageInterface)
+	if problem != nil {
+		return out, "", problem
+	}
+	parentJob, problem := parentSurface.Function(parent.Entrypoint)
+	if problem != nil {
+		return out, "", problem
+	}
+	if parentJob.Invocable != nil && parentJob.Invocable.Reusable && !job.Invocable.Reusable {
+		return out, "", exit.Named(exit.Conflict, "child.impure_dependency", "a reusable parent operation cannot call a non-reusable dependency")
+	}
 	if problem := launch.ValidatePayload(install.Package, job, payload); problem != nil {
 		return out, "", problem
 	}

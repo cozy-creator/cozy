@@ -551,17 +551,20 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 // JobState is one job's document: the lifecycle a request has, plus the two facts only a
 // job has — its publication and its running bill.
 type JobState struct {
-	RetainWork bool   `json:"retain_work,omitempty"`
-	Retaining  bool   `json:"retaining,omitempty"`
-	RetryOf    string `json:"retry_of,omitempty"`
-	ReuseScope string `json:"reuse_scope,omitempty"`
-	Number     int64  `json:"number"`
-	JobID      string `json:"job_id"`
-	Status     string `json:"status"`
-	Package    string `json:"package"`
-	Function   string `json:"function"`
-	Attempt    uint64 `json:"attempt"`
-	Attempts   int    `json:"attempts"`
+	ParentRequestID string `json:"parent_request_id,omitempty"`
+	ParentCallIndex *int64 `json:"parent_call_index,omitempty"`
+	ReusedFrom      string `json:"reused_from,omitempty"`
+	RetainWork      bool   `json:"retain_work,omitempty"`
+	Retaining       bool   `json:"retaining,omitempty"`
+	RetryOf         string `json:"retry_of,omitempty"`
+	ReuseScope      string `json:"reuse_scope,omitempty"`
+	Number          int64  `json:"number"`
+	JobID           string `json:"job_id"`
+	Status          string `json:"status"`
+	Package         string `json:"package"`
+	Function        string `json:"function"`
+	Attempt         uint64 `json:"attempt"`
+	Attempts        int    `json:"attempts"`
 	// Queued is the job's position in the dispatch queue while it waits for a worker,
 	// counted from 1. Absent once it has an attempt — a running job is not queued.
 	QueuePosition *int `json:"queue_position,omitempty"`
@@ -703,6 +706,12 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	if row.State == "blocked" {
 		state.ErrorType, state.Error, _ = s.store.RetainedFailure(row.ID)
 	}
+	if row.ParentRequestID != "" {
+		state.ParentRequestID = row.ParentRequestID
+		index := row.ParentCallIndex
+		state.ParentCallIndex = &index
+		state.ReusedFrom = row.ReusedFrom
+	}
 	if row.ModelTransfer != nil {
 		if transfer, problem := s.store.ModelTransferOf(row.ID); problem == nil && transfer != nil {
 			state.ModelDestination = transfer.Destination
@@ -834,6 +843,16 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		}
 	}
 	if len(attempts) == 0 {
+		if row.ReusedFrom != "" {
+			if prior, problem := s.store.Attempts(row.ReusedFrom); problem == nil && len(prior) > 0 {
+				last := prior[len(prior)-1]
+				if last.State == "closed" && last.TerminalStatus == "SUCCEEDED" {
+					if doc, err := canonical.Read(last.TerminalBody, &pb.AttemptOutcomeBody{}); err == nil {
+						state.Result = inlineJobResult(doc)
+					}
+				}
+			}
+		}
 		return state
 	}
 	last := attempts[len(attempts)-1]
@@ -859,15 +878,20 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	if last.TerminalStatus != "SUCCEEDED" && state.ErrorType == "" {
 		state.ErrorType, state.Error = last.TerminalCause, last.SafeMessage
 	}
+	state.Result = inlineJobResult(doc)
+	return state
+}
+
+func inlineJobResult(doc canonical.Doc) any {
 	if inline := doc.Sub("result").Str("inline_result"); inline != "" {
 		if decoded, err := base64.StdEncoding.DecodeString(inline); err == nil {
 			var typed any
 			if json.Unmarshal(decoded, &typed) == nil {
-				state.Result = typed
+				return typed
 			}
 		}
 	}
-	return state
+	return nil
 }
 
 // parseStamp reads the authority's own RFC3339Nano timestamps. An unreadable one answers

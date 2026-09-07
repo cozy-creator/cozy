@@ -1058,8 +1058,12 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			minor = worker.wireMinor
 		}
 		c.mu.Unlock()
-		if minor < RetainedWorkWireMinor {
-			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "request.retention_unsupported", "retained work requires worker wire %d; selected worker speaks %d", RetainedWorkWireMinor, minor)
+		required, problem := c.requiredPrivateWire(req)
+		if problem != nil {
+			return WorkerLaunchSpec{}, "", problem
+		}
+		if minor < required {
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "request.retention_unsupported", "this private work requires worker wire %d; selected worker speaks %d", required, minor)
 		}
 	}
 	if req.InstallID != "" {
@@ -1321,9 +1325,15 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			c.releaseDispatch(reservation)
 		}
 	}()
-	if req.RetainWork && w.wireMinor < RetainedWorkWireMinor {
-		return 0, exit.Named(exit.Structural, "request.retention_unsupported",
-			"retained work requires worker wire %d; selected worker speaks %d", RetainedWorkWireMinor, w.wireMinor)
+	if req.RetainWork {
+		required, problem := c.requiredPrivateWire(req)
+		if problem != nil {
+			return 0, problem
+		}
+		if w.wireMinor < required {
+			return 0, exit.Named(exit.Structural, "request.retention_unsupported",
+				"this private work requires worker wire %d; selected worker speaks %d", required, w.wireMinor)
+		}
 	}
 	if w.spec.Connection != nil && req.Worker == "" {
 		// THE PIN IS ROUTING'S OUTPUT (cl-092 step 4): the argmin was a rental, so the

@@ -725,7 +725,7 @@ func priorStatements(version int) []string {
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n  evidence         BLOB NOT NULL,\n", 1)
 		}
 		if requestStatement && version < 27 {
-			stmt = strings.Replace(stmt, ",\n  parent_request_id TEXT NOT NULL DEFAULT '',\n  parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<32),\n  child_intent_digest TEXT NOT NULL DEFAULT '',\n  child_target_digest TEXT NOT NULL DEFAULT '',\n  child_reusable INTEGER NOT NULL DEFAULT 0 CHECK(child_reusable IN (0,1)),\n  reused_from TEXT NOT NULL DEFAULT ''", "", 1)
+			stmt = strings.Replace(stmt, ",\n  parent_request_id TEXT NOT NULL DEFAULT '',\n  parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<32),\n  child_intent_digest TEXT NOT NULL DEFAULT '',\n  child_target_digest TEXT NOT NULL DEFAULT '',\n  child_reusable INTEGER NOT NULL DEFAULT 0 CHECK(child_reusable IN (0,1)),\n  reused_from TEXT NOT NULL DEFAULT '',\n  orchestration_directive BLOB NOT NULL DEFAULT x''", "", 1)
 		}
 		if requestStatement && version < 26 {
 			stmt = strings.Replace(stmt, ",\n  retain_work INTEGER NOT NULL DEFAULT 0 CHECK(retain_work IN (0,1)),\n  retry_of TEXT NOT NULL DEFAULT '',\n  reuse_scope TEXT NOT NULL DEFAULT '',\n  control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision>=0)", "", 1)

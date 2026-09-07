@@ -69,14 +69,15 @@ type Entrypoint struct {
 }
 
 type Invocable struct {
-	Reusable    bool                       `json:"reusable"`
-	Context     string                     `json:"context"`
-	Module      string                     `json:"module"`
-	Export      string                     `json:"export"`
-	Parameters  []string                   `json:"parameters"`
-	Defaults    map[string]json.RawMessage `json:"defaults"`
-	TypeNames   map[string]string          `json:"type_names"`
-	EnumMembers map[string]json.RawMessage `json:"enum_members"`
+	Reusable     bool                       `json:"reusable"`
+	Capabilities []string                   `json:"capabilities"`
+	Context      string                     `json:"context"`
+	Module       string                     `json:"module"`
+	Export       string                     `json:"export"`
+	Parameters   []string                   `json:"parameters"`
+	Defaults     map[string]json.RawMessage `json:"defaults"`
+	TypeNames    map[string]string          `json:"type_names"`
+	EnumMembers  map[string]json.RawMessage `json:"enum_members"`
 }
 
 type WeightsOutput struct {
@@ -212,7 +213,7 @@ func validateClosedPackageInterface(data []byte) error {
 				return err
 			}
 			if metadata := callable["invocable"]; metadata != nil {
-				if _, err := exactKeys(metadata, []string{"context", "module", "export", "parameters", "defaults", "type_names", "enum_members"}, []string{"reusable"}); err != nil {
+				if _, err := exactKeys(metadata, []string{"context", "module", "export", "parameters", "defaults", "type_names", "enum_members"}, []string{"reusable", "capabilities"}); err != nil {
 					return err
 				}
 			}

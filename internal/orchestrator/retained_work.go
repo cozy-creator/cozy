@@ -17,6 +17,9 @@ func (c *Orchestrator) CancelRetainedRequest(id, actor string) *exit.Error {
 		return problem
 	}
 	c.forget(id)
+	if problem := c.cancelChildCalls(id); problem != nil {
+		return problem
+	}
 	if problem := c.stopRetainedAttempt(id, pb.CancelReason_CANCEL_REASON_CLIENT); problem != nil {
 		return problem
 	}
@@ -109,6 +112,7 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 	}
 	changed, problem := c.opt.Store.ReleaseRetainedWork(id)
 	if problem != nil || !changed {
+		c.retryRetainedCancellation(id)
 		return
 	}
 	request.State = "releasing"
@@ -176,6 +180,9 @@ func (c *Orchestrator) PauseRequest(id, actor string) *exit.Error {
 		return problem
 	}
 	c.forget(id)
+	if problem := c.pauseChildCalls(id); problem != nil {
+		return problem
+	}
 	if state == "pausing" {
 		problem := c.stopRetainedAttempt(id, pb.CancelReason_CANCEL_REASON_DRAIN)
 		c.retryRetainedPause(id)

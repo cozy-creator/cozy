@@ -1054,6 +1054,7 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 		return
 	}
 	if records.RetainedState(req.State) {
+		go func() { _ = c.pauseChildCalls(req.ID) }()
 		c.cleanupAttempt(req, uint64(attempt.Attempt), holder, false)
 		c.signalClosed(key(req.ID, uint64(attempt.Attempt)), outcomeError(attempt.TerminalStatus, attempt.TerminalCause, attempt.SafeMessage))
 		if _, problem := c.opt.Store.CompleteRequestPause(req.ID); problem != nil {

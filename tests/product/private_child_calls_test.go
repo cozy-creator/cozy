@@ -5,8 +5,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func childDigest(letter string) string { return "sha256:" + strings.Repeat(letter, 64) }
@@ -19,6 +21,44 @@ func offerChildParent(t *testing.T, store *records.Store, parent records.Request
 	current, problem := store.RequestRow(parent.ID)
 	fatal(t, problem)
 	return *current
+}
+
+func TestPrivateParentRetainsExactOrchestrationContract(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "creator.sqlite")
+	store, problem := records.Open(path)
+	fatal(t, problem)
+	parent := recordPrivateTransaction(t, store, "parent-capacity", "")
+	directive := &pb.JobDirective{BuildId: childDigest("a"), JobDescriptorId: parent.PlanID, Orchestration: true, ResourceCaps: &pb.ResourceCaps{MaxRssBytes: 123456}}
+	raw, _, err := canonical.Identity(directive)
+	must(t, err)
+	fatal(t, store.CaptureOrchestrationDirective(parent.ID, raw))
+	fatal(t, store.CaptureOrchestrationDirective(parent.ID, raw))
+	directive.ResourceCaps.MaxRssBytes++
+	changed, _, err := canonical.Identity(directive)
+	must(t, err)
+	if problem := store.CaptureOrchestrationDirective(parent.ID, changed); problem == nil {
+		t.Fatal("parent capacity was replaced after capture")
+	}
+	store.Close()
+	store, problem = records.Open(path)
+	fatal(t, problem)
+	defer store.Close()
+	retained, problem := store.RequestRow(parent.ID)
+	fatal(t, problem)
+	if string(retained.OrchestrationDirective) != string(raw) {
+		t.Fatal("parent restart lost its exact capacity declaration")
+	}
+	_, problem = store.RequestPause(parent.ID, "test")
+	fatal(t, problem)
+	_, problem = store.CompleteRequestPause(parent.ID)
+	fatal(t, problem)
+	retry := *retained
+	retry.ID, retry.IdemKey, retry.RetryOf = "req-parent-capacity-new", "parent-capacity-new", parent.ID
+	retry, _, problem = store.Submit(retry)
+	fatal(t, problem)
+	if len(retry.OrchestrationDirective) != 0 {
+		t.Fatal("new parent inherited old execution capacity without resolving its new code")
+	}
 }
 
 func TestPrivateChildBindingsAreImmutableAndOwnTheirImplementation(t *testing.T) {
@@ -85,6 +125,31 @@ func TestPrivateChildrenDoNotReuseEffectsByDefault(t *testing.T) {
 	}
 }
 
+func TestPrivateParentPauseWaitsForChildExecutionBarrier(t *testing.T) {
+	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
+	parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "pause-parent", ""))
+	child, _, problem := store.SubmitChild(records.Request{ID: "req-child-pause", IdemKey: "child-pause", BodyDigest: childDigest("3"), Package: "local/operation", Entrypoint: "run", Kind: "job", Payload: []byte(`{}`), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("4"), ChildTargetDigest: childDigest("5")}, 1, childDigest("1"), "private-boot")
+	fatal(t, problem)
+	child = offerChildParent(t, store, child)
+	_, problem = store.RequestPause(parent.ID, "test")
+	fatal(t, problem)
+	closeChild(t, store, parent, "CANCELED", "pausing")
+	paused, problem := store.CompleteRequestPause(parent.ID)
+	fatal(t, problem)
+	if paused {
+		t.Fatal("parent claimed paused while its child still executed")
+	}
+	closeChild(t, store, child, "CANCELED", "paused")
+	paused, problem = store.CompleteRequestPause(parent.ID)
+	fatal(t, problem)
+	if !paused {
+		t.Fatal("parent did not pause after every writer closed")
+	}
+}
+
 func closeChild(t *testing.T, store *records.Store, request records.Request, status, state string) {
 	t.Helper()
 	if request.Ordinal == 0 {
@@ -143,7 +208,13 @@ func TestPrivateChildrenReuseExactSuccessfulOperationAfterParentEdit(t *testing.
 	if changed.State != "submitted" || changed.ReusedFrom != "" {
 		t.Fatal("changed operation inherited stale result")
 	}
-	call.ID, call.IdemKey, call.ParentCallIndex = "req-child-forged", "child-forged", 2
+	call.ID, call.IdemKey, call.ParentCallIndex, call.ChildTargetDigest = "req-child-reordered", "child-reordered", 2, childDigest("5")
+	reordered, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot")
+	fatal(t, problem)
+	if reordered.ReusedFrom != child.ID {
+		t.Fatal("moving an unchanged reusable operation invalidated its result")
+	}
+	call.ID, call.IdemKey, call.ParentCallIndex = "req-child-forged", "child-forged", 3
 	if _, _, problem := store.SubmitChild(call, 1, childDigest("9"), "private-boot"); problem == nil {
 		t.Fatal("forged parent invocation admitted child")
 	}

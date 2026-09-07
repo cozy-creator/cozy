@@ -94,6 +94,12 @@ func databaseRows(t *testing.T, path string) map[string]string {
 					}
 					continue
 				}
+				if name == "requests" && column == "orchestration_directive" {
+					if raw, ok := values[i].([]byte); !ok || len(raw) != 0 {
+						t.Fatal("migration invented parent capacity")
+					}
+					continue
+				}
 				preserved = append(preserved, values[i])
 			}
 			raw, err := json.Marshal(preserved)

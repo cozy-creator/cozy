@@ -11,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // THE JOB BRANCH (cl-004). A job is an ATTEMPT CLASS on this one orchestrator, not a
@@ -57,6 +58,7 @@ type JobPlan struct {
 	NeedsAccelerator    bool
 	Orchestration       bool
 	OrchestrationParent *JobPlan
+	FrozenDirective     *pb.JobDirective
 }
 
 const DefaultJobRSSCap int64 = 8 << 30
@@ -160,6 +162,9 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker) *exit.Error {
 }
 
 func (c *Orchestrator) jobDirective(plan *JobPlan) *pb.JobDirective {
+	if plan.FrozenDirective != nil {
+		return proto.Clone(plan.FrozenDirective).(*pb.JobDirective)
+	}
 	directive := &pb.JobDirective{
 		BuildId:         plan.BuildID,
 		JobDescriptorId: plan.DescriptorID,

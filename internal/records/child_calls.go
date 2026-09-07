@@ -65,10 +65,10 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	// adoption contract supplies independent new-request ownership.
 	if r.ChildReusable && r.Outputs == "" && (r.WeightsOutputs == "" || r.WeightsOutputs == "[]") && parent.RetryOf != "" {
 		var previous string
-		err = tx.QueryRow(`SELECT COALESCE(NULLIF(reused_from,''),id) FROM requests WHERE parent_request_id=? AND parent_call_index=?
+		err = tx.QueryRow(`SELECT COALESCE(NULLIF(reused_from,''),id) FROM requests WHERE parent_request_id<>''
 			AND state='succeeded' AND child_reusable=1 AND child_intent_digest=? AND child_target_digest=? AND reuse_scope=?
 			AND EXISTS(SELECT 1 FROM attempts WHERE request_id=COALESCE(NULLIF(requests.reused_from,''),requests.id) AND state='closed' AND terminal_status='SUCCEEDED')
-			ORDER BY created_at DESC,id DESC LIMIT 1`, parent.RetryOf, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ReuseScope).Scan(&previous)
+			ORDER BY created_at DESC,id DESC LIMIT 1`, r.ChildIntentDigest, r.ChildTargetDigest, r.ReuseScope).Scan(&previous)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return Request{}, false, exit.Internalf("cannot inspect reusable child result: %s", err)
 		}
