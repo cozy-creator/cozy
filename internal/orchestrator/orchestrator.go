@@ -21,9 +21,11 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -77,15 +80,14 @@ type Options struct {
 	// tombstone is idempotent.
 	ReportReleaseDefect ReleaseDefectReporter
 	// RentalFleet renders the one fleet burn line after reconciling every local
-	// rental with Tensorhub. AcquireManagedRental is the capacity decision for a --rental
-	// request no rental holds a placement for (residency-aware-routing.md §3.2): it pins
-	// the request to the ready rental RankRentals puts first — disk holdings ORDER the
-	// candidates, never veto — and says which it chose over what; with no ready rental it
-	// BUYS a pod (owner ruling 2026-09-03: --rental is permission AND intent to spend).
+	// rental with Tensorhub. AcquireManagedRental is the placement decision for a --rental
+	// request no rental holds a placement for (placement-economics.md): it pins the
+	// request to an attached ready rental or BUYS a pod (owner ruling 2026-09-03:
+	// --rental is permission AND intent to spend) and records what it chose over what.
 	// ReleaseManagedRental observes a rental as a request pinned to it settles and tears
 	// it down once nothing is left on it.
 	RentalFleet          func() (string, *exit.Error)
-	AcquireManagedRental func(req records.Request) (RentalDecision, string, *exit.Error)
+	AcquireManagedRental func(req records.Request) (PlacementDecision, string, *exit.Error)
 	ReleaseManagedRental func(string) (string, *exit.Error)
 	// ReleaseRetainedRental is explicit owner abandonment, independent of idle policy.
 	ReleaseRetainedRental func(string) (string, *exit.Error)
@@ -203,193 +205,153 @@ type LogicalJob struct {
 
 type ModelRef = records.ModelRef
 
-// RentalCoverage is one ready rental read against a placement's manifests (§3.2): whether
-// its worker's verified store reports every one of them, how many (and how many bytes)
-// it lacks, and the room its worker reports. A rental with no worker attached yet has
-// reported nothing, so it holds nothing.
-type RentalCoverage struct {
-	RentalID         string `json:"rental"`
-	Worker           string `json:"worker,omitempty"`
-	Holds            bool   `json:"holds"`
-	ManifestsMissing int    `json:"manifests_missing"`
-	BytesMissing     int64  `json:"bytes_missing"`
-	Room             int    `json:"room"`
-	Held             int    `json:"held"`
-	// Lane is the lane this machine's rung of the binding ladder pins (cl-166); Queued
-	// is the pinned work not yet offered to its worker, which with Held is the work
-	// queued ahead of a new request on this rental.
-	Lane   string `json:"lane,omitempty"`
-	Queued int    `json:"queued"`
-	// Fit says how the device was sized (cl-168): `components` with the bytes compared, or
-	// `rung_asserted` when the card published no per-component bytes and the owner's rung
-	// stood alone. ResidentBytes is the entrypoint's largest resident group, VRAMBytes the
-	// device's memory, both as compared.
-	Fit           string `json:"fit,omitempty"`
-	ResidentBytes int64  `json:"resident_bytes,omitempty"`
-	VRAMBytes     int64  `json:"vram_bytes,omitempty"`
-	// Models is the request's selection pinned to this rental's rung.
+// PlacementDecision is the capacity decision's whole record (cl-165, placement-economics.md):
+// the tier it ran under, the config it read, every throughput row it used, and every
+// candidate — attached ready rental or purchasable product — with its rate, expected
+// time, cost, score and verdict. It is the `request.placement` event. A record naming
+// only its winner cannot be audited: on 2026-09-04 a `--rental-only` run bought a second
+// pod while a ready rental sat idle, and the durable record could not say why.
+type PlacementDecision struct {
+	Tier         string `json:"tier"`
+	ConfigDigest string `json:"config_digest"`
+	// Ladder is the fit map the candidates were pinned by (`H100=fp8`), one entry per
+	// slot when slots differ.
+	Ladder     []string              `json:"ladder,omitempty"`
+	Throughput []hub.ModelThroughput `json:"throughput"`
+	Candidates []PlacementCandidate  `json:"candidates"`
+	RentalID   string                `json:"rental,omitempty"`
+	Bought     bool                  `json:"bought"`
+	// Models is the request's selection pinned to the chosen machine's rung; nil when
+	// the request was already exact.
 	Models []ModelRef `json:"-"`
 }
 
-// Ahead is the attempts a new request would wait behind on this rental.
-func (r RentalCoverage) Ahead() int { return r.Held + r.Queued }
-
-// RentalCandidate is one ready rental the ladder fits, before its worker's facts are read.
-type RentalCandidate struct {
-	RentalID string
-	Queued   int
-	Models   []ModelRef
-	// Fit, ResidentBytes and VRAMBytes are the device sizing as compared (cl-168).
-	Fit           string
-	ResidentBytes int64
-	VRAMBytes     int64
-}
-
-// RentalDecision is the capacity decision's answer: the rental the placement is staged
-// on, whether it was bought for this request, and every ready rental it was chosen over.
-//
-// Excluded and SKU carry the other half of the case (cl-132). A decision that records
-// only its winner cannot be audited: on 2026-09-04 a `--rental-only` run bought a second
-// $0.95/hr pod while a ready rental sat idle, and the durable record of that choice read
-// `{"bought":true,"candidates":[]}` — an empty candidate list that means "there were no
-// ready rentals" and "every ready rental was excluded" in the same six characters. The
-// first is the market; the second is a decision somebody should be able to check.
-type RentalDecision struct {
-	RentalID   string
-	Bought     bool
-	Candidates []RentalCoverage
-	// Excluded are the fleet's ready rentals that were NOT candidates, each with the
-	// reason. An empty Candidates beside a populated Excluded is the difference
-	// between an empty fleet and a fleet that could not take this work.
-	Excluded []RentalExclusion
-	// SKU is the catalog choice behind a buy: every product on offer at that instant,
-	// in ladder walk order. Nil when no pod was bought.
-	SKU *SKUDecision
-	// Models is the request's selection pinned to the winning machine's rung (cl-166).
-	// Nil when the request was already exact.
-	Models []ModelRef
-}
-
-// Verdicts a SKU candidate can carry. The chosen product carries none.
-const (
-	// VerdictDearer: a cheaper compatible product of the same rung won. This is the
-	// ordinary runner-up, and it is what makes an overpay readable — a dearer pick
-	// with a `dearer` row above it is a defect; a dearer pick that IS the cheapest
-	// row is the market, not the code.
-	VerdictDearer = "dearer"
-	// VerdictLaterRung: compatible, but the ladder reached a fitting machine on an
-	// earlier rung first. Price never outranks the owner's rung order.
-	VerdictLaterRung = "later_rung"
-	// VerdictBaseMismatch is spelled with the pod's own reason appended.
-	VerdictBaseMismatch = "base_mismatch"
-	// VerdictGPUMismatch: no rung of the ladder names this accelerator class.
-	VerdictGPUMismatch = "gpu_mismatch"
-	// VerdictVRAMShort is spelled with the need and the card's memory appended: the
-	// entrypoint's largest resident component group does not fit on the device (the
-	// 2026-09-07 defect — a 24 GB card bought for a lane whose text encoder is 51.5 GB).
-	VerdictVRAMShort = "vram_short"
-	// VerdictNoInventory: the hub refused the buy for want of stock, and the walk
-	// moved on to the next machine.
-	VerdictNoInventory = "no_inventory"
-)
-
-// SKUCandidate is one offered product as the choice saw it.
-type SKUCandidate struct {
-	Name string `json:"sku"`
-	// TotalUSDMicrosPerHour is what the renter PAYS — the ordering key within a
-	// rung, not the GPU rate alone (th-126).
-	TotalUSDMicrosPerHour int64 `json:"total_usd_micros_per_hour"`
-	// Rung is the 1-based ladder rung this product fell under (0: none); Lane is the
-	// lane that rung pins on it.
+// PlacementCandidate is one machine the run could be placed on, as the choice saw it: an
+// attached ready rental (Rental set) or a purchasable product.
+type PlacementCandidate struct {
+	Rental  string `json:"rental,omitempty"`
+	Machine string `json:"machine,omitempty"`
+	SKU     string `json:"sku"`
+	// Rung is the 1-based ladder rung the machine fell under and Lane the lane it pins;
+	// Fit says how the device was sized against that lane (cl-168).
 	Rung int    `json:"rung,omitempty"`
 	Lane string `json:"lane,omitempty"`
-	// Verdict is empty on the chosen product and otherwise names why not this one.
-	Verdict string `json:"verdict,omitempty"`
-	// Fit, ResidentBytes and VRAMBytes are the device sizing as compared (cl-168):
-	// `components` with the entrypoint's largest resident group against the device, or
-	// `rung_asserted` when the card published no per-component bytes for the rung's lane.
-	Fit           string `json:"fit,omitempty"`
-	ResidentBytes int64  `json:"resident_bytes,omitempty"`
-	VRAMBytes     int64  `json:"vram_bytes,omitempty"`
+	Fit  string `json:"fit,omitempty"`
+	// Ahead is the attempts a new request waits behind on an attached rental.
+	Ahead int `json:"ahead,omitempty"`
+	// RateUSDMicrosPerHour is what the renter pays: the live catalog's price plus storage.
+	RateUSDMicrosPerHour int64 `json:"rate_usd_micros_per_hour"`
+	// Measured says a throughput row exists for (lane, sku). TimeS, CostUSDMicros and
+	// Score follow placement-economics.md and are zero on an unmeasured candidate.
+	Measured      bool    `json:"measured"`
+	TimeS         float64 `json:"time_s,omitempty"`
+	CostUSDMicros int64   `json:"cost_usd_micros,omitempty"`
+	Score         float64 `json:"score,omitempty"`
+	// Verdict is one of the constants below; empty only while the choice is still open.
+	Verdict string     `json:"verdict"`
+	Models  []ModelRef `json:"-"`
 }
 
-// SKUDecision is the recordable answer to "what did the fleet buy, and what did it buy
-// that over?" (cl-132).
-//
-// It exists because the choice used to be a bare return value. On 2026-09-04 an
-// auto-placement bought a $0.953504/hr rtx-4090 while an rtx-a4000 at $0.463504/hr was
-// believed to be on offer, and NOTHING in any log or row distinguished the two
-// explanations — a broken compatibility filter, or a card that was simply out of stock
-// in that minute. Both leave a byte-identical trace once the winner is the only thing
-// written down, and the question was settled only by reading provider inventory
-// generations out of the hub's Postgres hours later. Only the CANDIDATE SET separates
-// them, so the candidate set is what gets recorded.
-//
-// Offered is every product of the requested class the live catalog carried at the
-// instant of the choice, in walk order: rung by rung as the owner ordered the ladder,
-// cheapest first within a rung, then the products no rung names. A stock-out is
-// therefore an ABSENCE from this list — a fact the reader can see, rather than one they
-// must infer by running a second command minutes later and hoping the market has not
-// moved underneath them.
-type SKUDecision struct {
-	Offered []SKUCandidate `json:"offered"`
-	Chosen  string         `json:"chosen,omitempty"`
-	// Ladder is the fit map the walk followed, rung by rung (`H100=fp8`), one entry per
-	// slot when slots differ.
-	Ladder []string `json:"ladder,omitempty"`
-	// Mismatch is the first accelerator-compatible product the release's own
-	// requirements excluded, when nothing could be chosen.
-	Mismatch string `json:"mismatch,omitempty"`
+// Verdicts a placement candidate carries once the choice is made.
+const (
+	VerdictChosen     = "chosen"
+	VerdictSlower     = "slower"
+	VerdictDearer     = "dearer"
+	VerdictUnmeasured = "unmeasured"
+	// VerdictNoRung: no rung of the binding ladder names this machine's accelerator.
+	VerdictNoRung = "no_rung"
+	// VerdictNoStock: the hub refused the buy for want of inventory, and the choice repeated.
+	VerdictNoStock = "no_stock"
+	// VerdictExcluded is a prefix; the reason follows (`excluded:vram_short: …`).
+	VerdictExcluded = "excluded:"
+)
+
+// Attached says the candidate is a rental this daemon already holds.
+func (c PlacementCandidate) Attached() bool { return c.Rental != "" }
+
+// Name is how a reader knows the candidate: the machine word, or the product.
+func (c PlacementCandidate) Name() string {
+	if c.Machine != "" {
+		return c.Machine
+	}
+	if c.Rental != "" {
+		return c.Rental
+	}
+	return c.SKU
 }
 
-// Cheapest is the lowest-priced offered product of the requested class, chosen or not.
-func (d SKUDecision) Cheapest() (SKUCandidate, bool) {
-	var cheapest SKUCandidate
-	found := false
-	for _, candidate := range d.Offered {
-		if !found || candidate.TotalUSDMicrosPerHour < cheapest.TotalUSDMicrosPerHour {
-			cheapest, found = candidate, true
+// Chosen is the candidate the decision placed the run on.
+func (d PlacementDecision) Chosen() (PlacementCandidate, bool) {
+	for _, c := range d.Candidates {
+		if c.Verdict == VerdictChosen {
+			return c, true
 		}
 	}
-	return cheapest, found
+	return PlacementCandidate{}, false
 }
 
-// UnexplainedPick names a product that was passed over WITHOUT a stated reason, and is
-// empty when the record is sound. It is the invariant th-151 was filed to check: buying a
-// dearer machine is allowed — the cheap card is often simply out of stock, or on a later
-// rung — but buying one while another product sits in Offered with no verdict on it is a
-// defect in the chooser, and this is the predicate that says so.
-func (d SKUDecision) UnexplainedPick() string {
-	if d.Chosen == "" {
-		return ""
-	}
-	for _, candidate := range d.Offered {
-		if candidate.Name != d.Chosen && candidate.Verdict == "" {
-			return candidate.Name
+// Unexplained names a candidate passed over with NO verdict, and is empty when the
+// record is sound. It is the invariant th-151 was filed to check: choosing a dearer or
+// slower machine is allowed, but passing one over with nothing said is a chooser defect.
+func (d PlacementDecision) Unexplained() string {
+	for _, c := range d.Candidates {
+		if c.Verdict == "" {
+			return c.Name()
 		}
 	}
 	return ""
 }
 
-// RentalExclusion is one ready rental the capacity decision could not use, and why.
-type RentalExclusion struct {
-	RentalID string `json:"rental"`
-	Machine  string `json:"machine,omitempty"`
-	Reason   string `json:"reason"`
+// Line is the one human sentence `cozy run` prints for the decision.
+func (d PlacementDecision) Line() string {
+	c, ok := d.Chosen()
+	if !ok {
+		return "placement: nothing chosen"
+	}
+	line := "placement: buy " + c.SKU
+	if c.Attached() {
+		line = "placement: reuse " + c.Name() + " (" + c.SKU
+		if c.Lane != "" {
+			line += ", " + c.Lane
+		}
+		line += ")"
+	} else if c.Lane != "" {
+		line += " (" + c.Lane + ")"
+	}
+	if !c.Measured {
+		return fmt.Sprintf("%s — %s, unmeasured (rung %d)", line, d.Tier, c.Rung)
+	}
+	return fmt.Sprintf("%s — %s, %.0f s, $%.2f", line, d.Tier, c.TimeS, float64(c.CostUSDMicros)/1e6)
 }
 
-// Exclusion reasons. They are properties of the FLEET at the moment of the decision,
-// not of the request, so a reader can tell "nothing was available" from "nothing was
-// eligible".
+// verdicts renders every candidate with its verdict, for the daemon log.
+func (d PlacementDecision) verdicts() string {
+	parts := make([]string, 0, len(d.Candidates))
+	for _, c := range d.Candidates {
+		parts = append(parts, c.Name()+" "+c.Verdict)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// payload is the record as the `request.placement` event carries it, plus the line.
+func (d PlacementDecision) payload() map[string]any {
+	raw, _ := json.Marshal(d)
+	out := map[string]any{}
+	_ = json.Unmarshal(raw, &out)
+	out["line"] = d.Line()
+	return out
+}
+
+// Exclusion reasons an attached rental can carry behind VerdictExcluded. They are
+// properties of the FLEET at the moment of the decision, not of the request, so a
+// reader can tell "nothing was available" from "nothing was eligible" (cl-132).
 const (
 	// ExcludedProtocol: new directives use the current generated wire contract.
 	ExcludedProtocol = "protocol_unsupported"
 	// ExcludedSpent: a completed managed job rental is retained custody, not capacity.
 	ExcludedSpent = "managed_job_spent"
 	// ExcludedModeConflict: the rental's worker already holds the other half of the
-	// `oneof mode` — a job where a serving set is wanted, or the reverse. This is the
-	// one that read as waste live: a `ready` pod with no running work, which a
-	// serving request nonetheless may not touch.
+	// `oneof mode` — a job where a serving set is wanted, or the reverse.
 	ExcludedModeConflict = "mode_conflict"
 	// ExcludedWrongClass: CPU rental cannot satisfy an accelerator requirement.
 	ExcludedWrongClass = "wrong_class"
@@ -397,110 +359,43 @@ const (
 	ExcludedNotReady = "not_ready"
 	// ExcludedUnattached: ready, but with no address or pinned certificate yet.
 	ExcludedUnattached = "unattached"
-	// ExcludedGPUMismatch: no rung of the binding ladder names the rental's accelerator.
-	ExcludedGPUMismatch = "gpu_mismatch"
-	// ExcludedVRAMShort: the rung lane's resident components do not fit the device memory.
+	// ExcludedVRAMShort is spelled with the need and the device's memory appended: the
+	// rung lane's resident components do not fit (cl-168).
 	ExcludedVRAMShort = "vram_short"
-	// ExcludedSaturated is spelled with the measured comparison appended: the work
-	// queued ahead on this rental is expected to outlast a fresh pod's observed cold
-	// path for the lane, so buying wins over waiting.
-	ExcludedSaturated = "saturated"
+	// ExcludedBaseMismatch is spelled with the pod's own reason appended: the release's
+	// requirements contradict the product's base image.
+	ExcludedBaseMismatch = "base_mismatch"
 )
 
-// ModeCompatibleRentals filters ready rentals by the one desired MODE a worker can hold.
-// DesiredWorkerState is a full-replace `oneof mode` — a JobDirective or a serving
-// placement set — so a pod worker cannot host both at once: converging a job onto a
-// worker with a serving desire (or a serving set onto a job worker) would unload the
-// other tenant mid-flight. Placements co-host per package (issuePackageSet); modes do
-// not, because the wire forbids it — a mode-conflicted rental is simply not a candidate,
-// and the capacity decision moves to the next rental or the buy (owner's --rental
-// ruling). An unattached rental has no mode yet and takes it from its first desire.
-// A silently shortened list is the whole defect, so the exclusion-reporting form below
-// is the one a caller that records a decision must use (cl-132).
-func (c *Orchestrator) ModeCompatibleRentals(ids []string, job bool) []string {
-	out, _ := c.ModeCompatibleRentalsWithExclusions(ids, job)
-	return out
-}
-
-// ModeCompatibleRentalsWithExclusions is ModeCompatibleRentals with the dropped rentals
-// named. Callers that record a decision use this one.
-func (c *Orchestrator) ModeCompatibleRentalsWithExclusions(ids []string, job bool) (
-	[]string, []RentalExclusion,
-) {
+// RentalStanding is what this owner knows live about one ready rental a placement could
+// go to: the reason its worker cannot take this request's MODE, or the attempts the
+// worker holds and has been offered — what a new request waits behind, with the
+// requests still queued for it. DesiredWorkerState is a full-replace `oneof mode` — a
+// JobDirective or a serving placement set — so a pod worker cannot host both at once:
+// converging a job onto a worker with a serving desire (or the reverse) would unload the
+// other tenant mid-flight. An unattached rental has no mode yet and holds nothing.
+func (c *Orchestrator) RentalStanding(id string, job bool) (reason string, held int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	out := make([]string, 0, len(ids))
-	var excluded []RentalExclusion
-	for _, id := range ids {
-		w := c.workers[rentalInstanceID(id)]
-		if w != nil && !w.supportsCurrentProtocol() {
-			excluded = append(excluded, RentalExclusion{RentalID: id, Reason: ExcludedProtocol})
-			continue
-		}
-		if w != nil && !w.exited && !w.stopping {
-			serving := len(w.desiredPackages) > 0 || w.desiredLocal != nil ||
-				w.desiredPrivatePlacement != nil || len(w.observedRemote) > 0
-			if job && serving || !job && w.spec.IsJob() {
-				excluded = append(excluded, RentalExclusion{
-					RentalID: id, Reason: ExcludedModeConflict})
-				continue
-			}
-		}
-		out = append(out, id)
+	w := c.workers[rentalInstanceID(id)]
+	if w == nil {
+		return "", 0
 	}
-	return out, excluded
-}
-
-// RankRentals orders the ready rentals a request's ladder fits, for a NEW placement
-// (§3.2, D4, cl-166): the fewest attempts queued ahead first — the counts route scoring
-// already reads, held plus this owner's unanswered offers plus pinned work not yet
-// offered — then warmth for the rental's OWN lane (a store holding every manifest,
-// then the fewest missing bytes), then the most room, then the caller's order. Rung
-// order ranks nothing here: a live fitting 5090 with room beats buying an H100.
-// Nothing here is a timer, and the ranking never desires residency anywhere: it reads
-// what each worker last said.
-func (c *Orchestrator) RankRentals(candidates []RentalCandidate) []RentalCoverage {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := make([]RentalCoverage, 0, len(candidates))
-	for _, candidate := range candidates {
-		row := RentalCoverage{RentalID: candidate.RentalID, Queued: candidate.Queued,
-			Lane: records.Lanes(candidate.Models), Models: candidate.Models, Fit: candidate.Fit,
-			ResidentBytes: candidate.ResidentBytes, VRAMBytes: candidate.VRAMBytes}
-		w := c.workers[rentalInstanceID(candidate.RentalID)]
-		if w == nil || w.exited || w.stopping || c.sessions[w.bootID] == nil {
-			w = nil
-		}
-		if w != nil {
-			row.Worker, row.Room, row.Held = w.instanceID, w.seats.slots, w.held+w.seats.reserved
-		}
-		for _, model := range candidate.Models {
-			if model.Manifest == "" || (w != nil && w.heldManifests[model.Manifest]) {
-				continue
-			}
-			row.ManifestsMissing++
-			row.BytesMissing += model.Bytes
-		}
-		row.Holds = row.ManifestsMissing == 0
-		out = append(out, row)
+	if !w.supportsCurrentProtocol() {
+		return ExcludedProtocol, 0
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		a, b := out[i], out[j]
-		if a.Ahead() != b.Ahead() {
-			return a.Ahead() < b.Ahead()
-		}
-		if a.Holds != b.Holds {
-			return a.Holds
-		}
-		if a.BytesMissing != b.BytesMissing {
-			return a.BytesMissing < b.BytesMissing
-		}
-		if a.ManifestsMissing != b.ManifestsMissing {
-			return a.ManifestsMissing < b.ManifestsMissing
-		}
-		return a.Room > b.Room
-	})
-	return out
+	if w.exited || w.stopping {
+		return "", 0
+	}
+	serving := len(w.desiredPackages) > 0 || w.desiredLocal != nil ||
+		w.desiredPrivatePlacement != nil || len(w.observedRemote) > 0
+	if job && serving || !job && w.spec.IsJob() {
+		return ExcludedModeConflict, 0
+	}
+	if c.sessions[w.bootID] == nil {
+		return "", 0
+	}
+	return "", w.held + w.seats.reserved
 }
 
 // Orchestrator is the Cozy daemon's scheduling role.

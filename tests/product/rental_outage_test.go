@@ -78,9 +78,9 @@ func TestRentalHubOutageKeepsTheRequestQueued(t *testing.T) {
 			observations.Add(1)
 			return "", exit.Unavailablef("Tensorhub is temporarily unreachable")
 		}
-		options.AcquireManagedRental = func(records.Request) (orchestrator.RentalDecision, string, *exit.Error) {
+		options.AcquireManagedRental = func(records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 			t.Fatal("rental acquisition ran without a readable fleet")
-			return orchestrator.RentalDecision{}, "", nil
+			return orchestrator.PlacementDecision{}, "", nil
 		}
 	})
 

@@ -619,20 +619,6 @@ func (m ModelRef) Pin(rung ModelRung) ModelRef {
 	return m
 }
 
-// PinModels binds every unpinned ref to the rung fitting `accelerator`. The second
-// return names the first slot no rung fits, in which case the machine is not a candidate.
-func PinModels(models []ModelRef, accelerator string) ([]ModelRef, string) {
-	out := make([]ModelRef, 0, len(models))
-	for _, model := range models {
-		rung, _, ok := model.RungFor(accelerator)
-		if !ok {
-			return nil, model.Slot
-		}
-		out = append(out, model.Pin(rung))
-	}
-	return out, ""
-}
-
 // How a machine-class decision sized the device (cl-168).
 const (
 	// FitComponents: the card published every component's bytes, so the need is the

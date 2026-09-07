@@ -438,9 +438,9 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 }
 
 func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
-	// Cheapest first, on the same key the scheduler ranks by (rental.CheapestCompatibleSKU):
-	// the combined micros a renter actually pays, tie-broken by name so equal-priced rows
-	// hold still between runs. The sort key is the column the table shows, never its
+	// Cheapest first on the combined micros a renter actually pays — the rate the
+	// placement decision reads — tie-broken by name so equal-priced rows hold still
+	// between runs. The sort key is the column the table shows, never its
 	// formatted text.
 	ladder := append([]hub.RentalSKU(nil), skus...)
 	total := func(sku hub.RentalSKU) int64 {

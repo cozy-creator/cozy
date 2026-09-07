@@ -74,10 +74,10 @@ func TestRemoteJobUnknownSelectionRequiresCheckpointPreparation(t *testing.T) {
 	connection, _ := startFakePod(t, t.TempDir(), pod)
 	o := hostOwner(t, "job-unknown-selection", rentalWiring(connection, private), func(options *orchestrator.Options) {
 		options.RentalFleet = func() (string, *exit.Error) { return "one existing rental", nil }
-		options.AcquireManagedRental = func(req records.Request) (orchestrator.RentalDecision, string, *exit.Error) {
+		options.AcquireManagedRental = func(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 			fleetSelections.Add(1)
 			_, problem := options.Store.PinRental(req.ID, podRental, nil)
-			return orchestrator.RentalDecision{RentalID: podRental}, "", problem
+			return orchestrator.PlacementDecision{RentalID: podRental}, "", problem
 		}
 	})
 	first, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: "unknown-selection", Package: pkg,

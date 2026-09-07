@@ -264,19 +264,17 @@ func offeredNames(skus []hub.RentalSKU) string {
 	return strings.Join(names, ", ")
 }
 
-// acquire is the capacity decision for a --rental request no rental holds a placement
-// for (residency-aware-routing.md §3.2, D4; cl-166). REUSE FIRST: among the fleet's ready
-// rentals the candidates are those the request's binding ladder FITS — the rung whose gpu
-// pattern names the rental's accelerator pins that machine's lane — ranked by spare
-// capacity, then warmth (RankRentals). Rung order ranks no machine here: a live fitting
-// 5090 with room beats buying an H100. BUY only when no ready rental fits, or every
-// fitting one is measured saturated; then the ladder is walked in the owner's order,
-// cheapest fitting in-stock product per rung, and a hub inventory refusal falls through
-// to the next machine. --rental is permission AND intent to spend (owner ruling
-// 2026-09-03) regardless of what local holds on disk. The chosen rental is pinned to THIS
-// request alone, with the lane the winning machine's rung names, in one write.
-func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecision, string, *exit.Error) {
-	var none orchestrator.RentalDecision
+// acquire is the placement decision for a --rental request no rental holds a placement
+// for (placement-economics.md, cl-165). The candidates are the fleet's attached ready
+// rentals — the cl-132 exclusions still apply — and the catalog's purchasable products,
+// each pinned to the lane its rung of the binding ladder selects and priced from the
+// live catalog; the model's published throughput rows give each its expected time and
+// cost, and placement.prefer picks. --rental is permission AND intent to spend (owner
+// ruling 2026-09-03). The chosen machine is pinned to THIS request alone, with the lane
+// its rung names, in one write; a buy the hub refuses for stock drops that product and
+// the choice repeats.
+func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
+	var none orchestrator.PlacementDecision
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !req.Rental || req.Worker != "" {
@@ -293,9 +291,82 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 	if problem != nil {
 		return none, "", problem
 	}
-	rows, problem := m.store.Rentals()
+	bySKU := make(map[string]hub.RentalSKU, len(skus))
+	for _, sku := range skus {
+		bySKU[sku.Name] = sku
+	}
+	decision := orchestrator.PlacementDecision{Tier: m.ctx.Cfg.PlacementPrefer,
+		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models)}
+	attached, problem := m.attachedLocked(req, bySKU, needsAccelerator)
 	if problem != nil {
 		return none, "", problem
+	}
+	purchases := rental.Purchases(skus, req.Models, needsAccelerator, releaseConstraints(m.ctx, req))
+	var capped *exit.Error
+	for i := range purchases {
+		c := &purchases[i]
+		if c.Verdict != "" {
+			continue
+		}
+		if problem := m.admitLocked(bySKU[c.SKU]); problem != nil {
+			c.Verdict, capped = orchestrator.VerdictExcluded+problem.ErrName(), problem
+		}
+	}
+	decision.Candidates = append(attached, purchases...)
+	rows, problem := m.throughputLocked(req)
+	if problem != nil {
+		return none, "", problem
+	}
+	decision.Throughput = rental.Measure(decision.Candidates, rows, req.Models)
+	for {
+		i := rental.Place(decision.Tier, decision.Candidates)
+		if i < 0 {
+			return none, "", refusal(req, decision, capped)
+		}
+		c := &decision.Candidates[i]
+		rentalID := c.Rental
+		if !c.Attached() {
+			row, problem := m.buyLocked(req, *c, bySKU[c.SKU])
+			if problem != nil {
+				if problem.ErrName() != "rental.sku_out_of_stock" && problem.ErrName() != "rental.sku_unavailable" {
+					return none, "", problem
+				}
+				c.Verdict = orchestrator.VerdictNoStock
+				fmt.Fprintf(m.ctx.Out, "rentals: %s has no inventory; choosing again without it\n", c.SKU)
+				continue
+			}
+			rentalID, decision.Bought = row.ID, true
+		}
+		rental.Conclude(decision.Candidates, i)
+		decision.RentalID, decision.Models = rentalID, c.Models
+		pinned, problem := m.store.PinRental(req.ID, rentalID, c.Models)
+		if problem != nil {
+			return none, "", problem
+		}
+		if !pinned {
+			if !decision.Bought {
+				return none, "", exit.New(exit.Canceled, "request %s settled before rental assignment", req.ID)
+			}
+			if _, releaseProblem := m.releaseLocked(rentalID); releaseProblem != nil {
+				return none, "", releaseProblem
+			}
+			return none, "", exit.New(exit.Canceled,
+				"request %s settled while rental %s was starting; the rental was released", req.ID, rentalID)
+		}
+		line, problem := m.lineLocked()
+		return decision, line, problem
+	}
+}
+
+// attachedLocked is every rental the fleet holds as a candidate: with the reason it
+// cannot take this request, or, when it can, the attempts ahead of a new one. Nothing
+// is silently dropped (cl-132): a decision reporting no attached candidate while the
+// fleet holds two is the shape that read as waste live.
+func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hub.RentalSKU,
+	needsAccelerator bool) ([]orchestrator.PlacementCandidate, *exit.Error) {
+	rows, problem := m.store.Rentals()
+	if problem != nil {
+		return nil, problem
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].HourlyRateUSDMicros != rows[j].HourlyRateUSDMicros {
@@ -303,238 +374,121 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.RentalDecisi
 		}
 		return rows[i].ID < rows[j].ID
 	})
-	vram := make(map[string]int64, len(skus))
-	for _, sku := range skus {
-		vram[sku.Name] = sku.VRAMGB
-	}
-	// Every rental the fleet holds but cannot use is recorded with its reason, not
-	// silently dropped (cl-132). A buy that reports "0 ready rentals" while the fleet
-	// holds two of them is the shape that read as waste live, and the reader could not
-	// tell an empty fleet from an ineligible one.
-	var candidates []orchestrator.RentalCandidate
-	var excluded []orchestrator.RentalExclusion
-	machine := make(map[string]string, len(rows))
+	out := make([]orchestrator.PlacementCandidate, 0, len(rows))
 	for _, row := range rows {
-		machine[row.ID] = row.MachineName
-		exclude := func(reason string) {
-			excluded = append(excluded, orchestrator.RentalExclusion{RentalID: row.ID, Reason: reason})
+		c := orchestrator.PlacementCandidate{Rental: row.ID, Machine: row.MachineName, SKU: row.SKU,
+			RateUSDMicrosPerHour: row.HourlyRateUSDMicros}
+		sku, offered := bySKU[row.SKU]
+		if offered {
+			c.RateUSDMicrosPerHour = sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour
 		}
+		reason, problem := m.standingLocked(row, needsAccelerator)
+		if problem != nil {
+			return nil, problem
+		}
+		var ok bool
 		switch {
-		case needsAccelerator && row.AcceleratorModel == "CPU":
-			exclude(orchestrator.ExcludedWrongClass)
-		case row.State != hub.RentalReady && row.State != "attached":
-			exclude(orchestrator.ExcludedNotReady)
-		case row.Address == "" || row.CertPath == "":
-			exclude(orchestrator.ExcludedUnattached)
+		case reason != "":
+			c.Verdict = orchestrator.VerdictExcluded + reason
 		default:
-			retained, problem := m.store.RentalHasRetainedJob(row.ID)
-			if problem != nil {
-				return none, "", problem
+			if c.Models, c.Rung, ok = rental.Pin(req.Models, row.AcceleratorModel); !ok {
+				c.Verdict = orchestrator.VerdictNoRung
+				break
 			}
-			if retained {
-				exclude(orchestrator.ExcludedModeConflict)
-				continue
-			}
-			spent, problem := orchestrator.RentalSpent(m.store, row)
-			if problem != nil {
-				return none, "", problem
-			}
-			if spent {
-				exclude(orchestrator.ExcludedSpent)
-				continue
-			}
-			pinned, slot := records.PinModels(req.Models, row.AcceleratorModel)
-			if slot != "" {
-				exclude(orchestrator.ExcludedGPUMismatch + ": " + slot)
-				continue
-			}
-			candidate := orchestrator.RentalCandidate{RentalID: row.ID, Models: pinned}
-			if needsAccelerator {
+			c.Lane = records.Lanes(c.Models)
+			if needsAccelerator && offered {
 				// A machine the user already has up is held to the same floor as a buy;
 				// the catalog's memory figure for its product is the fact (a product gone
 				// from the catalog this minute decides nothing).
-				need := records.Resident(pinned)
-				candidate.Fit, candidate.ResidentBytes, candidate.VRAMBytes = need.Fit, need.Bytes, vram[row.SKU]<<30
-				if verdict := rental.Fit(need, vram[row.SKU], row.SKU); vram[row.SKU] > 0 && verdict != "" {
-					exclude(verdict)
-					continue
-				}
+				need := records.Resident(c.Models)
+				c.Fit, c.Verdict = rental.FitNote(need, sku.VRAMGB), rental.Fit(need, sku.VRAMGB, row.SKU)
 			}
+			if c.Verdict != "" {
+				break
+			}
+			mode, held := m.owner.RentalStanding(row.ID, req.IsJob())
 			queued, _, problem := m.store.RentalRunCounts(row.ID)
 			if problem != nil {
-				return none, "", problem
+				return nil, problem
 			}
-			candidate.Queued = queued
-			candidates = append(candidates, candidate)
+			c.Ahead = queued + held
+			if mode != "" {
+				c.Verdict = orchestrator.VerdictExcluded + mode
+			}
 		}
+		out = append(out, c)
 	}
-	ids := make([]string, 0, len(candidates))
-	for _, candidate := range candidates {
-		ids = append(ids, candidate.RentalID)
+	return out, nil
+}
+
+// standingLocked is the fleet-side reason a rental cannot take any new placement, or "".
+func (m *managedRentals) standingLocked(row records.Rental, needsAccelerator bool) (string, *exit.Error) {
+	switch {
+	case needsAccelerator && row.AcceleratorModel == "CPU":
+		return orchestrator.ExcludedWrongClass, nil
+	case row.State != hub.RentalReady && row.State != "attached":
+		return orchestrator.ExcludedNotReady, nil
+	case row.Address == "" || row.CertPath == "":
+		return orchestrator.ExcludedUnattached, nil
 	}
-	compatible, modeExcluded := m.owner.ModeCompatibleRentalsWithExclusions(ids, req.IsJob())
-	excluded = append(excluded, modeExcluded...)
-	keep := make(map[string]bool, len(compatible))
-	for _, id := range compatible {
-		keep[id] = true
-	}
-	fitting := candidates[:0]
-	for _, candidate := range candidates {
-		if keep[candidate.RentalID] {
-			fitting = append(fitting, candidate)
-		}
-	}
-	ranked := m.owner.RankRentals(fitting)
-	chosen, saturated, problem := m.unsaturated(ranked)
+	retained, problem := m.store.RentalHasRetainedJob(row.ID)
 	if problem != nil {
-		return none, "", problem
+		return "", problem
 	}
-	excluded = append(excluded, saturated...)
-	for i := range excluded {
-		excluded[i].Machine = machine[excluded[i].RentalID]
+	if retained {
+		return orchestrator.ExcludedModeConflict, nil
 	}
-	if chosen != nil {
-		pinned, pinProblem := m.store.PinRental(req.ID, chosen.RentalID, chosen.Models)
-		if pinProblem != nil {
-			return none, "", pinProblem
-		}
-		if !pinned {
-			return none, "", exit.New(exit.Canceled,
-				"request %s settled before rental assignment", req.ID)
-		}
-		line, lineProblem := m.lineLocked()
-		return orchestrator.RentalDecision{RentalID: chosen.RentalID, Candidates: ranked,
-			Excluded: excluded, Models: chosen.Models}, line, lineProblem
+	spent, problem := orchestrator.RentalSpent(m.store, row)
+	if problem != nil {
+		return "", problem
 	}
-	return m.buyLocked(req, skus, needsAccelerator, ranked, excluded)
+	if spent {
+		return orchestrator.ExcludedSpent, nil
+	}
+	return "", nil
 }
 
-// unsaturated is the owner's measured rule for passing over a fitting rental: only when
-// the work queued ahead on it is expected to outlast a fresh pod's cold path for the lane,
-// BOTH as this host has observed them (the median attempt on that rental; the paid ask to
-// first dispatch of a pod bought for the same manifests). A rental with a free attempt
-// slot, or with nothing ahead, is never saturated; with either quantity unobserved nothing
-// is — a buy on no evidence is the expensive mistake, and the first buy on an empty fleet
-// is what produces the evidence.
-func (m *managedRentals) unsaturated(ranked []orchestrator.RentalCoverage) (
-	*orchestrator.RentalCoverage, []orchestrator.RentalExclusion, *exit.Error,
-) {
-	var excluded []orchestrator.RentalExclusion
-	for i := range ranked {
-		row := &ranked[i]
-		if row.Room > 0 || row.Ahead() == 0 {
-			return row, excluded, nil
-		}
-		manifests := make([]string, 0, len(row.Models))
-		for _, model := range row.Models {
-			manifests = append(manifests, model.Manifest)
-		}
-		cold, observedCold, problem := m.store.ObservedColdPath(manifests)
-		if problem != nil {
-			return nil, nil, problem
-		}
-		pace, observedPace, problem := m.store.ObservedAttemptDuration(row.RentalID)
-		if problem != nil {
-			return nil, nil, problem
-		}
-		wait := time.Duration(row.Ahead()) * pace
-		if !observedCold || !observedPace || wait <= cold {
-			return row, excluded, nil
-		}
-		excluded = append(excluded, orchestrator.RentalExclusion{RentalID: row.RentalID,
-			Reason: fmt.Sprintf("%s: %d ahead × %s = %s, over the observed %s cold path",
-				orchestrator.ExcludedSaturated, row.Ahead(), roughDuration(pace),
-				roughDuration(wait), roughDuration(cold))})
+// throughputLocked reads the model's published throughput rows once per decision. A
+// request binding no model has nothing to look up.
+func (m *managedRentals) throughputLocked(req records.Request) ([]hub.ModelThroughput, *exit.Error) {
+	if len(req.Models) == 0 {
+		return nil, nil
 	}
-	return nil, excluded, nil
+	ref, problem := hub.ParseRef(req.Models[0].Model)
+	if problem != nil {
+		return nil, problem
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	return client(m.ctx).ModelThroughput(hctx, ref)
 }
 
-// buyLocked walks the ladder's fitting products in order and buys the first the hub has
-// stock for. Each step pins the request's selection to that machine's lane BEFORE the
-// paid ask, so the rental POST declares the lane the pod will hold (th-155); a step the
-// hub refuses for inventory is recorded and the walk continues.
-func (m *managedRentals) buyLocked(req records.Request, skus []hub.RentalSKU, needsAccelerator bool,
-	ranked []orchestrator.RentalCoverage, excluded []orchestrator.RentalExclusion,
-) (orchestrator.RentalDecision, string, *exit.Error) {
-	var none orchestrator.RentalDecision
-	steps, decision := rental.Plan(skus, req.Models, needsAccelerator, releaseConstraints(m.ctx, req))
-	if len(steps) == 0 {
-		if decision.Mismatch != "" {
-			// Refused BEFORE the paid ask, in the pod's own vocabulary. Publication stays
-			// base-independent: the release is published and simply unqualified here.
-			return none, "", exit.Named(exit.Unavailable, "rental.package_base_incompatible",
-				"no rentable machine can run %s@%s — %s", req.Package, req.Release, decision.Mismatch).
-				WithRemedy("publish a release whose requirements one of Tensorhub's offered base images satisfies")
-		}
-		return none, "", exit.Named(exit.Capacity, "rental.no_fitting_sku",
-			"no rental SKU on offer fits %s: %s", req.Package, verdicts(decision)).
-			WithRemedy("bind a lane that fits an offered machine (cozy package bind … --gpu <GPU>=<lane>), " +
-				"or override with model.<param>=org/model@release/lane")
-	}
-	current, currentProblem := m.store.RequestRow(req.ID)
-	if currentProblem != nil {
-		return none, "", currentProblem
+// buyLocked is one paid ask for the chosen product. The request's selection is pinned to
+// that machine's lane BEFORE the ask, so the rental POST declares the lane the pod will
+// hold (th-155), and the boot is named while it passes (cl-121).
+func (m *managedRentals) buyLocked(req records.Request, c orchestrator.PlacementCandidate,
+	sku hub.RentalSKU) (records.Rental, *exit.Error) {
+	current, problem := m.store.RequestRow(req.ID)
+	if problem != nil {
+		return records.Rental{}, problem
 	}
 	if current == nil || settledRequest(current.State) {
-		return none, "", exit.New(exit.Canceled, "request %s settled before rental acquisition", req.ID)
+		return records.Rental{}, exit.New(exit.Canceled, "request %s settled before rental acquisition", req.ID)
 	}
-	var refused []int
-	for i, step := range steps {
-		if problem := m.admitLocked(step.SKU); problem != nil {
-			return none, "", problem
-		}
-		if problem := m.store.PinRequestModels(req.ID, step.Models); problem != nil {
-			return none, "", problem
-		}
-		fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s (%s)\n", step.SKU.Name, skuRate(step.SKU), stepNote(step))
-		row, problem := m.rentLocked(req, step)
-		if problem != nil {
-			if problem.ErrName() != "rental.sku_out_of_stock" && problem.ErrName() != "rental.sku_unavailable" {
-				return none, "", problem
-			}
-			refused = append(refused, i)
-			fmt.Fprintf(m.ctx.Out, "rentals: %s has no inventory; walking to the next fitting machine\n",
-				step.SKU.Name)
-			continue
-		}
-		rental.Conclude(&decision, steps, refused, i)
-		pinned, problem := m.store.PinRental(req.ID, row.ID, step.Models)
-		if problem != nil {
-			return none, "", problem
-		}
-		if !pinned {
-			if _, releaseProblem := m.releaseLocked(row.ID); releaseProblem != nil {
-				return none, "", releaseProblem
-			}
-			return none, "", exit.New(exit.Canceled,
-				"request %s settled while rental %s was starting; the rental was released", req.ID, row.ID)
-		}
-		line, problem := m.lineLocked()
-		return orchestrator.RentalDecision{RentalID: row.ID, Bought: true, Candidates: ranked,
-			Excluded: excluded, SKU: &decision, Models: step.Models}, line, problem
+	if problem := m.store.PinRequestModels(req.ID, c.Models); problem != nil {
+		return records.Rental{}, problem
 	}
-	rental.Conclude(&decision, steps, refused, -1)
-	names := make([]string, 0, len(steps))
-	for _, step := range steps {
-		names = append(names, step.SKU.Name)
-	}
-	return none, "", exit.Named(exit.Capacity, "rental.no_inventory",
-		"every rental SKU fitting %s is out of stock right now (%s) — NOTHING was rented",
-		req.Package, strings.Join(names, ", ")).
-		WithRemedy("this is a stock-out, not a bad ladder: retry in a minute or two")
-}
-
-// rentLocked is one paid ask for one step, with the boot named while it passes (cl-121).
-func (m *managedRentals) rentLocked(req records.Request, step rental.Step) (records.Rental, *exit.Error) {
+	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s (rung %d, lane %s, fit %s)\n",
+		sku.Name, skuRate(sku), c.Rung, orNone(c.Lane), orNone(c.Fit))
 	m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{Name: orchestrator.PhaseAcquiring})
 	defer m.owner.ForgetPhase(req.ID)
 	operationKey, problem := m.store.ManagedRentalOperationKey(req.ID)
 	if problem != nil {
 		return records.Rental{}, problem
 	}
-	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, step.SKU.Name,
+	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name,
 		operationKey, rental.AcquisitionReason(req),
-		step.SKU.PriceUSDMicrosPerHour, step.SKU.StorageUSDMicrosPerHour,
+		sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
 		m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID,
 		func(seen hub.Rental) {
 			// A failure carried by a rental that is BACK in pending_acquisition is the
@@ -558,29 +512,43 @@ func (m *managedRentals) rentLocked(req records.Request, step rental.Step) (reco
 	return row, problem
 }
 
-// stepNote renders one walk step for the log: its rung, lane and how the device was sized.
-func stepNote(step rental.Step) string {
-	note := fmt.Sprintf("rung %d, lane %s", step.Rung, orNone(records.Lanes(step.Models)))
-	switch step.Fit.Fit {
-	case records.FitComponents:
-		note += fmt.Sprintf(", fit %s %.1f GiB of %d GB", records.FitComponents,
-			float64(step.Fit.Bytes)/(1<<30), step.SKU.VRAMGB)
-	case records.FitRungAsserted:
-		note += ", fit " + records.FitRungAsserted
+// refusal names why nothing could be placed, in the order a reader can act on: a
+// stock-out to retry, a spend cap to raise, a release no offered base image runs, a
+// ladder no offered machine fits — each with every candidate's verdict.
+func refusal(req records.Request, d orchestrator.PlacementDecision, capped *exit.Error) *exit.Error {
+	var noStock, verdicts []string
+	mismatch := ""
+	for _, c := range d.Candidates {
+		verdicts = append(verdicts, c.Name()+" "+c.Verdict)
+		if c.Verdict == orchestrator.VerdictNoStock {
+			noStock = append(noStock, c.SKU)
+		}
+		if reason, ok := strings.CutPrefix(c.Verdict,
+			orchestrator.VerdictExcluded+orchestrator.ExcludedBaseMismatch+": "); ok && mismatch == "" {
+			mismatch = c.SKU + ": " + reason
+		}
 	}
-	return note
-}
-
-// verdicts renders why every offered product was excluded, for a refusal with no step.
-func verdicts(decision orchestrator.SKUDecision) string {
-	if len(decision.Offered) == 0 {
-		return "the catalog offers no product of this class"
+	switch {
+	case len(noStock) > 0:
+		return exit.Named(exit.Capacity, "rental.no_inventory",
+			"every rental SKU fitting %s is out of stock right now (%s) — NOTHING was rented",
+			req.Package, strings.Join(noStock, ", ")).
+			WithRemedy("this is a stock-out, not a bad ladder: retry in a minute or two")
+	case capped != nil:
+		return capped
+	case mismatch != "":
+		// Refused BEFORE the paid ask, in the pod's own vocabulary. Publication stays
+		// base-independent: the release is published and simply unqualified here.
+		return exit.Named(exit.Unavailable, "rental.package_base_incompatible",
+			"no rentable machine can run %s@%s — %s", req.Package, req.Release, mismatch).
+			WithRemedy("publish a release whose requirements one of Tensorhub's offered base images satisfies")
+	case len(verdicts) == 0:
+		verdicts = []string{"the catalog offers no product of this class"}
 	}
-	parts := make([]string, 0, len(decision.Offered))
-	for _, row := range decision.Offered {
-		parts = append(parts, row.Name+" "+row.Verdict)
-	}
-	return strings.Join(parts, "; ")
+	return exit.Named(exit.Capacity, "rental.no_fitting_sku",
+		"no rental SKU on offer fits %s: %s", req.Package, strings.Join(verdicts, "; ")).
+		WithRemedy("bind a lane that fits an offered machine (cozy package bind … --gpu <GPU>=<lane>), " +
+			"or override with model.<param>=org/model@release/lane")
 }
 
 func (m *managedRentals) catalogLocked() ([]hub.RentalSKU, *exit.Error) {

@@ -32,7 +32,7 @@ const (
 	// textEncoderNeed is the largest group any H3 method holds resident: the text
 	// conditioning's 51.5 GiB encoder. Every DiT sample holds one ~20 GiB DiT.
 	textEncoderNeed    = 103 * gib / 2
-	textEncoderVerdict = "vram_short: needs 51.5 GiB resident (condition_text: text_encoder)"
+	textEncoderVerdict = "excluded:vram_short: needs 51.5 GiB resident (condition_text: text_encoder)"
 )
 
 // h3Components is the fp8-adaln-pruned lane as the card publishes it: 103 GB in five
@@ -95,20 +95,31 @@ func market20260907() []hub.RentalSKU {
 	}
 }
 
-func stepNames(steps []rental.Step) []string {
-	out := make([]string, 0, len(steps))
-	for _, step := range steps {
-		out = append(out, step.SKU.Name)
+// walk is the order the choice would buy in if the hub refused every product for stock in
+// turn: each pick is marked no_stock and the choice repeats on a copy of the candidates.
+func walk(candidates []orchestrator.PlacementCandidate) []string {
+	rows := append([]orchestrator.PlacementCandidate(nil), candidates...)
+	var out []string
+	for i := rental.Place("balanced", rows); i >= 0; i = rental.Place("balanced", rows) {
+		out = append(out, rows[i].Name())
+		rows[i].Verdict = orchestrator.VerdictNoStock
 	}
 	return out
 }
 
 // sized asserts one audit row says what it compared.
-func sized(t *testing.T, row orchestrator.SKUCandidate, fit string, resident, vramGB int64) {
+func sized(t *testing.T, row orchestrator.PlacementCandidate, fit string) {
 	t.Helper()
-	if row.Fit != fit || row.ResidentBytes != resident || row.VRAMBytes != vramGB<<30 {
-		t.Fatalf("%s recorded fit=%q resident=%d vram=%d; want %s %d %d GB", row.Name, row.Fit,
-			row.ResidentBytes, row.VRAMBytes, fit, resident, vramGB)
+	if row.Fit != fit {
+		t.Fatalf("%s recorded fit=%q; want %q", row.Name(), row.Fit, fit)
+	}
+}
+
+func mark(candidates []orchestrator.PlacementCandidate, name, verdict string) {
+	for i := range candidates {
+		if candidates[i].Name() == name {
+			candidates[i].Verdict = verdict
+		}
 	}
 }
 
@@ -116,13 +127,13 @@ func TestLadderWalkNeversBuysWhatTheLaneCannotFit(t *testing.T) {
 	// The defect as it happened: the H3 ladder against a market whose only cards were
 	// 24 GB and 32 GB. Both land on the catch-all bf16 rung, whose text encoder alone
 	// outweighs them: nothing is bought, and the record says the need per card.
-	steps, decision := rental.Plan(market20260907()[:2], h3Ladder(), true, rental.Constraints{})
-	if len(steps) != 0 {
-		t.Fatalf("a lane whose text encoder is 51.5 GiB was given a machine to buy: %v", stepNames(steps))
+	decision := rental.Purchases(market20260907()[:2], h3Ladder(), true, rental.Constraints{})
+	if bought := walk(decision); len(bought) != 0 {
+		t.Fatalf("a lane whose text encoder is 51.5 GiB was given a machine to buy: %v", bought)
 	}
 	for _, name := range []string{"rtx-4090", "rtx-5090"} {
 		if verdict := find(t, decision, name).Verdict; !strings.HasPrefix(verdict, textEncoderVerdict) {
-			t.Fatalf("%s recorded %q; want a %s verdict naming the resident need", name, verdict, orchestrator.VerdictVRAMShort)
+			t.Fatalf("%s recorded %q; want a %s verdict naming the resident need", name, verdict, orchestrator.ExcludedVRAMShort)
 		}
 	}
 
@@ -130,48 +141,48 @@ func TestLadderWalkNeversBuysWhatTheLaneCannotFit(t *testing.T) {
 	// within a rung, and price never lifts a later rung over an earlier one — the $5.99
 	// B200 (rung 2) precedes the $3.59 H200 (rung 3). The 103 GB fp8 lane fits both H100s
 	// because no method holds more than its 51.5 GiB text encoder (the production case).
-	steps, decision = rental.Plan(market20260907(), h3Ladder(), true, rental.Constraints{})
-	if got := strings.Join(stepNames(steps), " "); got != "h100-80 h100-nvl b200 h200" {
+	decision = rental.Purchases(market20260907(), h3Ladder(), true, rental.Constraints{})
+	if got := strings.Join(walk(decision), " "); got != "h100-80 h100-nvl b200 h200" {
 		t.Fatalf("walk order %q; want h100-80 h100-nvl b200 h200", got)
 	}
-	if steps[0].Rung != 1 || steps[0].Models[0].Lane != "fp8-adaln-pruned" || steps[0].Models[0].Manifest != fp8Manifest {
-		t.Fatalf("the H100 step pins %+v; want rung 1 fp8-adaln-pruned", steps[0].Models[0])
+	if h100 := find(t, decision, "h100-80"); h100.Rung != 1 || h100.Lane != "fp8-adaln-pruned" || h100.Models[0].Manifest != fp8Manifest {
+		t.Fatalf("the H100 candidate pins %+v; want rung 1 fp8-adaln-pruned", h100)
 	}
-	if steps[2].Models[0].Lane != "mxfp8-adaln-pruned" || steps[3].Models[0].Lane != "bf16-full" {
-		t.Fatalf("B200 and H200 steps pin %q and %q; want mxfp8-adaln-pruned and bf16-full",
-			steps[2].Models[0].Lane, steps[3].Models[0].Lane)
+	if find(t, decision, "b200").Lane != "mxfp8-adaln-pruned" || find(t, decision, "h200").Lane != "bf16-full" {
+		t.Fatalf("B200 and H200 pin %q and %q; want mxfp8-adaln-pruned and bf16-full",
+			find(t, decision, "b200").Lane, find(t, decision, "h200").Lane)
 	}
-	sized(t, find(t, decision, "h100-80"), records.FitComponents, textEncoderNeed, 80)
-	sized(t, find(t, decision, "h100-nvl"), records.FitComponents, textEncoderNeed, 94)
+	sized(t, find(t, decision, "h100-80"), "components 51.5 GiB of 80 GB")
+	sized(t, find(t, decision, "h100-nvl"), "components 51.5 GiB of 94 GB")
 	// The mxfp8 lane publishes no component bytes: the owner's B200 rung is the fit, and
 	// the record says so rather than pretending a figure was compared.
-	sized(t, find(t, decision, "b200"), records.FitRungAsserted, 0, 180)
-	sized(t, find(t, decision, "h200"), records.FitComponents, textEncoderNeed, 141)
+	sized(t, find(t, decision, "b200"), records.FitRungAsserted)
+	sized(t, find(t, decision, "h200"), "components 51.5 GiB of 141 GB")
 	for _, name := range []string{"rtx-4090", "rtx-5090"} {
 		row := find(t, decision, name)
 		if row.Rung != 3 || row.Lane != "bf16-full" || !strings.HasPrefix(row.Verdict, textEncoderVerdict) {
-			t.Fatalf("%s recorded %+v; want rung 3 bf16-full %s", name, row, orchestrator.VerdictVRAMShort)
+			t.Fatalf("%s recorded %+v; want rung 3 bf16-full %s", name, row, orchestrator.ExcludedVRAMShort)
 		}
 	}
-	sized(t, find(t, decision, "rtx-4090"), records.FitComponents, textEncoderNeed, 24)
+	sized(t, find(t, decision, "rtx-4090"), "components 51.5 GiB of 24 GB")
 	absent(t, decision, "cpu")
-	if len(decision.Ladder) != 1 || decision.Ladder[0] != "H100=fp8-adaln-pruned > B200=mxfp8-adaln-pruned > *=bf16-full" {
-		t.Fatalf("the record does not carry the ladder it walked: %v", decision.Ladder)
+	if ladder := rental.Ladder(h3Ladder()); len(ladder) != 1 || ladder[0] != "H100=fp8-adaln-pruned > B200=mxfp8-adaln-pruned > *=bf16-full" {
+		t.Fatalf("the record does not carry the ladder it walked: %v", ladder)
 	}
 
-	// The hub refuses the first H100 for inventory; the walk continues within the rung
-	// and the record explains every row — no_inventory, chosen, dearer, later_rung.
-	rental.Conclude(&decision, steps, []int{0}, 1)
-	want := map[string]string{"h100-80": orchestrator.VerdictNoInventory, "h100-nvl": "",
-		"b200": orchestrator.VerdictLaterRung + ": rung 2", "h200": orchestrator.VerdictLaterRung + ": rung 3"}
+	// The hub refuses the first H100 for inventory; the choice repeats within the rung
+	// and the record explains every row — no_stock, chosen, unmeasured.
+	mark(decision, "h100-80", orchestrator.VerdictNoStock)
+	rental.Conclude(decision, rental.Place("balanced", decision))
+	want := map[string]string{"h100-80": orchestrator.VerdictNoStock, "h100-nvl": orchestrator.VerdictChosen,
+		"b200": orchestrator.VerdictUnmeasured, "h200": orchestrator.VerdictUnmeasured}
 	for name, verdict := range want {
 		if got := find(t, decision, name).Verdict; got != verdict {
 			t.Fatalf("%s recorded verdict %q; want %q", name, got, verdict)
 		}
 	}
-	if decision.Chosen != "h100-nvl" || decision.UnexplainedPick() != "" {
-		t.Fatalf("chosen=%q unexplained=%q; want h100-nvl with every other row explained",
-			decision.Chosen, decision.UnexplainedPick())
+	if record := (orchestrator.PlacementDecision{Candidates: decision}); record.Unexplained() != "" {
+		t.Fatalf("unexplained=%q; want every row explained", record.Unexplained())
 	}
 }
 
@@ -179,8 +190,8 @@ func TestExplicitLaneIsHeldToTheSameFloor(t *testing.T) {
 	// `model.<param>=paul/minimax-h3@1.0.0-rc.1/fp8-adaln-pruned` pins the 103 GB lane; the
 	// buy takes the cheapest card that holds its largest resident group — the 80 GB H100
 	// — and refuses the 24 GB and 32 GB cards naming the 51.5 GiB text encoder.
-	steps, decision := rental.Plan(market20260907(), []records.ModelRef{fp8Exact()}, true, rental.Constraints{})
-	if got := strings.Join(stepNames(steps), " "); got != "h100-80 h100-nvl h200 b200" {
+	decision := rental.Purchases(market20260907(), []records.ModelRef{fp8Exact()}, true, rental.Constraints{})
+	if got := strings.Join(walk(decision), " "); got != "h100-80 h100-nvl h200 b200" {
 		t.Fatalf("an explicit fp8 lane may buy %q; want h100-80 h100-nvl h200 b200", got)
 	}
 	for _, name := range []string{"rtx-4090", "rtx-5090"} {
@@ -190,11 +201,12 @@ func TestExplicitLaneIsHeldToTheSameFloor(t *testing.T) {
 			t.Fatalf("%s recorded %q; want the need and the card's memory", name, row.Verdict)
 		}
 	}
-	sized(t, find(t, decision, "rtx-4090"), records.FitComponents, textEncoderNeed, 24)
-	sized(t, find(t, decision, "h100-80"), records.FitComponents, textEncoderNeed, 80)
-	rental.Conclude(&decision, steps, nil, 0)
-	if decision.Chosen != "h100-80" || find(t, decision, "h100-nvl").Verdict != orchestrator.VerdictDearer {
-		t.Fatalf("chosen %q, h100-nvl %q; want h100-80 with h100-nvl dearer", decision.Chosen, find(t, decision, "h100-nvl").Verdict)
+	sized(t, find(t, decision, "rtx-4090"), "components 51.5 GiB of 24 GB")
+	sized(t, find(t, decision, "h100-80"), "components 51.5 GiB of 80 GB")
+	rental.Conclude(decision, rental.Place("balanced", decision))
+	if find(t, decision, "h100-80").Verdict != orchestrator.VerdictChosen || find(t, decision, "h100-nvl").Verdict != orchestrator.VerdictUnmeasured {
+		t.Fatalf("h100-80 %q, h100-nvl %q; want h100-80 chosen with h100-nvl unmeasured",
+			find(t, decision, "h100-80").Verdict, find(t, decision, "h100-nvl").Verdict)
 	}
 }
 
@@ -219,11 +231,11 @@ func TestComponentFitHoldsTheOwnersRung(t *testing.T) {
 		need.Need != "condition_text: text_encoder; condition_text: text_encoder" {
 		t.Fatalf("two slots sized %+v; want 103 GiB", need)
 	}
-	steps, decision := rental.Plan(market20260907(), two, true, rental.Constraints{})
-	if got := strings.Join(stepNames(steps), " "); got != "h200 b200" {
+	decision := rental.Purchases(market20260907(), two, true, rental.Constraints{})
+	if got := strings.Join(walk(decision), " "); got != "h200 b200" {
 		t.Fatalf("two text encoders may buy %q; want h200 b200", got)
 	}
-	if verdict := find(t, decision, "h100-80").Verdict; !strings.HasPrefix(verdict, "vram_short: needs 103.0 GiB resident (condition_text: text_encoder; condition_text: text_encoder), h100-80 has 80 GB") {
+	if verdict := find(t, decision, "h100-80").Verdict; !strings.HasPrefix(verdict, "excluded:vram_short: needs 103.0 GiB resident (condition_text: text_encoder; condition_text: text_encoder), h100-80 has 80 GB") {
 		t.Fatalf("h100-80 recorded %q; want both slots' needs", verdict)
 	}
 
@@ -234,11 +246,11 @@ func TestComponentFitHoldsTheOwnersRung(t *testing.T) {
 	if need := records.Resident([]records.ModelRef{asserted}); need.Fit != records.FitRungAsserted || need.Bytes != 0 {
 		t.Fatalf("a lane without component bytes sized %+v; want rung_asserted", need)
 	}
-	steps, decision = rental.Plan(market20260907(), []records.ModelRef{asserted}, true, rental.Constraints{})
-	if got := strings.Join(stepNames(steps), " "); got != "rtx-4090 rtx-5090 h100-80 h100-nvl h200 b200" {
+	decision = rental.Purchases(market20260907(), []records.ModelRef{asserted}, true, rental.Constraints{})
+	if got := strings.Join(walk(decision), " "); got != "rtx-4090 rtx-5090 h100-80 h100-nvl h200 b200" {
 		t.Fatalf("an asserted lane walked %q; want every card in price order", got)
 	}
-	sized(t, find(t, decision, "rtx-4090"), records.FitRungAsserted, 0, 24)
+	sized(t, find(t, decision, "rtx-4090"), records.FitRungAsserted)
 	if row := find(t, decision, "rtx-4090"); row.Verdict != "" {
 		t.Fatalf("an asserted lane was refused a card: %q", row.Verdict)
 	}
@@ -258,23 +270,22 @@ func TestComponentFitHoldsTheOwnersRung(t *testing.T) {
 func TestLadderWithoutCatchAllExcludesUnnamedClasses(t *testing.T) {
 	models := h3Ladder()
 	models[0].Ladder = models[0].Ladder[:2] // H100 and B200 only
-	steps, decision := rental.Plan(market20260907(), models, true, rental.Constraints{})
-	if got := strings.Join(stepNames(steps), " "); got != "h100-80 h100-nvl b200" {
+	decision := rental.Purchases(market20260907(), models, true, rental.Constraints{})
+	if got := strings.Join(walk(decision), " "); got != "h100-80 h100-nvl b200" {
 		t.Fatalf("walk %q; want h100-80 h100-nvl b200", got)
 	}
 	for _, name := range []string{"rtx-4090", "rtx-5090", "h200"} {
-		if row := find(t, decision, name); row.Verdict != orchestrator.VerdictGPUMismatch || row.Rung != 0 || row.Fit != "" {
-			t.Fatalf("%s recorded %+v; want %s on no rung, unsized", name, row, orchestrator.VerdictGPUMismatch)
+		if row := find(t, decision, name); row.Verdict != orchestrator.VerdictNoRung || row.Rung != 0 || row.Fit != "" {
+			t.Fatalf("%s recorded %+v; want %s on no rung, unsized", name, row, orchestrator.VerdictNoRung)
 		}
 	}
 	// A CPU-class request fits only through the catch-all, and has no device to check.
-	steps, _ = rental.Plan(market20260907(), models, false, rental.Constraints{})
-	if len(steps) != 0 {
-		t.Fatalf("a CPU box fits an H100/B200-only ladder: %v", stepNames(steps))
+	if bought := walk(rental.Purchases(market20260907(), models, false, rental.Constraints{})); len(bought) != 0 {
+		t.Fatalf("a CPU box fits an H100/B200-only ladder: %v", bought)
 	}
-	steps, decision = rental.Plan(market20260907(), h3Ladder(), false, rental.Constraints{})
-	if len(steps) != 1 || steps[0].SKU.Name != "cpu" || steps[0].Models[0].Lane != "bf16-full" || find(t, decision, "cpu").Fit != "" {
-		t.Fatalf("CPU class walked %v; want cpu alone on the catch-all lane, unsized", stepNames(steps))
+	decision = rental.Purchases(market20260907(), h3Ladder(), false, rental.Constraints{})
+	if got := walk(decision); len(got) != 1 || got[0] != "cpu" || find(t, decision, "cpu").Lane != "bf16-full" || find(t, decision, "cpu").Fit != "" {
+		t.Fatalf("CPU class walked %v; want cpu alone on the catch-all lane, unsized", got)
 	}
 }
 
@@ -302,14 +313,14 @@ func TestRungMatchingIsTheAcceleratorSubsequence(t *testing.T) {
 	if !ok || index != 2 || rung.Lane != "bf16-full" {
 		t.Fatalf("a 5090 fits rung %d %+v; want the catch-all bf16-full", index, rung)
 	}
-	pinned, missing := records.PinModels(models, "NVIDIA H100 NVL")
-	if missing != "" || !pinned[0].Pinned() || pinned[0].Lane != "fp8-adaln-pruned" || pinned[0].Ladder != nil ||
+	pinned, first, fits := rental.Pin(models, "NVIDIA H100 NVL")
+	if !fits || first != 1 || !pinned[0].Pinned() || pinned[0].Lane != "fp8-adaln-pruned" || pinned[0].Ladder != nil ||
 		pinned[0].ComponentBytes["text_encoder"] != textEncoderNeed || len(pinned[0].ComponentUse) != len(h3ComponentUse()) {
-		t.Fatalf("pinning to an H100 NVL gave %+v (missing %q)", pinned, missing)
+		t.Fatalf("pinning to an H100 NVL gave %+v (rung %d, fits %t)", pinned, first, fits)
 	}
 	models[0].Ladder = models[0].Ladder[:1]
-	if _, missing := records.PinModels(models, "NVIDIA H200"); missing != "generate.models.model" {
-		t.Fatalf("an H200 against an H100-only ladder should name the unfit slot; got %q", missing)
+	if _, _, fits := rental.Pin(models, "NVIDIA H200"); fits {
+		t.Fatal("an H200 fits an H100-only ladder")
 	}
 }
 
@@ -338,7 +349,7 @@ func TestRentalPinCarriesTheLaneAndARejectedBuyFreesTheNextRung(t *testing.T) {
 		row.Models[0].ComponentUse["sample_fl2va"][0] != "fl2va_dit" {
 		t.Fatalf("the unpinned ladder and its sizing facts did not survive the row: %+v", row.Models)
 	}
-	pinned, _ := records.PinModels(h3Ladder(), "NVIDIA H100 80GB HBM3")
+	pinned, _, _ := rental.Pin(h3Ladder(), "NVIDIA H100 80GB HBM3")
 	fatal(t, store.RecordRental(records.Rental{ID: "pr-ladder-h100", MachineName: "ladder-h100",
 		SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3", HourlyRateUSDMicros: 2_490_000,
 		State: "ready", Hub: "http://hub.example"}))
