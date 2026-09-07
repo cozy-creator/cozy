@@ -80,6 +80,8 @@ type fakePod struct {
 	serve bool
 	// jobReady advertises the independent job seat after accepting a JobDirective.
 	jobReady bool
+	// localJobOnly supplies a prepared interface without any serving entrypoints.
+	localJobOnly bool
 	// onJobReady can delay and sequence the independent peer's readiness facts.
 	onJobReady func(*pb.WorkerFrame, func(*pb.WorkerFrame) error) error
 	// answerOffer supplies a protocol outcome when a test exercises settlement.
@@ -467,6 +469,10 @@ func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream g
 	p.localPrepares = append(p.localPrepares, call)
 	p.lanes = append(p.lanes, "prepare_private")
 	p.mu.Unlock()
+	entrypoints := []*pb.Entrypoint{{Name: "tile", EntrypointBindingDigest: bytes.Repeat([]byte{0x34}, 32)}}
+	if p.localJobOnly {
+		entrypoints = nil
+	}
 	setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{{
 		PlacementId: "package-" + selected.OperationId,
 		PackageMode: &pb.Placement_Development{Development: &pb.DevelopmentPackage{
@@ -478,7 +484,7 @@ func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream g
 		EnvironmentDigest: bytes.Repeat([]byte{0x23}, 32),
 		PackageInterface:  &pb.Ref{Digest: bytes.Repeat([]byte{0x24}, 32), Length: 2048},
 		BindingsDigest:    bytes.Repeat([]byte{0x25}, 32),
-		Entrypoints:       []*pb.Entrypoint{{Name: "tile", EntrypointBindingDigest: bytes.Repeat([]byte{0x34}, 32)}},
+		Entrypoints:       entrypoints,
 		Environment:       &pb.Environment{},
 	}}})
 	if err != nil {
