@@ -31,15 +31,19 @@ func snapshotSource(installDir string, local *LocalSource) (string, *exit.Error)
 	}
 	for name, from := range dependencies {
 		to := filepath.Join(root, ".cozy-dependencies", name)
+		inside := false
 		if rel, err := filepath.Rel(pack.Tree, from); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			to = filepath.Join(root, rel)
+			inside = true
 		}
 		info, err := os.Stat(from)
 		if err != nil {
 			return "", exit.Internalf("cannot inspect snapshot dependency: %s", err)
 		}
 		if !info.IsDir() {
-			to = filepath.Join(to, filepath.Base(from))
+			if !inside {
+				to = filepath.Join(to, filepath.Base(from))
+			}
 			files[to], relocated[from] = from, to
 			continue
 		}

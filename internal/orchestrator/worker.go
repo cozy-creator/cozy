@@ -371,7 +371,7 @@ func (w *worker) supportsCurrentProtocol() bool {
 	if w.refusal != nil && w.refusal.ErrName() == "worker.protocol_incompatible" {
 		return false
 	}
-	return w.declaredInstance == "" || w.wireMinor >= pb.WireMinor
+	return w.declaredInstance == "" || w.wireMinor >= pb.MinCompatibleWireMinor
 }
 
 type worker struct {
