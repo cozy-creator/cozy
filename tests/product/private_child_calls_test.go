@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"bytes"
 	"database/sql"
 	"path/filepath"
 	"strings"
@@ -8,11 +9,40 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func childDigest(letter string) string { return "sha256:" + strings.Repeat(letter, 64) }
+
+func TestPrivateJobBuildIncludesChangedDependencyRevision(t *testing.T) {
+	development := &pb.DevelopmentPackage{Package: "local/script", Release: "0.0.0", SourceDigest: bytes.Repeat([]byte{0x11}, 32), ProjectWheel: &pb.WheelFact{Ref: &pb.Ref{Digest: bytes.Repeat([]byte{0x22}, 32), Length: 123}}}
+	set := &pb.PlacementSet{Placements: []*pb.Placement{{PackageMode: &pb.Placement_Development{Development: development}}}}
+	var before string
+	for _, value := range []byte{0x33, 0x44} {
+		development.LocalRevisionDigest = bytes.Repeat([]byte{value}, 32)
+		raw, _, err := canonical.Identity(set)
+		must(t, err)
+		build, problem := orchestrator.JobBuildID(raw, "local/script")
+		fatal(t, problem)
+		want, _ := canonical.Spell(development.LocalRevisionDigest)
+		if build != want || build == before {
+			t.Fatalf("same parent wheel hid changed dependency revision: %s", build)
+		}
+		before = build
+	}
+	development.LocalRevisionDigest = nil
+	development.ProjectWheel = nil
+	raw, _, err := canonical.Identity(set)
+	must(t, err)
+	build, problem := orchestrator.JobBuildID(raw, "local/script")
+	fatal(t, problem)
+	want, _ := canonical.Spell(development.SourceDigest)
+	if build != want {
+		t.Fatal("same-host source install lost its captured build identity")
+	}
+}
 
 func offerChildParent(t *testing.T, store *records.Store, parent records.Request) records.Request {
 	t.Helper()
