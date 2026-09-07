@@ -12,7 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-const interfaceGeneratorABI = "cozy.interface-generator/1"
+const interfaceGeneratorABI = "cozy.interface-generator/2"
 
 func GenerateInterfaceWheel(ctx context.Context, install records.PackageInstall, home string, env []string, implementation, output string) (InterfaceWheel, *exit.Error) {
 	runtime := RuntimeCLI{Bin: Binary(install), Dir: install.ProjectDir, Home: home, Env: env}

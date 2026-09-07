@@ -114,8 +114,8 @@ class Result(msgspec.Struct):
 app = App()
 @app.job
 async def main(request: Request, ctx: Context) -> Result:
-    original = await source(ctx, value=request.value)
-    improved = await candidate(ctx, value=original.value, factor=0)
+    original = await source(value=request.value)
+    improved = await candidate(value=original.value, factor=0)
     return Result(improved.value)
 `
 	must(t, os.WriteFile(script, []byte(code), 0o600))
