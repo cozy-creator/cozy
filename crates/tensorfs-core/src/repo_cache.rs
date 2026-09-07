@@ -92,6 +92,27 @@ impl RepoObjectCache {
         &self.root
     }
 
+    /// Offer optional replication after local acquisition. This reports no durability
+    /// and never waits for filesystem I/O or queue space. Ingest's explicit Mirror
+    /// retains its separate completion/watermark contract.
+    pub(crate) fn offer_backfill(
+        &self,
+        source: &Store,
+        kind: CacheKind,
+        object: &ObjectRef,
+    ) -> bool {
+        static BACKFILLS: std::sync::OnceLock<Backfills> = std::sync::OnceLock::new();
+        let pool = BACKFILLS.get_or_init(Backfills::start);
+        pool.sender
+            .try_send(Backfill {
+                cache: self.clone(),
+                source: source.root().to_path_buf(),
+                kind,
+                object: object.clone(),
+            })
+            .is_ok()
+    }
+
     /// The one cross-language layout contract. `digest` is bare lowercase SHA-256.
     pub fn path(&self, kind: CacheKind, digest: &str) -> Result<PathBuf> {
         let digest = hex64("repo cache object", digest)?;
@@ -225,6 +246,52 @@ impl RepoObjectCache {
             },
             Err(_) => CacheWrite::Unavailable,
         })
+    }
+}
+
+// Reference-only memory policy for optional acquisition backfill, not a protocol bound.
+// Typical jobs are a few hundred bytes; even two 4 KiB paths per job stay near 1 MiB.
+const BACKFILL_QUEUE: usize = 128;
+
+struct Backfill {
+    cache: RepoObjectCache,
+    source: PathBuf,
+    kind: CacheKind,
+    object: ObjectRef,
+}
+
+struct Backfills {
+    sender: std::sync::mpsc::SyncSender<Backfill>,
+}
+
+impl Backfills {
+    fn start() -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Backfill>(BACKFILL_QUEUE);
+        let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+        // One pool for the process, never a new blocked thread set for every pull.
+        // Workers are detached: process exit may leave cache temps, never canonical
+        // partial objects. Dropping a pull must not join a stalled FUSE syscall.
+        for _ in 0..STREAMS {
+            let receiver = receiver.clone();
+            let _ = std::thread::Builder::new()
+                .name("tfs-cache-write".into())
+                .spawn(move || loop {
+                    let work = {
+                        let queue = receiver.lock().unwrap_or_else(|error| error.into_inner());
+                        match queue.recv() {
+                            Ok(work) => work,
+                            Err(_) => return,
+                        }
+                    };
+                    // Reopen without a caller's progress observer. Queued work owns no GC
+                    // hold: a source reclaimed before it opens is simply a missed cache fill.
+                    // Once opened, the verified descriptor pins that inode through the copy.
+                    if let Ok(store) = Store::open(&work.source) {
+                        let _ = work.cache.backfill_store(&store, work.kind, &work.object);
+                    }
+                });
+        }
+        Self { sender }
     }
 }
 

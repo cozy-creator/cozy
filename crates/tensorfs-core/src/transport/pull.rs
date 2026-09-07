@@ -813,10 +813,9 @@ pub fn fetch_wanted(
                         store, &grant, &authorize, policy, credential, deadline, ledger, None,
                     )?;
                     if let (Some(kind), Some(cache)) = (kind, cache) {
-                        // Weather, and deliberately unread: a cache that cannot be written
-                        // has cost this pull nothing, and the object it could not take is
-                        // already local and already proved.
-                        let _ = cache.backfill_store(store, kind, object);
+                        // Local admission is complete. Optional replication must never
+                        // occupy an origin slot or delay this object's completion report.
+                        cache.offer_backfill(store, kind, object);
                     }
                     Ok(Source::Origin(one))
                 });
