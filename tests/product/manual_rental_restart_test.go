@@ -109,6 +109,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	must(t, err)
 	control := grpc.NewServer(grpc.Creds(credentials.NewServerTLSFromCert(&pair)))
 	pb.RegisterWorkerControlServer(control, pod)
+	pb.RegisterPodHostServer(control, pod)
 	go func() { _ = control.Serve(listener) }()
 	defer control.Stop()
 	var mediaUnavailable atomic.Bool
@@ -200,6 +201,9 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		}
 		// The machine now belongs to a retained transaction. Recovery must not
 		// rely on the manual-rental exception or an open Python attempt.
+		observed, problem := store.RentalRow(podRental)
+		fatal(t, problem)
+		row = *observed
 		row.ManagedRequestID = request.ID
 		fatal(t, store.RecordRental(row))
 		before, problem = store.RentalRow(podRental)

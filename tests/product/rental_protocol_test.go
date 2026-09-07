@@ -19,7 +19,7 @@ func TestRentalReuseRequiresNegotiatedCurrentProtocol(t *testing.T) {
 		minor := uint32(pb.WireMinor)
 		if older {
 			name = "older"
-			minor--
+			minor = pb.MinCompatibleWireMinor - 1
 		}
 		t.Run(name, func(t *testing.T) {
 			public, private, err := ed25519.GenerateKey(rand.Reader)
@@ -52,7 +52,7 @@ func TestRentalReuseRequiresNegotiatedCurrentProtocol(t *testing.T) {
 func TestQueuedPinToOlderWorkerReplansWithoutOffering(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
-	pod := &fakePod{controlKey: public, wireMinor: pb.WireMinor - 1, serve: true}
+	pod := &fakePod{controlKey: public, wireMinor: pb.MinCompatibleWireMinor - 1, serve: true}
 	connection, _ := startFakePod(t, t.TempDir(), pod)
 	var acquisitions atomic.Int64
 	o := hostOwner(t, "old-pin", rentalWiring(connection, private), func(options *orchestrator.Options) {

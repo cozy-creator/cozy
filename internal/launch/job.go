@@ -71,6 +71,9 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}
+	if !facts.NeedsAccelerator {
+		devices = nil
+	}
 	runtimeBin, e := HostRuntime(f.RuntimeCLI.Env)
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
