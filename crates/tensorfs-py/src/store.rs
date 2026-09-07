@@ -754,7 +754,7 @@ impl PyStore {
 
     /// Advance the exact source plan over verified physical carriers. Checkpoint heads are
     /// local progress until the RecordOwner acknowledges their complete upload.
-    #[pyo3(signature = (operation_id, source_selection_digest, profiles, roster, landed, *, checkpoints=Vec::new()))]
+    #[pyo3(signature = (operation_id, source_selection_digest, profiles, roster, landed, *, checkpoints=Vec::new(), adopt_from_operation_id=None))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn prepare_model_source<'p>(
         &self,
@@ -765,6 +765,7 @@ impl PyStore {
         roster: Vec<(String, String, u64, PathBuf, Vec<u8>)>,
         landed: Vec<String>,
         checkpoints: Vec<(String, String, u64)>,
+        adopt_from_operation_id: Option<String>,
     ) -> PyResult<Bound<'p, PyDict>> {
         let checkpoints = checkpoints
             .into_iter()
@@ -802,6 +803,7 @@ impl PyStore {
                 .collect(),
             landed,
             checkpoints,
+            adopt_from_operation_id,
         };
         let prepared = py
             .detach(|| model_source::prepare_model_source(&self.store, &request))

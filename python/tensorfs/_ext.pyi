@@ -466,6 +466,7 @@ class Store:
         landed: Sequence[str],
         *,
         checkpoints: Sequence[tuple[str, str, int]] = ...,
+        adopt_from_operation_id: str | None = ...,
     ) -> PreparedModelSource: ...
     def checkpoint_page(
         self, head_id: str, head_length: int, *, operation_id: str, slot: str,
