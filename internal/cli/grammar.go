@@ -312,7 +312,7 @@ type RunExecuteCmd struct {
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`
 	Trees          []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
 	Org            string   `help:"Job publication organization (defaults to local)."`
-	PublishTo      string   `help:"Publish the job's declared weight outputs to org/model."`
+	PublishTo      string   `help:"Store the job's declared weight outputs as checkpoints in org/model; no release is created."`
 	SourceProfiles []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
 	DryRun         bool     `help:"Resolve exact job inputs and conversion headers without queueing or renting."`
 	Await          bool     `help:"Wait for the terminal result instead of returning after the short optimistic observation."`
@@ -327,7 +327,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets,
 		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org,
-		"--publish-to", c.PublishTo, "--source-profile", c.SourceProfiles), false)
+		"--publish-to", c.PublishTo, "--source-profile", c.SourceProfiles), !c.DryRun && !c.Describe)
 }
 
 type RunRetryPublicationCmd struct {

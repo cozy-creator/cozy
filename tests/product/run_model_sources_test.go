@@ -134,7 +134,7 @@ func TestRunPublishedModelJobKeepsPayloadAndDeclaresRentalClosure(t *testing.T) 
 		t.Fatalf("ordinary request changed: %+v", row)
 	}
 	for _, model := range row.Models {
-		if (model.Slot != "dits" && model.Slot != "shared") || model.Manifest != digest || model.ManifestLength != int64(len(manifest)) {
+		if (model.Slot != "dits" && model.Slot != "shared") || model.Manifest != digest || model.ManifestLength != int64(len(manifest)) || model.BindingPath != "quantize.models."+model.Slot {
 			t.Fatalf("job grant lost exact root identity: %+v", model)
 		}
 	}
