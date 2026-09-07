@@ -38,8 +38,14 @@ func retainRetryTx(tx *sql.Tx, request *Request) *exit.Error {
 	if err != nil {
 		return exit.Internalf("cannot read retry predecessor: %s", err)
 	}
+	retainedResult := prior.RetainsLocalOutputs()
+	if prior.State == "succeeded" && !retainedResult {
+		if err := tx.QueryRow(retainedDescendantsSQL, prior.ID).Scan(&retainedResult); err != nil {
+			return exit.Internalf("cannot inspect predecessor child custody: %s", err)
+		}
+	}
 	if !request.RetainWork || request.Kind != "job" || !prior.RetainWork || !prior.IsJob() ||
-		(prior.State != "paused" && prior.State != "blocked" && !(prior.State == "succeeded" && prior.RetainsLocalOutputs())) {
+		(prior.State != "paused" && prior.State != "blocked" && !(prior.State == "succeeded" && retainedResult)) {
 		return exit.Named(exit.Conflict, "request.retry_refused", "retry predecessor %s must retain stopped work; current state %s", prior.ID, prior.State)
 	}
 	var open int
@@ -231,7 +237,7 @@ func (s *Store) RentalRetainsWork(id string) (bool, *exit.Error) {
 	var found bool
 	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests r LEFT JOIN request_model_transfers t ON t.request_id=r.id WHERE r.worker=? AND r.retain_work=1
 		AND ((r.state IN (`+activeRequestStates+`) AND r.state!='releasing') OR
-		(r.state='succeeded' AND (r.child_artifacts=1 OR r.weights_outputs!='[]') AND COALESCE(json_extract(t.intent,'$.destination'),'')='')))`, id).Scan(&found)
+		(r.state='succeeded' AND (r.child_artifacts=1 OR r.weights_outputs NOT IN ('','[]')) AND COALESCE(json_extract(t.intent,'$.destination'),'')='')))`, id).Scan(&found)
 	if err != nil {
 		return false, exit.Internalf("cannot read retained rental ownership: %s", err)
 	}

@@ -187,3 +187,28 @@ func (s *Store) Children(parent string) ([]Request, *exit.Error) {
 	}
 	return out, nil
 }
+
+const retainedDescendantsSQL = `WITH RECURSIVE descendants(id) AS (
+		SELECT id FROM requests WHERE parent_request_id=?
+		UNION ALL SELECT r.id FROM requests r JOIN descendants d ON r.parent_request_id=d.id
+	) SELECT EXISTS(SELECT 1 FROM descendants d JOIN requests r ON r.id=d.id
+		LEFT JOIN request_model_transfers t ON t.request_id=r.id WHERE r.retain_work=1 AND
+		(r.state IN (` + activeRequestStates + `) OR (r.state='succeeded' AND
+		(r.child_artifacts=1 OR r.weights_outputs NOT IN ('','[]')) AND COALESCE(json_extract(t.intent,'$.destination'),'')='')))`
+
+// RequestRetaining includes work delegated by a script that returns no result.
+// Descendants remain ordinary requests; this is only the parent's retention view.
+func (s *Store) RequestRetaining(request Request) (bool, *exit.Error) {
+	if !request.RetainWork || (Settled(request.State) && request.State != "succeeded") {
+		return false, nil
+	}
+	if request.State != "succeeded" || request.RetainsLocalOutputs() {
+		return true, nil
+	}
+	var retained bool
+	err := s.db.QueryRow(retainedDescendantsSQL, request.ID).Scan(&retained)
+	if err != nil {
+		return false, exit.Internalf("cannot inspect retained child work: %s", err)
+	}
+	return retained, nil
+}
