@@ -1131,6 +1131,8 @@ const (
 	PodHost_RetainDerivedResult_FullMethodName     = "/cozy.worker.v1.PodHost/RetainDerivedResult"
 	PodHost_ReleaseDerivedRetention_FullMethodName = "/cozy.worker.v1.PodHost/ReleaseDerivedRetention"
 	PodHost_ReleaseDerivedResult_FullMethodName    = "/cozy.worker.v1.PodHost/ReleaseDerivedResult"
+	PodHost_RecordOperationResult_FullMethodName   = "/cozy.worker.v1.PodHost/RecordOperationResult"
+	PodHost_LookupOperation_FullMethodName         = "/cozy.worker.v1.PodHost/LookupOperation"
 	PodHost_ModelSourceAdopt_FullMethodName        = "/cozy.worker.v1.PodHost/ModelSourceAdopt"
 	PodHost_CheckpointPage_FullMethodName          = "/cozy.worker.v1.PodHost/CheckpointPage"
 	PodHost_CheckpointTransfer_FullMethodName      = "/cozy.worker.v1.PodHost/CheckpointTransfer"
@@ -1185,6 +1187,8 @@ type PodHostClient interface {
 	RetainDerivedResult(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
 	ReleaseDerivedRetention(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
 	ReleaseDerivedResult(ctx context.Context, in *DerivedResultReleaseCall, opts ...grpc.CallOption) (*DerivedResultReleaseResult, error)
+	RecordOperationResult(ctx context.Context, in *RecordOperationResultCall, opts ...grpc.CallOption) (*RecordOperationResultResult, error)
+	LookupOperation(ctx context.Context, in *LookupOperationCall, opts ...grpc.CallOption) (*LookupOperationResult, error)
 	ModelSourceAdopt(ctx context.Context, in *ModelSourceAdoptCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error)
 	CheckpointPage(ctx context.Context, in *CheckpointPageCall, opts ...grpc.CallOption) (*CheckpointPageResult, error)
 	CheckpointTransfer(ctx context.Context, in *CheckpointTransferCall, opts ...grpc.CallOption) (*CheckpointTransferStatus, error)
@@ -1359,6 +1363,26 @@ func (c *podHostClient) ReleaseDerivedResult(ctx context.Context, in *DerivedRes
 	return out, nil
 }
 
+func (c *podHostClient) RecordOperationResult(ctx context.Context, in *RecordOperationResultCall, opts ...grpc.CallOption) (*RecordOperationResultResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RecordOperationResultResult)
+	err := c.cc.Invoke(ctx, PodHost_RecordOperationResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) LookupOperation(ctx context.Context, in *LookupOperationCall, opts ...grpc.CallOption) (*LookupOperationResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LookupOperationResult)
+	err := c.cc.Invoke(ctx, PodHost_LookupOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *podHostClient) ModelSourceAdopt(ctx context.Context, in *ModelSourceAdoptCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ModelSourcePrepared)
@@ -1504,6 +1528,8 @@ type PodHostServer interface {
 	RetainDerivedResult(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
 	ReleaseDerivedRetention(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
 	ReleaseDerivedResult(context.Context, *DerivedResultReleaseCall) (*DerivedResultReleaseResult, error)
+	RecordOperationResult(context.Context, *RecordOperationResultCall) (*RecordOperationResultResult, error)
+	LookupOperation(context.Context, *LookupOperationCall) (*LookupOperationResult, error)
 	ModelSourceAdopt(context.Context, *ModelSourceAdoptCall) (*ModelSourcePrepared, error)
 	CheckpointPage(context.Context, *CheckpointPageCall) (*CheckpointPageResult, error)
 	CheckpointTransfer(context.Context, *CheckpointTransferCall) (*CheckpointTransferStatus, error)
@@ -1557,6 +1583,12 @@ func (UnimplementedPodHostServer) ReleaseDerivedRetention(context.Context, *Deri
 }
 func (UnimplementedPodHostServer) ReleaseDerivedResult(context.Context, *DerivedResultReleaseCall) (*DerivedResultReleaseResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReleaseDerivedResult not implemented")
+}
+func (UnimplementedPodHostServer) RecordOperationResult(context.Context, *RecordOperationResultCall) (*RecordOperationResultResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method RecordOperationResult not implemented")
+}
+func (UnimplementedPodHostServer) LookupOperation(context.Context, *LookupOperationCall) (*LookupOperationResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method LookupOperation not implemented")
 }
 func (UnimplementedPodHostServer) ModelSourceAdopt(context.Context, *ModelSourceAdoptCall) (*ModelSourcePrepared, error) {
 	return nil, status.Error(codes.Unimplemented, "method ModelSourceAdopt not implemented")
@@ -1791,6 +1823,42 @@ func _PodHost_ReleaseDerivedResult_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PodHost_RecordOperationResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RecordOperationResultCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).RecordOperationResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_RecordOperationResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).RecordOperationResult(ctx, req.(*RecordOperationResultCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_LookupOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LookupOperationCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).LookupOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_LookupOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).LookupOperation(ctx, req.(*LookupOperationCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _PodHost_ModelSourceAdopt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ModelSourceAdoptCall)
 	if err := dec(in); err != nil {
@@ -1948,6 +2016,14 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReleaseDerivedResult",
 			Handler:    _PodHost_ReleaseDerivedResult_Handler,
+		},
+		{
+			MethodName: "RecordOperationResult",
+			Handler:    _PodHost_RecordOperationResult_Handler,
+		},
+		{
+			MethodName: "LookupOperation",
+			Handler:    _PodHost_LookupOperation_Handler,
 		},
 		{
 			MethodName: "ModelSourceAdopt",
