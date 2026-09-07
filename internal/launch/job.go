@@ -61,18 +61,15 @@ type JobFacts struct {
 // keeping a job worker warm after it finishes. Warm persistence is a serving concern and
 // stays one.
 func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerLaunchSpec, *JobFacts, *exit.Error) {
-	if f.Install.SourceKind == "local" {
+	if f.Install.SourceKind == "local" && (f.Install.ProjectDir == "" ||
+		filepath.Clean(f.Install.SourceRef) != filepath.Join(f.Install.Dir, "source")) {
 		return orchestrator.WorkerLaunchSpec{}, nil, exit.Named(exit.Structural,
-			"editable_jobs_unsupported", "editable source checkouts do not run job callables").
-			WithRemedy("publish the package before running its job callable")
+			"job_snapshot_required", "local jobs require a captured source revision").
+			WithRemedy("run the local job through `cozy run` to capture its source and dependencies")
 	}
 	facts, e := f.Job(function)
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
-	}
-	deviceCount := int64(0)
-	if facts.NeedsAccelerator {
-		deviceCount = 1
 	}
 	runtimeBin, e := HostRuntime(f.RuntimeCLI.Env)
 	if e != nil {
@@ -110,7 +107,6 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 			"python":                      environmentPython,
 			"environment_content_digest":  environmentContent,
 			"job":                         facts.Name,
-			"gpu_count":                   deviceCount,
 			"publishes":                   facts.Publishes,
 			"emits_media":                 false,
 			"gpu_rate_micro_usd_per_hour": int64(0),

@@ -56,10 +56,11 @@ type editableSync struct {
 }
 
 type editableTree struct {
-	pkg, root string
-	events    atomic.Uint64
-	kick      chan struct{}
-	stop      chan struct{}
+	pkg, root  string
+	watchRoots []string
+	events     atomic.Uint64
+	kick       chan struct{}
+	stop       chan struct{}
 }
 
 // startEditableSync watches the records database for pin changes and every editable
@@ -127,28 +128,33 @@ func wake(kick chan struct{}) {
 
 func (s *editableSync) onSourceEvent(event fsnotify.Event) {
 	s.mu.Lock()
-	var tree *editableTree
-	for root, candidate := range s.trees {
-		if (event.Name == root || strings.HasPrefix(event.Name, root+string(filepath.Separator))) &&
-			(tree == nil || len(root) > len(tree.root)) {
-			tree = candidate
+	type touched struct {
+		tree *editableTree
+		root string
+	}
+	var changed []touched
+	for _, tree := range s.trees {
+		for _, root := range tree.watchRoots {
+			if event.Name == root || strings.HasPrefix(event.Name, root+string(filepath.Separator)) {
+				changed = append(changed, touched{tree, root})
+				break
+			}
 		}
 	}
 	s.mu.Unlock()
-	if tree == nil {
-		return
-	}
-	rel, err := filepath.Rel(tree.root, event.Name)
-	if err != nil || rel == "." || packagepublish.IgnoredSourcePath(rel) {
-		return
-	}
-	if event.Has(fsnotify.Create) {
-		if info, err := os.Lstat(event.Name); err == nil && info.IsDir() {
-			s.watchDirs(tree.root, event.Name)
+	for _, item := range changed {
+		rel, err := filepath.Rel(item.root, event.Name)
+		if err != nil || packagepublish.IgnoredSourcePath(rel) {
+			continue
 		}
+		if event.Has(fsnotify.Create) {
+			if info, err := os.Lstat(event.Name); err == nil && info.IsDir() {
+				s.watchDirs(item.root, event.Name)
+			}
+		}
+		item.tree.events.Add(1)
+		wake(item.tree.kick)
 	}
-	tree.events.Add(1)
-	wake(tree.kick)
 }
 
 // watchDirs adds a watch on dir and every directory beneath it the source rules read.
@@ -194,15 +200,27 @@ func (s *editableSync) reconcile() {
 		return
 	}
 	want := map[string]string{}
+	roots := map[string][]string{}
 	for _, row := range rows {
-		if row.SourceKind == "local" && row.SourceRef != "" {
-			want[row.SourceRef] = row.Package
+		if row.SourceKind != "local" || row.SourceRef == "" {
+			continue
 		}
+		want[row.SourceRef] = row.Package
+		roots[row.SourceRef] = []string{row.SourceRef}
+		dependencies, problem := packagepublish.LocalDependencyPaths(row.SourceRef)
+		if problem != nil {
+			fmt.Fprintf(s.log, "editable %s: dependency watch scan refused: %s\n", row.Package, problem.Message)
+			continue
+		}
+		for _, path := range dependencies {
+			roots[row.SourceRef] = append(roots[row.SourceRef], path)
+		}
+		sort.Strings(roots[row.SourceRef])
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for root, tree := range s.trees {
-		if want[root] == tree.pkg {
+		if want[root] == tree.pkg && strings.Join(roots[root], "\n") == strings.Join(tree.watchRoots, "\n") {
 			continue
 		}
 		delete(s.trees, root)
@@ -218,9 +236,15 @@ func (s *editableSync) reconcile() {
 		if s.trees[root] != nil {
 			continue
 		}
-		tree := &editableTree{pkg: pkg, root: root, kick: make(chan struct{}, 1), stop: make(chan struct{})}
+		tree := &editableTree{pkg: pkg, root: root, watchRoots: roots[root], kick: make(chan struct{}, 1), stop: make(chan struct{})}
 		s.trees[root] = tree
-		s.watchDirs(root, root)
+		for _, source := range tree.watchRoots {
+			if info, err := os.Stat(source); err == nil && !info.IsDir() {
+				_ = s.watcher.Add(filepath.Dir(source))
+			} else {
+				s.watchDirs(source, source)
+			}
+		}
 		fmt.Fprintf(s.log, "editable %s: watching %s\n", pkg, root)
 		go s.syncTree(tree)
 		// The daemon has not read this tree yet: what changed while nobody watched is

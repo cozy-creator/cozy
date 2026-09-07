@@ -82,6 +82,12 @@ func JobBuildID(setBytes []byte, pkg string) (string, *exit.Error) {
 		if development := row.Sub("development"); development.Str("package") == pkg {
 			id := development.Sub("project_wheel").Sub("ref").Str("digest")
 			if id == "" {
+				// A local immutable source install has no transported project wheel.
+				// Its captured source closure is the build identity; the environment
+				// remains separately bound in the invocation and writer fingerprint.
+				id = development.Str("source_digest")
+			}
+			if id == "" {
 				return "", exit.Named(exit.Structural, "job_build_identity_missing",
 					"the development placement for %s names no project wheel", pkg)
 			}

@@ -125,8 +125,8 @@ func TestPublicationCancellationMigratesPrivateCopyWithoutChangingRows(t *testin
 	defer db.Close()
 	var version int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	if version != 25 {
-		t.Fatal("migration did not stamp schema25")
+	if version != 26 {
+		t.Fatal("migration did not stamp schema26")
 	}
 	fk, err := db.Query(`PRAGMA foreign_key_check`)
 	must(t, err)
@@ -139,5 +139,5 @@ func TestPublicationCancellationMigratesPrivateCopyWithoutChangingRows(t *testin
 	if sha256.Sum256(still) != sha256.Sum256(original) {
 		t.Fatal("source snapshot changed")
 	}
-	t.Logf("schema23→25 private copy preserves all rows in %d tables, including source heads/ACKs/revisions; foreign keys valid; original snapshot unchanged", len(before))
+	t.Logf("schema23→26 private copy preserves all rows in %d tables, including source heads/ACKs/revisions; foreign keys valid; original snapshot unchanged", len(before))
 }

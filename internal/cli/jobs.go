@@ -105,7 +105,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if problem != nil {
 		return problem
 	}
-	if terminal != nil || settled(state.Status) {
+	if terminal != nil || settled(state.Status) || state.Status == "paused" || state.Status == "blocked" {
 		return renderJobTerminal(ctx, state, terminal, began)
 	}
 	return renderSubmittedJob(ctx, state, !handle.Replay)
@@ -306,7 +306,23 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	}()
 
 	lines := NewProgress(ctx, false, began)
-	terminal, e := c.WatchContext(watchCtx, jobID, 0, lines.On)
+	var stopped *localapi.Event
+	terminal, e := c.WatchContext(watchCtx, jobID, 0, func(event localapi.Event) bool {
+		keep := lines.On(event)
+		if event.Type == "request.paused" || event.Type == "request.blocked" {
+			// A resumed request may replay an older pause event. Stop only when
+			// its current state still matches the event being observed.
+			state, problem := c.Job(jobID)
+			if problem == nil && "request."+state.Status == event.Type {
+				stopped = &event
+				return false
+			}
+		}
+		return keep
+	})
+	if terminal == nil {
+		terminal = stopped
+	}
 	lines.Done()
 	if e != nil {
 		return e
@@ -331,6 +347,9 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	status := localapi.StreamStatus(terminal)
 	if status == "" {
 		status = state.Status
+	}
+	if status == "paused" {
+		return renderSubmittedJob(ctx, state, false)
 	}
 	// A REQUEST THAT ENDED BEFORE ANY ATTEMPT has its reason only in the terminal EVENT:
 	// there is no attempt row, so the state document has no terminal to read a cause off.
@@ -369,6 +388,9 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		return emit(ctx, rec)
 	}
 	err := exit.Named(code, status, "job %s ended %s", state.JobID, status)
+	if status == "blocked" {
+		err.WithNext("cozy run <updated-script-or-package> --retry %s", runReference(state.Number, state.JobID))
+	}
 	if state.Error != "" {
 		err.Message = fmt.Sprintf("job %s ended %s: %s — %s",
 			state.JobID, status, state.ErrorType, state.Error)
