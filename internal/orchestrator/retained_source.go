@@ -3,15 +3,12 @@ package orchestrator
 import (
 	"bytes"
 	"context"
-	"io"
 	"sort"
-	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -67,13 +64,6 @@ func (c *Orchestrator) adoptRetriedSource(ctx context.Context, request records.R
 	if s == nil || s.host == nil || s.claim == nil {
 		return exit.Unavailablef("retained source adoption requires the claimed original pod")
 	}
-	prior, problem := c.opt.Store.RequestRow(priorID)
-	if problem != nil || prior == nil {
-		return exit.Unavailablef("retained source predecessor metadata is unavailable")
-	}
-	if problem := declareAdoptionSource(ctx, s, *prior); problem != nil {
-		return problem
-	}
 	selection, err := canonical.Raw(request.ModelTransfer.SourceSelection)
 	if err != nil {
 		return exit.Internalf("retained source selection is malformed")
@@ -105,7 +95,7 @@ func (c *Orchestrator) adoptRetriedSource(ctx context.Context, request records.R
 	}
 	answer, err := s.host.ModelSourceAdopt(ctx, call)
 	if err != nil {
-		return sourceAdoptionError(err)
+		return exit.Unavailablef("retained source adoption is awaiting the original pod")
 	}
 	if answer == nil || answer.OperationId != request.ID || answer.WorkerBootId != s.bootID ||
 		answer.RecordOwnerEpoch != recordOwnerEpoch || answer.ControlStreamEpoch != 0 ||
@@ -150,52 +140,4 @@ func (c *Orchestrator) adoptRetriedSource(ctx context.Context, request records.R
 		adopted[i] = observed[i].Observed
 	}
 	return c.opt.Store.RecordRetriedSourceAdoption(request.ID, priorID, s.bootID, previous, adopted)
-}
-
-// The Host's source admission roster is session memory. After its restart, the
-// owner must redeclare the old operation's exact metadata before asking to adopt
-// its retained native checkpoint. Empty URLs cannot fetch any provider bodies.
-func declareAdoptionSource(ctx context.Context, s *session, prior records.Request) *exit.Error {
-	if prior.ModelTransfer == nil {
-		return exit.New(exit.Validation, "retained source predecessor has no acquisition")
-	}
-	selection, err := canonical.Raw(prior.ModelTransfer.SourceSelection)
-	if err != nil {
-		return exit.Internalf("retained source predecessor selection is malformed")
-	}
-	provider := pb.ModelSourceProvider_MODEL_SOURCE_PROVIDER_UNSPECIFIED
-	if strings.HasPrefix(prior.ModelTransfer.Source, "hf://") {
-		provider = pb.ModelSourceProvider_MODEL_SOURCE_PROVIDER_HUGGING_FACE
-	}
-	if strings.HasPrefix(prior.ModelTransfer.Source, "civitai://") {
-		provider = pb.ModelSourceProvider_MODEL_SOURCE_PROVIDER_CIVITAI
-	}
-	for _, file := range prior.ModelTransfer.SourceFiles {
-		request := &pb.ModelSourceFileRequest{RecordOwnerEpoch: recordOwnerEpoch, WorkerBootId: s.bootID, OperationId: prior.ID, SourceSelectionDigest: selection,
-			Member: file.Member, ObjectId: "sha256:" + file.SHA256, Length: uint64(file.Length), Header: file.Header, Provider: provider, CapabilityRevision: 1}
-		stream, err := s.host.ModelSourceFile(ctx, &pb.ModelSourceFileCall{Claim: s.claim, Request: request})
-		if err != nil {
-			return sourceAdoptionError(err)
-		}
-		for {
-			answer, err := stream.Recv()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				return sourceAdoptionError(err)
-			}
-			if answer == nil || answer.OperationId != prior.ID || answer.Member != file.Member || answer.ObjectId != request.ObjectId || answer.Length != request.Length || !bytes.Equal(answer.SourceSelectionDigest, selection) {
-				return exit.Named(exit.Structural, "request.source_adoption_changed", "retained source declaration changed its exact metadata")
-			}
-		}
-	}
-	return nil
-}
-
-func sourceAdoptionError(err error) *exit.Error {
-	if result := classifyPrepareEnd(err); result.refusal != "" {
-		return exit.Named(exit.Structural, "request.source_adoption_refused", "retained source adoption refused (%s): %s", status.Code(err), refusalDetail(err))
-	}
-	return exit.Unavailablef("retained source adoption awaits the original pod (%s)", status.Code(err))
 }
