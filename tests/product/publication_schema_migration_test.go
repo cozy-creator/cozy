@@ -44,7 +44,19 @@ func databaseRows(t *testing.T, path string) map[string]string {
 				ptrs[i] = &values[i]
 			}
 			must(t, rows.Scan(ptrs...))
-			raw, err := json.Marshal(values)
+			// Schema 25 appends opt-in retention. Compare every pre-existing
+			// cell and separately require the new field's legacy-safe default.
+			preserved := make([]any, 0, len(values))
+			for i, column := range columns {
+				if name == "requests" && column == "retain_work" {
+					if values[i] != int64(0) {
+						t.Fatal("migration changed a legacy request's retention policy")
+					}
+					continue
+				}
+				preserved = append(preserved, values[i])
+			}
+			raw, err := json.Marshal(preserved)
 			must(t, err)
 			encoded = append(encoded, string(raw))
 		}
@@ -88,7 +100,7 @@ func TestPublicationCancellationMigratesPrivateCopyWithoutChangingRows(t *testin
 	var version int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	if version != 25 {
-		t.Fatal("migration did not stamp schema24")
+		t.Fatal("migration did not stamp schema25")
 	}
 	fk, err := db.Query(`PRAGMA foreign_key_check`)
 	must(t, err)
