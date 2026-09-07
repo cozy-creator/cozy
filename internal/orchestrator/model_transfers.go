@@ -673,6 +673,17 @@ func (c *Orchestrator) kickModelTransferFinalizer(requestID string, attempt int6
 		if readProblem != nil || retainedAttempt == nil {
 			return
 		}
+		// Publication success belongs to the request; worker ACK and cleanup remain
+		// durable attempt obligations even when its control session cannot respond.
+		transfer, transferProblem := c.opt.Store.ModelTransferOf(requestID)
+		if transferProblem == nil && transfer != nil && transfer.State == "completed" &&
+			retainedAttempt.TerminalStatus == "SUCCEEDED" {
+			if state, problem := c.opt.Store.SettleModelTransferRequest(requestID, attempt); problem != nil {
+				c.logf("model transfer %s publication settlement remains pending: %s", requestID, problem.Message)
+			} else if state == "succeeded" {
+				c.signalClosed(requestWaitKey(requestID), nil)
+			}
+		}
 		c.mu.Lock()
 		var session *session
 		if worker := c.workers[retainedAttempt.InstanceID]; worker != nil && worker.snapshotAcknowledged {
@@ -765,7 +776,8 @@ func (c *Orchestrator) ResumeModelTransfers() *exit.Error {
 		if readProblem != nil || attempt == nil {
 			continue
 		}
-		if c.retainedPublication(*request, *attempt) {
+		if c.retainedPublication(*request, *attempt) ||
+			(attempt.State == "terminal" && attempt.TerminalStatus == "SUCCEEDED" && transfer.State == "completed") {
 			if transfer.State == "failed" {
 				if request.Worker != "" {
 					c.selectOrStart(*request)
