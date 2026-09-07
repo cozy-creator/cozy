@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -614,8 +613,8 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
 		// --rental is permission AND intent to spend (owner ruling 2026-09-03): local
 		// could not take the request now and no ready rental holds its placement, so the
-		// fleet stages it on the rental whose store misses the least — or BUYS a pod.
-		// Local disk holdings order rental candidates; they never veto the buy.
+		// fleet places it by expected time and cost — on an attached rental or a bought
+		// pod (placement-economics.md).
 		decision, after, problem := c.opt.AcquireManagedRental(req)
 		if problem != nil {
 			unguard()
@@ -632,7 +631,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		if decision.Models != nil {
 			req.Models = decision.Models
 		}
-		c.logDownloadDecision(req, decision)
+		c.logPlacement(req, decision)
 	}
 	// A JOB names its own slot — one worker per (package, job function) — so the
 	// "already starting" and "already resident" questions are asked about that slot and
@@ -863,107 +862,12 @@ func (c *Orchestrator) rentalHeld(req records.Request) bool {
 	return false
 }
 
-// logDownloadDecision is the decision log for the capacity half (D8): no worker held the
-// placement, so the fleet chose a rental to stage it on — by what each ready rental's
-// store already held — and this request is pinned there until its placement reports.
-func (c *Orchestrator) logDownloadDecision(req records.Request, decision RentalDecision) {
-	rows := make([]any, 0, len(decision.Candidates))
-	var chosen RentalCoverage
-	for _, k := range decision.Candidates {
-		rows = append(rows, k)
-		if k.RentalID == decision.RentalID {
-			chosen = k
-		}
-	}
-	if decision.Bought {
-		chosen = RentalCoverage{RentalID: decision.RentalID, ManifestsMissing: len(req.Models)}
-		for _, model := range req.Models {
-			chosen.BytesMissing += model.Bytes
-		}
-		if decision.SKU != nil {
-			for _, offered := range decision.SKU.Offered {
-				if offered.Name == decision.SKU.Chosen {
-					chosen.Fit, chosen.ResidentBytes, chosen.VRAMBytes = offered.Fit, offered.ResidentBytes, offered.VRAMBytes
-				}
-			}
-		}
-	}
-	c.logf("%s: no worker holds %s for %s; rental %s stages it (bought=%t, lane=%s, fit=%s, holds=%t, "+
-		"manifests_missing=%d, bytes_missing=%d) over %d ready rental(s)%s%s; the download "+
-		"the download set goes with its desired state", req.ID, req.PlanID, req.Package,
-		decision.RentalID, decision.Bought, orNone(records.Lanes(req.Models)), fitNote(chosen), chosen.Holds,
-		chosen.ManifestsMissing, chosen.BytesMissing, len(decision.Candidates),
-		exclusionNote(decision.Excluded), skuNote(decision.SKU))
-	payload := map[string]any{
-		"decision": "download", "candidates": rows, "bought": decision.Bought,
-		"manifests_missing": chosen.ManifestsMissing, "bytes_missing": chosen.BytesMissing,
-		"pick": map[string]any{"rental": decision.RentalID, "worker": chosen.Worker,
-			"lane": records.Lanes(req.Models)},
-	}
-	// The two facts that used to be absent from the durable record (cl-132): which
-	// ready rentals could not take this work, and what the catalog offered when a pod
-	// was bought. Written only when there is something to say, so an ordinary decision
-	// keeps the shape a reader already knows.
-	if len(decision.Excluded) > 0 {
-		payload["excluded"] = decision.Excluded
-	}
-	if decision.SKU != nil {
-		payload["sku"] = decision.SKU
-	}
-	c.emit(req.ID, "request.routed", 0, payload)
-}
-
-// fitNote renders how the chosen machine was sized (cl-168), so the line itself says
-// whether a figure was compared or the owner's rung stood alone.
-func fitNote(chosen RentalCoverage) string {
-	switch chosen.Fit {
-	case records.FitComponents:
-		return fmt.Sprintf("%s %.1f GiB of %.0f GB", chosen.Fit,
-			float64(chosen.ResidentBytes)/(1<<30), float64(chosen.VRAMBytes)/(1<<30))
-	case "":
-		return "unsized"
-	}
-	return chosen.Fit
-}
-
-// exclusionNote renders the ready rentals the decision could not use. "over 0 ready
-// rental(s)" is true of an empty fleet and of a fleet whose every machine was
-// ineligible, and only this suffix separates them.
-func exclusionNote(excluded []RentalExclusion) string {
-	if len(excluded) == 0 {
-		return ""
-	}
-	note := fmt.Sprintf(" (%d excluded: ", len(excluded))
-	for i, row := range excluded {
-		if i > 0 {
-			note += ", "
-		}
-		name := row.Machine
-		if name == "" {
-			name = row.RentalID
-		}
-		note += name + " " + row.Reason
-	}
-	return note + ")"
-}
-
-// skuNote renders the catalog the buy chose from, so an overpay is readable in the log
-// line itself rather than only in the emitted payload.
-func skuNote(decision *SKUDecision) string {
-	if decision == nil || decision.Chosen == "" {
-		return ""
-	}
-	note := fmt.Sprintf("; bought %s of %d offered", decision.Chosen, len(decision.Offered))
-	if len(decision.Ladder) > 0 {
-		note += " (ladder " + strings.Join(decision.Ladder, " > ") + ")"
-	}
-	if cheapest, ok := decision.Cheapest(); ok && cheapest.Name != decision.Chosen {
-		note += ", cheapest " + cheapest.Name
-		if cheapest.Verdict != "" {
-			note += " (" + cheapest.Verdict + ")"
-		}
-	}
-	return note
+// logPlacement is the decision log for the capacity half: no worker held the placement,
+// so the fleet placed the run on an attached rental or a bought pod (cl-165), and this
+// request is pinned there until its placement reports.
+func (c *Orchestrator) logPlacement(req records.Request, decision PlacementDecision) {
+	c.logf("%s: %s; candidates: %s", req.ID, decision.Line(), decision.verdicts())
+	c.emit(req.ID, "request.placement", 0, decision.payload())
 }
 
 // staged answers whether this worker was launched with the given plan id staged for it.

@@ -36,13 +36,11 @@ func TestRentalReuseRequiresNegotiatedCurrentProtocol(t *testing.T) {
 				fatal(t, problem)
 			}
 			for _, job := range []bool{false, true} {
-				kept, excluded := o.c.ModeCompatibleRentalsWithExclusions([]string{podRental}, job)
-				if older {
-					if len(kept) != 0 || len(excluded) != 1 || excluded[0].RentalID != podRental || excluded[0].Reason != "protocol_unsupported" {
-						t.Fatalf("older claimed pod remained eligible (job=%t): kept=%v excluded=%v", job, kept, excluded)
-					}
-				} else if len(kept) != 1 || kept[0] != podRental || len(excluded) != 0 {
-					t.Fatalf("current claimed pod excluded (job=%t): kept=%v excluded=%v", job, kept, excluded)
+				reason, _ := o.c.RentalStanding(podRental, job)
+				if older && reason != "protocol_unsupported" {
+					t.Fatalf("older claimed pod remained eligible (job=%t): %q", job, reason)
+				} else if !older && reason != "" {
+					t.Fatalf("current claimed pod excluded (job=%t): %q", job, reason)
 				}
 			}
 		})
@@ -57,12 +55,12 @@ func TestQueuedPinToOlderWorkerReplansWithoutOffering(t *testing.T) {
 	var acquisitions atomic.Int64
 	o := hostOwner(t, "old-pin", rentalWiring(connection, private), func(options *orchestrator.Options) {
 		options.RentalFleet = func() (string, *exit.Error) { return "fleet retained", nil }
-		options.AcquireManagedRental = func(req records.Request) (orchestrator.RentalDecision, string, *exit.Error) {
+		options.AcquireManagedRental = func(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 			if req.Worker != "" {
 				t.Errorf("acquisition retained obsolete pin: %s", req.Worker)
 			}
 			acquisitions.Add(1)
-			return orchestrator.RentalDecision{}, "", exit.Unavailablef("new capacity held by test")
+			return orchestrator.PlacementDecision{}, "", exit.Unavailablef("new capacity held by test")
 		}
 	})
 	_, _, _, problem := o.c.EnsureRental(podRental)

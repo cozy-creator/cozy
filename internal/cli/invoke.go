@@ -1243,7 +1243,7 @@ func (p *RunProgress) observeWait(e localapi.Event) {
 			p.waitedSince = eventTime(e)
 			p.armPatience()
 		}
-	case "rentals", "log", "metric":
+	case "rentals", "placement", "log", "metric":
 		// Still the same wait; these narrate it without ending it.
 	default:
 		p.waitedSince = time.Time{}
@@ -1531,7 +1531,7 @@ func progressLine(e localapi.Event, full bool) string {
 		return ""
 	case "queued", "parked":
 		return HumanWaitLine(e.Payload)
-	case "rentals":
+	case "rentals", "placement":
 		if line, ok := e.Payload["line"].(string); ok {
 			return line
 		}
@@ -1721,7 +1721,7 @@ func diagnosticProgressLine(e localapi.Event) string {
 			return "  " + kind + " — " + reason
 		}
 		return "  " + kind
-	case "rentals":
+	case "rentals", "placement":
 		if line, ok := e.Payload["line"].(string); ok {
 			return line
 		}

@@ -52,36 +52,49 @@ func marketWithoutA4000() []hub.RentalSKU {
 	}
 }
 
-// choose is the modelless buy: Plan walked to its first fitting product, the way an
-// unmodeled request buys. It keeps the pre-ladder proofs below on the real chooser.
+// choose is the modelless buy through the real chooser: the product Place picks among
+// Purchases, with every candidate's verdict, or the first base mismatch when none may be
+// bought. It keeps the pre-ladder proofs below on the real code.
 func choose(skus []hub.RentalSKU, needsAccelerator bool, constraints rental.Constraints) (
-	hub.RentalSKU, orchestrator.SKUDecision, string, bool,
+	hub.RentalSKU, []orchestrator.PlacementCandidate, string, bool,
 ) {
-	steps, decision := rental.Plan(skus, nil, needsAccelerator, constraints)
-	if len(steps) == 0 {
-		return hub.RentalSKU{}, decision, decision.Mismatch, false
+	candidates := rental.Purchases(skus, nil, needsAccelerator, constraints)
+	i := rental.Place("balanced", candidates)
+	if i < 0 {
+		for _, c := range candidates {
+			if reason, ok := strings.CutPrefix(c.Verdict,
+				orchestrator.VerdictExcluded+orchestrator.ExcludedBaseMismatch+": "); ok {
+				return hub.RentalSKU{}, candidates, c.SKU + ": " + reason, false
+			}
+		}
+		return hub.RentalSKU{}, candidates, "", false
 	}
-	rental.Conclude(&decision, steps, nil, 0)
-	return steps[0].SKU, decision, "", true
+	rental.Conclude(candidates, i)
+	for _, sku := range skus {
+		if sku.Name == candidates[i].SKU {
+			return sku, candidates, "", true
+		}
+	}
+	return hub.RentalSKU{}, candidates, "", false
 }
 
-func find(t *testing.T, decision orchestrator.SKUDecision, name string) orchestrator.SKUCandidate {
+func find(t *testing.T, candidates []orchestrator.PlacementCandidate, name string) orchestrator.PlacementCandidate {
 	t.Helper()
-	for _, candidate := range decision.Offered {
-		if candidate.Name == name {
+	for _, candidate := range candidates {
+		if candidate.Name() == name {
 			return candidate
 		}
 	}
-	t.Fatalf("%q is not in the recorded offer set %+v", name, decision.Offered)
-	return orchestrator.SKUCandidate{}
+	t.Fatalf("%q is not in the recorded candidate set %+v", name, candidates)
+	return orchestrator.PlacementCandidate{}
 }
 
-func absent(t *testing.T, decision orchestrator.SKUDecision, name string) {
+func absent(t *testing.T, candidates []orchestrator.PlacementCandidate, name string) {
 	t.Helper()
-	for _, candidate := range decision.Offered {
-		if candidate.Name == name {
-			t.Fatalf("%q is recorded as offered, but this market did not carry it: %+v",
-				name, decision.Offered)
+	for _, candidate := range candidates {
+		if candidate.Name() == name {
+			t.Fatalf("%q is recorded as a candidate, but this market did not carry it: %+v",
+				name, candidates)
 		}
 	}
 }
@@ -95,22 +108,24 @@ func TestTheChoiceRecordsWhatItChoseOver(t *testing.T) {
 		t.Fatalf("with the A4000 in stock the cheapest compatible pick must be rtx-a4000; got %q (ok=%v)",
 			stocked.Name, ok)
 	}
-	if got := find(t, withA4000, "rtx-a4000").TotalUSDMicrosPerHour; got != liveA4000TotalUSDMicros {
+	if got := find(t, withA4000, "rtx-a4000").RateUSDMicrosPerHour; got != liveA4000TotalUSDMicros {
 		t.Fatalf("recorded A4000 total is %d micros/hour; the live figure was %d",
 			got, liveA4000TotalUSDMicros)
 	}
-	// The dearer card is on the record WITH the reason it lost. This is the row whose
-	// absence made the overpay unauditable.
-	if verdict := find(t, withA4000, "rtx-4090").Verdict; verdict != orchestrator.VerdictDearer {
-		t.Fatalf("rtx-4090 lost to a cheaper card but is recorded with verdict %q; want %q",
-			verdict, orchestrator.VerdictDearer)
+	// The dearer card is on the record WITH its rate and a verdict — unmeasured, since a
+	// modelless buy has no throughput row and falls to rung and price. This is the row
+	// whose absence made the overpay unauditable.
+	if row := find(t, withA4000, "rtx-4090"); row.Verdict != orchestrator.VerdictUnmeasured ||
+		row.RateUSDMicrosPerHour != live4090TotalUSDMicros {
+		t.Fatalf("rtx-4090 lost to a cheaper card but is recorded as %+v; want %q at %d",
+			row, orchestrator.VerdictUnmeasured, live4090TotalUSDMicros)
 	}
 
 	short, withoutA4000, _, ok := choose(marketWithoutA4000(), true, rental.Constraints{})
 	if !ok || short.Name != "rtx-4090" {
 		t.Fatalf("with no A4000 offered the pick must be rtx-4090; got %q (ok=%v)", short.Name, ok)
 	}
-	if got := find(t, withoutA4000, "rtx-4090").TotalUSDMicrosPerHour; got != live4090TotalUSDMicros {
+	if got := find(t, withoutA4000, "rtx-4090").RateUSDMicrosPerHour; got != live4090TotalUSDMicros {
 		t.Fatalf("recorded 4090 total is %d micros/hour; the live figure was %d",
 			got, live4090TotalUSDMicros)
 	}
@@ -119,9 +134,9 @@ func TestTheChoiceRecordsWhatItChoseOver(t *testing.T) {
 	// the fact, which is exactly how th-151 came to be filed as a placement defect.
 	absent(t, withoutA4000, "rtx-a4000")
 
-	if len(withA4000.Offered) == len(withoutA4000.Offered) {
-		t.Fatalf("the two markets produced offer sets of the same size (%d); the record "+
-			"is not distinguishing them", len(withA4000.Offered))
+	if len(withA4000) == len(withoutA4000) {
+		t.Fatalf("the two markets produced candidate sets of the same size (%d); the record "+
+			"is not distinguishing them", len(withA4000))
 	}
 }
 
@@ -130,41 +145,39 @@ func TestTheChoiceRecordsWhatItChoseOver(t *testing.T) {
 // but a cheaper compatible product passed over with NO stated reason is a chooser defect.
 func TestCheapestOfferedIsAlwaysExplained(t *testing.T) {
 	for _, market := range [][]hub.RentalSKU{marketWithA4000(), marketWithoutA4000()} {
-		_, decision, _, ok := choose(market, true, rental.Constraints{})
+		_, candidates, _, ok := choose(market, true, rental.Constraints{})
 		if !ok {
-			t.Fatalf("a GPU market with compatible products chose nothing: %+v", decision)
+			t.Fatalf("a GPU market with compatible products chose nothing: %+v", candidates)
 		}
-		if unexplained := decision.UnexplainedPick(); unexplained != "" {
+		decision := orchestrator.PlacementDecision{Candidates: candidates}
+		if unexplained := decision.Unexplained(); unexplained != "" {
 			t.Fatalf("real choice passed over %q with no stated reason: %+v",
-				unexplained, decision.Offered)
+				unexplained, candidates)
 		}
 	}
 
 	// RED ARM — plant the violation. This is the shape a broken chooser would emit:
-	// the cheapest product sits in the offer set carrying no verdict, and something
-	// dearer was bought anyway. If UnexplainedPick cannot see this, it cannot see a
-	// real overpay either and the invariant is decorative.
-	planted := orchestrator.SKUDecision{
-		Chosen: "rtx-4090",
-		Offered: []orchestrator.SKUCandidate{
-			{Name: "rtx-a4000", TotalUSDMicrosPerHour: liveA4000TotalUSDMicros},
-			{Name: "rtx-4090", TotalUSDMicrosPerHour: live4090TotalUSDMicros},
-		},
-	}
-	if unexplained := planted.UnexplainedPick(); unexplained != "rtx-a4000" {
-		t.Fatalf("planted silent overpay was not detected: UnexplainedPick()=%q, want rtx-a4000",
+	// the cheapest product sits in the candidate set carrying no verdict, and something
+	// dearer was bought anyway. If Unexplained cannot see this, it cannot see a real
+	// overpay either and the invariant is decorative.
+	planted := orchestrator.PlacementDecision{Candidates: []orchestrator.PlacementCandidate{
+		{SKU: "rtx-a4000", RateUSDMicrosPerHour: liveA4000TotalUSDMicros},
+		{SKU: "rtx-4090", RateUSDMicrosPerHour: live4090TotalUSDMicros, Verdict: orchestrator.VerdictChosen},
+	}}
+	if unexplained := planted.Unexplained(); unexplained != "rtx-a4000" {
+		t.Fatalf("planted silent overpay was not detected: Unexplained()=%q, want rtx-a4000",
 			unexplained)
 	}
 
 	// A cheaper card that lost for a STATED reason is not an overpay: that is the
 	// out-of-stock and base-mismatch case, and it must stay quiet.
 	explained := planted
-	explained.Offered = []orchestrator.SKUCandidate{
-		{Name: "rtx-a4000", TotalUSDMicrosPerHour: liveA4000TotalUSDMicros,
-			Verdict: orchestrator.VerdictBaseMismatch + ": torch 2.13 needs sm_89"},
-		{Name: "rtx-4090", TotalUSDMicrosPerHour: live4090TotalUSDMicros},
+	explained.Candidates = []orchestrator.PlacementCandidate{
+		{SKU: "rtx-a4000", RateUSDMicrosPerHour: liveA4000TotalUSDMicros,
+			Verdict: orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": torch 2.13 needs sm_89"},
+		{SKU: "rtx-4090", RateUSDMicrosPerHour: live4090TotalUSDMicros, Verdict: orchestrator.VerdictChosen},
 	}
-	if unexplained := explained.UnexplainedPick(); unexplained != "" {
+	if unexplained := explained.Unexplained(); unexplained != "" {
 		t.Fatalf("a cheaper card that lost for a stated reason was reported as unexplained: %q",
 			unexplained)
 	}

@@ -110,10 +110,10 @@ func TestRemoteJobRefreshesCheckpointBeforeUsingNewCredit(t *testing.T) {
 	connection, _ := startFakePod(t, t.TempDir(), pod)
 	o := hostOwner(t, "job-checkpoint-refresh", rentalWiring(connection, private), func(options *orchestrator.Options) {
 		options.RentalFleet = func() (string, *exit.Error) { return "one existing rental", nil }
-		options.AcquireManagedRental = func(req records.Request) (orchestrator.RentalDecision, string, *exit.Error) {
+		options.AcquireManagedRental = func(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 			acquisitions.Add(1)
 			_, problem := options.Store.PinRental(req.ID, podRental, nil)
-			return orchestrator.RentalDecision{RentalID: podRental}, "", problem
+			return orchestrator.PlacementDecision{RentalID: podRental}, "", problem
 		}
 	})
 	submit := func(id, manifest, worker string) string {

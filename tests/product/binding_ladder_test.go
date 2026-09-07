@@ -33,9 +33,14 @@ type ladderHub struct {
 	puts     [][]byte
 	posts    [][]byte
 	// soldOut names the SKUs whose paid ask the hub refuses for inventory; rentals holds
-	// what a GET on a rental answers.
-	soldOut map[string]bool
-	rentals map[string]map[string]any
+	// what a GET on a rental answers; throughput is the model's published table, and a
+	// hub holding none answers the route as an older build would — not at all.
+	soldOut    map[string]bool
+	rentals    map[string]map[string]any
+	throughput []hub.ModelThroughput
+	// provisions makes a bought pod come up READY with the triple the ask pinned, so the
+	// buy completes and the placement is recorded; otherwise the fixture pod fails.
+	provisions bool
 }
 
 const (
@@ -108,6 +113,15 @@ func newLadderHub(t *testing.T) *ladderHub {
 						ComponentBytes: h3BF16Components()}}},
 			}})
 	})
+	mux.HandleFunc("GET /v1/models/proof/minimax/throughput", func(w http.ResponseWriter, _ *http.Request) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.throughput == nil {
+			http.NotFound(w, nil)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"model": "proof/minimax", "throughput": h.throughput})
+	})
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(market20260907())
 	})
@@ -140,6 +154,13 @@ func newLadderHub(t *testing.T) *ladderHub {
 		row := map[string]any{"rental_id": id, "name": request.Name, "state": "failed",
 			"requested_accelerator_model": "NVIDIA H200", "hourly_rate_usd_micros": 3_590_000,
 			"failure": map[string]any{"code": "fixture_finished"}}
+		if h.provisions {
+			row = map[string]any{"rental_id": id, "name": request.Name, "state": "ready",
+				"requested_accelerator_model": "NVIDIA H100 NVL", "hourly_rate_usd_micros": 2_790_000,
+				"worker_address": "127.0.0.1:1", "media_address": "127.0.0.1:2", "cert_pem": "fixture",
+				"worker_id": "fixture-worker", "worker_boot_id": "fixture-boot",
+				"creator_public_key": request.CreatorPublicKey, "media_token_sha256": []string{request.MediaTokenSHA256}}
+		}
 		h.rentals[id] = row
 		accepted := map[string]any{}
 		for k, v := range row {
@@ -358,7 +379,7 @@ func TestAutoRentWalksTheLadderAndNeverBuysAShortCard(t *testing.T) {
 	}
 	log := tail(filepath.Join(root, "daemon.log"))
 	for _, want := range []string{"renting h100-80", "(rung 1, lane fp8-adaln-pruned, fit components 51.5 GiB of 80 GB)",
-		"h100-80 has no inventory; walking to the next fitting machine",
+		"h100-80 has no inventory; choosing again without it",
 		"renting b200", "(rung 2, lane mxfp8-adaln-pruned, fit rung_asserted)",
 		"renting h200", "(rung 3, lane bf16-full, fit components 51.5 GiB of 141 GB)"} {
 		if !strings.Contains(log, want) {
@@ -417,8 +438,48 @@ func TestAutoRentReusesTheFittingRentalBeforeBuying(t *testing.T) {
 		t.Fatalf("a fitting live rental was passed over for a buy: %v", asks)
 	}
 	log := tail(filepath.Join(root, "daemon.log"))
-	if !strings.Contains(log, "cheap vram_short: needs 51.5 GiB resident (condition_text: text_encoder), rtx-5090 has 32 GB") ||
-		!strings.Contains(log, "rental pr-morgiana stages it (bought=false, lane=fp8-adaln-pruned, fit=components 51.5 GiB of 80 GB,") {
-		t.Fatalf("daemon.log does not record the passed-over 5090's need, the pinned lane and the sizing:\n%s", log)
+	if !strings.Contains(log, "cheap excluded:vram_short: needs 51.5 GiB resident (condition_text: text_encoder), rtx-5090 has 32 GB") ||
+		!strings.Contains(log, "placement: reuse morgiana (h100-80, fp8-adaln-pruned) — balanced, unmeasured (rung 1)") {
+		t.Fatalf("daemon.log does not record the passed-over 5090's need and the placement:\n%s", log)
 	}
+	// A hub without the throughput route measured nothing: the record says every open
+	// candidate was unmeasured and cites no row, and the live H100 won by the ladder's
+	// own order — attached first — over a later-rung H200 and every buy.
+	placement := placementEvent(t, store, row.ID)
+	if placement["tier"] != "balanced" || len(placement["throughput"].([]any)) != 0 {
+		t.Fatalf("an unmeasured placement recorded %v", placement)
+	}
+	verdicts := candidateVerdicts(placement)
+	if verdicts["morgiana"] != "chosen" || verdicts["zack"] != "unmeasured" || verdicts["h100-80"] != "unmeasured" ||
+		verdicts["b200"] != "unmeasured" || !strings.HasPrefix(verdicts["cheap"], "excluded:vram_short") {
+		t.Fatalf("unmeasured verdicts %v", verdicts)
+	}
+}
+
+// placementEvent is the request's one durable `request.placement` record.
+func placementEvent(t *testing.T, store *records.Store, requestID string) map[string]any {
+	t.Helper()
+	events, problem := store.EventsAfter(requestID, 0, 200)
+	fatal(t, problem)
+	for _, event := range events {
+		if event.Type == "request.placement" {
+			return event.Payload
+		}
+	}
+	t.Fatalf("no request.placement event among %d events", len(events))
+	return nil
+}
+
+// candidateVerdicts reads the record's candidates as name -> verdict.
+func candidateVerdicts(placement map[string]any) map[string]string {
+	out := map[string]string{}
+	for _, raw := range placement["candidates"].([]any) {
+		c := raw.(map[string]any)
+		name, _ := c["machine"].(string)
+		if name == "" {
+			name, _ = c["sku"].(string)
+		}
+		out[name], _ = c["verdict"].(string)
+	}
+	return out
 }

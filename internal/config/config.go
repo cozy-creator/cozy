@@ -7,6 +7,9 @@
 package config
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -80,6 +83,13 @@ type Config struct {
 	// keeps the daemon up until `cozy down`.
 	DaemonIdleShutdown time.Duration
 
+	// PlacementPrefer is the tier a rented run is placed under (placement-economics.md):
+	// fast | balanced | cheap. Config only, never a flag.
+	PlacementPrefer string
+	// Digest is the sha256 of config.yaml's bytes, so a decision record can cite the
+	// configuration it read.
+	Digest string
+
 	// MaintenanceGCCron is when the daemon runs the store's reclamation pass (owner ruling
 	// 2026-09-02: repo-CAS garbage collection runs on a cron job). A cadence, never a
 	// decision: what is reclaimed is TensorFS's call from its filesystem census. Standard
@@ -109,6 +119,7 @@ type values struct {
 	RentalsIdleReleaseS      int64  `name:"rentals_idle_release_s" default:"300"`
 	DaemonIdleShutdownS      int64  `name:"daemon_idle_shutdown_s" default:"900"`
 	MaintenanceGCCron        string `name:"maintenance_gc_cron" default:"0 3 * * *"`
+	PlacementPrefer          string `name:"placement_prefer" default:"balanced"`
 	Port                     int    `name:"port" default:"8818"`
 	Yield                    string `name:"yield" default:"smart" enum:"smart,always,never"`
 	Bootstrap                string `name:"bootstrap"`
@@ -138,6 +149,11 @@ func (v *values) Validate() error {
 			return fmt.Errorf("maintenance.gc_cron %q is not a five-field cron schedule: %w", expr, err)
 		}
 	}
+	switch v.PlacementPrefer {
+	case "fast", "balanced", "cheap":
+	default:
+		return fmt.Errorf("placement.prefer %q is not fast, balanced or cheap", v.PlacementPrefer)
+	}
 	if v.Port < 0 || v.Port > 65535 {
 		return fmt.Errorf("port %d is not a TCP port or zero for automatic selection", v.Port)
 	}
@@ -157,6 +173,7 @@ var fileKeys = map[string]bool{
 	"rentals":                       true,
 	"daemon":                        true,
 	"maintenance":                   true,
+	"placement":                     true,
 }
 
 // nestedFileKeys are the one-level sections config.yaml admits, each mapping its
@@ -166,6 +183,7 @@ var nestedFileKeys = map[string]map[string]string{
 		"idle_release_s": "rentals_idle_release_s"},
 	"daemon":      {"idle_shutdown_s": "daemon_idle_shutdown_s"},
 	"maintenance": {"gc_cron": "maintenance_gc_cron"},
+	"placement":   {"prefer": "placement_prefer"},
 }
 
 var environmentNames = map[string]string{
@@ -200,7 +218,7 @@ func load() (Config, *exit.Error) {
 		return Config{}, problem
 	}
 
-	file, problem := readConfigFile(filepath.Join(home, FileName))
+	file, digest, problem := readConfigFile(filepath.Join(home, FileName))
 	if problem != nil {
 		return Config{}, problem
 	}
@@ -248,6 +266,8 @@ func load() (Config, *exit.Error) {
 		RentalsIdleRelease:             time.Duration(input.RentalsIdleReleaseS) * time.Second,
 		DaemonIdleShutdown:             time.Duration(input.DaemonIdleShutdownS) * time.Second,
 		MaintenanceGCCron:              strings.TrimSpace(input.MaintenanceGCCron),
+		PlacementPrefer:                input.PlacementPrefer,
+		Digest:                         digest,
 		Bootstrap:                      secret.New(input.Bootstrap),
 		inherited:                      inherited,
 	}
@@ -372,36 +392,45 @@ func knownFileKeys() string {
 	return strings.Join(keys, ", ")
 }
 
-func readConfigFile(path string) (*resolver, *exit.Error) {
+func readConfigFile(path string) (*resolver, string, *exit.Error) {
 	nameInfo, lstatErr := os.Lstat(path)
 	if lstatErr != nil && !os.IsNotExist(lstatErr) {
-		return nil, exit.Internalf("cannot inspect %s: %s", path, lstatErr)
+		return nil, "", exit.Internalf("cannot inspect %s: %s", path, lstatErr)
 	}
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &resolver{values: map[string]any{}}, nil
+			return &resolver{values: map[string]any{}}, digestOf(nil), nil
 		}
-		return nil, exit.Internalf("cannot read %s: %s", path, err)
+		return nil, "", exit.Internalf("cannot read %s: %s", path, err)
 	}
 	defer file.Close()
-
-	resolved, err := strictYAML(file)
+	data, err := io.ReadAll(file)
 	if err != nil {
-		return nil, exit.Usagef("%s is invalid: %s", path, err).
+		return nil, "", exit.Internalf("cannot read %s: %s", path, err)
+	}
+
+	resolved, err := strictYAML(bytes.NewReader(data))
+	if err != nil {
+		return nil, "", exit.Usagef("%s is invalid: %s", path, err).
 			WithRemedy("this file admits: %s", knownFileKeys())
 	}
 	if resolved.has("huggingface_token") || resolved.has("civitai_token") {
 		openedInfo, statErr := file.Stat()
 		if statErr != nil {
-			return nil, exit.Internalf("cannot inspect opened %s: %s", path, statErr)
+			return nil, "", exit.Internalf("cannot inspect opened %s: %s", path, statErr)
 		}
 		if err := validateProviderSecretFile(nameInfo, openedInfo); err != nil {
-			return nil, exit.Usagef("%s is invalid: %s", path, err).
+			return nil, "", exit.Usagef("%s is invalid: %s", path, err).
 				WithRemedy("store provider credentials in an owner-only regular file: chmod 600 %s", path)
 		}
 	}
-	return resolved, nil
+	return resolved, digestOf(data), nil
+}
+
+func digestOf(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // strictYAML accepts one flat YAML mapping. Kong remains the typed assignment

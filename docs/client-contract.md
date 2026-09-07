@@ -170,7 +170,8 @@ after it arrives in order, across a host restart. `id:` carries the cursor on th
 |---|---|
 | `request.submitted` | `package`, `function`, `body_digest`, `plan_id`, `outputs` |
 | `request.queued` | `reason` (verbatim diagnostic), `wait` (stable cause: `worker_start` · `worker_warming` · `slot_busy` · `queue_ahead` · `rental` · `model_transfer`), `waiting_on` (machine word, when known), `package`, `position` |
-| `request.routed` | the routing decision (residency-aware-routing.md §3.1): `candidates[]` (`worker`, `lane`, `held`, `cost`, `score`, `resident[]`, `manifests_missing`, `rental`), `pick` (`worker`, `lane`, `rental`, `pinned`); with `decision: "download"` (attempt 0) no worker held the placement and `pick.rental` stages it — `candidates[]` are the ready rentals it was chosen over, `bought`, `manifests_missing`, `bytes_missing` |
+| `request.routed` | the routing decision (residency-aware-routing.md §3.1): `candidates[]` (`worker`, `lane`, `held`, `cost`, `score`, `resident[]`, `manifests_missing`, `rental`), `pick` (`worker`, `lane`, `rental`, `pinned`) |
+| `request.placement` | the placement decision (placement-economics.md, attempt 0): no worker held the placement, so the fleet placed it on an attached rental or a bought pod — `tier`, `config_digest`, `ladder[]`, `throughput[]` (every row used), `candidates[]` (`rental`, `machine`, `sku`, `rung`, `lane`, `fit`, `ahead`, `rate_usd_micros_per_hour`, `measured`, `time_s`, `cost_usd_micros`, `score`, `verdict`: `chosen` · `slower` · `dearer` · `unmeasured` · `no_rung` · `no_stock` · `excluded:<reason>`), `rental`, `bought`, `line` |
 | `request.parked` | the drain skipped a waiting request: the `request.queued` fields plus `lanes`, `overtaken`, `budget`, `claims` |
 | `request.dispatch_aborted` | pre-offer preparation failed; `cause`, `error`; no worker saw this ordinal |
 | `request.dispatched` | `instance_id`, `invocation_digest` |
