@@ -88,7 +88,7 @@ func (c *Orchestrator) retainLostWork(req records.Request) {
 			c.settleDispatch(req.ID, uint64(attempt.Attempt), false)
 		}
 	}
-	_, _ = c.opt.Store.BlockRetainedWork(req.ID, "request.state_lost", "the retained rental and its local intermediate bytes are no longer available")
+	_, _ = c.opt.Store.BlockLostRetainedWork(req.ID, "the retained rental and its local intermediate bytes are no longer available")
 	c.forget(req.ID)
 }
 
