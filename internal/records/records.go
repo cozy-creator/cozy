@@ -346,6 +346,13 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
+	if sourceVersion < 27 {
+		for _, statement := range []string{childBindingsDDL, childRequestIndex} {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot create private child ownership in %s: %s", path, err)
+			}
+		}
+	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}

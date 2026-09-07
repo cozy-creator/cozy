@@ -95,7 +95,7 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 26 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 27 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	if columns := columnNames(t, db, "attempts"); !columns["triage_bundle"] || columns["triage_path"] {
