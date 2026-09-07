@@ -1170,7 +1170,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 			return Request{}, false, problem
 		}
 	}
-	if r.Worker != "" {
+	if r.RetainWork && r.Worker != "" {
 		var releasing bool
 		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM rentals WHERE id=? AND state IN ('release_requested','released','failed'))`, r.Worker).Scan(&releasing); err != nil {
 			return Request{}, false, exit.Internalf("cannot inspect request rental admission: %s", err)
