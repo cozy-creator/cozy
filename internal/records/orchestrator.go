@@ -566,6 +566,84 @@ type ModelRef struct {
 	// hub fact the capacity decision ranks a rental's missing download by (§3.2). Zero
 	// when the resolver did not carry it.
 	Bytes int64 `json:"bytes,omitempty"`
+	// Ladder is the hub binding's FIT MAP (cl-166): which lane belongs on which GPU
+	// class, in the owner's order, each rung resolved to the exact manifest the model
+	// card publishes for that lane. A ref carrying a Ladder and no Manifest is UNPINNED:
+	// the machine decision picks the rung whose gpu pattern matches the winning
+	// accelerator and pins Lane/Manifest/Bytes from it. Empty on an explicit override.
+	Ladder []ModelRung `json:"ladder,omitempty"`
+}
+
+// ModelRung is one (gpu, lane) fit resolved against the model card.
+type ModelRung struct {
+	GPU      string `json:"gpu"`
+	Lane     string `json:"lane"`
+	Manifest string `json:"manifest"`
+	Bytes    int64  `json:"bytes"`
+}
+
+func (r ModelRung) String() string { return r.GPU + "=" + r.Lane }
+
+// Pinned says the ref names one exact manifest; an unpinned ref still carries its ladder.
+func (m ModelRef) Pinned() bool { return m.Manifest != "" }
+
+// RungFor is the first rung whose gpu pattern fits `accelerator` and its index; a pinned
+// ref fits every machine as itself (index 0). An empty accelerator — a host without an
+// NVIDIA device — fits only the "*" rung.
+func (m ModelRef) RungFor(accelerator string) (ModelRung, int, bool) {
+	if m.Pinned() {
+		return ModelRung{GPU: "*", Lane: m.Lane, Manifest: m.Manifest, Bytes: m.Bytes}, 0, true
+	}
+	for i, rung := range m.Ladder {
+		if RungMatches(rung.GPU, accelerator) {
+			return rung, i, true
+		}
+	}
+	return ModelRung{}, -1, false
+}
+
+// Pin returns the ref bound to one rung. The ladder is dropped: a pinned ref is the same
+// object an explicit `model.<param>=org/model@release/lane` produces.
+func (m ModelRef) Pin(rung ModelRung) ModelRef {
+	m.Lane, m.Manifest, m.Bytes, m.Ladder = rung.Lane, rung.Manifest, rung.Bytes, nil
+	return m
+}
+
+// PinModels binds every unpinned ref to the rung fitting `accelerator`. The second
+// return names the first slot no rung fits, in which case the machine is not a candidate.
+func PinModels(models []ModelRef, accelerator string) ([]ModelRef, string) {
+	out := make([]ModelRef, 0, len(models))
+	for _, model := range models {
+		rung, _, ok := model.RungFor(accelerator)
+		if !ok {
+			return nil, model.Slot
+		}
+		out = append(out, model.Pin(rung))
+	}
+	return out, ""
+}
+
+// ResidentBytes is what the pinned selection weighs on one device: the lanes' total
+// manifest bytes summed over slots, because a placement holds every slot at once.
+func ResidentBytes(models []ModelRef) int64 {
+	var total int64
+	for _, model := range models {
+		total += model.Bytes
+	}
+	return total
+}
+
+// Lanes renders the pinned selection for a log line or audit row: the lane alone for one
+// slot, `slot=lane` pairs for several.
+func Lanes(models []ModelRef) string {
+	if len(models) == 1 {
+		return models[0].Lane
+	}
+	parts := make([]string, 0, len(models))
+	for _, model := range models {
+		parts = append(parts, model.Slot+"="+model.Lane)
+	}
+	return strings.Join(parts, ",")
 }
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
@@ -777,11 +855,23 @@ func (s *Store) MarkLocalPackageUploaded(id, digest, bootID string) *exit.Error 
 // caller that bought the rental to release it. The pin also records the rental's machine
 // word on the request (cl-107): the word is history the run keeps after the rental row
 // is gone, never a read-time join.
-func (s *Store) PinRental(id, rentalID string) (bool, *exit.Error) {
+func (s *Store) PinRental(id, rentalID string, models []ModelRef) (bool, *exit.Error) {
+	// The pin and the lane are ONE decision (cl-166): the machine decides the rung, so
+	// the pinned selection lands in the same statement as the worker. Nil models keep
+	// the row's selection (a request that was already exact).
+	set := ""
+	args := []any{rentalID, rentalID}
+	if models != nil {
+		encoded, err := json.Marshal(models)
+		if err != nil {
+			return false, exit.Internalf("cannot encode request %s models: %s", id, err)
+		}
+		set, args = ", models=?", append(args, string(encoded))
+	}
 	result, err := s.db.Exec(`UPDATE requests SET worker=?,
-		machine=COALESCE((SELECT machine_name FROM rentals WHERE id=?),machine)
+		machine=COALESCE((SELECT machine_name FROM rentals WHERE id=?),machine)`+set+`
 		WHERE id=? AND rental=1 AND worker='' AND
-		state IN ('submitted','queued','requeue_pending')`, rentalID, rentalID, id)
+		state IN ('submitted','queued','requeue_pending')`, append(args, id)...)
 	if err != nil {
 		return false, exit.Internalf("cannot assign request %s to rental %s: %s", id, rentalID, err)
 	}
@@ -798,6 +888,21 @@ func (s *Store) PinRental(id, rentalID string) (bool, *exit.Error) {
 	}
 	return row != nil && row.Rental && row.Worker == rentalID &&
 		!settledRequestState(row.State), nil
+}
+
+// PinRequestModels writes an unassigned --rental request's selection before the paid ask,
+// so the rental POST declares the lane the machine decision chose (th-155). A later
+// rung — the hub refused the first for inventory — overwrites it.
+func (s *Store) PinRequestModels(id string, models []ModelRef) *exit.Error {
+	encoded, err := json.Marshal(models)
+	if err != nil {
+		return exit.Internalf("cannot encode request %s models: %s", id, err)
+	}
+	if _, err := s.db.Exec(`UPDATE requests SET models=? WHERE id=? AND rental=1 AND worker=''
+		AND state IN ('submitted','queued','requeue_pending')`, string(encoded), id); err != nil {
+		return exit.Internalf("cannot record request %s models: %s", id, err)
+	}
+	return nil
 }
 
 func settledRequestState(state string) bool {

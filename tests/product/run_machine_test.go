@@ -143,7 +143,7 @@ func TestRunListMachineColumn(t *testing.T) {
 
 	// The blank→name transition: the exact durable claim the fleet records, observed by
 	// the very next list. The list reads placement state as it is NOW, not as submitted.
-	assigned, problem := store.PinRental("req-machine-unclaimed", "pr-machine-column")
+	assigned, problem := store.PinRental("req-machine-unclaimed", "pr-machine-column", nil)
 	fatal(t, problem)
 	if !assigned {
 		t.Fatal("the queued run refused its rental assignment")

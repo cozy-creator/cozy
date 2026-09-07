@@ -105,7 +105,6 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}
 	record := compactRecord(fields, "package", "release", "status")
-	record.Notes = append(record.Notes, done.BindingWarnings...)
 	for _, dependency := range pack.Vendored {
 		record.Notes = append(record.Notes, packagepublish.VendoredNote(account.Name, dependency))
 	}

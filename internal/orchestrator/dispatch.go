@@ -629,6 +629,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			c.emit(req.ID, "request.rentals", 0, map[string]any{"line": after})
 		}
 		req.Worker = decision.RentalID
+		if decision.Models != nil {
+			req.Models = decision.Models
+		}
 		c.logDownloadDecision(req, decision)
 	}
 	// A JOB names its own slot — one worker per (package, job function) — so the
@@ -878,16 +881,17 @@ func (c *Orchestrator) logDownloadDecision(req records.Request, decision RentalD
 			chosen.BytesMissing += model.Bytes
 		}
 	}
-	c.logf("%s: no worker holds %s for %s; rental %s stages it (bought=%t, holds=%t, "+
+	c.logf("%s: no worker holds %s for %s; rental %s stages it (bought=%t, lane=%s, holds=%t, "+
 		"manifests_missing=%d, bytes_missing=%d) over %d ready rental(s)%s%s; the download "+
 		"the download set goes with its desired state", req.ID, req.PlanID, req.Package,
-		decision.RentalID, decision.Bought, chosen.Holds, chosen.ManifestsMissing,
-		chosen.BytesMissing, len(decision.Candidates), exclusionNote(decision.Excluded),
-		skuNote(decision.SKU))
+		decision.RentalID, decision.Bought, orNone(records.Lanes(req.Models)), chosen.Holds,
+		chosen.ManifestsMissing, chosen.BytesMissing, len(decision.Candidates),
+		exclusionNote(decision.Excluded), skuNote(decision.SKU))
 	payload := map[string]any{
 		"decision": "download", "candidates": rows, "bought": decision.Bought,
 		"manifests_missing": chosen.ManifestsMissing, "bytes_missing": chosen.BytesMissing,
-		"pick": map[string]any{"rental": decision.RentalID, "worker": chosen.Worker},
+		"pick": map[string]any{"rental": decision.RentalID, "worker": chosen.Worker,
+			"lane": records.Lanes(req.Models)},
 	}
 	// The two facts that used to be absent from the durable record (cl-132): which
 	// ready rentals could not take this work, and what the catalog offered when a pod
@@ -930,6 +934,9 @@ func skuNote(decision *SKUDecision) string {
 		return ""
 	}
 	note := fmt.Sprintf("; bought %s of %d offered", decision.Chosen, len(decision.Offered))
+	if len(decision.Ladder) > 0 {
+		note += " (ladder " + strings.Join(decision.Ladder, " > ") + ")"
+	}
 	if cheapest, ok := decision.Cheapest(); ok && cheapest.Name != decision.Chosen {
 		note += ", cheapest " + cheapest.Name
 		if cheapest.Verdict != "" {
@@ -1002,11 +1009,55 @@ func selectionServes(requested, held []ModelRef) bool {
 		holds[m.Slot] = m.Manifest
 	}
 	for _, m := range requested {
-		if manifest, ok := holds[m.Slot]; ok && manifest != m.Manifest {
+		manifest, ok := holds[m.Slot]
+		if !ok {
+			continue
+		}
+		if _, fits := rungHolding(m, manifest); !fits {
 			return false
 		}
 	}
 	return true
+}
+
+// rungHolding answers whether a held manifest is one the request's ref accepts: its own
+// pin, or — unpinned — any rung of its ladder (cl-166). The rung is what a dispatch onto
+// that placement pins the request to.
+func rungHolding(m ModelRef, manifest string) (records.ModelRung, bool) {
+	if m.Pinned() {
+		return records.ModelRung{Lane: m.Lane, Manifest: m.Manifest, Bytes: m.Bytes}, m.Manifest == manifest
+	}
+	for _, rung := range m.Ladder {
+		if rung.Manifest == manifest {
+			return rung, true
+		}
+	}
+	return records.ModelRung{}, false
+}
+
+// pinToPlacement binds a request's unpinned refs to the manifests the placement that
+// won routing already holds. Nil when nothing was unpinned.
+func pinToPlacement(requested, held []ModelRef) []ModelRef {
+	holds := make(map[string]string, len(held))
+	for _, m := range held {
+		holds[m.Slot] = m.Manifest
+	}
+	var out []ModelRef
+	for i, m := range requested {
+		manifest, ok := holds[m.Slot]
+		if m.Pinned() || !ok {
+			continue
+		}
+		rung, fits := rungHolding(m, manifest)
+		if !fits {
+			continue
+		}
+		if out == nil {
+			out = append([]ModelRef(nil), requested...)
+		}
+		out[i] = m.Pin(rung)
+	}
+	return out
 }
 
 // settledState answers whether the authority has already recorded this request's outcome.
@@ -1365,13 +1416,22 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		// rental's placement — and everything below reads the pinned request. A request
 		// that settled first has no worker to pin; it is not dispatched.
 		rentalID := w.spec.Connection.RentalID
-		pinned, e := c.opt.Store.PinRental(req.ID, rentalID)
+		// The placement that won routing holds one rung of the request's ladder; the
+		// pin binds the request to that lane in the same write (cl-166).
+		var models []ModelRef
+		if placement, ok := w.remotePlacements[remotePlanKey(pinnedPackage(req.Package, rentalID), req.PlanID)]; ok {
+			models = pinToPlacement(req.Models, placement.Models)
+		}
+		pinned, e := c.opt.Store.PinRental(req.ID, rentalID, models)
 		if e != nil {
 			return 0, e
 		}
 		if !pinned {
 			return 0, exit.New(exit.Conflict, "request %s settled before it could be pinned to rental %s",
 				req.ID, rentalID)
+		}
+		if models != nil {
+			req.Models = models
 		}
 		req.Worker = rentalID
 		target.routed.pinned = rentalID

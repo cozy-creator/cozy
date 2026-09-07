@@ -43,7 +43,7 @@ func TestPrivateRentalIncludesChildGPUWithoutGrantingItToParent(t *testing.T) {
 			if requiresGPU != gpu || request.NeedsAccelerator {
 				t.Fatalf("rental class=%t parent GPU grant=%t", requiresGPU, request.NeedsAccelerator)
 			}
-			sku, _, ok := rental.Choose(offeredSKUs(), requiresGPU, rental.Constraints{})
+			sku, _, _, ok := choose(offeredSKUs(), requiresGPU, rental.Constraints{})
 			wanted := "cpu"
 			if gpu {
 				wanted = "rtx-4090"

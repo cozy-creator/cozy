@@ -224,11 +224,10 @@ func exactPackageInstallDocument(name string, document hub.ExactDocument) (insta
 		Digest: document.Digest, Length: document.Length}, nil
 }
 
-// downloadPublishedPackageModels prefetches the models the package's CURRENT
-// hub bindings select (th-116): the mutable rows seeded from the shipped
-// package.toml at release commit and owner-retargetable afterwards. The
-// installed toml is never consulted; only rows naming a slot this release's
-// PackageInterface declares are prefetched.
+// downloadPublishedPackageModels prefetches the models the package's CURRENT hub
+// bindings select (th-116, cl-166): each binding's ladder pinned to the rung this host's
+// own accelerator fits. Nothing in the installed release is a binding; only rows naming
+// a slot this release's PackageInterface declares are prefetched.
 func downloadPublishedPackageModels(ctx context.Context, cli *Context, root string,
 	published *install.PublishedSource,
 ) *exit.Error {
@@ -272,9 +271,13 @@ func downloadPublishedPackageModels(ctx context.Context, cli *Context, root stri
 	}
 	hubClient := client(cli)
 	for index, binding := range bindings {
-		packagePublishStatus(cli, "Resolving model %s...", binding.Ref())
+		rung, problem := localRung(cli, binding.Ladder)
+		if problem != nil {
+			return problem
+		}
+		packagePublishStatus(cli, "Resolving model %s/%s...", binding.Ref(), rung.Lane)
 		selected, problem := acquirePublishedModel(ctx, cli, tool, hubClient,
-			binding.Ref(), binding.Lane, published.Package, declared[binding.Slot],
+			binding.Ref(), rung.Lane, published.Package, declared[binding.Slot],
 			filepath.Join(root, "models", fmt.Sprintf("%03d", index)))
 		if problem != nil {
 			return problem

@@ -215,6 +215,23 @@ type RentalCoverage struct {
 	BytesMissing     int64  `json:"bytes_missing"`
 	Room             int    `json:"room"`
 	Held             int    `json:"held"`
+	// Lane is the lane this machine's rung of the binding ladder pins (cl-166); Queued
+	// is the pinned work not yet offered to its worker, which with Held is the work
+	// queued ahead of a new request on this rental.
+	Lane   string `json:"lane,omitempty"`
+	Queued int    `json:"queued"`
+	// Models is the request's selection pinned to this rental's rung.
+	Models []ModelRef `json:"-"`
+}
+
+// Ahead is the attempts a new request would wait behind on this rental.
+func (r RentalCoverage) Ahead() int { return r.Held + r.Queued }
+
+// RentalCandidate is one ready rental the ladder fits, before its worker's facts are read.
+type RentalCandidate struct {
+	RentalID string
+	Queued   int
+	Models   []ModelRef
 }
 
 // RentalDecision is the capacity decision's answer: the rental the placement is staged
@@ -235,27 +252,46 @@ type RentalDecision struct {
 	// between an empty fleet and a fleet that could not take this work.
 	Excluded []RentalExclusion
 	// SKU is the catalog choice behind a buy: every product on offer at that instant,
-	// cheapest first. Nil when no pod was bought.
+	// in ladder walk order. Nil when no pod was bought.
 	SKU *SKUDecision
+	// Models is the request's selection pinned to the winning machine's rung (cl-166).
+	// Nil when the request was already exact.
+	Models []ModelRef
 }
 
 // Verdicts a SKU candidate can carry. The chosen product carries none.
 const (
-	// VerdictDearer: a cheaper compatible product won. This is the ordinary
-	// runner-up, and it is what makes an overpay readable — a dearer pick with a
-	// `dearer` row above it is a defect; a dearer pick that IS the cheapest row is
-	// the market, not the code.
+	// VerdictDearer: a cheaper compatible product of the same rung won. This is the
+	// ordinary runner-up, and it is what makes an overpay readable — a dearer pick
+	// with a `dearer` row above it is a defect; a dearer pick that IS the cheapest
+	// row is the market, not the code.
 	VerdictDearer = "dearer"
+	// VerdictLaterRung: compatible, but the ladder reached a fitting machine on an
+	// earlier rung first. Price never outranks the owner's rung order.
+	VerdictLaterRung = "later_rung"
 	// VerdictBaseMismatch is spelled with the pod's own reason appended.
 	VerdictBaseMismatch = "base_mismatch"
+	// VerdictGPUMismatch: no rung of the ladder names this accelerator class.
+	VerdictGPUMismatch = "gpu_mismatch"
+	// VerdictVRAMShort is spelled with the need and the card's memory appended: the
+	// rung's lane does not fit on the device (the 2026-09-07 defect — a 24 GB card
+	// bought for a 103 GB lane).
+	VerdictVRAMShort = "vram_short"
+	// VerdictNoInventory: the hub refused the buy for want of stock, and the walk
+	// moved on to the next machine.
+	VerdictNoInventory = "no_inventory"
 )
 
 // SKUCandidate is one offered product as the choice saw it.
 type SKUCandidate struct {
 	Name string `json:"sku"`
-	// TotalUSDMicrosPerHour is what the renter PAYS — the ordering key, not the
-	// GPU rate alone (th-126).
+	// TotalUSDMicrosPerHour is what the renter PAYS — the ordering key within a
+	// rung, not the GPU rate alone (th-126).
 	TotalUSDMicrosPerHour int64 `json:"total_usd_micros_per_hour"`
+	// Rung is the 1-based ladder rung this product fell under (0: none); Lane is the
+	// lane that rung pins on it.
+	Rung int    `json:"rung,omitempty"`
+	Lane string `json:"lane,omitempty"`
 	// Verdict is empty on the chosen product and otherwise names why not this one.
 	Verdict string `json:"verdict,omitempty"`
 }
@@ -273,12 +309,17 @@ type SKUCandidate struct {
 // them, so the candidate set is what gets recorded.
 //
 // Offered is every product of the requested class the live catalog carried at the
-// instant of the choice, cheapest first. A stock-out is therefore an ABSENCE from this
-// list — a fact the reader can see, rather than one they must infer by running a second
-// command minutes later and hoping the market has not moved underneath them.
+// instant of the choice, in walk order: rung by rung as the owner ordered the ladder,
+// cheapest first within a rung, then the products no rung names. A stock-out is
+// therefore an ABSENCE from this list — a fact the reader can see, rather than one they
+// must infer by running a second command minutes later and hoping the market has not
+// moved underneath them.
 type SKUDecision struct {
 	Offered []SKUCandidate `json:"offered"`
 	Chosen  string         `json:"chosen,omitempty"`
+	// Ladder is the fit map the walk followed, rung by rung (`H100=fp8`), one entry per
+	// slot when slots differ.
+	Ladder []string `json:"ladder,omitempty"`
 	// Mismatch is the first accelerator-compatible product the release's own
 	// requirements excluded, when nothing could be chosen.
 	Mismatch string `json:"mismatch,omitempty"`
@@ -286,29 +327,27 @@ type SKUDecision struct {
 
 // Cheapest is the lowest-priced offered product of the requested class, chosen or not.
 func (d SKUDecision) Cheapest() (SKUCandidate, bool) {
-	if len(d.Offered) == 0 {
-		return SKUCandidate{}, false
+	var cheapest SKUCandidate
+	found := false
+	for _, candidate := range d.Offered {
+		if !found || candidate.TotalUSDMicrosPerHour < cheapest.TotalUSDMicrosPerHour {
+			cheapest, found = candidate, true
+		}
 	}
-	return d.Offered[0], true
+	return cheapest, found
 }
 
-// UnexplainedPick names a cheaper product that was passed over WITHOUT a stated reason,
-// and is empty when the record is sound. It is the invariant th-151 was filed to check:
-// buying a dearer machine is allowed — the cheap card is often simply out of stock — but
-// buying one while a cheaper compatible product sits in Offered with no verdict on it is
-// a defect in the chooser, and this is the predicate that says so.
-//
-// Sound records make it empty two ways, and the difference is the whole point: the
-// cheapest row IS the chosen one, or the cheapest row carries the reason it lost.
+// UnexplainedPick names a product that was passed over WITHOUT a stated reason, and is
+// empty when the record is sound. It is the invariant th-151 was filed to check: buying a
+// dearer machine is allowed — the cheap card is often simply out of stock, or on a later
+// rung — but buying one while another product sits in Offered with no verdict on it is a
+// defect in the chooser, and this is the predicate that says so.
 func (d SKUDecision) UnexplainedPick() string {
 	if d.Chosen == "" {
 		return ""
 	}
 	for _, candidate := range d.Offered {
-		if candidate.Name == d.Chosen {
-			return ""
-		}
-		if candidate.Verdict == "" {
+		if candidate.Name != d.Chosen && candidate.Verdict == "" {
 			return candidate.Name
 		}
 	}
@@ -341,6 +380,14 @@ const (
 	ExcludedNotReady = "not_ready"
 	// ExcludedUnattached: ready, but with no address or pinned certificate yet.
 	ExcludedUnattached = "unattached"
+	// ExcludedGPUMismatch: no rung of the binding ladder names the rental's accelerator.
+	ExcludedGPUMismatch = "gpu_mismatch"
+	// ExcludedVRAMShort: the rental's rung lane does not fit its device memory.
+	ExcludedVRAMShort = "vram_short"
+	// ExcludedSaturated is spelled with the measured comparison appended: the work
+	// queued ahead on this rental is expected to outlast a fresh pod's observed cold
+	// path for the lane, so buying wins over waiting.
+	ExcludedSaturated = "saturated"
 )
 
 // ModeCompatibleRentals filters ready rentals by the one desired MODE a worker can hold.
@@ -387,24 +434,29 @@ func (c *Orchestrator) ModeCompatibleRentalsWithExclusions(ids []string, job boo
 	return out, excluded
 }
 
-// RankRentals orders ready rentals for a NEW placement by the no-holder rule (§3.2, D4):
-// a store holding every manifest first (nothing to fetch), then the fewest missing bytes,
-// then the most room, then the caller's order — cheapest first. Nothing here is a timer,
-// and the ranking never desires residency anywhere: it reads what each worker last said.
-func (c *Orchestrator) RankRentals(ids []string, models []ModelRef) []RentalCoverage {
+// RankRentals orders the ready rentals a request's ladder fits, for a NEW placement
+// (§3.2, D4, cl-166): the fewest attempts queued ahead first — the counts route scoring
+// already reads, held plus this owner's unanswered offers plus pinned work not yet
+// offered — then warmth for the rental's OWN lane (a store holding every manifest,
+// then the fewest missing bytes), then the most room, then the caller's order. Rung
+// order ranks nothing here: a live fitting 5090 with room beats buying an H100.
+// Nothing here is a timer, and the ranking never desires residency anywhere: it reads
+// what each worker last said.
+func (c *Orchestrator) RankRentals(candidates []RentalCandidate) []RentalCoverage {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	out := make([]RentalCoverage, 0, len(ids))
-	for _, id := range ids {
-		row := RentalCoverage{RentalID: id}
-		w := c.workers[rentalInstanceID(id)]
+	out := make([]RentalCoverage, 0, len(candidates))
+	for _, candidate := range candidates {
+		row := RentalCoverage{RentalID: candidate.RentalID, Queued: candidate.Queued,
+			Lane: records.Lanes(candidate.Models), Models: candidate.Models}
+		w := c.workers[rentalInstanceID(candidate.RentalID)]
 		if w == nil || w.exited || w.stopping || c.sessions[w.bootID] == nil {
 			w = nil
 		}
 		if w != nil {
 			row.Worker, row.Room, row.Held = w.instanceID, w.seats.slots, w.held+w.seats.reserved
 		}
-		for _, model := range models {
+		for _, model := range candidate.Models {
 			if model.Manifest == "" || (w != nil && w.heldManifests[model.Manifest]) {
 				continue
 			}
@@ -416,6 +468,9 @@ func (c *Orchestrator) RankRentals(ids []string, models []ModelRef) []RentalCove
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		a, b := out[i], out[j]
+		if a.Ahead() != b.Ahead() {
+			return a.Ahead() < b.Ahead()
+		}
 		if a.Holds != b.Holds {
 			return a.Holds
 		}
