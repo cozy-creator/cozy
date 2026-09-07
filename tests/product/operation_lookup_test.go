@@ -145,6 +145,26 @@ func TestOperationLookupAdoptsAcrossFreshRunHistory(t *testing.T) {
 	if lookup.State != "hit" || lookup.Key != key {
 		t.Fatal("cache hit lost its durable RPC receipt")
 	}
+	third := offerChildParent(t, store, recordPrivateTransaction(t, store, "pause-hit", "workspace"))
+	paused := operationHistory(t, store, "paused-hit", third)
+	fatal(t, store.BeginOperationLookup(paused.ID, key))
+	_, problem = store.RequestPause(paused.ID, "lookup pending")
+	fatal(t, problem)
+	fatal(t, store.AdoptCachedOperation(paused.ID, cached))
+	done, problem := store.CompleteRequestPause(paused.ID)
+	fatal(t, problem)
+	if !done {
+		t.Fatal("observed cache HIT did not complete pause")
+	}
+	_, problem = store.ResumeRequest(paused.ID, "resume owned result")
+	fatal(t, problem)
+	// No Host lookup or cache-index survival is needed after ownership is ours.
+	fatal(t, store.CompleteReusedChild(paused.ID))
+	resumed, problem := store.RequestRow(paused.ID)
+	fatal(t, problem)
+	if resumed.State != "succeeded" || resumed.Ordinal != 0 || resumed.ReusedFrom != source.ID {
+		t.Fatal("paused cached result was executed again on resume")
+	}
 }
 
 func TestOperationLookupBlocksPauseAndCancelUntilReconciled(t *testing.T) {

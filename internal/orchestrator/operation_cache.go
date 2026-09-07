@@ -104,6 +104,9 @@ func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOn
 	if pendingOnly && (lookup == nil || lookup.State != "pending") {
 		return false, nil
 	}
+	if !pendingOnly && lookup != nil && lookup.State == "hit" && request.ReusedFrom != "" {
+		return true, c.opt.Store.CompleteReusedChild(request.ID)
+	}
 	// A MISS releases the lookup obligation and authorizes ordinary execution.
 	// Do not start another native lookup while that dispatch may be crossing its
 	// offer boundary. New requests still query the current workspace cache.
