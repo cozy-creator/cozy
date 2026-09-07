@@ -24,7 +24,7 @@ func TestPrivateRentalIncludesChildGPUWithoutGrantingItToParent(t *testing.T) {
 			defer store.Close()
 			parent := cleanupTestInstall(layout, "1111111111111111", "1.0.0")
 			child := cleanupTestInstall(layout, "2222222222222222", "1.0.0")
-			child.Closure = "cozy-runtime==0.3.0"
+			child.Closure = "cozy-runtime==0.4.0"
 			if gpu {
 				child.Closure += "\ntorch==2.13.0"
 			}

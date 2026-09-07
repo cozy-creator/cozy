@@ -59,7 +59,7 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 		}
 	}
 	if !hasRuntime {
-		metadata.Dependencies = append(metadata.Dependencies, "cozy-runtime>=0.3.0,<1") //cozy:allow distribution metadata, not an executable invocation
+		metadata.Dependencies = append(metadata.Dependencies, "cozy-runtime>=0.4.0,<1") //cozy:allow distribution metadata, not an executable invocation
 	}
 	if metadata.Tool != nil {
 		// A script's dependency metadata has the same explicit source rules as a
