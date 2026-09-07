@@ -1067,6 +1067,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "request.retention_unsupported", "this private work requires worker wire %d; selected worker speaks %d", required, minor)
 		}
 	}
+	var jobPrepared *pb.DesiredPlacementSet
 	if req.InstallID != "" {
 		if c.opt.Packages == nil || !validDigest(req.LocalPackageDigest) {
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
@@ -1083,17 +1084,21 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 				"local_package_revision_changed",
 				"request %s no longer matches its sealed local package revision", req.ID)
 		}
-		var preserveParent *JobPlan
 		if req.ParentRequestID != "" {
-			preserveParent, e = c.retainedOrchestrationParent(req)
+			_, e = c.retainedOrchestrationParent(req)
 			if e != nil {
 				return WorkerLaunchSpec{}, "", e
 			}
 		}
-		if e := c.ConvergeLocalPackage(instance, req.ID, revision,
+		if req.IsJob() {
+			jobPrepared, problem = c.prepareLocalJob(instance, req, revision)
+			if problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+		} else if e := c.ConvergeLocalPackage(instance, req.ID, revision,
 			req.LocalPackageUploadedBootID, func(bootID string) *exit.Error {
 				return c.opt.Store.MarkLocalPackageUploaded(req.ID, revision.Digest, bootID)
-			}, preserveParent); e != nil {
+			}); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
 		if !req.IsJob() && len(logical.Models) > 0 {
@@ -1120,17 +1125,22 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		}
 	}
 	if req.IsJob() {
-		if e := c.waitPackageStaged(instance); e != nil {
-			return WorkerLaunchSpec{}, "", e
-		}
-		c.mu.Lock()
 		preparedSet := ""
 		var preparedBytes []byte
-		if worker := c.workers[instance]; worker != nil {
-			preparedSet = spellOf(worker.setDigest)
-			preparedBytes = append([]byte(nil), worker.setBytes...)
+		if jobPrepared != nil {
+			preparedSet = spellOf(jobPrepared.PlacementSetDigest)
+			preparedBytes = jobPrepared.PlacementSetCanonicalBytes
+		} else {
+			if e := c.waitPackageStaged(instance); e != nil {
+				return WorkerLaunchSpec{}, "", e
+			}
+			c.mu.Lock()
+			if worker := c.workers[instance]; worker != nil {
+				preparedSet = spellOf(worker.setDigest)
+				preparedBytes = append([]byte(nil), worker.setBytes...)
+			}
+			c.mu.Unlock()
 		}
-		c.mu.Unlock()
 		if !validDigest(preparedSet) {
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
 				"rental.package_preparation_identity_missing",
