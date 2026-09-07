@@ -502,6 +502,27 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
+	if manifest != "" && release == "" {
+		if wantedLane != "" {
+			return empty, exit.Usagef("a checkpoint digest without a release cannot select a lane")
+		}
+		resolved, problem := client(ctx).ResolveModel(hctx, ref.String()+"@"+manifest, "")
+		if problem != nil {
+			return empty, problem
+		}
+		if resolved.Model != ref.String() || resolved.ManifestID != manifest ||
+			resolved.ManifestLength <= 0 || resolved.Bytes <= 0 {
+			return empty, exit.Named(exit.Conflict, "rental.model_resolution_changed",
+				"Tensorhub returned different or incomplete checkpoint facts for %s", raw)
+		}
+		if problem := requireCheckpointComponents(raw, slot, resolved.Components); problem != nil {
+			return empty, problem
+		}
+		return orchestrator.ModelRef{Package: packageName, Slot: slot.Path,
+			Model: ref.String(), Manifest: manifest, HubCheckpoint: true,
+			ManifestLength: resolved.ManifestLength, Bytes: resolved.Bytes,
+			ComponentBytes: resolved.ComponentBytes, ComponentUse: slot.ComponentUse}, nil
+	}
 	_, selected, problem := modelReleaseCard(hctx, client(ctx), ref, release)
 	if problem != nil {
 		return empty, problem

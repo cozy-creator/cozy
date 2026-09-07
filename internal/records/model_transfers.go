@@ -924,7 +924,7 @@ func (s *Store) DeclaredServingModels(requestID string) ([]ModelRef, *exit.Error
 	}
 	out := make([]ModelRef, 0, len(request.Models))
 	for _, model := range request.Models {
-		if !model.Published() {
+		if !model.Downloadable() {
 			continue
 		}
 		out = append(out, model)
@@ -932,9 +932,8 @@ func (s *Store) DeclaredServingModels(requestID string) ([]ModelRef, *exit.Error
 	return out, nil
 }
 
-// Published identifies the exact catalog model vocabulary the Hub can measure
-// and the worker download set can fetch. Operation-local manifests have no
-// published closure authority and must not be used to size new capacity.
-func (model ModelRef) Published() bool {
-	return model.Release != "" && model.Model != "" && model.Manifest != ""
+// Downloadable identifies a Hub-resolved checkpoint that can be measured and
+// fetched. Operation-local manifests remain private to their prepared worker.
+func (model ModelRef) Downloadable() bool {
+	return model.Model != "" && model.Manifest != "" && (model.Release != "" || model.HubCheckpoint)
 }

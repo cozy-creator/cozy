@@ -1692,9 +1692,9 @@ func inputBindings(req records.Request, payloadDigest string) []*pb.InputBinding
 func downloadModelRefs(models []ModelRef) []*pb.DownloadModelRef {
 	out := make([]*pb.DownloadModelRef, 0, len(models))
 	for _, model := range models {
-		// A release-less ref is an operation-local Manifest already held by this
-		// worker's TensorFS store (source preparation or a prior step output).
-		if model.Release == "" {
+		// Operation-local manifests are already held by this worker. A retained
+		// Hub checkpoint can be downloaded even when no release names it.
+		if !model.Downloadable() {
 			continue
 		}
 		path := model.Slot

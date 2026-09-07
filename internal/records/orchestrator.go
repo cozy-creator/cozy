@@ -560,6 +560,9 @@ type ModelRef struct {
 	Release     string `json:"release"`
 	Lane        string `json:"lane,omitempty"`
 	Manifest    string `json:"manifest"`
+	// HubCheckpoint records that Hub resolved an exact retained checkpoint without
+	// a release. It routes downloads; the Hub still checks repository custody.
+	HubCheckpoint bool `json:"hub_checkpoint,omitempty"`
 	// ManifestLength is the manifest's exact byte length. Only a JOB declares its models
 	// as invocation inputs (orchestrator.jobModels); a serving request's models reach
 	// the worker through the placement's package-set lane, never as inputs.
