@@ -27,7 +27,7 @@ func replacementRequest(t *testing.T, store *records.Store, id, worker string) {
 	fatal(t, problem)
 }
 func replacementAuthor(machine string) ([]byte, string, *exit.Error) {
-	raw, problem := hub.RentalRequestBytes(machine, "cpu", strings.Repeat("1", 64), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", hub.DeclaredWorkload{SourceBytes: 2})
+	raw, problem := hub.RentalRequestBytes(machine, "cpu", strings.Repeat("1", 64), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", hub.DeclaredWorkload{SourceBytes: 2}, nil)
 	if problem != nil {
 		return nil, "", problem
 	}
