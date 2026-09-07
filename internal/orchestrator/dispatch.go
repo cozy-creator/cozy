@@ -238,7 +238,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		LocalPackageDigest: s.LocalPackageDigest,
 		Outputs:            strings.Join(s.Outputs, ","),
 		Assets:             s.Assets, WeightsOutputs: string(weightsBytes),
-		Kind: s.Kind, RetainWork: s.RetainWork, RetryOf: s.RetryOf, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
+		Kind: s.Kind, RetainWork: s.RetainWork, RetryOf: s.RetryOf, ChildArtifacts: s.ChildArtifacts, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, Models: s.Models,
 		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer,

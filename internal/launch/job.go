@@ -1,6 +1,8 @@
 package launch
 
 import (
+	"bytes"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 
@@ -29,7 +31,8 @@ type JobFacts struct {
 	Name string
 	// Request is the exact callable schema used by the admission authority before
 	// the request enters the ordinary queue.
-	Request Struct
+	Request          Struct
+	RetainsArtifacts bool
 	// DescriptorID is `job_descriptor_id`: sha256 over the canonical bytes of
 	// `{"format":"cozy.runtime.JobDescriptor/1", …the job's own descriptor entry}`.
 	// DERIVED, never stored (cr-009's seam) — every environment of one release computes
@@ -184,6 +187,8 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		Publishes:        declared.Publishes,
 		NeedsAccelerator: AcceleratorRequired(strings.Split(f.Install.Closure, "\n")),
 	}
+	resultSchema, _ := json.Marshal(declared.Result)
+	facts.RetainsArtifacts = bytes.Contains(resultSchema, []byte(`"input":"model"`))
 	for _, model := range declared.Models {
 		facts.ModelParams = append(facts.ModelParams, model.Param)
 	}

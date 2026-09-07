@@ -104,6 +104,10 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 			return
 		}
 	}
+	if problem := c.releaseOriginalDerivedResults(id); problem != nil {
+		c.retryRetainedCancellation(id)
+		return
+	}
 	if request.ModelTransfer != nil {
 		pending, problem := c.opt.Store.RetriedSourceCustodyPending(id)
 		if problem != nil || pending {

@@ -272,7 +272,8 @@ func replayJobSubmission(sub JobSubmission,
 		sort.Strings(params)
 	}
 	return orchestrator.Submission{Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: packageName,
-		Entrypoint: function, Payload: payload, Org: org,
+		ChildArtifacts: recorded.ChildArtifacts,
+		Entrypoint:     function, Payload: payload, Org: org,
 		InstallID: recorded.InstallID, Release: recorded.Release,
 		LocalPackageDigest: recorded.LocalPackageDigest,
 		PlanID:             recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
@@ -388,6 +389,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			continue
 		}
 		out.PlanID = job.DescriptorID
+		out.ChildArtifacts = job.RetainsArtifacts
 		out.Outputs = job.Outputs
 		out.WeightsOutputs = job.WeightsOutputs
 		out.NeedsAccelerator = job.NeedsAccelerator
@@ -439,6 +441,7 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 			continue
 		}
 		out.PlanID, out.Outputs = job.DescriptorID, job.Outputs
+		out.ChildArtifacts = job.RetainsArtifacts
 		out.WeightsOutputs, out.NeedsAccelerator = job.WeightsOutputs, job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
 		if problem := validateJobPayload(sub.Package, job, out.Payload); problem != nil {

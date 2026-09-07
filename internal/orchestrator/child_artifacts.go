@@ -11,6 +11,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func childArtifacts(raw []byte) (map[string]records.ModelArtifact, *exit.Error) {
@@ -146,6 +148,10 @@ func (c *Orchestrator) changeDerivedRetention(ctx context.Context, retention rec
 		result, err = session.preparation.RetainDerivedResult(ctx, request)
 	}
 	if err != nil {
+		switch status.Code(err) {
+		case codes.InvalidArgument, codes.PermissionDenied, codes.FailedPrecondition, codes.NotFound:
+			return exit.Named(exit.Conflict, "child.artifact_retention_refused", "native artifact retention refused its captured owner or receipt")
+		}
 		return exit.Unavailablef("native artifact retention awaits its current owner")
 	}
 	if result == nil || result.RetentionId != request.RetentionId || result.WeightsTransactionId != request.WeightsTransactionId || !bytes.Equal(result.TensorfsReceiptDigest, digest) || result.Released != release {
@@ -163,6 +169,66 @@ func (c *Orchestrator) changeDerivedRetention(ctx context.Context, retention rec
 		return c.opt.Store.CompleteWeightsRetentionRelease(retention.RetentionID)
 	}
 	return c.opt.Store.ConfirmWeightsRetention(retention.RetentionID, session.instanceID, session.bootID)
+}
+
+func (c *Orchestrator) releaseOriginalDerivedResults(id string) *exit.Error {
+	request, problem := c.opt.Store.RequestRow(id)
+	if problem != nil || request == nil {
+		return problem
+	}
+	if request.ParentRequestID == "" && !request.ChildArtifacts {
+		return nil
+	}
+	outputs, problem := c.opt.Store.AllModelTransferWeights(id, request.Ordinal)
+	if problem != nil {
+		return problem
+	}
+	if len(outputs) == 0 {
+		return nil
+	}
+	var session *session
+	if request.Worker != "" {
+		session, problem = c.rentalControl(request.Worker)
+	} else {
+		c.mu.Lock()
+		for _, candidate := range c.sessions {
+			if candidate.host == nil && candidate.preparation != nil {
+				session = candidate
+				break
+			}
+		}
+		c.mu.Unlock()
+	}
+	if problem != nil {
+		return problem
+	}
+	if session == nil {
+		return exit.Unavailablef("original artifact release awaits its native owner")
+	}
+	for _, output := range outputs {
+		receipt, err := canonical.Read(output.Receipt, &pb.WeightsReceipt{})
+		if err != nil {
+			return exit.Internalf("original artifact receipt is not canonical")
+		}
+		digest, err := canonical.Raw(receipt.Str("tensorfs_receipt_digest"))
+		if err != nil {
+			return exit.Internalf("original artifact native receipt digest is malformed")
+		}
+		call := &pb.DerivedResultReleaseRequest{WeightsTransactionId: output.TransactionID, TensorfsReceiptDigest: digest}
+		var result *pb.DerivedResultReleaseResult
+		if session.host != nil {
+			result, err = session.host.ReleaseDerivedResult(context.Background(), &pb.DerivedResultReleaseCall{Claim: session.claim, Request: call})
+		} else {
+			result, err = session.preparation.ReleaseDerivedResult(context.Background(), call)
+		}
+		if err != nil {
+			return exit.Unavailablef("original artifact release awaits native disposal")
+		}
+		if result == nil || !result.Released || result.WeightsTransactionId != output.TransactionID || !bytes.Equal(result.TensorfsReceiptDigest, digest) {
+			return exit.Named(exit.Structural, "child.original_release_changed", "native disposal changed the original result authority")
+		}
+	}
+	return nil
 }
 
 func (c *Orchestrator) retainChildInputs(request records.Request) *exit.Error {

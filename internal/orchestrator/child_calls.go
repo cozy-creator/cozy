@@ -184,6 +184,9 @@ func (c *Orchestrator) watchChildCall(s *session, call *pb.ChildCallRequest, id 
 				state := pb.ChildCallState_CHILD_CALL_STATE_SUCCEEDED
 				if problem != nil {
 					state = pb.ChildCallState_CHILD_CALL_STATE_FAILED
+					if row.State == "finalizing" {
+						_, _ = c.opt.Store.BlockRetainedWork(id, problem.ErrName(), problem.Message)
+					}
 				}
 				c.sendChildResult(s, call, id, state, result, problem)
 				return
