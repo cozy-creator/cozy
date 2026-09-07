@@ -1,6 +1,8 @@
 package producttest
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -10,7 +12,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 var privateChildRuntimeWheel = flag.String("child-runtime-wheel", "", "exact Runtime40 wheel for actual private child composition")
@@ -103,20 +107,11 @@ class Result(msgspec.Struct, frozen=True):
 ` + runtimeScriptSource + `# private-source = {path = "./source"}
 # private-candidate = {path = "./candidate"}
 # ///
-import msgspec
-from cozy_runtime.author import App, Context
 from private_source import compute as source
 from private_candidate import compute as candidate
-class Request(msgspec.Struct):
-    value: int = 7
-class Result(msgspec.Struct):
-    value: int
-app = App()
-@app.job
-async def main(request: Request, ctx: Context) -> Result:
-    original = await source(value=request.value)
-    improved = await candidate(value=original.value, factor=0)
-    return Result(improved.value)
+async def main():
+    original = await source(value=7)
+    await candidate(value=original.value, factor=0)
 `
 	must(t, os.WriteFile(script, []byte(code), 0o600))
 	status, out := runCozyPath(t, root, path, "run", script, "--await", "--json")
@@ -139,7 +134,7 @@ async def main(request: Request, ctx: Context) -> Result:
 	code = strings.Replace(code, "factor=0", "factor=2", 1)
 	must(t, os.WriteFile(script, []byte(code), 0o600))
 	status, out = runCozyPath(t, root, path, "run", script, "--retry", "1", "--await", "--json")
-	if status != 0 || !strings.Contains(out, `"value":214`) {
+	if status != 0 {
 		t.Fatalf("edited parent did not complete [%d]: %s", status, out)
 	}
 	second, problem := store.RequestByReference("4")
@@ -150,12 +145,13 @@ async def main(request: Request, ctx: Context) -> Result:
 		t.Fatalf("parent edit did not reuse only A: %+v", children)
 	}
 	secondB := children[1]
+	assertChildScalar(t, store, secondB.ID, 214)
 	implementation := filepath.Join(project, "candidate", "private_candidate.py")
 	raw, err := os.ReadFile(implementation)
 	must(t, err)
 	must(t, os.WriteFile(implementation, []byte(strings.Replace(string(raw), "return Result(value * factor)", "return Result(value * factor + 1)", 1)), 0o600))
 	status, out = runCozyPath(t, root, path, "run", script, "--retry", "1", "--await", "--json")
-	if status != 0 || !strings.Contains(out, `"value":215`) {
+	if status != 0 {
 		t.Fatalf("same-version library edit did not execute [%d]: %s", status, out)
 	}
 	third, problem := store.RequestByReference("7")
@@ -165,6 +161,7 @@ async def main(request: Request, ctx: Context) -> Result:
 	if len(children) != 2 || children[0].ReusedFrom != originalA.ID || children[0].Ordinal != 0 || children[1].Ordinal != 1 || children[1].ChildTargetDigest == secondB.ChildTargetDigest || children[1].ChildIntentDigest != secondB.ChildIntentDigest {
 		t.Fatalf("library edit did not invalidate exactly B: %+v", children)
 	}
+	assertChildScalar(t, store, children[1].ID, 215)
 	old, problem := store.RequestRow(first.ID)
 	fatal(t, problem)
 	if old.State != "blocked" || old.BodyDigest != first.BodyDigest {
@@ -174,5 +171,25 @@ async def main(request: Request, ctx: Context) -> Result:
 	must(t, err)
 	if strings.Contains(string(retained), "value * factor + 1") {
 		t.Fatal("library edit modified the original captured implementation")
+	}
+}
+
+func assertChildScalar(t *testing.T, store *records.Store, id string, value int) {
+	t.Helper()
+	attempts, problem := store.Attempts(id)
+	fatal(t, problem)
+	if len(attempts) != 1 {
+		t.Fatalf("child result has %d executions", len(attempts))
+	}
+	doc, err := canonical.Read(attempts[0].TerminalBody, &pb.AttemptOutcomeBody{})
+	must(t, err)
+	raw, err := base64.StdEncoding.DecodeString(doc.Sub("result").Str("inline_result"))
+	must(t, err)
+	var result struct {
+		Value int `json:"value"`
+	}
+	must(t, json.Unmarshal(raw, &result))
+	if result.Value != value {
+		t.Fatalf("child returned %d, want %d", result.Value, value)
 	}
 }
