@@ -39,10 +39,10 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if job.Kind != "job" || job.Invocable == nil || job.Invocable.Module != module || job.Invocable.Export != export {
 		return out, "", exit.Named(exit.Conflict, "child.export_changed", "the captured implementation does not expose the exact invocable job")
 	}
-	if job.Invocable.Reusable {
+	if job.Invocable.Memoize {
 		for _, capability := range job.Invocable.Capabilities {
 			if capability == "egress" || capability == "secrets" {
-				return out, "", exit.Named(exit.Conflict, "child.reusable_effect", "a reusable operation cannot carry external egress or secret capabilities")
+				return out, "", exit.Named(exit.Conflict, "child.memoized_effect", "a memoized operation cannot carry external egress or secret capabilities")
 			}
 		}
 	}
@@ -58,8 +58,8 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if problem != nil {
 		return out, "", problem
 	}
-	if parentJob.Invocable != nil && parentJob.Invocable.Reusable && !job.Invocable.Reusable {
-		return out, "", exit.Named(exit.Conflict, "child.impure_dependency", "a reusable parent operation cannot call a non-reusable dependency")
+	if parentJob.Invocable != nil && parentJob.Invocable.Memoize && !job.Invocable.Memoize {
+		return out, "", exit.Named(exit.Conflict, "child.impure_dependency", "a memoized parent operation cannot call a dependency that does not opt into memoization")
 	}
 	if problem := launch.ValidatePayload(install.Package, job, payload); problem != nil {
 		return out, "", problem
@@ -125,7 +125,7 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	out = orchestrator.Submission{Kind: "job", RetainWork: true, Package: install.Package, Entrypoint: binding.Entrypoint, Release: install.Version, InstallID: install.ID,
 		PlanID: facts.DescriptorID, Payload: append([]byte(nil), payload...), Outputs: facts.Outputs, WeightsOutputs: facts.WeightsOutputs, NeedsAccelerator: facts.NeedsAccelerator, Org: parent.Org}
 	out.Models = models
-	out.ChildReusable = job.Invocable.Reusable
+	out.ChildReusable = job.Invocable.Memoize
 	out.ChildArtifacts = len(launch.ModelArtifactPaths(job.Result)) > 0
 	if parent.Worker != "" {
 		out.Worker, out.Rental, out.RentalRequired = parent.Worker, true, true

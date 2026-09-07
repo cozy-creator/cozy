@@ -274,7 +274,7 @@ transaction blocks or pauses, and the ordinary run view explains the stopped sta
 An invocable dependency exposes an ordinary typed Python call. Its implementation is
 captured separately; the parent imports a generated interface containing signatures and
 result types. Calling it creates an ordinary managed child job. A reusable computation
-opts in with `@invocable(reusable=True)` and registers through `app.job(function)`.
+opts in with `@invocable(memoize=True)` and registers through `app.job(function)`.
 Arbitrary helper functions and external effects do not become cached operations.
 
 On the private worker, a reusable child can acquire an earlier successful result when its

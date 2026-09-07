@@ -358,7 +358,7 @@ install, then creates an ordinary job. The child status includes `parent_request
 no invented execution attempt. Scalar results can complete immediately; model results stay
 `finalizing` until native independent retention is confirmed.
 
-Cross-request reuse requires an explicit `reusable:true` callable declaration, identical
+Cross-request reuse requires an explicit `memoize:true` callable declaration, identical
 target implementation/dependencies, typed inputs/model references, and the current
 privileged numerical environment measurement. An unavailable measurement disables reuse
 while allowing execution. Exact same-parent call replay continues the original recorded

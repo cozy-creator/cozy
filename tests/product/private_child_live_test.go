@@ -85,7 +85,7 @@ import msgspec
 from cozy_runtime.author import App, Context, invocable
 class Result(msgspec.Struct, frozen=True):
     value: int
-@invocable(reusable=True)
+@invocable(memoize=True)
 `
 		if name == "source" {
 			body += "async def compute(ctx: Context, *, value: int) -> Result:\n    return Result(value + 100)\n"
