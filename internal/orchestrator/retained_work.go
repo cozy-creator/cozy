@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -134,6 +135,10 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 			return
 		}
 	}
+	if problem := c.ackReleasedRetainedAttempts(*request, attempts); problem != nil {
+		c.retryRetainedCancellation(id)
+		return
+	}
 	changed, problem := c.opt.Store.ReleaseRetainedWork(id)
 	if problem != nil || !changed {
 		c.retryRetainedCancellation(id)
@@ -141,6 +146,45 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 	}
 	request.State = "releasing"
 	c.finishRetainedRelease(*request)
+}
+
+// A retained terminal remains a Host obligation after the attempt first closes.
+// Release that same terminal only after its native/source ownership is settled.
+// Reconnect replays this ordinary ACK if the connection dies before delivery.
+func (c *Orchestrator) ackReleasedRetainedAttempts(request records.Request, attempts []records.Attempt) *exit.Error {
+	if request.Worker == "" || len(attempts) == 0 {
+		return nil
+	}
+	rental, problem := c.opt.Store.RentalRow(request.Worker)
+	if problem != nil {
+		return problem
+	}
+	if rental != nil && (rental.State == "released" || rental.State == "failed") {
+		return nil
+	}
+	s, problem := c.rentalControl(request.Worker)
+	if problem != nil {
+		_, _, _, _ = c.EnsureRental(request.Worker)
+		return problem
+	}
+	for _, attempt := range attempts {
+		if attempt.State != "closed" || attempt.TerminalID == "" {
+			continue
+		}
+		invocation, err := canonical.Raw(attempt.InvocationDigest)
+		if err != nil {
+			return exit.Internalf("retained attempt has malformed invocation identity")
+		}
+		outcome, err := canonical.Raw(attempt.TerminalDigest)
+		if err != nil {
+			return exit.Internalf("retained attempt has malformed terminal identity")
+		}
+		ack := &pb.AttemptOutcomeAck{RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, RequestId: request.ID, AttemptOrdinal: uint64(attempt.Attempt), InvocationSpecDigest: invocation, OutcomeId: attempt.TerminalID, OutcomeDigest: outcome, RetainWork: false}
+		if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_OutcomeAck{OutcomeAck: ack}}) {
+			return exit.Unavailablef("released terminal acknowledgement awaits its Host connection")
+		}
+	}
+	return nil
 }
 
 func (c *Orchestrator) finishRetainedRelease(request records.Request) {

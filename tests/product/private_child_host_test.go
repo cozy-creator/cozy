@@ -259,6 +259,16 @@ func TestPrivateChildActualHostArtifacts(t *testing.T) {
 	checkTensor(thirdChildren[1], 15)
 	var removed uint32
 	var reclaimed uint64
+	probe, err := os.Open(filepath.Join("testdata", "private_host_pending.py"))
+	must(t, err)
+	command := exec.Command("docker", "exec", "-i", host.Container, "python3", "-")
+	command.Stdin = probe //cozy:stdin-value read-only actual Host journal proof
+	observed, err := command.CombinedOutput()
+	probe.Close()
+	if err != nil {
+		t.Fatalf("canceled executions remain Host obligations: %v %s", err, observed)
+	}
+	t.Logf("Host journal after historical cancellation: %s", observed)
 	for deadline := time.Now().Add(10 * time.Second); ; {
 		status, out = runCozyPath(t, layout.Root, path, "rental", "prune", "child-host", "--json")
 		if status != 0 {
