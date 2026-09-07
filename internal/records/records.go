@@ -1113,7 +1113,7 @@ func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
 func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + installCols("i.") + `
 		FROM installs i WHERE i.id NOT IN (SELECT install_id FROM pins)
-		AND NOT EXISTS(SELECT 1 FROM requests WHERE install_id=i.id AND state IN (` + activeRequestStates + `))
+		AND NOT EXISTS(SELECT 1 FROM requests WHERE install_id=i.id AND (state IN (` + activeRequestStates + `) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
 		AND NOT EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=i.id)
 		ORDER BY i.created_at`)
 	if err != nil {
@@ -1168,6 +1168,18 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 		return false, exit.New(exit.Conflict, "cannot begin install %s gc: %s", id, err)
 	}
 	defer tx.Rollback()
+	// Check ownership before clearing historical references. A rejected GC must
+	// not sever the result schema from a completed child still owned by its parent.
+	var held bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM pins WHERE install_id=?)
+		OR EXISTS(SELECT 1 FROM requests WHERE install_id=? AND (state IN (`+activeRequestStates+`) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
+		OR EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=?)
+		OR EXISTS(SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')`, id, id, id, id).Scan(&held); err != nil {
+		return false, exit.New(exit.Conflict, "cannot inspect install %s gc ownership: %s", id, err)
+	}
+	if held {
+		return false, nil
+	}
 	if _, err := tx.Exec(`UPDATE requests SET install_id=NULL WHERE install_id=?
 		AND state NOT IN (`+activeRequestStates+`)`, id); err != nil {
 		return false, exit.New(exit.Conflict,

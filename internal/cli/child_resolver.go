@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -153,4 +154,52 @@ func (r *Resolver) PrivateArtifactPaths(request records.Request) ([][]string, *e
 		return nil, problem
 	}
 	return launch.ModelArtifactPaths(job.Result), nil
+}
+
+// PrivateRentalNeedsAccelerator sizes the rental for its captured children while
+// keeping the parent itself on the separate CPU orchestration slot.
+func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool, *exit.Error) {
+	if request.NeedsAccelerator || request.InstallID == "" {
+		return request.NeedsAccelerator, nil
+	}
+	queue := []string{request.InstallID}
+	seen := map[string]bool{}
+	needed := false
+	for len(queue) > 0 {
+		install := queue[0]
+		queue = queue[1:]
+		if seen[install] {
+			continue
+		}
+		seen[install] = true
+		bindings, problem := r.store.ChildBindings(install)
+		if problem != nil {
+			return false, problem
+		}
+		for _, binding := range bindings {
+			child, problem := r.store.Install(binding.ChildInstallID)
+			if problem != nil {
+				return false, problem
+			}
+			if child == nil {
+				return false, exit.Named(exit.Conflict, "child.install_absent", "captured child implementation is unavailable for rental sizing")
+			}
+			surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(child.Dir), binding.InterfaceDigest)
+			if problem != nil {
+				return false, problem
+			}
+			job, problem := surface.Function(binding.Entrypoint)
+			if problem != nil {
+				return false, problem
+			}
+			if job.Kind != "job" || job.Invocable == nil || job.Invocable.Module != binding.Module || job.Invocable.Export != binding.Export {
+				return false, exit.Named(exit.Conflict, "child.export_changed", "captured child has no exact job for rental sizing")
+			}
+			// The same immutable closure predicate JobsInstall uses; no package
+			// code needs importing again merely to choose a machine class.
+			needed = needed || launch.AcceleratorRequired(strings.Split(child.Closure, "\n"))
+			queue = append(queue, binding.ChildInstallID)
+		}
+	}
+	return needed, nil
 }

@@ -73,9 +73,10 @@ const DefaultJobRSSCap int64 = 8 << 30
 // its records — and a rented worker stages them itself, from
 // `package_prepare.py::_prepare_published`, before this owner has united anything. The
 // identity a preparation CAN name is its own placement's, and that is what the runtime
-// writes: `environment_digest` for a published preparation, the project wheel's digest
-// for a development one (`package_prepare.py::prepare_package`). This reads exactly
-// those two fields back off the document, so the local lane — which stages the record
+// writes: `environment_digest` for a published preparation, and the complete
+// `local_revision_digest` for a transported private preparation. A source-local
+// development install instead has its project wheel or captured source digest.
+// This reads those existing identities from the document, so the local lane — which stages the record
 // here, in Go — writes the same value the remote lane's worker wrote for itself.
 func JobBuildID(setBytes []byte, pkg string) (string, *exit.Error) {
 	doc, err := canonical.Read(setBytes, &pb.PlacementSet{})
@@ -85,7 +86,10 @@ func JobBuildID(setBytes []byte, pkg string) (string, *exit.Error) {
 	}
 	for _, row := range doc.List("placements") {
 		if development := row.Sub("development"); development.Str("package") == pkg {
-			id := development.Sub("project_wheel").Sub("ref").Str("digest")
+			id := development.Str("local_revision_digest")
+			if id == "" {
+				id = development.Sub("project_wheel").Sub("ref").Str("digest")
+			}
 			if id == "" {
 				// A local immutable source install has no transported project wheel.
 				// Its captured source closure is the build identity; the environment
@@ -226,6 +230,9 @@ func (c *Orchestrator) ConvergeRemoteJob(instanceID string, spec WorkerLaunchSpe
 		s = c.sessions[w.bootID]
 		w.spec = spec
 		w.planIDs = []string{spec.Placement.Jobs[0].DescriptorID}
+		if parent := spec.Placement.Jobs[0].OrchestrationParent; parent != nil {
+			w.planIDs = append(w.planIDs, parent.DescriptorID)
+		}
 		w.desiredRefusal = nil
 	}
 	c.mu.Unlock()

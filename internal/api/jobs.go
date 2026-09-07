@@ -696,9 +696,13 @@ func (s *Server) jobRow(w http.ResponseWriter, r *http.Request) (records.Request
 }
 
 func (s *Server) jobStateOf(row records.Request) JobState {
+	retaining, retentionProblem := s.store.RequestRetaining(row)
+	if retentionProblem != nil {
+		retaining = row.RetainWork
+	}
 	state := JobState{
 		RetainWork: row.RetainWork,
-		Retaining:  row.RetainWork && (!records.Settled(row.State) || (row.State == "succeeded" && row.RetainsLocalOutputs())),
+		Retaining:  retaining,
 		RetryOf:    row.RetryOf, ReuseScope: row.ReuseScope,
 		Number: row.Number, JobID: row.ID, Status: contractStatus(row.State), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
@@ -970,7 +974,12 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	actor := requestActor(r)
-	if row.RetainWork && row.State != "finalizing" && (!records.Settled(row.State) || (row.State == "succeeded" && row.RetainsLocalOutputs())) {
+	retaining, problem := s.store.RequestRetaining(row)
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	if retaining && row.State != "finalizing" {
 		if e := s.orchestrator.CancelRetainedRequest(row.ID, actor); e != nil {
 			s.refuseTyped(w, r, e)
 			return

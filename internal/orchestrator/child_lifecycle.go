@@ -36,7 +36,11 @@ func (c *Orchestrator) cancelChildCalls(parent string) *exit.Error {
 		return problem
 	}
 	for _, child := range children {
-		if records.Settled(child.State) && !(child.State == "succeeded" && child.RetainsLocalOutputs()) {
+		retaining, problem := c.opt.Store.RequestRetaining(child)
+		if problem != nil {
+			return problem
+		}
+		if records.Settled(child.State) && !retaining {
 			continue
 		}
 		if problem := c.CancelRetainedRequest(child.ID, "parent transaction abandoned"); problem != nil {

@@ -449,12 +449,19 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			// hosts no placement at all, so it has no serving axis. `jobs_available` IS
 			// the job credit, and this lane's dispatchability is that number.
 			avail := r.GetJobCapacity().GetJobsAvailable()
+			inFlight := r.GetJobCapacity().GetJobsInFlight()
 			if w.spec.Placement.Jobs[0].Orchestration {
 				avail = r.GetJobCapacity().GetOrchestrationAvailable()
+				inFlight = r.GetJobCapacity().GetOrchestrationInFlight()
 			}
 			w.observeJobs(int(avail))
+			w.jobReady = map[string]bool{}
 			for _, p := range w.spec.Placement.Jobs {
 				dispatchable[p.DescriptorID] = avail > 0
+				w.jobReady[p.DescriptorID] = avail > 0 || inFlight > 0
+				if parent := p.OrchestrationParent; parent != nil {
+					w.jobReady[parent.DescriptorID] = r.GetJobCapacity().GetOrchestrationAvailable() > 0 || r.GetJobCapacity().GetOrchestrationInFlight() > 0
+				}
 			}
 			// A job worker's own admission fence is its job capacity: the placement-set
 			// machinery does not run, so the seats are what it says they are.

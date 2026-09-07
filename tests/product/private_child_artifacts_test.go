@@ -108,3 +108,38 @@ func TestModelArtifactIsClosedAndDigestExact(t *testing.T) {
 		}
 	}
 }
+
+func TestPrivateCompletedScriptRetainsDelegatedArtifacts(t *testing.T) {
+	for _, artifacts := range []bool{false, true} {
+		t.Run(map[bool]string{false: "scalar", true: "native_artifact"}[artifacts], func(t *testing.T) {
+			store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
+			fatal(t, problem)
+			defer store.Close()
+			fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
+			parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "no-result-parent", ""))
+			child, _, problem := store.SubmitChild(records.Request{ID: "req-delegated-result", IdemKey: "delegated-result", Kind: "job", Package: "local/source", Entrypoint: "compute", Payload: []byte(`{}`), BodyDigest: childDigest("1"), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("2"), ChildTargetDigest: childDigest("3"), ChildArtifacts: artifacts}, 1, childDigest("1"), "private-boot")
+			fatal(t, problem)
+			closeChild(t, store, child, "SUCCEEDED", "succeeded")
+			closeChild(t, store, parent, "SUCCEEDED", "succeeded")
+			parentRow, problem := store.RequestRow(parent.ID)
+			fatal(t, problem)
+			retaining, problem := store.RequestRetaining(*parentRow)
+			fatal(t, problem)
+			if retaining != artifacts {
+				t.Fatalf("parent with no return value retained=%t, expected child artifact custody=%t", retaining, artifacts)
+			}
+			if artifacts {
+				fatal(t, store.RequestRetainedCancellation(child.ID, "release retained child"))
+				_, problem = store.ReleaseRetainedWork(child.ID)
+				fatal(t, problem)
+				_, problem = store.CompleteRetainedCancellation(child.ID)
+				fatal(t, problem)
+				retaining, problem = store.RequestRetaining(*parentRow)
+				fatal(t, problem)
+				if retaining {
+					t.Fatal("completed parent still retained an abandoned child")
+				}
+			}
+		})
+	}
+}

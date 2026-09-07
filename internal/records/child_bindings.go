@@ -43,6 +43,26 @@ func (s *Store) HasChildBindings(parentInstall string) (bool, *exit.Error) {
 	return held, nil
 }
 
+func (s *Store) ChildBindings(parentInstall string) ([]ChildBinding, *exit.Error) {
+	rows, err := s.db.Query(`SELECT `+childBindingCols+` FROM private_child_bindings WHERE parent_install_id=? ORDER BY interface_digest,module,export`, parentInstall)
+	if err != nil {
+		return nil, exit.Internalf("cannot read frozen child dependencies: %s", err)
+	}
+	defer rows.Close()
+	var out []ChildBinding
+	for rows.Next() {
+		binding, err := scanChildBinding(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read frozen child dependency: %s", err)
+		}
+		out = append(out, binding)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot finish frozen child dependency census: %s", err)
+	}
+	return out, nil
+}
+
 const childBindingCols = `parent_install_id,interface_digest,module,export,child_install_id,local_revision_digest,entrypoint`
 
 func scanChildBinding(row interface{ Scan(...any) error }) (ChildBinding, error) {
