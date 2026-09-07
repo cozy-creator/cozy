@@ -708,6 +708,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	// side is readable before the first observed state: admission reports CLOSED until the
 	// ack lands, which is exactly what "dispatch stays closed" looks like on the wire.
 	c.mu.Lock()
+	restateRevision := w.revision
 	w.acceptedRevision = uint64(doc.Int("accepted_desired_state_revision"))
 	// The surviving Host may have received a revision the replacement Runtime
 	// has never accepted. Seed only the owner's existing outgoing sequence;
@@ -791,6 +792,12 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		}
 		w.desiredMu.Lock()
 		defer w.desiredMu.Unlock()
+		c.mu.Lock()
+		changed := w.revision != restateRevision
+		c.mu.Unlock()
+		if changed {
+			return true // a concurrent caller already issued a newer selection
+		}
 		if e := c.issuePackageSet(s, w, packages, models); e != nil {
 			c.logf("rental %s package_set could not be issued: %s",
 				w.spec.Connection.RentalID, e.Message)
