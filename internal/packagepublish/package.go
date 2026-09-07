@@ -46,6 +46,7 @@ type Package struct {
 	Root             string // disposable wheel output, empty until Build
 	Name             string
 	Release          string
+	temporarySource  string // generated single-file project, copied into a retained install
 }
 
 type sourceIdentityFile struct {
@@ -58,7 +59,10 @@ type sourceIdentityDocument struct {
 	Sources []sourceIdentityFile `json:"sources"`
 }
 
-func (p *Package) Close() { _ = os.RemoveAll(p.Root) }
+func (p *Package) Close() {
+	_ = os.RemoveAll(p.Root)
+	_ = os.RemoveAll(p.temporarySource)
+}
 
 // Prepare reads publication identity and source paths without executing the
 // project's build backend. The caller can therefore ask Tensorhub whether the

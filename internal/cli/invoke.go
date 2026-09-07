@@ -74,6 +74,7 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	defer func() { reclaimSnapshot(ctx, target) }()
 	if target.Function == "" {
 		return emitFunctions(ctx, target, packageInterface)
 	}
@@ -83,6 +84,16 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	}
 	if ctx.Inv.Bool("--describe") {
 		return emitDescribe(ctx, target, packageInterface, callable)
+	}
+	if callable.Kind == "job" && strings.HasPrefix(target.Package, "local/") && !target.Snapshot {
+		target, packageInterface, problem = snapshotLocalJob(ctx, target)
+		if problem != nil {
+			return problem
+		}
+		callable, problem = packageInterface.Function(target.Function)
+		if problem != nil {
+			return unknownFunction(target, packageInterface)
+		}
 	}
 	if callable.Kind != "job" {
 		if len(ctx.Inv.Values["--input"]) > 0 {
@@ -2014,6 +2025,7 @@ type Target struct {
 	Function  string
 	InstallID string
 	Release   string
+	Snapshot  bool
 }
 
 // parseTarget reads the user-facing package grammar. Versions are flags, not path
@@ -2042,6 +2054,9 @@ func parseTarget(raw string) (Target, *exit.Error) {
 }
 
 func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) {
+	if isScriptTarget(ctx.Inv.Args[0]) {
+		return scriptTarget(ctx)
+	}
 	target, problem := parseTarget(ctx.Inv.Args[0])
 	if problem != nil {
 		return Target{}, nil, problem
