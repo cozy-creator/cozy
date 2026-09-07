@@ -214,13 +214,17 @@ type ModelRef = records.ModelRef
 type PlacementDecision struct {
 	Tier         string `json:"tier"`
 	ConfigDigest string `json:"config_digest"`
-	// Ladder is the fit map the candidates were pinned by (`H100=fp8`), one entry per
-	// slot when slots differ.
+	// Ladder is the owner's fit map the candidates were sized by (`H100=fp8 > *=bf16`),
+	// one entry per slot when slots differ; none when the request binds no ladder.
+	// Override is the lane the request pinned itself — an explicit `model.<param>=…/lane`
+	// (cl-170) — which is not a rung and asserts no fit.
 	Ladder     []string              `json:"ladder,omitempty"`
+	Override   string                `json:"override,omitempty"`
 	Throughput []hub.ModelThroughput `json:"throughput"`
 	Candidates []PlacementCandidate  `json:"candidates"`
-	RentalID   string                `json:"rental,omitempty"`
-	Bought     bool                  `json:"bought"`
+	// RentalID is the machine chosen; empty on a decision to wait for one attaching.
+	RentalID string `json:"rental,omitempty"`
+	Bought   bool   `json:"bought"`
 	// Models is the request's selection pinned to the chosen machine's rung; nil when
 	// the request was already exact.
 	Models []ModelRef `json:"-"`
@@ -232,8 +236,9 @@ type PlacementCandidate struct {
 	Rental  string `json:"rental,omitempty"`
 	Machine string `json:"machine,omitempty"`
 	SKU     string `json:"sku"`
-	// Rung is the 1-based ladder rung the machine fell under and Lane the lane it pins;
-	// Fit says how the device was sized against that lane (cl-168).
+	// Rung is the 1-based ladder rung the machine fell under — 0 under an explicit lane,
+	// which is not a rung — and Lane the lane it pins; Fit says how the device was sized
+	// against that lane (cl-168, cl-170).
 	Rung int    `json:"rung,omitempty"`
 	Lane string `json:"lane,omitempty"`
 	Fit  string `json:"fit,omitempty"`
@@ -258,6 +263,9 @@ const (
 	VerdictSlower     = "slower"
 	VerdictDearer     = "dearer"
 	VerdictUnmeasured = "unmeasured"
+	// VerdictAttaching: a fitting rental the fleet holds whose worker has not attached
+	// yet; the request waits for it (cl-170).
+	VerdictAttaching = "attaching"
 	// VerdictNoRung: no rung of the binding ladder names this machine's accelerator.
 	VerdictNoRung = "no_rung"
 	// VerdictNoStock: the hub refused the buy for want of inventory, and the choice repeated.
@@ -302,26 +310,52 @@ func (d PlacementDecision) Unexplained() string {
 	return ""
 }
 
+// Waiting is the rental the decision waits on: a fitting one whose worker has not attached.
+func (d PlacementDecision) Waiting() (PlacementCandidate, bool) {
+	for _, c := range d.Candidates {
+		if c.Verdict == VerdictAttaching {
+			return c, true
+		}
+	}
+	return PlacementCandidate{}, false
+}
+
 // Line is the one human sentence `cozy run` prints for the decision.
 func (d PlacementDecision) Line() string {
 	c, ok := d.Chosen()
 	if !ok {
+		if w, waiting := d.Waiting(); waiting {
+			return fmt.Sprintf("placement: wait for %s to attach — %s", w.describe(), d.Tier)
+		}
 		return "placement: nothing chosen"
 	}
-	line := "placement: buy " + c.SKU
+	line := "placement: buy " + c.describe()
 	if c.Attached() {
-		line = "placement: reuse " + c.Name() + " (" + c.SKU
-		if c.Lane != "" {
-			line += ", " + c.Lane
-		}
-		line += ")"
-	} else if c.Lane != "" {
-		line += " (" + c.Lane + ")"
+		line = "placement: reuse " + c.describe()
 	}
-	if !c.Measured {
+	switch {
+	case c.Measured:
+		return fmt.Sprintf("%s — %s, %.0f s, $%.2f", line, d.Tier, c.TimeS, float64(c.CostUSDMicros)/1e6)
+	case c.Rung > 0:
 		return fmt.Sprintf("%s — %s, unmeasured (rung %d)", line, d.Tier, c.Rung)
 	}
-	return fmt.Sprintf("%s — %s, %.0f s, $%.2f", line, d.Tier, c.TimeS, float64(c.CostUSDMicros)/1e6)
+	return fmt.Sprintf("%s — %s, unmeasured", line, d.Tier)
+}
+
+// describe is the candidate as a line names it: `morgiana (h100-80, fp8)` for a rental,
+// `h100-80 (fp8)` for a product.
+func (c PlacementCandidate) describe() string {
+	name, detail := c.SKU, []string{}
+	if c.Attached() {
+		name, detail = c.Name(), append(detail, c.SKU)
+	}
+	if c.Lane != "" {
+		detail = append(detail, c.Lane)
+	}
+	if len(detail) == 0 {
+		return name
+	}
+	return name + " (" + strings.Join(detail, ", ") + ")"
 }
 
 // verdicts renders every candidate with its verdict, for the daemon log.
@@ -357,10 +391,11 @@ const (
 	ExcludedWrongClass = "wrong_class"
 	// ExcludedNotReady: the rental is not in a state that can take a placement.
 	ExcludedNotReady = "not_ready"
-	// ExcludedUnattached: ready, but with no address or pinned certificate yet.
-	ExcludedUnattached = "unattached"
-	// ExcludedVRAMShort is spelled with the need and the device's memory appended: the
-	// rung lane's resident components do not fit (cl-168).
+	// ExcludedAttaching is spelled with the machine appended: a fitting rental is
+	// attaching, and nothing is chosen or bought past it (cl-170).
+	ExcludedAttaching = "attaching"
+	// ExcludedVRAMShort is spelled with the need and the device's memory appended: what
+	// the pinned lanes need does not fit (cl-168, cl-170).
 	ExcludedVRAMShort = "vram_short"
 	// ExcludedBaseMismatch is spelled with the pod's own reason appended: the release's
 	// requirements contradict the product's base image.
@@ -750,11 +785,11 @@ func (c *Orchestrator) drain() {
 // on every worker report, and a parked request that is still parked is not news.
 // A caller that knows the blocking condition passes it; an empty waitFacts means "a
 // capacity refusal" and the condition is read from the same routing that names the lanes.
-func (c *Orchestrator) park(req records.Request, position int, facts waitFacts, reason string) {
+func (c *Orchestrator) park(req records.Request, position int, facts waitFacts, reason string) bool {
 	c.mu.Lock()
 	if !c.queued(req.ID) {
 		c.mu.Unlock()
-		return
+		return false
 	}
 	p := c.parked[req.ID]
 	if p == nil {
@@ -774,7 +809,7 @@ func (c *Orchestrator) park(req records.Request, position int, facts waitFacts, 
 	overtaken, budget, claims := p.overtaken, p.budget, p.claims()
 	c.mu.Unlock()
 	if !changed {
-		return
+		return false
 	}
 	c.logf("%s PARKED at queue position %d (lanes %s, overtaken %d of %d, claims=%t): %s",
 		req.ID, position+1, orNone(laneStrings(lanes)), overtaken, budget, claims, reason)
@@ -786,6 +821,7 @@ func (c *Orchestrator) park(req records.Request, position int, facts waitFacts, 
 		"reason": reason, "position": position + 1, "lanes": rows,
 		"overtaken": overtaken, "budget": budget, "claims": claims,
 	}, req))
+	return true
 }
 
 // queued answers whether a request is still in the dispatch queue. Callers hold c.mu.

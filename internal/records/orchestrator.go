@@ -577,7 +577,8 @@ type ModelRef struct {
 	// class, in the owner's order, each rung resolved to the exact manifest the model
 	// card publishes for that lane. A ref carrying a Ladder and no Manifest is UNPINNED:
 	// the machine decision picks the rung whose gpu pattern matches the winning
-	// accelerator and pins Lane/Manifest/Bytes from it. Empty on an explicit override.
+	// accelerator and pins Lane/Manifest/Bytes from it. A pinned ref keeps the ladder as
+	// the owner's word on where its lane fits (cl-170): an explicit override is not a rung.
 	Ladder []ModelRung `json:"ladder,omitempty"`
 }
 
@@ -611,57 +612,73 @@ func (m ModelRef) RungFor(accelerator string) (ModelRung, int, bool) {
 	return ModelRung{}, -1, false
 }
 
-// Pin returns the ref bound to one rung. The ladder is dropped: a pinned ref is the same
-// object an explicit `model.<param>=org/model@release/lane` produces.
+// Pin returns the ref bound to one rung, its ladder kept.
 func (m ModelRef) Pin(rung ModelRung) ModelRef {
-	m.Lane, m.Manifest, m.Bytes, m.ComponentBytes, m.Ladder =
-		rung.Lane, rung.Manifest, rung.Bytes, rung.ComponentBytes, nil
+	m.Lane, m.Manifest, m.Bytes, m.ComponentBytes = rung.Lane, rung.Manifest, rung.Bytes, rung.ComponentBytes
 	return m
 }
 
-// How a machine-class decision sized the device (cl-168).
+// How a machine-class decision sized the device against one slot (cl-168, cl-170).
 const (
 	// FitComponents: the card published every component's bytes, so the need is the
 	// entrypoint's largest resident group and the device is held to it.
 	FitComponents = "components"
-	// FitRungAsserted: the card carries no per-component bytes for a pinned lane. The
-	// owner's rung is the assertion that the lane fits this class; no figure overrides it.
+	// FitRungAsserted: no component bytes, but a rung of the owner's ladder names this
+	// accelerator AND this lane. That rung asserts the lane fits; no figure is compared.
 	FitRungAsserted = "rung_asserted"
+	// FitLaneBytes: no component bytes and no rung asserting this lane on this
+	// accelerator — an explicit override off the ladder, or bound to none — so the whole
+	// lane's bytes are the need, conservatively.
+	FitLaneBytes = "lane_bytes"
 )
 
-// Residency is what a pinned selection must hold on one device at once.
+// Residency is what a pinned selection must hold on one device at once, and the rule that
+// sized it — per slot, distinct rules joined by "+".
 type Residency struct {
 	Bytes int64
 	Fit   string
-	// Need names each slot's largest group — `condition_text: text_encoder`, or the largest
-	// single component when the slot declares no component_use.
+	// Need names each slot's figure: `condition_text: text_encoder`, the largest single
+	// component when the slot declares no component_use, or `lane <lane>` for whole-lane bytes.
 	Need string
 }
 
-// Resident sizes the selection the way cozy-runtime loads it: per slot, the largest sum
-// over the slot's component_use groups (a method stages only the components it names), or
-// the largest single component when the slot declares none; summed over slots, because a
-// placement holds every slot at once. A pinned lane with no component bytes makes the
-// whole selection rung-asserted — there is no figure to hold a device to.
-func Resident(models []ModelRef) Residency {
-	if len(models) == 0 {
-		return Residency{}
-	}
-	out := Residency{Fit: FitComponents}
-	needs := make([]string, 0, len(models))
+// Resident sizes the pinned selection against one accelerator the way cozy-runtime loads
+// it: per slot, the largest sum over the slot's component_use groups (a method stages only
+// the components it names), or the largest single component when the slot declares none;
+// with no component bytes, the owner's rung for this accelerator and lane asserts the fit
+// with no figure, and failing that the lane's whole bytes stand in. Summed over slots,
+// because a placement holds every slot at once.
+func Resident(models []ModelRef, accelerator string) Residency {
+	var out Residency
+	var fits, needs []string
 	for _, model := range models {
-		if len(model.ComponentBytes) == 0 {
-			return Residency{Fit: FitRungAsserted}
-		}
-		bytes, need := model.resident()
+		bytes, need, fit := model.resident(accelerator)
 		out.Bytes += bytes
-		needs = append(needs, need)
+		if need != "" {
+			needs = append(needs, need)
+		}
+		if !slices.Contains(fits, fit) {
+			fits = append(fits, fit)
+		}
 	}
-	out.Need = strings.Join(needs, "; ")
+	out.Fit, out.Need = strings.Join(fits, "+"), strings.Join(needs, "; ")
 	return out
 }
 
-func (m ModelRef) resident() (int64, string) {
+func (m ModelRef) resident(accelerator string) (int64, string, string) {
+	if len(m.ComponentBytes) > 0 {
+		bytes, need := m.largestGroup()
+		return bytes, need, FitComponents
+	}
+	for _, rung := range m.Ladder {
+		if rung.Lane == m.Lane && RungMatches(rung.GPU, accelerator) {
+			return 0, "", FitRungAsserted
+		}
+	}
+	return m.Bytes, "lane " + m.Lane, FitLaneBytes
+}
+
+func (m ModelRef) largestGroup() (int64, string) {
 	var best int64
 	need := ""
 	for _, method := range slices.Sorted(maps.Keys(m.ComponentUse)) {

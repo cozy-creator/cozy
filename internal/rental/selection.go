@@ -21,9 +21,9 @@ type Constraints struct {
 
 // Purchases is every product of the request's class as a placement candidate (cl-165),
 // pinned to the rung its accelerator fits and carrying the verdict that keeps it out —
-// no rung, a device the lane's resident components outweigh (cl-168), a base image the
-// release contradicts — or none, when it may be bought. The rate is what the renter pays:
-// price plus storage. A CPU-class request skips the device check: there is no device.
+// no rung, a device the selection outweighs (cl-168, cl-170), a base image the release
+// contradicts — or none, when it may be bought. The rate is what the renter pays: price
+// plus storage. A CPU-class request skips the device check: there is no device.
 func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator bool,
 	constraints Constraints) []orchestrator.PlacementCandidate {
 	var out []orchestrator.PlacementCandidate
@@ -33,35 +33,46 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 		}
 		c := orchestrator.PlacementCandidate{SKU: sku.Name,
 			RateUSDMicrosPerHour: sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour}
-		var ok bool
-		if c.Models, c.Rung, ok = Pin(models, sku.AcceleratorModel); !ok {
-			c.Verdict = orchestrator.VerdictNoRung
-		} else {
-			c.Lane = records.Lanes(c.Models)
-			if needsAccelerator {
-				need := records.Resident(c.Models)
-				c.Fit, c.Verdict = FitNote(need, sku.VRAMGB), Fit(need, sku.VRAMGB, sku.Name)
-			}
-			if c.Verdict == "" {
-				c.Verdict = baseMismatch(sku, constraints)
-			}
+		Size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator)
+		if c.Verdict == "" {
+			c.Verdict = baseMismatch(sku, constraints)
 		}
 		out = append(out, c)
 	}
 	return out
 }
 
+// Size pins the selection onto one machine and holds its device to what the pinned lanes
+// need (cl-168, cl-170): Models, Rung and Lane, then Fit — the rule that sized it — and
+// the verdict that keeps it out, no_rung or vram_short. `device` is false for a CPU-class
+// request, or a machine the catalog no longer sizes: nothing is compared.
+func Size(c *orchestrator.PlacementCandidate, models []records.ModelRef, accelerator string,
+	vramGB int64, device bool) {
+	var ok bool
+	if c.Models, c.Rung, ok = Pin(models, accelerator); !ok {
+		c.Verdict = orchestrator.VerdictNoRung
+		return
+	}
+	c.Lane = records.Lanes(c.Models)
+	if !device {
+		return
+	}
+	need := records.Resident(c.Models, accelerator)
+	c.Fit, c.Verdict = FitNote(need, vramGB), Fit(need, vramGB, c.SKU)
+}
+
 // Pin binds the selection to the rung fitting `accelerator`: the pinned refs, the first
-// slot's 1-based rung, and whether every slot fits. An empty selection fits anywhere.
+// slot's 1-based rung — 0 when that slot pinned its own lane, which is not a rung
+// (cl-170) — and whether every slot fits. An empty selection fits anywhere.
 func Pin(models []records.ModelRef, accelerator string) ([]records.ModelRef, int, bool) {
-	rung := 1
+	rung := 0
 	pinned := make([]records.ModelRef, 0, len(models))
 	for i, model := range models {
 		fitted, index, ok := model.RungFor(accelerator)
 		if !ok {
 			return nil, 0, false
 		}
-		if i == 0 {
+		if i == 0 && !model.Pinned() {
 			rung = index + 1
 		}
 		pinned = append(pinned, model.Pin(fitted))
@@ -70,25 +81,24 @@ func Pin(models []records.ModelRef, accelerator string) ([]records.ModelRef, int
 }
 
 // Fit is the one VRAM sanity floor a buy, a reuse and an explicit override are held to
-// (cl-168): a device is short only when the entrypoint's resident components measurably
-// outweigh it. It is never a second opinion on the owner's rung — a selection the card
-// publishes no component bytes for fits by that assertion. VRAMGB is read as GiB, the
-// unit GPU memory is built in (an "80 GB" H100 carries 81920 MiB).
+// (cl-168): a device is short only when what the selection measurably needs outweighs it.
+// A rung-asserted slot needs no figure — the owner's word stands. VRAMGB is read as GiB,
+// the unit GPU memory is built in (an "80 GB" H100 carries 81920 MiB).
 func Fit(need records.Residency, vramGB int64, name string) string {
-	if need.Fit != records.FitComponents || need.Bytes <= vramGB<<30 {
+	if need.Bytes <= vramGB<<30 {
 		return ""
 	}
 	return fmt.Sprintf("%s%s: needs %.1f GiB resident (%s), %s has %d GB", orchestrator.VerdictExcluded,
 		orchestrator.ExcludedVRAMShort, float64(need.Bytes)/(1<<30), need.Need, name, vramGB)
 }
 
-// FitNote renders how the device was sized, so the record says whether a figure was
-// compared or the owner's rung stood alone.
+// FitNote renders how the device was sized: the rule, and the figure compared when there
+// was one.
 func FitNote(need records.Residency, vramGB int64) string {
-	if need.Fit == records.FitComponents {
-		return fmt.Sprintf("%s %.1f GiB of %d GB", need.Fit, float64(need.Bytes)/(1<<30), vramGB)
+	if need.Bytes == 0 {
+		return need.Fit
 	}
-	return need.Fit
+	return fmt.Sprintf("%s %.1f GiB of %d GB", need.Fit, float64(need.Bytes)/(1<<30), vramGB)
 }
 
 func baseMismatch(sku hub.RentalSKU, constraints Constraints) string {
@@ -103,25 +113,65 @@ func baseMismatch(sku hub.RentalSKU, constraints Constraints) string {
 	return orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": " + reason
 }
 
-// Ladder renders the fit map the candidates were pinned by: the lone slot's ladder, or
-// one `slot: …` line per slot when the request binds several.
+// Ladder renders the owner's fit map the candidates were sized by: the lone slot's
+// ladder, or one `slot: …` line per slot when the request binds several; nothing for a
+// slot bound to none.
 func Ladder(models []records.ModelRef) []string {
 	var out []string
 	for _, model := range models {
-		rungs := model.Lane
-		if !model.Pinned() {
-			parts := make([]string, 0, len(model.Ladder))
-			for _, rung := range model.Ladder {
-				parts = append(parts, rung.String())
-			}
-			rungs = strings.Join(parts, " > ")
+		if len(model.Ladder) == 0 {
+			continue
 		}
+		parts := make([]string, 0, len(model.Ladder))
+		for _, rung := range model.Ladder {
+			parts = append(parts, rung.String())
+		}
+		rungs := strings.Join(parts, " > ")
 		if len(models) == 1 {
 			return []string{rungs}
 		}
 		out = append(out, model.Slot+": "+rungs)
 	}
 	return out
+}
+
+// Override renders the lane(s) the request pinned before any machine existed — an explicit
+// `model.<param>=org/model@release/lane` — the lone slot's lane, or `slot=lane` pairs.
+func Override(models []records.ModelRef) string {
+	var parts []string
+	for _, model := range models {
+		if !model.Pinned() {
+			continue
+		}
+		if len(models) == 1 {
+			return model.Lane
+		}
+		parts = append(parts, model.Slot+"="+model.Lane)
+	}
+	return strings.Join(parts, ",")
+}
+
+// Attaching is the index of a fitting rental the fleet holds whose worker has not
+// attached yet (cl-170), or -1. It cannot take the request now, and the request waits
+// for it rather than buying around a machine already paid for (the cl-132 shape).
+func Attaching(candidates []orchestrator.PlacementCandidate) int {
+	for i, c := range candidates {
+		if c.Verdict == orchestrator.VerdictAttaching {
+			return i
+		}
+	}
+	return -1
+}
+
+// Wait closes the record on a decision to wait for `attaching`: every candidate still
+// open is passed over for it.
+func Wait(candidates []orchestrator.PlacementCandidate, attaching int) {
+	for i := range candidates {
+		if candidates[i].Verdict == "" {
+			candidates[i].Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedAttaching +
+				": " + candidates[attaching].Name()
+		}
+	}
 }
 
 // Measure reads each open candidate's expected time and cost from the row measured for

@@ -26,6 +26,7 @@ import (
 
 const (
 	gib          = int64(1) << 30
+	h100SXM      = "NVIDIA H100 80GB HBM3"
 	fp8Manifest  = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	mxfpManifest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	bf16Manifest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
@@ -214,20 +215,20 @@ func TestComponentFitHoldsTheOwnersRung(t *testing.T) {
 	// A slot without component_use holds its largest single component.
 	plain := fp8Exact()
 	plain.ComponentUse = nil
-	need := records.Resident([]records.ModelRef{plain})
+	need := records.Resident([]records.ModelRef{plain}, h100SXM)
 	if need.Fit != records.FitComponents || need.Bytes != textEncoderNeed || need.Need != "text_encoder" {
 		t.Fatalf("no component_use sized %+v; want the 51.5 GiB text encoder", need)
 	}
 	// A group is the SUM of the components its method stages, and the largest group wins.
 	pair := fp8Exact()
 	pair.ComponentUse = map[string][]string{"sample_pair": {"fl2va_dit", "ref2va_dit"}, "decode": {"audio_vae"}}
-	if need := records.Resident([]records.ModelRef{pair}); need.Bytes != 40*gib || need.Need != "sample_pair: fl2va_dit+ref2va_dit" {
+	if need := records.Resident([]records.ModelRef{pair}, h100SXM); need.Bytes != 40*gib || need.Need != "sample_pair: fl2va_dit+ref2va_dit" {
 		t.Fatalf("a two-DiT group sized %+v; want 40 GiB", need)
 	}
 	// A placement holds every slot at once: two H3 slots need two text encoders.
 	two := []records.ModelRef{fp8Exact(), fp8Exact()}
 	two[1].Slot = "generate.models.refiner"
-	if need := records.Resident(two); need.Bytes != 103*gib || need.Fit != records.FitComponents ||
+	if need := records.Resident(two, h100SXM); need.Bytes != 103*gib || need.Fit != records.FitComponents ||
 		need.Need != "condition_text: text_encoder; condition_text: text_encoder" {
 		t.Fatalf("two slots sized %+v; want 103 GiB", need)
 	}
@@ -239,31 +240,100 @@ func TestComponentFitHoldsTheOwnersRung(t *testing.T) {
 		t.Fatalf("h100-80 recorded %q; want both slots' needs", verdict)
 	}
 
-	// No component bytes on the card: the rung (or the explicit lane) is the owner's
-	// assertion. Nothing is excluded, and the record says the device was not sized.
-	asserted := fp8Exact()
-	asserted.ComponentBytes = nil
-	if need := records.Resident([]records.ModelRef{asserted}); need.Fit != records.FitRungAsserted || need.Bytes != 0 {
-		t.Fatalf("a lane without component bytes sized %+v; want rung_asserted", need)
+	// No component bytes on the card and no ladder: the whole lane is the need (cl-170).
+	// Nothing asserts a 103 GB lane onto a 24 GB card.
+	unsized := fp8Exact()
+	unsized.ComponentBytes = nil
+	if need := records.Resident([]records.ModelRef{unsized}, h100SXM); need.Fit != records.FitLaneBytes ||
+		need.Bytes != 103*gib || need.Need != "lane fp8-adaln-pruned" {
+		t.Fatalf("a lane without component bytes sized %+v; want its whole bytes", need)
 	}
-	decision = rental.Purchases(market20260907(), []records.ModelRef{asserted}, true, rental.Constraints{})
-	if got := strings.Join(walk(decision), " "); got != "rtx-4090 rtx-5090 h100-80 h100-nvl h200 b200" {
-		t.Fatalf("an asserted lane walked %q; want every card in price order", got)
+	decision = rental.Purchases(market20260907(), []records.ModelRef{unsized}, true, rental.Constraints{})
+	if got := strings.Join(walk(decision), " "); got != "h200 b200" {
+		t.Fatalf("an unsized lane walked %q; want only the cards that hold 103 GiB whole", got)
 	}
-	sized(t, find(t, decision, "rtx-4090"), records.FitRungAsserted)
-	if row := find(t, decision, "rtx-4090"); row.Verdict != "" {
-		t.Fatalf("an asserted lane was refused a card: %q", row.Verdict)
-	}
+	sized(t, find(t, decision, "rtx-4090"), "lane_bytes 103.0 GiB of 24 GB")
+	// A rung-asserted slot needs no figure, and the floor never overrules it.
 	if verdict := rental.Fit(records.Residency{Fit: records.FitRungAsserted}, 24, "rtx-4090"); verdict != "" {
 		t.Fatalf("the floor overruled the owner's rung: %q", verdict)
 	}
-	// One slot without bytes makes the whole selection asserted: there is no figure to
-	// hold the device to.
-	if need := records.Resident([]records.ModelRef{fp8Exact(), asserted}); need.Fit != records.FitRungAsserted {
-		t.Fatalf("a half-sized selection was held to %+v", need)
+	// Mixed slots sum what they can and name every rule.
+	mixed := []records.ModelRef{fp8Exact(), unsized}
+	mixed[1].Slot = "generate.models.refiner"
+	if need := records.Resident(mixed, h100SXM); need.Fit != "components+lane_bytes" || need.Bytes != textEncoderNeed+103*gib ||
+		need.Need != "condition_text: text_encoder; lane fp8-adaln-pruned" {
+		t.Fatalf("mixed slots sized %+v", need)
 	}
-	if need := records.Resident(nil); need.Fit != "" {
+	if need := records.Resident(nil, h100SXM); need.Fit != "" || need.Bytes != 0 {
 		t.Fatalf("an empty selection was sized %+v", need)
+	}
+}
+
+// cl-170. On 2026-09-07 `model.model=paul/minimax-h3@1.0.0-rc.1/fp8-adaln-pruned` on a card
+// publishing no component bytes read as "rung 1, rung_asserted" on EVERY product: the
+// override had become a one-lane ladder, and a 24 GB RTX 4090 was bought for the 103 GB
+// lane. An explicit lane is not a rung. Under it a card fits by the components when the
+// card sizes them; else by the owner's rung naming this card AND this lane; else by the
+// whole lane's bytes, conservatively.
+func TestExplicitLaneIsNotARung(t *testing.T) {
+	explicit := fp8Exact()
+	explicit.ComponentBytes = nil
+	explicit.Ladder = h3Ladder()[0].Ladder
+	models := []records.ModelRef{explicit}
+	decision := rental.Purchases(market20260907(), models, true, rental.Constraints{})
+	if got := strings.Join(walk(decision), " "); got != "h100-80 h100-nvl h200 b200" {
+		t.Fatalf("an explicit unsized fp8 lane may buy %q; want h100-80 h100-nvl h200 b200", got)
+	}
+	// The H100 rung names fp8: asserted, no figure compared. The B200 rung names mxfp8 and
+	// the catch-all bf16: fp8 is off the ladder there, so its 103 GiB are held to the card.
+	sized(t, find(t, decision, "h100-80"), records.FitRungAsserted)
+	sized(t, find(t, decision, "h100-nvl"), records.FitRungAsserted)
+	sized(t, find(t, decision, "b200"), "lane_bytes 103.0 GiB of 180 GB")
+	sized(t, find(t, decision, "h200"), "lane_bytes 103.0 GiB of 141 GB")
+	sized(t, find(t, decision, "rtx-4090"), "lane_bytes 103.0 GiB of 24 GB")
+	for _, name := range []string{"rtx-4090", "rtx-5090"} {
+		row := find(t, decision, name)
+		if row.Rung != 0 || !strings.HasPrefix(row.Verdict, "excluded:vram_short: needs 103.0 GiB resident (lane fp8-adaln-pruned), "+name+" has ") {
+			t.Fatalf("%s recorded %+v; want no rung and the whole lane's need", name, row)
+		}
+	}
+	if h100 := find(t, decision, "h100-80"); h100.Rung != 0 || h100.Lane != "fp8-adaln-pruned" || len(h100.Models[0].Ladder) != 3 {
+		t.Fatalf("the H100 candidate pins %+v; want no rung, the lane, the ladder kept", h100)
+	}
+	// The record says which lane was pinned and shows the real ladder, never one made of it.
+	if ladder := rental.Ladder(models); len(ladder) != 1 || ladder[0] != "H100=fp8-adaln-pruned > B200=mxfp8-adaln-pruned > *=bf16-full" {
+		t.Fatalf("the ladder rendered %v", ladder)
+	}
+	if rental.Override(models) != "fp8-adaln-pruned" || rental.Override(h3Ladder()) != "" {
+		t.Fatalf("override rendered %q and %q", rental.Override(models), rental.Override(h3Ladder()))
+	}
+	rental.Conclude(decision, rental.Place("balanced", decision))
+	if line := (orchestrator.PlacementDecision{Tier: "balanced", Candidates: decision}).Line(); line != "placement: buy h100-80 (fp8-adaln-pruned) — balanced, unmeasured" {
+		t.Fatalf("an override names a rung: %q", line)
+	}
+	// A rung naming the card and the pinned lane asserts it wherever it sits: the
+	// catch-all's bf16 on an H100.
+	bf16 := explicit
+	bf16.Lane, bf16.Manifest, bf16.Bytes = "bf16-full", bf16Manifest, 130*gib
+	if need := records.Resident([]records.ModelRef{bf16}, h100SXM); need.Fit != records.FitRungAsserted || need.Bytes != 0 {
+		t.Fatalf("the catch-all did not assert bf16 on an H100: %+v", need)
+	}
+	// No ladder bound at all: only the components or the whole lane size a card.
+	explicit.Ladder = nil
+	decision = rental.Purchases(market20260907(), []records.ModelRef{explicit}, true, rental.Constraints{})
+	if got := strings.Join(walk(decision), " "); got != "h200 b200" {
+		t.Fatalf("an unsized lane with no ladder may buy %q; want h200 b200 alone", got)
+	}
+	if verdict := find(t, decision, "h100-80").Verdict; !strings.HasPrefix(verdict, "excluded:vram_short: needs 103.0 GiB resident (lane fp8-adaln-pruned), h100-80 has 80 GB") {
+		t.Fatalf("with no ladder the H100 recorded %q", verdict)
+	}
+	sized(t, find(t, decision, "h100-80"), "lane_bytes 103.0 GiB of 80 GB")
+	if ladder := rental.Ladder([]records.ModelRef{explicit}); ladder != nil {
+		t.Fatalf("no ladder rendered as %v", ladder)
+	}
+	// The card's own figures beat both rules: a sized override is held to its components (cl-168).
+	if need := records.Resident([]records.ModelRef{fp8Exact()}, "NVIDIA GeForce RTX 4090"); need.Fit != records.FitComponents || need.Bytes != textEncoderNeed {
+		t.Fatalf("a sized override was not held to its components: %+v", need)
 	}
 }
 
@@ -314,7 +384,7 @@ func TestRungMatchingIsTheAcceleratorSubsequence(t *testing.T) {
 		t.Fatalf("a 5090 fits rung %d %+v; want the catch-all bf16-full", index, rung)
 	}
 	pinned, first, fits := rental.Pin(models, "NVIDIA H100 NVL")
-	if !fits || first != 1 || !pinned[0].Pinned() || pinned[0].Lane != "fp8-adaln-pruned" || pinned[0].Ladder != nil ||
+	if !fits || first != 1 || !pinned[0].Pinned() || pinned[0].Lane != "fp8-adaln-pruned" || len(pinned[0].Ladder) != 3 ||
 		pinned[0].ComponentBytes["text_encoder"] != textEncoderNeed || len(pinned[0].ComponentUse) != len(h3ComponentUse()) {
 		t.Fatalf("pinning to an H100 NVL gave %+v (rung %d, fits %t)", pinned, first, fits)
 	}
@@ -358,7 +428,7 @@ func TestRentalPinCarriesTheLaneAndARejectedBuyFreesTheNextRung(t *testing.T) {
 	row, problem = store.RequestRow(request)
 	fatal(t, problem)
 	if !assigned || row.Worker != "pr-ladder-h100" || row.Models[0].Lane != "fp8-adaln-pruned" ||
-		row.Models[0].Manifest != fp8Manifest || row.Models[0].Ladder != nil ||
+		row.Models[0].Manifest != fp8Manifest || len(row.Models[0].Ladder) != 3 ||
 		row.Models[0].ComponentBytes["fl2va_dit"] != 20*gib {
 		t.Fatalf("the pin did not carry the rung's lane and bytes: worker=%q models=%+v", row.Worker, row.Models)
 	}
