@@ -600,6 +600,9 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 			w.desiredRefusal = refused
 		}
+		if refused := w.jobExecutorRefusal(r); refused != nil {
+			w.desiredRefusal = refused
+		}
 		repeatedFault = w.latchedFaultReports > 1
 		workerTerminal = retirementGround(w) != ""
 	}

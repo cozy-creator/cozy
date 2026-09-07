@@ -1551,6 +1551,25 @@ func (w *worker) observeLatchedFault(r *pb.ObservedWorkerState) *exit.Error {
 		fault.Reason, brief(fault.Detail, 1024))
 }
 
+// Jobs have no placement set, so placement-fault reconciliation cannot settle
+// their preparation. This explicit safety refusal means no executor was created.
+// A stale revision or any usable/live job slot is never preparation-failure proof.
+func (w *worker) jobExecutorRefusal(r *pb.ObservedWorkerState) *exit.Error {
+	capacity := r.GetJobCapacity()
+	if !w.spec.IsJob() || w.revision == 0 || r.AcceptedDesiredStateRevision != w.revision ||
+		capacity.GetJobsAvailable() != 0 || capacity.GetJobsInFlight() != 0 ||
+		capacity.GetOrchestrationAvailable() != 0 || capacity.GetOrchestrationInFlight() != 0 {
+		return nil
+	}
+	for _, fault := range r.Faults {
+		if fault != nil && fault.Kind == pb.FaultKind_FAULT_KIND_LOCAL_SAFETY_REFUSAL && fault.Reason == "job_executor_absent" {
+			return exit.Named(exit.Structural, "job_executor_absent",
+				"the worker cannot create its contained job executor; run it within a delegated cgroup or use a configured private rental")
+		}
+	}
+	return nil
+}
+
 // EnsurePlacementReady blocks until the placement's SERVING AXIS says DISPATCHABLE for
 // this plan — a real activation completed, never merely "connected" and never merely
 // "materialized". The two axes are why this can now be said precisely: a placement that is
