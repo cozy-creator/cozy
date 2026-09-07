@@ -848,7 +848,7 @@ func (c *Orchestrator) rentalHeld(req records.Request) bool {
 		slot := pinnedPackage(req.Package, w.spec.Connection.RentalID)
 		if req.IsJob() {
 			if w.spec.Placement.Package == slot &&
-				w.spec.Placement.Jobs[0].Function == req.Entrypoint && staged(w, req.PlanID) {
+				w.spec.Placement.Jobs[0].Function == req.Entrypoint && stagedFor(w, req) {
 				return true
 			}
 			continue
@@ -953,6 +953,8 @@ func staged(w *worker, planID string) bool {
 
 func stagedFor(w *worker, req records.Request) bool {
 	if req.IsJob() && w.spec.Connection != nil {
+		// Exact job inputs include their count; an unknown older selection
+		// cannot satisfy a requested model through the serving wildcard.
 		return staged(w, req.PlanID) && exactJobSelection(w.spec.Placement, req)
 	}
 	if req.Worker != "" && w.spec.Connection != nil && !req.IsJob() {
@@ -1190,7 +1192,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		}
 		spec := WorkerLaunchSpec{Connection: remote.Connection, Placement: DesiredPlacement{
 			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
-			InstallID: req.InstallID, Models: append([]ModelRef(nil), req.Models...),
+			InstallID: req.InstallID, Models: append([]ModelRef(nil), logical.Models...),
 			LocalRevisionDigest: req.LocalPackageDigest,
 			PlacementSetDigest:  preparedSet,
 			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,

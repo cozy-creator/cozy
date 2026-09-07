@@ -571,7 +571,12 @@ type remotePlacementObservation struct {
 // seat is free. A placement that is STAGED but OFFLINE is not capacity, however much of it
 // is on disk.
 func (w *worker) dispatchableFor(planID string) bool {
-	if w.spec.Connection != nil && !w.spec.IsJob() {
+	if w.spec.IsJob() {
+		// Job capacity is the readiness axis. A serving convergence or serving
+		// status does not exist, but credits must describe the current directive.
+		return w.acceptedRevision >= w.revision && w.dispatchable[planID]
+	}
+	if w.spec.Connection != nil {
 		for key, placement := range w.remotePlacements {
 			if strings.HasSuffix(key, "\x00"+planID) && w.remoteDispatchable(placement, planID) {
 				return true

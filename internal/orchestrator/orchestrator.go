@@ -634,6 +634,10 @@ func (c *Orchestrator) emit(requestID, eventType string, attempt uint64, payload
 func (c *Orchestrator) nextRevision() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.nextRevisionLocked()
+}
+
+func (c *Orchestrator) nextRevisionLocked() uint64 {
 	c.revision++
 	return c.revision
 }
