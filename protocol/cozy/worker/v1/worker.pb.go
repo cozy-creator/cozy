@@ -13607,8 +13607,14 @@ type AttemptOutcomeAck struct {
 	InvocationSpecDigest []byte                 `protobuf:"bytes,7,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
 	OutcomeId            string                 `protobuf:"bytes,8,opt,name=outcome_id,json=outcomeId,proto3" json:"outcome_id,omitempty"`             // echo; a mismatched ack is NOT an ack — replay continues
 	OutcomeDigest        []byte                 `protobuf:"bytes,9,opt,name=outcome_digest,json=outcomeDigest,proto3" json:"outcome_digest,omitempty"` // echo; compared, never recomputed
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// MINOR 39: close this attempt while retaining its request-scoped writer identity,
+	// epochs and artifact custody for pause/retry. Does not authorize further execution.
+	// The owner sends false only after permanent abandonment or required final custody
+	// and disposition have settled. Native roots are still controlled by their explicit
+	// finalization/source-release operations; this flag never adopts or deletes bytes.
+	RetainWork    bool `protobuf:"varint,10,opt,name=retain_work,json=retainWork,proto3" json:"retain_work,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AttemptOutcomeAck) Reset() {
@@ -13695,6 +13701,13 @@ func (x *AttemptOutcomeAck) GetOutcomeDigest() []byte {
 		return x.OutcomeDigest
 	}
 	return nil
+}
+
+func (x *AttemptOutcomeAck) GetRetainWork() bool {
+	if x != nil {
+		return x.RetainWork
+	}
+	return false
 }
 
 type JobCheckpointRequest struct {
@@ -16865,7 +16878,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\fneeded_bytes\x18\x03 \x01(\x04R\vneededBytes\x12'\n" +
 	"\x0favailable_bytes\x18\x04 \x01(\x04R\x0eavailableBytes\x12#\n" +
 	"\rrequest_shape\x18\x05 \x01(\tR\frequestShape\x12%\n" +
-	"\x0eevidence_class\x18\x06 \x01(\tR\revidenceClass\"\xe3\x02\n" +
+	"\x0eevidence_class\x18\x06 \x01(\tR\revidenceClass\"\x84\x03\n" +
 	"\x11AttemptOutcomeAck\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
 	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
@@ -16876,7 +16889,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x16invocation_spec_digest\x18\a \x01(\fR\x14invocationSpecDigest\x12\x1d\n" +
 	"\n" +
 	"outcome_id\x18\b \x01(\tR\toutcomeId\x12%\n" +
-	"\x0eoutcome_digest\x18\t \x01(\fR\routcomeDigestJ\x04\b\x04\x10\x05\"\xa2\x03\n" +
+	"\x0eoutcome_digest\x18\t \x01(\fR\routcomeDigest\x12\x1f\n" +
+	"\vretain_work\x18\n" +
+	" \x01(\bR\n" +
+	"retainWorkJ\x04\b\x04\x10\x05\"\xa2\x03\n" +
 	"\x14JobCheckpointRequest\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
 	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
