@@ -5,7 +5,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -154,8 +153,19 @@ func TestPrivateTransactionRefusesPeerWithoutRetention(t *testing.T) {
 	requestID, _, problem := o.c.Submit(sub)
 	fatal(t, problem)
 	waitUntil(t, "typed refusal of retention-incompatible worker", func() bool {
-		return strings.Contains(strings.Join(o.c.Events(), "\n"), "request.retention_unsupported")
+		request, problem := o.store.RequestRow(requestID)
+		fatal(t, problem)
+		return request.State == "blocked"
 	})
+	events, problem := o.store.EventsAfter(requestID, 0, 100)
+	fatal(t, problem)
+	found := false
+	for _, event := range events {
+		found = found || event.Payload["error_type"] == "worker.protocol_incompatible"
+	}
+	if !found {
+		t.Fatal("the workspace protocol hard cut did not report its incompatible peer")
+	}
 	attempts, problem := o.store.Attempts(requestID)
 	fatal(t, problem)
 	if len(attempts) != 0 {

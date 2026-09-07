@@ -352,21 +352,30 @@ var WorkerControl_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	RuntimePreparation_ProtocolInfo_FullMethodName                 = "/cozy.worker.v1.RuntimePreparation/ProtocolInfo"
-	RuntimePreparation_NumericalEnvironment_FullMethodName         = "/cozy.worker.v1.RuntimePreparation/NumericalEnvironment"
-	RuntimePreparation_CheckPackageSetCompatibility_FullMethodName = "/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility"
-	RuntimePreparation_PreparePackageSet_FullMethodName            = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
-	RuntimePreparation_PrepareModelSource_FullMethodName           = "/cozy.worker.v1.RuntimePreparation/PrepareModelSource"
-	RuntimePreparation_ReleaseModelSource_FullMethodName           = "/cozy.worker.v1.RuntimePreparation/ReleaseModelSource"
-	RuntimePreparation_RetainDerivedResult_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/RetainDerivedResult"
-	RuntimePreparation_ReleaseDerivedRetention_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/ReleaseDerivedRetention"
-	RuntimePreparation_ReleaseDerivedResult_FullMethodName         = "/cozy.worker.v1.RuntimePreparation/ReleaseDerivedResult"
-	RuntimePreparation_CollectStoreGarbage_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/CollectStoreGarbage"
-	RuntimePreparation_ValidateWeightsCheckpoint_FullMethodName    = "/cozy.worker.v1.RuntimePreparation/ValidateWeightsCheckpoint"
-	RuntimePreparation_CheckpointPage_FullMethodName               = "/cozy.worker.v1.RuntimePreparation/CheckpointPage"
-	RuntimePreparation_CheckpointTransfer_FullMethodName           = "/cozy.worker.v1.RuntimePreparation/CheckpointTransfer"
-	RuntimePreparation_PrepareLocalPackage_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/PrepareLocalPackage"
-	RuntimePreparation_PreparePrivatePlacement_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/PreparePrivatePlacement"
+	RuntimePreparation_ProtocolInfo_FullMethodName                     = "/cozy.worker.v1.RuntimePreparation/ProtocolInfo"
+	RuntimePreparation_NumericalEnvironment_FullMethodName             = "/cozy.worker.v1.RuntimePreparation/NumericalEnvironment"
+	RuntimePreparation_RecordOperationResult_FullMethodName            = "/cozy.worker.v1.RuntimePreparation/RecordOperationResult"
+	RuntimePreparation_LookupOperation_FullMethodName                  = "/cozy.worker.v1.RuntimePreparation/LookupOperation"
+	RuntimePreparation_PruneOperationCache_FullMethodName              = "/cozy.worker.v1.RuntimePreparation/PruneOperationCache"
+	RuntimePreparation_WorkspaceRetainDerivedResult_FullMethodName     = "/cozy.worker.v1.RuntimePreparation/WorkspaceRetainDerivedResult"
+	RuntimePreparation_WorkspaceReleaseDerivedRetention_FullMethodName = "/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseDerivedRetention"
+	RuntimePreparation_WorkspaceReleaseDerivedResult_FullMethodName    = "/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseDerivedResult"
+	RuntimePreparation_WorkspaceWeightsIntentReady_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/WorkspaceWeightsIntentReady"
+	RuntimePreparation_ImportWorkspace_FullMethodName                  = "/cozy.worker.v1.RuntimePreparation/ImportWorkspace"
+	RuntimePreparation_ActivateWorkspaceImport_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/ActivateWorkspaceImport"
+	RuntimePreparation_CheckPackageSetCompatibility_FullMethodName     = "/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility"
+	RuntimePreparation_PreparePackageSet_FullMethodName                = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
+	RuntimePreparation_PrepareModelSource_FullMethodName               = "/cozy.worker.v1.RuntimePreparation/PrepareModelSource"
+	RuntimePreparation_ReleaseModelSource_FullMethodName               = "/cozy.worker.v1.RuntimePreparation/ReleaseModelSource"
+	RuntimePreparation_RetainDerivedResult_FullMethodName              = "/cozy.worker.v1.RuntimePreparation/RetainDerivedResult"
+	RuntimePreparation_ReleaseDerivedRetention_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/ReleaseDerivedRetention"
+	RuntimePreparation_ReleaseDerivedResult_FullMethodName             = "/cozy.worker.v1.RuntimePreparation/ReleaseDerivedResult"
+	RuntimePreparation_CollectStoreGarbage_FullMethodName              = "/cozy.worker.v1.RuntimePreparation/CollectStoreGarbage"
+	RuntimePreparation_ValidateWeightsCheckpoint_FullMethodName        = "/cozy.worker.v1.RuntimePreparation/ValidateWeightsCheckpoint"
+	RuntimePreparation_CheckpointPage_FullMethodName                   = "/cozy.worker.v1.RuntimePreparation/CheckpointPage"
+	RuntimePreparation_CheckpointTransfer_FullMethodName               = "/cozy.worker.v1.RuntimePreparation/CheckpointTransfer"
+	RuntimePreparation_PrepareLocalPackage_FullMethodName              = "/cozy.worker.v1.RuntimePreparation/PrepareLocalPackage"
+	RuntimePreparation_PreparePrivatePlacement_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/PreparePrivatePlacement"
 )
 
 // RuntimePreparationClient is the client API for RuntimePreparation service.
@@ -383,6 +392,19 @@ const (
 type RuntimePreparationClient interface {
 	ProtocolInfo(ctx context.Context, in *ProtocolInfoRequest, opts ...grpc.CallOption) (*ProtocolInfoResult, error)
 	NumericalEnvironment(ctx context.Context, in *NumericalEnvironmentRequest, opts ...grpc.CallOption) (*NumericalEnvironmentResult, error)
+	// The same authenticated workspace custody service is used by the local owner
+	// and the remote Host. Identity/custody is independent of a worker's job root.
+	RecordOperationResult(ctx context.Context, in *RecordOperationResultCall, opts ...grpc.CallOption) (*RecordOperationResultResult, error)
+	LookupOperation(ctx context.Context, in *LookupOperationCall, opts ...grpc.CallOption) (*LookupOperationResult, error)
+	PruneOperationCache(ctx context.Context, in *PruneOperationCacheCall, opts ...grpc.CallOption) (*PruneOperationCacheResult, error)
+	WorkspaceRetainDerivedResult(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
+	WorkspaceReleaseDerivedRetention(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
+	WorkspaceReleaseDerivedResult(ctx context.Context, in *DerivedResultReleaseCall, opts ...grpc.CallOption) (*DerivedResultReleaseResult, error)
+	WorkspaceWeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error)
+	// One-time authority transfer from a quiesced legacy Host journal. This is
+	// never forwarded from PodHost or exposed as an author-controlled cache write.
+	ImportWorkspace(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[WorkspaceImportFrame, WorkspaceImportResult], error)
+	ActivateWorkspaceImport(ctx context.Context, in *WorkspaceActivationCall, opts ...grpc.CallOption) (*WorkspaceImportResult, error)
 	CheckPackageSetCompatibility(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
 	PrepareModelSource(ctx context.Context, in *PrepareModelSourceRequest, opts ...grpc.CallOption) (*PrepareModelSourceResult, error)
@@ -420,6 +442,99 @@ func (c *runtimePreparationClient) NumericalEnvironment(ctx context.Context, in 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(NumericalEnvironmentResult)
 	err := c.cc.Invoke(ctx, RuntimePreparation_NumericalEnvironment_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) RecordOperationResult(ctx context.Context, in *RecordOperationResultCall, opts ...grpc.CallOption) (*RecordOperationResultResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RecordOperationResultResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_RecordOperationResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) LookupOperation(ctx context.Context, in *LookupOperationCall, opts ...grpc.CallOption) (*LookupOperationResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LookupOperationResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_LookupOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) PruneOperationCache(ctx context.Context, in *PruneOperationCacheCall, opts ...grpc.CallOption) (*PruneOperationCacheResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PruneOperationCacheResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_PruneOperationCache_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) WorkspaceRetainDerivedResult(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DerivedRetentionResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_WorkspaceRetainDerivedResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) WorkspaceReleaseDerivedRetention(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DerivedRetentionResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_WorkspaceReleaseDerivedRetention_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) WorkspaceReleaseDerivedResult(ctx context.Context, in *DerivedResultReleaseCall, opts ...grpc.CallOption) (*DerivedResultReleaseResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DerivedResultReleaseResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_WorkspaceReleaseDerivedResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) WorkspaceWeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WeightsHostAck)
+	err := c.cc.Invoke(ctx, RuntimePreparation_WorkspaceWeightsIntentReady_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) ImportWorkspace(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[WorkspaceImportFrame, WorkspaceImportResult], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &RuntimePreparation_ServiceDesc.Streams[0], RuntimePreparation_ImportWorkspace_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WorkspaceImportFrame, WorkspaceImportResult]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RuntimePreparation_ImportWorkspaceClient = grpc.ClientStreamingClient[WorkspaceImportFrame, WorkspaceImportResult]
+
+func (c *runtimePreparationClient) ActivateWorkspaceImport(ctx context.Context, in *WorkspaceActivationCall, opts ...grpc.CallOption) (*WorkspaceImportResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WorkspaceImportResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_ActivateWorkspaceImport_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -570,6 +685,19 @@ func (c *runtimePreparationClient) PreparePrivatePlacement(ctx context.Context, 
 type RuntimePreparationServer interface {
 	ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error)
 	NumericalEnvironment(context.Context, *NumericalEnvironmentRequest) (*NumericalEnvironmentResult, error)
+	// The same authenticated workspace custody service is used by the local owner
+	// and the remote Host. Identity/custody is independent of a worker's job root.
+	RecordOperationResult(context.Context, *RecordOperationResultCall) (*RecordOperationResultResult, error)
+	LookupOperation(context.Context, *LookupOperationCall) (*LookupOperationResult, error)
+	PruneOperationCache(context.Context, *PruneOperationCacheCall) (*PruneOperationCacheResult, error)
+	WorkspaceRetainDerivedResult(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
+	WorkspaceReleaseDerivedRetention(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
+	WorkspaceReleaseDerivedResult(context.Context, *DerivedResultReleaseCall) (*DerivedResultReleaseResult, error)
+	WorkspaceWeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error)
+	// One-time authority transfer from a quiesced legacy Host journal. This is
+	// never forwarded from PodHost or exposed as an author-controlled cache write.
+	ImportWorkspace(grpc.ClientStreamingServer[WorkspaceImportFrame, WorkspaceImportResult]) error
+	ActivateWorkspaceImport(context.Context, *WorkspaceActivationCall) (*WorkspaceImportResult, error)
 	CheckPackageSetCompatibility(context.Context, *PreparePackageSetRequest) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error)
 	PrepareModelSource(context.Context, *PrepareModelSourceRequest) (*PrepareModelSourceResult, error)
@@ -598,6 +726,33 @@ func (UnimplementedRuntimePreparationServer) ProtocolInfo(context.Context, *Prot
 }
 func (UnimplementedRuntimePreparationServer) NumericalEnvironment(context.Context, *NumericalEnvironmentRequest) (*NumericalEnvironmentResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method NumericalEnvironment not implemented")
+}
+func (UnimplementedRuntimePreparationServer) RecordOperationResult(context.Context, *RecordOperationResultCall) (*RecordOperationResultResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method RecordOperationResult not implemented")
+}
+func (UnimplementedRuntimePreparationServer) LookupOperation(context.Context, *LookupOperationCall) (*LookupOperationResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method LookupOperation not implemented")
+}
+func (UnimplementedRuntimePreparationServer) PruneOperationCache(context.Context, *PruneOperationCacheCall) (*PruneOperationCacheResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method PruneOperationCache not implemented")
+}
+func (UnimplementedRuntimePreparationServer) WorkspaceRetainDerivedResult(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method WorkspaceRetainDerivedResult not implemented")
+}
+func (UnimplementedRuntimePreparationServer) WorkspaceReleaseDerivedRetention(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method WorkspaceReleaseDerivedRetention not implemented")
+}
+func (UnimplementedRuntimePreparationServer) WorkspaceReleaseDerivedResult(context.Context, *DerivedResultReleaseCall) (*DerivedResultReleaseResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method WorkspaceReleaseDerivedResult not implemented")
+}
+func (UnimplementedRuntimePreparationServer) WorkspaceWeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error) {
+	return nil, status.Error(codes.Unimplemented, "method WorkspaceWeightsIntentReady not implemented")
+}
+func (UnimplementedRuntimePreparationServer) ImportWorkspace(grpc.ClientStreamingServer[WorkspaceImportFrame, WorkspaceImportResult]) error {
+	return status.Error(codes.Unimplemented, "method ImportWorkspace not implemented")
+}
+func (UnimplementedRuntimePreparationServer) ActivateWorkspaceImport(context.Context, *WorkspaceActivationCall) (*WorkspaceImportResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method ActivateWorkspaceImport not implemented")
 }
 func (UnimplementedRuntimePreparationServer) CheckPackageSetCompatibility(context.Context, *PreparePackageSetRequest) (*CheckPackageSetCompatibilityResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckPackageSetCompatibility not implemented")
@@ -691,6 +846,157 @@ func _RuntimePreparation_NumericalEnvironment_Handler(srv interface{}, ctx conte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(RuntimePreparationServer).NumericalEnvironment(ctx, req.(*NumericalEnvironmentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_RecordOperationResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RecordOperationResultCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).RecordOperationResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_RecordOperationResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).RecordOperationResult(ctx, req.(*RecordOperationResultCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_LookupOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LookupOperationCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).LookupOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_LookupOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).LookupOperation(ctx, req.(*LookupOperationCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_PruneOperationCache_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PruneOperationCacheCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).PruneOperationCache(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_PruneOperationCache_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).PruneOperationCache(ctx, req.(*PruneOperationCacheCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_WorkspaceRetainDerivedResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DerivedRetentionCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).WorkspaceRetainDerivedResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_WorkspaceRetainDerivedResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).WorkspaceRetainDerivedResult(ctx, req.(*DerivedRetentionCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_WorkspaceReleaseDerivedRetention_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DerivedRetentionCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).WorkspaceReleaseDerivedRetention(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_WorkspaceReleaseDerivedRetention_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).WorkspaceReleaseDerivedRetention(ctx, req.(*DerivedRetentionCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_WorkspaceReleaseDerivedResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DerivedResultReleaseCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).WorkspaceReleaseDerivedResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_WorkspaceReleaseDerivedResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).WorkspaceReleaseDerivedResult(ctx, req.(*DerivedResultReleaseCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_WorkspaceWeightsIntentReady_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WeightsIntentReadyCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).WorkspaceWeightsIntentReady(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_WorkspaceWeightsIntentReady_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).WorkspaceWeightsIntentReady(ctx, req.(*WeightsIntentReadyCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_ImportWorkspace_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(RuntimePreparationServer).ImportWorkspace(&grpc.GenericServerStream[WorkspaceImportFrame, WorkspaceImportResult]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RuntimePreparation_ImportWorkspaceServer = grpc.ClientStreamingServer[WorkspaceImportFrame, WorkspaceImportResult]
+
+func _RuntimePreparation_ActivateWorkspaceImport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WorkspaceActivationCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).ActivateWorkspaceImport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_ActivateWorkspaceImport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).ActivateWorkspaceImport(ctx, req.(*WorkspaceActivationCall))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -945,6 +1251,38 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RuntimePreparation_NumericalEnvironment_Handler,
 		},
 		{
+			MethodName: "RecordOperationResult",
+			Handler:    _RuntimePreparation_RecordOperationResult_Handler,
+		},
+		{
+			MethodName: "LookupOperation",
+			Handler:    _RuntimePreparation_LookupOperation_Handler,
+		},
+		{
+			MethodName: "PruneOperationCache",
+			Handler:    _RuntimePreparation_PruneOperationCache_Handler,
+		},
+		{
+			MethodName: "WorkspaceRetainDerivedResult",
+			Handler:    _RuntimePreparation_WorkspaceRetainDerivedResult_Handler,
+		},
+		{
+			MethodName: "WorkspaceReleaseDerivedRetention",
+			Handler:    _RuntimePreparation_WorkspaceReleaseDerivedRetention_Handler,
+		},
+		{
+			MethodName: "WorkspaceReleaseDerivedResult",
+			Handler:    _RuntimePreparation_WorkspaceReleaseDerivedResult_Handler,
+		},
+		{
+			MethodName: "WorkspaceWeightsIntentReady",
+			Handler:    _RuntimePreparation_WorkspaceWeightsIntentReady_Handler,
+		},
+		{
+			MethodName: "ActivateWorkspaceImport",
+			Handler:    _RuntimePreparation_ActivateWorkspaceImport_Handler,
+		},
+		{
 			MethodName: "CheckPackageSetCompatibility",
 			Handler:    _RuntimePreparation_CheckPackageSetCompatibility_Handler,
 		},
@@ -997,7 +1335,13 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RuntimePreparation_PreparePrivatePlacement_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "ImportWorkspace",
+			Handler:       _RuntimePreparation_ImportWorkspace_Handler,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "cozy/worker/v1/worker.proto",
 }
 
@@ -1015,10 +1359,9 @@ const (
 // on the external listener. It carries the supervisor<->Runtime privates that were
 // direction-annotated WorkerControl frames before minor 21.
 type RuntimeWeightsClient interface {
-	// Runtime -> host intents and receipts, host -> Runtime acks, on ONE stream the supervisor
-	// opens per accepted control session. The host commits its ledger before each ack, and
-	// forwards a recorded receipt to the RecordOwner on WorkerControl BEFORE acking it, so the
-	// owner sees the receipt ahead of the attempt outcome the Runtime can only send after.
+	// Retired at minor 41; implementations refuse this legacy custody stream. Runtime
+	// commits its common workspace journal and sends custody observations and outcomes
+	// on the same ordered WorkerControl stream. The Host never grants native authority.
 	Exchange(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[WeightsHostAck, WeightsHostEvent], error)
 	// One validated upload grant in, one terminal answer out. Runtime streams the bytes it holds.
 	Upload(ctx context.Context, in *WeightsUploadRequest, opts ...grpc.CallOption) (*WeightsUploadResult, error)
@@ -1064,10 +1407,9 @@ func (c *runtimeWeightsClient) Upload(ctx context.Context, in *WeightsUploadRequ
 // on the external listener. It carries the supervisor<->Runtime privates that were
 // direction-annotated WorkerControl frames before minor 21.
 type RuntimeWeightsServer interface {
-	// Runtime -> host intents and receipts, host -> Runtime acks, on ONE stream the supervisor
-	// opens per accepted control session. The host commits its ledger before each ack, and
-	// forwards a recorded receipt to the RecordOwner on WorkerControl BEFORE acking it, so the
-	// owner sees the receipt ahead of the attempt outcome the Runtime can only send after.
+	// Retired at minor 41; implementations refuse this legacy custody stream. Runtime
+	// commits its common workspace journal and sends custody observations and outcomes
+	// on the same ordered WorkerControl stream. The Host never grants native authority.
 	Exchange(grpc.BidiStreamingServer[WeightsHostAck, WeightsHostEvent]) error
 	// One validated upload grant in, one terminal answer out. Runtime streams the bytes it holds.
 	Upload(context.Context, *WeightsUploadRequest) (*WeightsUploadResult, error)

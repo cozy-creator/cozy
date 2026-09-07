@@ -17,17 +17,24 @@ import (
 
 func operationCacheProblem(err error) *exit.Error {
 	switch status.Code(err) {
-	case codes.InvalidArgument, codes.PermissionDenied, codes.FailedPrecondition:
+	case codes.InvalidArgument, codes.PermissionDenied, codes.FailedPrecondition, codes.Unimplemented:
 		return exit.Named(exit.Structural, "operation.cache_refused", "worker operation cache refused its captured identity")
 	default:
 		return exit.Unavailablef("worker operation cache is temporarily unavailable")
 	}
 }
 
-// Cache completion precedes OutcomeAck: the Host still has the actual terminal
+// Cache completion precedes OutcomeAck: the workspace still has the actual terminal
 // to verify, including scalar results whose ordinary ACK releases that journal.
 func (c *Orchestrator) recordOperationResult(s *session, request records.Request, attempt records.Attempt) *exit.Error {
-	if s.host == nil || !request.ChildReusable || request.ParentRequestID == "" || request.ReusedFrom != "" || attempt.TerminalStatus != "SUCCEEDED" || request.State == "canceling" || request.State == "canceled" || request.State == "releasing" {
+	// Closed follows the cache decision and queues its ACK; it does not prove
+	// delivery. Historical replay therefore resends only the ACK, even if the
+	// workspace compacted its source. ClosedAt timestamps terminal acceptance
+	// before this decision, so only the preserved closed state is this marker.
+	if attempt.State == "closed" {
+		return nil
+	}
+	if !request.ChildReusable || request.ParentRequestID == "" || request.ReusedFrom != "" || attempt.TerminalStatus != "SUCCEEDED" || request.State == "canceling" || request.State == "canceled" || request.State == "releasing" {
 		return nil
 	}
 	key, problem := records.OperationKey(request)
@@ -50,7 +57,7 @@ func (c *Orchestrator) recordOperationResult(s *session, request records.Request
 		return problem
 	}
 	for _, artifact := range artifacts {
-		// The initial Host index adopts outputs this operation actually wrote.
+		// The workspace index adopts outputs this operation actually wrote.
 		// Returning a borrowed handle still executes and retains normally.
 		if artifact.ProducerRequestID != request.ID {
 			return nil
@@ -62,10 +69,11 @@ func (c *Orchestrator) recordOperationResult(s *session, request records.Request
 	keyBytes, _ := canonical.Raw(key)
 	invocation, _ := canonical.Raw(attempt.InvocationDigest)
 	outcome, _ := canonical.Raw(attempt.TerminalDigest)
-	answer, err := s.host.RecordOperationResult(s.ctx, &pb.RecordOperationResultCall{Claim: s.claim, ComputationDigest: keyBytes, RequestId: request.ID, AttemptOrdinal: uint64(attempt.Attempt), InvocationSpecDigest: invocation, OutcomeId: attempt.TerminalID, OutcomeDigest: outcome})
-	if status.Code(err) == codes.Unimplemented {
-		return nil
+	workspace, problem := s.operationWorkspace()
+	if problem != nil {
+		return problem
 	}
+	answer, err := workspace.RecordOperationResult(s.ctx, &pb.RecordOperationResultCall{Claim: s.claim, ComputationDigest: keyBytes, RequestId: request.ID, AttemptOrdinal: uint64(attempt.Attempt), InvocationSpecDigest: invocation, OutcomeId: attempt.TerminalID, OutcomeDigest: outcome})
 	if err != nil {
 		return operationCacheProblem(err)
 	}
@@ -73,7 +81,7 @@ func (c *Orchestrator) recordOperationResult(s *session, request records.Request
 		return exit.Named(exit.Structural, "operation.cache_changed", "worker operation cache changed the completed computation identity")
 	}
 	if !answer.Recorded {
-		return exit.Unavailablef("worker operation cache has not committed the completed result")
+		c.logf("%s completed without memoization: the workspace declined this optional cache entry", request.ID)
 	}
 	return nil
 }
@@ -83,7 +91,7 @@ func (c *Orchestrator) lookupOperation(request records.Request) (bool, *exit.Err
 }
 
 func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOnly bool) (bool, *exit.Error) {
-	if !request.ChildReusable || request.ParentRequestID == "" || request.Worker == "" || request.Ordinal != 0 {
+	if !request.ChildReusable || request.ParentRequestID == "" || request.Ordinal != 0 {
 		return false, nil
 	}
 	c.mu.Lock()
@@ -127,7 +135,7 @@ func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOn
 			return false, problem
 		}
 	}
-	if pendingOnly {
+	if pendingOnly && request.Worker != "" {
 		rental, problem := c.opt.Store.RentalRow(request.Worker)
 		if problem != nil {
 			return false, problem
@@ -136,19 +144,16 @@ func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOn
 			return false, c.opt.Store.CompleteOperationMiss(request.ID, key)
 		}
 	}
-	s, problem := c.rentalControl(request.Worker)
+	s, problem := c.workspaceControl(request.Worker)
 	if problem != nil {
-		_, _, _, _ = c.EnsureRental(request.Worker)
 		return false, problem
 	}
-	if s.host == nil {
-		return false, c.opt.Store.CompleteOperationMiss(request.ID, key)
-	}
 	keyBytes, _ := canonical.Raw(key)
-	answer, err := s.host.LookupOperation(s.ctx, &pb.LookupOperationCall{Claim: s.claim, ComputationDigest: keyBytes, ConsumerRequestId: request.ID})
-	if status.Code(err) == codes.Unimplemented {
-		return false, c.opt.Store.CompleteOperationMiss(request.ID, key)
+	workspace, problem := s.operationWorkspace()
+	if problem != nil {
+		return false, problem
 	}
+	answer, err := workspace.LookupOperation(s.ctx, &pb.LookupOperationCall{Claim: s.claim, ComputationDigest: keyBytes, ConsumerRequestId: request.ID})
 	if err != nil {
 		return false, operationCacheProblem(err)
 	}

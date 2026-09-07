@@ -21,8 +21,8 @@ var privateChildRuntimeWheel = flag.String("child-runtime-wheel", "", "exact Run
 
 // This uses the actual Creator binary, installed interface wheels, independent
 // package executors and typed broker. No control peer or executor is simulated.
-func TestPrivateChildCompositionRunsEditsWithoutALocalCache(t *testing.T) {
-	runtimeVersion := "0.3.0"
+func TestPrivateChildCompositionReusesLocalWorkspace(t *testing.T) {
+	runtimeVersion := "0.4.0"
 	runtimeInstall := "cozy-runtime==" + runtimeVersion
 	runtimeSource := ""
 	if *privateChildRuntimeWheel != "" {
@@ -85,7 +85,7 @@ import msgspec
 from cozy_runtime.author import App, Context, invocable
 class Result(msgspec.Struct, frozen=True):
     value: int
-@invocable(reusable=True)
+@invocable(memoize=True)
 `
 		if name == "source" {
 			body += "async def compute(ctx: Context, *, value: int) -> Result:\n    return Result(value + 100)\n"
@@ -141,8 +141,8 @@ async def main():
 	fatal(t, problem)
 	children, problem = store.Children(second.ID)
 	fatal(t, problem)
-	if len(children) != 2 || children[0].ReusedFrom != "" || children[0].Ordinal != 1 || children[0].ChildTargetDigest != originalA.ChildTargetDigest || children[1].Ordinal != 1 || children[1].ChildTargetDigest != originalB.ChildTargetDigest || children[1].ChildIntentDigest == originalB.ChildIntentDigest {
-		t.Fatalf("local composition did not execute unchanged A and changed B: %+v", children)
+	if len(children) != 2 || children[0].ReusedFrom != originalA.ID || children[0].Ordinal != 0 || children[0].ChildTargetDigest != originalA.ChildTargetDigest || children[1].Ordinal != 1 || children[1].ChildTargetDigest != originalB.ChildTargetDigest || children[1].ChildIntentDigest == originalB.ChildIntentDigest {
+		t.Fatalf("local composition did not reuse A and execute changed B: %+v", children)
 	}
 	secondB := children[1]
 	assertChildScalar(t, store, secondB.ID, 214)
@@ -158,10 +158,22 @@ async def main():
 	fatal(t, problem)
 	children, problem = store.Children(third.ID)
 	fatal(t, problem)
-	if len(children) != 2 || children[0].ReusedFrom != "" || children[0].Ordinal != 1 || children[0].ChildTargetDigest != originalA.ChildTargetDigest || children[1].Ordinal != 1 || children[1].ChildTargetDigest == secondB.ChildTargetDigest || children[1].ChildIntentDigest != secondB.ChildIntentDigest {
+	if len(children) != 2 || children[0].ReusedFrom != originalA.ID || children[0].Ordinal != 0 || children[0].ChildTargetDigest != originalA.ChildTargetDigest || children[1].Ordinal != 1 || children[1].ChildTargetDigest == secondB.ChildTargetDigest || children[1].ChildIntentDigest != secondB.ChildIntentDigest {
 		t.Fatalf("library edit did not invalidate exactly B: %+v", children)
 	}
 	assertChildScalar(t, store, children[1].ID, 215)
+	thirdB := children[1]
+	status, out = runCozyPath(t, root, path, "run", script, "--await", "--json")
+	if status != 0 {
+		t.Fatalf("fresh scalar run did not reuse its local workspace [%d]: %s", status, out)
+	}
+	fresh, problem := store.RequestByReference("10")
+	fatal(t, problem)
+	cached, problem := store.Children(fresh.ID)
+	fatal(t, problem)
+	if fresh.RetryOf != "" || len(cached) != 2 || cached[0].Ordinal != 0 || cached[1].Ordinal != 0 || cached[0].ReusedFrom != originalA.ID || cached[1].ReusedFrom != thirdB.ID {
+		t.Fatalf("fresh scalar run computed instead of acquiring cached results: %+v", cached)
+	}
 	old, problem := store.RequestRow(first.ID)
 	fatal(t, problem)
 	if old.State != "blocked" || old.BodyDigest != first.BodyDigest {

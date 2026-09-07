@@ -12,6 +12,7 @@ type CLI struct {
 	Auth    AuthCmd    `cmd:"" group:"Authentication" help:"Authenticate this machine to Tensorhub."`
 	Run     RunCmd     `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
 	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud."`
+	Cache   CacheCmd   `cmd:"" group:"Lifecycle" help:"Manage cached operation results on this machine."`
 	Volume  VolumeCmd  `cmd:"" group:"Rentals" help:"Manage an optional repo-object cache in a datacenter you rent in."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
 	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
@@ -21,6 +22,16 @@ type CLI struct {
 
 type DaemonCmd struct {
 	Log DaemonLogCmd `cmd:"" help:"Print the cozy-daemon log ($COZY_HOME/daemon.log)."`
+}
+
+type CacheCmd struct {
+	Prune CachePruneCmd `cmd:"" help:"Free unused cached operation results on this machine."`
+}
+
+type CachePruneCmd struct{}
+
+func (c *CachePruneCmd) Run(r *Runtime) error {
+	return r.call(handleCachePrune, nil, nil, nil, true)
 }
 
 type DaemonLogCmd struct {

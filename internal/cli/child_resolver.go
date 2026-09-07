@@ -9,7 +9,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
 // ResolvePrivateChild resolves only the immutable interface binding captured by
@@ -39,10 +38,10 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if job.Kind != "job" || job.Invocable == nil || job.Invocable.Module != module || job.Invocable.Export != export {
 		return out, "", exit.Named(exit.Conflict, "child.export_changed", "the captured implementation does not expose the exact invocable job")
 	}
-	if job.Invocable.Reusable {
+	if job.Invocable.Memoize {
 		for _, capability := range job.Invocable.Capabilities {
 			if capability == "egress" || capability == "secrets" {
-				return out, "", exit.Named(exit.Conflict, "child.reusable_effect", "a reusable operation cannot carry external egress or secret capabilities")
+				return out, "", exit.Named(exit.Conflict, "child.memoized_effect", "a memoized operation cannot carry external egress or secret capabilities")
 			}
 		}
 	}
@@ -58,8 +57,8 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if problem != nil {
 		return out, "", problem
 	}
-	if parentJob.Invocable != nil && parentJob.Invocable.Reusable && !job.Invocable.Reusable {
-		return out, "", exit.Named(exit.Conflict, "child.impure_dependency", "a reusable parent operation cannot call a non-reusable dependency")
+	if parentJob.Invocable != nil && parentJob.Invocable.Memoize && !job.Invocable.Memoize {
+		return out, "", exit.Named(exit.Conflict, "child.impure_dependency", "a memoized parent operation cannot call a dependency that does not opt into memoization")
 	}
 	if problem := launch.ValidatePayload(install.Package, job, payload); problem != nil {
 		return out, "", problem
@@ -80,14 +79,6 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	}
 	if facts == nil {
 		return out, "", exit.Named(exit.Conflict, "child.export_changed", "the captured child has no matching job facts")
-	}
-	if parent.Worker == "" && len(facts.WeightsOutputs) > 0 {
-		return out, "", exit.Named(exit.Unavailable, "child.weights_rental_required", "weight-producing child operations require a private rental with native Host custody").WithRemedy("run the parent script with --rental-only")
-	}
-	if parent.Worker == "" && (len(facts.WeightsOutputs) > 0 || len(facts.ModelParams) > 0) {
-		if _, problem := tfs.Open(r.cfg); problem != nil {
-			return out, "", problem
-		}
 	}
 	if len(facts.Outputs) > len(facts.WeightsOutputs) {
 		return out, "", exit.Named(exit.Unavailable, "child.artifact_binding_required", "artifact and model child calls require explicit native reference adoption")
@@ -125,7 +116,7 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	out = orchestrator.Submission{Kind: "job", RetainWork: true, Package: install.Package, Entrypoint: binding.Entrypoint, Release: install.Version, InstallID: install.ID,
 		PlanID: facts.DescriptorID, Payload: append([]byte(nil), payload...), Outputs: facts.Outputs, WeightsOutputs: facts.WeightsOutputs, NeedsAccelerator: facts.NeedsAccelerator, Org: parent.Org}
 	out.Models = models
-	out.ChildReusable = job.Invocable.Reusable
+	out.ChildReusable = job.Invocable.Memoize
 	out.ChildArtifacts = len(launch.ModelArtifactPaths(job.Result)) > 0
 	if parent.Worker != "" {
 		out.Worker, out.Rental, out.RentalRequired = parent.Worker, true, true

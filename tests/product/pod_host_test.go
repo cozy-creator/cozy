@@ -59,11 +59,12 @@ const (
 // the rental's auth document would carry, records what crossed, and answers minimally.
 type fakePod struct {
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
-	sourceRuntime pb.RuntimePreparationClient
-	sourceRelease func(*pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error)
-	sourceControl func(*pb.ModelSourceControlCall) (*pb.ModelSourceControlResult, error)
-	weightsReady  func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
-	protocolInfo  func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
+	sourceRuntime   pb.RuntimePreparationClient
+	sourceRelease   func(*pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error)
+	sourceControl   func(*pb.ModelSourceControlCall) (*pb.ModelSourceControlResult, error)
+	weightsReady    func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
+	protocolInfo    func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
+	recordOperation func(*pb.RecordOperationResultCall) (*pb.RecordOperationResultResult, error)
 	pb.UnimplementedWorkerControlServer
 	pb.UnimplementedPodHostServer
 	controlKey ed25519.PublicKey

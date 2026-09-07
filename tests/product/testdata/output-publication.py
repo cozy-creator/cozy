@@ -1,7 +1,8 @@
 """Native worker half of Creator's opt-in publication regression.
 
 The Go peer supplies claimed transport. Runtime owns transaction identity, the
-native receipt/inventory, object upload and finalization. No host ledger is copied.
+native receipt/inventory, object upload and finalization through its shared workspace.
+The Host observes these committed decisions; it never authorizes a native writer.
 """
 
 import base64
@@ -20,14 +21,16 @@ from cozy_runtime.author._weights import WeightsCommit
 from cozy_runtime.internal.encoding import SPEC_PLAIN
 from cozy_runtime.internal.weights_sink import WeightsHostBinding, WeightsTransactionHost, protocol_receipt
 from cozy_runtime.internal.worker.weights import WeightsExchange
-from cozy_runtime.internal.worker.weights_finalize import finalize
+from cozy_runtime.internal.worker.workspace import Workspace
+from cozy_runtime.internal.worker.workspace_finalize import finalize
 from cozy_runtime.protocol import documents, worker_pb2 as pb
 
 assert (importlib.metadata.version("cozy-runtime"), importlib.metadata.version("tensorfs")) in {
-    ("0.2.24", "0.3.10"), ("0.2.25", "0.3.11")
+    ("0.4.0", "0.3.20")
 }
 root = Path(sys.argv[1])
 store = tensorfs.Store.ensure(str(root / "store"))
+workspace = Workspace(root / "store")
 owner = None
 bridge = "--host-bridge" in sys.argv[2:]
 held = None
@@ -49,12 +52,13 @@ def envelope(request):
 def send_host(frame):
     inner = getattr(frame, frame.WhichOneof("msg"))
     for key, value in envelope(offer).items():
-        setattr(inner, key, value)
+        if key in inner.DESCRIPTOR.fields_by_name:
+            setattr(inner, key, value)
     emit(frame)
 
 
 exchange = WeightsExchange(store_root=root / "store", send=send_host,
-    stop=stop, owner_scope=lambda: owner, allow_private_egress=True)
+    stop=stop, owner_scope=lambda: owner, allow_private_egress=True, workspace=workspace)
 
 
 def read_input():
@@ -62,10 +66,7 @@ def read_input():
         for line in sys.stdin:
             if line.startswith("{"):
                 message = json.loads(line)
-                if "ack" in message:
-                    ack = pb.WeightsHostAck.FromString(base64.b64decode(message["ack"], validate=True))
-                    exchange.absorb_ack(ack, lane=("control", ack.control_stream_epoch))
-                elif "upload" in message:
+                if "upload" in message:
                     request = pb.WeightsUploadRequest.FromString(base64.b64decode(message["upload"], validate=True))
                     emit(exchange.upload(request))
                 else:
@@ -86,20 +87,25 @@ try:
         elif kind == "attempt_offer":
             assert owner
             offer = frame.attempt_offer
+            previous = workspace.accept(owner, offer, worker_boot=offer.worker_boot_id)
+            if previous is not None:
+                send_host(pb.WorkerFrame(attempt_outcome=previous))
+                continue
             digest = documents.spell(offer.invocation_spec_digest)
             declaration_digest = None
+            writer_epoch = 0
 
             attempt = SimpleNamespace(request_id=offer.request_id, attempt=offer.attempt_ordinal,
                 digest=offer.invocation_spec_digest, canceling=False, weights_receipts={})
 
             def bind(slot, transaction_id, native_digest, declaration):
-                global declaration_digest
+                global declaration_digest, writer_epoch
                 declaration_digest = native_digest
-                if bridge:
-                    result = exchange.intent(attempt, output_slot=slot, transaction_id=transaction_id,
-                        declaration_digest=native_digest, declaration=declaration, requested_writer_epoch=0)
-                    return WeightsHostBinding(result["weights_transaction_id"], result["writer_epoch"])
-                return WeightsHostBinding(transaction_id, 1)
+                result = exchange.intent(attempt, output_slot=slot, transaction_id=transaction_id,
+                    declaration_digest=native_digest, declaration=declaration, requested_writer_epoch=0)
+                writer_epoch = result["writer_epoch"]
+                assert writer_epoch > 0
+                return WeightsHostBinding(result["weights_transaction_id"], writer_epoch)
 
             def record(receipt):
                 reference, canonical, digest = protocol_receipt(receipt, owner_scope=owner,
@@ -108,8 +114,8 @@ try:
                     receipt_digest=digest, canonical_receipt=canonical)
 
             host = WeightsTransactionHost(store=store, owner_scope=owner, request_id=offer.request_id,
-                invocation_spec_digest=digest, writer_session_id=1, allowed_sources={},
-                output_bounds={"model": 1 << 20}, bind_intent=bind, record_receipt=record if bridge else None)
+                invocation_spec_digest=digest, work_fingerprint=digest, writer_session_id=offer.attempt_ordinal, allowed_sources={},
+                output_bounds={"model": 1 << 20}, bind_intent=bind, record_receipt=record)
             config = json.dumps({"proof": offer.request_id}).encode()
             transaction = host.open(WeightsCommit(output_slot="model", sources={},
                 targets={"transformer": WeightsTarget(add={"weight": WeightsTensor(
@@ -122,27 +128,20 @@ try:
             receipt = transaction.commit()
             reference, _, _ = protocol_receipt(receipt, owner_scope=owner,
                 request_id=offer.request_id, invocation_spec_digest=digest)
-            held = exchange._hold(receipt.weights_transaction_id, 1, reference)
-            if not bridge:
-                emit(pb.WorkerFrame(weights_receipt=pb.WeightsReceiptFrame(**envelope(offer),
-                    request_id=offer.request_id, attempt_ordinal=offer.attempt_ordinal,
-                    invocation_spec_digest=offer.invocation_spec_digest, output_slot="model",
-                    weights_transaction_id=receipt.weights_transaction_id, writer_epoch=1,
-                    tensorfs_declaration_digest=declaration_digest,
-                    weights_receipt=reference, manifest=held.manifest,
-                    objects=[held.objects[key] for key in sorted(held.objects)])))
+            held = exchange._hold(receipt.weights_transaction_id, writer_epoch, reference)
             body, outcome_digest = documents.identity(pb.AttemptOutcomeBody(
                 request_id=offer.request_id, attempt_ordinal=offer.attempt_ordinal,
                 invocation_spec_digest=digest, status=pb.OUTCOME_STATUS_SUCCEEDED,
                 execution_started=True, cause=pb.OutcomeCause(origin=pb.CAUSE_ORIGIN_RUNTIME), weights_receipts=[reference]))
-            emit(pb.WorkerFrame(attempt_outcome=pb.AttemptOutcome(**envelope(offer),
+            outcome = pb.AttemptOutcome(**envelope(offer),
                 request_id=offer.request_id, attempt_ordinal=offer.attempt_ordinal,
                 invocation_spec_digest=offer.invocation_spec_digest, outcome_id="native-output",
-                outcome_digest=outcome_digest, outcome_canonical_bytes=body)))
+                outcome_digest=outcome_digest, outcome_canonical_bytes=body)
+            workspace.outcome(owner, outcome)
+            emit(pb.WorkerFrame(attempt_outcome=outcome))
         elif kind == "weights_finalize_request":
             request = frame.weights_finalize_request
-            result = finalize(request, owner_scope=owner, attempts=[], tensorfs_root=root / "store",
-                journal_root=root / "worker", on_abandon=exchange.abandon)
+            result = finalize(workspace, owner, request, on_abandon=exchange.abandon)
             result.record_owner_epoch = request.record_owner_epoch
             result.control_stream_epoch = request.control_stream_epoch
             result.worker_boot_id = request.worker_boot_id
@@ -163,7 +162,7 @@ try:
                 state=pb.WEIGHTS_TRANSFER_STATE_HELD)
             if request.WhichOneof("decision") == "upload_grant":
                 result = exchange.upload(pb.WeightsUploadRequest(**envelope(request),
-                    weights_transaction_id=request.weights_transaction_id, writer_epoch=1,
+                    weights_transaction_id=request.weights_transaction_id, writer_epoch=writer_epoch,
                     operation_id=request.operation_id, object_id=obj.object_id,
                     source_ref=obj.source_ref, length=obj.length, grant=grant,
                     grant_revision=request.grant_revision)).weights_upload_result
@@ -176,6 +175,7 @@ try:
                 status.checksum_sha256 = result.checksum_sha256
             emit(pb.WorkerFrame(weights_transfer_status=status))
         elif kind == "outcome_ack":
+            workspace.acknowledge(owner, frame.outcome_ack)
             break
         else:
             raise RuntimeError("unexpected publication frame " + str(kind))

@@ -274,10 +274,10 @@ transaction blocks or pauses, and the ordinary run view explains the stopped sta
 An invocable dependency exposes an ordinary typed Python call. Its implementation is
 captured separately; the parent imports a generated interface containing signatures and
 result types. Calling it creates an ordinary managed child job. A reusable computation
-opts in with `@invocable(reusable=True)` and registers through `app.job(function)`.
+opts in with `@invocable(memoize=True)` and registers through `app.job(function)`.
 Arbitrary helper functions and external effects do not become cached operations.
 
-On the private worker, a reusable child can acquire an earlier successful result when its
+On either a local or rented worker, a memoized child can acquire an earlier successful result when its
 exact implementation closure, entrypoint, canonical inputs, resolved model checkpoints,
 and measured numerical environment match. A fresh script can reuse this work without a retry
 ID. Run IDs, the parent's script digest and call position are not computation cache keys.
@@ -292,15 +292,18 @@ Source ingestion already has its own exact source/profile identity, so changing 
 producer does not invalidate its retained source conversion. No system can infer that
 arbitrary Python side effects are reversible or safe to repeat.
 
-Scalar compositions can run locally; this first implementation's shared operation cache is
-on the private Host, so local scalar calls compute normally. Weight-producing child jobs require `--rental-only`
-and the private worker's native Host custody. A completed result stored only on that
-machine continues holding the rental until its owner releases it; completion alone does
-not make those bytes remotely durable. Parent and child attempts retain separate history.
+Scalar and tensor compositions use the same Runtime workspace journal locally and on a
+private rental. The journal belongs to the configured TensorFS store and survives package
+worker and daemon restarts. The remote Host authenticates access to that same service.
+A completed result stored only on a rented machine continues holding the rental until its
+owner releases it; completion alone does not make those bytes remotely durable.
+Parent and child attempts retain separate history.
 The worker may retain reusable results under an independent cache hold. Canceling a producing
 run releases its own holds; cache or other consumer holds may keep those bytes available.
 Cache holds alone do not keep paid capacity alive, and evicted or missing results compute again.
 The cache records original result provenance without inventing another compute attempt.
+Use `cozy cache prune` for unused local operation results, or `cozy rental prune <rental>`
+on a rented machine. Both preserve results still owned by retained runs or other consumers.
 
 For editable libraries, declare paths explicitly in the same script metadata:
 

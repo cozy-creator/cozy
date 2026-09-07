@@ -1,6 +1,6 @@
 import tensorfs,struct,json,sys,time
 from tensorfs.errors import StoreBusy
-root='/var/lib/tensorfs'
+root=sys.argv[3] if len(sys.argv)>3 else '/var/lib/tensorfs'
 deadline=time.monotonic()+10
 while True:
     try:

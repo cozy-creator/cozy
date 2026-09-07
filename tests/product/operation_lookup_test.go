@@ -103,14 +103,24 @@ func TestOperationArtifactScopeRequiresNativeCacheAdoption(t *testing.T) {
 }
 
 func TestOperationLookupAdoptsAcrossFreshRunHistory(t *testing.T) {
+	for _, workspace := range []string{"", "workspace"} {
+		name := "local"
+		if workspace != "" {
+			name = "rental"
+		}
+		t.Run(name, func(t *testing.T) { proveOperationLookupAcrossFreshRunHistory(t, workspace) })
+	}
+}
+
+func proveOperationLookupAcrossFreshRunHistory(t *testing.T, workspace string) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
-	first := offerChildParent(t, store, recordPrivateTransaction(t, store, "first", "workspace"))
+	first := offerChildParent(t, store, recordPrivateTransaction(t, store, "first", workspace))
 	source := operationHistory(t, store, "original-op", first)
 	closeChild(t, store, source, "SUCCEEDED", "succeeded")
-	second := offerChildParent(t, store, recordPrivateTransaction(t, store, "fresh", "workspace"))
+	second := offerChildParent(t, store, recordPrivateTransaction(t, store, "fresh", workspace))
 	consumer := operationHistory(t, store, "fresh-op", second)
 	if consumer.ReuseScope == source.ReuseScope || second.RetryOf != "" {
 		t.Fatal("fixture did not create an unrelated run")
@@ -145,7 +155,7 @@ func TestOperationLookupAdoptsAcrossFreshRunHistory(t *testing.T) {
 	if lookup.State != "hit" || lookup.Key != key {
 		t.Fatal("cache hit lost its durable RPC receipt")
 	}
-	third := offerChildParent(t, store, recordPrivateTransaction(t, store, "pause-hit", "workspace"))
+	third := offerChildParent(t, store, recordPrivateTransaction(t, store, "pause-hit", workspace))
 	paused := operationHistory(t, store, "paused-hit", third)
 	fatal(t, store.BeginOperationLookup(paused.ID, key))
 	_, problem = store.RequestPause(paused.ID, "lookup pending")

@@ -24,11 +24,11 @@ func TestPrivateRentalIncludesChildGPUWithoutGrantingItToParent(t *testing.T) {
 			defer store.Close()
 			parent := cleanupTestInstall(layout, "1111111111111111", "1.0.0")
 			child := cleanupTestInstall(layout, "2222222222222222", "1.0.0")
-			child.Closure = "cozy-runtime==0.3.0"
+			child.Closure = "cozy-runtime==0.4.0"
 			if gpu {
 				child.Closure += "\ntorch==2.13.0"
 			}
-			raw, err := canonical.NormalizeJCS([]byte(`{"format":"cozy.package.interface/1","application":"private_ops:app","entrypoints":[],"jobs":[{"name":"compute","models":[],"request":{"fields":[]},"result":{"fields":[]},"publishes":false,"weights_outputs":[],"invocable":{"context":"ctx","module":"private_ops","export":"compute","parameters":[],"defaults":{},"type_names":{},"enum_members":{},"reusable":true,"capabilities":[]}}]}`))
+			raw, err := canonical.NormalizeJCS([]byte(`{"format":"cozy.package.interface/1","application":"private_ops:app","entrypoints":[],"jobs":[{"name":"compute","models":[],"request":{"fields":[]},"result":{"fields":[]},"publishes":false,"weights_outputs":[],"invocable":{"context":"ctx","module":"private_ops","export":"compute","parameters":[],"defaults":{},"type_names":{},"enum_members":{},"memoize":true,"capabilities":[]}}]}`))
 			must(t, err)
 			child.PackageInterface, _ = canonical.Spell(canonical.Digest(raw))
 			must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(child.Dir)), 0o700))

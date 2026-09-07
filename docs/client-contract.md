@@ -264,6 +264,7 @@ URLs but remain local-scope rows in the same guarded route table.
 | `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the daemon to one generic empty private worker and directly claim WorkerControl |
 | `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | detach that worker and wait for its control loop before rental credentials are removed |
 | `POST /v1/local/rentals/{rental_id}/prune` | local | yes | prune unused operation cache roots on the claimed Host; report `removed_entries`, `reclaimed_bytes`, and whether native GC is still `store_busy` |
+| `POST /v1/local/cache/prune` | local | yes | prune unused operation cache roots in this machine's Runtime workspace; report `removed_entries`, `reclaimed_bytes`, and `store_busy` |
 | `POST /v1/local/daemon/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
 | `POST /v1/local/daemon/down` | local | yes | safe down fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
@@ -359,23 +360,26 @@ install, then creates an ordinary job. The child status includes `parent_request
 no invented execution attempt. Scalar results can complete immediately; model results stay
 `finalizing` until native independent retention is confirmed.
 
-Cross-request reuse requires an explicit `reusable:true` callable declaration, identical
+Cross-request reuse requires an explicit `memoize:true` callable declaration, identical
 target implementation/dependencies, typed inputs/model references, and the current
 privileged numerical environment measurement. An unavailable measurement disables reuse
 while allowing execution. Exact same-parent call replay continues the original recorded
 child. Known egress/secret capabilities and non-reusable child effects cannot enter a
 reusable operation. This is an author contract, not a proof of arbitrary Python purity.
 
-The Host records cache results from verified successful terminals before outcome ACKs.
+The Runtime workspace records cache results from verified successful terminals before outcome ACKs.
 Lookup uses the computation key and an already-recorded consumer request; a HIT acquires
 independent native holds before returning. Creator persists a pending lookup obligation
 before the RPC, so pause/cancel and owner restart reconcile even a lost response. Once the
 request owns a result, resuming it does not depend on the cache entry still existing.
-Local scalar execution currently computes normally; no second local cache authority is
-inferred from request history.
+Local and rented execution address this same journal through RuntimePreparation or the
+authenticated Host. Request history never becomes a second cache authority. Declined
+optional cache admission leaves the successful result unchanged; an unresolved journal
+RPC remains an obligation until it can be reconciled.
 
-`cozy rental prune <rental>` removes unused cache roots and attempts native garbage
-collection on that same Host. Request-owned results and unresolved lookup recipients are
+`cozy cache prune` or `cozy rental prune <rental>` removes unused cache roots and attempts
+native garbage collection in the selected workspace. Local pruning can start an empty
+control Runtime when no package worker remains. Request-owned results and unresolved lookup recipients are
 preserved. A busy Store reports deferred byte collection; repeating prune can collect
 those bytes even when no further cache entries are removed. Cache roots do not count as
 unfinished rental work, and pruning neither ends the rental nor deletes run history.

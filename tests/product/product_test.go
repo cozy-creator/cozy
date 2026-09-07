@@ -17,7 +17,7 @@ import (
 )
 
 const localWeightlessRef = "local/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "3381ae1373725117c8e702c52f6ad25ab162ace4"
+const editableRuntimeFixtureSHA = "4732ba992dbeea819a3d21e2e3d53862c69ad8dd"
 
 var tensorfsFixtureWheel = flag.String("tensorfs-fixture-wheel", "", "exact native candidate wheel for an unpublished paired Runtime proof; omitted uses public resolution")
 

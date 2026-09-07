@@ -69,7 +69,7 @@ type Entrypoint struct {
 }
 
 type Invocable struct {
-	Reusable     bool                       `json:"reusable"`
+	Memoize      bool                       `json:"memoize"`
 	Capabilities []string                   `json:"capabilities"`
 	Context      string                     `json:"context"`
 	Module       string                     `json:"module"`
@@ -214,7 +214,7 @@ func validateClosedPackageInterface(data []byte) error {
 				return err
 			}
 			if metadata := callable["invocable"]; metadata != nil {
-				if _, err := exactKeys(metadata, []string{"context", "module", "export", "parameters", "defaults", "type_names", "enum_members"}, []string{"reusable", "capabilities"}); err != nil {
+				if _, err := exactKeys(metadata, []string{"context", "module", "export", "parameters", "defaults", "type_names", "enum_members"}, []string{"memoize", "capabilities"}); err != nil {
 					return err
 				}
 			}

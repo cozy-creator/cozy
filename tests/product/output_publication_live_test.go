@@ -40,7 +40,7 @@ import (
 
 var publicationHub = flag.String("publication-hub", "", "live Tensorhub for the explicit tiny publication proof")
 var publicationHome = flag.String("publication-home", "", "existing enrolled home used only for the live proof's account credential")
-var publicationPython = flag.String("publication-python", "", "public Runtime 0.2.24/TensorFS 0.3.10 interpreter for the live proof")
+var publicationPython = flag.String("publication-python", "", "Runtime 0.4.0/TensorFS 0.3.20 interpreter for the live proof")
 var publicationCancel = flag.Bool("publication-cancel", false, "prove explicit cancellation of a retained publication after owner restart")
 var publicationRetry = flag.Bool("publication-retry", false, "prove failed bound upload, owner restart and explicit same-receipt retry")
 var publicationHostBridge = flag.String("publication-host-bridge", "", "compiled real Go Host bridge for the full native publication proof")
@@ -276,6 +276,11 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 				t.Cleanup(o.close)
 				go func() { _ = controller.Serve() }()
 				fatal(t, controller.ResumeModelTransfers())
+				// This standalone owner has no persisted rental acquisition row for
+				// daemon startup to reconcile. Reattach its existing transport only;
+				// the failed publication remains stopped until the explicit command.
+				_, _, _, problem = controller.EnsureRental(podRental)
+				fatal(t, problem)
 				current, problem := store.RequestRow(requestID)
 				fatal(t, problem)
 				if current.State != "finalizing" || releases.Load() != 0 {
