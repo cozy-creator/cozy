@@ -77,6 +77,9 @@ func TestPrivateTransactionQueuedPauseSurvivesDaemonCrash(t *testing.T) {
 	if attempts, problem := store.Attempts(before.ID); problem != nil || len(attempts) != 0 {
 		t.Fatalf("queued pause invented computation: %+v %v", attempts, problem)
 	}
+	if code, out := runCozy(t, root, "run", "watch", reference, "--json"); code != 0 || !strings.Contains(out, `"status":"paused"`) {
+		t.Fatalf("watch did not acknowledge retained pause [exit %d]: %s", code, out)
+	}
 
 	daemon = crashAndRestartTransactionDaemon(t, daemon)
 	state := daemon.call(t, http.MethodGet, "/v1/local/jobs/"+before.ID, nil)

@@ -9,6 +9,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -95,7 +97,12 @@ func (c *Orchestrator) adoptRetriedSource(ctx context.Context, request records.R
 	}
 	answer, err := s.host.ModelSourceAdopt(ctx, call)
 	if err != nil {
-		return exit.Unavailablef("retained source adoption is awaiting the original pod")
+		switch status.Code(err) {
+		case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+			return exit.Unavailablef("retained source adoption is awaiting the original pod")
+		default:
+			return exit.Named(exit.Conflict, "request.source_adoption_refused", "source adoption was refused by the original pod (%s)", status.Code(err))
+		}
 	}
 	if answer == nil || answer.OperationId != request.ID || answer.WorkerBootId != s.bootID ||
 		answer.RecordOwnerEpoch != recordOwnerEpoch || answer.ControlStreamEpoch != 0 ||

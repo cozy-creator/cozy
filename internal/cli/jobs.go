@@ -297,7 +297,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 			// asking for cancellation. The daemon owns the accepted job; this client
 			// merely detaches, and only an explicit `cozy job cancel` cancels.
 			fmt.Fprintf(ctx.Err,
-				"\ndetached — the job keeps running; `cozy run watch %s` reattaches, `cozy job cancel %s` cancels\n",
+				"\ndetached — the job keeps running; `cozy run watch %s` reattaches, `cozy run cancel %s` cancels\n",
 				jobID, jobID)
 			detached <- struct{}{}
 			stopWatch()
