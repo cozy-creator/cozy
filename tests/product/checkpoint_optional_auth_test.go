@@ -13,24 +13,32 @@ import (
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
-type signedOutCheckpointSource struct{ refreshed atomic.Int32 }
+type checkpointTokenSource struct {
+	token     secret.Value
+	refreshed atomic.Int32
+}
 
-func (*signedOutCheckpointSource) AccessToken(context.Context) (secret.Value, *exit.Error) {
+func (s *checkpointTokenSource) AccessToken(context.Context) (secret.Value, *exit.Error) {
+	if s.token.Present() {
+		return s.token, nil
+	}
 	return secret.Value{}, exit.Named(exit.Credential, "auth.machine_key_missing", "not enrolled")
 }
-func (s *signedOutCheckpointSource) Invalidate() { s.refreshed.Add(1) }
+func (s *checkpointTokenSource) Invalidate() { s.refreshed.Add(1) }
 
 func TestCheckpointReadsUseOptionalOwnerCredentials(t *testing.T) {
 	for _, test := range []struct {
-		name, token, authorization string
-		status                     int
+		name, token, machine, authorization string
+		status                              int
 	}{
-		{"signed out public", "", "", 200},
-		{"owner fallback", "owner", "Bearer owner", 200},
-		{"anonymous missing", "", "", 404},
-		{"anonymous unauthorized", "", "", 401},
-		{"owner denied", "wrong", "Bearer wrong", 403},
-		{"server failure", "owner", "Bearer owner", 503},
+		{"signed out public", "", "", "", 200},
+		{"owner fallback", "owner", "", "Bearer owner", 200},
+		{"machine credential", "", "owner", "Bearer owner", 200},
+		{"machine credential preferred", "operator", "owner", "Bearer owner", 200},
+		{"anonymous missing", "", "", "", 404},
+		{"anonymous unauthorized", "", "", "", 401},
+		{"owner denied", "wrong", "", "Bearer wrong", 403},
+		{"server failure", "owner", "", "Bearer owner", 503},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var calls atomic.Int32
@@ -51,7 +59,7 @@ func TestCheckpointReadsUseOptionalOwnerCredentials(t *testing.T) {
 				}
 			}))
 			defer server.Close()
-			source := &signedOutCheckpointSource{}
+			source := &checkpointTokenSource{token: secret.New(test.machine)}
 			client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New(test.token)}, "checkpoint-auth-proof").WithTokenSource(source)
 			ref := hub.Ref{Org: "proof", Name: "source"}
 			_, manifestErr := client.CheckpointManifest(context.Background(), ref, "fixture")
