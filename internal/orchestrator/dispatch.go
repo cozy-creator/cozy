@@ -945,11 +945,35 @@ func staged(w *worker, planID string) bool {
 }
 
 func stagedFor(w *worker, req records.Request) bool {
+	if req.IsJob() && w.spec.Connection != nil {
+		return staged(w, req.PlanID) && exactJobSelection(w.spec.Placement, req)
+	}
 	if req.Worker != "" && w.spec.Connection != nil && !req.IsJob() {
 		return w.remoteStaged(pinnedPackage(req.Package, req.Worker), req.PlanID,
 			req.Release, req.LocalPackageDigest, req.Models)
 	}
 	return staged(w, req.PlanID) && selectionServes(req.Models, w.spec.Placement.Models)
+}
+
+func exactJobSelection(placement DesiredPlacement, req records.Request) bool {
+	if req.InstallID != "" && placement.InstallID != req.InstallID ||
+		req.LocalPackageDigest != "" && placement.LocalRevisionDigest != req.LocalPackageDigest ||
+		req.Release != "" && placement.Release != req.Release || len(placement.Models) != len(req.Models) {
+		return false
+	}
+	for _, requested := range req.Models {
+		found := false
+		for _, held := range placement.Models {
+			if held.Slot == requested.Slot && held.Manifest == requested.Manifest && held.ManifestLength == requested.ManifestLength {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // selectionServes is the model half of the match (cl-114): a placement that holds a slot
@@ -1159,6 +1183,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		}
 		spec := WorkerLaunchSpec{Connection: remote.Connection, Placement: DesiredPlacement{
 			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
+			InstallID: req.InstallID, Models: append([]ModelRef(nil), req.Models...),
 			LocalRevisionDigest: req.LocalPackageDigest,
 			PlacementSetDigest:  preparedSet,
 			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,

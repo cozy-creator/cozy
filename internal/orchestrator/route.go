@@ -345,7 +345,7 @@ func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) (
 	}
 	slot := pinnedPackage(req.Package, w.spec.Connection.RentalID)
 	if req.IsJob() {
-		return slot, w.spec.IsJob() && w.spec.Placement.Package == slot && w.dispatchable[planID]
+		return slot, w.spec.IsJob() && w.spec.Placement.Package == slot && exactJobSelection(w.spec.Placement, req) && w.dispatchable[planID]
 	}
 	placement, ok := w.remotePlacements[remotePlanKey(slot, planID)]
 	return slot, ok && !w.spec.IsJob() && placement.Package == slot &&
