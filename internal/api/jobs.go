@@ -41,6 +41,7 @@ type JobSubmission struct {
 	Release        string          `json:"release,omitempty"`
 	Rental         bool            `json:"rental,omitempty"`
 	RentalRequired bool            `json:"rental_required,omitempty"`
+	RetainWork     bool            `json:"retain_work,omitempty"`
 	// Worker pins an internal production step to the already-attached rental that
 	// prepared its source Manifests. It is admitted only with the CLI credential.
 	Worker string `json:"worker,omitempty"`
@@ -128,7 +129,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	if existing != nil && (existing.State == "canceled" || existing.State == "failed" || existing.State == "refused") {
+	if existing != nil && !existing.RetainWork && (existing.State == "canceled" || existing.State == "failed" || existing.State == "refused") {
 		released, e := s.store.ReleaseCanceledIdempotencyKey(key)
 		if e != nil {
 			s.refuseTyped(w, r, e)
@@ -247,7 +248,7 @@ func replayJobSubmission(sub JobSubmission,
 		}
 		sort.Strings(params)
 	}
-	return orchestrator.Submission{Kind: "job", Package: packageName,
+	return orchestrator.Submission{Kind: "job", RetainWork: sub.RetainWork, Package: packageName,
 		Entrypoint: function, Payload: payload, Org: org,
 		InstallID: recorded.InstallID, Release: recorded.Release,
 		LocalPackageDigest: recorded.LocalPackageDigest,
@@ -272,7 +273,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			PlanID: "sha256:" + strings.Repeat("0", 64), ModelTransfer: sub.ModelTransfer}, nil
 	}
 	out := orchestrator.Submission{
-		Kind: "job", Package: sub.Package, Entrypoint: sub.Function,
+		Kind: "job", RetainWork: sub.RetainWork, Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org),
 		Release: sub.Release,
 		Rental:  sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
@@ -486,6 +487,9 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"trees":           strings.Join(spec.Trees, ","),
 		"models":          models,
 	}
+	if spec.RetainWork {
+		doc["retain_work"] = true
+	}
 	if spec.Rental {
 		doc["rental"] = true
 		doc["release"] = spec.Release
@@ -516,13 +520,14 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 // JobState is one job's document: the lifecycle a request has, plus the two facts only a
 // job has — its publication and its running bill.
 type JobState struct {
-	Number   int64  `json:"number"`
-	JobID    string `json:"job_id"`
-	Status   string `json:"status"`
-	Package  string `json:"package"`
-	Function string `json:"function"`
-	Attempt  uint64 `json:"attempt"`
-	Attempts int    `json:"attempts"`
+	RetainWork bool   `json:"retain_work,omitempty"`
+	Number     int64  `json:"number"`
+	JobID      string `json:"job_id"`
+	Status     string `json:"status"`
+	Package    string `json:"package"`
+	Function   string `json:"function"`
+	Attempt    uint64 `json:"attempt"`
+	Attempts   int    `json:"attempts"`
 	// Queued is the job's position in the dispatch queue while it waits for a worker,
 	// counted from 1. Absent once it has an attempt — a running job is not queued.
 	QueuePosition *int `json:"queue_position,omitempty"`
@@ -652,7 +657,8 @@ func (s *Server) jobRow(w http.ResponseWriter, r *http.Request) (records.Request
 
 func (s *Server) jobStateOf(row records.Request) JobState {
 	state := JobState{
-		Number: row.Number, JobID: row.ID, Status: contractStatus(row.State), Package: row.Package,
+		RetainWork: row.RetainWork,
+		Number:     row.Number, JobID: row.ID, Status: contractStatus(row.State), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		Requeues: row.Requeues, RetryBudget: orchestrator.MaxRequeues,
 		Outputs: []MediaRef{}, CreatedAt: row.CreatedAt,
@@ -898,6 +904,19 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	actor := requestActor(r)
+	if row.RetainWork && row.State != "finalizing" && !records.Settled(row.State) {
+		if e := s.orchestrator.CancelRetainedRequest(row.ID, actor); e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		updated, e := s.store.RequestRow(row.ID)
+		if e != nil || updated == nil {
+			s.refuse(w, r, http.StatusInternalServerError, "internal", "canceled request cannot be read", "")
+			return
+		}
+		s.ok(w, r, http.StatusAccepted, s.jobStateOf(*updated))
+		return
+	}
 	if status := contractStatus(row.State); status == "completed" || status == "failed" || status == "canceled" {
 		s.ok(w, r, http.StatusOK, s.jobStateOf(row))
 		return

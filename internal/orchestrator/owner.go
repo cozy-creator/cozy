@@ -717,6 +717,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		c.afterAck(continuation.request, continuation.attempt, w)
 	}
 	c.retryMediaCleanup(w)
+	_ = c.restoreRetainedWork()
 	c.logf("snapshot %s (%s, %d B) acknowledged: %d held attempt(s), %d host-held outcome(s), "+
 		"accepted revision %d, converged %d; dispatch is open", snap.SnapshotId,
 		shortDigest(shortNone(snap.SnapshotDigest)), len(snap.SnapshotCanonicalBytes),

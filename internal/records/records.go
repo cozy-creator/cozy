@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 24
+const schemaVersion = 25
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -267,7 +267,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 20 {
+	if sourceVersion < 25 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
 		}
@@ -665,6 +665,7 @@ func priorStatements(version int) []string {
 	}
 	for index, stmt := range statements {
 		transferStatement := stmt == modelTransferSchema[0]
+		requestStatement := stmt == requestsDDL
 		switch {
 		case stmt == requestsDDL && version == 6:
 			stmt = priorRequestsSix
@@ -702,6 +703,9 @@ func priorStatements(version int) []string {
 			stmt = strings.Replace(stmt,
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n",
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n  evidence         BLOB NOT NULL,\n", 1)
+		}
+		if requestStatement && version < 25 {
+			stmt = strings.Replace(stmt, ",\n  retain_work INTEGER NOT NULL DEFAULT 0 CHECK(retain_work IN (0,1))", "", 1)
 		}
 		if transferStatement && version < 24 {
 			stmt = strings.Replace(stmt, ",'canceling'", "", 1)
@@ -1042,6 +1046,7 @@ func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
 func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + installCols("i.") + `
 		FROM installs i WHERE i.id NOT IN (SELECT install_id FROM pins)
+		AND NOT EXISTS(SELECT 1 FROM requests WHERE install_id=i.id AND state IN (` + activeRequestStates + `))
 		ORDER BY i.created_at`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list unreferenced installs: %s", err)
@@ -1096,7 +1101,7 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 	}
 	defer tx.Rollback()
 	if _, err := tx.Exec(`UPDATE requests SET install_id=NULL WHERE install_id=?
-		AND state NOT IN ('submitted','queued','dispatching','requeue_pending')`, id); err != nil {
+		AND state NOT IN (`+activeRequestStates+`)`, id); err != nil {
 		return false, exit.New(exit.Conflict,
 			"cannot release terminal requests from install %s: %s", id, err)
 	}
@@ -1107,7 +1112,7 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 	result, err := tx.Exec(`DELETE FROM installs WHERE id=?
 		AND NOT EXISTS (SELECT 1 FROM pins WHERE install_id=?)
 		AND NOT EXISTS (SELECT 1 FROM requests WHERE install_id=?
-		  AND state IN ('submitted','queued','dispatching','requeue_pending'))
+		  AND state IN (`+activeRequestStates+`))
 		AND NOT EXISTS (SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')`,
 		id, id, id, id)
 	if err != nil {

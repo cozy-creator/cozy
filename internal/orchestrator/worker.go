@@ -2223,6 +2223,9 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	if problem := c.resumeManualRentals(); problem != nil {
 		return killed, forgotten, problem
 	}
+	if problem := c.restoreRetainedWork(); problem != nil {
+		return killed, forgotten, problem
+	}
 	return killed, forgotten, nil
 }
 
