@@ -237,6 +237,9 @@ func (s *Store) RequestRetainedCancellation(id, actor string) *exit.Error {
 	if changed == 0 {
 		return nil
 	}
+	if _, err := tx.Exec(`UPDATE request_model_transfers SET state='canceling',updated_at=? WHERE request_id=? AND state NOT IN ('completed','canceled')`, now(), id); err != nil {
+		return exit.Internalf("cannot fence retained source and publication work: %s", err)
+	}
 	if err := appendEventTx(tx, id, "request.cancel_requested", 0, map[string]any{"actor": actor, "status": "canceling"}); err != nil {
 		return exit.Internalf("cannot journal retained cancellation: %s", err)
 	}
