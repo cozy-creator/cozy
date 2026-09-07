@@ -131,7 +131,7 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 		out.Worker, out.Rental, out.RentalRequired = parent.Worker, true, true
 		out.LocalPackageDigest = binding.LocalRevisionDigest
 	}
-	identity, _ := json.Marshal(map[string]any{"local_revision_digest": binding.LocalRevisionDigest, "interface_digest": iface, "entrypoint": binding.Entrypoint, "module": module, "export": export, "models": models})
+	identity, _ := json.Marshal(map[string]any{"local_revision_digest": binding.LocalRevisionDigest, "interface_digest": iface, "entrypoint": binding.Entrypoint, "module": module, "export": export})
 	identity, err := canonical.NormalizeJCS(identity)
 	if err != nil {
 		return out, "", exit.Internalf("cannot encode frozen child identity: %s", err)
