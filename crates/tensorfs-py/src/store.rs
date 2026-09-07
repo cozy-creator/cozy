@@ -1658,6 +1658,50 @@ impl PyStore {
         Ok(out)
     }
 
+    /// Retain an immutable committed result for another owner without changing its receipt.
+    fn retain_derived_result<'p>(
+        &self,
+        py: Python<'p>,
+        transaction_id: &str,
+        expected_receipt_digest: &str,
+        retention_id: &str,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let value = py
+            .detach(|| {
+                derived::retain_result(
+                    &self.store,
+                    &self.meta,
+                    transaction_id,
+                    expected_receipt_digest,
+                    retention_id,
+                )
+            })
+            .or_refuse(py)?;
+        marshal(py, &tensorfs_core::ids::Plain::to_value(&value))
+    }
+
+    /// Permanently release only the named retention owner, including before acquisition.
+    fn release_derived_retention<'p>(
+        &self,
+        py: Python<'p>,
+        transaction_id: &str,
+        expected_receipt_digest: &str,
+        retention_id: &str,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let value = py
+            .detach(|| {
+                derived::release_retention(
+                    &self.store,
+                    &self.meta,
+                    transaction_id,
+                    expected_receipt_digest,
+                    retention_id,
+                )
+            })
+            .or_refuse(py)?;
+        marshal(py, &tensorfs_core::ids::Plain::to_value(&value))
+    }
+
     /// Release the committed transaction after its manifest has been published or rejected.
     fn derived_dispose<'p>(
         &self,

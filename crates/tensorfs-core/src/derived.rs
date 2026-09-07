@@ -7,8 +7,10 @@
 //! vocabulary, Torch, schedule, publication, or serving decision here.
 
 mod progress;
+mod retention;
 mod roots;
 use progress::read as read_progress;
+pub use retention::{release_retention, retain_result, RetainedResult};
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -2484,7 +2486,7 @@ pub(crate) fn retain_restore(
 }
 
 pub(crate) fn retained_objects(store: &Store) -> Result<Vec<crate::storage::HeldKey>> {
-    let mut holds = Vec::new();
+    let mut holds = retention::held_objects(store)?;
     for root in roots::all(store)? {
         let mut blobs = root.blobs;
         let mut manifests = root.sources;

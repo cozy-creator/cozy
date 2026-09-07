@@ -628,3 +628,16 @@ Selection uses exact existing part `what` identifiers, keeps every native window
 ObjectRef for those parts in native order, and compacts destination offsets. Duplicate or
 unknown identifiers refuse before I/O; an empty selection returns an empty plan. The original
 plan is unchanged, and selected plans use the same lease, stream and caller-owned ring.
+
+A committed derived result can acquire independent private retention without changing its
+execution receipt: `Store.retain_derived_result(transaction_id, expected_receipt_digest,
+retention_id)`. The caller supplies an exact SHA-256 retention identity; the result names
+the original transaction, receipt, and manifest. It verifies native retained custody and
+resident verification records without copying tensor payloads.
+
+`Store.release_derived_retention` takes the same three arguments and releases only that
+retention owner. Its durable tombstone rejects delayed reacquisition, including release
+before acquire. The original transaction can be disposed independently. Native GC finds
+these manifest roots directly from the filesystem, without relying on request or transaction
+metadata. Eligibility and authorization belong to the caller; this API provides storage
+retention and never schedules computation or publishes a model repository.
