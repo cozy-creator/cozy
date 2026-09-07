@@ -160,26 +160,44 @@ blobs — never a database's. A pass never runs beside an active request (a down
 unnamed until its commit): `remove` defers reclamation to `model gc`, `model gc` refuses, the
 cron logs `gc: deferred`. A live worker holding a model refuses by name (`cozy unload` first).
 
-Upload a pinned source directly, or execute one package-reviewed producer job whose named outputs
-become owner-only immutable checkpoints. `--lane` on upload selects only an existing input release;
-producers do not choose public lane names. A local alias can be uploaded without copying its
-already-canonical objects. The destination owner must match the account shown by `cozy auth`:
+Upload an already canonical local alias, or ingest a provider source with `model download`.
+Run quantization and other weight-producing jobs through the ordinary package command.
+The job receives prepared model inputs and its typed payload; TensorFS owns provider
+conversion. The destination owner must match the account shown by `cozy auth`:
 
 ```sh
 cozy model upload local/model org/model
 
-cozy model upload hf://MiniMaxAI/MiniMax-H3@<full-commit> \
-  tensorhub/minimax-h3 \
-  --producer tensorhub/minimax-h3-tools@v2/four-lane \
-  --rental-only --await
+cozy run paul/minimax-h3-tools/four-lane \
+  model.dits=hf://MiniMaxAI/MiniMax-H3@<full-commit> \
+  model.shared=hf://MiniMaxAI/MiniMax-H3@<full-commit> \
+  --source-profile dits=hf/minimax-h3/native-dual-bf16/1 \
+  --source-profile shared=hf/minimax-h3/shared-bf16/1 \
+  --publish-to paul/minimax-h3 --rental-only --await
+
+cozy run org/quantize/convert model.source=org/model@release/bf16 \
+  --in quantize.json --publish-to org/quantized --rental-only
 ```
 
-`--dry-run` resolves the immutable source, producer release, resource floors, and named outputs
-without moving model bodies or authorizing rental spend. Submission records an ordinary `job-*` run
-and returns immediately; `--await` watches it, and `cozy run watch <job-id>` attaches later. Repeating
-the exact normalized transfer safely returns the same durable request. A checkpoint retained before a
-later destination failure remains visible in `model_outputs`, while the request reports the failure.
-Upload never makes checkpoints public.
+`--publish-to` retains each declared weight output as an owner-only immutable checkpoint;
+it does not create public lane pointers. `--source-profile slot=profile` narrows each foreign
+input to a reviewed TensorFS profile. Currently every foreign input must name the same
+provider source and all model slots must be foreign; mixed inputs and multiple independent
+sources refuse before acquisition. Tensorhub inputs use the ordinary exact model resolver.
+The Hub measures their shared closure when sizing a rental; a manifest's small metadata
+length is never a disk-size estimate.
+
+`cozy run ... --dry-run` resolves the selected release, typed payload, exact inputs, and
+foreign conversion headers without starting a daemon, queueing work or renting. It reads
+provider metadata and headers, never downloads the model bodies. Submission records an
+ordinary `job-*` run; `--await` watches it and `cozy run watch <job-id>` attaches later.
+Use `--idempotency-key` to replay the same request. Existing source operations continue
+through their recorded intent after an upgrade. `--producer` on model upload/download is
+removed; jobs have one invocation surface.
+
+A successful producer with blocked publication retains its receipts and worker bytes.
+`cozy run retry-publication <run-id>` retries publication without rerunning the producer;
+explicit cancellation abandons unfinished output custody through the same finalizer.
 
 Publish, repoint, add, or remove release lanes separately. Omitted lanes stay unchanged:
 
@@ -194,7 +212,7 @@ cozy model yank org/model --release 1.0.0
 Checkpoint IDs are immutable. Release labels and their lane maps are mutable owner pointers. Ordinary
 consumers follow a release lane so fixes take effect; accepted runs freeze the checkpoint they resolved.
 
-With `--rental`, producer and job packages resolve directly to their latest non-yanked immutable
+With `--rental`, job packages resolve directly to their latest non-yanked immutable
 Tensorhub releases. The transfer intent pins `(package, release)`; downloaded execution files carry
 their own exact refs, including `metadata/package-interface.json`.
 They do not need to be installable in the laptop's local Python environment. Local production still

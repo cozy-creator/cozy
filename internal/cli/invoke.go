@@ -53,6 +53,13 @@ import (
 // dial builds the API client. Every verb here has already passed the shared exit-9 gate,
 // so this is the credential read and nothing else.
 func dial(ctx *Context) (*localapi.Client, *exit.Error) {
+	if ctx.Daemon.Addr == "" {
+		state, _, problem := ensureDaemon(ctx)
+		if problem != nil {
+			return nil, problem
+		}
+		ctx.Daemon = state
+	}
 	return localapi.Open(ctx.Cfg, ctx.Daemon)
 }
 
@@ -84,7 +91,13 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if ctx.Inv.Bool("--describe") {
 		return emitDescribe(ctx, target, packageInterface, callable)
 	}
+	if ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--await") {
+		return exit.Usagef("--dry-run and --await conflict")
+	}
 	if callable.Kind != "job" {
+		if ctx.Inv.Value("--publish-to") != "" || len(ctx.Inv.Values["--source-profile"]) > 0 || ctx.Inv.Bool("--dry-run") {
+			return exit.Usagef("--publish-to, --source-profile, and --dry-run apply only to job callables")
+		}
 		if len(ctx.Inv.Values["--input"]) > 0 {
 			return exit.Usagef("--input-tree applies only to a job callable")
 		}
@@ -97,10 +110,6 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
 			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --await, and --rental")
-	}
-	if rentalRequested(ctx) && len(callable.Models) > 0 {
-		return exit.Named(exit.Unavailable, "rental.modeled_job_unsupported",
-			"remote jobs with model slots are not supported yet")
 	}
 	if rentalRequested(ctx) && len(ctx.Inv.Values["--input"]) > 0 {
 		return exit.Named(exit.Unavailable, "rental.job_input_tree_unsupported",
@@ -263,6 +272,12 @@ func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
 	if problem != nil || len(selected) == 0 {
 		return nil, problem
 	}
+	return resolveSelectedInvocationModels(ctx, target, ep, selected, remote)
+}
+
+func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
+	selected []invocationModelSpec, remote bool,
+) ([]orchestrator.ModelRef, *exit.Error) {
 	slots := make(map[string]launch.Slot, len(ep.Models))
 	for _, slot := range ep.Models {
 		slots[slot.Path] = slot
@@ -336,6 +351,14 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 	// beside the ref the way the resolvers take it.
 	selected := make(map[string]invocationModelSpec, len(overrides))
 	for slotPath, raw := range overrides {
+		source, provider, problem := providerModelSource(raw)
+		if problem != nil {
+			return nil, problem
+		}
+		if provider {
+			selected[slotPath] = invocationModelSpec{Slot: slotPath, Ref: source}
+			continue
+		}
 		model, release, lane, manifest, problem := parseModelRef(raw)
 		if problem != nil {
 			return nil, problem

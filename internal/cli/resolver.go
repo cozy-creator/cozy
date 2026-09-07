@@ -572,8 +572,8 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, function string,
 		return empty, nil, exit.Named(exit.Validation, "rental.job_model_selection_incomplete",
 			"remote job %s requires exactly %d model Manifest binding(s)", function, len(job.Models))
 	}
-	byParam := make(map[string]orchestrator.ModelRef, len(models))
-	for _, model := range models {
+	byParam := make(map[string]int, len(models))
+	for index, model := range models {
 		if model.Package != pkg || model.Slot == "" || model.Model == "" ||
 			model.ManifestLength <= 0 || model.ManifestLength > (int64(1)<<53)-1 {
 			return empty, nil, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
@@ -587,16 +587,22 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, function string,
 			return empty, nil, exit.Named(exit.Validation, "rental.job_model_manifest_invalid",
 				"remote job %s model parameter %s has no exact Manifest digest", function, model.Slot)
 		}
-		byParam[model.Slot] = model
+		byParam[model.Slot] = index
 	}
 	for _, slot := range job.Models {
 		if deferredModels {
 			continue
 		}
-		if _, ok := byParam[slot.Param]; !ok {
+		index, ok := byParam[slot.Param]
+		if !ok {
 			return empty, nil, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
 				"remote job %s does not bind model parameter %s", function, slot.Param)
 		}
+		if models[index].BindingPath != "" && models[index].BindingPath != slot.Path {
+			return empty, nil, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
+				"remote job %s model parameter %s changed its interface binding path", function, slot.Param)
+		}
+		models[index].BindingPath = slot.Path
 	}
 	weights := make([]orchestrator.WeightsOutput, 0, len(job.WeightsOutputs))
 	params := make([]string, 0, len(job.Models))
