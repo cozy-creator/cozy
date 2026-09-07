@@ -32,7 +32,8 @@ func (c *Orchestrator) adoptRetriedSource(ctx context.Context, request records.R
 	}
 	call := &pb.ModelSourceAdoptCall{Claim: s.claim, FromOperationId: priorID,
 		Request: &pb.ModelSourcePrepareRequest{RecordOwnerEpoch: recordOwnerEpoch,
-			WorkerBootId: s.bootID, OperationId: request.ID, SourceSelectionDigest: selection}}
+			WorkerBootId: s.bootID, OperationId: request.ID, SourceSelectionDigest: selection,
+			SourceUri: request.ModelTransfer.Source, DeclaredLicense: request.ModelTransfer.SourceLicense}}
 	for _, progress := range progress {
 		if progress.WorkerBootID != s.bootID {
 			return exit.Named(exit.Conflict, "request.state_lost", "retained source checkpoint belongs to another worker boot; local bytes cannot be claimed as resumed")

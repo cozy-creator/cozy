@@ -387,7 +387,7 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		if problem != nil || request == nil {
 			return nil, problem
 		}
-		if request.State == "canceled" {
+		if request.State == "canceled" || request.State == "canceling" || request.State == "releasing" {
 			return nil, exit.New(exit.Canceled, "model transfer %s was canceled", req.ID)
 		}
 		session, problem := c.rentalControl(request.Worker)
