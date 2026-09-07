@@ -88,24 +88,61 @@ pub fn objectize_held<R: Read>(
     operation: Option<&str>,
 ) -> Result<Written> {
     let want = checked_bytes(what, &shape, dtype)?;
-    let mut h = Sha256::new();
+    let mut whole = Sha256::new();
+    let stored = if want > limits::GRID_BYTES {
+        let mut tee = Tee {
+            r: src,
+            h: &mut whole,
+        };
+        store_part_held(store, what, dtype, shape, &mut tee, operation)?
+    } else {
+        store_part_held(store, what, dtype, shape, src, operation)?
+    };
+    let digest = match &stored.part.body {
+        Body::Inline(bytes) => sha256::hex_digest(bytes),
+        Body::Segments(segments) if segments.len() == 1 => segments[0].sha256.clone(),
+        Body::Segments(_) => sha256::hex(&whole.finish()),
+    };
+    Ok(Written {
+        segments: stored.part.segments().len(),
+        part: stored.part,
+        whole: digest,
+        bytes: stored.bytes,
+        deduped: stored.deduped,
+    })
+}
+
+/// The source converter needs stored parts, not an unused whole-tensor identity.
+/// Both callers share the same bounded objectization and verification path.
+pub(crate) struct StoredPart {
+    pub part: Part,
+    pub bytes: u64,
+    pub deduped: u64,
+}
+
+pub(crate) fn store_part_held<R: Read>(
+    store: &Store,
+    what: &str,
+    dtype: Dtype,
+    shape: Vec<u64>,
+    src: &mut R,
+    operation: Option<&str>,
+) -> Result<StoredPart> {
+    let want = checked_bytes(what, &shape, dtype)?;
 
     if Part::is_inline(want) {
         let mut buf = vec![0u8; want as usize];
         src.read_exact(&mut buf)
             .map_err(|e| io(format!("{what}: read {want} inline bytes"), e))?;
-        h.update(&buf);
         store.moved(want);
-        return Ok(Written {
+        return Ok(StoredPart {
             part: Part {
                 dtype,
                 shape,
                 body: Body::Inline(buf),
             },
-            whole: sha256::hex(&h.finish()),
             bytes: want,
             deduped: 0,
-            segments: 0,
         });
     }
 
@@ -114,10 +151,7 @@ pub fn objectize_held<R: Read>(
     let mut deduped = 0u64;
     while left > 0 {
         let n = left.min(limits::GRID_BYTES);
-        let mut t = Tee {
-            r: (&mut *src).take(n),
-            h: &mut h,
-        };
+        let mut t = (&mut *src).take(n);
         let put = store.put_stream_held(&mut t, None, &Fault::default(), operation)?;
         if put.obj.length != n {
             return refuse(
@@ -134,17 +168,14 @@ pub fn objectize_held<R: Read>(
         segs.push(put.obj);
         left -= n;
     }
-    let segments = segs.len();
-    Ok(Written {
+    Ok(StoredPart {
         part: Part {
             dtype,
             shape,
             body: Body::Segments(segs),
         },
-        whole: sha256::hex(&h.finish()),
         bytes: want,
         deduped,
-        segments,
     })
 }
 

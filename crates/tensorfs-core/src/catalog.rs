@@ -701,45 +701,37 @@ impl Catalog {
     /// that `ingest::journal` appends to as each op lands. Writing a row here and expecting
     /// the collector to honour it is the mistake this note exists to prevent.
     pub fn hold(&self, operation: &str, key: &str, length: u64) -> Result<()> {
-        let kind = if key.starts_with("blobs/") {
-            "blob"
-        } else if key.starts_with("manifests/") {
-            "manifest"
-        } else {
-            return refuse(Code::KEY_GRAMMAR, "hold key must be a blob or manifest key");
-        };
-        let line = crate::canon::write(&crate::canon::Value::obj(vec![
-            ("key", crate::canon::Value::str(key)),
-            ("kind", crate::canon::Value::str(kind)),
-            ("length", crate::canon::Value::uint(length)),
-        ]));
-        crate::storage::HeldKey::parse_line(&line)?;
-        let connection = self.connection()?;
-        let changed = connection
-            .execute(
-                "INSERT INTO tensorfs_holds(operation_id,key,length) VALUES (?1,?2,?3)
-                 ON CONFLICT(operation_id,key) DO NOTHING",
-                params![operation, key, length],
-            )
-            .map_err(|error| sql("register exact hold", error))?;
-        if changed == 1 {
-            return Ok(());
+        hold_on(&self.connection()?, operation, key, length)
+    }
+
+    /// The object's existing hold and verification become durable together. Filesystem
+    /// publication still precedes its verification record, with FULL synchronization.
+    pub(crate) fn admit_blob(
+        &self,
+        operation: Option<&str>,
+        object: &crate::ids::ObjectRef,
+        publish: impl FnOnce() -> Result<Option<crate::store::VRecord>>,
+    ) -> Result<bool> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| sql("begin blob admission", error))?;
+        if let Some(operation) = operation {
+            hold_on(
+                &transaction,
+                operation,
+                &crate::storage::blob_key(&object.sha256)?,
+                object.length,
+            )?;
         }
-        let existing: u64 = connection
-            .query_row(
-                "SELECT length FROM tensorfs_holds WHERE operation_id=?1 AND key=?2",
-                params![operation, key],
-                |row| row.get(0),
-            )
-            .map_err(|error| sql("read existing hold", error))?;
-        if existing == length {
-            Ok(())
-        } else {
-            refuse(
-                Code::LENGTH_MISMATCH,
-                "the operation already holds this key at another length",
-            )
+        let verified = publish()?;
+        if let Some(row) = &verified {
+            write_verification_on(&transaction, row)?;
         }
+        transaction
+            .commit()
+            .map_err(|error| sql("commit blob admission", error))?;
+        Ok(verified.is_some())
     }
 
     pub fn held_keys(&self) -> Result<Vec<crate::storage::HeldKey>> {
@@ -835,25 +827,7 @@ impl Catalog {
     }
 
     pub(crate) fn write_verification(&self, row: &crate::store::VRecord) -> Result<()> {
-        self.connection()?
-            .execute(
-                "INSERT INTO tensorfs_verified_blobs
-                 (sha256,length,dev,ino,mtime_s,mtime_ns)
-                 VALUES (?1,?2,?3,?4,?5,?6)
-                 ON CONFLICT(sha256) DO UPDATE SET
-                   length=excluded.length,dev=excluded.dev,ino=excluded.ino,
-                   mtime_s=excluded.mtime_s,mtime_ns=excluded.mtime_ns",
-                params![
-                    row.sha256,
-                    row.length,
-                    row.dev.to_string(),
-                    row.ino.to_string(),
-                    row.mtime_s,
-                    row.mtime_ns,
-                ],
-            )
-            .map_err(|error| sql("write blob verification", error))?;
-        Ok(())
+        write_verification_on(&self.connection()?, row)
     }
 
     pub(crate) fn verification(&self, sha256: &str) -> Result<Option<crate::store::VRecord>> {
@@ -930,6 +904,69 @@ impl Catalog {
         }
         Ok(pruned)
     }
+}
+
+fn hold_on(connection: &Connection, operation: &str, key: &str, length: u64) -> Result<()> {
+    let kind = if key.starts_with("blobs/") {
+        "blob"
+    } else if key.starts_with("manifests/") {
+        "manifest"
+    } else {
+        return refuse(Code::KEY_GRAMMAR, "hold key must be a blob or manifest key");
+    };
+    let line = crate::canon::write(&crate::canon::Value::obj(vec![
+        ("key", crate::canon::Value::str(key)),
+        ("kind", crate::canon::Value::str(kind)),
+        ("length", crate::canon::Value::uint(length)),
+    ]));
+    crate::storage::HeldKey::parse_line(&line)?;
+    let changed = connection
+        .execute(
+            "INSERT INTO tensorfs_holds(operation_id,key,length) VALUES (?1,?2,?3)
+                 ON CONFLICT(operation_id,key) DO NOTHING",
+            params![operation, key, length],
+        )
+        .map_err(|error| sql("register exact hold", error))?;
+    if changed == 1 {
+        return Ok(());
+    }
+    let existing: u64 = connection
+        .query_row(
+            "SELECT length FROM tensorfs_holds WHERE operation_id=?1 AND key=?2",
+            params![operation, key],
+            |row| row.get(0),
+        )
+        .map_err(|error| sql("read existing hold", error))?;
+    if existing == length {
+        Ok(())
+    } else {
+        refuse(
+            Code::LENGTH_MISMATCH,
+            "the operation already holds this key at another length",
+        )
+    }
+}
+
+fn write_verification_on(connection: &Connection, row: &crate::store::VRecord) -> Result<()> {
+    connection
+        .execute(
+            "INSERT INTO tensorfs_verified_blobs
+                 (sha256,length,dev,ino,mtime_s,mtime_ns)
+                 VALUES (?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(sha256) DO UPDATE SET
+                   length=excluded.length,dev=excluded.dev,ino=excluded.ino,
+                   mtime_s=excluded.mtime_s,mtime_ns=excluded.mtime_ns",
+            params![
+                row.sha256,
+                row.length,
+                row.dev.to_string(),
+                row.ino.to_string(),
+                row.mtime_s,
+                row.mtime_ns,
+            ],
+        )
+        .map_err(|error| sql("write blob verification", error))?;
+    Ok(())
 }
 
 fn insert_projection(transaction: &Connection, projection: &Projection) -> Result<()> {

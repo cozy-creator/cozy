@@ -1117,38 +1117,42 @@ impl Store {
             sha256: hex,
             length: len,
         } = self.stream_verified(r, expect, fault, PUT_TEMP)?;
-        if let Some(operation) = operation {
-            catalog.hold(operation, &crate::storage::blob_key(&hex)?, len)?;
-        }
-
-        if let Err(e) = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o444)) {
-            return cleanup(&tmp, io("chmod 0444", e));
-        }
-        fault.hit("chmod");
-
-        let dst = self.object_path(&hex);
-        let dir = dst.parent().unwrap().to_path_buf();
-        if let Err(e) = fs::create_dir_all(&dir) {
-            return cleanup(&tmp, io("mkdir fan-out", e));
-        }
-        // No-clobber admission: link() refuses to replace an installed object.
-        let admitted = match fs::hard_link(&tmp, &dst) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-            Err(e) => return cleanup(&tmp, io(format!("link {}", dst.display()), e)),
+        let object = ObjectRef {
+            sha256: hex.clone(),
+            length: len,
         };
-        fault.hit("linked");
-        if admitted {
-            fsync_dir(&dir)?;
-        }
-        let _ = fs::remove_file(&tmp);
-        drop(f);
+        let admitted = catalog.admit_blob(operation, &object, || {
+            if let Err(e) = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o444)) {
+                return cleanup(&tmp, io("chmod 0444", e));
+            }
+            fault.hit("chmod");
 
-        // A record is written only for bytes THIS process hashed. Losing the race means we
-        // never saw the installed file's bytes, so we make no claim about them.
+            let dst = self.object_path(&hex);
+            let dir = dst.parent().unwrap().to_path_buf();
+            if let Err(e) = fs::create_dir_all(&dir) {
+                return cleanup(&tmp, io("mkdir fan-out", e));
+            }
+            // No-clobber admission: link() refuses to replace an installed object.
+            let admitted = match fs::hard_link(&tmp, &dst) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(e) => return cleanup(&tmp, io(format!("link {}", dst.display()), e)),
+            };
+            fault.hit("linked");
+            if admitted {
+                fsync_dir(&dir)?;
+            }
+            let _ = fs::remove_file(&tmp);
+            drop(f);
+
+            // Losing the no-clobber race does not verify another writer's inode.
+            if admitted {
+                Ok(Some(VRecord::of(&hex, &stat(&dst)?)))
+            } else {
+                Ok(None)
+            }
+        })?;
         if admitted {
-            let md = stat(&dst)?;
-            self.write_record(&VRecord::of(&hex, &md))?;
             if let Some(sink) = &self.progress {
                 sink.admitted();
             }
