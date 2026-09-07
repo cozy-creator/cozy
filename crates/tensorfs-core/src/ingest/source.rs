@@ -803,6 +803,8 @@ pub struct PreparedModelSources {
     pub converted_roles: usize,
     pub resumed_roles: usize,
     pub deferred_ops: usize,
+    pub converted_bytes: u64,
+    pub largest_op_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1097,6 +1099,22 @@ fn prepare_model_source_with_registry(
     registry_locator: &str,
     registry_bytes: &[u8],
 ) -> Result<PreparedModelSources> {
+    prepare_model_source_with_budget(
+        store,
+        request,
+        registry_locator,
+        registry_bytes,
+        &mut transaction::Budget::new(durability::INTERVAL_BYTES),
+    )
+}
+
+fn prepare_model_source_with_budget(
+    store: &Store,
+    request: &PrepareModelSource,
+    registry_locator: &str,
+    registry_bytes: &[u8],
+    budget: &mut transaction::Budget,
+) -> Result<PreparedModelSources> {
     let registry = FingerprintRegistry::parse(registry_bytes)?;
     let (ready, fences) = validate_request(request, &registry)?;
     let digest = request_digest(request, registry_bytes);
@@ -1250,6 +1268,8 @@ fn prepare_model_source_with_registry(
                 converted_roles: 0,
                 resumed_roles: 0,
                 deferred_ops: 0,
+                converted_bytes: 0,
+                largest_op_bytes: 0,
             });
         }
         crate::catalog::SourcePreparation::Open(writer) => writer,
@@ -1264,6 +1284,8 @@ fn prepare_model_source_with_registry(
         converted_roles: 0,
         resumed_roles: 0,
         deferred_ops: 0,
+        converted_bytes: 0,
+        largest_op_bytes: 0,
     };
     let mut needed = std::collections::BTreeSet::new();
     for (requested, (plan_hex, prepared)) in request.profiles.iter().zip(plans) {
@@ -1308,6 +1330,7 @@ fn prepare_model_source_with_registry(
             transaction::Carriers::Ready(&ready),
             None,
             &mut journal,
+            Some(budget),
         )?;
         let checkpoint = durability::checkpoint(
             store,
@@ -1329,6 +1352,8 @@ fn prepare_model_source_with_registry(
         }
         needed.extend(progress.needed);
         result.converted_roles += progress.converted_roles;
+        result.converted_bytes += progress.written;
+        result.largest_op_bytes = budget.largest_op;
         result.resumed_roles += progress.resumed_roles;
         result.deferred_ops += progress.deferred_ops;
         if let Some(outcome) = outcome {
@@ -1569,6 +1594,58 @@ mod tests {
     }
 
     #[test]
+    fn one_pass_budget_is_shared_by_profiles_and_allows_one_oversized_op() {
+        for limit in [1024, 4096] {
+            let root = temporary("bounded-profiles");
+            let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+            let first = prepare_model_source_with_budget(
+                &store,
+                &request,
+                "fixture:registry",
+                &registry,
+                &mut transaction::Budget::new(limit),
+            )
+            .unwrap();
+            assert!(!first.complete);
+            assert_eq!(first.converted_roles, 1);
+            assert_eq!(first.converted_bytes, 4096);
+            assert_eq!(first.largest_op_bytes, 4096);
+            assert_eq!(first.deferred_ops, 1, "one budget covers both profiles");
+            let mut stalled = request.clone();
+            stalled.landed.clear();
+            let no_work = prepare_model_source_with_budget(
+                &store,
+                &stalled,
+                "fixture:registry",
+                &registry,
+                &mut transaction::Budget::new(limit),
+            )
+            .unwrap();
+            assert_eq!(no_work.converted_bytes, 0);
+            assert_eq!(no_work.largest_op_bytes, 0);
+            assert_eq!(no_work.checkpoints, first.checkpoints);
+            let second = prepare_model_source_with_budget(
+                &store,
+                &request,
+                "fixture:registry",
+                &registry,
+                &mut transaction::Budget::new(limit),
+            )
+            .unwrap();
+            assert!(second.complete);
+            assert_eq!(second.converted_roles, 1);
+            assert_eq!(second.resumed_roles, 1);
+            assert_eq!(second.converted_bytes, 4096);
+            let clean = Store::init(&root.join("clean")).unwrap();
+            let expected =
+                prepare_model_source_with_registry(&clean, &request, "fixture:registry", &registry)
+                    .unwrap();
+            assert_eq!(second.sources, expected.sources);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn full_byte_multi_profile_transaction_replays_conflicts_rebuilds_and_releases_holds() {
         let root = temporary("transaction");
         let (store, registry, request) = fixture(&root, false);
@@ -1619,6 +1696,7 @@ mod tests {
             prepare_model_source_with_registry(&store, &bodies_gone, "fixture:registry", &registry)
                 .unwrap();
         assert_eq!(recovered_heads.checkpoints, first.checkpoints);
+        assert_eq!(recovered_heads.converted_bytes, 0);
         // Remaining arms need their original carriers again.
         carrier(&request.roster[0].path, "weight", [1, 2, 3, 4]);
         carrier(&request.roster[1].path, "weight", [5, 6, 7, 8]);
@@ -2371,8 +2449,9 @@ mod tests {
         assert!(replay.replayed && replay.complete);
         assert_eq!(
             replay.checkpoints, resumed.checkpoints,
-            "a lost final response replays even with an old ACK"
+            "a lost final response is replayed even with an old ACK"
         );
+        assert_eq!(replay.converted_bytes, 0);
         let mut unrelated = registry.clone();
         unrelated.entries[0]
             .provenance

@@ -276,6 +276,7 @@ pub fn manifest_presence(store: &Store, object: &ObjectRef) -> Result<Presence> 
     match store.read_manifest(object) {
         Ok(_) => Ok(Presence::Recorded),
         Err(error) if error.code == Code::OBJECT_ABSENT => Ok(Presence::Absent),
+        Err(error) if error.code == Code::LENGTH_MISMATCH => Err(error),
         Err(error) => {
             let why = error.to_string();
             store.remove_corrupt_manifest(&object.sha256)?;
@@ -289,15 +290,28 @@ fn presence(store: &Store, o: &ObjectRef) -> Result<Presence> {
     if !store.contains(&o.sha256) {
         return Ok(Presence::Absent);
     }
-    if store.record_valid(&o.sha256).is_ok() {
-        return Ok(Presence::Recorded);
+    let (record, presence) = match store.record_valid(&o.sha256) {
+        Ok(record) => (record, Presence::Recorded),
+        Err(_) => match store.verify(&o.sha256)? {
+            Verdict::CorruptRemoved { why } => return Ok(Presence::CorruptRemoved { why }),
+            Verdict::Verified { .. } | Verdict::Invalidated { .. } => {
+                let record = store
+                    .record_valid(&o.sha256)
+                    .map_err(|why| crate::err::Refusal {
+                        code: Code::OBJECT_CORRUPT,
+                        detail: format!("object verification changed while planning: {why}"),
+                    })?;
+                (record, Presence::Rehashed)
+            }
+        },
+    };
+    if record.length != o.length {
+        return refuse(
+            Code::LENGTH_MISMATCH,
+            "declared object length differs from verified bytes",
+        );
     }
-    // The record could not vouch. One rehash decides, and a disagreement is removed by
-    // `verify` itself — which is what frees the id for the re-fetch below.
-    match store.verify(&o.sha256)? {
-        Verdict::Verified { .. } | Verdict::Invalidated { .. } => Ok(Presence::Rehashed),
-        Verdict::CorruptRemoved { why } => Ok(Presence::CorruptRemoved { why }),
-    }
+    Ok(presence)
 }
 
 impl FetchPlan {
@@ -644,6 +658,45 @@ mod tests {
             Code::SIZE_CAP
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wrong_reference_lengths_refuse_without_removing_verified_bytes() {
+        let root = temporary("wrong-reference-length");
+        let (store, manifest, header, manifest_bytes) = fixture(&root);
+        let wrong_manifest = ObjectRef {
+            length: manifest.length + 1,
+            ..manifest.clone()
+        };
+        assert_eq!(
+            FetchPlan::of(
+                &store,
+                "wrong-manifest",
+                &wrong_manifest,
+                std::slice::from_ref(&header)
+            )
+            .unwrap_err()
+            .code,
+            Code::LENGTH_MISMATCH
+        );
+        assert_eq!(
+            fs::read(store.manifest_path(&manifest.sha256)).unwrap(),
+            manifest_bytes
+        );
+        let wrong_blob = ObjectRef {
+            length: header.length + 1,
+            ..header.clone()
+        };
+        assert_eq!(
+            FetchPlan::of_objects(&store, "wrong-blob", &[wrong_blob])
+                .unwrap_err()
+                .code,
+            Code::LENGTH_MISMATCH
+        );
+        assert!(store.record_valid(&header.sha256).is_ok());
+        let (plan, _) = FetchPlan::of(&store, "still-valid", &manifest, &[header]).unwrap();
+        assert!(plan.wanted.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

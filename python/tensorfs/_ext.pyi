@@ -83,6 +83,8 @@ class PreparedModelSource(TypedDict):
     converted_roles: int
     resumed_roles: int
     deferred_ops: int
+    converted_bytes: int
+    largest_op_bytes: int
 
 class ManifestRow(TypedDict):
     manifest_id: str
@@ -359,6 +361,9 @@ class Operation:
 
 class DerivedWriter:
     def sources(self) -> list[Any]: ...
+    def completed_parts(self) -> list[tuple[str, str, str]]: ...
+    def completed_configs(self) -> list[str]: ...
+    def checkpoint(self, operation_id: str, slot: str, *, previous: tuple[str, int] | None = None) -> dict[str, str | int | None]: ...
     def source_read_into(
         self, source: str, component: str, key: str, role: str, off: int, into: object
     ) -> None: ...
@@ -462,15 +467,16 @@ class Store:
         *,
         checkpoints: Sequence[tuple[str, str, int]] = ...,
     ) -> PreparedModelSource: ...
-    def source_checkpoint_page(
+    def checkpoint_page(
         self, head_id: str, head_length: int, *, operation_id: str, slot: str,
         plan_digest: str, offset: int = 0, limit: int = 128,
     ) -> SourceCheckpointPage: ...
-    def source_checkpoint_push(
+    def checkpoint_push(
         self, object_id: str, length: int, manifest: bool, grant: str, *, allow_local: bool = False,
     ) -> dict[str, int | bool]: ...
-    def source_checkpoint_fetch(
+    def checkpoint_fetch(
         self, object_id: str, length: int, manifest: bool, url: str, *, allow_local: bool = False,
+        derived_restore: tuple[str, int] | None = None,
     ) -> dict[str, int | bool]: ...
     def model_source_operations(self) -> list[str]: ...
     def release_model_source(self, operation_id: str) -> None: ...
@@ -485,8 +491,12 @@ class Store:
     ) -> dict[str, Any]: ...
     def derived_declaration(
         self, sources: dict[str, Any], targets: dict[str, Any], configs: dict[str, Any],
-        order: Sequence[tuple[str, str]], max_new_bytes: int,
+        order: Sequence[tuple[str, str]], max_new_bytes: int, *, work_fingerprint: str,
     ) -> bytes: ...
+    def validate_derived_checkpoint(
+        self, transaction_id: str, declaration: bytes, head_id: str, head_length: int, *,
+        operation_id: str, slot: str, plan_digest: str,
+    ) -> None: ...
     def begin_derived(
         self,
         transaction_id: str,
@@ -496,6 +506,9 @@ class Store:
         configs: dict[str, Any],
         order: Sequence[tuple[str, str]],
         max_new_bytes: int,
+        *,
+        work_fingerprint: str,
+        checkpoint: tuple[str, int] | None = None,
     ) -> DerivedWriter: ...
     def derived_lookup(self, transaction_id: str) -> dict[str, Any]: ...
     def derived_fence(self, transaction_id: str, writer_session_id: int) -> bool: ...
