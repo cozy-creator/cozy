@@ -69,7 +69,7 @@ func (s *Store) BlockRetainedWork(id, code, detail string) (bool, *exit.Error) {
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(`UPDATE requests SET state='blocked' WHERE id=? AND retain_work=1
-		AND state IN ('submitted','queued','dispatching','requeue_pending','finalizing')`, id)
+		AND state IN ('submitted','queued','dispatching','requeue_pending','finalizing','pausing','paused')`, id)
 	if err != nil {
 		return false, exit.Internalf("cannot retain failed work: %s", err)
 	}
@@ -98,10 +98,8 @@ func (s *Store) RequestPause(id, actor string) (string, *exit.Error) {
 	defer tx.Rollback()
 	var state, kind string
 	var retain bool
-	var open int
-	if err := tx.QueryRow(`SELECT state,kind,retain_work,(SELECT COUNT(*) FROM attempts
-		WHERE request_id=r.id AND state IN (`+openAttemptStates+`)) FROM requests r WHERE id=?`, id).
-		Scan(&state, &kind, &retain, &open); err != nil {
+	if err := tx.QueryRow(`SELECT state,kind,retain_work FROM requests WHERE id=?`, id).
+		Scan(&state, &kind, &retain); err != nil {
 		if err == sql.ErrNoRows {
 			return "", exit.New(exit.NotFound, "request %s is absent", id)
 		}
@@ -117,9 +115,6 @@ func (s *Store) RequestPause(id, actor string) (string, *exit.Error) {
 		return "", exit.Named(exit.Conflict, "request.pause_refused", "request %s cannot pause from %s", id, state)
 	}
 	next := "pausing"
-	if open == 0 {
-		next = "paused"
-	}
 	if _, err := tx.Exec(`UPDATE requests SET state=?,control_revision=control_revision+1 WHERE id=?`, next, id); err != nil {
 		return "", exit.Internalf("cannot record pause: %s", err)
 	}
@@ -139,7 +134,8 @@ func (s *Store) CompleteRequestPause(id string) (bool, *exit.Error) {
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(`UPDATE requests SET state='paused' WHERE id=? AND state='pausing'
-		AND NOT EXISTS(SELECT 1 FROM attempts WHERE request_id=? AND state IN (`+openAttemptStates+`))`, id, id)
+		AND NOT EXISTS(SELECT 1 FROM attempts WHERE request_id=? AND state IN (`+openAttemptStates+`))
+		AND NOT EXISTS(SELECT 1 FROM request_model_transfers WHERE request_id=? AND state='materializing')`, id, id, id)
 	if err != nil {
 		return false, exit.Internalf("cannot finish pause: %s", err)
 	}

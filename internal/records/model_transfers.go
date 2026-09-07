@@ -309,7 +309,8 @@ func (s *Store) ModelTransfersOwed() ([]ModelTransfer, *exit.Error) {
 
 func (s *Store) BeginModelTransferMaterialization(requestID string) *exit.Error {
 	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='materializing',updated_at=?
-		WHERE request_id=? AND state IN ('pending','materializing','materialized')`, now(), requestID)
+		WHERE request_id=? AND state IN ('pending','materializing','materialized')
+		AND EXISTS(SELECT 1 FROM requests WHERE id=? AND state IN ('submitted','queued'))`, now(), requestID, requestID)
 	if err != nil {
 		return exit.Internalf("cannot begin model transfer materialization: %s", err)
 	}

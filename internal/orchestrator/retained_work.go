@@ -177,7 +177,9 @@ func (c *Orchestrator) PauseRequest(id, actor string) *exit.Error {
 	}
 	c.forget(id)
 	if state == "pausing" {
-		return c.stopRetainedAttempt(id, pb.CancelReason_CANCEL_REASON_DRAIN)
+		problem := c.stopRetainedAttempt(id, pb.CancelReason_CANCEL_REASON_DRAIN)
+		c.retryRetainedPause(id)
+		return problem
 	}
 	return nil
 }
@@ -200,8 +202,31 @@ func (c *Orchestrator) stopRetainedAttempt(id string, reason pb.CancelReason) *e
 			}
 		}
 	}
+	c.mu.Lock()
+	preparing := c.transferDispatching[id] || c.transferRunning[id] || c.localTransfers[id] != nil || c.checkpointUploads[id] != nil
+	c.mu.Unlock()
+	if preparing {
+		return nil
+	}
 	_, problem = c.opt.Store.CompleteRequestPause(id)
 	return problem
+}
+
+func (c *Orchestrator) retryRetainedPause(id string) {
+	c.mu.Lock()
+	closing := c.closing
+	c.mu.Unlock()
+	if closing {
+		return
+	}
+	time.AfterFunc(ReportCadence, func() {
+		request, problem := c.opt.Store.RequestRow(id)
+		if problem != nil || request == nil || request.State != "pausing" {
+			return
+		}
+		_ = c.stopRetainedAttempt(id, pb.CancelReason_CANCEL_REASON_DRAIN)
+		c.retryRetainedPause(id)
+	})
 }
 
 func (c *Orchestrator) ResumeRequest(id, actor string) *exit.Error {
@@ -241,6 +266,7 @@ func (c *Orchestrator) restoreRetainedWork() *exit.Error {
 			if problem := c.stopRetainedAttempt(request.ID, pb.CancelReason_CANCEL_REASON_DRAIN); problem != nil {
 				c.logf("request %s pause recovery: %s", request.ID, problem.Message)
 			}
+			c.retryRetainedPause(request.ID)
 		}
 		if request.RetainWork && (request.State == "canceling" || request.State == "releasing") {
 			go c.finishRetainedCancellation(request.ID)
