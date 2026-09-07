@@ -1488,9 +1488,10 @@ fn adopt_source_checkpoint(
             super::journal::install(dir, plan_hex, &bytes)?;
             *journal = super::journal::Journal::open(dir, plan_hex)?;
         }
-        // checkpoint verifies every referenced object before returning its new head.
-        // The root owns those parts independently of the predecessor's chain.
-        transaction::name_candidates(store.root(), operation, &journal.objects())?;
+        // GC already discovers every part through this operation's installed journal.
+        // Keep only checkpoint documents in the small session root; duplicating the
+        // complete tensor roster there exceeds its independent metadata bound.
+        // checkpoint verifies every part before returning the new head.
         durability::checkpoint(
             store,
             &durability::Policy {
@@ -1867,6 +1868,99 @@ mod tests {
                 .contains(&request.operation_id));
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn large_source_adoption_retains_journal_parts_without_expanding_the_session_root() {
+        let root = temporary("source-adoption-large-roster");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.safetensors");
+        let keys: Vec<_> = (0..1024).map(|i| format!("weight_{i:04}")).collect();
+        let mut header = Vec::new();
+        let mut payload = Vec::new();
+        for (index, key) in keys.iter().enumerate() {
+            let start = payload.len();
+            for _ in 0..128 {
+                payload.extend_from_slice(&(index as u32).to_le_bytes());
+            }
+            header.push(format!(
+                "{key:?}:{{\"data_offsets\":[{start},{}],\"dtype\":\"F32\",\"shape\":[128]}}",
+                payload.len()
+            ));
+        }
+        let header = format!("{{{}}}", header.join(","));
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&payload);
+        fs::write(&path, &bytes).unwrap();
+        let (entry, mut profile) = banked(
+            "model",
+            "provider/large.safetensors",
+            &path,
+            "fixture/large/1",
+            "plain/1",
+        );
+        profile.components[0].variants[0].construction_order = keys;
+        let mut registry = FingerprintRegistry::default();
+        registry.merge(entry);
+        registry.merge_source_profile(profile);
+        let registry = registry.to_bytes();
+        let store = Store::init(&root.join("store")).unwrap();
+        let mut request = PrepareModelSource {
+            operation_id: "large-source-original".into(),
+            source_selection_digest: format!("sha256:{}", "12".repeat(32)),
+            profiles: vec![ModelSourceProfile {
+                slot: "source".into(),
+                profile: "fixture/large/1".into(),
+            }],
+            roster: vec![VerifiedModelSourceFile {
+                member: "provider/large.safetensors".into(),
+                object_id: ObjectRef::of(&bytes).id(),
+                length: bytes.len() as u64,
+                path: path.clone(),
+                header: header_prefix(&bytes),
+            }],
+            landed: vec!["provider/large.safetensors".into()],
+            checkpoints: Vec::new(),
+            adopt_from_operation_id: None,
+        };
+        let first =
+            prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
+                .unwrap();
+        assert!(first.complete);
+        assert_eq!(first.converted_roles, 1024);
+        let original = request.operation_id.clone();
+        request.operation_id = "large-source-edited".into();
+        request.adopt_from_operation_id = Some(original.clone());
+        request.checkpoints = first
+            .checkpoints
+            .iter()
+            .map(|item| (item.slot.clone(), item.head.head.clone().unwrap()))
+            .collect();
+        request.landed.clear();
+        fs::remove_file(path).unwrap();
+        let adopted =
+            prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
+                .unwrap();
+        assert!(adopted.complete);
+        assert_eq!(adopted.sources, first.sources);
+        assert_eq!(adopted.converted_bytes, 0);
+        assert_eq!(adopted.converted_roles, 0);
+        let candidate = transaction::read_session(store.root(), &request.operation_id).unwrap();
+        assert!(
+            candidate.candidates.len() < 100,
+            "tensor parts belong in the journal, not a duplicate root roster"
+        );
+        release_model_source(&store, &original).unwrap();
+        crate::gc::collect(store.root(), false).unwrap();
+        validate_prepared_result(&store, &adopted.sources[0]).unwrap();
+        let replay =
+            prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
+                .unwrap();
+        assert!(replay.replayed && replay.complete);
+        assert_eq!(replay.converted_bytes, 0);
+        release_model_source(&store, &request.operation_id).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
