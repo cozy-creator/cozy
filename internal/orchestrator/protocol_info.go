@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -14,6 +15,8 @@ import (
 // PodHost returns its intersection with the actual Runtime; a local worker is
 // queried directly on the same RuntimePreparation service.
 func probeWorkerProtocol(ctx context.Context, connection grpc.ClientConnInterface, remote bool) *exit.Error {
+	ctx, cancel := context.WithTimeout(ctx, hub.Timeout)
+	defer cancel()
 	var info *pb.ProtocolInfoResult
 	var err error
 	if remote {
