@@ -1761,9 +1761,11 @@ func (s *Store) Closed(requestID string, attempt int64) *exit.Error {
 // Recover marks an attempt the worker reported on Register as an OPEN OBLIGATION. While
 // it is open, NextOrdinal refuses for that request id — the whole point of the
 // recovered-journal handshake.
+// An already-acknowledged terminal stays closed: retained custody or a lost ACK
+// may require another reply, but cannot erase the owner's completed ACK decision.
 func (s *Store) Recover(requestID string, attempt int64, sessionID string) *exit.Error {
 	res, err := s.db.Exec(`UPDATE attempts SET
-		state=CASE WHEN terminal_digest<>'' THEN 'terminal' ELSE 'recovered_open' END,
+		state=CASE WHEN state='closed' THEN 'closed' WHEN terminal_digest<>'' THEN 'terminal' ELSE 'recovered_open' END,
 		session_id=? WHERE request_id=? AND attempt=?
 		AND state IN ('preparing','offered','accepted','recovered_open','terminal','closed')`,
 		sessionID, requestID, attempt)

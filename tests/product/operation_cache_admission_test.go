@@ -33,6 +33,7 @@ func TestOperationCacheDeclineAcknowledgesSuccessfulResult(t *testing.T) {
 	must(t, err)
 	pod := &fakePod{controlKey: public}
 	var calls, acknowledgements atomic.Int64
+	replay := make(chan func() error, 1)
 	const id = "req-cache-admission-declined"
 	invocation, _ := canonical.Raw(childDigest("1"))
 	body, digest, err := canonical.Identity(&pb.AttemptOutcomeBody{RequestId: id, AttemptOrdinal: 1,
@@ -45,17 +46,26 @@ func TestOperationCacheDeclineAcknowledgesSuccessfulResult(t *testing.T) {
 		if call.RequestId != id || call.OutcomeId != "out-cache-declined" || !bytes.Equal(call.OutcomeDigest, digest) {
 			t.Error("cache record changed original result provenance")
 		}
-		if calls.Add(1) == 1 {
+		count := calls.Add(1)
+		if count == 1 {
 			return nil, status.Error(codes.Unavailable, "controlled journal outage")
+		}
+		if count > 2 {
+			return nil, status.Error(codes.FailedPrecondition, "settled source already compacted")
 		}
 		return &pb.RecordOperationResultResult{ComputationDigest: call.ComputationDigest, Recorded: false}, nil
 	}
 	pod.onFrame = func(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) error) (bool, error) {
 		if ack := frame.GetSnapshotAck(); ack != nil {
-			return false, send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptOutcome{AttemptOutcome: &pb.AttemptOutcome{
+			outcome := &pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptOutcome{AttemptOutcome: &pb.AttemptOutcome{
 				RecordOwnerEpoch: ack.RecordOwnerEpoch, ControlStreamEpoch: ack.ControlStreamEpoch, WorkerBootId: ack.WorkerBootId,
 				RequestId: id, AttemptOrdinal: 1, InvocationSpecDigest: invocation, OutcomeId: "out-cache-declined",
-				OutcomeDigest: digest, OutcomeCanonicalBytes: body}}})
+				OutcomeDigest: digest, OutcomeCanonicalBytes: body}}}
+			select {
+			case replay <- func() error { return send(outcome) }:
+			default:
+			}
+			return false, send(outcome)
 		}
 		if ack := frame.GetOutcomeAck(); ack != nil && ack.RequestId == id {
 			if calls.Load() < 2 || ack.OutcomeId != "out-cache-declined" || !bytes.Equal(ack.OutcomeDigest, digest) {
@@ -66,7 +76,7 @@ func TestOperationCacheDeclineAcknowledgesSuccessfulResult(t *testing.T) {
 		return false, nil
 	}
 	connection, _ := startFakePod(t, t.TempDir(), pod)
-	o := hostOwner(t, "operation-cache-decline", rentalWiring(connection, private))
+	o := hostOwner(t, "operation-cache-decline-"+records.NewID("proof"), rentalWiring(connection, private))
 	instance := (orchestrator.WorkerLaunchSpec{Connection: connection}).InstanceID()
 	fatal(t, o.store.SpawnWorker(records.WorkerProcess{InstanceID: instance, WorkerID: podWorkerID}))
 	request, _, problem := o.store.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: childDigest("2"),
@@ -84,6 +94,16 @@ func TestOperationCacheDeclineAcknowledgesSuccessfulResult(t *testing.T) {
 	_, _, _, problem = o.c.EnsureRental(podRental)
 	fatal(t, problem)
 	waitUntil(t, "uncached success receives its original ACK", func() bool { return acknowledgements.Load() > 0 })
+	waitUntil(t, "the original outcome closure is durable", func() bool {
+		row, problem := o.store.AttemptRow(id, 1)
+		fatal(t, problem)
+		return row.State == "closed"
+	})
+	fatal(t, o.store.Recover(id, 1, podBootID))
+	// A delayed duplicate may outlive the workspace's acknowledged source row.
+	// Creator already completed cache admission, so only its exact ACK is replayed.
+	must(t, (<-replay)())
+	waitUntil(t, "historical terminal replays only its ACK", func() bool { return acknowledgements.Load() == 2 })
 	current, problem := o.store.RequestRow(request.ID)
 	fatal(t, problem)
 	if current.State != "succeeded" || current.Ordinal != 1 || calls.Load() != 2 {

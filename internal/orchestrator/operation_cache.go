@@ -27,6 +27,13 @@ func operationCacheProblem(err error) *exit.Error {
 // Cache completion precedes OutcomeAck: the workspace still has the actual terminal
 // to verify, including scalar results whose ordinary ACK releases that journal.
 func (c *Orchestrator) recordOperationResult(s *session, request records.Request, attempt records.Attempt) *exit.Error {
+	// Closed follows the cache decision and queues its ACK; it does not prove
+	// delivery. Historical replay therefore resends only the ACK, even if the
+	// workspace compacted its source. ClosedAt timestamps terminal acceptance
+	// before this decision, so only the preserved closed state is this marker.
+	if attempt.State == "closed" {
+		return nil
+	}
 	if !request.ChildReusable || request.ParentRequestID == "" || request.ReusedFrom != "" || attempt.TerminalStatus != "SUCCEEDED" || request.State == "canceling" || request.State == "canceled" || request.State == "releasing" {
 		return nil
 	}
