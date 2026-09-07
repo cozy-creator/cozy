@@ -675,6 +675,65 @@ func preparedRemotePlacement(w *worker, pkg, release string) (DesiredPlacement, 
 	return DesiredPlacement{}, false, nil
 }
 
+// preparedPlacementServes answers whether the set this rental last converged to already
+// binds the request's function to the request's exact models (h3a-018): the placement for
+// the package release names the function, and every slot the pod bound for it references
+// the manifest the request pins for that slot. A request that is served by what the pod
+// holds issues no package prepare — the prepare it would issue authors the same bytes and
+// costs the pod a full materialization (28 s measured, for zero new bytes) — and reaches
+// dispatch through the ordinary ready wait. A refused or failed desire is never "held".
+func preparedPlacementServes(w *worker, logical LogicalPackage) bool {
+	if w == nil || w.refusal != nil || w.desiredRefusal != nil || len(logical.Models) == 0 {
+		return false
+	}
+	desired, found, problem := preparedRemotePlacement(w, logical.Package, logical.Release)
+	if problem != nil || !found {
+		return false
+	}
+	if observed, ok := w.observedRemote[desired.PlacementIDValue]; ok &&
+		observed.materialization == pb.MaterializationState_MATERIALIZATION_STATE_FAILED {
+		return false
+	}
+	doc, err := canonical.Read(w.setBytes, &pb.PlacementSet{})
+	if err != nil {
+		return false
+	}
+	pinned := make(map[string]string, len(logical.Models))
+	for _, model := range logical.Models {
+		if !model.Pinned() {
+			return false
+		}
+		pinned[model.Slot] = model.Manifest
+	}
+	for _, row := range doc.List("placements") {
+		if row.Str("placement_id") != desired.PlacementIDValue {
+			continue
+		}
+		manifests := map[string]string{}
+		for _, model := range row.List("models") {
+			manifests[model.Str("id")] = model.Sub("manifest").Str("digest")
+		}
+		for _, entrypoint := range row.List("entrypoints") {
+			if entrypoint.Str("name") != logical.Function {
+				continue
+			}
+			slots := entrypoint.List("slots")
+			if len(slots) != len(pinned) {
+				return false
+			}
+			for _, slot := range slots {
+				path := logical.Function + ".models." + slot.Str("slot")
+				held := manifests[slot.Str("reference_model_id")]
+				if held == "" || pinned[path] != held {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+
 // admissible answers the worker-level half. CLOSED is STRUCTURAL (pre-snapshot-barrier,
 // draining, mid-cutover); OPEN with zero seats is TRANSIENT saturation — both refuse under
 // CAUSE_CODE_NO_CAPACITY at the worker, and an owner backs off differently for each
