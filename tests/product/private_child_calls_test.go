@@ -138,10 +138,19 @@ func TestPrivateChildBindingsAreImmutableAndOwnTheirImplementation(t *testing.T)
 	if problem := store.RecordChildBindings([]records.ChildBinding{binding}); problem == nil {
 		t.Fatal("captured dependency accepted a replacement implementation")
 	}
+	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
+	completed, _, problem := store.Submit(records.Request{ID: "req-bound-result", IdemKey: "bound-result", Kind: "job", Package: child.Package, Entrypoint: "compute", Payload: []byte(`{}`), BodyDigest: childDigest("1"), InstallID: child.ID})
+	fatal(t, problem)
+	closeChild(t, store, completed, "SUCCEEDED", "succeeded")
 	forgotten, problem := store.ForgetIfUnreferenced(child.ID)
 	fatal(t, problem)
 	if forgotten {
 		t.Fatal("GC discarded an implementation still owned by a parent interface")
+	}
+	completedRow, problem := store.RequestRow(completed.ID)
+	fatal(t, problem)
+	if completedRow.InstallID != child.ID {
+		t.Fatal("rejected GC severed a completed child's exact result schema")
 	}
 	held, problem := store.LocalPackageInUse(binding.LocalRevisionDigest, "local/ignored", "1.0.0", childDigest("c"))
 	fatal(t, problem)

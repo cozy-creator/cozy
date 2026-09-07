@@ -139,6 +139,7 @@ func (c *Orchestrator) sendChildResult(s *session, call *pb.ChildCallRequest, ch
 		ParentRequestId: call.ParentRequestId, ParentAttemptOrdinal: call.ParentAttemptOrdinal, ParentInvocationSpecDigest: call.ParentInvocationSpecDigest,
 		CallIndex: call.CallIndex, IntentDigest: call.IntentDigest, ChildRequestId: child, State: state, ResultCanonicalBytes: result}
 	if problem != nil {
+		frame.ResultCanonicalBytes = nil
 		frame.SafeCode = problem.ErrName()
 		frame.SafeDetail = problem.Message
 		if len(frame.SafeDetail) > 1024 {

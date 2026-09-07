@@ -74,6 +74,9 @@ func childArtifacts(raw []byte, paths [][]string) (map[string]records.ModelArtif
 }
 
 func (c *Orchestrator) childResultArtifacts(request records.Request, raw []byte) (map[string]records.ModelArtifact, *exit.Error) {
+	if !request.ChildArtifacts && (request.WeightsOutputs == "" || request.WeightsOutputs == "[]") {
+		return nil, nil
+	}
 	resolver, ok := c.opt.Packages.(interface {
 		PrivateArtifactPaths(records.Request) ([][]string, *exit.Error)
 	})
