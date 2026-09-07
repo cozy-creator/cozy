@@ -17,7 +17,7 @@ import (
 
 func operationCacheProblem(err error) *exit.Error {
 	switch status.Code(err) {
-	case codes.InvalidArgument, codes.PermissionDenied, codes.FailedPrecondition:
+	case codes.InvalidArgument, codes.PermissionDenied, codes.FailedPrecondition, codes.Unimplemented:
 		return exit.Named(exit.Structural, "operation.cache_refused", "worker operation cache refused its captured identity")
 	default:
 		return exit.Unavailablef("worker operation cache is temporarily unavailable")
@@ -67,9 +67,6 @@ func (c *Orchestrator) recordOperationResult(s *session, request records.Request
 		return problem
 	}
 	answer, err := workspace.RecordOperationResult(s.ctx, &pb.RecordOperationResultCall{Claim: s.claim, ComputationDigest: keyBytes, RequestId: request.ID, AttemptOrdinal: uint64(attempt.Attempt), InvocationSpecDigest: invocation, OutcomeId: attempt.TerminalID, OutcomeDigest: outcome})
-	if status.Code(err) == codes.Unimplemented {
-		return nil
-	}
 	if err != nil {
 		return operationCacheProblem(err)
 	}
@@ -77,7 +74,7 @@ func (c *Orchestrator) recordOperationResult(s *session, request records.Request
 		return exit.Named(exit.Structural, "operation.cache_changed", "worker operation cache changed the completed computation identity")
 	}
 	if !answer.Recorded {
-		return exit.Unavailablef("worker operation cache has not committed the completed result")
+		c.logf("%s completed without memoization: the workspace declined this optional cache entry", request.ID)
 	}
 	return nil
 }
@@ -154,9 +151,6 @@ func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOn
 		return false, problem
 	}
 	answer, err := workspace.LookupOperation(s.ctx, &pb.LookupOperationCall{Claim: s.claim, ComputationDigest: keyBytes, ConsumerRequestId: request.ID})
-	if status.Code(err) == codes.Unimplemented {
-		return false, c.opt.Store.CompleteOperationMiss(request.ID, key)
-	}
 	if err != nil {
 		return false, operationCacheProblem(err)
 	}
