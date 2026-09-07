@@ -22,7 +22,7 @@ func TestPrivateTransactionPauseFencesAttemptBeforeResume(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	pod := &fakePod{controlKey: public, serve: true, jobReady: true}
-	peer := &privateAttemptPeer{release: make(chan struct{}), canceled: make(chan struct{}, 1)}
+	peer := &privateAttemptPeer{release: make(chan struct{}), canceled: make(chan struct{})}
 	t.Cleanup(func() { peer.releaseOnce.Do(func() { close(peer.release) }) })
 	pod.onFrame = peer.frame
 	pod.onJobReady = func(frame *pb.WorkerFrame, send func(*pb.WorkerFrame) error) error {
@@ -139,6 +139,7 @@ type privateAttemptPeer struct {
 	release     chan struct{}
 	canceled    chan struct{}
 	releaseOnce sync.Once
+	cancelOnce  sync.Once
 }
 
 func (p *privateAttemptPeer) frame(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) error) (bool, error) {
@@ -167,16 +168,14 @@ func (p *privateAttemptPeer) frame(frame *pb.RecordOwnerFrame, send func(*pb.Wor
 		}
 		offer := p.offers[0]
 		p.mu.Unlock()
-		select {
-		case p.canceled <- struct{}{}:
-		default:
-			return true, nil
-		}
-		go func() {
-			<-p.release
-			_ = send(privateAttemptOutcome(offer, pb.OutcomeStatus_OUTCOME_STATUS_CANCELED,
-				pb.CauseCode_CAUSE_CODE_DRAIN_CANCEL, pb.CauseOrigin_CAUSE_ORIGIN_RECORD_OWNER))
-		}()
+		p.cancelOnce.Do(func() {
+			close(p.canceled)
+			go func() {
+				<-p.release
+				_ = send(privateAttemptOutcome(offer, pb.OutcomeStatus_OUTCOME_STATUS_CANCELED,
+					pb.CauseCode_CAUSE_CODE_DRAIN_CANCEL, pb.CauseOrigin_CAUSE_ORIGIN_RECORD_OWNER))
+			}()
+		})
 		return true, nil
 	}
 	if ack := frame.GetOutcomeAck(); ack != nil {
