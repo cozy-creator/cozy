@@ -81,6 +81,13 @@ func TestProductPath(t *testing.T) {
 	// THE DEFAULT LOCATION (cl-090): no --out, and the run still says where the file is —
 	// the package's own store, `outputs/<org>-<package>/<content digest>.<ext>`.
 	storeDir := filepath.Join(root, "outputs", "local-cozy-weightless-package")
+	code, scalar := runCozy(t, root, "run", localWeightlessRef+"/echo", "why=Polo", "--await")
+	if code != 0 || !strings.Contains(scalar, "Polo") {
+		t.Fatalf("scalar-only invocation failed [exit %d]\n%s", code, scalar)
+	}
+	if _, err := os.Stat(storeDir); !os.IsNotExist(err) {
+		t.Fatalf("scalar-only local run created an output directory: %v", err)
+	}
 	code, stdout, stderr := runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "--await")
 	if code != 0 {

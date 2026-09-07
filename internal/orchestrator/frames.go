@@ -1651,9 +1651,6 @@ func outputDest(req records.Request, dir string, entry canonical.Doc) (string, *
 func (c *Orchestrator) fetchOutputs(req records.Request, attempt uint64,
 	list []canonical.Value, dir string, holder *worker) *exit.Error {
 	slot := media.Slot(req.ID, attempt)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return exit.Internalf("cannot create the local mirror directory %s: %s", dir, err)
-	}
 	for _, item := range list {
 		entry, ok := item.(map[string]canonical.Value)
 		if !ok {
