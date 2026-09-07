@@ -222,12 +222,37 @@ weights-read return plane; local-only sources under `--rental` remain local.
 
 ## Run packages and jobs
 
-Private scripts expose one registered App callable and declare dependencies with PEP 723
-inline metadata. They use the same package preparation and execution path:
+Private scripts define ordinary `main()` or `main(ctx)`, synchronous or asynchronous.
+They need no App, request/result class, published package, or separate install command.
+Dependencies may be declared with PEP 723 inline metadata:
+
+```python
+# /// script
+# requires-python = ">=3.12,<3.13"
+# dependencies = []
+# ///
+
+async def main(ctx):
+    ctx.log("Starting my experiment")
+    ctx.raise_if_cancelled()
+    # Call your imported operations and write ordinary Python control flow here.
+    ctx.progress(1.0, stage="complete")
+```
+
+The optional context supplies cancellation, logs, progress and metrics. Discovery checks the
+script's syntax without importing it on the client; its captured code executes on the worker.
+Generator entrypoints are refused rather than reported as completed without running their body.
 
 ```sh
 cozy run ./experiment.py --rental-only --await
-# After failure, edit the script or one of its declared local libraries:
+# Edit the script or its declared local libraries, then start a fresh run:
+cozy run ./experiment.py --rental-only --await
+```
+
+To explicitly continue development on an earlier run's retained machine and record that
+relationship, use the optional retry handle:
+
+```sh
 cozy run ./experiment.py --retry <prior-run-id> --rental-only --await
 ```
 
@@ -240,7 +265,8 @@ from their package repositories. Ordinary Python edits do not rebuild the worker
 
 Failed private jobs keep their resumable work and rental. `cozy run pause <id>` stops execution
 while retaining that state; `cozy run resume <id>` runs the exact captured revision again.
-Use `--retry` when changing code or parameters. `cozy run cancel <id>` abandons the retained
+Changed code or parameters are captured by a new run, optionally linked with `--retry`.
+`cozy run cancel <id>` abandons the retained
 work, releasing only resources with no other owner. Retained rentals continue billing.
 An unchanged deterministic failure is not automatically retried. `--await` returns when a
 transaction blocks or pauses, and the ordinary run view explains the stopped state.
@@ -251,10 +277,11 @@ result types. Calling it creates an ordinary managed child job. A reusable compu
 opts in with `@invocable(reusable=True)` and registers through `app.job(function)`.
 Arbitrary helper functions and external effects do not become cached operations.
 
-On an edited retry, a reusable child can acquire an earlier successful result when its
+On the private worker, a reusable child can acquire an earlier successful result when its
 exact implementation closure, entrypoint, canonical inputs, resolved model checkpoints,
-and measured numerical environment match. This works independently of the parent's
-script digest or the call's position. Native model results travel as `ModelArtifact`
+and measured numerical environment match. A fresh script can reuse this work without a retry
+ID. Run IDs, the parent's script digest and call position are not computation cache keys.
+Native model results travel as `ModelArtifact`
 references; reuse acquires independent native custody before the new result is visible.
 The reference names its original producer and receipt without copying tensor bytes.
 
@@ -265,10 +292,30 @@ Source ingestion already has its own exact source/profile identity, so changing 
 producer does not invalidate its retained source conversion. No system can infer that
 arbitrary Python side effects are reversible or safe to repeat.
 
-Scalar compositions can run locally. Weight-producing child jobs require `--rental-only`
+Scalar compositions can run locally; this first implementation's shared operation cache is
+on the private Host, so local scalar calls compute normally. Weight-producing child jobs require `--rental-only`
 and the private worker's native Host custody. A completed result stored only on that
 machine continues holding the rental until its owner releases it; completion alone does
 not make those bytes remotely durable. Parent and child attempts retain separate history.
+The worker may retain reusable results under an independent cache hold. Canceling a producing
+run releases its own holds; cache or other consumer holds may keep those bytes available.
+Cache holds alone do not keep paid capacity alive, and evicted or missing results compute again.
+The cache records original result provenance without inventing another compute attempt.
+
+For editable libraries, declare paths explicitly in the same script metadata:
+
+```python
+# /// script
+# dependencies = ["my-algorithm"]
+# [tool.uv.sources]
+# my-algorithm = {path = "./my-algorithm", editable = true}
+# ///
+```
+
+Each run captures current declared source bytes, including library edits made without a
+version bump. Source changes never mutate an already active or captured attempt. An ordinary
+library call runs inside its caller; only operations participating in the managed memoization
+contract reuse completed computation.
 
 Serving entrypoints and bounded jobs use the same command. Cozy reads the installed package interface
 to determine the callable lifecycle:
