@@ -312,6 +312,7 @@ type RunExecuteCmd struct {
 	Rental         bool     `help:"Run on a Creator-managed rental."`
 	RentalOnly     bool     `help:"Require a remote rental even when local capacity is ready."`
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`
+	Retry          string   `help:"Retry with current code while retaining compatible work from this prior run."`
 	Trees          []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
 	Org            string   `help:"Job publication organization (defaults to local)."`
 	PublishTo      string   `help:"Store the job's declared weight outputs as checkpoints in org/model; no release is created."`
@@ -328,7 +329,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--rental-only", c.RentalOnly, "--describe", c.Describe, "--dry-run", c.DryRun), values(
 		"--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets,
-		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org,
+		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
 		"--publish-to", c.PublishTo, "--source-profile", c.SourceProfiles), !c.DryRun && !c.Describe)
 }
 

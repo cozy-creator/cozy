@@ -54,6 +54,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	}
 
 	sub := api.JobSubmission{Package: target.Package, Function: target.Function, Input: input,
+		RetainWork: strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
 		RentalRequired: ctx.Inv.Bool("--rental-only")}
@@ -138,6 +139,15 @@ func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Er
 	rec.Next = []string{
 		"cozy run watch " + reference,
 		"cozy run cancel " + reference,
+	}
+	if state.RetainWork {
+		if state.Status == "paused" {
+			rec.Next = append(rec.Next, "cozy run resume "+reference)
+		} else if state.Status == "blocked" {
+			rec.Next = append(rec.Next, "cozy run <updated-script-or-package> --retry "+reference)
+		} else if state.Status != "pausing" {
+			rec.Next = append(rec.Next, "cozy run pause "+reference)
+		}
 	}
 	return emit(ctx, rec)
 }

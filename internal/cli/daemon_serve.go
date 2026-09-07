@@ -129,7 +129,16 @@ func serveDaemon(ctx *Context) *exit.Error {
 		RentalFleet:        fleet.status, AcquireManagedRental: fleet.acquire,
 		ReleaseManagedRental: fleet.release,
 		ModelTransfers:       transfers,
-		ReportReleaseDefect:  defects.report,
+		ReclaimInstall: func(id string) *exit.Error {
+			writer, problem := install.Lock(l)
+			if problem != nil {
+				return problem
+			}
+			defer writer.Unlock()
+			_, problem = install.Reclaim(l, st, id)
+			return problem
+		},
+		ReportReleaseDefect: defects.report,
 	})
 	if e != nil {
 		closeListeners()

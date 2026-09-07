@@ -106,6 +106,9 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		return exit.Usagef("--dry-run and --await conflict")
 	}
 	if callable.Kind != "job" {
+		if ctx.Inv.Value("--retry") != "" {
+			return exit.Usagef("--retry applies only to job transactions")
+		}
 		if ctx.Inv.Value("--publish-to") != "" || len(ctx.Inv.Values["--source-profile"]) > 0 || ctx.Inv.Bool("--dry-run") {
 			return exit.Usagef("--publish-to, --source-profile, and --dry-run apply only to job callables")
 		}
