@@ -73,6 +73,29 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		refuse(exit.Named(exit.Conflict, "child.intent_changed", "child intent digest does not match its exact target and input"))
 		return
 	}
+	priorCalls, problem := c.opt.Store.Children(parent.ID)
+	if problem != nil {
+		refuse(problem)
+		return
+	}
+	intentDigest, _ := canonical.Spell(call.IntentDigest)
+	for _, child := range priorCalls {
+		if child.ParentCallIndex != int64(call.CallIndex) {
+			continue
+		}
+		if child.ChildIntentDigest != intentDigest {
+			refuse(exit.Named(exit.Conflict, "child.intent_changed", "the parent call index already names different inputs"))
+			return
+		}
+		// Same-parent replay continues its durable call, even when a transient
+		// environment probe is unavailable. Cross-parent reuse is qualified below.
+		c.sendChildResult(s, call, child.ID, pb.ChildCallState_CHILD_CALL_STATE_PENDING, nil, nil)
+		if child.State == "paused" {
+			go func() { _ = c.ResumeRequest(child.ID, "parent resumed its child call") }()
+		}
+		c.watchChildCall(s, proto.Clone(call).(*pb.ChildCallRequest), child.ID)
+		return
+	}
 	resolver, ok := c.opt.Packages.(privateChildResolver)
 	if !ok {
 		refuse(exit.Unavailablef("this package owner cannot resolve frozen child interfaces"))
@@ -83,6 +106,7 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		refuse(problem)
 		return
 	}
+	target = c.qualifyChildReuse(s, call, &spec, target)
 	spec.IdemKey = fmt.Sprintf("child/%s/%d", parent.ID, call.CallIndex)
 	request, _, problem := requestRecord(spec)
 	if problem != nil {
@@ -162,7 +186,7 @@ func (c *Orchestrator) watchChildCall(s *session, call *pb.ChildCallRequest, id 
 					continue
 				}
 				if problem == nil {
-					artifacts, inspectProblem := childArtifacts(result)
+					artifacts, inspectProblem := c.childResultArtifacts(*row, result)
 					problem = inspectProblem
 					if problem == nil {
 						problem = c.retainChildArtifacts(s.ctx, *row, "result", artifacts)

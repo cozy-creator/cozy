@@ -9,6 +9,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
 // ResolvePrivateChild resolves only the immutable interface binding captured by
@@ -79,6 +80,11 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	}
 	if facts == nil {
 		return out, "", exit.Named(exit.Conflict, "child.export_changed", "the captured child has no matching job facts")
+	}
+	if parent.Worker == "" && (len(facts.WeightsOutputs) > 0 || len(facts.ModelParams) > 0) {
+		if _, problem := tfs.Open(r.cfg); problem != nil {
+			return out, "", problem
+		}
 	}
 	if len(facts.Outputs) > len(facts.WeightsOutputs) {
 		return out, "", exit.Named(exit.Unavailable, "child.artifact_binding_required", "artifact and model child calls require explicit native reference adoption")

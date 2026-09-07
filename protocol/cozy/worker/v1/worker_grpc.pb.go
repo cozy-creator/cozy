@@ -353,6 +353,7 @@ var WorkerControl_ServiceDesc = grpc.ServiceDesc{
 
 const (
 	RuntimePreparation_ProtocolInfo_FullMethodName                 = "/cozy.worker.v1.RuntimePreparation/ProtocolInfo"
+	RuntimePreparation_NumericalEnvironment_FullMethodName         = "/cozy.worker.v1.RuntimePreparation/NumericalEnvironment"
 	RuntimePreparation_CheckPackageSetCompatibility_FullMethodName = "/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility"
 	RuntimePreparation_PreparePackageSet_FullMethodName            = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
 	RuntimePreparation_PrepareModelSource_FullMethodName           = "/cozy.worker.v1.RuntimePreparation/PrepareModelSource"
@@ -380,6 +381,7 @@ const (
 // crosses — an https URL, never a credential.
 type RuntimePreparationClient interface {
 	ProtocolInfo(ctx context.Context, in *ProtocolInfoRequest, opts ...grpc.CallOption) (*ProtocolInfoResult, error)
+	NumericalEnvironment(ctx context.Context, in *NumericalEnvironmentRequest, opts ...grpc.CallOption) (*NumericalEnvironmentResult, error)
 	CheckPackageSetCompatibility(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
 	PrepareModelSource(ctx context.Context, in *PrepareModelSourceRequest, opts ...grpc.CallOption) (*PrepareModelSourceResult, error)
@@ -406,6 +408,16 @@ func (c *runtimePreparationClient) ProtocolInfo(ctx context.Context, in *Protoco
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ProtocolInfoResult)
 	err := c.cc.Invoke(ctx, RuntimePreparation_ProtocolInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) NumericalEnvironment(ctx context.Context, in *NumericalEnvironmentRequest, opts ...grpc.CallOption) (*NumericalEnvironmentResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NumericalEnvironmentResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_NumericalEnvironment_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -545,6 +557,7 @@ func (c *runtimePreparationClient) PreparePrivatePlacement(ctx context.Context, 
 // crosses — an https URL, never a credential.
 type RuntimePreparationServer interface {
 	ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error)
+	NumericalEnvironment(context.Context, *NumericalEnvironmentRequest) (*NumericalEnvironmentResult, error)
 	CheckPackageSetCompatibility(context.Context, *PreparePackageSetRequest) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error)
 	PrepareModelSource(context.Context, *PrepareModelSourceRequest) (*PrepareModelSourceResult, error)
@@ -569,6 +582,9 @@ type UnimplementedRuntimePreparationServer struct{}
 
 func (UnimplementedRuntimePreparationServer) ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ProtocolInfo not implemented")
+}
+func (UnimplementedRuntimePreparationServer) NumericalEnvironment(context.Context, *NumericalEnvironmentRequest) (*NumericalEnvironmentResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method NumericalEnvironment not implemented")
 }
 func (UnimplementedRuntimePreparationServer) CheckPackageSetCompatibility(context.Context, *PreparePackageSetRequest) (*CheckPackageSetCompatibilityResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckPackageSetCompatibility not implemented")
@@ -641,6 +657,24 @@ func _RuntimePreparation_ProtocolInfo_Handler(srv interface{}, ctx context.Conte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(RuntimePreparationServer).ProtocolInfo(ctx, req.(*ProtocolInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_NumericalEnvironment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NumericalEnvironmentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).NumericalEnvironment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_NumericalEnvironment_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).NumericalEnvironment(ctx, req.(*NumericalEnvironmentRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -873,6 +907,10 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RuntimePreparation_ProtocolInfo_Handler,
 		},
 		{
+			MethodName: "NumericalEnvironment",
+			Handler:    _RuntimePreparation_NumericalEnvironment_Handler,
+		},
+		{
 			MethodName: "CheckPackageSetCompatibility",
 			Handler:    _RuntimePreparation_CheckPackageSetCompatibility_Handler,
 		},
@@ -1082,6 +1120,7 @@ var RuntimeWeights_ServiceDesc = grpc.ServiceDesc{
 
 const (
 	PodHost_ProtocolInfo_FullMethodName            = "/cozy.worker.v1.PodHost/ProtocolInfo"
+	PodHost_NumericalEnvironment_FullMethodName    = "/cozy.worker.v1.PodHost/NumericalEnvironment"
 	PodHost_PreparePackageSet_FullMethodName       = "/cozy.worker.v1.PodHost/PreparePackageSet"
 	PodHost_PrepareLocalPackage_FullMethodName     = "/cozy.worker.v1.PodHost/PrepareLocalPackage"
 	PodHost_PreparePrivatePlacement_FullMethodName = "/cozy.worker.v1.PodHost/PreparePrivatePlacement"
@@ -1134,6 +1173,7 @@ type PodHostClient interface {
 	// Static, read-only compatibility probe over the existing pinned TLS connection.
 	// The Host forwards its actual Runtime's loopback result; it does not guess a version.
 	ProtocolInfo(ctx context.Context, in *ProtocolInfoRequest, opts ...grpc.CallOption) (*ProtocolInfoResult, error)
+	NumericalEnvironment(ctx context.Context, in *NumericalEnvironmentCall, opts ...grpc.CallOption) (*NumericalEnvironmentResult, error)
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
 	PrepareLocalPackage(ctx context.Context, in *PrepareLocalPackageCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
 	PreparePrivatePlacement(ctx context.Context, in *PreparePrivatePlacementCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
@@ -1165,6 +1205,16 @@ func (c *podHostClient) ProtocolInfo(ctx context.Context, in *ProtocolInfoReques
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ProtocolInfoResult)
 	err := c.cc.Invoke(ctx, PodHost_ProtocolInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) NumericalEnvironment(ctx context.Context, in *NumericalEnvironmentCall, opts ...grpc.CallOption) (*NumericalEnvironmentResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NumericalEnvironmentResult)
+	err := c.cc.Invoke(ctx, PodHost_NumericalEnvironment_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1431,6 +1481,7 @@ type PodHostServer interface {
 	// Static, read-only compatibility probe over the existing pinned TLS connection.
 	// The Host forwards its actual Runtime's loopback result; it does not guess a version.
 	ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error)
+	NumericalEnvironment(context.Context, *NumericalEnvironmentCall) (*NumericalEnvironmentResult, error)
 	PreparePackageSet(*PreparePackageSetCall, grpc.ServerStreamingServer[PrepareEvent]) error
 	PrepareLocalPackage(*PrepareLocalPackageCall, grpc.ServerStreamingServer[PrepareEvent]) error
 	PreparePrivatePlacement(*PreparePrivatePlacementCall, grpc.ServerStreamingServer[PrepareEvent]) error
@@ -1460,6 +1511,9 @@ type UnimplementedPodHostServer struct{}
 
 func (UnimplementedPodHostServer) ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ProtocolInfo not implemented")
+}
+func (UnimplementedPodHostServer) NumericalEnvironment(context.Context, *NumericalEnvironmentCall) (*NumericalEnvironmentResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method NumericalEnvironment not implemented")
 }
 func (UnimplementedPodHostServer) PreparePackageSet(*PreparePackageSetCall, grpc.ServerStreamingServer[PrepareEvent]) error {
 	return status.Error(codes.Unimplemented, "method PreparePackageSet not implemented")
@@ -1547,6 +1601,24 @@ func _PodHost_ProtocolInfo_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(PodHostServer).ProtocolInfo(ctx, req.(*ProtocolInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_NumericalEnvironment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NumericalEnvironmentCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).NumericalEnvironment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_NumericalEnvironment_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).NumericalEnvironment(ctx, req.(*NumericalEnvironmentCall))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1814,6 +1886,10 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ProtocolInfo",
 			Handler:    _PodHost_ProtocolInfo_Handler,
+		},
+		{
+			MethodName: "NumericalEnvironment",
+			Handler:    _PodHost_NumericalEnvironment_Handler,
 		},
 		{
 			MethodName: "ModelSourcePrepare",

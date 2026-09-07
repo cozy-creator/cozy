@@ -60,6 +60,41 @@ func childArtifacts(raw []byte) (map[string]records.ModelArtifact, *exit.Error) 
 	return out, nil
 }
 
+func (c *Orchestrator) childResultArtifacts(request records.Request, raw []byte) (map[string]records.ModelArtifact, *exit.Error) {
+	artifacts, problem := childArtifacts(raw)
+	if problem != nil {
+		return nil, problem
+	}
+	original := request.ID
+	if request.ReusedFrom != "" {
+		original = request.ReusedFrom
+	}
+	producer, problem := c.opt.Store.RequestRow(original)
+	if problem != nil || producer == nil {
+		return nil, exit.Unavailablef("child result producer is unavailable")
+	}
+	outputs, problem := c.opt.Store.AllModelTransferWeights(original, producer.Ordinal)
+	if problem != nil {
+		return nil, problem
+	}
+	declared, problem := decodeWeightsOutputs(request.WeightsOutputs)
+	if problem != nil {
+		return nil, problem
+	}
+	if len(outputs) != len(declared) {
+		return nil, exit.Unavailablef("child native output receipts are not yet fully observed")
+	}
+	for _, output := range outputs {
+		receipt, err := canonical.Read(output.Receipt, &pb.WeightsReceipt{})
+		if err != nil {
+			return nil, exit.Internalf("child native output receipt is malformed")
+		}
+		artifacts["weights/"+output.OutputSlot] = records.ModelArtifact{ProducerRequestID: original, OutputSlot: output.OutputSlot,
+			Manifest: records.ArtifactObjectRef{Digest: output.ManifestID, Length: output.ManifestLength}, TensorFSReceiptDigest: receipt.Str("tensorfs_receipt_digest")}
+	}
+	return artifacts, nil
+}
+
 func (c *Orchestrator) retainChildArtifacts(ctx context.Context, consumer records.Request, kind string, artifacts map[string]records.ModelArtifact) *exit.Error {
 	slots := make([]string, 0, len(artifacts))
 	for slot := range artifacts {

@@ -140,7 +140,9 @@ func (s *Store) CompleteReusedChild(id string) *exit.Error {
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(`UPDATE requests SET state='succeeded' WHERE id=? AND reused_from<>'' AND state='finalizing'
-		AND NOT EXISTS(SELECT 1 FROM request_weights_retentions h WHERE h.request_id=requests.id AND h.kind='result' AND h.state!='held')`, id)
+		AND NOT EXISTS(SELECT 1 FROM request_weights_retentions h WHERE h.request_id=requests.id AND h.kind='result' AND h.state!='held')
+		AND (child_artifacts=0 OR EXISTS(SELECT 1 FROM request_weights_retentions h WHERE h.request_id=requests.id AND h.kind='result' AND h.state='held'))
+		AND (weights_outputs='[]' OR (SELECT COUNT(*) FROM request_weights_retentions h WHERE h.request_id=requests.id AND h.kind='result' AND h.slot LIKE 'weights/%' AND h.state='held')=json_array_length(weights_outputs))`, id)
 	if err != nil {
 		return exit.Internalf("cannot complete reused child result: %s", err)
 	}
