@@ -328,7 +328,7 @@ func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) (
 		}
 		if w.spec.IsJob() {
 			// A JOB worker hosts no placement: its dispatchability IS its job capacity.
-			return req.Package, w.dispatchable[planID]
+			return req.Package, w.dispatchableFor(planID)
 		}
 		// The model selection is part of the match (cl-114): the plan id hashes the
 		// entrypoint's interface, not its weights, so a placement holding the same plan
@@ -345,7 +345,8 @@ func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) (
 	}
 	slot := pinnedPackage(req.Package, w.spec.Connection.RentalID)
 	if req.IsJob() {
-		return slot, w.spec.IsJob() && w.spec.Placement.Package == slot && w.dispatchable[planID]
+		return slot, w.spec.IsJob() && w.spec.Placement.Package == slot &&
+			stagedFor(w, req) && w.dispatchableFor(planID)
 	}
 	placement, ok := w.remotePlacements[remotePlanKey(slot, planID)]
 	return slot, ok && !w.spec.IsJob() && placement.Package == slot &&

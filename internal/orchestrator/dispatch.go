@@ -819,7 +819,7 @@ func (c *Orchestrator) rentalHeld(req records.Request) bool {
 		slot := pinnedPackage(req.Package, w.spec.Connection.RentalID)
 		if req.IsJob() {
 			if w.spec.Placement.Package == slot &&
-				w.spec.Placement.Jobs[0].Function == req.Entrypoint && staged(w, req.PlanID) {
+				w.spec.Placement.Jobs[0].Function == req.Entrypoint && stagedFor(w, req) {
 				return true
 			}
 			continue
@@ -923,6 +923,11 @@ func staged(w *worker, planID string) bool {
 }
 
 func stagedFor(w *worker, req records.Request) bool {
+	if req.IsJob() && w.spec.Connection != nil && len(req.Models) > 0 && len(w.spec.Placement.Models) == 0 {
+		// An older job spec may not retain its input selection. Unknown inputs
+		// require ordinary preparation, never the serving selection wildcard.
+		return false
+	}
 	if req.Worker != "" && w.spec.Connection != nil && !req.IsJob() {
 		return w.remoteStaged(pinnedPackage(req.Package, req.Worker), req.PlanID,
 			req.Release, req.LocalPackageDigest, req.Models)
@@ -1098,6 +1103,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		spec := WorkerLaunchSpec{Connection: remote.Connection, Placement: DesiredPlacement{
 			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
 			PlacementSetDigest: preparedSet,
+			Models:             logical.Models,
 			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,
 				BuildID:        buildID,
 				Outputs:        strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),

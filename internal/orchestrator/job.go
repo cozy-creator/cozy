@@ -127,14 +127,26 @@ func stageJobPlans(workerHome string, plans []*JobPlan) *exit.Error {
 // inferred from which field happens to be populated (cr-009's `fabd6fc` lesson). Job mode
 // hosts no PLACEMENT at all: there is no set, no serving axis, and no placement_id on its
 // attempts.
-func (c *Orchestrator) sendJobDirective(s *session, w *worker) *exit.Error {
-	plan := w.spec.Placement.Jobs[0]
+func (c *Orchestrator) sendJobDirective(s *session, w *worker, replacement *WorkerLaunchSpec) *exit.Error {
+	c.mu.Lock()
+	spec := w.spec
+	if replacement != nil {
+		spec = *replacement
+	}
+	plan := spec.Placement.Jobs[0]
 	if plan.BuildID == "" {
+		c.mu.Unlock()
 		return exit.Named(exit.Structural, "job_build_identity_missing",
 			"job %s carries no build identity to name in its directive", plan.Function)
 	}
-	rev := c.nextRevision()
-	c.mu.Lock()
+	rev := c.nextRevisionLocked()
+	// Publish the selection and its new readiness fence together. A concurrent
+	// old capacity report must never make the replacement spec dispatchable.
+	if replacement != nil {
+		w.spec = spec
+		w.planIDs = []string{plan.DescriptorID}
+		w.desiredRefusal = nil
+	}
 	w.revision = rev
 	c.mu.Unlock()
 	d := &pb.DesiredWorkerState{
@@ -179,15 +191,12 @@ func (c *Orchestrator) ConvergeRemoteJob(instanceID string, spec WorkerLaunchSpe
 	var s *session
 	if w != nil {
 		s = c.sessions[w.bootID]
-		w.spec = spec
-		w.planIDs = []string{spec.Placement.Jobs[0].DescriptorID}
-		w.desiredRefusal = nil
 	}
 	c.mu.Unlock()
 	if w == nil || s == nil {
 		return exit.Unavailablef("worker %s holds no claimed control stream", instanceID)
 	}
-	return c.sendJobDirective(s, w)
+	return c.sendJobDirective(s, w, &spec)
 }
 
 func gpuCountOf(p *JobPlan) int64 {
