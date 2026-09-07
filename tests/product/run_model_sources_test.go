@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -48,14 +49,20 @@ func runModelCatalog(t *testing.T) (string, *sync.Mutex, *[][]byte, string, []by
 	})
 	mux.HandleFunc("GET /v1/models/proof/source/releases/1.0.0/lanes/bf16/manifest", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(manifest) })
 	mux.HandleFunc("GET /v1/models/resolve", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("ref") != "proof/source@"+digest || r.URL.Query().Get("lane") != "" {
+		ref, lane := r.URL.Query().Get("ref"), r.URL.Query().Get("lane")
+		released := ref == "proof/source@1.0.0@"+digest && lane == "bf16"
+		if !released && (ref != "proof/source@"+digest || lane != "") {
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"error":{"code":"manifest.not_found","message":"not retained"}}`))
 			return
 		}
-		_ = json.NewEncoder(w).Encode(hub.ModelResolution{Model: "proof/source", ManifestID: digest,
+		resolution := hub.ModelResolution{Model: "proof/source", ManifestID: digest,
 			ManifestLength: int64(len(manifest)), Bytes: 210_000_000_000, Objects: 100,
-			Components: []string{"model"}, ComponentBytes: map[string]int64{"model": 100}})
+			Components: []string{"model"}, ComponentBytes: map[string]int64{"model": 100}}
+		if released {
+			resolution.Release, resolution.Lane = "1.0.0", "bf16"
+		}
+		_ = json.NewEncoder(w).Encode(resolution)
 	})
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]hub.RentalSKU{{Name: "cpu", AcceleratorModel: "CPU", PriceUSDMicrosPerHour: 100_000, BaseWorkerProfile: "python3.12-cpu-linux-x86"}})
@@ -77,6 +84,31 @@ func runModelCatalog(t *testing.T) (string, *sync.Mutex, *[][]byte, string, []by
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: model-run-test\nrentals:\n  max_hourly_spend_usd: 20\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	return root, &mu, &posts, digest, manifest
+}
+
+func TestPinnedCheckpointTransferKeepsReleaseAndLaneConstraints(t *testing.T) {
+	root, _, _, digest, _ := runModelCatalog(t)
+	source := "proof/source@1.0.0/bf16#" + digest
+	code, out := runCozy(t, root, "model", "download", source, "local/pinned", "--dry-run", "--json", "--full")
+	var result struct{ ID string }
+	if code != 0 || json.Unmarshal([]byte(out), &result) != nil {
+		t.Fatalf("pinned checkpoint preflight failed: %d %s", code, out)
+	}
+	want := modeltransfer.Instruction{Kind: "model-download", Destination: "local/pinned", Source: source}.ID()
+	if result.ID != want {
+		t.Fatal("canonical instruction discarded the explicit release/lane/digest constraints")
+	}
+	code, out = runCozy(t, root, "model", "download", source, "local/pinned", "--lane", "fp8", "--dry-run", "--json")
+	if code == 0 || !strings.Contains(out, "disagree") {
+		t.Fatal("conflicting explicit lane was accepted")
+	}
+	code, out = runCozy(t, root, "model", "download", "proof/source@1.0.0/bf16#sha256:"+strings.Repeat("f", 64), "local/pinned", "--dry-run", "--json")
+	if code == 0 || !strings.Contains(out, "manifest.not_found") {
+		t.Fatal("checkpoint outside the pinned release/lane was accepted")
+	}
+	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
+		t.Fatal("selection refusal or preflight started a daemon")
+	}
 }
 
 func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {

@@ -5,13 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/secret"
 	"github.com/cozy-creator/cozy/internal/tfs"
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
@@ -98,5 +102,54 @@ func TestRetainedCheckpointLocalFetchKeepsNativeRoots(t *testing.T) {
 	if len(rows) != 0 {
 		t.Fatal("second checkpoint created a release")
 	}
+	// The shared Hub fixture also retains a mixed source snapshot. Exercise the
+	// exact Creator read methods, including the real private carrier body, so an
+	// anonymous model-read change cannot silently break the owner source path.
+	sibling := []byte("private source-carrier sibling")
+	siblingID, err := canonical.Spell(canonical.Digest(sibling))
+	must(t, err)
+	var mixedDocument map[string]any
+	must(t, json.Unmarshal(original, &mixedDocument))
+	mixedDocument["entries"] = append(mixedDocument["entries"].([]any), map[string]any{
+		"path": "source.bin", "kind": "file", "blob": map[string]any{
+			"sha256": strings.TrimPrefix(siblingID, "sha256:"), "length": len(sibling)},
+	})
+	mixed, err := json.Marshal(mixedDocument)
+	must(t, err)
+	mixedID, err := canonical.Spell(canonical.Digest(mixed))
+	must(t, err)
+	if _, problem := client.CheckpointManifest(context.Background(), ref, mixedID); problem == nil {
+		t.Fatal("anonymous Creator read exposed a mixed source snapshot")
+	}
+	if _, problem := client.CheckpointReads(context.Background(), ref, mixedID, []string{siblingID}); problem == nil {
+		t.Fatal("anonymous Creator read exposed a private source carrier")
+	}
+	owner := client.WithToken(secret.New("checkpoint-proof-admin"), "synthetic Hub fixture")
+	actual, problem := owner.CheckpointManifest(context.Background(), ref, mixedID)
+	fatal(t, problem)
+	if !bytes.Equal(actual, mixed) {
+		t.Fatal("owner Creator read changed the retained source manifest")
+	}
+	grants, problem := owner.CheckpointReads(context.Background(), ref, mixedID, []string{siblingID})
+	fatal(t, problem)
+	if len(grants) != 1 || grants[0].ObjectID != siblingID || grants[0].Length != int64(len(sibling)) {
+		t.Fatal("owner source grant changed exact carrier identity")
+	}
+	response, err := http.Get(grants[0].URL)
+	must(t, err)
+	carrier, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	must(t, err)
+	if response.StatusCode != http.StatusOK || !bytes.Equal(carrier, sibling) {
+		t.Fatal("owner source carrier transfer failed")
+	}
+	if _, problem := owner.CheckpointReads(context.Background(), ref, facts.Checkpoint, []string{siblingID}); problem == nil {
+		t.Fatal("owner credential bypassed exact checkpoint membership")
+	}
+	wrong := client.WithToken(secret.New("wrong-owner"), "synthetic refusal control")
+	if _, problem := wrong.CheckpointManifest(context.Background(), ref, mixedID); problem == nil {
+		t.Fatal("unrecognized owner credential exposed private source")
+	}
 	t.Log("real Hub digest resolution, native cold/warm local fetch, two retained roots and zero releases passed")
+	t.Log("exact Creator owner manifest/read methods transferred private source bytes; anonymous and wrong-scope controls refused")
 }

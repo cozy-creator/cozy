@@ -4,7 +4,7 @@ package hub
 // on the ONE client. `do` still owns request construction, credentials, reasons, and
 // error mapping. A publication opens under a stable operation id, claims known object
 // transfers, uploads through bounded grants, finalizes one owner checkpoint, then
-// retains that checkpoint owner-only. Mutable release pointers are a separate call.
+// retains that checkpoint. Mutable release pointers are a separate call.
 
 import (
 	"context"
@@ -155,7 +155,7 @@ type ManifestRef struct {
 	Length int64  `json:"length"`
 }
 
-// CheckpointPublication is the durable owner-only checkpoint returned by finalize.
+// CheckpointPublication is the durable checkpoint returned by finalize.
 type CheckpointPublication struct {
 	PublishID    string      `json:"publish_id"`
 	CheckpointID string      `json:"checkpoint_id"`
@@ -344,9 +344,9 @@ func (c *Client) ReleaseManifest(ctx context.Context, ref Ref, release, lane str
 func (c *Client) CheckpointManifest(ctx context.Context, ref Ref, checkpointID string) ([]byte, *exit.Error) {
 	var raw []byte
 	e := c.do(ctx, call{
-		method: http.MethodGet,
-		path:   "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + checkpointID,
-		raw:    &raw, byBytes: true,
+		method: http.MethodGet, optionalAuth: true,
+		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + checkpointID,
+		raw:  &raw, byBytes: true,
 	}, nil)
 	return raw, e
 }
@@ -390,7 +390,7 @@ func (c *Client) CheckpointReads(ctx context.Context, ref Ref, checkpointID stri
 		Reads []Read `json:"reads"`
 	}
 	e := c.do(ctx, call{
-		method: http.MethodPost, byBytes: true,
+		method: http.MethodPost, byBytes: true, optionalAuth: true,
 		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + checkpointID + "/reads",
 		body: map[string]any{"object_ids": ids},
 	}, &out)

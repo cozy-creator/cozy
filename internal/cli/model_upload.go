@@ -349,11 +349,18 @@ func canonicalProductionSource(ctx *Context, raw string) (string, *exit.Error) {
 		return "", problem
 	}
 	if strings.Contains(raw, "#") {
-		model, _, _, manifest, problem := parseModelRef(raw)
+		model, release, lane, manifest, problem := parseModelRef(raw)
 		if problem != nil {
 			return "", problem
 		}
-		return model + "@" + manifest, nil
+		if release == "" {
+			return model + "@" + manifest, nil
+		}
+		selected := model + "@" + release
+		if lane != "" {
+			selected += "/" + lane
+		}
+		return selected + "#" + manifest, nil
 	}
 	name, release, pinned := strings.Cut(raw, "@")
 	if !pinned || strings.TrimSpace(release) == "" {
