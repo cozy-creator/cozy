@@ -67,7 +67,7 @@ func (c *Orchestrator) runModelPassThrough(req records.Request) {
 		c.logf("pass-through model transfer %s settlement failed: %s", req.ID, problem.Message)
 	}
 	c.forgetTransferProgress(req.ID)
-	c.kickSourceCheckpointUpload(req.ID)
+	c.kickCheckpointUpload(req.ID)
 }
 
 // weightsGrantExpired is the pod's name for the one weights-transfer refusal a freshly
@@ -387,7 +387,7 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		if problem != nil || request == nil {
 			return nil, problem
 		}
-		if request.State == "canceled" {
+		if request.State == "canceled" || request.State == "canceling" || request.State == "releasing" {
 			return nil, exit.New(exit.Canceled, "model transfer %s was canceled", req.ID)
 		}
 		session, problem := c.rentalControl(request.Worker)
@@ -468,9 +468,12 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 			return nil, problem
 		}
 		if phase == "declaring" && allDeclared {
+			if problem := c.adoptRetriedSource(ctx, *request, session); problem != nil {
+				return nil, problem
+			}
 			phase = "probe"
 			if len(checkpoints) > 0 {
-				host, problem := c.sourceCheckpointHost(*request)
+				host, problem := c.checkpointHost(*request)
 				if problem != nil {
 					return nil, problem
 				}
@@ -716,12 +719,12 @@ func (c *Orchestrator) CancelModelTransferFinalization(requestID, actor string) 
 		cancel()
 	}
 	c.signalTransfer(requestID)
-	c.kickSourceCheckpointUpload(requestID)
+	c.kickCheckpointUpload(requestID)
 	return c.resumeModelTransferPublication(requestID)
 }
 
 func (c *Orchestrator) finishModelTransferRequest(requestID string, attempt int64) {
-	c.kickSourceCheckpointUpload(requestID)
+	c.kickCheckpointUpload(requestID)
 	request, problem := c.opt.Store.RequestRow(requestID)
 	if problem != nil || request == nil || request.State == "canceled" {
 		return
@@ -730,10 +733,12 @@ func (c *Orchestrator) finishModelTransferRequest(requestID string, attempt int6
 	if readProblem != nil || retainedAttempt == nil || c.retainedPublication(*request, *retainedAttempt) {
 		return
 	}
-	if problem := c.releaseManagedNow(*request); problem != nil {
-		c.logf("model transfer %s provider cleanup remains pending: %s", requestID, problem.Message)
-		time.AfterFunc(2*time.Second, func() { c.finishModelTransferRequest(requestID, attempt) })
-		return
+	if !request.RetainsLocalOutputs() {
+		if problem := c.releaseManagedNow(*request); problem != nil {
+			c.logf("model transfer %s provider cleanup remains pending: %s", requestID, problem.Message)
+			time.AfterFunc(2*time.Second, func() { c.finishModelTransferRequest(requestID, attempt) })
+			return
+		}
 	}
 	if _, problem := c.opt.Store.SettleModelTransferRequest(requestID, attempt); problem != nil {
 		c.logf("model transfer %s terminal settlement remains pending: %s", requestID, problem.Message)
@@ -749,12 +754,12 @@ func (c *Orchestrator) finishModelTransferRequest(requestID string, attempt int6
 }
 
 func (c *Orchestrator) ResumeModelTransfers() *exit.Error {
-	checkpointRequests, problem := c.opt.Store.SourceCheckpointRequests()
+	checkpointRequests, problem := c.opt.Store.CheckpointRequests()
 	if problem != nil {
 		return problem
 	}
 	for _, requestID := range checkpointRequests {
-		c.kickSourceCheckpointUpload(requestID)
+		c.kickCheckpointUpload(requestID)
 	}
 	owed, problem := c.opt.Store.ModelTransfersOwed()
 	if problem != nil {

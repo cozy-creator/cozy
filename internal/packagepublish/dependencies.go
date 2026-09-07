@@ -80,6 +80,7 @@ type dependencyCollector struct {
 	count    int
 	registry bool
 	publish  bool
+	scanOnly bool
 }
 
 var requirementName = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?`)
@@ -244,6 +245,9 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 	}
 
 	out := filepath.Join(c.stage, "dependencies", fmt.Sprintf("%02d-%s", len(c.wheels)+1, name))
+	if c.scanOnly {
+		return nil
+	}
 	built, problem := wheel.Build(wheel.Request{Context: c.ctx, Tree: canonical, OutDir: out})
 	if problem != nil {
 		return problem
@@ -288,7 +292,36 @@ func (c *dependencyCollector) collectWheel(req requirement, source string) *exit
 	}
 	c.count++
 	c.byName[identity.Distribution] = dependencyRecord{source: canonical, version: identity.Version}
+	if c.scanOnly {
+		return nil
+	}
 	return c.add(identity, canonical)
+}
+
+// LocalDependencyPaths uses the same resolver/closure validation as wheel building,
+// without executing a build backend. Watchers and immutable source capture use it.
+func LocalDependencyPaths(root string) (map[string]string, *exit.Error) {
+	canonical, problem := canonicalLocalPath(root)
+	if problem != nil {
+		return nil, problem
+	}
+	document, problem := readProjectDocument(filepath.Join(canonical, "pyproject.toml"))
+	if problem != nil {
+		return nil, problem
+	}
+	c := &dependencyCollector{byName: map[string]dependencyRecord{}, extras: map[string]map[string]bool{},
+		stack: map[string]bool{canonical: true}, scanOnly: true}
+	c.byName[normalizedProjectName(document.Project.Name)] = dependencyRecord{source: canonical, version: document.Project.Version}
+	if problem := c.collectProject(canonical, document, nil, true); problem != nil {
+		return nil, problem
+	}
+	out := map[string]string{}
+	for name, row := range c.byName {
+		if row.source != canonical {
+			out[name] = row.source
+		}
+	}
+	return out, nil
 }
 
 func (c *dependencyCollector) add(identity wheel.Identity, path string) *exit.Error {

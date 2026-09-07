@@ -178,11 +178,11 @@ type declaredSourceRuntime struct {
 	before func()
 }
 
-func (r declaredSourceRuntime) SourceCheckpointPage(ctx context.Context, request *pb.SourceCheckpointPageRequest, options ...grpc.CallOption) (*pb.SourceCheckpointPageResult, error) {
+func (r declaredSourceRuntime) CheckpointPage(ctx context.Context, request *pb.CheckpointPageRequest, options ...grpc.CallOption) (*pb.CheckpointPageResult, error) {
 	r.before()
-	return r.RuntimePreparationClient.SourceCheckpointPage(ctx, request, options...)
+	return r.RuntimePreparationClient.CheckpointPage(ctx, request, options...)
 }
-func (r declaredSourceRuntime) SourceCheckpointTransfer(ctx context.Context, request *pb.SourceCheckpointTransferRequest, options ...grpc.CallOption) (*pb.SourceCheckpointTransferStatus, error) {
+func (r declaredSourceRuntime) CheckpointTransfer(ctx context.Context, request *pb.CheckpointTransferRequest, options ...grpc.CallOption) (*pb.CheckpointTransferStatus, error) {
 	r.before()
-	return r.RuntimePreparationClient.SourceCheckpointTransfer(ctx, request, options...)
+	return r.RuntimePreparationClient.CheckpointTransfer(ctx, request, options...)
 }

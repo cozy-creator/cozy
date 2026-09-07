@@ -348,6 +348,8 @@ func contractStatus(state string) string {
 		return "failed"
 	case "canceled":
 		return "canceled"
+	case "releasing":
+		return "canceling"
 	}
 	return state
 }
@@ -889,6 +891,8 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 		state = "failed"
 	case "canceled":
 		state = "canceled"
+	case "paused", "pausing", "blocked", "canceling":
+		state = strings.TrimSpace(r.URL.Query().Get("status"))
 	default:
 		s.refuse(w, r, http.StatusBadRequest, "invalid_status",
 			"unknown status filter", "any | queued | in_progress | completed | failed | canceled")
@@ -938,6 +942,19 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	id := row.ID
 	actor := requestActor(r)
+	if row.RetainWork && row.IsJob() && row.State != "finalizing" && (!records.Settled(row.State) || (row.State == "succeeded" && row.RetainsLocalOutputs())) {
+		if e := s.orchestrator.CancelRetainedRequest(id, actor); e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		updated, e := s.store.RequestRow(id)
+		if e != nil || updated == nil {
+			s.refuse(w, r, http.StatusInternalServerError, "internal", "canceled request cannot be read", "")
+			return
+		}
+		s.ok(w, r, http.StatusAccepted, s.lifecycleOf(*updated))
+		return
+	}
 	if status := contractStatus(row.State); status == "completed" || status == "failed" || status == "canceled" {
 		s.ok(w, r, http.StatusOK, s.lifecycleOf(*row))
 		return

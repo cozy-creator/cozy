@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,7 +17,9 @@ import (
 )
 
 const localWeightlessRef = "local/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "c0d98b55ab69b158a5a70b7d3c75e002bef35244"
+const editableRuntimeFixtureSHA = "3381ae1373725117c8e702c52f6ad25ab162ace4"
+
+var tensorfsFixtureWheel = flag.String("tensorfs-fixture-wheel", "", "exact native candidate wheel for an unpublished paired Runtime proof; omitted uses public resolution")
 
 // TestProductPath is the one end-to-end product path: a local package installed from
 // source, invoked as a user types it, answered with a typed result and real bytes on
@@ -241,26 +244,21 @@ func TestProductPath(t *testing.T) {
 
 	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job",
 		"size=8", "seed=11", "--await", "--json")
-	if code != 1 || !strings.Contains(out, "editable_jobs_unsupported") {
-		t.Fatalf("editable job red arm changed [exit %d]\n%s", code, out)
+	if code != 0 || !strings.Contains(out, `"status":"completed"`) {
+		t.Fatalf("captured local job did not complete [exit %d]\n%s", code, out)
 	}
 	runs = listRuns()
 	if len(runs) == 0 {
-		t.Fatal("failed job is absent from run list")
+		t.Fatal("completed local job is absent from run list")
 	}
-	// A request refused before any attempt waited and never ran: its queue clock is
-	// closed at the terminal, and its execution time is exactly nothing.
-	if runs[0].Kind != "job" || runs[0].Status != "failed" ||
-		runs[0].QueuedMS < 0 || runs[0].QueuedMS > 10_000 || runs[0].ExecutionMS != 0 ||
-		runs[0].Attempts != 0 {
-		t.Fatalf("pre-attempt job row lost its kind or its clocks: %+v", runs)
+	// The ordinary local package job now has a real attempt and retained history.
+	if runs[0].Kind != "job" || runs[0].Status != "completed" ||
+		runs[0].QueuedMS < 0 || runs[0].ExecutionMS < 0 || runs[0].Attempts != 1 {
+		t.Fatalf("local job row lost its attempt or clocks: %+v", runs)
 	}
-	if runs[0].Machine != "" {
-		t.Fatalf("a request that never landed anywhere claims MACHINE %q: %+v", runs[0].Machine, runs[0])
-	}
-	if code, out := runCozy(t, root, "run", "watch", fmt.Sprint(runs[0].Number), "--json"); code == 0 ||
-		!strings.Contains(out, "editable_jobs_unsupported") {
-		t.Fatalf("numeric failed-job watch did not resolve the job [exit %d]\n%s", code, out)
+	if code, out := runCozy(t, root, "run", "watch", fmt.Sprint(runs[0].Number), "--json"); code != 0 ||
+		!strings.Contains(out, `"status":"completed"`) {
+		t.Fatalf("numeric completed-job watch did not resolve the job [exit %d]\n%s", code, out)
 	}
 
 	detachedDir := filepath.Join(root, "detached-output")
@@ -511,6 +509,9 @@ func weightlessProject(t *testing.T) string {
 	build := exec.Command("/usr/bin/nice", "-n", "19", "python3",
 		"tests/product/testdata/build-weightless.py", "--out", dir, "--source-out", project,
 		"--runtime-sha", editableRuntimeFixtureSHA)
+	if *tensorfsFixtureWheel != "" {
+		build.Args = append(build.Args, "--tensorfs-wheel", *tensorfsFixtureWheel)
+	}
 	build.Dir = "../.."
 	build.Env = childEnv(t, repo, "RUNTIME_REPO="+repo)
 	if out, err := build.CombinedOutput(); err != nil {

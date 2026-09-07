@@ -54,6 +54,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	}
 
 	sub := api.JobSubmission{Package: target.Package, Function: target.Function, Input: input,
+		RetainWork: strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
 		RentalRequired: ctx.Inv.Bool("--rental-only")}
@@ -104,7 +105,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if problem != nil {
 		return problem
 	}
-	if terminal != nil || settled(state.Status) {
+	if terminal != nil || settled(state.Status) || state.Status == "paused" || state.Status == "blocked" {
 		return renderJobTerminal(ctx, state, terminal, began)
 	}
 	return renderSubmittedJob(ctx, state, !handle.Replay)
@@ -138,6 +139,15 @@ func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Er
 	rec.Next = []string{
 		"cozy run watch " + reference,
 		"cozy run cancel " + reference,
+	}
+	if state.RetainWork {
+		if state.Status == "paused" {
+			rec.Next = append(rec.Next, "cozy run resume "+reference)
+		} else if state.Status == "blocked" {
+			rec.Next = append(rec.Next, "cozy run <updated-script-or-package> --retry "+reference)
+		} else if state.Status != "pausing" {
+			rec.Next = append(rec.Next, "cozy run pause "+reference)
+		}
 	}
 	return emit(ctx, rec)
 }
@@ -287,7 +297,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 			// asking for cancellation. The daemon owns the accepted job; this client
 			// merely detaches, and only an explicit `cozy job cancel` cancels.
 			fmt.Fprintf(ctx.Err,
-				"\ndetached — the job keeps running; `cozy run watch %s` reattaches, `cozy job cancel %s` cancels\n",
+				"\ndetached — the job keeps running; `cozy run watch %s` reattaches, `cozy run cancel %s` cancels\n",
 				jobID, jobID)
 			detached <- struct{}{}
 			stopWatch()
@@ -296,7 +306,23 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	}()
 
 	lines := NewProgress(ctx, false, began)
-	terminal, e := c.WatchContext(watchCtx, jobID, 0, lines.On)
+	var stopped *localapi.Event
+	terminal, e := c.WatchContext(watchCtx, jobID, 0, func(event localapi.Event) bool {
+		keep := lines.On(event)
+		if event.Type == "request.paused" || event.Type == "request.blocked" {
+			// A resumed request may replay an older pause event. Stop only when
+			// its current state still matches the event being observed.
+			state, problem := c.Job(jobID)
+			if problem == nil && "request."+state.Status == event.Type {
+				stopped = &event
+				return false
+			}
+		}
+		return keep
+	})
+	if terminal == nil {
+		terminal = stopped
+	}
 	lines.Done()
 	if e != nil {
 		return e
@@ -321,6 +347,9 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	status := localapi.StreamStatus(terminal)
 	if status == "" {
 		status = state.Status
+	}
+	if status == "paused" {
+		return renderSubmittedJob(ctx, state, false)
 	}
 	// A REQUEST THAT ENDED BEFORE ANY ATTEMPT has its reason only in the terminal EVENT:
 	// there is no attempt row, so the state document has no terminal to read a cause off.
@@ -359,6 +388,9 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		return emit(ctx, rec)
 	}
 	err := exit.Named(code, status, "job %s ended %s", state.JobID, status)
+	if status == "blocked" {
+		err.WithNext("cozy run <updated-script-or-package> --retry " + runReference(state.Number, state.JobID))
+	}
 	if state.Error != "" {
 		err.Message = fmt.Sprintf("job %s ended %s: %s — %s",
 			state.JobID, status, state.ErrorType, state.Error)
@@ -452,7 +484,7 @@ func handleJobCancel(ctx *Context) *exit.Error {
 	}
 	// ALREADY TERMINAL = IDEMPOTENT 0 printing the terminal. A cancel that arrives after
 	// the terminal is late, not wrong.
-	if settled(state.Status) {
+	if settled(state.Status) && !state.Retaining {
 		fields := append(jobFields(ctx.Mode(), state, true), output.Field{K: "changed", V: false})
 		return emit(ctx, compactRecord(fields, "job", "status", "changed"))
 	}

@@ -120,7 +120,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	transfers := NewModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
-	localWheels := newLocalWheelOwner(ctx.Cfg, ctx.Out, ctx.AccountAuth)
 	defects := newDefectReporter(ctx.Cfg, ctx.Out, ctx.AccountAuth)
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
@@ -128,10 +127,19 @@ func serveDaemon(ctx *Context) *exit.Error {
 		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSource(),
 		RentalPrepareFacts: rental.PrepareFactsSource(client(ctx)),
 		RentalFleet:        fleet.status, AcquireManagedRental: fleet.acquire,
-		ReleaseManagedRental: fleet.release,
-		ModelTransfers:       transfers,
-		LocalWheels:          localWheels.grants,
-		ReportReleaseDefect:  defects.report,
+		ReleaseManagedRental:  fleet.release,
+		ReleaseRetainedRental: fleet.releaseRetained,
+		ModelTransfers:        transfers,
+		ReclaimInstall: func(id string) *exit.Error {
+			writer, problem := install.Lock(l)
+			if problem != nil {
+				return problem
+			}
+			defer writer.Unlock()
+			_, problem = install.Reclaim(l, st, id)
+			return problem
+		},
+		ReportReleaseDefect: defects.report,
 	})
 	if e != nil {
 		closeListeners()

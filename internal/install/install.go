@@ -31,8 +31,11 @@ import (
 )
 
 type Request struct {
-	Ref       Ref
-	Force     bool
+	Ref   Ref
+	Force bool
+	// Snapshot freezes local source into the install and leaves its active pin alone.
+	// It is the same installation path, owned by one or more durable invocations.
+	Snapshot  bool
 	Local     *LocalSource
 	Published *PublishedSource
 }
@@ -207,6 +210,9 @@ type Result struct {
 // Run executes the whole transaction. Every refusal before Activate leaves the
 // records untouched, so the previously pinned install stays runnable.
 func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
+	if req.Snapshot && req.Local == nil {
+		return nil, exit.Internalf("an invocation snapshot requires local package source")
+	}
 	if (req.Published == nil) == (req.Local == nil) {
 		return nil, exit.Usagef("`cozy package install` needs exactly one package source").
 			WithRemedy("pass org/package for Tensorhub, or an explicit directory such as . or ./project").
@@ -262,6 +268,14 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		inst.SourceKind, inst.SourceRef, inst.SourceDigest = "local", abs, local.SourceDigest
 		inst.Package, inst.Version = local.Package, local.Release
 		res.Files, res.Bytes = local.Files, local.Bytes
+		if req.Snapshot {
+			sourceDir, e = snapshotSource(installDir, local)
+			if e != nil {
+				return fail(e)
+			}
+			inst.SourceRef, inst.ProjectDir = sourceDir, sourceDir
+			inst.SourceDigest = local.SourceDigest
+		}
 	}
 	mark("stage")
 
@@ -279,7 +293,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if e != nil {
 		return fail(e)
 	}
-	if prior != nil && priorInstall != nil && priorInstall.SourceKind == inst.SourceKind &&
+	if !req.Snapshot && prior != nil && priorInstall != nil && priorInstall.SourceKind == inst.SourceKind &&
 		priorInstall.Package == inst.Package && priorInstall.Version == inst.Version &&
 		(inst.SourceKind == "tensorhub" || priorInstall.SourceDigest == inst.SourceDigest) {
 		res.Idempotent = true
@@ -287,7 +301,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		_ = os.RemoveAll(installDir)
 		return res, nil
 	}
-	if prior != nil && !req.Force {
+	if !req.Snapshot && prior != nil && !req.Force {
 		_ = os.RemoveAll(installDir)
 		return nil, exit.New(exit.Conflict,
 			"%s is already installed and pinned to install %s", inst.Package+majorSuffix(inst.Major), short12(prior.InstallID)).
@@ -333,7 +347,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if req.Published != nil {
 		packageInterface, placement, inst.Runtime, env, err = preparePublished(l, installDir, req.Published)
 	} else {
-		env, err = MaterializeEnvironment(sourceDir, venvDir)
+		env, err = materializeEnvironment(sourceDir, venvDir, !req.Snapshot)
 	}
 	if err != nil {
 		return guard(err)
@@ -394,7 +408,12 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	inst.BytesExcl, inst.BytesShared = Disk(installDir)
 
 	// ---- activate: the install row and the pin swap commit together ----
-	superseded, e := st.Activate(inst)
+	var superseded string
+	if req.Snapshot {
+		e = st.RecordInstall(inst)
+	} else {
+		superseded, e = st.Activate(inst)
+	}
 	if e != nil {
 		return guard(e)
 	}

@@ -47,6 +47,10 @@ type EnvironmentReceipt struct {
 // needs no network at all (verified with UV_OFFLINE=1). The two flags are mutually
 // exclusive in uv, so this is the stronger reading of one rule, not a second one.
 func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *exit.Error) {
+	return materializeEnvironment(sourceDir, venvDir, true)
+}
+
+func materializeEnvironment(sourceDir, venvDir string, editable bool) (*EnvironmentReceipt, *exit.Error) {
 	lock := filepath.Join(sourceDir, "uv.lock")
 	lockDigest, err := fileDigest(lock)
 	if err != nil {
@@ -63,6 +67,9 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 	env.Extra = pickCUDAExtra(sourceDir, &env.Warnings)
 
 	args := []string{"sync", "--locked", "--no-progress"}
+	if !editable {
+		args = append(args, "--no-editable")
+	}
 	if env.Extra != "" {
 		args = append(args, "--extra", env.Extra)
 	}

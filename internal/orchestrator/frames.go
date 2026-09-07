@@ -449,6 +449,9 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			// hosts no placement at all, so it has no serving axis. `jobs_available` IS
 			// the job credit, and this lane's dispatchability is that number.
 			avail := r.GetJobCapacity().GetJobsAvailable()
+			if w.spec.Placement.Jobs[0].Orchestration {
+				avail = r.GetJobCapacity().GetOrchestrationAvailable()
+			}
 			w.observeJobs(int(avail))
 			for _, p := range w.spec.Placement.Jobs {
 				dispatchable[p.DescriptorID] = avail > 0
@@ -647,7 +650,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		if r.AvailableAttemptSlots > 0 {
 			go c.reviveQueue()
 		}
-	} else if w != nil && w.spec.IsJob() && r.GetJobCapacity().GetJobsAvailable() > 0 {
+	} else if w != nil && w.spec.IsJob() && (r.GetJobCapacity().GetJobsAvailable() > 0 || r.GetJobCapacity().GetOrchestrationAvailable() > 0) {
 		go c.drain()
 	} else if workerTerminal {
 		// A FAILED axis or permanent desired-state refusal is the worker's answer, not a
@@ -912,16 +915,38 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	// attempt's ABANDONED terminal stopped the client's stream while attempt 2 was still
 	// being minted.
 	requeuing := requeueable(status, cause, origin, executionStarted)
+	retaining := req.RetainWork && status != "SUCCEEDED" && req.State != "canceling" &&
+		(req.State == "pausing" || req.State == "paused" || req.State == "blocked" || !requeuing)
+	if retaining || req.State == "canceling" {
+		requeuing = false
+	}
 	kept := triage.keep(status, cause, doc.Str("safe_message"), outputs, requeuing)
 	requestState := requeueState(status, requeuing)
-	if req.ModelTransfer != nil && !requeuing {
+	if retaining {
+		requestState = "blocked"
+		if req.State == "pausing" || req.State == "paused" {
+			requestState = "pausing"
+		}
+		kept.Type = "request." + requestState
+		kept.Payload["status"] = requestState
+		kept.Payload["execution_status"] = status
+	}
+	if req.State == "canceling" {
+		requestState = "canceling"
+		kept.Type = "request.canceling"
+		kept.Payload["status"] = "canceling"
+	}
+	if req.ModelTransfer != nil && !requeuing && !retaining && req.State != "canceling" {
 		requestState = "finalizing"
 		kept.Type = "request.finalizing"
 		kept.Payload = map[string]any{"status": "FINALIZING", "execution_status": status,
 			"outputs": []any{}, "requeuing": false}
 	}
 	weightsFinalizations, e := weightsFinalizationIntents(
-		*req, *attemptRow, status, requeuing, receiptsBySlot)
+		*req, *attemptRow, status, requeuing || retaining, receiptsBySlot)
+	if req.State == "canceling" {
+		weightsFinalizations, e = weightsFinalizationIntents(*req, *attemptRow, "CANCELED", false, receiptsBySlot)
+	}
 	if e != nil {
 		refuse("%s", e.Message)
 		return
@@ -939,7 +964,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	// goes on to succeed. Observed live: attempt 1 of a killed job committed an empty
 	// `local/_job-…` publication seconds before attempt 2 published the real one.
 	var publication *records.Publication
-	if req.IsJob() && len(declaredWeightsOutputs) == 0 && !requeuing && !knownReplay {
+	if req.IsJob() && len(declaredWeightsOutputs) == 0 && !requeuing && !retaining && req.State != "canceling" && !knownReplay {
 		if e := c.promote(*req, ordinal, outputs); e != nil {
 			refuse("%s", e.Message)
 			return
@@ -961,8 +986,8 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		// A requeueing request is QUEUED for its next ordinal, not failed. Writing the
 		// attempt's own status onto the request row would make the status document say
 		// `failed` for a request that is still going.
-		RequestState: requestState,
-		Publication:  publication,
+		RequestState: requestState, ExpectedRequestState: req.State,
+		Publication: publication,
 	})
 	if e != nil {
 		refuse("%s", e.Message)
@@ -995,7 +1020,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		c.logf("AttemptOutcome %s#%d is an exact replay of a closed outcome: re-acked, "+
 			"nothing applied twice", t.RequestId, ordinal)
 	}
-	if !requeuing {
+	if !requeuing && !retaining && req.State != "canceling" {
 		// Export settlement is deliberately separate from the execution terminal. A full
 		// destination does not rewrite success into failure, and an exact replay retries
 		// this durable row without mirroring worker bytes twice.
@@ -1021,6 +1046,27 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 // recovery. It is intentionally idempotent: cleanup and BeginRequeue both have durable
 // guards, so a replay cannot spend twice or delete a still-owned asset.
 func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, holder *worker) {
+	if req.State == "succeeded" && req.RetainsLocalOutputs() {
+		c.cleanupAttempt(req, uint64(attempt.Attempt), holder, false)
+		c.signalClosed(key(req.ID, uint64(attempt.Attempt)), nil)
+		c.signalClosed(requestWaitKey(req.ID), nil)
+		c.forget(req.ID)
+		return
+	}
+	if records.RetainedState(req.State) {
+		go func() { _ = c.pauseChildCalls(req.ID) }()
+		c.cleanupAttempt(req, uint64(attempt.Attempt), holder, false)
+		c.signalClosed(key(req.ID, uint64(attempt.Attempt)), outcomeError(attempt.TerminalStatus, attempt.TerminalCause, attempt.SafeMessage))
+		if _, problem := c.opt.Store.CompleteRequestPause(req.ID); problem != nil {
+			c.logf("request %s pause completion: %s", req.ID, problem.Message)
+		}
+		c.forget(req.ID)
+		return
+	}
+	if req.RetainWork && req.State == "canceling" {
+		go c.finishRetainedCancellation(req.ID)
+		return
+	}
 	if req.ModelTransfer != nil && req.State == "finalizing" {
 		go c.finishModelTransferRequest(req.ID, attempt.Attempt)
 		return
@@ -1206,6 +1252,11 @@ func (c *Orchestrator) cleanupAttempt(req records.Request, attempt uint64, holde
 }
 
 func (c *Orchestrator) cleanupRequestAssets(req records.Request) {
+	if req.InstallID != "" && c.opt.ReclaimInstall != nil {
+		if problem := c.opt.ReclaimInstall(req.InstallID); problem != nil {
+			c.logf("request %s snapshot cleanup deferred: %s", req.ID, problem.Message)
+		}
+	}
 	unlock := inputasset.Guard()
 	if e := inputasset.DropUnowned(c.opt.Layout, c.opt.Store, req.Assets); e != nil {
 		c.logf("request %s input asset cleanup deferred: %s", req.ID, e.Message)

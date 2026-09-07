@@ -27,7 +27,7 @@ import (
 )
 
 func proveOperatorSourceCustody(t *testing.T, ctx context.Context, root string, store *records.Store, auth *accountauth.Manager,
-	request *pb.PrepareModelSourceRequest, address string, observed records.ModelSourceCheckpoint) {
+	request *pb.PrepareModelSourceRequest, address string, observed records.ModelCheckpoint) {
 	t.Helper()
 	raw, err := proto.Marshal(request)
 	must(t, err)
@@ -99,7 +99,7 @@ func proveOperatorSourceCustody(t *testing.T, ctx context.Context, root string, 
 	held.Release()
 	owner := cli.NewModelTransferOwner(cfg, store, io.Discard, auth)
 	defer func() {
-		if problem := owner.ReleaseSourceCheckpoints(context.Background(), request.OperationId); problem != nil {
+		if problem := owner.ReleaseCheckpoints(context.Background(), request.OperationId); problem != nil {
 			t.Errorf("exact fixture hold cleanup: %s", problem.ErrName())
 		}
 	}()

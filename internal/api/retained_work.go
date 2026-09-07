@@ -1,0 +1,80 @@
+package api
+
+import (
+	"net/http"
+
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/records"
+)
+
+// Fresh snapshots may have different local install IDs with identical immutable
+// contents. An idempotency replay accepts that equivalence, but it must never
+// silently replace newly supplied code/dependencies with the prior request's code.
+func (s *Server) verifyJobReplayInstall(sub JobSubmission, recorded records.Request) *exit.Error {
+	if sub.InstallID == "" || sub.InstallID == recorded.InstallID {
+		return nil
+	}
+	prior, problem := s.store.Install(recorded.InstallID)
+	if problem != nil {
+		return problem
+	}
+	next, problem := s.store.Install(sub.InstallID)
+	if problem != nil {
+		return problem
+	}
+	if prior == nil || next == nil {
+		return exit.Named(exit.Conflict, "request.replay_install_unavailable", "the supplied and recorded package snapshots must both be available to verify replay")
+	}
+	if prior.Package != next.Package || prior.Version != next.Version || prior.SourceDigest != next.SourceDigest ||
+		prior.LockDigest != next.LockDigest || prior.PackageInterface != next.PackageInterface || prior.Closure != next.Closure ||
+		prior.Platform != next.Platform || prior.Extra != next.Extra || prior.PlacementSetDigest != next.PlacementSetDigest {
+		return exit.Named(exit.Conflict, "request.replay_install_changed", "this idempotency key names a different immutable package snapshot; submit a new request to run the edited revision")
+	}
+	return nil
+}
+
+func (s *Server) pauseJob(w http.ResponseWriter, r *http.Request) {
+	row, ok := s.jobRow(w, r)
+	if !ok {
+		return
+	}
+	if problem := s.orchestrator.PauseRequest(row.ID, requestActor(r)); problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	updated, problem := s.store.RequestRow(row.ID)
+	if problem != nil || updated == nil {
+		s.refuse(w, r, http.StatusInternalServerError, "internal", "paused request cannot be read", "")
+		return
+	}
+	status := http.StatusAccepted
+	if updated.State == "paused" {
+		status = http.StatusOK
+	}
+	s.ok(w, r, status, s.jobStateOf(*updated))
+}
+
+func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
+	row, ok := s.jobRow(w, r)
+	if !ok {
+		return
+	}
+	s.shutdownAdmission.RLock()
+	if s.shuttingDown {
+		s.shutdownAdmission.RUnlock()
+		s.refuse(w, r, http.StatusServiceUnavailable, "daemon_shutting_down", "the daemon is shutting down", "")
+		return
+	}
+	problem := s.orchestrator.ResumeRequest(row.ID, requestActor(r))
+	s.shutdownAdmission.RUnlock()
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	updated, problem := s.store.RequestRow(row.ID)
+	if problem != nil || updated == nil {
+		s.refuse(w, r, http.StatusInternalServerError, "internal", "resumed request cannot be read", "")
+		return
+	}
+	s.ok(w, r, http.StatusAccepted, s.jobStateOf(*updated))
+}

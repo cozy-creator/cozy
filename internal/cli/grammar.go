@@ -295,12 +295,14 @@ type RunCmd struct {
 	RetryPublication RunRetryPublicationCmd `cmd:"" help:"Retry a blocked model publication without rerunning its producer."`
 	Execute          RunExecuteCmd          `cmd:"" default:"withargs" hidden:""`
 	Cancel           RunCancelCmd           `cmd:"" help:"Cancel a queued or running run."`
+	Pause            RunPauseCmd            `cmd:"" help:"Stop a private transaction while retaining its work and rental."`
+	Resume           RunResumeCmd           `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
 	List             RunListCmd             `cmd:"" help:"List current and past runs."`
 	Watch            RunWatchCmd            `cmd:"" help:"Watch one recorded run until it settles."`
 }
 
 type RunExecuteCmd struct {
-	Target         string   `arg:"" name:"target" help:"Package or callable as org/package[/function]."`
+	Target         string   `arg:"" name:"target" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
 	Input          []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, and model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
 	Out            string   `help:"Output directory." type:"path"`
 	Timeout        string   `help:"Request deadline."`
@@ -310,6 +312,7 @@ type RunExecuteCmd struct {
 	Rental         bool     `help:"Run on a Creator-managed rental."`
 	RentalOnly     bool     `help:"Require a remote rental even when local capacity is ready."`
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`
+	Retry          string   `help:"Retry with current code while retaining compatible work from this prior run."`
 	Trees          []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
 	Org            string   `help:"Job publication organization (defaults to local)."`
 	PublishTo      string   `help:"Store the job's declared weight outputs as checkpoints in org/model; no release is created."`
@@ -326,7 +329,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--rental-only", c.RentalOnly, "--describe", c.Describe, "--dry-run", c.DryRun), values(
 		"--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets,
-		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org,
+		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
 		"--publish-to", c.PublishTo, "--source-profile", c.SourceProfiles), !c.DryRun && !c.Describe)
 }
 
@@ -340,6 +343,22 @@ func (c *RunRetryPublicationCmd) Run(r *Runtime) error {
 
 type RunCancelCmd struct {
 	ID string `arg:"" name:"run" help:"Run id."`
+}
+
+type RunPauseCmd struct {
+	ID string `arg:"" name:"run" help:"Run id."`
+}
+
+func (c *RunPauseCmd) Run(r *Runtime) error {
+	return r.call(handleRunPause, []string{c.ID}, nil, nil, true)
+}
+
+type RunResumeCmd struct {
+	ID string `arg:"" name:"run" help:"Run id."`
+}
+
+func (c *RunResumeCmd) Run(r *Runtime) error {
+	return r.call(handleRunResume, []string{c.ID}, nil, nil, true)
 }
 
 func (c *RunCancelCmd) Run(r *Runtime) error {
@@ -370,12 +389,15 @@ func (c *RunWatchCmd) Run(r *Runtime) error {
 // RentalCmd has no default subcommand: bare `cozy rental` prints its verbs, the way
 // bare `cozy package` and `cozy model` do.
 type RentalCmd struct {
-	List RentalListCmd `cmd:"" help:"List rented machines, live on a terminal."`
-	New  RentalNewCmd  `cmd:"" help:"Start a private rental."`
-	End  RentalEndCmd  `cmd:"" help:"End a private rental and stop billing."`
+	SSHInfo RentalSSHInfoCmd `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
+	List    RentalListCmd    `cmd:"" help:"List rented machines, live on a terminal."`
+	New     RentalNewCmd     `cmd:"" help:"Start a private rental."`
+	End     RentalEndCmd     `cmd:"" help:"End a private rental and stop billing."`
 }
 
 type RentalNewCmd struct {
+	Development    bool     `help:"Rent an explicit developer worker for SSH/SFTP wheel updates."`
+	SSHPublicKey   string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
 	SKU            string   `arg:"" optional:"" name:"gpu" help:"Cozy GPU SKU, such as h200."`
 	Models         []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
 	IdempotencyKey string   `help:"Stable paid-operation identity."`
@@ -383,8 +405,8 @@ type RentalNewCmd struct {
 }
 
 func (c *RentalNewCmd) Run(r *Runtime) error {
-	return r.call(handleRent, []string{c.SKU}, nil, values(
-		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models), false)
+	return r.call(handleRent, []string{c.SKU}, bools("--development", c.Development), values(
+		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey), false)
 }
 
 type RentalEndCmd struct {
@@ -451,4 +473,13 @@ type DownCmd struct {
 
 func (c *DownCmd) Run(r *Runtime) error {
 	return r.call(handleDown, nil, bools("--all", c.All), nil, false)
+}
+
+// SSHInfo reads current provider mapping from Hub; it stores no endpoint locally.
+type RentalSSHInfoCmd struct {
+	Rental string `arg:"" name:"rental" help:"Attached machine name or rental id."`
+}
+
+func (c *RentalSSHInfoCmd) Run(r *Runtime) error {
+	return r.call(handleRentalSSHInfo, []string{c.Rental}, nil, nil, false)
 }

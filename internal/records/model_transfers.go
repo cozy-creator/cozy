@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS request_model_transfer_objects (
   PRIMARY KEY(request_id,attempt,output_slot,object_id),
   FOREIGN KEY(request_id,attempt,output_slot)
     REFERENCES request_model_transfer_outputs(request_id,attempt,output_slot)
-)`, modelSourceCheckpointSchema, modelSourcePublicationSchema}
+)`, modelCheckpointSchema, modelCheckpointPublicationSchema}
 
 type ModelTransferSourceFile struct {
 	Member string `json:"member"`
@@ -147,8 +147,7 @@ func NormalizeModelTransferIntent(intent *ModelTransferIntent) *exit.Error {
 	if intent == nil {
 		return nil
 	}
-	if (intent.Kind != "model-upload" && intent.Kind != "model-download") ||
-		intent.Destination == "" || len(intent.Outputs) == 0 {
+	if (intent.Kind != "model-upload" && intent.Kind != "model-download") || len(intent.Outputs) == 0 {
 		return exit.New(exit.Validation, "model transfer intent is incomplete")
 	}
 	if intent.HasAcquisition() {
@@ -163,7 +162,11 @@ func NormalizeModelTransferIntent(intent *ModelTransferIntent) *exit.Error {
 		return exit.New(exit.Validation, "model transfer local_only does not match its source")
 	}
 	parts := strings.Split(intent.Destination, "/")
-	if intent.Kind == "model-upload" {
+	if intent.Destination == "" {
+		if intent.Kind != "model-upload" || !intent.HasAcquisition() {
+			return exit.New(exit.Validation, "an unpublished model result requires a source acquisition")
+		}
+	} else if intent.Kind == "model-upload" {
 		if len(parts) != 2 || parts[0] == "local" || !modelTransferSlug.MatchString(parts[0]) ||
 			!modelTransferSlug.MatchString(parts[1]) {
 			return exit.New(exit.Validation, "model upload destination is not one org/model")
@@ -309,7 +312,8 @@ func (s *Store) ModelTransfersOwed() ([]ModelTransfer, *exit.Error) {
 
 func (s *Store) BeginModelTransferMaterialization(requestID string) *exit.Error {
 	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='materializing',updated_at=?
-		WHERE request_id=? AND state IN ('pending','materializing','materialized')`, now(), requestID)
+		WHERE request_id=? AND state IN ('pending','materializing','materialized')
+		AND EXISTS(SELECT 1 FROM requests WHERE id=? AND state IN ('submitted','queued'))`, now(), requestID, requestID)
 	if err != nil {
 		return exit.Internalf("cannot begin model transfer materialization: %s", err)
 	}

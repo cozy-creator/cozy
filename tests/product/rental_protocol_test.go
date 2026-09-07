@@ -12,15 +12,14 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// An older pod can remain attached to preserve its data and settle old work,
-// but new directives are authored at this client's current wire minor.
+// An incompatible older pod is excluded before any Claim mutates ownership.
 func TestRentalReuseRequiresNegotiatedCurrentProtocol(t *testing.T) {
 	for _, older := range []bool{false, true} {
 		name := "current"
 		minor := uint32(pb.WireMinor)
 		if older {
 			name = "older"
-			minor--
+			minor = pb.MinCompatibleWireMinor - 1
 		}
 		t.Run(name, func(t *testing.T) {
 			public, private, err := ed25519.GenerateKey(rand.Reader)
@@ -29,7 +28,13 @@ func TestRentalReuseRequiresNegotiatedCurrentProtocol(t *testing.T) {
 			connection, _ := startFakePod(t, t.TempDir(), pod)
 			o := hostOwner(t, "protocol-"+name, rentalWiring(connection, private))
 			_, _, _, problem := o.c.EnsureRental(podRental)
-			fatal(t, problem)
+			if older {
+				if problem == nil || problem.ErrName() != "worker.protocol_incompatible" {
+					t.Fatalf("old peer was not refused before Claim: %v", problem)
+				}
+			} else {
+				fatal(t, problem)
+			}
 			for _, job := range []bool{false, true} {
 				kept, excluded := o.c.ModeCompatibleRentalsWithExclusions([]string{podRental}, job)
 				if older {
@@ -47,7 +52,7 @@ func TestRentalReuseRequiresNegotiatedCurrentProtocol(t *testing.T) {
 func TestQueuedPinToOlderWorkerReplansWithoutOffering(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
-	pod := &fakePod{controlKey: public, wireMinor: pb.WireMinor - 1, serve: true}
+	pod := &fakePod{controlKey: public, wireMinor: pb.MinCompatibleWireMinor - 1, serve: true}
 	connection, _ := startFakePod(t, t.TempDir(), pod)
 	var acquisitions atomic.Int64
 	o := hostOwner(t, "old-pin", rentalWiring(connection, private), func(options *orchestrator.Options) {
@@ -61,7 +66,9 @@ func TestQueuedPinToOlderWorkerReplansWithoutOffering(t *testing.T) {
 		}
 	})
 	_, _, _, problem := o.c.EnsureRental(podRental)
-	fatal(t, problem)
+	if problem == nil || problem.ErrName() != "worker.protocol_incompatible" {
+		t.Fatalf("old peer was not refused before Claim: %v", problem)
+	}
 	id, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: "old-pin", Package: "acme/old-pin", Entrypoint: "tile", PlanID: podPlanID("acme/old-pin"), Release: "1.0.0", Payload: []byte(`{"size":16}`), Outputs: []string{"image"}, Worker: podRental, Rental: true, RentalRequired: true})
 	fatal(t, problem)
 	waitUntil(t, "replanning from negotiated old peer", func() bool { return acquisitions.Load() > 0 })

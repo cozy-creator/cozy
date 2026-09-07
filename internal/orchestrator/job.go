@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // THE JOB BRANCH (cl-004). A job is an ATTEMPT CLASS on this one orchestrator, not a
@@ -52,9 +54,12 @@ type JobPlan struct {
 	WeightsOutputs []WeightsOutput
 	// Record is the closed key set `plan.py::JobBinding.read` accepts. An unknown key is
 	// a refusal at the worker, which is what makes "closed at both ends" a fact.
-	Record           map[string]any
-	RSSCap           int64
-	NeedsAccelerator bool
+	Record              map[string]any
+	RSSCap              int64
+	NeedsAccelerator    bool
+	Orchestration       bool
+	OrchestrationParent *JobPlan
+	FrozenDirective     *pb.JobDirective
 }
 
 const DefaultJobRSSCap int64 = 8 << 30
@@ -82,6 +87,12 @@ func JobBuildID(setBytes []byte, pkg string) (string, *exit.Error) {
 		if development := row.Sub("development"); development.Str("package") == pkg {
 			id := development.Sub("project_wheel").Sub("ref").Str("digest")
 			if id == "" {
+				// A local immutable source install has no transported project wheel.
+				// Its captured source closure is the build identity; the environment
+				// remains separately bound in the invocation and writer fingerprint.
+				id = development.Str("source_digest")
+			}
+			if id == "" {
 				return "", exit.Named(exit.Structural, "job_build_identity_missing",
 					"the development placement for %s names no project wheel", pkg)
 			}
@@ -104,18 +115,40 @@ func JobBuildID(setBytes []byte, pkg string) (string, *exit.Error) {
 // stageJobPlans writes one job plan record per declared job into the worker's own home.
 // The file name is the descriptor id's hex, which is how the supervisor finds it.
 func stageJobPlans(workerHome string, plans []*JobPlan) *exit.Error {
-	dir := filepath.Join(workerHome, "job-plans")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return exit.Internalf("cannot create the job plan directory %s: %s", dir, err)
-	}
 	for _, p := range plans {
+		for _, id := range []string{p.BuildID, p.DescriptorID} {
+			raw, err := canonical.Raw(id)
+			spelled, _ := canonical.Spell(raw)
+			if err != nil || spelled != id {
+				return exit.New(exit.Validation, "job plan path requires exact canonical build and descriptor digests")
+			}
+		}
+		dir := filepath.Join(workerHome, "job-plans", strings.TrimPrefix(p.BuildID, "sha256:"))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return exit.Internalf("cannot create the job plan directory: %s", err)
+		}
 		data, err := json.MarshalIndent(p.Record, "", "  ")
 		if err != nil {
 			return exit.Internalf("cannot render the job plan record: %s", err)
 		}
 		name := strings.TrimPrefix(p.DescriptorID, "sha256:") + ".json"
-		if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
-			return exit.Internalf("cannot stage the job plan record: %s", err)
+		path := filepath.Join(dir, name)
+		out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o444)
+		if os.IsExist(err) {
+			held, readError := os.ReadFile(path)
+			if readError != nil || !bytes.Equal(held, data) {
+				return exit.Named(exit.Conflict, "job.plan_changed", "the exact job build and descriptor already name different plan bytes")
+			}
+			continue
+		}
+		if err != nil {
+			return exit.Internalf("cannot stage exact job plan: %s", err)
+		}
+		_, writeError := out.Write(data)
+		syncError := out.Sync()
+		closeError := out.Close()
+		if writeError != nil || syncError != nil || closeError != nil {
+			return exit.Internalf("cannot durably stage exact job plan")
 		}
 	}
 	return nil
@@ -140,26 +173,7 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker) *exit.Error {
 	d := &pb.DesiredWorkerState{
 		Revision: rev, WireMinor: pb.WireMinor,
 		Posture: pb.Posture_POSTURE_ACCEPTING,
-		Mode: &pb.DesiredWorkerState_Job{Job: &pb.JobDirective{
-			BuildId:         plan.BuildID,
-			JobDescriptorId: plan.DescriptorID,
-			ResourceCaps: &pb.ResourceCaps{
-				DeviceRequired: gpuCountOf(plan) > 0,
-				MaxRssBytes:    uint64(plan.RSSCap),
-			},
-			// The DIRECTIVE's publication contract is the worker-level authorization;
-			// the per-attempt one rides the InvocationSpec, because a worker that
-			// drains a queue publishes into a different scratch repo per request.
-			PublicationContract: &pb.PublicationContract{
-				GrantId: home.ScratchRepo("local", "queue"),
-				Outputs: invocationOutputBindings(plan.Outputs, plan.WeightsOutputs, c.maxOutputBytes()),
-			},
-			// TERMINAL AND RECLAIM, everywhere. A job worker is one immutable build
-			// running one bounded attempt; deep queueing is the orchestrator's dispatch
-			// queue, not a warm worker (audit-adopted, 2026-08-26).
-			ReclaimOnTerminal: true,
-			DeviceCount:       uint32(gpuCountOf(plan)),
-		}},
+		Mode:    &pb.DesiredWorkerState_Job{Job: c.jobDirective(plan)},
 	}
 	d.RecordOwnerEpoch, d.ControlStreamEpoch, d.WorkerBootId = recordOwnerEpoch, s.epoch, s.bootID
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}}) {
@@ -168,6 +182,37 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker) *exit.Error {
 	c.logf("DesiredWorkerState revision=%d posture=accepting JOB %s (%s) -> %s",
 		rev, plan.Function, shortDigest(plan.DescriptorID), s.bootID)
 	return nil
+}
+
+func (c *Orchestrator) jobDirective(plan *JobPlan) *pb.JobDirective {
+	if plan.FrozenDirective != nil {
+		return proto.Clone(plan.FrozenDirective).(*pb.JobDirective)
+	}
+	directive := &pb.JobDirective{
+		BuildId:         plan.BuildID,
+		JobDescriptorId: plan.DescriptorID,
+		ResourceCaps: &pb.ResourceCaps{
+			DeviceRequired: gpuCountOf(plan) > 0,
+			MaxRssBytes:    uint64(plan.RSSCap),
+		},
+		// The DIRECTIVE's publication contract is the worker-level authorization;
+		// the per-attempt one rides the InvocationSpec, because a worker that
+		// drains a queue publishes into a different scratch repo per request.
+		PublicationContract: &pb.PublicationContract{
+			GrantId: home.ScratchRepo("local", "queue"),
+			Outputs: invocationOutputBindings(plan.Outputs, plan.WeightsOutputs, c.maxOutputBytes()),
+		},
+		// TERMINAL AND RECLAIM, everywhere. A job worker is one immutable build
+		// running one bounded attempt; deep queueing is the orchestrator's dispatch
+		// queue, not a warm worker (audit-adopted, 2026-08-26).
+		ReclaimOnTerminal: true,
+		DeviceCount:       uint32(gpuCountOf(plan)),
+		Orchestration:     plan.Orchestration,
+	}
+	if plan.OrchestrationParent != nil {
+		directive.OrchestrationParent = c.jobDirective(plan.OrchestrationParent)
+	}
+	return directive
 }
 
 func (c *Orchestrator) ConvergeRemoteJob(instanceID string, spec WorkerLaunchSpec) *exit.Error {
