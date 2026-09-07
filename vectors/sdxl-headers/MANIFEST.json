@@ -1,0 +1,38 @@
+[
+  {
+    "component": "text_encoder",
+    "member": "text_encoder/model.fp16.safetensors",
+    "file": "text_encoder__model.fp16.safetensors.header",
+    "full_length": 246144152,
+    "header_sha256": "772cc627dd96f57615483a03ddb9a777141e3181200851c05949a58baceac3a8",
+    "provider_object_sha256": "660c6f5b1abae9dc498ac2d21e1347d2abdb0cf6c0c0c8576cd796491d9a6cdd",
+    "provider_revision": "462165984030d82259a11f4367a4eed129e94a7b"
+  },
+  {
+    "component": "text_encoder_2",
+    "member": "text_encoder_2/model.fp16.safetensors",
+    "file": "text_encoder_2__model.fp16.safetensors.header",
+    "full_length": 1389382176,
+    "header_sha256": "d919eb461ac56694ca9903953e15efba1fb38c7255fb9a530a55549f212e2ad7",
+    "provider_object_sha256": "ec310df2af79c318e24d20511b601a591ca8cd4f1fce1d8dff822a356bcdb1f4",
+    "provider_revision": "462165984030d82259a11f4367a4eed129e94a7b"
+  },
+  {
+    "component": "unet",
+    "member": "unet/diffusion_pytorch_model.fp16.safetensors",
+    "file": "unet__diffusion_pytorch_model.fp16.safetensors.header",
+    "full_length": 5135149760,
+    "header_sha256": "cad04db2c51e5000c5eb1a3090e8ebf18abd31be6a266c6fa884a3bfd2ce7294",
+    "provider_object_sha256": "83e012a805b84c7ca28e5646747c90a243c65c8ba4f070e2d7ddc9d74661e139",
+    "provider_revision": "462165984030d82259a11f4367a4eed129e94a7b"
+  },
+  {
+    "component": "vae",
+    "member": "vae/diffusion_pytorch_model.fp16.safetensors",
+    "file": "vae__diffusion_pytorch_model.fp16.safetensors.header",
+    "full_length": 167335342,
+    "header_sha256": "ba5f3ca58fc039f8064fb610d457f437e7827028c7dc41060aed82a5ece33e9d",
+    "provider_object_sha256": "bcb60880a46b63dea58e9bc591abe15f8350bde47b405f9c38f4be70c6161e68",
+    "provider_revision": "462165984030d82259a11f4367a4eed129e94a7b"
+  }
+]
