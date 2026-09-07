@@ -59,7 +59,7 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 		}
 	}
 	if !hasRuntime {
-		metadata.Dependencies = append(metadata.Dependencies, "cozy-runtime") //cozy:allow distribution metadata, not an executable invocation
+		metadata.Dependencies = append(metadata.Dependencies, "cozy-runtime>=0.2.33,<1") //cozy:allow distribution metadata, not an executable invocation
 	}
 	if metadata.Tool != nil {
 		// A script's dependency metadata has the same explicit source rules as a
@@ -87,13 +87,13 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 		tool = map[string]any{}
 	}
 	tool["hatch"] = map[string]any{"build": map[string]any{"targets": map[string]any{
-		"wheel": map[string]any{"only-include": []string{"cozy_script.py"}},
+		"wheel": map[string]any{"only-include": []string{"cozy_script.py", "cozy_script_entry.py"}},
 	}}}
 	document := map[string]any{
 		"project": map[string]any{
 			"name": name, "version": "0.0.0", "requires-python": metadata.RequiresPython,
 			"dependencies": metadata.Dependencies,
-			"entry-points": map[string]any{applicationGroup: map[string]string{"default": "cozy_script:app"}},
+			"entry-points": map[string]any{applicationGroup: map[string]string{"default": "cozy_script_entry:app"}},
 		},
 		"build-system": map[string]any{"requires": []string{"hatchling>=1.25"}, "build-backend": "hatchling.build"},
 		"tool":         tool,
@@ -113,9 +113,10 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 		}
 	}()
 	for filename, contents := range map[string][]byte{
-		"cozy_script.py": raw,
-		"pyproject.toml": project,
-		"package.toml":   []byte("[application]\nobject = \"cozy_script:app\"\n"),
+		"cozy_script.py":       raw,
+		"cozy_script_entry.py": []byte("from cozy_runtime.author import script_app\napp = script_app(\"cozy_script\")\n"),
+		"pyproject.toml":       project,
+		"package.toml":         []byte("[application]\nobject = \"cozy_script_entry:app\"\n"),
 		// The current Runtime contract requires standard CPython 3.12. Keep
 		// uv's choice with the snapshot; incompatible script metadata refuses.
 		".python-version": []byte("3.12\n"),
