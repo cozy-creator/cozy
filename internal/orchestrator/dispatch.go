@@ -63,7 +63,9 @@ type Submission struct {
 
 	// Kind is the ATTEMPT CLASS: "" or `serving`, or `job`. A job carries two more facts
 	// a serving request has no version of.
-	Kind string
+	Kind       string
+	RetainWork bool
+	RetryOf    string
 	// Org is the publishing org whose scratch repo this job publishes into.
 	Org string
 	// Trees are the job's typed input TREES as `ref=dir`, one grant input each.
@@ -174,6 +176,10 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	if s.RentalRequired {
 		s.Rental = true
 	}
+	if s.RetainWork && s.Kind != "job" {
+		return records.Request{}, nil, exit.Named(exit.Validation, "retain_work_not_job",
+			"retained work is an ordinary private job capability")
+	}
 	weightsOutputs, weightsBytes, e := normalizeWeightsOutputs(s)
 	if e != nil {
 		return records.Request{}, nil, e
@@ -230,7 +236,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		LocalPackageDigest: s.LocalPackageDigest,
 		Outputs:            strings.Join(s.Outputs, ","),
 		Assets:             s.Assets, WeightsOutputs: string(weightsBytes),
-		Kind: s.Kind, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
+		Kind: s.Kind, RetainWork: s.RetainWork, RetryOf: s.RetryOf, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, Models: s.Models,
 		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer,
@@ -318,6 +324,14 @@ func (c *Orchestrator) logRecordedReplay(req records.Request, idempotencyKey str
 }
 
 func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Error) {
+	current, problem := c.opt.Store.RequestRow(req.ID)
+	if problem != nil || current == nil {
+		return 0, problem
+	}
+	if current.State != "submitted" && current.State != "queued" {
+		return uint64(current.Ordinal), nil
+	}
+	req = *current
 	if req.ModelTransfer != nil && req.Package == "cozy/platform" &&
 		req.Entrypoint == "model-pass-through" {
 		// Narrow attempt-zero exception: an unchanged verified Manifest has no code
@@ -410,6 +424,10 @@ func (c *Orchestrator) requeue(requestID, why string, charge bool) {
 			"outputs": []any{}, "requeuing": false,
 		}
 		row, read := c.opt.Store.RequestRow(requestID)
+		if read == nil && row != nil && row.RetainWork {
+			_, _ = c.opt.Store.BlockRetainedWork(requestID, "REQUEUE_BUDGET_EXHAUSTED", e.Message)
+			return
+		}
 		if read == nil && row != nil && row.ModelTransfer != nil {
 			if problem := c.releaseManagedNow(*row); problem != nil {
 				c.logf("%s model transfer provider cleanup remains pending: %s", requestID, problem.Message)
@@ -1139,6 +1157,10 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 	// own settled state is the authority; nothing that happens to a process afterwards may
 	// contradict it.
 	row, readProblem := c.opt.Store.RequestRow(requestID)
+	if readProblem == nil && row != nil && row.RetainWork {
+		_, _ = c.opt.Store.BlockRetainedWork(requestID, cause.ErrName(), cause.Message)
+		return
+	}
 	if readProblem == nil && row != nil && settledState(row.State) {
 		c.logf("%s already settled %s — NOT failing it over: %s",
 			requestID, row.State, cause.Message)
@@ -1231,6 +1253,14 @@ func (c *Orchestrator) releaseManagedNow(req records.Request) *exit.Error {
 }
 
 func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
+	current, problem := c.opt.Store.RequestRow(req.ID)
+	if problem != nil {
+		return 0, problem
+	}
+	if current == nil || (current.State != "submitted" && current.State != "queued") {
+		return 0, exit.Named(exit.Conflict, "request.execution_stopped", "request %s is not queued for execution", req.ID)
+	}
+	req = *current
 	// PLACEMENT is the orchestrator's: the caller names the binding, and dispatch picks a
 	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence
 	// is open. `pick` also returns the admission epoch it OBSERVED, which is what
@@ -1246,6 +1276,10 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			c.releaseDispatch(reservation)
 		}
 	}()
+	if req.RetainWork && w.wireMinor < RetainedWorkWireMinor {
+		return 0, exit.Named(exit.Structural, "request.retention_unsupported",
+			"retained work requires worker wire %d; selected worker speaks %d", RetainedWorkWireMinor, w.wireMinor)
+	}
 	if w.spec.Connection != nil && req.Worker == "" {
 		// THE PIN IS ROUTING'S OUTPUT (cl-092 step 4): the argmin was a rental, so the
 		// request is pinned to it now — durably, before its identity is bound to that
@@ -1575,7 +1609,11 @@ func downloadModelRefs(models []ModelRef) []*pb.DownloadModelRef {
 		if model.Release == "" {
 			continue
 		}
-		out = append(out, &pb.DownloadModelRef{Package: model.Package, Slot: model.Slot,
+		path := model.Slot
+		if model.BindingPath != "" {
+			path = model.BindingPath
+		}
+		out = append(out, &pb.DownloadModelRef{Package: model.Package, Slot: path,
 			Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest})
 	}
 	return out

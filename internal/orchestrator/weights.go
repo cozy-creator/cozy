@@ -333,7 +333,7 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 	c.mu.Lock()
 	holder := c.workers[s.instanceID]
 	c.mu.Unlock()
-	if req.ModelTransfer != nil && attempt.TerminalStatus == "SUCCEEDED" {
+	if req.ModelTransfer != nil && attempt.TerminalStatus == "SUCCEEDED" && req.State != "canceling" {
 		transfer, problem := c.opt.Store.ModelTransferOf(requestID)
 		if problem != nil {
 			c.logf("OutcomeAck %s#%d not sent: model transfer cannot be read", requestID, ordinal)
@@ -372,7 +372,7 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 		c.logf("OutcomeAck %s#%d was queued but closure is still owed: %s", requestID, ordinal, e.Message)
 		return
 	}
-	if req.ModelTransfer != nil {
+	if req.ModelTransfer != nil && !records.RetainedState(req.State) && req.State != "canceling" {
 		go c.finishModelTransferRequest(requestID, int64(ordinal))
 		return
 	}

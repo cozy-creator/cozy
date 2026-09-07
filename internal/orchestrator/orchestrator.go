@@ -39,9 +39,11 @@ import (
 // Options is the frozen input to one Cozy daemon. Every field is decided by the
 // entrypoint; nothing in this package reads the environment.
 type Options struct {
-	Cfg    config.Config
-	Layout home.Layout
-	Store  *records.Store
+	// ReclaimInstall delegates unpinned snapshot cleanup to the existing package owner.
+	ReclaimInstall func(string) *exit.Error
+	Cfg            config.Config
+	Layout         home.Layout
+	Store          *records.Store
 	// Yield is the GPU yield policy: smart | always | never.
 	Yield string
 	Log   io.Writer
@@ -684,7 +686,7 @@ func (c *Orchestrator) enqueue(requestID string) bool {
 	// either activation appends first and cancel removes it, or activation observes
 	// the absorbing terminal and appends nothing.
 	row, problem := c.opt.Store.RequestRow(requestID)
-	if problem != nil || row == nil || settledState(row.State) {
+	if problem != nil || row == nil || (row.State != "submitted" && row.State != "queued") {
 		return false
 	}
 	for _, id := range c.pending {
@@ -729,7 +731,7 @@ func (c *Orchestrator) drain() {
 			c.forget(id)
 			continue
 		}
-		if settledState(req.State) {
+		if req.State != "submitted" && req.State != "queued" {
 			c.forget(id)
 			continue
 		}
@@ -821,6 +823,11 @@ func (c *Orchestrator) queued(requestID string) bool {
 }
 
 func (c *Orchestrator) kickQueuedTransferDispatch(req records.Request) {
+	current, problem := c.opt.Store.RequestRow(req.ID)
+	if problem != nil || current == nil || (current.State != "submitted" && current.State != "queued") {
+		return
+	}
+	req = *current
 	c.mu.Lock()
 	if c.transferDispatching[req.ID] {
 		c.mu.Unlock()
@@ -847,7 +854,7 @@ func (c *Orchestrator) kickQueuedTransferDispatch(req records.Request) {
 			return
 		}
 		current, readProblem := c.opt.Store.RequestRow(req.ID)
-		if readProblem == nil && current != nil && !settledState(current.State) {
+		if readProblem == nil && current != nil && (current.State == "submitted" || current.State == "queued") {
 			c.selectOrStart(*current)
 			time.AfterFunc(2*time.Second, func() { c.kickQueuedTransferDispatch(*current) })
 		}

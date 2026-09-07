@@ -36,8 +36,8 @@ import (
 //     The refusal is returned and nothing is rented.
 //   - the headers could not be read — an origin that will not serve a range, a network
 //     fault, a source with no provider resolution at all. UNDECIDED. "I could not look" is
-//     never "this is bad", so the caller proceeds to the ordinary path and the pod decides,
-//     exactly as it did before this existed.
+//     never "this is bad". A rented invocation waits for a retry before acquisition;
+//     an undecided header read cannot authorize paying for a conversion gamble.
 type conversionPreflight struct {
 	// Plans by producer slot, when the headers decided.
 	Plans map[string]tfs.SourcePlan
@@ -97,7 +97,7 @@ func preflightConversionPlan(runCtx context.Context, ctx *Context, source publis
 
 	// Reading the headers is the part that can be legitimately impossible. A refusal from
 	// here is a statement about the ORIGIN, never about the model, so it degrades to
-	// undecided rather than blocking a transfer that would have worked.
+	// undecided. The caller requires a decided plan before renting.
 	staged, problem := source.Resolver.Stage(runCtx, source.Resolution,
 		filepath.Join(work.Path, "headers"), true, progress(ctx))
 	if problem != nil {

@@ -411,7 +411,7 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 
 // Expose the existing owner through the ordinary authenticated API/daemon record so
 // the built CLI exercises the actual public recovery control, including closed attempts.
-func publicationControlAPI(t *testing.T, o *owner) func() {
+func publicationControlAPI(t *testing.T, o *owner, configure ...func(*api.Options)) func() {
 	t.Helper()
 	v4, v6, addr, problem := api.Listeners(0)
 	fatal(t, problem)
@@ -422,7 +422,11 @@ func publicationControlAPI(t *testing.T, o *owner) func() {
 	fatal(t, problem)
 	creds, problem := api.Mint(o.l)
 	fatal(t, problem)
-	handler, problem := api.New(api.Options{Orchestrator: o.c, Cfg: o.cfg, Creds: creds, Addr: addr, Web: cozyweb.Handler()}).Handler()
+	options := api.Options{Orchestrator: o.c, Cfg: o.cfg, Creds: creds, Addr: addr, Web: cozyweb.Handler()}
+	for _, apply := range configure {
+		apply(&options)
+	}
+	handler, problem := api.New(options).Handler()
 	fatal(t, problem)
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = server.Serve(v4) }()

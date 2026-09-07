@@ -100,6 +100,11 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 	// on an earlier pass is reused while it is young and re-minted once it is not, which is
 	// what stops a re-send from carrying a signature that has gone cold.
 	window := NewWeightsGrantWindow(mint)
+	type sentTransfer struct {
+		session  *session
+		revision int64
+	}
+	inFlight := make(map[string]sentTransfer, len(known))
 	for {
 		objects, problem := c.opt.Store.ModelTransferObjects(weights.RequestID,
 			weights.Attempt, weights.OutputSlot)
@@ -158,6 +163,12 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 			ids = append(ids, object.ObjectID)
 		}
 		for index, object := range outstanding {
+			if sent, ok := inFlight[object.ObjectID]; ok && sent.session == session &&
+				(object.State != "failed" || object.GrantRevision < sent.revision) {
+				// Progress wakes the whole mover. An accepted object is still in
+				// flight; refreshing its revision would fence its own pending result.
+				continue
+			}
 			// The grant is obtained HERE, immediately before this object's bytes are asked
 			// for, rather than for the whole batch before any of them moved.
 			decision, problem := window.Spendable(ctx, object.ObjectID, ids[index:], time.Now())
@@ -205,8 +216,10 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 						Url: decision.URL, RequiredHeaders: headers,
 						ExpiresAtUnix: decision.ExpiresAtUnix}}
 			}
-			session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_WeightsTransferRequest{
-				WeightsTransferRequest: transfer}})
+			if session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_WeightsTransferRequest{
+				WeightsTransferRequest: transfer}}) {
+				inFlight[object.ObjectID] = sentTransfer{session, object.GrantRevision + 1}
+			}
 		}
 		if wait := c.waitTransfer(ctx, weights.RequestID); wait != nil {
 			return wait
