@@ -935,9 +935,11 @@ const (
 	PodHost_PreparePrivatePlacement_FullMethodName = "/cozy.worker.v1.PodHost/PreparePrivatePlacement"
 	PodHost_ModelSourceFile_FullMethodName         = "/cozy.worker.v1.PodHost/ModelSourceFile"
 	PodHost_ModelSourcePrepare_FullMethodName      = "/cozy.worker.v1.PodHost/ModelSourcePrepare"
+	PodHost_ModelSourceAdopt_FullMethodName        = "/cozy.worker.v1.PodHost/ModelSourceAdopt"
 	PodHost_CheckpointPage_FullMethodName          = "/cozy.worker.v1.PodHost/CheckpointPage"
 	PodHost_CheckpointTransfer_FullMethodName      = "/cozy.worker.v1.PodHost/CheckpointTransfer"
 	PodHost_LocalPackageFetch_FullMethodName       = "/cozy.worker.v1.PodHost/LocalPackageFetch"
+	PodHost_LocalPackageUpload_FullMethodName      = "/cozy.worker.v1.PodHost/LocalPackageUpload"
 	PodHost_LocalPackageAbort_FullMethodName       = "/cozy.worker.v1.PodHost/LocalPackageAbort"
 	PodHost_WeightsTransfer_FullMethodName         = "/cozy.worker.v1.PodHost/WeightsTransfer"
 	PodHost_WeightsIntentReady_FullMethodName      = "/cozy.worker.v1.PodHost/WeightsIntentReady"
@@ -981,9 +983,11 @@ type PodHostClient interface {
 	PreparePrivatePlacement(ctx context.Context, in *PreparePrivatePlacementCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
 	ModelSourceFile(ctx context.Context, in *ModelSourceFileCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ModelSourceFileStatus], error)
 	ModelSourcePrepare(ctx context.Context, in *ModelSourcePrepareCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error)
+	ModelSourceAdopt(ctx context.Context, in *ModelSourceAdoptCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error)
 	CheckpointPage(ctx context.Context, in *CheckpointPageCall, opts ...grpc.CallOption) (*CheckpointPageResult, error)
 	CheckpointTransfer(ctx context.Context, in *CheckpointTransferCall, opts ...grpc.CallOption) (*CheckpointTransferStatus, error)
 	LocalPackageFetch(ctx context.Context, in *LocalPackageFetchCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LocalPackageFileStatus], error)
+	LocalPackageUpload(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LocalPackageUploadFrame, LocalPackageFileStatus], error)
 	LocalPackageAbort(ctx context.Context, in *LocalPackageAbortCall, opts ...grpc.CallOption) (*LocalPackageAbortStatus, error)
 	WeightsTransfer(ctx context.Context, in *WeightsTransferCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WeightsTransferStatus], error)
 	WeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error)
@@ -1093,6 +1097,16 @@ func (c *podHostClient) ModelSourcePrepare(ctx context.Context, in *ModelSourceP
 	return out, nil
 }
 
+func (c *podHostClient) ModelSourceAdopt(ctx context.Context, in *ModelSourceAdoptCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ModelSourcePrepared)
+	err := c.cc.Invoke(ctx, PodHost_ModelSourceAdopt_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *podHostClient) CheckpointPage(ctx context.Context, in *CheckpointPageCall, opts ...grpc.CallOption) (*CheckpointPageResult, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckpointPageResult)
@@ -1132,6 +1146,19 @@ func (c *podHostClient) LocalPackageFetch(ctx context.Context, in *LocalPackageF
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PodHost_LocalPackageFetchClient = grpc.ServerStreamingClient[LocalPackageFileStatus]
 
+func (c *podHostClient) LocalPackageUpload(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LocalPackageUploadFrame, LocalPackageFileStatus], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[5], PodHost_LocalPackageUpload_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[LocalPackageUploadFrame, LocalPackageFileStatus]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PodHost_LocalPackageUploadClient = grpc.BidiStreamingClient[LocalPackageUploadFrame, LocalPackageFileStatus]
+
 func (c *podHostClient) LocalPackageAbort(ctx context.Context, in *LocalPackageAbortCall, opts ...grpc.CallOption) (*LocalPackageAbortStatus, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(LocalPackageAbortStatus)
@@ -1144,7 +1171,7 @@ func (c *podHostClient) LocalPackageAbort(ctx context.Context, in *LocalPackageA
 
 func (c *podHostClient) WeightsTransfer(ctx context.Context, in *WeightsTransferCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WeightsTransferStatus], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[5], PodHost_WeightsTransfer_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[6], PodHost_WeightsTransfer_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1209,9 +1236,11 @@ type PodHostServer interface {
 	PreparePrivatePlacement(*PreparePrivatePlacementCall, grpc.ServerStreamingServer[PrepareEvent]) error
 	ModelSourceFile(*ModelSourceFileCall, grpc.ServerStreamingServer[ModelSourceFileStatus]) error
 	ModelSourcePrepare(context.Context, *ModelSourcePrepareCall) (*ModelSourcePrepared, error)
+	ModelSourceAdopt(context.Context, *ModelSourceAdoptCall) (*ModelSourcePrepared, error)
 	CheckpointPage(context.Context, *CheckpointPageCall) (*CheckpointPageResult, error)
 	CheckpointTransfer(context.Context, *CheckpointTransferCall) (*CheckpointTransferStatus, error)
 	LocalPackageFetch(*LocalPackageFetchCall, grpc.ServerStreamingServer[LocalPackageFileStatus]) error
+	LocalPackageUpload(grpc.BidiStreamingServer[LocalPackageUploadFrame, LocalPackageFileStatus]) error
 	LocalPackageAbort(context.Context, *LocalPackageAbortCall) (*LocalPackageAbortStatus, error)
 	WeightsTransfer(*WeightsTransferCall, grpc.ServerStreamingServer[WeightsTransferStatus]) error
 	WeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error)
@@ -1243,6 +1272,9 @@ func (UnimplementedPodHostServer) ModelSourceFile(*ModelSourceFileCall, grpc.Ser
 func (UnimplementedPodHostServer) ModelSourcePrepare(context.Context, *ModelSourcePrepareCall) (*ModelSourcePrepared, error) {
 	return nil, status.Error(codes.Unimplemented, "method ModelSourcePrepare not implemented")
 }
+func (UnimplementedPodHostServer) ModelSourceAdopt(context.Context, *ModelSourceAdoptCall) (*ModelSourcePrepared, error) {
+	return nil, status.Error(codes.Unimplemented, "method ModelSourceAdopt not implemented")
+}
 func (UnimplementedPodHostServer) CheckpointPage(context.Context, *CheckpointPageCall) (*CheckpointPageResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckpointPage not implemented")
 }
@@ -1251,6 +1283,9 @@ func (UnimplementedPodHostServer) CheckpointTransfer(context.Context, *Checkpoin
 }
 func (UnimplementedPodHostServer) LocalPackageFetch(*LocalPackageFetchCall, grpc.ServerStreamingServer[LocalPackageFileStatus]) error {
 	return status.Error(codes.Unimplemented, "method LocalPackageFetch not implemented")
+}
+func (UnimplementedPodHostServer) LocalPackageUpload(grpc.BidiStreamingServer[LocalPackageUploadFrame, LocalPackageFileStatus]) error {
+	return status.Error(codes.Unimplemented, "method LocalPackageUpload not implemented")
 }
 func (UnimplementedPodHostServer) LocalPackageAbort(context.Context, *LocalPackageAbortCall) (*LocalPackageAbortStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method LocalPackageAbort not implemented")
@@ -1362,6 +1397,24 @@ func _PodHost_ModelSourcePrepare_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PodHost_ModelSourceAdopt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ModelSourceAdoptCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).ModelSourceAdopt(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_ModelSourceAdopt_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).ModelSourceAdopt(ctx, req.(*ModelSourceAdoptCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _PodHost_CheckpointPage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CheckpointPageCall)
 	if err := dec(in); err != nil {
@@ -1408,6 +1461,13 @@ func _PodHost_LocalPackageFetch_Handler(srv interface{}, stream grpc.ServerStrea
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PodHost_LocalPackageFetchServer = grpc.ServerStreamingServer[LocalPackageFileStatus]
+
+func _PodHost_LocalPackageUpload_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(PodHostServer).LocalPackageUpload(&grpc.GenericServerStream[LocalPackageUploadFrame, LocalPackageFileStatus]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PodHost_LocalPackageUploadServer = grpc.BidiStreamingServer[LocalPackageUploadFrame, LocalPackageFileStatus]
 
 func _PodHost_LocalPackageAbort_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(LocalPackageAbortCall)
@@ -1472,6 +1532,10 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _PodHost_ModelSourcePrepare_Handler,
 		},
 		{
+			MethodName: "ModelSourceAdopt",
+			Handler:    _PodHost_ModelSourceAdopt_Handler,
+		},
+		{
 			MethodName: "CheckpointPage",
 			Handler:    _PodHost_CheckpointPage_Handler,
 		},
@@ -1513,6 +1577,12 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "LocalPackageFetch",
 			Handler:       _PodHost_LocalPackageFetch_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "LocalPackageUpload",
+			Handler:       _PodHost_LocalPackageUpload_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
 		},
 		{
 			StreamName:    "WeightsTransfer",

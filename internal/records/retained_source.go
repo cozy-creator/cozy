@@ -21,8 +21,9 @@ func SameSourceAcquisition(a, b *ModelTransferIntent) bool {
 	return reflect.DeepEqual(left, right)
 }
 
-// RetriedSourceCheckpoints returns only acknowledged checkpoints from the exact
-// predecessor acquisition. Merely observed bytes are never promoted to custody.
+// RetriedSourceCheckpoints selects the exact predecessor acquisition. Private
+// work uses observed local heads; the caller must also prove the original boot
+// still holds them. These observations never become remote custody acknowledgments.
 func (s *Store) RetriedSourceCheckpoints(id string) (string, []ModelCheckpointProgress, *exit.Error) {
 	request, problem := s.RequestRow(id)
 	if problem != nil || request == nil || request.RetryOf == "" {
@@ -35,6 +36,9 @@ func (s *Store) RetriedSourceCheckpoints(id string) (string, []ModelCheckpointPr
 	progress, problem := s.ModelSourceProgress(prior.ID)
 	if problem != nil {
 		return "", nil, problem
+	}
+	if request.RetainWork {
+		return prior.ID, progress, nil
 	}
 	retained := progress[:0]
 	for _, item := range progress {
@@ -119,6 +123,10 @@ func (s *Store) RetriedSourceCustodyPending(priorID string) (bool, *exit.Error) 
 	}
 	rows.Close()
 	for _, id := range ids {
+		request, problem := s.RequestRow(id)
+		if problem != nil || request == nil {
+			return false, problem
+		}
 		_, prior, problem := s.RetriedSourceCheckpoints(id)
 		if problem != nil {
 			return false, problem
@@ -130,10 +138,17 @@ func (s *Store) RetriedSourceCustodyPending(priorID string) (bool, *exit.Error) 
 		bySlot := map[string]*ModelCheckpoint{}
 		for _, progress := range current {
 			bySlot[progress.Observed.Slot] = progress.Acknowledged
+			if request.RetainWork {
+				bySlot[progress.Observed.Slot] = &progress.Observed
+			}
 		}
 		for _, progress := range prior {
 			owned := bySlot[progress.Observed.Slot]
-			if owned == nil || owned.PlanDigest != progress.Acknowledged.PlanDigest || owned.Index < progress.Acknowledged.Index {
+			needed := progress.Acknowledged
+			if request.RetainWork {
+				needed = &progress.Observed
+			}
+			if owned == nil || owned.PlanDigest != needed.PlanDigest || owned.Bytes < needed.Bytes {
 				return true, nil
 			}
 		}
