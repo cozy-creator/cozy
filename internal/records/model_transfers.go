@@ -799,7 +799,8 @@ func (s *Store) RequestModelTransferCancellation(requestID string) *exit.Error {
 }
 
 // SettleModelTransferRequest atomically projects destination retention into the
-// ordinary request terminal and its absorbing event. Provider teardown happens first.
+// ordinary request terminal and its absorbing event. Attempt ACK and provider cleanup
+// are separate obligations and do not delay successful publication.
 func (s *Store) SettleModelTransferRequest(requestID string, attempt int64) (string, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {

@@ -77,6 +77,8 @@ type fakePod struct {
 	serve bool
 	// jobReady advertises the independent job seat after accepting a JobDirective.
 	jobReady bool
+	// snapshotHeld replays actual retained attempt identities during reconnect tests.
+	snapshotHeld []*pb.HeldAttempt
 	// onJobReady can delay and sequence the independent peer's readiness facts.
 	onJobReady func(*pb.WorkerFrame, func(*pb.WorkerFrame) error) error
 	// answerOffer supplies a protocol outcome when a test exercises settlement.
@@ -266,7 +268,8 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			}
 			body, digest, err := canonical.Identity(&pb.WorkerSnapshotBody{
 				WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE, AdmissionEpoch: 1,
-				AdmissionState: pb.AdmissionState_ADMISSION_STATE_CLOSED, AvailableAttemptSlots: 2})
+				AdmissionState: pb.AdmissionState_ADMISSION_STATE_CLOSED, AvailableAttemptSlots: 2,
+				HeldAttempts: p.snapshotHeld})
 			if err != nil {
 				return err
 			}
