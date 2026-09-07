@@ -585,7 +585,7 @@ pub fn convert(
                     };
                     let (rp, abs) = carrier::resolve(&f.path, &f.header, t)?;
                     let mut region = carrier::Region::open(rp, abs, t.nbytes())?;
-                    let w = ck::objectize_held(
+                    let w = ck::store_part_held(
                         store,
                         &what,
                         r.dtype,
@@ -616,7 +616,7 @@ pub fn convert(
                     // peak RSS a function of the artifact (231 MB on the real H3 QKV).
                     let (rp, abs) = carrier::resolve(&f.path, &f.header, t)?;
                     let mut region = carrier::RunRegion::open(rp, abs, xform.runs())?;
-                    let w = ck::objectize_held(
+                    let w = ck::store_part_held(
                         store,
                         &what,
                         r.dtype,
