@@ -106,11 +106,12 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	// deletes the obsolete aggregate package revision digest.
 	if columns := columnNames(t, db, "requests"); !columns["local_package_digest"] ||
 		!columns["local_package_uploaded_boot_id"] || columns["private_package_digest"] ||
-		!columns["machine"] || !columns["retain_work"] || columns["config_digest"] || columns["package_revision_digest"] {
+		!columns["machine"] || !columns["retain_work"] || !columns["retry_of"] || !columns["reuse_scope"] ||
+		!columns["control_revision"] || columns["config_digest"] || columns["package_revision_digest"] {
 		t.Fatalf("requests columns after migration = %v", columns)
 	}
 	var retained int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM requests WHERE retain_work!=0`).Scan(&retained); err != nil || retained != 0 {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM requests WHERE retain_work!=0 OR retry_of!='' OR reuse_scope!='' OR control_revision!=0`).Scan(&retained); err != nil || retained != 0 {
 		t.Fatalf("migration silently opted existing requests into retained work: %d, %v", retained, err)
 	}
 	// Schema 17 backfill: a row whose rental row survives gets that rental's machine
