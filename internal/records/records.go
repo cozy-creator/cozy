@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 27
+const schemaVersion = 28
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -113,6 +113,8 @@ CREATE TABLE IF NOT EXISTS pins (
 // schema is the only records shape this pre-launch build accepts.
 var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orchestratorSchema,
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
+
+func init() { schema = append(schema, weightsRetentionsDDL) }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
@@ -270,6 +272,11 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 	if sourceVersion < 27 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
+		}
+	}
+	if sourceVersion < 28 {
+		if _, err := tx.Exec(weightsRetentionsDDL); err != nil {
+			return exit.Internalf("cannot create artifact retention ownership in %s: %s", path, err)
 		}
 	}
 	if sourceVersion < 16 {
@@ -670,6 +677,9 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
+		if version < 28 && statement == weightsRetentionsDDL {
+			continue
+		}
 		if version < 27 && (statement == childBindingsDDL || statement == childRequestIndex) {
 			continue
 		}

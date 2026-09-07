@@ -102,6 +102,7 @@ type Slot struct {
 
 // Struct is a rendered msgspec struct.
 type Struct struct {
+	Input    string          `json:"input,omitempty"`
 	Fields   []Field         `json:"fields"`
 	TagField string          `json:"tag_field"`
 	Tag      json.RawMessage `json:"tag"`
@@ -285,6 +286,10 @@ func MissingComponents(slot Slot, available []string) []string {
 }
 
 func validateStructRaw(raw json.RawMessage) error {
+	var native map[string]json.RawMessage
+	if json.Unmarshal(raw, &native) == nil && len(native) == 1 && string(native["input"]) == `"model"` {
+		return nil
+	}
 	object, err := exactKeys(raw, []string{"fields"}, []string{"tag", "tag_field"})
 	if err != nil {
 		return err
@@ -606,6 +611,9 @@ func typeOf(raw json.RawMessage) (kind string, nested Struct) {
 	// wire value is a REF, and the grant is what turns that ref into a readable path.
 	if kind, ok := object["input"]; ok && string(kind) == `"tree"` {
 		return "tree", Struct{}
+	}
+	if kind, ok := object["input"]; ok && string(kind) == `"model"` {
+		return "model", Struct{Input: "model"}
 	}
 	if _, ok := object["fields"]; ok {
 		var s Struct

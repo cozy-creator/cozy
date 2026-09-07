@@ -121,15 +121,29 @@ func (g WeightsGrantMint) DeclaredLife() time.Duration {
 
 func (c *Orchestrator) onModelTransferWeightsReceipt(s *session, frame *pb.WeightsReceiptFrame) {
 	transfer, problem := c.opt.Store.ModelTransferOf(frame.RequestId)
-	if problem != nil || transfer == nil {
+	if problem != nil {
 		return
 	}
 	request, problem := c.opt.Store.RequestRow(frame.RequestId)
 	if problem != nil || request == nil || !request.IsJob() {
 		return
 	}
+	if transfer == nil && !request.RetainWork {
+		return
+	}
 	attempt, problem := c.opt.Store.AttemptRow(frame.RequestId, int64(frame.AttemptOrdinal))
 	if problem != nil || attempt == nil || attempt.InstanceID != s.instanceID {
+		return
+	}
+	declared, problem := decodeWeightsOutputs(attempt.WeightsOutputs)
+	if problem != nil {
+		return
+	}
+	allowed := false
+	for _, output := range declared {
+		allowed = allowed || output.OutputID == frame.OutputSlot
+	}
+	if !allowed {
 		return
 	}
 	invocationDigest, err := canonical.Spell(frame.InvocationSpecDigest)
@@ -147,7 +161,7 @@ func (c *Orchestrator) onModelTransferWeightsReceipt(s *session, frame *pb.Weigh
 		"weights_receipt_canonical_bytes": base64.StdEncoding.EncodeToString(
 			frame.WeightsReceipt.WeightsReceiptCanonicalBytes),
 	})
-	if problem != nil || receipt.RequestID != frame.RequestId ||
+	if problem != nil || receipt.OwnerScope != recordOwnerID || receipt.RequestID != frame.RequestId ||
 		receipt.InvocationDigest != invocationDigest || receipt.OutputSlot != frame.OutputSlot {
 		return
 	}
