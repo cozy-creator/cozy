@@ -67,6 +67,19 @@ func (f *Fetch) Acquire(ctx context.Context, row hub.ModelManifest) (Fetched, *e
 			"waiting for the active model download stopped: %s", err)
 	}
 	defer flock.Release(file)
+	if row.Release == "" {
+		length, problem := f.Tool.RetainedCheckpoint(f.Ref.Org, f.Ref.Name, row.ManifestID, f.Scratch)
+		if problem != nil {
+			return out, problem
+		}
+		if length > 0 {
+			if problem := f.Tool.VerifyManifest(row.ManifestID); problem != nil {
+				return out, problem
+			}
+			return Fetched{ManifestID: row.ManifestID, ManifestLength: length, HeaderID: row.HeaderID, MS: map[string]int64{}}, nil
+		}
+		return f.Run(ctx, row)
+	}
 	releases, problem := f.Tool.Releases(filepath.Join(f.Scratch, "resident-releases.jsonl"))
 	if problem != nil {
 		return out, problem
@@ -149,10 +162,10 @@ func (f *Fetch) Resolve(ctx context.Context) (hub.ModelManifest, *exit.Error) {
 		return hub.ModelManifest{}, exit.Internalf(
 			"model resolution for %q returned an invalid model, manifest, or header", f.Spec)
 	}
-	if resolved.Release == "" || resolved.Lane == "" {
+	if (resolved.Release == "") != (resolved.Lane == "") {
 		return hub.ModelManifest{}, exit.Named(exit.Usage, "model.release_required",
-			"%q resolves only a manifest digest; a local repository requires a release and lane", f.Spec).
-			WithRemedy("download an immutable release and select one exact lane")
+			"%q resolves an incomplete release/lane pair", f.Spec).
+			WithRemedy("select a checkpoint digest or one exact release lane")
 	}
 	f.Ref, f.ManifestID = ref, resolved.ManifestID
 	return hub.ModelManifest{
@@ -178,7 +191,13 @@ func (f *Fetch) Run(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.
 	// Round 1 — the manifest. It proves its own identity before entering the typed
 	// manifest namespace.
 	t0 := time.Now()
-	doc, e := f.Hub.ReleaseManifest(ctx, f.Ref, row.Release, row.Lane)
+	var doc []byte
+	var e *exit.Error
+	if row.Release == "" {
+		doc, e = f.Hub.CheckpointManifest(ctx, f.Ref, row.ManifestID)
+	} else {
+		doc, e = f.Hub.ReleaseManifest(ctx, f.Ref, row.Release, row.Lane)
+	}
 	if e != nil {
 		return out, e
 	}
@@ -234,9 +253,8 @@ func (f *Fetch) Run(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.
 	out.MS["objects"] = since(t0)
 	out.Rounds = 3
 
-	// The proof. Every declared byte, hashed. Only now does the manifest become a
-	// named local release — before this it is objects in a store and nothing points at
-	// them, which is what "no partial visibility" means on this side.
+	// The proof. Every declared byte is verified before the native repository
+	// retains this checkpoint, with a release label only when one was selected.
 	t0 = time.Now()
 	if e := f.Tool.VerifyManifest(row.ManifestID); e != nil {
 		return out, e
@@ -244,8 +262,12 @@ func (f *Fetch) Run(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.
 	out.MS["verify"] = since(t0)
 	f.say("verified %d blobs — every declared byte", len(objects))
 
-	if e := f.Tool.CommitRelease(f.Ref.Org, f.Ref.Name, row.Release, row.Lane,
-		row.ManifestID, int64(len(doc)), f.Scratch); e != nil {
+	if row.Release == "" {
+		e = f.Tool.CommitCheckpoint(f.Ref.Org, f.Ref.Name, row.ManifestID, int64(len(doc)), f.Scratch)
+	} else {
+		e = f.Tool.CommitRelease(f.Ref.Org, f.Ref.Name, row.Release, row.Lane, row.ManifestID, int64(len(doc)), f.Scratch)
+	}
+	if e != nil {
 		return out, e
 	}
 	f.say("timing: %s", Timing(out.MS))
@@ -262,20 +284,28 @@ func (f *Fetch) plan(ctx context.Context, row hub.ModelManifest, out Fetched) (F
 	out.Objects, out.Bytes = row.Objects, row.Bytes
 	f.say("the hub's row: %d objects, %s", row.Objects, size(row.Bytes))
 
-	releases, e := f.Tool.Releases(filepath.Join(f.Scratch, "plan-releases.jsonl"))
-	if e != nil {
-		return out, e
-	}
 	resident := false
-	for _, release := range releases {
-		if "sha256:"+release.ManifestSHA256 == row.ManifestID {
-			resident = true
-			break
+	if row.Release == "" {
+		length, problem := f.Tool.RetainedCheckpoint(f.Ref.Org, f.Ref.Name, row.ManifestID, f.Scratch)
+		if problem != nil {
+			return out, problem
+		}
+		resident = length > 0
+	} else {
+		releases, problem := f.Tool.Releases(filepath.Join(f.Scratch, "plan-releases.jsonl"))
+		if problem != nil {
+			return out, problem
+		}
+		for _, release := range releases {
+			if "sha256:"+release.ManifestSHA256 == row.ManifestID {
+				resident = true
+				break
+			}
 		}
 	}
 	if !resident {
 		out.Moved = row.Bytes
-		f.say("this store has no release for the manifest: its whole closure would move")
+		f.say("this store does not retain the manifest: its whole closure would move")
 		return out, nil
 	}
 	objects, e := f.Tool.ManifestObjects(row.ManifestID, filepath.Join(f.Scratch, "plan-objects.jsonl"))
@@ -347,7 +377,13 @@ func (f *Fetch) round(ctx context.Context, row hub.ModelManifest, name string, o
 		// headers. Acquire only the grants this install batch will consume: a large
 		// closure must not become one closure-sized silent control-plane call, and
 		// later grants must not age while earlier objects move.
-		reads, e := f.Hub.ReleaseReads(ctx, f.Ref, row.Release, row.Lane, ids)
+		var reads []hub.Read
+		var e *exit.Error
+		if row.Release == "" {
+			reads, e = f.Hub.CheckpointReads(ctx, f.Ref, row.ManifestID, ids)
+		} else {
+			reads, e = f.Hub.ReleaseReads(ctx, f.Ref, row.Release, row.Lane, ids)
+		}
 		if e != nil {
 			return e
 		}

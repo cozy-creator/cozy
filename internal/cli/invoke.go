@@ -478,9 +478,8 @@ func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstal
 
 func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw, wantedLane string,
 	binding *hub.PackageBindingRow) (orchestrator.ModelRef, *exit.Error) {
-	// A caller may narrow by Manifest spelling, but cannot introduce one: the Hub-authored
-	// release card below must contain it in an exact lane before it enters request identity
-	// or a signed worker download delegation. No caller bytes or local path are trusted.
+	// Exact checkpoint inputs use Hub-owned facts; named selections use the release
+	// card. Both freeze a verified repository/manifest identity before preparation.
 	var empty orchestrator.ModelRef
 	modelName, release, refLane, manifest, problem := parseModelRef(raw)
 	if problem != nil {
