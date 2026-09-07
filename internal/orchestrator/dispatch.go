@@ -353,7 +353,7 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 		// one projection. Every OTHER refusal (an open recovered obligation, a live
 		// attempt) is a real conflict and still refuses.
 		if e.Code != exit.Unavailable {
-			c.failQueued(req.ID, e)
+			c.failQueued(req.ID, e, "")
 			return 0, e
 		}
 		if !c.enqueue(req.ID) {
@@ -553,7 +553,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		// it once its placement reports DISPATCHABLE.
 		if c.opt.RentalFleet == nil || c.opt.AcquireManagedRental == nil {
 			c.failQueued(req.ID, exit.Named(exit.Unavailable, "rental.acquisition_unavailable",
-				"this Cozy daemon cannot acquire managed rentals"))
+				"this Cozy daemon cannot acquire managed rentals"), "")
 			return
 		}
 		guard := "rental/" + requestSlot(req)
@@ -579,7 +579,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			if c.deferUnavailable(req, problem) {
 				return
 			}
-			c.failQueued(req.ID, problem)
+			c.failQueued(req.ID, problem, "")
 			return
 		}
 		c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
@@ -593,7 +593,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			if c.deferUnavailable(req, problem) {
 				return
 			}
-			c.failQueued(req.ID, problem)
+			c.failQueued(req.ID, problem, "")
 			return
 		}
 		if after != "" {
@@ -714,7 +714,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			if c.deferUnavailable(req, e) {
 				return
 			}
-			c.failQueued(req.ID, autoRentalGate(req, e))
+			c.failQueued(req.ID, autoRentalGate(req, e), "")
 			return
 		}
 		if planID != "" && planID != req.PlanID {
@@ -722,7 +722,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			// drain routes from, so the plan is durable before the queue is re-asked.
 			if e := c.opt.Store.BindRequestPlan(req.ID, planID); e != nil {
 				done()
-				c.failQueued(req.ID, e)
+				c.failQueued(req.ID, e, "")
 				return
 			}
 		}
@@ -745,7 +745,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			if c.deferUnavailable(req, e) {
 				return
 			}
-			c.failQueued(req.ID, autoRentalGate(req, e))
+			c.failQueued(req.ID, autoRentalGate(req, e), "")
 			return
 		}
 		c.logf("%s: %s is %s for the queued request", req.Package, instance, change)
@@ -767,9 +767,8 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 				done()
 				return
 			}
-			c.ShutdownWorker(instance, StopGrace)
 			done()
-			c.failQueued(req.ID, autoRentalGate(req, e))
+			c.failQueued(req.ID, autoRentalGate(req, e), instance)
 			return
 		}
 		c.drain()
@@ -1133,83 +1132,43 @@ func (c *Orchestrator) exactLocalTransferProducer(req records.Request, spec Work
 // failQueued settles a request that can never be placed. It is a request-level terminal:
 // no offer crossed to a worker, so there is no worker terminal to replay and the request
 // row is what settles. A closed dispatch_aborted row may remain as preparation history.
-func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
-	c.forget(requestID)
-	// A REQUEST THAT ALREADY SETTLED IS NOT FAILED BY A LATER OBSERVATION. The launch
-	// goroutine that made this request's worker resident OUTLIVES the request: a job
-	// worker is terminal-and-reclaim, so it EXITS the moment its terminal is acknowledged,
-	// and `EnsurePlacementReady` then answers "the package worker exited before reporting ready" —
-	// about a process whose exit was the successful end of the work.
-	//
-	// Observed live in cl-004's crash arm, and it is the worst failure class this system
-	// has: `request.completed` followed by `request.failed` on ONE request, with the row
-	// overwritten to `failed` after its publication had already committed. The request's
-	// own settled state is the authority; nothing that happens to a process afterwards may
-	// contradict it.
-	row, readProblem := c.opt.Store.RequestRow(requestID)
-	if readProblem == nil && row != nil && settledState(row.State) {
-		c.logf("%s already settled %s — NOT failing it over: %s",
-			requestID, row.State, cause.Message)
-		return
-	}
+func (c *Orchestrator) failQueued(requestID string, cause *exit.Error, workerToStop string) {
 	payload := map[string]any{"status": "FAILED", "cause": cause.ErrName(),
 		"error_type": cause.ErrName(), "error": cause.Message,
 		"outputs": []any{}, "requeuing": false}
-	if row != nil && row.ModelTransfer != nil {
-		if problem := c.releaseManagedNow(*row); problem != nil {
-			c.logf("%s model transfer provider cleanup remains pending: %s", requestID, problem.Message)
-			time.AfterFunc(2*time.Second, func() { c.failQueued(requestID, cause) })
+	// The preparation waiter can outlive an accepted attempt or its successful
+	// finalization. The store is the sole authority to fail queued work; neither
+	// cleanup nor worker/provider teardown may run before that transaction wins.
+	applied, problem := c.opt.Store.FailQueuedRequest(requestID, payload)
+	if problem != nil {
+		if problem.Code == exit.Conflict {
+			c.logf("%s preparation failure no longer applies: %s", requestID, problem.Message)
 			return
 		}
-		if _, problem := c.opt.Store.FailModelTransferRequest(requestID, cause.ErrName(),
-			cause.Message, payload); problem != nil {
-			c.logf("%s model transfer failure could not settle: %s", requestID, problem.Message)
-			time.AfterFunc(2*time.Second, func() { c.failQueued(requestID, cause) })
-			return
-		}
-		go c.cleanupRequestAssets(*row)
-		c.forgetTransferProgress(requestID)
-		c.logf("%s FAILED before any offer: %s", requestID, cause.Message)
-		c.signalClosed(requestWaitKey(requestID), cause)
-		return
-	}
-	applied, e := c.opt.Store.FailQueuedRequest(requestID, payload)
-	if e != nil {
-		// A CONFLICT HERE IS PERMANENT AND MUST NOT BE RETRIED. The store refuses a queued
-		// failure for a request that holds an open attempt, and no amount of asking again
-		// changes that: the attempt owns the request's fate, and the only thing that can
-		// settle it is the attempt's own terminal or the lost-attempt sweep. Retrying it
-		// every two seconds forever is the swallowed-refusal shape from the other
-		// direction — a permanent condition restated 1200 times an hour, filling the log
-		// and never surfacing. Observed live against req-b2df33d17e663a8a1e047246, whose
-		// pod had been destroyed: "could not be settled: … has an attempt and is not a
-		// queued failure", every 2 s, indefinitely.
-		if e.Code == exit.Conflict {
-			c.logf("%s cannot be failed as queued work: %s; leaving it to the attempt that holds it",
-				requestID, e.Message)
-			return
-		}
-		c.logf("%s could not be settled: %s", requestID, e.Message)
-		time.AfterFunc(2*time.Second, func() { c.failQueued(requestID, cause) })
+		c.logf("%s could not be settled: %s", requestID, problem.Message)
+		time.AfterFunc(2*time.Second, func() { c.failQueued(requestID, cause, workerToStop) })
 		return
 	}
 	if !applied {
+		c.logf("%s preparation failure no longer applies: %s", requestID, cause.Message)
 		return
-	} else {
-		// An --out row is created with the request, before attempt 1 exists. Failure at
-		// placement therefore still owes that row a durable `skipped` settlement; leaving
-		// it pending made the CLI consume the terminal and then wait forever for bytes a
-		// failed request can never publish.
-		c.RetryOutputExport(requestID)
 	}
-	if row, e := c.opt.Store.RequestRow(requestID); e == nil && row != nil {
+	c.forget(requestID)
+	if workerToStop != "" {
+		c.ShutdownWorker(workerToStop, StopGrace)
+	}
+	// An output obligation exists before attempt one. Settle it as skipped so
+	// the caller does not wait for bytes a failed preparation cannot produce.
+	c.RetryOutputExport(requestID)
+	if row, problem := c.opt.Store.RequestRow(requestID); problem == nil && row != nil {
 		go c.cleanupRequestAssets(*row)
+		if row.ModelTransfer != nil {
+			c.forgetTransferProgress(requestID)
+		}
+		c.releaseManaged(*row)
 	}
 	c.logf("%s FAILED before any offer: %s", requestID, cause.Message)
 	c.signalClosed(requestWaitKey(requestID), cause)
-	if row, problem := c.opt.Store.RequestRow(requestID); problem == nil && row != nil {
-		c.releaseManaged(*row)
-	}
 }
 
 func (c *Orchestrator) releaseManaged(req records.Request) {

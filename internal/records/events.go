@@ -152,8 +152,7 @@ func (s *Store) FailQueuedRequest(requestID string, payload map[string]any) (boo
 		}
 		return false, exit.Internalf("cannot read queued request %s: %s", requestID, err)
 	}
-	if state == "canceled" || state == "succeeded" || state == "failed" ||
-		state == "refused" || state == "abandoned" {
+	if state != "submitted" && state != "queued" {
 		return false, nil
 	}
 	if openAttempts != 0 {
@@ -162,6 +161,13 @@ func (s *Store) FailQueuedRequest(requestID string, payload map[string]any) (boo
 	}
 	if _, err := tx.Exec(`UPDATE requests SET state='failed' WHERE id=?`, requestID); err != nil {
 		return false, exit.Internalf("cannot settle queued request %s: %s", requestID, err)
+	}
+	code, _ := payload["error_type"].(string)
+	detail, _ := payload["error"].(string)
+	if _, err := tx.Exec(`UPDATE request_model_transfers SET state='failed',error_code=?,
+		safe_error=?,updated_at=? WHERE request_id=? AND state NOT IN ('completed','canceling','canceled')`,
+		code, detail, now(), requestID); err != nil {
+		return false, exit.Internalf("cannot fail queued model transfer %s: %s", requestID, err)
 	}
 	if err := appendEventTx(tx, requestID, "request.failed", 0, payload); err != nil {
 		return false, exit.Internalf("cannot append queued failure for %s: %s", requestID, err)
