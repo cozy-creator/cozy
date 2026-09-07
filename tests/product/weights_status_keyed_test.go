@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"database/sql"
@@ -52,12 +53,14 @@ func TestWeightsStatusUsesOnlyTheNamedObject(t *testing.T) {
 	for i := range objects {
 		objects[i] = records.ModelTransferObject{ObjectID: fmt.Sprintf("sha256:%064x", i+1), Length: 4096, SourceRef: "native-retained-object"}
 	}
-	weights := records.ModelTransferWeights{RequestID: id, Attempt: int64(p.offer.AttemptOrdinal), OutputSlot: "model", ManifestID: objects[0].ObjectID, ManifestLength: 4096, InvocationDigest: invocation, TransactionID: "weights-status-proof", Objects: objects}
+	// Actual H3 full publication retains 426,619 bytes of opaque native receipt.
+	receipt := bytes.Repeat([]byte{0x5a}, 426619)
+	weights := records.ModelTransferWeights{RequestID: id, Attempt: int64(p.offer.AttemptOrdinal), OutputSlot: "model", ManifestID: objects[0].ObjectID, ManifestLength: 4096, InvocationDigest: invocation, TransactionID: "weights-status-proof", Receipt: receipt, Objects: objects}
 	fatal(t, o.store.RecordModelTransferWeights(weights))
 	full, problem := o.store.ModelTransferWeights(id, weights.Attempt, "model")
 	fatal(t, problem)
-	if full == nil || len(full.Objects) != len(objects) {
-		t.Fatal("the ordinary transfer getter lost its full object roster")
+	if full == nil || len(full.Objects) != len(objects) || !bytes.Equal(full.Receipt, receipt) {
+		t.Fatal("the ordinary transfer getter lost its full object roster or receipt")
 	}
 	db, err := sql.Open("sqlite", o.l.DB)
 	must(t, err)
@@ -87,8 +90,9 @@ func TestWeightsStatusUsesOnlyTheNamedObject(t *testing.T) {
 	send(frame)
 	wait(frame.ObjectId, 1)
 	// Warm the transport before measuring 64 same-state progress updates. The
-	// 32 MiB ceiling leaves ample protocol/SQLite headroom but rejects allocating
-	// 128 full 5,424-object rosters. This is allocation, not a timing assertion.
+	// 8 MiB ceiling leaves ample protocol/SQLite headroom but rejects either
+	// 128 full 5,424-object rosters or 64 copies of the receipt. This is allocation,
+	// not a timing assertion.
 	runtime.GC()
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
@@ -102,8 +106,13 @@ func TestWeightsStatusUsesOnlyTheNamedObject(t *testing.T) {
 	runtime.ReadMemStats(&after)
 	allocated := after.TotalAlloc - before.TotalAlloc
 	t.Logf("5424-object closure, 64 real TLS status events: %s, %d allocated bytes", time.Since(start), allocated)
-	if allocated > 32<<20 {
-		t.Errorf("individual status updates allocated %d bytes: full-roster work remains in the hot path", allocated)
+	if allocated > 8<<20 {
+		t.Errorf("individual status updates allocated %d bytes: roster or receipt copying remains in the hot path", allocated)
+	}
+	metadata, problem := o.store.ModelTransferWeightsMetadata(id, weights.Attempt, "model")
+	fatal(t, problem)
+	if metadata == nil || len(metadata.Receipt) != 0 || len(metadata.Objects) != 0 || metadata.InvocationDigest != invocation || metadata.TransactionID != weights.TransactionID {
+		t.Error("metadata read copied receipt/objects or changed the transfer identity")
 	}
 	// A scan trap in an unrelated row makes any accidental full roster decode
 	// fail deterministically. The full-reader API must still detect the corrupt

@@ -518,7 +518,7 @@ func (s *Store) RecordModelTransferWeights(row ModelTransferWeights) *exit.Error
 func mustJSON(value any) []byte { data, _ := json.Marshal(value); return data }
 
 func (s *Store) ModelTransferWeights(requestID string, attempt int64, slot string) (*ModelTransferWeights, *exit.Error) {
-	row, problem := s.ModelTransferWeightsMetadata(requestID, attempt, slot)
+	row, problem := s.modelTransferWeightsMetadata(requestID, attempt, slot, true)
 	if problem != nil || row == nil {
 		return row, problem
 	}
@@ -529,12 +529,16 @@ func (s *Store) ModelTransferWeights(requestID string, attempt int64, slot strin
 	return row, nil
 }
 
-// ModelTransferWeightsMetadata reads output identity without loading its object roster.
+// ModelTransferWeightsMetadata omits the receipt and object roster from output identity reads.
 func (s *Store) ModelTransferWeightsMetadata(requestID string, attempt int64, slot string) (*ModelTransferWeights, *exit.Error) {
+	return s.modelTransferWeightsMetadata(requestID, attempt, slot, false)
+}
+
+func (s *Store) modelTransferWeightsMetadata(requestID string, attempt int64, slot string, includeReceipt bool) (*ModelTransferWeights, *exit.Error) {
 	var row ModelTransferWeights
 	err := s.db.QueryRow(`SELECT request_id,output_slot,manifest_id,manifest_length,
-		attempt,invocation_digest,transaction_id,receipt_digest,receipt,final_id
-		FROM request_model_transfer_outputs WHERE request_id=? AND attempt=? AND output_slot=?`, requestID, attempt, slot).
+		attempt,invocation_digest,transaction_id,receipt_digest,CASE WHEN ? THEN receipt ELSE NULL END,final_id
+		FROM request_model_transfer_outputs WHERE request_id=? AND attempt=? AND output_slot=?`, includeReceipt, requestID, attempt, slot).
 		Scan(&row.RequestID, &row.OutputSlot, &row.ManifestID, &row.ManifestLength,
 			&row.Attempt, &row.InvocationDigest, &row.TransactionID,
 			&row.ReceiptDigest, &row.Receipt, &row.FinalID)
