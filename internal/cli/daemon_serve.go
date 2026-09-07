@@ -128,10 +128,11 @@ func serveDaemon(ctx *Context) *exit.Error {
 		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSource(),
 		RentalPrepareFacts: rental.PrepareFactsSource(client(ctx)),
 		RentalFleet:        fleet.status, AcquireManagedRental: fleet.acquire,
-		ReleaseManagedRental: fleet.release,
-		ModelTransfers:       transfers,
-		LocalWheels:          localWheels.grants,
-		ReportReleaseDefect:  defects.report,
+		ReleaseManagedRental:  fleet.release,
+		ReleaseRetainedRental: fleet.releaseRetained,
+		ModelTransfers:        transfers,
+		LocalWheels:           localWheels.grants,
+		ReportReleaseDefect:   defects.report,
 	})
 	if e != nil {
 		closeListeners()

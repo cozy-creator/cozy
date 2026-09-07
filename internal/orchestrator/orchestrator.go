@@ -87,7 +87,9 @@ type Options struct {
 	RentalFleet          func() (string, *exit.Error)
 	AcquireManagedRental func(req records.Request) (RentalDecision, string, *exit.Error)
 	ReleaseManagedRental func(string) (string, *exit.Error)
-	ModelTransfers       ModelTransferOwner
+	// ReleaseRetainedRental is explicit owner abandonment, independent of idle policy.
+	ReleaseRetainedRental func(string) (string, *exit.Error)
+	ModelTransfers        ModelTransferOwner
 	// LocalWheels puts an unpublished revision's wheels in the object store and answers
 	// with one read capability per wheel (th-094). Without it this daemon cannot transfer a
 	// local package: the control stream carries control, not content.
