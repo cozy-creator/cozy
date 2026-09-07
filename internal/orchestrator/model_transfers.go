@@ -235,6 +235,11 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 	if !transfer.HasAcquisition() {
 		return req, nil
 	}
+	if w.spec.Connection != nil {
+		if problem := c.controlRetainedSource(context.Background(), req, false); problem != nil {
+			return req, problem
+		}
+	}
 	c.mu.Lock()
 	bootID := w.bootID
 	c.mu.Unlock()
@@ -270,6 +275,10 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 		}
 	}
 	if problem != nil {
+		current, readProblem := c.opt.Store.RequestRow(req.ID)
+		if readProblem == nil && current != nil && current.RetainWork && current.State == "pausing" {
+			return req, exit.Unavailablef("source preparation paused with retained work")
+		}
 		if permanentTransferFailure(problem) {
 			_ = c.opt.Store.FailModelTransfer(req.ID, problem.ErrName(), problem.Message)
 		}
@@ -389,6 +398,9 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 		}
 		if request.State == "canceled" || request.State == "canceling" || request.State == "releasing" {
 			return nil, exit.New(exit.Canceled, "model transfer %s was canceled", req.ID)
+		}
+		if request.State == "pausing" || request.State == "paused" {
+			return nil, exit.New(exit.Canceled, "source preparation is paused")
 		}
 		session, problem := c.rentalControl(request.Worker)
 		if problem != nil {
