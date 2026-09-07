@@ -269,11 +269,12 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		inst.Package, inst.Version = local.Package, local.Release
 		res.Files, res.Bytes = local.Files, local.Bytes
 		if req.Snapshot {
-			sourceDir, e = snapshotSource(installDir, *local)
+			sourceDir, e = snapshotSource(installDir, local)
 			if e != nil {
 				return fail(e)
 			}
 			inst.SourceRef, inst.ProjectDir = sourceDir, sourceDir
+			inst.SourceDigest = local.SourceDigest
 		}
 	}
 	mark("stage")
