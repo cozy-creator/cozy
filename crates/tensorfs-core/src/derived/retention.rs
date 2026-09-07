@@ -193,10 +193,7 @@ pub fn retain_result(
             code: Code::ROOT_ABSENT,
             detail: "derived result is absent".into(),
         })?;
-    if !matches!(
-        row.state,
-        TransactionState::Committed(Disposition::Pending | Disposition::Adopted(_))
-    ) {
+    if !matches!(row.state, TransactionState::Committed(_)) {
         return refuse(
             Code::TRANSACTION_CLOSED,
             "only a retained committed result can acquire another owner",
@@ -210,10 +207,29 @@ pub fn retain_result(
         );
     }
     let source = roots::read(store, transaction)?;
-    if source.as_ref().and_then(|root| root.manifest.as_ref()) != Some(&facts.manifest) {
+    let original_held = matches!(
+        row.state,
+        TransactionState::Committed(Disposition::Pending | Disposition::Adopted(_))
+    ) && source.as_ref().and_then(|root| root.manifest.as_ref())
+        == Some(&facts.manifest);
+    let independently_held = !original_held
+        && all(store)?.iter().any(|root| {
+            !root.released
+                && root.transaction_id == transaction
+                && root.receipt_digest == receipt
+                && root.manifest.as_ref() == Some(&facts.manifest)
+        });
+    if !original_held && !independently_held {
         return refuse(
-            Code::DURABILITY_UNPROVEN,
-            "original result has no exact retained root",
+            if matches!(
+                row.state,
+                TransactionState::Committed(Disposition::Released)
+            ) {
+                Code::TRANSACTION_CLOSED
+            } else {
+                Code::DURABILITY_UNPROVEN
+            },
+            "result has no original or independent retained owner",
         );
     }
     verify_manifest(store, &facts.manifest)?;
@@ -242,13 +258,13 @@ pub fn release_retention(
     Ok(root)
 }
 
-pub(super) fn held_objects(store: &Store) -> Result<Vec<HeldKey>> {
+fn all(store: &Store) -> Result<Vec<RetainedResult>> {
     let entries = match fs::read_dir(directory(store)) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(io(e)),
     };
-    let mut held = Vec::new();
+    let mut roots = Vec::new();
     for entry in entries {
         let name = entry.map_err(io)?.file_name();
         let name = name.to_string_lossy();
@@ -256,15 +272,23 @@ pub(super) fn held_objects(store: &Store) -> Result<Vec<HeldKey>> {
             continue;
         };
         if let Some(root) = read(store, &format!("sha256:{hex}"))? {
-            if !root.released {
-                let manifest = root.manifest.expect("held root has manifest");
-                held.push(HeldKey {
-                    key: crate::storage::manifest_key(&manifest.sha256)?,
-                    kind: "manifest".into(),
-                    length: manifest.length,
-                    sha256: manifest.sha256,
-                });
-            }
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+pub(super) fn held_objects(store: &Store) -> Result<Vec<HeldKey>> {
+    let mut held = Vec::new();
+    for root in all(store)? {
+        if !root.released {
+            let manifest = root.manifest.expect("held root has manifest");
+            held.push(HeldKey {
+                key: crate::storage::manifest_key(&manifest.sha256)?,
+                kind: "manifest".into(),
+                length: manifest.length,
+                sha256: manifest.sha256,
+            });
         }
     }
     Ok(held)
@@ -407,6 +431,34 @@ mod tests {
                 .code,
             Code::TRANSACTION_CLOSED
         );
+    }
+
+    #[test]
+    fn a_later_retry_acquires_from_an_independent_owner_after_original_cancellation() {
+        let f = fixture();
+        retain_result(&f.store, &f.meta, &f.transaction, &f.receipt, &id("a1")).unwrap();
+        derived::dispose(&f.store, &f.meta, &f.transaction).unwrap();
+        crate::gc::collect(&f.root, false).unwrap();
+        let second =
+            retain_result(&f.store, &f.meta, &f.transaction, &f.receipt, &id("a2")).unwrap();
+        assert_eq!(second.manifest.as_ref(), Some(&f.manifest));
+        release_retention(&f.store, &f.meta, &f.transaction, &f.receipt, &id("a1")).unwrap();
+        let reopened = Meta::open(&f.store).unwrap();
+        let third =
+            retain_result(&f.store, &reopened, &f.transaction, &f.receipt, &id("a3")).unwrap();
+        assert_eq!(third.receipt_digest, f.receipt);
+        release_retention(&f.store, &reopened, &f.transaction, &f.receipt, &id("a2")).unwrap();
+        crate::gc::collect(&f.root, false).unwrap();
+        assert!(f.store.contains(&f.payload.sha256));
+        release_retention(&f.store, &reopened, &f.transaction, &f.receipt, &id("a3")).unwrap();
+        assert_eq!(
+            retain_result(&f.store, &reopened, &f.transaction, &f.receipt, &id("a4"))
+                .unwrap_err()
+                .code,
+            Code::TRANSACTION_CLOSED
+        );
+        crate::gc::collect(&f.root, false).unwrap();
+        assert!(!f.store.contains(&f.payload.sha256));
     }
 
     #[test]

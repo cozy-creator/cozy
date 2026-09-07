@@ -19,7 +19,7 @@ def main():
                    "parts": {"value": {"dtype": "f32", "shape": [512]}}},
     }}}
     original = identity("31")
-    first, second = identity("41"), identity("42")
+    first, second, third = identity("41"), identity("42"), identity("43")
     data = bytes([0x11]) * 2048
     with tempfile.TemporaryDirectory(prefix="tensorfs-result-retention-") as root:
         store = tensorfs.Store.init(root)
@@ -34,6 +34,10 @@ def main():
         assert a["receipt_digest"] == b["receipt_digest"] == digest
         store.derived_dispose(original)
         store = tensorfs.Store.open(root)
+        # A later retry can take ownership through an existing independent root
+        # after the original computation's request has been canceled.
+        c = store.retain_derived_result(original, digest, third)
+        assert c["manifest"] == a["manifest"]
         assert store.retain_derived_result(original, digest, first) == a
         store.release_derived_retention(original, digest, first)
         tensorfs.gc(root)
@@ -45,6 +49,9 @@ def main():
         stopped = store.release_derived_retention(original, digest, second)
         assert stopped["released"]
         assert store.release_derived_retention(original, digest, second) == stopped
+        tensorfs.gc(root)
+        assert store.contains(payload["sha256"])
+        store.release_derived_retention(original, digest, third)
         tensorfs.gc(root)
         assert not store.contains(payload["sha256"])
         try:
