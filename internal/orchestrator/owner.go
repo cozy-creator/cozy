@@ -260,6 +260,12 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 	client := pb.NewWorkerControlClient(conn)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if problem := probeWorkerProtocol(ctx, conn, w.spec.Connection != nil); problem != nil {
+		if problem.Code != exit.Unavailable && problem.Code != exit.Deadline {
+			c.refuseClaim(w, problem)
+		}
+		return fmt.Errorf("%s", problem.Message)
+	}
 	c.mu.Lock()
 	if current := c.workers[w.instanceID]; current != w || w.exited || w.stopping || c.closing {
 		c.mu.Unlock()
@@ -426,6 +432,10 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			c.onLocalPackageAbortStatus(s, status)
+		case *pb.WorkerFrame_WeightsTransaction:
+			c.onWeightsTransaction(s, m.WeightsTransaction)
+		case *pb.WorkerFrame_WeightsCheckpoint:
+			c.onWeightsCheckpoint(s, m.WeightsCheckpoint)
 		case *pb.WorkerFrame_WeightsReceipt:
 			receipt := m.WeightsReceipt
 			if c.fenced(s, receipt.RecordOwnerEpoch, receipt.ControlStreamEpoch,
@@ -528,6 +538,9 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 	c.mu.Lock()
 	w.declaredInstance = ack.WorkerInstanceId
 	w.wireMinor = ack.WireMinor
+	if w.refusal != nil && w.refusal.ErrName() == "worker.protocol_incompatible" {
+		w.refusal = nil
+	}
 	if w.spec.Connection != nil {
 		w.remoteWorkerID = ack.WorkerId
 	}
@@ -660,6 +673,8 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	// the receipts it replays after this ack. It is fenced exactly like the worker's document
 	// and reconciled before the same ack; the worker's bytes above are the worker's own.
 	var hostHeld []canonical.Doc
+	var hostWeights []*pb.WeightsTransactionStatus
+	var hostRetainedRevision uint64
 	if len(snap.HostSnapshotCanonicalBytes) > 0 || len(snap.HostSnapshotDigest) > 0 {
 		computed := canonical.Digest(snap.HostSnapshotCanonicalBytes)
 		if !bytes.Equal(computed, snap.HostSnapshotDigest) {
@@ -673,6 +688,13 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 			return false
 		}
 		hostHeld = hostDoc.List("held_outcomes")
+		typed := new(pb.HostSnapshotBody)
+		if err := canonical.Unmarshal(snap.HostSnapshotCanonicalBytes, typed); err != nil {
+			refuse("host snapshot typed conversion failed: %s", err)
+			return false
+		}
+		hostWeights = typed.WeightsTransactions
+		hostRetainedRevision = typed.RetainedDesiredRevision
 		reconcileHeld(hostHeld, "host-held")
 	}
 	continuations := c.reconcileSnapshotAbsence(w, heldSet)
@@ -681,6 +703,10 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	// ack lands, which is exactly what "dispatch stays closed" looks like on the wire.
 	c.mu.Lock()
 	w.acceptedRevision = uint64(doc.Int("accepted_desired_state_revision"))
+	// The surviving Host may have received a revision the replacement Runtime
+	// has never accepted. Seed only the owner's existing outgoing sequence;
+	// acceptance and convergence remain the Runtime's independent observations.
+	c.revision = max(c.revision, w.acceptedRevision, hostRetainedRevision)
 	w.convergedRevision = uint64(doc.Int("converged_revision"))
 	w.admissionEpoch = uint64(doc.Int("admission_epoch"))
 	w.admission = pb.AdmissionState(doc.Int("admission_state"))
@@ -717,6 +743,10 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		c.afterAck(continuation.request, continuation.attempt, w)
 	}
 	c.retryMediaCleanup(w)
+	for _, row := range hostWeights {
+		c.onWeightsTransaction(s, row)
+	}
+	_ = c.restoreRetainedWork()
 	c.logf("snapshot %s (%s, %d B) acknowledged: %d held attempt(s), %d host-held outcome(s), "+
 		"accepted revision %d, converged %d; dispatch is open", snap.SnapshotId,
 		shortDigest(shortNone(snap.SnapshotDigest)), len(snap.SnapshotCanonicalBytes),

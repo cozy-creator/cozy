@@ -43,10 +43,10 @@ func TestSourceCheckpointResumeWaitsForWorkerReattachment(t *testing.T) {
 		t.Fatal("source operation was not newly recorded")
 	}
 	fatal(t, o.store.BeginModelTransferMaterialization(requestID))
-	checkpoint := records.ModelSourceCheckpoint{Slot: "shared", HeadID: "sha256:" + strings.Repeat("3", 64),
+	checkpoint := records.ModelCheckpoint{Slot: "shared", HeadID: "sha256:" + strings.Repeat("3", 64),
 		HeadLength: 500, PlanDigest: "sha256:" + strings.Repeat("4", 64), Index: 7, Bytes: 4096}
 	fatal(t, o.store.ObserveModelSourceCheckpoints(requestID, intent.SourceSelection, boot,
-		[]records.ModelSourceCheckpoint{checkpoint}))
+		[]records.ModelCheckpoint{checkpoint}))
 	before, problem := o.store.ModelTransferOf(requestID)
 	fatal(t, problem)
 	beforeProgress, problem := o.store.ModelSourceProgress(requestID)

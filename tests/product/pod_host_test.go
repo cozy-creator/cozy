@@ -60,6 +60,8 @@ const (
 type fakePod struct {
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
 	sourceRuntime pb.RuntimePreparationClient
+	weightsReady  func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
+	protocolInfo  func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
 	pb.UnimplementedWorkerControlServer
 	pb.UnimplementedPodHostServer
 	controlKey ed25519.PublicKey
@@ -115,6 +117,17 @@ type fakePod struct {
 	// else is what `session.py::apply_job_directive` refuses as `job_plan_mismatch`.
 	stagedJobBuild string
 	jobDirectives  []*pb.JobDirective
+}
+
+func (p *fakePod) ProtocolInfo(ctx context.Context, request *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+	if p.protocolInfo != nil {
+		return p.protocolInfo(ctx, request)
+	}
+	version := p.wireMinor
+	if version == 0 {
+		version = pb.WireMinor
+	}
+	return &pb.ProtocolInfoResult{WireMinor: version, MinimumWireMinor: min(version, pb.MinCompatibleWireMinor)}, nil
 }
 
 // served is the serve arm's ObservedWorkerState: the exact set accepted and converged,
@@ -1105,21 +1118,31 @@ func TestPodHostJobDirectiveNamesTheStagedBuild(t *testing.T) {
 	}
 }
 
-func (p *fakePod) SourceCheckpointPage(ctx context.Context, call *pb.SourceCheckpointPageCall) (*pb.SourceCheckpointPageResult, error) {
+func (p *fakePod) CheckpointPage(ctx context.Context, call *pb.CheckpointPageCall) (*pb.CheckpointPageResult, error) {
 	if err := p.verifyClaim(call.GetClaim(), false); err != nil {
 		return nil, err
 	}
 	if p.sourceRuntime == nil {
 		return nil, status.Error(codes.Unimplemented, "no source Runtime")
 	}
-	return p.sourceRuntime.SourceCheckpointPage(ctx, call.GetRequest())
+	return p.sourceRuntime.CheckpointPage(ctx, call.GetRequest())
 }
-func (p *fakePod) SourceCheckpointTransfer(ctx context.Context, call *pb.SourceCheckpointTransferCall) (*pb.SourceCheckpointTransferStatus, error) {
+
+func (p *fakePod) WeightsIntentReady(_ context.Context, call *pb.WeightsIntentReadyCall) (*pb.WeightsHostAck, error) {
+	if err := p.verifyClaim(call.GetClaim(), false); err != nil {
+		return nil, err
+	}
+	if p.weightsReady == nil {
+		return nil, status.Error(codes.Unimplemented, "no weights Ready peer")
+	}
+	return p.weightsReady(call.GetRequest())
+}
+func (p *fakePod) CheckpointTransfer(ctx context.Context, call *pb.CheckpointTransferCall) (*pb.CheckpointTransferStatus, error) {
 	if err := p.verifyClaim(call.GetClaim(), false); err != nil {
 		return nil, err
 	}
 	if p.sourceRuntime == nil {
 		return nil, status.Error(codes.Unimplemented, "no source Runtime")
 	}
-	return p.sourceRuntime.SourceCheckpointTransfer(ctx, call.GetRequest())
+	return p.sourceRuntime.CheckpointTransfer(ctx, call.GetRequest())
 }

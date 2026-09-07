@@ -265,7 +265,7 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 	c.mu.Lock()
 	delete(c.sourcePrepareBlocked, frame.OperationId)
 	c.mu.Unlock()
-	checkpoints := make([]records.ModelSourceCheckpoint, 0, len(frame.Checkpoints))
+	checkpoints := make([]records.ModelCheckpoint, 0, len(frame.Checkpoints))
 	for _, checkpoint := range frame.Checkpoints {
 		if checkpoint == nil || checkpoint.Head == nil || len(checkpoint.Head.Digest) != 32 ||
 			len(checkpoint.PlanDigest) != 32 || checkpoint.Head.Length == 0 ||
@@ -275,7 +275,7 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 				"worker returned malformed source checkpoint progress")
 			return
 		}
-		checkpoints = append(checkpoints, records.ModelSourceCheckpoint{
+		checkpoints = append(checkpoints, records.ModelCheckpoint{
 			Slot: checkpoint.Slot, HeadID: "sha256:" + hex.EncodeToString(checkpoint.Head.Digest),
 			HeadLength: int64(checkpoint.Head.Length), PlanDigest: "sha256:" + hex.EncodeToString(checkpoint.PlanDigest),
 			Index: int64(checkpoint.Index), Bytes: int64(checkpoint.Bytes)})
@@ -290,7 +290,7 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 			converted += uint64(checkpoint.Bytes)
 		}
 		c.ObservePhase(frame.OperationId, PhaseSample{Name: PhasePreparing, Detail: "source conversion", HasBytes: true, Moved: converted})
-		c.kickSourceCheckpointUpload(frame.OperationId)
+		c.kickCheckpointUpload(frame.OperationId)
 	}
 	c.logf("model transfer %s: source prepare %s on %s (%d source(s)) %s %s", frame.OperationId,
 		trimEnum(pb.ModelSourcePrepareOutcome_name[int32(frame.Outcome)], "MODEL_SOURCE_PREPARE_OUTCOME_"),

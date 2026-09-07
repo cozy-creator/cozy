@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 import grpc
 from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime.internal.worker.control import _PreparationServicer
-from cozy_runtime.internal.worker import model_source_prepare, model_source_checkpoint
+from cozy_runtime.internal.worker import model_source_prepare, checkpoint_transport
 from cozy_runtime.protocol import worker_pb2 as pb, worker_pb2_grpc as pb_grpc
 
 root = Path(sys.argv[1]).resolve()
@@ -72,8 +72,8 @@ if prepared.outcome != pb.MODEL_SOURCE_PREPARE_OUTCOME_INCOMPLETE or len(prepare
 def serve(selected_store):
     service = _PreparationServicer(None, None,
         lambda value: model_source_prepare.prepare_model_source(value, tensorfs_root=selected_store), None, None,
-        lambda value: model_source_checkpoint.page(value, tensorfs_root=selected_store),
-        lambda value: model_source_checkpoint.transfer(value, tensorfs_root=selected_store, allow_local=wide))
+        lambda value: checkpoint_transport.page(value, tensorfs_root=selected_store),
+        lambda value: checkpoint_transport.transfer(value, tensorfs_root=selected_store, allow_local=wide))
     server = grpc.server(ThreadPoolExecutor(max_workers=4))
     pb_grpc.add_RuntimePreparationServicer_to_server(service, server)
     port = server.add_insecure_port('127.0.0.1:0')

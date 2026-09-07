@@ -237,7 +237,11 @@ func (c *Orchestrator) resumeManualRentals() *exit.Error {
 		return problem
 	}
 	for _, row := range rows {
-		if row.ManagedRequestID != "" || !records.RentalReadyState(row.State) {
+		retained, problem := c.opt.Store.RentalRetainsWork(row.ID)
+		if problem != nil {
+			return problem
+		}
+		if (row.ManagedRequestID != "" && !retained) || !records.RentalReadyState(row.State) {
 			continue
 		}
 		go c.resumeManualRental(row.ID)
@@ -258,7 +262,11 @@ func (c *Orchestrator) resumeManualRental(id string) {
 			c.logf("rental %s control reattachment cannot read ownership: %s", id, problem.Message)
 			return
 		}
-		if row == nil || row.ManagedRequestID != "" || !records.RentalReadyState(row.State) {
+		retained, retainedProblem := c.opt.Store.RentalRetainsWork(id)
+		if retainedProblem != nil {
+			return
+		}
+		if row == nil || (row.ManagedRequestID != "" && !retained) || !records.RentalReadyState(row.State) {
 			return
 		}
 		if _, _, _, problem = c.EnsureRental(id); problem == nil {

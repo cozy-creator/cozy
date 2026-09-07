@@ -157,9 +157,9 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	must(t, err)
 	plan, err := canonical.Spell(checkpoint.PlanDigest)
 	must(t, err)
-	observed := records.ModelSourceCheckpoint{Slot: checkpoint.Slot, HeadID: head,
+	observed := records.ModelCheckpoint{Slot: checkpoint.Slot, HeadID: head,
 		HeadLength: int64(checkpoint.Head.Length), PlanDigest: plan, Index: int64(checkpoint.Index), Bytes: int64(checkpoint.Bytes)}
-	fatal(t, store.ObserveModelSourceCheckpoints(requestID, selection, boot, []records.ModelSourceCheckpoint{observed}))
+	fatal(t, store.ObserveModelSourceCheckpoints(requestID, selection, boot, []records.ModelCheckpoint{observed}))
 	if *sourceCustodyBridge != "" {
 		preparedRequest.OperationId = requestID
 		proveOperatorSourceCustody(t, ctx, root, store, auth, preparedRequest, started.Address, observed)
@@ -182,10 +182,10 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 			cancelTransfer()
 		})
 	}
-	host := orchestrator.SourceCheckpointHost{BootID: boot,
-		Page: func(ctx context.Context, request *pb.SourceCheckpointPageRequest) (*pb.SourceCheckpointPageResult, *exit.Error) {
+	host := orchestrator.CheckpointHost{BootID: boot,
+		Page: func(ctx context.Context, request *pb.CheckpointPageRequest) (*pb.CheckpointPageResult, *exit.Error) {
 			request.RecordOwnerEpoch, request.WorkerBootId = 1, activeBoot
-			answer, err := runtime.SourceCheckpointPage(ctx, request)
+			answer, err := runtime.CheckpointPage(ctx, request)
 			if err != nil {
 				return nil, exit.Unavailablef("native checkpoint page RPC failed")
 			}
@@ -195,17 +195,17 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 			pages.Add(1)
 			return answer, nil
 		},
-		Transfer: func(ctx context.Context, request *pb.SourceCheckpointTransferRequest) (*pb.SourceCheckpointTransferStatus, *exit.Error) {
+		Transfer: func(ctx context.Context, request *pb.CheckpointTransferRequest) (*pb.CheckpointTransferStatus, *exit.Error) {
 			request.RecordOwnerEpoch, request.WorkerBootId = 1, activeBoot
 			if gate != nil {
 				if grant := request.GetUploadGrant(); grant != nil {
 					grant.Url = gate.route(http.MethodPut, grant.ObjectId, grant.Url)
 				} else {
 					id, _ := canonical.Spell(request.Object.Ref.Digest)
-					request.Decision = &pb.SourceCheckpointTransferRequest_DownloadUrl{DownloadUrl: gate.route(http.MethodGet, id, request.GetDownloadUrl())}
+					request.Decision = &pb.CheckpointTransferRequest_DownloadUrl{DownloadUrl: gate.route(http.MethodGet, id, request.GetDownloadUrl())}
 				}
 			}
-			answer, err := runtime.SourceCheckpointTransfer(ctx, request)
+			answer, err := runtime.CheckpointTransfer(ctx, request)
 			if err != nil {
 				return nil, exit.Unavailablef("native checkpoint transfer RPC failed")
 			}
@@ -223,12 +223,12 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	defer func() {
 		cleanup, stop := context.WithTimeout(context.Background(), 30*time.Second)
 		defer stop()
-		if problem := owner.ReleaseSourceCheckpoints(cleanup, requestID); problem != nil {
+		if problem := owner.ReleaseCheckpoints(cleanup, requestID); problem != nil {
 			t.Errorf("exact source publication cleanup failed: %s", problem.ErrName())
 		}
 	}()
 	if gate != nil {
-		ended := owner.SyncSourceCheckpoints(canceled, requestID, host)
+		ended := owner.SyncCheckpoints(canceled, requestID, host)
 		if ended == nil || ended.Code != exit.Canceled {
 			t.Fatalf("native transfer cancellation lost its type: %v", ended)
 		}
@@ -239,7 +239,7 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 		}
 	}
 	if gate != nil {
-		denied := owner.SyncSourceCheckpoints(ctx, requestID, host)
+		denied := owner.SyncCheckpoints(ctx, requestID, host)
 		if denied == nil || denied.Code != exit.Unavailable {
 			t.Fatalf("native denied PUT lost its typed failure: %v", denied)
 		}
@@ -248,7 +248,7 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 		if len(failed) != 1 || failed[0].Acknowledged != nil {
 			t.Fatal("failed Link advanced its custody acknowledgment")
 		}
-		held, problem := store.SourcePublications(requestID)
+		held, problem := store.CheckpointPublications(requestID)
 		fatal(t, problem)
 		if len(held) == 0 {
 			t.Fatal("failed Link dropped its recovery holds")
@@ -257,7 +257,7 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 		gate.refuse = false
 		gate.mu.Unlock()
 	}
-	fatal(t, owner.SyncSourceCheckpoints(ctx, requestID, host))
+	fatal(t, owner.SyncCheckpoints(ctx, requestID, host))
 	progress, problem := store.ModelSourceProgress(requestID)
 	fatal(t, problem)
 	if pages.Load() == 0 || transfers.Load() == 0 || len(progress) != 1 || progress[0].Acknowledged == nil ||
@@ -327,7 +327,7 @@ func TestSourceCheckpointThroughPublicRuntimeAndHub(t *testing.T) {
 	}
 	t.Logf("new boot resumed same operation %s: %d checkpointed bytes, %d spent members, zero source bodies present; partial profile remains incomplete", requestID, recovered.Checkpoints[0].Bytes, len(spent))
 
-	held, problem := store.SourcePublications(requestID)
+	held, problem := store.CheckpointPublications(requestID)
 	fatal(t, problem)
 	if len(held) == 0 {
 		t.Fatal("source acknowledgment has no retained Hub publication")
