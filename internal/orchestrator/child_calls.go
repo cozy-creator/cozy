@@ -186,7 +186,7 @@ func (c *Orchestrator) watchChildCall(s *session, call *pb.ChildCallRequest, id 
 					}
 					continue
 				}
-				if problem == nil {
+				if problem == nil && row.ReusedFrom == "" {
 					artifacts, inspectProblem := c.childResultArtifacts(*row, result)
 					problem = inspectProblem
 					if problem == nil {
@@ -202,9 +202,12 @@ func (c *Orchestrator) watchChildCall(s *session, call *pb.ChildCallRequest, id 
 						}
 						continue
 					}
-					if problem == nil && row.State == "finalizing" {
-						problem = c.opt.Store.CompleteReusedChild(row.ID)
-					}
+				}
+				if problem == nil {
+					problem = c.releaseChildRetentions(row.ID, true)
+				}
+				if problem == nil && row.State == "finalizing" {
+					problem = c.opt.Store.CompleteReusedChild(row.ID)
 				}
 				if problem != nil && problem.Code == exit.Unavailable {
 					select {

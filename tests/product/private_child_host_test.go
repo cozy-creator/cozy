@@ -239,4 +239,22 @@ func TestPrivateChildActualHostArtifacts(t *testing.T) {
 	}
 	checkTensor(children[0], 7)
 	checkTensor(thirdChildren[1], 15)
+	status, out = runCozyPath(t, layout.Root, path, "run", script, "--rental-only", "--await", "--json")
+	if status != 0 {
+		t.Fatalf("fresh run could not use its physical workspace cache: [%d] %s", status, out)
+	}
+	fresh, problem := store.RequestByReference("10")
+	fatal(t, problem)
+	freshChildren, problem := store.Children(fresh.ID)
+	fatal(t, problem)
+	if fresh.RetryOf != "" || fresh.ReuseScope == third.ReuseScope || len(freshChildren) != 2 || freshChildren[0].Ordinal != 0 || freshChildren[1].Ordinal != 0 || freshChildren[0].ReusedFrom != children[0].ID || freshChildren[1].ReusedFrom != thirdChildren[1].ID {
+		t.Fatalf("fresh run did not independently adopt compatible A and B: %+v %+v", fresh, freshChildren)
+	}
+	status, out = runCozyPath(t, layout.Root, path, "run", "cancel", "7", "--json")
+	if status != 0 {
+		t.Fatalf("old run cancellation after fresh-run adoption: [%d] %s", status, out)
+	}
+	restartHost()
+	checkTensor(children[0], 7)
+	checkTensor(thirdChildren[1], 15)
 }

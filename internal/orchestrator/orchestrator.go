@@ -498,8 +498,9 @@ type Orchestrator struct {
 	checkpointUploads    map[string]*checkpointUpload
 	// localTransfers is command-scoped, lossy progress over Creator's durable request
 	// row and sealed revision. A restart simply replays exact chunks from those authorities.
-	localTransfers map[string]*localTransfer
-	childWatches   map[string]*session
+	localTransfers   map[string]*localTransfer
+	childWatches     map[string]*session
+	operationLookups map[string]bool // one native lookup in flight per request; not a result cache
 }
 
 type wait struct {

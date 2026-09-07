@@ -1203,6 +1203,13 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		if e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
+		current, problem := c.opt.Store.RequestRow(req.ID)
+		if problem != nil {
+			return WorkerLaunchSpec{}, "", problem
+		}
+		if current == nil || (current.State != "submitted" && current.State != "queued") {
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "request.execution_stopped", "request stopped while its private job was being prepared")
+		}
 		if e := c.ConvergeRemoteJob(instance, spec); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
@@ -1314,6 +1321,16 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence
 	// is open. `pick` also returns the admission epoch it OBSERVED, which is what
 	// makes a stale offer refuse deterministically rather than race.
+	if hit, problem := c.lookupOperation(req); hit || problem != nil {
+		return 0, problem
+	}
+	current, problem = c.opt.Store.RequestRow(req.ID)
+	if problem != nil {
+		return 0, problem
+	}
+	if current == nil || (current.State != "submitted" && current.State != "queued") {
+		return 0, exit.Named(exit.Conflict, "request.execution_stopped", "request stopped while its operation lookup was in progress")
+	}
 	target, e := c.pick(req)
 	if e != nil {
 		return 0, e

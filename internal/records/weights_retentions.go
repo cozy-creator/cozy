@@ -77,13 +77,15 @@ func (s *Store) RecordWeightsRetention(r WeightsRetention) (WeightsRetention, *e
 
 func recordWeightsRetentionTx(tx *sql.Tx, r WeightsRetention) (WeightsRetention, *exit.Error) {
 	var allowed bool
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests consumer JOIN requests producer ON consumer.reuse_scope=producer.reuse_scope
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests consumer JOIN requests producer ON consumer.worker=producer.worker
 		WHERE consumer.id=? AND producer.id=? AND consumer.retain_work=1 AND consumer.reuse_scope<>'' AND consumer.worker=producer.worker
+		AND (consumer.reuse_scope=producer.reuse_scope OR EXISTS(SELECT 1 FROM request_weights_retentions adopted JOIN requests keeper ON keeper.id=adopted.request_id
+		WHERE adopted.producer_request_id=producer.id AND adopted.producer_attempt=? AND adopted.producer_output_slot=? AND adopted.state='held' AND keeper.reuse_scope=consumer.reuse_scope AND keeper.state NOT IN ('canceling','canceled','releasing')))
 		AND consumer.state IN ('submitted','queued','dispatching','finalizing','succeeded')
 		AND (producer.state NOT IN ('canceling','canceled','releasing') OR (consumer.reused_from=producer.id AND consumer.state='finalizing' AND producer.state='canceling')
 		OR EXISTS(SELECT 1 FROM request_weights_retentions reserved WHERE reserved.request_id=consumer.id AND reserved.producer_request_id=producer.id AND reserved.state='pending' AND producer.state='canceling')
 		OR EXISTS(SELECT 1 FROM request_weights_retentions live JOIN requests keeper ON keeper.id=live.request_id
-		WHERE live.producer_request_id=producer.id AND live.producer_attempt=? AND live.producer_output_slot=? AND live.state='held' AND keeper.reuse_scope=consumer.reuse_scope AND keeper.state NOT IN ('canceling','canceled','releasing'))))`, r.RequestID, r.ProducerRequestID, r.ProducerAttempt, r.ProducerOutputSlot).Scan(&allowed); err != nil {
+		WHERE live.producer_request_id=producer.id AND live.producer_attempt=? AND live.producer_output_slot=? AND live.state='held' AND keeper.reuse_scope=consumer.reuse_scope AND keeper.state NOT IN ('canceling','canceled','releasing'))))`, r.RequestID, r.ProducerRequestID, r.ProducerAttempt, r.ProducerOutputSlot, r.ProducerAttempt, r.ProducerOutputSlot).Scan(&allowed); err != nil {
 		return r, exit.Internalf("cannot validate artifact retention scope: %s", err)
 	}
 	if !allowed {

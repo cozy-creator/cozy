@@ -98,6 +98,8 @@ func TestPrivateChildSchemaUpgradePreservesPriorOwnership(t *testing.T) {
 	must(t, err)
 	_, err = db.Exec(`DROP TABLE request_weights_retentions`)
 	must(t, err)
+	_, err = db.Exec(`DROP TABLE request_operation_lookups`)
+	must(t, err)
 	_, err = db.Exec(`PRAGMA user_version=27`)
 	must(t, err)
 	db.Close()
@@ -257,7 +259,7 @@ func closeChild(t *testing.T, store *records.Store, request records.Request, sta
 	fatal(t, store.Closed(request.ID, 1))
 }
 
-func TestPrivateChildrenReuseExactSuccessfulOperationAfterParentEdit(t *testing.T) {
+func TestPrivateChildHistoryDoesNotActAsOperationCache(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -281,8 +283,8 @@ func TestPrivateChildrenReuseExactSuccessfulOperationAfterParentEdit(t *testing.
 	call.ID, call.IdemKey, call.ParentRequestID = "req-child-edited-a", "child-edited-a", next.ID
 	reused, fresh, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot")
 	fatal(t, problem)
-	if !fresh || reused.ID == child.ID || reused.State != "succeeded" || reused.Ordinal != 0 || reused.ReusedFrom != child.ID {
-		t.Fatalf("edited parent did not acquire previous exact result: %+v", reused)
+	if !fresh || reused.ID == child.ID || reused.State != "submitted" || reused.Ordinal != 0 || reused.ReusedFrom != "" {
+		t.Fatalf("run history invented a cache hit without its workspace owner: %+v", reused)
 	}
 	history, problem := store.Attempts(child.ID)
 	fatal(t, problem)
@@ -308,8 +310,8 @@ func TestPrivateChildrenReuseExactSuccessfulOperationAfterParentEdit(t *testing.
 	call.ID, call.IdemKey, call.ParentCallIndex, call.ChildTargetDigest = "req-child-reordered", "child-reordered", 2, childDigest("5")
 	reordered, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot")
 	fatal(t, problem)
-	if reordered.ReusedFrom != child.ID {
-		t.Fatal("moving an unchanged reusable operation invalidated its result")
+	if reordered.ReusedFrom != "" {
+		t.Fatal("matching call inputs bypassed the workspace cache authority")
 	}
 	call.ID, call.IdemKey, call.ParentCallIndex = "req-child-forged", "child-forged", 3
 	if _, _, problem := store.SubmitChild(call, 1, childDigest("9"), "private-boot"); problem == nil {

@@ -36,6 +36,10 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 		c.finishRetainedRelease(*request)
 		return
 	}
+	if _, problem := c.lookupOperationPending(*request, true); problem != nil {
+		c.retryRetainedCancellation(id)
+		return
+	}
 	attempts, problem := c.opt.Store.Attempts(id)
 	if problem != nil {
 		return
@@ -241,6 +245,11 @@ func (c *Orchestrator) stopRetainedAttempt(id string, reason pb.CancelReason) *e
 	request, problem := c.opt.Store.RequestRow(id)
 	if problem != nil {
 		return problem
+	}
+	if request != nil {
+		if _, problem := c.lookupOperationPending(*request, true); problem != nil {
+			return problem
+		}
 	}
 	if request != nil && request.State == "pausing" && request.Worker != "" && request.ModelTransfer != nil && request.ModelTransfer.HasAcquisition() {
 		c.pauseRetainedSource(*request)

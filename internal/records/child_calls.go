@@ -57,25 +57,10 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 		return Request{}, false, exit.Internalf("cannot inspect child replay: %s", err)
 	}
 	r.RetainWork = true
+	r.ReusedFrom = "" // Only an authenticated workspace lookup may adopt old results.
 	r.ReuseScope = parent.ReuseScope
 	if r.ReuseScope == "" {
 		r.ReuseScope = parent.ID
-	}
-	// Scalar result reuse has no native byte ownership to transfer. Artifact and
-	// weights children continue through ordinary execution until their native
-	// adoption contract supplies independent new-request ownership.
-	if r.ChildReusable && parent.RetryOf != "" {
-		var previous string
-		err = tx.QueryRow(`SELECT COALESCE(NULLIF(reused_from,''),id) FROM requests WHERE parent_request_id<>''
-			AND state='succeeded' AND child_reusable=1 AND child_intent_digest=? AND child_target_digest=? AND reuse_scope=?
-			AND EXISTS(SELECT 1 FROM attempts WHERE request_id=COALESCE(NULLIF(requests.reused_from,''),requests.id) AND state='closed' AND terminal_status='SUCCEEDED')
-			ORDER BY created_at DESC,id DESC LIMIT 1`, r.ChildIntentDigest, r.ChildTargetDigest, r.ReuseScope).Scan(&previous)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return Request{}, false, exit.Internalf("cannot inspect reusable child result: %s", err)
-		}
-		if err == nil {
-			r.ReusedFrom = previous
-		}
 	}
 	recorded, fresh, problem := submitRequestTx(tx, r, assets, models, exports)
 	if problem != nil {
@@ -109,21 +94,6 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	}
 	event := "request.submitted"
 	payload := map[string]any{"parent_request_id": parent.ID, "call_index": r.ParentCallIndex, "child_intent_digest": r.ChildIntentDigest, "child_target_digest": r.ChildTargetDigest}
-	if r.ReusedFrom != "" {
-		state := "succeeded"
-		if r.ChildArtifacts || (r.WeightsOutputs != "" && r.WeightsOutputs != "[]") || len(r.Models) > 0 {
-			state = "finalizing"
-		}
-		if _, err := tx.Exec(`UPDATE requests SET state=? WHERE id=?`, state, r.ID); err != nil {
-			return Request{}, false, exit.Internalf("cannot acquire reused child result: %s", err)
-		}
-		recorded.State = state
-		event = "request.completed"
-		if state == "finalizing" {
-			event = "request.finalizing"
-		}
-		payload["status"], payload["reused_from"] = state, r.ReusedFrom
-	}
 	if err := appendEventTx(tx, r.ID, event, 0, payload); err != nil {
 		return Request{}, false, exit.Internalf("cannot journal child admission: %s", err)
 	}
@@ -142,7 +112,7 @@ func (s *Store) CompleteReusedChild(id string) *exit.Error {
 	result, err := tx.Exec(`UPDATE requests SET state='succeeded' WHERE id=? AND reused_from<>'' AND state='finalizing'
 		AND NOT EXISTS(SELECT 1 FROM request_weights_retentions h WHERE h.request_id=requests.id AND h.kind='result' AND h.state!='held')
 		AND (child_artifacts=0 OR EXISTS(SELECT 1 FROM request_weights_retentions h WHERE h.request_id=requests.id AND h.kind='result' AND h.state='held'))
-		AND (weights_outputs='[]' OR (SELECT COUNT(*) FROM request_weights_retentions h WHERE h.request_id=requests.id AND h.kind='result' AND h.slot LIKE 'weights/%' AND h.state='held')=json_array_length(weights_outputs))`, id)
+		AND (weights_outputs IN ('','[]') OR (SELECT COUNT(*) FROM request_weights_retentions h WHERE h.request_id=requests.id AND h.kind='result' AND h.slot LIKE 'weights/%' AND h.state='held')=json_array_length(weights_outputs))`, id)
 	if err != nil {
 		return exit.Internalf("cannot complete reused child result: %s", err)
 	}

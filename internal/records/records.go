@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 28
+const schemaVersion = 29
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS pins (
 var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orchestratorSchema,
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
 
-func init() { schema = append(schema, weightsRetentionsDDL) }
+func init() { schema = append(schema, weightsRetentionsDDL, operationLookupsDDL) }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
@@ -361,6 +361,11 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			if _, err := tx.Exec(statement); err != nil {
 				return exit.Internalf("cannot create private child ownership in %s: %s", path, err)
 			}
+		}
+	}
+	if sourceVersion < 29 {
+		if _, err := tx.Exec(operationLookupsDDL); err != nil {
+			return exit.Internalf("cannot create pending operation lookups in %s: %s", path, err)
 		}
 	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
@@ -685,6 +690,9 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
+		if version < 29 && statement == operationLookupsDDL {
+			continue
+		}
 		if version < 28 && statement == weightsRetentionsDDL {
 			continue
 		}

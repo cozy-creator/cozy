@@ -178,6 +178,7 @@ func (s *Store) CompleteRequestPause(id string) (bool, *exit.Error) {
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(`UPDATE requests SET state='paused' WHERE id=? AND state='pausing'
+		AND NOT EXISTS(SELECT 1 FROM request_operation_lookups WHERE request_id=requests.id AND state='pending')
 		AND NOT EXISTS(SELECT 1 FROM attempts WHERE request_id=? AND state IN (`+openAttemptStates+`))
 		AND NOT EXISTS(SELECT 1 FROM request_model_transfers WHERE request_id=? AND state='materializing')
 		AND NOT EXISTS(WITH RECURSIVE family(id) AS (SELECT id FROM requests WHERE parent_request_id=? UNION ALL SELECT r.id FROM requests r JOIN family f ON r.parent_request_id=f.id)
@@ -295,6 +296,8 @@ func (s *Store) ReleaseRetainedWork(id string) (bool, *exit.Error) {
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(`UPDATE requests SET state='releasing' WHERE id=? AND state='canceling'
+		AND NOT EXISTS(SELECT 1 FROM request_operation_lookups WHERE request_id=requests.id AND state='pending')
+		AND NOT EXISTS(SELECT 1 FROM request_weights_retentions WHERE request_id=requests.id AND state!='released')
 		AND NOT EXISTS(SELECT 1 FROM attempts WHERE request_id=? AND state IN (`+openAttemptStates+`))
 		AND NOT EXISTS(SELECT 1 FROM weights_finalizations WHERE request_id=? AND completed_at='')
 		AND NOT EXISTS(SELECT 1 FROM requests WHERE parent_request_id=? AND state IN (`+activeRequestStates+`))`, id, id, id, id)

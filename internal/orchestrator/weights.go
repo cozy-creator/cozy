@@ -358,6 +358,11 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 		c.logf("OutcomeAck %s#%d not sent: malformed persisted outcome digest", requestID, ordinal)
 		return
 	}
+	if problem := c.recordOperationResult(s, *req, *attempt); problem != nil {
+		c.logf("OutcomeAck %s#%d awaits operation cache: %s", requestID, ordinal, problem.Message)
+		c.retryOperationAck(s, requestID, ordinal)
+		return
+	}
 	ack := &pb.AttemptOutcomeAck{
 		RequestId: requestID, AttemptOrdinal: ordinal, InvocationSpecDigest: specDigest,
 		OutcomeId: attempt.TerminalID, OutcomeDigest: outcomeDigest,

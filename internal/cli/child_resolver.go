@@ -110,7 +110,7 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 			return out, "", problem
 		}
 		producer, problem := r.store.RequestRow(artifact.ProducerRequestID)
-		if problem != nil || producer == nil || producer.ReuseScope != parent.ReuseScope || producer.Worker != parent.Worker {
+		if problem != nil || producer == nil || producer.Worker != parent.Worker {
 			return out, "", exit.Named(exit.Conflict, "child.artifact_scope", "model artifact does not belong to the parent's retained scope and store")
 		}
 		held, problem := r.store.ArtifactHasCustody(producer.ID, weights.Attempt, weights.OutputSlot, parent.ReuseScope)
