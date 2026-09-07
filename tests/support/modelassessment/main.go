@@ -87,7 +87,7 @@ func main() {
 		if account.Name != ref.Org {
 			fatal("producer destination is not the authenticated account")
 		}
-		if problem = client.AttachAssessment(ctx, ref, info.Subject.Candidate, info.Report.Digest, raw); problem != nil {
+		if problem = client.AttachAssessment(ctx, ref, info.Subject.Candidate, info.Report.Digest, info.Verdict, raw); problem != nil {
 			fatal(problem.Message)
 		}
 	}

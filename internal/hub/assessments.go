@@ -10,7 +10,7 @@ import (
 
 // AttachAssessment stores and reads back the exact canonical report. The caller
 // verifies its invocation/receipt bindings first; Hub records a publisher assessment.
-func (c *Client) AttachAssessment(ctx context.Context, ref Ref, checkpoint, digest string, raw []byte) *exit.Error {
+func (c *Client) AttachAssessment(ctx context.Context, ref Ref, checkpoint, digest, expectedVerdict string, raw []byte) *exit.Error {
 	path := resourcePath("models", ref) + "/checkpoints/" + url.PathEscape(checkpoint) + "/assessments/" + url.PathEscape(digest)
 	var out struct {
 		Assessment struct {
@@ -28,7 +28,7 @@ func (c *Client) AttachAssessment(ctx context.Context, ref Ref, checkpoint, dige
 	if problem := c.do(ctx, call{method: http.MethodPut, path: path, auth: true, reason: "attach verified producer evidence", bodyBytes: raw, strict: true}, &out); problem != nil {
 		return problem
 	}
-	if out.Assessment.Checkpoint != checkpoint || out.Assessment.Scope != "publisher_assessment" || out.Assessment.Report.Digest != digest || out.Assessment.Report.Length != int64(len(raw)) || out.Verdict != "indeterminate" {
+	if out.Assessment.Checkpoint != checkpoint || out.Assessment.Scope != "publisher_assessment" || out.Assessment.Report.Digest != digest || out.Assessment.Report.Length != int64(len(raw)) || out.Verdict != expectedVerdict {
 		return exit.Internalf("checkpoint assessment readback changed its identity or scope")
 	}
 	var received []byte
