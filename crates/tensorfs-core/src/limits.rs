@@ -50,9 +50,9 @@ pub const MAX_ELEMENTS: u64 = 1 << 48;
 /// read, checked, and only then is a buffer made. Real evidence: the shipped H3 DiT header
 /// is 486 KiB over 1,667 keys and SDXL's largest is 121 KiB over 2,516 — 16 MiB leaves 30x.
 pub const CARRIER_HEADER_MAX_BYTES: usize = 16 * 1024 * 1024;
-/// A permutation-class op needs the whole logical tensor resident (a head interleave is not
-/// a streaming transform). Above this a converter refuses rather than growing without bound;
-/// identity/inherit ops never buffer and are not subject to it.
+/// Maximum source role admitted for a permutation-class op. Source runs stream through
+/// the fixed writer buffer; this is a declared work bound, not a resident allocation.
+/// Identity/inherit ops are not subject to this permutation-specific limit.
 pub const CONVERT_TENSOR_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Interoperable integer range (I-JSON): numbers outside it refuse.

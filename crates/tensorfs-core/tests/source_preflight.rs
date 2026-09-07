@@ -683,7 +683,7 @@ fn the_preflight_document_names_the_session_and_the_accounting() {
         registry_sha256: format!("sha256:{}", "0".repeat(64)),
         plans: vec![preflight::ProfilePlan {
             profile: DUAL.into(),
-            converter: "h3.native/1".into(),
+            converter: "h3.native/2".into(),
             target: "fl2va_dit=plain/1,ref2va_dit=plain/1".into(),
             session: "0123456789abcdef".into(),
             components: vec![preflight::PlannedComponent {

@@ -9,7 +9,7 @@ complete H3 model. Its `span` command uses the existing carrier parser/range res
 ```sh
 cargo build --release --locked -p tensorfs-core --example resident_conversion_profile
 # Inputs are real safetensors files. The caller explicitly names the component.
-target/release/examples/resident_conversion_profile convert STORE OP all h3.native/1 ref2va_dit=INPUT
+target/release/examples/resident_conversion_profile convert STORE OP all h3.native/2 ref2va_dit=INPUT
 # Repeat with the same paths/operation to measure verified journal reuse.
 ```
 
