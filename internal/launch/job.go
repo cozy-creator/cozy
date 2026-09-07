@@ -1,8 +1,6 @@
 package launch
 
 import (
-	"bytes"
-	"encoding/json"
 	"path/filepath"
 	"strings"
 
@@ -187,8 +185,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		Publishes:        declared.Publishes,
 		NeedsAccelerator: AcceleratorRequired(strings.Split(f.Install.Closure, "\n")),
 	}
-	resultSchema, _ := json.Marshal(declared.Result)
-	facts.RetainsArtifacts = bytes.Contains(resultSchema, []byte(`"input":"model"`))
+	facts.RetainsArtifacts = len(ModelArtifactPaths(declared.Result)) > 0
 	for _, model := range declared.Models {
 		facts.ModelParams = append(facts.ModelParams, model.Param)
 	}

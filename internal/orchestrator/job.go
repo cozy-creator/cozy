@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -114,18 +115,40 @@ func JobBuildID(setBytes []byte, pkg string) (string, *exit.Error) {
 // stageJobPlans writes one job plan record per declared job into the worker's own home.
 // The file name is the descriptor id's hex, which is how the supervisor finds it.
 func stageJobPlans(workerHome string, plans []*JobPlan) *exit.Error {
-	dir := filepath.Join(workerHome, "job-plans")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return exit.Internalf("cannot create the job plan directory %s: %s", dir, err)
-	}
 	for _, p := range plans {
+		for _, id := range []string{p.BuildID, p.DescriptorID} {
+			raw, err := canonical.Raw(id)
+			spelled, _ := canonical.Spell(raw)
+			if err != nil || spelled != id {
+				return exit.New(exit.Validation, "job plan path requires exact canonical build and descriptor digests")
+			}
+		}
+		dir := filepath.Join(workerHome, "job-plans", strings.TrimPrefix(p.BuildID, "sha256:"))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return exit.Internalf("cannot create the job plan directory: %s", err)
+		}
 		data, err := json.MarshalIndent(p.Record, "", "  ")
 		if err != nil {
 			return exit.Internalf("cannot render the job plan record: %s", err)
 		}
 		name := strings.TrimPrefix(p.DescriptorID, "sha256:") + ".json"
-		if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
-			return exit.Internalf("cannot stage the job plan record: %s", err)
+		path := filepath.Join(dir, name)
+		out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o444)
+		if os.IsExist(err) {
+			held, readError := os.ReadFile(path)
+			if readError != nil || !bytes.Equal(held, data) {
+				return exit.Named(exit.Conflict, "job.plan_changed", "the exact job build and descriptor already name different plan bytes")
+			}
+			continue
+		}
+		if err != nil {
+			return exit.Internalf("cannot stage exact job plan: %s", err)
+		}
+		_, writeError := out.Write(data)
+		syncError := out.Sync()
+		closeError := out.Close()
+		if writeError != nil || syncError != nil || closeError != nil {
+			return exit.Internalf("cannot durably stage exact job plan")
 		}
 	}
 	return nil

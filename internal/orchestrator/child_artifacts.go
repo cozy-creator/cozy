@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -15,53 +16,75 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func childArtifacts(raw []byte) (map[string]records.ModelArtifact, *exit.Error) {
+func childArtifacts(raw []byte, paths [][]string) (map[string]records.ModelArtifact, *exit.Error) {
 	var value any
 	if json.Unmarshal(raw, &value) != nil {
 		return nil, exit.New(exit.Validation, "child artifact result is not JSON")
 	}
 	out := map[string]records.ModelArtifact{}
-	var walk func(any, string, int) *exit.Error
-	walk = func(value any, path string, depth int) *exit.Error {
-		if depth > 12 {
+	var walk func(any, []string, string) *exit.Error
+	walk = func(value any, segments []string, path string) *exit.Error {
+		if value == nil {
+			return nil
+		}
+		if len(segments) == 0 {
+			body, _ := json.Marshal(value)
+			artifact, problem := records.DecodeModelArtifact(body)
+			if problem != nil {
+				return problem
+			}
+			if len(out) >= 32 {
+				return exit.New(exit.Validation, "child artifact references exceed 32")
+			}
+			out[path] = *artifact
+			return nil
+		}
+		if len(segments) > 12 {
 			return exit.New(exit.Validation, "child artifact nesting exceeds its bound")
 		}
-		switch node := value.(type) {
-		case map[string]any:
-			if _, ok := node["tensorfs_receipt_digest"]; ok {
-				raw, _ := json.Marshal(node)
-				artifact, problem := records.DecodeModelArtifact(raw)
-				if problem != nil {
-					return problem
-				}
-				if len(out) >= 32 {
-					return exit.New(exit.Validation, "child artifact references exceed 32")
-				}
-				out[path] = *artifact
-				return nil
+		if segments[0] == "*" {
+			values, ok := value.([]any)
+			if !ok {
+				return exit.New(exit.Validation, "child artifact list differs from its result schema")
 			}
-			for name, child := range node {
-				if problem := walk(child, path+"/"+name, depth+1); problem != nil {
+			for index, child := range values {
+				if problem := walk(child, segments[1:], fmt.Sprintf("%s/%d", path, index)); problem != nil {
 					return problem
 				}
 			}
-		case []any:
-			for index, child := range node {
-				if problem := walk(child, fmt.Sprintf("%s/%d", path, index), depth+1); problem != nil {
-					return problem
-				}
-			}
+			return nil
 		}
-		return nil
+		object, ok := value.(map[string]any)
+		if !ok {
+			return exit.New(exit.Validation, "child artifact structure differs from its result schema")
+		}
+		child, exists := object[segments[0]]
+		if !exists {
+			return nil
+		}
+		escaped := strings.ReplaceAll(strings.ReplaceAll(segments[0], "~", "~0"), "/", "~1")
+		return walk(child, segments[1:], path+"/"+escaped)
 	}
-	if problem := walk(value, "result", 0); problem != nil {
-		return nil, problem
+	for _, path := range paths {
+		if problem := walk(value, path, "result"); problem != nil {
+			return nil, problem
+		}
 	}
 	return out, nil
 }
 
 func (c *Orchestrator) childResultArtifacts(request records.Request, raw []byte) (map[string]records.ModelArtifact, *exit.Error) {
-	artifacts, problem := childArtifacts(raw)
+	resolver, ok := c.opt.Packages.(interface {
+		PrivateArtifactPaths(records.Request) ([][]string, *exit.Error)
+	})
+	if !ok {
+		return nil, exit.Internalf("child result schema owner is unavailable")
+	}
+	paths, problem := resolver.PrivateArtifactPaths(request)
+	if problem != nil {
+		return nil, problem
+	}
+	artifacts, problem := childArtifacts(raw, paths)
 	if problem != nil {
 		return nil, problem
 	}
@@ -267,7 +290,11 @@ func (c *Orchestrator) releaseOriginalDerivedResults(id string) *exit.Error {
 }
 
 func (c *Orchestrator) retainChildInputs(request records.Request) *exit.Error {
-	artifacts, problem := childArtifacts(request.Payload)
+	paths := make([][]string, 0, len(request.Models))
+	for _, model := range request.Models {
+		paths = append(paths, []string{model.Slot})
+	}
+	artifacts, problem := childArtifacts(request.Payload, paths)
 	if problem != nil {
 		return problem
 	}

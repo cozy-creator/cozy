@@ -3,9 +3,11 @@ package producttest
 import (
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -76,6 +78,20 @@ func TestPrivateModelArtifactAdmissionAcquiresCustodyBeforeExecution(t *testing.
 	}
 	if _, problem := store.RecordWeightsRetention(retentions[0]); problem == nil {
 		t.Fatal("released artifact retention was resurrected")
+	}
+}
+
+func TestOnlySchemaDeclaredModelResultsAcquireNativeCustody(t *testing.T) {
+	ordinary := launch.Struct{Fields: []launch.Field{{Name: "tensorfs_receipt_digest", Type: json.RawMessage(`"str"`)}, {Name: "manifest", Type: json.RawMessage(`"str"`)}}}
+	if paths := launch.ModelArtifactPaths(ordinary); len(paths) != 0 {
+		t.Fatal("ordinary result field spellings became native ownership")
+	}
+	native := launch.Struct{Fields: []launch.Field{{Name: "candidate", Type: json.RawMessage(`{"union":["null",{"input":"model"}]}`)}, {Name: "history", Type: json.RawMessage(`{"list":{"input":"model"}}`)}}}
+	if paths := launch.ModelArtifactPaths(native); !reflect.DeepEqual(paths, [][]string{{"candidate"}, {"history", "*"}}) {
+		t.Fatalf("typed native artifact paths = %#v", paths)
+	}
+	if paths := launch.ModelArtifactPaths(launch.Struct{Input: "model"}); len(paths) != 1 || len(paths[0]) != 0 {
+		t.Fatalf("direct ModelArtifact result path = %#v", paths)
 	}
 }
 

@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"encoding/json"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -126,8 +125,7 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 		PlanID: facts.DescriptorID, Payload: append([]byte(nil), payload...), Outputs: facts.Outputs, WeightsOutputs: facts.WeightsOutputs, NeedsAccelerator: facts.NeedsAccelerator, Org: parent.Org}
 	out.Models = models
 	out.ChildReusable = job.Invocable.Reusable
-	resultSchema, _ := json.Marshal(job.Result)
-	out.ChildArtifacts = bytes.Contains(resultSchema, []byte(`"input":"model"`))
+	out.ChildArtifacts = len(launch.ModelArtifactPaths(job.Result)) > 0
 	if parent.Worker != "" {
 		out.Worker, out.Rental, out.RentalRequired = parent.Worker, true, true
 		out.LocalPackageDigest = binding.LocalRevisionDigest
@@ -139,4 +137,20 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	}
 	target, _ := canonical.Spell(canonical.Digest(identity))
 	return out, target, nil
+}
+
+func (r *Resolver) PrivateArtifactPaths(request records.Request) ([][]string, *exit.Error) {
+	install, problem := r.store.Install(request.InstallID)
+	if problem != nil || install == nil {
+		return nil, exit.Named(exit.Conflict, "child.install_absent", "captured artifact result schema is unavailable")
+	}
+	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir), install.PackageInterface)
+	if problem != nil {
+		return nil, problem
+	}
+	job, problem := surface.Function(request.Entrypoint)
+	if problem != nil {
+		return nil, problem
+	}
+	return launch.ModelArtifactPaths(job.Result), nil
 }
