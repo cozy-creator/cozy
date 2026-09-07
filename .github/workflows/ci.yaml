@@ -23,6 +23,13 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Real privileged-broker and unprivileged Store-owner writers
+        run: |
+          for proof in target/debug/deps/store_boundaries-*; do
+            if [ -f "$proof" ] && [ -x "$proof" ]; then
+              sudo "$proof" --exact privileged_writer_preserves_the_store_owners_public_directories --nocapture
+            fi
+          done
       - run: python3 scripts/fence.py
       # This package ships `py.typed`, which tells every consumer's type checker that the
       # facade and `_ext.pyi` are true. Nothing checked either until tfs-077, and the stub

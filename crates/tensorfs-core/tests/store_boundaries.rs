@@ -380,3 +380,206 @@ fn the_repo_cache_binding_survives_reopen_and_can_never_refuse_a_store() {
     assert!(!cache.exists());
     let _ = fs::remove_dir_all(root);
 }
+
+// Run this arm as root as well as in the ordinary suite. Separate CLI processes
+// exercise the same public Store boundary used by broker writes and Host downloads.
+#[test]
+fn privileged_writer_preserves_the_store_owners_public_directories() {
+    use std::io::Write;
+    use std::os::unix::fs::{chown, MetadataExt};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Output, Stdio};
+
+    let root = temporary("writer-owner");
+    fs::create_dir_all(&root).unwrap();
+    if fs::metadata(&root).unwrap().uid() != 0 {
+        eprintln!("multi-uid arm requires root; CI runs this exact test through sudo too");
+        fs::remove_dir_all(root).unwrap();
+        return;
+    }
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    // CI workspaces may have owner-only ancestors. The child identities need an
+    // executable in this fixture's traversable root, not access to the runner home.
+    let executable = root.join("tfs");
+    fs::copy(env!("CARGO_BIN_EXE_tfs"), &executable).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let store_root = root.join("store");
+    fs::create_dir(&store_root).unwrap();
+    let uid = 65530;
+    chown(&store_root, Some(uid), Some(uid)).unwrap();
+    let run = |args: &[&str], as_uid: u32| -> Output {
+        Command::new(&executable)
+            .args(args)
+            .uid(as_uid)
+            .gid(as_uid)
+            .output()
+            .unwrap()
+    };
+    let ok = |out: Output| {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    ok(run(&["store", "init", store_root.to_str().unwrap()], uid));
+    ok(run(
+        &["store", "prepare-readers", store_root.to_str().unwrap()],
+        uid,
+    ));
+    let store = Store::open(&store_root).unwrap();
+    let root_bytes = b"privileged writer payload";
+    let root_ref = ObjectRef::of(root_bytes);
+    let mut matching = Vec::new();
+    for i in 0u64.. {
+        let raw = format!("owner payload {i}").into_bytes();
+        if ObjectRef::of(&raw).sha256[..4] == root_ref.sha256[..4] {
+            matching.push(raw);
+            if matching.len() == 2 {
+                break;
+            }
+        }
+    }
+    let owner_bytes = &matching[0];
+    store
+        .put_stream(&mut root_bytes.as_slice(), None, &Fault::default())
+        .unwrap();
+    let path = store.blob_path(&root_ref.sha256);
+    let directory = path.parent().unwrap();
+    let before = fs::metadata(&path).unwrap();
+    assert_eq!(before.uid(), 0); // immutable payload ownership is not rewritten
+    assert_eq!(mode(&path), 0o444);
+    assert_eq!(fs::metadata(directory).unwrap().uid(), uid);
+    assert_eq!(fs::metadata(directory).unwrap().gid(), uid);
+    assert_eq!(mode(directory), 0o755);
+    let inode = fs::metadata(directory).unwrap().ino();
+    let input = root.join("owner-input");
+    fs::write(&input, owner_bytes).unwrap();
+    ok(run(
+        &["put", store_root.to_str().unwrap(), input.to_str().unwrap()],
+        uid,
+    ));
+    assert_eq!(fs::metadata(directory).unwrap().ino(), inode);
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(
+        (
+            before.ino(),
+            before.uid(),
+            before.gid(),
+            before.mode(),
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec()
+        ),
+        (
+            after.ino(),
+            after.uid(),
+            after.gid(),
+            after.mode(),
+            after.len(),
+            after.mtime(),
+            after.mtime_nsec()
+        )
+    );
+    assert_eq!(fs::read(&path).unwrap(), root_bytes);
+
+    // Concurrent owners compete for previously absent first-level namespaces. The
+    // parent-directory lock covers mkdir/owner assignment, never their payload reads.
+    let mut inputs = Vec::new();
+    let concurrent_prefix = ObjectRef::of(b"new concurrent shard").sha256[..4].to_string();
+    assert_ne!(concurrent_prefix, root_ref.sha256[..4]);
+    for i in 0u64.. {
+        let raw = format!("concurrent directory fixture {i}");
+        if ObjectRef::of(raw.as_bytes()).sha256[..4] != concurrent_prefix {
+            continue;
+        }
+        let n = inputs.len();
+        let file = root.join(format!("concurrent-{n}"));
+        fs::write(&file, raw).unwrap();
+        inputs.push(file);
+        if inputs.len() == 12 {
+            break;
+        }
+    }
+    let mut children = Vec::new();
+    for (n, file) in inputs.iter().enumerate() {
+        children.push(
+            Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "read gate; exec \"$@\"",
+                    "owner-proof",
+                    executable.to_str().unwrap(),
+                    "put",
+                    store_root.to_str().unwrap(),
+                    file.to_str().unwrap(),
+                ])
+                .uid(if n % 2 == 0 { 0 } else { uid })
+                .gid(if n % 2 == 0 { 0 } else { uid })
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for child in &mut children {
+        child.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    }
+    for child in children {
+        ok(child.wait_with_output().unwrap());
+    }
+    for first in fs::read_dir(store_root.join("blobs")).unwrap() {
+        let first = first.unwrap().path();
+        assert_eq!(fs::metadata(&first).unwrap().uid(), uid);
+        for second in fs::read_dir(first).unwrap() {
+            assert_eq!(fs::metadata(second.unwrap().path()).unwrap().uid(), uid);
+        }
+    }
+    let manifest = Manifest::from_files(vec![("payload".into(), root_ref.clone())]).unwrap();
+    let admitted = store.put_manifest(&manifest).unwrap();
+    let manifest_path = store.manifest_path(&admitted.obj.sha256);
+    assert_eq!(
+        fs::metadata(manifest_path.parent().unwrap()).unwrap().uid(),
+        uid
+    );
+    assert_eq!(mode(&manifest_path), 0o444);
+
+    // Unprivileged readers cannot become public writers. The shared lease door is
+    // separate from all public CAS directories, which remain owner-write only.
+    assert!(!run(
+        &["put", store_root.to_str().unwrap(), input.to_str().unwrap()],
+        uid - 1
+    )
+    .status
+    .success());
+
+    // An existing unexpected owner needs an explicit repair, including when called
+    // by root. Do not mutate its inode, metadata, or existing payload to make it pass.
+    chown(directory, Some(uid - 1), Some(uid - 1)).unwrap();
+    let wrong = fs::metadata(directory).unwrap();
+    let refusal = store
+        .put_stream(&mut matching[1].as_slice(), None, &Fault::default())
+        .unwrap_err();
+    assert_eq!(refusal.code, Code::STORE_ERA);
+    assert_eq!(fs::metadata(directory).unwrap().uid(), wrong.uid());
+    assert_eq!(fs::metadata(directory).unwrap().ino(), wrong.ino());
+    assert_eq!(fs::read(&path).unwrap(), root_bytes);
+    chown(directory, Some(uid), Some(uid)).unwrap();
+
+    let outside = root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    let raw = b"symlink must not redirect admission";
+    let reference = ObjectRef::of(raw);
+    let target = store.blob_path(&reference.sha256);
+    fs::create_dir_all(target.parent().unwrap().parent().unwrap()).unwrap();
+    let first = target.parent().unwrap().parent().unwrap();
+    chown(first, Some(uid), Some(uid)).unwrap();
+    symlink(&outside, target.parent().unwrap()).unwrap();
+    assert!(store
+        .put_stream(&mut raw.as_slice(), None, &Fault::default())
+        .is_err());
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    assert_eq!(fs::metadata(&outside).unwrap().uid(), 0);
+    fs::remove_dir_all(root).unwrap();
+}

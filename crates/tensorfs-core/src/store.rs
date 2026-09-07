@@ -18,7 +18,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{fchown, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -664,6 +664,81 @@ impl Store {
         fsync_dir(&self.root.join("tmp/writers"))
     }
 
+    /// Public directory ownership follows the Store owner, not whichever trusted writer
+    /// first touches a hash prefix. A privileged broker may write beside the Store owner;
+    /// its new directories must not strand that owner behind root-owned 0755 prefixes.
+    /// Existing directories are checked, never silently repaired; payload modes/owners and
+    /// operation-private roots are outside this policy.
+    fn prepare_public_directory(&self, path: &Path) -> Result<()> {
+        let relative = path.strip_prefix(&self.root).map_err(|_| Refusal {
+            code: Code::STORE_ERA,
+            detail: "public directory is outside the Store".into(),
+        })?;
+        let mut parts = relative.components();
+        let namespace = parts.next();
+        if !matches!(namespace, Some(std::path::Component::Normal(name))
+            if name == "blobs" || name == "manifests" || name == "repos")
+            || parts
+                .clone()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return refuse(
+                Code::STORE_ERA,
+                "directory is outside public Store namespaces",
+            );
+        }
+        let mut current = self.root.clone();
+        let mut parent = open_real_directory(&current)?;
+        let owner = parent
+            .metadata()
+            .map_err(|error| io("stat Store owner", error))?;
+        for part in relative.components() {
+            // The directory fd itself coordinates only mkdir/chown, never payload I/O.
+            // This also prevents another writer from seeing a newly created directory
+            // before its owner/mode are established. A crashed creator leaves a named,
+            // explicitly refused owner mismatch rather than a blind repair permission.
+            FileExt::lock_exclusive(&parent)
+                .map_err(|error| io("lock Store directory admission", error))?;
+            current.push(part.as_os_str());
+            let created = match fs::create_dir(&current) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(error) => return Err(io("create public Store directory", error)),
+            };
+            let child = open_real_directory(&current)?;
+            let metadata = child
+                .metadata()
+                .map_err(|error| io("stat Store directory", error))?;
+            if created {
+                if metadata.uid() != owner.uid() || metadata.gid() != owner.gid() {
+                    fchown(&child, Some(owner.uid()), Some(owner.gid()))
+                        .map_err(|error| io("assign public directory to Store owner", error))?;
+                }
+                child
+                    .set_permissions(fs::Permissions::from_mode(0o755))
+                    .map_err(|error| io("set public Store directory mode", error))?;
+                child
+                    .sync_all()
+                    .map_err(|error| io("sync public Store directory", error))?;
+                parent
+                    .sync_all()
+                    .map_err(|error| io("sync public directory parent", error))?;
+            } else if metadata.uid() != owner.uid() || metadata.gid() != owner.gid() {
+                return refuse(
+                    Code::STORE_ERA,
+                    format!(
+                        "{} owner differs from Store owner; explicit directory repair required",
+                        current.display()
+                    ),
+                );
+            }
+            FileExt::unlock(&parent)
+                .map_err(|error| io("unlock Store directory admission", error))?;
+            parent = child;
+        }
+        Ok(())
+    }
+
     /// Sorted Manifest ids whose CozyTensors runtime closures are verifiably resident.
     ///
     /// Ordinary snapshots, incomplete models, malformed Manifests, and corrupt/missing reached
@@ -810,7 +885,7 @@ impl Store {
             )?;
         }
         let path = self.manifest_path(&object.sha256);
-        fs::create_dir_all(path.parent().unwrap()).map_err(|error| io("mkdir manifest", error))?;
+        self.prepare_public_directory(path.parent().unwrap())?;
         if path.exists() {
             self.read_manifest(&object)?;
             return Ok(Put {
@@ -952,8 +1027,7 @@ impl Store {
                     let bytes = repository.canonical_bytes();
                     if actual.as_deref() != Some(bytes.as_slice()) {
                         let directory = path_for_write.parent().unwrap();
-                        fs::create_dir_all(directory)
-                            .map_err(|error| io("mkdir repository org", error))?;
+                        self.prepare_public_directory(directory)?;
                         let temporary = directory.join(format!(
                             ".{}.{}.{}",
                             path_for_write.file_name().unwrap().to_string_lossy(),
@@ -1140,8 +1214,8 @@ impl Store {
 
             let dst = self.object_path(&hex);
             let dir = dst.parent().unwrap().to_path_buf();
-            if let Err(e) = fs::create_dir_all(&dir) {
-                return cleanup(&tmp, io("mkdir fan-out", e));
+            if let Err(error) = self.prepare_public_directory(&dir) {
+                return cleanup(&tmp, error);
             }
             // No-clobber admission: link() refuses to replace an installed object.
             let admitted = match fs::hard_link(&tmp, &dst) {
@@ -1762,12 +1836,7 @@ fn open_validated(root: &Path) -> Result<Store> {
     })
 }
 
-fn prepare_reader_dir(path: &Path, mode: u32) -> Result<()> {
-    match fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(io(format!("mkdir {}", path.display()), error)),
-    }
+fn open_real_directory(path: &Path) -> Result<File> {
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW)
@@ -1775,7 +1844,7 @@ fn prepare_reader_dir(path: &Path, mode: u32) -> Result<()> {
         .map_err(|error| io(format!("open directory {}", path.display()), error))?;
     if !directory
         .metadata()
-        .map_err(|error| io(format!("stat directory {}", path.display()), error))?
+        .map_err(|error| io("stat directory", error))?
         .is_dir()
     {
         return refuse(
@@ -1783,6 +1852,16 @@ fn prepare_reader_dir(path: &Path, mode: u32) -> Result<()> {
             format!("{} is not a real Store directory", path.display()),
         );
     }
+    Ok(directory)
+}
+
+fn prepare_reader_dir(path: &Path, mode: u32) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(io(format!("mkdir {}", path.display()), error)),
+    }
+    let directory = open_real_directory(path)?;
     directory
         .set_permissions(fs::Permissions::from_mode(mode))
         .map_err(|error| io(format!("chmod directory {}", path.display()), error))?;
