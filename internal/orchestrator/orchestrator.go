@@ -758,7 +758,7 @@ func (c *Orchestrator) drain() {
 				c.park(*req, position, waitFacts{}, e.Message)
 				continue
 			}
-			c.failQueued(id, e)
+			c.failQueued(id, e, "")
 			continue
 		}
 		c.forget(id)
@@ -842,7 +842,7 @@ func (c *Orchestrator) kickQueuedTransferDispatch(req records.Request) {
 			return
 		}
 		if problem.Code != exit.Unavailable && problem.Code != exit.Conflict {
-			c.failQueued(req.ID, problem)
+			c.failQueued(req.ID, problem, "")
 			go c.drain()
 			return
 		}

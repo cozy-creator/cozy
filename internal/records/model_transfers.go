@@ -851,8 +851,8 @@ func (s *Store) SettleModelTransferRequest(requestID string, attempt int64) (str
 	return state, nil
 }
 
-// FailModelTransferRequest atomically settles a pre-attempt hook failure and its
-// ordinary absorbing event. It never overwrites cancellation or a completed request.
+// FailModelTransferRequest settles exhausted attempt retries and their absorbing
+// event. Pre-attempt preparation failures must use FailQueuedRequest instead.
 func (s *Store) FailModelTransferRequest(requestID, code, detail string,
 	payload map[string]any,
 ) (bool, *exit.Error) {
