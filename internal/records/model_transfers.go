@@ -906,10 +906,17 @@ func (s *Store) DeclaredServingModels(requestID string) ([]ModelRef, *exit.Error
 	}
 	out := make([]ModelRef, 0, len(request.Models))
 	for _, model := range request.Models {
-		if model.Release == "" || model.Model == "" || model.Manifest == "" {
+		if !model.Published() {
 			continue
 		}
 		out = append(out, model)
 	}
 	return out, nil
+}
+
+// Published identifies the exact catalog model vocabulary the Hub can measure
+// and the worker download set can fetch. Operation-local manifests have no
+// published closure authority and must not be used to size new capacity.
+func (model ModelRef) Published() bool {
+	return model.Release != "" && model.Model != "" && model.Manifest != ""
 }

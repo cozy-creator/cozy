@@ -1575,7 +1575,11 @@ func downloadModelRefs(models []ModelRef) []*pb.DownloadModelRef {
 		if model.Release == "" {
 			continue
 		}
-		out = append(out, &pb.DownloadModelRef{Package: model.Package, Slot: model.Slot,
+		path := model.Slot
+		if model.BindingPath != "" {
+			path = model.BindingPath
+		}
+		out = append(out, &pb.DownloadModelRef{Package: model.Package, Slot: path,
 			Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest})
 	}
 	return out

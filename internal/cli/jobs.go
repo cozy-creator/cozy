@@ -45,26 +45,48 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
-	if len(overrides) > 0 {
-		return exit.Usagef("model.<param>= applies to serving callables; remote modeled jobs are not supported yet")
+	if e := launch.ValidatePayload(target.Package, job, input); e != nil {
+		return e
 	}
 	trees, e := parseTrees(ctx.Inv.Values["--input"])
 	if e != nil {
 		return e
 	}
 
+	sub := api.JobSubmission{Package: target.Package, Function: target.Function, Input: input,
+		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
+		Release: target.Release, Rental: rentalRequested(ctx),
+		RentalRequired: ctx.Inv.Bool("--rental-only")}
+	source, profiles, models, e := resolveJobModelInputs(ctx, target, job, overrides)
+	if e != nil {
+		return e
+	}
+	sub.Models = models
+	if source != "" {
+		if len(trees) > 0 {
+			return exit.Usagef("foreign model inputs cannot also use local input trees")
+		}
+		return submitSourceTransfer(ctx, "model-upload", source, ctx.Inv.Value("--publish-to"),
+			&sourceInvocation{Target: target, Job: job, Profiles: profiles}, sub)
+	}
+	if e := jobOutputDestination(ctx, job, &sub); e != nil {
+		return e
+	}
+	if ctx.Inv.Bool("--dry-run") {
+		return emit(ctx, compactRecord([]output.Field{
+			{K: "target", V: target.Package + "/" + target.Function}, {K: "release", V: target.Release},
+			{K: "input", V: input}, {K: "models", V: models},
+			{K: "publish_to", V: ctx.Inv.Value("--publish-to")},
+			{K: "status", V: "planned"}, {K: "changed", V: false},
+		}, "target", "release", "models", "publish_to", "status", "changed"))
+	}
 	c, e := dial(ctx)
 	if e != nil {
 		return e
 	}
 	key := requestKey(ctx.Inv.Value("--idempotency-key"))
 	began := time.Now()
-	handle, e := c.SubmitJob(api.JobSubmission{
-		Package: target.Package, Function: target.Function, Input: input,
-		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
-		Release: target.Release, Rental: rentalRequested(ctx),
-		RentalRequired: ctx.Inv.Bool("--rental-only"),
-	}, key)
+	handle, e := c.SubmitJob(sub, key)
 	if e != nil {
 		return e
 	}

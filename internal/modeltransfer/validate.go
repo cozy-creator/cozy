@@ -6,7 +6,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
-// ValidateProducer checks only the callable shape model download/upload needs.
+// ValidateProducer checks the ordinary modeled job shape used by source preparation.
+// Payload requirements are checked by the existing typed job payload validator.
 // Output tensor schemas depend on the selected source and remain owned by the produced
 // CozyTensors header; publication declares only bounded output slots here.
 // The PackageInterface declares no source selection (cr-077): every model input is bound
@@ -30,12 +31,6 @@ func ValidateProducer(name string, job *launch.Entrypoint, supplied map[string]s
 				"--source-profile names %s, which is not a model input of producer job %s", param, name)
 		}
 	}
-	for _, field := range job.Request.Fields {
-		if field.Wire == "required" {
-			return exit.Named(exit.Validation, "model_producer.argument_missing",
-				"producer job %s requires argument %s", name, field.Name)
-		}
-	}
 	if len(job.WeightsOutputs) == 0 {
 		return exit.Named(exit.Validation, "model_producer.outputs_absent",
 			"producer job %s has no WeightsSink model output", name)
@@ -51,9 +46,16 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 		return nil
 	}
 	if !intent.HasAcquisition() && (spec.Rental || spec.RentalRequired) && spec.Worker == "" {
-		return exit.Named(exit.Validation, "model_transfer.prepared_rental_required",
-			"output-only publication requires an explicitly selected existing rental").
-			WithRemedy("select a prepared rental with sufficient disk and host memory; manifest byte lengths do not size their model closures")
+		// The existing rental workload declaration carries these exact model
+		// identities to the Hub's closure union measurement, for jobs as well
+		// as serving. Private operation-local manifests have no such authority.
+		for _, model := range spec.Models {
+			if !model.Published() {
+				return exit.Named(exit.Validation, "model_transfer.prepared_rental_required",
+					"unpublished model inputs require an explicitly selected prepared rental").
+					WithRemedy("use published model references so Tensorhub can measure their closures before renting")
+			}
+		}
 	}
 	if spec.Rental || spec.RentalRequired {
 		for _, file := range intent.SourceFiles {
