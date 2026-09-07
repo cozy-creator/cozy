@@ -92,12 +92,19 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 			return
 		}
 	}
-	if request.ModelTransfer != nil && c.opt.ModelTransfers != nil {
+	if request.ModelTransfer != nil {
 		pending, problem := c.opt.Store.RetriedSourceCustodyPending(id)
 		if problem != nil || pending {
 			c.retryRetainedCancellation(id)
 			return
 		}
+		if problem := c.releaseRetainedSource(*request); problem != nil {
+			c.logf("request %s retained source release: %s", id, problem.Message)
+			c.retryRetainedCancellation(id)
+			return
+		}
+	}
+	if request.ModelTransfer != nil && c.opt.ModelTransfers != nil {
 		if problem := c.opt.ModelTransfers.AbandonModelTransferPublications(context.Background(), id); problem != nil {
 			c.retryRetainedCancellation(id)
 			return

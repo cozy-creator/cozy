@@ -12,6 +12,44 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// Source roots belong to the request, not to the Python process's lifetime.
+// Wait for the original Host to fence and drain its source operation before
+// relinquishing retention. An explicitly ended rental has already lost its disk.
+func (c *Orchestrator) releaseRetainedSource(request records.Request) *exit.Error {
+	if request.Worker == "" || !request.ModelTransfer.HasAcquisition() {
+		return nil
+	}
+	row, problem := c.opt.Store.RentalRow(request.Worker)
+	if problem != nil {
+		return problem
+	}
+	if row != nil && row.State == "released" {
+		return nil
+	}
+	s, problem := c.rentalControl(request.Worker)
+	if problem != nil {
+		_, _, _, _ = c.EnsureRental(request.Worker)
+		return problem
+	}
+	if s.host == nil || s.claim == nil {
+		return exit.Unavailablef("source release is awaiting the claimed original pod")
+	}
+	selection, err := canonical.Raw(request.ModelTransfer.SourceSelection)
+	if err != nil {
+		return exit.Internalf("retained source selection is malformed")
+	}
+	answer, err := s.host.ModelSourceRelease(s.ctx, &pb.ModelSourceReleaseCall{
+		Claim: s.claim, OperationId: request.ID, SourceSelectionDigest: selection,
+	})
+	if err != nil {
+		return exit.Unavailablef("source release is awaiting the original pod")
+	}
+	if answer == nil || !answer.Released || answer.OperationId != request.ID {
+		return exit.Named(exit.Structural, "request.source_release_changed", "source release did not acknowledge this request")
+	}
+	return nil
+}
+
 // adoptRetriedSource asks the same claimed pod to independently retain source
 // computation for an edited request. The native owner validates the old chain
 // against the new source plan and produces new operation-bound checkpoints.
