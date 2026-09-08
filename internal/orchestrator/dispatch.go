@@ -1920,7 +1920,7 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 			c.cleanupRemote(req.ID, attempt, w)
 		}
 	}()
-	dir, e := w.media.ReserveOutputs(slot, reservedOutputBytes)
+	dir, e := w.media.ReserveOutputs(slot, reservedOutputBytes, len(outputIDs))
 	if e != nil {
 		return nil, e
 	}

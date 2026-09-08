@@ -54,6 +54,31 @@ func TestMediaRequiresScopedInputSupportBeforeBytes(t *testing.T) {
 	}
 }
 
+// A zero-output attempt still reserves an explicit count; the receiver must
+// distinguish zero from an old client which omitted inode obligations entirely.
+func TestMediaOutputReservationCarriesExactCount(t *testing.T) {
+	for _, count := range []int{0, 3} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			bound := int64(count) * 512
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/outputs/attempt-7" ||
+					r.URL.Query().Get("output_count") != fmt.Sprint(count) ||
+					r.URL.Query().Get("max_bytes") != fmt.Sprint(bound) {
+					t.Errorf("output byte/count reservation changed: %s %s", r.Method, r.URL)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"dir": "/outputs/attempt-7"})
+			}))
+			defer server.Close()
+			client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
+			dir, problem := client.ReserveOutputs("attempt-7", bound, count)
+			fatal(t, problem)
+			if dir != "/outputs/attempt-7" {
+				t.Fatalf("reservation lost its directory: %q", dir)
+			}
+		})
+	}
+}
+
 // Exercise the common bytes/file transport with a response lost after the peer
 // consumes the body. Retrying preserves both path components and the original file.
 func TestMediaInputRetryKeepsAttemptAndOriginalFile(t *testing.T) {
@@ -135,6 +160,15 @@ func TestAttemptScopedInputsAgainstPodMedia(t *testing.T) {
 	}
 	client := inputMediaClient(t, address, 2*time.Second)
 	fatal(t, client.Health())
+	outputSlot := media.Slot("output-count-proof", 1)
+	defer client.DropAttempt(outputSlot)
+	_, problem := client.ReserveOutputs(outputSlot, 4096, 3)
+	fatal(t, problem)
+	_, problem = client.ReserveOutputs(outputSlot, 4096, 3)
+	fatal(t, problem)
+	if _, problem = client.ReserveOutputs(outputSlot, 4096, 2); problem == nil {
+		t.Fatal("receiver allowed an existing output count to change")
+	}
 	body := []byte("same cached bytes across attempts")
 	slotA := media.Slot("input-proof-a", 1)
 	slotB := media.Slot("input-proof-b", 1)
@@ -143,7 +177,7 @@ func TestAttemptScopedInputsAgainstPodMedia(t *testing.T) {
 	if _, problem := client.PutInput(slotA, "payload", body); problem == nil {
 		t.Fatal("receiver accepted bytes before reservation")
 	}
-	_, problem := client.ReserveOutputs(slotA, 0)
+	_, problem = client.ReserveOutputs(slotA, 0, 0)
 	fatal(t, problem)
 	// Let the actual receiver commit the input, then drop its response before
 	// Creator can obtain a path. The next upload retries the same binding.
@@ -178,7 +212,7 @@ func TestAttemptScopedInputsAgainstPodMedia(t *testing.T) {
 	if _, problem := client.PutInput(slotA, "payload", []byte("changed binding")); problem == nil {
 		t.Fatal("receiver rebound an existing input to changed bytes")
 	}
-	_, problem = client.ReserveOutputs(slotB, 0)
+	_, problem = client.ReserveOutputs(slotB, 0, 0)
 	fatal(t, problem)
 	original := filepath.Join(t.TempDir(), "original")
 	must(t, os.WriteFile(original, body, 0600))
@@ -202,7 +236,7 @@ func TestAttemptScopedInputsAgainstPodMedia(t *testing.T) {
 	for _, boundary := range []string{"reserved", "payload", "file"} {
 		t.Run("cancel_"+boundary, func(t *testing.T) {
 			slot := media.Slot("cancel-"+boundary, 1)
-			_, problem := client.ReserveOutputs(slot, 0)
+			_, problem := client.ReserveOutputs(slot, 0, 0)
 			fatal(t, problem)
 			if boundary != "reserved" {
 				_, problem = client.PutInput(slot, "payload", body)

@@ -716,6 +716,12 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{"path": path, "length": len(body), "digest": "sha256:" + hex.EncodeToString(sha256Of(body))})
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/outputs/"):
+			count, err := strconv.Atoi(r.URL.Query().Get("output_count"))
+			if err != nil || count < 0 {
+				t.Errorf("output reservation omitted its exact file count: %s", r.URL)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			slot := strings.TrimPrefix(r.URL.Path, "/v1/outputs/")
 			reserved[slot] = true
 			dir := filepath.Join(mediaRoot, "outputs", slot)
