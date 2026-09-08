@@ -99,7 +99,7 @@ class RelayOutput(msgspec.Struct):
 def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> TileOutput:
     """A deterministic RGB tile from a linear congruential sequence — real computation
     whose output is a real WebP the runtime encodes, with nothing to load first."""
-    side = 8 if ctx.boot_warmup else payload.size
+    side = payload.size
     tel.log("filling the tile", side=side, seed=payload.seed)
     tel.progress(0.25, stage="tile")
     # Leave the real CLI enough time to observe this deliberately lossy frame. The fixture
