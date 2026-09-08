@@ -1055,7 +1055,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		TriageLength: triage.Length, TriageBundle: triage.Bundle,
 		Body: t.OutcomeCanonicalBytes, Outputs: outputs, ByteOutputs: byteOutputs,
 		WeightsFinalizations: weightsFinalizations,
-		EventType:            kept.Type, EventPayload: kept.Payload,
+		EventType:            kept.Type, EventPayload: c.withProgressSummary(t.RequestId, ordinal, kept.Payload),
 		// A requeueing request is QUEUED for its next ordinal, not failed. Writing the
 		// attempt's own status onto the request row would make the status document say
 		// `failed` for a request that is still going.
@@ -1297,9 +1297,9 @@ func (c *Orchestrator) settleRefusedOutcome(s *session, requestID string, ordina
 		InvocationDigest: r.spec, TerminalID: r.outcomeID, TerminalDigest: r.digest,
 		Status: "FAILED", Cause: outcomeRefusedCause, SafeMessage: r.reason, Body: r.body,
 		EventType: "request.failed",
-		EventPayload: map[string]any{"status": "FAILED", "cause": outcomeRefusedCause,
+		EventPayload: c.withProgressSummary(requestID, ordinal, map[string]any{"status": "FAILED", "cause": outcomeRefusedCause,
 			"error_type": outcomeRefusedCause, "error": r.reason,
-			"outputs": []any{}, "requeuing": false},
+			"outputs": []any{}, "requeuing": false}),
 		RequestState: "failed",
 	})
 	if e != nil {

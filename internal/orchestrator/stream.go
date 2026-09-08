@@ -93,7 +93,7 @@ func (c *Orchestrator) LatestFrame(requestID string) (Frame, bool) {
 
 // ProgressSnapshot is the latest real work coordinate Runtime reported and an optional
 // whole-job estimate from measured elapsed time per overall-fraction advance. It is
-// observational and live-only.
+// observational; the final overall fraction is copied into the attempt-end event.
 type ProgressSnapshot struct {
 	Stage           string
 	StageFraction   *float64
@@ -151,6 +151,21 @@ func (c *Orchestrator) LatestProgress(requestID string, attempt uint64) (Progres
 		snapshot.Estimated = true
 	}
 	return snapshot, true
+}
+
+// withProgressSummary preserves one measured fraction in the existing outcome
+// transaction. Progress ticks themselves remain lossy and never write the journal.
+func (c *Orchestrator) withProgressSummary(requestID string, attempt uint64, payload map[string]any) map[string]any {
+	progress, ok := c.LatestProgress(requestID, attempt)
+	if !ok || progress.OverallFraction == nil {
+		return payload
+	}
+	summary := make(map[string]any, len(payload)+1)
+	for key, value := range payload {
+		summary[key] = value
+	}
+	summary["overall_fraction"] = *progress.OverallFraction
+	return summary
 }
 
 type progressCoordinate struct {
@@ -292,8 +307,8 @@ func (f *fanout) publish(frame Frame) {
 	}
 }
 
-// forgetFrames drops a settled request's retained tick. A terminal request's last
-// progress reading is not a fact anyone needs after the terminal itself is durable.
+// forget drops a settled request's live telemetry. Its last measured overall
+// fraction has already committed with the attempt-end event.
 func (f *fanout) forget(requestID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

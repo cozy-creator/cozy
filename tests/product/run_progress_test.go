@@ -179,7 +179,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 
 	// The list reuses the same lossy Runtime progress lane. Whole-job percentage and ETA
 	// come only from overall_fraction; the current stage remains explicitly stage-local.
-	// Terminal rows return to a dash because progress beside "completed" adds no information.
+	// Completed rows preserve the successful 100% coordinate after live telemetry is gone.
 	code, output := runCozy(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=6", "delay_ms=5000")
 	if code != 0 {
@@ -258,9 +258,9 @@ func TestRunProgressSurfaces(t *testing.T) {
 		t.Fatalf("progress proof run did not settle [exit %d]\n%s", code, out)
 	}
 	if terminal := list(true); terminal.Status != "completed" || terminal.ProgressStage != "" ||
-		terminal.StageFraction != nil || terminal.OverallFraction != nil ||
+		terminal.StageFraction != nil || terminal.OverallFraction == nil || *terminal.OverallFraction != 1 ||
 		terminal.Position != nil || terminal.Total != nil || terminal.RemainingMS != nil {
-		t.Fatalf("terminal run retained redundant progress: %+v", terminal)
+		t.Fatalf("terminal run did not preserve completed progress: %+v", terminal)
 	}
 
 	// The live inventory is a real terminal viewport: a wheel event moves the bounded page,
