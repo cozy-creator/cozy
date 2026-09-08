@@ -622,25 +622,45 @@ func writeJSON(path string, value any) *exit.Error {
 }
 
 func (t *Tool) observedRepository(org, name, scratch string) (string, *exit.Error) {
-	rows, e := t.Releases(filepath.Join(scratch, "repo-list.jsonl"))
-	if e != nil {
-		return "", e
-	}
-	found := false
-	for _, row := range rows {
-		if row.Org == org && row.Name == name {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return "-", nil
-	}
 	current := filepath.Join(scratch, "repo-current.json")
 	if _, e := t.run("repo", "get", t.Root, org, name, "--out", current); e != nil {
+		// The native CLI owns the distinction between an absent repository and
+		// corrupt/unreadable metadata. Its release listing omits retained-only repos.
+		if strings.Contains(e.Message, "REFUSED REPOSITORY_ABSENT:") {
+			return "-", nil
+		}
 		return "", e
 	}
 	return current, nil
+}
+
+// RetainedCheckpoint reads the native repository's exact checkpoint membership.
+func (t *Tool) RetainedCheckpoint(org, name, manifestID, scratch string) (int64, *exit.Error) {
+	current, problem := t.observedRepository(org, name, scratch)
+	if problem != nil || current == "-" {
+		return 0, problem
+	}
+	raw, err := os.ReadFile(current)
+	if err != nil {
+		return 0, exit.Internalf("cannot read native repository metadata: %s", err)
+	}
+	var repository struct {
+		Checkpoints []struct {
+			Manifest struct {
+				SHA256 string `json:"sha256"`
+				Length int64  `json:"length"`
+			} `json:"manifest"`
+		} `json:"checkpoints"`
+	}
+	if err := json.Unmarshal(raw, &repository); err != nil {
+		return 0, exit.Internalf("cannot decode native repository metadata: %s", err)
+	}
+	for _, checkpoint := range repository.Checkpoints {
+		if "sha256:"+checkpoint.Manifest.SHA256 == manifestID {
+			return checkpoint.Manifest.Length, nil
+		}
+	}
+	return 0, nil
 }
 
 func releaseRevision(path, version string) (uint64, *exit.Error) {
@@ -668,8 +688,8 @@ func releaseRevision(path, version string) (uint64, *exit.Error) {
 	return 0, nil
 }
 
-// CommitRelease makes one verified manifest visible under the local repository.
-func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length int64,
+// CommitCheckpoint retains a verified manifest without inventing a release.
+func (t *Tool) CommitCheckpoint(org, name, manifestID string, length int64,
 	scratch string,
 ) *exit.Error {
 	current, e := t.observedRepository(org, name, scratch)
@@ -687,8 +707,18 @@ func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length
 	if _, e = t.run("repo", "commit", t.Root, current, checkpointMutation); e != nil {
 		return e
 	}
+	return nil
+}
+
+// CommitRelease names an already verified and retained checkpoint locally.
+func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length int64,
+	scratch string,
+) *exit.Error {
+	if e := t.CommitCheckpoint(org, name, manifestID, length, scratch); e != nil {
+		return e
+	}
 	checkpointed := filepath.Join(scratch, "repo-checkpointed.json")
-	if _, e = t.run("repo", "get", t.Root, org, name, "--out", checkpointed); e != nil {
+	if _, e := t.run("repo", "get", t.Root, org, name, "--out", checkpointed); e != nil {
 		return e
 	}
 	expectedRevision, e := releaseRevision(checkpointed, version)

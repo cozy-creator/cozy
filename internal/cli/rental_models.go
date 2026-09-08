@@ -32,8 +32,11 @@ func manualRentalModels(ctx *Context, existing *records.RentalOperation) ([]hub.
 		if problem != nil {
 			return nil, problem
 		}
-		if release == "" || lane == "" {
-			return nil, exit.Usagef("--model %q must pin org/model@release/lane", spec)
+		if manifest == "" && (release == "" || lane == "") {
+			return nil, exit.Usagef("--model %q must pin org/model@release/lane or org/model#sha256:<digest>", spec)
+		}
+		if release == "" && lane != "" {
+			return nil, exit.Usagef("--model %q selects a lane without a release", spec)
 		}
 		ref, problem := hub.ParseRef(model)
 		if problem != nil {
@@ -56,7 +59,11 @@ func manualRentalModels(ctx *Context, existing *records.RentalOperation) ([]hub.
 			}
 		} else {
 			hctx, cancel := hub.Context()
-			resolved, problem := client(ctx).ResolveModel(hctx, model+"@"+release, lane)
+			resolveRef := model + "@" + release
+			if release == "" {
+				resolveRef = model + "@" + manifest
+			}
+			resolved, problem := client(ctx).ResolveModel(hctx, resolveRef, lane)
 			cancel()
 			if problem != nil {
 				return nil, problem
@@ -71,7 +78,11 @@ func manualRentalModels(ctx *Context, existing *records.RentalOperation) ([]hub.
 		if !seen[exact] {
 			seen[exact] = true
 			selected = append(selected, exact)
-			fmt.Fprintf(ctx.Err, "Sizing rental for %s@%s/%s#%s\n", exact.Model, exact.Release, exact.Lane, exact.Manifest)
+			if exact.Release == "" {
+				fmt.Fprintf(ctx.Err, "Sizing rental for %s#%s\n", exact.Model, exact.Manifest)
+			} else {
+				fmt.Fprintf(ctx.Err, "Sizing rental for %s@%s/%s#%s\n", exact.Model, exact.Release, exact.Lane, exact.Manifest)
+			}
 		}
 	}
 	if existing != nil && len(selected) != len(pinned) {

@@ -237,7 +237,7 @@ func TestAnIncompleteServingModelIsRefusedBeforeItIsSent(t *testing.T) {
 		model hub.ServingModel
 	}{
 		{"no manifest", hub.ServingModel{Lane: "bf16", Model: "paul/m", Release: "1.0.0"}},
-		{"no release", hub.ServingModel{Lane: "bf16", Model: "paul/m",
+		{"lane without release", hub.ServingModel{Lane: "bf16", Model: "paul/m",
 			Manifest: "sha256:" + strings.Repeat("1", 64)}},
 		{"no model", hub.ServingModel{Lane: "bf16", Release: "1.0.0",
 			Manifest: "sha256:" + strings.Repeat("1", 64)}},

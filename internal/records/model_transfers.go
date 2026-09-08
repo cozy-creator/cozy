@@ -903,7 +903,7 @@ func (s *Store) FailModelTransferRequest(requestID, code, detail string,
 	return true, nil
 }
 
-// DeclaredServingModels is the set of published models this request will make
+// DeclaredServingModels is the set of Hub-resolved models this request will make
 // its pod hold, or empty when it names none (th-155/cl-130).
 //
 // It is the SERVING half of what PlannedSourceBytes does for an ingest, and it
@@ -914,9 +914,8 @@ func (s *Store) FailModelTransferRequest(requestID, code, detail string,
 // — so declaring them costs no extra round trip and cannot disagree with what
 // the pod later fetches.
 //
-// A release-less ref is dropped, exactly as downloadModelRefs drops it: that is
-// an operation-local manifest already held in the worker's own store, not a
-// published model the hub can resolve or size.
+// Operation-local refs are dropped through the same Downloadable predicate as
+// the worker download set. Retained Hub checkpoints need no release to be sized.
 func (s *Store) DeclaredServingModels(requestID string) ([]ModelRef, *exit.Error) {
 	request, problem := s.RequestRow(requestID)
 	if problem != nil || request == nil {
@@ -924,7 +923,7 @@ func (s *Store) DeclaredServingModels(requestID string) ([]ModelRef, *exit.Error
 	}
 	out := make([]ModelRef, 0, len(request.Models))
 	for _, model := range request.Models {
-		if !model.Published() {
+		if !model.Downloadable() {
 			continue
 		}
 		out = append(out, model)
@@ -932,9 +931,8 @@ func (s *Store) DeclaredServingModels(requestID string) ([]ModelRef, *exit.Error
 	return out, nil
 }
 
-// Published identifies the exact catalog model vocabulary the Hub can measure
-// and the worker download set can fetch. Operation-local manifests have no
-// published closure authority and must not be used to size new capacity.
-func (model ModelRef) Published() bool {
-	return model.Release != "" && model.Model != "" && model.Manifest != ""
+// Downloadable identifies a Hub-resolved checkpoint that can be measured and
+// fetched. Operation-local manifests remain private to their prepared worker.
+func (model ModelRef) Downloadable() bool {
+	return model.Model != "" && model.Manifest != "" && (model.Release != "" || model.HubCheckpoint)
 }

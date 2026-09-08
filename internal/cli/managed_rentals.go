@@ -273,8 +273,9 @@ func offeredNames(skus []hub.RentalSKU) string {
 // permission AND intent to spend (owner ruling 2026-09-03). The chosen machine is pinned
 // to THIS request alone, with the lane its rung names, in one write; a buy the hub
 // refuses for stock drops that product and the choice repeats. A fitting rental whose
-// worker has not attached yet is waited for, never bought around (cl-170): the decision
-// returns with no rental and the fleet's next observation re-asks.
+// worker has not attached yet is waited for, never bought around (cl-170) nor queued
+// around (cl-174): the decision returns with no rental and the fleet's next observation
+// re-asks. A refusal returns its record too, so every decision is durable.
 func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 	var none orchestrator.PlacementDecision
 	m.mu.Lock()
@@ -322,13 +323,17 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	decision.Throughput = rental.Measure(decision.Candidates, rows, req.Models)
 	for {
 		i := rental.Place(decision.Tier, decision.Candidates)
-		if w := rental.Attaching(decision.Candidates); w >= 0 && (i < 0 || !decision.Candidates[i].Attached()) {
+		if w := rental.Attaching(decision.Candidates); w >= 0 &&
+			(i < 0 || !decision.Candidates[i].Attached() || decision.Candidates[i].Ahead > 0) {
+			// An idle attached rental is taken now; a buy, or a queue behind a busy one,
+			// is not chosen over the machine attaching: the request parks unpinned and
+			// goes to whichever is free first.
 			rental.Wait(decision.Candidates, w)
 			line, problem := m.lineLocked()
 			return decision, line, problem
 		}
 		if i < 0 {
-			return none, "", refusal(req, decision, capped)
+			return decision, "", refusal(req, decision, capped)
 		}
 		c := &decision.Candidates[i]
 		rentalID := c.Rental

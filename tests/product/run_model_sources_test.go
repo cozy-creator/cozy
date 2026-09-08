@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -47,6 +48,22 @@ func runModelCatalog(t *testing.T) (string, *sync.Mutex, *[][]byte, string, []by
 		_ = json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Org: "proof", Name: "source"}, Releases: []hub.ModelReleaseSummary{{ReleaseSummary: hub.ReleaseSummary{Release: "1.0.0"}, Lanes: []hub.ModelLaneSummary{{Lane: "bf16", ManifestID: digest, Bytes: 210_000_000_000}}}}})
 	})
 	mux.HandleFunc("GET /v1/models/proof/source/releases/1.0.0/lanes/bf16/manifest", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(manifest) })
+	mux.HandleFunc("GET /v1/models/resolve", func(w http.ResponseWriter, r *http.Request) {
+		ref, lane := r.URL.Query().Get("ref"), r.URL.Query().Get("lane")
+		released := ref == "proof/source@1.0.0@"+digest && lane == "bf16"
+		if !released && (ref != "proof/source@"+digest || lane != "") {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":"manifest.not_found","message":"not retained"}}`))
+			return
+		}
+		resolution := hub.ModelResolution{Model: "proof/source", ManifestID: digest,
+			ManifestLength: int64(len(manifest)), Bytes: 210_000_000_000, Objects: 100,
+			Components: []string{"model"}, ComponentBytes: map[string]int64{"model": 100}}
+		if released {
+			resolution.Release, resolution.Lane = "1.0.0", "bf16"
+		}
+		_ = json.NewEncoder(w).Encode(resolution)
+	})
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]hub.RentalSKU{{Name: "cpu", AcceleratorModel: "CPU", PriceUSDMicrosPerHour: 100_000, BaseWorkerProfile: "python3.12-cpu-linux-x86"}})
 	})
@@ -67,6 +84,31 @@ func runModelCatalog(t *testing.T) (string, *sync.Mutex, *[][]byte, string, []by
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: model-run-test\nrentals:\n  max_hourly_spend_usd: 20\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	return root, &mu, &posts, digest, manifest
+}
+
+func TestPinnedCheckpointTransferKeepsReleaseAndLaneConstraints(t *testing.T) {
+	root, _, _, digest, _ := runModelCatalog(t)
+	source := "proof/source@1.0.0/bf16#" + digest
+	code, out := runCozy(t, root, "model", "download", source, "local/pinned", "--dry-run", "--json", "--full")
+	var result struct{ ID string }
+	if code != 0 || json.Unmarshal([]byte(out), &result) != nil {
+		t.Fatalf("pinned checkpoint preflight failed: %d %s", code, out)
+	}
+	want := modeltransfer.Instruction{Kind: "model-download", Destination: "local/pinned", Source: source}.ID()
+	if result.ID != want {
+		t.Fatal("canonical instruction discarded the explicit release/lane/digest constraints")
+	}
+	code, out = runCozy(t, root, "model", "download", source, "local/pinned", "--lane", "fp8", "--dry-run", "--json")
+	if code == 0 || !strings.Contains(out, "disagree") {
+		t.Fatal("conflicting explicit lane was accepted")
+	}
+	code, out = runCozy(t, root, "model", "download", "proof/source@1.0.0/bf16#sha256:"+strings.Repeat("f", 64), "local/pinned", "--dry-run", "--json")
+	if code == 0 || !strings.Contains(out, "manifest.not_found") {
+		t.Fatal("checkpoint outside the pinned release/lane was accepted")
+	}
+	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
+		t.Fatal("selection refusal or preflight started a daemon")
+	}
 }
 
 func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {
@@ -105,6 +147,83 @@ func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {
 		if code == 0 || !strings.Contains(out, "unknown flag --producer") {
 			t.Fatalf("retired producer flag accepted: %d %s", code, out)
 		}
+	}
+}
+
+func TestRunRetainedCheckpointPinsFactsWithoutRelease(t *testing.T) {
+	root, mu, posts, digest, manifest := runModelCatalog(t)
+	code, out := runCozy(t, root, "model", "download", "proof/source#"+digest, "local/checkpoint-proof", "--dry-run", "--json")
+	if code != 0 {
+		t.Fatalf("checkpoint download preflight refused: %d %s", code, out)
+	}
+	args := []string{"run", "proof/quantize/quantize", "steps=7",
+		"model.dits=proof/source#" + digest, "model.shared=proof/source#" + digest,
+		"--publish-to", "proof/output", "--rental-only", "--json", "--idempotency-key", "retained-model-job"}
+	code, out = runCozy(t, root, append(append([]string{}, args...), "--dry-run")...)
+	if code != 0 {
+		t.Fatalf("digest-only preflight refused: %d %s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
+		t.Fatal("preflight started owner")
+	}
+	startDaemonProcess(t, root)
+	code, out = runCozy(t, root, args...)
+	if code != 0 {
+		t.Fatalf("digest-only job did not queue: %d %s", code, out)
+	}
+	st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer st.Close()
+	row, problem := st.RequestByIdempotencyKey("retained-model-job")
+	fatal(t, problem)
+	if row == nil || len(row.Models) != 2 {
+		t.Fatal("retained inputs missing from request")
+	}
+	for _, model := range row.Models {
+		if !model.HubCheckpoint || !model.Downloadable() || model.Manifest != digest || model.ManifestLength != int64(len(manifest)) || model.Release != "" || model.Lane != "" || model.ComponentBytes["model"] != 100 {
+			t.Fatal("job lost Hub facts or invented release metadata")
+		}
+	}
+	waitUntil(t, "retained checkpoint identity reaches sizing boundary", func() bool { mu.Lock(); defer mu.Unlock(); return len(*posts) > 0 })
+	mu.Lock()
+	body := append([]byte(nil), (*posts)[0]...)
+	mu.Unlock()
+	request, problem := hub.ParseRentalRequestBytes(body)
+	fatal(t, problem)
+	if len(request.ServingModels) != 1 || request.ServingModels[0].Manifest != digest || request.ServingModels[0].Release != "" || request.ServingModels[0].Lane != "" {
+		t.Fatal("rental declaration lost exact release-less checkpoint")
+	}
+}
+
+func TestManualRentalAcceptsRetainedCheckpointIdentity(t *testing.T) {
+	root, mu, posts, digest, _ := runModelCatalog(t)
+	startDaemonProcess(t, root)
+	args := []string{"rental", "new", "cpu", "--idempotency-key", "retained-manual-rental",
+		"--model", "proof/source#" + digest, "--model", "proof/source#" + digest, "--json"}
+	code, out := runCozy(t, root, args...)
+	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
+		t.Fatalf("retained checkpoint did not reach isolated sizing boundary: %d %s", code, out)
+	}
+	mu.Lock()
+	if len(*posts) != 1 {
+		mu.Unlock()
+		t.Fatal("expected one isolated rental request")
+	}
+	body := append([]byte(nil), (*posts)[0]...)
+	mu.Unlock()
+	request, problem := hub.ParseRentalRequestBytes(body)
+	fatal(t, problem)
+	if len(request.ServingModels) != 1 || request.ServingModels[0] != (hub.ServingModel{Model: "proof/source", Manifest: digest}) {
+		t.Fatal("manual rental invented release metadata or duplicated checkpoint")
+	}
+	code, out = runCozy(t, root, "rental", "new", "cpu", "--idempotency-key", "retained-manual-rental", "--json")
+	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
+		t.Fatalf("pinned retry failed: %d %s", code, out)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*posts) != 2 || !bytes.Equal((*posts)[1], body) {
+		t.Fatal("retry changed the frozen checkpoint sizing identity")
 	}
 }
 

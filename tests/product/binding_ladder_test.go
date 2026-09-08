@@ -42,8 +42,10 @@ type ladderHub struct {
 	// buy completes and the placement is recorded; otherwise the fixture pod fails.
 	provisions bool
 	// unsized makes the card publish no component bytes for any lane (the card as it
-	// stood on 2026-09-07 22:27Z, cl-170).
+	// stood on 2026-09-07 22:27Z, cl-170). later adds the sized 1.0.0-rc.2 release a
+	// later package binds while a run still names rc.1 explicitly (cl-174).
 	unsized bool
+	later   bool
 }
 
 const (
@@ -102,7 +104,7 @@ func newLadderHub(t *testing.T) *ladderHub {
 	})
 	mux.HandleFunc("GET /v1/models/proof/minimax", func(w http.ResponseWriter, _ *http.Request) {
 		h.mu.Lock()
-		unsized := h.unsized
+		unsized, later := h.unsized, h.later
 		h.mu.Unlock()
 		card := hub.ModelCard{Model: hub.Resource{Org: "proof", Name: "minimax"},
 			Releases: []hub.ModelReleaseSummary{
@@ -124,6 +126,15 @@ func newLadderHub(t *testing.T) *ladderHub {
 					release.Lanes[i].ComponentBytes = nil
 				}
 			}
+		}
+		if later {
+			card.Releases = append(card.Releases, hub.ModelReleaseSummary{
+				ReleaseSummary: hub.ReleaseSummary{Release: "1.0.0-rc.2"}, Lanes: []hub.ModelLaneSummary{
+					{Lane: "fp8-adaln-pruned", ManifestID: fp8LaterManifest, Bytes: 104 * gib,
+						Components:     []string{"audio_vae", "fl2va_dit", "ref2va_dit", "text_encoder", "video_vae"},
+						ComponentBytes: h3Components()},
+					{Lane: "mxfp8-adaln-pruned", ManifestID: mxfpManifest, Bytes: 55 * gib},
+					{Lane: "bf16-full", ManifestID: bf16Manifest, Bytes: 130 * gib, ComponentBytes: h3BF16Components()}}})
 		}
 		_ = json.NewEncoder(w).Encode(card)
 	})

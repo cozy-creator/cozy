@@ -477,9 +477,8 @@ func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstal
 
 func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw, wantedLane string,
 	binding *hub.PackageBindingRow) (orchestrator.ModelRef, *exit.Error) {
-	// A caller may narrow by Manifest spelling, but cannot introduce one: the Hub-authored
-	// release card below must contain it in an exact lane before it enters request identity
-	// or a signed worker download delegation. No caller bytes or local path are trusted.
+	// Exact checkpoint inputs use Hub-owned facts; named selections use the release
+	// card. Both freeze a verified repository/manifest identity before preparation.
 	var empty orchestrator.ModelRef
 	modelName, release, refLane, manifest, problem := parseModelRef(raw)
 	if problem != nil {
@@ -501,6 +500,27 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
+	if manifest != "" && release == "" {
+		if wantedLane != "" {
+			return empty, exit.Usagef("a checkpoint digest without a release cannot select a lane")
+		}
+		resolved, problem := client(ctx).ResolveModel(hctx, ref.String()+"@"+manifest, "")
+		if problem != nil {
+			return empty, problem
+		}
+		if resolved.Model != ref.String() || resolved.ManifestID != manifest ||
+			resolved.ManifestLength <= 0 || resolved.Bytes <= 0 {
+			return empty, exit.Named(exit.Conflict, "rental.model_resolution_changed",
+				"Tensorhub returned different or incomplete checkpoint facts for %s", raw)
+		}
+		if problem := requireCheckpointComponents(raw, slot, resolved.Components); problem != nil {
+			return empty, problem
+		}
+		return orchestrator.ModelRef{Package: packageName, Slot: slot.Path,
+			Model: ref.String(), Manifest: manifest, HubCheckpoint: true,
+			ManifestLength: resolved.ManifestLength, Bytes: resolved.Bytes,
+			ComponentBytes: resolved.ComponentBytes, ComponentUse: slot.ComponentUse}, nil
+	}
 	_, selected, problem := modelReleaseCard(hctx, client(ctx), ref, release)
 	if problem != nil {
 		return empty, problem
@@ -553,12 +573,15 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 }
 
 // assertedRungs is the owner's ladder carried beside an explicit lane (cl-170): each rung
-// bound to the card's lane, saying where the owner puts each lane of THIS release — the
-// evidence a machine decision reads for the fit of the lane the run key chose, never a
-// choice. A binding for another model or release, or a rung naming a lane the card
-// lacks, says nothing here.
+// resolved to the selected release's lane of that name, saying where the owner puts each
+// lane of THIS model — the evidence a machine decision reads for the fit of the lane the
+// run key chose, never a choice. The binding's release is not required (cl-174): a rung
+// names a card and a lane, and on 2026-09-08 a package bound to rc.2 sized an explicit
+// rc.1 lane of the same name by whole-lane bytes, refusing two H100s that were running
+// that very lane. A binding for another model, or a rung naming a lane the selected
+// release lacks, says nothing here.
 func assertedRungs(binding *hub.PackageBindingRow, ref hub.Ref, selected *hub.ModelReleaseSummary) []records.ModelRung {
-	if binding == nil || binding.Model != ref.String() || binding.Release != selected.Release {
+	if binding == nil || binding.Model != ref.String() {
 		return nil
 	}
 	var rungs []records.ModelRung
