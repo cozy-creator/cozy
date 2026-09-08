@@ -20,12 +20,19 @@ type AssetsSlot struct {
 	View      string       `json:"view,omitempty"`
 }
 
+type ImagePreparation struct {
+	Profile   string `json:"profile"`
+	MaxEdge   *int64 `json:"max_edge,omitempty"`
+	MaxPixels *int64 `json:"max_pixels,omitempty"`
+}
+
 type AssetsKind struct {
-	Kind            string   `json:"kind"`
-	MediaTypes      []string `json:"media_types"`
-	MaxBytes        int64    `json:"max_bytes,omitempty"`
-	MaxCount        *int64   `json:"max_count,omitempty"`
-	MaxDecodedBytes int64    `json:"max_decoded_bytes,omitempty"`
+	Preparation     *ImagePreparation `json:"prepare,omitempty"`
+	Kind            string            `json:"kind"`
+	MediaTypes      []string          `json:"media_types"`
+	MaxBytes        int64             `json:"max_bytes,omitempty"`
+	MaxCount        *int64            `json:"max_count,omitempty"`
+	MaxDecodedBytes int64             `json:"max_decoded_bytes,omitempty"`
 }
 
 func validateAssetsSlot(raw, request json.RawMessage) error {
@@ -65,11 +72,29 @@ func validateAssetsSlot(raw, request json.RawMessage) error {
 	}
 	seen, media := map[string]bool{}, map[string]bool{}
 	for i, row := range rows {
-		fields, err := exactKeys(row, []string{"kind", "media_types"}, []string{"max_bytes", "max_decoded_bytes", "max_count"})
+		fields, err := exactKeys(row, []string{"kind", "media_types"}, []string{"max_bytes", "max_decoded_bytes", "max_count", "prepare"})
 		if err != nil {
 			return err
 		}
 		kind := slot.Kinds[i]
+		if raw := fields["prepare"]; raw != nil {
+			if kind.Kind != "image" || slot.View != "decoded" {
+				return fmt.Errorf("image preparation requires decoded image Assets")
+			}
+			caps, err := exactKeys(raw, []string{"profile"}, []string{"max_edge", "max_pixels"})
+			if err != nil {
+				return err
+			}
+			prep := kind.Preparation
+			if prep == nil || prep.Profile != "image-fit/1" || prep.MaxEdge == nil && prep.MaxPixels == nil {
+				return fmt.Errorf("unknown or empty image preparation")
+			}
+			for name, limit := range map[string]*int64{"max_edge": prep.MaxEdge, "max_pixels": prep.MaxPixels} {
+				if caps[name] != nil && (limit == nil || *limit <= 0) {
+					return fmt.Errorf("image preparation caps must be positive integers")
+				}
+			}
+		}
 		if slot.View == "decoded" && kind.Kind == "file" {
 			return fmt.Errorf("decoded assets need image, video or audio kinds")
 		}
@@ -288,6 +313,17 @@ func applyAssetFidelity(ep *Entrypoint, document map[string]any, mappings []stri
 			return exit.Usagef("asset fidelity selector %q names no attached occurrence", key)
 		}
 		entry["fidelity"] = fidelity
+	}
+	return nil
+}
+
+func (s *AssetsSlot) preparedImageKind() *AssetsKind {
+	if s != nil {
+		for i := range s.Kinds {
+			if s.Kinds[i].Kind == "image" && s.Kinds[i].Preparation != nil {
+				return &s.Kinds[i]
+			}
+		}
 	}
 	return nil
 }
