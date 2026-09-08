@@ -14,7 +14,7 @@ func TestAwaitedJobJSONSeparatesEventsAndResult(t *testing.T) {
 	must(t, err)
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all"); _ = os.RemoveAll(root) })
 	script := filepath.Join(t.TempDir(), "simple.py")
-	metadata := "# /// script\n# requires-python = \">=3.12,<3.13\"\n# dependencies = [\"cozy-runtime==0.8.0\"]\n"
+	metadata := "# /// script\n# requires-python = \">=3.12,<3.13\"\n# dependencies = [\"cozy-runtime==0.10.0\"]\n"
 	if wheel := *privateScriptRuntimeWheel; wheel != "" {
 		metadata += fmt.Sprintf("# [tool.uv.sources]\n# cozy-runtime = {path = %q}\n", wheel)
 	}

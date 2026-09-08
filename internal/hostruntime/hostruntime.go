@@ -20,10 +20,10 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Floor is the first release with wire43 private byte-result custody and observations.
+// Floor is the first release with wire44 native serving and source-preserving caller overlays.
 // Metadata description remains static against the captured source environment; one
 // coherent release remedy serves both host-tool and worker-wire admission checks.
-const Floor = "0.8.0"
+const Floor = "0.10.0"
 
 var floor = pep440.MustParse(Floor)
 
