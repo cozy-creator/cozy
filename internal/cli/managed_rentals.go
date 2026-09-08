@@ -512,7 +512,12 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 			if name := orchestrator.PhaseOfHubRental(seen.State, seen.ProviderState,
 				seen.ContainerState, retrying); name != "" {
 				m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{
-					Name: name, Machine: seen.Name, Detail: detail})
+					Name: name, Machine: seen.Name, Detail: detail,
+					Rental: &orchestrator.RentalProgress{
+						AcceleratorModel:    seen.AcceleratorModel,
+						AcceleratorCount:    seen.AcceleratorCount,
+						HourlyRateUSDMicros: seen.HourlyRateUSDMicros,
+					}})
 			}
 		})
 	return row, problem

@@ -64,6 +64,7 @@ type fakePod struct {
 	sourceControl   func(*pb.ModelSourceControlCall) (*pb.ModelSourceControlResult, error)
 	weightsReady    func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
 	protocolInfo    func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
+	watchProgress   func(*pb.ProgressOpen, pb.WorkerControl_WatchProgressServer) error
 	recordOperation func(*pb.RecordOperationResultCall) (*pb.RecordOperationResultResult, error)
 	pb.UnimplementedWorkerControlServer
 	pb.UnimplementedPodHostServer
@@ -1205,4 +1206,12 @@ func (p *fakePod) CheckpointTransfer(ctx context.Context, call *pb.CheckpointTra
 		return nil, status.Error(codes.Unimplemented, "no source Runtime")
 	}
 	return p.sourceRuntime.CheckpointTransfer(ctx, call.GetRequest())
+}
+
+func (p *fakePod) WatchProgress(open *pb.ProgressOpen, stream pb.WorkerControl_WatchProgressServer) error {
+	if p.watchProgress != nil {
+		return p.watchProgress(open, stream)
+	}
+	<-stream.Context().Done()
+	return nil
 }

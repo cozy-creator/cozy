@@ -100,6 +100,7 @@ type ProgressSnapshot struct {
 	OverallFraction *float64
 	Position        *int64
 	Total           *int64
+	StepMS          *float64
 	RemainingMS     int64
 	Estimated       bool
 }
@@ -116,6 +117,7 @@ type progressAccumulator struct {
 	hasOverall       bool
 	overallDelta     float64
 	overallMSSum     float64
+	stepMS           float64
 }
 
 func (c *Orchestrator) LatestProgress(requestID string, attempt uint64) (ProgressSnapshot, bool) {
@@ -127,6 +129,10 @@ func (c *Orchestrator) LatestProgress(requestID string, attempt uint64) (Progres
 		return ProgressSnapshot{}, false
 	}
 	snapshot := ProgressSnapshot{Stage: progress.stage}
+	if progress.stepMS > 0 {
+		step := progress.stepMS
+		snapshot.StepMS = &step
+	}
 	if progress.hasStageFraction {
 		value := progress.stageFraction
 		snapshot.StageFraction = &value
@@ -246,7 +252,13 @@ func (f *fanout) observeProgress(frame Frame) {
 	if coordinate.hasOverall {
 		progress.overallFraction, progress.hasOverall = coordinate.overallFraction, true
 	}
+	if progress.stage != coordinate.stage {
+		progress.stepMS = 0
+	}
 	progress.stage = coordinate.stage
+	if coordinate.stepMS > 0 {
+		progress.stepMS = coordinate.stepMS
+	}
 	progress.stageFraction, progress.hasStageFraction =
 		coordinate.stageFraction, coordinate.hasStageFraction
 	progress.position, progress.total, progress.hasPosition =
