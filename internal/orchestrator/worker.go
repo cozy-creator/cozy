@@ -101,6 +101,7 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 	}
 	row := rows[0]
 	packageFact, development := row.Sub("package"), row.Sub("development")
+	environment := row.Sub("environment")
 	placement := DesiredPlacement{
 		Package: pkg, InstallID: installID, PlacementIDValue: row.Str("placement_id"),
 		Release:            packageFact.Str("release"),
@@ -112,9 +113,19 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 		placement.SourceDigest = development.Str("source_digest")
 		placement.LocalRevisionDigest = development.Str("local_revision_digest")
 		if development.Str("package") != pkg || placement.Release == "" ||
-			placement.PlacementIDValue == "" || placement.EnvironmentDigest != "" {
+			placement.PlacementIDValue == "" || len(packageFact) != 0 || len(environment.Sub("locked_requirements")) != 0 {
 			return DesiredPlacement{}, exit.Named(exit.Structural, "development_placement_incomplete",
 				"development PlacementSet mixes local source with published selection facts")
+		}
+		project := development.Sub("project_wheel")
+		if placement.LocalRevisionDigest == "" {
+			if len(project) != 0 || placement.EnvironmentDigest != "" {
+				return DesiredPlacement{}, exit.Named(exit.Structural, "development_placement_incomplete",
+					"source-only development placement cannot carry an incomplete captured environment")
+			}
+		} else if project.Sub("ref").Str("digest") == "" || placement.EnvironmentDigest == "" {
+			return DesiredPlacement{}, exit.Named(exit.Structural, "development_placement_incomplete",
+				"captured development placement requires its project wheel and environment identity")
 		}
 	} else if packageFact.Str("package") != pkg || placement.Release == "" ||
 		placement.EnvironmentDigest == "" ||
@@ -122,8 +133,7 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 		return DesiredPlacement{}, exit.Named(exit.Structural, "placement_set_incomplete",
 			"PlacementSet omits or mismatches its placement, package selection, or environment identity")
 	}
-	environment := row.Sub("environment")
-	if placement.SourceDigest == "" {
+	if placement.EnvironmentDigest != "" {
 		// Wire 30: a published Environment is its locked-requirements ref; supplied
 		// wheels belong to editable revisions only.
 		environmentIdentity := map[string]canonical.Value{
