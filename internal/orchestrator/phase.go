@@ -74,13 +74,14 @@ const (
 // a link degrading while it degrades. Reporting one number for both jobs would make it
 // wrong for one of them.
 type PhaseObservation struct {
-	Name    string
-	Since   time.Time
-	At      time.Time
-	Machine string
-	Detail  string
-	Rental  *RentalProgress
-	Models  []ModelDownloadProgress
+	Name       string
+	Since      time.Time
+	At         time.Time
+	Machine    string
+	Detail     string
+	Rental     *RentalProgress
+	Models     []ModelDownloadProgress
+	WaitingFor *WaitingRun
 	// HasBytes is false for a phase whose producer declared no counters. Moved and Total
 	// are then meaningless and must not be rendered.
 	HasBytes bool
@@ -306,6 +307,9 @@ func (p PhaseObservation) wire() map[string]any {
 	if len(p.Models) > 0 {
 		out["models"] = p.Models
 	}
+	if p.WaitingFor != nil {
+		out["waiting_for"] = p.WaitingFor
+	}
 	if elapsed := p.Elapsed(); elapsed > 0 {
 		out["elapsed_ms"] = elapsed.Milliseconds()
 	}
@@ -325,24 +329,28 @@ func (p PhaseObservation) wire() map[string]any {
 }
 
 // QueuePhase answers what a request that has not yet dispatched is doing, for the surfaces
-// that render it. A real observation wins; otherwise the routing's own wait cause stands in
+// that render it. A current capacity wait wins over old preparation observations;
+// otherwise a real preparation observation wins and the routing's wait cause stands in
 // so the column is never blank while the request is genuinely waiting on capacity. The
 // stand-in carries no timing, because a wait cause is a classification and not a
 // measurement — and inventing an elapsed for it would be exactly the fabrication this lane
 // refuses everywhere else.
 func (c *Orchestrator) QueuePhase(requestID string) (PhaseObservation, bool) {
-	if observed, ok := c.PhaseOf(requestID); ok {
-		return c.phaseRental(requestID, observed), true
-	}
 	row, problem := c.opt.Store.RequestRow(requestID)
 	if problem != nil || row == nil {
 		return PhaseObservation{}, false
 	}
 	facts := c.waitOf(*row)
+	if facts.cause != WaitSlotBusy && facts.cause != WaitQueueAhead {
+		if observed, ok := c.PhaseOf(requestID); ok {
+			return c.phaseRental(requestID, observed), true
+		}
+	}
 	if facts.cause == "" {
 		return PhaseObservation{}, false
 	}
-	return c.phaseRental(requestID, PhaseObservation{Name: facts.cause, Machine: facts.on}), true
+	return c.phaseRental(requestID, PhaseObservation{Name: facts.cause, Machine: facts.on,
+		WaitingFor: facts.waitingFor}), true
 }
 
 // PreparationPhase is one subject's observation read directly — the worker instance a

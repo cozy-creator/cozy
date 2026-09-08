@@ -127,3 +127,24 @@ func TestReattachedProgressUsesRecordedStageBoundaries(t *testing.T) {
 		t.Fatalf("terminal stage did not freeze at its recorded completion: %q", terminal)
 	}
 }
+
+func TestCapacityWaitReplacesWarmingButNeverExecution(t *testing.T) {
+	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
+	t.Cleanup(p.Done)
+	p.On(liveEvent("phase", map[string]any{"phase": "warming", "machine": "aldra"}))
+	wait := waitEnvelope("request.parked", time.Now(), map[string]any{
+		"wait": "slot_busy", "waiting_on": "aldra", "reason": rawDiagnostic,
+		"waiting_for": map[string]any{"number": 429, "request_id": "req-429"},
+	})
+	before := len(buf.String())
+	p.On(wait)
+	if got := buf.String()[before:]; !strings.Contains(got, "waiting for run 429 on aldra") || strings.Contains(got, rawDiagnostic) {
+		t.Fatalf("fresh queue wait did not replace old preparation: %q", got)
+	}
+	p.On(liveEvent("progress", map[string]any{"stage": "denoise", "position": 1, "total": 30}))
+	before = len(buf.String())
+	p.On(wait)
+	if got := buf.String()[before:]; got != "" {
+		t.Fatalf("queue replay replaced running denoising: %q", got)
+	}
+}

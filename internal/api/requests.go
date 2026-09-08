@@ -682,6 +682,7 @@ type Lifecycle struct {
 	// a missing rate means "not measured", never zero.
 	Phase            string                               `json:"phase,omitempty"`
 	PhaseMachine     string                               `json:"phase_machine,omitempty"`
+	WaitingFor       *orchestrator.WaitingRun             `json:"waiting_for,omitempty"`
 	PhaseDetail      string                               `json:"phase_detail,omitempty"`
 	PhaseModels      []orchestrator.ModelDownloadProgress `json:"phase_models,omitempty"`
 	RentalProgress   *orchestrator.RentalProgress         `json:"rental_progress,omitempty"`
@@ -784,6 +785,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 			life.Phase, life.PhaseMachine = phase.Name, phase.Machine
 			life.PhaseDetail, life.RentalProgress = phase.Detail, phase.Rental
 			life.PhaseModels = phase.Models
+			life.WaitingFor = phase.WaitingFor
 			if elapsed := phase.Elapsed(); elapsed > 0 {
 				ms := elapsed.Milliseconds()
 				life.PhaseElapsedMS = &ms

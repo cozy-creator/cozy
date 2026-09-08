@@ -56,7 +56,10 @@ func (p *RunProgress) interactive(e localapi.Event) {
 		return
 	case "queued", "parked":
 		// A queue heartbeat has less detail than the live preparation phase.
-		if strings.HasPrefix(p.terminal.key, "phase:") || strings.HasPrefix(p.terminal.key, "stage:") {
+		cause, _ := e.Payload["wait"].(string)
+		capacity := cause == "slot_busy" || cause == "queue_ahead"
+		if strings.HasPrefix(p.terminal.key, "stage:") ||
+			(strings.HasPrefix(p.terminal.key, "phase:") && !capacity) {
 			return
 		}
 		key = "wait"
@@ -228,12 +231,6 @@ func (p *RunProgress) visibleRows(at time.Time) []string {
 	}
 	if p.terminal.key == "wait" {
 		rows[0] = HumanWaitLine(p.terminal.event.Payload)
-		if elapsed >= WaitPatience {
-			if reason, _ := p.terminal.event.Payload["reason"].(string); reason != "" {
-				rows[0] += " — " + shortDuration(elapsed) + " so far: " + reason
-				return rows
-			}
-		}
 	}
 	// Counted rows prioritize useful speed and ETA; their clock gets its own short
 	// line so those facts survive on an ordinary 80-column terminal.
