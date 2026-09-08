@@ -16,6 +16,7 @@ use crate::limits;
 use crate::manifest::Manifest;
 use crate::sha256::{self, Sha256};
 use crate::store::{self, Fault, Store};
+use crate::transport::Ledger;
 
 /// The two immutable repository object namespaces a cache may contain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,16 +102,21 @@ impl RepoObjectCache {
         kind: CacheKind,
         object: &ObjectRef,
     ) -> bool {
-        static BACKFILLS: std::sync::OnceLock<Backfills> = std::sync::OnceLock::new();
         let pool = BACKFILLS.get_or_init(Backfills::start);
-        pool.sender
+        pool.activity.offered();
+        let sent = pool
+            .sender
             .try_send(Backfill {
                 cache: self.clone(),
                 source: source.root().to_path_buf(),
                 kind,
                 object: object.clone(),
             })
-            .is_ok()
+            .is_ok();
+        if !sent {
+            pool.activity.finished();
+        }
+        sent
     }
 
     /// The one cross-language layout contract. `digest` is bare lowercase SHA-256.
@@ -219,9 +225,19 @@ impl RepoObjectCache {
         kind: CacheKind,
         want: &ObjectRef,
     ) -> Result<CacheWrite> {
+        self.backfill_observed(source, kind, want, None)
+    }
+
+    fn backfill_observed(
+        &self,
+        source: &Store,
+        kind: CacheKind,
+        want: &ObjectRef,
+        progress: Option<&dyn store::Progress>,
+    ) -> Result<CacheWrite> {
         let destination = self.path(kind, &want.sha256)?;
         if destination.exists() {
-            return Ok(match verify_path(&destination, kind, want) {
+            return Ok(match verify_path(&destination, kind, want, progress) {
                 Ok(()) => CacheWrite::Present,
                 Err(_) => CacheWrite::Unavailable,
             });
@@ -229,18 +245,18 @@ impl RepoObjectCache {
         let result = match kind {
             CacheKind::Blob => match source.open_verified(&want.sha256) {
                 Ok(mut file) if file.len() == want.length => {
-                    publish_stream(&mut file, &destination, want)
+                    publish_stream(&mut file, &destination, want, progress)
                 }
                 Ok(_) | Err(_) => Err(SoftFailure::Unavailable),
             },
             CacheKind::Manifest => match source.read_manifest(want) {
-                Ok(manifest) => publish_bytes(&manifest.canonical_bytes(), &destination),
+                Ok(manifest) => publish_bytes(&manifest.canonical_bytes(), &destination, progress),
                 Err(_) => Err(SoftFailure::Unavailable),
             },
         };
         Ok(match result {
             Ok(true) => CacheWrite::Stored,
-            Ok(false) => match verify_path(&destination, kind, want) {
+            Ok(false) => match verify_path(&destination, kind, want, progress) {
                 Ok(()) => CacheWrite::Present,
                 Err(_) => CacheWrite::Unavailable,
             },
@@ -260,19 +276,99 @@ struct Backfill {
     object: ObjectRef,
 }
 
+static BACKFILLS: std::sync::OnceLock<Backfills> = std::sync::OnceLock::new();
+
 struct Backfills {
     sender: std::sync::mpsc::SyncSender<Backfill>,
+    activity: std::sync::Arc<BackfillActivity>,
+}
+
+struct BackfillActivity {
+    pending: std::sync::Mutex<(usize, Ledger)>,
+    changed: std::sync::Condvar,
+}
+
+impl BackfillActivity {
+    fn new(ledger: Ledger) -> Self {
+        Self {
+            pending: std::sync::Mutex::new((0, ledger)),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn offered(&self) {
+        let mut state = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.0 == 0 {
+            state.1 = Ledger::with_resolution(state.1.sample());
+        }
+        state.0 += 1;
+    }
+
+    fn finished(&self) {
+        let mut state = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.0 -= 1;
+        state.1.answered();
+        self.changed.notify_all();
+    }
+
+    fn wait(&self) -> bool {
+        let mut state = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while state.0 != 0 {
+            let patience = state.1.stillness().saturating_sub(state.1.still().silent);
+            if patience.is_zero() {
+                return false;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, patience)
+                .unwrap_or_else(|error| error.into_inner())
+                .0;
+        }
+        true
+    }
+}
+
+impl store::Progress for BackfillActivity {
+    fn admitted(&self) {}
+
+    fn moved(&self, bytes: u64) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .1
+            .moved(bytes);
+        self.changed.notify_all();
+    }
+}
+
+/// Before a short-lived CLI exits, give its existing optional write pool time to
+/// finish while real copy/verification progress continues. A stalled cache only
+/// ends this wait; it never changes the completed local fetch or joins its worker.
+/// Long-lived Store callers keep the original asynchronous behavior.
+pub fn finish_optional_backfills() -> bool {
+    BACKFILLS.get().is_none_or(|pool| pool.activity.wait())
 }
 
 impl Backfills {
     fn start() -> Self {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<Backfill>(BACKFILL_QUEUE);
         let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+        let activity = std::sync::Arc::new(BackfillActivity::new(Ledger::new()));
         // One pool for the process, never a new blocked thread set for every pull.
         // Workers are detached: process exit may leave cache temps, never canonical
         // partial objects. Dropping a pull must not join a stalled FUSE syscall.
         for _ in 0..STREAMS {
             let receiver = receiver.clone();
+            let activity = activity.clone();
             let _ = std::thread::Builder::new()
                 .name("tfs-cache-write".into())
                 .spawn(move || loop {
@@ -287,11 +383,18 @@ impl Backfills {
                     // hold: a source reclaimed before it opens is simply a missed cache fill.
                     // Once opened, the verified descriptor pins that inode through the copy.
                     if let Ok(store) = Store::open(&work.source) {
-                        let _ = work.cache.backfill_store(&store, work.kind, &work.object);
+                        let store = store.observed(activity.clone());
+                        let _ = work.cache.backfill_observed(
+                            &store,
+                            work.kind,
+                            &work.object,
+                            Some(activity.as_ref()),
+                        );
                     }
+                    activity.finished();
                 });
         }
-        Self { sender }
+        Self { sender, activity }
     }
 }
 
@@ -344,27 +447,33 @@ fn verify_path(
     path: &Path,
     kind: CacheKind,
     want: &ObjectRef,
+    progress: Option<&dyn store::Progress>,
 ) -> std::result::Result<(), SoftFailure> {
     match kind {
         CacheKind::Blob => {
             let mut file = open_exact(path, want.length)?;
             let mut sink = std::io::sink();
-            stream_exact(&mut file, &mut sink, want)
+            stream_exact(&mut file, &mut sink, want, progress)
         }
         CacheKind::Manifest => read_manifest(path, want).map(|_| ()),
     }
 }
 
-fn publish_bytes(bytes: &[u8], destination: &Path) -> std::result::Result<bool, SoftFailure> {
+fn publish_bytes(
+    bytes: &[u8],
+    destination: &Path,
+    progress: Option<&dyn store::Progress>,
+) -> std::result::Result<bool, SoftFailure> {
     let mut source = bytes;
     let want = ObjectRef::of(bytes);
-    publish_stream(&mut source, destination, &want)
+    publish_stream(&mut source, destination, &want, progress)
 }
 
 fn publish_stream(
     source: &mut impl Read,
     destination: &Path,
     want: &ObjectRef,
+    progress: Option<&dyn store::Progress>,
 ) -> std::result::Result<bool, SoftFailure> {
     let Some(directory) = destination.parent() else {
         return Err(SoftFailure::Unavailable);
@@ -385,7 +494,7 @@ fn publish_stream(
         .mode(0o600)
         .open(&temporary)
         .map_err(|_| SoftFailure::Unavailable)?;
-    if let Err(error) = stream_exact(source, &mut output, want) {
+    if let Err(error) = stream_exact(source, &mut output, want, progress) {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
@@ -414,6 +523,7 @@ fn stream_exact(
     source: &mut impl Read,
     destination: &mut impl Write,
     want: &ObjectRef,
+    progress: Option<&dyn store::Progress>,
 ) -> std::result::Result<(), SoftFailure> {
     let mut digest = Sha256::new();
     let mut length = 0u64;
@@ -429,6 +539,9 @@ fn stream_exact(
         destination
             .write_all(&buffer[..read])
             .map_err(|_| SoftFailure::Unavailable)?;
+        if let Some(progress) = progress {
+            progress.moved(read as u64);
+        }
         length = length
             .checked_add(read as u64)
             .ok_or(SoftFailure::Corrupt)?;
@@ -918,10 +1031,16 @@ mod backfill_tests {
             first: true,
             length: object.length,
         };
-        assert_eq!(publish_stream(&mut input, &destination, &object), Ok(true));
+        assert_eq!(
+            publish_stream(&mut input, &destination, &object, None),
+            Ok(true)
+        );
         assert!(!source.contains(&object.sha256));
         assert_eq!(fs::read(&destination).unwrap(), bytes);
-        assert_eq!(verify_path(&destination, CacheKind::Blob, &object), Ok(()));
+        assert_eq!(
+            verify_path(&destination, CacheKind::Blob, &object, None),
+            Ok(())
+        );
         assert_eq!(
             fs::read_dir(destination.parent().unwrap()).unwrap().count(),
             1
@@ -950,7 +1069,7 @@ mod backfill_tests {
             }
         }
         assert_eq!(
-            publish_stream(&mut Fails(false), &destination, &object),
+            publish_stream(&mut Fails(false), &destination, &object, None),
             Err(SoftFailure::Unavailable)
         );
         assert!(!destination.exists());
@@ -959,6 +1078,115 @@ mod backfill_tests {
             fs::read_dir(destination.parent().unwrap()).unwrap().count(),
             1
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod exit_wait_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn advancing_copy_outlives_the_initial_silence_allowance() {
+        struct Paced<'a>(&'a [u8]);
+        impl Read for Paced<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(5));
+                let take = out.len().min(4096);
+                self.0.read(&mut out[..take])
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-exit-moving-{}-{}",
+            std::process::id(),
+            store::now_nanos_unique()
+        ));
+        let data = vec![7; 256 << 10];
+        let object = ObjectRef::of(&data);
+        let destination = root.join(&object.sha256);
+        let activity = Arc::new(BackfillActivity::new(Ledger::with_resolution(
+            Duration::from_millis(10),
+        )));
+        activity.offered();
+        let observed = activity.clone();
+        let target = destination.clone();
+        let wanted = object.clone();
+        let started = Instant::now();
+        let copy = std::thread::spawn(move || {
+            let result =
+                publish_stream(&mut Paced(&data), &target, &wanted, Some(observed.as_ref()));
+            observed.finished();
+            result
+        });
+        assert!(activity.wait(), "a moving copy was abandoned");
+        assert_eq!(copy.join().unwrap(), Ok(true));
+        assert!(
+            started.elapsed() > Duration::from_millis(60),
+            "copy never outlived the initial silence floor"
+        );
+        assert_eq!(
+            verify_path(&destination, CacheKind::Blob, &object, None),
+            Ok(())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stalled_optional_copy_stops_waiting_without_joining_its_worker() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-exit-stalled-{}-{}",
+            std::process::id(),
+            store::now_nanos_unique()
+        ));
+        let source = Store::init(&root.join("source")).unwrap();
+        let object = source
+            .put_stream(&mut b"still local".as_slice(), None, &Fault::default())
+            .unwrap()
+            .obj;
+        let cache = RepoObjectCache::new(root.join("cache"));
+        let fifo = cache.path(CacheKind::Blob, &object.sha256).unwrap();
+        fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let activity = Arc::new(BackfillActivity::new(Ledger::with_resolution(
+            Duration::from_millis(10),
+        )));
+        activity.offered();
+        let observed = activity.clone();
+        let wanted = object.clone();
+        let store = source.clone();
+        let worker = std::thread::spawn(move || {
+            let result =
+                cache.backfill_observed(&store, CacheKind::Blob, &wanted, Some(observed.as_ref()));
+            observed.finished();
+            result
+        });
+        assert!(
+            !activity.wait(),
+            "blocked optional cache never produced a no-progress verdict"
+        );
+        assert!(
+            !worker.is_finished(),
+            "the wait returned by joining the stalled cache worker"
+        );
+        assert!(
+            source.record_valid(&object.sha256).is_ok(),
+            "cache stall invalidated completed local bytes"
+        );
+        let unblock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(0x800)
+            .open(&fifo)
+            .unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), CacheWrite::Unavailable);
+        drop(unblock);
+        assert!(activity.wait());
         fs::remove_dir_all(root).unwrap();
     }
 }
