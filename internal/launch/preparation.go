@@ -30,7 +30,8 @@ func (f *Facts) PreparationSpec(devices []string) (orchestrator.WorkerLaunchSpec
 	sort.Strings(slots)
 	spec := orchestrator.WorkerLaunchSpec{
 		Python: runtime, Args: []string{"serve"}, Dir: f.Install.Dir,
-		Devices: devices, GraceSec: 3,
+		EnvironmentPython: home.VenvPython(filepath.Join(f.Install.Dir, "venv")),
+		Devices:           devices, GraceSec: 3,
 		ArtifactCache: filepath.Join(f.Install.Dir, "artifact-cache"),
 		InstallRoot:   filepath.Join(f.Install.Dir, "worker-environments"),
 		TensorFSRoot:  config.Frozen().TensorFSRoot,
@@ -46,7 +47,6 @@ func (f *Facts) PreparationSpec(devices []string) (orchestrator.WorkerLaunchSpec
 	}
 	if spec.Preparation.Published {
 		spec.InstallRoot = ""
-		spec.EnvironmentPython = home.VenvPython(filepath.Join(f.Install.Dir, "venv"))
 		spec.Placement.SourceDigest = ""
 	}
 	return spec, nil
