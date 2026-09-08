@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
@@ -45,10 +44,10 @@ func PinDependencies(source, target string, requirements []string) *exit.Error {
 	files := append([]*zip.File(nil), reader.File...)
 	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
 	for _, member := range files {
-		if strings.HasSuffix(member.Name, ".dist-info/RECORD.jws") || strings.HasSuffix(member.Name, ".dist-info/RECORD.p7s") {
+		if distInfoMember(member.Name, "RECORD.jws") || distInfoMember(member.Name, "RECORD.p7s") {
 			return wheelStructure("signed project metadata cannot be privately repinned")
 		}
-		if strings.HasSuffix(member.Name, ".dist-info/RECORD") {
+		if distInfoMember(member.Name, "RECORD") {
 			recordName = member.Name
 			continue
 		}
@@ -57,7 +56,7 @@ func PinDependencies(source, target string, requirements []string) *exit.Error {
 		}
 		hash := sha256.New()
 		var size int64
-		if strings.HasSuffix(member.Name, ".dist-info/METADATA") {
+		if distInfoMember(member.Name, "METADATA") {
 			body, problem := wheelMember(member)
 			if problem != nil {
 				return problem

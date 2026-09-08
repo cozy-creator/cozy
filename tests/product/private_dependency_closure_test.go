@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -112,8 +113,21 @@ func TestPrivateWheelPinsPreserveImplementationAndVerifyRecord(t *testing.T) {
 	file, err := os.Create(source)
 	must(t, err)
 	writer := zip.NewWriter(file)
-	members := map[string]string{"fixture.py": "VALUE = 123\n", "fixture-1.0.dist-info/METADATA": "Metadata-Version: 2.3\nName: fixture\nVersion: 1.0\nRequires-Dist: numpy>=1.26\nProvides-Extra: audio\n\nOriginal description.\n", "fixture-1.0.dist-info/RECORD": "", "fixture-1.0.dist-info/package-interface.json": "{\"unchanged\":true}"}
-	for _, name := range []string{"fixture.py", "fixture-1.0.dist-info/METADATA", "fixture-1.0.dist-info/RECORD", "fixture-1.0.dist-info/package-interface.json"} {
+	members := map[string]string{
+		"fixture.py":                                     "VALUE = 123\n",
+		"fixture-1.0.dist-info/METADATA":                 "Metadata-Version: 2.3\nName: fixture\nVersion: 1.0\nRequires-Dist: numpy>=1.26\nProvides-Extra: audio\n\nOriginal description.\n",
+		"fixture-1.0.dist-info/RECORD":                   "",
+		"fixture-1.0.dist-info/package-interface.json":   "{\"unchanged\":true}",
+		"fixture/_vendor/other-2.0.dist-info/METADATA":   "Metadata-Version: 2.3\nName: other\nVersion: 2.0\nRequires-Dist: original>=1.0\n\n",
+		"fixture/_vendor/other-2.0.dist-info/RECORD":     "original nested record\n",
+		"fixture/_vendor/other-2.0.dist-info/RECORD.jws": "original nested signature\n",
+	}
+	names := make([]string, 0, len(members))
+	for name := range members {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		out, err := writer.Create(name)
 		must(t, err)
 		_, err = io.WriteString(out, members[name])
@@ -135,8 +149,10 @@ func TestPrivateWheelPinsPreserveImplementationAndVerifyRecord(t *testing.T) {
 		must(t, in.Close())
 		actual[member.Name] = data
 	}
-	if string(actual["fixture.py"]) != members["fixture.py"] || string(actual["fixture-1.0.dist-info/package-interface.json"]) != members["fixture-1.0.dist-info/package-interface.json"] {
-		t.Fatal("pinning changed executable or interface bytes")
+	for name, original := range members {
+		if name != "fixture-1.0.dist-info/METADATA" && name != "fixture-1.0.dist-info/RECORD" && string(actual[name]) != original {
+			t.Fatalf("pinning changed implementation or vendored metadata: %s", name)
+		}
 	}
 	metadata := string(actual["fixture-1.0.dist-info/METADATA"])
 	if !strings.Contains(metadata, "Requires-Dist: numpy==2.5.3\n") || !strings.Contains(metadata, "Requires-Dist: scipy==1.18.1\n") || strings.Contains(metadata, "Provides-Extra:") || strings.Contains(metadata, ">=") {
@@ -148,7 +164,7 @@ func TestPrivateWheelPinsPreserveImplementationAndVerifyRecord(t *testing.T) {
 		t.Fatal("RECORD omitted a wheel member")
 	}
 	for _, row := range record {
-		if strings.HasSuffix(row[0], "/RECORD") {
+		if row[0] == "fixture-1.0.dist-info/RECORD" {
 			continue
 		}
 		sum := sha256.Sum256(actual[row[0]])
