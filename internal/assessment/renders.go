@@ -83,6 +83,8 @@ func ReadRenderInspection(report, inspected []byte) (RenderInspection, *exit.Err
 // excluded from the payload comparison because the candidate/reference intentionally
 // select different checkpoints; their input binding is checked separately.
 //
+// parentID is the retained render-composition owner, resolved from report custody;
+// it need not be the parent invoking attachment after a nested composition returns.
 // This is deliberately narrower than full assessment verification. A caller must
 // still verify cr-113 capture and execution observations before any Hub mutation.
 func VerifyRenderBindings(st *records.Store, parentID string, info RenderInspection, workloadBytes []byte) ([]BoundRender, *exit.Error) {
