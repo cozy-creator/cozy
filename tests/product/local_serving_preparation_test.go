@@ -270,7 +270,7 @@ cozy-runtime={path=%q}
 				t.Fatal("metadata intake invented a serving placement")
 			}
 			model := "model.model=proof/ordered@1.0.0/bf16#" + seed.Manifest
-			code, out := runCozyPath(t, root, path, "run", pkg+"/generate", "value=3", model, "--json")
+			code, out := runCozyPath(t, root, path, "run", pkg+"/generate", "value=3", model, "--await", "--json")
 			events := preparationEvents(t, audit)
 			var prepared *servingPreparationEvent
 			for i := range events {
