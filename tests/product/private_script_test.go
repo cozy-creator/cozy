@@ -149,7 +149,14 @@ func TestPrivateScriptTypedOutputsUseNormalAttempt(t *testing.T) {
 	}
 	root, err := os.MkdirTemp("", "cozy-typed-")
 	must(t, err)
-	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all"); _ = os.RemoveAll(root) })
+	t.Cleanup(func() {
+		compositionDown(t, root, os.Getenv("PATH"))
+		if t.Failed() {
+			t.Log("typed script evidence retained", root)
+		} else {
+			_ = os.RemoveAll(root)
+		}
+	})
 	script := filepath.Join(t.TempDir(), "image.py")
 	code := fmt.Sprintf(`# /// script
 # requires-python = ">=3.12,<3.13"
