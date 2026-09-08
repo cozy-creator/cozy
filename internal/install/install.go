@@ -447,7 +447,8 @@ func deriveDevelopmentPlacement(venvDir, sourceDir, tensorfsRoot string, local L
 	}
 	cmd := exec.Command(runtimeBin, "--json", "--dir", sourceDir, "development-placement",
 		"--package", local.Package, "--release", local.Release,
-		"--source-digest", local.SourceDigest, "--tensorfs-root", tensorfsRoot)
+		"--source-digest", local.SourceDigest, "--tensorfs-root", tensorfsRoot,
+		"--environment-python", home.VenvPython(venvDir))
 	cmd.Env = env
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
