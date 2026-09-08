@@ -91,7 +91,7 @@ object = "assets_app:app"
 		t.Fatalf("Assets package install failed: %d %s %s", status, stdout, stderr)
 	}
 
-	photo := filepath.Join(project, "same.png")
+	photo := filepath.Join(project, "same #100%?.png")
 	file, err := os.Create(photo)
 	must(t, err)
 	must(t, png.Encode(file, image.NewRGBA(image.Rect(0, 0, 2, 2))))
@@ -117,6 +117,29 @@ object = "assets_app:app"
 			}
 			if status != 0 || json.Unmarshal([]byte(stdout), &result) != nil || result.Status != "completed" {
 				t.Fatalf("actual Assets job failed: code=%d stdout=%s stderr=%s", status, stdout, stderr)
+			}
+			store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+			fatal(t, problem)
+			defer store.Close()
+			reference := "1"
+			if function == "main" {
+				reference = "2"
+			}
+			row, problem := store.RequestByReference(reference)
+			fatal(t, problem)
+			if row == nil || len(row.Assets) != 2 {
+				t.Fatal("completed request lost borrowed input identity")
+			}
+			for _, asset := range row.Assets {
+				if asset.LocalPath != photo {
+					t.Fatalf("input was copied instead of borrowed: %s", asset.LocalPath)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(root, "inputs")); !os.IsNotExist(err) {
+				t.Fatalf("submission created an input store: %v", err)
+			}
+			if _, err := os.Stat(photo); err != nil {
+				t.Fatalf("terminal cleanup removed original: %v", err)
 			}
 			got := result.Result
 			if len(got.Labels) != 2 || got.Labels[0] != "艾丽丝" || got.Labels[1] != "" || got.IDs[0] != "assets.0.asset" || got.IDs[1] != "assets.1.asset" || got.Positions[0] != 0 || got.Positions[1] != 1 || got.Sizes[0] <= 0 || got.Sizes[0] != got.Sizes[1] || len(got.Fidelities) != 2 || got.Fidelities[0] != "high" || got.Fidelities[1] != "low" {

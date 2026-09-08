@@ -38,11 +38,6 @@ type Layout struct {
 	// result file, named by its own content digest so a regenerated file lands on itself.
 	// User-owned result files are never automatically removed.
 	Outputs string
-	// Inputs is the content-addressed request input store, created on demand. cl-116's
-	// end state narrows it to uploaded/streamed bodies only — bytes without a stable
-	// caller path; the zero-copy local-CLI-file arm is still open and Stage currently
-	// copies those too.
-	Inputs string
 	// Tmp is typed in-flight work: a model transfer's request-named staging and the
 	// model-acquisition flocks under `tmp/locks`. Verb-lifetime exchange scratch uses OS
 	// temp; the whole root disappears when nothing is in flight.
@@ -83,7 +78,6 @@ func Open(root string) (Layout, *exit.Error) {
 		Daemon:   filepath.Join(root, "daemon.lock"),
 		Workers:  filepath.Join(root, "workers"),
 		Outputs:  filepath.Join(root, "outputs"),
-		Inputs:   filepath.Join(root, "inputs"),
 		Tmp:      filepath.Join(root, "tmp"),
 	}
 	l.Lock = filepath.Join(l.Installs, ".lock")
@@ -232,13 +226,6 @@ func priorStoreHoldsRecords(path string) (holds bool, why string) {
 		}
 	}
 	return false, ""
-}
-
-// InputAsset resolves one verified sha256 digest into its private immutable staging
-// path. Callers validate the digest before reaching this method; keeping the spelling
-// here prevents each transport from inventing a layout.
-func (l Layout) InputAsset(digest string) string {
-	return filepath.Join(l.Inputs, strings.TrimPrefix(digest, "sha256:"))
 }
 
 // RentalMediaToken is one rental's provisioned media bearer, mode 0600. It is deliberately

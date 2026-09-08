@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -17,7 +16,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
@@ -127,10 +125,6 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			"use `cozy run --input-tree <ref>=<dir>`; this build exposes no browser tree-upload route")
 		return
 	}
-	if len(sub.LocalAssets) > 0 {
-		unlock := inputasset.Guard()
-		defer unlock()
-	}
 	if sub.RetryOf != "" {
 		prior, problem := s.store.RequestByReference(sub.RetryOf)
 		if problem != nil {
@@ -179,14 +173,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		}
 		spec, e = s.resolveJob(r.Context(), sub)
 		if e == nil {
-			spec.Assets, e = s.stageAssets(spec.Assets)
-		}
-		if e == nil && len(spec.Assets) > 0 {
-			defer func() {
-				if problem := inputasset.DropUnowned(s.layout, s.store, spec.Assets); problem != nil {
-					fmt.Fprintf(s.log, "job input cleanup deferred: %s\n", problem.Message)
-				}
-			}()
+			spec.Assets, e = bindAssets(spec.Assets)
 		}
 	}
 	if e != nil {

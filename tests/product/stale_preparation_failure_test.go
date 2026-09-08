@@ -57,7 +57,7 @@ func TestLatePreparationFailureRespectsAttemptOwnership(t *testing.T) {
 			asset := filepath.Join(t.TempDir(), "reference.txt")
 			must(t, os.WriteFile(asset, []byte("retained input bytes"), 0600))
 			sub := outputPublicationSubmission()
-			binding, problem := inputasset.Stage(o.l, records.AssetBinding{FieldPath: "reference", LocalPath: asset}, 1024)
+			binding, problem := inputasset.Bind(records.AssetBinding{FieldPath: "reference", LocalPath: asset}, 1024)
 			fatal(t, problem)
 			sub.Assets = []records.AssetBinding{binding}
 			id, _, problem := o.c.Submit(sub)
@@ -124,9 +124,9 @@ func TestLatePreparationFailureRespectsAttemptOwnership(t *testing.T) {
 				if after.State != "failed" || transfer.State != "failed" || failures != 1 || transfer.ErrorCode != "placement_config_refused" {
 					t.Fatalf("preoffer failure not atomic: request=%s transfer=%+v failures=%d", after.State, transfer, failures)
 				}
-				waitUntil(t, "failed preparation released provider and staged input", func() bool {
+				waitUntil(t, "failed preparation released provider without removing original", func() bool {
 					_, err := os.Stat(row.Assets[0].LocalPath)
-					return releases.Load() == 1 && os.IsNotExist(err)
+					return releases.Load() == 1 && err == nil
 				})
 			} else {
 				expectedTransfer := "pending"

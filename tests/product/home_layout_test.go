@@ -115,6 +115,7 @@ func TestHomeMigrationFromPriorShape(t *testing.T) {
 	seed("outputs/cozy-example/deadbeef.png", "user-owned")
 	seed("cas/blobs/aa/bb/cc", "tensorfs-owned")
 	seed("backups/2026-01-01/records.db", "manual")
+	seed("inputs/"+sixtyFour("a"), "historic-input-preserved")
 	seed("rentals/pr-gone.media-token", "secret\n")
 	seed("rentals/pr-gone.pem", "cert")
 	seed("rentals/pending-"+sixtyFour("d")+".media-token", "secret\n")
@@ -150,7 +151,7 @@ func TestHomeMigrationFromPriorShape(t *testing.T) {
 	// daemon.lock is created by the migration's own liveness guard and is a target
 	// entry anyway; backups and cas are deliberately untouched (the final backup
 	// deletion and the Store move belong to the last cut and tfs-047).
-	want := []string{"backups", "cas", "creator.sqlite", "daemon.lock", "installs", "outputs"}
+	want := []string{"backups", "cas", "creator.sqlite", "daemon.lock", "inputs", "installs", "outputs"}
 	if got := rootEntries(t, root); strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("migrated home holds %v, want exactly %v", got, want)
 	}
