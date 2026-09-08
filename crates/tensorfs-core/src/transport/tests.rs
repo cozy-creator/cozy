@@ -1255,10 +1255,53 @@ fn hub_envelope_crosses_verbatim_as_typed_refusals() {
     assert!(refusal.detail.contains("models.unknown_ref"));
     assert!(refusal.detail.contains("check the ref"));
 
-    let denied: Dispatch = Arc::new(|_: &Request| status(401, b"{}"));
+    let denied: Dispatch = Arc::new(|_: &Request| {
+        status(
+            401,
+            br#"{"error":{"code":"auth.credential_required","message":"no credential"}}"#,
+        )
+    });
     let origin = self::origin(denied);
     let refusal = pull(&request_for(&store, &origin.base, &policy)).unwrap_err();
     assert_eq!(refusal.code, Code::CREDENTIAL_REQUIRED);
+    let _ = std::fs::remove_dir_all(store_root);
+}
+
+// tfs-101. A status is evidence about the CATALOG only when the hub wrote it. On
+// 2026-09-08 the public origin's tunnel agent was seconds out of a reconnect loop and its
+// edge answered `POST /v1/tensorfs/presign` with its own 404 page; the status alone was
+// read as REF_NOT_FOUND, which the pod supervisor treats as poisoned, and a paid H100
+// journaled a permanent refusal for a placement set the hub was holding in full.
+#[test]
+fn a_status_with_no_hub_envelope_is_the_edge_and_stays_resumable() {
+    let store_root = temporary("unenveloped");
+    let store = Store::init(&store_root).unwrap();
+    let policy = SourcePolicy::default();
+    // Exactly what an ngrok endpoint answers while its agent session is down.
+    let edge_page: Dispatch = Arc::new(|_: &Request| {
+        status(
+            404,
+            b"<!DOCTYPE html><html><body>ERR_NGROK_3200 endpoint offline</body></html>",
+        )
+    });
+    let origin = origin(edge_page);
+    let refusal = pull(&request_for(&store, &origin.base, &policy)).unwrap_err();
+    assert_eq!(refusal.code, Code::HUB_UNREACHABLE);
+    assert!(refusal.detail.contains("no hub envelope"));
+    assert!(refusal.detail.contains("404"));
+
+    // A 401 page from a gateway is not this hub asking for a credential it does not take.
+    let gateway: Dispatch = Arc::new(|_: &Request| status(401, b"<html>Unauthorized</html>"));
+    let origin = self::origin(gateway);
+    let refusal = pull(&request_for(&store, &origin.base, &policy)).unwrap_err();
+    assert_eq!(refusal.code, Code::HUB_UNREACHABLE);
+
+    // And a well-formed JSON body that is simply not the envelope stays weather too: the
+    // test is the hub's own code, not the content type.
+    let shaped: Dispatch = Arc::new(|_: &Request| status(404, br#"{"detail":"not found"}"#));
+    let origin = self::origin(shaped);
+    let refusal = pull(&request_for(&store, &origin.base, &policy)).unwrap_err();
+    assert_eq!(refusal.code, Code::HUB_UNREACHABLE);
     let _ = std::fs::remove_dir_all(store_root);
 }
 
@@ -2318,6 +2361,79 @@ fn a_403_is_judged_by_the_leases_age_and_not_by_a_count() {
         1,
         "a fresh lease's refusal bought a second mint"
     );
+}
+
+/// **A SLOW MINT MUST NOT POISON ITS OWN ANSWER.**
+///
+/// tfs-102, from two paid H100s on 2026-09-08. `gayong` and `weed` each moved ~82 GB of
+/// `paul/minimax-h3` at 378 MB/s, then stopped dead and refused with "a URL whose declared
+/// life is already spent when it is granted authorizes nothing". Nothing was wrong with the
+/// objects — the same closure landed clean on two other pods within the hour.
+///
+/// `minted` was stamped BEFORE the presign call, and a lease is spent at half the life the
+/// hub declared. The hub's life is ten minutes, so a presign that took five — one flaky
+/// tunnel, or two of `call`'s own retries — returned URLs that were unusable the instant
+/// they arrived, and the walk refused terminally with 82 GB already on disk.
+///
+/// The URL does not exist for the duration of the call that fetches it. The hub signs it
+/// while handling the request and states the life it granted in its own clock; the request
+/// leg, the queueing and the signing are time the URL had not begun. Stamping on ARRIVAL
+/// charges it only for the return leg, which is one hop.
+///
+/// Reaching the decision needs a mint slower than half a declared life, so the fixture
+/// shortens the LIFE rather than lengthening the call. Everything else is production.
+#[test]
+fn a_slow_mint_does_not_poison_the_urls_it_returns() {
+    let root = temporary("slow-mint");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(3, 4 * 1024));
+    // The shortest life the wire can express is one second — the hub states its clocks in
+    // whole seconds — so the call need only take past half of it. Stamped before the call,
+    // every URL in the answer is over half its life on arrival and the walk has none it
+    // may use; stamped on arrival, every one is whole.
+    const DECLARED: u64 = 1;
+    let slow = Duration::from_millis(700);
+    let base_slot: Arc<Mutex<String>> = Arc::default();
+    let dispatch_base = Arc::clone(&base_slot);
+    let mints = Arc::new(AtomicUsize::new(0));
+    let minted = Arc::clone(&mints);
+    let served = Arc::clone(&checkpoint);
+    let dispatch: Dispatch = Arc::new(move |request: &Request| {
+        let base = dispatch_base.lock().unwrap().clone();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/v1/tensorfs/closure") => ok_json(&closure_value(&served, &base)),
+            ("POST", "/v1/tensorfs/presign") => {
+                minted.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(slow);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let Value::Obj(mut fields) = presign_value(&request.body, &base) else {
+                    panic!()
+                };
+                fields.push(("expires_at_unix".into(), Value::uint(now + DECLARED)));
+                fields.push(("server_time_unix".into(), Value::uint(now)));
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                ok_json(&Value::Obj(fields))
+            }
+            ("GET", path) if path.starts_with("/obj/") => {
+                match served.bodies.get(&path["/obj/".len()..]) {
+                    Some(body) => status(200, body),
+                    None => status(404, b"no such object"),
+                }
+            }
+            _ => status(404, b"no such route"),
+        }
+    });
+    let origin = origin(dispatch);
+    *base_slot.lock().unwrap() = origin.base.clone();
+    let policy = SourcePolicy::default();
+    let report = pull(&request_for(&store, &origin.base, &policy))
+        .expect("a mint slower than half a declared life still returns usable URLs");
+    assert_eq!(report.fetched, checkpoint.objects.len() as u64 + 1);
+    assert!(mints.load(Ordering::Relaxed) >= 1);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// **A hub that says "wait" is waited for, and the same request is then answered.**
