@@ -20,6 +20,7 @@ jobs:
       - run: cargo build --workspace
       - run: python3 scripts/rebank-h3.py --tfs target/debug/tfs
       - run: python3 scripts/rebank-sdxl.py --tfs target/debug/tfs
+      - run: python3 scripts/rebank-instruments.py --tfs target/debug/tfs
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
