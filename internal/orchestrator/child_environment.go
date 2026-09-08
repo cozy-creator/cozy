@@ -10,6 +10,14 @@ import (
 // This session belongs to the selected callee, after its preparation completed.
 // Its numerical identity is independent of the script's CPU control process.
 func (c *Orchestrator) qualifyOperation(s *session, request records.Request) (*records.OperationContext, *exit.Error) {
+	environment, problem := numericalEnvironment(s)
+	if problem != nil {
+		return nil, problem
+	}
+	return c.opt.Store.BindOperationContext(request.ID, environment)
+}
+
+func numericalEnvironment(s *session) (string, *exit.Error) {
 	var result *pb.NumericalEnvironmentResult
 	var err error
 	if s.host != nil {
@@ -21,12 +29,12 @@ func (c *Orchestrator) qualifyOperation(s *session, request records.Request) (*r
 		if err != nil {
 			problem := operationCacheProblem(err)
 			if problem.Code == exit.Structural {
-				return nil, exit.Named(exit.Structural, "operation.numerical_environment_unproven", "the selected callee's prepared interpreter could not prove its numerical identity")
+				return "", exit.Named(exit.Structural, "operation.numerical_environment_unproven", "the selected callee's prepared interpreter could not prove its numerical identity")
 			}
-			return nil, problem
+			return "", problem
 		}
-		return nil, exit.Named(exit.Structural, "operation.numerical_environment_unproven", "the selected callee did not provide its numerical identity")
+		return "", exit.Named(exit.Structural, "operation.numerical_environment_unproven", "the selected callee did not provide its numerical identity")
 	}
 	environment, _ := canonical.Spell(result.Digest)
-	return c.opt.Store.BindOperationContext(request.ID, environment)
+	return environment, nil
 }

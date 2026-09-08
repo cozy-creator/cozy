@@ -91,4 +91,27 @@ only-include=["model_tools.py"]
 	if produced != 2 || reused != 1 || verified != 4 {
 		t.Fatalf("independent scripts did not reuse production and execute both recipient reads: produce=%d reused=%d verify=%d", produced, reused, verified)
 	}
+	var install string
+	must(t, db.QueryRow(`SELECT dir FROM installs WHERE package='local/model-tools' LIMIT 1`).Scan(&install))
+	staged, err := filepath.Glob(filepath.Join(install, "worker-environments", ".stage", "*", "wheels"))
+	must(t, err)
+	if len(staged) != 2 {
+		t.Fatalf("unchanged code was prepared more than once per worker: stages=%v", staged)
+	}
+	rows, err := db.Query(`SELECT count(DISTINCT p.body) FROM attempt_serving_placements p JOIN requests r ON r.id=p.request_id GROUP BY r.parent_request_id`)
+	must(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var placements int
+		must(t, rows.Scan(&placements))
+		if placements != 1 {
+			t.Fatal("repeated inference rebuilt its unchanged prepared placement")
+		}
+	}
+	must(t, rows.Err())
+	var inputs int
+	must(t, db.QueryRow(`SELECT count(DISTINCT h.request_id) FROM request_weights_retentions h JOIN requests r ON r.id=h.request_id WHERE r.entrypoint='generate' AND h.kind='input' AND h.slot='result/model'`).Scan(&inputs))
+	if inputs != 4 {
+		t.Fatal("prepared code reuse bypassed per-call model custody")
+	}
 }
