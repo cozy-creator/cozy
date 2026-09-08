@@ -13,12 +13,18 @@ import (
 )
 
 func TestPrivateModelArtifactAdmissionAcquiresCustodyBeforeExecution(t *testing.T) {
+	for _, kind := range []string{"job", "serving"} {
+		t.Run(kind, func(t *testing.T) { privateModelArtifactAdmission(t, kind) })
+	}
+}
+
+func privateModelArtifactAdmission(t *testing.T, kind string) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
 	parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "artifact-parent", ""))
-	producer, _, problem := store.SubmitChild(records.Request{ID: "req-artifact-producer", IdemKey: "artifact-producer", Kind: "job", Package: "local/source", Entrypoint: "source", Payload: []byte(`{}`), BodyDigest: childDigest("1"), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("2"), ChildTargetDigest: childDigest("3"), ChildArtifacts: true, WeightsOutputs: `[{"output_id":"weights"}]`}, 1, childDigest("1"), "private-boot")
+	producer, _, problem := store.SubmitChild(records.Request{ID: "req-artifact-producer", IdemKey: "artifact-producer", Kind: "job", Package: "local/source", Entrypoint: "source", Payload: []byte(`{}`), BodyDigest: childDigest("1"), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("2"), ChildTargetDigest: childDigest("3"), ChildArtifacts: true, WeightsOutputs: `[{"output_id":"weights"}]`}, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	producer = offerChildParent(t, store, producer)
 	nativeReceipt := childDigest("4")
@@ -39,8 +45,21 @@ func TestPrivateModelArtifactAdmissionAcquiresCustodyBeforeExecution(t *testing.
 	}
 	payload, err := json.Marshal(map[string]any{"model": artifact})
 	must(t, err)
-	consumer, _, problem := store.SubmitChild(records.Request{ID: "req-artifact-consumer", IdemKey: "artifact-consumer", Kind: "job", Package: "local/candidate", Entrypoint: "run", Payload: payload, BodyDigest: childDigest("7"), ParentRequestID: parent.ID, ParentCallIndex: 1, ChildIntentDigest: childDigest("8"), ChildTargetDigest: childDigest("9"), Models: []records.ModelRef{{Slot: "model", Manifest: artifact.Manifest.Digest, ManifestLength: artifact.Manifest.Length}}}, 1, childDigest("1"), "private-boot")
+	var callArguments []byte
+	if kind == "serving" {
+		callArguments, err = canonical.NormalizeJCS(append(append([]byte(`{"models":`), payload...), []byte(`,"payload":{"prompt":"test"}}`)...))
+		must(t, err)
+		payload = []byte(`{"prompt":"test"}`)
+	}
+	consumer, _, problem := store.SubmitChild(records.Request{ID: "req-artifact-consumer", IdemKey: "artifact-consumer", Kind: kind, Package: "local/candidate", Entrypoint: "run", Payload: payload, BodyDigest: childDigest("7"), ParentRequestID: parent.ID, ParentCallIndex: 1, ChildIntentDigest: childDigest("8"), ChildTargetDigest: childDigest("9"), Models: []records.ModelRef{{Slot: "model", Manifest: artifact.Manifest.Digest, ManifestLength: artifact.Manifest.Length}}}, 1, childDigest("1"), "private-boot", callArguments)
 	fatal(t, problem)
+	if kind == "serving" {
+		retained, problem := store.ChildArguments(consumer)
+		fatal(t, problem)
+		if string(retained) != string(callArguments) || string(consumer.Payload) != `{"prompt":"test"}` {
+			t.Fatal("serving admission changed its payload or lost the original call")
+		}
+	}
 	retentions, problem := store.WeightsRetentions(consumer.ID)
 	fatal(t, problem)
 	if len(retentions) != 1 || retentions[0].State != "pending" || retentions[0].ProducerRequestID != producer.ID || retentions[0].ProducerAttempt != 1 {
@@ -117,7 +136,7 @@ func TestPrivateCompletedScriptRetainsDelegatedArtifacts(t *testing.T) {
 			defer store.Close()
 			fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
 			parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "no-result-parent", ""))
-			child, _, problem := store.SubmitChild(records.Request{ID: "req-delegated-result", IdemKey: "delegated-result", Kind: "job", Package: "local/source", Entrypoint: "compute", Payload: []byte(`{}`), BodyDigest: childDigest("1"), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("2"), ChildTargetDigest: childDigest("3"), ChildArtifacts: artifacts}, 1, childDigest("1"), "private-boot")
+			child, _, problem := store.SubmitChild(records.Request{ID: "req-delegated-result", IdemKey: "delegated-result", Kind: "job", Package: "local/source", Entrypoint: "compute", Payload: []byte(`{}`), BodyDigest: childDigest("1"), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("2"), ChildTargetDigest: childDigest("3"), ChildArtifacts: artifacts}, 1, childDigest("1"), "private-boot", nil)
 			fatal(t, problem)
 			closeChild(t, store, child, "SUCCEEDED", "succeeded")
 			closeChild(t, store, parent, "SUCCEEDED", "succeeded")

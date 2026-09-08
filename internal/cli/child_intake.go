@@ -117,7 +117,7 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 			return fail(problem)
 		}
 		var exports []launch.Entrypoint
-		for _, job := range surface.Jobs {
+		for _, job := range append(append([]launch.Entrypoint(nil), surface.Entrypoints...), surface.Jobs...) {
 			if job.Invocable != nil {
 				exports = append(exports, job)
 			}

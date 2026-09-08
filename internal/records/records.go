@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 33
+const schemaVersion = 34
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -115,7 +115,7 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
 
 func init() {
-	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL)
+	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, childArgumentsDDL)
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
@@ -410,6 +410,11 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 		}
 	}
 
+	if sourceVersion < 34 {
+		if _, err := tx.Exec(childArgumentsDDL); err != nil {
+			return exit.Internalf("cannot add serving child arguments: %s", err)
+		}
+	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
@@ -736,6 +741,9 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
+		if version < 34 && statement == childArgumentsDDL {
+			continue
+		}
 		if version < 33 && statement == byteOutputsDDL {
 			continue
 		}
