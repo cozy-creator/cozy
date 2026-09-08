@@ -2,8 +2,9 @@
 from pathlib import Path
 
 import msgspec
+import numpy as np
 from PIL import Image
-from cozy_eval.facts import IMAGE_PAIR, score_pair
+from cozy_eval.metrics.reference import psnr, ssim
 from cozy_runtime.author import App, Context, Model, Telemetry, invocable
 
 
@@ -23,9 +24,11 @@ async def score(ctx: Context, *, model: Candidate, tel: Telemetry) -> Result:
     ctx.raise_if_cancelled()
     root = Path(__file__).parent
     with Image.open(root / "baseline.png") as base, Image.open(root / "candidate.png") as candidate:
-        facts = score_pair(base, candidate, modality="image", metrics=IMAGE_PAIR)
+        reference = np.asarray(base.convert("RGB"))
+        compared = np.asarray(candidate.convert("RGB"))
+        values = psnr(reference, compared), ssim(reference, compared)
     tel.log("scored supplied qualification images", checkpoint=model.checkpoint_ref)
-    return Result(model.checkpoint_ref, facts.values["psnr"], facts.values["ssim"])
+    return Result(model.checkpoint_ref, *values)
 
 
 app = App()
