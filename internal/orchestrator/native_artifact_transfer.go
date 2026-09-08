@@ -28,6 +28,13 @@ func (c *Orchestrator) artifactRoundtrip(ctx context.Context, worker string, com
 	if session == nil {
 		return nil, exit.Unavailablef("native artifact transfer awaits its claimed workspace")
 	}
+	c.mu.Lock()
+	currentWorker := c.workers[session.instanceID]
+	capable := currentWorker != nil && currentWorker.wireMinor >= 42
+	c.mu.Unlock()
+	if !capable {
+		return nil, exit.Named(exit.Unavailable, "publication.worker_upgrade_required", "native artifact publication requires worker protocol42")
+	}
 	command.RecordOwnerEpoch, command.ControlStreamEpoch, command.WorkerBootId = recordOwnerEpoch, session.epoch, session.bootID
 	command.CommandId = c.artifactSequence.Add(1)
 	key := fmt.Sprintf("%s/%d", command.EffectId, command.CommandId)
