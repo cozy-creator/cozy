@@ -12,12 +12,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/output"
 )
 
-// A package's default bindings are MUTABLE HUB ROWS — one per (package, slot path) — and
-// `cozy package bind` sets them; Tensorhub removes defaults whose slots disappear.
-// package.toml carries no bindings and publish seeds none. A row names a model release and its ladder, the fit
-// map from GPU class to lane. Bind verifies both against the hub before writing — the
-// slot against the package's latest published interface, the release and every lane
-// against the model card — so a binding can never name what the card does not offer.
+// Owner overrides are mutable Hub rows, one per (package, slot path). Authored
+// defaults stay in the published function interface; publishing seeds no rows.
+// Bind verifies the slot against the latest package interface and every lane
+// against the model release. Unbind removes the override so authored defaults apply.
 
 func handlePackageBindings(ctx *Context) *exit.Error {
 	ref, problem := hub.ParseRef(strings.TrimSpace(ctx.Inv.Args[0]))
