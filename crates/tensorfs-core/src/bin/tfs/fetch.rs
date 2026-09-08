@@ -258,17 +258,18 @@ pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
     // What is printed is what was MEASURED — bytes through each door and the instant they
     // landed — and nothing derived. A rate is the consumer's division of two of these
     // samples, which is the only place it can be computed honestly: this walk has sixteen
-    // streams and no opinion about what interval anyone wants to average over. There is no
-    // denominator here on purpose. `FetchPlan` knows it and `pull()` holds it, but a
-    // caller that must not invent a percentage would rather be given none than one this
-    // side guessed.
+    // streams and no opinion about what interval anyone wants to average over. The
+    // denominator is the native FetchPlan's declared byte count. The plan callback also
+    // supplies already-held bytes, so a resumed or warm pull starts at its real position.
     //
     // The two doors are separate counters because they cost different things and only one
     // of them is an invoice. A cache that has silently gone cold produces a complete
     // closure, correct totals, and a bill — and looks exactly like a warm one unless the
     // split is reported while it happens.
     let progress = PullProgress::new(request.sample_seconds);
+    let planned = |plan: &FetchPlan| progress.planned(plan);
     let observe = |_object: &ObjectRef, moved: u64, door: ObjectSource| progress.saw(moved, door);
+    request.on_plan = Some(&planned);
     request.on_object = Some(&observe);
     let report = ok!(transport::pull(&request));
     progress.settle();
@@ -1282,6 +1283,8 @@ struct PullProgress {
 }
 
 struct PullProgressState {
+    total_bytes: u64,
+    held_bytes: u64,
     origin_bytes: u64,
     cache_bytes: u64,
     origin_objects: u64,
@@ -1293,6 +1296,8 @@ impl PullProgress {
     fn new(sample_seconds: f64) -> PullProgress {
         PullProgress {
             state: Mutex::new(PullProgressState {
+                total_bytes: 0,
+                held_bytes: 0,
                 origin_bytes: 0,
                 cache_bytes: 0,
                 origin_objects: 0,
@@ -1301,6 +1306,14 @@ impl PullProgress {
             }),
             resolution: Duration::from_secs_f64(sample_seconds.clamp(0.001, 3600.0)),
         }
+    }
+
+    fn planned(&self, plan: &FetchPlan) {
+        let mut state = self.state.lock().unwrap();
+        state.total_bytes = plan.declared_bytes();
+        state.held_bytes = plan.held_bytes();
+        state.last = Some(Instant::now());
+        print_progress(&state);
     }
 
     fn saw(&self, moved: u64, door: ObjectSource) {
@@ -1364,7 +1377,8 @@ impl PullProgress {
 /// door at all, and those are the two states worth telling apart.
 fn print_progress(state: &PullProgressState) {
     eprintln!(
-        "{{\"event\":\"pull.progress\",\"origin_bytes\":{},\"cache_bytes\":{},\"origin_objects\":{},\"cache_objects\":{}}}",
-        state.origin_bytes, state.cache_bytes, state.origin_objects, state.cache_objects
+        "{{\"event\":\"pull.progress\",\"total_bytes\":{},\"held_bytes\":{},\"origin_bytes\":{},\"cache_bytes\":{},\"origin_objects\":{},\"cache_objects\":{}}}",
+        state.total_bytes, state.held_bytes, state.origin_bytes, state.cache_bytes,
+        state.origin_objects, state.cache_objects
     );
 }
