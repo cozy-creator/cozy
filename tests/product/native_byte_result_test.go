@@ -89,3 +89,56 @@ func TestNativeByteServiceUsesOriginalAttemptAndIndependentReceivedHold(t *testi
 		t.Fatal("parent release erased independent child input")
 	}
 }
+
+func TestNativeSourceRetryPreservesCancellationAndOriginalByteProducer(t *testing.T) {
+	for _, state := range []string{"failed", "stopped", "canceled"} {
+		t.Run(state, func(t *testing.T) {
+			store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
+			fatal(t, problem)
+			defer store.Close()
+			fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
+			parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "native-retry", ""))
+			call := records.NativeCall{ID: "source-retry", ParentRequestID: parent.ID, CallIndex: 1, Kind: "source", Operation: "source_files", IntentDigest: childDigest("4"), Request: []byte(`{}`)}
+			_, _, problem = store.AcceptNativeCall(call, 1, childDigest("1"), "private-boot")
+			fatal(t, problem)
+			fatal(t, store.StopNativeCall(call.ID, state, "interrupted"))
+			_, problem = store.AcceptTerminal(records.Terminal{RequestID: parent.ID, Attempt: 1, SessionID: "private-boot", InvocationDigest: childDigest("1"), TerminalID: "failed", TerminalDigest: childDigest("a"), Status: "FAILED", RequestState: "requeue_pending", Body: []byte(`{}`)})
+			fatal(t, problem)
+			fatal(t, store.Closed(parent.ID, 1))
+			_, _, _, problem = store.BeginRequeue(parent.ID, 3, false)
+			fatal(t, problem)
+			ordinal, problem := store.Dispatch(records.Attempt{RequestID: parent.ID, InstanceID: "private-worker", SessionID: "private-boot", InvocationDigest: childDigest("2"), InvocationCanonical: []byte(`{}`)})
+			fatal(t, problem)
+			if ordinal != 2 {
+				t.Fatal("retry changed original attempt")
+			}
+			fatal(t, store.OfferDispatch(parent.ID, 2, "private-boot"))
+			again, _, problem := store.AcceptNativeCall(call, 2, childDigest("2"), "private-boot")
+			fatal(t, problem)
+			if state != "failed" {
+				if again.State != state {
+					t.Fatal("final cancellation was reopened")
+				}
+				return
+			}
+			if again.State != "accepted" {
+				t.Fatal("interruption did not preserve retryable source intent")
+			}
+			receipt := []byte("native original A1 receipt")
+			digest, _ := canonical.Spell(canonical.Digest(receipt))
+			spec, _ := canonical.Raw(childDigest("1"))
+			output := records.ByteOutput{RequestID: parent.ID, Attempt: 1, OutputID: "runtime.source_files.1", Digest: childDigest("6"), Length: 100, MimeType: "application/vnd.cozy.tree-manifest", ReceiptDigest: digest, ManifestID: childDigest("6"), ManifestLength: 100, ContentBytes: 1024}
+			output.ProducerRootID = records.NativeByteProducerRoot("cozy-local-client", parent.ID, 1, spec, output.OutputID)
+			hold, problem := store.CompleteNativeByteCall(call.ID, 2, childDigest("2"), "private-boot", childDigest("1"), output, []byte(`{"files":{}}`), receipt, "private-worker")
+			fatal(t, problem)
+			if hold.ProducerAttempt != 1 {
+				t.Fatal("reattachment rebound A1 producer to A2")
+			}
+			changed := output
+			changed.Attempt = 2
+			if _, problem := store.CompleteNativeByteCall(call.ID, 2, childDigest("2"), "private-boot", childDigest("2"), changed, []byte(`{"files":{}}`), receipt, "private-worker"); problem == nil {
+				t.Fatal("replay replaced original producer")
+			}
+		})
+	}
+}
