@@ -47,6 +47,19 @@ type managedRentals struct {
 	retryAt map[string]time.Time
 	said    map[string]string
 	closed  bool
+	// unrecorded is the OTHER HALF OF THE FLEET (cl-196): the rentals the hub says
+	// this account owns that this host holds no live record of. It is refreshed by
+	// every reconcile from `GET /v1/rentals` (th-199) and is the only place a pod
+	// this host never recorded can be counted, named, or ended.
+	//
+	// listingProblem is why the last reconcile could not ask. It is kept rather than
+	// raised because a hub that cannot be asked is not a hub that says the account
+	// owns nothing, and the difference has to reach the reader: a board that silently
+	// falls back to local records is exactly the board that showed an empty fleet
+	// while six H100s billed.
+	unrecorded     []hub.Rental
+	listed         bool
+	listingProblem *exit.Error
 }
 
 // idleReleaseRetry is how soon a release the hub did not confirm is asked again. A fifth
@@ -552,10 +565,18 @@ func (m *managedRentals) admitLocked(sku hub.RentalSKU) *exit.Error {
 	// figure admitted is the estimated TOTAL the pod will bill — the GPU rate
 	// plus the SKU's storage adder — never the GPU rate alone (th-126).
 	if burn > cap || sku.PriceUSDMicrosPerHour+sku.StorageUSDMicrosPerHour > cap-burn {
+		remedy := "raise rentals.max_hourly_spend_usd or end another rental"
+		// WHICH rental to end is the whole question when part of the burn is a pod
+		// this host never filed: without this line the reader ends a machine they can
+		// see and the ceiling stays breached by the ones they cannot.
+		if unrecorded, unrecordedBurn := m.unrecordedTotalsLocked(); unrecorded > 0 {
+			remedy = fmt.Sprintf("%s of the burn is %d machine(s) the hub bills this account for that this "+
+				"host holds no record of; `cozy rental list` names them and `cozy rental end` releases them",
+				usdPerHour(unrecordedBurn), unrecorded)
+		}
 		return exit.Named(exit.Capacity, "rental.fleet_spend_cap",
 			"rental %s at %s would exceed %s",
-			sku.Name, skuRate(sku), usdPerHour(cap)).
-			WithRemedy("raise rentals.max_hourly_spend_usd or end another rental")
+			sku.Name, skuRate(sku), usdPerHour(cap)).WithRemedy("%s", remedy)
 	}
 	return nil
 }
@@ -678,6 +699,7 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 }
 
 func (m *managedRentals) sweepLocked() {
+	m.sayUnrecordedLocked()
 	rows, problem := m.store.Rentals()
 	if problem != nil {
 		m.sayLocked("", "idle release deferred: "+problem.Message)
@@ -833,7 +855,61 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 	return m.lineLocked()
 }
 
+// reconcileLocked converges this host's rental rows with the hub, and then asks the
+// hub the question this host cannot answer from its own rows at all: what else does
+// this account own? The two directions are not the same read and only one of them
+// existed. Local-row reconciliation can correct a row; it can never notice a pod
+// that has no row.
 func (m *managedRentals) reconcileLocked() *exit.Error {
+	if problem := m.reconcileRowsLocked(); problem != nil {
+		return problem
+	}
+	m.reconcileListingLocked()
+	return nil
+}
+
+// reconcileListingLocked refreshes the unrecorded set. A listing this hub does not
+// publish, or cannot answer right now, leaves the set EMPTY and the reason recorded
+// — never an assertion that there is nothing there.
+func (m *managedRentals) reconcileListingLocked() {
+	hctx, cancel := hub.Context()
+	remote, listed, problem := client(m.ctx).Rentals(hctx)
+	cancel()
+	m.listed, m.listingProblem, m.unrecorded = listed, problem, nil
+	if problem != nil || !listed {
+		return
+	}
+	for _, seen := range remote {
+		if seen.State == hub.RentalReleased || seen.State == hub.RentalFailed {
+			continue
+		}
+		row, rowProblem := m.store.RentalRow(seen.ID)
+		if rowProblem != nil {
+			m.listingProblem = rowProblem
+			m.unrecorded = nil
+			return
+		}
+		if row != nil {
+			continue
+		}
+		m.unrecorded = append(m.unrecorded, seen)
+	}
+}
+
+// sayUnrecordedLocked is the DAEMON's alarm, and it belongs to the sweep rather than
+// to the reconcile because the reconcile also runs under a CLI verb, whose stdout is
+// a machine document that a log line would corrupt. The daemon has no reader watching
+// a board, so a machine billing outside its records has to reach the log by itself —
+// once per machine, at the sweep's own cadence, saying the word that ends it.
+func (m *managedRentals) sayUnrecordedLocked() {
+	for _, seen := range m.unrecorded {
+		m.sayLocked("hub:"+seen.ID, fmt.Sprintf(
+			"rental %s (%s) is %s at %s and this host holds no record of it; end it with `cozy rental end %s`",
+			seen.ID, seen.Name, seen.State, usdPerHour(seen.HourlyRateUSDMicros), seen.Name))
+	}
+}
+
+func (m *managedRentals) reconcileRowsLocked() *exit.Error {
 	rows, problem := m.store.Rentals()
 	if problem != nil {
 		return problem
@@ -922,16 +998,57 @@ func (m *managedRentals) lineLocked() (string, *exit.Error) {
 	if count != 1 {
 		machine = "machines"
 	}
-	return fmt.Sprintf("rentals: %d remote %s running · %s of %s",
-		count, machine, usdPerHour(burn), usdPerHour(m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros)), nil
+	line := fmt.Sprintf("rentals: %d remote %s running · %s of %s",
+		count, machine, usdPerHour(burn), usdPerHour(m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros))
+	if unrecorded, _ := m.unrecordedTotalsLocked(); unrecorded > 0 {
+		line += fmt.Sprintf(" · %d of them recorded only at the hub", unrecorded)
+	}
+	if m.listingProblem != nil {
+		line += " · the hub could not be asked what this account owns (" + m.listingProblem.Message + ")"
+	} else if !m.listed {
+		line += " · this hub publishes no rental listing, so only recorded machines are counted"
+	}
+	return line, nil
 }
 
+// totalsLocked is what THE ACCOUNT is paying, not what this host filed. The
+// unrecorded half counts, and it counts in the spend admission as well as on the
+// board: on 2026-09-07 six pods at $3.19/hour billed against a $10/hour ceiling
+// that admitted every one of them, because the ceiling was computed from local rows
+// and none of the six had one. A cap that cannot see half the spend is not a cap.
 func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
 	count, burn, problem := m.store.RentalFleetTotals()
 	if problem != nil || burn < 0 {
 		return 0, 0, problem
 	}
-	return count, burn, nil
+	unrecordedCount, unrecordedBurn := m.unrecordedTotalsLocked()
+	return count + unrecordedCount, burn + unrecordedBurn, nil
+}
+
+func (m *managedRentals) unrecordedTotalsLocked() (int, int64) {
+	var burn int64
+	for _, seen := range m.unrecorded {
+		if seen.HourlyRateUSDMicros > 0 {
+			burn += seen.HourlyRateUSDMicros
+		}
+	}
+	return len(m.unrecorded), burn
+}
+
+// unrecorded is the cached set, for a caller rendering the fleet rather than
+// deciding on it. It never asks the hub: the reconcile owns that, at the cadence
+// every rental verb already samples at.
+func (m *managedRentals) unrecordedSnapshot() ([]hub.Rental, bool, *exit.Error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]hub.Rental(nil), m.unrecorded...), m.listed, m.listingProblem
+}
+
+// cachedTotals is totalsLocked without a reconcile, for the live board's redraw.
+func (m *managedRentals) cachedTotals() (int, int64, *exit.Error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.totalsLocked()
 }
 
 func usdPerHour(micros int64) string {

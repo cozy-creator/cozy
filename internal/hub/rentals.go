@@ -94,6 +94,11 @@ type Rental struct {
 	// Blank whenever the hub has not observed the pod yet, or is older than the field.
 	ProviderState  string
 	ContainerState string
+	// CreatedAt is when the hub opened the rental, which is when it began billing.
+	// It is how long a pod this host holds no record of has been costing money —
+	// there is no local `rented_at` for a rental the records never saw. RFC 3339 as
+	// the hub says it, or blank from a hub older than th-199.
+	CreatedAt string
 }
 
 // RentalFailure is Tensorhub's sanitized terminal boot diagnosis. It contains
@@ -159,12 +164,18 @@ type wireRental struct {
 	HourlyRateUSDMicros int64          `json:"hourly_rate_usd_micros"`
 	ProviderState       string         `json:"provider_state,omitempty"`
 	ContainerState      string         `json:"container_state,omitempty"`
+	CreatedAt           string         `json:"created_at,omitempty"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var computeCapabilityPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+$`)
 
 const maxRentalResponseBytes = 1 << 20
+
+// maxRentalListingBytes bounds the account listing. Each row carries the same view
+// the by-id route serves — a pinned certificate included — so the bound is the
+// per-rental cap over a fleet, not a new number about how many pods someone may own.
+const maxRentalListingBytes = 64 * maxRentalResponseBytes
 
 func validateRentalID(id string) *exit.Error {
 	if !rentalid.Valid(id) {
@@ -187,6 +198,7 @@ func (w wireRental) rental() Rental {
 		HourlyRateUSDMicros: w.HourlyRateUSDMicros,
 		ProviderState:       w.ProviderState,
 		ContainerState:      w.ContainerState,
+		CreatedAt:           w.CreatedAt,
 	}
 }
 
@@ -441,6 +453,55 @@ func (w wireRental) named(what string) *exit.Error {
 			WithRemedy("upgrade Tensorhub; every rental states the width it delivers")
 	}
 	return validateRentalID(w.ID)
+}
+
+// Rentals is every rental THE HUB says this account owns (th-199). It is the only
+// answer to a question Creator cannot answer from its own records: a pod bought by
+// this account that this host never recorded — because the create answer was
+// refused, because the records were lost, or because another host bought it — is
+// billing and is nameable nowhere else. Six H100 NVLs proved that on 2026-09-07.
+//
+// The second result says whether the hub PUBLISHES a listing. A hub older than
+// th-199 has no such route and answers 404 for it, which is a statement about the
+// hub's version and not about the account's pods; a caller must not read it as "you
+// own nothing", so the two are separated here rather than collapsed into an empty
+// slice. Nothing else is inferred from an absent route.
+//
+// Identity is validated per row and a row that cannot be named is DROPPED rather
+// than failing the listing: a hub that serves one malformed row must not thereby
+// hide the ten good ones, which is the same lesson as the release path's (cl-193).
+func (c *Client) Rentals(ctx context.Context) ([]Rental, bool, *exit.Error) {
+	var out struct {
+		Rentals []wireRental `json:"rentals"`
+	}
+	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals", auth: true,
+		responseBytes: maxRentalListingBytes}, &out)
+	if e != nil {
+		if unpublishedRoute(e) {
+			return nil, false, nil
+		}
+		return nil, false, e
+	}
+	rentals := make([]Rental, 0, len(out.Rentals))
+	for _, wire := range out.Rentals {
+		if !rentalid.Valid(wire.ID) || !rentalid.ValidMachineName(wire.Name) {
+			continue
+		}
+		rentals = append(rentals, wire.rental())
+	}
+	return rentals, true, nil
+}
+
+// unpublishedRoute says a refusal came from the hub's own router rather than from the
+// hub's product: net/http answers an unregistered path 404 and a registered path with
+// the wrong method 405, both as PLAIN TEXT with no error envelope, which is exactly
+// what `hub.untyped_refusal` names. A hub older than th-199 has `POST /v1/rentals` and
+// therefore answers 405, not 404 — reading only the 404 would have made every
+// pre-th-199 hub a hard failure of the listing rather than a hub that does not publish
+// one. A typed refusal is the product speaking and is never silently swallowed.
+func unpublishedRoute(e *exit.Error) bool {
+	return e.ErrName() == "hub.untyped_refusal" &&
+		(e.Code == exit.NotFound || e.Code == exit.Validation)
 }
 
 // Rental reads one rental's current state using the renter's account authority.
