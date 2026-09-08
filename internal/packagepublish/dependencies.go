@@ -349,6 +349,18 @@ func LocalDependencySelections(root string, extras ...string) (map[string]LocalD
 	out := map[string]LocalDependencySelection{}
 	for name, row := range c.byName {
 		if row.source != canonical {
+			declared, problem := readProjectDocument(filepath.Join(row.source, "pyproject.toml"))
+			if problem != nil {
+				return nil, problem
+			}
+			if len(declared.Project.EntryPoints[applicationGroup]) != 0 {
+				info, err := os.Stat(filepath.Join(row.source, "package.toml"))
+				if err != nil || !info.Mode().IsRegular() {
+					return nil, exit.Named(exit.Validation, "local_application_declaration_missing",
+						"local dependency %s declares a cozy.application entry point but has no regular package.toml", name).
+						WithRemedy("add package.toml with [application] object matching that entry point, then retry cozy run")
+				}
+			}
 			selected := make([]string, 0, len(c.extras[row.source]))
 			for extra := range c.extras[row.source] {
 				selected = append(selected, extra)
