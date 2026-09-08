@@ -938,7 +938,7 @@ pub struct PullRequest<'a> {
     pub sample_seconds: f64,
     /// The native plan, once, before body transfers. Observability only; consumers can
     /// report the exact declared and already-held bytes without resolving a second plan.
-    pub on_plan: Option<&'a dyn Fn(&FetchPlan)>,
+    pub on_plan: Option<&'a (dyn Fn(&FetchPlan) + Sync)>,
     pub on_object: Option<ObjectObserver<'a>>,
 }
 
