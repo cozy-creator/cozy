@@ -302,6 +302,9 @@ fn pull_with_budget(
     request.on_object = Some(&observe);
     let report = ok!(transport::pull(&request));
     progress.settle();
+    if !tensorfs_core::repo_cache::finish_optional_backfills() {
+        eprintln!("repo cache backfill stopped advancing; local fetch remains complete");
+    }
     println!(
         "model        {}@{} lane {}",
         report.model, report.release, report.lane
