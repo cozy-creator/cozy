@@ -52,9 +52,9 @@ func TestRuntimeFixtureRefusesMissingOrMutableProvenance(t *testing.T) {
 			must(t, err)
 			// An independently executable peer passes normal wire qualification but
 			// has no immutable source authority. The fixture must stop before Git/build.
-			must(t, os.WriteFile(filepath.Join(bin, "cozy-runtime"), []byte("#!/bin/sh\nprintf '%s\\n' '"+string(answer)+"'\n"), 0700))
-			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-			_, err = qualifiedRuntimeFixtureSHA(filepath.Join(t.TempDir(), "no-repository"), os.Environ())
+			must(t, os.WriteFile(filepath.Join(bin, "cozy-runtime"), []byte("#!/bin/sh\nprintf '%s\\n' '"+string(answer)+"'\n"), 0700)) //cozy:allow a stand-in provenance tool, not this host's
+			t.Setenv("PATH", bin)
+			_, err = qualifiedRuntimeFixtureSHA(filepath.Join(t.TempDir(), "no-repository"), childEnv(t, t.TempDir(), "PATH="+bin))
 			if err == nil || !strings.Contains(err.Error(), "immutable build provenance") {
 				t.Fatalf("missing/mutable source was not refused before Git/build: %v", err)
 			}
