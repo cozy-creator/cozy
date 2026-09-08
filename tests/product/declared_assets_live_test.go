@@ -9,6 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
+
+	"github.com/cozy-creator/cozy/internal/records"
 	"testing"
 )
 
@@ -38,9 +41,12 @@ def result(assets: Pictures) -> Result:
     assert assets.by_label("艾丽丝").position == 0
     return Result([a.label for a in assets],[a.id for a in assets],[a.position for a in assets],[len(a.read_bytes()) for a in assets])
 @invocable(memoize=False)
-async def main(ctx: Context, *, assets: Pictures) -> Result:
+async def main(ctx: Context, *, assets: Pictures, fail: bool = False) -> Result:
     ctx.raise_if_cancelled()
-    return result(assets)
+    got = result(assets)
+    if fail:
+        raise ValueError("deliberate asset retry")
+    return got
 app.job(main)
 class Request(msgspec.Struct):
     prompt: str
@@ -107,4 +113,42 @@ object = "assets_app:app"
 			}
 		})
 	}
+	t.Run("retry", func(t *testing.T) {
+		code, out, _ := runCozyStreams(t, root, "--json", "run", "local/cozy-assets-proof/main", "fail=true", "--asset", "艾丽丝="+photo, "--asset", photo, "--await")
+		if code == 0 || !strings.Contains(out, "deliberate asset retry") {
+			t.Fatalf("initial asset job did not fail intentionally: %d %s", code, out)
+		}
+		st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+		fatal(t, problem)
+		defer st.Close()
+		prior, problem := st.RequestByReference("3")
+		fatal(t, problem)
+		if prior == nil || prior.State != "blocked" || len(prior.Assets) != 2 {
+			t.Fatalf("failed job lost retained assets: %+v", prior)
+		}
+		code, out, _ = runCozyStreams(t, root, "--json", "run", "local/cozy-assets-proof/main", "fail=false", "--retry", prior.ID)
+		if code == 0 || !strings.Contains(out, "assets") {
+			t.Fatalf("retry silently dropped required asset inputs: %d %s", code, out)
+		}
+		missing, problem := st.RequestByReference("4")
+		fatal(t, problem)
+		if missing != nil {
+			t.Fatal("missing-assets retry queued a request")
+		}
+		code, out, stderr := runCozyStreams(t, root, "--json", "run", "local/cozy-assets-proof/main", "fail=false", "--retry", prior.ID, "--asset", "艾丽丝="+photo, "--asset", photo, "--await")
+		if code != 0 {
+			t.Fatalf("explicit asset retry failed: %d %s %s", code, out, stderr)
+		}
+		fresh, problem := st.RequestByReference("4")
+		fatal(t, problem)
+		if fresh == nil || fresh.State != "succeeded" || fresh.RetryOf != prior.ID || len(fresh.Assets) != 2 {
+			t.Fatalf("retry lost its input lineage: %+v", fresh)
+		}
+		for i, asset := range fresh.Assets {
+			if asset.Digest != prior.Assets[i].Digest || asset.FieldPath != prior.Assets[i].FieldPath || asset.Order != prior.Assets[i].Order || asset.MediaType != prior.Assets[i].MediaType {
+				t.Fatalf("retry changed retained asset identity: %+v", fresh.Assets)
+			}
+		}
+	})
+
 }

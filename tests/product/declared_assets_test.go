@@ -24,7 +24,7 @@ func assetsCallable(t *testing.T) *launch.Entrypoint {
 
 func TestDeclaredAssetsPreserveOccurrencesLabelsAndNamedFields(t *testing.T) {
 	ep := assetsCallable(t)
-	path := filepath.Join(t.TempDir(), "image.png")
+	path := filepath.Join(t.TempDir(), "a=b.png")
 	f, err := os.Create(path)
 	must(t, err)
 	must(t, png.Encode(f, image.NewRGBA(image.Rect(0, 0, 2, 2))))
@@ -63,6 +63,9 @@ func TestDeclaredAssetsPreserveOccurrencesLabelsAndNamedFields(t *testing.T) {
 		if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"test"}`), specs); problem == nil {
 			t.Fatalf("invalid occurrence list accepted: %v", specs)
 		}
+	}
+	if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"test","assets":[{"asset":"existing","label":"same"},{"asset":"existing","label":"same"}]}`), []string{"/absent-file"}); problem == nil || !strings.Contains(problem.Message, "more than once") {
+		t.Fatalf("duplicate payload labels did not refuse before IO: %v", problem)
 	}
 	// Bounds and duplicate labels are checked before trying to read missing files.
 	if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"test"}`), []string{"same=/absent-a", "same=/absent-b"}); problem == nil || !strings.Contains(problem.Message, "more than once") {

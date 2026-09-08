@@ -36,13 +36,7 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 	seen := map[string]bool{}
 	assets := make([]records.AssetBinding, 0, len(specs))
 	for _, spec := range specs {
-		fieldPath, source, explicit := strings.Cut(spec, "=")
-		label := ""
-		if !explicit {
-			source = spec
-		} else if !namedAssetSpec(ep, fieldPath) && ep.Assets != nil {
-			label, explicit = fieldPath, false
-		}
+		fieldPath, source, label, explicit := splitAssetArgument(ep, spec)
 		if !explicit {
 			if ep.Assets == nil {
 				return nil, nil, exit.Usagef("%s declares no Assets input for --asset %q", ep.Name, spec).
@@ -136,6 +130,23 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 		return nil, nil, exit.Internalf("cannot render the payload with input assets: %s", err)
 	}
 	return rendered, assets, nil
+}
+
+// Explicit path syntax wins over label/field assignment, so a=b.png stays a
+// filename in /refs/a=b.png, ~/refs/a=b.png or ./refs/a=b.png.
+func splitAssetArgument(ep *Entrypoint, spec string) (field, source, label string, named bool) {
+	if filepath.IsAbs(spec) || spec == "~" || strings.HasPrefix(spec, "~/") ||
+		strings.HasPrefix(spec, "./") || strings.HasPrefix(spec, "../") {
+		return "", spec, "", false
+	}
+	field, source, named = strings.Cut(spec, "=")
+	if !named {
+		return "", spec, "", false
+	}
+	if ep.Assets == nil || namedAssetSpec(ep, field) {
+		return field, source, "", true
+	}
+	return "", source, field, false
 }
 
 // LegacyFileTerm returns the first `key=@file` payload term. That spelling embeds bytes

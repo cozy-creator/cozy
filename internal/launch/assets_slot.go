@@ -168,19 +168,17 @@ func preflightAssetCount(ep *Entrypoint, document map[string]any, specs []string
 		}
 	}
 	for _, spec := range specs {
-		name, _, named := strings.Cut(spec, "=")
+		name, _, label, named := splitAssetArgument(ep, spec)
 		if named {
-			if namedAssetSpec(ep, name) {
-				parts, _ := assetPath(strings.TrimSpace(name))
-				if ep.Assets.contains(parts) {
-					position, _ := strconv.ParseInt(parts[1], 10, 32)
-					count = max(count, position+1)
-				}
-				continue
+			parts, _ := assetPath(strings.TrimSpace(name))
+			if ep.Assets.contains(parts) {
+				position, _ := strconv.ParseInt(parts[1], 10, 32)
+				count = max(count, position+1)
 			}
-			if problem := addLabel(name); problem != nil {
-				return problem
-			}
+			continue
+		}
+		if problem := addLabel(label); problem != nil {
+			return problem
 		}
 		count++
 	}
