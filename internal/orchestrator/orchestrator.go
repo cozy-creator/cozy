@@ -264,8 +264,10 @@ const (
 	VerdictSlower     = "slower"
 	VerdictDearer     = "dearer"
 	VerdictUnmeasured = "unmeasured"
-	// VerdictAttaching: a fitting rental the fleet holds whose worker has not attached
-	// yet; the request waits for it (cl-170).
+	// VerdictAttaching: a fitting rental the fleet holds that cannot take the request
+	// YET but is provably on its way — anywhere from `pending_acquisition` through a
+	// `ready` pod whose worker has not attached. The request waits for it (cl-170) and
+	// is never failed on it (cl-185).
 	VerdictAttaching = "attaching"
 	// VerdictNoRung: no rung of the binding ladder names this machine's accelerator.
 	VerdictNoRung = "no_rung"
@@ -390,7 +392,10 @@ const (
 	ExcludedModeConflict = "mode_conflict"
 	// ExcludedWrongClass: CPU rental cannot satisfy an accelerator requirement.
 	ExcludedWrongClass = "wrong_class"
-	// ExcludedNotReady: the rental is not in a state that can take a placement.
+	// ExcludedNotReady is spelled with the hub's own state word appended: the rental is
+	// FINISHED — its acquisition failed, or it is being or has been given back — so no
+	// request may wait for it. A rental merely on its way is VerdictAttaching, not this
+	// (cl-185).
 	ExcludedNotReady = "not_ready"
 	// ExcludedAttaching is spelled with the machine appended: a fitting rental is
 	// attaching, and nothing is chosen or bought past it (cl-170).
@@ -401,6 +406,12 @@ const (
 	// ExcludedBaseMismatch is spelled with the pod's own reason appended: the release's
 	// requirements contradict the product's base image.
 	ExcludedBaseMismatch = "base_mismatch"
+	// ExcludedWidthUndeclared is spelled with the product's width and the degrees the
+	// package declares: a machine wider than one card serves a placement as ONE group of
+	// that degree, and a package whose author declared no such degree cannot be sharded
+	// across it. The worker would refuse `device_group_unsupported` on arrival, so the
+	// exclusion belongs here, before the pod is paid for (cl-179).
+	ExcludedWidthUndeclared = "width_undeclared"
 )
 
 // RentalStanding is what this owner knows live about one ready rental a placement could

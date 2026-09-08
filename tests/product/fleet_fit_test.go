@@ -60,7 +60,7 @@ func plantH100(t *testing.T, root string, h *ladderHub, store *records.Store, id
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(rentals, id+".creator.pem"),
 		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o600))
-	row := records.Rental{ID: id, MachineName: machine, SKU: "h100-80", AcceleratorModel: h100SXM,
+	row := records.Rental{AcceleratorCount: 1, ID: id, MachineName: machine, SKU: "h100-80", AcceleratorModel: h100SXM,
 		HourlyRateUSDMicros: 2_490_000, State: "ready", Hub: h.server.URL}
 	if attached {
 		row.Address, row.CertPath = "127.0.0.1:1", filepath.Join(rentals, id+".pem")
@@ -220,7 +220,7 @@ func TestExplicitLaneFailsOnTheCapOnlyWhenNoRentalFits(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	hairu := records.Rental{ID: "pr-hairu", MachineName: "hairu", SKU: "rtx-4090", AcceleratorModel: "NVIDIA GeForce RTX 4090",
+	hairu := records.Rental{AcceleratorCount: 1, ID: "pr-hairu", MachineName: "hairu", SKU: "rtx-4090", AcceleratorModel: "NVIDIA GeForce RTX 4090",
 		HourlyRateUSDMicros: 740_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL}
 	fatal(t, store.RecordRental(hairu))
 	h.addReady(hairu.ID, hairu.MachineName, hairu.AcceleratorModel, hairu.HourlyRateUSDMicros)

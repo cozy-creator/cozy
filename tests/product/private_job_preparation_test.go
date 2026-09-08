@@ -21,7 +21,7 @@ func TestPrivateJobPreparationDoesNotActivateServing(t *testing.T) {
 	o := hostOwner(t, "private-job-preparation", rentalWiring(connection, private), func(opt *orchestrator.Options) {
 		opt.Packages = localLauncher{revision: revision}
 	})
-	fatal(t, o.store.RecordRental(records.Rental{ID: podRental, MachineName: "otter", State: "ready",
+	fatal(t, o.store.RecordRental(records.Rental{AcceleratorCount: 1, ID: podRental, MachineName: "otter", State: "ready",
 		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,
 		Address: connection.Addr, CertPath: connection.CACert,
 		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))

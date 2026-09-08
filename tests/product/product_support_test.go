@@ -3,6 +3,7 @@ package producttest
 import (
 	"bytes"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -449,4 +450,40 @@ func stat(path string) (int64, error) {
 		return 0, err
 	}
 	return info.Size(), nil
+}
+
+// revertRentalsBeforeWidth puts the rentals table back into its pre-schema-33 shape, for a
+// fixture that builds an OLD database by mutating a current one. Schema 33 added the
+// rental's width (cl-179), and `records.Open` compares a claimed prior schema's sqlite_master
+// character for character — so a fixture stamping 27, 28 or 31 must carry the rentals table
+// those schemas had, not this one. The DDL is read back from the database rather than
+// restated here: a second copy of the released shape is exactly what the comparison exists
+// to catch.
+func revertRentalsBeforeWidth(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var ddl string
+	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='rentals'`).Scan(&ddl))
+	prior := strings.Replace(ddl, "  accelerator_count INTEGER NOT NULL DEFAULT 0,\n", "", 1)
+	if prior == ddl {
+		t.Fatalf("the rentals table carries no width column to remove:\n%s", ddl)
+	}
+	columns := "id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,managed_request_id," +
+		"address,cert_path,state,hub,rented_at,media_address,expected_worker_id," +
+		"expected_worker_boot_id,ready_at,failure_code,failure_image_digest,failure_provider," +
+		"failure_provider_resource_id,failure_provider_host_id,failure_provider_state," +
+		"failure_container_state"
+	var index string
+	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='rentals_machine_name'`).Scan(&index))
+	for _, statement := range []string{
+		`DROP INDEX rentals_machine_name`,
+		`ALTER TABLE rentals RENAME TO rentals_current`,
+		prior,
+		`INSERT INTO rentals(` + columns + `) SELECT ` + columns + ` FROM rentals_current`,
+		`DROP TABLE rentals_current`,
+		index,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("cannot revert the rentals table: %v (%s)", err, statement)
+		}
+	}
 }

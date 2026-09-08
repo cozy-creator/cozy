@@ -217,7 +217,8 @@ func open(path string, migratePrior bool, triageDir string) (*Store, *exit.Error
 // the obsolete aggregate package revision digest. Package, request, event, export, and rental rows survive;
 // schema 21 retains Tensorhub's sanitized terminal rental boot failure; schema 22 moves
 // each attempt's verified triage bundle bytes INTO the attempt row (cl-116), retiring the
-// triage file directory and its orphan class.
+// triage file directory and its orphan class; schema 33 records the rental's WIDTH
+// (cl-179), the count of accelerators the paid pod delivers.
 // only schema 9's superseded special
 // model-production subsystem is dropped.
 // Schema 10 creates empty request-attached transfer sidecars because older rows cannot be
@@ -261,7 +262,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 21 {
+	if sourceVersion < schemaVersion {
 		if e := migrateRentals(tx, path, sourceVersion); e != nil {
 			return e
 		}
@@ -482,9 +483,12 @@ func migrateInstalls(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 }
 
 // migrateRentals rebuilds the rentals table on every migration: schema 13 added ready_at,
-// and every earlier shape carries the released column list without it. A rental that was
-// already ready when the schema moved gets no ready_at; its idle clock starts at its next
-// settlement, never at a guess.
+// schema 21 the sanitized boot failure, schema 33 the rental's WIDTH, and every earlier
+// shape carries the released column list without them. A rental that was already ready
+// when the schema moved gets no ready_at; its idle clock starts at its next settlement,
+// never at a guess. Every rental that predates schema 33 was bought one card wide — no
+// wider product could be expressed, let alone attached — so the width backfills to 1,
+// which is a fact about those rows and not a default standing in for an unknown.
 func migrateRentals(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	if _, err := tx.Exec(`DROP INDEX rentals_machine_name`); err != nil {
 		return exit.Internalf("cannot stage rental index while migrating %s: %s", path, err)
@@ -495,13 +499,19 @@ func migrateRentals(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	if _, err := tx.Exec(rentalsDDL); err != nil {
 		return exit.Internalf("cannot create current rentals table while migrating %s: %s", path, err)
 	}
-	columns := rentalColsPriorTwentyOne
-	if sourceVersion < 13 {
+	columns := rentalColsPriorThirtyThree
+	switch {
+	case sourceVersion < 13:
 		columns = rentalColsPriorThirteen
+	case sourceVersion < 21:
+		columns = rentalColsPriorTwentyOne
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(` + columns + `) SELECT ` +
 		columns + ` FROM rentals_prior`); err != nil {
 		return exit.Internalf("cannot preserve rental rows while migrating %s: %s", path, err)
+	}
+	if _, err := tx.Exec(`UPDATE rentals SET accelerator_count=1 WHERE accelerator_count=0`); err != nil {
+		return exit.Internalf("cannot record the width of retained rentals in %s: %s", path, err)
 	}
 	if _, err := tx.Exec(`DROP TABLE rentals_prior`); err != nil {
 		return exit.Internalf("cannot finish rental migration in %s: %s", path, err)
@@ -722,7 +732,10 @@ func priorStatements(version int) []string {
 		"  job_gpu_count INTEGER NOT NULL DEFAULT 0,\n", 1)
 	priorRequestsSix := strings.Replace(priorRequests,
 		"  rental_required INTEGER NOT NULL DEFAULT 0,\n", "", 1)
-	priorRentalsTwenty := strings.Replace(rentalsDDL,
+	// Schema 33 gave the rentals row its width; every earlier shape is this one without it.
+	priorRentalsThirtyTwo := strings.Replace(rentalsDDL,
+		"  accelerator_count INTEGER NOT NULL DEFAULT 0,\n", "", 1)
+	priorRentalsTwenty := strings.Replace(priorRentalsThirtyTwo,
 		"  ready_at          TEXT NOT NULL DEFAULT '',\n  failure_code                 TEXT NOT NULL DEFAULT '',\n  failure_image_digest         TEXT NOT NULL DEFAULT '',\n  failure_provider             TEXT NOT NULL DEFAULT '',\n  failure_provider_resource_id TEXT NOT NULL DEFAULT '',\n  failure_provider_host_id     TEXT NOT NULL DEFAULT '',\n  failure_provider_state       TEXT NOT NULL DEFAULT '',\n  failure_container_state      TEXT NOT NULL DEFAULT ''\n",
 		"  ready_at          TEXT NOT NULL DEFAULT ''\n", 1)
 	priorRentals := strings.Replace(priorRentalsTwenty,
@@ -805,6 +818,8 @@ func priorStatements(version int) []string {
 			stmt = priorRentals
 		case stmt == rentalsDDL && version < 21:
 			stmt = priorRentalsTwenty
+		case stmt == rentalsDDL && version < 33:
+			stmt = priorRentalsThirtyTwo
 		case stmt == attemptsDDL && version < 22:
 			stmt = strings.Replace(stmt,
 				"  triage_bundle    BLOB    NOT NULL DEFAULT x'',\n",

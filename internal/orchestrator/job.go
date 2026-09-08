@@ -251,6 +251,15 @@ func (c *Orchestrator) ConvergeRemoteJob(instanceID string, spec WorkerLaunchSpe
 	return c.sendJobDirective(s, w, &spec)
 }
 
+// gpuCountOf is the job's device FLOOR: how many accelerators the attempt may not start
+// without. It is 0 or 1 and stays 0 or 1 on a wide pod, deliberately (cl-179).
+//
+// A width is not a floor. `JobDirective.device_count` is, in the runtime's own words, a
+// floor and never concurrency; a job is one bounded attempt over a derive-only view of its model
+// inputs — it shards nothing, so a job on a four-card pod needs one card and would be
+// refused by a floor of four. Sequence parallelism is a SERVING lane property expressed as
+// a device pin, not a job resource cap. What keeps a job off a wide pod is the selection
+// side, where a wide product is excluded for a job outright rather than bought and idled.
 func gpuCountOf(p *JobPlan) int64 {
 	if p.NeedsAccelerator {
 		return 1

@@ -30,7 +30,7 @@ func TestACapacityRefusalDoesNotSpendALife(t *testing.T) {
 	instance, _, e := o.c.EnsureWorker(spec)
 	fatal(t, e)
 	planID := planIDOf(t, spec)
-	fatal(t, o.c.EnsurePlacementReady(instance, planID))
+	fatal(t, o.c.EnsurePlacementReady(instance, planID, ""))
 
 	requestID, _, e := o.c.Submit(submission(planID, "fake/no-capacity", "crowded",
 		map[string]any{"n": 1}))

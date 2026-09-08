@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -25,6 +26,20 @@ import (
 // "Multi-GPU local": K independent placements on K lanes) has an owner — a wider envelope
 // with no pin refuses typed at the worker rather than idling cards (group-lanes ruling 3).
 func LocalDeviceEnvelope() []string { return []string{"0"} }
+
+// RentalDeviceEnvelope is the envelope a RENTED pod's worker holds: its width, spelled as
+// the ordinals its lanes index into. This daemon grants a rental nothing — the pod's cards
+// are the pod's, and its worker was launched over all of them by whoever provisioned it —
+// so this is not a grant but the paid WIDTH read back onto the same space a local grant
+// occupies, which is what lets one lane reader, one breach check and one pin author serve
+// both lanes. A CPU rental holds no device and gets no envelope.
+func RentalDeviceEnvelope(count int) []string {
+	out := make([]string, 0, count)
+	for ordinal := 0; ordinal < count; ordinal++ {
+		out = append(out, strconv.Itoa(ordinal))
+	}
+	return out
+}
 
 // seatLedger is one admission window as this owner sees it: the peer's last reported free
 // seats, minus this owner's reservations from choosing the window until its offer is

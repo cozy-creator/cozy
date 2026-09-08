@@ -81,7 +81,7 @@ func TestRentalBoardEscExits(t *testing.T) {
 	for i := range 12 {
 		id, machine := fmt.Sprintf("pr-board-%02d", i), fmt.Sprintf("machine%02d", i)
 		hub.add(id, machine)
-		fatal(t, store.RecordRental(records.Rental{
+		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 			ID: id, MachineName: machine, SKU: "cpu", AcceleratorModel: "CPU",
 			HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL,
 			Address: "127.0.0.1:1", CertPath: filepath.Join(root, id+".pem"),

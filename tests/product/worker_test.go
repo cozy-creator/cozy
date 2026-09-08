@@ -53,7 +53,7 @@ func TestWorkerRefusals(t *testing.T) {
 	}
 
 	planA := planIDOf(t, victim)
-	fatal(t, o.c.EnsurePlacementReady(instanceA, planA))
+	fatal(t, o.c.EnsurePlacementReady(instanceA, planA, ""))
 	factsA := o.c.Worker(instanceA)
 	if factsA.BootID == "" {
 		t.Fatal("worker A never claimed over raw protocol bytes")
@@ -123,7 +123,7 @@ func TestWorkerRefusals(t *testing.T) {
 	instanceB, _, e := o.c.EnsureWorker(badspec)
 	fatal(t, e)
 	planB := planIDOf(t, badspec)
-	fatal(t, o.c.EnsurePlacementReady(instanceB, planB))
+	fatal(t, o.c.EnsurePlacementReady(instanceB, planB, ""))
 	requestB, attemptB, e := o.c.Submit(submission(planB, "fake/badterminal", "idem-arms",
 		map[string]any{"arms": true}))
 	fatal(t, e)
@@ -159,7 +159,7 @@ func TestWorkerRefusals(t *testing.T) {
 	instanceC, _, e := o.c.EnsureWorker(missingSpec)
 	fatal(t, e)
 	planC := planIDOf(t, missingSpec)
-	fatal(t, o.c.EnsurePlacementReady(instanceC, planC))
+	fatal(t, o.c.EnsurePlacementReady(instanceC, planC, ""))
 	requestC, attemptC, e := o.c.Submit(submission(planC, "fake/missing-output",
 		"missing-output-1", map[string]any{"missing": true}))
 	fatal(t, e)
@@ -242,7 +242,7 @@ func TestDroppedOutcomeAck(t *testing.T) {
 	instance, _, e := o.c.EnsureWorker(spec)
 	fatal(t, e)
 	planID := planIDOf(t, spec)
-	fatal(t, o.c.EnsurePlacementReady(instance, planID))
+	fatal(t, o.c.EnsurePlacementReady(instance, planID, ""))
 	requestID, attempt, e := o.c.Submit(submission(planID, "fake/dropack", "dropack-1",
 		map[string]any{"dropack": true}))
 	fatal(t, e)

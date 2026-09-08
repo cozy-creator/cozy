@@ -71,7 +71,7 @@ func TestRentalFailureRecovery(t *testing.T) {
 		must(t, err)
 		must(t, os.WriteFile(filepath.Join(rentals, id+".creator.pem"),
 			pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o600))
-		fatal(t, store.RecordRental(records.Rental{
+		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 			ID: id, MachineName: machine, SKU: "cpu", AcceleratorModel: "CPU",
 			HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL,
 			Address: "127.0.0.1:1", CertPath: filepath.Join(rentals, id+".pem"),
@@ -211,7 +211,7 @@ func TestRentalFailureKeepsARecordedTerminal(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 
-	fatal(t, store.RecordRental(records.Rental{
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 		ID: "rental-terminal", MachineName: "gone", SKU: "cpu", AcceleratorModel: "CPU",
 		HourlyRateUSDMicros: 100_000, State: "ready", Hub: "http://127.0.0.1:1",
 		Address: "127.0.0.1:1", CertPath: filepath.Join(root, "rental-terminal.pem"),

@@ -44,7 +44,7 @@ func TestDaemonIdleShutdown(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	fatal(t, store.RecordRental(records.Rental{
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 		ID: "rental-idle-arm", MachineName: "heron",
 		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,
 		State: "release_requested", Hub: "https://hub.invalid",

@@ -60,7 +60,7 @@ func TestExplicitLaneWaitsForTheAttachingRentalAndNeverBuysAround(t *testing.T) 
 	fatal(t, problem)
 	defer store.Close()
 	// The user's H100, ready seconds ago and not yet attached: no address, no certificate.
-	yumichika := records.Rental{ID: "pr-yumichika", MachineName: "yumichika", SKU: "h100-80",
+	yumichika := records.Rental{AcceleratorCount: 1, ID: "pr-yumichika", MachineName: "yumichika", SKU: "h100-80",
 		AcceleratorModel: h100SXM, HourlyRateUSDMicros: 2_490_000, State: "ready", Hub: h.server.URL}
 	fatal(t, store.RecordRental(yumichika))
 	h.addReady(yumichika.ID, yumichika.MachineName, yumichika.AcceleratorModel, yumichika.HourlyRateUSDMicros)
@@ -150,9 +150,9 @@ func TestExplicitLaneReusesTheFittingRentalOverTheCheaperShortOne(t *testing.T) 
 	fatal(t, problem)
 	// Two attached rentals: the cheaper 4090 sorts first and used to win the rung tie.
 	for _, seed := range []records.Rental{
-		{ID: "pr-hairu", MachineName: "hairu", SKU: "rtx-4090", AcceleratorModel: "NVIDIA GeForce RTX 4090",
+		{AcceleratorCount: 1, ID: "pr-hairu", MachineName: "hairu", SKU: "rtx-4090", AcceleratorModel: "NVIDIA GeForce RTX 4090",
 			HourlyRateUSDMicros: 740_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
-		{ID: "pr-yumichika", MachineName: "yumichika", SKU: "h100-80", AcceleratorModel: h100SXM,
+		{AcceleratorCount: 1, ID: "pr-yumichika", MachineName: "yumichika", SKU: "h100-80", AcceleratorModel: h100SXM,
 			HourlyRateUSDMicros: 2_490_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
 	} {
 		fatal(t, store.RecordRental(seed))

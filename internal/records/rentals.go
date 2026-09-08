@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS rentals (
   machine_name      TEXT NOT NULL DEFAULT '',
   sku               TEXT NOT NULL DEFAULT '',
   accelerator_model TEXT NOT NULL,
+  accelerator_count INTEGER NOT NULL DEFAULT 0,
   hourly_rate_usd_micros INTEGER NOT NULL,
   managed_request_id TEXT NOT NULL DEFAULT '',
   address           TEXT NOT NULL,
@@ -420,10 +421,17 @@ func (s *Store) RequestRentalRelease(id string) (string, *exit.Error) {
 
 // Rental is one provider-neutral pod rental this client may attach a worker to.
 type Rental struct {
-	ID                  string
-	MachineName         string
-	SKU                 string
-	AcceleratorModel    string
+	ID               string
+	MachineName      string
+	SKU              string
+	AcceleratorModel string
+	// AcceleratorCount is this pod's WIDTH, as the hub reported it for the product that
+	// was PAID for. It is a first-class rental fact, not a detail of the SKU name: it is
+	// the device envelope this host grants the pod's worker, the degree a group placement
+	// on it is pinned to, and the count the worker's own readback must equal. A pod that
+	// delivers fewer cards than were bought is a billing fault, and without this column
+	// there is nothing to notice it against.
+	AcceleratorCount    int
 	HourlyRateUSDMicros int64
 	ManagedRequestID    string
 	Address             string
@@ -456,7 +464,11 @@ type RentalFailure struct {
 	ContainerState        string
 }
 
-const rentalCols = `id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at,failure_code,failure_image_digest,failure_provider,failure_provider_resource_id,failure_provider_host_id,failure_provider_state,failure_container_state`
+const rentalCols = `id,machine_name,sku,accelerator_model,accelerator_count,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at,failure_code,failure_image_digest,failure_provider,failure_provider_resource_id,failure_provider_host_id,failure_provider_state,failure_container_state`
+
+// rentalColsPriorThirtyThree is the released column list every schema before 33 carried:
+// the current one without the rental's width.
+var rentalColsPriorThirtyThree = strings.Replace(rentalCols, ",accelerator_count", "", 1)
 
 const rentalColsPriorTwentyOne = `id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at`
 
@@ -465,7 +477,7 @@ var rentalColsPriorThirteen = strings.TrimSuffix(rentalColsPriorTwentyOne, ",rea
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
-	err := row.Scan(&r.ID, &r.MachineName, &r.SKU, &r.AcceleratorModel,
+	err := row.Scan(&r.ID, &r.MachineName, &r.SKU, &r.AcceleratorModel, &r.AcceleratorCount,
 		&r.HourlyRateUSDMicros, &r.ManagedRequestID, &r.Address, &r.CertPath,
 		&r.State, &r.Hub, &r.RentedAt, &r.MediaAddress,
 		&r.ExpectedWorkerID, &r.ExpectedWorkerBootID, &r.ReadyAt,
@@ -477,6 +489,23 @@ func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 
 // RentalReadyState answers whether a hub state means the pod is booted and attachable.
 func RentalReadyState(state string) bool { return state == "ready" || state == "attached" }
+
+// rentalTerminalStates are the hub's words for a pod that will never take work again:
+// its acquisition failed, or the rental is being or has been given back. Every OTHER
+// word — the whole pre-ready lifecycle above, and any state this build does not yet
+// know — describes a machine that is, or may still be, on its way.
+//
+// The asymmetry is deliberate (cl-185). Refusing a placement needs PROOF that nothing
+// can ever fit; not holding proof that something WILL is a different statement, and
+// reading the second as the first is how a rental four minutes into its own boot came
+// to fail a run permanently while the pod it named went on to serve.
+var rentalTerminalStates = map[string]bool{
+	"failed": true, "release_requested": true, "released": true, "rejected": true,
+}
+
+// RentalTerminalState answers whether a hub state means the pod is finished, so a
+// request that would fit it must not wait for it.
+func RentalTerminalState(state string) bool { return rentalTerminalStates[state] }
 
 // RecordRental writes what the hub provisioned. It REPLACES on the rental id because the
 // id is the hub's, not this host's: re-reading a rental that moved from acquisition to
@@ -492,18 +521,22 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		return exit.Internalf("cannot begin recording rental %s: %s", r.ID, err)
 	}
 	defer tx.Rollback()
-	if r.MachineName == "" || r.SKU == "" || r.HourlyRateUSDMicros == 0 {
+	if r.MachineName == "" || r.SKU == "" || r.HourlyRateUSDMicros == 0 || r.AcceleratorCount == 0 {
 		var existingName, existingSKU string
 		var existingRate int64
+		var existingCount int
 		var existingManagedRequestID string
-		err := tx.QueryRow(`SELECT machine_name,sku,hourly_rate_usd_micros,managed_request_id FROM rentals WHERE id=?`, r.ID).
-			Scan(&existingName, &existingSKU, &existingRate, &existingManagedRequestID)
+		err := tx.QueryRow(`SELECT machine_name,sku,accelerator_count,hourly_rate_usd_micros,managed_request_id FROM rentals WHERE id=?`, r.ID).
+			Scan(&existingName, &existingSKU, &existingCount, &existingRate, &existingManagedRequestID)
 		if err == nil {
 			if r.MachineName == "" {
 				r.MachineName = existingName
 			}
 			if r.SKU == "" {
 				r.SKU = existingSKU
+			}
+			if r.AcceleratorCount == 0 {
+				r.AcceleratorCount = existingCount
 			}
 			if r.HourlyRateUSDMicros == 0 {
 				r.HourlyRateUSDMicros = existingRate
@@ -512,6 +545,11 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return exit.Internalf("cannot read rental %s local identity: %s", r.ID, err)
 		}
+	}
+	if r.AcceleratorCount < 1 {
+		return exit.Named(exit.Conflict, "rental.accelerator_count_missing",
+			"rental %s states no accelerator count", r.ID).
+			WithRemedy("upgrade Tensorhub before accepting a rental; a pod whose width is unknown cannot be attached")
 	}
 	if r.HourlyRateUSDMicros <= 0 {
 		return exit.Named(exit.Conflict, "rental.hourly_rate_missing",
@@ -550,10 +588,12 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.ReadyAt = now()
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 		  machine_name=CASE WHEN rentals.machine_name<>'' THEN rentals.machine_name ELSE excluded.machine_name END,
 		  sku=CASE WHEN rentals.sku<>'' THEN rentals.sku ELSE excluded.sku END,
+		  accelerator_count=CASE WHEN rentals.accelerator_count>0
+		    THEN rentals.accelerator_count ELSE excluded.accelerator_count END,
 		  hourly_rate_usd_micros=CASE WHEN excluded.hourly_rate_usd_micros>0
 		    THEN excluded.hourly_rate_usd_micros ELSE rentals.hourly_rate_usd_micros END,
 		  managed_request_id=rentals.managed_request_id,
@@ -573,7 +613,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		  failure_provider_host_id=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_provider_host_id ELSE excluded.failure_provider_host_id END,
 		  failure_provider_state=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_provider_state ELSE excluded.failure_provider_state END,
 		  failure_container_state=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_container_state ELSE excluded.failure_container_state END`,
-		r.ID, r.MachineName, r.SKU, r.AcceleratorModel, r.HourlyRateUSDMicros, r.ManagedRequestID,
+		r.ID, r.MachineName, r.SKU, r.AcceleratorModel, r.AcceleratorCount, r.HourlyRateUSDMicros, r.ManagedRequestID,
 		r.Address, r.CertPath, r.State, r.Hub,
 		r.RentedAt, r.MediaAddress, r.ExpectedWorkerID, r.ExpectedWorkerBootID, r.ReadyAt,
 		r.Failure.Code, r.Failure.BaseWorkerImageDigest, r.Failure.Provider,
@@ -586,6 +626,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		return exit.Internalf("cannot read back rental %s: %s", r.ID, err)
 	}
 	if stored.MachineName != r.MachineName || stored.SKU != r.SKU ||
+		stored.AcceleratorCount != r.AcceleratorCount ||
 		stored.HourlyRateUSDMicros != r.HourlyRateUSDMicros ||
 		stored.ManagedRequestID != r.ManagedRequestID ||
 		r.Address != "" && stored.Address != r.Address ||
@@ -595,7 +636,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.ExpectedWorkerBootID != "" && stored.ExpectedWorkerBootID != r.ExpectedWorkerBootID ||
 		r.Failure.Code != "" && stored.Failure != r.Failure {
 		return exit.Named(exit.Conflict, "rental.attach_projection_conflict",
-			"rental %s already carries another address, media address, certificate pin, or worker identity", r.ID)
+			"rental %s already carries another width, address, media address, certificate pin, or worker identity", r.ID)
 	}
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit rental %s: %s", r.ID, err)
@@ -627,14 +668,14 @@ func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
 	if err != nil {
 		return exit.Internalf("cannot read rental %s for worker observation: %s", id, err)
 	}
-	cpu := strings.EqualFold(row.AcceleratorModel, "CPU")
+	cpu := CPUAccelerator(row.AcceleratorModel)
 	complete := row.State == "ready" || row.State == "attached"
 	if cpu {
 		complete = complete && accelerator == "" && backend == "none" && count == 0 &&
 			driverVersion == "" && backendVersion == "" && deviceMemory == 0 &&
 			instance != "" && workerID != "" && bootID != ""
 	} else {
-		complete = complete && accelerator != "" && backend != "" && count == 1 &&
+		complete = complete && accelerator != "" && backend != "" && count > 0 &&
 			instance != "" && workerID != "" && bootID != ""
 	}
 	if !complete {
@@ -653,8 +694,24 @@ func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
 			id, accelerator, row.AcceleratorModel).
 			WithRemedy("release it; never invoke a model on hardware that disagrees with the paid selection")
 	}
+	// THE WIDTH IS READ BACK LIKE THE MODEL IS. It used to be asserted as one, which is
+	// how a four-card pod refused to attach at all; the honest check is that the pod
+	// delivers exactly the width that was bought. Fewer cards than paid for is a billing
+	// fault; more is a pod this host's envelope does not describe, and a placement pinned
+	// to the paid width would leave the surplus idle without saying so.
+	if !cpu && count != row.AcceleratorCount {
+		return exit.Named(exit.Conflict, "rental.accelerator_count_mismatch",
+			"rental %s worker reports %d accelerator(s) but the paid request bought %d",
+			id, count, row.AcceleratorCount).
+			WithRemedy("release it; never run on a pod that delivers a different width from the one being billed")
+	}
 	return nil
 }
+
+// CPUAccelerator answers whether a rental's paid accelerator model is the CPU product,
+// whose pod holds no device at all — so it reports no accelerator, grants no envelope,
+// and can host no device group however wide its `accelerator_count` reads.
+func CPUAccelerator(model string) bool { return strings.EqualFold(model, "CPU") }
 
 // RungMatches is a binding rung's gpu pattern against a machine's accelerator: the
 // literal "*" fits every machine, a host without an NVIDIA device included; anything

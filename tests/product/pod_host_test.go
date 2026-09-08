@@ -98,6 +98,11 @@ type fakePod struct {
 	preparedPlacement func([]byte, string, string) *pb.Placement
 	// slots is the advertised seat count while serving; zero means one.
 	slots uint32
+	// deviceCount is the width this pod's ClaimAck reports — how many accelerators the
+	// worker actually found. Zero reports one card, which is what every pod was until
+	// wide products became buyable. A test sets it to say what the PROVIDER delivered,
+	// which the owner holds against the width the rental was paid for (cl-179).
+	deviceCount uint32
 	// downloadSamples is how many DOWNLOADING events the prepare stream reports before
 	// it finishes. One is what a pod host that only reports the stage boundary sends;
 	// more is what one that reports while the bytes are moving sends. It exists so the
@@ -280,8 +285,8 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: &pb.ClaimAck{
 				RecordOwnerEpoch: m.Claim.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: podBootID,
 				Accepted: true, WireMinor: minor, WorkerId: podWorkerID, WorkerInstanceId: "inst-pod-1",
-				Resources: &pb.WorkerResources{Backend: "cuda", DeviceName: "fake-4090", DeviceCount: 1,
-					DeviceMemoryTotalBytes: 24 << 30},
+				Resources: &pb.WorkerResources{Backend: "cuda", DeviceName: "fake-4090",
+					DeviceCount: max(p.deviceCount, 1), DeviceMemoryTotalBytes: 24 << 30},
 			}}}); err != nil {
 				return err
 			}
@@ -688,7 +693,7 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 	t.Cleanup(server.Stop)
 	rev := mediawire.ContractRev
 	mediaRoot := filepath.Join(root, "pod-media")
-	mediaPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mediaPlane := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/health":
 			_ = json.NewEncoder(w).Encode(mediawire.Health{Service: mediawire.Service, ContractRev: &rev})
@@ -710,11 +715,20 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
+	mediaPlane.TLS = &tls.Config{MinVersion: tls.VersionTLS12,
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
+	mediaPlane.StartTLS()
 	t.Cleanup(mediaPlane.Close)
 	return &orchestrator.WorkerConnection{
 		RentalID: podRental, Addr: listener.Addr().String(), CACert: pemPath,
 		WorkerID: podWorkerID, WorkerBootID: podBootID,
-		Media: &media.Spec{Addr: strings.TrimPrefix(mediaPlane.URL, "http://"), Token: secret.New("media-token")},
+		// ONE PROVISIONED IDENTITY, TWO LISTENERS: the byte plane presents the SAME pinned
+		// leaf as the control leg, which is the shape `rental.Resolver` resolves in
+		// production — it hands the media client the rental's pinned certificate, so a
+		// plain-http harness plane would be a leg this suite exercises and the daemon never
+		// does.
+		Media: &media.Spec{Addr: strings.TrimPrefix(mediaPlane.URL, "https://"),
+			Token: secret.New("media-token"), CACert: pemPath},
 	}, pemPath
 }
 

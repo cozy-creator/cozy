@@ -70,11 +70,11 @@ func TestPackageReleaseRequirementsBindExactInterface(t *testing.T) {
 // running CPU Torch; `python3.12-cpu-linux-x86` is the torch-free one.
 func offeredSKUs() []hub.RentalSKU {
 	return []hub.RentalSKU{
-		{Name: "rtx-4090", AcceleratorModel: "RTX 4090", PriceUSDMicrosPerHour: 740_000,
+		{Name: "rtx-4090", AcceleratorModel: "RTX 4090", AcceleratorCount: 1, PriceUSDMicrosPerHour: 740_000,
 			BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"},
-		{Name: "cpu-torch", AcceleratorModel: "CPU", PriceUSDMicrosPerHour: 90_000,
+		{Name: "cpu-torch", AcceleratorModel: "CPU", AcceleratorCount: 1, PriceUSDMicrosPerHour: 90_000,
 			BaseWorkerProfile: "torch2.13.0-cpu-cp312-linux-x86"},
-		{Name: "cpu", AcceleratorModel: "CPU", PriceUSDMicrosPerHour: 70_000,
+		{Name: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, PriceUSDMicrosPerHour: 70_000,
 			BaseWorkerProfile: "python3.12-cpu-linux-x86"},
 	}
 }
@@ -112,7 +112,7 @@ func TestReleaseRefusedBeforeRentalSpend(t *testing.T) {
 		{
 			name:         "torch-free accelerator base",
 			requirements: []string{"torch<3,>=2.13"},
-			skus: []hub.RentalSKU{{Name: "rtx-4090", AcceleratorModel: "RTX 4090",
+			skus: []hub.RentalSKU{{Name: "rtx-4090", AcceleratorModel: "RTX 4090", AcceleratorCount: 1,
 				PriceUSDMicrosPerHour: 740_000, BaseWorkerProfile: "python3.12-cpu-linux-x86"}},
 			wantMismatch: "this base carries no Torch",
 		},
@@ -125,7 +125,7 @@ func TestReleaseRefusedBeforeRentalSpend(t *testing.T) {
 		{
 			name:         "an unreadable label decides nothing",
 			requirements: []string{"torch<3,>=2.14"},
-			skus: []hub.RentalSKU{{Name: "rtx-4090", AcceleratorModel: "RTX 4090",
+			skus: []hub.RentalSKU{{Name: "rtx-4090", AcceleratorModel: "RTX 4090", AcceleratorCount: 1,
 				PriceUSDMicrosPerHour: 740_000, BaseWorkerProfile: "some-future-spelling"}},
 			wantSKU: "rtx-4090",
 		},
@@ -163,7 +163,7 @@ func TestSameSpecStorageAdderLeavesRankingUnchanged(t *testing.T) {
 			skus[i].StorageUSDMicrosPerHour = 213_504
 		}
 	}
-	skus = append(skus, hub.RentalSKU{Name: "l4", AcceleratorModel: "NVIDIA L4",
+	skus = append(skus, hub.RentalSKU{Name: "l4", AcceleratorModel: "NVIDIA L4", AcceleratorCount: 1,
 		PriceUSDMicrosPerHour: 490_000, StorageUSDMicrosPerHour: 213_504,
 		BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"})
 	sku, _, mismatch, ok := choose(skus, true, rental.Constraints{})
@@ -172,7 +172,7 @@ func TestSameSpecStorageAdderLeavesRankingUnchanged(t *testing.T) {
 	}
 	// Different adders DO reorder by true cost: a cheap card on a bloated spec
 	// loses to a dearer card whose pod bills less in total.
-	skus = append(skus, hub.RentalSKU{Name: "l4-bloated", AcceleratorModel: "NVIDIA L4",
+	skus = append(skus, hub.RentalSKU{Name: "l4-bloated", AcceleratorModel: "NVIDIA L4", AcceleratorCount: 1,
 		PriceUSDMicrosPerHour: 480_000, StorageUSDMicrosPerHour: 300_000,
 		BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"})
 	sku, _, _, ok = choose(skus, true, rental.Constraints{})

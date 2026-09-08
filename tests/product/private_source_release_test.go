@@ -49,7 +49,7 @@ func TestPrivateSourceCancellationWaitsForOriginalHostRelease(t *testing.T) {
 	o := hostOwner(t, "private-source-release", rentalWiring(connection, private))
 	// Release blocked RPCs before hostOwner's cleanup waits for sessions to end.
 	t.Cleanup(release)
-	fatal(t, o.store.RecordRental(records.Rental{ID: podRental, MachineName: "otter", State: "ready",
+	fatal(t, o.store.RecordRental(records.Rental{AcceleratorCount: 1, ID: podRental, MachineName: "otter", State: "ready",
 		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,
 		Address: connection.Addr, CertPath: connection.CACert,
 		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))

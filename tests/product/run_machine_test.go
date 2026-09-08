@@ -34,7 +34,7 @@ func TestRunListMachineColumn(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	fatal(t, store.RecordRental(records.Rental{
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 		ID: "pr-machine-column", MachineName: "otter", SKU: "cpu", AcceleratorModel: "CPU",
 		HourlyRateUSDMicros: 100_000, State: "ready", Hub: "http://127.0.0.1:1",
 		Address: "127.0.0.1:1", CertPath: filepath.Join(root, "pr-machine-column.pem"),

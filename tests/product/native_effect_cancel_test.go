@@ -253,6 +253,7 @@ func TestNativeEffectCancellationMigrationPreservesExecutingIntent(t *testing.T)
 	must(t, err)
 	_, err = db.Exec(`DROP TABLE prior32`)
 	must(t, err)
+	revertRentalsBeforeWidth(t, db)
 	for _, statement := range []string{`DROP TABLE byte_outputs`, `ALTER TABLE requests DROP COLUMN capture`, `ALTER TABLE native_artifact_retentions DROP COLUMN artifact_kind`, `ALTER TABLE native_artifact_retentions DROP COLUMN producer_attempt`, `ALTER TABLE native_artifact_retentions DROP COLUMN producer_output_id`, `ALTER TABLE native_artifact_retentions DROP COLUMN content_bytes`} {
 		_, err = db.Exec(statement)
 		must(t, err)

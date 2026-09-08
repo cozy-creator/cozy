@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -323,6 +324,15 @@ func (c *Orchestrator) setDesiredUnavailable(w *worker, seq uint64, e *exit.Erro
 func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, label string, prepared *pb.DesiredPlacementSet) {
 	setBytes := append([]byte(nil), prepared.PlacementSetCanonicalBytes...)
 	digest := append([]byte(nil), prepared.PlacementSetDigest...)
+	// THE WIDTH IS AUTHORED HERE TOO. This is the rental's own convergence path — the pod
+	// prepared its own bytes and this owner relays them — so the device pin has to be
+	// authored over the SAME rule as a locally prepared set, or a wide pod would take a
+	// placement with no pin and refuse `device_group_unsupported` after the hour started.
+	pins, problem := devicePins(setBytes, w.spec.Devices)
+	if problem != nil {
+		c.setDesiredRefusal(w, seq, problem)
+		return
+	}
 	c.mu.Lock()
 	if w.hostPrepareSeq != seq {
 		c.mu.Unlock()
@@ -335,14 +345,16 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID,
 		Revision: rev, WireMinor: pb.WireMinor, Posture: pb.Posture_POSTURE_ACCEPTING,
 		Mode: &pb.DesiredWorkerState_PlacementSet{PlacementSet: &pb.DesiredPlacementSet{
-			PlacementSetDigest: digest, PlacementSetCanonicalBytes: setBytes}},
+			PlacementSetDigest: digest, PlacementSetCanonicalBytes: setBytes, DevicePins: pins}},
 	}
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}}) {
 		c.logf("PodHost prepare %s#%d: control stream closed before the placement_set send", label, seq)
 		return
 	}
-	c.logf("DesiredWorkerState revision=%d placement_set=%s (%d canonical bytes, prepared by the host as %s) -> %s",
-		rev, shortDigest(shortNone(digest)), len(setBytes), label, s.bootID)
+	c.logf("DesiredWorkerState revision=%d placement_set=%s (%d canonical bytes, prepared by the host as %s) "+
+		"envelope=[%s] pins=%d -> %s",
+		rev, shortDigest(shortNone(digest)), len(setBytes), label,
+		strings.Join(w.spec.Devices, ","), len(pins), s.bootID)
 }
 
 func hostLabel(kind, id string) string { return fmt.Sprintf("%s(%s)", kind, id) }

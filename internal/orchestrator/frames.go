@@ -348,6 +348,7 @@ func cloneModelRefs(in []*pb.DownloadModelRef) []*pb.DownloadModelRef {
 
 func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlacement) *exit.Error {
 	var setBytes, digest []byte
+	var pins []*pb.PlacementDevicePin
 	if len(placements) == 1 {
 		p := placements[0]
 		declared, err := canonical.Raw(p.PlacementSetDigest)
@@ -362,6 +363,11 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 				"the persisted PlacementSet does not name placement %s: %v", p.PlacementID(), err)
 		}
 		setBytes, digest = append([]byte(nil), p.PlacementSetBytes...), append([]byte(nil), declared...)
+		authored, problem := devicePins(setBytes, w.spec.Devices)
+		if problem != nil {
+			return problem
+		}
+		pins = authored
 	} else {
 		var err error
 		setBytes, digest, err = canonical.Identity(&pb.PlacementSet{})
@@ -378,12 +384,10 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 	d := &pb.DesiredWorkerState{
 		Revision: rev, WireMinor: pb.WireMinor,
 		Posture: pb.Posture_POSTURE_ACCEPTING,
-		// No `device_pins` (proto-024): this owner grants a one-device envelope, and width
-		// 1 pins nothing — the worker assigns the lane by measured fit. Where the pin lives
-		// and who authors a wider one are open group-lanes rulings, not this owner's call.
 		Mode: &pb.DesiredWorkerState_PlacementSet{PlacementSet: &pb.DesiredPlacementSet{
 			PlacementSetDigest:         digest,
 			PlacementSetCanonicalBytes: setBytes,
+			DevicePins:                 pins,
 		}},
 	}
 	if len(placements) == 0 {
@@ -394,10 +398,57 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 	}
 	d.RecordOwnerEpoch, d.ControlStreamEpoch, d.WorkerBootId = recordOwnerEpoch, s.epoch, s.bootID
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}})
-	c.logf("DesiredWorkerState revision=%d posture=%s placements=%d set=%s (%d canonical bytes) -> %s",
+	c.logf("DesiredWorkerState revision=%d posture=%s placements=%d set=%s (%d canonical bytes) "+
+		"envelope=[%s] pins=%d -> %s",
 		rev, trimEnum(pb.Posture_name[int32(d.Posture)], "POSTURE_"), len(placements),
-		shortDigest(shortNone(digest)), len(setBytes), s.bootID)
+		shortDigest(shortNone(digest)), len(setBytes), strings.Join(w.spec.Devices, ","),
+		len(d.GetPlacementSet().GetDevicePins()), s.bootID)
 	return nil
+}
+
+// devicePins authors proto-024's `device_pins`: WHERE this owner puts each placement on
+// this worker's devices. It is the whole of Creator's authorship of width.
+//
+// The rule is one line because the width is a property of the machine, not of a request: a
+// model-bearing placement on a K-device envelope is pinned to ALL K ordinals, which fuses
+// one group lane of degree K advertising ONE seat. There is nothing to choose. The renter
+// bought K cards; the package declares which degrees it can shard at; the worker joins the
+// two and refuses `device_group_unsupported` when they disagree, which is a typed refusal
+// against a machine that is already paid for rather than a silent success that idles K-1
+// cards (group-lanes ruling 3). A degree is never a request parameter and never a fallback.
+//
+// Width 1 pins nothing: one envelope device is one lane and the worker assigns it by
+// measured fit, which is the behaviour every worker had before there was a wider one. A
+// weightless placement is never pinned to a group either — a group shards a model's
+// attention and there is no model — so it stays on the worker's own least-loaded lane.
+//
+// Weight is read from the SET, never from a projection beside it: `models` in the exact
+// document the worker is about to accept is the same fact the worker's own
+// `model_bearing` is folded from, and Creator supports exactly one placement per set.
+func devicePins(setBytes []byte, envelope []string) ([]*pb.PlacementDevicePin, *exit.Error) {
+	if len(envelope) < 2 {
+		return nil, nil
+	}
+	doc, err := canonical.Read(setBytes, &pb.PlacementSet{})
+	if err != nil || len(doc.List("placements")) != 1 {
+		// REFUSE, never send an unpinned wide set. A placement the owner cannot read is a
+		// placement it cannot pin, and an unpinned model-bearing placement on a wide
+		// envelope is either K-1 idle paid cards or a typed worker refusal — never the
+		// group the renter bought.
+		return nil, exit.Named(exit.Conflict, "placement_set_unpinnable",
+			"a %d-device rental needs one readable placement to pin: %v", len(envelope), err)
+	}
+	placement := doc.List("placements")[0]
+	if len(placement.List("models")) == 0 {
+		return nil, nil
+	}
+	ordinals := make([]uint32, 0, len(envelope))
+	for ordinal := range envelope {
+		ordinals = append(ordinals, uint32(ordinal))
+	}
+	return []*pb.PlacementDevicePin{{
+		PlacementId: placement.Str("placement_id"), DeviceOrdinals: ordinals,
+	}}, nil
 }
 
 // ------------------------------------------------------------------- observed state

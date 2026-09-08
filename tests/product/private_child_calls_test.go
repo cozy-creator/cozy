@@ -108,6 +108,7 @@ func TestPrivateChildSchemaUpgradePreservesPriorOwnership(t *testing.T) {
 	must(t, err)
 	_, err = db.Exec(`DROP TABLE native_calls`)
 	must(t, err)
+	revertRentalsBeforeWidth(t, db)
 	_, err = db.Exec(`PRAGMA user_version=27`)
 	must(t, err)
 	db.Close()

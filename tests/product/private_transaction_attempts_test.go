@@ -34,7 +34,7 @@ func TestPrivateTransactionPauseFencesAttemptBeforeResume(t *testing.T) {
 	}
 	connection, _ := startFakePod(t, t.TempDir(), pod)
 	o := hostOwner(t, "private-transaction-attempts", rentalWiring(connection, private))
-	fatal(t, o.store.RecordRental(records.Rental{ID: podRental, MachineName: "otter", State: "ready",
+	fatal(t, o.store.RecordRental(records.Rental{AcceleratorCount: 1, ID: podRental, MachineName: "otter", State: "ready",
 		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,
 		Address: connection.Addr, CertPath: connection.CACert,
 		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))

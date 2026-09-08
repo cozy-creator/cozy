@@ -141,7 +141,7 @@ func ordinaryScheduledCheckpoint(t *testing.T) {
 	o := hostOwner(t, "ordinary-checkpoint-"+records.NewID("proof"), configure)
 	o.cfg.HubURL = *publicationHub
 	o.cfg.RentalsMaxHourlySpendUSDMicros = 20_000_000
-	fatal(t, o.store.RecordRental(records.Rental{ID: podRental, MachineName: "ordinary-proof", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, State: "ready", Hub: *publicationHub, Address: bridge.Address, CertPath: certificate, ExpectedWorkerID: bridge.WorkerID, ExpectedWorkerBootID: bridge.WorkerBootID}))
+	fatal(t, o.store.RecordRental(records.Rental{AcceleratorCount: 1, ID: podRental, MachineName: "ordinary-proof", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, State: "ready", Hub: *publicationHub, Address: bridge.Address, CertPath: certificate, ExpectedWorkerID: bridge.WorkerID, ExpectedWorkerBootID: bridge.WorkerBootID}))
 	// Copy only the enrolled credential for this exact Hub into the isolated CLI
 	// home; neither private key nor bearer enters the worker or the test output.
 	authDir := filepath.Join(o.root, "auth")
