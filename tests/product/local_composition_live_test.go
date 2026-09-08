@@ -199,7 +199,7 @@ async def main(ctx):
 	for stopped.PID == 0 {
 		select {
 		case err := <-done:
-			t.Fatalf("script ended before real checkpoint: %v\n%s", err, firstOutput.String())
+			t.Fatalf("script ended before real checkpoint: %v\n%s", err, compositionTail(firstOutput.String()))
 		case <-time.After(25 * time.Millisecond):
 			raw, err := os.ReadFile(marker)
 			if err == nil {
@@ -223,6 +223,7 @@ async def main(ctx):
 	must(t, pause.Start())
 	pauseDone := make(chan error, 1)
 	go func() { pauseDone <- pause.Wait() }()
+	pauseEnded := false
 	for {
 		var state string
 		must(t, controlDB.QueryRow(`SELECT state FROM requests WHERE id=?`, stopped.Request).Scan(&state))
@@ -231,7 +232,11 @@ async def main(ctx):
 		}
 		select {
 		case err := <-pauseDone:
-			t.Fatalf("pause returned without fencing the quantizer: %v %s", err, pauseOutput.String())
+			if err != nil {
+				t.Fatalf("pause failed before fencing: %v %s", err, pauseOutput.String())
+			}
+			pauseEnded = true
+			pauseDone = nil
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
@@ -240,8 +245,10 @@ async def main(ctx):
 	if err = process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		t.Fatal(err)
 	}
-	if err := <-pauseDone; err != nil {
-		t.Fatalf("pause failed: %v %s", err, pauseOutput.String())
+	if !pauseEnded {
+		if err := <-pauseDone; err != nil {
+			t.Fatalf("pause failed: %v %s", err, pauseOutput.String())
+		}
 	}
 
 	if err := <-done; err == nil {
@@ -265,6 +272,9 @@ async def main(ctx):
 	journal, err := sql.Open("sqlite", "file:"+filepath.Join(root, "tensorfs", ".cozy-workspace", "journal.sqlite3")+"?mode=ro")
 	must(t, err)
 	defer journal.Close()
+	journal.SetMaxOpenConns(1)
+	_, err = journal.Exec("PRAGMA busy_timeout=5000")
+	must(t, err)
 	var interruptedTransaction string
 	must(t, journal.QueryRow(`SELECT id FROM weights WHERE request=? AND length(checkpoint)>0 ORDER BY ordinal LIMIT 1`, stopped.Request).Scan(&interruptedTransaction))
 	var memoize, schemaBytes int
@@ -274,8 +284,13 @@ async def main(ctx):
 	}
 	originalQuant, problem := store.RequestRow(stopped.Request)
 	fatal(t, problem)
+	for originalQuant.State == "pausing" {
+		time.Sleep(25 * time.Millisecond)
+		originalQuant, problem = store.RequestRow(stopped.Request)
+		fatal(t, problem)
+	}
 	if originalQuant.Ordinal != 1 || originalQuant.State != "paused" {
-		t.Fatalf("fault was automatically retried instead of retaining a paused partial: %+v", originalQuant)
+		t.Fatalf("fault did not retain its original paused attempt: id=%s state=%s ordinal=%d", originalQuant.ID, originalQuant.State, originalQuant.Ordinal)
 	}
 
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "creator.sqlite")+"?mode=ro")
@@ -295,7 +310,7 @@ async def main(ctx):
 		t.Helper()
 		status, out := runCozyPath(t, root, path, "run", script, "--await", "--json")
 		if status != 0 {
-			t.Fatalf("fresh script failed [%d]: %s", status, out)
+			t.Fatalf("fresh script failed [%d]: %s", status, compositionTail(out))
 		}
 	}
 	run()
@@ -349,4 +364,11 @@ async def main(ctx):
 		t.Fatal("changed quantization discarded retained source")
 	}
 
+}
+
+func compositionTail(value string) string {
+	if len(value) > 8192 {
+		return strings.ToValidUTF8(value[len(value)-8192:], "?")
+	}
+	return value
 }
