@@ -9,7 +9,6 @@ import (
 	"image/color"
 	"image/png"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -76,9 +75,7 @@ func TestRetainedRenderBindingRejectsChangedWorkloadAndArmEvidence(t *testing.T)
 		Digest     string `json:"digest"`
 	}{"proof.render", assessmentDigest(workload)})
 	info.Subject.Arms = map[string]assessment.RenderArm{}
-	info.Environment = map[string]struct {
-		WorkerBootID string `json:"worker_boot_id"`
-	}{}
+	info.Environment = map[string]assessment.Environment{}
 	for i, name := range []string{"reference", "repeat", "candidate"} {
 		id := "render-" + name
 		checkpoint := info.Subject.Reference
@@ -104,9 +101,7 @@ func TestRetainedRenderBindingRejectsChangedWorkloadAndArmEvidence(t *testing.T)
 		_, problem = st.AcceptTerminal(records.Terminal{RequestID: id, Attempt: ordinal, SessionID: "boot", InvocationDigest: assessmentDigest(spec), TerminalID: "out-" + id, TerminalDigest: assessmentDigest(terminal), Status: "SUCCEEDED", Body: terminal, RequestState: "succeeded"})
 		assessmentRecord(t, problem)
 		info.Subject.Arms[name] = assessment.RenderArm{Checkpoint: checkpoint, Requests: []string{id}, Media: []string{assessmentDigest(media)}}
-		info.Environment[name] = struct {
-			WorkerBootID string `json:"worker_boot_id"`
-		}{"boot"}
+		info.Environment[name] = assessment.Environment{WorkerBootID: "boot"}
 	}
 	assertRefused := func(label string, altered assessment.RenderInspection, preimages []byte) {
 		t.Helper()
@@ -134,9 +129,7 @@ func TestRetainedRenderBindingRejectsChangedWorkloadAndArmEvidence(t *testing.T)
 		case "checkpoint":
 			arm.Checkpoint = info.Subject.Reference
 		case "boot":
-			changed.Environment["candidate"] = struct {
-				WorkerBootID string `json:"worker_boot_id"`
-			}{"other-boot"}
+			changed.Environment["candidate"] = assessment.Environment{WorkerBootID: "other-boot"}
 		case "repeat_request":
 			repeat := changed.Subject.Arms["repeat"]
 			repeat.Requests = changed.Subject.Arms["reference"].Requests
@@ -185,13 +178,9 @@ func TestAssessmentV3InspectorIdentityBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := exec.CommandContext(t.Context(), evaluator, "report", "inspect")
-	command.Env = []string{"PYTHONNOUSERSITE=1"}
-	command.Stdin = bytes.NewReader(report) //cozy:stdin-value — exact held report bytes, never interactive input
-	inspected, err := command.Output()
-	if err != nil {
-		t.Fatal("the actual @3 report reader refused the banked fixture")
-	}
+	t.Setenv("PATH", filepath.Dir(evaluator))
+	inspected, problem := assessment.Inspect(t.Context(), report, []string{"PYTHONNOUSERSITE=1"})
+	assessmentRecord(t, problem)
 	info, problem := assessment.ReadRenderInspection(report, inspected)
 	assessmentRecord(t, problem)
 	if info.Report.Digest != assessmentDigest(report) || info.Verdict != "pass" || len(info.Subject.Arms) != 3 {

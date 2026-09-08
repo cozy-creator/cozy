@@ -29,10 +29,11 @@ type RenderInspection struct {
 		} `json:"workloads"`
 		Arms map[string]RenderArm `json:"arms"`
 	} `json:"subject"`
-	Environment map[string]struct {
-		WorkerBootID string `json:"worker_boot_id"`
-	} `json:"environment"`
-	Verdict string `json:"publisher_reported_verdict"`
+	Environment     map[string]Environment `json:"environment"`
+	Verdict         string                 `json:"publisher_reported_verdict"`
+	Required        []string               `json:"required"`
+	SamePod         bool                   `json:"same_pod"`
+	SamePodRequired bool                   `json:"same_pod_required"`
 }
 
 type RenderArm struct {
@@ -68,6 +69,22 @@ func ReadRenderInspection(report, inspected []byte) (RenderInspection, *exit.Err
 		len(out.Subject.Arms) != 3 || len(out.Environment) != 3 {
 		return out, renderRefusal()
 	}
+
+	var envelope struct {
+		Body struct {
+			Environment map[string]Environment `json:"environment"`
+		} `json:"body"`
+	}
+	if json.Unmarshal(report, &envelope) != nil || len(envelope.Body.Environment) != 3 {
+		return out, renderRefusal()
+	}
+	for arm, projected := range out.Environment {
+		full, ok := envelope.Body.Environment[arm]
+		if !ok || !sameProjection(projected, full) {
+			return out, renderRefusal()
+		}
+	}
+	out.Environment = envelope.Body.Environment
 	switch out.Verdict {
 	case "pass", "fail", "indeterminate":
 	default:
@@ -168,7 +185,11 @@ func VerifyRenderBindings(st *records.Store, parentID string, info RenderInspect
 				!request.IsJob() || request.State != "succeeded" || request.ChildReusable || request.ReusedFrom != "" || len(request.Models) != 1 || request.Models[0].Manifest != checkpoint {
 				return nil, renderRefusal()
 			}
-			identity, _ := json.Marshal(map[string]any{"interface_digest": target.binding.InterfaceDigest, "module": target.binding.Module, "export": target.binding.Export, "request": json.RawMessage(request.Payload)})
+			intent := map[string]any{"interface_digest": target.binding.InterfaceDigest, "module": target.binding.Module, "export": target.binding.Export, "request": json.RawMessage(request.Payload)}
+			if request.Capture != "" {
+				intent["capture"] = json.RawMessage(request.Capture)
+			}
+			identity, _ := json.Marshal(intent)
 			identity, err = canonical.NormalizeJCS(identity)
 			if err != nil || spell(identity) != request.ChildIntentDigest {
 				return nil, renderRefusal()
