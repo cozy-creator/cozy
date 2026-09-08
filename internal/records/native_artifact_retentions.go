@@ -11,24 +11,24 @@ const nativeArtifactRetentionsDDL = `CREATE TABLE IF NOT EXISTS native_artifact_
  consumer_id TEXT NOT NULL, parent_request_id TEXT NOT NULL REFERENCES requests(id),
  kind TEXT NOT NULL CHECK(kind IN ('input','result','effect')),slot TEXT NOT NULL,
  producer_id TEXT NOT NULL, manifest_id TEXT NOT NULL, manifest_length INTEGER NOT NULL,
- receipt_digest TEXT NOT NULL, transaction_id TEXT NOT NULL, owner_request_id TEXT NOT NULL,
+ receipt_digest TEXT NOT NULL, transaction_id TEXT NOT NULL, owner_request_id TEXT NOT NULL, owner_worker TEXT NOT NULL,
  retention_id TEXT NOT NULL UNIQUE, instance_id TEXT NOT NULL DEFAULT '',worker_boot_id TEXT NOT NULL DEFAULT '',
  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','held','releasing','released')),
  PRIMARY KEY(consumer_id,kind,slot)
 )`
 
 type NativeArtifactRetention struct {
-	ConsumerID, ParentRequestID, Kind, Slot                                                    string
-	ProducerID, ManifestID                                                                     string
-	ManifestLength                                                                             int64
-	ReceiptDigest, TransactionID, OwnerRequestID, RetentionID, InstanceID, WorkerBootID, State string
+	ConsumerID, ParentRequestID, Kind, Slot                                                                 string
+	ProducerID, ManifestID                                                                                  string
+	ManifestLength                                                                                          int64
+	ReceiptDigest, TransactionID, OwnerRequestID, OwnerWorker, RetentionID, InstanceID, WorkerBootID, State string
 }
 
-const nativeArtifactCols = `consumer_id,parent_request_id,kind,slot,producer_id,manifest_id,manifest_length,receipt_digest,transaction_id,owner_request_id,retention_id,instance_id,worker_boot_id,state`
+const nativeArtifactCols = `consumer_id,parent_request_id,kind,slot,producer_id,manifest_id,manifest_length,receipt_digest,transaction_id,owner_request_id,owner_worker,retention_id,instance_id,worker_boot_id,state`
 
 func scanNativeArtifact(row interface{ Scan(...any) error }) (NativeArtifactRetention, error) {
 	var h NativeArtifactRetention
-	err := row.Scan(&h.ConsumerID, &h.ParentRequestID, &h.Kind, &h.Slot, &h.ProducerID, &h.ManifestID, &h.ManifestLength, &h.ReceiptDigest, &h.TransactionID, &h.OwnerRequestID, &h.RetentionID, &h.InstanceID, &h.WorkerBootID, &h.State)
+	err := row.Scan(&h.ConsumerID, &h.ParentRequestID, &h.Kind, &h.Slot, &h.ProducerID, &h.ManifestID, &h.ManifestLength, &h.ReceiptDigest, &h.TransactionID, &h.OwnerRequestID, &h.OwnerWorker, &h.RetentionID, &h.InstanceID, &h.WorkerBootID, &h.State)
 	return h, err
 }
 
@@ -63,7 +63,7 @@ func reserveNativeArtifactTx(tx *sql.Tx, consumerID, parentID, kind, slot string
 		return NativeArtifactRetention{}, exit.Named(exit.Conflict, "child.artifact_scope", "native artifact was not received in this private scope")
 	}
 	id := ArtifactRetentionID(consumerID, kind, slot, artifact)
-	_, err = tx.Exec(`INSERT INTO native_artifact_retentions(consumer_id,parent_request_id,kind,slot,producer_id,manifest_id,manifest_length,receipt_digest,transaction_id,owner_request_id,retention_id) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(consumer_id,kind,slot) DO NOTHING`, consumerID, parentID, kind, slot, artifact.ProducerRequestID, artifact.Manifest.Digest, artifact.Manifest.Length, artifact.TensorFSReceiptDigest, source.TransactionID, source.OwnerRequestID, id)
+	_, err = tx.Exec(`INSERT INTO native_artifact_retentions(consumer_id,parent_request_id,kind,slot,producer_id,manifest_id,manifest_length,receipt_digest,transaction_id,owner_request_id,owner_worker,retention_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(consumer_id,kind,slot) DO NOTHING`, consumerID, parentID, kind, slot, artifact.ProducerRequestID, artifact.Manifest.Digest, artifact.Manifest.Length, artifact.TensorFSReceiptDigest, source.TransactionID, source.OwnerRequestID, source.Worker, id)
 	if err != nil {
 		return NativeArtifactRetention{}, exit.Internalf("cannot reserve native artifact: %s", err)
 	}

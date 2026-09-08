@@ -54,7 +54,7 @@ func nativeArtifactSource(q artifactQuery, artifact ModelArtifact) (*ArtifactSou
 	if _, err := canonical.Raw(identity.TransactionID); err != nil {
 		return nil, exit.Named(exit.Conflict, "child.artifact_provenance_lost", "native receipt has no exact transaction")
 	}
-	return &ArtifactSource{Artifact: artifact, OwnerRequestID: call.ParentRequestID, NativeServiceID: call.ID, TransactionID: identity.TransactionID, NativeReceipt: receipt}, nil
+	return &ArtifactSource{Artifact: artifact, OwnerRequestID: call.ParentRequestID, Worker: call.Worker, NativeServiceID: call.ID, TransactionID: identity.TransactionID, NativeReceipt: receipt}, nil
 }
 
 func (s *Store) ResolveArtifactSource(artifact ModelArtifact) (*ArtifactSource, *exit.Error) {
@@ -84,11 +84,11 @@ func nativeArtifactAllowed(q artifactQuery, parent Request, artifact ModelArtifa
 	}
 	var allowed bool
 	err = q.QueryRow(`SELECT EXISTS(SELECT 1 FROM native_calls n JOIN requests r ON r.id=n.parent_request_id
-        WHERE n.kind='source' AND n.state='succeeded' AND n.result=? AND r.worker=? AND r.reuse_scope=?
+        WHERE n.kind='source' AND n.state='succeeded' AND n.result=? AND n.worker=? AND r.worker=n.worker AND r.reuse_scope=?
         AND r.state NOT IN ('canceling','canceled','releasing'))
         OR EXISTS(SELECT 1 FROM native_artifact_retentions h JOIN requests r ON r.id=h.parent_request_id
         WHERE h.producer_id=? AND h.manifest_id=? AND h.receipt_digest=? AND h.state='held'
-        AND r.worker=? AND r.reuse_scope=? AND r.state NOT IN ('canceling','canceled','releasing'))`, raw, parent.Worker, parent.ReuseScope, artifact.ProducerRequestID, artifact.Manifest.Digest, artifact.TensorFSReceiptDigest, parent.Worker, parent.ReuseScope).Scan(&allowed)
+        AND h.owner_worker=? AND r.worker=h.owner_worker AND r.reuse_scope=? AND r.state NOT IN ('canceling','canceled','releasing'))`, raw, parent.Worker, parent.ReuseScope, artifact.ProducerRequestID, artifact.Manifest.Digest, artifact.TensorFSReceiptDigest, parent.Worker, parent.ReuseScope).Scan(&allowed)
 	if err != nil {
 		return false, exit.Internalf("cannot authorize native artifact scope: %s", err)
 	}
