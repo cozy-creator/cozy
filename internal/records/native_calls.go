@@ -20,12 +20,14 @@ const nativeCallsDDL = `CREATE TABLE IF NOT EXISTS native_calls (
  safe_code TEXT NOT NULL DEFAULT '', worker TEXT NOT NULL DEFAULT '',
  instance_id TEXT NOT NULL DEFAULT '', worker_boot_id TEXT NOT NULL DEFAULT '',
  parent_attempt INTEGER NOT NULL DEFAULT 0,
+ cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),
  UNIQUE(parent_request_id,call_index)
 )`
 
 type NativeCall struct {
 	ID, ParentRequestID              string
 	ParentAttempt                    int64
+	CancelRequested                  bool
 	CallIndex                        int64
 	Kind, Operation, IntentDigest    string
 	Request, Frozen                  []byte
@@ -35,11 +37,11 @@ type NativeCall struct {
 	Worker, InstanceID, WorkerBootID string
 }
 
-const nativeCallColumns = `id,parent_request_id,call_index,kind,operation,intent_digest,request,frozen,state,result,native_receipt,safe_code,worker,instance_id,worker_boot_id,parent_attempt`
+const nativeCallColumns = `id,parent_request_id,call_index,kind,operation,intent_digest,request,frozen,state,result,native_receipt,safe_code,worker,instance_id,worker_boot_id,parent_attempt,cancel_requested`
 
 func scanNativeCall(row interface{ Scan(...any) error }) (NativeCall, error) {
 	var call NativeCall
-	err := row.Scan(&call.ID, &call.ParentRequestID, &call.CallIndex, &call.Kind, &call.Operation, &call.IntentDigest, &call.Request, &call.Frozen, &call.State, &call.Result, &call.NativeReceipt, &call.SafeCode, &call.Worker, &call.InstanceID, &call.WorkerBootID, &call.ParentAttempt)
+	err := row.Scan(&call.ID, &call.ParentRequestID, &call.CallIndex, &call.Kind, &call.Operation, &call.IntentDigest, &call.Request, &call.Frozen, &call.State, &call.Result, &call.NativeReceipt, &call.SafeCode, &call.Worker, &call.InstanceID, &call.WorkerBootID, &call.ParentAttempt, &call.CancelRequested)
 	return call, err
 }
 func (s *Store) NativeCall(parent string, index int64) (*NativeCall, *exit.Error) {
@@ -159,6 +161,9 @@ func (s *Store) CompleteNativeCall(id string, result, receipt []byte) *exit.Erro
 	return s.CompleteNativeCallAt(id, result, receipt, "", "")
 }
 func (s *Store) CompleteNativeCallAt(id string, result, receipt []byte, instance, boot string) *exit.Error {
+	if receipt == nil {
+		receipt = []byte{}
+	}
 	raw, err := canonical.NormalizeJCS(result)
 	if err != nil || !bytes.Equal(raw, result) || len(raw) > 48*1024 || len(receipt) > 1<<20 {
 		return exit.New(exit.Validation, "native completion exceeds canonical result bounds")
@@ -235,4 +240,110 @@ func (s *Store) OwedNativeCalls(kind string) ([]NativeCall, *exit.Error) {
 		return nil, exit.Internalf("cannot finish owed native calls: %s", err)
 	}
 	return calls, nil
+}
+
+// RequestNativeEffectCancel records cancellation of one awaited effect while
+// retaining its executing marker for authoritative late-commit reconciliation.
+func (s *Store) RequestNativeEffectCancel(parentID string, index, parentAttempt int64, parentSpec, parentSession, intent string) (*NativeCall, *exit.Error) {
+	if parentID == "" || index < 0 || index >= 32 || parentAttempt <= 0 {
+		return nil, exit.New(exit.Validation, "effect cancellation has invalid parent identity")
+	}
+	for _, value := range []string{parentSpec, intent} {
+		raw, err := canonical.Raw(value)
+		if err != nil {
+			return nil, exit.New(exit.Validation, "effect cancellation has malformed identity")
+		}
+		spelled, _ := canonical.Spell(raw)
+		if spelled != value {
+			return nil, exit.New(exit.Validation, "effect cancellation identity is not canonical")
+		}
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, exit.Internalf("cannot begin effect cancellation: %s", err)
+	}
+	defer tx.Rollback()
+	parent, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE id=?`, parentID))
+	if err != nil {
+		return nil, exit.Named(exit.Conflict, "native.parent_absent", "effect cancellation has no parent")
+	}
+	var owned bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM attempts WHERE request_id=? AND attempt=? AND session_id=? AND invocation_digest=? AND state IN ('offered','accepted','recovered_open'))`, parentID, parentAttempt, parentSession, parentSpec).Scan(&owned); err != nil {
+		return nil, exit.Internalf("cannot inspect effect cancellation authority: %s", err)
+	}
+	if !owned || !parent.IsJob() || !parent.RetainWork || parent.Ordinal != parentAttempt {
+		return nil, exit.Named(exit.Conflict, "native.parent_stopped", "effect cancellation does not belong to the current parent attempt")
+	}
+	row, err := scanNativeCall(tx.QueryRow(`SELECT `+nativeCallColumns+` FROM native_calls WHERE parent_request_id=? AND call_index=?`, parentID, index))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read canceled effect: %s", err)
+	}
+	if row.Kind != "effect" {
+		return nil, nil
+	}
+	if row.IntentDigest != intent {
+		return nil, exit.Named(exit.Conflict, "child.intent_changed", "effect cancellation names another accepted intent")
+	}
+	// Parent suspension interrupts Python awaits but retains logical effects.
+	if parent.State == "pausing" || parent.State == "paused" || parent.State == "blocked" {
+		return &row, nil
+	}
+	if row.State == "succeeded" || row.State == "failed" || row.State == "canceled" {
+		return &row, nil
+	}
+	state, code := row.State, "publication.cancel_requested"
+	if state != "executing" {
+		state, code = "canceled", "publication.call_canceled"
+	}
+	if _, err := tx.Exec(`UPDATE native_calls SET cancel_requested=1,state=?,safe_code=? WHERE id=?`, state, code, row.ID); err != nil {
+		return nil, exit.Internalf("cannot record effect cancellation: %s", err)
+	}
+	if err := appendEventTx(tx, parentID, "native.effect_cancel_requested", parentAttempt, map[string]any{"call_index": index, "service_id": row.ID, "intent_digest": intent}); err != nil {
+		return nil, exit.Internalf("cannot journal effect cancellation: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, exit.Internalf("cannot commit effect cancellation: %s", err)
+	}
+	row.CancelRequested, row.State, row.SafeCode = true, state, code
+	return &row, nil
+}
+
+// StartNativeEffectWrite is the last owner-side authorization before each grant,
+// PUT, finalize or CAS. Cancellation and this mutation reservation serialize here.
+func (s *Store) StartNativeEffectWrite(id string) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot authorize effect write: %s", err)
+	}
+	defer tx.Rollback()
+	row, err := scanNativeCall(tx.QueryRow(`SELECT `+nativeCallColumns+` FROM native_calls WHERE id=?`, id))
+	if err != nil || row.Kind != "effect" {
+		return exit.Named(exit.Conflict, "native.call_absent", "publication has no accepted effect")
+	}
+	if row.CancelRequested {
+		return exit.Named(exit.Canceled, "publication.call_canceled", "the awaited publication call was canceled")
+	}
+	parent, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE id=?`, row.ParentRequestID))
+	if err != nil {
+		return exit.Named(exit.Canceled, "publication.parent_stopped", "publication parent is absent")
+	}
+	if parent.State != "dispatching" {
+		if parent.State == "canceling" || parent.State == "canceled" || parent.State == "releasing" {
+			return exit.Named(exit.Canceled, "publication.parent_stopped", "stopped parent cannot issue publication writes")
+		}
+		return exit.Named(exit.Unavailable, "publication.parent_paused", "publication waits for its parent to resume")
+	}
+	if row.State != "frozen" && row.State != "executing" {
+		return exit.Named(exit.Conflict, "native.call_closed", "publication must freeze before execution")
+	}
+	if _, err := tx.Exec(`UPDATE native_calls SET state='executing' WHERE id=?`, id); err != nil {
+		return exit.Internalf("cannot reserve effect write: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit effect write reservation: %s", err)
+	}
+	return nil
 }

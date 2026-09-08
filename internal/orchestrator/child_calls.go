@@ -308,6 +308,9 @@ func (c *Orchestrator) onChildCancel(s *session, call *pb.ChildCallCancel) {
 	if problem != nil {
 		return
 	}
+	if c.cancelNativeEffect(s, call) {
+		return
+	}
 	if c.cancelNativeSource(s, call) {
 		return
 	}

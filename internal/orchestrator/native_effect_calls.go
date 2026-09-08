@@ -79,7 +79,11 @@ func (c *Orchestrator) watchNativeEffect(s *session, call *pb.ChildCallRequest, 
 				c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_SUCCEEDED, observed.Result, nil)
 				return
 			case "failed", "canceled":
-				c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_FAILED, nil, exit.Named(exit.Failed, observed.SafeCode, "publication effect stopped"))
+				state, code := pb.ChildCallState_CHILD_CALL_STATE_FAILED, exit.Failed
+				if observed.State == "canceled" {
+					state, code = pb.ChildCallState_CHILD_CALL_STATE_CANCELED, exit.Canceled
+				}
+				c.sendChildResult(s, call, row.ID, state, nil, exit.Named(code, observed.SafeCode, "publication effect stopped"))
 				return
 			}
 			select {
@@ -136,7 +140,11 @@ func (c *Orchestrator) runNativeEffect(row records.NativeCall) {
 				return
 			}
 			if permanentEffectFailure(problem) {
-				_ = c.opt.Store.StopNativeCall(row.ID, "failed", problem.ErrName())
+				state := "failed"
+				if problem.Code == exit.Canceled {
+					state = "canceled"
+				}
+				_ = c.opt.Store.StopNativeCall(row.ID, state, problem.ErrName())
 				return
 			}
 			select {
@@ -153,7 +161,11 @@ func (c *Orchestrator) runNativeEffect(row records.NativeCall) {
 			}
 			if problem != nil {
 				if permanentEffectFailure(problem) {
-					_ = c.opt.Store.StopNativeCall(row.ID, "failed", problem.ErrName())
+					state := "failed"
+					if problem.Code == exit.Canceled {
+						state = "canceled"
+					}
+					_ = c.opt.Store.StopNativeCall(row.ID, state, problem.ErrName())
 					return
 				}
 			} else {
@@ -167,7 +179,11 @@ func (c *Orchestrator) runNativeEffect(row records.NativeCall) {
 				}
 			}
 			if permanentEffectFailure(problem) {
-				_ = c.opt.Store.StopNativeCall(row.ID, "failed", problem.ErrName())
+				state := "failed"
+				if problem.Code == exit.Canceled {
+					state = "canceled"
+				}
+				_ = c.opt.Store.StopNativeCall(row.ID, state, problem.ErrName())
 				return
 			}
 		}
@@ -230,9 +246,34 @@ func (c *Orchestrator) ResumeNativeEffects() *exit.Error {
 		return problem
 	}
 	for _, id := range cleanup {
+		c.mu.Lock()
+		active := c.transferRunning[id]
+		c.mu.Unlock()
+		if active {
+			continue
+		}
 		if problem := c.releaseNativeEffectInputs(id); problem != nil {
 			return problem
 		}
 	}
 	return nil
+}
+
+func (c *Orchestrator) cancelNativeEffect(s *session, call *pb.ChildCallCancel) bool {
+	spec, specErr := canonical.Spell(call.ParentInvocationSpecDigest)
+	intent, intentErr := canonical.Spell(call.IntentDigest)
+	if specErr != nil || intentErr != nil {
+		return true
+	}
+	row, problem := c.opt.Store.RequestNativeEffectCancel(call.ParentRequestId, int64(call.CallIndex), int64(call.ParentAttemptOrdinal), spec, s.bootID, intent)
+	if problem != nil {
+		return true
+	}
+	if row == nil {
+		return false
+	}
+	// The actor finishes its accepted I/O before releasing the input hold and
+	// reconciles executing-phase uncertainty instead of claiming a rollback.
+	_ = c.ResumeNativeEffects()
+	return true
 }
