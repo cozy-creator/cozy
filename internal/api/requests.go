@@ -820,6 +820,11 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 				life.RemainingMS = &progress.RemainingMS
 			}
 		}
+	} else if life.Status == "completed" {
+		complete := 1.0
+		life.OverallFraction = &complete
+	} else if life.Status == "failed" || life.Status == "canceled" {
+		life.OverallFraction, _ = s.store.TerminalOverallFraction(row.ID, row.Ordinal)
 	}
 	if export, problem := s.store.OutputExportOf(row.ID); problem == nil && export != nil {
 		life.OutputExport = &OutputExportRef{

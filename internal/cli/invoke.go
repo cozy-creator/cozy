@@ -759,18 +759,14 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		if life.CanceledBy != "" {
 			typed["canceled_by"] = life.CanceledBy
 		}
-		// Progress is an observation of the current attempt, not durable lifecycle
-		// state. A queued or terminal row therefore carries no progress facts even
-		// if an older frame is still present in an upstream response.
+		// Stage, position and ETA describe live execution. Terminal rows retain only
+		// the API's overall fraction: completed=1, otherwise the last measured value.
 		if life.Status == "in_progress" {
 			if life.ProgressStage != "" {
 				typed["progress_stage"] = life.ProgressStage
 			}
 			if life.StageFraction != nil {
 				typed["stage_fraction"] = *life.StageFraction
-			}
-			if life.OverallFraction != nil {
-				typed["overall_fraction"] = *life.OverallFraction
 			}
 			if life.Position != nil {
 				typed["position"] = *life.Position
@@ -781,6 +777,9 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 			if life.RemainingMS != nil {
 				typed["remaining_ms"] = *life.RemainingMS
 			}
+		}
+		if life.OverallFraction != nil && (life.Status == "in_progress" || life.Status == "completed" || life.Status == "failed" || life.Status == "canceled") {
+			typed["overall_fraction"] = *life.OverallFraction
 		}
 		list.TypedRows = append(list.TypedRows, typed)
 		states[life.Status]++
@@ -866,7 +865,13 @@ func progressValue(life api.Lifecycle) string {
 		}
 		return "-"
 	}
+	if life.Status == "completed" {
+		return "100%"
+	}
 	if life.Status != "in_progress" {
+		if (life.Status == "failed" || life.Status == "canceled") && life.OverallFraction != nil {
+			return fmt.Sprintf("%.0f%%", *life.OverallFraction*100)
+		}
 		return "-"
 	}
 	// ONE NUMBER AND THE STAGE. This cell carried four facts at once -- an overall
