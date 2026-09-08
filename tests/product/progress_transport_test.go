@@ -65,7 +65,7 @@ func TestProgressWatchReconnectsWithoutRestartingControl(t *testing.T) {
 }
 
 func TestPreparationSnapshotCarriesRentalAndSeparateModelProgress(t *testing.T) {
-	o := hostOwner(t, "progress-metadata", orchestrator.Options{})
+	o := hostOwner(t, "progress-metadata")
 	rental := &orchestrator.RentalProgress{AcceleratorModel: "H100 NVL", AcceleratorCount: 1, HourlyRateUSDMicros: 3236009}
 	o.c.ObservePhase("rental-stage", orchestrator.PhaseSample{Name: "booting", Machine: "aldra", Rental: rental})
 	rental.AcceleratorModel = "mutated after emission"
