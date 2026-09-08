@@ -44,6 +44,17 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 		refuse(exit.New(exit.Validation, "source call is not a fixed native interface"))
 		return true
 	}
+	if eligibility, ok := c.opt.Packages.(interface {
+		NativeSourceEligible(records.Request, string) *exit.Error
+	}); ok {
+		if problem := eligibility.NativeSourceEligible(*parent, call.Export); problem != nil {
+			refuse(problem)
+			return true
+		}
+	} else {
+		refuse(exit.Unavailablef("source owner cannot validate the captured caller descriptor"))
+		return true
+	}
 	spec, _ := canonical.Spell(call.ParentInvocationSpecDigest)
 	intent, _ := canonical.Spell(call.IntentDigest)
 	row, _, problem := c.opt.Store.AcceptNativeCall(records.NativeCall{ID: nativeServiceID(parent.ID, call.CallIndex), ParentRequestID: parent.ID, CallIndex: int64(call.CallIndex), Kind: "source", Operation: call.Export, IntentDigest: intent, Request: call.RequestCanonicalBytes}, int64(call.ParentAttemptOrdinal), spec, s.bootID)
@@ -55,7 +66,7 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 		c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_SUCCEEDED, row.Result, nil)
 		return true
 	}
-	if row.State == "canceled" || row.State == "failed" {
+	if row.State == "canceled" || row.State == "failed" || row.State == "stopped" {
 		c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_FAILED, nil, exit.Named(exit.Failed, "native.source_stopped", "native source call stopped"))
 		return true
 	}
@@ -69,6 +80,9 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 }
 func (c *Orchestrator) sendNativeSource(s *session, call *pb.ChildCallRequest, id string, phase pb.NativeSourcePhase, selection *pb.NativeSourceSelection) {
 	command := &pb.NativeSourceCommand{RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, ParentCall: proto.Clone(call).(*pb.ChildCallRequest), ServiceId: id, Operation: nativeSourceOperation(call.Export), Phase: phase, Selection: selection}
+	if credentials, ok := c.opt.Packages.(interface{ NativeSourceCredential(string) string }); ok {
+		command.Credential = credentials.NativeSourceCredential(call.Export)
+	}
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_NativeSourceCommand{NativeSourceCommand: command}})
 }
 func sourcePin(selection *pb.NativeSourceSelection) ([]byte, error) {
@@ -134,7 +148,26 @@ func (c *Orchestrator) onNativeSourceStatus(s *session, status *pb.NativeSourceS
 		_ = c.opt.Store.StopNativeCall(row.ID, "failed", "native_source_failed")
 		c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_FAILED, nil, exit.Named(exit.Failed, "native.source_failed", "native source operation failed; retained bytes remain available"))
 	case pb.NativeSourceState_NATIVE_SOURCE_STATE_CANCELED:
-		_ = c.opt.Store.StopNativeCall(row.ID, "canceled", "native_source_canceled")
+		_ = c.opt.Store.StopNativeCall(row.ID, "stopped", "native_source_stopped")
 		c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_CANCELED, nil, nil)
 	}
+}
+
+func (c *Orchestrator) cancelNativeSource(s *session, call *pb.ChildCallCancel) bool {
+	row, problem := c.opt.Store.NativeCall(call.ParentRequestId, int64(call.CallIndex))
+	if problem != nil || row == nil || row.Kind != "source" {
+		return false
+	}
+	intent, err := canonical.Spell(call.IntentDigest)
+	if err != nil || intent != row.IntentDigest {
+		return true
+	}
+	if row.State == "succeeded" {
+		return true
+	}
+	_ = c.opt.Store.StopNativeCall(row.ID, "stopped", "native_source_stopped")
+	parent := &pb.ChildCallRequest{ParentRequestId: call.ParentRequestId, ParentAttemptOrdinal: call.ParentAttemptOrdinal, ParentInvocationSpecDigest: call.ParentInvocationSpecDigest,
+		CallIndex: call.CallIndex, InterfaceDigest: nativeinterface.SourceDigest(), Module: nativeinterface.SourceModule, Export: row.Operation, RequestCanonicalBytes: row.Request, IntentDigest: call.IntentDigest}
+	c.sendNativeSource(s, parent, row.ID, pb.NativeSourcePhase_NATIVE_SOURCE_PHASE_CANCEL, nil)
+	return true
 }

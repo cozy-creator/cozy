@@ -10,7 +10,7 @@ import (
 // invocable dependencies need no author-maintained lock; existing locks seed uv's
 // resolution without changing either the author's source or their lock file.
 // Published package intake keeps its strict source/lock requirements.
-func PreparePrivateFrom(ctx context.Context, projectDir string) (*Package, *exit.Error) {
+func PreparePrivateFrom(ctx context.Context, projectDir string, extras ...string) (*Package, *exit.Error) {
 	tree, files, problem := boundedSourceTree(projectDir, []string{"package.toml", "pyproject.toml"})
 	if problem != nil {
 		return nil, problem
@@ -26,5 +26,5 @@ func PreparePrivateFrom(ctx context.Context, projectDir string) (*Package, *exit
 	return preparePrivateCopy(ctx, &Package{
 		Files: files, Tree: tree,
 		Name: normalizedProjectName(metadata.Name), Release: metadata.Version,
-	}, nil)
+	}, nil, extras...)
 }
