@@ -102,3 +102,13 @@ func HashHex(v Value) string {
 	sum := sha256.Sum256([]byte(v.raw))
 	return hex.EncodeToString(sum[:])
 }
+
+// NativeSourceCredential is the scoped private-worker transport carrier. The
+// caller places it only in the accepted source command, never history or logs;
+// native transport presents it only to the original provider host on each hop.
+func NativeSourceCredential(v Value) string {
+	if !v.Present() {
+		return ""
+	}
+	return "bearer " + v.raw
+}
