@@ -20,7 +20,7 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Floor is the first release with wire43 private byte-result custody and observations.
+// Floor is the minimum released host-helper contract this CLI requires.
 // Metadata description remains static against the captured source environment; one
 // coherent release remedy serves both host-tool and worker-wire admission checks.
 const Floor = "0.9.0"
@@ -121,8 +121,7 @@ func admitHostRuntime(path string, env []string) *exit.Error {
 	}
 	if release.LessThan(floor) {
 		return exit.Named(exit.Structural, "host_runtime_below_floor",
-			"cozy-runtime %s is release %s; this Cozy needs %s or newer, the first release whose "+
-				"`describe` reads package source without importing it",
+			"cozy-runtime %s is release %s; this Cozy needs %s or newer for its host helper contract",
 			path, answer.Distribution, Floor).
 			WithRemedy("%s", hostRuntimeInstall)
 	}
