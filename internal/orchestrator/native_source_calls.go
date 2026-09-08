@@ -12,6 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
+	"sort"
 )
 
 func nativeServiceID(parent string, index uint32) string {
@@ -28,6 +29,8 @@ func nativeSourceOperation(name string) pb.NativeSourceOperation {
 		return pb.NativeSourceOperation_NATIVE_SOURCE_OPERATION_CIVITAI
 	case "convert_cozytensors":
 		return pb.NativeSourceOperation_NATIVE_SOURCE_OPERATION_CONVERT
+	case "source_files":
+		return pb.NativeSourceOperation_NATIVE_SOURCE_OPERATION_SOURCE_FILES
 	}
 	return pb.NativeSourceOperation_NATIVE_SOURCE_OPERATION_UNSPECIFIED
 }
@@ -42,10 +45,10 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 	}
 	c.mu.Lock()
 	worker := c.workers[s.instanceID]
-	supported := worker != nil && worker.wireMinor >= 42
+	supported := worker != nil && worker.wireMinor >= 45
 	c.mu.Unlock()
 	if !supported {
-		refuse(exit.Named(exit.Conflict, "native.source_wire_unsupported", "native source operations require worker protocol 42"))
+		refuse(exit.Named(exit.Conflict, "native.source_wire_unsupported", "native source operations require worker protocol 45"))
 		return true
 	}
 	if !bytes.Equal(call.InterfaceDigest, nativeinterface.SourceDigest()) || nativeSourceOperation(call.Export) == 0 {
@@ -80,7 +83,7 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 	}
 	c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_PENDING, nil, nil)
 	phase := pb.NativeSourcePhase_NATIVE_SOURCE_PHASE_RESOLVE
-	if row.Operation == "convert_cozytensors" {
+	if row.Operation == "convert_cozytensors" || row.Operation == "source_files" {
 		phase = pb.NativeSourcePhase_NATIVE_SOURCE_PHASE_EXECUTE
 	}
 	c.sendNativeSource(s, call, row.ID, phase, nil)
@@ -93,15 +96,29 @@ func (c *Orchestrator) sendNativeSource(s *session, call *pb.ChildCallRequest, i
 	}
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_NativeSourceCommand{NativeSourceCommand: command}})
 }
-func sourcePin(selection *pb.NativeSourceSelection) ([]byte, error) {
+func sourcePin(selection *pb.NativeSourceSelection, files []string) ([]byte, error) {
 	if selection == nil || len(selection.Members) == 0 || len(selection.Members) > 4096 || selection.ContentManifest == nil || len(selection.ContentManifest.Digest) != 32 || len(selection.SelectionDigest) != 32 {
 		return nil, fmt.Errorf("source selection missing bounded exact identity")
 	}
 	members := make([]map[string]any, 0, len(selection.Members))
+	if len(files) > 0 {
+		files = append([]string(nil), files...)
+		sort.Strings(files)
+		if len(files) != len(selection.Members) {
+			return nil, fmt.Errorf("ordinary file selection changed its requested roster")
+		}
+	}
+	var total uint64
 	prior := ""
-	for _, member := range selection.Members {
-		if member.Member <= prior || member.Object == nil || len(member.Object.Digest) != 32 || member.Object.Length == 0 {
+	for i, member := range selection.Members {
+		if member.Member <= prior || member.Object == nil || len(member.Object.Digest) != 32 || (member.Object.Length == 0 && len(files) == 0) {
 			return nil, fmt.Errorf("source members lack exact ordered identities")
+		}
+		if len(files) > 0 {
+			if member.Member != files[i] || member.Object.Length > (64<<20)-total {
+				return nil, fmt.Errorf("ordinary file selection changed its roster or exceeded 64 MiB")
+			}
+			total += member.Object.Length
 		}
 		prior = member.Member
 		digest, _ := canonical.Spell(member.Object.Digest)
@@ -131,7 +148,15 @@ func (c *Orchestrator) onNativeSourceStatus(s *session, status *pb.NativeSourceS
 	call := &pb.ChildCallRequest{ParentRequestId: parent.ID, ParentAttemptOrdinal: status.ParentAttemptOrdinal, ParentInvocationSpecDigest: status.ParentInvocationSpecDigest, CallIndex: status.CallIndex, InterfaceDigest: nativeinterface.SourceDigest(), Module: nativeinterface.SourceModule, Export: row.Operation, RequestCanonicalBytes: row.Request, IntentDigest: status.IntentDigest}
 	switch status.State {
 	case pb.NativeSourceState_NATIVE_SOURCE_STATE_RESOLVED:
-		pinned, err := sourcePin(status.Selection)
+		var request struct {
+			Files []string `json:"files"`
+		}
+		if row.Operation == "download_huggingface" {
+			if err := json.Unmarshal(row.Request, &request); err != nil {
+				return
+			}
+		}
+		pinned, err := sourcePin(status.Selection, request.Files)
 		if err != nil {
 			return
 		}
