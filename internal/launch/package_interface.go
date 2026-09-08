@@ -102,6 +102,62 @@ type Slot struct {
 	SequenceParallel json.RawMessage     `json:"sequence_parallel,omitempty"`
 }
 
+// SequenceParallelDegrees is the group degrees this package can be built at: the
+// INTERSECTION of `sequence_parallel.degrees` over every model slot of every model-bearing
+// entrypoint, which is the same fold cozy-runtime does over a placement's bindings before
+// it will honour a device pin of degree K. A slot that declares nothing makes the whole
+// construction unshardable, and an author who declared nothing anywhere declares none —
+// the answer is empty, not "any".
+//
+// This is CAPABILITY, never selection: it says a group of this degree can be built, not
+// that one will be. What decides the actual degree is the width of the machine the renter
+// bought (cl-179).
+func (d *PackageInterface) SequenceParallelDegrees() []int {
+	folded, first := map[int]bool{}, true
+	for _, entrypoint := range d.Entrypoints {
+		for _, slot := range entrypoint.Models {
+			declared := slot.sequenceParallelDegrees()
+			if first {
+				folded, first = declared, false
+				continue
+			}
+			for degree := range folded {
+				if !declared[degree] {
+					delete(folded, degree)
+				}
+			}
+		}
+	}
+	out := make([]int, 0, len(folded))
+	for degree := range folded {
+		out = append(out, degree)
+	}
+	sort.Ints(out)
+	return out
+}
+
+// sequenceParallelDegrees reads one slot's `{"degrees": [K, ...]}`. An absent, unreadable
+// or empty document declares nothing, which is the same answer as a slot that cannot be
+// sharded — this side never infers a degree an author did not write.
+func (s Slot) sequenceParallelDegrees() map[int]bool {
+	if len(s.SequenceParallel) == 0 {
+		return nil
+	}
+	var declared struct {
+		Degrees []int `json:"degrees"`
+	}
+	if json.Unmarshal(s.SequenceParallel, &declared) != nil {
+		return nil
+	}
+	out := make(map[int]bool, len(declared.Degrees))
+	for _, degree := range declared.Degrees {
+		if degree >= 2 {
+			out[degree] = true
+		}
+	}
+	return out
+}
+
 // Struct is a rendered msgspec struct.
 type Struct struct {
 	Input    string          `json:"input,omitempty"`

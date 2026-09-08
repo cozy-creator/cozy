@@ -160,7 +160,7 @@ func (f developmentFixture) attach(t *testing.T, address string) {
 	fatal(t, problem)
 	certificate, err := os.ReadFile(f.cert)
 	must(t, err)
-	fatal(t, rental.Attach(f.layout, f.store, records.Rental{ID: f.rentalID, State: "ready", Hub: f.cfg.HubURL,
+	fatal(t, rental.Attach(f.layout, f.store, records.Rental{AcceleratorCount: 1, ID: f.rentalID, State: "ready", Hub: f.cfg.HubURL,
 		MachineName: "proof", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, Address: address,
 		ExpectedWorkerID: f.peer.workerID, ExpectedWorkerBootID: f.peer.bootID}, string(certificate), token, identity))
 }

@@ -49,7 +49,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	fatal(t, store.RecordRental(records.Rental{
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 		ID: "rental-tui", MachineName: "sparrow", SKU: "cpu", AcceleratorModel: "CPU",
 		HourlyRateUSDMicros: 100_000, State: "acquiring", Hub: hubURL,
 		Address: "127.0.0.1:1", CertPath: filepath.Join(root, "rental-tui.pem"),

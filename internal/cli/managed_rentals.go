@@ -10,6 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -1034,5 +1035,14 @@ func releaseConstraints(ctx *Context, req records.Request) rental.Constraints {
 	if problem != nil {
 		return rental.Constraints{}
 	}
-	return rental.Constraints{Requirements: requirements, RequiresPython: requiresPython}
+	// The committed interface is what says which group degrees this package can be built
+	// at, so a WIDE product is only a candidate when its author declared that width
+	// (cl-179). It rides the same advisory read as the base-image check: unreadable means
+	// nothing is declared, which excludes wide products rather than admitting them.
+	var degrees []int
+	if declared, e := launch.DecodePackageInterface(detail.PackageInterface); e == nil {
+		degrees = declared.SequenceParallelDegrees()
+	}
+	return rental.Constraints{Requirements: requirements, RequiresPython: requiresPython,
+		Degrees: degrees}
 }

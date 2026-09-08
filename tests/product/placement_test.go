@@ -176,7 +176,7 @@ func TestPlacementReusesTheMeasuredCard(t *testing.T) {
 	must(t, os.WriteFile(cert, []byte("fixture"), 0600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
-	seed := records.Rental{ID: "pr-morgiana", MachineName: "morgiana", SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3",
+	seed := records.Rental{AcceleratorCount: 1, ID: "pr-morgiana", MachineName: "morgiana", SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3",
 		HourlyRateUSDMicros: 2_490_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL}
 	fatal(t, store.RecordRental(seed))
 	h.addReady(seed.ID, seed.MachineName, seed.AcceleratorModel, seed.HourlyRateUSDMicros)

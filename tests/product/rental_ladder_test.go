@@ -438,7 +438,7 @@ func TestRentalPinCarriesTheLaneAndARejectedBuyFreesTheNextRung(t *testing.T) {
 		t.Fatalf("the unpinned ladder and its sizing facts did not survive the row: %+v", row.Models)
 	}
 	pinned, _, _ := rental.Pin(h3Ladder(), "NVIDIA H100 80GB HBM3")
-	fatal(t, store.RecordRental(records.Rental{ID: "pr-ladder-h100", MachineName: "ladder-h100",
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: "pr-ladder-h100", MachineName: "ladder-h100",
 		SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3", HourlyRateUSDMicros: 2_490_000,
 		State: "ready", Hub: "http://hub.example"}))
 	assigned, problem := store.PinRental(request, "pr-ladder-h100", pinned)

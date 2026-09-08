@@ -1198,7 +1198,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		if e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
-		spec := WorkerLaunchSpec{Connection: remote.Connection, Placement: DesiredPlacement{
+		spec := WorkerLaunchSpec{Connection: remote.Connection, Devices: remote.Devices, Placement: DesiredPlacement{
 			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
 			InstallID: req.InstallID, Models: append([]ModelRef(nil), logical.Models...),
 			LocalRevisionDigest: req.LocalPackageDigest,

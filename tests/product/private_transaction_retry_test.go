@@ -17,7 +17,7 @@ func TestPrivateTransactionEditedRetryPreservesHistoryAndCustody(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	const rental = "pr-edited-retry"
-	fatal(t, store.RecordRental(records.Rental{ID: rental, MachineName: "otter", State: "ready", HourlyRateUSDMicros: 100_000}))
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: rental, MachineName: "otter", State: "ready", HourlyRateUSDMicros: 100_000}))
 	prior := recordPrivateTransaction(t, store, "broken-program", rental)
 	changed, problem := store.BlockRetainedWork(prior.ID, "author_exception", "step B failed")
 	fatal(t, problem)
@@ -81,7 +81,7 @@ func TestPrivateTransactionRetryRefusesUnavailableCustody(t *testing.T) {
 			defer store.Close()
 			const rental = "pr-retry-refusal"
 			if arm != "lost-machine" {
-				fatal(t, store.RecordRental(records.Rental{ID: rental, MachineName: "otter", State: "ready", HourlyRateUSDMicros: 100_000}))
+				fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: rental, MachineName: "otter", State: "ready", HourlyRateUSDMicros: 100_000}))
 			}
 			prior := recordPrivateTransaction(t, store, arm, rental)
 			if arm != "active" {

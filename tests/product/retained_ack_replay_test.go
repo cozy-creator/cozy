@@ -71,7 +71,7 @@ func TestCanceledRetainedAttemptReplaysLostReleaseAck(t *testing.T) {
 	}
 	connection, _ := startFakePod(t, t.TempDir(), pod)
 	o := hostOwner(t, "retained-ack-replay", rentalWiring(connection, private))
-	fatal(t, o.store.RecordRental(records.Rental{ID: podRental, MachineName: "otter", State: "ready", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, Address: connection.Addr, CertPath: connection.CACert, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
+	fatal(t, o.store.RecordRental(records.Rental{AcceleratorCount: 1, ID: podRental, MachineName: "otter", State: "ready", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, Address: connection.Addr, CertPath: connection.CACert, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
 	id, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: "ack-loss", Package: "cozy/h3-package", Entrypoint: "prepare", PlanID: childDigest("1"), Release: "1.0.7", Kind: "job", Payload: []byte(`{}`), Worker: podRental, Rental: true, RentalRequired: true, RetainWork: true})
 	fatal(t, problem)
 	waitUntil(t, "original retained terminal", func() bool { mu.Lock(); defer mu.Unlock(); return held })

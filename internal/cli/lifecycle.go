@@ -276,6 +276,7 @@ func resolveRentalOperation(ctx *Context, key string) (string, *exit.Error) {
 	}
 	row := records.Rental{
 		ID: seen.ID, SKU: request.SKU, AcceleratorModel: seen.AcceleratorModel,
+		AcceleratorCount:    seen.AcceleratorCount,
 		HourlyRateUSDMicros: seen.HourlyRateUSDMicros, ManagedRequestID: operation.ManagedRequestID,
 		State: seen.State, Hub: operation.Hub,
 	}

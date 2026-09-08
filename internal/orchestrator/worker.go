@@ -243,21 +243,31 @@ type WorkerConnection struct {
 	Media *media.Spec `json:"media,omitempty"`
 }
 
-// RemoteTarget is only the dial identity for generic rented capacity. Desired
-// package/model state is a later Creator-to-worker command.
+// RemoteTarget is the dial identity for generic rented capacity, and the WIDTH that
+// identity was paid for. Desired package/model state is a later Creator-to-worker command.
 type RemoteTarget struct {
 	Connection *WorkerConnection
+	// Devices is the pod's device envelope: RentalDeviceEnvelope over the rental's paid
+	// accelerator count, empty for a CPU pod. It travels with the dial identity because a
+	// rental's width is a property of the machine, settled when it was bought, and every
+	// later reader — the lane breach check, the decision log's device names, the device
+	// pin this owner authors — is reading one fact and must read the same one.
+	Devices []string
 }
 
 // WorkerLaunchSpec is everything this owner needs to make one worker exist and host one
 // placement. The caller (cl-010's `start`, or cl-001's live driver) resolves it from the
 // install; the orchestrator itself resolves nothing about Python.
 type WorkerLaunchSpec struct {
-	Python            string   `json:"python"` // package-independent control Runtime
-	Args              []string `json:"args"`
-	Dir               string   `json:"dir"`
-	Imposed           []string `json:"imposed"` // exact env values the launcher imposes, never inherited
-	Devices           []string `json:"devices"` // the device envelope this process may SEE
+	Python  string   `json:"python"` // package-independent control Runtime
+	Args    []string `json:"args"`
+	Dir     string   `json:"dir"`
+	Imposed []string `json:"imposed"` // exact env values the launcher imposes, never inherited
+	// Devices is the device envelope this worker holds: for a spawned worker the names on
+	// its own `--devices` line, which this daemon GRANTS and arbitrates; for an attached
+	// rental the pod's paid width, which this daemon only reads. Lane ordinals are
+	// positions in it, and its length is the placement's device-group degree.
+	Devices           []string `json:"devices"`
 	GraceSec          float64  `json:"grace_sec"`
 	ArtifactCache     string   `json:"artifact_cache,omitempty"`
 	InstallRoot       string   `json:"install_root,omitempty"`
@@ -964,7 +974,7 @@ func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *e
 	if already {
 		return instance, "", ChangeNone, c.ensureWorkerClaimed(instance)
 	}
-	spec := WorkerLaunchSpec{Connection: target.Connection}
+	spec := WorkerLaunchSpec{Connection: target.Connection, Devices: target.Devices}
 	instance, change, problem := c.EnsureWorker(spec)
 	if problem == nil {
 		problem = c.ensureWorkerClaimed(instance)

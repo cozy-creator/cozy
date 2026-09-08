@@ -34,7 +34,7 @@ func TestSpentJobRentalIsPreservedWhileUnstartedWorkReplans(t *testing.T) {
 			origin := fmt.Sprintf("http://127.0.0.1:%d", port)
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+origin+"\ntensorhub_token: rental-idle-test\nrentals:\n  max_hourly_spend_usd: 1\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 			peer := newFakeRentalHub(t, port)
-			peer.setSKUs(map[string]any{"name": "cpu", "accelerator_model": "CPU", "price_usd_micros_per_hour": 100000, "base_worker_profile": "python3.12-cpu-linux-x86"})
+			peer.setSKUs(map[string]any{"name": "cpu", "accelerator_model": "CPU", "accelerator_count": 1, "price_usd_micros_per_hour": 100000, "base_worker_profile": "python3.12-cpu-linux-x86"})
 			store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 			fatal(t, problem)
 			defer store.Close()
@@ -70,7 +70,7 @@ func TestSpentJobRentalIsPreservedWhileUnstartedWorkReplans(t *testing.T) {
 			if custody == "managed" {
 				managedRequest = old
 			}
-			fatal(t, store.RecordRental(records.Rental{ID: retained, MachineName: "bus", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100000, ManagedRequestID: managedRequest, State: "ready", Hub: origin, Address: "127.0.0.1:1", CertPath: filepath.Join(root, "retained.pem")}))
+			fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: retained, MachineName: "bus", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100000, ManagedRequestID: managedRequest, State: "ready", Hub: origin, Address: "127.0.0.1:1", CertPath: filepath.Join(root, "retained.pem")}))
 			kept := filepath.Join(root, "retained-output-evidence")
 			raw := []byte("unbanked output custody is not disposable capacity")
 			must(t, os.WriteFile(kept, raw, 0600))
@@ -84,7 +84,7 @@ func TestSpentJobRentalIsPreservedWhileUnstartedWorkReplans(t *testing.T) {
 			var creates atomic.Int64
 			peer.rent = func(body map[string]any) map[string]any {
 				creates.Add(1)
-				return map[string]any{"rental_id": "pr-fresh", "name": body["name"], "state": "acquiring", "requested_accelerator_model": "CPU", "hourly_rate_usd_micros": 100000}
+				return map[string]any{"rental_id": "pr-fresh", "name": body["name"], "state": "acquiring", "requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 100000}
 			}
 			startDaemonProcess(t, root)
 			defer peer.setState("pr-fresh", "failed", "fixture_finished")
@@ -143,7 +143,7 @@ func TestRentalPurposeKeepsManualAndOwedCustody(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	row := records.Rental{ID: "rental-purpose"}
+	row := records.Rental{AcceleratorCount: 1, ID: "rental-purpose"}
 	spent, problem := orchestrator.RentalSpent(store, row)
 	fatal(t, problem)
 	if spent {
