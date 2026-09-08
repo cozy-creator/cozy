@@ -105,6 +105,8 @@ func TestPrivateChildSchemaUpgradePreservesPriorOwnership(t *testing.T) {
 	must(t, err)
 	_, err = db.Exec(`DROP TABLE byte_outputs`)
 	must(t, err)
+	_, err = db.Exec(`DROP TABLE attempt_serving_placements`)
+	must(t, err)
 	_, err = db.Exec(`DROP TABLE request_child_arguments`)
 	must(t, err)
 	_, err = db.Exec(`DROP TABLE native_calls`)

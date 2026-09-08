@@ -66,6 +66,8 @@ func TestServingArgumentsSchemaUpgradePreservesPrivateParent(t *testing.T) {
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
 	restorePriorCallIndexBounds(t, db)
+	_, err = db.Exec(`DROP TABLE attempt_serving_placements`)
+	must(t, err)
 	_, err = db.Exec(`DROP TABLE request_child_arguments`)
 	must(t, err)
 	_, err = db.Exec(`PRAGMA user_version=33`)
