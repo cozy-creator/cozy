@@ -13,7 +13,7 @@ from cozy_runtime.internal.worker import session
 AUDIT = Path(__file__).with_name("serving_fixture_audit.jsonl")
 
 
-def record(method, worker, request, result=None, error=None):
+def record(method, worker, request, result=None, error=None, **facts):
     row = {
         "method": method,
         "worker_pid": os.getpid(),
@@ -29,6 +29,7 @@ def record(method, worker, request, result=None, error=None):
         row["digest"] = result.placement_set.placement_set_digest.hex()
     if error is not None:
         row["error"] = str(error)
+    row.update(facts)
     with AUDIT.open("a") as output:
         output.write(json.dumps(row, sort_keys=True) + "\n")
 
@@ -38,6 +39,17 @@ if "serve" in sys.argv[1:]:
 
 
 class FixtureWorker(session.Worker):
+    def _acquire(self, placement, revision):
+        acquired = super()._acquire(placement, revision)
+        if acquired is not None and acquired.installed is not None:
+            record(
+                "Acquire", self, None,
+                environment=str(acquired.installed.python),
+                dependency_environment=str(self.options.environment_python),
+                receipt=acquired.installed.receipt_digest,
+            )
+        return acquired
+
     def prepare_local_package(self, request):
         try:
             result = super().prepare_local_package(request)

@@ -36,14 +36,17 @@ type servingSeed struct {
 }
 
 type servingPreparationEvent struct {
-	Method      string `json:"method"`
-	WorkerPID   int    `json:"worker_pid"`
-	Birth       string `json:"birth"`
-	WorkerBoot  string `json:"worker_boot_id"`
-	OperationID string `json:"operation_id"`
-	Placement   string `json:"placement"`
-	Digest      string `json:"digest"`
-	Error       string `json:"error"`
+	Method                string `json:"method"`
+	WorkerPID             int    `json:"worker_pid"`
+	Birth                 string `json:"birth"`
+	WorkerBoot            string `json:"worker_boot_id"`
+	OperationID           string `json:"operation_id"`
+	Placement             string `json:"placement"`
+	Digest                string `json:"digest"`
+	Error                 string `json:"error"`
+	Environment           string `json:"environment"`
+	DependencyEnvironment string `json:"dependency_environment"`
+	Receipt               string `json:"receipt"`
 }
 
 // The catalog declares the exact real checkpoint seeded below. It does not return
@@ -287,6 +290,16 @@ cozy-runtime={path=%q}
 			must(t, err)
 			if !bytes.Equal(retained, raw) {
 				t.Fatal("owner retained different placement bytes")
+			}
+			var acquired *servingPreparationEvent
+			for i := range events {
+				if events[i].Method == "Acquire" {
+					acquired = &events[i]
+				}
+			}
+			if acquired == nil || acquired.Receipt == "" || acquired.Environment == acquired.DependencyEnvironment ||
+				!strings.HasPrefix(acquired.Environment, filepath.Join(after.Dir, "worker-environments", "contents")+string(filepath.Separator)) {
+				t.Fatalf("activation did not retain the captured immutable code environment: %+v", acquired)
 			}
 			store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 			fatal(t, problem)
