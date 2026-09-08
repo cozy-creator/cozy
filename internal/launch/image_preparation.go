@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 )
 
 // The host Runtime owns the image profile and codec behavior. These are ordinary
@@ -25,7 +26,7 @@ type PreparedImage struct {
 // ImagePreparationTool selects the same qualified host Runtime as other neutral
 // capabilities; a package's importing interpreter is never an analysis tool.
 func ImagePreparationTool(root string, env []string) (RuntimeCLI, *exit.Error) {
-	binary, problem := HostRuntime(env)
+	binary, problem := hostruntime.Path(env)
 	if problem != nil {
 		return RuntimeCLI{}, problem
 	}
