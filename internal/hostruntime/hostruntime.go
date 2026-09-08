@@ -20,10 +20,10 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Floor is the minimum released host-helper contract this CLI requires.
+// Floor supports exact private dependency closure with ordinary prebuilt wheels.
 // Metadata description remains static against the captured source environment; one
 // coherent release remedy serves both host-tool and worker-wire admission checks.
-const Floor = "0.10.0"
+const Floor = "0.10.3"
 
 var floor = pep440.MustParse(Floor)
 
@@ -122,7 +122,7 @@ func admitHostRuntime(path string, env []string) *exit.Error {
 	}
 	if release.LessThan(floor) {
 		return exit.Named(exit.Structural, "host_runtime_below_floor",
-			"cozy-runtime %s is release %s; this Cozy needs %s or newer for its host helper contract",
+			"cozy-runtime %s is release %s; this Cozy needs %s or newer to validate exact private dependency closures",
 			path, answer.Distribution, Floor).
 			WithRemedy("%s", hostRuntimeInstall)
 	}
