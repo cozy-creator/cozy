@@ -592,6 +592,29 @@ impl PyStore {
         tree_root_dict(py, &root)
     }
 
+    /// Import exact manifest members, retaining each member before byte admission.
+    fn import_tree<'p>(
+        &self,
+        py: Python<'p>,
+        owner: &str,
+        manifest_bytes: &[u8],
+        files: Vec<(String, PathBuf)>,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let tree = Manifest::parse(manifest_bytes).or_refuse(py)?;
+        let root = py
+            .detach(|| {
+                tensorfs_core::source_artifact::import_tree(
+                    &self.store,
+                    owner,
+                    &tree,
+                    &files,
+                    &Fault::default(),
+                )
+            })
+            .or_refuse(py)?;
+        tree_root_dict(py, &root)
+    }
+
     fn retain_tree_root<'p>(
         &self,
         py: Python<'p>,
@@ -1654,13 +1677,13 @@ impl PyStore {
         Ok(PyBytes::new(py, &v))
     }
 
-    /// Canonical manifest bytes and the CozyTensors header selected by its typed entry.
+    /// Canonical manifest bytes and an optional CozyTensors header selected by its typed entry.
     fn manifest<'p>(&self, py: Python<'p>, hex: &str) -> PyResult<Bound<'p, PyDict>> {
         let (m, mb, hb) = self.load(py, hex)?;
         let d = PyDict::new(py);
         d.set_item("manifest_id", m.manifest_id())?;
         d.set_item("manifest", PyBytes::new(py, &mb))?;
-        d.set_item("header", PyBytes::new(py, &hb))?;
+        d.set_item("header", hb.as_deref().map(|bytes| PyBytes::new(py, bytes)))?;
         Ok(d)
     }
 
@@ -2491,7 +2514,7 @@ impl PyDerivedWriter {
 }
 
 impl PyStore {
-    fn load(&self, py: Python<'_>, hex: &str) -> PyResult<(Manifest, Vec<u8>, Vec<u8>)> {
+    fn load(&self, py: Python<'_>, hex: &str) -> PyResult<(Manifest, Vec<u8>, Option<Vec<u8>>)> {
         let hex = hex.trim_start_matches("sha256:").to_string();
         let len = std::fs::metadata(self.store.manifest_path(&hex))
             .map(|m| m.len())
@@ -2501,24 +2524,12 @@ impl PyStore {
             length: len,
         };
         let m = checkpoint::load_manifest(&self.store, &r).or_refuse(py)?;
-        let hr = match m.header() {
-            Some(h) => h.clone(),
-            None => {
-                return Err(to_py(
-                    py,
-                    &Refusal {
-                        code: Code::MISSING_FIELD,
-                        detail: format!("manifest {} attaches no header", m.manifest_id()),
-                    },
-                ))
-            }
-        };
-        let h = checkpoint::load_header(&self.store, &hr).or_refuse(py)?;
-        Ok((
-            m.clone(),
-            m.canonical_bytes(),
-            h.canonical_bytes().or_refuse(py)?,
-        ))
+        let header = m
+            .header()
+            .map(|reference| checkpoint::load_header(&self.store, reference)?.canonical_bytes())
+            .transpose()
+            .or_refuse(py)?;
+        Ok((m.clone(), m.canonical_bytes(), header))
     }
 }
 

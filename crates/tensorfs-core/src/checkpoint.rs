@@ -477,7 +477,11 @@ pub fn walk_cozytensors(store: &Store, snap: &Manifest) -> Result<Walk> {
 /// Repository completeness, checkout, retention, and accounting use this full walk; workers
 /// use `walk_cozytensors` because an optional README or sample image is not a runtime input.
 pub fn walk(store: &Store, snap: &Manifest) -> Result<Walk> {
-    let mut w = walk_cozytensors(store, snap)?;
+    let mut w = if snap.header().is_some() {
+        walk_cozytensors(store, snap)?
+    } else {
+        Walk::default()
+    };
 
     // Anything listed that the header does not account for is a sibling asset — with two
     // audit-driven tightenings (external review, folded in at tfs-003):
