@@ -386,10 +386,11 @@ func sourceIdentityFileAt(name, file string) (sourceIdentityFile, *exit.Error) {
 
 type projectMetadata struct {
 	Project struct {
-		Name                 string              `toml:"name"`
-		Version              string              `toml:"version"`
-		Dependencies         []string            `toml:"dependencies"`
-		OptionalDependencies map[string][]string `toml:"optional-dependencies"`
+		Name                 string                       `toml:"name"`
+		Version              string                       `toml:"version"`
+		Dependencies         []string                     `toml:"dependencies"`
+		OptionalDependencies map[string][]string          `toml:"optional-dependencies"`
+		EntryPoints          map[string]map[string]string `toml:"entry-points"`
 	} `toml:"project"`
 	Tool struct {
 		Cozy struct {
