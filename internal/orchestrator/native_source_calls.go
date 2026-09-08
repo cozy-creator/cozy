@@ -40,6 +40,14 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 	refuse := func(problem *exit.Error) {
 		c.sendChildResult(s, call, "", pb.ChildCallState_CHILD_CALL_STATE_REFUSED, nil, problem)
 	}
+	c.mu.Lock()
+	worker := c.workers[s.instanceID]
+	supported := worker != nil && worker.wireMinor >= 42
+	c.mu.Unlock()
+	if !supported {
+		refuse(exit.Named(exit.Conflict, "native.source_wire_unsupported", "native source operations require worker protocol 42"))
+		return true
+	}
 	if !bytes.Equal(call.InterfaceDigest, nativeinterface.SourceDigest()) || nativeSourceOperation(call.Export) == 0 {
 		refuse(exit.New(exit.Validation, "source call is not a fixed native interface"))
 		return true
@@ -80,7 +88,7 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 }
 func (c *Orchestrator) sendNativeSource(s *session, call *pb.ChildCallRequest, id string, phase pb.NativeSourcePhase, selection *pb.NativeSourceSelection) {
 	command := &pb.NativeSourceCommand{RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, ParentCall: proto.Clone(call).(*pb.ChildCallRequest), ServiceId: id, Operation: nativeSourceOperation(call.Export), Phase: phase, Selection: selection}
-	if credentials, ok := c.opt.Packages.(interface{ NativeSourceCredential(string) string }); ok {
+	if credentials, ok := c.opt.Packages.(interface{ NativeSourceCredential(string) string }); ok && phase != pb.NativeSourcePhase_NATIVE_SOURCE_PHASE_CANCEL {
 		command.Credential = credentials.NativeSourceCredential(call.Export)
 	}
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_NativeSourceCommand{NativeSourceCommand: command}})
@@ -145,8 +153,18 @@ func (c *Orchestrator) onNativeSourceStatus(s *session, status *pb.NativeSourceS
 		}
 		c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_SUCCEEDED, status.ResultCanonicalBytes, nil)
 	case pb.NativeSourceState_NATIVE_SOURCE_STATE_FAILED:
-		_ = c.opt.Store.StopNativeCall(row.ID, "failed", "native_source_failed")
-		c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_FAILED, nil, exit.Named(exit.Failed, "native.source_failed", "native source operation failed; retained bytes remain available"))
+		code := status.SafeCode
+		valid := len(code) > 0 && len(code) <= 64
+		for _, letter := range code {
+			if !(letter >= 'A' && letter <= 'Z' || letter == '_') {
+				valid = false
+			}
+		}
+		if !valid {
+			code = "native_source_failed"
+		}
+		_ = c.opt.Store.StopNativeCall(row.ID, "failed", code)
+		c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_FAILED, nil, exit.Named(exit.Failed, "native.source_failed", "native source operation failed (%s); retained bytes remain available", code))
 	case pb.NativeSourceState_NATIVE_SOURCE_STATE_CANCELED:
 		_ = c.opt.Store.StopNativeCall(row.ID, "stopped", "native_source_stopped")
 		c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_CANCELED, nil, nil)
