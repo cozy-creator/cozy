@@ -90,7 +90,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 		code, out = runCozy(t, root, "--json", "run", video, spelling)
 		folded := refusalOf(t, out)
 		if code != 1 || folded.Code != "request_payload_invalid" ||
-			!strings.Contains(folded.Message, `missing required field "first_frame"`) ||
+			!strings.Contains(folded.Message, `provide required arguments: ["first_frame"]`) ||
 			strings.Contains(folded.Message, `"prompt"`) {
 			t.Fatalf("%s did not fold onto prompt [exit %d]\n%s", spelling, code, out)
 		}
