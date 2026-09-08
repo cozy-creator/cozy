@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -143,13 +145,36 @@ func TestAttemptScopedInputsAgainstPodMedia(t *testing.T) {
 	}
 	_, problem := client.ReserveOutputs(slotA, 0)
 	fatal(t, problem)
+	// Let the actual receiver commit the input, then drop its response before
+	// Creator can obtain a path. The next upload retries the same binding.
+	proxy := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: address})
+	var committed atomic.Bool
+	proxy.ModifyResponse = func(response *http.Response) error {
+		if response.StatusCode >= 400 {
+			return nil
+		}
+		_, err := io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		if err != nil {
+			return err
+		}
+		committed.Store(true)
+		return fmt.Errorf("discard committed upload response")
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
+		connection, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = connection.Close()
+		}
+	}
+	lostReply := httptest.NewServer(proxy)
+	defer lostReply.Close()
+	interrupted := inputMediaClient(t, strings.TrimPrefix(lostReply.URL, "http://"), time.Second)
+	if path, problem := interrupted.PutInput(slotA, "payload", body); problem == nil || path != "" || !committed.Load() {
+		t.Fatalf("lost committed response yielded a grant: %q, %v, committed=%t", path, problem, committed.Load())
+	}
 	path, problem := client.PutInput(slotA, "payload", body)
 	fatal(t, problem)
-	retry, problem := client.PutInput(slotA, "payload", body)
-	fatal(t, problem)
-	if retry != path {
-		t.Fatal("identical retry did not reuse cache path")
-	}
 	if _, problem := client.PutInput(slotA, "payload", []byte("changed binding")); problem == nil {
 		t.Fatal("receiver rebound an existing input to changed bytes")
 	}
@@ -173,6 +198,31 @@ func TestAttemptScopedInputsAgainstPodMedia(t *testing.T) {
 	must(t, err)
 	if !bytes.Equal(got, body) {
 		t.Fatal("attempt cleanup changed the borrowed original")
+	}
+	for _, boundary := range []string{"reserved", "payload", "file"} {
+		t.Run("cancel_"+boundary, func(t *testing.T) {
+			slot := media.Slot("cancel-"+boundary, 1)
+			_, problem := client.ReserveOutputs(slot, 0)
+			fatal(t, problem)
+			if boundary != "reserved" {
+				_, problem = client.PutInput(slot, "payload", body)
+				fatal(t, problem)
+			}
+			if boundary == "file" {
+				_, problem = client.PutInputFile(slot, "input-0", original, inputDigest(body), int64(len(body)))
+				fatal(t, problem)
+			}
+			fatal(t, client.DropAttempt(slot))
+			fatal(t, client.DropAttempt(slot))
+			if _, problem = client.PutInput(slot, "payload", body); problem == nil {
+				t.Fatal("released reservation still accepted an input")
+			}
+			got, err := os.ReadFile(shared)
+			must(t, err)
+			if !bytes.Equal(got, body) {
+				t.Fatal("cancellation removed another attempt's input")
+			}
+		})
 	}
 }
 

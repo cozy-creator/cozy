@@ -568,14 +568,6 @@ func digestOf(data []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-func shortDigest(d string) string {
-	bare := strings.TrimPrefix(d, "sha256:")
-	if len(bare) > 12 {
-		return "sha256:" + bare[:12]
-	}
-	return d
-}
-
 func brief(s string) string {
 	s = strings.Join(strings.Fields(s), " ")
 	if len(s) > 200 {
