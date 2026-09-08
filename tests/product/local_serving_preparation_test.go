@@ -291,6 +291,7 @@ cozy-runtime={path=%q}
 				if parent != prepared.WorkerPID {
 					t.Fatalf("constructor parent %d is not preparation worker %d", parent, prepared.WorkerPID)
 				}
+				t.Logf("actual worker %d reported constructor child %s on meta; metadata intake did not initialize it", prepared.WorkerPID, match[1])
 				return
 			}
 			if prepared.Error != "" {
@@ -360,6 +361,7 @@ cozy-runtime={path=%q}
 			if !strings.Contains(out, `"value":12`) {
 				t.Fatalf("normal inference did not read the actual filled tensors: %s", out)
 			}
+			t.Logf("actual worker %d retained components %v and immutable environment %s; inference returned 12", prepared.WorkerPID, components, acquired.Receipt)
 		})
 	}
 }
