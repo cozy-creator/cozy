@@ -253,6 +253,17 @@ fn list_observed(
     deadline: Deadline,
     ledger: &Ledger,
 ) -> Result<Vec<SourceMember>> {
+    list_selected_observed(uri, endpoints, credentials, deadline, ledger, None)
+}
+
+fn list_selected_observed(
+    uri: &SourceUri,
+    endpoints: &Endpoints,
+    credentials: &dyn CredentialProvider,
+    deadline: Deadline,
+    ledger: &Ledger,
+    files: Option<&[String]>,
+) -> Result<Vec<SourceMember>> {
     let policy = endpoints.policy(uri);
     let base = endpoints.base(uri);
     let mut members = match uri {
@@ -289,6 +300,9 @@ fn list_observed(
                     let Some(path) = json_str(row, "path") else {
                         return refuse(Code::MISSING_FIELD, "a tree row names no path");
                     };
+                    if files.is_some_and(|files| !files.iter().any(|file| file == path)) {
+                        continue;
+                    }
                     if !member_path(path) {
                         // Every HuggingFace repository carries `.gitattributes`, and a
                         // leading dot is outside the member grammar. Refusing the whole
@@ -1388,7 +1402,8 @@ pub fn resolve_files(
     }
     let ledger = Ledger::new();
     let policy = endpoints.policy(uri);
-    let listed = list_observed(uri, endpoints, credentials, deadline, &ledger)?;
+    let listed =
+        list_selected_observed(uri, endpoints, credentials, deadline, &ledger, Some(&names))?;
     // Establish the whole roster before fetching any body. A missing later member
     // must not turn a partial requested tree into a successful smaller selection.
     let selected = names
@@ -2384,7 +2399,7 @@ mod tests {
             {{"type":"file","path":"tokenizer.json","size":{}}},
             {{"type":"file","path":"unused.py","size":99}}
         ]"#,
-            "a".repeat(64),
+            "*".repeat(64),
             config.len(),
             tokenizer.len()
         );
