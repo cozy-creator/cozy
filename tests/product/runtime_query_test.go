@@ -4,11 +4,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // TestSlowRuntimeMetadataIsAnswered is xs-007 row 10 as behaviour.
@@ -27,8 +30,11 @@ func TestSlowRuntimeMetadataIsAnswered(t *testing.T) {
 	}
 	root := t.TempDir()
 	slowRuntime := filepath.Join(root, "cozy-runtime") //cozy:allow a stand-in runtime, not this host's
-	must(t, os.WriteFile(slowRuntime, []byte("#!/bin/sh\nsleep 6\n"+
+	version := strings.TrimPrefix(stubRuntime(t, hostruntime.Floor, pb.WireMinor), "#!/bin/sh\n")
+	must(t, os.WriteFile(slowRuntime, []byte("#!/bin/sh\nfor arg in \"$@\"; do\n"+
+		"if [ \"$arg\" = version ]; then\n"+version+"exit 0\nfi\ndone\nsleep 6\n"+
 		`printf '{"job_descriptor_id":"jd-slow"}\n'`+"\n"), 0o700))
+	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	facts := &launch.Facts{
 		Install:          records.PackageInstall{Package: "acme/slow"},

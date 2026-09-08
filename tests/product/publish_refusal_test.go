@@ -260,10 +260,10 @@ func TestPublishBuildAcceptsCompliantPackage(t *testing.T) {
 	pyprojectPath := filepath.Join(project, "pyproject.toml")
 	metadata, err := os.ReadFile(pyprojectPath)
 	must(t, err)
-	pinned := regexp.MustCompile(`"cozy-runtime\[media\]==([0-9][0-9a-zA-Z.]*)"`)
+	pinned := regexp.MustCompile(`"cozy-runtime\[media\]>=([0-9][0-9a-zA-Z.]*),<1"`)
 	match := pinned.FindStringSubmatch(string(metadata))
 	if match == nil {
-		t.Fatalf("weightless fixture no longer pins cozy-runtime:\n%s", metadata)
+		t.Fatalf("weightless fixture no longer declares its bounded cozy-runtime range:\n%s", metadata)
 	}
 	ranged := fmt.Sprintf(`"cozy-runtime[media]>=%s,<2", "cozy-weightless-helper==0.0.1"`, match[1])
 	rewritten := strings.Replace(string(metadata), match[0], ranged, 1)
