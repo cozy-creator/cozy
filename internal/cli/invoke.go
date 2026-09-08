@@ -1213,7 +1213,6 @@ type RunProgress struct {
 	rawJSON         bool
 	mu              sync.Mutex
 	last            string
-	dirty           bool
 	closed          bool
 	began           time.Time
 	waitedSince     time.Time
@@ -1543,9 +1542,6 @@ func (p *RunProgress) Done() {
 	if p.ctx.Mode().Color && !p.ctx.Mode().Full {
 		p.finishLive("")
 		return
-	}
-	if p.dirty && p.ctx.Mode().Color {
-		fmt.Fprintln(p.ctx.Err)
 	}
 }
 
