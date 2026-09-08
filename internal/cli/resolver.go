@@ -519,6 +519,23 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 			}
 		}
 	}
+	if len(models) > 0 && len(packageInterface.Entrypoints) > 1 {
+		// ONE PLACEMENT PER CONSTRUCTION (h3a-018). The selection also binds every
+		// sibling slot the owner bound to the same model release under the same ladder,
+		// so the pod prepares both entrypoints once and a switch between them is a
+		// dispatch. The hub's binding rows are the one source of what the owner bound.
+		rows, problem := r.catalog.PackageBindings(ctx, ref)
+		if problem != nil {
+			return empty, nil, problem
+		}
+		defaults := make(map[string]hub.PackageBindingRow, len(rows))
+		for _, row := range rows {
+			defaults[row.Slot] = row
+		}
+		for i := range models {
+			models[i].SharedSlots = sharedSlots(models[i], entrypoint, packageInterface.Entrypoints, defaults)
+		}
+	}
 	planID := ""
 	if len(models) == 0 {
 		body, err := canonical.Write(map[string]canonical.Value{
@@ -852,4 +869,61 @@ func dedupe(in []string) []string {
 		last = v
 	}
 	return out
+}
+
+// sharedSlots names the sibling entrypoints' slots one selection also binds (h3a-018): a
+// slot of another entrypoint declaring the selected slot's model class, whose hub default
+// names the same model release and offers the selected lane — the same ladder for an
+// unpinned selection, a rung carrying the pinned lane for an explicit one. Those slots
+// construct the same object from the same bytes on every machine class, so the pod serves
+// them from one placement. Anything else — another class, another release, another
+// ladder — is its own construction and stays out.
+func sharedSlots(model orchestrator.ModelRef, own *launch.Entrypoint, all []launch.Entrypoint,
+	defaults map[string]hub.PackageBindingRow) []string {
+	class := ""
+	for _, slot := range own.Models {
+		if slot.Path == model.Slot {
+			class = slot.Class
+		}
+	}
+	var out []string
+	for i := range all {
+		sibling := &all[i]
+		if sibling.Name == own.Name {
+			continue
+		}
+		for _, slot := range sibling.Models {
+			row, bound := defaults[slot.Path]
+			if slot.Class != class || !bound || row.Model != model.Model || row.Release != model.Release ||
+				!ladderOffers(row.Ladder, model) {
+				continue
+			}
+			out = append(out, slot.Path)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ladderOffers answers whether a sibling's ladder serves the selection: rung for rung the
+// same ladder when the selection still carries one, or a rung on the pinned lane when the
+// caller pinned it explicitly.
+func ladderOffers(ladder []hub.BindingRung, model orchestrator.ModelRef) bool {
+	if model.Pinned() {
+		for _, rung := range ladder {
+			if rung.Lane == model.Lane {
+				return true
+			}
+		}
+		return false
+	}
+	if len(ladder) != len(model.Ladder) {
+		return false
+	}
+	for i, rung := range ladder {
+		if rung.GPU != model.Ladder[i].GPU || rung.Lane != model.Ladder[i].Lane {
+			return false
+		}
+	}
+	return true
 }

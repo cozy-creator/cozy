@@ -1145,7 +1145,13 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			return WorkerLaunchSpec{}, "", exit.Unavailablef(
 				"published remote package preparation requires a package_set signer")
 		}
-		if e := c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
+		c.mu.Lock()
+		held := preparedPlacementServes(c.workers[instance], logical)
+		c.mu.Unlock()
+		if held {
+			c.logf("%s: rental %s already holds %s/%s under this selection; no package prepare",
+				req.ID, req.Worker, logical.Package, logical.Function)
+		} else if e := c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
 			Package: logical.Package, Release: logical.Release,
 		}}, downloadModelRefs(logical.Models)); e != nil {
 			return WorkerLaunchSpec{}, "", e
@@ -1695,8 +1701,13 @@ func downloadModelRefs(models []ModelRef) []*pb.DownloadModelRef {
 		if model.BindingPath != "" {
 			path = model.BindingPath
 		}
-		out = append(out, &pb.DownloadModelRef{Package: model.Package, Slot: path,
-			Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest})
+		// ONE PLACEMENT PER CONSTRUCTION (h3a-018): the selection rides under every slot
+		// that shares its bytes, so the pod binds each of those entrypoints in the one
+		// placement it prepares.
+		for _, slot := range append([]string{path}, model.SharedSlots...) {
+			out = append(out, &pb.DownloadModelRef{Package: model.Package, Slot: slot,
+				Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest})
+		}
 	}
 	return out
 }

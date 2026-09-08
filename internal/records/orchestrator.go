@@ -580,6 +580,14 @@ type ModelRef struct {
 	// accelerator and pins Lane/Manifest/Bytes from it. A pinned ref keeps the ladder as
 	// the owner's word on where its lane fits (cl-170): an explicit override is not a rung.
 	Ladder []ModelRung `json:"ladder,omitempty"`
+	// SharedSlots are the OTHER interface slots this selection also binds, under the same
+	// bytes (h3a-018): sibling entrypoints whose slot declares the same model class and
+	// whose hub default names the same model release and ladder. The download set selects
+	// the model under every one of them, so the pod prepares ONE placement carrying every
+	// entrypoint of the construction and a switch between them is a dispatch, not a
+	// prepare. Sizing reads Slot alone: the siblings share the construction, they do not
+	// add to it.
+	SharedSlots []string `json:"shared_slots,omitempty"`
 }
 
 // ModelRung is one (gpu, lane) fit resolved against the model card.
