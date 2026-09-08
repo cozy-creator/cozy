@@ -20,5 +20,5 @@ func (r *Resolver) ResolveWorkspace() (orchestrator.WorkerLaunchSpec, *exit.Erro
 		return orchestrator.WorkerLaunchSpec{}, exit.Internalf("cannot prepare the Runtime workspace artifact directory: %s", err)
 	}
 	return orchestrator.WorkerLaunchSpec{Python: runtime, Args: []string{"serve"},
-		Dir: r.cfg.Home, TensorFSRoot: r.cfg.TensorFSRoot, ArtifactCache: artifacts, Warmup: orchestrator.WarmupNone}, nil
+		Dir: r.cfg.Home, TensorFSRoot: r.cfg.TensorFSRoot, ArtifactCache: artifacts}, nil
 }

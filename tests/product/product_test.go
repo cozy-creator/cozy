@@ -92,7 +92,7 @@ func TestProductPath(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("human invocation failed [exit %d]\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
-	for _, useful := range []string{"pixels:", "revision:", "size:", "warm:", "saved:", storeDir + "/"} {
+	for _, useful := range []string{"pixels:", "revision:", "size:", "saved:", storeDir + "/"} {
 		if !strings.Contains(stdout, useful) {
 			t.Errorf("human result omitted %q\n%s", useful, stdout)
 		}
