@@ -52,12 +52,14 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	for _, asset := range r.Assets {
 		held := false
 		for _, original := range parent.Assets {
-			if asset.Digest == original.Digest && asset.Length == original.Length &&
-				asset.MediaType == original.MediaType && asset.LocalPath == original.LocalPath {
+			if sameAssetCustody(asset, original) {
 				held = true
 				break
 			}
 		}
+		if asset.Native != nil {
+			held = true
+		} // Rechecked transactionally below against the parent recipient hold.
 		if !held {
 			return Request{}, false, exit.Named(exit.Conflict, "child.asset_ungranted", "child input bytes are not owned by the current parent")
 		}
@@ -88,6 +90,35 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	}
 	if !fresh {
 		return recorded, false, nil
+	}
+	recorded.Capture = r.Capture
+	if _, err := tx.Exec("UPDATE requests SET capture=? WHERE id=?", r.Capture, recorded.ID); err != nil {
+		return Request{}, false, exit.Internalf("cannot persist capture options: %s", err)
+	}
+
+	for i, asset := range recorded.Assets {
+		if asset.Native == nil {
+			continue
+		}
+		if asset.LocalPath != "" || asset.Digest != asset.Native.Output.Digest || asset.Length != asset.Native.Output.Length || asset.MediaType != asset.Native.Output.MimeType {
+			return Request{}, false, exit.New(exit.Validation, "byte input differs from native output identity")
+		}
+		h, problem := reserveByteRetentionTx(tx, recorded, "input", asset.FieldPath, asset.Native.Output, asset.Native.RetentionID)
+		if problem != nil {
+			return Request{}, false, problem
+		}
+		copied := *asset.Native
+		copied.RetentionID = h.RetentionID
+		recorded.Assets[i].Native = &copied
+	}
+	if len(recorded.Assets) > 0 {
+		body, err := json.Marshal(recorded.Assets)
+		if err != nil {
+			return Request{}, false, exit.Internalf("cannot encode byte admission: %s", err)
+		}
+		if _, err := tx.Exec("UPDATE requests SET assets=? WHERE id=?", string(body), recorded.ID); err != nil {
+			return Request{}, false, exit.Internalf("cannot retain byte inputs: %s", err)
+		}
 	}
 	var arguments map[string]json.RawMessage
 	if len(r.Models) > 0 && json.Unmarshal(r.Payload, &arguments) != nil {

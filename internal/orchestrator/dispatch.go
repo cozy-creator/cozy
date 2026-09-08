@@ -1451,6 +1451,13 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			},
 		}}
 	}
+	if req.Capture != "" {
+		var capture pb.ActivationCapture
+		if err := json.Unmarshal([]byte(req.Capture), &capture); err != nil {
+			return 0, exit.New(exit.Validation, "recorded capture options are invalid")
+		}
+		spec.Capture = &capture
+	}
 	canonicalBytes, digest, err := canonical.Identity(spec)
 	if err != nil {
 		return 0, exit.Internalf("cannot mint the InvocationSpec document: %s", err)
@@ -1929,6 +1936,10 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 	}
 	g.Inputs = append(g.Inputs, modelAccess(req)...)
 	for index, asset := range req.Assets {
+		if asset.Native != nil {
+			g.Inputs = append(g.Inputs, &pb.InputAccess{InputId: asset.FieldPath, NativeTree: &pb.NativeByteRetentionRequest{Source: asset.Native.Output.NativeRef(), RetentionId: asset.Native.RetentionID}})
+			continue
+		}
 		path, e := w.media.PutInputFile(slot+"-input-"+strconv.Itoa(index),
 			asset.LocalPath, asset.Digest, asset.Length)
 		if e != nil {
@@ -2023,6 +2034,16 @@ func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Reque
 func localAssetAccess(req records.Request) ([]*pb.InputAccess, *exit.Error) {
 	var inputs []*pb.InputAccess
 	for _, asset := range req.Assets {
+		if asset.Native != nil {
+			if req.ParentRequestID == "" {
+				return nil, exit.New(exit.Conflict, "native byte inputs require a private child grant")
+			}
+			if asset.LocalPath != "" || asset.Digest != asset.Native.Output.Digest || asset.Length != asset.Native.Output.Length || asset.MediaType != asset.Native.Output.MimeType {
+				return nil, exit.New(exit.Validation, "native input differs from recorded byte output")
+			}
+			inputs = append(inputs, &pb.InputAccess{InputId: asset.FieldPath, NativeTree: &pb.NativeByteRetentionRequest{Source: asset.Native.Output.NativeRef(), RetentionId: asset.Native.RetentionID}})
+			continue
+		}
 		limit := asset.MaxBytes
 		if limit <= 0 {
 			limit = asset.Length

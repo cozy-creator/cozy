@@ -14,6 +14,7 @@ type CachedOperation struct {
 	SourceAttempt                                                    int64
 	OutcomeBody                                                      []byte
 	Retentions                                                       []WeightsRetention
+	ByteRetentions                                                   []NativeArtifactRetention
 }
 
 func (s *Store) AdoptCachedOperation(id string, cached CachedOperation) *exit.Error {
@@ -70,7 +71,11 @@ func (s *Store) AdoptCachedOperation(id string, cached CachedOperation) *exit.Er
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM request_model_transfer_outputs WHERE request_id=? AND attempt=?`, source.ID, cached.SourceAttempt).Scan(&expected); err != nil {
 		return exit.Internalf("cannot read cached native result inventory: %s", err)
 	}
-	if len(cached.Retentions) != expected || (request.ChildArtifacts && expected == 0) {
+	var expectedBytes int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM byte_outputs WHERE request_id=? AND attempt=?`, source.ID, cached.SourceAttempt).Scan(&expectedBytes); err != nil {
+		return exit.Internalf("cannot read byte cache inventory: %s", err)
+	}
+	if len(cached.ByteRetentions) != expectedBytes || len(cached.Retentions) != expected || (request.ChildArtifacts && expected+expectedBytes == 0) {
 		return exit.Named(exit.Conflict, "operation.retention_incomplete", "cached result did not independently retain every native output")
 	}
 	seen := map[string]bool{}
@@ -92,6 +97,32 @@ func (s *Store) AdoptCachedOperation(id string, cached CachedOperation) *exit.Er
 		row, err := scanWeightsRetention(tx.QueryRow(`SELECT `+weightsRetentionCols+` FROM request_weights_retentions WHERE request_id=? AND kind='result' AND slot=?`, id, hold.Slot))
 		if err != nil || row.RetentionID != hold.RetentionID || row.ProducerRequestID != hold.ProducerRequestID || row.ProducerAttempt != hold.ProducerAttempt || row.ProducerOutputSlot != hold.ProducerOutputSlot || row.State != "held" {
 			return exit.Named(exit.Conflict, "operation.retention_changed", "cached result ownership changed or was already released")
+		}
+	}
+
+	seenBytes := map[string]bool{}
+	for _, h := range cached.ByteRetentions {
+		if seenBytes[h.ProducerOutputID] {
+			return exit.New(exit.Validation, "cached byte output was repeated")
+		}
+		seenBytes[h.ProducerOutputID] = true
+		if h.ConsumerID != request.ID || h.ParentRequestID != request.ParentRequestID || h.Kind != "result" || h.ArtifactKind != "tree" || h.ProducerID != source.ID || h.ProducerAttempt != cached.SourceAttempt || h.Slot != h.ProducerOutputID || h.OwnerRequestID != source.ID || h.OwnerWorker != request.Worker || h.InstanceID == "" || h.WorkerBootID == "" || h.State != "held" {
+			return exit.New(exit.Validation, "cached byte recipient differs from exact request and producer")
+		}
+		b, err := scanByteOutput(tx.QueryRow(`SELECT `+byteOutputCols+` FROM byte_outputs WHERE request_id=? AND attempt=? AND output_id=?`, h.ProducerID, h.ProducerAttempt, h.ProducerOutputID))
+		if err != nil || b.ProducerRootID != h.TransactionID || b.ReceiptDigest != h.ReceiptDigest || b.ManifestID != h.ManifestID || b.ManifestLength != h.ManifestLength || b.ContentBytes != h.ContentBytes {
+			return exit.New(exit.Conflict, "cached byte retention differs from original output")
+		}
+		if _, err := canonical.Raw(h.RetentionID); err != nil {
+			return exit.New(exit.Validation, "cached byte retention identity is invalid")
+		}
+		_, err = tx.Exec(`INSERT INTO native_artifact_retentions(`+nativeArtifactCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(consumer_id,kind,slot) DO NOTHING`, h.ArtifactKind, h.ProducerAttempt, h.ProducerOutputID, h.ContentBytes, h.ConsumerID, h.ParentRequestID, h.Kind, h.Slot, h.ProducerID, h.ManifestID, h.ManifestLength, h.ReceiptDigest, h.TransactionID, h.OwnerRequestID, h.OwnerWorker, h.RetentionID, h.InstanceID, h.WorkerBootID, h.State)
+		if err != nil {
+			return exit.Internalf("cannot record cached byte retention: %s", err)
+		}
+		held, err := scanNativeArtifact(tx.QueryRow(`SELECT `+nativeArtifactCols+` FROM native_artifact_retentions WHERE consumer_id=? AND kind='result' AND slot=?`, request.ID, h.Slot))
+		if err != nil || held != h {
+			return exit.New(exit.Conflict, "cached byte ownership changed or was canceled")
 		}
 	}
 	if request.State != "canceling" {

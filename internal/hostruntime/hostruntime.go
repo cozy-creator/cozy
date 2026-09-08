@@ -20,11 +20,10 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Floor is the first release that statically describes plain scripts, managed operations,
-// and model types from their captured environment. The environment is a source location,
-// never an interpreter to start for description. This cohort also vendors the required
-// wire minor, so one remedy serves both admission checks.
-const Floor = "0.7.0"
+// Floor is the first release with wire43 private byte-result custody and observations.
+// Metadata description remains static against the captured source environment; one
+// coherent release remedy serves both host-tool and worker-wire admission checks.
+const Floor = "0.8.0"
 
 var floor = pep440.MustParse(Floor)
 

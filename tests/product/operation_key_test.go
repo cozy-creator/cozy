@@ -43,3 +43,18 @@ func TestOperationKeyExcludesHistoryAndPreservesObservableInputs(t *testing.T) {
 		t.Fatal("forged model override passed its resolved input binding")
 	}
 }
+
+func TestOperationCaptureOptionsParticipateInMemoIdentity(t *testing.T) {
+	request := records.Request{ChildTargetDigest: childDigest("a"), Payload: []byte(`{"value":7}`)}
+	before, problem := records.OperationKey(request)
+	fatal(t, problem)
+	request.Capture = `{"components":["dit"],"steps":[]}`
+	captured, problem := records.OperationKey(request)
+	fatal(t, problem)
+	request.Capture = `{"components":["dit"],"steps":[0,2]}`
+	selected, problem := records.OperationKey(request)
+	fatal(t, problem)
+	if before == captured || captured == selected || before == selected {
+		t.Fatal("capture request reused incompatible observation")
+	}
+}

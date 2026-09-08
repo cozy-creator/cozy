@@ -68,10 +68,23 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		return
 	}
 	iface, _ := canonical.Spell(call.InterfaceDigest)
-	identity, _ := json.Marshal(map[string]any{"interface_digest": iface, "module": call.Module, "export": call.Export, "request": json.RawMessage(payload)})
+	intent := map[string]any{"interface_digest": iface, "module": call.Module, "export": call.Export, "request": json.RawMessage(payload)}
+	capture, problem := captureOptions(call.Capture)
+	if problem != nil {
+		refuse(problem)
+		return
+	}
+	if capture != "" {
+		intent["capture"] = json.RawMessage(capture)
+	}
+	identity, _ := json.Marshal(intent)
 	identity, err = canonical.NormalizeJCS(identity)
 	if err != nil || !bytes.Equal(canonical.Digest(identity), call.IntentDigest) {
 		refuse(exit.Named(exit.Conflict, "child.intent_changed", "child intent digest does not match its exact target and input"))
+		return
+	}
+	if capture != "" && (call.Module == "cozy_runtime.author.sources" || call.Module == "cozy_runtime.author.checkpoints") {
+		refuse(exit.New(exit.Validation, "capture requires an ordinary model execution"))
 		return
 	}
 	if c.onNativeSourceCall(s, parent, call) {
@@ -128,6 +141,20 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 	request.ChildTargetDigest = target
 	request.ChildReusable = spec.ChildReusable
 	request.ChildArtifacts = spec.ChildArtifacts
+	request.Capture = capture
+	if capture != "" {
+		request.ChildArtifacts = true
+		for _, id := range splitList(request.Outputs) {
+			if id == "runtime.capture" {
+				refuse(exit.New(exit.Validation, "author output collides with runtime.capture"))
+				return
+			}
+		}
+		if request.Outputs != "" {
+			request.Outputs += ","
+		}
+		request.Outputs += "runtime.capture"
+	}
 	parentDigest, _ := canonical.Spell(call.ParentInvocationSpecDigest)
 	child, fresh, problem := c.opt.Store.SubmitChild(request, int64(call.ParentAttemptOrdinal), parentDigest, s.bootID)
 	if problem != nil {
@@ -144,17 +171,31 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 	c.watchChildCall(s, proto.Clone(call).(*pb.ChildCallRequest), child.ID)
 }
 
-func (c *Orchestrator) sendChildResult(s *session, call *pb.ChildCallRequest, child string, state pb.ChildCallState, result []byte, problem *exit.Error) {
+func (c *Orchestrator) sendChildResult(s *session, call *pb.ChildCallRequest, child string, state pb.ChildCallState, result []byte, problem *exit.Error, extras ...*pb.ChildCallResult) {
 	frame := &pb.ChildCallResult{RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID,
 		ParentRequestId: call.ParentRequestId, ParentAttemptOrdinal: call.ParentAttemptOrdinal, ParentInvocationSpecDigest: call.ParentInvocationSpecDigest,
 		CallIndex: call.CallIndex, IntentDigest: call.IntentDigest, ChildRequestId: child, State: state, ResultCanonicalBytes: result}
+	if len(extras) > 0 && extras[0] != nil {
+		frame.ByteResultGrants = extras[0].ByteResultGrants
+		frame.Observation = extras[0].Observation
+	}
 	if problem != nil {
 		frame.ResultCanonicalBytes = nil
+		frame.ByteResultGrants = nil
+		frame.Observation = nil
 		frame.SafeCode = problem.ErrName()
 		frame.SafeDetail = problem.Message
 		if len(frame.SafeDetail) > 1024 {
 			frame.SafeDetail = strings.ToValidUTF8(frame.SafeDetail[:1024], "")
 		}
+	}
+	if len(frame.ByteResultGrants) > pb.MaxChildArtifactGrants || proto.Size(frame) > pb.MaxInlineControlBytes {
+		frame.State = pb.ChildCallState_CHILD_CALL_STATE_FAILED
+		frame.ResultCanonicalBytes = nil
+		frame.ByteResultGrants = nil
+		frame.Observation = nil
+		frame.SafeCode = "child.result_bounds"
+		frame.SafeDetail = "child result exceeds bounded control metadata"
 	}
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ChildCallResult{ChildCallResult: frame}})
 }
@@ -219,6 +260,11 @@ func (c *Orchestrator) watchChildCall(s *session, call *pb.ChildCallRequest, id 
 				if problem == nil && row.State == "finalizing" {
 					problem = c.opt.Store.CompleteReusedChild(row.ID)
 				}
+				var byteGrants []*pb.ChildByteResultGrant
+				var observation *pb.ExecutionObservation
+				if problem == nil {
+					byteGrants, observation, problem = c.childByteGrants(s, call, *row)
+				}
 				if problem != nil && problem.Code == exit.Unavailable {
 					select {
 					case <-s.ctx.Done():
@@ -236,7 +282,7 @@ func (c *Orchestrator) watchChildCall(s *session, call *pb.ChildCallRequest, id 
 						_, _ = c.opt.Store.BlockRetainedWork(id, problem.ErrName(), problem.Message)
 					}
 				}
-				c.sendChildResult(s, call, id, state, result, problem)
+				c.sendChildResult(s, call, id, state, result, problem, &pb.ChildCallResult{ByteResultGrants: byteGrants, Observation: observation})
 				return
 			}
 			switch row.State {

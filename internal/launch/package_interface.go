@@ -587,7 +587,7 @@ func assetPaths(s Struct, prefix string) []string {
 		name := prefix + f.Name
 		kind, nested := typeOf(f.Type)
 		switch kind {
-		case "asset":
+		case "asset", "tree":
 			out = append(out, name)
 		case "struct":
 			out = append(out, assetPaths(nested, name+".")...)
