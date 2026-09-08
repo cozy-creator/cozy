@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"image"
 	"image/color"
@@ -16,11 +17,13 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
+var privateChildEvalWheel = flag.String("child-eval-wheel", "", "exact Cozy Eval wheel for managed scoring transport")
+
 // Real Creator, independent executors, generated interface wheel, staged input
 // custody and completed memo lookup; no synthetic control peer.
 func TestPrivateChildMediaUsesExistingInputGrantsAndMemo(t *testing.T) {
-	if *privateChildRuntimeWheel == "" {
-		t.Skip("requires exact candidate Runtime wheel with child media forwarding")
+	if *privateChildRuntimeWheel == "" || *privateChildEvalWheel == "" {
+		t.Skip("requires candidate Runtime and Cozy Eval wheels")
 	}
 	wheel, err := filepath.Abs(*privateChildRuntimeWheel)
 	must(t, err)
@@ -77,35 +80,24 @@ build-backend="hatchling.build"
 only-include=[%q]
 `, name, version, extra, wheel, sources, module+":app", module+".py")
 	}
-	write(child, "pyproject.toml", metadata("private-media-scorer", "scorer", "", ""))
+	evalWheel, err := filepath.Abs(*privateChildEvalWheel)
+	must(t, err)
+	evalVersion := strings.Split(filepath.Base(evalWheel), "-")[1]
+	write(child, "pyproject.toml", metadata("private-media-scorer", "scorer", `,"cozy-eval==`+evalVersion+`"`, "cozy-eval={path="+strconv.Quote(evalWheel)+"}"))
 	write(child, "package.toml", "[application]\nobject=\"scorer:app\"\n")
-	write(child, "scorer.py", `import hashlib
-import msgspec
-from typing import Annotated
-from cozy_runtime.author import App,Context,ImageAsset,AssetBound,MediaDecoder,invocable
-class Input(msgspec.Struct,tag="image"):
-    image: Annotated[ImageAsset,AssetBound(max_bytes=4096,max_decoded_bytes=4096)]
-class Result(msgspec.Struct):
-    digest: str
-@invocable(memoize=True)
-async def score(ctx:Context,*,media:Input,decoder:MediaDecoder)->Result:
-    image=decoder.decode_image(media.image)
-    return Result(hashlib.sha256(image.rgb).hexdigest())
-app=App()
-app.job(score)
-`)
+	write(child, "scorer.py", "from cozy_eval.operations import app\n")
 	write(project, "pyproject.toml", metadata("private-media-parent", "parent", `,"private-media-scorer==0.1.0"`, "private-media-scorer={path=\"./child\"}"))
 	write(project, "package.toml", "[application]\nobject=\"parent:app\"\n")
 	write(project, "parent.py", `import msgspec
 from typing import Annotated
 from cozy_runtime.author import App,Context,ImageAsset,AssetBound
-from scorer import score,Input,Result
+from cozy_eval.operations import score_pair,ImageInput,ScoreResult
 class Request(msgspec.Struct):
     image: Annotated[ImageAsset,AssetBound(max_bytes=4096,max_decoded_bytes=4096)]
 app=App()
 @app.job
-async def run(ctx:Context,payload:Request)->Result:
-    return await score(media=Input(image=payload.image))
+async def run(ctx:Context,payload:Request)->ScoreResult:
+    return await score_pair(baseline=ImageInput(image=payload.image),candidate=ImageInput(image=payload.image),metrics=["psnr","ssim"])
 `)
 	run := func(args ...string) {
 		t.Helper()
@@ -139,7 +131,7 @@ async def run(ctx:Context,payload:Request)->Result:
 		fatal(t, problem)
 		children, problem := store.Children(parent.ID)
 		fatal(t, problem)
-		if len(children) != 1 || children[0].State != "succeeded" || len(children[0].Assets) != 1 {
+		if len(children) != 1 || children[0].State != "succeeded" || len(children[0].Assets) != 2 {
 			t.Fatalf("child missing retained media: %+v", children)
 		}
 		if index == 0 {
