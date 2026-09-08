@@ -56,6 +56,9 @@ type Client struct {
 	http   *http.Client
 	scheme string
 	budget time.Duration
+	// Health runs before rental attachment. Only an explicit successful legacy
+	// health response selects the old routes; unprobed harness clients stay scoped.
+	legacyInputs atomic.Bool
 	// maxObject is the largest body this host will pull from the pod. A pod is a machine
 	// somebody else is running; without a bound here, one that streams forever streams
 	// into this process's memory. It is the OWNER's own per-output ceiling, passed in —
@@ -307,11 +310,9 @@ func (c *Client) Health() *exit.Error {
 		return c.skew("speaks media contract rev %d and this host speaks rev %d",
 			*said.ContractRev, mediawire.ContractRev)
 	}
-	if !said.AttemptScopedInputs {
-		return exit.Named(exit.Conflict, "media_input_scope_unsupported",
-			"the pod's media plane at %s does not support attempt-scoped inputs", c.spec.Addr).
-			WithRemedy("update the pod supervisor before attaching this rental; inputs require an existing attempt reservation")
-	}
+	// Existing rented pods keep their pinned supervisor. Its original media
+	// routes remain usable, and that old receiver never activates input GC.
+	c.legacyInputs.Store(!said.AttemptScopedInputs)
 	return nil
 }
 
@@ -352,15 +353,20 @@ func (c *Client) PutInputFile(slot, inputID, path, wantDigest string, wantLength
 	return c.putInput(slot, inputID, file, wantDigest, wantLength)
 }
 
-// putInput is shared by payload bytes and borrowed files. The receiver records
-// this exact input against the reserved attempt before returning its cache path.
+// putInput is shared by payload bytes and borrowed files. Scoped receivers record
+// the reserved attempt before returning a path; negotiated old peers use their
+// original opaque upload names. Neither transport retries through the other route.
 func (c *Client) putInput(slot, inputID string, body io.Reader, wantDigest string, wantLength int64) (string, *exit.Error) {
 	if slot == "" || inputID == "" {
 		return "", exit.New(exit.Validation, "media input requires an attempt slot and input ID")
 	}
+	path := "/v1/attempts/" + url.PathEscape(slot) + "/inputs/" + url.PathEscape(inputID)
+	if c.legacyInputs.Load() {
+		path = "/v1/inputs/" + url.PathEscape(slot+"-"+inputID)
+	}
 	hash := sha256.New()
 	request, err := http.NewRequest(http.MethodPut,
-		c.url("/v1/attempts/"+url.PathEscape(slot)+"/inputs/"+url.PathEscape(inputID)),
+		c.url(path),
 		io.TeeReader(body, hash))
 	if err != nil {
 		return "", exit.Internalf("cannot build the media upload: %s", err)
@@ -419,9 +425,11 @@ func (c *Client) ReserveOutputs(slot string, maxBytes int64, outputCount int) (s
 	if maxBytes < 0 || outputCount < 0 {
 		return "", exit.New(exit.Validation, "output reservation requires non-negative bytes and file count")
 	}
-	doc, _, e := c.call(http.MethodPost,
-		"/v1/outputs/"+url.PathEscape(slot)+"?max_bytes="+strconv.FormatInt(maxBytes, 10)+
-			"&output_count="+strconv.Itoa(outputCount), nil)
+	path := "/v1/outputs/" + url.PathEscape(slot) + "?max_bytes=" + strconv.FormatInt(maxBytes, 10)
+	if !c.legacyInputs.Load() {
+		path += "&output_count=" + strconv.Itoa(outputCount)
+	}
+	doc, _, e := c.call(http.MethodPost, path, nil)
 	if e != nil {
 		return "", e
 	}
