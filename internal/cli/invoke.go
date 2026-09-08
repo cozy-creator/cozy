@@ -116,8 +116,7 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		}
 		return handleRun(ctx, target, callable)
 	}
-	if len(ctx.Inv.Values["--asset"]) > 0 ||
-		ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" {
+	if ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
 			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --await, and --rental")
 	}
