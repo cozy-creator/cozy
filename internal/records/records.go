@@ -217,8 +217,9 @@ func open(path string, migratePrior bool, triageDir string) (*Store, *exit.Error
 // the obsolete aggregate package revision digest. Package, request, event, export, and rental rows survive;
 // schema 21 retains Tensorhub's sanitized terminal rental boot failure; schema 22 moves
 // each attempt's verified triage bundle bytes INTO the attempt row (cl-116), retiring the
-// triage file directory and its orphan class; schema 33 records the rental's WIDTH
-// (cl-179), the count of accelerators the paid pod delivers.
+// triage file directory and its orphan class; schema 34 records the rental's WIDTH
+// (cl-179). That column was initially shipped under the already released schema 33,
+// so migration accepts both exact 33 shapes and preserves existing width values.
 // only schema 9's superseded special
 // model-production subsystem is dropped.
 // Schema 10 creates empty request-attached transfer sidecars because older rows cannot be
@@ -497,13 +498,18 @@ func migrateInstalls(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 }
 
 // migrateRentals rebuilds the rentals table on every migration: schema 13 added ready_at,
-// schema 21 the sanitized boot failure, schema 33 the rental's WIDTH, and every earlier
-// shape carries the released column list without them. A rental that was already ready
+// schema 21 the sanitized boot failure, and schema 34 the rental's WIDTH (first shipped
+// under a second schema-33 shape). A rental that was already ready
 // when the schema moved gets no ready_at; its idle clock starts at its next settlement,
-// never at a guess. Every rental that predates schema 33 was bought one card wide — no
+// never at a guess. Every rental that predates the width field was bought one card wide — no
 // wider product could be expressed, let alone attached — so the width backfills to 1,
 // which is a fact about those rows and not a default standing in for an unknown.
+// A schema-33 row that already has width retains it verbatim, including zero.
 func migrateRentals(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
+	var hasWidth int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('rentals') WHERE name='accelerator_count'`).Scan(&hasWidth); err != nil {
+		return exit.Internalf("cannot inspect retained rental width in %s: %s", path, err)
+	}
 	if _, err := tx.Exec(`DROP INDEX rentals_machine_name`); err != nil {
 		return exit.Internalf("cannot stage rental index while migrating %s: %s", path, err)
 	}
@@ -515,6 +521,8 @@ func migrateRentals(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	}
 	columns := rentalColsPriorThirtyThree
 	switch {
+	case hasWidth == 1:
+		columns = rentalCols
 	case sourceVersion < 13:
 		columns = rentalColsPriorThirteen
 	case sourceVersion < 21:
@@ -524,8 +532,10 @@ func migrateRentals(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		columns + ` FROM rentals_prior`); err != nil {
 		return exit.Internalf("cannot preserve rental rows while migrating %s: %s", path, err)
 	}
-	if _, err := tx.Exec(`UPDATE rentals SET accelerator_count=1 WHERE accelerator_count=0`); err != nil {
-		return exit.Internalf("cannot record the width of retained rentals in %s: %s", path, err)
+	if hasWidth == 0 {
+		if _, err := tx.Exec(`UPDATE rentals SET accelerator_count=1`); err != nil {
+			return exit.Internalf("cannot record the width of retained rentals in %s: %s", path, err)
+		}
 	}
 	if _, err := tx.Exec(`DROP TABLE rentals_prior`); err != nil {
 		return exit.Internalf("cannot finish rental migration in %s: %s", path, err)
@@ -942,6 +952,19 @@ func verifyPriorSchema(db *sql.DB, path string, version int) *exit.Error {
 		return exit.Internalf("cannot inspect schema-%d records in %s: %s", version, path, err)
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		// PR400 and PR405 both shipped user_version33. Permit only the exact
+		// earlier table text, not arbitrary column subsets or unknown schema drift.
+		if version == 33 {
+			legacy := append([]string(nil), want...)
+			for index, row := range legacy {
+				if strings.HasPrefix(row, "table\x00rentals\x00") {
+					legacy[index] = strings.Replace(row, "  accelerator_count INTEGER NOT NULL DEFAULT 0,\n", "", 1)
+				}
+			}
+			if strings.Join(got, "\n") == strings.Join(legacy, "\n") {
+				return nil
+			}
+		}
 		return schemaReset(path, "records database claims schema %d but is not its exact released shape", version)
 	}
 	return nil
