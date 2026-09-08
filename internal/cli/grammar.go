@@ -320,7 +320,7 @@ type RunExecuteCmd struct {
 	Timeout        string   `help:"Request deadline."`
 	Stream         bool     `help:"Emit typed progress deltas."`
 	PayloadFile    string   `name:"in" help:"Read the whole payload from a JSON file, e.g. --in request.json." type:"path"`
-	Assets         []string `name:"asset" help:"Bind a local asset as field-path=file."`
+	Assets         []string `name:"asset" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
 	Rental         bool     `help:"Run on a Creator-managed rental."`
 	RentalOnly     bool     `help:"Require a remote rental even when local capacity is ready."`
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`

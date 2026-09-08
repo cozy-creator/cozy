@@ -66,6 +66,7 @@ type Entrypoint struct {
 	// result asset fields because worker-protocol rev5 OutputBinding has no kind.
 	WeightsOutputs []WeightsOutput `json:"weights_outputs"`
 	Invocable      *Invocable      `json:"invocable,omitempty"`
+	Assets         *AssetsSlot     `json:"assets,omitempty"`
 }
 
 type Invocable struct {
@@ -204,7 +205,7 @@ func validateClosedPackageInterface(data []byte) error {
 		}
 		for _, row := range rows {
 			required := []string{"name", "request", "result"}
-			optional := []string{"models", "invocable"}
+			optional := []string{"models", "invocable", "assets"}
 			if kind == "job" {
 				required = append(required, "publishes")
 				optional = append(optional, "weights_outputs")
@@ -220,6 +221,11 @@ func validateClosedPackageInterface(data []byte) error {
 			}
 			for _, name := range []string{"request", "result"} {
 				if err := validateStructRaw(callable[name]); err != nil {
+					return err
+				}
+			}
+			if metadata := callable["assets"]; metadata != nil {
+				if err := validateAssetsSlot(metadata, callable["request"]); err != nil {
 					return err
 				}
 			}

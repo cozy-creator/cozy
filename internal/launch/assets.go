@@ -2,6 +2,8 @@ package launch
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -24,18 +26,39 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 	var document map[string]any
 	decoder := json.NewDecoder(strings.NewReader(string(payload)))
 	decoder.UseNumber()
-	if err := decoder.Decode(&document); err != nil {
+	if err := decoder.Decode(&document); err != nil || document == nil {
 		return nil, nil, exit.Internalf("cannot add input assets to the payload: %s", err)
 	}
 
+	if problem := preflightAssetCount(ep, document, specs); problem != nil {
+		return nil, nil, problem
+	}
 	seen := map[string]bool{}
 	assets := make([]records.AssetBinding, 0, len(specs))
 	for _, spec := range specs {
-		fieldPath, source, ok := strings.Cut(spec, "=")
+		fieldPath, source, explicit := strings.Cut(spec, "=")
+		label := ""
+		if !explicit {
+			source = spec
+		} else if !namedAssetSpec(ep, fieldPath) && ep.Assets != nil {
+			label, explicit = fieldPath, false
+		}
+		if !explicit {
+			if ep.Assets == nil {
+				return nil, nil, exit.Usagef("%s declares no Assets input for --asset %q", ep.Name, spec).
+					WithRemedy("use --asset <field-path>=<file> for a named payload asset")
+			}
+			values, _ := document[ep.Assets.Parameter].([]any)
+			fieldPath = fmt.Sprintf("%s.%d.asset", ep.Assets.Parameter, len(values))
+			entry := map[string]any{}
+			if label != "" {
+				entry["label"] = label
+			}
+			document[ep.Assets.Parameter] = append(values, entry)
+		}
 		fieldPath, source = strings.TrimSpace(fieldPath), strings.TrimSpace(source)
-		if !ok || fieldPath == "" || source == "" {
-			return nil, nil, exit.Usagef("--asset %q is not <field-path>=<file>", spec).
-				WithRemedy("examples: `--asset first_frame=frame.png` or `--asset references.0.image=ref.jpg`")
+		if fieldPath == "" || source == "" {
+			return nil, nil, exit.Usagef("--asset %q needs a file", spec)
 		}
 		parts, e := assetPath(fieldPath)
 		if e != nil {
@@ -70,6 +93,17 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 			maxBytes = inputasset.MaxBytes
 		}
 
+		if source == "~" || strings.HasPrefix(source, "~/") {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return nil, nil, exit.New(exit.NotFound, "cannot resolve input asset home: %s", err)
+			}
+			if source == "~" {
+				source = home
+			} else {
+				source = filepath.Join(home, strings.TrimPrefix(source, "~/"))
+			}
+		}
 		absolute, err := filepath.Abs(source)
 		if err != nil {
 			return nil, nil, exit.New(exit.NotFound, "cannot resolve input asset %s: %s", source, err)
@@ -78,10 +112,15 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 		if e != nil {
 			return nil, nil, e
 		}
-		if !assetSpec.AcceptsMediaType(mediaType) {
+		selected, admitted := AssetSpecForMedia(ep, fieldPath, mediaType)
+		if !admitted || !selected.AcceptsMediaType(mediaType) {
 			return nil, nil, exit.New(exit.Validation,
 				"%s.%s accepts media types [%s], not %q",
 				ep.Name, fieldPath, strings.Join(assetSpec.MediaTypes, ", "), mediaType)
+		}
+		maxBytes = effectiveAssetMax(selected.MaxBytes)
+		if length > maxBytes {
+			return nil, nil, exit.Named(exit.Validation, "input_asset_bound", "input asset %s is %d B; its media policy permits %d B", fieldPath, length, maxBytes)
 		}
 		if e := setAssetRef(document, parts, digest); e != nil {
 			return nil, nil, e
@@ -154,6 +193,9 @@ func AssetSpec(ep *Entrypoint, path string) (AssetField, bool) {
 	parts, problem := assetPath(path)
 	if problem != nil {
 		return AssetField{}, false
+	}
+	if ep.Assets.contains(parts) {
+		return AssetField{Kind: "file", MaxBytes: ep.Assets.maxBytes()}, true
 	}
 	return assetSpecAt(ep.Request, parts, AssetField{})
 }

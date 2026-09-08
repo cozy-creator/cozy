@@ -411,7 +411,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.WeightsOutputs = job.WeightsOutputs
 		out.NeedsAccelerator = job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
-		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request}, &out); problem != nil {
+		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request, Assets: job.Assets}, &out); problem != nil {
 			return out, problem
 		}
 	}
@@ -461,7 +461,7 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 		out.ChildArtifacts = job.RetainsArtifacts
 		out.WeightsOutputs, out.NeedsAccelerator = job.WeightsOutputs, job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
-		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request}, &out); problem != nil {
+		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request, Assets: job.Assets}, &out); problem != nil {
 			return out, problem
 		}
 	}
@@ -535,17 +535,8 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"trees":           strings.Join(spec.Trees, ","),
 		"models":          models,
 	}
-	if len(spec.Assets) > 0 {
-		assets := append([]records.AssetBinding(nil), spec.Assets...)
-		sort.Slice(assets, func(i, j int) bool { return assets[i].FieldPath < assets[j].FieldPath })
-		rows := make([]canonical.Value, 0, len(assets))
-		for _, asset := range assets {
-			rows = append(rows, map[string]canonical.Value{
-				"field_path": asset.FieldPath, "digest": asset.Digest, "length": asset.Length,
-				"media_type": asset.MediaType, "order": int64(asset.Order),
-			})
-		}
-		doc["assets"] = rows
+	if assets := assetIdentity(spec.Assets); len(assets) > 0 {
+		doc["assets"] = assets
 	}
 	if spec.RetainWork {
 		doc["retain_work"] = true
