@@ -68,6 +68,11 @@ func TestChildByteResultHasIndependentRecipientAndCannotBeBorrowedByHash(t *test
 	if len(retained) != 1 || retained[0].Kind != "input" || retained[0].State != "pending" {
 		t.Fatal("input hold was not part of child admission")
 	}
+	borrowed, problem := store.PendingArtifactBorrowers(child.ID)
+	fatal(t, problem)
+	if !borrowed {
+		t.Fatal("producer cancellation ignored an unsettled native byte borrower")
+	}
 	stranger := offerChildParent(t, store, recordPrivateTransaction(t, store, "byte-stranger", ""))
 	forged := downstream
 	forged.ID = "req-byte-forged"
