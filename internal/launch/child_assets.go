@@ -73,11 +73,17 @@ func InheritChildAssets(ep *Entrypoint, payload []byte, parent []records.AssetBi
 		if maximum <= 0 {
 			maximum = inputasset.MaxBytes
 		}
-		if owned.Length > maximum || !spec.AcceptsMediaType(owned.MediaType) {
+		contentBytes := owned.Length
+		if owned.Native != nil {
+			contentBytes = owned.Native.Output.ContentBytes
+		}
+		if contentBytes > maximum || !spec.AcceptsMediaType(owned.MediaType) {
 			return nil, exit.Named(exit.Validation, "child.asset_bound", "inherited media exceeds the child field's byte or MIME bound")
 		}
-		if problem := inputasset.Verify(*owned, maximum); problem != nil {
-			return nil, problem
+		if owned.Native == nil {
+			if problem := inputasset.Verify(*owned, maximum); problem != nil {
+				return nil, problem
+			}
 		}
 		bound := *owned
 		bound.FieldPath, bound.Order, bound.MaxBytes = path, pathOrder(parts), maximum

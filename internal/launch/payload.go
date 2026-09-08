@@ -389,6 +389,9 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 	}
 	if input, ok := schema["input"]; ok && string(input) == `"tree"` {
 		if _, ok := value.(string); ok {
+			if assets != nil {
+				*assets = append(*assets, path)
+			}
 			return nil
 		}
 		return exit.New(exit.Validation, "request tree field %s is not a reference", path)

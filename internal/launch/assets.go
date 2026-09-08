@@ -297,6 +297,10 @@ func assetSpecAtValue(schema any, parts []string, inherited AssetField) (AssetFi
 	if !ok {
 		return AssetField{}, false
 	}
+	if object["input"] == "tree" {
+		inherited.Kind = "tree"
+		return inherited, len(parts) == 0
+	}
 	if kind, ok := object["asset"].(string); ok {
 		inherited.Kind = kind
 		return inherited, len(parts) == 0

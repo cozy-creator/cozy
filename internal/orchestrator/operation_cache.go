@@ -185,6 +185,29 @@ func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOn
 	}
 	outcome, _ := canonical.Spell(source.OutcomeDigest)
 	cached := records.CachedOperation{Key: key, SourceRequestID: source.RequestId, SourceAttempt: int64(source.AttemptOrdinal), InvocationDigest: invocation, OutcomeID: source.OutcomeId, OutcomeDigest: outcome, OutcomeBody: source.OutcomeCanonicalBytes}
+
+	byteOutputs, problem := c.opt.Store.ByteOutputs(source.RequestId, int64(source.AttemptOrdinal))
+	if problem != nil {
+		return false, problem
+	}
+	if len(byteOutputs) != len(answer.ByteRetentions) || len(answer.ByteRetentions)+len(answer.Retentions) > pb.MaxChildArtifactGrants {
+		return false, exit.New(exit.Structural, "cached byte output inventory changed")
+	}
+	for _, output := range byteOutputs {
+		var matched *pb.NativeByteRetentionResult
+		for _, held := range answer.ByteRetentions {
+			if held != nil && proto.Equal(held.Source, output.NativeRef()) {
+				if matched != nil {
+					return false, exit.New(exit.Structural, "cached byte recipient is duplicated")
+				}
+				matched = held
+			}
+		}
+		if matched == nil || matched.Released {
+			return false, exit.New(exit.Structural, "cached byte result lacks exact independent custody")
+		}
+		cached.ByteRetentions = append(cached.ByteRetentions, records.NativeArtifactRetention{ArtifactKind: "tree", ProducerAttempt: output.Attempt, ProducerOutputID: output.OutputID, ContentBytes: output.ContentBytes, ConsumerID: request.ID, ParentRequestID: request.ParentRequestID, Kind: "result", Slot: output.OutputID, ProducerID: source.RequestId, ManifestID: output.ManifestID, ManifestLength: output.ManifestLength, ReceiptDigest: output.ReceiptDigest, TransactionID: output.ProducerRootID, OwnerRequestID: source.RequestId, OwnerWorker: request.Worker, RetentionID: matched.RetentionId, InstanceID: s.instanceID, WorkerBootID: s.bootID, State: "held"})
+	}
 	for _, hold := range answer.Retentions {
 		if hold == nil {
 			return false, exit.New(exit.Structural, "cached operation returned an absent native retention")

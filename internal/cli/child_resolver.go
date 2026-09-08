@@ -6,6 +6,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -80,9 +81,7 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if facts == nil {
 		return out, "", exit.Named(exit.Conflict, "child.export_changed", "the captured child has no matching job facts")
 	}
-	if len(facts.Outputs) > len(facts.WeightsOutputs) {
-		return out, "", exit.Named(exit.Unavailable, "child.artifact_binding_required", "artifact and model child calls require explicit native reference adoption")
-	}
+
 	var arguments map[string]json.RawMessage
 	if json.Unmarshal(payload, &arguments) != nil {
 		return out, "", exit.New(exit.Validation, "child input is not an object")
@@ -113,12 +112,17 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	out = orchestrator.Submission{Kind: "job", RetainWork: true, Package: install.Package, Entrypoint: binding.Entrypoint, Release: install.Version, InstallID: install.ID,
 		PlanID: facts.DescriptorID, Payload: append([]byte(nil), payload...), Outputs: facts.Outputs, WeightsOutputs: facts.WeightsOutputs, NeedsAccelerator: facts.NeedsAccelerator, Org: parent.Org}
 	out.Models = models
-	out.Assets, problem = launch.InheritChildAssets(job, payload, parent.Assets)
+	received, problem := r.store.ReceivedByteAssets(parent.ID)
+	if problem != nil {
+		return out, "", problem
+	}
+	parentAssets := append(append([]records.AssetBinding(nil), parent.Assets...), received...)
+	out.Assets, problem = launch.InheritChildAssets(job, payload, parentAssets)
 	if problem != nil {
 		return out, "", problem
 	}
 	out.ChildReusable = job.Invocable.Memoize
-	out.ChildArtifacts = len(launch.ModelArtifactPaths(job.Result)) > 0
+	out.ChildArtifacts = len(launch.ModelArtifactPaths(job.Result)) > 0 || len(facts.Outputs) > len(facts.WeightsOutputs)
 	if parent.Worker != "" {
 		out.Worker, out.Rental, out.RentalRequired = parent.Worker, true, true
 		out.LocalPackageDigest = binding.LocalRevisionDigest
@@ -194,4 +198,30 @@ func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool,
 		}
 	}
 	return needed, nil
+}
+
+// PrivateByteOutputBound uses the captured result schema, with the same finite
+// asset bounds as ordinary inputs. A manifest entry cannot invent a result field.
+func (r *Resolver) PrivateByteOutputBound(request records.Request, path, mediaType string) (int64, *exit.Error) {
+	install, problem := r.store.Install(request.InstallID)
+	if problem != nil || install == nil {
+		return 0, exit.Unavailablef("byte result schema install is absent")
+	}
+	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir), install.PackageInterface)
+	if problem != nil {
+		return 0, problem
+	}
+	entry, problem := surface.Function(request.Entrypoint)
+	if problem != nil {
+		return 0, problem
+	}
+	spec, ok := launch.ResultAssetSpec(entry, path)
+	if !ok || !spec.AcceptsMediaType(mediaType) {
+		return 0, exit.New(exit.Validation, "native byte output is not a declared asset field")
+	}
+	maximum := spec.MaxBytes
+	if maximum <= 0 {
+		maximum = inputasset.MaxBytes
+	}
+	return maximum, nil
 }

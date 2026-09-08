@@ -11,6 +11,9 @@ import (
 )
 
 func (c *Orchestrator) changeNativeArtifactRetention(ctx context.Context, h records.NativeArtifactRetention, release bool) *exit.Error {
+	if h.ArtifactKind == "tree" {
+		return c.changeByteRetention(ctx, h, release)
+	}
 	owner, problem := c.opt.Store.RequestRow(h.OwnerRequestID)
 	if problem != nil || owner == nil {
 		return exit.Unavailablef("native artifact owner request is unavailable")
