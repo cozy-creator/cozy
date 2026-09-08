@@ -156,3 +156,23 @@ func TestSchema33WidthMigrationPreservesExplicitZeroAndRejectsUnknownShape(t *te
 		t.Fatal("refused migration changed retained database")
 	}
 }
+
+func TestRetainedWidthMigrationRollsBackBeforePublishingInvalidForeignKeys(t *testing.T) {
+	path, db := retainedWidthDatabase(t, false)
+	defer db.Close()
+	_, err := db.Exec(`UPDATE byte_outputs SET attempt=99`)
+	must(t, err)
+	before := tableRows(t, db, "byte_outputs")
+	store, problem := records.OpenForDaemon(path, "")
+	if store != nil {
+		store.Close()
+	}
+	if problem == nil || problem.ErrName() != "records.migration_foreign_key_failed" {
+		t.Fatalf("invalid retained foreign key must refuse before commit: %v", problem)
+	}
+	var version int
+	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
+	if version != 33 || columnNames(t, db, "rentals")["accelerator_count"] || tableRows(t, db, "byte_outputs") != before {
+		t.Fatal("failed migration published a partial schema or changed retained bytes")
+	}
+}

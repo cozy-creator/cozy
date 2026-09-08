@@ -434,6 +434,20 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
+	rows, err := tx.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		return exit.Internalf("cannot verify migrated foreign keys in %s: %s", path, err)
+	}
+	invalid := rows.Next()
+	readErr := rows.Err()
+	rows.Close()
+	if readErr != nil {
+		return exit.Internalf("cannot read migrated foreign keys in %s: %s", path, readErr)
+	}
+	if invalid {
+		return exit.Named(exit.Conflict, "records.migration_foreign_key_failed",
+			"records migration in %s would leave an invalid foreign-key reference", path)
+	}
 	if e := commitMigration(tx, path); e != nil {
 		return e
 	}
@@ -442,15 +456,6 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 	}
 	if _, err := db.Exec(`PRAGMA foreign_keys=ON`); err != nil {
 		return exit.Internalf("cannot restore foreign keys after migrating %s: %s", path, err)
-	}
-	rows, err := db.Query(`PRAGMA foreign_key_check`)
-	if err != nil {
-		return exit.Internalf("cannot verify migrated foreign keys in %s: %s", path, err)
-	}
-	defer rows.Close()
-	if rows.Next() {
-		return exit.Named(exit.Conflict, "records.migration_foreign_key_failed",
-			"records migration in %s left an invalid foreign-key reference", path)
 	}
 	return nil
 }
