@@ -42,7 +42,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 	// cl-106: --describe renders the callable's contract from the installed PackageInterface —
 	// the exact facts submit validates against — without dialing anything.
 	code, out = runCozy(t, root, "run", video, "--describe")
-	for _, expected := range []string{video, "prompt: str", "first_frame: image asset", "usage: " + usage} {
+	for _, expected := range []string{video, "prompt: str", "first_frame: image asset", "output:", "usage: " + usage} {
 		if code != 0 || !strings.Contains(out, expected) {
 			t.Fatalf("--describe omitted %q [exit %d]\n%s", expected, code, out)
 		}
@@ -78,7 +78,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 		t.Fatalf("promptless submit did not refuse typed with the usage line [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", video); code != 1 ||
-		!strings.Contains(out, "missing required fields") || !strings.Contains(out, usage) {
+		!strings.Contains(out, "provide required arguments: [") || !strings.Contains(out, "Arguments:") || !strings.Contains(out, usage) {
 		t.Fatalf("the human refusal lost its fields or usage line [exit %d]\n%s", code, out)
 	}
 
@@ -90,7 +90,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 		code, out = runCozy(t, root, "--json", "run", video, spelling)
 		folded := refusalOf(t, out)
 		if code != 1 || folded.Code != "request_payload_invalid" ||
-			!strings.Contains(folded.Message, `missing required field "first_frame"`) ||
+			!strings.Contains(folded.Message, `provide required arguments: ["first_frame"]`) ||
 			strings.Contains(folded.Message, `"prompt"`) {
 			t.Fatalf("%s did not fold onto prompt [exit %d]\n%s", spelling, code, out)
 		}

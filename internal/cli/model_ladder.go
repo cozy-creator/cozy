@@ -89,7 +89,9 @@ func localAccelerator(cfg config.Config) string {
 	return inventory.GPUs[0].Model
 }
 
-// localRung is the rung the host machine fits — local execution's lane decision.
+// localRung chooses a GPU-specific preference when present, otherwise the first
+// declared lane. The ladder is not a local hardware allowlist: Runtime still
+// checks actual encoding support, construction compatibility and memory capacity.
 func localRung(ctx *Context, ladder []hub.BindingRung) (hub.BindingRung, *exit.Error) {
 	accelerator := localAccelerator(ctx.Cfg)
 	for _, rung := range ladder {
@@ -97,14 +99,12 @@ func localRung(ctx *Context, ladder []hub.BindingRung) (hub.BindingRung, *exit.E
 			return rung, nil
 		}
 	}
-	have := accelerator
-	if have == "" {
-		have = "no NVIDIA GPU"
+	if len(ladder) > 0 {
+		return ladder[0], nil
 	}
-	return hub.BindingRung{}, exit.Named(exit.Unavailable, "model_ladder_no_local_fit",
-		"this host (%s) fits no rung of the binding ladder %s", have, hub.LadderText(ladder)).
-		WithRemedy("run it rented (--rental), override the slot with model.<param>=org/model@release/lane, " +
-			"or bind a '*' catch-all rung")
+	return hub.BindingRung{}, exit.Named(exit.Validation, "model_ladder_empty",
+		"the model binding has no default lanes").
+		WithRemedy("declare a default lane or supply model.<param>=org/model@release/lane")
 }
 
 // bindRemedy is the exact command that gives a slot its hub binding.
