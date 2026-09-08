@@ -8,8 +8,9 @@ import (
 )
 
 // OperationKey names computation, never its run history or custody recipients.
-// ChildTargetDigest already binds the exact implementation, interface and actual
-// numerical environment. Only declared injected Models hide receipt provenance
+// ChildTargetDigest binds the exact captured implementation and interface. The
+// selected numerical environment is bound separately by QualifiedOperationKey.
+// Only declared injected Models hide receipt provenance
 // from the implementation; ordinary value arguments remain intact.
 func OperationKey(request Request) (string, *exit.Error) {
 	if _, err := canonical.Raw(request.ChildTargetDigest); err != nil {

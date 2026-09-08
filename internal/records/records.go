@@ -115,7 +115,7 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
 
 func init() {
-	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL)
+	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
@@ -425,7 +425,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 		if _, err := tx.Exec(childArgumentsDDL); err != nil {
 			return exit.Internalf("cannot add serving child arguments: %s", err)
 		}
-		for _, statement := range []string{activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL} {
+		for _, statement := range []string{activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL} {
 			if _, err := tx.Exec(statement); err != nil {
 				return exit.Internalf("cannot add managed serving records: %s", err)
 			}
@@ -787,7 +787,7 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
-		if version < 35 && (statement == childArgumentsDDL || statement == activeChildRequestIndex || statement == activeNativeCallIndex || statement == servingPlacementsDDL) {
+		if version < 35 && (statement == childArgumentsDDL || statement == activeChildRequestIndex || statement == activeNativeCallIndex || statement == servingPlacementsDDL || statement == operationContextsDDL) {
 			continue
 		}
 		if version < 33 && statement == byteOutputsDDL {

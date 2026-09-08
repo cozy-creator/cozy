@@ -20,6 +20,8 @@ func operationHistory(t *testing.T, store *records.Store, label string, parent r
 	}
 	child, _, problem := store.SubmitChild(request, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
+	_, problem = store.BindOperationContext(child.ID, childDigest("f"))
+	fatal(t, problem)
 	return child
 }
 
@@ -45,7 +47,7 @@ func TestOperationArtifactScopeRequiresNativeCacheAdoption(t *testing.T) {
 		t.Fatal("same worker allowed a forged cross-run artifact grant")
 	}
 	consumer := operationHistory(t, store, "cached-native", second, true)
-	key, problem := records.OperationKey(consumer)
+	key, problem := records.QualifiedOperationKey(consumer, childDigest("f"))
 	fatal(t, problem)
 	fatal(t, store.BeginOperationLookup(consumer.ID, key))
 	last, problem := store.AttemptRow(source.ID, 1)
@@ -125,7 +127,7 @@ func proveOperationLookupAcrossFreshRunHistory(t *testing.T, workspace string) {
 	if consumer.ReuseScope == source.ReuseScope || second.RetryOf != "" {
 		t.Fatal("fixture did not create an unrelated run")
 	}
-	key, problem := records.OperationKey(consumer)
+	key, problem := records.QualifiedOperationKey(consumer, childDigest("f"))
 	fatal(t, problem)
 	last, problem := store.AttemptRow(source.ID, 1)
 	fatal(t, problem)
@@ -186,7 +188,7 @@ func TestOperationLookupBlocksPauseAndCancelUntilReconciled(t *testing.T) {
 			fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
 			parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "parent", "workspace"))
 			child := operationHistory(t, store, "pending-op", parent)
-			key, problem := records.OperationKey(child)
+			key, problem := records.QualifiedOperationKey(child, childDigest("f"))
 			fatal(t, problem)
 			fatal(t, store.BeginOperationLookup(child.ID, key))
 			if action == "pause" {
