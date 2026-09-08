@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -52,11 +52,14 @@ func InstallToolEnv(inst records.PackageInstall, env []string) []string {
 // no longer exit 4 on the owner's box before a request is even sent, it is a typed
 // BINDING_UNAVAILABLE from the pod that would have served it, naming that pod's own index.
 
-// RuntimeCLI is one install's own cozy-runtime binary, run against a named local root.
-// Every question this host asks the runtime goes through here, so there is one place
-// that knows how to invoke it and one place that renders its refusals.
+// RuntimeCLI invokes one cozy-runtime binary against a named local root. Every question this
+// host asks the runtime goes through here, so there is one place that knows how to invoke it
+// and one place that renders its refusals. A metadata question goes to THIS host's tool
+// (hostruntime.Path, at or above hostruntime.Floor): package code is untrusted and a reading of it
+// never imports it (cl-175). The install's own Runtime (Binary) is asked only for the
+// interface wheel its executor consumes.
 type RuntimeCLI struct {
-	Bin              string   // package Runtime for metadata; the control Runtime is selected separately
+	Bin              string   // the binary selected for the question: hostruntime.Path for metadata, Binary(install) for interface-wheel
 	Dir              string   // the package project root
 	PackageInterface string   // exact published package interface; empty for editable/source installs
 	Home             string   // COZY_HOME the runtime reads its artifact index out of
@@ -112,7 +115,7 @@ func (r RuntimeCLI) callInputContext(ctx context.Context, input []byte, out any,
 			WithRemedy("a package's surface is answered by the runtime the release itself pinned")
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return RuntimeExit(code, strings.Join(verb, " "), "runtime_query_failed",
+		return hostruntime.RuntimeExit(code, strings.Join(verb, " "), "runtime_query_failed",
 			stdout.String(), stderr.String())
 	}
 	if out == nil {
@@ -123,65 +126,4 @@ func (r RuntimeCLI) callInputContext(ctx context.Context, input []byte, out any,
 			strings.Join(verb, " "), err)
 	}
 	return nil
-}
-
-// RuntimeExit is the ONE reading of a cozy-runtime child that exited non-zero. The exit
-// matrix is SHARED (cozy-runtime-cli.md), so a runtime exit is already a cozy exit and the
-// `--json` refusal it wrote is already the answer: code, name, message and remedy pass
-// through as themselves. Nothing here re-labels. The runtime is the only layer that
-// evaluated the wheels, the GPU, the CAS or the models, so it alone names the verdict —
-// preparation, wheel, GPU, CAS and network refusals keep their names, and "does not fit"
-// is said by a Fit and nobody else (model-code-fit §3). A child that died without a
-// document (a signal, a traceback) is `untyped`, with the tail of what it wrote as the
-// detail, because the end of a traceback is where the exception is.
-func RuntimeExit(code int, verb, untyped, stdout, stderr string) *exit.Error {
-	var doc struct {
-		Error struct {
-			Name    string `json:"name"`
-			Message string `json:"message"`
-			Remedy  string `json:"remedy"`
-		} `json:"error"`
-	}
-	c := exit.Code(code)
-	if !c.Valid() {
-		c = exit.Internal
-	}
-	if json.Unmarshal([]byte(stderr), &doc) == nil && doc.Error.Message != "" {
-		name := doc.Error.Name
-		if name == "" {
-			name = untyped
-		}
-		e := exit.Named(c, name, "%s", doc.Error.Message)
-		if doc.Error.Remedy != "" {
-			e.WithRemedy("%s", doc.Error.Remedy)
-		}
-		return e
-	}
-	said := strings.TrimSpace(stderr)
-	if said == "" {
-		said = strings.TrimSpace(stdout)
-	}
-	what := fmt.Sprintf("exited %d", code)
-	if code < 0 {
-		what = "was killed"
-	}
-	return exit.Named(c, untyped, "`cozy-runtime %s` %s without a typed refusal: %s",
-		verb, what, tail(said))
-}
-
-// tail keeps the END of what a child wrote; a traceback names its exception last.
-func tail(s string) string {
-	s = strings.Join(strings.Fields(s), " ")
-	if r := []rune(s); len(r) > 400 {
-		return "…" + string(r[len(r)-400:])
-	}
-	return s
-}
-
-func condense(s string) string {
-	s = strings.Join(strings.Fields(s), " ")
-	if len(s) > 400 {
-		return s[:400] + "…"
-	}
-	return s
 }

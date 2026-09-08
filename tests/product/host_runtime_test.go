@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -23,7 +24,7 @@ func TestHostRuntimeWireFence(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in runtimes are POSIX shell scripts")
 	}
-	install := "uv tool install --force 'cozy-runtime[media,model-execution]'"
+	install := "uv tool install --force 'cozy-runtime[media,model-execution]>=" + hostruntime.Floor + "'"
 
 	// (a) An older minor cannot serve: `cozy up` refuses under the tool's own words, and
 	// `cozy run` — which starts the same daemon — answers the same code instead of queuing.
@@ -37,12 +38,23 @@ func TestHostRuntimeWireFence(t *testing.T) {
 		t.Fatalf("an older host tool did not refuse `cozy up` by name [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozyPath(t, root, path, "up"); code == 0 ||
-		!strings.Contains(out, "Try: install a cozy-runtime release that vendors cozy.worker.v1 minor") {
+		!strings.Contains(out, "Try: install cozy-runtime "+hostruntime.Floor+" or newer") {
 		t.Fatalf("the human form of the refusal lost its remedy [exit %d]\n%s", code, out)
 	}
 	code, out = runCozyPath(t, root, path, "run", "fake/older/generate", "prompt=fox", "--json")
 	if refusal := refusalOf(t, out); code == 0 || refusal.Code != "host_runtime_wire_mismatch" {
 		t.Fatalf("`cozy run` under an older host tool did not refuse by name [exit %d]\n%s", code, out)
+	}
+
+	// (a′) The wire is right but the release predates static describe (cl-175): a tool
+	// that would import a package to describe it is refused by name, with the floor.
+	root, path = hostRuntimeRoot(t, "below-floor", stubRuntime(t, "0.4.0", pb.WireMinor))
+	code, out = runCozyPath(t, root, path, "up", "--json")
+	refusal = refusalOf(t, out)
+	if code == 0 || refusal.Code != "host_runtime_below_floor" ||
+		!strings.Contains(refusal.Message, "release 0.4.0; this Cozy needs "+hostruntime.Floor+" or newer") ||
+		!strings.Contains(refusal.Remedy, install) {
+		t.Fatalf("a host tool below the describe floor did not refuse `cozy up` by name [exit %d]\n%s", code, out)
 	}
 
 	// (b) A tool that cannot say what it is.

@@ -15,8 +15,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/install"
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/reclaim"
@@ -59,7 +59,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// speaks an older wire minor cannot bring a worker READY, and a daemon that starts over
 	// one queues every local run silently (cl-086). A host with NO tool starts: rentals and
 	// the hub need none, and the launch itself refuses `host_runtime_missing` by name.
-	if _, e := launch.HostRuntime(ctx.Cfg.Tool()); e != nil && e.ErrName() != "host_runtime_missing" {
+	if _, e := hostruntime.Path(ctx.Cfg.Tool()); e != nil && e.ErrName() != "host_runtime_missing" {
 		return e
 	}
 
