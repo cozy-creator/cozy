@@ -41,7 +41,7 @@ func TestQueueWaitCauses(t *testing.T) {
 	instance, _, e := o.c.EnsureWorker(spec)
 	fatal(t, e)
 	planID := planIDOf(t, spec)
-	fatal(t, o.c.EnsurePlacementReady(instance, planID))
+	fatal(t, o.c.EnsurePlacementReady(instance, planID, ""))
 	requestA, attemptA, e := o.c.Submit(submission(planID, "fake/wait-lanes", "wait-lanes-a",
 		map[string]any{"n": 1}))
 	fatal(t, e)

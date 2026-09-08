@@ -796,7 +796,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			return
 		}
 		c.logf("%s: %s is %s for the queued request", req.Package, instance, change)
-		if e := c.EnsurePlacementReady(instance, req.PlanID); e != nil {
+		if e := c.EnsurePlacementReady(instance, req.PlanID, req.ID); e != nil {
 			if deferred, _ := c.deferUnavailable(req, e); deferred {
 				done()
 				return
