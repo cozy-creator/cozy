@@ -585,7 +585,16 @@ func (c *Orchestrator) Serve() error {
 func (c *Orchestrator) Close(grace time.Duration) {
 	c.mu.Lock()
 	c.closing = true
+	starting := make([]chan struct{}, 0, len(c.ensuring))
+	for _, done := range c.ensuring {
+		starting = append(starting, done)
+	}
 	c.mu.Unlock()
+	// A start already crossed the ownership gate. Let it publish its process
+	// before taking the shutdown census; later starts refuse under closing.
+	for _, done := range starting {
+		<-done
+	}
 	// Workers drain IN PARALLEL: each gets the same grace, and the whole close costs one
 	// grace window, not one per worker — a serial loop here could outlive the deadline
 	// its own caller was waiting under (#449).
