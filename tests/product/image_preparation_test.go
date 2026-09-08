@@ -77,7 +77,7 @@ func TestImagePreparationActualCLI(t *testing.T) {
 			t.Fatalf("qualified helper prefix: %v %s", err, out)
 		}
 	}
-	runtimeBin := filepath.Join(prefix, "bin", "cozy-runtime")
+	runtimeBin := filepath.Join(prefix, "bin", "cozy-runtime") //cozy:allow exact Runtime wheel in the isolated product fixture
 	run := func(args ...string) (int, string, string) {
 		cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
 		cmd.Env = launch.InstallToolEnv(records.PackageInstall{Runtime: runtimeBin}, childEnv(t, root))
