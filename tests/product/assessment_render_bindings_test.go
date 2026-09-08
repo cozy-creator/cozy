@@ -3,6 +3,7 @@ package producttest
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"image"
 	"image/color"
@@ -173,8 +174,10 @@ func assessmentDigest(raw []byte) string {
 
 // The canonical reader remains the numerical/schema authority; Creator consumes
 // its exact association projection and binds the original artifact identity.
+var assessmentEvaluatorPath = flag.String("assessment-v3-evaluator", "", "installed canonical @3 report reader for association proof")
+
 func TestAssessmentV3InspectorIdentityBoundary(t *testing.T) {
-	evaluator := os.Getenv("COZY_TEST_EVAL")
+	evaluator := *assessmentEvaluatorPath
 	if evaluator == "" {
 		t.Skip("requires the installed cozy-eval @3 reader")
 	}
@@ -184,7 +187,7 @@ func TestAssessmentV3InspectorIdentityBoundary(t *testing.T) {
 	}
 	command := exec.CommandContext(t.Context(), evaluator, "report", "inspect")
 	command.Env = []string{"PYTHONNOUSERSITE=1"}
-	command.Stdin = bytes.NewReader(report)
+	command.Stdin = bytes.NewReader(report) //cozy:stdin-value — exact held report bytes, never interactive input
 	inspected, err := command.Output()
 	if err != nil {
 		t.Fatal("the actual @3 report reader refused the banked fixture")
