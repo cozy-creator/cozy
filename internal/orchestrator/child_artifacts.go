@@ -283,6 +283,21 @@ func (c *Orchestrator) releaseOriginalDerivedResults(id string) *exit.Error {
 }
 
 func (c *Orchestrator) retainChildInputs(request records.Request) *exit.Error {
+	native, problem := c.opt.Store.NativeArtifactRetentions(request.ID)
+	if problem != nil {
+		return problem
+	}
+	for _, h := range native {
+		if h.Kind == "input" && h.ArtifactKind == "tree" && h.State != "held" {
+			if h.State != "pending" {
+				return exit.New(exit.Conflict, "byte input retention is closed")
+			}
+			if problem := c.changeByteRetention(context.Background(), h, false); problem != nil {
+				return problem
+			}
+		}
+	}
+
 	paths := make([][]string, 0, len(request.Models))
 	for _, model := range request.Models {
 		paths = append(paths, []string{model.Slot})

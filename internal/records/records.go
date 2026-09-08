@@ -115,7 +115,7 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
 
 func init() {
-	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL)
+	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL)
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
@@ -272,12 +272,12 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 28 {
+	if sourceVersion < 33 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
 		}
 	}
-	if sourceVersion < 28 {
+	if sourceVersion < 33 {
 		if _, err := tx.Exec(childRequestIndex); err != nil {
 			return exit.Internalf("cannot restore child call admission index in %s: %s", path, err)
 		}
@@ -391,6 +391,22 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 		} {
 			if _, err := tx.Exec(statement); err != nil {
 				return exit.Internalf("cannot preserve effect cancellation in %s: %s", path, err)
+			}
+		}
+	}
+
+	if sourceVersion < 33 {
+
+		if _, err := tx.Exec(byteOutputsDDL); err != nil {
+			return exit.Internalf("cannot add byte output custody: %s", err)
+		}
+
+		if sourceVersion >= 31 {
+			columns := strings.TrimPrefix(nativeArtifactCols, "artifact_kind,producer_attempt,producer_output_id,content_bytes,")
+			for _, statement := range []string{`ALTER TABLE native_artifact_retentions RENAME TO native_artifact_retentions_prior`, nativeArtifactRetentionsDDL, `INSERT INTO native_artifact_retentions(` + columns + `) SELECT ` + columns + ` FROM native_artifact_retentions_prior`, `DROP TABLE native_artifact_retentions_prior`} {
+				if _, err := tx.Exec(statement); err != nil {
+					return exit.Internalf("cannot preserve native custody migration: %s", err)
+				}
 			}
 		}
 	}
@@ -662,6 +678,10 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		destinationColumns += child
 		selectColumns += child
 	}
+	if sourceVersion >= 28 {
+		destinationColumns += ",child_artifacts"
+		selectColumns += ",child_artifacts"
+	}
 	if _, err := tx.Exec(`INSERT INTO requests(` + destinationColumns + `) SELECT ` + selectColumns +
 		` FROM requests_prior`); err != nil {
 		return exit.Internalf("cannot preserve request rows while migrating %s: %s", path, err)
@@ -729,6 +749,10 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
+		if version < 33 && statement == byteOutputsDDL {
+			continue
+		}
+
 		if version < 29 && statement == operationLookupsDDL {
 			continue
 		}
@@ -748,6 +772,9 @@ func priorStatements(version int) []string {
 			version < 16 && containsStatement(packageEventSchema, statement) ||
 			version < 23 && (statement == modelCheckpointSchema || statement == modelCheckpointPublicationSchema) {
 			continue
+		}
+		if version < 33 && statement == nativeArtifactRetentionsDDL {
+			statement = strings.Replace(statement, " artifact_kind TEXT NOT NULL DEFAULT 'derived' CHECK(artifact_kind IN ('derived','tree')),\n producer_attempt INTEGER NOT NULL DEFAULT 0, producer_output_id TEXT NOT NULL DEFAULT '',content_bytes INTEGER NOT NULL DEFAULT 0,\n", "", 1)
 		}
 		if version < 32 && statement == nativeCallsDDL {
 			statement = strings.Replace(statement, " cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),\n", "", 1)
@@ -822,6 +849,9 @@ func priorStatements(version int) []string {
 		}
 		if version < 12 {
 			stmt = priorInstallNames(stmt)
+		}
+		if requestStatement && version < 33 {
+			stmt = strings.Replace(stmt, "  capture      TEXT    NOT NULL DEFAULT '',\n", "", 1)
 		}
 		statements[index] = stmt
 	}

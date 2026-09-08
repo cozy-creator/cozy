@@ -954,8 +954,13 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	holder := c.workers[s.instanceID]
 	c.mu.Unlock()
 	var outputs []records.Output
+	var byteOutputs []records.ByteOutput
 	if !knownReplay {
-		outputs, e = c.mirrorOutputs(*req, ordinal, doc, holder)
+		if req.ParentRequestID != "" && len(declaredWeightsOutputs) == 0 {
+			byteOutputs, e = c.privateByteOutputs(*req, *attemptRow, doc)
+		} else {
+			outputs, e = c.mirrorOutputs(*req, ordinal, doc, holder)
+		}
 		if e != nil {
 			refuse("%s", e.Message)
 			return
@@ -1025,7 +1030,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	// goes on to succeed. Observed live: attempt 1 of a killed job committed an empty
 	// `local/_job-…` publication seconds before attempt 2 published the real one.
 	var publication *records.Publication
-	if req.IsJob() && len(declaredWeightsOutputs) == 0 && !requeuing && !retaining && req.State != "canceling" && !knownReplay {
+	if req.IsJob() && req.ParentRequestID == "" && len(declaredWeightsOutputs) == 0 && !requeuing && !retaining && req.State != "canceling" && !knownReplay {
 		if e := c.promote(*req, ordinal, outputs); e != nil {
 			refuse("%s", e.Message)
 			return
@@ -1041,7 +1046,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		SafeMessage:   doc.Str("safe_message"),
 		TriageSubject: triage.Subject, TriageDigest: triage.Digest,
 		TriageLength: triage.Length, TriageBundle: triage.Bundle,
-		Body: t.OutcomeCanonicalBytes, Outputs: outputs,
+		Body: t.OutcomeCanonicalBytes, Outputs: outputs, ByteOutputs: byteOutputs,
 		WeightsFinalizations: weightsFinalizations,
 		EventType:            kept.Type, EventPayload: kept.Payload,
 		// A requeueing request is QUEUED for its next ordinal, not failed. Writing the

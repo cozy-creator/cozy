@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS requests (
   rental_required INTEGER NOT NULL DEFAULT 0,
   install_id   TEXT    REFERENCES installs(id),
   assets       TEXT    NOT NULL DEFAULT '[]',
+  capture      TEXT    NOT NULL DEFAULT '',
   models       TEXT    NOT NULL DEFAULT '[]',
   weights_outputs TEXT NOT NULL DEFAULT '[]',
   retain_work INTEGER NOT NULL DEFAULT 0 CHECK(retain_work IN (0,1)),
@@ -443,6 +444,7 @@ func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
 // --------------------------------------------------------------------------- requests
 
 type Request struct {
+	Capture string
 	// Number is this host's short user-facing request reference. The globally unique ID
 	// remains the durable internal/Hub identity; Number is derived from the retained local
 	// request chronology and is never sent across the worker protocol.
@@ -538,13 +540,14 @@ type Request struct {
 // name inferred later. LocalPath is resolution only and is excluded from submission
 // identity; Digest, Length and MediaType are the claims inside InvocationSpec.
 type AssetBinding struct {
-	FieldPath string `json:"field_path"`
-	LocalPath string `json:"local_path"`
-	Digest    string `json:"digest"`
-	Length    int64  `json:"length"`
-	MediaType string `json:"media_type,omitempty"`
-	Order     uint32 `json:"order"`
-	MaxBytes  int64  `json:"max_bytes,omitempty"`
+	Native    *ByteAssetBinding `json:"native,omitempty"`
+	FieldPath string            `json:"field_path"`
+	LocalPath string            `json:"local_path"`
+	Digest    string            `json:"digest"`
+	Length    int64             `json:"length"`
+	MediaType string            `json:"media_type,omitempty"`
+	Order     uint32            `json:"order"`
+	MaxBytes  int64             `json:"max_bytes,omitempty"`
 }
 
 // ModelRef is one exact user-selected model binding. Creator resolves the human
@@ -752,7 +755,7 @@ const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_
 	local_package_digest,local_package_uploaded_boot_id,
 	environment_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
-	COALESCE(install_id,''),assets,models,weights_outputs,retain_work,retry_of,reuse_scope,control_revision,
+	COALESCE(install_id,''),assets,capture,models,weights_outputs,retain_work,retry_of,reuse_scope,control_revision,
 	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
@@ -761,7 +764,7 @@ func requestScanTargets(r *Request, assets, models *string) []any {
 		&r.LocalPackageUploadedBootID, &r.EnvironmentDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
-		&r.InstallID, assets, models, &r.WeightsOutputs, &r.RetainWork, &r.RetryOf, &r.ReuseScope, &r.ControlRevision,
+		&r.InstallID, assets, &r.Capture, models, &r.WeightsOutputs, &r.RetainWork, &r.RetryOf, &r.ReuseScope, &r.ControlRevision,
 		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom, &r.OrchestrationDirective, &r.ChildArtifacts}
 }
 
@@ -1745,6 +1748,7 @@ type Terminal struct {
 	TriageBundle         []byte
 	Body                 []byte
 	Outputs              []Output
+	ByteOutputs          []ByteOutput
 	WeightsFinalizations []WeightsFinalization
 	// Event is the attempt-end lifecycle event, appended INSIDE this transaction so the
 	// stream cannot disagree with the authority about whether the request ended.
@@ -1856,6 +1860,9 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 			return false, exit.Internalf("cannot publish output %s of %s#%d: %s",
 				o.OutputID, t.RequestID, t.Attempt, err)
 		}
+	}
+	if problem := recordByteOutputsTx(tx, t); problem != nil {
+		return false, problem
 	}
 	visible := now()
 	for _, finalization := range t.WeightsFinalizations {

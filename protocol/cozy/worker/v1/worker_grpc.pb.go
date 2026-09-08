@@ -360,6 +360,9 @@ const (
 	RuntimePreparation_WorkspaceRetainDerivedResult_FullMethodName     = "/cozy.worker.v1.RuntimePreparation/WorkspaceRetainDerivedResult"
 	RuntimePreparation_WorkspaceReleaseDerivedRetention_FullMethodName = "/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseDerivedRetention"
 	RuntimePreparation_WorkspaceReleaseDerivedResult_FullMethodName    = "/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseDerivedResult"
+	RuntimePreparation_WorkspaceRetainByteTree_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/WorkspaceRetainByteTree"
+	RuntimePreparation_WorkspaceReleaseByteTree_FullMethodName         = "/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseByteTree"
+	RuntimePreparation_WorkspaceReadByteTreeObject_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/WorkspaceReadByteTreeObject"
 	RuntimePreparation_WorkspaceWeightsIntentReady_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/WorkspaceWeightsIntentReady"
 	RuntimePreparation_ImportWorkspace_FullMethodName                  = "/cozy.worker.v1.RuntimePreparation/ImportWorkspace"
 	RuntimePreparation_ActivateWorkspaceImport_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/ActivateWorkspaceImport"
@@ -400,6 +403,10 @@ type RuntimePreparationClient interface {
 	WorkspaceRetainDerivedResult(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
 	WorkspaceReleaseDerivedRetention(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
 	WorkspaceReleaseDerivedResult(ctx context.Context, in *DerivedResultReleaseCall, opts ...grpc.CallOption) (*DerivedResultReleaseResult, error)
+	// MINOR43. Ordinary byte-tree custody uses the same authenticated Workspace.
+	WorkspaceRetainByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
+	WorkspaceReleaseByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
+	WorkspaceReadByteTreeObject(ctx context.Context, in *NativeByteReadCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[NativeByteReadChunk], error)
 	WorkspaceWeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error)
 	// One-time authority transfer from a quiesced legacy Host journal. This is
 	// never forwarded from PodHost or exposed as an author-controlled cache write.
@@ -508,6 +515,45 @@ func (c *runtimePreparationClient) WorkspaceReleaseDerivedResult(ctx context.Con
 	return out, nil
 }
 
+func (c *runtimePreparationClient) WorkspaceRetainByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NativeByteRetentionResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_WorkspaceRetainByteTree_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) WorkspaceReleaseByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NativeByteRetentionResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_WorkspaceReleaseByteTree_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimePreparationClient) WorkspaceReadByteTreeObject(ctx context.Context, in *NativeByteReadCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[NativeByteReadChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &RuntimePreparation_ServiceDesc.Streams[0], RuntimePreparation_WorkspaceReadByteTreeObject_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[NativeByteReadCall, NativeByteReadChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RuntimePreparation_WorkspaceReadByteTreeObjectClient = grpc.ServerStreamingClient[NativeByteReadChunk]
+
 func (c *runtimePreparationClient) WorkspaceWeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(WeightsHostAck)
@@ -520,7 +566,7 @@ func (c *runtimePreparationClient) WorkspaceWeightsIntentReady(ctx context.Conte
 
 func (c *runtimePreparationClient) ImportWorkspace(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[WorkspaceImportFrame, WorkspaceImportResult], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &RuntimePreparation_ServiceDesc.Streams[0], RuntimePreparation_ImportWorkspace_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &RuntimePreparation_ServiceDesc.Streams[1], RuntimePreparation_ImportWorkspace_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -693,6 +739,10 @@ type RuntimePreparationServer interface {
 	WorkspaceRetainDerivedResult(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
 	WorkspaceReleaseDerivedRetention(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
 	WorkspaceReleaseDerivedResult(context.Context, *DerivedResultReleaseCall) (*DerivedResultReleaseResult, error)
+	// MINOR43. Ordinary byte-tree custody uses the same authenticated Workspace.
+	WorkspaceRetainByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
+	WorkspaceReleaseByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
+	WorkspaceReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error
 	WorkspaceWeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error)
 	// One-time authority transfer from a quiesced legacy Host journal. This is
 	// never forwarded from PodHost or exposed as an author-controlled cache write.
@@ -744,6 +794,15 @@ func (UnimplementedRuntimePreparationServer) WorkspaceReleaseDerivedRetention(co
 }
 func (UnimplementedRuntimePreparationServer) WorkspaceReleaseDerivedResult(context.Context, *DerivedResultReleaseCall) (*DerivedResultReleaseResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method WorkspaceReleaseDerivedResult not implemented")
+}
+func (UnimplementedRuntimePreparationServer) WorkspaceRetainByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method WorkspaceRetainByteTree not implemented")
+}
+func (UnimplementedRuntimePreparationServer) WorkspaceReleaseByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method WorkspaceReleaseByteTree not implemented")
+}
+func (UnimplementedRuntimePreparationServer) WorkspaceReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error {
+	return status.Error(codes.Unimplemented, "method WorkspaceReadByteTreeObject not implemented")
 }
 func (UnimplementedRuntimePreparationServer) WorkspaceWeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error) {
 	return nil, status.Error(codes.Unimplemented, "method WorkspaceWeightsIntentReady not implemented")
@@ -957,6 +1016,53 @@ func _RuntimePreparation_WorkspaceReleaseDerivedResult_Handler(srv interface{}, 
 	}
 	return interceptor(ctx, in, info, handler)
 }
+
+func _RuntimePreparation_WorkspaceRetainByteTree_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NativeByteRetentionCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).WorkspaceRetainByteTree(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_WorkspaceRetainByteTree_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).WorkspaceRetainByteTree(ctx, req.(*NativeByteRetentionCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_WorkspaceReleaseByteTree_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NativeByteRetentionCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).WorkspaceReleaseByteTree(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_WorkspaceReleaseByteTree_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).WorkspaceReleaseByteTree(ctx, req.(*NativeByteRetentionCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimePreparation_WorkspaceReadByteTreeObject_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(NativeByteReadCall)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(RuntimePreparationServer).WorkspaceReadByteTreeObject(m, &grpc.GenericServerStream[NativeByteReadCall, NativeByteReadChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RuntimePreparation_WorkspaceReadByteTreeObjectServer = grpc.ServerStreamingServer[NativeByteReadChunk]
 
 func _RuntimePreparation_WorkspaceWeightsIntentReady_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(WeightsIntentReadyCall)
@@ -1275,6 +1381,14 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RuntimePreparation_WorkspaceReleaseDerivedResult_Handler,
 		},
 		{
+			MethodName: "WorkspaceRetainByteTree",
+			Handler:    _RuntimePreparation_WorkspaceRetainByteTree_Handler,
+		},
+		{
+			MethodName: "WorkspaceReleaseByteTree",
+			Handler:    _RuntimePreparation_WorkspaceReleaseByteTree_Handler,
+		},
+		{
 			MethodName: "WorkspaceWeightsIntentReady",
 			Handler:    _RuntimePreparation_WorkspaceWeightsIntentReady_Handler,
 		},
@@ -1336,6 +1450,11 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WorkspaceReadByteTreeObject",
+			Handler:       _RuntimePreparation_WorkspaceReadByteTreeObject_Handler,
+			ServerStreams: true,
+		},
 		{
 			StreamName:    "ImportWorkspace",
 			Handler:       _RuntimePreparation_ImportWorkspace_Handler,
@@ -1511,6 +1630,9 @@ const (
 	PodHost_RetainDerivedResult_FullMethodName     = "/cozy.worker.v1.PodHost/RetainDerivedResult"
 	PodHost_ReleaseDerivedRetention_FullMethodName = "/cozy.worker.v1.PodHost/ReleaseDerivedRetention"
 	PodHost_ReleaseDerivedResult_FullMethodName    = "/cozy.worker.v1.PodHost/ReleaseDerivedResult"
+	PodHost_RetainByteTree_FullMethodName          = "/cozy.worker.v1.PodHost/RetainByteTree"
+	PodHost_ReleaseByteTree_FullMethodName         = "/cozy.worker.v1.PodHost/ReleaseByteTree"
+	PodHost_ReadByteTreeObject_FullMethodName      = "/cozy.worker.v1.PodHost/ReadByteTreeObject"
 	PodHost_RecordOperationResult_FullMethodName   = "/cozy.worker.v1.PodHost/RecordOperationResult"
 	PodHost_LookupOperation_FullMethodName         = "/cozy.worker.v1.PodHost/LookupOperation"
 	PodHost_PruneOperationCache_FullMethodName     = "/cozy.worker.v1.PodHost/PruneOperationCache"
@@ -1568,6 +1690,9 @@ type PodHostClient interface {
 	RetainDerivedResult(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
 	ReleaseDerivedRetention(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
 	ReleaseDerivedResult(ctx context.Context, in *DerivedResultReleaseCall, opts ...grpc.CallOption) (*DerivedResultReleaseResult, error)
+	RetainByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
+	ReleaseByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
+	ReadByteTreeObject(ctx context.Context, in *NativeByteReadCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[NativeByteReadChunk], error)
 	RecordOperationResult(ctx context.Context, in *RecordOperationResultCall, opts ...grpc.CallOption) (*RecordOperationResultResult, error)
 	LookupOperation(ctx context.Context, in *LookupOperationCall, opts ...grpc.CallOption) (*LookupOperationResult, error)
 	PruneOperationCache(ctx context.Context, in *PruneOperationCacheCall, opts ...grpc.CallOption) (*PruneOperationCacheResult, error)
@@ -1745,6 +1870,45 @@ func (c *podHostClient) ReleaseDerivedResult(ctx context.Context, in *DerivedRes
 	return out, nil
 }
 
+func (c *podHostClient) RetainByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NativeByteRetentionResult)
+	err := c.cc.Invoke(ctx, PodHost_RetainByteTree_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) ReleaseByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NativeByteRetentionResult)
+	err := c.cc.Invoke(ctx, PodHost_ReleaseByteTree_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) ReadByteTreeObject(ctx context.Context, in *NativeByteReadCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[NativeByteReadChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[4], PodHost_ReadByteTreeObject_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[NativeByteReadCall, NativeByteReadChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PodHost_ReadByteTreeObjectClient = grpc.ServerStreamingClient[NativeByteReadChunk]
+
 func (c *podHostClient) RecordOperationResult(ctx context.Context, in *RecordOperationResultCall, opts ...grpc.CallOption) (*RecordOperationResultResult, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RecordOperationResultResult)
@@ -1807,7 +1971,7 @@ func (c *podHostClient) CheckpointTransfer(ctx context.Context, in *CheckpointTr
 
 func (c *podHostClient) LocalPackageFetch(ctx context.Context, in *LocalPackageFetchCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LocalPackageFileStatus], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[4], PodHost_LocalPackageFetch_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[5], PodHost_LocalPackageFetch_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1826,7 +1990,7 @@ type PodHost_LocalPackageFetchClient = grpc.ServerStreamingClient[LocalPackageFi
 
 func (c *podHostClient) LocalPackageUpload(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LocalPackageUploadFrame, LocalPackageFileStatus], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[5], PodHost_LocalPackageUpload_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[6], PodHost_LocalPackageUpload_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1849,7 +2013,7 @@ func (c *podHostClient) LocalPackageAbort(ctx context.Context, in *LocalPackageA
 
 func (c *podHostClient) WeightsTransfer(ctx context.Context, in *WeightsTransferCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WeightsTransferStatus], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[6], PodHost_WeightsTransfer_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[7], PodHost_WeightsTransfer_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1920,6 +2084,9 @@ type PodHostServer interface {
 	RetainDerivedResult(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
 	ReleaseDerivedRetention(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
 	ReleaseDerivedResult(context.Context, *DerivedResultReleaseCall) (*DerivedResultReleaseResult, error)
+	RetainByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
+	ReleaseByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
+	ReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error
 	RecordOperationResult(context.Context, *RecordOperationResultCall) (*RecordOperationResultResult, error)
 	LookupOperation(context.Context, *LookupOperationCall) (*LookupOperationResult, error)
 	PruneOperationCache(context.Context, *PruneOperationCacheCall) (*PruneOperationCacheResult, error)
@@ -1976,6 +2143,15 @@ func (UnimplementedPodHostServer) ReleaseDerivedRetention(context.Context, *Deri
 }
 func (UnimplementedPodHostServer) ReleaseDerivedResult(context.Context, *DerivedResultReleaseCall) (*DerivedResultReleaseResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReleaseDerivedResult not implemented")
+}
+func (UnimplementedPodHostServer) RetainByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method RetainByteTree not implemented")
+}
+func (UnimplementedPodHostServer) ReleaseByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseByteTree not implemented")
+}
+func (UnimplementedPodHostServer) ReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error {
+	return status.Error(codes.Unimplemented, "method ReadByteTreeObject not implemented")
 }
 func (UnimplementedPodHostServer) RecordOperationResult(context.Context, *RecordOperationResultCall) (*RecordOperationResultResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method RecordOperationResult not implemented")
@@ -2219,6 +2395,53 @@ func _PodHost_ReleaseDerivedResult_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PodHost_RetainByteTree_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NativeByteRetentionCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).RetainByteTree(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_RetainByteTree_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).RetainByteTree(ctx, req.(*NativeByteRetentionCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_ReleaseByteTree_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NativeByteRetentionCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).ReleaseByteTree(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_ReleaseByteTree_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).ReleaseByteTree(ctx, req.(*NativeByteRetentionCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_ReadByteTreeObject_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(NativeByteReadCall)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(PodHostServer).ReadByteTreeObject(m, &grpc.GenericServerStream[NativeByteReadCall, NativeByteReadChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PodHost_ReadByteTreeObjectServer = grpc.ServerStreamingServer[NativeByteReadChunk]
+
 func _PodHost_RecordOperationResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RecordOperationResultCall)
 	if err := dec(in); err != nil {
@@ -2432,6 +2655,14 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _PodHost_ReleaseDerivedResult_Handler,
 		},
 		{
+			MethodName: "RetainByteTree",
+			Handler:    _PodHost_RetainByteTree_Handler,
+		},
+		{
+			MethodName: "ReleaseByteTree",
+			Handler:    _PodHost_ReleaseByteTree_Handler,
+		},
+		{
 			MethodName: "RecordOperationResult",
 			Handler:    _PodHost_RecordOperationResult_Handler,
 		},
@@ -2483,6 +2714,11 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ModelSourceFile",
 			Handler:       _PodHost_ModelSourceFile_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "ReadByteTreeObject",
+			Handler:       _PodHost_ReadByteTreeObject_Handler,
 			ServerStreams: true,
 		},
 		{

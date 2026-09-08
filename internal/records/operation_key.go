@@ -41,7 +41,11 @@ func OperationKey(request Request) (string, *exit.Error) {
 		}
 		inputs[model.Slot], _ = json.Marshal(map[string]any{"manifest": ArtifactObjectRef{Digest: model.Manifest, Length: model.ManifestLength}})
 	}
-	raw, err := json.Marshal(map[string]any{"target_digest": request.ChildTargetDigest, "inputs": inputs})
+	identity := map[string]any{"target_digest": request.ChildTargetDigest, "inputs": inputs}
+	if request.Capture != "" {
+		identity["capture"] = json.RawMessage(request.Capture)
+	}
+	raw, err := json.Marshal(identity)
 	if err != nil {
 		return "", exit.Internalf("cannot encode operation identity: %s", err)
 	}
