@@ -412,12 +412,16 @@ func mediaRefusal(status int, data []byte) *exit.Error {
 	return problem
 }
 
-// ReserveOutputs charges the exact sum of the attempt's OutputBinding max_bytes values,
-// then creates its output directory and answers the pod-local destination. Charging first
-// is what lets direct worker filesystem writes and owner HTTP uploads share one quota.
-func (c *Client) ReserveOutputs(slot string, maxBytes int64) (string, *exit.Error) {
+// ReserveOutputs reserves the total output byte bound and exact output count
+// before the worker can write. The receiver uses the count to protect the inodes
+// still owed by this attempt, including when the declared count is zero.
+func (c *Client) ReserveOutputs(slot string, maxBytes int64, outputCount int) (string, *exit.Error) {
+	if maxBytes < 0 || outputCount < 0 {
+		return "", exit.New(exit.Validation, "output reservation requires non-negative bytes and file count")
+	}
 	doc, _, e := c.call(http.MethodPost,
-		"/v1/outputs/"+slot+"?max_bytes="+strconv.FormatInt(maxBytes, 10), nil)
+		"/v1/outputs/"+url.PathEscape(slot)+"?max_bytes="+strconv.FormatInt(maxBytes, 10)+
+			"&output_count="+strconv.Itoa(outputCount), nil)
 	if e != nil {
 		return "", e
 	}
