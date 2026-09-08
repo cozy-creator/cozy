@@ -61,7 +61,9 @@ func (c *Orchestrator) changeNativeArtifactRetention(ctx context.Context, h reco
 	if problem := c.opt.Store.ConfirmNativeArtifact(h.RetentionID, session.instanceID, session.bootID); problem != nil {
 		// Cancellation may have committed before the acquire response. Release the
 		// native hold against its durable tombstone instead of resurrecting it.
-		_ = c.changeNativeArtifactRetention(ctx, h, true)
+		if problem.ErrName() == "child.artifact_release_pending" {
+			_ = c.changeNativeArtifactRetention(ctx, h, true)
+		}
 		return problem
 	}
 	return nil
