@@ -317,6 +317,7 @@ const (
 	NativeSourceOperation_NATIVE_SOURCE_OPERATION_CIVITAI      NativeSourceOperation = 2
 	NativeSourceOperation_NATIVE_SOURCE_OPERATION_CONVERT      NativeSourceOperation = 3
 	NativeSourceOperation_NATIVE_SOURCE_OPERATION_SOURCE_FILES NativeSourceOperation = 4 // minor45: bounded readonly ordinary-source view
+	NativeSourceOperation_NATIVE_SOURCE_OPERATION_COMMIT_FILE  NativeSourceOperation = 5 // minor45: explicitly complete one own pending file
 )
 
 // Enum value maps for NativeSourceOperation.
@@ -327,6 +328,7 @@ var (
 		2: "NATIVE_SOURCE_OPERATION_CIVITAI",
 		3: "NATIVE_SOURCE_OPERATION_CONVERT",
 		4: "NATIVE_SOURCE_OPERATION_SOURCE_FILES",
+		5: "NATIVE_SOURCE_OPERATION_COMMIT_FILE",
 	}
 	NativeSourceOperation_value = map[string]int32{
 		"NATIVE_SOURCE_OPERATION_UNSPECIFIED":  0,
@@ -334,6 +336,7 @@ var (
 		"NATIVE_SOURCE_OPERATION_CIVITAI":      2,
 		"NATIVE_SOURCE_OPERATION_CONVERT":      3,
 		"NATIVE_SOURCE_OPERATION_SOURCE_FILES": 4,
+		"NATIVE_SOURCE_OPERATION_COMMIT_FILE":  5,
 	}
 )
 
@@ -8580,7 +8583,7 @@ type NativeSourceStatus struct {
 	NativeReceiptCanonicalBytes    []byte                 `protobuf:"bytes,15,opt,name=native_receipt_canonical_bytes,json=nativeReceiptCanonicalBytes,proto3" json:"native_receipt_canonical_bytes,omitempty"` // actual native result, bounded by existing receipt cap
 	ComputationDigest              []byte                 `protobuf:"bytes,16,opt,name=computation_digest,json=computationDigest,proto3" json:"computation_digest,omitempty"`
 	MemoHit                        bool                   `protobuf:"varint,17,opt,name=memo_hit,json=memoHit,proto3" json:"memo_hit,omitempty"`                                                                           // observation, excluded from semantic result
-	ByteOutput                     *NativeByteTreeRef     `protobuf:"bytes,18,opt,name=byte_output,json=byteOutput,proto3" json:"byte_output,omitempty"`                                                                   // minor45 SOURCE_FILES/SUCCEEDED only; exact parent-owned view
+	ByteOutput                     *NativeByteTreeRef     `protobuf:"bytes,18,opt,name=byte_output,json=byteOutput,proto3" json:"byte_output,omitempty"`                                                                   // minor45 SOURCE_FILES or COMMIT_FILE/SUCCEEDED; parent-owned bytes
 	ByteOutputAttemptOrdinal       uint64                 `protobuf:"varint,19,opt,name=byte_output_attempt_ordinal,json=byteOutputAttemptOrdinal,proto3" json:"byte_output_attempt_ordinal,omitempty"`                    // original producer attempt, possibly before reply correlation
 	ByteOutputInvocationSpecDigest []byte                 `protobuf:"bytes,20,opt,name=byte_output_invocation_spec_digest,json=byteOutputInvocationSpecDigest,proto3" json:"byte_output_invocation_spec_digest,omitempty"` // exact original parent producer spec; 32 bytes
 	unknownFields                  protoimpl.UnknownFields
@@ -21912,13 +21915,14 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x1fNATIVE_SOURCE_PHASE_UNSPECIFIED\x10\x00\x12\x1f\n" +
 	"\x1bNATIVE_SOURCE_PHASE_RESOLVE\x10\x01\x12\x1f\n" +
 	"\x1bNATIVE_SOURCE_PHASE_EXECUTE\x10\x02\x12\x1e\n" +
-	"\x1aNATIVE_SOURCE_PHASE_CANCEL\x10\x03*\xdd\x01\n" +
+	"\x1aNATIVE_SOURCE_PHASE_CANCEL\x10\x03*\x86\x02\n" +
 	"\x15NativeSourceOperation\x12'\n" +
 	"#NATIVE_SOURCE_OPERATION_UNSPECIFIED\x10\x00\x12'\n" +
 	"#NATIVE_SOURCE_OPERATION_HUGGINGFACE\x10\x01\x12#\n" +
 	"\x1fNATIVE_SOURCE_OPERATION_CIVITAI\x10\x02\x12#\n" +
 	"\x1fNATIVE_SOURCE_OPERATION_CONVERT\x10\x03\x12(\n" +
-	"$NATIVE_SOURCE_OPERATION_SOURCE_FILES\x10\x04*\xbf\x01\n" +
+	"$NATIVE_SOURCE_OPERATION_SOURCE_FILES\x10\x04\x12'\n" +
+	"#NATIVE_SOURCE_OPERATION_COMMIT_FILE\x10\x05*\xbf\x01\n" +
 	"\x11NativeSourceState\x12#\n" +
 	"\x1fNATIVE_SOURCE_STATE_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cNATIVE_SOURCE_STATE_RESOLVED\x10\x01\x12!\n" +
