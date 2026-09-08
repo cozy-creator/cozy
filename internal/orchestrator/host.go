@@ -386,8 +386,21 @@ func (c *Orchestrator) observePrepareEvent(instanceID, machine, label string, ev
 	default:
 		return
 	}
+	models := make([]ModelDownloadProgress, 0, len(event.GetModelProgress()))
+	for _, item := range event.GetModelProgress() {
+		ref := item.GetModel()
+		if ref == nil {
+			continue
+		}
+		models = append(models, ModelDownloadProgress{
+			Model: ref.GetModel(), Release: ref.GetRelease(), Lane: ref.GetLane(),
+			Slot: ref.GetSlot(), Manifest: ref.GetManifest(),
+			Moved: item.GetTransferredBytes(), Total: item.GetTotalBytes(),
+			OriginBytes: item.GetOriginBytes(), CachedBytes: item.GetCachedBytes(),
+		})
+	}
 	c.ObservePhase(instanceID, PhaseSample{
-		Name: name, Machine: machine, Detail: label,
+		Name: name, Machine: machine, Detail: label, Models: models,
 		HasBytes: event.GetTotalBytes() > 0 || event.GetTransferredBytes() > 0,
 		Moved:    event.GetTransferredBytes(), Total: event.GetTotalBytes(),
 	})

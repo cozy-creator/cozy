@@ -109,6 +109,7 @@ type fakePod struct {
 	// more is what one that reports while the bytes are moving sends. It exists so the
 	// phase lane is proven on a stream that ADVANCES, not only on one that is wired.
 	downloadSamples int
+	prepareEvent    func(*pb.PrepareEvent)
 
 	mu                 sync.Mutex
 	acks               []*pb.SnapshotAck
@@ -626,6 +627,9 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 		&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED, TotalBytes: total, TransferredBytes: total,
 			PlacementSet: &pb.DesiredPlacementSet{PlacementSetDigest: setDigest, PlacementSetCanonicalBytes: setBytes}})
 	for i, event := range events {
+		if p.prepareEvent != nil {
+			p.prepareEvent(event)
+		}
 		if err := stream.Send(event); err != nil {
 			return err
 		}
