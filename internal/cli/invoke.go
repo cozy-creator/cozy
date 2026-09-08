@@ -1202,8 +1202,8 @@ func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
 }
 
 // progress renders the live lane. Three shapes, and they are not the same surface:
-// Awaited `--json` writes NDJSON of the typed envelope on stderr, a terminal gets ONE
-// carriage-return-rewritten line, and a redirected human command gets sparse
+// Awaited `--json` writes NDJSON of the typed envelope on stderr, a terminal keeps
+// finished stages above a refreshed active block, and a redirected human command gets sparse
 // append-only lines — a stage change, each new tenth of the work, one line per five
 // quiet seconds — never the full lossy tick stream. JSON results stay on stdout. Exported —
 // with HumanWaitLine and WaitPatience — so the product suite (#661: verification's one
@@ -1222,7 +1222,9 @@ type RunProgress struct {
 	stepStage       string
 	stepSeconds     float64
 	stepSamples     int
+	stepPosition    float64
 	progressAttempt uint64
+	terminal        liveProgress
 	overallSeen     bool
 	overallFraction float64
 	overallDelta    float64
@@ -1259,6 +1261,9 @@ func (p *RunProgress) On(e localapi.Event) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if strings.TrimPrefix(e.Type, "request.") == "progress" && p.progressAttempt != e.Attempt {
+		if p.progressAttempt != 0 && p.ctx.Mode().Color && !p.ctx.Mode().Full {
+			p.finishLive("retrying")
+		}
 		p.progressAttempt = e.Attempt
 		p.stepStage, p.stepSeconds, p.stepSamples = "", 0, 0
 		p.overallSeen, p.overallFraction, p.overallDelta, p.overallSeconds = false, 0, 0, 0
@@ -1270,26 +1275,21 @@ func (p *RunProgress) On(e localapi.Event) bool {
 		p.sparse(e)
 		return true
 	}
-	p.render(p.line(e, p.ctx.Mode().Full))
+	if p.ctx.Mode().Color && !p.ctx.Mode().Full {
+		p.interactive(e)
+	} else {
+		p.render(diagnosticProgressLine(e))
+	}
 	return true
 }
 
-// render rewrites the status line. Callers hold p.mu.
+// render appends diagnostic text; only the ordinary interactive lane owns a live block.
 func (p *RunProgress) render(line string) {
 	if line == "" || line == p.last {
 		return
 	}
-	p.last, p.dirty = line, true
-	// stderr, deliberately: stdout carries the RESULT, so a piped `cozy run` is not
-	// polluted by the progress of producing it.
-	if p.ctx.Mode().Color {
-		// The one in-place line. Clamped to the CURRENT terminal width on every write:
-		// a line that wraps leaves rows \r can never reach again, so on a narrow or
-		// just-resized terminal the tail is dropped instead.
-		fmt.Fprintf(p.ctx.Err, "\r\033[K%s", clampLine(line, p.width()))
-	} else {
-		fmt.Fprintln(p.ctx.Err, line)
-	}
+	p.last = line
+	fmt.Fprintln(p.ctx.Err, line)
 }
 
 // observeWait keeps the wait clock. It starts on a queued/parked event — at the event's
@@ -1327,7 +1327,11 @@ func (p *RunProgress) armPatience() {
 		if p.closed || p.waitedSince.IsZero() {
 			return
 		}
-		p.render(p.waitLine(p.waitEvent))
+		if p.ctx.Mode().Color && !p.ctx.Mode().Full {
+			p.interactive(p.waitEvent)
+		} else {
+			p.render(p.waitLine(p.waitEvent))
+		}
 	})
 }
 
@@ -1423,11 +1427,14 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 	total, totalOK := number(fields["total"])
 	stepMS, stepOK := number(fields["step_ms"])
 	if name != "" && name != p.stepStage {
-		p.stepStage, p.stepSeconds, p.stepSamples = name, 0, 0
+		p.stepStage, p.stepSeconds, p.stepSamples, p.stepPosition = name, 0, 0, -1
 	}
 	if stepOK && stepMS >= 0 {
-		p.stepSeconds += stepMS / 1000
-		p.stepSamples++
+		if stepMS > 0 && (!positionOK || position > p.stepPosition) {
+			p.stepSeconds += stepMS / 1000
+			p.stepSamples++
+			p.stepPosition = position
+		}
 	}
 	label := stageLabel(name)
 	if label == "" {
@@ -1473,60 +1480,23 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 	return facts, facts.hasStageFraction || facts.hasOverall
 }
 
-func (p *RunProgress) line(e localapi.Event, full bool) string {
-	if full {
-		return diagnosticProgressLine(e)
-	}
-	switch strings.TrimPrefix(e.Type, "request.") {
-	case "queued", "parked":
-		return p.waitLine(e)
-	}
-	if strings.TrimPrefix(e.Type, "request.") != "progress" {
-		return progressLine(e, false)
-	}
-	fields, ok := e.Payload["value"].(map[string]any)
-	if !ok {
-		return humanProgress(e.Payload["value"])
-	}
-	facts, ok := p.observe(fields)
-	if !ok {
-		return humanStage(map[string]any{"name": stageLabel(facts.label)})
-	}
-	elapsed := p.now().Sub(p.began)
-	fraction := facts.stageFraction
-	label := facts.label + " stage"
-	if facts.hasOverall {
-		fraction, label = facts.overallFraction, "overall"
-	}
-	bar := progressBar(fraction, 18)
-	line := fmt.Sprintf("  %s %s %.0f%%", label, bar, fraction*100)
-	if facts.counted {
-		line += fmt.Sprintf(" · %s %d/%d", facts.label, facts.current, facts.total)
-	}
-	if facts.hasOverall && facts.hasStageFraction {
-		line += fmt.Sprintf(" · %.0f%% stage", facts.stageFraction*100)
-	}
-	if facts.perStep > 0 {
-		line += fmt.Sprintf(" · %.2fs/step · %.2f steps/s", facts.perStep, 1/facts.perStep)
-	}
-	line += " · elapsed " + shortDuration(elapsed)
-	if facts.hasOverallETA {
-		line += " · ETA ~" + shortDuration(facts.overallRemaining)
-	}
-	return line
-}
-
 // clampLine bounds one rewritten status line to the terminal: a wrapped line leaves
 // debris \r cannot reach.
 func clampLine(line string, width int) string {
-	if width <= 0 {
-		return line
+	var out strings.Builder
+	cells := 0
+	for _, r := range line {
+		if r < 32 || r == 127 {
+			continue
+		}
+		n := runeCells(r)
+		if width > 0 && cells+n >= width {
+			break
+		}
+		out.WriteRune(r)
+		cells += n
 	}
-	runes := []rune(line)
-	if len(runes) < width {
-		return line
-	}
-	return string(runes[:width-1])
+	return out.String()
 }
 
 func progressBar(fraction float64, width int) string {
@@ -1567,6 +1537,13 @@ func (p *RunProgress) Done() {
 	defer p.mu.Unlock()
 	p.closed = true
 	p.disarmPatience()
+	if p.terminal.timer != nil {
+		p.terminal.timer.Stop()
+	}
+	if p.ctx.Mode().Color && !p.ctx.Mode().Full {
+		p.finishLive("")
+		return
+	}
 	if p.dirty && p.ctx.Mode().Color {
 		fmt.Fprintln(p.ctx.Err)
 	}
@@ -1713,7 +1690,7 @@ func HumanPhaseLine(value any) string {
 		line += " · " + output.Bytes(int64(rate)) + "/s"
 	}
 	if remaining, ok := number(fields["remaining_ms"]); ok && remaining > 0 {
-		line += " · ~" + shortDuration(time.Duration(remaining)*time.Millisecond)
+		line += " · ETA ~" + shortDuration(time.Duration(remaining)*time.Millisecond)
 	} else if !hasMoved {
 		if elapsed, ok := number(fields["elapsed_ms"]); ok && elapsed > 0 {
 			line += " — " + shortDuration(time.Duration(elapsed)*time.Millisecond)
