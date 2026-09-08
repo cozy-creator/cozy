@@ -648,13 +648,14 @@ func preparedRemotePlacement(w *worker, pkg, release string) (DesiredPlacement, 
 		}
 		placement := DesiredPlacement{Package: pkg, Release: release,
 			PlacementIDValue: row.Str("placement_id"), PlacementSetDigest: digest,
+			BindingsDigest:    row.Str("bindings_digest"),
 			PlacementSetBytes: append([]byte(nil), w.setBytes...),
 			EnvironmentDigest: row.Str("environment_digest")}
 		if development.Str("package") != "" {
 			placement.SourceDigest = development.Str("source_digest")
 			placement.LocalRevisionDigest = development.Str("local_revision_digest")
 		}
-		if placement.PlacementIDValue == "" ||
+		if placement.PlacementIDValue == "" || !validDigest(placement.BindingsDigest) ||
 			(placement.SourceDigest == "" && placement.EnvironmentDigest == "") {
 			return DesiredPlacement{}, false, exit.Named(exit.Structural,
 				"rental.placement_incomplete", "prepared placement for %s@%s is incomplete", pkg, release)
