@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime==0.4.0", "tensor-source==0.1.0", "tensor-candidate==0.1.0"]
+# dependencies = ["cozy-runtime==0.7.0", "tensor-source==0.1.0", "tensor-candidate==0.1.0"]
 # [tool.uv.sources]
 # tensor-source = {path = "./source"}
 # tensor-candidate = {path = "./candidate"}

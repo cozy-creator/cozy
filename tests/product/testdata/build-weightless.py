@@ -81,12 +81,14 @@ def main() -> int:
         # top_level.txt said `vendor`), which a rented pod refused minutes later. The
         # entry point is the wheel's spelling of package.toml's [application] object: an
         # editable run reads package.toml, a worker reads the installed wheel.
+        # Declare image-compatible Runtime support; the vendored wheel source and
+        # uv.lock below still select the exact qualified Runtime revision.
         (tree / "pyproject.toml").write_text(
             "[project]\n"
             'name = "cozy-weightless-package"\n'
             f'version = "{args.version}"\n'
             'requires-python = ">=3.12,<3.13"\n'
-            f'dependencies = ["cozy-runtime[media]=={runtime_version}"]\n\n'
+            f'dependencies = ["cozy-runtime[media]>={runtime_version},<1"]\n\n'
             '[project.entry-points."cozy.application"]\n'
             'default = "weightless:app"\n\n'
             "[build-system]\n"
@@ -100,18 +102,24 @@ def main() -> int:
         )
         run("uv", "lock", "--quiet", cwd=tree)
         run("uv", "sync", "--locked", "--quiet", cwd=tree)
+        # The committed PackageInterface every publishable tree carries (cl-175): publication
+        # pre-flights it against this host's static reading and uploads it unchanged.
         env = dict(os.environ, PYTHONPATH=str(tree))
-        run(
-            str(tree / ".venv/bin/python"),
-            "-m",
-            "cozy_runtime.cli.main",
-            "--dir",
-            str(tree),
-            "describe",
-            "--json",
+        interface = subprocess.check_output(
+            [
+                str(tree / ".venv/bin/python"),
+                "-m",
+                "cozy_runtime.cli.main",
+                "--dir",
+                str(tree),
+                "describe",
+                "--json",
+            ],
             cwd=tree,
             env=env,
         )
+        (tree / "metadata").mkdir()
+        (tree / "metadata" / "package-interface.json").write_bytes(interface)
 
         if args.source_out:
             source_out = pathlib.Path(args.source_out).resolve()

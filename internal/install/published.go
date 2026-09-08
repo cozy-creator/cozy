@@ -13,6 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -107,47 +108,9 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 		return nil, empty, "", nil, exit.Named(exit.Structural, "package_interface_invalid",
 			"the release commits an invalid package interface")
 	}
-	deferredModels := len(published.Models) == 0 && hasServingModelSlots(packageInterface)
-	if deferredModels && !hasWeightlessCallable(packageInterface) {
-		// The retained locked-requirements export is the reusable code-only preparation;
-		// a later model selection re-runs preparation from it.
-		return packageInterface, empty, runtimeBin, environment, nil
-	}
-	answer, problem := preparePackageSet(l, installDir, published)
-	if problem != nil {
-		return nil, empty, "", nil, problem
-	}
-	if !bytes.Equal(answer.PackageInterface.Bytes, published.Selection.PackageInterface.Bytes) {
-		if published.ReportDefect != nil {
-			published.ReportDefect("package_prepare_interface_disagrees",
-				"local preparation derived a different package interface than the committed release")
-		}
-		return nil, empty, "", nil, exit.Named(exit.Conflict, "package_interface_mismatch",
-			"the installed package describes a different callable surface than its committed release")
-	}
-	packageInterface, problem = launch.DecodePackageInterface(answer.PackageInterface.Bytes)
-	if problem != nil || packageInterface.Digest != answer.PackageInterface.Digest {
-		return nil, empty, "", nil, exit.Named(exit.Structural, "package_interface_invalid",
-			"cozy-runtime returned an invalid package interface")
-	}
-	set, readErr := canonical.Read(answer.PlacementSet.Bytes, &pb.PlacementSet{})
-	if readErr != nil || len(set.List("placements")) != 1 {
-		return nil, empty, "", nil, exit.Named(exit.Structural, "package_placement_invalid",
-			"cozy-runtime returned an invalid package PlacementSet")
-	}
-	prepared := set.List("placements")[0]
-	fact := prepared.Sub("package")
-	if fact.Str("package") != published.Package || fact.Str("release") != published.Release {
-		return nil, empty, "", nil, exit.Named(exit.Conflict, "package_placement_mismatch",
-			"cozy-runtime prepared a different package identity than Creator installed")
-	}
-	placementPath := filepath.Join(cache, strings.TrimPrefix(answer.PlacementSet.Digest, "sha256:"))
-	if err := os.WriteFile(placementPath, answer.PlacementSet.Bytes, 0o600); err != nil {
-		return nil, empty, "", nil, exit.Internalf("cannot store prepared package placement: %s", err)
-	}
-	// The placement binds the release's locked-requirements export; the local environment
-	// receipt above records the complete frozen closure this machine runs.
-	return packageInterface, answer.PlacementSet, runtimeBin, environment, nil
+	// Installing code is not permission to run its imports or constructors.
+	// Serving selections are prepared by the claimed worker before activation.
+	return packageInterface, empty, runtimeBin, environment, nil
 }
 
 // PreparePublishedSelection turns one installed code/environment tree plus exact
@@ -234,7 +197,7 @@ type packagePreparation struct {
 func preparePackageSet(l home.Layout, installDir string, published *PublishedSource,
 ) (answer packagePreparation, problem *exit.Error) {
 	var empty packagePreparation
-	runtimeBin, problem := launch.HostRuntime(config.Frozen().Tool())
+	runtimeBin, problem := hostruntime.Path(config.Frozen().Tool())
 	if problem != nil {
 		return empty, problem
 	}
@@ -262,7 +225,7 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 		return empty, exit.Internalf("cannot run %s: %s", runtimeBin, err)
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return empty, launch.RuntimeExit(code, "prepare-package", "runtime_preparation_failed",
+		return empty, hostruntime.RuntimeExit(code, "prepare-package", "runtime_preparation_failed",
 			stdout.String(), stderr.String())
 	}
 	decoder := json.NewDecoder(strings.NewReader(stdout.String()))

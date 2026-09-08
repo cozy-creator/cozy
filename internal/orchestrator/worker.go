@@ -45,30 +45,6 @@ type Entrypoint struct {
 // RecordOwner converges a LIVE worker onto, so "the placement" cannot be a field of "the
 // launch". Splitting them is what lets `ConvergePlacementSet` exist at all.
 
-// WarmupPolicy is the boot warm pass, as an enum rather than a `NoWarm bool` (#484). A
-// negated boolean can only ever spell two things and reads backwards at every call site;
-// the enum says which policy is in force and leaves room for the ones cl-003 found it
-// needs (a per-entrypoint warm shape).
-type WarmupPolicy string
-
-const (
-	// WarmupOnBoot pays the first-call tax before a user's first request. It is the
-	// serving default, so it is also the zero value's meaning.
-	WarmupOnBoot WarmupPolicy = "on_boot"
-	// WarmupNone skips the pass. cl-003 found the two cases that want it: an entrypoint
-	// whose warm shape does not fit degrades its binding at boot for nothing, and the warm
-	// pass is a BIT-LEVEL input to the first real image.
-	WarmupNone WarmupPolicy = "none"
-)
-
-// Or fills in the serving default. A spec that never mentions warmup warms.
-func (p WarmupPolicy) Or() WarmupPolicy {
-	if p == "" {
-		return WarmupOnBoot
-	}
-	return p
-}
-
 // DesiredPlacement is ONE assignment this owner wants a worker to host — the local half of
 // rev-2's Placement nested directly in PlacementSet (#481). It carries the identity
 // facts, and nothing about how a process is started.
@@ -125,6 +101,7 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 	}
 	row := rows[0]
 	packageFact, development := row.Sub("package"), row.Sub("development")
+	environment := row.Sub("environment")
 	placement := DesiredPlacement{
 		Package: pkg, InstallID: installID, PlacementIDValue: row.Str("placement_id"),
 		Release:            packageFact.Str("release"),
@@ -136,9 +113,19 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 		placement.SourceDigest = development.Str("source_digest")
 		placement.LocalRevisionDigest = development.Str("local_revision_digest")
 		if development.Str("package") != pkg || placement.Release == "" ||
-			placement.PlacementIDValue == "" || placement.EnvironmentDigest != "" {
+			placement.PlacementIDValue == "" || len(packageFact) != 0 || len(environment.Sub("locked_requirements")) != 0 {
 			return DesiredPlacement{}, exit.Named(exit.Structural, "development_placement_incomplete",
 				"development PlacementSet mixes local source with published selection facts")
+		}
+		project := development.Sub("project_wheel")
+		if placement.LocalRevisionDigest == "" {
+			if len(project) != 0 || placement.EnvironmentDigest != "" {
+				return DesiredPlacement{}, exit.Named(exit.Structural, "development_placement_incomplete",
+					"source-only development placement cannot carry an incomplete captured environment")
+			}
+		} else if project.Sub("ref").Str("digest") == "" || placement.EnvironmentDigest == "" {
+			return DesiredPlacement{}, exit.Named(exit.Structural, "development_placement_incomplete",
+				"captured development placement requires its project wheel and environment identity")
 		}
 	} else if packageFact.Str("package") != pkg || placement.Release == "" ||
 		placement.EnvironmentDigest == "" ||
@@ -146,8 +133,7 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 		return DesiredPlacement{}, exit.Named(exit.Structural, "placement_set_incomplete",
 			"PlacementSet omits or mismatches its placement, package selection, or environment identity")
 	}
-	environment := row.Sub("environment")
-	if placement.SourceDigest == "" {
+	if placement.EnvironmentDigest != "" {
 		// Wire 30: a published Environment is its locked-requirements ref; supplied
 		// wheels belong to editable revisions only.
 		environmentIdentity := map[string]canonical.Value{
@@ -267,24 +253,24 @@ type RemoteTarget struct {
 // placement. The caller (cl-010's `start`, or cl-001's live driver) resolves it from the
 // install; the orchestrator itself resolves nothing about Python.
 type WorkerLaunchSpec struct {
-	Python            string       `json:"python"` // package-independent control Runtime
-	Args              []string     `json:"args"`
-	Dir               string       `json:"dir"`
-	Imposed           []string     `json:"imposed"` // exact env values the launcher imposes, never inherited
-	Devices           []string     `json:"devices"` // the device envelope this process may SEE
-	GraceSec          float64      `json:"grace_sec"`
-	Warmup            WarmupPolicy `json:"warmup,omitempty"`
-	ArtifactCache     string       `json:"artifact_cache,omitempty"`
-	InstallRoot       string       `json:"install_root,omitempty"`
-	EnvironmentPython string       `json:"environment_python,omitempty"` // preinstalled package venv
-	TensorFSRoot      string       `json:"tensorfs_root,omitempty"`
+	Python            string   `json:"python"` // package-independent control Runtime
+	Args              []string `json:"args"`
+	Dir               string   `json:"dir"`
+	Imposed           []string `json:"imposed"` // exact env values the launcher imposes, never inherited
+	Devices           []string `json:"devices"` // the device envelope this process may SEE
+	GraceSec          float64  `json:"grace_sec"`
+	ArtifactCache     string   `json:"artifact_cache,omitempty"`
+	InstallRoot       string   `json:"install_root,omitempty"`
+	EnvironmentPython string   `json:"environment_python,omitempty"` // preinstalled package venv
+	TensorFSRoot      string   `json:"tensorfs_root,omitempty"`
 	// Placement is what this worker is launched to host. LAUNCH CLAMPS THE SET TO ONE
 	// (worker-protocol header): a longer set is a typed refusal at the worker, so this
 	// side names one placement rather than pretending to a generality it cannot deliver.
 	Placement DesiredPlacement `json:"placement"`
 	// Connection attaches an ALREADY-RUNNING worker instead of spawning one: the owner
 	// pins CACert and signs Claim with its per-rental key. Nil = the ordinary local spawn.
-	Connection *WorkerConnection `json:"connection,omitempty"`
+	Connection  *WorkerConnection        `json:"connection,omitempty"`
+	Preparation *LocalServingPreparation `json:"preparation,omitempty"`
 }
 
 // WorkerChange is what an EnsureWorker call actually DID (#484). `Resident bool` could
@@ -794,6 +780,9 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 		break
 	}
 	if live != nil {
+		if spec.Preparation != nil {
+			return instanceID, ChangeNone, nil
+		}
 		// A concurrent empty-rental attach may have waited for this connection.
 		// It requests the existing claim, never an empty replacement placement.
 		if spec.Connection != nil && spec.Placement.Package == "" {
@@ -1027,7 +1016,7 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 				observed.placementSetDigest == desired.PlacementSetDigest &&
 				observed.materialization == pb.MaterializationState_MATERIALIZATION_STATE_FAILED
 			planID := logical.PlanID
-			if planID == "" && len(logical.Models) > 0 {
+			if planID == "" {
 				// Runtime authored each binding beside its callable name. Other
 				// dispatchable entrypoints cannot identify this request's function.
 				for _, entrypoint := range desired.Entrypoints {
@@ -1254,9 +1243,6 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		if option.value != "" {
 			args = append(args, option.flag, option.value)
 		}
-	}
-	if spec.Warmup.Or() == WarmupNone {
-		args = append(args, "--no-warm")
 	}
 	cmd := exec.Command(spec.Python, args...)
 	cmd.Dir = spec.Dir
@@ -2309,6 +2295,9 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	}
 	if problem := c.ResumeOutputExports(); problem != nil {
 		return killed, forgotten, problem
+	}
+	if problem := c.ResumeNativeEffects(); problem != nil {
+		c.logf("native effect recovery pending: %s", problem.ErrName())
 	}
 	if problem := c.ResumeModelTransfers(); problem != nil {
 		return killed, forgotten, problem

@@ -10,9 +10,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,11 +21,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/units"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 type Request struct {
@@ -358,11 +356,10 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	res.Warnings = append(res.Warnings, env.Warnings...)
 	mark("environment")
 
-	// ---- package interface: Runtime authored both the imported published surface and its
-	// resident placement. Editable source retains its existing development path.
+	// ---- package interface: retain the published document or statically read the
+	// editable source. Model placement is prepared only when a worker is requested.
 	if req.Local != nil {
-		packageInterface, placement, e = deriveDevelopmentPlacement(
-			venvDir, sourceDir, config.Frozen().TensorFSRoot, *req.Local)
+		packageInterface, e = readDevelopmentInterface(venvDir, sourceDir)
 		if e != nil {
 			return guard(e)
 		}
@@ -380,9 +377,10 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		if err := os.MkdirAll(cache, 0o700); err != nil {
 			return guard(exit.Internalf("cannot create editable placement cache: %s", err))
 		}
-		if err := os.WriteFile(filepath.Join(cache,
-			strings.TrimPrefix(placement.Digest, "sha256:")), placement.Bytes, 0o600); err != nil {
-			return guard(exit.Internalf("cannot store editable PlacementSet: %s", err))
+		if placement.Digest != "" {
+			if err := os.WriteFile(filepath.Join(cache, strings.TrimPrefix(placement.Digest, "sha256:")), placement.Bytes, 0o600); err != nil {
+				return guard(exit.Internalf("cannot store editable PlacementSet: %s", err))
+			}
 		}
 	}
 	inst.PlacementSetDigest = placement.Digest
@@ -422,90 +420,31 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	return res, nil
 }
 
-// deriveDevelopmentPlacement runs the install's own Runtime over its source. Runtime emits the
-// complete package interface without writing the source tree; Cozy validates the closed grammar
-// and stores the canonical bytes under the immutable install root.
-func deriveDevelopmentPlacement(venvDir, sourceDir, tensorfsRoot string, local LocalSource) (
-	*launch.PackageInterface, ExactDocument, *exit.Error,
-) {
-	var empty ExactDocument
-	bin := home.VenvTool(venvDir, "cozy-runtime")
-	if _, err := os.Stat(bin); err != nil {
-		return nil, empty, exit.Named(exit.Structural, "runtime_missing",
-			"this install's venv provides no cozy-runtime at %s", bin).
-			WithRemedy("a package depends on cozy-runtime; its surface is described by the runtime the release itself pinned, never this host's").
-			WithNext("cozy help package install")
+// readDevelopmentInterface reads only the source interface. Model construction
+// belongs to an admitted worker; a source install retains no serving PlacementSet.
+func readDevelopmentInterface(venvDir, sourceDir string) (*launch.PackageInterface, *exit.Error) {
+	env := config.Frozen().Tool("COZY_HOME=" + runtimeScratchHome())
+	runtimeBin, problem := hostruntime.Path(env)
+	if problem != nil {
+		return nil, problem
 	}
-	cmd := exec.Command(bin, "--json", "--dir", sourceDir, "development-placement",
-		"--package", local.Package, "--release", local.Release,
-		"--source-digest", local.SourceDigest, "--tensorfs-root", tensorfsRoot)
-	cmd.Env = config.Frozen().Tool("COZY_HOME=" + runtimeScratchHome())
+	cmd := exec.Command(runtimeBin, "--json", "--dir", sourceDir, "describe",
+		"--environment-python", home.VenvPython(venvDir))
+	cmd.Env = env
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
 	if cmd.ProcessState == nil {
-		return nil, empty, exit.Internalf("cannot run %s: %s", bin, err)
+		return nil, exit.Internalf("cannot run %s: %s", runtimeBin, err)
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return nil, empty, launch.RuntimeExit(code, "development-placement",
-			"runtime_preparation_failed", stdout.String(), stderr.String()).
-			WithNext("cozy help package install")
+		return nil, hostruntime.RuntimeExit(code, "describe", "runtime_preparation_failed", stdout.String(), stderr.String())
 	}
-	type exact struct {
-		Bytes  []byte `json:"canonical_bytes_base64"`
-		Digest string `json:"digest"`
-		Length int64  `json:"length"`
+	decoded, problem := launch.DecodePackageInterface([]byte(stdout.String()))
+	if problem != nil {
+		return nil, problem
 	}
-	var answer struct {
-		Package          string `json:"package"`
-		Release          string `json:"release"`
-		SourceDigest     string `json:"source_digest"`
-		PlacementSet     exact  `json:"placement_set"`
-		PackageInterface exact  `json:"package_interface"`
-	}
-	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
-	decoder.DisallowUnknownFields()
-	decodeErr := decoder.Decode(&answer)
-	var trailing any
-	if decodeErr == nil {
-		decodeErr = decoder.Decode(&trailing)
-	}
-	if decodeErr != io.EOF || answer.Package != local.Package ||
-		answer.Release != local.Release || answer.SourceDigest != local.SourceDigest {
-		return nil, empty, exit.Named(exit.Structural, "editable_placement_invalid",
-			"cozy-runtime development-placement returned a mismatched answer")
-	}
-	validExact := func(value exact) bool {
-		digest, err := canonical.Raw(value.Digest)
-		return err == nil && value.Length == int64(len(value.Bytes)) &&
-			bytes.Equal(canonical.Digest(value.Bytes), digest)
-	}
-	if !validExact(answer.PlacementSet) || !validExact(answer.PackageInterface) {
-		return nil, empty, exit.Named(exit.Structural, "editable_placement_identity_mismatch",
-			"cozy-runtime development-placement returned bytes that do not match their digest and length")
-	}
-	packageInterface, problem := launch.DecodePackageInterface(answer.PackageInterface.Bytes)
-	if problem != nil || packageInterface.Digest != answer.PackageInterface.Digest {
-		return nil, empty, exit.Named(exit.Validation, "package_interface_invalid",
-			"cozy-runtime development-placement returned an invalid package interface")
-	}
-	set, readErr := canonical.Read(answer.PlacementSet.Bytes, &pb.PlacementSet{})
-	if readErr != nil || len(set.List("placements")) != 1 {
-		return nil, empty, exit.Named(exit.Structural, "editable_placement_invalid",
-			"cozy-runtime returned an invalid development PlacementSet")
-	}
-	placement := set.List("placements")[0]
-	development := placement.Sub("development")
-	if development.Str("package") != local.Package || development.Str("release") != local.Release ||
-		development.Str("source_digest") != local.SourceDigest ||
-		placement.Sub("package_interface").Str("digest") != answer.PackageInterface.Digest ||
-		placement.Sub("package_interface").Int("length") != answer.PackageInterface.Length ||
-		placement.Str("environment_digest") != "" {
-		return nil, empty, exit.Named(exit.Structural, "editable_placement_invalid",
-			"cozy-runtime development PlacementSet mixes local source with published selection facts")
-	}
-	return packageInterface, ExactDocument{Bytes: answer.PlacementSet.Bytes,
-		Digest: answer.PlacementSet.Digest, Length: answer.PlacementSet.Length}, nil
+	return decoded, nil
 }
 
 // verifySource settles source identity before any build backend or import can run.

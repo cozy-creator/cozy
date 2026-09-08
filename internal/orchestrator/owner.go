@@ -357,6 +357,10 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			if e := c.onClaimAck(w, s, ack); e != nil {
 				return fmt.Errorf("%s", e.Message)
 			}
+		case *pb.WorkerFrame_NativeSourceStatus:
+			c.onNativeSourceStatus(s, m.NativeSourceStatus)
+		case *pb.WorkerFrame_NativeArtifactTransferStatus:
+			c.onNativeArtifactTransfer(s, m.NativeArtifactTransferStatus)
 		case *pb.WorkerFrame_ChildCallRequest:
 			c.onChildCall(s, m.ChildCallRequest)
 		case *pb.WorkerFrame_ChildCallCancel:
@@ -805,6 +809,9 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		return true
 	}
 	placements := []DesiredPlacement(nil)
+	if w.spec.Preparation != nil && w.spec.Placement.PlacementSetDigest == "" {
+		return true // the owner activates only the worker's completed preparation
+	}
 	if w.spec.Placement.Package == "" && w.spec.Placement.PlacementSetDigest == "" {
 		return true // empty local Runtime serves workspace RPCs without an executor
 	}

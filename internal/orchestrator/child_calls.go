@@ -74,6 +74,12 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		refuse(exit.Named(exit.Conflict, "child.intent_changed", "child intent digest does not match its exact target and input"))
 		return
 	}
+	if c.onNativeSourceCall(s, parent, call) {
+		return
+	}
+	if c.onNativeEffect(s, *parent, call) {
+		return
+	}
 	priorCalls, problem := c.opt.Store.Children(parent.ID)
 	if problem != nil {
 		refuse(problem)
@@ -300,6 +306,12 @@ func (c *Orchestrator) onChildCancel(s *session, call *pb.ChildCallCancel) {
 	}
 	parent, problem := c.childParent(s, call.ParentRequestId, call.ParentAttemptOrdinal, call.ParentInvocationSpecDigest)
 	if problem != nil {
+		return
+	}
+	if c.cancelNativeEffect(s, call) {
+		return
+	}
+	if c.cancelNativeSource(s, call) {
 		return
 	}
 	children, problem := c.opt.Store.Children(call.ParentRequestId)

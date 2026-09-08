@@ -330,85 +330,15 @@ func (r *Resolver) ResolveInstall(installID string, models []orchestrator.ModelR
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
-	if len(models) == 0 {
-		if facts.Install.PlacementSetDigest == "" {
-			return orchestrator.WorkerLaunchSpec{}, exit.Named(exit.Validation,
-				"package_model_binding_required",
-				"%s is installed as code but this modeled invocation supplied no exact model binding",
-				facts.Install.Package).
-				WithRemedy("invoke through `cozy run` so package defaults resolve, or pass model.<param>=org/model@release")
+	if facts.Install.PlacementSetDigest == "" || len(models) > 0 {
+		spec, problem := facts.PreparationSpec(r.Devices)
+		if problem != nil {
+			return spec, problem
 		}
-		return facts.Spec(r.Devices)
-	}
-	if facts.Install.SourceKind == "local" {
-		// An editable install serves the selection its PlacementSet was derived under;
-		// the rows a rental request carries are that projection handed back (cl-101). A
-		// per-run selection the set does not hold needs cozy-runtime's development
-		// placement re-derived for it, which the runtime does not yet take as input.
-		spec, e := facts.Spec(r.Devices)
-		if e != nil {
-			return orchestrator.WorkerLaunchSpec{}, e
-		}
-		if selectedInstallKey(installID, models) != selectedInstallKey(installID, spec.Placement.Models) {
-			return orchestrator.WorkerLaunchSpec{}, exit.Named(exit.Unavailable,
-				"editable_model_selection_unprepared",
-				"%s is an editable install whose placement does not hold this run's model selection",
-				facts.Install.Package).
-				WithRemedy("publish the package and run it with model.<param>=org/model@release/lane, or run the selection its placement holds")
-		}
+		spec.Placement.Models = append([]orchestrator.ModelRef(nil), models...)
 		return spec, nil
 	}
-	key := selectedInstallKey(installID, models)
-	r.mu.Lock()
-	cached, ok := r.selected[key]
-	r.mu.Unlock()
-	if ok {
-		return cached, nil
-	}
-	r.selectionMu.Lock()
-	defer r.selectionMu.Unlock()
-	r.mu.Lock()
-	cached, ok = r.selected[key]
-	r.mu.Unlock()
-	if ok {
-		return cached, nil
-	}
-	selected := make([]install.PublishedModel, 0, len(models))
-	for _, model := range models {
-		if model.Package != facts.Install.Package || model.Slot == "" || model.Model == "" ||
-			model.Release == "" || model.Lane == "" || model.ManifestLength <= 0 {
-			return orchestrator.WorkerLaunchSpec{}, exit.Named(exit.Validation,
-				"local_model_selection_incomplete",
-				"model selection for %s does not carry exact slot/release/lane/Manifest facts",
-				facts.Install.Package)
-		}
-		selected = append(selected, install.PublishedModel{Package: model.Package, Slot: model.Slot,
-			Model: model.Model, Release: model.Release, Lane: model.Lane,
-			Manifest: model.Manifest, ManifestLength: model.ManifestLength})
-	}
-	layout, e := home.Open(r.cfg.Home)
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, e
-	}
-	placement, e := install.PreparePublishedSelection(layout, facts.Install, selected)
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, e
-	}
-	chosen := facts.Install
-	chosen.PlacementSetDigest = placement.Digest
-	selectedFacts, e := launch.Read(chosen, r.cfg.Home, r.cfg.Tool())
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, e
-	}
-	spec, e := selectedFacts.Spec(r.Devices)
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, e
-	}
-	spec.Placement.Models = append([]orchestrator.ModelRef(nil), models...)
-	r.mu.Lock()
-	r.selected[key] = spec
-	r.mu.Unlock()
-	return spec, nil
+	return facts.Spec(r.Devices)
 }
 
 func selectedInstallKey(installID string, models []orchestrator.ModelRef) string {

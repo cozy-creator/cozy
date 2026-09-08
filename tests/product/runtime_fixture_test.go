@@ -10,14 +10,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // Runtime's version verb observes the installed wheel's embedded source, not
 // ambient Git. Resolve only that immutable prefix; never fall back to HEAD.
 func qualifiedRuntimeFixtureSHA(repo string, env []string) (string, error) {
-	tool, problem := launch.HostRuntime(env)
+	tool, problem := hostruntime.Path(env)
 	if problem != nil {
 		return "", problem
 	}
@@ -48,7 +48,7 @@ func TestRuntimeFixtureRefusesMissingOrMutableProvenance(t *testing.T) {
 	for _, commit := range []string{"", "unknown", "HEAD", "v0.4.0", "not-a-commit!"} {
 		t.Run(fmt.Sprintf("commit_%q", commit), func(t *testing.T) {
 			bin := t.TempDir()
-			answer, err := json.Marshal(map[string]any{"distribution": "0.4.0", "wire_protocol": fmt.Sprintf("cozy.worker.v1+minor.%d", pb.WireMinor), "commit": commit})
+			answer, err := json.Marshal(map[string]any{"distribution": hostruntime.Floor, "wire_protocol": fmt.Sprintf("cozy.worker.v1+minor.%d", pb.WireMinor), "commit": commit})
 			must(t, err)
 			// An independently executable peer passes normal wire qualification but
 			// has no immutable source authority. The fixture must stop before Git/build.

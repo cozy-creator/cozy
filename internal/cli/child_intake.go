@@ -59,7 +59,7 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 	defer delete(stack, pack.Tree)
 	intake := &childIntake{Package: pack, layout: layout, store: store}
 	fail := func(problem *exit.Error) (*childIntake, *exit.Error) { intake.Close(); return nil, problem }
-	dependencies, problem := packagepublish.LocalDependencyPaths(pack.Tree)
+	dependencies, problem := packagepublish.LocalDependencySelections(pack.Tree)
 	if problem != nil {
 		return fail(problem)
 	}
@@ -70,7 +70,7 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 	sort.Strings(names)
 	replacements := map[string]string{}
 	for _, name := range names {
-		path := dependencies[name]
+		path := dependencies[name].Path
 		if stack[path] {
 			return fail(exit.New(exit.Validation, "private invocable dependency graph is cyclic"))
 		}
@@ -80,7 +80,7 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 		if len(intake.Bindings) >= 32 {
 			return fail(exit.New(exit.Validation, "private parent exceeds 32 invocable dependency exports"))
 		}
-		dependency, problem := packagepublish.PreparePrivateFrom(context.Background(), path)
+		dependency, problem := packagepublish.PreparePrivateFrom(context.Background(), path, dependencies[name].Extras...)
 		if problem != nil {
 			return fail(problem)
 		}

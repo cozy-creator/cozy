@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
@@ -120,5 +122,104 @@ private-lock-library = {path = "../library", editable = true}
 	fatal(t, problem)
 	if editedIdentity == firstIdentity {
 		t.Fatal("same-version local library edit did not change captured identity")
+	}
+}
+
+func TestPrivateSelectedExtrasAreCanonicalCapturedAndValidated(t *testing.T) {
+	root := t.TempDir()
+	project, library, alternate := filepath.Join(root, "operation"), filepath.Join(root, "library"), filepath.Join(root, "alternate")
+	for _, dir := range []string{project, library, alternate} {
+		must(t, os.MkdirAll(dir, 0700))
+	}
+	metadata := `[project]
+name="private-extra-operation"
+version="0.0.1"
+requires-python=">=3.12,<3.13"
+dependencies=[]
+[project.optional-dependencies]
+managed=["private-extra-library==0.0.1"]
+Tool_Box=["private-extra-alternate==0.0.1"]
+all=["private-extra-operation[managed,tool-box]"]
+windows=["private-extra-operation[managed]; sys_platform == 'win32'"]
+marker=["six==1.17.0; extra == 'marker'"]
+[tool.uv.sources]
+private-extra-library={path="../library"}
+private-extra-alternate={path="../alternate"}
+`
+	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(metadata), 0600))
+	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte("[application]\nobject='operation:app'\n"), 0600))
+	must(t, os.WriteFile(filepath.Join(project, "operation.py"), []byte("VALUE=7\n"), 0600))
+	for _, item := range []struct{ dir, name string }{{library, "private-extra-library"}, {alternate, "private-extra-alternate"}} {
+		must(t, os.WriteFile(filepath.Join(item.dir, "pyproject.toml"), []byte(fmt.Sprintf("[project]\nname=%q\nversion='0.0.1'\n", item.name)), 0600))
+		must(t, os.WriteFile(filepath.Join(item.dir, "helper.py"), []byte("VALUE=11\n"), 0600))
+	}
+	capture := func(extras ...string) (*packagepublish.Package, string) {
+		t.Helper()
+		pack, problem := packagepublish.PreparePrivateFrom(context.Background(), project, extras...)
+		fatal(t, problem)
+		t.Cleanup(pack.Close)
+		identity, _, _, problem := pack.SourceIdentity()
+		fatal(t, problem)
+		return pack, identity
+	}
+	first, identity := capture("managed", "TOOL_box", "managed")
+	_, repeat := capture("tool-box", "managed")
+	if identity != repeat {
+		t.Fatal("extra normalization/order changed immutable capture")
+	}
+	grouped, _ := capture("all")
+	groupDependencies, problem := packagepublish.LocalDependencySelections(grouped.Tree)
+	fatal(t, problem)
+	if len(groupDependencies) != 2 {
+		t.Fatal("self-extra grouping lost dependencies")
+	}
+	conditional, _ := capture("windows")
+	conditionalMetadata, err := os.ReadFile(filepath.Join(conditional.Tree, "pyproject.toml"))
+	must(t, err)
+	if !strings.Contains(string(conditionalMetadata), "private-extra-operation[windows]==0.0.1") || !strings.Contains(string(conditionalMetadata), "sys_platform == 'win32'") {
+		t.Fatal("conditional self extra lost its selection or environment marker")
+	}
+	marked, _ := capture("marker")
+	environment, problem := install.MaterializeEnvironment(marked.Tree, filepath.Join(t.TempDir(), "venv"))
+	fatal(t, problem)
+	if !strings.Contains(environment.Closure, "six==1.17.0") {
+		t.Fatalf("selected extra marker did not install its declared dependency: %s", environment.Closure)
+	}
+	_, one := capture("managed")
+	if one == identity {
+		t.Fatal("different selected extras kept the same closure")
+	}
+	selected, problem := packagepublish.LocalDependencySelections(first.Tree)
+	fatal(t, problem)
+	if len(selected) != 2 || selected["private-extra-library"].Path != library || selected["private-extra-alternate"].Path != alternate {
+		t.Fatalf("selected optional dependencies lost their original paths: %+v", selected)
+	}
+	for _, extra := range []string{"missing", "managed; injected"} {
+		pack, problem := packagepublish.PreparePrivateFrom(context.Background(), project, extra)
+		if pack != nil {
+			pack.Close()
+		}
+		if problem == nil {
+			t.Fatalf("unvalidated optional dependency group accepted: %q", extra)
+		}
+	}
+	actual, err := os.ReadFile(filepath.Join(project, "pyproject.toml"))
+	must(t, err)
+	if string(actual) != metadata {
+		t.Fatal("extra activation mutated editable source metadata")
+	}
+	if _, err := os.Stat(filepath.Join(project, "uv.lock")); !os.IsNotExist(err) {
+		t.Fatal("extra activation wrote original lock")
+	}
+	must(t, os.WriteFile(filepath.Join(library, "helper.py"), []byte("VALUE=12\n"), 0600))
+	_, edited := capture("managed")
+	if edited == one {
+		t.Fatal("selected same-version helper edit did not change captured closure")
+	}
+	changed := strings.Replace(metadata, "private-extra-library==0.0.1", "private-extra-library>=0.0.1", 1)
+	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(changed), 0600))
+	_, repinned := capture("managed")
+	if repinned == edited {
+		t.Fatal("selected dependency requirement edit did not change capture")
 	}
 }

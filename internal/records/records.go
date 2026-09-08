@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 29
+const schemaVersion = 32
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -114,7 +114,9 @@ CREATE TABLE IF NOT EXISTS pins (
 var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orchestratorSchema,
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
 
-func init() { schema = append(schema, weightsRetentionsDDL, operationLookupsDDL) }
+func init() {
+	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL)
+}
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
@@ -368,6 +370,30 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return exit.Internalf("cannot create pending operation lookups in %s: %s", path, err)
 		}
 	}
+	if sourceVersion < 30 {
+		if _, err := tx.Exec(nativeCallsDDL); err != nil {
+			return exit.Internalf("cannot create native call admission in %s: %s", path, err)
+		}
+	}
+	if sourceVersion < 31 {
+		if _, err := tx.Exec(nativeArtifactRetentionsDDL); err != nil {
+			return exit.Internalf("cannot create native artifact custody in %s: %s", path, err)
+		}
+	}
+
+	if sourceVersion >= 30 && sourceVersion < 32 {
+		columns := strings.Replace(nativeCallColumns, ",cancel_requested", "", 1)
+		for _, statement := range []string{
+			`ALTER TABLE native_calls RENAME TO native_calls_prior`, nativeCallsDDL,
+			`INSERT INTO native_calls(` + columns + `) SELECT ` + columns + ` FROM native_calls_prior`,
+			`DROP TABLE native_calls_prior`,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot preserve effect cancellation in %s: %s", path, err)
+			}
+		}
+	}
+
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
@@ -693,6 +719,12 @@ func priorStatements(version int) []string {
 		if version < 29 && statement == operationLookupsDDL {
 			continue
 		}
+		if version < 31 && statement == nativeArtifactRetentionsDDL {
+			continue
+		}
+		if version < 30 && statement == nativeCallsDDL {
+			continue
+		}
 		if version < 28 && statement == weightsRetentionsDDL {
 			continue
 		}
@@ -703,6 +735,9 @@ func priorStatements(version int) []string {
 			version < 16 && containsStatement(packageEventSchema, statement) ||
 			version < 23 && (statement == modelCheckpointSchema || statement == modelCheckpointPublicationSchema) {
 			continue
+		}
+		if version < 32 && statement == nativeCallsDDL {
+			statement = strings.Replace(statement, " cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),\n", "", 1)
 		}
 		statements = append(statements, statement)
 	}

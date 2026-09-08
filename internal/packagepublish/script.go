@@ -45,6 +45,10 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
+	models, problem := scriptModels(metadata)
+	if problem != nil {
+		return nil, problem
+	}
 	if metadata.RequiresPython == "" {
 		metadata.RequiresPython = ">=3.12"
 	}
@@ -138,6 +142,7 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 		return nil, problem
 	}
 	pack.temporarySource = root
+	pack.ScriptModels = models
 	keep = true
 	return pack, nil
 }
@@ -181,4 +186,24 @@ func readScriptMetadata(raw []byte) (scriptMetadata, *exit.Error) {
 		return metadata, exit.Named(exit.Validation, "script_metadata_invalid", "invalid PEP 723 metadata: %s", err)
 	}
 	return metadata, nil
+}
+
+func scriptModels(metadata scriptMetadata) (map[string]string, *exit.Error) {
+	models := map[string]string{}
+	cozy, ok := metadata.Tool["cozy"].(map[string]any)
+	if !ok {
+		return models, nil
+	}
+	declared, ok := cozy["models"].(map[string]any)
+	if !ok && cozy["models"] != nil {
+		return nil, exit.Named(exit.Validation, "script_metadata_invalid", "tool.cozy.models must map model parameters to references")
+	}
+	for name, value := range declared {
+		ref, ok := value.(string)
+		if !ok || name == "" || strings.ContainsAny(name, ".= /\\") || ref == "" {
+			return nil, exit.Named(exit.Validation, "script_metadata_invalid", "script model default is invalid")
+		}
+		models[name] = ref
+	}
+	return models, nil
 }

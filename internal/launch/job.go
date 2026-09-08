@@ -7,6 +7,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
@@ -76,17 +77,11 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	if !facts.NeedsAccelerator {
 		devices = nil
 	}
-	runtimeBin, e := HostRuntime(f.RuntimeCLI.Env)
+	runtimeBin, e := hostruntime.Path(f.RuntimeCLI.Env)
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}
-	placement, e := f.Placement()
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, nil, e
-	}
-	// The build id comes off the SELECTED PlacementSet, exactly as a rented worker reads
-	// it off the set it prepared for itself. One derivation, one meaning, both lanes.
-	buildID, e := orchestrator.JobBuildID(placement.PlacementSetBytes, f.Install.Package)
+	placement, buildID, e := f.JobCodeIdentity()
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}
@@ -140,7 +135,9 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 // because no verb would say it; cr-016's `describe <job> --json` now carries it beside the
 // entry, so the second implementation of the canonical form — and the whole class of
 // refusals it owed for values the protocol profile cannot spell (a float bound, a null
-// default) — deletes with it.
+// default) — deletes with it. The reader is THIS host's Runtime (hostruntime.Path, cl-175): a
+// published install is read from its exact retained interface, an editable one from its
+// source, and neither imports the package.
 func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	var declared *Entrypoint
 	for i := range f.PackageInterface.Jobs {
@@ -155,10 +152,16 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 			WithRemedy("it registers: %s", strings.Join(f.PackageInterface.Names(), ", ")).
 			WithNext("cozy package list --full")
 	}
+	runtimeBin, problem := hostruntime.Path(f.RuntimeCLI.Env)
+	if problem != nil {
+		return nil, problem
+	}
 	var said struct {
 		DescriptorID string `json:"job_descriptor_id"`
 	}
-	if e := f.RuntimeCLI.call(&said, "describe", function); e != nil {
+	runtime := f.RuntimeCLI
+	runtime.Bin = runtimeBin
+	if e := runtime.call(&said, "describe", function); e != nil {
 		return nil, e
 	}
 	if said.DescriptorID == "" {

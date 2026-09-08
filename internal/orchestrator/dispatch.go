@@ -207,10 +207,10 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		bodyDigest = spelled
 	}
 	if s.LocalPackageDigest != "" {
-		if !s.Rental || s.InstallID == "" || !validDigest(s.LocalPackageDigest) {
+		if s.InstallID == "" || !validDigest(s.LocalPackageDigest) {
 			return records.Request{}, nil, exit.Named(exit.Structural,
 				"local_package_request_invalid",
-				"a local package revision requires one editable rental install")
+				"a local package revision requires one exact editable install")
 		}
 		identity, err := canonical.Write(map[string]canonical.Value{
 			"body_digest":          bodyDigest,
@@ -693,7 +693,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			// A local package_set request learns its binding digest from the worker.
 			// Until that happens an empty plan is neither staged nor stale; resolveFor
 			// sends the logical set and binds the observed answer.
-			if req.Worker != "" && req.PlanID == "" {
+			if req.PlanID == "" {
 				continue
 			}
 			// RESIDENCY IS ABOUT THE PLAN, not about the slot. A worker that STAGED this
@@ -1038,6 +1038,9 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			spec, e := c.opt.Packages.ResolveInstall(req.InstallID, req.Models)
 			if e != nil {
 				return WorkerLaunchSpec{}, "", e
+			}
+			if spec.Preparation != nil {
+				return c.prepareLocalServing(req, spec)
 			}
 			if spec.Placement.Package != req.Package {
 				return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict,

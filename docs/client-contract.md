@@ -470,3 +470,12 @@ cannot drift:
 **A FAILED or CANCELED terminal never comes back through this table.** It is answered
 `200` on purpose—a terminal is an answer, not a transport failure. The CLI preserves the
 terminal's detailed symbolic status and returns shell exit 1 for any non-successful outcome.
+
+
+Private invocable dependencies preserve standard Python extra selection. For example,
+a local dependency declared as `cozy-eval[managed]` activates that library's declared
+managed requirements in the immutable child capture. The original editable pyproject
+and lock remain unchanged. The captured pyproject, resolved uv lock, wheel and execution
+environment identify the selected closure; equivalent normalized extra sets capture
+identically. Unknown or ambiguous local extra groups refuse. This uses the existing
+private installation and invocation flow, without a wrapper package or another command.

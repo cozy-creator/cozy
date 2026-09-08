@@ -10,14 +10,12 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/wheel"
 	"github.com/pelletier/go-toml/v2"
@@ -46,7 +44,8 @@ type Package struct {
 	Root             string // disposable wheel output, empty until Build
 	Name             string
 	Release          string
-	temporarySource  string // generated single-file project, copied into a retained install
+	ScriptModels     map[string]string // plain-main default model refs; ordinary CLI overrides win
+	temporarySource  string            // generated single-file project, copied into a retained install
 }
 
 type sourceIdentityFile struct {
@@ -161,7 +160,7 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 			return problem
 		}
 	}
-	packageInterface, problem := describe(ctx, p.Tree, root)
+	packageInterface, problem := describe(ctx, p.Tree, root, publish)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
@@ -305,29 +304,6 @@ func VerifyProjectWheel(ctx context.Context, tree, name, release string) *exit.E
 	return problem
 }
 
-func describe(ctx context.Context, tree, root string) (string, *exit.Error) {
-	cmd := exec.CommandContext(ctx, "uv", "run", "--locked", "--no-progress",
-		"cozy-runtime", "--json", "--dir", tree, "describe")
-	cmd.Dir = tree
-	cmd.Env = config.Frozen().Tool()
-	var stdout, stderr strings.Builder
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return "", exit.Named(exit.Validation, "package_interface_refused",
-			"cozy-runtime could not describe the package").WithRemedy("%s", strings.TrimSpace(stderr.String()))
-	}
-	raw := []byte(strings.TrimSpace(stdout.String()))
-	if len(raw) == 0 || len(raw) > 1<<20 || !json.Valid(raw) {
-		return "", exit.Named(exit.Structural, "package_interface_invalid",
-			"cozy-runtime returned an invalid package interface")
-	}
-	path := filepath.Join(root, "package-interface.json")
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return "", exit.Internalf("cannot stage package interface: %s", err)
-	}
-	return path, nil
-}
-
 // Paths returns the sorted source-relative paths of one prepared tree.
 func Paths(files map[string]string) []string {
 	out := make([]string, 0, len(files))
@@ -341,18 +317,19 @@ func Paths(files map[string]string) []string {
 // SourceIdentity binds an editable install to the exact publishable source tree.
 // It neither builds nor claims a wheel: editable execution uses this live tree,
 // while published execution remains the separate wheel-backed path.
-func (p *Package) SourceIdentity() (string, int, int64, *exit.Error) {
+func (p *Package) SourceIdentity(extras ...string) (string, int, int64, *exit.Error) {
 	document := sourceIdentityDocument{}
 	var sourceBytes int64
 	files := make(map[string]string, len(p.Files))
 	for name, path := range p.Files {
 		files[name] = path
 	}
-	dependencies, problem := LocalDependencyPaths(p.Tree)
+	dependencies, problem := LocalDependencySelections(p.Tree, extras...)
 	if problem != nil {
 		return "", 0, 0, problem
 	}
-	for name, source := range dependencies {
+	for name, selection := range dependencies {
+		source := selection.Path
 		info, err := os.Stat(source)
 		if err != nil {
 			return "", 0, 0, exit.Internalf("cannot inspect local dependency: %s", err)

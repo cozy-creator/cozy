@@ -240,8 +240,10 @@ func TestOperationLookupSchemaUpgradePreservesRequests(t *testing.T) {
 	store.Close()
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
-	_, err = db.Exec(`DROP TABLE request_operation_lookups`)
-	must(t, err)
+	for _, table := range []string{"native_artifact_retentions", "native_calls", "request_operation_lookups"} {
+		_, err = db.Exec(`DROP TABLE ` + table)
+		must(t, err)
+	}
 	_, err = db.Exec(`PRAGMA user_version=28`)
 	must(t, err)
 	must(t, db.Close())
