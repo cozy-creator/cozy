@@ -19,6 +19,8 @@ func restorePriorCallIndexBounds(t *testing.T, db *sql.DB) {
 	}
 	_, err = db.Exec(`PRAGMA legacy_alter_table=ON`)
 	must(t, err)
+	_, err = db.Exec(`DROP TABLE IF EXISTS request_operation_contexts`)
+	must(t, err)
 	for _, name := range []string{"requests_active_children", "native_active_calls"} {
 		_, err := db.Exec(`DROP INDEX IF EXISTS ` + name)
 		must(t, err)

@@ -29,22 +29,28 @@ import (
 var cozyBin, fakeWorkerBin string
 
 func TestMain(m *testing.M) {
-	if len(os.Args) == 2 && strings.HasPrefix(os.Args[1], "--cozy-test-daemon-parent=") {
-		daemonPath := strings.TrimPrefix(os.Args[1], "--cozy-test-daemon-parent=")
-		cmd := exec.Command(daemonPath)
-		cmd.Args[0] = "cozy-daemon"
-		cmd.Stdout = io.Discard
-		cmd.Stderr = os.Stderr
-		if err := cmd.Start(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
+	// The reaper is this same binary under another argv (see reap_test.go). It must be
+	// recognised before anything else happens: it builds nothing and runs no test.
+	if len(os.Args) == 2 && strings.HasPrefix(os.Args[1], reapMode) {
+		runDaemonReaper(strings.TrimPrefix(os.Args[1], reapMode), os.Stdin) //cozy:stdin-value owned reaper subprocess liveness pipe
 		os.Exit(0)
+	}
+	// Reap the roots the previous run abandoned before claiming disk of our own,
+	// and refuse to start at all on a box that has no fork headroom left — a
+	// suite that dies partway through leaks a scratch root per killed test.
+	if reaped, failed := reapAbandonedScratch(os.TempDir(), scratchReapMinAge); reaped+failed > 0 {
+		fmt.Fprintf(os.Stderr, "reaped %d abandoned scratch roots (%d could not be removed)\n", reaped, failed)
+	}
+	if ok, detail := forkHeadroom(); !ok {
+		fmt.Fprintf(os.Stderr, "refusing to start: the box is out of fork headroom (%s).\n"+
+			"Reap orphaned daemons and scratch roots before running the suite.\n", detail)
+		os.Exit(1)
 	}
 	dir, err := os.MkdirTemp("", "cozy-product-test-bin")
 	if err != nil {
 		panic(err)
 	}
+	claimScratch(dir)
 	// The suite must never reach the user's ~/.tensorfs: config freezes on its first
 	// in-process Load, so the isolated TensorFS home is pinned before any test runs.
 	if err := os.Setenv("TENSORFS_HOME", filepath.Join(dir, "tensorfs")); err != nil {
@@ -60,7 +66,14 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 	}
+	// Every daemon this run causes to exist dies with it. Layer 3 first, so the roots a
+	// test registers are known to a process that outlives a SIGKILL of this one.
+	startDaemonReaper()
 	code := m.Run()
+	for _, root := range trackedRoots() {
+		reapDaemonRoot(root)
+	}
+	stopDaemonReaper()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
 }
@@ -85,8 +98,9 @@ type owner struct {
 func hostOwner(t *testing.T, name string, with ...func(*orchestrator.Options)) *owner {
 	t.Helper()
 	root := filepath.Join(os.TempDir(), "cozy-product-test", name)
-	must(t, os.RemoveAll(root))
+	must(t, removeAllForce(root))
 	must(t, os.MkdirAll(root, 0o755))
+	claimScratch(root)
 	must(t, os.Setenv("COZY_HOME", root))
 
 	cfg, e := config.Load()
@@ -384,8 +398,13 @@ func runCozyStreams(t *testing.T, root string, args ...string) (int, string, str
 	return code, stdout.String(), stderr.String()
 }
 
+// childEnv is the ONE chokepoint every daemon-capable child process passes: a Cozy daemon
+// can only ever be started by a process that got its COZY_HOME from here. Registering the
+// root here is therefore the same thing as registering every daemon that can exist, and a
+// test cannot forget to do it. See reap_test.go for what the registration arms.
 func childEnv(t *testing.T, root string, imposed ...string) []string {
 	t.Helper()
+	trackDaemonRoot(t, root)
 	must(t, os.Setenv("COZY_HOME", root))
 	cfg, e := config.Load()
 	fatal(t, e)

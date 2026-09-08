@@ -122,7 +122,6 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		refuse(problem)
 		return
 	}
-	target = c.qualifyChildReuse(s, call, &spec, target)
 	spec.IdemKey = fmt.Sprintf("child/%s/%d", parent.ID, call.CallIndex)
 	request, _, problem := requestRecord(spec)
 	if problem != nil {

@@ -879,31 +879,57 @@ func (c *Orchestrator) reconcileSnapshotAbsence(w *worker, held map[string]bool)
 	return continuations
 }
 
-// openWatch opens the LOSSY progress lane on its own connection after the snapshot
-// barrier, bound to the claimed epoch. Its death is invisible to control; the
-// redial cycle reopens it.
+// openWatch owns the independent lossy connection for this control session. A
+// dropped watch must reconnect even while the healthy control lane keeps running.
 func (c *Orchestrator) openWatch(addr string, w *worker, s *session) context.CancelFunc {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s.ctx)
 	go func() {
-		conn, err := dialWorker(addr, w.spec.Connection)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		open := &pb.ProgressOpen{}
-		open.RecordOwnerEpoch, open.ControlStreamEpoch, open.WorkerBootId =
-			recordOwnerEpoch, s.epoch, s.bootID
-		watch, err := pb.NewWorkerControlClient(conn).WatchProgress(ctx, open)
-		if err != nil {
-			return
-		}
-		for {
-			p, err := watch.Recv()
-			if err != nil {
+		backoff := 250 * time.Millisecond
+		for ctx.Err() == nil {
+			received, err := c.watchProgress(ctx, addr, w, s)
+			if ctx.Err() != nil {
 				return
 			}
-			c.frames.publish(frameOf(p))
+			if received {
+				backoff = 250 * time.Millisecond
+			}
+			// gRPC details may contain transport addresses; log only the safe status class.
+			c.logf("progress stream for %s disconnected (%s); reconnecting in %s", w.instanceID, status.Code(err), backoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			backoff = min(backoff*2, 5*time.Second)
 		}
 	}()
 	return cancel
+}
+
+func (c *Orchestrator) watchProgress(ctx context.Context, addr string, w *worker, s *session) (bool, error) {
+	conn, err := dialWorker(addr, w.spec.Connection)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	open := &pb.ProgressOpen{RecordOwnerEpoch: recordOwnerEpoch,
+		ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID}
+	watch, err := pb.NewWorkerControlClient(conn).WatchProgress(ctx, open)
+	if err != nil {
+		return false, err
+	}
+	received := false
+	for {
+		p, err := watch.Recv()
+		if err != nil {
+			return received, err
+		}
+		if p.RecordOwnerEpoch != recordOwnerEpoch || p.ControlStreamEpoch != s.epoch || p.WorkerBootId != s.bootID {
+			continue
+		}
+		received = true
+		c.frames.publish(frameOf(p))
+	}
 }

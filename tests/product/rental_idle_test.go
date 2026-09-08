@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -245,12 +246,37 @@ type fakeRentalHub struct {
 	rent     func(map[string]any) map[string]any
 	released map[string]int
 	server   *httptest.Server
+	// publishes is whether this stand-in hub carries th-199's account listing.
+	publishes bool
 }
 
 func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	t.Helper()
 	h := &fakeRentalHub{rentals: map[string]map[string]any{}, released: map[string]int{}}
 	mux := http.NewServeMux()
+	// th-199's enumeration door, the half a pre-th-199 hub does not have: `publishes`
+	// off leaves `POST /v1/rentals` to answer a GET with net/http's own 405, exactly as
+	// an un-upgraded Tensorhub does.
+	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if !h.publishes || r.Header.Get("Authorization") != "Bearer rental-idle-test" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		rows := []map[string]any{}
+		for _, row := range h.rentals {
+			if state, _ := row["state"].(string); state == "released" || state == "failed" {
+				continue
+			}
+			rows = append(rows, row)
+		}
+		sort.Slice(rows, func(i, j int) bool {
+			return fmt.Sprint(rows[i]["rental_id"]) < fmt.Sprint(rows[j]["rental_id"])
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"rentals": rows})
+	})
 	mux.HandleFunc("GET /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -305,6 +331,14 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	h.server.Start()
 	t.Cleanup(h.close)
 	return h
+}
+
+// publishListing turns th-199's account listing on. It is off by default so every
+// proof written before the route still runs against the hub it was written for.
+func (h *fakeRentalHub) publishListing() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.publishes = true
 }
 
 // setSKUs is the fake hub's product catalog, the shape Tensorhub serves it:

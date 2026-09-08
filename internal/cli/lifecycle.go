@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -12,7 +11,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostgpu"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -177,13 +175,18 @@ func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 					continue
 				}
 				if id == "" {
+					// The hub proved this ask created nothing; there is no pod to end.
+					ended[identity.ID] = true
 					continue
 				}
 				if problem := endRentalSilently(ctx, id); problem != nil {
 					note("rental "+id, problem.Message)
 					continue
 				}
-				ended[id] = true
+				// Keyed under BOTH names: the warning loop below walks the daemon's
+				// identities, which spell an operation by its key, and a pod that was
+				// ended must not be reported as still billing.
+				ended[id], ended[identity.ID] = true, true
 			}
 		}
 		if result.ShuttingDown {
@@ -216,8 +219,11 @@ func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 	}
 }
 
+// endRentalSilently releases one rental for `cozy down --all`. The hub it asks is the one
+// the rental was BOUGHT from — recorded on the rental row, or on the paid ask when the
+// pod was never attached — because a 404 from any other hub says nothing about the pod.
 func endRentalSilently(ctx *Context, id string) *exit.Error {
-	row, problem := rentalRow(ctx, id)
+	authority, problem := rentalAuthority(ctx, id)
 	if problem != nil {
 		return problem
 	}
@@ -225,11 +231,28 @@ func endRentalSilently(ctx *Context, id string) *exit.Error {
 	sub.Out = io.Discard
 	sub.Inv = &Invocation{Args: []string{id}, Bools: map[string]bool{},
 		Values: map[string][]string{}, Mode: ctx.Mode()}
-	if row != nil {
-		sub.Cfg.HubURL = row.Hub
+	if authority != "" {
+		sub.Cfg.HubURL = authority
 		sub.Cfg.HubURLSource = "rental record"
 	}
 	return handleRentRelease(&sub)
+}
+
+func rentalAuthority(ctx *Context, id string) (string, *exit.Error) {
+	layout, problem := home.Open(ctx.Cfg.Home)
+	if problem != nil {
+		return "", problem
+	}
+	store, problem := records.Open(layout.DB)
+	if problem != nil {
+		return "", problem
+	}
+	defer store.Close()
+	known, problem := rental.Resolve(store, id)
+	if problem != nil {
+		return "", problem
+	}
+	return known.Hub, nil
 }
 
 func resolveRentalOperation(ctx *Context, key string) (string, *exit.Error) {
@@ -249,55 +272,7 @@ func resolveRentalOperation(ctx *Context, key string) (string, *exit.Error) {
 	if operation.RentalID != "" {
 		return operation.RentalID, nil
 	}
-	var request hub.RentalRequest
-	if err := json.Unmarshal(operation.RequestBody, &request); err != nil {
-		return "", exit.Internalf("stored rental operation %s has an unreadable request: %s", key, err)
-	}
-	sub := *ctx
-	sub.Cfg.HubURL = operation.Hub
-	sub.Cfg.HubURLSource = "rental operation"
-	hubClient := client(&sub)
-	hctx, cancel := hub.LongContext()
-	seen, problem := hubClient.Rent(hctx, operation.RequestBody, operation.Reason, operation.Key)
-	cancel()
-	if problem != nil {
-		if problem.Code == exit.Credential || problem.Code == exit.Validation ||
-			problem.Code == exit.NotFound || problem.Code == exit.Conflict {
-			if advanced := store.AdvanceRentalOperation(key, "", "rejected"); advanced != nil {
-				return "", advanced
-			}
-			rental.ForgetPending(layout, key)
-			return "", nil
-		}
-		return "", problem
-	}
-	if problem := store.AdvanceRentalOperation(key, seen.ID, seen.State); problem != nil {
-		return "", problem
-	}
-	row := records.Rental{
-		ID: seen.ID, SKU: request.SKU, AcceleratorModel: seen.AcceleratorModel,
-		AcceleratorCount:    seen.AcceleratorCount,
-		HourlyRateUSDMicros: seen.HourlyRateUSDMicros, ManagedRequestID: operation.ManagedRequestID,
-		State: seen.State, Hub: operation.Hub,
-	}
-	copyRentalFailure(&row, seen)
-	if problem := store.RecordRental(row); problem != nil {
-		return "", problem
-	}
-	return seen.ID, nil
-}
-
-func rentalRow(ctx *Context, id string) (*records.Rental, *exit.Error) {
-	layout, problem := home.Open(ctx.Cfg.Home)
-	if problem != nil {
-		return nil, problem
-	}
-	store, problem := records.Open(layout.DB)
-	if problem != nil {
-		return nil, problem
-	}
-	defer store.Close()
-	return store.RentalRow(id)
+	return learnRentalIdentity(ctx, layout, store, operation)
 }
 
 func offlineDownBlockers(ctx *Context) ([]string, *exit.Error) {

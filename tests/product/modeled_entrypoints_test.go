@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"flag"
@@ -57,8 +56,8 @@ func TestModeledRentalSelectsTheNamedPreparedBinding(t *testing.T) {
 			public, private, err := ed25519.GenerateKey(rand.Reader)
 			must(t, err)
 			bindings := map[string][]byte{
-				"first_last_frame_to_video": bytes.Repeat([]byte{0x31}, 32),
-				"reference_media_to_video":  bytes.Repeat([]byte{0x32}, 32),
+				"first_last_frame_to_video": podEntrypoint("first_last_frame_to_video").EntrypointBindingDigest,
+				"reference_media_to_video":  podEntrypoint("reference_media_to_video").EntrypointBindingDigest,
 			}
 			pod := &fakePod{controlKey: public, serve: true,
 				preparedPlacement: func(download []byte, pkg, release string) *pb.Placement {

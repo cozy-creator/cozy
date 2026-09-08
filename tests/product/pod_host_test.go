@@ -64,6 +64,7 @@ type fakePod struct {
 	sourceControl   func(*pb.ModelSourceControlCall) (*pb.ModelSourceControlResult, error)
 	weightsReady    func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
 	protocolInfo    func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
+	watchProgress   func(*pb.ProgressOpen, pb.WorkerControl_WatchProgressServer) error
 	recordOperation func(*pb.RecordOperationResultCall) (*pb.RecordOperationResultResult, error)
 	pb.UnimplementedWorkerControlServer
 	pb.UnimplementedPodHostServer
@@ -96,6 +97,7 @@ type fakePod struct {
 	// preparedPlacement supplies a complete second-implementation placement for
 	// tests of modeled callable routing. The normal package preparation path still runs.
 	preparedPlacement func([]byte, string, string) *pb.Placement
+	numericalDigest   []byte
 	// slots is the advertised seat count while serving; zero means one.
 	slots uint32
 	// deviceCount is the width this pod's ClaimAck reports — how many accelerators the
@@ -484,11 +486,11 @@ func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream g
 	p.localPrepares = append(p.localPrepares, call)
 	p.lanes = append(p.lanes, "prepare_private")
 	p.mu.Unlock()
-	entrypoints := []*pb.Entrypoint{{Name: "tile", EntrypointBindingDigest: bytes.Repeat([]byte{0x34}, 32)}}
+	entrypoints := []*pb.Entrypoint{podEntrypoint("tile")}
 	if p.localJobOnly {
 		entrypoints = nil
 	}
-	setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{{
+	placement := &pb.Placement{
 		PlacementId: "package-" + selected.OperationId,
 		PackageMode: &pb.Placement_Development{Development: &pb.DevelopmentPackage{
 			Package: selected.Package.Package, Release: selected.Package.Release,
@@ -501,7 +503,9 @@ func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream g
 		BindingsDigest:    bytes.Repeat([]byte{0x25}, 32),
 		Entrypoints:       entrypoints,
 		Environment:       &pb.Environment{},
-	}}})
+	}
+	sealPodBindings(placement)
+	setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{placement}})
 	if err != nil {
 		return err
 	}
@@ -597,6 +601,7 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 	if p.preparedPlacement != nil {
 		placement = p.preparedPlacement(call.PackageSet.DownloadDelegation, name, release)
 	}
+	sealPodBindings(placement)
 	setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{
 		placement,
 	}})
@@ -652,7 +657,7 @@ func podPlacement(downloadSet []byte, name, release, distribution string) *pb.Pl
 		EnvironmentDigest: sha256Of([]byte("environment:" + name)),
 		PackageInterface:  &pb.Ref{Digest: sha256Of([]byte("interface:" + name)), Length: 2048},
 		BindingsDigest:    sha256Of([]byte("bindings:" + name)),
-		Entrypoints:       []*pb.Entrypoint{{Name: "tile", EntrypointBindingDigest: sha256Of([]byte("entrypoint:" + name))}},
+		Entrypoints:       []*pb.Entrypoint{podEntrypoint("tile")},
 		Environment: &pb.Environment{LockedRequirements: &pb.Ref{
 			Digest: sha256Of([]byte("locked:" + name)), Length: 1024}},
 	}
@@ -660,8 +665,38 @@ func podPlacement(downloadSet []byte, name, release, distribution string) *pb.Pl
 
 // podPlanID is the plan a request binds to reach podPlacement's entrypoint for `name`.
 func podPlanID(name string) string {
-	spelled, _ := canonical.Spell(sha256Of([]byte("entrypoint:" + name)))
+	spelled, _ := canonical.Spell(podEntrypoint("tile").EntrypointBindingDigest)
 	return spelled
+}
+
+func podEntrypoint(name string) *pb.Entrypoint {
+	raw, _ := canonical.Write(map[string]canonical.Value{"name": name, "slots": []canonical.Value{}})
+	return &pb.Entrypoint{Name: name, EntrypointBindingDigest: canonical.Digest(raw)}
+}
+
+func sealPodBindings(placement *pb.Placement) {
+	raw, _, _ := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{placement}})
+	set, _ := canonical.Read(raw, &pb.PlacementSet{})
+	row := set.List("placements")[0]
+	for index, entry := range row.List("entrypoints") {
+		slots := canonical.Value([]canonical.Value{})
+		if value, exists := entry["slots"]; exists {
+			slots = value
+		}
+		raw, _ := canonical.Write(map[string]canonical.Value{"name": entry.Str("name"), "slots": slots})
+		placement.Entrypoints[index].EntrypointBindingDigest = canonical.Digest(raw)
+	}
+	raw, _, _ = canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{placement}})
+	set, _ = canonical.Read(raw, &pb.PlacementSet{})
+	row = set.List("placements")[0]
+	fields := map[string]canonical.Value{"entrypoints": []canonical.Value{}, "models": []canonical.Value{}}
+	for field := range fields {
+		if value, exists := row[field]; exists {
+			fields[field] = value
+		}
+	}
+	raw, _ = canonical.Write(fields)
+	placement.BindingsDigest = canonical.Digest(raw)
 }
 
 // startFakePod mints the pod leaf, binds the pinned listener, and serves the media health
@@ -946,7 +981,7 @@ func submitPrivateRental(t *testing.T, o *owner, revision localpackage.Revision,
 		Dir: filepath.Join(o.root, "installs", idem), Python: "/usr/bin/python3", Platform: "linux-x86"}
 	_, e := o.store.Activate(install)
 	fatal(t, e)
-	planID := "sha256:" + strings.Repeat("34", 32)
+	planID := podPlanID(revision.Package)
 	requestID, _, e := o.c.Submit(orchestrator.Submission{
 		IdemKey: idem, Package: revision.Package, Entrypoint: "tile", PlanID: planID,
 		Release:            revision.Release,
@@ -979,47 +1014,48 @@ func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 		defer pod.mu.Unlock()
 		return len(pod.desired) >= 1
 	})
-	pod.mu.Lock()
-	defer pod.mu.Unlock()
-	if got := strings.Join(pod.lanes, ","); got != "upload,prepare_private,placement_set" {
-		t.Fatalf("the pod saw the lanes in the order %q; want upload, prepare_private, placement_set", got)
-	}
-	project := 0
-	for _, grant := range pod.uploads {
-		spelled, _ := canonical.Spell(grant.Digest)
-		if strings.HasPrefix(grant.Filename, "weightless-1.0.0-") {
-			project++
-			if spelled != revision.Files[0].Digest && spelled != revision.Files[1].Digest ||
-				grant.Length == 0 {
-				t.Fatalf("the project wheel grant names %s %s, not the sealed revision's wheel", spelled, grant.Filename)
+	func() {
+		pod.mu.Lock()
+		defer pod.mu.Unlock()
+		if got := strings.Join(pod.lanes, ","); got != "upload,prepare_private,placement_set" {
+			t.Fatalf("the pod saw the lanes in the order %q; want upload, prepare_private, placement_set", got)
+		}
+		project := 0
+		for _, grant := range pod.uploads {
+			spelled, _ := canonical.Spell(grant.Digest)
+			if strings.HasPrefix(grant.Filename, "weightless-1.0.0-") {
+				project++
+				if spelled != revision.Files[0].Digest && spelled != revision.Files[1].Digest ||
+					grant.Length == 0 {
+					t.Fatalf("the project wheel grant names %s %s, not the sealed revision's wheel", spelled, grant.Filename)
+				}
 			}
 		}
-	}
-	if len(pod.uploads) != len(revision.Files) || project != 1 {
-		t.Fatalf("%d grant(s) with %d project wheel(s); want %d grants naming exactly one project wheel",
-			len(pod.uploads), project, len(revision.Files))
-	}
-	if len(pod.localPrepares) != 1 || len(pod.localPrepares[0].LocalPackageSet.Files) != len(revision.Files) ||
-		pod.localPrepares[0].LocalPackageSet.OperationId != requestID {
-		t.Fatalf("PodHost.PrepareLocalPackage saw %d call(s) for %v; want one naming request %s and every wheel",
-			len(pod.localPrepares), pod.localPrepares, requestID)
-	}
-	sent := pod.desired[0].GetPlacementSet()
-	if sent == nil || !bytes.Equal(sent.PlacementSetCanonicalBytes, pod.preparedSet) {
-		t.Fatalf("the desired state does not carry the exact bytes the host prepared")
-	}
-	doc, err := canonical.Read(sent.PlacementSetCanonicalBytes, &pb.PlacementSet{})
-	must(t, err)
-	wheel := doc.List("placements")[0].Sub("development").Sub("project_wheel").Sub("ref").Str("digest")
-	if wheel != revision.Files[0].Digest && wheel != revision.Files[1].Digest {
-		t.Fatalf("the placement's project wheel %s is not one the owner granted", wheel)
-	}
-	row, e := o.store.RequestRow(requestID)
-	fatal(t, e)
-	if row.LocalPackageUploadedBootID != podBootID {
-		t.Fatalf("the request row records upload boot %q; want the pod's %s", row.LocalPackageUploadedBootID, podBootID)
-	}
-	pod.mu.Unlock()
+		if len(pod.uploads) != len(revision.Files) || project != 1 {
+			t.Fatalf("%d grant(s) with %d project wheel(s); want %d grants naming exactly one project wheel",
+				len(pod.uploads), project, len(revision.Files))
+		}
+		if len(pod.localPrepares) != 1 || len(pod.localPrepares[0].LocalPackageSet.Files) != len(revision.Files) ||
+			pod.localPrepares[0].LocalPackageSet.OperationId != requestID {
+			t.Fatalf("PodHost.PrepareLocalPackage saw %d call(s) for %v; want one naming request %s and every wheel",
+				len(pod.localPrepares), pod.localPrepares, requestID)
+		}
+		sent := pod.desired[0].GetPlacementSet()
+		if sent == nil || !bytes.Equal(sent.PlacementSetCanonicalBytes, pod.preparedSet) {
+			t.Fatalf("the desired state does not carry the exact bytes the host prepared")
+		}
+		doc, err := canonical.Read(sent.PlacementSetCanonicalBytes, &pb.PlacementSet{})
+		must(t, err)
+		wheel := doc.List("placements")[0].Sub("development").Sub("project_wheel").Sub("ref").Str("digest")
+		if wheel != revision.Files[0].Digest && wheel != revision.Files[1].Digest {
+			t.Fatalf("the placement's project wheel %s is not one the owner granted", wheel)
+		}
+		row, e := o.store.RequestRow(requestID)
+		fatal(t, e)
+		if row.LocalPackageUploadedBootID != podBootID {
+			t.Fatalf("the request row records upload boot %q; want the pod's %s", row.LocalPackageUploadedBootID, podBootID)
+		}
+	}()
 	// THE POD SERVES: the request is DISPATCHED to the rented worker exactly once — the
 	// install that pins a local relaunch never hides the rental — and the spec names the
 	// local revision with no Environment identity, which development execution has none of.
@@ -1030,6 +1066,7 @@ func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 	})
 	time.Sleep(300 * time.Millisecond)
 	pod.mu.Lock()
+	defer pod.mu.Unlock()
 	if len(pod.offers) != 1 || len(pod.desired) != 1 {
 		t.Fatalf("%d offer(s) over %d desired state(s); want one offer over the one prepared set",
 			len(pod.offers), len(pod.desired))
@@ -1205,4 +1242,12 @@ func (p *fakePod) CheckpointTransfer(ctx context.Context, call *pb.CheckpointTra
 		return nil, status.Error(codes.Unimplemented, "no source Runtime")
 	}
 	return p.sourceRuntime.CheckpointTransfer(ctx, call.GetRequest())
+}
+
+func (p *fakePod) WatchProgress(open *pb.ProgressOpen, stream pb.WorkerControl_WatchProgressServer) error {
+	if p.watchProgress != nil {
+		return p.watchProgress(open, stream)
+	}
+	<-stream.Context().Done()
+	return nil
 }

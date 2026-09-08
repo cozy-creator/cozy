@@ -674,22 +674,27 @@ type Lifecycle struct {
 	Position        *int64   `json:"position,omitempty"`
 	Total           *int64   `json:"total,omitempty"`
 	RemainingMS     *int64   `json:"remaining_ms,omitempty"`
+	StepMS          *float64 `json:"step_ms,omitempty"`
 	// The PREPARATION facts (cl-121). A queued request is not idle — it is acquiring a
 	// machine, booting one, or landing model bytes on it — and these say which, with
 	// whatever advancement that phase actually has. Absent for anything that has left
 	// the queue, and absent field by field for a phase whose producer measured nothing:
 	// a missing rate means "not measured", never zero.
-	Phase            string         `json:"phase,omitempty"`
-	PhaseMachine     string         `json:"phase_machine,omitempty"`
-	PhaseElapsedMS   *int64         `json:"phase_elapsed_ms,omitempty"`
-	PhaseMovedBytes  *int64         `json:"phase_moved_bytes,omitempty"`
-	PhaseTotalBytes  *int64         `json:"phase_total_bytes,omitempty"`
-	PhaseRate        *float64       `json:"phase_rate_bytes_per_second,omitempty"`
-	PhaseRemainingMS *int64         `json:"phase_remaining_ms,omitempty"`
-	ResponseURL      string         `json:"response_url"`
-	Metrics          map[string]any `json:"metrics,omitempty"`
-	ErrorType        string         `json:"error_type,omitempty"`
-	Error            string         `json:"error,omitempty"`
+	Phase            string                               `json:"phase,omitempty"`
+	PhaseMachine     string                               `json:"phase_machine,omitempty"`
+	WaitingFor       *orchestrator.WaitingRun             `json:"waiting_for,omitempty"`
+	PhaseDetail      string                               `json:"phase_detail,omitempty"`
+	PhaseModels      []orchestrator.ModelDownloadProgress `json:"phase_models,omitempty"`
+	RentalProgress   *orchestrator.RentalProgress         `json:"rental_progress,omitempty"`
+	PhaseElapsedMS   *int64                               `json:"phase_elapsed_ms,omitempty"`
+	PhaseMovedBytes  *int64                               `json:"phase_moved_bytes,omitempty"`
+	PhaseTotalBytes  *int64                               `json:"phase_total_bytes,omitempty"`
+	PhaseRate        *float64                             `json:"phase_rate_bytes_per_second,omitempty"`
+	PhaseRemainingMS *int64                               `json:"phase_remaining_ms,omitempty"`
+	ResponseURL      string                               `json:"response_url"`
+	Metrics          map[string]any                       `json:"metrics,omitempty"`
+	ErrorType        string                               `json:"error_type,omitempty"`
+	Error            string                               `json:"error,omitempty"`
 	// CanceledBy is the recorded actor behind a canceled run (cl-108): the explicit
 	// `cozy run cancel`, a caller-authored --timeout, `cozy down --all` — never blank
 	// for a run this daemon canceled on request.
@@ -778,6 +783,9 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		}
 		if phase, ok := s.orchestrator.QueuePhase(row.ID); ok {
 			life.Phase, life.PhaseMachine = phase.Name, phase.Machine
+			life.PhaseDetail, life.RentalProgress = phase.Detail, phase.Rental
+			life.PhaseModels = phase.Models
+			life.WaitingFor = phase.WaitingFor
 			if elapsed := phase.Elapsed(); elapsed > 0 {
 				ms := elapsed.Milliseconds()
 				life.PhaseElapsedMS = &ms
@@ -807,10 +815,16 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 			life.OverallFraction = progress.OverallFraction
 			life.Position = progress.Position
 			life.Total = progress.Total
+			life.StepMS = progress.StepMS
 			if progress.Estimated {
 				life.RemainingMS = &progress.RemainingMS
 			}
 		}
+	} else if life.Status == "completed" {
+		complete := 1.0
+		life.OverallFraction = &complete
+	} else if life.Status == "failed" || life.Status == "canceled" {
+		life.OverallFraction, _ = s.store.TerminalOverallFraction(row.ID, row.Ordinal)
 	}
 	if export, problem := s.store.OutputExportOf(row.ID); problem == nil && export != nil {
 		life.OutputExport = &OutputExportRef{
