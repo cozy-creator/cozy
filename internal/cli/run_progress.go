@@ -60,13 +60,13 @@ func (p *RunProgress) interactive(e localapi.Event) {
 			return
 		}
 		key = "wait"
-		rows = []string{p.waitLine(e)}
+		rows = []string{HumanWaitLine(e.Payload)}
 	case "accepted":
 		// A delayed accepted event must not replace a stage already observed.
 		if strings.HasPrefix(p.terminal.key, "stage:") {
 			return
 		}
-		rows = []string{"  starting request"}
+		rows = []string{"  running · waiting for stage updates"}
 	case "dispatched", "submitted", "metric", "log":
 		return
 	case "rentals", "placement":
@@ -75,17 +75,17 @@ func (p *RunProgress) interactive(e localapi.Event) {
 			p.eraseLive()
 			fmt.Fprintln(p.ctx.Err, line)
 			p.last = line
-			p.drawLive()
+			p.drawLive(p.displayTime(e))
 		}
 		return
 	case "completed", "succeeded":
-		p.finishLive("done")
+		p.finishLive("done", eventTime(e))
 		return
 	case "failed", "canceled":
-		p.finishLive(kind)
+		p.finishLive(kind, eventTime(e))
 		return
 	case "attempt_failed", "requeued":
-		p.finishLive("retrying")
+		p.finishLive("retrying", eventTime(e))
 		rows = []string{progressLine(e, false)}
 	default:
 		return
@@ -94,12 +94,12 @@ func (p *RunProgress) interactive(e localapi.Event) {
 		return
 	}
 	if p.terminal.key != key {
-		p.finishLive("done")
+		p.finishLive("done", eventTime(e))
 		p.terminal.started = eventTime(e)
 	}
 	p.terminal.key, p.terminal.rows = key, rows
 	p.terminal.event, p.terminal.counted = e, counted
-	p.drawLive()
+	p.drawLive(p.displayTime(e))
 	p.armLiveClock()
 }
 
@@ -196,17 +196,26 @@ func (p *RunProgress) armLiveClock() {
 		if p.closed || p.terminal.key == "" {
 			return
 		}
-		p.drawLive()
+		p.drawLive(p.now())
 		p.armLiveClock()
 	})
 }
 
-func (p *RunProgress) visibleRows() []string {
+// Durable replay describes what happened at the recorded time. The live timer
+// advances only the stage that remains after the history has drained.
+func (p *RunProgress) displayTime(e localapi.Event) time.Time {
+	if at := eventTime(e); e.EventID > 0 && at.Before(p.began) {
+		return at
+	}
+	return p.now()
+}
+
+func (p *RunProgress) visibleRows(at time.Time) []string {
 	rows := append([]string(nil), p.terminal.rows...)
 	if len(rows) == 0 {
 		return rows
 	}
-	elapsed := max(p.now().Sub(p.terminal.started), 0)
+	elapsed := max(at.Sub(p.terminal.started), 0)
 	if strings.HasPrefix(p.terminal.key, "phase:") {
 		original, _ := p.terminal.event.Payload["value"].(map[string]any)
 		fields := make(map[string]any, len(original)+1)
@@ -214,8 +223,17 @@ func (p *RunProgress) visibleRows() []string {
 			fields[k] = v
 		}
 		prior, _ := number(fields["elapsed_ms"])
-		fields["elapsed_ms"] = prior + float64(max(p.now().Sub(eventTime(p.terminal.event)), 0).Milliseconds())
+		fields["elapsed_ms"] = prior + float64(max(at.Sub(eventTime(p.terminal.event)), 0).Milliseconds())
 		return phaseRows(fields)
+	}
+	if p.terminal.key == "wait" {
+		rows[0] = HumanWaitLine(p.terminal.event.Payload)
+		if elapsed >= WaitPatience {
+			if reason, _ := p.terminal.event.Payload["reason"].(string); reason != "" {
+				rows[0] += " — " + shortDuration(elapsed) + " so far: " + reason
+				return rows
+			}
+		}
 	}
 	// Counted rows prioritize useful speed and ETA; their clock gets its own short
 	// line so those facts survive on an ordinary 80-column terminal.
@@ -249,8 +267,8 @@ func (p *RunProgress) eraseLive() {
 	p.terminal.drawn = 0
 }
 
-func (p *RunProgress) drawLive() {
-	rows := p.visibleRows()
+func (p *RunProgress) drawLive(at time.Time) {
+	rows := p.visibleRows(at)
 	if height := terminalHeight(p.ctx.Err); height > 1 && len(rows) >= height {
 		visible := max(1, height-2)
 		rows = append(rows[:visible], fmt.Sprintf("    … %d more rows", len(rows)-visible))
@@ -272,14 +290,14 @@ func (p *RunProgress) drawLive() {
 	p.terminal.drawn = len(rows)
 }
 
-func (p *RunProgress) finishLive(status string) {
+func (p *RunProgress) finishLive(status string, at time.Time) {
 	if p.terminal.timer != nil {
 		p.terminal.timer.Stop()
 	}
 	if p.terminal.key == "" {
 		return
 	}
-	rows := p.visibleRows()
+	rows := p.visibleRows(at)
 	p.eraseLive()
 	for i, row := range rows {
 		columns := p.width()
