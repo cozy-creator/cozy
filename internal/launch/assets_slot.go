@@ -70,6 +70,9 @@ func validateAssetsSlot(raw, request json.RawMessage) error {
 			return err
 		}
 		kind := slot.Kinds[i]
+		if slot.View == "decoded" && kind.Kind == "file" {
+			return fmt.Errorf("decoded assets need image, video or audio kinds")
+		}
 		if seen[kind.Kind] || (kind.Kind != "image" && kind.Kind != "video" && kind.Kind != "audio" && kind.Kind != "file") || (len(kind.MediaTypes) == 0 && kind.Kind != "file") {
 			return fmt.Errorf("assets kinds must be unique media contracts")
 		}
@@ -238,8 +241,8 @@ func ValidateAssetCounts(ep *Entrypoint, bindings []records.AssetBinding) *exit.
 	return nil
 }
 
-// Fidelity stays in the request's ordinary occurrence record. The SDK owns
-// its interpretation; neither this binding nor the shared loader resizes media.
+// Fidelity stays in the request's ordinary occurrence record. The package owns
+// its interpretation and resizing; this binding and the shared loader preserve media.
 func applyAssetFidelity(ep *Entrypoint, document map[string]any, mappings []string) *exit.Error {
 	if len(mappings) == 0 {
 		return nil

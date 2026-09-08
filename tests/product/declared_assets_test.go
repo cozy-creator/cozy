@@ -135,6 +135,14 @@ func TestDeclaredAssetsDecodedViewDescriptor(t *testing.T) {
 			}
 		})
 	}
+	fileKind := strings.Replace(declaredAssetsInterface, `"kind":"image"`, `"kind":"file"`, 1)
+	if _, problem := launch.DecodePackageInterface([]byte(fileKind)); problem != nil {
+		t.Fatalf("ordinary raw file Assets refused: %v", problem)
+	}
+	decodedFile := strings.Replace(fileKind, `"parameter":"assets"`, `"parameter":"assets","view":"decoded"`, 1)
+	if _, problem := launch.DecodePackageInterface([]byte(decodedFile)); problem == nil {
+		t.Fatal("decoded Assets admitted a generic file kind")
+	}
 }
 
 func TestDeclaredAssetsCountsAndFidelity(t *testing.T) {
