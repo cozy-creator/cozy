@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
@@ -139,6 +140,8 @@ dependencies=[]
 managed=["private-extra-library==0.0.1"]
 Tool_Box=["private-extra-alternate==0.0.1"]
 all=["private-extra-operation[managed,tool-box]"]
+windows=["private-extra-operation[managed]; sys_platform == 'win32'"]
+marker=["six==1.17.0; extra == 'marker'"]
 [tool.uv.sources]
 private-extra-library={path="../library"}
 private-extra-alternate={path="../alternate"}
@@ -164,9 +167,23 @@ private-extra-alternate={path="../alternate"}
 	if identity != repeat {
 		t.Fatal("extra normalization/order changed immutable capture")
 	}
-	_, combined := capture("all")
-	if combined != identity {
-		t.Fatal("self-extra grouping changed effective captured requirements")
+	grouped, _ := capture("all")
+	groupDependencies, problem := packagepublish.LocalDependencySelections(grouped.Tree)
+	fatal(t, problem)
+	if len(groupDependencies) != 2 {
+		t.Fatal("self-extra grouping lost dependencies")
+	}
+	conditional, _ := capture("windows")
+	conditionalMetadata, err := os.ReadFile(filepath.Join(conditional.Tree, "pyproject.toml"))
+	must(t, err)
+	if !strings.Contains(string(conditionalMetadata), "private-extra-operation[windows]==0.0.1") || !strings.Contains(string(conditionalMetadata), "sys_platform == 'win32'") {
+		t.Fatal("conditional self extra lost its selection or environment marker")
+	}
+	marked, _ := capture("marker")
+	environment, problem := install.MaterializeEnvironment(marked.Tree, filepath.Join(t.TempDir(), "venv"))
+	fatal(t, problem)
+	if !strings.Contains(environment.Closure, "six==1.17.0") {
+		t.Fatalf("selected extra marker did not install its declared dependency: %s", environment.Closure)
 	}
 	_, one := capture("managed")
 	if one == identity {

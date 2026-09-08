@@ -2,6 +2,7 @@ package packagepublish
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -95,12 +96,12 @@ func preparePrivateCopy(ctx context.Context, parent *Package, replacements map[s
 		if problem != nil {
 			return fail(problem)
 		}
+		// A self-extra requirement lets uv evaluate the original optional
+		// markers in their proper extra context. The selected set becomes part
+		// of this immutable copied metadata, never the editable source.
 		requirements := append([]string(nil), source.Project.Dependencies...)
-		optional, problem := selectedExtraRequirements(source, extras)
-		if problem != nil {
-			return fail(problem)
-		}
-		requirements = append(requirements, optional...)
+		requirements = append(requirements, fmt.Sprintf("%s[%s]==%s",
+			normalizedProjectName(source.Project.Name), strings.Join(extras, ","), source.Project.Version))
 		nested(document, "project")["dependencies"] = requirements
 	}
 	uv := nested(nested(document, "tool"), "uv")
