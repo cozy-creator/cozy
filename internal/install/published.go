@@ -2,6 +2,7 @@ package install
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -48,10 +50,11 @@ func hasWeightlessCallable(packageInterface *launch.PackageInterface) bool {
 	return false
 }
 
-// preparePublished materializes the release's complete frozen uv environment, asks that
-// environment's Runtime to describe the surface the release itself pinned, and asks THIS
-// host's Runtime to admit the environment and author its resident placement. Creator
-// compares the derived package interface with the committed publication interface.
+// preparePublished materializes the release's complete frozen uv environment, asks THIS host's
+// Runtime for a static reading of the module that environment now holds, compares the reading
+// with the committed publication interface, and asks the same host Runtime to admit the
+// environment and author its resident placement. The environment's own Runtime is never asked
+// to describe: the release pins it, and an older one described a package by importing it.
 func preparePublished(l home.Layout, installDir string, published *PublishedSource) (
 	*launch.PackageInterface, ExactDocument, string, *EnvironmentReceipt, *exit.Error,
 ) {
@@ -93,7 +96,7 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 			"the published package environment provides no cozy-runtime").
 			WithRemedy("declare cozy-runtime in pyproject.toml and refresh uv.lock")
 	}
-	packageInterface, problem := describePublished(runtimeBin, sourceDir,
+	packageInterface, problem := describePublished(venvDir, sourceDir,
 		published.Selection.PackageInterface)
 	if problem != nil {
 		if published.ReportDefect != nil && problem.Name == "package_interface_mismatch" {
@@ -145,22 +148,17 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 	return packageInterface, answer.PlacementSet, runtimeBin, environment, nil
 }
 
-func describePublished(runtimeBin, sourceDir string, committed ExactDocument) (
+// describePublished is the install-time reading of the release's surface (cl-175): THIS host's
+// Runtime parses the module the venv holds — resolved through the venv's interpreter, never
+// imported — and Creator compares the reading with the committed release interface.
+func describePublished(venvDir, sourceDir string, committed ExactDocument) (
 	*launch.PackageInterface, *exit.Error,
 ) {
-	cmd := exec.Command(runtimeBin, "--json", "--dir", sourceDir, "describe")
-	cmd.Env = config.Frozen().Tool()
-	var stdout, stderr strings.Builder
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-	if cmd.ProcessState == nil {
-		return nil, exit.Internalf("cannot run %s: %s", runtimeBin, err)
+	raw, problem := hostruntime.Describe(context.Background(), config.Frozen().Tool(), sourceDir,
+		"--environment-python", home.VenvPython(venvDir))
+	if problem != nil {
+		return nil, problem
 	}
-	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return nil, launch.RuntimeExit(code, "describe", "runtime_query_failed",
-			stdout.String(), stderr.String())
-	}
-	raw := bytes.TrimSuffix([]byte(stdout.String()), []byte("\n"))
 	if !bytes.Equal(raw, committed.Bytes) {
 		return nil, exit.Named(exit.Conflict, "package_interface_mismatch",
 			"the installed package describes a different callable surface than its committed release")
@@ -257,7 +255,7 @@ type packagePreparation struct {
 func preparePackageSet(l home.Layout, installDir string, published *PublishedSource,
 ) (answer packagePreparation, problem *exit.Error) {
 	var empty packagePreparation
-	runtimeBin, problem := launch.HostRuntime(config.Frozen().Tool())
+	runtimeBin, problem := hostruntime.Path(config.Frozen().Tool())
 	if problem != nil {
 		return empty, problem
 	}
@@ -285,7 +283,7 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 		return empty, exit.Internalf("cannot run %s: %s", runtimeBin, err)
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return empty, launch.RuntimeExit(code, "prepare-package", "runtime_preparation_failed",
+		return empty, hostruntime.RuntimeExit(code, "prepare-package", "runtime_preparation_failed",
 			stdout.String(), stderr.String())
 	}
 	decoder := json.NewDecoder(strings.NewReader(stdout.String()))

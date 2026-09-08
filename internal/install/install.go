@@ -23,6 +23,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -422,9 +423,12 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	return res, nil
 }
 
-// deriveDevelopmentPlacement runs the install's own Runtime over its source. Runtime emits the
-// complete package interface without writing the source tree; Cozy validates the closed grammar
-// and stores the canonical bytes under the immutable install root.
+// deriveDevelopmentPlacement runs THIS host's Runtime over the source checkout (cl-175): a
+// static reading of the package — nothing imported — plus its development PlacementSet. Runtime
+// emits the complete package interface without writing the source tree; Cozy validates the
+// closed grammar and stores the canonical bytes under the immutable install root. The venv must
+// still provide the release's own Runtime: it is the worker that serves the package, and
+// serving is where package code runs.
 func deriveDevelopmentPlacement(venvDir, sourceDir, tensorfsRoot string, local LocalSource) (
 	*launch.PackageInterface, ExactDocument, *exit.Error,
 ) {
@@ -433,21 +437,26 @@ func deriveDevelopmentPlacement(venvDir, sourceDir, tensorfsRoot string, local L
 	if _, err := os.Stat(bin); err != nil {
 		return nil, empty, exit.Named(exit.Structural, "runtime_missing",
 			"this install's venv provides no cozy-runtime at %s", bin).
-			WithRemedy("a package depends on cozy-runtime; its surface is described by the runtime the release itself pinned, never this host's").
+			WithRemedy("a package depends on cozy-runtime; the runtime the release pins is the worker that serves it").
 			WithNext("cozy help package install")
 	}
-	cmd := exec.Command(bin, "--json", "--dir", sourceDir, "development-placement",
+	env := config.Frozen().Tool("COZY_HOME=" + runtimeScratchHome())
+	runtimeBin, problem := hostruntime.Path(env)
+	if problem != nil {
+		return nil, empty, problem
+	}
+	cmd := exec.Command(runtimeBin, "--json", "--dir", sourceDir, "development-placement",
 		"--package", local.Package, "--release", local.Release,
 		"--source-digest", local.SourceDigest, "--tensorfs-root", tensorfsRoot)
-	cmd.Env = config.Frozen().Tool("COZY_HOME=" + runtimeScratchHome())
+	cmd.Env = env
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
 	if cmd.ProcessState == nil {
-		return nil, empty, exit.Internalf("cannot run %s: %s", bin, err)
+		return nil, empty, exit.Internalf("cannot run %s: %s", runtimeBin, err)
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return nil, empty, launch.RuntimeExit(code, "development-placement",
+		return nil, empty, hostruntime.RuntimeExit(code, "development-placement",
 			"runtime_preparation_failed", stdout.String(), stderr.String()).
 			WithNext("cozy help package install")
 	}

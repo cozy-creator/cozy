@@ -140,17 +140,23 @@ const applicationTable = "[project.entry-points.\"cozy.application\"]\ndefault =
 // runs before uv.lock is consulted, so the lock is left as built.
 func weightlessVariant(t *testing.T, project string, rewrite func(pyproject string) string) string {
 	t.Helper()
+	return weightlessFileVariant(t, project, "pyproject.toml", rewrite)
+}
+
+// weightlessFileVariant is the fixture tree with one file rewritten.
+func weightlessFileVariant(t *testing.T, project, name string, rewrite func(content string) string) string {
+	t.Helper()
 	variant := filepath.Join(t.TempDir(), "variant")
 	if out, err := exec.Command("cp", "-r", project, variant).CombinedOutput(); err != nil {
 		t.Fatalf("copying the fixture: %v\n%s", err, out)
 	}
-	metadata, err := os.ReadFile(filepath.Join(project, "pyproject.toml"))
+	content, err := os.ReadFile(filepath.Join(project, name))
 	must(t, err)
-	rewritten := rewrite(string(metadata))
-	if rewritten == string(metadata) {
-		t.Fatalf("the variant rewrite changed nothing:\n%s", metadata)
+	rewritten := rewrite(string(content))
+	if rewritten == string(content) {
+		t.Fatalf("the variant rewrite changed nothing:\n%s", content)
 	}
-	must(t, os.WriteFile(filepath.Join(variant, "pyproject.toml"), []byte(rewritten), 0o644))
+	must(t, os.WriteFile(filepath.Join(variant, name), []byte(rewritten), 0o644))
 	return variant
 }
 
@@ -159,7 +165,7 @@ func weightlessVariant(t *testing.T, project string, rewrite func(pyproject stri
 // and packaged nothing.
 func brokenWeightlessProject(t *testing.T, project string) string {
 	t.Helper()
-	return weightlessVariant(t, project, func(pyproject string) string {
+	broken := weightlessVariant(t, project, func(pyproject string) string {
 		start := strings.Index(pyproject, applicationTable)
 		end := strings.Index(pyproject, "[tool.uv.sources]")
 		if start < 0 || end < start {
@@ -167,6 +173,11 @@ func brokenWeightlessProject(t *testing.T, project string) string {
 		}
 		return pyproject[:start] + pyproject[end:]
 	})
+	// The historical tree predates the committed interface (cl-175): with two stray
+	// top-level directories setuptools refuses outright instead of emitting the empty wheel
+	// this arm exists to catch.
+	must(t, os.RemoveAll(filepath.Join(broken, "metadata")))
+	return broken
 }
 
 func wheelRecord(t *testing.T, path string) string {

@@ -177,7 +177,7 @@ RUNTIME_SITES = {
     "internal/install/install.go",
     "internal/install/published.go",
     "internal/launch/artifacts.go",
-    "internal/launch/host_runtime.go",
+    "internal/hostruntime/hostruntime.go",
     "internal/packagepublish/package.go",
 }
 RUNTIME_BIN = re.compile(r'"cozy-runtime"')

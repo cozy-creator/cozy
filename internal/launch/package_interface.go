@@ -4,10 +4,10 @@
 //
 // Nothing here re-derives a fact its owner already produced:
 //
-//   - THE SURFACE is an install-private package interface derived once by the release's own
-//     Runtime at install. Reading it back costs microseconds; re-running `describe` per
-//     invocation would import the package's module graph to learn a fact already frozen.
-//     The recorded semantic digest is checked on every read.
+//   - THE SURFACE is an install-private package interface read once at install by THIS host's
+//     Runtime — a static reading of the source that imports nothing (cl-175) — and compared
+//     with the committed release. Reading it back costs microseconds; the recorded semantic
+//     digest is checked on every read.
 //   - THE PLACEMENT FACTS come from the exact PlacementSet retained at install. Runtime owns
 //     no local model-ref index, and cozy-creator never composes a TensorFS store path.
 //   - THE SELECTION is the request's own: the hub binding's rung for the machine, or a

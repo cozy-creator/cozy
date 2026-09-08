@@ -8,6 +8,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -20,15 +21,17 @@ type Facts struct {
 	RuntimeCLI       RuntimeCLI
 }
 
-// Read gathers an install's facts: where its source is, the surface it proved at
-// install, and the runtime that proved it.
+// Read gathers an install's facts: where its source is, the surface it proved at install,
+// and how this host's Runtime is asked about it — a published install by its exact retained
+// interface, an editable one by its source. The tool itself is resolved when a question is
+// asked (Job), so a host that never asks one needs none.
 func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *exit.Error) {
 	source := SourceDir(inst)
 	d, e := ReadPackageInterface(PackageInterfacePath(inst.Dir), inst.PackageInterface)
 	if e != nil {
 		return nil, e
 	}
-	runtimeBin, packageInterface := Binary(inst), ""
+	packageInterface := ""
 	if inst.SourceKind == "tensorhub" {
 		packageInterface = PackageInterfacePath(inst.Dir)
 	}
@@ -37,7 +40,7 @@ func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *
 		Source:           source,
 		PackageInterface: d,
 		RuntimeCLI: RuntimeCLI{
-			Bin: runtimeBin, Dir: source, PackageInterface: packageInterface, Home: cozyHome, Env: env,
+			Dir: source, PackageInterface: packageInterface, Home: cozyHome, Env: env,
 		},
 	}, nil
 }
@@ -104,7 +107,7 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 			TensorFSRoot:  config.Frozen().TensorFSRoot,
 		}, nil
 	}
-	runtimeBin, e := HostRuntime(f.RuntimeCLI.Env)
+	runtimeBin, e := hostruntime.Path(f.RuntimeCLI.Env)
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
