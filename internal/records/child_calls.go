@@ -88,6 +88,13 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 		if artifact == nil || artifact.Manifest.Digest != model.Manifest || artifact.Manifest.Length != model.ManifestLength {
 			return Request{}, false, exit.Named(exit.Conflict, "child.model_changed", "child model grant differs from its canonical artifact handle")
 		}
+		native, problem := nativeArtifactInput(tx, r.ID, model.Slot, arguments[model.Slot])
+		if problem != nil {
+			return Request{}, false, problem
+		}
+		if native {
+			continue
+		}
 		var ordinal int64
 		if err := tx.QueryRow(`SELECT attempt FROM request_model_transfer_outputs WHERE request_id=? AND output_slot=? AND manifest_id=? AND manifest_length=?
 			AND json_extract(CAST(receipt AS TEXT),'$.tensorfs_receipt_digest')=? ORDER BY attempt DESC LIMIT 1`, artifact.ProducerRequestID, artifact.OutputSlot, artifact.Manifest.Digest, artifact.Manifest.Length, artifact.TensorFSReceiptDigest).Scan(&ordinal); err != nil {
@@ -119,7 +126,8 @@ func (s *Store) CompleteReusedChild(id string) *exit.Error {
 	result, err := tx.Exec(`UPDATE requests SET state='succeeded' WHERE id=? AND reused_from<>'' AND ordinal=0
 		AND (state='finalizing' OR (state IN ('submitted','queued') AND EXISTS(SELECT 1 FROM request_operation_lookups l WHERE l.request_id=requests.id AND l.state='hit')))
 		AND NOT EXISTS(SELECT 1 FROM request_weights_retentions h WHERE h.request_id=requests.id AND h.kind='result' AND h.state!='held')
-		AND (child_artifacts=0 OR EXISTS(SELECT 1 FROM request_weights_retentions h WHERE h.request_id=requests.id AND h.kind='result' AND h.state='held'))
+		AND NOT EXISTS(SELECT 1 FROM native_artifact_retentions h WHERE h.consumer_id=requests.id AND h.kind='result' AND h.state!='held')
+        AND (child_artifacts=0 OR EXISTS(SELECT 1 FROM request_weights_retentions h WHERE h.request_id=requests.id AND h.kind='result' AND h.state='held') OR EXISTS(SELECT 1 FROM native_artifact_retentions h WHERE h.consumer_id=requests.id AND h.kind='result' AND h.state='held'))
 		AND (weights_outputs IN ('','[]') OR (SELECT COUNT(*) FROM request_weights_retentions h WHERE h.request_id=requests.id AND h.kind='result' AND h.slot LIKE 'weights/%' AND h.state='held')=json_array_length(weights_outputs))`, id)
 	if err != nil {
 		return exit.Internalf("cannot complete reused child result: %s", err)
