@@ -3,7 +3,7 @@ import json
 import os
 import time
 
-from cozy_runtime.author import App, Context, ModelArtifact, Telemetry, WeightsOutput, WeightsSink, WeightsTransaction, invocable
+from cozy_runtime.author import App, Context, ModelArtifact, Telemetry, WeightsOutput, WeightsSink, WeightsTarget, WeightsTransaction, invocable
 from cozy_runtime.derive import plan, quantize_artifact
 from cozy_runtime.derive.quantization import QuantizationSource
 
@@ -40,3 +40,19 @@ async def quantize(ctx: Context, *, source: QuantizationSource, encoding: str,
 
 app = App()
 app.job(quantize, weights=(WeightsOutput("model", max_new_bytes=1 << 20),))
+
+
+@invocable(memoize=True)
+async def graft(ctx: Context, *, source: QuantizationSource, weights: WeightsSink) -> ModelArtifact:
+    """Retain the raw fixture's tensors without permitting new payload bytes."""
+    structure = weights.structure(source)
+    assert not structure.configs
+    components = sorted({tensor.component for tensor in structure.tensors})
+    with weights.open("model", sources={"source": source},
+                      targets={name: WeightsTarget(source="source", source_component=name)
+                               for name in components},
+                      order=tuple((tensor.component, tensor.key) for tensor in structure.tensors)) as writer:
+        return writer.commit().artifact
+
+
+app.job(graft, weights=(WeightsOutput("model", max_new_bytes=0),))
