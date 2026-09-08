@@ -1,4 +1,4 @@
-package orchestrator
+package records
 
 import (
 	"bytes"
@@ -9,19 +9,18 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // The worker has verified the private spool and native receipt. Creator matches
 // the resulting immutable byte identity to the already accepted own-file intent.
-func nativeCommittedFileOutput(row records.NativeCall, status *pb.NativeSourceStatus) (records.ByteOutput, *exit.Error) {
-	fail := func() (records.ByteOutput, *exit.Error) {
-		return records.ByteOutput{}, exit.New(exit.Validation, "committed file differs from its bounded owned-file intent")
+func CommittedFileOutput(owner string, row NativeCall, status *pb.NativeSourceStatus) (ByteOutput, *exit.Error) {
+	fail := func() (ByteOutput, *exit.Error) {
+		return ByteOutput{}, exit.New(exit.Validation, "committed file differs from its bounded owned-file intent")
 	}
 	ref := status.ByteOutput
-	if problem := records.ValidateByteRef(ref); problem != nil {
-		return records.ByteOutput{}, problem
+	if problem := ValidateByteRef(ref); problem != nil {
+		return ByteOutput{}, problem
 	}
 	if row.Operation != "commit_file" || status.ByteOutputAttemptOrdinal == 0 || status.ByteOutputAttemptOrdinal > status.ParentAttemptOrdinal || len(status.ByteOutputInvocationSpecDigest) != 32 || ref.ContentBytes > 256<<20 {
 		return fail()
@@ -63,8 +62,8 @@ func nativeCommittedFileOutput(row records.NativeCall, status *pb.NativeSourceSt
 	}
 	manifestID, _ := canonical.Spell(ref.Manifest.Digest)
 	receiptID, _ := canonical.Spell(ref.ReceiptDigest)
-	b := records.ByteOutput{RequestID: row.ParentRequestID, Attempt: int64(status.ByteOutputAttemptOrdinal), OutputID: fmt.Sprintf("runtime.commit_file.%d", row.CallIndex), Digest: request.Digest, Length: request.Size, MimeType: request.MediaType, ProducerRootID: ref.ProducerRootId, ReceiptDigest: receiptID, ManifestID: manifestID, ManifestLength: int64(ref.Manifest.Length), ContentBytes: request.Size}
-	if b.ProducerRootID != records.NativeByteProducerRoot(recordOwnerID, b.RequestID, b.Attempt, status.ByteOutputInvocationSpecDigest, b.OutputID) {
+	b := ByteOutput{RequestID: row.ParentRequestID, Attempt: int64(status.ByteOutputAttemptOrdinal), OutputID: fmt.Sprintf("runtime.commit_file.%d", row.CallIndex), Digest: request.Digest, Length: request.Size, MimeType: request.MediaType, ProducerRootID: ref.ProducerRootId, ReceiptDigest: receiptID, ManifestID: manifestID, ManifestLength: int64(ref.Manifest.Length), ContentBytes: request.Size}
+	if b.ProducerRootID != NativeByteProducerRoot(owner, b.RequestID, b.Attempt, status.ByteOutputInvocationSpecDigest, b.OutputID) {
 		return fail()
 	}
 	return b, nil
