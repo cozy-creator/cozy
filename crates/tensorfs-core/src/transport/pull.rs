@@ -629,18 +629,34 @@ impl ObjectUrls for Leases<'_> {
             return Ok(url);
         }
         self.mint_from(at)?;
-        self.fresh(&object.sha256).ok_or_else(|| Refusal {
-            code: Code::HUB_REFUSED,
-            detail: format!(
-                "{}: the mint answered without leaving a usable URL for it — a URL whose \
-                 declared life is already spent when it is granted authorizes nothing",
-                object.id()
+        if let Some(url) = self.fresh(&object.sha256) {
+            return Ok(url);
+        }
+        // The mint answered and the URL was STILL not usable. With `minted` stamped on
+        // arrival this can only mean the hub granted a life it had already spent — it
+        // declared `expires_at_unix` at or before its own `server_time_unix` — so say
+        // that, and say the number, instead of leaving the reader to infer which of the
+        // two clocks was wrong.
+        refuse(
+            Code::HUB_REFUSED,
+            format!(
+                "{}: the mint answered but the URL was unusable on arrival; the hub \
+                 declared a life of {:?} for it, and a URL whose declared life is already \
+                 spent when it is granted authorizes nothing",
+                object.id(),
+                self.declared_lifetime(&object.sha256)
             ),
-        })
+        )
     }
 }
 
 impl Leases<'_> {
+    /// What the hub said this digest's URL was good for, for a refusal to quote.
+    fn declared_lifetime(&self, digest: &str) -> Option<Duration> {
+        let held = self.held.lock().unwrap();
+        held.get(digest).and_then(|lease| lease.lifetime)
+    }
+
     fn fresh(&self, digest: &str) -> Option<String> {
         let held = self.held.lock().unwrap();
         held.get(digest)
@@ -694,9 +710,6 @@ impl Leases<'_> {
         if digests.is_empty() {
             return Ok(());
         }
-        // Stamped BEFORE the call, so the call's own latency is spent out of the lease it
-        // is fetching rather than granted back to it.
-        let minted = Instant::now();
         let answer = hub::presign(
             self.client,
             self.base,
@@ -706,6 +719,24 @@ impl Leases<'_> {
             self.deadline,
             self.ledger,
         )?;
+        // Stamped when the ANSWER ARRIVES (tfs-102). It used to be stamped before the
+        // call, "so the call's own latency is spent out of the lease it is fetching
+        // rather than granted back to it" — but the URL does not exist for any of that
+        // time. The hub signs it while handling the call and states, in its own clock,
+        // the life it granted; the request leg, the hub's queueing, custody's signing and
+        // every retry `call` makes inside `presign` are all time the URL had not begun.
+        //
+        // Charging them to it made a slow mint POISON ITS OWN ANSWER. The hub's lifetime
+        // is ten minutes and a lease is spent at half of it, so a presign that took five
+        // minutes — one flaky tunnel, or two of `call`'s own retries — returned URLs that
+        // were unusable the instant they arrived, and the walk refused terminally on a
+        // paid pod with "a URL whose declared life is already spent when it is granted
+        // authorizes nothing". Twice on 2026-09-08, on gayong and weed, each after ~82 GB
+        // had already moved at 378 MB/s.
+        //
+        // What is left uncharged is the return leg alone, which is one hop and bounded by
+        // the call's own deadline.
+        let minted = Instant::now();
         let mut held = self.held.lock().unwrap();
         for (digest, url) in answer.urls {
             held.insert(
