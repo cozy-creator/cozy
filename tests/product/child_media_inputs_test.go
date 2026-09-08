@@ -17,7 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestChildMediaInheritsOnlyParentInputsAndKeepsIndependentCustody(t *testing.T) {
+func TestChildMediaBorrowsOnlyParentInputs(t *testing.T) {
 	layout, problem := home.Open(t.TempDir())
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
@@ -27,12 +27,13 @@ func TestChildMediaInheritsOnlyParentInputsAndKeepsIndependentCustody(t *testing
 	must(t, png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 16, 16))))
 	original := filepath.Join(t.TempDir(), "original.png")
 	must(t, os.WriteFile(original, encoded.Bytes(), 0600))
-	unlock := inputasset.Guard()
-	asset, problem := inputasset.Stage(layout, records.AssetBinding{FieldPath: "original", LocalPath: original}, 4096)
+	asset, problem := inputasset.Bind(records.AssetBinding{FieldPath: "original", LocalPath: original}, 4096)
 	fatal(t, problem)
+	if asset.LocalPath != original {
+		t.Fatal("binding copied the original", asset.LocalPath)
+	}
 	parent, _, problem := store.Submit(records.Request{ID: "req-media-parent", IdemKey: "media-parent", BodyDigest: childDigest("8"), Package: "local/parent", Entrypoint: "run", Kind: "job", Payload: []byte(`{}`), RetainWork: true, Assets: []records.AssetBinding{asset}})
 	fatal(t, problem)
-	unlock()
 	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
 	parent = offerChildParent(t, store, parent)
 	ep := launch.Entrypoint{Name: "score", Request: launch.Struct{Fields: []launch.Field{{Name: "media", Wire: "required", Type: json.RawMessage(`{"union":[{"tag":"image","fields":[{"name":"image","wire":"required","type":{"asset":"image"},"asset_bound":{"max_bytes":4096}}]},{"tag":"video","fields":[{"name":"video","wire":"required","type":{"asset":"video"}}]}],"tag_field":"type"}`)}}}}
@@ -69,13 +70,20 @@ func TestChildMediaInheritsOnlyParentInputsAndKeepsIndependentCustody(t *testing
 	forged.IdemKey = "forged"
 	forged.ParentCallIndex = 1
 	forged.Assets = append([]records.AssetBinding(nil), forwarded...)
-	forged.Assets[0].LocalPath = original
+	forged.Assets[0].LocalPath = filepath.Join(t.TempDir(), "ungranted.png")
 	if _, _, problem := store.SubmitChild(forged, 1, childDigest("1"), "private-boot"); problem == nil {
 		t.Fatal("forged input path accepted by atomic admission")
 	}
-	must(t, os.WriteFile(asset.LocalPath, []byte("changed"), 0600))
+	must(t, os.WriteFile(asset.LocalPath, bytes.Repeat([]byte("x"), encoded.Len()), 0600))
 	if _, problem := launch.InheritChildAssets(&ep, payload, parent.Assets); problem == nil {
-		t.Fatal("changed staged media accepted")
+		t.Fatal("changed original media accepted")
+	}
+	must(t, os.Remove(original))
+	if _, problem := inputasset.Bind(asset, 4096); problem == nil {
+		t.Fatal("missing source silently reused a staged copy")
+	}
+	if _, problem := launch.InheritChildAssets(&ep, payload, parent.Assets); problem == nil {
+		t.Fatal("missing original accepted by child")
 	}
 	must(t, os.WriteFile(asset.LocalPath, encoded.Bytes(), 0600))
 	db, err := sql.Open("sqlite", layout.DB)
@@ -83,19 +91,13 @@ func TestChildMediaInheritsOnlyParentInputsAndKeepsIndependentCustody(t *testing
 	defer db.Close()
 	_, err = db.Exec(`UPDATE requests SET state='succeeded' WHERE id=?`, parent.ID)
 	must(t, err)
-	unlock = inputasset.Guard()
-	fatal(t, inputasset.DropUnowned(layout, store, parent.Assets))
-	unlock()
 	if _, err := os.Stat(asset.LocalPath); err != nil {
 		t.Fatal("parent cleanup removed child's owned bytes", err)
 	}
 	_, err = db.Exec(`UPDATE requests SET state='succeeded' WHERE id=?`, child.ID)
 	must(t, err)
-	unlock = inputasset.Guard()
-	fatal(t, inputasset.DropUnowned(layout, store, child.Assets))
-	unlock()
-	if _, err := os.Stat(asset.LocalPath); !os.IsNotExist(err) {
-		t.Fatal("settled input bytes stayed pinned", err)
+	if data, err := os.ReadFile(original); err != nil || !bytes.Equal(data, encoded.Bytes()) {
+		t.Fatal("settled child changed borrowed original", err)
 	}
 
 }

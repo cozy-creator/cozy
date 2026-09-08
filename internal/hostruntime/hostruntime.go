@@ -23,7 +23,7 @@ import (
 // Floor is the first release with wire43 private byte-result custody and observations.
 // Metadata description remains static against the captured source environment; one
 // coherent release remedy serves both host-tool and worker-wire admission checks.
-const Floor = "0.8.0"
+const Floor = "0.8.3"
 
 var floor = pep440.MustParse(Floor)
 
@@ -50,6 +50,7 @@ var hostRuntimeVerdicts = struct {
 // an older daemon and an older tool cannot (cl-086's live run: a 0.0.29 tool (minor 16) under
 // a minor-22 daemon launched, never came READY, and the request sat `queued` with nothing
 // said). Floor also requires the static script and managed-operation metadata contract.
+// It also requires Runtime-owned temporary image preparation (0.8.3).
 // The tool's own `version` verb is the fact, asked here.
 func Path(env []string) (string, *exit.Error) {
 	path, err := exec.LookPath("cozy-runtime")
