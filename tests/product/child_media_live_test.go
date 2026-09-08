@@ -31,7 +31,7 @@ func TestPrivateChildEvalManagedExtraUsesDirectEditableLibrary(t *testing.T) {
 	privateChildMediaProof(t, *privateChildEvalSource)
 }
 
-// Real Creator, independent executors, generated interface wheel, staged input
+// Real Creator, independent executors, generated interface wheel, borrowed input
 // custody and completed memo lookup; no synthetic control peer.
 func TestPrivateChildMediaUsesExistingInputGrantsAndMemo(t *testing.T) {
 	privateChildMediaProof(t, "")

@@ -430,7 +430,7 @@ func Retired(l home.Layout) (Swept, *exit.Error) {
 // structure. Each remove refuses unless the directory is empty, which is the point.
 func EmptyRoots(l home.Layout) {
 	for _, dir := range []string{
-		l.Workers, filepath.Join(l.Tmp, "locks"), l.Tmp, l.Inputs,
+		l.Workers, filepath.Join(l.Tmp, "locks"), l.Tmp,
 		l.LocalPackages,
 	} {
 		_ = os.Remove(dir)

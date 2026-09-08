@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1990,7 +1991,7 @@ func modelAccess(req records.Request) []*pb.InputAccess {
 }
 
 // grant builds the LOCAL delivery grant: the payload INLINE, every bound model, every
-// input asset at its immutable store path, and one destination per result field path —
+// input asset at its borrowed original path, and one destination per result field path —
 // the store directory itself (`outputs/<org>-<package>/` or the caller's --out), which
 // the worker names the file in by its content digest, `<sha256>.<ext>`. Nothing is
 // staged on this side and nothing is copied afterwards: the granted directory is where
@@ -2052,7 +2053,7 @@ func localAssetAccess(req records.Request) ([]*pb.InputAccess, *exit.Error) {
 			return nil, e
 		}
 		inputs = append(inputs, &pb.InputAccess{
-			InputId: asset.FieldPath, Url: "file://" + asset.LocalPath,
+			InputId: asset.FieldPath, Url: (&url.URL{Scheme: "file", Path: asset.LocalPath}).String(),
 		})
 	}
 	return inputs, nil

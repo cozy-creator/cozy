@@ -40,6 +40,9 @@ type Revision struct {
 }
 
 func Stage(ctx context.Context, layout home.Layout, install records.PackageInstall) (Revision, *exit.Error) {
+	if install.Platform != "linux/amd64" || !strings.HasPrefix(install.Python, "3.12.") {
+		return Revision{}, exit.Named(exit.Validation, "private_dependency_platform_unsupported", "private worker revisions require a captured Linux amd64 Python 3.12 environment")
+	}
 	if install.SourceKind != "local" || install.SourceRef == "" || install.SourceDigest == "" ||
 		!strings.HasPrefix(install.Package, "local/") {
 		return Revision{}, exit.Named(exit.Validation, "local_package_install_invalid",
@@ -65,6 +68,9 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 			WithRemedy("retry the command to select and build the new revision")
 	}
 	if problem := pack.Build(ctx); problem != nil {
+		return Revision{}, problem
+	}
+	if problem := pack.CapturePrivateClosure(ctx, install.Closure); problem != nil {
 		return Revision{}, problem
 	}
 	after, _, _, problem := pack.SourceIdentity()

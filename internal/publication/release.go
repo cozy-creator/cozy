@@ -4,14 +4,11 @@ package publication
 import (
 	"context"
 	"maps"
-	"regexp"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
-
-var labelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+!-]{0,63}$`)
 
 // ReleaseRequest is caller intent. A nil revision reads and freezes the current one.
 type ReleaseRequest struct {
@@ -42,15 +39,13 @@ type Releases interface {
 	UpdateModelRelease(context.Context, hub.Ref, string, int64, map[string]string, []string, string) (hub.ModelRelease, *exit.Error)
 }
 
-func Label(value string) bool { return labelPattern.MatchString(value) }
-
 func ReleaseLanes(release hub.ModelRelease) (map[string]string, *exit.Error) {
-	if release.Revision < 1 || release.Yanked || !Label(release.Release) {
+	if release.Revision < 1 || release.Yanked || !hub.ValidModelLabel(release.Release) {
 		return nil, exit.Named(exit.Conflict, "publication.release_invalid", "release is not an active positive revision")
 	}
 	lanes := make(map[string]string, len(release.Lanes))
 	for _, lane := range release.Lanes {
-		if !Label(lane.Lane) || lanes[lane.Lane] != "" {
+		if !hub.ValidModelLabel(lane.Lane) || lanes[lane.Lane] != "" {
 			return nil, exit.Named(exit.Conflict, "publication.release_invalid", "release has a repeated or invalid lane")
 		}
 		if _, problem := tfs.ManifestID(lane.CheckpointID); problem != nil {
@@ -81,7 +76,7 @@ func readRelease(ctx context.Context, client Releases, ref hub.Ref, label string
 
 func PrepareRelease(ctx context.Context, client Releases, request ReleaseRequest) (ReleaseIntent, *exit.Error) {
 	ref, problem := hub.ParseRef(request.Destination)
-	if problem != nil || ref.Org == "local" || !Label(request.Release) || len(request.Lanes) == 0 || len(request.Lanes) > 32 {
+	if problem != nil || ref.Org == "local" || !hub.ValidModelLabel(request.Release) || len(request.Lanes) == 0 || len(request.Lanes) > 32 {
 		return ReleaseIntent{}, exit.New(exit.Validation, "release publication needs a public destination, label and 1..32 lanes")
 	}
 	if request.ExpectedRevision != nil && (*request.ExpectedRevision < 0 || *request.ExpectedRevision > (1<<53)-2) {
@@ -93,7 +88,7 @@ func PrepareRelease(ctx context.Context, client Releases, request ReleaseRequest
 		request.ExpectedRevision = &revision
 	}
 	for lane, checkpoint := range request.Lanes {
-		if !Label(lane) {
+		if !hub.ValidModelLabel(lane) {
 			return ReleaseIntent{}, exit.New(exit.Validation, "release lane name is invalid")
 		}
 		if _, problem := tfs.ManifestID(checkpoint); problem != nil {
@@ -116,7 +111,7 @@ func PrepareRelease(ctx context.Context, client Releases, request ReleaseRequest
 // mutation may have been sent; errors leave that uncertainty in the owner's journal.
 // Retries may repeat the original CAS, never apply against a newer revision.
 func ApplyRelease(ctx context.Context, client Releases, intent ReleaseIntent, sent bool, beforeSend func() *exit.Error) (ReleaseReceipt, *exit.Error) {
-	if !Label(intent.Request.Release) || intent.BaselineRevision < 0 || intent.BaselineRevision > (1<<53)-2 || len(intent.Request.Lanes) == 0 {
+	if !hub.ValidModelLabel(intent.Request.Release) || intent.BaselineRevision < 0 || intent.BaselineRevision > (1<<53)-2 || len(intent.Request.Lanes) == 0 {
 		return ReleaseReceipt{}, exit.New(exit.Validation, "release effect intent is malformed")
 	}
 	desired := maps.Clone(intent.Baseline)
