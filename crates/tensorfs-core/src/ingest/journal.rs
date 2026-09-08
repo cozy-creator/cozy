@@ -352,6 +352,12 @@ impl Journal {
         self.sink
             .sync_data()
             .map_err(|error| io("sync conversion journal", error))?;
+        #[cfg(test)]
+        RECORD_FAULT.with(|fault| {
+            if let Some(fault) = fault.borrow().as_ref() {
+                fault.hit("journal-record");
+            }
+        });
         for (role, part) in roles {
             self.parts.insert(
                 (component.to_string(), key.to_string(), role.clone()),
@@ -511,6 +517,11 @@ pub fn session_objects(dir: &Path) -> Result<Vec<ObjectRef>> {
     out.sort_by(|a, b| a.sha256.cmp(&b.sha256));
     out.dedup_by(|a, b| a.sha256 == b.sha256);
     Ok(out)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RECORD_FAULT: std::cell::RefCell<Option<crate::store::Fault>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]

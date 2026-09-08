@@ -2,6 +2,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    os::unix::fs::MetadataExt,
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -315,7 +316,21 @@ fn partial_adoption_survives_source_release_and_gc_and_disk_budget_counts_prefix
     let origin = Origin::new(false);
     kill_at(&dir, &origin, "prefix-checkpoint");
     assert_eq!(store.occupancy().unwrap(), BLOCK);
-    source_artifact::adopt_partial(&store, &owner("producer"), &owner("recipient")).unwrap();
+    let pending = source_artifact::read(&store, &owner("producer"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.objects, vec![ObjectRef::of(&bytes())]);
+    assert!(
+        pending.receipt().is_err(),
+        "liveness intent cannot produce a reusable receipt"
+    );
+    gc::collect(&dir, false).unwrap();
+    let adopted =
+        source_artifact::adopt_partial(&store, &owner("producer"), &owner("recipient")).unwrap();
+    assert!(
+        !adopted.complete && adopted.objects.is_empty(),
+        "missing reserved object became completed work"
+    );
     assert_eq!(store.occupancy().unwrap(), 2 * BLOCK);
     source_artifact::release(&store, &owner("producer")).unwrap();
     assert_eq!(store.occupancy().unwrap(), BLOCK);
@@ -360,4 +375,96 @@ fn expired_authority_and_transformed_responses_preserve_verified_identity_prefix
         assert_eq!(rows[0].transferred, 3 * BLOCK + 19 - expected);
         fs::remove_dir_all(dir).unwrap();
     }
+}
+
+fn fresh_owner_after_admission(stage: &str, remove_cas: bool) {
+    let dir = root();
+    let store = Store::init(&dir).unwrap();
+    let origin = Origin::new(false);
+    kill_at(&dir, &origin, stage);
+    let object = ObjectRef::of(&bytes());
+    let prefix = dir
+        .join("roots/source-downloads")
+        .join(&owner("producer")[7..])
+        .join(&object.sha256);
+    let before_state = fs::read(prefix.join("state.json")).unwrap();
+    let before_bytes = fs::metadata(prefix.join("bytes.part")).ok();
+    if stage == "linked" {
+        assert_eq!(
+            before_bytes.as_ref().unwrap().ino(),
+            fs::metadata(store.object_path(&object.sha256))
+                .unwrap()
+                .ino()
+        );
+        assert_eq!(before_bytes.as_ref().unwrap().mode() & 0o222, 0);
+    }
+    if remove_cas {
+        // The link existed before its directory fsync; simulate the surviving
+        // durable prefix without that CAS name, keeping the exact donor inode.
+        fs::remove_file(store.object_path(&object.sha256)).unwrap();
+    }
+    let prior = source_artifact::read(&store, &owner("producer"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !prior.complete && prior.objects == vec![object.clone()],
+        "incomplete source must durably reserve the exact member before admission"
+    );
+    gc::collect(&dir, false).unwrap(); // a dead source writer no longer excludes GC
+    let adopted = source_artifact::adopt_partial(&store, &owner("producer"), &owner("recipient"))
+        .unwrap_or_else(|error| panic!("fresh owner after {stage}: {error:?}"));
+    assert!(
+        adopted.objects.contains(&object),
+        "verified CAS member needs independent recipient custody"
+    );
+    assert_eq!(fs::read(prefix.join("state.json")).unwrap(), before_state);
+    if let Some(before) = before_bytes {
+        let after = fs::metadata(prefix.join("bytes.part")).unwrap();
+        assert_eq!(
+            (after.ino(), after.len(), after.mode()),
+            (before.ino(), before.len(), before.mode())
+        );
+        assert_eq!(fs::read(prefix.join("bytes.part")).unwrap(), bytes());
+    } else {
+        assert!(
+            !prefix.join("bytes.part").exists(),
+            "adoption recreated removed donor bytes"
+        );
+    }
+    assert!(
+        !dir.join("roots/source-downloads")
+            .join(&owner("recipient")[7..])
+            .exists(),
+        "complete objects must not become copied recipient prefixes"
+    );
+    source_artifact::release(&store, &owner("producer")).unwrap();
+    gc::collect(&dir, false).unwrap();
+    let requests = origin.asks.lock().unwrap().len();
+    let (_, rows) = run(&store, &origin.url, &owner("recipient"), Fault::default()).unwrap();
+    assert_eq!(rows[0].transferred, 0);
+    assert_eq!(origin.asks.lock().unwrap().len(), requests);
+    assert_eq!(
+        store.read_range(&object.sha256, 0, object.length).unwrap(),
+        bytes()
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn fresh_owner_after_link_before_record() {
+    fresh_owner_after_admission("linked", false);
+}
+#[test]
+fn fresh_owner_after_record_before_landed() {
+    fresh_owner_after_admission("record", false);
+}
+#[test]
+fn fresh_owner_after_admission_before_landed() {
+    fresh_owner_after_admission("prefix-admitted", false);
+}
+
+#[test]
+fn fresh_owner_admits_readonly_prefix_without_cas_link() {
+    fresh_owner_after_admission("chmod", false);
+    fresh_owner_after_admission("linked", true);
 }

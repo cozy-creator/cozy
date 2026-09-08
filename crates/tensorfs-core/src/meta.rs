@@ -37,13 +37,17 @@ pub fn now_secs() -> u64 {
 }
 
 pub fn now_nanos_unique() -> u128 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
+    use std::sync::Mutex;
+    static LAST: Mutex<u128> = Mutex::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    nanos + NEXT.fetch_add(1, Ordering::Relaxed) as u128
+    // Reserve the entire name together. Adding a separately sampled clock and
+    // counter can collide when threads observe those two values in reverse order.
+    let mut last = LAST.lock().unwrap();
+    *last = nanos.max(*last + 1);
+    *last
 }
 
 #[derive(Debug, Clone)]

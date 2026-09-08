@@ -785,6 +785,7 @@ pub struct PrepareModelSource {
     pub checkpoints: Vec<(String, ObjectRef)>,
     /// Explicit same-Store reuse. The supplied heads remain owned by this predecessor;
     /// preparation creates new operation-bound heads and independent retention roots.
+    /// An empty checkpoint set snapshots the stopped predecessor's local journal first.
     pub adopt_from_operation_id: Option<String>,
 }
 
@@ -1112,6 +1113,59 @@ pub fn prepare_model_source_with_registry(
     registry_locator: &str,
     registry_bytes: &[u8],
 ) -> Result<PreparedModelSources> {
+    // The guard bridges local snapshot publication and recipient root adoption. A
+    // predecessor can be released between them, but GC cannot remove the saved bytes.
+    let _guard = crate::catalog::WriterGuard::acquire(store.root())?;
+    let mut resumed;
+    let request = if let Some(prior) = request
+        .adopt_from_operation_id
+        .as_ref()
+        .filter(|_| request.checkpoints.is_empty())
+    {
+        if prior == &request.operation_id {
+            return refuse(
+                Code::CROSS_SUBJECT_REPLAY,
+                "source adoption requires another operation",
+            );
+        }
+        let operations = crate::catalog::Catalog::open(store.root())?.model_source_operations()?;
+        let own_work = operations.contains(&request.operation_id);
+        let mut original = request.clone();
+        original.adopt_from_operation_id = None;
+        let own_heads = if own_work {
+            snapshot_model_source(store, &original, registry_locator, registry_bytes)?
+        } else {
+            Vec::new()
+        };
+        resumed = request.clone();
+        let heads = if own_heads.len() < request.profiles.len() && operations.contains(prior) {
+            original.operation_id = prior.clone();
+            let heads = snapshot_model_source(store, &original, registry_locator, registry_bytes)?;
+            if heads.is_empty() {
+                resumed.adopt_from_operation_id = None;
+                own_heads
+            } else {
+                // The normal per-profile adoption path prefers each recipient's local
+                // head, then uses the predecessor only for profiles not acquired yet.
+                heads
+            }
+        } else if own_work {
+            resumed.adopt_from_operation_id = None;
+            own_heads
+        } else {
+            return refuse(
+                Code::ROOT_ABSENT,
+                "source adoption has no retained predecessor",
+            );
+        };
+        resumed.checkpoints = heads
+            .into_iter()
+            .filter_map(|checkpoint| checkpoint.head.head.map(|head| (checkpoint.slot, head)))
+            .collect();
+        &resumed
+    } else {
+        request
+    };
     prepare_model_source_with_budget(
         store,
         request,
@@ -1121,13 +1175,19 @@ pub fn prepare_model_source_with_registry(
     )
 }
 
-fn prepare_model_source_with_budget(
+struct PlannedPreparation {
+    ready: std::collections::BTreeSet<PathBuf>,
+    fences: Vec<FileFence>,
+    plans: Vec<(String, Prepared)>,
+    digest: String,
+}
+
+fn plan_preparation(
     store: &Store,
     request: &PrepareModelSource,
     registry_locator: &str,
     registry_bytes: &[u8],
-    budget: &mut transaction::Budget,
-) -> Result<PreparedModelSources> {
+) -> Result<PlannedPreparation> {
     let registry = FingerprintRegistry::parse(registry_bytes)?;
     let (ready, fences) = validate_request(request, &registry)?;
     let digest = request_digest(request, registry_bytes);
@@ -1200,6 +1260,27 @@ fn prepare_model_source_with_budget(
         digest_field(&mut request_hash, plan.as_bytes());
     }
     let digest = format!("sha256:{}", crate::sha256::hex(&request_hash.finish()));
+    Ok(PlannedPreparation {
+        ready,
+        fences,
+        plans,
+        digest,
+    })
+}
+
+fn prepare_model_source_with_budget(
+    store: &Store,
+    request: &PrepareModelSource,
+    registry_locator: &str,
+    registry_bytes: &[u8],
+    budget: &mut transaction::Budget,
+) -> Result<PreparedModelSources> {
+    let PlannedPreparation {
+        ready,
+        fences,
+        plans,
+        digest,
+    } = plan_preparation(store, request, registry_locator, registry_bytes)?;
     let catalog = crate::catalog::Catalog::open(store.root())?;
     let writer = match catalog.begin_source_preparation(&request.operation_id, &digest)? {
         crate::catalog::SourcePreparation::Prepared(rows) => {
@@ -1469,6 +1550,20 @@ fn adopt_source_checkpoint(
     let meta = crate::meta::Meta::open(store)?;
     let hold = meta.acquire_hold("source-adoption")?;
     let result = (|| {
+        // Hold the predecessor's actual operation through independent recipient
+        // admission. Its release either wins first (refusal) or observes this live
+        // claim; resident unowned checkpoint bytes alone are never adoption authority.
+        let catalog = crate::catalog::Catalog::open(store.root())?;
+        let _predecessor =
+            catalog.resume_retained_operation(prior, "_tensorfs", "model-source-preparation")?;
+        let retained = transaction::read_session(store.root(), prior)?;
+        if !retained.candidates.contains(head) {
+            return refuse(
+                Code::ROOT_ABSENT,
+                "source checkpoint is outside its predecessor retention root",
+            );
+        }
+
         let plan = format!("sha256:{plan_hex}");
         let held = durability::local_chain(store, head, &plan)?;
         let slot = chain
@@ -1601,6 +1696,75 @@ pub fn source_checkpoints(store: &Store, operation: &str) -> Result<Vec<SourceCh
     Ok(checkpoints.into_values().collect())
 }
 
+/// Export only already-fsynced conversion groups from a stopped exact source writer.
+/// No missing conversion operation runs. Existing local checkpoint export supplies the
+/// immutable head which a fresh request independently adopts through the normal engine.
+pub fn snapshot_model_source(
+    store: &Store,
+    request: &PrepareModelSource,
+    registry_locator: &str,
+    registry_bytes: &[u8],
+) -> Result<Vec<SourceCheckpoint>> {
+    if request.adopt_from_operation_id.is_some() || !request.checkpoints.is_empty() {
+        return refuse(
+            Code::TRANSACTION_CONFLICT,
+            "source snapshot names its own original declaration only",
+        );
+    }
+    let catalog = crate::catalog::Catalog::open(store.root())?;
+    if !catalog
+        .model_source_operations()?
+        .iter()
+        .any(|id| id == &request.operation_id)
+    {
+        return refuse(
+            Code::ROOT_ABSENT,
+            "source snapshot requires a retained operation",
+        );
+    }
+    transaction::read_session(store.root(), &request.operation_id)?;
+    let PlannedPreparation {
+        plans,
+        digest,
+        fences,
+        ..
+    } = plan_preparation(store, request, registry_locator, registry_bytes)?;
+    // This existing operation claim refuses a live predecessor. Its persisted request
+    // digest also refuses edited converter code, source identity, or selected plans.
+    let _writer = match catalog.begin_retained_source_preparation(&request.operation_id, &digest)? {
+        crate::catalog::SourcePreparation::Prepared(_) => {
+            return source_checkpoints(store, &request.operation_id)
+        }
+        crate::catalog::SourcePreparation::Open(writer) => writer,
+    };
+    transaction::read_session(store.root(), &request.operation_id)?;
+    let dir = transaction::candidate_dir(store.root(), &request.operation_id);
+    for (requested, (plan_hex, _)) in request.profiles.iter().zip(plans) {
+        if !dir.join(format!("convert-{plan_hex}.jsonl")).is_file() {
+            continue;
+        }
+        let journal = super::journal::Journal::open(&dir, &plan_hex)?;
+        if journal.is_empty() {
+            continue;
+        }
+        for fence in &fences {
+            fence.check()?;
+        }
+        durability::checkpoint(
+            store,
+            &durability::Policy {
+                chain: &format!("{}/{}", request.operation_id, requested.slot),
+                operation: &request.operation_id,
+                plan: &format!("sha256:{plan_hex}"),
+                interval: durability::INTERVAL_BYTES,
+            },
+            None,
+            &journal,
+        )?;
+    }
+    source_checkpoints(store, &request.operation_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1726,7 +1890,7 @@ mod tests {
         registry.merge(second_entry);
         registry.merge_source_profile(first_profile);
         registry.merge_source_profile(second_profile);
-        let store = Store::init(&root.join("store")).unwrap();
+        let store = Store::ensure(&root.join("store")).unwrap();
         let request = PrepareModelSource {
             operation_id: "model-source-fixture".into(),
             source_selection_digest: format!("sha256:{}", "11".repeat(32)),
@@ -1764,6 +1928,325 @@ mod tests {
             adopt_from_operation_id: None,
         };
         (store, registry.to_bytes(), request)
+    }
+
+    #[test]
+    #[ignore = "subprocess for source journal SIGKILL proof"]
+    fn source_tail_snapshot_worker() {
+        let root =
+            PathBuf::from(std::env::var_os("TFS_SOURCE_TAIL_FIXTURE").expect("fixture root"));
+        let (store, registry, mut request) = fixture_sized(&root, false, Some(1024));
+        if std::env::var_os("TFS_SOURCE_TAIL_RAW_TREE").is_some() {
+            let mut entries = Vec::new();
+            for row in &request.roster {
+                let reference = ObjectRef {
+                    sha256: row.object_id[7..].into(),
+                    length: row.length,
+                };
+                store
+                    .put_file(&row.path, Some(&reference), &crate::store::Fault::default())
+                    .unwrap();
+                entries.push((row.member.clone(), reference));
+            }
+            let tree = crate::manifest::Manifest::from_files(entries).unwrap();
+            let owner = crate::ids::object_id(b"source-tail-raw-fixture");
+            crate::source_artifact::create(&store, &owner, &tree).unwrap();
+            let (identity, roster, landed) =
+                crate::source_artifact::conversion_roster(&store, &owner).unwrap();
+            request.source_selection_digest = identity.id();
+            request.roster = roster;
+            request.landed = landed;
+            fs::write(root.join("native-registry.json"), &registry).unwrap();
+            fs::write(
+                root.join("tail-fixture.json"),
+                canon::write(&Value::obj(vec![
+                    ("source_owner", Value::str(owner)),
+                    ("operation", Value::str(request.operation_id.clone())),
+                ])),
+            )
+            .unwrap();
+        }
+        super::super::journal::RECORD_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some(crate::store::Fault {
+                stage: Some("journal-record".into()),
+                ready: Some(root.join("journal-ready")),
+            });
+        });
+        prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
+            .unwrap();
+        panic!("journal fault did not pause the worker");
+    }
+
+    fn interrupted_source_tail() -> (PathBuf, Store, Vec<u8>, PrepareModelSource) {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let root = temporary("source-tail-sigkill");
+        let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ingest::source::tests::source_tail_snapshot_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TFS_SOURCE_TAIL_FIXTURE", &root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !root.join("journal-ready").exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "source worker exited before journal commit"
+            );
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("source worker never reached its journal commit");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            source_checkpoints(&store, &request.operation_id)
+                .unwrap()
+                .is_empty(),
+            "first sub-4GiB journal group unexpectedly exported a head"
+        );
+        assert_eq!(
+            snapshot_model_source(&store, &request, "fixture:registry", &registry)
+                .unwrap_err()
+                .code,
+            Code::STORE_BUSY,
+            "snapshot stole a live writer"
+        );
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        (root, store, registry, request)
+    }
+
+    #[test]
+    fn stopped_source_tail_snapshots_without_reconverting_and_adopts_independently() {
+        let (root, store, registry, mut original) = interrupted_source_tail();
+        // A missing first carrier makes any accidental re-conversion observable.
+        fs::remove_file(&original.roster[0].path).unwrap();
+        original.landed.remove(0);
+        let heads =
+            snapshot_model_source(&store, &original, "fixture:registry", &registry).unwrap();
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].slot, "first");
+        assert!(heads[0].head.bytes < durability::INTERVAL_BYTES);
+        let head = heads[0].head.head.clone().unwrap();
+        let chain = durability::local_chain(&store, &head, &heads[0].plan_digest).unwrap();
+        let part = chain
+            .blobs
+            .iter()
+            .find(|part| part.length == 4096)
+            .unwrap()
+            .clone();
+        let before = transaction::read_session(store.root(), &original.operation_id).unwrap();
+        for _ in 0..4 {
+            assert_eq!(
+                snapshot_model_source(&store, &original, "fixture:registry", &registry).unwrap(),
+                heads
+            );
+        }
+        assert_eq!(
+            transaction::read_session(store.root(), &original.operation_id).unwrap(),
+            before,
+            "unchanged snapshots grew metadata roots"
+        );
+        let mut retry = original.clone();
+        retry.operation_id = "source-tail-recipient".into();
+        retry.adopt_from_operation_id = Some(original.operation_id.clone());
+        let mut empty_recipient = retry.clone();
+        empty_recipient.adopt_from_operation_id = None;
+        empty_recipient.landed.clear();
+        let empty = prepare_model_source_with_registry(
+            &store,
+            &empty_recipient,
+            "fixture:registry",
+            &registry,
+        )
+        .unwrap();
+        assert!(!empty.complete && empty.checkpoints.is_empty());
+        let completed =
+            prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
+                .unwrap();
+        assert!(completed.complete);
+        assert_eq!(completed.resumed_roles, 1);
+        assert_eq!(completed.converted_roles, 1);
+        assert_eq!(completed.converted_bytes, 4096);
+        let control_root = temporary("source-tail-control");
+        let (control_store, control_registry, control_request) =
+            fixture_sized(&control_root, false, Some(1024));
+        let control = prepare_model_source_with_registry(
+            &control_store,
+            &control_request,
+            "fixture:registry",
+            &control_registry,
+        )
+        .unwrap();
+        assert_eq!(completed.sources, control.sources);
+        release_model_source(&store, &original.operation_id).unwrap();
+        crate::gc::collect(store.root(), false).unwrap();
+        store.open_verified(&part.sha256).unwrap();
+        for source in &completed.sources {
+            validate_prepared_result(&store, source).unwrap();
+        }
+        let replay =
+            prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
+                .unwrap();
+        assert!(replay.replayed && replay.complete);
+        assert_eq!(replay.converted_bytes, 0);
+        assert_eq!(replay.sources, completed.sources);
+        release_model_source(&store, &retry.operation_id).unwrap();
+        crate::gc::collect(store.root(), false).unwrap();
+        assert!(!store.contains(&part.sha256));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
+    fn source_tail_adoption_keeps_own_profiles_and_acquires_missing_predecessor_profiles() {
+        let root = temporary("source-tail-mixed-profiles");
+        let (store, registry, original) = fixture_sized(&root, false, Some(1024));
+        let first =
+            prepare_model_source_with_registry(&store, &original, "fixture:registry", &registry)
+                .unwrap();
+        let mut retry = original.clone();
+        retry.operation_id = "partially-adopted-recipient".into();
+        retry.landed.pop();
+        let partial =
+            prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
+                .unwrap();
+        assert!(!partial.complete);
+        assert_eq!(partial.checkpoints.len(), 1);
+        fs::remove_file(&retry.roster[1].path).unwrap();
+        retry.adopt_from_operation_id = Some(original.operation_id.clone());
+        let adopted =
+            prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
+                .unwrap();
+        assert!(adopted.complete);
+        assert_eq!(adopted.converted_bytes, 0);
+        assert_eq!(adopted.resumed_roles, 2);
+        assert_eq!(adopted.sources, first.sources);
+        assert_eq!(adopted.checkpoints[0], partial.checkpoints[0]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_tail_adoption_refuses_released_predecessor_even_when_bytes_remain() {
+        let (root, store, registry, original) = interrupted_source_tail();
+        let heads =
+            snapshot_model_source(&store, &original, "fixture:registry", &registry).unwrap();
+        let _bridge = crate::catalog::WriterGuard::acquire(store.root()).unwrap();
+        release_model_source(&store, &original.operation_id).unwrap();
+        let mut retry = original.clone();
+        retry.operation_id = "released-predecessor-recipient".into();
+        retry.adopt_from_operation_id = Some(original.operation_id.clone());
+        retry.checkpoints = heads
+            .into_iter()
+            .map(|checkpoint| (checkpoint.slot, checkpoint.head.head.unwrap()))
+            .collect();
+        assert!(
+            store.contains(&retry.checkpoints[0].1.sha256),
+            "test needs still-resident snapshot bytes"
+        );
+        assert_eq!(
+            prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
+                .unwrap_err()
+                .code,
+            Code::ROOT_ABSENT
+        );
+        assert!(
+            !Catalog::open(store.root())
+                .unwrap()
+                .model_source_operations()
+                .unwrap()
+                .contains(&original.operation_id),
+            "adoption recreated a released predecessor claim"
+        );
+        assert_eq!(
+            snapshot_model_source(&store, &original, "fixture:registry", &registry)
+                .unwrap_err()
+                .code,
+            Code::ROOT_ABSENT
+        );
+        drop(_bridge);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_tail_snapshot_refuses_prepared_metadata_without_its_root() {
+        let root = temporary("source-tail-prepared-without-root");
+        let (store, registry, original) = fixture_sized(&root, false, Some(1024));
+        let prepared =
+            prepare_model_source_with_registry(&store, &original, "fixture:registry", &registry)
+                .unwrap();
+        assert!(prepared.complete);
+        fs::remove_file(
+            transaction::candidate_dir(store.root(), &original.operation_id).join("session.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot_model_source(&store, &original, "fixture:registry", &registry)
+                .unwrap_err()
+                .code,
+            Code::ROOT_ABSENT
+        );
+        assert!(
+            !transaction::candidate_dir(store.root(), &original.operation_id)
+                .join("session.json")
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_tail_snapshot_refuses_changed_work_and_missing_objects() {
+        let (root, store, registry, original) = interrupted_source_tail();
+        let dir = transaction::candidate_dir(store.root(), &original.operation_id);
+        let mut journal_files: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .collect();
+        journal_files.sort();
+        assert_eq!(journal_files.len(), 1);
+        let before = fs::read(&journal_files[0]).unwrap();
+        let mut changed = original.clone();
+        changed.source_selection_digest = format!("sha256:{}", "ff".repeat(32));
+        assert_eq!(
+            snapshot_model_source(&store, &changed, "fixture:registry", &registry)
+                .unwrap_err()
+                .code,
+            Code::TRANSACTION_CONFLICT
+        );
+        assert!(source_checkpoints(&store, &original.operation_id)
+            .unwrap()
+            .is_empty());
+        let mut changed_plan = original.clone();
+        changed_plan.profiles.pop();
+        assert_eq!(
+            snapshot_model_source(&store, &changed_plan, "fixture:registry", &registry)
+                .unwrap_err()
+                .code,
+            Code::TRANSACTION_CONFLICT,
+            "snapshot accepted a changed closed profile plan",
+        );
+        assert_eq!(fs::read(&journal_files[0]).unwrap(), before);
+        let objects = super::super::journal::session_objects(&dir).unwrap();
+        assert_eq!(objects.len(), 1);
+        fs::remove_file(store.blob_path(&objects[0].sha256)).unwrap();
+        assert!(
+            snapshot_model_source(&store, &original, "fixture:registry", &registry).is_err(),
+            "missing journal object exported as usable work"
+        );
+        assert!(source_checkpoints(&store, &original.operation_id)
+            .unwrap()
+            .is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1938,7 +2421,7 @@ mod tests {
                         | Code::OBJECT_ABSENT
                         | Code::IO_FAILED
                         | Code::JOURNAL_STALE
-                ),
+                ) || (arm == "operation" && error.code == Code::ROOT_ABSENT),
                 "{arm}: {error:?}"
             );
             assert!(Catalog::open(store.root())

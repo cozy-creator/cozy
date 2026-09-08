@@ -7,7 +7,7 @@ use super::{
 use crate::{
     canon::{Fields, Value},
     err::{refuse, Code, Refusal, Result},
-    fetch::{Admitted, DeliveryGrant},
+    fetch::{Admitted, DeliveryGrant, FetchPlan},
     ids::{prefixed, ObjectRef, Plain},
     sha256::{hex, Sha256},
     store::{Fault, Store, Verified},
@@ -93,6 +93,9 @@ struct Prefix {
 }
 impl Prefix {
     fn open(store: &Store, owner: &str, object: &ObjectRef) -> Result<Self> {
+        Self::open_mode(store, owner, object, true)
+    }
+    fn open_mode(store: &Store, owner: &str, object: &ObjectRef, writable: bool) -> Result<Self> {
         crate::ids::hex64("prefix object", &object.sha256)?;
         let dir = owner_dir(store, owner)?.join(&object.sha256);
         fs::create_dir_all(&dir).map_err(io)?;
@@ -132,8 +135,8 @@ impl Prefix {
         }
         let mut file = OpenOptions::new()
             .read(true)
-            .write(true)
-            .create(true)
+            .write(writable)
+            .create(writable)
             .truncate(false)
             .open(dir.join("bytes.part"))
             .map_err(io)?;
@@ -151,13 +154,21 @@ impl Prefix {
             left -= n as u64;
         }
         let corrupt = left != 0 || hex(&hash.clone().finish()) != state.prefix_sha256;
+        if corrupt && !writable {
+            return refuse(
+                Code::OBJECT_CORRUPT,
+                "source donor prefix failed integrity validation",
+            );
+        }
         if corrupt {
             // Untrusted local bytes are never an input to a resumed completed object.
             state.extent = 0;
             hash = Sha256::new();
             state.prefix_sha256 = hex(&hash.clone().finish());
         }
-        file.set_len(state.extent).map_err(io)?;
+        if writable {
+            file.set_len(state.extent).map_err(io)?;
+        }
         file.seek(SeekFrom::Start(state.extent)).map_err(io)?;
         let mut prefix = Self {
             dir,
@@ -166,7 +177,9 @@ impl Prefix {
             hash,
             _lock: lock,
         };
-        prefix.checkpoint(&Fault::default())?;
+        if writable {
+            prefix.checkpoint(&Fault::default())?;
+        }
         if corrupt {
             return refuse(Code::OBJECT_CORRUPT, "retained source prefix failed integrity validation and was discarded; retry starts this object at zero");
         }
@@ -407,7 +420,12 @@ pub(crate) fn bytes(store: &Store) -> Result<u64> {
     Ok(total)
 }
 /// Copy an independently owned verified prefix while both source and recipient are fenced.
-pub(crate) fn adopt_owner(store: &Store, source: &str, owner: &str) -> Result<()> {
+pub(crate) fn adopt_owner(
+    store: &Store,
+    source: &str,
+    owner: &str,
+    mut landed: impl FnMut(&ObjectRef) -> Result<()>,
+) -> Result<()> {
     let entries = match fs::read_dir(owner_dir(store, source)?) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -425,7 +443,40 @@ pub(crate) fn adopt_owner(store: &Store, source: &str, owner: &str) -> Result<()
             .read_to_end(&mut bytes)
             .map_err(io)?;
         let state = State::parse(&bytes)?;
-        let mut from = Prefix::open(store, source, &state.object)?;
+        if state.owner != source
+            || dir.file_name().and_then(|name| name.to_str()) != Some(&state.object.sha256)
+        {
+            return refuse(
+                Code::TRANSACTION_CONFLICT,
+                "source prefix has another immutable identity",
+            );
+        }
+        // Admission may have linked a read-only CAS inode or removed bytes.part
+        // before the source writer recorded this member. Reuse the native verified
+        // object and record recipient custody before considering any prefix copy.
+        let (plan, _) = FetchPlan::of_objects(
+            store,
+            "source-prefix-adoption",
+            std::slice::from_ref(&state.object),
+        )?;
+        if !plan.held.is_empty() {
+            landed(&state.object)?;
+            continue;
+        }
+        let mut from = Prefix::open_mode(store, source, &state.object, false)?;
+        from.file.seek(SeekFrom::Start(0)).map_err(io)?;
+        if from.state.extent == from.state.object.length {
+            // A stopped chmod/link admission may leave only a read-only prefix.
+            // Copy through normal digest-checked admission; never chmod, truncate,
+            // consume or unlink the donor inode before recipient custody is durable.
+            store.put_stream(
+                &mut (&mut from.file).take(from.state.extent),
+                Some(&from.state.object),
+                &Fault::default(),
+            )?;
+            landed(&from.state.object)?;
+            continue;
+        }
         let mut to = Prefix::open(store, owner, &state.object)?;
         if to.state.extent >= from.state.extent {
             continue;

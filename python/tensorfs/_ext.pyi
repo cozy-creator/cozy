@@ -437,6 +437,8 @@ class Store:
         allowed_hosts: Sequence[str], credential_hosts: Sequence[str] = ...,
         credential: str = ..., allow_local: bool = False,
     ) -> MaterializedSource: ...
+    # An empty checkpoints list with adopt_from_operation_id snapshots the stopped
+    # predecessor's verified local journal before normal independent adoption.
     def prepare_source_artifact(
         self, source_owner: str, operation_id: str, profiles: Sequence[tuple[str, str]], *,
         checkpoints: Sequence[tuple[str, str, int]] = ...,

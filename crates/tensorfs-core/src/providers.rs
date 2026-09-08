@@ -805,6 +805,7 @@ pub fn materialize_selected_with_options(
     let ledger = Ledger::new();
     let mut pulled = vec![];
     for member in &resolution.members {
+        writer.hold_expected(&member.object)?;
         let held = matches!(store.record_valid(&member.object.sha256), Ok(row) if row.length == member.object.length);
         let transferred = if held {
             0

@@ -187,6 +187,25 @@ fn payload(seed: usize, length: usize) -> Vec<u8> {
         .collect()
 }
 
+// Concurrent tests start real child processes. An inherited recovery descriptor
+// may outlive this thread's writer until exec; STORE_BUSY is then the correct GC
+// refusal. Await that transient liveness before asserting exact collection facts.
+fn collect_when_idle(root: &Path) -> tensorfs_core::gc::Report {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match tensorfs_core::gc::collect(root, false) {
+            Ok(report) => return report,
+            Err(error)
+                if error.code == tensorfs_core::err::Code::STORE_BUSY
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => panic!("idle staging collection failed: {error:?}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------- the proof
 
 /// THE WHOLE ISSUE, in one test and its red arm.
@@ -244,7 +263,7 @@ fn a_staged_carrier_is_not_a_store_object_and_the_same_bytes_admitted_are() {
     assert_eq!(vouched(&store_root, &carrier.sha256), 0);
 
     // ---- and a REAL collection reclaims nothing and leaves it standing.
-    let report = tensorfs_core::gc::collect(&store_root, false).unwrap();
+    let report = collect_when_idle(&store_root);
     assert_eq!((report.reclaimed_bytes, report.reclaimed_blobs), (0, 0));
     assert!(path.is_file(), "gc reclaimed a staged carrier");
 
@@ -261,7 +280,7 @@ fn a_staged_carrier_is_not_a_store_object_and_the_same_bytes_admitted_are() {
         planned(&store_root).contains(&carrier.sha256),
         "the CAS path did not reach the gc plan, so this suite proves nothing"
     );
-    let report = tensorfs_core::gc::collect(&store_root, false).unwrap();
+    let report = collect_when_idle(&store_root);
     assert_eq!(report.reclaimed_bytes, carrier.length);
     assert_eq!(report.reclaimed_blobs, 1);
     assert!(!store.blob_path(&carrier.sha256).exists());
@@ -534,7 +553,7 @@ fn gc_reaps_an_orphan_stage_temp_and_never_a_landed_carrier() {
     let orphan = store_root.join("tmp/stage-77777-54321");
     std::fs::write(&orphan, vec![7u8; 8192]).unwrap();
 
-    let report = tensorfs_core::gc::collect(&store_root, false).unwrap();
+    let report = collect_when_idle(&store_root);
     assert_eq!(report.reclaimed_bytes, 0);
     assert!(report.scratch_reaped >= 1, "gc left the orphan stage- temp");
     assert!(!orphan.exists());

@@ -4,6 +4,7 @@ use crate::{
     canon::{as_arr, Fields, Value},
     catalog::WriterGuard,
     err::{refuse, Code, Refusal, Result},
+    fetch::FetchPlan,
     ids::{prefixed, Doc, ObjectRef, Plain},
     manifest::Manifest,
     storage::HeldKey,
@@ -21,6 +22,7 @@ pub struct TreeRoot {
     pub owner: String,
     pub producer: String,
     pub manifest: ObjectRef,
+    /// GC liveness intent while incomplete; complete roots additionally verify every member.
     pub objects: Vec<ObjectRef>,
     pub complete: bool,
     pub released: bool,
@@ -233,6 +235,11 @@ impl<'a> Writer<'a> {
         {
             return refuse(Code::DURABILITY_UNPROVEN, "source member is not admitted");
         }
+        self.hold_expected(object)
+    }
+    /// Publish exact-member liveness before admission may unlink its durable prefix.
+    /// This is neither verification nor a reusable result: completion verifies the roster.
+    pub(crate) fn hold_expected(&mut self, object: &ObjectRef) -> Result<()> {
         if !self.root.objects.contains(object) {
             self.root.objects.push(object.clone());
             self.root.objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
@@ -399,10 +406,16 @@ pub fn adopt_partial(store: &Store, source: &str, owner: &str) -> Result<TreeRoo
             "recipient source is already complete",
         );
     }
-    for object in original.objects {
-        recipient.landed(&object)?;
+    if !original.objects.is_empty() {
+        // Incomplete roots reserve expected members before downloading them. Only
+        // present, natively verified objects can become completed recipient work.
+        let (plan, _) =
+            FetchPlan::of_objects(store, "source-progress-adoption", &original.objects)?;
+        for object in plan.held {
+            recipient.landed(&object)?;
+        }
     }
-    crate::transport::prefix::adopt_owner(store, source, owner)?;
+    crate::transport::prefix::adopt_owner(store, source, owner, |object| recipient.landed(object))?;
     Ok(recipient.root.clone())
 }
 

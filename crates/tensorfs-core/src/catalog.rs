@@ -384,6 +384,26 @@ impl Catalog {
     /// after an explicit catalog rebuild. The returned advisory-lock guard must live for the
     /// whole resumed writer/install process.
     pub fn resume_operation(&self, id: &str, org: &str, name: &str) -> Result<WriterGuard> {
+        self.resume_operation_inner(id, org, name, true)
+    }
+
+    /// Borrow an existing operation without recreating a released predecessor.
+    pub(crate) fn resume_retained_operation(
+        &self,
+        id: &str,
+        org: &str,
+        name: &str,
+    ) -> Result<WriterGuard> {
+        self.resume_operation_inner(id, org, name, false)
+    }
+
+    fn resume_operation_inner(
+        &self,
+        id: &str,
+        org: &str,
+        name: &str,
+        recreate: bool,
+    ) -> Result<WriterGuard> {
         use rusqlite::OptionalExtension;
 
         let root = self.path.parent().ok_or_else(|| Refusal {
@@ -404,6 +424,12 @@ impl Catalog {
             .optional()
             .map_err(|error| sql("read operation resume", error))?;
         match existing {
+            None if !recreate => {
+                return refuse(
+                    Code::ROOT_ABSENT,
+                    "predecessor operation is no longer retained",
+                )
+            }
             None => {
                 transaction
                     .execute(
@@ -451,9 +477,31 @@ impl Catalog {
         operation: &str,
         request_digest: &str,
     ) -> Result<SourcePreparation> {
+        self.begin_source_preparation_inner(operation, request_digest, true)
+    }
+
+    pub(crate) fn begin_retained_source_preparation(
+        &self,
+        operation: &str,
+        request_digest: &str,
+    ) -> Result<SourcePreparation> {
+        self.begin_source_preparation_inner(operation, request_digest, false)
+    }
+
+    fn begin_source_preparation_inner(
+        &self,
+        operation: &str,
+        request_digest: &str,
+        recreate: bool,
+    ) -> Result<SourcePreparation> {
         source_operation_id(operation)?;
         let request_digest = crate::ids::prefixed("source preparation request", request_digest)?;
-        let guard = self.resume_operation(operation, "_tensorfs", "model-source-preparation")?;
+        let guard = self.resume_operation_inner(
+            operation,
+            "_tensorfs",
+            "model-source-preparation",
+            recreate,
+        )?;
         let connection = self.connection()?;
         let existing = connection.query_row(
             "SELECT request_digest,state FROM tensorfs_source_preparations WHERE operation_id=?1",
@@ -469,6 +517,12 @@ impl Catalog {
                     );
                 }
                 state
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) if !recreate => {
+                return refuse(
+                    Code::ROOT_ABSENT,
+                    "source preparation is no longer retained",
+                )
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 connection
@@ -1287,6 +1341,28 @@ mod tests {
         );
         drop(rebuild);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inherited_recovery_descriptor_keeps_gc_fenced_until_child_exit() {
+        use std::process::{Command, Stdio};
+        let root = temporary("inherited-recovery");
+        crate::store::Store::init(&root).unwrap();
+        let writer = WriterGuard::acquire(&root).unwrap();
+        // An actual child retains the same open-file description. Concurrent
+        // spawn/exec can briefly inherit such descriptors even with CLOEXEC.
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(writer._recovery.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        drop(writer);
+        let refused = WriterGuard::lock_rebuild(&root);
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        assert_eq!(refused.unwrap_err().code, Code::STORE_BUSY);
+        WriterGuard::lock_rebuild(&root).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
