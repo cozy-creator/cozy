@@ -684,7 +684,7 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 			"phase", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
 			"remaining_ms", "execution_ms"},
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id",
-			"status", "canceled_by", "phase", "phase_machine", "phase_elapsed_ms",
+			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "phase_elapsed_ms",
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
 			"phase_remaining_ms", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "remaining_ms", "queued_ms", "execution_ms", "attempts",
@@ -734,6 +734,9 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		// was zero", and a rendered string cannot say that.
 		if life.Phase != "" {
 			typed["phase"] = life.Phase
+			if life.WaitingFor != nil {
+				typed["waiting_for"] = life.WaitingFor
+			}
 			if life.PhaseMachine != "" {
 				typed["phase_machine"] = life.PhaseMachine
 			}
@@ -823,6 +826,13 @@ func phaseValue(life api.Lifecycle) string { return PhaseCell(life) }
 func PhaseCell(life api.Lifecycle) string {
 	if life.Phase == "" {
 		return ""
+	}
+	if life.Phase == orchestrator.WaitSlotBusy || life.Phase == orchestrator.WaitQueueAhead {
+		fields := map[string]any{"wait": life.Phase, "waiting_on": life.PhaseMachine}
+		if life.WaitingFor != nil {
+			fields["waiting_for"] = map[string]any{"number": life.WaitingFor.Number}
+		}
+		return strings.TrimSpace(HumanWaitLine(fields))
 	}
 	head := strings.ReplaceAll(life.Phase, "_", " ")
 	if life.PhaseMachine != "" {
@@ -1206,7 +1216,7 @@ func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
 // finished stages above a refreshed active block, and a redirected human command gets sparse
 // append-only lines — a stage change, each new tenth of the work, one line per five
 // quiet seconds — never the full lossy tick stream. JSON results stay on stdout. Exported —
-// with HumanWaitLine and WaitPatience — so the product suite (#661: verification's one
+// with HumanWaitLine — so the product suite (#661: verification's one
 // home) drives this exact render path.
 type RunProgress struct {
 	ctx             *Context
@@ -1215,9 +1225,6 @@ type RunProgress struct {
 	last            string
 	closed          bool
 	began           time.Time
-	waitedSince     time.Time
-	waitEvent       localapi.Event
-	patience        *time.Timer
 	stepStage       string
 	stepSeconds     float64
 	stepSamples     int
@@ -1267,7 +1274,6 @@ func (p *RunProgress) On(e localapi.Event) bool {
 		p.stepStage, p.stepSeconds, p.stepSamples = "", 0, 0
 		p.overallSeen, p.overallFraction, p.overallDelta, p.overallSeconds = false, 0, 0, 0
 	}
-	p.observeWait(e)
 	// A redirected human command has no status line to rewrite: it gets the sparse
 	// append lane. --full deliberately restores the complete diagnostic stream.
 	if !p.ctx.Mode().Color && !p.ctx.Mode().Full {
@@ -1289,58 +1295,6 @@ func (p *RunProgress) render(line string) {
 	}
 	p.last = line
 	fmt.Fprintln(p.ctx.Err, line)
-}
-
-// observeWait keeps the wait clock. It starts on a queued/parked event — at the event's
-// own recorded time, so a reattached watcher inherits the wait already served — and
-// stops on any event that says the queue let go of the request. Callers hold p.mu.
-func (p *RunProgress) observeWait(e localapi.Event) {
-	switch strings.TrimPrefix(e.Type, "request.") {
-	case "queued", "parked":
-		p.waitEvent = e
-		if p.waitedSince.IsZero() {
-			p.waitedSince = eventTime(e)
-			if e.EventID == 0 || !p.waitedSince.Before(p.began) {
-				p.armPatience()
-			}
-		}
-	case "rentals", "placement", "log", "metric":
-		// Still the same wait; these narrate it without ending it.
-	default:
-		p.waitedSince = time.Time{}
-		p.disarmPatience()
-	}
-}
-
-// armPatience schedules the one time-driven render: a wait that outlives WaitPatience
-// re-renders with the diagnostic even when no new event arrives — the stuck case emits
-// exactly one parked event and then silence. Only the human status line needs it; the
-// diagnostic surfaces (--full and --json) carry the detail from the start.
-// Callers hold p.mu.
-func (p *RunProgress) armPatience() {
-	if !p.ctx.Mode().Color || p.ctx.Mode().Full {
-		return
-	}
-	remaining := max(WaitPatience-time.Since(p.waitedSince), 0)
-	p.patience = time.AfterFunc(remaining, func() {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		if p.closed || p.waitedSince.IsZero() {
-			return
-		}
-		if p.ctx.Mode().Color && !p.ctx.Mode().Full {
-			p.drawLive(p.now())
-		} else {
-			p.render(p.waitLine(p.waitEvent))
-		}
-	})
-}
-
-func (p *RunProgress) disarmPatience() {
-	if p.patience != nil {
-		p.patience.Stop()
-		p.patience = nil
-	}
 }
 
 // eventTime is the event's own recorded time, this process's clock when it carries none.
@@ -1537,7 +1491,6 @@ func (p *RunProgress) Done() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.closed = true
-	p.disarmPatience()
 	if p.terminal.timer != nil {
 		p.terminal.timer.Stop()
 	}
@@ -1617,12 +1570,6 @@ func humanProgress(value any) string {
 	}
 	return ""
 }
-
-// WaitPatience is how long a wait stays a calm one-liner (cl-103). Past it, the
-// dispatcher's own diagnostic joins the line: a long wait is the abnormal case, and the
-// detail is how a person sees exactly what the queue is stuck on. The full diagnostic is
-// always in --full and --json regardless.
-const WaitPatience = 90 * time.Second
 
 // HumanWaitLine says what the queue is DOING, never how it thinks: the event's stable
 // `wait` cause becomes a calm stage line with no digests and no dispatcher vocabulary.
@@ -1710,24 +1657,6 @@ func HumanPhaseLine(value any) string {
 		}
 	}
 	return line
-}
-
-// waitLine is HumanWaitLine plus patience: once the wait outlives WaitPatience the raw
-// diagnostic earns its place on the human line too. Callers hold p.mu.
-func (p *RunProgress) waitLine(e localapi.Event) string {
-	line := HumanWaitLine(e.Payload)
-	if cause, _ := e.Payload["wait"].(string); cause != "" {
-		return line
-	}
-	if p.waitedSince.IsZero() || time.Since(p.waitedSince) < WaitPatience {
-		return line
-	}
-	reason, _ := e.Payload["reason"].(string)
-	if reason == "" {
-		return line
-	}
-	return fmt.Sprintf("%s — %s so far: %s",
-		line, shortDuration(time.Since(p.waitedSince)), reason)
 }
 
 func humanStage(value any) string {

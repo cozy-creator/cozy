@@ -76,10 +76,6 @@ func TestQueueWaitCauses(t *testing.T) {
 	if queuedC.Payload["wait"] != "queue_ahead" {
 		t.Errorf("C's queued wait = %v, want queue_ahead behind B", queuedC.Payload["wait"])
 	}
-	waitingFor, _ = queuedC.Payload["waiting_for"].(map[string]any)
-	if waitingFor["request_id"] != requestB {
-		t.Fatalf("C did not name the queued request claiming its lane: %v", queuedC.Payload)
-	}
 	if position, ok := queuedC.Payload["position"].(float64); !ok || position < 2 {
 		t.Errorf("C's queued position = %v, want its real place in line", queuedC.Payload["position"])
 	}

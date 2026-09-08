@@ -21,7 +21,7 @@ import (
 const rawDiagnostic = "no claimed worker in paul/anima has a DISPATCHABLE placement for " +
 	"sha256:fc1db0000000000000000000000000000000000000000000000000000000000 with a free attempt slot"
 
-// renderBuffer takes the patience timer's own goroutine writes.
+// renderBuffer takes the live elapsed timer's goroutine writes.
 type renderBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
@@ -135,14 +135,14 @@ func TestWaitDetailsStayInDiagnosticOutput(t *testing.T) {
 	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
 	p.On(waitEnvelope("request.parked", time.Now(), payload))
 	if got := buf.String(); strings.Contains(got, "DISPATCHABLE") {
-		t.Errorf("the diagnostic surfaced before WaitPatience: %q", got)
+		t.Errorf("the diagnostic surfaced before the wait threshold: %q", got)
 	}
 	p.Done()
 
 	// A long wait is ordinary while another inference owns the GPU. Reattaching
 	// must not turn that into a wall of internal dispatcher diagnostics.
 	p, buf = progressSink(output.Mode{Human: true, Color: true}, false)
-	p.On(waitEnvelope("request.parked", time.Now().Add(-2*cli.WaitPatience), payload))
+	p.On(waitEnvelope("request.parked", time.Now().Add(-10*time.Minute), payload))
 	got := buf.String()
 	if !strings.Contains(got, "waiting for a free slot on shidehiko") || strings.Contains(got, rawDiagnostic) {
 		t.Errorf("a long wait exposed the dispatcher diagnostic: %q", got)
