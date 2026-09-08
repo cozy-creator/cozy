@@ -220,9 +220,10 @@ func contains(rows []hub.ModelThroughput, row hub.ModelThroughput) bool {
 // Place is the tier's choice among the open candidates and returns its index, or -1
 // when none is open: `fast` the least time, `cheap` the least cost, `balanced` the least
 // (time / best time) × (cost / best cost) — a candidate worse on both axes cannot win
-// any tier. Ties break by rung, attached over purchase, rate, name. Unmeasured
-// candidates count only when nothing is measured, attached first and then by rung and
-// rate — the ladder's own order. Every measured candidate's score is written.
+// any tier. Ties break by rung, attached over purchase, attempts ahead, rate, name.
+// Unmeasured candidates count only when nothing is measured, attached first and then by
+// rung, the fewest attempts ahead and rate — the ladder's own order, an idle machine
+// before a busy one (cl-174). Every measured candidate's score is written.
 func Place(tier string, candidates []orchestrator.PlacementCandidate) int {
 	bestTime, bestCost := math.Inf(1), math.Inf(1)
 	for _, c := range candidates {
@@ -260,6 +261,9 @@ func prefers(tier string, a, b orchestrator.PlacementCandidate) bool {
 	}
 	if a.Attached() != b.Attached() {
 		return a.Attached()
+	}
+	if a.Ahead != b.Ahead {
+		return a.Ahead < b.Ahead
 	}
 	if a.RateUSDMicrosPerHour != b.RateUSDMicrosPerHour {
 		return a.RateUSDMicrosPerHour < b.RateUSDMicrosPerHour
