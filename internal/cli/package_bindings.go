@@ -12,12 +12,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/output"
 )
 
-// A package's default bindings are MUTABLE HUB ROWS — one per (package, slot path) — and
-// `cozy package bind` sets them; Tensorhub removes defaults whose slots disappear.
-// package.toml carries no bindings and publish seeds none. A row names a model release and its ladder, the fit
-// map from GPU class to lane. Bind verifies both against the hub before writing — the
-// slot against the package's latest published interface, the release and every lane
-// against the model card — so a binding can never name what the card does not offer.
+// Owner overrides are mutable Hub rows, one per (package, slot path). Authored
+// defaults stay in the published function interface; publishing seeds no rows.
+// Bind verifies the slot against the latest package interface and every lane
+// against the model release. Unbind removes the override so authored defaults apply.
 
 func handlePackageBindings(ctx *Context) *exit.Error {
 	ref, problem := hub.ParseRef(strings.TrimSpace(ctx.Inv.Args[0]))
@@ -43,7 +41,8 @@ func handlePackageBindings(ctx *Context) *exit.Error {
 		})
 	}
 	if len(l.Rows) == 0 {
-		l.Next = []string{bindRemedy(ref.String(), "<slot-path>")}
+		l.Notes = []string{"No owner overrides."}
+		l.Next = []string{"cozy run " + ref.String() + " --describe"}
 	}
 	return emit(ctx, l)
 }
@@ -84,15 +83,9 @@ func handlePackageBind(ctx *Context) *exit.Error {
 	// CAS: read the row's current revision (0 for an unbound slot), then move. An exact
 	// replay is a hub-side revision-keeping no-op, so this pair never invents a conflict
 	// for the same intent sent twice.
-	current, problem := c.PackageBindings(hctx, ref)
+	expected, problem := packageBindingRevision(hctx, c, ref, slot)
 	if problem != nil {
 		return problem
-	}
-	expected := int64(0)
-	for _, row := range current {
-		if row.Slot == slot {
-			expected = row.Revision
-		}
 	}
 	written, problem := c.BindPackageSlot(hctx, ref, slot, model, release, ladder, expected,
 		"cozy package bind "+ref.String()+" "+slot)
@@ -111,6 +104,51 @@ func handlePackageBind(ctx *Context) *exit.Error {
 		{K: "revision", V: written.Binding.Revision}, {K: "status", V: "bound"},
 		{K: "changed", V: written.Changed},
 	}, "package", "slot", "model", "release", "ladder", "revision", "status", "changed"))
+}
+
+func handlePackageUnbind(ctx *Context) *exit.Error {
+	ref, problem := hub.ParseRef(strings.TrimSpace(ctx.Inv.Args[0]))
+	if problem != nil {
+		return problem
+	}
+	slot := strings.TrimSpace(ctx.Inv.Args[1])
+	if slot == "" || strings.ContainsAny(slot, " \t") {
+		return exit.Usagef("%q is not a slot path such as generate.models.model", slot)
+	}
+	c, problem := ownedPublication(ctx, ref)
+	if problem != nil {
+		return problem
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	expected, problem := packageBindingRevision(hctx, c, ref, slot)
+	if problem != nil {
+		return problem
+	}
+	result, problem := c.UnbindPackageSlot(hctx, ref, slot, expected, "cozy package unbind "+ref.String()+" "+slot)
+	if problem != nil {
+		return problem
+	}
+	if result.Slot != slot {
+		return exit.Internalf("Tensorhub reset a different binding slot")
+	}
+	return emit(ctx, compactRecord([]output.Field{
+		{K: "package", V: ref.String()}, {K: "slot", V: slot},
+		{K: "status", V: "unbound"}, {K: "changed", V: result.Changed},
+	}, "package", "slot", "status", "changed"))
+}
+
+func packageBindingRevision(ctx context.Context, c *hub.Client, ref hub.Ref, slot string) (int64, *exit.Error) {
+	rows, problem := c.PackageBindings(ctx, ref)
+	if problem != nil {
+		return 0, problem
+	}
+	for _, row := range rows {
+		if row.Slot == slot {
+			return row.Revision, nil
+		}
+	}
+	return 0, nil
 }
 
 // verifyPackageSlot refuses a slot path the package's latest published interface does
@@ -186,49 +224,11 @@ func parseLadder(raw []string) ([]hub.BindingRung, *exit.Error) {
 	return ladder, nil
 }
 
-// parseModelRef reads the ONE model-ref grammar (cl-109):
-//
-//	org/model[@release[/lane]][#sha256:<hex>]
-//
-// It serves the `model.<param>=` run key and `package bind` alike; a lane narrows to
-// one encoding and a manifest to one exact release artifact.
-func parseModelRef(raw string) (model, release, lane, manifest string, problem *exit.Error) {
-	spec := strings.TrimSpace(raw)
-	if strings.Count(spec, "#") > 1 {
-		return "", "", "", "", exit.Usagef("%q carries more than one manifest", raw)
-	}
-	rest, digest, hasManifest := strings.Cut(spec, "#")
-	if hasManifest {
-		if digest == "" {
-			return "", "", "", "", exit.Usagef("%q carries an empty manifest", raw)
-		}
-		if _, err := canonical.Raw(digest); err != nil {
-			return "", "", "", "", exit.Usagef("%q is not a sha256 model manifest", digest)
-		}
-		manifest = digest
-	}
-	if strings.Count(rest, "@") > 1 {
-		return "", "", "", "", exit.Usagef("%q carries more than one release", rest)
-	}
-	model, versioned, pinned := strings.Cut(rest, "@")
-	if _, e := hub.ParseRef(model); e != nil {
-		return "", "", "", "", e
-	}
-	if pinned {
-		var sliced bool
-		release, lane, sliced = strings.Cut(versioned, "/")
-		if release == "" || sliced && lane == "" || strings.ContainsAny(lane, " \t") {
-			return "", "", "", "", exit.Usagef("%q is not org/model[@release[/lane]][#sha256:<hex>]", raw)
-		}
-	}
-	return model, release, lane, manifest, nil
-}
-
 // parseBindingTarget reads the verb's slice of the one ref grammar: a binding row pins
 // org/model@release, its lanes ride the ladder, and an exact manifest is per-run
 // narrowing on the `model.<param>=` run key.
 func parseBindingTarget(raw string) (model, release string, problem *exit.Error) {
-	model, release, lane, manifest, problem := parseModelRef(raw)
+	model, release, lane, manifest, problem := hub.ParseModelRef(raw)
 	if problem != nil {
 		return "", "", problem
 	}

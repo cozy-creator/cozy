@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -249,11 +250,9 @@ func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string) 
 
 // ---------------------------------------------------------------- bindings (th-116)
 
-// PackageBindingRow is one mutable hub default: which model release a package slot loads
-// when no `model.<param>=` run key speaks, and — as a FIT MAP, not a ranking of machines
-// (cl-166) — which of that release's lanes belongs on which GPU class. The hub row is
-// the ONE source: `cozy package bind` sets defaults, Tensorhub removes obsolete slots,
-// and nothing reads a package.toml binding at install or run time.
+// PackageBindingRow is one mutable owner override: a model release and its GPU-to-lane
+// fit map. Explicit run selection takes precedence; absent rows use immutable defaults
+// from the selected package interface. Only owner writes change these rows.
 type PackageBindingRow struct {
 	Slot      string        `json:"slot"`
 	Model     string        `json:"model"`
@@ -293,8 +292,9 @@ func ValidateLadder(ladder []BindingRung) *exit.Error {
 		return exit.Usagef("a binding needs at least one --gpu <GPU>=<lane> rung")
 	}
 	for i, rung := range ladder {
-		if strings.TrimSpace(rung.GPU) == "" || strings.TrimSpace(rung.Lane) == "" ||
-			strings.ContainsAny(rung.GPU+rung.Lane, " \t") {
+		if len(rung.GPU) == 0 || len(rung.GPU) > 64 || strings.TrimSpace(rung.GPU) != rung.GPU ||
+			(rung.GPU != "*" && strings.IndexFunc(rung.GPU, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) }) < 0) ||
+			strings.TrimSpace(rung.Lane) == "" || strings.ContainsAny(rung.Lane, " \t") {
 			return exit.Usagef("rung %d is not <GPU>=<lane>: %q", i+1, rung.String())
 		}
 		if rung.GPU == "*" && i != len(ladder)-1 {
@@ -304,7 +304,7 @@ func ValidateLadder(ladder []BindingRung) *exit.Error {
 	return nil
 }
 
-// PackageBindings is the anonymous read of a package's current default bindings.
+// PackageBindings is the anonymous read of a package's current owner overrides.
 func (c *Client) PackageBindings(ctx context.Context, ref Ref) ([]PackageBindingRow, *exit.Error) {
 	var out struct {
 		Bindings []PackageBindingRow `json:"bindings"`
@@ -331,7 +331,7 @@ type PackageBindingWrite struct {
 	Changed bool              `json:"changed"`
 }
 
-// BindPackageSlot moves one package slot's default to a model release and its ladder
+// BindPackageSlot sets one package slot's owner override to a model release and ladder
 // under CAS on expectedRevision (0 creates an unbound row).
 func (c *Client) BindPackageSlot(ctx context.Context, ref Ref, slot, model, release string,
 	ladder []BindingRung, expectedRevision int64, reason string,
@@ -343,4 +343,19 @@ func (c *Client) BindPackageSlot(ctx context.Context, ref Ref, slot, model, rele
 		body: map[string]any{"model": model, "release": release, "ladder": ladder,
 			"expected_revision": expectedRevision}}, &out)
 	return out, e
+}
+
+// PackageBindingReset removes an owner override so authored defaults can apply.
+type PackageBindingReset struct {
+	Slot    string `json:"slot"`
+	Changed bool   `json:"changed"`
+}
+
+func (c *Client) UnbindPackageSlot(ctx context.Context, ref Ref, slot string, expectedRevision int64, reason string) (PackageBindingReset, *exit.Error) {
+	var out PackageBindingReset
+	problem := c.do(ctx, call{method: http.MethodDelete,
+		path: resourcePath("packages", ref) + "/bindings/" + url.PathEscape(slot),
+		auth: true, reason: reason, strict: true,
+		body: map[string]any{"expected_revision": expectedRevision}}, &out)
+	return out, problem
 }

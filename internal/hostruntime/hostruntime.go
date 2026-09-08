@@ -23,7 +23,7 @@ import (
 // Floor is the minimum released host-helper contract this CLI requires.
 // Metadata description remains static against the captured source environment; one
 // coherent release remedy serves both host-tool and worker-wire admission checks.
-const Floor = "0.9.0"
+const Floor = "0.10.0"
 
 var floor = pep440.MustParse(Floor)
 
@@ -51,6 +51,7 @@ var hostRuntimeVerdicts = struct {
 // a minor-22 daemon launched, never came READY, and the request sat `queued` with nothing
 // said). Floor also requires the static script and managed-operation metadata contract.
 // It also requires Runtime-owned temporary image preparation (0.9.0).
+// Source-authored model default metadata requires 0.10.0.
 // The tool's own `version` verb is the fact, asked here.
 func Path(env []string) (string, *exit.Error) {
 	path, err := exec.LookPath("cozy-runtime")

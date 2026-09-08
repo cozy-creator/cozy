@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -27,11 +28,14 @@ import (
 // ladderHub is the stand-in: one package with one modeled entrypoint, one model with one
 // unyanked release of two lanes, the 2026-09-07 GPU market, and a mutable binding row.
 type ladderHub struct {
-	mu       sync.Mutex
-	server   *httptest.Server
-	bindings []hub.PackageBindingRow
-	puts     [][]byte
-	posts    [][]byte
+	mu                  sync.Mutex
+	server              *httptest.Server
+	bindings            []hub.PackageBindingRow
+	puts                [][]byte
+	deletes             [][]byte
+	resetConflict       bool
+	bindingsUnavailable bool
+	posts               [][]byte
 	// soldOut names the SKUs whose paid ask the hub refuses for inventory; rentals holds
 	// what a GET on a rental answers; throughput is the model's published table, and a
 	// hub holding none answers the route as an older build would — not at all.
@@ -60,19 +64,36 @@ const (
 	ladderLane    = "fp8-adaln-pruned"
 )
 
-func newLadderHub(t *testing.T) *ladderHub {
+func newLadderHub(t *testing.T, authored ...[]launch.ModelDefaultRung) *ladderHub {
 	t.Helper()
 	// `generate` is the serving entrypoint whose methods stage components. `lane` is the
 	// se-037 shape: a JOB whose model input is a derive-only source it reads the header of
 	// and inherits by reference — its class declares no component_use, and it writes one
 	// 64 KiB config per output.
 	iface := []byte(`{"application":"h3:app","entrypoints":[{"name":"generate","models":[{"class":"H3","component_use":{"condition_fl2va_media":["video_vae"],"condition_ref2va_media":["audio_vae","video_vae"],"condition_text":["text_encoder"],"decode_audio":["audio_vae"],"decode_video":["video_vae"],"sample_fl2va":["fl2va_dit"],"sample_ref2va":["ref2va_dit"]},"path":"generate.models.model"}],"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[{"name":"lane","models":[{"class":"Source","component_use":{},"path":"lane.models.pruned"}],"publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":65536,"mime_type":"application/vnd.cozy.model-manifest","output_id":"attn8"}]}]}`)
-	contract, problem := launch.DecodePackageInterface(iface)
-	fatal(t, problem)
+	if len(authored) > 0 {
+		var doc map[string]any
+		must(t, json.Unmarshal(iface, &doc))
+		for index, group := range []string{"entrypoints", "jobs"} {
+			if index >= len(authored) {
+				break
+			}
+			call := doc[group].([]any)[0].(map[string]any)
+			slot := call["models"].([]any)[0].(map[string]any)
+			slot["default_ladder"] = authored[index]
+		}
+		var err error
+		iface, err = json.Marshal(doc)
+		must(t, err)
+	}
+	normalized, err := canonical.NormalizeJCS(iface)
+	must(t, err)
+	digest, err := canonical.Spell(canonical.Digest(normalized))
+	must(t, err)
 	var detail hub.PackageReleaseDetail
 	detail.PackageInterface = iface
 	detail.Release.Release = "1.0.0"
-	detail.Release.PackageInterfaceDigest = contract.Digest
+	detail.Release.PackageInterfaceDigest = digest
 	detail.Release.PackageInterfaceLength = int64(len(iface))
 	detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25", "torch<3,>=2.13"}
 	h := &ladderHub{soldOut: map[string]bool{}, rentals: map[string]map[string]any{},
@@ -88,7 +109,46 @@ func newLadderHub(t *testing.T) *ladderHub {
 	mux.HandleFunc("GET /v1/packages/proof/h3/bindings", func(w http.ResponseWriter, _ *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
+		if h.bindingsUnavailable {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"code":"bindings_unavailable","message":"temporarily unavailable"}}`))
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"bindings": append([]hub.PackageBindingRow{}, h.bindings...)})
+	})
+	mux.HandleFunc("DELETE /v1/packages/proof/h3/bindings/{slot}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer ladder-test" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		must(t, err)
+		var request struct {
+			ExpectedRevision *int64 `json:"expected_revision"`
+		}
+		must(t, json.Unmarshal(body, &request))
+		if request.ExpectedRevision == nil {
+			t.Error("reset omitted revision")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.deletes = append(h.deletes, body)
+		for index, row := range h.bindings {
+			if row.Slot != r.PathValue("slot") {
+				continue
+			}
+			if h.resetConflict || row.Revision != *request.ExpectedRevision {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"error":{"code":"binding.revision_conflict","message":"owner changed binding"}}`))
+				return
+			}
+			h.bindings = append(h.bindings[:index], h.bindings[index+1:]...)
+			_ = json.NewEncoder(w).Encode(hub.PackageBindingReset{Slot: row.Slot, Changed: true})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(hub.PackageBindingReset{Slot: r.PathValue("slot"), Changed: false})
 	})
 	mux.HandleFunc("PUT /v1/packages/proof/h3/bindings/{slot}", func(w http.ResponseWriter, r *http.Request) {
 		raw, err := io.ReadAll(r.Body)
