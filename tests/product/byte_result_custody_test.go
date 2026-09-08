@@ -18,7 +18,7 @@ func TestChildByteResultHasIndependentRecipientAndCannotBeBorrowedByHash(t *test
 	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
 	parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "byte-parent", ""))
 	child := records.Request{ID: "req-byte-producer", IdemKey: "byte-producer", BodyDigest: childDigest("3"), Package: "local/operation", Entrypoint: "report", Kind: "job", Payload: []byte(`{}`), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("4"), ChildTargetDigest: childDigest("5")}
-	child, _, problem = store.SubmitChild(child, 1, childDigest("1"), "private-boot")
+	child, _, problem = store.SubmitChild(child, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	child = offerChildParent(t, store, child)
 	output := records.ByteOutput{RequestID: child.ID, Attempt: 1, OutputID: "report", Digest: childDigest("6"), Length: 65537, MimeType: "application/json", ProducerRootID: childDigest("7"), ReceiptDigest: childDigest("8"), ManifestID: childDigest("9"), ManifestLength: 192, ContentBytes: 65537}
@@ -58,7 +58,7 @@ func TestChildByteResultHasIndependentRecipientAndCannotBeBorrowedByHash(t *test
 	}
 	downstream := records.Request{ID: "req-byte-reader", IdemKey: "byte-reader", BodyDigest: childDigest("b"), Package: "local/operation", Entrypoint: "read", Kind: "job", Payload: []byte(`{}`), ParentRequestID: parent.ID, ParentCallIndex: 1, ChildIntentDigest: childDigest("c"), ChildTargetDigest: childDigest("d"), Assets: assets}
 	downstream.Assets[0].FieldPath = "report"
-	recorded, _, problem := store.SubmitChild(downstream, 1, childDigest("1"), "private-boot")
+	recorded, _, problem := store.SubmitChild(downstream, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	if recorded.Assets[0].Native.RetentionID == hold.RetentionID {
 		t.Fatal("downstream borrowed parent retention instead of acquiring an input hold")
@@ -74,7 +74,7 @@ func TestChildByteResultHasIndependentRecipientAndCannotBeBorrowedByHash(t *test
 	forged.IdemKey = "byte-forged"
 	forged.ParentRequestID = stranger.ID
 	forged.ParentCallIndex = 0
-	if _, _, problem := store.SubmitChild(forged, 1, childDigest("1"), "private-boot"); problem == nil {
+	if _, _, problem := store.SubmitChild(forged, 1, childDigest("1"), "private-boot", nil); problem == nil {
 		t.Fatal("another parent borrowed a known byte digest")
 	}
 	fatal(t, store.BeginNativeArtifactRelease(child.ID, false))

@@ -1,6 +1,7 @@
 package records
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -12,8 +13,8 @@ import (
 // SubmitChild records an ordinary request under the parent/index identity. The
 // parent attempt and its captured executable authority are checked in the same
 // transaction that acquires the child. Runtime supplies no placement or scope.
-func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSession string) (Request, bool, *exit.Error) {
-	if r.ParentRequestID == "" || r.ParentCallIndex < 0 || r.ParentCallIndex >= 32 || parentAttempt <= 0 {
+func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSession string, callArguments []byte) (Request, bool, *exit.Error) {
+	if r.ParentRequestID == "" || r.ParentCallIndex < 0 || r.ParentCallIndex > maxChildCallIndex || parentAttempt <= 0 {
 		return Request{}, false, exit.New(exit.Validation, "child call must name a current parent attempt and bounded call index")
 	}
 	if _, err := canonical.Raw(r.ChildIntentDigest); err != nil {
@@ -21,6 +22,24 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	}
 	if _, err := canonical.Raw(r.ChildTargetDigest); err != nil {
 		return Request{}, false, exit.New(exit.Validation, "child target digest is malformed")
+	}
+	var arguments map[string]json.RawMessage
+	if r.IsJob() {
+		if len(callArguments) > 0 && !bytes.Equal(callArguments, r.Payload) {
+			return Request{}, false, exit.Named(exit.Conflict, "child.arguments_changed", "job call differs from its payload")
+		}
+		if len(r.Models) > 0 && json.Unmarshal(r.Payload, &arguments) != nil {
+			return Request{}, false, exit.New(exit.Validation, "child model payload is not JSON")
+		}
+	} else {
+		payload, models, problem := ServingCallArguments(callArguments)
+		if problem != nil {
+			return Request{}, false, problem
+		}
+		if !bytes.Equal(payload, r.Payload) || len(models) != len(r.Models) {
+			return Request{}, false, exit.Named(exit.Conflict, "child.arguments_changed", "serving call differs from its payload/model roster")
+		}
+		arguments = models
 	}
 	r, assets, models, exports, problem := prepareRequest(r)
 	if problem != nil {
@@ -66,8 +85,14 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	}
 	existing, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE parent_request_id=? AND parent_call_index=?`, parent.ID, r.ParentCallIndex))
 	if err == nil {
-		if existing.ChildIntentDigest != r.ChildIntentDigest || existing.ChildTargetDigest != r.ChildTargetDigest || existing.ChildReusable != r.ChildReusable || existing.ChildArtifacts != r.ChildArtifacts {
+		if existing.Kind != r.Kind || existing.ChildIntentDigest != r.ChildIntentDigest || existing.ChildTargetDigest != r.ChildTargetDigest || existing.ChildReusable != r.ChildReusable || existing.ChildArtifacts != r.ChildArtifacts {
 			return Request{}, false, exit.Named(exit.Conflict, "child.intent_changed", "a parent call index already names a different target or input")
+		}
+		if !existing.IsJob() {
+			var prior []byte
+			if err := tx.QueryRow(`SELECT body FROM request_child_arguments WHERE request_id=?`, existing.ID).Scan(&prior); err != nil || !bytes.Equal(prior, callArguments) {
+				return Request{}, false, exit.Named(exit.Conflict, "child.arguments_changed", "serving call index already names different arguments")
+			}
 		}
 		existing.Number, err = requestNumber(tx, existing)
 		if err != nil {
@@ -77,6 +102,9 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Request{}, false, exit.Internalf("cannot inspect child replay: %s", err)
+	}
+	if problem := requireActiveChildSlot(tx, parent.ID); problem != nil {
+		return Request{}, false, problem
 	}
 	r.RetainWork = true
 	r.ReusedFrom = "" // Only an authenticated workspace lookup may adopt old results.
@@ -90,6 +118,11 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	}
 	if !fresh {
 		return recorded, false, nil
+	}
+	if !r.IsJob() {
+		if _, err := tx.Exec(`INSERT INTO request_child_arguments(request_id,body) VALUES(?,?)`, recorded.ID, callArguments); err != nil {
+			return Request{}, false, exit.Internalf("cannot retain serving call arguments: %s", err)
+		}
 	}
 	recorded.Capture = r.Capture
 	if _, err := tx.Exec("UPDATE requests SET capture=? WHERE id=?", r.Capture, recorded.ID); err != nil {
@@ -119,10 +152,6 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 		if _, err := tx.Exec("UPDATE requests SET assets=? WHERE id=?", string(body), recorded.ID); err != nil {
 			return Request{}, false, exit.Internalf("cannot retain byte inputs: %s", err)
 		}
-	}
-	var arguments map[string]json.RawMessage
-	if len(r.Models) > 0 && json.Unmarshal(r.Payload, &arguments) != nil {
-		return Request{}, false, exit.New(exit.Validation, "child model payload is not JSON")
 	}
 	for _, model := range r.Models {
 		artifact, problem := DecodeModelArtifact(arguments[model.Slot])

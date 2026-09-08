@@ -240,6 +240,7 @@ func TestNativeEffectCancellationMigrationPreservesExecutingIntent(t *testing.T)
 	store.Close()
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
+	restorePriorCallIndexBounds(t, db)
 	// Rebuild the exact previous schema, retaining its actual executing row.
 	var ddl string
 	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='native_calls'`).Scan(&ddl))
@@ -254,7 +255,7 @@ func TestNativeEffectCancellationMigrationPreservesExecutingIntent(t *testing.T)
 	_, err = db.Exec(`DROP TABLE prior32`)
 	must(t, err)
 	revertRentalsBeforeWidth(t, db)
-	for _, statement := range []string{`DROP TABLE byte_outputs`, `ALTER TABLE requests DROP COLUMN capture`, `ALTER TABLE native_artifact_retentions DROP COLUMN artifact_kind`, `ALTER TABLE native_artifact_retentions DROP COLUMN producer_attempt`, `ALTER TABLE native_artifact_retentions DROP COLUMN producer_output_id`, `ALTER TABLE native_artifact_retentions DROP COLUMN content_bytes`} {
+	for _, statement := range []string{`DROP TABLE attempt_serving_placements`, `DROP TABLE request_child_arguments`, `DROP TABLE byte_outputs`, `ALTER TABLE requests DROP COLUMN capture`, `ALTER TABLE native_artifact_retentions DROP COLUMN artifact_kind`, `ALTER TABLE native_artifact_retentions DROP COLUMN producer_attempt`, `ALTER TABLE native_artifact_retentions DROP COLUMN producer_output_id`, `ALTER TABLE native_artifact_retentions DROP COLUMN content_bytes`} {
 		_, err = db.Exec(statement)
 		must(t, err)
 	}

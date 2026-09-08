@@ -345,7 +345,7 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID,
 		Revision: rev, WireMinor: pb.WireMinor, Posture: pb.Posture_POSTURE_ACCEPTING,
 		Mode: &pb.DesiredWorkerState_PlacementSet{PlacementSet: &pb.DesiredPlacementSet{
-			PlacementSetDigest: digest, PlacementSetCanonicalBytes: setBytes, DevicePins: pins}},
+			PlacementSetDigest: digest, PlacementSetCanonicalBytes: setBytes, DevicePins: pins, OrchestrationParent: w.orchestrationParent}},
 	}
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}}) {
 		c.logf("PodHost prepare %s#%d: control stream closed before the placement_set send", label, seq)

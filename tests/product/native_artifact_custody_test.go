@@ -45,7 +45,7 @@ func TestNativeArtifactChildAdmissionUsesRealServiceProvenanceAndIndependentHold
 	payload, _ := json.Marshal(map[string]any{"source": artifact})
 	payload, _ = canonical.NormalizeJCS(payload)
 	child := records.Request{ID: "req-native-artifact-consumer", IdemKey: "native-artifact-consumer", BodyDigest: childDigest("5"), Package: "local/operation", Entrypoint: "quantize", Kind: "job", Payload: payload, Models: []records.ModelRef{{Slot: "source", Model: "native/model", Manifest: artifact.Manifest.Digest, ManifestLength: artifact.Manifest.Length}}, ParentRequestID: parent.ID, ParentCallIndex: 1, ChildIntentDigest: childDigest("6"), ChildTargetDigest: childDigest("7")}
-	recorded, _, problem := store.SubmitChild(child, 1, childDigest("1"), "private-boot")
+	recorded, _, problem := store.SubmitChild(child, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	holds, problem := store.NativeArtifactRetentions(recorded.ID)
 	fatal(t, problem)

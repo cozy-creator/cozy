@@ -67,7 +67,7 @@ func InspectIdentity(file string) (Identity, *exit.Error) {
 	}
 	var metadata []byte
 	for _, member := range zr.File {
-		if !strings.HasSuffix(member.Name, ".dist-info/METADATA") {
+		if !distInfoMember(member.Name, "METADATA") {
 			continue
 		}
 		if metadata != nil {
@@ -93,6 +93,12 @@ func InspectIdentity(file string) (Identity, *exit.Error) {
 	out.Distribution, out.Filename = distribution, filename
 	out.Length, out.Version = info.Size(), version
 	return out, nil
+}
+
+// Vendored libraries can carry their own nested .dist-info directories. Only
+// the root distribution metadata describes the wheel being installed.
+func distInfoMember(name, member string) bool {
+	return strings.Count(name, "/") == 1 && strings.HasSuffix(name, ".dist-info/"+member)
 }
 
 func parseWheelFilename(filename string) (string, string, *exit.Error) {

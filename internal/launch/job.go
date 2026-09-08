@@ -187,7 +187,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		Name: function, Request: declared.Request, Assets: declared.Assets, DescriptorID: said.DescriptorID, Outputs: outputs,
 		WeightsOutputs:   weightsOutputs,
 		Publishes:        declared.Publishes,
-		NeedsAccelerator: AcceleratorRequired(strings.Split(f.Install.Closure, "\n")),
+		NeedsAccelerator: AcceleratorRequired(strings.Split(f.Install.Closure, "\n")) && !(f.CPUOrchestration && len(declared.Models) == 0 && len(declared.WeightsOutputs) == 0),
 	}
 	facts.RetainsArtifacts = len(ModelArtifactPaths(declared.Result)) > 0
 	for _, model := range declared.Models {

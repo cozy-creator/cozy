@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS requests (
   reuse_scope TEXT NOT NULL DEFAULT '',
   control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision>=0),
   parent_request_id TEXT NOT NULL DEFAULT '',
-  parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<32),
+  parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<4294967296),
   child_intent_digest TEXT NOT NULL DEFAULT '',
   child_target_digest TEXT NOT NULL DEFAULT '',
   child_reusable INTEGER NOT NULL DEFAULT 0 CHECK(child_reusable IN (0,1)),
@@ -1441,6 +1441,7 @@ type Attempt struct {
 	SessionID           string
 	InvocationDigest    string
 	InvocationCanonical []byte
+	ServingPlacementSet []byte // exact prepared PlacementSet, committed with the serving offer
 	WeightsOutputs      string
 	State               string // preparing | offered | dispatch_aborted | accepted | recovered_open | terminal | closed
 	PlanDigest          string
@@ -1541,6 +1542,13 @@ func (s *Store) Dispatch(a Attempt) (int64, *exit.Error) {
 		return 0, e
 	}
 	a.Attempt = ordinal
+	var request Request
+	if err := tx.QueryRow(`SELECT package,entrypoint,kind FROM requests WHERE id=?`, a.RequestID).Scan(&request.Package, &request.Entrypoint, &request.Kind); err != nil {
+		return 0, exit.Internalf("cannot read serving dispatch subject: %s", err)
+	}
+	if _, problem := BoundServingPlacement(request, a); problem != nil {
+		return 0, problem
+	}
 	if _, err := tx.Exec(`INSERT INTO attempts(request_id,attempt,attempt_key,instance_id,
 		session_id,invocation_digest,invocation,weights_outputs,state,dispatched_at)
 		VALUES(?,?,?,?,?,?,?,?,'preparing',?)`,
@@ -1548,6 +1556,11 @@ func (s *Store) Dispatch(a Attempt) (int64, *exit.Error) {
 		a.InvocationDigest, a.InvocationCanonical, a.WeightsOutputs, a.DispatchedAt); err != nil {
 		return 0, exit.New(exit.Conflict, "cannot journal attempt %s#%d: %s", a.RequestID, a.Attempt, err).
 			WithRemedy("an attempt ordinal is written once")
+	}
+	if len(a.ServingPlacementSet) > 0 {
+		if _, err := tx.Exec(`INSERT INTO attempt_serving_placements(request_id,attempt,body) VALUES(?,?,?)`, a.RequestID, a.Attempt, a.ServingPlacementSet); err != nil {
+			return 0, exit.Internalf("cannot retain prepared serving placement: %s", err)
+		}
 	}
 	advanced, err := tx.Exec(`UPDATE requests SET state='dispatching', ordinal=?
 		WHERE id=? AND state IN ('submitted','queued')`, a.Attempt, a.RequestID)
@@ -2013,7 +2026,8 @@ func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error
 		invocation_digest,invocation,weights_outputs,state,plan_digest,construction,plan_summary,terminal_id,
 		terminal_digest,terminal_status,terminal_cause,safe_message,triage_subject,
 		triage_digest,triage_length,length(triage_bundle)>0,
-		COALESCE(terminal_body,x''),dispatched_at,accepted_at,closed_at
+		COALESCE(terminal_body,x''),dispatched_at,accepted_at,closed_at,
+		COALESCE((SELECT body FROM attempt_serving_placements p WHERE p.request_id=attempts.request_id AND p.attempt=attempts.attempt),x'')
 		FROM attempts WHERE `+where+` ORDER BY request_id, attempt`, args...)
 	if err != nil {
 		return nil, exit.Internalf("cannot read attempts: %s", err)
@@ -2026,7 +2040,7 @@ func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error
 			&a.InvocationDigest, &a.InvocationCanonical, &a.WeightsOutputs, &a.State, &a.PlanDigest, &a.Construction,
 			&a.PlanSummary, &a.TerminalID, &a.TerminalDigest, &a.TerminalStatus, &a.TerminalCause,
 			&a.SafeMessage, &a.TriageSubject, &a.TriageDigest, &a.TriageLength, &a.TriageKept,
-			&a.TerminalBody, &a.DispatchedAt, &a.AcceptedAt, &a.ClosedAt); err != nil {
+			&a.TerminalBody, &a.DispatchedAt, &a.AcceptedAt, &a.ClosedAt, &a.ServingPlacementSet); err != nil {
 			return nil, exit.Internalf("cannot read an attempt row: %s", err)
 		}
 		out = append(out, a)

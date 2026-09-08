@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -702,11 +703,15 @@ func (c *Orchestrator) issueLocalPackageSet(s *session, w *worker,
 func (c *Orchestrator) ConvergePrivatePlacement(instanceID, operationID,
 	localRevisionDigest string, models []*pb.DownloadModelRef,
 ) *exit.Error {
-	if operationID == "" || !validDigest(localRevisionDigest) || len(models) == 0 {
+	return c.convergePrivateModels(instanceID, operationID, localRevisionDigest, models, nil)
+}
+
+func (c *Orchestrator) convergePrivateModels(instanceID, operationID, localRevisionDigest string, models []*pb.DownloadModelRef, native []*pb.NativeModelBinding) *exit.Error {
+	if operationID == "" || !validDigest(localRevisionDigest) || len(models)+len(native) == 0 || (len(models) > 0 && len(native) > 0) {
 		return exit.Named(exit.Validation, "private_placement_incomplete",
 			"local package placement requires operation, exact revision, and models")
 	}
-	if c.opt.RentalPackageSet == nil {
+	if len(models) > 0 && c.opt.RentalPackageSet == nil {
 		return exit.Named(exit.Unavailable, "rental.package_set_signer_missing",
 			"this Cozy daemon has no package_set signer")
 	}
@@ -730,18 +735,22 @@ func (c *Orchestrator) ConvergePrivatePlacement(instanceID, operationID,
 	if problem := c.awaitLocalRevision(instanceID, localRevisionDigest); problem != nil {
 		return problem
 	}
-	downloadSet, problem := c.opt.RentalPackageSet(nil, models)
-	if problem != nil {
-		return problem
+	var downloadSet []byte
+	if len(models) > 0 {
+		var problem *exit.Error
+		downloadSet, problem = c.opt.RentalPackageSet(nil, models)
+		if problem != nil {
+			return problem
+		}
 	}
 	revision, err := canonical.Raw(localRevisionDigest)
-	if err != nil || len(downloadSet) == 0 {
+	if err != nil || (len(downloadSet) == 0 && len(native) == 0) {
 		return exit.Named(exit.Validation, "private_placement_download_set_incomplete",
 			"local package placement download set is incomplete")
 	}
 	operationID = c.localOperation(w, revision, operationID)
 	selected := &pb.DesiredPrivatePlacementSet{OperationId: operationID,
-		LocalRevisionDigest: revision, DownloadDelegation: downloadSet}
+		LocalRevisionDigest: revision, DownloadDelegation: downloadSet, NativeModels: native}
 	return c.issuePrivatePlacementSet(s, w, selected)
 }
 
@@ -786,7 +795,5 @@ func clonePrivatePlacementSet(in *pb.DesiredPrivatePlacementSet) *pb.DesiredPriv
 	if in == nil {
 		return nil
 	}
-	return &pb.DesiredPrivatePlacementSet{OperationId: in.OperationId,
-		LocalRevisionDigest: append([]byte(nil), in.LocalRevisionDigest...),
-		DownloadDelegation:  append([]byte(nil), in.DownloadDelegation...)}
+	return proto.Clone(in).(*pb.DesiredPrivatePlacementSet)
 }

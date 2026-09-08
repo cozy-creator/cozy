@@ -51,7 +51,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 		(req.LocalPackageDigest == "" || req.LocalPackageDigest == w.spec.Placement.LocalRevisionDigest) && w.desiredRefusal == nil
 	preparedSpec := w.spec
 	c.mu.Unlock()
-	if already {
+	if already && req.ParentRequestID == "" {
 		plan, problem := preparedSpec.Placement.EntrypointDigest(req.Entrypoint)
 		if problem != nil {
 			return WorkerLaunchSpec{}, "", problem
@@ -99,13 +99,16 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 			Wheels:  files,
 		})
 		if rpcError == nil && len(req.Models) > 0 {
-			selected, problem := localDownloadSelection(req.Models, nil)
+			call := &pb.PreparePrivatePlacementRequest{OperationId: req.ID, LocalRevisionDigest: digest, Claim: s.claim}
+			if req.ParentRequestID != "" {
+				call.NativeModels, problem = c.nativeServingModels(req)
+			} else {
+				call.DownloadDelegation, problem = localDownloadSelection(req.Models, nil)
+			}
 			if problem != nil {
 				return WorkerLaunchSpec{}, "", problem
 			}
-			result, rpcError = s.preparation.PreparePrivatePlacement(s.ctx, &pb.PreparePrivatePlacementRequest{
-				OperationId: req.ID, LocalRevisionDigest: digest, DownloadDelegation: selected,
-			})
+			result, rpcError = s.preparation.PreparePrivatePlacement(s.ctx, call)
 		}
 	}
 	if rpcError != nil {
