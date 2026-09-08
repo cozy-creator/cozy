@@ -364,10 +364,14 @@ func compositionTail(value string) string {
 func compositionDown(t *testing.T, root, path string) {
 	t.Helper()
 	processes := map[int]string{}
-	db, err := sql.Open("sqlite3", filepath.Join(root, "creator.sqlite")+"?mode=ro&_busy_timeout=5000")
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "creator.sqlite")+"?mode=ro")
 	if err == nil {
+		db.SetMaxOpenConns(1)
+		_, err = db.Exec(`PRAGMA busy_timeout=5000`)
 		var rows *sql.Rows
-		rows, err = db.Query(`SELECT pid,birth FROM worker_processes WHERE pid>0`)
+		if err == nil {
+			rows, err = db.Query(`SELECT pid,birth FROM worker_processes WHERE pid>0`)
+		}
 		if err == nil {
 			for rows.Next() {
 				var pid int
