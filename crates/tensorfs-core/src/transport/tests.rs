@@ -1416,7 +1416,19 @@ fn sixteen_way_walk_lands_everything_through_the_one_door() {
     let policy = SourcePolicy::default();
     let counted = AtomicUsize::new(0);
     let from_origin = AtomicUsize::new(0);
+    let plans = Mutex::new(Vec::new());
+    let planned = |plan: &FetchPlan| {
+        plans
+            .lock()
+            .unwrap()
+            .push((plan.declared_bytes(), plan.held_bytes()));
+    };
     let observer = |_: &ObjectRef, _: u64, door: ObjectSource| {
+        assert_eq!(
+            plans.lock().unwrap().len(),
+            1,
+            "the plan precedes all body transfers"
+        );
         counted.fetch_add(1, Ordering::Relaxed);
         if door == ObjectSource::Origin {
             from_origin.fetch_add(1, Ordering::Relaxed);
@@ -1424,6 +1436,7 @@ fn sixteen_way_walk_lands_everything_through_the_one_door() {
     };
     let mut request = request_for(&store, &origin.base, &policy);
     request.streams = 16;
+    request.on_plan = Some(&planned);
     request.on_object = Some(&observer);
     let report = pull(&request).unwrap();
     assert_eq!(report.fetched, 26);
@@ -1431,6 +1444,17 @@ fn sixteen_way_walk_lands_everything_through_the_one_door() {
     // With no cache mounted every object came through the origin door, and the observer
     // was told so per object rather than only in the final report.
     assert_eq!(from_origin.load(Ordering::Relaxed), 26);
+    assert_eq!(*plans.lock().unwrap(), vec![(report.bytes_total, 0)]);
+    let warm = pull(&request).unwrap();
+    assert_eq!(warm.fetched, 0);
+    assert_eq!(counted.load(Ordering::Relaxed), 26);
+    assert_eq!(
+        *plans.lock().unwrap(),
+        vec![
+            (report.bytes_total, 0),
+            (report.bytes_total, report.bytes_total)
+        ]
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 

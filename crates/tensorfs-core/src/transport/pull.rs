@@ -936,6 +936,9 @@ pub struct PullRequest<'a> {
     pub streams: usize,
     pub session: &'a str,
     pub sample_seconds: f64,
+    /// The native plan, once, before body transfers. Observability only; consumers can
+    /// report the exact declared and already-held bytes without resolving a second plan.
+    pub on_plan: Option<&'a dyn Fn(&FetchPlan)>,
     pub on_object: Option<ObjectObserver<'a>>,
 }
 
@@ -958,6 +961,7 @@ impl<'a> PullRequest<'a> {
             streams: STREAMS,
             session: "",
             sample_seconds: crate::transport::ledger::SAMPLE_SECONDS,
+            on_plan: None,
             on_object: None,
         }
     }
@@ -1030,6 +1034,9 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         request.session.to_string()
     };
     let (plan, why) = FetchPlan::of(request.store, &session, &closure.manifest, &closure.objects)?;
+    if let Some(observer) = request.on_plan {
+        observer(&plan);
+    }
     let mut report = PullReport {
         refspec: request.refspec.to_string(),
         model: closure.model.clone(),
