@@ -138,7 +138,7 @@ def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> Tile
         size=side,
         pixels=side * side,
         digest=hashlib.sha256(pixels).hexdigest(),
-        warm=ctx.boot_warmup,
+        warm=False,
         revision=REVISION,
     )
 
