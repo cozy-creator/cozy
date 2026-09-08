@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -191,5 +192,65 @@ def main(*, out: Outputs, tel: Telemetry) -> ImageAsset:
 	}
 	if !strings.Contains(stdout, "image/png") {
 		t.Fatalf("typed image result missing: %s", stdout)
+	}
+}
+
+// The model class lives in a captured editable library, outside the script tree.
+// Both modules refuse execution; only the static source reader can describe it.
+func TestPrivateScriptDescribesCapturedModelWithoutImports(t *testing.T) {
+	root, err := os.MkdirTemp("", "cozy-script-model-description-")
+	must(t, err)
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "down", "--all")
+		if t.Failed() {
+			t.Log("captured model description evidence retained", root)
+		} else {
+			_ = os.RemoveAll(root)
+		}
+	})
+	project := t.TempDir()
+	library := filepath.Join(project, "model_types")
+	must(t, os.MkdirAll(library, 0700))
+	must(t, os.WriteFile(filepath.Join(library, "pyproject.toml"), []byte(`[project]
+name="private-script-model-types"
+version="0.0.1"
+requires-python=">=3.12,<3.13"
+[build-system]
+requires=["hatchling"]
+build-backend="hatchling.build"
+[tool.hatch.build.targets.wheel]
+only-include=["model_types.py"]
+`), 0600))
+	must(t, os.WriteFile(filepath.Join(library, "model_types.py"), []byte(`raise RuntimeError("model dependency imported during description")
+from cozy_runtime.author import Model, uses_components
+class Probe(Model[object], encoded_leaves="accept"):
+    @uses_components("video_vae")
+    def decode(self): pass
+`), 0600))
+	sources := ""
+	if wheel := *privateScriptRuntimeWheel; wheel != "" {
+		sources = fmt.Sprintf("# cozy-runtime={path=%q}\n", wheel)
+	}
+	script := filepath.Join(project, "prepare.py")
+	must(t, os.WriteFile(script, []byte(`# /// script
+# requires-python=">=3.12,<3.13"
+# dependencies=["cozy-runtime==0.6.0","private-script-model-types==0.0.1"]
+# [tool.uv.sources]
+# private-script-model-types={path="./model_types",editable=true}
+`+sources+`# ///
+raise RuntimeError("client script imported during description")
+from model_types import Probe
+
+def main(*, model: Probe): pass
+`), 0600))
+	code, out := runCozy(t, root, "run", script, "--describe", "--json")
+	var described struct {
+		Fields []json.RawMessage `json:"fields"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &described) != nil || described.Fields == nil {
+		t.Fatalf("captured model source was not described without imports [%d]: %s", code, out)
+	}
+	if len(described.Fields) != 0 {
+		t.Fatalf("injected model became an ordinary payload field: %s", out)
 	}
 }
