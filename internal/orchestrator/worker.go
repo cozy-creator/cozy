@@ -770,6 +770,10 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 	var mine chan struct{}
 	for {
 		c.mu.Lock()
+		if c.closing {
+			c.mu.Unlock()
+			return "", ChangeNone, exit.Named(exit.Unavailable, "daemon.closing", "the daemon is closing; no worker can be started")
+		}
 		if inFlight := c.ensuring[instanceID]; inFlight != nil {
 			c.mu.Unlock()
 			<-inFlight
