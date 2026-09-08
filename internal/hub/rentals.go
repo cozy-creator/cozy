@@ -64,6 +64,11 @@ type Rental struct {
 	Name             string
 	State            string
 	AcceleratorModel string
+	// AcceleratorCount is the pod's WIDTH: how many accelerators this rental delivers,
+	// and therefore the size of the device envelope its worker holds and the only degree
+	// a group placement on it may be pinned to. One for a one-card pod, and one for a CPU
+	// product, whose pod has no accelerator at all.
+	AcceleratorCount int
 	Address          string
 	CertPEM          string
 	Detail           string
@@ -141,6 +146,7 @@ type wireRental struct {
 	Name                string         `json:"name"`
 	State               string         `json:"state"`
 	AcceleratorModel    string         `json:"requested_accelerator_model"`
+	AcceleratorCount    int            `json:"accelerator_count"`
 	WorkerAddress       string         `json:"worker_address"`
 	CertPEM             string         `json:"cert_pem"`
 	Detail              string         `json:"detail"`
@@ -172,8 +178,8 @@ func validateRentalID(id string) *exit.Error {
 func (w wireRental) rental() Rental {
 	return Rental{
 		Development: w.Development, SSHAddress: w.SSHAddress, ID: w.ID, Name: w.Name, State: w.State,
-		AcceleratorModel: w.AcceleratorModel,
-		Address:          w.WorkerAddress, CertPEM: w.CertPEM,
+		AcceleratorModel: w.AcceleratorModel, AcceleratorCount: w.AcceleratorCount,
+		Address: w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, Failure: w.Failure, MediaAddress: w.MediaAddress,
 		WorkerID: w.WorkerID, WorkerBootID: w.WorkerBootID,
 		CreatorPublicKey:    w.CreatorPublicKey,
@@ -324,6 +330,13 @@ func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
 type RentalSKU struct {
 	Name             string `json:"name"`
 	AcceleratorModel string `json:"accelerator_model"`
+	// AcceleratorCount is the product's WIDTH: how many accelerators one rental of it
+	// delivers. It is the provider's own published pod width, never a multiplied one-card
+	// figure, and it is the degree a group placement bought on it must be pinned to.
+	// VRAMGB stays the ONE-CARD figure at every width, and that is the right fit test:
+	// under a sequence-parallel group every rank holds the FULL weights, so width buys
+	// latency and activation headroom, never capacity.
+	AcceleratorCount int `json:"accelerator_count"`
 	// BaseWorkerProfile is the hub's own label for the base image this product boots,
 	// e.g. `torch2.13.0-cu130-cp312-linux-x86`. It is read so a published release whose
 	// requirements the label already contradicts is refused before the paid ask. It is
@@ -357,11 +370,11 @@ func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
 		invalidGPU := !cpu && (!computeCapabilityPattern.MatchString(sku.ComputeCapability) ||
 			sku.VRAMGB <= 0 || sku.MinimumRAMPerGPUGB <= 0)
 		if strings.TrimSpace(sku.Name) == "" || strings.TrimSpace(sku.AcceleratorModel) == "" ||
-			invalidCPU || invalidGPU ||
+			invalidCPU || invalidGPU || sku.AcceleratorCount < 1 ||
 			sku.PriceUSDMicrosPerHour <= 0 || sku.StorageUSDMicrosPerHour < 0 || seen[sku.Name] {
 			return nil, exit.Named(exit.Conflict, "hub.rental_catalog_invalid",
 				"the hub returned an invalid or duplicate rental SKU %q", sku.Name).
-				WithRemedy("Tensorhub must publish unique positive-price CPU SKUs without GPU fields, or GPU SKUs with compute capability and positive VRAM/RAM")
+				WithRemedy("Tensorhub must publish unique positive-price CPU SKUs without GPU fields, or GPU SKUs with compute capability and positive VRAM/RAM, each stating its accelerator count")
 		}
 		seen[sku.Name] = true
 	}
@@ -409,6 +422,15 @@ func (w wireRental) named(what string) *exit.Error {
 		return exit.Named(exit.Conflict, "hub.rental_name_invalid",
 			"the hub %s with invalid private rental name %q", what, w.Name).
 			WithRemedy("Tensorhub must return the exact safe name Creator sent at rental creation")
+	}
+	// THE WIDTH IS NOT OPTIONAL. It decides the device envelope this host grants the pod's
+	// worker and the degree it pins a group placement to, so a rental that will not say how
+	// many accelerators it delivers cannot be attached at all — and reading its silence as
+	// one would attach a wide paid pod as a single card and idle the rest.
+	if w.AcceleratorCount < 1 {
+		return exit.Named(exit.Conflict, "hub.rental_accelerator_count_missing",
+			"the hub %s with accelerator count %d", what, w.AcceleratorCount).
+			WithRemedy("upgrade Tensorhub; every rental states the width it delivers")
 	}
 	return validateRentalID(w.ID)
 }

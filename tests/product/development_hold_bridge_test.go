@@ -54,7 +54,7 @@ func TestDevelopmentHoldBridge(t *testing.T) {
 	token, problem := rental.PendingMediaToken(layout, "isolated-development-hold")
 	fatal(t, problem)
 	cfg := config.Config{Home: fixture.Root, HubURL: "http://127.0.0.1:1"}
-	fatal(t, rental.Attach(layout, store, records.Rental{ID: rentalID, MachineName: "isolated-development-proof",
+	fatal(t, rental.Attach(layout, store, records.Rental{AcceleratorCount: 1, ID: rentalID, MachineName: "isolated-development-proof",
 		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, State: "ready", Hub: cfg.HubURL,
 		Address: fixture.Address, ExpectedWorkerID: fixture.WorkerID, ExpectedWorkerBootID: fixture.WorkerBootID},
 		string(certificate), token, identity))

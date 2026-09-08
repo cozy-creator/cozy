@@ -116,7 +116,7 @@ func TestLostOnlyRentalReacquiresForTheSameSourceJob(t *testing.T) {
 	origin := fmt.Sprintf("http://127.0.0.1:%d", port)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+origin+"\ntensorhub_token: rental-idle-test\nrentals:\n  max_hourly_spend_usd: 1\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	peer := newFakeRentalHub(t, port)
-	peer.setSKUs(map[string]any{"name": "cpu", "accelerator_model": "CPU", "price_usd_micros_per_hour": 100000, "base_worker_profile": "python3.12-cpu-linux-x86"})
+	peer.setSKUs(map[string]any{"name": "cpu", "accelerator_model": "CPU", "accelerator_count": 1, "price_usd_micros_per_hour": 100000, "base_worker_profile": "python3.12-cpu-linux-x86"})
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -131,11 +131,11 @@ func TestLostOnlyRentalReacquiresForTheSameSourceJob(t *testing.T) {
 	must(t, json.Unmarshal(original.RequestBody, &oldBody))
 	peer.add("rental-lost-only", oldBody.Name)
 	peer.setState("rental-lost-only", "released", "")
-	fatal(t, store.RecordRental(records.Rental{ID: "rental-lost-only", MachineName: oldBody.Name, SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100000, ManagedRequestID: request, State: "ready", Hub: origin}))
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: "rental-lost-only", MachineName: oldBody.Name, SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100000, ManagedRequestID: request, State: "ready", Hub: origin}))
 	var creates atomic.Int64
 	peer.rent = func(body map[string]any) map[string]any {
 		creates.Add(1)
-		return map[string]any{"rental_id": "pr-replacement-only", "name": body["name"], "state": "acquiring", "requested_accelerator_model": "CPU", "hourly_rate_usd_micros": 100000}
+		return map[string]any{"rental_id": "pr-replacement-only", "name": body["name"], "state": "acquiring", "requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 100000}
 	}
 	startDaemonProcess(t, root)
 	defer peer.setState("pr-replacement-only", "failed", "fixture_finished")

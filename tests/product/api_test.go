@@ -171,7 +171,7 @@ func TestLocalAPIDoor(t *testing.T) {
 	// Plain down is safe by default: one paid obligation refuses shutdown by exact id.
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
-	fatal(t, store.RecordRental(records.Rental{
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 		ID:               "rental-down-arm",
 		MachineName:      "heron",
 		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,

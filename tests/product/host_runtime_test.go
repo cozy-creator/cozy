@@ -24,7 +24,7 @@ func TestHostRuntimeWireFence(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in runtimes are POSIX shell scripts")
 	}
-	install := "uv tool install --force 'cozy-runtime[media,model-execution]>=" + hostruntime.Floor + "'"
+	install := "uv tool install --force --python 3.12 'cozy-runtime[media,model-execution]>=" + hostruntime.Floor + "'"
 
 	// (a) An older minor cannot serve: `cozy up` refuses under the tool's own words, and
 	// `cozy run` — which starts the same daemon — answers the same code instead of queuing.

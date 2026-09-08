@@ -96,7 +96,7 @@ func TestRentalMachineNames(t *testing.T) {
 		t.Helper()
 		word := begin(key)
 		fatal(t, store.AdvanceRentalOperation(key, id, "ready"))
-		fatal(t, store.RecordRental(records.Rental{
+		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 			ID: id, MachineName: word, SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,
 			State: "ready", Hub: hubURL, Address: "127.0.0.1:1", CertPath: id + ".pem",
 		}))
@@ -136,7 +136,7 @@ func TestRentalMachineNames(t *testing.T) {
 		if word == first || taken[word] {
 			continue
 		}
-		fatal(t, store.RecordRental(records.Rental{
+		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 			ID: "pr-" + word, MachineName: word, SKU: "cpu", AcceleratorModel: "CPU",
 			HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL, Address: "127.0.0.1:1",
 			CertPath: word + ".pem",

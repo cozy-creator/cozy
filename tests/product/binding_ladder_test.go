@@ -46,6 +46,10 @@ type ladderHub struct {
 	// later package binds while a run still names rc.1 explicitly (cl-174).
 	unsized bool
 	later   bool
+	// market is what GET /v1/rental-skus answers. It is MUTABLE because a catalog that
+	// momentarily offers no product of the request's class is a real hub state and one
+	// half of what killed run 412 (cl-185); a fixed market cannot express it.
+	market []hub.RentalSKU
 }
 
 const (
@@ -71,7 +75,8 @@ func newLadderHub(t *testing.T) *ladderHub {
 	detail.Release.PackageInterfaceDigest = contract.Digest
 	detail.Release.PackageInterfaceLength = int64(len(iface))
 	detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25", "torch<3,>=2.13"}
-	h := &ladderHub{soldOut: map[string]bool{}, rentals: map[string]map[string]any{}}
+	h := &ladderHub{soldOut: map[string]bool{}, rentals: map[string]map[string]any{},
+		market: market20260907()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/packages/proof/h3", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "h3"},
@@ -162,7 +167,9 @@ func newLadderHub(t *testing.T) *ladderHub {
 		_ = json.NewEncoder(w).Encode(map[string]any{"model": "proof/minimax", "throughput": h.throughput})
 	})
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(market20260907())
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(h.market)
 	})
 	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`[]`)) })
 	mux.HandleFunc("GET /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -191,11 +198,11 @@ func newLadderHub(t *testing.T) *ladderHub {
 		}
 		id := "pr-ladder-" + request.SKU
 		row := map[string]any{"rental_id": id, "name": request.Name, "state": "failed",
-			"requested_accelerator_model": "NVIDIA H200", "hourly_rate_usd_micros": 3_590_000,
+			"requested_accelerator_model": "NVIDIA H200", "accelerator_count": 1, "hourly_rate_usd_micros": 3_590_000,
 			"failure": map[string]any{"code": "fixture_finished"}}
 		if h.provisions {
 			row = map[string]any{"rental_id": id, "name": request.Name, "state": "ready",
-				"requested_accelerator_model": "NVIDIA H100 NVL", "hourly_rate_usd_micros": 2_790_000,
+				"requested_accelerator_model": "NVIDIA H100 NVL", "accelerator_count": 1, "hourly_rate_usd_micros": 2_790_000,
 				"worker_address": "127.0.0.1:1", "media_address": "127.0.0.1:2", "cert_pem": "fixture",
 				"worker_id": "fixture-worker", "worker_boot_id": "fixture-boot",
 				"creator_public_key": request.CreatorPublicKey, "media_token_sha256": []string{request.MediaTokenSHA256}}
@@ -236,11 +243,28 @@ func (h *ladderHub) postedSKUs() []string {
 	return out
 }
 
+// sell replaces what the catalog offers; an empty list is a hub with nothing on offer.
+func (h *ladderHub) sell(skus ...hub.RentalSKU) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.market = skus
+}
+
+// addState is a rental the hub reports in one exact lifecycle word, with no worker triple:
+// `acquiring` for a pod still being provisioned, `failed` for one that never will be.
+func (h *ladderHub) addState(id, machine, accelerator, state string, rate int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.rentals[id] = map[string]any{"rental_id": id, "name": machine, "state": state,
+		"requested_accelerator_model": accelerator, "accelerator_count": 1,
+		"hourly_rate_usd_micros": rate}
+}
+
 func (h *ladderHub) addReady(id, machine, accelerator string, rate int64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.rentals[id] = map[string]any{"rental_id": id, "name": machine, "state": "ready",
-		"requested_accelerator_model": accelerator, "hourly_rate_usd_micros": rate,
+		"requested_accelerator_model": accelerator, "accelerator_count": 1, "hourly_rate_usd_micros": rate,
 		"worker_address": "127.0.0.1:1", "media_address": "127.0.0.1:2"}
 }
 
@@ -441,11 +465,11 @@ func TestAutoRentReusesTheFittingRentalBeforeBuying(t *testing.T) {
 	// on the bf16 rung fits too; the 5090 fits a rung but not that text encoder, so it is
 	// passed over with the need recorded (the 2026-09-07 production case, cl-168).
 	for _, seed := range []records.Rental{
-		{ID: "pr-zack", MachineName: "zack", SKU: "h200", AcceleratorModel: "NVIDIA H200",
+		{AcceleratorCount: 1, ID: "pr-zack", MachineName: "zack", SKU: "h200", AcceleratorModel: "NVIDIA H200",
 			HourlyRateUSDMicros: 3_590_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
-		{ID: "pr-cheap", MachineName: "cheap", SKU: "rtx-5090", AcceleratorModel: "NVIDIA GeForce RTX 5090",
+		{AcceleratorCount: 1, ID: "pr-cheap", MachineName: "cheap", SKU: "rtx-5090", AcceleratorModel: "NVIDIA GeForce RTX 5090",
 			HourlyRateUSDMicros: 990_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
-		{ID: "pr-morgiana", MachineName: "morgiana", SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3",
+		{AcceleratorCount: 1, ID: "pr-morgiana", MachineName: "morgiana", SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3",
 			HourlyRateUSDMicros: 2_490_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
 	} {
 		fatal(t, store.RecordRental(seed))

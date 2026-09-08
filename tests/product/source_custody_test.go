@@ -83,7 +83,7 @@ func proveOperatorSourceCustody(t *testing.T, ctx context.Context, root string, 
 	fatal(t, problem)
 	token, problem := rental.PendingMediaToken(layout, "source-custody-proof")
 	fatal(t, problem)
-	fatal(t, rental.Attach(layout, store, records.Rental{ID: rentalID, MachineName: "proof", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, Address: bridge.Address, State: "ready", Hub: *publicationHub, ExpectedWorkerID: bridge.WorkerID, ExpectedWorkerBootID: bridge.WorkerBootID}, bridge.Certificate, token, identity))
+	fatal(t, rental.Attach(layout, store, records.Rental{AcceleratorCount: 1, ID: rentalID, MachineName: "proof", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, Address: bridge.Address, State: "ready", Hub: *publicationHub, ExpectedWorkerID: bridge.WorkerID, ExpectedWorkerBootID: bridge.WorkerBootID}, bridge.Certificate, token, identity))
 	cfg := config.Config{Home: root, HubURL: *publicationHub}
 	before, problem := cli.InspectStoredSourceCustody(cfg, request.OperationId, rentalID, bridge.WorkerBootID)
 	fatal(t, problem)

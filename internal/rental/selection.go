@@ -3,20 +3,28 @@ package rental
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Constraints is the published release's own Requirements/RequiresPython. It narrows the
-// catalog ADVISORILY: a product whose base profile the release already contradicts is not
-// worth an hour's rent, because the pod would refuse it typed on arrival.
+// Constraints is the published release's own Requirements/RequiresPython and the degrees
+// its package declares it can shard at. It narrows the catalog ADVISORILY: a product whose
+// base profile the release already contradicts, or whose WIDTH the package cannot shard
+// across, is not worth an hour's rent, because the pod would refuse it typed on arrival.
 type Constraints struct {
 	Requirements   []string
 	RequiresPython string
+	// Degrees is the intersection of every model slot's `sequence_parallel.degrees` in the
+	// package interface — the author's statement of which group degrees the whole
+	// construction can be built at. Empty means the package declares none, which is most
+	// packages and is why a wide product is excluded rather than chosen by default.
+	Degrees []int
 }
 
 // Purchases is every product of the request's class as a placement candidate (cl-165),
@@ -35,6 +43,9 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 		c := orchestrator.PlacementCandidate{SKU: sku.Name,
 			RateUSDMicrosPerHour: sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour}
 		Size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator, job)
+		if c.Verdict == "" {
+			c.Verdict = WidthUnusable(sku.AcceleratorCount, job, constraints)
+		}
 		if c.Verdict == "" {
 			c.Verdict = baseMismatch(sku, constraints)
 		}
@@ -87,6 +98,13 @@ func Pin(models []records.ModelRef, accelerator string) ([]records.ModelRef, int
 // (cl-168): a device is short only when what the selection measurably needs outweighs it.
 // A rung-asserted slot needs no figure — the owner's word stands. VRAMGB is read as GiB,
 // the unit GPU memory is built in (an "80 GB" H100 carries 81920 MiB).
+//
+// ONE CARD, AT EVERY WIDTH, DELIBERATELY (cl-179). VRAMGB is the per-card figure for a
+// wide product as much as a narrow one, and that is the correct test: nothing here is
+// tensor- or pipeline-parallel, so under a sequence-parallel group every rank holds the
+// WHOLE weights and a four-card pod fits exactly what one of its cards fits. Reading a
+// width as capacity — summing it, or dividing the need by it — would buy a pod that
+// cannot hold the model and only discover it after the hour was billed.
 func Fit(need records.Residency, vramGB int64, name string) string {
 	if need.Bytes <= vramGB<<30 {
 		return ""
@@ -102,6 +120,51 @@ func FitNote(need records.Residency, vramGB int64) string {
 		return need.Fit
 	}
 	return fmt.Sprintf("%s %.1f GiB of %d GB", need.Fit, float64(need.Bytes)/(1<<30), vramGB)
+}
+
+// WidthUnusable keeps a machine WIDER than one card out of the decision unless this request
+// can actually use every card it would be billed for (cl-179). It holds a BUY and a REUSE
+// to the same rule: a wide pod already up is as unusable to a package that cannot shard as
+// one that has not been bought yet, and choosing it would fail the request typed at the
+// worker instead of placing it on a machine that works.
+//
+// A wide machine is not more capacity: every rank of a sequence-parallel group holds the
+// FULL weights, so width buys latency and never fit. The only thing that uses the extra
+// cards is a group placement of exactly that degree, which needs two things this side
+// knows before spending: the package's author must have declared the degree, and the
+// request must be a serving one — a job is a single bounded attempt and shards nothing,
+// so a wide pod given one idles every card but the first for the whole hour.
+//
+// Constraints are advisory — a hub that will not answer yields none — so this narrows the
+// decision and never widens it: with no declared degrees only one-card machines remain,
+// which is exactly the behaviour before wide products existed.
+func WidthUnusable(width int, job bool, constraints Constraints) string {
+	if width < 2 {
+		return ""
+	}
+	if job {
+		return orchestrator.VerdictExcluded + orchestrator.ExcludedWidthUndeclared +
+			fmt.Sprintf(": %d cards, and a job shards none of them", width)
+	}
+	for _, degree := range constraints.Degrees {
+		if degree == width {
+			return ""
+		}
+	}
+	return orchestrator.VerdictExcluded + orchestrator.ExcludedWidthUndeclared +
+		fmt.Sprintf(": %d cards, and the package declares %s", width,
+			declaredDegrees(constraints.Degrees))
+}
+
+func declaredDegrees(degrees []int) string {
+	if len(degrees) == 0 {
+		return "no sequence-parallel degree"
+	}
+	parts := make([]string, 0, len(degrees))
+	for _, degree := range degrees {
+		parts = append(parts, strconv.Itoa(degree))
+	}
+	return "degrees " + strings.Join(parts, ", ")
 }
 
 func baseMismatch(sku hub.RentalSKU, constraints Constraints) string {
@@ -164,6 +227,157 @@ func Attaching(candidates []orchestrator.PlacementCandidate) int {
 		}
 	}
 	return -1
+}
+
+// Standing pins one rental the fleet already holds as a placement candidate and answers
+// whether the caller must still ask its LIVE questions — what the pod is holding right
+// now, and how much work is ahead of a new request. Everything decidable from the rental
+// ROW alone is settled here, in the ONE order that keeps a transient state out of a
+// permanent verdict (cl-185):
+//
+//  1. CLASS — a CPU pod cannot serve an accelerator request, ever.
+//  2. GEOMETRY — no rung names this accelerator, or what the pinned lanes need outweighs
+//     its memory. Both are facts about the machine and the binding, so they hold whatever
+//     the pod is doing this second.
+//  3. LIFECYCLE — and only now. A hub state this build knows to be FINISHED excludes the
+//     machine, naming the state. Every other state, including the whole pre-ready
+//     lifecycle, is a machine on its way: VerdictAttaching, waited for (cl-170), never
+//     bought around and never failed on.
+//
+// Asking liveness first is what cost run 412: `karam`, bought eleven minutes earlier and
+// `ready` four minutes later, was excluded `not_ready` beside a genuinely dead pod, and
+// the request settled FAILED on a fleet that was simply still booting.
+func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
+	row records.Rental, vramGB int64, needsAccelerator, offered, job bool,
+	constraints Constraints,
+) bool {
+	if needsAccelerator && row.AcceleratorModel == "CPU" {
+		c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedWrongClass
+		return false
+	}
+	// A machine the user already has up is held to the same floor as a buy; the catalog's
+	// memory figure for its product is the fact (a product gone from the catalog this
+	// minute decides nothing). Its WIDTH is held to the same rule too, and read from the
+	// machine's own row rather than its product's: an attached rental is the authority on
+	// how many cards it has, and its SKU may have left the catalog (cl-179).
+	Size(c, models, row.AcceleratorModel, vramGB, needsAccelerator && offered, job)
+	if c.Verdict == "" {
+		c.Verdict = WidthUnusable(row.AcceleratorCount, job, constraints)
+	}
+	switch {
+	case c.Verdict != "":
+		return false
+	case records.RentalTerminalState(row.State):
+		c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedNotReady + ": " + row.State
+		return false
+	case !records.RentalReadyState(row.State) || row.Address == "" || row.CertPath == "":
+		c.Verdict = orchestrator.VerdictAttaching
+		return false
+	}
+	return true
+}
+
+// Refusal names why nothing could be placed. The FIRST question is not which reason to
+// print, it is whether the answer can change on its own (cl-185).
+//
+// A stock-out, and a catalog that offered no product of this class the second it was
+// asked, are WEATHER: the same request placed a minute later succeeds. They exit
+// Unavailable, which Orchestrator.deferUnavailable PARKS and re-asks rather than
+// settling — the same treatment a fitting machine still coming up already gets, which
+// never reaches here at all. Only a refusal nothing but an operator can lift is
+// terminal, and exit.Capacity means what it says: a quantified shortfall against the
+// physical floor. Run 412 died on `rental.no_fitting_sku` while both machines it named
+// were mid-acquisition and the catalog was momentarily empty; nothing about that
+// sentence was true.
+func Refusal(req records.Request, d orchestrator.PlacementDecision, needsAccelerator bool,
+	capped *exit.Error) *exit.Error {
+	var noStock, verdicts []string
+	mismatch, offered := "", 0
+	for _, c := range d.Candidates {
+		verdicts = append(verdicts, c.Name()+" "+c.Verdict)
+		if !c.Attached() {
+			offered++
+		}
+		if c.Verdict == orchestrator.VerdictNoStock {
+			noStock = append(noStock, c.SKU)
+		}
+		if reason, ok := strings.CutPrefix(c.Verdict,
+			orchestrator.VerdictExcluded+orchestrator.ExcludedBaseMismatch+": "); ok && mismatch == "" {
+			mismatch = c.SKU + ": " + reason
+		}
+	}
+	class := "accelerator"
+	if !needsAccelerator {
+		class = "CPU"
+	}
+	switch {
+	case len(noStock) > 0:
+		return exit.Named(exit.Unavailable, "rental.no_inventory",
+			"every rental SKU fitting %s is out of stock right now (%s) — NOTHING was rented",
+			req.Package, strings.Join(noStock, ", ")).
+			WithRemedy("this is a stock-out, not a bad ladder: the request waits and the fleet re-asks")
+	case capped != nil:
+		// The one refusal that names an OPERATOR action rather than weather. Parking on
+		// it would hide a misconfigured cap behind a queue that never drains.
+		return capped
+	case mismatch != "":
+		// Refused BEFORE the paid ask, in the pod's own vocabulary. Publication stays
+		// base-independent: the release is published and simply unqualified here.
+		return exit.Named(exit.Unavailable, "rental.package_base_incompatible",
+			"no rentable machine can run %s@%s — %s", req.Package, req.Release, mismatch).
+			WithRemedy("publish a release whose requirements one of Tensorhub's offered base images satisfies")
+	case offered == 0:
+		// Nothing on offer to fit. Saying "no SKU fits" over an empty market is the
+		// conflation this branch exists to refuse: it sends the reader to the ladder for
+		// a fact about Tensorhub's inventory.
+		return exit.Named(exit.Unavailable, "rental.catalog_empty",
+			"Tensorhub offered no %s product when %s was placed; %s",
+			class, req.Package, heldOrNothing(verdicts)).
+			WithRemedy("this is an empty catalog, not a bad ladder: the request waits and the fleet re-asks")
+	}
+	return exit.Named(exit.Capacity, "rental.no_fitting_sku",
+		"no rental SKU on offer fits %s: %s", req.Package, strings.Join(verdicts, "; ")).
+		WithRemedy("bind a lane that fits an offered machine (cozy package bind … --gpu <GPU>=<lane>), " +
+			"or override with model.<param>=org/model@release/lane")
+}
+
+// heldOrNothing renders what the fleet DID hold beside an empty catalog, so the reader
+// can tell "we own nothing" from "we own two machines and none of them could take it".
+func heldOrNothing(verdicts []string) string {
+	if len(verdicts) == 0 {
+		return "and this fleet holds no machine of its own"
+	}
+	return "and the machines it holds are " + strings.Join(verdicts, "; ")
+}
+
+// IdleAttached is the index of an open candidate the fleet ALREADY HOLDS with nothing
+// ahead of it, or -1 — the tier's own order among those, so the choice stays the
+// decision's and not an accident of row order.
+//
+// It is asked instead of reading the tier's overall winner when some machine is still
+// coming up (cl-185). A tier may score a purchase above an attached pod; buying, or
+// waiting, past a machine this fleet has already paid for and left idle is what cl-132
+// and cl-174 forbid, and reading the winner alone let it happen whenever the arithmetic
+// came out that way.
+func IdleAttached(tier string, candidates []orchestrator.PlacementCandidate) int {
+	best := -1
+	for i := range candidates {
+		c := candidates[i]
+		if c.Verdict != "" || !c.Attached() || c.Ahead > 0 {
+			continue
+		}
+		switch {
+		case best < 0:
+		case c.Measured != candidates[best].Measured:
+			if !c.Measured {
+				continue
+			}
+		case !prefers(tier, c, candidates[best]):
+			continue
+		}
+		best = i
+	}
+	return best
 }
 
 // Wait closes the record on a decision to wait for `attaching`: every candidate still

@@ -136,7 +136,8 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	if columns := columnNames(t, db, "rentals"); !columns["failure_code"] ||
 		!columns["failure_image_digest"] || !columns["failure_provider_resource_id"] ||
-		!columns["failure_provider_host_id"] || !columns["failure_container_state"] {
+		!columns["failure_provider_host_id"] || !columns["failure_container_state"] ||
+		!columns["accelerator_count"] {
 		t.Fatalf("rental failure columns after migration = %v", columns)
 	}
 	var tables int
@@ -170,6 +171,13 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	if problem != nil || rented == nil || rented.State != "ready" || rented.ReadyAt != "" ||
 		rented.MachineName != "quiet-heron-0000000000000011" {
 		t.Fatalf("rental after migration = %+v, %v", rented, problem)
+	}
+	// Schema 33: the retained rental states its WIDTH. Every rental bought before that
+	// schema was one card wide — no wider product could be expressed by the Creator that
+	// bought it, let alone attached — so 1 is a fact about this row, not a placeholder.
+	if rented.AcceleratorCount != 1 {
+		t.Fatalf("rental width after migration = %d, want the one card it was bought as",
+			rented.AcceleratorCount)
 	}
 }
 

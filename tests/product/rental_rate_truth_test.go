@@ -35,7 +35,7 @@ func TestRentalListingAdoptsTheHubBilledRate(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	fatal(t, store.RecordRental(records.Rental{
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 		ID: "pr-redarm", MachineName: "twine", SKU: "gpu-cu130",
 		AcceleratorModel: "NVIDIA GeForce RTX 3090", HourlyRateUSDMicros: 500_000,
 		State: "ready", Hub: hubURL,
@@ -141,7 +141,7 @@ func TestRentalListingShowsStructuredBootFailure(t *testing.T) {
 
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
-	fatal(t, store.RecordRental(records.Rental{
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 		ID: "pr-boot-failed", MachineName: "yuzuriha", SKU: "gpu-cu130",
 		AcceleratorModel: "L4", HourlyRateUSDMicros: 100_000,
 		State: "booting", Hub: hubURL,
@@ -201,7 +201,7 @@ func TestRentalListingShowsStructuredBootFailure(t *testing.T) {
 	hubServer.rent = func(request map[string]any) map[string]any {
 		return map[string]any{
 			"rental_id": "pr-new-boot-failed", "name": request["name"], "state": "failed",
-			"requested_accelerator_model": "NVIDIA L4", "hourly_rate_usd_micros": 100_000,
+			"requested_accelerator_model": "NVIDIA L4", "accelerator_count": 1, "hourly_rate_usd_micros": 100_000,
 			"detail": "container_exited_before_readiness",
 			"failure": map[string]any{"code": "container_exited_before_readiness",
 				"base_worker_image_digest": "sha256:" + strings.Repeat("a", 64),

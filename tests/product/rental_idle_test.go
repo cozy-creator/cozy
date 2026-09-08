@@ -44,7 +44,7 @@ func TestRentalIdleRelease(t *testing.T) {
 	plant := func(id, machine string) {
 		t.Helper()
 		hub.add(id, machine)
-		fatal(t, store.RecordRental(records.Rental{
+		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 			ID: id, MachineName: machine, SKU: "cpu", AcceleratorModel: "CPU",
 			HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL,
 			Address: "127.0.0.1:1", CertPath: filepath.Join(root, id+".pem"),
@@ -102,7 +102,7 @@ func TestRentalIdleRelease(t *testing.T) {
 	// it was ready: Spent saw a managed rental with no settled attempt and reaped a
 	// healthy pod its buyer was still waiting for (observed live, pr-b192da1a).
 	hub.add("rental-idle-owed", "curlew")
-	fatal(t, store.RecordRental(records.Rental{
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 		ID: "rental-idle-owed", MachineName: "curlew", SKU: "cpu", AcceleratorModel: "CPU",
 		HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL,
 		Address: "127.0.0.1:1", CertPath: filepath.Join(root, "rental-idle-owed.pem"),
@@ -320,7 +320,7 @@ func (h *fakeRentalHub) add(id, machine string) {
 	defer h.mu.Unlock()
 	h.rentals[id] = map[string]any{
 		"rental_id": id, "name": machine, "state": "ready",
-		"requested_accelerator_model": "CPU", "hourly_rate_usd_micros": 100_000,
+		"requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 100_000,
 	}
 }
 

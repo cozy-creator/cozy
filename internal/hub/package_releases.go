@@ -255,12 +255,19 @@ func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string) 
 // the ONE source: `cozy package bind` is its only writer and nothing reads a package.toml
 // binding at install or run time.
 type PackageBindingRow struct {
-	Slot      string        `json:"slot"`
-	Model     string        `json:"model"`
-	Release   string        `json:"release"`
-	Ladder    []BindingRung `json:"ladder"`
-	Revision  int64         `json:"revision"`
-	UpdatedAt string        `json:"updated_at"`
+	Slot     string        `json:"slot"`
+	Model    string        `json:"model"`
+	Release  string        `json:"release"`
+	Ladder   []BindingRung `json:"ladder"`
+	Revision int64         `json:"revision"`
+	// Orphaned is the hub saying the package's latest published interface declares no
+	// slot of this path (cl-184). `cozy package bind` checks the slot against that
+	// interface before it writes, so a row cannot be born orphaned — it becomes one when
+	// a release renames the slot under it, and the ladder then stops moving while still
+	// resolving. paul/minimax-h3 carried two such rows for a two-slot interface and
+	// nothing distinguished them from the live pair.
+	Orphaned  bool   `json:"orphaned"`
+	UpdatedAt string `json:"updated_at"`
 }
 
 // BindingRung pairs an accelerator pattern with the lane that fits it. GPU is matched as

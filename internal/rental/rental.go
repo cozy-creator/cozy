@@ -292,7 +292,16 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 			// as a launch grant from whoever provisioned it.
 			spec.Media = &media.Spec{Addr: row.MediaAddress, Token: token, CACert: cert}
 		}
-		return &orchestrator.RemoteTarget{Connection: spec}, nil
+		// THE WIDTH TRAVELS WITH THE DIAL IDENTITY. It is the paid `accelerator_count`,
+		// spelled as the device envelope the pod's worker holds, and a CPU rental holds
+		// none. Everything downstream — the lane breach check, the decision log's device
+		// names, the device pin this owner authors — reads it from here, so there is one
+		// place the width of a machine is decided and it is the record of what was bought.
+		devices := orchestrator.RentalDeviceEnvelope(row.AcceleratorCount)
+		if records.CPUAccelerator(row.AcceleratorModel) {
+			devices = nil
+		}
+		return &orchestrator.RemoteTarget{Connection: spec, Devices: devices}, nil
 	}
 }
 

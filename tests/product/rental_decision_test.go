@@ -31,7 +31,7 @@ const (
 // `cozy rental new rtx-a4000` succeeded and acquired `cisqua`.
 func marketWithA4000() []hub.RentalSKU {
 	return append(marketWithoutA4000(), hub.RentalSKU{
-		Name: "rtx-a4000", AcceleratorModel: "NVIDIA RTX A4000",
+		Name: "rtx-a4000", AcceleratorModel: "NVIDIA RTX A4000", AcceleratorCount: 1,
 		PriceUSDMicrosPerHour: 250_000, StorageUSDMicrosPerHour: 213_504,
 		BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"})
 }
@@ -41,13 +41,13 @@ func marketWithA4000() []hub.RentalSKU {
 // were bought inside that window.
 func marketWithoutA4000() []hub.RentalSKU {
 	return []hub.RentalSKU{
-		{Name: "rtx-4090", AcceleratorModel: "NVIDIA GeForce RTX 4090",
+		{Name: "rtx-4090", AcceleratorModel: "NVIDIA GeForce RTX 4090", AcceleratorCount: 1,
 			PriceUSDMicrosPerHour: 740_000, StorageUSDMicrosPerHour: 213_504,
 			BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"},
-		{Name: "rtx-5090", AcceleratorModel: "NVIDIA GeForce RTX 5090",
+		{Name: "rtx-5090", AcceleratorModel: "NVIDIA GeForce RTX 5090", AcceleratorCount: 1,
 			PriceUSDMicrosPerHour: 990_000, StorageUSDMicrosPerHour: 213_504,
 			BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"},
-		{Name: "cpu", AcceleratorModel: "CPU", PriceUSDMicrosPerHour: 70_000,
+		{Name: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, PriceUSDMicrosPerHour: 70_000,
 			BaseWorkerProfile: "python3.12-cpu-linux-x86"},
 	}
 }

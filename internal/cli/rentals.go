@@ -356,8 +356,9 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	}
 	row := records.Rental{
 		ID: remote.ID, MachineName: machineName, SKU: skuName,
-		AcceleratorModel: remote.AcceleratorModel, HourlyRateUSDMicros: remote.HourlyRateUSDMicros,
-		ManagedRequestID: managedRequestID, State: remote.State, Hub: c.Base(),
+		AcceleratorModel: remote.AcceleratorModel, AcceleratorCount: remote.AcceleratorCount,
+		HourlyRateUSDMicros: remote.HourlyRateUSDMicros,
+		ManagedRequestID:    managedRequestID, State: remote.State, Hub: c.Base(),
 	}
 	copyRentalFailure(&row, remote)
 	stored, problem := st.RentalRow(remote.ID)
@@ -460,8 +461,9 @@ func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
 		// components stay one --full away, where `gpu price` is the rate the accepted
 		// quote locks.
 		rows = append(rows, map[string]string{
-			"name": sku.Name, "gpu": acceleratorName(sku.AcceleratorModel),
+			"name": sku.Name, "gpu": acceleratorLabel(sku.AcceleratorModel, sku.AcceleratorCount),
 			"accelerator model": sku.AcceleratorModel,
+			"accelerator count": strconv.Itoa(sku.AcceleratorCount),
 			"compute":           computeCapabilityText(sku.ComputeCapability),
 			"vram":              fmt.Sprintf("%d GB", sku.VRAMGB),
 			"gpu price":         rentalPrice(sku.PriceUSDMicrosPerHour),
@@ -472,12 +474,25 @@ func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
 	doc := output.List{
 		Name:   "gpus",
 		Fields: []string{"name", "gpu", "compute", "vram", "price"},
-		AllFields: []string{"name", "gpu", "accelerator model", "compute", "vram",
-			"gpu price", "storage price", "price"},
+		AllFields: []string{"name", "gpu", "accelerator model", "accelerator count", "compute",
+			"vram", "gpu price", "storage price", "price"},
 		Rows: rows, Total: len(rows),
 		Next: []string{"cozy rental new <gpu-name>"},
 	}
 	return emit(ctx, doc)
+}
+
+// acceleratorLabel is how a machine READS in the GPU column: its card, and — because a
+// product is sold at a WIDTH — how many of them one rental delivers. The width belongs
+// beside the card rather than in a column of its own: `4x NVIDIA H100 80GB HBM3` is one
+// machine with four cards, and the VRAM figure next to it stays the ONE-CARD figure,
+// which is the number that decides fit (every rank of a group holds the full weights).
+func acceleratorLabel(model string, count int) string {
+	name := acceleratorName(model)
+	if count > 1 {
+		return fmt.Sprintf("%dx %s", count, name)
+	}
+	return name
 }
 
 // acceleratorName is how a provider accelerator id READS in the GPU column. The id
@@ -774,7 +789,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		TypedFields: []string{"machine", "sku", "state", "rental_id", "rented_at",
 			"running", "queued", "idle_s", "release_due_at"},
 		TypedAllFields: []string{"machine", "sku", "state", "rental_id", "bought_for",
-			"accelerator", "address", "media_address", "hub", "rented_at", "ready_at",
+			"accelerator", "accelerator_count", "address", "media_address", "hub", "rented_at", "ready_at",
 			"running", "queued", "idle_s", "idle_since_at", "release_due_at",
 			"hourly_rate_usd_micros", "failure_code", "base_worker_image_digest",
 			"provider", "provider_resource_id", "provider_host_id", "provider_state",
@@ -804,8 +819,9 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			"running": strconv.Itoa(idle.Running), "queued": strconv.Itoa(idle.Queued),
 			"idle":   idleCell(idle, grace),
 			"rental": r.ID, "bought for": orNone(boughtFor[r.ID]),
-			"accelerator": r.AcceleratorModel, "address": r.Address,
-			"media": r.MediaAddress, "hub": r.Hub,
+			"accelerator": acceleratorLabel(r.AcceleratorModel, r.AcceleratorCount),
+			"address":     r.Address,
+			"media":       r.MediaAddress, "hub": r.Hub,
 			"rented": stamp(r.RentedAt), "ready": orNone(stamp(r.ReadyAt)),
 			"idle_since": idleSince, "release_due": releaseDue,
 			"image": r.Failure.BaseWorkerImageDigest, "provider": r.Failure.Provider,
@@ -816,6 +832,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			"machine": r.MachineName, "state": r.State, "rental_id": r.ID,
 			"running": idle.Running, "queued": idle.Queued,
 			"hourly_rate_usd_micros": r.HourlyRateUSDMicros,
+			"accelerator_count":      r.AcceleratorCount,
 		}
 		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
 			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub,

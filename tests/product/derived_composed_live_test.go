@@ -150,7 +150,7 @@ func composedScheduledDerivedCheckpointCustody(t *testing.T, fault string) {
 	o := hostOwner(t, "derived-composed-"+records.NewID("proof"), configure)
 	// The isolated rental adapter has no provider. Persist its test rental just
 	// like the existing rental product fixtures so normal startup can reattach it.
-	fatal(t, o.store.RecordRental(records.Rental{ID: podRental, MachineName: "derived-proof", SKU: "cpu",
+	fatal(t, o.store.RecordRental(records.Rental{AcceleratorCount: 1, ID: podRental, MachineName: "derived-proof", SKU: "cpu",
 		AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, State: "ready", Hub: *publicationHub,
 		Address: bridge.Address, CertPath: certificate}))
 	scaleMarker := records.NewID("scale")

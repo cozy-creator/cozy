@@ -245,6 +245,7 @@ func TestOperationLookupSchemaUpgradePreservesRequests(t *testing.T) {
 		_, err = db.Exec(`DROP TABLE ` + table)
 		must(t, err)
 	}
+	revertRentalsBeforeWidth(t, db)
 	_, err = db.Exec(`ALTER TABLE requests DROP COLUMN capture`)
 	must(t, err)
 	_, err = db.Exec(`PRAGMA user_version=28`)

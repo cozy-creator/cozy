@@ -29,10 +29,10 @@ const fp8Lane = "fp8-adaln-pruned"
 // H100 SXM $3.52/h, RTX 5090 $0.99/h.
 func exampleMarket() []hub.RentalSKU {
 	return []hub.RentalSKU{
-		{Name: "h100-sxm5-80gb", AcceleratorModel: "NVIDIA H100 80GB HBM3", VRAMGB: 80, ComputeCapability: "9.0",
+		{Name: "h100-sxm5-80gb", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 1, VRAMGB: 80, ComputeCapability: "9.0",
 			MinimumRAMPerGPUGB: 64, PriceUSDMicrosPerHour: 3_306_496, StorageUSDMicrosPerHour: 213_504,
 			BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"},
-		{Name: "rtx-5090", AcceleratorModel: "NVIDIA GeForce RTX 5090", VRAMGB: 32, ComputeCapability: "12.0",
+		{Name: "rtx-5090", AcceleratorModel: "NVIDIA GeForce RTX 5090", AcceleratorCount: 1, VRAMGB: 32, ComputeCapability: "12.0",
 			MinimumRAMPerGPUGB: 64, PriceUSDMicrosPerHour: 776_496, StorageUSDMicrosPerHour: 213_504,
 			BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"},
 	}
@@ -176,7 +176,7 @@ func TestPlacementReusesTheMeasuredCard(t *testing.T) {
 	must(t, os.WriteFile(cert, []byte("fixture"), 0600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
-	seed := records.Rental{ID: "pr-morgiana", MachineName: "morgiana", SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3",
+	seed := records.Rental{AcceleratorCount: 1, ID: "pr-morgiana", MachineName: "morgiana", SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3",
 		HourlyRateUSDMicros: 2_490_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL}
 	fatal(t, store.RecordRental(seed))
 	h.addReady(seed.ID, seed.MachineName, seed.AcceleratorModel, seed.HourlyRateUSDMicros)

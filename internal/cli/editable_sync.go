@@ -383,7 +383,7 @@ func (s *editableSync) reprepare(pkg string, snapshot *EditableSnapshot, install
 			}
 			instance, change, problem := s.owner.EnsureWorker(spec)
 			if problem == nil && len(spec.Placement.Entrypoints) > 0 {
-				problem = s.owner.EnsurePlacementReady(instance, spec.Placement.Entrypoints[0].Digest)
+				problem = s.owner.EnsurePlacementReady(instance, spec.Placement.Entrypoints[0].Digest, "")
 			}
 			if problem != nil {
 				fmt.Fprintf(s.log, "editable %s: local worker not re-prepared (%s); the next run starts it\n",

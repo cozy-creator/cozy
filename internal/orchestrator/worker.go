@@ -243,21 +243,31 @@ type WorkerConnection struct {
 	Media *media.Spec `json:"media,omitempty"`
 }
 
-// RemoteTarget is only the dial identity for generic rented capacity. Desired
-// package/model state is a later Creator-to-worker command.
+// RemoteTarget is the dial identity for generic rented capacity, and the WIDTH that
+// identity was paid for. Desired package/model state is a later Creator-to-worker command.
 type RemoteTarget struct {
 	Connection *WorkerConnection
+	// Devices is the pod's device envelope: RentalDeviceEnvelope over the rental's paid
+	// accelerator count, empty for a CPU pod. It travels with the dial identity because a
+	// rental's width is a property of the machine, settled when it was bought, and every
+	// later reader — the lane breach check, the decision log's device names, the device
+	// pin this owner authors — is reading one fact and must read the same one.
+	Devices []string
 }
 
 // WorkerLaunchSpec is everything this owner needs to make one worker exist and host one
 // placement. The caller (cl-010's `start`, or cl-001's live driver) resolves it from the
 // install; the orchestrator itself resolves nothing about Python.
 type WorkerLaunchSpec struct {
-	Python            string   `json:"python"` // package-independent control Runtime
-	Args              []string `json:"args"`
-	Dir               string   `json:"dir"`
-	Imposed           []string `json:"imposed"` // exact env values the launcher imposes, never inherited
-	Devices           []string `json:"devices"` // the device envelope this process may SEE
+	Python  string   `json:"python"` // package-independent control Runtime
+	Args    []string `json:"args"`
+	Dir     string   `json:"dir"`
+	Imposed []string `json:"imposed"` // exact env values the launcher imposes, never inherited
+	// Devices is the device envelope this worker holds: for a spawned worker the names on
+	// its own `--devices` line, which this daemon GRANTS and arbitrates; for an attached
+	// rental the pod's paid width, which this daemon only reads. Lane ordinals are
+	// positions in it, and its length is the placement's device-group degree.
+	Devices           []string `json:"devices"`
 	GraceSec          float64  `json:"grace_sec"`
 	ArtifactCache     string   `json:"artifact_cache,omitempty"`
 	InstallRoot       string   `json:"install_root,omitempty"`
@@ -964,7 +974,7 @@ func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *e
 	if already {
 		return instance, "", ChangeNone, c.ensureWorkerClaimed(instance)
 	}
-	spec := WorkerLaunchSpec{Connection: target.Connection}
+	spec := WorkerLaunchSpec{Connection: target.Connection, Devices: target.Devices}
 	instance, change, problem := c.EnsureWorker(spec)
 	if problem == nil {
 		problem = c.ensureWorkerClaimed(instance)
@@ -1632,7 +1642,20 @@ func (w *worker) jobExecutorRefusal(r *pb.ObservedWorkerState) *exit.Error {
 // had gone wrong. Every way this can actually fail is already visible: the worker EXITS,
 // reports a FAILED axis, or its process/stream exits. A worker that is materializing is none
 // of those, however long it takes.
-func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Error {
+//
+// `requestID` is the request this wait exists FOR, and the wait ends when it does (cl-186).
+// That is not a timeout — it is the observation that the only reason to keep waiting has
+// gone. Without it a wedged preparation held `starting[slot]` forever: the request could be
+// cancelled and the loop went on spinning, every later request for the slot returned early
+// from selectOrStart and parked on "no attached rental has a DISPATCHABLE placement", and
+// the only recovery anyone found was `cozy rental end`. Two H100s were surrendered that way
+// on 2026-09-08. The guard two paragraphs down already refuses one particular version of
+// this wedge (`plan_not_staged`) and says so in those words; this is the general case.
+//
+// An empty `requestID` is a wait no request owns — `cozy install --sync`'s foreground
+// relaunch, which the operator interrupts directly.
+func (c *Orchestrator) EnsurePlacementReady(instanceID, planID, requestID string) *exit.Error {
+	settledCheck := time.Time{}
 	for {
 		c.mu.Lock()
 		w := c.workers[instanceID]
@@ -1667,6 +1690,20 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 		}
 		if desiredRefusal != nil {
 			return desiredRefusal
+		}
+		// THE WAIT ENDS WHEN ITS REQUEST DOES (cl-186), and it is asked here — after
+		// readiness and after this owner's own verdicts, so a placement that became
+		// dispatchable still wins and a real refusal is still the answer. The durable row
+		// is read on entry and then no oftener than the fact can usefully change; the
+		// loop's 20 ms cadence is for in-memory observations, not for SQLite.
+		if requestID != "" && time.Since(settledCheck) >= time.Second {
+			settledCheck = time.Now()
+			if row, problem := c.opt.Store.RequestRow(requestID); problem == nil &&
+				(row == nil || records.Settled(row.State)) {
+				return exit.Named(exit.Canceled, "request.settled_while_preparing",
+					"request %s settled while worker %s was still preparing %s; the wait it "+
+						"started is over", requestID, instanceID, planID)
+			}
 		}
 		// A PLAN THE LAUNCHER NEVER STAGED CAN NEVER BECOME DISPATCHABLE (cl-022's
 		// corollary guard). The live case: submit, then an install --force moves the
