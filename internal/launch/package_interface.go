@@ -89,8 +89,8 @@ type WeightsOutput struct {
 
 // Slot is one declared model binding path — capability, never selection. Its members
 // mirror cozy-runtime's `internal/package_interface.py` slot (cr-078a): `{class, component_use,
-// path}` plus the class's one keyword `encoded_leaves` and an optional `sequence_parallel`
-// document. `stamps` is a RETIRED member: every release published before the cut ships an
+// path}` plus the class's two closed consents `encoded_leaves` and `fusion` (h3a-015) and an
+// optional `sequence_parallel` document. `stamps` is a RETIRED member: every release published before the cut ships an
 // empty map, which reads as nothing declared, and a value in it refuses by name below.
 type Slot struct {
 	Class            string              `json:"class"`
@@ -98,6 +98,7 @@ type Slot struct {
 	Param            string              `json:"-"`
 	ComponentUse     map[string][]string `json:"component_use"`
 	EncodedLeaves    string              `json:"encoded_leaves,omitempty"`
+	Fusion           string              `json:"fusion,omitempty"`
 	SequenceParallel json.RawMessage     `json:"sequence_parallel,omitempty"`
 }
 
@@ -237,14 +238,16 @@ func validateClosedPackageInterface(data []byte) error {
 				for _, slot := range slots {
 					members, err := exactKeys(slot,
 						[]string{"class", "component_use", "path"},
-						[]string{"encoded_leaves", "sequence_parallel"})
+						[]string{"encoded_leaves", "fusion", "sequence_parallel"})
 					if err != nil {
 						return err
 					}
-					if leaves, ok := members["encoded_leaves"]; ok {
-						var value string
-						if json.Unmarshal(leaves, &value) != nil || (value != "refuse" && value != "accept") {
-							return fmt.Errorf("encoded_leaves must be \"refuse\" or \"accept\"")
+					for _, consent := range []string{"encoded_leaves", "fusion"} {
+						if raw, ok := members[consent]; ok {
+							var value string
+							if json.Unmarshal(raw, &value) != nil || (value != "refuse" && value != "accept") {
+								return fmt.Errorf("%s must be \"refuse\" or \"accept\"", consent)
+							}
 						}
 					}
 				}

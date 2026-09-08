@@ -2,7 +2,6 @@ package install
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -50,11 +49,9 @@ func hasWeightlessCallable(packageInterface *launch.PackageInterface) bool {
 	return false
 }
 
-// preparePublished materializes the release's complete frozen uv environment, asks THIS host's
-// Runtime for a static reading of the module that environment now holds, compares the reading
-// with the committed publication interface, and asks the same host Runtime to admit the
-// environment and author its resident placement. The environment's own Runtime is never asked
-// to describe: the release pins it, and an older one described a package by importing it.
+// preparePublished materializes the release's complete frozen uv environment and asks THIS
+// host's Runtime to admit it and author its resident placement. The surface is READ from the
+// release's own committed package interface; nothing here re-derives it.
 func preparePublished(l home.Layout, installDir string, published *PublishedSource) (
 	*launch.PackageInterface, ExactDocument, string, *EnvironmentReceipt, *exit.Error,
 ) {
@@ -96,14 +93,20 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 			"the published package environment provides no cozy-runtime").
 			WithRemedy("declare cozy-runtime in pyproject.toml and refresh uv.lock")
 	}
-	packageInterface, problem := describePublished(venvDir, sourceDir,
-		published.Selection.PackageInterface)
-	if problem != nil {
-		if published.ReportDefect != nil && problem.Name == "package_interface_mismatch" {
-			published.ReportDefect("package_prepare_interface_disagrees",
-				"local describe derived a different package interface than the committed release")
-		}
-		return nil, empty, "", nil, problem
+	// DECISION #713: the publisher derives the interface and the committed document is the
+	// truth. An install has no module tree to re-derive it from — `source/` holds
+	// package.toml, pyproject.toml and uv.lock, nothing else — and re-deriving buys nothing:
+	// the interface is not a security boundary (Runtime re-enforces every declared bound,
+	// slot and component use at execution), and `cozy package publish` already refuses a
+	// release whose own static describe disagrees with the document it commits. Asking the
+	// environment's Runtime to describe here is what made every 0.5.2+ install fail
+	// ("static_module: module 'h3_tables.job' is not a file under .../source"), and before
+	// 0.5.2 it answered by IMPORTING the package, which #713 forbids outright.
+	packageInterface, problem := launch.DecodePackageInterface(
+		published.Selection.PackageInterface.Bytes)
+	if problem != nil || packageInterface.Digest != published.Selection.PackageInterface.Digest {
+		return nil, empty, "", nil, exit.Named(exit.Structural, "package_interface_invalid",
+			"the release commits an invalid package interface")
 	}
 	deferredModels := len(published.Models) == 0 && hasServingModelSlots(packageInterface)
 	if deferredModels && !hasWeightlessCallable(packageInterface) {
@@ -146,29 +149,6 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 	// The placement binds the release's locked-requirements export; the local environment
 	// receipt above records the complete frozen closure this machine runs.
 	return packageInterface, answer.PlacementSet, runtimeBin, environment, nil
-}
-
-// describePublished is the install-time reading of the release's surface (cl-175): THIS host's
-// Runtime parses the module the venv holds — resolved through the venv's interpreter, never
-// imported — and Creator compares the reading with the committed release interface.
-func describePublished(venvDir, sourceDir string, committed ExactDocument) (
-	*launch.PackageInterface, *exit.Error,
-) {
-	raw, problem := hostruntime.Describe(context.Background(), config.Frozen().Tool(), sourceDir,
-		"--environment-python", home.VenvPython(venvDir))
-	if problem != nil {
-		return nil, problem
-	}
-	if !bytes.Equal(raw, committed.Bytes) {
-		return nil, exit.Named(exit.Conflict, "package_interface_mismatch",
-			"the installed package describes a different callable surface than its committed release")
-	}
-	packageInterface, problem := launch.DecodePackageInterface(raw)
-	if problem != nil || packageInterface.Digest != committed.Digest {
-		return nil, exit.Named(exit.Structural, "package_interface_invalid",
-			"cozy-runtime returned an invalid installed package interface")
-	}
-	return packageInterface, nil
 }
 
 // PreparePublishedSelection turns one installed code/environment tree plus exact
