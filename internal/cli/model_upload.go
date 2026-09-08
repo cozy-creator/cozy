@@ -348,6 +348,20 @@ func canonicalProductionSource(ctx *Context, raw string) (string, *exit.Error) {
 		_, problem := modelsource.Parse(raw, cwd)
 		return "", problem
 	}
+	if strings.Contains(raw, "#") {
+		model, release, lane, manifest, problem := parseModelRef(raw)
+		if problem != nil {
+			return "", problem
+		}
+		if release == "" {
+			return model + "@" + manifest, nil
+		}
+		selected := model + "@" + release
+		if lane != "" {
+			selected += "/" + lane
+		}
+		return selected + "#" + manifest, nil
+	}
 	name, release, pinned := strings.Cut(raw, "@")
 	if !pinned || strings.TrimSpace(release) == "" {
 		return "", exit.Usagef("model transfer source %q is not pinned to one Tensorhub release", raw).
@@ -469,15 +483,36 @@ func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (pu
 	}
 	hctx, cancel := hub.LongContext()
 	defer cancel()
-	resolved, problem := client(ctx).ResolveModel(hctx, raw, lane)
+	refspec := raw
+	if strings.Contains(raw, "#") {
+		model, release, selectedLane, manifest, problem := parseModelRef(raw)
+		if problem != nil {
+			return publishSource{}, problem
+		}
+		if selectedLane != "" {
+			if lane != "" && lane != selectedLane {
+				return publishSource{}, exit.Usagef("model reference and selected lane disagree")
+			}
+			lane = selectedLane
+		}
+		refspec = model + "@" + manifest
+		if release != "" {
+			refspec = model + "@" + release + "@" + manifest
+		}
+	}
+	resolved, problem := client(ctx).ResolveModel(hctx, refspec, lane)
 	if problem != nil {
 		return publishSource{}, problem
 	}
-	if resolved.Release == "" || resolved.Lane == "" || resolved.ManifestID == "" {
+	if (resolved.Release == "") != (resolved.Lane == "") || resolved.ManifestID == "" {
 		return publishSource{}, exit.Named(exit.Structural, "model_source_resolution_incomplete",
-			"Tensorhub did not resolve one exact checkpoint from the model release lane")
+			"Tensorhub did not resolve one exact checkpoint")
 	}
-	return publishSource{Canonical: resolved.Model + "@" + resolved.Release,
+	selectedRef := resolved.Model + "@" + resolved.ManifestID
+	if resolved.Release != "" {
+		selectedRef = resolved.Model + "@" + resolved.Release
+	}
+	return publishSource{Canonical: selectedRef,
 		Selection: resolved.ManifestID, Lane: resolved.Lane,
 		Files: resolved.Objects, Bytes: resolved.Bytes}, nil
 }

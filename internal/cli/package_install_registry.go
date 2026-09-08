@@ -305,7 +305,23 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 	if problem != nil {
 		return empty, problem
 	}
-	fetch := &transfer.Fetch{Tool: tool, Hub: hubClient, Spec: spec, Lane: lane,
+	modelName, release, selectedLane, manifestPin, problem := parseModelRef(spec)
+	if problem != nil {
+		return empty, problem
+	}
+	if selectedLane != "" {
+		if lane != "" && lane != selectedLane {
+			return empty, exit.Usagef("model reference and selected lane disagree")
+		}
+		lane = selectedLane
+	}
+	refspec := modelName
+	if release != "" {
+		refspec += "@" + release
+	} else if manifestPin != "" {
+		refspec += "@" + manifestPin
+	}
+	fetch := &transfer.Fetch{Tool: tool, Hub: hubClient, Spec: refspec, Lane: lane,
 		Progress: progress(cli), Scratch: work, Locks: layout.AcquisitionLocks()}
 	resolved, problem := fetch.Resolve(ctx)
 	if problem != nil {
@@ -316,13 +332,16 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 	if problem := requireCheckpointComponents(spec, slot, resolved.Components); problem != nil {
 		return empty, problem
 	}
+	if manifestPin != "" && resolved.ManifestID != manifestPin {
+		return empty, exit.Named(exit.Conflict, "model_resolution_changed", "resolved model differs from its checkpoint pin")
+	}
 	fetched, problem := fetch.Acquire(ctx, resolved)
 	if problem != nil {
 		return empty, problem
 	}
 	manifest, err := canonical.Raw(fetched.ManifestID)
 	if err != nil || len(manifest) != 32 || fetched.ManifestLength <= 0 ||
-		fetched.Release == "" || fetched.Lane == "" || fetch.Ref.String() == "/" {
+		(fetched.Release == "") != (fetched.Lane == "") || fetch.Ref.String() == "/" {
 		return empty, exit.Named(exit.Structural, "model_download_result_invalid",
 			"model acquisition returned an incomplete exact selection for package slot %s", slot.Path)
 	}
@@ -353,6 +372,26 @@ func exactLocalModel(tool *tfs.Tool, spec, lane, work string) (
 	var empty localModelSelection
 	modelRelease, manifest, hasManifest := strings.Cut(strings.TrimSpace(spec), "#")
 	modelName, release, hasRelease := strings.Cut(modelRelease, "@")
+	if !hasRelease && hasManifest && lane == "" {
+		ref, problem := hub.ParseRef(modelName)
+		if problem != nil {
+			return empty, false, problem
+		}
+		if raw, err := canonical.Raw(manifest); err != nil || len(raw) != 32 {
+			return empty, false, exit.Usagef("%q is not an exact model Manifest", manifest)
+		}
+		if err := os.MkdirAll(work, 0o700); err != nil {
+			return empty, false, exit.Internalf("cannot create model lookup scratch: %s", err)
+		}
+		length, problem := tool.RetainedCheckpoint(ref.Org, ref.Name, manifest, work)
+		if problem != nil || length == 0 {
+			return empty, false, problem
+		}
+		if problem := tool.VerifyManifest(manifest); problem != nil {
+			return empty, false, problem
+		}
+		return localModelSelection{Model: ref.String(), Manifest: manifest, ManifestLength: length}, true, nil
+	}
 	if !hasRelease || release == "" || hasManifest && manifest == "" {
 		return empty, false, nil
 	}

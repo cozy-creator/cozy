@@ -478,9 +478,8 @@ func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstal
 
 func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw, wantedLane string,
 	binding *hub.PackageBindingRow) (orchestrator.ModelRef, *exit.Error) {
-	// A caller may narrow by Manifest spelling, but cannot introduce one: the Hub-authored
-	// release card below must contain it in an exact lane before it enters request identity
-	// or a signed worker download delegation. No caller bytes or local path are trusted.
+	// Exact checkpoint inputs use Hub-owned facts; named selections use the release
+	// card. Both freeze a verified repository/manifest identity before preparation.
 	var empty orchestrator.ModelRef
 	modelName, release, refLane, manifest, problem := parseModelRef(raw)
 	if problem != nil {
@@ -502,6 +501,27 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
+	if manifest != "" && release == "" {
+		if wantedLane != "" {
+			return empty, exit.Usagef("a checkpoint digest without a release cannot select a lane")
+		}
+		resolved, problem := client(ctx).ResolveModel(hctx, ref.String()+"@"+manifest, "")
+		if problem != nil {
+			return empty, problem
+		}
+		if resolved.Model != ref.String() || resolved.ManifestID != manifest ||
+			resolved.ManifestLength <= 0 || resolved.Bytes <= 0 {
+			return empty, exit.Named(exit.Conflict, "rental.model_resolution_changed",
+				"Tensorhub returned different or incomplete checkpoint facts for %s", raw)
+		}
+		if problem := requireCheckpointComponents(raw, slot, resolved.Components); problem != nil {
+			return empty, problem
+		}
+		return orchestrator.ModelRef{Package: packageName, Slot: slot.Path,
+			Model: ref.String(), Manifest: manifest, HubCheckpoint: true,
+			ManifestLength: resolved.ManifestLength, Bytes: resolved.Bytes,
+			ComponentBytes: resolved.ComponentBytes, ComponentUse: slot.ComponentUse}, nil
+	}
 	_, selected, problem := modelReleaseCard(hctx, client(ctx), ref, release)
 	if problem != nil {
 		return empty, problem
