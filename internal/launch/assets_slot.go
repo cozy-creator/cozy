@@ -3,6 +3,7 @@ package launch
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -43,24 +44,9 @@ func validateAssetsSlot(raw, request json.RawMessage) error {
 		if field.Name != slot.Parameter {
 			continue
 		}
-		var kind struct {
-			List Struct `json:"list"`
-		}
-		if json.Unmarshal(field.Type, &kind) != nil || len(kind.List.Fields) != 2 {
-			return fmt.Errorf("assets parameter must name a list of asset/label records")
-		}
-		asset, label := false, false
-		for _, item := range kind.List.Fields {
-			var typ any
-			_ = json.Unmarshal(item.Type, &typ)
-			if object, ok := typ.(map[string]any); ok && item.Name == "asset" && len(object) == 1 && object["asset"] == "file" {
-				asset = true
-			}
-			if item.Name == "label" && typ == "str" && item.Wire == "optional" {
-				label = true
-			}
-		}
-		if !asset || !label {
+		var expected, actual any
+		_ = json.Unmarshal([]byte(`{"list":{"fields":[{"name":"asset","type":{"asset":"file"}},{"name":"label","type":"str","wire":"optional"}]}}`), &expected)
+		if json.Unmarshal(field.Type, &actual) != nil || !reflect.DeepEqual(actual, expected) {
 			return fmt.Errorf("assets parameter must name a list of asset/label records")
 		}
 		matches++
