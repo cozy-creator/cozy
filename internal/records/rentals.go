@@ -490,6 +490,23 @@ func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 // RentalReadyState answers whether a hub state means the pod is booted and attachable.
 func RentalReadyState(state string) bool { return state == "ready" || state == "attached" }
 
+// rentalTerminalStates are the hub's words for a pod that will never take work again:
+// its acquisition failed, or the rental is being or has been given back. Every OTHER
+// word — the whole pre-ready lifecycle above, and any state this build does not yet
+// know — describes a machine that is, or may still be, on its way.
+//
+// The asymmetry is deliberate (cl-185). Refusing a placement needs PROOF that nothing
+// can ever fit; not holding proof that something WILL is a different statement, and
+// reading the second as the first is how a rental four minutes into its own boot came
+// to fail a run permanently while the pod it named went on to serve.
+var rentalTerminalStates = map[string]bool{
+	"failed": true, "release_requested": true, "released": true, "rejected": true,
+}
+
+// RentalTerminalState answers whether a hub state means the pod is finished, so a
+// request that would fit it must not wait for it.
+func RentalTerminalState(state string) bool { return rentalTerminalStates[state] }
+
 // RecordRental writes what the hub provisioned. It REPLACES on the rental id because the
 // id is the hub's, not this host's: re-reading a rental that moved from acquisition to
 // ready must land on the same row rather than accumulate one per poll. State only moves

@@ -332,12 +332,21 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 			// An idle attached rental is taken now; a buy, or a queue behind a busy one,
 			// is not chosen over the machine attaching: the request parks unpinned and
 			// goes to whichever is free first.
-			rental.Wait(decision.Candidates, w)
-			line, problem := m.lineLocked()
-			return decision, line, problem
+			//
+			// The idle machine is asked for by NAME, not read off the tier's winner
+			// (cl-185). A tier is free to score a purchase above a pod this fleet has
+			// already bought, attached and left idle; waiting on a third machine because
+			// of that arithmetic is the head-of-line shape cl-132 and cl-174 both forbid.
+			idle := rental.IdleAttached(decision.Tier, decision.Candidates)
+			if idle < 0 {
+				rental.Wait(decision.Candidates, w)
+				line, problem := m.lineLocked()
+				return decision, line, problem
+			}
+			i = idle
 		}
 		if i < 0 {
-			return decision, "", refusal(req, decision, capped)
+			return decision, "", rental.Refusal(req, decision, needsAccelerator, capped)
 		}
 		c := &decision.Candidates[i]
 		rentalID := c.Rental
@@ -398,40 +407,26 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hu
 		if offered {
 			c.RateUSDMicrosPerHour = sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour
 		}
-		reason, problem := m.standingLocked(row, needsAccelerator)
-		if problem != nil {
-			return nil, problem
-		}
-		switch {
-		case reason != "":
-			c.Verdict = orchestrator.VerdictExcluded + reason
-		default:
-			// A machine the user already has up is held to the same floor as a buy; the
-			// catalog's memory figure for its product is the fact (a product gone from
-			// the catalog this minute decides nothing).
-			rental.Size(&c, req.Models, row.AcceleratorModel, sku.VRAMGB, needsAccelerator && offered, req.IsJob())
-			if c.Verdict == "" {
-				// The machine's OWN width, not its product's: an attached rental is the
-				// authority on how many cards it has, and its SKU may have left the catalog.
-				c.Verdict = rental.WidthUnusable(row.AcceleratorCount, req.IsJob(), constraints)
-			}
-			if c.Verdict != "" {
-				break
-			}
-			if row.Address == "" || row.CertPath == "" {
-				// Ready, its worker not attached yet: a fitting machine the request waits
-				// for (cl-170), never one it buys around.
-				c.Verdict = orchestrator.VerdictAttaching
-				break
-			}
-			mode, held := m.owner.RentalStanding(row.ID, req.IsJob())
-			queued, _, problem := m.store.RentalRunCounts(row.ID)
+		// Everything decidable from the rental ROW is settled by the chooser, in the one
+		// order that keeps a transient state out of a permanent verdict (cl-185). What
+		// is left are the questions only this host can answer.
+		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints) {
+			reason, problem := m.standingLocked(row)
 			if problem != nil {
 				return nil, problem
 			}
-			c.Ahead = queued + held
-			if mode != "" {
-				c.Verdict = orchestrator.VerdictExcluded + mode
+			if reason != "" {
+				c.Verdict = orchestrator.VerdictExcluded + reason
+			} else {
+				mode, held := m.owner.RentalStanding(row.ID, req.IsJob())
+				queued, _, problem := m.store.RentalRunCounts(row.ID)
+				if problem != nil {
+					return nil, problem
+				}
+				c.Ahead = queued + held
+				if mode != "" {
+					c.Verdict = orchestrator.VerdictExcluded + mode
+				}
 			}
 		}
 		out = append(out, c)
@@ -439,14 +434,10 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hu
 	return out, nil
 }
 
-// standingLocked is the fleet-side reason a rental cannot take any new placement, or "".
-func (m *managedRentals) standingLocked(row records.Rental, needsAccelerator bool) (string, *exit.Error) {
-	switch {
-	case needsAccelerator && row.AcceleratorModel == "CPU":
-		return orchestrator.ExcludedWrongClass, nil
-	case row.State != hub.RentalReady && row.State != "attached":
-		return orchestrator.ExcludedNotReady, nil
-	}
+// standingLocked is the fleet-side reason an ATTACHED rental cannot take any new
+// placement, or "". Class, geometry and lifecycle are settled by the caller before this
+// is asked, so every answer here is a fact about what the pod is already holding.
+func (m *managedRentals) standingLocked(row records.Rental) (string, *exit.Error) {
 	retained, problem := m.store.RentalHasRetainedJob(row.ID)
 	if problem != nil {
 		return "", problem
@@ -534,45 +525,6 @@ func pinText(c orchestrator.PlacementCandidate) string {
 		return fmt.Sprintf("rung %d, %s", c.Rung, text)
 	}
 	return text
-}
-
-// refusal names why nothing could be placed, in the order a reader can act on: a
-// stock-out to retry, a spend cap to raise, a release no offered base image runs, a
-// ladder no offered machine fits — each with every candidate's verdict.
-func refusal(req records.Request, d orchestrator.PlacementDecision, capped *exit.Error) *exit.Error {
-	var noStock, verdicts []string
-	mismatch := ""
-	for _, c := range d.Candidates {
-		verdicts = append(verdicts, c.Name()+" "+c.Verdict)
-		if c.Verdict == orchestrator.VerdictNoStock {
-			noStock = append(noStock, c.SKU)
-		}
-		if reason, ok := strings.CutPrefix(c.Verdict,
-			orchestrator.VerdictExcluded+orchestrator.ExcludedBaseMismatch+": "); ok && mismatch == "" {
-			mismatch = c.SKU + ": " + reason
-		}
-	}
-	switch {
-	case len(noStock) > 0:
-		return exit.Named(exit.Capacity, "rental.no_inventory",
-			"every rental SKU fitting %s is out of stock right now (%s) — NOTHING was rented",
-			req.Package, strings.Join(noStock, ", ")).
-			WithRemedy("this is a stock-out, not a bad ladder: retry in a minute or two")
-	case capped != nil:
-		return capped
-	case mismatch != "":
-		// Refused BEFORE the paid ask, in the pod's own vocabulary. Publication stays
-		// base-independent: the release is published and simply unqualified here.
-		return exit.Named(exit.Unavailable, "rental.package_base_incompatible",
-			"no rentable machine can run %s@%s — %s", req.Package, req.Release, mismatch).
-			WithRemedy("publish a release whose requirements one of Tensorhub's offered base images satisfies")
-	case len(verdicts) == 0:
-		verdicts = []string{"the catalog offers no product of this class"}
-	}
-	return exit.Named(exit.Capacity, "rental.no_fitting_sku",
-		"no rental SKU on offer fits %s: %s", req.Package, strings.Join(verdicts, "; ")).
-		WithRemedy("bind a lane that fits an offered machine (cozy package bind … --gpu <GPU>=<lane>), " +
-			"or override with model.<param>=org/model@release/lane")
 }
 
 func (m *managedRentals) catalogLocked() ([]hub.RentalSKU, *exit.Error) {
