@@ -1,4 +1,4 @@
-package orchestrator
+package producttest
 
 import (
 	"encoding/json"
@@ -31,7 +31,7 @@ func TestCommittedFileKeepsOriginalProducerAndExactOwnedBytes(t *testing.T) {
 			manifest := encode(map[string]any{"entries": []any{map[string]any{"path": "payload", "kind": "file", "blob": map[string]any{"sha256": strings.TrimPrefix(digest, "sha256:"), "length": 80000}}}})
 			row := records.NativeCall{ParentRequestID: "parent", CallIndex: 80, Operation: "commit_file"}
 			status := &pb.NativeSourceStatus{ParentAttemptOrdinal: 2, ByteOutputAttemptOrdinal: 1, ByteOutputInvocationSpecDigest: spec, ByteOutput: &pb.NativeByteTreeRef{
-				ProducerRootId: records.NativeByteProducerRoot(recordOwnerID, "parent", 1, spec, "runtime.commit_file.80"), ReceiptDigest: []byte(strings.Repeat("r", 32)),
+				ProducerRootId: records.NativeByteProducerRoot("cozy-local-client", "parent", 1, spec, "runtime.commit_file.80"), ReceiptDigest: []byte(strings.Repeat("r", 32)),
 				Manifest: &pb.Ref{Digest: canonical.Digest(manifest), Length: uint64(len(manifest))}, ContentBytes: 80000,
 			}}
 			switch fault {
@@ -55,7 +55,7 @@ func TestCommittedFileKeepsOriginalProducerAndExactOwnedBytes(t *testing.T) {
 				status.ByteOutput = nil
 			}
 			row.Request, status.ResultCanonicalBytes = encode(request), encode(result)
-			output, problem := nativeSourceByteOutput(row, status)
+			output, problem := records.CommittedFileOutput("cozy-local-client", row, status)
 			if fault != "" {
 				if problem == nil {
 					t.Fatal("accepted mismatched owned file")
