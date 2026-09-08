@@ -11,11 +11,20 @@ func reserveByteRetentionTx(tx *sql.Tx, consumer Request, kind, slot string, b B
 	fail := func(message string) (NativeArtifactRetention, *exit.Error) {
 		return NativeArtifactRetention{}, exit.Named(exit.Conflict, "child.byte_scope", "%s", message)
 	}
-	if consumer.ParentRequestID == "" || !consumer.RetainWork || (kind != "input" && kind != "result") || len(slot) == 0 || len(slot) > 512 {
+	rootResult := consumer.ParentRequestID == "" && consumer.RetainsLocalOutputs() && kind == "result"
+	if (consumer.ParentRequestID == "" && !rootResult) || !consumer.RetainWork || (kind != "input" && kind != "result") || len(slot) == 0 || len(slot) > 512 {
 		return fail("byte custody requires a bounded private child obligation")
 	}
-	parent, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE id=?`, consumer.ParentRequestID))
-	if err != nil || parent.State != "dispatching" || !parent.RetainWork {
+	parentID := consumer.ParentRequestID
+	if rootResult {
+		parentID = consumer.ID
+	}
+	parent, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE id=?`, parentID))
+	expectedState := "dispatching"
+	if rootResult {
+		expectedState = "succeeded"
+	}
+	if err != nil || parent.State != expectedState || !parent.RetainWork {
 		return fail("byte recipient parent is not executing")
 	}
 	if consumer.State == "canceling" || consumer.State == "canceled" || consumer.State == "releasing" {

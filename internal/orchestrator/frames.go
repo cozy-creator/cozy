@@ -957,6 +957,8 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	if !knownReplay {
 		if req.ParentRequestID != "" && len(declaredWeightsOutputs) == 0 {
 			byteOutputs, e = c.privateByteOutputs(*req, *attemptRow, doc)
+		} else if req.RetainsLocalOutputs() && len(declaredWeightsOutputs) == 0 {
+			byteOutputs, outputs, e = c.privateRootOutputs(*req, *attemptRow, doc, holder)
 		} else {
 			outputs, e = c.mirrorOutputs(*req, ordinal, doc, holder)
 		}
@@ -1029,7 +1031,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	// goes on to succeed. Observed live: attempt 1 of a killed job committed an empty
 	// `local/_job-…` publication seconds before attempt 2 published the real one.
 	var publication *records.Publication
-	if req.IsJob() && req.ParentRequestID == "" && len(declaredWeightsOutputs) == 0 && !requeuing && !retaining && req.State != "canceling" && !knownReplay {
+	if req.IsJob() && req.ParentRequestID == "" && len(declaredWeightsOutputs) == 0 && !requeuing && !retaining && req.State != "canceling" && !knownReplay && (len(byteOutputs) == 0 || len(outputs) > 0) {
 		if e := c.promote(*req, ordinal, outputs); e != nil {
 			refuse("%s", e.Message)
 			return

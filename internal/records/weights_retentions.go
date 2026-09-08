@@ -169,7 +169,10 @@ func (s *Store) ArtifactHasCustody(producer string, attempt int64, slot, scope s
 func (s *Store) PendingArtifactBorrowers(producer string) (bool, *exit.Error) {
 	var found bool
 	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_weights_retentions h JOIN requests r ON r.id=h.request_id WHERE h.producer_request_id=? AND h.state='pending' AND r.state NOT IN ('canceling','releasing','canceled'))
-		OR EXISTS(SELECT 1 FROM requests WHERE reused_from=? AND state='finalizing')`, producer, producer).Scan(&found); err != nil {
+		OR EXISTS(SELECT 1 FROM requests WHERE reused_from=? AND state='finalizing')
+		OR EXISTS(SELECT 1 FROM native_artifact_retentions h JOIN requests p ON p.id=h.parent_request_id
+		 LEFT JOIN requests c ON c.id=h.consumer_id WHERE h.owner_request_id=? AND h.state='pending'
+		 AND COALESCE(c.state,p.state) NOT IN ('canceling','releasing','canceled'))`, producer, producer, producer).Scan(&found); err != nil {
 		return false, exit.Internalf("cannot read pending artifact borrowers: %s", err)
 	}
 	return found, nil
