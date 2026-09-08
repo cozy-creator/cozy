@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS requests (
   reuse_scope TEXT NOT NULL DEFAULT '',
   control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision>=0),
   parent_request_id TEXT NOT NULL DEFAULT '',
-  parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<32),
+  parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<4294967296),
   child_intent_digest TEXT NOT NULL DEFAULT '',
   child_target_digest TEXT NOT NULL DEFAULT '',
   child_reusable INTEGER NOT NULL DEFAULT 0 CHECK(child_reusable IN (0,1)),

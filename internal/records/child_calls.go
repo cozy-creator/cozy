@@ -14,7 +14,7 @@ import (
 // parent attempt and its captured executable authority are checked in the same
 // transaction that acquires the child. Runtime supplies no placement or scope.
 func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSession string, callArguments []byte) (Request, bool, *exit.Error) {
-	if r.ParentRequestID == "" || r.ParentCallIndex < 0 || r.ParentCallIndex >= 32 || parentAttempt <= 0 {
+	if r.ParentRequestID == "" || r.ParentCallIndex < 0 || r.ParentCallIndex > maxChildCallIndex || parentAttempt <= 0 {
 		return Request{}, false, exit.New(exit.Validation, "child call must name a current parent attempt and bounded call index")
 	}
 	if _, err := canonical.Raw(r.ChildIntentDigest); err != nil {
@@ -36,8 +36,8 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 		if problem != nil {
 			return Request{}, false, problem
 		}
-		if !bytes.Equal(payload, r.Payload) || len(models) != len(r.Models) || r.ChildReusable {
-			return Request{}, false, exit.Named(exit.Conflict, "child.arguments_changed", "serving call differs from its payload/model roster or declares memoization")
+		if !bytes.Equal(payload, r.Payload) || len(models) != len(r.Models) {
+			return Request{}, false, exit.Named(exit.Conflict, "child.arguments_changed", "serving call differs from its payload/model roster")
 		}
 		arguments = models
 	}
@@ -102,6 +102,9 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Request{}, false, exit.Internalf("cannot inspect child replay: %s", err)
+	}
+	if problem := requireActiveChildSlot(tx, parent.ID); problem != nil {
+		return Request{}, false, problem
 	}
 	r.RetainWork = true
 	r.ReusedFrom = "" // Only an authenticated workspace lookup may adopt old results.

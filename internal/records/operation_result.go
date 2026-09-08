@@ -27,11 +27,26 @@ func (s *Store) AdoptCachedOperation(id string, cached CachedOperation) *exit.Er
 	if err != nil {
 		return exit.Internalf("cannot read operation consumer: %s", err)
 	}
-	key, problem := OperationKey(request)
+	context, problem := scanOperationContext(tx.QueryRow(`SELECT numerical_environment_digest,computation_digest FROM request_operation_contexts WHERE request_id=?`, id))
 	if problem != nil {
 		return problem
 	}
-	if key != cached.Key || !request.ChildReusable || request.ParentRequestID == "" || request.Ordinal != 0 {
+	// Older pending lookups carried only a prequalified target. Cancellation may
+	// recover and release their receipts, but cannot turn them into a new result.
+	legacyCancellation := context == nil && request.State == "canceling"
+	if context == nil && !legacyCancellation {
+		return exit.Named(exit.Conflict, "operation.context_absent", "cached computation has no bound callee environment")
+	}
+	key := ""
+	if legacyCancellation {
+		key, problem = OperationKey(request)
+	} else {
+		key, problem = QualifiedOperationKey(request, context.NumericalEnvironment)
+	}
+	if problem != nil {
+		return problem
+	}
+	if key != cached.Key || (context != nil && key != context.Key) || !request.ChildReusable || request.ParentRequestID == "" || request.Ordinal != 0 {
 		return exit.Named(exit.Conflict, "operation.consumer_changed", "cached computation does not match this unoffered private child")
 	}
 	if request.State == "succeeded" && request.ReusedFrom == cached.SourceRequestID {
@@ -42,18 +57,30 @@ func (s *Store) AdoptCachedOperation(id string, cached CachedOperation) *exit.Er
 		return exit.Named(exit.Conflict, "operation.consumer_stopped", "the cached result consumer already stopped or started execution")
 	}
 	var pending string
-	if err := tx.QueryRow(`SELECT computation_digest FROM request_operation_lookups WHERE request_id=? AND state='pending'`, id).Scan(&pending); err != nil || pending != key {
+	if err := tx.QueryRow(`SELECT computation_digest FROM request_operation_lookups WHERE request_id=? AND state IN ('pending','hit')`, id).Scan(&pending); err != nil || pending != key {
 		return exit.Named(exit.Conflict, "operation.lookup_absent", "cached result has no exact pending lookup intent")
 	}
 	source, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE id=?`, cached.SourceRequestID))
 	if err != nil {
 		return exit.Named(exit.Conflict, "operation.source_unavailable", "cached result provenance is unavailable in this owner history")
 	}
-	sourceKey, problem := OperationKey(source)
+	sourceContext, problem := scanOperationContext(tx.QueryRow(`SELECT numerical_environment_digest,computation_digest FROM request_operation_contexts WHERE request_id=?`, source.ID))
 	if problem != nil {
 		return problem
 	}
-	if sourceKey != key || !source.ChildReusable || source.Worker != request.Worker {
+	if sourceContext == nil && !legacyCancellation {
+		return exit.Named(exit.Conflict, "operation.source_changed", "cached source has no recorded callee environment")
+	}
+	sourceKey := ""
+	if sourceContext == nil {
+		sourceKey, problem = OperationKey(source)
+	} else {
+		sourceKey, problem = QualifiedOperationKey(source, sourceContext.NumericalEnvironment)
+	}
+	if problem != nil {
+		return problem
+	}
+	if sourceKey != key || (sourceContext != nil && sourceKey != sourceContext.Key) || !source.ChildReusable || source.Worker != request.Worker {
 		return exit.Named(exit.Conflict, "operation.source_changed", "cached result changed its computation or workspace")
 	}
 	var state, status, invocation, outcome, digest string

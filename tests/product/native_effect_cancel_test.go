@@ -240,6 +240,7 @@ func TestNativeEffectCancellationMigrationPreservesExecutingIntent(t *testing.T)
 	store.Close()
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
+	restorePriorCallIndexBounds(t, db)
 	// Rebuild the exact previous schema, retaining its actual executing row.
 	var ddl string
 	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='native_calls'`).Scan(&ddl))

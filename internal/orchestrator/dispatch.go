@@ -759,6 +759,10 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		spec, planID, e := c.resolveFor(req)
 		if e != nil {
 			done()
+			if e.ErrName() == "device_envelope_held" {
+				c.logf("%s remains QUEUED while serving preparation awaits the local device envelope", req.ID)
+				return
+			}
 			if deferred, _ := c.deferUnavailable(req, e); deferred {
 				return
 			}
@@ -1120,12 +1124,19 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 				"local_package_revision_changed",
 				"request %s no longer matches its sealed local package revision", req.ID)
 		}
+		var parent *pb.JobDirective
 		if req.ParentRequestID != "" {
-			_, e = c.retainedOrchestrationParent(req)
-			if e != nil {
-				return WorkerLaunchSpec{}, "", e
+			plan, problem := c.retainedOrchestrationParent(req)
+			if problem != nil {
+				return WorkerLaunchSpec{}, "", problem
 			}
+			parent = c.jobDirective(plan)
 		}
+		c.mu.Lock()
+		if worker := c.workers[instance]; worker != nil {
+			worker.orchestrationParent = parent
+		}
+		c.mu.Unlock()
 		if req.IsJob() {
 			jobPrepared, problem = c.prepareLocalJob(instance, req, revision)
 			if problem != nil {
@@ -1137,7 +1148,15 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			}); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
-		if !req.IsJob() && len(logical.Models) > 0 {
+		if !req.IsJob() && len(logical.Models) > 0 && req.ParentRequestID != "" {
+			native, problem := c.nativeServingModels(req)
+			if problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+			if problem := c.convergePrivateModels(instance, req.ID, req.LocalPackageDigest, nil, native); problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+		} else if !req.IsJob() && len(logical.Models) > 0 {
 			models := downloadModelRefs(logical.Models)
 			if len(models) != len(logical.Models) {
 				return WorkerLaunchSpec{}, "", exit.Named(exit.Validation,
@@ -1332,16 +1351,6 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence
 	// is open. `pick` also returns the admission epoch it OBSERVED, which is what
 	// makes a stale offer refuse deterministically rather than race.
-	if hit, problem := c.lookupOperation(req); hit || problem != nil {
-		return 0, problem
-	}
-	current, problem = c.opt.Store.RequestRow(req.ID)
-	if problem != nil {
-		return 0, problem
-	}
-	if current == nil || (current.State != "submitted" && current.State != "queued") {
-		return 0, exit.Named(exit.Conflict, "request.execution_stopped", "request stopped while its operation lookup was in progress")
-	}
 	target, e := c.pick(req)
 	if e != nil {
 		return 0, e
@@ -1353,6 +1362,16 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			c.releaseDispatch(reservation)
 		}
 	}()
+	if hit, problem := c.lookupOperationOn(req, sess); hit || problem != nil {
+		return 0, problem
+	}
+	current, problem = c.opt.Store.RequestRow(req.ID)
+	if problem != nil {
+		return 0, problem
+	}
+	if current == nil || (current.State != "submitted" && current.State != "queued") {
+		return 0, exit.Named(exit.Conflict, "request.execution_stopped", "request stopped while its operation lookup was in progress")
+	}
 	if req.RetainWork {
 		required, problem := c.requiredPrivateWire(req)
 		if problem != nil {
@@ -1420,6 +1439,18 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	}
 	payloadDigest := spellOf(canonical.Digest(req.Payload))
 	outputLimit := c.maxOutputBytes()
+	var servingPlacement DesiredPlacement
+	if !req.IsJob() {
+		c.mu.Lock()
+		servingPlacement = w.spec.Placement
+		if selected, ok := w.remotePlacements[remotePlanKey(pinnedPackage(req.Package, req.Worker), req.PlanID)]; ok {
+			servingPlacement = selected
+		}
+		c.mu.Unlock()
+		if servingPlacement.BindingsDigest == "" || len(servingPlacement.PlacementSetBytes) == 0 {
+			return 0, exit.Named(exit.Conflict, "serving.placement_evidence_absent", "serving dispatch needs the exact prepared model bindings")
+		}
+	}
 	spec := &pb.InvocationSpec{
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
 		// for a native install with no OCI image at all. The value is the same one this
@@ -1430,6 +1461,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		Outputs:           invocationOutputBindings(splitList(req.Outputs), weightsOutputs, outputLimit),
 		Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{
 			EntrypointBindingDigest: req.PlanID,
+			BindingsDigest:          servingPlacement.BindingsDigest,
 			// With no adapters the binding IS the plan, so the two ids are equal by
 			// construction rather than by copying a value around.
 			AttemptBindingId: req.PlanID,
@@ -1472,7 +1504,8 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	ordinal, e := c.opt.Store.Dispatch(records.Attempt{
 		RequestID: req.ID, InstanceID: w.instanceID,
 		SessionID: w.bootID, InvocationDigest: spelled, InvocationCanonical: canonicalBytes,
-		WeightsOutputs: req.WeightsOutputs,
+		WeightsOutputs:      req.WeightsOutputs,
+		ServingPlacementSet: servingPlacement.PlacementSetBytes,
 	})
 	if e != nil {
 		return 0, e

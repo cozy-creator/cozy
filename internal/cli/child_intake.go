@@ -147,7 +147,13 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 				return fail(exit.Internalf("cannot stage child interfaces: %s", err))
 			}
 		}
-		wheel, problem := launch.GenerateInterfaceWheel(context.Background(), result.Install, layout.Root, config.Frozen().Tool(), revision.Digest, intake.staging)
+		var projectWheel localpackage.File
+		for _, file := range revision.Files {
+			if file.Kind == "project" {
+				projectWheel = file
+			}
+		}
+		wheel, problem := launch.GenerateInterfaceWheel(context.Background(), result.Install, layout.Root, config.Frozen().Tool(), revision.Digest, projectWheel.Path, projectWheel.Digest, intake.staging)
 		if problem != nil {
 			nested.Close()
 			dependency.Close()

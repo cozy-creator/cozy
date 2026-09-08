@@ -1,19 +1,15 @@
 package orchestrator
 
 import (
-	"encoding/json"
-
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// qualifyChildReuse measures the current privileged execution environment before
-// making a cache decision. A missing measurement permits ordinary execution but
-// never reuses numerical work under an unqualified Runtime/framework/settings.
-func (c *Orchestrator) qualifyChildReuse(s *session, call *pb.ChildCallRequest, spec *Submission, target string) string {
-	if !spec.ChildReusable {
-		return target
-	}
+// This session belongs to the selected callee, after its preparation completed.
+// Its numerical identity is independent of the script's CPU control process.
+func (c *Orchestrator) qualifyOperation(s *session, request records.Request) (*records.OperationContext, *exit.Error) {
 	var result *pb.NumericalEnvironmentResult
 	var err error
 	if s.host != nil {
@@ -22,13 +18,15 @@ func (c *Orchestrator) qualifyChildReuse(s *session, call *pb.ChildCallRequest, 
 		result, err = s.preparation.NumericalEnvironment(s.ctx, &pb.NumericalEnvironmentRequest{})
 	}
 	if err != nil || result == nil || len(result.Digest) != 32 {
-		spec.ChildReusable = false
-		c.logf("child call %s/%d executes without cross-run reuse: numerical environment is unqualified", call.ParentRequestId, call.CallIndex)
-		return target
+		if err != nil {
+			problem := operationCacheProblem(err)
+			if problem.Code == exit.Structural {
+				return nil, exit.Named(exit.Structural, "operation.numerical_environment_unproven", "the selected callee's prepared interpreter could not prove its numerical identity")
+			}
+			return nil, problem
+		}
+		return nil, exit.Named(exit.Structural, "operation.numerical_environment_unproven", "the selected callee did not provide its numerical identity")
 	}
 	environment, _ := canonical.Spell(result.Digest)
-	raw, _ := json.Marshal(map[string]string{"target_digest": target, "numerical_environment_digest": environment})
-	raw, _ = canonical.NormalizeJCS(raw)
-	qualified, _ := canonical.Spell(canonical.Digest(raw))
-	return qualified
+	return c.opt.Store.BindOperationContext(request.ID, environment)
 }

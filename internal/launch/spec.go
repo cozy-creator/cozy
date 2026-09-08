@@ -15,6 +15,7 @@ import (
 
 // Facts is everything one package install needs to be served, gathered once.
 type Facts struct {
+	CPUOrchestration bool // exact captured child bindings give model-free composition its CPU role
 	Install          records.PackageInstall
 	Source           string
 	PackageInterface *PackageInterface
