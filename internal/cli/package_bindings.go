@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"strings"
 
@@ -14,8 +13,8 @@ import (
 )
 
 // A package's default bindings are MUTABLE HUB ROWS — one per (package, slot path) — and
-// `cozy package bind` is their ONE writer (th-116, cl-166): package.toml carries no
-// bindings and publish seeds none. A row names a model release and its ladder, the fit
+// `cozy package bind` sets them; Tensorhub removes defaults whose slots disappear.
+// package.toml carries no bindings and publish seeds none. A row names a model release and its ladder, the fit
 // map from GPU class to lane. Bind verifies both against the hub before writing — the
 // slot against the package's latest published interface, the release and every lane
 // against the model card — so a binding can never name what the card does not offer.
@@ -33,32 +32,18 @@ func handlePackageBindings(ctx *Context) *exit.Error {
 	}
 	l := output.List{
 		Name:      "bindings",
-		Fields:    []string{"slot", "model", "release", "ladder", "revision", "standing"},
-		AllFields: []string{"slot", "model", "release", "ladder", "revision", "standing", "updated"},
+		Fields:    []string{"slot", "model", "release", "ladder", "revision"},
+		AllFields: []string{"slot", "model", "release", "ladder", "revision", "updated"},
 	}
-	orphans := 0
 	for _, row := range rows {
-		standing := "ok"
-		if row.Orphaned {
-			standing = "orphaned"
-			orphans++
-		}
 		l.Rows = append(l.Rows, map[string]string{
 			"slot": row.Slot, "model": row.Model, "release": row.Release,
 			"ladder": hub.LadderText(row.Ladder), "revision": output.Int(row.Revision),
-			"standing": standing, "updated": row.UpdatedAt,
+			"updated": row.UpdatedAt,
 		})
 	}
-	switch {
-	case len(l.Rows) == 0:
+	if len(l.Rows) == 0 {
 		l.Next = []string{bindRemedy(ref.String(), "<slot-path>")}
-	case orphans > 0:
-		// A binding whose slot the latest published interface no longer declares still
-		// resolves and still carries a ladder, so nothing about reading it says the
-		// ladder stopped being maintained. Say it here, where the reader is looking.
-		l.Notes = append(l.Notes, fmt.Sprintf("%d binding(s) name a slot the latest published interface of %s "+
-			"does not declare — the slot was renamed or removed and the ladder has not moved since",
-			orphans, ref.String()))
 	}
 	return emit(ctx, l)
 }

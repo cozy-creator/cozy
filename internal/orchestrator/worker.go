@@ -18,7 +18,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/processtree"
@@ -2249,12 +2248,6 @@ func (c *Orchestrator) idleLocalServingWorkerLocked(w *worker, active []records.
 // orphan and is killed (it holds a device grant and a socket this daemon no longer
 // knows); a mismatch is a REUSED PID and is never signalled — only its row is closed.
 func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
-	unlock := inputasset.Guard()
-	e = inputasset.Sweep(c.opt.Layout, c.opt.Store)
-	unlock()
-	if e != nil {
-		return 0, 0, e
-	}
 	unlockLocal := localpackage.Guard()
 	e = localpackage.Sweep(c.opt.Layout, c.opt.Store)
 	unlockLocal()

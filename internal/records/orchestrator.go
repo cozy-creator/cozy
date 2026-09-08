@@ -515,9 +515,8 @@ type Request struct {
 	// InstallID pins the exact immutable local install resolved before
 	// submission. The initial remote lane reads only its published release and PackageInterface.
 	InstallID string
-	// Assets are the request's durable input-asset bindings. LocalPath points into the
-	// authority-owned immutable input store, not at the caller's original file: a requeue
-	// after a client exit or daemon restart therefore grants the same verified bytes.
+	// Assets are durable identity claims and borrowed source paths. Requeues reverify
+	// those files; callers must keep their bytes available and unchanged.
 	Assets []AssetBinding
 	// Models are exact package-slot-to-model bindings resolved before rental creation.
 	// They are local request state and are disclosed only after worker attachment.
@@ -1179,35 +1178,6 @@ func (s *Store) Unsettled() ([]Request, *exit.Error) {
 		out = append(out, r)
 	}
 	return out, nil
-}
-
-// AssetInUse answers whether an unsettled request still owns a staged content object.
-// Settled request rows retain their identity claims for audit/idempotency, but their bytes
-// are no longer execution inputs and must not pin the private input store forever.
-func (s *Store) AssetInUse(digest string) (bool, *exit.Error) {
-	rows, err := s.db.Query(`SELECT assets FROM requests
-		WHERE state IN (` + activeRequestStates + `)
-		  AND assets <> '[]'`)
-	if err != nil {
-		return false, exit.Internalf("cannot read live input asset ownership: %s", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var raw string
-		if err := rows.Scan(&raw); err != nil {
-			return false, exit.Internalf("cannot read a live input asset binding: %s", err)
-		}
-		var assets []AssetBinding
-		if err := json.Unmarshal([]byte(raw), &assets); err != nil {
-			return false, exit.Internalf("cannot decode a live input asset binding: %s", err)
-		}
-		for _, asset := range assets {
-			if asset.Digest == digest {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
 }
 
 // LocalPackageInUse keeps one exact wheel revision while executable work or the current

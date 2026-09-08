@@ -167,8 +167,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	prepareImage, releasePrepared := imagePreparer(ctx)
-	defer releasePrepared()
+	prepareImage := imagePreparer(ctx)
 	input, assets, e := launch.ParseAssets(ep, input, ctx.Inv.Values["--asset"], ctx.Inv.Values["--asset-fidelity"], prepareImage)
 	if e != nil {
 		return e
@@ -203,7 +202,6 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Models:          models,
 		OutputDirectory: outputDirectory,
 	}, key)
-	releasePrepared()
 	if e != nil {
 		return e
 	}

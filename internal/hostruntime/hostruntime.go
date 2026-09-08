@@ -50,6 +50,7 @@ var hostRuntimeVerdicts = struct {
 // an older daemon and an older tool cannot (cl-086's live run: a 0.0.29 tool (minor 16) under
 // a minor-22 daemon launched, never came READY, and the request sat `queued` with nothing
 // said). Floor also requires the static script and managed-operation metadata contract.
+// It also requires Runtime-owned temporary image preparation (0.9.0).
 // The tool's own `version` verb is the fact, asked here.
 func Path(env []string) (string, *exit.Error) {
 	path, err := exec.LookPath("cozy-runtime")
@@ -120,8 +121,7 @@ func admitHostRuntime(path string, env []string) *exit.Error {
 	}
 	if release.LessThan(floor) {
 		return exit.Named(exit.Structural, "host_runtime_below_floor",
-			"cozy-runtime %s is release %s; this Cozy needs %s or newer, the first release whose "+
-				"`describe` reads package source without importing it",
+			"cozy-runtime %s is release %s; this Cozy needs %s or newer for its host helper contract",
 			path, answer.Distribution, Floor).
 			WithRemedy("%s", hostRuntimeInstall)
 	}

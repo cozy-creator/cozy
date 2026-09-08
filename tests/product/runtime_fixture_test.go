@@ -61,3 +61,17 @@ func TestRuntimeFixtureRefusesMissingOrMutableProvenance(t *testing.T) {
 		})
 	}
 }
+
+// Runtime fixtures follow the CLI floor unless a prerelease wheel is selected.
+// Control, scripts and child projects use this same version instead of separate pins.
+func runtimeFixtureVersion(t *testing.T, wheel string) string {
+	t.Helper()
+	if wheel == "" {
+		return hostruntime.Floor
+	}
+	parts := strings.Split(filepath.Base(wheel), "-")
+	if len(parts) < 3 || parts[0] != "cozy_runtime" || parts[1] == "" || !strings.HasSuffix(wheel, ".whl") {
+		t.Fatal("fixture requires a named Runtime wheel")
+	}
+	return parts[1]
+}

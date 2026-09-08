@@ -166,10 +166,29 @@ cozy-runtime = {path = ` + strconv.Quote(*assetsRuntimeWheel) + `}
 	if !bytes.Equal(before, after) {
 		t.Fatal("client preparation changed the original")
 	}
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	request, problem := store.RequestByReference("1")
+	fatal(t, problem)
+	if request == nil || len(request.Assets) != 1 {
+		t.Fatal("prepared request lost input")
+	}
+	asset := request.Assets[0]
+	if filepath.Dir(asset.LocalPath) != filepath.Join(os.TempDir(), "cozy") ||
+		filepath.Base(asset.LocalPath) != strings.TrimPrefix(asset.Digest, "sha256:")+".webp" {
+		t.Fatalf("derivative is not Runtime's hash-addressed temporary file: %s", asset.LocalPath)
+	}
+	if _, err := os.Stat(asset.LocalPath); err != nil {
+		t.Fatalf("temporary derivative was removed while request could retry: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "inputs")); !os.IsNotExist(err) {
+		t.Fatalf("prepared image was copied into an input store: %v", err)
+	}
 	remaining, err := filepath.Glob(filepath.Join(root, "tmp", "image-preparation-*"))
 	must(t, err)
 	if len(remaining) != 0 {
-		t.Fatalf("prepared scratch survived staging: %v", remaining)
+		t.Fatalf("image preparation created request scratch: %v", remaining)
 	}
 }
 

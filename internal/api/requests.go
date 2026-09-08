@@ -41,9 +41,9 @@ type Submission struct {
 	Release   string   `json:"release,omitempty"`
 	Outputs   []string `json:"outputs,omitempty"`
 	PlanID    string   `json:"plan_id,omitempty"`
-	// LocalAssets is the local API's out-of-band input set. Each source path is ingested into
-	// the daemon-owned immutable input store before the request row exists; it never
-	// crosses the worker protocol. The typed payload carries only its opaque reference.
+	// LocalAssets is the local API's out-of-band input set. Source paths remain borrowed
+	// and are reverified before local reads or remote upload. The typed payload carries
+	// only its opaque reference.
 	LocalAssets    []records.AssetBinding  `json:"local_assets,omitempty"`
 	Rental         bool                    `json:"rental,omitempty"`
 	RentalRequired bool                    `json:"rental_required,omitempty"`
@@ -115,13 +115,6 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			"use `cozy run --asset <field-path>=<file>`; this build exposes no browser asset-upload route")
 		return
 	}
-	// Staging bytes and recording their request are one ownership handoff even though the
-	// filesystem and SQLite cannot share a transaction. Terminal GC takes the same short
-	// guard, so it cannot remove a digest in the gap between those two operations.
-	if len(sub.LocalAssets) > 0 {
-		unlock := inputasset.Guard()
-		defer unlock()
-	}
 	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	existing, e := s.store.RequestByIdempotencyKey(key)
 	if e != nil {
@@ -132,8 +125,8 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	if existing != nil {
 		// Resolve an existing key from the durable request identity, not from resources
 		// retained only while it can execute. The caller's asset claims are still hashed
-		// below, so a different body conflicts, but neither its source nor the reclaimed
-		// staging object is opened merely to answer an already-recorded request.
+		// below, so a different body conflicts, but its source is not
+		// opened merely to answer an already-recorded request.
 		spec = replaySubmission(sub, *existing)
 		// The digest covers the DERIVED export rows, and a replay resolves no
 		// entrypoint to re-derive them from. The recorded export row is that exact
@@ -162,8 +155,8 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// The DAEMON is the process that publishes --out, so the daemon probes the
-		// destination — here, where the path is finally resolved, before a byte is
-		// staged or a row recorded. A doomed export refuses in milliseconds instead
+		// destination — here, where the path is finally resolved, before an input is
+		// bound or a row recorded. A doomed export refuses in milliseconds instead
 		// of after GPU minutes.
 		if spec.OutputExport != nil {
 			if e := resultfiles.Preflight(spec.OutputExport.Directory); e != nil {
@@ -171,17 +164,10 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		spec.Assets, e = s.stageAssets(spec.Assets)
+		spec.Assets, e = bindAssets(spec.Assets)
 		if e != nil {
 			s.refuseTyped(w, r, e)
 			return
-		}
-		if len(spec.Assets) > 0 {
-			defer func() {
-				if e := inputasset.DropUnowned(s.layout, s.store, spec.Assets); e != nil {
-					fmt.Fprintf(s.log, "input asset cleanup deferred: %s\n", e.Message)
-				}
-			}()
 		}
 	}
 	spec.IdemKey = key
@@ -640,20 +626,14 @@ func placementPlan(placement orchestrator.DesiredPlacement, function string) (st
 		WithRemedy("GET /v1/local/packages lists the functions this target serves")
 }
 
-func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBinding, *exit.Error) {
+func bindAssets(assets []records.AssetBinding) ([]records.AssetBinding, *exit.Error) {
 	if len(assets) == 0 {
 		return nil, nil
 	}
 	out := make([]records.AssetBinding, 0, len(assets))
-	rollback := func() {
-		if e := inputasset.DropUnowned(s.layout, s.store, out); e != nil {
-			fmt.Fprintf(s.log, "partial input asset cleanup deferred: %s\n", e.Message)
-		}
-	}
 	seen := map[string]bool{}
 	for _, asset := range assets {
 		if seen[asset.FieldPath] {
-			rollback()
 			return nil, exit.New(exit.Validation,
 				"input asset field %q was supplied more than once", asset.FieldPath)
 		}
@@ -662,12 +642,11 @@ func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBind
 		if maxBytes <= 0 {
 			maxBytes = inputasset.MaxBytes
 		}
-		staged, e := inputasset.Stage(s.layout, asset, maxBytes)
+		bound, e := inputasset.Bind(asset, maxBytes)
 		if e != nil {
-			rollback()
 			return nil, e
 		}
-		out = append(out, staged)
+		out = append(out, bound)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].FieldPath < out[j].FieldPath })
 	return out, nil
