@@ -43,7 +43,8 @@ func handlePackageBindings(ctx *Context) *exit.Error {
 		})
 	}
 	if len(l.Rows) == 0 {
-		l.Next = []string{bindRemedy(ref.String(), "<slot-path>")}
+		l.Notes = []string{"No owner overrides."}
+		l.Next = []string{"cozy run " + ref.String() + " --describe"}
 	}
 	return emit(ctx, l)
 }

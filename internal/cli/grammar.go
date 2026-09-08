@@ -84,9 +84,9 @@ type PackageCmd struct {
 	Publish PackagePublishCmd `cmd:"" help:"Publish a package release."`
 	Yank    PackageYankCmd    `cmd:"" help:"Permanently yank a package release."`
 
-	Bind     PackageBindCmd     `cmd:"" help:"Point one package slot's default at another model release/lane."`
+	Bind     PackageBindCmd     `cmd:"" help:"Set an owner model override for one package slot."`
 	Unbind   PackageUnbindCmd   `cmd:"" help:"Remove an owner override and use the package default."`
-	Bindings PackageBindingsCmd `cmd:"" help:"Show the package's current default bindings."`
+	Bindings PackageBindingsCmd `cmd:"" help:"Show the package owner's model overrides."`
 }
 
 type PackageBindCmd struct {
