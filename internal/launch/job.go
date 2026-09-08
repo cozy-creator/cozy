@@ -81,13 +81,7 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}
-	placement, e := f.Placement()
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, nil, e
-	}
-	// The build id comes off the SELECTED PlacementSet, exactly as a rented worker reads
-	// it off the set it prepared for itself. One derivation, one meaning, both lanes.
-	buildID, e := orchestrator.JobBuildID(placement.PlacementSetBytes, f.Install.Package)
+	placement, buildID, e := f.JobCodeIdentity()
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}

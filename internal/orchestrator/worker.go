@@ -259,7 +259,8 @@ type WorkerLaunchSpec struct {
 	Placement DesiredPlacement `json:"placement"`
 	// Connection attaches an ALREADY-RUNNING worker instead of spawning one: the owner
 	// pins CACert and signs Claim with its per-rental key. Nil = the ordinary local spawn.
-	Connection *WorkerConnection `json:"connection,omitempty"`
+	Connection  *WorkerConnection        `json:"connection,omitempty"`
+	Preparation *LocalServingPreparation `json:"preparation,omitempty"`
 }
 
 // WorkerChange is what an EnsureWorker call actually DID (#484). `Resident bool` could
@@ -769,6 +770,9 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 		break
 	}
 	if live != nil {
+		if spec.Preparation != nil {
+			return instanceID, ChangeNone, nil
+		}
 		// A concurrent empty-rental attach may have waited for this connection.
 		// It requests the existing claim, never an empty replacement placement.
 		if spec.Connection != nil && spec.Placement.Package == "" {
@@ -1002,7 +1006,7 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 				observed.placementSetDigest == desired.PlacementSetDigest &&
 				observed.materialization == pb.MaterializationState_MATERIALIZATION_STATE_FAILED
 			planID := logical.PlanID
-			if planID == "" && len(logical.Models) > 0 {
+			if planID == "" {
 				// Runtime authored each binding beside its callable name. Other
 				// dispatchable entrypoints cannot identify this request's function.
 				for _, entrypoint := range desired.Entrypoints {
