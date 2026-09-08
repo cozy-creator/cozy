@@ -159,28 +159,13 @@ build-backend="hatchling.build"
 		must(t, os.WriteFile(filepath.Join(to, "package.toml"), []byte("[application]\nobject="+strconv.Quote(name+":app")+"\n"), 0600))
 	}
 	script := filepath.Join(project, "prepare.py")
-	code := `# //cozy:allow product fixture calls public Runtime source operations
-# /// script
-# requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==` + runtimeVersion + `","quantize-tools==0.0.1","score-tools==0.0.1"]
-# [tool.uv.sources]
-# cozy-runtime={path=` + strconv.Quote(runtimeWheel) + `}
-# quantize-tools={path="./quantize_tools"}
-# score-tools={path="./score_tools"}
-# ///
-from cozy_runtime.author.sources import download_huggingface,convert_cozytensors
-from quantize_tools import quantize
-from score_tools import score
-
-async def main(ctx):
-    source=await download_huggingface("example/model",revision="` + strings.Repeat("a", 40) + `")
-    original=await convert_cozytensors(source,profile="fixture/quantize/1")
-    candidate=await quantize(source=original,encoding="fp8-rowwise/1")
-    report=await score(model=candidate)
-    ctx.log(f"Supplied fixture media SSIM={report.ssim}; checkpoint={report.checkpoint}")
-    if report.ssim < 1.01:
-        raise ValueError("qualification media gate rejected")
-`
+	clientScript, err := os.ReadFile(filepath.Join(fixture, "prepare.py"))
+	must(t, err)
+	code := strings.NewReplacer(
+		"__RUNTIME_VERSION__", runtimeVersion,
+		"__RUNTIME_WHEEL__", strconv.Quote(runtimeWheel),
+		"__REVISION__", strings.Repeat("a", 40),
+	).Replace(string(clientScript))
 	must(t, os.WriteFile(script, []byte(code), 0600))
 	command := exec.Command(cozyBin, "run", script, "--await", "--json")
 	command.Env = childEnv(t, root)
