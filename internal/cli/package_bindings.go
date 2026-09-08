@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -32,18 +33,32 @@ func handlePackageBindings(ctx *Context) *exit.Error {
 	}
 	l := output.List{
 		Name:      "bindings",
-		Fields:    []string{"slot", "model", "release", "ladder", "revision"},
-		AllFields: []string{"slot", "model", "release", "ladder", "revision", "updated"},
+		Fields:    []string{"slot", "model", "release", "ladder", "revision", "standing"},
+		AllFields: []string{"slot", "model", "release", "ladder", "revision", "standing", "updated"},
 	}
+	orphans := 0
 	for _, row := range rows {
+		standing := "ok"
+		if row.Orphaned {
+			standing = "orphaned"
+			orphans++
+		}
 		l.Rows = append(l.Rows, map[string]string{
 			"slot": row.Slot, "model": row.Model, "release": row.Release,
 			"ladder": hub.LadderText(row.Ladder), "revision": output.Int(row.Revision),
-			"updated": row.UpdatedAt,
+			"standing": standing, "updated": row.UpdatedAt,
 		})
 	}
-	if len(l.Rows) == 0 {
+	switch {
+	case len(l.Rows) == 0:
 		l.Next = []string{bindRemedy(ref.String(), "<slot-path>")}
+	case orphans > 0:
+		// A binding whose slot the latest published interface no longer declares still
+		// resolves and still carries a ladder, so nothing about reading it says the
+		// ladder stopped being maintained. Say it here, where the reader is looking.
+		l.Notes = append(l.Notes, fmt.Sprintf("%d binding(s) name a slot the latest published interface of %s "+
+			"does not declare — the slot was renamed or removed and the ladder has not moved since",
+			orphans, ref.String()))
 	}
 	return emit(ctx, l)
 }
