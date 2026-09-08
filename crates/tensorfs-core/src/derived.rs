@@ -6,9 +6,11 @@
 //! additions through the ordinary object writer. There is no filename inference, model
 //! vocabulary, Torch, schedule, publication, or serving decision here.
 
+mod adoption;
 mod progress;
 mod retention;
 mod roots;
+pub use adoption::adopt_checkpoint;
 use progress::read as read_progress;
 pub use retention::{release_retention, retain_result, RetainedResult};
 
@@ -83,11 +85,42 @@ pub struct Source {
     pub manifest: ObjectRef,
 }
 
+/// Closed semantic selection from a granted source; never an author-supplied ObjectRef.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartSource {
+    pub source: String,
+    pub component: String,
+    pub tensor: String,
+    pub role: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartDeclaration {
     pub role: String,
     pub dtype: Dtype,
     pub shape: Vec<u64>,
+    pub source: Option<PartSource>,
+}
+
+impl PartDeclaration {
+    fn to_value(&self) -> Value {
+        let mut fields = vec![
+            ("dtype", Value::str(self.dtype.name())),
+            ("shape", shape_value(&self.shape)),
+        ];
+        if let Some(selected) = &self.source {
+            fields.push((
+                "source",
+                Value::obj(vec![
+                    ("source", Value::str(selected.source.clone())),
+                    ("component", Value::str(selected.component.clone())),
+                    ("tensor", Value::str(selected.tensor.clone())),
+                    ("role", Value::str(selected.role.clone())),
+                ]),
+            ));
+        }
+        Value::obj(fields)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,6 +334,24 @@ impl Declaration {
                 }
                 for part in &tensor.parts {
                     name("addition role", &part.role)?;
+                    if let Some(selected) = &part.source {
+                        name("part source alias", &selected.source)?;
+                        name("part source component", &selected.component)?;
+                        key("part source tensor", &selected.tensor)?;
+                        name("part source role", &selected.role)?;
+                        if !source_names.contains(selected.source.as_str()) {
+                            return refuse(
+                                Code::ROOT_ABSENT,
+                                "part selects undeclared source alias",
+                            );
+                        }
+                        if selected.role != part.role {
+                            return refuse(
+                                Code::TRANSACTION_CONFLICT,
+                                "grafted part must preserve its encoding role",
+                            );
+                        }
+                    }
                     checked_bytes(
                         &format!("{}/{}#{}", component.target, tensor.key, part.role),
                         &part.shape,
@@ -392,6 +443,17 @@ impl Declaration {
             .components
             .iter()
             .filter_map(|component| component.source.as_deref())
+            .chain(
+                self.components
+                    .iter()
+                    .flat_map(|component| &component.add)
+                    .flat_map(|tensor| &tensor.parts)
+                    .filter_map(|part| {
+                        part.source
+                            .as_ref()
+                            .map(|selected| selected.source.as_str())
+                    }),
+            )
             .chain(self.configs.iter().filter_map(|config| match config {
                 ConfigDeclaration::Copy { source, .. }
                 | ConfigDeclaration::Derive { source, .. } => Some(source.as_str()),
@@ -440,6 +502,9 @@ impl Declaration {
         for component in &self.components {
             for tensor in &component.add {
                 for part in &tensor.parts {
+                    if part.source.is_some() {
+                        continue;
+                    }
                     let n = checked_bytes(
                         &format!("{}/{}#{}", component.target, tensor.key, part.role),
                         &part.shape,
@@ -532,11 +597,26 @@ impl Declaration {
                     let mut pf = Fields::new("DerivedDeclaration.part", part_value)?;
                     let dtype = Dtype::parse(pf.req_str("dtype")?)?;
                     let part_shape = shape(pf.req("shape")?, "DerivedDeclaration.part")?;
+                    let source = pf
+                        .opt("source")
+                        .map(|value| {
+                            let mut sf = Fields::new("DerivedDeclaration.part.source", value)?;
+                            let selected = PartSource {
+                                source: sf.req_str("source")?.to_string(),
+                                component: sf.req_str("component")?.to_string(),
+                                tensor: sf.req_str("tensor")?.to_string(),
+                                role: sf.req_str("role")?.to_string(),
+                            };
+                            sf.done()?;
+                            Ok(selected)
+                        })
+                        .transpose()?;
                     pf.done()?;
                     parts.push(PartDeclaration {
                         role: role.clone(),
                         dtype,
                         shape: part_shape,
+                        source,
                     });
                 }
                 tf.done()?;
@@ -664,21 +744,7 @@ impl Declaration {
                                                                     .map(|part| {
                                                                         (
                                                                             part.role.clone(),
-                                                                            Value::obj(vec![
-                                                                                (
-                                                                                    "dtype",
-                                                                                    Value::str(
-                                                                                        part.dtype
-                                                                                            .name(),
-                                                                                    ),
-                                                                                ),
-                                                                                (
-                                                                                    "shape",
-                                                                                    shape_value(
-                                                                                        &part.shape,
-                                                                                    ),
-                                                                                ),
-                                                                            ]),
+                                                                            part.to_value(),
                                                                         )
                                                                     })
                                                                     .collect(),
@@ -800,6 +866,16 @@ fn selected_components(declaration: &Declaration, source_alias: &str) -> Vec<Str
             },
         )
         .collect();
+    components.extend(
+        declaration
+            .components
+            .iter()
+            .flat_map(|component| &component.add)
+            .flat_map(|tensor| &tensor.parts)
+            .filter_map(|part| part.source.as_ref())
+            .filter(|selected| selected.source == source_alias)
+            .map(|selected| selected.component.clone()),
+    );
     components.sort();
     components.dedup();
     components
@@ -1523,6 +1599,55 @@ fn admit_registry(store: &Store, adoptions: &[RegistryAdoption]) -> Result<()> {
     Ok(())
 }
 
+fn graft_part(
+    sources: &[SourceData],
+    target: &TensorDeclaration,
+    part: &PartDeclaration,
+    selected: &PartSource,
+) -> Result<Part> {
+    let tensor = source(sources, &selected.source)?
+        .header
+        .components
+        .iter()
+        .find(|(component, _)| component == &selected.component)
+        .ok_or_else(|| Refusal {
+            code: Code::MISSING_COMPONENT,
+            detail: "grafted source component is absent".into(),
+        })?
+        .1
+        .iter()
+        .find(|(key, _)| key == &selected.tensor)
+        .ok_or_else(|| Refusal {
+            code: Code::MISSING_TENSOR,
+            detail: "grafted source tensor is absent".into(),
+        })?;
+    let tensor = &tensor.1;
+    if tensor.dtype != target.dtype
+        || tensor.shape != target.shape
+        || tensor.encoding != target.encoding
+    {
+        return refuse(
+            Code::TRANSACTION_CONFLICT,
+            "grafted tensor changes logical dtype, shape or encoding",
+        );
+    }
+    let inherited = tensor
+        .parts
+        .iter()
+        .find(|(role, _)| role == &selected.role)
+        .ok_or_else(|| Refusal {
+            code: Code::MISSING_FIELD,
+            detail: "grafted source role is absent".into(),
+        })?;
+    if inherited.1.dtype != part.dtype || inherited.1.shape != part.shape {
+        return refuse(
+            Code::TRANSACTION_CONFLICT,
+            "grafted part changes stored dtype or shape",
+        );
+    }
+    Ok(inherited.1.clone())
+}
+
 fn build_header(
     declaration: &Declaration,
     sources: &[SourceData],
@@ -1580,10 +1705,19 @@ fn build_header(
                         && added.key == tensor.key
                         && added.role == part_declaration.role
                 });
-                let part = match supplied {
-                    Some(added) => added.part.clone(),
-                    None if planned => planned_part(part_declaration)?,
-                    None => {
+                let part = match (&part_declaration.source, supplied) {
+                    (Some(selected), None) => {
+                        graft_part(sources, tensor, part_declaration, selected)?
+                    }
+                    (Some(_), Some(_)) => {
+                        return refuse(
+                            Code::TRANSACTION_CONFLICT,
+                            "grafted part cannot contain supplied bytes",
+                        )
+                    }
+                    (None, Some(added)) => added.part.clone(),
+                    (None, None) if planned => planned_part(part_declaration)?,
+                    (None, None) => {
                         return refuse(
                             Code::ARTIFACT_INCOMPLETE,
                             format!(
@@ -2129,7 +2263,9 @@ fn validate_additions(row: &TransactionRow) -> Result<()> {
             .and_then(|c| c.add.iter().find(|t| t.key == added.key))
             .and_then(|t| t.parts.iter().find(|p| p.role == added.role));
         if !expected.is_some_and(|expected| {
-            expected.dtype == added.part.dtype && expected.shape == added.part.shape
+            expected.source.is_none()
+                && expected.dtype == added.part.dtype
+                && expected.shape == added.part.shape
         }) {
             return refuse(
                 Code::TRANSACTION_CONFLICT,
@@ -2599,6 +2735,12 @@ pub fn add_part<R: Read>(
         (declaration, expected)
     };
     let _ = declaration;
+    if expected.source.is_some() {
+        return refuse(
+            Code::TRANSACTION_CONFLICT,
+            "grafted part cannot receive byte writes",
+        );
+    }
 
     let written = checkpoint::objectize(
         store,
@@ -3188,6 +3330,7 @@ mod tests {
                         role: "value".into(),
                         dtype: Dtype::F32,
                         shape: vec![512],
+                        source: None,
                     }],
                 }],
             }],
@@ -3842,3 +3985,6 @@ mod tests {
 
 #[cfg(test)]
 mod resume_tests;
+
+#[cfg(test)]
+mod graft_tests;

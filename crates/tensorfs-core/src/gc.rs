@@ -133,6 +133,7 @@ pub fn session_holds(store: &Store) -> Result<(Vec<HeldKey>, Vec<String>)> {
         .map(|line| HeldKey::parse_line(line))
         .collect::<Result<Vec<_>>>()?;
     holds.extend(crate::derived::retained_objects(store)?);
+    holds.extend(crate::source_artifact::held_objects(store)?);
     holds.sort_by(|left, right| left.key.cmp(&right.key));
     if holds
         .windows(2)

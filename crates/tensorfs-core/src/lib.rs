@@ -42,9 +42,13 @@ pub mod relation;
 pub mod repo_cache;
 pub mod repository;
 pub mod sha256;
+pub mod source_artifact;
 pub mod spec;
 pub mod staging;
 pub mod storage;
 pub mod store;
 pub mod transport;
 pub mod vectors;
+
+/// Conservative identity of the actual native converter build, not its version label.
+pub const IMPLEMENTATION_SHA256: &str = env!("TENSORFS_IMPLEMENTATION_SHA256");

@@ -1071,7 +1071,8 @@ fn digest_field(hash: &mut crate::sha256::Sha256, value: &[u8]) {
 
 fn request_digest(request: &PrepareModelSource, _registry_bytes: &[u8]) -> String {
     let mut hash = crate::sha256::Sha256::new();
-    digest_field(&mut hash, b"tensorfs.model-source-preparation");
+    digest_field(&mut hash, b"tensorfs.model-source-preparation/2");
+    digest_field(&mut hash, crate::IMPLEMENTATION_SHA256.as_bytes());
     digest_field(&mut hash, request.source_selection_digest.as_bytes());
     for row in &request.profiles {
         digest_field(&mut hash, row.slot.as_bytes());
@@ -1105,7 +1106,7 @@ fn validate_prepared_result(store: &Store, source: &PreparedModelSource) -> Resu
     Ok(())
 }
 
-fn prepare_model_source_with_registry(
+pub fn prepare_model_source_with_registry(
     store: &Store,
     request: &PrepareModelSource,
     registry_locator: &str,
@@ -1519,6 +1520,85 @@ pub fn release_model_source(store: &Store, operation_id: &str) -> Result<()> {
             }),
         }
     })
+}
+
+/// Read already-durable source heads without reopening a converter or rewriting a journal.
+/// Each cursor is validated against its native chain and exact operation/plan identity.
+pub fn source_checkpoints(store: &Store, operation: &str) -> Result<Vec<SourceCheckpoint>> {
+    crate::catalog::source_operation_id(operation)?;
+    let _writer = crate::catalog::WriterGuard::acquire(store.root())?;
+    if !crate::catalog::Catalog::open(store.root())?
+        .model_source_operations()?
+        .iter()
+        .any(|id| id == operation)
+    {
+        return refuse(Code::ROOT_ABSENT, "source operation is not retained");
+    }
+    let dir = transaction::candidate_dir(store.root(), operation);
+    let mut checkpoints = BTreeMap::new();
+    for entry in fs::read_dir(&dir).map_err(|e| Refusal {
+        code: Code::IO_FAILED,
+        detail: format!("source progress directory: {e}"),
+    })? {
+        let path = entry
+            .map_err(|e| Refusal {
+                code: Code::IO_FAILED,
+                detail: format!("source progress entry: {e}"),
+            })?
+            .path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(plan_hex) = name
+            .strip_prefix("convert-")
+            .and_then(|value| value.strip_suffix(".head.json"))
+        else {
+            continue;
+        };
+        crate::ids::hex64("source progress plan", plan_hex)?;
+        let mut bytes = Vec::new();
+        fs::File::open(&path)
+            .map_err(|e| Refusal {
+                code: Code::IO_FAILED,
+                detail: format!("source progress cursor: {e}"),
+            })?
+            .take(crate::limits::SPEC_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| Refusal {
+                code: Code::IO_FAILED,
+                detail: format!("source progress read: {e}"),
+            })?;
+        let value = canon::parse_canonical(&bytes, crate::limits::SPEC_MAX_BYTES)?;
+        let head = ObjectRef::from_value("source progress head", &value)?;
+        let plan_digest = format!("sha256:{plan_hex}");
+        let chain = durability::local_chain(store, &head, &plan_digest)?;
+        let Some(slot) = chain.operation.strip_prefix(&format!("{operation}/")) else {
+            return refuse(
+                Code::CROSS_SUBJECT_REPLAY,
+                "source cursor belongs to another operation",
+            );
+        };
+        ascii_name("source progress slot", slot, crate::limits::MAX_NAME_BYTES)?;
+        if checkpoints.contains_key(slot) {
+            return refuse(
+                Code::TRANSACTION_CONFLICT,
+                "source slot has multiple durable plans",
+            );
+        }
+        checkpoints.insert(
+            slot.to_string(),
+            SourceCheckpoint {
+                slot: slot.to_string(),
+                plan_digest,
+                head: durability::Head {
+                    head: Some(head),
+                    links: chain.links,
+                    bytes: chain.bytes,
+                },
+            },
+        );
+    }
+    Ok(checkpoints.into_values().collect())
 }
 
 #[cfg(test)]
@@ -2146,6 +2226,32 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn durable_source_heads_are_readable_without_restarting_conversion() {
+        let root = temporary("source-head-readback");
+        let (store, registry, request) = fixture_sized(&root, false, Some(256));
+        let produced =
+            prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
+                .unwrap();
+        assert_eq!(
+            source_checkpoints(&store, &request.operation_id).unwrap(),
+            produced.checkpoints
+        );
+        let reopened = Store::open(store.root()).unwrap();
+        assert_eq!(
+            source_checkpoints(&reopened, &request.operation_id).unwrap(),
+            produced.checkpoints
+        );
+        release_model_source(&store, &request.operation_id).unwrap();
+        assert_eq!(
+            source_checkpoints(&store, &request.operation_id)
+                .unwrap_err()
+                .code,
+            Code::ROOT_ABSENT
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     // The replacement-Runtime consumer needs a real native prepared source and head,
     // not hand-authored SQL. Explicitly opt in; the caller owns the retained fixture.
     #[test]
@@ -2156,6 +2262,7 @@ mod tests {
         );
         assert!(!root.exists(), "fixture export requires a fresh owned path");
         let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+        fs::write(root.join("native-registry.json"), &registry).unwrap();
         let prepared =
             prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
                 .unwrap();
@@ -2389,6 +2496,62 @@ mod tests {
             },
         ];
         (store, registry.to_bytes(), carriers)
+    }
+
+    #[test]
+    fn retained_raw_tree_conversion_keeps_inputs_and_charges_output_space() {
+        let root = temporary("retained-raw-conversion");
+        let (store, registry, mut request) = fixture_sized(&root, false, Some(256));
+        let mut entries = Vec::new();
+        for row in &request.roster {
+            let reference = ObjectRef {
+                sha256: row.object_id.trim_start_matches("sha256:").into(),
+                length: row.length,
+            };
+            store
+                .put_file(&row.path, Some(&reference), &crate::store::Fault::default())
+                .unwrap();
+            entries.push((row.member.clone(), reference));
+        }
+        let tree = crate::manifest::Manifest::from_files(entries).unwrap();
+        let owner = crate::ids::object_id(b"raw source owner");
+        crate::source_artifact::create(&store, &owner, &tree).unwrap();
+        let (identity, roster, landed) =
+            crate::source_artifact::conversion_roster(&store, &owner).unwrap();
+        request.source_selection_digest = identity.id();
+        request.roster = roster;
+        request.landed = landed;
+        let occupied = store.occupancy().unwrap();
+        let constrained = store
+            .clone()
+            .bind_disk_budget(Some(occupied + 1023))
+            .unwrap();
+        let refusal = prepare_model_source_with_registry(
+            &constrained,
+            &request,
+            "fixture:registry",
+            &registry,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code, Code::CAPACITY_EXHAUSTED);
+        let store = constrained.bind_disk_budget(None).unwrap();
+        let result =
+            prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
+                .unwrap();
+        assert!(result.complete);
+        assert!(!result.spent.is_empty());
+        crate::gc::collect(store.root(), false).unwrap();
+        for row in tree.entries() {
+            assert!(store.record_valid(&row.1.blob().sha256).is_ok());
+        }
+        // A fresh converter request can start over while the original raw artifact survives.
+        request.operation_id = "changed-converter-attempt".into();
+        assert!(
+            prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
+                .unwrap()
+                .complete
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// A SHARDED model, prepared end to end out of a content-addressed staging area — the

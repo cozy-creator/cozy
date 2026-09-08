@@ -630,6 +630,9 @@ fn convert_bounded(
             progress.deferred_ops += 1;
             continue;
         }
+        // Retained raw source artifacts remain part of occupancy while new tensor
+        // groups are produced. Completed journal groups passed the skip above.
+        store.admits(bytes)?;
         let written_before = progress.written;
 
         let mut tparts: Vec<(String, Part)> = Vec::new();

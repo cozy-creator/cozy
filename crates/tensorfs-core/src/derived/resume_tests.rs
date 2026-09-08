@@ -20,11 +20,13 @@ fn fixture(label: &str) -> (Store, Meta, String, Declaration) {
         .object_id();
     tensor.parts = vec![
         PartDeclaration {
+            source: None,
             role: "data".into(),
             dtype: Dtype::F8E4M3FN,
             shape: vec![16, 32],
         },
         PartDeclaration {
+            source: None,
             role: "scale".into(),
             dtype: Dtype::F32,
             shape: vec![16],

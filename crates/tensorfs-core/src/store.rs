@@ -144,7 +144,7 @@ pub const FAULT_STAGES: &[&str] = &[
 ];
 
 impl Fault {
-    fn hit(&self, stage: &str) {
+    pub(crate) fn hit(&self, stage: &str) {
         if self.stage.as_deref() != Some(stage) {
             return;
         }
@@ -556,7 +556,12 @@ impl Store {
     /// they are not in any census — which is exactly why the number that decides whether an
     /// admission fits must see them.
     pub fn occupancy(&self) -> Result<u64> {
-        let mut total: u64 = crate::staging::bytes(self)?;
+        let mut total: u64 = crate::staging::bytes(self)?
+            .checked_add(crate::transport::prefix::bytes(self)?)
+            .ok_or_else(|| Refusal {
+                code: Code::ARITH_OVERFLOW,
+                detail: "prefix occupancy overflow".into(),
+            })?;
         for (namespace, suffix) in [("blobs", ""), ("manifests", ".json")] {
             let base = self.root.join(namespace);
             if !base.is_dir() {
@@ -1194,6 +1199,18 @@ impl Store {
         fault: &Fault,
         operation: Option<&str>,
     ) -> Result<Put> {
+        let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
+        let verified = self.stream_verified(r, expect, fault, PUT_TEMP)?;
+        self.admit_verified(verified, fault, operation)
+    }
+
+    /// Common no-clobber admission after streaming or durable-prefix digest verification.
+    pub(crate) fn admit_verified(
+        &self,
+        verified: Verified,
+        fault: &Fault,
+        operation: Option<&str>,
+    ) -> Result<Put> {
         let catalog = crate::catalog::Catalog::open(&self.root)?;
         let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
         let Verified {
@@ -1201,7 +1218,7 @@ impl Store {
             file: f,
             sha256: hex,
             length: len,
-        } = self.stream_verified(r, expect, fault, PUT_TEMP)?;
+        } = verified;
         let object = ObjectRef {
             sha256: hex.clone(),
             length: len,

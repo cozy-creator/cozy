@@ -29,7 +29,7 @@ that broke, is typed to its rows here.
 
 from collections.abc import Callable, Sequence
 from os import PathLike
-from typing import Any, Literal, Self, TypedDict
+from typing import Any, Literal, NotRequired, Self, TypedDict
 
 __version__: str
 
@@ -43,6 +43,29 @@ _Bytes = bytes
 # rows. Only where a caller indexes the result: a TypedDict that drifts from the Rust
 # `set_item` calls is a wrong answer with a type on it, so these are kept to the surfaces
 # a consumer actually reads.
+
+class TreeRoot(TypedDict):
+    owner: str
+    producer: str
+    receipt_digest: NotRequired[str]
+    receipt: NotRequired[bytes]
+    manifest_digest: str
+    manifest_length: int
+    complete: bool
+    released: bool
+
+class SelectedSource(TypedDict):
+    canonical: str
+    selection_sha256: str
+    content_manifest_digest: str
+    content_manifest_length: int
+    members: list[tuple[str, str, int, str]]
+    allowed_hosts: list[str]
+    credential_hosts: list[str]
+
+class MaterializedSource(TypedDict):
+    artifact: TreeRoot
+    transferred_bytes: int
 
 class PreparedSource(TypedDict):
     """One prepared foreign source, as `Store.prepare_model_source` returns it."""
@@ -397,6 +420,29 @@ class Store:
     def init(root: StrPath | None = None) -> Store: ...
     @property
     def root(self) -> str: ...
+    @property
+    def implementation_sha256(self) -> str: ...
+    def create_tree_root(self, owner: str, manifest_id: str, manifest_length: int) -> TreeRoot: ...
+    def retain_tree_root(self, source_owner: str, owner: str) -> TreeRoot: ...
+    def tree_root(self, owner: str) -> TreeRoot | None: ...
+    def release_tree_root(self, owner: str) -> None: ...
+    def release_tree_retention(self, source_owner: str, receipt_digest: str, owner: str) -> None: ...
+    def adopt_source_progress(self, source_owner: str, owner: str) -> TreeRoot: ...
+    def resolve_source(
+        self, source_uri: str, carriers: Sequence[str] = ..., *, profiles: Sequence[str] = ..., credential: str = ...,
+        huggingface: str | None = None, civitai: str | None = None, allow_local: bool = False,
+    ) -> SelectedSource: ...
+    def materialize_source(
+        self, owner: str, members: Sequence[tuple[str, str, int, str]], *,
+        allowed_hosts: Sequence[str], credential_hosts: Sequence[str] = ...,
+        credential: str = ..., allow_local: bool = False,
+    ) -> MaterializedSource: ...
+    def prepare_source_artifact(
+        self, source_owner: str, operation_id: str, profiles: Sequence[tuple[str, str]], *,
+        checkpoints: Sequence[tuple[str, str, int]] = ...,
+        adopt_from_operation_id: str | None = None,
+        registry: bytes | None = None,
+    ) -> PreparedModelSource: ...
     #: Read-only: the mount is recorded on the Store by `tfs store ensure --repo-cache`,
     #: and no caller of this facade passes one.
     @property
@@ -467,6 +513,7 @@ class Store:
         *,
         checkpoints: Sequence[tuple[str, str, int]] = ...,
         adopt_from_operation_id: str | None = ...,
+        registry: bytes | None = None,
     ) -> PreparedModelSource: ...
     def checkpoint_page(
         self, head_id: str, head_length: int, *, operation_id: str, slot: str,
@@ -479,6 +526,7 @@ class Store:
         self, object_id: str, length: int, manifest: bool, url: str, *, allow_local: bool = False,
         derived_restore: tuple[str, int] | None = None,
     ) -> dict[str, int | bool]: ...
+    def source_checkpoints(self, operation_id: str) -> list[SourceCheckpoint]: ...
     def model_source_operations(self) -> list[str]: ...
     def release_model_source(self, operation_id: str) -> None: ...
 
@@ -511,6 +559,10 @@ class Store:
         work_fingerprint: str,
         checkpoint: tuple[str, int] | None = None,
     ) -> DerivedWriter: ...
+    def adopt_derived_checkpoint(
+        self, transaction_id: str, source_transaction_id: str, declaration: bytes,
+        head_id: str, head_length: int, *, operation_id: str, slot: str,
+    ) -> dict[str, Any]: ...
     def derived_lookup(self, transaction_id: str) -> dict[str, Any]: ...
     def derived_fence(self, transaction_id: str, writer_session_id: int) -> bool: ...
     def derived_abandon(self, transaction_id: str) -> dict[str, Any]: ...

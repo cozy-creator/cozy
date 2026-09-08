@@ -36,6 +36,7 @@ mod http;
 mod hub;
 mod ledger;
 mod policy;
+pub(crate) mod prefix;
 mod pull;
 mod push;
 mod ranged;
@@ -59,3 +60,5 @@ pub use pull::{
 };
 pub use push::{push_object, Pushed, UploadGrant, MAX_GRANT_BYTES, PUT_ATTEMPTS};
 pub use ranged::{fetch_ranged, Ranged, PART_BYTES, RANGED_MIN_BYTES, SOURCE_STREAMS};
+
+pub use prefix::SourceDownload;

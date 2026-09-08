@@ -724,6 +724,120 @@ impl Resolution {
     }
 }
 
+/// Origin-independent identity of the exact selected logical file tree.
+pub fn content_manifest(resolution: &Resolution) -> Result<crate::manifest::Manifest> {
+    if resolution.members.is_empty() || resolution.members.len() > MEMBER_MAX {
+        return refuse(
+            Code::COUNT_CAP,
+            "selected source member count is outside the bound",
+        );
+    }
+    let mut lengths = std::collections::BTreeMap::new();
+    for member in &resolution.members {
+        if lengths
+            .insert(&member.object.sha256, member.object.length)
+            .is_some_and(|length| length != member.object.length)
+        {
+            return refuse(
+                Code::LENGTH_MISMATCH,
+                "selected members disagree on the same content length",
+            );
+        }
+        for required in &member.requires {
+            if !resolution.members.iter().any(|row| &row.member == required) {
+                return refuse(
+                    Code::MISSING_FIELD,
+                    "selected source is missing an index shard",
+                );
+            }
+        }
+    }
+    crate::manifest::Manifest::from_files(
+        resolution
+            .members
+            .iter()
+            .map(|member| (member.member.clone(), member.object.clone()))
+            .collect(),
+    )
+}
+
+/// Materialize precisely an accepted selection; never re-list or broaden its roster.
+#[allow(clippy::too_many_arguments)]
+pub fn materialize_selected(
+    store: &Store,
+    owner: &str,
+    resolution: &Resolution,
+    policy: &SourcePolicy,
+    credentials: &dyn CredentialProvider,
+    deadline: Deadline,
+    progress: &mut dyn FnMut(&str, u64),
+) -> Result<(crate::source_artifact::TreeRoot, Vec<Pulled>)> {
+    materialize_selected_with_options(
+        store,
+        owner,
+        resolution,
+        policy,
+        credentials,
+        deadline,
+        progress,
+        &crate::transport::SourceDownload::default(),
+    )
+}
+
+/// Native development fault points and checkpoint sizing for source qualification.
+#[allow(clippy::too_many_arguments)]
+pub fn materialize_selected_with_options(
+    store: &Store,
+    owner: &str,
+    resolution: &Resolution,
+    policy: &SourcePolicy,
+    credentials: &dyn CredentialProvider,
+    deadline: Deadline,
+    progress: &mut dyn FnMut(&str, u64),
+    options: &crate::transport::SourceDownload,
+) -> Result<(crate::source_artifact::TreeRoot, Vec<Pulled>)> {
+    use crate::ids::Doc;
+    let tree = content_manifest(resolution)?;
+    crate::source_artifact::check_roster(owner, &tree)?;
+    let mut writer = crate::source_artifact::Writer::open(store, owner, tree.object_ref())?;
+    let objects = resolution.objects();
+    let (plan, _) = FetchPlan::of_objects(store, "selected-source", &objects)?;
+    let ledger = Ledger::new();
+    let mut pulled = vec![];
+    for member in &resolution.members {
+        let held = matches!(store.record_valid(&member.object.sha256), Ok(row) if row.length == member.object.length);
+        let transferred = if held {
+            0
+        } else {
+            let grant = DeliveryGrant::mint(&plan, &member.object)?;
+            crate::transport::prefix::fetch_source(
+                store,
+                owner,
+                &grant,
+                &member.url,
+                policy,
+                credentials,
+                deadline,
+                &ledger,
+                options,
+                Some(&mut |bytes| progress(&member.member, bytes)),
+            )?
+            .transferred
+        };
+        writer.landed(&member.object)?;
+        pulled.push(Pulled {
+            member: member.member.clone(),
+            object: member.object.clone(),
+            transferred,
+            held,
+        });
+    }
+    plan.complete(store)?;
+    crate::transport::prefix::discard_owner(store, owner)?;
+    let result = writer.finish(&tree)?;
+    Ok((result, pulled))
+}
+
 /// The Go resolver's `finishPlan` digest, same construction: the canonical source name and
 /// every (member, digest, length) triple, each field NUL-terminated, in member order. One
 /// value naming this exact selection.

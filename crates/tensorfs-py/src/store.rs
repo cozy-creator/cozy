@@ -18,8 +18,8 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use tensorfs_core::catalog::{Catalog, WriterGuard};
 use tensorfs_core::checkpoint;
 use tensorfs_core::derived::{
-    self, ComponentDeclaration, ConfigDeclaration, Declaration, PartDeclaration, Source,
-    TensorDeclaration,
+    self, ComponentDeclaration, ConfigDeclaration, Declaration, PartDeclaration, PartSource,
+    Source, TensorDeclaration,
 };
 use tensorfs_core::err::{refuse, Code, Refusal, Result as TResult};
 use tensorfs_core::header::Header;
@@ -283,14 +283,38 @@ fn parse_declaration(
                     py,
                     part,
                     &format!("addition {target}/{tensor_key}#{role}"),
-                    &["dtype", "shape"],
+                    &["dtype", "shape", "source"],
                 )?;
                 let dtype = tensorfs_core::dtype::Dtype::parse(
                     &required(py, part, "part", "dtype")?.extract::<String>()?,
                 )
                 .or_refuse(py)?;
                 let shape: Vec<u64> = required(py, part, "part", "shape")?.extract()?;
-                parts.push(PartDeclaration { role, dtype, shape });
+                let source = part
+                    .get_item("source")?
+                    .map(|value| -> PyResult<PartSource> {
+                        let selected = value.cast::<PyDict>()?;
+                        only_keys(
+                            py,
+                            selected,
+                            "part source",
+                            &["source", "component", "tensor", "role"],
+                        )?;
+                        Ok(PartSource {
+                            source: required(py, selected, "part source", "source")?.extract()?,
+                            component: required(py, selected, "part source", "component")?
+                                .extract()?,
+                            tensor: required(py, selected, "part source", "tensor")?.extract()?,
+                            role: required(py, selected, "part source", "role")?.extract()?,
+                        })
+                    })
+                    .transpose()?;
+                parts.push(PartDeclaration {
+                    role,
+                    dtype,
+                    shape,
+                    source,
+                });
             }
             add.push(TensorDeclaration {
                 key: tensor_key,
@@ -478,6 +502,25 @@ impl PyRepoObjectCache {
     }
 }
 
+fn tree_root_dict<'p>(
+    py: Python<'p>,
+    root: &tensorfs_core::source_artifact::TreeRoot,
+) -> PyResult<Bound<'p, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("owner", &root.owner)?;
+    result.set_item("producer", &root.producer)?;
+    if root.complete {
+        let receipt = root.receipt().or_refuse(py)?;
+        result.set_item("receipt_digest", tensorfs_core::ids::object_id(&receipt))?;
+        result.set_item("receipt", PyBytes::new(py, &receipt))?;
+    }
+    result.set_item("manifest_digest", root.manifest.id())?;
+    result.set_item("manifest_length", root.manifest.length)?;
+    result.set_item("complete", root.complete)?;
+    result.set_item("released", root.released)?;
+    Ok(result)
+}
+
 #[pyclass(name = "Store")]
 pub struct PyStore {
     pub store: Arc<CoreStore>,
@@ -523,6 +566,237 @@ impl PyStore {
     #[getter]
     fn root(&self) -> String {
         self.store.root().display().to_string()
+    }
+
+    /// Exact native source/converter build identity, including same-version source edits.
+    #[getter]
+    fn implementation_sha256(&self) -> &'static str {
+        tensorfs_core::IMPLEMENTATION_SHA256
+    }
+
+    /// Retain a complete ordinary-file manifest under an independent producer root.
+    fn create_tree_root<'p>(
+        &self,
+        py: Python<'p>,
+        owner: &str,
+        manifest_id: &str,
+        manifest_length: u64,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let reference = obj_ref(py, manifest_id, manifest_length)?;
+        let root = py
+            .detach(|| {
+                let tree = self.store.read_manifest(&reference)?;
+                tensorfs_core::source_artifact::create(&self.store, owner, &tree)
+            })
+            .or_refuse(py)?;
+        tree_root_dict(py, &root)
+    }
+
+    fn retain_tree_root<'p>(
+        &self,
+        py: Python<'p>,
+        source_owner: &str,
+        owner: &str,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let root = py
+            .detach(|| tensorfs_core::source_artifact::retain(&self.store, source_owner, owner))
+            .or_refuse(py)?;
+        tree_root_dict(py, &root)
+    }
+
+    fn tree_root<'p>(&self, py: Python<'p>, owner: &str) -> PyResult<Option<Bound<'p, PyDict>>> {
+        let root = py
+            .detach(|| tensorfs_core::source_artifact::read(&self.store, owner))
+            .or_refuse(py)?;
+        root.as_ref()
+            .map(|root| tree_root_dict(py, root))
+            .transpose()
+    }
+
+    fn adopt_source_progress<'p>(
+        &self,
+        py: Python<'p>,
+        source_owner: &str,
+        owner: &str,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let root = py
+            .detach(|| {
+                tensorfs_core::source_artifact::adopt_partial(&self.store, source_owner, owner)
+            })
+            .or_refuse(py)?;
+        tree_root_dict(py, &root)
+    }
+
+    fn release_tree_retention(
+        &self,
+        py: Python<'_>,
+        source_owner: &str,
+        receipt_digest: &str,
+        owner: &str,
+    ) -> PyResult<()> {
+        py.detach(|| {
+            tensorfs_core::source_artifact::release_retention(
+                &self.store,
+                source_owner,
+                receipt_digest,
+                owner,
+            )
+        })
+        .or_refuse(py)
+    }
+
+    fn release_tree_root(&self, py: Python<'_>, owner: &str) -> PyResult<()> {
+        py.detach(|| tensorfs_core::source_artifact::release(&self.store, owner))
+            .or_refuse(py)
+    }
+
+    /// Resolve only immutable provider URIs and narrow to the reviewed carriers.
+    /// Deployment adapters own credentials and optional loopback origins.
+    #[pyo3(signature = (source_uri, carriers=Vec::new(), *, profiles=Vec::new(), credential=String::new(), huggingface=None, civitai=None, allow_local=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_source<'p>(
+        &self,
+        py: Python<'p>,
+        source_uri: &str,
+        carriers: Vec<String>,
+        profiles: Vec<String>,
+        credential: String,
+        huggingface: Option<String>,
+        civitai: Option<String>,
+        allow_local: bool,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        use tensorfs_core::{providers, transport};
+        let uri = providers::SourceUri::parse(source_uri).or_refuse(py)?;
+        let mut endpoints = providers::Endpoints::default();
+        if let Some(value) = huggingface {
+            endpoints.huggingface = value;
+        }
+        if let Some(value) = civitai {
+            endpoints.civitai = value;
+        }
+        endpoints.allow_local = allow_local;
+        let policy = endpoints.policy(&uri);
+        let host = transport::base_host(match &uri {
+            providers::SourceUri::HuggingFace { .. } => &endpoints.huggingface,
+            providers::SourceUri::Civitai { .. } => &endpoints.civitai,
+        })
+        .or_refuse(py)?;
+        let credentials =
+            transport::credential_from_spec(&credential, vec![host.clone()]).or_refuse(py)?;
+        let selected = py
+            .detach(|| {
+                let resolution = providers::resolve(
+                    &uri,
+                    &endpoints,
+                    &credentials,
+                    transport::Deadline::none(),
+                )?;
+                let selected = if !carriers.is_empty() {
+                    if !profiles.is_empty() { return refuse(Code::TRANSACTION_CONFLICT, "choose carriers or reviewed profiles"); }
+                    carriers.clone()
+                } else if !profiles.is_empty() {
+                    let heads = providers::read_heads(&resolution, &uri, &endpoints, &credentials, transport::Deadline::none())?;
+                    if !heads.unread.is_empty() { return refuse(Code::DURABILITY_UNPROVEN, "provider headers cannot establish reviewed profile selection"); }
+                    let planned = tensorfs_core::ingest::preflight::plan(model_source::BUILTIN_REGISTRY,
+                        model_source::BUILTIN_REGISTRY_BYTES, &heads.heads, &profiles,
+                        &self.store.root().join("tmp").join(format!("source-select-{}", tensorfs_core::meta::now_nanos_unique())))?;
+                    let mut selected: Vec<String> = planned.plans.into_iter().flat_map(|plan| plan.components.into_iter().filter_map(|component| component.member)).collect();
+                    selected.sort(); selected.dedup(); selected
+                } else {
+                    let candidates: Vec<_> = resolution.members.iter().filter(|row| row.carrier).map(|row| row.member.clone()).collect();
+                    if candidates.len() != 1 { return refuse(Code::AMBIGUOUS_CLASSIFICATION, "source has multiple carriers; select a reviewed profile or explicit carrier"); }
+                    candidates
+                };
+                resolution.select(&selected)
+            })
+            .or_refuse(py)?;
+        let manifest = providers::content_manifest(&selected).or_refuse(py)?;
+        let result = PyDict::new(py);
+        result.set_item("canonical", selected.canonical)?;
+        result.set_item("selection_sha256", selected.selection_sha256)?;
+        result.set_item("content_manifest_digest", manifest.object_id())?;
+        result.set_item("content_manifest_length", manifest.canonical_bytes().len())?;
+        result.set_item(
+            "members",
+            selected
+                .members
+                .iter()
+                .map(|row| {
+                    (
+                        row.member.clone(),
+                        row.object.id(),
+                        row.object.length,
+                        row.url.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        result.set_item("allowed_hosts", policy.allowed_hosts)?;
+        result.set_item("credential_hosts", vec![host])?;
+        Ok(result)
+    }
+
+    /// Members are accepted exact (logical member, raw SHA-256, length, URL) rows.
+    /// URLs and credentials are used for this call only and are never persisted in roots.
+    #[pyo3(signature = (owner, members, *, allowed_hosts, credential_hosts=Vec::new(), credential=String::new(), allow_local=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_source<'p>(
+        &self,
+        py: Python<'p>,
+        owner: &str,
+        members: Vec<(String, String, u64, String)>,
+        allowed_hosts: Vec<String>,
+        credential_hosts: Vec<String>,
+        credential: String,
+        allow_local: bool,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        use tensorfs_core::{providers, transport};
+        let rows = members
+            .into_iter()
+            .map(|(member, digest, length, url)| {
+                let object = obj_ref(py, &digest, length)?;
+                Ok(providers::ResolvedMember {
+                    member,
+                    object,
+                    url,
+                    provenance: providers::Provenance::Declared,
+                    carrier: true,
+                    requires: vec![],
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let resolution = providers::Resolution {
+            canonical: String::new(),
+            selection_sha256: String::new(),
+            members: rows,
+        };
+        let credentials =
+            transport::credential_from_spec(&credential, credential_hosts).or_refuse(py)?;
+        let policy = transport::SourcePolicy {
+            allowed_hosts,
+            allow_local,
+            max_redirects: 5,
+        };
+        let (root, rows) = py
+            .detach(|| {
+                providers::materialize_selected(
+                    &self.store,
+                    owner,
+                    &resolution,
+                    &policy,
+                    &credentials,
+                    transport::Deadline::none(),
+                    &mut |_, _| {},
+                )
+            })
+            .or_refuse(py)?;
+        let result = PyDict::new(py);
+        result.set_item("artifact", tree_root_dict(py, &root)?)?;
+        result.set_item(
+            "transferred_bytes",
+            rows.iter().map(|row| row.transferred).sum::<u64>(),
+        )?;
+        Ok(result)
     }
 
     /// The mounted immutable object cache this Store is bound to, or `None`.
@@ -755,7 +1029,7 @@ impl PyStore {
 
     /// Advance the exact source plan over verified physical carriers. Checkpoint heads are
     /// local progress until the RecordOwner acknowledges their complete upload.
-    #[pyo3(signature = (operation_id, source_selection_digest, profiles, roster, landed, *, checkpoints=Vec::new(), adopt_from_operation_id=None))]
+    #[pyo3(signature = (operation_id, source_selection_digest, profiles, roster, landed, *, checkpoints=Vec::new(), adopt_from_operation_id=None, registry=None))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn prepare_model_source<'p>(
         &self,
@@ -767,6 +1041,7 @@ impl PyStore {
         landed: Vec<String>,
         checkpoints: Vec<(String, String, u64)>,
         adopt_from_operation_id: Option<String>,
+        registry: Option<Vec<u8>>,
     ) -> PyResult<Bound<'p, PyDict>> {
         let checkpoints = checkpoints
             .into_iter()
@@ -807,7 +1082,15 @@ impl PyStore {
             adopt_from_operation_id,
         };
         let prepared = py
-            .detach(|| model_source::prepare_model_source(&self.store, &request))
+            .detach(|| match &registry {
+                Some(bytes) => model_source::prepare_model_source_with_registry(
+                    &self.store,
+                    &request,
+                    "supplied:native-registry",
+                    bytes,
+                ),
+                None => model_source::prepare_model_source(&self.store, &request),
+            })
             .or_refuse(py)?;
         let out = PyDict::new(py);
         out.set_item("replayed", prepared.replayed)?;
@@ -844,6 +1127,44 @@ impl PyStore {
         }
         out.set_item("checkpoints", checkpoints)?;
         Ok(out)
+    }
+
+    /// Convert a retained source tree without exposing native carrier paths to authors.
+    #[pyo3(signature = (source_owner, operation_id, profiles, *, checkpoints=Vec::new(), adopt_from_operation_id=None, registry=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_source_artifact<'p>(
+        &self,
+        py: Python<'p>,
+        source_owner: &str,
+        operation_id: &str,
+        profiles: Vec<(String, String)>,
+        checkpoints: Vec<(String, String, u64)>,
+        adopt_from_operation_id: Option<String>,
+        registry: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let _source_lease = py
+            .detach(|| WriterGuard::acquire(self.store.root()))
+            .or_refuse(py)?;
+        let retained = py
+            .detach(|| tensorfs_core::source_artifact::conversion_roster(&self.store, source_owner))
+            .or_refuse(py)?;
+        let roster = retained
+            .1
+            .into_iter()
+            .map(|row| (row.member, row.object_id, row.length, row.path, row.header))
+            .collect();
+        let landed = retained.2;
+        self.prepare_model_source(
+            py,
+            operation_id,
+            &retained.0.id(),
+            profiles,
+            roster,
+            landed,
+            checkpoints,
+            adopt_from_operation_id,
+            registry,
+        )
     }
 
     /// One bounded link window, usable as soon as that link alone is resident.
@@ -1063,6 +1384,29 @@ impl PyStore {
 
     /// Source-operation cleanup roster; the caller quiesces the owned Store lifecycle.
     /// Does not scan roots or recover coordination lost with a deleted catalog.
+    fn source_checkpoints<'p>(
+        &self,
+        py: Python<'p>,
+        operation_id: &str,
+    ) -> PyResult<Bound<'p, PyList>> {
+        let checkpoints = py
+            .detach(|| model_source::source_checkpoints(&self.store, operation_id))
+            .or_refuse(py)?;
+        let result = PyList::empty(py);
+        for checkpoint in checkpoints {
+            let head = checkpoint.head.head.expect("source checkpoint has a head");
+            let row = PyDict::new(py);
+            row.set_item("slot", checkpoint.slot)?;
+            row.set_item("plan_digest", checkpoint.plan_digest)?;
+            row.set_item("head", head.id())?;
+            row.set_item("head_length", head.length)?;
+            row.set_item("index", checkpoint.head.links - 1)?;
+            row.set_item("bytes", checkpoint.head.bytes)?;
+            result.append(row)?;
+        }
+        Ok(result)
+    }
+
     fn model_source_operations(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         py.detach(|| {
             tensorfs_core::catalog::Catalog::open(self.store.root())?.model_source_operations()
@@ -1530,6 +1874,44 @@ impl PyStore {
             )
         })
         .or_refuse(py)
+    }
+
+    /// Adopt exact checkpointed parts into independently owned recipient progress.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (transaction_id, source_transaction_id, declaration, head_id, head_length, *, operation_id, slot))]
+    fn adopt_derived_checkpoint<'p>(
+        &self,
+        py: Python<'p>,
+        transaction_id: &str,
+        source_transaction_id: &str,
+        declaration: &[u8],
+        head_id: &str,
+        head_length: u64,
+        operation_id: &str,
+        slot: &str,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let head = obj_ref(py, head_id, head_length)?;
+        let (plan, head) = py
+            .detach(|| {
+                derived::adopt_checkpoint(
+                    &self.store,
+                    &self.meta,
+                    transaction_id,
+                    source_transaction_id,
+                    declaration,
+                    &head,
+                    operation_id,
+                    slot,
+                )
+            })
+            .or_refuse(py)?;
+        let out = PyDict::new(py);
+        out.set_item("plan_digest", plan)?;
+        out.set_item("head", head.head.as_ref().map(ObjectRef::id))?;
+        out.set_item("head_length", head.head.as_ref().map_or(0, |r| r.length))?;
+        out.set_item("index", head.links.saturating_sub(1))?;
+        out.set_item("bytes", head.bytes)?;
+        Ok(out)
     }
 
     /// Open one exact tfs-019 transaction. Python supplies typed plain values; canonical
