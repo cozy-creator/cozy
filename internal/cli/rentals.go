@@ -20,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/rentalid"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
@@ -304,9 +305,31 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	// create answer can name a billing pod. Cancellation is sampled immediately
 	// after its durable verdict, when the rental id can be released exactly.
 	hctx, cancel := rentalCallContext(deadline)
-	remote, e := c.Rent(hctx, op.RequestBody, op.Reason, operationKey)
+	remote, answered, e := c.Rent(hctx, op.RequestBody, op.Reason, operationKey)
 	cancel()
 	if e != nil {
+		// AN ANSWERED ASK BOUGHT A POD. Whether this client can use the answer is a
+		// separate question from whether a machine is now provisioning and billing, and
+		// conflating them is what orphaned six H100s: the hub's create answer omitted one
+		// field, the width fence refused it, and the ask was filed as having bought
+		// nothing — deleting the only name this host had for a live pod. So the identity
+		// the answer DID carry is recorded, the operation stays open, and the refusal says
+		// how to end the machine it just paid for.
+		if answered {
+			if rentalid.Valid(remote.ID) {
+				state := remote.State
+				if state == "" {
+					state = "pending_acquisition"
+				}
+				if advanced := st.AdvanceRentalOperation(operationKey, remote.ID, state); advanced != nil {
+					return records.Rental{}, hub.Rental{}, false, advanced
+				}
+			}
+			return records.Rental{}, hub.Rental{}, false, e.
+				WithRemedy("%s ACCEPTED this ask, so a pod may be provisioning and billing under it; "+
+					"this host kept the operation and will not treat the answer as a refusal", c.Base()).
+				WithNext("cozy rental end "+either(remote.ID, machineName), "cozy rental")
+		}
 		if e.Code == exit.Credential || e.Code == exit.Validation ||
 			e.Code == exit.NotFound || e.Code == exit.Conflict {
 			if advanced := st.AdvanceRentalOperation(operationKey, "", "rejected"); advanced != nil {
@@ -645,6 +668,14 @@ func detailOr(detail string) string {
 	return detail
 }
 
+// either is the first non-empty of two names for the same thing.
+func either(preferred, fallback string) string {
+	if preferred != "" {
+		return preferred
+	}
+	return fallback
+}
+
 func rentalFailureCode(r hub.Rental) string {
 	if r.Failure != nil && r.Failure.Code != "" {
 		return r.Failure.Code
@@ -859,6 +890,63 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		list.TypedFields = []string{"machine", "sku", "state", "rental_id", "rented_at",
 			"running", "queued", "idle_s", "release_due_at", "failure_code"}
 	}
+	// UNSETTLED PAID ASKS ARE PART OF THE FLEET (cl-193). A board built only from attached
+	// rows shows zero machines while an accepted ask provisions a pod that is billing, and
+	// that is not a display detail — it is the difference between noticing a runaway charge
+	// and finding it in the invoice. Creator cannot enumerate the hub's side, so it shows
+	// the asks it made and has not seen settled, which is the half it does own.
+	open, e := st.ActiveRentalOperations()
+	if e != nil {
+		return output.List{}, e
+	}
+	unattached := 0
+	for index := range open {
+		op := open[index]
+		if op.RentalID != "" {
+			attached, problem := st.RentalRow(op.RentalID)
+			if problem != nil {
+				return output.List{}, problem
+			}
+			if attached != nil {
+				continue
+			}
+		}
+		unattached++
+		var request hub.RentalRequest
+		_ = json.Unmarshal(op.RequestBody, &request)
+		machine := either(request.Name, op.Key)
+		list.Rows = append(list.Rows, map[string]string{
+			"machine": machine, "sku": orNone(request.SKU), "state": op.State,
+			"failure": "—", "uptime": rentalUptime(op.CreatedAt), "running": "0", "queued": "0",
+			"idle": "—", "rental": orNone(op.RentalID), "bought for": orNone(op.ManagedRequestID),
+			"accelerator": "—", "address": "", "media": "", "hub": op.Hub,
+			"rented": stamp(op.CreatedAt), "ready": "—", "idle_since": "", "release_due": "",
+			"image": "", "provider": "", "provider resource": "", "provider host": "",
+			"provider state": "", "container state": "",
+		})
+		typed := map[string]any{
+			"machine": machine, "state": op.State, "rental_id": op.RentalID,
+			"running": 0, "queued": 0, "hourly_rate_usd_micros": op.HourlyRateUSDMicros,
+			"accelerator_count": 0, "operation": op.Key, "attached": false,
+		}
+		for key, value := range map[string]string{"sku": request.SKU, "hub": op.Hub,
+			"rented_at": op.CreatedAt, "bought_for": op.ManagedRequestID} {
+			if value != "" {
+				typed[key] = value
+			}
+		}
+		list.TypedRows = append(list.TypedRows, typed)
+	}
+	if unattached > 0 {
+		list.AllFields = append(list.AllFields, "operation")
+		list.TypedAllFields = append(list.TypedAllFields, "operation", "attached")
+		list.Lead = append(list.Lead, fmt.Sprintf(
+			"Paid asks with no attached machine: %d (a pod may be provisioning and billing under each)", unattached))
+		list.Aggregates = append(list.Aggregates,
+			output.Field{K: "unattached_rental_operations", V: jsonFact{unattached}})
+		list.Trail = append(list.Trail,
+			"this host can only name the rentals it recorded; the hub publishes no list of the pods this account owns")
+	}
 	if len(list.Rows) > 0 {
 		list.Next = []string{"cozy rental end " + list.Rows[0]["machine"]}
 	}
@@ -963,6 +1051,14 @@ func idleReleaseNote(grace time.Duration) string {
 // handleRentRelease is idempotent and ends only on provider ABSENCE: the hub reporting the
 // rental gone (404) or `released`. Nothing local is forgotten before that, because the row
 // is the only name this host has for a pod that may still be billing.
+//
+// ABSENCE HAS TO BE PROVED, and a 404 only proves it for an id the hub can look up
+// (cl-193). A machine word is Creator's own alias — `GET /v1/rentals/aeirik` is a
+// well-formed request for a key that hub indexes nothing under, so its 404 says exactly
+// nothing about the pod. Reading it as `state: ended` is what let six provisioned H100s
+// keep billing while this command reported success, so the subject is resolved through
+// everything this host recorded FIRST, and an unresolvable subject refuses rather than
+// answering about Creator's own empty view.
 func handleRentRelease(ctx *Context) *exit.Error {
 	subject := strings.TrimSpace(ctx.Inv.Args[0])
 	l, st, e := rentalStores(ctx)
@@ -975,41 +1071,81 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		return e
 	}
 	fmt.Fprintln(ctx.Err, line)
-	row, e := st.RentalByMachine(subject)
+	known, e := rental.Resolve(st, subject)
 	if e != nil {
 		return e
 	}
-	id := subject
-	if row != nil {
-		id = row.ID
-	}
+	row := known.Row
 	c := client(ctx)
-	if row != nil && row.Hub != c.Base() {
+	if known.Hub != "" && known.Hub != c.Base() {
 		return exit.Named(exit.Conflict, "rental.hub_mismatch",
-			"rental %s was rented from %s, not the configured hub %s", id, row.Hub, c.Base()).
+			"rental %s was rented from %s, not the configured hub %s",
+			either(known.RentalID, subject), known.Hub, c.Base()).
 			WithRemedy("point TENSORHUB_URL at the hub that holds the pod; a 404 from another hub says nothing about it")
+	}
+	// An ask this host recorded but never got an id back from is the exact shape of the
+	// live incident: the pod is provisioned and billing, and the only handle on it is the
+	// idempotency key the ask was sent under. Replaying that key is not a second purchase —
+	// it is the hub's own contract for recovering the identity of the first one.
+	if known.RentalID == "" && known.Operation != nil {
+		// A REFUSED ask bought nothing, and replaying it would be a purchase rather than a
+		// recovery. That is the one absence this host can prove without asking anyone.
+		if known.Operation.State == "rejected" {
+			return emit(ctx, output.Record{Fields: []output.Field{
+				{K: "machine", V: either(known.Machine, subject)}, {K: "rental", V: ""},
+				{K: "state", V: "ended"}, {K: "changed", V: false}, {K: "forgotten", V: false},
+			}, Notes: []string{known.Operation.Hub + " REFUSED this ask (operation " +
+				known.Operation.Key + "), so no pod was ever created under it"}})
+		}
+		id, problem := learnRentalIdentity(ctx, l, st, known.Operation)
+		if problem != nil {
+			return problem
+		}
+		if id == "" {
+			return exit.Named(exit.Conflict, "rental.identity_unknown",
+				"this host asked %s for machine %s under operation %s and never learned the rental id it was given",
+				known.Operation.Hub, either(known.Machine, subject), known.Operation.Key).
+				WithRemedy("a pod may be provisioned and billing under that ask, and Creator cannot release what it " +
+					"cannot name; have the hub name the rentals this account owns and release that id there").
+				WithNext("cozy rental")
+		}
+		known.RentalID = id
+	}
+	id := known.RentalID
+	if id == "" {
+		// Nothing local matches. The caller may still be naming a hub id this host never
+		// recorded, so ask — but the answer is only believed when the hub AFFIRMS.
+		id = subject
 	}
 	rctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	machine := subject
-	if row != nil {
-		machine = row.MachineName
+	machine := known.Machine
+	if machine == "" {
+		machine = subject
 	}
 	w := releaseWatch{ctx: ctx, c: c, id: id, machine: machine, rctx: rctx}
 
-	seen, gone, e := w.observe()
+	seen, verdict, e := w.observe()
 	if e != nil {
 		return e
+	}
+	if verdict == rentalAbsent && !known.Recorded() {
+		return exit.Named(exit.NotFound, "rental.unknown",
+			"this host holds no record of %q and %s answered 404 for that exact key", subject, c.Base()).
+			WithRemedy("that 404 is not proof the machine is gone: the hub identifies a rental by the opaque id it "+
+				"minted, which a machine word is not, so an unrecorded name cannot be looked up at all. "+
+				"Name the rental id, or have the hub list the rentals this account owns").
+			WithNext("cozy rental", "cozy rental end <rental-id>")
 	}
 	if problem := st.RequestRetainedRentalAbandonment(id, "cozy rental end"); problem != nil {
 		return problem
 	}
-	if gone {
+	if verdict != rentalLive {
 		operationKey, releaseProblem := st.RequestRentalRelease(id)
 		if releaseProblem != nil {
 			return releaseProblem
 		}
-		return w.finish(l, st, operationKey, row != nil,
+		return w.finish(l, st, operationKey, row != nil, false, known.Operation,
 			"the hub already reported this rental gone")
 	}
 
@@ -1024,12 +1160,13 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		}
 	}
 	for {
-		_, gone, e := w.observe()
+		_, verdict, e := w.observe()
 		if e != nil {
 			return e
 		}
-		if gone {
-			return w.finish(l, st, operationKey, row != nil, "the hub destroyed the pod")
+		if verdict != rentalLive {
+			return w.finish(l, st, operationKey, row != nil, true, known.Operation,
+				"the hub destroyed the pod")
 		}
 		select {
 		case <-rctx.Done():
@@ -1037,6 +1174,52 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		case <-time.After(pollCadence):
 		}
 	}
+}
+
+// learnRentalIdentity recovers the hub identity of a paid ask this host never got one back
+// from. It replays the ask under its ORIGINAL idempotency key, which is not a second
+// purchase but the hub's own contract for answering with the rental the first ask created.
+//
+// It is the only way out of the state that cost real money: the create answer was received
+// and REFUSED locally, so a pod was provisioned and billing while nothing here held its
+// name. It returns "" only when the hub proves the ask created nothing.
+func learnRentalIdentity(ctx *Context, l home.Layout, st *records.Store,
+	op *records.RentalOperation,
+) (string, *exit.Error) {
+	sub := *ctx
+	sub.Cfg.HubURL = op.Hub
+	sub.Cfg.HubURLSource = "rental operation"
+	hctx, cancel := hub.LongContext()
+	seen, answered, problem := client(&sub).Rent(hctx, op.RequestBody, op.Reason, op.Key)
+	cancel()
+	// A REFUSAL created nothing, so the ask may be settled as having bought nothing. An
+	// ANSWERED ask did create something, whatever this client makes of the body, so its
+	// identity is kept and the operation stays open.
+	if problem != nil && !answered {
+		if problem.Code == exit.Credential || problem.Code == exit.Validation ||
+			problem.Code == exit.NotFound || problem.Code == exit.Conflict {
+			if advanced := st.AdvanceRentalOperation(op.Key, "", "rejected"); advanced != nil {
+				return "", advanced
+			}
+			rental.ForgetPending(l, op.Key)
+			return "", nil
+		}
+		return "", problem
+	}
+	if !rentalid.Valid(seen.ID) {
+		return "", exit.Named(exit.Conflict, "rental.identity_unnamed",
+			"%s answered the replay of operation %s without a usable rental id", op.Hub, op.Key).
+			WithRemedy("upgrade Tensorhub; a pod may be provisioned under this ask and only its id can release it")
+	}
+	state := seen.State
+	if state == "" {
+		state = "pending_acquisition"
+	}
+	if advanced := st.AdvanceRentalOperation(op.Key, seen.ID, state); advanced != nil {
+		return "", advanced
+	}
+	op.RentalID = seen.ID
+	return seen.ID, nil
 }
 
 type releaseWatch struct {
@@ -1048,27 +1231,40 @@ type releaseWatch struct {
 	said    string
 }
 
+// rentalVerdict is what the hub said about the id it was asked, and the three answers are
+// deliberately not two. `rentalReleased` is the hub AFFIRMING a rental it knows and has
+// torn down; `rentalAbsent` is a 404, which affirms nothing — it means only that nothing
+// is filed under the key that was sent, whether because the pod is gone or because the key
+// was never one the hub could resolve. Collapsing the two is the whole defect (cl-193).
+type rentalVerdict int
+
+const (
+	rentalLive rentalVerdict = iota
+	rentalReleased
+	rentalAbsent
+)
+
 // observe reads the rental until the hub gives a verdict. Transport faults are retried at
 // cadence: they say nothing about the pod, and a release that gave up on them would leave
 // the local half of a billing pod deleted or orphaned on a guess.
-func (w *releaseWatch) observe() (hub.Rental, bool, *exit.Error) {
+func (w *releaseWatch) observe() (hub.Rental, rentalVerdict, *exit.Error) {
 	for {
-		r, e := w.c.Rental(w.rctx, w.id)
+		r, e := w.c.RentalView(w.rctx, w.id)
 		switch {
 		case e == nil && r.State == hub.RentalReleased:
-			return r, true, nil
+			return r, rentalReleased, nil
 		case e == nil:
 			w.say(r.State, r.Detail)
-			return r, false, nil
+			return r, rentalLive, nil
 		case e.Code == exit.NotFound:
-			return hub.Rental{}, true, nil
+			return hub.Rental{}, rentalAbsent, nil
 		case !transient(e):
-			return hub.Rental{}, false, w.kept(e)
+			return hub.Rental{}, rentalLive, w.kept(e)
 		}
 		w.say("hub", e.Message+"; retrying")
 		select {
 		case <-w.rctx.Done():
-			return hub.Rental{}, false, w.interrupted()
+			return hub.Rental{}, rentalLive, w.interrupted()
 		case <-time.After(pollCadence):
 		}
 	}
@@ -1113,7 +1309,14 @@ func (w *releaseWatch) interrupted() *exit.Error {
 		WithNext("cozy rental end " + w.id)
 }
 
-func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey string, had bool, note string) *exit.Error {
+// finish states what this command did to the WORLD, not to Creator's filing cabinet.
+// `changed` used to mean "a local row was deleted", which is why a command that released
+// nothing and forgot nothing could answer `state: ended, changed: false` and read as an
+// accomplished teardown. It now means: this command found a live pod and the hub destroyed
+// it. An idempotent second `rental end` still answers `changed: false` — and now says why
+// it is entitled to, naming the record that proves this host once held the machine.
+func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey string, had, destroyed bool,
+	op *records.RentalOperation, note string) *exit.Error {
 	if problem := st.CompleteRetainedRentalAbandonment(w.id, "cozy rental end"); problem != nil {
 		return problem
 	}
@@ -1140,13 +1343,21 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 	}
 	notes := []string{note + "; its media bearer, Creator key, and pinned certificate are gone from this host"}
 	if !had {
-		notes = []string{note + "; this host held no record of it — already released"}
+		switch {
+		case destroyed:
+			notes = []string{note + "; this host held no local record of it and released it by the id given"}
+		case op != nil:
+			notes = []string{note + "; this host bought it under operation " + op.Key + " and holds no live record of it"}
+		default:
+			notes = []string{note + "; this host holds no live record of it"}
+		}
 	}
 	if line, problem := (&managedRentals{ctx: w.ctx, layout: l, store: st}).status(); problem == nil {
 		notes = append(notes, line)
 	}
 	return emit(w.ctx, output.Record{Fields: []output.Field{
 		{K: "machine", V: w.machine}, {K: "rental", V: w.id},
-		{K: "state", V: "ended"}, {K: "changed", V: forgotten},
+		{K: "state", V: "ended"}, {K: "changed", V: destroyed},
+		{K: "forgotten", V: forgotten},
 	}, Notes: notes})
 }

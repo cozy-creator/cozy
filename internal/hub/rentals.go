@@ -392,19 +392,27 @@ func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
 // Rent retransmits the exact canonical bytes the caller persisted before the
 // paid mutation. The hub authority is bound separately by the local operation
 // digest; a retry against another hub therefore conflicts before this method.
-func (c *Client) Rent(ctx context.Context, requestBody []byte, reason, operationKey string) (Rental, *exit.Error) {
+//
+// THE SECOND RESULT IS THE ONE THAT COSTS MONEY. It says the hub ANSWERED the ask:
+// a 2xx create answer means a pod may exist and bill from that moment, whatever this
+// client then makes of the body. Only a refusal that created nothing answers false,
+// and only that may be recorded as an ask that bought nothing. An answered ask whose
+// body this client cannot use still comes back with whatever identity it carried —
+// that identity is the only name the pod has here, and destroying it because a
+// sibling field was missing is how six paid pods came to boot unattended (cl-192).
+func (c *Client) Rent(ctx context.Context, requestBody []byte, reason, operationKey string) (Rental, bool, *exit.Error) {
 	var out wireRental
 	e := c.do(ctx, call{
 		method: http.MethodPost, path: "/v1/rentals", auth: true, reason: reason,
 		idempotency: operationKey, bodyBytes: requestBody, responseBytes: maxRentalResponseBytes,
 	}, &out)
 	if e != nil {
-		return Rental{}, e
+		return Rental{}, false, e
 	}
 	if e := out.named("accepted the rental"); e != nil {
-		return Rental{}, e
+		return out.rental(), true, e
 	}
-	return out.rental(), nil
+	return out.rental(), true, nil
 }
 
 func (w wireRental) named(what string) *exit.Error {
@@ -447,6 +455,31 @@ func (c *Client) Rental(ctx context.Context, id string) (Rental, *exit.Error) {
 		return Rental{}, e
 	}
 	if e := out.named("answered rental " + id); e != nil {
+		return Rental{}, e
+	}
+	if out.ID != id {
+		return Rental{}, exit.Named(exit.Conflict, "hub.rental_id_changed",
+			"the hub answered rental %s with identity %s", id, out.ID).
+			WithRemedy("preserve the original rental identity; never attach the response under another id")
+	}
+	return out.rental(), nil
+}
+
+// RentalView reads a rental for a decision that does not depend on what the pod IS —
+// whether it still exists, and tearing it down. It validates IDENTITY and nothing else.
+//
+// The strict read above is right for attachment: a pod whose width the hub will not state
+// must not be attached. It is wrong for a release, and dangerously so — a fence meant to
+// protect an attachment then stands between an operator and a machine that is billing,
+// refusing the one command that stops the money over a field the teardown never reads.
+func (c *Client) RentalView(ctx context.Context, id string) (Rental, *exit.Error) {
+	if e := validateRentalID(id); e != nil {
+		return Rental{}, e
+	}
+	var out wireRental
+	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals/" + url.PathEscape(id),
+		auth: true, responseBytes: maxRentalResponseBytes}, &out)
+	if e != nil {
 		return Rental{}, e
 	}
 	if out.ID != id {

@@ -1,10 +1,6 @@
 package orchestrator
 
-import (
-	"strings"
-
-	"github.com/cozy-creator/cozy/internal/records"
-)
+import "github.com/cozy-creator/cozy/internal/records"
 
 // The wait vocabulary (cl-103). A queued/parked event names WHAT the queue is doing in a
 // stable `wait` payload field beside the verbatim diagnostic `reason`, so a client can
@@ -28,8 +24,16 @@ const (
 // waitFacts is the classification a queued/parked event carries beside the raw reason:
 // the stable cause, and the machine word the wait is on when one is known.
 type waitFacts struct {
-	cause string
-	on    string
+	cause      string
+	on         string
+	waitingFor *WaitingRun
+}
+
+// WaitingRun names existing work occupying capacity. It is display metadata;
+// neither the local number nor this observation authorizes routing or cancellation.
+type WaitingRun struct {
+	Number    int64  `json:"number"`
+	RequestID string `json:"request_id"`
 }
 
 // decorate adds the wait facts and the request's package to an event payload. The
@@ -40,6 +44,9 @@ func (f waitFacts) decorate(payload map[string]any, req records.Request) map[str
 	}
 	if f.on != "" {
 		payload["waiting_on"] = f.on
+	}
+	if f.waitingFor != nil {
+		payload["waiting_for"] = f.waitingFor
 	}
 	if req.Package != "" {
 		payload["package"] = req.Package
@@ -55,11 +62,23 @@ func (c *Orchestrator) classifyCapacityWait(req records.Request, r routing) wait
 		return waitFacts{}
 	}
 	if len(r.claimed) > 0 {
-		return waitFacts{cause: WaitQueueAhead}
+		facts := waitFacts{cause: WaitQueueAhead}
+		claims := c.claimsAhead(req.ID)
+		for _, id := range c.pending {
+			for _, lane := range r.lanes {
+				if claims[lane] == id {
+					facts.waitingFor = c.waitingRun(id)
+					facts.on = c.machineWord(lane.worker)
+					return facts
+				}
+			}
+		}
+		return facts
 	}
-	if len(r.parked) > 0 {
-		instance, _, _ := strings.Cut(r.parked[0], ":")
-		return waitFacts{cause: WaitSlotBusy, on: c.machineWord(strings.TrimSpace(instance))}
+	if len(r.blocked) > 0 {
+		blocked := r.blocked[0]
+		return waitFacts{cause: WaitSlotBusy, on: c.machineWord(blocked.worker),
+			waitingFor: c.blockingRun(blocked)}
 	}
 	// No eligible worker at all. A live worker already in the request's slot is loading
 	// toward dispatchable; none at all means one is being started (selectOrStart).
@@ -82,6 +101,45 @@ func (c *Orchestrator) classifyCapacityWait(req records.Request, r routing) wait
 		return waitFacts{cause: WaitRental}
 	}
 	return waitFacts{cause: WaitWorkerStart}
+}
+
+// blockingRun reads the owner's existing open attempts on the actual blocked
+// worker and lane. Unknown work stays unnamed; diagnostic strings are never parsed.
+// Callers hold c.mu, as they do for routing and machineWord.
+func (c *Orchestrator) blockingRun(blocked laneKey) *WaitingRun {
+	w := c.workers[blocked.worker]
+	if w == nil {
+		return nil
+	}
+	attempts, problem := c.opt.Store.OpenAttemptsOf(blocked.worker)
+	if problem != nil {
+		return nil
+	}
+	var first *WaitingRun
+	for _, attempt := range attempts {
+		request, problem := c.opt.Store.RequestByReference(attempt.RequestID)
+		if problem != nil || request == nil {
+			continue
+		}
+		if blocked.lane != "" {
+			placement := w.placementFor(pinnedPackage(request.Package, request.Worker), request.PlanID)
+			if lane := w.lanes.of(placement); lane == nil || lane.id != blocked.lane {
+				continue
+			}
+		}
+		if first == nil || request.Number < first.Number {
+			first = &WaitingRun{Number: request.Number, RequestID: request.ID}
+		}
+	}
+	return first
+}
+
+func (c *Orchestrator) waitingRun(requestID string) *WaitingRun {
+	request, problem := c.opt.Store.RequestByReference(requestID)
+	if problem != nil || request == nil {
+		return nil
+	}
+	return &WaitingRun{Number: request.Number, RequestID: request.ID}
 }
 
 // waitOf classifies a request's blocking condition against the live routing.

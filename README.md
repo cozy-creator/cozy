@@ -144,11 +144,14 @@ See [package publication](docs/package-publication.md) for the release contract.
 
 ## Models
 
-Search lists `MODEL`, `FAMILY`, `RELEASE`, and `LANES`, with one row per available
-release. Long columns are shortened in the compact human table; `--full` and JSON
-retain complete values and lane lists.
+Search lists `MODEL`, `FAMILY`, `RELEASE`, and `LANES`, with one row per model at its
+latest available release in Tensorhub's catalog order. Long columns are shortened
+in the compact human table; `--full` and JSON retain complete values and lane lists
+for that release.
 `cozy model info org/name` shows all available releases, while `@release` selects
-one exact tag. Info shows full lanes and immutable checkpoint refs. Unavailable
+one exact tag. Info shows every lane's full stored byte size and immutable checkpoint
+ref; JSON also includes components and their sizes when available. Stored size is
+not a VRAM requirement or a measurement of bytes missing from the local cache. Unavailable
 Hub timestamps remain unavailable; model creation is distinct from release creation.
 
 Model releases live in the local TensorFS store:

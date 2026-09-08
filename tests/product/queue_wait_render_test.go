@@ -15,13 +15,13 @@ import (
 
 // cl-103's render half: the default human wait line says what the queue is DOING — no
 // digests, no dispatcher vocabulary. The raw diagnostic lives in --json/--full
-// and joins the human line only after WaitPatience. The events fed here are exactly the
+// only. The events fed here are exactly the
 // payloads TestQueueWaitCauses proves the orchestrator emits.
 
 const rawDiagnostic = "no claimed worker in paul/anima has a DISPATCHABLE placement for " +
 	"sha256:fc1db0000000000000000000000000000000000000000000000000000000000 with a free attempt slot"
 
-// renderBuffer takes the patience timer's own goroutine writes.
+// renderBuffer takes the live elapsed timer's goroutine writes.
 type renderBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
@@ -63,7 +63,7 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 	p.On(frame(0.50, 0.10, 50))
 	if got := buf.String(); !strings.Contains(got, "overall") ||
 		!strings.Contains(got, "tile_steps 50/100") || !strings.Contains(got, "50% stage") ||
-		strings.Contains(got, "ETA") {
+		strings.Contains(got, "overall 10% · ETA") {
 		t.Fatalf("first progress sample conflated stage and overall facts: %q", got)
 	}
 	p.On(frame(0.60, 0.20, 60))
@@ -99,6 +99,8 @@ func TestWaitLinesAreStageHonest(t *testing.T) {
 		{"slot_busy", map[string]any{"wait": "slot_busy", "waiting_on": "shidehiko"},
 			"waiting for a free slot on shidehiko"},
 		{"slot_busy_local", map[string]any{"wait": "slot_busy"}, "waiting for a free slot"},
+		{"blocking_run", map[string]any{"wait": "slot_busy", "waiting_on": "aldra",
+			"waiting_for": map[string]any{"number": 429, "request_id": "req-blocking"}}, "waiting for run 429 on aldra"},
 		{"queue_ahead", map[string]any{"wait": "queue_ahead", "position": float64(3)},
 			"waiting in line — position 3"},
 		{"rental", map[string]any{"wait": "rental"}, "waiting for a rental machine"},
@@ -126,42 +128,27 @@ func TestWaitLinesAreStageHonest(t *testing.T) {
 	}
 }
 
-func TestWaitDetailArrivesWithPatience(t *testing.T) {
+func TestWaitDetailsStayInDiagnosticOutput(t *testing.T) {
 	payload := map[string]any{"wait": "slot_busy", "waiting_on": "shidehiko", "reason": rawDiagnostic}
 
 	// A fresh wait stays calm.
 	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
 	p.On(waitEnvelope("request.parked", time.Now(), payload))
 	if got := buf.String(); strings.Contains(got, "DISPATCHABLE") {
-		t.Errorf("the diagnostic surfaced before WaitPatience: %q", got)
+		t.Errorf("the diagnostic surfaced before the wait threshold: %q", got)
 	}
 	p.Done()
 
-	// A wait that already outlived WaitPatience (by the event's own recorded time — a
-	// reattached watcher inherits the wait served) carries the raw diagnostic.
+	// A long wait is ordinary while another inference owns the GPU. Reattaching
+	// must not turn that into a wall of internal dispatcher diagnostics.
 	p, buf = progressSink(output.Mode{Human: true, Color: true}, false)
-	p.On(waitEnvelope("request.parked", time.Now().Add(-2*cli.WaitPatience), payload))
+	p.On(waitEnvelope("request.parked", time.Now().Add(-10*time.Minute), payload))
 	got := buf.String()
-	if !strings.Contains(got, "waiting for a free slot on shidehiko") || !strings.Contains(got, rawDiagnostic) {
-		t.Errorf("a long wait must carry both the calm line and the diagnostic: %q", got)
+	if !strings.Contains(got, "waiting for a free slot on shidehiko") || strings.Contains(got, rawDiagnostic) {
+		t.Errorf("a long wait exposed the dispatcher diagnostic: %q", got)
 	}
 	p.Done()
 
-	// The stuck case: ONE event, then silence. The patience timer re-renders with the
-	// detail even though nothing new arrives.
-	p, buf = progressSink(output.Mode{Human: true, Color: true}, false)
-	p.On(waitEnvelope("request.parked", time.Now().Add(-cli.WaitPatience+50*time.Millisecond), payload))
-	if got := buf.String(); strings.Contains(got, "DISPATCHABLE") {
-		t.Fatalf("detail arrived before the threshold: %q", got)
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(buf.String(), rawDiagnostic) {
-		if time.Now().After(deadline) {
-			t.Fatal("the patience timer never surfaced the diagnostic")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	p.Done()
 }
 
 func TestDiagnosticSurfacesKeepTheRawCause(t *testing.T) {

@@ -684,7 +684,7 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 			"phase", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
 			"remaining_ms", "execution_ms"},
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id",
-			"status", "canceled_by", "phase", "phase_machine", "phase_elapsed_ms",
+			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "phase_elapsed_ms",
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
 			"phase_remaining_ms", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "remaining_ms", "queued_ms", "execution_ms", "attempts",
@@ -734,6 +734,9 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		// was zero", and a rendered string cannot say that.
 		if life.Phase != "" {
 			typed["phase"] = life.Phase
+			if life.WaitingFor != nil {
+				typed["waiting_for"] = life.WaitingFor
+			}
 			if life.PhaseMachine != "" {
 				typed["phase_machine"] = life.PhaseMachine
 			}
@@ -823,6 +826,13 @@ func phaseValue(life api.Lifecycle) string { return PhaseCell(life) }
 func PhaseCell(life api.Lifecycle) string {
 	if life.Phase == "" {
 		return ""
+	}
+	if life.Phase == orchestrator.WaitSlotBusy || life.Phase == orchestrator.WaitQueueAhead {
+		fields := map[string]any{"wait": life.Phase, "waiting_on": life.PhaseMachine}
+		if life.WaitingFor != nil {
+			fields["waiting_for"] = map[string]any{"number": life.WaitingFor.Number}
+		}
+		return strings.TrimSpace(HumanWaitLine(fields))
 	}
 	head := strings.ReplaceAll(life.Phase, "_", " ")
 	if life.PhaseMachine != "" {
@@ -1202,27 +1212,25 @@ func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
 }
 
 // progress renders the live lane. Three shapes, and they are not the same surface:
-// Awaited `--json` writes NDJSON of the typed envelope on stderr, a terminal gets ONE
-// carriage-return-rewritten line, and a redirected human command gets sparse
+// Awaited `--json` writes NDJSON of the typed envelope on stderr, a terminal keeps
+// finished stages above a refreshed active block, and a redirected human command gets sparse
 // append-only lines — a stage change, each new tenth of the work, one line per five
 // quiet seconds — never the full lossy tick stream. JSON results stay on stdout. Exported —
-// with HumanWaitLine and WaitPatience — so the product suite (#661: verification's one
+// with HumanWaitLine — so the product suite (#661: verification's one
 // home) drives this exact render path.
 type RunProgress struct {
 	ctx             *Context
 	rawJSON         bool
 	mu              sync.Mutex
 	last            string
-	dirty           bool
 	closed          bool
 	began           time.Time
-	waitedSince     time.Time
-	waitEvent       localapi.Event
-	patience        *time.Timer
 	stepStage       string
 	stepSeconds     float64
 	stepSamples     int
+	stepPosition    float64
 	progressAttempt uint64
+	terminal        liveProgress
 	overallSeen     bool
 	overallFraction float64
 	overallDelta    float64
@@ -1259,83 +1267,34 @@ func (p *RunProgress) On(e localapi.Event) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if strings.TrimPrefix(e.Type, "request.") == "progress" && p.progressAttempt != e.Attempt {
+		if p.progressAttempt != 0 && p.ctx.Mode().Color && !p.ctx.Mode().Full {
+			p.finishLive("retrying", eventTime(e))
+		}
 		p.progressAttempt = e.Attempt
 		p.stepStage, p.stepSeconds, p.stepSamples = "", 0, 0
 		p.overallSeen, p.overallFraction, p.overallDelta, p.overallSeconds = false, 0, 0, 0
 	}
-	p.observeWait(e)
 	// A redirected human command has no status line to rewrite: it gets the sparse
 	// append lane. --full deliberately restores the complete diagnostic stream.
 	if !p.ctx.Mode().Color && !p.ctx.Mode().Full {
 		p.sparse(e)
 		return true
 	}
-	p.render(p.line(e, p.ctx.Mode().Full))
+	if p.ctx.Mode().Color && !p.ctx.Mode().Full {
+		p.interactive(e)
+	} else {
+		p.render(diagnosticProgressLine(e))
+	}
 	return true
 }
 
-// render rewrites the status line. Callers hold p.mu.
+// render appends diagnostic text; only the ordinary interactive lane owns a live block.
 func (p *RunProgress) render(line string) {
 	if line == "" || line == p.last {
 		return
 	}
-	p.last, p.dirty = line, true
-	// stderr, deliberately: stdout carries the RESULT, so a piped `cozy run` is not
-	// polluted by the progress of producing it.
-	if p.ctx.Mode().Color {
-		// The one in-place line. Clamped to the CURRENT terminal width on every write:
-		// a line that wraps leaves rows \r can never reach again, so on a narrow or
-		// just-resized terminal the tail is dropped instead.
-		fmt.Fprintf(p.ctx.Err, "\r\033[K%s", clampLine(line, p.width()))
-	} else {
-		fmt.Fprintln(p.ctx.Err, line)
-	}
-}
-
-// observeWait keeps the wait clock. It starts on a queued/parked event — at the event's
-// own recorded time, so a reattached watcher inherits the wait already served — and
-// stops on any event that says the queue let go of the request. Callers hold p.mu.
-func (p *RunProgress) observeWait(e localapi.Event) {
-	switch strings.TrimPrefix(e.Type, "request.") {
-	case "queued", "parked":
-		p.waitEvent = e
-		if p.waitedSince.IsZero() {
-			p.waitedSince = eventTime(e)
-			p.armPatience()
-		}
-	case "rentals", "placement", "log", "metric":
-		// Still the same wait; these narrate it without ending it.
-	default:
-		p.waitedSince = time.Time{}
-		p.disarmPatience()
-	}
-}
-
-// armPatience schedules the one time-driven render: a wait that outlives WaitPatience
-// re-renders with the diagnostic even when no new event arrives — the stuck case emits
-// exactly one parked event and then silence. Only the human status line needs it; the
-// diagnostic surfaces (--full and --json) carry the detail from the start.
-// Callers hold p.mu.
-func (p *RunProgress) armPatience() {
-	if !p.ctx.Mode().Color || p.ctx.Mode().Full {
-		return
-	}
-	remaining := max(WaitPatience-time.Since(p.waitedSince), 0)
-	p.patience = time.AfterFunc(remaining, func() {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		if p.closed || p.waitedSince.IsZero() {
-			return
-		}
-		p.render(p.waitLine(p.waitEvent))
-	})
-}
-
-func (p *RunProgress) disarmPatience() {
-	if p.patience != nil {
-		p.patience.Stop()
-		p.patience = nil
-	}
+	p.last = line
+	fmt.Fprintln(p.ctx.Err, line)
 }
 
 // eventTime is the event's own recorded time, this process's clock when it carries none.
@@ -1423,11 +1382,14 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 	total, totalOK := number(fields["total"])
 	stepMS, stepOK := number(fields["step_ms"])
 	if name != "" && name != p.stepStage {
-		p.stepStage, p.stepSeconds, p.stepSamples = name, 0, 0
+		p.stepStage, p.stepSeconds, p.stepSamples, p.stepPosition = name, 0, 0, -1
 	}
 	if stepOK && stepMS >= 0 {
-		p.stepSeconds += stepMS / 1000
-		p.stepSamples++
+		if stepMS > 0 && (!positionOK || position > p.stepPosition) {
+			p.stepSeconds += stepMS / 1000
+			p.stepSamples++
+			p.stepPosition = position
+		}
 	}
 	label := stageLabel(name)
 	if label == "" {
@@ -1473,60 +1435,23 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 	return facts, facts.hasStageFraction || facts.hasOverall
 }
 
-func (p *RunProgress) line(e localapi.Event, full bool) string {
-	if full {
-		return diagnosticProgressLine(e)
-	}
-	switch strings.TrimPrefix(e.Type, "request.") {
-	case "queued", "parked":
-		return p.waitLine(e)
-	}
-	if strings.TrimPrefix(e.Type, "request.") != "progress" {
-		return progressLine(e, false)
-	}
-	fields, ok := e.Payload["value"].(map[string]any)
-	if !ok {
-		return humanProgress(e.Payload["value"])
-	}
-	facts, ok := p.observe(fields)
-	if !ok {
-		return humanStage(map[string]any{"name": stageLabel(facts.label)})
-	}
-	elapsed := p.now().Sub(p.began)
-	fraction := facts.stageFraction
-	label := facts.label + " stage"
-	if facts.hasOverall {
-		fraction, label = facts.overallFraction, "overall"
-	}
-	bar := progressBar(fraction, 18)
-	line := fmt.Sprintf("  %s %s %.0f%%", label, bar, fraction*100)
-	if facts.counted {
-		line += fmt.Sprintf(" · %s %d/%d", facts.label, facts.current, facts.total)
-	}
-	if facts.hasOverall && facts.hasStageFraction {
-		line += fmt.Sprintf(" · %.0f%% stage", facts.stageFraction*100)
-	}
-	if facts.perStep > 0 {
-		line += fmt.Sprintf(" · %.2fs/step · %.2f steps/s", facts.perStep, 1/facts.perStep)
-	}
-	line += " · elapsed " + shortDuration(elapsed)
-	if facts.hasOverallETA {
-		line += " · ETA ~" + shortDuration(facts.overallRemaining)
-	}
-	return line
-}
-
 // clampLine bounds one rewritten status line to the terminal: a wrapped line leaves
 // debris \r cannot reach.
 func clampLine(line string, width int) string {
-	if width <= 0 {
-		return line
+	var out strings.Builder
+	cells := 0
+	for _, r := range line {
+		if r < 32 || r == 127 {
+			continue
+		}
+		n := runeCells(r)
+		if width > 0 && cells+n >= width {
+			break
+		}
+		out.WriteRune(r)
+		cells += n
 	}
-	runes := []rune(line)
-	if len(runes) < width {
-		return line
-	}
-	return string(runes[:width-1])
+	return out.String()
 }
 
 func progressBar(fraction float64, width int) string {
@@ -1566,9 +1491,12 @@ func (p *RunProgress) Done() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.closed = true
-	p.disarmPatience()
-	if p.dirty && p.ctx.Mode().Color {
-		fmt.Fprintln(p.ctx.Err)
+	if p.terminal.timer != nil {
+		p.terminal.timer.Stop()
+	}
+	if p.ctx.Mode().Color && !p.ctx.Mode().Full {
+		p.finishLive("", p.now())
+		return
 	}
 }
 
@@ -1643,12 +1571,6 @@ func humanProgress(value any) string {
 	return ""
 }
 
-// WaitPatience is how long a wait stays a calm one-liner (cl-103). Past it, the
-// dispatcher's own diagnostic joins the line: a long wait is the abnormal case, and the
-// detail is how a person sees exactly what the queue is stuck on. The full diagnostic is
-// always in --full and --json regardless.
-const WaitPatience = 90 * time.Second
-
 // HumanWaitLine says what the queue is DOING, never how it thinks: the event's stable
 // `wait` cause becomes a calm stage line with no digests and no dispatcher vocabulary.
 // The verbatim diagnostic stays in the payload's `reason` for the machine surfaces.
@@ -1656,6 +1578,17 @@ func HumanWaitLine(payload map[string]any) string {
 	pkg, _ := payload["package"].(string)
 	on, _ := payload["waiting_on"].(string)
 	cause, _ := payload["wait"].(string)
+	if cause == orchestrator.WaitSlotBusy || cause == orchestrator.WaitQueueAhead {
+		if waiting, ok := payload["waiting_for"].(map[string]any); ok {
+			if run, ok := number(waiting["number"]); ok && run > 0 {
+				line := fmt.Sprintf("  waiting for run %.0f", run)
+				if on != "" {
+					line += " on " + on
+				}
+				return line
+			}
+		}
+	}
 	switch cause {
 	case orchestrator.WaitWorkerStart:
 		if pkg != "" {
@@ -1698,6 +1631,10 @@ func HumanPhaseLine(value any) string {
 	if strings.TrimSpace(name) == "" {
 		return ""
 	}
+	if name == orchestrator.WaitSlotBusy || name == orchestrator.WaitQueueAhead {
+		return HumanWaitLine(map[string]any{"wait": name, "waiting_on": fields["machine"],
+			"waiting_for": fields["waiting_for"]})
+	}
 	line := "  " + strings.ReplaceAll(name, "_", " ")
 	if machine, _ := fields["machine"].(string); machine != "" {
 		line += " on " + machine
@@ -1713,28 +1650,13 @@ func HumanPhaseLine(value any) string {
 		line += " · " + output.Bytes(int64(rate)) + "/s"
 	}
 	if remaining, ok := number(fields["remaining_ms"]); ok && remaining > 0 {
-		line += " · ~" + shortDuration(time.Duration(remaining)*time.Millisecond)
+		line += " · ETA ~" + shortDuration(time.Duration(remaining)*time.Millisecond)
 	} else if !hasMoved {
 		if elapsed, ok := number(fields["elapsed_ms"]); ok && elapsed > 0 {
 			line += " — " + shortDuration(time.Duration(elapsed)*time.Millisecond)
 		}
 	}
 	return line
-}
-
-// waitLine is HumanWaitLine plus patience: once the wait outlives WaitPatience the raw
-// diagnostic earns its place on the human line too. Callers hold p.mu.
-func (p *RunProgress) waitLine(e localapi.Event) string {
-	line := HumanWaitLine(e.Payload)
-	if p.waitedSince.IsZero() || time.Since(p.waitedSince) < WaitPatience {
-		return line
-	}
-	reason, _ := e.Payload["reason"].(string)
-	if reason == "" {
-		return line
-	}
-	return fmt.Sprintf("%s — %s so far: %s",
-		line, shortDuration(time.Since(p.waitedSince)), reason)
 }
 
 func humanStage(value any) string {
