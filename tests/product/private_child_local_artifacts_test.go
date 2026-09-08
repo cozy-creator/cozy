@@ -24,7 +24,7 @@ func TestPrivateChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		}
 	}
 	uv("venv", control, "--python", "3.12")
-	runtime := "cozy-runtime==0.5.2"
+	runtime := "cozy-runtime==0.6.0"
 	if *privateChildRuntimeWheel != "" {
 		runtime = *privateChildRuntimeWheel
 	}
