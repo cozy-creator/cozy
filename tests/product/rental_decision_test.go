@@ -58,7 +58,7 @@ func marketWithoutA4000() []hub.RentalSKU {
 func choose(skus []hub.RentalSKU, needsAccelerator bool, constraints rental.Constraints) (
 	hub.RentalSKU, []orchestrator.PlacementCandidate, string, bool,
 ) {
-	candidates := rental.Purchases(skus, nil, needsAccelerator, constraints)
+	candidates := rental.Purchases(skus, nil, needsAccelerator, false, constraints)
 	i := rental.Place("balanced", candidates)
 	if i < 0 {
 		for _, c := range candidates {

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -27,7 +28,6 @@ import (
 const (
 	gib          = int64(1) << 30
 	h100SXM      = "NVIDIA H100 80GB HBM3"
-	fp8Manifest  = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	mxfpManifest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	bf16Manifest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	// fp8LaterManifest is the fp8 lane of the sized 1.0.0-rc.2 release (cl-174).
@@ -37,6 +37,22 @@ const (
 	textEncoderNeed    = 103 * gib / 2
 	textEncoderVerdict = "excluded:vram_short: needs 51.5 GiB resident (condition_text: text_encoder)"
 )
+
+// fp8ManifestBody is the fp8 lane's manifest document, and fp8Manifest its real digest: a
+// JOB binds EXACT manifest bytes and verifies their digest before it is submitted
+// (jobManifestInputs), so the stand-in hub has to be able to serve them.
+var (
+	fp8ManifestBody = []byte(`{"cozytensors":"proof","lane":"fp8-adaln-pruned"}`)
+	fp8Manifest     = mustSpell(fp8ManifestBody)
+)
+
+func mustSpell(raw []byte) string {
+	id, err := canonical.Spell(canonical.Digest(raw))
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
 
 // h3Components is the fp8-adaln-pruned lane as the card publishes it: 103 GB in five
 // components. h3BF16Components is the bf16-full lane, 130 GiB, same text encoder.
@@ -130,7 +146,7 @@ func TestLadderWalkNeversBuysWhatTheLaneCannotFit(t *testing.T) {
 	// The defect as it happened: the H3 ladder against a market whose only cards were
 	// 24 GB and 32 GB. Both land on the catch-all bf16 rung, whose text encoder alone
 	// outweighs them: nothing is bought, and the record says the need per card.
-	decision := rental.Purchases(market20260907()[:2], h3Ladder(), true, rental.Constraints{})
+	decision := rental.Purchases(market20260907()[:2], h3Ladder(), true, false, rental.Constraints{})
 	if bought := walk(decision); len(bought) != 0 {
 		t.Fatalf("a lane whose text encoder is 51.5 GiB was given a machine to buy: %v", bought)
 	}
@@ -144,7 +160,7 @@ func TestLadderWalkNeversBuysWhatTheLaneCannotFit(t *testing.T) {
 	// within a rung, and price never lifts a later rung over an earlier one — the $5.99
 	// B200 (rung 2) precedes the $3.59 H200 (rung 3). The 103 GB fp8 lane fits both H100s
 	// because no method holds more than its 51.5 GiB text encoder (the production case).
-	decision = rental.Purchases(market20260907(), h3Ladder(), true, rental.Constraints{})
+	decision = rental.Purchases(market20260907(), h3Ladder(), true, false, rental.Constraints{})
 	if got := strings.Join(walk(decision), " "); got != "h100-80 h100-nvl b200 h200" {
 		t.Fatalf("walk order %q; want h100-80 h100-nvl b200 h200", got)
 	}
@@ -193,7 +209,7 @@ func TestExplicitLaneIsHeldToTheSameFloor(t *testing.T) {
 	// `model.<param>=paul/minimax-h3@1.0.0-rc.1/fp8-adaln-pruned` pins the 103 GB lane; the
 	// buy takes the cheapest card that holds its largest resident group — the 80 GB H100
 	// — and refuses the 24 GB and 32 GB cards naming the 51.5 GiB text encoder.
-	decision := rental.Purchases(market20260907(), []records.ModelRef{fp8Exact()}, true, rental.Constraints{})
+	decision := rental.Purchases(market20260907(), []records.ModelRef{fp8Exact()}, true, false, rental.Constraints{})
 	if got := strings.Join(walk(decision), " "); got != "h100-80 h100-nvl h200 b200" {
 		t.Fatalf("an explicit fp8 lane may buy %q; want h100-80 h100-nvl h200 b200", got)
 	}
@@ -217,24 +233,24 @@ func TestComponentFitHoldsTheOwnersRung(t *testing.T) {
 	// A slot without component_use holds its largest single component.
 	plain := fp8Exact()
 	plain.ComponentUse = nil
-	need := records.Resident([]records.ModelRef{plain}, h100SXM)
+	need := records.Resident([]records.ModelRef{plain}, h100SXM, false)
 	if need.Fit != records.FitComponents || need.Bytes != textEncoderNeed || need.Need != "text_encoder" {
 		t.Fatalf("no component_use sized %+v; want the 51.5 GiB text encoder", need)
 	}
 	// A group is the SUM of the components its method stages, and the largest group wins.
 	pair := fp8Exact()
 	pair.ComponentUse = map[string][]string{"sample_pair": {"fl2va_dit", "ref2va_dit"}, "decode": {"audio_vae"}}
-	if need := records.Resident([]records.ModelRef{pair}, h100SXM); need.Bytes != 40*gib || need.Need != "sample_pair: fl2va_dit+ref2va_dit" {
+	if need := records.Resident([]records.ModelRef{pair}, h100SXM, false); need.Bytes != 40*gib || need.Need != "sample_pair: fl2va_dit+ref2va_dit" {
 		t.Fatalf("a two-DiT group sized %+v; want 40 GiB", need)
 	}
 	// A placement holds every slot at once: two H3 slots need two text encoders.
 	two := []records.ModelRef{fp8Exact(), fp8Exact()}
 	two[1].Slot = "generate.models.refiner"
-	if need := records.Resident(two, h100SXM); need.Bytes != 103*gib || need.Fit != records.FitComponents ||
+	if need := records.Resident(two, h100SXM, false); need.Bytes != 103*gib || need.Fit != records.FitComponents ||
 		need.Need != "condition_text: text_encoder; condition_text: text_encoder" {
 		t.Fatalf("two slots sized %+v; want 103 GiB", need)
 	}
-	decision := rental.Purchases(market20260907(), two, true, rental.Constraints{})
+	decision := rental.Purchases(market20260907(), two, true, false, rental.Constraints{})
 	if got := strings.Join(walk(decision), " "); got != "h200 b200" {
 		t.Fatalf("two text encoders may buy %q; want h200 b200", got)
 	}
@@ -246,11 +262,11 @@ func TestComponentFitHoldsTheOwnersRung(t *testing.T) {
 	// Nothing asserts a 103 GB lane onto a 24 GB card.
 	unsized := fp8Exact()
 	unsized.ComponentBytes = nil
-	if need := records.Resident([]records.ModelRef{unsized}, h100SXM); need.Fit != records.FitLaneBytes ||
+	if need := records.Resident([]records.ModelRef{unsized}, h100SXM, false); need.Fit != records.FitLaneBytes ||
 		need.Bytes != 103*gib || need.Need != "lane fp8-adaln-pruned" {
 		t.Fatalf("a lane without component bytes sized %+v; want its whole bytes", need)
 	}
-	decision = rental.Purchases(market20260907(), []records.ModelRef{unsized}, true, rental.Constraints{})
+	decision = rental.Purchases(market20260907(), []records.ModelRef{unsized}, true, false, rental.Constraints{})
 	if got := strings.Join(walk(decision), " "); got != "h200 b200" {
 		t.Fatalf("an unsized lane walked %q; want only the cards that hold 103 GiB whole", got)
 	}
@@ -262,11 +278,11 @@ func TestComponentFitHoldsTheOwnersRung(t *testing.T) {
 	// Mixed slots sum what they can and name every rule.
 	mixed := []records.ModelRef{fp8Exact(), unsized}
 	mixed[1].Slot = "generate.models.refiner"
-	if need := records.Resident(mixed, h100SXM); need.Fit != "components+lane_bytes" || need.Bytes != textEncoderNeed+103*gib ||
+	if need := records.Resident(mixed, h100SXM, false); need.Fit != "components+lane_bytes" || need.Bytes != textEncoderNeed+103*gib ||
 		need.Need != "condition_text: text_encoder; lane fp8-adaln-pruned" {
 		t.Fatalf("mixed slots sized %+v", need)
 	}
-	if need := records.Resident(nil, h100SXM); need.Fit != "" || need.Bytes != 0 {
+	if need := records.Resident(nil, h100SXM, false); need.Fit != "" || need.Bytes != 0 {
 		t.Fatalf("an empty selection was sized %+v", need)
 	}
 }
@@ -282,7 +298,7 @@ func TestExplicitLaneIsNotARung(t *testing.T) {
 	explicit.ComponentBytes = nil
 	explicit.Ladder = h3Ladder()[0].Ladder
 	models := []records.ModelRef{explicit}
-	decision := rental.Purchases(market20260907(), models, true, rental.Constraints{})
+	decision := rental.Purchases(market20260907(), models, true, false, rental.Constraints{})
 	if got := strings.Join(walk(decision), " "); got != "h100-80 h100-nvl h200 b200" {
 		t.Fatalf("an explicit unsized fp8 lane may buy %q; want h100-80 h100-nvl h200 b200", got)
 	}
@@ -317,12 +333,12 @@ func TestExplicitLaneIsNotARung(t *testing.T) {
 	// catch-all's bf16 on an H100.
 	bf16 := explicit
 	bf16.Lane, bf16.Manifest, bf16.Bytes = "bf16-full", bf16Manifest, 130*gib
-	if need := records.Resident([]records.ModelRef{bf16}, h100SXM); need.Fit != records.FitRungAsserted || need.Bytes != 0 {
+	if need := records.Resident([]records.ModelRef{bf16}, h100SXM, false); need.Fit != records.FitRungAsserted || need.Bytes != 0 {
 		t.Fatalf("the catch-all did not assert bf16 on an H100: %+v", need)
 	}
 	// No ladder bound at all: only the components or the whole lane size a card.
 	explicit.Ladder = nil
-	decision = rental.Purchases(market20260907(), []records.ModelRef{explicit}, true, rental.Constraints{})
+	decision = rental.Purchases(market20260907(), []records.ModelRef{explicit}, true, false, rental.Constraints{})
 	if got := strings.Join(walk(decision), " "); got != "h200 b200" {
 		t.Fatalf("an unsized lane with no ladder may buy %q; want h200 b200 alone", got)
 	}
@@ -334,7 +350,7 @@ func TestExplicitLaneIsNotARung(t *testing.T) {
 		t.Fatalf("no ladder rendered as %v", ladder)
 	}
 	// The card's own figures beat both rules: a sized override is held to its components (cl-168).
-	if need := records.Resident([]records.ModelRef{fp8Exact()}, "NVIDIA GeForce RTX 4090"); need.Fit != records.FitComponents || need.Bytes != textEncoderNeed {
+	if need := records.Resident([]records.ModelRef{fp8Exact()}, "NVIDIA GeForce RTX 4090", false); need.Fit != records.FitComponents || need.Bytes != textEncoderNeed {
 		t.Fatalf("a sized override was not held to its components: %+v", need)
 	}
 }
@@ -342,7 +358,7 @@ func TestExplicitLaneIsNotARung(t *testing.T) {
 func TestLadderWithoutCatchAllExcludesUnnamedClasses(t *testing.T) {
 	models := h3Ladder()
 	models[0].Ladder = models[0].Ladder[:2] // H100 and B200 only
-	decision := rental.Purchases(market20260907(), models, true, rental.Constraints{})
+	decision := rental.Purchases(market20260907(), models, true, false, rental.Constraints{})
 	if got := strings.Join(walk(decision), " "); got != "h100-80 h100-nvl b200" {
 		t.Fatalf("walk %q; want h100-80 h100-nvl b200", got)
 	}
@@ -352,10 +368,10 @@ func TestLadderWithoutCatchAllExcludesUnnamedClasses(t *testing.T) {
 		}
 	}
 	// A CPU-class request fits only through the catch-all, and has no device to check.
-	if bought := walk(rental.Purchases(market20260907(), models, false, rental.Constraints{})); len(bought) != 0 {
+	if bought := walk(rental.Purchases(market20260907(), models, false, false, rental.Constraints{})); len(bought) != 0 {
 		t.Fatalf("a CPU box fits an H100/B200-only ladder: %v", bought)
 	}
-	decision = rental.Purchases(market20260907(), h3Ladder(), false, rental.Constraints{})
+	decision = rental.Purchases(market20260907(), h3Ladder(), false, false, rental.Constraints{})
 	if got := walk(decision); len(got) != 1 || got[0] != "cpu" || find(t, decision, "cpu").Lane != "bf16-full" || find(t, decision, "cpu").Fit != "" {
 		t.Fatalf("CPU class walked %v; want cpu alone on the catch-all lane, unsized", got)
 	}
@@ -447,5 +463,60 @@ func TestRentalPinCarriesTheLaneAndARejectedBuyFreesTheNextRung(t *testing.T) {
 	fatal(t, problem)
 	if next == first {
 		t.Fatalf("a rejected buy replays its operation key %q; the next rung needs a fresh one", next)
+	}
+}
+
+// cl-180. `attention-lane` (se-037) reads its source's HEADER, inherits every tensor by
+// reference and adds 550 bytes, and was sized "fit components 48.0 GiB of 48 GB" — the
+// components a SERVING construction of that lane would stage. cozy-runtime hands a JOB a
+// derive-only view of the Manifest and refuses load and component access on it, so no
+// component of a job's model is ever on the device, whatever the closure weighs. The
+// figure is dropped, never lowered: the same selection under a serving request is still
+// held to its 51.5 GiB text encoder.
+func TestAJobsModelIsNeverResident(t *testing.T) {
+	models := []records.ModelRef{fp8Exact()}
+	if need := records.Resident(models, h100SXM, true); need.Fit != records.FitDeriveOnly ||
+		need.Bytes != 0 || need.Need != "" {
+		t.Fatalf("a job's model sized %+v; want derive_only with no figure", need)
+	}
+	if need := records.Resident(models, h100SXM, false); need.Fit != records.FitComponents || need.Bytes != textEncoderNeed {
+		t.Fatalf("the same selection served sized %+v; want its 51.5 GiB text encoder", need)
+	}
+	// The whole market is admissible for the job and the cheapest card wins; the serving
+	// request still refuses both small cards naming the need.
+	job := rental.Purchases(market20260907(), models, true, true, rental.Constraints{})
+	if got := strings.Join(walk(job), " "); got != "rtx-4090 rtx-5090 h100-80 h100-nvl h200 b200" {
+		t.Fatalf("a job walked %q; want every card, cheapest first", got)
+	}
+	sized(t, find(t, job, "rtx-4090"), records.FitDeriveOnly)
+	serving := rental.Purchases(market20260907(), models, true, false, rental.Constraints{})
+	if got := strings.Join(walk(serving), " "); got != "h100-80 h100-nvl h200 b200" {
+		t.Fatalf("serving walked %q; want the cards that hold the text encoder", got)
+	}
+
+	// A job's ladder still QUALIFIES the machine: a rung nobody names is still no_rung,
+	// and the rung it lands on still pins the lane the job reads.
+	unpinned := h3Ladder()
+	unpinned[0].Ladder = unpinned[0].Ladder[:1] // H100 only
+	decision := rental.Purchases(market20260907(), unpinned, true, true, rental.Constraints{})
+	if got := strings.Join(walk(decision), " "); got != "h100-80 h100-nvl" {
+		t.Fatalf("a job on an H100-only ladder walked %q; want the H100s alone", got)
+	}
+	if row := find(t, decision, "rtx-4090"); row.Verdict != orchestrator.VerdictNoRung {
+		t.Fatalf("rtx-4090 recorded %q; want %s", row.Verdict, orchestrator.VerdictNoRung)
+	}
+	if row := find(t, decision, "h100-80"); row.Lane != "fp8-adaln-pruned" || row.Rung != 1 {
+		t.Fatalf("a job's rung pinned %+v; want rung 1 fp8-adaln-pruned", row)
+	}
+	// A whole-lane figure and a rung assertion are equally beside the point for a job.
+	unsized := fp8Exact()
+	unsized.ComponentBytes = nil
+	for _, model := range []records.ModelRef{unsized, fp8Exact()} {
+		if need := records.Resident([]records.ModelRef{model}, "NVIDIA GeForce RTX 4090", true); need.Bytes != 0 {
+			t.Fatalf("a job's model sized %+v against a 24 GB card", need)
+		}
+	}
+	if need := records.Resident(nil, h100SXM, true); need.Fit != "" || need.Bytes != 0 {
+		t.Fatalf("a job binding no model sized %+v", need)
 	}
 }
