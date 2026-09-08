@@ -236,6 +236,11 @@ func preflightAssetCount(ep *Entrypoint, document map[string]any, specs []string
 		name, _, named := strings.Cut(spec, "=")
 		if named {
 			if namedAssetSpec(ep, name) {
+				parts, _ := assetPath(strings.TrimSpace(name))
+				if ep.Assets.contains(parts) {
+					position, _ := strconv.ParseInt(parts[1], 10, 32)
+					count = max(count, position+1)
+				}
 				continue
 			}
 			if problem := addLabel(name); problem != nil {
