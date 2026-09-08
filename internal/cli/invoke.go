@@ -559,12 +559,15 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 }
 
 // assertedRungs is the owner's ladder carried beside an explicit lane (cl-170): each rung
-// bound to the card's lane, saying where the owner puts each lane of THIS release — the
-// evidence a machine decision reads for the fit of the lane the run key chose, never a
-// choice. A binding for another model or release, or a rung naming a lane the card
-// lacks, says nothing here.
+// resolved to the selected release's lane of that name, saying where the owner puts each
+// lane of THIS model — the evidence a machine decision reads for the fit of the lane the
+// run key chose, never a choice. The binding's release is not required (cl-174): a rung
+// names a card and a lane, and on 2026-09-08 a package bound to rc.2 sized an explicit
+// rc.1 lane of the same name by whole-lane bytes, refusing two H100s that were running
+// that very lane. A binding for another model, or a rung naming a lane the selected
+// release lacks, says nothing here.
 func assertedRungs(binding *hub.PackageBindingRow, ref hub.Ref, selected *hub.ModelReleaseSummary) []records.ModelRung {
-	if binding == nil || binding.Model != ref.String() || binding.Release != selected.Release {
+	if binding == nil || binding.Model != ref.String() {
 		return nil
 	}
 	var rungs []records.ModelRung

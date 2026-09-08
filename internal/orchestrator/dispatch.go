@@ -604,7 +604,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		line, problem := c.opt.RentalFleet()
 		if problem != nil {
 			unguard()
-			if c.deferUnavailable(req, problem) {
+			if deferred, _ := c.deferUnavailable(req, problem); deferred {
 				return
 			}
 			c.failQueued(req.ID, problem, "")
@@ -618,7 +618,13 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		decision, after, problem := c.opt.AcquireManagedRental(req)
 		if problem != nil {
 			unguard()
-			if c.deferUnavailable(req, problem) {
+			// A refusal is a decision too (cl-174): its record is durable before the
+			// request parks or fails, once per distinct park.
+			deferred, news := c.deferUnavailable(req, problem)
+			if len(decision.Candidates) > 0 && (news || !deferred) {
+				c.logPlacement(req, decision)
+			}
+			if deferred {
 				return
 			}
 			c.failQueued(req.ID, problem, "")
@@ -752,7 +758,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		spec, planID, e := c.resolveFor(req)
 		if e != nil {
 			done()
-			if c.deferUnavailable(req, e) {
+			if deferred, _ := c.deferUnavailable(req, e); deferred {
 				return
 			}
 			c.failQueued(req.ID, autoRentalGate(req, e), "")
@@ -783,7 +789,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 				c.logf("%s remains QUEUED for the local device envelope: %s", req.ID, e.Message)
 				return
 			}
-			if c.deferUnavailable(req, e) {
+			if deferred, _ := c.deferUnavailable(req, e); deferred {
 				return
 			}
 			c.failQueued(req.ID, autoRentalGate(req, e), "")
@@ -791,7 +797,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		}
 		c.logf("%s: %s is %s for the queued request", req.Package, instance, change)
 		if e := c.EnsurePlacementReady(instance, req.PlanID); e != nil {
-			if c.deferUnavailable(req, e) {
+			if deferred, _ := c.deferUnavailable(req, e); deferred {
 				done()
 				return
 			}
@@ -821,15 +827,14 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 	}()
 }
 
-func (c *Orchestrator) deferUnavailable(req records.Request, problem *exit.Error) bool {
+func (c *Orchestrator) deferUnavailable(req records.Request, problem *exit.Error) (deferred, news bool) {
 	if !req.Rental || problem == nil || problem.Code != exit.Unavailable {
-		return false
+		return false, false
 	}
 	if c.QueuePosition(req.ID) == 0 {
-		return false
+		return false, false
 	}
-	c.parkFor(req, problem.Message)
-	return true
+	return true, c.parkFor(req, problem.Message)
 }
 
 // parkFor parks a queued --rental request with the reason it waits, and says whether that
