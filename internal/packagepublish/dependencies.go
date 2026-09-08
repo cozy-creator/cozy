@@ -138,6 +138,17 @@ func (c *dependencyCollector) collectProject(root string, document projectMetada
 				"project dependency %q uses a direct URL", raw).
 				WithRemedy("publish the distribution to an index or use a local path/workspace source")
 		}
+		if req.name == normalizedProjectName(document.Project.Name) && len(req.extras) > 0 {
+			if problem := req.accepts(document.Project.Version); problem != nil {
+				return problem
+			}
+			// Capture every potentially consumed local helper; uv still evaluates
+			// the original marker when materializing the copied environment.
+			if problem := c.collectProject(root, document, req.extras, false); problem != nil {
+				return problem
+			}
+			continue
+		}
 		source, exists := sources[req.name]
 		if !exists {
 			c.registry = true
@@ -439,6 +450,7 @@ func selectedExtraRequirements(document projectMetadata, extras []string) ([]str
 				return nil, problem
 			}
 			if req.name == normalizedProjectName(document.Project.Name) && len(req.extras) > 0 && !req.direct {
+
 				if problem := req.accepts(document.Project.Version); problem != nil {
 					return nil, problem
 				}
