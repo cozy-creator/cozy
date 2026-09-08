@@ -84,15 +84,9 @@ func handlePackageBind(ctx *Context) *exit.Error {
 	// CAS: read the row's current revision (0 for an unbound slot), then move. An exact
 	// replay is a hub-side revision-keeping no-op, so this pair never invents a conflict
 	// for the same intent sent twice.
-	current, problem := c.PackageBindings(hctx, ref)
+	expected, problem := packageBindingRevision(hctx, c, ref, slot)
 	if problem != nil {
 		return problem
-	}
-	expected := int64(0)
-	for _, row := range current {
-		if row.Slot == slot {
-			expected = row.Revision
-		}
 	}
 	written, problem := c.BindPackageSlot(hctx, ref, slot, model, release, ladder, expected,
 		"cozy package bind "+ref.String()+" "+slot)
@@ -111,6 +105,51 @@ func handlePackageBind(ctx *Context) *exit.Error {
 		{K: "revision", V: written.Binding.Revision}, {K: "status", V: "bound"},
 		{K: "changed", V: written.Changed},
 	}, "package", "slot", "model", "release", "ladder", "revision", "status", "changed"))
+}
+
+func handlePackageUnbind(ctx *Context) *exit.Error {
+	ref, problem := hub.ParseRef(strings.TrimSpace(ctx.Inv.Args[0]))
+	if problem != nil {
+		return problem
+	}
+	slot := strings.TrimSpace(ctx.Inv.Args[1])
+	if slot == "" || strings.ContainsAny(slot, " \t") {
+		return exit.Usagef("%q is not a slot path such as generate.models.model", slot)
+	}
+	c, problem := ownedPublication(ctx, ref)
+	if problem != nil {
+		return problem
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	expected, problem := packageBindingRevision(hctx, c, ref, slot)
+	if problem != nil {
+		return problem
+	}
+	result, problem := c.UnbindPackageSlot(hctx, ref, slot, expected, "cozy package unbind "+ref.String()+" "+slot)
+	if problem != nil {
+		return problem
+	}
+	if result.Slot != slot {
+		return exit.Internalf("Tensorhub reset a different binding slot")
+	}
+	return emit(ctx, compactRecord([]output.Field{
+		{K: "package", V: ref.String()}, {K: "slot", V: slot},
+		{K: "status", V: "unbound"}, {K: "changed", V: result.Changed},
+	}, "package", "slot", "status", "changed"))
+}
+
+func packageBindingRevision(ctx context.Context, c *hub.Client, ref hub.Ref, slot string) (int64, *exit.Error) {
+	rows, problem := c.PackageBindings(ctx, ref)
+	if problem != nil {
+		return 0, problem
+	}
+	for _, row := range rows {
+		if row.Slot == slot {
+			return row.Revision, nil
+		}
+	}
+	return 0, nil
 }
 
 // verifyPackageSlot refuses a slot path the package's latest published interface does

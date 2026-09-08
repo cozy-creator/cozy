@@ -85,6 +85,7 @@ type PackageCmd struct {
 	Yank    PackageYankCmd    `cmd:"" help:"Permanently yank a package release."`
 
 	Bind     PackageBindCmd     `cmd:"" help:"Point one package slot's default at another model release/lane."`
+	Unbind   PackageUnbindCmd   `cmd:"" help:"Remove an owner override and use the package default."`
 	Bindings PackageBindingsCmd `cmd:"" help:"Show the package's current default bindings."`
 }
 
@@ -97,6 +98,15 @@ type PackageBindCmd struct {
 
 func (c *PackageBindCmd) Run(r *Runtime) error {
 	return r.call(handlePackageBind, []string{c.Ref, c.Slot, c.To}, nil, values("--gpu", c.GPU), false)
+}
+
+type PackageUnbindCmd struct {
+	Ref  string `arg:"" name:"package" help:"Published package name (org/name)."`
+	Slot string `arg:"" name:"slot-path" help:"Model slot whose owner override to remove."`
+}
+
+func (c *PackageUnbindCmd) Run(r *Runtime) error {
+	return r.call(handlePackageUnbind, []string{c.Ref, c.Slot}, nil, nil, false)
 }
 
 type PackageBindingsCmd struct {

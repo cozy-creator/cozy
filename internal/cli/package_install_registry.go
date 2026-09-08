@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -224,10 +225,8 @@ func exactPackageInstallDocument(name string, document hub.ExactDocument) (insta
 		Digest: document.Digest, Length: document.Length}, nil
 }
 
-// downloadPublishedPackageModels prefetches the models the package's CURRENT hub
-// bindings select (th-116, cl-166): each binding's ladder pinned to the rung this host's
-// own accelerator fits. Nothing in the installed release is a binding; only rows naming
-// a slot this release's PackageInterface declares are prefetched.
+// downloadPublishedPackageModels uses the same owner-override/authored-default
+// selection as invocation, pinned to the rung this host's accelerator fits.
 func downloadPublishedPackageModels(ctx context.Context, cli *Context, root string,
 	published *install.PublishedSource,
 ) *exit.Error {
@@ -251,12 +250,15 @@ func downloadPublishedPackageModels(ctx context.Context, cli *Context, root stri
 	if problem != nil {
 		return problem
 	}
-	bindings := make([]hub.PackageBindingRow, 0, len(rows))
-	for _, row := range rows {
-		if _, ok := declared[row.Slot]; ok {
-			bindings = append(bindings, row)
-		}
+	effective, problem := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints, packageInterface.Jobs), rows)
+	if problem != nil {
+		return problem
 	}
+	bindings := make([]hub.PackageBindingRow, 0, len(effective))
+	for _, row := range effective {
+		bindings = append(bindings, row)
+	}
+	sort.Slice(bindings, func(i, j int) bool { return bindings[i].Slot < bindings[j].Slot })
 	if len(bindings) == 0 {
 		return nil
 	}

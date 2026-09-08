@@ -113,7 +113,7 @@ func bindRemedy(packageName, slot string) string {
 		packageName, slot)
 }
 
-// resolveRemoteLadder resolves a hub binding for a rented run WITHOUT choosing a lane: every
+// resolveRemoteLadder resolves a configured ladder for a rented run WITHOUT choosing a lane: every
 // rung is bound to the exact manifest the card publishes for its lane, and the machine
 // decision pins one of them once the machine exists.
 func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
@@ -159,7 +159,7 @@ func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
 // rebind turns a card miss into the early refusal that names its fix: the binding points
 // at something the card does not offer, and `cozy package bind` is the one write path.
 func rebind(problem *exit.Error, packageName, slot string) *exit.Error {
-	return problem.WithRemedy("the hub binding for %s slot %s names it; rebind: %s",
+	return problem.WithRemedy("the model selection for %s slot %s names it; rebind: %s",
 		packageName, slot, bindRemedy(packageName, slot))
 }
 

@@ -11,7 +11,7 @@
 //   - THE PLACEMENT FACTS come from the exact PlacementSet retained at install. Runtime owns
 //     no local model-ref index, and cozy-creator never composes a TensorFS store path.
 //   - THE SELECTION is the request's own: the hub binding's rung for the machine, or a
-//     `model.<param>=` run key. Nothing in the package source is a binding (cl-166).
+//     `model.<param>=` run key, with immutable authored defaults when no owner override exists.
 //
 // For a wholly weightless package the installed runtime is the sole canonical plan writer:
 // `bindings --json` reports exact WeightsSubjects before spawn and
@@ -87,7 +87,7 @@ type WeightsOutput struct {
 	MaxBytes uint64 `json:"max_bytes"`
 }
 
-// Slot is one declared model binding path — capability, never selection. Its members
+// Slot is one declared model binding path with optional authored selection defaults. Its members
 // mirror cozy-runtime's `internal/package_interface.py` slot (cr-078a): `{class, component_use,
 // path}` plus the class's two closed consents `encoded_leaves` and `fusion` (h3a-015) and an
 // optional `sequence_parallel` document. `stamps` is a RETIRED member: every release published before the cut ships an
@@ -100,6 +100,14 @@ type Slot struct {
 	EncodedLeaves    string              `json:"encoded_leaves,omitempty"`
 	Fusion           string              `json:"fusion,omitempty"`
 	SequenceParallel json.RawMessage     `json:"sequence_parallel,omitempty"`
+	DefaultLadder    []ModelDefaultRung  `json:"default_ladder,omitempty"`
+}
+
+// ModelDefaultRung binds a GPU pattern to a full org/model@release/lane reference.
+// This immutable metadata is a fallback; it is never a mutable Hub binding row.
+type ModelDefaultRung struct {
+	GPU  string `json:"gpu"`
+	Lane string `json:"lane"`
 }
 
 // SequenceParallelDegrees is the group degrees this package can be built at: the
@@ -294,9 +302,27 @@ func validateClosedPackageInterface(data []byte) error {
 				for _, slot := range slots {
 					members, err := exactKeys(slot,
 						[]string{"class", "component_use", "path"},
-						[]string{"encoded_leaves", "fusion", "sequence_parallel"})
+						[]string{"encoded_leaves", "fusion", "sequence_parallel", "default_ladder"})
 					if err != nil {
 						return err
+					}
+					if raw, present := members["default_ladder"]; present {
+						var rungs []json.RawMessage
+						if json.Unmarshal(raw, &rungs) != nil || len(rungs) == 0 || len(rungs) > 32 {
+							return fmt.Errorf("default_ladder must contain 1 through 32 rungs")
+						}
+						for _, rung := range rungs {
+							fields, err := exactKeys(rung, []string{"gpu", "lane"}, nil)
+							if err != nil {
+								return err
+							}
+							for _, field := range fields {
+								var value string
+								if json.Unmarshal(field, &value) != nil || value == "" {
+									return fmt.Errorf("default_ladder GPU patterns and lane references must be nonempty strings")
+								}
+							}
+						}
 					}
 					for _, consent := range []string{"encoded_leaves", "fusion"} {
 						if raw, ok := members[consent]; ok {

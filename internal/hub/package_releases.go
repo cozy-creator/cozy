@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -293,8 +294,9 @@ func ValidateLadder(ladder []BindingRung) *exit.Error {
 		return exit.Usagef("a binding needs at least one --gpu <GPU>=<lane> rung")
 	}
 	for i, rung := range ladder {
-		if strings.TrimSpace(rung.GPU) == "" || strings.TrimSpace(rung.Lane) == "" ||
-			strings.ContainsAny(rung.GPU+rung.Lane, " \t") {
+		if len(rung.GPU) == 0 || len(rung.GPU) > 64 || strings.TrimSpace(rung.GPU) != rung.GPU ||
+			(rung.GPU != "*" && strings.IndexFunc(rung.GPU, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) }) < 0) ||
+			strings.TrimSpace(rung.Lane) == "" || strings.ContainsAny(rung.Lane, " \t") {
 			return exit.Usagef("rung %d is not <GPU>=<lane>: %q", i+1, rung.String())
 		}
 		if rung.GPU == "*" && i != len(ladder)-1 {
@@ -343,4 +345,19 @@ func (c *Client) BindPackageSlot(ctx context.Context, ref Ref, slot, model, rele
 		body: map[string]any{"model": model, "release": release, "ladder": ladder,
 			"expected_revision": expectedRevision}}, &out)
 	return out, e
+}
+
+// PackageBindingReset removes an owner override so authored defaults can apply.
+type PackageBindingReset struct {
+	Slot    string `json:"slot"`
+	Changed bool   `json:"changed"`
+}
+
+func (c *Client) UnbindPackageSlot(ctx context.Context, ref Ref, slot string, expectedRevision int64, reason string) (PackageBindingReset, *exit.Error) {
+	var out PackageBindingReset
+	problem := c.do(ctx, call{method: http.MethodDelete,
+		path: resourcePath("packages", ref) + "/bindings/" + url.PathEscape(slot),
+		auth: true, reason: reason, strict: true,
+		body: map[string]any{"expected_revision": expectedRevision}}, &out)
+	return out, problem
 }
