@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -95,7 +96,7 @@ build-backend="hatchling.build"
 only-include=[%q]
 `, name, version, extra, wheel, sources, module+":app", module+".py")
 	}
-	var sourceMetadata []byte
+	var sourceMetadata, sourceLock []byte
 	if directSource != "" {
 		_, files, problem := packagepublish.LibrarySourceTree(directSource)
 		fatal(t, problem)
@@ -107,6 +108,8 @@ only-include=[%q]
 			must(t, os.WriteFile(destination, raw, 0600))
 		}
 		sourceMetadata, err = os.ReadFile(filepath.Join(child, "pyproject.toml"))
+		must(t, err)
+		sourceLock, err = os.ReadFile(filepath.Join(child, "uv.lock"))
 		must(t, err)
 		var parsed struct {
 			Project struct {
@@ -145,9 +148,18 @@ async def run(ctx:Context,payload:Request)->ScoreResult:
 `)
 	run := func(args ...string) {
 		t.Helper()
-		code, out := runCozyPath(t, root, path, args...)
-		if code != 0 {
-			t.Fatalf("cozy %s [%d]: %s", strings.Join(args, " "), code, out)
+		for {
+			code, out := runCozyPath(t, root, path, args...)
+			if code != 0 && strings.Contains(out, "another Cozy writer holds") {
+				// The real editable watcher may be capturing the just-edited
+				// dependency. Retry its explicit contention result, not failures.
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			if code != 0 {
+				t.Fatalf("cozy %s [%d]: %s", strings.Join(args, " "), code, out)
+			}
+			return
 		}
 	}
 	if directSource == "" {
@@ -164,8 +176,18 @@ async def run(ctx:Context,payload:Request)->ScoreResult:
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	var original records.Request
-	for index := 0; index < 3; index++ {
+	var original, previous records.Request
+	runs := 3
+	if directSource != "" {
+		runs = 4
+	}
+	for index := 0; index < runs; index++ {
+		if index == 3 {
+			helper := filepath.Join(child, "src", "cozy_eval", "facts.py")
+			code, err := os.ReadFile(helper)
+			must(t, err)
+			must(t, os.WriteFile(helper, append(code, []byte("\n# Same-version editable source capture proof.\n")...), 0600))
+		}
 		if index == 2 {
 			pixels.Set(3, 3, color.RGBA{G: 255, A: 255})
 			buffer.Reset()
@@ -185,9 +207,13 @@ async def run(ctx:Context,payload:Request)->ScoreResult:
 		} else if index == 1 && (children[0].ReusedFrom != original.ID || children[0].Ordinal != 0) {
 			t.Fatalf("new parent rescored identical media: %+v", children[0])
 		}
-		if index == 2 && (children[0].ReusedFrom != "" || children[0].Ordinal != 1) {
+		if index >= 2 && (children[0].ReusedFrom != "" || children[0].Ordinal != 1) {
 			t.Fatalf("changed media reused an old score: %+v", children[0])
 		}
+		if index == 3 && children[0].ChildTargetDigest == previous.ChildTargetDigest {
+			t.Fatal("same-version metric source edit preserved old implementation identity")
+		}
+		previous = children[0]
 	}
 	if directSource != "" {
 		actual, err := os.ReadFile(filepath.Join(child, "pyproject.toml"))
@@ -195,6 +221,12 @@ async def run(ctx:Context,payload:Request)->ScoreResult:
 		if !bytes.Equal(actual, sourceMetadata) {
 			t.Fatal("managed capture mutated original editable pyproject")
 		}
+		actual, err = os.ReadFile(filepath.Join(child, "uv.lock"))
+		must(t, err)
+		if !bytes.Equal(actual, sourceLock) {
+			t.Fatal("managed capture mutated original editable lock")
+		}
+
 	}
 
 }
