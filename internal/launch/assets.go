@@ -20,7 +20,9 @@ import (
 // bytes travel out-of-band through DeliveryGrant. A nested path is resolved against the
 // package's recorded schema, so `references.0.image` cannot accidentally grant a file
 // to a scalar or to a misspelled field.
-func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, fidelities []string) (json.RawMessage, []records.AssetBinding, *exit.Error) {
+type ImagePreparer func(source string, kind AssetsKind) (string, *exit.Error)
+
+func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, fidelities []string, prepare ImagePreparer) (json.RawMessage, []records.AssetBinding, *exit.Error) {
 	if len(specs) == 0 && len(fidelities) == 0 && ep.Assets == nil {
 		return payload, nil, nil
 	}
@@ -130,6 +132,18 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, fidelities []st
 		absolute, err := filepath.Abs(source)
 		if err != nil {
 			return nil, nil, exit.New(exit.NotFound, "cannot resolve input asset %s: %s", source, err)
+		}
+		if kind := ep.Assets.preparedImageKind(); prepare != nil && kind != nil && ep.Assets.contains(parts) {
+			_, mediaType, problem := inputasset.Probe(absolute)
+			if problem != nil {
+				return nil, nil, problem
+			}
+			if (AssetField{MediaTypes: kind.MediaTypes}).AcceptsMediaType(mediaType) {
+				absolute, problem = prepare(absolute, *kind)
+				if problem != nil {
+					return nil, nil, problem
+				}
+			}
 		}
 		length, digest, mediaType, e := inputasset.Fingerprint(absolute, maxBytes)
 		if e != nil {
