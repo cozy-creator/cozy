@@ -1,4 +1,4 @@
-package publication
+package producttest
 
 import (
 	"context"
@@ -12,6 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/publication"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
@@ -20,7 +21,7 @@ func TestCheckpointLostFinalizeReplyAndFreshEffectReuseRetainedManifest(t *testi
 	manifest := []byte(`{"entries":[]}`)
 	digest, _ := canonical.Spell(canonical.Digest(manifest))
 	object := hub.Object{ID: digest, Length: int64(len(manifest))}
-	intent := UploadIntent{Request: UploadRequest{Destination: "alice/model", Artifact: records.ModelArtifact{ProducerRequestID: "source", OutputSlot: "model", Manifest: records.ArtifactObjectRef{Digest: digest, Length: int64(len(manifest))}, TensorFSReceiptDigest: "sha256:" + strings.Repeat("1", 64)}}, Objects: []hub.Object{object}}
+	intent := publication.UploadIntent{Request: publication.UploadRequest{Destination: "alice/model", Artifact: records.ModelArtifact{ProducerRequestID: "source", OutputSlot: "model", Manifest: records.ArtifactObjectRef{Digest: digest, Length: int64(len(manifest))}, TensorFSReceiptDigest: "sha256:" + strings.Repeat("1", 64)}}, Objects: []hub.Object{object}}
 	accepted, checkpointed := false, false
 	puts, finalizes, opens := 0, 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -61,14 +62,14 @@ func TestCheckpointLostFinalizeReplyAndFreshEffectReuseRetainedManifest(t *testi
 	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("test")}, "publication-test")
 	upload := func(context.Context, hub.Grant, int64) *exit.Error { puts++; accepted = true; return nil }
 	before := func() *exit.Error { return nil }
-	if _, problem := UploadCheckpoint(context.Background(), client, "effect-one", intent, before, upload); problem == nil {
+	if _, problem := publication.UploadCheckpoint(context.Background(), client, "effect-one", intent, before, upload); problem == nil {
 		t.Fatal("lost finalize response was falsely acknowledged")
 	}
-	receipt, problem := UploadCheckpoint(context.Background(), client, "effect-one", intent, before, upload)
+	receipt, problem := publication.UploadCheckpoint(context.Background(), client, "effect-one", intent, before, upload)
 	if problem != nil || receipt.Observation != "observed_convergence" {
 		t.Fatalf("lost finalize did not reconcile: %+v %v", receipt, problem)
 	}
-	fresh, problem := UploadCheckpoint(context.Background(), client, "effect-two", intent, before, upload)
+	fresh, problem := publication.UploadCheckpoint(context.Background(), client, "effect-two", intent, before, upload)
 	if problem != nil || fresh.Checkpoint != digest || fresh.Observation != "observed_convergence" {
 		t.Fatalf("fresh same-content effect failed: %+v %v", fresh, problem)
 	}

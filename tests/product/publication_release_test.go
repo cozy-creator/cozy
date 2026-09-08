@@ -1,4 +1,4 @@
-package publication
+package producttest
 
 import (
 	"context"
@@ -13,12 +13,13 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/publication"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
 // The owner client speaks its real HTTP API. This fixture controls commit/reply
 // loss and competing revisions, without replacing publication logic with a fake.
-type releaseServer struct {
+type publicationReleaseServer struct {
 	mu        sync.Mutex
 	revision  int64
 	lanes     map[string]string
@@ -27,7 +28,7 @@ type releaseServer struct {
 	denied    bool
 }
 
-func (s *releaseServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *publicationReleaseServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.denied {
@@ -79,9 +80,9 @@ func (s *releaseServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(hub.ModelRelease{Release: "v1", Revision: s.revision, Lanes: lanes, Changed: true})
 }
 
-func fixture(t *testing.T) (*releaseServer, *hub.Client) {
+func publicationReleaseFixture(t *testing.T) (*publicationReleaseServer, *hub.Client) {
 	t.Helper()
-	service := &releaseServer{revision: 1, lanes: map[string]string{"bf16": "sha256:" + strings.Repeat("1", 64)}}
+	service := &publicationReleaseServer{revision: 1, lanes: map[string]string{"bf16": "sha256:" + strings.Repeat("1", 64)}}
 	server := httptest.NewServer(service)
 	t.Cleanup(server.Close)
 	return service, hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("test")}, "publication-test")
@@ -90,14 +91,14 @@ func fixture(t *testing.T) (*releaseServer, *hub.Client) {
 func TestLostReplyReconcilesOnlyFrozenSuccessor(t *testing.T) {
 	for _, changed := range []bool{false, true} {
 		t.Run(fmt.Sprint(changed), func(t *testing.T) {
-			service, client := fixture(t)
-			intent, problem := PrepareRelease(context.Background(), client, ReleaseRequest{Destination: "alice/model", Release: "v1", Lanes: map[string]string{"fp8": "sha256:" + strings.Repeat("2", 64)}})
+			service, client := publicationReleaseFixture(t)
+			intent, problem := publication.PrepareRelease(context.Background(), client, publication.ReleaseRequest{Destination: "alice/model", Release: "v1", Lanes: map[string]string{"fp8": "sha256:" + strings.Repeat("2", 64)}})
 			if problem != nil {
 				t.Fatal(problem)
 			}
 			sent := false
 			service.loseReply = true
-			_, problem = ApplyRelease(context.Background(), client, intent, false, func() *exit.Error { sent = true; return nil })
+			_, problem = publication.ApplyRelease(context.Background(), client, intent, false, func() *exit.Error { sent = true; return nil })
 			if problem == nil || !sent || service.revision != 2 {
 				t.Fatalf("lost reply did not preserve uncertainty: %v", problem)
 			}
@@ -105,7 +106,7 @@ func TestLostReplyReconcilesOnlyFrozenSuccessor(t *testing.T) {
 				service.revision = 3
 				service.lanes["bf16"] = "sha256:" + strings.Repeat("3", 64)
 			}
-			result, problem := ApplyRelease(context.Background(), client, intent, true, func() *exit.Error { t.Fatal("recovery attempted another mutation"); return nil })
+			result, problem := publication.ApplyRelease(context.Background(), client, intent, true, func() *exit.Error { t.Fatal("recovery attempted another mutation"); return nil })
 			if changed {
 				if problem == nil || problem.ErrName() != "publication.outcome_unknown" {
 					t.Fatalf("changed state accepted: %+v %v", result, problem)
@@ -126,34 +127,34 @@ func TestLostReplyReconcilesOnlyFrozenSuccessor(t *testing.T) {
 }
 
 func TestExplicitStaleRevisionAndFreshNoop(t *testing.T) {
-	service, client := fixture(t)
+	service, client := publicationReleaseFixture(t)
 	desired := map[string]string{"bf16": service.lanes["bf16"]}
 	stale := int64(0)
-	_, problem := PrepareRelease(context.Background(), client, ReleaseRequest{Destination: "alice/model", Release: "v1", Lanes: desired, ExpectedRevision: &stale})
+	_, problem := publication.PrepareRelease(context.Background(), client, publication.ReleaseRequest{Destination: "alice/model", Release: "v1", Lanes: desired, ExpectedRevision: &stale})
 	if problem == nil || problem.ErrName() != "publication.release_conflict" {
 		t.Fatal("explicit stale no-op admitted", problem)
 	}
-	intent, problem := PrepareRelease(context.Background(), client, ReleaseRequest{Destination: "alice/model", Release: "v1", Lanes: desired})
+	intent, problem := publication.PrepareRelease(context.Background(), client, publication.ReleaseRequest{Destination: "alice/model", Release: "v1", Lanes: desired})
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	result, problem := ApplyRelease(context.Background(), client, intent, false, nil)
+	result, problem := publication.ApplyRelease(context.Background(), client, intent, false, nil)
 	if problem != nil || result.Observation != "observed_noop" || service.writes != 0 {
 		t.Fatalf("fresh no-op mutated: %+v %v", result, problem)
 	}
 	service.denied = true
-	if _, problem = ApplyRelease(context.Background(), client, intent, true, nil); problem == nil {
+	if _, problem = publication.ApplyRelease(context.Background(), client, intent, true, nil); problem == nil {
 		t.Fatal("revoked read authority admitted")
 	}
 }
 
 func TestUnchangedBaselineRetriesOriginalCASAfterRecordedSend(t *testing.T) {
-	service, client := fixture(t)
-	intent, problem := PrepareRelease(context.Background(), client, ReleaseRequest{Destination: "alice/model", Release: "v1", Lanes: map[string]string{"fp8": "sha256:" + strings.Repeat("2", 64)}})
+	service, client := publicationReleaseFixture(t)
+	intent, problem := publication.PrepareRelease(context.Background(), client, publication.ReleaseRequest{Destination: "alice/model", Release: "v1", Lanes: map[string]string{"fp8": "sha256:" + strings.Repeat("2", 64)}})
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	result, problem := ApplyRelease(context.Background(), client, intent, true, func() *exit.Error { return nil })
+	result, problem := publication.ApplyRelease(context.Background(), client, intent, true, func() *exit.Error { return nil })
 	if problem != nil || result.Observation != "acknowledged" || service.revision != 2 || service.writes != 1 {
 		t.Fatalf("original CAS failed: %+v %v", result, problem)
 	}
