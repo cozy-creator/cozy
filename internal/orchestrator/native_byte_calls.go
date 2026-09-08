@@ -12,6 +12,9 @@ import (
 )
 
 func nativeSourceByteOutput(row records.NativeCall, status *pb.NativeSourceStatus) (records.ByteOutput, *exit.Error) {
+	if row.Operation == "commit_file" {
+		return nativeCommittedFileOutput(row, status)
+	}
 	fail := func(message string) (records.ByteOutput, *exit.Error) {
 		return records.ByteOutput{}, exit.New(exit.Validation, "%s", message)
 	}

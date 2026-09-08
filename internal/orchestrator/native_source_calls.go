@@ -31,6 +31,8 @@ func nativeSourceOperation(name string) pb.NativeSourceOperation {
 		return pb.NativeSourceOperation_NATIVE_SOURCE_OPERATION_CONVERT
 	case "source_files":
 		return pb.NativeSourceOperation_NATIVE_SOURCE_OPERATION_SOURCE_FILES
+	case "commit_file":
+		return pb.NativeSourceOperation_NATIVE_SOURCE_OPERATION_COMMIT_FILE
 	}
 	return pb.NativeSourceOperation_NATIVE_SOURCE_OPERATION_UNSPECIFIED
 }
@@ -74,7 +76,7 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 		return true
 	}
 	if row.State == "succeeded" {
-		if row.Operation == "source_files" {
+		if row.Operation == "source_files" || row.Operation == "commit_file" {
 			go c.replayNativeByteResult(s, call, row)
 			return true
 		}
@@ -87,7 +89,7 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 	}
 	c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_PENDING, nil, nil)
 	phase := pb.NativeSourcePhase_NATIVE_SOURCE_PHASE_RESOLVE
-	if row.Operation == "convert_cozytensors" || row.Operation == "source_files" {
+	if row.Operation == "convert_cozytensors" || row.Operation == "source_files" || row.Operation == "commit_file" {
 		phase = pb.NativeSourcePhase_NATIVE_SOURCE_PHASE_EXECUTE
 	}
 	c.sendNativeSource(s, call, row.ID, phase, nil)
@@ -176,7 +178,7 @@ func (c *Orchestrator) onNativeSourceStatus(s *session, status *pb.NativeSourceS
 		if len(status.ResultCanonicalBytes) > childCallMaxBytes || len(status.NativeReceiptCanonicalBytes) > 1<<20 || len(status.ComputationDigest) != 32 {
 			return
 		}
-		if row.Operation == "source_files" {
+		if row.Operation == "source_files" || row.Operation == "commit_file" {
 			output, problem := nativeSourceByteOutput(*row, status)
 			if problem != nil {
 				c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_REFUSED, nil, problem)
