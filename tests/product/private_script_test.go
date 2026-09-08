@@ -150,7 +150,13 @@ func TestPrivateScriptTypedOutputsUseNormalAttempt(t *testing.T) {
 	root, err := os.MkdirTemp("", "cozy-typed-")
 	must(t, err)
 	t.Cleanup(func() {
-		compositionDown(t, root, os.Getenv("PATH"))
+		path := ""
+		for _, value := range childEnv(t, root) {
+			if strings.HasPrefix(value, "PATH=") {
+				path = strings.TrimPrefix(value, "PATH=")
+			}
+		}
+		compositionDown(t, root, path)
 		if t.Failed() {
 			t.Log("typed script evidence retained", root)
 		} else {
