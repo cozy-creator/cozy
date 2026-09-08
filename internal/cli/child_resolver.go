@@ -116,6 +116,10 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	out = orchestrator.Submission{Kind: "job", RetainWork: true, Package: install.Package, Entrypoint: binding.Entrypoint, Release: install.Version, InstallID: install.ID,
 		PlanID: facts.DescriptorID, Payload: append([]byte(nil), payload...), Outputs: facts.Outputs, WeightsOutputs: facts.WeightsOutputs, NeedsAccelerator: facts.NeedsAccelerator, Org: parent.Org}
 	out.Models = models
+	out.Assets, problem = launch.InheritChildAssets(job, payload, parent.Assets)
+	if problem != nil {
+		return out, "", problem
+	}
 	out.ChildReusable = job.Invocable.Memoize
 	out.ChildArtifacts = len(launch.ModelArtifactPaths(job.Result)) > 0
 	if parent.Worker != "" {
