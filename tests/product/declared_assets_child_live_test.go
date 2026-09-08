@@ -64,16 +64,16 @@ only-include=[%q]
 	write(child, "package.toml", "[application]\nobject=\"label_child:app\"\n")
 	write(child, "label_child.py", `from typing import Annotated
 import msgspec
-from cozy_runtime.author import App, Assets, AssetBound, ImageAsset, Context, MediaDecoder, invocable
-Pictures=Annotated[Assets[Annotated[ImageAsset,AssetBound(max_bytes=1024,max_decoded_bytes=4096)]],msgspec.Meta(min_length=1,max_length=3)]
+from cozy_runtime.author import App, Assets, AssetBound, Image, Context, invocable
+Pictures=Annotated[Assets[Annotated[Image,AssetBound(max_bytes=1024,max_decoded_bytes=4096)]],msgspec.Meta(min_length=1,max_length=3)]
 class Result(msgspec.Struct):
     labels: list[str]
     ids: list[str]
     rgb: list[str]
 @invocable(memoize=True)
-async def inspect_assets(ctx: Context, *, assets: Pictures, decoder: MediaDecoder) -> Result:
+async def inspect_assets(ctx: Context, *, assets: Pictures) -> Result:
     ctx.raise_if_cancelled()
-    return Result([a.label for a in assets],[a.id for a in assets],[decoder.decode_image(a).rgb.hex() for a in assets])
+    return Result([assets.info(i).label for i in range(len(assets))],[assets.info(i).id for i in range(len(assets))],[image.tobytes().hex() for image in assets])
 app=App()
 app.job(inspect_assets)
 `)
@@ -81,13 +81,13 @@ app.job(inspect_assets)
 	write(project, "package.toml", "[application]\nobject=\"label_parent:app\"\n")
 	write(project, "label_parent.py", `from typing import Annotated
 import msgspec
-from cozy_runtime.author import App, Assets, AssetBound, ImageAsset, Context, invocable
+from cozy_runtime.author import App, Assets, AssetBound, Image, Context, invocable
 from label_child import Result, inspect_assets
-Pictures=Annotated[Assets[Annotated[ImageAsset,AssetBound(max_bytes=1024,max_decoded_bytes=4096)]],msgspec.Meta(min_length=1,max_length=3)]
+Pictures=Annotated[Assets[Annotated[Image,AssetBound(max_bytes=1024,max_decoded_bytes=4096)]],msgspec.Meta(min_length=1,max_length=3)]
 app=App()
 @invocable(memoize=False)
 async def run(ctx: Context, *, assets: Pictures) -> Result:
-    return await inspect_assets(assets=Assets([assets[1],assets[0]]))
+    return await inspect_assets(assets=assets.select(1,0))
 app.job(run)
 `)
 	for _, dir := range []string{child, project} {

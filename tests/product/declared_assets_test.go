@@ -12,9 +12,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 )
 
+const declaredAssetsInterface = `{"application":"assets:app","format":"cozy.package.interface/1","jobs":[],"entrypoints":[{"name":"run","assets":{"parameter":"assets","kinds":[{"kind":"image","max_bytes":1024,"max_decoded_bytes":4096,"media_types":["image/png"]}]},"request":{"fields":[{"name":"prompt","type":"str"},{"name":"assets","constraints":{"min_length":1,"max_length":3},"type":{"list":{"fields":[{"name":"asset","type":{"asset":"file"}},{"name":"label","type":"str","wire":"optional"}]}}},{"name":"poster","type":{"asset":"image"},"asset_bound":{"max_bytes":1024,"media_types":["image/png"]},"wire":"optional"}]},"result":{"fields":[]}}]}`
+
 func assetsCallable(t *testing.T) *launch.Entrypoint {
 	t.Helper()
-	raw := []byte(`{"application":"assets:app","format":"cozy.package.interface/1","jobs":[],"entrypoints":[{"name":"run","assets":{"parameter":"assets","kinds":[{"kind":"image","max_bytes":1024,"max_decoded_bytes":4096,"media_types":["image/png"]}]},"request":{"fields":[{"name":"prompt","type":"str"},{"name":"assets","constraints":{"min_length":1,"max_length":3},"type":{"list":{"fields":[{"name":"asset","type":{"asset":"file"}},{"name":"label","type":"str","wire":"optional"}]}}},{"name":"poster","type":{"asset":"image"},"asset_bound":{"max_bytes":1024,"media_types":["image/png"]},"wire":"optional"}]},"result":{"fields":[]}}]}`)
+	raw := []byte(declaredAssetsInterface)
 	iface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
 	ep, problem := iface.Function("run")
@@ -111,5 +113,26 @@ func TestDeclaredAssetsDefaultEmptyCollection(t *testing.T) {
 	}
 	if _, _, problem = launch.ParseAssets(ep, []byte(`{"prompt":"text only","assets":null}`), nil); problem == nil {
 		t.Fatal("explicit null collection became an empty list")
+	}
+}
+
+func TestDeclaredAssetsDecodedViewDescriptor(t *testing.T) {
+	for _, value := range []string{`"decoded"`, `"raw"`, `""`, `null`, `true`, `1`} {
+		t.Run(value, func(t *testing.T) {
+			raw := strings.Replace(declaredAssetsInterface, `"parameter":"assets"`, `"parameter":"assets","view":`+value, 1)
+			iface, problem := launch.DecodePackageInterface([]byte(raw))
+			if value != `"decoded"` {
+				if problem == nil {
+					t.Fatal("invalid explicit Assets view accepted")
+				}
+				return
+			}
+			fatal(t, problem)
+			ep, problem := iface.Function("run")
+			fatal(t, problem)
+			if ep.Assets.View != "decoded" {
+				t.Fatal("decoded view descriptor was dropped")
+			}
+		})
 	}
 }

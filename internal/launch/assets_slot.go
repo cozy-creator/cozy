@@ -16,6 +16,7 @@ import (
 type AssetsSlot struct {
 	Parameter string       `json:"parameter"`
 	Kinds     []AssetsKind `json:"kinds"`
+	View      string       `json:"view,omitempty"`
 }
 
 type AssetsKind struct {
@@ -26,13 +27,16 @@ type AssetsKind struct {
 }
 
 func validateAssetsSlot(raw, request json.RawMessage) error {
-	value, err := exactKeys(raw, []string{"parameter", "kinds"}, nil)
+	value, err := exactKeys(raw, []string{"parameter", "kinds"}, []string{"view"})
 	if err != nil {
 		return err
 	}
 	var slot AssetsSlot
 	if json.Unmarshal(raw, &slot) != nil || slot.Parameter == "" || strings.ContainsAny(slot.Parameter, ". /\\") {
 		return fmt.Errorf("assets parameter must be one field identifier")
+	}
+	if value["view"] != nil && slot.View != "decoded" {
+		return fmt.Errorf("assets view must be decoded when present")
 	}
 	var schema Struct
 	if json.Unmarshal(request, &schema) != nil {

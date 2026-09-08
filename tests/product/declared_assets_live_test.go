@@ -30,9 +30,9 @@ func TestDeclaredAssetsActualCallable(t *testing.T) {
 	code := `
 from typing import Annotated
 import msgspec
-from cozy_runtime.author import App, Assets, AssetBound, ImageAsset, Context, invocable
-Pictures = Annotated[Assets[Annotated[ImageAsset, AssetBound(max_bytes=1024, max_decoded_bytes=4096)]], msgspec.Meta(min_length=1,max_length=3)]
-OptionalPictures = Annotated[Assets[Annotated[ImageAsset, AssetBound(max_bytes=1024, max_decoded_bytes=4096)]], msgspec.Meta(max_length=3)]
+from cozy_runtime.author import App, Assets, AssetBound, Image, Context, invocable
+Pictures = Annotated[Assets[Annotated[Image, AssetBound(max_bytes=1024, max_decoded_bytes=4096)]], msgspec.Meta(min_length=1,max_length=3)]
+OptionalPictures = Annotated[Assets[Annotated[Image, AssetBound(max_bytes=1024, max_decoded_bytes=4096)]], msgspec.Meta(max_length=3)]
 class Result(msgspec.Struct):
     labels: list[str]
     ids: list[str]
@@ -40,8 +40,9 @@ class Result(msgspec.Struct):
     sizes: list[int]
 app = App()
 def result(assets: Pictures) -> Result:
-    assert assets.by_label("艾丽丝").position == 0
-    return Result([a.label for a in assets],[a.id for a in assets],[a.position for a in assets],[len(a.read_bytes()) for a in assets])
+    assert assets.info("艾丽丝").position == 0
+    assert assets["艾丽丝"].size == (2, 2)
+    return Result([assets.info(i).label for i in range(len(assets))],[assets.info(i).id for i in range(len(assets))],[assets.info(i).position for i in range(len(assets))],[assets.info(i).size_bytes for i in range(len(assets))])
 @invocable(memoize=False)
 async def main(ctx: Context, *, assets: Pictures, fail: bool = False) -> Result:
     ctx.raise_if_cancelled()
@@ -67,7 +68,7 @@ async def empty(payload: Request, assets: OptionalPictures) -> Result:
 name = "cozy-assets-proof"
 version = "1.0.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime==` + version + `"]
+dependencies = ["cozy-runtime[media]==` + version + `"]
 [project.entry-points."cozy.application"]
 default = "assets_app:app"
 [build-system]
