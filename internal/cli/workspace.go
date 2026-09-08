@@ -2,7 +2,7 @@ package cli
 
 import (
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"os"
 	"path/filepath"
@@ -11,7 +11,7 @@ import (
 // ResolveWorkspace launches only the installed control Runtime. It imports no
 // package, allocates no accelerator and uses the same store as local jobs.
 func (r *Resolver) ResolveWorkspace() (orchestrator.WorkerLaunchSpec, *exit.Error) {
-	runtime, problem := launch.HostRuntime(r.cfg.Child())
+	runtime, problem := hostruntime.Path(r.cfg.Child())
 	if problem != nil {
 		return orchestrator.WorkerLaunchSpec{}, problem
 	}

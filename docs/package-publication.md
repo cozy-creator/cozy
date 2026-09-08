@@ -52,9 +52,16 @@ output. Modified and ordinary untracked files are published normally.
 Cozy runs `uv build --wheel` against the current tree. `uv` invokes the project's declared
 PEP 517 backend; Cozy does not maintain another Python package builder. Cozy verifies that
 every bundled local wheel's name and version agrees with its project and parent requirement.
-The only publish-time metadata derivation is the project's locked `cozy-runtime describe`;
-its canonical output is published as `metadata/package-interface.json`. Publication derives
-no checkpoint evidence, code topology, tensor requirements, or compatibility cache.
+Publication derives no metadata. The tree's committed `metadata/package-interface.json` is the
+PackageInterface Tensorhub accepts as truth (decision #713); the package's own tooling writes
+it. Right before upload Cozy pre-flights it: this host's `cozy-runtime describe` — a release
+at or above `hostruntime.Floor`, whose reading is static — parses the tree and imports
+nothing, so no package code runs on the publisher's host and no environment is built for the
+question. A committed file that differs from that reading, or is absent, is refused as
+`package_publish.interface_stale`, naming the first difference; on a match the committed file
+uploads unchanged. The same static reading, by the same host tool, is what install compares
+with the committed release and what a job's descriptor id is read from (cl-175). Publication
+derives no checkpoint evidence, code topology, tensor requirements, or compatibility cache.
 
 The uploaded ordinary file tree contains the source paths, the project wheel at
 `artifacts/project/<wheel>`, genuinely bundled dependency wheels at
@@ -64,8 +71,8 @@ external locked environment facts and are never re-uploaded.
 Publication is one bounded digest-declared session:
 
 1. Cozy checks whether the exact release already exists; a committed replay stops here.
-2. It builds the project and bundled dependency wheels, derives the PackageInterface, and hashes
-   every ordinary file locally.
+2. It builds the project and bundled dependency wheels, pre-flights the committed
+   PackageInterface, and hashes every ordinary file locally.
 3. `POST /v1/packages/{org}/{name}/publish/{release}` carries `{files:[{path,digest,length}]}`.
    Tensorhub journals the declaration under a `publication_id` and answers each file from the
    store's own HEAD: already present, or one checksum-pinned single-object PUT.

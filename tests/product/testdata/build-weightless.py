@@ -100,18 +100,24 @@ def main() -> int:
         )
         run("uv", "lock", "--quiet", cwd=tree)
         run("uv", "sync", "--locked", "--quiet", cwd=tree)
+        # The committed PackageInterface every publishable tree carries (cl-175): publication
+        # pre-flights it against this host's static reading and uploads it unchanged.
         env = dict(os.environ, PYTHONPATH=str(tree))
-        run(
-            str(tree / ".venv/bin/python"),
-            "-m",
-            "cozy_runtime.cli.main",
-            "--dir",
-            str(tree),
-            "describe",
-            "--json",
+        interface = subprocess.check_output(
+            [
+                str(tree / ".venv/bin/python"),
+                "-m",
+                "cozy_runtime.cli.main",
+                "--dir",
+                str(tree),
+                "describe",
+                "--json",
+            ],
             cwd=tree,
             env=env,
         )
+        (tree / "metadata").mkdir()
+        (tree / "metadata" / "package-interface.json").write_bytes(interface)
 
         if args.source_out:
             source_out = pathlib.Path(args.source_out).resolve()

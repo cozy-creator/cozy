@@ -10,14 +10,12 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/wheel"
 	"github.com/pelletier/go-toml/v2"
@@ -162,7 +160,7 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 			return problem
 		}
 	}
-	packageInterface, problem := describe(ctx, p.Tree, root)
+	packageInterface, problem := describe(ctx, p.Tree, root, publish)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
@@ -304,29 +302,6 @@ func VerifyProjectWheel(ctx context.Context, tree, name, release string) *exit.E
 	defer os.RemoveAll(out)
 	_, problem := projectWheel(ctx, tree, out, name, release)
 	return problem
-}
-
-func describe(ctx context.Context, tree, root string) (string, *exit.Error) {
-	cmd := exec.CommandContext(ctx, "uv", "run", "--locked", "--no-progress",
-		"cozy-runtime", "--json", "--dir", tree, "describe")
-	cmd.Dir = tree
-	cmd.Env = config.Frozen().Tool()
-	var stdout, stderr strings.Builder
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return "", exit.Named(exit.Validation, "package_interface_refused",
-			"cozy-runtime could not describe the package").WithRemedy("%s", strings.TrimSpace(stderr.String()))
-	}
-	raw := []byte(strings.TrimSpace(stdout.String()))
-	if len(raw) == 0 || len(raw) > 1<<20 || !json.Valid(raw) {
-		return "", exit.Named(exit.Structural, "package_interface_invalid",
-			"cozy-runtime returned an invalid package interface")
-	}
-	path := filepath.Join(root, "package-interface.json")
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return "", exit.Internalf("cannot stage package interface: %s", err)
-	}
-	return path, nil
 }
 
 // Paths returns the sorted source-relative paths of one prepared tree.
