@@ -126,7 +126,7 @@ func PinDependencies(source, target string, requirements []string) *exit.Error {
 func pinnedMetadata(raw []byte, requirements []string) ([]byte, error) {
 	reader := bufio.NewReader(bytes.NewReader(raw))
 	headers, err := textproto.NewReader(reader).ReadMIMEHeader()
-	if err != nil {
+	if err != nil && err != io.EOF {
 		return nil, err
 	}
 	body, err := io.ReadAll(reader)
