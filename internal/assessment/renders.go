@@ -156,7 +156,7 @@ func VerifyRenderBindings(st *records.Store, parentID string, info RenderInspect
 			inputs = append(inputs, invocation{matches[0], payload})
 		}
 	}
-	if len(inputs) == 0 || len(inputs)*3 > 32 {
+	if len(inputs) == 0 {
 		return nil, renderRefusal()
 	}
 	seen := map[string]bool{}
@@ -182,10 +182,14 @@ func VerifyRenderBindings(st *records.Store, parentID string, info RenderInspect
 			}
 			target := inputs[i]
 			if request == nil || request.ParentRequestID != parentID || request.InstallID != target.binding.ChildInstallID || request.Entrypoint != target.binding.Entrypoint ||
-				!request.IsJob() || request.State != "succeeded" || request.ChildReusable || request.ReusedFrom != "" || len(request.Models) != 1 || request.Models[0].Manifest != checkpoint {
+				request.State != "succeeded" || request.ChildReusable || request.ReusedFrom != "" || len(request.Models) != 1 || request.Models[0].Manifest != checkpoint {
 				return nil, renderRefusal()
 			}
-			intent := map[string]any{"interface_digest": target.binding.InterfaceDigest, "module": target.binding.Module, "export": target.binding.Export, "request": json.RawMessage(request.Payload)}
+			arguments, problem := st.ChildArguments(*request)
+			if problem != nil {
+				return nil, problem
+			}
+			intent := map[string]any{"interface_digest": target.binding.InterfaceDigest, "module": target.binding.Module, "export": target.binding.Export, "request": json.RawMessage(arguments)}
 			if request.Capture != "" {
 				intent["capture"] = json.RawMessage(request.Capture)
 			}
@@ -198,8 +202,10 @@ func VerifyRenderBindings(st *records.Store, parentID string, info RenderInspect
 			if json.Unmarshal(request.Payload, &payload) != nil {
 				return nil, renderRefusal()
 			}
-			for _, model := range request.Models {
-				delete(payload, model.Slot)
+			if request.IsJob() {
+				for _, model := range request.Models {
+					delete(payload, model.Slot)
+				}
 			}
 			projected, _ := json.Marshal(payload)
 			projected, err = canonical.NormalizeJCS(projected)
@@ -216,16 +222,23 @@ func VerifyRenderBindings(st *records.Store, parentID string, info RenderInspect
 				return nil, renderRefusal()
 			}
 			spec, err := canonical.Read(attempt.InvocationCanonical, &pb.InvocationSpec{})
-			if err != nil || spec.Str("payload_digest") != spell(request.Payload) || spec.Sub("job").Str("build_id") != target.binding.LocalRevisionDigest {
+			if err != nil || spec.Str("payload_digest") != spell(request.Payload) {
 				return nil, renderRefusal()
 			}
-			modelInput := false
-			for _, input := range spec.List("inputs") {
-				if input.Str("input_id") == "model:"+request.Models[0].Slot && input.Str("digest") == checkpoint {
-					modelInput = true
+			if request.IsJob() {
+				if spec.Sub("job").Str("build_id") != target.binding.LocalRevisionDigest {
+					return nil, renderRefusal()
 				}
-			}
-			if !modelInput {
+				modelInput := false
+				for _, input := range spec.List("inputs") {
+					if input.Str("input_id") == "model:"+request.Models[0].Slot && input.Str("digest") == checkpoint {
+						modelInput = true
+					}
+				}
+				if !modelInput {
+					return nil, renderRefusal()
+				}
+			} else if !servingModelMatches(*request, *attempt, target.binding, checkpoint) {
 				return nil, renderRefusal()
 			}
 			terminal, err := canonical.Read(attempt.TerminalBody, &pb.AttemptOutcomeBody{})
@@ -251,6 +264,33 @@ func VerifyRenderBindings(st *records.Store, parentID string, info RenderInspect
 		}
 	}
 	return out, nil
+}
+
+func servingModelMatches(request records.Request, attempt records.Attempt, binding records.ChildBinding, checkpoint string) bool {
+	placement, problem := records.BoundServingPlacement(request, attempt)
+	if problem != nil || placement == nil || placement.Sub("development").Str("local_revision_digest") != binding.LocalRevisionDigest || placement.Sub("package_interface").Str("digest") != binding.InterfaceDigest {
+		return false
+	}
+	models := map[string]canonical.Doc{}
+	for _, model := range placement.List("models") {
+		id := model.Str("id")
+		if id == "" || models[id] != nil {
+			return false
+		}
+		models[id] = model
+	}
+	for _, entrypoint := range placement.List("entrypoints") {
+		if entrypoint.Str("name") != request.Entrypoint {
+			continue
+		}
+		slots := entrypoint.List("slots")
+		if len(slots) != 1 || slots[0].Str("slot") != request.Models[0].Slot {
+			return false
+		}
+		model := models[slots[0].Str("reference_model_id")]
+		return model != nil && model.Sub("manifest").Str("digest") == checkpoint && model.Sub("manifest").Int("length") == request.Models[0].ManifestLength
+	}
+	return false
 }
 
 func spell(raw []byte) string { out, _ := canonical.Spell(canonical.Digest(raw)); return out }
