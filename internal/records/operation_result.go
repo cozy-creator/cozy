@@ -99,7 +99,7 @@ func (s *Store) AdoptCachedOperation(id string, cached CachedOperation) *exit.Er
 		return exit.Internalf("cannot read cached native result inventory: %s", err)
 	}
 	var expectedBytes int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM byte_outputs WHERE request_id=? AND attempt=?`, source.ID, cached.SourceAttempt).Scan(&expectedBytes); err != nil {
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM byte_outputs WHERE request_id=? AND attempt=? AND native_service_id IS NULL`, source.ID, cached.SourceAttempt).Scan(&expectedBytes); err != nil {
 		return exit.Internalf("cannot read byte cache inventory: %s", err)
 	}
 	if len(cached.ByteRetentions) != expectedBytes || len(cached.Retentions) != expected || (request.ChildArtifacts && expected+expectedBytes == 0) {

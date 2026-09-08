@@ -93,9 +93,9 @@ func (s *Store) AcceptNativeCall(call NativeCall, parentAttempt int64, parentSpe
 		if existing.ID != call.ID || existing.IntentDigest != call.IntentDigest || existing.Kind != call.Kind || existing.Operation != call.Operation || !bytes.Equal(existing.Request, call.Request) {
 			return NativeCall{}, false, exit.Named(exit.Conflict, "child.intent_changed", "parent index already names another native call")
 		}
-		if existing.Kind == "source" && parentAttempt > existing.ParentAttempt && existing.State != "succeeded" && existing.State != "canceled" {
+		if existing.Kind == "source" && parentAttempt > existing.ParentAttempt && existing.State != "succeeded" && existing.State != "canceled" && existing.State != "stopped" {
 			state := existing.State
-			if state == "failed" || state == "stopped" {
+			if state == "failed" {
 				if problem := requireActiveChildSlot(tx, parent.ID); problem != nil {
 					return NativeCall{}, false, problem
 				}

@@ -68,7 +68,7 @@ type JobHandle struct {
 	Attempt       uint64 `json:"attempt"`
 	Package       string `json:"package"`
 	Function      string `json:"function"`
-	Repo          string `json:"publication_repo"`
+	Repo          string `json:"publication_repo,omitempty"`
 	StatusURL     string `json:"status_url"`
 	CancelURL     string `json:"cancel_url"`
 	EventsURL     string `json:"events_url"`
@@ -209,10 +209,14 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	if fresh {
 		defer s.activateRecorded(recorded)
 	}
+	publicationRepo := ""
+	if !recorded.RetainsLocalOutputs() {
+		publicationRepo = home.ScratchRepo(recorded.Org, recorded.ID)
+	}
 	handle := JobHandle{
 		Number: recorded.Number, JobID: jobID, Status: contractStatus(recorded.State), Attempt: attempt,
 		Package: recorded.Package, Function: recorded.Entrypoint,
-		Repo:      home.ScratchRepo(recorded.Org, recorded.ID),
+		Repo:      publicationRepo,
 		StatusURL: "/v1/local/jobs/" + jobID,
 		CancelURL: "/v1/local/jobs/" + jobID + "/cancel",
 		EventsURL: "/v1/requests/" + jobID + "/events",
@@ -604,8 +608,9 @@ type JobState struct {
 	// surface showed a percentage: `safe_code` and `safe_detail` reached the durable row
 	// and the live frame and then stopped. Only members that are NOT verified are listed —
 	// a verified member has nothing to say — so a healthy transfer carries none of this.
-	ModelSources []ModelSourceState `json:"model_sources,omitempty"`
-	Publication  *PublicationRef    `json:"publication,omitempty"`
+	ModelSources  []ModelSourceState `json:"model_sources,omitempty"`
+	Publication   *PublicationRef    `json:"publication,omitempty"`
+	NativeOutputs []NativeOutputRef  `json:"native_outputs,omitempty"`
 	// Bill is ABSENT unless this host was configured with an explicit local rate. There
 	// is no `$0.00`: a fabricated zero is a claim about money nobody made (cl-004).
 	Bill      *JobBill   `json:"bill,omitempty"`
@@ -617,6 +622,16 @@ type JobState struct {
 // ModelSourceState is one selected source file's transfer, as a client sees it. `safe_code`
 // and `safe_detail` are the POD's own words about these bytes, bounded and sanitized at the
 // border they came from; this host neither rewrites nor summarizes them.
+// NativeOutputRef describes retained bytes without inventing a local publication.
+type NativeOutputRef struct {
+	OutputID  string `json:"output_id"`
+	Kind      string `json:"kind"`
+	Digest    string `json:"digest"`
+	SizeBytes int64  `json:"size_bytes"`
+	MediaType string `json:"media_type"`
+	State     string `json:"state"`
+}
+
 type ModelSourceState struct {
 	Member      string `json:"member"`
 	State       string `json:"state"`
@@ -807,6 +822,26 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 			})
 		}
 	}
+	if row.ParentRequestID == "" && row.RetainsLocalOutputs() {
+		if outputs, problem := s.store.ByteOutputs(row.ID, row.Ordinal); problem == nil {
+			holds, _ := s.store.NativeArtifactRetentions(row.ID)
+			for _, output := range outputs {
+				kind, custody := "file", "pending"
+				if output.MimeType == "application/vnd.cozy.tree-manifest" {
+					kind = "tree"
+				}
+				for _, hold := range holds {
+					if hold.Kind == "result" && hold.ProducerID == row.ID && hold.ProducerAttempt == output.Attempt && hold.ProducerOutputID == output.OutputID {
+						custody = hold.State
+					}
+				}
+				if custody == "held" {
+					custody = "retained"
+				}
+				state.NativeOutputs = append(state.NativeOutputs, NativeOutputRef{OutputID: output.OutputID, Kind: kind, Digest: output.Digest, SizeBytes: output.ContentBytes, MediaType: output.MimeType, State: custody})
+			}
+		}
+	}
 	if p, e := s.store.PublicationOf(row.ID); e == nil && p != nil {
 		state.Publication = &PublicationRef{
 			Repo: p.Repo, Root: p.Root, Status: p.Status, Cause: p.Cause,
@@ -893,6 +928,11 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		state.ErrorType, state.Error = last.TerminalCause, last.SafeMessage
 	}
 	state.Result = inlineJobResult(doc)
+	if row.State == "finalizing" && len(state.NativeOutputs) > 0 {
+		state.Result = nil
+		state.Stage = "retaining native results"
+		state.ErrorType, state.Error, _ = s.store.NativeResultWait(row.ID, row.Ordinal)
+	}
 	return state
 }
 
