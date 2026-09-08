@@ -70,7 +70,7 @@ func TestTheReaperOutlivesAKilledTestBinary(t *testing.T) {
 	read, write, err := os.Pipe()
 	must(t, err)
 	reaper := exec.Command(self, reapMode+cozyBin)
-	reaper.Stdin, reaper.Stdout, reaper.Stderr = read, os.Stderr, os.Stderr
+	reaper.Stdin, reaper.Stdout, reaper.Stderr = read, os.Stderr, os.Stderr //cozy:stdin-value controlled reaper liveness pipe
 	detachSession(reaper)
 	must(t, reaper.Start())
 	read.Close()
