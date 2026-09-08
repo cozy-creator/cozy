@@ -189,7 +189,8 @@ func TestLocalServingPreparationOwnsInitializationAndComponentOrder(t *testing.T
 			launcher, err := os.ReadFile(filepath.Join(fixture, "runtime_fixture.py"))
 			must(t, err)
 			must(t, os.WriteFile(filepath.Join(control, "bin", "cozy-runtime"), append([]byte("#!"+python+"\n"), launcher...), 0700))
-			audit := filepath.Join(control, "bin", "serving_fixture_audit.jsonl")
+			audit := filepath.Join(root, "serving_fixture_audit.jsonl")
+			must(t, os.Symlink(audit, filepath.Join(control, "bin", "serving_fixture_audit.jsonl")))
 			path := filepath.Join(control, "bin")
 			for _, value := range childEnv(t, root) {
 				if strings.HasPrefix(value, "PATH=") {
@@ -341,7 +342,7 @@ cozy-runtime={path=%q}
 			}
 			after := activeInstall(t, root, pkg)
 			if after.PlacementSetDigest != digest {
-				t.Fatalf("owner did not adopt real worker placement: %s != %s", after.PlacementSetDigest, digest)
+				t.Fatalf("owner did not adopt real worker placement: %s != %s; code=%d output=%s", after.PlacementSetDigest, digest, code, out)
 			}
 			retained, err := os.ReadFile(filepath.Join(after.Dir, "artifact-cache", prepared.Digest))
 			must(t, err)
