@@ -28,7 +28,7 @@ func manualRentalModels(ctx *Context, existing *records.RentalOperation) ([]hub.
 	selected := make([]hub.ServingModel, 0, len(specs))
 	seen := map[hub.ServingModel]bool{}
 	for _, spec := range specs {
-		model, release, lane, manifest, problem := parseModelRef(spec)
+		model, release, lane, manifest, problem := hub.ParseModelRef(spec)
 		if problem != nil {
 			return nil, problem
 		}

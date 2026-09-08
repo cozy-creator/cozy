@@ -50,7 +50,14 @@ func TestPrivateChildCompositionReusesLocalWorkspace(t *testing.T) {
 			path += string(os.PathListSeparator) + strings.TrimPrefix(item, "PATH=")
 		}
 	}
-	t.Cleanup(func() { _, _ = runCozyPath(t, root, path, "down", "--all"); _ = os.RemoveAll(root) })
+	t.Cleanup(func() {
+		compositionDown(t, root, path)
+		if t.Failed() {
+			t.Log("private composition evidence retained", root)
+		} else {
+			must(t, os.RemoveAll(root))
+		}
+	})
 	project := t.TempDir()
 	for _, name := range []string{"source", "candidate"} {
 		lib := filepath.Join(project, name)

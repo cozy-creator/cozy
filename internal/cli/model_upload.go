@@ -349,7 +349,7 @@ func canonicalProductionSource(ctx *Context, raw string) (string, *exit.Error) {
 		return "", problem
 	}
 	if strings.Contains(raw, "#") {
-		model, release, lane, manifest, problem := parseModelRef(raw)
+		model, release, lane, manifest, problem := hub.ParseModelRef(raw)
 		if problem != nil {
 			return "", problem
 		}
@@ -485,7 +485,7 @@ func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (pu
 	defer cancel()
 	refspec := raw
 	if strings.Contains(raw, "#") {
-		model, release, selectedLane, manifest, problem := parseModelRef(raw)
+		model, release, selectedLane, manifest, problem := hub.ParseModelRef(raw)
 		if problem != nil {
 			return publishSource{}, problem
 		}

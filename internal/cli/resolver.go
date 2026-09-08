@@ -453,15 +453,12 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 		// ONE PLACEMENT PER CONSTRUCTION (h3a-018). The selection also binds every
 		// sibling slot the owner bound to the same model release under the same ladder,
 		// so the pod prepares both entrypoints once and a switch between them is a
-		// dispatch. The hub's binding rows are the one source of what the owner bound.
+		// dispatch. Owner overrides and authored defaults use the same selection here.
 		rows, problem := r.catalog.PackageBindings(ctx, ref)
 		if problem != nil {
 			return empty, nil, problem
 		}
-		defaults := make(map[string]hub.PackageBindingRow, len(rows))
-		for _, row := range rows {
-			defaults[row.Slot] = row
-		}
+		defaults := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints), rows)
 		for i := range models {
 			models[i].SharedSlots = sharedSlots(models[i], entrypoint, packageInterface.Entrypoints, defaults)
 		}

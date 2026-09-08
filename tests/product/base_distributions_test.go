@@ -24,7 +24,7 @@ import (
 // Defaults to the conventional sibling checkout, so an edit on either side is caught on
 // a developer box without anyone remembering a flag.
 var cozyRuntimeRepo = flag.String("cozy-runtime-repo", "",
-	"a cozy-runtime checkout; the vendored base-distributions.json is compared against it")
+	"a cozy-runtime checkout for shared corpus and vendored roster comparisons")
 
 var requireCozyRuntimePeer = flag.Bool("require-cozy-runtime-peer", false,
 	"fail instead of reporting when no cozy-runtime checkout is found")
