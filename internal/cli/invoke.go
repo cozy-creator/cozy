@@ -1261,7 +1261,7 @@ func (p *RunProgress) On(e localapi.Event) bool {
 	defer p.mu.Unlock()
 	if strings.TrimPrefix(e.Type, "request.") == "progress" && p.progressAttempt != e.Attempt {
 		if p.progressAttempt != 0 && p.ctx.Mode().Color && !p.ctx.Mode().Full {
-			p.finishLive("retrying")
+			p.finishLive("retrying", eventTime(e))
 		}
 		p.progressAttempt = e.Attempt
 		p.stepStage, p.stepSeconds, p.stepSamples = "", 0, 0
@@ -1300,7 +1300,9 @@ func (p *RunProgress) observeWait(e localapi.Event) {
 		p.waitEvent = e
 		if p.waitedSince.IsZero() {
 			p.waitedSince = eventTime(e)
-			p.armPatience()
+			if e.EventID == 0 || !p.waitedSince.Before(p.began) {
+				p.armPatience()
+			}
 		}
 	case "rentals", "placement", "log", "metric":
 		// Still the same wait; these narrate it without ending it.
@@ -1327,7 +1329,7 @@ func (p *RunProgress) armPatience() {
 			return
 		}
 		if p.ctx.Mode().Color && !p.ctx.Mode().Full {
-			p.interactive(p.waitEvent)
+			p.drawLive(p.now())
 		} else {
 			p.render(p.waitLine(p.waitEvent))
 		}
@@ -1540,7 +1542,7 @@ func (p *RunProgress) Done() {
 		p.terminal.timer.Stop()
 	}
 	if p.ctx.Mode().Color && !p.ctx.Mode().Full {
-		p.finishLive("")
+		p.finishLive("", p.now())
 		return
 	}
 }

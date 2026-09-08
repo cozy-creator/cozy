@@ -89,3 +89,41 @@ func TestLiveProgressClockStopsWhenWatcherDetaches(t *testing.T) {
 		t.Fatalf("a detached watcher kept writing to the terminal: %q", buf.String()[before:])
 	}
 }
+
+func TestReattachedProgressUsesRecordedStageBoundaries(t *testing.T) {
+	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
+	t.Cleanup(p.Done)
+	start := time.Now().Add(-20 * time.Minute)
+	replay := func(kind string, after time.Duration, seq int64, fields map[string]any) localapi.Event {
+		e := liveEvent(kind, fields)
+		e.At, e.EventID = start.Add(after).UTC().Format(time.RFC3339Nano), seq
+		return e
+	}
+	queued := replay("queued", 0, 1, nil)
+	queued.Payload = map[string]any{"wait": "rental", "reason": "historical wait diagnostic"}
+	p.On(queued)
+	before := len(buf.String())
+	p.On(replay("accepted", 12*time.Second, 2, nil))
+	accepted := buf.String()[before:]
+	for _, want := range []string{"waiting for a rental machine · elapsed 12s · done", "running · waiting for stage updates"} {
+		if !strings.Contains(accepted, want) {
+			t.Fatalf("replayed acceptance lacks %q: %q", want, accepted)
+		}
+	}
+	if strings.Contains(accepted, "starting request") || strings.Contains(accepted, "20m") || strings.Contains(accepted, "historical wait diagnostic") {
+		t.Fatalf("historical wait elapsed grew until reattach: %q", accepted)
+	}
+	p.On(replay("progress", 15*time.Second, 3, map[string]any{"stage": "condition_text"}))
+	before = len(buf.String())
+	p.On(replay("progress", 25*time.Second, 4, map[string]any{"stage": "denoise", "position": 1, "total": 30, "step_ms": 15000}))
+	transition := buf.String()[before:]
+	if !strings.Contains(transition, "conditioning · elapsed 10s · done") {
+		t.Fatalf("finished stage used reattach walltime instead of recorded boundary: %q", transition)
+	}
+	before = len(buf.String())
+	p.On(replay("completed", 40*time.Second, 5, nil))
+	terminal := buf.String()[before:]
+	if !strings.Contains(terminal, "elapsed 15s") || strings.Contains(terminal, "19m") {
+		t.Fatalf("terminal stage did not freeze at its recorded completion: %q", terminal)
+	}
+}
