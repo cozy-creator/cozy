@@ -69,19 +69,10 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 		return Target{}, nil, problem
 	}
 	defer intake.Close()
-	pack = intake.Package
-	digest, files, bytes, problem := pack.SourceIdentity()
-	if problem != nil {
-		return Target{}, nil, problem
-	}
 	var result *install.Result
 	problem = packagePublishStage(ctx, "Preparing private script environment", func() *exit.Error {
 		var problem *exit.Error
-		result, problem = install.Run(layout, store, install.Request{
-			Ref: install.Ref{Package: "local/" + pack.Name}, Snapshot: true,
-			Local: &install.LocalSource{SourceDigest: digest, Bytes: bytes, Files: files,
-				Package: "local/" + pack.Name, Release: pack.Release, Tree: pack.Tree},
-		})
+		result, problem = intake.Install()
 		return problem
 	})
 	if problem != nil {

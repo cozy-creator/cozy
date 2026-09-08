@@ -40,6 +40,13 @@ type Revision struct {
 }
 
 func Stage(ctx context.Context, layout home.Layout, install records.PackageInstall) (Revision, *exit.Error) {
+	if install.SourceKind == "wheel" {
+		raw, err := os.ReadFile(filepath.Join(install.Dir, "private-revision"))
+		if err != nil {
+			return Revision{}, exit.New(exit.NotFound, "captured wheel revision is unavailable")
+		}
+		return Open(layout, install, string(raw))
+	}
 	if install.Platform != "linux/amd64" || !strings.HasPrefix(install.Python, "3.12.") {
 		return Revision{}, exit.Named(exit.Validation, "private_dependency_platform_unsupported", "private worker revisions require a captured Linux amd64 Python 3.12 environment")
 	}
@@ -84,15 +91,25 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 		return Revision{}, exit.Named(exit.Structural, "local_package_interface_invalid",
 			"local package interface is absent or exceeds the canonical document bound")
 	}
+	paths := []string{pack.Wheel}
+	for _, dependency := range pack.DependencyWheels {
+		paths = append(paths, dependency.Path)
+	}
+	return StageWheels(layout, install, packageInterfaceBytes, paths)
+}
+
+// StageWheels uses the same immutable revision writer for source builds and
+// already-built library wheels. It preserves every supplied original byte.
+func StageWheels(layout home.Layout, install records.PackageInstall, packageInterfaceBytes []byte, paths []string) (Revision, *exit.Error) {
+	if len(packageInterfaceBytes) == 0 || len(packageInterfaceBytes) > canonical.DocMax {
+		return Revision{}, exit.New(exit.Validation, "private wheel interface exceeds its document bound")
+	}
+	sourceDigest := install.SourceDigest
 	normalized, normalizeErr := canonical.NormalizeJCS(packageInterfaceBytes)
 	packageInterfaceDigest, err := canonical.Spell(canonical.Digest(packageInterfaceBytes))
 	if normalizeErr != nil || err != nil || !bytes.Equal(normalized, packageInterfaceBytes) {
 		return Revision{}, exit.Named(exit.Structural, "local_package_interface_invalid",
 			"local package interface bytes are not their canonical identity")
-	}
-	paths := []string{pack.Wheel}
-	for _, dependency := range pack.DependencyWheels {
-		paths = append(paths, dependency.Path)
 	}
 	if err := os.MkdirAll(layout.LocalPackages, 0o700); err != nil {
 		return Revision{}, exit.Internalf("cannot create the local package store: %s", err)

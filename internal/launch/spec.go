@@ -33,7 +33,7 @@ func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *
 		return nil, e
 	}
 	packageInterface := ""
-	if inst.SourceKind == "tensorhub" {
+	if inst.SourceKind == "tensorhub" || inst.SourceKind == "wheel" {
 		packageInterface = PackageInterfacePath(inst.Dir)
 	}
 	return &Facts{

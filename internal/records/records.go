@@ -40,7 +40,7 @@ type PackageInstall struct {
 	Package            string // org/name
 	Major              int
 	Version            string
-	SourceKind         string // "tensorhub" | "local"
+	SourceKind         string // "tensorhub" | "local" | "wheel" (private immutable dependency)
 	SourceRef          string
 	SourceDigest       string
 	Verified           bool // false = an explicit local/development install, not published custody
