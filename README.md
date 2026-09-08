@@ -20,6 +20,17 @@ install -m 0755 ./cozy ~/.local/bin/cozy
 cozy -v
 ```
 
+Install the host Runtime with its supported Python interpreter:
+
+```sh
+uv tool install --force --python 3.12 'cozy-runtime[media,model-execution]'
+cozy-runtime version
+```
+
+Keep `--python 3.12` when reinstalling or upgrading. uv
+[ignores dependency Python upper bounds](https://docs.astral.sh/uv/pip/compatibility/#requires-python-upper-bounds),
+so an unqualified tool installation can select a newer interpreter that Runtime cannot use.
+
 On Windows, build `cozy.exe` and place it in a directory on `PATH`:
 
 ```powershell
