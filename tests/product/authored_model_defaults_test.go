@@ -164,10 +164,13 @@ func TestGPUFitPatternsAllowMultipleTokens(t *testing.T) {
 }
 
 func TestAuthoredDefaultsMatchRuntimeCorpus(t *testing.T) {
-	path := os.Getenv("COZY_MODEL_DEFAULTS_CORPUS")
-	if path == "" {
-		t.Skip("set COZY_MODEL_DEFAULTS_CORPUS to Runtime's shared model-default-ladders.json")
+	if *cozyRuntimeRepo == "" {
+		if *requireCozyRuntimePeer {
+			t.Fatal("-require-cozy-runtime-peer was set without -cozy-runtime-repo for the shared corpus")
+		}
+		t.Skip("set -cozy-runtime-repo to compare Runtime's shared model-default-ladders.json")
 	}
+	path := filepath.Join(*cozyRuntimeRepo, "tests", "testdata", "model-default-ladders.json")
 	body, err := os.ReadFile(path)
 	must(t, err)
 	var groups map[string][]struct {
