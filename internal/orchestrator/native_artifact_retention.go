@@ -15,7 +15,7 @@ func (c *Orchestrator) changeNativeArtifactRetention(ctx context.Context, h reco
 	if problem != nil || owner == nil {
 		return exit.Unavailablef("native artifact owner request is unavailable")
 	}
-	session, problem := c.workspaceControl(owner.Worker)
+	session, problem := c.workspaceControl(h.OwnerWorker)
 	if problem != nil {
 		return problem
 	}
