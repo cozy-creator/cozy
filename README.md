@@ -370,7 +370,7 @@ content digest, `<sha256>.<ext>`, so regenerating the same bytes lands on the sa
 different results never collide. Nothing but result files is ever written there, and nothing is
 staged anywhere first: the worker is granted that directory and writes each file into it under its
 digest name, the request payload rides the grant itself, and input assets are read from the
-immutable input store. `saved:` lists the absolute paths (`saved[].path` under `--json`). The
+original input paths without copying them. Keep those files available and unchanged until the request finishes; missing or modified inputs are refused before execution. Downloaded or resized media lives in the system temporary directory under `cozy/`, named by its content hash. `saved:` lists the absolute paths (`saved[].path` under `--json`). The
 daemon probes the destination writable at submit and refuses typed (`output_destination_unwritable`)
 before any execution, and records the destination with the request, so closing the command or
 restarting Cozy does not lose where the files are.
