@@ -9,7 +9,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
-	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // AssetsSlot is the explicit callable input contract authored by Runtime.
@@ -131,56 +130,6 @@ func AssetSpecForMedia(ep *Entrypoint, path, mediaType string) (AssetField, bool
 		return AssetField{Kind: "file", MaxBytes: effectiveAssetMax(fallback.MaxBytes)}, true
 	}
 	return AssetField{}, false
-}
-
-// BindChildAssets forwards only explicit occurrences whose content the parent
-// already owns. A cache hit or ambient file path never grants a child authority.
-func BindChildAssets(ep *Entrypoint, payload json.RawMessage, parent []records.AssetBinding) ([]records.AssetBinding, *exit.Error) {
-	if ep.Assets == nil {
-		return nil, nil
-	}
-	var doc map[string]json.RawMessage
-	if json.Unmarshal(payload, &doc) != nil {
-		return nil, exit.New(exit.Validation, "child Assets input is not an object")
-	}
-	if _, present := doc[ep.Assets.Parameter]; !present {
-		return nil, nil
-	}
-	var values []struct {
-		Asset string `json:"asset"`
-		Label string `json:"label"`
-	}
-	if json.Unmarshal(doc[ep.Assets.Parameter], &values) != nil {
-		return nil, exit.New(exit.Validation, "child Assets input is not an occurrence list")
-	}
-	out := make([]records.AssetBinding, 0, len(values))
-	labels := map[string]bool{}
-	for i, value := range values {
-		if value.Label != "" && labels[value.Label] {
-			return nil, exit.New(exit.Validation, "asset label %q was supplied more than once", value.Label)
-		}
-		labels[value.Label] = true
-		var held *records.AssetBinding
-		for j := range parent {
-			if parent[j].Digest == value.Asset {
-				held = &parent[j]
-				break
-			}
-		}
-		if held == nil {
-			return nil, exit.Named(exit.Conflict, "child.asset_scope", "child asset %d is not authorized by the parent request", i)
-		}
-		bound := *held
-		bound.FieldPath = fmt.Sprintf("%s.%d.asset", ep.Assets.Parameter, i)
-		bound.Order = uint32(i)
-		spec, ok := AssetSpecForMedia(ep, bound.FieldPath, bound.MediaType)
-		if !ok || bound.Length > spec.MaxBytes {
-			return nil, exit.Named(exit.Validation, "input_asset_bound", "child asset %d is not admitted by the callable's media policy", i)
-		}
-		bound.MaxBytes = spec.MaxBytes
-		out = append(out, bound)
-	}
-	return out, nil
 }
 
 // Count/label checks precede file reads. Explicit named payload bindings never

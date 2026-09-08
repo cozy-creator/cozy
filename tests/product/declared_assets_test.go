@@ -51,12 +51,12 @@ func TestDeclaredAssetsPreserveOccurrencesLabelsAndNamedFields(t *testing.T) {
 	// A callee can repeat/subset its parent's authorized contents with new
 	// occurrence labels. A cached digest outside the parent grant is no authority.
 	child := json.RawMessage(`{"prompt":"child","assets":[{"asset":"` + assets[0].Digest + `","label":"second"},{"asset":"` + assets[0].Digest + `","label":"first"}]}`)
-	forwarded, problem := launch.BindChildAssets(ep, child, assets)
+	forwarded, problem := launch.InheritChildAssets(ep, child, assets)
 	fatal(t, problem)
 	if len(forwarded) != 2 || forwarded[0].LocalPath != assets[0].LocalPath || forwarded[1].Order != 1 || forwarded[1].FieldPath != "assets.1.asset" {
 		t.Fatalf("child occurrences changed: %+v", forwarded)
 	}
-	if _, problem = launch.BindChildAssets(ep, child, nil); problem == nil || problem.ErrName() != "child.asset_scope" {
+	if _, problem = launch.InheritChildAssets(ep, child, nil); problem == nil || problem.ErrName() != "child.asset_ungranted" {
 		t.Fatalf("child inherited an ungranted asset: %v", problem)
 	}
 	for _, specs := range [][]string{{"same=" + path, "same=" + path}, {path, path, path, path}} {
