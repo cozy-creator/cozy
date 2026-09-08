@@ -505,6 +505,15 @@ fn call(
             client, base, path, body, credential, policy, deadline, ledger,
         ) {
             Ok(value) => return Ok(value),
+            // NOT WEATHER, AND NOT ABOUT THE HUB (tfs-106). `TRANSFER_FAILED` out of an
+            // exchange means the PULL has stopped moving while this call was outstanding.
+            // Re-asking reaches the identical verdict on the next attempt's first tick —
+            // nothing this loop does can restart a transfer — and the only thing three more
+            // asks would achieve is replacing a refusal that names the response head with
+            // one that names a request write. Answer with what was measured.
+            Err(Retryable { refusal, .. }) if refusal.code == Code::TRANSFER_FAILED => {
+                return Err(refusal)
+            }
             Err(Retryable { wait, refusal }) if !final_attempt => {
                 // A wait is spent out of the caller's budget, never past it.
                 let wait = match deadline.remaining()? {
@@ -561,7 +570,13 @@ fn call_once(
         Some(body),
         deadline,
         ledger,
-        false,
+        // THE CONTROL PLANE (tfs-106). Every wait in this exchange answers to the pull's own
+        // progress. It is not a bound on how long a mint may take — a hub is entitled to be
+        // slow, and a mint outstanding while sixteen streams keep landing objects is left
+        // entirely alone. It is a bound on a call that is serving a transfer which has
+        // itself stopped, which is the only shape `Leases::minting` can wedge in, and the
+        // shape that cost `gayong` and `weed` fifteen billed minutes at zero bytes.
+        crate::transport::http::Judge::Transfer,
         None,
         Code::HUB_UNREACHABLE,
     )

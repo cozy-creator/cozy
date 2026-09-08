@@ -390,7 +390,7 @@ pub(super) fn open_object<'l>(
             None,
             deadline,
             ledger,
-            true,
+            http::Judge::Stream,
             None,
             Code::TRANSFER_FAILED,
         )?;
@@ -696,6 +696,13 @@ impl Leases<'_> {
     /// `Deadline` and teaches the same `Ledger` the object fetches teach: a mint that hangs
     /// must be as visible to liveness as a stream that stops sending, and a cheap call that
     /// hangs is still a hang.
+    ///
+    /// That was an aspiration until tfs-106 and is now the mechanism. The call runs under
+    /// `Judge::Transfer`, so it faults once THIS PULL has landed nothing for longer than its
+    /// own measured pace allows — never because the mint itself took long. It matters that
+    /// the verdict is reached HERE, holding `minting`: the fifteen streams parked on that
+    /// mutex cannot observe anything, so the only thread that can end their wait is the one
+    /// that owns it.
     fn mint_from(&self, at: usize) -> Result<()> {
         let mut digests: Vec<String> = Vec::new();
         for object in &self.wanted[at..] {
@@ -856,6 +863,15 @@ pub fn fetch_wanted(
                             Source::Cache => {
                                 cached.fetch_add(1, Ordering::Relaxed);
                                 bytes_cached.fetch_add(object.length, Ordering::Relaxed);
+                                // THE CACHE DOOR IS PROGRESS TOO (tfs-106). Origin bytes are
+                                // counted where they cross the socket; cached ones never
+                                // reach a socket, so without this a warm datacenter reading
+                                // its own volume would look, to the control plane, exactly
+                                // like a pull that had stopped — and the first mint after a
+                                // run of cache hits would be condemned for the volume's
+                                // honest read time. Per object is fine grained enough: a CAS
+                                // object is bounded by the 64 MiB grid.
+                                ledger.moved(object.length);
                                 object.length
                             }
                             Source::Origin(one) => {
@@ -1046,6 +1062,11 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     // nothing — and the two figures agree exactly when nothing is shared, which is exactly
     // the fixture a careless proof would use.
     request.store.admits(plan.wanted_bytes())?;
+    // THE TRANSFER STARTS HERE, and the control plane's clock starts with it. Everything
+    // above is local — opening the store, splitting the closure against what it already
+    // holds, the disk-budget check — and charging that to the transfer would let a slow
+    // planning pass condemn the very first mint that followed it.
+    ledger.transfer_begins();
     if !plan.wanted.is_empty() {
         let leases = Leases {
             client,

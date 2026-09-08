@@ -8,8 +8,19 @@
 //!   rebinding window `egress.py` could only name;
 //! - **every socket wait is bounded by the caller's deadline and judged by the liveness
 //!   ledger, never by an invented constant.** The socket read timeout here is the ledger's
-//!   sampling RESOLUTION; each empty tick re-consults the deadline and, on a judged body,
-//!   the measured stall rule. Nothing in this file owns a number of seconds.
+//!   sampling RESOLUTION; each empty tick re-consults the deadline and the measured stall
+//!   rule. Nothing in this file owns a number of seconds.
+//!
+//! That second claim used to hold for the BYTE plane only, and tfs-106 is the repair. A
+//! caller with no wall deadline — which is every pod fetch, deliberately, because a module
+//! that substituted a number there would be deciding on the caller's behalf that a large
+//! artifact on a slow link is a failure — could wait here forever: `read_head` and the TLS
+//! handshake looped on an empty tick with nothing to consult, and a hub exchange left the
+//! body rule disarmed. That is how a presign to a black-holed tunnel held `Leases::minting`
+//! while sixteen streams parked behind it and two paid H100s billed fifteen minutes at
+//! exactly zero bytes. A CONTROL-plane exchange now answers to `Judge::Transfer`: the
+//! pull's own progress, which is a measurement, and never to this call's own duration,
+//! which would be a constant.
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::transport::ledger::{Deadline, Ledger};
@@ -25,6 +36,90 @@ const WRITE_CHUNK: usize = 64 * 1024;
 
 fn would_block(error: &std::io::Error) -> bool {
     matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
+/// What an exchange's SILENCE answers to, beyond the caller's deadline.
+///
+/// The two planes measure different things because they are different things, and the whole
+/// defect tfs-106 repairs is that only one of them was measured at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Judge {
+    /// The BYTE plane. This stream's own chunks, against the pull's measured pace: an
+    /// object GET that accepted a connection and stopped sending is stalled, closed, and
+    /// re-asked, which the plan already made cost one object.
+    Stream,
+    /// The CONTROL plane. A hub call has no bytes of its own worth judging — a mint that
+    /// takes a minute while sixteen streams keep landing objects is a call, not a wedge —
+    /// so it is judged by the PULL'S OWN PROGRESS instead. It faults exactly when nothing
+    /// has landed anywhere in this pull for longer than the pull's measured pace allows,
+    /// which is the owner's rule read literally: the lack of measured progress, never a
+    /// number of seconds.
+    Transfer,
+    /// Neither. The caller's deadline is the only bound, which is what a foreign-source
+    /// read with its own per-part retry loop above it already had.
+    Deadline,
+}
+
+/// The CONTROL plane's verdict, quoting exactly the figures a reader needs and no others:
+/// how long this call has been waiting, what the pull has actually landed, how long ago,
+/// and the term the pull itself taught. Nobody has to read this file to learn whether the
+/// number was earned.
+///
+/// It refuses `TRANSFER_FAILED` and deliberately not the exchange's own `fail` code. The hub
+/// may be perfectly healthy; what has been established is that the transfer this call serves
+/// has stopped, and calling that "the hub did not answer" would send the next reader to the
+/// wrong machine. It is also what makes the verdict terminal in `hub::call` instead of
+/// re-asked three more times: a re-ask reaches the identical conclusion on its first tick and
+/// would only overwrite this diagnosis with a duller one.
+fn transfer_verdict(
+    judge: Judge,
+    ledger: &Ledger,
+    since: Instant,
+    waiting_for: &str,
+) -> Result<()> {
+    if judge != Judge::Transfer {
+        return Ok(());
+    }
+    let still = ledger.still();
+    // NOTHING MOVED IS NOT THE SAME AS STOPPED MOVING, and the owner's rule turns on exactly
+    // that distinction: kill or error on the lack of MEASURED progress. A pull that has not
+    // yet landed a byte has measured nothing about its own pace, so there is no term here
+    // that is not a number somebody made up — and a made-up number is the thing this whole
+    // module refuses. A hub call that wedges before the first byte of a pull is therefore
+    // still bounded by the caller's deadline alone. That is a real remaining silence and it
+    // is stated rather than papered over with a constant.
+    if still.moved == 0 {
+        return Ok(());
+    }
+    let patience = ledger.stillness();
+    // TWO CLOCKS, AND BOTH MUST BE PAST THE MEASURED TERM. `silent` is how long the pull has
+    // moved nothing; `outstanding` is how long THIS call has been the thing it waits on.
+    //
+    // A call must never inherit stillness that predates it. Between one object landing and
+    // the next mint going out, a pull is legitimately still — it is hashing, fsyncing and
+    // committing what just arrived — and a mint that opened into the tail of that would
+    // otherwise be condemned on its first tick for local work it had nothing to do with.
+    // Requiring the call to have been outstanding for the term as well gives every call a
+    // full measured window of its own, and leaves the verdict meaning what it says: this
+    // call has been waiting this long, and the transfer moved nothing in any of it.
+    let outstanding = since.elapsed();
+    if still.silent <= patience || outstanding <= patience {
+        return Ok(());
+    }
+    refuse(
+        Code::TRANSFER_FAILED,
+        format!(
+            "the transfer this call serves has stopped: {:.1} s waiting for {waiting_for}, \
+             {} B landed in this pull and none of them for {:.1} s, against the {:.1} s \
+             this pull's own measured pace allows ({} times the longest it has ever gone \
+             still and recovered, and never less than one stream's own term)",
+            outstanding.as_secs_f64(),
+            still.moved,
+            still.silent.as_secs_f64(),
+            patience.as_secs_f64(),
+            crate::transport::ledger::STALL_FACTOR,
+        ),
+    )
 }
 
 pub struct Client {
@@ -182,10 +277,14 @@ fn tls_handshake(
     sock: &mut TcpStream,
     conn: &mut rustls::ClientConnection,
     deadline: Deadline,
-    sample: Duration,
+    ledger: &Ledger,
+    judge: Judge,
+    since: Instant,
     fail: Code,
 ) -> Result<()> {
+    let sample = ledger.sample();
     while conn.is_handshaking() {
+        transfer_verdict(judge, ledger, since, "a TLS handshake")?;
         let tick = match deadline.remaining()? {
             Some(left) => left.min(sample),
             None => sample,
@@ -275,8 +374,11 @@ pub struct BodyReader<'l> {
     raw_at: usize,
     deadline: Deadline,
     ledger: &'l Ledger,
-    judge: bool,
+    judge: Judge,
     advanced: Instant,
+    /// When this body's reader was built — the start of the wait a control-plane verdict
+    /// measures, so a body that opens into a pull's local pause is not condemned for it.
+    since: Instant,
     failure: Option<Refusal>,
     stalled: bool,
     fail: Code,
@@ -309,8 +411,9 @@ impl BodyReader<'_> {
                     return Ok(n);
                 }
                 Err(e) if would_block(&e) => {
+                    transfer_verdict(self.judge, self.ledger, self.since, "a response body")?;
                     let silent = self.advanced.elapsed();
-                    if self.judge && silent > self.ledger.patience() {
+                    if self.judge == Judge::Stream && silent > self.ledger.patience() {
                         self.stalled = true;
                         let _ = self.wire.sock().shutdown(std::net::Shutdown::Both);
                         return refuse(
@@ -381,7 +484,30 @@ impl BodyReader<'_> {
         }
     }
 
+    /// One read of the framed body, and the ONE place the pull's own progress is counted.
+    ///
+    /// It is counted here and not at the socket because `read_head` fills its buffer with
+    /// the head AND whatever of the body arrived behind it, so a small object can land in
+    /// its entirety before this reader exists. Counting at the socket missed exactly those,
+    /// which left the control plane believing a busy pull had moved nothing — the one state
+    /// in which it must not judge at all.
+    ///
+    /// THE PULL'S PROGRESS IS ITS ARTIFACT BYTES. A judged body is an object crossing the
+    /// door and is counted; anything else — a hub's JSON answer, a foreign source read —
+    /// advances the pull without adding to the figure a refusal quotes, because a reader
+    /// checking that figure against the transfer's own report must find the same number.
     pub fn read_refusing(&mut self, out: &mut [u8]) -> Result<usize> {
+        let n = self.read_framed(out)?;
+        if n > 0 {
+            match self.judge {
+                Judge::Stream => self.ledger.moved(n as u64),
+                _ => self.ledger.answered(),
+            }
+        }
+        Ok(n)
+    }
+
+    fn read_framed(&mut self, out: &mut [u8]) -> Result<usize> {
         if out.is_empty() {
             return Ok(0);
         }
@@ -469,11 +595,13 @@ impl Read for BodyReader<'_> {
 }
 
 /// One exchange: connect to the CHECKED addresses, write the request, read the head, hand
-/// back the framed body. `judge_body` arms the ledger's stall verdict on body reads (the
-/// object plane); hub JSON exchanges leave it off and answer to the deadline alone, as
-/// `pull.py`'s `_json` did. `write_silence` bounds one WRITE operation that moves nothing
-/// — the push plane derives it from the ledger's floor, the port of egress.py's one
-/// derived silence bound; `None` answers to the deadline alone.
+/// back the framed body. `judge` says which plane this exchange belongs to and therefore
+/// what its silence answers to — see `Judge`. It governs EVERY wait in the exchange, not
+/// only the body: the handshake, the request write and the response head are exactly where
+/// a black-holed tunnel parks a hub call, and leaving them unjudged is what made a
+/// deadline-free caller wait forever. `write_silence` additionally bounds one WRITE
+/// operation that moves nothing — the push plane derives it from the ledger's floor, the
+/// port of egress.py's one derived silence bound; `None` leaves the write to `judge`.
 #[allow(clippy::too_many_arguments)]
 pub fn request<'l>(
     client: &Client,
@@ -483,7 +611,7 @@ pub fn request<'l>(
     body: Option<&[u8]>,
     deadline: Deadline,
     ledger: &'l Ledger,
-    judge_body: bool,
+    judge: Judge,
     write_silence: Option<Duration>,
     fail: Code,
 ) -> Result<Response<'l>> {
@@ -501,7 +629,7 @@ pub fn request<'l>(
             })?;
         let mut sock = sock;
         let mut conn = Box::new(conn);
-        tls_handshake(&mut sock, &mut conn, deadline, ledger.sample(), fail)?;
+        tls_handshake(&mut sock, &mut conn, deadline, ledger, judge, opened, fail)?;
         Wire::Tls { sock, conn }
     } else {
         Wire::Plain(sock)
@@ -531,12 +659,19 @@ pub fn request<'l>(
         &request_bytes,
         deadline,
         ledger,
+        judge,
+        opened,
         write_silence,
         fail,
     )?;
 
-    let (status, response_headers, spill) = read_head(&mut wire, deadline, ledger, fail)?;
+    let (status, response_headers, spill) =
+        read_head(&mut wire, deadline, ledger, judge, opened, fail)?;
     ledger.taught(opened.elapsed());
+    // A HEAD THAT ARRIVED IS PROGRESS. Without this, the second page of a paginated closure
+    // would be judged from the start of the first, and a pull whose hub is merely slow
+    // would condemn its own second call for the first call's honest latency.
+    ledger.answered();
 
     let framing = framing_of(status, &response_headers, fail)?;
     Ok(Response {
@@ -549,8 +684,9 @@ pub fn request<'l>(
             raw_at: 0,
             deadline,
             ledger,
-            judge: judge_body,
+            judge,
             advanced: Instant::now(),
+            since: Instant::now(),
             failure: None,
             stalled: false,
             fail,
@@ -558,17 +694,21 @@ pub fn request<'l>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_all(
     wire: &mut Wire,
     bytes: &[u8],
     deadline: Deadline,
     ledger: &Ledger,
+    judge: Judge,
+    since: Instant,
     silence: Option<Duration>,
     fail: Code,
 ) -> Result<()> {
     let mut at = 0;
     let mut advanced = Instant::now();
     loop {
+        transfer_verdict(judge, ledger, since, "a request write")?;
         let tick = match deadline.remaining()? {
             Some(left) => left.min(ledger.sample()),
             None => ledger.sample(),
@@ -611,7 +751,14 @@ fn write_all(
 /// Status, headers (lowercased names), and body bytes read past the head.
 type Head = (u16, Vec<(String, String)>, Vec<u8>);
 
-fn read_head(wire: &mut Wire, deadline: Deadline, ledger: &Ledger, fail: Code) -> Result<Head> {
+fn read_head(
+    wire: &mut Wire,
+    deadline: Deadline,
+    ledger: &Ledger,
+    judge: Judge,
+    since: Instant,
+    fail: Code,
+) -> Result<Head> {
     let mut collected: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 8 * 1024];
     let split = loop {
@@ -624,7 +771,7 @@ fn read_head(wire: &mut Wire, deadline: Deadline, ledger: &Ledger, fail: Code) -
         if collected.len() > HEAD_MAX_BYTES {
             return refuse(fail, "response head passed 64 KiB");
         }
-        let n = read_step_ticking(wire, &mut buf, deadline, ledger, fail)?;
+        let n = read_step_ticking(wire, &mut buf, deadline, ledger, judge, since, fail)?;
         if n == 0 {
             return refuse(
                 fail,
@@ -660,9 +807,12 @@ fn read_step_ticking(
     buf: &mut [u8],
     deadline: Deadline,
     ledger: &Ledger,
+    judge: Judge,
+    since: Instant,
     fail: Code,
 ) -> Result<usize> {
     loop {
+        transfer_verdict(judge, ledger, since, "a response head")?;
         let tick = match deadline.remaining()? {
             Some(left) => left.min(ledger.sample()),
             None => ledger.sample(),

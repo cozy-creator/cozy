@@ -185,7 +185,13 @@ fn open_following_with<'l>(
             None,
             deadline,
             ledger,
-            false,
+            // The one plane tfs-106 deliberately left as it was. A foreign source read is
+            // not serving a hub call and has the source lane's own per-part retry above it,
+            // so arming a plane here would change a path this lane did not measure. It is
+            // therefore still bounded by the caller's deadline alone, and a foreign source
+            // that accepts a connection and stops sending to a caller who set no deadline
+            // still waits. Named here so the next reader finds a decision, not an oversight.
+            http::Judge::Deadline,
             None,
             Code::TRANSFER_FAILED,
         )?;

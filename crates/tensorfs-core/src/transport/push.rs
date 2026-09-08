@@ -229,7 +229,10 @@ pub fn push_object(
             Some(&bytes),
             deadline,
             ledger,
-            false,
+            // The push plane keeps its own derived write bound below and gains no plane
+            // here: it serves no hub call, so it has no transfer whose stillness could
+            // judge it.
+            http::Judge::Deadline,
             Some(ledger.floor()),
             Code::TRANSFER_FAILED,
         );

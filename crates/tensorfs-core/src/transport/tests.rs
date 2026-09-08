@@ -939,6 +939,205 @@ fn slow_origin_teaches_the_ledger_and_is_left_alone() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A hub whose PRESIGN can be made to HOLD, and whose closure declares the mint window, so a
+/// test can put a slow mint at an exact point in a walk. `hold(n)` is how long the hub keeps
+/// presign ask number `n` before answering it — normally, with real URLs.
+///
+/// The hold is FINITE on purpose. A hub that never answers would prove only that something
+/// eventually gave up; a hub that answers late lets one assertion say WHICH clock ended the
+/// wait, because a refusal that arrives before the hub would have spoken cannot have been
+/// caused by the hub speaking.
+fn minting_hub(
+    checkpoint: Arc<Checkpoint>,
+    window: usize,
+    hold: impl Fn(usize) -> Duration + Send + Sync + 'static,
+    serve_object: impl Fn(&[u8]) -> Serve + Send + Sync + 'static,
+) -> (Origin, Arc<AtomicUsize>) {
+    let base_slot: Arc<Mutex<String>> = Arc::default();
+    let hits: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+    let mints = Arc::new(AtomicUsize::new(0));
+    let dispatch_base = Arc::clone(&base_slot);
+    let minted = Arc::clone(&mints);
+    let dispatch: Dispatch = Arc::new(move |request: &Request| {
+        let base = dispatch_base.lock().unwrap().clone();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/v1/tensorfs/closure") => {
+                let Value::Obj(mut fields) = closure_value(&checkpoint, &base) else {
+                    panic!("the closure emulation is an object")
+                };
+                fields.push((
+                    "presign_max_digests".to_string(),
+                    Value::uint(window as u64),
+                ));
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                ok_json(&Value::Obj(fields))
+            }
+            ("POST", "/v1/tensorfs/presign") => {
+                let ask = minted.fetch_add(1, Ordering::Relaxed) + 1;
+                std::thread::sleep(hold(ask));
+                ok_json(&presign_value(&request.body, &base))
+            }
+            ("GET", path) if path.starts_with("/obj/") => {
+                match checkpoint.bodies.get(&path["/obj/".len()..]) {
+                    Some(body) => serve_object(body),
+                    None => status(404, b"no such object"),
+                }
+            }
+            _ => status(404, b"no such route"),
+        }
+    });
+    let origin = origin_with_hits(dispatch, hits);
+    *base_slot.lock().unwrap() = origin.base.clone();
+    (origin, mints)
+}
+
+/// **THE CONTROL PLANE (tfs-106): a mint that goes silent while the transfer is standing
+/// still faults, and says what it measured.**
+///
+/// The byte-plane arms above judge a stream that stopped sending. On 2026-09-08 the streams
+/// were not sending and were not being judged, because they were not reading: fifteen of
+/// them were parked on `Leases::minting` behind one thread inside `hub::presign`, and a hub
+/// call answered to the caller's wall deadline alone — which a pod fetch deliberately does
+/// not set. `gayong` and `weed` each moved ~82 GB, stopped dead, and billed fifteen minutes
+/// at exactly zero with nothing anywhere raising anything.
+///
+/// The mint here is reached WITH BYTES ALREADY LANDED, which is the production shape and the
+/// reason the refusal has a real figure to quote. The verdict must arrive well before the
+/// hub would have answered: that is what proves it came from the measurement rather than
+/// from the hub finally speaking.
+#[test]
+fn a_mint_that_goes_silent_on_a_still_pull_faults_with_what_it_measured() {
+    // Far longer than any patience this pull can earn at 25 ms resolution, and the whole
+    // assertion below is that the walk did not wait for it.
+    const HOLD: Duration = Duration::from_secs(5);
+    let root = temporary("still-mint");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(3, 8 * 1024));
+    // One digest per mint, so the walk asks the hub again between objects and the second ask
+    // is reached only after the first object's bytes are already in the store.
+    let (origin, mints) = minting_hub(
+        Arc::clone(&checkpoint),
+        1,
+        |ask| {
+            if ask >= 2 {
+                HOLD
+            } else {
+                Duration::ZERO
+            }
+        },
+        |body| status(200, body),
+    );
+    let policy = SourcePolicy::default();
+    let mut request = request_for(&store, &origin.base, &policy);
+    request.streams = 1;
+    // NO DEADLINE — `Deadline::none()` is `PullRequest`'s default and is exactly what the pod
+    // supervisor passes, deliberately. Before tfs-106 this pull could not end.
+    let started = std::time::Instant::now();
+    let refusal = pull(&request).unwrap_err();
+    let waited = started.elapsed();
+
+    assert_eq!(refusal.code, Code::TRANSFER_FAILED, "{refusal}");
+    assert!(
+        refusal
+            .detail
+            .contains("the transfer this call serves has stopped"),
+        "{refusal}"
+    );
+    assert!(
+        refusal.detail.contains("s waiting for a response head"),
+        "the verdict names the wait it was in: {refusal}"
+    );
+    // THE FIGURE IS REAL. A fault that could not say what had landed would leave the next
+    // reader exactly where the stale progress line left them.
+    let quoted = refusal
+        .detail
+        .split(" B landed in this pull")
+        .next()
+        .unwrap();
+    let landed: u64 = quoted.rsplit(' ').next().unwrap().parse().unwrap();
+    let whole: u64 =
+        checkpoint.objects.iter().map(|o| o.length).sum::<u64>() + checkpoint.manifest.length;
+    assert!(
+        landed > 0,
+        "the pull had moved bytes before it stopped: {refusal}"
+    );
+    assert!(
+        landed < whole,
+        "the pull had NOT finished when it stopped: {refusal}"
+    );
+    // WHICH CLOCK ENDED IT. The hub was still holding its answer when the walk refused.
+    assert!(
+        waited < HOLD,
+        "the walk waited {waited:?} for a hub holding {HOLD:?} — that is the hub answering, \
+         not the pull measuring"
+    );
+    // Terminal, not re-asked: the transfer stopped, and no number of asks restarts it.
+    assert_eq!(
+        mints.load(Ordering::Relaxed),
+        2,
+        "the silent mint was re-asked"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// **The arm that proves this is the owner's rule and not a timeout: the SAME slow mint,
+/// over a transfer that is still moving, is left completely alone.**
+///
+/// Every mint after the first is held far longer than this pull's own measured patience — at
+/// 20 ms drip gaps the pull earns roughly 160 ms and the hub holds 1.2 s, seven times it. A
+/// bound on how long a mint may take would kill this walk. Nothing here is killed, because
+/// the question asked is not how long the call has taken; it is whether the transfer the
+/// call serves has stopped. Bytes are landing on the other stream the whole time, so it has
+/// not, and a slow hub over a working link is exactly what must not be condemned.
+#[test]
+fn a_slow_mint_over_a_moving_transfer_is_left_alone() {
+    const HOLD: Duration = Duration::from_millis(1200);
+    let root = temporary("slow-mint");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(3, 40 * 1024));
+    let (origin, mints) = minting_hub(
+        Arc::clone(&checkpoint),
+        1,
+        |ask| if ask >= 2 { HOLD } else { Duration::ZERO },
+        // EVERY object drips, in the same number of pieces whatever its size, so one stream
+        // is always moving bytes while the other is waiting on the hub. The 20 ms gap is far
+        // inside the pull's own measured pace; the hub's hold is far outside it.
+        |body| Serve::Drip {
+            body: body.to_vec(),
+            chunk: (body.len() / 80).max(1),
+            gap: Duration::from_millis(20),
+            ttfb: Duration::ZERO,
+        },
+    );
+    let policy = SourcePolicy::default();
+    let mut request = request_for(&store, &origin.base, &policy);
+    request.streams = 2;
+    let started = std::time::Instant::now();
+    let report = pull(&request).unwrap();
+    let took = started.elapsed();
+
+    assert_eq!(report.fetched, checkpoint.objects.len() as u64 + 1);
+    // The slow mint really happened — otherwise this arm proves nothing about patience.
+    assert!(
+        took >= HOLD,
+        "the walk finished in {took:?} without ever waiting out a {HOLD:?} mint"
+    );
+    assert!(
+        mints.load(Ordering::Relaxed) >= 2,
+        "only one mint was ever asked for"
+    );
+    // One ask per object: nothing was condemned and re-asked behind the slow mint.
+    for object in checkpoint.objects.iter() {
+        assert_eq!(
+            origin.hits(&format!("/obj/{}", object.sha256)),
+            1,
+            "object {} was re-asked",
+            object.sha256
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn deadline_refuses_midpull_and_the_next_pull_resumes_per_object() {
     let root = temporary("deadline");
@@ -1925,7 +2124,7 @@ fn the_tls_pump_carries_a_real_exchange() {
         None,
         Deadline::none(),
         &ledger,
-        true,
+        super::http::Judge::Stream,
         None,
         Code::TRANSFER_FAILED,
     )

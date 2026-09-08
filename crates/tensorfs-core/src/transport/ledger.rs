@@ -17,6 +17,18 @@
 //! the socket down. Here each stream samples ITSELF: its socket read timeout is the
 //! sampling resolution — resolution, not a verdict — and on each empty tick it consults
 //! the deadline and this ledger. Same rule, same granularity, no watchdog thread.
+//!
+//! **Two planes, one rule (tfs-106).** The paragraph above judges a STREAM by its own
+//! chunks, which is the byte plane. It cannot judge the CONTROL plane, because a hub call
+//! has no bytes of its own worth judging: a mint that takes a minute while sixteen streams
+//! keep landing objects is a call, not a wedge. What makes a hub call a wedge is that the
+//! TRANSFER it is serving has itself stopped — every stream parked on `Leases::minting`
+//! behind one thread that will never return. So this ledger keeps a second measurement,
+//! `still()`: what the whole pull has achieved and how long ago. A control-plane wait is
+//! judged by THAT, never by its own duration, against a term (`stillness()`) measured the
+//! same way and from the same evidence — the longest this pull has itself gone still and
+//! recovered — and never shorter than the byte plane's own `patience()`. On 2026-09-08 two
+//! paid H100s sat at exactly zero for fifteen minutes with neither plane complaining.
 
 use crate::err::{refuse, Code, Result};
 use std::sync::Mutex;
@@ -92,10 +104,39 @@ impl Deadline {
     }
 }
 
+/// What the WHOLE pull has achieved, and when. `moved` is every object byte that has
+/// crossed into this process; `advanced` is the last instant this pull got anywhere at all
+/// — a byte landed, or a hub call it was waiting on answered.
+///
+/// A hub answer counts as an advance and NOT as bytes, and both halves of that matter. It
+/// counts, because a closure page that just came back is a pull that is getting somewhere
+/// and the next page must be judged from there rather than from the start of the walk. It
+/// is not bytes, because the figure a refusal quotes has to be what actually landed.
+struct Progress {
+    moved: u64,
+    advanced: Instant,
+    /// The longest this pull has ever gone between advances AND THEN ADVANCED AGAIN. It is
+    /// the control plane's whole measured term, and it is kept apart from `worst_gap`
+    /// deliberately: that one is one stream's chunk rhythm, this one is the pull's, and a
+    /// pull legitimately goes still between objects for as long as its own store takes to
+    /// admit one. Folding them would make each rule wrong in the other's units.
+    worst_still: Duration,
+}
+
+/// What the pull has moved and how long it has been still. This is the CONTROL plane's
+/// whole evidence, and it is the pair a refusal quotes: a number a reader can check against
+/// the transfer's own report, and an interval they can check against `patience()`.
+#[derive(Debug, Clone, Copy)]
+pub struct Still {
+    pub moved: u64,
+    pub silent: Duration,
+}
+
 /// The one liveness ledger a pull shares across its streams.
 pub struct Ledger {
     sample: Duration,
     worst_gap: Mutex<Duration>,
+    progress: Mutex<Progress>,
 }
 
 impl Ledger {
@@ -109,6 +150,11 @@ impl Ledger {
         Ledger {
             sample: sample.max(Duration::from_millis(1)),
             worst_gap: Mutex::new(Duration::ZERO),
+            progress: Mutex::new(Progress {
+                moved: 0,
+                advanced: Instant::now(),
+                worst_still: Duration::ZERO,
+            }),
         }
     }
 
@@ -136,6 +182,64 @@ impl Ledger {
     pub fn patience(&self) -> Duration {
         let worst = *self.worst_gap.lock().unwrap();
         worst.mul_f64(STALL_FACTOR).max(self.floor())
+    }
+
+    /// Object bytes that just crossed into this process. Counted where they arrive, on
+    /// whichever of the pull's streams arrived first, so `still()` describes the pull and
+    /// not whichever stream happens to ask.
+    pub fn moved(&self, bytes: u64) {
+        self.advance(bytes);
+    }
+
+    /// A call this pull was waiting on came back. It moved no artifact bytes and says so,
+    /// but the pull did get somewhere, and the next wait must be measured from here.
+    pub fn answered(&self) {
+        self.advance(0);
+    }
+
+    /// The transfer starts NOW. Everything before it — opening the store, splitting the
+    /// closure against what is already local, the disk-budget check — is local work whose
+    /// duration this pull has just DEMONSTRATED, so it is taught rather than discarded: the
+    /// first mint of the walk is then judged by a term that has seen how still this pull
+    /// goes while it is doing something that is not moving bytes.
+    pub fn transfer_begins(&self) {
+        self.advance(0);
+    }
+
+    /// One advance of the whole pull, teaching the gap it just closed.
+    ///
+    /// EVERY closed gap is evidence, including a long one. A gap that ended in an advance
+    /// is by definition not a stall — the pull recovered from it — and it is precisely the
+    /// pull saying how still it can legitimately be. Silence that never ends teaches
+    /// nothing, because nothing arrives to teach it, which is the same reason a condemned
+    /// stream cannot raise the bar the next stream is judged by.
+    fn advance(&self, bytes: u64) {
+        let mut progress = self.progress.lock().unwrap();
+        let now = Instant::now();
+        let gap = now.saturating_duration_since(progress.advanced);
+        if gap > progress.worst_still {
+            progress.worst_still = gap;
+        }
+        progress.moved = progress.moved.saturating_add(bytes);
+        progress.advanced = now;
+    }
+
+    /// The CONTROL plane's verdict term: the longest this pull has ever gone between
+    /// advances, times the same factor the byte plane uses — and never less patient than
+    /// the byte plane itself. A coarser plane that condemned sooner than the finer one
+    /// beneath it would kill transfers the finer one had already judged healthy.
+    pub fn stillness(&self) -> Duration {
+        let worst = self.progress.lock().unwrap().worst_still;
+        worst.mul_f64(STALL_FACTOR).max(self.patience())
+    }
+
+    /// What this pull has moved and how long it has been still.
+    pub fn still(&self) -> Still {
+        let progress = self.progress.lock().unwrap();
+        Still {
+            moved: progress.moved,
+            silent: progress.advanced.elapsed(),
+        }
     }
 }
 
