@@ -74,6 +74,10 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 		return true
 	}
 	if row.State == "succeeded" {
+		if row.Operation == "source_files" {
+			go c.replayNativeByteResult(s, call, row)
+			return true
+		}
 		c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_SUCCEEDED, row.Result, nil)
 		return true
 	}
@@ -170,6 +174,19 @@ func (c *Orchestrator) onNativeSourceStatus(s *session, status *pb.NativeSourceS
 		c.sendNativeSource(s, call, row.ID, pb.NativeSourcePhase_NATIVE_SOURCE_PHASE_EXECUTE, status.Selection)
 	case pb.NativeSourceState_NATIVE_SOURCE_STATE_SUCCEEDED:
 		if len(status.ResultCanonicalBytes) > childCallMaxBytes || len(status.NativeReceiptCanonicalBytes) > 1<<20 || len(status.ComputationDigest) != 32 {
+			return
+		}
+		if row.Operation == "source_files" {
+			output, problem := nativeSourceByteOutput(*row, status)
+			if problem != nil {
+				c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_REFUSED, nil, problem)
+				return
+			}
+			producerSpec, _ := canonical.Spell(status.ByteOutputInvocationSpecDigest)
+			go c.sendNativeByteResult(s, call, *row, output, producerSpec, append([]byte(nil), status.ResultCanonicalBytes...), append([]byte(nil), status.NativeReceiptCanonicalBytes...))
+			return
+		}
+		if status.ByteOutput != nil || status.ByteOutputAttemptOrdinal != 0 || len(status.ByteOutputInvocationSpecDigest) != 0 {
 			return
 		}
 		if problem = c.opt.Store.CompleteNativeCallAt(row.ID, status.ResultCanonicalBytes, status.NativeReceiptCanonicalBytes, s.instanceID, s.bootID); problem != nil {
