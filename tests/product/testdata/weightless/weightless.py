@@ -163,7 +163,7 @@ def fail(payload: RefuseInput) -> TileOutput:
 
 @app.entrypoint
 def relay(
-    payload: RelayInput, ctx: Context, decoder: MediaDecoder, out: Outputs
+    payload: RelayInput, ctx: Context, decoder: MediaDecoder, out: Outputs, tel: Telemetry
 ) -> RelayOutput:
     """CPU-only exact workflow handoff: decode the prior accepted image and save it again."""
     remaining = payload.delay_ms

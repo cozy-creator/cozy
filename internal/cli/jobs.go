@@ -45,7 +45,9 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
-	input, assets, e := launch.ParseAssets(job, input, ctx.Inv.Values["--asset"], ctx.Inv.Values["--asset-fidelity"])
+	prepareImage, releasePrepared := imagePreparer(ctx)
+	defer releasePrepared()
+	input, assets, e := launch.ParseAssets(job, input, ctx.Inv.Values["--asset"], ctx.Inv.Values["--asset-fidelity"], prepareImage)
 	if e != nil {
 		return e
 	}
@@ -92,6 +94,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	key := requestKey(ctx.Inv.Value("--idempotency-key"))
 	began := time.Now()
 	handle, e := c.SubmitJob(sub, key)
+	releasePrepared()
 	if e != nil {
 		return e
 	}

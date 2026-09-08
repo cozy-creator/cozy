@@ -46,6 +46,29 @@ func ValidateID(fieldPath string) *exit.Error {
 	return nil
 }
 
+// Probe reads only a regular file's stat and MIME prefix. It creates no identity;
+// the prepared or original bytes still pass through Fingerprint before admission.
+func Probe(path string) (int64, string, *exit.Error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, "", exit.New(exit.NotFound, "input asset %s: %s", path, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, "", exit.New(exit.NotFound, "input asset %s: %s", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return 0, "", exit.New(exit.Validation, "input asset %s is not a regular file", path)
+	}
+	prefix := make([]byte, 512)
+	n, err := io.ReadFull(file, prefix)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return 0, "", exit.New(exit.NotFound, "input asset %s: %s", path, err)
+	}
+	return info.Size(), normalizeMediaType(http.DetectContentType(prefix[:n])), nil
+}
+
 // Fingerprint streams one bounded regular file and returns the identity facts used by
 // both the request record and InvocationSpec. Encoded media never enters a whole-file
 // buffer. Unknown media type stays empty.

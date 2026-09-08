@@ -35,7 +35,7 @@ func TestDeclaredAssetsPreserveOccurrencesLabelsAndNamedFields(t *testing.T) {
 	must(t, err)
 	relative, err := filepath.Rel(home, path)
 	must(t, err)
-	payload, assets, problem := launch.ParseAssets(ep, []byte(`{"prompt":"<Picture1> and <Picture2>"}`), []string{" 艾丽丝 =~/" + relative, path, "POSTER=" + path}, nil)
+	payload, assets, problem := launch.ParseAssets(ep, []byte(`{"prompt":"<Picture1> and <Picture2>"}`), []string{" 艾丽丝 =~/" + relative, path, "POSTER=" + path}, nil, nil)
 	fatal(t, problem)
 	fatal(t, launch.ValidatePayload("proof/assets", ep, payload))
 	var doc struct {
@@ -62,39 +62,39 @@ func TestDeclaredAssetsPreserveOccurrencesLabelsAndNamedFields(t *testing.T) {
 		t.Fatalf("child inherited an ungranted asset: %v", problem)
 	}
 	for _, specs := range [][]string{{"same=" + path, "same=" + path}, {path, path, path, path}} {
-		if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"test"}`), specs, nil); problem == nil {
+		if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"test"}`), specs, nil, nil); problem == nil {
 			t.Fatalf("invalid occurrence list accepted: %v", specs)
 		}
 	}
-	if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"test","assets":[{"asset":"existing","label":"same"},{"asset":"existing","label":"same"}]}`), []string{"/absent-file"}, nil); problem == nil || !strings.Contains(problem.Message, "more than once") {
+	if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"test","assets":[{"asset":"existing","label":"same"},{"asset":"existing","label":"same"}]}`), []string{"/absent-file"}, nil, nil); problem == nil || !strings.Contains(problem.Message, "more than once") {
 		t.Fatalf("duplicate payload labels did not refuse before IO: %v", problem)
 	}
 	// Bounds and duplicate labels are checked before trying to read missing files.
-	if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"test"}`), []string{"same=/absent-a", "same=/absent-b"}, nil); problem == nil || !strings.Contains(problem.Message, "more than once") {
+	if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"test"}`), []string{"same=/absent-a", "same=/absent-b"}, nil, nil); problem == nil || !strings.Contains(problem.Message, "more than once") {
 		t.Fatalf("duplicate label did not refuse before IO: %v", problem)
 	}
 	plain := filepath.Join(t.TempDir(), "not-an-image.png")
 	must(t, os.WriteFile(plain, []byte("plain text"), 0600))
-	if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"test"}`), []string{plain}, nil); problem == nil {
+	if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"test"}`), []string{plain}, nil, nil); problem == nil {
 		t.Fatal("file extension overruled observed MIME")
 	}
 	bytes, err := os.ReadFile(path)
 	must(t, err)
 	large := filepath.Join(t.TempDir(), "large.png")
 	must(t, os.WriteFile(large, append(bytes, make([]byte, 2048)...), 0600))
-	if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"test"}`), []string{large}, nil); problem == nil {
+	if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"test"}`), []string{large}, nil, nil); problem == nil {
 		t.Fatal("encoded per-item limit was ignored")
 	}
 	undeclared := *ep
 	undeclared.Assets = nil
-	if _, _, problem := launch.ParseAssets(&undeclared, []byte(`{"prompt":"test"}`), []string{path}, nil); problem == nil {
+	if _, _, problem := launch.ParseAssets(&undeclared, []byte(`{"prompt":"test"}`), []string{path}, nil, nil); problem == nil {
 		t.Fatal("bare asset guessed a payload destination without a declared Assets slot")
 	}
 }
 
 func TestDeclaredAssetsDefaultEmptyCollection(t *testing.T) {
 	ep := assetsCallable(t)
-	payload, bindings, problem := launch.ParseAssets(ep, []byte(`{"prompt":"text only"}`), nil, nil)
+	payload, bindings, problem := launch.ParseAssets(ep, []byte(`{"prompt":"text only"}`), nil, nil, nil)
 	fatal(t, problem)
 	if len(bindings) != 0 || !strings.Contains(string(payload), `"assets":[]`) {
 		t.Fatalf("missing declared Assets did not become an empty collection: %s %+v", payload, bindings)
@@ -106,12 +106,12 @@ func TestDeclaredAssetsDefaultEmptyCollection(t *testing.T) {
 	ep.Request.Fields[1].Constraints.MinLength = nil
 	fatal(t, launch.ValidatePayload("proof/assets", ep, payload))
 	explicit := []byte(`{"prompt":"text only","assets":[{"asset":"retained","label":"last"}]}`)
-	payload, bindings, problem = launch.ParseAssets(ep, explicit, nil, nil)
+	payload, bindings, problem = launch.ParseAssets(ep, explicit, nil, nil, nil)
 	fatal(t, problem)
 	if len(bindings) != 0 || !strings.Contains(string(payload), `"asset":"retained","label":"last"`) {
 		t.Fatalf("explicit collection was replaced: %s %+v", payload, bindings)
 	}
-	if _, _, problem = launch.ParseAssets(ep, []byte(`{"prompt":"text only","assets":null}`), nil, nil); problem == nil {
+	if _, _, problem = launch.ParseAssets(ep, []byte(`{"prompt":"text only","assets":null}`), nil, nil, nil); problem == nil {
 		t.Fatal("explicit null collection became an empty list")
 	}
 }
@@ -154,7 +154,7 @@ func TestDeclaredAssetsCountsAndFidelity(t *testing.T) {
 	must(t, err)
 	must(t, png.Encode(file, image.NewRGBA(image.Rect(0, 0, 2, 2))))
 	must(t, file.Close())
-	payload, bindings, problem := launch.ParseAssets(ep, []byte(`{"prompt":"same"}`), []string{"alice=" + photo, "poster=" + photo}, []string{"alice=high"})
+	payload, bindings, problem := launch.ParseAssets(ep, []byte(`{"prompt":"same"}`), []string{"alice=" + photo, "poster=" + photo}, []string{"alice=high"}, nil)
 	fatal(t, problem)
 	fatal(t, launch.ValidatePayload("proof/assets", ep, payload))
 	if len(bindings) != 2 || !strings.Contains(string(payload), `"fidelity":"high"`) {
@@ -166,18 +166,18 @@ func TestDeclaredAssetsCountsAndFidelity(t *testing.T) {
 	}
 	for _, count := range []int64{1, 0} {
 		limit = count
-		if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"same"}`), []string{photo, photo}, nil); problem == nil || problem.ErrName() != "input_asset_count" {
+		if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"same"}`), []string{photo, photo}, nil, nil); problem == nil || problem.ErrName() != "input_asset_count" {
 			t.Fatalf("observed image count exceeded cap %d: %v", count, problem)
 		}
 	}
 	// Unknown hints and duplicate aliases refuse before opening either file.
 	for _, mappings := range [][]string{{"alice=low", "0=high"}, {"missing=high"}, {"0=extreme"}, {"01=low"}, {"-1=low"}} {
-		if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"same"}`), []string{"alice=/absent-one", "/absent-two"}, mappings); problem == nil || !strings.Contains(problem.Message, "fidelity") {
+		if _, _, problem := launch.ParseAssets(ep, []byte(`{"prompt":"same"}`), []string{"alice=/absent-one", "/absent-two"}, mappings, nil); problem == nil || !strings.Contains(problem.Message, "fidelity") {
 			t.Fatalf("invalid fidelity mapping reached file IO: %v %v", mappings, problem)
 		}
 	}
 	// Exact labels win, including numeric labels; the final '=' belongs to the hint.
-	payload, _, problem = launch.ParseAssets(ep, []byte(`{"prompt":"same","assets":[{"asset":"retained","label":"名=字"},{"asset":"retained","label":"0"}]}`), nil, []string{"名=字=medium", "0=low"})
+	payload, _, problem = launch.ParseAssets(ep, []byte(`{"prompt":"same","assets":[{"asset":"retained","label":"名=字"},{"asset":"retained","label":"0"}]}`), nil, []string{"名=字=medium", "0=low"}, nil)
 	fatal(t, problem)
 	var document struct {
 		Assets []struct{ Label, Fidelity string }
