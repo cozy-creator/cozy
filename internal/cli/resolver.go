@@ -589,7 +589,18 @@ func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, bool,
 		return nil, false, problem
 	}
 	entrypoint, problem := packageInterface.Function(name)
-	return entrypoint, launch.AcceleratorRequired(strings.Split(install.Closure, "\n")), problem
+	if problem != nil {
+		return nil, false, problem
+	}
+	accelerator := launch.AcceleratorRequired(strings.Split(install.Closure, "\n"))
+	if entrypoint.Kind == "job" && len(entrypoint.Models) == 0 && len(entrypoint.WeightsOutputs) == 0 {
+		bound, problem := r.store.HasChildBindings(installID)
+		if problem != nil {
+			return nil, false, problem
+		}
+		accelerator = accelerator && !bound
+	}
+	return entrypoint, accelerator, nil
 }
 
 func (r *Resolver) installRecord(installID string) (*records.PackageInstall, *exit.Error) {
@@ -623,7 +634,12 @@ func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
 	if e != nil {
 		return nil, e
 	}
-	return launch.Read(*install, r.cfg.Home, r.cfg.Tool())
+	facts, problem := launch.Read(*install, r.cfg.Home, r.cfg.Tool())
+	if problem != nil {
+		return nil, problem
+	}
+	facts.CPUOrchestration, problem = r.store.HasChildBindings(installID)
+	return facts, problem
 }
 
 // ResolveJob answers with the spec that makes ONE job function's worker resident. It is

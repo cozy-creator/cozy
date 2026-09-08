@@ -36,8 +36,8 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if problem != nil {
 		return out, "", problem
 	}
-	if job.Kind != "job" || job.Invocable == nil || job.Invocable.Module != module || job.Invocable.Export != export {
-		return out, "", exit.Named(exit.Conflict, "child.export_changed", "the captured implementation does not expose the exact invocable job")
+	if (job.Kind != "job" && job.Kind != "entrypoint") || job.Invocable == nil || job.Invocable.Module != module || job.Invocable.Export != export {
+		return out, "", exit.Named(exit.Conflict, "child.export_changed", "the captured implementation does not expose the exact managed callable")
 	}
 	if job.Invocable.Memoize {
 		for _, capability := range job.Invocable.Capabilities {
@@ -61,30 +61,44 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if parentJob.Invocable != nil && parentJob.Invocable.Memoize && !job.Invocable.Memoize {
 		return out, "", exit.Named(exit.Conflict, "child.impure_dependency", "a memoized parent operation cannot call a dependency that does not opt into memoization")
 	}
+	var arguments map[string]json.RawMessage
+	if job.Kind == "entrypoint" {
+		payload, arguments, problem = records.ServingCallArguments(payload)
+		if problem != nil {
+			return out, "", problem
+		}
+		if len(arguments) != len(job.Models) {
+			return out, "", exit.Named(exit.Conflict, "child.model_unbound", "serving model arguments differ from declared slots")
+		}
+	} else if json.Unmarshal(payload, &arguments) != nil {
+		return out, "", exit.New(exit.Validation, "child input is not an object")
+	}
 	if problem := launch.ValidatePayload(install.Package, job, payload); problem != nil {
 		return out, "", problem
 	}
 	if _, problem := r.LocalRevision(install.ID, binding.LocalRevisionDigest); problem != nil {
 		return out, "", problem
 	}
-	jobs, problem := r.JobsInstall(install.ID)
-	if problem != nil {
-		return out, "", problem
-	}
-	var facts *launch.JobFacts
-	for i := range jobs {
-		if jobs[i].Name == binding.Entrypoint {
-			facts = &jobs[i]
-			break
+	out = orchestrator.Submission{Kind: "serving", Package: install.Package, Entrypoint: binding.Entrypoint, Release: install.Version, InstallID: install.ID,
+		Payload: append([]byte(nil), payload...), Outputs: launch.AssetPaths(job.Result),
+		NeedsAccelerator: launch.AcceleratorRequired(strings.Split(install.Closure, "\n")), Org: parent.Org}
+	if job.Kind == "job" {
+		jobs, problem := r.JobsInstall(install.ID)
+		if problem != nil {
+			return out, "", problem
 		}
-	}
-	if facts == nil {
-		return out, "", exit.Named(exit.Conflict, "child.export_changed", "the captured child has no matching job facts")
-	}
-
-	var arguments map[string]json.RawMessage
-	if json.Unmarshal(payload, &arguments) != nil {
-		return out, "", exit.New(exit.Validation, "child input is not an object")
+		var facts *launch.JobFacts
+		for i := range jobs {
+			if jobs[i].Name == binding.Entrypoint {
+				facts = &jobs[i]
+				break
+			}
+		}
+		if facts == nil {
+			return out, "", exit.Named(exit.Conflict, "child.export_changed", "captured child has no matching job facts")
+		}
+		out.Kind, out.RetainWork, out.PlanID = "job", true, facts.DescriptorID
+		out.Outputs, out.WeightsOutputs, out.NeedsAccelerator = facts.Outputs, facts.WeightsOutputs, facts.NeedsAccelerator
 	}
 	models := make([]orchestrator.ModelRef, 0, len(job.Models))
 	for _, slot := range job.Models {
@@ -109,8 +123,6 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 
 		models = append(models, orchestrator.ModelRef{Package: install.Package, Slot: slot.Param, BindingPath: slot.Path, Model: artifact.ProducerRequestID + "/" + artifact.OutputSlot, Manifest: artifact.Manifest.Digest, ManifestLength: artifact.Manifest.Length})
 	}
-	out = orchestrator.Submission{Kind: "job", RetainWork: true, Package: install.Package, Entrypoint: binding.Entrypoint, Release: install.Version, InstallID: install.ID,
-		PlanID: facts.DescriptorID, Payload: append([]byte(nil), payload...), Outputs: facts.Outputs, WeightsOutputs: facts.WeightsOutputs, NeedsAccelerator: facts.NeedsAccelerator, Org: parent.Org}
 	out.Models = models
 	received, problem := r.store.ReceivedByteAssets(parent.ID)
 	if problem != nil {
@@ -122,10 +134,10 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 		return out, "", problem
 	}
 	out.ChildReusable = job.Invocable.Memoize
-	out.ChildArtifacts = len(launch.ModelArtifactPaths(job.Result)) > 0 || len(facts.Outputs) > len(facts.WeightsOutputs)
+	out.ChildArtifacts = len(launch.ModelArtifactPaths(job.Result)) > 0 || len(out.Outputs) > len(out.WeightsOutputs)
+	out.LocalPackageDigest = binding.LocalRevisionDigest
 	if parent.Worker != "" {
 		out.Worker, out.Rental, out.RentalRequired = parent.Worker, true, true
-		out.LocalPackageDigest = binding.LocalRevisionDigest
 	}
 	identity, _ := json.Marshal(map[string]any{"local_revision_digest": binding.LocalRevisionDigest, "interface_digest": iface, "entrypoint": binding.Entrypoint, "module": module, "export": export})
 	identity, err := canonical.NormalizeJCS(identity)
@@ -188,8 +200,8 @@ func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool,
 			if problem != nil {
 				return false, problem
 			}
-			if job.Kind != "job" || job.Invocable == nil || job.Invocable.Module != binding.Module || job.Invocable.Export != binding.Export {
-				return false, exit.Named(exit.Conflict, "child.export_changed", "captured child has no exact job for rental sizing")
+			if (job.Kind != "job" && job.Kind != "entrypoint") || job.Invocable == nil || job.Invocable.Module != binding.Module || job.Invocable.Export != binding.Export {
+				return false, exit.Named(exit.Conflict, "child.export_changed", "captured child has no exact callable for rental sizing")
 			}
 			// The same immutable closure predicate JobsInstall uses; no package
 			// code needs importing again merely to choose a machine class.

@@ -57,7 +57,7 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		refuse(exit.Named(exit.Conflict, "child.parent_stopped", "stopped parent cannot start child work"))
 		return
 	}
-	if call.CallIndex >= 32 || len(call.InterfaceDigest) != 32 || len(call.IntentDigest) != 32 || len(call.RequestCanonicalBytes) > childCallMaxBytes || len(call.Module) == 0 || len(call.Export) == 0 || len(call.Module) > 256 || len(call.Export) > 128 {
+	if len(call.InterfaceDigest) != 32 || len(call.IntentDigest) != 32 || len(call.RequestCanonicalBytes) > childCallMaxBytes || len(call.Module) == 0 || len(call.Export) == 0 || len(call.Module) > 256 || len(call.Export) > 128 {
 		refuse(exit.New(exit.Validation, "child call exceeds its closed identity or payload bounds"))
 		return
 	}
@@ -92,27 +92,24 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 	if c.onNativeEffect(s, *parent, call) {
 		return
 	}
-	priorCalls, problem := c.opt.Store.Children(parent.ID)
+	existing, problem := c.opt.Store.ChildAt(parent.ID, int64(call.CallIndex))
 	if problem != nil {
 		refuse(problem)
 		return
 	}
 	intentDigest, _ := canonical.Spell(call.IntentDigest)
-	for _, child := range priorCalls {
-		if child.ParentCallIndex != int64(call.CallIndex) {
-			continue
-		}
-		if child.ChildIntentDigest != intentDigest {
+	if existing != nil {
+		if existing.ChildIntentDigest != intentDigest {
 			refuse(exit.Named(exit.Conflict, "child.intent_changed", "the parent call index already names different inputs"))
 			return
 		}
 		// Same-parent replay continues its durable call, even when a transient
 		// environment probe is unavailable. Cross-parent reuse is qualified below.
-		c.sendChildResult(s, call, child.ID, pb.ChildCallState_CHILD_CALL_STATE_PENDING, nil, nil)
-		if child.State == "paused" {
-			go func() { _ = c.ResumeRequest(child.ID, "parent resumed its child call") }()
+		c.sendChildResult(s, call, existing.ID, pb.ChildCallState_CHILD_CALL_STATE_PENDING, nil, nil)
+		if existing.State == "paused" {
+			go func() { _ = c.ResumeRequest(existing.ID, "parent resumed its child call") }()
 		}
-		c.watchChildCall(s, proto.Clone(call).(*pb.ChildCallRequest), child.ID)
+		c.watchChildCall(s, proto.Clone(call).(*pb.ChildCallRequest), existing.ID)
 		return
 	}
 	resolver, ok := c.opt.Packages.(privateChildResolver)
@@ -152,7 +149,7 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		request.Outputs += "runtime.capture"
 	}
 	parentDigest, _ := canonical.Spell(call.ParentInvocationSpecDigest)
-	child, fresh, problem := c.opt.Store.SubmitChild(request, int64(call.ParentAttemptOrdinal), parentDigest, s.bootID)
+	child, fresh, problem := c.opt.Store.SubmitChild(request, int64(call.ParentAttemptOrdinal), parentDigest, s.bootID, call.RequestCanonicalBytes)
 	if problem != nil {
 		refuse(problem)
 		return

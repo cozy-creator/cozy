@@ -12,7 +12,7 @@ import (
 // with ordinary package children. It is execution history, never a second job queue.
 const nativeCallsDDL = `CREATE TABLE IF NOT EXISTS native_calls (
  id TEXT PRIMARY KEY, parent_request_id TEXT NOT NULL REFERENCES requests(id),
- call_index INTEGER NOT NULL CHECK(call_index>=0 AND call_index<32),
+ call_index INTEGER NOT NULL CHECK(call_index>=0 AND call_index<4294967296),
  kind TEXT NOT NULL CHECK(kind IN ('source','effect')), operation TEXT NOT NULL,
  intent_digest TEXT NOT NULL, request BLOB NOT NULL, frozen BLOB NOT NULL DEFAULT x'',
  state TEXT NOT NULL CHECK(state IN ('accepted','frozen','executing','succeeded','failed','canceled','stopped')),
@@ -55,7 +55,7 @@ func (s *Store) NativeCall(parent string, index int64) (*NativeCall, *exit.Error
 	return &call, nil
 }
 func (s *Store) AcceptNativeCall(call NativeCall, parentAttempt int64, parentSpec, parentSession string) (NativeCall, bool, *exit.Error) {
-	if call.ID == "" || len(call.ID) > 128 || call.ParentRequestID == "" || call.CallIndex < 0 || call.CallIndex >= 32 || parentAttempt <= 0 || len(call.Request) > 48*1024 || (call.Kind != "source" && call.Kind != "effect") || call.Operation == "" || len(call.Operation) > 128 {
+	if call.ID == "" || len(call.ID) > 128 || call.ParentRequestID == "" || call.CallIndex < 0 || call.CallIndex > maxChildCallIndex || parentAttempt <= 0 || len(call.Request) > 48*1024 || (call.Kind != "source" && call.Kind != "effect") || call.Operation == "" || len(call.Operation) > 128 {
 		return NativeCall{}, false, exit.New(exit.Validation, "native call exceeds fixed identity bounds")
 	}
 	if _, err := canonical.Raw(call.IntentDigest); err != nil {
@@ -96,6 +96,9 @@ func (s *Store) AcceptNativeCall(call NativeCall, parentAttempt int64, parentSpe
 		if existing.Kind == "source" && parentAttempt > existing.ParentAttempt && existing.State != "succeeded" && existing.State != "canceled" {
 			state := existing.State
 			if state == "failed" || state == "stopped" {
+				if problem := requireActiveChildSlot(tx, parent.ID); problem != nil {
+					return NativeCall{}, false, problem
+				}
 				state = "accepted"
 				if len(existing.Frozen) > 0 {
 					state = "frozen"
@@ -113,6 +116,9 @@ func (s *Store) AcceptNativeCall(call NativeCall, parentAttempt int64, parentSpe
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return NativeCall{}, false, exit.Internalf("cannot read native replay: %s", err)
+	}
+	if problem := requireActiveChildSlot(tx, parent.ID); problem != nil {
+		return NativeCall{}, false, problem
 	}
 	_, err = tx.Exec(`INSERT INTO native_calls(id,parent_request_id,call_index,kind,operation,intent_digest,request,state,worker,parent_attempt) VALUES(?,?,?,?,?,?,?,'accepted',?,?)`, call.ID, parent.ID, call.CallIndex, call.Kind, call.Operation, call.IntentDigest, call.Request, parent.Worker, parentAttempt)
 	if err != nil {

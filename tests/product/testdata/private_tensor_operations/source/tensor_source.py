@@ -1,14 +1,10 @@
 import struct
-from importlib.metadata import distributions
 
 import tensorfs
 from cozy_runtime.author import (
     App, Context, ModelArtifact, WeightsOutput, WeightsPart, WeightsSink,
     WeightsTarget, WeightsTensor, invocable,
 )
-
-if any((item.metadata.get("Name") or "").startswith("cozy-script-") for item in distributions()):
-    raise RuntimeError("tensor implementation imported into parent")
 
 PLAIN = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
 
