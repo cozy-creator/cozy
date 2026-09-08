@@ -181,8 +181,8 @@ func (c *PackagePublishCmd) Run(r *Runtime) error {
 }
 
 type ModelCmd struct {
-	Info     ModelInfoCmd     `cmd:"" help:"Show model metadata, release lanes, and exact checkpoint refs."`
-	Search   ModelSearchCmd   `cmd:"" help:"Search the model catalog."`
+	Info     ModelInfoCmd     `cmd:"" help:"Show all releases, lane sizes, and exact checkpoint refs."`
+	Search   ModelSearchCmd   `cmd:"" help:"Search models, showing each model's latest available release."`
 	Family   ModelFamilyCmd   `cmd:"" help:"Set a model repository's discovery family."`
 	Download ModelDownloadCmd `cmd:"" help:"Acquire a source, optionally run one producer job, and retain it locally."`
 	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model repositories and reclaim their bytes."`
@@ -204,7 +204,7 @@ func (c *ModelInfoCmd) Run(r *Runtime) error {
 
 type ModelSearchCmd struct {
 	Query  []string `arg:"" optional:"" name:"query" help:"Search text or an exact org/name."`
-	Limit  int      `help:"Maximum matching models; each release has its own row." default:"20"`
+	Limit  int      `help:"Maximum matching models; one row per model." default:"20"`
 	Family string   `help:"Only show one recognized model family."`
 }
 
