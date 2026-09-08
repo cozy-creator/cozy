@@ -17,24 +17,27 @@ const nativeCallsDDL = `CREATE TABLE IF NOT EXISTS native_calls (
  intent_digest TEXT NOT NULL, request BLOB NOT NULL, frozen BLOB NOT NULL DEFAULT x'',
  state TEXT NOT NULL CHECK(state IN ('accepted','frozen','executing','succeeded','failed','canceled')),
  result BLOB NOT NULL DEFAULT x'', native_receipt BLOB NOT NULL DEFAULT x'',
- safe_code TEXT NOT NULL DEFAULT '', UNIQUE(parent_request_id,call_index)
+ safe_code TEXT NOT NULL DEFAULT '', worker TEXT NOT NULL DEFAULT '',
+ instance_id TEXT NOT NULL DEFAULT '', worker_boot_id TEXT NOT NULL DEFAULT '',
+ UNIQUE(parent_request_id,call_index)
 )`
 
 type NativeCall struct {
-	ID, ParentRequestID           string
-	CallIndex                     int64
-	Kind, Operation, IntentDigest string
-	Request, Frozen               []byte
-	State                         string
-	Result, NativeReceipt         []byte
-	SafeCode                      string
+	ID, ParentRequestID              string
+	CallIndex                        int64
+	Kind, Operation, IntentDigest    string
+	Request, Frozen                  []byte
+	State                            string
+	Result, NativeReceipt            []byte
+	SafeCode                         string
+	Worker, InstanceID, WorkerBootID string
 }
 
-const nativeCallColumns = `id,parent_request_id,call_index,kind,operation,intent_digest,request,frozen,state,result,native_receipt,safe_code`
+const nativeCallColumns = `id,parent_request_id,call_index,kind,operation,intent_digest,request,frozen,state,result,native_receipt,safe_code,worker,instance_id,worker_boot_id`
 
 func scanNativeCall(row interface{ Scan(...any) error }) (NativeCall, error) {
 	var call NativeCall
-	err := row.Scan(&call.ID, &call.ParentRequestID, &call.CallIndex, &call.Kind, &call.Operation, &call.IntentDigest, &call.Request, &call.Frozen, &call.State, &call.Result, &call.NativeReceipt, &call.SafeCode)
+	err := row.Scan(&call.ID, &call.ParentRequestID, &call.CallIndex, &call.Kind, &call.Operation, &call.IntentDigest, &call.Request, &call.Frozen, &call.State, &call.Result, &call.NativeReceipt, &call.SafeCode, &call.Worker, &call.InstanceID, &call.WorkerBootID)
 	return call, err
 }
 func (s *Store) NativeCall(parent string, index int64) (*NativeCall, *exit.Error) {
@@ -91,7 +94,7 @@ func (s *Store) AcceptNativeCall(call NativeCall, parentAttempt int64, parentSpe
 	if !errors.Is(err, sql.ErrNoRows) {
 		return NativeCall{}, false, exit.Internalf("cannot read native replay: %s", err)
 	}
-	_, err = tx.Exec(`INSERT INTO native_calls(id,parent_request_id,call_index,kind,operation,intent_digest,request,state) VALUES(?,?,?,?,?,?,?,'accepted')`, call.ID, parent.ID, call.CallIndex, call.Kind, call.Operation, call.IntentDigest, call.Request)
+	_, err = tx.Exec(`INSERT INTO native_calls(id,parent_request_id,call_index,kind,operation,intent_digest,request,state,worker) VALUES(?,?,?,?,?,?,?,'accepted',?)`, call.ID, parent.ID, call.CallIndex, call.Kind, call.Operation, call.IntentDigest, call.Request, parent.Worker)
 	if err != nil {
 		return NativeCall{}, false, exit.Internalf("cannot record native call: %s", err)
 	}
@@ -102,6 +105,7 @@ func (s *Store) AcceptNativeCall(call NativeCall, parentAttempt int64, parentSpe
 		return NativeCall{}, false, exit.Internalf("cannot commit native call: %s", err)
 	}
 	call.State = "accepted"
+	call.Worker = parent.Worker
 	return call, true, nil
 }
 func (s *Store) FreezeNativeCall(id string, frozen []byte) *exit.Error {
@@ -136,6 +140,9 @@ func (s *Store) FreezeNativeCall(id string, frozen []byte) *exit.Error {
 	return nil
 }
 func (s *Store) CompleteNativeCall(id string, result, receipt []byte) *exit.Error {
+	return s.CompleteNativeCallAt(id, result, receipt, "", "")
+}
+func (s *Store) CompleteNativeCallAt(id string, result, receipt []byte, instance, boot string) *exit.Error {
 	raw, err := canonical.NormalizeJCS(result)
 	if err != nil || !bytes.Equal(raw, result) || len(raw) > 48*1024 || len(receipt) > 1<<20 {
 		return exit.New(exit.Validation, "native completion exceeds canonical result bounds")
@@ -158,7 +165,7 @@ func (s *Store) CompleteNativeCall(id string, result, receipt []byte) *exit.Erro
 	if call.State != "accepted" && call.State != "frozen" && call.State != "executing" {
 		return exit.Named(exit.Conflict, "native.call_closed", "native call stopped before completion")
 	}
-	if _, err = tx.Exec(`UPDATE native_calls SET state='succeeded',result=?,native_receipt=? WHERE id=?`, result, receipt, id); err != nil {
+	if _, err = tx.Exec(`UPDATE native_calls SET state='succeeded',result=?,native_receipt=?,instance_id=?,worker_boot_id=? WHERE id=?`, result, receipt, instance, boot, id); err != nil {
 		return exit.Internalf("cannot record native completion: %s", err)
 	}
 	if err = appendEventTx(tx, call.ParentRequestID, "native.completed", 0, map[string]any{"call_index": call.CallIndex, "service_id": id}); err != nil {
