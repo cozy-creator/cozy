@@ -134,7 +134,7 @@ func DescribeContract(target string, ep *Entrypoint, bindings map[string]string)
 		}
 	}
 	if len(ep.Result.Fields) > 0 {
-		b.WriteString("  result:\n")
+		b.WriteString("  output:\n")
 		writeFields(&b, ep.Result.Fields, "    ")
 	}
 	b.WriteString("\nusage: " + UsageLine(target, ep) + "\n")

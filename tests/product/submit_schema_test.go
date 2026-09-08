@@ -42,7 +42,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 	// cl-106: --describe renders the callable's contract from the installed PackageInterface —
 	// the exact facts submit validates against — without dialing anything.
 	code, out = runCozy(t, root, "run", video, "--describe")
-	for _, expected := range []string{video, "prompt: str", "first_frame: image asset", "usage: " + usage} {
+	for _, expected := range []string{video, "prompt: str", "first_frame: image asset", "output:", "usage: " + usage} {
 		if code != 0 || !strings.Contains(out, expected) {
 			t.Fatalf("--describe omitted %q [exit %d]\n%s", expected, code, out)
 		}
