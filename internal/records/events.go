@@ -3,6 +3,7 @@ package records
 import (
 	"database/sql"
 	"encoding/json"
+	"math"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
@@ -22,7 +23,8 @@ import (
 //
 // The LOSSY half — progress ticks, logs, per-stage marks — is never written here. It is
 // live-only by construction (orchestrator/dispatch.go's fanout), because a durable row per
-// denoising step would make the authority a log sink.
+// denoising step would make the authority a log sink. The attempt-end event may
+// retain its final measured overall fraction in the same terminal transaction.
 var eventSchema = []string{`
 CREATE TABLE IF NOT EXISTS request_events (
   seq        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -246,6 +248,35 @@ func (s *Store) TerminalEventAt(requestID string) (string, *exit.Error) {
 		return "", exit.Internalf("cannot read terminal event time for %s: %s", requestID, err)
 	}
 	return at, nil
+}
+
+// TerminalOverallFraction reads only the current attempt's persisted outcome
+// summary. A prior attempt or a stage-local denominator cannot supply this value.
+func (s *Store) TerminalOverallFraction(requestID string, attempt int64) (*float64, *exit.Error) {
+	var body string
+	err := s.db.QueryRow(`SELECT payload FROM request_events
+		WHERE request_id=? AND attempt=? AND type IN (
+		'request.completed','request.failed','request.canceled','request.attempt_failed',
+		'request.pausing','request.blocked','request.canceling','request.finalizing')
+		AND json_extract(payload,'$.overall_fraction') IS NOT NULL
+		ORDER BY seq DESC LIMIT 1`, requestID, attempt).Scan(&body)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read terminal progress for %s: %s", requestID, err)
+	}
+	var summary struct {
+		OverallFraction *float64 `json:"overall_fraction"`
+	}
+	if err := json.Unmarshal([]byte(body), &summary); err != nil {
+		return nil, exit.Internalf("cannot read terminal progress payload for %s: %s", requestID, err)
+	}
+	value := summary.OverallFraction
+	if value == nil || math.IsNaN(*value) || math.IsInf(*value, 0) || *value < 0 || *value > 1 {
+		return nil, nil
+	}
+	return value, nil
 }
 
 // CancelAttribution is who canceled this request. Every cancellation path records its
