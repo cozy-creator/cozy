@@ -88,7 +88,7 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 		}
 		var notes []string
 		if search.Capped || search.Total > len(resources) {
-			notes = append(notes, fmt.Sprintf("Showing releases for %d of %d matching models", len(resources), search.Total))
+			notes = append(notes, fmt.Sprintf("Showing %d of %d matching models", len(resources), search.Total))
 		}
 		return emit(ctx, modelSearchView{Cards: cards, Notes: notes})
 	}
