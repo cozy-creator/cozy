@@ -268,6 +268,14 @@ func ValidatePayload(pkg string, ep *Entrypoint, payload json.RawMessage) *exit.
 		}
 	}
 	if len(problems) > 0 {
+		if len(missing) > 0 {
+			message := "provide required arguments: [" + strings.Join(missing, ", ") + "]"
+			if len(problems) > 1 {
+				message += "; " + strings.Join(problems[1:], "; ")
+			}
+			return exit.Named(exit.Validation, "request_payload_invalid", "%s", message).
+				WithRemedy("%s", UsageLine(target, ep))
+		}
 		return refuse(problems)
 	}
 	return nil
