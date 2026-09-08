@@ -176,6 +176,9 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
+	if e := validateInvocationPayload(ctx, target.Package, ep, input); e != nil {
+		return e
+	}
 	models, e := resolveInvocationModels(ctx, target, ep, overrides, managedRental)
 	if e != nil {
 		return e
@@ -328,7 +331,8 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 		}
 		lane := spec.Lane
 		if !spec.Explicit {
-			// Local execution: the lane is the rung this host's own accelerator fits.
+			// GPU-specific defaults take precedence; an unlisted local GPU uses the
+			// first declared lane and still goes through ordinary Runtime admission.
 			rung, problem := localRung(ctx, spec.Binding.Ladder)
 			if problem != nil {
 				return nil, problem
@@ -2064,6 +2068,16 @@ func requestKey(supplied string) string {
 // already-minted idempotency key, so a normal invocation gets fresh entropy while an
 // explicit-key retry reconstructs byte-identical input instead of conflicting with its
 // recorded request. An explicitly supplied seed is never changed.
+// The same validation and argument help apply to serving functions and jobs,
+// before either path resolves or acquires a model.
+func validateInvocationPayload(ctx *Context, pkg string, ep *launch.Entrypoint, input json.RawMessage) *exit.Error {
+	problem := launch.ValidatePayload(pkg, ep, input)
+	if problem != nil && !ctx.Mode().JSON {
+		problem.Message += "\n\n" + launch.DescribeArguments(ep)
+	}
+	return problem
+}
+
 func finalizeInputPayload(ep *launch.Entrypoint, input json.RawMessage,
 	idempotencyKey string,
 ) (json.RawMessage, *exit.Error) {

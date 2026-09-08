@@ -78,7 +78,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 		t.Fatalf("promptless submit did not refuse typed with the usage line [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", video); code != 1 ||
-		!strings.Contains(out, "missing required fields") || !strings.Contains(out, usage) {
+		!strings.Contains(out, "provide required arguments: [") || !strings.Contains(out, "Arguments:") || !strings.Contains(out, usage) {
 		t.Fatalf("the human refusal lost its fields or usage line [exit %d]\n%s", code, out)
 	}
 

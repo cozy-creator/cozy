@@ -141,6 +141,15 @@ func DescribeContract(target string, ep *Entrypoint, bindings map[string]string)
 	return b.String()
 }
 
+// DescribeArguments uses the same schema printer as --describe without resolving
+// model defaults, so an invalid invocation can show its arguments immediately.
+func DescribeArguments(ep *Entrypoint) string {
+	var b strings.Builder
+	b.WriteString("Arguments:\n")
+	writeFields(&b, ep.Request.Fields, "  ")
+	return b.String()
+}
+
 func writeFields(b *strings.Builder, fields []Field, indent string) {
 	for i := range fields {
 		field := &fields[i]
