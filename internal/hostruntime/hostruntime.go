@@ -28,8 +28,10 @@ const Floor = "0.8.0"
 var floor = pep440.MustParse(Floor)
 
 // hostRuntimeInstall is the one remedy for a host tool this Cozy cannot drive.
+// Select the supported interpreter explicitly: uv ignores dependency Requires-Python
+// upper bounds, so the package's <3.13 metadata does not constrain `uv tool install`.
 var hostRuntimeInstall = fmt.Sprintf(
-	"install cozy-runtime %s or newer: uv tool install --force 'cozy-runtime[media,model-execution]>=%s' — then retry",
+	"install cozy-runtime %s or newer: uv tool install --force --python 3.12 'cozy-runtime[media,model-execution]>=%s' — then retry",
 	Floor, Floor)
 
 func wirePackage() string { return string(pb.File_cozy_worker_v1_worker_proto.Package()) }
