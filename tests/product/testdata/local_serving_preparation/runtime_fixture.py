@@ -39,7 +39,11 @@ if "serve" in sys.argv[1:]:
 
 class FixtureWorker(session.Worker):
     def prepare_local_package(self, request):
-        result = super().prepare_local_package(request)
+        try:
+            result = super().prepare_local_package(request)
+        except Exception as error:
+            record("PrepareLocalPackage", self, request, error=error)
+            raise
         record("PrepareLocalPackage", self, request, result=result)
         return result
 
